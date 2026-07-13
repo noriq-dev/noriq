@@ -58,7 +58,7 @@ export function useAppStore() {
   const [user, setUser] = useState<UserVM | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
   const [needsSetup, setNeedsSetup] = useState(false);
-  const [modal, setModal] = useState<null | 'project' | 'task' | 'group' | 'agent' | 'milestone'>(null);
+  const [modal, setModal] = useState<null | 'project' | 'project-edit' | 'task' | 'group' | 'agent' | 'milestone'>(null);
   const [editMilestone, setEditMilestone] = useState<{ id: string; title: string; dueAt: string | null } | null>(null);
   const [groups, setGroups] = useState<Array<{ id: string; name: string; description: string }>>([]);
   const initialUrl = useRef(parseUrl());
@@ -366,6 +366,14 @@ export function useAppStore() {
         await api.createMilestone(pidRef.current, title, dueAt);
         setModal('task'); // return to the task dialog with the new milestone available
       }
+      refresh();
+    },
+
+    async submitProjectMeta(meta: { name?: string; description?: string; groupId?: string | null }) {
+      if (!pidRef.current) return;
+      await api.setProjectMeta(pidRef.current, meta);
+      await loadProjects();
+      setModal(null);
       refresh();
     },
 

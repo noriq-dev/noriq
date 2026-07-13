@@ -33,7 +33,12 @@ export function TopBar({ store }: { store: AppStore }) {
         background: 'var(--bg-raised)',
       }}
     >
-      <div style={{ display: 'flex', alignItems: 'center', gap: 9, minWidth: 0, overflow: 'hidden', flexShrink: 1 }}>
+      <div
+        onClick={() => actions.openModal('project-edit')}
+        title="Edit project settings"
+        className="hover-border"
+        style={{ display: 'flex', alignItems: 'center', gap: 9, minWidth: 0, overflow: 'hidden', flexShrink: 1, cursor: 'pointer', padding: '4px 8px', margin: '-4px -8px', borderRadius: 8, border: '1px solid transparent' }}
+      >
         <span
           style={{
             fontFamily: 'var(--mono)',

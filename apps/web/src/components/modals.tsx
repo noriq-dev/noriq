@@ -7,6 +7,7 @@ import { Button, ErrorNote, Field, Modal, Select, TextArea, TextInput } from './
 export function ModalHost({ store }: { store: AppStore }) {
   switch (store.modal) {
     case 'project': return <CreateProjectModal store={store} />;
+    case 'project-edit': return <EditProjectModal store={store} />;
     case 'task': return <CreateTaskModal store={store} />;
     case 'group': return <CreateGroupModal store={store} />;
     case 'agent': return <NewAgentModal store={store} />;
@@ -80,6 +81,46 @@ function CreateProjectModal({ store }: { store: AppStore }) {
         <Button disabled={busy || !key.trim() || !name.trim()} onClick={run}>Create project</Button>
       </div>
       {key && <div style={{ marginTop: 12, fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>tasks will be numbered {key}-1, {key}-2, …</div>}
+    </Modal>
+  );
+}
+
+function EditProjectModal({ store }: { store: AppStore }) {
+  const project = store.data.projects.find((p) => p.id === store.currentPid);
+  const [name, setName] = useState(project?.name ?? '');
+  const [description, setDescription] = useState(project?.phase ?? '');
+  const [groupId, setGroupId] = useState(project?.groupId ?? '');
+  const { busy, error, run } = useSubmit(async () => {
+    await store.actions.submitProjectMeta({
+      name: name.trim(),
+      description: description.trim(),
+      groupId: groupId || null,
+    });
+  });
+  if (!project) return null;
+
+  return (
+    <Modal title={`Edit ${project.key}`} subtitle="project settings" onClose={store.actions.closeModal}>
+      <Field label="Name">
+        <TextInput autoFocus value={name} onChange={(e) => setName(e.target.value)} />
+      </Field>
+      <Field label="Description" hint="shown in the top bar">
+        <TextInput value={description} onChange={(e) => setDescription(e.target.value)} />
+      </Field>
+      <Field label="Group">
+        <Select value={groupId} onChange={(e) => setGroupId(e.target.value)}>
+          <option value="">— none —</option>
+          {store.groups.map((g) => (
+            <option key={g.id} value={g.id}>{g.name}</option>
+          ))}
+        </Select>
+      </Field>
+      <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
+        <Button variant="ghost" onClick={() => store.actions.openModal('group')}>+ new group</Button>
+        <div style={{ flex: 1 }} />
+        <ErrorNote>{error}</ErrorNote>
+        <Button disabled={busy || !name.trim()} onClick={run}>Save changes</Button>
+      </div>
     </Modal>
   );
 }
