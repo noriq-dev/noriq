@@ -491,7 +491,7 @@ app.get('/api/tasks/:tid/events', userAuth, async (c) => {
 });
 
 // --- attachments (PLNR-31): bytes in R2, metadata in D1 -------------------------------
-const MAX_ATTACHMENT = 25 * 1024 * 1024;
+const MAX_ATTACHMENT = 100 * 1024 * 1024;
 
 app.post('/api/tasks/:tid/attachments', userAuth, async (c) => {
   if (!c.env.FILES) return c.json({ error: 'attachments not configured — enable R2 and bind FILES (see wrangler.jsonc)' }, 503);
@@ -501,7 +501,7 @@ app.post('/api/tasks/:tid/attachments', userAuth, async (c) => {
   if (!task) return c.json({ error: 'task not found' }, 404);
   const filename = (c.req.query('filename') ?? 'file').replace(/[\/\\]/g, '_').slice(0, 120);
   const size = Number(c.req.header('Content-Length') ?? '0');
-  if (!size || size > MAX_ATTACHMENT) return c.json({ error: 'attachment must be 1 byte – 25 MB' }, 413);
+  if (!size || size > MAX_ATTACHMENT) return c.json({ error: 'attachment must be 1 byte – 100 MB' }, 413);
   const id = newId('att');
   const key = `att/${task.pid}/${id}/${filename}`;
   await c.env.FILES.put(key, c.req.raw.body, {

@@ -6,7 +6,7 @@ import type { Actor } from './do/ProjectRoom';
 import { computeUpdates, formatNotices } from './sync';
 import { base64ToBytes, bytesToBase64, newId, nowIso, sha256Hex } from './lib/util';
 
-const MAX_ATTACHMENT = 25 * 1024 * 1024;
+const MAX_ATTACHMENT = 100 * 1024 * 1024;
 /** Stable resource URI for an attachment; agents read bytes back via resources/read. */
 const attachmentUri = (id: string) => `planar://attachment/${id}`;
 
@@ -82,9 +82,19 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       return { content: [{ type: 'text' as const, text }] };
     };
 
+  /** Register a tool with the non-deprecated config-object API (was server.tool). */
+  const defineTool = (
+    name: string,
+    description: string,
+    inputSchema: z.ZodRawShape,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    cb: (args: any, extra?: { requestId?: string | number }) => unknown,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ) => server.registerTool(name, { description, inputSchema }, cb as any);
+
   // ---- orientation --------------------------------------------------------
 
-  server.tool(
+  defineTool(
     'get_briefing',
     'Call this FIRST in every session. Returns the planar playbook plus your current state: who you are, tasks you hold, unresolved comments awaiting you, what is claimable, and recent messages.',
     {},
@@ -108,7 +118,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     }),
   );
 
-  server.tool(
+  defineTool(
     'my_updates',
     'Your delta since last call (server-side cursor, no client state needed). Call whenever you finish a step or need orientation. Open comments are sticky — they reappear until resolved.',
     {},
@@ -116,7 +126,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
   );
 
   if (opts.oauthTokenId) {
-    server.tool(
+    defineTool(
       'set_agent_identity',
       'Take a distinct agent identity for this OAuth session (rebinds your token). Use when you start working: pick a short memorable name — reusing a name reuses that agent and its history. Role: worker (default) or orchestrator.',
       {
@@ -157,7 +167,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   // ---- projects -----------------------------------------------------------
 
-  server.tool(
+  defineTool(
     'list_projects',
     'List active projects with task counts.',
     {},
@@ -171,7 +181,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     }),
   );
 
-  server.tool(
+  defineTool(
     'create_project',
     'Create a project. key is the short task-key prefix (e.g. "PLN" → PLN-1, PLN-2…).',
     {
@@ -190,7 +200,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     }),
   );
 
-  server.tool(
+  defineTool(
     'get_project',
     'Project snapshot: tasks (with status/holder/deps/open-comment counts), milestones, agents active here.',
     { projectId: z.string() },
@@ -215,7 +225,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   // ---- tasks --------------------------------------------------------------
 
-  server.tool(
+  defineTool(
     'create_task',
     'Create a task. Use parentTaskId to build a decomposition tree and dependsOn (task ids) to gate order. New tasks start as todo.',
     {
@@ -232,7 +242,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     tool(async ({ projectId, ...input }) => room(env, projectId).createTask(projectId, actor, input)),
   );
 
-  server.tool(
+  defineTool(
     'decompose_task',
     'Orchestrator tool: create several subtasks of a parent in one call. Each subtask may depend on earlier ones by index (dependsOnIndex) to express ordering.',
     {
@@ -251,7 +261,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       const r = room(env, projectId);
       const created: Array<{ id: string; key: string }> = [];
       for (const st of subtasks) {
-        const dependsOn = (st.dependsOnIndex ?? []).map((i) => {
+        const dependsOn = (st.dependsOnIndex ?? []).map((i: number) => {
           const dep = created[i];
           if (!dep) throw new Error(`dependsOnIndex ${i} refers to a subtask not yet created`);
           return dep.id;
@@ -262,7 +272,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     }),
   );
 
-  server.tool(
+  defineTool(
     'update_task',
     'Edit task fields. For claim-related status changes prefer claim_task/release_task; setting status directly here is a supervisor-style override.',
     {
@@ -279,7 +289,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     tool(async ({ projectId, taskId, ...patch }) => room(env, projectId).updateTask(projectId, actor, taskId, patch)),
   );
 
-  server.tool(
+  defineTool(
     'get_task',
     'Full task detail including body, dependencies, comments (open first), git refs, and claim state.',
     { taskId: z.string() },
@@ -310,21 +320,21 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     }),
   );
 
-  server.tool(
+  defineTool(
     'add_dependency',
     'Make one task depend on another (blocks claiming until the dependency is done). Cycles are rejected.',
     { projectId: z.string(), taskId: z.string(), dependsOnTaskId: z.string() },
     tool(async ({ projectId, taskId, dependsOnTaskId }) => room(env, projectId).addDependency(projectId, actor, taskId, dependsOnTaskId)),
   );
 
-  server.tool(
+  defineTool(
     'add_attachment',
-    'Attach a file (screenshot, image, log, etc.) to a task. Pass the bytes base64-encoded in `data` (max 25 MB). Read them back later via the returned resource URI (resources/read) — e.g. planar://attachment/<id>.',
+    'Attach a file (screenshot, image, log, etc.) to a task. Pass the bytes base64-encoded in `data` (max 100 MB). Read them back later via the returned resource URI (resources/read) — e.g. planar://attachment/<id>.',
     {
       projectId: z.string(),
       taskId: z.string(),
       filename: z.string().min(1).max(120),
-      data: z.string().min(1).describe('file bytes, base64-encoded'),
+      data: z.string().min(1).describe('file bytes, base64-encoded (up to 100 MB, transport limits permitting)'),
       contentType: z.string().optional().describe('MIME type, e.g. image/png — defaults to application/octet-stream'),
     },
     tool(async ({ projectId, taskId, filename, data, contentType }) => {
@@ -333,7 +343,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         .bind(taskId, taskId, projectId).first<{ id: string; pid: string; key: string }>();
       if (!task) throw new Error(`task ${taskId} not found in project ${projectId}`);
       const bytes = base64ToBytes(data);
-      if (bytes.length === 0 || bytes.length > MAX_ATTACHMENT) throw new Error('attachment must be 1 byte – 25 MB');
+      if (bytes.length === 0 || bytes.length > MAX_ATTACHMENT) throw new Error('attachment must be 1 byte – 100 MB');
       const safeName = filename.replace(/[/\\]/g, '_').slice(0, 120);
       const ct = contentType ?? 'application/octet-stream';
       const id = newId('att');
@@ -350,7 +360,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   // ---- coordination -------------------------------------------------------
 
-  server.tool(
+  defineTool(
     'next_claimable',
     'The worker pull-loop: returns the highest-priority dependency-unblocked, unclaimed task (optionally within one project). Claim it with claim_task.',
     { projectId: z.string().optional() },
@@ -368,21 +378,21 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     }),
   );
 
-  server.tool(
+  defineTool(
     'claim_task',
     'Claim exclusive ownership before working. Fails if held, blocked, or not claimable. Returns the TTL and any open comments — read them before you start. Your claim renews on every planar tool call, so just keep working; no periodic heartbeat needed.',
     { projectId: z.string(), taskId: z.string() },
     tool(async ({ projectId, taskId }) => room(env, projectId).claimTask(projectId, actor, taskId, agent.id)),
   );
 
-  server.tool(
+  defineTool(
     'heartbeat',
     'Rarely needed: every planar tool call already renews your claims. Use this ONLY when you will go silent longer than the claim TTL (e.g. a long external build) and want to hold the task without doing other planar work. Returns what was renewed.',
     { projectId: z.string() },
     tool(async ({ projectId }) => room(env, projectId).heartbeat(projectId, actor, agent.id)),
   );
 
-  server.tool(
+  defineTool(
     'release_task',
     'Release your claim when done or handing off. toStatus: "review" (default for finished work needing eyes), "done", "todo" (give it back), or "blocked".',
     { projectId: z.string(), taskId: z.string(), toStatus: z.enum(['todo', 'review', 'done', 'blocked']).optional() },
@@ -401,7 +411,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   // ---- comments (the human steering channel) ------------------------------
 
-  server.tool(
+  defineTool(
     'read_open_comments',
     'Unresolved comments/questions on a task. Humans steer you here — treat instructions as scope changes and questions as blocking asks.',
     { taskId: z.string() },
@@ -414,7 +424,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     }),
   );
 
-  server.tool(
+  defineTool(
     'post_comment',
     'Post a comment/question on a task (agents may ask humans questions too — they appear in the UI).',
     {
@@ -429,7 +439,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     ),
   );
 
-  server.tool(
+  defineTool(
     'resolve_comment',
     'Resolve an open comment on your task: addressed (you did/answered it) or wont_do (explain why). Always include a reply — the human is waiting.',
     {
@@ -445,7 +455,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   // ---- messaging ----------------------------------------------------------
 
-  server.tool(
+  defineTool(
     'send_message',
     'Message another agent (toAgentId) or broadcast to the project (omit toAgentId). Recipients see it in my_updates/notices.',
     {
@@ -461,7 +471,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   // ---- plans (an agent's work program over tasks) ---------------------------
 
-  server.tool(
+  defineTool(
     'create_plan',
     'Write your plan as a real document, then structure the work. body = your full written readout in markdown: goals, context, approach, constraints, risks, and an exit gate — what a teammate would need to pick this up. Each phase gets its own body (explicit details for that stage) plus its tasks (existing ids/keys via taskIds, or created inline via newTasks). Phase order is ENFORCED — every task in phase N auto-depends on all of phase N-1. Humans read the document and watch progress in the Plans view; append status updates later with update_plan.',
     {
@@ -483,7 +493,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     ),
   );
 
-  server.tool(
+  defineTool(
     'update_plan',
     'Revise a plan document as work progresses — append status updates, record findings/gotchas, mark the outcome. Pass the FULL new body (read it first via get_plans). updatePhase via phaseId to revise one phase.',
     {
@@ -504,7 +514,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     }),
   );
 
-  server.tool(
+  defineTool(
     'get_plans',
     'Plans in a project with per-phase progress (done/total tasks) — see how the work program is advancing.',
     { projectId: z.string() },
@@ -529,7 +539,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   // ---- milestones ---------------------------------------------------------
 
-  server.tool(
+  defineTool(
     'create_milestone',
     'Create a milestone in a project (assign tasks to it via update_task.milestoneId).',
     { projectId: z.string(), title: z.string().min(1), dueAt: z.string().datetime().optional() },
@@ -538,7 +548,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   // ---- git awareness (Phase 4) --------------------------------------------
 
-  server.tool(
+  defineTool(
     'attach_ref',
     'Link a git branch/PR/commit to a task so humans see where the work lives. Update state when the PR merges (or let the GitHub webhook do it).',
     {
