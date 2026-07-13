@@ -113,6 +113,21 @@ describe('coordination core', () => {
     expect(rel.body.status).toBe('review');
   });
 
+  it('release_task can record closing thoughts in the same call', async () => {
+    const t = (await mcpCall(orch.apiKey, 'create_task', { projectId, title: 'note on release' })).body;
+    await mcpCall(nova.apiKey, 'claim_task', { projectId, taskId: t.id });
+    const rel = await mcpCall(nova.apiKey, 'release_task', {
+      projectId, taskId: t.id, toStatus: 'done', comment: 'shipped; watch the retry path under load',
+    });
+    expect(rel.isError).toBe(false);
+    expect(rel.body.status).toBe('done');
+    expect(rel.body.commentId).toBeTruthy();
+    // The note is recorded as already-resolved (didn't block `done`, doesn't reopen).
+    const detail = await mcpCall(orch.apiKey, 'get_task', { taskId: t.id });
+    const note = detail.body.comments.find((c: { body: string }) => c.body.includes('watch the retry path'));
+    expect(note.status).toBe('addressed');
+  });
+
   it('decompose_task builds an ordered subtree', async () => {
     const parent = (await mcpCall(orch.apiKey, 'create_task', { projectId, title: 'Epic' })).body;
     const dec = await mcpCall(orch.apiKey, 'decompose_task', {

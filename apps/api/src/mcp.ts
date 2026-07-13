@@ -422,9 +422,14 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'release_task',
-    'Release your claim when done or handing off. toStatus: "review" (default for finished work needing eyes), "done", "todo" (give it back), or "blocked".',
-    { projectId: z.string(), taskId: z.string(), toStatus: z.enum(['todo', 'review', 'done', 'blocked']).optional() },
-    tool(async ({ projectId, taskId, toStatus }) => {
+    'Release your claim when done or handing off. toStatus: "review" (default for finished work needing eyes), "done", "todo" (give it back), or "blocked". Optional comment: your closing thoughts / handoff notes, recorded on the task in one call (no separate post_comment needed).',
+    {
+      projectId: z.string(),
+      taskId: z.string(),
+      toStatus: z.enum(['todo', 'review', 'done', 'blocked']).optional(),
+      comment: z.string().optional().describe('Closing thoughts / handoff notes to record on the task'),
+    },
+    tool(async ({ projectId, taskId, toStatus, comment }) => {
       if (toStatus === 'done') {
         const open = await env.DB.prepare(
           "SELECT COUNT(*) AS n FROM comments WHERE task_id = ? AND status IN ('open','acknowledged')",
@@ -433,7 +438,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           throw new Error(`task has ${open.n} unresolved comment(s) — resolve them (resolve_comment) before marking done`);
         }
       }
-      return room(env, projectId).releaseTask(projectId, actor, taskId, { toStatus });
+      return room(env, projectId).releaseTask(projectId, actor, taskId, { toStatus, comment });
     }),
   );
 

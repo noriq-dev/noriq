@@ -398,7 +398,7 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
-  async releaseTask(projectId: string, actor: Actor, taskId: string, opts: { toStatus?: string } = {})  {
+  async releaseTask(projectId: string, actor: Actor, taskId: string, opts: { toStatus?: string; comment?: string } = {})  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const task = await this.getTask(taskId);
@@ -413,8 +413,22 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.emit(actor, 'task.released', 'task', taskId, {
         key: task.key, title: task.title, by: actor.id, previousHolder: task.claimed_by, toStatus,
       });
-      return { ok: true, key: task.key, status: toStatus };
-    
+      // Optional closing note from the agent. Recorded as already-resolved so it reads as
+      // a handoff remark, not an unresolved question (and never blocks a later `done`).
+      let commentId: string | null = null;
+      const note = opts.comment?.trim();
+      if (note) {
+        commentId = newId('cmt');
+        await this.env.DB.prepare(
+          `INSERT INTO comments (id, task_id, author_kind, author_id, kind, body, status, created_at)
+           VALUES (?, ?, ?, ?, 'comment', ?, 'addressed', ?)`,
+        ).bind(commentId, taskId, actor.kind, actor.id, note, nowIso()).run();
+        await this.emit(actor, 'comment.posted', 'comment', commentId, {
+          taskId, taskKey: task.key, kind: 'comment', body: note.slice(0, 140), holder: null,
+        });
+      }
+      return { ok: true, key: task.key, status: toStatus, commentId };
+
     });
   }
 
