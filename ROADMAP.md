@@ -34,7 +34,7 @@ task **picks those up and acts on them** — steering work without stopping it.
 | Human front-end | Web app (SPA) |
 | Coordination scope | Full: task claiming/locks, orchestrator+workers, shared context, messaging |
 | Tenancy | Single-tenant self-host (each user deploys their own instance) |
-| Agent auth | OAuth 2.1 (authorization code + PKCE, DCR, refresh rotation) — tokens map to agent identities; scoped API keys remain for headless/CI |
+| Agent auth | OAuth 2.1 only (authorization code + PKCE, DCR, refresh rotation) — tokens map to agent identities via set_agent_identity; no static API keys |
 | Human auth | Minimal user accounts (email/passkey + sessions, admin role) |
 | SPA framework | React |
 | MCP transport | Streamable HTTP (latest MCP spec) |

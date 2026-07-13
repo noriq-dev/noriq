@@ -85,7 +85,7 @@ npm run deploy                       # creates your domain's record + cert autom
 
 Shipped: the MCP coordination server (claim arbiter with TTL/heartbeat/alarm-requeue,
 dependency gating, comment lifecycle, get_briefing/my_updates with server-side cursor,
-notices piggyback), agent API keys + human sessions, the live SPA (login, REST snapshots,
+notices piggyback), OAuth 2.1 agent auth + human sessions, the live SPA (login, REST snapshots,
 WS invalidation, human actions incl. force-release and comment resolution), GitHub
 webhook PR-state reflection, and /skill.md. 18 workerd tests cover the coordination
 scenario end-to-end through the real MCP endpoint.

@@ -81,7 +81,7 @@ export function Setup({ store }: { store: AppStore }) {
         </div>
         <div style={{ fontSize: 12.5, color: 'var(--text-mid)', lineHeight: 1.6, marginBottom: 20 }}>
           This instance isn't configured yet. Create the founding <b style={{ color: 'var(--text)' }}>admin account</b> —
-          you'll use it to sign in, issue agent keys, and supervise projects.
+          you'll use it to sign in, invite teammates, and supervise projects.
         </div>
         <Field label="Your name">
           <TextInput autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Montana" />
@@ -105,7 +105,7 @@ export function Setup({ store }: { store: AppStore }) {
           {busy ? 'setting up…' : 'Create account & enter'}
         </Button>
         <div style={{ marginTop: 14, fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)', lineHeight: 1.7 }}>
-          next: issue an agent key from the Agents tab, then connect Claude Code to /mcp.
+          next: connect Claude Code to /mcp (OAuth — no keys); the connect card on the homepage has the exact command.
         </div>
       </div>
     </div>
