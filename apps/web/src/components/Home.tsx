@@ -153,36 +153,54 @@ const CLIENTS: Array<{ id: ClientId; label: string }> = [
   { id: 'copilot', label: 'Copilot' },
 ];
 
-function clientSnippet(id: ClientId): { intro: string; code: string } {
+type Scope = 'project' | 'global';
+
+function clientSnippet(id: ClientId, scope: Scope): { intro: string; code: string } {
   const url = `${location.origin}/mcp`;
-  switch (id) {
-    case 'claude':
-      return {
-        intro: 'Connects via OAuth — approve in the browser and name the agent identity:',
-        code: `claude mcp add --transport http planar ${url}`,
-      };
-    case 'codex':
-      return {
-        intro: 'Add to ~/.codex/config.toml (OAuth prompt on first use):',
-        code: `[mcp_servers.planar]
-url = "${url}"`,
-      };
-    case 'copilot':
-      return {
-        intro: 'VS Code: add to .vscode/mcp.json (or via MCP: Add Server):',
-        code: `{
+  const codexToml = `[mcp_servers.planar]
+url = "${url}"`;
+  const vscodeJson = `{
   "servers": {
     "planar": { "type": "http", "url": "${url}" }
   }
-}`,
+}`;
+  switch (id) {
+    case 'claude':
+      return scope === 'global'
+        ? {
+            intro: 'All your projects (user scope) — OAuth consent in the browser names the agent identity:',
+            code: `claude mcp add -s user --transport http planar ${url}`,
+          }
+        : {
+            intro: 'This project only (local scope) — run inside the repo:',
+            code: `claude mcp add --transport http planar ${url}`,
+          };
+    case 'codex':
+      return {
+        intro:
+          scope === 'global'
+            ? 'Add to ~/.codex/config.toml (OAuth prompt on first use):'
+            : 'Codex reads its config globally — add to ~/.codex/config.toml and tell the agent which planar project to work:',
+        code: codexToml,
       };
+    case 'copilot':
+      return scope === 'global'
+        ? {
+            intro: 'VS Code (all workspaces): Command Palette → “MCP: Add Server” → HTTP → Global. Or user-profile mcp.json:',
+            code: vscodeJson,
+          }
+        : {
+            intro: 'This workspace only — add to .vscode/mcp.json:',
+            code: vscodeJson,
+          };
   }
 }
 
 function ConnectCard() {
   const [copied, setCopied] = useState(false);
   const [client, setClient] = useState<ClientId>('claude');
-  const { intro, code } = clientSnippet(client);
+  const [scope, setScope] = useState<Scope>('global');
+  const { intro, code } = clientSnippet(client, scope);
   const copy = async () => {
     await navigator.clipboard.writeText(code);
     setCopied(true);
@@ -209,7 +227,22 @@ function ConnectCard() {
           ))}
         </div>
       </div>
-      <div style={{ fontSize: 12, color: 'var(--text-mid)', lineHeight: 1.6, margin: '10px 0 12px' }}>{intro}</div>
+      <div style={{ display: 'flex', gap: 2, margin: '10px 0 0', width: 'fit-content', background: 'rgba(255,255,255,.04)', border: '1px solid rgba(255,255,255,.07)', borderRadius: 7, padding: 2 }}>
+        {(['global', 'project'] as const).map((sc) => (
+          <button
+            key={sc}
+            onClick={() => setScope(sc)}
+            style={{
+              cursor: 'pointer', padding: '2px 9px', borderRadius: 5, fontFamily: 'var(--mono)', fontSize: 9.5,
+              background: scope === sc ? 'rgba(255,255,255,.1)' : 'transparent',
+              color: scope === sc ? 'var(--text)' : 'var(--text-faint)',
+            }}
+          >
+            {sc}
+          </button>
+        ))}
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--text-mid)', lineHeight: 1.6, margin: '8px 0 12px' }}>{intro}</div>
       <pre
         onClick={copy}
         title="click to copy"
