@@ -95,9 +95,9 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
   // Recent direct/broadcast messages (last 10, regardless of cursor, for context).
   const messages = (
     await env.DB.prepare(
-      `SELECT m.id, a.name AS "from", m.body, m.ref_task_id AS refTaskId, m.created_at AS createdAt
-       FROM messages m JOIN agents a ON a.id = m.from_agent_id
-       WHERE (m.to_agent_id = ? OR m.to_agent_id IS NULL) AND m.from_agent_id != ?
+      `SELECT m.id, m.from_name AS "from", m.body, m.ref_task_id AS refTaskId, m.created_at AS createdAt
+       FROM messages m
+       WHERE (m.to_agent_id = ? OR m.to_agent_id IS NULL) AND m.from_id != ?
        ORDER BY m.created_at DESC LIMIT 10`,
     ).bind(agent.id, agent.id).all<AgentUpdates['messages'][number]>()
   ).results;

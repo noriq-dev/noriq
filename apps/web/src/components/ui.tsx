@@ -19,10 +19,13 @@ export function Modal({ title, subtitle, onClose, children, width = 420 }: {
       <div onClick={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.55)', zIndex: 50, backdropFilter: 'blur(2px)' }} />
       <div
         style={{
-          position: 'fixed',
-          top: '50%',
-          left: '50%',
-          transform: 'translate(-50%,-50%)',
+          position: 'fixed', inset: 0, zIndex: 51,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          pointerEvents: 'none',
+        }}
+      >
+      <div
+        style={{
           width,
           maxWidth: 'calc(100vw - 40px)',
           maxHeight: 'calc(100vh - 80px)',
@@ -30,10 +33,10 @@ export function Modal({ title, subtitle, onClose, children, width = 420 }: {
           background: 'var(--bg-raised)',
           border: '1px solid rgba(255,255,255,.12)',
           borderRadius: 16,
-          zIndex: 51,
           padding: 24,
           boxShadow: '0 30px 80px rgba(0,0,0,.6)',
           animation: 'pl-stream .25s ease both',
+          pointerEvents: 'auto',
         }}
       >
         <div style={{ display: 'flex', alignItems: 'flex-start', marginBottom: 18 }}>
@@ -51,6 +54,7 @@ export function Modal({ title, subtitle, onClose, children, width = 420 }: {
           </button>
         </div>
         {children}
+      </div>
       </div>
     </>
   );

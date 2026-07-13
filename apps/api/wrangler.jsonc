@@ -1,3 +1,7 @@
+// Generic config — deploys to <name>.workers.dev out of the box and drives local
+// dev + tests. For a real instance (custom domain, email, attachments), copy
+// wrangler.production.jsonc.example to wrangler.production.jsonc (gitignored)
+// and fill in your values; npm run deploy prefers it automatically.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "planar",
@@ -5,18 +9,6 @@
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat"],
 
-  // Production domain — requires the frs.llc zone on the same Cloudflare
-  // account. Wrangler creates the DNS record + cert automatically on deploy.
-  "routes": [
-    {
-      "pattern": "plan.frs.llc",
-      "custom_domain": true
-    }
-  ],
-
-  // React SPA (apps/web) built into this Worker as static assets.
-  // `run_worker_first` keeps /api, /mcp and /ws on the Worker; everything
-  // else falls through to the SPA with client-side routing.
   "assets": {
     "directory": "../web/dist",
     "binding": "ASSETS",
@@ -30,31 +22,19 @@
       { "name": "AGENT_SESSION", "class_name": "AgentSession" }
     ]
   },
-  "migrations": [
-    {
-      "tag": "v1",
-      "new_sqlite_classes": ["ProjectRoom", "AgentSession"]
-    }
-  ],
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ProjectRoom", "AgentSession"] }],
 
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "planar",
-      "database_id": "60978d16-e01e-48a8-b5da-20f2c350abcb",
+      "database_id": "00000000-0000-0000-0000-000000000000", // replace via wrangler d1 create planar
       "migrations_dir": "migrations"
     }
   ],
 
-  // Transactional email (invites). OPTIONAL: self-hosters without an onboarded
-  // sending domain can delete this block + EMAIL_FROM — invites fall back to
-  // copyable links. Enable with: npx wrangler email sending enable <domain>
-  "send_email": [{ "name": "EMAIL" }],
-  "vars": {
-    "EMAIL_FROM": "planar@frs.llc"
-  },
+  // Email invites + attachments are configured in wrangler.production.jsonc
+  // (see the .example) — both optional, planar degrades gracefully without them.
 
-  "observability": {
-    "enabled": true
-  }
+  "observability": { "enabled": true }
 }

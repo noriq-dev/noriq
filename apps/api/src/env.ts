@@ -14,4 +14,6 @@ export interface Env {
   EMAIL?: { send(msg: { to: string; from: { email: string; name?: string }; subject: string; text: string; html?: string }): Promise<unknown> };
   /** From-address for transactional email (must be on an onboarded sending domain). */
   EMAIL_FROM?: string;
+  /** Task attachments — optional; endpoints 503 until R2 is enabled + bound. */
+  FILES?: R2Bucket;
 }

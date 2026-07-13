@@ -81,7 +81,7 @@ export function AgentsView({ store }: { store: AppStore }) {
                       {revoked && <MonoTag color="var(--red-soft)" bg="rgba(255,92,92,.12)" size={9}>REVOKED</MonoTag>}
                     </div>
                     <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', marginTop: 2 }}>
-                      last seen {ago(a.lastSeenAt)} · {a.totalClaims} claims lifetime
+                      {a.ownerName ? `delegated by ${a.ownerName} · ` : 'unowned (static key) · '}last seen {ago(a.lastSeenAt)} · {a.totalClaims} claims lifetime
                     </div>
                   </div>
                   {a.heldTasks > 0 && (

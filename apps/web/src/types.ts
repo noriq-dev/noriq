@@ -32,6 +32,7 @@ export interface AgentVM {
   role: 'orch' | 'worker';
   color: string;
   lastSeenAt: string | null;
+  ownerName: string | null;
 }
 
 export interface CommentVM {
@@ -55,7 +56,8 @@ export interface TaskVM {
   ttlMax?: number;
   deps: string[];
   milestoneId: string | null;
-  categoryId: string | null;
+  tagIds: string[];
+  type: string;
   openComments: number;
   comments: CommentVM[]; // populated for the selected task
 }

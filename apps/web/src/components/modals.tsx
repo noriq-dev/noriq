@@ -1,7 +1,8 @@
 // Modal host + the create dialogs (projects, tasks, groups, agents).
 import { useState } from 'react';
 import type { AppStore } from '../store';
-import { api } from '../api';
+import { api, type ApiUser } from '../api';
+import { useEffect } from 'react';
 import { Button, ErrorNote, Field, Modal, Select, TextArea, TextInput } from './ui';
 
 export function ModalHost({ store }: { store: AppStore }) {
@@ -74,6 +75,11 @@ function CreateProjectModal({ store }: { store: AppStore }) {
           ))}
         </Select>
       </Field>
+      {!groupId && (
+        <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--amber)', background: 'rgba(245,166,35,.07)', border: '1px solid rgba(245,166,35,.25)', borderRadius: 8, padding: '7px 10px', marginBottom: 12 }}>
+          ⚠ no group — only you (and admins) will see this project
+        </div>
+      )}
       <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
         <Button variant="ghost" onClick={() => store.actions.openModal('group')}>+ new group</Button>
         <div style={{ flex: 1 }} />
@@ -91,12 +97,19 @@ function EditProjectModal({ store }: { store: AppStore }) {
   const [description, setDescription] = useState(project?.phase ?? '');
   const [groupId, setGroupId] = useState(project?.groupId ?? '');
   const [ttlMin, setTtlMin] = useState(String(Math.round((store.snapshot?.project.claimTtlSeconds ?? 1800) / 60)));
+  const [users, setUsers] = useState<ApiUser[]>([]);
+  const [ownerId, setOwnerId] = useState<string>('');
+  const isAdmin = store.user?.role === 'admin';
+  useEffect(() => {
+    if (isAdmin) api.users().then((r) => setUsers(r.users)).catch(() => {});
+  }, [isAdmin]);
   const { busy, error, run } = useSubmit(async () => {
     await store.actions.submitProjectMeta({
       name: name.trim(),
       description: description.trim(),
       groupId: groupId || null,
       claimTtlSeconds: Math.max(1, Number(ttlMin) || 30) * 60,
+      ...(isAdmin && ownerId ? { ownerUserId: ownerId } : {}),
     });
   });
   if (!project) return null;
@@ -122,6 +135,21 @@ function EditProjectModal({ store }: { store: AppStore }) {
           <TextInput type="number" min={1} max={1440} value={ttlMin} onChange={(e) => setTtlMin(e.target.value)} />
         </Field>
       </div>
+      {!groupId && (
+        <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--amber)', background: 'rgba(245,166,35,.07)', border: '1px solid rgba(245,166,35,.25)', borderRadius: 8, padding: '7px 10px', marginBottom: 12 }}>
+          ⚠ no group — only the owner (and admins) can see this project
+        </div>
+      )}
+      {isAdmin && (
+        <Field label="Owner" hint="ungrouped projects are visible only to their owner">
+          <Select value={ownerId} onChange={(e) => setOwnerId(e.target.value)}>
+            <option value="">— keep current —</option>
+            {users.map((u) => (
+              <option key={u.id} value={u.id}>{u.name} ({u.email})</option>
+            ))}
+          </Select>
+        </Field>
+      )}
       <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
         <Button variant="ghost" onClick={() => store.actions.openModal('group')}>+ new group</Button>
         <div style={{ flex: 1 }} />
@@ -137,16 +165,18 @@ function CreateTaskModal({ store }: { store: AppStore }) {
   const [body, setBody] = useState('');
   const [priority, setPriority] = useState(2);
   const [milestoneId, setMilestoneId] = useState('');
-  const [category, setCategory] = useState('');
+  const [tagsInput, setTagsInput] = useState('');
+  const [taskType, setTaskType] = useState('feature');
   const milestones = store.snapshot?.milestones ?? [];
-  const categories = store.snapshot?.categories ?? [];
+  const tags = store.snapshot?.tags ?? [];
   const { busy, error, run } = useSubmit(async () => {
     await store.actions.submitTask({
       title: title.trim(),
       body: body.trim() || undefined,
       priority,
       milestoneId: milestoneId || undefined,
-      category: category.trim() || undefined,
+      tags: tagsInput.split(',').map((t) => t.trim()).filter(Boolean),
+      type: taskType,
     });
   });
 
@@ -177,19 +207,29 @@ function CreateTaskModal({ store }: { store: AppStore }) {
           </Select>
         </Field>
       </div>
-      <Field label="Category" hint="pick one or type a new name to create it">
-        <TextInput
-          list="planar-categories"
-          value={category}
-          onChange={(e) => setCategory(e.target.value)}
-          placeholder={categories.length ? categories.map((c) => c.name).slice(0, 3).join(' / ') + ' / …' : 'backend, docs, infra…'}
-        />
-        <datalist id="planar-categories">
-          {categories.map((c) => (
-            <option key={c.id} value={c.name} />
-          ))}
-        </datalist>
-      </Field>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+        <Field label="Type">
+          <Select value={taskType} onChange={(e) => setTaskType(e.target.value)}>
+            <option value="feature">feature</option>
+            <option value="bug">bug</option>
+            <option value="chore">chore</option>
+            <option value="research">research</option>
+          </Select>
+        </Field>
+        <Field label="Tags" hint="comma-separated; new names are created">
+          <TextInput
+            list="planar-tags"
+            value={tagsInput}
+            onChange={(e) => setTagsInput(e.target.value)}
+            placeholder={tags.length ? tags.map((c) => c.name).slice(0, 3).join(', ') + ', …' : 'backend, auth, …'}
+          />
+          <datalist id="planar-tags">
+            {tags.map((c) => (
+              <option key={c.id} value={c.name} />
+            ))}
+          </datalist>
+        </Field>
+      </div>
       <div style={{ display: 'flex', gap: 8, marginTop: 6, alignItems: 'center' }}>
         <Button variant="ghost" onClick={() => store.actions.openModal('milestone')}>+ new milestone</Button>
         <ErrorNote>{error}</ErrorNote>

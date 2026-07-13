@@ -120,8 +120,9 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           throw new Error(`agent name "${name}" is owned by another user — pick a different name`);
         }
         if (target && target.status === 'revoked') {
-          // Reactivate: the name's history is preserved, ownership transfers to this user.
-          await env.DB.prepare("UPDATE agents SET status = 'idle', user_id = ? WHERE id = ?").bind(token.userId, target.id).run();
+          // Retired for good: resurrecting a revoked name would let new work
+          // inherit old cross-project attribution (PLNR-47).
+          throw new Error(`agent name "${name}" was revoked and is retired — pick a new name`);
         }
         if (!target) {
           const agentId = newId('agt');
@@ -183,18 +184,19 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     tool(async ({ projectId }) => {
       const [tasks, milestones, project, categories] = await Promise.all([
         env.DB.prepare(
-          `SELECT t.id, t.key, t.title, t.status, t.priority, t.claimed_by AS claimedBy, t.parent_task_id AS parentTaskId,
-                  t.milestone_id AS milestoneId, t.category_id AS categoryId, t.open_comments AS openComments, t.claim_expires_at AS claimExpiresAt,
-                  (SELECT GROUP_CONCAT(dt.key) FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id WHERE d.task_id = t.id) AS dependsOn
+          `SELECT t.id, t.key, t.title, t.status, t.type, t.priority, t.claimed_by AS claimedBy, t.parent_task_id AS parentTaskId,
+                  t.milestone_id AS milestoneId, t.open_comments AS openComments, t.claim_expires_at AS claimExpiresAt,
+                  (SELECT GROUP_CONCAT(dt.key) FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id WHERE d.task_id = t.id) AS dependsOn,
+                  (SELECT GROUP_CONCAT(g.name) FROM task_tags tt JOIN tags g ON g.id = tt.tag_id WHERE tt.task_id = t.id) AS tags
            FROM tasks t WHERE t.project_id = ? ORDER BY t."order"`,
         ).bind(projectId).all(),
         env.DB.prepare('SELECT id, title, due_at AS dueAt FROM milestones WHERE project_id = ? ORDER BY "order"').bind(projectId).all(),
         env.DB.prepare('SELECT id, key, name, description, repo_url AS repoUrl, claim_ttl_seconds AS claimTtlSeconds FROM projects WHERE id = ?')
           .bind(projectId).first(),
-        env.DB.prepare('SELECT id, name, color FROM categories WHERE project_id = ? ORDER BY "order"').bind(projectId).all(),
+        env.DB.prepare('SELECT id, name, color FROM tags WHERE project_id = ? ORDER BY "order"').bind(projectId).all(),
       ]);
       if (!project) throw new Error(`project ${projectId} not found`);
-      return { project, milestones: milestones.results, categories: categories.results, tasks: tasks.results };
+      return { project, milestones: milestones.results, tags: categories.results, tasks: tasks.results };
     }),
   );
 
@@ -211,7 +213,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       milestoneId: z.string().optional(),
       priority: z.number().int().min(0).max(4).optional(),
       dependsOn: z.array(z.string()).optional(),
-      category: z.string().optional().describe('Category name — auto-created for the project if new (e.g. "backend", "docs", "infra")'),
+      tags: z.array(z.string()).optional().describe('Tag names — auto-created for the project if new (e.g. ["backend", "auth"])'),
+      type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
     },
     tool(async ({ projectId, ...input }) => room(env, projectId).createTask(projectId, actor, input)),
   );
@@ -257,7 +260,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       status: z.enum(['todo', 'in_progress', 'blocked', 'review', 'done', 'cancelled']).optional(),
       priority: z.number().int().min(0).max(4).optional(),
       milestoneId: z.string().optional(),
-      category: z.string().optional().describe('Category name — auto-created if new; empty string clears'),
+      tags: z.array(z.string()).optional().describe('REPLACES the tag set (auto-created; [] clears)'),
+      type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
     },
     tool(async ({ projectId, taskId, ...patch }) => room(env, projectId).updateTask(projectId, actor, taskId, patch)),
   );
@@ -401,7 +405,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       refTaskId: z.string().optional(),
     },
     tool(async ({ projectId, body, toAgentId, refTaskId }) =>
-      room(env, projectId).sendMessage(projectId, actor, agent.id, body, toAgentId, refTaskId),
+      room(env, projectId).sendMessage(projectId, actor, body, toAgentId, refTaskId),
     ),
   );
 

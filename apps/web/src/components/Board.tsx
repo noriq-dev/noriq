@@ -1,4 +1,4 @@
-// Board — kanban with milestone/category filters and breathing room.
+// Board — kanban with a two-row filter bar (milestones / tags) and breathing room.
 import { useState } from 'react';
 import type { AppStore } from '../store';
 import type { TaskStatus } from '../types';
@@ -12,38 +12,37 @@ const COLUMNS: Array<[TaskStatus, string]> = [
   ['done', 'Done'],
 ];
 
+const TYPE_ICON: Record<string, string> = { bug: '✕', chore: '⟳', research: '?', feature: '' };
+
 export function Board({ store }: { store: AppStore }) {
   const { currentPid, helpers, actions, draggedId, snapshot } = store;
   const tasks = helpers.tasksOf(currentPid);
   const milestones = snapshot?.milestones ?? [];
-  const categories = snapshot?.categories ?? [];
+  const tags = snapshot?.tags ?? [];
   const [msFilter, setMsFilter] = useState<string | null>(null);
-  const [catFilter, setCatFilter] = useState<string | null>(null);
-  const catById = new Map(categories.map((c) => [c.id, c]));
+  const [tagFilter, setTagFilter] = useState<string | null>(null);
+  const tagById = new Map(tags.map((c) => [c.id, c]));
   const msById = new Map(milestones.map((m) => [m.id, m]));
 
   const visible = tasks.filter(
-    (t) => (msFilter === null || t.milestoneId === msFilter) && (catFilter === null || t.categoryId === catFilter),
+    (t) => (msFilter === null || t.milestoneId === msFilter) && (tagFilter === null || t.tagIds.includes(tagFilter)),
   );
 
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-      {/* filter bar */}
+      {/* filter bar — row 1: milestones */}
       <div
         style={{
-          flex: 'none',
-          display: 'flex',
-          alignItems: 'center',
-          gap: 8,
-          padding: '12px 22px 10px',
-          overflowX: 'auto',
-          borderBottom: '1px solid rgba(255,255,255,.05)',
+          flex: 'none', display: 'flex', alignItems: 'center', gap: 8,
+          padding: '12px 22px 8px', overflowX: 'auto',
         }}
       >
         <FilterChip label="All" active={msFilter === null} onClick={() => setMsFilter(null)} />
         {milestones.map((m) => {
           const total = tasks.filter((t) => t.milestoneId === m.id).length;
           const done = tasks.filter((t) => t.milestoneId === m.id && t.status === 'done').length;
+          // Completed milestones stay out of the way unless actively selected.
+          if (total > 0 && done === total && msFilter !== m.id) return null;
           return (
             <FilterChip
               key={m.id}
@@ -58,12 +57,12 @@ export function Board({ store }: { store: AppStore }) {
         <button
           onClick={() => actions.openModal('milestone')}
           title="New milestone"
+          className="rail-add"
           style={{
             cursor: 'pointer', flex: 'none', fontFamily: 'var(--mono)', fontSize: 10.5,
             color: 'var(--text-dim)', border: '1px dashed rgba(255,255,255,.15)',
             padding: '4px 10px', borderRadius: 8, background: 'transparent',
           }}
-          className="rail-add"
         >
           + milestone
         </button>
@@ -83,17 +82,32 @@ export function Board({ store }: { store: AppStore }) {
             ✎ edit
           </button>
         )}
-        {categories.length > 0 && <span style={{ width: 1, height: 18, background: 'rgba(255,255,255,.1)', flex: 'none', margin: '0 4px' }} />}
-        {categories.map((c) => (
-          <FilterChip
-            key={c.id}
-            label={c.name}
-            dot={c.color}
-            active={catFilter === c.id}
-            onClick={() => setCatFilter(catFilter === c.id ? null : c.id)}
-          />
-        ))}
       </div>
+
+      {/* filter bar — row 2: tags */}
+      {tags.length > 0 && (
+        <div
+          style={{
+            flex: 'none', display: 'flex', alignItems: 'center', gap: 6,
+            padding: '0 22px 10px', overflowX: 'auto',
+            borderBottom: '1px solid rgba(255,255,255,.05)',
+          }}
+        >
+          <span style={{ fontFamily: 'var(--mono)', fontSize: 9, letterSpacing: '.07em', textTransform: 'uppercase', color: 'var(--text-faint)', flex: 'none', marginRight: 2 }}>
+            tags
+          </span>
+          {tags.map((c) => (
+            <FilterChip
+              key={c.id}
+              label={c.name}
+              dot={c.color}
+              small
+              active={tagFilter === c.id}
+              onClick={() => setTagFilter(tagFilter === c.id ? null : c.id)}
+            />
+          ))}
+        </div>
+      )}
 
       {/* columns */}
       <div style={{ flex: 1, minHeight: 0, overflowX: 'auto', overflowY: 'hidden', padding: '16px 22px 18px' }}>
@@ -125,9 +139,10 @@ export function Board({ store }: { store: AppStore }) {
                     const ag = t.claimedBy ? helpers.agentById(currentPid, t.claimedBy) : null;
                     const eff = helpers.effStatus(currentPid, t);
                     const blocked = eff === 'blocked';
-                    const cat = t.categoryId ? catById.get(t.categoryId) : null;
+                    const taskTags = t.tagIds.map((id) => tagById.get(id)).filter(Boolean) as Array<{ id: string; name: string; color: string }>;
                     const ms = t.milestoneId ? msById.get(t.milestoneId) : null;
                     const depKey = t.deps.map((d) => tasks.find((x) => x.id === d)?.key ?? '')[0] ?? '';
+                    const typeIcon = TYPE_ICON[t.type] ?? '';
                     return (
                       <div
                         key={t.id}
@@ -142,7 +157,7 @@ export function Board({ store }: { store: AppStore }) {
                         style={{
                           background: 'var(--card)',
                           border: '1px solid rgba(255,255,255,.06)',
-                          borderLeft: `3px solid ${cat ? cat.color : 'rgba(255,255,255,.08)'}`,
+                          borderLeft: `3px solid ${taskTags[0]?.color ?? 'rgba(255,255,255,.08)'}`,
                           borderRadius: 10,
                           padding: '12px 13px',
                           cursor: 'grab',
@@ -151,8 +166,10 @@ export function Board({ store }: { store: AppStore }) {
                       >
                         <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 7 }}>
                           <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: statusMeta(eff).color }}>{t.key}</span>
-                          {cat && (
-                            <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: cat.color, opacity: 0.9 }}>{cat.name}</span>
+                          {typeIcon && (
+                            <span title={t.type} style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: t.type === 'bug' ? 'var(--red-soft)' : 'var(--text-dim)' }}>
+                              {typeIcon} {t.type}
+                            </span>
                           )}
                           <div style={{ flex: 1 }} />
                           {t.openComments > 0 && (
@@ -160,15 +177,28 @@ export function Board({ store }: { store: AppStore }) {
                           )}
                         </div>
                         <div style={{ fontSize: 12.5, lineHeight: 1.45, color: '#e0e2e6' }}>{t.title}</div>
-                        {(ag || blocked || (ms && msFilter === null)) && (
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginTop: 9 }}>
+                        {(taskTags.length > 0 || ag || blocked || (ms && msFilter === null)) && (
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 9, flexWrap: 'wrap' }}>
+                            {taskTags.map((tg) => (
+                              <span
+                                key={tg.id}
+                                style={{
+                                  display: 'inline-flex', alignItems: 'center', gap: 4,
+                                  fontFamily: 'var(--mono)', fontSize: 9, color: tg.color,
+                                  border: `1px solid ${tg.color}44`, padding: '1px 6px', borderRadius: 5,
+                                }}
+                              >
+                                <span style={{ width: 5, height: 5, borderRadius: '50%', background: tg.color }} />
+                                {tg.name}
+                              </span>
+                            ))}
                             {ag && (
-                              <>
-                                <AvatarChip name={ag.name} color={ag.color} size={18} radius={5} fontSize={8} />
+                              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                                <AvatarChip name={ag.name} color={ag.color} size={16} radius={4} fontSize={7.5} />
                                 <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-mid)' }}>{ag.name}</span>
-                              </>
+                              </span>
                             )}
-                            <div style={{ flex: 1 }} />
+                            <span style={{ flex: 1 }} />
                             {blocked && (
                               <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--red-soft)' }}>⟂ {depKey}</span>
                             )}
@@ -177,7 +207,7 @@ export function Board({ store }: { store: AppStore }) {
                                 style={{
                                   fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)',
                                   border: '1px solid rgba(255,255,255,.08)', padding: '1px 6px', borderRadius: 4,
-                                  whiteSpace: 'nowrap', maxWidth: 130, overflow: 'hidden', textOverflow: 'ellipsis',
+                                  whiteSpace: 'nowrap', maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis',
                                 }}
                               >
                                 {ms.title}
@@ -198,26 +228,23 @@ export function Board({ store }: { store: AppStore }) {
   );
 }
 
-function FilterChip({ label, meta, pct, dot, active, onClick }: {
+function FilterChip({ label, meta, pct, dot, active, small, onClick }: {
   label: string;
   meta?: string;
   pct?: number;
   dot?: string;
   active: boolean;
+  small?: boolean;
   onClick: () => void;
 }) {
   return (
     <button
       onClick={onClick}
       style={{
-        cursor: 'pointer',
-        flex: 'none',
-        display: 'flex',
-        alignItems: 'center',
-        gap: 7,
-        padding: '5px 11px',
+        cursor: 'pointer', flex: 'none', display: 'flex', alignItems: 'center', gap: 7,
+        padding: small ? '3px 9px' : '5px 11px',
         borderRadius: 8,
-        fontSize: 11.5,
+        fontSize: small ? 10.5 : 11.5,
         fontWeight: 500,
         background: active ? 'rgba(198,242,78,.1)' : 'rgba(255,255,255,.03)',
         color: active ? 'var(--accent)' : 'var(--text-mid)',

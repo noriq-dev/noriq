@@ -35,7 +35,7 @@ export const api = {
     req<{ id: string; key: string }>('POST', '/api/projects', { key, name, description }),
   groups: () => req<{ groups: Array<{ id: string; name: string; description: string }> }>('GET', '/api/groups'),
   createGroup: (name: string, description?: string) => req<{ id: string }>('POST', '/api/groups', { name, description }),
-  setProjectMeta: (pid: string, meta: { groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number }) =>
+  setProjectMeta: (pid: string, meta: { groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number; ownerUserId?: string | null }) =>
     req('PATCH', `/api/projects/${pid}/meta`, meta),
 
   users: () => req<{ users: ApiUser[] }>('GET', '/api/users'),
@@ -62,7 +62,20 @@ export const api = {
 
   patchGroup: (gid: string, patch: { name?: string; description?: string }) => req('PATCH', `/api/groups/${gid}`, patch),
   deleteGroup: (gid: string) => req('DELETE', `/api/groups/${gid}`),
-  createCategory: (pid: string, name: string) => req<{ id: string }>('POST', `/api/projects/${pid}/categories`, { name }),
+  deleteUser: (uid: string) => req('DELETE', `/api/users/${uid}`),
+  taskEvents: (tid: string) => req<{ events: ApiAgentEvent[] }>('GET', `/api/tasks/${tid}/events`),
+  uploadAttachment: async (tid: string, file: File) => {
+    const res = await fetch(`/api/tasks/${tid}/attachments?filename=${encodeURIComponent(file.name)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': file.type || 'application/octet-stream' },
+      body: file,
+      credentials: 'same-origin',
+    });
+    if (!res.ok) throw new ApiError(res.status, ((await res.json().catch(() => ({}))) as { error?: string }).error ?? res.statusText);
+    return (await res.json()) as { id: string; filename: string };
+  },
+  deleteAttachment: (aid: string) => req('DELETE', `/api/attachments/${aid}`),
+  createTag: (pid: string, name: string) => req<{ id: string }>('POST', `/api/projects/${pid}/tags`, { name }),
 
   agents: () => req<{ agents: ApiAgent[] }>('GET', '/api/agents'),
   agentEvents: (aid: string) => req<{ events: ApiAgentEvent[] }>('GET', `/api/agents/${aid}/events`),
@@ -74,10 +87,12 @@ export const api = {
     req('PATCH', `/api/projects/${pid}/milestones/${mid}`, patch),
   createMilestone: (pid: string, title: string, dueAt?: string) =>
     req<{ id: string }>('POST', `/api/projects/${pid}/milestones`, { title, dueAt }),
-  createTask: (pid: string, input: { title: string; body?: string; priority?: number; milestoneId?: string; category?: string }) =>
+  createTask: (pid: string, input: { title: string; body?: string; priority?: number; milestoneId?: string; tags?: string[]; type?: string }) =>
     req<{ id: string; key: string }>('POST', `/api/projects/${pid}/tasks`, input),
   updateTask: (pid: string, tid: string, patch: Record<string, unknown>) =>
     req('PATCH', `/api/projects/${pid}/tasks/${tid}`, patch),
+  sendMessage: (pid: string, body: string, toAgentId?: string) =>
+    req<{ id: string }>('POST', `/api/projects/${pid}/messages`, { body, toAgentId }),
   postComment: (pid: string, tid: string, kind: string, body: string) =>
     req<{ id: string }>('POST', `/api/projects/${pid}/tasks/${tid}/comments`, { kind, body }),
   resolveComment: (pid: string, cid: string, resolution: string, reply?: string) =>
@@ -108,6 +123,7 @@ export interface ApiUser {
   pending: number;
   passkeys: number;
   groupIds: string | null;
+  ownedProjects: number;
 }
 
 export interface ApiAgent {
@@ -119,13 +135,17 @@ export interface ApiAgent {
   createdAt: string;
   heldTasks: number;
   totalClaims: number;
+  ownerName: string | null;
+  ownerUserId: string | null;
 }
 
 export interface ApiAgentEvent {
   id: string;
-  projectId: string;
+  projectId?: string;
   seq: number;
   verb: string;
+  actorKind?: string;
+  actorId?: string;
   subjectType: string;
   subjectId: string;
   payload: Record<string, unknown>;
@@ -135,17 +155,18 @@ export interface ApiAgentEvent {
 export interface ApiSnapshot {
   project: { id: string; key: string; name: string; description: string; claimTtlSeconds: number };
   tasks: Array<{
-    id: string; key: string; title: string; body: string; status: string; priority: number;
+    id: string; key: string; title: string; body: string; status: string; type: string; priority: number;
     claimedBy: string | null; claimExpiresAt: string | null; parentTaskId: string | null;
-    milestoneId: string | null; categoryId: string | null; openComments: number; order: number;
+    milestoneId: string | null; openComments: number; order: number;
   }>;
   dependencies: Array<{ taskId: string; dependsOnTaskId: string }>;
-  agents: Array<{ id: string; name: string; role: string; status: string; lastSeenAt: string | null }>;
+  agents: Array<{ id: string; name: string; role: string; status: string; lastSeenAt: string | null; ownerName: string | null }>;
   milestones: Array<{ id: string; title: string; dueAt: string | null; order: number }>;
   plans: Array<{ id: string; agentId: string | null; title: string; description: string; body: string; createdAt: string }>;
   phases: Array<{ id: string; planId: string; title: string; body: string; order: number }>;
   phaseTasks: Array<{ phaseId: string; taskId: string }>;
-  categories: Array<{ id: string; name: string; color: string; order: number }>;
+  tags: Array<{ id: string; name: string; color: string; order: number }>;
+  taskTags: Array<{ taskId: string; tagId: string }>;
   events: Array<{
     id: string; seq: number; actorKind: 'agent' | 'human' | 'system'; actorId: string; verb: string;
     subjectType: string; subjectId: string; payload: Record<string, unknown>; createdAt: string;
@@ -158,4 +179,6 @@ export interface ApiTaskDetail {
     id: string; authorKind: string; authorId: string; kind: string; body: string; status: string; createdAt: string;
   }>;
   refs: Array<{ kind: string; ref: string; url: string | null; state: string | null }>;
+  attachments: Array<{ id: string; filename: string; contentType: string; size: number; uploaderKind: string; uploadedBy: string; createdAt: string }>;
+  tagIds: string[];
 }

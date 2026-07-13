@@ -28,8 +28,11 @@ export interface CreateTaskInput {
   priority?: number;
   estimate?: number | null;
   dependsOn?: string[];
-  /** Category by name — auto-created for the project if it doesn't exist. */
+  /** Tags by name — auto-created for the project if they don't exist. */
+  tags?: string[];
+  /** Legacy alias for a single tag. */
   category?: string | null;
+  type?: string;
 }
 
 export interface TaskPatch {
@@ -39,9 +42,11 @@ export interface TaskPatch {
   priority?: number;
   estimate?: number | null;
   milestoneId?: string | null;
-  categoryId?: string | null;
-  /** Category by name — auto-created if needed (takes precedence over categoryId). */
+  /** Replace the task's tag set (names; auto-created). */
+  tags?: string[];
+  /** Legacy single-tag alias. */
   category?: string | null;
+  type?: string;
   order?: number;
 }
 
@@ -171,22 +176,34 @@ export class ProjectRoom extends DurableObject<Env> {
   // Task CRUD (RPC from the Worker)
   // ---------------------------------------------------------------------------
 
-  /** Find or create a category by name (per-project). */
-  async resolveCategory(projectId: string, actor: Actor, name: string): Promise<string> {
+  /** Find or create a tag by name (per-project). */
+  async resolveTag(projectId: string, actor: Actor, name: string): Promise<string> {
     await this.setPid(projectId);
-    const trimmed = name.trim();
-    const existing = await this.env.DB.prepare('SELECT id FROM categories WHERE project_id = ? AND name = ?')
+    const trimmed = name.trim().toLowerCase();
+    const existing = await this.env.DB.prepare('SELECT id FROM tags WHERE project_id = ? AND name = ?')
       .bind(this.projectId, trimmed).first<{ id: string }>();
     if (existing) return existing.id;
-    const id = newId('cat');
+    const id = newId('tag');
     const palette = ['#4c9dff', '#b57bff', '#3fd98b', '#f5a623', '#ff8a8a', '#c6f24e', '#8a95a3'];
-    const count = await this.env.DB.prepare('SELECT COUNT(*) AS n FROM categories WHERE project_id = ?')
+    const count = await this.env.DB.prepare('SELECT COUNT(*) AS n FROM tags WHERE project_id = ?')
       .bind(this.projectId).first<{ n: number }>();
     const color = palette[(count?.n ?? 0) % palette.length]!;
-    await this.env.DB.prepare('INSERT INTO categories (id, project_id, name, color, "order", created_at) VALUES (?, ?, ?, ?, ?, ?)')
+    await this.env.DB.prepare('INSERT INTO tags (id, project_id, name, color, "order", created_at) VALUES (?, ?, ?, ?, ?, ?)')
       .bind(id, this.projectId, trimmed, color, count?.n ?? 0, nowIso()).run();
-    await this.emit(actor, 'category.created', 'category', id, { name: trimmed, color });
+    await this.emit(actor, 'tag.created', 'tag', id, { name: trimmed, color });
     return id;
+  }
+
+  private async setTaskTags(projectId: string, actor: Actor, taskId: string, names: string[]) {
+    const ids: string[] = [];
+    for (const n of names) {
+      if (n.trim()) ids.push(await this.resolveTag(projectId, actor, n));
+    }
+    const stmts = [this.env.DB.prepare('DELETE FROM task_tags WHERE task_id = ?').bind(taskId)];
+    for (const tid of ids) {
+      stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO task_tags (task_id, tag_id) VALUES (?, ?)').bind(taskId, tid));
+    }
+    await this.env.DB.batch(stmts);
   }
 
   async createTask(projectId: string, actor: Actor, input: CreateTaskInput) {
@@ -196,15 +213,14 @@ export class ProjectRoom extends DurableObject<Env> {
       .bind(pid)
       .first<{ key: string; n: number }>();
     if (!proj) throw new Error(`project ${pid} not found`);
-    const categoryId = input.category ? await this.resolveCategory(pid, actor, input.category) : null;
     const id = newId('task');
     const key = `${proj.key}-${proj.n}`;
     const now = nowIso();
     const stmts = [
       this.env.DB.prepare(
-        `INSERT INTO tasks (id, project_id, key, milestone_id, parent_task_id, category_id, title, body, status, priority, estimate, "order", created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)`,
-      ).bind(id, pid, key, input.milestoneId ?? null, input.parentTaskId ?? null, categoryId, input.title, input.body ?? '', input.priority ?? 2, input.estimate ?? null, proj.n, now, now),
+        `INSERT INTO tasks (id, project_id, key, milestone_id, parent_task_id, title, body, status, type, priority, estimate, "order", created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)`,
+      ).bind(id, pid, key, input.milestoneId ?? null, input.parentTaskId ?? null, input.title, input.body ?? '', input.type ?? 'feature', input.priority ?? 2, input.estimate ?? null, proj.n, now, now),
       this.env.DB.prepare('UPDATE projects SET next_task_number = ? WHERE id = ?').bind(proj.n + 1, pid),
     ];
     for (const dep of input.dependsOn ?? []) {
@@ -213,7 +229,9 @@ export class ProjectRoom extends DurableObject<Env> {
       );
     }
     await this.env.DB.batch(stmts);
-    await this.emit(actor, input.parentTaskId ? 'task.created' : 'task.created', 'task', id, {
+    const tagNames = [...(input.tags ?? []), ...(input.category ? [input.category] : [])];
+    if (tagNames.length) await this.setTaskTags(pid, actor, id, tagNames);
+    await this.emit(actor, 'task.created', 'task', id, {
       key, title: input.title, parentTaskId: input.parentTaskId ?? null,
     });
     return { id, key };
@@ -223,14 +241,23 @@ export class ProjectRoom extends DurableObject<Env> {
     await this.setPid(projectId);
     const task = await this.getTask(taskId);
     if (patch.category !== undefined) {
-      patch.categoryId = patch.category === null || patch.category === '' ? null : await this.resolveCategory(projectId, actor, patch.category);
+      patch.tags = patch.category ? [patch.category] : [];
       delete patch.category;
+    }
+    if (patch.tags !== undefined) {
+      await this.setTaskTags(projectId, actor, taskId, patch.tags);
+      delete patch.tags;
+      // Tag-only updates still emit below via the fields list; ensure at least one emit.
+      if (Object.keys(patch).filter((k) => k !== 'tags').length === 0) {
+        await this.emit(actor, 'task.updated', 'task', taskId, { key: task.key, fields: ['tags'] });
+        return { ok: true, key: task.key };
+      }
     }
     const sets: string[] = [];
     const binds: unknown[] = [];
     const fields: Array<[keyof TaskPatch, string]> = [
-      ['title', 'title'], ['body', 'body'], ['priority', 'priority'],
-      ['estimate', 'estimate'], ['milestoneId', 'milestone_id'], ['categoryId', 'category_id'], ['order', '"order"'],
+      ['title', 'title'], ['body', 'body'], ['priority', 'priority'], ['type', 'type'],
+      ['estimate', 'estimate'], ['milestoneId', 'milestone_id'], ['order', '"order"'],
     ];
     for (const [k, col] of fields) {
       if (patch[k] !== undefined) {
@@ -462,12 +489,13 @@ export class ProjectRoom extends DurableObject<Env> {
   // Messaging / milestones
   // ---------------------------------------------------------------------------
 
-  async sendMessage(projectId: string, actor: Actor, fromAgentId: string, body: string, toAgentId?: string | null, refTaskId?: string | null) {
+  async sendMessage(projectId: string, actor: Actor, body: string, toAgentId?: string | null, refTaskId?: string | null) {
     await this.setPid(projectId);
+    if (actor.kind === 'system') throw new Error('system cannot send messages');
     const id = newId('msg');
     await this.env.DB.prepare(
-      'INSERT INTO messages (id, project_id, from_agent_id, to_agent_id, body, ref_task_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    ).bind(id, this.projectId, fromAgentId, toAgentId ?? null, body, refTaskId ?? null, nowIso()).run();
+      'INSERT INTO messages (id, project_id, from_kind, from_id, from_name, to_agent_id, body, ref_task_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    ).bind(id, this.projectId, actor.kind, actor.id, actor.name, toAgentId ?? null, body, refTaskId ?? null, nowIso()).run();
     await this.emit(actor, 'message.sent', 'message', id, {
       to: toAgentId ?? 'broadcast', body: body.slice(0, 140), refTaskId: refTaskId ?? null,
     });
@@ -566,6 +594,13 @@ export class ProjectRoom extends DurableObject<Env> {
       title: input.title, phases: phases.map((p) => ({ title: p.title, tasks: p.taskIds.length })),
     });
     return { id: planId, title: input.title, phases };
+  }
+
+  async noteAttachment(projectId: string, actor: Actor, taskId: string, filename: string, attachmentId: string) {
+    await this.setPid(projectId);
+    const task = await this.getTask(taskId);
+    await this.emit(actor, 'attachment.added', 'task', taskId, { key: task.key, filename, attachmentId });
+    return { ok: true };
   }
 
   /** Plans evolve — agents append status updates, correct course, mark outcomes. */

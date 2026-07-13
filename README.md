@@ -31,11 +31,11 @@ npx wrangler login
 
 # 2. Create the database and wire it up
 cd apps/api
-npx wrangler d1 create planar        # paste database_id into wrangler.jsonc
+npx wrangler d1 create planar        # paste database_id into wrangler.production.jsonc
 
-# 3. Adjust wrangler.jsonc for your instance:
-#    - routes[0].pattern  → your domain (or delete "routes" to use workers.dev)
-#    - vars.EMAIL_FROM    → an address on your domain, or delete it (see Email below)
+# 3. Configure your instance:
+#    (copy wrangler.production.jsonc.example → wrangler.production.jsonc, gitignored:
+#     your domain, D1 id, optional email + R2 — npm run deploy prefers it)
 
 # 4. Migrate, build, ship
 npm run db:migrate:remote

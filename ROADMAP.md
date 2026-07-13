@@ -230,7 +230,7 @@ concurrently, with graceful recovery when an agent dies mid-task.
 ### Phase 5 — Hardening & v1.0 Release
 *Goal: something others can confidently self-host.*
 - Docs: quickstart (deploy to your CF account in minutes), MCP tool reference, agent integration guide.
-- **Installable agent skill, served by planar itself**: `GET plan.frs.llc/skill.md` (+ install
+- **Installable agent skill, served by planar itself**: `GET <your-instance>/skill.md` (+ install
   one-liner in the docs). Generated from the same source as the tool descriptions so it can't drift;
   stays a thin pointer — the work loop + "call `get_briefing` for current truth". Ground truth lives
   server-side.

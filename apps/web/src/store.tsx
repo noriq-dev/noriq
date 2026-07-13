@@ -65,13 +65,14 @@ export function useAppStore() {
   const [currentPid, setCurrentPid] = useState<string | null>(initialUrl.current.pid);
   const [view, setView] = useState<ViewId>(initialUrl.current.view);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(initialUrl.current.task);
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [draftKind, setDraftKind] = useState<Exclude<CommentKind, 'reply'>>('question');
   const [draftText, setDraftText] = useState('');
   const [draggedId, setDraggedId] = useState<string | null>(null);
   const [projects, setProjects] = useState<ProjectVM[]>([]);
   const [snapshot, setSnapshot] = useState<ApiSnapshot | null>(null);
   const [comments, setComments] = useState<TaskVM['comments']>([]);
-  const [, setTick] = useState(0);
+  const [tick, setTick] = useState(0);
 
   const pidRef = useRef(currentPid);
   pidRef.current = currentPid;
@@ -254,6 +255,10 @@ export function useAppStore() {
     for (const d of snapshot?.dependencies ?? []) {
       depsByTask.set(d.taskId, [...(depsByTask.get(d.taskId) ?? []), d.dependsOnTaskId]);
     }
+    const tagsByTask = new Map<string, string[]>();
+    for (const tt of snapshot?.taskTags ?? []) {
+      tagsByTask.set(tt.taskId, [...(tagsByTask.get(tt.taskId) ?? []), tt.tagId]);
+    }
     const tasks: TaskVM[] = (snapshot?.tasks ?? []).map((t) => {
       const expires = t.claimExpiresAt ? new Date(t.claimExpiresAt).getTime() : null;
       const ttl = expires !== null ? Math.max(0, Math.round((expires - now) / 1000)) : undefined;
@@ -269,7 +274,8 @@ export function useAppStore() {
         ttlMax,
         deps: depsByTask.get(t.id) ?? [],
         milestoneId: t.milestoneId,
-        categoryId: t.categoryId,
+        tagIds: tagsByTask.get(t.id) ?? [],
+        type: t.type,
         openComments: t.openComments,
         comments: t.id === selectedTaskId ? comments : [],
       };
@@ -280,6 +286,7 @@ export function useAppStore() {
       role: a.role === 'orchestrator' ? ('orch' as const) : ('worker' as const),
       color: a.role === 'orchestrator' ? '#f5a623' : PALETTE[hashIdx(a.id, PALETTE.length)]!,
       lastSeenAt: a.lastSeenAt,
+      ownerName: a.ownerName,
     }));
     const events = (snapshot?.events ?? []).map(eventToVM);
     return {
@@ -288,7 +295,8 @@ export function useAppStore() {
       tasks: { [pid]: tasks },
       events: { [pid]: events },
     };
-  }, [projects, snapshot, comments, currentPid, selectedTaskId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- tick drives the live TTL countdown
+  }, [projects, snapshot, comments, currentPid, selectedTaskId, tick]);
 
   const helpers = useMemo(() => {
     const tasksOf = (pid: string) => data.tasks[pid] ?? [];
@@ -331,6 +339,14 @@ export function useAppStore() {
     },
     setView,
     openTask: (id: string) => setSelectedTaskId(id),
+    refreshNow: refresh,
+    selectAgent: (id: string | null) => setSelectedAgentId(id),
+
+    async sendMessage(body: string, toAgentId?: string) {
+      if (!pidRef.current || !body.trim()) return;
+      await api.sendMessage(pidRef.current, body.trim(), toAgentId);
+      refresh();
+    },
     closeTask: () => setSelectedTaskId(null),
     setDraftText,
     setDraggedId,
@@ -357,7 +373,7 @@ export function useAppStore() {
       lastSeq.current = 0;
     },
 
-    async submitTask(input: { title: string; body?: string; priority?: number; milestoneId?: string; category?: string }) {
+    async submitTask(input: { title: string; body?: string; priority?: number; milestoneId?: string; tags?: string[]; type?: string }) {
       if (!pidRef.current) return;
       await api.createTask(pidRef.current, input);
       setModal(null);
@@ -423,13 +439,14 @@ export function useAppStore() {
     async postComment() {
       const text = draftText.trim();
       if (!text || !pidRef.current) return;
-      const tasks = data.tasks[pidRef.current] ?? [];
-      const target =
-        (selectedTaskId != null ? tasks.find((x) => x.id === selectedTaskId) : null) ??
-        tasks.find((x) => x.status === 'in_progress') ??
-        tasks.find((x) => !['done', 'cancelled'].includes(x.status));
-      if (!target) return;
-      await api.postComment(pidRef.current, target.id, draftKind, text);
+      if (selectedTaskId != null) {
+        // Drawer context: a comment on the open task.
+        await api.postComment(pidRef.current, selectedTaskId, draftKind, text);
+      } else {
+        // Feed context: broadcast — any agent should pick it up (kind prefixed for intent).
+        const prefix = draftKind === 'comment' ? '' : `[${draftKind}] `;
+        await api.sendMessage(pidRef.current, prefix + text);
+      }
       setDraftText('');
       refresh();
     },
@@ -437,7 +454,7 @@ export function useAppStore() {
 
   return {
     user, authChecked, needsSetup, modal, editMilestone, groups, snapshot,
-    currentPid: currentPid ?? '', view, selectedTaskId, draftKind, draftText, draggedId,
+    currentPid: currentPid ?? '', view, selectedTaskId, selectedAgentId, draftKind, draftText, draggedId,
     data, helpers, actions,
   };
 }

@@ -143,7 +143,9 @@ function UsersSection({ store }: { store: AppStore }) {
               <div style={{ fontSize: 12.5, fontWeight: 600 }}>
                 {u.name} {u.id === me && <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-dim)' }}>(you)</span>}
               </div>
-              <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)' }}>{u.email}</div>
+              <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+                {u.email} · {u.ownedProjects} project{u.ownedProjects === 1 ? '' : 's'}
+              </div>
             </div>
             <MonoTag color={u.role === 'admin' ? 'var(--accent)' : 'var(--text-mid)'} bg={u.role === 'admin' ? 'rgba(198,242,78,.12)' : 'rgba(255,255,255,.06)'} size={9.5}>{u.role}</MonoTag>
             {u.pending ? <MonoTag color="var(--amber)" bg="rgba(245,166,35,.12)" size={9.5}>PENDING</MonoTag> : null}
@@ -161,6 +163,19 @@ function UsersSection({ store }: { store: AppStore }) {
                 <SmallAction danger onClick={async () => { await api.patchUser(u.id, { disabled: !u.disabled }); load(); }}>
                   {u.disabled ? 'enable' : 'disable'}
                 </SmallAction>
+                {u.disabled ? (
+                  <SmallAction
+                    danger
+                    onClick={async () => {
+                      if (confirm(`Permanently delete ${u.name}? Their sessions, passkeys, invites and tokens are removed; owned projects become unowned. History keeps their name.`)) {
+                        await api.deleteUser(u.id);
+                        load();
+                      }
+                    }}
+                  >
+                    delete
+                  </SmallAction>
+                ) : null}
               </div>
             )}
             {editGroupsFor === u.id && (

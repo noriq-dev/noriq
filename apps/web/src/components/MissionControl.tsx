@@ -1,4 +1,5 @@
-// Mission Control — agent roster | live event feed | who-holds-what.
+// Mission Control — agent roster | live event feed | agent detail or who-holds-what.
+import { useState } from 'react';
 import type { AppStore } from '../store';
 import { agentFg, fmtTtl, initials, isGhostColor, statusMeta, verbColors, YOU_GRADIENT } from '../design';
 import { AvatarChip, MonoTag, SectionLabel, WaveBars } from './bits';
@@ -9,7 +10,141 @@ export function MissionControl({ store }: { store: AppStore }) {
     <div style={{ position: 'absolute', inset: 0, display: 'grid', gridTemplateColumns: '272px 1fr 328px', minHeight: 0 }}>
       <Roster store={store} />
       <EventFeed store={store} />
-      <Holds store={store} />
+      {store.selectedAgentId ? <AgentPanel store={store} /> : <Holds store={store} />}
+    </div>
+  );
+}
+
+function ago(iso: string | null): string {
+  if (!iso) return 'never';
+  const s = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 90) return `${s}s ago`;
+  if (s < 5400) return `${Math.round(s / 60)}m ago`;
+  return `${Math.round(s / 3600)}h ago`;
+}
+
+function AgentPanel({ store }: { store: AppStore }) {
+  const { data, currentPid, helpers, actions, selectedAgentId } = store;
+  const agent = (data.agents[currentPid] ?? []).find((a) => a.id === selectedAgentId);
+  const tasks = helpers.tasksOf(currentPid);
+  const events = (data.events[currentPid] ?? []).filter((e) => e.actor === agent?.name).slice(0, 12);
+  const [msg, setMsg] = useState('');
+  const [sent, setSent] = useState(false);
+  if (!agent) return <Holds store={store} />;
+
+  const held = tasks.filter((t) => t.claimedBy === agent.id && !['done', 'cancelled'].includes(t.status));
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+      <div style={{ padding: '14px 16px 12px', display: 'flex', alignItems: 'center', gap: 10, flex: 'none', borderBottom: '1px solid rgba(255,255,255,.05)' }}>
+        <AvatarChip name={agent.name} color={agent.color} size={34} radius={9} fontSize={12.5} />
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={{ fontSize: 14, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6 }}>
+            {agent.name}
+            {agent.role === 'orch' && <MonoTag color="var(--accent)" bg="rgba(198,242,78,.12)" size={9}>ORCH</MonoTag>}
+          </div>
+          <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+            {agent.ownerName ? `delegated by ${agent.ownerName} · ` : ''}seen {ago(agent.lastSeenAt)}
+          </div>
+        </div>
+        <button
+          onClick={() => actions.selectAgent(null)}
+          className="drawer-x"
+          style={{ cursor: 'pointer', color: 'var(--text-dim)', fontSize: 15, width: 24, height: 24, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6 }}
+        >
+          ✕
+        </button>
+      </div>
+
+      <div style={{ flex: 1, overflowY: 'auto', padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 14 }}>
+        <div>
+          <SectionLabel>Holding · {held.length}</SectionLabel>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 8 }}>
+            {held.length === 0 && (
+              <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>no live claims</div>
+            )}
+            {held.map((t) => {
+              const eff = helpers.effStatus(currentPid, t);
+              const mm = statusMeta(eff);
+              return (
+                <div
+                  key={t.id}
+                  onClick={() => actions.openTask(t.id)}
+                  className="hover-border"
+                  style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '8px 10px', borderRadius: 8, background: 'var(--card)', border: '1px solid rgba(255,255,255,.07)', cursor: 'pointer' }}
+                >
+                  <span style={{ width: 7, height: 7, borderRadius: '50%', background: mm.dot, flex: 'none' }} />
+                  <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: mm.color, flex: 'none' }}>{t.key}</span>
+                  <span style={{ fontSize: 11.5, color: 'var(--text-soft)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.title}</span>
+                  <div style={{ flex: 1 }} />
+                  {t.status === 'in_progress' && typeof t.ttl === 'number' && (
+                    <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--green)' }}>{fmtTtl(t.ttl)}</span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <div>
+          <SectionLabel>Message {agent.name}</SectionLabel>
+          <div style={{ display: 'flex', gap: 7, marginTop: 8 }}>
+            <input
+              value={msg}
+              onChange={(e) => setMsg(e.target.value)}
+              onKeyDown={async (e) => {
+                if (e.key === 'Enter' && msg.trim()) {
+                  await store.actions.sendMessage(msg, agent.id);
+                  setMsg('');
+                  setSent(true);
+                  setTimeout(() => setSent(false), 1500);
+                }
+              }}
+              placeholder={`Direct to ${agent.name} — no task needed…`}
+              style={{
+                flex: 1, minWidth: 0, background: 'rgba(255,255,255,.05)', border: '1px solid rgba(255,255,255,.09)',
+                borderRadius: 8, padding: '8px 11px', color: 'var(--text)', fontSize: 12, outline: 'none',
+              }}
+            />
+            <button
+              onClick={async () => {
+                if (msg.trim()) {
+                  await store.actions.sendMessage(msg, agent.id);
+                  setMsg('');
+                  setSent(true);
+                  setTimeout(() => setSent(false), 1500);
+                }
+              }}
+              className="hover-bright"
+              style={{ cursor: 'pointer', background: 'var(--accent)', color: 'var(--bg)', fontWeight: 600, fontSize: 11.5, padding: '8px 12px', borderRadius: 8 }}
+            >
+              {sent ? '✓' : 'Send'}
+            </button>
+          </div>
+          <div style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)', marginTop: 6 }}>
+            delivered via my_updates + notices on their next call
+          </div>
+        </div>
+
+        <div>
+          <SectionLabel>Recent activity</SectionLabel>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginTop: 8 }}>
+            {events.length === 0 && (
+              <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>nothing yet</div>
+            )}
+            {events.map((ev) => {
+              const vc = verbColors(ev.verb);
+              return (
+                <div key={ev.id} style={{ display: 'flex', gap: 8, alignItems: 'baseline', fontSize: 11 }}>
+                  <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)', flex: 'none' }}>{ev.t}</span>
+                  <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: vc.color, flex: 'none' }}>{ev.verb}</span>
+                  <span style={{ color: 'var(--text-mid)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ev.subject}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -50,14 +185,14 @@ function Roster({ store }: { store: AppStore }) {
           return (
             <div
               key={a.id}
-              onClick={claim ? () => actions.openTask(claim.id) : undefined}
+              onClick={() => actions.selectAgent(store.selectedAgentId === a.id ? null : a.id)}
               className="hover-border"
               style={{
                 padding: '11px 12px',
                 borderRadius: 10,
-                background: isOrch ? 'rgba(198,242,78,.06)' : claim ? 'rgba(255,255,255,.03)' : 'rgba(255,255,255,.02)',
-                border: `1px solid ${isOrch ? 'rgba(198,242,78,.22)' : claim ? 'rgba(255,255,255,.06)' : 'rgba(255,255,255,.05)'}`,
-                cursor: claim ? 'pointer' : 'default',
+                background: store.selectedAgentId === a.id ? 'rgba(198,242,78,.07)' : isOrch ? 'rgba(198,242,78,.04)' : claim ? 'rgba(255,255,255,.03)' : 'rgba(255,255,255,.02)',
+                border: `1px solid ${store.selectedAgentId === a.id ? 'rgba(198,242,78,.35)' : isOrch ? 'rgba(198,242,78,.22)' : claim ? 'rgba(255,255,255,.06)' : 'rgba(255,255,255,.05)'}`,
+                cursor: 'pointer',
                 opacity: claim || isOrch ? 1 : 0.72,
               }}
             >
@@ -193,7 +328,7 @@ function EventFeed({ store }: { store: AppStore }) {
           flex: 'none',
         }}
       >
-        <Composer store={store} placeholder={selTask ? `Steer ${holderName ?? 'the agent'}…` : 'Post to the active task…'} />
+        <Composer store={store} placeholder={selTask ? `Steer ${holderName ?? 'the agent'}…` : 'Broadcast to all agents — anyone picks it up…'} />
       </div>
     </div>
   );

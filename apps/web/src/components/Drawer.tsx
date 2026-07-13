@@ -1,13 +1,38 @@
-// Task detail drawer — meta grid, claim/release action, comment thread, composer.
+// Task detail drawer — view/edit, tags, comments, attachments, event timeline.
+import { useEffect, useRef, useState } from 'react';
 import type { AppStore } from '../store';
-import { KIND_META, statusMeta } from '../design';
+import { api, type ApiAgentEvent } from '../api';
+import { KIND_META, statusMeta, verbColors } from '../design';
 import { AvatarChip, MonoTag, SectionLabel } from './bits';
 import { Composer } from './Composer';
+import { Button, Select, TextArea, TextInput } from './ui';
 
 export function Drawer({ store }: { store: AppStore }) {
-  const { currentPid, selectedTaskId, helpers, actions } = store;
+  const { currentPid, selectedTaskId, helpers, actions, snapshot } = store;
   const tasks = helpers.tasksOf(currentPid);
   const task = selectedTaskId != null ? tasks.find((t) => t.id === selectedTaskId) : null;
+
+  const [editing, setEditing] = useState(false);
+  const [eTitle, setETitle] = useState('');
+  const [eBody, setEBody] = useState('');
+  const [eType, setEType] = useState('feature');
+  const [ePriority, setEPriority] = useState(2);
+  const [eTags, setETags] = useState('');
+  const [timeline, setTimeline] = useState<ApiAgentEvent[]>([]);
+  const [attachments, setAttachments] = useState<Array<{ id: string; filename: string; size: number; createdAt: string }>>([]);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  const allTags = snapshot?.tags ?? [];
+  const tagById = new Map(allTags.map((t) => [t.id, t]));
+
+  useEffect(() => {
+    setEditing(false);
+    if (selectedTaskId) {
+      api.taskEvents(selectedTaskId).then((r) => setTimeline(r.events)).catch(() => setTimeline([]));
+      api.taskDetail(selectedTaskId).then((r) => setAttachments(r.attachments)).catch(() => setAttachments([]));
+    }
+  }, [selectedTaskId]);
+
   if (!task) return null;
 
   const eff = helpers.effStatus(currentPid, task);
@@ -18,60 +43,121 @@ export function Drawer({ store }: { store: AppStore }) {
     return dt ? `${dt.key}${dt.status !== 'done' ? ' ⟂' : ' ✓'}` : `#${d}`;
   });
   const canRelease = !!task.claimedBy;
-  const openCount = task.openComments;
-  const milestone = task.milestoneId ? (store.snapshot?.milestones ?? []).find((m) => m.id === task.milestoneId) : null;
-  const category = task.categoryId ? (store.snapshot?.categories ?? []).find((c) => c.id === task.categoryId) : null;
   const holder = ag ? ag.name : eff === 'blocked' ? '— (blocked)' : '— (unclaimed)';
+  const taskTags = task.tagIds.map((id) => tagById.get(id)).filter(Boolean) as Array<{ id: string; name: string; color: string }>;
+  const milestone = task.milestoneId ? (snapshot?.milestones ?? []).find((mm) => mm.id === task.milestoneId) : null;
+
+  const startEdit = () => {
+    setETitle(task.title);
+    setEBody(task.body);
+    setEType(task.type);
+    setEPriority(0); // priority isn't in the VM snapshot list; leave unchanged unless touched
+    setETags(taskTags.map((t) => t.name).join(', '));
+    setEditing(true);
+  };
+
+  const saveEdit = async () => {
+    await api.updateTask(currentPid, task.id, {
+      title: eTitle.trim() || task.title,
+      body: eBody,
+      type: eType,
+      tags: eTags.split(',').map((t) => t.trim()).filter(Boolean),
+      ...(ePriority > 0 ? { priority: ePriority } : {}),
+    });
+    setEditing(false);
+    actions.refreshNow();
+  };
+
+  const upload = async (file: File) => {
+    await api.uploadAttachment(task.id, file);
+    const detail = await api.taskDetail(task.id);
+    setAttachments(detail.attachments);
+    actions.refreshNow();
+  };
 
   return (
     <>
       <div onClick={actions.closeTask} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', zIndex: 40 }} />
       <div
         style={{
-          position: 'fixed',
-          top: 0,
-          right: 0,
-          bottom: 0,
-          width: 460,
-          background: 'var(--bg-raised)',
-          borderLeft: '1px solid rgba(255,255,255,.1)',
-          zIndex: 41,
-          display: 'flex',
-          flexDirection: 'column',
+          position: 'fixed', top: 0, right: 0, bottom: 0, width: 480,
+          background: 'var(--bg-raised)', borderLeft: '1px solid rgba(255,255,255,.1)', zIndex: 41,
+          display: 'flex', flexDirection: 'column',
           animation: 'pl-drawer .28s cubic-bezier(.22,1,.36,1) both',
           boxShadow: '-20px 0 60px rgba(0,0,0,.5)',
         }}
       >
         <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--line)', flex: 'none' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, flexWrap: 'wrap' }}>
             <MonoTag color={m.color} bg={m.bg} size={11}>{task.key}</MonoTag>
             <MonoTag color={m.color} bg={m.bg} size={10.5}>{m.label}</MonoTag>
-            {category && <MonoTag color={category.color} bg="rgba(255,255,255,.05)" size={10}>{category.name}</MonoTag>}
+            <MonoTag color={task.type === 'bug' ? 'var(--red-soft)' : 'var(--text-mid)'} bg="rgba(255,255,255,.05)" size={10}>{task.type}</MonoTag>
             {milestone && <MonoTag color="var(--text-mid)" bg="rgba(255,255,255,.05)" size={10}>{milestone.title}</MonoTag>}
+            {taskTags.map((t) => (
+              <MonoTag key={t.id} color={t.color} bg="rgba(255,255,255,.04)" size={10}>{t.name}</MonoTag>
+            ))}
             <div style={{ flex: 1 }} />
+            {!editing && (
+              <button
+                onClick={startEdit}
+                title="Edit task"
+                className="drawer-x"
+                style={{ cursor: 'pointer', color: 'var(--text-dim)', fontSize: 13, width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6 }}
+              >
+                ✎
+              </button>
+            )}
             <button
               onClick={actions.closeTask}
               className="drawer-x"
-              style={{
-                cursor: 'pointer',
-                color: 'var(--text-dim)',
-                fontSize: 18,
-                width: 26,
-                height: 26,
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                borderRadius: 6,
-              }}
+              style={{ cursor: 'pointer', color: 'var(--text-dim)', fontSize: 18, width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6 }}
             >
               ✕
             </button>
           </div>
-          <div style={{ fontSize: 16, fontWeight: 600, lineHeight: 1.35, letterSpacing: '-.01em' }}>{task.title}</div>
+          {editing ? (
+            <TextInput value={eTitle} onChange={(e) => setETitle(e.target.value)} style={{ fontSize: 15, fontWeight: 600 }} />
+          ) : (
+            <div style={{ fontSize: 16, fontWeight: 600, lineHeight: 1.35, letterSpacing: '-.01em' }}>{task.title}</div>
+          )}
         </div>
 
         <div style={{ flex: 1, overflowY: 'auto', padding: '18px 20px' }}>
-          <div style={{ fontSize: 13, lineHeight: 1.6, color: '#a9adb4', marginBottom: 18 }}>{task.body}</div>
+          {editing ? (
+            <div style={{ marginBottom: 18 }}>
+              <TextArea value={eBody} onChange={(e) => setEBody(e.target.value)} style={{ minHeight: 110 }} />
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 10 }}>
+                <Select value={eType} onChange={(e) => setEType(e.target.value)}>
+                  <option value="feature">feature</option>
+                  <option value="bug">bug</option>
+                  <option value="chore">chore</option>
+                  <option value="research">research</option>
+                </Select>
+                <Select value={ePriority} onChange={(e) => setEPriority(Number(e.target.value))}>
+                  <option value={0}>priority — keep</option>
+                  <option value={4}>P4 · urgent</option>
+                  <option value={3}>P3 · high</option>
+                  <option value={2}>P2 · normal</option>
+                  <option value={1}>P1 · low</option>
+                </Select>
+              </div>
+              <div style={{ marginTop: 10 }}>
+                <TextInput value={eTags} onChange={(e) => setETags(e.target.value)} placeholder="tags, comma, separated" list="planar-tags-drawer" />
+                <datalist id="planar-tags-drawer">
+                  {allTags.map((t) => (
+                    <option key={t.id} value={t.name} />
+                  ))}
+                </datalist>
+              </div>
+              <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+                <Button variant="ghost" onClick={() => setEditing(false)}>cancel</Button>
+                <div style={{ flex: 1 }} />
+                <Button onClick={saveEdit}>Save changes</Button>
+              </div>
+            </div>
+          ) : (
+            <div style={{ fontSize: 13, lineHeight: 1.6, color: '#a9adb4', marginBottom: 18, whiteSpace: 'pre-wrap' }}>{task.body}</div>
+          )}
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 18 }}>
             <MetaCell label="Claimed by">
@@ -92,31 +178,67 @@ export function Drawer({ store }: { store: AppStore }) {
               onClick={() => actions.claimToggle(task.id)}
               className="hover-bright"
               style={{
-                cursor: 'pointer',
-                boxSizing: 'border-box',
-                width: '100%',
-                textAlign: 'center',
-                padding: 11,
-                borderRadius: 10,
-                background: 'transparent',
-                color: 'var(--red-soft)',
-                fontSize: 13,
-                fontWeight: 600,
-                marginBottom: 20,
-                border: '1px solid rgba(255,92,92,.4)',
-                display: 'block',
+                cursor: 'pointer', boxSizing: 'border-box', width: '100%', textAlign: 'center', padding: 11,
+                borderRadius: 10, background: 'transparent', color: 'var(--red-soft)', fontSize: 13, fontWeight: 600,
+                marginBottom: 20, border: '1px solid rgba(255,92,92,.4)', display: 'block',
               }}
             >
               {`Force-release ${ag?.name ?? 'agent'}’s claim (requeue)`}
             </button>
           )}
 
+          {/* attachments */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 10 }}>
+            <SectionLabel>Attachments · {attachments.length}</SectionLabel>
+            <div style={{ flex: 1 }} />
+            <button
+              onClick={() => fileRef.current?.click()}
+              style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)', border: '1px dashed rgba(255,255,255,.15)', padding: '3px 9px', borderRadius: 6, background: 'transparent' }}
+              className="rail-add"
+            >
+              + upload
+            </button>
+            <input
+              ref={fileRef}
+              type="file"
+              hidden
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) void upload(f);
+                e.target.value = '';
+              }}
+            />
+          </div>
+          {attachments.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginBottom: 18 }}>
+              {attachments.map((att) => (
+                <div key={att.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 10px', borderRadius: 8, background: 'rgba(255,255,255,.02)', border: '1px solid rgba(255,255,255,.06)' }}>
+                  <span style={{ fontSize: 12 }}>📎</span>
+                  <a href={`/api/attachments/${att.id}`} style={{ fontSize: 12, textDecoration: 'none', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {att.filename}
+                  </a>
+                  <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>{(att.size / 1024).toFixed(0)} KB</span>
+                  <div style={{ flex: 1 }} />
+                  <button
+                    onClick={async () => {
+                      await api.deleteAttachment(att.id);
+                      setAttachments((l) => l.filter((x) => x.id !== att.id));
+                    }}
+                    style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--red-soft)', background: 'transparent' }}
+                  >
+                    ✕
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* comments */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 14 }}>
             <SectionLabel>Comments &amp; questions</SectionLabel>
-            {openCount > 0 && <MonoTag color="var(--amber)" bg="rgba(245,166,35,.12)" size={9.5}>{openCount} open</MonoTag>}
+            {task.openComments > 0 && <MonoTag color="var(--amber)" bg="rgba(245,166,35,.12)" size={9.5}>{task.openComments} open</MonoTag>}
           </div>
-
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 14, marginBottom: 6 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14, marginBottom: 18 }}>
             {task.comments.map((c) => {
               const isHuman = c.role === 'human';
               const cag = c.role === 'agent' ? helpers.agentById(currentPid, c.author) : null;
@@ -135,7 +257,7 @@ export function Drawer({ store }: { store: AppStore }) {
                         <button
                           onClick={() => actions.resolveComment(c.id, 'addressed')}
                           title="mark addressed"
-                          style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--green)', marginLeft: 4 }}
+                          style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--green)', marginLeft: 4, background: 'transparent' }}
                         >
                           ✓ resolve
                         </button>
@@ -143,18 +265,40 @@ export function Drawer({ store }: { store: AppStore }) {
                     </div>
                     <div
                       style={{
-                        fontSize: 12.5,
-                        lineHeight: 1.55,
-                        color: 'var(--text-soft)',
+                        fontSize: 12.5, lineHeight: 1.55, color: 'var(--text-soft)',
                         background: c.role === 'agent' ? 'rgba(76,157,255,.06)' : 'rgba(255,255,255,.03)',
                         border: `1px solid ${c.role === 'agent' ? 'rgba(76,157,255,.18)' : 'rgba(255,255,255,.07)'}`,
-                        borderRadius: 10,
-                        padding: '9px 12px',
+                        borderRadius: 10, padding: '9px 12px',
                       }}
                     >
                       {c.body}
                     </div>
                   </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* timeline */}
+          <div style={{ marginBottom: 8 }}>
+            <SectionLabel>History</SectionLabel>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+            {timeline.map((e) => {
+              const vc = verbColors(String(e.verb).split('.').pop() ?? '');
+              const p = e.payload as { actorName?: string; to?: string; body?: string; from?: string; resolution?: string; filename?: string };
+              return (
+                <div key={e.id} style={{ display: 'flex', gap: 8, alignItems: 'baseline', fontSize: 11 }}>
+                  <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)', flex: 'none', width: 78 }}>
+                    {new Date(e.createdAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                  </span>
+                  <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: vc.color, flex: 'none' }}>{e.verb.replace('task.', '').replace('comment.', '')}</span>
+                  <span style={{ color: 'var(--text-mid)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {p.actorName ?? e.actorId}
+                    {p.to ? ` → ${p.to}` : ''}
+                    {p.filename ? ` · ${p.filename}` : ''}
+                    {p.body ? ` · “${p.body}”` : ''}
+                  </span>
                 </div>
               );
             })}
@@ -174,12 +318,8 @@ function MetaCell({ label, children }: { label: string; children: React.ReactNod
     <div style={{ background: 'rgba(255,255,255,.03)', border: '1px solid rgba(255,255,255,.06)', borderRadius: 9, padding: '10px 12px' }}>
       <div
         style={{
-          fontFamily: 'var(--mono)',
-          fontSize: 9.5,
-          textTransform: 'uppercase',
-          letterSpacing: '.07em',
-          color: 'var(--text-dim)',
-          marginBottom: 5,
+          fontFamily: 'var(--mono)', fontSize: 9.5, textTransform: 'uppercase', letterSpacing: '.07em',
+          color: 'var(--text-dim)', marginBottom: 5,
         }}
       >
         {label}

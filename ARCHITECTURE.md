@@ -14,7 +14,7 @@ planar/                     npm workspaces monorepo
 │  │  ├─ src/do/AgentSession.ts   presence + inbox (1/agent)
 │  │  ├─ migrations/        D1 schema (SQL, applied via wrangler d1 migrations)
 │  │  ├─ test/              Vitest in workerd (@cloudflare/vitest-pool-workers)
-│  │  └─ wrangler.jsonc     bindings, custom domain plan.frs.llc, assets
+│  │  └─ wrangler.jsonc     bindings, assets; instance values live in wrangler.production.jsonc (gitignored)
 │  └─ web/                  React 18 + Vite SPA (design ported from design.html)
 │     └─ src/store.tsx      mock store — swap point for the live REST/WS adapter
 └─ packages/
@@ -68,7 +68,7 @@ npm run dev:web        # Vite dev server w/ proxy to :8787 (hot reload)
 npm run test           # workerd-based API tests
 npm run typecheck
 npm run build          # shared + web → apps/web/dist
-npm run deploy         # build + wrangler deploy → plan.frs.llc
+npm run deploy         # build + wrangler deploy (uses wrangler.production.jsonc if present)
 ```
 
 First-time setup on a Cloudflare account:
@@ -78,7 +78,7 @@ wrangler login                       # or CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCO
 cd apps/api
 wrangler d1 create planar            # then paste database_id into wrangler.jsonc
 npm run db:migrate:remote
-npm run deploy                       # creates plan.frs.llc record + cert automatically
+npm run deploy                       # creates your domain's record + cert automatically
 ```
 
 ## Current status

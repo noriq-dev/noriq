@@ -126,26 +126,42 @@ app.post('/api/auth/logout', userAuth, async (c) => {
 app.get('/api/auth/me', userAuth, (c) => c.json({ user: c.var.user }));
 
 // --- UI read API (session-authed) -------------------------------------------------
+/** Visibility (PLNR-48): ungrouped → owner only; grouped → group members; admins see all.
+ *  Legacy/agent-created projects with no owner remain visible to everyone. */
+const VISIBILITY_WHERE = `(
+  ? = 'admin'
+  OR p.owner_user_id = ?
+  OR (p.group_id IS NOT NULL AND p.group_id IN (SELECT group_id FROM user_groups WHERE user_id = ?))
+  OR (p.group_id IS NULL AND p.owner_user_id IS NULL)
+)`;
+
 app.get('/api/projects', userAuth, async (c) => {
+  const u = c.var.user!;
   const { results } = await c.env.DB.prepare(
     `SELECT p.id, p.key, p.name, p.description, p.status, p.repo_url AS repoUrl, p.group_id AS groupId,
+            p.owner_user_id AS ownerUserId,
             (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'in_progress') AS liveTasks,
             (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status NOT IN ('done','cancelled')) AS openTasks,
             (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) AS totalTasks,
             (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'done') AS doneTasks
-     FROM projects p WHERE p.status = 'active' ORDER BY p.created_at`,
-  ).all();
+     FROM projects p WHERE p.status = 'active' AND ${VISIBILITY_WHERE} ORDER BY p.created_at`,
+  ).bind(u.role, u.id, u.id).all();
   return c.json({ projects: results });
 });
 
 app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
-  const [project, tasks, deps, agents, events, milestones, plans, phases, phaseTasks, categories] = await Promise.all([
+  const u = c.var.user!;
+  const visible = await c.env.DB.prepare(
+    `SELECT 1 FROM projects p WHERE p.id = ? AND ${VISIBILITY_WHERE}`,
+  ).bind(pid, u.role, u.id, u.id).first();
+  if (!visible) return c.json({ error: 'not found' }, 404);
+  const [project, tasks, deps, agents, events, milestones, plans, phases, phaseTasks, tags, taskTags] = await Promise.all([
     c.env.DB.prepare('SELECT id, key, name, description, claim_ttl_seconds AS claimTtlSeconds, repo_url AS repoUrl FROM projects WHERE id = ?')
       .bind(pid).first(),
     c.env.DB.prepare(
-      `SELECT id, key, title, body, status, priority, claimed_by AS claimedBy, claim_expires_at AS claimExpiresAt,
-              parent_task_id AS parentTaskId, milestone_id AS milestoneId, category_id AS categoryId,
+      `SELECT id, key, title, body, status, type, priority, claimed_by AS claimedBy, claim_expires_at AS claimExpiresAt,
+              parent_task_id AS parentTaskId, milestone_id AS milestoneId,
               open_comments AS openComments, "order"
        FROM tasks WHERE project_id = ? ORDER BY "order"`,
     ).bind(pid).all(),
@@ -154,8 +170,8 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
        FROM dependencies d JOIN tasks t ON t.id = d.task_id WHERE t.project_id = ?`,
     ).bind(pid).all(),
     c.env.DB.prepare(
-      `SELECT DISTINCT a.id, a.name, a.role, a.status, a.last_seen_at AS lastSeenAt
-       FROM agents a WHERE a.status != 'revoked' ORDER BY a.created_at`,
+      `SELECT DISTINCT a.id, a.name, a.role, a.status, a.last_seen_at AS lastSeenAt, u.name AS ownerName
+       FROM agents a LEFT JOIN users u ON u.id = a.user_id WHERE a.status != 'revoked' ORDER BY a.created_at`,
     ).all(),
     c.env.DB.prepare(
       `SELECT id, seq, actor_kind AS actorKind, actor_id AS actorId, verb, subject_type AS subjectType,
@@ -166,7 +182,8 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     c.env.DB.prepare('SELECT id, agent_id AS agentId, title, description, body, created_at AS createdAt FROM plans WHERE project_id = ? ORDER BY created_at DESC').bind(pid).all(),
     c.env.DB.prepare('SELECT ph.id, ph.plan_id AS planId, ph.title, ph.body, ph."order" FROM phases ph JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ? ORDER BY ph."order"').bind(pid).all(),
     c.env.DB.prepare('SELECT pt.phase_id AS phaseId, pt.task_id AS taskId FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ?').bind(pid).all(),
-    c.env.DB.prepare('SELECT id, name, color, "order" FROM categories WHERE project_id = ? ORDER BY "order"').bind(pid).all(),
+    c.env.DB.prepare('SELECT id, name, color, "order" FROM tags WHERE project_id = ? ORDER BY "order"').bind(pid).all(),
+    c.env.DB.prepare('SELECT tt.task_id AS taskId, tt.tag_id AS tagId FROM task_tags tt JOIN tasks t ON t.id = tt.task_id WHERE t.project_id = ?').bind(pid).all(),
   ]);
   if (!project) return c.json({ error: 'not found' }, 404);
   return c.json({
@@ -178,7 +195,8 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     plans: plans.results,
     phases: phases.results,
     phaseTasks: phaseTasks.results,
-    categories: categories.results,
+    tags: tags.results,
+    taskTags: taskTags.results,
     events: events.results.map((e) => ({ ...e, payload: JSON.parse(String(e.payload)) })),
   });
 });
@@ -187,14 +205,16 @@ app.get('/api/tasks/:tid', userAuth, async (c) => {
   const tid = c.req.param('tid')!;
   const task = await c.env.DB.prepare('SELECT * FROM tasks WHERE id = ?').bind(tid).first();
   if (!task) return c.json({ error: 'not found' }, 404);
-  const [comments, refs] = await Promise.all([
+  const [comments, refs, attachments, taskTagRows] = await Promise.all([
     c.env.DB.prepare(
       `SELECT id, author_kind AS authorKind, author_id AS authorId, kind, body, status, parent_comment_id AS parentCommentId, created_at AS createdAt
        FROM comments WHERE task_id = ? ORDER BY created_at`,
     ).bind(tid).all(),
     c.env.DB.prepare('SELECT kind, ref, url, state FROM task_refs WHERE task_id = ?').bind(tid).all(),
+    c.env.DB.prepare('SELECT id, filename, content_type AS contentType, size, uploaded_by_kind AS uploaderKind, uploaded_by AS uploadedBy, created_at AS createdAt FROM attachments WHERE task_id = ? ORDER BY created_at').bind(tid).all(),
+    c.env.DB.prepare('SELECT tag_id AS tagId FROM task_tags WHERE task_id = ?').bind(tid).all(),
   ]);
-  return c.json({ task, comments: comments.results, refs: refs.results });
+  return c.json({ task, comments: comments.results, refs: refs.results, attachments: attachments.results, tagIds: taskTagRows.results.map((r) => r.tagId) });
 });
 
 // --- UI write API (all writes go through ProjectRoom; a human is just another actor) ---
@@ -203,8 +223,8 @@ app.post('/api/projects', userAuth, async (c) => {
   if (!/^[A-Z][A-Z0-9]{0,7}$/.test(body.key ?? '')) return c.json({ error: 'key must be 1-8 uppercase letters/digits' }, 400);
   const id = `prj_${body.key.toLowerCase()}`;
   await c.env.DB.prepare(
-    `INSERT INTO projects (id, key, name, description, status, claim_ttl_seconds, created_at) VALUES (?, ?, ?, ?, 'active', 1800, ?)`,
-  ).bind(id, body.key, body.name, body.description ?? '', nowIso()).run();
+    `INSERT INTO projects (id, key, name, description, status, claim_ttl_seconds, owner_user_id, created_at) VALUES (?, ?, ?, ?, 'active', 1800, ?, ?)`,
+  ).bind(id, body.key, body.name, body.description ?? '', c.var.user!.id, nowIso()).run();
   await room(c.env, id).createMilestone(id, humanActor(c), 'Backlog');
   return c.json({ id, key: body.key });
 });
@@ -232,6 +252,13 @@ app.post('/api/projects/:pid/tasks', userAuth, async (c) => {
 app.patch('/api/projects/:pid/tasks/:tid', userAuth, async (c) => {
   const patch = await c.req.json();
   const result = await room(c.env, c.req.param('pid')!).updateTask(c.req.param('pid')!, humanActor(c), c.req.param('tid')!, patch);
+  return c.json(result);
+});
+
+app.post('/api/projects/:pid/messages', userAuth, async (c) => {
+  const { body, toAgentId } = await c.req.json<{ body: string; toAgentId?: string }>();
+  if (!body?.trim()) return c.json({ error: 'body required' }, 400);
+  const result = await room(c.env, c.req.param('pid')!).sendMessage(c.req.param('pid')!, humanActor(c), body.trim(), toAgentId ?? null);
   return c.json(result);
 });
 
@@ -271,7 +298,7 @@ app.post('/api/groups', userAuth, async (c) => {
 });
 
 app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
-  const body = await c.req.json<{ groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number }>();
+  const body = await c.req.json<{ groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number; ownerUserId?: string | null }>();
   const sets: string[] = [];
   const binds: unknown[] = [];
   if (body.groupId !== undefined) { sets.push('group_id = ?'); binds.push(body.groupId); }
@@ -281,6 +308,10 @@ app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
     if (body.claimTtlSeconds < 60 || body.claimTtlSeconds > 24 * 3600) return c.json({ error: 'claim TTL must be 60s–24h' }, 400);
     sets.push('claim_ttl_seconds = ?'); binds.push(Math.round(body.claimTtlSeconds));
   }
+  if (body.ownerUserId !== undefined) {
+    if (c.var.user!.role !== 'admin') return c.json({ error: 'admin role required to reassign ownership' }, 403);
+    sets.push('owner_user_id = ?'); binds.push(body.ownerUserId);
+  }
   if (!sets.length) return c.json({ ok: true });
   binds.push(c.req.param('pid')!);
   await c.env.DB.prepare(`UPDATE projects SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
@@ -288,12 +319,12 @@ app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
 });
 
 // --- categories (custom, per project) -----------------------------------------------
-app.post('/api/projects/:pid/categories', userAuth, async (c) => {
+app.post('/api/projects/:pid/tags', userAuth, async (c) => {
   const { name } = await c.req.json<{ name: string }>();
   if (!name?.trim()) return c.json({ error: 'name required' }, 400);
   const pid = c.req.param('pid')!;
-  const id = await room(c.env, pid).resolveCategory(pid, humanActor(c), name);
-  return c.json({ id, name: name.trim() });
+  const id = await room(c.env, pid).resolveTag(pid, humanActor(c), name);
+  return c.json({ id, name: name.trim().toLowerCase() });
 });
 
 // --- user management ------------------------------------------------------------------
@@ -304,7 +335,8 @@ app.get('/api/users', userAuth, async (c) => {
     `SELECT u.id, u.email, u.name, u.role, u.disabled, u.created_at AS createdAt,
             (u.password_hash IS NULL AND NOT EXISTS (SELECT 1 FROM passkeys p WHERE p.user_id = u.id)) AS pending,
             (SELECT COUNT(*) FROM passkeys p WHERE p.user_id = u.id) AS passkeys,
-            (SELECT GROUP_CONCAT(g.id) FROM user_groups ug JOIN groups g ON g.id = ug.group_id WHERE ug.user_id = u.id) AS groupIds
+            (SELECT GROUP_CONCAT(g.id) FROM user_groups ug JOIN groups g ON g.id = ug.group_id WHERE ug.user_id = u.id) AS groupIds,
+            (SELECT COUNT(*) FROM projects p WHERE p.owner_user_id = u.id AND p.status = 'active') AS ownedProjects
      FROM users u ORDER BY u.created_at`,
   ).all();
   return c.json({ users: results });
@@ -339,6 +371,28 @@ app.patch('/api/users/:uid', userAuth, async (c) => {
   binds.push(uid);
   await c.env.DB.prepare(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
   if (body.disabled) await c.env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(uid).run();
+  return c.json({ ok: true });
+});
+
+app.delete('/api/users/:uid', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  const uid = c.req.param('uid')!;
+  if (uid === c.var.user!.id) return c.json({ error: 'cannot delete yourself' }, 400);
+  const target = await c.env.DB.prepare('SELECT disabled FROM users WHERE id = ?').bind(uid).first<{ disabled: number }>();
+  if (!target) return c.json({ error: 'not found' }, 404);
+  if (!target.disabled) return c.json({ error: 'disable the user first — delete is only available for disabled users' }, 400);
+  await c.env.DB.batch([
+    c.env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(uid),
+    c.env.DB.prepare('DELETE FROM invites WHERE user_id = ?').bind(uid),
+    c.env.DB.prepare('DELETE FROM passkeys WHERE user_id = ?').bind(uid),
+    c.env.DB.prepare('DELETE FROM user_groups WHERE user_id = ?').bind(uid),
+    c.env.DB.prepare('DELETE FROM oauth_codes WHERE user_id = ?').bind(uid),
+    c.env.DB.prepare('DELETE FROM oauth_tokens WHERE user_id = ?').bind(uid),
+    c.env.DB.prepare('UPDATE agents SET user_id = NULL WHERE user_id = ?').bind(uid),
+    c.env.DB.prepare('UPDATE projects SET owner_user_id = NULL WHERE owner_user_id = ?').bind(uid),
+    c.env.DB.prepare('DELETE FROM users WHERE id = ?').bind(uid),
+  ]);
+  // Historical attribution in events/comments keeps the raw id — intentionally preserved.
   return c.json({ ok: true });
 });
 
@@ -391,9 +445,10 @@ app.delete('/api/groups/:gid', userAuth, async (c) => {
 app.get('/api/agents', userAuth, async (c) => {
   const { results } = await c.env.DB.prepare(
     `SELECT a.id, a.name, a.role, a.status, a.last_seen_at AS lastSeenAt, a.created_at AS createdAt,
+            u.name AS ownerName, u.id AS ownerUserId,
             (SELECT COUNT(*) FROM tasks t WHERE t.claimed_by = a.id) AS heldTasks,
             (SELECT COUNT(*) FROM claims cl WHERE cl.agent_id = a.id) AS totalClaims
-     FROM agents a ORDER BY a.created_at`,
+     FROM agents a LEFT JOIN users u ON u.id = a.user_id ORDER BY a.created_at`,
   ).all();
   return c.json({ agents: results });
 });
@@ -422,6 +477,67 @@ app.post('/api/agents', userAuth, async (c) => {
 app.post('/api/agents/:aid/revoke', userAuth, async (c) => {
   if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
   await c.env.DB.prepare("UPDATE agents SET status = 'revoked' WHERE id = ?").bind(c.req.param('aid')!).run();
+  return c.json({ ok: true });
+});
+
+// --- per-task event timeline (PLNR-34) ----------------------------------------------
+app.get('/api/tasks/:tid/events', userAuth, async (c) => {
+  const tid = c.req.param('tid')!;
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, seq, actor_kind AS actorKind, actor_id AS actorId, verb, payload, created_at AS createdAt
+     FROM events WHERE subject_id = ?1 OR payload LIKE '%"taskId":"' || ?1 || '"%'
+     ORDER BY rowid DESC LIMIT 60`,
+  ).bind(tid).all();
+  return c.json({ events: results.map((e) => ({ ...e, payload: JSON.parse(String(e.payload)) })) });
+});
+
+// --- attachments (PLNR-31): bytes in R2, metadata in D1 -------------------------------
+const MAX_ATTACHMENT = 25 * 1024 * 1024;
+
+app.post('/api/tasks/:tid/attachments', userAuth, async (c) => {
+  if (!c.env.FILES) return c.json({ error: 'attachments not configured — enable R2 and bind FILES (see wrangler.jsonc)' }, 503);
+  const tid = c.req.param('tid')!;
+  const task = await c.env.DB.prepare('SELECT id, project_id AS pid FROM tasks WHERE id = ?').bind(tid)
+    .first<{ id: string; pid: string }>();
+  if (!task) return c.json({ error: 'task not found' }, 404);
+  const filename = (c.req.query('filename') ?? 'file').replace(/[\/\\]/g, '_').slice(0, 120);
+  const size = Number(c.req.header('Content-Length') ?? '0');
+  if (!size || size > MAX_ATTACHMENT) return c.json({ error: 'attachment must be 1 byte – 25 MB' }, 413);
+  const id = newId('att');
+  const key = `att/${task.pid}/${id}/${filename}`;
+  await c.env.FILES.put(key, c.req.raw.body, {
+    httpMetadata: { contentType: c.req.header('Content-Type') ?? 'application/octet-stream' },
+  });
+  await c.env.DB.prepare(
+    `INSERT INTO attachments (id, task_id, filename, content_type, size, r2_key, uploaded_by_kind, uploaded_by, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'human', ?, ?)`,
+  ).bind(id, tid, filename, c.req.header('Content-Type') ?? 'application/octet-stream', size, key, c.var.user!.id, nowIso()).run();
+  await room(c.env, task.pid).noteAttachment(task.pid, humanActor(c), tid, filename, id);
+  return c.json({ id, filename, size });
+});
+
+app.get('/api/attachments/:aid', userAuth, async (c) => {
+  const row = await c.env.DB.prepare('SELECT r2_key AS key, filename, content_type AS ct FROM attachments WHERE id = ?')
+    .bind(c.req.param('aid')!).first<{ key: string; filename: string; ct: string }>();
+  if (!row) return c.json({ error: 'not found' }, 404);
+  if (!c.env.FILES) return c.json({ error: 'attachments not configured' }, 503);
+  const obj = await c.env.FILES.get(row.key);
+  if (!obj) return c.json({ error: 'file missing from storage' }, 404);
+  return new Response(obj.body, {
+    headers: {
+      'Content-Type': row.ct,
+      'Content-Disposition': `attachment; filename="${row.filename.replace(/"/g, '')}"`,
+    },
+  });
+});
+
+app.delete('/api/attachments/:aid', userAuth, async (c) => {
+  const row = await c.env.DB.prepare('SELECT id, r2_key AS key, uploaded_by AS uploader FROM attachments WHERE id = ?')
+    .bind(c.req.param('aid')!).first<{ id: string; key: string; uploader: string }>();
+  if (!row) return c.json({ error: 'not found' }, 404);
+  if (c.var.user!.role !== 'admin' && row.uploader !== c.var.user!.id) return c.json({ error: 'not yours' }, 403);
+  if (c.env.FILES) await c.env.FILES.delete(row.key);
+  await c.env.DB.prepare('DELETE FROM attachments WHERE id = ?').bind(row.id).run();
   return c.json({ ok: true });
 });
 

@@ -5,12 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "sh -c 'wrangler deploy --config $([ -f wrangler.production.jsonc ] && echo wrangler.production.jsonc || echo wrangler.jsonc)'",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "cf-typegen": "wrangler types",
     "db:migrate:local": "wrangler d1 migrations apply planar --local",
-    "db:migrate:remote": "wrangler d1 migrations apply planar --remote"
+    "db:migrate:remote": "sh -c 'wrangler d1 migrations apply planar --remote --config $([ -f wrangler.production.jsonc ] && echo wrangler.production.jsonc || echo wrangler.jsonc)'"
   },
   "dependencies": {
     "@hono/mcp": "^0.3.1",

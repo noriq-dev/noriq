@@ -206,37 +206,39 @@ describe('oauth 2.1 for MCP', () => {
   });
 });
 
-describe('categories', () => {
+describe('tags', () => {
   let agentKey: string;
   let projectId: string;
 
   beforeAll(async () => {
-    const a = await createAgent('cat-agent', 'orchestrator');
+    const a = await createAgent('tag-agent', 'orchestrator');
     agentKey = a.apiKey;
-    const proj = await mcpCall(agentKey, 'create_project', { key: 'CAT', name: 'categories-project' });
+    const proj = await mcpCall(agentKey, 'create_project', { key: 'TAG', name: 'tags-project' });
     projectId = proj.body.id;
   });
 
-  it('create_task auto-creates a category by name; reuse is idempotent', async () => {
-    const t1 = await mcpCall(agentKey, 'create_task', { projectId, title: 'api thing', category: 'backend' });
+  it('create_task applies multiple tags, auto-creating by name (idempotent)', async () => {
+    const t1 = await mcpCall(agentKey, 'create_task', { projectId, title: 'api thing', tags: ['backend', 'auth'], type: 'bug' });
     expect(t1.isError).toBe(false);
-    const t2 = await mcpCall(agentKey, 'create_task', { projectId, title: 'another api thing', category: 'backend' });
+    const t2 = await mcpCall(agentKey, 'create_task', { projectId, title: 'another api thing', tags: ['backend'] });
     expect(t2.isError).toBe(false);
     const proj = await mcpCall(agentKey, 'get_project', { projectId });
-    expect(proj.body.categories).toHaveLength(1);
-    expect(proj.body.categories[0].name).toBe('backend');
-    const catId = proj.body.categories[0].id;
-    expect(proj.body.tasks.filter((t: { categoryId: string }) => t.categoryId === catId)).toHaveLength(2);
+    expect(proj.body.tags.map((c: { name: string }) => c.name).sort()).toEqual(['auth', 'backend']);
+    const task1 = proj.body.tasks.find((x: { id: string }) => x.id === t1.body.id);
+    expect(task1.tags.split(',').sort()).toEqual(['auth', 'backend']);
+    expect(task1.type).toBe('bug');
   });
 
-  it('update_task can set and clear a category', async () => {
+  it('update_task replaces and clears the tag set', async () => {
     const t = await mcpCall(agentKey, 'create_task', { projectId, title: 'docs thing' });
-    await mcpCall(agentKey, 'update_task', { projectId, taskId: t.body.id, category: 'docs' });
+    await mcpCall(agentKey, 'update_task', { projectId, taskId: t.body.id, tags: ['docs'], type: 'chore' });
     let proj = await mcpCall(agentKey, 'get_project', { projectId });
-    expect(proj.body.categories.map((c: { name: string }) => c.name).sort()).toEqual(['backend', 'docs']);
-    await mcpCall(agentKey, 'update_task', { projectId, taskId: t.body.id, category: '' });
+    let task = proj.body.tasks.find((x: { id: string }) => x.id === t.body.id);
+    expect(task.tags).toBe('docs');
+    expect(task.type).toBe('chore');
+    await mcpCall(agentKey, 'update_task', { projectId, taskId: t.body.id, tags: [] });
     proj = await mcpCall(agentKey, 'get_project', { projectId });
-    const task = proj.body.tasks.find((x: { id: string }) => x.id === t.body.id);
-    expect(task.categoryId).toBeNull();
+    task = proj.body.tasks.find((x: { id: string }) => x.id === t.body.id);
+    expect(task.tags).toBeNull();
   });
 });
