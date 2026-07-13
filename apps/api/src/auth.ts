@@ -22,18 +22,37 @@ export type Vars = {
 
 export type AppContext = { Bindings: Env; Variables: Vars };
 
-/** Bearer-key auth for agents (MCP + agent REST). Sets c.var.agent. */
+/**
+ * Bearer auth for agents (MCP + agent REST). Accepts both static API keys
+ * (plnr_*) and OAuth access tokens (plnrt_*). 401s advertise the OAuth
+ * resource metadata so MCP clients can discover the authorization server.
+ */
 export async function agentAuth(c: Context<AppContext>, next: Next) {
+  const unauthorized = (msg: string) => {
+    c.header(
+      'WWW-Authenticate',
+      `Bearer resource_metadata="${new URL(c.req.url).origin}/.well-known/oauth-protected-resource"`,
+    );
+    return c.json({ error: msg }, 401);
+  };
   const header = c.req.header('Authorization') ?? '';
   const key = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
-  if (!key) return c.json({ error: 'missing bearer token' }, 401);
+  if (!key) return unauthorized('missing bearer token');
   const hash = await sha256Hex(key);
-  const row = await c.env.DB.prepare(
-    "SELECT id, name, role FROM agents WHERE api_key_hash = ? AND status != 'revoked'",
-  )
-    .bind(hash)
-    .first<AgentIdentity>();
-  if (!row) return c.json({ error: 'invalid or revoked token' }, 401);
+
+  let row: AgentIdentity | null;
+  if (key.startsWith('plnrt_')) {
+    row = await c.env.DB.prepare(
+      `SELECT a.id, a.name, a.role FROM oauth_tokens t JOIN agents a ON a.id = t.agent_id
+       WHERE t.token_hash = ? AND t.revoked_at IS NULL
+         AND t.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') AND a.status != 'revoked'`,
+    ).bind(hash).first<AgentIdentity>();
+  } else {
+    row = await c.env.DB.prepare(
+      "SELECT id, name, role FROM agents WHERE api_key_hash = ? AND status != 'revoked'",
+    ).bind(hash).first<AgentIdentity>();
+  }
+  if (!row) return unauthorized('invalid, expired, or revoked token');
   c.set('agent', row);
   await next();
 }
@@ -54,7 +73,7 @@ export async function userAuth(c: Context<AppContext>, next: Next) {
   if (!sid) return c.json({ error: 'not signed in' }, 401);
   const row = await c.env.DB.prepare(
     `SELECT u.id, u.email, u.name, u.role FROM sessions s JOIN users u ON u.id = s.user_id
-     WHERE s.id = ? AND s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
+     WHERE s.id = ? AND s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') AND u.disabled = 0`,
   )
     .bind(await sha256Hex(sid))
     .first<UserIdentity>();

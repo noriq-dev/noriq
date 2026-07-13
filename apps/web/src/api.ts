@@ -38,6 +38,18 @@ export const api = {
   setProjectMeta: (pid: string, meta: { groupId?: string | null; description?: string; name?: string }) =>
     req('PATCH', `/api/projects/${pid}/meta`, meta),
 
+  users: () => req<{ users: ApiUser[] }>('GET', '/api/users'),
+  createUser: (email: string, name: string, password: string, role: string) =>
+    req<{ id: string }>('POST', '/api/users', { email, name, password, role }),
+  patchUser: (uid: string, patch: { role?: string; disabled?: boolean; name?: string }) =>
+    req('PATCH', `/api/users/${uid}`, patch),
+  resetPassword: (uid: string) => req<{ tempPassword: string }>('POST', `/api/users/${uid}/reset-password`),
+  changePassword: (current: string, next: string) => req('POST', '/api/auth/change-password', { current, next }),
+
+  patchGroup: (gid: string, patch: { name?: string; description?: string }) => req('PATCH', `/api/groups/${gid}`, patch),
+  deleteGroup: (gid: string) => req('DELETE', `/api/groups/${gid}`),
+  createCategory: (pid: string, name: string) => req<{ id: string }>('POST', `/api/projects/${pid}/categories`, { name }),
+
   agents: () => req<{ agents: ApiAgent[] }>('GET', '/api/agents'),
   agentEvents: (aid: string) => req<{ events: ApiAgentEvent[] }>('GET', `/api/agents/${aid}/events`),
   createAgent: (name: string, role: string) =>
@@ -46,7 +58,7 @@ export const api = {
 
   createMilestone: (pid: string, title: string, dueAt?: string) =>
     req<{ id: string }>('POST', `/api/projects/${pid}/milestones`, { title, dueAt }),
-  createTask: (pid: string, input: { title: string; body?: string; priority?: number; milestoneId?: string }) =>
+  createTask: (pid: string, input: { title: string; body?: string; priority?: number; milestoneId?: string; category?: string }) =>
     req<{ id: string; key: string }>('POST', `/api/projects/${pid}/tasks`, input),
   updateTask: (pid: string, tid: string, patch: Record<string, unknown>) =>
     req('PATCH', `/api/projects/${pid}/tasks/${tid}`, patch),
@@ -65,6 +77,15 @@ export interface ApiProject {
   description: string;
   liveTasks: number;
   groupId: string | null;
+}
+
+export interface ApiUser {
+  id: string;
+  email: string;
+  name: string;
+  role: string;
+  disabled: number;
+  createdAt: string;
 }
 
 export interface ApiAgent {
@@ -94,7 +115,7 @@ export interface ApiSnapshot {
   tasks: Array<{
     id: string; key: string; title: string; body: string; status: string; priority: number;
     claimedBy: string | null; claimExpiresAt: string | null; parentTaskId: string | null;
-    milestoneId: string | null; openComments: number; order: number;
+    milestoneId: string | null; categoryId: string | null; openComments: number; order: number;
   }>;
   dependencies: Array<{ taskId: string; dependsOnTaskId: string }>;
   agents: Array<{ id: string; name: string; role: string; status: string; lastSeenAt: string | null }>;
@@ -102,6 +123,7 @@ export interface ApiSnapshot {
   plans: Array<{ id: string; agentId: string | null; title: string; description: string; createdAt: string }>;
   phases: Array<{ id: string; planId: string; title: string; order: number }>;
   phaseTasks: Array<{ phaseId: string; taskId: string }>;
+  categories: Array<{ id: string; name: string; color: string; order: number }>;
   events: Array<{
     id: string; seq: number; actorKind: 'agent' | 'human' | 'system'; actorId: string; verb: string;
     subjectType: string; subjectId: string; payload: Record<string, unknown>; createdAt: string;

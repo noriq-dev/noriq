@@ -89,13 +89,16 @@ function CreateTaskModal({ store }: { store: AppStore }) {
   const [body, setBody] = useState('');
   const [priority, setPriority] = useState(2);
   const [milestoneId, setMilestoneId] = useState('');
+  const [category, setCategory] = useState('');
   const milestones = store.snapshot?.milestones ?? [];
+  const categories = store.snapshot?.categories ?? [];
   const { busy, error, run } = useSubmit(async () => {
     await store.actions.submitTask({
       title: title.trim(),
       body: body.trim() || undefined,
       priority,
       milestoneId: milestoneId || undefined,
+      category: category.trim() || undefined,
     });
   });
 
@@ -126,6 +129,19 @@ function CreateTaskModal({ store }: { store: AppStore }) {
           </Select>
         </Field>
       </div>
+      <Field label="Category" hint="pick one or type a new name to create it">
+        <TextInput
+          list="planar-categories"
+          value={category}
+          onChange={(e) => setCategory(e.target.value)}
+          placeholder={categories.length ? categories.map((c) => c.name).slice(0, 3).join(' / ') + ' / …' : 'backend, docs, infra…'}
+        />
+        <datalist id="planar-categories">
+          {categories.map((c) => (
+            <option key={c.id} value={c.name} />
+          ))}
+        </datalist>
+      </Field>
       <div style={{ display: 'flex', gap: 8, marginTop: 6, alignItems: 'center' }}>
         <Button variant="ghost" onClick={() => store.actions.openModal('milestone')}>+ new milestone</Button>
         <ErrorNote>{error}</ErrorNote>

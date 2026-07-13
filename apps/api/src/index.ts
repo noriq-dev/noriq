@@ -6,11 +6,16 @@ import { buildMcpServer } from './mcp';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, verifyPassword } from './lib/util';
 import type { Actor } from './do/ProjectRoom';
 import { SKILL_MD } from './skill';
+import { metadataRoutes, oauth } from './oauth';
 
 export { ProjectRoom } from './do/ProjectRoom';
 export { AgentSession } from './do/AgentSession';
 
 const app = new Hono<AppContext>();
+
+// OAuth 2.1 AS for MCP clients: discovery + register/authorize/token.
+metadataRoutes(app);
+app.route('/oauth', oauth);
 
 const room = (env: Env, projectId: string) => env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName(projectId));
 const humanActor = (c: { var: { user?: { id: string; name: string } } }): Actor => ({
@@ -97,7 +102,7 @@ app.post('/api/setup', async (c) => {
 // --- human auth -----------------------------------------------------------------
 app.post('/api/auth/login', async (c) => {
   const { email, password } = await c.req.json<{ email: string; password: string }>();
-  const user = await c.env.DB.prepare('SELECT id, email, name, role, password_hash AS hash FROM users WHERE email = ?')
+  const user = await c.env.DB.prepare('SELECT id, email, name, role, password_hash AS hash FROM users WHERE email = ? AND disabled = 0')
     .bind((email ?? '').toLowerCase())
     .first<{ id: string; email: string; name: string; role: string; hash: string | null }>();
   if (!user?.hash || !(await verifyPassword(password ?? '', user.hash))) {
@@ -130,12 +135,13 @@ app.get('/api/projects', userAuth, async (c) => {
 
 app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
-  const [project, tasks, deps, agents, events, milestones, plans, phases, phaseTasks] = await Promise.all([
+  const [project, tasks, deps, agents, events, milestones, plans, phases, phaseTasks, categories] = await Promise.all([
     c.env.DB.prepare('SELECT id, key, name, description, claim_ttl_seconds AS claimTtlSeconds, repo_url AS repoUrl FROM projects WHERE id = ?')
       .bind(pid).first(),
     c.env.DB.prepare(
       `SELECT id, key, title, body, status, priority, claimed_by AS claimedBy, claim_expires_at AS claimExpiresAt,
-              parent_task_id AS parentTaskId, milestone_id AS milestoneId, open_comments AS openComments, "order"
+              parent_task_id AS parentTaskId, milestone_id AS milestoneId, category_id AS categoryId,
+              open_comments AS openComments, "order"
        FROM tasks WHERE project_id = ? ORDER BY "order"`,
     ).bind(pid).all(),
     c.env.DB.prepare(
@@ -155,6 +161,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     c.env.DB.prepare('SELECT id, agent_id AS agentId, title, description, created_at AS createdAt FROM plans WHERE project_id = ? ORDER BY created_at DESC').bind(pid).all(),
     c.env.DB.prepare('SELECT ph.id, ph.plan_id AS planId, ph.title, ph."order" FROM phases ph JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ? ORDER BY ph."order"').bind(pid).all(),
     c.env.DB.prepare('SELECT pt.phase_id AS phaseId, pt.task_id AS taskId FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ?').bind(pid).all(),
+    c.env.DB.prepare('SELECT id, name, color, "order" FROM categories WHERE project_id = ? ORDER BY "order"').bind(pid).all(),
   ]);
   if (!project) return c.json({ error: 'not found' }, 404);
   return c.json({
@@ -166,6 +173,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     plans: plans.results,
     phases: phases.results,
     phaseTasks: phaseTasks.results,
+    categories: categories.results,
     events: events.results.map((e) => ({ ...e, payload: JSON.parse(String(e.payload)) })),
   });
 });
@@ -264,8 +272,102 @@ app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
   return c.json({ ok: true });
 });
 
-// --- agent management (admin humans) ------------------------------------------------
+// --- categories (custom, per project) -----------------------------------------------
+app.post('/api/projects/:pid/categories', userAuth, async (c) => {
+  const { name } = await c.req.json<{ name: string }>();
+  if (!name?.trim()) return c.json({ error: 'name required' }, 400);
+  const pid = c.req.param('pid')!;
+  const id = await room(c.env, pid).resolveCategory(pid, humanActor(c), name);
+  return c.json({ id, name: name.trim() });
+});
+
+// --- user management ------------------------------------------------------------------
 const requireAdmin = (c: { var: { user?: { role: string } } }) => c.var.user?.role === 'admin';
+
+app.get('/api/users', userAuth, async (c) => {
+  const { results } = await c.env.DB.prepare(
+    'SELECT id, email, name, role, disabled, created_at AS createdAt FROM users ORDER BY created_at',
+  ).all();
+  return c.json({ users: results });
+});
+
+app.post('/api/users', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  const body = await c.req.json<{ email: string; name: string; password: string; role?: 'admin' | 'member' }>();
+  if (!body.email || !body.name || (body.password ?? '').length < 8) {
+    return c.json({ error: 'email, name and password (8+) required' }, 400);
+  }
+  const id = newId('usr');
+  await c.env.DB.prepare(
+    'INSERT INTO users (id, email, name, role, password_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+  ).bind(id, body.email.toLowerCase(), body.name, body.role ?? 'member', await hashPassword(body.password), nowIso()).run();
+  return c.json({ id, email: body.email, name: body.name, role: body.role ?? 'member' });
+});
+
+app.patch('/api/users/:uid', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  const uid = c.req.param('uid')!;
+  const body = await c.req.json<{ role?: 'admin' | 'member'; disabled?: boolean; name?: string }>();
+  if (uid === c.var.user!.id && (body.role === 'member' || body.disabled)) {
+    return c.json({ error: 'cannot demote or disable yourself' }, 400);
+  }
+  const sets: string[] = [];
+  const binds: unknown[] = [];
+  if (body.role !== undefined) { sets.push('role = ?'); binds.push(body.role); }
+  if (body.disabled !== undefined) { sets.push('disabled = ?'); binds.push(body.disabled ? 1 : 0); }
+  if (body.name !== undefined) { sets.push('name = ?'); binds.push(body.name); }
+  if (!sets.length) return c.json({ ok: true });
+  binds.push(uid);
+  await c.env.DB.prepare(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
+  if (body.disabled) await c.env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(uid).run();
+  return c.json({ ok: true });
+});
+
+app.post('/api/users/:uid/reset-password', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  const temp = newApiKey().slice(5, 21); // 16 random chars
+  await c.env.DB.prepare('UPDATE users SET password_hash = ? WHERE id = ?')
+    .bind(await hashPassword(temp), c.req.param('uid')!).run();
+  await c.env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(c.req.param('uid')!).run();
+  return c.json({ tempPassword: temp }); // shown once to the admin
+});
+
+app.post('/api/auth/change-password', userAuth, async (c) => {
+  const { current, next } = await c.req.json<{ current: string; next: string }>();
+  if ((next ?? '').length < 8) return c.json({ error: 'new password must be 8+ chars' }, 400);
+  const row = await c.env.DB.prepare('SELECT password_hash AS hash FROM users WHERE id = ?')
+    .bind(c.var.user!.id).first<{ hash: string | null }>();
+  if (!row?.hash || !(await verifyPassword(current ?? '', row.hash))) {
+    return c.json({ error: 'current password incorrect' }, 401);
+  }
+  await c.env.DB.prepare('UPDATE users SET password_hash = ? WHERE id = ?')
+    .bind(await hashPassword(next), c.var.user!.id).run();
+  return c.json({ ok: true });
+});
+
+// --- group management -----------------------------------------------------------------
+app.patch('/api/groups/:gid', userAuth, async (c) => {
+  const { name, description } = await c.req.json<{ name?: string; description?: string }>();
+  const sets: string[] = [];
+  const binds: unknown[] = [];
+  if (name !== undefined) { sets.push('name = ?'); binds.push(name); }
+  if (description !== undefined) { sets.push('description = ?'); binds.push(description); }
+  if (!sets.length) return c.json({ ok: true });
+  binds.push(c.req.param('gid')!);
+  await c.env.DB.prepare(`UPDATE groups SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
+  return c.json({ ok: true });
+});
+
+app.delete('/api/groups/:gid', userAuth, async (c) => {
+  const gid = c.req.param('gid')!;
+  await c.env.DB.batch([
+    c.env.DB.prepare('UPDATE projects SET group_id = NULL WHERE group_id = ?').bind(gid),
+    c.env.DB.prepare('DELETE FROM groups WHERE id = ?').bind(gid),
+  ]);
+  return c.json({ ok: true });
+});
+
+// --- agent management (admin humans) ------------------------------------------------
 
 app.get('/api/agents', userAuth, async (c) => {
   const { results } = await c.env.DB.prepare(

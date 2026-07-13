@@ -19,6 +19,8 @@ export function Drawer({ store }: { store: AppStore }) {
   });
   const canRelease = !!task.claimedBy;
   const openCount = task.openComments;
+  const milestone = task.milestoneId ? (store.snapshot?.milestones ?? []).find((m) => m.id === task.milestoneId) : null;
+  const category = task.categoryId ? (store.snapshot?.categories ?? []).find((c) => c.id === task.categoryId) : null;
   const holder = ag ? ag.name : eff === 'blocked' ? '— (blocked)' : '— (unclaimed)';
 
   return (
@@ -44,6 +46,8 @@ export function Drawer({ store }: { store: AppStore }) {
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
             <MonoTag color={m.color} bg={m.bg} size={11}>{task.key}</MonoTag>
             <MonoTag color={m.color} bg={m.bg} size={10.5}>{m.label}</MonoTag>
+            {category && <MonoTag color={category.color} bg="rgba(255,255,255,.05)" size={10}>{category.name}</MonoTag>}
+            {milestone && <MonoTag color="var(--text-mid)" bg="rgba(255,255,255,.05)" size={10}>{milestone.title}</MonoTag>}
             <div style={{ flex: 1 }} />
             <button
               onClick={actions.closeTask}

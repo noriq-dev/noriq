@@ -219,6 +219,8 @@ export function useAppStore() {
         ttl,
         ttlMax,
         deps: depsByTask.get(t.id) ?? [],
+        milestoneId: t.milestoneId,
+        categoryId: t.categoryId,
         openComments: t.openComments,
         comments: t.id === selectedTaskId ? comments : [],
       };
@@ -292,7 +294,7 @@ export function useAppStore() {
       lastSeq.current = 0;
     },
 
-    async submitTask(input: { title: string; body?: string; priority?: number; milestoneId?: string }) {
+    async submitTask(input: { title: string; body?: string; priority?: number; milestoneId?: string; category?: string }) {
       if (!pidRef.current) return;
       await api.createTask(pidRef.current, input);
       setModal(null);
@@ -343,7 +345,7 @@ export function useAppStore() {
       const target =
         (selectedTaskId != null ? tasks.find((x) => x.id === selectedTaskId) : null) ??
         tasks.find((x) => x.status === 'in_progress') ??
-        tasks[0];
+        tasks.find((x) => !['done', 'cancelled'].includes(x.status));
       if (!target) return;
       await api.postComment(pidRef.current, target.id, draftKind, text);
       setDraftText('');

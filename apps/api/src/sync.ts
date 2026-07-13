@@ -15,6 +15,8 @@ export interface AgentUpdates {
     id: string; taskId: string; taskKey: string; kind: string; body: string; status: string; author: string;
   }>;
   heldTasks: Array<{ id: string; key: string; title: string; status: string; claimExpiresAt: string | null }>;
+  /** Open comments on tasks NOBODY holds — visible to every agent so questions can't vanish. */
+  unassignedComments: Array<{ id: string; taskId: string; taskKey: string; kind: string; body: string }>;
   claimable: Array<{ id: string; key: string; title: string; projectId: string; priority: number }>;
   messages: Array<{ id: string; from: string; body: string; refTaskId: string | null; createdAt: string }>;
 }
@@ -66,6 +68,17 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
       ).results
     : [];
 
+  // Open comments on unclaimed tasks — sticky for everyone, so a question posted
+  // to a task nobody holds still reaches an agent (dogfooding find, 2026-07-13).
+  const unassignedComments = (
+    await env.DB.prepare(
+      `SELECT c.id, c.task_id AS taskId, t.key AS taskKey, c.kind, c.body
+       FROM comments c JOIN tasks t ON t.id = c.task_id
+       WHERE t.claimed_by IS NULL AND c.status IN ('open','acknowledged') AND c.author_kind != 'agent'
+       ORDER BY c.created_at LIMIT 10`,
+    ).all<AgentUpdates['unassignedComments'][number]>()
+  ).results;
+
   // Dependency-unblocked, unclaimed tasks across active projects.
   const claimable = (
     await env.DB.prepare(
@@ -94,7 +107,7 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
   }
   await session.touch();
 
-  return { notices, openComments, heldTasks: heldRows.results, claimable, messages };
+  return { notices, openComments, unassignedComments, heldTasks: heldRows.results, claimable, messages };
 }
 
 /** Compact notices block appended to every MCP tool result (pushed-feeling updates without polling). */
@@ -103,6 +116,9 @@ export function formatNotices(u: AgentUpdates): string | null {
   for (const n of u.notices.slice(0, 5)) lines.push(`• ${n}`);
   if (u.openComments.length) {
     lines.push(`• ${u.openComments.length} unresolved comment(s) on your task(s) — resolve with resolve_comment before finishing.`);
+  }
+  for (const c of u.unassignedComments.slice(0, 3)) {
+    lines.push(`• Unassigned ${c.kind} on ${c.taskKey} (no holder): "${c.body.slice(0, 90)}" — answer via resolve_comment if you can.`);
   }
   if (!lines.length) return null;
   return `--- notices ---\n${lines.join('\n')}`;

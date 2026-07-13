@@ -10,6 +10,7 @@ import { Setup } from './components/Setup';
 import { PlansView } from './components/PlansView';
 import { AgentsView } from './components/AgentsView';
 import { ModalHost } from './components/modals';
+import { SettingsView } from './components/SettingsView';
 
 export function App() {
   const store = useAppStore();
@@ -39,6 +40,7 @@ export function App() {
               {store.view === 'board' && <Board store={store} />}
               {store.view === 'plans' && <PlansView store={store} />}
               {store.view === 'agents' && <AgentsView store={store} />}
+              {store.view === 'settings' && <SettingsView store={store} />}
             </div>
           </>
         ) : (

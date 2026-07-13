@@ -1,0 +1,219 @@
+// Settings — user management (admin), group management, own password.
+import { useEffect, useState } from 'react';
+import { api, type ApiUser } from '../api';
+import type { AppStore } from '../store';
+import { MonoTag, SectionLabel } from './bits';
+import { Button, ErrorNote, Field, Select, TextInput } from './ui';
+
+export function SettingsView({ store }: { store: AppStore }) {
+  const isAdmin = store.user?.role === 'admin';
+  return (
+    <div style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: '20px 26px' }}>
+      <div style={{ maxWidth: 760, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 28 }}>
+        {isAdmin && <UsersSection store={store} />}
+        <GroupsSection store={store} />
+        <PasswordSection />
+      </div>
+    </div>
+  );
+}
+
+function Section({ title, action, children }: { title: string; action?: React.ReactNode; children: React.ReactNode }) {
+  return (
+    <div style={{ border: '1px solid rgba(255,255,255,.07)', borderRadius: 14, background: 'rgba(255,255,255,.015)', padding: '18px 20px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', marginBottom: 14 }}>
+        <SectionLabel>{title}</SectionLabel>
+        <div style={{ flex: 1 }} />
+        {action}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function UsersSection({ store }: { store: AppStore }) {
+  const [users, setUsers] = useState<ApiUser[]>([]);
+  const [adding, setAdding] = useState(false);
+  const [email, setEmail] = useState('');
+  const [name, setName] = useState('');
+  const [password, setPassword] = useState('');
+  const [role, setRole] = useState('member');
+  const [error, setError] = useState<string | null>(null);
+  const [tempReveal, setTempReveal] = useState<{ name: string; temp: string } | null>(null);
+
+  const load = () => api.users().then((r) => setUsers(r.users)).catch(() => {});
+  useEffect(() => {
+    load();
+  }, []);
+
+  const me = store.user?.id;
+
+  return (
+    <Section
+      title={`Users · ${users.length}`}
+      action={<Button variant="ghost" style={{ padding: '5px 12px', fontSize: 11.5 }} onClick={() => setAdding(!adding)}>{adding ? 'cancel' : '+ add user'}</Button>}
+    >
+      {adding && (
+        <div style={{ border: '1px solid rgba(255,255,255,.08)', borderRadius: 10, padding: 14, marginBottom: 14 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <Field label="Name"><TextInput value={name} onChange={(e) => setName(e.target.value)} /></Field>
+            <Field label="Email"><TextInput type="email" value={email} onChange={(e) => setEmail(e.target.value)} /></Field>
+            <Field label="Initial password" hint="8+ chars"><TextInput value={password} onChange={(e) => setPassword(e.target.value)} /></Field>
+            <Field label="Role">
+              <Select value={role} onChange={(e) => setRole(e.target.value)}>
+                <option value="member">member</option>
+                <option value="admin">admin</option>
+              </Select>
+            </Field>
+          </div>
+          <ErrorNote>{error}</ErrorNote>
+          <Button
+            disabled={!name.trim() || !/\S+@\S+/.test(email) || password.length < 8}
+            onClick={async () => {
+              setError(null);
+              try {
+                await api.createUser(email.trim(), name.trim(), password, role);
+                setAdding(false);
+                setEmail(''); setName(''); setPassword('');
+                load();
+              } catch (e) {
+                setError(e instanceof Error ? e.message : String(e));
+              }
+            }}
+          >
+            Create user
+          </Button>
+        </div>
+      )}
+
+      {tempReveal && (
+        <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--accent)', background: 'rgba(198,242,78,.06)', border: '1px solid rgba(198,242,78,.25)', borderRadius: 9, padding: '9px 12px', marginBottom: 12 }}>
+          temp password for {tempReveal.name}: <b>{tempReveal.temp}</b> — shown once
+        </div>
+      )}
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {users.map((u) => (
+          <div key={u.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 11px', borderRadius: 9, background: 'rgba(255,255,255,.02)', border: '1px solid rgba(255,255,255,.06)', opacity: u.disabled ? 0.5 : 1 }}>
+            <div style={{ width: 26, height: 26, borderRadius: '50%', background: 'linear-gradient(135deg,#c6f24e,#3fd98b)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, color: 'var(--bg)', fontWeight: 700 }}>
+              {u.name.slice(0, 1).toUpperCase()}
+            </div>
+            <div style={{ minWidth: 0, flex: 1 }}>
+              <div style={{ fontSize: 12.5, fontWeight: 600 }}>
+                {u.name} {u.id === me && <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-dim)' }}>(you)</span>}
+              </div>
+              <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)' }}>{u.email}</div>
+            </div>
+            <MonoTag color={u.role === 'admin' ? 'var(--accent)' : 'var(--text-mid)'} bg={u.role === 'admin' ? 'rgba(198,242,78,.12)' : 'rgba(255,255,255,.06)'} size={9.5}>{u.role}</MonoTag>
+            {u.disabled ? <MonoTag color="var(--red-soft)" bg="rgba(255,92,92,.12)" size={9.5}>DISABLED</MonoTag> : null}
+            {u.id !== me && (
+              <div style={{ display: 'flex', gap: 6 }}>
+                <SmallAction onClick={async () => { await api.patchUser(u.id, { role: u.role === 'admin' ? 'member' : 'admin' }); load(); }}>
+                  {u.role === 'admin' ? 'demote' : 'promote'}
+                </SmallAction>
+                <SmallAction onClick={async () => { const r = await api.resetPassword(u.id); setTempReveal({ name: u.name, temp: r.tempPassword }); }}>
+                  reset pw
+                </SmallAction>
+                <SmallAction danger onClick={async () => { await api.patchUser(u.id, { disabled: !u.disabled }); load(); }}>
+                  {u.disabled ? 'enable' : 'disable'}
+                </SmallAction>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </Section>
+  );
+}
+
+function GroupsSection({ store }: { store: AppStore }) {
+  const groups = store.groups;
+  return (
+    <Section
+      title={`Groups · ${groups.length}`}
+      action={<Button variant="ghost" style={{ padding: '5px 12px', fontSize: 11.5 }} onClick={() => store.actions.openModal('group')}>+ new group</Button>}
+    >
+      {groups.length === 0 && <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>no groups — projects are ungrouped</div>}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {groups.map((g) => {
+          const count = store.data.projects.filter((p) => p.groupId === g.id).length;
+          return (
+            <div key={g.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 11px', borderRadius: 9, background: 'rgba(255,255,255,.02)', border: '1px solid rgba(255,255,255,.06)' }}>
+              <div style={{ minWidth: 0, flex: 1 }}>
+                <div style={{ fontSize: 12.5, fontWeight: 600 }}>{g.name}</div>
+                <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)' }}>{count} project{count === 1 ? '' : 's'}{g.description ? ` · ${g.description}` : ''}</div>
+              </div>
+              <SmallAction
+                onClick={async () => {
+                  const name = window.prompt('Rename group:', g.name)?.trim();
+                  if (name && name !== g.name) {
+                    await api.patchGroup(g.id, { name });
+                    location.reload();
+                  }
+                }}
+              >
+                rename
+              </SmallAction>
+              <SmallAction
+                danger
+                onClick={async () => {
+                  if (window.confirm(`Delete group "${g.name}"? Projects become ungrouped.`)) {
+                    await api.deleteGroup(g.id);
+                    location.reload();
+                  }
+                }}
+              >
+                delete
+              </SmallAction>
+            </div>
+          );
+        })}
+      </div>
+    </Section>
+  );
+}
+
+function PasswordSection() {
+  const [current, setCurrent] = useState('');
+  const [next, setNext] = useState('');
+  const [confirm, setConfirm] = useState('');
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const valid = current && next.length >= 8 && next === confirm;
+  return (
+    <Section title="Your password">
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
+        <Field label="Current"><TextInput type="password" value={current} onChange={(e) => setCurrent(e.target.value)} /></Field>
+        <Field label="New" hint="8+ chars"><TextInput type="password" value={next} onChange={(e) => setNext(e.target.value)} /></Field>
+        <Field label="Confirm"><TextInput type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} /></Field>
+      </div>
+      {msg && (
+        <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: msg.ok ? 'var(--green)' : 'var(--red-soft)', marginBottom: 10 }}>{msg.text}</div>
+      )}
+      <Button
+        disabled={!valid}
+        onClick={async () => {
+          try {
+            await api.changePassword(current, next);
+            setMsg({ ok: true, text: 'password changed' });
+            setCurrent(''); setNext(''); setConfirm('');
+          } catch (e) {
+            setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
+          }
+        }}
+      >
+        Change password
+      </Button>
+    </Section>
+  );
+}
+
+function SmallAction({ children, onClick, danger }: { children: React.ReactNode; onClick: () => void; danger?: boolean }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 10, color: danger ? 'var(--red-soft)' : 'var(--text-mid)', border: `1px solid ${danger ? 'rgba(255,92,92,.3)' : 'rgba(255,255,255,.12)'}`, padding: '3px 9px', borderRadius: 6, background: 'transparent' }}
+    >
+      {children}
+    </button>
+  );
+}

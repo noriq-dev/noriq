@@ -28,6 +28,8 @@ export interface CreateTaskInput {
   priority?: number;
   estimate?: number | null;
   dependsOn?: string[];
+  /** Category by name — auto-created for the project if it doesn't exist. */
+  category?: string | null;
 }
 
 export interface TaskPatch {
@@ -37,6 +39,9 @@ export interface TaskPatch {
   priority?: number;
   estimate?: number | null;
   milestoneId?: string | null;
+  categoryId?: string | null;
+  /** Category by name — auto-created if needed (takes precedence over categoryId). */
+  category?: string | null;
   order?: number;
 }
 
@@ -166,6 +171,24 @@ export class ProjectRoom extends DurableObject<Env> {
   // Task CRUD (RPC from the Worker)
   // ---------------------------------------------------------------------------
 
+  /** Find or create a category by name (per-project). */
+  async resolveCategory(projectId: string, actor: Actor, name: string): Promise<string> {
+    await this.setPid(projectId);
+    const trimmed = name.trim();
+    const existing = await this.env.DB.prepare('SELECT id FROM categories WHERE project_id = ? AND name = ?')
+      .bind(this.projectId, trimmed).first<{ id: string }>();
+    if (existing) return existing.id;
+    const id = newId('cat');
+    const palette = ['#4c9dff', '#b57bff', '#3fd98b', '#f5a623', '#ff8a8a', '#c6f24e', '#8a95a3'];
+    const count = await this.env.DB.prepare('SELECT COUNT(*) AS n FROM categories WHERE project_id = ?')
+      .bind(this.projectId).first<{ n: number }>();
+    const color = palette[(count?.n ?? 0) % palette.length]!;
+    await this.env.DB.prepare('INSERT INTO categories (id, project_id, name, color, "order", created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .bind(id, this.projectId, trimmed, color, count?.n ?? 0, nowIso()).run();
+    await this.emit(actor, 'category.created', 'category', id, { name: trimmed, color });
+    return id;
+  }
+
   async createTask(projectId: string, actor: Actor, input: CreateTaskInput) {
     await this.setPid(projectId);
     const pid = this.projectId;
@@ -173,14 +196,15 @@ export class ProjectRoom extends DurableObject<Env> {
       .bind(pid)
       .first<{ key: string; n: number }>();
     if (!proj) throw new Error(`project ${pid} not found`);
+    const categoryId = input.category ? await this.resolveCategory(pid, actor, input.category) : null;
     const id = newId('task');
     const key = `${proj.key}-${proj.n}`;
     const now = nowIso();
     const stmts = [
       this.env.DB.prepare(
-        `INSERT INTO tasks (id, project_id, key, milestone_id, parent_task_id, title, body, status, priority, estimate, "order", created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)`,
-      ).bind(id, pid, key, input.milestoneId ?? null, input.parentTaskId ?? null, input.title, input.body ?? '', input.priority ?? 2, input.estimate ?? null, proj.n, now, now),
+        `INSERT INTO tasks (id, project_id, key, milestone_id, parent_task_id, category_id, title, body, status, priority, estimate, "order", created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)`,
+      ).bind(id, pid, key, input.milestoneId ?? null, input.parentTaskId ?? null, categoryId, input.title, input.body ?? '', input.priority ?? 2, input.estimate ?? null, proj.n, now, now),
       this.env.DB.prepare('UPDATE projects SET next_task_number = ? WHERE id = ?').bind(proj.n + 1, pid),
     ];
     for (const dep of input.dependsOn ?? []) {
@@ -198,11 +222,15 @@ export class ProjectRoom extends DurableObject<Env> {
   async updateTask(projectId: string, actor: Actor, taskId: string, patch: TaskPatch) {
     await this.setPid(projectId);
     const task = await this.getTask(taskId);
+    if (patch.category !== undefined) {
+      patch.categoryId = patch.category === null || patch.category === '' ? null : await this.resolveCategory(projectId, actor, patch.category);
+      delete patch.category;
+    }
     const sets: string[] = [];
     const binds: unknown[] = [];
     const fields: Array<[keyof TaskPatch, string]> = [
       ['title', 'title'], ['body', 'body'], ['priority', 'priority'],
-      ['estimate', 'estimate'], ['milestoneId', 'milestone_id'], ['order', '"order"'],
+      ['estimate', 'estimate'], ['milestoneId', 'milestone_id'], ['categoryId', 'category_id'], ['order', '"order"'],
     ];
     for (const [k, col] of fields) {
       if (patch[k] !== undefined) {

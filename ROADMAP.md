@@ -34,7 +34,7 @@ task **picks those up and acts on them** — steering work without stopping it.
 | Human front-end | Web app (SPA) |
 | Coordination scope | Full: task claiming/locks, orchestrator+workers, shared context, messaging |
 | Tenancy | Single-tenant self-host (each user deploys their own instance) |
-| Agent auth | Scoped API keys / tokens (OAuth deferred) |
+| Agent auth | OAuth 2.1 (authorization code + PKCE, DCR, refresh rotation) — tokens map to agent identities; scoped API keys remain for headless/CI |
 | Human auth | Minimal user accounts (email/passkey + sessions, admin role) |
 | SPA framework | React |
 | MCP transport | Streamable HTTP (latest MCP spec) |
@@ -48,8 +48,9 @@ task **picks those up and acts on them** — steering work without stopping it.
 | Licensing | Open source |
 | Horizon | Aggressive — MVP in weeks, phases as sprints |
 
-**Deferred by choice:** multi-tenant SaaS, OAuth, a full shared-memory/knowledge store, and deep git
+**Deferred by choice:** multi-tenant SaaS, a full shared-memory/knowledge store, and deep git
 integration (triggering agent runs, worktrees). These are sketched in §6 but out of the near-term path.
+(OAuth — originally deferred — shipped early: the MCP is an OAuth 2.1 protected resource.)
 
 ---
 

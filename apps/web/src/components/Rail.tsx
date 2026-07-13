@@ -78,6 +78,18 @@ export function Rail({ store }: { store: AppStore }) {
       >
         +
       </button>
+      <button
+        title="Settings"
+        onClick={() => actions.setView('settings')}
+        className="rail-add"
+        style={{
+          cursor: 'pointer', width: 34, height: 34, borderRadius: 10, flex: 'none', marginTop: 6,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          color: 'var(--text-dim)', fontSize: 15, border: '1px solid rgba(255,255,255,.08)',
+        }}
+      >
+        ⚙
+      </button>
       <div
         title={`${store.user?.name ?? 'you'} · supervisor`}
         style={{

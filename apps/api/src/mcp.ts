@@ -124,19 +124,20 @@ export function buildMcpServer(env: Env, agent: AgentIdentity): McpServer {
     'Project snapshot: tasks (with status/holder/deps/open-comment counts), milestones, agents active here.',
     { projectId: z.string() },
     tool(async ({ projectId }) => {
-      const [tasks, milestones, project] = await Promise.all([
+      const [tasks, milestones, project, categories] = await Promise.all([
         env.DB.prepare(
           `SELECT t.id, t.key, t.title, t.status, t.priority, t.claimed_by AS claimedBy, t.parent_task_id AS parentTaskId,
-                  t.milestone_id AS milestoneId, t.open_comments AS openComments, t.claim_expires_at AS claimExpiresAt,
+                  t.milestone_id AS milestoneId, t.category_id AS categoryId, t.open_comments AS openComments, t.claim_expires_at AS claimExpiresAt,
                   (SELECT GROUP_CONCAT(dt.key) FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id WHERE d.task_id = t.id) AS dependsOn
            FROM tasks t WHERE t.project_id = ? ORDER BY t."order"`,
         ).bind(projectId).all(),
         env.DB.prepare('SELECT id, title, due_at AS dueAt FROM milestones WHERE project_id = ? ORDER BY "order"').bind(projectId).all(),
         env.DB.prepare('SELECT id, key, name, description, repo_url AS repoUrl, claim_ttl_seconds AS claimTtlSeconds FROM projects WHERE id = ?')
           .bind(projectId).first(),
+        env.DB.prepare('SELECT id, name, color FROM categories WHERE project_id = ? ORDER BY "order"').bind(projectId).all(),
       ]);
       if (!project) throw new Error(`project ${projectId} not found`);
-      return { project, milestones: milestones.results, tasks: tasks.results };
+      return { project, milestones: milestones.results, categories: categories.results, tasks: tasks.results };
     }),
   );
 
@@ -153,6 +154,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity): McpServer {
       milestoneId: z.string().optional(),
       priority: z.number().int().min(0).max(4).optional(),
       dependsOn: z.array(z.string()).optional(),
+      category: z.string().optional().describe('Category name — auto-created for the project if new (e.g. "backend", "docs", "infra")'),
     },
     tool(async ({ projectId, ...input }) => room(env, projectId).createTask(projectId, actor, input)),
   );
@@ -198,6 +200,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity): McpServer {
       status: z.enum(['todo', 'in_progress', 'blocked', 'review', 'done', 'cancelled']).optional(),
       priority: z.number().int().min(0).max(4).optional(),
       milestoneId: z.string().optional(),
+      category: z.string().optional().describe('Category name — auto-created if new; empty string clears'),
     },
     tool(async ({ projectId, taskId, ...patch }) => room(env, projectId).updateTask(projectId, actor, taskId, patch)),
   );

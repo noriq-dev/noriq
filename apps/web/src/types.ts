@@ -51,6 +51,8 @@ export interface TaskVM {
   ttl?: number;
   ttlMax?: number;
   deps: string[];
+  milestoneId: string | null;
+  categoryId: string | null;
   openComments: number;
   comments: CommentVM[]; // populated for the selected task
 }
@@ -65,7 +67,7 @@ export interface EventVM {
   taskId?: string;
 }
 
-export type ViewId = 'control' | 'graph' | 'board' | 'plans' | 'agents';
+export type ViewId = 'control' | 'graph' | 'board' | 'plans' | 'agents' | 'settings';
 
 export interface AppData {
   projects: ProjectVM[];
