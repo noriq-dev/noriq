@@ -1,0 +1,37 @@
+# PLNR-22: quality gate for contributors. Runs the test suite + typecheck on every
+# PR (and pushes to main). No secrets, no deploy — planar is self-hosted, so each
+# operator runs their own `wrangler deploy`. This only stops regressions from merging.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      # apps/web typechecks against @planar/shared's built types.
+      - name: Build shared package
+        run: npm run build --workspace @planar/shared
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # apps/api's vitest runs on the workerd pool (real Durable Objects + D1 migrations).
+      - name: Test
+        run: npm run test
