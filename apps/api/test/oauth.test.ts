@@ -122,37 +122,17 @@ describe('oauth 2.1 for MCP', () => {
     expect(briefing.body.you.role).toBe('orchestrator');
   });
 
-  it('set_agent_identity refuses names owned by other users', async () => {
-    // create a second user + token via a fresh consent (same client)
-    await createUser('other@example.com', 'Other', 'longenough1', 'member').catch(() => {});
-    const otherCookie = await loginSession('other@example.com', 'longenough1');
-    const verifier = 'other-verifier-other-verifier-other-verifier';
-    const challenge = await s256(verifier);
-    const q = new URLSearchParams({
-      response_type: 'code', client_id: clientId, redirect_uri: redirectUri,
-      code_challenge: challenge, code_challenge_method: 'S256', scope: 'mcp', state: 'o',
-    });
-    const form = new URLSearchParams(Object.fromEntries(q.entries()));
-    form.set('decision', 'approve');
-    const approve = await SELF.fetch('https://planar.test/oauth/authorize', {
-      method: 'POST',
-      headers: { Cookie: otherCookie, 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: form.toString(),
-      redirect: 'manual',
-    });
-    const code = new URL(approve.headers.get('Location')!).searchParams.get('code')!;
-    const token = await SELF.fetch('https://planar.test/oauth/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'authorization_code', code, redirect_uri: redirectUri,
-        client_id: clientId, code_verifier: verifier,
-      }).toString(),
-    });
-    const otherToken = ((await token.json()) as { access_token: string }).access_token;
-    const steal = await mcpCall(otherToken, 'set_agent_identity', { name: 'atlas-prime' });
+  it('set_agent_identity refuses a name already taken in the same project', async () => {
+    // Two independent connections (kept off `accessToken` so the refresh test's
+    // identity is untouched). Names are unique per project now, so the second collides.
+    const owner = await createAgent('coll-owner');
+    const other = await createAgent('coll-other');
+    const proj = await mcpCall(owner.apiKey, 'create_project', { key: 'OWN', name: 'ownership' });
+    const mine = await mcpCall(owner.apiKey, 'set_agent_identity', { name: 'shared-name', projectId: proj.body.id });
+    expect(mine.isError).toBe(false);
+    const steal = await mcpCall(other.apiKey, 'set_agent_identity', { name: 'shared-name', projectId: proj.body.id });
     expect(steal.isError).toBe(true);
-    expect(steal.text).toContain('owned by another user');
+    expect(steal.text).toMatch(/already taken in this project/);
   });
 
   it('rejects a bad PKCE verifier', async () => {

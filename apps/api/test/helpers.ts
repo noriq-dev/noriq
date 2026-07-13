@@ -76,24 +76,26 @@ export async function createUser(email: string, name: string, password: string, 
 
 let rpcId = 1;
 
-/** Call an MCP tool over Streamable HTTP and return the parsed result body + notices. */
-export async function mcpCall(apiKey: string, tool: string, args: Record<string, unknown> = {}) {
-  const first = await mcpCallOnce(apiKey, tool, args);
+/** Call an MCP tool over Streamable HTTP and return the parsed result body + notices.
+ *  Pass a sessionId to act as a distinct MCP session (a chat / sub-agent). */
+export async function mcpCall(apiKey: string, tool: string, args: Record<string, unknown> = {}, sessionId?: string) {
+  const first = await mcpCallOnce(apiKey, tool, args, sessionId);
   // vitest-pool-workers reloads the bundle between files, breaking in-flight DO
   // stubs exactly once ("invalidating this Durable Object ... Please retry").
   if (first.isError && first.text.includes('invalidating this Durable Object')) {
-    return mcpCallOnce(apiKey, tool, args);
+    return mcpCallOnce(apiKey, tool, args, sessionId);
   }
   return first;
 }
 
-async function mcpCallOnce(apiKey: string, tool: string, args: Record<string, unknown> = {}) {
+async function mcpCallOnce(apiKey: string, tool: string, args: Record<string, unknown> = {}, sessionId?: string) {
   const res = await SELF.fetch('https://planar.test/mcp', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
       Accept: 'application/json, text/event-stream',
+      ...(sessionId ? { 'Mcp-Session-Id': sessionId } : {}),
     },
     body: JSON.stringify({
       jsonrpc: '2.0',

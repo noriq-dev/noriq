@@ -36,7 +36,7 @@ function room(env: Env, projectId: string) {
 
 const asActor = (a: AgentIdentity): Actor => ({ kind: 'agent', id: a.id, name: a.name });
 
-export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthTokenId?: string } = {}): McpServer {
+export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthTokenId?: string; sessionId?: string } = {}): McpServer {
   const server = new McpServer(
     { name: 'planar', version: '0.3.0' },
     {
@@ -140,38 +140,44 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
   if (opts.oauthTokenId) {
     defineTool(
       'set_agent_identity',
-      'Take a distinct agent identity for this OAuth session (rebinds your token). Use when you start working: pick a short memorable name — reusing a name reuses that agent and its history. Role: worker (default) or orchestrator.',
+      'Name THIS session as a distinct agent, scoped to the project you are about to work. Each chat/sub-agent is its own agent (keyed by MCP session), so pick a short name that reads well in that project — names are unique per project. Pass projectId to localize it (recommended; otherwise it scopes on your first claim). Sub-agents: pass parentAgentId to attribute your work to the agent that spawned you.',
       {
         name: z.string().min(2).max(40).regex(/^[a-z0-9][a-z0-9._-]*$/i, 'letters/digits/._-'),
         role: z.enum(['worker', 'orchestrator']).optional(),
+        projectId: z.string().optional().describe('Localize this agent to a project (recommended)'),
+        parentAgentId: z.string().optional().describe('If you are a sub-agent, the id of the agent that spawned you'),
       },
-      tool(async ({ name, role }) => {
+      tool(async ({ name, role, projectId, parentAgentId }) => {
         const token = await env.DB.prepare('SELECT user_id AS userId FROM oauth_tokens WHERE id = ?')
           .bind(opts.oauthTokenId).first<{ userId: string }>();
         if (!token) throw new Error('token not found');
-        let target = await env.DB.prepare('SELECT id, name, role, status, user_id AS userId FROM agents WHERE name = ?')
-          .bind(name).first<{ id: string; name: string; role: string; status: string; userId: string | null }>();
-        if (target && target.userId && target.userId !== token.userId) {
-          throw new Error(`agent name "${name}" is owned by another user — pick a different name`);
+        // Names are unique per project; a revoked name stays retired (PLNR-47).
+        if (projectId) {
+          const clash = await env.DB.prepare(
+            `SELECT id, status, user_id AS userId FROM agents WHERE project_id = ? AND name = ? AND id != ?`,
+          ).bind(projectId, name, agent.id).first<{ id: string; status: string; userId: string | null }>();
+          if (clash) {
+            if (clash.status === 'revoked') throw new Error(`agent name "${name}" was revoked in this project and is retired — pick a new name`);
+            throw new Error(`agent name "${name}" is already taken in this project — pick another`);
+          }
         }
-        if (target && target.status === 'revoked') {
-          // Retired for good: resurrecting a revoked name would let new work
-          // inherit old cross-project attribution (PLNR-47).
-          throw new Error(`agent name "${name}" was revoked and is retired — pick a new name`);
+        if (parentAgentId) {
+          const parent = await env.DB.prepare('SELECT id, user_id AS userId FROM agents WHERE id = ?')
+            .bind(parentAgentId).first<{ id: string; userId: string | null }>();
+          if (!parent) throw new Error(`parentAgentId ${parentAgentId} not found`);
+          if (parent.userId && parent.userId !== token.userId) throw new Error('parent agent belongs to another user');
         }
-        if (!target) {
-          const agentId = newId('agt');
-          await env.DB.prepare(
-            `INSERT INTO agents (id, name, role, status, api_key_hash, user_id, created_at) VALUES (?, ?, ?, 'idle', ?, ?, ?)`,
-          ).bind(agentId, name, role ?? 'worker', await sha256Hex(crypto.randomUUID() + crypto.randomUUID()), token.userId, nowIso()).run();
-          target = { id: agentId, name, role: role ?? 'worker', status: 'idle', userId: token.userId };
-        } else if (role && target.role !== role) {
-          await env.DB.prepare('UPDATE agents SET role = ? WHERE id = ?').bind(role, target.id).run();
-        }
-        await env.DB.prepare('UPDATE oauth_tokens SET agent_id = ? WHERE id = ?').bind(target.id, opts.oauthTokenId).run();
+        const newRole = role ?? agent.role;
+        await env.DB.prepare(
+          `UPDATE agents SET name = ?, role = ?, project_id = COALESCE(?, project_id),
+             parent_agent_id = COALESCE(?, parent_agent_id), status = 'active', last_seen_at = ?
+           WHERE id = ?`,
+        ).bind(name, newRole, projectId ?? null, parentAgentId ?? null, nowIso(), agent.id).run();
         return {
-          actingAs: { id: target.id, name: target.name, role: role ?? target.role },
-          note: 'identity rebound — subsequent calls on this token act as this agent',
+          actingAs: { id: agent.id, name, role: newRole },
+          project: projectId ?? null,
+          parentAgentId: parentAgentId ?? null,
+          note: 'this session now acts as this agent; subsequent calls are attributed to it',
         };
       }),
     );
@@ -394,7 +400,13 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     'claim_task',
     'Claim exclusive ownership before working. Fails if held, blocked, or not claimable. Returns the TTL and any open comments — read them before you start. Your claim renews on every planar tool call, so just keep working; no periodic heartbeat needed.',
     { projectId: z.string(), taskId: z.string() },
-    tool(async ({ projectId, taskId }) => room(env, projectId).claimTask(projectId, actor, taskId, agent.id)),
+    tool(async ({ projectId, taskId }) => {
+      const result = await room(env, projectId).claimTask(projectId, actor, taskId, agent.id);
+      // An agent that hasn't localized itself yet adopts the project it first works in.
+      await env.DB.prepare("UPDATE agents SET project_id = ?, status = 'active' WHERE id = ? AND project_id IS NULL")
+        .bind(projectId, agent.id).run();
+      return result;
+    }),
   );
 
   defineTool(

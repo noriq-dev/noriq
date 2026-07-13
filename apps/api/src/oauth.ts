@@ -203,17 +203,17 @@ oauth.post('/authorize', async (c) => {
   if (!user) return c.html(consentPage(v.name, '', p, null, 'sign in first'), 401);
   if (form.decision !== 'approve') return c.html(consentPage(v.name, '', p, user), 400);
 
-  // Default agent for this grant: owned by the user, named after user+client.
-  // The agent can rebind itself later via the set_agent_identity MCP tool (PLNR-43).
+  // Connection default agent: a placeholder for this grant (project_id NULL, so it never
+  // shows in a project). Real work happens under per-session agents created at MCP
+  // initialize and named via set_agent_identity. Reused across grants of the same client.
   const agentName = `${(user.name.split(' ')[0] ?? 'user').toLowerCase()}-${v.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 20) || 'client'}`;
-  let agent = await c.env.DB.prepare("SELECT id FROM agents WHERE name = ? AND status != 'revoked'")
-    .bind(agentName).first<{ id: string }>();
+  let agent = await c.env.DB.prepare("SELECT id FROM agents WHERE name = ? AND user_id = ? AND project_id IS NULL AND status != 'revoked'")
+    .bind(agentName, user.id).first<{ id: string }>();
   if (!agent) {
     const agentId = newId('agt');
-    // OAuth agents have no static API key; a random unusable hash fills the column.
     await c.env.DB.prepare(
-      `INSERT INTO agents (id, name, role, status, api_key_hash, user_id, created_at) VALUES (?, ?, 'worker', 'idle', ?, ?, ?)`,
-    ).bind(agentId, agentName, await sha256Hex(randToken('unused_')), user.id, nowIso()).run();
+      `INSERT INTO agents (id, name, role, status, user_id, created_at) VALUES (?, ?, 'worker', 'idle', ?, ?)`,
+    ).bind(agentId, agentName, user.id, nowIso()).run();
     agent = { id: agentId };
   }
 

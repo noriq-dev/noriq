@@ -1,11 +1,21 @@
 import type { Context, Next } from 'hono';
 import type { Env } from './env';
-import { sha256Hex } from './lib/util';
+import { newId, nowIso, sha256Hex } from './lib/util';
 
 export interface AgentIdentity {
   id: string;
   name: string;
   role: 'orchestrator' | 'worker';
+}
+
+/** An authorized OAuth credential (one `claude mcp add`). Many agents (sessions) share one. */
+export interface Connection {
+  tokenId: string;
+  userId: string;
+  clientId: string;
+  clientName: string;
+  /** The token's legacy default agent — used only when a client sends no MCP session id. */
+  defaultAgent: AgentIdentity;
 }
 
 export interface UserIdentity {
@@ -20,6 +30,8 @@ export type Vars = {
   user?: UserIdentity;
   /** Set when the agent authenticated with an OAuth access token (enables set_agent_identity). */
   oauthTokenId?: string;
+  /** The OAuth connection behind an agent request (agents are resolved per MCP session). */
+  connection?: Connection;
 };
 
 export type AppContext = { Bindings: Env; Variables: Vars };
@@ -43,15 +55,48 @@ export async function agentAuth(c: Context<AppContext>, next: Next) {
   const hash = await sha256Hex(key);
 
   const t = await c.env.DB.prepare(
-    `SELECT a.id, a.name, a.role, t.id AS tokenId FROM oauth_tokens t JOIN agents a ON a.id = t.agent_id
+    `SELECT t.id AS tokenId, t.user_id AS userId, t.client_id AS clientId,
+            a.id AS agentId, a.name AS agentName, a.role AS agentRole,
+            COALESCE(cl.name, 'MCP client') AS clientName
+     FROM oauth_tokens t
+     JOIN agents a ON a.id = t.agent_id
+     LEFT JOIN oauth_clients cl ON cl.id = t.client_id
      WHERE t.token_hash = ? AND t.revoked_at IS NULL
        AND t.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') AND a.status != 'revoked'`,
-  ).bind(hash).first<AgentIdentity & { tokenId: string }>();
-  const row: AgentIdentity | null = t ? { id: t.id, name: t.name, role: t.role } : null;
-  if (t) c.set('oauthTokenId', t.tokenId);
-  if (!row) return unauthorized('invalid, expired, or revoked token — connect via OAuth');
-  c.set('agent', row);
+  ).bind(hash).first<{
+    tokenId: string; userId: string; clientId: string; clientName: string;
+    agentId: string; agentName: string; agentRole: 'orchestrator' | 'worker';
+  }>();
+  if (!t) return unauthorized('invalid, expired, or revoked token — connect via OAuth');
+
+  const defaultAgent: AgentIdentity = { id: t.agentId, name: t.agentName, role: t.agentRole };
+  c.set('oauthTokenId', t.tokenId);
+  c.set('connection', { tokenId: t.tokenId, userId: t.userId, clientId: t.clientId, clientName: t.clientName, defaultAgent });
+  // Legacy fallback identity; the /mcp route resolves the real per-session agent.
+  c.set('agent', defaultAgent);
   await next();
+}
+
+const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 16) || 'agent';
+
+/**
+ * Resolve the agent for one MCP session (a chat, or a sub-agent) on a connection.
+ * Each MCP client `initialize` gets its own session id, so this is one agent per
+ * session. Created unscoped (project_id NULL) and unnamed-ish; set_agent_identity or
+ * the first claim gives it a real name + project.
+ */
+export async function resolveSessionAgent(env: Env, conn: Connection, sessionId: string): Promise<AgentIdentity> {
+  const existing = await env.DB.prepare(
+    `SELECT id, name, role FROM agents WHERE session_id = ? AND status != 'revoked'`,
+  ).bind(sessionId).first<AgentIdentity>();
+  if (existing) return existing;
+  const id = newId('agt');
+  const name = `${slug(conn.clientName)}-${sessionId.replace(/[^a-z0-9]/gi, '').slice(0, 4).toLowerCase()}`;
+  await env.DB.prepare(
+    `INSERT INTO agents (id, name, role, status, user_id, oauth_token_id, session_id, created_at)
+     VALUES (?, ?, 'worker', 'idle', ?, ?, ?, ?)`,
+  ).bind(id, name, conn.userId, conn.tokenId, sessionId, nowIso()).run();
+  return { id, name, role: 'worker' };
 }
 
 /** Admin-token auth for bootstrap/ops endpoints (agent key issuance, user creation). */

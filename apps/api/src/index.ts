@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { StreamableHTTPTransport } from '@hono/mcp';
 import type { Env } from './env';
-import { adminAuth, agentAuth, userAuth, type AppContext } from './auth';
+import { adminAuth, agentAuth, resolveSessionAgent, userAuth, type AppContext } from './auth';
 import { buildMcpServer } from './mcp';
 import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot } from './backup';
@@ -52,13 +52,30 @@ app.get('/api/health', async (c) => {
 
 // --- MCP (agents) -------------------------------------------------------------
 app.all('/mcp', agentAuth, async (c) => {
-  // Per-agent throughput cap; generous for heartbeat cadence, hostile to floods.
-  const rl = await rateLimit(c.env, `mcp:${c.var.agent!.id}`, 120);
+  const conn = c.var.connection!;
+  // Per-connection throughput cap; generous for tool cadence, hostile to floods.
+  const rl = await rateLimit(c.env, `mcp:${conn.tokenId}`, 120);
   if (!rl.ok) return c.json({ error: 'rate limited — back off and retry' }, 429, { 'Retry-After': String(rl.retryAfter) });
-  const server = buildMcpServer(c.env, c.var.agent!, { oauthTokenId: c.var.oauthTokenId });
+
+  // Agents are per MCP SESSION (a chat / sub-agent), not per connection. We issue a
+  // session id at initialize and the client echoes it back (Mcp-Session-Id); each
+  // session resolves to its own agent. Sessionless (legacy) calls use the connection's
+  // default agent.
+  const raw = await c.req.json().catch(() => null);
+  const msgs = raw == null ? [] : Array.isArray(raw) ? raw : [raw];
+  const isInit = msgs.some((m) => m?.method === 'initialize');
+  let sessionId = c.req.header('mcp-session-id') || undefined;
+  if (isInit && !sessionId) sessionId = crypto.randomUUID();
+  let agent = c.var.agent!;
+  if (sessionId) {
+    agent = await resolveSessionAgent(c.env, conn, sessionId);
+    if (isInit) c.header('Mcp-Session-Id', sessionId);
+  }
+
+  const server = buildMcpServer(c.env, agent, { oauthTokenId: conn.tokenId, sessionId });
   const transport = new StreamableHTTPTransport();
   await server.connect(transport);
-  return transport.handleRequest(c);
+  return transport.handleRequest(c, raw ?? undefined);
 });
 
 // --- agent skill (served by planar itself; ROADMAP Phase 5) -------------------
@@ -204,9 +221,12 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
        FROM dependencies d JOIN tasks t ON t.id = d.task_id WHERE t.project_id = ?`,
     ).bind(pid).all(),
     c.env.DB.prepare(
-      `SELECT DISTINCT a.id, a.name, a.role, a.status, a.last_seen_at AS lastSeenAt, u.name AS ownerName
-       FROM agents a LEFT JOIN users u ON u.id = a.user_id WHERE a.status != 'revoked' ORDER BY a.created_at`,
-    ).all(),
+      // Project-local agents only (PLNR agent re-model): an agent belongs to the
+      // project it works, not to every project.
+      `SELECT a.id, a.name, a.role, a.status, a.last_seen_at AS lastSeenAt, a.parent_agent_id AS parentAgentId, u.name AS ownerName
+       FROM agents a LEFT JOIN users u ON u.id = a.user_id
+       WHERE a.project_id = ? AND a.status != 'revoked' ORDER BY a.created_at`,
+    ).bind(pid).all(),
     c.env.DB.prepare(
       `SELECT id, seq, actor_kind AS actorKind, actor_id AS actorId, verb, subject_type AS subjectType,
               subject_id AS subjectId, payload, created_at AS createdAt
