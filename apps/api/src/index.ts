@@ -522,10 +522,16 @@ app.get('/api/attachments/:aid', userAuth, async (c) => {
   if (!c.env.FILES) return c.json({ error: 'attachments not configured' }, 503);
   const obj = await c.env.FILES.get(row.key);
   if (!obj) return c.json({ error: 'file missing from storage' }, 404);
+  // Show viewable types inline (images, PDF, text, media) so a click opens in the
+  // browser instead of forcing a download. SVG is excluded — as same-origin markup it
+  // can carry script — so it downloads. Everything else downloads too.
+  const inlineable = /^(image\/(?!svg)|application\/pdf$|text\/|audio\/|video\/|application\/json)/.test(row.ct);
   return new Response(obj.body, {
     headers: {
       'Content-Type': row.ct,
-      'Content-Disposition': `attachment; filename="${row.filename.replace(/"/g, '')}"`,
+      'Content-Disposition': `${inlineable ? 'inline' : 'attachment'}; filename="${row.filename.replace(/"/g, '')}"`,
+      'Cache-Control': 'private, max-age=3600',
+      'X-Content-Type-Options': 'nosniff',
     },
   });
 });

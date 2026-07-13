@@ -21,7 +21,7 @@ export function Drawer({ store }: { store: AppStore }) {
   const [timeline, setTimeline] = useState<ApiAgentEvent[]>([]);
   const [addingTag, setAddingTag] = useState(false);
   const [newTag, setNewTag] = useState('');
-  const [attachments, setAttachments] = useState<Array<{ id: string; filename: string; size: number; createdAt: string }>>([]);
+  const [attachments, setAttachments] = useState<Array<{ id: string; filename: string; size: number; contentType?: string; createdAt: string }>>([]);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const allTags = snapshot?.tags ?? [];
@@ -254,25 +254,42 @@ export function Drawer({ store }: { store: AppStore }) {
           </div>
           {attachments.length > 0 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginBottom: 18 }}>
-              {attachments.map((att) => (
-                <div key={att.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 10px', borderRadius: 8, background: 'rgba(255,255,255,.02)', border: '1px solid rgba(255,255,255,.06)' }}>
-                  <span style={{ fontSize: 12 }}>📎</span>
-                  <a href={`/api/attachments/${att.id}`} style={{ fontSize: 12, textDecoration: 'none', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {att.filename}
-                  </a>
-                  <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>{(att.size / 1024).toFixed(0)} KB</span>
-                  <div style={{ flex: 1 }} />
-                  <button
-                    onClick={async () => {
-                      await api.deleteAttachment(att.id);
-                      setAttachments((l) => l.filter((x) => x.id !== att.id));
-                    }}
-                    style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--red-soft)', background: 'transparent' }}
-                  >
-                    ✕
-                  </button>
-                </div>
-              ))}
+              {attachments.map((att) => {
+                const url = `/api/attachments/${att.id}`;
+                const isImage = (att.contentType ?? '').startsWith('image/');
+                return (
+                  <div key={att.id} style={{ borderRadius: 8, background: 'rgba(255,255,255,.02)', border: '1px solid rgba(255,255,255,.06)', overflow: 'hidden' }}>
+                    {isImage && (
+                      // Inline preview — click to open full size in a new tab.
+                      <a href={url} target="_blank" rel="noreferrer" style={{ display: 'block' }}>
+                        <img
+                          src={url}
+                          alt={att.filename}
+                          loading="lazy"
+                          style={{ display: 'block', width: '100%', maxHeight: 220, objectFit: 'contain', background: 'rgba(0,0,0,.25)' }}
+                        />
+                      </a>
+                    )}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 10px' }}>
+                      <span style={{ fontSize: 12 }}>{isImage ? '🖼️' : '📎'}</span>
+                      <a href={url} target="_blank" rel="noreferrer" style={{ fontSize: 12, textDecoration: 'none', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {att.filename}
+                      </a>
+                      <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>{(att.size / 1024).toFixed(0)} KB</span>
+                      <div style={{ flex: 1 }} />
+                      <button
+                        onClick={async () => {
+                          await api.deleteAttachment(att.id);
+                          setAttachments((l) => l.filter((x) => x.id !== att.id));
+                        }}
+                        style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--red-soft)', background: 'transparent' }}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           )}
 

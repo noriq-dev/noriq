@@ -1,6 +1,7 @@
 // MCP attachments (add_attachment tool + planar://attachment/<id> resource).
+import { SELF } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
-import { createAgent, mcpCall, mcpRpc } from './helpers';
+import { createAgent, createUser, loginSession, mcpCall, mcpRpc } from './helpers';
 
 // 1x1 transparent PNG.
 const PNG_B64 =
@@ -64,6 +65,25 @@ describe('MCP attachments', () => {
     const list = await mcpRpc(agent.apiKey, 'resources/list', {});
     expect(Array.isArray(list.resources)).toBe(true);
     expect(list.resources.some((r: { uri: string }) => r.uri.startsWith('planar://attachment/'))).toBe(true);
+  });
+
+  it('serves images inline (viewable), other types as download', async () => {
+    await createUser('att-viewer@example.com', 'Att Viewer', 'longenough1', 'admin').catch(() => {});
+    const cookie = await loginSession('att-viewer@example.com', 'longenough1');
+
+    const png = await mcpCall(agent.apiKey, 'add_attachment', {
+      projectId, taskId, filename: 'inline.png', data: PNG_B64, contentType: 'image/png',
+    });
+    const log = await mcpCall(agent.apiKey, 'add_attachment', {
+      projectId, taskId, filename: 'notes.bin', data: btoa('bytes'), contentType: 'application/octet-stream',
+    });
+
+    const pngRes = await SELF.fetch(`https://planar.test/api/attachments/${png.body.id}`, { headers: { Cookie: cookie } });
+    expect(pngRes.headers.get('Content-Type')).toBe('image/png');
+    expect(pngRes.headers.get('Content-Disposition')).toMatch(/^inline/);
+
+    const logRes = await SELF.fetch(`https://planar.test/api/attachments/${log.body.id}`, { headers: { Cookie: cookie } });
+    expect(logRes.headers.get('Content-Disposition')).toMatch(/^attachment/);
   });
 
   it('rejects a bad task', async () => {
