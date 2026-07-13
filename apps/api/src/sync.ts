@@ -51,10 +51,10 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
       notices.push(`Your claim on ${p.key} expired — the task was requeued (${p.reason}).`);
     } else if (e.verb === 'task.released' && p.previousHolder === agent.id) {
       notices.push(`Your claim on ${p.key} was force-released by ${p.actorName ?? 'a supervisor'}.`);
-    } else if (e.verb === 'task.status_changed' && p.to === 'done') {
-      // A completed task may unblock work — cheap signal, claimables below give truth.
-      notices.push(`${p.key} is done — dependent tasks may now be claimable.`);
     }
+    // NB (PLNR-25): we deliberately do NOT notice every task.done here. It fired for
+    // every completed task to every agent — noise — and the claimable list below is
+    // the authoritative signal for "what can I pick up now". Relevance over volume.
   }
 
   // Sticky open comments on held tasks (state, not events — never cursor-gated).
@@ -110,15 +110,30 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
   return { notices, openComments, unassignedComments, heldTasks: heldRows.results, claimable, messages };
 }
 
-/** Compact notices block appended to every MCP tool result (pushed-feeling updates without polling). */
+/**
+ * Compact notices block appended to every MCP tool result (pushed-feeling updates
+ * without polling). Policy (PLNR-25) — piggyback only what's URGENT to *this* agent:
+ *  - direct messages / broadcasts, comments on tasks it holds, and its own claim
+ *    being requeued or force-released (the `notices` list, cursor-gated so each
+ *    fires once);
+ *  - a nudge if it has unresolved comments blocking a finish.
+ * Everything lower-urgency (the full claimable list, recent-message history, and —
+ * for a heads-down agent — questions on tasks nobody holds) stays in my_updates so
+ * an actively-working agent's context isn't padded on every call. Unassigned
+ * questions still piggyback for IDLE agents (no held task), so they never vanish.
+ */
 export function formatNotices(u: AgentUpdates): string | null {
   const lines: string[] = [];
   for (const n of u.notices.slice(0, 5)) lines.push(`• ${n}`);
   if (u.openComments.length) {
     lines.push(`• ${u.openComments.length} unresolved comment(s) on your task(s) — resolve with resolve_comment before finishing.`);
   }
-  for (const c of u.unassignedComments.slice(0, 3)) {
-    lines.push(`• Unassigned ${c.kind} on ${c.taskKey} (no holder): "${c.body.slice(0, 90)}" — answer via resolve_comment if you can.`);
+  // Only surface unheld-task questions on the piggyback to agents that aren't
+  // already heads-down; working agents still see them via my_updates.
+  if (u.heldTasks.length === 0) {
+    for (const c of u.unassignedComments.slice(0, 3)) {
+      lines.push(`• Unassigned ${c.kind} on ${c.taskKey} (no holder): "${c.body.slice(0, 90)}" — answer via resolve_comment if you can.`);
+    }
   }
   if (!lines.length) return null;
   return `--- notices ---\n${lines.join('\n')}`;
