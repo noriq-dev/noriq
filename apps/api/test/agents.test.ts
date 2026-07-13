@@ -44,6 +44,20 @@ describe('agents are per-session, project-local', () => {
     expect(names).not.toContain('gamma'); // belongs to the other project
   });
 
+  it('the same friendly name is allowed in different projects (PLNR-65)', async () => {
+    const here = await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'builder', projectId }, 'sess-dup1');
+    const there = await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'builder', projectId: otherProjectId }, 'sess-dup2');
+    expect(here.isError).toBe(false);
+    expect(there.isError).toBe(false);
+    expect(here.body.actingAs.name).toBe('builder');
+    expect(there.body.actingAs.name).toBe('builder');
+    expect(here.body.actingAs.id).not.toBe(there.body.actingAs.id);
+    // But a second 'builder' in the SAME project is refused.
+    const clash = await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'builder', projectId }, 'sess-dup3');
+    expect(clash.isError).toBe(true);
+    expect(clash.text).toMatch(/already taken in this project/);
+  });
+
   it('a sub-agent is attributed to its parent', async () => {
     const parent = await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'lead', projectId }, 'sess-lead');
     const sub = await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'helper', projectId, parentAgentId: parent.body.actingAs.id }, 'sess-sub');

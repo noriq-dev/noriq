@@ -203,20 +203,17 @@ oauth.post('/authorize', async (c) => {
   if (!user) return c.html(consentPage(v.name, '', p, null, 'sign in first'), 401);
   if (form.decision !== 'approve') return c.html(consentPage(v.name, '', p, user), 400);
 
-  // Connection default agent: a placeholder for this grant (project_id NULL, so it never
+  // Connection default agent: one per grant/connection (project_id NULL, so it never
   // shows in a project). Real work happens under per-session agents created at MCP
-  // initialize and named via set_agent_identity. Reused across grants of the same client.
-  const agentName = `${(user.name.split(' ')[0] ?? 'user').toLowerCase()}-${v.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 20) || 'client'}`;
-  let agent = await c.env.DB.prepare("SELECT id FROM agents WHERE name = ? AND user_id = ? AND project_id IS NULL AND status != 'revoked'")
-    .bind(agentName, user.id).first<{ id: string }>();
-  if (!agent) {
-    const agentId = newId('agt');
-    // api_key_hash is a vestigial NOT NULL column (no static keys); a random hash fills it.
-    await c.env.DB.prepare(
-      `INSERT INTO agents (id, name, role, status, user_id, api_key_hash, created_at) VALUES (?, ?, 'worker', 'idle', ?, ?, ?)`,
-    ).bind(agentId, agentName, user.id, await sha256Hex(randToken('unused_')), nowIso()).run();
-    agent = { id: agentId };
-  }
+  // initialize and named via set_agent_identity. `name` is a unique internal handle;
+  // `label` is the friendly display.
+  const display = `${(user.name.split(' ')[0] ?? 'user').toLowerCase()}-${v.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 20) || 'client'}`;
+  const agentId = newId('agt');
+  // api_key_hash is a vestigial NOT NULL column (no static keys); a random hash fills it.
+  await c.env.DB.prepare(
+    `INSERT INTO agents (id, name, label, role, status, user_id, api_key_hash, created_at) VALUES (?, ?, ?, 'worker', 'idle', ?, ?, ?)`,
+  ).bind(agentId, `${display}-${agentId.slice(-6)}`, display, user.id, await sha256Hex(randToken('unused_')), nowIso()).run();
+  const agent = { id: agentId };
 
   const code = randToken('plnrc_');
   await c.env.DB.prepare(

@@ -256,7 +256,8 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     c.env.DB.prepare(
       // Project-local agents only (PLNR agent re-model): an agent belongs to the
       // project it works, not to every project.
-      `SELECT a.id, a.name, a.role, a.status, a.last_seen_at AS lastSeenAt, a.parent_agent_id AS parentAgentId, u.name AS ownerName
+      `SELECT a.id, COALESCE(a.label, a.name) AS name, a.role, a.status, a.last_seen_at AS lastSeenAt,
+              a.parent_agent_id AS parentAgentId, u.name AS ownerName
        FROM agents a LEFT JOIN users u ON u.id = a.user_id
        WHERE a.project_id = ? AND a.status != 'revoked' ORDER BY a.created_at`,
     ).bind(pid).all(),
@@ -544,7 +545,7 @@ app.delete('/api/groups/:gid', userAuth, async (c) => {
 
 app.get('/api/agents', userAuth, async (c) => {
   const { results } = await c.env.DB.prepare(
-    `SELECT a.id, a.name, a.role, a.status, a.last_seen_at AS lastSeenAt, a.created_at AS createdAt,
+    `SELECT a.id, COALESCE(a.label, a.name) AS name, a.role, a.status, a.last_seen_at AS lastSeenAt, a.created_at AS createdAt,
             u.name AS ownerName, u.id AS ownerUserId,
             (SELECT COUNT(*) FROM tasks t WHERE t.claimed_by = a.id) AS heldTasks,
             (SELECT COUNT(*) FROM claims cl WHERE cl.agent_id = a.id) AS totalClaims

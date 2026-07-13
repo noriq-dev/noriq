@@ -152,15 +152,18 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         const token = await env.DB.prepare('SELECT user_id AS userId FROM oauth_tokens WHERE id = ?')
           .bind(opts.oauthTokenId).first<{ userId: string }>();
         if (!token) throw new Error('token not found');
-        // Names are globally unique for now (D1 can't relax the constraint in-place);
-        // a revoked name stays retired (PLNR-47).
+        // The friendly name is the per-project display *label*; the DB `name` stays a
+        // stable unique internal handle. Labels are unique within a project (app-enforced,
+        // since D1 can't hold a per-project UNIQUE here); a retired label stays retired.
+        const scope = projectId ?? null;
         const clash = await env.DB.prepare(
-          `SELECT id, status, user_id AS userId FROM agents WHERE name = ? AND id != ?`,
-        ).bind(name, agent.id).first<{ id: string; status: string; userId: string | null }>();
+          `SELECT id, status, user_id AS userId FROM agents
+           WHERE label = ? AND id != ? AND ((project_id IS NULL AND ? IS NULL) OR project_id = ?)`,
+        ).bind(name, agent.id, scope, scope).first<{ id: string; status: string; userId: string | null }>();
         if (clash) {
-          if (clash.status === 'revoked') throw new Error(`agent name "${name}" was revoked and is retired — pick a new name`);
+          if (clash.status === 'revoked') throw new Error(`agent name "${name}" was revoked in this project and is retired — pick a new name`);
           if (clash.userId && clash.userId !== token.userId) throw new Error(`agent name "${name}" is owned by another user — pick a different name`);
-          throw new Error(`agent name "${name}" is already in use — pick another`);
+          throw new Error(`agent name "${name}" is already taken in this project — pick another`);
         }
         if (parentAgentId) {
           const parent = await env.DB.prepare('SELECT id, user_id AS userId FROM agents WHERE id = ?')
@@ -170,7 +173,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         }
         const newRole = role ?? agent.role;
         await env.DB.prepare(
-          `UPDATE agents SET name = ?, role = ?, project_id = COALESCE(?, project_id),
+          `UPDATE agents SET label = ?, role = ?, project_id = COALESCE(?, project_id),
              parent_agent_id = COALESCE(?, parent_agent_id), status = 'active', last_seen_at = ?
            WHERE id = ?`,
         ).bind(name, newRole, projectId ?? null, parentAgentId ?? null, nowIso(), agent.id).run();

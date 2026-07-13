@@ -56,7 +56,7 @@ export async function agentAuth(c: Context<AppContext>, next: Next) {
 
   const t = await c.env.DB.prepare(
     `SELECT t.id AS tokenId, t.user_id AS userId, t.client_id AS clientId,
-            a.id AS agentId, a.name AS agentName, a.role AS agentRole,
+            a.id AS agentId, COALESCE(a.label, a.name) AS agentName, a.role AS agentRole,
             COALESCE(cl.name, 'MCP client') AS clientName
      FROM oauth_tokens t
      JOIN agents a ON a.id = t.agent_id
@@ -87,11 +87,13 @@ const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(
  */
 export async function resolveSessionAgent(env: Env, conn: Connection, sessionId: string): Promise<AgentIdentity> {
   const existing = await env.DB.prepare(
-    `SELECT id, name, role FROM agents WHERE session_id = ? AND status != 'revoked'`,
+    `SELECT id, COALESCE(label, name) AS name, role FROM agents WHERE session_id = ? AND status != 'revoked'`,
   ).bind(sessionId).first<AgentIdentity>();
   if (existing) return existing;
   const id = newId('agt');
-  const name = `${slug(conn.clientName)}-${sessionId.replace(/[^a-z0-9]/gi, '').slice(0, 6).toLowerCase()}`;
+  // `name` is a stable, globally-unique internal handle (label is the friendly display,
+  // set via set_agent_identity). The id suffix guarantees uniqueness.
+  const name = `${slug(conn.clientName)}-${id.slice(-6)}`;
   // api_key_hash is a vestigial NOT NULL column (no static keys); a random unusable hash fills it.
   await env.DB.prepare(
     `INSERT INTO agents (id, name, role, status, user_id, oauth_token_id, session_id, api_key_hash, created_at)
