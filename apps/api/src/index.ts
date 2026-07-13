@@ -211,6 +211,12 @@ app.post('/api/projects/:pid/milestones', userAuth, async (c) => {
   return c.json(result);
 });
 
+app.patch('/api/projects/:pid/milestones/:mid', userAuth, async (c) => {
+  const patch = await c.req.json<{ title?: string; dueAt?: string | null }>();
+  const result = await room(c.env, c.req.param('pid')!).updateMilestone(c.req.param('pid')!, humanActor(c), c.req.param('mid')!, patch);
+  return c.json(result);
+});
+
 app.post('/api/projects/:pid/tasks', userAuth, async (c) => {
   const body = await c.req.json<{ title: string; body?: string; parentTaskId?: string; priority?: number; dependsOn?: string[] }>();
   if (!body.title) return c.json({ error: 'title required' }, 400);

@@ -153,14 +153,15 @@ function CreateTaskModal({ store }: { store: AppStore }) {
 }
 
 function CreateMilestoneModal({ store }: { store: AppStore }) {
-  const [title, setTitle] = useState('');
-  const [dueAt, setDueAt] = useState('');
+  const editing = store.editMilestone;
+  const [title, setTitle] = useState(editing?.title ?? '');
+  const [dueAt, setDueAt] = useState(editing?.dueAt ? editing.dueAt.slice(0, 10) : '');
   const { busy, error, run } = useSubmit(async () => {
     await store.actions.submitMilestone(title.trim(), dueAt ? new Date(dueAt).toISOString() : undefined);
   });
   return (
     <Modal
-      title="New milestone"
+      title={editing ? `Edit milestone` : 'New milestone'}
       subtitle={`in ${store.data.projects.find((p) => p.id === store.currentPid)?.name ?? 'project'} — a collection of tasks`}
       onClose={store.actions.closeModal}
       width={360}
@@ -174,7 +175,7 @@ function CreateMilestoneModal({ store }: { store: AppStore }) {
       <div style={{ display: 'flex', marginTop: 6 }}>
         <ErrorNote>{error}</ErrorNote>
         <div style={{ flex: 1 }} />
-        <Button disabled={busy || !title.trim()} onClick={run}>Create milestone</Button>
+        <Button disabled={busy || !title.trim()} onClick={run}>{editing ? 'Save changes' : 'Create milestone'}</Button>
       </div>
     </Modal>
   );

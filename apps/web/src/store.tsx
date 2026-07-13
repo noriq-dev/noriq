@@ -42,15 +42,29 @@ function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
   return { id: e.id, t: timeOf(e.createdAt), actor, actorKind: e.actorKind, verb, subject, taskId };
 }
 
+const VIEWS: ViewId[] = ['control', 'graph', 'board', 'plans', 'agents', 'settings'];
+
+function parseUrl(): { pid: string | null; view: ViewId; task: string | null } {
+  const m = location.pathname.match(/^\/p\/([^/]+)(?:\/([a-z]+))?/);
+  const view = location.pathname === '/settings' ? 'settings' : (m?.[2] as ViewId | undefined);
+  return {
+    pid: m?.[1] ? decodeURIComponent(m[1]) : null,
+    view: view && VIEWS.includes(view) ? view : 'control',
+    task: new URLSearchParams(location.search).get('task'),
+  };
+}
+
 export function useAppStore() {
   const [user, setUser] = useState<UserVM | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
   const [needsSetup, setNeedsSetup] = useState(false);
   const [modal, setModal] = useState<null | 'project' | 'task' | 'group' | 'agent' | 'milestone'>(null);
+  const [editMilestone, setEditMilestone] = useState<{ id: string; title: string; dueAt: string | null } | null>(null);
   const [groups, setGroups] = useState<Array<{ id: string; name: string; description: string }>>([]);
-  const [currentPid, setCurrentPid] = useState<string | null>(null);
-  const [view, setView] = useState<ViewId>('control');
-  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const initialUrl = useRef(parseUrl());
+  const [currentPid, setCurrentPid] = useState<string | null>(initialUrl.current.pid);
+  const [view, setView] = useState<ViewId>(initialUrl.current.view);
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(initialUrl.current.task);
   const [draftKind, setDraftKind] = useState<Exclude<CommentKind, 'reply'>>('question');
   const [draftText, setDraftText] = useState('');
   const [draggedId, setDraggedId] = useState<string | null>(null);
@@ -111,7 +125,7 @@ export function useAppStore() {
       groupId: p.groupId,
     }));
     setProjects(vms);
-    setCurrentPid((cur) => cur ?? vms[0]?.id ?? null);
+    setCurrentPid((cur) => (cur && vms.some((p) => p.id === cur) ? cur : vms[0]?.id ?? null));
   }, []);
 
   const loadSnapshot = useCallback(async (pid: string) => {
@@ -190,6 +204,34 @@ export function useAppStore() {
     };
   }, [user, currentPid, loadSnapshot, loadComments]);
 
+  // --- URL <-> state sync (PLNR-36) ---------------------------------------------
+  const popping = useRef(false);
+  useEffect(() => {
+    if (!user) return;
+    const path = view === 'settings' ? '/settings' : currentPid ? `/p/${encodeURIComponent(currentPid)}/${view}` : '/';
+    const search = selectedTaskId ? `?task=${encodeURIComponent(selectedTaskId)}` : '';
+    const target = path + search;
+    if (location.pathname + location.search !== target) {
+      if (popping.current) {
+        popping.current = false;
+      } else {
+        history.pushState(null, '', target);
+      }
+    }
+  }, [user, currentPid, view, selectedTaskId]);
+
+  useEffect(() => {
+    const onPop = () => {
+      popping.current = true;
+      const u = parseUrl();
+      if (u.pid) setCurrentPid(u.pid);
+      setView(u.view);
+      setSelectedTaskId(u.task);
+    };
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
+
   // TTL countdown repaint.
   useEffect(() => {
     const iv = setInterval(() => setTick((x) => x + 1), 1000);
@@ -262,9 +304,17 @@ export function useAppStore() {
   const actions = {
     login,
     selectProject(id: string) {
+      if (id === pidRef.current) {
+        // Re-selecting the current project (e.g. from Settings): don't blank the
+        // snapshot — the load effect won't re-fire for an unchanged pid (PLNR-37).
+        setView((v) => (v === 'settings' || v === 'agents' ? 'control' : v));
+        refresh();
+        return;
+      }
       setCurrentPid(id);
       setSelectedTaskId(null);
       setSnapshot(null);
+      setView((v) => (v === 'settings' ? 'control' : v));
       lastSeq.current = 0;
     },
     setView,
@@ -278,7 +328,7 @@ export function useAppStore() {
     },
 
     openModal: setModal,
-    closeModal: () => setModal(null),
+    closeModal: () => { setModal(null); setEditMilestone(null); },
     completeSetup,
 
     createProject: () => setModal('project'),
@@ -301,10 +351,21 @@ export function useAppStore() {
       refresh();
     },
 
+    openMilestoneEditor(m: { id: string; title: string; dueAt: string | null }) {
+      setEditMilestone(m);
+      setModal('milestone');
+    },
+
     async submitMilestone(title: string, dueAt?: string) {
       if (!pidRef.current) return;
-      await api.createMilestone(pidRef.current, title, dueAt);
-      setModal('task'); // return to the task dialog with the new milestone available
+      if (editMilestone) {
+        await api.updateMilestone(pidRef.current, editMilestone.id, { title, dueAt: dueAt ?? null });
+        setEditMilestone(null);
+        setModal(null);
+      } else {
+        await api.createMilestone(pidRef.current, title, dueAt);
+        setModal('task'); // return to the task dialog with the new milestone available
+      }
       refresh();
     },
 
@@ -354,7 +415,7 @@ export function useAppStore() {
   };
 
   return {
-    user, authChecked, needsSetup, modal, groups, snapshot,
+    user, authChecked, needsSetup, modal, editMilestone, groups, snapshot,
     currentPid: currentPid ?? '', view, selectedTaskId, draftKind, draftText, draggedId,
     data, helpers, actions,
   };

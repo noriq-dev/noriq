@@ -474,6 +474,22 @@ export class ProjectRoom extends DurableObject<Env> {
     return { id };
   }
 
+  async updateMilestone(projectId: string, actor: Actor, milestoneId: string, patch: { title?: string; dueAt?: string | null }) {
+    await this.setPid(projectId);
+    const ms = await this.env.DB.prepare('SELECT id, title FROM milestones WHERE id = ? AND project_id = ?')
+      .bind(milestoneId, this.projectId).first<{ id: string; title: string }>();
+    if (!ms) throw new Error('milestone not found in this project');
+    const sets: string[] = [];
+    const binds: unknown[] = [];
+    if (patch.title !== undefined) { sets.push('title = ?'); binds.push(patch.title); }
+    if (patch.dueAt !== undefined) { sets.push('due_at = ?'); binds.push(patch.dueAt); }
+    if (!sets.length) return { ok: true };
+    binds.push(milestoneId);
+    await this.env.DB.prepare(`UPDATE milestones SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
+    await this.emit(actor, 'milestone.updated', 'milestone', milestoneId, { from: ms.title, title: patch.title ?? ms.title });
+    return { ok: true };
+  }
+
   async createMilestone(projectId: string, actor: Actor, title: string, dueAt?: string | null) {
     await this.setPid(projectId);
     const id = newId('ms');

@@ -43,7 +43,6 @@ export function Board({ store }: { store: AppStore }) {
         <FilterChip label="All" active={msFilter === null} onClick={() => setMsFilter(null)} />
         {milestones.map((m) => {
           const total = tasks.filter((t) => t.milestoneId === m.id).length;
-          if (!total) return null;
           const done = tasks.filter((t) => t.milestoneId === m.id && t.status === 'done').length;
           return (
             <FilterChip
@@ -56,6 +55,34 @@ export function Board({ store }: { store: AppStore }) {
             />
           );
         })}
+        <button
+          onClick={() => actions.openModal('milestone')}
+          title="New milestone"
+          style={{
+            cursor: 'pointer', flex: 'none', fontFamily: 'var(--mono)', fontSize: 10.5,
+            color: 'var(--text-dim)', border: '1px dashed rgba(255,255,255,.15)',
+            padding: '4px 10px', borderRadius: 8, background: 'transparent',
+          }}
+          className="rail-add"
+        >
+          + milestone
+        </button>
+        {msFilter !== null && (
+          <button
+            onClick={() => {
+              const m = msById.get(msFilter);
+              if (m) actions.openMilestoneEditor({ id: m.id, title: m.title, dueAt: m.dueAt });
+            }}
+            title="Edit this milestone"
+            style={{
+              cursor: 'pointer', flex: 'none', fontFamily: 'var(--mono)', fontSize: 10.5,
+              color: 'var(--accent)', border: '1px solid rgba(198,242,78,.3)',
+              padding: '4px 10px', borderRadius: 8, background: 'rgba(198,242,78,.06)',
+            }}
+          >
+            ✎ edit
+          </button>
+        )}
         {categories.length > 0 && <span style={{ width: 1, height: 18, background: 'rgba(255,255,255,.1)', flex: 'none', margin: '0 4px' }} />}
         {categories.map((c) => (
           <FilterChip

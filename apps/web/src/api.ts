@@ -56,6 +56,8 @@ export const api = {
     req<{ id: string; name: string; role: string; apiKey: string }>('POST', '/api/agents', { name, role }),
   revokeAgent: (aid: string) => req('POST', `/api/agents/${aid}/revoke`),
 
+  updateMilestone: (pid: string, mid: string, patch: { title?: string; dueAt?: string | null }) =>
+    req('PATCH', `/api/projects/${pid}/milestones/${mid}`, patch),
   createMilestone: (pid: string, title: string, dueAt?: string) =>
     req<{ id: string }>('POST', `/api/projects/${pid}/milestones`, { title, dueAt }),
   createTask: (pid: string, input: { title: string; body?: string; priority?: number; milestoneId?: string; category?: string }) =>
