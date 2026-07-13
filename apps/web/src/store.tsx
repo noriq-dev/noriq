@@ -42,14 +42,14 @@ function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
   return { id: e.id, t: timeOf(e.createdAt), actor, actorKind: e.actorKind, verb, subject, taskId };
 }
 
-const VIEWS: ViewId[] = ['control', 'graph', 'board', 'plans', 'agents', 'settings'];
+const VIEWS: ViewId[] = ['home', 'control', 'graph', 'board', 'plans', 'agents', 'settings'];
 
 function parseUrl(): { pid: string | null; view: ViewId; task: string | null } {
   const m = location.pathname.match(/^\/p\/([^/]+)(?:\/([a-z]+))?/);
   const view = location.pathname === '/settings' ? 'settings' : (m?.[2] as ViewId | undefined);
   return {
     pid: m?.[1] ? decodeURIComponent(m[1]) : null,
-    view: view && VIEWS.includes(view) ? view : 'control',
+    view: view && VIEWS.includes(view) ? view : m ? 'control' : 'home',
     task: new URLSearchParams(location.search).get('task'),
   };
 }
@@ -123,9 +123,12 @@ export function useAppStore() {
       badge: p.key.slice(0, 2),
       hasLive: p.liveTasks > 0,
       groupId: p.groupId,
+      openTasks: p.openTasks,
+      totalTasks: p.totalTasks,
+      doneTasks: p.doneTasks,
     }));
     setProjects(vms);
-    setCurrentPid((cur) => (cur && vms.some((p) => p.id === cur) ? cur : vms[0]?.id ?? null));
+    setCurrentPid((cur) => (cur && vms.some((p) => p.id === cur) ? cur : null));
   }, []);
 
   const loadSnapshot = useCallback(async (pid: string) => {
@@ -208,7 +211,7 @@ export function useAppStore() {
   const popping = useRef(false);
   useEffect(() => {
     if (!user) return;
-    const path = view === 'settings' ? '/settings' : currentPid ? `/p/${encodeURIComponent(currentPid)}/${view}` : '/';
+    const path = view === 'settings' ? '/settings' : view === 'home' || !currentPid ? '/' : `/p/${encodeURIComponent(currentPid)}/${view}`;
     const search = selectedTaskId ? `?task=${encodeURIComponent(selectedTaskId)}` : '';
     const target = path + search;
     if (location.pathname + location.search !== target) {
@@ -303,18 +306,23 @@ export function useAppStore() {
 
   const actions = {
     login,
+    goHome() {
+      setView('home');
+      setSelectedTaskId(null);
+    },
+
     selectProject(id: string) {
       if (id === pidRef.current) {
         // Re-selecting the current project (e.g. from Settings): don't blank the
         // snapshot — the load effect won't re-fire for an unchanged pid (PLNR-37).
-        setView((v) => (v === 'settings' || v === 'agents' ? 'control' : v));
+        setView((v) => (v === 'settings' || v === 'agents' || v === 'home' ? 'control' : v));
         refresh();
         return;
       }
       setCurrentPid(id);
       setSelectedTaskId(null);
       setSnapshot(null);
-      setView((v) => (v === 'settings' ? 'control' : v));
+      setView((v) => (v === 'settings' || v === 'home' ? 'control' : v));
       lastSeq.current = 0;
     },
     setView,

@@ -24,15 +24,17 @@ export function Rail({ store }: { store: AppStore }) {
         overflowY: 'auto',
       }}
     >
-      <div
-        title="planar"
+      <button
+        title="planar · home"
+        onClick={() => actions.goHome()}
+        className="hover-bright"
         style={{
-          width: 34, height: 34, borderRadius: 9, background: 'var(--accent)',
+          cursor: 'pointer', width: 34, height: 34, borderRadius: 9, background: 'var(--accent)',
           display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: 8, flex: 'none',
         }}
       >
         <div style={{ width: 14, height: 14, background: 'var(--bg)', transform: 'rotate(45deg)' }} />
-      </div>
+      </button>
 
       {ungrouped.map((p) => (
         <RailProject

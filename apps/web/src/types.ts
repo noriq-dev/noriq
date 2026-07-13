@@ -21,6 +21,9 @@ export interface ProjectVM {
   badge: string;
   hasLive: boolean;
   groupId: string | null;
+  openTasks: number;
+  totalTasks: number;
+  doneTasks: number;
 }
 
 export interface AgentVM {
@@ -67,7 +70,7 @@ export interface EventVM {
   taskId?: string;
 }
 
-export type ViewId = 'control' | 'graph' | 'board' | 'plans' | 'agents' | 'settings';
+export type ViewId = 'home' | 'control' | 'graph' | 'board' | 'plans' | 'agents' | 'settings';
 
 export interface AppData {
   projects: ProjectVM[];

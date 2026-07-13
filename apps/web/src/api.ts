@@ -78,6 +78,9 @@ export interface ApiProject {
   name: string;
   description: string;
   liveTasks: number;
+  openTasks: number;
+  totalTasks: number;
+  doneTasks: number;
   groupId: string | null;
 }
 

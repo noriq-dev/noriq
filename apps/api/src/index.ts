@@ -127,7 +127,10 @@ app.get('/api/auth/me', userAuth, (c) => c.json({ user: c.var.user }));
 app.get('/api/projects', userAuth, async (c) => {
   const { results } = await c.env.DB.prepare(
     `SELECT p.id, p.key, p.name, p.description, p.status, p.repo_url AS repoUrl, p.group_id AS groupId,
-            (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'in_progress') AS liveTasks
+            (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'in_progress') AS liveTasks,
+            (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status NOT IN ('done','cancelled')) AS openTasks,
+            (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) AS totalTasks,
+            (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'done') AS doneTasks
      FROM projects p WHERE p.status = 'active' ORDER BY p.created_at`,
   ).all();
   return c.json({ projects: results });
