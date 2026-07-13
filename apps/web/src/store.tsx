@@ -287,6 +287,7 @@ export function useAppStore() {
       color: a.role === 'orchestrator' ? '#f5a623' : PALETTE[hashIdx(a.id, PALETTE.length)]!,
       lastSeenAt: a.lastSeenAt,
       ownerName: a.ownerName,
+      parentAgentId: a.parentAgentId,
     }));
     const events = (snapshot?.events ?? []).map(eventToVM);
     return {

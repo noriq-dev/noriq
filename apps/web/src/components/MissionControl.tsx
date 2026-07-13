@@ -33,6 +33,9 @@ function AgentPanel({ store }: { store: AppStore }) {
   if (!agent) return <Holds store={store} />;
 
   const held = tasks.filter((t) => t.claimedBy === agent.id && !['done', 'cancelled'].includes(t.status));
+  const agents = data.agents[currentPid] ?? [];
+  const parent = agent.parentAgentId ? agents.find((a) => a.id === agent.parentAgentId) : null;
+  const children = agents.filter((a) => a.parentAgentId === agent.id);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
@@ -42,8 +45,17 @@ function AgentPanel({ store }: { store: AppStore }) {
           <div style={{ fontSize: 14, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6 }}>
             {agent.name}
             {agent.role === 'orch' && <MonoTag color="var(--accent)" bg="rgba(198,242,78,.12)" size={9}>ORCH</MonoTag>}
+            {parent && <MonoTag color="var(--blue)" bg="rgba(76,157,255,.12)" size={9}>SUB</MonoTag>}
           </div>
           <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+            {parent && (
+              <>
+                sub-agent of{' '}
+                <button onClick={() => actions.selectAgent(parent.id)} style={{ cursor: 'pointer', background: 'transparent', border: 'none', color: 'var(--blue)', padding: 0, font: 'inherit' }}>{parent.name}</button>
+                {' · '}
+              </>
+            )}
+            {!parent && children.length > 0 && `${children.length} sub-agent${children.length === 1 ? '' : 's'} · `}
             {agent.ownerName ? `delegated by ${agent.ownerName} · ` : ''}seen {ago(agent.lastSeenAt)}
           </div>
         </div>

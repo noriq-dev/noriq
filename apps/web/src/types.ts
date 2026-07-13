@@ -33,6 +33,7 @@ export interface AgentVM {
   color: string;
   lastSeenAt: string | null;
   ownerName: string | null;
+  parentAgentId: string | null;
 }
 
 export interface CommentVM {

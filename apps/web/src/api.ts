@@ -60,6 +60,10 @@ export const api = {
   passkeys: () => req<{ passkeys: Array<{ id: string; name: string; createdAt: string }> }>('GET', '/api/webauthn/passkeys'),
   deletePasskey: (id: string) => req('DELETE', `/api/webauthn/passkeys/${id}`),
 
+  authSessions: () => req<{ sessions: Array<{ id: string; clientName: string; scope: string; createdAt: string; expiresAt: string; agentCount: number; lastActive: string | null }> }>('GET', '/api/auth/sessions'),
+  revokeSession: (id: string) => req('POST', `/api/auth/sessions/${id}/revoke`),
+  revokeAllSessions: () => req('POST', '/api/auth/sessions/revoke-all'),
+
   patchGroup: (gid: string, patch: { name?: string; description?: string }) => req('PATCH', `/api/groups/${gid}`, patch),
   deleteGroup: (gid: string) => req('DELETE', `/api/groups/${gid}`),
   deleteUser: (uid: string) => req('DELETE', `/api/users/${uid}`),
@@ -162,7 +166,7 @@ export interface ApiSnapshot {
     milestoneId: string | null; openComments: number; order: number;
   }>;
   dependencies: Array<{ taskId: string; dependsOnTaskId: string }>;
-  agents: Array<{ id: string; name: string; role: string; status: string; lastSeenAt: string | null; ownerName: string | null }>;
+  agents: Array<{ id: string; name: string; role: string; status: string; lastSeenAt: string | null; ownerName: string | null; parentAgentId: string | null }>;
   milestones: Array<{ id: string; title: string; dueAt: string | null; order: number }>;
   plans: Array<{ id: string; agentId: string | null; title: string; description: string; body: string; createdAt: string }>;
   phases: Array<{ id: string; planId: string; title: string; body: string; order: number }>;

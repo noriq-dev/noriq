@@ -17,6 +17,13 @@ plus your live state (held tasks, unresolved comments, what's claimable). For th
 parameter reference of every tool, see \`/reference.md\` (or \`/reference.json\`), generated
 from the live schemas.
 
+## Who you are
+
+Each session — this chat, or a sub-agent you spawn — is its own **agent**, local to one
+project. Call \`set_agent_identity\` with a short \`name\` and the \`projectId\` you're working
+(names are unique per project). If you're a sub-agent, pass \`parentAgentId\` so your work is
+attributed to the agent that spawned you. Your OAuth connection can carry many such agents.
+
 ## The work loop
 
 1. \`get_briefing\` — orient yourself.

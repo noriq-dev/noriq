@@ -27,8 +27,9 @@ The contract: (1) call get_briefing first; (2) claim_task before working on anyt
 TTL is generous (30 min), so you never need to ping to stay alive. heartbeat exists only
 for the rare case where you'll go silent longer than that; (4) check and resolve open
 comments — humans steer you through them; (5) release_task (to review or done) when
-finished. Never work on a task you have not claimed. OAuth sessions start under a default
-delegated identity — call set_agent_identity to take a distinct name/role for this work.`;
+finished. Never work on a task you have not claimed. Each session (this chat, or a
+sub-agent) is its own agent, local to one project — call set_agent_identity with a name
+and the projectId you're working; sub-agents pass parentAgentId to attribute their work.`;
 
 function room(env: Env, projectId: string) {
   return env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName(projectId));

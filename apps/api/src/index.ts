@@ -176,6 +176,39 @@ app.post('/api/auth/logout', userAuth, async (c) => {
 
 app.get('/api/auth/me', userAuth, (c) => c.json({ user: c.var.user }));
 
+// --- OAuth connections ("sessions") the user can see & revoke (agent re-model) ----
+app.get('/api/auth/sessions', userAuth, async (c) => {
+  const { results } = await c.env.DB.prepare(
+    `SELECT t.id, COALESCE(cl.name, 'MCP client') AS clientName, t.scope, t.created_at AS createdAt, t.expires_at AS expiresAt,
+            (SELECT COUNT(*) FROM agents a WHERE a.oauth_token_id = t.id AND a.status != 'revoked') AS agentCount,
+            (SELECT MAX(a.last_seen_at) FROM agents a WHERE a.oauth_token_id = t.id) AS lastActive
+     FROM oauth_tokens t LEFT JOIN oauth_clients cl ON cl.id = t.client_id
+     WHERE t.user_id = ? AND t.revoked_at IS NULL AND t.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     ORDER BY t.created_at DESC`,
+  ).bind(c.var.user!.id).all();
+  return c.json({ sessions: results });
+});
+
+app.post('/api/auth/sessions/:id/revoke', userAuth, async (c) => {
+  const now = nowIso();
+  const r = await c.env.DB.prepare("UPDATE oauth_tokens SET revoked_at = ? WHERE id = ? AND user_id = ? AND revoked_at IS NULL")
+    .bind(now, c.req.param('id'), c.var.user!.id).run();
+  // Retire the agents that ran on this connection so they stop showing as live.
+  await c.env.DB.prepare("UPDATE agents SET status = 'offline' WHERE oauth_token_id = ? AND status = 'active'")
+    .bind(c.req.param('id')).run();
+  return c.json({ ok: true, revoked: r.meta.changes ?? 0 });
+});
+
+app.post('/api/auth/sessions/revoke-all', userAuth, async (c) => {
+  const now = nowIso();
+  const r = await c.env.DB.prepare("UPDATE oauth_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL")
+    .bind(now, c.var.user!.id).run();
+  await c.env.DB.prepare(
+    "UPDATE agents SET status = 'offline' WHERE status = 'active' AND oauth_token_id IN (SELECT id FROM oauth_tokens WHERE user_id = ?)",
+  ).bind(c.var.user!.id).run();
+  return c.json({ ok: true, revoked: r.meta.changes ?? 0 });
+});
+
 // --- UI read API (session-authed) -------------------------------------------------
 /** Visibility (PLNR-48): ungrouped → owner only; grouped → group members; admins see all.
  *  Legacy/agent-created projects with no owner remain visible to everyone. */

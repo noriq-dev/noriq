@@ -14,6 +14,7 @@ export function SettingsView({ store }: { store: AppStore }) {
         {isAdmin && <UsersSection store={store} />}
         <GroupsSection store={store} />
         <PasskeysSection />
+        <SessionsSection />
         <PasswordSection />
       </div>
     </div>
@@ -299,6 +300,52 @@ function PasskeysSection() {
         ))}
       </div>
       <ErrorNote>{error}</ErrorNote>
+    </Section>
+  );
+}
+
+function SessionsSection() {
+  const [sessions, setSessions] = useState<Array<{ id: string; clientName: string; createdAt: string; agentCount: number; lastActive: string | null }>>([]);
+  const load = () => api.authSessions().then((r) => setSessions(r.sessions)).catch(() => {});
+  useEffect(() => { load(); }, []);
+  const ago = (iso: string | null) => (iso ? new Date(iso).toLocaleString() : 'never');
+
+  return (
+    <Section
+      title={`Agent connections · ${sessions.length}`}
+      action={
+        sessions.length > 0 ? (
+          <SmallAction danger onClick={async () => {
+            if (confirm('Revoke ALL agent connections? Every Claude/Codex/Copilot session using this account will need to reconnect via OAuth.')) {
+              await api.revokeAllSessions();
+              load();
+            }
+          }}>revoke all</SmallAction>
+        ) : undefined
+      }
+    >
+      <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)', marginBottom: 8 }}>
+        Each is one OAuth authorization (a `claude mcp add`). Revoking forces that client to reconnect. Individual agents (chats / sub-agents) live under a connection.
+      </div>
+      {sessions.length === 0 && (
+        <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>
+          no active connections — connect an agent from the homepage
+        </div>
+      )}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {sessions.map((s) => (
+          <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 11px', borderRadius: 9, background: 'rgba(255,255,255,.02)', border: '1px solid rgba(255,255,255,.06)' }}>
+            <span style={{ fontSize: 13 }}>🔌</span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 12.5, fontWeight: 500 }}>{s.clientName}</div>
+              <div style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)' }}>
+                {s.agentCount} agent{s.agentCount === 1 ? '' : 's'} · last active {ago(s.lastActive)}
+              </div>
+            </div>
+            <SmallAction danger onClick={async () => { await api.revokeSession(s.id); load(); }}>revoke</SmallAction>
+          </div>
+        ))}
+      </div>
     </Section>
   );
 }
