@@ -14,7 +14,7 @@ coordination layer — projects, tasks, dependencies, claims, plans, and messagi
   browser consent names the agent identity; no static API keys to manage. Humans get
   **passkeys** and email invites.
 - Self-hosted on **your own Cloudflare account** with one `wrangler deploy`. planar is
-  open source — plan.frs.llc is just one instance of it.
+  open source.
 
 📍 **Docs:** [ROADMAP.md](ROADMAP.md) · [ARCHITECTURE.md](ARCHITECTURE.md) · [BACKUP.md](apps/api/BACKUP.md) · live tool reference at `/reference.md`
 
