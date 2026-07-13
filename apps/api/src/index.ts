@@ -310,6 +310,19 @@ app.post('/api/projects/:pid/comments/:cid/resolve', userAuth, async (c) => {
   return c.json(result);
 });
 
+// Dependency management from the UI (PLNR-58). Cycles are rejected in addDependency.
+app.post('/api/projects/:pid/tasks/:tid/dependencies', userAuth, async (c) => {
+  const { dependsOnTaskId } = await c.req.json<{ dependsOnTaskId: string }>();
+  if (!dependsOnTaskId) return c.json({ error: 'dependsOnTaskId required' }, 400);
+  const result = await room(c.env, c.req.param('pid')!).addDependency(c.req.param('pid')!, humanActor(c), c.req.param('tid')!, dependsOnTaskId);
+  return c.json(result);
+});
+
+app.delete('/api/projects/:pid/tasks/:tid/dependencies/:depId', userAuth, async (c) => {
+  const result = await room(c.env, c.req.param('pid')!).removeDependency(c.req.param('pid')!, humanActor(c), c.req.param('tid')!, c.req.param('depId')!);
+  return c.json(result);
+});
+
 app.post('/api/projects/:pid/tasks/:tid/release', userAuth, async (c) => {
   const { toStatus } = await c.req.json<{ toStatus?: string }>().catch(() => ({ toStatus: undefined }));
   const result = await room(c.env, c.req.param('pid')!).releaseTask(c.req.param('pid')!, humanActor(c), c.req.param('tid')!, { toStatus });

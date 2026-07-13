@@ -21,6 +21,8 @@ export function Drawer({ store }: { store: AppStore }) {
   const [timeline, setTimeline] = useState<ApiAgentEvent[]>([]);
   const [addingTag, setAddingTag] = useState(false);
   const [newTag, setNewTag] = useState('');
+  const [addingDep, setAddingDep] = useState(false);
+  const [depError, setDepError] = useState('');
   const [attachments, setAttachments] = useState<Array<{ id: string; filename: string; size: number; contentType?: string; createdAt: string }>>([]);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -40,10 +42,14 @@ export function Drawer({ store }: { store: AppStore }) {
   const eff = helpers.effStatus(currentPid, task);
   const m = statusMeta(eff);
   const ag = task.claimedBy ? helpers.agentById(currentPid, task.claimedBy) : null;
-  const depNames = task.deps.map((d) => {
+  const deps = task.deps.map((d) => {
     const dt = tasks.find((x) => x.id === d);
-    return dt ? `${dt.key}${dt.status !== 'done' ? ' ⟂' : ' ✓'}` : `#${d}`;
+    return dt
+      ? { id: dt.id, key: dt.key, title: dt.title, status: helpers.effStatus(currentPid, dt), found: true as const }
+      : { id: d, key: `#${d.slice(0, 8)}`, title: '', status: 'todo' as const, found: false as const };
   });
+  // Tasks eligible as a new dependency: same project, not self, not already a dep.
+  const eligibleDeps = tasks.filter((t) => t.id !== task.id && !task.deps.includes(t.id));
   const canRelease = !!task.claimedBy;
   const holder = ag ? ag.name : eff === 'blocked' ? '— (blocked)' : '— (unclaimed)';
   const taskTags = task.tagIds.map((id) => tagById.get(id)).filter(Boolean) as Array<{ id: string; name: string; color: string }>;
@@ -210,9 +216,80 @@ export function Drawer({ store }: { store: AppStore }) {
               </div>
             </MetaCell>
             <MetaCell label="Dependencies">
-              <div style={{ fontSize: 12.5, fontWeight: 500, color: depNames.length ? (eff === 'blocked' ? 'var(--red-soft)' : 'var(--text-mid)') : 'var(--text-mid)' }}>
-                {depNames.length ? depNames.join(', ') : 'none'}
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, alignItems: 'center' }}>
+                {deps.map((d) => {
+                  const sm = statusMeta(d.status);
+                  const done = d.status === 'done';
+                  return (
+                    <span
+                      key={d.id}
+                      style={{
+                        display: 'inline-flex', alignItems: 'center', gap: 5,
+                        fontFamily: 'var(--mono)', fontSize: 10.5, color: sm.color,
+                        background: 'rgba(255,255,255,.03)', border: `1px solid ${sm.color}44`,
+                        padding: '2px 4px 2px 7px', borderRadius: 6,
+                      }}
+                    >
+                      <button
+                        onClick={() => d.found && actions.openTask(d.id)}
+                        disabled={!d.found}
+                        title={d.found ? `${d.title} — ${sm.label}${done ? '' : ' (blocking)'}` : 'task not in this view'}
+                        className={d.found ? 'hover-bright' : undefined}
+                        style={{ cursor: d.found ? 'pointer' : 'default', display: 'inline-flex', alignItems: 'center', gap: 5, background: 'transparent', color: 'inherit', border: 'none', padding: 0, font: 'inherit' }}
+                      >
+                        <span style={{ width: 6, height: 6, borderRadius: '50%', background: sm.dot, flex: 'none' }} />
+                        {d.key}
+                        <span style={{ color: 'var(--text-faint)' }}>{done ? '✓' : '⟂'}</span>
+                      </button>
+                      <button
+                        onClick={() => void actions.removeDependency(task.id, d.id)}
+                        title="Remove dependency"
+                        style={{ cursor: 'pointer', background: 'transparent', border: 'none', color: 'var(--text-faint)', padding: '0 1px', fontSize: 11, lineHeight: 1 }}
+                        className="hover-bright"
+                      >
+                        ✕
+                      </button>
+                    </span>
+                  );
+                })}
+                {addingDep ? (
+                  <select
+                    autoFocus
+                    defaultValue=""
+                    onChange={async (e) => {
+                      const depId = e.target.value;
+                      if (!depId) return;
+                      setDepError('');
+                      try {
+                        await actions.addDependency(task.id, depId);
+                        setAddingDep(false);
+                      } catch (err) {
+                        setDepError(err instanceof Error ? err.message : 'could not add dependency');
+                      }
+                    }}
+                    onBlur={() => setAddingDep(false)}
+                    style={{ fontFamily: 'var(--mono)', fontSize: 10.5, maxWidth: 180, padding: '2px 4px', borderRadius: 6 }}
+                  >
+                    <option value="" disabled>depends on…</option>
+                    {eligibleDeps.map((t) => (
+                      <option key={t.id} value={t.id}>{t.key} — {t.title.slice(0, 40)}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <button
+                    onClick={() => { setDepError(''); setAddingDep(true); }}
+                    disabled={eligibleDeps.length === 0}
+                    title={eligibleDeps.length ? 'Add a dependency' : 'no other tasks to depend on'}
+                    className="rail-add"
+                    style={{ cursor: eligibleDeps.length ? 'pointer' : 'default', fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', border: '1px dashed rgba(255,255,255,.15)', padding: '2px 7px', borderRadius: 6, background: 'transparent' }}
+                  >
+                    {deps.length ? '+ dep' : '+ add dependency'}
+                  </button>
+                )}
               </div>
+              {depError && (
+                <div style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--red-soft)', marginTop: 4 }}>{depError}</div>
+              )}
             </MetaCell>
           </div>
 

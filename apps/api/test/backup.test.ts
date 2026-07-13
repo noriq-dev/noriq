@@ -14,8 +14,9 @@ describe('D1 backup/export', () => {
     expect(snap.planar).toBe('d1-snapshot');
     // Core tables present, discovered from sqlite_master (not a hard-coded list).
     for (const t of ['users', 'projects', 'tasks', 'agents']) {
-      expect(Array.isArray(snap.tables[t])).toBe(true);
-      expect(snap.counts[t]).toBe(snap.tables[t].length);
+      const rows = snap.tables[t];
+      expect(Array.isArray(rows)).toBe(true);
+      expect(snap.counts[t]).toBe(rows!.length);
     }
     // D1/SQLite internals are excluded.
     expect(snap.tables['d1_migrations']).toBeUndefined();

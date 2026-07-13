@@ -89,6 +89,10 @@ export const api = {
     req<{ id: string; key: string }>('POST', `/api/projects/${pid}/tasks`, input),
   updateTask: (pid: string, tid: string, patch: Record<string, unknown>) =>
     req('PATCH', `/api/projects/${pid}/tasks/${tid}`, patch),
+  addDependency: (pid: string, tid: string, dependsOnTaskId: string) =>
+    req('POST', `/api/projects/${pid}/tasks/${tid}/dependencies`, { dependsOnTaskId }),
+  removeDependency: (pid: string, tid: string, depId: string) =>
+    req('DELETE', `/api/projects/${pid}/tasks/${tid}/dependencies/${depId}`),
   sendMessage: (pid: string, body: string, toAgentId?: string) =>
     req<{ id: string }>('POST', `/api/projects/${pid}/messages`, { body, toAgentId }),
   postComment: (pid: string, tid: string, kind: string, body: string) =>

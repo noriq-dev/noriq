@@ -443,6 +443,18 @@ export function useAppStore() {
       refresh();
     },
 
+    async addDependency(taskId: string, dependsOnTaskId: string) {
+      if (!pidRef.current) return;
+      await api.addDependency(pidRef.current, taskId, dependsOnTaskId);
+      refresh();
+    },
+
+    async removeDependency(taskId: string, dependsOnTaskId: string) {
+      if (!pidRef.current) return;
+      await api.removeDependency(pidRef.current, taskId, dependsOnTaskId);
+      refresh();
+    },
+
     async postComment() {
       const text = draftText.trim();
       if (!text || !pidRef.current) return;

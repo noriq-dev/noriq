@@ -344,7 +344,20 @@ export class ProjectRoom extends DurableObject<Env> {
         .run();
       await this.emit(actor, 'dependency.added', 'task', taskId, { key: task.key, dependsOn: dep.key });
       return { ok: true };
-    
+
+    });
+  }
+
+  async removeDependency(projectId: string, actor: Actor, taskId: string, dependsOnTaskId: string)  {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const [task, dep] = await Promise.all([this.getTask(taskId), this.getTask(dependsOnTaskId)]);
+      await this.env.DB.prepare('DELETE FROM dependencies WHERE task_id = ? AND depends_on_task_id = ?')
+        .bind(taskId, dependsOnTaskId)
+        .run();
+      await this.emit(actor, 'dependency.removed', 'task', taskId, { key: task.key, dependsOn: dep.key });
+      return { ok: true };
+
     });
   }
 
