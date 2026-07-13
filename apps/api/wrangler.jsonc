@@ -19,10 +19,14 @@
   "durable_objects": {
     "bindings": [
       { "name": "PROJECT_ROOM", "class_name": "ProjectRoom" },
-      { "name": "AGENT_SESSION", "class_name": "AgentSession" }
+      { "name": "AGENT_SESSION", "class_name": "AgentSession" },
+      { "name": "RATE_LIMITER", "class_name": "RateLimiter" }
     ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ProjectRoom", "AgentSession"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ProjectRoom", "AgentSession"] },
+    { "tag": "v2", "new_sqlite_classes": ["RateLimiter"] }
+  ],
 
   "d1_databases": [
     {

@@ -167,6 +167,10 @@ oauth.get('/authorize', async (c) => {
 });
 
 oauth.post('/authorize', async (c) => {
+  if (!c.env.DISABLE_RATE_LIMIT) {
+    const stub = c.env.RATE_LIMITER.get(c.env.RATE_LIMITER.idFromName(`auth:${c.req.header('CF-Connecting-IP') ?? 'local'}`));
+    if (!(await stub.hit(20, 60_000)).ok) return c.text('too many attempts — slow down', 429);
+  }
   const form = await c.req.parseBody();
   const p = readParams(new URLSearchParams(Object.entries(form).map(([k, v]) => [k, String(v)])));
   const v = await validateClient(c.env.DB, p);
@@ -224,6 +228,10 @@ oauth.post('/authorize', async (c) => {
 
 // --- token ---------------------------------------------------------------------
 oauth.post('/token', async (c) => {
+  if (!c.env.DISABLE_RATE_LIMIT) {
+    const stub = c.env.RATE_LIMITER.get(c.env.RATE_LIMITER.idFromName(`auth:${c.req.header('CF-Connecting-IP') ?? 'local'}`));
+    if (!(await stub.hit(20, 60_000)).ok) return c.json({ error: 'slow_down' }, 429);
+  }
   const form = await c.req.parseBody();
   const grant = String(form.grant_type ?? '');
 

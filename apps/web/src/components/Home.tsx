@@ -256,8 +256,8 @@ function ConnectCard() {
       </pre>
       <div style={{ fontSize: 11, color: 'var(--text-dim)', lineHeight: 1.6, marginTop: 12 }}>
         The agent then calls <span style={{ fontFamily: 'var(--mono)' }}>get_briefing</span> and teaches itself the
-        rest. For headless/CI agents, issue a static key from the{' '}
-        <span style={{ fontFamily: 'var(--mono)' }}>Agents</span> tab instead.
+        rest; it takes its working identity with{' '}
+        <span style={{ fontFamily: 'var(--mono)' }}>set_agent_identity</span>. All access is OAuth — no API keys to manage.
       </div>
     </div>
   );

@@ -50,7 +50,9 @@ export function AgentsView({ store }: { store: AppStore }) {
           <div style={{ display: 'flex', alignItems: 'center', marginBottom: 14 }}>
             <SectionLabel>Agents · {agents.filter((a) => a.status !== 'revoked').length}</SectionLabel>
             <div style={{ flex: 1 }} />
-            {isAdmin && <Button onClick={() => store.actions.openModal('agent')}>+ new agent</Button>}
+            <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>
+              agents join via OAuth — connect a client from the homepage
+            </span>
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -107,7 +109,7 @@ export function AgentsView({ store }: { store: AppStore }) {
             })}
             {!agents.length && (
               <div style={{ padding: 40, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-dim)' }}>
-                no agents yet — issue the first key
+                no agents yet — connect an MCP client via OAuth from the homepage
               </div>
             )}
           </div>

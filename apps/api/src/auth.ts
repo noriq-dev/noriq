@@ -25,9 +25,9 @@ export type Vars = {
 export type AppContext = { Bindings: Env; Variables: Vars };
 
 /**
- * Bearer auth for agents (MCP + agent REST). Accepts both static API keys
- * (plnr_*) and OAuth access tokens (plnrt_*). 401s advertise the OAuth
- * resource metadata so MCP clients can discover the authorization server.
+ * Bearer auth for agents (MCP): OAuth 2.1 access tokens only (static API keys
+ * were retired — PLNR-52). 401s advertise the OAuth resource metadata so MCP
+ * clients can discover the authorization server.
  */
 export async function agentAuth(c: Context<AppContext>, next: Next) {
   const unauthorized = (msg: string) => {
@@ -42,21 +42,14 @@ export async function agentAuth(c: Context<AppContext>, next: Next) {
   if (!key) return unauthorized('missing bearer token');
   const hash = await sha256Hex(key);
 
-  let row: AgentIdentity | null;
-  if (key.startsWith('plnrt_')) {
-    const t = await c.env.DB.prepare(
-      `SELECT a.id, a.name, a.role, t.id AS tokenId FROM oauth_tokens t JOIN agents a ON a.id = t.agent_id
-       WHERE t.token_hash = ? AND t.revoked_at IS NULL
-         AND t.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') AND a.status != 'revoked'`,
-    ).bind(hash).first<AgentIdentity & { tokenId: string }>();
-    row = t ? { id: t.id, name: t.name, role: t.role } : null;
-    if (t) c.set('oauthTokenId', t.tokenId);
-  } else {
-    row = await c.env.DB.prepare(
-      "SELECT id, name, role FROM agents WHERE api_key_hash = ? AND status != 'revoked'",
-    ).bind(hash).first<AgentIdentity>();
-  }
-  if (!row) return unauthorized('invalid, expired, or revoked token');
+  const t = await c.env.DB.prepare(
+    `SELECT a.id, a.name, a.role, t.id AS tokenId FROM oauth_tokens t JOIN agents a ON a.id = t.agent_id
+     WHERE t.token_hash = ? AND t.revoked_at IS NULL
+       AND t.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') AND a.status != 'revoked'`,
+  ).bind(hash).first<AgentIdentity & { tokenId: string }>();
+  const row: AgentIdentity | null = t ? { id: t.id, name: t.name, role: t.role } : null;
+  if (t) c.set('oauthTokenId', t.tokenId);
+  if (!row) return unauthorized('invalid, expired, or revoked token — connect via OAuth');
   c.set('agent', row);
   await next();
 }

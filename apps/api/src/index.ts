@@ -7,10 +7,12 @@ import { hashPassword, newApiKey, newId, nowIso, sha256Hex, verifyPassword } fro
 import type { Actor } from './do/ProjectRoom';
 import { SKILL_MD } from './skill';
 import { metadataRoutes, oauth } from './oauth';
+import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
 
 export { ProjectRoom } from './do/ProjectRoom';
 export { AgentSession } from './do/AgentSession';
+export { RateLimiter } from './do/RateLimiter';
 
 const app = new Hono<AppContext>();
 
@@ -20,6 +22,16 @@ app.route('/oauth', oauth);
 app.route('/', onboarding);
 
 const room = (env: Env, projectId: string) => env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName(projectId));
+
+/** Fixed-window limiter via the RateLimiter DO (PLNR-18). */
+const rateLimit = async (env: Env, bucket: string, limit: number, windowMs = 60_000) => {
+  if (env.DISABLE_RATE_LIMIT) return { ok: true, retryAfter: 0 };
+  const stub = env.RATE_LIMITER.get(env.RATE_LIMITER.idFromName(bucket));
+  return stub.hit(limit, windowMs);
+};
+const clientIp = (c: { req: { header: (n: string) => string | undefined } }) =>
+  c.req.header('CF-Connecting-IP') ?? 'local';
+const tooMany = { error: 'too many attempts — slow down' };
 const humanActor = (c: { var: { user?: { id: string; name: string } } }): Actor => ({
   kind: 'human',
   id: c.var.user!.id,
@@ -29,11 +41,18 @@ const humanActor = (c: { var: { user?: { id: string; name: string } } }): Actor 
 // --- health -----------------------------------------------------------------
 app.get('/api/health', async (c) => {
   const row = await c.env.DB.prepare('SELECT 1 AS ok').first<{ ok: number }>();
-  return c.json({ ok: row?.ok === 1, service: 'planar', version: '0.2.0' });
+  return c.json({
+    ok: row?.ok === 1,
+    service: 'planar',
+    version: '0.2.0',
+  });
 });
 
 // --- MCP (agents) -------------------------------------------------------------
 app.all('/mcp', agentAuth, async (c) => {
+  // Per-agent throughput cap; generous for heartbeat cadence, hostile to floods.
+  const rl = await rateLimit(c.env, `mcp:${c.var.agent!.id}`, 120);
+  if (!rl.ok) return c.json({ error: 'rate limited — back off and retry' }, 429, { 'Retry-After': String(rl.retryAfter) });
   const server = buildMcpServer(c.env, c.var.agent!, { oauthTokenId: c.var.oauthTokenId });
   const transport = new StreamableHTTPTransport();
   await server.connect(transport);
@@ -51,19 +70,7 @@ app.get('/ws/projects/:projectId', async (c) => {
   return room(c.env, c.req.param('projectId')).fetch(c.req.raw);
 });
 
-// --- admin bootstrap (agent keys, users) ----------------------------------------
-app.post('/api/admin/agents', adminAuth, async (c) => {
-  const body = await c.req.json<{ name: string; role?: 'orchestrator' | 'worker' }>();
-  if (!body.name) return c.json({ error: 'name required' }, 400);
-  const key = newApiKey();
-  const id = newId('agt');
-  await c.env.DB.prepare(
-    `INSERT INTO agents (id, name, role, status, api_key_hash, created_at) VALUES (?, ?, ?, 'idle', ?, ?)`,
-  ).bind(id, body.name, body.role ?? 'worker', await sha256Hex(key), nowIso()).run();
-  // The raw key is returned exactly once; only its hash is stored.
-  return c.json({ id, name: body.name, role: body.role ?? 'worker', apiKey: key });
-});
-
+// --- admin bootstrap (users; agent key issuance retired — agents arrive via OAuth) --
 app.post('/api/admin/users', adminAuth, async (c) => {
   const body = await c.req.json<{ email: string; name: string; password: string; role?: 'admin' | 'member' }>();
   if (!body.email || !body.password || !body.name) return c.json({ error: 'email, name, password required' }, 400);
@@ -82,6 +89,8 @@ app.get('/api/setup/status', async (c) => {
 });
 
 app.post('/api/setup', async (c) => {
+  const rl = await rateLimit(c.env, `auth:${clientIp(c)}`, 10);
+  if (!rl.ok) return c.json(tooMany, 429, { 'Retry-After': String(rl.retryAfter) });
   const row = await c.env.DB.prepare('SELECT COUNT(*) AS n FROM users').first<{ n: number }>();
   if ((row?.n ?? 0) > 0) return c.json({ error: 'already configured' }, 409);
   const body = await c.req.json<{ email: string; name: string; password: string }>();
@@ -103,6 +112,8 @@ app.post('/api/setup', async (c) => {
 
 // --- human auth -----------------------------------------------------------------
 app.post('/api/auth/login', async (c) => {
+  const rl = await rateLimit(c.env, `auth:${clientIp(c)}`, 10);
+  if (!rl.ok) return c.json(tooMany, 429, { 'Retry-After': String(rl.retryAfter) });
   const { email, password } = await c.req.json<{ email: string; password: string }>();
   const user = await c.env.DB.prepare('SELECT id, email, name, role, password_hash AS hash FROM users WHERE email = ? AND disabled = 0')
     .bind((email ?? '').toLowerCase())
@@ -462,18 +473,6 @@ app.get('/api/agents/:aid/events', userAuth, async (c) => {
   return c.json({ events: results.map((e) => ({ ...e, payload: JSON.parse(String(e.payload)) })) });
 });
 
-app.post('/api/agents', userAuth, async (c) => {
-  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
-  const body = await c.req.json<{ name: string; role?: 'orchestrator' | 'worker' }>();
-  if (!body.name) return c.json({ error: 'name required' }, 400);
-  const key = newApiKey();
-  const id = newId('agt');
-  await c.env.DB.prepare(
-    `INSERT INTO agents (id, name, role, status, api_key_hash, created_at) VALUES (?, ?, ?, 'idle', ?, ?)`,
-  ).bind(id, body.name, body.role ?? 'worker', await sha256Hex(key), nowIso()).run();
-  return c.json({ id, name: body.name, role: body.role ?? 'worker', apiKey: key });
-});
-
 app.post('/api/agents/:aid/revoke', userAuth, async (c) => {
   if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
   await c.env.DB.prepare("UPDATE agents SET status = 'revoked' WHERE id = ?").bind(c.req.param('aid')!).run();
@@ -580,6 +579,16 @@ app.post('/api/webhooks/github', async (c) => {
   return c.json({ ok: true, updated });
 });
 
-app.onError((err, c) => c.json({ error: err.message }, 400));
+app.onError((err, c) => {
+  const status = (err as { status?: number }).status ?? 500;
+  if (wantsHtml(c.req.raw)) return c.html(errorPage(status, status >= 500 ? undefined : err.message), status as never);
+  return c.json({ error: err.message }, status as never);
+});
+
+// 404 for unmatched routes: styled page for navigations, JSON otherwise.
+app.notFound((c) => {
+  if (wantsHtml(c.req.raw)) return c.html(errorPage(404), 404);
+  return c.json({ error: 'not found' }, 404);
+});
 
 export default app;

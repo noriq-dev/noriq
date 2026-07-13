@@ -11,7 +11,6 @@ export function ModalHost({ store }: { store: AppStore }) {
     case 'project-edit': return <EditProjectModal store={store} />;
     case 'task': return <CreateTaskModal store={store} />;
     case 'group': return <CreateGroupModal store={store} />;
-    case 'agent': return <NewAgentModal store={store} />;
     case 'milestone': return <CreateMilestoneModal store={store} />;
     case 'tag': return <CreateTagModal store={store} />;
     default: return null;
@@ -312,74 +311,3 @@ function CreateGroupModal({ store }: { store: AppStore }) {
   );
 }
 
-function NewAgentModal({ store }: { store: AppStore }) {
-  const [name, setName] = useState('');
-  const [role, setRole] = useState<'worker' | 'orchestrator'>('worker');
-  const [issued, setIssued] = useState<{ name: string; apiKey: string } | null>(null);
-  const [copied, setCopied] = useState(false);
-  const { busy, error, run } = useSubmit(async () => {
-    const r = await api.createAgent(name.trim(), role);
-    setIssued({ name: r.name, apiKey: r.apiKey });
-  });
-
-  if (issued) {
-    const mcpCmd = `claude mcp add --transport http planar ${location.origin}/mcp \\\n  --header "Authorization: Bearer ${issued.apiKey}"`;
-    return (
-      <Modal title={`${issued.name} · key issued`} subtitle="shown ONCE — only a hash is stored" onClose={store.actions.closeModal} width={520}>
-        <div
-          style={{
-            fontFamily: 'var(--mono)', fontSize: 11.5, color: 'var(--accent)',
-            background: 'rgba(198,242,78,.06)', border: '1px solid rgba(198,242,78,.25)',
-            borderRadius: 9, padding: '10px 12px', wordBreak: 'break-all', marginBottom: 12,
-          }}
-        >
-          {issued.apiKey}
-        </div>
-        <Field label="Connect Claude Code">
-          <pre
-            style={{
-              fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-soft)',
-              background: 'rgba(255,255,255,.04)', border: '1px solid rgba(255,255,255,.08)',
-              borderRadius: 9, padding: '10px 12px', overflowX: 'auto', margin: 0, whiteSpace: 'pre-wrap',
-            }}
-          >
-            {mcpCmd}
-          </pre>
-        </Field>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <Button
-            variant="ghost"
-            onClick={async () => {
-              await navigator.clipboard.writeText(issued.apiKey);
-              setCopied(true);
-              setTimeout(() => setCopied(false), 1500);
-            }}
-          >
-            {copied ? '✓ copied' : 'Copy key'}
-          </Button>
-          <div style={{ flex: 1 }} />
-          <Button onClick={store.actions.closeModal}>Done</Button>
-        </div>
-      </Modal>
-    );
-  }
-
-  return (
-    <Modal title="New agent" subtitle="issues an MCP API key" onClose={store.actions.closeModal} width={380}>
-      <Field label="Name" hint="how it appears in feeds & the graph">
-        <TextInput autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="nova" />
-      </Field>
-      <Field label="Role">
-        <Select value={role} onChange={(e) => setRole(e.target.value as 'worker' | 'orchestrator')}>
-          <option value="worker">worker — claims and executes tasks</option>
-          <option value="orchestrator">orchestrator — plans and decomposes</option>
-        </Select>
-      </Field>
-      <div style={{ display: 'flex', marginTop: 6 }}>
-        <ErrorNote>{error}</ErrorNote>
-        <div style={{ flex: 1 }} />
-        <Button disabled={busy || !name.trim()} onClick={run}>Issue key</Button>
-      </div>
-    </Modal>
-  );
-}

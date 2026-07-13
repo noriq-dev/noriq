@@ -1,11 +1,15 @@
 import type { ProjectRoom } from './do/ProjectRoom';
 import type { AgentSession } from './do/AgentSession';
+import type { RateLimiter } from './do/RateLimiter';
 
 export interface Env {
   DB: D1Database;
   ASSETS: Fetcher;
   PROJECT_ROOM: DurableObjectNamespace<ProjectRoom>;
   AGENT_SESSION: DurableObjectNamespace<AgentSession>;
+  RATE_LIMITER: DurableObjectNamespace<RateLimiter>;
+  /** Set in tests to bypass rate limiting. */
+  DISABLE_RATE_LIMIT?: boolean;
   /** Bootstrap secret for issuing agent keys / creating users. Set via `wrangler secret put ADMIN_TOKEN`. */
   ADMIN_TOKEN?: string;
   /** Optional shared secret for GitHub webhook signature verification. */

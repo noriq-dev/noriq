@@ -136,22 +136,24 @@ describe('plans & groups', () => {
     expect(projects.find((p) => p.id === projectId)?.groupId).toBe(groupId);
   });
 
-  it('admin humans can issue and revoke agent keys via the UI API', async () => {
-    const created = await SELF.fetch('https://planar.test/api/agents', {
+  it('static key issuance is gone; revoking an OAuth agent kills its access', async () => {
+    // The old issuance endpoint must be dead (OAuth-only — PLNR-52).
+    const issue = await SELF.fetch('https://planar.test/api/agents', {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'ui-issued', role: 'worker' }),
+      body: JSON.stringify({ name: 'ui-issued' }),
     });
-    expect(created.status).toBe(200);
-    const agent = (await created.json()) as { id: string; apiKey: string };
-    expect(agent.apiKey).toMatch(/^plnr_/);
+    expect(issue.status).toBe(404);
 
-    const revoked = await SELF.fetch(`https://planar.test/api/agents/${agent.id}/revoke`, {
+    const doomed = await createAgent('doomed-agent');
+    const before = await mcpCall(doomed.apiKey, 'get_briefing', {});
+    expect(before.isError).toBe(false);
+    const revoked = await SELF.fetch(`https://planar.test/api/agents/${doomed.id}/revoke`, {
       method: 'POST',
       headers: { Cookie: cookie },
     });
     expect(revoked.status).toBe(200);
-    const rejected = await mcpCall(agent.apiKey, 'get_briefing', {}).catch((e) => e);
+    const rejected = await mcpCall(doomed.apiKey, 'get_briefing', {}).catch((e) => e);
     expect(String(rejected)).toContain('401');
   });
 });

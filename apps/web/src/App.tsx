@@ -11,25 +11,46 @@ import { PlansView } from './components/PlansView';
 import { AgentsView } from './components/AgentsView';
 import { ModalHost } from './components/modals';
 import { SettingsView } from './components/SettingsView';
+import { useState } from 'react';
+import { resolveTheme, toggleTheme } from './theme';
 import { Home } from './components/Home';
 import { Invite } from './components/Invite';
+
+function ThemeToggle() {
+  const [theme, setTheme] = useState(resolveTheme());
+  return (
+    <button
+      onClick={() => setTheme(toggleTheme())}
+      title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+      style={{
+        position: 'fixed', top: 12, right: 14, zIndex: 60,
+        cursor: 'pointer', width: 30, height: 30, borderRadius: 8,
+        display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14,
+        background: 'var(--bg-raised)', border: '1px solid var(--line)', color: 'var(--text-mid)',
+      }}
+      className="hover-bright"
+    >
+      {theme === 'dark' ? '☀' : '☾'}
+    </button>
+  );
+}
 
 export function App() {
   const store = useAppStore();
 
   const inviteMatch = location.pathname.match(/^\/invite\/([^/]+)/);
   if (inviteMatch) {
-    return <Invite token={inviteMatch[1]!} onDone={() => { location.href = '/'; }} />;
+    return <><ThemeToggle /><Invite token={inviteMatch[1]!} onDone={() => { location.href = '/'; }} /></>;
   }
 
   if (store.needsSetup) {
-    return <Setup store={store} />;
+    return <><ThemeToggle /><Setup store={store} /></>;
   }
   if (!store.authChecked) {
     return <div style={{ height: '100vh', background: 'var(--bg)' }} />;
   }
   if (!store.user) {
-    return <Login store={store} />;
+    return <><ThemeToggle /><Login store={store} /></>;
   }
 
   const project = store.data.projects.find((p) => p.id === store.currentPid);
@@ -37,6 +58,7 @@ export function App() {
 
   return (
     <div style={{ height: '100vh', display: 'flex', background: 'var(--bg)' }}>
+      <ThemeToggle />
       <Rail store={store} />
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
         {projectView && <TopBar store={store} />}

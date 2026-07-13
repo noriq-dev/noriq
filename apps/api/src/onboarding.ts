@@ -97,6 +97,10 @@ onboarding.get('/api/invites/:token', async (c) => {
 /** Accept: the token proves identity; optionally sets a password; signs in.
  *  The invite page then offers passkey enrollment on the fresh session. */
 onboarding.post('/api/invites/:token/accept', async (c) => {
+  if (!c.env.DISABLE_RATE_LIMIT) {
+    const stub = c.env.RATE_LIMITER.get(c.env.RATE_LIMITER.idFromName(`auth:${c.req.header('CF-Connecting-IP') ?? 'local'}`));
+    if (!(await stub.hit(20, 60_000)).ok) return c.json({ error: 'too many attempts — slow down' }, 429);
+  }
   const tokenHash = await sha256Hex(c.req.param('token')!);
   const row = await c.env.DB.prepare(
     'SELECT i.id, i.user_id AS userId, i.expires_at AS exp, i.accepted_at AS accepted FROM invites i WHERE i.token_hash = ?',
@@ -191,6 +195,10 @@ onboarding.post('/api/webauthn/login/options', async (c) => {
 });
 
 onboarding.post('/api/webauthn/login/verify', async (c) => {
+  if (!c.env.DISABLE_RATE_LIMIT) {
+    const stub = c.env.RATE_LIMITER.get(c.env.RATE_LIMITER.idFromName(`auth:${c.req.header('CF-Connecting-IP') ?? 'local'}`));
+    if (!(await stub.hit(20, 60_000)).ok) return c.json({ error: 'too many attempts — slow down' }, 429);
+  }
   const { rpID, origin } = rp(c);
   const body = await c.req.json<{ response: AuthenticationResponseJSON }>();
   const clientData = JSON.parse(atob(body.response.response.clientDataJSON.replace(/-/g, '+').replace(/_/g, '/')));

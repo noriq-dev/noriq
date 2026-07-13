@@ -23,6 +23,23 @@
 
 * { box-sizing: border-box; }
 :root { color-scheme: dark; } /* native widgets (select popups, scrollbars, date pickers) render dark */
+
+/* Light scheme — applied via data-theme (system preference by default, toggle persisted). */
+:root[data-theme='light'] {
+  color-scheme: light;
+  --bg: #f2f3f6;
+  --bg-raised: #ffffff;
+  --bg-rail: #e9eaee;
+  --card: #ffffff;
+  --text: #171a20;
+  --text-soft: #2e333c;
+  --text-mid: #59606d;
+  --text-dim: #79808e;
+  --text-faint: #99a0ac;
+  --line: rgba(0, 0, 0, 0.09);
+}
+:root[data-theme='light'] body { background: var(--bg); color: var(--text); }
+:root[data-theme='light'] ::-webkit-scrollbar-thumb { background: rgba(0,0,0,.18); background-clip: content-box; }
 html, body, #root { margin: 0; height: 100%; }
 body {
   background: var(--bg);

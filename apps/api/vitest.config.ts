@@ -26,7 +26,7 @@ export default defineWorkersConfig(async () => {
           singleWorker: true,
           wrangler: { configPath: './wrangler.jsonc' },
           miniflare: {
-            bindings: { TEST_MIGRATIONS: migrations, ADMIN_TOKEN: 'test-admin-token' },
+            bindings: { TEST_MIGRATIONS: migrations, ADMIN_TOKEN: 'test-admin-token', DISABLE_RATE_LIMIT: true },
             // Tests run without built web assets.
             assets: { directory: './test/fixtures/empty-assets' },
           },
