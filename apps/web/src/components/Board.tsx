@@ -38,6 +38,18 @@ export function Board({ store }: { store: AppStore }) {
         }}
       >
         <FilterChip label="All" active={msFilter === null} onClick={() => setMsFilter(null)} />
+        <button
+          onClick={() => actions.openModal('milestone')}
+          title="New milestone"
+          className="rail-add"
+          style={{
+            cursor: 'pointer', flex: 'none', fontFamily: 'var(--mono)', fontSize: 10.5,
+            color: 'var(--text-dim)', border: '1px dashed rgba(255,255,255,.15)',
+            padding: '4px 10px', borderRadius: 8, background: 'transparent',
+          }}
+        >
+          + milestone
+        </button>
         {milestones.map((m) => {
           const total = tasks.filter((t) => t.milestoneId === m.id).length;
           const done = tasks.filter((t) => t.milestoneId === m.id && t.status === 'done').length;
@@ -54,18 +66,6 @@ export function Board({ store }: { store: AppStore }) {
             />
           );
         })}
-        <button
-          onClick={() => actions.openModal('milestone')}
-          title="New milestone"
-          className="rail-add"
-          style={{
-            cursor: 'pointer', flex: 'none', fontFamily: 'var(--mono)', fontSize: 10.5,
-            color: 'var(--text-dim)', border: '1px dashed rgba(255,255,255,.15)',
-            padding: '4px 10px', borderRadius: 8, background: 'transparent',
-          }}
-        >
-          + milestone
-        </button>
         {msFilter !== null && (
           <button
             onClick={() => {
@@ -85,7 +85,7 @@ export function Board({ store }: { store: AppStore }) {
       </div>
 
       {/* filter bar — row 2: tags */}
-      {tags.length > 0 && (
+      {(
         <div
           style={{
             flex: 'none', display: 'flex', alignItems: 'center', gap: 6,
@@ -96,6 +96,18 @@ export function Board({ store }: { store: AppStore }) {
           <span style={{ fontFamily: 'var(--mono)', fontSize: 9, letterSpacing: '.07em', textTransform: 'uppercase', color: 'var(--text-faint)', flex: 'none', marginRight: 2 }}>
             tags
           </span>
+          <button
+            onClick={() => actions.openModal('tag')}
+            title="New tag"
+            className="rail-add"
+            style={{
+              cursor: 'pointer', flex: 'none', fontFamily: 'var(--mono)', fontSize: 10,
+              color: 'var(--text-dim)', border: '1px dashed rgba(255,255,255,.15)',
+              padding: '3px 9px', borderRadius: 8, background: 'transparent',
+            }}
+          >
+            + tag
+          </button>
           {tags.map((c) => (
             <FilterChip
               key={c.id}

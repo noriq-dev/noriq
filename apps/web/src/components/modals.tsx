@@ -13,6 +13,7 @@ export function ModalHost({ store }: { store: AppStore }) {
     case 'group': return <CreateGroupModal store={store} />;
     case 'agent': return <NewAgentModal store={store} />;
     case 'milestone': return <CreateMilestoneModal store={store} />;
+    case 'tag': return <CreateTagModal store={store} />;
     default: return null;
   }
 }
@@ -264,6 +265,25 @@ function CreateMilestoneModal({ store }: { store: AppStore }) {
         <ErrorNote>{error}</ErrorNote>
         <div style={{ flex: 1 }} />
         <Button disabled={busy || !title.trim()} onClick={run}>{editing ? 'Save changes' : 'Create milestone'}</Button>
+      </div>
+    </Modal>
+  );
+}
+
+function CreateTagModal({ store }: { store: AppStore }) {
+  const [name, setName] = useState('');
+  const { busy, error, run } = useSubmit(async () => {
+    await store.actions.submitTag(name.trim().toLowerCase());
+  });
+  return (
+    <Modal title="New tag" subtitle="tasks can carry any number of tags" onClose={store.actions.closeModal} width={320}>
+      <Field label="Name">
+        <TextInput autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="backend" onKeyDown={(e) => e.key === 'Enter' && name.trim() && run()} />
+      </Field>
+      <div style={{ display: 'flex', marginTop: 6 }}>
+        <ErrorNote>{error}</ErrorNote>
+        <div style={{ flex: 1 }} />
+        <Button disabled={busy || !name.trim()} onClick={run}>Create tag</Button>
       </div>
     </Modal>
   );

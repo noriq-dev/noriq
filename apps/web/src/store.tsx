@@ -58,7 +58,7 @@ export function useAppStore() {
   const [user, setUser] = useState<UserVM | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
   const [needsSetup, setNeedsSetup] = useState(false);
-  const [modal, setModal] = useState<null | 'project' | 'project-edit' | 'task' | 'group' | 'agent' | 'milestone'>(null);
+  const [modal, setModal] = useState<null | 'project' | 'project-edit' | 'task' | 'group' | 'agent' | 'milestone' | 'tag'>(null);
   const [editMilestone, setEditMilestone] = useState<{ id: string; title: string; dueAt: string | null } | null>(null);
   const [groups, setGroups] = useState<Array<{ id: string; name: string; description: string }>>([]);
   const initialUrl = useRef(parseUrl());
@@ -402,6 +402,13 @@ export function useAppStore() {
       if (!pidRef.current) return;
       await api.setProjectMeta(pidRef.current, meta);
       await loadProjects();
+      setModal(null);
+      refresh();
+    },
+
+    async submitTag(name: string) {
+      if (!pidRef.current) return;
+      await api.createTag(pidRef.current, name);
       setModal(null);
       refresh();
     },

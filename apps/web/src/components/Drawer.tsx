@@ -19,6 +19,8 @@ export function Drawer({ store }: { store: AppStore }) {
   const [ePriority, setEPriority] = useState(2);
   const [eTags, setETags] = useState('');
   const [timeline, setTimeline] = useState<ApiAgentEvent[]>([]);
+  const [addingTag, setAddingTag] = useState(false);
+  const [newTag, setNewTag] = useState('');
   const [attachments, setAttachments] = useState<Array<{ id: string; filename: string; size: number; createdAt: string }>>([]);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -96,6 +98,47 @@ export function Drawer({ store }: { store: AppStore }) {
             {taskTags.map((t) => (
               <MonoTag key={t.id} color={t.color} bg="rgba(255,255,255,.04)" size={10}>{t.name}</MonoTag>
             ))}
+            {addingTag ? (
+              <input
+                autoFocus
+                list="planar-tags-quick"
+                value={newTag}
+                onChange={(e) => setNewTag(e.target.value)}
+                onBlur={() => { setAddingTag(false); setNewTag(''); }}
+                onKeyDown={async (e) => {
+                  if (e.key === 'Escape') { setAddingTag(false); setNewTag(''); }
+                  if (e.key === 'Enter' && newTag.trim()) {
+                    await api.updateTask(currentPid, task.id, { tags: [...taskTags.map((t) => t.name), newTag.trim().toLowerCase()] });
+                    setAddingTag(false);
+                    setNewTag('');
+                    actions.refreshNow();
+                  }
+                }}
+                placeholder="tag…"
+                style={{
+                  width: 90, background: 'rgba(255,255,255,.06)', border: '1px solid rgba(255,255,255,.15)',
+                  borderRadius: 5, padding: '2px 7px', color: 'var(--text)', fontSize: 10.5,
+                  fontFamily: 'var(--mono)', outline: 'none',
+                }}
+              />
+            ) : (
+              <button
+                onClick={() => setAddingTag(true)}
+                title="Add tag"
+                style={{
+                  cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)',
+                  border: '1px dashed rgba(255,255,255,.18)', padding: '1px 7px', borderRadius: 5, background: 'transparent',
+                }}
+                className="rail-add"
+              >
+                + tag
+              </button>
+            )}
+            <datalist id="planar-tags-quick">
+              {allTags.map((t) => (
+                <option key={t.id} value={t.name} />
+              ))}
+            </datalist>
             <div style={{ flex: 1 }} />
             {!editing && (
               <button
