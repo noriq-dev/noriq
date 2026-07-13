@@ -96,6 +96,24 @@ export function TopBar({ store }: { store: AppStore }) {
 
       <div style={{ flex: 1 }} />
 
+      <button
+        onClick={() => actions.createTask()}
+        className="hover-bright"
+        title="New task"
+        style={{
+          cursor: 'pointer',
+          fontFamily: 'var(--mono)',
+          fontSize: 11.5,
+          color: 'var(--accent)',
+          background: 'rgba(198,242,78,.1)',
+          border: '1px solid rgba(198,242,78,.3)',
+          padding: '5px 11px',
+          borderRadius: 8,
+        }}
+      >
+        + task
+      </button>
+
       <div
         style={{
           display: 'flex',

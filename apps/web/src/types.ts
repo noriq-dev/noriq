@@ -1,5 +1,4 @@
-// View-model types for the SPA. Mirrors @planar/shared enums; the local shape
-// is what the mock store (and later the live API adapter) feeds the UI.
+// View-model types for the SPA — the shape the live store feeds the components.
 
 export type TaskStatus =
   | 'todo'
@@ -20,6 +19,7 @@ export interface ProjectVM {
   phase: string;
   dotColor: string;
   badge: string;
+  hasLive: boolean;
 }
 
 export interface AgentVM {
@@ -27,10 +27,11 @@ export interface AgentVM {
   name: string;
   role: 'orch' | 'worker';
   color: string;
+  lastSeenAt: string | null;
 }
 
 export interface CommentVM {
-  id: number;
+  id: string;
   author: string;
   role: 'human' | 'agent';
   kind: CommentKind;
@@ -39,25 +40,28 @@ export interface CommentVM {
 }
 
 export interface TaskVM {
-  id: number;
+  id: string;
   key: string;
   title: string;
   body: string;
   status: TaskStatus;
   claimedBy: string | null;
+  claimExpiresAt: string | null;
   ttl?: number;
   ttlMax?: number;
-  deps: number[];
-  comments: CommentVM[];
+  deps: string[];
+  openComments: number;
+  comments: CommentVM[]; // populated for the selected task
 }
 
 export interface EventVM {
   id: string;
   t: string;
   actor: string;
+  actorKind: 'agent' | 'human' | 'system';
   verb: string;
   subject: string;
-  taskId?: number;
+  taskId?: string;
 }
 
 export type ViewId = 'control' | 'graph' | 'board';
@@ -67,4 +71,11 @@ export interface AppData {
   agents: Record<string, AgentVM[]>;
   tasks: Record<string, TaskVM[]>;
   events: Record<string, EventVM[]>;
+}
+
+export interface UserVM {
+  id: string;
+  email: string;
+  name: string;
+  role: string;
 }

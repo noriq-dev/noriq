@@ -17,9 +17,8 @@ export function Drawer({ store }: { store: AppStore }) {
     const dt = tasks.find((x) => x.id === d);
     return dt ? `${dt.key}${dt.status !== 'done' ? ' ⟂' : ' ✓'}` : `#${d}`;
   });
-  const canClaim = !task.claimedBy && eff !== 'blocked' && task.status !== 'done';
   const canRelease = !!task.claimedBy;
-  const openCount = task.comments.filter((c) => c.status === 'open').length;
+  const openCount = task.openComments;
   const holder = ag ? ag.name : eff === 'blocked' ? '— (blocked)' : '— (unclaimed)';
 
   return (
@@ -84,7 +83,7 @@ export function Drawer({ store }: { store: AppStore }) {
             </MetaCell>
           </div>
 
-          {(canClaim || canRelease) && (
+          {canRelease && (
             <button
               onClick={() => actions.claimToggle(task.id)}
               className="hover-bright"
@@ -95,16 +94,16 @@ export function Drawer({ store }: { store: AppStore }) {
                 textAlign: 'center',
                 padding: 11,
                 borderRadius: 10,
-                background: canRelease ? 'transparent' : 'var(--accent)',
-                color: canRelease ? 'var(--red-soft)' : 'var(--bg)',
+                background: 'transparent',
+                color: 'var(--red-soft)',
                 fontSize: 13,
                 fontWeight: 600,
                 marginBottom: 20,
-                border: `1px solid ${canRelease ? 'rgba(255,92,92,.4)' : 'transparent'}`,
+                border: '1px solid rgba(255,92,92,.4)',
                 display: 'block',
               }}
             >
-              {canRelease ? `Force-release ${ag!.name}’s claim` : 'Claim as pilot'}
+              {`Force-release ${ag?.name ?? 'agent'}’s claim (requeue)`}
             </button>
           )}
 
@@ -115,19 +114,28 @@ export function Drawer({ store }: { store: AppStore }) {
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: 14, marginBottom: 6 }}>
             {task.comments.map((c) => {
-              const isHuman = c.author === 'you';
+              const isHuman = c.role === 'human';
               const cag = c.role === 'agent' ? helpers.agentById(currentPid, c.author) : null;
               const kind = KIND_META[c.kind];
               const statusColor =
                 c.status === 'addressed' ? 'var(--green)' : c.status === 'acknowledged' ? 'var(--text-mid)' : c.status === 'wont_do' ? 'var(--red-soft)' : 'var(--amber)';
               return (
                 <div key={c.id} style={{ display: 'flex', gap: 10 }}>
-                  <AvatarChip name={c.author} color={isHuman ? 'you' : cag?.color ?? '#4c9dff'} size={26} radius={7} fontSize={10} />
+                  <AvatarChip name={isHuman ? 'you' : cag?.name ?? c.author} color={isHuman ? 'you' : cag?.color ?? '#4c9dff'} size={26} radius={7} fontSize={10} />
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 4 }}>
-                      <span style={{ fontSize: 12.5, fontWeight: 600 }}>{c.author}</span>
+                      <span style={{ fontSize: 12.5, fontWeight: 600 }}>{isHuman ? 'you' : cag?.name ?? c.author}</span>
                       <MonoTag color={kind.color} bg={kind.bg} size={9}>{c.kind}</MonoTag>
                       <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: statusColor }}>{c.status}</span>
+                      {(c.status === 'open' || c.status === 'acknowledged') && (
+                        <button
+                          onClick={() => actions.resolveComment(c.id, 'addressed')}
+                          title="mark addressed"
+                          style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--green)', marginLeft: 4 }}
+                        >
+                          ✓ resolve
+                        </button>
+                      )}
                     </div>
                     <div
                       style={{

@@ -83,6 +83,9 @@ npm run deploy                       # creates plan.frs.llc record + cert automa
 
 ## Current status
 
-Phase 0 scaffold: routes, DO stubs, schema, tests, and the SPA shell (running on a
-mock store with the design prototype's seed data). Phase 1 replaces the stubs with
-the real MCP server + claim arbiter and swaps the SPA's mock store for REST + WS.
+Shipped: the MCP coordination server (claim arbiter with TTL/heartbeat/alarm-requeue,
+dependency gating, comment lifecycle, get_briefing/my_updates with server-side cursor,
+notices piggyback), agent API keys + human sessions, the live SPA (login, REST snapshots,
+WS invalidation, human actions incl. force-release and comment resolution), GitHub
+webhook PR-state reflection, and /skill.md. 18 workerd tests cover the coordination
+scenario end-to-end through the real MCP endpoint.

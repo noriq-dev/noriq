@@ -31,10 +31,23 @@ npm run db:migrate:remote
 cd ../.. && npm run deploy                 # → plan.frs.llc
 ```
 
+## Connect an agent (Claude Code)
+
+```sh
+claude mcp add --transport http planar https://plan.frs.llc/mcp \
+  --header "Authorization: Bearer <agent-api-key>"
+```
+
+Issue agent keys with `POST /api/admin/agents` (admin token). The server is
+self-teaching — agents call `get_briefing` first; a ready-made skill is served
+at [/skill.md](https://plan.frs.llc/skill.md).
+
 ## Status
 
-Phase 0 — foundations. See the [roadmap](ROADMAP.md) for the phased plan
-(MCP + coordination core is Phase 1, the proof point).
+Phases 0–4 core shipped: MCP coordination server (exclusive claims, TTL/heartbeat,
+dependency gating, human steering comments, delta sync), live web app (login,
+three views, WS live updates, human actions), git awareness (attach_ref + GitHub
+webhook), served agent skill. See [ROADMAP.md](ROADMAP.md) for what's next.
 
 ## License
 

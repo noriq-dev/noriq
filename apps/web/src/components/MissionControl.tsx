@@ -94,7 +94,7 @@ function Roster({ store }: { store: AppStore }) {
           Y
         </div>
         <div style={{ fontSize: 12, color: 'var(--text-mid)' }}>
-          you · <span style={{ color: 'var(--text)' }}>supervisor</span>
+          {store.user?.name ?? 'you'} · <span style={{ color: 'var(--text)' }}>supervisor</span>
         </div>
       </div>
     </div>
@@ -131,9 +131,9 @@ function EventFeed({ store }: { store: AppStore }) {
       </div>
       <div style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: '8px 0' }}>
         {events.map((ev) => {
-          const ag = helpers.agentById(currentPid, ev.actor);
-          const isYou = ev.actor === 'you';
-          const isSystem = ev.actor === 'system';
+          const ag = (data.agents[currentPid] ?? []).find((a) => a.name === ev.actor || a.id === ev.actor) ?? null;
+          const isYou = ev.actorKind === 'human';
+          const isSystem = ev.actorKind === 'system';
           const vc = verbColors(ev.verb);
           return (
             <div

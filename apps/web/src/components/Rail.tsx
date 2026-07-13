@@ -35,7 +35,7 @@ export function Rail({ store }: { store: AppStore }) {
 
       {data.projects.map((p) => {
         const active = p.id === currentPid;
-        const hasLive = (data.tasks[p.id] ?? []).some((t) => t.status === 'in_progress');
+        const hasLive = p.hasLive || (data.tasks[p.id] ?? []).some((t) => t.status === 'in_progress');
         return (
           <button
             key={p.id}
@@ -92,6 +92,7 @@ export function Rail({ store }: { store: AppStore }) {
       <div style={{ flex: 1 }} />
       <button
         title="New project"
+        onClick={() => actions.createProject()}
         className="rail-add"
         style={{
           cursor: 'pointer',
@@ -109,7 +110,7 @@ export function Rail({ store }: { store: AppStore }) {
         +
       </button>
       <div
-        title="you · supervisor"
+        title={`${store.user?.name ?? 'you'} · supervisor`}
         style={{
           width: 32,
           height: 32,
@@ -124,7 +125,7 @@ export function Rail({ store }: { store: AppStore }) {
           marginTop: 8,
         }}
       >
-        Y
+        {(store.user?.name ?? 'Y').slice(0, 1).toUpperCase()}
       </div>
     </div>
   );

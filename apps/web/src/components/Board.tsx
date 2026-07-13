@@ -53,7 +53,7 @@ export function Board({ store }: { store: AppStore }) {
                   const ag = t.claimedBy ? helpers.agentById(currentPid, t.claimedBy) : null;
                   const eff = helpers.effStatus(currentPid, t);
                   const blocked = eff === 'blocked';
-                  const openC = t.comments.filter((c) => c.status === 'open').length;
+                  const openC = t.openComments;
                   const depKey = t.deps.map((d) => tasks.find((x) => x.id === d)?.key ?? '')[0] ?? '';
                   return (
                     <div
