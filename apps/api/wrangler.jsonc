@@ -13,7 +13,7 @@
     "directory": "../web/dist",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*", "/mcp", "/mcp/*", "/ws", "/ws/*", "/oauth/*", "/.well-known/*", "/skill.md"]
+    "run_worker_first": ["/api/*", "/mcp", "/mcp/*", "/ws", "/ws/*", "/oauth/*", "/.well-known/*", "/skill.md", "/reference.md", "/reference.json"]
   },
 
   "durable_objects": {
@@ -39,6 +39,10 @@
 
   // Email invites + attachments are configured in wrangler.production.jsonc
   // (see the .example) — both optional, planar degrades gracefully without them.
+
+  // Daily D1 backup to R2 at 06:00 UTC (PLNR-21). No-op until R2 (FILES) is bound;
+  // safe to keep enabled. Snapshots land under backups/ — see BACKUP.md to restore.
+  "triggers": { "crons": ["0 6 * * *"] },
 
   "observability": { "enabled": true }
 }

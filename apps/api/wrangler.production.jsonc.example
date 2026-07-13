@@ -16,7 +16,7 @@
     "directory": "../web/dist",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*", "/mcp", "/mcp/*", "/ws", "/ws/*", "/oauth/*", "/.well-known/*", "/skill.md"]
+    "run_worker_first": ["/api/*", "/mcp", "/mcp/*", "/ws", "/ws/*", "/oauth/*", "/.well-known/*", "/skill.md", "/reference.md", "/reference.json"]
   },
 
   "durable_objects": {
@@ -50,6 +50,9 @@
   // Delete if unused; the attachments UI reports it as not configured.
   "r2_buckets": [{ "binding": "FILES", "bucket_name": "planar-files" }],
 
+
+  // Daily D1 backup to R2 at 06:00 UTC (PLNR-21); snapshots land under backups/ (see BACKUP.md).
+  "triggers": { "crons": ["0 6 * * *"] },
 
   "observability": { "enabled": true }
 }

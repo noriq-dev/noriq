@@ -4,6 +4,7 @@ import type { Env } from './env';
 import { adminAuth, agentAuth, userAuth, type AppContext } from './auth';
 import { buildMcpServer } from './mcp';
 import { renderMcpReference, mcpReferenceJson } from './reference';
+import { backupToR2, exportSnapshot } from './backup';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, verifyPassword } from './lib/util';
 import type { Actor } from './do/ProjectRoom';
 import { SKILL_MD } from './skill';
@@ -78,6 +79,21 @@ app.get('/ws/projects/:projectId', async (c) => {
 });
 
 // --- admin bootstrap (users; agent key issuance retired — agents arrive via OAuth) --
+// Full D1 snapshot download (PLNR-21). Admin-only; restore steps in BACKUP.md.
+app.get('/api/admin/export', adminAuth, async (c) => {
+  const at = nowIso();
+  const snapshot = await exportSnapshot(c.env, at);
+  return c.json(snapshot, 200, {
+    'Content-Disposition': `attachment; filename="planar-${at.replace(/[:.]/g, '-')}.json"`,
+  });
+});
+
+// On-demand trigger of the same backup the cron runs → R2 (admin-only).
+app.post('/api/admin/backup', adminAuth, async (c) => {
+  const res = await backupToR2(c.env, nowIso());
+  return c.json(res, res.ok ? 200 : 503);
+});
+
 app.post('/api/admin/users', adminAuth, async (c) => {
   const body = await c.req.json<{ email: string; name: string; password: string; role?: 'admin' | 'member' }>();
   if (!body.email || !body.password || !body.name) return c.json({ error: 'email, name, password required' }, 400);
@@ -604,4 +620,16 @@ app.notFound((c) => {
   return c.json({ error: 'not found' }, 404);
 });
 
-export default app;
+// Scheduled backup (PLNR-21): the cron trigger in wrangler.jsonc fires this; it writes
+// a D1 snapshot to R2. No-op (logged) when R2 isn't configured, so it's safe by default.
+export default {
+  fetch: app.fetch,
+  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext) {
+    ctx.waitUntil(
+      backupToR2(env, new Date(event.scheduledTime).toISOString()).then((r) => {
+        // eslint-disable-next-line no-console
+        console.log(r.ok ? `[backup] wrote ${r.key}` : `[backup] skipped: ${r.reason}`);
+      }),
+    );
+  },
+};
