@@ -1,0 +1,61 @@
+import { z } from 'zod';
+import { ActorKind } from './model';
+
+// ---------------------------------------------------------------------------
+// Append-only event log (ROADMAP §4). Every mutation emits one of these; the
+// ProjectRoom DO persists it to D1 and fans it out over WebSocket to the UI
+// and subscribed agents.
+// ---------------------------------------------------------------------------
+
+export const EventVerb = z.enum([
+  'project.created',
+  'project.updated',
+  'milestone.created',
+  'milestone.updated',
+  'task.created',
+  'task.updated',
+  'task.status_changed',
+  'task.claimed',
+  'task.released',
+  'task.claim_expired',
+  'task.requeued',
+  'dependency.added',
+  'dependency.removed',
+  'comment.posted',
+  'comment.acknowledged',
+  'comment.resolved',
+  'message.sent',
+  'agent.registered',
+  'agent.online',
+  'agent.offline',
+]);
+export type EventVerb = z.infer<typeof EventVerb>;
+
+export const PlanarEvent = z.object({
+  id: z.string(),
+  projectId: z.string(),
+  seq: z.number().int(), // monotonic per project — ordering + resume cursor
+  actorKind: ActorKind,
+  actorId: z.string(),
+  verb: EventVerb,
+  subjectType: z.enum(['project', 'milestone', 'task', 'comment', 'message', 'agent']),
+  subjectId: z.string(),
+  payload: z.record(z.unknown()).default({}),
+  createdAt: z.string().datetime(),
+});
+export type PlanarEvent = z.infer<typeof PlanarEvent>;
+
+// WebSocket protocol: client → server
+export const WsClientMessage = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('subscribe'), projectId: z.string(), sinceSeq: z.number().int().optional() }),
+  z.object({ type: z.literal('ping') }),
+]);
+export type WsClientMessage = z.infer<typeof WsClientMessage>;
+
+// WebSocket protocol: server → client
+export const WsServerMessage = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('event'), event: PlanarEvent }),
+  z.object({ type: z.literal('backlog'), events: z.array(PlanarEvent) }),
+  z.object({ type: z.literal('pong') }),
+]);
+export type WsServerMessage = z.infer<typeof WsServerMessage>;

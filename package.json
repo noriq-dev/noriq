@@ -1,0 +1,31 @@
+{
+  "name": "planar",
+  "private": true,
+  "version": "0.1.0",
+  "description": "AI-native project management — MCP coordination layer for agents, web app for humans",
+  "license": "MIT",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace @planar/api",
+    "dev:web": "npm run dev --workspace @planar/web",
+    "build": "npm run build --workspace @planar/shared && npm run build --workspace @planar/web",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "deploy": "npm run build && npm run deploy --workspace @planar/api"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true,
+    "esbuild@0.25.4": true,
+    "esbuild@0.28.1": true,
+    "workerd@1.20250906.0": true,
+    "workerd@1.20260708.1": true,
+    "sharp@0.33.5": true,
+    "sharp@0.34.5": true
+  }
+}

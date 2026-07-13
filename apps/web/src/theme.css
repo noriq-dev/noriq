@@ -1,0 +1,58 @@
+/* planar theme — ported from design.html */
+:root {
+  --bg: #0a0b0d;
+  --bg-raised: #0c0d10;
+  --bg-rail: #08090b;
+  --card: #101216;
+  --text: #e6e8ec;
+  --text-soft: #c9ccd1;
+  --text-mid: #8a8f98;
+  --text-dim: #6b7280;
+  --text-faint: #4b5563;
+  --accent: #c6f24e;        /* lime — brand */
+  --green: #3fd98b;         /* live / done */
+  --blue: #4c9dff;          /* in progress / instruction */
+  --purple: #b57bff;        /* review */
+  --amber: #f5a623;         /* claimed / question / orch */
+  --red: #ff5c5c;           /* blocked */
+  --red-soft: #ff8a8a;
+  --line: rgba(255, 255, 255, 0.07);
+  --mono: 'IBM Plex Mono', ui-monospace, monospace;
+  --sans: 'Space Grotesk', system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { margin: 0; height: 100%; }
+body {
+  background: var(--bg);
+  font-family: var(--sans);
+  -webkit-font-smoothing: antialiased;
+  color: var(--text);
+  overflow: hidden;
+}
+a { color: var(--accent); }
+a:hover { color: #d6ff6e; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.2); background-clip: content-box; }
+input, button, textarea { font-family: inherit; }
+button { all: unset; }
+
+@keyframes pl-pulse { 0% { transform: scale(1); opacity: 0.9; } 70% { transform: scale(2.6); opacity: 0; } 100% { opacity: 0; } }
+@keyframes pl-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+@keyframes pl-stream { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+@keyframes pl-dash { to { stroke-dashoffset: -24; } }
+@keyframes pl-wave { 0%, 100% { transform: scaleY(0.35); } 50% { transform: scaleY(1); } }
+@keyframes pl-drawer { from { transform: translateX(30px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+/* shared hover affordances (design used style-hover) */
+.hover-border:hover { border-color: rgba(255, 255, 255, 0.2) !important; }
+.hover-bright:hover { filter: brightness(1.1); }
+.event-row:hover { background: rgba(255, 255, 255, 0.03); border-left-color: rgba(198, 242, 78, 0.5) !important; }
+.rail-add:hover { color: var(--text); border-color: rgba(255, 255, 255, 0.3) !important; }
+.drawer-x:hover { background: rgba(255, 255, 255, 0.08); color: var(--text); }

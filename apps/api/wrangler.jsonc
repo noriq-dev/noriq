@@ -1,0 +1,52 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "planar",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Production domain — requires the frs.llc zone on the same Cloudflare
+  // account. Wrangler creates the DNS record + cert automatically on deploy.
+  "routes": [
+    {
+      "pattern": "plan.frs.llc",
+      "custom_domain": true
+    }
+  ],
+
+  // React SPA (apps/web) built into this Worker as static assets.
+  // `run_worker_first` keeps /api, /mcp and /ws on the Worker; everything
+  // else falls through to the SPA with client-side routing.
+  "assets": {
+    "directory": "../web/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/mcp", "/mcp/*", "/ws", "/ws/*"]
+  },
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "PROJECT_ROOM", "class_name": "ProjectRoom" },
+      { "name": "AGENT_SESSION", "class_name": "AgentSession" }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ProjectRoom", "AgentSession"]
+    }
+  ],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "planar",
+      "database_id": "60978d16-e01e-48a8-b5da-20f2c350abcb",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  "observability": {
+    "enabled": true
+  }
+}
