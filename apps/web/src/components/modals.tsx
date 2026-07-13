@@ -10,6 +10,7 @@ export function ModalHost({ store }: { store: AppStore }) {
     case 'task': return <CreateTaskModal store={store} />;
     case 'group': return <CreateGroupModal store={store} />;
     case 'agent': return <NewAgentModal store={store} />;
+    case 'milestone': return <CreateMilestoneModal store={store} />;
     default: return null;
   }
 }
@@ -126,9 +127,38 @@ function CreateTaskModal({ store }: { store: AppStore }) {
         </Field>
       </div>
       <div style={{ display: 'flex', gap: 8, marginTop: 6, alignItems: 'center' }}>
+        <Button variant="ghost" onClick={() => store.actions.openModal('milestone')}>+ new milestone</Button>
         <ErrorNote>{error}</ErrorNote>
         <div style={{ flex: 1 }} />
         <Button disabled={busy || !title.trim()} onClick={run}>Create task</Button>
+      </div>
+    </Modal>
+  );
+}
+
+function CreateMilestoneModal({ store }: { store: AppStore }) {
+  const [title, setTitle] = useState('');
+  const [dueAt, setDueAt] = useState('');
+  const { busy, error, run } = useSubmit(async () => {
+    await store.actions.submitMilestone(title.trim(), dueAt ? new Date(dueAt).toISOString() : undefined);
+  });
+  return (
+    <Modal
+      title="New milestone"
+      subtitle={`in ${store.data.projects.find((p) => p.id === store.currentPid)?.name ?? 'project'} — a collection of tasks`}
+      onClose={store.actions.closeModal}
+      width={360}
+    >
+      <Field label="Title">
+        <TextInput autoFocus value={title} onChange={(e) => setTitle(e.target.value)} placeholder="v1.0 release" onKeyDown={(e) => e.key === 'Enter' && title.trim() && run()} />
+      </Field>
+      <Field label="Due date" hint="optional">
+        <TextInput type="date" value={dueAt} onChange={(e) => setDueAt(e.target.value)} />
+      </Field>
+      <div style={{ display: 'flex', marginTop: 6 }}>
+        <ErrorNote>{error}</ErrorNote>
+        <div style={{ flex: 1 }} />
+        <Button disabled={busy || !title.trim()} onClick={run}>Create milestone</Button>
       </div>
     </Modal>
   );

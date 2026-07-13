@@ -196,6 +196,13 @@ app.post('/api/projects', userAuth, async (c) => {
   return c.json({ id, key: body.key });
 });
 
+app.post('/api/projects/:pid/milestones', userAuth, async (c) => {
+  const { title, dueAt } = await c.req.json<{ title: string; dueAt?: string }>();
+  if (!title) return c.json({ error: 'title required' }, 400);
+  const result = await room(c.env, c.req.param('pid')!).createMilestone(c.req.param('pid')!, humanActor(c), title, dueAt ?? null);
+  return c.json(result);
+});
+
 app.post('/api/projects/:pid/tasks', userAuth, async (c) => {
   const body = await c.req.json<{ title: string; body?: string; parentTaskId?: string; priority?: number; dependsOn?: string[] }>();
   if (!body.title) return c.json({ error: 'title required' }, 400);

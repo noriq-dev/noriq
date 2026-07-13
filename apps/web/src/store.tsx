@@ -299,6 +299,13 @@ export function useAppStore() {
       refresh();
     },
 
+    async submitMilestone(title: string, dueAt?: string) {
+      if (!pidRef.current) return;
+      await api.createMilestone(pidRef.current, title, dueAt);
+      setModal('task'); // return to the task dialog with the new milestone available
+      refresh();
+    },
+
     async submitGroup(name: string, description?: string) {
       await api.createGroup(name, description);
       const r = await api.groups();
