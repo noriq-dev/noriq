@@ -19,6 +19,9 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
 }
 
 export const api = {
+  setupStatus: () => req<{ needsSetup: boolean }>('GET', '/api/setup/status'),
+  setup: (email: string, name: string, password: string) =>
+    req<{ user: import('./types').UserVM }>('POST', '/api/setup', { email, name, password }),
   me: () => req<{ user: import('./types').UserVM }>('GET', '/api/auth/me'),
   login: (email: string, password: string) =>
     req<{ user: import('./types').UserVM }>('POST', '/api/auth/login', { email, password }),
@@ -30,7 +33,18 @@ export const api = {
 
   createProject: (key: string, name: string, description?: string) =>
     req<{ id: string; key: string }>('POST', '/api/projects', { key, name, description }),
-  createTask: (pid: string, input: { title: string; body?: string; priority?: number }) =>
+  groups: () => req<{ groups: Array<{ id: string; name: string; description: string }> }>('GET', '/api/groups'),
+  createGroup: (name: string, description?: string) => req<{ id: string }>('POST', '/api/groups', { name, description }),
+  setProjectMeta: (pid: string, meta: { groupId?: string | null; description?: string; name?: string }) =>
+    req('PATCH', `/api/projects/${pid}/meta`, meta),
+
+  agents: () => req<{ agents: ApiAgent[] }>('GET', '/api/agents'),
+  agentEvents: (aid: string) => req<{ events: ApiAgentEvent[] }>('GET', `/api/agents/${aid}/events`),
+  createAgent: (name: string, role: string) =>
+    req<{ id: string; name: string; role: string; apiKey: string }>('POST', '/api/agents', { name, role }),
+  revokeAgent: (aid: string) => req('POST', `/api/agents/${aid}/revoke`),
+
+  createTask: (pid: string, input: { title: string; body?: string; priority?: number; milestoneId?: string }) =>
     req<{ id: string; key: string }>('POST', `/api/projects/${pid}/tasks`, input),
   updateTask: (pid: string, tid: string, patch: Record<string, unknown>) =>
     req('PATCH', `/api/projects/${pid}/tasks/${tid}`, patch),
@@ -48,6 +62,29 @@ export interface ApiProject {
   name: string;
   description: string;
   liveTasks: number;
+  groupId: string | null;
+}
+
+export interface ApiAgent {
+  id: string;
+  name: string;
+  role: string;
+  status: string;
+  lastSeenAt: string | null;
+  createdAt: string;
+  heldTasks: number;
+  totalClaims: number;
+}
+
+export interface ApiAgentEvent {
+  id: string;
+  projectId: string;
+  seq: number;
+  verb: string;
+  subjectType: string;
+  subjectId: string;
+  payload: Record<string, unknown>;
+  createdAt: string;
 }
 
 export interface ApiSnapshot {
@@ -59,6 +96,10 @@ export interface ApiSnapshot {
   }>;
   dependencies: Array<{ taskId: string; dependsOnTaskId: string }>;
   agents: Array<{ id: string; name: string; role: string; status: string; lastSeenAt: string | null }>;
+  milestones: Array<{ id: string; title: string; dueAt: string | null; order: number }>;
+  plans: Array<{ id: string; agentId: string | null; title: string; description: string; createdAt: string }>;
+  phases: Array<{ id: string; planId: string; title: string; order: number }>;
+  phaseTasks: Array<{ phaseId: string; taskId: string }>;
   events: Array<{
     id: string; seq: number; actorKind: 'agent' | 'human' | 'system'; actorId: string; verb: string;
     subjectType: string; subjectId: string; payload: Record<string, unknown>; createdAt: string;

@@ -49,6 +49,7 @@ button { all: unset; }
 @keyframes pl-dash { to { stroke-dashoffset: -24; } }
 @keyframes pl-wave { 0%, 100% { transform: scaleY(0.35); } 50% { transform: scaleY(1); } }
 @keyframes pl-drawer { from { transform: translateX(30px); opacity: 0; } to { transform: none; opacity: 1; } }
+@keyframes pl-bubble { from { transform: translate(-50%,-100%) translateY(8px) scale(.92); opacity: 0; } to { transform: translate(-50%,-100%); opacity: 1; } }
 
 /* shared hover affordances (design used style-hover) */
 .hover-border:hover { border-color: rgba(255, 255, 255, 0.2) !important; }

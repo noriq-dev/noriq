@@ -45,6 +45,9 @@ function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
 export function useAppStore() {
   const [user, setUser] = useState<UserVM | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
+  const [needsSetup, setNeedsSetup] = useState(false);
+  const [modal, setModal] = useState<null | 'project' | 'task' | 'group' | 'agent' | 'milestone'>(null);
+  const [groups, setGroups] = useState<Array<{ id: string; name: string; description: string }>>([]);
   const [currentPid, setCurrentPid] = useState<string | null>(null);
   const [view, setView] = useState<ViewId>('control');
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
@@ -64,12 +67,29 @@ export function useAppStore() {
   const wsRef = useRef<WebSocket | null>(null);
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // --- auth -----------------------------------------------------------------
+  // --- auth + first-run setup ---------------------------------------------------
   useEffect(() => {
-    api.me()
-      .then((r) => setUser(r.user))
-      .catch(() => {})
-      .finally(() => setAuthChecked(true));
+    (async () => {
+      try {
+        const status = await api.setupStatus();
+        if (status.needsSetup) {
+          setNeedsSetup(true);
+          return;
+        }
+        const r = await api.me();
+        setUser(r.user);
+      } catch {
+        /* not signed in */
+      } finally {
+        setAuthChecked(true);
+      }
+    })();
+  }, []);
+
+  const completeSetup = useCallback(async (email: string, name: string, password: string) => {
+    const r = await api.setup(email, name, password);
+    setNeedsSetup(false);
+    setUser(r.user);
   }, []);
 
   const login = useCallback(async (email: string, password: string) => {
@@ -88,6 +108,7 @@ export function useAppStore() {
       dotColor: PROJECT_COLORS[i % PROJECT_COLORS.length]!,
       badge: p.key.slice(0, 2),
       hasLive: p.liveTasks > 0,
+      groupId: p.groupId,
     }));
     setProjects(vms);
     setCurrentPid((cur) => cur ?? vms[0]?.id ?? null);
@@ -116,7 +137,10 @@ export function useAppStore() {
   }, []);
 
   useEffect(() => {
-    if (user) void loadProjects();
+    if (user) {
+      void loadProjects();
+      api.groups().then((r) => setGroups(r.groups)).catch(() => {});
+    }
   }, [user, loadProjects]);
 
   useEffect(() => {
@@ -251,23 +275,35 @@ export function useAppStore() {
       setDraftKind((k) => order[(order.indexOf(k) + 1) % order.length]!);
     },
 
-    async createProject() {
-      const key = prompt('Project key (e.g. PLN — uppercase, ≤8 chars):')?.trim().toUpperCase();
-      if (!key) return;
-      const name = prompt('Project name:')?.trim();
-      if (!name) return;
-      const description = prompt('Short description (shown in the top bar):')?.trim();
-      await api.createProject(key, name, description || undefined);
+    openModal: setModal,
+    closeModal: () => setModal(null),
+    completeSetup,
+
+    createProject: () => setModal('project'),
+    createTask: () => setModal('task'),
+
+    async submitProject(input: { key: string; name: string; description?: string; groupId?: string }) {
+      const r = await api.createProject(input.key, input.name, input.description);
+      if (input.groupId) await api.setProjectMeta(r.id, { groupId: input.groupId });
       await loadProjects();
+      setModal(null);
+      setCurrentPid(r.id);
+      setSnapshot(null);
+      lastSeq.current = 0;
     },
 
-    async createTask() {
+    async submitTask(input: { title: string; body?: string; priority?: number; milestoneId?: string }) {
       if (!pidRef.current) return;
-      const title = prompt('Task title:')?.trim();
-      if (!title) return;
-      const body = prompt('Task description (optional):')?.trim();
-      await api.createTask(pidRef.current, { title, body: body || undefined });
+      await api.createTask(pidRef.current, input);
+      setModal(null);
       refresh();
+    },
+
+    async submitGroup(name: string, description?: string) {
+      await api.createGroup(name, description);
+      const r = await api.groups();
+      setGroups(r.groups);
+      setModal(null);
     },
 
     async claimToggle(taskId: string) {
@@ -309,7 +345,8 @@ export function useAppStore() {
   };
 
   return {
-    user, authChecked, currentPid: currentPid ?? '', view, selectedTaskId, draftKind, draftText, draggedId,
+    user, authChecked, needsSetup, modal, groups, snapshot,
+    currentPid: currentPid ?? '', view, selectedTaskId, draftKind, draftText, draggedId,
     data, helpers, actions,
   };
 }

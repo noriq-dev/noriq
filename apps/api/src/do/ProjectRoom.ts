@@ -458,6 +458,71 @@ export class ProjectRoom extends DurableObject<Env> {
   }
 
   // ---------------------------------------------------------------------------
+  // Plans — an agent's work program over existing (or inline-created) tasks.
+  // Phase order is ENFORCED: every task in phase N gains a dependency on every
+  // task in phase N-1, so the claim arbiter gates the sequence automatically.
+  // ---------------------------------------------------------------------------
+
+  async createPlan(
+    projectId: string,
+    actor: Actor,
+    input: {
+      title: string;
+      description?: string;
+      agentId?: string | null;
+      phases: Array<{ title: string; taskIds?: string[]; newTasks?: Array<{ title: string; body?: string; priority?: number }> }>;
+    },
+  ) {
+    await this.setPid(projectId);
+    const planId = newId('pln');
+    await this.env.DB.prepare(
+      'INSERT INTO plans (id, project_id, agent_id, title, description, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+    ).bind(planId, projectId, input.agentId ?? null, input.title, input.description ?? '', nowIso()).run();
+
+    let prevPhaseTaskIds: string[] = [];
+    const phases: Array<{ id: string; title: string; taskIds: string[] }> = [];
+    for (let i = 0; i < input.phases.length; i++) {
+      const ph = input.phases[i]!;
+      const phaseId = newId('phs');
+      await this.env.DB.prepare('INSERT INTO phases (id, plan_id, title, "order") VALUES (?, ?, ?, ?)')
+        .bind(phaseId, planId, ph.title, i).run();
+
+      const taskIds: string[] = [];
+      for (const tid of ph.taskIds ?? []) {
+        // Accept ids or keys; validate the task belongs to this project.
+        const t = await this.env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+          .bind(tid, tid, projectId).first<{ id: string }>();
+        if (!t) throw new Error(`task ${tid} not found in this project`);
+        taskIds.push(t.id);
+      }
+      for (const nt of ph.newTasks ?? []) {
+        const created = await this.createTask(projectId, actor, { title: nt.title, body: nt.body, priority: nt.priority });
+        taskIds.push(created.id);
+      }
+      if (!taskIds.length) throw new Error(`phase "${ph.title}" has no tasks`);
+
+      const stmts = taskIds.map((tid) =>
+        this.env.DB.prepare('INSERT OR IGNORE INTO phase_tasks (phase_id, task_id) VALUES (?, ?)').bind(phaseId, tid),
+      );
+      // Enforce phase ordering through the dependency graph.
+      for (const tid of taskIds) {
+        for (const prev of prevPhaseTaskIds) {
+          if (tid !== prev) {
+            stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO dependencies (task_id, depends_on_task_id) VALUES (?, ?)').bind(tid, prev));
+          }
+        }
+      }
+      await this.env.DB.batch(stmts);
+      prevPhaseTaskIds = taskIds;
+      phases.push({ id: phaseId, title: ph.title, taskIds });
+    }
+    await this.emit(actor, 'plan.created', 'plan', planId, {
+      title: input.title, phases: phases.map((p) => ({ title: p.title, tasks: p.taskIds.length })),
+    });
+    return { id: planId, title: input.title, phases };
+  }
+
+  // ---------------------------------------------------------------------------
   // Queries used by the arbiter (kept here for cohesion; harmless reads)
   // ---------------------------------------------------------------------------
 

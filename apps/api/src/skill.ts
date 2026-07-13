@@ -37,10 +37,12 @@ Acknowledge fast, resolve with a substantive reply. The human is waiting.
 
 ## Orchestrating
 
-If you are decomposing work for other agents: \`create_task\` for top-level items,
-\`decompose_task\` to fan a parent into ordered subtasks (dependsOnIndex gates order),
-\`add_dependency\` across trees, and \`send_message\` to coordinate. Workers drain the
-queue via \`next_claimable\`.
+You won't work a whole project — build a **plan** instead: \`create_plan\` groups
+tasks into ordered **phases** (existing tasks by key, or created inline). Phase
+order is enforced — tasks in phase N auto-depend on all of phase N-1, so workers
+can only claim in sequence. For a quick subtree, \`decompose_task\`; for ad-hoc
+ordering, \`add_dependency\`; to coordinate, \`send_message\`. Workers drain the
+queue via \`next_claimable\`. Check progress with \`get_plans\`.
 
 ## Git
 

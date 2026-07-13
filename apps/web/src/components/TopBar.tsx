@@ -7,6 +7,8 @@ const TABS: Array<{ id: ViewId; label: string }> = [
   { id: 'control', label: 'Mission Control' },
   { id: 'graph', label: 'Orchestration' },
   { id: 'board', label: 'Board' },
+  { id: 'plans', label: 'Plans' },
+  { id: 'agents', label: 'Agents' },
 ];
 
 export function TopBar({ store }: { store: AppStore }) {

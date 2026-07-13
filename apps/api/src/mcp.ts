@@ -67,7 +67,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity): McpServer {
         playbook: [
           'Work loop: my_updates → pick from claimable (or next_claimable) → claim_task → do the work → heartbeat every ~60s → resolve any comments → release_task {toStatus:"review"|"done"}.',
           'Humans steer via comments on tasks (kind: question/instruction). Acknowledge fast, resolve with resolve_comment (addressed|wont_do) + a reply. Unresolved comments should block you from finishing.',
-          'Orchestrators: decompose_task creates a subtree of dependent subtasks; workers drain them via next_claimable.',
+          'Orchestrators: structure work with create_plan (ordered phases over tasks — order is enforced via auto-dependencies) or decompose_task for a quick subtree; workers drain via next_claimable.',
           'Claims are exclusive. If claim_task fails, the task is taken or blocked — pick another.',
           'Every tool result may end with a "--- notices ---" block: read it, it is addressed to you.',
         ],
@@ -343,6 +343,50 @@ export function buildMcpServer(env: Env, agent: AgentIdentity): McpServer {
     tool(async ({ projectId, body, toAgentId, refTaskId }) =>
       room(env, projectId).sendMessage(projectId, actor, agent.id, body, toAgentId, refTaskId),
     ),
+  );
+
+  // ---- plans (an agent's work program over tasks) ---------------------------
+
+  server.tool(
+    'create_plan',
+    'Structure your approach: group tasks into ordered phases. Phase order is ENFORCED — every task in phase N automatically depends on all tasks in phase N-1, so workers can only claim in sequence. Reference existing tasks by id/key (taskIds) and/or create tasks inline (newTasks). Humans see the plan visualized.',
+    {
+      projectId: z.string(),
+      title: z.string().min(1),
+      description: z.string().optional(),
+      phases: z.array(
+        z.object({
+          title: z.string().min(1),
+          taskIds: z.array(z.string()).optional(),
+          newTasks: z.array(z.object({ title: z.string().min(1), body: z.string().optional(), priority: z.number().int().min(0).max(4).optional() })).optional(),
+        }),
+      ).min(1).max(12),
+    },
+    tool(async ({ projectId, title, description, phases }) =>
+      room(env, projectId).createPlan(projectId, actor, { title, description, agentId: agent.id, phases }),
+    ),
+  );
+
+  server.tool(
+    'get_plans',
+    'Plans in a project with per-phase progress (done/total tasks) — see how the work program is advancing.',
+    { projectId: z.string() },
+    tool(async ({ projectId }) => {
+      const { results: plans } = await env.DB.prepare(
+        'SELECT id, agent_id AS agentId, title, description, created_at AS createdAt FROM plans WHERE project_id = ? ORDER BY created_at DESC',
+      ).bind(projectId).all();
+      const enriched = [];
+      for (const p of plans) {
+        const { results: phasesRows } = await env.DB.prepare(
+          `SELECT ph.id, ph.title, ph."order",
+                  (SELECT COUNT(*) FROM phase_tasks pt WHERE pt.phase_id = ph.id) AS total,
+                  (SELECT COUNT(*) FROM phase_tasks pt JOIN tasks t ON t.id = pt.task_id WHERE pt.phase_id = ph.id AND t.status = 'done') AS done
+           FROM phases ph WHERE ph.plan_id = ? ORDER BY ph."order"`,
+        ).bind(p.id).all();
+        enriched.push({ ...p, phases: phasesRows });
+      }
+      return { plans: enriched };
+    }),
   );
 
   // ---- milestones ---------------------------------------------------------

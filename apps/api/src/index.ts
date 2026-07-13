@@ -67,6 +67,33 @@ app.post('/api/admin/users', adminAuth, async (c) => {
   return c.json({ id, email: body.email, name: body.name });
 });
 
+// --- first-run setup (self-install) ------------------------------------------------
+// Open until the first user exists; afterwards it's a no-op that reports configured.
+app.get('/api/setup/status', async (c) => {
+  const row = await c.env.DB.prepare('SELECT COUNT(*) AS n FROM users').first<{ n: number }>();
+  return c.json({ needsSetup: (row?.n ?? 0) === 0 });
+});
+
+app.post('/api/setup', async (c) => {
+  const row = await c.env.DB.prepare('SELECT COUNT(*) AS n FROM users').first<{ n: number }>();
+  if ((row?.n ?? 0) > 0) return c.json({ error: 'already configured' }, 409);
+  const body = await c.req.json<{ email: string; name: string; password: string }>();
+  if (!body.email || !body.name || (body.password ?? '').length < 8) {
+    return c.json({ error: 'email, name and a password of 8+ chars required' }, 400);
+  }
+  const id = newId('usr');
+  await c.env.DB.prepare(
+    "INSERT INTO users (id, email, name, role, password_hash, created_at) VALUES (?, ?, ?, 'admin', ?, ?)",
+  ).bind(id, body.email.toLowerCase(), body.name, await hashPassword(body.password), nowIso()).run();
+  // Sign the founder in immediately.
+  const sid = crypto.randomUUID() + crypto.randomUUID().replace(/-/g, '');
+  const expires = new Date(Date.now() + 30 * 24 * 3600 * 1000);
+  await c.env.DB.prepare('INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)')
+    .bind(await sha256Hex(sid), id, expires.toISOString()).run();
+  c.header('Set-Cookie', `planar_session=${sid}; HttpOnly; Secure; SameSite=Lax; Path=/; Expires=${expires.toUTCString()}`);
+  return c.json({ user: { id, email: body.email, name: body.name, role: 'admin' } });
+});
+
 // --- human auth -----------------------------------------------------------------
 app.post('/api/auth/login', async (c) => {
   const { email, password } = await c.req.json<{ email: string; password: string }>();
@@ -94,7 +121,7 @@ app.get('/api/auth/me', userAuth, (c) => c.json({ user: c.var.user }));
 // --- UI read API (session-authed) -------------------------------------------------
 app.get('/api/projects', userAuth, async (c) => {
   const { results } = await c.env.DB.prepare(
-    `SELECT p.id, p.key, p.name, p.description, p.status, p.repo_url AS repoUrl,
+    `SELECT p.id, p.key, p.name, p.description, p.status, p.repo_url AS repoUrl, p.group_id AS groupId,
             (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'in_progress') AS liveTasks
      FROM projects p WHERE p.status = 'active' ORDER BY p.created_at`,
   ).all();
@@ -103,7 +130,7 @@ app.get('/api/projects', userAuth, async (c) => {
 
 app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
-  const [project, tasks, deps, agents, events, milestones] = await Promise.all([
+  const [project, tasks, deps, agents, events, milestones, plans, phases, phaseTasks] = await Promise.all([
     c.env.DB.prepare('SELECT id, key, name, description, claim_ttl_seconds AS claimTtlSeconds, repo_url AS repoUrl FROM projects WHERE id = ?')
       .bind(pid).first(),
     c.env.DB.prepare(
@@ -125,6 +152,9 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
        FROM events WHERE project_id = ? ORDER BY seq DESC LIMIT 60`,
     ).bind(pid).all(),
     c.env.DB.prepare('SELECT id, title, due_at AS dueAt, "order" FROM milestones WHERE project_id = ? ORDER BY "order"').bind(pid).all(),
+    c.env.DB.prepare('SELECT id, agent_id AS agentId, title, description, created_at AS createdAt FROM plans WHERE project_id = ? ORDER BY created_at DESC').bind(pid).all(),
+    c.env.DB.prepare('SELECT ph.id, ph.plan_id AS planId, ph.title, ph."order" FROM phases ph JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ? ORDER BY ph."order"').bind(pid).all(),
+    c.env.DB.prepare('SELECT pt.phase_id AS phaseId, pt.task_id AS taskId FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ?').bind(pid).all(),
   ]);
   if (!project) return c.json({ error: 'not found' }, 404);
   return c.json({
@@ -133,6 +163,9 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     dependencies: deps.results,
     agents: agents.results,
     milestones: milestones.results,
+    plans: plans.results,
+    phases: phases.results,
+    phaseTasks: phaseTasks.results,
     events: events.results.map((e) => ({ ...e, payload: JSON.parse(String(e.payload)) })),
   });
 });
@@ -194,6 +227,74 @@ app.post('/api/projects/:pid/tasks/:tid/release', userAuth, async (c) => {
   const { toStatus } = await c.req.json<{ toStatus?: string }>().catch(() => ({ toStatus: undefined }));
   const result = await room(c.env, c.req.param('pid')!).releaseTask(c.req.param('pid')!, humanActor(c), c.req.param('tid')!, { toStatus });
   return c.json(result);
+});
+
+// --- groups (collections of projects) ----------------------------------------------
+app.get('/api/groups', userAuth, async (c) => {
+  const { results } = await c.env.DB.prepare('SELECT id, name, description, "order" FROM groups ORDER BY "order", created_at').all();
+  return c.json({ groups: results });
+});
+
+app.post('/api/groups', userAuth, async (c) => {
+  const body = await c.req.json<{ name: string; description?: string }>();
+  if (!body.name) return c.json({ error: 'name required' }, 400);
+  const id = newId('grp');
+  await c.env.DB.prepare('INSERT INTO groups (id, name, description, created_at) VALUES (?, ?, ?, ?)')
+    .bind(id, body.name, body.description ?? '', nowIso()).run();
+  return c.json({ id, name: body.name });
+});
+
+app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
+  const body = await c.req.json<{ groupId?: string | null; description?: string; name?: string }>();
+  const sets: string[] = [];
+  const binds: unknown[] = [];
+  if (body.groupId !== undefined) { sets.push('group_id = ?'); binds.push(body.groupId); }
+  if (body.description !== undefined) { sets.push('description = ?'); binds.push(body.description); }
+  if (body.name !== undefined) { sets.push('name = ?'); binds.push(body.name); }
+  if (!sets.length) return c.json({ ok: true });
+  binds.push(c.req.param('pid')!);
+  await c.env.DB.prepare(`UPDATE projects SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
+  return c.json({ ok: true });
+});
+
+// --- agent management (admin humans) ------------------------------------------------
+const requireAdmin = (c: { var: { user?: { role: string } } }) => c.var.user?.role === 'admin';
+
+app.get('/api/agents', userAuth, async (c) => {
+  const { results } = await c.env.DB.prepare(
+    `SELECT a.id, a.name, a.role, a.status, a.last_seen_at AS lastSeenAt, a.created_at AS createdAt,
+            (SELECT COUNT(*) FROM tasks t WHERE t.claimed_by = a.id) AS heldTasks,
+            (SELECT COUNT(*) FROM claims cl WHERE cl.agent_id = a.id) AS totalClaims
+     FROM agents a ORDER BY a.created_at`,
+  ).all();
+  return c.json({ agents: results });
+});
+
+app.get('/api/agents/:aid/events', userAuth, async (c) => {
+  const { results } = await c.env.DB.prepare(
+    `SELECT e.id, e.project_id AS projectId, e.seq, e.verb, e.subject_type AS subjectType, e.subject_id AS subjectId,
+            e.payload, e.created_at AS createdAt
+     FROM events e WHERE e.actor_id = ? ORDER BY e.rowid DESC LIMIT 50`,
+  ).bind(c.req.param('aid')!).all();
+  return c.json({ events: results.map((e) => ({ ...e, payload: JSON.parse(String(e.payload)) })) });
+});
+
+app.post('/api/agents', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  const body = await c.req.json<{ name: string; role?: 'orchestrator' | 'worker' }>();
+  if (!body.name) return c.json({ error: 'name required' }, 400);
+  const key = newApiKey();
+  const id = newId('agt');
+  await c.env.DB.prepare(
+    `INSERT INTO agents (id, name, role, status, api_key_hash, created_at) VALUES (?, ?, ?, 'idle', ?, ?)`,
+  ).bind(id, body.name, body.role ?? 'worker', await sha256Hex(key), nowIso()).run();
+  return c.json({ id, name: body.name, role: body.role ?? 'worker', apiKey: key });
+});
+
+app.post('/api/agents/:aid/revoke', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  await c.env.DB.prepare("UPDATE agents SET status = 'revoked' WHERE id = ?").bind(c.req.param('aid')!).run();
+  return c.json({ ok: true });
 });
 
 // --- GitHub webhook (Phase 4: reflect PR/commit state onto tasks) ----------------

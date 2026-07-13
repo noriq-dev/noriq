@@ -1,14 +1,45 @@
 // Orchestration graph — orchestrator on top, workers fanned out below,
 // animated edges to live claims, signal ticker along the bottom.
+// New events pop up as speech bubbles from the acting agent's node.
+import { useEffect, useRef, useState } from 'react';
 import type { AppStore } from '../store';
-import { initials, isGhostColor, statusMeta } from '../design';
+import { initials, isGhostColor, statusMeta, verbColors } from '../design';
 import { SectionLabel, WaveBars } from './bits';
+
+interface Bubble {
+  key: string;
+  agent: string; // agent name
+  verb: string;
+  text: string;
+}
 
 export function Graph({ store }: { store: AppStore }) {
   const { data, currentPid, helpers, actions } = store;
   const agents = data.agents[currentPid] ?? [];
   const tasks = helpers.tasksOf(currentPid);
   const events = data.events[currentPid] ?? [];
+
+  // --- live speech bubbles ---------------------------------------------------
+  const [bubbles, setBubbles] = useState<Bubble[]>([]);
+  const seen = useRef<Set<string>>(new Set());
+  const primed = useRef(false);
+  useEffect(() => {
+    if (!primed.current) {
+      // Don't replay history on mount — only bubble events that arrive live.
+      events.forEach((e) => seen.current.add(e.id));
+      primed.current = true;
+      return;
+    }
+    const fresh = events.filter((e) => !seen.current.has(e.id) && e.actorKind === 'agent');
+    for (const e of [...fresh].reverse()) {
+      seen.current.add(e.id);
+      const bubble: Bubble = { key: e.id, agent: e.actor, verb: e.verb, text: e.subject.slice(0, 90) };
+      setBubbles((b) => [...b.slice(-5), bubble]);
+      setTimeout(() => setBubbles((b) => b.filter((x) => x.key !== e.id)), 6500);
+    }
+    // Mark non-agent events seen too so they never replay.
+    events.forEach((e) => seen.current.add(e.id));
+  }, [events]);
 
   const orch = agents.find((a) => a.role === 'orch');
   const workers = agents.filter((a) => a.role !== 'orch');
@@ -101,6 +132,56 @@ export function Graph({ store }: { store: AppStore }) {
             />
           );
         })}
+
+        {/* speech bubbles from acting agents */}
+        {(() => {
+          const pos = new Map<string, { x: number; y: number }>();
+          if (orch) pos.set(orch.name, { x: orchX, y: orchY });
+          workers.forEach((w, i) => pos.set(w.name, { x: n === 1 ? 50 : 15 + 70 * (i / (n - 1)), y: 55 }));
+          const byAgent = new Map<string, Bubble[]>();
+          for (const b of bubbles) {
+            byAgent.set(b.agent, [...(byAgent.get(b.agent) ?? []), b]);
+          }
+          return [...byAgent.entries()].flatMap(([agentName, list]) => {
+            const p = pos.get(agentName);
+            if (!p) return [];
+            return list.slice(-2).map((b, i) => {
+              const vc = verbColors(b.verb);
+              return (
+                <div
+                  key={b.key}
+                  style={{
+                    position: 'absolute',
+                    left: `${p.x}%`,
+                    top: `calc(${p.y}% - ${74 + i * 46}px)`,
+                    transform: 'translate(-50%,-100%)',
+                    zIndex: 5,
+                    maxWidth: 260,
+                    background: '#14171c',
+                    border: '1px solid rgba(255,255,255,.14)',
+                    borderRadius: 11,
+                    padding: '7px 11px',
+                    boxShadow: '0 8px 30px rgba(0,0,0,.5)',
+                    animation: 'pl-bubble .3s cubic-bezier(.22,1,.36,1) both',
+                    pointerEvents: 'none',
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
+                    <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: vc.color, background: vc.bg, padding: '1px 5px', borderRadius: 4, whiteSpace: 'nowrap' }}>{b.verb}</span>
+                    <span style={{ fontSize: 11, lineHeight: 1.45, color: 'var(--text-soft)', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>{b.text}</span>
+                  </div>
+                  <div
+                    style={{
+                      position: 'absolute', left: '50%', bottom: -5, width: 8, height: 8,
+                      background: '#14171c', borderRight: '1px solid rgba(255,255,255,.14)', borderBottom: '1px solid rgba(255,255,255,.14)',
+                      transform: 'translateX(-50%) rotate(45deg)',
+                    }}
+                  />
+                </div>
+              );
+            });
+          });
+        })()}
 
         {blocked.map((t, i) => (
           <div

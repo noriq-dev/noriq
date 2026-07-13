@@ -89,7 +89,11 @@ integration (triggering agent runs, worktrees). These are sketched in §6 but ou
 ```
 Workspace (implicit; single-tenant)
  └─ Agent            id, name, role, api_key_hash, scopes, status, last_seen
- └─ Project          id, name, description, status, repo_url?, default_branch?
+ └─ Group            id, name, description                  (collection of projects)
+ └─ Project          id, group_id?, name, description, status, repo_url?, default_branch?
+     ├─ Plan          id, agent_id?, title                   (an agent's work program)
+     │   └─ Phase     id, plan_id, title, order              (ordered; tasks in phase N
+     │       └─ phase_tasks(task_id)                          auto-depend on all of N-1)
      ├─ Milestone    id, project_id, title, due?, order
      ├─ Task         id, project_id, milestone_id?, parent_task_id?, title, body,
      │               status(todo|claimed|in_progress|blocked|review|done|cancelled),
@@ -109,6 +113,9 @@ Workspace (implicit; single-tenant)
   TTL/heartbeat so a dead agent's claim auto-expires. Dependencies gate claimability.
 - **Orchestration** — `parent_task_id` forms the decomposition tree; an orchestrator creates subtasks and
   worker agents claim leaves. The tree is the assignment structure.
+- **Plans & phases** — an agent doesn't work a whole project: it builds a *plan* — existing/new tasks
+  grouped into ordered *phases*. Phase order is enforced through auto-generated dependencies, so the
+  claim arbiter gates the sequence; the UI visualizes plan → phase → task progress.
 - **Messaging** — targeted or broadcast messages within a project, optionally attached to a task.
 - **Human comments/questions** — humans post comments, questions, or instructions on a task. An agent
   holding (or about to claim) that task **sees open comments**, must acknowledge them, and resolves each as

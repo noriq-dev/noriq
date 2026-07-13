@@ -6,10 +6,17 @@ import { Graph } from './components/Graph';
 import { Board } from './components/Board';
 import { Drawer } from './components/Drawer';
 import { Login } from './components/Login';
+import { Setup } from './components/Setup';
+import { PlansView } from './components/PlansView';
+import { AgentsView } from './components/AgentsView';
+import { ModalHost } from './components/modals';
 
 export function App() {
   const store = useAppStore();
 
+  if (store.needsSetup) {
+    return <Setup store={store} />;
+  }
   if (!store.authChecked) {
     return <div style={{ height: '100vh', background: 'var(--bg)' }} />;
   }
@@ -30,6 +37,8 @@ export function App() {
               {store.view === 'control' && <MissionControl store={store} />}
               {store.view === 'graph' && <Graph store={store} />}
               {store.view === 'board' && <Board store={store} />}
+              {store.view === 'plans' && <PlansView store={store} />}
+              {store.view === 'agents' && <AgentsView store={store} />}
             </div>
           </>
         ) : (
@@ -37,6 +46,7 @@ export function App() {
         )}
       </div>
       <Drawer store={store} />
+      <ModalHost store={store} />
     </div>
   );
 }

@@ -12,11 +12,11 @@ export async function createAgent(name: string, role: 'orchestrator' | 'worker' 
   return (await res.json()) as { id: string; apiKey: string };
 }
 
-export async function createUser(email: string, name: string, password: string) {
+export async function createUser(email: string, name: string, password: string, role: 'admin' | 'member' = 'member') {
   const res = await SELF.fetch('https://planar.test/api/admin/users', {
     method: 'POST',
     headers: { Authorization: `Bearer ${ADMIN}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email, name, password }),
+    body: JSON.stringify({ email, name, password, role }),
   });
   if (res.status !== 200) throw new Error(`createUser failed: ${await res.text()}`);
   return (await res.json()) as { id: string };

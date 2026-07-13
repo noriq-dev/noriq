@@ -20,6 +20,7 @@ export interface ProjectVM {
   dotColor: string;
   badge: string;
   hasLive: boolean;
+  groupId: string | null;
 }
 
 export interface AgentVM {
@@ -64,7 +65,7 @@ export interface EventVM {
   taskId?: string;
 }
 
-export type ViewId = 'control' | 'graph' | 'board';
+export type ViewId = 'control' | 'graph' | 'board' | 'plans' | 'agents';
 
 export interface AppData {
   projects: ProjectVM[];

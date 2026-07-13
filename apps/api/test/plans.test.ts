@@ -1,0 +1,130 @@
+import { SELF } from 'cloudflare:test';
+import { beforeAll, describe, expect, it } from 'vitest';
+import { createAgent, createUser, loginSession, mcpCall } from './helpers';
+
+// NOTE: runs in the same shared-storage suite as coordination.test.ts;
+// setup endpoints are exercised first while no users beyond ours may exist.
+
+describe('first-run setup', () => {
+  it('reports and performs setup exactly once', async () => {
+    const before = await SELF.fetch('https://planar.test/api/setup/status');
+    const status = (await before.json()) as { needsSetup: boolean };
+
+    if (status.needsSetup) {
+      const res = await SELF.fetch('https://planar.test/api/setup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'founder@example.com', name: 'Founder', password: 'longenough1' }),
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get('Set-Cookie')).toContain('planar_session=');
+    }
+
+    // Now configured: further setup attempts are refused.
+    const after = await SELF.fetch('https://planar.test/api/setup/status');
+    expect(((await after.json()) as { needsSetup: boolean }).needsSetup).toBe(false);
+    const again = await SELF.fetch('https://planar.test/api/setup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'evil@example.com', name: 'X', password: 'hackhackhack' }),
+    });
+    expect(again.status).toBe(409);
+  });
+});
+
+describe('plans & groups', () => {
+  let planner: { id: string; apiKey: string };
+  let worker: { id: string; apiKey: string };
+  let cookie: string;
+  let projectId: string;
+
+  beforeAll(async () => {
+    planner = await createAgent('planner', 'orchestrator');
+    worker = await createAgent('drone');
+    // Setup may have been consumed by another suite (shared storage) — ensure the user exists either way.
+    cookie = await loginSession('founder@example.com', 'longenough1').catch(async () => {
+      await createUser('founder@example.com', 'Founder', 'longenough1', 'admin');
+      return loginSession('founder@example.com', 'longenough1');
+    });
+    const proj = await mcpCall(planner.apiKey, 'create_project', { key: 'PLZ', name: 'plans-project' });
+    projectId = proj.body.id;
+  });
+
+  it('create_plan builds enforced phase ordering', async () => {
+    const plan = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId,
+      title: 'Ship the feature',
+      phases: [
+        { title: 'Foundations', newTasks: [{ title: 'schema' }, { title: 'api scaffold' }] },
+        { title: 'Build', newTasks: [{ title: 'implement endpoints' }] },
+        { title: 'Verify', newTasks: [{ title: 'e2e tests' }] },
+      ],
+    });
+    expect(plan.body.phases).toHaveLength(3);
+
+    // Phase-2 task is dep-blocked until phase-1 tasks are done.
+    const buildTask = plan.body.phases[1].taskIds[0];
+    const blocked = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: buildTask });
+    expect(blocked.isError).toBe(true);
+    expect(blocked.text).toContain('blocked');
+
+    // Phase-1 tasks are claimable.
+    const p1 = plan.body.phases[0].taskIds[0];
+    const ok = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: p1 });
+    expect(ok.isError).toBe(false);
+  });
+
+  it('get_plans reports per-phase progress', async () => {
+    const plans = await mcpCall(planner.apiKey, 'get_plans', { projectId });
+    expect(plans.body.plans).toHaveLength(1);
+    const phases = plans.body.plans[0].phases;
+    expect(phases[0].total).toBe(2);
+    expect(phases[0].done).toBe(0);
+  });
+
+  it('snapshot exposes plans/phases/phaseTasks for the UI', async () => {
+    const res = await SELF.fetch(`https://planar.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } });
+    const snap = (await res.json()) as any;
+    expect(snap.plans).toHaveLength(1);
+    expect(snap.phases).toHaveLength(3);
+    expect(snap.phaseTasks.length).toBe(4);
+  });
+
+  it('groups can be created and projects assigned', async () => {
+    const g = await SELF.fetch('https://planar.test/api/groups', {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Platform' }),
+    });
+    expect(g.status).toBe(200);
+    const { id: groupId } = (await g.json()) as { id: string };
+    const patch = await SELF.fetch(`https://planar.test/api/projects/${projectId}/meta`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ groupId }),
+    });
+    expect(patch.status).toBe(200);
+    const list = await SELF.fetch('https://planar.test/api/projects', { headers: { Cookie: cookie } });
+    const { projects } = (await list.json()) as { projects: Array<{ id: string; groupId: string | null }> };
+    expect(projects.find((p) => p.id === projectId)?.groupId).toBe(groupId);
+  });
+
+  it('admin humans can issue and revoke agent keys via the UI API', async () => {
+    const created = await SELF.fetch('https://planar.test/api/agents', {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'ui-issued', role: 'worker' }),
+    });
+    expect(created.status).toBe(200);
+    const agent = (await created.json()) as { id: string; apiKey: string };
+    expect(agent.apiKey).toMatch(/^plnr_/);
+
+    const revoked = await SELF.fetch(`https://planar.test/api/agents/${agent.id}/revoke`, {
+      method: 'POST',
+      headers: { Cookie: cookie },
+    });
+    expect(revoked.status).toBe(200);
+    const rejected = await mcpCall(agent.apiKey, 'get_briefing', {}).catch((e) => e);
+    expect(String(rejected)).toContain('401');
+  });
+});
