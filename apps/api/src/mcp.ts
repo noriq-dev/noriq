@@ -15,11 +15,12 @@ import { newId, nowIso, sha256Hex } from './lib/util';
 
 const INSTRUCTIONS = `planar coordinates multiple AI agents working the same project.
 The contract: (1) call get_briefing first; (2) claim_task before working on anything;
-(3) call heartbeat (or any tool) at least every minute while working — your claim's TTL
-lapses otherwise and the task is requeued; (4) check and resolve open comments — humans
-steer you through them; (5) release_task (to review or done) when finished. Never work
-on a task you have not claimed. OAuth sessions start under a default delegated
-identity — call set_agent_identity to take a distinct name/role for this work.`;
+(3) just keep working — every planar tool call renews your claim automatically, and the
+TTL is generous (30 min), so you never need to ping to stay alive. heartbeat exists only
+for the rare case where you'll go silent longer than that; (4) check and resolve open
+comments — humans steer you through them; (5) release_task (to review or done) when
+finished. Never work on a task you have not claimed. OAuth sessions start under a default
+delegated identity — call set_agent_identity to take a distinct name/role for this work.`;
 
 function room(env: Env, projectId: string) {
   return env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName(projectId));
@@ -83,7 +84,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       return {
         you: { id: agent.id, name: agent.name, role: agent.role },
         playbook: [
-          'Work loop: my_updates → pick from claimable (or next_claimable) → claim_task → do the work → heartbeat every ~60s → resolve any comments → release_task {toStatus:"review"|"done"}.',
+          'Work loop: my_updates → pick from claimable (or next_claimable) → claim_task → do the work → resolve any comments → release_task {toStatus:"review"|"done"}. Every tool call renews your claim, so no periodic pinging — heartbeat only if you will be idle longer than the claim TTL.',
           'Humans steer via comments on tasks (kind: question/instruction). Acknowledge fast, resolve with resolve_comment (addressed|wont_do) + a reply. Unresolved comments should block you from finishing.',
           'Orchestrators: structure work with create_plan (ordered phases over tasks — order is enforced via auto-dependencies) or decompose_task for a quick subtree; workers drain via next_claimable.',
           'Claims are exclusive. If claim_task fails, the task is taken or blocked — pick another.',
@@ -320,14 +321,14 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   server.tool(
     'claim_task',
-    'Claim exclusive ownership before working. Fails if held, blocked, or not claimable. Returns the TTL and any open comments — read them before you start. Keep the claim alive with heartbeat.',
+    'Claim exclusive ownership before working. Fails if held, blocked, or not claimable. Returns the TTL and any open comments — read them before you start. Your claim renews on every planar tool call, so just keep working; no periodic heartbeat needed.',
     { projectId: z.string(), taskId: z.string() },
     tool(async ({ projectId, taskId }) => room(env, projectId).claimTask(projectId, actor, taskId, agent.id)),
   );
 
   server.tool(
     'heartbeat',
-    'Renew your claim TTLs in a project (call at least every 60s while working — any planar tool call also counts as liveness). Returns what was renewed.',
+    'Rarely needed: every planar tool call already renews your claims. Use this ONLY when you will go silent longer than the claim TTL (e.g. a long external build) and want to hold the task without doing other planar work. Returns what was renewed.',
     { projectId: z.string() },
     tool(async ({ projectId }) => room(env, projectId).heartbeat(projectId, actor, agent.id)),
   );

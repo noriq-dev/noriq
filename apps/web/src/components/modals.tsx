@@ -131,7 +131,7 @@ function EditProjectModal({ store }: { store: AppStore }) {
             ))}
           </Select>
         </Field>
-        <Field label="Claim TTL (minutes)" hint="how long agents hold tasks between heartbeats">
+        <Field label="Claim TTL (minutes)" hint="how long a held task survives with no agent activity before it's requeued">
           <TextInput type="number" min={1} max={1440} value={ttlMin} onChange={(e) => setTtlMin(e.target.value)} />
         </Field>
       </div>

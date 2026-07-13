@@ -21,8 +21,10 @@ plus your live state (held tasks, unresolved comments, what's claimable).
 2. Pick work: use the \`claimable\` list, or \`next_claimable\` for the single best pick.
 3. \`claim_task\` — you MUST claim before working. Claims are exclusive; a failed claim
    means pick something else. The response includes any open comments — read them first.
-4. Do the work. Call \`heartbeat\` (or any planar tool) at least every ~60 seconds;
-   your claim's TTL lapses otherwise and the task is requeued to another agent.
+4. Do the work. Your claim renews automatically on **every** planar tool call, and the
+   TTL is generous (30 min by default), so there is no need to ping to stay alive — don't
+   waste turns on periodic \`heartbeat\`. Reach for \`heartbeat\` only if you'll go silent
+   longer than the TTL (e.g. a long external build) and want to keep holding the task.
 5. Watch the \`--- notices ---\` block on every tool result — new comments, messages,
    and requeues addressed to you appear there. Also \`my_updates\` after each step.
 6. Resolve every open comment with \`resolve_comment\` (addressed | wont_do) + a reply.

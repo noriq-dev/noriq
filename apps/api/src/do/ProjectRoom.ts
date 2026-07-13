@@ -8,7 +8,7 @@ import { newId, nowIso } from '../lib/util';
  * The coordination authority (ROADMAP §3/§7):
  *  - SOLE WRITER of project-scoped rows in D1 — every mutation is serialized here,
  *    which is what makes the claim guarantees hold (no read-modify-write races).
- *  - Claim/lock arbiter: at most one live claim per task; TTL renewed by heartbeat;
+ *  - Claim/lock arbiter: at most one live claim per task; TTL renewed by any agent action;
  *    dependency gating; alarm-driven auto-requeue of expired claims.
  *  - Every mutation appends to the per-project event log (monotonic seq) and fans
  *    out over WebSocket to subscribed UIs/agents (hibernation API).
@@ -72,6 +72,10 @@ export class ProjectRoom extends DurableObject<Env> {
   // rather than relying on ctx.id.name, which some runtimes don't expose.
   private _pid?: string;
 
+  // Claim TTL rarely changes; cache it per instance so the liveness renewal folded
+  // into emit() doesn't add a D1 read to every agent action.
+  private _ttl?: number;
+
   private get projectId(): string {
     if (!this._pid) throw new Error('ProjectRoom: projectId not bound');
     return this._pid;
@@ -109,13 +113,31 @@ export class ProjectRoom extends DurableObject<Env> {
     const seq = seqRow?.seq ?? 1;
     const id = newId('ev');
     const createdAt = nowIso();
-    await this.env.DB.batch([
+    const stmts = [
       this.env.DB.prepare(
         `INSERT INTO events (id, project_id, seq, actor_kind, actor_id, verb, subject_type, subject_id, payload, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(id, pid, seq, actor.kind, actor.id, verb, subjectType, subjectId, JSON.stringify({ actorName: actor.name, ...payload }), createdAt),
       this.env.DB.prepare('UPDATE projects SET next_event_seq = ? WHERE id = ?').bind(seq + 1, pid),
-    ]);
+    ];
+    // Liveness is free: any action an agent takes renews its own live claims, so a
+    // working agent never needs a standalone heartbeat (PLNR: stop the per-minute ping).
+    // A no-op when the agent holds nothing; the pending alarm re-checks and reschedules.
+    if (actor.kind === 'agent') {
+      const ttl = await this.claimTtlSeconds();
+      const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
+      stmts.push(
+        this.env.DB.prepare(
+          "UPDATE tasks SET claim_expires_at = ? WHERE project_id = ? AND claimed_by = ? AND status = 'in_progress' AND claim_expires_at IS NOT NULL",
+        ).bind(expiresAt, pid, actor.id),
+        this.env.DB.prepare(
+          `UPDATE claims SET expires_at = ? WHERE agent_id = ? AND released_at IS NULL
+           AND task_id IN (SELECT id FROM tasks WHERE project_id = ? AND claimed_by = ? AND status = 'in_progress')`,
+        ).bind(expiresAt, actor.id, pid, actor.id),
+        this.env.DB.prepare('UPDATE agents SET last_seen_at = ? WHERE id = ?').bind(createdAt, actor.id),
+      );
+    }
+    await this.env.DB.batch(stmts);
     const event = {
       id, projectId: pid, seq,
       actorKind: actor.kind, actorId: actor.id, actorName: actor.name,
@@ -719,9 +741,10 @@ export class ProjectRoom extends DurableObject<Env> {
   }
 
   private async claimTtlSeconds(): Promise<number> {
+    if (this._ttl !== undefined) return this._ttl;
     const row = await this.env.DB.prepare('SELECT claim_ttl_seconds AS ttl FROM projects WHERE id = ?')
       .bind(this.projectId).first<{ ttl: number }>();
-    return row?.ttl ?? 300;
+    return (this._ttl = row?.ttl ?? 1800);
   }
 
   private async openCommentsFor(taskId: string) {

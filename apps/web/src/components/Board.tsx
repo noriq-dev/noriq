@@ -21,22 +21,32 @@ export function Board({ store }: { store: AppStore }) {
   const tags = snapshot?.tags ?? [];
   const [msFilter, setMsFilter] = useState<string | null>(null);
   const [tagFilter, setTagFilter] = useState<string | null>(null);
+  const [query, setQuery] = useState('');
   const tagById = new Map(tags.map((c) => [c.id, c]));
   const msById = new Map(milestones.map((m) => [m.id, m]));
 
+  const q = query.trim().toLowerCase();
   const visible = tasks.filter(
-    (t) => (msFilter === null || t.milestoneId === msFilter) && (tagFilter === null || t.tagIds.includes(tagFilter)),
+    (t) =>
+      (msFilter === null || t.milestoneId === msFilter) &&
+      (tagFilter === null || t.tagIds.includes(tagFilter)) &&
+      (q === '' ||
+        t.title.toLowerCase().includes(q) ||
+        t.key.toLowerCase().includes(q) ||
+        (t.body ?? '').toLowerCase().includes(q) ||
+        t.tagIds.some((id) => tagById.get(id)?.name.toLowerCase().includes(q))),
   );
 
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-      {/* filter bar — row 1: milestones */}
+      {/* filter bar — row 1: milestones (scroll) + pinned search */}
       <div
         style={{
           flex: 'none', display: 'flex', alignItems: 'center', gap: 8,
-          padding: '12px 22px 8px', overflowX: 'auto',
+          padding: '12px 22px 8px',
         }}
       >
+        <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 8, overflowX: 'auto' }}>
         <FilterChip label="All" active={msFilter === null} onClick={() => setMsFilter(null)} />
         <button
           onClick={() => actions.openModal('milestone')}
@@ -82,6 +92,8 @@ export function Board({ store }: { store: AppStore }) {
             ✎ edit
           </button>
         )}
+        </div>
+        <SearchBox value={query} onChange={setQuery} />
       </div>
 
       {/* filter bar — row 2: tags */}
@@ -236,6 +248,38 @@ export function Board({ store }: { store: AppStore }) {
           })}
         </div>
       </div>
+    </div>
+  );
+}
+
+function SearchBox({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  return (
+    <div
+      style={{
+        flex: 'none', display: 'flex', alignItems: 'center', gap: 6,
+        background: 'rgba(255,255,255,.03)', border: '1px solid rgba(255,255,255,.08)',
+        borderRadius: 8, padding: '0 8px', height: 28, width: 210, maxWidth: '32vw',
+      }}
+    >
+      <span style={{ color: 'var(--text-faint)', fontSize: 12, flex: 'none' }}>⌕</span>
+      <input
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="Search tasks…"
+        style={{
+          flex: 1, minWidth: 0, background: 'transparent', border: 'none', outline: 'none',
+          color: 'var(--text-soft)', fontSize: 12, fontFamily: 'inherit',
+        }}
+      />
+      {value && (
+        <button
+          onClick={() => onChange('')}
+          title="Clear search"
+          style={{ cursor: 'pointer', flex: 'none', color: 'var(--text-faint)', fontSize: 13, background: 'transparent', border: 'none', padding: 0, lineHeight: 1 }}
+        >
+          ✕
+        </button>
+      )}
     </div>
   );
 }
