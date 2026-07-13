@@ -37,12 +37,15 @@ Acknowledge fast, resolve with a substantive reply. The human is waiting.
 
 ## Orchestrating
 
-You won't work a whole project — build a **plan** instead: \`create_plan\` groups
-tasks into ordered **phases** (existing tasks by key, or created inline). Phase
-order is enforced — tasks in phase N auto-depend on all of phase N-1, so workers
-can only claim in sequence. For a quick subtree, \`decompose_task\`; for ad-hoc
-ordering, \`add_dependency\`; to coordinate, \`send_message\`. Workers drain the
-queue via \`next_claimable\`. Check progress with \`get_plans\`.
+You won't work a whole project — write a **plan** instead. A plan is a real
+document: \`create_plan\` takes a markdown \`body\` (goals, context, approach,
+constraints, risks, exit gate — what a teammate needs to pick the work up) plus
+ordered **phases**, each with its own \`body\` and its tasks (existing by key, or
+created inline). Phase order is enforced — tasks in phase N auto-depend on all of
+phase N-1, so workers can only claim in sequence. As work progresses, keep the
+document alive with \`update_plan\` (status updates, findings, gotchas, outcome).
+For a quick subtree, \`decompose_task\`; for ad-hoc ordering, \`add_dependency\`;
+to coordinate, \`send_message\`. Check progress with \`get_plans\`.
 
 ## Git
 

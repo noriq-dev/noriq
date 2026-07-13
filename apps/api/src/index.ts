@@ -163,8 +163,8 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
        FROM events WHERE project_id = ? ORDER BY seq DESC LIMIT 60`,
     ).bind(pid).all(),
     c.env.DB.prepare('SELECT id, title, due_at AS dueAt, "order" FROM milestones WHERE project_id = ? ORDER BY "order"').bind(pid).all(),
-    c.env.DB.prepare('SELECT id, agent_id AS agentId, title, description, created_at AS createdAt FROM plans WHERE project_id = ? ORDER BY created_at DESC').bind(pid).all(),
-    c.env.DB.prepare('SELECT ph.id, ph.plan_id AS planId, ph.title, ph."order" FROM phases ph JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ? ORDER BY ph."order"').bind(pid).all(),
+    c.env.DB.prepare('SELECT id, agent_id AS agentId, title, description, body, created_at AS createdAt FROM plans WHERE project_id = ? ORDER BY created_at DESC').bind(pid).all(),
+    c.env.DB.prepare('SELECT ph.id, ph.plan_id AS planId, ph.title, ph.body, ph."order" FROM phases ph JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ? ORDER BY ph."order"').bind(pid).all(),
     c.env.DB.prepare('SELECT pt.phase_id AS phaseId, pt.task_id AS taskId FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ?').bind(pid).all(),
     c.env.DB.prepare('SELECT id, name, color, "order" FROM categories WHERE project_id = ? ORDER BY "order"').bind(pid).all(),
   ]);

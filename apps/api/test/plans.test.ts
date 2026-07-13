@@ -54,8 +54,10 @@ describe('plans & groups', () => {
     const plan = await mcpCall(planner.apiKey, 'create_plan', {
       projectId,
       title: 'Ship the feature',
+      description: 'One-line summary',
+      body: '# Goals\n\nShip it **properly**.\n\n## Exit gate\n\nAll e2e green.',
       phases: [
-        { title: 'Foundations', newTasks: [{ title: 'schema' }, { title: 'api scaffold' }] },
+        { title: 'Foundations', body: 'Schema first — see `docs/00`.', newTasks: [{ title: 'schema' }, { title: 'api scaffold' }] },
         { title: 'Build', newTasks: [{ title: 'implement endpoints' }] },
         { title: 'Verify', newTasks: [{ title: 'e2e tests' }] },
       ],
@@ -74,12 +76,32 @@ describe('plans & groups', () => {
     expect(ok.isError).toBe(false);
   });
 
-  it('get_plans reports per-phase progress', async () => {
+  it('get_plans reports per-phase progress and carries the documents', async () => {
     const plans = await mcpCall(planner.apiKey, 'get_plans', { projectId });
     expect(plans.body.plans).toHaveLength(1);
+    expect(plans.body.plans[0].body).toContain('# Goals');
     const phases = plans.body.plans[0].phases;
     expect(phases[0].total).toBe(2);
     expect(phases[0].done).toBe(0);
+    expect(phases[0].body).toContain('Schema first');
+    expect(phases[0].taskKeys).toContain('PLZ-1');
+  });
+
+  it('update_plan revises the document; phases patchable too', async () => {
+    const plans = await mcpCall(planner.apiKey, 'get_plans', { projectId });
+    const plan = plans.body.plans[0];
+    const upd = await mcpCall(planner.apiKey, 'update_plan', {
+      projectId, planId: plan.id,
+      body: plan.body + '\n\n> **Status:** foundations landed.',
+    });
+    expect(upd.isError).toBe(false);
+    const phaseUpd = await mcpCall(planner.apiKey, 'update_plan', {
+      projectId, planId: plan.id, phaseId: plan.phases[0].id, phaseBody: 'Schema done — see migration 0001.',
+    });
+    expect(phaseUpd.isError).toBe(false);
+    const after = await mcpCall(planner.apiKey, 'get_plans', { projectId });
+    expect(after.body.plans[0].body).toContain('foundations landed');
+    expect(after.body.plans[0].phases[0].body).toContain('migration 0001');
   });
 
   it('snapshot exposes plans/phases/phaseTasks for the UI', async () => {

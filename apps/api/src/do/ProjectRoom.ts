@@ -513,23 +513,25 @@ export class ProjectRoom extends DurableObject<Env> {
     input: {
       title: string;
       description?: string;
+      /** The full written plan — goals, approach, constraints, exit gate (markdown). */
+      body?: string;
       agentId?: string | null;
-      phases: Array<{ title: string; taskIds?: string[]; newTasks?: Array<{ title: string; body?: string; priority?: number }> }>;
+      phases: Array<{ title: string; body?: string; taskIds?: string[]; newTasks?: Array<{ title: string; body?: string; priority?: number }> }>;
     },
   ) {
     await this.setPid(projectId);
     const planId = newId('pln');
     await this.env.DB.prepare(
-      'INSERT INTO plans (id, project_id, agent_id, title, description, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-    ).bind(planId, projectId, input.agentId ?? null, input.title, input.description ?? '', nowIso()).run();
+      'INSERT INTO plans (id, project_id, agent_id, title, description, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    ).bind(planId, projectId, input.agentId ?? null, input.title, input.description ?? '', input.body ?? '', nowIso()).run();
 
     let prevPhaseTaskIds: string[] = [];
     const phases: Array<{ id: string; title: string; taskIds: string[] }> = [];
     for (let i = 0; i < input.phases.length; i++) {
       const ph = input.phases[i]!;
       const phaseId = newId('phs');
-      await this.env.DB.prepare('INSERT INTO phases (id, plan_id, title, "order") VALUES (?, ?, ?, ?)')
-        .bind(phaseId, planId, ph.title, i).run();
+      await this.env.DB.prepare('INSERT INTO phases (id, plan_id, title, body, "order") VALUES (?, ?, ?, ?, ?)')
+        .bind(phaseId, planId, ph.title, ph.body ?? '', i).run();
 
       const taskIds: string[] = [];
       for (const tid of ph.taskIds ?? []) {
@@ -564,6 +566,41 @@ export class ProjectRoom extends DurableObject<Env> {
       title: input.title, phases: phases.map((p) => ({ title: p.title, tasks: p.taskIds.length })),
     });
     return { id: planId, title: input.title, phases };
+  }
+
+  /** Plans evolve — agents append status updates, correct course, mark outcomes. */
+  async updatePlan(projectId: string, actor: Actor, planId: string, patch: { title?: string; description?: string; body?: string }) {
+    await this.setPid(projectId);
+    const plan = await this.env.DB.prepare('SELECT id, title FROM plans WHERE id = ? AND project_id = ?')
+      .bind(planId, projectId).first<{ id: string; title: string }>();
+    if (!plan) throw new Error('plan not found in this project');
+    const sets: string[] = [];
+    const binds: unknown[] = [];
+    if (patch.title !== undefined) { sets.push('title = ?'); binds.push(patch.title); }
+    if (patch.description !== undefined) { sets.push('description = ?'); binds.push(patch.description); }
+    if (patch.body !== undefined) { sets.push('body = ?'); binds.push(patch.body); }
+    if (!sets.length) return { ok: true };
+    binds.push(planId);
+    await this.env.DB.prepare(`UPDATE plans SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
+    await this.emit(actor, 'plan.updated', 'plan', planId, { title: patch.title ?? plan.title, fields: Object.keys(patch) });
+    return { ok: true };
+  }
+
+  async updatePhase(projectId: string, actor: Actor, phaseId: string, patch: { title?: string; body?: string }) {
+    await this.setPid(projectId);
+    const row = await this.env.DB.prepare(
+      'SELECT ph.id, ph.title, pl.id AS planId FROM phases ph JOIN plans pl ON pl.id = ph.plan_id WHERE ph.id = ? AND pl.project_id = ?',
+    ).bind(phaseId, projectId).first<{ id: string; title: string; planId: string }>();
+    if (!row) throw new Error('phase not found in this project');
+    const sets: string[] = [];
+    const binds: unknown[] = [];
+    if (patch.title !== undefined) { sets.push('title = ?'); binds.push(patch.title); }
+    if (patch.body !== undefined) { sets.push('body = ?'); binds.push(patch.body); }
+    if (!sets.length) return { ok: true };
+    binds.push(phaseId);
+    await this.env.DB.prepare(`UPDATE phases SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
+    await this.emit(actor, 'plan.updated', 'plan', row.planId, { title: patch.title ?? row.title, fields: ['phase'] });
+    return { ok: true };
   }
 
   // ---------------------------------------------------------------------------

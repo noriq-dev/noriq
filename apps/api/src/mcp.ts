@@ -114,17 +114,21 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         const token = await env.DB.prepare('SELECT user_id AS userId FROM oauth_tokens WHERE id = ?')
           .bind(opts.oauthTokenId).first<{ userId: string }>();
         if (!token) throw new Error('token not found');
-        let target = await env.DB.prepare("SELECT id, name, role, user_id AS userId FROM agents WHERE name = ? AND status != 'revoked'")
-          .bind(name).first<{ id: string; name: string; role: string; userId: string | null }>();
+        let target = await env.DB.prepare('SELECT id, name, role, status, user_id AS userId FROM agents WHERE name = ?')
+          .bind(name).first<{ id: string; name: string; role: string; status: string; userId: string | null }>();
         if (target && target.userId && target.userId !== token.userId) {
           throw new Error(`agent name "${name}" is owned by another user — pick a different name`);
+        }
+        if (target && target.status === 'revoked') {
+          // Reactivate: the name's history is preserved, ownership transfers to this user.
+          await env.DB.prepare("UPDATE agents SET status = 'idle', user_id = ? WHERE id = ?").bind(token.userId, target.id).run();
         }
         if (!target) {
           const agentId = newId('agt');
           await env.DB.prepare(
             `INSERT INTO agents (id, name, role, status, api_key_hash, user_id, created_at) VALUES (?, ?, ?, 'idle', ?, ?, ?)`,
           ).bind(agentId, name, role ?? 'worker', await sha256Hex(crypto.randomUUID() + crypto.randomUUID()), token.userId, nowIso()).run();
-          target = { id: agentId, name, role: role ?? 'worker', userId: token.userId };
+          target = { id: agentId, name, role: role ?? 'worker', status: 'idle', userId: token.userId };
         } else if (role && target.role !== role) {
           await env.DB.prepare('UPDATE agents SET role = ? WHERE id = ?').bind(role, target.id).run();
         }
@@ -405,22 +409,45 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   server.tool(
     'create_plan',
-    'Structure your approach: group tasks into ordered phases. Phase order is ENFORCED — every task in phase N automatically depends on all tasks in phase N-1, so workers can only claim in sequence. Reference existing tasks by id/key (taskIds) and/or create tasks inline (newTasks). Humans see the plan visualized.',
+    'Write your plan as a real document, then structure the work. body = your full written readout in markdown: goals, context, approach, constraints, risks, and an exit gate — what a teammate would need to pick this up. Each phase gets its own body (explicit details for that stage) plus its tasks (existing ids/keys via taskIds, or created inline via newTasks). Phase order is ENFORCED — every task in phase N auto-depends on all of phase N-1. Humans read the document and watch progress in the Plans view; append status updates later with update_plan.',
     {
       projectId: z.string(),
       title: z.string().min(1),
-      description: z.string().optional(),
+      description: z.string().optional().describe('One-line summary shown on the plan card'),
+      body: z.string().optional().describe('The full plan document (markdown): goals, approach, constraints, exit gate'),
       phases: z.array(
         z.object({
           title: z.string().min(1),
+          body: z.string().optional().describe('Explicit details for this phase (markdown): what, how, done-when'),
           taskIds: z.array(z.string()).optional(),
           newTasks: z.array(z.object({ title: z.string().min(1), body: z.string().optional(), priority: z.number().int().min(0).max(4).optional() })).optional(),
         }),
       ).min(1).max(12),
     },
-    tool(async ({ projectId, title, description, phases }) =>
-      room(env, projectId).createPlan(projectId, actor, { title, description, agentId: agent.id, phases }),
+    tool(async ({ projectId, title, description, body, phases }) =>
+      room(env, projectId).createPlan(projectId, actor, { title, description, body, agentId: agent.id, phases }),
     ),
+  );
+
+  server.tool(
+    'update_plan',
+    'Revise a plan document as work progresses — append status updates, record findings/gotchas, mark the outcome. Pass the FULL new body (read it first via get_plans). updatePhase via phaseId to revise one phase.',
+    {
+      projectId: z.string(),
+      planId: z.string(),
+      title: z.string().optional(),
+      description: z.string().optional(),
+      body: z.string().optional().describe('Full replacement markdown for the plan document'),
+      phaseId: z.string().optional().describe('If set, patch this phase instead of the plan'),
+      phaseBody: z.string().optional(),
+      phaseTitle: z.string().optional(),
+    },
+    tool(async ({ projectId, planId, title, description, body, phaseId, phaseBody, phaseTitle }) => {
+      if (phaseId) {
+        return room(env, projectId).updatePhase(projectId, actor, phaseId, { title: phaseTitle, body: phaseBody });
+      }
+      return room(env, projectId).updatePlan(projectId, actor, planId, { title, description, body });
+    }),
   );
 
   server.tool(
@@ -429,14 +456,15 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     { projectId: z.string() },
     tool(async ({ projectId }) => {
       const { results: plans } = await env.DB.prepare(
-        'SELECT id, agent_id AS agentId, title, description, created_at AS createdAt FROM plans WHERE project_id = ? ORDER BY created_at DESC',
+        'SELECT id, agent_id AS agentId, title, description, body, created_at AS createdAt FROM plans WHERE project_id = ? ORDER BY created_at DESC',
       ).bind(projectId).all();
       const enriched = [];
       for (const p of plans) {
         const { results: phasesRows } = await env.DB.prepare(
-          `SELECT ph.id, ph.title, ph."order",
+          `SELECT ph.id, ph.title, ph.body, ph."order",
                   (SELECT COUNT(*) FROM phase_tasks pt WHERE pt.phase_id = ph.id) AS total,
-                  (SELECT COUNT(*) FROM phase_tasks pt JOIN tasks t ON t.id = pt.task_id WHERE pt.phase_id = ph.id AND t.status = 'done') AS done
+                  (SELECT COUNT(*) FROM phase_tasks pt JOIN tasks t ON t.id = pt.task_id WHERE pt.phase_id = ph.id AND t.status = 'done') AS done,
+                  (SELECT GROUP_CONCAT(t.key) FROM phase_tasks pt JOIN tasks t ON t.id = pt.task_id WHERE pt.phase_id = ph.id) AS taskKeys
            FROM phases ph WHERE ph.plan_id = ? ORDER BY ph."order"`,
         ).bind(p.id).all();
         enriched.push({ ...p, phases: phasesRows });

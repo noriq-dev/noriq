@@ -142,8 +142,8 @@ export interface ApiSnapshot {
   dependencies: Array<{ taskId: string; dependsOnTaskId: string }>;
   agents: Array<{ id: string; name: string; role: string; status: string; lastSeenAt: string | null }>;
   milestones: Array<{ id: string; title: string; dueAt: string | null; order: number }>;
-  plans: Array<{ id: string; agentId: string | null; title: string; description: string; createdAt: string }>;
-  phases: Array<{ id: string; planId: string; title: string; order: number }>;
+  plans: Array<{ id: string; agentId: string | null; title: string; description: string; body: string; createdAt: string }>;
+  phases: Array<{ id: string; planId: string; title: string; body: string; order: number }>;
   phaseTasks: Array<{ phaseId: string; taskId: string }>;
   categories: Array<{ id: string; name: string; color: string; order: number }>;
   events: Array<{
