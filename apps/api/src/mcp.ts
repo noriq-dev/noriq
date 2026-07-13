@@ -37,27 +37,35 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     { name: 'planar', version: '0.3.0' },
     {
       instructions: INSTRUCTIONS,
-      // Experimental notification channel (PLNR-45): clients that understand it
-      // receive notices as pushed channel messages on the response stream.
-      capabilities: { experimental: { 'claude/channel': {} } },
+      // logging → standard notifications/message (any client); experimental claude/channel
+      // → Claude's richer surfacing. Both ride the live POST SSE stream (PLNR-54/45).
+      capabilities: { logging: {}, experimental: { 'claude/channel': {} } },
     },
   );
   const actor = asActor(agent);
 
-  const pushChannel = async (content: string, meta: Record<string, string> = {}) => {
+  // PLNR-54: in stateless Streamable HTTP there is NO standing GET SSE stream, so a
+  // notification sent with no related request id is dropped by the transport. The fix
+  // (per spec) is to ride the *current* tool call's POST SSE stream: tag the
+  // notification with relatedRequestId = the in-flight request id (from the handler's
+  // `extra`). It then flushes on that stream and reaches the client within the same
+  // turn, alongside the tool result — a real push, not just the text-block fallback.
+  const pushChannel = async (content: string, meta: Record<string, string>, relatedRequestId?: string | number) => {
+    if (relatedRequestId === undefined) return; // nowhere to deliver in stateless mode
+    const params = { content, meta: { source: 'planar', agent: agent.name, ...meta } };
     try {
-      await server.server.notification({
-        method: 'notifications/claude/channel',
-        params: { content, meta: { source: 'planar', agent: agent.name, ...meta } },
-      });
-    } catch {
-      /* client/transport without channel support — the text block still carries it */
-    }
+      // Standard logging notification — surfaced by any spec-compliant client.
+      await server.server.notification({ method: 'notifications/message', params: { level: 'info', logger: 'planar', data: params } }, { relatedRequestId });
+    } catch { /* client without logging capability */ }
+    try {
+      // Experimental channel — Claude surfaces this richly (capabilities.experimental).
+      await server.server.notification({ method: 'notifications/claude/channel', params }, { relatedRequestId });
+    } catch { /* transport/client without channel support — text block still carries it */ }
   };
 
-  /** Wrap a handler: JSON result + piggybacked notices for the calling agent. */
+  /** Wrap a handler: JSON result + piggybacked notices, pushed on the live stream too. */
   const tool = <T>(fn: (args: T) => Promise<unknown>) =>
-    async (args: T) => {
+    async (args: T, extra?: { requestId?: string | number }) => {
       let body: unknown;
       try {
         body = await fn(args);
@@ -69,7 +77,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       }
       const updates = await computeUpdates(env, agent);
       const notices = formatNotices(updates);
-      if (notices) await pushChannel(notices, { kind: 'notices' });
+      if (notices) await pushChannel(notices, { kind: 'notices' }, extra?.requestId);
       const text = JSON.stringify(body, null, 1) + (notices ? `\n\n${notices}` : '');
       return { content: [{ type: 'text' as const, text }] };
     };

@@ -135,6 +135,35 @@ export async function mcpRpc(apiKey: string, method: string, params: Record<stri
   return message.result;
 }
 
+/**
+ * Like mcpCall but also returns every JSON-RPC *notification* (no `id`) the server
+ * pushed on the POST SSE stream — used to assert live delivery (PLNR-54).
+ */
+export async function mcpCallStream(apiKey: string, tool: string, args: Record<string, unknown> = {}) {
+  const res = await SELF.fetch('https://planar.test/mcp', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/event-stream',
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: rpcId++, method: 'tools/call', params: { name: tool, arguments: args } }),
+  });
+  const raw = await res.text();
+  if (res.status !== 200) throw new Error(`mcp ${tool} → ${res.status}: ${raw}`);
+  const frames = raw.split('\n').filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trim());
+  const notifications: any[] = [];
+  let result: any = null;
+  for (const d of frames) {
+    try {
+      const parsed = JSON.parse(d);
+      if (parsed.id !== undefined) result = parsed;
+      else if (parsed.method) notifications.push(parsed);
+    } catch { /* skip */ }
+  }
+  return { result, notifications };
+}
+
 export async function mcpList(apiKey: string) {
   const res = await SELF.fetch('https://planar.test/mcp', {
     method: 'POST',
