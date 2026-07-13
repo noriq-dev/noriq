@@ -8,16 +8,9 @@ describe('planar worker', () => {
     expect(await res.json()).toMatchObject({ ok: true, service: 'planar' });
   });
 
-  it('lists projects from D1', async () => {
+  it('UI API requires a session', async () => {
     const res = await SELF.fetch('https://planar.test/api/projects');
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { projects: unknown[] };
-    expect(Array.isArray(body.projects)).toBe(true);
-  });
-
-  it('MCP endpoint is stubbed with 501', async () => {
-    const res = await SELF.fetch('https://planar.test/mcp', { method: 'POST' });
-    expect(res.status).toBe(501);
+    expect(res.status).toBe(401);
   });
 
   it('ws route requires an upgrade', async () => {

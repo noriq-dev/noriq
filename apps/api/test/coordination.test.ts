@@ -1,0 +1,158 @@
+import { SELF } from 'cloudflare:test';
+import { describe, expect, it, beforeAll } from 'vitest';
+import { createAgent, createUser, loginSession, mcpCall, mcpList } from './helpers';
+
+let orch: { id: string; apiKey: string };
+let nova: { id: string; apiKey: string };
+let echo: { id: string; apiKey: string };
+let cookie: string;
+
+beforeAll(async () => {
+  orch = await createAgent('atlas', 'orchestrator');
+  nova = await createAgent('nova');
+  echo = await createAgent('echo');
+  await createUser('you@example.com', 'You', 'hunter2!');
+  cookie = await loginSession('you@example.com', 'hunter2!');
+});
+
+describe('auth', () => {
+  it('rejects MCP calls without a key', async () => {
+    const res = await SELF.fetch('https://planar.test/mcp', { method: 'POST' });
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects bad session cookies on the UI API', async () => {
+    const res = await SELF.fetch('https://planar.test/api/projects', { headers: { Cookie: 'planar_session=nope' } });
+    expect(res.status).toBe(401);
+  });
+
+  it('exposes the coordination tools', async () => {
+    const tools = await mcpList(orch.apiKey);
+    const names = tools.map((t) => t.name);
+    for (const required of ['get_briefing', 'my_updates', 'claim_task', 'release_task', 'heartbeat', 'next_claimable', 'resolve_comment', 'decompose_task']) {
+      expect(names).toContain(required);
+    }
+  });
+});
+
+describe('coordination core', () => {
+  let projectId: string;
+  let t1: { id: string; key: string };
+  let t2: { id: string; key: string };
+
+  it('orchestrator creates a project and tasks with dependencies', async () => {
+    const proj = await mcpCall(orch.apiKey, 'create_project', { key: 'TST', name: 'test-project' });
+    expect(proj.body.key).toBe('TST');
+    projectId = proj.body.id;
+
+    t1 = (await mcpCall(orch.apiKey, 'create_task', { projectId, title: 'Build the base' })).body;
+    expect(t1.key).toBe('TST-1');
+    t2 = (await mcpCall(orch.apiKey, 'create_task', { projectId, title: 'Build on top', dependsOn: [t1.id] })).body;
+    expect(t2.key).toBe('TST-2');
+  });
+
+  it('grants exactly one claim — the loser gets a clean error', async () => {
+    const a = await mcpCall(nova.apiKey, 'claim_task', { projectId, taskId: t1.id });
+    expect(a.body.key).toBe('TST-1');
+    expect(a.body.ttlSeconds).toBeGreaterThan(0);
+
+    const b = await mcpCall(echo.apiKey, 'claim_task', { projectId, taskId: t1.id });
+    expect(b.isError).toBe(true);
+    expect(b.text).toMatch(/already claimed|not claimable/);
+  });
+
+  it('dependency-gates claims', async () => {
+    const blocked = await mcpCall(echo.apiKey, 'claim_task', { projectId, taskId: t2.id });
+    expect(blocked.isError).toBe(true);
+    expect(blocked.text).toContain('blocked');
+  });
+
+  it('next_claimable skips claimed and blocked tasks', async () => {
+    const next = await mcpCall(echo.apiKey, 'next_claimable', { projectId });
+    expect(next.body.task).toBeNull(); // t1 claimed, t2 dep-blocked
+  });
+
+  it('heartbeat renews the claim', async () => {
+    const hb = await mcpCall(nova.apiKey, 'heartbeat', { projectId });
+    expect(hb.body.renewed).toContain('TST-1');
+  });
+
+  it('human comments flow to the claiming agent as notices; done is gated on resolution', async () => {
+    const post = await SELF.fetch(`https://planar.test/api/projects/${projectId}/tasks/${t1.id}/comments`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: 'question', body: 'Does this handle the crash case?' }),
+    });
+    expect(post.status).toBe(200);
+    const { id: commentId } = (await post.json()) as { id: string };
+
+    // The holder sees it in notices on the next tool call.
+    const hb = await mcpCall(nova.apiKey, 'heartbeat', { projectId });
+    expect(hb.notices).toContain('Does this handle the crash case?');
+
+    // Finishing with an unresolved comment is refused.
+    const refuse = await mcpCall(nova.apiKey, 'release_task', { projectId, taskId: t1.id, toStatus: 'done' });
+    expect(refuse.isError).toBe(true);
+    expect(refuse.text).toContain('unresolved comment');
+
+    // Resolve with a reply, then done works.
+    const resolve = await mcpCall(nova.apiKey, 'resolve_comment', {
+      projectId, commentId, resolution: 'addressed', reply: 'Yes — TTL lapse requeues it.',
+    });
+    expect(resolve.body.ok).toBe(true);
+    const done = await mcpCall(nova.apiKey, 'release_task', { projectId, taskId: t1.id, toStatus: 'done' });
+    expect(done.body.status).toBe('done');
+  });
+
+  it('finishing the dependency unblocks the dependent task', async () => {
+    const next = await mcpCall(echo.apiKey, 'next_claimable', { projectId });
+    expect(next.body.task?.key).toBe('TST-2');
+    const claim = await mcpCall(echo.apiKey, 'claim_task', { projectId, taskId: t2.id });
+    expect(claim.body.key).toBe('TST-2');
+    const rel = await mcpCall(echo.apiKey, 'release_task', { projectId, taskId: t2.id, toStatus: 'review' });
+    expect(rel.body.status).toBe('review');
+  });
+
+  it('decompose_task builds an ordered subtree', async () => {
+    const parent = (await mcpCall(orch.apiKey, 'create_task', { projectId, title: 'Epic' })).body;
+    const dec = await mcpCall(orch.apiKey, 'decompose_task', {
+      projectId,
+      parentTaskId: parent.id,
+      subtasks: [
+        { title: 'step one' },
+        { title: 'step two', dependsOnIndex: [0] },
+      ],
+    });
+    expect(dec.body.created).toHaveLength(2);
+    const blocked = await mcpCall(nova.apiKey, 'claim_task', { projectId, taskId: dec.body.created[1].id });
+    expect(blocked.isError).toBe(true);
+  });
+
+  it('messages reach the recipient via my_updates', async () => {
+    await mcpCall(echo.apiKey, 'send_message', { projectId, toAgentId: nova.id, body: 'ping from echo' });
+    const updates = await mcpCall(nova.apiKey, 'my_updates', {});
+    expect(JSON.stringify(updates.body)).toContain('ping from echo');
+  });
+
+  it('briefing orients an agent', async () => {
+    const b = await mcpCall(nova.apiKey, 'get_briefing', {});
+    expect(b.body.you.name).toBe('nova');
+    expect(b.body.playbook.length).toBeGreaterThan(2);
+    expect(Array.isArray(b.body.state.claimable)).toBe(true);
+  });
+
+  it('serves the agent skill', async () => {
+    const res = await SELF.fetch('https://planar.test/skill.md');
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('get_briefing');
+  });
+
+  it('UI snapshot reflects everything live', async () => {
+    const res = await SELF.fetch(`https://planar.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } });
+    expect(res.status).toBe(200);
+    const snap = (await res.json()) as any;
+    expect(snap.tasks.length).toBeGreaterThanOrEqual(5);
+    expect(snap.events.length).toBeGreaterThan(5);
+    expect(snap.events[0].seq).toBeGreaterThan(snap.events[1].seq);
+  });
+});

@@ -4,17 +4,31 @@ import type { Env } from '../env';
 /**
  * AgentSession — one instance per agent (idFromName(agentId)).
  *
- * Tracks presence (last heartbeat) and holds the agent's message inbox
- * pointer. Phase 1 fills this in.
+ * Holds the agent's server-side sync state so `my_updates` needs zero client
+ * state (ROADMAP §5 Phase 1):
+ *  - lastEventRowid: global events-table cursor (auto-advances on delivery; no ack).
+ *  - lastSeenAt: presence.
+ *
+ * Open comments are intentionally NOT tracked here — they are state, not events,
+ * and stay sticky in every briefing until actually resolved.
  */
 export class AgentSession extends DurableObject<Env> {
-  async heartbeat(): Promise<{ ok: true; at: string }> {
+  async touch(): Promise<string> {
     const at = new Date().toISOString();
     await this.ctx.storage.put('lastSeenAt', at);
-    return { ok: true, at };
+    return at;
   }
 
   async lastSeen(): Promise<string | null> {
     return (await this.ctx.storage.get<string>('lastSeenAt')) ?? null;
+  }
+
+  /** Read the delivery cursor and advance it (no-ack model). */
+  async advanceCursor(to: number): Promise<void> {
+    await this.ctx.storage.put('lastEventRowid', to);
+  }
+
+  async cursor(): Promise<number> {
+    return (await this.ctx.storage.get<number>('lastEventRowid')) ?? 0;
   }
 }
