@@ -12,9 +12,15 @@ import { AgentsView } from './components/AgentsView';
 import { ModalHost } from './components/modals';
 import { SettingsView } from './components/SettingsView';
 import { Home } from './components/Home';
+import { Invite } from './components/Invite';
 
 export function App() {
   const store = useAppStore();
+
+  const inviteMatch = location.pathname.match(/^\/invite\/([^/]+)/);
+  if (inviteMatch) {
+    return <Invite token={inviteMatch[1]!} onDone={() => { location.href = '/'; }} />;
+  }
 
   if (store.needsSetup) {
     return <Setup store={store} />;

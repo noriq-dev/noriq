@@ -145,31 +145,82 @@ function ProjectGrid({ projects, onOpen }: { projects: ProjectVM[]; onOpen: (id:
   );
 }
 
+type ClientId = 'claude' | 'codex' | 'copilot';
+
+const CLIENTS: Array<{ id: ClientId; label: string }> = [
+  { id: 'claude', label: 'Claude Code' },
+  { id: 'codex', label: 'Codex' },
+  { id: 'copilot', label: 'Copilot' },
+];
+
+function clientSnippet(id: ClientId): { intro: string; code: string } {
+  const url = `${location.origin}/mcp`;
+  switch (id) {
+    case 'claude':
+      return {
+        intro: 'Connects via OAuth — approve in the browser and name the agent identity:',
+        code: `claude mcp add --transport http planar ${url}`,
+      };
+    case 'codex':
+      return {
+        intro: 'Add to ~/.codex/config.toml (OAuth prompt on first use):',
+        code: `[mcp_servers.planar]
+url = "${url}"`,
+      };
+    case 'copilot':
+      return {
+        intro: 'VS Code: add to .vscode/mcp.json (or via MCP: Add Server):',
+        code: `{
+  "servers": {
+    "planar": { "type": "http", "url": "${url}" }
+  }
+}`,
+      };
+  }
+}
+
 function ConnectCard() {
-  const [copied, setCopied] = useState<string | null>(null);
-  const oauthCmd = `claude mcp add --transport http planar ${location.origin}/mcp`;
-  const copy = async (text: string, which: string) => {
-    await navigator.clipboard.writeText(text);
-    setCopied(which);
-    setTimeout(() => setCopied(null), 1500);
+  const [copied, setCopied] = useState(false);
+  const [client, setClient] = useState<ClientId>('claude');
+  const { intro, code } = clientSnippet(client);
+  const copy = async () => {
+    await navigator.clipboard.writeText(code);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
   };
   return (
     <div style={{ border: '1px solid rgba(198,242,78,.2)', borderRadius: 14, background: 'rgba(198,242,78,.03)', padding: '18px 20px' }}>
-      <SectionLabel>Connect an agent</SectionLabel>
-      <div style={{ fontSize: 12, color: 'var(--text-mid)', lineHeight: 1.6, margin: '10px 0 12px' }}>
-        Claude Code connects via OAuth — approve in the browser and name the agent identity:
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <SectionLabel>Connect an agent</SectionLabel>
+        <div style={{ flex: 1 }} />
+        <div style={{ display: 'flex', gap: 2, background: 'rgba(255,255,255,.05)', border: '1px solid rgba(255,255,255,.08)', borderRadius: 8, padding: 2 }}>
+          {CLIENTS.map((c) => (
+            <button
+              key={c.id}
+              onClick={() => setClient(c.id)}
+              style={{
+                cursor: 'pointer', padding: '3px 9px', borderRadius: 6, fontSize: 10.5, fontWeight: 600,
+                background: client === c.id ? 'rgba(198,242,78,.15)' : 'transparent',
+                color: client === c.id ? 'var(--accent)' : 'var(--text-dim)',
+              }}
+            >
+              {c.label}
+            </button>
+          ))}
+        </div>
       </div>
-      <div
-        onClick={() => copy(oauthCmd, 'oauth')}
+      <div style={{ fontSize: 12, color: 'var(--text-mid)', lineHeight: 1.6, margin: '10px 0 12px' }}>{intro}</div>
+      <pre
+        onClick={copy}
         title="click to copy"
         style={{
           fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--accent)', cursor: 'pointer',
           background: 'rgba(0,0,0,.3)', border: '1px solid rgba(198,242,78,.25)', borderRadius: 9,
-          padding: '10px 12px', wordBreak: 'break-all', lineHeight: 1.5,
+          padding: '10px 12px', lineHeight: 1.5, margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-all',
         }}
       >
-        {copied === 'oauth' ? '✓ copied' : oauthCmd}
-      </div>
+        {copied ? '✓ copied' : code}
+      </pre>
       <div style={{ fontSize: 11, color: 'var(--text-dim)', lineHeight: 1.6, marginTop: 12 }}>
         The agent then calls <span style={{ fontFamily: 'var(--mono)' }}>get_briefing</span> and teaches itself the
         rest. For headless/CI agents, issue a static key from the{' '}

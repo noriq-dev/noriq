@@ -100,10 +100,14 @@ export function useAppStore() {
     })();
   }, []);
 
-  const completeSetup = useCallback(async (email: string, name: string, password: string) => {
+  const pendingSetupUser = useRef<UserVM | null>(null);
+  const completeSetupDeferred = useCallback(async (email: string, name: string, password: string) => {
     const r = await api.setup(email, name, password);
+    pendingSetupUser.current = r.user; // session cookie is set; enter after the passkey step
+  }, []);
+  const finishSetup = useCallback(() => {
     setNeedsSetup(false);
-    setUser(r.user);
+    if (pendingSetupUser.current) setUser(pendingSetupUser.current);
   }, []);
 
   const login = useCallback(async (email: string, password: string) => {
@@ -335,9 +339,10 @@ export function useAppStore() {
       setDraftKind((k) => order[(order.indexOf(k) + 1) % order.length]!);
     },
 
+    completeSetupDeferred,
+    finishSetup,
     openModal: setModal,
     closeModal: () => { setModal(null); setEditMilestone(null); },
-    completeSetup,
 
     createProject: () => setModal('project'),
     createTask: () => setModal('task'),

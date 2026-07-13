@@ -1,9 +1,13 @@
 // First-run self-install: create the founding admin account.
 import { useState } from 'react';
+import { startRegistration } from '@simplewebauthn/browser';
+import { api } from '../api';
 import type { AppStore } from '../store';
 import { Button, ErrorNote, Field, TextInput } from './ui';
 
 export function Setup({ store }: { store: AppStore }) {
+  const [stage, setStage] = useState<'account' | 'passkey'>('account');
+  const [done, setDone] = useState(false);
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -18,13 +22,53 @@ export function Setup({ store }: { store: AppStore }) {
     setBusy(true);
     setError(null);
     try {
-      await store.actions.completeSetup(email.trim(), name.trim(), password);
+      await store.actions.completeSetupDeferred(email.trim(), name.trim(), password);
+      setStage('passkey');
     } catch (e) {
       setError(e instanceof Error ? e.message : 'setup failed');
     } finally {
       setBusy(false);
     }
   };
+
+  if (stage === 'passkey') {
+    return (
+      <div style={{ height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg)' }}>
+        <div style={{ width: 400, padding: 30, background: 'var(--bg-raised)', border: '1px solid var(--line)', borderRadius: 16 }}>
+          <div style={{ fontWeight: 700, fontSize: 18, marginBottom: 10 }}>One more thing 🔑</div>
+          <div style={{ fontSize: 13, color: 'var(--text-mid)', lineHeight: 1.6, marginBottom: 20 }}>
+            Add a <b style={{ color: 'var(--text)' }}>passkey</b> — sign in with your fingerprint, face, or security
+            key instead of the password. Recommended.
+          </div>
+          {error && <ErrorNote>{error}</ErrorNote>}
+          <Button
+            disabled={busy || done}
+            style={{ width: '100%', boxSizing: 'border-box', padding: 12, marginBottom: 10 }}
+            onClick={async () => {
+              setBusy(true);
+              setError(null);
+              try {
+                const options = await api.registerOptions();
+                const response = await startRegistration({ optionsJSON: options as never });
+                await api.registerVerify(response, 'setup passkey');
+                setDone(true);
+                setTimeout(() => store.actions.finishSetup(), 700);
+              } catch (e) {
+                setError(e instanceof Error ? e.message : 'passkey setup failed — you can add one later in Settings');
+              } finally {
+                setBusy(false);
+              }
+            }}
+          >
+            {done ? '✓ passkey added' : busy ? 'waiting for authenticator…' : 'Create passkey'}
+          </Button>
+          <Button variant="ghost" style={{ width: '100%', boxSizing: 'border-box', padding: 12 }} onClick={() => store.actions.finishSetup()}>
+            Skip for now
+          </Button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div style={{ height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg)' }}>

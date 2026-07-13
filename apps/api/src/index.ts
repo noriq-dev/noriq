@@ -7,6 +7,7 @@ import { hashPassword, newApiKey, newId, nowIso, sha256Hex, verifyPassword } fro
 import type { Actor } from './do/ProjectRoom';
 import { SKILL_MD } from './skill';
 import { metadataRoutes, oauth } from './oauth';
+import { onboarding } from './onboarding';
 
 export { ProjectRoom } from './do/ProjectRoom';
 export { AgentSession } from './do/AgentSession';
@@ -16,6 +17,7 @@ const app = new Hono<AppContext>();
 // OAuth 2.1 AS for MCP clients: discovery + register/authorize/token.
 metadataRoutes(app);
 app.route('/oauth', oauth);
+app.route('/', onboarding);
 
 const room = (env: Env, projectId: string) => env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName(projectId));
 const humanActor = (c: { var: { user?: { id: string; name: string } } }): Actor => ({
@@ -295,7 +297,11 @@ const requireAdmin = (c: { var: { user?: { role: string } } }) => c.var.user?.ro
 
 app.get('/api/users', userAuth, async (c) => {
   const { results } = await c.env.DB.prepare(
-    'SELECT id, email, name, role, disabled, created_at AS createdAt FROM users ORDER BY created_at',
+    `SELECT u.id, u.email, u.name, u.role, u.disabled, u.created_at AS createdAt,
+            (u.password_hash IS NULL AND NOT EXISTS (SELECT 1 FROM passkeys p WHERE p.user_id = u.id)) AS pending,
+            (SELECT COUNT(*) FROM passkeys p WHERE p.user_id = u.id) AS passkeys,
+            (SELECT GROUP_CONCAT(g.id) FROM user_groups ug JOIN groups g ON g.id = ug.group_id WHERE ug.user_id = u.id) AS groupIds
+     FROM users u ORDER BY u.created_at`,
   ).all();
   return c.json({ users: results });
 });

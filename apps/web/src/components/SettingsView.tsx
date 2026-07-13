@@ -1,5 +1,6 @@
 // Settings — user management (admin), group management, own password.
 import { useEffect, useState } from 'react';
+import { startRegistration } from '@simplewebauthn/browser';
 import { api, type ApiUser } from '../api';
 import type { AppStore } from '../store';
 import { MonoTag, SectionLabel } from './bits';
@@ -12,6 +13,7 @@ export function SettingsView({ store }: { store: AppStore }) {
       <div style={{ maxWidth: 760, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 28 }}>
         {isAdmin && <UsersSection store={store} />}
         <GroupsSection store={store} />
+        <PasskeysSection />
         <PasswordSection />
       </div>
     </div>
@@ -36,10 +38,12 @@ function UsersSection({ store }: { store: AppStore }) {
   const [adding, setAdding] = useState(false);
   const [email, setEmail] = useState('');
   const [name, setName] = useState('');
-  const [password, setPassword] = useState('');
   const [role, setRole] = useState('member');
+  const [groupIds, setGroupIds] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [tempReveal, setTempReveal] = useState<{ name: string; temp: string } | null>(null);
+  const [inviteLink, setInviteLink] = useState<{ name: string; url: string } | null>(null);
+  const [editGroupsFor, setEditGroupsFor] = useState<string | null>(null);
 
   const load = () => api.users().then((r) => setUsers(r.users)).catch(() => {});
   useEffect(() => {
@@ -47,42 +51,79 @@ function UsersSection({ store }: { store: AppStore }) {
   }, []);
 
   const me = store.user?.id;
+  const toggleGroup = (gid: string) =>
+    setGroupIds((ids) => (ids.includes(gid) ? ids.filter((x) => x !== gid) : [...ids, gid]));
 
   return (
     <Section
       title={`Users · ${users.length}`}
-      action={<Button variant="ghost" style={{ padding: '5px 12px', fontSize: 11.5 }} onClick={() => setAdding(!adding)}>{adding ? 'cancel' : '+ add user'}</Button>}
+      action={<Button variant="ghost" style={{ padding: '5px 12px', fontSize: 11.5 }} onClick={() => setAdding(!adding)}>{adding ? 'cancel' : '+ invite user'}</Button>}
     >
       {adding && (
         <div style={{ border: '1px solid rgba(255,255,255,.08)', borderRadius: 10, padding: 14, marginBottom: 14 }}>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
             <Field label="Name"><TextInput value={name} onChange={(e) => setName(e.target.value)} /></Field>
             <Field label="Email"><TextInput type="email" value={email} onChange={(e) => setEmail(e.target.value)} /></Field>
-            <Field label="Initial password" hint="8+ chars"><TextInput value={password} onChange={(e) => setPassword(e.target.value)} /></Field>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
             <Field label="Role">
               <Select value={role} onChange={(e) => setRole(e.target.value)}>
                 <option value="member">member</option>
                 <option value="admin">admin</option>
               </Select>
             </Field>
+            <Field label="Groups" hint="membership">
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, paddingTop: 4 }}>
+                {store.groups.length === 0 && <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>none defined</span>}
+                {store.groups.map((g) => (
+                  <button
+                    key={g.id}
+                    onClick={() => toggleGroup(g.id)}
+                    style={{
+                      cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 10, padding: '3px 9px', borderRadius: 6,
+                      background: groupIds.includes(g.id) ? 'rgba(198,242,78,.12)' : 'rgba(255,255,255,.04)',
+                      color: groupIds.includes(g.id) ? 'var(--accent)' : 'var(--text-mid)',
+                      border: `1px solid ${groupIds.includes(g.id) ? 'rgba(198,242,78,.35)' : 'rgba(255,255,255,.1)'}`,
+                    }}
+                  >
+                    {g.name}
+                  </button>
+                ))}
+              </div>
+            </Field>
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--text-dim)', lineHeight: 1.5, marginBottom: 10 }}>
+            They'll receive a verification email to create their account (passkey preferred). If email isn't
+            configured on this instance, you'll get a link to send them yourself.
           </div>
           <ErrorNote>{error}</ErrorNote>
           <Button
-            disabled={!name.trim() || !/\S+@\S+/.test(email) || password.length < 8}
+            disabled={!name.trim() || !/\S+@\S+/.test(email)}
             onClick={async () => {
               setError(null);
               try {
-                await api.createUser(email.trim(), name.trim(), password, role);
+                const r = await api.invite(email.trim(), name.trim(), role, groupIds);
+                if (!r.emailed && r.inviteUrl) setInviteLink({ name: name.trim(), url: r.inviteUrl });
                 setAdding(false);
-                setEmail(''); setName(''); setPassword('');
+                setEmail(''); setName(''); setGroupIds([]);
                 load();
               } catch (e) {
                 setError(e instanceof Error ? e.message : String(e));
               }
             }}
           >
-            Create user
+            Send invite
           </Button>
+        </div>
+      )}
+
+      {inviteLink && (
+        <div
+          onClick={async () => { await navigator.clipboard.writeText(inviteLink.url); }}
+          title="click to copy"
+          style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--accent)', background: 'rgba(198,242,78,.06)', border: '1px solid rgba(198,242,78,.25)', borderRadius: 9, padding: '9px 12px', marginBottom: 12, cursor: 'pointer', wordBreak: 'break-all' }}
+        >
+          email not configured — send {inviteLink.name} this link (click to copy): {inviteLink.url}
         </div>
       )}
 
@@ -105,6 +146,8 @@ function UsersSection({ store }: { store: AppStore }) {
               <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)' }}>{u.email}</div>
             </div>
             <MonoTag color={u.role === 'admin' ? 'var(--accent)' : 'var(--text-mid)'} bg={u.role === 'admin' ? 'rgba(198,242,78,.12)' : 'rgba(255,255,255,.06)'} size={9.5}>{u.role}</MonoTag>
+            {u.pending ? <MonoTag color="var(--amber)" bg="rgba(245,166,35,.12)" size={9.5}>PENDING</MonoTag> : null}
+            {u.passkeys > 0 ? <MonoTag color="var(--green)" bg="rgba(63,217,139,.1)" size={9.5}>🔑 {u.passkeys}</MonoTag> : null}
             {u.disabled ? <MonoTag color="var(--red-soft)" bg="rgba(255,92,92,.12)" size={9.5}>DISABLED</MonoTag> : null}
             {u.id !== me && (
               <div style={{ display: 'flex', gap: 6 }}>
@@ -114,9 +157,36 @@ function UsersSection({ store }: { store: AppStore }) {
                 <SmallAction onClick={async () => { const r = await api.resetPassword(u.id); setTempReveal({ name: u.name, temp: r.tempPassword }); }}>
                   reset pw
                 </SmallAction>
+                <SmallAction onClick={() => setEditGroupsFor(editGroupsFor === u.id ? null : u.id)}>groups</SmallAction>
                 <SmallAction danger onClick={async () => { await api.patchUser(u.id, { disabled: !u.disabled }); load(); }}>
                   {u.disabled ? 'enable' : 'disable'}
                 </SmallAction>
+              </div>
+            )}
+            {editGroupsFor === u.id && (
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                {store.groups.map((g) => {
+                  const memberOf = (u.groupIds ?? '').split(',').includes(g.id);
+                  return (
+                    <button
+                      key={g.id}
+                      onClick={async () => {
+                        const current = (u.groupIds ?? '').split(',').filter(Boolean);
+                        const next = memberOf ? current.filter((x) => x !== g.id) : [...current, g.id];
+                        await api.setUserGroups(u.id, next);
+                        load();
+                      }}
+                      style={{
+                        cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 9.5, padding: '2px 8px', borderRadius: 6,
+                        background: memberOf ? 'rgba(198,242,78,.12)' : 'rgba(255,255,255,.04)',
+                        color: memberOf ? 'var(--accent)' : 'var(--text-mid)',
+                        border: `1px solid ${memberOf ? 'rgba(198,242,78,.35)' : 'rgba(255,255,255,.1)'}`,
+                      }}
+                    >
+                      {g.name}
+                    </button>
+                  );
+                })}
               </div>
             )}
           </div>
@@ -169,6 +239,51 @@ function GroupsSection({ store }: { store: AppStore }) {
           );
         })}
       </div>
+    </Section>
+  );
+}
+
+function PasskeysSection() {
+  const [passkeys, setPasskeys] = useState<Array<{ id: string; name: string; createdAt: string }>>([]);
+  const [error, setError] = useState<string | null>(null);
+  const load = () => api.passkeys().then((r) => setPasskeys(r.passkeys)).catch(() => {});
+  useEffect(() => {
+    load();
+  }, []);
+
+  const add = async () => {
+    setError(null);
+    try {
+      const options = await api.registerOptions();
+      const response = await startRegistration({ optionsJSON: options as never });
+      await api.registerVerify(response);
+      load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  return (
+    <Section
+      title={`Your passkeys · ${passkeys.length}`}
+      action={<Button variant="ghost" style={{ padding: '5px 12px', fontSize: 11.5 }} onClick={add}>+ add passkey</Button>}
+    >
+      {passkeys.length === 0 && (
+        <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>
+          no passkeys — add one to sign in without a password
+        </div>
+      )}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {passkeys.map((p) => (
+          <div key={p.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 11px', borderRadius: 9, background: 'rgba(255,255,255,.02)', border: '1px solid rgba(255,255,255,.06)' }}>
+            <span style={{ fontSize: 13 }}>🔑</span>
+            <div style={{ flex: 1, fontSize: 12.5, fontWeight: 500 }}>{p.name}</div>
+            <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)' }}>{new Date(p.createdAt).toLocaleDateString()}</span>
+            <SmallAction danger onClick={async () => { await api.deletePasskey(p.id); load(); }}>remove</SmallAction>
+          </div>
+        ))}
+      </div>
+      <ErrorNote>{error}</ErrorNote>
     </Section>
   );
 }

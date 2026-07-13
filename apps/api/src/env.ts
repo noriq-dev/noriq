@@ -10,4 +10,8 @@ export interface Env {
   ADMIN_TOKEN?: string;
   /** Optional shared secret for GitHub webhook signature verification. */
   GITHUB_WEBHOOK_SECRET?: string;
+  /** Cloudflare Email Service binding — optional; invites fall back to copyable links. */
+  EMAIL?: { send(msg: { to: string; from: { email: string; name?: string }; subject: string; text: string; html?: string }): Promise<unknown> };
+  /** From-address for transactional email (must be on an onboarded sending domain). */
+  EMAIL_FROM?: string;
 }

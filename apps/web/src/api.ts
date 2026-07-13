@@ -46,6 +46,20 @@ export const api = {
   resetPassword: (uid: string) => req<{ tempPassword: string }>('POST', `/api/users/${uid}/reset-password`),
   changePassword: (current: string, next: string) => req('POST', '/api/auth/change-password', { current, next }),
 
+  invite: (email: string, name: string, role: string, groupIds: string[]) =>
+    req<{ userId: string; emailed: boolean; inviteUrl?: string }>('POST', '/api/users/invite', { email, name, role, groupIds }),
+  inviteInfo: (token: string) => req<{ name: string; email: string }>('GET', `/api/invites/${token}`),
+  acceptInvite: (token: string, password?: string) =>
+    req<{ user: import('./types').UserVM }>('POST', `/api/invites/${token}/accept`, { password }),
+  setUserGroups: (uid: string, groupIds: string[]) => req('PUT', `/api/users/${uid}/groups`, { groupIds }),
+
+  registerOptions: () => req<Record<string, unknown>>('POST', '/api/webauthn/register/options'),
+  registerVerify: (response: unknown, name?: string) => req('POST', '/api/webauthn/register/verify', { response, name }),
+  loginOptions: () => req<Record<string, unknown>>('POST', '/api/webauthn/login/options'),
+  loginVerify: (response: unknown) => req<{ user: import('./types').UserVM }>('POST', '/api/webauthn/login/verify', { response }),
+  passkeys: () => req<{ passkeys: Array<{ id: string; name: string; createdAt: string }> }>('GET', '/api/webauthn/passkeys'),
+  deletePasskey: (id: string) => req('DELETE', `/api/webauthn/passkeys/${id}`),
+
   patchGroup: (gid: string, patch: { name?: string; description?: string }) => req('PATCH', `/api/groups/${gid}`, patch),
   deleteGroup: (gid: string) => req('DELETE', `/api/groups/${gid}`),
   createCategory: (pid: string, name: string) => req<{ id: string }>('POST', `/api/projects/${pid}/categories`, { name }),
@@ -91,6 +105,9 @@ export interface ApiUser {
   role: string;
   disabled: number;
   createdAt: string;
+  pending: number;
+  passkeys: number;
+  groupIds: string | null;
 }
 
 export interface ApiAgent {

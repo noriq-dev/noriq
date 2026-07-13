@@ -1,4 +1,6 @@
 import { useState } from 'react';
+import { startAuthentication } from '@simplewebauthn/browser';
+import { api } from '../api';
 import type { AppStore } from '../store';
 
 export function Login({ store }: { store: AppStore }) {
@@ -6,6 +8,20 @@ export function Login({ store }: { store: AppStore }) {
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  const passkeySignIn = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const options = await api.loginOptions();
+      const response = await startAuthentication({ optionsJSON: options as never });
+      await api.loginVerify(response);
+      location.reload(); // pick up the fresh session everywhere
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'passkey sign-in failed');
+      setBusy(false);
+    }
+  };
 
   const submit = async () => {
     setBusy(true);
@@ -70,6 +86,22 @@ export function Login({ store }: { store: AppStore }) {
             }}
           >
             {busy ? 'signing in…' : 'Sign in'}
+          </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '2px 0' }}>
+            <span style={{ flex: 1, height: 1, background: 'rgba(255,255,255,.08)' }} />
+            <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)' }}>or</span>
+            <span style={{ flex: 1, height: 1, background: 'rgba(255,255,255,.08)' }} />
+          </div>
+          <button
+            onClick={passkeySignIn}
+            className="hover-bright"
+            style={{
+              cursor: 'pointer', textAlign: 'center', background: 'rgba(255,255,255,.05)',
+              color: 'var(--text)', border: '1px solid rgba(255,255,255,.12)', fontWeight: 600,
+              fontSize: 13, padding: 11, borderRadius: 9, opacity: busy ? 0.6 : 1,
+            }}
+          >
+            🔑 Sign in with a passkey
           </button>
         </div>
       </div>

@@ -4,10 +4,20 @@ import path from 'node:path';
 export default defineWorkersConfig(async () => {
   const migrations = await readD1Migrations(path.join(__dirname, 'migrations'));
   return {
+    // tslib's CJS default-export shape confuses the workers pool; force the ESM build.
+    resolve: { alias: { tslib: 'tslib/tslib.es6.js' } },
     test: {
       setupFiles: ['./test/apply-migrations.ts'],
-      // ajv (CJS, via @modelcontextprotocol/sdk) breaks the pool's ESM shim; pre-bundle it.
-      deps: { optimizer: { ssr: { enabled: true, include: ['ajv'] } } },
+      // CJS deps (ajv via MCP SDK; tslib + ASN.1 libs via @simplewebauthn) break
+      // the pool's ESM shim; pre-bundle them.
+      deps: {
+        optimizer: {
+          ssr: {
+            enabled: true,
+            include: ['ajv', 'tslib', '@simplewebauthn/server', '@peculiar/asn1-schema', '@peculiar/asn1-ecc', '@peculiar/asn1-rsa', '@peculiar/asn1-x509', '@peculiar/asn1-android', '@hexagon/base64', 'cbor-x'],
+          },
+        },
+      },
       poolOptions: {
         workers: {
           // Coordination tests are sequential scenarios sharing one D1/DO state;

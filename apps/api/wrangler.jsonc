@@ -46,6 +46,14 @@
     }
   ],
 
+  // Transactional email (invites). OPTIONAL: self-hosters without an onboarded
+  // sending domain can delete this block + EMAIL_FROM — invites fall back to
+  // copyable links. Enable with: npx wrangler email sending enable <domain>
+  "send_email": [{ "name": "EMAIL" }],
+  "vars": {
+    "EMAIL_FROM": "planar@frs.llc"
+  },
+
   "observability": {
     "enabled": true
   }
