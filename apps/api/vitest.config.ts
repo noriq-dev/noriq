@@ -26,6 +26,8 @@ export default defineWorkersConfig(async () => {
           singleWorker: true,
           wrangler: { configPath: './wrangler.jsonc' },
           miniflare: {
+            // R2 for attachment tests (the generic wrangler.jsonc doesn't bind FILES).
+            r2Buckets: ['FILES'],
             bindings: { TEST_MIGRATIONS: migrations, ADMIN_TOKEN: 'test-admin-token', DISABLE_RATE_LIMIT: true },
             // Tests run without built web assets.
             assets: { directory: './test/fixtures/empty-assets' },

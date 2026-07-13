@@ -117,6 +117,24 @@ async function mcpCallOnce(apiKey: string, tool: string, args: Record<string, un
   };
 }
 
+/** Raw JSON-RPC call (resources/read, resources/list, etc.) → parsed result. */
+export async function mcpRpc(apiKey: string, method: string, params: Record<string, unknown> = {}) {
+  const res = await SELF.fetch('https://planar.test/mcp', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/event-stream',
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: rpcId++, method, params }),
+  });
+  const raw = await res.text();
+  if (res.status !== 200) throw new Error(`mcp ${method} → ${res.status}: ${raw}`);
+  const message = parseRpcResponse(raw, res.headers.get('Content-Type') ?? '');
+  if (message.error) throw new Error(`mcp ${method} rpc error: ${JSON.stringify(message.error)}`);
+  return message.result;
+}
+
 export async function mcpList(apiKey: string) {
   const res = await SELF.fetch('https://planar.test/mcp', {
     method: 'POST',

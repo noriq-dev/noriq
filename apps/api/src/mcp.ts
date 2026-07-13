@@ -1,10 +1,14 @@
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { Env } from './env';
 import type { AgentIdentity } from './auth';
 import type { Actor } from './do/ProjectRoom';
 import { computeUpdates, formatNotices } from './sync';
-import { newId, nowIso, sha256Hex } from './lib/util';
+import { base64ToBytes, bytesToBase64, newId, nowIso, sha256Hex } from './lib/util';
+
+const MAX_ATTACHMENT = 25 * 1024 * 1024;
+/** Stable resource URI for an attachment; agents read bytes back via resources/read. */
+const attachmentUri = (id: string) => `planar://attachment/${id}`;
 
 /**
  * planar MCP server — Streamable HTTP, stateless (a fresh server per request,
@@ -278,7 +282,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       ).bind(taskId, taskId).first();
       if (!task) throw new Error(`task ${taskId} not found`);
       const id = String(task.id);
-      const [deps, comments, refs] = await Promise.all([
+      const [deps, comments, refs, attachments] = await Promise.all([
         env.DB.prepare(
           `SELECT dt.id, dt.key, dt.status FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id WHERE d.task_id = ?`,
         ).bind(id).all(),
@@ -287,8 +291,14 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
            FROM comments WHERE task_id = ? ORDER BY CASE WHEN status IN ('open','acknowledged') THEN 0 ELSE 1 END, created_at`,
         ).bind(id).all(),
         env.DB.prepare('SELECT kind, ref, url, state FROM task_refs WHERE task_id = ?').bind(id).all(),
+        env.DB.prepare(
+          `SELECT id, filename, content_type AS contentType, size, uploaded_by_kind AS uploadedByKind, uploaded_by AS uploadedBy, created_at AS createdAt
+           FROM attachments WHERE task_id = ? ORDER BY created_at`,
+        ).bind(id).all(),
       ]);
-      return { task, dependencies: deps.results, comments: comments.results, refs: refs.results };
+      // Each attachment carries its resource URI — read the bytes with resources/read.
+      const withUris = attachments.results.map((a) => ({ ...a, resource: attachmentUri(String(a.id)) }));
+      return { task, dependencies: deps.results, comments: comments.results, refs: refs.results, attachments: withUris };
     }),
   );
 
@@ -297,6 +307,37 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     'Make one task depend on another (blocks claiming until the dependency is done). Cycles are rejected.',
     { projectId: z.string(), taskId: z.string(), dependsOnTaskId: z.string() },
     tool(async ({ projectId, taskId, dependsOnTaskId }) => room(env, projectId).addDependency(projectId, actor, taskId, dependsOnTaskId)),
+  );
+
+  server.tool(
+    'add_attachment',
+    'Attach a file (screenshot, image, log, etc.) to a task. Pass the bytes base64-encoded in `data` (max 25 MB). Read them back later via the returned resource URI (resources/read) — e.g. planar://attachment/<id>.',
+    {
+      projectId: z.string(),
+      taskId: z.string(),
+      filename: z.string().min(1).max(120),
+      data: z.string().min(1).describe('file bytes, base64-encoded'),
+      contentType: z.string().optional().describe('MIME type, e.g. image/png — defaults to application/octet-stream'),
+    },
+    tool(async ({ projectId, taskId, filename, data, contentType }) => {
+      if (!env.FILES) throw new Error('attachments not configured on this instance — enable R2 and bind FILES');
+      const task = await env.DB.prepare('SELECT id, project_id AS pid, key FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+        .bind(taskId, taskId, projectId).first<{ id: string; pid: string; key: string }>();
+      if (!task) throw new Error(`task ${taskId} not found in project ${projectId}`);
+      const bytes = base64ToBytes(data);
+      if (bytes.length === 0 || bytes.length > MAX_ATTACHMENT) throw new Error('attachment must be 1 byte – 25 MB');
+      const safeName = filename.replace(/[/\\]/g, '_').slice(0, 120);
+      const ct = contentType ?? 'application/octet-stream';
+      const id = newId('att');
+      const key = `att/${task.pid}/${id}/${safeName}`;
+      await env.FILES.put(key, bytes, { httpMetadata: { contentType: ct } });
+      await env.DB.prepare(
+        `INSERT INTO attachments (id, task_id, filename, content_type, size, r2_key, uploaded_by_kind, uploaded_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'agent', ?, ?)`,
+      ).bind(id, task.id, safeName, ct, bytes.length, key, agent.id, nowIso()).run();
+      await room(env, task.pid).noteAttachment(task.pid, actor, task.id, safeName, id);
+      return { id, taskKey: task.key, filename: safeName, contentType: ct, size: bytes.length, resource: attachmentUri(id) };
+    }),
   );
 
   // ---- coordination -------------------------------------------------------
@@ -509,6 +550,48 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       ).bind(`ref_${crypto.randomUUID().slice(0, 12)}`, task.id, kind, ref, url ?? null, state ?? null, nowIso()).run();
       return { ok: true, taskKey: task.key };
     }),
+  );
+
+  // ---- resources: read attachment bytes back ------------------------------
+  // planar://attachment/<id> — binary comes back as base64 `blob`, text as `text`.
+  server.registerResource(
+    'attachment',
+    new ResourceTemplate('planar://attachment/{id}', {
+      // Discovery: recent attachments across active projects, each with its URI.
+      list: async () => {
+        const { results } = await env.DB.prepare(
+          `SELECT a.id, a.filename, a.content_type AS ct, a.size
+           FROM attachments a JOIN tasks t ON t.id = a.task_id JOIN projects p ON p.id = t.project_id
+           WHERE p.status = 'active' ORDER BY a.created_at DESC LIMIT 50`,
+        ).all<{ id: string; filename: string; ct: string; size: number }>();
+        return {
+          resources: results.map((a) => ({
+            uri: attachmentUri(a.id),
+            name: a.filename,
+            mimeType: a.ct,
+            description: `${a.size} bytes`,
+          })),
+        };
+      },
+    }),
+    { title: 'Task attachment', description: 'Bytes of a file attached to a task (image, log, etc.)' },
+    async (uri, { id }) => {
+      if (!env.FILES) throw new Error('attachments not configured on this instance');
+      const attId = Array.isArray(id) ? id[0]! : id;
+      const row = await env.DB.prepare('SELECT r2_key AS key, content_type AS ct FROM attachments WHERE id = ?')
+        .bind(attId).first<{ key: string; ct: string }>();
+      if (!row) throw new Error(`attachment ${attId} not found`);
+      const obj = await env.FILES.get(row.key);
+      if (!obj) throw new Error('file missing from storage');
+      const bytes = new Uint8Array(await obj.arrayBuffer());
+      const mimeType = row.ct || 'application/octet-stream';
+      // Text types come back as text so agents can read them directly; everything else as base64.
+      const isText = /^text\/|^application\/(json|xml|yaml|x-yaml)/.test(mimeType);
+      const content = isText
+        ? { uri: uri.href, mimeType, text: new TextDecoder().decode(bytes) }
+        : { uri: uri.href, mimeType, blob: bytesToBase64(bytes) };
+      return { contents: [content] };
+    },
   );
 
   return server;
