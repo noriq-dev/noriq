@@ -152,15 +152,15 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         const token = await env.DB.prepare('SELECT user_id AS userId FROM oauth_tokens WHERE id = ?')
           .bind(opts.oauthTokenId).first<{ userId: string }>();
         if (!token) throw new Error('token not found');
-        // Names are unique per project; a revoked name stays retired (PLNR-47).
-        if (projectId) {
-          const clash = await env.DB.prepare(
-            `SELECT id, status, user_id AS userId FROM agents WHERE project_id = ? AND name = ? AND id != ?`,
-          ).bind(projectId, name, agent.id).first<{ id: string; status: string; userId: string | null }>();
-          if (clash) {
-            if (clash.status === 'revoked') throw new Error(`agent name "${name}" was revoked in this project and is retired — pick a new name`);
-            throw new Error(`agent name "${name}" is already taken in this project — pick another`);
-          }
+        // Names are globally unique for now (D1 can't relax the constraint in-place);
+        // a revoked name stays retired (PLNR-47).
+        const clash = await env.DB.prepare(
+          `SELECT id, status, user_id AS userId FROM agents WHERE name = ? AND id != ?`,
+        ).bind(name, agent.id).first<{ id: string; status: string; userId: string | null }>();
+        if (clash) {
+          if (clash.status === 'revoked') throw new Error(`agent name "${name}" was revoked and is retired — pick a new name`);
+          if (clash.userId && clash.userId !== token.userId) throw new Error(`agent name "${name}" is owned by another user — pick a different name`);
+          throw new Error(`agent name "${name}" is already in use — pick another`);
         }
         if (parentAgentId) {
           const parent = await env.DB.prepare('SELECT id, user_id AS userId FROM agents WHERE id = ?')

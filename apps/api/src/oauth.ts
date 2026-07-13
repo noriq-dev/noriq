@@ -211,9 +211,10 @@ oauth.post('/authorize', async (c) => {
     .bind(agentName, user.id).first<{ id: string }>();
   if (!agent) {
     const agentId = newId('agt');
+    // api_key_hash is a vestigial NOT NULL column (no static keys); a random hash fills it.
     await c.env.DB.prepare(
-      `INSERT INTO agents (id, name, role, status, user_id, created_at) VALUES (?, ?, 'worker', 'idle', ?, ?)`,
-    ).bind(agentId, agentName, user.id, nowIso()).run();
+      `INSERT INTO agents (id, name, role, status, user_id, api_key_hash, created_at) VALUES (?, ?, 'worker', 'idle', ?, ?, ?)`,
+    ).bind(agentId, agentName, user.id, await sha256Hex(randToken('unused_')), nowIso()).run();
     agent = { id: agentId };
   }
 

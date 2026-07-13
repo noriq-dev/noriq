@@ -132,7 +132,7 @@ describe('oauth 2.1 for MCP', () => {
     expect(mine.isError).toBe(false);
     const steal = await mcpCall(other.apiKey, 'set_agent_identity', { name: 'shared-name', projectId: proj.body.id });
     expect(steal.isError).toBe(true);
-    expect(steal.text).toMatch(/already taken in this project/);
+    expect(steal.text).toMatch(/already in use|owned by another/);
   });
 
   it('rejects a bad PKCE verifier', async () => {

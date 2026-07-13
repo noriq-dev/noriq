@@ -91,11 +91,12 @@ export async function resolveSessionAgent(env: Env, conn: Connection, sessionId:
   ).bind(sessionId).first<AgentIdentity>();
   if (existing) return existing;
   const id = newId('agt');
-  const name = `${slug(conn.clientName)}-${sessionId.replace(/[^a-z0-9]/gi, '').slice(0, 4).toLowerCase()}`;
+  const name = `${slug(conn.clientName)}-${sessionId.replace(/[^a-z0-9]/gi, '').slice(0, 6).toLowerCase()}`;
+  // api_key_hash is a vestigial NOT NULL column (no static keys); a random unusable hash fills it.
   await env.DB.prepare(
-    `INSERT INTO agents (id, name, role, status, user_id, oauth_token_id, session_id, created_at)
-     VALUES (?, ?, 'worker', 'idle', ?, ?, ?, ?)`,
-  ).bind(id, name, conn.userId, conn.tokenId, sessionId, nowIso()).run();
+    `INSERT INTO agents (id, name, role, status, user_id, oauth_token_id, session_id, api_key_hash, created_at)
+     VALUES (?, ?, 'worker', 'idle', ?, ?, ?, ?, ?)`,
+  ).bind(id, name, conn.userId, conn.tokenId, sessionId, await sha256Hex(crypto.randomUUID()), nowIso()).run();
   return { id, name, role: 'worker' };
 }
 
