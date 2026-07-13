@@ -18,6 +18,8 @@ export interface UserIdentity {
 export type Vars = {
   agent?: AgentIdentity;
   user?: UserIdentity;
+  /** Set when the agent authenticated with an OAuth access token (enables set_agent_identity). */
+  oauthTokenId?: string;
 };
 
 export type AppContext = { Bindings: Env; Variables: Vars };
@@ -42,11 +44,13 @@ export async function agentAuth(c: Context<AppContext>, next: Next) {
 
   let row: AgentIdentity | null;
   if (key.startsWith('plnrt_')) {
-    row = await c.env.DB.prepare(
-      `SELECT a.id, a.name, a.role FROM oauth_tokens t JOIN agents a ON a.id = t.agent_id
+    const t = await c.env.DB.prepare(
+      `SELECT a.id, a.name, a.role, t.id AS tokenId FROM oauth_tokens t JOIN agents a ON a.id = t.agent_id
        WHERE t.token_hash = ? AND t.revoked_at IS NULL
          AND t.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') AND a.status != 'revoked'`,
-    ).bind(hash).first<AgentIdentity>();
+    ).bind(hash).first<AgentIdentity & { tokenId: string }>();
+    row = t ? { id: t.id, name: t.name, role: t.role } : null;
+    if (t) c.set('oauthTokenId', t.tokenId);
   } else {
     row = await c.env.DB.prepare(
       "SELECT id, name, role FROM agents WHERE api_key_hash = ? AND status != 'revoked'",

@@ -90,11 +90,13 @@ function EditProjectModal({ store }: { store: AppStore }) {
   const [name, setName] = useState(project?.name ?? '');
   const [description, setDescription] = useState(project?.phase ?? '');
   const [groupId, setGroupId] = useState(project?.groupId ?? '');
+  const [ttlMin, setTtlMin] = useState(String(Math.round((store.snapshot?.project.claimTtlSeconds ?? 1800) / 60)));
   const { busy, error, run } = useSubmit(async () => {
     await store.actions.submitProjectMeta({
       name: name.trim(),
       description: description.trim(),
       groupId: groupId || null,
+      claimTtlSeconds: Math.max(1, Number(ttlMin) || 30) * 60,
     });
   });
   if (!project) return null;
@@ -107,14 +109,19 @@ function EditProjectModal({ store }: { store: AppStore }) {
       <Field label="Description" hint="shown in the top bar">
         <TextInput value={description} onChange={(e) => setDescription(e.target.value)} />
       </Field>
-      <Field label="Group">
-        <Select value={groupId} onChange={(e) => setGroupId(e.target.value)}>
-          <option value="">— none —</option>
-          {store.groups.map((g) => (
-            <option key={g.id} value={g.id}>{g.name}</option>
-          ))}
-        </Select>
-      </Field>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+        <Field label="Group">
+          <Select value={groupId} onChange={(e) => setGroupId(e.target.value)}>
+            <option value="">— none —</option>
+            {store.groups.map((g) => (
+              <option key={g.id} value={g.id}>{g.name}</option>
+            ))}
+          </Select>
+        </Field>
+        <Field label="Claim TTL (minutes)" hint="how long agents hold tasks between heartbeats">
+          <TextInput type="number" min={1} max={1440} value={ttlMin} onChange={(e) => setTtlMin(e.target.value)} />
+        </Field>
+      </div>
       <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
         <Button variant="ghost" onClick={() => store.actions.openModal('group')}>+ new group</Button>
         <div style={{ flex: 1 }} />

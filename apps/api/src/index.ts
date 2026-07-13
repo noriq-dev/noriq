@@ -34,7 +34,7 @@ app.get('/api/health', async (c) => {
 
 // --- MCP (agents) -------------------------------------------------------------
 app.all('/mcp', agentAuth, async (c) => {
-  const server = buildMcpServer(c.env, c.var.agent!);
+  const server = buildMcpServer(c.env, c.var.agent!, { oauthTokenId: c.var.oauthTokenId });
   const transport = new StreamableHTTPTransport();
   await server.connect(transport);
   return transport.handleRequest(c);
@@ -203,7 +203,7 @@ app.post('/api/projects', userAuth, async (c) => {
   if (!/^[A-Z][A-Z0-9]{0,7}$/.test(body.key ?? '')) return c.json({ error: 'key must be 1-8 uppercase letters/digits' }, 400);
   const id = `prj_${body.key.toLowerCase()}`;
   await c.env.DB.prepare(
-    `INSERT INTO projects (id, key, name, description, status, created_at) VALUES (?, ?, ?, ?, 'active', ?)`,
+    `INSERT INTO projects (id, key, name, description, status, claim_ttl_seconds, created_at) VALUES (?, ?, ?, ?, 'active', 1800, ?)`,
   ).bind(id, body.key, body.name, body.description ?? '', nowIso()).run();
   await room(c.env, id).createMilestone(id, humanActor(c), 'Backlog');
   return c.json({ id, key: body.key });
@@ -271,12 +271,16 @@ app.post('/api/groups', userAuth, async (c) => {
 });
 
 app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
-  const body = await c.req.json<{ groupId?: string | null; description?: string; name?: string }>();
+  const body = await c.req.json<{ groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number }>();
   const sets: string[] = [];
   const binds: unknown[] = [];
   if (body.groupId !== undefined) { sets.push('group_id = ?'); binds.push(body.groupId); }
   if (body.description !== undefined) { sets.push('description = ?'); binds.push(body.description); }
   if (body.name !== undefined) { sets.push('name = ?'); binds.push(body.name); }
+  if (body.claimTtlSeconds !== undefined) {
+    if (body.claimTtlSeconds < 60 || body.claimTtlSeconds > 24 * 3600) return c.json({ error: 'claim TTL must be 60s–24h' }, 400);
+    sets.push('claim_ttl_seconds = ?'); binds.push(Math.round(body.claimTtlSeconds));
+  }
   if (!sets.length) return c.json({ ok: true });
   binds.push(c.req.param('pid')!);
   await c.env.DB.prepare(`UPDATE projects SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();

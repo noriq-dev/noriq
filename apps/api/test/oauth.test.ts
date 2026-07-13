@@ -72,7 +72,7 @@ describe('oauth 2.1 for MCP', () => {
     // consent page renders for a signed-in user
     const page = await SELF.fetch(`https://planar.test/oauth/authorize?${q}`, { headers: { Cookie: cookie } });
     expect(page.status).toBe(200);
-    expect(await page.text()).toContain('act as agent');
+    expect(await page.text()).toContain('on your behalf');
 
     // approve
     const form = new URLSearchParams(Object.fromEntries(q.entries()));
@@ -108,9 +108,51 @@ describe('oauth 2.1 for MCP', () => {
     refreshToken = t.refresh_token;
     expect(accessToken).toMatch(/^plnrt_/);
 
-    // the token works on MCP, acting as the named agent
+    // the token works on MCP under a default delegated identity (user+client derived)
     const briefing = await mcpCall(accessToken, 'get_briefing', {});
-    expect(briefing.body.you.name).toBe('oauth-test-agent');
+    expect(briefing.body.you.name).toContain('oauth');
+  });
+
+  it('set_agent_identity rebinds the token to a named agent', async () => {
+    const set = await mcpCall(accessToken, 'set_agent_identity', { name: 'atlas-prime', role: 'orchestrator' });
+    expect(set.isError).toBe(false);
+    expect(set.body.actingAs.name).toBe('atlas-prime');
+    const briefing = await mcpCall(accessToken, 'get_briefing', {});
+    expect(briefing.body.you.name).toBe('atlas-prime');
+    expect(briefing.body.you.role).toBe('orchestrator');
+  });
+
+  it('set_agent_identity refuses names owned by other users', async () => {
+    // create a second user + token via a fresh consent (same client)
+    await createUser('other@example.com', 'Other', 'longenough1', 'member').catch(() => {});
+    const otherCookie = await loginSession('other@example.com', 'longenough1');
+    const verifier = 'other-verifier-other-verifier-other-verifier';
+    const challenge = await s256(verifier);
+    const q = new URLSearchParams({
+      response_type: 'code', client_id: clientId, redirect_uri: redirectUri,
+      code_challenge: challenge, code_challenge_method: 'S256', scope: 'mcp', state: 'o',
+    });
+    const form = new URLSearchParams(Object.fromEntries(q.entries()));
+    form.set('decision', 'approve');
+    const approve = await SELF.fetch('https://planar.test/oauth/authorize', {
+      method: 'POST',
+      headers: { Cookie: otherCookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: form.toString(),
+      redirect: 'manual',
+    });
+    const code = new URL(approve.headers.get('Location')!).searchParams.get('code')!;
+    const token = await SELF.fetch('https://planar.test/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code', code, redirect_uri: redirectUri,
+        client_id: clientId, code_verifier: verifier,
+      }).toString(),
+    });
+    const otherToken = ((await token.json()) as { access_token: string }).access_token;
+    const steal = await mcpCall(otherToken, 'set_agent_identity', { name: 'atlas-prime' });
+    expect(steal.isError).toBe(true);
+    expect(steal.text).toContain('owned by another user');
   });
 
   it('rejects a bad PKCE verifier', async () => {
@@ -158,9 +200,9 @@ describe('oauth 2.1 for MCP', () => {
     });
     expect(replay.status).toBe(400);
 
-    // new access token works
+    // new access token works and inherits the rebound identity
     const briefing = await mcpCall(t.access_token, 'get_briefing', {});
-    expect(briefing.body.you.name).toBe('oauth-test-agent');
+    expect(briefing.body.you.name).toBe('atlas-prime');
   });
 });
 

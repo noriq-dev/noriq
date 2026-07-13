@@ -4,7 +4,7 @@ import type { Env } from './env';
 import type { AgentIdentity } from './auth';
 import type { Actor } from './do/ProjectRoom';
 import { computeUpdates, formatNotices } from './sync';
-import { nowIso } from './lib/util';
+import { newId, nowIso, sha256Hex } from './lib/util';
 
 /**
  * planar MCP server — Streamable HTTP, stateless (a fresh server per request,
@@ -18,7 +18,8 @@ The contract: (1) call get_briefing first; (2) claim_task before working on anyt
 (3) call heartbeat (or any tool) at least every minute while working — your claim's TTL
 lapses otherwise and the task is requeued; (4) check and resolve open comments — humans
 steer you through them; (5) release_task (to review or done) when finished. Never work
-on a task you have not claimed.`;
+on a task you have not claimed. OAuth sessions start under a default delegated
+identity — call set_agent_identity to take a distinct name/role for this work.`;
 
 function room(env: Env, projectId: string) {
   return env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName(projectId));
@@ -26,12 +27,28 @@ function room(env: Env, projectId: string) {
 
 const asActor = (a: AgentIdentity): Actor => ({ kind: 'agent', id: a.id, name: a.name });
 
-export function buildMcpServer(env: Env, agent: AgentIdentity): McpServer {
+export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthTokenId?: string } = {}): McpServer {
   const server = new McpServer(
-    { name: 'planar', version: '0.2.0' },
-    { instructions: INSTRUCTIONS },
+    { name: 'planar', version: '0.3.0' },
+    {
+      instructions: INSTRUCTIONS,
+      // Experimental notification channel (PLNR-45): clients that understand it
+      // receive notices as pushed channel messages on the response stream.
+      capabilities: { experimental: { 'claude/channel': {} } },
+    },
   );
   const actor = asActor(agent);
+
+  const pushChannel = async (content: string, meta: Record<string, string> = {}) => {
+    try {
+      await server.server.notification({
+        method: 'notifications/claude/channel',
+        params: { content, meta: { source: 'planar', agent: agent.name, ...meta } },
+      });
+    } catch {
+      /* client/transport without channel support — the text block still carries it */
+    }
+  };
 
   /** Wrap a handler: JSON result + piggybacked notices for the calling agent. */
   const tool = <T>(fn: (args: T) => Promise<unknown>) =>
@@ -47,6 +64,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity): McpServer {
       }
       const updates = await computeUpdates(env, agent);
       const notices = formatNotices(updates);
+      if (notices) await pushChannel(notices, { kind: 'notices' });
       const text = JSON.stringify(body, null, 1) + (notices ? `\n\n${notices}` : '');
       return { content: [{ type: 'text' as const, text }] };
     };
@@ -84,6 +102,41 @@ export function buildMcpServer(env: Env, agent: AgentIdentity): McpServer {
     tool(async () => computeUpdates(env, agent)),
   );
 
+  if (opts.oauthTokenId) {
+    server.tool(
+      'set_agent_identity',
+      'Take a distinct agent identity for this OAuth session (rebinds your token). Use when you start working: pick a short memorable name — reusing a name reuses that agent and its history. Role: worker (default) or orchestrator.',
+      {
+        name: z.string().min(2).max(40).regex(/^[a-z0-9][a-z0-9._-]*$/i, 'letters/digits/._-'),
+        role: z.enum(['worker', 'orchestrator']).optional(),
+      },
+      tool(async ({ name, role }) => {
+        const token = await env.DB.prepare('SELECT user_id AS userId FROM oauth_tokens WHERE id = ?')
+          .bind(opts.oauthTokenId).first<{ userId: string }>();
+        if (!token) throw new Error('token not found');
+        let target = await env.DB.prepare("SELECT id, name, role, user_id AS userId FROM agents WHERE name = ? AND status != 'revoked'")
+          .bind(name).first<{ id: string; name: string; role: string; userId: string | null }>();
+        if (target && target.userId && target.userId !== token.userId) {
+          throw new Error(`agent name "${name}" is owned by another user — pick a different name`);
+        }
+        if (!target) {
+          const agentId = newId('agt');
+          await env.DB.prepare(
+            `INSERT INTO agents (id, name, role, status, api_key_hash, user_id, created_at) VALUES (?, ?, ?, 'idle', ?, ?, ?)`,
+          ).bind(agentId, name, role ?? 'worker', await sha256Hex(crypto.randomUUID() + crypto.randomUUID()), token.userId, nowIso()).run();
+          target = { id: agentId, name, role: role ?? 'worker', userId: token.userId };
+        } else if (role && target.role !== role) {
+          await env.DB.prepare('UPDATE agents SET role = ? WHERE id = ?').bind(role, target.id).run();
+        }
+        await env.DB.prepare('UPDATE oauth_tokens SET agent_id = ? WHERE id = ?').bind(target.id, opts.oauthTokenId).run();
+        return {
+          actingAs: { id: target.id, name: target.name, role: role ?? target.role },
+          note: 'identity rebound — subsequent calls on this token act as this agent',
+        };
+      }),
+    );
+  }
+
   // ---- projects -----------------------------------------------------------
 
   server.tool(
@@ -112,7 +165,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity): McpServer {
     tool(async (args) => {
       const id = `prj_${args.key.toLowerCase()}`;
       await env.DB.prepare(
-        `INSERT INTO projects (id, key, name, description, status, repo_url, created_at) VALUES (?, ?, ?, ?, 'active', ?, ?)`,
+        `INSERT INTO projects (id, key, name, description, status, repo_url, claim_ttl_seconds, created_at) VALUES (?, ?, ?, ?, 'active', ?, 1800, ?)`,
       ).bind(id, args.key, args.name, args.description ?? '', args.repoUrl ?? null, nowIso()).run();
       await room(env, id).createMilestone(id, actor, 'Backlog');
       return { id, key: args.key };

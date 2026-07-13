@@ -122,10 +122,10 @@ function consentPage(clientName: string, agentDefault: string, params: AuthzPara
     .join('');
   const inner = user
     ? `
-    <p class="sub">Signed in as <b>${esc(user.name)}</b>. <b>${esc(clientName)}</b> is requesting access to the planar MCP.</p>
+    <p class="sub">Signed in as <b>${esc(user.name)}</b>. <b>${esc(clientName)}</b> is requesting access to the planar MCP <b>on your behalf</b>.</p>
+    <p class="hint">It starts as the agent <b>${esc(agentDefault)}</b> (delegated by you). The agent itself can take a
+    different identity later with the <code>set_agent_identity</code> tool — no need to decide here.</p>
     <form method="POST" action="/oauth/authorize">${hidden}
-      <label>act as agent<input name="agent_name" value="${esc(agentDefault)}" maxlength="40" pattern="[a-zA-Z0-9._ -]+"></label>
-      <p class="hint">This client's actions (claims, comments, messages) appear under this agent name. Reusing a name reuses that agent identity.</p>
       <div class="row">
         <button name="decision" value="deny" class="ghost">Deny</button>
         <button name="decision" value="approve" class="approve">Approve</button>
@@ -197,18 +197,19 @@ oauth.post('/authorize', async (c) => {
     return c.html(consentPage(v.name, agentDefault, { ...p, ...({ _u: '' } as object) } as AuthzParams, user));
   }
   if (!user) return c.html(consentPage(v.name, '', p, null, 'sign in first'), 401);
-  if (form.decision !== 'approve') return c.html(consentPage(v.name, String(form.agent_name ?? ''), p, user), 400);
+  if (form.decision !== 'approve') return c.html(consentPage(v.name, '', p, user), 400);
 
-  // Resolve the agent identity this grant acts as.
-  const agentName = String(form.agent_name ?? '').trim().slice(0, 40) || `${user.name.toLowerCase()}-oauth`;
+  // Default agent for this grant: owned by the user, named after user+client.
+  // The agent can rebind itself later via the set_agent_identity MCP tool (PLNR-43).
+  const agentName = `${(user.name.split(' ')[0] ?? 'user').toLowerCase()}-${v.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 20) || 'client'}`;
   let agent = await c.env.DB.prepare("SELECT id FROM agents WHERE name = ? AND status != 'revoked'")
     .bind(agentName).first<{ id: string }>();
   if (!agent) {
     const agentId = newId('agt');
     // OAuth agents have no static API key; a random unusable hash fills the column.
     await c.env.DB.prepare(
-      `INSERT INTO agents (id, name, role, status, api_key_hash, created_at) VALUES (?, ?, 'worker', 'idle', ?, ?)`,
-    ).bind(agentId, agentName, await sha256Hex(randToken('unused_')), nowIso()).run();
+      `INSERT INTO agents (id, name, role, status, api_key_hash, user_id, created_at) VALUES (?, ?, 'worker', 'idle', ?, ?, ?)`,
+    ).bind(agentId, agentName, await sha256Hex(randToken('unused_')), user.id, nowIso()).run();
     agent = { id: agentId };
   }
 

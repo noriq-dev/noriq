@@ -90,6 +90,11 @@ describe('plans & groups', () => {
     expect(snap.phaseTasks.length).toBe(4);
   });
 
+  it('new projects default to a 30-minute claim TTL', async () => {
+    const proj = await mcpCall(planner.apiKey, 'get_project', { projectId });
+    expect(proj.body.project.claimTtlSeconds).toBe(1800);
+  });
+
   it('groups can be created and projects assigned', async () => {
     const g = await SELF.fetch('https://planar.test/api/groups', {
       method: 'POST',

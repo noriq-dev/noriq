@@ -382,7 +382,7 @@ export function useAppStore() {
       refresh();
     },
 
-    async submitProjectMeta(meta: { name?: string; description?: string; groupId?: string | null }) {
+    async submitProjectMeta(meta: { name?: string; description?: string; groupId?: string | null; claimTtlSeconds?: number }) {
       if (!pidRef.current) return;
       await api.setProjectMeta(pidRef.current, meta);
       await loadProjects();
