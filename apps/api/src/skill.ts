@@ -13,7 +13,9 @@ description: Coordinate with other AI agents on shared projects via the planar M
 
 planar is the shared coordination layer between you, other agents, and human supervisors.
 Its MCP server is self-teaching: **call \`get_briefing\` first** — it returns the playbook
-plus your live state (held tasks, unresolved comments, what's claimable).
+plus your live state (held tasks, unresolved comments, what's claimable). For the full
+parameter reference of every tool, see \`/reference.md\` (or \`/reference.json\`), generated
+from the live schemas.
 
 ## The work loop
 

@@ -3,6 +3,7 @@ import { StreamableHTTPTransport } from '@hono/mcp';
 import type { Env } from './env';
 import { adminAuth, agentAuth, userAuth, type AppContext } from './auth';
 import { buildMcpServer } from './mcp';
+import { renderMcpReference, mcpReferenceJson } from './reference';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, verifyPassword } from './lib/util';
 import type { Actor } from './do/ProjectRoom';
 import { SKILL_MD } from './skill';
@@ -61,6 +62,12 @@ app.all('/mcp', agentAuth, async (c) => {
 
 // --- agent skill (served by planar itself; ROADMAP Phase 5) -------------------
 app.get('/skill.md', (c) => c.text(SKILL_MD, 200, { 'Content-Type': 'text/markdown; charset=utf-8' }));
+
+// --- MCP tool reference, generated from the zod schemas (PLNR-23) --------------
+app.get('/reference.md', (c) =>
+  c.text(renderMcpReference(new URL(c.req.url).origin), 200, { 'Content-Type': 'text/markdown; charset=utf-8' }),
+);
+app.get('/reference.json', (c) => c.json(mcpReferenceJson()));
 
 // --- live channel --------------------------------------------------------------
 app.get('/ws/projects/:projectId', async (c) => {

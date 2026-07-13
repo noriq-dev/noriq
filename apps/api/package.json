@@ -18,7 +18,8 @@
     "@planar/shared": "*",
     "@simplewebauthn/server": "^13.3.2",
     "hono": "^4.7.0",
-    "zod": "^3.24.0"
+    "zod": "^3.24.0",
+    "zod-to-json-schema": "^3.24.0"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.8.0",

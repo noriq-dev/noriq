@@ -10,6 +10,10 @@ const MAX_ATTACHMENT = 100 * 1024 * 1024;
 /** Stable resource URI for an attachment; agents read bytes back via resources/read. */
 const attachmentUri = (id: string) => `planar://attachment/${id}`;
 
+/** Tool metadata captured at registration, used to generate the reference doc (PLNR-23). */
+export type ToolSpec = { name: string; description: string; inputSchema: z.ZodRawShape };
+export type ResourceSpec = { name: string; uriTemplate: string; description: string };
+
 /**
  * planar MCP server — Streamable HTTP, stateless (a fresh server per request,
  * bound to the authenticated agent). Tools ARE the documentation: descriptions
@@ -43,6 +47,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     },
   );
   const actor = asActor(agent);
+  const toolSpecs: ToolSpec[] = [];
+  const resourceSpecs: ResourceSpec[] = [];
 
   // PLNR-54: in stateless Streamable HTTP there is NO standing GET SSE stream, so a
   // notification sent with no related request id is dropped by the transport. The fix
@@ -90,7 +96,13 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     cb: (args: any, extra?: { requestId?: string | number }) => unknown,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  ) => server.registerTool(name, { description, inputSchema }, cb as any);
+  ) => {
+    // Capture the spec at definition time so the reference doc is generated from the
+    // exact same zod schemas the tools validate against — it can't drift (PLNR-23).
+    toolSpecs.push({ name, description, inputSchema });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return server.registerTool(name, { description, inputSchema }, cb as any);
+  };
 
   // ---- orientation --------------------------------------------------------
 
@@ -572,6 +584,11 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   // ---- resources: read attachment bytes back ------------------------------
   // planar://attachment/<id> — binary comes back as base64 `blob`, text as `text`.
+  resourceSpecs.push({
+    name: 'attachment',
+    uriTemplate: 'planar://attachment/{id}',
+    description: 'Bytes of a file attached to a task (image, log, etc.). Binary returns as base64 blob; text/json/xml/yaml as text.',
+  });
   server.registerResource(
     'attachment',
     new ResourceTemplate('planar://attachment/{id}', {
@@ -612,5 +629,20 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     },
   );
 
+  // Expose the captured specs so the reference doc can be generated from them.
+  (server as unknown as { specs: { tools: ToolSpec[]; resources: ResourceSpec[] } }).specs = { tools: toolSpecs, resources: resourceSpecs };
   return server;
+}
+
+/**
+ * The tool/resource specs, for generating the reference doc (PLNR-23). Built with
+ * stub env/agent — the specs (names/descriptions/zod schemas) are static and never
+ * invoke a handler, so no DB/agent is needed. oauthTokenId is set so set_agent_identity
+ * appears in the reference.
+ */
+export function mcpReferenceSpecs(): { tools: ToolSpec[]; resources: ResourceSpec[] } {
+  const stubEnv = {} as Env;
+  const stubAgent: AgentIdentity = { id: 'stub', name: 'stub', role: 'worker' } as AgentIdentity;
+  const server = buildMcpServer(stubEnv, stubAgent, { oauthTokenId: 'stub' });
+  return (server as unknown as { specs: { tools: ToolSpec[]; resources: ResourceSpec[] } }).specs;
 }
