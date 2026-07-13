@@ -39,6 +39,7 @@ export function Rail({ store }: { store: AppStore }) {
         display: 'flex',
         flexDirection: 'column',
         minHeight: 0,
+        overflowX: 'hidden',
       }}
     >
       {/* header / home */}
@@ -59,7 +60,7 @@ export function Rail({ store }: { store: AppStore }) {
         </div>
       </button>
 
-      <div style={{ flex: 1, overflowY: 'auto', padding: '2px 8px 8px', minHeight: 0 }}>
+      <div style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: '2px 8px 8px', minHeight: 0 }}>
         {ungrouped.length > 0 && (
           <div style={{ marginBottom: 6 }}>
             <div style={{ fontFamily: 'var(--mono)', fontSize: 9, letterSpacing: '.08em', textTransform: 'uppercase', color: 'var(--text-faint)', padding: '8px 8px 5px' }}>
@@ -91,7 +92,7 @@ export function Rail({ store }: { store: AppStore }) {
                 >
                   ▶
                 </span>
-                <span style={{ fontFamily: 'var(--mono)', fontSize: 9, letterSpacing: '.08em', textTransform: 'uppercase', color: 'var(--text-dim)' }}>
+                <span style={{ fontFamily: 'var(--mono)', fontSize: 9, letterSpacing: '.08em', textTransform: 'uppercase', color: 'var(--text-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>
                   {group.name}
                 </span>
                 <span style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>{projects.length}</span>
