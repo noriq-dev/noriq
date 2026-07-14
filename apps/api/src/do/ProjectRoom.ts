@@ -661,6 +661,19 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.emit(actor, 'signal.raised', task ? 'task' : 'project', task?.id ?? this.projectId, {
         signalId: id, sigType: input.type, severity, title: input.title, taskKey: task?.key ?? null, parked,
       });
+      // Mirror to the Run (RUN-18): if this input_request comes from a spawned agent
+      // driving a running Run, park the Run → blocked so the dashboard shows "waiting
+      // on you", not a hung run. (Raw UPDATE, not transitionRun, to avoid nesting
+      // blockConcurrencyWhile; running→blocked is a legal transition.)
+      if (input.type === 'input_request' && actor.kind === 'agent') {
+        const { results } = await this.env.DB.prepare(
+          "SELECT id FROM runs WHERE project_id = ? AND agent_id = ? AND status = 'running'",
+        ).bind(this.projectId, actor.id).all<{ id: string }>();
+        for (const r of results) {
+          await this.env.DB.prepare("UPDATE runs SET status = 'blocked', updated_at = ? WHERE id = ?").bind(nowIso(), r.id).run();
+          await this.emit(actor, 'run.status_changed', 'run', r.id, { from: 'running', to: 'blocked', reason: 'request_input' });
+        }
+      }
       return { id, type: input.type, taskKey: task?.key ?? null, parked };
 
     });
@@ -684,6 +697,17 @@ export class ProjectRoom extends DurableObject<Env> {
         taskKey = task.key;
         if (task.status === 'blocked') {
           await this.env.DB.prepare("UPDATE tasks SET status = 'todo', updated_at = ? WHERE id = ?").bind(nowIso(), sig.taskId).run();
+        }
+      }
+      // Mirror to the Run (RUN-18): the answer returns a blocked Run to running so
+      // the spawned agent resumes (it picks up the answer via its own MCP notices).
+      if (sig.type === 'input_request' && sig.agentId) {
+        const { results } = await this.env.DB.prepare(
+          "SELECT id FROM runs WHERE project_id = ? AND agent_id = ? AND status = 'blocked'",
+        ).bind(this.projectId, sig.agentId).all<{ id: string }>();
+        for (const r of results) {
+          await this.env.DB.prepare("UPDATE runs SET status = 'running', updated_at = ? WHERE id = ?").bind(nowIso(), r.id).run();
+          await this.emit(actor, 'run.status_changed', 'run', r.id, { from: 'blocked', to: 'running', reason: 'input_answered' });
         }
       }
       await this.emit(actor, 'signal.answered', sig.taskId ? 'task' : 'project', sig.taskId ?? this.projectId, {

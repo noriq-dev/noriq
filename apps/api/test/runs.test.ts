@@ -5,7 +5,7 @@ import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import type { Actor, CreateRunInput, RunPatch, RunView } from '../src/do/ProjectRoom';
 import type { Env } from '../src/env';
-import { createUser, loginSession, mintTokenForUser } from './helpers';
+import { createAgent, createUser, loginSession, mcpCall, mintTokenForUser } from './helpers';
 
 const actor: Actor = { kind: 'human', id: 'usr_runtest', name: 'Run Tester' };
 let cookie: string;
@@ -137,6 +137,37 @@ describe('run lifecycle in ProjectRoom (RUN-6)', () => {
     expect(runnerRuns.every((r) => r.runnerId === 'rnr_1')).toBe(true);
     const doneRuns = await room(pid).listRuns(pid, { status: 'done' });
     expect(doneRuns.every((r) => r.status === 'done')).toBe(true);
+  });
+
+  it('mirrors a spawned agent request_input to Run blocked, and the answer back to running (RUN-18)', async () => {
+    const spawned = await createAgent('run18-agent');
+    const mintCookie = await loginSession('agent-mint@example.com', 'longenough1');
+    const pr = await SELF.fetch('https://planar.test/api/projects', {
+      method: 'POST', headers: { Cookie: mintCookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'RB18', name: 'rb18' }),
+    });
+    const rbPid = ((await pr.json()) as { id: string }).id;
+    // A running Run driven by the spawned agent.
+    const runId = `run_rb18_${crypto.randomUUID().slice(0, 8)}`;
+    await env.DB.prepare(
+      "INSERT INTO runs (id, project_id, agent_id, kind, repo_ref, agent_tool, status, created_by) VALUES (?, ?, ?, 'build', 'r', 'claude', 'running', ?)",
+    ).bind(runId, rbPid, spawned.id, spawned.id).run();
+
+    // The spawned agent asks for input → Run mirrors to blocked.
+    await mcpCall(spawned.apiKey, 'request_input', { projectId: rbPid, title: 'which approach?' });
+    const blocked = await env.DB.prepare('SELECT status FROM runs WHERE id = ?').bind(runId).first<{ status: string }>();
+    expect(blocked!.status).toBe('blocked'); // "waiting on you", not hung
+
+    // Human answers → Run returns to running.
+    const sig = await env.DB.prepare("SELECT id FROM signals WHERE agent_id = ? AND type = 'input_request' ORDER BY created_at DESC LIMIT 1")
+      .bind(spawned.id).first<{ id: string }>();
+    const ans = await SELF.fetch(`https://planar.test/api/projects/${rbPid}/signals/${sig!.id}/answer`, {
+      method: 'POST', headers: { Cookie: mintCookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ response: 'go with option B' }),
+    });
+    expect(ans.status).toBe(200);
+    const running = await env.DB.prepare('SELECT status FROM runs WHERE id = ?').bind(runId).first<{ status: string }>();
+    expect(running!.status).toBe('running');
   });
 
   it('re-register (reconnect) reconciles the runner\'s orphaned runs over HTTP', async () => {

@@ -158,3 +158,66 @@ describe('steering-ack dedups the notices fallback (RUN-7)', () => {
     expect(joined).not.toContain('STEER-ONE-acked'); // runtime-delivered → suppressed
   });
 });
+
+describe('WS steer → ack → notices dedup (RUN-17)', () => {
+  async function waitDelivery(agentId: string, messageId: string, tries = 40) {
+    for (let i = 0; i < tries; i++) {
+      const r = await env.DB.prepare('SELECT 1 FROM runtime_deliveries WHERE agent_id = ? AND message_id = ?').bind(agentId, messageId).first();
+      if (r) return;
+      await sleep(25);
+    }
+    throw new Error('no runtime_delivery recorded');
+  }
+
+  it('POST /steer pushes over the socket; the daemon ack suppresses the source notice', async () => {
+    const A = await createAgent('wsteer-sender');
+    const B = await createAgent('wsteer-target');
+    const mintCookie = await loginSession('agent-mint@example.com', 'longenough1');
+    const p = await SELF.fetch('https://planar.test/api/projects', {
+      method: 'POST', headers: { Cookie: mintCookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'WSTR', name: 'wstr' }),
+    });
+    const pid = ((await p.json()) as { id: string }).id;
+    const reg = await SELF.fetch('https://planar.test/api/runners', {
+      method: 'POST', headers: { Authorization: `Bearer ${A.apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: 'wsteer-daemon' }),
+    });
+    const runnerId = ((await reg.json()) as { runner: { id: string } }).runner.id;
+    const runId = `run_wsteer_${crypto.randomUUID().slice(0, 8)}`;
+    await env.DB.prepare(
+      "INSERT INTO runs (id, project_id, runner_id, agent_id, kind, repo_ref, agent_tool, status, created_by) VALUES (?, ?, ?, ?, 'build', 'r', 'claude', 'running', ?)",
+    ).bind(runId, pid, runnerId, B.id, A.id).run();
+
+    // Daemon connects its runner WS.
+    const res = await SELF.fetch(`https://planar.test/ws/runner/${runnerId}`, { headers: { Upgrade: 'websocket', Authorization: `Bearer ${A.apiKey}` } });
+    const ws = res.webSocket!;
+    ws.accept();
+    ws.send(JSON.stringify({ type: 'hello', protocol: 1, label: 'wsteer-daemon' }));
+    await nextFrame(ws, (m) => m.type === 'registered');
+
+    // A message A→B is the steer source.
+    const src = (await mcpCall(A.apiKey, 'send_message', { projectId: pid, toAgentId: B.id, body: 'WS-STEER-acked' })).body;
+
+    // Human steers the run via HTTP → server pushes a steer down the socket.
+    const steerP = nextFrame(ws, (m) => m.type === 'steer');
+    const steerRes = await SELF.fetch(`https://planar.test/api/runs/${runId}/steer`, {
+      method: 'POST', headers: { Cookie: mintCookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'focus on auth', mode: 'soft', sourceMessageId: src.id }),
+    });
+    const { steerId, delivered } = (await steerRes.json()) as { steerId: string; delivered: boolean };
+    expect(delivered).toBe(true);
+    const steerFrame = await steerP;
+    expect(steerFrame.steerId).toBe(steerId);
+    expect(steerFrame.body).toBe('focus on auth');
+
+    // Daemon injected it → acks delivered-via-runtime.
+    ws.send(JSON.stringify({ type: 'steer.ack', runId, steerId, delivered: true, via: 'runtime', noticeCursor: null, detail: null, ackedAt: new Date(0).toISOString() }));
+    await waitDelivery(B.id, src.id); // dedup row recorded
+
+    // A second, un-steered message must still surface.
+    await mcpCall(A.apiKey, 'send_message', { projectId: pid, toAgentId: B.id, body: 'WS-STEER-live' });
+    const notices = ((await mcpCall(B.apiKey, 'my_updates')).body as { notices: string[] }).notices.join('\n');
+    expect(notices).toContain('WS-STEER-live'); // not steered → surfaced
+    expect(notices).not.toContain('WS-STEER-acked'); // steered + acked runtime → suppressed
+  });
+});
