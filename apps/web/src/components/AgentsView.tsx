@@ -45,7 +45,7 @@ export function AgentsView({ store }: { store: AppStore }) {
   const sel = agents.find((a) => a.id === selected) ?? null;
 
   return (
-    <div style={{ position: 'absolute', inset: 0, display: 'grid', gridTemplateColumns: selected ? '1fr 380px' : '1fr', minHeight: 0 }}>
+    <div className="agents-grid" style={{ position: 'absolute', inset: 0, display: 'grid', gridTemplateColumns: selected ? '1fr 380px' : '1fr', minHeight: 0 }}>
       <div style={{ overflowY: 'auto', padding: '18px 22px', minWidth: 0 }}>
         <div style={{ maxWidth: 860, margin: '0 auto' }}>
           <div style={{ display: 'flex', alignItems: 'center', marginBottom: 14 }}>
@@ -68,8 +68,8 @@ export function AgentsView({ store }: { store: AppStore }) {
                   style={{
                     display: 'flex', alignItems: 'center', gap: 12, padding: '13px 15px',
                     borderRadius: 11, cursor: 'pointer',
-                    background: selected === a.id ? 'rgba(255,255,255,.045)' : 'rgba(255,255,255,.02)',
-                    border: `1px solid ${selected === a.id ? 'rgba(255,255,255,.18)' : 'rgba(255,255,255,.07)'}`,
+                    background: selected === a.id ? 'var(--w-045)' : 'var(--w-02)',
+                    border: `1px solid ${selected === a.id ? 'var(--w-18)' : 'var(--w-07)'}`,
                     opacity: revoked ? 0.45 : 1,
                   }}
                 >
@@ -120,7 +120,7 @@ export function AgentsView({ store }: { store: AppStore }) {
       {/* per-agent activity */}
       {sel && (
         <div style={{ borderLeft: '1px solid var(--line)', display: 'flex', flexDirection: 'column', minHeight: 0, background: 'var(--bg-raised)' }}>
-          <div style={{ padding: '15px 18px 11px', display: 'flex', alignItems: 'center', gap: 9, flex: 'none', borderBottom: '1px solid rgba(255,255,255,.05)' }}>
+          <div style={{ padding: '15px 18px 11px', display: 'flex', alignItems: 'center', gap: 9, flex: 'none', borderBottom: '1px solid var(--w-05)' }}>
             <SectionLabel>{sel.name} · activity</SectionLabel>
             <div style={{ flex: 1 }} />
             <button onClick={() => setSelected(null)} className="drawer-x" style={{ cursor: 'pointer', color: 'var(--text-dim)', fontSize: 15, width: 24, height: 24, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6 }}>✕</button>

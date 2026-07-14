@@ -23,7 +23,7 @@ export const statusMeta = (st: TaskStatus): StatusMeta => STATUS[st] ?? STATUS.t
 export const KIND_META: Record<CommentKind, { label: string; color: string; bg: string }> = {
   question: { label: '? question', color: '#f5a623', bg: 'rgba(245,166,35,.12)' },
   instruction: { label: '! instruction', color: '#4c9dff', bg: 'rgba(76,157,255,.12)' },
-  comment: { label: '# comment', color: '#8a8f98', bg: 'rgba(255,255,255,.06)' },
+  comment: { label: '# comment', color: '#8a8f98', bg: 'var(--w-06)' },
   reply: { label: 'reply', color: '#3fd98b', bg: 'rgba(63,217,139,.1)' },
 };
 
@@ -46,5 +46,5 @@ export function verbColors(verb: string): { color: string; bg: string } {
   if (verb === 'subtask') return { color: '#c6f24e', bg: 'rgba(198,242,78,.1)' };
   if (verb.startsWith('status')) return { color: '#b57bff', bg: 'rgba(181,123,255,.12)' };
   if (verb.startsWith('released')) return { color: '#ff8a8a', bg: 'rgba(255,92,92,.12)' };
-  return { color: '#8a8f98', bg: 'rgba(255,255,255,.06)' };
+  return { color: '#8a8f98', bg: 'var(--w-06)' };
 }

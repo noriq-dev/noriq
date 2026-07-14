@@ -20,7 +20,7 @@ export function AvatarChip({
   title?: string;
 }) {
   const isYou = color === 'you';
-  const bg = isYou ? YOU_GRADIENT : isGhostColor(color) ? 'rgba(255,255,255,.16)' : color;
+  const bg = isYou ? YOU_GRADIENT : isGhostColor(color) ? 'var(--w-16)' : color;
   const fg = isYou ? '#0a0b0d' : agentFg(color);
   const style: CSSProperties = {
     position: 'relative',

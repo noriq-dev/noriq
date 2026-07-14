@@ -31,7 +31,7 @@ export function Modal({ title, subtitle, onClose, children, width = 420 }: {
           maxHeight: 'calc(100vh - 80px)',
           overflowY: 'auto',
           background: 'var(--bg-raised)',
-          border: '1px solid rgba(255,255,255,.12)',
+          border: '1px solid var(--w-12)',
           borderRadius: 16,
           padding: 24,
           boxShadow: '0 30px 80px rgba(0,0,0,.6)',
@@ -63,8 +63,8 @@ export function Modal({ title, subtitle, onClose, children, width = 420 }: {
 const inputStyle: CSSProperties = {
   boxSizing: 'border-box',
   width: '100%',
-  background: 'rgba(255,255,255,.05)',
-  border: '1px solid rgba(255,255,255,.1)',
+  background: 'var(--w-05)',
+  border: '1px solid var(--w-1)',
   borderRadius: 9,
   padding: '9px 12px',
   color: 'var(--text)',
@@ -100,7 +100,7 @@ export function Select(props: React.SelectHTMLAttributes<HTMLSelectElement>) {
 export function Button({ variant = 'primary', ...props }: React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: 'primary' | 'ghost' | 'danger' }) {
   const styles: Record<string, CSSProperties> = {
     primary: { background: 'var(--accent)', color: 'var(--bg)', border: '1px solid transparent' },
-    ghost: { background: 'rgba(255,255,255,.05)', color: 'var(--text)', border: '1px solid rgba(255,255,255,.12)' },
+    ghost: { background: 'var(--w-05)', color: 'var(--text)', border: '1px solid var(--w-12)' },
     danger: { background: 'transparent', color: 'var(--red-soft)', border: '1px solid rgba(255,92,92,.4)' },
   };
   return (

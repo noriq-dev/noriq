@@ -7,7 +7,7 @@ import { Composer } from './Composer';
 
 export function MissionControl({ store }: { store: AppStore }) {
   return (
-    <div style={{ position: 'absolute', inset: 0, display: 'grid', gridTemplateColumns: '272px 1fr 328px', minHeight: 0 }}>
+    <div className="mc-grid" style={{ position: 'absolute', inset: 0, display: 'grid', gridTemplateColumns: '272px 1fr 328px', minHeight: 0 }}>
       <Roster store={store} />
       <EventFeed store={store} />
       {store.selectedAgentId ? <AgentPanel store={store} /> : <Holds store={store} />}
@@ -39,7 +39,7 @@ function AgentPanel({ store }: { store: AppStore }) {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-      <div style={{ padding: '14px 16px 12px', display: 'flex', alignItems: 'center', gap: 10, flex: 'none', borderBottom: '1px solid rgba(255,255,255,.05)' }}>
+      <div style={{ padding: '14px 16px 12px', display: 'flex', alignItems: 'center', gap: 10, flex: 'none', borderBottom: '1px solid var(--w-05)' }}>
         <AvatarChip name={agent.name} color={agent.color} size={34} radius={9} fontSize={12.5} />
         <div style={{ minWidth: 0, flex: 1 }}>
           <div style={{ fontSize: 14, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -83,7 +83,7 @@ function AgentPanel({ store }: { store: AppStore }) {
                   key={t.id}
                   onClick={() => actions.openTask(t.id)}
                   className="hover-border"
-                  style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '8px 10px', borderRadius: 8, background: 'var(--card)', border: '1px solid rgba(255,255,255,.07)', cursor: 'pointer' }}
+                  style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '8px 10px', borderRadius: 8, background: 'var(--card)', border: '1px solid var(--w-07)', cursor: 'pointer' }}
                 >
                   <span style={{ width: 7, height: 7, borderRadius: '50%', background: mm.dot, flex: 'none' }} />
                   <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: mm.color, flex: 'none' }}>{t.key}</span>
@@ -114,7 +114,7 @@ function AgentPanel({ store }: { store: AppStore }) {
               }}
               placeholder={`Direct to ${agent.name} — no task needed…`}
               style={{
-                flex: 1, minWidth: 0, background: 'rgba(255,255,255,.05)', border: '1px solid rgba(255,255,255,.09)',
+                flex: 1, minWidth: 0, background: 'var(--w-05)', border: '1px solid var(--w-09)',
                 borderRadius: 8, padding: '8px 11px', color: 'var(--text)', fontSize: 12, outline: 'none',
               }}
             />
@@ -202,8 +202,8 @@ function Roster({ store }: { store: AppStore }) {
               style={{
                 padding: '11px 12px',
                 borderRadius: 10,
-                background: store.selectedAgentId === a.id ? 'rgba(198,242,78,.07)' : isOrch ? 'rgba(198,242,78,.04)' : claim ? 'rgba(255,255,255,.03)' : 'rgba(255,255,255,.02)',
-                border: `1px solid ${store.selectedAgentId === a.id ? 'rgba(198,242,78,.35)' : isOrch ? 'rgba(198,242,78,.22)' : claim ? 'rgba(255,255,255,.06)' : 'rgba(255,255,255,.05)'}`,
+                background: store.selectedAgentId === a.id ? 'rgba(198,242,78,.07)' : isOrch ? 'rgba(198,242,78,.04)' : claim ? 'var(--w-03)' : 'var(--w-02)',
+                border: `1px solid ${store.selectedAgentId === a.id ? 'rgba(198,242,78,.35)' : isOrch ? 'rgba(198,242,78,.22)' : claim ? 'var(--w-06)' : 'var(--w-05)'}`,
                 cursor: 'pointer',
                 opacity: claim || isOrch ? 1 : 0.72,
               }}
@@ -286,7 +286,7 @@ function AttentionInbox({ store }: { store: AppStore }) {
                       {s.options.map((opt) => (
                         <button key={opt} onClick={() => void actions.answerSignal(s.id, opt)}
                           className="hover-bright"
-                          style={{ cursor: 'pointer', fontSize: 11.5, fontWeight: 500, color: 'var(--accent)', background: 'rgba(198,242,78,.08)', border: '1px solid rgba(198,242,78,.35)', borderRadius: 7, padding: '4px 10px' }}>
+                          style={{ cursor: 'pointer', fontSize: 11.5, fontWeight: 500, color: 'var(--accent-ink)', background: 'rgba(198,242,78,.08)', border: '1px solid rgba(198,242,78,.35)', borderRadius: 7, padding: '4px 10px' }}>
                           {opt}
                         </button>
                       ))}
@@ -298,7 +298,7 @@ function AttentionInbox({ store }: { store: AppStore }) {
                       onChange={(e) => setAnswers((a) => ({ ...a, [s.id]: e.target.value }))}
                       onKeyDown={(e) => { if (e.key === 'Enter' && (answers[s.id] ?? '').trim()) { void actions.answerSignal(s.id, answers[s.id]!); } }}
                       placeholder={s.options?.length ? 'or type a decision…' : 'your decision…'}
-                      style={{ flex: 1, minWidth: 0, background: 'rgba(255,255,255,.03)', border: '1px solid rgba(255,255,255,.1)', borderRadius: 7, padding: '5px 9px', color: 'var(--text)', fontSize: 12 }}
+                      style={{ flex: 1, minWidth: 0, background: 'var(--w-03)', border: '1px solid var(--w-1)', borderRadius: 7, padding: '5px 9px', color: 'var(--text)', fontSize: 12 }}
                     />
                     <button disabled={!(answers[s.id] ?? '').trim()} onClick={() => void actions.answerSignal(s.id, answers[s.id]!)}
                       style={{ cursor: (answers[s.id] ?? '').trim() ? 'pointer' : 'default', fontSize: 12, fontWeight: 600, color: '#0a0b0d', background: 'var(--accent)', border: 'none', borderRadius: 7, padding: '5px 12px', opacity: (answers[s.id] ?? '').trim() ? 1 : 0.4 }}>
@@ -308,7 +308,7 @@ function AttentionInbox({ store }: { store: AppStore }) {
                 </div>
               ) : (
                 <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
-                  <button onClick={() => void actions.acknowledgeSignal(s.id)} style={{ cursor: 'pointer', fontSize: 11.5, fontWeight: 500, color: 'var(--text-soft)', background: 'rgba(255,255,255,.04)', border: '1px solid rgba(255,255,255,.1)', borderRadius: 7, padding: '4px 11px' }}>Acknowledge</button>
+                  <button onClick={() => void actions.acknowledgeSignal(s.id)} style={{ cursor: 'pointer', fontSize: 11.5, fontWeight: 500, color: 'var(--text-soft)', background: 'var(--w-04)', border: '1px solid var(--w-1)', borderRadius: 7, padding: '4px 11px' }}>Acknowledge</button>
                   <button onClick={() => void actions.acknowledgeSignal(s.id, true)} style={{ cursor: 'pointer', fontSize: 11, color: 'var(--text-faint)', background: 'transparent', border: 'none', padding: '4px 4px' }}>dismiss</button>
                 </div>
               )}
@@ -335,7 +335,7 @@ function EventFeed({ store }: { store: AppStore }) {
           display: 'flex',
           alignItems: 'center',
           gap: 10,
-          borderBottom: '1px solid rgba(255,255,255,.05)',
+          borderBottom: '1px solid var(--w-05)',
           flex: 'none',
         }}
       >
@@ -378,7 +378,7 @@ function EventFeed({ store }: { store: AppStore }) {
                   width: 20,
                   height: 20,
                   borderRadius: 5,
-                  background: isYou ? YOU_GRADIENT : isSystem ? '#3fd98b' : ag ? (isGhostColor(ag.color) ? 'rgba(255,255,255,.16)' : ag.color) : 'rgba(255,255,255,.16)',
+                  background: isYou ? YOU_GRADIENT : isSystem ? '#3fd98b' : ag ? (isGhostColor(ag.color) ? 'var(--w-16)' : ag.color) : 'var(--w-16)',
                   flex: 'none',
                   display: 'flex',
                   alignItems: 'center',
@@ -447,10 +447,10 @@ function Holds({ store }: { store: AppStore }) {
               onClick={() => actions.openTask(t.id)}
               className="hover-border"
               style={{
-                border: `1px solid ${blocked ? 'rgba(255,92,92,.28)' : 'rgba(255,255,255,.09)'}`,
+                border: `1px solid ${blocked ? 'rgba(255,92,92,.28)' : 'var(--w-09)'}`,
                 borderRadius: 11,
                 padding: 12,
-                background: blocked ? 'rgba(255,92,92,.05)' : 'rgba(255,255,255,.02)',
+                background: blocked ? 'rgba(255,92,92,.05)' : 'var(--w-02)',
                 cursor: 'pointer',
               }}
             >
@@ -469,7 +469,7 @@ function Holds({ store }: { store: AppStore }) {
                     <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>claim TTL</span>
                     <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--green)' }}>renews in {fmtTtl(t.ttl!)}</span>
                   </div>
-                  <div style={{ height: 4, borderRadius: 2, background: 'rgba(255,255,255,.08)', overflow: 'hidden' }}>
+                  <div style={{ height: 4, borderRadius: 2, background: 'var(--w-08)', overflow: 'hidden' }}>
                     <div style={{ height: '100%', background: 'var(--green)', width: `${Math.round((t.ttl! / (t.ttlMax ?? 90)) * 100)}%` }} />
                   </div>
                 </>

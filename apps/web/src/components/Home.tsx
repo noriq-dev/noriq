@@ -16,7 +16,7 @@ export function Home({ store }: { store: AppStore }) {
 
   return (
     <div style={{ position: 'absolute', inset: 0, overflowY: 'auto' }}>
-      <div style={{ maxWidth: 880, margin: '0 auto', padding: '44px 28px 60px' }}>
+      <div className="content-pad" style={{ maxWidth: 880, margin: '0 auto', padding: '44px 28px 60px' }}>
         {/* header */}
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 14, marginBottom: 6 }}>
           <h1 style={{ fontSize: 26, fontWeight: 700, letterSpacing: '-.02em', margin: 0 }}>
@@ -41,7 +41,7 @@ export function Home({ store }: { store: AppStore }) {
         {data.projects.length === 0 ? (
           <div
             style={{
-              border: '1px dashed rgba(255,255,255,.12)', borderRadius: 14, padding: '36px 20px',
+              border: '1px dashed var(--w-12)', borderRadius: 14, padding: '36px 20px',
               textAlign: 'center', marginBottom: 36,
             }}
           >
@@ -67,8 +67,8 @@ export function Home({ store }: { store: AppStore }) {
           <ConnectCard />
           <div
             style={{
-              border: '1px solid rgba(255,255,255,.07)', borderRadius: 14,
-              background: 'rgba(255,255,255,.015)', padding: '18px 20px',
+              border: '1px solid var(--w-07)', borderRadius: 14,
+              background: 'var(--w-015)', padding: '18px 20px',
             }}
           >
             <SectionLabel>How planar works</SectionLabel>
@@ -80,7 +80,7 @@ export function Home({ store }: { store: AppStore }) {
                 ['watch', 'Mission Control, the orchestration graph, and the board are all live over WebSocket.'],
               ].map(([k, v]) => (
                 <li key={k} style={{ display: 'flex', gap: 10, fontSize: 12, lineHeight: 1.55, color: 'var(--text-mid)' }}>
-                  <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--accent)', paddingTop: 2, width: 38, flex: 'none' }}>{k}</span>
+                  <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--accent-ink)', paddingTop: 2, width: 38, flex: 'none' }}>{k}</span>
                   <span>{v}</span>
                 </li>
               ))}
@@ -108,15 +108,15 @@ function ProjectGrid({ projects, onOpen }: { projects: ProjectVM[]; onOpen: (id:
             onClick={() => onOpen(p.id)}
             className="hover-border"
             style={{
-              border: '1px solid rgba(255,255,255,.07)', borderRadius: 13, padding: '15px 16px',
-              background: 'rgba(255,255,255,.02)', cursor: 'pointer',
+              border: '1px solid var(--w-07)', borderRadius: 13, padding: '15px 16px',
+              background: 'var(--w-02)', cursor: 'pointer',
             }}
           >
             <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 8 }}>
               <span
                 style={{
                   fontFamily: 'var(--mono)', fontSize: 10.5, fontWeight: 700, color: p.dotColor,
-                  background: 'rgba(255,255,255,.05)', padding: '2px 7px', borderRadius: 5,
+                  background: 'var(--w-05)', padding: '2px 7px', borderRadius: 5,
                 }}
               >
                 {p.key}
@@ -131,7 +131,7 @@ function ProjectGrid({ projects, onOpen }: { projects: ProjectVM[]; onOpen: (id:
               </div>
             )}
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <div style={{ flex: 1, height: 4, borderRadius: 2, background: 'rgba(255,255,255,.07)', overflow: 'hidden' }}>
+              <div style={{ flex: 1, height: 4, borderRadius: 2, background: 'var(--w-07)', overflow: 'hidden' }}>
                 <div style={{ height: '100%', width: `${pct * 100}%`, background: pct === 1 ? 'var(--green)' : 'var(--blue)' }} />
               </div>
               <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)', whiteSpace: 'nowrap' }}>
@@ -211,7 +211,7 @@ function ConnectCard() {
       <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
         <SectionLabel>Connect an agent</SectionLabel>
         <div style={{ flex: 1 }} />
-        <div style={{ display: 'flex', gap: 2, background: 'rgba(255,255,255,.05)', border: '1px solid rgba(255,255,255,.08)', borderRadius: 8, padding: 2 }}>
+        <div style={{ display: 'flex', gap: 2, background: 'var(--w-05)', border: '1px solid var(--w-08)', borderRadius: 8, padding: 2 }}>
           {CLIENTS.map((c) => (
             <button
               key={c.id}
@@ -227,14 +227,14 @@ function ConnectCard() {
           ))}
         </div>
       </div>
-      <div style={{ display: 'flex', gap: 2, margin: '10px 0 0', width: 'fit-content', background: 'rgba(255,255,255,.04)', border: '1px solid rgba(255,255,255,.07)', borderRadius: 7, padding: 2 }}>
+      <div style={{ display: 'flex', gap: 2, margin: '10px 0 0', width: 'fit-content', background: 'var(--w-04)', border: '1px solid var(--w-07)', borderRadius: 7, padding: 2 }}>
         {(['global', 'project'] as const).map((sc) => (
           <button
             key={sc}
             onClick={() => setScope(sc)}
             style={{
               cursor: 'pointer', padding: '2px 9px', borderRadius: 5, fontFamily: 'var(--mono)', fontSize: 9.5,
-              background: scope === sc ? 'rgba(255,255,255,.1)' : 'transparent',
+              background: scope === sc ? 'var(--w-1)' : 'transparent',
               color: scope === sc ? 'var(--text)' : 'var(--text-faint)',
             }}
           >
@@ -247,7 +247,7 @@ function ConnectCard() {
         onClick={copy}
         title="click to copy"
         style={{
-          fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--accent)', cursor: 'pointer',
+          fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--accent-ink)', cursor: 'pointer',
           background: 'rgba(0,0,0,.3)', border: '1px solid rgba(198,242,78,.25)', borderRadius: 9,
           padding: '10px 12px', lineHeight: 1.5, margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-all',
         }}

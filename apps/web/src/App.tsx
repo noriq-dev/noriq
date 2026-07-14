@@ -37,6 +37,7 @@ function ThemeToggle() {
 
 export function App() {
   const store = useAppStore();
+  const [railOpen, setRailOpen] = useState(false);
 
   const inviteMatch = location.pathname.match(/^\/invite\/([^/]+)/);
   if (inviteMatch) {
@@ -59,8 +60,24 @@ export function App() {
   return (
     <div style={{ height: '100vh', display: 'flex', background: 'var(--bg)' }}>
       <ThemeToggle />
-      <Rail store={store} />
+      {railOpen && <div className="rail-backdrop" onClick={() => setRailOpen(false)} />}
+      <Rail store={store} open={railOpen} onNavigate={() => setRailOpen(false)} />
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+        <div className="mobile-topbar">
+          <button
+            onClick={() => setRailOpen(true)}
+            aria-label="Menu"
+            style={{ cursor: 'pointer', width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 19, color: 'var(--text-soft)', borderRadius: 8 }}
+          >
+            ☰
+          </button>
+          <div style={{ width: 22, height: 22, borderRadius: 6, background: 'var(--accent)', display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 'none' }}>
+            <div style={{ width: 9, height: 9, background: 'var(--bg)', transform: 'rotate(45deg)' }} />
+          </div>
+          <span style={{ fontWeight: 700, fontSize: 14.5, letterSpacing: '-.01em', color: 'var(--text)' }}>
+            {project && projectView ? project.name : 'planar'}
+          </span>
+        </div>
         {projectView && <TopBar store={store} />}
         <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
           {(store.view === 'home' || (!project && store.view !== 'settings')) && <Home store={store} />}

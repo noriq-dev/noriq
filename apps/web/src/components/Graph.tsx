@@ -119,7 +119,7 @@ export function Graph({ store }: { store: AppStore }) {
               fontSize={15}
               label={w.name}
               initialsText={initials(w.name)}
-              color={ghost ? 'rgba(255,255,255,.1)' : w.color}
+              color={ghost ? 'var(--w-1)' : w.color}
               fg={ghost ? '#e6e8ec' : '#0a0b0d'}
               shadow={claim ? `0 0 30px ${m ? m.color : '#4c9dff'}55` : 'none'}
               dot={isWorking ? '#3fd98b' : m?.dot}
@@ -158,7 +158,7 @@ export function Graph({ store }: { store: AppStore }) {
                     zIndex: 5,
                     maxWidth: 260,
                     background: '#14171c',
-                    border: '1px solid rgba(255,255,255,.14)',
+                    border: '1px solid var(--w-14)',
                     borderRadius: 11,
                     padding: '7px 11px',
                     boxShadow: '0 8px 30px rgba(0,0,0,.5)',
@@ -173,7 +173,7 @@ export function Graph({ store }: { store: AppStore }) {
                   <div
                     style={{
                       position: 'absolute', left: '50%', bottom: -5, width: 8, height: 8,
-                      background: '#14171c', borderRight: '1px solid rgba(255,255,255,.14)', borderBottom: '1px solid rgba(255,255,255,.14)',
+                      background: '#14171c', borderRight: '1px solid var(--w-14)', borderBottom: '1px solid var(--w-14)',
                       transform: 'translateX(-50%) rotate(45deg)',
                     }}
                   />
@@ -221,7 +221,7 @@ export function Graph({ store }: { store: AppStore }) {
         </div>
         <div style={{ display: 'flex', gap: 10, overflowX: 'auto', paddingBottom: 4 }}>
           {signals.map((e) => {
-            let bg = 'rgba(255,255,255,.03)', border = 'rgba(255,255,255,.07)', tagColor = 'var(--text-dim)', tag: string = e.verb;
+            let bg = 'var(--w-03)', border = 'var(--w-07)', tagColor = 'var(--text-dim)', tag: string = e.verb;
             if (e.verb === 'question') { bg = 'rgba(245,166,35,.06)'; border = 'rgba(245,166,35,.25)'; tagColor = 'var(--amber)'; tag = `? ${e.actor}`; }
             else if (e.verb === 'done' || e.verb === 'resolved') { bg = 'rgba(63,217,139,.06)'; border = 'rgba(63,217,139,.22)'; tagColor = 'var(--green)'; tag = `✓ ${e.verb}`; }
             else if (e.verb === 'msg') { tag = e.actor; }
@@ -330,7 +330,7 @@ function GraphNode(props: {
               style={{
                 fontFamily: 'var(--mono)',
                 fontSize: 8.5,
-                color: 'var(--accent)',
+                color: 'var(--accent-ink)',
                 background: 'rgba(198,242,78,.12)',
                 padding: '1px 5px',
                 borderRadius: 4,

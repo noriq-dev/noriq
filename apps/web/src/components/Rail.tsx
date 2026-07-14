@@ -13,8 +13,16 @@ function loadCollapsed(): Record<string, boolean> {
   }
 }
 
-export function Rail({ store }: { store: AppStore }) {
-  const { data, currentPid, actions, groups } = store;
+export function Rail({ store, open, onNavigate }: { store: AppStore; open?: boolean; onNavigate?: () => void }) {
+  const { data, currentPid, actions: rawActions, groups } = store;
+  // Wrap navigation so tapping an item also closes the mobile slide-over.
+  const actions = {
+    ...rawActions,
+    goHome: () => { rawActions.goHome(); onNavigate?.(); },
+    selectProject: (id: string) => { rawActions.selectProject(id); onNavigate?.(); },
+    createProject: () => { rawActions.createProject(); onNavigate?.(); },
+    setView: (v: Parameters<typeof rawActions.setView>[0]) => { rawActions.setView(v); onNavigate?.(); },
+  };
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>(loadCollapsed);
   const ungrouped = data.projects.filter((p) => !p.groupId);
   const grouped = groups
@@ -31,11 +39,12 @@ export function Rail({ store }: { store: AppStore }) {
 
   return (
     <div
+      className={`rail${open ? ' rail-open' : ''}`}
       style={{
         width: 216,
         flex: 'none',
         background: 'var(--bg-rail)',
-        borderRight: '1px solid rgba(255,255,255,.06)',
+        borderRight: '1px solid var(--w-06)',
         display: 'flex',
         flexDirection: 'column',
         minHeight: 0,
@@ -107,7 +116,7 @@ export function Rail({ store }: { store: AppStore }) {
       </div>
 
       {/* footer */}
-      <div style={{ flex: 'none', borderTop: '1px solid rgba(255,255,255,.06)', padding: 8 }}>
+      <div style={{ flex: 'none', borderTop: '1px solid var(--w-06)', padding: 8 }}>
         <FooterRow icon="+" label="New project" onClick={() => actions.createProject()} />
         <FooterRow icon="⚙" label="Settings" onClick={() => actions.setView('settings')} />
         <div style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 8px' }}>
@@ -150,7 +159,7 @@ function ProjectRow({ p, active, onSelect }: { p: ProjectVM; active: boolean; on
         style={{
           fontFamily: 'var(--mono)', fontSize: 9, fontWeight: 700, flex: 'none',
           color: active ? 'var(--accent)' : p.dotColor,
-          background: 'rgba(255,255,255,.05)', padding: '2px 5px', borderRadius: 4, minWidth: 26, textAlign: 'center',
+          background: 'var(--w-05)', padding: '2px 5px', borderRadius: 4, minWidth: 26, textAlign: 'center',
         }}
       >
         {p.key}
@@ -167,8 +176,8 @@ function ProjectRow({ p, active, onSelect }: { p: ProjectVM; active: boolean; on
       {p.hasLive ? (
         <LiveDot size={6} />
       ) : p.totalTasks > 0 ? (
-        <span style={{ width: 22, height: 3, borderRadius: 2, background: 'rgba(255,255,255,.08)', overflow: 'hidden', flex: 'none' }}>
-          <span style={{ display: 'block', height: '100%', width: `${pct * 100}%`, background: pct === 1 ? 'var(--green)' : 'rgba(255,255,255,.25)' }} />
+        <span style={{ width: 22, height: 3, borderRadius: 2, background: 'var(--w-08)', overflow: 'hidden', flex: 'none' }}>
+          <span style={{ display: 'block', height: '100%', width: `${pct * 100}%`, background: pct === 1 ? 'var(--green)' : 'var(--w-25)' }} />
         </span>
       ) : null}
     </button>
@@ -185,7 +194,7 @@ function FooterRow({ icon, label, onClick }: { icon: string; label: string; onCl
         padding: '7px 8px', borderRadius: 8, textAlign: 'left', background: 'transparent',
       }}
     >
-      <span style={{ width: 24, height: 24, borderRadius: 7, border: '1px dashed rgba(255,255,255,.15)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 13, color: 'var(--text-dim)', flex: 'none' }}>
+      <span style={{ width: 24, height: 24, borderRadius: 7, border: '1px dashed var(--w-15)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 13, color: 'var(--text-dim)', flex: 'none' }}>
         {icon}
       </span>
       <span style={{ fontSize: 12, color: 'var(--text-mid)' }}>{label}</span>

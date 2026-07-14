@@ -22,6 +22,7 @@ export function TopBar({ store }: { store: AppStore }) {
 
   return (
     <div
+      className="topbar"
       style={{
         height: 54,
         flex: 'none',
@@ -36,7 +37,7 @@ export function TopBar({ store }: { store: AppStore }) {
       <div
         onClick={() => actions.openModal('project-edit')}
         title="Edit project settings"
-        className="hover-border"
+        className="hover-border topbar-project"
         style={{ display: 'flex', alignItems: 'center', gap: 9, minWidth: 0, overflow: 'hidden', flexShrink: 1, cursor: 'pointer', padding: '4px 8px', margin: '-4px -8px', borderRadius: 8, border: '1px solid transparent' }}
       >
         <span
@@ -45,7 +46,7 @@ export function TopBar({ store }: { store: AppStore }) {
             fontSize: 11,
             fontWeight: 600,
             color: project.dotColor,
-            background: 'rgba(255,255,255,.05)',
+            background: 'var(--w-05)',
             padding: '2px 7px',
             borderRadius: 5,
             flex: 'none',
@@ -75,8 +76,8 @@ export function TopBar({ store }: { store: AppStore }) {
         style={{
           display: 'flex',
           gap: 2,
-          background: 'rgba(255,255,255,.04)',
-          border: '1px solid rgba(255,255,255,.06)',
+          background: 'var(--w-04)',
+          border: '1px solid var(--w-06)',
           borderRadius: 9,
           padding: 3,
           marginLeft: 6,
@@ -92,7 +93,7 @@ export function TopBar({ store }: { store: AppStore }) {
               borderRadius: 6,
               fontSize: 12.5,
               fontWeight: 500,
-              background: view === t.id ? 'rgba(255,255,255,.1)' : 'transparent',
+              background: view === t.id ? 'var(--w-1)' : 'transparent',
               color: view === t.id ? 'var(--text)' : 'var(--text-mid)',
             }}
           >
@@ -111,7 +112,7 @@ export function TopBar({ store }: { store: AppStore }) {
           cursor: 'pointer',
           fontFamily: 'var(--mono)',
           fontSize: 11.5,
-          color: 'var(--accent)',
+          color: 'var(--accent-ink)',
           background: 'rgba(198,242,78,.1)',
           border: '1px solid rgba(198,242,78,.3)',
           padding: '5px 11px',

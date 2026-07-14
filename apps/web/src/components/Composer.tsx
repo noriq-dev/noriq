@@ -14,8 +14,8 @@ export function Composer({ store, placeholder, compact }: { store: AppStore; pla
           display: 'flex',
           alignItems: 'center',
           gap: 8,
-          background: 'rgba(255,255,255,.05)',
-          border: '1px solid rgba(255,255,255,.08)',
+          background: 'var(--w-05)',
+          border: '1px solid var(--w-08)',
           borderRadius: compact ? 10 : 9,
           padding: compact ? '8px 12px' : '7px 12px',
         }}

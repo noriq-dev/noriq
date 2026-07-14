@@ -10,6 +10,7 @@
   --text-dim: #6b7280;
   --text-faint: #4b5563;
   --accent: #c6f24e;        /* lime — brand */
+  --accent-ink: #c6f24e;   /* accent used as TEXT (readable on the current bg) */
   --green: #3fd98b;         /* live / done */
   --blue: #4c9dff;          /* in progress / instruction */
   --purple: #b57bff;        /* review */
@@ -19,6 +20,16 @@
   --line: rgba(255, 255, 255, 0.07);
   --mono: 'IBM Plex Mono', ui-monospace, monospace;
   --sans: 'Space Grotesk', system-ui, sans-serif;
+
+  /* Alpha steps for borders/surfaces/hovers. In dark mode these are white-alpha
+     (identical to the original hardcoded values); light mode flips them to
+     dark-alpha below so hairlines and fills stay visible on a light background. */
+  --w-015: rgba(255,255,255,.015); --w-02: rgba(255,255,255,.02); --w-03: rgba(255,255,255,.03);
+  --w-04: rgba(255,255,255,.04); --w-045: rgba(255,255,255,.045); --w-05: rgba(255,255,255,.05);
+  --w-06: rgba(255,255,255,.06); --w-07: rgba(255,255,255,.07); --w-08: rgba(255,255,255,.08);
+  --w-09: rgba(255,255,255,.09); --w-1: rgba(255,255,255,.1); --w-12: rgba(255,255,255,.12);
+  --w-14: rgba(255,255,255,.14); --w-15: rgba(255,255,255,.15); --w-16: rgba(255,255,255,.16);
+  --w-18: rgba(255,255,255,.18); --w-25: rgba(255,255,255,.25);
 }
 
 * { box-sizing: border-box; }
@@ -27,16 +38,24 @@
 /* Light scheme — applied via data-theme (system preference by default, toggle persisted). */
 :root[data-theme='light'] {
   color-scheme: light;
-  --bg: #f2f3f6;
+  --accent-ink: #4f7a06;
+  --bg: #e8eaef;            /* a touch darker so white cards separate clearly */
   --bg-raised: #ffffff;
-  --bg-rail: #e9eaee;
+  --bg-rail: #dcdee4;
   --card: #ffffff;
-  --text: #171a20;
-  --text-soft: #2e333c;
-  --text-mid: #59606d;
-  --text-dim: #79808e;
-  --text-faint: #99a0ac;
-  --line: rgba(0, 0, 0, 0.09);
+  --text: #12151b;
+  --text-soft: #262b33;
+  --text-mid: #454b57;      /* darker: was #59606d — readable secondary text */
+  --text-dim: #626977;      /* darker: was #79808e */
+  --text-faint: #7c8493;    /* darker: was #99a0ac */
+  --line: rgba(0, 0, 0, 0.14);
+  /* Flip the alpha steps to dark-on-light so borders/fills are visible. */
+  --w-015: rgba(0,0,0,.03); --w-02: rgba(0,0,0,.035); --w-03: rgba(0,0,0,.045);
+  --w-04: rgba(0,0,0,.055); --w-045: rgba(0,0,0,.06); --w-05: rgba(0,0,0,.065);
+  --w-06: rgba(0,0,0,.09); --w-07: rgba(0,0,0,.1); --w-08: rgba(0,0,0,.11);
+  --w-09: rgba(0,0,0,.12); --w-1: rgba(0,0,0,.14); --w-12: rgba(0,0,0,.16);
+  --w-14: rgba(0,0,0,.18); --w-15: rgba(0,0,0,.2); --w-16: rgba(0,0,0,.22);
+  --w-18: rgba(0,0,0,.24); --w-25: rgba(0,0,0,.3);
 }
 :root[data-theme='light'] body { background: var(--bg); color: var(--text); }
 :root[data-theme='light'] ::-webkit-scrollbar-thumb { background: rgba(0,0,0,.18); background-clip: content-box; }
@@ -48,8 +67,8 @@ body {
   color: var(--text);
   overflow: hidden;
 }
-a { color: var(--accent); }
-a:hover { color: #d6ff6e; }
+a { color: var(--accent-ink); }
+a:hover { filter: brightness(1.15); }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.1);
@@ -71,11 +90,11 @@ button { all: unset; box-sizing: border-box; max-width: 100%; }
 @keyframes pl-bubble { from { transform: translate(-50%,-100%) translateY(8px) scale(.92); opacity: 0; } to { transform: translate(-50%,-100%); opacity: 1; } }
 
 /* shared hover affordances (design used style-hover) */
-.hover-border:hover { border-color: rgba(255, 255, 255, 0.2) !important; }
+.hover-border:hover { border-color: var(--w-16) !important; }
 .hover-bright:hover { filter: brightness(1.1); }
-.event-row:hover { background: rgba(255, 255, 255, 0.03); border-left-color: rgba(198, 242, 78, 0.5) !important; }
-.rail-add:hover { color: var(--text); border-color: rgba(255, 255, 255, 0.3) !important; }
-.drawer-x:hover { background: rgba(255, 255, 255, 0.08); color: var(--text); }
+.event-row:hover { background: var(--w-03); border-left-color: rgba(198, 242, 78, 0.5) !important; }
+.rail-add:hover { color: var(--text); border-color: var(--w-18) !important; }
+.drawer-x:hover { background: var(--w-08); color: var(--text); }
 
 /* markdown (plan documents) */
 .md { font-size: 12.5px; line-height: 1.65; color: var(--text-soft); }
@@ -85,15 +104,61 @@ button { all: unset; box-sizing: border-box; max-width: 100%; }
 .md p { margin: .55em 0; }
 .md ul, .md ol { margin: .55em 0; padding-left: 1.4em; }
 .md li { margin: .25em 0; }
-.md code { font-family: var(--mono); font-size: .92em; background: rgba(255,255,255,.06); padding: 1px 5px; border-radius: 4px; color: var(--accent); }
-.md pre { background: rgba(0,0,0,.35); border: 1px solid rgba(255,255,255,.08); border-radius: 9px; padding: 10px 12px; overflow-x: auto; margin: .7em 0; }
+.md code { font-family: var(--mono); font-size: .92em; background: var(--w-06); padding: 1px 5px; border-radius: 4px; color: var(--accent-ink); }
+.md pre { background: var(--w-06); border: 1px solid var(--w-08); border-radius: 9px; padding: 10px 12px; overflow-x: auto; margin: .7em 0; }
 .md pre code { background: transparent; padding: 0; color: var(--text-soft); font-size: 11px; line-height: 1.55; }
 .md blockquote { border-left: 3px solid rgba(198,242,78,.4); margin: .7em 0; padding: 2px 0 2px 12px; color: var(--text-mid); }
 .md table { border-collapse: collapse; margin: .7em 0; font-size: 11.5px; display: block; overflow-x: auto; }
-.md th, .md td { border: 1px solid rgba(255,255,255,.1); padding: 5px 9px; text-align: left; }
-.md th { color: var(--text); background: rgba(255,255,255,.04); font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
-.md hr { border: none; border-top: 1px solid rgba(255,255,255,.08); margin: 1em 0; }
-.md a { color: var(--accent); }
+.md th, .md td { border: 1px solid var(--w-1); padding: 5px 9px; text-align: left; }
+.md th { color: var(--text); background: var(--w-04); font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
+.md hr { border: none; border-top: 1px solid var(--w-08); margin: 1em 0; }
+.md a { color: var(--accent-ink); }
 .md strong { color: var(--text); }
 .md-compact { font-size: 11.5px; }
 .md-compact h1, .md-compact h2, .md-compact h3 { font-size: 12px; }
+
+/* -------------------------------------------------------------------------
+   Responsive / mobile. Layout containers use inline grid styles, so these
+   overrides use !important to win. The Rail becomes a slide-over drawer, and
+   multi-column views collapse to a single scrollable column.
+   ------------------------------------------------------------------------- */
+.mobile-topbar { display: none; }
+
+@media (max-width: 860px) {
+  .mobile-topbar {
+    display: flex; align-items: center; gap: 10px; flex: none;
+    height: 50px; padding: 0 12px 0 10px;
+    border-bottom: 1px solid var(--line); background: var(--bg-rail);
+  }
+
+  .rail {
+    position: fixed !important; top: 0; left: 0; bottom: 0; z-index: 80;
+    transform: translateX(-100%); transition: transform .22s ease;
+    box-shadow: 2px 0 30px rgba(0,0,0,.45);
+  }
+  .rail.rail-open { transform: none; }
+  .rail-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 75; }
+
+  /* Mission Control 3-col + Agents 2-col → one scrollable column. */
+  .mc-grid { display: block !important; overflow-y: auto !important; }
+  .mc-grid > * { border-right: none !important; min-height: 62vh; }
+  .mc-grid > *:not(:last-child) { border-bottom: 1px solid var(--line); }
+  .agents-grid { grid-template-columns: 1fr !important; }
+
+  /* Task drawer + centered modals go full-bleed. */
+  .task-drawer { width: 100vw !important; }
+  .modal-card { width: calc(100vw - 24px) !important; max-width: none !important; }
+
+  /* Roomier tap targets, tighter page padding. */
+  .content-pad { padding-left: 14px !important; padding-right: 14px !important; }
+
+  /* TopBar: hide the redundant project block (shown in the mobile bar), let the
+     view tabs scroll horizontally instead of clipping. */
+  .topbar { padding: 0 12px !important; gap: 10px !important; overflow-x: auto; }
+  .topbar-project { display: none !important; }
+}
+
+@media (max-width: 480px) {
+  /* Two-up form grids stack on small phones. */
+  .stack-sm { grid-template-columns: 1fr !important; }
+}

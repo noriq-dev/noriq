@@ -47,9 +47,9 @@ export function PlansView({ store }: { store: AppStore }) {
             <div
               key={plan.id}
               style={{
-                border: '1px solid rgba(255,255,255,.08)',
+                border: '1px solid var(--w-08)',
                 borderRadius: 14,
-                background: 'rgba(255,255,255,.02)',
+                background: 'var(--w-02)',
                 overflow: 'hidden',
               }}
             >
@@ -77,7 +77,7 @@ export function PlansView({ store }: { store: AppStore }) {
                     const isActive = i === activeIdx;
                     return (
                       <div key={ph.id} title={`${ph.title} · ${done}/${ids.length}`} style={{ width: 46 }}>
-                        <div style={{ height: 5, borderRadius: 3, background: 'rgba(255,255,255,.08)', overflow: 'hidden', outline: isActive ? '1px solid rgba(198,242,78,.5)' : 'none' }}>
+                        <div style={{ height: 5, borderRadius: 3, background: 'var(--w-08)', overflow: 'hidden', outline: isActive ? '1px solid rgba(198,242,78,.5)' : 'none' }}>
                           <div style={{ height: '100%', width: `${pct * 100}%`, background: pct === 1 ? 'var(--green)' : 'var(--blue)' }} />
                         </div>
                       </div>
@@ -88,9 +88,9 @@ export function PlansView({ store }: { store: AppStore }) {
 
               {/* expanded: the plan document + stacked phases */}
               {open && (
-                <div style={{ borderTop: '1px solid rgba(255,255,255,.06)' }}>
+                <div style={{ borderTop: '1px solid var(--w-06)' }}>
                   {plan.body && (
-                    <div style={{ padding: '16px 20px', borderBottom: '1px solid rgba(255,255,255,.05)', maxWidth: 780 }}>
+                    <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--w-05)', maxWidth: 780 }}>
                       <Markdown source={plan.body} />
                     </div>
                   )}
@@ -104,8 +104,8 @@ export function PlansView({ store }: { store: AppStore }) {
                         <div
                           key={ph.id}
                           style={{
-                            border: `1px solid ${isActive ? 'rgba(198,242,78,.3)' : 'rgba(255,255,255,.07)'}`,
-                            background: isActive ? 'rgba(198,242,78,.03)' : 'rgba(255,255,255,.015)',
+                            border: `1px solid ${isActive ? 'rgba(198,242,78,.3)' : 'var(--w-07)'}`,
+                            background: isActive ? 'rgba(198,242,78,.03)' : 'var(--w-015)',
                             borderRadius: 11,
                             padding: '13px 15px',
                             opacity: complete ? 0.75 : 1,
@@ -143,7 +143,7 @@ export function PlansView({ store }: { store: AppStore }) {
                                     className="hover-border"
                                     style={{
                                       display: 'flex', alignItems: 'center', gap: 7, padding: '7px 9px',
-                                      borderRadius: 8, background: 'var(--card)', border: '1px solid rgba(255,255,255,.07)', cursor: 'pointer',
+                                      borderRadius: 8, background: 'var(--card)', border: '1px solid var(--w-07)', cursor: 'pointer',
                                     }}
                                   >
                                     <span style={{ width: 7, height: 7, borderRadius: '50%', background: m.dot, flex: 'none' }} />

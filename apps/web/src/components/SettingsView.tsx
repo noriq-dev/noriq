@@ -9,7 +9,7 @@ import { Button, ErrorNote, Field, Select, TextInput } from './ui';
 export function SettingsView({ store }: { store: AppStore }) {
   const isAdmin = store.user?.role === 'admin';
   return (
-    <div style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: '20px 26px' }}>
+    <div className="content-pad" style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: '20px 26px' }}>
       <div style={{ maxWidth: 760, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 28 }}>
         {isAdmin && <UsersSection store={store} />}
         <GroupsSection store={store} />
@@ -23,7 +23,7 @@ export function SettingsView({ store }: { store: AppStore }) {
 
 function Section({ title, action, children }: { title: string; action?: React.ReactNode; children: React.ReactNode }) {
   return (
-    <div style={{ border: '1px solid rgba(255,255,255,.07)', borderRadius: 14, background: 'rgba(255,255,255,.015)', padding: '18px 20px' }}>
+    <div style={{ border: '1px solid var(--w-07)', borderRadius: 14, background: 'var(--w-015)', padding: '18px 20px' }}>
       <div style={{ display: 'flex', alignItems: 'center', marginBottom: 14 }}>
         <SectionLabel>{title}</SectionLabel>
         <div style={{ flex: 1 }} />
@@ -61,7 +61,7 @@ function UsersSection({ store }: { store: AppStore }) {
       action={<Button variant="ghost" style={{ padding: '5px 12px', fontSize: 11.5 }} onClick={() => setAdding(!adding)}>{adding ? 'cancel' : '+ invite user'}</Button>}
     >
       {adding && (
-        <div style={{ border: '1px solid rgba(255,255,255,.08)', borderRadius: 10, padding: 14, marginBottom: 14 }}>
+        <div style={{ border: '1px solid var(--w-08)', borderRadius: 10, padding: 14, marginBottom: 14 }}>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
             <Field label="Name"><TextInput value={name} onChange={(e) => setName(e.target.value)} /></Field>
             <Field label="Email"><TextInput type="email" value={email} onChange={(e) => setEmail(e.target.value)} /></Field>
@@ -82,9 +82,9 @@ function UsersSection({ store }: { store: AppStore }) {
                     onClick={() => toggleGroup(g.id)}
                     style={{
                       cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 10, padding: '3px 9px', borderRadius: 6,
-                      background: groupIds.includes(g.id) ? 'rgba(198,242,78,.12)' : 'rgba(255,255,255,.04)',
+                      background: groupIds.includes(g.id) ? 'rgba(198,242,78,.12)' : 'var(--w-04)',
                       color: groupIds.includes(g.id) ? 'var(--accent)' : 'var(--text-mid)',
-                      border: `1px solid ${groupIds.includes(g.id) ? 'rgba(198,242,78,.35)' : 'rgba(255,255,255,.1)'}`,
+                      border: `1px solid ${groupIds.includes(g.id) ? 'rgba(198,242,78,.35)' : 'var(--w-1)'}`,
                     }}
                   >
                     {g.name}
@@ -122,21 +122,21 @@ function UsersSection({ store }: { store: AppStore }) {
         <div
           onClick={async () => { await navigator.clipboard.writeText(inviteLink.url); }}
           title="click to copy"
-          style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--accent)', background: 'rgba(198,242,78,.06)', border: '1px solid rgba(198,242,78,.25)', borderRadius: 9, padding: '9px 12px', marginBottom: 12, cursor: 'pointer', wordBreak: 'break-all' }}
+          style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--accent-ink)', background: 'rgba(198,242,78,.06)', border: '1px solid rgba(198,242,78,.25)', borderRadius: 9, padding: '9px 12px', marginBottom: 12, cursor: 'pointer', wordBreak: 'break-all' }}
         >
           email not configured — send {inviteLink.name} this link (click to copy): {inviteLink.url}
         </div>
       )}
 
       {tempReveal && (
-        <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--accent)', background: 'rgba(198,242,78,.06)', border: '1px solid rgba(198,242,78,.25)', borderRadius: 9, padding: '9px 12px', marginBottom: 12 }}>
+        <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--accent-ink)', background: 'rgba(198,242,78,.06)', border: '1px solid rgba(198,242,78,.25)', borderRadius: 9, padding: '9px 12px', marginBottom: 12 }}>
           temp password for {tempReveal.name}: <b>{tempReveal.temp}</b> — shown once
         </div>
       )}
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
         {users.map((u) => (
-          <div key={u.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 11px', borderRadius: 9, background: 'rgba(255,255,255,.02)', border: '1px solid rgba(255,255,255,.06)', opacity: u.disabled ? 0.5 : 1 }}>
+          <div key={u.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 11px', borderRadius: 9, background: 'var(--w-02)', border: '1px solid var(--w-06)', opacity: u.disabled ? 0.5 : 1 }}>
             <div style={{ width: 26, height: 26, borderRadius: '50%', background: 'linear-gradient(135deg,#c6f24e,#3fd98b)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, color: 'var(--bg)', fontWeight: 700 }}>
               {u.name.slice(0, 1).toUpperCase()}
             </div>
@@ -148,7 +148,7 @@ function UsersSection({ store }: { store: AppStore }) {
                 {u.email} · {u.ownedProjects} project{u.ownedProjects === 1 ? '' : 's'}
               </div>
             </div>
-            <MonoTag color={u.role === 'admin' ? 'var(--accent)' : 'var(--text-mid)'} bg={u.role === 'admin' ? 'rgba(198,242,78,.12)' : 'rgba(255,255,255,.06)'} size={9.5}>{u.role}</MonoTag>
+            <MonoTag color={u.role === 'admin' ? 'var(--accent)' : 'var(--text-mid)'} bg={u.role === 'admin' ? 'rgba(198,242,78,.12)' : 'var(--w-06)'} size={9.5}>{u.role}</MonoTag>
             {u.pending ? <MonoTag color="var(--amber)" bg="rgba(245,166,35,.12)" size={9.5}>PENDING</MonoTag> : null}
             {u.passkeys > 0 ? <MonoTag color="var(--green)" bg="rgba(63,217,139,.1)" size={9.5}>🔑 {u.passkeys}</MonoTag> : null}
             {u.disabled ? <MonoTag color="var(--red-soft)" bg="rgba(255,92,92,.12)" size={9.5}>DISABLED</MonoTag> : null}
@@ -194,9 +194,9 @@ function UsersSection({ store }: { store: AppStore }) {
                       }}
                       style={{
                         cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 9.5, padding: '2px 8px', borderRadius: 6,
-                        background: memberOf ? 'rgba(198,242,78,.12)' : 'rgba(255,255,255,.04)',
+                        background: memberOf ? 'rgba(198,242,78,.12)' : 'var(--w-04)',
                         color: memberOf ? 'var(--accent)' : 'var(--text-mid)',
-                        border: `1px solid ${memberOf ? 'rgba(198,242,78,.35)' : 'rgba(255,255,255,.1)'}`,
+                        border: `1px solid ${memberOf ? 'rgba(198,242,78,.35)' : 'var(--w-1)'}`,
                       }}
                     >
                       {g.name}
@@ -224,7 +224,7 @@ function GroupsSection({ store }: { store: AppStore }) {
         {groups.map((g) => {
           const count = store.data.projects.filter((p) => p.groupId === g.id).length;
           return (
-            <div key={g.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 11px', borderRadius: 9, background: 'rgba(255,255,255,.02)', border: '1px solid rgba(255,255,255,.06)' }}>
+            <div key={g.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 11px', borderRadius: 9, background: 'var(--w-02)', border: '1px solid var(--w-06)' }}>
               <div style={{ minWidth: 0, flex: 1 }}>
                 <div style={{ fontSize: 12.5, fontWeight: 600 }}>{g.name}</div>
                 <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)' }}>{count} project{count === 1 ? '' : 's'}{g.description ? ` · ${g.description}` : ''}</div>
@@ -291,7 +291,7 @@ function PasskeysSection() {
       )}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
         {passkeys.map((p) => (
-          <div key={p.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 11px', borderRadius: 9, background: 'rgba(255,255,255,.02)', border: '1px solid rgba(255,255,255,.06)' }}>
+          <div key={p.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 11px', borderRadius: 9, background: 'var(--w-02)', border: '1px solid var(--w-06)' }}>
             <span style={{ fontSize: 13 }}>🔑</span>
             <div style={{ flex: 1, fontSize: 12.5, fontWeight: 500 }}>{p.name}</div>
             <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)' }}>{new Date(p.createdAt).toLocaleDateString()}</span>
@@ -334,7 +334,7 @@ function SessionsSection() {
       )}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
         {sessions.map((s) => (
-          <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 11px', borderRadius: 9, background: 'rgba(255,255,255,.02)', border: '1px solid rgba(255,255,255,.06)' }}>
+          <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 11px', borderRadius: 9, background: 'var(--w-02)', border: '1px solid var(--w-06)' }}>
             <span style={{ fontSize: 13 }}>🔌</span>
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontSize: 12.5, fontWeight: 500 }}>{s.clientName}</div>
@@ -388,7 +388,7 @@ function SmallAction({ children, onClick, danger }: { children: React.ReactNode;
   return (
     <button
       onClick={onClick}
-      style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 10, color: danger ? 'var(--red-soft)' : 'var(--text-mid)', border: `1px solid ${danger ? 'rgba(255,92,92,.3)' : 'rgba(255,255,255,.12)'}`, padding: '3px 9px', borderRadius: 6, background: 'transparent' }}
+      style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 10, color: danger ? 'var(--red-soft)' : 'var(--text-mid)', border: `1px solid ${danger ? 'rgba(255,92,92,.3)' : 'var(--w-12)'}`, padding: '3px 9px', borderRadius: 6, background: 'transparent' }}
     >
       {children}
     </button>

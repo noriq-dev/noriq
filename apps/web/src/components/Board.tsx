@@ -54,7 +54,7 @@ export function Board({ store }: { store: AppStore }) {
           className="rail-add"
           style={{
             cursor: 'pointer', flex: 'none', fontFamily: 'var(--mono)', fontSize: 10.5,
-            color: 'var(--text-dim)', border: '1px dashed rgba(255,255,255,.15)',
+            color: 'var(--text-dim)', border: '1px dashed var(--w-15)',
             padding: '4px 10px', borderRadius: 8, background: 'transparent',
           }}
         >
@@ -85,7 +85,7 @@ export function Board({ store }: { store: AppStore }) {
             title="Edit this milestone"
             style={{
               cursor: 'pointer', flex: 'none', fontFamily: 'var(--mono)', fontSize: 10.5,
-              color: 'var(--accent)', border: '1px solid rgba(198,242,78,.3)',
+              color: 'var(--accent-ink)', border: '1px solid rgba(198,242,78,.3)',
               padding: '4px 10px', borderRadius: 8, background: 'rgba(198,242,78,.06)',
             }}
           >
@@ -102,7 +102,7 @@ export function Board({ store }: { store: AppStore }) {
           style={{
             flex: 'none', display: 'flex', alignItems: 'center', gap: 6,
             padding: '0 22px 10px', overflowX: 'auto',
-            borderBottom: '1px solid rgba(255,255,255,.05)',
+            borderBottom: '1px solid var(--w-05)',
           }}
         >
           <span style={{ fontFamily: 'var(--mono)', fontSize: 9, letterSpacing: '.07em', textTransform: 'uppercase', color: 'var(--text-faint)', flex: 'none', marginRight: 2 }}>
@@ -114,7 +114,7 @@ export function Board({ store }: { store: AppStore }) {
             className="rail-add"
             style={{
               cursor: 'pointer', flex: 'none', fontFamily: 'var(--mono)', fontSize: 10,
-              color: 'var(--text-dim)', border: '1px dashed rgba(255,255,255,.15)',
+              color: 'var(--text-dim)', border: '1px dashed var(--w-15)',
               padding: '3px 9px', borderRadius: 8, background: 'transparent',
             }}
           >
@@ -156,7 +156,7 @@ export function Board({ store }: { store: AppStore }) {
                   <span style={{ width: 8, height: 8, borderRadius: '50%', background: m.dot }} />
                   <span style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-soft)' }}>{label}</span>
                   <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-faint)' }}>{list.length}</span>
-                  <div style={{ flex: 1, height: 1, background: 'rgba(255,255,255,.05)' }} />
+                  <div style={{ flex: 1, height: 1, background: 'var(--w-05)' }} />
                 </div>
                 <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10, paddingRight: 2 }}>
                   {list.map((t) => {
@@ -180,8 +180,8 @@ export function Board({ store }: { store: AppStore }) {
                         className="hover-border"
                         style={{
                           background: 'var(--card)',
-                          border: '1px solid rgba(255,255,255,.06)',
-                          borderLeft: `3px solid ${taskTags[0]?.color ?? 'rgba(255,255,255,.08)'}`,
+                          border: '1px solid var(--w-06)',
+                          borderLeft: `3px solid ${taskTags[0]?.color ?? 'var(--w-08)'}`,
                           borderRadius: 10,
                           padding: '12px 13px',
                           cursor: 'grab',
@@ -200,7 +200,7 @@ export function Board({ store }: { store: AppStore }) {
                             <MonoTag color="var(--amber)" bg="rgba(245,166,35,.12)" size={9.5}>{t.openComments} ?</MonoTag>
                           )}
                         </div>
-                        <div style={{ fontSize: 12.5, lineHeight: 1.45, color: '#e0e2e6' }}>{t.title}</div>
+                        <div style={{ fontSize: 12.5, lineHeight: 1.45, color: 'var(--text)' }}>{t.title}</div>
                         {(taskTags.length > 0 || ag || blocked || (ms && msFilter === null)) && (
                           <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 9, flexWrap: 'wrap' }}>
                             {taskTags.map((tg) => (
@@ -230,7 +230,7 @@ export function Board({ store }: { store: AppStore }) {
                               <span
                                 style={{
                                   fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)',
-                                  border: '1px solid rgba(255,255,255,.08)', padding: '1px 6px', borderRadius: 4,
+                                  border: '1px solid var(--w-08)', padding: '1px 6px', borderRadius: 4,
                                   whiteSpace: 'nowrap', maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis',
                                 }}
                               >
@@ -257,7 +257,7 @@ function SearchBox({ value, onChange }: { value: string; onChange: (v: string) =
     <div
       style={{
         flex: 'none', display: 'flex', alignItems: 'center', gap: 6,
-        background: 'rgba(255,255,255,.03)', border: '1px solid rgba(255,255,255,.08)',
+        background: 'var(--w-03)', border: '1px solid var(--w-08)',
         borderRadius: 8, padding: '0 8px', height: 28, width: 210, maxWidth: '32vw',
       }}
     >
@@ -302,9 +302,9 @@ function FilterChip({ label, meta, pct, dot, active, small, onClick }: {
         borderRadius: 8,
         fontSize: small ? 10.5 : 11.5,
         fontWeight: 500,
-        background: active ? 'rgba(198,242,78,.1)' : 'rgba(255,255,255,.03)',
+        background: active ? 'rgba(198,242,78,.1)' : 'var(--w-03)',
         color: active ? 'var(--accent)' : 'var(--text-mid)',
-        border: `1px solid ${active ? 'rgba(198,242,78,.35)' : 'rgba(255,255,255,.07)'}`,
+        border: `1px solid ${active ? 'rgba(198,242,78,.35)' : 'var(--w-07)'}`,
         whiteSpace: 'nowrap',
       }}
     >
@@ -314,7 +314,7 @@ function FilterChip({ label, meta, pct, dot, active, small, onClick }: {
         <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: active ? 'var(--accent)' : 'var(--text-faint)' }}>{meta}</span>
       )}
       {pct !== undefined && (
-        <span style={{ width: 30, height: 3, borderRadius: 2, background: 'rgba(255,255,255,.1)', overflow: 'hidden' }}>
+        <span style={{ width: 30, height: 3, borderRadius: 2, background: 'var(--w-1)', overflow: 'hidden' }}>
           <span style={{ display: 'block', height: '100%', width: `${pct * 100}%`, background: pct === 1 ? 'var(--green)' : 'var(--blue)' }} />
         </span>
       )}

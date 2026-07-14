@@ -38,8 +38,8 @@ export function Login({ store }: { store: AppStore }) {
   const field = {
     boxSizing: 'border-box' as const,
     width: '100%',
-    background: 'rgba(255,255,255,.05)',
-    border: '1px solid rgba(255,255,255,.1)',
+    background: 'var(--w-05)',
+    border: '1px solid var(--w-1)',
     borderRadius: 9,
     padding: '10px 12px',
     color: 'var(--text)',
@@ -88,16 +88,16 @@ export function Login({ store }: { store: AppStore }) {
             {busy ? 'signing in…' : 'Sign in'}
           </button>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '2px 0' }}>
-            <span style={{ flex: 1, height: 1, background: 'rgba(255,255,255,.08)' }} />
+            <span style={{ flex: 1, height: 1, background: 'var(--w-08)' }} />
             <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)' }}>or</span>
-            <span style={{ flex: 1, height: 1, background: 'rgba(255,255,255,.08)' }} />
+            <span style={{ flex: 1, height: 1, background: 'var(--w-08)' }} />
           </div>
           <button
             onClick={passkeySignIn}
             className="hover-bright"
             style={{
-              cursor: 'pointer', textAlign: 'center', background: 'rgba(255,255,255,.05)',
-              color: 'var(--text)', border: '1px solid rgba(255,255,255,.12)', fontWeight: 600,
+              cursor: 'pointer', textAlign: 'center', background: 'var(--w-05)',
+              color: 'var(--text)', border: '1px solid var(--w-12)', fontWeight: 600,
               fontSize: 13, padding: 11, borderRadius: 9, opacity: busy ? 0.6 : 1,
             }}
           >

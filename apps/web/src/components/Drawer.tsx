@@ -88,9 +88,10 @@ export function Drawer({ store }: { store: AppStore }) {
     <>
       <div onClick={actions.closeTask} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', zIndex: 40 }} />
       <div
+        className="task-drawer"
         style={{
-          position: 'fixed', top: 0, right: 0, bottom: 0, width: 480,
-          background: 'var(--bg-raised)', borderLeft: '1px solid rgba(255,255,255,.1)', zIndex: 41,
+          position: 'fixed', top: 0, right: 0, bottom: 0, width: 480, maxWidth: '100vw',
+          background: 'var(--bg-raised)', borderLeft: '1px solid var(--w-1)', zIndex: 41,
           display: 'flex', flexDirection: 'column',
           animation: 'pl-drawer .28s cubic-bezier(.22,1,.36,1) both',
           boxShadow: '-20px 0 60px rgba(0,0,0,.5)',
@@ -100,10 +101,10 @@ export function Drawer({ store }: { store: AppStore }) {
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, flexWrap: 'wrap' }}>
             <MonoTag color={m.color} bg={m.bg} size={11}>{task.key}</MonoTag>
             <MonoTag color={m.color} bg={m.bg} size={10.5}>{m.label}</MonoTag>
-            <MonoTag color={task.type === 'bug' ? 'var(--red-soft)' : 'var(--text-mid)'} bg="rgba(255,255,255,.05)" size={10}>{task.type}</MonoTag>
-            {milestone && <MonoTag color="var(--text-mid)" bg="rgba(255,255,255,.05)" size={10}>{milestone.title}</MonoTag>}
+            <MonoTag color={task.type === 'bug' ? 'var(--red-soft)' : 'var(--text-mid)'} bg="var(--w-05)" size={10}>{task.type}</MonoTag>
+            {milestone && <MonoTag color="var(--text-mid)" bg="var(--w-05)" size={10}>{milestone.title}</MonoTag>}
             {taskTags.map((t) => (
-              <MonoTag key={t.id} color={t.color} bg="rgba(255,255,255,.04)" size={10}>{t.name}</MonoTag>
+              <MonoTag key={t.id} color={t.color} bg="var(--w-04)" size={10}>{t.name}</MonoTag>
             ))}
             {addingTag ? (
               <input
@@ -123,7 +124,7 @@ export function Drawer({ store }: { store: AppStore }) {
                 }}
                 placeholder="tag…"
                 style={{
-                  width: 90, background: 'rgba(255,255,255,.06)', border: '1px solid rgba(255,255,255,.15)',
+                  width: 90, background: 'var(--w-06)', border: '1px solid var(--w-15)',
                   borderRadius: 5, padding: '2px 7px', color: 'var(--text)', fontSize: 10.5,
                   fontFamily: 'var(--mono)', outline: 'none',
                 }}
@@ -134,7 +135,7 @@ export function Drawer({ store }: { store: AppStore }) {
                 title="Add tag"
                 style={{
                   cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)',
-                  border: '1px dashed rgba(255,255,255,.18)', padding: '1px 7px', borderRadius: 5, background: 'transparent',
+                  border: '1px dashed var(--w-18)', padding: '1px 7px', borderRadius: 5, background: 'transparent',
                 }}
                 className="rail-add"
               >
@@ -227,7 +228,7 @@ export function Drawer({ store }: { store: AppStore }) {
                       style={{
                         display: 'inline-flex', alignItems: 'center', gap: 5,
                         fontFamily: 'var(--mono)', fontSize: 10.5, color: sm.color,
-                        background: 'rgba(255,255,255,.03)', border: `1px solid ${sm.color}44`,
+                        background: 'var(--w-03)', border: `1px solid ${sm.color}44`,
                         padding: '2px 4px 2px 7px', borderRadius: 6,
                       }}
                     >
@@ -282,7 +283,7 @@ export function Drawer({ store }: { store: AppStore }) {
                     disabled={eligibleDeps.length === 0}
                     title={eligibleDeps.length ? 'Add a dependency' : 'no other tasks to depend on'}
                     className="rail-add"
-                    style={{ cursor: eligibleDeps.length ? 'pointer' : 'default', fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', border: '1px dashed rgba(255,255,255,.15)', padding: '2px 7px', borderRadius: 6, background: 'transparent' }}
+                    style={{ cursor: eligibleDeps.length ? 'pointer' : 'default', fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', border: '1px dashed var(--w-15)', padding: '2px 7px', borderRadius: 6, background: 'transparent' }}
                   >
                     {deps.length ? '+ dep' : '+ add dependency'}
                   </button>
@@ -317,7 +318,7 @@ export function Drawer({ store }: { store: AppStore }) {
                   const gate = s.type === 'input_request';
                   const accent = gate ? 'var(--accent)' : s.severity === 'critical' ? 'var(--red-soft)' : s.severity === 'warning' ? 'var(--amber)' : 'var(--blue)';
                   return (
-                    <div key={s.id} style={{ border: `1px solid ${accent}44`, borderLeft: `3px solid ${accent}`, borderRadius: 8, background: 'rgba(255,255,255,.02)', padding: '9px 11px' }}>
+                    <div key={s.id} style={{ border: `1px solid ${accent}44`, borderLeft: `3px solid ${accent}`, borderRadius: 8, background: 'var(--w-02)', padding: '9px 11px' }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 4 }}>
                         <MonoTag color={accent} bg={`${accent}1a`} size={8.5}>{gate ? 'DECISION' : s.severity.toUpperCase()}</MonoTag>
                         <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>{s.agentName}</span>
@@ -328,12 +329,12 @@ export function Drawer({ store }: { store: AppStore }) {
                         {gate ? (
                           <>
                             {(s.options ?? []).map((opt) => (
-                              <button key={opt} onClick={() => void actions.answerSignal(s.id, opt)} style={{ cursor: 'pointer', fontSize: 11, color: 'var(--accent)', background: 'rgba(198,242,78,.08)', border: '1px solid rgba(198,242,78,.35)', borderRadius: 6, padding: '3px 9px' }}>{opt}</button>
+                              <button key={opt} onClick={() => void actions.answerSignal(s.id, opt)} style={{ cursor: 'pointer', fontSize: 11, color: 'var(--accent-ink)', background: 'rgba(198,242,78,.08)', border: '1px solid rgba(198,242,78,.35)', borderRadius: 6, padding: '3px 9px' }}>{opt}</button>
                             ))}
                             <SignalAnswer onAnswer={(v) => void actions.answerSignal(s.id, v)} />
                           </>
                         ) : (
-                          <button onClick={() => void actions.acknowledgeSignal(s.id)} style={{ cursor: 'pointer', fontSize: 11, color: 'var(--text-soft)', background: 'rgba(255,255,255,.04)', border: '1px solid rgba(255,255,255,.1)', borderRadius: 6, padding: '3px 10px' }}>Acknowledge</button>
+                          <button onClick={() => void actions.acknowledgeSignal(s.id)} style={{ cursor: 'pointer', fontSize: 11, color: 'var(--text-soft)', background: 'var(--w-04)', border: '1px solid var(--w-1)', borderRadius: 6, padding: '3px 10px' }}>Acknowledge</button>
                         )}
                       </div>
                     </div>
@@ -349,7 +350,7 @@ export function Drawer({ store }: { store: AppStore }) {
             <div style={{ flex: 1 }} />
             <button
               onClick={() => fileRef.current?.click()}
-              style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)', border: '1px dashed rgba(255,255,255,.15)', padding: '3px 9px', borderRadius: 6, background: 'transparent' }}
+              style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)', border: '1px dashed var(--w-15)', padding: '3px 9px', borderRadius: 6, background: 'transparent' }}
               className="rail-add"
             >
               + upload
@@ -371,7 +372,7 @@ export function Drawer({ store }: { store: AppStore }) {
                 const url = `/api/attachments/${att.id}`;
                 const isImage = (att.contentType ?? '').startsWith('image/');
                 return (
-                  <div key={att.id} style={{ borderRadius: 8, background: 'rgba(255,255,255,.02)', border: '1px solid rgba(255,255,255,.06)', overflow: 'hidden' }}>
+                  <div key={att.id} style={{ borderRadius: 8, background: 'var(--w-02)', border: '1px solid var(--w-06)', overflow: 'hidden' }}>
                     {isImage && (
                       // Inline preview — click to open full size in a new tab.
                       <a href={url} target="_blank" rel="noreferrer" style={{ display: 'block' }}>
@@ -439,8 +440,8 @@ export function Drawer({ store }: { store: AppStore }) {
                     <div
                       style={{
                         fontSize: 12.5, lineHeight: 1.55, color: 'var(--text-soft)',
-                        background: c.role === 'agent' ? 'rgba(76,157,255,.06)' : 'rgba(255,255,255,.03)',
-                        border: `1px solid ${c.role === 'agent' ? 'rgba(76,157,255,.18)' : 'rgba(255,255,255,.07)'}`,
+                        background: c.role === 'agent' ? 'rgba(76,157,255,.06)' : 'var(--w-03)',
+                        border: `1px solid ${c.role === 'agent' ? 'rgba(76,157,255,.18)' : 'var(--w-07)'}`,
                         borderRadius: 10, padding: '9px 12px',
                       }}
                     >
@@ -495,7 +496,7 @@ function SignalAnswer({ onAnswer }: { onAnswer: (v: string) => void }) {
         onChange={(e) => setV(e.target.value)}
         onKeyDown={(e) => { if (e.key === 'Enter' && v.trim()) { onAnswer(v.trim()); setV(''); } }}
         placeholder="your decision…"
-        style={{ flex: 1, minWidth: 0, background: 'rgba(255,255,255,.03)', border: '1px solid rgba(255,255,255,.1)', borderRadius: 6, padding: '3px 8px', color: 'var(--text)', fontSize: 11.5 }}
+        style={{ flex: 1, minWidth: 0, background: 'var(--w-03)', border: '1px solid var(--w-1)', borderRadius: 6, padding: '3px 8px', color: 'var(--text)', fontSize: 11.5 }}
       />
       <button disabled={!v.trim()} onClick={() => { onAnswer(v.trim()); setV(''); }}
         style={{ cursor: v.trim() ? 'pointer' : 'default', fontSize: 11, fontWeight: 600, color: '#0a0b0d', background: 'var(--accent)', border: 'none', borderRadius: 6, padding: '3px 10px', opacity: v.trim() ? 1 : 0.4 }}>
@@ -507,7 +508,7 @@ function SignalAnswer({ onAnswer }: { onAnswer: (v: string) => void }) {
 
 function MetaCell({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div style={{ background: 'rgba(255,255,255,.03)', border: '1px solid rgba(255,255,255,.06)', borderRadius: 9, padding: '10px 12px' }}>
+    <div style={{ background: 'var(--w-03)', border: '1px solid var(--w-06)', borderRadius: 9, padding: '10px 12px' }}>
       <div
         style={{
           fontFamily: 'var(--mono)', fontSize: 9.5, textTransform: 'uppercase', letterSpacing: '.07em',
