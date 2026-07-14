@@ -439,8 +439,18 @@ app.post('/api/projects/:pid/tasks/:tid/release', userAuth, async (c) => {
 });
 
 // --- groups (collections of projects) ----------------------------------------------
+// Authorization (PLNR-81): a group is adjustable only by its members (rows in
+// user_groups) or an admin. Non-members can't even see groups they don't belong to.
+const isGroupMember = async (env: Env, userId: string, gid: string) =>
+  !!(await env.DB.prepare('SELECT 1 FROM user_groups WHERE user_id = ? AND group_id = ?').bind(userId, gid).first());
+
 app.get('/api/groups', userAuth, async (c) => {
-  const { results } = await c.env.DB.prepare('SELECT id, name, description, "order" FROM groups ORDER BY "order", created_at').all();
+  const u = c.var.user!;
+  const { results } = u.role === 'admin'
+    ? await c.env.DB.prepare('SELECT id, name, description, "order" FROM groups ORDER BY "order", created_at').all()
+    : await c.env.DB.prepare(
+        'SELECT id, name, description, "order" FROM groups WHERE id IN (SELECT group_id FROM user_groups WHERE user_id = ?) ORDER BY "order", created_at',
+      ).bind(u.id).all();
   return c.json({ groups: results });
 });
 
@@ -450,6 +460,9 @@ app.post('/api/groups', userAuth, async (c) => {
   const id = newId('grp');
   await c.env.DB.prepare('INSERT INTO groups (id, name, description, created_at) VALUES (?, ?, ?, ?)')
     .bind(id, body.name, body.description ?? '', nowIso()).run();
+  // The creator becomes a member so they can manage (and see) the group they made.
+  await c.env.DB.prepare('INSERT OR IGNORE INTO user_groups (user_id, group_id) VALUES (?, ?)')
+    .bind(c.var.user!.id, id).run();
   return c.json({ id, name: body.name });
 });
 
@@ -576,21 +589,31 @@ app.post('/api/auth/change-password', userAuth, async (c) => {
 
 // --- group management -----------------------------------------------------------------
 app.patch('/api/groups/:gid', userAuth, async (c) => {
+  const u = c.var.user!;
+  const gid = c.req.param('gid')!;
+  if (u.role !== 'admin' && !(await isGroupMember(c.env, u.id, gid))) {
+    return c.json({ error: 'only a group member can edit this group' }, 403);
+  }
   const { name, description } = await c.req.json<{ name?: string; description?: string }>();
   const sets: string[] = [];
   const binds: unknown[] = [];
   if (name !== undefined) { sets.push('name = ?'); binds.push(name); }
   if (description !== undefined) { sets.push('description = ?'); binds.push(description); }
   if (!sets.length) return c.json({ ok: true });
-  binds.push(c.req.param('gid')!);
+  binds.push(gid);
   await c.env.DB.prepare(`UPDATE groups SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
   return c.json({ ok: true });
 });
 
 app.delete('/api/groups/:gid', userAuth, async (c) => {
+  const u = c.var.user!;
   const gid = c.req.param('gid')!;
+  if (u.role !== 'admin' && !(await isGroupMember(c.env, u.id, gid))) {
+    return c.json({ error: 'only a group member can delete this group' }, 403);
+  }
   await c.env.DB.batch([
     c.env.DB.prepare('UPDATE projects SET group_id = NULL WHERE group_id = ?').bind(gid),
+    c.env.DB.prepare('DELETE FROM user_groups WHERE group_id = ?').bind(gid),
     c.env.DB.prepare('DELETE FROM groups WHERE id = ?').bind(gid),
   ]);
   return c.json({ ok: true });

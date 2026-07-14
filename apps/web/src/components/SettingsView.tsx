@@ -45,6 +45,7 @@ function UsersSection({ store }: { store: AppStore }) {
   const [tempReveal, setTempReveal] = useState<{ name: string; temp: string } | null>(null);
   const [inviteLink, setInviteLink] = useState<{ name: string; url: string } | null>(null);
   const [editGroupsFor, setEditGroupsFor] = useState<string | null>(null);
+  const [inviting, setInviting] = useState(false);
 
   const load = () => api.users().then((r) => setUsers(r.users)).catch(() => {});
   useEffect(() => {
@@ -99,9 +100,10 @@ function UsersSection({ store }: { store: AppStore }) {
           </div>
           <ErrorNote>{error}</ErrorNote>
           <Button
-            disabled={!name.trim() || !/\S+@\S+/.test(email)}
+            disabled={inviting || !name.trim() || !/\S+@\S+/.test(email)}
             onClick={async () => {
               setError(null);
+              setInviting(true);
               try {
                 const r = await api.invite(email.trim(), name.trim(), role, groupIds);
                 if (!r.emailed && r.inviteUrl) setInviteLink({ name: name.trim(), url: r.inviteUrl });
@@ -110,10 +112,12 @@ function UsersSection({ store }: { store: AppStore }) {
                 load();
               } catch (e) {
                 setError(e instanceof Error ? e.message : String(e));
+              } finally {
+                setInviting(false);
               }
             }}
           >
-            Send invite
+            {inviting ? 'Sending invite…' : 'Send invite'}
           </Button>
         </div>
       )}
