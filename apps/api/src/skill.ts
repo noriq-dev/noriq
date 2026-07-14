@@ -56,17 +56,30 @@ decision (tie it to the task), \`raise_alert\` when something is wrong and needs
 \`send_message\` for a narrative progress update that wants no answer. Don't bury a blocking
 question inside a \`send_message\` — it reads as status and no one will reply.
 
-## Orchestrating
+## Planning
 
-You won't work a whole project — write a **plan** instead. A plan is a real
-document: \`create_plan\` takes a markdown \`body\` (goals, context, approach,
-constraints, risks, exit gate — what a teammate needs to pick the work up) plus
-ordered **phases**, each with its own \`body\` and its tasks (existing by key, or
-created inline). Phase order is enforced — tasks in phase N auto-depend on all of
-phase N-1, so workers can only claim in sequence. As work progresses, keep the
-document alive with \`update_plan\` (status updates, findings, gotchas, outcome).
-For a quick subtree, \`decompose_task\`; for ad-hoc ordering, \`add_dependency\`;
-to coordinate, \`send_message\`. Check progress with \`get_plans\`.
+Anything bigger than a single task starts with a **plan** — don't open-loop into
+claiming. Think the whole pass through first (in plan mode, if your client has one):
+the goal, the approach, the phases it breaks into, and the tasks under each. Then
+**write that plan into Noriq** so humans can see it coming and workers can drain it.
+The plan you'd write in plan mode maps onto \`create_plan\` one-to-one:
+
+- \`body\` — your full written readout in markdown: goals, context, approach,
+  constraints, risks, and the **exit gate** (what "done" means). This is the core plan
+  a teammate reads to pick the work up. Humans watch it in the Plans view.
+- \`phases[]\` (ordered, up to 12) — each a stage of the pass, with its own \`body\`
+  (what / how / done-when) and its tasks: \`newTasks\` created inline (title, body,
+  priority) or \`taskIds\` for ones that already exist.
+
+Phase order is **enforced**: every task in phase N auto-depends on all of phase N-1, so
+the plan becomes a dependency-ordered work tree — workers (you, later, or others) can
+only claim in sequence and drain it via \`next_claimable\`. Keep the document alive as you
+go with \`update_plan\` (status, findings, gotchas, final outcome; pass the full new body,
+or a \`phaseId\` to revise one phase).
+
+For a quick subtree without the ceremony, \`decompose_task\`; for ad-hoc ordering,
+\`add_dependency\`; to coordinate mid-flight, \`send_message\`. Check progress with
+\`get_plans\`.
 
 ## Git
 
