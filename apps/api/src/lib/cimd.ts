@@ -72,14 +72,26 @@ export async function resolveCimdClient(env: Env, clientId: string, doFetch: typ
   try {
     res = await doFetch(url.toString(), {
       method: 'GET',
-      headers: { Accept: 'application/json' },
-      redirect: 'error', // the document must live at the client_id URL exactly
+      // A User-Agent avoids UA-less bot blocks; follow redirects (some hosts, incl.
+      // ChatGPT, redirect edge fetches). We re-check the final host for SSRF below
+      // and still require doc.client_id to equal the original URL, so following a
+      // redirect can't let a document from a different identity through.
+      headers: { Accept: 'application/json', 'User-Agent': 'Noriq-MCP/1.0 (+https://plan.frs.llc)' },
+      redirect: 'follow',
       signal: ctrl.signal,
     });
-  } catch {
-    throw new Error('could not fetch client metadata document');
+  } catch (e) {
+    throw new Error(`could not fetch client metadata document (${e instanceof Error ? e.message : String(e)})`);
   } finally {
     clearTimeout(timer);
+  }
+  // Guard redirect-to-internal SSRF: the URL we ended up at must also be allowed.
+  try {
+    const finalHost = new URL(res.url || url.toString()).hostname;
+    if (hostIsBlocked(finalHost)) throw new Error('client metadata document redirected to a disallowed host');
+    if (allow.length && !allow.includes(finalHost.toLowerCase())) throw new Error('client metadata document redirected off the allowlist');
+  } catch (e) {
+    if (e instanceof Error && e.message.startsWith('client metadata')) throw e;
   }
   if (!res.ok) throw new Error(`client metadata document returned ${res.status}`);
 
