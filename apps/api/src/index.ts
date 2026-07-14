@@ -7,6 +7,7 @@ import { buildMcpServer } from './mcp';
 import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot } from './backup';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, verifyPassword } from './lib/util';
+import { USER_PROJECT_WHERE } from './lib/visibility';
 import type { Actor } from './do/ProjectRoom';
 import { SKILL_MD } from './skill';
 import { metadataRoutes, oauth } from './oauth';
@@ -232,16 +233,23 @@ const VISIBILITY_WHERE = `(
 
 app.get('/api/projects', userAuth, async (c) => {
   const u = c.var.user!;
-  const { results } = await c.env.DB.prepare(
-    `SELECT p.id, p.key, p.name, p.description, p.status, p.repo_url AS repoUrl, p.group_id AS groupId,
-            p.owner_user_id AS ownerUserId,
+  // PLNR-83: admins see only their own projects by default (owning all of them is
+  // noise); `?scope=all` opts into the admin-wide view. Non-admins always get the
+  // user-scoped set. `admin` in the response tells the UI it may offer admin view.
+  const adminAll = u.role === 'admin' && c.req.query('scope') === 'all';
+  const select = `SELECT p.id, p.key, p.name, p.description, p.status, p.repo_url AS repoUrl, p.group_id AS groupId,
+            p.owner_user_id AS ownerUserId, ou.name AS ownerName,
             (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'in_progress') AS liveTasks,
             (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status NOT IN ('done','cancelled')) AS openTasks,
             (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) AS totalTasks,
-            (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'done') AS doneTasks
-     FROM projects p WHERE p.status = 'active' AND ${VISIBILITY_WHERE} ORDER BY p.created_at`,
-  ).bind(u.role, u.id, u.id).all();
-  return c.json({ projects: results });
+            (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'done') AS doneTasks,
+            (SELECT COUNT(*) FROM agents a WHERE a.project_id = p.id AND a.status != 'revoked') AS agentCount
+     FROM projects p LEFT JOIN users ou ON ou.id = p.owner_user_id`;
+  const stmt = adminAll
+    ? c.env.DB.prepare(`${select} WHERE p.status = 'active' ORDER BY p.created_at`)
+    : c.env.DB.prepare(`${select} WHERE p.status = 'active' AND ${USER_PROJECT_WHERE} ORDER BY p.created_at`).bind(u.id);
+  const { results } = await stmt.all();
+  return c.json({ projects: results, admin: u.role === 'admin' });
 });
 
 app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {

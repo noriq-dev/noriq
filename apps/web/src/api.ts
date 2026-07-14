@@ -27,7 +27,7 @@ export const api = {
     req<{ user: import('./types').UserVM }>('POST', '/api/auth/login', { email, password }),
   logout: () => req('POST', '/api/auth/logout'),
 
-  projects: () => req<{ projects: ApiProject[] }>('GET', '/api/projects'),
+  projects: (scope?: 'all') => req<{ projects: ApiProject[]; admin: boolean }>('GET', scope === 'all' ? '/api/projects?scope=all' : '/api/projects'),
   snapshot: (pid: string, includeArchived = false) => req<ApiSnapshot>('GET', `/api/projects/${pid}/snapshot${includeArchived ? '?archived=1' : ''}`),
   archiveTask: (pid: string, tid: string) => req('POST', `/api/projects/${pid}/tasks/${tid}/archive`),
   restoreTask: (pid: string, tid: string) => req('POST', `/api/projects/${pid}/tasks/${tid}/restore`),
@@ -132,6 +132,9 @@ export interface ApiProject {
   totalTasks: number;
   doneTasks: number;
   groupId: string | null;
+  ownerUserId: string | null;
+  ownerName: string | null;
+  agentCount: number;
 }
 
 export interface ApiUser {

@@ -24,6 +24,7 @@ export function Rail({ store, open, onNavigate }: { store: AppStore; open?: bool
     selectProject: (id: string) => { rawActions.selectProject(id); onNavigate?.(); },
     createProject: () => { rawActions.createProject(); onNavigate?.(); },
     setView: (v: Parameters<typeof rawActions.setView>[0]) => { rawActions.setView(v); onNavigate?.(); },
+    openAdmin: () => { rawActions.openAdmin(); onNavigate?.(); },
   };
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>(loadCollapsed);
   const ungrouped = data.projects.filter((p) => !p.groupId);
@@ -118,6 +119,7 @@ export function Rail({ store, open, onNavigate }: { store: AppStore; open?: bool
       {/* footer */}
       <div style={{ flex: 'none', borderTop: '1px solid var(--w-06)', padding: 8 }}>
         <FooterRow icon="+" label="New project" onClick={() => actions.createProject()} />
+        {store.isAdmin && <FooterRow icon="◈" label="Admin" onClick={() => actions.openAdmin()} />}
         <FooterRow icon="⚙" label="Settings" onClick={() => actions.setView('settings')} />
         <div style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 8px' }}>
           <div

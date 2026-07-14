@@ -6,6 +6,8 @@ export interface AgentIdentity {
   id: string;
   name: string;
   role: 'orchestrator' | 'worker';
+  /** The user this agent acts on behalf of — its MCP access is scoped to them (PLNR-83). */
+  userId: string;
 }
 
 /** An authorized OAuth credential (one `claude mcp add`). Many agents (sessions) share one. */
@@ -69,7 +71,7 @@ export async function agentAuth(c: Context<AppContext>, next: Next) {
   }>();
   if (!t) return unauthorized('invalid, expired, or revoked token — connect via OAuth');
 
-  const defaultAgent: AgentIdentity = { id: t.agentId, name: t.agentName, role: t.agentRole };
+  const defaultAgent: AgentIdentity = { id: t.agentId, name: t.agentName, role: t.agentRole, userId: t.userId };
   c.set('oauthTokenId', t.tokenId);
   c.set('connection', { tokenId: t.tokenId, userId: t.userId, clientId: t.clientId, clientName: t.clientName, defaultAgent });
   // Legacy fallback identity; the /mcp route resolves the real per-session agent.
@@ -87,7 +89,7 @@ const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(
  */
 export async function resolveSessionAgent(env: Env, conn: Connection, sessionId: string): Promise<AgentIdentity> {
   const existing = await env.DB.prepare(
-    `SELECT id, COALESCE(label, name) AS name, role FROM agents WHERE session_id = ? AND status != 'revoked'`,
+    `SELECT id, COALESCE(label, name) AS name, role, user_id AS userId FROM agents WHERE session_id = ? AND status != 'revoked'`,
   ).bind(sessionId).first<AgentIdentity>();
   if (existing) return existing;
   const id = newId('agt');
@@ -99,7 +101,7 @@ export async function resolveSessionAgent(env: Env, conn: Connection, sessionId:
     `INSERT INTO agents (id, name, role, status, user_id, oauth_token_id, session_id, api_key_hash, created_at)
      VALUES (?, ?, 'worker', 'idle', ?, ?, ?, ?, ?)`,
   ).bind(id, name, conn.userId, conn.tokenId, sessionId, await sha256Hex(crypto.randomUUID()), nowIso()).run();
-  return { id, name, role: 'worker' };
+  return { id, name, role: 'worker', userId: conn.userId };
 }
 
 /** Admin-token auth for bootstrap/ops endpoints (agent key issuance, user creation). */

@@ -1,6 +1,6 @@
 // Live store — REST snapshots + WebSocket invalidation. Replaces the Phase-0 mock.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, type ApiSnapshot } from './api';
+import { api, type ApiProject, type ApiSnapshot } from './api';
 import type { AppData, CommentKind, EventVM, ProjectVM, TaskStatus, TaskVM, UserVM, ViewId } from './types';
 
 const PALETTE = ['#4c9dff', '#b57bff', '#3fd98b', '#ff8a8a', '#c6f24e', '#f5a623'];
@@ -45,7 +45,7 @@ function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
   return { id: e.id, t: timeOf(e.createdAt), actor, actorKind: e.actorKind, verb, subject, taskId };
 }
 
-const VIEWS: ViewId[] = ['home', 'control', 'graph', 'board', 'plans', 'agents', 'settings'];
+const VIEWS: ViewId[] = ['home', 'control', 'graph', 'board', 'plans', 'agents', 'settings', 'admin'];
 
 function parseUrl(): { pid: string | null; view: ViewId; task: string | null } {
   const m = location.pathname.match(/^\/p\/([^/]+)(?:\/([a-z]+))?/);
@@ -73,6 +73,8 @@ export function useAppStore() {
   const [draftText, setDraftText] = useState('');
   const [draggedId, setDraggedId] = useState<string | null>(null);
   const [projects, setProjects] = useState<ProjectVM[]>([]);
+  const [adminProjects, setAdminProjects] = useState<ProjectVM[]>([]);
+  const [isAdmin, setIsAdmin] = useState(false);
   const [snapshot, setSnapshot] = useState<ApiSnapshot | null>(null);
   const [comments, setComments] = useState<TaskVM['comments']>([]);
   const [tick, setTick] = useState(0);
@@ -126,23 +128,36 @@ export function useAppStore() {
   }, []);
 
   // --- data loading -----------------------------------------------------------
+  const toProjectVM = (p: ApiProject, i: number): ProjectVM => ({
+    id: p.id,
+    key: p.key,
+    name: p.name,
+    phase: p.description || '',
+    dotColor: PROJECT_COLORS[i % PROJECT_COLORS.length]!,
+    badge: p.key.slice(0, 2),
+    hasLive: p.liveTasks > 0,
+    groupId: p.groupId,
+    openTasks: p.openTasks,
+    totalTasks: p.totalTasks,
+    doneTasks: p.doneTasks,
+    ownerName: p.ownerName,
+    agentCount: p.agentCount,
+  });
+
   const loadProjects = useCallback(async () => {
     const r = await api.projects();
-    const vms = r.projects.map((p, i) => ({
-      id: p.id,
-      key: p.key,
-      name: p.name,
-      phase: p.description || '',
-      dotColor: PROJECT_COLORS[i % PROJECT_COLORS.length]!,
-      badge: p.key.slice(0, 2),
-      hasLive: p.liveTasks > 0,
-      groupId: p.groupId,
-      openTasks: p.openTasks,
-      totalTasks: p.totalTasks,
-      doneTasks: p.doneTasks,
-    }));
+    const vms = r.projects.map(toProjectVM);
     setProjects(vms);
+    setIsAdmin(r.admin);
     setCurrentPid((cur) => (cur && vms.some((p) => p.id === cur) ? cur : null));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // PLNR-83: the admin-wide project list (all projects), loaded on demand for the Admin view.
+  const loadAdminProjects = useCallback(async () => {
+    const r = await api.projects('all');
+    setAdminProjects(r.projects.map(toProjectVM));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const loadSnapshot = useCallback(async (pid: string) => {
@@ -347,17 +362,25 @@ export function useAppStore() {
       if (id === pidRef.current) {
         // Re-selecting the current project (e.g. from Settings): don't blank the
         // snapshot — the load effect won't re-fire for an unchanged pid (PLNR-37).
-        setView((v) => (v === 'settings' || v === 'agents' || v === 'home' ? 'control' : v));
+        setView((v) => (v === 'settings' || v === 'admin' || v === 'agents' || v === 'home' ? 'control' : v));
         refresh();
         return;
       }
       setCurrentPid(id);
       setSelectedTaskId(null);
       setSnapshot(null);
-      setView((v) => (v === 'settings' || v === 'home' ? 'control' : v));
+      setView((v) => (v === 'settings' || v === 'admin' || v === 'home' ? 'control' : v));
       lastSeq.current = 0;
     },
     setView,
+    openAdmin() {
+      setView('admin');
+      setSelectedTaskId(null);
+      void loadAdminProjects();
+    },
+    async refreshAdmin() {
+      await loadAdminProjects();
+    },
     openTask: (id: string) => setSelectedTaskId(id),
     refreshNow: refresh,
     selectAgent: (id: string | null) => setSelectedAgentId(id),
@@ -580,6 +603,7 @@ export function useAppStore() {
 
   return {
     user, authChecked, needsSetup, modal, editMilestone, groups, snapshot, showArchived, boardId,
+    isAdmin, adminProjects,
     currentPid: currentPid ?? '', view, selectedTaskId, selectedAgentId, draftKind, draftText, draggedId,
     data, helpers, actions,
   };

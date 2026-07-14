@@ -5,6 +5,7 @@ import type { AgentIdentity } from './auth';
 import type { Actor } from './do/ProjectRoom';
 import { computeUpdates, formatNotices } from './sync';
 import { base64ToBytes, bytesToBase64, newId, nowIso, sha256Hex } from './lib/util';
+import { USER_PROJECT_WHERE, userCanAccessProject } from './lib/visibility';
 
 const MAX_ATTACHMENT = 100 * 1024 * 1024;
 /** Stable resource URI for an attachment; agents read bytes back via resources/read. */
@@ -87,6 +88,12 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     async (args: T, extra?: { requestId?: string | number }) => {
       let body: unknown;
       try {
+        // Scope every project-bearing tool to what the AGENT'S USER can reach — an
+        // agent (even an admin's) never acts with admin-wide access (PLNR-83).
+        const pid = args && typeof args === 'object' ? (args as { projectId?: unknown }).projectId : undefined;
+        if (typeof pid === 'string' && pid && !(await userCanAccessProject(env, agent.userId, pid))) {
+          throw new Error(`project ${pid} not found or not accessible to you`);
+        }
         body = await fn(args);
       } catch (err) {
         return {
@@ -126,7 +133,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     tool(async () => {
       const updates = await computeUpdates(env, agent, { advanceCursor: false });
       const projects = (
-        await env.DB.prepare("SELECT id, key, name, description, status FROM projects WHERE status = 'active'").all()
+        await env.DB.prepare(
+          `SELECT p.id, p.key, p.name, p.description, p.status FROM projects p
+           WHERE p.status = 'active' AND ${USER_PROJECT_WHERE} ORDER BY p.created_at`,
+        ).bind(agent.userId).all()
       ).results;
       return {
         you: { id: agent.id, name: agent.name, role: agent.role },
@@ -210,8 +220,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       const { results } = await env.DB.prepare(
         `SELECT p.id, p.key, p.name, p.description, p.repo_url AS repoUrl,
                 (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status NOT IN ('done','cancelled')) AS openTasks
-         FROM projects p WHERE p.status = 'active' ORDER BY p.created_at`,
-      ).all();
+         FROM projects p WHERE p.status = 'active' AND ${USER_PROJECT_WHERE} ORDER BY p.created_at`,
+      ).bind(agent.userId).all();
       return { projects: results };
     }),
   );
@@ -338,6 +348,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
          FROM tasks t WHERE t.id = ? OR t.key = ?`,
       ).bind(taskId, taskId).first();
       if (!task) throw new Error(`task ${taskId} not found`);
+      // Scope to the agent's user (get_task takes only a taskId — check its project).
+      if (!(await userCanAccessProject(env, agent.userId, String(task.project_id)))) {
+        throw new Error(`task ${taskId} not found`);
+      }
       const id = String(task.id);
       const [deps, comments, refs, attachments, signals] = await Promise.all([
         env.DB.prepare(

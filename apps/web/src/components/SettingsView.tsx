@@ -7,11 +7,10 @@ import { MonoTag, SectionLabel } from './bits';
 import { Button, ErrorNote, Field, Select, TextInput } from './ui';
 
 export function SettingsView({ store }: { store: AppStore }) {
-  const isAdmin = store.user?.role === 'admin';
+  // User management moved to the Admin menu (PLNR-83) — Settings is user-level only.
   return (
     <div className="content-pad" style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: '20px 26px' }}>
       <div style={{ maxWidth: 760, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 28 }}>
-        {isAdmin && <UsersSection store={store} />}
         <GroupsSection store={store} />
         <PasskeysSection />
         <SessionsSection />
@@ -21,7 +20,7 @@ export function SettingsView({ store }: { store: AppStore }) {
   );
 }
 
-function Section({ title, action, children }: { title: string; action?: React.ReactNode; children: React.ReactNode }) {
+export function Section({ title, action, children }: { title: string; action?: React.ReactNode; children: React.ReactNode }) {
   return (
     <div style={{ border: '1px solid var(--w-07)', borderRadius: 14, background: 'var(--w-015)', padding: '18px 20px' }}>
       <div style={{ display: 'flex', alignItems: 'center', marginBottom: 14 }}>
@@ -34,7 +33,7 @@ function Section({ title, action, children }: { title: string; action?: React.Re
   );
 }
 
-function UsersSection({ store }: { store: AppStore }) {
+export function UsersSection({ store }: { store: AppStore }) {
   const [users, setUsers] = useState<ApiUser[]>([]);
   const [adding, setAdding] = useState(false);
   const [email, setEmail] = useState('');

@@ -11,6 +11,7 @@ import { PlansView } from './components/PlansView';
 import { AgentsView } from './components/AgentsView';
 import { ModalHost } from './components/modals';
 import { SettingsView } from './components/SettingsView';
+import { AdminView } from './components/AdminView';
 import { Logo } from './components/Logo';
 import { useState } from 'react';
 import { useTheme } from './theme';
@@ -58,7 +59,7 @@ export function App() {
   }
 
   const project = store.data.projects.find((p) => p.id === store.currentPid);
-  const projectView = project && !['home', 'settings'].includes(store.view);
+  const projectView = project && !['home', 'settings', 'admin'].includes(store.view);
 
   return (
     <div style={{ height: '100vh', display: 'flex', background: 'var(--bg)' }}>
@@ -82,8 +83,9 @@ export function App() {
         </div>
         {projectView && <TopBar store={store} />}
         <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
-          {(store.view === 'home' || (!project && store.view !== 'settings')) && <Home store={store} />}
+          {(store.view === 'home' || (!project && store.view !== 'settings' && store.view !== 'admin')) && <Home store={store} />}
           {store.view === 'settings' && <SettingsView store={store} />}
+          {store.view === 'admin' && <AdminView store={store} />}
           {projectView && (
             <>
               {store.view === 'control' && <MissionControl store={store} />}

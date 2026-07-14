@@ -83,6 +83,15 @@ for the components. (ARCHITECTURE.md calls it a "mock store" — that's stale; i
   dropped. Always pass `extra.requestId` as `relatedRequestId` (see `pushChannel` in mcp.ts). A fully
   idle agent cannot be pushed to — the notices text-block is the reliable fallback.
 
+- **Agent-facing guidance lives in three overlapping places that must be kept in sync.** The
+  MCP `instructions` string (`INSTRUCTIONS` in [mcp.ts](apps/api/src/mcp.ts), sent once on
+  `initialize`), the `playbook` array returned by `get_briefing` (same file), and `SKILL_MD`
+  ([skill.ts](apps/api/src/skill.ts), served at `/skill.md`). The duplication is intentional —
+  the inline playbook spares a working agent a second fetch, and the skill is not registered as
+  an MCP resource, so a bare "read the skill" pointer would dangle for MCP clients. **When you
+  change the work-loop contract (claim/release, identity, planning, escalation), update all
+  three** — they drift silently otherwise.
+
 - **`fetchMock` from `cloudflare:test` only intercepts the test isolate, not the worker isolate
   reached via `SELF.fetch()`.** To test code that makes outbound `fetch` from within the Worker,
   inject the fetch function (see `resolveCimdClient(env, id, doFetch)` in [lib/cimd.ts](apps/api/src/lib/cimd.ts))
