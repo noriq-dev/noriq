@@ -1,5 +1,6 @@
 import type { Env } from './env';
 import type { AgentIdentity } from './auth';
+import { USER_PROJECT_WHERE } from './lib/visibility';
 
 /**
  * Agent-scoped delta sync (ROADMAP Phase 1).
@@ -47,6 +48,23 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
   ).bind(agent.id).all<{ id: string; key: string; title: string; status: string; claimExpiresAt: string | null }>();
   for (const t of heldRows.results) heldTaskIds.add(t.id);
 
+  // Dependency-unblocked, unclaimed tasks across active projects. Computed up front so
+  // the "new task available" notice (PLNR-90) can confirm a freshly-created task is
+  // actually claimable right now (not gated behind unfinished dependencies).
+  const claimable = (
+    await env.DB.prepare(
+      `SELECT t.id, t.key, t.title, t.project_id AS projectId, t.priority
+       FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
+       WHERE t.status = 'todo' AND t.claimed_by IS NULL
+         AND ${USER_PROJECT_WHERE}
+         AND NOT EXISTS (
+           SELECT 1 FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id
+           WHERE d.task_id = t.id AND dt.status NOT IN ('done','cancelled'))
+       ORDER BY t.priority DESC, t."order" LIMIT 20`,
+    ).bind(agent.userId).all<AgentUpdates['claimable'][number]>()
+  ).results;
+  const claimableIds = new Set(claimable.map((t) => t.id));
+
   const notices: string[] = [];
   let maxRid = cursor;
   for (const e of rawEvents) {
@@ -64,10 +82,16 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
     } else if (e.verb === 'signal.answered' && p.agentId === agent.id) {
       const where = p.taskKey ? ` (${p.taskKey} is back in the queue — re-claim to resume)` : '';
       notices.push(`Your input request "${p.title}" was answered: "${p.response}"${where}`);
+    } else if (e.verb === 'task.created' && heldTaskIds.size === 0 && claimableIds.has(e.subjectId)) {
+      // PLNR-90: nudge AVAILABLE agents (holding nothing — i.e. not heads-down draining
+      // a plan) about a new, immediately-claimable task, so ad-hoc work gets picked up
+      // dynamically instead of waiting for someone to poll. Heads-down agents aren't
+      // distracted; the claimable list stays the authoritative queue for them.
+      notices.push(`New task ${p.key} is up for grabs: "${p.title}" — claim_task it if you can take it on.`);
     }
     // NB (PLNR-25): we deliberately do NOT notice every task.done here. It fired for
-    // every completed task to every agent — noise — and the claimable list below is
-    // the authoritative signal for "what can I pick up now". Relevance over volume.
+    // every completed task to every agent — noise — and the claimable list is the
+    // authoritative signal for "what can I pick up now". Relevance over volume.
   }
 
   // Sticky open comments on held tasks (state, not events — never cursor-gated).
@@ -90,19 +114,6 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
        WHERE t.claimed_by IS NULL AND c.status IN ('open','acknowledged') AND c.author_kind != 'agent'
        ORDER BY c.created_at LIMIT 10`,
     ).all<AgentUpdates['unassignedComments'][number]>()
-  ).results;
-
-  // Dependency-unblocked, unclaimed tasks across active projects.
-  const claimable = (
-    await env.DB.prepare(
-      `SELECT t.id, t.key, t.title, t.project_id AS projectId, t.priority
-       FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
-       WHERE t.status = 'todo' AND t.claimed_by IS NULL
-         AND NOT EXISTS (
-           SELECT 1 FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id
-           WHERE d.task_id = t.id AND dt.status NOT IN ('done','cancelled'))
-       ORDER BY t.priority DESC, t."order" LIMIT 20`,
-    ).all<AgentUpdates['claimable'][number]>()
   ).results;
 
   // Recent direct/broadcast messages (last 10, regardless of cursor, for context).
