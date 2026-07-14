@@ -70,7 +70,7 @@ function CreateProjectModal({ store }: { store: AppStore }) {
       <Field label="Group" hint="optional">
         <Select value={groupId} onChange={(e) => setGroupId(e.target.value)}>
           <option value="">— none —</option>
-          {store.groups.map((g) => (
+          {store.groups.filter((g) => g.canEdit || g.id === groupId).map((g) => (
             <option key={g.id} value={g.id}>{g.name}</option>
           ))}
         </Select>
@@ -128,7 +128,7 @@ function EditProjectModal({ store }: { store: AppStore }) {
         <Field label="Group">
           <Select value={groupId} onChange={(e) => setGroupId(e.target.value)}>
             <option value="">— none —</option>
-            {store.groups.map((g) => (
+            {store.groups.filter((g) => g.canEdit || g.id === groupId).map((g) => (
               <option key={g.id} value={g.id}>{g.name}</option>
             ))}
           </Select>

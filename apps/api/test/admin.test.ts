@@ -103,4 +103,39 @@ describe('grouped projects are shared with the group members only (PLNR-83)', ()
     expect((await listProjects(adminCookie)).projects.some((p) => p.id === bobProjectId)).toBe(false);
     expect((await listProjects(adminCookie, 'all')).projects.some((p) => p.id === bobProjectId)).toBe(true);
   });
+
+  it('putting your project in a group joins you, so co-members see each others projects', async () => {
+    await createUser('av-ed@example.com', 'AV Ed', 'longenough1').catch(() => {});
+    await createUser('av-fred@example.com', 'AV Fred', 'longenough1').catch(() => {});
+    const edCookie = await loginSession('av-ed@example.com', 'longenough1');
+    const fredCookie = await loginSession('av-fred@example.com', 'longenough1');
+    const mkProject = async (cookie: string, key: string) => {
+      const r = await SELF.fetch('https://planar.test/api/projects', {
+        method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ key, name: key }),
+      });
+      return (await r.json() as { id: string }).id;
+    };
+    const setGroup = (cookie: string, pid: string, gid: string) => SELF.fetch(`https://planar.test/api/projects/${pid}/meta`, {
+      method: 'PATCH', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ groupId: gid }),
+    });
+
+    // Ed makes a group (auto-joins) and puts his project in it.
+    const g = await SELF.fetch('https://planar.test/api/groups', {
+      method: 'POST', headers: { Cookie: edCookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Shared Nod' }),
+    });
+    const gid = (await g.json() as { id: string }).id;
+    const edProj = await mkProject(edCookie, 'AVED');
+    await setGroup(edCookie, edProj, gid);
+
+    // Fred puts HIS project in the same group → he auto-joins it.
+    const fredProj = await mkProject(fredCookie, 'AVFRED');
+    await setGroup(fredCookie, fredProj, gid);
+
+    // Both are now members and see each other's grouped projects.
+    const fredSees = (await listProjects(fredCookie)).projects.map((p) => p.id);
+    expect(fredSees).toContain(fredProj);
+    expect(fredSees).toContain(edProj);   // ← the previously-broken case
+    const edSees = (await listProjects(edCookie)).projects.map((p) => p.id);
+    expect(edSees).toContain(fredProj);
+  });
 });

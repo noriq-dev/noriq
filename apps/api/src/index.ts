@@ -534,8 +534,18 @@ app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
     sets.push('owner_user_id = ?'); binds.push(body.ownerUserId);
   }
   if (!sets.length) return c.json({ ok: true });
-  binds.push(c.req.param('pid')!);
+  const pid = c.req.param('pid')!;
+  binds.push(pid);
   await c.env.DB.prepare(`UPDATE projects SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
+  // Putting a project in a group makes its owner a member of that group (PLNR-83):
+  // otherwise the owner shares their project into the group but can't see the
+  // group's other projects. Members are what grant visibility.
+  if (body.groupId) {
+    await c.env.DB.prepare(
+      `INSERT OR IGNORE INTO user_groups (user_id, group_id)
+       SELECT owner_user_id, ? FROM projects WHERE id = ? AND owner_user_id IS NOT NULL`,
+    ).bind(body.groupId, pid).run();
+  }
   return c.json({ ok: true });
 });
 
