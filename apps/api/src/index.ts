@@ -671,6 +671,39 @@ app.delete('/api/groups/:gid', userAuth, async (c) => {
   return c.json({ ok: true });
 });
 
+// Per-group membership, self-service (PLNR-83): a group's members (or an admin)
+// manage who's in it. This is what lets a regular user run their own group
+// without the admin-only PUT /users/:uid/groups.
+const requireGroupMember = async (c: { env: Env; var: { user?: { id: string; role: string } } }, gid: string) =>
+  c.var.user!.role === 'admin' || (await isGroupMember(c.env, c.var.user!.id, gid));
+
+app.get('/api/groups/:gid/members', userAuth, async (c) => {
+  const gid = c.req.param('gid')!;
+  if (!(await requireGroupMember(c, gid))) return c.json({ error: 'only a group member can view membership' }, 403);
+  const { results } = await c.env.DB.prepare(
+    `SELECT u.id, u.name, u.email FROM user_groups ug JOIN users u ON u.id = ug.user_id
+     WHERE ug.group_id = ? ORDER BY u.name`,
+  ).bind(gid).all();
+  return c.json({ members: results });
+});
+
+app.post('/api/groups/:gid/members', userAuth, async (c) => {
+  const gid = c.req.param('gid')!;
+  if (!(await requireGroupMember(c, gid))) return c.json({ error: 'only a group member can add members' }, 403);
+  const { userId } = await c.req.json<{ userId: string }>();
+  const target = await c.env.DB.prepare('SELECT 1 FROM users WHERE id = ? AND disabled = 0').bind(userId ?? '').first();
+  if (!target) return c.json({ error: 'user not found' }, 404);
+  await c.env.DB.prepare('INSERT OR IGNORE INTO user_groups (user_id, group_id) VALUES (?, ?)').bind(userId, gid).run();
+  return c.json({ ok: true });
+});
+
+app.delete('/api/groups/:gid/members/:uid', userAuth, async (c) => {
+  const gid = c.req.param('gid')!;
+  if (!(await requireGroupMember(c, gid))) return c.json({ error: 'only a group member can remove members' }, 403);
+  await c.env.DB.prepare('DELETE FROM user_groups WHERE user_id = ? AND group_id = ?').bind(c.req.param('uid')!, gid).run();
+  return c.json({ ok: true });
+});
+
 // --- agent management (admin humans) ------------------------------------------------
 
 app.get('/api/agents', userAuth, async (c) => {

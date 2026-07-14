@@ -78,6 +78,31 @@ describe('group authorization (PLNR-81)', () => {
     expect(patch.status).toBe(200);
   });
 
+  it('members manage membership themselves; non-members are locked out (PLNR-83)', async () => {
+    // Member A views membership and adds Member B to the group.
+    const list = await SELF.fetch(`https://planar.test/api/groups/${groupId}/members`, { headers: { Cookie: aCookie } });
+    expect(list.status).toBe(200);
+
+    // B (non-member) can't view or add.
+    expect((await SELF.fetch(`https://planar.test/api/groups/${groupId}/members`, { headers: { Cookie: bCookie } })).status).toBe(403);
+
+    const bId = (await (await SELF.fetch('https://planar.test/api/users', { headers: { Cookie: aCookie } })).json() as {
+      users: Array<{ id: string; email: string }>;
+    }).users.find((u) => u.email === 'grp-b@example.com')!.id;
+    const add = await SELF.fetch(`https://planar.test/api/groups/${groupId}/members`, {
+      method: 'POST', headers: { Cookie: aCookie, ...asJson }, body: JSON.stringify({ userId: bId }),
+    });
+    expect(add.status).toBe(200);
+
+    // B is now a member: sees the group as editable and can remove themself.
+    expect((await listGroups(bCookie)).find((g) => g.id === groupId)?.canEdit).toBeTruthy();
+    const remove = await SELF.fetch(`https://planar.test/api/groups/${groupId}/members/${bId}`, {
+      method: 'DELETE', headers: { Cookie: bCookie },
+    });
+    expect(remove.status).toBe(200);
+    expect((await listGroups(bCookie)).find((g) => g.id === groupId)?.canEdit).toBeFalsy();
+  });
+
   it('an admin can delete any group regardless of membership', async () => {
     const del = await SELF.fetch(`https://planar.test/api/groups/${groupId}`, { method: 'DELETE', headers: { Cookie: adminCookie } });
     expect(del.status).toBe(200);

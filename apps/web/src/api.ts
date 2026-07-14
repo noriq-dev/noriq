@@ -68,6 +68,9 @@ export const api = {
 
   patchGroup: (gid: string, patch: { name?: string; description?: string }) => req('PATCH', `/api/groups/${gid}`, patch),
   deleteGroup: (gid: string) => req('DELETE', `/api/groups/${gid}`),
+  groupMembers: (gid: string) => req<{ members: Array<{ id: string; name: string; email: string }> }>('GET', `/api/groups/${gid}/members`),
+  addGroupMember: (gid: string, userId: string) => req('POST', `/api/groups/${gid}/members`, { userId }),
+  removeGroupMember: (gid: string, uid: string) => req('DELETE', `/api/groups/${gid}/members/${uid}`),
   deleteUser: (uid: string) => req('DELETE', `/api/users/${uid}`),
   taskEvents: (tid: string) => req<{ events: ApiAgentEvent[] }>('GET', `/api/tasks/${tid}/events`),
   uploadAttachment: async (tid: string, file: File) => {

@@ -66,7 +66,7 @@ export function AdminView({ store }: { store: AppStore }) {
         </Section>
 
         <UsersSection store={store} />
-        <GroupsSection store={store} />
+        <GroupsSection store={store} all />
       </div>
     </div>
   );

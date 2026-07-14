@@ -11,6 +11,7 @@ export function SettingsView({ store }: { store: AppStore }) {
   return (
     <div className="content-pad" style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: '20px 26px' }}>
       <div style={{ maxWidth: 760, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 28 }}>
+        <GroupsSection store={store} />
         <PasskeysSection />
         <SessionsSection />
         <PasswordSection />
@@ -214,57 +215,141 @@ export function UsersSection({ store }: { store: AppStore }) {
   );
 }
 
-export function GroupsSection({ store }: { store: AppStore }) {
-  const groups = store.groups;
+/**
+ * Group management (PLNR-83). Self-service in Settings: users see only THEIR
+ * groups and can create/rename/describe/delete them and manage members. The
+ * Admin view passes `all` to get the same editing surface over every group.
+ */
+export function GroupsSection({ store, all }: { store: AppStore; all?: boolean }) {
+  const groups = all ? store.groups : store.groups.filter((g) => g.canEdit);
+  const [membersFor, setMembersFor] = useState<string | null>(null);
   return (
     <Section
-      title={`Groups · ${groups.length}`}
+      title={all ? `All groups · ${groups.length}` : `Your groups · ${groups.length}`}
       action={<Button variant="ghost" style={{ padding: '5px 12px', fontSize: 11.5 }} onClick={() => store.actions.openModal('group')}>+ new group</Button>}
     >
-      {groups.length === 0 && <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>no groups — projects are ungrouped</div>}
+      {groups.length === 0 && (
+        <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>
+          {all ? 'no groups — projects are ungrouped' : 'you are not in any group — create one to share projects with a team'}
+        </div>
+      )}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
         {groups.map((g) => {
           const count = store.data.projects.filter((p) => p.groupId === g.id).length;
           return (
-            <div key={g.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 11px', borderRadius: 9, background: 'var(--w-02)', border: '1px solid var(--w-06)' }}>
-              <div style={{ minWidth: 0, flex: 1 }}>
-                <div style={{ fontSize: 12.5, fontWeight: 600 }}>{g.name}</div>
-                <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)' }}>{count} project{count === 1 ? '' : 's'}{g.description ? ` · ${g.description}` : ''}</div>
+            <div key={g.id} style={{ borderRadius: 9, background: 'var(--w-02)', border: '1px solid var(--w-06)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 11px' }}>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ fontSize: 12.5, fontWeight: 600 }}>{g.name}</div>
+                  <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)' }}>{count} project{count === 1 ? '' : 's'}{g.description ? ` · ${g.description}` : ''}</div>
+                </div>
+                {g.canEdit ? (
+                  <>
+                    <SmallAction onClick={() => setMembersFor(membersFor === g.id ? null : g.id)}>members</SmallAction>
+                    <SmallAction
+                      onClick={async () => {
+                        const name = window.prompt('Rename group:', g.name)?.trim();
+                        if (name && name !== g.name) {
+                          await api.patchGroup(g.id, { name });
+                          location.reload();
+                        }
+                      }}
+                    >
+                      rename
+                    </SmallAction>
+                    <SmallAction
+                      onClick={async () => {
+                        const description = window.prompt('Group description:', g.description ?? '');
+                        if (description !== null && description !== g.description) {
+                          await api.patchGroup(g.id, { description });
+                          location.reload();
+                        }
+                      }}
+                    >
+                      describe
+                    </SmallAction>
+                    <SmallAction
+                      danger
+                      onClick={async () => {
+                        if (window.confirm(`Delete group "${g.name}"? Projects become ungrouped.`)) {
+                          await api.deleteGroup(g.id);
+                          location.reload();
+                        }
+                      }}
+                    >
+                      delete
+                    </SmallAction>
+                  </>
+                ) : (
+                  <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)' }}>member-only</span>
+                )}
               </div>
-              {/* Only group members (or admins) may rename/delete — PLNR-81. */}
-              {g.canEdit ? (
-                <>
-                  <SmallAction
-                    onClick={async () => {
-                      const name = window.prompt('Rename group:', g.name)?.trim();
-                      if (name && name !== g.name) {
-                        await api.patchGroup(g.id, { name });
-                        location.reload();
-                      }
-                    }}
-                  >
-                    rename
-                  </SmallAction>
-                  <SmallAction
-                    danger
-                    onClick={async () => {
-                      if (window.confirm(`Delete group "${g.name}"? Projects become ungrouped.`)) {
-                        await api.deleteGroup(g.id);
-                        location.reload();
-                      }
-                    }}
-                  >
-                    delete
-                  </SmallAction>
-                </>
-              ) : (
-                <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)' }}>member-only</span>
-              )}
+              {membersFor === g.id && g.canEdit && <GroupMembers store={store} groupId={g.id} />}
             </div>
           );
         })}
       </div>
     </Section>
+  );
+}
+
+/** Inline membership editor for one group: list + remove, and add from the user directory. */
+function GroupMembers({ store, groupId }: { store: AppStore; groupId: string }) {
+  const [members, setMembers] = useState<Array<{ id: string; name: string; email: string }>>([]);
+  const [everyone, setEveryone] = useState<ApiUser[]>([]);
+  const [adding, setAdding] = useState('');
+  const load = () => api.groupMembers(groupId).then((r) => setMembers(r.members)).catch(() => {});
+  useEffect(() => {
+    load();
+    api.users().then((r) => setEveryone(r.users)).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groupId]);
+
+  const memberIds = new Set(members.map((m) => m.id));
+  const candidates = everyone.filter((u) => !memberIds.has(u.id) && !u.disabled);
+  const me = store.user?.id;
+
+  return (
+    <div style={{ borderTop: '1px solid var(--w-05)', padding: '9px 11px', display: 'flex', flexDirection: 'column', gap: 6 }}>
+      {members.map((m) => (
+        <div key={m.id} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: 12, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {m.name} <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)' }}>{m.email}{m.id === me ? ' (you)' : ''}</span>
+          </span>
+          <SmallAction
+            danger
+            onClick={async () => {
+              if (m.id === me && !window.confirm('Remove yourself? You will lose management of this group.')) return;
+              await api.removeGroupMember(groupId, m.id);
+              if (m.id === me) { location.reload(); return; }
+              load();
+            }}
+          >
+            remove
+          </SmallAction>
+        </div>
+      ))}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <Select value={adding} onChange={(e) => setAdding(e.target.value)} style={{ flex: 1 }}>
+          <option value="">+ add member…</option>
+          {candidates.map((u) => (
+            <option key={u.id} value={u.id}>{u.name} · {u.email}</option>
+          ))}
+        </Select>
+        <Button
+          variant="ghost"
+          disabled={!adding}
+          style={{ padding: '5px 12px', fontSize: 11.5 }}
+          onClick={async () => {
+            await api.addGroupMember(groupId, adding);
+            setAdding('');
+            load();
+          }}
+        >
+          add
+        </Button>
+      </div>
+    </div>
   );
 }
 
