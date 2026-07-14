@@ -1,6 +1,6 @@
 # Backup & restore (D1)
 
-planar stores all durable state in one D1 database (`DB`). There are two backup
+Noriq stores all durable state in one D1 database (`DB`). There are two backup
 paths — pick either or both.
 
 ## 1. Automatic daily snapshot → R2 (PLNR-21)
@@ -21,7 +21,7 @@ under `backups/planar-<timestamp>.json`.
 
 ```sh
 curl -H "Authorization: Bearer $ADMIN_TOKEN" \
-  https://<your-host>/api/admin/export -o planar-backup.json
+  https://<your-host>/api/admin/export -o noriq-backup.json
 ```
 
 The snapshot is `{ planar: "d1-snapshot", version, exportedAt, counts, tables }`,

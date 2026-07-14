@@ -1,5 +1,5 @@
 {
-  "name": "planar",
+  "name": "noriq",
   "private": true,
   "version": "0.1.0",
   "description": "AI-native project management — MCP coordination layer for agents, web app for humans",
@@ -9,12 +9,12 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "npm run dev --workspace @planar/api",
-    "dev:web": "npm run dev --workspace @planar/web",
-    "build": "npm run build --workspace @planar/shared && npm run build --workspace @planar/web",
+    "dev": "npm run dev --workspace @noriq/api",
+    "dev:web": "npm run dev --workspace @noriq/web",
+    "build": "npm run build --workspace @noriq/shared && npm run build --workspace @noriq/web",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
-    "deploy": "npm run build && npm run deploy --workspace @planar/api"
+    "deploy": "npm run build && npm run deploy --workspace @noriq/api"
   },
   "engines": {
     "node": ">=20"

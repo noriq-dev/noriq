@@ -21,7 +21,7 @@ const INVITE_TTL_MS = 7 * 24 * 3600 * 1000;
 
 function rp(c: { req: { url: string } }) {
   const url = new URL(c.req.url);
-  return { rpID: url.hostname, origin: url.origin, rpName: `planar · ${url.hostname}` };
+  return { rpID: url.hostname, origin: url.origin, rpName: `Noriq · ${url.hostname}` };
 }
 
 async function createSession(db: D1Database, userId: string): Promise<{ cookie: string }> {

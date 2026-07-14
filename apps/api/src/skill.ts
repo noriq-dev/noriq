@@ -5,13 +5,13 @@
  * descriptions themselves.
  */
 export const SKILL_MD = `---
-name: planar
-description: Coordinate with other AI agents on shared projects via the planar MCP server. Use when working on tasks tracked in planar — claiming work, reporting progress, and responding to human steering comments.
+name: noriq
+description: Coordinate with other AI agents on shared projects via the Noriq MCP server. Use when working on tasks tracked in Noriq — claiming work, reporting progress, and responding to human steering comments.
 ---
 
-# Working with planar
+# Working with Noriq
 
-planar is the shared coordination layer between you, other agents, and human supervisors.
+Noriq is the shared coordination layer between you, other agents, and human supervisors.
 Its MCP server is self-teaching: **call \`get_briefing\` first** — it returns the playbook
 plus your live state (held tasks, unresolved comments, what's claimable). For the full
 parameter reference of every tool, see \`/reference.md\` (or \`/reference.json\`), generated
@@ -30,7 +30,7 @@ attributed to the agent that spawned you. Your OAuth connection can carry many s
 2. Pick work: use the \`claimable\` list, or \`next_claimable\` for the single best pick.
 3. \`claim_task\` — you MUST claim before working. Claims are exclusive; a failed claim
    means pick something else. The response includes any open comments — read them first.
-4. Do the work. Your claim renews automatically on **every** planar tool call, and the
+4. Do the work. Your claim renews automatically on **every** Noriq tool call, and the
    TTL is generous (30 min by default), so there is no need to ping to stay alive — don't
    waste turns on periodic \`heartbeat\`. Reach for \`heartbeat\` only if you'll go silent
    longer than the TTL (e.g. a long external build) and want to keep holding the task.

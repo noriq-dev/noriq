@@ -11,14 +11,14 @@ const MESSAGES: Record<number, { title: string; detail: string }> = {
   429: { title: 'Slow down', detail: 'Too many requests. Give it a moment and try again.' },
   500: { title: 'Something broke', detail: 'An unexpected error occurred on our end.' },
   501: { title: 'Not implemented', detail: 'That capability is not available yet.' },
-  502: { title: 'Upstream error', detail: 'A service planar depends on failed.' },
+  502: { title: 'Upstream error', detail: 'A service Noriq depends on failed.' },
   503: { title: 'Unavailable', detail: 'This feature is not configured on this instance.' },
 };
 
 export function errorPage(status: number, override?: string): string {
   const m = MESSAGES[status] ?? { title: 'Error', detail: 'An error occurred.' };
   const detail = override ?? m.detail;
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${status} · planar</title><style>
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${status} · Noriq</title><style>
     :root { color-scheme: light dark; --bg:#0a0b0d; --card:#0c0d10; --text:#e6e8ec; --dim:#8a8f98; --faint:#4b5563; --accent:#c6f24e; --line:rgba(255,255,255,.1) }
     @media (prefers-color-scheme: light) { :root { --bg:#f2f3f6; --card:#fff; --text:#171a20; --dim:#59606d; --faint:#99a0ac; --line:rgba(0,0,0,.1) } }
     * { box-sizing:border-box } html,body { margin:0;height:100% }
@@ -36,8 +36,8 @@ export function errorPage(status: number, override?: string): string {
     <p class="code">${status}</p>
     <h1>${escapeHtml(m.title)}</h1>
     <p>${escapeHtml(detail)}</p>
-    <a href="/">← Back to planar</a>
-    <div class="foot">planar · AI-native project management</div>
+    <a href="/">← Back to Noriq</a>
+    <div class="foot">Noriq · AI-native project management</div>
   </div></body></html>`;
 }
 

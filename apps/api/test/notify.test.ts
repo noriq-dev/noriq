@@ -30,8 +30,8 @@ describe('MCP live notifications', () => {
 
     const payload = JSON.stringify(channel?.params ?? logging?.params);
     expect(payload).toContain('ping from alice');
-    // Correlated to planar and the receiving agent.
-    expect(payload).toContain('planar');
+    // Correlated to noriq and the receiving agent.
+    expect(payload).toContain('noriq');
   });
 
   it('no pending notices → no channel notification pushed', async () => {

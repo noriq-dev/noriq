@@ -4,6 +4,7 @@ import { startRegistration } from '@simplewebauthn/browser';
 import { api } from '../api';
 import type { AppStore } from '../store';
 import { Button, ErrorNote, Field, TextInput } from './ui';
+import { Logo } from './Logo';
 
 export function Setup({ store }: { store: AppStore }) {
   const [stage, setStage] = useState<'account' | 'passkey'>('account');
@@ -74,10 +75,8 @@ export function Setup({ store }: { store: AppStore }) {
     <div style={{ height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg)' }}>
       <div style={{ width: 400, padding: 30, background: 'var(--bg-raised)', border: '1px solid var(--line)', borderRadius: 16 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 11, marginBottom: 8 }}>
-          <div style={{ width: 34, height: 34, borderRadius: 9, background: 'var(--accent)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            <div style={{ width: 14, height: 14, background: 'var(--bg)', transform: 'rotate(45deg)' }} />
-          </div>
-          <div style={{ fontWeight: 700, fontSize: 18, letterSpacing: '-.01em' }}>Welcome to planar</div>
+          <Logo size={34} radius={9} />
+          <div style={{ fontWeight: 700, fontSize: 18, letterSpacing: '-.01em' }}>Welcome to Noriq</div>
         </div>
         <div style={{ fontSize: 12.5, color: 'var(--text-mid)', lineHeight: 1.6, marginBottom: 20 }}>
           This instance isn't configured yet. Create the founding <b style={{ color: 'var(--text)' }}>admin account</b> —

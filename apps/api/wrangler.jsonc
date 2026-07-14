@@ -38,7 +38,7 @@
   ],
 
   // Email invites + attachments are configured in wrangler.production.jsonc
-  // (see the .example) — both optional, planar degrades gracefully without them.
+  // (see the .example) — both optional, Noriq degrades gracefully without them.
 
   // Daily D1 backup to R2 at 06:00 UTC (PLNR-21). No-op until R2 (FILES) is bound;
   // safe to keep enabled. Snapshots land under backups/ — see BACKUP.md to restore.

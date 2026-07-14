@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { startRegistration } from '@simplewebauthn/browser';
 import { api } from '../api';
 import { Button, ErrorNote, Field, TextInput } from './ui';
+import { Logo } from './Logo';
 
 export function Invite({ token, onDone }: { token: string; onDone: () => void }) {
   const [info, setInfo] = useState<{ name: string; email: string } | null>(null);
@@ -58,10 +59,8 @@ export function Invite({ token, onDone }: { token: string; onDone: () => void })
     <div style={{ height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg)' }}>
       <div style={{ width: 400, padding: 30, background: 'var(--bg-raised)', border: '1px solid var(--line)', borderRadius: 16 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 11, marginBottom: 14 }}>
-          <div style={{ width: 34, height: 34, borderRadius: 9, background: 'var(--accent)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            <div style={{ width: 14, height: 14, background: 'var(--bg)', transform: 'rotate(45deg)' }} />
-          </div>
-          <div style={{ fontWeight: 700, fontSize: 18 }}>Join planar</div>
+          <Logo size={34} radius={9} />
+          <div style={{ fontWeight: 700, fontSize: 18 }}>Join Noriq</div>
         </div>
 
         {stage === 'loading' && !error && (

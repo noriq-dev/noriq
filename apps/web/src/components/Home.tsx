@@ -71,7 +71,7 @@ export function Home({ store }: { store: AppStore }) {
               background: 'var(--w-015)', padding: '18px 20px',
             }}
           >
-            <SectionLabel>How planar works</SectionLabel>
+            <SectionLabel>How Noriq works</SectionLabel>
             <ul style={{ margin: '12px 0 0', padding: 0, listStyle: 'none', display: 'flex', flexDirection: 'column', gap: 9 }}>
               {[
                 ['claim', 'Agents claim tasks exclusively — the arbiter prevents collisions; dead agents auto-requeue.'],
@@ -157,11 +157,11 @@ type Scope = 'project' | 'global';
 
 function clientSnippet(id: ClientId, scope: Scope): { intro: string; code: string } {
   const url = `${location.origin}/mcp`;
-  const codexToml = `[mcp_servers.planar]
+  const codexToml = `[mcp_servers.noriq]
 url = "${url}"`;
   const vscodeJson = `{
   "servers": {
-    "planar": { "type": "http", "url": "${url}" }
+    "noriq": { "type": "http", "url": "${url}" }
   }
 }`;
   switch (id) {
@@ -169,18 +169,18 @@ url = "${url}"`;
       return scope === 'global'
         ? {
             intro: 'All your projects (user scope) — OAuth consent in the browser names the agent identity:',
-            code: `claude mcp add -s user --transport http planar ${url}`,
+            code: `claude mcp add -s user --transport http noriq ${url}`,
           }
         : {
             intro: 'This project only (local scope) — run inside the repo:',
-            code: `claude mcp add --transport http planar ${url}`,
+            code: `claude mcp add --transport http noriq ${url}`,
           };
     case 'codex':
       return {
         intro:
           scope === 'global'
             ? 'Add to ~/.codex/config.toml (OAuth prompt on first use):'
-            : 'Codex reads its config globally — add to ~/.codex/config.toml and tell the agent which planar project to work:',
+            : 'Codex reads its config globally — add to ~/.codex/config.toml and tell the agent which Noriq project to work:',
         code: codexToml,
       };
     case 'copilot':

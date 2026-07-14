@@ -45,7 +45,7 @@ app.get('/api/health', async (c) => {
   const row = await c.env.DB.prepare('SELECT 1 AS ok').first<{ ok: number }>();
   return c.json({
     ok: row?.ok === 1,
-    service: 'planar',
+    service: 'noriq',
     version: '0.2.0',
   });
 });
@@ -78,7 +78,7 @@ app.all('/mcp', agentAuth, async (c) => {
   return transport.handleRequest(c, raw ?? undefined);
 });
 
-// --- agent skill (served by planar itself; ROADMAP Phase 5) -------------------
+// --- agent skill (served by Noriq itself; ROADMAP Phase 5) -------------------
 app.get('/skill.md', (c) => c.text(SKILL_MD, 200, { 'Content-Type': 'text/markdown; charset=utf-8' }));
 
 // --- MCP tool reference, generated from the zod schemas (PLNR-23) --------------

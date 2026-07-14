@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { startAuthentication } from '@simplewebauthn/browser';
 import { api } from '../api';
 import type { AppStore } from '../store';
+import { Logo } from './Logo';
 
 export function Login({ store }: { store: AppStore }) {
   const [email, setEmail] = useState('');
@@ -51,11 +52,9 @@ export function Login({ store }: { store: AppStore }) {
     <div style={{ height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg)' }}>
       <div style={{ width: 340, padding: 28, background: 'var(--bg-raised)', border: '1px solid var(--line)', borderRadius: 16 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 11, marginBottom: 22 }}>
-          <div style={{ width: 34, height: 34, borderRadius: 9, background: 'var(--accent)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            <div style={{ width: 14, height: 14, background: 'var(--bg)', transform: 'rotate(45deg)' }} />
-          </div>
+          <Logo size={34} radius={9} />
           <div>
-            <div style={{ fontWeight: 700, fontSize: 17, letterSpacing: '-.01em' }}>planar</div>
+            <div style={{ fontWeight: 700, fontSize: 17, letterSpacing: '-.01em' }}>Noriq</div>
             <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>mission control</div>
           </div>
         </div>

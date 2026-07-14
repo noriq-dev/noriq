@@ -122,7 +122,7 @@ function consentPage(clientName: string, agentDefault: string, params: AuthzPara
     .join('');
   const inner = user
     ? `
-    <p class="sub">Signed in as <b>${esc(user.name)}</b>. <b>${esc(clientName)}</b> is requesting access to the planar MCP <b>on your behalf</b>.</p>
+    <p class="sub">Signed in as <b>${esc(user.name)}</b>. <b>${esc(clientName)}</b> is requesting access to the Noriq MCP <b>on your behalf</b>.</p>
     <p class="hint">It starts as the agent <b>${esc(agentDefault)}</b> (delegated by you). The agent itself can take a
     different identity later with the <code>set_agent_identity</code> tool — no need to decide here.</p>
     <form method="POST" action="/oauth/authorize">${hidden}
@@ -138,7 +138,7 @@ function consentPage(clientName: string, agentDefault: string, params: AuthzPara
       <label>password<input name="password" type="password" required></label>
       <div class="row"><button name="decision" value="login" class="approve">Sign in &amp; continue</button></div>
     </form>`;
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>planar · authorize</title><style>
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Noriq · authorize</title><style>
     body{background:#0a0b0d;color:#e6e8ec;font-family:'Space Grotesk',system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
     .card{width:380px;background:#0c0d10;border:1px solid rgba(255,255,255,.1);border-radius:16px;padding:28px}
     .logo{width:34px;height:34px;border-radius:9px;background:#c6f24e;display:inline-flex;align-items:center;justify-content:center;vertical-align:middle;margin-right:10px}
@@ -154,7 +154,7 @@ function consentPage(clientName: string, agentDefault: string, params: AuthzPara
     .approve{background:#c6f24e;color:#0a0b0d}
     .ghost{background:rgba(255,255,255,.05);color:#e6e8ec;border:1px solid rgba(255,255,255,.12)}
     .err{font-family:ui-monospace,monospace;font-size:11px;color:#ff8a8a;margin-top:10px}
-  </style></head><body><div class="card"><span class="logo"><div></div></span><h1>planar</h1>${inner}${error ? `<div class="err">${esc(error)}</div>` : ''}</div></body></html>`;
+  </style></head><body><div class="card"><span class="logo"><div></div></span><h1>Noriq</h1>${inner}${error ? `<div class="err">${esc(error)}</div>` : ''}</div></body></html>`;
 }
 
 oauth.get('/authorize', async (c) => {

@@ -15,12 +15,12 @@ export async function sendInviteEmail(
   try {
     await env.EMAIL.send({
       to: opts.to,
-      from: { email: env.EMAIL_FROM, name: `planar · ${instance}` },
-      subject: `${opts.inviterName} invited you to planar (${instance})`,
+      from: { email: env.EMAIL_FROM, name: `Noriq · ${instance}` },
+      subject: `${opts.inviterName} invited you to Noriq (${instance})`,
       text: [
-        `${opts.inviterName} invited you to the planar instance at ${opts.origin}.`,
+        `${opts.inviterName} invited you to the Noriq instance at ${opts.origin}.`,
         '',
-        'planar coordinates AI agents and the humans supervising them.',
+        'Noriq coordinates AI agents and the humans supervising them.',
         '',
         `Accept your invite and set up your account (passkey or password):`,
         opts.inviteUrl,
@@ -30,9 +30,9 @@ export async function sendInviteEmail(
       html: `
 <div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:24px">
   <div style="display:inline-block;width:28px;height:28px;border-radius:7px;background:#c6f24e;text-align:center;line-height:28px;font-weight:bold;color:#0a0b0d">◆</div>
-  <span style="font-size:18px;font-weight:700;vertical-align:top;line-height:28px"> planar</span>
+  <span style="font-size:18px;font-weight:700;vertical-align:top;line-height:28px"> Noriq</span>
   <p style="font-size:14px;color:#333;line-height:1.6">
-    <b>${escapeHtml(opts.inviterName)}</b> invited you (<b>${escapeHtml(opts.toName)}</b>) to the planar
+    <b>${escapeHtml(opts.inviterName)}</b> invited you (<b>${escapeHtml(opts.toName)}</b>) to the Noriq
     instance at <b>${escapeHtml(instance)}</b> — a mission control where AI agents and humans work
     projects together.
   </p>

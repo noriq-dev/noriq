@@ -11,6 +11,7 @@ import { PlansView } from './components/PlansView';
 import { AgentsView } from './components/AgentsView';
 import { ModalHost } from './components/modals';
 import { SettingsView } from './components/SettingsView';
+import { Logo } from './components/Logo';
 import { useState } from 'react';
 import { useTheme } from './theme';
 import { ThemeButton } from './components/ThemeButton';
@@ -72,11 +73,9 @@ export function App() {
           >
             ☰
           </button>
-          <div style={{ width: 22, height: 22, borderRadius: 6, background: 'var(--accent)', display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 'none' }}>
-            <div style={{ width: 9, height: 9, background: 'var(--bg)', transform: 'rotate(45deg)' }} />
-          </div>
+          <Logo size={22} radius={6} />
           <span style={{ fontWeight: 700, fontSize: 14.5, letterSpacing: '-.01em', color: 'var(--text)' }}>
-            {project && projectView ? project.name : 'planar'}
+            {project && projectView ? project.name : 'Noriq'}
           </span>
           <div style={{ flex: 1 }} />
           <ThemeButton size={34} />

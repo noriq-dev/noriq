@@ -16,7 +16,7 @@ describe('MCP tool reference', () => {
     expect(md).toMatch(/`projectId` \*\*string\*\* \(required\)/);
     expect(md).toMatch(/\(optional\)/);
     // The attachment resource template.
-    expect(md).toContain('planar://attachment/{id}');
+    expect(md).toContain('noriq://attachment/{id}');
   });
 
   it('/reference.json exposes JSON Schema per tool', async () => {

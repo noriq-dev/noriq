@@ -1,4 +1,4 @@
-// MCP attachments (add_attachment tool + planar://attachment/<id> resource).
+// MCP attachments (add_attachment tool + noriq://attachment/<id> resource).
 import { SELF } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import { createAgent, createUser, loginSession, mcpCall, mcpRpc } from './helpers';
@@ -25,7 +25,7 @@ describe('MCP attachments', () => {
       projectId, taskId, filename: 'shot.png', data: PNG_B64, contentType: 'image/png',
     });
     expect(r.isError).toBe(false);
-    expect(r.body.resource).toBe(`planar://attachment/${r.body.id}`);
+    expect(r.body.resource).toBe(`noriq://attachment/${r.body.id}`);
     expect(r.body.contentType).toBe('image/png');
     expect(r.body.size).toBeGreaterThan(0);
   });
@@ -57,14 +57,14 @@ describe('MCP attachments', () => {
     const gt = await mcpCall(agent.apiKey, 'get_task', { taskId });
     expect(gt.body.attachments.length).toBeGreaterThanOrEqual(3);
     for (const a of gt.body.attachments) {
-      expect(a.resource).toBe(`planar://attachment/${a.id}`);
+      expect(a.resource).toBe(`noriq://attachment/${a.id}`);
     }
   });
 
   it('resources/list enumerates recent attachments', async () => {
     const list = await mcpRpc(agent.apiKey, 'resources/list', {});
     expect(Array.isArray(list.resources)).toBe(true);
-    expect(list.resources.some((r: { uri: string }) => r.uri.startsWith('planar://attachment/'))).toBe(true);
+    expect(list.resources.some((r: { uri: string }) => r.uri.startsWith('noriq://attachment/'))).toBe(true);
   });
 
   it('serves images inline (viewable), other types as download', async () => {

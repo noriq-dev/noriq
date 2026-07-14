@@ -246,12 +246,12 @@ function CreateTaskModal({ store }: { store: AppStore }) {
         </Field>
         <Field label="Tags" hint="comma-separated; new names are created">
           <TextInput
-            list="planar-tags"
+            list="noriq-tags"
             value={tagsInput}
             onChange={(e) => setTagsInput(e.target.value)}
             placeholder={tags.length ? tags.map((c) => c.name).slice(0, 3).join(', ') + ', …' : 'backend, auth, …'}
           />
-          <datalist id="planar-tags">
+          <datalist id="noriq-tags">
             {tags.map((c) => (
               <option key={c.id} value={c.name} />
             ))}

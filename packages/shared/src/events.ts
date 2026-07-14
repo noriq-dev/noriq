@@ -31,7 +31,7 @@ export const EventVerb = z.enum([
 ]);
 export type EventVerb = z.infer<typeof EventVerb>;
 
-export const PlanarEvent = z.object({
+export const NoriqEvent = z.object({
   id: z.string(),
   projectId: z.string(),
   seq: z.number().int(), // monotonic per project — ordering + resume cursor
@@ -43,7 +43,7 @@ export const PlanarEvent = z.object({
   payload: z.record(z.unknown()).default({}),
   createdAt: z.string().datetime(),
 });
-export type PlanarEvent = z.infer<typeof PlanarEvent>;
+export type NoriqEvent = z.infer<typeof NoriqEvent>;
 
 // WebSocket protocol: client → server
 export const WsClientMessage = z.discriminatedUnion('type', [
@@ -54,8 +54,8 @@ export type WsClientMessage = z.infer<typeof WsClientMessage>;
 
 // WebSocket protocol: server → client
 export const WsServerMessage = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('event'), event: PlanarEvent }),
-  z.object({ type: z.literal('backlog'), events: z.array(PlanarEvent) }),
+  z.object({ type: z.literal('event'), event: NoriqEvent }),
+  z.object({ type: z.literal('backlog'), events: z.array(NoriqEvent) }),
   z.object({ type: z.literal('pong') }),
 ]);
 export type WsServerMessage = z.infer<typeof WsServerMessage>;

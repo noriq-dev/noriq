@@ -112,7 +112,7 @@ export function Drawer({ store }: { store: AppStore }) {
             {addingTag ? (
               <input
                 autoFocus
-                list="planar-tags-quick"
+                list="noriq-tags-quick"
                 value={newTag}
                 onChange={(e) => setNewTag(e.target.value)}
                 onBlur={() => { setAddingTag(false); setNewTag(''); }}
@@ -145,7 +145,7 @@ export function Drawer({ store }: { store: AppStore }) {
                 + tag
               </button>
             )}
-            <datalist id="planar-tags-quick">
+            <datalist id="noriq-tags-quick">
               {allTags.map((t) => (
                 <option key={t.id} value={t.name} />
               ))}
@@ -228,8 +228,8 @@ export function Drawer({ store }: { store: AppStore }) {
                 </Select>
               </div>
               <div style={{ marginTop: 10 }}>
-                <TextInput value={eTags} onChange={(e) => setETags(e.target.value)} placeholder="tags, comma, separated" list="planar-tags-drawer" />
-                <datalist id="planar-tags-drawer">
+                <TextInput value={eTags} onChange={(e) => setETags(e.target.value)} placeholder="tags, comma, separated" list="noriq-tags-drawer" />
+                <datalist id="noriq-tags-drawer">
                   {allTags.map((t) => (
                     <option key={t.id} value={t.name} />
                   ))}

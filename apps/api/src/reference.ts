@@ -57,11 +57,11 @@ function renderProps(schema: JsonSchema, indent = ''): string[] {
 export function renderMcpReference(baseUrl: string): string {
   const { tools, resources } = mcpReferenceSpecs();
   const out: string[] = [];
-  out.push('# planar MCP — tool reference');
+  out.push('# Noriq MCP — tool reference');
   out.push('');
   out.push('_Generated from the live zod schemas; this file cannot drift from the server._');
   out.push('');
-  out.push(`Connect: \`claude mcp add -s user --transport http planar ${baseUrl}/mcp\``);
+  out.push(`Connect: \`claude mcp add -s user --transport http noriq ${baseUrl}/mcp\``);
   out.push('');
   out.push('The contract: call `get_briefing` first, `claim_task` before working, resolve open comments, `release_task` when done. Every tool call renews your claim.');
   out.push('');

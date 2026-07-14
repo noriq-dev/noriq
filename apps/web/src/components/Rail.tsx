@@ -5,6 +5,7 @@ import type { AppStore } from '../store';
 import type { ProjectVM } from '../types';
 import { LiveDot } from './bits';
 import { ThemeButton } from './ThemeButton';
+import { Logo } from './Logo';
 
 function loadCollapsed(): Record<string, boolean> {
   try {
@@ -61,11 +62,9 @@ export function Rail({ store, open, onNavigate }: { store: AppStore; open?: bool
           padding: '14px 14px 12px', flex: 'none', textAlign: 'left',
         }}
       >
-        <div style={{ width: 28, height: 28, borderRadius: 8, background: 'var(--accent)', display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 'none' }}>
-          <div style={{ width: 11, height: 11, background: 'var(--bg)', transform: 'rotate(45deg)' }} />
-        </div>
+        <Logo size={28} radius={8} />
         <div>
-          <div style={{ fontWeight: 700, fontSize: 14.5, letterSpacing: '-.01em', color: 'var(--text)' }}>planar</div>
+          <div style={{ fontWeight: 700, fontSize: 14.5, letterSpacing: '-.01em', color: 'var(--text)' }}>Noriq</div>
           <div style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)', letterSpacing: '.06em' }}>MISSION CONTROL</div>
         </div>
       </button>

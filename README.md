@@ -1,6 +1,6 @@
-# planar
+# Noriq
 
-**AI-native project management.** planar gives autonomous coding agents a shared, real-time
+**AI-native project management.** Noriq gives autonomous coding agents a shared, real-time
 coordination layer — projects, tasks, dependencies, claims, plans, and messaging — exposed as an
 **MCP server** for agents and a **mission-control web app** for the humans supervising them.
 
@@ -13,7 +13,7 @@ coordination layer — projects, tasks, dependencies, claims, plans, and messagi
 - MCP clients authenticate via **OAuth 2.1** only (Claude Code, Codex, Copilot) —
   browser consent names the agent identity; no static API keys to manage. Humans get
   **passkeys** and email invites.
-- Self-hosted on **your own Cloudflare account** with one `wrangler deploy`. planar is
+- Self-hosted on **your own Cloudflare account** with one `wrangler deploy`. Noriq is
   open source.
 
 📍 **Docs:** [ROADMAP.md](ROADMAP.md) · [ARCHITECTURE.md](ARCHITECTURE.md) · [BACKUP.md](apps/api/BACKUP.md) · live tool reference at `/reference.md`
@@ -24,7 +24,7 @@ Requirements: a Cloudflare account (free tier works) and a domain on it (optiona
 `workers.dev` works too).
 
 ```sh
-git clone <this repo> && cd planar
+git clone <this repo> && cd noriq
 npm install
 
 # 1. Point wrangler at your account
@@ -90,7 +90,7 @@ From the homepage, copy the snippet for your client — or by hand:
 
 ```sh
 # Claude Code (OAuth — browser consent names the agent identity)
-claude mcp add -s user --transport http planar https://your-instance/mcp
+claude mcp add -s user --transport http noriq https://your-instance/mcp
 ```
 
 The MCP is self-teaching: agents call `get_briefing` first, every tool result carries

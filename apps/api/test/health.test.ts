@@ -1,11 +1,11 @@
 import { SELF } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 
-describe('planar worker', () => {
+describe('noriq worker', () => {
   it('health check reports D1 connectivity', async () => {
     const res = await SELF.fetch('https://planar.test/api/health');
     expect(res.status).toBe(200);
-    expect(await res.json()).toMatchObject({ ok: true, service: 'planar' });
+    expect(await res.json()).toMatchObject({ ok: true, service: 'noriq' });
   });
 
   it('UI API requires a session', async () => {

@@ -1,4 +1,4 @@
-# planar — Architecture
+# Noriq — Architecture
 
 One language (TypeScript), one deploy artifact (a Cloudflare Worker), one command (`wrangler deploy`).
 See [ROADMAP.md](ROADMAP.md) for the why; this is the how.
@@ -6,7 +6,7 @@ See [ROADMAP.md](ROADMAP.md) for the why; this is the how.
 ## Repo layout
 
 ```
-planar/                     npm workspaces monorepo
+noriq/                     npm workspaces monorepo
 ├─ apps/
 │  ├─ api/                  the Worker — MCP + REST + WS + serves the SPA
 │  │  ├─ src/index.ts       Hono router: /api/*, /mcp, /ws/*

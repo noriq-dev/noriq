@@ -1,6 +1,6 @@
-# planar — Roadmap
+# Noriq — Roadmap
 
-> **planar** is an AI-native project management system. It gives autonomous coding agents a shared,
+> **Noriq** is an AI-native project management system. It gives autonomous coding agents a shared,
 > real-time coordination layer — projects, tasks, dependencies, claims, and messaging — exposed as an
 > **MCP server** for agents and a **web app** for humans supervising them.
 
@@ -8,9 +8,9 @@
 
 ## 1. Vision
 
-Most project management tools are built for humans and bolt AI on as an afterthought. planar inverts
+Most project management tools are built for humans and bolt AI on as an afterthought. Noriq inverts
 that: **agents are the primary actors**, humans supervise, review, and set direction. The hard problem
-planar solves is **coordination between multiple agents working the same project** — preventing collisions,
+Noriq solves is **coordination between multiple agents working the same project** — preventing collisions,
 enabling orchestrator→worker decomposition, and giving agents a way to share context and hand off work.
 It also keeps the human in the loop: humans **comment on and question tasks**, and the agent working a
 task **picks those up and acts on them** — steering work without stopping it.
@@ -230,7 +230,7 @@ concurrently, with graceful recovery when an agent dies mid-task.
 ### Phase 5 — Hardening & v1.0 Release
 *Goal: something others can confidently self-host.*
 - Docs: quickstart (deploy to your CF account in minutes), MCP tool reference, agent integration guide.
-- **Installable agent skill, served by planar itself**: `GET <your-instance>/skill.md` (+ install
+- **Installable agent skill, served by Noriq itself**: `GET <your-instance>/skill.md` (+ install
   one-liner in the docs). Generated from the same source as the tool descriptions so it can't drift;
   stays a thin pointer — the work loop + "call `get_briefing` for current truth". Ground truth lives
   server-side.
@@ -252,7 +252,7 @@ coordinated multi-agent project.
   retrievable notes), beyond task bodies + events.
 - **Multi-tenant SaaS** — workspaces, per-tenant isolation, billing; hosted option alongside self-host.
 - **OAuth (MCP spec)** — standards-based agent auth for the SaaS track.
-- **Deep git / execution integration** — trigger agent runs, manage worktrees, drive the loop from planar.
+- **Deep git / execution integration** — trigger agent runs, manage worktrees, drive the loop from Noriq.
 - **Analytics** — throughput, cycle time, per-agent productivity, bottleneck detection.
 - **Richer planning** — sprints, estimates roll-ups, roadmap views, capacity across an agent pool.
 

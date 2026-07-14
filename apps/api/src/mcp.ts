@@ -8,22 +8,22 @@ import { base64ToBytes, bytesToBase64, newId, nowIso, sha256Hex } from './lib/ut
 
 const MAX_ATTACHMENT = 100 * 1024 * 1024;
 /** Stable resource URI for an attachment; agents read bytes back via resources/read. */
-const attachmentUri = (id: string) => `planar://attachment/${id}`;
+const attachmentUri = (id: string) => `noriq://attachment/${id}`;
 
 /** Tool metadata captured at registration, used to generate the reference doc (PLNR-23). */
 export type ToolSpec = { name: string; description: string; inputSchema: z.ZodRawShape };
 export type ResourceSpec = { name: string; uriTemplate: string; description: string };
 
 /**
- * planar MCP server — Streamable HTTP, stateless (a fresh server per request,
+ * Noriq MCP server — Streamable HTTP, stateless (a fresh server per request,
  * bound to the authenticated agent). Tools ARE the documentation: descriptions
  * teach the workflow, get_briefing orients, and every result carries a notices
  * block so working agents get pushed-feeling updates without polling.
  */
 
-const INSTRUCTIONS = `planar coordinates multiple AI agents working the same project.
+const INSTRUCTIONS = `Noriq coordinates multiple AI agents working the same project.
 The contract: (1) call get_briefing first; (2) claim_task before working on anything;
-(3) just keep working — every planar tool call renews your claim automatically, and the
+(3) just keep working — every Noriq tool call renews your claim automatically, and the
 TTL is generous (30 min), so you never need to ping to stay alive. heartbeat exists only
 for the rare case where you'll go silent longer than that; (4) check and resolve open
 comments — humans steer you through them; (5) release_task (to review or done) when
@@ -39,7 +39,7 @@ const asActor = (a: AgentIdentity): Actor => ({ kind: 'agent', id: a.id, name: a
 
 export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthTokenId?: string; sessionId?: string } = {}): McpServer {
   const server = new McpServer(
-    { name: 'planar', version: '0.3.0' },
+    { name: 'noriq', version: '0.3.0' },
     {
       instructions: INSTRUCTIONS,
       // logging → standard notifications/message (any client); experimental claude/channel
@@ -59,10 +59,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
   // turn, alongside the tool result — a real push, not just the text-block fallback.
   const pushChannel = async (content: string, meta: Record<string, string>, relatedRequestId?: string | number) => {
     if (relatedRequestId === undefined) return; // nowhere to deliver in stateless mode
-    const params = { content, meta: { source: 'planar', agent: agent.name, ...meta } };
+    const params = { content, meta: { source: 'noriq', agent: agent.name, ...meta } };
     try {
       // Standard logging notification — surfaced by any spec-compliant client.
-      await server.server.notification({ method: 'notifications/message', params: { level: 'info', logger: 'planar', data: params } }, { relatedRequestId });
+      await server.server.notification({ method: 'notifications/message', params: { level: 'info', logger: 'noriq', data: params } }, { relatedRequestId });
     } catch { /* client without logging capability */ }
     try {
       // Experimental channel — Claude surfaces this richly (capabilities.experimental).
@@ -109,7 +109,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'get_briefing',
-    'Call this FIRST in every session. Returns the planar playbook plus your current state: who you are, tasks you hold, unresolved comments awaiting you, what is claimable, and recent messages.',
+    'Call this FIRST in every session. Returns the Noriq playbook plus your current state: who you are, tasks you hold, unresolved comments awaiting you, what is claimable, and recent messages.',
     {},
     tool(async () => {
       const updates = await computeUpdates(env, agent, { advanceCursor: false });
@@ -357,7 +357,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'add_attachment',
-    'Attach a file (screenshot, image, log, etc.) to a task. Pass the bytes base64-encoded in `data` (max 100 MB). Read them back later via the returned resource URI (resources/read) — e.g. planar://attachment/<id>.',
+    'Attach a file (screenshot, image, log, etc.) to a task. Pass the bytes base64-encoded in `data` (max 100 MB). Read them back later via the returned resource URI (resources/read) — e.g. noriq://attachment/<id>.',
     {
       projectId: z.string(),
       taskId: z.string(),
@@ -408,7 +408,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'claim_task',
-    'Claim exclusive ownership before working. Fails if held, blocked, or not claimable. Returns the TTL and any open comments — read them before you start. Your claim renews on every planar tool call, so just keep working; no periodic heartbeat needed.',
+    'Claim exclusive ownership before working. Fails if held, blocked, or not claimable. Returns the TTL and any open comments — read them before you start. Your claim renews on every Noriq tool call, so just keep working; no periodic heartbeat needed.',
     { projectId: z.string(), taskId: z.string() },
     tool(async ({ projectId, taskId }) => {
       const result = await room(env, projectId).claimTask(projectId, actor, taskId, agent.id);
@@ -421,7 +421,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'heartbeat',
-    'Rarely needed: every planar tool call already renews your claims. Use this ONLY when you will go silent longer than the claim TTL (e.g. a long external build) and want to hold the task without doing other planar work. Returns what was renewed.',
+    'Rarely needed: every Noriq tool call already renews your claims. Use this ONLY when you will go silent longer than the claim TTL (e.g. a long external build) and want to hold the task without doing other Noriq work. Returns what was renewed.',
     { projectId: z.string() },
     tool(async ({ projectId }) => room(env, projectId).heartbeat(projectId, actor, agent.id)),
   );
@@ -657,15 +657,15 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
   );
 
   // ---- resources: read attachment bytes back ------------------------------
-  // planar://attachment/<id> — binary comes back as base64 `blob`, text as `text`.
+  // noriq://attachment/<id> — binary comes back as base64 `blob`, text as `text`.
   resourceSpecs.push({
     name: 'attachment',
-    uriTemplate: 'planar://attachment/{id}',
+    uriTemplate: 'noriq://attachment/{id}',
     description: 'Bytes of a file attached to a task (image, log, etc.). Binary returns as base64 blob; text/json/xml/yaml as text.',
   });
   server.registerResource(
     'attachment',
-    new ResourceTemplate('planar://attachment/{id}', {
+    new ResourceTemplate('noriq://attachment/{id}', {
       // Discovery: recent attachments across active projects, each with its URI.
       list: async () => {
         const { results } = await env.DB.prepare(
