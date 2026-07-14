@@ -1029,6 +1029,52 @@ app.post('/api/runs/:runId/cancel', userAuth, async (c) => {
   return c.json({ run: updated });
 });
 
+// Steer a live Run (RUN-16/17): push a human's steer down the runner's socket so
+// the daemon injects it into the running agent's live input. Records the steer so
+// the daemon's steer.ack can mark the source delivered-via-runtime (dedup — the
+// notices fallback won't also surface it). Graceful degradation: if the daemon is
+// down / never acks, no suppression is recorded and the notice fires normally.
+const SteerBody = z.object({
+  text: z.string().min(1),
+  mode: z.enum(['soft', 'hard']).default('soft'),
+  // The Noriq comment/message id this steer derives from — the stable dedup key.
+  sourceCommentId: z.string().nullish(),
+  sourceMessageId: z.string().nullish(),
+  noticeCursor: z.number().int().nonnegative().nullish(),
+});
+app.post('/api/runs/:runId/steer', userAuth, async (c) => {
+  const runId = c.req.param('runId')!;
+  const parsed = SteerBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid steer', detail: parsed.error.issues }, 400);
+  const b = parsed.data;
+  const run = await c.env.DB.prepare('SELECT project_id AS pid, runner_id AS runnerId, agent_id AS agentId FROM runs WHERE id = ?')
+    .bind(runId).first<{ pid: string; runnerId: string | null; agentId: string | null }>();
+  if (!run) return c.json({ error: 'run not found' }, 404);
+  if (!(await reachesProject(c, run.pid))) return c.json({ error: 'not found' }, 404);
+  if (!run.runnerId) return c.json({ error: 'run has no runner to steer' }, 409);
+
+  const steerId = newId('str');
+  const sourceId = b.sourceCommentId ?? b.sourceMessageId ?? null;
+  await c.env.DB.prepare(
+    'INSERT INTO steers (id, run_id, agent_id, source_id, notice_cursor, mode) VALUES (?, ?, ?, ?, ?, ?)',
+  ).bind(steerId, runId, run.agentId, sourceId, b.noticeCursor ?? null, b.mode).run();
+
+  const { delivered } = await hub(c.env, run.runnerId).deliver(
+    JSON.stringify({
+      type: 'steer',
+      runId,
+      steerId,
+      mode: b.mode,
+      body: b.text,
+      sourceCommentId: b.sourceCommentId ?? null,
+      sourceMessageId: b.sourceMessageId ?? null,
+      noticeCursor: b.noticeCursor ?? null,
+      issuedAt: new Date().toISOString(),
+    }),
+  );
+  return c.json({ steerId, delivered });
+});
+
 // Steering-ack (RUN-7): the daemon reports it delivered a steer to the agent over
 // the runtime channel. Record it so the MCP notices fallback won't double-deliver
 // (the dedup guard consumed in computeUpdates). agentAuth → the runner's owner.

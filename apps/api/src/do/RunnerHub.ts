@@ -101,11 +101,23 @@ export class RunnerHub extends DurableObject<Env> {
         return;
       }
 
-      case 'steer.ack':
-        // The runtime-channel dedup ack. Mapping steerId → (agent, message) needs the
-        // steer-send bookkeeping built in Phase 5 (RUN-17); the HTTP steer-ack endpoint
-        // is the RUN-7 suppression path. Accepted here as a no-op for now.
+      case 'steer.ack': {
+        // The runtime-channel dedup ack (RUN-17). Look up the steer we sent to map
+        // steerId → (agent, source id); on a live runtime delivery, record it in
+        // runtime_deliveries so computeUpdates suppresses the notices fallback for
+        // that source (dedup by the stable source id).
+        const steer = await this.env.DB.prepare(
+          'SELECT agent_id AS agentId, source_id AS sourceId, run_id AS runId FROM steers WHERE id = ?',
+        ).bind(msg.steerId).first<{ agentId: string | null; sourceId: string | null; runId: string }>();
+        await this.env.DB.prepare('UPDATE steers SET delivered_via = ?, acked_at = ? WHERE id = ?')
+          .bind(msg.via, new Date().toISOString(), msg.steerId).run();
+        if (steer && msg.via === 'runtime' && msg.delivered && steer.agentId && steer.sourceId) {
+          await this.env.DB.prepare(
+            'INSERT OR IGNORE INTO runtime_deliveries (agent_id, message_id, run_id) VALUES (?, ?, ?)',
+          ).bind(steer.agentId, steer.sourceId, steer.runId).run();
+        }
         return;
+      }
     }
   }
 

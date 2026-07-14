@@ -85,7 +85,7 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
     maxRid = Math.max(maxRid, e.rid);
     if (e.actorId === agent.id) continue; // own actions aren't news
     const p = JSON.parse(e.payload) as Record<string, unknown>;
-    if (e.verb === 'comment.posted' && typeof p.taskId === 'string' && heldTaskIds.has(p.taskId)) {
+    if (e.verb === 'comment.posted' && !runtimeDelivered.has(e.subjectId) && typeof p.taskId === 'string' && heldTaskIds.has(p.taskId)) {
       notices.push(`New ${p.kind} on ${p.taskKey} (your task): "${p.body}"`);
     } else if (e.verb === 'message.sent' && !runtimeDelivered.has(e.subjectId) && (p.to === agent.id || (p.to === 'broadcast' && accessibleProjectIds.has(e.projectId)))) {
       notices.push(`Message from ${p.actorName ?? e.actorId}${p.refTaskId ? ` re ${p.refTaskId}` : ''}: "${p.body}"`);

@@ -1017,6 +1017,7 @@ export class ProjectRoom extends DurableObject<Env> {
         // Runners are machines (project_id optional, multi-project) → unpin, not delete;
         // the daemon's heartbeat keeps its status.
         this.env.DB.prepare('DELETE FROM runtime_deliveries WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
+        this.env.DB.prepare('DELETE FROM steers WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare('DELETE FROM runs WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('UPDATE runners SET project_id = NULL WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('UPDATE tasks SET parent_task_id = NULL WHERE project_id = ?').bind(pid),
