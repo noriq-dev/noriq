@@ -472,12 +472,17 @@ const isGroupMember = async (env: Env, userId: string, gid: string) =>
   !!(await env.DB.prepare('SELECT 1 FROM user_groups WHERE user_id = ? AND group_id = ?').bind(userId, gid).first());
 
 app.get('/api/groups', userAuth, async (c) => {
+  // Everyone sees every group (group names are needed to render the project
+  // directory — a project's group must resolve or the project vanishes from the
+  // UI). Editing is what's restricted: `canEdit` gates the rename/delete controls,
+  // and PATCH/DELETE enforce membership server-side (PLNR-81).
   const u = c.var.user!;
-  const { results } = u.role === 'admin'
-    ? await c.env.DB.prepare('SELECT id, name, description, "order" FROM groups ORDER BY "order", created_at').all()
-    : await c.env.DB.prepare(
-        'SELECT id, name, description, "order" FROM groups WHERE id IN (SELECT group_id FROM user_groups WHERE user_id = ?) ORDER BY "order", created_at',
-      ).bind(u.id).all();
+  const { results } = await c.env.DB.prepare(
+    `SELECT g.id, g.name, g.description, g."order",
+            (CASE WHEN ?1 = 'admin' OR EXISTS (SELECT 1 FROM user_groups ug WHERE ug.group_id = g.id AND ug.user_id = ?2)
+                  THEN 1 ELSE 0 END) AS canEdit
+     FROM groups g ORDER BY g."order", g.created_at`,
+  ).bind(u.role, u.id).all();
   return c.json({ groups: results });
 });
 

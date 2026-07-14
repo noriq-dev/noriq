@@ -35,6 +35,18 @@ function room(env: Env, projectId: string) {
   return env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName(projectId));
 }
 
+/**
+ * Resolve a task reference — either the opaque `task_…` id or the `PLN-##` display key —
+ * to its canonical id, so callers can accept whichever the agent passes. The ProjectRoom
+ * is strictly id-keyed, so claim/release resolve here before crossing into it.
+ */
+async function resolveTaskId(env: Env, projectId: string, taskId: string): Promise<string> {
+  const row = await env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+    .bind(taskId, taskId, projectId).first<{ id: string }>();
+  if (!row) throw new Error(`task ${taskId} not found in project ${projectId}`);
+  return String(row.id);
+}
+
 const asActor = (a: AgentIdentity): Actor => ({ kind: 'agent', id: a.id, name: a.name });
 
 export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthTokenId?: string; sessionId?: string } = {}): McpServer {
@@ -415,7 +427,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     'Claim exclusive ownership before working. Fails if held, blocked, or not claimable. Returns the TTL and any open comments — read them before you start. Your claim renews on every Noriq tool call, so just keep working; no periodic heartbeat needed.',
     { projectId: z.string(), taskId: z.string() },
     tool(async ({ projectId, taskId }) => {
-      const result = await room(env, projectId).claimTask(projectId, actor, taskId, agent.id);
+      const id = await resolveTaskId(env, projectId, taskId);
+      const result = await room(env, projectId).claimTask(projectId, actor, id, agent.id);
       // An agent that hasn't localized itself yet adopts the project it first works in.
       await env.DB.prepare("UPDATE agents SET project_id = ?, status = 'active' WHERE id = ? AND project_id IS NULL")
         .bind(projectId, agent.id).run();
@@ -440,21 +453,22 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       comment: z.string().optional().describe('Closing thoughts / handoff notes to record on the task'),
     },
     tool(async ({ projectId, taskId, toStatus, comment }) => {
+      const id = await resolveTaskId(env, projectId, taskId);
       if (toStatus === 'done') {
         const open = await env.DB.prepare(
           "SELECT COUNT(*) AS n FROM comments WHERE task_id = ? AND status IN ('open','acknowledged')",
-        ).bind(taskId).first<{ n: number }>();
+        ).bind(id).first<{ n: number }>();
         if (open && open.n > 0) {
           throw new Error(`task has ${open.n} unresolved comment(s) — resolve them (resolve_comment) before marking done`);
         }
         const gate = await env.DB.prepare(
           "SELECT COUNT(*) AS n FROM signals WHERE task_id = ? AND type = 'input_request' AND status = 'open'",
-        ).bind(taskId).first<{ n: number }>();
+        ).bind(id).first<{ n: number }>();
         if (gate && gate.n > 0) {
           throw new Error(`task has ${gate.n} open input request(s) awaiting a human decision — can't finish until they're answered`);
         }
       }
-      return room(env, projectId).releaseTask(projectId, actor, taskId, { toStatus, comment });
+      return room(env, projectId).releaseTask(projectId, actor, id, { toStatus, comment });
     }),
   );
 

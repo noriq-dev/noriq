@@ -63,7 +63,7 @@ export function useAppStore() {
   const [needsSetup, setNeedsSetup] = useState(false);
   const [modal, setModal] = useState<null | 'project' | 'project-edit' | 'task' | 'group' | 'milestone' | 'tag'>(null);
   const [editMilestone, setEditMilestone] = useState<{ id: string; title: string; dueAt: string | null } | null>(null);
-  const [groups, setGroups] = useState<Array<{ id: string; name: string; description: string }>>([]);
+  const [groups, setGroups] = useState<Array<{ id: string; name: string; description: string; canEdit: number }>>([]);
   const initialUrl = useRef(parseUrl());
   const [currentPid, setCurrentPid] = useState<string | null>(initialUrl.current.pid);
   const [view, setView] = useState<ViewId>(initialUrl.current.view);

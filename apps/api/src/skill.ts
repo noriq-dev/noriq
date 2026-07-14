@@ -32,9 +32,9 @@ Do this **before your first claim** so everything you do is attributed from the 
 3. \`claim_task\` — you MUST claim before working, and claim only the **one** task you're
    about to start (don't batch-claim a list — an already-\`in_progress\` task is held, so
    re-claiming just errors). Claims are exclusive; a failed claim means pick something else.
-   Identify the task by the opaque \`task_…\` id from the briefing or \`create_task\` — that's
-   what \`claim_task\`/\`release_task\` want; the \`PLN-##\` display key won't resolve here. Pass
-   \`projectId\` on every call. The response includes any open comments — read them first.
+   Identify the task by either its opaque \`task_…\` id or its \`PLN-##\` display key (both
+   resolve), and pass \`projectId\` on every call. The response includes any open comments —
+   read them first.
 4. Do the work. Your claim renews automatically on **every** Noriq tool call, and the
    TTL is generous (30 min by default), so there is no need to ping to stay alive — don't
    waste turns on periodic \`heartbeat\`. Reach for \`heartbeat\` only if you'll go silent

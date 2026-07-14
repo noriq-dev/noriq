@@ -13,7 +13,7 @@ let groupId: string;
 const asJson = { 'Content-Type': 'application/json' };
 const listGroups = async (cookie: string) =>
   (await (await SELF.fetch('https://planar.test/api/groups', { headers: { Cookie: cookie } })).json() as {
-    groups: Array<{ id: string; name: string }>;
+    groups: Array<{ id: string; name: string; canEdit: number }>;
   }).groups;
 
 beforeAll(async () => {
@@ -36,10 +36,15 @@ beforeAll(async () => {
 });
 
 describe('group authorization (PLNR-81)', () => {
-  it('a non-member cannot see the group in the list', async () => {
-    expect((await listGroups(bCookie)).some((g) => g.id === groupId)).toBe(false);
-    expect((await listGroups(aCookie)).some((g) => g.id === groupId)).toBe(true); // member sees it
-    expect((await listGroups(adminCookie)).some((g) => g.id === groupId)).toBe(true); // admin sees all
+  it('everyone sees every group, but canEdit reflects membership (PLNR-81 regression)', async () => {
+    // A non-member must still SEE the group — the project directory needs group
+    // names to resolve, or projects in unseen groups vanish from the UI.
+    const bView = (await listGroups(bCookie)).find((g) => g.id === groupId);
+    expect(bView).toBeTruthy();
+    expect(bView!.canEdit).toBeFalsy(); // …but no edit rights
+
+    expect((await listGroups(aCookie)).find((g) => g.id === groupId)?.canEdit).toBeTruthy(); // member
+    expect((await listGroups(adminCookie)).find((g) => g.id === groupId)?.canEdit).toBeTruthy(); // admin
   });
 
   it('a non-member is forbidden from renaming or deleting the group', async () => {

@@ -7,7 +7,10 @@ import { Button } from './ui';
 
 export function Home({ store }: { store: AppStore }) {
   const { data, groups, actions } = store;
-  const ungrouped = data.projects.filter((p) => !p.groupId);
+  // A project whose group isn't in the list (e.g. not loaded) must still show —
+  // treat it as ungrouped rather than dropping it (PLNR-81 regression guard).
+  const knownGroupIds = new Set(groups.map((g) => g.id));
+  const ungrouped = data.projects.filter((p) => !p.groupId || !knownGroupIds.has(p.groupId));
   const grouped = groups
     .map((g) => ({ group: g, projects: data.projects.filter((p) => p.groupId === g.id) }))
     .filter((g) => g.projects.length > 0);

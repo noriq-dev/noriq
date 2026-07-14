@@ -233,28 +233,35 @@ function GroupsSection({ store }: { store: AppStore }) {
                 <div style={{ fontSize: 12.5, fontWeight: 600 }}>{g.name}</div>
                 <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)' }}>{count} project{count === 1 ? '' : 's'}{g.description ? ` · ${g.description}` : ''}</div>
               </div>
-              <SmallAction
-                onClick={async () => {
-                  const name = window.prompt('Rename group:', g.name)?.trim();
-                  if (name && name !== g.name) {
-                    await api.patchGroup(g.id, { name });
-                    location.reload();
-                  }
-                }}
-              >
-                rename
-              </SmallAction>
-              <SmallAction
-                danger
-                onClick={async () => {
-                  if (window.confirm(`Delete group "${g.name}"? Projects become ungrouped.`)) {
-                    await api.deleteGroup(g.id);
-                    location.reload();
-                  }
-                }}
-              >
-                delete
-              </SmallAction>
+              {/* Only group members (or admins) may rename/delete — PLNR-81. */}
+              {g.canEdit ? (
+                <>
+                  <SmallAction
+                    onClick={async () => {
+                      const name = window.prompt('Rename group:', g.name)?.trim();
+                      if (name && name !== g.name) {
+                        await api.patchGroup(g.id, { name });
+                        location.reload();
+                      }
+                    }}
+                  >
+                    rename
+                  </SmallAction>
+                  <SmallAction
+                    danger
+                    onClick={async () => {
+                      if (window.confirm(`Delete group "${g.name}"? Projects become ungrouped.`)) {
+                        await api.deleteGroup(g.id);
+                        location.reload();
+                      }
+                    }}
+                  >
+                    delete
+                  </SmallAction>
+                </>
+              ) : (
+                <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)' }}>member-only</span>
+              )}
             </div>
           );
         })}

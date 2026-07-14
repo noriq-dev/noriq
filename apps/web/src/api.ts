@@ -35,7 +35,7 @@ export const api = {
 
   createProject: (key: string, name: string, description?: string) =>
     req<{ id: string; key: string }>('POST', '/api/projects', { key, name, description }),
-  groups: () => req<{ groups: Array<{ id: string; name: string; description: string }> }>('GET', '/api/groups'),
+  groups: () => req<{ groups: Array<{ id: string; name: string; description: string; canEdit: number }> }>('GET', '/api/groups'),
   createGroup: (name: string, description?: string) => req<{ id: string }>('POST', '/api/groups', { name, description }),
   setProjectMeta: (pid: string, meta: { groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number; ownerUserId?: string | null }) =>
     req('PATCH', `/api/projects/${pid}/meta`, meta),

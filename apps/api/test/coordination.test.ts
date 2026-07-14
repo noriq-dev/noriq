@@ -127,6 +127,16 @@ describe('coordination core', () => {
     expect(note.authorKind).toBe('agent');
   });
 
+  it('claim_task and release_task accept the display key, not just the opaque id', async () => {
+    const t = (await mcpCall(orch.apiKey, 'create_task', { projectId, title: 'claim me by key' })).body;
+    const claim = await mcpCall(nova.apiKey, 'claim_task', { projectId, taskId: t.key });
+    expect(claim.isError).toBe(false);
+    expect(claim.body.key).toBe(t.key);
+    const rel = await mcpCall(nova.apiKey, 'release_task', { projectId, taskId: t.key, toStatus: 'done' });
+    expect(rel.isError).toBe(false);
+    expect(rel.body.status).toBe('done');
+  });
+
   it('release_task can record closing thoughts in the same call', async () => {
     const t = (await mcpCall(orch.apiKey, 'create_task', { projectId, title: 'note on release' })).body;
     await mcpCall(nova.apiKey, 'claim_task', { projectId, taskId: t.id });
