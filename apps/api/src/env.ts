@@ -1,6 +1,7 @@
 import type { ProjectRoom } from './do/ProjectRoom';
 import type { AgentSession } from './do/AgentSession';
 import type { RateLimiter } from './do/RateLimiter';
+import type { RunnerHub } from './do/RunnerHub';
 
 export interface Env {
   DB: D1Database;
@@ -8,6 +9,7 @@ export interface Env {
   PROJECT_ROOM: DurableObjectNamespace<ProjectRoom>;
   AGENT_SESSION: DurableObjectNamespace<AgentSession>;
   RATE_LIMITER: DurableObjectNamespace<RateLimiter>;
+  RUNNER_HUB: DurableObjectNamespace<RunnerHub>;
   /** Set in tests to bypass rate limiting. */
   DISABLE_RATE_LIMIT?: boolean;
   /** Bootstrap secret for issuing agent keys / creating users. Set via `wrangler secret put ADMIN_TOKEN`. */

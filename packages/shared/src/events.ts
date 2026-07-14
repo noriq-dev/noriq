@@ -28,6 +28,10 @@ export const EventVerb = z.enum([
   'agent.registered',
   'agent.online',
   'agent.offline',
+  // Run lifecycle (execution plane) — authoritative in ProjectRoom (RUN-6).
+  'run.created',
+  'run.dispatched',
+  'run.status_changed',
 ]);
 export type EventVerb = z.infer<typeof EventVerb>;
 
@@ -38,7 +42,7 @@ export const NoriqEvent = z.object({
   actorKind: ActorKind,
   actorId: z.string(),
   verb: EventVerb,
-  subjectType: z.enum(['project', 'milestone', 'task', 'comment', 'message', 'agent']),
+  subjectType: z.enum(['project', 'milestone', 'task', 'comment', 'message', 'agent', 'run']),
   subjectId: z.string(),
   payload: z.record(z.unknown()).default({}),
   createdAt: z.string().datetime(),

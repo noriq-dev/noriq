@@ -72,6 +72,13 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
       .bind(agent.userId).all<{ id: string }>()).results.map((r) => r.id),
   );
 
+  // Steers already delivered to this agent over the runtime channel (RUN-7): skip
+  // them here so a daemon-injected steer isn't ALSO surfaced via notices (dedup).
+  const runtimeDelivered = new Set(
+    (await env.DB.prepare('SELECT message_id FROM runtime_deliveries WHERE agent_id = ?')
+      .bind(agent.id).all<{ message_id: string }>()).results.map((r) => r.message_id),
+  );
+
   const notices: string[] = [];
   let maxRid = cursor;
   for (const e of rawEvents) {
@@ -80,7 +87,7 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
     const p = JSON.parse(e.payload) as Record<string, unknown>;
     if (e.verb === 'comment.posted' && typeof p.taskId === 'string' && heldTaskIds.has(p.taskId)) {
       notices.push(`New ${p.kind} on ${p.taskKey} (your task): "${p.body}"`);
-    } else if (e.verb === 'message.sent' && (p.to === agent.id || (p.to === 'broadcast' && accessibleProjectIds.has(e.projectId)))) {
+    } else if (e.verb === 'message.sent' && !runtimeDelivered.has(e.subjectId) && (p.to === agent.id || (p.to === 'broadcast' && accessibleProjectIds.has(e.projectId)))) {
       notices.push(`Message from ${p.actorName ?? e.actorId}${p.refTaskId ? ` re ${p.refTaskId}` : ''}: "${p.body}"`);
     } else if (e.verb === 'task.requeued' && p.previousHolder === agent.id) {
       notices.push(`Your claim on ${p.key} expired — the task was requeued (${p.reason}).`);

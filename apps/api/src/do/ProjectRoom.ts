@@ -2,6 +2,7 @@ import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../env';
 import { newId, nowIso } from '../lib/util';
 import { userCanAccessProject } from '../lib/visibility';
+import { RunKind, AgentTool, RunStatus, isTerminalRunStatus } from '@noriq/shared';
 
 /**
  * ProjectRoom — one instance per project (idFromName(projectId)).
@@ -66,6 +67,69 @@ type TaskRow = {
 };
 
 const CLAIMABLE_STATUSES = ['todo', 'claimed'];
+
+// --- Runs (execution plane, RUN-6) -----------------------------------------
+export interface CreateRunInput {
+  kind: string; // RunKind: scope|build|verify
+  anchor?: { type: 'task' | 'plan'; id: string } | null;
+  brief?: string;
+  repoRef: string;
+  agentTool: string; // AgentTool: claude|codex
+  budget?: Record<string, unknown> | null;
+  /** Pre-assign a runner (create + dispatch in one shot); else the Run starts queued. */
+  runnerId?: string | null;
+  /** Actor id credited as the dispatcher; defaults to the acting actor. */
+  createdBy?: string;
+}
+
+export interface RunPatch {
+  status: string; // target RunStatus
+  agentId?: string | null; // set once the spawned agent registers its own actor
+  exit?: Record<string, unknown> | null; // terminal detail; synthesized if omitted
+  reason?: string | null;
+}
+
+type RunRow = {
+  id: string; project_id: string; runner_id: string | null; agent_id: string | null;
+  kind: string; anchor_type: string | null; anchor_id: string | null; brief: string;
+  repo_ref: string; agent_tool: string; budget: string; status: string; exit: string | null;
+  created_by: string; created_at: string; updated_at: string;
+  dispatched_at: string | null; started_at: string | null;
+};
+
+// The wire shape of a Run (mirrors the shared Run entity). Named explicitly so the
+// DO-stub RPC return-type inference doesn't recurse on a large anonymous literal.
+export interface RunView {
+  id: string;
+  projectId: string;
+  runnerId: string | null;
+  agentId: string | null;
+  kind: string;
+  anchor: { type: 'task'; taskId: string } | { type: 'plan'; planId: string } | null;
+  brief: string;
+  repoRef: string;
+  agentTool: string;
+  budget: Record<string, unknown>;
+  status: string;
+  exit: Record<string, unknown> | null;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+  dispatchedAt: string | null;
+  startedAt: string | null;
+}
+
+// Legal Run status transitions. queued Runs were never sent to a daemon (no
+// process); dispatched/running/blocked have a live (or expected-live) process.
+const RUN_TRANSITIONS: Record<string, string[]> = {
+  queued: ['dispatched', 'cancelled'],
+  dispatched: ['running', 'failed', 'cancelled'],
+  running: ['blocked', 'done', 'failed', 'cancelled'],
+  blocked: ['running', 'done', 'failed', 'cancelled'],
+  done: [],
+  failed: [],
+  cancelled: [],
+};
 
 /*
  * SERIALIZATION NOTE (PLNR-19): D1 calls are subrequests and do NOT close the
@@ -946,6 +1010,12 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM plans WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM tags WHERE project_id = ?').bind(pid),
         this.env.DB.prepare("UPDATE agents SET project_id = NULL, status = 'offline' WHERE project_id = ?").bind(pid),
+        // Runs are project-scoped → delete (with any steer-delivery rows keyed to them).
+        // Runners are machines (project_id optional, multi-project) → unpin, not delete;
+        // the daemon's heartbeat keeps its status.
+        this.env.DB.prepare('DELETE FROM runtime_deliveries WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
+        this.env.DB.prepare('DELETE FROM runs WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare('UPDATE runners SET project_id = NULL WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('UPDATE tasks SET parent_task_id = NULL WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM tasks WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM milestones WHERE project_id = ?').bind(pid),
@@ -955,6 +1025,157 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.ctx.storage.deleteAlarm().catch(() => {});
       return { ok: true, key: proj.key, name: proj.name };
     });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Runs — the execution plane (RUN-6). Runs are AUTHORITATIVE here, not in the
+  // daemon: create/dispatch/transition all flow through blockConcurrencyWhile so
+  // status changes serialize, append to the event log, and fan out over WS. The
+  // daemon only *reports* transitions (RUN-7); this DO owns the truth.
+  // ---------------------------------------------------------------------------
+
+  private runToWire(r: RunRow): RunView {
+    return {
+      id: r.id,
+      projectId: r.project_id,
+      runnerId: r.runner_id,
+      agentId: r.agent_id,
+      kind: r.kind,
+      // CHECK((anchor_type IS NULL) = (anchor_id IS NULL)) guarantees the id is set here.
+      anchor:
+        r.anchor_type === 'task' ? { type: 'task', taskId: r.anchor_id! }
+        : r.anchor_type === 'plan' ? { type: 'plan', planId: r.anchor_id! }
+        : null,
+      brief: r.brief,
+      repoRef: r.repo_ref,
+      agentTool: r.agent_tool,
+      budget: JSON.parse(r.budget || '{}'),
+      status: r.status,
+      exit: r.exit ? JSON.parse(r.exit) : null,
+      createdBy: r.created_by,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+      dispatchedAt: r.dispatched_at,
+      startedAt: r.started_at,
+    };
+  }
+
+  private async loadRun(runId: string): Promise<RunRow> {
+    const row = await this.env.DB.prepare('SELECT * FROM runs WHERE id = ? AND project_id = ?')
+      .bind(runId, this.projectId).first<RunRow>();
+    if (!row) throw new Error('run not found');
+    return row;
+  }
+
+  /** Create a Run. Starts `queued`; if runnerId is given, create + dispatch atomically. */
+  async createRun(projectId: string, actor: Actor, input: CreateRunInput): Promise<RunView> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      // Validate against the shared contract; the DB CHECKs are the backstop.
+      RunKind.parse(input.kind);
+      AgentTool.parse(input.agentTool);
+      const id = newId('run');
+      const now = nowIso();
+      const anchorType = input.anchor?.type ?? null;
+      const anchorId = input.anchor?.id ?? null;
+      const runnerId = input.runnerId ?? null;
+      const status = runnerId ? 'dispatched' : 'queued';
+      await this.env.DB.prepare(
+        `INSERT INTO runs (id, project_id, runner_id, kind, anchor_type, anchor_id, brief, repo_ref,
+                           agent_tool, budget, status, created_by, created_at, updated_at, dispatched_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        id, projectId, runnerId, input.kind, anchorType, anchorId, input.brief ?? '', input.repoRef,
+        input.agentTool, JSON.stringify(input.budget ?? {}), status, input.createdBy ?? actor.id, now, now,
+        runnerId ? now : null,
+      ).run();
+      await this.emit(actor, 'run.created', 'run', id, {
+        kind: input.kind, agentTool: input.agentTool, repoRef: input.repoRef, anchor: anchorType,
+      });
+      if (runnerId) await this.emit(actor, 'run.dispatched', 'run', id, { runnerId, to: 'dispatched' });
+      return this.runToWire(await this.loadRun(id));
+    });
+  }
+
+  /** Assign a queued Run to a runner and mark it dispatched. */
+  async dispatchRun(projectId: string, actor: Actor, runId: string, runnerId: string): Promise<RunView> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const run = await this.loadRun(runId);
+      if (!RUN_TRANSITIONS[run.status]?.includes('dispatched')) {
+        throw new Error(`cannot dispatch run in status ${run.status}`);
+      }
+      const now = nowIso();
+      await this.env.DB.prepare(
+        "UPDATE runs SET runner_id = ?, status = 'dispatched', dispatched_at = ?, updated_at = ? WHERE id = ?",
+      ).bind(runnerId, now, now, runId).run();
+      await this.emit(actor, 'run.dispatched', 'run', runId, { runnerId, from: run.status, to: 'dispatched' });
+      return this.runToWire(await this.loadRun(runId));
+    });
+  }
+
+  /** Advance a Run's status (running/blocked/terminal). Enforces the transition map. */
+  async transitionRun(projectId: string, actor: Actor, runId: string, patch: RunPatch): Promise<RunView> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const run = await this.loadRun(runId);
+      const to = RunStatus.parse(patch.status);
+      if (!RUN_TRANSITIONS[run.status]?.includes(to)) {
+        throw new Error(`illegal run transition ${run.status} -> ${to}`);
+      }
+      const now = nowIso();
+      const startedAt = to === 'running' && !run.started_at ? now : run.started_at;
+      const agentId = patch.agentId !== undefined ? patch.agentId : run.agent_id;
+      let exitJson = run.exit;
+      if (isTerminalRunStatus(to)) {
+        // Synthesize a RunExit if the caller didn't supply one; caller fields win.
+        exitJson = JSON.stringify({
+          outcome: to, code: null, signal: null, reason: patch.reason ?? null, finishedAt: now,
+          ...(patch.exit ?? {}),
+        });
+      }
+      await this.env.DB.prepare(
+        'UPDATE runs SET status = ?, agent_id = ?, exit = ?, started_at = ?, updated_at = ? WHERE id = ?',
+      ).bind(to, agentId, exitJson, startedAt, now, runId).run();
+      await this.emit(actor, 'run.status_changed', 'run', runId, { from: run.status, to, reason: patch.reason ?? null });
+      return this.runToWire(await this.loadRun(runId));
+    });
+  }
+
+  /** On daemon reconnect, orphaned non-terminal Runs for that runner → failed{daemon_restart}. */
+  async reconcileRunnerRuns(projectId: string, actor: Actor, runnerId: string): Promise<{ failed: number }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const { results } = await this.env.DB.prepare(
+        "SELECT id, status FROM runs WHERE project_id = ? AND runner_id = ? AND status IN ('dispatched','running','blocked')",
+      ).bind(projectId, runnerId).all<{ id: string; status: string }>();
+      const now = nowIso();
+      for (const r of results) {
+        const exit = JSON.stringify({ outcome: 'failed', code: null, signal: null, reason: 'daemon_restart', finishedAt: now });
+        await this.env.DB.prepare("UPDATE runs SET status = 'failed', exit = ?, updated_at = ? WHERE id = ?")
+          .bind(exit, now, r.id).run();
+        await this.emit(actor, 'run.status_changed', 'run', r.id, { from: r.status, to: 'failed', reason: 'daemon_restart' });
+      }
+      return { failed: results.length };
+    });
+  }
+
+  /** Read Runs for the project (UI + dispatch). Optional runner/status filters. */
+  async listRuns(projectId: string, opts: { runnerId?: string; status?: string } = {}): Promise<RunView[]> {
+    await this.setPid(projectId);
+    const clauses = ['project_id = ?'];
+    const binds: unknown[] = [projectId];
+    if (opts.runnerId) { clauses.push('runner_id = ?'); binds.push(opts.runnerId); }
+    if (opts.status) { clauses.push('status = ?'); binds.push(opts.status); }
+    const { results } = await this.env.DB.prepare(
+      `SELECT * FROM runs WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC`,
+    ).bind(...binds).all<RunRow>();
+    return results.map((r) => this.runToWire(r));
+  }
+
+  async getRun(projectId: string, runId: string): Promise<RunView> {
+    await this.setPid(projectId);
+    return this.runToWire(await this.loadRun(runId));
   }
 
   // ---------------------------------------------------------------------------

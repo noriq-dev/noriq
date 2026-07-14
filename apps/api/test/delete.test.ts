@@ -1,5 +1,5 @@
 // PLNR-70: deletion cascades for milestone/tag/plan/task/project.
-import { SELF } from 'cloudflare:test';
+import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import { createAgent, createUser, loginSession, mcpCall } from './helpers';
 
@@ -72,6 +72,48 @@ describe('deletion', () => {
     // snapshot 404s now
     const s = await SELF.fetch(`https://planar.test/api/projects/${p.id}/snapshot`, { headers: { Cookie: cookie } });
     expect(s.status).toBe(404);
+  });
+
+  it('project delete removes its runs and unpins (keeps) its runners — RUN-4', async () => {
+    const p = (await mcpCall(agent.apiKey, 'create_project', { key: 'DELR', name: 'delr' })).body;
+    const runnerId = `rnr_del_${crypto.randomUUID().slice(0, 8)}`;
+    const runId = `run_del_${crypto.randomUUID().slice(0, 8)}`;
+    // Insert directly — MCP insert paths land in RUN-5+; this drives the migration + cascade now.
+    await env.DB.prepare('INSERT INTO runners (id, project_id, label, status) VALUES (?, ?, ?, ?)')
+      .bind(runnerId, p.id, 'del-runner', 'online').run();
+    await env.DB.prepare(
+      'INSERT INTO runs (id, project_id, runner_id, kind, repo_ref, agent_tool, status, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    ).bind(runId, p.id, runnerId, 'build', 'repo_a', 'claude', 'running', agent.id).run();
+
+    expect((await del(p.id, '')).status).toBe(200);
+
+    const run = await env.DB.prepare('SELECT id FROM runs WHERE id = ?').bind(runId).first();
+    expect(run).toBeNull(); // run deleted
+    const runner = await env.DB.prepare('SELECT id, project_id FROM runners WHERE id = ?').bind(runnerId)
+      .first<{ id: string; project_id: string | null }>();
+    expect(runner).not.toBeNull(); // runner survives...
+    expect(runner!.project_id).toBeNull(); // ...unpinned
+    // cleanup the surviving runner so it doesn't leak into other tests' snapshots
+    await env.DB.prepare('DELETE FROM runners WHERE id = ?').bind(runnerId).run();
+  });
+
+  it('plans.status gate: defaults active, accepts proposed, rejects bogus — RUN-4', async () => {
+    const p = (await mcpCall(agent.apiKey, 'create_project', { key: 'DELS', name: 'dels' })).body;
+    const plan = await mcpCall(agent.apiKey, 'create_plan', {
+      projectId: p.id, title: 'Plan', phases: [{ title: 'P1', newTasks: [{ title: 't' }] }],
+    });
+    const row = await env.DB.prepare('SELECT status FROM plans WHERE id = ?').bind(plan.body.id)
+      .first<{ status: string }>();
+    expect(row!.status).toBe('active'); // existing create_plan path is ungated
+    // column accepts 'proposed'
+    await env.DB.prepare('UPDATE plans SET status = ? WHERE id = ?').bind('proposed', plan.body.id).run();
+    const proposed = await env.DB.prepare('SELECT status FROM plans WHERE id = ?').bind(plan.body.id).first<{ status: string }>();
+    expect(proposed!.status).toBe('proposed');
+    // CHECK rejects an unknown status
+    await expect(
+      env.DB.prepare('UPDATE plans SET status = ? WHERE id = ?').bind('bogus', plan.body.id).run(),
+    ).rejects.toThrow();
+    await del(p.id, '');
   });
 
   it('project delete is refused for a non-owner member', async () => {

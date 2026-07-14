@@ -14,10 +14,13 @@ import { SKILL_MD } from './skill';
 import { metadataRoutes, oauth } from './oauth';
 import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
+import { z } from 'zod';
+import { AgentTool, RunKind, RunnerRepo, RunBudget, normalizeProjectKey } from '@noriq/shared';
 
 export { ProjectRoom } from './do/ProjectRoom';
 export { AgentSession } from './do/AgentSession';
 export { RateLimiter } from './do/RateLimiter';
+export { RunnerHub } from './do/RunnerHub';
 
 const app = new Hono<AppContext>();
 
@@ -156,6 +159,26 @@ app.get('/ws/projects/:projectId', async (c) => {
     return c.text('not found', 404);
   }
   return room(c.env, pid).fetch(c.req.raw);
+});
+
+// The runtime channel (RUN-7): the daemon dials this per-runner WS. Unlike the
+// browser project socket it authenticates with the user's OAuth Bearer (a Node
+// client can set headers), and the runner must belong to that user. The socket
+// itself lives in the RunnerHub DO (idFromName(runnerId)).
+app.get('/ws/runner/:id', async (c) => {
+  if (c.req.header('Upgrade')?.toLowerCase() !== 'websocket') return c.text('expected WebSocket upgrade', 426);
+  const header = c.req.header('Authorization') ?? '';
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  if (!token) return c.text('missing bearer token', 401);
+  const tok = await c.env.DB.prepare(
+    `SELECT t.user_id AS userId FROM oauth_tokens t
+     WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
+  ).bind(await sha256Hex(token)).first<{ userId: string }>();
+  if (!tok) return c.text('invalid or expired token', 401);
+  const id = c.req.param('id')!;
+  const owned = await c.env.DB.prepare('SELECT id FROM runners WHERE id = ? AND owner_user_id = ?').bind(id, tok.userId).first();
+  if (!owned) return c.text('not found', 404);
+  return c.env.RUNNER_HUB.get(c.env.RUNNER_HUB.idFromName(id)).fetch(c.req.raw);
 });
 
 // --- admin bootstrap (users; agent key issuance retired — agents arrive via OAuth) --
@@ -819,6 +842,221 @@ app.post('/api/agents/:aid/revoke', userAuth, async (c) => {
   if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
   await c.env.DB.prepare("UPDATE agents SET status = 'revoked' WHERE id = ?").bind(c.req.param('aid')!).run();
   return c.json({ ok: true });
+});
+
+// --- runners: the execution plane (RUN-5) -----------------------------------
+// A runner is a per-user local daemon, authenticated by the user's OAuth token
+// (the same credential its spawned agents use). Registration + heartbeat run over
+// REST (agentAuth → the owning user); the dashboard reads them via userAuth. Run
+// dispatch + the live WS channel land in RUN-6/RUN-7.
+
+// A runner is treated offline once its heartbeat is older than this (≈3 missed
+// 30s beats), derived on read so the panel is correct even without a sweeper.
+const RUNNER_HEARTBEAT_TTL_MS = 90_000;
+
+const RegisterRunnerBody = z.object({
+  runnerId: z.string().optional(), // present on re-register (reconnect)
+  label: z.string().min(1),
+  tools: z.array(AgentTool).default([]),
+  kinds: z.array(RunKind).default([]),
+  maxConcurrency: z.number().int().nonnegative().default(1),
+  repos: z.array(RunnerRepo).default([]),
+});
+
+const HeartbeatBody = z.object({
+  freeSlots: z.number().int().nonnegative(),
+  status: z.enum(['online', 'draining']).default('online'),
+  repos: z.array(RunnerRepo).nullish(), // resend only when discovery changed the set
+});
+
+// Wire the RUN-3 resolution contract: a committed KEY resolves to a prj_… id on
+// THIS server, but only among projects the owning user may reach (mirrors the
+// agent/MCP scoping — no admin escalation, no leaking other tenants' projects).
+async function resolveRunnerRepos(
+  env: Env,
+  ownerUserId: string,
+  repos: Array<z.infer<typeof RunnerRepo>>,
+): Promise<Array<z.infer<typeof RunnerRepo>>> {
+  const out: Array<z.infer<typeof RunnerRepo>> = [];
+  for (const r of repos) {
+    const key = normalizeProjectKey(r.projectKey);
+    const row = await env.DB.prepare(
+      `SELECT p.id AS id FROM projects p WHERE p.key = ?2 AND ${USER_PROJECT_WHERE}`,
+    ).bind(ownerUserId, key).first<{ id: string }>();
+    out.push({ ...r, projectKey: key, projectId: row?.id ?? null });
+  }
+  return out;
+}
+
+// Map a runners row to the wire Runner shape (never leak owner_user_id), deriving
+// effective online/offline from heartbeat freshness.
+function runnerView(row: Record<string, unknown>) {
+  const last = row.last_heartbeat_at as string | null;
+  const stale = !last || Date.now() - Date.parse(last) > RUNNER_HEARTBEAT_TTL_MS;
+  return {
+    id: row.id as string,
+    projectId: (row.project_id as string | null) ?? null,
+    label: row.label as string,
+    status: stale ? 'offline' : (row.status as string),
+    capabilities: JSON.parse(String(row.capabilities)),
+    repos: JSON.parse(String(row.repos)),
+    freeSlots: row.free_slots as number,
+    lastHeartbeatAt: last,
+    createdAt: row.created_at as string,
+  };
+}
+
+app.post('/api/runners', agentAuth, async (c) => {
+  const parsed = RegisterRunnerBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid runner registration', detail: parsed.error.issues }, 400);
+  const b = parsed.data;
+  const userId = c.var.connection!.userId;
+  const repos = await resolveRunnerRepos(c.env, userId, b.repos);
+  const capabilities = JSON.stringify({ tools: b.tools, kinds: b.kinds, maxConcurrency: b.maxConcurrency });
+  const now = nowIso();
+  let id = b.runnerId;
+  if (id) {
+    // Re-register (reconnect): only the owner may re-bind an existing runner.
+    const owned = await c.env.DB.prepare('SELECT id FROM runners WHERE id = ? AND owner_user_id = ?').bind(id, userId).first();
+    if (!owned) return c.json({ error: 'runner not found' }, 404);
+    await c.env.DB.prepare(
+      "UPDATE runners SET label = ?, status = 'online', capabilities = ?, repos = ?, free_slots = ?, last_heartbeat_at = ? WHERE id = ?",
+    ).bind(b.label, capabilities, JSON.stringify(repos), b.maxConcurrency, now, id).run();
+    // Reconnect reconciliation (RUN-6): the daemon's previous process died, so any
+    // Runs still dispatched/running/blocked for it are orphaned → failed{daemon_restart}.
+    // Runs are per-project, so sweep each affected project's ProjectRoom (the authority).
+    const { results: staleProjects } = await c.env.DB.prepare(
+      "SELECT DISTINCT project_id AS pid FROM runs WHERE runner_id = ? AND status IN ('dispatched','running','blocked')",
+    ).bind(id).all<{ pid: string }>();
+    const sysActor: Actor = { kind: 'system', id: 'system', name: 'system' };
+    for (const { pid } of staleProjects) {
+      await room(c.env, pid).reconcileRunnerRuns(pid, sysActor, id);
+    }
+  } else {
+    id = newId('rnr');
+    await c.env.DB.prepare(
+      `INSERT INTO runners (id, owner_user_id, label, status, capabilities, repos, free_slots, last_heartbeat_at, created_at)
+       VALUES (?, ?, ?, 'online', ?, ?, ?, ?, ?)`,
+    ).bind(id, userId, b.label, capabilities, JSON.stringify(repos), b.maxConcurrency, now, now).run();
+  }
+  const row = await c.env.DB.prepare('SELECT * FROM runners WHERE id = ?').bind(id).first<Record<string, unknown>>();
+  return c.json({ runner: runnerView(row!) });
+});
+
+app.post('/api/runners/:id/heartbeat', agentAuth, async (c) => {
+  const parsed = HeartbeatBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid heartbeat', detail: parsed.error.issues }, 400);
+  const userId = c.var.connection!.userId;
+  const id = c.req.param('id')!;
+  const owned = await c.env.DB.prepare('SELECT id FROM runners WHERE id = ? AND owner_user_id = ?').bind(id, userId).first();
+  if (!owned) return c.json({ error: 'runner not found' }, 404);
+  const b = parsed.data;
+  if (b.repos) {
+    const repos = await resolveRunnerRepos(c.env, userId, b.repos);
+    await c.env.DB.prepare('UPDATE runners SET free_slots = ?, status = ?, repos = ?, last_heartbeat_at = ? WHERE id = ?')
+      .bind(b.freeSlots, b.status, JSON.stringify(repos), nowIso(), id).run();
+  } else {
+    await c.env.DB.prepare('UPDATE runners SET free_slots = ?, status = ?, last_heartbeat_at = ? WHERE id = ?')
+      .bind(b.freeSlots, b.status, nowIso(), id).run();
+  }
+  return c.json({ ok: true });
+});
+
+app.get('/api/runners', userAuth, async (c) => {
+  // A user sees their own runners; an admin may see all with ?all=1.
+  const all = c.req.query('all') === '1' && c.var.user!.role === 'admin';
+  const stmt = all
+    ? c.env.DB.prepare('SELECT * FROM runners ORDER BY created_at DESC')
+    : c.env.DB.prepare('SELECT * FROM runners WHERE owner_user_id = ? ORDER BY created_at DESC').bind(c.var.user!.id);
+  const { results } = await stmt.all<Record<string, unknown>>();
+  return c.json({ runners: results.map(runnerView) });
+});
+
+const hub = (env: Env, runnerId: string) => env.RUNNER_HUB.get(env.RUNNER_HUB.idFromName(runnerId));
+
+const DispatchBody = z.object({
+  runnerId: z.string(),
+  kind: RunKind,
+  agentTool: AgentTool,
+  repoRef: z.string(), // must be one of the runner's advertised repos, resolving to this project
+  brief: z.string().default(''),
+  anchor: z.discriminatedUnion('type', [
+    z.object({ type: z.literal('task'), id: z.string() }),
+    z.object({ type: z.literal('plan'), id: z.string() }),
+  ]).nullish(),
+  budget: RunBudget.optional(),
+});
+
+// Dispatch a brief → a Run on a runner (RUN-7). The dispatch primitive is the
+// *intent*: kind + repo + brief (+ optional task/plan anchor). Creates the Run in
+// the project's ProjectRoom (authoritative, dispatched) and pushes run.assigned
+// down the runner's live socket. Under /api/projects/:pid/* → project reach gated.
+app.post('/api/projects/:pid/runs', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const parsed = DispatchBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid dispatch', detail: parsed.error.issues }, 400);
+  const b = parsed.data;
+  // The runner must belong to this user, and the target repo must resolve to THIS project.
+  const runner = await c.env.DB.prepare('SELECT repos FROM runners WHERE id = ? AND owner_user_id = ?')
+    .bind(b.runnerId, c.var.user!.id).first<{ repos: string }>();
+  if (!runner) return c.json({ error: 'runner not found' }, 404);
+  const repo = (JSON.parse(runner.repos) as Array<{ id: string; projectId: string | null }>).find((r) => r.id === b.repoRef);
+  if (!repo) return c.json({ error: 'unknown repoRef for this runner' }, 400);
+  if (repo.projectId !== pid) return c.json({ error: 'repo does not resolve to this project' }, 400);
+
+  const run = await room(c.env, pid).createRun(pid, humanActor(c), {
+    kind: b.kind, agentTool: b.agentTool, repoRef: b.repoRef, brief: b.brief,
+    anchor: b.anchor ? { type: b.anchor.type, id: b.anchor.id } : null,
+    budget: b.budget, runnerId: b.runnerId,
+  });
+  const { delivered } = await hub(c.env, b.runnerId).deliver(JSON.stringify({ type: 'run.assigned', run }));
+  return c.json({ run, delivered });
+});
+
+// Cancel a Run (RUN-7): mark it cancelled in its project's authority and push
+// run.cancel down the runner's socket so the daemon SIGTERMs the process.
+app.post('/api/runs/:runId/cancel', userAuth, async (c) => {
+  const runId = c.req.param('runId')!;
+  const reason = ((await c.req.json<{ reason?: string }>().catch(() => ({}))) as { reason?: string }).reason ?? null;
+  const run = await c.env.DB.prepare('SELECT project_id AS pid, runner_id AS runnerId FROM runs WHERE id = ?')
+    .bind(runId).first<{ pid: string; runnerId: string | null }>();
+  if (!run) return c.json({ error: 'run not found' }, 404);
+  if (!(await reachesProject(c, run.pid))) return c.json({ error: 'not found' }, 404);
+  const updated = await room(c.env, run.pid).transitionRun(run.pid, humanActor(c), runId, { status: 'cancelled', reason });
+  if (run.runnerId) {
+    await hub(c.env, run.runnerId).deliver(JSON.stringify({ type: 'run.cancel', runId, hard: true, reason }));
+  }
+  return c.json({ run: updated });
+});
+
+// Steering-ack (RUN-7): the daemon reports it delivered a steer to the agent over
+// the runtime channel. Record it so the MCP notices fallback won't double-deliver
+// (the dedup guard consumed in computeUpdates). agentAuth → the runner's owner.
+const SteerAckBody = z.object({
+  messageId: z.string(),
+  agentId: z.string().optional(), // defaults to the Run's spawned agent
+  via: z.enum(['runtime', 'fallback', 'dropped']).default('runtime'),
+});
+app.post('/api/runs/:runId/steer-ack', agentAuth, async (c) => {
+  const runId = c.req.param('runId')!;
+  const parsed = SteerAckBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid steer-ack', detail: parsed.error.issues }, 400);
+  const b = parsed.data;
+  const run = await c.env.DB.prepare(
+    `SELECT r.agent_id AS agentId, rn.owner_user_id AS owner
+     FROM runs r LEFT JOIN runners rn ON rn.id = r.runner_id WHERE r.id = ?`,
+  ).bind(runId).first<{ agentId: string | null; owner: string | null }>();
+  if (!run || run.owner !== c.var.connection!.userId) return c.json({ error: 'run not found' }, 404);
+  // Only a live runtime delivery suppresses the notices fallback; fallback/dropped
+  // leave the notice to fire normally.
+  if (b.via === 'runtime') {
+    const agentId = b.agentId ?? run.agentId;
+    if (!agentId) return c.json({ error: 'no agent to attribute delivery to' }, 400);
+    await c.env.DB.prepare(
+      'INSERT OR IGNORE INTO runtime_deliveries (agent_id, message_id, run_id) VALUES (?, ?, ?)',
+    ).bind(agentId, b.messageId, runId).run();
+  }
+  return c.json({ ok: true, suppressed: b.via === 'runtime' });
 });
 
 // --- per-task event timeline (PLNR-34) ----------------------------------------------
