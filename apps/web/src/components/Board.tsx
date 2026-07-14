@@ -15,19 +15,27 @@ const COLUMNS: Array<[TaskStatus, string]> = [
 const TYPE_ICON: Record<string, string> = { bug: '✕', chore: '⟳', research: '?', feature: '' };
 
 export function Board({ store }: { store: AppStore }) {
-  const { currentPid, helpers, actions, draggedId, snapshot, showArchived } = store;
+  const { currentPid, helpers, actions, draggedId, snapshot, showArchived, boardId } = store;
   const tasks = helpers.tasksOf(currentPid);
   const milestones = snapshot?.milestones ?? [];
   const tags = snapshot?.tags ?? [];
+  const boards = snapshot?.boards ?? [];
+  const firstBoardId = boards[0]?.id ?? null;
   const [msFilter, setMsFilter] = useState<string | null>(null);
   const [tagFilter, setTagFilter] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const tagById = new Map(tags.map((c) => [c.id, c]));
   const msById = new Map(milestones.map((m) => [m.id, m]));
 
+  // A task shows on the selected board; tasks with no board (shouldn't happen post-
+  // migration) fall onto the default board so nothing ever disappears.
+  const onBoard = (tBoardId: string | null) =>
+    boardId === null || tBoardId === boardId || (tBoardId == null && boardId === firstBoardId);
+
   const q = query.trim().toLowerCase();
   const visible = tasks.filter(
     (t) =>
+      onBoard(t.boardId) &&
       (msFilter === null || t.milestoneId === msFilter) &&
       (tagFilter === null || t.tagIds.includes(tagFilter)) &&
       (q === '' ||
@@ -39,6 +47,24 @@ export function Board({ store }: { store: AppStore }) {
 
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+      {/* board switcher (PLNR-80) */}
+      <BoardTabs
+        boards={boards}
+        current={boardId}
+        onSelect={(id) => actions.setBoard(id)}
+        onCreate={() => {
+          const name = window.prompt('New board name:')?.trim();
+          if (name) void actions.createBoard(name);
+        }}
+        onRename={(id, cur) => {
+          const name = window.prompt('Rename board:', cur)?.trim();
+          if (name && name !== cur) void actions.renameBoard(id, name);
+        }}
+        onDelete={(id, name) => {
+          if (window.confirm(`Delete board "${name}"? Its tasks move to another board.`)) void actions.deleteBoard(id);
+        }}
+      />
+
       {/* filter bar — row 1: milestones (scroll) + pinned search */}
       <div
         style={{
@@ -270,6 +296,81 @@ export function Board({ store }: { store: AppStore }) {
           })}
         </div>
       </div>
+    </div>
+  );
+}
+
+function BoardTabs({ boards, current, onSelect, onCreate, onRename, onDelete }: {
+  boards: Array<{ id: string; name: string }>;
+  current: string | null;
+  onSelect: (id: string) => void;
+  onCreate: () => void;
+  onRename: (id: string, name: string) => void;
+  onDelete: (id: string, name: string) => void;
+}) {
+  return (
+    <div
+      style={{
+        flex: 'none', display: 'flex', alignItems: 'center', gap: 6,
+        padding: '10px 22px 0', overflowX: 'auto',
+      }}
+    >
+      {boards.map((b) => {
+        const active = b.id === current;
+        return (
+          <div
+            key={b.id}
+            onClick={() => onSelect(b.id)}
+            className="hover-border"
+            style={{
+              cursor: 'pointer', flex: 'none', display: 'flex', alignItems: 'center', gap: 7,
+              padding: '6px 11px', borderRadius: '9px 9px 0 0',
+              fontSize: 12.5, fontWeight: 600,
+              color: active ? 'var(--text)' : 'var(--text-dim)',
+              background: active ? 'var(--card)' : 'transparent',
+              borderBottom: `2px solid ${active ? 'var(--accent)' : 'transparent'}`,
+            }}
+          >
+            {b.name}
+            {active && (
+              <>
+                <span
+                  role="button"
+                  title="Rename board"
+                  onClick={(e) => { e.stopPropagation(); onRename(b.id, b.name); }}
+                  className="hover-bright"
+                  style={{ color: 'var(--text-faint)', fontSize: 10.5, lineHeight: 1, cursor: 'pointer' }}
+                >
+                  ✎
+                </span>
+                {boards.length > 1 && (
+                  <span
+                    role="button"
+                    title="Delete board"
+                    onClick={(e) => { e.stopPropagation(); onDelete(b.id, b.name); }}
+                    className="hover-bright"
+                    style={{ color: 'var(--text-faint)', fontSize: 11, lineHeight: 1, cursor: 'pointer' }}
+                  >
+                    🗑
+                  </span>
+                )}
+              </>
+            )}
+          </div>
+        );
+      })}
+      <button
+        onClick={onCreate}
+        title="New board"
+        className="rail-add"
+        style={{
+          cursor: 'pointer', flex: 'none', fontFamily: 'var(--mono)', fontSize: 11,
+          color: 'var(--text-dim)', border: '1px dashed var(--w-15)',
+          padding: '5px 11px', borderRadius: 8, background: 'transparent', marginBottom: 2,
+        }}
+      >
+        + board
+      </button>
     </div>
   );
 }

@@ -87,11 +87,15 @@ export const api = {
   agentEvents: (aid: string) => req<{ events: ApiAgentEvent[] }>('GET', `/api/agents/${aid}/events`),
   revokeAgent: (aid: string) => req('POST', `/api/agents/${aid}/revoke`),
 
+  createBoard: (pid: string, name: string) => req<{ id: string; name: string }>('POST', `/api/projects/${pid}/boards`, { name }),
+  renameBoard: (pid: string, bid: string, name: string) => req('PATCH', `/api/projects/${pid}/boards/${bid}`, { name }),
+  deleteBoard: (pid: string, bid: string) => req<{ ok: boolean; movedTo: string }>('DELETE', `/api/projects/${pid}/boards/${bid}`),
+
   updateMilestone: (pid: string, mid: string, patch: { title?: string; dueAt?: string | null }) =>
     req('PATCH', `/api/projects/${pid}/milestones/${mid}`, patch),
   createMilestone: (pid: string, title: string, dueAt?: string) =>
     req<{ id: string }>('POST', `/api/projects/${pid}/milestones`, { title, dueAt }),
-  createTask: (pid: string, input: { title: string; body?: string; priority?: number; milestoneId?: string; tags?: string[]; type?: string }) =>
+  createTask: (pid: string, input: { title: string; body?: string; priority?: number; milestoneId?: string; tags?: string[]; type?: string; boardId?: string }) =>
     req<{ id: string; key: string }>('POST', `/api/projects/${pid}/tasks`, input),
   updateTask: (pid: string, tid: string, patch: Record<string, unknown>) =>
     req('PATCH', `/api/projects/${pid}/tasks/${tid}`, patch),
@@ -175,11 +179,12 @@ export interface ApiSnapshot {
   tasks: Array<{
     id: string; key: string; title: string; body: string; status: string; type: string; priority: number;
     claimedBy: string | null; claimExpiresAt: string | null; parentTaskId: string | null;
-    milestoneId: string | null; openComments: number; order: number; archivedAt: string | null;
+    milestoneId: string | null; boardId: string | null; openComments: number; order: number; archivedAt: string | null;
   }>;
   dependencies: Array<{ taskId: string; dependsOnTaskId: string }>;
   agents: Array<{ id: string; name: string; role: string; status: string; lastSeenAt: string | null; ownerName: string | null; parentAgentId: string | null }>;
   milestones: Array<{ id: string; title: string; dueAt: string | null; order: number }>;
+  boards: Array<{ id: string; name: string; order: number }>;
   plans: Array<{ id: string; agentId: string | null; title: string; description: string; body: string; createdAt: string }>;
   phases: Array<{ id: string; planId: string; title: string; body: string; order: number }>;
   phaseTasks: Array<{ phaseId: string; taskId: string }>;

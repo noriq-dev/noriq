@@ -219,30 +219,32 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         `INSERT INTO projects (id, key, name, description, status, repo_url, claim_ttl_seconds, created_at) VALUES (?, ?, ?, ?, 'active', ?, 1800, ?)`,
       ).bind(id, args.key, args.name, args.description ?? '', args.repoUrl ?? null, nowIso()).run();
       await room(env, id).createMilestone(id, actor, 'Backlog');
+      await room(env, id).createBoard(id, actor, 'Main');
       return { id, key: args.key };
     }),
   );
 
   defineTool(
     'get_project',
-    'Project snapshot: tasks (with status/holder/deps/open-comment counts), milestones, agents active here.',
+    'Project snapshot: tasks (with status/holder/deps/board/open-comment counts), milestones, boards, agents active here.',
     { projectId: z.string() },
     tool(async ({ projectId }) => {
-      const [tasks, milestones, project, categories] = await Promise.all([
+      const [tasks, milestones, boards, project, categories] = await Promise.all([
         env.DB.prepare(
           `SELECT t.id, t.key, t.title, t.status, t.type, t.priority, t.claimed_by AS claimedBy, t.parent_task_id AS parentTaskId,
-                  t.milestone_id AS milestoneId, t.open_comments AS openComments, t.claim_expires_at AS claimExpiresAt,
+                  t.milestone_id AS milestoneId, t.board_id AS boardId, t.open_comments AS openComments, t.claim_expires_at AS claimExpiresAt,
                   (SELECT GROUP_CONCAT(dt.key) FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id WHERE d.task_id = t.id) AS dependsOn,
                   (SELECT GROUP_CONCAT(g.name) FROM task_tags tt JOIN tags g ON g.id = tt.tag_id WHERE tt.task_id = t.id) AS tags
            FROM tasks t WHERE t.project_id = ? ORDER BY t."order"`,
         ).bind(projectId).all(),
         env.DB.prepare('SELECT id, title, due_at AS dueAt FROM milestones WHERE project_id = ? ORDER BY "order"').bind(projectId).all(),
+        env.DB.prepare('SELECT id, name FROM boards WHERE project_id = ? ORDER BY "order", created_at').bind(projectId).all(),
         env.DB.prepare('SELECT id, key, name, description, repo_url AS repoUrl, claim_ttl_seconds AS claimTtlSeconds FROM projects WHERE id = ?')
           .bind(projectId).first(),
         env.DB.prepare('SELECT id, name, color FROM tags WHERE project_id = ? ORDER BY "order"').bind(projectId).all(),
       ]);
       if (!project) throw new Error(`project ${projectId} not found`);
-      return { project, milestones: milestones.results, tags: categories.results, tasks: tasks.results };
+      return { project, milestones: milestones.results, boards: boards.results, tags: categories.results, tasks: tasks.results };
     }),
   );
 
@@ -261,6 +263,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       dependsOn: z.array(z.string()).optional(),
       tags: z.array(z.string()).optional().describe('Tag names — auto-created for the project if new (e.g. ["backend", "auth"])'),
       type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
+      boardId: z.string().optional().describe('Board to place the task on (see get_project.boards); defaults to the project’s default board'),
     },
     tool(async ({ projectId, ...input }) => room(env, projectId).createTask(projectId, actor, input)),
   );
@@ -308,6 +311,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       milestoneId: z.string().optional(),
       tags: z.array(z.string()).optional().describe('REPLACES the tag set (auto-created; [] clears)'),
       type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
+      boardId: z.string().optional().describe('Move the task to another board (see get_project.boards)'),
     },
     tool(async ({ projectId, taskId, ...patch }) => room(env, projectId).updateTask(projectId, actor, taskId, patch)),
   );

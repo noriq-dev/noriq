@@ -36,6 +36,9 @@ function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
     case 'comment.acknowledged': verb = 'acknowledged'; subject = `comments on ${p.taskKey}`; taskId = e.subjectId; break;
     case 'message.sent': verb = 'msg'; subject = `→ ${p.to} · “${p.body}”`; break;
     case 'milestone.created': verb = 'milestone'; subject = String(p.title ?? ''); break;
+    case 'board.created': verb = 'board'; subject = `created ${p.name ?? ''}`; break;
+    case 'board.updated': verb = 'board'; subject = `renamed → ${p.name ?? ''}`; break;
+    case 'board.deleted': verb = 'board'; subject = 'deleted'; break;
     case 'dependency.added': verb = 'dep'; subject = `${p.key} depends on ${p.dependsOn}`; taskId = e.subjectId; break;
     default: subject = `${e.verb} ${e.subjectId}`;
   }
@@ -74,11 +77,14 @@ export function useAppStore() {
   const [comments, setComments] = useState<TaskVM['comments']>([]);
   const [tick, setTick] = useState(0);
   const [showArchived, setShowArchived] = useState(false);
+  const [boardId, setBoardId] = useState<string | null>(null); // PLNR-80: which board the board view shows
 
   const pidRef = useRef(currentPid);
   pidRef.current = currentPid;
   const archivedRef = useRef(showArchived);
   archivedRef.current = showArchived;
+  const boardRef = useRef(boardId);
+  boardRef.current = boardId;
   const selRef = useRef(selectedTaskId);
   selRef.current = selectedTaskId;
   const lastSeq = useRef(0);
@@ -171,6 +177,14 @@ export function useAppStore() {
   useEffect(() => {
     if (user && currentPid) void loadSnapshot(currentPid);
   }, [user, currentPid, loadSnapshot]);
+
+  // Keep the selected board valid: default to the first board, and re-home if the
+  // current one vanished (project switch or board deletion).
+  useEffect(() => {
+    const boards = snapshot?.boards ?? [];
+    if (!boards.length) { setBoardId(null); return; }
+    setBoardId((cur) => (cur && boards.some((b) => b.id === cur) ? cur : boards[0]!.id));
+  }, [snapshot?.boards]);
 
   useEffect(() => {
     if (selectedTaskId) void loadComments(selectedTaskId);
@@ -277,6 +291,7 @@ export function useAppStore() {
         ttlMax,
         deps: depsByTask.get(t.id) ?? [],
         milestoneId: t.milestoneId,
+        boardId: t.boardId,
         tagIds: tagsByTask.get(t.id) ?? [],
         type: t.type,
         openComments: t.openComments,
@@ -380,7 +395,8 @@ export function useAppStore() {
 
     async submitTask(input: { title: string; body?: string; priority?: number; milestoneId?: string; tags?: string[]; type?: string }) {
       if (!pidRef.current) return;
-      await api.createTask(pidRef.current, input);
+      // New tasks land on the board you're currently viewing (falls back to default server-side).
+      await api.createTask(pidRef.current, { ...input, ...(boardRef.current ? { boardId: boardRef.current } : {}) });
       setModal(null);
       refresh();
     },
@@ -495,6 +511,33 @@ export function useAppStore() {
       await loadProjects(); // refetches without the deleted project
     },
 
+    // --- boards (PLNR-80) ---
+    setBoard(id: string) {
+      setBoardId(id);
+    },
+    async createBoard(name: string) {
+      if (!pidRef.current || !name.trim()) return;
+      const b = await api.createBoard(pidRef.current, name.trim());
+      setBoardId(b.id); // jump to the board you just made
+      refresh();
+    },
+    async renameBoard(id: string, name: string) {
+      if (!pidRef.current || !name.trim()) return;
+      await api.renameBoard(pidRef.current, id, name.trim());
+      refresh();
+    },
+    async deleteBoard(id: string) {
+      if (!pidRef.current) return;
+      const r = await api.deleteBoard(pidRef.current, id);
+      setBoardId(r.movedTo); // follow the tasks to where they landed
+      refresh();
+    },
+    async moveTaskToBoard(taskId: string, targetBoardId: string) {
+      if (!pidRef.current) return;
+      await api.updateTask(pidRef.current, taskId, { boardId: targetBoardId });
+      refresh();
+    },
+
     async answerSignal(signalId: string, response: string) {
       if (!pidRef.current || !response.trim()) return;
       await api.answerSignal(pidRef.current, signalId, response.trim());
@@ -536,7 +579,7 @@ export function useAppStore() {
   };
 
   return {
-    user, authChecked, needsSetup, modal, editMilestone, groups, snapshot, showArchived,
+    user, authChecked, needsSetup, modal, editMilestone, groups, snapshot, showArchived, boardId,
     currentPid: currentPid ?? '', view, selectedTaskId, selectedAgentId, draftKind, draftText, draggedId,
     data, helpers, actions,
   };

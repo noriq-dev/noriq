@@ -33,6 +33,8 @@ export interface CreateTaskInput {
   /** Legacy alias for a single tag. */
   category?: string | null;
   type?: string;
+  /** Board this task lands on; defaults to the project's default board. */
+  boardId?: string | null;
 }
 
 export interface TaskPatch {
@@ -42,6 +44,7 @@ export interface TaskPatch {
   priority?: number;
   estimate?: number | null;
   milestoneId?: string | null;
+  boardId?: string | null;
   /** Replace the task's tag set (names; auto-created). */
   tags?: string[];
   /** Legacy single-tag alias. */
@@ -248,11 +251,13 @@ export class ProjectRoom extends DurableObject<Env> {
       const id = newId('task');
       const key = `${proj.key}-${proj.n}`;
       const now = nowIso();
+      // Every task lands on a board; fall back to the project's default board.
+      const boardId = input.boardId ?? (await this.defaultBoardId(pid));
       const stmts = [
         this.env.DB.prepare(
-          `INSERT INTO tasks (id, project_id, key, milestone_id, parent_task_id, title, body, status, type, priority, estimate, "order", created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)`,
-        ).bind(id, pid, key, input.milestoneId ?? null, input.parentTaskId ?? null, input.title, input.body ?? '', input.type ?? 'feature', input.priority ?? 2, input.estimate ?? null, proj.n, now, now),
+          `INSERT INTO tasks (id, project_id, key, milestone_id, board_id, parent_task_id, title, body, status, type, priority, estimate, "order", created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)`,
+        ).bind(id, pid, key, input.milestoneId ?? null, boardId, input.parentTaskId ?? null, input.title, input.body ?? '', input.type ?? 'feature', input.priority ?? 2, input.estimate ?? null, proj.n, now, now),
         this.env.DB.prepare('UPDATE projects SET next_task_number = ? WHERE id = ?').bind(proj.n + 1, pid),
       ];
       for (const dep of input.dependsOn ?? []) {
@@ -292,7 +297,7 @@ export class ProjectRoom extends DurableObject<Env> {
       const binds: unknown[] = [];
       const fields: Array<[keyof TaskPatch, string]> = [
         ['title', 'title'], ['body', 'body'], ['priority', 'priority'], ['type', 'type'],
-        ['estimate', 'estimate'], ['milestoneId', 'milestone_id'], ['order', '"order"'],
+        ['estimate', 'estimate'], ['milestoneId', 'milestone_id'], ['boardId', 'board_id'], ['order', '"order"'],
       ];
       for (const [k, col] of fields) {
         if (patch[k] !== undefined) {
@@ -716,6 +721,60 @@ export class ProjectRoom extends DurableObject<Env> {
   }
 
   // ---------------------------------------------------------------------------
+  // Boards (PLNR-80): a project can hold several boards (environments, stages…).
+  // Every task belongs to one board; the default board is the earliest one.
+  // ---------------------------------------------------------------------------
+
+  /** The project's default board (lowest order, then oldest). Null only if none exist. */
+  private async defaultBoardId(projectId: string): Promise<string | null> {
+    const row = await this.env.DB.prepare(
+      'SELECT id FROM boards WHERE project_id = ? ORDER BY "order", created_at LIMIT 1',
+    ).bind(projectId).first<{ id: string }>();
+    return row?.id ?? null;
+  }
+
+  async createBoard(projectId: string, actor: Actor, name: string)  {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const id = newId('brd');
+      const row = await this.env.DB.prepare('SELECT COUNT(*) AS n FROM boards WHERE project_id = ?')
+        .bind(this.projectId).first<{ n: number }>();
+      await this.env.DB.prepare('INSERT INTO boards (id, project_id, name, "order", created_at) VALUES (?, ?, ?, ?, ?)')
+        .bind(id, this.projectId, name, row?.n ?? 0, nowIso()).run();
+      await this.emit(actor, 'board.created', 'board', id, { name });
+      return { id, name };
+    });
+  }
+
+  async renameBoard(projectId: string, actor: Actor, boardId: string, name: string)  {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      await this.env.DB.prepare('UPDATE boards SET name = ? WHERE id = ? AND project_id = ?')
+        .bind(name, boardId, this.projectId).run();
+      await this.emit(actor, 'board.updated', 'board', boardId, { name });
+      return { ok: true };
+    });
+  }
+
+  /** Delete a board, moving its tasks to another board. Refuses to remove the last one. */
+  async deleteBoard(projectId: string, actor: Actor, boardId: string)  {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const others = await this.env.DB.prepare(
+        'SELECT id FROM boards WHERE project_id = ? AND id != ? ORDER BY "order", created_at LIMIT 1',
+      ).bind(this.projectId, boardId).first<{ id: string }>();
+      if (!others) throw new Error('cannot delete the only board — a project needs at least one');
+      await this.env.DB.batch([
+        this.env.DB.prepare('UPDATE tasks SET board_id = ? WHERE board_id = ? AND project_id = ?')
+          .bind(others.id, boardId, this.projectId),
+        this.env.DB.prepare('DELETE FROM boards WHERE id = ? AND project_id = ?').bind(boardId, this.projectId),
+      ]);
+      await this.emit(actor, 'board.deleted', 'board', boardId, { movedTo: others.id });
+      return { ok: true, movedTo: others.id };
+    });
+  }
+
+  // ---------------------------------------------------------------------------
   // Archive (PLNR-70/73): archived tasks drop off the board unless the switch is on.
   // ---------------------------------------------------------------------------
 
@@ -858,6 +917,7 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('UPDATE tasks SET parent_task_id = NULL WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM tasks WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM milestones WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare('DELETE FROM boards WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM projects WHERE id = ?').bind(pid),
       ]);
       await this.ctx.storage.deleteAlarm().catch(() => {});

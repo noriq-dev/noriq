@@ -19,6 +19,7 @@ export function Drawer({ store }: { store: AppStore }) {
   const [ePriority, setEPriority] = useState(2);
   const [eTags, setETags] = useState('');
   const [eMilestone, setEMilestone] = useState('');
+  const [eBoard, setEBoard] = useState('');
   const [timeline, setTimeline] = useState<ApiAgentEvent[]>([]);
   const [addingTag, setAddingTag] = useState(false);
   const [newTag, setNewTag] = useState('');
@@ -64,6 +65,7 @@ export function Drawer({ store }: { store: AppStore }) {
     setEPriority(0); // priority isn't in the VM snapshot list; leave unchanged unless touched
     setETags(taskTags.map((t) => t.name).join(', '));
     setEMilestone(task.milestoneId ?? '');
+    setEBoard(task.boardId ?? '');
     setEditing(true);
   };
 
@@ -74,6 +76,7 @@ export function Drawer({ store }: { store: AppStore }) {
       type: eType,
       tags: eTags.split(',').map((t) => t.trim()).filter(Boolean),
       milestoneId: eMilestone || null,
+      ...(eBoard ? { boardId: eBoard } : {}),
       ...(ePriority > 0 ? { priority: ePriority } : {}),
     });
     setEditing(false);
@@ -227,6 +230,15 @@ export function Drawer({ store }: { store: AppStore }) {
                   ))}
                 </Select>
               </div>
+              {(snapshot?.boards ?? []).length > 1 && (
+                <div style={{ marginTop: 10 }}>
+                  <Select value={eBoard} onChange={(e) => setEBoard(e.target.value)}>
+                    {(snapshot?.boards ?? []).map((b) => (
+                      <option key={b.id} value={b.id}>board: {b.name}</option>
+                    ))}
+                  </Select>
+                </div>
+              )}
               <div style={{ marginTop: 10 }}>
                 <TextInput value={eTags} onChange={(e) => setETags(e.target.value)} placeholder="tags, comma, separated" list="noriq-tags-drawer" />
                 <datalist id="noriq-tags-drawer">

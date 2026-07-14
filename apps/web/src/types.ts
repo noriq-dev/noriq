@@ -57,6 +57,7 @@ export interface TaskVM {
   ttlMax?: number;
   deps: string[];
   milestoneId: string | null;
+  boardId: string | null;
   tagIds: string[];
   type: string;
   openComments: number;
@@ -75,6 +76,12 @@ export interface EventVM {
 }
 
 export type ViewId = 'home' | 'control' | 'graph' | 'board' | 'plans' | 'agents' | 'settings';
+
+export interface BoardVM {
+  id: string;
+  name: string;
+  order: number;
+}
 
 export interface AppData {
   projects: ProjectVM[];

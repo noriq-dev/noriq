@@ -243,12 +243,12 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
   // Auto-archive done tasks untouched for >24h whenever the project is viewed.
   await room(c.env, pid).sweepArchive(pid).catch(() => {});
   const includeArchived = c.req.query('archived') === '1';
-  const [project, tasks, deps, agents, events, milestones, plans, phases, phaseTasks, tags, taskTags, signals] = await Promise.all([
+  const [project, tasks, deps, agents, events, milestones, boards, plans, phases, phaseTasks, tags, taskTags, signals] = await Promise.all([
     c.env.DB.prepare('SELECT id, key, name, description, claim_ttl_seconds AS claimTtlSeconds, repo_url AS repoUrl FROM projects WHERE id = ?')
       .bind(pid).first(),
     c.env.DB.prepare(
       `SELECT id, key, title, body, status, type, priority, claimed_by AS claimedBy, claim_expires_at AS claimExpiresAt,
-              parent_task_id AS parentTaskId, milestone_id AS milestoneId, archived_at AS archivedAt,
+              parent_task_id AS parentTaskId, milestone_id AS milestoneId, board_id AS boardId, archived_at AS archivedAt,
               open_comments AS openComments, "order"
        FROM tasks WHERE project_id = ? ${includeArchived ? '' : 'AND archived_at IS NULL'} ORDER BY "order"`,
     ).bind(pid).all(),
@@ -270,6 +270,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
        FROM events WHERE project_id = ? ORDER BY seq DESC LIMIT 60`,
     ).bind(pid).all(),
     c.env.DB.prepare('SELECT id, title, due_at AS dueAt, "order" FROM milestones WHERE project_id = ? ORDER BY "order"').bind(pid).all(),
+    c.env.DB.prepare('SELECT id, name, "order" FROM boards WHERE project_id = ? ORDER BY "order", created_at').bind(pid).all(),
     c.env.DB.prepare('SELECT id, agent_id AS agentId, title, description, body, created_at AS createdAt FROM plans WHERE project_id = ? ORDER BY created_at DESC').bind(pid).all(),
     c.env.DB.prepare('SELECT ph.id, ph.plan_id AS planId, ph.title, ph.body, ph."order" FROM phases ph JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ? ORDER BY ph."order"').bind(pid).all(),
     c.env.DB.prepare('SELECT pt.phase_id AS phaseId, pt.task_id AS taskId FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ?').bind(pid).all(),
@@ -291,6 +292,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     dependencies: deps.results,
     agents: agents.results,
     milestones: milestones.results,
+    boards: boards.results,
     plans: plans.results,
     phases: phases.results,
     phaseTasks: phaseTasks.results,
@@ -326,6 +328,7 @@ app.post('/api/projects', userAuth, async (c) => {
     `INSERT INTO projects (id, key, name, description, status, claim_ttl_seconds, owner_user_id, created_at) VALUES (?, ?, ?, ?, 'active', 1800, ?, ?)`,
   ).bind(id, body.key, body.name, body.description ?? '', c.var.user!.id, nowIso()).run();
   await room(c.env, id).createMilestone(id, humanActor(c), 'Backlog');
+  await room(c.env, id).createBoard(id, humanActor(c), 'Main');
   return c.json({ id, key: body.key });
 });
 
@@ -342,8 +345,32 @@ app.patch('/api/projects/:pid/milestones/:mid', userAuth, async (c) => {
   return c.json(result);
 });
 
+// --- boards (PLNR-80): multiple boards per project -----------------------------------
+app.post('/api/projects/:pid/boards', userAuth, async (c) => {
+  const { name } = await c.req.json<{ name: string }>();
+  if (!name?.trim()) return c.json({ error: 'name required' }, 400);
+  const result = await room(c.env, c.req.param('pid')!).createBoard(c.req.param('pid')!, humanActor(c), name.trim());
+  return c.json(result);
+});
+
+app.patch('/api/projects/:pid/boards/:bid', userAuth, async (c) => {
+  const { name } = await c.req.json<{ name?: string }>();
+  if (!name?.trim()) return c.json({ error: 'name required' }, 400);
+  const result = await room(c.env, c.req.param('pid')!).renameBoard(c.req.param('pid')!, humanActor(c), c.req.param('bid')!, name.trim());
+  return c.json(result);
+});
+
+app.delete('/api/projects/:pid/boards/:bid', userAuth, async (c) => {
+  try {
+    const result = await room(c.env, c.req.param('pid')!).deleteBoard(c.req.param('pid')!, humanActor(c), c.req.param('bid')!);
+    return c.json(result);
+  } catch (e) {
+    return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
+  }
+});
+
 app.post('/api/projects/:pid/tasks', userAuth, async (c) => {
-  const body = await c.req.json<{ title: string; body?: string; parentTaskId?: string; priority?: number; dependsOn?: string[] }>();
+  const body = await c.req.json<{ title: string; body?: string; parentTaskId?: string; priority?: number; dependsOn?: string[]; boardId?: string | null }>();
   if (!body.title) return c.json({ error: 'title required' }, 400);
   const result = await room(c.env, c.req.param('pid')!).createTask(c.req.param('pid')!, humanActor(c), body);
   return c.json(result);
