@@ -81,6 +81,19 @@ describe('run lifecycle in ProjectRoom (RUN-6)', () => {
     expect(done.exit!.finishedAt).toBeTruthy();
   });
 
+  it('persists the worktree path reported on a transition (server-side Run visibility)', async () => {
+    const run = await room(pid).createRun(pid, actor, { kind: 'build', repoRef: 'r', agentTool: 'claude', runnerId: 'rnr_1' });
+    expect(run.worktreePath).toBeNull(); // not known until the daemon reports it
+    const running = await room(pid).transitionRun(pid, actor, run.id, {
+      status: 'running',
+      worktreePath: '/home/mtuska/.noriq/worktrees/repo-run_1',
+    });
+    expect(running.worktreePath).toBe('/home/mtuska/.noriq/worktrees/repo-run_1');
+    // sticky: a later transition that omits it keeps the path
+    const done = await room(pid).transitionRun(pid, actor, run.id, { status: 'done' });
+    expect(done.worktreePath).toBe('/home/mtuska/.noriq/worktrees/repo-run_1');
+  });
+
   it('rejects an illegal transition (queued → done)', async () => {
     const run = await room(pid).createRun(pid, actor, { kind: 'scope', repoRef: 'r', agentTool: 'codex' });
     await expect(room(pid).transitionRun(pid, actor, run.id, { status: 'done' })).rejects.toThrow(/illegal run transition/);

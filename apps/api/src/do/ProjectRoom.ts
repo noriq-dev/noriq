@@ -86,6 +86,7 @@ export interface RunPatch {
   status: string; // target RunStatus
   agentId?: string | null; // set once the spawned agent registers its own actor
   exit?: Record<string, unknown> | null; // terminal detail; synthesized if omitted
+  worktreePath?: string | null; // daemon-side checkout path, for server-side visibility
   reason?: string | null;
 }
 
@@ -93,6 +94,7 @@ type RunRow = {
   id: string; project_id: string; runner_id: string | null; agent_id: string | null;
   kind: string; anchor_type: string | null; anchor_id: string | null; brief: string;
   repo_ref: string; agent_tool: string; budget: string; status: string; exit: string | null;
+  worktree_path: string | null;
   created_by: string; created_at: string; updated_at: string;
   dispatched_at: string | null; started_at: string | null;
 };
@@ -112,6 +114,7 @@ export interface RunView {
   budget: Record<string, unknown>;
   status: string;
   exit: Record<string, unknown> | null;
+  worktreePath: string | null;
   createdBy: string;
   createdAt: string;
   updatedAt: string;
@@ -1052,6 +1055,7 @@ export class ProjectRoom extends DurableObject<Env> {
       budget: JSON.parse(r.budget || '{}'),
       status: r.status,
       exit: r.exit ? JSON.parse(r.exit) : null,
+      worktreePath: r.worktree_path,
       createdBy: r.created_by,
       createdAt: r.created_at,
       updatedAt: r.updated_at,
@@ -1126,6 +1130,7 @@ export class ProjectRoom extends DurableObject<Env> {
       const now = nowIso();
       const startedAt = to === 'running' && !run.started_at ? now : run.started_at;
       const agentId = patch.agentId !== undefined ? patch.agentId : run.agent_id;
+      const worktreePath = patch.worktreePath !== undefined ? patch.worktreePath : run.worktree_path;
       let exitJson = run.exit;
       if (isTerminalRunStatus(to)) {
         // Synthesize a RunExit if the caller didn't supply one; caller fields win.
@@ -1135,8 +1140,8 @@ export class ProjectRoom extends DurableObject<Env> {
         });
       }
       await this.env.DB.prepare(
-        'UPDATE runs SET status = ?, agent_id = ?, exit = ?, started_at = ?, updated_at = ? WHERE id = ?',
-      ).bind(to, agentId, exitJson, startedAt, now, runId).run();
+        'UPDATE runs SET status = ?, agent_id = ?, exit = ?, worktree_path = ?, started_at = ?, updated_at = ? WHERE id = ?',
+      ).bind(to, agentId, exitJson, worktreePath, startedAt, now, runId).run();
       await this.emit(actor, 'run.status_changed', 'run', runId, { from: run.status, to, reason: patch.reason ?? null });
       return this.runToWire(await this.loadRun(runId));
     });

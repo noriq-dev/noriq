@@ -116,6 +116,9 @@ export const RunnerClientMessage = z.discriminatedUnion('type', [
     status: RunStatus,
     agentId: z.string().nullable().default(null),
     exit: RunExit.nullable().default(null),
+    // The Run's worktree path, reported once the daemon prepares the checkout —
+    // gives the server/dashboard visibility into where the Run is executing.
+    worktreePath: z.string().nullable().default(null),
     at: z.string().datetime(),
   }),
 

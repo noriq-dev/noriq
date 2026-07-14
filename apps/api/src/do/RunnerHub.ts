@@ -92,7 +92,10 @@ export class RunnerHub extends DurableObject<Env> {
         if (!row || row.rid !== runnerId) return;
         try {
           await this.room(row.pid).transitionRun(row.pid, SYS, msg.runId, {
-            status: msg.status, agentId: msg.agentId ?? undefined, exit: msg.exit ?? undefined,
+            status: msg.status,
+            agentId: msg.agentId ?? undefined,
+            exit: msg.exit ?? undefined,
+            worktreePath: msg.worktreePath ?? undefined,
           });
         } catch { /* illegal transition — ignore; the DO is authoritative */ }
         return;

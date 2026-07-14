@@ -82,6 +82,11 @@ export const Run = z.object({
   budget: RunBudget,
   status: RunStatus,
   exit: RunExit.nullable().default(null),
+  // The daemon's isolated git worktree for this Run (branch noriq/run/<id>),
+  // reported once the process starts so the server/dashboard can see where the
+  // work is happening (and the verify agent can reference the checkout). Machine-
+  // local path; null until the daemon reports it.
+  worktreePath: z.string().nullable().default(null),
   // Provenance + lifecycle timestamps.
   createdBy: z.string(), // actor id that dispatched the brief
   createdAt: z.string().datetime(),
