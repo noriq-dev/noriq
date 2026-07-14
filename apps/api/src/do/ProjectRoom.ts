@@ -708,7 +708,129 @@ export class ProjectRoom extends DurableObject<Env> {
         .bind(id, this.projectId, title, dueAt ?? null, row?.n ?? 0).run();
       await this.emit(actor, 'milestone.created', 'milestone', id, { title });
       return { id };
-    
+
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Deletion (PLNR-70). D1 enforces FKs, so children go before parents. R2 objects
+  // for attachments are removed out-of-band before the rows.
+  // ---------------------------------------------------------------------------
+
+  /** Delete a milestone; its tasks survive (milestone_id nulled). */
+  async deleteMilestone(projectId: string, actor: Actor, milestoneId: string)  {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const ms = await this.env.DB.prepare('SELECT id, title FROM milestones WHERE id = ? AND project_id = ?')
+        .bind(milestoneId, this.projectId).first<{ id: string; title: string }>();
+      if (!ms) throw new Error('milestone not found');
+      await this.env.DB.batch([
+        this.env.DB.prepare('UPDATE tasks SET milestone_id = NULL WHERE milestone_id = ?').bind(milestoneId),
+        this.env.DB.prepare('DELETE FROM milestones WHERE id = ?').bind(milestoneId),
+      ]);
+      await this.emit(actor, 'milestone.deleted', 'milestone', milestoneId, { title: ms.title });
+      return { ok: true };
+    });
+  }
+
+  /** Delete a tag; task_tags links removed, tasks survive. */
+  async deleteTag(projectId: string, actor: Actor, tagId: string)  {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const tag = await this.env.DB.prepare('SELECT id, name FROM tags WHERE id = ? AND project_id = ?')
+        .bind(tagId, this.projectId).first<{ id: string; name: string }>();
+      if (!tag) throw new Error('tag not found');
+      await this.env.DB.batch([
+        this.env.DB.prepare('DELETE FROM task_tags WHERE tag_id = ?').bind(tagId),
+        this.env.DB.prepare('DELETE FROM tags WHERE id = ?').bind(tagId),
+      ]);
+      await this.emit(actor, 'tag.deleted', 'tag', tagId, { name: tag.name });
+      return { ok: true };
+    });
+  }
+
+  /** Delete a plan + its phases/phase-links. The underlying tasks survive. */
+  async deletePlan(projectId: string, actor: Actor, planId: string)  {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const plan = await this.env.DB.prepare('SELECT id, title FROM plans WHERE id = ? AND project_id = ?')
+        .bind(planId, this.projectId).first<{ id: string; title: string }>();
+      if (!plan) throw new Error('plan not found');
+      await this.env.DB.batch([
+        this.env.DB.prepare('DELETE FROM phase_tasks WHERE phase_id IN (SELECT id FROM phases WHERE plan_id = ?)').bind(planId),
+        this.env.DB.prepare('DELETE FROM phases WHERE plan_id = ?').bind(planId),
+        this.env.DB.prepare('DELETE FROM plans WHERE id = ?').bind(planId),
+      ]);
+      await this.emit(actor, 'plan.deleted', 'plan', planId, { title: plan.title });
+      return { ok: true };
+    });
+  }
+
+  /** Hard-delete a task and everything hanging off it (deps, claims, comments,
+   *  refs, tags, attachments+R2, signals). Child tasks are orphaned, not deleted. */
+  async deleteTask(projectId: string, actor: Actor, taskId: string)  {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const task = await this.getTask(taskId);
+      // R2 first (best-effort; not transactional with D1).
+      if (this.env.FILES) {
+        const { results } = await this.env.DB.prepare('SELECT r2_key AS key FROM attachments WHERE task_id = ?').bind(task.id).all<{ key: string }>();
+        for (const a of results) await this.env.FILES.delete(a.key).catch(() => {});
+      }
+      const id = task.id;
+      await this.env.DB.batch([
+        this.env.DB.prepare('DELETE FROM phase_tasks WHERE task_id = ?').bind(id),
+        this.env.DB.prepare('DELETE FROM dependencies WHERE task_id = ? OR depends_on_task_id = ?').bind(id, id),
+        this.env.DB.prepare('DELETE FROM claims WHERE task_id = ?').bind(id),
+        this.env.DB.prepare('DELETE FROM comments WHERE task_id = ?').bind(id),
+        this.env.DB.prepare('DELETE FROM task_refs WHERE task_id = ?').bind(id),
+        this.env.DB.prepare('DELETE FROM task_tags WHERE task_id = ?').bind(id),
+        this.env.DB.prepare('DELETE FROM attachments WHERE task_id = ?').bind(id),
+        this.env.DB.prepare('DELETE FROM signals WHERE task_id = ?').bind(id),
+        this.env.DB.prepare('UPDATE tasks SET parent_task_id = NULL WHERE parent_task_id = ?').bind(id),
+        this.env.DB.prepare('UPDATE messages SET ref_task_id = NULL WHERE ref_task_id = ?').bind(id),
+        this.env.DB.prepare('DELETE FROM tasks WHERE id = ?').bind(id),
+      ]);
+      await this.emit(actor, 'task.deleted', 'task', id, { key: task.key, title: task.title });
+      return { ok: true, key: task.key };
+    });
+  }
+
+  /** Delete an entire project and every row under it. Irreversible. */
+  async deleteProject(projectId: string, actor: Actor)  {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const proj = await this.env.DB.prepare('SELECT id, key, name FROM projects WHERE id = ?').bind(this.projectId).first<{ id: string; key: string; name: string }>();
+      if (!proj) throw new Error('project not found');
+      const pid = this.projectId;
+      // R2: every attachment on any task in the project.
+      if (this.env.FILES) {
+        const { results } = await this.env.DB.prepare('SELECT a.r2_key AS key FROM attachments a JOIN tasks t ON t.id = a.task_id WHERE t.project_id = ?').bind(pid).all<{ key: string }>();
+        for (const a of results) await this.env.FILES.delete(a.key).catch(() => {});
+      }
+      const tasksSub = 'SELECT id FROM tasks WHERE project_id = ?';
+      await this.env.DB.batch([
+        this.env.DB.prepare(`DELETE FROM phase_tasks WHERE task_id IN (${tasksSub}) OR phase_id IN (SELECT id FROM phases WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ?))`).bind(pid, pid),
+        this.env.DB.prepare(`DELETE FROM dependencies WHERE task_id IN (${tasksSub}) OR depends_on_task_id IN (${tasksSub})`).bind(pid, pid),
+        this.env.DB.prepare(`DELETE FROM claims WHERE task_id IN (${tasksSub})`).bind(pid),
+        this.env.DB.prepare(`DELETE FROM task_refs WHERE task_id IN (${tasksSub})`).bind(pid),
+        this.env.DB.prepare(`DELETE FROM task_tags WHERE task_id IN (${tasksSub}) OR tag_id IN (SELECT id FROM tags WHERE project_id = ?)`).bind(pid, pid),
+        this.env.DB.prepare(`DELETE FROM comments WHERE task_id IN (${tasksSub})`).bind(pid),
+        this.env.DB.prepare(`DELETE FROM attachments WHERE task_id IN (${tasksSub})`).bind(pid),
+        this.env.DB.prepare('DELETE FROM signals WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare('DELETE FROM messages WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare('DELETE FROM events WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare('DELETE FROM phases WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ?)').bind(pid),
+        this.env.DB.prepare('DELETE FROM plans WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare('DELETE FROM tags WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare("UPDATE agents SET project_id = NULL, status = 'offline' WHERE project_id = ?").bind(pid),
+        this.env.DB.prepare('UPDATE tasks SET parent_task_id = NULL WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare('DELETE FROM tasks WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare('DELETE FROM milestones WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare('DELETE FROM projects WHERE id = ?').bind(pid),
+      ]);
+      await this.ctx.storage.deleteAlarm().catch(() => {});
+      return { ok: true, key: proj.key, name: proj.name };
     });
   }
 

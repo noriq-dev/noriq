@@ -128,6 +128,12 @@ export function Board({ store }: { store: AppStore }) {
               small
               active={tagFilter === c.id}
               onClick={() => setTagFilter(tagFilter === c.id ? null : c.id)}
+              onDelete={() => {
+                if (confirm(`Delete tag "${c.name}"? It's removed from all tasks.`)) {
+                  if (tagFilter === c.id) setTagFilter(null);
+                  void actions.deleteTag(c.id);
+                }
+              }}
             />
           ))}
         </div>
@@ -284,7 +290,7 @@ function SearchBox({ value, onChange }: { value: string; onChange: (v: string) =
   );
 }
 
-function FilterChip({ label, meta, pct, dot, active, small, onClick }: {
+function FilterChip({ label, meta, pct, dot, active, small, onClick, onDelete }: {
   label: string;
   meta?: string;
   pct?: number;
@@ -292,6 +298,7 @@ function FilterChip({ label, meta, pct, dot, active, small, onClick }: {
   active: boolean;
   small?: boolean;
   onClick: () => void;
+  onDelete?: () => void;
 }) {
   return (
     <button
@@ -316,6 +323,17 @@ function FilterChip({ label, meta, pct, dot, active, small, onClick }: {
       {pct !== undefined && (
         <span style={{ width: 30, height: 3, borderRadius: 2, background: 'var(--w-1)', overflow: 'hidden' }}>
           <span style={{ display: 'block', height: '100%', width: `${pct * 100}%`, background: pct === 1 ? 'var(--green)' : 'var(--blue)' }} />
+        </span>
+      )}
+      {onDelete && (
+        <span
+          role="button"
+          title="Delete tag"
+          onClick={(e) => { e.stopPropagation(); onDelete(); }}
+          style={{ marginLeft: 1, color: 'var(--text-faint)', fontSize: 11, lineHeight: 1, cursor: 'pointer' }}
+          className="hover-bright"
+        >
+          ✕
         </span>
       )}
     </button>

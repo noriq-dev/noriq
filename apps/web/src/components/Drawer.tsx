@@ -158,6 +158,20 @@ export function Drawer({ store }: { store: AppStore }) {
                 ✎
               </button>
             )}
+            {!editing && (
+              <button
+                onClick={() => {
+                  if (confirm(`Delete ${task.key} "${task.title}"? This removes its comments, attachments and dependency links. Child tasks are kept.`)) {
+                    void actions.deleteTask(task.id);
+                  }
+                }}
+                title="Delete task"
+                className="drawer-x"
+                style={{ cursor: 'pointer', color: 'var(--red-soft)', fontSize: 13, width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6 }}
+              >
+                🗑
+              </button>
+            )}
             <button
               onClick={actions.closeTask}
               className="drawer-x"

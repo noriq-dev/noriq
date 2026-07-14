@@ -444,6 +444,35 @@ export function useAppStore() {
       refresh();
     },
 
+    async deleteTask(taskId: string) {
+      if (!pidRef.current) return;
+      await api.deleteTask(pidRef.current, taskId);
+      setSelectedTaskId(null);
+      refresh();
+    },
+    async deleteMilestone(milestoneId: string) {
+      if (!pidRef.current) return;
+      await api.deleteMilestone(pidRef.current, milestoneId);
+      refresh();
+    },
+    async deletePlan(planId: string) {
+      if (!pidRef.current) return;
+      await api.deletePlan(pidRef.current, planId);
+      refresh();
+    },
+    async deleteTag(tagId: string) {
+      if (!pidRef.current) return;
+      await api.deleteTag(pidRef.current, tagId);
+      refresh();
+    },
+    async deleteProject(projectId: string) {
+      await api.deleteProject(projectId);
+      setSelectedTaskId(null);
+      setCurrentPid(null);
+      setView('home');
+      await loadProjects(); // refetches without the deleted project
+    },
+
     async answerSignal(signalId: string, response: string) {
       if (!pidRef.current || !response.trim()) return;
       await api.answerSignal(pidRef.current, signalId, response.trim());

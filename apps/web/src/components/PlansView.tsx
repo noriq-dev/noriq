@@ -84,6 +84,19 @@ export function PlansView({ store }: { store: AppStore }) {
                     );
                   })}
                 </div>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (confirm(`Delete plan "${plan.title}"? Its phases are removed; the tasks themselves stay.`)) {
+                      void store.actions.deletePlan(plan.id);
+                    }
+                  }}
+                  title="Delete plan"
+                  className="drawer-x"
+                  style={{ cursor: 'pointer', color: 'var(--red-soft)', fontSize: 13, width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6, flex: 'none' }}
+                >
+                  🗑
+                </button>
               </div>
 
               {/* expanded: the plan document + stacked phases */}

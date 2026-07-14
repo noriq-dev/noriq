@@ -400,6 +400,29 @@ app.post('/api/projects/:pid/signals/:sid/acknowledge', userAuth, async (c) => {
   return c.json(result);
 });
 
+// --- deletion (PLNR-70) ------------------------------------------------------
+app.delete('/api/projects/:pid/milestones/:mid', userAuth, async (c) =>
+  c.json(await room(c.env, c.req.param('pid')!).deleteMilestone(c.req.param('pid')!, humanActor(c), c.req.param('mid')!)));
+
+app.delete('/api/projects/:pid/tags/:tid', userAuth, async (c) =>
+  c.json(await room(c.env, c.req.param('pid')!).deleteTag(c.req.param('pid')!, humanActor(c), c.req.param('tid')!)));
+
+app.delete('/api/projects/:pid/plans/:plid', userAuth, async (c) =>
+  c.json(await room(c.env, c.req.param('pid')!).deletePlan(c.req.param('pid')!, humanActor(c), c.req.param('plid')!)));
+
+app.delete('/api/projects/:pid/tasks/:tid', userAuth, async (c) =>
+  c.json(await room(c.env, c.req.param('pid')!).deleteTask(c.req.param('pid')!, humanActor(c), c.req.param('tid')!)));
+
+// Whole-project delete — owner or admin only. Irreversible.
+app.delete('/api/projects/:pid', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const proj = await c.env.DB.prepare('SELECT owner_user_id AS owner FROM projects WHERE id = ?').bind(pid).first<{ owner: string | null }>();
+  if (!proj) return c.json({ error: 'not found' }, 404);
+  const u = c.var.user!;
+  if (u.role !== 'admin' && proj.owner && proj.owner !== u.id) return c.json({ error: 'only the project owner or an admin can delete a project' }, 403);
+  return c.json(await room(c.env, pid).deleteProject(pid, humanActor(c)));
+});
+
 app.post('/api/projects/:pid/tasks/:tid/release', userAuth, async (c) => {
   const { toStatus } = await c.req.json<{ toStatus?: string }>().catch(() => ({ toStatus: undefined }));
   const result = await room(c.env, c.req.param('pid')!).releaseTask(c.req.param('pid')!, humanActor(c), c.req.param('tid')!, { toStatus });

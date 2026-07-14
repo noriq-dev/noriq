@@ -93,6 +93,11 @@ export const api = {
     req<{ id: string; key: string }>('POST', `/api/projects/${pid}/tasks`, input),
   updateTask: (pid: string, tid: string, patch: Record<string, unknown>) =>
     req('PATCH', `/api/projects/${pid}/tasks/${tid}`, patch),
+  deleteMilestone: (pid: string, mid: string) => req('DELETE', `/api/projects/${pid}/milestones/${mid}`),
+  deleteTag: (pid: string, tid: string) => req('DELETE', `/api/projects/${pid}/tags/${tid}`),
+  deletePlan: (pid: string, plid: string) => req('DELETE', `/api/projects/${pid}/plans/${plid}`),
+  deleteTask: (pid: string, tid: string) => req('DELETE', `/api/projects/${pid}/tasks/${tid}`),
+  deleteProject: (pid: string) => req('DELETE', `/api/projects/${pid}`),
   answerSignal: (pid: string, sid: string, response: string) =>
     req('POST', `/api/projects/${pid}/signals/${sid}/answer`, { response }),
   acknowledgeSignal: (pid: string, sid: string, dismiss = false) =>

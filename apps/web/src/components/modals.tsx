@@ -99,6 +99,8 @@ function EditProjectModal({ store }: { store: AppStore }) {
   const [ttlMin, setTtlMin] = useState(String(Math.round((store.snapshot?.project.claimTtlSeconds ?? 1800) / 60)));
   const [users, setUsers] = useState<ApiUser[]>([]);
   const [ownerId, setOwnerId] = useState<string>('');
+  const [confirmName, setConfirmName] = useState('');
+  const [delError, setDelError] = useState<string | null>(null);
   const isAdmin = store.user?.role === 'admin';
   useEffect(() => {
     if (isAdmin) api.users().then((r) => setUsers(r.users)).catch(() => {});
@@ -155,6 +157,32 @@ function EditProjectModal({ store }: { store: AppStore }) {
         <div style={{ flex: 1 }} />
         <ErrorNote>{error}</ErrorNote>
         <Button disabled={busy || !name.trim()} onClick={run}>Save changes</Button>
+      </div>
+
+      <div style={{ marginTop: 18, borderTop: '1px solid var(--w-08)', paddingTop: 14 }}>
+        <div style={{ fontFamily: 'var(--mono)', fontSize: 10, textTransform: 'uppercase', letterSpacing: '.06em', color: 'var(--red-soft)', marginBottom: 7 }}>Danger zone</div>
+        <div style={{ fontSize: 11.5, color: 'var(--text-mid)', lineHeight: 1.55, marginBottom: 9 }}>
+          Deleting removes every task, plan, milestone, tag and its history — permanently. Type <b style={{ color: 'var(--text)' }}>{project.name}</b> to confirm.
+        </div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <TextInput value={confirmName} onChange={(e) => setConfirmName(e.target.value)} placeholder={project.name} />
+          <Button
+            variant="danger"
+            disabled={confirmName !== project.name}
+            onClick={async () => {
+              setDelError(null);
+              try {
+                await store.actions.deleteProject(project.id);
+                store.actions.closeModal();
+              } catch (e) {
+                setDelError(e instanceof Error ? e.message : 'could not delete');
+              }
+            }}
+          >
+            Delete project
+          </Button>
+        </div>
+        <ErrorNote>{delError}</ErrorNote>
       </div>
     </Modal>
   );
@@ -260,7 +288,20 @@ function CreateMilestoneModal({ store }: { store: AppStore }) {
       <Field label="Due date" hint="optional">
         <TextInput type="date" value={dueAt} onChange={(e) => setDueAt(e.target.value)} />
       </Field>
-      <div style={{ display: 'flex', marginTop: 6 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 }}>
+        {editing && (
+          <Button
+            variant="danger"
+            onClick={async () => {
+              if (confirm(`Delete milestone "${editing.title}"? Its tasks stay, just unassigned.`)) {
+                await store.actions.deleteMilestone(editing.id);
+                store.actions.closeModal();
+              }
+            }}
+          >
+            Delete
+          </Button>
+        )}
         <ErrorNote>{error}</ErrorNote>
         <div style={{ flex: 1 }} />
         <Button disabled={busy || !title.trim()} onClick={run}>{editing ? 'Save changes' : 'Create milestone'}</Button>
