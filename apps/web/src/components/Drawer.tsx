@@ -54,6 +54,7 @@ export function Drawer({ store }: { store: AppStore }) {
   const holder = ag ? ag.name : eff === 'blocked' ? '— (blocked)' : '— (unclaimed)';
   const taskTags = task.tagIds.map((id) => tagById.get(id)).filter(Boolean) as Array<{ id: string; name: string; color: string }>;
   const milestone = task.milestoneId ? (snapshot?.milestones ?? []).find((mm) => mm.id === task.milestoneId) : null;
+  const taskSignals = (snapshot?.signals ?? []).filter((s) => s.taskId === task.id);
 
   const startEdit = () => {
     setETitle(task.title);
@@ -307,6 +308,41 @@ export function Drawer({ store }: { store: AppStore }) {
             </button>
           )}
 
+          {/* open signals (decision gates / alerts) on this task */}
+          {taskSignals.length > 0 && (
+            <div style={{ marginBottom: 18 }}>
+              <div style={{ marginBottom: 8 }}><SectionLabel>Needs attention · {taskSignals.length}</SectionLabel></div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+                {taskSignals.map((s) => {
+                  const gate = s.type === 'input_request';
+                  const accent = gate ? 'var(--accent)' : s.severity === 'critical' ? 'var(--red-soft)' : s.severity === 'warning' ? 'var(--amber)' : 'var(--blue)';
+                  return (
+                    <div key={s.id} style={{ border: `1px solid ${accent}44`, borderLeft: `3px solid ${accent}`, borderRadius: 8, background: 'rgba(255,255,255,.02)', padding: '9px 11px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 4 }}>
+                        <MonoTag color={accent} bg={`${accent}1a`} size={8.5}>{gate ? 'DECISION' : s.severity.toUpperCase()}</MonoTag>
+                        <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>{s.agentName}</span>
+                      </div>
+                      <div style={{ fontSize: 12.5, fontWeight: 600 }}>{s.title}</div>
+                      {s.body && <div style={{ fontSize: 11.5, color: 'var(--text-mid)', marginTop: 3, lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{s.body}</div>}
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
+                        {gate ? (
+                          <>
+                            {(s.options ?? []).map((opt) => (
+                              <button key={opt} onClick={() => void actions.answerSignal(s.id, opt)} style={{ cursor: 'pointer', fontSize: 11, color: 'var(--accent)', background: 'rgba(198,242,78,.08)', border: '1px solid rgba(198,242,78,.35)', borderRadius: 6, padding: '3px 9px' }}>{opt}</button>
+                            ))}
+                            <SignalAnswer onAnswer={(v) => void actions.answerSignal(s.id, v)} />
+                          </>
+                        ) : (
+                          <button onClick={() => void actions.acknowledgeSignal(s.id)} style={{ cursor: 'pointer', fontSize: 11, color: 'var(--text-soft)', background: 'rgba(255,255,255,.04)', border: '1px solid rgba(255,255,255,.1)', borderRadius: 6, padding: '3px 10px' }}>Acknowledge</button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           {/* attachments */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 10 }}>
             <SectionLabel>Attachments · {attachments.length}</SectionLabel>
@@ -447,6 +483,25 @@ export function Drawer({ store }: { store: AppStore }) {
         </div>
       </div>
     </>
+  );
+}
+
+function SignalAnswer({ onAnswer }: { onAnswer: (v: string) => void }) {
+  const [v, setV] = useState('');
+  return (
+    <span style={{ display: 'inline-flex', gap: 5, flex: 1, minWidth: 140 }}>
+      <input
+        value={v}
+        onChange={(e) => setV(e.target.value)}
+        onKeyDown={(e) => { if (e.key === 'Enter' && v.trim()) { onAnswer(v.trim()); setV(''); } }}
+        placeholder="your decision…"
+        style={{ flex: 1, minWidth: 0, background: 'rgba(255,255,255,.03)', border: '1px solid rgba(255,255,255,.1)', borderRadius: 6, padding: '3px 8px', color: 'var(--text)', fontSize: 11.5 }}
+      />
+      <button disabled={!v.trim()} onClick={() => { onAnswer(v.trim()); setV(''); }}
+        style={{ cursor: v.trim() ? 'pointer' : 'default', fontSize: 11, fontWeight: 600, color: '#0a0b0d', background: 'var(--accent)', border: 'none', borderRadius: 6, padding: '3px 10px', opacity: v.trim() ? 1 : 0.4 }}>
+        Answer
+      </button>
+    </span>
   );
 }
 

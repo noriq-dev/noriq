@@ -444,6 +444,18 @@ export function useAppStore() {
       refresh();
     },
 
+    async answerSignal(signalId: string, response: string) {
+      if (!pidRef.current || !response.trim()) return;
+      await api.answerSignal(pidRef.current, signalId, response.trim());
+      refresh();
+    },
+
+    async acknowledgeSignal(signalId: string, dismiss = false) {
+      if (!pidRef.current) return;
+      await api.acknowledgeSignal(pidRef.current, signalId, dismiss);
+      refresh();
+    },
+
     async addDependency(taskId: string, dependsOnTaskId: string) {
       if (!pidRef.current) return;
       await api.addDependency(pidRef.current, taskId, dependsOnTaskId);

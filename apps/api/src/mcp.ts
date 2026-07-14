@@ -123,6 +123,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           'Humans steer via comments on tasks (kind: question/instruction). Acknowledge fast, resolve with resolve_comment (addressed|wont_do) + a reply. Unresolved comments should block you from finishing.',
           'Orchestrators: structure work with create_plan (ordered phases over tasks — order is enforced via auto-dependencies) or decompose_task for a quick subtree; workers drain via next_claimable.',
           'Claims are exclusive. If claim_task fails, the task is taken or blocked — pick another.',
+          'Blocked on a human decision? request_input (it auto-parks the task and frees you to work elsewhere) — do not guess or stall. Flag non-blocking concerns (deviations, risks) with raise_alert and keep going.',
           'Every tool result may end with a "--- notices ---" block: read it, it is addressed to you.',
         ],
         projects,

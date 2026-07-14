@@ -248,6 +248,78 @@ function Roster({ store }: { store: AppStore }) {
   );
 }
 
+const SEV_COLOR: Record<string, string> = { critical: 'var(--red-soft)', warning: 'var(--amber)', info: 'var(--blue)' };
+
+function AttentionInbox({ store }: { store: AppStore }) {
+  const { snapshot, actions } = store;
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const signals = snapshot?.signals ?? [];
+  if (signals.length === 0) return null;
+
+  return (
+    <div style={{ flex: 'none', maxHeight: '46%', overflowY: 'auto', borderBottom: '1px solid var(--line)', background: 'rgba(245,166,35,.03)' }}>
+      <div style={{ padding: '10px 20px 6px', display: 'flex', alignItems: 'center', gap: 8 }}>
+        <SectionLabel>Needs attention</SectionLabel>
+        <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--amber)' }}>{signals.length}</span>
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: '2px 16px 12px' }}>
+        {signals.map((s) => {
+          const gate = s.type === 'input_request';
+          const accent = gate ? 'var(--accent)' : SEV_COLOR[s.severity] ?? 'var(--blue)';
+          return (
+            <div key={s.id} style={{ border: `1px solid ${accent}44`, borderLeft: `3px solid ${accent}`, borderRadius: 9, background: 'var(--card)', padding: '10px 12px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 5 }}>
+                <MonoTag color={accent} bg={`${accent}1a`} size={9}>{gate ? 'DECISION' : s.severity.toUpperCase()}</MonoTag>
+                {s.taskKey && (
+                  <button onClick={() => s.taskId && actions.openTask(s.taskId)} style={{ cursor: 'pointer', background: 'transparent', border: 'none', color: 'var(--text-mid)', fontFamily: 'var(--mono)', fontSize: 10, padding: 0 }}>{s.taskKey}</button>
+                )}
+                <div style={{ flex: 1 }} />
+                <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>{s.agentName}</span>
+              </div>
+              <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text)', lineHeight: 1.4 }}>{s.title}</div>
+              {s.body && <div style={{ fontSize: 11.5, color: 'var(--text-mid)', marginTop: 4, lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{s.body}</div>}
+
+              {gate ? (
+                <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {s.options && s.options.length > 0 && (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                      {s.options.map((opt) => (
+                        <button key={opt} onClick={() => void actions.answerSignal(s.id, opt)}
+                          className="hover-bright"
+                          style={{ cursor: 'pointer', fontSize: 11.5, fontWeight: 500, color: 'var(--accent)', background: 'rgba(198,242,78,.08)', border: '1px solid rgba(198,242,78,.35)', borderRadius: 7, padding: '4px 10px' }}>
+                          {opt}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <input
+                      value={answers[s.id] ?? ''}
+                      onChange={(e) => setAnswers((a) => ({ ...a, [s.id]: e.target.value }))}
+                      onKeyDown={(e) => { if (e.key === 'Enter' && (answers[s.id] ?? '').trim()) { void actions.answerSignal(s.id, answers[s.id]!); } }}
+                      placeholder={s.options?.length ? 'or type a decision…' : 'your decision…'}
+                      style={{ flex: 1, minWidth: 0, background: 'rgba(255,255,255,.03)', border: '1px solid rgba(255,255,255,.1)', borderRadius: 7, padding: '5px 9px', color: 'var(--text)', fontSize: 12 }}
+                    />
+                    <button disabled={!(answers[s.id] ?? '').trim()} onClick={() => void actions.answerSignal(s.id, answers[s.id]!)}
+                      style={{ cursor: (answers[s.id] ?? '').trim() ? 'pointer' : 'default', fontSize: 12, fontWeight: 600, color: '#0a0b0d', background: 'var(--accent)', border: 'none', borderRadius: 7, padding: '5px 12px', opacity: (answers[s.id] ?? '').trim() ? 1 : 0.4 }}>
+                      Answer
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
+                  <button onClick={() => void actions.acknowledgeSignal(s.id)} style={{ cursor: 'pointer', fontSize: 11.5, fontWeight: 500, color: 'var(--text-soft)', background: 'rgba(255,255,255,.04)', border: '1px solid rgba(255,255,255,.1)', borderRadius: 7, padding: '4px 11px' }}>Acknowledge</button>
+                  <button onClick={() => void actions.acknowledgeSignal(s.id, true)} style={{ cursor: 'pointer', fontSize: 11, color: 'var(--text-faint)', background: 'transparent', border: 'none', padding: '4px 4px' }}>dismiss</button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function EventFeed({ store }: { store: AppStore }) {
   const { data, currentPid, helpers, actions, selectedTaskId } = store;
   const events = data.events[currentPid] ?? [];
@@ -276,6 +348,7 @@ function EventFeed({ store }: { store: AppStore }) {
           append-only · {1200 + events.length}
         </span>
       </div>
+      <AttentionInbox store={store} />
       <div style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: '8px 0' }}>
         {events.map((ev) => {
           const ag = (data.agents[currentPid] ?? []).find((a) => a.name === ev.actor || a.id === ev.actor) ?? null;

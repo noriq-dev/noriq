@@ -93,6 +93,10 @@ export const api = {
     req<{ id: string; key: string }>('POST', `/api/projects/${pid}/tasks`, input),
   updateTask: (pid: string, tid: string, patch: Record<string, unknown>) =>
     req('PATCH', `/api/projects/${pid}/tasks/${tid}`, patch),
+  answerSignal: (pid: string, sid: string, response: string) =>
+    req('POST', `/api/projects/${pid}/signals/${sid}/answer`, { response }),
+  acknowledgeSignal: (pid: string, sid: string, dismiss = false) =>
+    req('POST', `/api/projects/${pid}/signals/${sid}/acknowledge`, { dismiss }),
   addDependency: (pid: string, tid: string, dependsOnTaskId: string) =>
     req('POST', `/api/projects/${pid}/tasks/${tid}/dependencies`, { dependsOnTaskId }),
   removeDependency: (pid: string, tid: string, depId: string) =>
@@ -176,6 +180,11 @@ export interface ApiSnapshot {
   events: Array<{
     id: string; seq: number; actorKind: 'agent' | 'human' | 'system'; actorId: string; verb: string;
     subjectType: string; subjectId: string; payload: Record<string, unknown>; createdAt: string;
+  }>;
+  signals: Array<{
+    id: string; taskId: string | null; taskKey: string | null; agentId: string | null; agentName: string;
+    type: 'input_request' | 'alert'; severity: 'info' | 'warning' | 'critical';
+    title: string; body: string | null; options: string[] | null; createdAt: string;
   }>;
 }
 
