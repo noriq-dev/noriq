@@ -28,7 +28,9 @@ export const api = {
   logout: () => req('POST', '/api/auth/logout'),
 
   projects: () => req<{ projects: ApiProject[] }>('GET', '/api/projects'),
-  snapshot: (pid: string) => req<ApiSnapshot>('GET', `/api/projects/${pid}/snapshot`),
+  snapshot: (pid: string, includeArchived = false) => req<ApiSnapshot>('GET', `/api/projects/${pid}/snapshot${includeArchived ? '?archived=1' : ''}`),
+  archiveTask: (pid: string, tid: string) => req('POST', `/api/projects/${pid}/tasks/${tid}/archive`),
+  restoreTask: (pid: string, tid: string) => req('POST', `/api/projects/${pid}/tasks/${tid}/restore`),
   taskDetail: (tid: string) => req<ApiTaskDetail>('GET', `/api/tasks/${tid}`),
 
   createProject: (key: string, name: string, description?: string) =>
@@ -173,7 +175,7 @@ export interface ApiSnapshot {
   tasks: Array<{
     id: string; key: string; title: string; body: string; status: string; type: string; priority: number;
     claimedBy: string | null; claimExpiresAt: string | null; parentTaskId: string | null;
-    milestoneId: string | null; openComments: number; order: number;
+    milestoneId: string | null; openComments: number; order: number; archivedAt: string | null;
   }>;
   dependencies: Array<{ taskId: string; dependsOnTaskId: string }>;
   agents: Array<{ id: string; name: string; role: string; status: string; lastSeenAt: string | null; ownerName: string | null; parentAgentId: string | null }>;

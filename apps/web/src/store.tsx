@@ -73,9 +73,12 @@ export function useAppStore() {
   const [snapshot, setSnapshot] = useState<ApiSnapshot | null>(null);
   const [comments, setComments] = useState<TaskVM['comments']>([]);
   const [tick, setTick] = useState(0);
+  const [showArchived, setShowArchived] = useState(false);
 
   const pidRef = useRef(currentPid);
   pidRef.current = currentPid;
+  const archivedRef = useRef(showArchived);
+  archivedRef.current = showArchived;
   const selRef = useRef(selectedTaskId);
   selRef.current = selectedTaskId;
   const lastSeq = useRef(0);
@@ -137,7 +140,7 @@ export function useAppStore() {
   }, []);
 
   const loadSnapshot = useCallback(async (pid: string) => {
-    const snap = await api.snapshot(pid);
+    const snap = await api.snapshot(pid, archivedRef.current);
     if (pidRef.current !== pid) return;
     setSnapshot(snap);
     lastSeq.current = Math.max(0, ...snap.events.map((e) => e.seq));
@@ -277,6 +280,7 @@ export function useAppStore() {
         tagIds: tagsByTask.get(t.id) ?? [],
         type: t.type,
         openComments: t.openComments,
+        archivedAt: t.archivedAt,
         comments: t.id === selectedTaskId ? comments : [],
       };
     });
@@ -450,6 +454,24 @@ export function useAppStore() {
       setSelectedTaskId(null);
       refresh();
     },
+    async archiveTask(taskId: string) {
+      if (!pidRef.current) return;
+      await api.archiveTask(pidRef.current, taskId);
+      setSelectedTaskId(null);
+      refresh();
+    },
+    async restoreTask(taskId: string) {
+      if (!pidRef.current) return;
+      await api.restoreTask(pidRef.current, taskId);
+      refresh();
+    },
+    toggleArchived() {
+      setShowArchived((v) => {
+        archivedRef.current = !v;
+        if (pidRef.current) void loadSnapshot(pidRef.current);
+        return !v;
+      });
+    },
     async deleteMilestone(milestoneId: string) {
       if (!pidRef.current) return;
       await api.deleteMilestone(pidRef.current, milestoneId);
@@ -514,7 +536,7 @@ export function useAppStore() {
   };
 
   return {
-    user, authChecked, needsSetup, modal, editMilestone, groups, snapshot,
+    user, authChecked, needsSetup, modal, editMilestone, groups, snapshot, showArchived,
     currentPid: currentPid ?? '', view, selectedTaskId, selectedAgentId, draftKind, draftText, draggedId,
     data, helpers, actions,
   };

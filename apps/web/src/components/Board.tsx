@@ -15,7 +15,7 @@ const COLUMNS: Array<[TaskStatus, string]> = [
 const TYPE_ICON: Record<string, string> = { bug: '✕', chore: '⟳', research: '?', feature: '' };
 
 export function Board({ store }: { store: AppStore }) {
-  const { currentPid, helpers, actions, draggedId, snapshot } = store;
+  const { currentPid, helpers, actions, draggedId, snapshot, showArchived } = store;
   const tasks = helpers.tasksOf(currentPid);
   const milestones = snapshot?.milestones ?? [];
   const tags = snapshot?.tags ?? [];
@@ -93,6 +93,19 @@ export function Board({ store }: { store: AppStore }) {
           </button>
         )}
         </div>
+        <button
+          onClick={() => actions.toggleArchived()}
+          title={showArchived ? 'Hide archived tasks' : 'Show archived tasks'}
+          style={{
+            cursor: 'pointer', flex: 'none', fontFamily: 'var(--mono)', fontSize: 10.5,
+            padding: '4px 10px', borderRadius: 8, whiteSpace: 'nowrap',
+            color: showArchived ? 'var(--accent-ink)' : 'var(--text-dim)',
+            background: showArchived ? 'rgba(198,242,78,.1)' : 'transparent',
+            border: `1px solid ${showArchived ? 'rgba(198,242,78,.35)' : 'var(--w-1)'}`,
+          }}
+        >
+          🗄 archive
+        </button>
         <SearchBox value={query} onChange={setQuery} />
       </div>
 
@@ -191,11 +204,14 @@ export function Board({ store }: { store: AppStore }) {
                           borderRadius: 10,
                           padding: '12px 13px',
                           cursor: 'grab',
-                          opacity: draggedId === t.id ? 0.4 : 1,
+                          opacity: draggedId === t.id ? 0.4 : t.archivedAt ? 0.5 : 1,
                         }}
                       >
                         <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 7 }}>
                           <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: statusMeta(eff).color }}>{t.key}</span>
+                          {t.archivedAt && (
+                            <span style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)', border: '1px solid var(--w-1)', padding: '0 4px', borderRadius: 4 }}>🗄</span>
+                          )}
                           {typeIcon && (
                             <span title={t.type} style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: t.type === 'bug' ? 'var(--red-soft)' : 'var(--text-dim)' }}>
                               {typeIcon} {t.type}

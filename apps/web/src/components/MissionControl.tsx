@@ -223,27 +223,6 @@ function Roster({ store }: { store: AppStore }) {
           );
         })}
       </div>
-      <div style={{ padding: '12px 16px', borderTop: '1px solid var(--line)', flex: 'none', display: 'flex', alignItems: 'center', gap: 9 }}>
-        <div
-          style={{
-            width: 24,
-            height: 24,
-            borderRadius: 6,
-            background: YOU_GRADIENT,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            fontSize: 11,
-            color: 'var(--bg)',
-            fontWeight: 700,
-          }}
-        >
-          Y
-        </div>
-        <div style={{ fontSize: 12, color: 'var(--text-mid)' }}>
-          {store.user?.name ?? 'you'} · <span style={{ color: 'var(--text)' }}>supervisor</span>
-        </div>
-      </div>
     </div>
   );
 }

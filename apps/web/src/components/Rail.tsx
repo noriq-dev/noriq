@@ -4,6 +4,7 @@ import { useState } from 'react';
 import type { AppStore } from '../store';
 import type { ProjectVM } from '../types';
 import { LiveDot } from './bits';
+import { ThemeButton } from './ThemeButton';
 
 function loadCollapsed(): Record<string, boolean> {
   try {
@@ -130,12 +131,13 @@ export function Rail({ store, open, onNavigate }: { store: AppStore; open?: bool
           >
             {(store.user?.name ?? 'Y').slice(0, 1).toUpperCase()}
           </div>
-          <div style={{ minWidth: 0 }}>
+          <div style={{ minWidth: 0, flex: 1 }}>
             <div style={{ fontSize: 12, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {store.user?.name ?? 'you'}
             </div>
             <div style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>{store.user?.role ?? 'supervisor'}</div>
           </div>
+          <ThemeButton size={28} />
         </div>
       </div>
     </div>

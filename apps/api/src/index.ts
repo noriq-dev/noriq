@@ -240,14 +240,17 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     `SELECT 1 FROM projects p WHERE p.id = ? AND ${VISIBILITY_WHERE}`,
   ).bind(pid, u.role, u.id, u.id).first();
   if (!visible) return c.json({ error: 'not found' }, 404);
+  // Auto-archive done tasks untouched for >24h whenever the project is viewed.
+  await room(c.env, pid).sweepArchive(pid).catch(() => {});
+  const includeArchived = c.req.query('archived') === '1';
   const [project, tasks, deps, agents, events, milestones, plans, phases, phaseTasks, tags, taskTags, signals] = await Promise.all([
     c.env.DB.prepare('SELECT id, key, name, description, claim_ttl_seconds AS claimTtlSeconds, repo_url AS repoUrl FROM projects WHERE id = ?')
       .bind(pid).first(),
     c.env.DB.prepare(
       `SELECT id, key, title, body, status, type, priority, claimed_by AS claimedBy, claim_expires_at AS claimExpiresAt,
-              parent_task_id AS parentTaskId, milestone_id AS milestoneId,
+              parent_task_id AS parentTaskId, milestone_id AS milestoneId, archived_at AS archivedAt,
               open_comments AS openComments, "order"
-       FROM tasks WHERE project_id = ? ORDER BY "order"`,
+       FROM tasks WHERE project_id = ? ${includeArchived ? '' : 'AND archived_at IS NULL'} ORDER BY "order"`,
     ).bind(pid).all(),
     c.env.DB.prepare(
       `SELECT d.task_id AS taskId, d.depends_on_task_id AS dependsOnTaskId
@@ -399,6 +402,12 @@ app.post('/api/projects/:pid/signals/:sid/acknowledge', userAuth, async (c) => {
   const result = await room(c.env, c.req.param('pid')!).acknowledgeSignal(c.req.param('pid')!, humanActor(c), c.req.param('sid')!, !!dismiss);
   return c.json(result);
 });
+
+// --- archive (PLNR-73) -------------------------------------------------------
+app.post('/api/projects/:pid/tasks/:tid/archive', userAuth, async (c) =>
+  c.json(await room(c.env, c.req.param('pid')!).archiveTask(c.req.param('pid')!, humanActor(c), c.req.param('tid')!, true)));
+app.post('/api/projects/:pid/tasks/:tid/restore', userAuth, async (c) =>
+  c.json(await room(c.env, c.req.param('pid')!).archiveTask(c.req.param('pid')!, humanActor(c), c.req.param('tid')!, false)));
 
 // --- deletion (PLNR-70) ------------------------------------------------------
 app.delete('/api/projects/:pid/milestones/:mid', userAuth, async (c) =>
@@ -748,6 +757,12 @@ export default {
         // eslint-disable-next-line no-console
         console.log(r.ok ? `[backup] wrote ${r.key}` : `[backup] skipped: ${r.reason}`);
       }),
+    );
+    // Backstop auto-archive for projects nobody has viewed (the snapshot sweeps viewed ones).
+    ctx.waitUntil(
+      env.DB.prepare(
+        "UPDATE tasks SET archived_at = ? WHERE status = 'done' AND archived_at IS NULL AND updated_at < ?",
+      ).bind(new Date(event.scheduledTime).toISOString(), new Date(event.scheduledTime - 24 * 3600 * 1000).toISOString()).run().then(() => {}),
     );
   },
 };

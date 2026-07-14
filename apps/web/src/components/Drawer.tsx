@@ -18,6 +18,7 @@ export function Drawer({ store }: { store: AppStore }) {
   const [eType, setEType] = useState('feature');
   const [ePriority, setEPriority] = useState(2);
   const [eTags, setETags] = useState('');
+  const [eMilestone, setEMilestone] = useState('');
   const [timeline, setTimeline] = useState<ApiAgentEvent[]>([]);
   const [addingTag, setAddingTag] = useState(false);
   const [newTag, setNewTag] = useState('');
@@ -62,6 +63,7 @@ export function Drawer({ store }: { store: AppStore }) {
     setEType(task.type);
     setEPriority(0); // priority isn't in the VM snapshot list; leave unchanged unless touched
     setETags(taskTags.map((t) => t.name).join(', '));
+    setEMilestone(task.milestoneId ?? '');
     setEditing(true);
   };
 
@@ -71,6 +73,7 @@ export function Drawer({ store }: { store: AppStore }) {
       body: eBody,
       type: eType,
       tags: eTags.split(',').map((t) => t.trim()).filter(Boolean),
+      milestoneId: eMilestone || null,
       ...(ePriority > 0 ? { priority: ePriority } : {}),
     });
     setEditing(false);
@@ -160,6 +163,16 @@ export function Drawer({ store }: { store: AppStore }) {
             )}
             {!editing && (
               <button
+                onClick={() => void (task.archivedAt ? actions.restoreTask(task.id) : actions.archiveTask(task.id))}
+                title={task.archivedAt ? 'Restore from archive' : 'Archive task'}
+                className="drawer-x"
+                style={{ cursor: 'pointer', color: 'var(--text-dim)', fontSize: 13, width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6 }}
+              >
+                {task.archivedAt ? '⤴' : '🗄'}
+              </button>
+            )}
+            {!editing && (
+              <button
                 onClick={() => {
                   if (confirm(`Delete ${task.key} "${task.title}"? This removes its comments, attachments and dependency links. Child tasks are kept.`)) {
                     void actions.deleteTask(task.id);
@@ -204,6 +217,14 @@ export function Drawer({ store }: { store: AppStore }) {
                   <option value={3}>P3 · high</option>
                   <option value={2}>P2 · normal</option>
                   <option value={1}>P1 · low</option>
+                </Select>
+              </div>
+              <div style={{ marginTop: 10 }}>
+                <Select value={eMilestone} onChange={(e) => setEMilestone(e.target.value)}>
+                  <option value="">— no milestone —</option>
+                  {(snapshot?.milestones ?? []).map((mm) => (
+                    <option key={mm.id} value={mm.id}>{mm.title}</option>
+                  ))}
                 </Select>
               </div>
               <div style={{ marginTop: 10 }}>

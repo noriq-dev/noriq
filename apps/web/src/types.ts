@@ -60,6 +60,7 @@ export interface TaskVM {
   tagIds: string[];
   type: string;
   openComments: number;
+  archivedAt: string | null;
   comments: CommentVM[]; // populated for the selected task
 }
 

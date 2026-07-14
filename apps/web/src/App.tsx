@@ -12,15 +12,17 @@ import { AgentsView } from './components/AgentsView';
 import { ModalHost } from './components/modals';
 import { SettingsView } from './components/SettingsView';
 import { useState } from 'react';
-import { resolveTheme, toggleTheme } from './theme';
+import { useTheme } from './theme';
+import { ThemeButton } from './components/ThemeButton';
 import { Home } from './components/Home';
 import { Invite } from './components/Invite';
 
-function ThemeToggle() {
-  const [theme, setTheme] = useState(resolveTheme());
+// Floating toggle for the unauthenticated screens (login / setup / invite) — no rail there.
+function FloatingTheme() {
+  const [theme, toggle] = useTheme();
   return (
     <button
-      onClick={() => setTheme(toggleTheme())}
+      onClick={toggle}
       title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
       style={{
         position: 'fixed', top: 12, right: 14, zIndex: 60,
@@ -41,17 +43,17 @@ export function App() {
 
   const inviteMatch = location.pathname.match(/^\/invite\/([^/]+)/);
   if (inviteMatch) {
-    return <><ThemeToggle /><Invite token={inviteMatch[1]!} onDone={() => { location.href = '/'; }} /></>;
+    return <><FloatingTheme /><Invite token={inviteMatch[1]!} onDone={() => { location.href = '/'; }} /></>;
   }
 
   if (store.needsSetup) {
-    return <><ThemeToggle /><Setup store={store} /></>;
+    return <><FloatingTheme /><Setup store={store} /></>;
   }
   if (!store.authChecked) {
     return <div style={{ height: '100vh', background: 'var(--bg)' }} />;
   }
   if (!store.user) {
-    return <><ThemeToggle /><Login store={store} /></>;
+    return <><FloatingTheme /><Login store={store} /></>;
   }
 
   const project = store.data.projects.find((p) => p.id === store.currentPid);
@@ -59,7 +61,6 @@ export function App() {
 
   return (
     <div style={{ height: '100vh', display: 'flex', background: 'var(--bg)' }}>
-      <ThemeToggle />
       {railOpen && <div className="rail-backdrop" onClick={() => setRailOpen(false)} />}
       <Rail store={store} open={railOpen} onNavigate={() => setRailOpen(false)} />
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
@@ -77,6 +78,8 @@ export function App() {
           <span style={{ fontWeight: 700, fontSize: 14.5, letterSpacing: '-.01em', color: 'var(--text)' }}>
             {project && projectView ? project.name : 'planar'}
           </span>
+          <div style={{ flex: 1 }} />
+          <ThemeButton size={34} />
         </div>
         {projectView && <TopBar store={store} />}
         <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>

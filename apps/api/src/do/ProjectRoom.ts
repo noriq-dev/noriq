@@ -716,6 +716,34 @@ export class ProjectRoom extends DurableObject<Env> {
   }
 
   // ---------------------------------------------------------------------------
+  // Archive (PLNR-70/73): archived tasks drop off the board unless the switch is on.
+  // ---------------------------------------------------------------------------
+
+  async archiveTask(projectId: string, actor: Actor, taskId: string, archived: boolean)  {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const task = await this.getTask(taskId);
+      // Restore also bumps updated_at so the 24h auto-sweep doesn't immediately re-archive it.
+      await this.env.DB.prepare('UPDATE tasks SET archived_at = ?, updated_at = ? WHERE id = ?')
+        .bind(archived ? nowIso() : null, nowIso(), taskId).run();
+      await this.emit(actor, archived ? 'task.archived' : 'task.restored', 'task', taskId, { key: task.key, title: task.title });
+      return { ok: true, key: task.key, archived };
+    });
+  }
+
+  /** Auto-archive done tasks untouched for >24h. Returns how many were swept. */
+  async sweepArchive(projectId: string)  {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const cutoff = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+      const { meta } = await this.env.DB.prepare(
+        "UPDATE tasks SET archived_at = ? WHERE project_id = ? AND status = 'done' AND archived_at IS NULL AND updated_at < ?",
+      ).bind(nowIso(), this.projectId, cutoff).run();
+      return { archived: meta.changes ?? 0 };
+    });
+  }
+
+  // ---------------------------------------------------------------------------
   // Deletion (PLNR-70). D1 enforces FKs, so children go before parents. R2 objects
   // for attachments are removed out-of-band before the rows.
   // ---------------------------------------------------------------------------
