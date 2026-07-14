@@ -87,6 +87,7 @@ describe('CIMD OAuth wiring (PLNR-82)', () => {
     const meta = (await as.json()) as Record<string, unknown>;
     expect(meta.client_id_metadata_document_supported).toBe(true);
     expect(meta.registration_endpoint).toContain('/oauth/register');
+    expect(meta.authorization_response_iss_parameter_supported).toBe(true); // RFC 9207
     expect(as.headers.get('Cache-Control')).toBe('no-store'); // never edge-cache a stale (pre-CIMD) copy
   });
 

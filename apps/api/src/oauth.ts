@@ -43,6 +43,8 @@ export function metadataRoutes(app: Hono<AppContext>) {
     token_endpoint_auth_methods_supported: ['none'],
     scopes_supported: ['mcp'],
     subject_types_supported: ['public'],
+    // RFC 9207 — we return `iss` in the authorization response (PLNR-82).
+    authorization_response_iss_parameter_supported: true,
     // CIMD: clients MAY use an HTTPS-URL client_id pointing at a metadata
     // document; DCR (registration_endpoint) remains as a fallback.
     client_id_metadata_document_supported: true,
@@ -229,10 +231,14 @@ oauth.post('/authorize', async (c) => {
   const v = await validateClient(c.env, p);
   if (!v.ok) return c.text(`invalid authorization request: ${v.err}`, 400);
 
+  const issuer = new URL(c.req.url).origin;
   const redirect = (extra: Record<string, string>) => {
     const url = new URL(p.redirect_uri);
     for (const [k, val] of Object.entries(extra)) url.searchParams.set(k, val);
     if (p.state) url.searchParams.set('state', p.state);
+    // RFC 9207: identify the issuer in the authorization response. Strict clients
+    // (e.g. OpenAI/ChatGPT) reject the callback without it — mix-up defense (PLNR-82).
+    url.searchParams.set('iss', issuer);
     return c.redirect(url.toString(), 302);
   };
 

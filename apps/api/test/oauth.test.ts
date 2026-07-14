@@ -87,6 +87,7 @@ describe('oauth 2.1 for MCP', () => {
     expect(approve.status).toBe(302);
     const loc = new URL(approve.headers.get('Location')!);
     expect(loc.searchParams.get('state')).toBe('xyz');
+    expect(loc.searchParams.get('iss')).toBe('https://planar.test'); // RFC 9207
     const code = loc.searchParams.get('code')!;
     expect(code).toBeTruthy();
 
