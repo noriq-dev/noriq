@@ -445,15 +445,19 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     'The worker pull-loop: returns the highest-priority dependency-unblocked, unclaimed task (optionally within one project). Claim it with claim_task.',
     { projectId: z.string().optional() },
     tool(async ({ projectId }) => {
+      // Scope to what the agent's USER can reach (PLNR-95): with no projectId the
+      // central guard is skipped, so without this an omitted-projectId call returned
+      // the top task (incl. body) across ALL tenants. Mirrors sync.ts `claimable`.
       const row = await env.DB.prepare(
         `SELECT t.id, t.key, t.title, t.body, t.priority, t.project_id AS projectId
          FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
-         WHERE t.status = 'todo' AND t.claimed_by IS NULL AND (? IS NULL OR t.project_id = ?)
+         WHERE t.status = 'todo' AND t.claimed_by IS NULL AND (?2 IS NULL OR t.project_id = ?2)
+           AND ${USER_PROJECT_WHERE}
            AND NOT EXISTS (
              SELECT 1 FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id
              WHERE d.task_id = t.id AND dt.status NOT IN ('done','cancelled'))
          ORDER BY t.priority DESC, t."order" LIMIT 1`,
-      ).bind(projectId ?? null, projectId ?? null).first();
+      ).bind(agent.userId, projectId ?? null).first();
       return row ? { task: row } : { task: null, note: 'nothing claimable right now — check my_updates for blockers' };
     }),
   );
@@ -515,10 +519,17 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     'Unresolved comments/questions on a task. Humans steer you here — treat instructions as scope changes and questions as blocking asks.',
     { taskId: z.string() },
     tool(async ({ taskId }) => {
+      // Authorize (PLNR-95): resolve the task (id or key) and require the agent's
+      // user can reach its project. This tool took only a taskId and never checked,
+      // so any agent could read any task's human instructions. Mirrors get_task.
+      const task = await env.DB.prepare('SELECT id, project_id AS pid FROM tasks WHERE id = ? OR key = ?')
+        .bind(taskId, taskId).first<{ id: string; pid: string }>();
+      if (!task) throw new Error(`task ${taskId} not found`);
+      if (!(await userCanAccessProject(env, agent.userId, task.pid))) throw new Error(`task ${taskId} not found`);
       const { results } = await env.DB.prepare(
         `SELECT id, author_kind AS authorKind, author_id AS authorId, kind, body, status, created_at AS createdAt
          FROM comments WHERE task_id = ? AND status IN ('open','acknowledged') ORDER BY created_at`,
-      ).bind(taskId).all();
+      ).bind(task.id).all();
       return { openComments: results };
     }),
   );
@@ -699,14 +710,14 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       state: z.string().optional(),
     },
     tool(async ({ taskId, kind, ref, url, state }) => {
-      const task = await env.DB.prepare('SELECT id, project_id AS pid, key FROM tasks WHERE id = ? OR key = ?')
-        .bind(taskId, taskId).first<{ id: string; pid: string; key: string }>();
+      // Authorize + route through the DO (PLNR-95): this matched the guessable task
+      // KEY with no access check and wrote straight to D1 (no event, no WS fanout),
+      // so any agent could plant a ref/URL on any tenant's task, silently.
+      const task = await env.DB.prepare('SELECT id, project_id AS pid FROM tasks WHERE id = ? OR key = ?')
+        .bind(taskId, taskId).first<{ id: string; pid: string }>();
       if (!task) throw new Error(`task ${taskId} not found`);
-      await env.DB.prepare(
-        `INSERT INTO task_refs (id, task_id, kind, ref, url, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (task_id, kind, ref) DO UPDATE SET url = excluded.url, state = excluded.state`,
-      ).bind(`ref_${crypto.randomUUID().slice(0, 12)}`, task.id, kind, ref, url ?? null, state ?? null, nowIso()).run();
-      return { ok: true, taskKey: task.key };
+      if (!(await userCanAccessProject(env, agent.userId, task.pid))) throw new Error(`task ${taskId} not found`);
+      return room(env, task.pid).attachRef(task.pid, actor, task.id, kind, ref, url ?? null, state ?? null);
     }),
   );
 
@@ -722,11 +733,14 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     new ResourceTemplate('noriq://attachment/{id}', {
       // Discovery: recent attachments across active projects, each with its URI.
       list: async () => {
+        // Scope discovery to attachments in projects the agent's USER can reach
+        // (PLNR-94) — this list used to enumerate every tenant's recent files,
+        // handing out the ids needed to read them.
         const { results } = await env.DB.prepare(
           `SELECT a.id, a.filename, a.content_type AS ct, a.size
            FROM attachments a JOIN tasks t ON t.id = a.task_id JOIN projects p ON p.id = t.project_id
-           WHERE p.status = 'active' ORDER BY a.created_at DESC LIMIT 50`,
-        ).all<{ id: string; filename: string; ct: string; size: number }>();
+           WHERE p.status = 'active' AND ${USER_PROJECT_WHERE} ORDER BY a.created_at DESC LIMIT 50`,
+        ).bind(agent.userId).all<{ id: string; filename: string; ct: string; size: number }>();
         return {
           resources: results.map((a) => ({
             uri: attachmentUri(a.id),
@@ -741,9 +755,15 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     async (uri, { id }) => {
       if (!env.FILES) throw new Error('attachments not configured on this instance');
       const attId = Array.isArray(id) ? id[0]! : id;
-      const row = await env.DB.prepare('SELECT r2_key AS key, content_type AS ct FROM attachments WHERE id = ?')
-        .bind(attId).first<{ key: string; ct: string }>();
+      // Authorize (PLNR-94): only stream bytes from a project the agent's USER can
+      // reach. Join through the owning task/project; 404 (indistinguishable from a
+      // missing id) otherwise. Previously any agent could read any tenant's file.
+      const row = await env.DB.prepare(
+        `SELECT a.r2_key AS key, a.content_type AS ct, t.project_id AS pid
+         FROM attachments a JOIN tasks t ON t.id = a.task_id WHERE a.id = ?`,
+      ).bind(attId).first<{ key: string; ct: string; pid: string }>();
       if (!row) throw new Error(`attachment ${attId} not found`);
+      if (!(await userCanAccessProject(env, agent.userId, row.pid))) throw new Error(`attachment ${attId} not found`);
       const obj = await env.FILES.get(row.key);
       if (!obj) throw new Error('file missing from storage');
       const bytes = new Uint8Array(await obj.arrayBuffer());

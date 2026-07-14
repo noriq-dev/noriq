@@ -1,13 +1,14 @@
 import { Hono } from 'hono';
+import type { Context, Next } from 'hono';
 import { cors } from 'hono/cors';
 import { StreamableHTTPTransport } from '@hono/mcp';
 import type { Env } from './env';
-import { adminAuth, agentAuth, resolveSessionAgent, userAuth, type AppContext } from './auth';
+import { adminAuth, agentAuth, getCookie, resolveSessionAgent, userAuth, type AppContext } from './auth';
 import { buildMcpServer } from './mcp';
 import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot } from './backup';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, verifyPassword } from './lib/util';
-import { USER_PROJECT_WHERE } from './lib/visibility';
+import { USER_PROJECT_WHERE, userCanAccessProject } from './lib/visibility';
 import type { Actor } from './do/ProjectRoom';
 import { SKILL_MD } from './skill';
 import { metadataRoutes, oauth } from './oauth';
@@ -51,6 +52,32 @@ const humanActor = (c: { var: { user?: { id: string; name: string } } }): Actor 
   id: c.var.user!.id,
   name: c.var.user!.name,
 });
+
+// Gate every project-scoped route (PLNR-92): being signed in is NOT enough — you
+// must be able to REACH this project. Mirrors VISIBILITY_WHERE (owner, a member of
+// its group, or an admin). Returns 404 (not 403) so project-id existence doesn't
+// leak. Registered as ONE chokepoint over /api/projects/:pid/* so no individual
+// write route can forget the check (the mass-IDOR hole this closes came from the
+// check living only on the MCP path). userAuth runs first (idempotent) to populate
+// c.var.user; the route-level userAuth then no-ops.
+/** Human-path project reach (PLNR-92/97): an admin sees everything; everyone else
+ *  must own the project or be a member of its group. */
+const reachesProject = (c: Context<AppContext>, pid: string): Promise<boolean> =>
+  c.var.user!.role === 'admin' ? Promise.resolve(true) : userCanAccessProject(c.env, c.var.user!.id, pid);
+
+async function requireProjectAccess(c: Context<AppContext>, next: Next) {
+  // Path shape: /api/projects/<pid>/<sub>... — derive pid directly (robust
+  // regardless of how Hono resolves params for wildcard middleware). Only the
+  // SUB-routes are governed here; the bare /api/projects/:pid (whole-project
+  // DELETE) is out of scope — it keeps its own owner/admin gate (403).
+  const parts = new URL(c.req.url).pathname.split('/');
+  const pid = parts[3];
+  if (pid && parts.length > 4 && !(await reachesProject(c, pid))) {
+    return c.json({ error: 'not found' }, 404);
+  }
+  await next();
+}
+app.use('/api/projects/:pid/*', userAuth, requireProjectAccess);
 
 // --- health -----------------------------------------------------------------
 app.get('/api/health', async (c) => {
@@ -104,7 +131,31 @@ app.get('/ws/projects/:projectId', async (c) => {
   if (c.req.header('Upgrade')?.toLowerCase() !== 'websocket') {
     return c.text('expected WebSocket upgrade', 426);
   }
-  return room(c.env, c.req.param('projectId')).fetch(c.req.raw);
+  // Refuse cross-origin upgrades (PLNR-91): WS handshakes aren't covered by CORS,
+  // and SameSite=Lax already withholds the cookie cross-site — reject explicitly too.
+  const origin = c.req.header('Origin');
+  if (origin) {
+    let originHost: string | null = null;
+    try { originHost = new URL(origin).host; } catch { originHost = null; } // malformed → treat as cross-origin
+    if (originHost !== new URL(c.req.url).host) return c.text('cross-origin websocket refused', 403);
+  }
+  // Authenticate + authorize the handshake (PLNR-91): the session cookie rides the
+  // upgrade. Previously this forwarded straight to the DO with NO check, so anyone
+  // could subscribe to any project's entire event log. Mirror VISIBILITY_WHERE
+  // (owner / group member / admin); 404 (not 403) so project existence doesn't leak.
+  const sid = getCookie(c.req.header('Cookie') ?? '', 'planar_session');
+  const user = sid
+    ? await c.env.DB.prepare(
+        `SELECT u.id, u.role FROM sessions s JOIN users u ON u.id = s.user_id
+         WHERE s.id = ? AND s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') AND u.disabled = 0`,
+      ).bind(await sha256Hex(sid)).first<{ id: string; role: string }>()
+    : null;
+  if (!user) return c.text('not signed in', 401);
+  const pid = c.req.param('projectId');
+  if (user.role !== 'admin' && !(await userCanAccessProject(c.env, user.id, pid))) {
+    return c.text('not found', 404);
+  }
+  return room(c.env, pid).fetch(c.req.raw);
 });
 
 // --- admin bootstrap (users; agent key issuance retired — agents arrive via OAuth) --
@@ -327,6 +378,7 @@ app.get('/api/tasks/:tid', userAuth, async (c) => {
   const tid = c.req.param('tid')!;
   const task = await c.env.DB.prepare('SELECT * FROM tasks WHERE id = ?').bind(tid).first();
   if (!task) return c.json({ error: 'not found' }, 404);
+  if (!(await reachesProject(c, String(task.project_id)))) return c.json({ error: 'not found' }, 404); // PLNR-97
   const [comments, refs, attachments, taskTagRows] = await Promise.all([
     c.env.DB.prepare(
       `SELECT id, author_kind AS authorKind, author_id AS authorId, kind, body, status, parent_comment_id AS parentCommentId, created_at AS createdAt
@@ -510,8 +562,8 @@ app.post('/api/groups', userAuth, async (c) => {
   const body = await c.req.json<{ name: string; description?: string }>();
   if (!body.name) return c.json({ error: 'name required' }, 400);
   const id = newId('grp');
-  await c.env.DB.prepare('INSERT INTO groups (id, name, description, created_at) VALUES (?, ?, ?, ?)')
-    .bind(id, body.name, body.description ?? '', nowIso()).run();
+  await c.env.DB.prepare('INSERT INTO groups (id, name, description, created_by, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind(id, body.name, body.description ?? '', c.var.user!.id, nowIso()).run();
   // The creator becomes a member so they can manage (and see) the group they made.
   await c.env.DB.prepare('INSERT OR IGNORE INTO user_groups (user_id, group_id) VALUES (?, ?)')
     .bind(c.var.user!.id, id).run();
@@ -522,7 +574,20 @@ app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
   const body = await c.req.json<{ groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number; ownerUserId?: string | null }>();
   const sets: string[] = [];
   const binds: unknown[] = [];
-  if (body.groupId !== undefined) { sets.push('group_id = ?'); binds.push(body.groupId); }
+  if (body.groupId !== undefined) {
+    // PLNR-93 ("closed + self-join"): you may move a project into a group only if you
+    // CREATED it or already belong to it (or you're an admin) — you can't join
+    // someone else's group by dropping a project into it. (The reach-check on the
+    // project itself is handled by the requireProjectAccess middleware.)
+    if (body.groupId !== null && c.var.user!.role !== 'admin') {
+      const g = await c.env.DB.prepare('SELECT created_by AS createdBy FROM groups WHERE id = ?')
+        .bind(body.groupId).first<{ createdBy: string | null }>();
+      if (!g) return c.json({ error: 'group not found' }, 404);
+      const allowed = g.createdBy === c.var.user!.id || await isGroupMember(c.env, c.var.user!.id, body.groupId);
+      if (!allowed) return c.json({ error: 'you must be a member or the creator of the target group' }, 403);
+    }
+    sets.push('group_id = ?'); binds.push(body.groupId);
+  }
   if (body.description !== undefined) { sets.push('description = ?'); binds.push(body.description); }
   if (body.name !== undefined) { sets.push('name = ?'); binds.push(body.name); }
   if (body.claimTtlSeconds !== undefined) {
@@ -537,15 +602,9 @@ app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
   binds.push(pid);
   await c.env.DB.prepare(`UPDATE projects SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
-  // Putting a project in a group makes its owner a member of that group (PLNR-83):
-  // otherwise the owner shares their project into the group but can't see the
-  // group's other projects. Members are what grant visibility.
-  if (body.groupId) {
-    await c.env.DB.prepare(
-      `INSERT OR IGNORE INTO user_groups (user_id, group_id)
-       SELECT owner_user_id, ? FROM projects WHERE id = ? AND owner_user_id IS NOT NULL`,
-    ).bind(body.groupId, pid).run();
-  }
+  // No auto-join anymore (PLNR-93): the caller was required to already be a member or
+  // the creator of the target group above, so their visibility is already correct —
+  // and this closes the "join any group by dropping a project in" hole.
   return c.json({ ok: true });
 });
 
@@ -720,6 +779,13 @@ app.get('/api/agents', userAuth, async (c) => {
   // Agents are project-local; scope the roster to a project when given (the Agents tab
   // passes the current project). Connection default agents (project_id NULL) never show.
   const projectId = c.req.query('projectId');
+  // PLNR-97: the roster is per-project — a non-admin must be able to reach it; the
+  // cross-project view (no projectId) stays admin-only.
+  if (projectId) {
+    if (!(await reachesProject(c, projectId))) return c.json({ error: 'not found' }, 404);
+  } else if (c.var.user!.role !== 'admin') {
+    return c.json({ agents: [] });
+  }
   const where = projectId ? 'WHERE a.project_id = ?' : 'WHERE a.project_id IS NOT NULL';
   const stmt = c.env.DB.prepare(
     `SELECT a.id, COALESCE(a.label, a.name) AS name, a.role, a.status, a.last_seen_at AS lastSeenAt, a.created_at AS createdAt,
@@ -733,11 +799,19 @@ app.get('/api/agents', userAuth, async (c) => {
 });
 
 app.get('/api/agents/:aid/events', userAuth, async (c) => {
-  const { results } = await c.env.DB.prepare(
-    `SELECT e.id, e.project_id AS projectId, e.seq, e.verb, e.subject_type AS subjectType, e.subject_id AS subjectId,
-            e.payload, e.created_at AS createdAt
-     FROM events e WHERE e.actor_id = ? ORDER BY e.rowid DESC LIMIT 50`,
-  ).bind(c.req.param('aid')!).all();
+  const aid = c.req.param('aid')!;
+  const ag = await c.env.DB.prepare('SELECT project_id AS pid FROM agents WHERE id = ?').bind(aid).first<{ pid: string | null }>();
+  if (!ag) return c.json({ events: [] });
+  // PLNR-97: only an admin, or someone who can reach the agent's project, sees its events.
+  if (!(c.var.user!.role === 'admin' || (ag.pid && await userCanAccessProject(c.env, c.var.user!.id, ag.pid)))) {
+    return c.json({ error: 'not found' }, 404);
+  }
+  const cols = `SELECT e.id, e.project_id AS projectId, e.seq, e.verb, e.subject_type AS subjectType, e.subject_id AS subjectId,
+            e.payload, e.created_at AS createdAt FROM events e`;
+  const stmt = ag.pid
+    ? c.env.DB.prepare(`${cols} WHERE e.actor_id = ? AND e.project_id = ? ORDER BY e.rowid DESC LIMIT 50`).bind(aid, ag.pid)
+    : c.env.DB.prepare(`${cols} WHERE e.actor_id = ? ORDER BY e.rowid DESC LIMIT 50`).bind(aid);
+  const { results } = await stmt.all();
   return c.json({ events: results.map((e) => ({ ...e, payload: JSON.parse(String(e.payload)) })) });
 });
 
@@ -750,11 +824,14 @@ app.post('/api/agents/:aid/revoke', userAuth, async (c) => {
 // --- per-task event timeline (PLNR-34) ----------------------------------------------
 app.get('/api/tasks/:tid/events', userAuth, async (c) => {
   const tid = c.req.param('tid')!;
+  const task = await c.env.DB.prepare('SELECT project_id AS pid FROM tasks WHERE id = ?').bind(tid).first<{ pid: string }>();
+  if (!task) return c.json({ error: 'not found' }, 404);
+  if (!(await reachesProject(c, task.pid))) return c.json({ error: 'not found' }, 404); // PLNR-97
   const { results } = await c.env.DB.prepare(
     `SELECT id, seq, actor_kind AS actorKind, actor_id AS actorId, verb, payload, created_at AS createdAt
-     FROM events WHERE subject_id = ?1 OR payload LIKE '%"taskId":"' || ?1 || '"%'
+     FROM events WHERE project_id = ?2 AND (subject_id = ?1 OR payload LIKE '%"taskId":"' || ?1 || '"%')
      ORDER BY rowid DESC LIMIT 60`,
-  ).bind(tid).all();
+  ).bind(tid, task.pid).all();
   return c.json({ events: results.map((e) => ({ ...e, payload: JSON.parse(String(e.payload)) })) });
 });
 
@@ -767,26 +844,38 @@ app.post('/api/tasks/:tid/attachments', userAuth, async (c) => {
   const task = await c.env.DB.prepare('SELECT id, project_id AS pid FROM tasks WHERE id = ?').bind(tid)
     .first<{ id: string; pid: string }>();
   if (!task) return c.json({ error: 'task not found' }, 404);
+  if (!(await reachesProject(c, task.pid))) return c.json({ error: 'task not found' }, 404); // PLNR-98
   const filename = (c.req.query('filename') ?? 'file').replace(/[\/\\]/g, '_').slice(0, 120);
-  const size = Number(c.req.header('Content-Length') ?? '0');
-  if (!size || size > MAX_ATTACHMENT) return c.json({ error: 'attachment must be 1 byte – 100 MB' }, 413);
+  // Early reject on an honest oversized Content-Length; but the header is
+  // client-controlled, so the REAL size is enforced from R2 after the stream lands
+  // (a forged small length used to under-report while R2 stored the full body — PLNR-98).
+  if (Number(c.req.header('Content-Length') ?? '0') > MAX_ATTACHMENT) {
+    return c.json({ error: 'attachment must be 1 byte – 100 MB' }, 413);
+  }
   const id = newId('att');
   const key = `att/${task.pid}/${id}/${filename}`;
-  await c.env.FILES.put(key, c.req.raw.body, {
-    httpMetadata: { contentType: c.req.header('Content-Type') ?? 'application/octet-stream' },
-  });
+  const ct = c.req.header('Content-Type') ?? 'application/octet-stream';
+  const obj = await c.env.FILES.put(key, c.req.raw.body, { httpMetadata: { contentType: ct } });
+  const size = obj?.size ?? 0;
+  if (!size || size > MAX_ATTACHMENT) {
+    await c.env.FILES.delete(key).catch(() => {});
+    return c.json({ error: 'attachment must be 1 byte – 100 MB' }, 413);
+  }
   await c.env.DB.prepare(
     `INSERT INTO attachments (id, task_id, filename, content_type, size, r2_key, uploaded_by_kind, uploaded_by, created_at)
      VALUES (?, ?, ?, ?, ?, ?, 'human', ?, ?)`,
-  ).bind(id, tid, filename, c.req.header('Content-Type') ?? 'application/octet-stream', size, key, c.var.user!.id, nowIso()).run();
+  ).bind(id, tid, filename, ct, size, key, c.var.user!.id, nowIso()).run();
   await room(c.env, task.pid).noteAttachment(task.pid, humanActor(c), tid, filename, id);
   return c.json({ id, filename, size });
 });
 
 app.get('/api/attachments/:aid', userAuth, async (c) => {
-  const row = await c.env.DB.prepare('SELECT r2_key AS key, filename, content_type AS ct FROM attachments WHERE id = ?')
-    .bind(c.req.param('aid')!).first<{ key: string; filename: string; ct: string }>();
+  const row = await c.env.DB.prepare(
+    `SELECT a.r2_key AS key, a.filename, a.content_type AS ct, t.project_id AS pid
+     FROM attachments a JOIN tasks t ON t.id = a.task_id WHERE a.id = ?`,
+  ).bind(c.req.param('aid')!).first<{ key: string; filename: string; ct: string; pid: string }>();
   if (!row) return c.json({ error: 'not found' }, 404);
+  if (!(await reachesProject(c, row.pid))) return c.json({ error: 'not found' }, 404); // PLNR-97
   if (!c.env.FILES) return c.json({ error: 'attachments not configured' }, 503);
   const obj = await c.env.FILES.get(row.key);
   if (!obj) return c.json({ error: 'file missing from storage' }, 404);

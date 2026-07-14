@@ -1,6 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../env';
 import { newId, nowIso } from '../lib/util';
+import { userCanAccessProject } from '../lib/visibility';
 
 /**
  * ProjectRoom — one instance per project (idFromName(projectId)).
@@ -696,6 +697,16 @@ export class ProjectRoom extends DurableObject<Env> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       if (actor.kind === 'system') throw new Error('system cannot send messages');
+      // A directed message must target an agent whose USER can reach this project
+      // (PLNR-96) — blocks cross-tenant DM injection, while allowing same-user and
+      // group co-member agents (including ones not yet scoped to a project).
+      if (toAgentId) {
+        const target = await this.env.DB.prepare('SELECT user_id AS userId, project_id AS pid FROM agents WHERE id = ?')
+          .bind(toAgentId).first<{ userId: string | null; pid: string | null }>();
+        const reachable = !!target && (target.pid === this.projectId
+          || (!!target.userId && await userCanAccessProject(this.env, target.userId, this.projectId)));
+        if (!reachable) throw new Error(`agent ${toAgentId} cannot be messaged in this project`);
+      }
       const id = newId('msg');
       await this.env.DB.prepare(
         'INSERT INTO messages (id, project_id, from_kind, from_id, from_name, to_agent_id, body, ref_task_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
@@ -1022,7 +1033,23 @@ export class ProjectRoom extends DurableObject<Env> {
       const task = await this.getTask(taskId);
       await this.emit(actor, 'attachment.added', 'task', taskId, { key: task.key, filename, attachmentId });
       return { ok: true };
-    
+
+    });
+  }
+
+  /** Link a git branch/PR/commit to a task. Routed through the DO (PLNR-95) so it
+   *  emits an event + WS fanout — the attach_ref tool used to write straight to D1,
+   *  silently. getTask scopes to this project (throws if the task isn't in it). */
+  async attachRef(projectId: string, actor: Actor, taskId: string, kind: string, ref: string, url: string | null, state: string | null)  {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const task = await this.getTask(taskId);
+      await this.env.DB.prepare(
+        `INSERT INTO task_refs (id, task_id, kind, ref, url, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (task_id, kind, ref) DO UPDATE SET url = excluded.url, state = excluded.state`,
+      ).bind(newId('ref'), taskId, kind, ref, url, state, nowIso()).run();
+      await this.emit(actor, 'ref.attached', 'task', taskId, { key: task.key, kind, ref, url, state });
+      return { ok: true, taskKey: task.key };
     });
   }
 

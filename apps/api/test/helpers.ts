@@ -64,6 +64,34 @@ export async function createAgent(name: string, role: 'orchestrator' | 'worker' 
   return { id: set.body.actingAs.id as string, apiKey };
 }
 
+/** OAuth-mint an access token bound to a SPECIFIC user (createAgent mints all agents
+ *  under one shared user). Registers a throwaway client and runs the full flow with
+ *  that user's cookie — used for genuine cross-tenant tests. */
+export async function mintTokenForUser(email: string, password = 'longenough1'): Promise<string> {
+  await createUser(email, email, password).catch(() => {});
+  const cookie = await loginSession(email, password);
+  const reg = await SELF.fetch('https://planar.test/oauth/register', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ client_name: 'mint-user', redirect_uris: ['http://localhost:39990/cb'] }),
+  });
+  const clientId = ((await reg.json()) as { client_id: string }).client_id;
+  const verifier = `mint-${email}-`.padEnd(48, 'x');
+  const form = new URLSearchParams({
+    response_type: 'code', client_id: clientId, redirect_uri: 'http://localhost:39990/cb',
+    code_challenge: await s256b64url(verifier), code_challenge_method: 'S256', scope: 'mcp', state: 'm', decision: 'approve',
+  });
+  const approve = await SELF.fetch('https://planar.test/oauth/authorize', {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: form.toString(), redirect: 'manual',
+  });
+  const code = new URL(approve.headers.get('Location')!).searchParams.get('code')!;
+  const tok = await SELF.fetch('https://planar.test/oauth/token', {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: 'http://localhost:39990/cb', client_id: clientId, code_verifier: verifier }).toString(),
+  });
+  return ((await tok.json()) as { access_token: string }).access_token;
+}
+
 export async function createUser(email: string, name: string, password: string, role: 'admin' | 'member' = 'member') {
   const res = await SELF.fetch('https://planar.test/api/admin/users', {
     method: 'POST',

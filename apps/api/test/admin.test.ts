@@ -104,11 +104,13 @@ describe('grouped projects are shared with the group members only (PLNR-83)', ()
     expect((await listProjects(adminCookie, 'all')).projects.some((p) => p.id === bobProjectId)).toBe(true);
   });
 
-  it('putting your project in a group joins you, so co-members see each others projects', async () => {
+  it('closed + self-join: creator adds their project; a non-member cannot join by dropping one in; an added member can (PLNR-93)', async () => {
     await createUser('av-ed@example.com', 'AV Ed', 'longenough1').catch(() => {});
     await createUser('av-fred@example.com', 'AV Fred', 'longenough1').catch(() => {});
     const edCookie = await loginSession('av-ed@example.com', 'longenough1');
     const fredCookie = await loginSession('av-fred@example.com', 'longenough1');
+    const users = await (await SELF.fetch('https://planar.test/api/users', { headers: { Cookie: adminCookie } })).json() as { users: Array<{ id: string; email: string }> };
+    const fredId = users.users.find((u) => u.email === 'av-fred@example.com')!.id;
     const mkProject = async (cookie: string, key: string) => {
       const r = await SELF.fetch('https://planar.test/api/projects', {
         method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ key, name: key }),
@@ -119,23 +121,27 @@ describe('grouped projects are shared with the group members only (PLNR-83)', ()
       method: 'PATCH', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ groupId: gid }),
     });
 
-    // Ed makes a group (auto-joins) and puts his project in it.
+    // Ed makes a group (auto-joins as creator) and can put his project in it.
     const g = await SELF.fetch('https://planar.test/api/groups', {
       method: 'POST', headers: { Cookie: edCookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Shared Nod' }),
     });
     const gid = (await g.json() as { id: string }).id;
     const edProj = await mkProject(edCookie, 'AVED');
-    await setGroup(edCookie, edProj, gid);
+    expect((await setGroup(edCookie, edProj, gid)).status).toBe(200);
 
-    // Fred puts HIS project in the same group → he auto-joins it.
+    // Fred is NOT a member → dropping his project into Ed's group is refused, and he does not join.
     const fredProj = await mkProject(fredCookie, 'AVFRED');
-    await setGroup(fredCookie, fredProj, gid);
+    expect((await setGroup(fredCookie, fredProj, gid)).status).toBe(403);
+    expect((await listProjects(fredCookie)).projects.some((p) => p.id === edProj)).toBe(false);
 
-    // Both are now members and see each other's grouped projects.
+    // Ed (a member) adds Fred; now Fred may add his project, and co-members see each other's.
+    await SELF.fetch(`https://planar.test/api/groups/${gid}/members`, {
+      method: 'POST', headers: { Cookie: edCookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ userId: fredId }),
+    });
+    expect((await setGroup(fredCookie, fredProj, gid)).status).toBe(200);
     const fredSees = (await listProjects(fredCookie)).projects.map((p) => p.id);
     expect(fredSees).toContain(fredProj);
-    expect(fredSees).toContain(edProj);   // ← the previously-broken case
-    const edSees = (await listProjects(edCookie)).projects.map((p) => p.id);
-    expect(edSees).toContain(fredProj);
+    expect(fredSees).toContain(edProj);
+    expect((await listProjects(edCookie)).projects.map((p) => p.id)).toContain(fredProj);
   });
 });

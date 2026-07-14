@@ -91,7 +91,13 @@ export async function resolveSessionAgent(env: Env, conn: Connection, sessionId:
   const existing = await env.DB.prepare(
     `SELECT id, COALESCE(label, name) AS name, role, user_id AS userId FROM agents WHERE session_id = ? AND status != 'revoked'`,
   ).bind(sessionId).first<AgentIdentity>();
-  if (existing) return existing;
+  if (existing) {
+    // The session id is client-supplied (echoed back from initialize). Bind it to
+    // the authenticated user so a leaked session id can't be replayed with another
+    // user's token to act AS that user's agent (PLNR-101).
+    if (existing.userId !== conn.userId) throw new Error('session id does not belong to this connection');
+    return existing;
+  }
   const id = newId('agt');
   // `name` is a stable, globally-unique internal handle (label is the friendly display,
   // set via set_agent_identity). The id suffix guarantees uniqueness.
@@ -116,6 +122,9 @@ export async function adminAuth(c: Context<AppContext>, next: Next) {
 
 /** Session-cookie auth for humans. Sets c.var.user. */
 export async function userAuth(c: Context<AppContext>, next: Next) {
+  // Idempotent: the project-subtree access middleware (PLNR-92) resolves the user
+  // before the route-level userAuth runs again — don't re-query the session then.
+  if (c.get('user')) return next();
   const sid = getCookie(c.req.header('Cookie') ?? '', 'planar_session');
   if (!sid) return c.json({ error: 'not signed in' }, 401);
   const row = await c.env.DB.prepare(

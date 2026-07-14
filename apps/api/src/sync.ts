@@ -38,9 +38,9 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
 
   // New events since the cursor that concern this agent.
   const { results: rawEvents } = await env.DB.prepare(
-    `SELECT e.rowid AS rid, e.verb, e.payload, e.actor_id AS actorId, e.subject_id AS subjectId
+    `SELECT e.rowid AS rid, e.verb, e.payload, e.actor_id AS actorId, e.subject_id AS subjectId, e.project_id AS projectId
      FROM events e WHERE e.rowid > ? ORDER BY e.rowid LIMIT 500`,
-  ).bind(cursor).all<{ rid: number; verb: string; payload: string; actorId: string; subjectId: string }>();
+  ).bind(cursor).all<{ rid: number; verb: string; payload: string; actorId: string; subjectId: string; projectId: string }>();
 
   const heldTaskIds = new Set<string>();
   const heldRows = await env.DB.prepare(
@@ -65,6 +65,13 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
   ).results;
   const claimableIds = new Set(claimable.map((t) => t.id));
 
+  // Projects the agent's USER can reach — scopes broadcast messages/notices so an
+  // agent never hears cross-tenant chatter (PLNR-96).
+  const accessibleProjectIds = new Set(
+    (await env.DB.prepare(`SELECT p.id FROM projects p WHERE ${USER_PROJECT_WHERE}`)
+      .bind(agent.userId).all<{ id: string }>()).results.map((r) => r.id),
+  );
+
   const notices: string[] = [];
   let maxRid = cursor;
   for (const e of rawEvents) {
@@ -73,7 +80,7 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
     const p = JSON.parse(e.payload) as Record<string, unknown>;
     if (e.verb === 'comment.posted' && typeof p.taskId === 'string' && heldTaskIds.has(p.taskId)) {
       notices.push(`New ${p.kind} on ${p.taskKey} (your task): "${p.body}"`);
-    } else if (e.verb === 'message.sent' && (p.to === agent.id || p.to === 'broadcast')) {
+    } else if (e.verb === 'message.sent' && (p.to === agent.id || (p.to === 'broadcast' && accessibleProjectIds.has(e.projectId)))) {
       notices.push(`Message from ${p.actorName ?? e.actorId}${p.refTaskId ? ` re ${p.refTaskId}` : ''}: "${p.body}"`);
     } else if (e.verb === 'task.requeued' && p.previousHolder === agent.id) {
       notices.push(`Your claim on ${p.key} expired — the task was requeued (${p.reason}).`);
@@ -110,20 +117,21 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
   const unassignedComments = (
     await env.DB.prepare(
       `SELECT c.id, c.task_id AS taskId, t.key AS taskKey, c.kind, c.body
-       FROM comments c JOIN tasks t ON t.id = c.task_id
+       FROM comments c JOIN tasks t ON t.id = c.task_id JOIN projects p ON p.id = t.project_id
        WHERE t.claimed_by IS NULL AND c.status IN ('open','acknowledged') AND c.author_kind != 'agent'
+         AND ${USER_PROJECT_WHERE}
        ORDER BY c.created_at LIMIT 10`,
-    ).all<AgentUpdates['unassignedComments'][number]>()
+    ).bind(agent.userId).all<AgentUpdates['unassignedComments'][number]>()
   ).results;
 
   // Recent direct/broadcast messages (last 10, regardless of cursor, for context).
   const messages = (
     await env.DB.prepare(
       `SELECT m.id, m.from_name AS "from", m.body, m.ref_task_id AS refTaskId, m.created_at AS createdAt
-       FROM messages m
-       WHERE (m.to_agent_id = ? OR m.to_agent_id IS NULL) AND m.from_id != ?
+       FROM messages m JOIN projects p ON p.id = m.project_id
+       WHERE (m.to_agent_id = ?2 OR (m.to_agent_id IS NULL AND ${USER_PROJECT_WHERE})) AND m.from_id != ?2
        ORDER BY m.created_at DESC LIMIT 10`,
-    ).bind(agent.id, agent.id).all<AgentUpdates['messages'][number]>()
+    ).bind(agent.userId, agent.id).all<AgentUpdates['messages'][number]>()
   ).results;
 
   // Input requests this agent is still waiting on (so it doesn't re-ask or forget).
