@@ -355,6 +355,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       tags: z.array(z.string()).optional().describe('REPLACES the tag set (auto-created; [] clears)'),
       type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
       boardId: z.string().optional().describe('Move the task to another board (see get_project.boards)'),
+      parentTaskId: z.string().nullable().optional().describe('Re-parent under another task (id or key); null detaches it to a root. Lets you build the tree after creating tasks in key order.'),
     },
     tool(async ({ projectId, taskId, ...patch }) => room(env, projectId).updateTask(projectId, actor, taskId, patch)),
   );

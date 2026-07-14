@@ -45,6 +45,8 @@ export interface TaskPatch {
   estimate?: number | null;
   milestoneId?: string | null;
   boardId?: string | null;
+  /** Re-parent the task (PLNR-89); null detaches it to a root. Accepts an id or key. */
+  parentTaskId?: string | null;
   /** Replace the task's tag set (names; auto-created). */
   tags?: string[];
   /** Legacy single-tag alias. */
@@ -304,6 +306,25 @@ export class ProjectRoom extends DurableObject<Env> {
           sets.push(`${col} = ?`);
           binds.push(patch[k]);
         }
+      }
+      // Re-parent (PLNR-89): resolve the new parent by id-or-key, reject self-parenting
+      // and cycles (the new parent must not be the task or one of its descendants).
+      if (patch.parentTaskId !== undefined) {
+        let parentId: string | null = null;
+        if (patch.parentTaskId) {
+          const parent = await this.env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+            .bind(patch.parentTaskId, patch.parentTaskId, this.projectId).first<{ id: string }>();
+          if (!parent) throw new Error(`parent task ${patch.parentTaskId} not found in this project`);
+          parentId = parent.id;
+          let cursor: string | null = parentId;
+          while (cursor) {
+            if (cursor === task.id) throw new Error('cannot re-parent a task under itself or a descendant (would create a cycle)');
+            const anc: { p: string | null } | null = await this.env.DB.prepare('SELECT parent_task_id AS p FROM tasks WHERE id = ?').bind(cursor).first<{ p: string | null }>();
+            cursor = anc?.p ?? null;
+          }
+        }
+        sets.push('parent_task_id = ?');
+        binds.push(parentId);
       }
       let statusChanged = false;
       if (patch.status !== undefined && patch.status !== task.status) {
