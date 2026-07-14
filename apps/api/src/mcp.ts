@@ -238,8 +238,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     tool(async (args) => {
       const id = `prj_${args.key.toLowerCase()}`;
       await env.DB.prepare(
-        `INSERT INTO projects (id, key, name, description, status, repo_url, claim_ttl_seconds, created_at) VALUES (?, ?, ?, ?, 'active', ?, 1800, ?)`,
-      ).bind(id, args.key, args.name, args.description ?? '', args.repoUrl ?? null, nowIso()).run();
+        `INSERT INTO projects (id, key, name, description, status, repo_url, claim_ttl_seconds, owner_user_id, created_at) VALUES (?, ?, ?, ?, 'active', ?, 1800, ?, ?)`,
+      ).bind(id, args.key, args.name, args.description ?? '', args.repoUrl ?? null, agent.userId, nowIso()).run();
       await room(env, id).createMilestone(id, actor, 'Backlog');
       await room(env, id).createBoard(id, actor, 'Main');
       return { id, key: args.key };

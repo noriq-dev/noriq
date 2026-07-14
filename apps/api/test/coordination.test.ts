@@ -11,7 +11,9 @@ beforeAll(async () => {
   orch = await createAgent('atlas', 'orchestrator');
   nova = await createAgent('nova');
   echo = await createAgent('echo');
-  await createUser('you@example.com', 'You', 'hunter2!');
+  // The supervising human is an admin (like the instance owner) — sees every
+  // project, incl. those the agents create (which are now owned by their user).
+  await createUser('you@example.com', 'You', 'hunter2!', 'admin');
   cookie = await loginSession('you@example.com', 'hunter2!');
 });
 

@@ -1,9 +1,10 @@
 // Project visibility helpers (PLNR-48 / PLNR-83).
 //
-// USER_PROJECT_WHERE is the set of projects a *user* may reach: ones they own,
-// ANY project that belongs to a group (grouped projects are shared/visible to all
-// users — PLNR-83), or legacy/agent-created projects with no owner. Only an
-// ungrouped project owned by someone else is private.
+// USER_PROJECT_WHERE is the set of projects a *user* may reach: ones they own
+// (private), plus ones in a group they belong to (shared with that group's
+// members — NOT with everyone). There is intentionally no "ownerless → everyone"
+// escape hatch; every project has an owner (migration 0014 / create_project), so a
+// project you don't own and whose group you aren't in is simply not visible.
 //
 // It deliberately OMITS the admin-sees-all escalation — an agent (even an admin's,
 // over MCP) is scoped to what the user can reach, never to admin. The web UI adds
@@ -15,8 +16,7 @@ import type { Env } from '../env';
 
 export const USER_PROJECT_WHERE = `(
   p.owner_user_id = ?1
-  OR p.group_id IS NOT NULL
-  OR (p.group_id IS NULL AND p.owner_user_id IS NULL)
+  OR (p.group_id IS NOT NULL AND p.group_id IN (SELECT group_id FROM user_groups WHERE user_id = ?1))
 )`;
 
 /** Whether a user may access a specific project (owned / group / ownerless). */

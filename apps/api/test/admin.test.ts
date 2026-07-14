@@ -68,7 +68,7 @@ describe("an agent is scoped to its user, not admin (PLNR-83)", () => {
     expect(create.isError).toBe(true);
   });
 
-  it('but ownerless (agent-created) projects remain workable', async () => {
+  it('a project the agent creates is owned by its user and workable', async () => {
     const p = await mcpCall(agent.apiKey, 'create_project', { key: 'AVAGT', name: 'agent project' });
     expect(p.isError).toBe(false);
     const t = await mcpCall(agent.apiKey, 'create_task', { projectId: p.body.id, title: 'ok' });
@@ -76,23 +76,31 @@ describe("an agent is scoped to its user, not admin (PLNR-83)", () => {
   });
 });
 
-describe('grouped projects are shared with everyone (PLNR-83)', () => {
-  it('putting a private project in a group makes it visible + workable to others', async () => {
-    // Admin creates a group, Bob moves his (previously private) project into it.
+describe('grouped projects are shared with the group members only (PLNR-83)', () => {
+  it('a group project is visible to members, not to outsiders', async () => {
+    const charlie = await createUser('av-charlie@example.com', 'AV Charlie', 'longenough1').catch(() => null);
+    await createUser('av-dave@example.com', 'AV Dave', 'longenough1').catch(() => {});
+    const charlieCookie = await loginSession('av-charlie@example.com', 'longenough1');
+    const daveCookie = await loginSession('av-dave@example.com', 'longenough1');
+
+    // Bob makes a group (auto-joins), adds Charlie, and moves his project into it.
+    // Admin is deliberately NOT a member, to prove grouped != globally visible.
     const g = await SELF.fetch('https://planar.test/api/groups', {
-      method: 'POST', headers: { Cookie: adminCookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Shared team' }),
+      method: 'POST', headers: { Cookie: bobCookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Team X' }),
     });
     const gid = (await g.json() as { id: string }).id;
+    await SELF.fetch(`https://planar.test/api/groups/${gid}/members`, {
+      method: 'POST', headers: { Cookie: bobCookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ userId: charlie!.id }),
+    });
     await SELF.fetch(`https://planar.test/api/projects/${bobProjectId}/meta`, {
       method: 'PATCH', headers: { Cookie: bobCookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ groupId: gid }),
     });
 
-    // An agent under a different user now sees and can work Bob's grouped project.
-    const b = await mcpCall(agent.apiKey, 'get_briefing', {});
-    expect(b.body.projects.some((p: { id: string }) => p.id === bobProjectId)).toBe(true);
-    const get = await mcpCall(agent.apiKey, 'get_project', { projectId: bobProjectId });
-    expect(get.isError).toBe(false);
-    // And it shows in an admin's default list too (no ?scope=all needed for shared projects).
-    expect((await listProjects(adminCookie)).projects.some((p) => p.id === bobProjectId)).toBe(true);
+    // Member sees it; outsider does not.
+    expect((await listProjects(charlieCookie)).projects.some((p) => p.id === bobProjectId)).toBe(true);
+    expect((await listProjects(daveCookie)).projects.some((p) => p.id === bobProjectId)).toBe(false);
+    // Admin isn't a member/owner → not in the default view; ?scope=all still shows it.
+    expect((await listProjects(adminCookie)).projects.some((p) => p.id === bobProjectId)).toBe(false);
+    expect((await listProjects(adminCookie, 'all')).projects.some((p) => p.id === bobProjectId)).toBe(true);
   });
 });
