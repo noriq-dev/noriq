@@ -50,6 +50,26 @@ async function resolveTaskId(env: Env, projectId: string, taskId: string): Promi
 
 const asActor = (a: AgentIdentity): Actor => ({ kind: 'agent', id: a.id, name: a.name });
 
+// MCP tool annotations (PLNR-88). Without these, clients assume the spec defaults —
+// write + destructive + open-world — for every tool. Ours are more benign: reads are
+// marked read-only; writes are additive/coordination edits (no MCP tool deletes data —
+// deletion is human-only in the web app), so destructiveHint is false; some are
+// idempotent; and everything operates on this project system, never the open internet,
+// so openWorldHint is false. Unlisted tools fall back to a plain non-destructive write.
+type ToolHints = { readOnlyHint?: boolean; destructiveHint?: boolean; idempotentHint?: boolean; openWorldHint?: boolean };
+const READ: ToolHints = { readOnlyHint: true, openWorldHint: false };
+const WRITE: ToolHints = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
+const WRITE_IDEMPOTENT: ToolHints = { ...WRITE, idempotentHint: true };
+const TOOL_HINTS: Record<string, ToolHints> = {
+  // reads
+  get_briefing: READ, my_updates: READ, list_projects: READ, get_project: READ,
+  get_task: READ, next_claimable: READ, read_open_comments: READ, get_plans: READ,
+  // writes that are safe to repeat with the same args (renew/replace-in-place/insert-or-ignore)
+  heartbeat: WRITE_IDEMPOTENT, set_agent_identity: WRITE_IDEMPOTENT, update_task: WRITE_IDEMPOTENT,
+  update_plan: WRITE_IDEMPOTENT, add_dependency: WRITE_IDEMPOTENT, attach_ref: WRITE_IDEMPOTENT,
+  // everything else → WRITE (additive, non-idempotent, non-destructive, closed-world)
+};
+
 export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthTokenId?: string; sessionId?: string } = {}): McpServer {
   const server = new McpServer(
     { name: 'noriq', version: '0.3.0' },
@@ -120,8 +140,9 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     // Capture the spec at definition time so the reference doc is generated from the
     // exact same zod schemas the tools validate against — it can't drift (PLNR-23).
     toolSpecs.push({ name, description, inputSchema });
+    const annotations = TOOL_HINTS[name] ?? WRITE; // PLNR-88: proper read/write/destructive hints
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return server.registerTool(name, { description, inputSchema }, cb as any);
+    return server.registerTool(name, { description, inputSchema, annotations }, cb as any);
   };
 
   // ---- orientation --------------------------------------------------------
