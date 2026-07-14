@@ -38,7 +38,7 @@ export function TopBar({ store }: { store: AppStore }) {
         onClick={() => actions.openModal('project-edit')}
         title="Edit project settings"
         className="hover-border topbar-project"
-        style={{ display: 'flex', alignItems: 'center', gap: 9, minWidth: 0, overflow: 'hidden', flexShrink: 1, cursor: 'pointer', padding: '4px 8px', margin: '-4px -8px', borderRadius: 8, border: '1px solid transparent' }}
+        style={{ display: 'flex', alignItems: 'center', gap: 9, width: 240, flex: 'none', minWidth: 0, overflow: 'hidden', cursor: 'pointer', padding: '4px 8px', margin: '-4px -8px', borderRadius: 8, border: '1px solid transparent' }}
       >
         <span
           style={{
@@ -54,7 +54,7 @@ export function TopBar({ store }: { store: AppStore }) {
         >
           {project.key}
         </span>
-        <span style={{ fontWeight: 600, fontSize: 15, letterSpacing: '-.01em', whiteSpace: 'nowrap', flex: 'none' }}>
+        <span style={{ fontWeight: 600, fontSize: 15, letterSpacing: '-.01em', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0, flexShrink: 1 }}>
           {project.name}
         </span>
         <span
