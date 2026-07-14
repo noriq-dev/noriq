@@ -29,8 +29,8 @@ describe('boards (PLNR-80)', () => {
   it('a new project has a default board and new tasks land on it', async () => {
     const s = await snapshot();
     expect(s.boards.length).toBe(1);
-    expect(s.boards[0].name).toBe('Main');
-    expect(s.tasks.find((t) => t.id === taskId)?.boardId).toBe(s.boards[0].id);
+    expect(s.boards[0]!.name).toBe('Main');
+    expect(s.tasks.find((t) => t.id === taskId)?.boardId).toBe(s.boards[0]!.id);
   });
 
   it('creates a second board and moves a task onto it', async () => {
@@ -73,7 +73,7 @@ describe('boards (PLNR-80)', () => {
   it('refuses to delete the last remaining board', async () => {
     const s = await snapshot();
     expect(s.boards.length).toBe(1);
-    const del = await SELF.fetch(`https://planar.test/api/projects/${projectId}/boards/${s.boards[0].id}`, {
+    const del = await SELF.fetch(`https://planar.test/api/projects/${projectId}/boards/${s.boards[0]!.id}`, {
       method: 'DELETE', headers: { Cookie: cookie },
     });
     expect(del.status).toBe(400);

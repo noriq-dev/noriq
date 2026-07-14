@@ -6,8 +6,10 @@
 // coordination paths as key-based ones.
 import { Hono } from 'hono';
 import type { AppContext } from './auth';
+import type { Env } from './env';
 import { getCookie } from './auth';
 import { newId, nowIso, sha256Hex } from './lib/util';
+import { isCimdId, resolveCimdClient } from './lib/cimd';
 
 const ACCESS_TTL_S = 7 * 24 * 3600; // 7 days
 const REFRESH_TTL_S = 90 * 24 * 3600; // 90 days
@@ -34,6 +36,9 @@ export function metadataRoutes(app: Hono<AppContext>) {
       code_challenge_methods_supported: ['S256'],
       token_endpoint_auth_methods_supported: ['none'],
       scopes_supported: ['mcp'],
+      // CIMD (PLNR-82): clients MAY use an HTTPS-URL client_id pointing at a
+      // metadata document; DCR (registration_endpoint) remains as a fallback.
+      client_id_metadata_document_supported: true,
     });
   });
   app.get('/.well-known/oauth-protected-resource', (c) => {
@@ -104,14 +109,39 @@ function readParams(q: URLSearchParams): AuthzParams {
   };
 }
 
-async function validateClient(db: D1Database, p: AuthzParams): Promise<{ ok: true; name: string } | { ok: false; err: string }> {
+type ClientCheck = { ok: true; name: string; redirectUris: string[]; cimd: boolean } | { ok: false; err: string };
+
+async function validateClient(env: Env, p: AuthzParams): Promise<ClientCheck> {
   if (p.response_type !== 'code') return { ok: false, err: 'response_type must be code' };
   if (p.code_challenge_method !== 'S256' || !p.code_challenge) return { ok: false, err: 'PKCE S256 required' };
-  const client = await db.prepare('SELECT name, redirect_uris FROM oauth_clients WHERE id = ?')
+
+  // CIMD (PLNR-82): an HTTPS-URL client_id resolves to a fetched metadata document.
+  if (isCimdId(p.client_id)) {
+    let client;
+    try {
+      client = await resolveCimdClient(env, p.client_id);
+    } catch (e) {
+      return { ok: false, err: `client metadata: ${e instanceof Error ? e.message : String(e)}` };
+    }
+    if (!client.redirectUris.includes(p.redirect_uri)) return { ok: false, err: 'redirect_uri not in client metadata document' };
+    return { ok: true, name: client.name, redirectUris: client.redirectUris, cimd: true };
+  }
+
+  // Pre-registered / dynamically-registered clients live in the DB.
+  const client = await env.DB.prepare('SELECT name, redirect_uris FROM oauth_clients WHERE id = ?')
     .bind(p.client_id).first<{ name: string; redirect_uris: string }>();
   if (!client) return { ok: false, err: 'unknown client_id' };
-  if (!(JSON.parse(client.redirect_uris) as string[]).includes(p.redirect_uri)) return { ok: false, err: 'redirect_uri not registered' };
-  return { ok: true, name: client.name };
+  const uris = JSON.parse(client.redirect_uris) as string[];
+  if (!uris.includes(p.redirect_uri)) return { ok: false, err: 'redirect_uri not registered' };
+  return { ok: true, name: client.name, redirectUris: uris, cimd: false };
+}
+
+/** CIMD clients must exist as an oauth_clients row (FK target for codes/tokens). */
+async function ensureCimdClientRow(db: D1Database, clientId: string, name: string, redirectUris: string[]) {
+  await db.prepare(
+    `INSERT INTO oauth_clients (id, name, redirect_uris, created_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET name = excluded.name, redirect_uris = excluded.redirect_uris`,
+  ).bind(clientId, name, JSON.stringify(redirectUris), nowIso()).run();
 }
 
 const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -120,9 +150,14 @@ function consentPage(clientName: string, agentDefault: string, params: AuthzPara
   const hidden = Object.entries(params)
     .map(([k, v]) => `<input type="hidden" name="${esc(k)}" value="${esc(v)}">`)
     .join('');
+  // Show where approval will send the code — the key phishing defense when the
+  // client_id is a CIMD URL and the client name can't be fully trusted (PLNR-82).
+  let redirectHost = params.redirect_uri;
+  try { redirectHost = new URL(params.redirect_uri).host; } catch { /* keep raw */ }
   const inner = user
     ? `
     <p class="sub">Signed in as <b>${esc(user.name)}</b>. <b>${esc(clientName)}</b> is requesting access to the Noriq MCP <b>on your behalf</b>.</p>
+    <p class="hint">On approval you'll be returned to <b>${esc(redirectHost)}</b> — only continue if you recognize it.</p>
     <p class="hint">It starts as the agent <b>${esc(agentDefault)}</b> (delegated by you). The agent itself can take a
     different identity later with the <code>set_agent_identity</code> tool — no need to decide here.</p>
     <form method="POST" action="/oauth/authorize">${hidden}
@@ -159,7 +194,7 @@ function consentPage(clientName: string, agentDefault: string, params: AuthzPara
 
 oauth.get('/authorize', async (c) => {
   const p = readParams(new URL(c.req.url).searchParams);
-  const v = await validateClient(c.env.DB, p);
+  const v = await validateClient(c.env, p);
   if (!v.ok) return c.text(`invalid authorization request: ${v.err}`, 400);
   const user = await currentUser(c);
   const agentDefault = user ? `${user.name.split(' ')[0]?.toLowerCase() ?? 'me'}-${v.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 20)}` : '';
@@ -173,7 +208,7 @@ oauth.post('/authorize', async (c) => {
   }
   const form = await c.req.parseBody();
   const p = readParams(new URLSearchParams(Object.entries(form).map(([k, v]) => [k, String(v)])));
-  const v = await validateClient(c.env.DB, p);
+  const v = await validateClient(c.env, p);
   if (!v.ok) return c.text(`invalid authorization request: ${v.err}`, 400);
 
   const redirect = (extra: Record<string, string>) => {
@@ -214,6 +249,10 @@ oauth.post('/authorize', async (c) => {
     `INSERT INTO agents (id, name, label, role, status, user_id, api_key_hash, created_at) VALUES (?, ?, ?, 'worker', 'idle', ?, ?, ?)`,
   ).bind(agentId, `${display}-${agentId.slice(-6)}`, display, user.id, await sha256Hex(randToken('unused_')), nowIso()).run();
   const agent = { id: agentId };
+
+  // A CIMD client has no persistent registration; materialize it now so the
+  // oauth_codes / oauth_tokens FK to oauth_clients resolves.
+  if (v.cimd) await ensureCimdClientRow(c.env.DB, p.client_id, v.name, v.redirectUris);
 
   const code = randToken('plnrc_');
   await c.env.DB.prepare(

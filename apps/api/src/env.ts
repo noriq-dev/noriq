@@ -20,4 +20,11 @@ export interface Env {
   EMAIL_FROM?: string;
   /** Task attachments — optional; endpoints 503 until R2 is enabled + bound. */
   FILES?: R2Bucket;
+  /**
+   * Optional CIMD (Client ID Metadata Document) trust policy: a comma-separated
+   * allowlist of hostnames permitted as URL-formatted client_ids (e.g.
+   * "chatgpt.com,claude.ai"). Unset = open server (any HTTPS client_id, still
+   * SSRF-guarded). See PLNR-82.
+   */
+  CIMD_ALLOWED_HOSTS?: string;
 }

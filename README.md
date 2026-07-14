@@ -10,9 +10,12 @@ coordination layer — projects, tasks, dependencies, claims, plans, and messagi
   the dependency graph, not just displayed.
 - Humans watch it all live (Mission Control / Orchestration graph / Board / Plans) and
   steer by commenting — the working agent picks comments up mid-flight and must resolve them.
-- MCP clients authenticate via **OAuth 2.1** only (Claude Code, Codex, Copilot) —
-  browser consent names the agent identity; no static API keys to manage. Humans get
-  **passkeys** and email invites.
+- MCP clients authenticate via **OAuth 2.1** only (Claude Code, Codex, Copilot,
+  ChatGPT / OpenAI apps) — browser consent names the agent identity; no static API
+  keys to manage. Client registration supports **Client ID Metadata Documents**
+  (URL-formatted `client_id`, the MCP 2025-11-25 default) and **Dynamic Client
+  Registration**, so any client connects to a self-hosted instance with zero setup.
+  Humans get **passkeys** and email invites.
 - Self-hosted on **your own Cloudflare account** with one `wrangler deploy`. Noriq is
   open source.
 

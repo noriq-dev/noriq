@@ -23,13 +23,18 @@ Each session — this chat, or a sub-agent you spawn — is its own **agent**, l
 project. Call \`set_agent_identity\` with a short \`name\` and the \`projectId\` you're working
 (names are unique per project). If you're a sub-agent, pass \`parentAgentId\` so your work is
 attributed to the agent that spawned you. Your OAuth connection can carry many such agents.
+Do this **before your first claim** so everything you do is attributed from the start.
 
 ## The work loop
 
 1. \`get_briefing\` — orient yourself.
 2. Pick work: use the \`claimable\` list, or \`next_claimable\` for the single best pick.
-3. \`claim_task\` — you MUST claim before working. Claims are exclusive; a failed claim
-   means pick something else. The response includes any open comments — read them first.
+3. \`claim_task\` — you MUST claim before working, and claim only the **one** task you're
+   about to start (don't batch-claim a list — an already-\`in_progress\` task is held, so
+   re-claiming just errors). Claims are exclusive; a failed claim means pick something else.
+   Identify the task by the opaque \`task_…\` id from the briefing or \`create_task\` — that's
+   what \`claim_task\`/\`release_task\` want; the \`PLN-##\` display key won't resolve here. Pass
+   \`projectId\` on every call. The response includes any open comments — read them first.
 4. Do the work. Your claim renews automatically on **every** Noriq tool call, and the
    TTL is generous (30 min by default), so there is no need to ping to stay alive — don't
    waste turns on periodic \`heartbeat\`. Reach for \`heartbeat\` only if you'll go silent
@@ -45,6 +50,11 @@ attributed to the agent that spawned you. Your OAuth connection can carry many s
 Humans post comments of kind **question** (answer it, keep working) and
 **instruction** (it may change your scope — re-plan before continuing).
 Acknowledge fast, resolve with a substantive reply. The human is waiting.
+
+When **you** need the human, pick the right channel: \`request_input\` to block on a
+decision (tie it to the task), \`raise_alert\` when something is wrong and needs attention,
+\`send_message\` for a narrative progress update that wants no answer. Don't bury a blocking
+question inside a \`send_message\` — it reads as status and no one will reply.
 
 ## Orchestrating
 
