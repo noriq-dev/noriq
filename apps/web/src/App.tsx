@@ -18,6 +18,7 @@ import { useTheme } from './theme';
 import { ThemeButton } from './components/ThemeButton';
 import { Home } from './components/Home';
 import { Invite } from './components/Invite';
+import { ResetPassword } from './components/ResetPassword';
 
 // Floating toggle for the unauthenticated screens (login / setup / invite) — no rail there.
 function FloatingTheme() {
@@ -46,6 +47,11 @@ export function App() {
   const inviteMatch = location.pathname.match(/^\/invite\/([^/]+)/);
   if (inviteMatch) {
     return <><FloatingTheme /><Invite token={inviteMatch[1]!} onDone={() => { location.href = '/'; }} /></>;
+  }
+
+  const resetMatch = location.pathname.match(/^\/reset\/([^/]+)/);
+  if (resetMatch) {
+    return <><FloatingTheme /><ResetPassword token={resetMatch[1]!} onDone={() => { location.href = '/'; }} /></>;
   }
 
   if (store.needsSetup) {

@@ -10,14 +10,16 @@ import {
   type RegistrationResponseJSON,
 } from '@simplewebauthn/server';
 import type { AppContext } from './auth';
+import type { Env } from './env';
 import { userAuth } from './auth';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex } from './lib/util';
-import { sendInviteEmail } from './email';
+import { sendInviteEmail, sendPasswordResetEmail } from './email';
 
 export const onboarding = new Hono<AppContext>();
 
 const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 const INVITE_TTL_MS = 7 * 24 * 3600 * 1000;
+const RESET_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 function rp(c: { req: { url: string } }) {
   const url = new URL(c.req.url);
@@ -114,6 +116,66 @@ onboarding.post('/api/invites/:token/accept', async (c) => {
       .bind(await hashPassword(password), row.userId).run();
   }
   await c.env.DB.prepare('UPDATE invites SET accepted_at = ? WHERE id = ?').bind(nowIso(), row.id).run();
+  const { cookie } = await createSession(c.env.DB, row.userId);
+  c.header('Set-Cookie', cookie);
+  const user = await c.env.DB.prepare('SELECT id, email, name, role FROM users WHERE id = ?').bind(row.userId).first();
+  return c.json({ user });
+});
+
+// --- forgot / reset password (PLNR-87) -----------------------------------------------
+const rateLimitAuth = async (c: { env: Env; req: { header: (n: string) => string | undefined } }) => {
+  if (c.env.DISABLE_RATE_LIMIT) return true;
+  const stub = c.env.RATE_LIMITER.get(c.env.RATE_LIMITER.idFromName(`auth:${c.req.header('CF-Connecting-IP') ?? 'local'}`));
+  return (await stub.hit(20, 60_000)).ok;
+};
+
+/** Request a reset link. Always returns ok — never reveals whether the email exists. */
+onboarding.post('/api/auth/forgot', async (c) => {
+  if (!(await rateLimitAuth(c))) return c.json({ error: 'too many attempts — slow down' }, 429);
+  const { email } = await c.req.json<{ email?: string }>().catch(() => ({ email: undefined }));
+  const user = email
+    ? await c.env.DB.prepare('SELECT id, email, name FROM users WHERE email = ? AND disabled = 0')
+        .bind(email.toLowerCase()).first<{ id: string; email: string; name: string }>()
+    : null;
+  if (user) {
+    const token = newApiKey().replace('plnr_', 'plnrpw_');
+    await c.env.DB.prepare('INSERT INTO password_resets (id, token_hash, user_id, expires_at) VALUES (?, ?, ?, ?)')
+      .bind(newId('pwr'), await sha256Hex(token), user.id, new Date(Date.now() + RESET_TTL_MS).toISOString()).run();
+    const origin = new URL(c.req.url).origin;
+    await sendPasswordResetEmail(c.env, { to: user.email, toName: user.name, resetUrl: `${origin}/reset/${token}`, origin });
+  }
+  // Uniform response regardless of whether the account exists (no enumeration).
+  return c.json({ ok: true });
+});
+
+/** Show who a reset token is for (so the reset page can confirm the account). */
+onboarding.get('/api/reset/:token', async (c) => {
+  const row = await c.env.DB.prepare(
+    `SELECT r.expires_at AS exp, r.used_at AS used, u.email, u.name
+     FROM password_resets r JOIN users u ON u.id = r.user_id WHERE r.token_hash = ?`,
+  ).bind(await sha256Hex(c.req.param('token')!)).first<{ exp: string; used: string | null; email: string; name: string }>();
+  if (!row) return c.json({ error: 'invalid reset link' }, 404);
+  if (row.used) return c.json({ error: 'this reset link was already used' }, 410);
+  if (row.exp < nowIso()) return c.json({ error: 'this reset link has expired' }, 410);
+  return c.json({ email: row.email, name: row.name });
+});
+
+/** Consume the token, set the new password, kill other sessions, sign in. */
+onboarding.post('/api/reset/:token', async (c) => {
+  if (!(await rateLimitAuth(c))) return c.json({ error: 'too many attempts — slow down' }, 429);
+  const row = await c.env.DB.prepare(
+    'SELECT id, user_id AS userId, expires_at AS exp, used_at AS used FROM password_resets WHERE token_hash = ?',
+  ).bind(await sha256Hex(c.req.param('token')!)).first<{ id: string; userId: string; exp: string; used: string | null }>();
+  if (!row || row.used || row.exp < nowIso()) return c.json({ error: 'invalid or expired reset link' }, 410);
+  const { password } = await c.req.json<{ password?: string }>().catch(() => ({ password: undefined }));
+  if (!password || password.length < 8) return c.json({ error: 'password must be 8+ chars' }, 400);
+
+  await c.env.DB.batch([
+    c.env.DB.prepare('UPDATE users SET password_hash = ? WHERE id = ?').bind(await hashPassword(password), row.userId),
+    c.env.DB.prepare('UPDATE password_resets SET used_at = ? WHERE id = ?').bind(nowIso(), row.id),
+    // Security: a reset invalidates every existing session for the account.
+    c.env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(row.userId),
+  ]);
   const { cookie } = await createSession(c.env.DB, row.userId);
   c.header('Set-Cookie', cookie);
   const user = await c.env.DB.prepare('SELECT id, email, name, role FROM users WHERE id = ?').bind(row.userId).first();

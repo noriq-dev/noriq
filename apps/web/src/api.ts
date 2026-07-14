@@ -27,6 +27,11 @@ export const api = {
     req<{ user: import('./types').UserVM }>('POST', '/api/auth/login', { email, password }),
   logout: () => req('POST', '/api/auth/logout'),
 
+  forgotPassword: (email: string) => req<{ ok: boolean }>('POST', '/api/auth/forgot', { email }),
+  resetInfo: (token: string) => req<{ email: string; name: string }>('GET', `/api/reset/${token}`),
+  submitReset: (token: string, password: string) =>
+    req<{ user: import('./types').UserVM }>('POST', `/api/reset/${token}`, { password }),
+
   projects: (scope?: 'all') => req<{ projects: ApiProject[]; admin: boolean }>('GET', scope === 'all' ? '/api/projects?scope=all' : '/api/projects'),
   snapshot: (pid: string, includeArchived = false) => req<ApiSnapshot>('GET', `/api/projects/${pid}/snapshot${includeArchived ? '?archived=1' : ''}`),
   archiveTask: (pid: string, tid: string) => req('POST', `/api/projects/${pid}/tasks/${tid}/archive`),

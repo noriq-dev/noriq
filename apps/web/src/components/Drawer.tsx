@@ -490,6 +490,7 @@ export function Drawer({ store }: { store: AppStore }) {
                         background: c.role === 'agent' ? 'rgba(76,157,255,.06)' : 'var(--w-03)',
                         border: `1px solid ${c.role === 'agent' ? 'rgba(76,157,255,.18)' : 'var(--w-07)'}`,
                         borderRadius: 10, padding: '9px 12px',
+                        whiteSpace: 'pre-wrap', wordBreak: 'break-word',
                       }}
                     >
                       {c.body}

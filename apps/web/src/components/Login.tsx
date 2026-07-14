@@ -9,6 +9,14 @@ export function Login({ store }: { store: AppStore }) {
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [resetSent, setResetSent] = useState(false);
+
+  const forgot = async () => {
+    if (!email.trim()) { setError('enter your email above, then tap “Forgot password?”'); return; }
+    setError(null);
+    try { await api.forgotPassword(email.trim()); } catch { /* uniform — never reveal existence */ }
+    setResetSent(true);
+  };
 
   const passkeySignIn = async () => {
     setBusy(true);
@@ -68,6 +76,20 @@ export function Login({ store }: { store: AppStore }) {
             onChange={(e) => setPassword(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && submit()}
           />
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: -4 }}>
+            <button
+              onClick={forgot}
+              style={{ cursor: 'pointer', background: 'transparent', border: 'none', padding: 0, fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}
+              className="hover-bright"
+            >
+              Forgot password?
+            </button>
+          </div>
+          {resetSent && (
+            <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--accent-ink)', background: 'rgba(198,242,78,.06)', border: '1px solid rgba(198,242,78,.25)', borderRadius: 8, padding: '8px 11px', lineHeight: 1.5 }}>
+              If an account exists for <b>{email.trim()}</b>, a reset link is on its way. It expires in 1 hour.
+            </div>
+          )}
           {error && <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--red-soft)' }}>{error}</div>}
           <button
             onClick={submit}
