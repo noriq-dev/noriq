@@ -131,9 +131,9 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       return {
         you: { id: agent.id, name: agent.name, role: agent.role },
         playbook: [
-          'Work loop: my_updates → pick from claimable (or next_claimable) → claim_task → do the work → resolve any comments → release_task {toStatus:"review"|"done"}. Every tool call renews your claim, so no periodic pinging — heartbeat only if you will be idle longer than the claim TTL.',
+          'Name this session for the project with set_agent_identity before your first claim. Work loop: my_updates → pick from claimable (or next_claimable) → claim_task (just the one you are about to start) → do the work → resolve any comments → release_task {toStatus:"review"|"done"}. Every tool call renews your claim, so no periodic pinging — heartbeat only if you will be idle longer than the claim TTL.',
           'Humans steer via comments on tasks (kind: question/instruction). Acknowledge fast, resolve with resolve_comment (addressed|wont_do) + a reply. Unresolved comments should block you from finishing.',
-          'Orchestrators: structure work with create_plan (ordered phases over tasks — order is enforced via auto-dependencies) or decompose_task for a quick subtree; workers drain via next_claimable.',
+          'Anything bigger than one task: plan first. create_plan writes the plan as a document — goals/approach in the body, then ordered phases over tasks (phase order enforced via auto-dependencies); or decompose_task for a quick subtree. Workers drain the plan via next_claimable; keep it current with update_plan.',
           'Claims are exclusive. If claim_task fails, the task is taken or blocked — pick another.',
           'Blocked on a human decision? request_input (it auto-parks the task and frees you to work elsewhere) — do not guess or stall. Flag non-blocking concerns (deviations, risks) with raise_alert and keep going.',
           'Every tool result may end with a "--- notices ---" block: read it, it is addressed to you.',

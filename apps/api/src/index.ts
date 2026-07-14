@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { cors } from 'hono/cors';
 import { StreamableHTTPTransport } from '@hono/mcp';
 import type { Env } from './env';
 import { adminAuth, agentAuth, resolveSessionAgent, userAuth, type AppContext } from './auth';
@@ -17,6 +18,16 @@ export { AgentSession } from './do/AgentSession';
 export { RateLimiter } from './do/RateLimiter';
 
 const app = new Hono<AppContext>();
+
+// CORS for the MCP + OAuth surface so browser-based and cross-origin MCP clients
+// can preflight (PLNR-82). Registered before the handlers so it wraps them.
+app.use('/mcp', cors({
+  allowMethods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+  allowHeaders: ['Authorization', 'Content-Type', 'Mcp-Session-Id', 'MCP-Protocol-Version'],
+  exposeHeaders: ['Mcp-Session-Id', 'WWW-Authenticate'],
+  maxAge: 86400,
+}));
+app.use('/oauth/*', cors({ allowMethods: ['GET', 'POST', 'OPTIONS'], maxAge: 86400 }));
 
 // OAuth 2.1 AS for MCP clients: discovery + register/authorize/token.
 metadataRoutes(app);

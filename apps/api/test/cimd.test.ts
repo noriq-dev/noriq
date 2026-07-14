@@ -87,6 +87,34 @@ describe('CIMD OAuth wiring (PLNR-82)', () => {
     const meta = (await as.json()) as Record<string, unknown>;
     expect(meta.client_id_metadata_document_supported).toBe(true);
     expect(meta.registration_endpoint).toContain('/oauth/register');
+    expect(as.headers.get('Cache-Control')).toBe('no-store'); // never edge-cache a stale (pre-CIMD) copy
+  });
+
+  it('the OIDC-discovery path also advertises CIMD (strict clients probe it — PLNR-82)', async () => {
+    const oidc = await SELF.fetch('https://planar.test/.well-known/openid-configuration');
+    expect(oidc.status).toBe(200);
+    const meta = (await oidc.json()) as Record<string, unknown>;
+    expect(meta.client_id_metadata_document_supported).toBe(true);
+    expect(meta.token_endpoint).toContain('/oauth/token');
+  });
+
+  it('protected-resource metadata is served at both root and the /mcp-scoped path', async () => {
+    for (const path of ['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp']) {
+      const rs = await SELF.fetch(`https://planar.test${path}`);
+      expect(rs.status).toBe(200);
+      const meta = (await rs.json()) as { resource: string; authorization_servers: string[] };
+      expect(meta.resource).toContain('/mcp');
+      expect(meta.authorization_servers[0]).toBe('https://planar.test');
+    }
+  });
+
+  it('CORS preflight is answered for /mcp', async () => {
+    const pre = await SELF.fetch('https://planar.test/mcp', {
+      method: 'OPTIONS',
+      headers: { Origin: 'https://chatgpt.com', 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'authorization' },
+    });
+    expect(pre.status).toBeLessThan(300);
+    expect(pre.headers.get('Access-Control-Allow-Origin')).toBeTruthy();
   });
 
   it('authorize rejects a disallowed (SSRF) URL client_id before fetching', async () => {

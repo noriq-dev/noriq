@@ -5,6 +5,7 @@
 // client will act as — so OAuth agents flow through the exact same
 // coordination paths as key-based ones.
 import { Hono } from 'hono';
+import type { Context } from 'hono';
 import type { AppContext } from './auth';
 import type { Env } from './env';
 import { getCookie } from './auth';
@@ -23,32 +24,49 @@ function b64url(bytes: Uint8Array): string {
 const randToken = (prefix: string) => `${prefix}${b64url(crypto.getRandomValues(new Uint8Array(32)))}`;
 
 // --- discovery -----------------------------------------------------------------
+// Discovery must be reachable by clients that follow the MCP 2025-11-25 spec to
+// the letter (e.g. OpenAI/ChatGPT): AS metadata is probed at BOTH the RFC 8414
+// path and the OpenID Connect discovery path, and Protected Resource Metadata at
+// both the root and the resource-path-scoped well-known. Missing any of these
+// makes a strict client conclude "CIMD not supported" (PLNR-82). Responses are
+// no-store + CORS-open so an edge cache can never serve a stale (pre-CIMD) copy
+// and browser-based clients can read them.
 export function metadataRoutes(app: Hono<AppContext>) {
-  app.get('/.well-known/oauth-authorization-server', (c) => {
-    const issuer = new URL(c.req.url).origin;
-    return c.json({
-      issuer,
-      authorization_endpoint: `${issuer}/oauth/authorize`,
-      token_endpoint: `${issuer}/oauth/token`,
-      registration_endpoint: `${issuer}/oauth/register`,
-      response_types_supported: ['code'],
-      grant_types_supported: ['authorization_code', 'refresh_token'],
-      code_challenge_methods_supported: ['S256'],
-      token_endpoint_auth_methods_supported: ['none'],
-      scopes_supported: ['mcp'],
-      // CIMD (PLNR-82): clients MAY use an HTTPS-URL client_id pointing at a
-      // metadata document; DCR (registration_endpoint) remains as a fallback.
-      client_id_metadata_document_supported: true,
-    });
+  const authServerMeta = (issuer: string) => ({
+    issuer,
+    authorization_endpoint: `${issuer}/oauth/authorize`,
+    token_endpoint: `${issuer}/oauth/token`,
+    registration_endpoint: `${issuer}/oauth/register`,
+    response_types_supported: ['code'],
+    grant_types_supported: ['authorization_code', 'refresh_token'],
+    code_challenge_methods_supported: ['S256'],
+    token_endpoint_auth_methods_supported: ['none'],
+    scopes_supported: ['mcp'],
+    subject_types_supported: ['public'],
+    // CIMD: clients MAY use an HTTPS-URL client_id pointing at a metadata
+    // document; DCR (registration_endpoint) remains as a fallback.
+    client_id_metadata_document_supported: true,
   });
-  app.get('/.well-known/oauth-protected-resource', (c) => {
-    const issuer = new URL(c.req.url).origin;
-    return c.json({
-      resource: `${issuer}/mcp`,
-      authorization_servers: [issuer],
-      bearer_methods_supported: ['header'],
-    });
+  const resourceMeta = (issuer: string) => ({
+    resource: `${issuer}/mcp`,
+    authorization_servers: [issuer],
+    bearer_methods_supported: ['header'],
   });
+  const send = (c: Context<AppContext>, body: unknown) => {
+    c.header('Cache-Control', 'no-store');
+    c.header('Access-Control-Allow-Origin', '*');
+    return c.json(body as never);
+  };
+
+  // AS metadata — RFC 8414 path and the OIDC-discovery path (both spec-required).
+  const asHandler = (c: Context<AppContext>) => send(c, authServerMeta(new URL(c.req.url).origin));
+  app.get('/.well-known/oauth-authorization-server', asHandler);
+  app.get('/.well-known/openid-configuration', asHandler);
+
+  // Protected Resource metadata — root and resource-path-scoped (RFC 9728).
+  const rsHandler = (c: Context<AppContext>) => send(c, resourceMeta(new URL(c.req.url).origin));
+  app.get('/.well-known/oauth-protected-resource', rsHandler);
+  app.get('/.well-known/oauth-protected-resource/mcp', rsHandler);
 }
 
 // --- dynamic client registration (RFC 7591) ---------------------------------------
