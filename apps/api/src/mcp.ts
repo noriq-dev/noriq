@@ -470,8 +470,17 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
   );
 
   defineTool(
+    'add_comment',
+    'Leave your OWN note on a task — progress, findings, rationale, a heads-up for whoever picks it up. A plain comment: it is recorded as a note and blocks nothing (not a question, not a resolution). To ask a human for a decision use request_input; to answer a human\'s open question use resolve_comment.',
+    { projectId: z.string(), taskId: z.string(), body: z.string().min(1) },
+    tool(async ({ projectId, taskId, body }) =>
+      room(env, projectId).postComment(projectId, actor, taskId, 'comment', body),
+    ),
+  );
+
+  defineTool(
     'post_comment',
-    'Post a comment/question on a task (agents may ask humans questions too — they appear in the UI).',
+    'Post a comment or a question on a task. kind:"question" asks a human (stays open until resolved); kind:"comment" is your own note (non-blocking); kind:"reply" answers a thread. For a plain note, add_comment is simpler.',
     {
       projectId: z.string(),
       taskId: z.string(),

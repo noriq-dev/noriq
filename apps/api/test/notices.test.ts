@@ -42,6 +42,15 @@ beforeAll(async () => {
 }, 60000);
 
 describe('notices policy (PLNR-25)', () => {
+  it('a brand-new session is not flooded with historical broadcasts', async () => {
+    // Seed some project history (broadcasts) BEFORE the new agent exists.
+    await mcpCall(idle.apiKey, 'send_message', { projectId, body: 'ancient broadcast one' });
+    await mcpCall(idle.apiKey, 'send_message', { projectId, body: 'ancient broadcast two' });
+    // A brand-new MCP session's FIRST call must not replay that history as notices.
+    const first = await mcpCall(idle.apiKey, 'get_project', { projectId }, 'flood-fresh-session');
+    expect(first.notices ?? '').not.toMatch(/ancient broadcast/);
+  });
+
   it('a completed task no longer piggybacks a "done" notice on other agents', async () => {
     const t = await mcpCall(idle.apiKey, 'create_task', { projectId, title: 'finish me' });
     await mcpCall(busy.apiKey, 'claim_task', { projectId, taskId: t.body.id });

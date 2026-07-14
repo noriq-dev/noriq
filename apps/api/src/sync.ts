@@ -25,7 +25,15 @@ export interface AgentUpdates {
 
 export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { advanceCursor?: boolean } = {}): Promise<AgentUpdates> {
   const session = env.AGENT_SESSION.get(env.AGENT_SESSION.idFromName(agent.id));
-  const cursor = await session.cursor();
+  let cursor = await session.cursor();
+
+  // A brand-new session (cursor 0) must NOT replay the whole event history as "new"
+  // notices — start it at the current tip so it only hears about things going forward.
+  if (cursor === 0) {
+    const tip = await env.DB.prepare('SELECT COALESCE(MAX(rowid), 0) AS m FROM events').first<{ m: number }>();
+    cursor = tip?.m ?? 0;
+    if (opts.advanceCursor !== false) await session.advanceCursor(cursor);
+  }
 
   // New events since the cursor that concern this agent.
   const { results: rawEvents } = await env.DB.prepare(

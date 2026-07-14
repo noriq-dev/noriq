@@ -513,7 +513,10 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.setPid(projectId);
       const task = await this.getTask(taskId);
       const id = newId('cmt');
-      const status = kind === 'reply' ? 'addressed' : 'open';
+      // An agent's own plain comment is a note (self-authored), not something a human
+      // must resolve — so it doesn't count as an open/unresolved comment. Questions and
+      // human comments stay open; replies are addressed.
+      const status = kind === 'reply' || (kind === 'comment' && actor.kind === 'agent') ? 'addressed' : 'open';
       await this.env.DB.prepare(
         `INSERT INTO comments (id, task_id, author_kind, author_id, kind, body, status, parent_comment_id, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,

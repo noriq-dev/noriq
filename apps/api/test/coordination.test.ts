@@ -113,6 +113,20 @@ describe('coordination core', () => {
     expect(rel.body.status).toBe('review');
   });
 
+  it('add_comment leaves a non-blocking note (agent can still finish)', async () => {
+    const t = (await mcpCall(orch.apiKey, 'create_task', { projectId, title: 'note task' })).body;
+    await mcpCall(nova.apiKey, 'claim_task', { projectId, taskId: t.id });
+    const c = await mcpCall(nova.apiKey, 'add_comment', { projectId, taskId: t.id, body: 'note: found a gotcha in retry logic' });
+    expect(c.isError).toBe(false);
+    // The agent's own note doesn't count as an unresolved comment → done still works.
+    const done = await mcpCall(nova.apiKey, 'release_task', { projectId, taskId: t.id, toStatus: 'done' });
+    expect(done.isError).toBe(false);
+    const gt = await mcpCall(orch.apiKey, 'get_task', { taskId: t.id });
+    const note = gt.body.comments.find((x: { body: string }) => x.body.includes('gotcha'));
+    expect(note.status).toBe('addressed');
+    expect(note.authorKind).toBe('agent');
+  });
+
   it('release_task can record closing thoughts in the same call', async () => {
     const t = (await mcpCall(orch.apiKey, 'create_task', { projectId, title: 'note on release' })).body;
     await mcpCall(nova.apiKey, 'claim_task', { projectId, taskId: t.id });
