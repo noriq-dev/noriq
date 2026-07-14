@@ -11,7 +11,6 @@ export function SettingsView({ store }: { store: AppStore }) {
   return (
     <div className="content-pad" style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: '20px 26px' }}>
       <div style={{ maxWidth: 760, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 28 }}>
-        <GroupsSection store={store} />
         <PasskeysSection />
         <SessionsSection />
         <PasswordSection />
@@ -215,7 +214,7 @@ export function UsersSection({ store }: { store: AppStore }) {
   );
 }
 
-function GroupsSection({ store }: { store: AppStore }) {
+export function GroupsSection({ store }: { store: AppStore }) {
   const groups = store.groups;
   return (
     <Section

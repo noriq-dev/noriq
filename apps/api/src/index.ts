@@ -222,12 +222,13 @@ app.post('/api/auth/sessions/revoke-all', userAuth, async (c) => {
 });
 
 // --- UI read API (session-authed) -------------------------------------------------
-/** Visibility (PLNR-48): ungrouped → owner only; grouped → group members; admins see all.
- *  Legacy/agent-created projects with no owner remain visible to everyone. */
+/** Visibility (PLNR-48/83): a private (ungrouped) project is owner-only; a GROUPED
+ *  project is shared — visible to all users; ownerless/legacy projects stay visible;
+ *  admins see everything. Binds: ?=role, ?=userId. */
 const VISIBILITY_WHERE = `(
   ? = 'admin'
   OR p.owner_user_id = ?
-  OR (p.group_id IS NOT NULL AND p.group_id IN (SELECT group_id FROM user_groups WHERE user_id = ?))
+  OR p.group_id IS NOT NULL
   OR (p.group_id IS NULL AND p.owner_user_id IS NULL)
 )`;
 
@@ -257,7 +258,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
   const u = c.var.user!;
   const visible = await c.env.DB.prepare(
     `SELECT 1 FROM projects p WHERE p.id = ? AND ${VISIBILITY_WHERE}`,
-  ).bind(pid, u.role, u.id, u.id).first();
+  ).bind(pid, u.role, u.id).first();
   if (!visible) return c.json({ error: 'not found' }, 404);
   // Auto-archive done tasks untouched for >24h whenever the project is viewed.
   await room(c.env, pid).sweepArchive(pid).catch(() => {});

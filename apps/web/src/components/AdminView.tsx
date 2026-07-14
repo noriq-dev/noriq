@@ -4,7 +4,7 @@
 import { useEffect } from 'react';
 import type { AppStore } from '../store';
 import { LiveDot } from './bits';
-import { Section, UsersSection } from './SettingsView';
+import { GroupsSection, Section, UsersSection } from './SettingsView';
 
 export function AdminView({ store }: { store: AppStore }) {
   useEffect(() => {
@@ -66,6 +66,7 @@ export function AdminView({ store }: { store: AppStore }) {
         </Section>
 
         <UsersSection store={store} />
+        <GroupsSection store={store} />
       </div>
     </div>
   );

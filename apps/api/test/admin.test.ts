@@ -75,3 +75,24 @@ describe("an agent is scoped to its user, not admin (PLNR-83)", () => {
     expect(t.isError).toBe(false);
   });
 });
+
+describe('grouped projects are shared with everyone (PLNR-83)', () => {
+  it('putting a private project in a group makes it visible + workable to others', async () => {
+    // Admin creates a group, Bob moves his (previously private) project into it.
+    const g = await SELF.fetch('https://planar.test/api/groups', {
+      method: 'POST', headers: { Cookie: adminCookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Shared team' }),
+    });
+    const gid = (await g.json() as { id: string }).id;
+    await SELF.fetch(`https://planar.test/api/projects/${bobProjectId}/meta`, {
+      method: 'PATCH', headers: { Cookie: bobCookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ groupId: gid }),
+    });
+
+    // An agent under a different user now sees and can work Bob's grouped project.
+    const b = await mcpCall(agent.apiKey, 'get_briefing', {});
+    expect(b.body.projects.some((p: { id: string }) => p.id === bobProjectId)).toBe(true);
+    const get = await mcpCall(agent.apiKey, 'get_project', { projectId: bobProjectId });
+    expect(get.isError).toBe(false);
+    // And it shows in an admin's default list too (no ?scope=all needed for shared projects).
+    expect((await listProjects(adminCookie)).projects.some((p) => p.id === bobProjectId)).toBe(true);
+  });
+});
