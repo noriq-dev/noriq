@@ -322,7 +322,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       ).bind(taskId, taskId).first();
       if (!task) throw new Error(`task ${taskId} not found`);
       const id = String(task.id);
-      const [deps, comments, refs, attachments] = await Promise.all([
+      const [deps, comments, refs, attachments, signals] = await Promise.all([
         env.DB.prepare(
           `SELECT dt.id, dt.key, dt.status FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id WHERE d.task_id = ?`,
         ).bind(id).all(),
@@ -335,10 +335,15 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           `SELECT id, filename, content_type AS contentType, size, uploaded_by_kind AS uploadedByKind, uploaded_by AS uploadedBy, created_at AS createdAt
            FROM attachments WHERE task_id = ? ORDER BY created_at`,
         ).bind(id).all(),
+        env.DB.prepare(
+          `SELECT id, type, severity, title, body, options, status, response, created_at AS createdAt, resolved_at AS resolvedAt
+           FROM signals WHERE task_id = ? ORDER BY CASE WHEN status = 'open' THEN 0 ELSE 1 END, created_at DESC`,
+        ).bind(id).all(),
       ]);
       // Each attachment carries its resource URI — read the bytes with resources/read.
       const withUris = attachments.results.map((a) => ({ ...a, resource: attachmentUri(String(a.id)) }));
-      return { task, dependencies: deps.results, comments: comments.results, refs: refs.results, attachments: withUris };
+      const sigs = signals.results.map((s) => ({ ...s, options: s.options ? JSON.parse(String(s.options)) : null }));
+      return { task, dependencies: deps.results, comments: comments.results, refs: refs.results, attachments: withUris, signals: sigs };
     }),
   );
 
@@ -437,6 +442,12 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         if (open && open.n > 0) {
           throw new Error(`task has ${open.n} unresolved comment(s) — resolve them (resolve_comment) before marking done`);
         }
+        const gate = await env.DB.prepare(
+          "SELECT COUNT(*) AS n FROM signals WHERE task_id = ? AND type = 'input_request' AND status = 'open'",
+        ).bind(taskId).first<{ n: number }>();
+        if (gate && gate.n > 0) {
+          throw new Error(`task has ${gate.n} open input request(s) awaiting a human decision — can't finish until they're answered`);
+        }
       }
       return room(env, projectId).releaseTask(projectId, actor, taskId, { toStatus, comment });
     }),
@@ -499,6 +510,38 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     },
     tool(async ({ projectId, body, toAgentId, refTaskId }) =>
       room(env, projectId).sendMessage(projectId, actor, body, toAgentId, refTaskId),
+    ),
+  );
+
+  // ---- signals: ask a human / flag attention ------------------------------
+
+  defineTool(
+    'request_input',
+    'GATE: you need a human decision before you can proceed. Raise it here instead of guessing or stalling. If taskId is given, that task is auto-parked (released to blocked) so it does not lapse — then MOVE ON to other work via next_claimable; when a human answers you will see it in my_updates/notices and the task returns to the queue for you to re-claim. Give a clear title, the context in body, and options[] if it is a choice.',
+    {
+      projectId: z.string(),
+      taskId: z.string().optional().describe('The task this decision blocks (auto-parked to blocked). Omit for a standalone question.'),
+      title: z.string().min(1).describe('The decision needed, in one line'),
+      body: z.string().optional().describe('Context: what you tried, why you are blocked, trade-offs'),
+      options: z.array(z.string()).optional().describe('Discrete choices, if applicable'),
+    },
+    tool(async ({ projectId, taskId, title, body, options }) =>
+      room(env, projectId).raiseSignal(projectId, actor, { type: 'input_request', taskId: taskId ?? null, title, body, options }),
+    ),
+  );
+
+  defineTool(
+    'raise_alert',
+    'Flag something a human should SEE but that does not gate your work — a deviation from the plan, an unexpected finding, a risk, a heads-up. Non-blocking: keep working. Use severity critical sparingly for things that genuinely need prompt human attention.',
+    {
+      projectId: z.string(),
+      taskId: z.string().optional(),
+      title: z.string().min(1),
+      body: z.string().optional(),
+      severity: z.enum(['info', 'warning', 'critical']).optional().describe('default info'),
+    },
+    tool(async ({ projectId, taskId, title, body, severity }) =>
+      room(env, projectId).raiseSignal(projectId, actor, { type: 'alert', taskId: taskId ?? null, title, body, severity }),
     ),
   );
 

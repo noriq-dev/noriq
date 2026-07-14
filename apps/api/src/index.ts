@@ -240,7 +240,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     `SELECT 1 FROM projects p WHERE p.id = ? AND ${VISIBILITY_WHERE}`,
   ).bind(pid, u.role, u.id, u.id).first();
   if (!visible) return c.json({ error: 'not found' }, 404);
-  const [project, tasks, deps, agents, events, milestones, plans, phases, phaseTasks, tags, taskTags] = await Promise.all([
+  const [project, tasks, deps, agents, events, milestones, plans, phases, phaseTasks, tags, taskTags, signals] = await Promise.all([
     c.env.DB.prepare('SELECT id, key, name, description, claim_ttl_seconds AS claimTtlSeconds, repo_url AS repoUrl FROM projects WHERE id = ?')
       .bind(pid).first(),
     c.env.DB.prepare(
@@ -272,6 +272,14 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     c.env.DB.prepare('SELECT pt.phase_id AS phaseId, pt.task_id AS taskId FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ?').bind(pid).all(),
     c.env.DB.prepare('SELECT id, name, color, "order" FROM tags WHERE project_id = ? ORDER BY "order"').bind(pid).all(),
     c.env.DB.prepare('SELECT tt.task_id AS taskId, tt.tag_id AS tagId FROM task_tags tt JOIN tasks t ON t.id = tt.task_id WHERE t.project_id = ?').bind(pid).all(),
+    c.env.DB.prepare(
+      `SELECT s.id, s.task_id AS taskId, t.key AS taskKey, s.agent_id AS agentId, s.agent_name AS agentName,
+              s.type, s.severity, s.title, s.body, s.options, s.created_at AS createdAt
+       FROM signals s LEFT JOIN tasks t ON t.id = s.task_id
+       WHERE s.project_id = ? AND s.status = 'open' ORDER BY
+         CASE s.type WHEN 'input_request' THEN 0 ELSE 1 END,
+         CASE s.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, s.created_at DESC`,
+    ).bind(pid).all(),
   ]);
   if (!project) return c.json({ error: 'not found' }, 404);
   return c.json({
@@ -285,6 +293,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     phaseTasks: phaseTasks.results,
     tags: tags.results,
     taskTags: taskTags.results,
+    signals: signals.results.map((s) => ({ ...s, options: s.options ? JSON.parse(String(s.options)) : null })),
     events: events.results.map((e) => ({ ...e, payload: JSON.parse(String(e.payload)) })),
   });
 });
@@ -374,6 +383,20 @@ app.post('/api/projects/:pid/tasks/:tid/dependencies', userAuth, async (c) => {
 
 app.delete('/api/projects/:pid/tasks/:tid/dependencies/:depId', userAuth, async (c) => {
   const result = await room(c.env, c.req.param('pid')!).removeDependency(c.req.param('pid')!, humanActor(c), c.req.param('tid')!, c.req.param('depId')!);
+  return c.json(result);
+});
+
+// Signals — human answers a decision gate / acknowledges an alert (PLNR-67).
+app.post('/api/projects/:pid/signals/:sid/answer', userAuth, async (c) => {
+  const { response } = await c.req.json<{ response: string }>();
+  if (!response?.trim()) return c.json({ error: 'response required' }, 400);
+  const result = await room(c.env, c.req.param('pid')!).answerSignal(c.req.param('pid')!, humanActor(c), c.req.param('sid')!, response.trim());
+  return c.json(result);
+});
+
+app.post('/api/projects/:pid/signals/:sid/acknowledge', userAuth, async (c) => {
+  const { dismiss } = await c.req.json<{ dismiss?: boolean }>().catch(() => ({ dismiss: false }));
+  const result = await room(c.env, c.req.param('pid')!).acknowledgeSignal(c.req.param('pid')!, humanActor(c), c.req.param('sid')!, !!dismiss);
   return c.json(result);
 });
 

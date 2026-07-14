@@ -527,6 +527,92 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
+  // ---------------------------------------------------------------------------
+  // Signals — agent → human input requests (decision gates) and alerts (PLNR-67)
+  // ---------------------------------------------------------------------------
+
+  /** Raise an input_request (gate) or alert. An input_request on a held task auto-parks
+   *  it to 'blocked' so it doesn't lapse to claim-TTL while the human decides. */
+  async raiseSignal(
+    projectId: string,
+    actor: Actor,
+    input: { type: 'input_request' | 'alert'; taskId?: string | null; title: string; body?: string; options?: string[]; severity?: string },
+  )  {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const task = input.taskId ? await this.getTask(input.taskId) : null;
+      const id = newId('sig');
+      const severity = input.type === 'input_request' ? 'info' : (input.severity ?? 'info');
+      await this.env.DB.prepare(
+        `INSERT INTO signals (id, project_id, task_id, agent_id, agent_name, type, severity, title, body, options, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)`,
+      ).bind(
+        id, this.projectId, task?.id ?? null, actor.kind === 'agent' ? actor.id : null, actor.name,
+        input.type, severity, input.title, input.body ?? null,
+        input.options && input.options.length ? JSON.stringify(input.options) : null, nowIso(),
+      ).run();
+
+      let parked = false;
+      // Auto-park a held task behind an input gate: release the claim, mark it blocked.
+      if (input.type === 'input_request' && task && task.claimed_by) {
+        await this.env.DB.batch([
+          this.env.DB.prepare('UPDATE claims SET released_at = ? WHERE task_id = ? AND released_at IS NULL').bind(nowIso(), task.id),
+          this.env.DB.prepare("UPDATE tasks SET status = 'blocked', claimed_by = NULL, claim_expires_at = NULL, updated_at = ? WHERE id = ?").bind(nowIso(), task.id),
+        ]);
+        parked = true;
+      }
+      await this.emit(actor, 'signal.raised', task ? 'task' : 'project', task?.id ?? this.projectId, {
+        signalId: id, sigType: input.type, severity, title: input.title, taskKey: task?.key ?? null, parked,
+      });
+      return { id, type: input.type, taskKey: task?.key ?? null, parked };
+
+    });
+  }
+
+  /** Human answers an input_request → unblocks its task (back to the queue) + notifies the requester. */
+  async answerSignal(projectId: string, actor: Actor, signalId: string, response: string)  {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const sig = await this.env.DB.prepare(
+        'SELECT id, task_id AS taskId, agent_id AS agentId, type, status, title FROM signals WHERE id = ? AND project_id = ?',
+      ).bind(signalId, this.projectId).first<{ id: string; taskId: string | null; agentId: string | null; type: string; status: string; title: string }>();
+      if (!sig) throw new Error('signal not found');
+      if (sig.status !== 'open') return { ok: true, alreadyResolved: true };
+      await this.env.DB.prepare("UPDATE signals SET status = 'answered', response = ?, responder_id = ?, resolved_at = ? WHERE id = ?")
+        .bind(response, actor.id, nowIso(), signalId).run();
+      // Return a parked task to the queue so the requester (or anyone) can resume it.
+      let taskKey: string | null = null;
+      if (sig.type === 'input_request' && sig.taskId) {
+        const task = await this.getTask(sig.taskId);
+        taskKey = task.key;
+        if (task.status === 'blocked') {
+          await this.env.DB.prepare("UPDATE tasks SET status = 'todo', updated_at = ? WHERE id = ?").bind(nowIso(), sig.taskId).run();
+        }
+      }
+      await this.emit(actor, 'signal.answered', sig.taskId ? 'task' : 'project', sig.taskId ?? this.projectId, {
+        signalId, agentId: sig.agentId, title: sig.title, response: response.slice(0, 200), taskKey,
+      });
+      return { ok: true, taskKey };
+
+    });
+  }
+
+  /** Human acknowledges/dismisses a signal (mainly alerts). */
+  async acknowledgeSignal(projectId: string, actor: Actor, signalId: string, dismiss = false)  {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const sig = await this.env.DB.prepare('SELECT id, status, title, task_id AS taskId FROM signals WHERE id = ? AND project_id = ?')
+        .bind(signalId, this.projectId).first<{ id: string; status: string; title: string; taskId: string | null }>();
+      if (!sig) throw new Error('signal not found');
+      if (sig.status !== 'open') return { ok: true, alreadyResolved: true };
+      await this.env.DB.prepare('UPDATE signals SET status = ?, responder_id = ?, resolved_at = ? WHERE id = ?')
+        .bind(dismiss ? 'dismissed' : 'acknowledged', actor.id, nowIso(), signalId).run();
+      await this.emit(actor, 'signal.acknowledged', sig.taskId ? 'task' : 'project', sig.taskId ?? this.projectId, { signalId, title: sig.title });
+      return { ok: true };
+
+    });
+  }
+
   async resolveComment(projectId: string, actor: Actor, commentId: string, resolution: 'addressed' | 'wont_do', reply?: string)  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);

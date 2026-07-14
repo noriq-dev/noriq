@@ -1,0 +1,92 @@
+// PLNR-67: input requests (decision gates, auto-park) and alerts (non-blocking).
+import { SELF } from 'cloudflare:test';
+import { describe, expect, it, beforeAll } from 'vitest';
+import { createAgent, createUser, loginSession, mcpCall } from './helpers';
+
+let agent: { id: string; apiKey: string };
+let projectId: string;
+let cookie: string;
+
+const snapshot = async () =>
+  (await (await SELF.fetch(`https://planar.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json()) as {
+    signals: Array<{ id: string; type: string; severity: string; title: string; taskKey: string | null }>;
+    tasks: Array<{ id: string; key: string; status: string }>;
+  };
+
+beforeAll(async () => {
+  agent = await createAgent('signal-agent');
+  await createUser('signal-human@example.com', 'Signal Human', 'longenough1', 'admin').catch(() => {});
+  cookie = await loginSession('signal-human@example.com', 'longenough1');
+  const proj = await mcpCall(agent.apiKey, 'create_project', { key: 'SIG', name: 'signals' });
+  projectId = proj.body.id;
+}, 60000);
+
+describe('input requests (decision gates)', () => {
+  it('parks the held task, and answering returns it to the queue + notifies the agent', async () => {
+    const t = (await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'needs a call' })).body;
+    await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId: t.id });
+
+    const req = await mcpCall(agent.apiKey, 'request_input', {
+      projectId, taskId: t.id, title: 'Which datastore?', body: 'KV vs D1 for the cache', options: ['KV', 'D1'],
+    });
+    expect(req.isError).toBe(false);
+    expect(req.body.parked).toBe(true);
+
+    // Task is parked to blocked (not claimable); signal shows in the snapshot.
+    let snap = await snapshot();
+    expect(snap.tasks.find((x) => x.id === t.id)!.status).toBe('blocked');
+    const sig = snap.signals.find((s) => s.title === 'Which datastore?');
+    expect(sig?.type).toBe('input_request');
+
+    // Can't finish while the gate is open (task is blocked anyway, but assert the guard).
+    // Human answers → task back to todo.
+    const ans = await SELF.fetch(`https://planar.test/api/projects/${projectId}/signals/${sig!.id}/answer`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ response: 'Use D1' }),
+    });
+    expect(ans.status).toBe(200);
+    snap = await snapshot();
+    expect(snap.tasks.find((x) => x.id === t.id)!.status).toBe('todo');
+    expect(snap.signals.find((s) => s.id === sig!.id)).toBeUndefined(); // no longer open
+
+    // The requesting agent is notified of the answer.
+    const upd = await mcpCall(agent.apiKey, 'get_project', { projectId });
+    expect(upd.notices ?? '').toMatch(/Use D1|input request/);
+  });
+
+  it('blocks done while an input request is open', async () => {
+    const t = (await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'gated finish' })).body;
+    // Raise the request before claiming, so the task isn't auto-parked and stays claimable.
+    await mcpCall(agent.apiKey, 'request_input', { projectId, taskId: t.id, title: 'ok to ship?' });
+    await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId: t.id });
+    const done = await mcpCall(agent.apiKey, 'release_task', { projectId, taskId: t.id, toStatus: 'done' });
+    expect(done.isError).toBe(true);
+    expect(done.text).toMatch(/open input request/);
+  });
+});
+
+describe('alerts (non-blocking)', () => {
+  it('raises an alert without parking anything', async () => {
+    const t = (await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'has a deviation' })).body;
+    await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId: t.id });
+    const a = await mcpCall(agent.apiKey, 'raise_alert', {
+      projectId, taskId: t.id, title: 'API returns 500s intermittently', severity: 'critical',
+    });
+    expect(a.isError).toBe(false);
+    expect(a.body.parked).toBe(false);
+    const snap = await snapshot();
+    expect(snap.tasks.find((x) => x.id === t.id)!.status).toBe('in_progress'); // still held/working
+    const alert = snap.signals.find((s) => s.title.startsWith('API returns'));
+    expect(alert?.type).toBe('alert');
+    expect(alert?.severity).toBe('critical');
+  });
+
+  it('a human can acknowledge an alert', async () => {
+    const a = (await mcpCall(agent.apiKey, 'raise_alert', { projectId, title: 'heads up' })).body;
+    const ack = await SELF.fetch(`https://planar.test/api/projects/${projectId}/signals/${a.id}/acknowledge`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({}),
+    });
+    expect(ack.status).toBe(200);
+    const snap = await snapshot();
+    expect(snap.signals.find((s) => s.id === a.id)).toBeUndefined();
+  });
+});

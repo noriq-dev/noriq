@@ -19,6 +19,8 @@ export interface AgentUpdates {
   unassignedComments: Array<{ id: string; taskId: string; taskKey: string; kind: string; body: string }>;
   claimable: Array<{ id: string; key: string; title: string; projectId: string; priority: number }>;
   messages: Array<{ id: string; from: string; body: string; refTaskId: string | null; createdAt: string }>;
+  /** Input requests this agent raised that are still awaiting a human decision. */
+  pendingInputRequests: Array<{ id: string; taskKey: string | null; title: string; createdAt: string }>;
 }
 
 export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { advanceCursor?: boolean } = {}): Promise<AgentUpdates> {
@@ -51,6 +53,9 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
       notices.push(`Your claim on ${p.key} expired — the task was requeued (${p.reason}).`);
     } else if (e.verb === 'task.released' && p.previousHolder === agent.id) {
       notices.push(`Your claim on ${p.key} was force-released by ${p.actorName ?? 'a supervisor'}.`);
+    } else if (e.verb === 'signal.answered' && p.agentId === agent.id) {
+      const where = p.taskKey ? ` (${p.taskKey} is back in the queue — re-claim to resume)` : '';
+      notices.push(`Your input request "${p.title}" was answered: "${p.response}"${where}`);
     }
     // NB (PLNR-25): we deliberately do NOT notice every task.done here. It fired for
     // every completed task to every agent — noise — and the claimable list below is
@@ -102,12 +107,22 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
     ).bind(agent.id, agent.id).all<AgentUpdates['messages'][number]>()
   ).results;
 
+  // Input requests this agent is still waiting on (so it doesn't re-ask or forget).
+  const pendingInputRequests = (
+    await env.DB.prepare(
+      `SELECT s.id, t.key AS taskKey, s.title, s.created_at AS createdAt
+       FROM signals s LEFT JOIN tasks t ON t.id = s.task_id
+       WHERE s.agent_id = ? AND s.type = 'input_request' AND s.status = 'open'
+       ORDER BY s.created_at`,
+    ).bind(agent.id).all<AgentUpdates['pendingInputRequests'][number]>()
+  ).results;
+
   if (opts.advanceCursor !== false && maxRid > cursor) {
     await session.advanceCursor(maxRid);
   }
   await session.touch();
 
-  return { notices, openComments, unassignedComments, heldTasks: heldRows.results, claimable, messages };
+  return { notices, openComments, unassignedComments, heldTasks: heldRows.results, claimable, messages, pendingInputRequests };
 }
 
 /**
