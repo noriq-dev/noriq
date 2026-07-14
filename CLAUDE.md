@@ -1,0 +1,104 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+Noriq (dir/worker/DB still named `planar` — see "Naming" below) is an AI-native project
+management system: an **MCP server for AI agents** plus a **React web app for the humans
+supervising them**, deployed as a single Cloudflare Worker. Open-source and self-hostable.
+
+## Commands
+
+Run from the repo root unless noted. Workspaces are `@noriq/api`, `@noriq/web`, `@noriq/shared`.
+
+```sh
+npm install
+npm run dev              # wrangler dev on :8787 (Worker: API + MCP + WS + built SPA)
+npm run dev:web          # Vite dev server with proxy to :8787 (hot reload for UI work)
+npm run build            # shared + web → apps/web/dist (the Worker serves this)
+npm run typecheck        # tsc --noEmit across workspaces
+npm test                 # all workspace tests
+```
+
+API tests run in a real `workerd` via `@cloudflare/vitest-pool-workers` (DOs + D1 are exercised, not mocked):
+
+```sh
+npm test --workspace @noriq/api                          # full API suite
+npx vitest run --root apps/api test/oauth.test.ts        # a single test file
+npx vitest run --root apps/api test/oauth.test.ts -t "refresh"   # a single case by name
+cd apps/api && npx tsc --noEmit                          # typecheck API (vitest uses esbuild — it does NOT catch type errors)
+```
+
+Deploy + migrations (production actions — only run when explicitly asked):
+
+```sh
+npm run deploy                                    # build + wrangler deploy (uses wrangler.production.jsonc if present)
+npm run db:migrate:local --workspace @noriq/api   # apply migrations to the local D1
+npm run db:migrate:remote --workspace @noriq/api  # apply migrations to the REMOTE (prod) D1
+```
+
+## Architecture
+
+**One Worker does everything.** `apps/api/src/index.ts` is a Hono router that serves `/api/*`
+(REST for the SPA), `/mcp` (agents), `/ws/*` (live updates), `/oauth/*` + `/.well-known/*`
+(OAuth 2.1 AS), and falls through to Workers Assets for the SPA. `run_worker_first` in the
+wrangler config keeps the dynamic paths on the Worker while static assets are served directly.
+
+**`ProjectRoom` (Durable Object) is the sole writer per project** — [apps/api/src/do/ProjectRoom.ts](apps/api/src/do/ProjectRoom.ts).
+All mutations (create/claim/release tasks, comments, milestones, boards, deletes) go through it,
+wrapped in `blockConcurrencyWhile`, so there are no double-claims or read-modify-write races, and
+every mutation appends to a per-project **event log** (monotonic `seq`, also the WS resume cursor)
+and fans out over WebSocket. **Reads go straight to D1** (e.g. the `/snapshot` endpoint); only
+writes cross into the DO. Humans and agents are the same `Actor` path — a human is just another actor.
+
+**MCP server** — [apps/api/src/mcp.ts](apps/api/src/mcp.ts). Streamable HTTP via `@hono/mcp`, **stateless**:
+a fresh `McpServer` is built per request, bound to the authenticated agent. Tools double as docs
+(descriptions teach the workflow); every tool result piggybacks a `--- notices ---` block computed
+in [sync.ts](apps/api/src/sync.ts) from a server-side cursor stored in the `AgentSession` DO, so
+working agents get pushed-feeling updates without polling.
+
+**Agent identity model:** user → OAuth connection (one per `claude mcp add`) → agent (one per MCP
+session, keyed by `Mcp-Session-Id`) → sub-agents (`parent_agent_id`). Agents are **project-local**.
+Auth lives in [auth.ts](apps/api/src/auth.ts) (agents: OAuth-only, no static keys) and
+[oauth.ts](apps/api/src/oauth.ts) (the AS: authz-code + PKCE/S256, DCR + CIMD client registration).
+
+**Shared zod schemas** — [packages/shared/src](packages/shared/src) — are the single source of truth for
+the data model and the event/WS protocol, consumed by MCP tools, REST, and the UI.
+
+**Web app** — [apps/web/src/store.tsx](apps/web/src/store.tsx) is the live store: it loads REST
+`/snapshot`s and invalidates on WS events, deriving view-model types ([types.ts](apps/web/src/types.ts))
+for the components. (ARCHITECTURE.md calls it a "mock store" — that's stale; it's live.)
+
+## Non-obvious constraints (read before changing schema, MCP, or tests)
+
+- **D1 enforces foreign keys during BOTH `migrations apply` AND `d1 execute`, and ignores
+  `PRAGMA foreign_keys`/`defer_foreign_keys`.** You cannot drop/rebuild a referenced table on
+  populated data. **All migrations must be additive** (`ALTER TABLE ADD COLUMN`, new tables).
+  When adding a table that other tables reference, order the statements so FK targets exist first,
+  and update the `deleteProject` cascade in `ProjectRoom` (FK-ordered deletes) for any new table.
+
+- **MCP notifications only deliver on the in-flight request's SSE stream.** In stateless Streamable
+  HTTP there is no standing GET stream, so `server.notification()` with no `relatedRequestId` is
+  dropped. Always pass `extra.requestId` as `relatedRequestId` (see `pushChannel` in mcp.ts). A fully
+  idle agent cannot be pushed to — the notices text-block is the reliable fallback.
+
+- **`fetchMock` from `cloudflare:test` only intercepts the test isolate, not the worker isolate
+  reached via `SELF.fetch()`.** To test code that makes outbound `fetch` from within the Worker,
+  inject the fetch function (see `resolveCimdClient(env, id, doFetch)` in [lib/cimd.ts](apps/api/src/lib/cimd.ts))
+  and unit-test it directly, rather than driving it through an HTTP route.
+
+- **Task- vs project-scoped tables:** `comments` and `attachments` are **task-scoped** (no
+  `project_id` column — join through `tasks`). `signals`, `messages`, `events` have `project_id`.
+
+- **A deployed change requires a hard browser refresh** — the open SPA tab caches the old JS bundle.
+
+## Naming (brand vs infrastructure)
+
+The product was renamed **planar → Noriq**. User-facing text, the logo/favicons, and cosmetic IDs
+(`@noriq/*` packages, `NoriqEvent`, MCP server name, `noriq://` attachment URIs) are **Noriq**. But
+**infrastructure identifiers were intentionally left as `planar`** and must not be renamed (doing so
+orphans live resources): the Worker name, D1 database name (`planar`), R2 buckets (`planar-files`),
+the `planar_session` cookie, localStorage keys (`planar.theme`/`planar.sidebar`), and the backup
+snapshot marker + `backups/planar-*.json` key. The project key `PLNR` and `PLNR-##` task keys are
+also unchanged. `wrangler.production.jsonc` holds the real instance values and is gitignored.

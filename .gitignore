@@ -3,6 +3,7 @@ dist/
 .wrangler/
 .dev.vars
 *.local
+CLAUDE.local.md
 .DS_Store
 coverage/
 wrangler.production.jsonc
