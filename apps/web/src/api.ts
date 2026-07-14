@@ -81,7 +81,7 @@ export const api = {
   deleteAttachment: (aid: string) => req('DELETE', `/api/attachments/${aid}`),
   createTag: (pid: string, name: string) => req<{ id: string }>('POST', `/api/projects/${pid}/tags`, { name }),
 
-  agents: () => req<{ agents: ApiAgent[] }>('GET', '/api/agents'),
+  agents: (projectId?: string) => req<{ agents: ApiAgent[] }>('GET', projectId ? `/api/agents?projectId=${projectId}` : '/api/agents'),
   agentEvents: (aid: string) => req<{ events: ApiAgentEvent[] }>('GET', `/api/agents/${aid}/events`),
   revokeAgent: (aid: string) => req('POST', `/api/agents/${aid}/revoke`),
 
@@ -147,6 +147,7 @@ export interface ApiAgent {
   totalClaims: number;
   ownerName: string | null;
   ownerUserId: string | null;
+  parentAgentId: string | null;
 }
 
 export interface ApiAgentEvent {

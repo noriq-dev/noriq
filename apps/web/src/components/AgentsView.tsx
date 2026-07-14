@@ -29,12 +29,13 @@ export function AgentsView({ store }: { store: AppStore }) {
   const [events, setEvents] = useState<ApiAgentEvent[]>([]);
   const isAdmin = store.user?.role === 'admin';
 
-  const load = () => api.agents().then((r) => setAgents(r.agents)).catch(() => {});
+  const load = () => api.agents(store.currentPid).then((r) => setAgents(r.agents)).catch(() => {});
   useEffect(() => {
     load();
     const iv = setInterval(load, 15000);
     return () => clearInterval(iv);
-  }, [store.modal]); // reload after the new-agent modal closes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [store.modal, store.currentPid]); // reload on project switch + after the new-agent modal closes
 
   useEffect(() => {
     if (selected) api.agentEvents(selected).then((r) => setEvents(r.events)).catch(() => setEvents([]));

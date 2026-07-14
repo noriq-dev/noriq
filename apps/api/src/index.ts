@@ -567,13 +567,18 @@ app.delete('/api/groups/:gid', userAuth, async (c) => {
 // --- agent management (admin humans) ------------------------------------------------
 
 app.get('/api/agents', userAuth, async (c) => {
-  const { results } = await c.env.DB.prepare(
+  // Agents are project-local; scope the roster to a project when given (the Agents tab
+  // passes the current project). Connection default agents (project_id NULL) never show.
+  const projectId = c.req.query('projectId');
+  const where = projectId ? 'WHERE a.project_id = ?' : 'WHERE a.project_id IS NOT NULL';
+  const stmt = c.env.DB.prepare(
     `SELECT a.id, COALESCE(a.label, a.name) AS name, a.role, a.status, a.last_seen_at AS lastSeenAt, a.created_at AS createdAt,
-            u.name AS ownerName, u.id AS ownerUserId,
+            a.parent_agent_id AS parentAgentId, u.name AS ownerName, u.id AS ownerUserId,
             (SELECT COUNT(*) FROM tasks t WHERE t.claimed_by = a.id) AS heldTasks,
             (SELECT COUNT(*) FROM claims cl WHERE cl.agent_id = a.id) AS totalClaims
-     FROM agents a LEFT JOIN users u ON u.id = a.user_id ORDER BY a.created_at`,
-  ).all();
+     FROM agents a LEFT JOIN users u ON u.id = a.user_id ${where} ORDER BY a.created_at`,
+  );
+  const { results } = await (projectId ? stmt.bind(projectId) : stmt).all();
   return c.json({ agents: results });
 });
 

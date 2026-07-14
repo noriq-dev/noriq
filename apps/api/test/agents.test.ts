@@ -58,6 +58,18 @@ describe('agents are per-session, project-local', () => {
     expect(clash.text).toMatch(/already taken in this project/);
   });
 
+  it('the Agents roster is scoped to a project too', async () => {
+    await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'roster-here', projectId }, 'sess-r1');
+    await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'roster-there', projectId: otherProjectId }, 'sess-r2');
+    const cookie = await bootAdmin();
+    const roster = await (await SELF.fetch(`https://planar.test/api/agents?projectId=${projectId}`, { headers: { Cookie: cookie } })).json() as {
+      agents: Array<{ name: string }>;
+    };
+    const names = roster.agents.map((a) => a.name);
+    expect(names).toContain('roster-here');
+    expect(names).not.toContain('roster-there');
+  });
+
   it('a sub-agent is attributed to its parent', async () => {
     const parent = await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'lead', projectId }, 'sess-lead');
     const sub = await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'helper', projectId, parentAgentId: parent.body.actingAs.id }, 'sess-sub');
