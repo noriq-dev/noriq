@@ -8,7 +8,7 @@
 import { SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/env';
-import { isCimdId, resolveCimdClient } from '../src/lib/cimd';
+import { isCimdId, redirectUriAllowed, resolveCimdClient } from '../src/lib/cimd';
 
 const env = (over: Partial<Env> = {}) => ({ ...over }) as Env;
 const CLIENT = 'https://client.example.com/oauth/client.json';
@@ -29,6 +29,26 @@ function serve(status: number, body: unknown) {
   ) as unknown as typeof fetch;
 }
 const boom = vi.fn(async () => { throw new Error('unreachable'); }) as unknown as typeof fetch;
+
+describe('redirectUriAllowed — loopback port flexibility (PLNR-82, RFC 8252)', () => {
+  it('matches a dynamic loopback port against a port-less registration (Claude Code)', () => {
+    const registered = ['http://localhost/callback', 'http://127.0.0.1/callback'];
+    expect(redirectUriAllowed('http://localhost:3118/callback', registered)).toBe(true);
+    expect(redirectUriAllowed('http://127.0.0.1:55044/callback', registered)).toBe(true);
+    expect(redirectUriAllowed('http://localhost/callback', registered)).toBe(true); // exact still fine
+  });
+  it('requires exact match for non-loopback (https) redirects', () => {
+    const registered = ['https://chatgpt.com/connector/oauth/abc'];
+    expect(redirectUriAllowed('https://chatgpt.com/connector/oauth/abc', registered)).toBe(true);
+    expect(redirectUriAllowed('https://chatgpt.com/connector/oauth/OTHER', registered)).toBe(false);
+    expect(redirectUriAllowed('https://evil.example.com/cb', registered)).toBe(false);
+  });
+  it('loopback flexibility does not cross paths or hosts', () => {
+    const registered = ['http://localhost/callback'];
+    expect(redirectUriAllowed('http://localhost:3118/evil', registered)).toBe(false); // different path
+    expect(redirectUriAllowed('http://evil.example.com:3118/callback', registered)).toBe(false); // not loopback
+  });
+});
 
 describe('resolveCimdClient (PLNR-82)', () => {
   it('detects URL-formatted client_ids', () => {

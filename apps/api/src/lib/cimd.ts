@@ -32,15 +32,38 @@ function hostIsBlocked(hostname: string): boolean {
   return false;
 }
 
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+const isLoopbackHttp = (u: URL) => u.protocol === 'http:' && LOOPBACK_HOSTS.has(u.hostname);
+
 /** A redirect URI is acceptable if it's https or a loopback http (localhost/127.0.0.1). */
 function redirectUriOk(u: string): boolean {
   try {
     const url = new URL(u);
-    if (url.protocol === 'https:') return true;
-    return url.protocol === 'http:' && (url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '[::1]');
+    return url.protocol === 'https:' || isLoopbackHttp(url);
   } catch {
     return false;
   }
+}
+
+/**
+ * Whether a requested redirect_uri is permitted by a client's registered list.
+ * Exact match, EXCEPT loopback (native-app) redirects match ignoring the port —
+ * RFC 8252 §7.3: clients bind an ephemeral OS port at request time (e.g. Claude
+ * Code's http://localhost:3118/callback vs the registered http://localhost/callback).
+ */
+export function redirectUriAllowed(requested: string, allowed: string[]): boolean {
+  if (allowed.includes(requested)) return true;
+  let req: URL;
+  try { req = new URL(requested); } catch { return false; }
+  if (!isLoopbackHttp(req)) return false; // non-loopback must match exactly
+  return allowed.some((a) => {
+    try {
+      const au = new URL(a);
+      return isLoopbackHttp(au) && au.hostname === req.hostname && au.pathname === req.pathname;
+    } catch {
+      return false;
+    }
+  });
 }
 
 /**

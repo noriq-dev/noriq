@@ -10,7 +10,7 @@ import type { AppContext } from './auth';
 import type { Env } from './env';
 import { getCookie } from './auth';
 import { newId, nowIso, sha256Hex } from './lib/util';
-import { isCimdId, resolveCimdClient } from './lib/cimd';
+import { isCimdId, redirectUriAllowed, resolveCimdClient } from './lib/cimd';
 
 const ACCESS_TTL_S = 7 * 24 * 3600; // 7 days
 const REFRESH_TTL_S = 90 * 24 * 3600; // 90 days
@@ -143,7 +143,7 @@ async function validateClient(env: Env, p: AuthzParams): Promise<ClientCheck> {
     } catch (e) {
       return { ok: false, err: `client metadata: ${e instanceof Error ? e.message : String(e)}` };
     }
-    if (!client.redirectUris.includes(p.redirect_uri)) return { ok: false, err: 'redirect_uri not in client metadata document' };
+    if (!redirectUriAllowed(p.redirect_uri, client.redirectUris)) return { ok: false, err: 'redirect_uri not in client metadata document' };
     return { ok: true, name: client.name, redirectUris: client.redirectUris, cimd: true };
   }
 
@@ -152,7 +152,7 @@ async function validateClient(env: Env, p: AuthzParams): Promise<ClientCheck> {
     .bind(p.client_id).first<{ name: string; redirect_uris: string }>();
   if (!client) return { ok: false, err: 'unknown client_id' };
   const uris = JSON.parse(client.redirect_uris) as string[];
-  if (!uris.includes(p.redirect_uri)) return { ok: false, err: 'redirect_uri not registered' };
+  if (!redirectUriAllowed(p.redirect_uri, uris)) return { ok: false, err: 'redirect_uri not registered' };
   return { ok: true, name: client.name, redirectUris: uris, cimd: false };
 }
 
