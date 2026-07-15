@@ -15,7 +15,7 @@ import { metadataRoutes, oauth } from './oauth';
 import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
 import { z } from 'zod';
-import { AgentTool, RunKind, RunnerRepo, RunBudget, normalizeProjectKey } from '@noriq/shared';
+import { AgentTool, RunKind, RunnerRepo, RunBudget, normalizeProjectKey } from '@noriq-dev/shared';
 
 export { ProjectRoom } from './do/ProjectRoom';
 export { AgentSession } from './do/AgentSession';

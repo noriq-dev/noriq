@@ -25,9 +25,9 @@ jobs:
       - name: Install
         run: npm ci
 
-      # apps/web typechecks against @planar/shared's built types.
+      # apps/web typechecks against @noriq-dev/shared's built types.
       - name: Build shared package
-        run: npm run build --workspace @planar/shared
+        run: npm run build --workspace @noriq-dev/shared
 
       - name: Typecheck
         run: npm run typecheck

@@ -1,5 +1,5 @@
 {
-  "name": "@noriq/web",
+  "name": "@noriq-dev/web",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -10,7 +10,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@noriq/shared": "*",
+    "@noriq-dev/shared": "*",
     "@simplewebauthn/browser": "^13.3.0",
     "dompurify": "^3.4.12",
     "marked": "^18.0.6",

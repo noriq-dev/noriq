@@ -138,7 +138,7 @@ export const api = {
   cancelRun: (runId: string, reason?: string) => req<{ run: ApiRun }>('POST', `/api/runs/${runId}/cancel`, { reason }),
 };
 
-// Mirrors @noriq/shared RunnerRepo / Runner / Run — kept as plain interfaces so
+// Mirrors @noriq-dev/shared RunnerRepo / Runner / Run — kept as plain interfaces so
 // the web app stays free of the zod dependency (matches the ApiTask style).
 export interface ApiRunnerRepo {
   id: string;

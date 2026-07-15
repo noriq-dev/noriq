@@ -1,7 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../env';
 import type { Actor } from './ProjectRoom';
-import { RunnerClientMessage, RUNNER_PROTOCOL_VERSION } from '@noriq/shared';
+import { RunnerClientMessage, RUNNER_PROTOCOL_VERSION } from '@noriq-dev/shared';
 
 /**
  * RunnerHub — one instance per runner (idFromName(runnerId)).

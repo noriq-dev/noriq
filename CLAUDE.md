@@ -10,7 +10,7 @@ supervising them**, deployed as a single Cloudflare Worker. Open-source and self
 
 ## Commands
 
-Run from the repo root unless noted. Workspaces are `@noriq/api`, `@noriq/web`, `@noriq/shared`.
+Run from the repo root unless noted. Workspaces are `@noriq-dev/api`, `@noriq-dev/web`, `@noriq-dev/shared`.
 
 ```sh
 npm install
@@ -24,7 +24,7 @@ npm test                 # all workspace tests
 API tests run in a real `workerd` via `@cloudflare/vitest-pool-workers` (DOs + D1 are exercised, not mocked):
 
 ```sh
-npm test --workspace @noriq/api                          # full API suite
+npm test --workspace @noriq-dev/api                          # full API suite
 npx vitest run --root apps/api test/oauth.test.ts        # a single test file
 npx vitest run --root apps/api test/oauth.test.ts -t "refresh"   # a single case by name
 cd apps/api && npx tsc --noEmit                          # typecheck API (vitest uses esbuild — it does NOT catch type errors)
@@ -34,8 +34,8 @@ Deploy + migrations (production actions — only run when explicitly asked):
 
 ```sh
 npm run deploy                                    # build + wrangler deploy (uses wrangler.production.jsonc if present)
-npm run db:migrate:local --workspace @noriq/api   # apply migrations to the local D1
-npm run db:migrate:remote --workspace @noriq/api  # apply migrations to the REMOTE (prod) D1
+npm run db:migrate:local --workspace @noriq-dev/api   # apply migrations to the local D1
+npm run db:migrate:remote --workspace @noriq-dev/api  # apply migrations to the REMOTE (prod) D1
 ```
 
 ## Architecture
@@ -105,7 +105,7 @@ for the components. (ARCHITECTURE.md calls it a "mock store" — that's stale; i
 ## Naming (brand vs infrastructure)
 
 The product was renamed **planar → Noriq**. User-facing text, the logo/favicons, and cosmetic IDs
-(`@noriq/*` packages, `NoriqEvent`, MCP server name, `noriq://` attachment URIs) are **Noriq**. But
+(`@noriq-dev/*` packages, `NoriqEvent`, MCP server name, `noriq://` attachment URIs) are **Noriq**. But
 **infrastructure identifiers were intentionally left as `planar`** and must not be renamed (doing so
 orphans live resources): the Worker name, D1 database name (`planar`), R2 buckets (`planar-files`),
 the `planar_session` cookie, localStorage keys (`planar.theme`/`planar.sidebar`), and the backup

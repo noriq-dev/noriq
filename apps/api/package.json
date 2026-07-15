@@ -1,5 +1,5 @@
 {
-  "name": "@noriq/api",
+  "name": "@noriq-dev/api",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -15,7 +15,7 @@
   "dependencies": {
     "@hono/mcp": "^0.3.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "@noriq/shared": "*",
+    "@noriq-dev/shared": "*",
     "@simplewebauthn/server": "^13.3.2",
     "hono": "^4.7.0",
     "zod": "^4.0.0"

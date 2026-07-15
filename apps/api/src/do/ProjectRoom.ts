@@ -3,7 +3,7 @@ import type { Env } from '../env';
 import { newId, nowIso } from '../lib/util';
 import { userCanAccessProject } from '../lib/visibility';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
-import { RunKind, AgentTool, RunStatus, isTerminalRunStatus } from '@noriq/shared';
+import { RunKind, AgentTool, RunStatus, isTerminalRunStatus } from '@noriq-dev/shared';
 
 /**
  * ProjectRoom — one instance per project (idFromName(projectId)).
