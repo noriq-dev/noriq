@@ -177,6 +177,11 @@ export interface ApiRunner {
   freeSlots: number;
   lastHeartbeatAt: string | null;
   offboardedAt: string | null;
+  /** The daemon's release version (RUN-36). Null = registered before version reporting. */
+  version: string | null;
+  /** Derived server-side against the current release — never stored, since "current" moves
+   *  when the server ships. Unknown is not outdated. */
+  outdated: boolean;
   createdAt: string;
 }
 export interface ApiRunBudget {

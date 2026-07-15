@@ -128,6 +128,16 @@ export function RunsView({ store }: { store: AppStore }) {
                         {r.capabilities.tools.map((t) => (
                           <MonoTag key={t} color="var(--blue)" bg="rgba(76,157,255,.1)" size={9}>{t}</MonoTag>
                         ))}
+                        {/* What code this box runs (RUN-36). You cannot support someone's
+                            install without knowing what they are running — and unknown is a
+                            different fact from old, so it says so rather than guessing. */}
+                        <MonoTag
+                          color={r.outdated ? 'var(--amber, #f5a623)' : 'var(--text-faint)'}
+                          bg={r.outdated ? 'rgba(245,166,35,.12)' : 'var(--w-04)'}
+                          size={9}
+                        >
+                          {r.version ? `v${r.version}${r.outdated ? ' · update' : ''}` : 'version unknown'}
+                        </MonoTag>
                       </div>
                       <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', marginTop: 2 }}>
                         {offboarded

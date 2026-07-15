@@ -1,0 +1,15 @@
+-- 0029: a runner says what code it is running (RUN-36).
+--
+-- Registration carried label / tools / kinds / maxConcurrency / repos and no version, so the
+-- Runners panel could not show one and the server could not warn about a runner too old to
+-- trust. You cannot support strangers' installs without knowing what they are running.
+--
+-- NOT the same thing as RUNNER_PROTOCOL_VERSION, which the daemon already sends in its WS
+-- hello and the server already checks. Protocol answers "can we talk at all"; release answers
+-- "what code is this". A runner can be three releases behind and still speak protocol 1
+-- perfectly, so conflating them would either reject working daemons or hide stale ones.
+--
+-- Nullable, no CHECK, no rebuild: a runner registered before this — or one that predates
+-- version reporting entirely — simply has none, and the panel says "unknown" rather than
+-- inventing a number.
+ALTER TABLE runners ADD COLUMN version TEXT;

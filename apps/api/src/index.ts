@@ -9,6 +9,7 @@ import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot } from './backup';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, verifyPassword } from './lib/util';
 import { USER_PROJECT_WHERE, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
+import { LATEST_RUNNER_VERSION, MIN_RUNNER_VERSION, isOutdated } from './runner-release';
 import type { Actor } from './do/ProjectRoom';
 import { SKILL_MD } from './skill';
 import { issueTokens, metadataRoutes, oauth } from './oauth';
@@ -893,6 +894,9 @@ const RegisterRunnerBody = z.object({
   kinds: z.array(RunKind).default([]),
   maxConcurrency: z.number().int().nonnegative().default(1),
   repos: z.array(RunnerRepo).default([]),
+  /** The daemon's RELEASE version (RUN-36). Optional: a runner older than version reporting
+   *  still registers, and the panel says "unknown" rather than inventing a number. */
+  version: z.string().max(40).optional(),
 });
 
 const HeartbeatBody = z.object({
@@ -951,6 +955,10 @@ function runnerView(row: Record<string, unknown>) {
     repos: JSON.parse(String(row.repos)),
     freeSlots: row.free_slots as number,
     lastHeartbeatAt: last,
+    version: (row.version as string | null) ?? null,
+    // Derived, not stored: "current" changes when the server does, so a stored flag would be
+    // wrong the moment a release ships. Unknown is not outdated — see isOutdated.
+    outdated: isOutdated((row.version as string | null) ?? null),
     createdAt: row.created_at as string,
   };
 }
@@ -977,8 +985,8 @@ app.post('/api/runners', agentAuth, async (c) => {
       return c.json({ error: 'this runner was offboarded — delete it to let this machine register again' }, 403);
     }
     await c.env.DB.prepare(
-      "UPDATE runners SET label = ?, status = 'online', capabilities = ?, repos = ?, free_slots = ?, last_heartbeat_at = ?, token_id = ? WHERE id = ?",
-    ).bind(b.label, capabilities, JSON.stringify(repos), b.maxConcurrency, now, c.var.connection!.tokenId, id).run();
+      "UPDATE runners SET label = ?, status = 'online', capabilities = ?, repos = ?, free_slots = ?, last_heartbeat_at = ?, token_id = ?, version = ? WHERE id = ?",
+    ).bind(b.label, capabilities, JSON.stringify(repos), b.maxConcurrency, now, c.var.connection!.tokenId, b.version ?? null, id).run();
     // Reconnect reconciliation (RUN-6): the daemon's previous process died, so any
     // Runs still dispatched/running/blocked for it are orphaned → failed{daemon_restart}.
     // Runs are per-project, so sweep each affected project's ProjectRoom (the authority).
@@ -992,9 +1000,9 @@ app.post('/api/runners', agentAuth, async (c) => {
   } else {
     id = newId('rnr');
     await c.env.DB.prepare(
-      `INSERT INTO runners (id, owner_user_id, label, status, capabilities, repos, free_slots, last_heartbeat_at, token_id, created_at)
-       VALUES (?, ?, ?, 'online', ?, ?, ?, ?, ?, ?)`,
-    ).bind(id, userId, b.label, capabilities, JSON.stringify(repos), b.maxConcurrency, now, c.var.connection!.tokenId, now).run();
+      `INSERT INTO runners (id, owner_user_id, label, status, capabilities, repos, free_slots, last_heartbeat_at, token_id, version, created_at)
+       VALUES (?, ?, ?, 'online', ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(id, userId, b.label, capabilities, JSON.stringify(repos), b.maxConcurrency, now, c.var.connection!.tokenId, b.version ?? null, now).run();
   }
   const row = await c.env.DB.prepare('SELECT * FROM runners WHERE id = ?').bind(id).first<Record<string, unknown>>();
   return c.json({ runner: runnerView(row!) });
@@ -1021,6 +1029,21 @@ app.post('/api/runners/:id/heartbeat', agentAuth, async (c) => {
       .bind(b.freeSlots, b.status, nowIso(), id).run();
   }
   return c.json({ ok: true });
+});
+
+/**
+ * The current runner release (RUN-36). Public and cache-friendly so a human can curl it and
+ * RUN-37's auto-update can poll it without a credential:
+ *
+ *   curl -s https://<noriq>/api/runner/latest
+ *
+ * See runner-release.ts for why this lives on the server rather than in git or npm — and for
+ * the migration path to the npm registry once the package is published.
+ */
+app.get('/api/runner/latest', (c) => {
+  c.header('Cache-Control', 'public, max-age=300');
+  c.header('Access-Control-Allow-Origin', '*');
+  return c.json({ version: LATEST_RUNNER_VERSION, minimum: MIN_RUNNER_VERSION });
 });
 
 app.get('/api/runners', userAuth, async (c) => {
