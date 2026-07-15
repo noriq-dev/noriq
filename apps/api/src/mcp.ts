@@ -163,7 +163,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         ).bind(agent.userId).all()
       ).results;
       return {
-        you: { id: agent.id, name: agent.name, role: agent.role },
+        // `kind` is what an identity most needs to know about itself (0026): a copilot is a
+        // human's session and may roam between projects; an agent is runner-owned, pinned to
+        // one project for life, and expected to stay reachable.
+        you: { id: agent.id, name: agent.name, role: agent.role, kind: agent.kind },
         playbook: [
           'Name this session for the project with set_agent_identity before your first claim. Work loop: my_updates → pick from claimable (or next_claimable) → claim_task (just the one you are about to start) → do the work → resolve any comments → release_task {toStatus:"review"|"done"}. Every tool call renews your claim, so no periodic pinging — heartbeat only if you will be idle longer than the claim TTL.',
           'Humans steer via comments on tasks (kind: question/instruction). Acknowledge fast, resolve with resolve_comment (addressed|wont_do) + a reply. Unresolved comments should block you from finishing.',

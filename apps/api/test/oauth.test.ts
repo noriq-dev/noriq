@@ -1,6 +1,6 @@
 import { SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { createAgent, createUser, loginSession, mcpCall } from './helpers';
+import { createAgent, createUser, loginSession, mcpCall, sessionFor } from './helpers';
 
 let cookie: string;
 
@@ -109,9 +109,13 @@ describe('oauth 2.1 for MCP', () => {
     refreshToken = t.refresh_token;
     expect(accessToken).toMatch(/^plnrt_/);
 
-    // the token works on MCP under a default delegated identity (user+client derived)
+    // The token works on MCP under a per-session COPILOT. A connection is not an agent
+    // (0026), so the grant mints no identity at all: the working one appears at initialize
+    // and is named after the CLIENT ('Claude Code'). This previously asserted a user-derived
+    // name — that was the now-deleted connection agent's `${firstname}-${clientname}` label.
     const briefing = await mcpCall(accessToken, 'get_briefing', {});
-    expect(briefing.body.you.name).toContain('oauth');
+    expect(briefing.body.you.name).toContain('claude-code');
+    expect(briefing.body.you.kind).toBe('copilot');
   });
 
   it('set_agent_identity rebinds the token to a named agent', async () => {
@@ -181,9 +185,14 @@ describe('oauth 2.1 for MCP', () => {
     });
     expect(replay.status).toBe(400);
 
-    // new access token works and inherits the rebound identity
-    const briefing = await mcpCall(t.access_token, 'get_briefing', {});
+    // The new access token works and still acts as the rebound identity — but note WHY it
+    // does. Identity used to ride the token (it mapped to a connection agent), so rotation
+    // carried it along for free. Since 0026 it rides the MCP SESSION: rotate the credential,
+    // keep the session, keep the copilot. So the session id is passed explicitly here, which
+    // is what a real client does — it refreshes its token without re-running initialize.
+    const briefing = await mcpCall(t.access_token, 'get_briefing', {}, sessionFor(accessToken));
     expect(briefing.body.you.name).toBe('atlas-prime');
+    expect(briefing.body.you.kind).toBe('copilot');
   });
 });
 

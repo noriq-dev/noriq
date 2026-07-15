@@ -1,5 +1,5 @@
 // Agent re-model: one connection (token) → many agents (MCP sessions), each project-local.
-import { SELF } from 'cloudflare:test';
+import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import { createAgent, loginSession, createUser, mcpCall } from './helpers';
 
@@ -81,6 +81,88 @@ describe('agents are per-session, project-local', () => {
     };
     const helper = snap.agents.find((a) => a.name === 'helper');
     expect(helper?.parentAgentId).toBe(parent.body.actingAs.id);
+  });
+});
+
+// --- copilots vs runner-spawned agents (RUN-43 / migration 0026) -------------------
+describe('copilot / agent split', () => {
+  it('a human session is a copilot, and says so', async () => {
+    const b = await mcpCall(conn.apiKey, 'get_briefing', {}, 'sess-kind');
+    expect(b.body.you.kind).toBe('copilot');
+  });
+
+  it('a connection is not an agent — the grant mints no identity of its own', async () => {
+    // Pre-0026 every `claude mcp add` created a "connection agent": project_id NULL, did no
+    // work, existed only so oauth_tokens.agent_id had a target — and showed up in the UI as
+    // an idle agent nobody created. Nothing sessionless should exist now.
+    const { results } = await env.DB.prepare(
+      "SELECT id FROM agents WHERE session_id IS NULL AND kind = 'copilot'",
+    ).all();
+    expect(results).toHaveLength(0);
+  });
+
+  it('refuses a sessionless call instead of inventing somebody to be', async () => {
+    const res = await SELF.fetch('https://planar.test/mcp', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${conn.apiKey}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'get_briefing', arguments: {} } }),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('no MCP session');
+  });
+
+  it('a revoked copilot cannot respawn itself by reusing its session id', async () => {
+    // The regression this guards is silent. resolveSessionAgent used to filter
+    // `status != 'revoked'`, so a revoked agent was invisible rather than refused — the
+    // lookup fell through to the INSERT and minted a REPLACEMENT identity on the same
+    // session, handing the revoked agent its access straight back. Now that a connection is
+    // not an agent, this is the only place left where revocation can bite.
+    const victim = await createAgent('revoke-respawn');
+    const before = await mcpCall(victim.apiKey, 'get_briefing', {}, 'sess-revoked');
+    const agentId = before.body.you.id as string;
+
+    const cookie = await bootAdmin();
+    const res = await SELF.fetch(`https://planar.test/api/agents/${agentId}/revoke`, {
+      method: 'POST', headers: { Cookie: cookie },
+    });
+    expect(res.status).toBe(200);
+
+    const after = await SELF.fetch('https://planar.test/mcp', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${victim.apiKey}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+        'Mcp-Session-Id': 'sess-revoked',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'get_briefing', arguments: {} } }),
+    });
+    expect(after.status).toBe(401);
+
+    // And no replacement row was quietly created for that session.
+    const { results } = await env.DB.prepare("SELECT id, status FROM agents WHERE session_id = 'sess-revoked'")
+      .all<{ id: string; status: string }>();
+    expect(results).toHaveLength(1);
+    expect(results[0]!.status).toBe('revoked');
+  });
+
+  it('the schema itself refuses a malformed agent — this is not a convention', async () => {
+    // An agent with no runner, and a copilot that owns one, are both rejected by a CHECK
+    // rather than by code remembering to look. That is the point of spending the migration
+    // on it instead of a helper function.
+    await expect(
+      env.DB.prepare("INSERT INTO agents (id, name, kind, project_id) VALUES ('agt_nr', 'agt_nr', 'agent', ?)")
+        .bind(projectId).run(),
+    ).rejects.toThrow(/CHECK constraint failed/);
+
+    await env.DB.prepare("INSERT OR IGNORE INTO runners (id, label) VALUES ('rnr_split', 'split')").run();
+    await expect(
+      env.DB.prepare("INSERT INTO agents (id, name, kind, runner_id) VALUES ('agt_cr', 'agt_cr', 'copilot', 'rnr_split')").run(),
+    ).rejects.toThrow(/CHECK constraint failed/);
   });
 });
 

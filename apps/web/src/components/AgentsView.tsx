@@ -80,11 +80,26 @@ export function AgentsView({ store }: { store: AppStore }) {
                   <div style={{ minWidth: 0, flex: 1 }}>
                     <div style={{ fontSize: 13.5, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 7 }}>
                       {a.name}
+                      {/* The split, made visible (RUN-43): the roster used to render a human's
+                          chat session and a runner-spawned process identically. */}
+                      {a.kind === 'agent' ? (
+                        <MonoTag color="var(--blue)" bg="rgba(76,157,255,.12)" size={9}>AGENT</MonoTag>
+                      ) : (
+                        <MonoTag color="var(--text-dim)" bg="rgba(255,255,255,.06)" size={9}>COPILOT</MonoTag>
+                      )}
                       {a.role === 'orchestrator' && <MonoTag color="var(--accent)" bg="rgba(198,242,78,.12)" size={9}>ORCH</MonoTag>}
                       {revoked && <MonoTag color="var(--red-soft)" bg="rgba(255,92,92,.12)" size={9}>REVOKED</MonoTag>}
                     </div>
                     <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', marginTop: 2 }}>
-                      {a.ownerName ? `delegated by ${a.ownerName} · ` : 'unowned (legacy) · '}last seen {ago(a.lastSeenAt)} · {a.totalClaims} claims lifetime
+                      {/* "last seen" means opposite things for the two kinds, so only one of
+                          them gets it. A quiet copilot is a human who stepped away — normal.
+                          A quiet agent has no human behind it, and liveness is the signal. */}
+                      {a.kind === 'agent'
+                        ? `runner-spawned · last seen ${ago(a.lastSeenAt)} · `
+                        : a.ownerName
+                          ? `${a.ownerName}’s session · `
+                          : 'unowned (legacy) · '}
+                      {a.totalClaims} claims lifetime
                     </div>
                   </div>
                   {a.heldTasks > 0 && (

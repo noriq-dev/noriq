@@ -2,22 +2,33 @@ import type { Context, Next } from 'hono';
 import type { Env } from './env';
 import { newId, nowIso, sha256Hex } from './lib/util';
 
+/** What kind of thing is working (RUN-43). See migration 0026 for the full contrast. */
+export type AgentKind = 'copilot' | 'agent';
+
 export interface AgentIdentity {
   id: string;
   name: string;
   role: 'orchestrator' | 'worker';
   /** The user this agent acts on behalf of — its MCP access is scoped to them (PLNR-83). */
   userId: string;
+  /** copilot = a human's session (self-created, may hop projects, no heartbeat expectation).
+   *  agent   = runner-spawned for one run (runner-owned, project-pinned, heartbeat matters). */
+  kind: AgentKind;
 }
 
-/** An authorized OAuth credential (one `claude mcp add`). Many agents (sessions) share one. */
+/** An authorized OAuth credential (one `claude mcp add`). Many copilots (sessions) share one.
+ *  A connection is NOT an agent — that conflation died in 0026. */
 export interface Connection {
   tokenId: string;
   userId: string;
   clientId: string;
   clientName: string;
-  /** The token's legacy default agent — used only when a client sends no MCP session id. */
-  defaultAgent: AgentIdentity;
+  /**
+   * Set only when the token is bound to one specific agent — i.e. a runner's per-run token,
+   * which acts as exactly that agent regardless of MCP session. NULL for a human's connection,
+   * where the working copilot is resolved per session instead.
+   */
+  boundAgent: AgentIdentity | null;
 }
 
 export interface UserIdentity {
@@ -56,58 +67,83 @@ export async function agentAuth(c: Context<AppContext>, next: Next) {
   if (!key) return unauthorized('missing bearer token');
   const hash = await sha256Hex(key);
 
+  // The token no longer resolves an agent by itself: a connection is not an agent (0026).
+  // agent_id is set ONLY for a runner's per-run token, so the join is LEFT and its absence
+  // is the normal case for a human's connection.
   const t = await c.env.DB.prepare(
-    `SELECT t.id AS tokenId, t.user_id AS userId, t.client_id AS clientId,
-            a.id AS agentId, COALESCE(a.label, a.name) AS agentName, a.role AS agentRole,
+    `SELECT t.id AS tokenId, t.user_id AS userId, t.client_id AS clientId, t.agent_id AS boundAgentId,
+            a.id AS agentId, COALESCE(a.label, a.name) AS agentName, a.role AS agentRole, a.kind AS agentKind,
             COALESCE(cl.name, 'MCP client') AS clientName
      FROM oauth_tokens t
-     JOIN agents a ON a.id = t.agent_id
+     LEFT JOIN agents a ON a.id = t.agent_id AND a.status != 'revoked'
      LEFT JOIN oauth_clients cl ON cl.id = t.client_id
      WHERE t.token_hash = ? AND t.revoked_at IS NULL
-       AND t.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') AND a.status != 'revoked'`,
+       AND t.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
   ).bind(hash).first<{
-    tokenId: string; userId: string; clientId: string; clientName: string;
-    agentId: string; agentName: string; agentRole: 'orchestrator' | 'worker';
+    tokenId: string; userId: string; clientId: string; clientName: string; boundAgentId: string | null;
+    agentId: string | null; agentName: string | null; agentRole: 'orchestrator' | 'worker' | null;
+    agentKind: AgentKind | null;
   }>();
   if (!t) return unauthorized('invalid, expired, or revoked token — connect via OAuth');
 
-  const defaultAgent: AgentIdentity = { id: t.agentId, name: t.agentName, role: t.agentRole, userId: t.userId };
+  // A token bound to an agent that is revoked (or gone) must FAIL, not silently degrade to
+  // an unbound connection — otherwise revoking a runaway agent would hand its token back the
+  // right to resolve a fresh copilot per session, which is the opposite of a kill switch.
+  if (t.boundAgentId && !t.agentId) return unauthorized('this token’s agent was revoked');
+
+  const boundAgent: AgentIdentity | null = t.agentId
+    ? { id: t.agentId, name: t.agentName ?? t.agentId, role: t.agentRole ?? 'worker', userId: t.userId, kind: t.agentKind ?? 'agent' }
+    : null;
   c.set('oauthTokenId', t.tokenId);
-  c.set('connection', { tokenId: t.tokenId, userId: t.userId, clientId: t.clientId, clientName: t.clientName, defaultAgent });
-  // Legacy fallback identity; the /mcp route resolves the real per-session agent.
-  c.set('agent', defaultAgent);
+  c.set('connection', { tokenId: t.tokenId, userId: t.userId, clientId: t.clientId, clientName: t.clientName, boundAgent });
+  // No `agent` is set here. Routes that need one either read connection.boundAgent or resolve
+  // it per MCP session; the runner's REST endpoints (register/heartbeat/steer-ack) need only
+  // the connection's user.
+  if (boundAgent) c.set('agent', boundAgent);
   await next();
 }
 
 const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 16) || 'agent';
 
 /**
- * Resolve the agent for one MCP session (a chat, or a sub-agent) on a connection.
- * Each MCP client `initialize` gets its own session id, so this is one agent per
+ * Resolve the COPILOT for one MCP session (a chat, or a sub-agent) on a connection.
+ * Each MCP client `initialize` gets its own session id, so this is one copilot per
  * session. Created unscoped (project_id NULL) and unnamed-ish; set_agent_identity or
- * the first claim gives it a real name + project.
+ * the first claim gives it a real label + project.
+ *
+ * This path only ever mints copilots. A runner-spawned agent is created by the runner
+ * and reached through a token bound to it (connection.boundAgent) — it never arrives
+ * here, and the kind filter below keeps it that way even if one somehow carried a
+ * session id: a runner's agent must never be adopted by whoever presents a session.
  */
 export async function resolveSessionAgent(env: Env, conn: Connection, sessionId: string): Promise<AgentIdentity> {
+  // Deliberately NOT filtered by status: a revoked copilot must be FOUND so it can be
+  // refused. Filtering it out here would make the row invisible and send us straight to
+  // the INSERT below — silently minting a replacement identity for the same session and
+  // handing a revoked agent its access back. Revocation has to bite somewhere, and with a
+  // connection no longer being an agent (0026) this is the only place left that it can.
   const existing = await env.DB.prepare(
-    `SELECT id, COALESCE(label, name) AS name, role, user_id AS userId FROM agents WHERE session_id = ? AND status != 'revoked'`,
-  ).bind(sessionId).first<AgentIdentity>();
+    `SELECT id, COALESCE(label, name) AS name, role, user_id AS userId, kind, status
+       FROM agents WHERE session_id = ? AND kind = 'copilot'`,
+  ).bind(sessionId).first<AgentIdentity & { status: string }>();
   if (existing) {
     // The session id is client-supplied (echoed back from initialize). Bind it to
     // the authenticated user so a leaked session id can't be replayed with another
     // user's token to act AS that user's agent (PLNR-101).
     if (existing.userId !== conn.userId) throw new Error('session id does not belong to this connection');
+    if (existing.status === 'revoked') throw new Error('this session’s agent was revoked');
     return existing;
   }
   const id = newId('agt');
   // `name` is a stable, globally-unique internal handle (label is the friendly display,
-  // set via set_agent_identity). The id suffix guarantees uniqueness.
+  // set via set_agent_identity). The id suffix guarantees uniqueness. PLNR-65 settled this
+  // split deliberately — name is not dead weight, it is the handle label falls back to.
   const name = `${slug(conn.clientName)}-${id.slice(-6)}`;
-  // api_key_hash is a vestigial NOT NULL column (no static keys); a random unusable hash fills it.
   await env.DB.prepare(
-    `INSERT INTO agents (id, name, role, status, user_id, oauth_token_id, session_id, api_key_hash, created_at)
-     VALUES (?, ?, 'worker', 'idle', ?, ?, ?, ?, ?)`,
-  ).bind(id, name, conn.userId, conn.tokenId, sessionId, await sha256Hex(crypto.randomUUID()), nowIso()).run();
-  return { id, name, role: 'worker', userId: conn.userId };
+    `INSERT INTO agents (id, name, role, status, kind, user_id, oauth_token_id, session_id, created_at)
+     VALUES (?, ?, 'worker', 'idle', 'copilot', ?, ?, ?, ?)`,
+  ).bind(id, name, conn.userId, conn.tokenId, sessionId, nowIso()).run();
+  return { id, name, role: 'worker', userId: conn.userId, kind: 'copilot' };
 }
 
 /** Admin-token auth for bootstrap/ops endpoints (agent key issuance, user creation). */

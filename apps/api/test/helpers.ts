@@ -104,6 +104,25 @@ export async function createUser(email: string, name: string, password: string, 
 
 let rpcId = 1;
 
+/**
+ * One implicit MCP session per token.
+ *
+ * A connection is not an agent (0026), so a sessionless call has nobody to be, and the
+ * server refuses it rather than inventing a phantom default agent. These tests were written
+ * against that fallback and what they mean by a bare token is "this token's one working
+ * identity" — so give each token a stable session and let that carry the meaning. Passing an
+ * explicit sessionId still resolves a distinct copilot, which is what the sub-agent tests
+ * are really exercising.
+ */
+const defaultSessions = new Map<string, string>();
+export const sessionFor = (apiKey: string): string => {
+  const existing = defaultSessions.get(apiKey);
+  if (existing) return existing;
+  const fresh = crypto.randomUUID();
+  defaultSessions.set(apiKey, fresh);
+  return fresh;
+};
+
 /** Call an MCP tool over Streamable HTTP and return the parsed result body + notices.
  *  Pass a sessionId to act as a distinct MCP session (a chat / sub-agent). */
 export async function mcpCall(apiKey: string, tool: string, args: Record<string, unknown> = {}, sessionId?: string) {
@@ -123,7 +142,7 @@ async function mcpCallOnce(apiKey: string, tool: string, args: Record<string, un
       Authorization: `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
       Accept: 'application/json, text/event-stream',
-      ...(sessionId ? { 'Mcp-Session-Id': sessionId } : {}),
+      'Mcp-Session-Id': sessionId ?? sessionFor(apiKey),
     },
     body: JSON.stringify({
       jsonrpc: '2.0',
@@ -155,6 +174,7 @@ export async function mcpRpc(apiKey: string, method: string, params: Record<stri
       Authorization: `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
       Accept: 'application/json, text/event-stream',
+      'Mcp-Session-Id': sessionFor(apiKey),
     },
     body: JSON.stringify({ jsonrpc: '2.0', id: rpcId++, method, params }),
   });
@@ -176,6 +196,7 @@ export async function mcpCallStream(apiKey: string, tool: string, args: Record<s
       Authorization: `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
       Accept: 'application/json, text/event-stream',
+      'Mcp-Session-Id': sessionFor(apiKey),
     },
     body: JSON.stringify({ jsonrpc: '2.0', id: rpcId++, method: 'tools/call', params: { name: tool, arguments: args } }),
   });
@@ -201,6 +222,7 @@ export async function mcpList(apiKey: string) {
       Authorization: `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
       Accept: 'application/json, text/event-stream',
+      'Mcp-Session-Id': sessionFor(apiKey),
     },
     body: JSON.stringify({ jsonrpc: '2.0', id: rpcId++, method: 'tools/list', params: {} }),
   });

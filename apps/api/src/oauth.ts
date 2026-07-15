@@ -1,9 +1,13 @@
 // OAuth 2.1 authorization server for MCP clients (PLNR-30).
 // Authorization-code + PKCE (S256, required), dynamic client registration
-// (public clients only), refresh tokens. Access tokens are opaque and map to
-// an AGENT identity: on consent the user names (or reuses) the agent this
-// client will act as — so OAuth agents flow through the exact same
-// coordination paths as key-based ones.
+// (public clients only), refresh tokens, and the device grant (RFC 8628).
+//
+// A token authorizes a CONNECTION, not an agent (RUN-43 / migration 0026). Granting
+// says "this client may act for this user"; it does not decide *who does the work*.
+// That is settled later, and separately: a human's session resolves its own copilot at
+// MCP initialize, and a runner mints the agent it owns and gets a token bound to it.
+// Tokens here are therefore issued with agent_id NULL — the binding is the exception
+// (a runner's per-run token), not the rule.
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 import type { AppContext } from './auth';
@@ -200,21 +204,13 @@ async function validateClient(env: Env, p: AuthzParams): Promise<ClientCheck> {
   return { ok: true, name: client.name, redirectUris: uris, cimd: false };
 }
 
-/**
- * The connection's default agent — one per grant (project_id NULL, so it never shows in
- * a project). Real work happens under per-session agents created at MCP initialize and
- * named via set_agent_identity. Shared by consent (authorization_code) and the device
- * verification page, so both grants produce identical agent identities.
- */
-async function createConnectionAgent(db: D1Database, user: { id: string; name: string }, clientName: string): Promise<string> {
-  const display = `${(user.name.split(' ')[0] ?? 'user').toLowerCase()}-${clientName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 20) || 'client'}`;
-  const agentId = newId('agt');
-  // api_key_hash is a vestigial NOT NULL column (no static keys); a random hash fills it.
-  await db.prepare(
-    `INSERT INTO agents (id, name, label, role, status, user_id, api_key_hash, created_at) VALUES (?, ?, ?, 'worker', 'idle', ?, ?, ?)`,
-  ).bind(agentId, `${display}-${agentId.slice(-6)}`, display, user.id, await sha256Hex(randToken('unused_')), nowIso()).run();
-  return agentId;
-}
+// createConnectionAgent is gone (0026). A grant used to mint a "connection agent": an
+// agents row, project_id NULL forever, that never did any work and existed only so
+// oauth_codes/oauth_tokens had an agent_id to point at. It made every `claude mcp add`
+// look like a working identity in the dashboard, and it is half the reason `agents` meant
+// two incompatible things. A connection is now just its oauth_tokens row — owned by a
+// user, bound to no agent. Working identities are minted per MCP session (copilots) or by
+// a runner (agents).
 
 /** CIMD clients must exist as an oauth_clients row (FK target for codes/tokens). */
 async function ensureCimdClientRow(db: D1Database, clientId: string, name: string, redirectUris: string[]) {
@@ -331,11 +327,8 @@ oauth.post('/authorize', async (c) => {
   if (!user) return c.html(consentPage(v.name, '', p, null, 'sign in first'), 401);
   if (form.decision !== 'approve') return c.html(consentPage(v.name, '', p, user), 400);
 
-  // Connection default agent: one per grant/connection (project_id NULL, so it never
-  // shows in a project). Real work happens under per-session agents created at MCP
-  // initialize and named via set_agent_identity. `name` is a unique internal handle;
-  // `label` is the friendly display.
-  const agent = { id: await createConnectionAgent(c.env.DB, user, v.name) };
+  // No agent is minted here (0026). The grant authorizes a *connection* for this user; who
+  // does the work is decided later, per MCP session (a copilot) or by a runner (an agent).
 
   // A CIMD client has no persistent registration; materialize it now so the
   // oauth_codes / oauth_tokens FK to oauth_clients resolves.
@@ -343,9 +336,9 @@ oauth.post('/authorize', async (c) => {
 
   const code = randToken('plnrc_');
   await c.env.DB.prepare(
-    `INSERT INTO oauth_codes (code_hash, client_id, user_id, agent_id, redirect_uri, code_challenge, scope, expires_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).bind(await sha256Hex(code), p.client_id, user.id, agent.id, p.redirect_uri, p.code_challenge, p.scope,
+    `INSERT INTO oauth_codes (code_hash, client_id, user_id, redirect_uri, code_challenge, scope, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(await sha256Hex(code), p.client_id, user.id, p.redirect_uri, p.code_challenge, p.scope,
     new Date(Date.now() + CODE_TTL_S * 1000).toISOString()).run();
   return redirect({ code });
 });
@@ -522,11 +515,12 @@ oauth.post('/device', async (c) => {
     return c.html(devicePage({ user, userCode, clientName: found.clientName, state: 'confirm' }));
   }
 
-  const agentId = await createConnectionAgent(c.env.DB, user, found.clientName);
+  // Approving binds the code to the human, not to an agent (0026) — same policy as the
+  // consent page, so both grants produce identical connections.
   const res = await c.env.DB.prepare(
-    `UPDATE oauth_device_codes SET approved_at = ?, user_id = ?, agent_id = ?
+    `UPDATE oauth_device_codes SET approved_at = ?, user_id = ?
      WHERE user_code = ? AND approved_at IS NULL AND denied_at IS NULL`,
-  ).bind(nowIso(), user.id, agentId, userCode).run();
+  ).bind(nowIso(), user.id, userCode).run();
   if (!res.meta.changes) return c.html(devicePage({ user, userCode, state: 'enter', error: 'that code was already resolved' }), 400);
   return c.html(devicePage({ user, userCode, clientName: found.clientName, state: 'done' }));
 });
@@ -570,7 +564,8 @@ async function deviceTokenGrant(c: Context<AppContext>, form: Record<string, unk
     'UPDATE oauth_device_codes SET consumed_at = ? WHERE device_code_hash = ? AND consumed_at IS NULL',
   ).bind(nowIso(), hash).run();
   if (!consume.meta.changes) return c.json({ error: 'invalid_grant', error_description: 'device_code already used' }, 400);
-  return c.json(await issueTokens(c.env.DB, String(row.client_id), String(row.user_id), String(row.agent_id), String(row.scope)));
+  const { tokenId: _dt, ...deviceGrant } = await issueTokens(c.env.DB, String(row.client_id), String(row.user_id), null, String(row.scope));
+  return c.json(deviceGrant);
 }
 
 // --- token ---------------------------------------------------------------------
@@ -601,7 +596,8 @@ oauth.post('/token', async (c) => {
     // PKCE S256
     const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
     if (b64url(new Uint8Array(digest)) !== row.code_challenge) return c.json({ error: 'invalid_grant', error_description: 'PKCE verification failed' }, 400);
-    return c.json(await issueTokens(c.env.DB, row.client_id!, row.user_id!, row.agent_id!, row.scope!));
+    const { tokenId: _ct, ...codeGrant } = await issueTokens(c.env.DB, row.client_id!, row.user_id!, null, row.scope!);
+    return c.json(codeGrant);
   }
 
   if (grant === 'refresh_token') {
@@ -612,22 +608,38 @@ oauth.post('/token', async (c) => {
     if (!row || (row.refresh_expires_at && row.refresh_expires_at < nowIso())) return c.json({ error: 'invalid_grant' }, 400);
     // Rotate: revoke the old pair, issue a new one.
     await c.env.DB.prepare('UPDATE oauth_tokens SET revoked_at = ? WHERE id = ?').bind(nowIso(), row.id!).run();
-    return c.json(await issueTokens(c.env.DB, row.client_id!, row.user_id!, row.agent_id!, row.scope!));
+    // Carry any agent binding across rotation — a runner's per-run token must not widen.
+    const { tokenId: _rt, ...refreshed } = await issueTokens(c.env.DB, row.client_id!, row.user_id!, row.agent_id ?? null, row.scope!);
+    return c.json(refreshed);
   }
 
   return c.json({ error: 'unsupported_grant_type' }, 400);
 });
 
-async function issueTokens(db: D1Database, clientId: string, userId: string, agentId: string, scope: string) {
+/**
+ * Mint an access/refresh pair for a connection.
+ *
+ * `agentId` is normally null: a connection is not an agent, and the working copilot is
+ * resolved per MCP session. It is non-null only for a token bound to one specific agent —
+ * a runner's per-run token, which acts as exactly that agent and nothing else. The refresh
+ * grant threads the existing binding through so rotation cannot quietly widen a bound
+ * token into a general-purpose one.
+ */
+export async function issueTokens(db: D1Database, clientId: string, userId: string, agentId: string | null, scope: string) {
   const access = randToken('plnrt_');
   const refresh = randToken('plnrr_');
+  const tokenId = newId('oat');
   await db.prepare(
     `INSERT INTO oauth_tokens (id, token_hash, refresh_hash, client_id, user_id, agent_id, scope, expires_at, refresh_expires_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).bind(newId('oat'), await sha256Hex(access), await sha256Hex(refresh), clientId, userId, agentId, scope,
+  ).bind(tokenId, await sha256Hex(access), await sha256Hex(refresh), clientId, userId, agentId, scope,
     new Date(Date.now() + ACCESS_TTL_S * 1000).toISOString(),
     new Date(Date.now() + REFRESH_TTL_S * 1000).toISOString()).run();
   return {
+    // Not part of the OAuth response — the grant handlers strip it. It exists so a caller
+    // minting a bound token (the run-agent endpoint) can point agents.oauth_token_id back
+    // at the credential, which is what makes "revoke this run's token" reachable later.
+    tokenId,
     access_token: access,
     token_type: 'Bearer',
     expires_in: ACCESS_TTL_S,

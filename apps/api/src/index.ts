@@ -11,7 +11,7 @@ import { hashPassword, newApiKey, newId, nowIso, sha256Hex, verifyPassword } fro
 import { USER_PROJECT_WHERE, userCanAccessProject } from './lib/visibility';
 import type { Actor } from './do/ProjectRoom';
 import { SKILL_MD } from './skill';
-import { metadataRoutes, oauth } from './oauth';
+import { issueTokens, metadataRoutes, oauth } from './oauth';
 import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
 import { z } from 'zod';
@@ -99,19 +99,34 @@ app.all('/mcp', agentAuth, async (c) => {
   const rl = await rateLimit(c.env, `mcp:${conn.tokenId}`, 120);
   if (!rl.ok) return c.json({ error: 'rate limited — back off and retry' }, 429, { 'Retry-After': String(rl.retryAfter) });
 
-  // Agents are per MCP SESSION (a chat / sub-agent), not per connection. We issue a
-  // session id at initialize and the client echoes it back (Mcp-Session-Id); each
-  // session resolves to its own agent. Sessionless (legacy) calls use the connection's
-  // default agent.
+  // Two ways to be somebody here (0026):
+  //  * a runner's per-run token is BOUND to one agent — it acts as that agent, full stop,
+  //    and no session id can move it. The runner owns that identity's lifecycle.
+  //  * a human's connection is bound to nothing; each MCP SESSION (a chat / sub-agent)
+  //    resolves to its own copilot. We issue a session id at initialize and the client
+  //    echoes it back (Mcp-Session-Id).
   const raw = await c.req.json().catch(() => null);
   const msgs = raw == null ? [] : Array.isArray(raw) ? raw : [raw];
   const isInit = msgs.some((m) => m?.method === 'initialize');
   let sessionId = c.req.header('mcp-session-id') || undefined;
   if (isInit && !sessionId) sessionId = crypto.randomUUID();
-  let agent = c.var.agent!;
-  if (sessionId) {
-    agent = await resolveSessionAgent(c.env, conn, sessionId);
+  let agent = conn.boundAgent;
+  if (!agent && sessionId) {
+    // Both refusals here are authentication failures, not server faults: a session id
+    // replayed under another user's token (PLNR-101), and a session whose copilot was
+    // revoked. They used to escape as 500s.
+    try {
+      agent = await resolveSessionAgent(c.env, conn, sessionId);
+    } catch (e) {
+      return c.json({ error: (e as Error).message }, 401);
+    }
     if (isInit) c.header('Mcp-Session-Id', sessionId);
+  }
+  // The old sessionless path silently acted as the connection's phantom "default agent".
+  // That agent no longer exists, and minting one per request would re-create precisely the
+  // unattributable work 0026 deletes — so refuse, and say why.
+  if (!agent) {
+    return c.json({ error: 'no MCP session — call initialize first (sessionless calls are not attributable)' }, 400);
   }
 
   const server = buildMcpServer(c.env, agent, { oauthTokenId: conn.tokenId, sessionId });
@@ -354,6 +369,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
       // Project-local agents only (PLNR agent re-model): an agent belongs to the
       // project it works, not to every project.
       `SELECT a.id, COALESCE(a.label, a.name) AS name, a.role, a.status, a.last_seen_at AS lastSeenAt,
+              a.kind, a.runner_id AS runnerId,
               a.parent_agent_id AS parentAgentId, u.name AS ownerName
        FROM agents a LEFT JOIN users u ON u.id = a.user_id
        WHERE a.project_id = ? AND a.status != 'revoked' ORDER BY a.created_at`,
@@ -820,6 +836,7 @@ app.get('/api/agents', userAuth, async (c) => {
   const where = projectId ? 'WHERE a.project_id = ?' : 'WHERE a.project_id IS NOT NULL';
   const stmt = c.env.DB.prepare(
     `SELECT a.id, COALESCE(a.label, a.name) AS name, a.role, a.status, a.last_seen_at AS lastSeenAt, a.created_at AS createdAt,
+            a.kind, a.runner_id AS runnerId,
             a.parent_agent_id AS parentAgentId, u.name AS ownerName, u.id AS ownerUserId,
             (SELECT COUNT(*) FROM tasks t WHERE t.claimed_by = a.id) AS heldTasks,
             (SELECT COUNT(*) FROM claims cl WHERE cl.agent_id = a.id) AS totalClaims
@@ -1103,6 +1120,73 @@ app.post('/api/runs/:runId/steer', userAuth, async (c) => {
     }),
   );
   return c.json({ steerId, delivered });
+});
+
+// The runner creates the agent it is about to spawn, and gets a token BOUND to it (RUN-43).
+//
+// This inverts how identity used to work. The daemon told the model, in English, to call
+// set_agent_identity — so identity depended on the model choosing to comply, the daemon never
+// learned the agt_ that resulted (run.status.agentId was always null), and Codex, which never
+// had MCP wired at all, was silently un-attributable. Now the identity exists BEFORE the
+// process does, and the process inherits it by holding a credential that can only be it.
+//
+// The bound token is also least-privilege: agents previously shared the runner's own token,
+// so every spawned process held the credential that can register runners and read every
+// project the human can reach. This one can only be one agent, in one project.
+const RunAgentBody = z.object({
+  label: z.string().min(1).max(60).optional(),
+  role: z.enum(['orchestrator', 'worker']).default('worker'),
+});
+app.post('/api/runs/:runId/agent', agentAuth, async (c) => {
+  const runId = c.req.param('runId')!;
+  const parsed = RunAgentBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid run-agent request', detail: parsed.error.issues }, 400);
+  const b = parsed.data;
+  const conn = c.var.connection!;
+  const run = await c.env.DB.prepare(
+    `SELECT r.id, r.kind, r.project_id AS projectId, r.runner_id AS runnerId, r.agent_id AS agentId,
+            rn.owner_user_id AS owner
+     FROM runs r LEFT JOIN runners rn ON rn.id = r.runner_id WHERE r.id = ?`,
+  ).bind(runId).first<{
+    id: string; kind: string; projectId: string; runnerId: string | null;
+    agentId: string | null; owner: string | null;
+  }>();
+  // Same ownership test as steer-ack: the run must belong to a runner this user owns.
+  if (!run || run.owner !== conn.userId) return c.json({ error: 'run not found' }, 404);
+  if (!run.runnerId) return c.json({ error: 'run has no runner yet' }, 400);
+  // One agent per run, and it is not re-issuable: handing out a second credential for the
+  // same run would mean two live processes could act as one identity, which is exactly the
+  // ambiguity this task exists to remove.
+  if (run.agentId) return c.json({ error: 'run already has an agent' }, 409);
+
+  const agentId = newId('agt');
+  // The label is what a human reads in the dashboard; scope it to the run so two concurrent
+  // runs in one project cannot collide (label uniqueness is per-project).
+  const label = b.label ?? `${run.kind}-${runId.slice(-6)}`;
+  const name = `runner-${agentId.slice(-6)}`;
+
+  // Order matters here and it is not arbitrary: agents.oauth_token_id and oauth_tokens.agent_id
+  // reference each other, so whichever row is written first points at one that does not exist
+  // yet. Minting the token first fails the FK outright. Hence: agent (unlinked) → token (bound
+  // to the agent) → link back. 0026 made this cycle survivable by dropping NOT NULL from
+  // oauth_tokens.agent_id; PLNR-143 is where the cycle stops existing at all.
+  await c.env.DB.prepare(
+    `INSERT INTO agents (id, name, label, role, status, kind, user_id, project_id, runner_id, last_seen_at, created_at)
+     VALUES (?, ?, ?, ?, 'active', 'agent', ?, ?, ?, ?, ?)`,
+  ).bind(agentId, name, label, b.role, conn.userId, run.projectId, run.runnerId, nowIso(), nowIso()).run();
+  const tokens = await issueTokens(c.env.DB, conn.clientId, conn.userId, agentId, 'mcp');
+  await c.env.DB.batch([
+    c.env.DB.prepare('UPDATE agents SET oauth_token_id = ? WHERE id = ?').bind(tokens.tokenId, agentId),
+    c.env.DB.prepare('UPDATE runs SET agent_id = ? WHERE id = ?').bind(agentId, runId),
+  ]);
+
+  return c.json({
+    agentId,
+    label,
+    projectId: run.projectId,
+    token: tokens.access_token,
+    expiresIn: tokens.expires_in,
+  });
 });
 
 // Steering-ack (RUN-7): the daemon reports it delivered a steer to the agent over

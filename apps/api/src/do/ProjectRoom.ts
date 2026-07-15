@@ -1195,9 +1195,35 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.env.DB.prepare(
         'UPDATE runs SET status = ?, agent_id = ?, exit = ?, worktree_path = ?, started_at = ?, updated_at = ? WHERE id = ?',
       ).bind(to, agentId, exitJson, worktreePath, startedAt, now, runId).run();
+      if (isTerminalRunStatus(to) && agentId) await this.retireRunAgent(agentId);
       await this.emit(actor, 'run.status_changed', 'run', runId, { from: run.status, to, reason: patch.reason ?? null });
       return this.runToWire(await this.loadRun(runId));
     });
+  }
+
+  /**
+   * A runner-spawned agent lives for exactly one run, so the run ending must end it (RUN-43).
+   *
+   * Its credential is bound to it and to nothing else, so leaving that token valid would let
+   * a dead run's identity keep acting — for the 7-day token TTL — with no process, no
+   * supervision, and no budget behind it. Revoking here is what makes "one run, one identity"
+   * true rather than aspirational, and it is the same lever RUN-35's kill switch needs.
+   *
+   * Copilots are untouched: a human's session is not owned by a run and must survive one.
+   */
+  private async retireRunAgent(agentId: string): Promise<void> {
+    const agent = await this.env.DB.prepare("SELECT id FROM agents WHERE id = ? AND kind = 'agent'")
+      .bind(agentId).first();
+    if (!agent) return; // a copilot (legacy runs report one) — not ours to retire
+    await this.env.DB.batch([
+      this.env.DB.prepare('UPDATE oauth_tokens SET revoked_at = ? WHERE agent_id = ? AND revoked_at IS NULL')
+        .bind(nowIso(), agentId),
+      this.env.DB.prepare("UPDATE agents SET status = 'offline' WHERE id = ?").bind(agentId),
+    ]);
+    // NOTE: a claim the agent still holds is left to the TTL reaper (alarm()), as before —
+    // it cannot release itself now that its token is dead. That is unchanged behaviour for a
+    // process that died mid-claim, but it is the reason RUN-30 (pause/resume) and the claim
+    // sweep matter more once identities are this short-lived.
   }
 
   /** On daemon reconnect, orphaned non-terminal Runs for that runner → failed{daemon_restart}. */

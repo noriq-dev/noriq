@@ -236,6 +236,12 @@ export interface ApiUser {
 export interface ApiAgent {
   id: string;
   name: string;
+  /** copilot = a human's Claude Code / Codex session. agent = spawned and owned by a runner
+   *  for exactly one run. Opposite lifecycles (RUN-43), so the roster must not show them
+   *  alike — a quiet copilot is a human who stepped away; a quiet agent is a runaway. */
+  kind: 'copilot' | 'agent';
+  /** The runner that owns it. Set iff kind='agent' — enforced by a CHECK (migration 0026). */
+  runnerId: string | null;
   role: string;
   status: string;
   lastSeenAt: string | null;

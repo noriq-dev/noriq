@@ -44,8 +44,14 @@ beforeAll(async () => {
   });
   pid = ((await p.json()) as { id: string }).id;
   for (const r of ['rnr_1', 'rnr_2', 'rnr_ev', 'rnr_recon', 'rnr_other']) await seedRunner(r);
-  // runs.agent_id is a real FK → agents(id); the spawned agent is a genuine actor.
-  await env.DB.prepare("INSERT OR IGNORE INTO agents (id, name, api_key_hash) VALUES ('agt_spawned', 'agt_spawned', 'x')").run();
+  // runs.agent_id is a real FK → agents(id); the spawned agent is a genuine actor. Since
+  // 0026 it is a genuinely distinct KIND of actor: runner-spawned, so it must carry both a
+  // runner and a project or the schema rejects the row outright. api_key_hash is gone (it
+  // was vestigial NOT NULL filler left over from the retired static-key era).
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO agents (id, name, kind, runner_id, project_id)
+     VALUES ('agt_spawned', 'agt_spawned', 'agent', 'rnr_1', ?)`,
+  ).bind(pid).run();
 }, 60000);
 
 describe('run lifecycle in ProjectRoom (RUN-6)', () => {
