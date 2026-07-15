@@ -132,7 +132,7 @@ export type RunnerCapabilities = z.infer<typeof RunnerCapabilities>;
 export const Runner = z.object({
   id: z.string(),
   projectId: z.string().nullable().default(null), // scoping project, if pinned; null = multi-project
-  label: z.string().min(1), // human label from machine config, e.g. "montana-laptop"
+  label: z.string().min(1), // human label from machine config, e.g. "my-laptop"
   status: RunnerStatus,
   capabilities: RunnerCapabilities,
   repos: z.array(RunnerRepo).default([]),

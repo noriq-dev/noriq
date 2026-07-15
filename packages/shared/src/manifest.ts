@@ -107,7 +107,7 @@ export type ProjectManifest = z.infer<typeof ProjectManifest>;
 // ---------------------------------------------------------------------------
 
 export const RunnerConfig = z.object({
-  label: z.string().min(1), // human name for this runner, e.g. "montana-laptop"
+  label: z.string().min(1), // human name for this runner, e.g. "my-laptop"
   server: z.string().url(), // the Noriq server this runner dials (control plane)
   scanRoots: z.array(z.string()).min(1), // dirs walked to discover .noriq/project.toml markers
   concurrency: z.number().int().positive().default(1), // → Runner.capabilities.maxConcurrency
