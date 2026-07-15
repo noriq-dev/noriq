@@ -76,6 +76,12 @@ export const Run = z.object({
   agentId: z.string().nullable().default(null),
   kind: RunKind,
   anchor: RunAnchor,
+  // VERIFY runs only: the BUILD run whose diff this one judges. The daemon branches the
+  // verifier's worktree from that run's branch — without it the verifier gets a pristine
+  // HEAD checkout, the `git diff` its prompt tells it to inspect is empty, and its verdict
+  // is about nothing. Distinct from `anchor`, which stays the TASK: that is where findings
+  // are posted, so a verify run needs both.
+  verifiesRunId: z.string().nullable().default(null),
   brief: z.string().default(''), // the dispatch intent; may be empty for anchored runs
   repoRef: z.string(), // id of a RunnerRepo advertised by the owning runner
   agentTool: AgentTool,

@@ -190,3 +190,86 @@ describe('run lifecycle in ProjectRoom (RUN-6)', () => {
     expect(after.exit!.reason).toBe('daemon_restart');
   });
 });
+
+describe('a verify run names the build it judges (verifiesRunId)', () => {
+  it('round-trips verifiesRunId through the DO onto the wire', async () => {
+    const build = await room(pid).createRun(pid, actor, {
+      kind: 'build', repoRef: 'repo_a', agentTool: 'claude',
+      anchor: { type: 'task', id: 'task_v' },
+    });
+    const verify = await room(pid).createRun(pid, actor, {
+      kind: 'verify', repoRef: 'repo_a', agentTool: 'claude',
+      anchor: { type: 'task', id: 'task_v' },
+      verifiesRunId: build.id,
+    });
+    // Without this the daemon branches the verifier from HEAD and its `git diff` is
+    // empty — it would review unchanged code and emit a verdict about nothing.
+    expect(verify.verifiesRunId).toBe(build.id);
+    // The task anchor SURVIVES alongside it: that is where findings get posted, so a
+    // verify run genuinely needs both.
+    expect(verify.anchor).toEqual({ type: 'task', taskId: 'task_v' });
+    expect((await room(pid).getRun(pid, verify.id)).verifiesRunId).toBe(build.id);
+  });
+
+  it('is null for scope/build runs even if supplied', async () => {
+    const build = await room(pid).createRun(pid, actor, {
+      kind: 'build', repoRef: 'repo_a', agentTool: 'claude', verifiesRunId: 'run_bogus',
+    });
+    expect(build.verifiesRunId).toBeNull(); // only a verifier judges another run
+  });
+
+  it('defaults to null', async () => {
+    const r = await room(pid).createRun(pid, actor, { kind: 'verify', repoRef: 'repo_a', agentTool: 'claude' });
+    expect(r.verifiesRunId).toBeNull();
+  });
+});
+
+describe('dispatch validates verifiesRunId (HTTP)', () => {
+  // The HTTP dispatch requires a runner OWNED by the caller whose advertised repos
+  // resolve to this project — seed one properly rather than reuse the bare rnr_* rows.
+  beforeAll(async () => {
+    const u = await env.DB.prepare('SELECT id FROM users WHERE email = ?')
+      .bind('run-owner@example.com').first<{ id: string }>();
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO runners (id, label, owner_user_id, repos, status)
+       VALUES ('rnr_owned', 'owned', ?, ?, 'online')`,
+    ).bind(u!.id, JSON.stringify([{ id: 'repo_a', projectId: pid }])).run();
+  });
+
+  const dispatch = (body: Record<string, unknown>) =>
+    SELF.fetch(`https://planar.test/api/projects/${pid}/runs`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+  it('rejects a verifiesRunId that names no run in this project', async () => {
+    // The daemon would otherwise branch a worktree from a ref that does not exist.
+    const res = await dispatch({
+      runnerId: 'rnr_owned', kind: 'verify', agentTool: 'claude', repoRef: 'repo_a',
+      verifiesRunId: 'run_nope',
+    });
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(await res.json())).toContain('does not name a run in this project');
+  });
+
+  it('rejects verifiesRunId on a non-verify run', async () => {
+    const build = await room(pid).createRun(pid, actor, { kind: 'build', repoRef: 'repo_a', agentTool: 'claude' });
+    const res = await dispatch({
+      runnerId: 'rnr_owned', kind: 'build', agentTool: 'claude', repoRef: 'repo_a',
+      verifiesRunId: build.id,
+    });
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(await res.json())).toContain('only valid for a verify run');
+  });
+
+  it('rejects verifying a run that produced no diff (scope)', async () => {
+    const scope = await room(pid).createRun(pid, actor, { kind: 'scope', repoRef: 'repo_a', agentTool: 'claude' });
+    const res = await dispatch({
+      runnerId: 'rnr_owned', kind: 'verify', agentTool: 'claude', repoRef: 'repo_a',
+      verifiesRunId: scope.id,
+    });
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(await res.json())).toContain('only a build run produces a diff');
+  });
+});

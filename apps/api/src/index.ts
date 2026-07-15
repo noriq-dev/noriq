@@ -992,6 +992,9 @@ const DispatchBody = z.object({
     z.object({ type: z.literal('task'), id: z.string() }),
     z.object({ type: z.literal('plan'), id: z.string() }),
   ]).nullish(),
+  // VERIFY only: the build run whose diff to judge. The daemon branches the verifier's
+  // worktree from that run's branch — without it the verifier reviews a pristine HEAD.
+  verifiesRunId: z.string().nullish(),
   budget: RunBudget.optional(),
 });
 
@@ -1012,9 +1015,20 @@ app.post('/api/projects/:pid/runs', userAuth, async (c) => {
   if (!repo) return c.json({ error: 'unknown repoRef for this runner' }, 400);
   if (repo.projectId !== pid) return c.json({ error: 'repo does not resolve to this project' }, 400);
 
+  // A verify run must judge a real build in THIS project — otherwise the daemon would
+  // branch its worktree from a ref that doesn't exist (or, worse, another tenant's).
+  if (b.verifiesRunId) {
+    if (b.kind !== 'verify') return c.json({ error: 'verifiesRunId is only valid for a verify run' }, 400);
+    const target = await c.env.DB.prepare('SELECT kind FROM runs WHERE id = ? AND project_id = ?')
+      .bind(b.verifiesRunId, pid).first<{ kind: string }>();
+    if (!target) return c.json({ error: 'verifiesRunId does not name a run in this project' }, 400);
+    if (target.kind !== 'build') return c.json({ error: 'only a build run produces a diff to verify' }, 400);
+  }
+
   const run = await room(c.env, pid).createRun(pid, humanActor(c), {
     kind: b.kind, agentTool: b.agentTool, repoRef: b.repoRef, brief: b.brief,
     anchor: b.anchor ? { type: b.anchor.type, id: b.anchor.id } : null,
+    verifiesRunId: b.verifiesRunId ?? null,
     budget: b.budget, runnerId: b.runnerId,
   });
   const { delivered } = await hub(c.env, b.runnerId).deliver(JSON.stringify({ type: 'run.assigned', run }));

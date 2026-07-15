@@ -73,6 +73,8 @@ const CLAIMABLE_STATUSES = ['todo', 'claimed'];
 export interface CreateRunInput {
   kind: string; // RunKind: scope|build|verify
   anchor?: { type: 'task' | 'plan'; id: string } | null;
+  /** VERIFY only: the build run whose diff this one judges (ignored for other kinds). */
+  verifiesRunId?: string | null;
   brief?: string;
   repoRef: string;
   agentTool: string; // AgentTool: claude|codex
@@ -93,7 +95,7 @@ export interface RunPatch {
 
 type RunRow = {
   id: string; project_id: string; runner_id: string | null; agent_id: string | null;
-  kind: string; anchor_type: string | null; anchor_id: string | null; brief: string;
+  kind: string; anchor_type: string | null; anchor_id: string | null; verifies_run_id: string | null; brief: string;
   repo_ref: string; agent_tool: string; budget: string; status: string; exit: string | null;
   worktree_path: string | null;
   tokens_used: number | null; usd_spent: number | null; log_tail: string | null;
@@ -110,6 +112,8 @@ export interface RunView {
   agentId: string | null;
   kind: string;
   anchor: { type: 'task'; taskId: string } | { type: 'plan'; planId: string } | null;
+  /** VERIFY only: the build run whose diff this one judges. */
+  verifiesRunId: string | null;
   brief: string;
   repoRef: string;
   agentTool: string;
@@ -1088,6 +1092,9 @@ export class ProjectRoom extends DurableObject<Env> {
         r.anchor_type === 'task' ? { type: 'task', taskId: r.anchor_id! }
         : r.anchor_type === 'plan' ? { type: 'plan', planId: r.anchor_id! }
         : null,
+      // VERIFY only: the build run this one judges — the daemon branches its worktree
+      // from that run, so the diff under review is actually present.
+      verifiesRunId: r.verifies_run_id,
       brief: r.brief,
       repoRef: r.repo_ref,
       agentTool: r.agent_tool,
@@ -1126,12 +1133,16 @@ export class ProjectRoom extends DurableObject<Env> {
       const anchorId = input.anchor?.id ?? null;
       const runnerId = input.runnerId ?? null;
       const status = runnerId ? 'dispatched' : 'queued';
+      // Only a verify run judges another run; carrying it elsewhere would be meaningless.
+      const verifiesRunId = input.kind === 'verify' ? (input.verifiesRunId ?? null) : null;
       await this.env.DB.prepare(
-        `INSERT INTO runs (id, project_id, runner_id, kind, anchor_type, anchor_id, brief, repo_ref,
-                           agent_tool, budget, status, created_by, created_at, updated_at, dispatched_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO runs (id, project_id, runner_id, kind, anchor_type, anchor_id, verifies_run_id,
+                           brief, repo_ref, agent_tool, budget, status, created_by, created_at,
+                           updated_at, dispatched_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(
-        id, projectId, runnerId, input.kind, anchorType, anchorId, input.brief ?? '', input.repoRef,
+        id, projectId, runnerId, input.kind, anchorType, anchorId, verifiesRunId,
+        input.brief ?? '', input.repoRef,
         input.agentTool, JSON.stringify(input.budget ?? {}), status, input.createdBy ?? actor.id, now, now,
         runnerId ? now : null,
       ).run();
