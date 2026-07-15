@@ -70,6 +70,11 @@ body {
 a { color: var(--accent-ink); }
 a:hover { filter: brightness(1.15); }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
+/* Styling ::-webkit-scrollbar suppresses the native track/corner rendering, and the
+   fallback for both is opaque white. Keep them transparent so the scroll container's
+   own background shows through in either theme. */
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-corner { background: transparent; }
 ::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.1);
   border-radius: 6px;
