@@ -55,6 +55,36 @@ export const VerifySpec = z.object({
 });
 export type VerifySpec = z.infer<typeof VerifySpec>;
 
+/**
+ * Where a passing build's diff goes, and whether the daemon puts it there itself.
+ *
+ * The point is to stop charging a human per run. A build that clears the gate is rebased
+ * onto `branch`, RE-VERIFIED there, then fast-forwarded in — and its worktree + throwaway
+ * branch are reaped. Work accumulates on one integration branch that a human merges
+ * onward into main/protected branches on their own schedule, reviewing a batch instead of
+ * clicking through every run.
+ *
+ * Verify runs AFTER the rebase, not before: two runs can each be green at their own fork
+ * point and broken together, and a gate that never sees the combination cannot catch it.
+ *
+ * SECURITY: the daemon merges LOCALLY and still never pushes — agent output reaches the
+ * operator's disk and nowhere else, so `git push` remains the human boundary. Pointing
+ * `branch` at something push-triggered or auto-deploying hands agents production; that is
+ * an explicit choice, never a default. Omit this section and nothing auto-lands.
+ */
+export const LandPolicy = z.object({
+  // The integration branch; created from defaultBranch if it doesn't exist. NO default,
+  // on purpose: auto-landing is opt-in per repo and must never silently choose `main`.
+  branch: z.string().min(1),
+  // Land only if the deterministic verify passes on the REBASED result. Off means an
+  // unverified diff reaches `branch` — permitted, never assumed.
+  onlyWhenVerifyPasses: z.boolean().default(true),
+  // Let the build agent resolve a rebase conflict in its own worktree, under the same
+  // permission floor, when the conflict is mechanical. Structural ones still fail out.
+  resolveConflicts: z.boolean().default(true),
+});
+export type LandPolicy = z.infer<typeof LandPolicy>;
+
 // A committed KEY must satisfy the same shape as Project.key (short prefix).
 export const ProjectKey = z.string().min(1).max(8);
 
@@ -66,6 +96,8 @@ export const ProjectManifest = z.object({
   verify: VerifySpec.nullable().default(null),
   tool: AgentTool.nullable().default(null), // default driver for this repo; null = runner default
   defaultBranch: z.string().nullable().default(null),
+  // null = no auto-landing; every run's diff waits on its own branch for a human.
+  land: LandPolicy.nullable().default(null),
   permissions: KindPermissions.default(defaultPermissions),
 });
 export type ProjectManifest = z.infer<typeof ProjectManifest>;
