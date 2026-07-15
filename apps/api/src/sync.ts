@@ -48,29 +48,39 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
   ).bind(agent.id).all<{ id: string; key: string; title: string; status: string; claimExpiresAt: string | null }>();
   for (const t of heldRows.results) heldTaskIds.add(t.id);
 
-  // Dependency-unblocked, unclaimed tasks across active projects. Computed up front so
-  // the "new task available" notice (PLNR-90) can confirm a freshly-created task is
-  // actually claimable right now (not gated behind unfinished dependencies).
+  // The agent's LOCAL project (set when it scopes via set_agent_identity or its first
+  // claim). my_updates is scoped to it so an agent working one project doesn't see
+  // other projects' claimable tasks / questions / broadcasts (PLNR-142) — even ones the
+  // same user owns. NULL for a not-yet-localized agent → fall back to the user-wide view
+  // (via `?2 IS NULL`) so a fresh agent can still discover work to pick up.
+  const agentProjectId = (
+    await env.DB.prepare('SELECT project_id AS pid FROM agents WHERE id = ?').bind(agent.id).first<{ pid: string | null }>()
+  )?.pid ?? null;
+
+  // Dependency-unblocked, unclaimed tasks in the agent's project (user-wide if it has
+  // none yet). Computed up front so the "new task available" notice (PLNR-90) can
+  // confirm a freshly-created task is actually claimable now (not dependency-gated).
   const claimable = (
     await env.DB.prepare(
       `SELECT t.id, t.key, t.title, t.project_id AS projectId, t.priority
        FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
        WHERE t.status = 'todo' AND t.claimed_by IS NULL
          AND ${USER_PROJECT_WHERE}
+         AND (?2 IS NULL OR t.project_id = ?2)
          AND NOT EXISTS (
            SELECT 1 FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id
            WHERE d.task_id = t.id AND dt.status NOT IN ('done','cancelled'))
          AND ${TASK_NOT_IN_PROPOSED_PLAN}
        ORDER BY t.priority DESC, t."order" LIMIT 20`,
-    ).bind(agent.userId).all<AgentUpdates['claimable'][number]>()
+    ).bind(agent.userId, agentProjectId).all<AgentUpdates['claimable'][number]>()
   ).results;
   const claimableIds = new Set(claimable.map((t) => t.id));
 
   // Projects the agent's USER can reach — scopes broadcast messages/notices so an
   // agent never hears cross-tenant chatter (PLNR-96).
   const accessibleProjectIds = new Set(
-    (await env.DB.prepare(`SELECT p.id FROM projects p WHERE ${USER_PROJECT_WHERE}`)
-      .bind(agent.userId).all<{ id: string }>()).results.map((r) => r.id),
+    (await env.DB.prepare(`SELECT p.id FROM projects p WHERE ${USER_PROJECT_WHERE} AND (?2 IS NULL OR p.id = ?2)`)
+      .bind(agent.userId, agentProjectId).all<{ id: string }>()).results.map((r) => r.id),
   );
 
   // Steers already delivered to this agent over the runtime channel (RUN-7): skip
@@ -128,8 +138,9 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
        FROM comments c JOIN tasks t ON t.id = c.task_id JOIN projects p ON p.id = t.project_id
        WHERE t.claimed_by IS NULL AND c.status IN ('open','acknowledged') AND c.author_kind != 'agent'
          AND ${USER_PROJECT_WHERE}
+         AND (?2 IS NULL OR t.project_id = ?2)
        ORDER BY c.created_at LIMIT 10`,
-    ).bind(agent.userId).all<AgentUpdates['unassignedComments'][number]>()
+    ).bind(agent.userId, agentProjectId).all<AgentUpdates['unassignedComments'][number]>()
   ).results;
 
   // Recent direct/broadcast messages (last 10, regardless of cursor, for context).
@@ -137,9 +148,9 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
     await env.DB.prepare(
       `SELECT m.id, m.from_name AS "from", m.body, m.ref_task_id AS refTaskId, m.created_at AS createdAt
        FROM messages m JOIN projects p ON p.id = m.project_id
-       WHERE (m.to_agent_id = ?2 OR (m.to_agent_id IS NULL AND ${USER_PROJECT_WHERE})) AND m.from_id != ?2
+       WHERE (m.to_agent_id = ?2 OR (m.to_agent_id IS NULL AND ${USER_PROJECT_WHERE} AND (?3 IS NULL OR m.project_id = ?3))) AND m.from_id != ?2
        ORDER BY m.created_at DESC LIMIT 10`,
-    ).bind(agent.userId, agent.id).all<AgentUpdates['messages'][number]>()
+    ).bind(agent.userId, agent.id, agentProjectId).all<AgentUpdates['messages'][number]>()
   ).results;
 
   // Input requests this agent is still waiting on (so it doesn't re-ask or forget).
