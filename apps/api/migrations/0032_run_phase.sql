@@ -1,0 +1,22 @@
+-- RUN-31: what a `running` Run is actually DOING.
+--
+-- The dashboard showed "running" for the 60–90s after the agent process exited, while the
+-- deterministic verify (and then rebase → re-verify → fast-forward) ran. Token/USD stop
+-- moving there, so a gate doing its job reads as a hung agent.
+--
+-- WHY A SECOND COLUMN AND NOT A WIDER `status` CHECK
+--
+-- The obvious move is to add 'verifying' to runs.status. It is the wrong one, and not merely
+-- because widening a CHECK means rebuilding the table (it does — and the repo forbids that).
+-- `verifying` is a sub-phase of running, not a peer of `done`: the Run holds its slot, is
+-- cancellable, and is not terminal throughout. Every liveness query we have asks
+-- `status IN ('dispatched','running','blocked')` — the daemon reconciler, owed-merges,
+-- request_input parking. A new status value silently falls out of all of them, so the
+-- reconciler would decide the daemon lost a Run that is merely mid-gate and fail it.
+--
+-- A phase cannot cause that: nothing branches on it. It is a label a human reads, and the
+-- server clears it on terminal (see ProjectRoom.transitionRun).
+--
+-- Additive, per apps/api/CLAUDE.md. D1 accepts a CHECK on ADD COLUMN (verified against prod
+-- schema, not assumed — the sibling constraint in 0026 relies on the same fact).
+ALTER TABLE runs ADD COLUMN phase TEXT CHECK (phase IN ('agent', 'verifying', 'landing'));

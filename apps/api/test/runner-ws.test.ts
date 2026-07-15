@@ -27,6 +27,24 @@ async function waitRunStatus(runId: string, want: string, tries = 40) {
   throw new Error(`run ${runId} never reached ${want}`);
 }
 
+type RunRowPeek = {
+  status: string; phase: string | null;
+  tokens_used: number | null; usd_spent: number | null; log_tail: string | null;
+};
+/** Poll the run row until `want` holds. WS frames are fire-and-forget into an async DO RPC,
+ *  so there is no reply to await — the row is the only observable. */
+async function pollRun(runId: string, want: (r: RunRowPeek) => boolean, tries = 40): Promise<RunRowPeek> {
+  let last: RunRowPeek | null = null;
+  for (let i = 0; i < tries; i++) {
+    last = await env.DB.prepare(
+      'SELECT status, phase, tokens_used, usd_spent, log_tail FROM runs WHERE id = ?',
+    ).bind(runId).first<RunRowPeek>();
+    if (last && want(last)) return last;
+    await sleep(25);
+  }
+  throw new Error(`run ${runId} never matched — last: ${JSON.stringify(last)}`);
+}
+
 describe('runner WS channel + dispatch (RUN-7)', () => {
   let token: string;
   let cookie: string;
@@ -184,6 +202,43 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
     expect(mine!.tokensUsed).toBe(8100);
     expect(mine!.usdSpent).toBeCloseTo(0.42);
     expect(mine!.logTail).toContain('ok');
+    ws.close();
+  });
+
+  it('carries the run phase (RUN-31) without disturbing the spend, and clears it on terminal', async () => {
+    const res = await wsConnect(runnerId, { Authorization: `Bearer ${token}` });
+    const ws = res.webSocket!;
+    ws.accept();
+    ws.send(JSON.stringify({ type: 'hello', protocol: 1, label: 'ws-daemon' }));
+    await nextFrame(ws, (m) => m.type === 'registered');
+
+    const disp = await (await SELF.fetch(`https://planar.test/api/projects/${pid}/runs`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runnerId, kind: 'build', agentTool: 'claude', repoRef: 'repo_x', brief: 'phase' }),
+    })).json() as { run: { id: string } };
+    const runId = disp.run.id;
+
+    ws.send(JSON.stringify({ type: 'run.status', runId, status: 'running', at: new Date(0).toISOString() }));
+    await waitRunStatus(runId, 'running');
+    // A spend tick, then a PHASE-ONLY tick — which is what entering the verify gate looks like:
+    // the agent process is gone, so there is no new spend to report.
+    ws.send(JSON.stringify({ type: 'run.telemetry', runId, tokensUsed: 5000, usdSpent: 0.25, logTail: 'built', at: new Date().toISOString() }));
+    await pollRun(runId, (r) => r.tokens_used === 5000);
+    ws.send(JSON.stringify({ type: 'run.telemetry', runId, phase: 'verifying', at: new Date().toISOString() }));
+    const gated = await pollRun(runId, (r) => r.phase === 'verifying');
+
+    // The whole point of COALESCE: a tick that says nothing about spend must not erase it.
+    // Binding null directly here would blank the dashboard the moment the gate started.
+    expect(gated.tokens_used).toBe(5000);
+    expect(gated.usd_spent).toBeCloseTo(0.25);
+    expect(gated.log_tail).toBe('built');
+    expect(gated.status).toBe('running'); // a phase is not a status — liveness queries still match
+
+    // Terminal ends the phase. The daemon cannot do this itself (its nulls mean "no news"),
+    // so the DO — the thing that actually knows the run is over — has to.
+    ws.send(JSON.stringify({ type: 'run.status', runId, status: 'done', at: new Date().toISOString() }));
+    const finished = await pollRun(runId, (r) => r.status === 'done');
+    expect(finished.phase).toBeNull(); // a done run that still reads "verifying" is worse than silent
     ws.close();
   });
 });

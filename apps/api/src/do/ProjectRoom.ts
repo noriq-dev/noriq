@@ -3,7 +3,7 @@ import type { Env } from '../env';
 import { newId, nowIso } from '../lib/util';
 import { userCanAccessProject } from '../lib/visibility';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
-import { RunKind, AgentTool, RunStatus, isTerminalRunStatus } from '@noriq-dev/shared';
+import { RunKind, AgentTool, RunStatus, type RunPhase, isTerminalRunStatus } from '@noriq-dev/shared';
 
 /**
  * ProjectRoom — one instance per project (idFromName(projectId)).
@@ -94,6 +94,7 @@ export interface RunPatch {
   agentId?: string | null; // set once the spawned agent registers its own actor
   exit?: Record<string, unknown> | null; // terminal detail; synthesized if omitted
   worktreePath?: string | null; // daemon-side checkout path, for server-side visibility
+  phase?: RunPhase | null; // sub-state of running (RUN-31); forced to null on terminal
   reason?: string | null;
 }
 
@@ -101,7 +102,8 @@ type RunRow = {
   id: string; project_id: string; runner_id: string | null; agent_id: string | null;
   kind: string; anchor_type: string | null; anchor_id: string | null; verifies_run_id: string | null;
   plan_id: string | null; plan_key: string | null; target_branch: string | null; brief: string;
-  repo_ref: string; agent_tool: string; budget: string; status: string; exit: string | null;
+  repo_ref: string; agent_tool: string; budget: string; status: string; phase: string | null;
+  exit: string | null;
   worktree_path: string | null;
   tokens_used: number | null; usd_spent: number | null; log_tail: string | null;
   created_by: string; created_at: string; updated_at: string;
@@ -128,6 +130,8 @@ export interface RunView {
   agentTool: string;
   budget: Record<string, unknown>;
   status: string;
+  /** Sub-state of `running` (RUN-31): what it is doing. Null when queued or terminal. */
+  phase: RunPhase | null;
   exit: Record<string, unknown> | null;
   worktreePath: string | null;
   // Live telemetry (RUN-22): last-writer-wins spend + log tail from the daemon.
@@ -1122,6 +1126,10 @@ export class ProjectRoom extends DurableObject<Env> {
       agentTool: r.agent_tool,
       budget: JSON.parse(r.budget || '{}'),
       status: r.status,
+      // Sub-state of running (RUN-31): 'verifying'/'landing' are the ~60–90s in which the
+      // dashboard used to show a blanket "running" with the spend frozen — a gate at work
+      // is indistinguishable from a hung agent unless it says so.
+      phase: r.phase as RunPhase | null,
       exit: r.exit ? JSON.parse(r.exit) : null,
       worktreePath: r.worktree_path,
       tokensUsed: r.tokens_used,
@@ -1316,9 +1324,15 @@ export class ProjectRoom extends DurableObject<Env> {
           ...(patch.exit ?? {}),
         });
       }
+      // Phase is a sub-state of `running` (RUN-31), so terminality ends it — a done Run that
+      // still reads "verifying" is worse than one that reads nothing. This is the only place
+      // it can be cleared: telemetry ticks COALESCE, so the daemon can set a phase but never
+      // unset one, and the DO is what actually knows the Run is over.
+      const phase = isTerminalRunStatus(to) ? null : (patch.phase ?? run.phase);
       await this.env.DB.prepare(
-        'UPDATE runs SET status = ?, agent_id = ?, exit = ?, worktree_path = ?, started_at = ?, updated_at = ? WHERE id = ?',
-      ).bind(to, agentId, exitJson, worktreePath, startedAt, now, runId).run();
+        `UPDATE runs SET status = ?, agent_id = ?, exit = ?, worktree_path = ?, phase = ?,
+                started_at = ?, updated_at = ? WHERE id = ?`,
+      ).bind(to, agentId, exitJson, worktreePath, phase, startedAt, now, runId).run();
       if (isTerminalRunStatus(to) && agentId) await this.retireRunAgent(agentId);
       await this.emit(actor, 'run.status_changed', 'run', runId, { from: run.status, to, reason: patch.reason ?? null });
       return this.runToWire(await this.loadRun(runId));
@@ -1397,12 +1411,19 @@ export class ProjectRoom extends DurableObject<Env> {
   async recordRunTelemetry(
     projectId: string,
     runId: string,
-    t: { tokensUsed?: number | null; usdSpent?: number | null; logTail?: string | null },
+    t: { tokensUsed?: number | null; usdSpent?: number | null; logTail?: string | null; phase?: RunPhase | null },
   ): Promise<void> {
     await this.setPid(projectId);
+    // COALESCE, not a plain bind: null on this frame means "no news", never "set it back to
+    // nothing". Ticks are partial by nature — the verify phase knows the phase but has no
+    // spend to report, and a spend tick mid-run carries no log tail. Binding null directly
+    // (as this did) let each such tick wipe the fields it happened not to carry, which is
+    // how the live log tail could blank itself between two token updates.
     await this.env.DB.prepare(
-      'UPDATE runs SET tokens_used = ?, usd_spent = ?, log_tail = ? WHERE id = ? AND project_id = ?',
-    ).bind(t.tokensUsed ?? null, t.usdSpent ?? null, t.logTail ?? null, runId, projectId).run();
+      `UPDATE runs SET tokens_used = COALESCE(?, tokens_used), usd_spent = COALESCE(?, usd_spent),
+              log_tail = COALESCE(?, log_tail), phase = COALESCE(?, phase)
+        WHERE id = ? AND project_id = ?`,
+    ).bind(t.tokensUsed ?? null, t.usdSpent ?? null, t.logTail ?? null, t.phase ?? null, runId, projectId).run();
   }
 
   /**

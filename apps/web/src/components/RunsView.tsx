@@ -33,6 +33,17 @@ const STATUS_STYLE: Record<RunStatus, { color: string; bg: string; live?: boolea
 const TERMINAL: RunStatus[] = ['done', 'failed', 'cancelled'];
 const KINDS: Array<ApiRun['kind']> = ['scope', 'build', 'verify'];
 
+/**
+ * What the pill says (RUN-31). A running Run spends its last 60–90s in the verify gate and then
+ * the landing rebase — agent process already gone, spend frozen — so a blanket "running" made a
+ * gate doing its job read as a hung agent.
+ *
+ * This replaces the WORD, not the status: it stays styled live because it genuinely is live.
+ * 'agent' gets no special label — "running" already means that to a reader.
+ */
+const runLabel = (run: ApiRun): string =>
+  run.status === 'running' && run.phase && run.phase !== 'agent' ? run.phase : run.status;
+
 function fmtBudget(b: ApiRun['budget']): string {
   const parts: string[] = [];
   if (b.maxTokens) parts.push(`${(b.maxTokens / 1000).toLocaleString()}k tok`);
@@ -245,7 +256,7 @@ function RunRow({ run, runner, onCancel }: { run: ApiRun; runner: ApiRunner | nu
         }}
       >
         {st.live && <LiveDot color={st.color} size={5} />}
-        {run.status}
+        {runLabel(run)}
       </span>
 
       <div style={{ minWidth: 0, flex: 1 }}>

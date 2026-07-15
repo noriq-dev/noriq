@@ -196,6 +196,8 @@ export interface ApiRunExit {
   finishedAt: string;
 }
 export type RunStatus = 'queued' | 'dispatched' | 'running' | 'blocked' | 'done' | 'failed' | 'cancelled';
+/** Sub-state of `running` (RUN-31), never a RunStatus value — see shared/runner.ts for why. */
+export type RunPhase = 'agent' | 'verifying' | 'landing';
 export interface ApiRun {
   id: string;
   projectId: string;
@@ -208,6 +210,8 @@ export interface ApiRun {
   agentTool: string;
   budget: Partial<ApiRunBudget>;
   status: RunStatus;
+  /** What a `running` run is doing right now (RUN-31). Null when queued or terminal. */
+  phase: RunPhase | null;
   exit: ApiRunExit | null;
   worktreePath: string | null;
   // Live telemetry (RUN-22): last-writer-wins spend + log tail from the daemon.

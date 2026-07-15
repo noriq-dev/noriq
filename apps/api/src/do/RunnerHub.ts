@@ -102,8 +102,8 @@ export class RunnerHub extends DurableObject<Env> {
       }
 
       case 'run.telemetry': {
-        // Non-transitional spend/log-tail tick (RUN-22). Persist on the run row via
-        // the owning project's authority; the runner may only report its OWN runs.
+        // Non-transitional spend/log-tail/phase tick (RUN-22, RUN-31). Persist on the run row
+        // via the owning project's authority; the runner may only report its OWN runs.
         const row = await this.env.DB.prepare('SELECT project_id AS pid, runner_id AS rid FROM runs WHERE id = ?')
           .bind(msg.runId).first<{ pid: string; rid: string | null }>();
         if (!row || row.rid !== runnerId) return;
@@ -112,6 +112,7 @@ export class RunnerHub extends DurableObject<Env> {
             tokensUsed: msg.tokensUsed,
             usdSpent: msg.usdSpent,
             logTail: msg.logTail,
+            phase: msg.phase,
           });
         } catch { /* best-effort telemetry — never fatal */ }
         return;
