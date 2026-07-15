@@ -344,6 +344,7 @@ function DispatchForm({
   const [agentTool, setAgentTool] = useState(tools[0] ?? '');
   const [brief, setBrief] = useState('');
   const [anchorTask, setAnchorTask] = useState(''); // '' = no anchor
+  const [targetBranch, setTargetBranch] = useState(''); // '' = the repo's own choice (RUN-41)
   const [maxUsd, setMaxUsd] = useState('');
   const [maxTokens, setMaxTokens] = useState('');
   const [maxMinutes, setMaxMinutes] = useState('');
@@ -368,6 +369,8 @@ function DispatchForm({
       repoRef,
       brief: brief.trim(),
       anchor: anchorTask ? { type: 'task', id: anchorTask } : null,
+      // Empty = don't override. Sending '' would be an override to a branch named "".
+      targetBranch: targetBranch.trim() || null,
       budget: { maxUsd: num(maxUsd), maxTokens: num(maxTokens), maxDurationSeconds: maxMinutes.trim() ? (num(maxMinutes) ?? 0) * 60 : null },
     };
     setBusy(true);
@@ -390,6 +393,18 @@ function DispatchForm({
               <option key={r.id} value={r.id}>{r.name || r.projectKey}{r.defaultBranch ? ` (${r.defaultBranch})` : ''}</option>
             ))}
           </Select>
+        </Field>
+        <Field label="branch (optional)">
+          {/* Blank = wherever the repo lands runs by default — its working branch, or the
+              per-plan one (RUN-28). Naming something else only works if the repo opted in via
+              [land].allowedBranches; the daemon refuses otherwise rather than quietly using the
+              default, since silently landing an agent's diff somewhere nobody asked for is how it
+              ends up somewhere nobody looks. */}
+          <TextInput
+            value={targetBranch}
+            onChange={(e: React.ChangeEvent<HTMLInputElement>) => setTargetBranch(e.target.value)}
+            placeholder="repo default"
+          />
         </Field>
         <Field label="kind">
           <Select value={kind} onChange={(e) => setKind(e.target.value as ApiRun['kind'])}>

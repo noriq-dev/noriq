@@ -227,6 +227,10 @@ export interface DispatchInput {
   repoRef: string;
   brief?: string;
   anchor?: { type: 'task'; id: string } | { type: 'plan'; id: string } | null;
+  /** Land this run somewhere other than the repo's usual branch (RUN-41). Whether that is allowed
+   *  at all is the REPO's call — [land].allowedBranches, checked by the daemon, which is the only
+   *  side that can see the committed manifest. Empty/omitted = the repo's own choice. */
+  targetBranch?: string | null;
   budget?: Partial<ApiRunBudget>;
 }
 

@@ -75,6 +75,10 @@ export interface CreateRunInput {
   anchor?: { type: 'task' | 'plan'; id: string } | null;
   /** VERIFY only: the build run whose diff this one judges (ignored for other kinds). */
   verifiesRunId?: string | null;
+  /** Land somewhere other than the repo's computed branch (RUN-41). The REPO decides whether that
+   *  is permitted — checked daemon-side against [land].allowedBranches, since the manifest is
+   *  committed in the repo and invisible here. */
+  targetBranch?: string | null;
   brief?: string;
   repoRef: string;
   agentTool: string; // AgentTool: claude|codex
@@ -96,7 +100,7 @@ export interface RunPatch {
 type RunRow = {
   id: string; project_id: string; runner_id: string | null; agent_id: string | null;
   kind: string; anchor_type: string | null; anchor_id: string | null; verifies_run_id: string | null;
-  plan_id: string | null; plan_key: string | null; brief: string;
+  plan_id: string | null; plan_key: string | null; target_branch: string | null; brief: string;
   repo_ref: string; agent_tool: string; budget: string; status: string; exit: string | null;
   worktree_path: string | null;
   tokens_used: number | null; usd_spent: number | null; log_tail: string | null;
@@ -117,6 +121,8 @@ export interface RunView {
   verifiesRunId: string | null;
   /** The plan this run serves (RUN-28) — drives the per-plan working branch. Null = one-off. */
   planKey: string | null;
+  /** A per-dispatch landing branch (RUN-41). Null = the repo's computed one. */
+  targetBranch: string | null;
   brief: string;
   repoRef: string;
   agentTool: string;
@@ -1110,6 +1116,7 @@ export class ProjectRoom extends DurableObject<Env> {
       verifiesRunId: r.verifies_run_id,
       // The plan this run serves (RUN-28) — the daemon uses it for the per-plan working branch.
       planKey: r.plan_key,
+      targetBranch: r.target_branch,
       brief: r.brief,
       repoRef: r.repo_ref,
       agentTool: r.agent_tool,
@@ -1158,12 +1165,12 @@ export class ProjectRoom extends DurableObject<Env> {
       const plan = await this.resolveRunPlan(anchorType, anchorId);
       await this.env.DB.prepare(
         `INSERT INTO runs (id, project_id, runner_id, kind, anchor_type, anchor_id, verifies_run_id,
-                           plan_id, plan_key, brief, repo_ref, agent_tool, budget, status, created_by,
-                           created_at, updated_at, dispatched_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                           plan_id, plan_key, target_branch, brief, repo_ref, agent_tool, budget, status,
+                           created_by, created_at, updated_at, dispatched_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(
         id, projectId, runnerId, input.kind, anchorType, anchorId, verifiesRunId,
-        plan?.id ?? null, plan ? this.planKey(plan) : null,
+        plan?.id ?? null, plan ? this.planKey(plan) : null, input.targetBranch ?? null,
         input.brief ?? '', input.repoRef,
         input.agentTool, JSON.stringify(input.budget ?? {}), status, input.createdBy ?? actor.id, now, now,
         runnerId ? now : null,

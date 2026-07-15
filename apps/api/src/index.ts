@@ -1166,6 +1166,15 @@ const DispatchBody = z.object({
   agentTool: AgentTool,
   repoRef: z.string(), // must be one of the runner's advertised repos, resolving to this project
   brief: z.string().default(''),
+  // Land this run somewhere other than the repo's computed branch (RUN-41). The REPO decides
+  // whether that is allowed at all — the daemon checks it against [land].allowedBranches, which
+  // the server cannot see (the manifest is committed in the repo, not here). Validated for shape
+  // only: a syntactically impossible branch name is worth rejecting at the door rather than
+  // spending an agent's tokens to fail at the very end.
+  targetBranch: z.string().min(1).max(200).regex(
+    /^(?!\/|.*\/\/|.*\.\.|.*@\{|.*[\x00-\x20~^:?*[\\])(?!.*\.lock(\/|$)).+(?<!\/|\.)$/,
+    'not a valid git branch name',
+  ).nullish(),
   anchor: z.discriminatedUnion('type', [
     z.object({ type: z.literal('task'), id: z.string() }),
     z.object({ type: z.literal('plan'), id: z.string() }),
@@ -1207,6 +1216,7 @@ app.post('/api/projects/:pid/runs', userAuth, async (c) => {
     kind: b.kind, agentTool: b.agentTool, repoRef: b.repoRef, brief: b.brief,
     anchor: b.anchor ? { type: b.anchor.type, id: b.anchor.id } : null,
     verifiesRunId: b.verifiesRunId ?? null,
+    targetBranch: b.targetBranch ?? null,
     budget: b.budget, runnerId: b.runnerId,
   });
   const { delivered } = await hub(c.env, b.runnerId).deliver(JSON.stringify({ type: 'run.assigned', run }));
