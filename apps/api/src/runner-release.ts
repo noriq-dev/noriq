@@ -1,31 +1,64 @@
 /**
  * The runner release this Noriq instance considers current (RUN-36).
  *
- * ## Why the server, and not git or npm
+ * ## Where the number comes from: the repo
  *
- * The task weighed four homes for this number. Three of them do not work *today*:
+ * `https://raw.githubusercontent.com/noriq-dev/runner/main/package.json`.
  *
- *  - **A committed version.json via raw.githubusercontent** — the runner repo is private
- *    (RUN-39 is deferred, so there is no LICENSE yet and it cannot go public), so a raw fetch
- *    needs a token. "Curl-able" and "bring your own GitHub credential" are not the same thing.
- *  - **Git tags / the Releases API** — same privacy problem, and nothing cuts tags yet.
- *  - **The npm registry** — canonical *once published*, and `npx @noriq-dev/runner` is the
- *    documented install path, so this is where it should end up. Nothing is published yet.
+ * Not a dedicated version.json, deliberately: package.json is ALREADY the single source of
+ * truth (RUN-36 made the build inject from it, killing the hand-typed literal that could lie).
+ * A second file would be a second thing to bump — and the failure mode of forgetting is a
+ * version feed that disagrees with the thing it describes, which is the exact class of bug
+ * RUN-36 existed to remove. One file, one number.
  *
- * The server works now, needs no new trust root (the daemon already holds an authenticated
- * channel to it, and this route is public so a human can curl it), and has no third-party rate
- * limit. RUN-37 (auto-update) can consume it immediately.
+ * This endpoint proxies rather than the daemon fetching GitHub directly, which buys three
+ * things: the daemon keeps one trust root (the server it already authenticates to) instead of
+ * gaining github.com; the answer is cached here rather than hammering raw.githubusercontent from
+ * every runner on every interval; and `curl <noriq>/api/runner/latest` stays the one place a
+ * human or a script asks, whatever we point it at next.
  *
- * ## The cost, stated plainly
+ * It also removes the cost this file used to carry: the version was a CONSTANT, so publishing a
+ * runner meant editing it and redeploying the Worker, and a stale constant told every runner it
+ * was current when it wasn't. That coupling is gone — cutting a release is now a commit to the
+ * runner repo.
  *
- * It couples runner releases to server deploys: publishing a runner means editing this constant
- * and redeploying the Worker. That is real friction and it is the reason to move to the npm
- * registry the moment the package is published — at which point this endpoint should proxy
- * `registry.npmjs.org/@noriq-dev/runner/latest` (cached) rather than hardcode, and this comment
- * should be deleted. Until then a stale constant here means runners think they are current when
- * they are not, which is a quieter failure than it looks: keep it in the release checklist.
+ * ## The caveat worth knowing
+ *
+ * main's package.json can be AHEAD of npm: bump + commit, publish later, and this reports a
+ * version `npm i -g @noriq-dev/runner@latest` will not install. The window is a release
+ * procedure problem (publish and push together), not a code one, but it is why the fallback
+ * below is null rather than a guess — reporting a version nobody can install is worse than
+ * admitting we do not know.
  */
-export const LATEST_RUNNER_VERSION = '0.1.0';
+
+const VERSION_SOURCE = 'https://raw.githubusercontent.com/noriq-dev/runner/main/package.json';
+
+/** Cache at the edge. Five minutes is short enough that a release propagates while you are
+ *  still looking at the terminal, and long enough that a fleet of runners on a 24h interval
+ *  never meaningfully touches GitHub. */
+const CACHE_TTL_S = 300;
+
+/**
+ * The current release, or null if we could not determine it.
+ *
+ * Never throws: this endpoint is polled by every runner, and a GitHub blip must not turn into a
+ * 500 that a daemon interprets as anything at all. Null is honest — the runner treats "unknown"
+ * as "not outdated", which is the only safe reading.
+ */
+export async function fetchLatestRunnerVersion(fetchImpl: typeof fetch = fetch): Promise<string | null> {
+  try {
+    const res = await fetchImpl(VERSION_SOURCE, {
+      // Workers-native edge caching — no KV, no Durable Object, no cron to keep warm.
+      cf: { cacheTtl: CACHE_TTL_S, cacheEverything: true },
+      headers: { 'User-Agent': 'noriq' },
+    } as RequestInit);
+    if (!res.ok) return null;
+    const pkg = (await res.json()) as { version?: unknown };
+    return typeof pkg.version === 'string' ? pkg.version : null;
+  } catch {
+    return null;
+  }
+}
 
 /** Below this, a runner is too old for this server to trust — reserved for a real protocol or
  *  security break, NOT mere staleness. Nothing enforces it yet; it exists so the wire shape is
@@ -51,7 +84,8 @@ export function compareVersions(a: string, b: string): number {
   return 0;
 }
 
-/** Is `version` behind the current release? Unknown (null) is NOT outdated — a runner that
- *  predates version reporting is unknown, and saying "outdated" would be inventing a fact. */
-export const isOutdated = (version: string | null): boolean =>
-  version != null && compareVersions(version, LATEST_RUNNER_VERSION) < 0;
+/** Is `version` behind `latest`? Unknown on EITHER side is NOT outdated — a runner that predates
+ *  version reporting is unknown, and a version feed we could not reach tells us nothing. Saying
+ *  "outdated" in either case would be inventing a fact. */
+export const isOutdated = (version: string | null, latest: string | null): boolean =>
+  version != null && latest != null && compareVersions(version, latest) < 0;

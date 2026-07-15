@@ -9,7 +9,7 @@ import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot } from './backup';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, verifyPassword } from './lib/util';
 import { USER_PROJECT_WHERE, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
-import { LATEST_RUNNER_VERSION, MIN_RUNNER_VERSION, isOutdated } from './runner-release';
+import { MIN_RUNNER_VERSION, fetchLatestRunnerVersion, isOutdated } from './runner-release';
 import type { Actor } from './do/ProjectRoom';
 import { SKILL_MD } from './skill';
 import { issueTokens, metadataRoutes, oauth } from './oauth';
@@ -938,7 +938,7 @@ async function resolveRunnerRepos(
 
 // Map a runners row to the wire Runner shape (never leak owner_user_id), deriving
 // effective online/offline from heartbeat freshness.
-function runnerView(row: Record<string, unknown>) {
+function runnerView(row: Record<string, unknown>, latest: string | null = null) {
   const last = row.last_heartbeat_at as string | null;
   const stale = !last || Date.now() - Date.parse(last) > RUNNER_HEARTBEAT_TTL_MS;
   const offboardedAt = (row.offboarded_at as string | null) ?? null;
@@ -956,9 +956,9 @@ function runnerView(row: Record<string, unknown>) {
     freeSlots: row.free_slots as number,
     lastHeartbeatAt: last,
     version: (row.version as string | null) ?? null,
-    // Derived, not stored: "current" changes when the server does, so a stored flag would be
-    // wrong the moment a release ships. Unknown is not outdated — see isOutdated.
-    outdated: isOutdated((row.version as string | null) ?? null),
+    // Derived, not stored: "current" moves when a release is cut, so a stored flag would be
+    // wrong the moment one lands. Unknown on either side is not outdated — see isOutdated.
+    outdated: isOutdated((row.version as string | null) ?? null, latest),
     createdAt: row.created_at as string,
   };
 }
@@ -1040,10 +1040,11 @@ app.post('/api/runners/:id/heartbeat', agentAuth, async (c) => {
  * See runner-release.ts for why this lives on the server rather than in git or npm — and for
  * the migration path to the npm registry once the package is published.
  */
-app.get('/api/runner/latest', (c) => {
+app.get('/api/runner/latest', async (c) => {
   c.header('Cache-Control', 'public, max-age=300');
   c.header('Access-Control-Allow-Origin', '*');
-  return c.json({ version: LATEST_RUNNER_VERSION, minimum: MIN_RUNNER_VERSION });
+  const version = await fetchLatestRunnerVersion();
+  return c.json({ version, minimum: MIN_RUNNER_VERSION });
 });
 
 app.get('/api/runners', userAuth, async (c) => {
@@ -1053,7 +1054,9 @@ app.get('/api/runners', userAuth, async (c) => {
     ? c.env.DB.prepare('SELECT * FROM runners ORDER BY created_at DESC')
     : c.env.DB.prepare('SELECT * FROM runners WHERE owner_user_id = ? ORDER BY created_at DESC').bind(c.var.user!.id);
   const { results } = await stmt.all<Record<string, unknown>>();
-  return c.json({ runners: results.map(runnerView) });
+  // One lookup for the whole list (edge-cached), not one per runner.
+  const latest = await fetchLatestRunnerVersion();
+  return c.json({ runners: results.map((r) => runnerView(r, latest)) });
 });
 
 /** The owner's runner, or null. Every lifecycle route below is owner-scoped through this. */

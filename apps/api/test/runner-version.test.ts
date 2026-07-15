@@ -28,17 +28,24 @@ describe('compareVersions', () => {
   });
 
   it('does not call an unknown version outdated — that would be inventing a fact', () => {
-    // A runner registered before version reporting has none. "Unknown" and "old" are different.
-    expect(isOutdated(null)).toBe(false);
+    // Unknown on EITHER side. A runner registered before version reporting has no version; and
+    // a version feed we could not reach tells us nothing about the runner. "Unknown" and "old"
+    // are different facts, and only one of them should nag.
+    expect(isOutdated(null, '1.0.0')).toBe(false);
+    expect(isOutdated('0.1.0', null)).toBe(false); // GitHub unreachable → not a verdict
+    expect(isOutdated('0.1.0', '0.2.0')).toBe(true);
   });
 });
 
 describe('runner version (RUN-36)', () => {
   it('publishes the current release, unauthenticated and curl-able', async () => {
+    // Proxies the runner repo's package.json (RUN-36). In the test worker the outbound fetch is
+    // not available, so version may be null — the shape and the caching are what matter here,
+    // and null-is-honest is asserted directly on isOutdated above.
     const res = await SELF.fetch('https://planar.test/api/runner/latest');
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { version: string; minimum: string | null };
-    expect(body.version).toMatch(/^\d+\.\d+\.\d+/);
+    const body = (await res.json()) as { version: string | null; minimum: string | null };
+    expect(body).toHaveProperty('version');
     expect(res.headers.get('Cache-Control')).toContain('max-age');
   });
 
@@ -49,9 +56,10 @@ describe('runner version (RUN-36)', () => {
     });
     const { runner } = (await reg.json()) as { runner: { id: string; version: string; outdated: boolean } };
     expect(runner.version).toBe('0.0.1');
-    // Derived, not stored: "current" moves when the server ships, so a stored flag would be
-    // wrong the moment a release lands.
-    expect(runner.outdated).toBe(true);
+    // `outdated` is derived against the live feed, so it is not asserted here — the test worker
+    // has no outbound fetch, and a test that depended on GitHub would be flaky by construction.
+    // The comparison itself is pinned on isOutdated/compareVersions above.
+    expect(runner).toHaveProperty('outdated');
   });
 
   it('a runner that predates version reporting still registers, as unknown', async () => {
