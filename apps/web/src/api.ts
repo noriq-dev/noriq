@@ -144,6 +144,13 @@ export const api = {
 
   // --- runners / runs (RUN-22) ---
   runners: () => req<{ runners: ApiRunner[] }>('GET', '/api/runners'),
+  /** Cut a runner off (RUN-35): revokes its token, fails its live runs. Severs Noriq — it does
+   *  NOT remove the daemon's local repo access, so the process must be stopped too. */
+  offboardRunner: (id: string) =>
+    req<{ ok: boolean; tokenRevoked: boolean; failedRuns: number; warning?: string; note: string }>(
+      'POST', `/api/runners/${id}/offboard`),
+  renameRunner: (id: string, label: string) => req('PATCH', `/api/runners/${id}`, { label }),
+  deleteRunner: (id: string) => req('DELETE', `/api/runners/${id}`),
   runs: (pid: string) => req<{ runs: ApiRun[] }>('GET', `/api/projects/${pid}/runs`),
   dispatchRun: (pid: string, body: DispatchInput) => req<{ run: ApiRun; delivered: boolean }>('POST', `/api/projects/${pid}/runs`, body),
   cancelRun: (runId: string, reason?: string) => req<{ run: ApiRun }>('POST', `/api/runs/${runId}/cancel`, { reason }),
@@ -162,11 +169,14 @@ export interface ApiRunner {
   id: string;
   projectId: string | null;
   label: string;
-  status: 'online' | 'offline' | 'draining';
+  /** 'offboarded' is a human's decision, not a liveness state (RUN-35) — it outranks the
+   *  heartbeat, so a cut-off runner never reads as online, or as merely crashed. */
+  status: 'online' | 'offline' | 'draining' | 'offboarded';
   capabilities: { tools: string[]; kinds: string[]; maxConcurrency: number };
   repos: ApiRunnerRepo[];
   freeSlots: number;
   lastHeartbeatAt: string | null;
+  offboardedAt: string | null;
   createdAt: string;
 }
 export interface ApiRunBudget {

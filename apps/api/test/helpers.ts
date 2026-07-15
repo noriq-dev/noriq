@@ -86,6 +86,14 @@ export async function createAgent(name: string, role: 'orchestrator' | 'worker' 
  *  under one shared user). Registers a throwaway client and runs the full flow with
  *  that user's cookie — used for genuine cross-tenant tests. */
 export async function mintTokenForUser(email: string, password = 'longenough1'): Promise<string> {
+  return (await mintPairForUser(email, password)).access;
+}
+
+/** Same flow, but hands back the refresh token too — for tests about rotation/revocation. */
+export async function mintPairForUser(
+  email: string,
+  password = 'longenough1',
+): Promise<{ access: string; refresh: string }> {
   await createUser(email, email, password).catch(() => {});
   const cookie = await loginSession(email, password);
   const reg = await SELF.fetch('https://planar.test/oauth/register', {
@@ -111,7 +119,8 @@ export async function mintTokenForUser(email: string, password = 'longenough1'):
     method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: 'http://localhost:39990/cb', client_id: clientId, code_verifier: verifier }).toString(),
   });
-  return ((await tok.json()) as { access_token: string }).access_token;
+  const body = (await tok.json()) as { access_token: string; refresh_token: string };
+  return { access: body.access_token, refresh: body.refresh_token };
 }
 
 export async function createUser(email: string, name: string, password: string, role: 'admin' | 'member' = 'member') {

@@ -103,7 +103,8 @@ export function RunsView({ store }: { store: AppStore }) {
             {runners.map((r) => {
               const repos = reposForPid(r);
               const online = r.status === 'online';
-              const dot = online ? (r.freeSlots > 0 ? '#3fd98b' : '#f5a623') : '#6b7280';
+              const offboarded = r.status === 'offboarded';
+              const dot = offboarded ? '#ff5c5c' : online ? (r.freeSlots > 0 ? '#3fd98b' : '#f5a623') : '#6b7280';
               return (
                 <div key={r.id}>
                   <div
@@ -117,15 +118,43 @@ export function RunsView({ store }: { store: AppStore }) {
                     <div style={{ minWidth: 0, flex: 1 }}>
                       <div style={{ fontSize: 13.5, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 7 }}>
                         {r.label}
-                        <MonoTag color="var(--text-mid)" bg="var(--w-05)" size={9}>{r.status}</MonoTag>
+                        <MonoTag
+                          color={offboarded ? 'var(--red-soft)' : 'var(--text-mid)'}
+                          bg={offboarded ? 'rgba(255,92,92,.12)' : 'var(--w-05)'}
+                          size={9}
+                        >
+                          {r.status}
+                        </MonoTag>
                         {r.capabilities.tools.map((t) => (
                           <MonoTag key={t} color="var(--blue)" bg="rgba(76,157,255,.1)" size={9}>{t}</MonoTag>
                         ))}
                       </div>
                       <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', marginTop: 2 }}>
-                        {r.freeSlots}/{r.capabilities.maxConcurrency} slots free · {repos.length} repo{repos.length === 1 ? '' : 's'} here · heartbeat {ago(r.lastHeartbeatAt)}
+                        {offboarded
+                          ? `offboarded ${ago(r.offboardedAt)} — token revoked`
+                          : `${r.freeSlots}/${r.capabilities.maxConcurrency} slots free · ${repos.length} repo${repos.length === 1 ? '' : 's'} here · heartbeat ${ago(r.lastHeartbeatAt)}`}
                       </div>
                     </div>
+                    {/* The kill switch (RUN-35). Confirmed, because it revokes a credential and
+                        fails live runs — and honest about its limit: it severs Noriq, it does not
+                        reach into the machine. */}
+                    {!offboarded && (
+                      <Button
+                        variant="danger"
+                        style={{ padding: '7px 12px', fontSize: 12 }}
+                        onClick={async () => {
+                          if (!confirm(
+                            `Offboard "${r.label}"?\n\nThis revokes its token: no dispatch, no MCP, and its live runs fail.\n\n` +
+                            'It does NOT stop the daemon touching that machine\'s repos — stop the process there too.',
+                          )) return;
+                          const res = await api.offboardRunner(r.id);
+                          if (res.warning) alert(res.warning);
+                          await load();
+                        }}
+                      >
+                        offboard
+                      </Button>
+                    )}
                     <Button
                       variant={dispatchFor === r.id ? 'ghost' : 'primary'}
                       disabled={!canDispatch(r)}

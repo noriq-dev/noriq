@@ -897,7 +897,11 @@ const RegisterRunnerBody = z.object({
 
 const HeartbeatBody = z.object({
   freeSlots: z.number().int().nonnegative(),
-  status: z.enum(['online', 'draining']).default('online'),
+  // 'offline' is the daemon saying GOODBYE on a clean shutdown (RUN-35). Without it, stopping
+  // a runner on purpose and a runner crashing look identical — both just stop heartbeating and
+  // go stale. A final beat saying "I'm going" is the whole difference, and the panel reads it
+  // as stopped-on-purpose precisely because the heartbeat is FRESH while the status is offline.
+  status: z.enum(['online', 'draining', 'offline']).default('online'),
   repos: z.array(RunnerRepo).nullish(), // resend only when discovery changed the set
 });
 
@@ -933,11 +937,16 @@ async function resolveRunnerRepos(
 function runnerView(row: Record<string, unknown>) {
   const last = row.last_heartbeat_at as string | null;
   const stale = !last || Date.now() - Date.parse(last) > RUNNER_HEARTBEAT_TTL_MS;
+  const offboardedAt = (row.offboarded_at as string | null) ?? null;
   return {
     id: row.id as string,
     projectId: (row.project_id as string | null) ?? null,
     label: row.label as string,
-    status: stale ? 'offline' : (row.status as string),
+    // Offboarded outranks liveness (RUN-35): a heartbeat cannot make a cut-off runner look
+    // online, and its absence must not make it look merely crashed. "Someone stopped this"
+    // and "this went quiet" are different facts and the panel has to tell them apart.
+    status: offboardedAt ? 'offboarded' : stale ? 'offline' : (row.status as string),
+    offboardedAt,
     capabilities: JSON.parse(String(row.capabilities)),
     repos: JSON.parse(String(row.repos)),
     freeSlots: row.free_slots as number,
@@ -957,11 +966,19 @@ app.post('/api/runners', agentAuth, async (c) => {
   let id = b.runnerId;
   if (id) {
     // Re-register (reconnect): only the owner may re-bind an existing runner.
-    const owned = await c.env.DB.prepare('SELECT id FROM runners WHERE id = ? AND owner_user_id = ?').bind(id, userId).first();
+    const owned = await c.env.DB.prepare('SELECT id, offboarded_at AS offboardedAt FROM runners WHERE id = ? AND owner_user_id = ?')
+      .bind(id, userId).first<{ id: string; offboardedAt: string | null }>();
     if (!owned) return c.json({ error: 'runner not found' }, 404);
+    // Offboarding is STICKY (RUN-35). Revoking the token is what stops a runner, but a human
+    // who later re-authorizes that box would otherwise silently un-offboard it by reconnecting
+    // — the decision would evaporate on the next registration and the kill switch would be a
+    // pause button. Coming back is a deliberate act: delete it and let it register fresh.
+    if (owned.offboardedAt) {
+      return c.json({ error: 'this runner was offboarded — delete it to let this machine register again' }, 403);
+    }
     await c.env.DB.prepare(
-      "UPDATE runners SET label = ?, status = 'online', capabilities = ?, repos = ?, free_slots = ?, last_heartbeat_at = ? WHERE id = ?",
-    ).bind(b.label, capabilities, JSON.stringify(repos), b.maxConcurrency, now, id).run();
+      "UPDATE runners SET label = ?, status = 'online', capabilities = ?, repos = ?, free_slots = ?, last_heartbeat_at = ?, token_id = ? WHERE id = ?",
+    ).bind(b.label, capabilities, JSON.stringify(repos), b.maxConcurrency, now, c.var.connection!.tokenId, id).run();
     // Reconnect reconciliation (RUN-6): the daemon's previous process died, so any
     // Runs still dispatched/running/blocked for it are orphaned → failed{daemon_restart}.
     // Runs are per-project, so sweep each affected project's ProjectRoom (the authority).
@@ -975,9 +992,9 @@ app.post('/api/runners', agentAuth, async (c) => {
   } else {
     id = newId('rnr');
     await c.env.DB.prepare(
-      `INSERT INTO runners (id, owner_user_id, label, status, capabilities, repos, free_slots, last_heartbeat_at, created_at)
-       VALUES (?, ?, ?, 'online', ?, ?, ?, ?, ?)`,
-    ).bind(id, userId, b.label, capabilities, JSON.stringify(repos), b.maxConcurrency, now, now).run();
+      `INSERT INTO runners (id, owner_user_id, label, status, capabilities, repos, free_slots, last_heartbeat_at, token_id, created_at)
+       VALUES (?, ?, ?, 'online', ?, ?, ?, ?, ?, ?)`,
+    ).bind(id, userId, b.label, capabilities, JSON.stringify(repos), b.maxConcurrency, now, c.var.connection!.tokenId, now).run();
   }
   const row = await c.env.DB.prepare('SELECT * FROM runners WHERE id = ?').bind(id).first<Record<string, unknown>>();
   return c.json({ runner: runnerView(row!) });
@@ -988,8 +1005,12 @@ app.post('/api/runners/:id/heartbeat', agentAuth, async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid heartbeat', detail: parsed.error.issues }, 400);
   const userId = c.var.connection!.userId;
   const id = c.req.param('id')!;
-  const owned = await c.env.DB.prepare('SELECT id FROM runners WHERE id = ? AND owner_user_id = ?').bind(id, userId).first();
+  const owned = await c.env.DB.prepare('SELECT id, offboarded_at AS offboardedAt FROM runners WHERE id = ? AND owner_user_id = ?')
+    .bind(id, userId).first<{ id: string; offboardedAt: string | null }>();
   if (!owned) return c.json({ error: 'runner not found' }, 404);
+  // Revoking the token normally stops this call ever arriving; this is defence in depth for a
+  // runner offboarded while holding a still-valid credential (an unscoped legacy token, say).
+  if (owned.offboardedAt) return c.json({ error: 'this runner was offboarded' }, 403);
   const b = parsed.data;
   if (b.repos) {
     const repos = await resolveRunnerRepos(c.env, userId, b.repos, c.var.connection!.tokenId);
@@ -1010,6 +1031,124 @@ app.get('/api/runners', userAuth, async (c) => {
     : c.env.DB.prepare('SELECT * FROM runners WHERE owner_user_id = ? ORDER BY created_at DESC').bind(c.var.user!.id);
   const { results } = await stmt.all<Record<string, unknown>>();
   return c.json({ runners: results.map(runnerView) });
+});
+
+/** The owner's runner, or null. Every lifecycle route below is owner-scoped through this. */
+async function ownedRunner(c: Context<AppContext>, id: string) {
+  return c.env.DB.prepare('SELECT * FROM runners WHERE id = ? AND owner_user_id = ?')
+    .bind(id, c.var.user!.id).first<Record<string, unknown>>();
+}
+
+/**
+ * Offboard: cut this runner off (RUN-35). The one action an operator needs when a box is lost,
+ * compromised, or running away.
+ *
+ * Revoking the TOKEN is what does the work — it severs dispatch, MCP, reporting and the WS in
+ * one row, because agentAuth already rejects revoked tokens and issueTokens puts the access and
+ * refresh hashes on that SAME row (so this is a stop, not a 7-day delay while the refresh
+ * outlives it). Marking the runner without revoking would accomplish nothing at all.
+ *
+ * BE HONEST ABOUT THE LIMIT: this severs Noriq. It does NOT stop a compromised machine touching
+ * the local repo — the daemon still has the checkout, and with [land] it has branch write, and
+ * with [land].autoPush (RUN-27) it can push until the git credential is pulled too. This is a
+ * real control, not a big red button, and the response says so rather than implying otherwise.
+ */
+app.post('/api/runners/:id/offboard', userAuth, async (c) => {
+  const id = c.req.param('id')!;
+  const runner = await ownedRunner(c, id);
+  if (!runner) return c.json({ error: 'runner not found' }, 404);
+  const now = nowIso();
+  const tokenId = (runner.token_id as string | null) ?? null;
+
+  const stmts = [
+    c.env.DB.prepare("UPDATE runners SET offboarded_at = ?, status = 'offline', free_slots = 0 WHERE id = ?").bind(now, id),
+  ];
+  if (tokenId) {
+    stmts.push(
+      c.env.DB.prepare('UPDATE oauth_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL').bind(now, tokenId),
+      // Same sweep the connections revoke does: retire the agents that ran on it so they stop
+      // showing as live. A runner's agents are exactly the ones it spawned (0026).
+      c.env.DB.prepare("UPDATE agents SET status = 'offline' WHERE oauth_token_id = ? AND status = 'active'").bind(tokenId),
+      c.env.DB.prepare("UPDATE agents SET status = 'offline' WHERE runner_id = ? AND status = 'active'").bind(id),
+    );
+  }
+  await c.env.DB.batch(stmts);
+
+  // Its live Runs are now orphaned — the daemon can no longer report on them, so they would sit
+  // `running` forever. Same treatment, and the same precedent, as a daemon that died.
+  const { results: pids } = await c.env.DB.prepare(
+    "SELECT DISTINCT project_id AS pid FROM runs WHERE runner_id = ? AND status IN ('dispatched','running','blocked')",
+  ).bind(id).all<{ pid: string }>();
+  const sysActor: Actor = { kind: 'system', id: 'system', name: 'system' };
+  let failedRuns = 0;
+  for (const { pid } of pids) {
+    failedRuns += (await room(c.env, pid).reconcileRunnerRuns(pid, sysActor, id)).failed;
+  }
+
+  return c.json({
+    ok: true,
+    tokenRevoked: !!tokenId,
+    failedRuns,
+    // A runner registered before 0028 has no token_id, so there is nothing to revoke and the
+    // offboard is only a flag. Say so plainly instead of reporting a stop that did not happen.
+    ...(tokenId
+      ? {}
+      : { warning: 'this runner predates token tracking — it is marked offboarded, but no token was revoked. Revoke its connection in Settings.' }),
+    note: 'Noriq access is severed. This does not remove the daemon’s local repo access — stop the process on that machine too.',
+  });
+});
+
+/** Re-label. Cosmetic, but it is how a human tells two boxes apart. */
+app.patch('/api/runners/:id', userAuth, async (c) => {
+  const id = c.req.param('id')!;
+  const body = await c.req.json<{ label?: string }>().catch(() => ({}) as { label?: string });
+  const label = (body.label ?? '').trim();
+  if (!label) return c.json({ error: 'label required' }, 400);
+  if (!(await ownedRunner(c, id))) return c.json({ error: 'runner not found' }, 404);
+  await c.env.DB.prepare('UPDATE runners SET label = ? WHERE id = ?').bind(label.slice(0, 80), id).run();
+  return c.json({ ok: true });
+});
+
+/**
+ * Delete a runner row. This is prune, not a kill switch — deleting a LIVE runner would only
+ * lose track of it while it kept working, so it must be offboarded (or already dead) first.
+ * That ordering is the whole safety property: you cannot make a runaway invisible.
+ *
+ * Also the escape hatch for a stray: `POST /api/runners` with no runnerId mints a new one, so a
+ * wiped state file or a copy-pasted curl quietly forks a duplicate identity that, until now,
+ * nothing could remove.
+ */
+app.delete('/api/runners/:id', userAuth, async (c) => {
+  const id = c.req.param('id')!;
+  const runner = await ownedRunner(c, id);
+  if (!runner) return c.json({ error: 'runner not found' }, 404);
+  const last = runner.last_heartbeat_at as string | null;
+  const live = !runner.offboarded_at && last && Date.now() - Date.parse(last) <= RUNNER_HEARTBEAT_TTL_MS;
+  if (live) {
+    return c.json({ error: 'runner is online — offboard it first (deleting a live runner only loses track of it)' }, 409);
+  }
+  // A runner that ever spawned an agent cannot be deleted, and that is the 0026 CHECK doing its
+  // job rather than getting in the way: `kind='agent'` REQUIRES a runner_id, so there is no
+  // "unlink and forget" — an agent's provenance is a fact, and erasing the runner would erase
+  // who ran the work. Offboard is the answer for a real runner; delete is for a stray that
+  // never did anything (an omitted runnerId mints one, so a wiped state file or a stray curl
+  // forks a duplicate identity that nothing could remove until now).
+  const agents = await c.env.DB.prepare('SELECT COUNT(*) AS n FROM agents WHERE runner_id = ?').bind(id)
+    .first<{ n: number }>();
+  if (agents?.n) {
+    return c.json(
+      { error: `this runner spawned ${agents.n} agent(s) — it is part of that work's history and cannot be deleted. Offboard it instead.` },
+      409,
+    );
+  }
+  // runs.runner_id has no such constraint, so null it rather than deleting the runs: a Run is
+  // history too, and the honest record is "the runner that did this is gone", not "this never
+  // happened".
+  await c.env.DB.batch([
+    c.env.DB.prepare('UPDATE runs SET runner_id = NULL WHERE runner_id = ?').bind(id),
+    c.env.DB.prepare('DELETE FROM runners WHERE id = ?').bind(id),
+  ]);
+  return c.json({ ok: true });
 });
 
 const hub = (env: Env, runnerId: string) => env.RUNNER_HUB.get(env.RUNNER_HUB.idFromName(runnerId));
