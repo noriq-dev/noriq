@@ -95,7 +95,8 @@ export interface RunPatch {
 
 type RunRow = {
   id: string; project_id: string; runner_id: string | null; agent_id: string | null;
-  kind: string; anchor_type: string | null; anchor_id: string | null; verifies_run_id: string | null; brief: string;
+  kind: string; anchor_type: string | null; anchor_id: string | null; verifies_run_id: string | null;
+  plan_id: string | null; plan_key: string | null; brief: string;
   repo_ref: string; agent_tool: string; budget: string; status: string; exit: string | null;
   worktree_path: string | null;
   tokens_used: number | null; usd_spent: number | null; log_tail: string | null;
@@ -114,6 +115,8 @@ export interface RunView {
   anchor: { type: 'task'; taskId: string } | { type: 'plan'; planId: string } | null;
   /** VERIFY only: the build run whose diff this one judges. */
   verifiesRunId: string | null;
+  /** The plan this run serves (RUN-28) — drives the per-plan working branch. Null = one-off. */
+  planKey: string | null;
   brief: string;
   repoRef: string;
   agentTool: string;
@@ -422,6 +425,13 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.env.DB.prepare(`UPDATE tasks SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
       if (statusChanged) {
         await this.emit(actor, 'task.status_changed', 'task', taskId, { key: task.key, from: task.status, to: patch.status, title: task.title });
+        // The second way a task reaches done — a supervisor override rather than an agent
+        // releasing it. Both paths need the hook or a plan finished by hand would never open its
+        // merge request. `cancelled` counts too: a plan whose last open task was explicitly
+        // dropped IS finished, and ignoring that strands its branch forever (RUN-28).
+        if (patch.status === 'done' || patch.status === 'cancelled') {
+          await this.maybeCompletePlan(taskId, actor);
+        }
       } else {
         await this.emit(actor, 'task.updated', 'task', taskId, { key: task.key, fields: Object.keys(patch) });
       }
@@ -538,6 +548,9 @@ export class ProjectRoom extends DurableObject<Env> {
           taskId, taskKey: task.key, kind: 'comment', body: note.slice(0, 140), holder: null,
         });
       }
+      // A plan is finished when its last task is — check here rather than on a timer, so the
+      // merge request follows the work instead of trailing it (RUN-28).
+      if (toStatus === 'done') await this.maybeCompletePlan(taskId, actor);
       return { ok: true, key: task.key, status: toStatus, commentId };
 
     });
@@ -1095,6 +1108,8 @@ export class ProjectRoom extends DurableObject<Env> {
       // VERIFY only: the build run this one judges — the daemon branches its worktree
       // from that run, so the diff under review is actually present.
       verifiesRunId: r.verifies_run_id,
+      // The plan this run serves (RUN-28) — the daemon uses it for the per-plan working branch.
+      planKey: r.plan_key,
       brief: r.brief,
       repoRef: r.repo_ref,
       agentTool: r.agent_tool,
@@ -1135,13 +1150,20 @@ export class ProjectRoom extends DurableObject<Env> {
       const status = runnerId ? 'dispatched' : 'queued';
       // Only a verify run judges another run; carrying it elsewhere would be meaningless.
       const verifiesRunId = input.kind === 'verify' ? (input.verifiesRunId ?? null) : null;
+      // Which plan does this run serve? (RUN-28) Resolved HERE because the daemon cannot: a
+      // plan-anchored run names its plan, but a task-anchored one only knows its task, and the
+      // task's plan membership is phase_tasks — server-side, and invisible to the runner.
+      // Stored rather than re-derived at landing time: a task can be re-parented and a plan
+      // deleted, but the branch a run landed on is a historical fact, not a live lookup.
+      const plan = await this.resolveRunPlan(anchorType, anchorId);
       await this.env.DB.prepare(
         `INSERT INTO runs (id, project_id, runner_id, kind, anchor_type, anchor_id, verifies_run_id,
-                           brief, repo_ref, agent_tool, budget, status, created_by, created_at,
-                           updated_at, dispatched_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                           plan_id, plan_key, brief, repo_ref, agent_tool, budget, status, created_by,
+                           created_at, updated_at, dispatched_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(
         id, projectId, runnerId, input.kind, anchorType, anchorId, verifiesRunId,
+        plan?.id ?? null, plan ? this.planKey(plan) : null,
         input.brief ?? '', input.repoRef,
         input.agentTool, JSON.stringify(input.budget ?? {}), status, input.createdBy ?? actor.id, now, now,
         runnerId ? now : null,
@@ -1169,6 +1191,101 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.emit(actor, 'run.dispatched', 'run', runId, { runnerId, from: run.status, to: 'dispatched' });
       return this.runToWire(await this.loadRun(runId));
     });
+  }
+
+
+  /**
+   * A branch-safe, readable, stable key for a plan (RUN-28). Plans have no `key` column — only a
+   * title, which is neither unique nor immutable — so derive one: a slug of the title for a human
+   * reading `git branch`, plus the id suffix so two plans called "Cleanup" never collide and a
+   * retitled plan keeps landing on the branch its earlier runs used.
+   */
+  /** The plan a run serves (RUN-28), from its anchor. A plan anchor names it outright; a task
+   *  anchor needs phase_tasks. Null = a one-off dispatch belonging to no plan, which lands on the
+   *  literal `[land].branch` with any `<planKey>` stripped. */
+  private async resolveRunPlan(
+    anchorType: string | null,
+    anchorId: string | null,
+  ): Promise<{ id: string; title: string } | null> {
+    if (!anchorType || !anchorId) return null;
+    if (anchorType === 'plan') {
+      return this.env.DB.prepare('SELECT id, title FROM plans WHERE id = ?')
+        .bind(anchorId).first<{ id: string; title: string }>();
+    }
+    return this.env.DB.prepare(
+      `SELECT pl.id, pl.title FROM phase_tasks pt
+         JOIN phases ph ON ph.id = pt.phase_id
+         JOIN plans pl ON pl.id = ph.plan_id
+       WHERE pt.task_id = ? LIMIT 1`,
+    ).bind(anchorId).first<{ id: string; title: string }>();
+  }
+
+  private planKey(plan: { id: string; title: string }): string {
+    const slug = plan.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 32)
+      || 'plan';
+    return `${slug}-${plan.id.slice(-6)}`;
+  }
+
+  /**
+   * Did this task's plan just finish? (RUN-28)
+   *
+   * Completion is a SERVER fact: the daemon sees Runs, never the plan's task graph. So it is
+   * computed here, the moment the last task lands, and RECORDED — the WS push is only the fast
+   * path. A plan can complete while no runner is listening (box off, runner offboarded, socket
+   * reconnecting), and a fire-and-forget notification would drop the merge request silently and
+   * forever. That exact class of bug has shipped here twice already.
+   *
+   * INSERT OR IGNORE is what makes it fire once: a plan completes a single time, no matter how
+   * many tasks are marked done in a batch or how often a runner re-asks.
+   */
+  private async maybeCompletePlan(taskId: string, actor: Actor): Promise<void> {
+    const { results: plans } = await this.env.DB.prepare(
+      `SELECT DISTINCT pl.id, pl.title FROM phase_tasks pt
+         JOIN phases ph ON ph.id = pt.phase_id
+         JOIN plans pl ON pl.id = ph.plan_id
+       WHERE pt.task_id = ? AND pl.status != 'proposed'`,
+    ).bind(taskId).all<{ id: string; title: string }>();
+
+    for (const plan of plans) {
+      // 'cancelled' counts as finished: a plan whose remaining work was explicitly dropped IS
+      // done, and refusing to notice would strand its branch with no merge request forever.
+      const open = await this.env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM phase_tasks pt
+           JOIN phases ph ON ph.id = pt.phase_id
+           JOIN tasks t ON t.id = pt.task_id
+         WHERE ph.plan_id = ? AND t.status NOT IN ('done', 'cancelled')`,
+      ).bind(plan.id).first<{ n: number }>();
+      if (open?.n) continue;
+
+      const rec = await this.env.DB.prepare(
+        'INSERT OR IGNORE INTO plan_landings (plan_id, project_id, completed_at) VALUES (?, ?, ?)',
+      ).bind(plan.id, this.projectId, nowIso()).run();
+      if (!rec.meta.changes) continue; // already recorded — completes once
+
+      const key = this.planKey(plan);
+      await this.emit(actor, 'plan.completed', 'plan', plan.id, { title: plan.title, planKey: key });
+
+      // Fast path: tell the runners that actually landed this plan's work. Best-effort by
+      // construction — plan_landings is the truth, and a runner that hears nothing reconciles
+      // when it reconnects.
+      const { results: runners } = await this.env.DB.prepare(
+        'SELECT DISTINCT runner_id AS id FROM runs WHERE plan_id = ? AND runner_id IS NOT NULL',
+      ).bind(plan.id).all<{ id: string }>();
+      const frame = JSON.stringify({
+        type: 'plan.completed',
+        planId: plan.id,
+        planKey: key,
+        planTitle: plan.title,
+        projectId: this.projectId,
+      });
+      for (const r of runners) {
+        try {
+          await this.env.RUNNER_HUB.get(this.env.RUNNER_HUB.idFromName(r.id)).deliver(frame);
+        } catch {
+          /* socket gone — plan_landings still owes it, and reconnect will ask */
+        }
+      }
+    }
   }
 
   /** Advance a Run's status (running/blocked/terminal). Enforces the transition map. */

@@ -1357,6 +1357,60 @@ app.post('/api/runs/:runId/agent', agentAuth, async (c) => {
   });
 });
 
+/**
+ * Merge requests this runner still owes (RUN-28).
+ *
+ * The durable half of plan completion. The WS `plan.completed` frame is the fast path, and it is
+ * only that: a plan can finish while the box is off, while the runner is offboarded, or while the
+ * socket is reconnecting — and a fire-and-forget push would drop the merge request silently and
+ * forever. So completion is recorded (`plan_landings`) and the daemon asks on reconnect.
+ *
+ * Scoped to plans this runner actually landed work for: it is the only machine with the branch.
+ */
+app.get('/api/runners/:id/owed-merges', agentAuth, async (c) => {
+  const id = c.req.param('id')!;
+  const owned = await c.env.DB.prepare('SELECT id FROM runners WHERE id = ? AND owner_user_id = ?')
+    .bind(id, c.var.connection!.userId).first();
+  if (!owned) return c.json({ error: 'runner not found' }, 404);
+  const { results } = await c.env.DB.prepare(
+    `SELECT pl.plan_id AS planId, pl.project_id AS projectId, p.title AS planTitle,
+            (SELECT r.plan_key FROM runs r WHERE r.plan_id = pl.plan_id AND r.plan_key IS NOT NULL LIMIT 1) AS planKey,
+            (SELECT r.repo_ref FROM runs r WHERE r.plan_id = pl.plan_id AND r.runner_id = ?1 LIMIT 1) AS repoRef
+     FROM plan_landings pl
+       JOIN plans p ON p.id = pl.plan_id
+     WHERE pl.merge_requested_at IS NULL
+       AND EXISTS (SELECT 1 FROM runs r WHERE r.plan_id = pl.plan_id AND r.runner_id = ?1)
+     ORDER BY pl.completed_at`,
+  ).bind(id).all();
+  return c.json({ owed: results });
+});
+
+/**
+ * The daemon reports what happened to a merge request it owed.
+ *
+ * Recorded either way — opened, or failed with a reason. Marking only successes would leave a
+ * failure invisible and the plan owed forever, so the daemon would retry the same broken thing on
+ * every reconnect and nobody would learn why.
+ */
+const MergeReportBody = z.object({
+  planId: z.string(),
+  url: z.string().nullable().default(null),
+  failed: z.string().nullable().default(null),
+});
+app.post('/api/runners/:id/owed-merges/report', agentAuth, async (c) => {
+  const id = c.req.param('id')!;
+  const parsed = MergeReportBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid report', detail: parsed.error.issues }, 400);
+  const owned = await c.env.DB.prepare('SELECT id FROM runners WHERE id = ? AND owner_user_id = ?')
+    .bind(id, c.var.connection!.userId).first();
+  if (!owned) return c.json({ error: 'runner not found' }, 404);
+  const b = parsed.data;
+  await c.env.DB.prepare(
+    'UPDATE plan_landings SET merge_requested_at = ?, merge_request_url = ?, failed_detail = ? WHERE plan_id = ?',
+  ).bind(nowIso(), b.url, b.failed, b.planId).run();
+  return c.json({ ok: true });
+});
+
 // Steering-ack (RUN-7): the daemon reports it delivered a steer to the agent over
 // the runtime channel. Record it so the MCP notices fallback won't double-deliver
 // (the dedup guard consumed in computeUpdates). agentAuth → the runner's owner.
