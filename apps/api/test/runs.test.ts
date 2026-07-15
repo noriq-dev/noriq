@@ -358,4 +358,38 @@ describe('dispatch validates verifiesRunId (HTTP)', () => {
     expect(res.status).toBe(400);
     expect(JSON.stringify(await res.json())).toContain('only a build run produces a diff');
   });
+
+  it('round-trips model + effort onto the Run the daemon receives (RUN-33)', async () => {
+    const res = await dispatch({
+      runnerId: 'rnr_owned', kind: 'build', agentTool: 'claude', repoRef: 'repo_a',
+      brief: 'pick a model', model: 'claude-opus-4-8', effort: 'xhigh',
+    });
+    expect(res.status).toBe(200);
+    const { run } = (await res.json()) as { run: { id: string; model: string | null; effort: string | null } };
+    // On the wire, because the daemon reads it off the run.assigned frame — the driver seam
+    // for `model` existed from RUN-12 and was dead precisely because Run never carried one.
+    expect(run.model).toBe('claude-opus-4-8');
+    expect(run.effort).toBe('xhigh');
+    const row = await env.DB.prepare('SELECT model, effort FROM runs WHERE id = ?')
+      .bind(run.id).first<{ model: string | null; effort: string | null }>();
+    expect(row).toMatchObject({ model: 'claude-opus-4-8', effort: 'xhigh' });
+  });
+
+  it('a dispatch that picks neither leaves both null — the tool keeps its default (RUN-33)', async () => {
+    const res = await dispatch({
+      runnerId: 'rnr_owned', kind: 'build', agentTool: 'claude', repoRef: 'repo_a', brief: 'no pick',
+    });
+    const { run } = (await res.json()) as { run: { model: string | null; effort: string | null } };
+    expect(run.model).toBeNull();
+    expect(run.effort).toBeNull();
+  });
+
+  it('rejects an effort that is not one of ours (RUN-33)', async () => {
+    // effort is a closed intent we map per driver, so a bad one is worth refusing at the door.
+    // `model` deliberately is NOT validated this way: names are the vendor's and they change.
+    const res = await dispatch({
+      runnerId: 'rnr_owned', kind: 'build', agentTool: 'claude', repoRef: 'repo_a', effort: 'ludicrous',
+    });
+    expect(res.status).toBe(400);
+  });
 });

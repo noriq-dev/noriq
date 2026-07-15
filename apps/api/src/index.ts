@@ -15,7 +15,7 @@ import { issueTokens, metadataRoutes, oauth } from './oauth';
 import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
 import { z } from 'zod';
-import { AgentTool, RunKind, RunnerRepo, RunBudget, normalizeProjectKey } from '@noriq-dev/shared';
+import { AgentTool, RunEffort, RunKind, RunnerRepo, RunBudget, normalizeProjectKey } from '@noriq-dev/shared';
 
 export { ProjectRoom } from './do/ProjectRoom';
 export { AgentSession } from './do/AgentSession';
@@ -1182,6 +1182,16 @@ const DispatchBody = z.object({
   // VERIFY only: the build run whose diff to judge. The daemon branches the verifier's
   // worktree from that run's branch — without it the verifier reviews a pristine HEAD.
   verifiesRunId: z.string().nullish(),
+  // Per-dispatch model + effort (RUN-33). Null/absent = the repo's [defaults] for this kind,
+  // then whatever the tool defaults to — the daemon resolves that chain, since the manifest is
+  // committed in the repo and invisible here.
+  //
+  // `model` is an unconstrained string on purpose: model names belong to the vendor and change
+  // constantly, so an allowlist here would need a deploy every time one ships, and would reject
+  // a model the operator's own CLI supports perfectly well. A wrong name fails fast and cheaply
+  // in the tool. `effort` IS closed, because it is a fixed intent we map per driver.
+  model: z.string().min(1).max(200).nullish(),
+  effort: RunEffort.nullish(),
   budget: RunBudget.optional(),
 });
 
@@ -1217,6 +1227,7 @@ app.post('/api/projects/:pid/runs', userAuth, async (c) => {
     anchor: b.anchor ? { type: b.anchor.type, id: b.anchor.id } : null,
     verifiesRunId: b.verifiesRunId ?? null,
     targetBranch: b.targetBranch ?? null,
+    model: b.model ?? null, effort: b.effort ?? null,
     budget: b.budget, runnerId: b.runnerId,
   });
   const { delivered } = await hub(c.env, b.runnerId).deliver(JSON.stringify({ type: 'run.assigned', run }));

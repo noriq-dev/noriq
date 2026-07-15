@@ -6,7 +6,7 @@
 // are not persisted server-side yet — the view surfaces the budget envelope and
 // the terminal exit instead (see the note in the Runs header).
 import { useEffect, useMemo, useState } from 'react';
-import { api, type ApiRun, type ApiRunner, type DispatchInput, type RunStatus } from '../api';
+import { api, type ApiRun, type ApiRunner, type DispatchInput, type RunEffort, type RunStatus } from '../api';
 import type { AppStore } from '../store';
 import { LiveDot, MonoTag, SectionLabel } from './bits';
 import { Button, ErrorNote, Field, Select, TextArea, TextInput } from './ui';
@@ -32,6 +32,9 @@ const STATUS_STYLE: Record<RunStatus, { color: string; bg: string; live?: boolea
 
 const TERMINAL: RunStatus[] = ['done', 'failed', 'cancelled'];
 const KINDS: Array<ApiRun['kind']> = ['scope', 'build', 'verify'];
+/** Tool-agnostic intent (RUN-33) — each driver maps it. Codex tops out at 'high' and clamps
+ *  the last two; the daemon does that translation, so this list stays what we MEAN. */
+const EFFORTS: RunEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 /**
  * What the pill says (RUN-31). A running Run spends its last 60–90s in the verify gate and then
@@ -356,6 +359,9 @@ function DispatchForm({
   const [brief, setBrief] = useState('');
   const [anchorTask, setAnchorTask] = useState(''); // '' = no anchor
   const [targetBranch, setTargetBranch] = useState(''); // '' = the repo's own choice (RUN-41)
+  // '' = don't override (RUN-33): the repo's [defaults] for this kind, then the tool's own.
+  const [model, setModel] = useState('');
+  const [effort, setEffort] = useState<RunEffort | ''>('');
   const [maxUsd, setMaxUsd] = useState('');
   const [maxTokens, setMaxTokens] = useState('');
   const [maxMinutes, setMaxMinutes] = useState('');
@@ -382,6 +388,10 @@ function DispatchForm({
       anchor: anchorTask ? { type: 'task', id: anchorTask } : null,
       // Empty = don't override. Sending '' would be an override to a branch named "".
       targetBranch: targetBranch.trim() || null,
+      // Same rule (RUN-33): blank means "whatever the repo/tool would have picked", so it must
+      // travel as null. Sending '' would be a request for a model named "".
+      model: model.trim() || null,
+      effort: effort || null,
       budget: { maxUsd: num(maxUsd), maxTokens: num(maxTokens), maxDurationSeconds: maxMinutes.trim() ? (num(maxMinutes) ?? 0) * 60 : null },
     };
     setBusy(true);
@@ -425,6 +435,22 @@ function DispatchForm({
         <Field label="agent">
           <Select value={agentTool} onChange={(e) => setAgentTool(e.target.value)}>
             {tools.map((t) => <option key={t} value={t}>{t}</option>)}
+          </Select>
+        </Field>
+        <Field label="model (optional)">
+          {/* Free text, not a dropdown: model names belong to the vendor and change constantly,
+              so a hardcoded list would go stale and would reject a model the operator's own CLI
+              supports. Blank = the repo's [defaults] for this kind, then the tool's own. */}
+          <TextInput
+            value={model}
+            onChange={(e: React.ChangeEvent<HTMLInputElement>) => setModel(e.target.value)}
+            placeholder="repo default"
+          />
+        </Field>
+        <Field label="effort (optional)">
+          <Select value={effort} onChange={(e) => setEffort(e.target.value as RunEffort | '')}>
+            <option value="">repo default</option>
+            {EFFORTS.map((x) => <option key={x} value={x}>{x}</option>)}
           </Select>
         </Field>
       </div>

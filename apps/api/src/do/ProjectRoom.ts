@@ -82,6 +82,10 @@ export interface CreateRunInput {
   brief?: string;
   repoRef: string;
   agentTool: string; // AgentTool: claude|codex
+  /** Per-dispatch model + effort (RUN-33). Null = the repo's [defaults] for this kind, then
+   *  the tool's own default. The daemon resolves that chain; it has the manifest, we don't. */
+  model?: string | null;
+  effort?: string | null;
   budget?: Record<string, unknown> | null;
   /** Pre-assign a runner (create + dispatch in one shot); else the Run starts queued. */
   runnerId?: string | null;
@@ -102,7 +106,8 @@ type RunRow = {
   id: string; project_id: string; runner_id: string | null; agent_id: string | null;
   kind: string; anchor_type: string | null; anchor_id: string | null; verifies_run_id: string | null;
   plan_id: string | null; plan_key: string | null; target_branch: string | null; brief: string;
-  repo_ref: string; agent_tool: string; budget: string; status: string; phase: string | null;
+  repo_ref: string; agent_tool: string; model: string | null; effort: string | null;
+  budget: string; status: string; phase: string | null;
   exit: string | null;
   worktree_path: string | null;
   tokens_used: number | null; usd_spent: number | null; log_tail: string | null;
@@ -128,6 +133,9 @@ export interface RunView {
   brief: string;
   repoRef: string;
   agentTool: string;
+  /** Per-dispatch model + effort (RUN-33). Null = the repo's [defaults], then the tool's. */
+  model: string | null;
+  effort: string | null;
   budget: Record<string, unknown>;
   status: string;
   /** Sub-state of `running` (RUN-31): what it is doing. Null when queued or terminal. */
@@ -1151,6 +1159,8 @@ export class ProjectRoom extends DurableObject<Env> {
       brief: r.brief,
       repoRef: r.repo_ref,
       agentTool: r.agent_tool,
+      model: r.model,
+      effort: r.effort,
       budget: JSON.parse(r.budget || '{}'),
       status: r.status,
       // Sub-state of running (RUN-31): 'verifying'/'landing' are the ~60–90s in which the
@@ -1200,14 +1210,15 @@ export class ProjectRoom extends DurableObject<Env> {
       const plan = await this.resolveRunPlan(anchorType, anchorId);
       await this.env.DB.prepare(
         `INSERT INTO runs (id, project_id, runner_id, kind, anchor_type, anchor_id, verifies_run_id,
-                           plan_id, plan_key, target_branch, brief, repo_ref, agent_tool, budget, status,
-                           created_by, created_at, updated_at, dispatched_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                           plan_id, plan_key, target_branch, brief, repo_ref, agent_tool, model, effort,
+                           budget, status, created_by, created_at, updated_at, dispatched_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(
         id, projectId, runnerId, input.kind, anchorType, anchorId, verifiesRunId,
         plan?.id ?? null, plan ? this.planKey(plan) : null, input.targetBranch ?? null,
         input.brief ?? '', input.repoRef,
-        input.agentTool, JSON.stringify(input.budget ?? {}), status, input.createdBy ?? actor.id, now, now,
+        input.agentTool, input.model ?? null, input.effort ?? null,
+        JSON.stringify(input.budget ?? {}), status, input.createdBy ?? actor.id, now, now,
         runnerId ? now : null,
       ).run();
       await this.emit(actor, 'run.created', 'run', id, {

@@ -198,6 +198,9 @@ export interface ApiRunExit {
 export type RunStatus = 'queued' | 'dispatched' | 'running' | 'blocked' | 'done' | 'failed' | 'cancelled';
 /** Sub-state of `running` (RUN-31), never a RunStatus value — see shared/runner.ts for why. */
 export type RunPhase = 'agent' | 'verifying' | 'landing';
+/** How hard the model should think (RUN-33) — intent, not a vendor knob. The daemon maps it per
+ *  driver: the Claude SDK takes these verbatim, codex clamps xhigh/max to its own 'high'. */
+export type RunEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 export interface ApiRun {
   id: string;
   projectId: string;
@@ -235,6 +238,11 @@ export interface DispatchInput {
    *  at all is the REPO's call — [land].allowedBranches, checked by the daemon, which is the only
    *  side that can see the committed manifest. Empty/omitted = the repo's own choice. */
   targetBranch?: string | null;
+  /** Per-dispatch model + effort (RUN-33). Omitted/null = the repo's [defaults] for this kind,
+   *  then whatever the tool defaults to — the daemon resolves that chain, since only it can see
+   *  the committed manifest. */
+  model?: string | null;
+  effort?: RunEffort | null;
   budget?: Partial<ApiRunBudget>;
 }
 
