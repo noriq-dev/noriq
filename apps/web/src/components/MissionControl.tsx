@@ -1,5 +1,5 @@
 // Mission Control — agent roster | live event feed | agent detail or who-holds-what.
-import { useState } from 'react';
+import { useLayoutEffect, useRef, useState } from 'react';
 import type { AppStore } from '../store';
 import { agentFg, fmtTtl, initials, isGhostColor, statusMeta, verbColors, YOU_GRADIENT } from '../design';
 import { AvatarChip, MonoTag, SectionLabel, WaveBars } from './bits';
@@ -299,12 +299,46 @@ function AttentionInbox({ store }: { store: AppStore }) {
   );
 }
 
+/** How close to the bottom (px) still counts as "pinned" for auto-scroll. */
+const STICK_THRESHOLD = 60;
+
 function EventFeed({ store }: { store: AppStore }) {
   const { data, currentPid, helpers, actions, selectedTaskId } = store;
-  const events = data.events[currentPid] ?? [];
+  // The store keeps events newest-first (Graph and the agent detail rely on that).
+  // The feed reads chat-style instead: oldest at the top, newest arriving at the bottom.
+  const events = [...(data.events[currentPid] ?? [])].reverse();
   const tasks = helpers.tasksOf(currentPid);
   const selTask = selectedTaskId != null ? tasks.find((t) => t.id === selectedTaskId) : null;
   const holderName = selTask?.claimedBy ? helpers.agentById(currentPid, selTask.claimedBy)?.name : null;
+
+  const scrollRef = useRef<HTMLDivElement>(null);
+  // Track whether the user is pinned to the bottom, so incoming events don't yank
+  // the viewport while they're reading back through history.
+  const stuckToBottom = useRef(true);
+  const newestId = events[events.length - 1]?.id ?? null;
+
+  const onScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    stuckToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight <= STICK_THRESHOLD;
+  };
+
+  // Jump (no animation) to the bottom when the project changes — a fresh feed
+  // should open at the newest event, not mid-history.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    stuckToBottom.current = true;
+    el.scrollTop = el.scrollHeight;
+  }, [currentPid]);
+
+  // Follow new events only while pinned to the bottom. Layout effect so the feed
+  // lands at the newest row before paint instead of visibly jumping after it.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !stuckToBottom.current) return;
+    el.scrollTop = el.scrollHeight;
+  }, [newestId]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, minWidth: 0, borderRight: '1px solid var(--line)' }}>
@@ -328,7 +362,7 @@ function EventFeed({ store }: { store: AppStore }) {
         </span>
       </div>
       <AttentionInbox store={store} />
-      <div style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: '8px 0' }}>
+      <div ref={scrollRef} onScroll={onScroll} style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: '8px 0' }}>
         {events.map((ev) => {
           const ag = (data.agents[currentPid] ?? []).find((a) => a.name === ev.actor || a.id === ev.actor) ?? null;
           const isYou = ev.actorKind === 'human';
@@ -345,7 +379,7 @@ function EventFeed({ store }: { store: AppStore }) {
                 gap: 12,
                 alignItems: 'flex-start',
                 cursor: ev.taskId != null ? 'pointer' : 'default',
-                animation: 'pl-stream .45s ease both',
+                animation: 'pl-stream-up .45s ease both',
                 borderLeft: '2px solid transparent',
               }}
             >

@@ -84,6 +84,8 @@ button { all: unset; box-sizing: border-box; max-width: 100%; }
 @keyframes pl-pulse { 0% { transform: scale(1); opacity: 0.9; } 70% { transform: scale(2.6); opacity: 0; } 100% { opacity: 0; } }
 @keyframes pl-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 @keyframes pl-stream { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+/* Feed rows append at the bottom (chat-style), so they rise into place rather than drop in. */
+@keyframes pl-stream-up { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 @keyframes pl-dash { to { stroke-dashoffset: -24; } }
 @keyframes pl-wave { 0%, 100% { transform: scaleY(0.35); } 50% { transform: scaleY(1); } }
 @keyframes pl-drawer { from { transform: translateX(30px); opacity: 0; } to { transform: none; opacity: 1; } }
