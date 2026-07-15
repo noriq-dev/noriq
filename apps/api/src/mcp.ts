@@ -5,7 +5,13 @@ import type { AgentIdentity } from './auth';
 import type { Actor } from './do/ProjectRoom';
 import { computeUpdates, formatNotices } from './sync';
 import { base64ToBytes, bytesToBase64, newId, nowIso, sha256Hex } from './lib/util';
-import { TASK_NOT_IN_PROPOSED_PLAN, USER_PROJECT_WHERE, userCanAccessProject } from './lib/visibility';
+import {
+  TASK_NOT_IN_PROPOSED_PLAN,
+  USER_PROJECT_WHERE,
+  tokenCanReachProject,
+  tokenProjectWhere,
+  userCanAccessProject,
+} from './lib/visibility';
 
 const MAX_ATTACHMENT = 100 * 1024 * 1024;
 /** Stable resource URI for an attachment; agents read bytes back via resources/read. */
@@ -114,6 +120,15 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         if (typeof pid === 'string' && pid && !(await userCanAccessProject(env, agent.userId, pid))) {
           throw new Error(`project ${pid} not found or not accessible to you`);
         }
+        // …and then to what THIS TOKEN was authorized for (RUN-38). Two distinct limits: the
+        // user's reach is who you are, the token's scope is what this particular credential
+        // was granted — a laptop authorized for one project must not touch the rest of the
+        // account. Enforced here, once, because every project-bearing tool funnels through
+        // this wrapper; sprinkling it per-tool is how the next tool forgets.
+        if (typeof pid === 'string' && pid && opts.oauthTokenId
+            && !(await tokenCanReachProject(env, opts.oauthTokenId, pid))) {
+          throw new Error(`project ${pid} is outside this connection's authorized projects`);
+        }
         body = await fn(args);
       } catch (err) {
         return {
@@ -121,7 +136,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           isError: true,
         };
       }
-      const updates = await computeUpdates(env, agent);
+      const updates = await computeUpdates(env, agent, { oauthTokenId: opts.oauthTokenId });
       const notices = formatNotices(updates);
       if (notices) await pushChannel(notices, { kind: 'notices' }, extra?.requestId);
       const text = JSON.stringify(body, null, 1) + (notices ? `\n\n${notices}` : '');
@@ -155,12 +170,13 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     'Call this FIRST in every session. Returns the Noriq playbook plus your current state: who you are, tasks you hold, unresolved comments awaiting you, what is claimable, and recent messages.',
     {},
     tool(async () => {
-      const updates = await computeUpdates(env, agent, { advanceCursor: false });
+      const updates = await computeUpdates(env, agent, { advanceCursor: false, oauthTokenId: opts.oauthTokenId });
       const projects = (
         await env.DB.prepare(
           `SELECT p.id, p.key, p.name, p.description, p.status FROM projects p
-           WHERE p.status = 'active' AND ${USER_PROJECT_WHERE} ORDER BY p.created_at`,
-        ).bind(agent.userId).all()
+           WHERE p.status = 'active' AND ${USER_PROJECT_WHERE}
+             AND ${tokenProjectWhere('?2')} ORDER BY p.created_at`,
+        ).bind(agent.userId, opts.oauthTokenId ?? null).all()
       ).results;
       return {
         // `kind` is what an identity most needs to know about itself (0026): a copilot is a
@@ -185,7 +201,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     'my_updates',
     'Your delta since last call (server-side cursor, no client state needed). Call whenever you finish a step or need orientation. Open comments are sticky — they reappear until resolved.',
     {},
-    tool(async () => computeUpdates(env, agent)),
+    tool(async () => computeUpdates(env, agent, { oauthTokenId: opts.oauthTokenId })),
   );
 
   if (opts.oauthTokenId) {
@@ -247,8 +263,9 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       const { results } = await env.DB.prepare(
         `SELECT p.id, p.key, p.name, p.description, p.repo_url AS repoUrl,
                 (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status NOT IN ('done','cancelled')) AS openTasks
-         FROM projects p WHERE p.status = 'active' AND ${USER_PROJECT_WHERE} ORDER BY p.created_at`,
-      ).bind(agent.userId).all();
+         FROM projects p WHERE p.status = 'active' AND ${USER_PROJECT_WHERE}
+           AND ${tokenProjectWhere('?2')} ORDER BY p.created_at`,
+      ).bind(agent.userId, opts.oauthTokenId ?? null).all();
       return { projects: results };
     }),
   );
@@ -269,6 +286,18 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       ).bind(id, args.key, args.name, args.description ?? '', args.repoUrl ?? null, agent.userId, nowIso()).run();
       await room(env, id).createMilestone(id, actor, 'Backlog');
       await room(env, id).createBoard(id, actor, 'Main');
+      // A scoped token joins the project it just created to its own scope (RUN-38). Otherwise
+      // create_project is a trap: it succeeds and returns an id the caller is then refused
+      // access to. This does let a scoped token widen itself — but only to projects it creates
+      // itself, under its own user, never to one that already existed. That is the line between
+      // bootstrapping and escalation, and it is what lets a token scoped to NOTHING (a
+      // brand-new user's first connection) get started at all.
+      if (opts.oauthTokenId) {
+        await env.DB.prepare(
+          `INSERT OR IGNORE INTO oauth_token_projects (token_id, project_id)
+           SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM oauth_tokens WHERE id = ?1 AND scoped_at IS NOT NULL)`,
+        ).bind(opts.oauthTokenId, id).run();
+      }
       return { id, key: args.key };
     }),
   );
@@ -454,17 +483,23 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       // Scope to what the agent's USER can reach (PLNR-95): with no projectId the
       // central guard is skipped, so without this an omitted-projectId call returned
       // the top task (incl. body) across ALL tenants. Mirrors sync.ts `claimable`.
+      //
+      // The token clause is here for the same reason, and it is not redundant with the
+      // central guard: omitting projectId is exactly how a scoped token would otherwise be
+      // handed work from a project it was never authorized for — the pull-loop chooses the
+      // project, so nothing upstream can check it (RUN-38).
       const row = await env.DB.prepare(
         `SELECT t.id, t.key, t.title, t.body, t.priority, t.project_id AS projectId
          FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
          WHERE t.status = 'todo' AND t.claimed_by IS NULL AND (?2 IS NULL OR t.project_id = ?2)
            AND ${USER_PROJECT_WHERE}
+           AND ${tokenProjectWhere('?3')}
            AND NOT EXISTS (
              SELECT 1 FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id
              WHERE d.task_id = t.id AND dt.status NOT IN ('done','cancelled'))
            AND ${TASK_NOT_IN_PROPOSED_PLAN}
          ORDER BY t.priority DESC, t."order" LIMIT 1`,
-      ).bind(agent.userId, projectId ?? null).first();
+      ).bind(agent.userId, projectId ?? null, opts.oauthTokenId ?? null).first();
       return row ? { task: row } : { task: null, note: 'nothing claimable right now — check my_updates for blockers' };
     }),
   );
@@ -747,8 +782,9 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         const { results } = await env.DB.prepare(
           `SELECT a.id, a.filename, a.content_type AS ct, a.size
            FROM attachments a JOIN tasks t ON t.id = a.task_id JOIN projects p ON p.id = t.project_id
-           WHERE p.status = 'active' AND ${USER_PROJECT_WHERE} ORDER BY a.created_at DESC LIMIT 50`,
-        ).bind(agent.userId).all<{ id: string; filename: string; ct: string; size: number }>();
+           WHERE p.status = 'active' AND ${USER_PROJECT_WHERE}
+             AND ${tokenProjectWhere('?2')} ORDER BY a.created_at DESC LIMIT 50`,
+        ).bind(agent.userId, opts.oauthTokenId ?? null).all<{ id: string; filename: string; ct: string; size: number }>();
         return {
           resources: results.map((a) => ({
             uri: attachmentUri(a.id),

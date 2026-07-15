@@ -1,4 +1,4 @@
-import { SELF } from 'cloudflare:test';
+import { SELF, env } from 'cloudflare:test';
 
 export const ADMIN = 'test-admin-token';
 
@@ -33,7 +33,24 @@ async function mintBoot() {
   }
 }
 
-/** Full OAuth mint: consent → code → token → set_agent_identity(name, role). */
+/** Every active project a user owns — what the mint helpers tick on the consent form. */
+async function userProjectIds(email: string): Promise<string[]> {
+  const { results } = await (env as unknown as { DB: D1Database }).DB.prepare(
+    "SELECT p.id FROM projects p JOIN users u ON u.id = p.owner_user_id WHERE u.email = ? AND p.status = 'active'",
+  ).bind(email).all<{ id: string }>();
+  return results.map((r) => r.id);
+}
+const mintUserProjectIds = () => userProjectIds('agent-mint@example.com');
+
+/**
+ * Full OAuth mint: consent → code → token → set_agent_identity(name, role).
+ *
+ * Consent now REQUIRES a project scope when the user has any (RUN-38), so tick all of them —
+ * that reproduces exactly what these tests assumed before scoping existed ("this token reaches
+ * everything its user does") while still exercising the scoped path rather than the legacy
+ * unscoped one. Projects created LATER by the token itself join its scope automatically
+ * (create_project), which is what lets a mint with zero projects still bootstrap.
+ */
 export async function createAgent(name: string, role: 'orchestrator' | 'worker' = 'worker') {
   await mintBoot();
   const verifier = `mint-verifier-${name}-`.padEnd(48, 'x');
@@ -43,6 +60,7 @@ export async function createAgent(name: string, role: 'orchestrator' | 'worker' 
   });
   const form = new URLSearchParams(Object.fromEntries(q.entries()));
   form.set('decision', 'approve');
+  for (const id of await mintUserProjectIds()) form.append('project_ids', id);
   const approve = await SELF.fetch('https://planar.test/oauth/authorize', {
     method: 'POST',
     headers: { Cookie: mintCookie!, 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -80,6 +98,10 @@ export async function mintTokenForUser(email: string, password = 'longenough1'):
     response_type: 'code', client_id: clientId, redirect_uri: 'http://localhost:39990/cb',
     code_challenge: await s256b64url(verifier), code_challenge_method: 'S256', scope: 'mcp', state: 'm', decision: 'approve',
   });
+  // Same rule as createAgent: consent requires a scope once the user has projects (RUN-38).
+  // Tick whatever exists at mint time. Anything this token creates later joins its scope
+  // automatically; anything created later by someone ELSE needs authorizeForAllProjects.
+  for (const id of await userProjectIds(email)) form.append('project_ids', id);
   const approve = await SELF.fetch('https://planar.test/oauth/authorize', {
     method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
     body: form.toString(), redirect: 'manual',
@@ -264,4 +286,41 @@ export async function loginSession(email: string, password: string): Promise<str
   if (res.status !== 200) throw new Error(`login failed: ${await res.text()}`);
   const cookie = res.headers.get('Set-Cookie') ?? '';
   return cookie.split(';')[0] ?? '';
+}
+
+/**
+ * Authorize an existing connection for every project its user can currently reach —
+ * i.e. what a human does by re-running consent with all the boxes ticked.
+ *
+ * Needed because scoping (RUN-38) makes fixture ORDER matter in a way it never used to. A
+ * token minted before a project exists is scoped to nothing, and only the token that CREATES
+ * a project gains it; several suites mint their agents in beforeAll and create the shared
+ * project afterwards, so the other agents are correctly — and newly — locked out. That is the
+ * feature working, not a bug, so the fixtures say out loud that the human granted access
+ * rather than having the old implicit "every token reaches everything" quietly restored.
+ */
+export async function authorizeForAllProjects(...apiKeys: string[]): Promise<void> {
+  const db = (env as unknown as { DB: D1Database }).DB;
+  for (const apiKey of apiKeys) {
+    const hash = await sha256HexTest(apiKey);
+    const tok = await db.prepare('SELECT id, user_id AS userId FROM oauth_tokens WHERE token_hash = ?')
+      .bind(hash).first<{ id: string; userId: string }>();
+    if (!tok) throw new Error('authorizeForAllProjects: unknown token');
+    const { results } = await db.prepare(
+      `SELECT p.id FROM projects p
+       WHERE p.status = 'active' AND (p.owner_user_id = ?1
+         OR (p.group_id IS NOT NULL AND p.group_id IN (SELECT group_id FROM user_groups WHERE user_id = ?1)))`,
+    ).bind(tok.userId).all<{ id: string }>();
+    if (!results.length) continue;
+    await db.batch(
+      results.map((r) =>
+        db.prepare('INSERT OR IGNORE INTO oauth_token_projects (token_id, project_id) VALUES (?, ?)').bind(tok.id, r.id),
+      ),
+    );
+  }
+}
+
+async function sha256HexTest(s: string): Promise<string> {
+  const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }

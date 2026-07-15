@@ -8,7 +8,7 @@ import { buildMcpServer } from './mcp';
 import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot } from './backup';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, verifyPassword } from './lib/util';
-import { USER_PROJECT_WHERE, userCanAccessProject } from './lib/visibility';
+import { USER_PROJECT_WHERE, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
 import type { Actor } from './do/ProjectRoom';
 import { SKILL_MD } from './skill';
 import { issueTokens, metadataRoutes, oauth } from './oauth';
@@ -281,6 +281,13 @@ app.get('/api/auth/me', userAuth, (c) => c.json({ user: c.var.user }));
 app.get('/api/auth/sessions', userAuth, async (c) => {
   const { results } = await c.env.DB.prepare(
     `SELECT t.id, COALESCE(cl.name, 'MCP client') AS clientName, t.scope, t.created_at AS createdAt, t.expires_at AS expiresAt,
+            -- RUN-38: what this connection may actually reach. scoped_at distinguishes a
+            -- legacy token (reaches everything its user can) from one a human put through the
+            -- picker. Surfacing it turns a grandfathered token from an invisible hole into
+            -- something a human can look at and decide to revoke.
+            t.scoped_at IS NOT NULL AS scoped,
+            (SELECT GROUP_CONCAT(p.key) FROM oauth_token_projects otp JOIN projects p ON p.id = otp.project_id
+              WHERE otp.token_id = t.id) AS projectKeys,
             (SELECT COUNT(*) FROM agents a WHERE a.oauth_token_id = t.id AND a.status != 'revoked') AS agentCount,
             (SELECT MAX(a.last_seen_at) FROM agents a WHERE a.oauth_token_id = t.id) AS lastActive
      FROM oauth_tokens t LEFT JOIN oauth_clients cl ON cl.id = t.client_id
@@ -901,13 +908,21 @@ async function resolveRunnerRepos(
   env: Env,
   ownerUserId: string,
   repos: Array<z.infer<typeof RunnerRepo>>,
+  tokenId: string | null = null,
 ): Promise<Array<z.infer<typeof RunnerRepo>>> {
   const out: Array<z.infer<typeof RunnerRepo>> = [];
   for (const r of repos) {
     const key = normalizeProjectKey(r.projectKey);
+    // Resolve only within the TOKEN's projects, not merely the user's (RUN-38). A repo the
+    // runner advertises but is not scoped for resolves to null — unresolved, undispatchable —
+    // rather than silently binding. That null is the enforcement: dispatch already refuses a
+    // repo with no projectId, so scoping the resolution scopes the whole dispatch path with
+    // it. Dropping the repo entirely would be worse: the operator would see a marker on disk
+    // and no repo in the dashboard, with nothing saying why.
     const row = await env.DB.prepare(
-      `SELECT p.id AS id FROM projects p WHERE p.key = ?2 AND ${USER_PROJECT_WHERE}`,
-    ).bind(ownerUserId, key).first<{ id: string }>();
+      `SELECT p.id AS id FROM projects p
+       WHERE p.key = ?2 AND ${USER_PROJECT_WHERE} AND ${tokenProjectWhere('?3')}`,
+    ).bind(ownerUserId, key, tokenId).first<{ id: string }>();
     out.push({ ...r, projectKey: key, projectId: row?.id ?? null });
   }
   return out;
@@ -936,7 +951,7 @@ app.post('/api/runners', agentAuth, async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid runner registration', detail: parsed.error.issues }, 400);
   const b = parsed.data;
   const userId = c.var.connection!.userId;
-  const repos = await resolveRunnerRepos(c.env, userId, b.repos);
+  const repos = await resolveRunnerRepos(c.env, userId, b.repos, c.var.connection!.tokenId);
   const capabilities = JSON.stringify({ tools: b.tools, kinds: b.kinds, maxConcurrency: b.maxConcurrency });
   const now = nowIso();
   let id = b.runnerId;
@@ -977,7 +992,7 @@ app.post('/api/runners/:id/heartbeat', agentAuth, async (c) => {
   if (!owned) return c.json({ error: 'runner not found' }, 404);
   const b = parsed.data;
   if (b.repos) {
-    const repos = await resolveRunnerRepos(c.env, userId, b.repos);
+    const repos = await resolveRunnerRepos(c.env, userId, b.repos, c.var.connection!.tokenId);
     await c.env.DB.prepare('UPDATE runners SET free_slots = ?, status = ?, repos = ?, last_heartbeat_at = ? WHERE id = ?')
       .bind(b.freeSlots, b.status, JSON.stringify(repos), nowIso(), id).run();
   } else {
@@ -1154,6 +1169,13 @@ app.post('/api/runs/:runId/agent', agentAuth, async (c) => {
   // Same ownership test as steer-ack: the run must belong to a runner this user owns.
   if (!run || run.owner !== conn.userId) return c.json({ error: 'run not found' }, 404);
   if (!run.runnerId) return c.json({ error: 'run has no runner yet' }, 400);
+  // The runner's token must be authorized for the run's project (RUN-38). Without this a
+  // scoped runner could mint itself an agent — and a working credential — inside a project it
+  // was never granted, which would make the whole scope decorative. Repo resolution normally
+  // stops such a run existing; this is the check that does not depend on that having worked.
+  if (!(await tokenCanReachProject(c.env, conn.tokenId, run.projectId))) {
+    return c.json({ error: 'run is outside this connection’s authorized projects' }, 403);
+  }
   // One agent per run, and it is not re-issuable: handing out a second credential for the
   // same run would mean two live processes could act as one identity, which is exactly the
   // ambiguity this task exists to remove.

@@ -1,7 +1,7 @@
 // PLNR-54: notices must be *pushed* as JSON-RPC notifications on the live POST SSE
 // stream (relatedRequestId routing), not only piggybacked in the tool result text.
 import { describe, expect, it, beforeAll } from 'vitest';
-import { createAgent, mcpCall, mcpCallStream } from './helpers';
+import { createAgent, mcpCall, mcpCallStream, authorizeForAllProjects } from './helpers';
 
 let alice: { id: string; apiKey: string };
 let bob: { id: string; apiKey: string };
@@ -12,6 +12,12 @@ beforeAll(async () => {
   bob = await createAgent('notify-bob');
   const proj = await mcpCall(alice.apiKey, 'create_project', { key: 'NTFY', name: 'notify' });
   projectId = proj.body.id;
+  // Scoping (RUN-38): these agents were minted before the project existed, so each token is
+  // scoped to nothing and only the CREATOR gains the new project. A human would authorize them
+  // for it — say so explicitly rather than let the old implicit "every token sees everything"
+  // creep back in.
+  await authorizeForAllProjects(alice.apiKey, bob.apiKey);
+
 }, 60000);
 
 describe('MCP live notifications', () => {

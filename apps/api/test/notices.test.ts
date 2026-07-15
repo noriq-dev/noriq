@@ -1,7 +1,7 @@
 // PLNR-25: notices policy — piggyback only what's urgent/relevant to THIS agent.
 import { SELF } from 'cloudflare:test';
 import { describe, expect, it, beforeAll, afterAll } from 'vitest';
-import { createAgent, createUser, loginSession, mcpCall } from './helpers';
+import { createAgent, createUser, loginSession, mcpCall, authorizeForAllProjects } from './helpers';
 
 let idle: { id: string; apiKey: string };
 let busy: { id: string; apiKey: string };
@@ -39,6 +39,12 @@ beforeAll(async () => {
   cookie = await loginSession('notices-human@example.com', 'longenough1');
   const proj = await mcpCall(idle.apiKey, 'create_project', { key: 'NOTE', name: 'notices' });
   projectId = proj.body.id;
+  // Scoping (RUN-38): these agents were minted before the project existed, so each token is
+  // scoped to nothing and only the CREATOR gains the new project. A human would authorize them
+  // for it — say so explicitly rather than let the old implicit "every token sees everything"
+  // creep back in.
+  await authorizeForAllProjects(idle.apiKey, busy.apiKey);
+
 }, 60000);
 
 describe('notices policy (PLNR-25)', () => {

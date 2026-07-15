@@ -2,7 +2,7 @@
 // foundation everything else stands on — prove it holds under a concurrent
 // stampede, and that legitimate parallel work isn't serialized away.
 import { describe, expect, it, beforeAll } from 'vitest';
-import { createAgent, mcpCall } from './helpers';
+import { createAgent, mcpCall, authorizeForAllProjects } from './helpers';
 
 const RACERS = 12;
 
@@ -17,6 +17,12 @@ beforeAll(async () => {
   }
   const proj = await mcpCall(agents[0]!.apiKey, 'create_project', { key: 'LOAD', name: 'load-test' });
   projectId = proj.body.id;
+  // Scoping (RUN-38): these agents were minted before the project existed, so each token is
+  // scoped to nothing and only the CREATOR gains the new project. A human would authorize them
+  // for it — say so explicitly rather than let the old implicit "every token sees everything"
+  // creep back in.
+  await authorizeForAllProjects(...agents.map((a) => a.apiKey));
+
 }, 60000);
 
 describe('claim arbiter under load', () => {

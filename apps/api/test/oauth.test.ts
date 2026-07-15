@@ -1,6 +1,6 @@
 import { SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { createAgent, createUser, loginSession, mcpCall, sessionFor } from './helpers';
+import { createAgent, createUser, loginSession, mcpCall, sessionFor, authorizeForAllProjects } from './helpers';
 
 let cookie: string;
 
@@ -133,6 +133,9 @@ describe('oauth 2.1 for MCP', () => {
     const owner = await createAgent('coll-owner');
     const other = await createAgent('coll-other');
     const proj = await mcpCall(owner.apiKey, 'create_project', { key: 'OWN', name: 'ownership' });
+    // `other` was minted before OWN existed, so it is not scoped for it (RUN-38) and would be
+    // refused for the wrong reason — this test is about NAME collision, not scope.
+    await authorizeForAllProjects(other.apiKey);
     const mine = await mcpCall(owner.apiKey, 'set_agent_identity', { name: 'shared-name', projectId: proj.body.id });
     expect(mine.isError).toBe(false);
     const steal = await mcpCall(other.apiKey, 'set_agent_identity', { name: 'shared-name', projectId: proj.body.id });

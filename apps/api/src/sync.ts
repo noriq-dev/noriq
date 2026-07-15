@@ -1,6 +1,6 @@
 import type { Env } from './env';
 import type { AgentIdentity } from './auth';
-import { TASK_NOT_IN_PROPOSED_PLAN, USER_PROJECT_WHERE } from './lib/visibility';
+import { TASK_NOT_IN_PROPOSED_PLAN, USER_PROJECT_WHERE, tokenProjectWhere } from './lib/visibility';
 
 /**
  * Agent-scoped delta sync (ROADMAP Phase 1).
@@ -24,7 +24,16 @@ export interface AgentUpdates {
   pendingInputRequests: Array<{ id: string; taskKey: string | null; title: string; createdAt: string }>;
 }
 
-export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { advanceCursor?: boolean } = {}): Promise<AgentUpdates> {
+export async function computeUpdates(
+  env: Env,
+  agent: AgentIdentity,
+  opts: { advanceCursor?: boolean; oauthTokenId?: string | null } = {},
+): Promise<AgentUpdates> {
+  // The token's own project scope (RUN-38). This feed is what an agent is TOLD exists —
+  // claimable work, notices, broadcast chatter — so leaving it unscoped would advertise
+  // projects the credential cannot actually touch: the agent would see the work, try it, and
+  // be refused by the tool guard. Narrow the offer, not just the action.
+  const tokenId = opts.oauthTokenId ?? null;
   const session = env.AGENT_SESSION.get(env.AGENT_SESSION.idFromName(agent.id));
   let cursor = await session.cursor();
 
@@ -66,21 +75,23 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
        FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
        WHERE t.status = 'todo' AND t.claimed_by IS NULL
          AND ${USER_PROJECT_WHERE}
+         AND ${tokenProjectWhere('?3')}
          AND (?2 IS NULL OR t.project_id = ?2)
          AND NOT EXISTS (
            SELECT 1 FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id
            WHERE d.task_id = t.id AND dt.status NOT IN ('done','cancelled'))
          AND ${TASK_NOT_IN_PROPOSED_PLAN}
        ORDER BY t.priority DESC, t."order" LIMIT 20`,
-    ).bind(agent.userId, agentProjectId).all<AgentUpdates['claimable'][number]>()
+    ).bind(agent.userId, agentProjectId, tokenId).all<AgentUpdates['claimable'][number]>()
   ).results;
   const claimableIds = new Set(claimable.map((t) => t.id));
 
   // Projects the agent's USER can reach — scopes broadcast messages/notices so an
   // agent never hears cross-tenant chatter (PLNR-96).
   const accessibleProjectIds = new Set(
-    (await env.DB.prepare(`SELECT p.id FROM projects p WHERE ${USER_PROJECT_WHERE} AND (?2 IS NULL OR p.id = ?2)`)
-      .bind(agent.userId, agentProjectId).all<{ id: string }>()).results.map((r) => r.id),
+    (await env.DB.prepare(
+      `SELECT p.id FROM projects p WHERE ${USER_PROJECT_WHERE} AND ${tokenProjectWhere('?3')} AND (?2 IS NULL OR p.id = ?2)`,
+    ).bind(agent.userId, agentProjectId, tokenId).all<{ id: string }>()).results.map((r) => r.id),
   );
 
   // Steers already delivered to this agent over the runtime channel (RUN-7): skip
@@ -138,9 +149,10 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
        FROM comments c JOIN tasks t ON t.id = c.task_id JOIN projects p ON p.id = t.project_id
        WHERE t.claimed_by IS NULL AND c.status IN ('open','acknowledged') AND c.author_kind != 'agent'
          AND ${USER_PROJECT_WHERE}
+         AND ${tokenProjectWhere('?3')}
          AND (?2 IS NULL OR t.project_id = ?2)
        ORDER BY c.created_at LIMIT 10`,
-    ).bind(agent.userId, agentProjectId).all<AgentUpdates['unassignedComments'][number]>()
+    ).bind(agent.userId, agentProjectId, tokenId).all<AgentUpdates['unassignedComments'][number]>()
   ).results;
 
   // Recent direct/broadcast messages (last 10, regardless of cursor, for context).
@@ -148,9 +160,9 @@ export async function computeUpdates(env: Env, agent: AgentIdentity, opts: { adv
     await env.DB.prepare(
       `SELECT m.id, m.from_name AS "from", m.body, m.ref_task_id AS refTaskId, m.created_at AS createdAt
        FROM messages m JOIN projects p ON p.id = m.project_id
-       WHERE (m.to_agent_id = ?2 OR (m.to_agent_id IS NULL AND ${USER_PROJECT_WHERE} AND (?3 IS NULL OR m.project_id = ?3))) AND m.from_id != ?2
+       WHERE (m.to_agent_id = ?2 OR (m.to_agent_id IS NULL AND ${USER_PROJECT_WHERE} AND ${tokenProjectWhere('?4')} AND (?3 IS NULL OR m.project_id = ?3))) AND m.from_id != ?2
        ORDER BY m.created_at DESC LIMIT 10`,
-    ).bind(agent.userId, agent.id, agentProjectId).all<AgentUpdates['messages'][number]>()
+    ).bind(agent.userId, agent.id, agentProjectId, tokenId).all<AgentUpdates['messages'][number]>()
   ).results;
 
   // Input requests this agent is still waiting on (so it doesn't re-ask or forget).

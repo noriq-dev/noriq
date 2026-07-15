@@ -13,6 +13,7 @@ import type { Context } from 'hono';
 import type { AppContext } from './auth';
 import type { Env } from './env';
 import { getCookie } from './auth';
+import { USER_PROJECT_WHERE } from './lib/visibility';
 import { newId, nowIso, sha256Hex } from './lib/util';
 import { isCimdId, redirectUriAllowed, resolveCimdClient } from './lib/cimd';
 
@@ -234,6 +235,13 @@ const AUTH_CSS = `
     label{display:block;font-family:ui-monospace,monospace;font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:#6b7280;margin:12px 0 0}
     input{box-sizing:border-box;width:100%;margin-top:6px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:9px;padding:9px 12px;color:#e6e8ec;font-size:13px;outline:none;font-family:inherit}
     .hint{font-size:11px;color:#6b7280;line-height:1.5}
+    .projects{max-height:190px;overflow-y:auto;border:1px solid rgba(255,255,255,.1);border-radius:9px;margin-top:8px}
+    .proj{display:flex;align-items:center;gap:9px;padding:9px 11px;margin:0;font-family:inherit;font-size:13px;
+          text-transform:none;letter-spacing:normal;color:#e6e8ec;cursor:pointer;border-bottom:1px solid rgba(255,255,255,.06)}
+    .proj:last-child{border-bottom:none}
+    .proj:hover{background:rgba(255,255,255,.04)}
+    .proj input{width:auto;margin:0;flex:none}
+    .proj span{color:#6b7280;font-size:12px}
     .row{display:flex;gap:10px;margin-top:18px;justify-content:flex-end}
     button{cursor:pointer;font-weight:600;font-size:13px;padding:10px 18px;border-radius:9px;border:none;font-family:inherit}
     .approve{background:#c6f24e;color:#0a0b0d}
@@ -247,7 +255,13 @@ const AUTH_CSS = `
 const authShell = (title: string, inner: string, error?: string) =>
   `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title><style>${AUTH_CSS}</style></head><body><div class="card"><span class="logo"><div></div></span><h1>Noriq</h1>${inner}${error ? `<div class="err">${esc(error)}</div>` : ''}</div></body></html>`;
 
-function consentPage(clientName: string, agentDefault: string, params: AuthzParams, user: { name: string } | null, error?: string): string {
+function consentPage(
+  clientName: string,
+  projects: Array<{ id: string; key: string; name: string }>,
+  params: AuthzParams,
+  user: { name: string } | null,
+  error?: string,
+): string {
   const hidden = Object.entries(params)
     .map(([k, v]) => `<input type="hidden" name="${esc(k)}" value="${esc(v)}">`)
     .join('');
@@ -255,13 +269,28 @@ function consentPage(clientName: string, agentDefault: string, params: AuthzPara
   // client_id is a CIMD URL and the client name can't be fully trusted (PLNR-82).
   let redirectHost = params.redirect_uri;
   try { redirectHost = new URL(params.redirect_uri).host; } catch { /* keep raw */ }
+  // The scope choice, made mandatory (RUN-38). A token used to inherit everything its user
+  // could reach, so authorizing a laptop handed it the whole account. `required` on the group
+  // is enforced server-side too — a hand-rolled POST must not skip the decision.
+  const picker = projects.length
+    ? `
+    <p class="hint" style="margin-top:14px">Which projects may this connection reach? It will not see the others.</p>
+    <div class="projects">
+      ${projects
+        .map(
+          (p) => `<label class="proj"><input type="checkbox" name="project_ids" value="${esc(p.id)}"> <b>${esc(p.key)}</b> <span>${esc(p.name)}</span></label>`,
+        )
+        .join('')}
+    </div>`
+    : `<p class="hint" style="margin-top:14px">You have no projects yet. Approving gives this connection
+       access to <b>nothing</b> — it can create a project, and reaches only what it creates until you
+       authorize it for more.</p>`;
   const inner = user
     ? `
     <p class="sub">Signed in as <b>${esc(user.name)}</b>. <b>${esc(clientName)}</b> is requesting access to the Noriq MCP <b>on your behalf</b>.</p>
     <p class="hint">On approval you'll be returned to <b>${esc(redirectHost)}</b> — only continue if you recognize it.</p>
-    <p class="hint">It starts as the agent <b>${esc(agentDefault)}</b> (delegated by you). The agent itself can take a
-    different identity later with the <code>set_agent_identity</code> tool — no need to decide here.</p>
     <form method="POST" action="/oauth/authorize">${hidden}
+      ${picker}
       <div class="row">
         <button name="decision" value="deny" class="ghost">Deny</button>
         <button name="decision" value="approve" class="approve">Approve</button>
@@ -277,13 +306,31 @@ function consentPage(clientName: string, agentDefault: string, params: AuthzPara
   return authShell('Noriq · authorize', inner, error);
 }
 
+/** The projects a human may grant this connection — exactly what they can already reach.
+ *  A token can never exceed its user, so the picker offers no more than that. */
+async function pickableProjects(db: D1Database, userId: string): Promise<Array<{ id: string; key: string; name: string }>> {
+  const { results } = await db.prepare(
+    `SELECT p.id, p.key, p.name FROM projects p
+     WHERE p.status = 'active' AND ${USER_PROJECT_WHERE} ORDER BY p.key`,
+  ).bind(userId).all<{ id: string; key: string; name: string }>();
+  return results;
+}
+
+/** The ticked boxes, validated against what the user can actually reach — never trust the
+ *  form. A hand-rolled POST could otherwise name any project id and scope itself to it. */
+async function readProjectIds(db: D1Database, userId: string, form: Record<string, unknown>): Promise<string[]> {
+  const raw = form.project_ids;
+  const wanted = new Set((Array.isArray(raw) ? raw : raw == null ? [] : [raw]).map(String));
+  return (await pickableProjects(db, userId)).map((p) => p.id).filter((id) => wanted.has(id));
+}
+
 oauth.get('/authorize', async (c) => {
   const p = readParams(new URL(c.req.url).searchParams);
   const v = await validateClient(c.env, p);
   if (!v.ok) return c.text(`invalid authorization request: ${v.err}`, 400);
   const user = await currentUser(c);
-  const agentDefault = user ? `${user.name.split(' ')[0]?.toLowerCase() ?? 'me'}-${v.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 20)}` : '';
-  return c.html(consentPage(v.name, agentDefault, p, user));
+  const projects = user ? await pickableProjects(c.env.DB, user.id) : [];
+  return c.html(consentPage(v.name, projects, p, user));
 });
 
 oauth.post('/authorize', async (c) => {
@@ -318,14 +365,28 @@ oauth.post('/authorize', async (c) => {
     if (row?.hash && (await verifyPassword(String(form.password ?? ''), row.hash))) {
       user = row;
     } else {
-      return c.html(consentPage(v.name, '', p, null, 'invalid credentials'), 401);
+      return c.html(consentPage(v.name, [], p, null, 'invalid credentials'), 401);
     }
     // Show the consent step now that they're identified.
-    const agentDefault = `${user.name.split(' ')[0]?.toLowerCase() ?? 'me'}-${v.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 20)}`;
-    return c.html(consentPage(v.name, agentDefault, { ...p, ...({ _u: '' } as object) } as AuthzParams, user));
+    return c.html(consentPage(v.name, await pickableProjects(c.env.DB, user.id), { ...p, ...({ _u: '' } as object) } as AuthzParams, user));
   }
-  if (!user) return c.html(consentPage(v.name, '', p, null, 'sign in first'), 401);
-  if (form.decision !== 'approve') return c.html(consentPage(v.name, '', p, user), 400);
+  if (!user) return c.html(consentPage(v.name, [], p, null, 'sign in first'), 401);
+  if (form.decision !== 'approve') return c.html(consentPage(v.name, await pickableProjects(c.env.DB, user.id), p, user), 400);
+
+  // The scope decision is REQUIRED, and enforced here rather than only by the form (RUN-38).
+  // `required` in HTML is a courtesy to a browser; this is the rule. A grant with no projects
+  // would mint an unscoped token — indistinguishable, by 0027's "no rows means unscoped" rule,
+  // from a legacy token that reaches everything. Refusing is the only safe reading: the human
+  // did not decline scope, they failed to choose, and those must not collapse into "all".
+  const pickable = await pickableProjects(c.env.DB, user.id);
+  const projectIds = await readProjectIds(c.env.DB, user.id, form);
+  // Require a pick only when there is something to pick. A brand-new user has no projects, and
+  // refusing them a token would be a deadlock: create_project is an MCP tool, so the first
+  // project has to be creatable by a client that has not been granted any yet. They get a
+  // token scoped to NOTHING — which is not the same as unscoped, and is why scoped_at exists.
+  if (pickable.length && !projectIds.length) {
+    return c.html(consentPage(v.name, pickable, p, user, 'pick at least one project'), 400);
+  }
 
   // No agent is minted here (0026). The grant authorizes a *connection* for this user; who
   // does the work is decided later, per MCP session (a copilot) or by a runner (an agent).
@@ -336,10 +397,10 @@ oauth.post('/authorize', async (c) => {
 
   const code = randToken('plnrc_');
   await c.env.DB.prepare(
-    `INSERT INTO oauth_codes (code_hash, client_id, user_id, redirect_uri, code_challenge, scope, expires_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO oauth_codes (code_hash, client_id, user_id, redirect_uri, code_challenge, scope, project_ids, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).bind(await sha256Hex(code), p.client_id, user.id, p.redirect_uri, p.code_challenge, p.scope,
-    new Date(Date.now() + CODE_TTL_S * 1000).toISOString()).run();
+    JSON.stringify(projectIds), new Date(Date.now() + CODE_TTL_S * 1000).toISOString()).run();
   return redirect({ code });
 });
 
@@ -356,6 +417,11 @@ function devicePage(o: {
   clientName?: string;
   error?: string;
   state: 'enter' | 'confirm' | 'done' | 'denied';
+  /** Offered at the confirm step — the same mandatory choice the browser flow makes (RUN-38).
+   *  Without it here, a headless runner (the whole reason the device grant exists) would
+   *  quietly receive the wide token the consent page now refuses to issue. Two flows, one
+   *  policy: the boxes are ticked on the second device, where the human already is. */
+  projects?: Array<{ id: string; key: string; name: string }>;
 }): string {
   if (o.state === 'done') {
     return authShell(
@@ -373,13 +439,24 @@ function devicePage(o: {
     );
   }
   if (o.state === 'confirm' && o.user) {
+    const projects = o.projects ?? [];
+    const picker = projects.length
+      ? `<p class="hint" style="margin-top:14px">Which projects may this device reach? It will not see the others.</p>
+         <div class="projects">
+           ${projects
+             .map((p) => `<label class="proj"><input type="checkbox" name="project_ids" value="${esc(p.id)}"> <b>${esc(p.key)}</b> <span>${esc(p.name)}</span></label>`)
+             .join('')}
+         </div>`
+      : `<p class="hint" style="margin-top:14px">You have no projects yet. Approving gives this device access to
+         <b>nothing</b> — it reaches only what it creates until you authorize it for more.</p>`;
     return authShell(
       'Noriq · authorize device',
       `<p class="sub">Signed in as <b>${esc(o.user.name)}</b>. <b>${esc(o.clientName ?? 'A device')}</b> is asking to connect <b>on your behalf</b>.</p>
        <div class="code">${esc(o.userCode)}</div>
-       <p class="hint">Approve only if this matches the code on the device you started — it will act as an agent delegated by you.</p>
+       <p class="hint">Approve only if this matches the code on the device you started.</p>
        <form method="POST" action="/oauth/device">
          <input type="hidden" name="user_code" value="${esc(o.userCode)}">
+         ${picker}
          <div class="row">
            <button name="decision" value="deny" class="ghost">Deny</button>
            <button name="decision" value="approve" class="approve">Approve</button>
@@ -474,7 +551,10 @@ oauth.get('/device', async (c) => {
   if (!userCode) return c.html(devicePage({ user, userCode: '', state: 'enter' }));
   const found = await lookupDeviceCode(c.env.DB, userCode);
   if (!found.ok) return c.html(devicePage({ user, userCode, state: 'enter', error: found.err }));
-  return c.html(devicePage({ user, userCode, clientName: found.clientName, state: 'confirm' }));
+  return c.html(devicePage({
+    user, userCode, clientName: found.clientName, state: 'confirm',
+    projects: await pickableProjects(c.env.DB, user.id),
+  }));
 });
 
 oauth.post('/device', async (c) => {
@@ -512,15 +592,34 @@ oauth.post('/device', async (c) => {
   }
   // 'lookup' / 'login' land on the confirm step now that we have both a user and a live code.
   if (decision !== 'approve') {
-    return c.html(devicePage({ user, userCode, clientName: found.clientName, state: 'confirm' }));
+    return c.html(devicePage({
+      user, userCode, clientName: found.clientName, state: 'confirm',
+      projects: await pickableProjects(c.env.DB, user.id),
+    }));
+  }
+
+  // Same mandatory scope rule as the consent page (RUN-38) — two flows, one policy. A device
+  // approved with no projects would mint an unscoped token, which 0027 reads as "reaches
+  // everything": exactly the wide grant this task removes, arriving through the back door.
+  const pickable = await pickableProjects(c.env.DB, user.id);
+  const projectIds = await readProjectIds(c.env.DB, user.id, form);
+  if (pickable.length && !projectIds.length) {
+    return c.html(
+      devicePage({
+        user, userCode, clientName: found.clientName, state: 'confirm',
+        projects: pickable, error: 'pick at least one project',
+      }),
+      400,
+    );
   }
 
   // Approving binds the code to the human, not to an agent (0026) — same policy as the
-  // consent page, so both grants produce identical connections.
+  // consent page, so both grants produce identical connections. The scope rides along until
+  // the device exchanges the code.
   const res = await c.env.DB.prepare(
-    `UPDATE oauth_device_codes SET approved_at = ?, user_id = ?
+    `UPDATE oauth_device_codes SET approved_at = ?, user_id = ?, project_ids = ?
      WHERE user_code = ? AND approved_at IS NULL AND denied_at IS NULL`,
-  ).bind(nowIso(), user.id, userCode).run();
+  ).bind(nowIso(), user.id, JSON.stringify(projectIds), userCode).run();
   if (!res.meta.changes) return c.html(devicePage({ user, userCode, state: 'enter', error: 'that code was already resolved' }), 400);
   return c.html(devicePage({ user, userCode, clientName: found.clientName, state: 'done' }));
 });
@@ -564,7 +663,10 @@ async function deviceTokenGrant(c: Context<AppContext>, form: Record<string, unk
     'UPDATE oauth_device_codes SET consumed_at = ? WHERE device_code_hash = ? AND consumed_at IS NULL',
   ).bind(nowIso(), hash).run();
   if (!consume.meta.changes) return c.json({ error: 'invalid_grant', error_description: 'device_code already used' }, 400);
-  const { tokenId: _dt, ...deviceGrant } = await issueTokens(c.env.DB, String(row.client_id), String(row.user_id), null, String(row.scope));
+  const { tokenId: _dt, ...deviceGrant } = await issueTokens(
+    c.env.DB, String(row.client_id), String(row.user_id), null, String(row.scope),
+    JSON.parse(String(row.project_ids ?? '[]')) as string[],
+  );
   return c.json(deviceGrant);
 }
 
@@ -596,7 +698,9 @@ oauth.post('/token', async (c) => {
     // PKCE S256
     const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
     if (b64url(new Uint8Array(digest)) !== row.code_challenge) return c.json({ error: 'invalid_grant', error_description: 'PKCE verification failed' }, 400);
-    const { tokenId: _ct, ...codeGrant } = await issueTokens(c.env.DB, row.client_id!, row.user_id!, null, row.scope!);
+    const { tokenId: _ct, ...codeGrant } = await issueTokens(
+      c.env.DB, row.client_id!, row.user_id!, null, row.scope!, JSON.parse(row.project_ids ?? '[]') as string[],
+    );
     return c.json(codeGrant);
   }
 
@@ -608,8 +712,21 @@ oauth.post('/token', async (c) => {
     if (!row || (row.refresh_expires_at && row.refresh_expires_at < nowIso())) return c.json({ error: 'invalid_grant' }, 400);
     // Rotate: revoke the old pair, issue a new one.
     await c.env.DB.prepare('UPDATE oauth_tokens SET revoked_at = ? WHERE id = ?').bind(nowIso(), row.id!).run();
-    // Carry any agent binding across rotation — a runner's per-run token must not widen.
-    const { tokenId: _rt, ...refreshed } = await issueTokens(c.env.DB, row.client_id!, row.user_id!, row.agent_id ?? null, row.scope!);
+    // Carry the agent binding AND the project scope across rotation — a refresh must never
+    // widen a token. Without this the rotated token would have no scope rows, which 0027 reads
+    // as unscoped: refreshing would silently promote a one-project laptop to the whole account.
+    // Preserve the token's exact scope state — including UNSCOPED. Rotating a legacy token
+    // into a scoped-to-zero one would lock it out; rotating it into scoped-to-everything
+    // would be a silent widening. Neither is a thing a refresh may decide.
+    const inherited = row.scoped_at
+      ? (
+          await c.env.DB.prepare('SELECT project_id AS id FROM oauth_token_projects WHERE token_id = ?')
+            .bind(row.id!).all<{ id: string }>()
+        ).results.map((r) => r.id)
+      : null;
+    const { tokenId: _rt, ...refreshed } = await issueTokens(
+      c.env.DB, row.client_id!, row.user_id!, row.agent_id ?? null, row.scope!, inherited,
+    );
     return c.json(refreshed);
   }
 
@@ -625,7 +742,19 @@ oauth.post('/token', async (c) => {
  * grant threads the existing binding through so rotation cannot quietly widen a bound
  * token into a general-purpose one.
  */
-export async function issueTokens(db: D1Database, clientId: string, userId: string, agentId: string | null, scope: string) {
+export async function issueTokens(
+  db: D1Database,
+  clientId: string,
+  userId: string,
+  agentId: string | null,
+  scope: string,
+  /**
+   * The projects this token may reach (RUN-38). `null` means UNSCOPED — reaches everything the
+   * user can — and is only correct for a legacy path; both grant flows always pass an array,
+   * even an empty one. An empty array is a real, different thing: scoped to nothing (yet).
+   */
+  projectIds: string[] | null = null,
+) {
   const access = randToken('plnrt_');
   const refresh = randToken('plnrr_');
   const tokenId = newId('oat');
@@ -635,6 +764,16 @@ export async function issueTokens(db: D1Database, clientId: string, userId: stri
   ).bind(tokenId, await sha256Hex(access), await sha256Hex(refresh), clientId, userId, agentId, scope,
     new Date(Date.now() + ACCESS_TTL_S * 1000).toISOString(),
     new Date(Date.now() + REFRESH_TTL_S * 1000).toISOString()).run();
+  // The scope, made real. Written after the token row so the FKs resolve. scoped_at is what
+  // distinguishes "a human chose, and chose nothing yet" from "legacy, reaches everything".
+  if (projectIds) {
+    await db.batch([
+      db.prepare('UPDATE oauth_tokens SET scoped_at = ? WHERE id = ?').bind(nowIso(), tokenId),
+      ...projectIds.map((pid) =>
+        db.prepare('INSERT OR IGNORE INTO oauth_token_projects (token_id, project_id) VALUES (?, ?)').bind(tokenId, pid),
+      ),
+    ]);
+  }
   return {
     // Not part of the OAuth response — the grant handlers strip it. It exists so a caller
     // minting a bound token (the run-agent endpoint) can point agents.oauth_token_id back

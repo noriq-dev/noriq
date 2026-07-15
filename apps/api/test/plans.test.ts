@@ -1,6 +1,6 @@
 import { SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { createAgent, createUser, loginSession, mcpCall } from './helpers';
+import { createAgent, createUser, loginSession, mcpCall, authorizeForAllProjects } from './helpers';
 
 // NOTE: runs in the same shared-storage suite as coordination.test.ts;
 // setup endpoints are exercised first while no users beyond ours may exist.
@@ -48,6 +48,10 @@ describe('plans & groups', () => {
     });
     const proj = await mcpCall(planner.apiKey, 'create_project', { key: 'PLZ', name: 'plans-project' });
     projectId = proj.body.id;
+    // Scoping (RUN-38): these agents were minted before this project existed, so their tokens
+    // are scoped to nothing and only the CREATOR gains it. A human would authorize the others —
+    // say so, rather than let the old implicit "every token sees everything" creep back.
+    await authorizeForAllProjects(planner.apiKey, worker.apiKey);
   });
 
   it('create_plan builds enforced phase ordering', async () => {

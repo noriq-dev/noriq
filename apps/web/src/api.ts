@@ -67,7 +67,18 @@ export const api = {
   passkeys: () => req<{ passkeys: Array<{ id: string; name: string; createdAt: string }> }>('GET', '/api/webauthn/passkeys'),
   deletePasskey: (id: string) => req('DELETE', `/api/webauthn/passkeys/${id}`),
 
-  authSessions: () => req<{ sessions: Array<{ id: string; clientName: string; scope: string; createdAt: string; expiresAt: string; agentCount: number; lastActive: string | null }> }>('GET', '/api/auth/sessions'),
+  authSessions: () =>
+    req<{
+      sessions: Array<{
+        id: string; clientName: string; scope: string; createdAt: string; expiresAt: string;
+        agentCount: number; lastActive: string | null;
+        /** RUN-38: 1 once a human put this connection through the project picker. 0 = minted
+         *  before scoping existed, so it still reaches every project its user can. */
+        scoped: number;
+        /** Comma-joined project keys it may reach; null when unscoped. */
+        projectKeys: string | null;
+      }>;
+    }>('GET', '/api/auth/sessions'),
   revokeSession: (id: string) => req('POST', `/api/auth/sessions/${id}/revoke`),
   revokeAllSessions: () => req('POST', '/api/auth/sessions/revoke-all'),
 

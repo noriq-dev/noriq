@@ -3,7 +3,7 @@
 // the MCP notices fallback.
 import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { createAgent, createUser, loginSession, mcpCall, mintTokenForUser } from './helpers';
+import { createAgent, createUser, loginSession, mcpCall, mintTokenForUser, authorizeForAllProjects } from './helpers';
 
 // Resolve the next WS frame matching a predicate (with a timeout).
 function nextFrame(ws: WebSocket, pred: (m: any) => boolean, timeoutMs = 3000): Promise<any> {
@@ -42,6 +42,11 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
       body: JSON.stringify({ key: 'RWSP', name: 'rwsp' }),
     });
     pid = ((await p.json()) as { id: string }).id;
+    // The token was minted before this project existed, so it is scoped to nothing (RUN-38).
+    // A human authorizing their runner does this on the consent page; do it explicitly here —
+    // registration resolves repo keys only within the TOKEN's projects, so without it every
+    // repo resolves to null and nothing is dispatchable.
+    await authorizeForAllProjects(token);
     const reg = await SELF.fetch('https://planar.test/api/runners', {
       method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ label: 'ws-daemon', tools: ['claude'], kinds: ['build'], maxConcurrency: 2, repos: [{ id: 'repo_x', projectKey: 'RWSP' }] }),
@@ -194,6 +199,9 @@ describe('steering-ack dedups the notices fallback (RUN-7)', () => {
       body: JSON.stringify({ key: 'STEER', name: 'steer' }),
     });
     const pid = ((await p.json()) as { id: string }).id;
+    // A and B were minted before this project existed, so their tokens are scoped to nothing
+    // for it (RUN-38) — a human would authorize them on the consent page.
+    await authorizeForAllProjects(A.apiKey, B.apiKey);
 
     // A runner + run owned by the mint user, so the steer-ack (agentAuth) authorizes.
     const reg = await SELF.fetch('https://planar.test/api/runners', {
@@ -243,6 +251,9 @@ describe('WS steer → ack → notices dedup (RUN-17)', () => {
       body: JSON.stringify({ key: 'WSTR', name: 'wstr' }),
     });
     const pid = ((await p.json()) as { id: string }).id;
+    // A and B were minted before this project existed, so their tokens are scoped to nothing
+    // for it (RUN-38) — a human would authorize them on the consent page.
+    await authorizeForAllProjects(A.apiKey, B.apiKey);
     const reg = await SELF.fetch('https://planar.test/api/runners', {
       method: 'POST', headers: { Authorization: `Bearer ${A.apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ label: 'wsteer-daemon' }),

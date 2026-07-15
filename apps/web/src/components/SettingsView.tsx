@@ -399,7 +399,7 @@ function PasskeysSection() {
 }
 
 function SessionsSection() {
-  const [sessions, setSessions] = useState<Array<{ id: string; clientName: string; createdAt: string; agentCount: number; lastActive: string | null }>>([]);
+  const [sessions, setSessions] = useState<Array<{ id: string; clientName: string; createdAt: string; agentCount: number; lastActive: string | null; scoped: number; projectKeys: string | null }>>([]);
   const load = () => api.authSessions().then((r) => setSessions(r.sessions)).catch(() => {});
   useEffect(() => { load(); }, []);
   const ago = (iso: string | null) => (iso ? new Date(iso).toLocaleString() : 'never');
@@ -431,8 +431,20 @@ function SessionsSection() {
           <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 11px', borderRadius: 9, background: 'var(--w-02)', border: '1px solid var(--w-06)' }}>
             <span style={{ fontSize: 13 }}>🔌</span>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: 12.5, fontWeight: 500 }}>{s.clientName}</div>
+              <div style={{ fontSize: 12.5, fontWeight: 500, display: 'flex', alignItems: 'center', gap: 7 }}>
+                {s.clientName}
+                {/* An unscoped connection reaches EVERY project you can (RUN-38) — a legacy
+                    token, grandfathered by 0027 so upgrading didn't sign everyone out. Say so
+                    plainly: it is only a deliberate trade while someone can see it and revoke. */}
+                {!s.scoped && (
+                  <span style={{ fontFamily: 'var(--mono)', fontSize: 9, padding: '1px 5px', borderRadius: 4,
+                                 color: 'var(--red-soft)', background: 'rgba(255,92,92,.12)' }}>
+                    ALL PROJECTS
+                  </span>
+                )}
+              </div>
               <div style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)' }}>
+                {s.scoped ? (s.projectKeys ?? 'no projects') : 'unscoped (pre-dates project scoping)'} ·{' '}
                 {s.agentCount} agent{s.agentCount === 1 ? '' : 's'} · last active {ago(s.lastActive)}
               </div>
             </div>

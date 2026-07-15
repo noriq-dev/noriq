@@ -1,6 +1,6 @@
 import { SELF } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
-import { createAgent, createUser, loginSession, mcpCall, mcpList } from './helpers';
+import { createAgent, createUser, loginSession, mcpCall, mcpList, authorizeForAllProjects } from './helpers';
 
 let orch: { id: string; apiKey: string };
 let nova: { id: string; apiKey: string };
@@ -46,6 +46,10 @@ describe('coordination core', () => {
     const proj = await mcpCall(orch.apiKey, 'create_project', { key: 'TST', name: 'test-project' });
     expect(proj.body.key).toBe('TST');
     projectId = proj.body.id;
+    // Scoping (RUN-38): these agents were minted before this project existed, so their tokens
+    // are scoped to nothing and only the CREATOR gains it. A human would authorize the others —
+    // say so, rather than let the old implicit "every token sees everything" creep back.
+    await authorizeForAllProjects(orch.apiKey, nova.apiKey, echo.apiKey);
 
     t1 = (await mcpCall(orch.apiKey, 'create_task', { projectId, title: 'Build the base' })).body;
     expect(t1.key).toBe('TST-1');

@@ -5,7 +5,7 @@ import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import type { Actor, CreateRunInput, RunPatch, RunView } from '../src/do/ProjectRoom';
 import type { Env } from '../src/env';
-import { createAgent, createUser, loginSession, mcpCall, mintTokenForUser } from './helpers';
+import { createAgent, createUser, loginSession, mcpCall, mintTokenForUser, authorizeForAllProjects } from './helpers';
 
 const actor: Actor = { kind: 'human', id: 'usr_runtest', name: 'Run Tester' };
 let cookie: string;
@@ -153,6 +153,8 @@ describe('run lifecycle in ProjectRoom (RUN-6)', () => {
       body: JSON.stringify({ key: 'RB18', name: 'rb18' }),
     });
     const rbPid = ((await pr.json()) as { id: string }).id;
+    // The agent was minted before RB18 existed, so it is scoped to nothing for it (RUN-38).
+    await authorizeForAllProjects(spawned.apiKey);
     // A running Run driven by the spawned agent.
     const runId = `run_rb18_${crypto.randomUUID().slice(0, 8)}`;
     await env.DB.prepare(

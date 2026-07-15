@@ -2,7 +2,7 @@
 // key→projectId resolution scoped to what the owning user may reach.
 import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
-import { createUser, loginSession, mintTokenForUser } from './helpers';
+import { createUser, loginSession, mintTokenForUser, authorizeForAllProjects } from './helpers';
 
 let ownerToken: string;
 let ownerCookie: string;
@@ -35,6 +35,11 @@ beforeAll(async () => {
   ownerCookie = await loginSession('runner-owner@example.com', 'longenough1');
   const p = await createProject(ownerCookie, 'RNRX', 'rnrx');
   rnrxProjectId = ((await p.json()) as { id: string }).id;
+  // The token was minted before this project existed, so it is scoped to nothing (RUN-38).
+  // A human authorizing their runner does this on the consent page; do it explicitly here —
+  // registration resolves repo keys only within the TOKEN's projects, so without it every
+  // repo resolves to null and nothing is dispatchable.
+  await authorizeForAllProjects(ownerToken);
 }, 60000);
 
 describe('runners (RUN-5)', () => {

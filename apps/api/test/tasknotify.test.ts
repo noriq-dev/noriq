@@ -2,7 +2,7 @@
 // nothing) so ad-hoc work is picked up dynamically — without distracting a
 // heads-down agent, and without pinging the creator about their own task.
 import { beforeAll, describe, expect, it } from 'vitest';
-import { createAgent, mcpCall } from './helpers';
+import { createAgent, mcpCall, authorizeForAllProjects } from './helpers';
 
 let worker: { id: string; apiKey: string };
 let busy: { id: string; apiKey: string };
@@ -16,6 +16,12 @@ beforeAll(async () => {
   busy = await createAgent('notify-busy');
   creator = await createAgent('notify-creator');
   projectId = (await mcpCall(creator.apiKey, 'create_project', { key: 'TN', name: 'task-notify' })).body.id;
+  // Scoping (RUN-38): these agents were minted before the project existed, so each token is
+  // scoped to nothing and only the CREATOR gains the new project. A human would authorize them
+  // for it — say so explicitly rather than let the old implicit "every token sees everything"
+  // creep back in.
+  await authorizeForAllProjects(worker.apiKey, busy.apiKey, creator.apiKey);
+
   // Make `busy` heads-down: it claims a seed task.
   const seed = (await mcpCall(creator.apiKey, 'create_task', { projectId, title: 'seed' })).body;
   await mcpCall(busy.apiKey, 'claim_task', { projectId, taskId: seed.id });

@@ -19,6 +19,42 @@ export const USER_PROJECT_WHERE = `(
   OR (p.group_id IS NOT NULL AND p.group_id IN (SELECT group_id FROM user_groups WHERE user_id = ?1))
 )`;
 
+/**
+ * Narrow to the projects THIS TOKEN was authorized for (RUN-38). Composes with
+ * USER_PROJECT_WHERE — a token can never exceed its user, only be narrower:
+ *
+ *   WHERE ${USER_PROJECT_WHERE} AND ${tokenProjectWhere('?3')}
+ *
+ * `param` is the bind placeholder holding the token id (e.g. '?3'), so callers keep control
+ * of their own numbering.
+ *
+ * `scoped_at IS NULL` means UNSCOPED, deliberately (see 0027): tokens minted before scoping
+ * existed reach everything their user can, because invalidating them would sign every human
+ * out and kill every live runner mid-run.
+ *
+ * Note it keys off `scoped_at`, NOT off row-absence. A scoped token may legitimately have zero
+ * projects — a brand-new user has none to tick — and "scoped to nothing" must never collapse
+ * into "reaches everything". They are exact opposites.
+ *
+ * The rule lives here, in SQL, rather than as a JS set each caller re-derives: a second copy
+ * of it is precisely what drifts and silently unlocks a fleet. Assumes projects aliased `p`.
+ */
+export const tokenProjectWhere = (param: string) => `(
+  NOT EXISTS (SELECT 1 FROM oauth_tokens WHERE id = ${param} AND scoped_at IS NOT NULL)
+  OR p.id IN (SELECT project_id FROM oauth_token_projects WHERE token_id = ${param})
+)`;
+
+/** Whether a token may reach one project — the single-project mirror of tokenProjectWhere,
+ *  for the central MCP tool guard. Unscoped (legacy) tokens pass; scoped ones must list it. */
+export async function tokenCanReachProject(env: Env, tokenId: string, projectId: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT
+       (SELECT COUNT(*) FROM oauth_tokens WHERE id = ?1 AND scoped_at IS NOT NULL) AS scoped,
+       (SELECT COUNT(*) FROM oauth_token_projects WHERE token_id = ?1 AND project_id = ?2) AS allowed`,
+  ).bind(tokenId, projectId).first<{ scoped: number; allowed: number }>();
+  return !row?.scoped || row.allowed > 0;
+}
+
 // Plan-level approval gate (RUN-23): a task belonging to a *proposed* plan (a scope
 // agent's un-approved output) is NOT claimable/dispatchable until a human approves
 // the plan (proposed → active). Gating is plan-level only for v1 — the task itself
