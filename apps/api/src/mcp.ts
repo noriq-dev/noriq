@@ -292,10 +292,14 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       // itself, under its own user, never to one that already existed. That is the line between
       // bootstrapping and escalation, and it is what lets a token scoped to NOTHING (a
       // brand-new user's first connection) get started at all.
+      // An "All projects" token (RUN-58) is excluded: it already reaches this, by asking its
+      // user rather than reading these rows, so a row here would be dead weight that also
+      // misreports the grant as a frozen list.
       if (opts.oauthTokenId) {
         await env.DB.prepare(
           `INSERT OR IGNORE INTO oauth_token_projects (token_id, project_id)
-           SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM oauth_tokens WHERE id = ?1 AND scoped_at IS NOT NULL)`,
+           SELECT ?1, ?2 WHERE EXISTS (
+             SELECT 1 FROM oauth_tokens WHERE id = ?1 AND scoped_at IS NOT NULL AND scope_all = 0)`,
         ).bind(opts.oauthTokenId, id).run();
       }
       return { id, key: args.key };

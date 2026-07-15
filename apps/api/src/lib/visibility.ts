@@ -41,18 +41,22 @@ export const USER_PROJECT_WHERE = `(
  */
 export const tokenProjectWhere = (param: string) => `(
   NOT EXISTS (SELECT 1 FROM oauth_tokens WHERE id = ${param} AND scoped_at IS NOT NULL)
+  OR EXISTS (SELECT 1 FROM oauth_tokens WHERE id = ${param} AND scope_all = 1)
   OR p.id IN (SELECT project_id FROM oauth_token_projects WHERE token_id = ${param})
 )`;
 
 /** Whether a token may reach one project — the single-project mirror of tokenProjectWhere,
- *  for the central MCP tool guard. Unscoped (legacy) tokens pass; scoped ones must list it. */
+ *  for the central MCP tool guard. Unscoped (legacy) tokens pass; so do "All projects" ones
+ *  (RUN-58); a specifically-scoped token must list it. Keep the three cases in lockstep with
+ *  tokenProjectWhere above — they are one rule wearing two shapes. */
 export async function tokenCanReachProject(env: Env, tokenId: string, projectId: string): Promise<boolean> {
   const row = await env.DB.prepare(
     `SELECT
        (SELECT COUNT(*) FROM oauth_tokens WHERE id = ?1 AND scoped_at IS NOT NULL) AS scoped,
+       (SELECT COUNT(*) FROM oauth_tokens WHERE id = ?1 AND scope_all = 1) AS scopeAll,
        (SELECT COUNT(*) FROM oauth_token_projects WHERE token_id = ?1 AND project_id = ?2) AS allowed`,
-  ).bind(tokenId, projectId).first<{ scoped: number; allowed: number }>();
-  return !row?.scoped || row.allowed > 0;
+  ).bind(tokenId, projectId).first<{ scoped: number; scopeAll: number; allowed: number }>();
+  return !row?.scoped || row.scopeAll > 0 || row.allowed > 0;
 }
 
 // Plan-level approval gate (RUN-23): a task belonging to a *proposed* plan (a scope

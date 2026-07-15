@@ -21,6 +21,41 @@ async function s256(verifier: string): Promise<string> {
   return btoa(String.fromCharCode(...new Uint8Array(digest))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
+/** Drive the REAL consent form and return the granted token pair.
+ *
+ *  `scope` is either 'all' (tick "All projects", RUN-58) or a list of ids, appended one
+ *  repeated field at a time — exactly what N ticked checkboxes POST, which is the shape
+ *  RUN-57 was mangling. An empty list is the bootstrap case: nothing to tick yet. */
+async function consentFor(
+  cookie: string, clientId: string, redirectUri: string, scope: string[] | 'all',
+): Promise<{ access: string; refresh: string }> {
+  const { verifier } = pkce();
+  const q = new URLSearchParams({
+    response_type: 'code', client_id: clientId, redirect_uri: redirectUri, state: 's',
+    code_challenge: await s256(verifier), code_challenge_method: 'S256', scope: 'mcp',
+  });
+  const form = new URLSearchParams(Object.fromEntries(q.entries()));
+  form.set('decision', 'approve');
+  if (scope === 'all') form.set('scope_all', '1');
+  else for (const id of scope) form.append('project_ids', id);
+  const approve = await SELF.fetch('https://planar.test/oauth/authorize', {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: form.toString(),
+    redirect: 'manual',
+  });
+  const code = new URL(approve.headers.get('Location')!).searchParams.get('code')!;
+  const tok = await SELF.fetch('https://planar.test/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code', code, redirect_uri: redirectUri, client_id: clientId, code_verifier: verifier,
+    }).toString(),
+  });
+  const body = (await tok.json()) as { access_token: string; refresh_token: string };
+  return { access: body.access_token, refresh: body.refresh_token };
+}
+
 describe('oauth 2.1 for MCP', () => {
   const redirectUri = 'http://localhost:33418/callback';
   let clientId: string;
@@ -127,6 +162,38 @@ describe('oauth 2.1 for MCP', () => {
     expect(briefing.body.you.role).toBe('orchestrator');
   });
 
+  it('scopes a token to EVERY ticked project, not just the last (RUN-57)', async () => {
+    // The whole bug hid behind having ONE project: N checkboxes all named project_ids POST N
+    // fields, and parseBody() without all:true kept only the LAST — so every grant silently
+    // scoped to a single project. It fails RESTRICTIVELY, so nothing ever complained; the
+    // fixtures just reached for authorizeForAllProjects and the picker itself stayed untested.
+    // Its OWN user: several tests below consent without ticking anything, which only works
+    // while their user has no projects — so handing the shared oauth-user fixture three
+    // would break them from a distance.
+    const email = 'multiscope@example.com';
+    const own = await loginSession(email, 'longenough1').catch(async () => {
+      await createUser(email, 'Multi Scope', 'longenough1');
+      return loginSession(email, 'longenough1');
+    });
+    // Bootstrap: with nothing to tick, consent is allowed unscoped — and that token is what
+    // creates the projects the real grant below then ticks.
+    const { access: boot } = await consentFor(own, clientId, redirectUri, []);
+    const keys = ['MTA', 'MTB', 'MTC'];
+    const ids: string[] = [];
+    for (const k of keys) {
+      const r = await mcpCall(boot, 'create_project', { key: k, name: `multi ${k}` });
+      ids.push(r.body.id as string);
+    }
+
+    const { access: granted } = await consentFor(own, clientId, redirectUri, ids);
+
+    // Asserted through what the human actually experiences — the projects the connection can
+    // reach — rather than by reading the join table, which is the thing under test.
+    const listed = await mcpCall(granted, 'list_projects', {});
+    const reachable = (listed.body.projects as Array<{ key: string }>).map((p) => p.key);
+    for (const k of keys) expect(reachable).toContain(k); // pre-fix: only 'MTC' survived
+  });
+
   it('set_agent_identity refuses a name already taken in the same project', async () => {
     // Two independent connections (kept off `accessToken` so the refresh test's
     // identity is untouched). Names are unique per project now, so the second collides.
@@ -196,6 +263,72 @@ describe('oauth 2.1 for MCP', () => {
     const briefing = await mcpCall(t.access_token, 'get_briefing', {}, sessionFor(accessToken));
     expect(briefing.body.you.name).toBe('atlas-prime');
     expect(briefing.body.you.kind).toBe('copilot');
+  });
+});
+
+// --- "All projects": a grant that follows the user instead of freezing a list (RUN-58) -----
+describe('all-projects scope (RUN-58)', () => {
+  const redirectUri = 'http://localhost:33418/callback';
+  let clientId: string;
+
+  /** A signed-in user with a bootstrap token — the one that creates the projects to grant. */
+  async function userWithBoot(email: string): Promise<{ cookie: string; boot: string }> {
+    const cookie = await loginSession(email, 'longenough1').catch(async () => {
+      await createUser(email, email, 'longenough1');
+      return loginSession(email, 'longenough1');
+    });
+    const { access: boot } = await consentFor(cookie, clientId, redirectUri, []);
+    return { cookie, boot };
+  }
+
+  beforeAll(async () => {
+    const res = await SELF.fetch('https://planar.test/oauth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_name: 'Scope All Client', redirect_uris: [redirectUri] }),
+    });
+    clientId = ((await res.json()) as { client_id: string }).client_id;
+  });
+
+  it('reaches a project created AFTER the grant, and still never another user’s', async () => {
+    const mine = await userWithBoot('scopeall@example.com');
+    await mcpCall(mine.boot, 'create_project', { key: 'SAA', name: 'before the grant' });
+
+    // Tick "All projects" — note zero ids are sent, which under RUN-38's rules would otherwise
+    // be "scoped to nothing".
+    const { access: granted } = await consentFor(mine.cookie, clientId, redirectUri, 'all');
+
+    // The whole point: this did not exist when the grant was made. A frozen list misses it.
+    await mcpCall(mine.boot, 'create_project', { key: 'SAB', name: 'after the grant' });
+
+    // Someone else's project, created by their own connection — "all" must not mean theirs.
+    const theirs = await userWithBoot('scopeall-other@example.com');
+    await mcpCall(theirs.boot, 'create_project', { key: 'OTH', name: 'not yours' });
+
+    const listed = await mcpCall(granted, 'list_projects', {});
+    const reachable = (listed.body.projects as Array<{ key: string }>).map((p) => p.key);
+    expect(reachable).toContain('SAA');
+    expect(reachable).toContain('SAB'); // ← the feature
+    // "All" composes with USER_PROJECT_WHERE rather than bypassing it: all of MINE, not all.
+    expect(reachable).not.toContain('OTH');
+  });
+
+  it('survives a refresh — rotation must not narrow it', async () => {
+    const mine = await userWithBoot('scopeall-refresh@example.com');
+    await mcpCall(mine.boot, 'create_project', { key: 'SAR', name: 'refresh me' });
+    const granted = await consentFor(mine.cookie, clientId, redirectUri, 'all');
+
+    const res = await SELF.fetch('https://planar.test/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: granted.refresh }).toString(),
+    });
+    const rotated = ((await res.json()) as { access_token: string }).access_token;
+
+    // An all-projects grant carries NO project rows, so a rotation that dropped the flag would
+    // read as scoped-to-nothing and lock the connection out on its next refresh.
+    const listed = await mcpCall(rotated, 'list_projects', {});
+    expect((listed.body.projects as Array<{ key: string }>).map((p) => p.key)).toContain('SAR');
   });
 });
 

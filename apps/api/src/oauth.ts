@@ -241,6 +241,9 @@ const AUTH_CSS = `
     .proj:last-child{border-bottom:none}
     .proj:hover{background:rgba(255,255,255,.04)}
     .proj input{width:auto;margin:0;flex:none}
+    /* "All projects" sits above the list and reads as a peer of the whole box, not a member. */
+    .scope-all{margin-top:8px;border:1px solid rgba(255,255,255,.1);border-radius:9px;border-bottom:1px solid rgba(255,255,255,.1)}
+    .scope-all span{color:#6b7280;font-size:11px}
     .proj span{color:#6b7280;font-size:12px}
     .row{display:flex;gap:10px;margin-top:18px;justify-content:flex-end}
     button{cursor:pointer;font-weight:600;font-size:13px;padding:10px 18px;border-radius:9px;border:none;font-family:inherit}
@@ -275,13 +278,34 @@ function consentPage(
   const picker = projects.length
     ? `
     <p class="hint" style="margin-top:14px">Which projects may this connection reach? It will not see the others.</p>
-    <div class="projects">
+    <label class="proj scope-all"><input type="checkbox" name="scope_all" value="1" id="scope_all">
+      <b>All projects</b> <span>including any you create later</span></label>
+    <div class="projects" id="project_list">
       ${projects
         .map(
           (p) => `<label class="proj"><input type="checkbox" name="project_ids" value="${esc(p.id)}"> <b>${esc(p.key)}</b> <span>${esc(p.name)}</span></label>`,
         )
         .join('')}
-    </div>`
+    </div>
+    <script>
+      // Cosmetic only — "All projects" is decided server-side (readScope), so a browser that
+      // never runs this still gets the same grant.
+      (function () {
+        var all = document.getElementById('scope_all');
+        var list = document.getElementById('project_list');
+        if (!all || !list) return;
+        var boxes = list.querySelectorAll('input[type=checkbox]');
+        function sync() {
+          list.style.opacity = all.checked ? '.45' : '';
+          for (var i = 0; i < boxes.length; i++) {
+            boxes[i].disabled = all.checked;
+            if (all.checked) boxes[i].checked = true;
+          }
+        }
+        all.addEventListener('change', sync);
+        sync();
+      })();
+    </script>`
     : `<p class="hint" style="margin-top:14px">You have no projects yet. Approving gives this connection
        access to <b>nothing</b> — it can create a project, and reaches only what it creates until you
        authorize it for more.</p>`;
@@ -316,12 +340,24 @@ async function pickableProjects(db: D1Database, userId: string): Promise<Array<{
   return results;
 }
 
-/** The ticked boxes, validated against what the user can actually reach — never trust the
- *  form. A hand-rolled POST could otherwise name any project id and scope itself to it. */
-async function readProjectIds(db: D1Database, userId: string, form: Record<string, unknown>): Promise<string[]> {
+/** What the human actually chose: every project they can reach (now and future), or an
+ *  explicit set (RUN-58).
+ *
+ *  The ticked ids are validated against what the user can reach — never trust the form, or a
+ *  hand-rolled POST could name any project id and scope itself to it. `all` needs no such
+ *  check precisely because it grants nothing BY id: it defers to USER_PROJECT_WHERE at read
+ *  time, which is exactly what lets a project created tomorrow fall inside it. */
+async function readScope(db: D1Database, userId: string, form: Record<string, unknown>): Promise<{ all: boolean; ids: string[] }> {
+  // "All projects" beats the individual boxes. The page disables them when it is ticked, but a
+  // client that ran no script (or a hand-rolled POST) can send both — and the server has to
+  // reach the same verdict either way, so decide it here rather than trusting the browser.
+  const rawAll = form.scope_all;
+  const picked = Array.isArray(rawAll) ? rawAll[0] : rawAll;
+  if (picked != null && String(picked) !== '' && String(picked) !== '0') return { all: true, ids: [] };
+
   const raw = form.project_ids;
   const wanted = new Set((Array.isArray(raw) ? raw : raw == null ? [] : [raw]).map(String));
-  return (await pickableProjects(db, userId)).map((p) => p.id).filter((id) => wanted.has(id));
+  return { all: false, ids: (await pickableProjects(db, userId)).map((p) => p.id).filter((id) => wanted.has(id)) };
 }
 
 oauth.get('/authorize', async (c) => {
@@ -338,7 +374,11 @@ oauth.post('/authorize', async (c) => {
     const stub = c.env.RATE_LIMITER.get(c.env.RATE_LIMITER.idFromName(`auth:${c.req.header('CF-Connecting-IP') ?? 'local'}`));
     if (!(await stub.hit(20, 60_000)).ok) return c.text('too many attempts — slow down', 429);
   }
-  const form = await c.req.parseBody();
+  // all:true is load-bearing (RUN-57): the picker renders one checkbox PER project, every one
+  // named project_ids, and a plain parseBody() keeps only the LAST — silently scoping every
+  // grant to a single project. readParams never reads project_ids, so String()-joining that
+  // one array below is inert.
+  const form = await c.req.parseBody({ all: true });
   const p = readParams(new URLSearchParams(Object.entries(form).map(([k, v]) => [k, String(v)])));
   const v = await validateClient(c.env, p);
   if (!v.ok) return c.text(`invalid authorization request: ${v.err}`, 400);
@@ -379,12 +419,13 @@ oauth.post('/authorize', async (c) => {
   // from a legacy token that reaches everything. Refusing is the only safe reading: the human
   // did not decline scope, they failed to choose, and those must not collapse into "all".
   const pickable = await pickableProjects(c.env.DB, user.id);
-  const projectIds = await readProjectIds(c.env.DB, user.id, form);
+  const scope = await readScope(c.env.DB, user.id, form);
   // Require a pick only when there is something to pick. A brand-new user has no projects, and
   // refusing them a token would be a deadlock: create_project is an MCP tool, so the first
   // project has to be creatable by a client that has not been granted any yet. They get a
   // token scoped to NOTHING — which is not the same as unscoped, and is why scoped_at exists.
-  if (pickable.length && !projectIds.length) {
+  // "All projects" is a choice, so it satisfies the rule on its own (RUN-58).
+  if (pickable.length && !scope.all && !scope.ids.length) {
     return c.html(consentPage(v.name, pickable, p, user, 'pick at least one project'), 400);
   }
 
@@ -397,10 +438,10 @@ oauth.post('/authorize', async (c) => {
 
   const code = randToken('plnrc_');
   await c.env.DB.prepare(
-    `INSERT INTO oauth_codes (code_hash, client_id, user_id, redirect_uri, code_challenge, scope, project_ids, expires_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO oauth_codes (code_hash, client_id, user_id, redirect_uri, code_challenge, scope, project_ids, scope_all, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).bind(await sha256Hex(code), p.client_id, user.id, p.redirect_uri, p.code_challenge, p.scope,
-    JSON.stringify(projectIds), new Date(Date.now() + CODE_TTL_S * 1000).toISOString()).run();
+    JSON.stringify(scope.ids), scope.all ? 1 : 0, new Date(Date.now() + CODE_TTL_S * 1000).toISOString()).run();
   return redirect({ code });
 });
 
@@ -442,11 +483,31 @@ function devicePage(o: {
     const projects = o.projects ?? [];
     const picker = projects.length
       ? `<p class="hint" style="margin-top:14px">Which projects may this device reach? It will not see the others.</p>
-         <div class="projects">
+         <label class="proj scope-all"><input type="checkbox" name="scope_all" value="1" id="scope_all">
+           <b>All projects</b> <span>including any you create later</span></label>
+         <div class="projects" id="project_list">
            ${projects
              .map((p) => `<label class="proj"><input type="checkbox" name="project_ids" value="${esc(p.id)}"> <b>${esc(p.key)}</b> <span>${esc(p.name)}</span></label>`)
              .join('')}
-         </div>`
+         </div>
+         <script>
+           // Cosmetic only — readScope decides this server-side; see the consent page.
+           (function () {
+             var all = document.getElementById('scope_all');
+             var list = document.getElementById('project_list');
+             if (!all || !list) return;
+             var boxes = list.querySelectorAll('input[type=checkbox]');
+             function sync() {
+               list.style.opacity = all.checked ? '.45' : '';
+               for (var i = 0; i < boxes.length; i++) {
+                 boxes[i].disabled = all.checked;
+                 if (all.checked) boxes[i].checked = true;
+               }
+             }
+             all.addEventListener('change', sync);
+             sync();
+           })();
+         </script>`
       : `<p class="hint" style="margin-top:14px">You have no projects yet. Approving gives this device access to
          <b>nothing</b> — it reaches only what it creates until you authorize it for more.</p>`;
     return authShell(
@@ -563,7 +624,9 @@ oauth.post('/device', async (c) => {
     const stub = c.env.RATE_LIMITER.get(c.env.RATE_LIMITER.idFromName(`auth:${c.req.header('CF-Connecting-IP') ?? 'local'}`));
     if (!(await stub.hit(20, 60_000)).ok) return c.text('too many attempts — slow down', 429);
   }
-  const form = await c.req.parseBody();
+  // all:true for the same reason as the consent picker (RUN-57) — multiple project_ids
+  // checkboxes must survive as an array. user_code/decision are single fields, unaffected.
+  const form = await c.req.parseBody({ all: true });
   const userCode = normalizeUserCode(String(form.user_code ?? ''));
   const decision = String(form.decision ?? '');
 
@@ -602,8 +665,8 @@ oauth.post('/device', async (c) => {
   // approved with no projects would mint an unscoped token, which 0027 reads as "reaches
   // everything": exactly the wide grant this task removes, arriving through the back door.
   const pickable = await pickableProjects(c.env.DB, user.id);
-  const projectIds = await readProjectIds(c.env.DB, user.id, form);
-  if (pickable.length && !projectIds.length) {
+  const scope = await readScope(c.env.DB, user.id, form);
+  if (pickable.length && !scope.all && !scope.ids.length) {
     return c.html(
       devicePage({
         user, userCode, clientName: found.clientName, state: 'confirm',
@@ -617,9 +680,9 @@ oauth.post('/device', async (c) => {
   // consent page, so both grants produce identical connections. The scope rides along until
   // the device exchanges the code.
   const res = await c.env.DB.prepare(
-    `UPDATE oauth_device_codes SET approved_at = ?, user_id = ?, project_ids = ?
+    `UPDATE oauth_device_codes SET approved_at = ?, user_id = ?, project_ids = ?, scope_all = ?
      WHERE user_code = ? AND approved_at IS NULL AND denied_at IS NULL`,
-  ).bind(nowIso(), user.id, JSON.stringify(projectIds), userCode).run();
+  ).bind(nowIso(), user.id, JSON.stringify(scope.ids), scope.all ? 1 : 0, userCode).run();
   if (!res.meta.changes) return c.html(devicePage({ user, userCode, state: 'enter', error: 'that code was already resolved' }), 400);
   return c.html(devicePage({ user, userCode, clientName: found.clientName, state: 'done' }));
 });
@@ -665,7 +728,7 @@ async function deviceTokenGrant(c: Context<AppContext>, form: Record<string, unk
   if (!consume.meta.changes) return c.json({ error: 'invalid_grant', error_description: 'device_code already used' }, 400);
   const { tokenId: _dt, ...deviceGrant } = await issueTokens(
     c.env.DB, String(row.client_id), String(row.user_id), null, String(row.scope),
-    JSON.parse(String(row.project_ids ?? '[]')) as string[],
+    JSON.parse(String(row.project_ids ?? '[]')) as string[], Number(row.scope_all ?? 0) === 1,
   );
   return c.json(deviceGrant);
 }
@@ -699,7 +762,8 @@ oauth.post('/token', async (c) => {
     const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
     if (b64url(new Uint8Array(digest)) !== row.code_challenge) return c.json({ error: 'invalid_grant', error_description: 'PKCE verification failed' }, 400);
     const { tokenId: _ct, ...codeGrant } = await issueTokens(
-      c.env.DB, row.client_id!, row.user_id!, null, row.scope!, JSON.parse(row.project_ids ?? '[]') as string[],
+      c.env.DB, row.client_id!, row.user_id!, null, row.scope!,
+      JSON.parse(row.project_ids ?? '[]') as string[], Number(row.scope_all ?? 0) === 1,
     );
     return c.json(codeGrant);
   }
@@ -724,8 +788,12 @@ oauth.post('/token', async (c) => {
             .bind(row.id!).all<{ id: string }>()
         ).results.map((r) => r.id)
       : null;
+    // An "All projects" grant carries no project rows, so `inherited` is legitimately empty for
+    // one. Dropping the flag here would rotate it into scoped-to-nothing — locking out a live
+    // connection on its next refresh. The exact mirror of the widening rule above.
+    const inheritedAll = !!row.scoped_at && Number(row.scope_all ?? 0) === 1;
     const { tokenId: _rt, ...refreshed } = await issueTokens(
-      c.env.DB, row.client_id!, row.user_id!, row.agent_id ?? null, row.scope!, inherited,
+      c.env.DB, row.client_id!, row.user_id!, row.agent_id ?? null, row.scope!, inherited, inheritedAll,
     );
     return c.json(refreshed);
   }
@@ -754,6 +822,12 @@ export async function issueTokens(
    * even an empty one. An empty array is a real, different thing: scoped to nothing (yet).
    */
   projectIds: string[] | null = null,
+  /**
+   * The human ticked "All projects" (RUN-58): this token tracks its user's access rather than
+   * a frozen list, so projects created later are included. Still SCOPED (scoped_at is set), so
+   * a deliberate wide grant stays distinguishable from a grandfathered legacy one — see 0034.
+   */
+  scopeAll = false,
 ) {
   const access = randToken('plnrt_');
   const refresh = randToken('plnrr_');
@@ -766,10 +840,13 @@ export async function issueTokens(
     new Date(Date.now() + REFRESH_TTL_S * 1000).toISOString()).run();
   // The scope, made real. Written after the token row so the FKs resolve. scoped_at is what
   // distinguishes "a human chose, and chose nothing yet" from "legacy, reaches everything".
-  if (projectIds) {
+  // scope_all carries no project rows on purpose: the grant is "whatever my user can reach",
+  // and freezing today's answer into rows is the very thing it exists not to do.
+  if (projectIds || scopeAll) {
     await db.batch([
-      db.prepare('UPDATE oauth_tokens SET scoped_at = ? WHERE id = ?').bind(nowIso(), tokenId),
-      ...projectIds.map((pid) =>
+      db.prepare('UPDATE oauth_tokens SET scoped_at = ?, scope_all = ? WHERE id = ?')
+        .bind(nowIso(), scopeAll ? 1 : 0, tokenId),
+      ...(scopeAll ? [] : (projectIds ?? [])).map((pid) =>
         db.prepare('INSERT OR IGNORE INTO oauth_token_projects (token_id, project_id) VALUES (?, ?)').bind(tokenId, pid),
       ),
     ]);
