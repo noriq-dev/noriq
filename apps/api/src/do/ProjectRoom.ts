@@ -2,6 +2,7 @@ import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../env';
 import { newId, nowIso } from '../lib/util';
 import { userCanAccessProject } from '../lib/visibility';
+import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
 import { RunKind, AgentTool, RunStatus, isTerminalRunStatus } from '@noriq/shared';
 
 /**
@@ -95,6 +96,7 @@ type RunRow = {
   kind: string; anchor_type: string | null; anchor_id: string | null; brief: string;
   repo_ref: string; agent_tool: string; budget: string; status: string; exit: string | null;
   worktree_path: string | null;
+  tokens_used: number | null; usd_spent: number | null; log_tail: string | null;
   created_by: string; created_at: string; updated_at: string;
   dispatched_at: string | null; started_at: string | null;
 };
@@ -115,6 +117,10 @@ export interface RunView {
   status: string;
   exit: Record<string, unknown> | null;
   worktreePath: string | null;
+  // Live telemetry (RUN-22): last-writer-wins spend + log tail from the daemon.
+  tokensUsed: number | null;
+  usdSpent: number | null;
+  logTail: string | null;
   createdBy: string;
   createdAt: string;
   updatedAt: string;
@@ -473,6 +479,13 @@ export class ProjectRoom extends DurableObject<Env> {
       if (blockers.length) {
         throw new Error(`${task.key} is blocked by unfinished dependencies: ${blockers.join(', ')}`);
       }
+      // RUN-23 gate (defense in depth — the claimable surface already hides these):
+      // a task in a proposed plan can't be worked until a human approves the plan.
+      const gated = await this.env.DB.prepare(
+        `SELECT 1 FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id JOIN plans pl ON pl.id = ph.plan_id
+         WHERE pt.task_id = ? AND pl.status = 'proposed'`,
+      ).bind(taskId).first();
+      if (gated) throw new Error(`${task.key} belongs to a proposed plan awaiting human approval`);
       const ttl = await this.claimTtlSeconds();
       const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
       const claimId = newId('clm');
@@ -1033,6 +1046,7 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM signals WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM messages WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM events WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare('DELETE FROM phase_gates WHERE phase_id IN (SELECT id FROM phases WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ?))').bind(pid),
         this.env.DB.prepare('DELETE FROM phases WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare('DELETE FROM plans WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM tags WHERE project_id = ?').bind(pid),
@@ -1081,6 +1095,9 @@ export class ProjectRoom extends DurableObject<Env> {
       status: r.status,
       exit: r.exit ? JSON.parse(r.exit) : null,
       worktreePath: r.worktree_path,
+      tokensUsed: r.tokens_used,
+      usdSpent: r.usd_spent,
+      logTail: r.log_tail,
       createdBy: r.created_by,
       createdAt: r.created_at,
       updatedAt: r.updated_at,
@@ -1208,6 +1225,92 @@ export class ProjectRoom extends DurableObject<Env> {
     return this.runToWire(await this.loadRun(runId));
   }
 
+  /**
+   * Persist live Run telemetry (RUN-22) reported by the owning daemon. This is a
+   * high-frequency, non-transitional update: it touches ONLY the telemetry columns
+   * (so it never races the status/exit columns transitionRun owns), does NOT append
+   * to the event log, and does NOT bump updated_at (telemetry must not perturb the
+   * recency sort). Last write wins — spend is monotonic, so the final tick carries
+   * the final numbers regardless of how it interleaves with the terminal status.
+   */
+  async recordRunTelemetry(
+    projectId: string,
+    runId: string,
+    t: { tokensUsed?: number | null; usdSpent?: number | null; logTail?: string | null },
+  ): Promise<void> {
+    await this.setPid(projectId);
+    await this.env.DB.prepare(
+      'UPDATE runs SET tokens_used = ?, usd_spent = ?, log_tail = ? WHERE id = ? AND project_id = ?',
+    ).bind(t.tokensUsed ?? null, t.usdSpent ?? null, t.logTail ?? null, runId, projectId).run();
+  }
+
+  /**
+   * Phase-boundary verify gate (RUN-21). Interposes at review→done: `passed`
+   * advances the phase (its review tasks → done, which unblocks the next phase via
+   * the phase-dependency chain); a failure bounces the phase's tasks back to todo
+   * for a fix and increments the attempt count — until DEFAULT_MAX_VERIFY_ATTEMPTS
+   * failed cycles, after which we stop auto-retrying and escalate to a human
+   * (raise an alert; leave the tasks) rather than burn budget on fix→fail→fix.
+   */
+  async recordPhaseVerify(
+    projectId: string,
+    actor: Actor,
+    phaseId: string,
+    passed: boolean,
+    opts: { maxAttempts?: number } = {},
+  ): Promise<{ action: PhaseGateAction; attempts: number }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const now = nowIso();
+      const prev = (await this.env.DB.prepare('SELECT attempts FROM phase_gates WHERE phase_id = ?')
+        .bind(phaseId).first<{ attempts: number }>())?.attempts ?? 0;
+      const attempts = passed ? prev : prev + 1;
+      const action = phaseGateDecision(attempts, passed, opts.maxAttempts ?? DEFAULT_MAX_VERIFY_ATTEMPTS);
+
+      const { results: tasks } = await this.env.DB.prepare(
+        'SELECT t.id, t.key, t.status FROM phase_tasks pt JOIN tasks t ON t.id = pt.task_id WHERE pt.phase_id = ?',
+      ).bind(phaseId).all<{ id: string; key: string; status: string }>();
+
+      let gateStatus: string;
+      if (action === 'advance') {
+        gateStatus = 'passed';
+        for (const t of tasks) {
+          if (t.status !== 'review') continue;
+          await this.env.DB.prepare("UPDATE tasks SET status = 'done', updated_at = ? WHERE id = ?").bind(now, t.id).run();
+          await this.emit(actor, 'task.status_changed', 'task', t.id, { key: t.key, from: 'review', to: 'done', reason: 'verify_passed' });
+        }
+      } else if (action === 'retry') {
+        gateStatus = 'retrying';
+        for (const t of tasks) {
+          if (t.status !== 'review' && t.status !== 'blocked') continue;
+          await this.env.DB.prepare("UPDATE tasks SET status = 'todo', claimed_by = NULL, claim_expires_at = NULL, updated_at = ? WHERE id = ?").bind(now, t.id).run();
+          await this.emit(actor, 'task.status_changed', 'task', t.id, { key: t.key, from: t.status, to: 'todo', reason: 'verify_failed_retry' });
+        }
+      } else {
+        // escalate — stop auto-retrying, raise an alert for a human (inline insert
+        // to avoid nesting blockConcurrencyWhile); leave the tasks as-is.
+        gateStatus = 'escalated';
+        const sigId = newId('sig');
+        await this.env.DB.prepare(
+          `INSERT INTO signals (id, project_id, task_id, agent_id, agent_name, type, severity, title, body, status, created_at)
+           VALUES (?, ?, ?, NULL, ?, 'alert', 'warning', ?, ?, 'open', ?)`,
+        ).bind(
+          sigId, this.projectId, tasks[0]?.id ?? null, actor.name,
+          `Phase verify failed ${attempts}× — human review needed`,
+          `Auto-retry stopped after ${attempts} failed verify cycles. Tasks: ${tasks.map((t) => t.key).join(', ') || '(none)'}.`,
+          now,
+        ).run();
+        await this.emit(actor, 'signal.raised', 'project', this.projectId, { signalId: sigId, sigType: 'alert', severity: 'warning', title: 'phase verify escalated', attempts });
+      }
+
+      await this.env.DB.prepare(
+        `INSERT INTO phase_gates (phase_id, attempts, status, updated_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(phase_id) DO UPDATE SET attempts = excluded.attempts, status = excluded.status, updated_at = excluded.updated_at`,
+      ).bind(phaseId, attempts, gateStatus, now).run();
+      return { action, attempts };
+    });
+  }
+
   // ---------------------------------------------------------------------------
   // Plans — an agent's work program over existing (or inline-created) tasks.
   // Phase order is ENFORCED: every task in phase N gains a dependency on every
@@ -1223,15 +1326,20 @@ export class ProjectRoom extends DurableObject<Env> {
       /** The full written plan — goals, approach, constraints, exit gate (markdown). */
       body?: string;
       agentId?: string | null;
+      /** Emit as a PROPOSED plan (RUN-23): its tasks are gated (not claimable) until
+       *  a human approves it. Scope-run agents set this; defaults to an active plan
+       *  so existing orchestrator create_plan behavior is unchanged. */
+      proposed?: boolean;
       phases: Array<{ title: string; body?: string; taskIds?: string[]; newTasks?: Array<{ title: string; body?: string; priority?: number }> }>;
     },
   )  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const planId = newId('pln');
+      const status = input.proposed ? 'proposed' : 'active';
       await this.env.DB.prepare(
-        'INSERT INTO plans (id, project_id, agent_id, title, description, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      ).bind(planId, projectId, input.agentId ?? null, input.title, input.description ?? '', input.body ?? '', nowIso()).run();
+        'INSERT INTO plans (id, project_id, agent_id, title, description, body, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      ).bind(planId, projectId, input.agentId ?? null, input.title, input.description ?? '', input.body ?? '', status, nowIso()).run();
   
       let prevPhaseTaskIds: string[] = [];
       const phases: Array<{ id: string; title: string; taskIds: string[] }> = [];
@@ -1271,10 +1379,63 @@ export class ProjectRoom extends DurableObject<Env> {
         phases.push({ id: phaseId, title: ph.title, taskIds });
       }
       await this.emit(actor, 'plan.created', 'plan', planId, {
-        title: input.title, phases: phases.map((p) => ({ title: p.title, tasks: p.taskIds.length })),
+        title: input.title, status, phases: phases.map((p) => ({ title: p.title, tasks: p.taskIds.length })),
       });
-      return { id: planId, title: input.title, phases };
-    
+      return { id: planId, title: input.title, status, phases };
+
+    });
+  }
+
+  /** Approve a PROPOSED plan (RUN-23): flip proposed → active so its tasks become
+   *  claimable/dispatchable. The mandatory human gate for v1 — gating is plan-level,
+   *  so no per-task write is needed (the claimable clause lifts the moment the plan
+   *  is active). Idempotent-ish: only a proposed plan can be approved. */
+  async approvePlan(projectId: string, actor: Actor, planId: string) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const plan = await this.env.DB.prepare('SELECT id, title, status FROM plans WHERE id = ? AND project_id = ?')
+        .bind(planId, projectId).first<{ id: string; title: string; status: string }>();
+      if (!plan) throw new Error('plan not found');
+      if (plan.status !== 'proposed') throw new Error(`plan is ${plan.status}, not proposed — nothing to approve`);
+      await this.env.DB.prepare("UPDATE plans SET status = 'active' WHERE id = ?").bind(planId).run();
+      // Count the tasks this ungates, for the event + response.
+      const { taskCount } = (await this.env.DB.prepare(
+        'SELECT COUNT(DISTINCT pt.task_id) AS taskCount FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE ph.plan_id = ?',
+      ).bind(planId).first<{ taskCount: number }>())!;
+      await this.emit(actor, 'plan.approved', 'plan', planId, { title: plan.title, tasks: taskCount });
+      return { id: planId, title: plan.title, status: 'active', tasksUngated: taskCount };
+    });
+  }
+
+  /** Reject a PROPOSED plan (RUN-23): discard the proposal. Cancels the plan's
+   *  never-started tasks (todo + unclaimed — so a referenced pre-existing task that
+   *  is already in flight is left alone) so they don't become claimable orphans when
+   *  the plan is removed, then deletes the plan + its phase structure. */
+  async rejectPlan(projectId: string, actor: Actor, planId: string) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const plan = await this.env.DB.prepare('SELECT id, title, status FROM plans WHERE id = ? AND project_id = ?')
+        .bind(planId, projectId).first<{ id: string; title: string; status: string }>();
+      if (!plan) throw new Error('plan not found');
+      if (plan.status !== 'proposed') throw new Error(`plan is ${plan.status}, not proposed — only a proposal can be rejected`);
+      const { results: taskRows } = await this.env.DB.prepare(
+        'SELECT DISTINCT pt.task_id AS id FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE ph.plan_id = ?',
+      ).bind(planId).all<{ id: string }>();
+      const now = nowIso();
+      const stmts = [
+        // Cancel only the plan's own un-started tasks (never touch in-flight/finished work).
+        ...taskRows.map((r) =>
+          this.env.DB.prepare(
+            "UPDATE tasks SET status = 'cancelled', updated_at = ? WHERE id = ? AND status = 'todo' AND claimed_by IS NULL",
+          ).bind(now, r.id),
+        ),
+        this.env.DB.prepare('DELETE FROM phase_tasks WHERE phase_id IN (SELECT id FROM phases WHERE plan_id = ?)').bind(planId),
+        this.env.DB.prepare('DELETE FROM phases WHERE plan_id = ?').bind(planId),
+        this.env.DB.prepare('DELETE FROM plans WHERE id = ?').bind(planId),
+      ];
+      await this.env.DB.batch(stmts);
+      await this.emit(actor, 'plan.rejected', 'plan', planId, { title: plan.title, cancelledTasks: taskRows.length });
+      return { ok: true, cancelledTasks: taskRows.length };
     });
   }
 

@@ -5,6 +5,7 @@ import { useState } from 'react';
 import type { AppStore } from '../store';
 import { statusMeta } from '../design';
 import { AvatarChip, MonoTag, SectionLabel } from './bits';
+import { Button } from './ui';
 import { Markdown } from './Markdown';
 
 export function PlansView({ store }: { store: AppStore }) {
@@ -38,6 +39,7 @@ export function PlansView({ store }: { store: AppStore }) {
           const allTaskIds = planPhases.flatMap((ph) => phaseTasks.filter((pt) => pt.phaseId === ph.id).map((pt) => pt.taskId));
           const doneCount = allTaskIds.filter((tid) => taskById.get(tid)?.status === 'done').length;
           const open = expanded[plan.id] ?? false;
+          const proposed = plan.status === 'proposed';
           // The active phase = first phase with unfinished tasks.
           const activeIdx = planPhases.findIndex((ph) =>
             phaseTasks.filter((pt) => pt.phaseId === ph.id).some((pt) => taskById.get(pt.taskId)?.status !== 'done'),
@@ -47,9 +49,9 @@ export function PlansView({ store }: { store: AppStore }) {
             <div
               key={plan.id}
               style={{
-                border: '1px solid var(--w-08)',
+                border: `1px solid ${proposed ? 'rgba(245,166,35,.45)' : 'var(--w-08)'}`,
                 borderRadius: 14,
-                background: 'var(--w-02)',
+                background: proposed ? 'rgba(245,166,35,.05)' : 'var(--w-02)',
                 overflow: 'hidden',
               }}
             >
@@ -62,7 +64,10 @@ export function PlansView({ store }: { store: AppStore }) {
                 <span style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--text-dim)', transform: open ? 'rotate(90deg)' : 'none', transition: 'transform .15s' }}>▸</span>
                 {agent && <AvatarChip name={agent.name} color={agent.color} size={28} radius={8} fontSize={10.5} />}
                 <div style={{ minWidth: 0, flex: 1 }}>
-                  <div style={{ fontSize: 14.5, fontWeight: 600, letterSpacing: '-.01em' }}>{plan.title}</div>
+                  <div style={{ fontSize: 14.5, fontWeight: 600, letterSpacing: '-.01em', display: 'flex', alignItems: 'center', gap: 8 }}>
+                    {plan.title}
+                    {proposed && <MonoTag color="#f5a623" bg="rgba(245,166,35,.14)" size={9}>PROPOSED</MonoTag>}
+                  </div>
                   <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {agent ? `planned by ${agent.name}` : 'planned by a human'} · {planPhases.length} phases · {doneCount}/{allTaskIds.length} tasks done
                     {plan.description ? ` · ${plan.description}` : ''}
@@ -98,6 +103,44 @@ export function PlansView({ store }: { store: AppStore }) {
                   🗑
                 </button>
               </div>
+
+              {/* the mandatory human gate (RUN-23): approve → tasks become claimable */}
+              {proposed && (
+                <div
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
+                    padding: '11px 18px', borderTop: '1px solid rgba(245,166,35,.2)',
+                    background: 'rgba(245,166,35,.06)',
+                  }}
+                >
+                  <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: '#f5a623' }}>
+                    ⏳ awaiting your approval — its {allTaskIds.length} task{allTaskIds.length === 1 ? '' : 's'} can't be claimed or dispatched until you approve
+                  </span>
+                  <div style={{ flex: 1 }} />
+                  <Button
+                    variant="primary"
+                    style={{ padding: '6px 16px', fontSize: 12 }}
+                    onClick={async (e) => {
+                      e.stopPropagation();
+                      await store.actions.approvePlan(plan.id);
+                    }}
+                  >
+                    Approve
+                  </Button>
+                  <Button
+                    variant="danger"
+                    style={{ padding: '6px 14px', fontSize: 12 }}
+                    onClick={async (e) => {
+                      e.stopPropagation();
+                      if (confirm(`Reject "${plan.title}"? Its un-started tasks are cancelled and the plan is discarded.`)) {
+                        await store.actions.rejectPlan(plan.id);
+                      }
+                    }}
+                  >
+                    Reject
+                  </Button>
+                </div>
+              )}
 
               {/* expanded: the plan document + stacked phases */}
               {open && (

@@ -77,7 +77,7 @@ export interface EventVM {
   taskId?: string;
 }
 
-export type ViewId = 'home' | 'control' | 'graph' | 'board' | 'plans' | 'agents' | 'settings' | 'admin';
+export type ViewId = 'home' | 'control' | 'graph' | 'board' | 'plans' | 'agents' | 'runs' | 'settings' | 'admin';
 
 export interface BoardVM {
   id: string;

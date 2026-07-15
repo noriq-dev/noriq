@@ -156,4 +156,65 @@ describe('plans & groups', () => {
     const rejected = await mcpCall(doomed.apiKey, 'get_briefing', {}).catch((e) => e);
     expect(String(rejected)).toContain('401');
   });
+
+  // ---- RUN-23: the proposed-plan approval gate --------------------------------
+  it('a proposed plan gates its tasks — un-claimable until a human approves it', async () => {
+    const plan = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId, title: 'Scoped work (proposed)', proposed: true,
+      phases: [{ title: 'Phase 1', newTasks: [{ title: 'gated task A' }] }],
+    });
+    expect(plan.isError).toBe(false);
+    expect(plan.body.status).toBe('proposed');
+    const taskId = plan.body.phases[0].taskIds[0];
+
+    // Gated: claim is refused even with no unfinished deps (plan-level gate).
+    const blocked = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId });
+    expect(blocked.isError).toBe(true);
+    expect(blocked.text).toContain('proposed plan');
+
+    // Gated: next_claimable for this project never surfaces it.
+    const nc = await mcpCall(worker.apiKey, 'next_claimable', { projectId });
+    expect(nc.body.task?.id === taskId).toBeFalsy();
+
+    // Approve → proposed → active → tasks ungate.
+    const appr = await SELF.fetch(`https://planar.test/api/projects/${projectId}/plans/${plan.body.id}/approve`, {
+      method: 'POST', headers: { Cookie: cookie },
+    });
+    expect(appr.status).toBe(200);
+    const apprBody = (await appr.json()) as { status: string; tasksUngated: number };
+    expect(apprBody.status).toBe('active');
+    expect(apprBody.tasksUngated).toBe(1);
+
+    // Now claimable.
+    const ok = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId });
+    expect(ok.isError).toBe(false);
+
+    // Approving a non-proposed plan is refused.
+    const again = await SELF.fetch(`https://planar.test/api/projects/${projectId}/plans/${plan.body.id}/approve`, {
+      method: 'POST', headers: { Cookie: cookie },
+    });
+    expect(again.status).toBe(500); // "plan is active, not proposed"
+  });
+
+  it('rejecting a proposed plan cancels its un-started tasks and discards the plan', async () => {
+    const plan = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId, title: 'To be rejected', proposed: true,
+      phases: [{ title: 'Phase 1', newTasks: [{ title: 'doomed task' }] }],
+    });
+    const planId = plan.body.id;
+    const taskId = plan.body.phases[0].taskIds[0];
+
+    const rej = await SELF.fetch(`https://planar.test/api/projects/${projectId}/plans/${planId}/reject`, {
+      method: 'POST', headers: { Cookie: cookie },
+    });
+    expect(rej.status).toBe(200);
+    expect(((await rej.json()) as { cancelledTasks: number }).cancelledTasks).toBe(1);
+
+    // The task is cancelled (never claimable), and the plan is gone from get_plans.
+    const claim = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId });
+    expect(claim.isError).toBe(true);
+    expect(claim.text).toContain('not claimable'); // status: cancelled
+    const plans = await mcpCall(planner.apiKey, 'get_plans', { projectId });
+    expect(plans.body.plans.some((p: { id: string }) => p.id === planId)).toBe(false);
+  });
 });

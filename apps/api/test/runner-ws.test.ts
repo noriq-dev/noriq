@@ -116,6 +116,71 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
     const row = await env.DB.prepare('SELECT status FROM runs WHERE id = ?').bind(disp.run.id).first<{ status: string }>();
     expect(row!.status).toBe('cancelled');
   });
+
+  it('the dashboard runs list (RUN-22) returns this project\'s runs to the owner, 404 to a non-owner', async () => {
+    // Dispatch one so the list is non-empty, then read it back over the GET surface.
+    const disp = await (await SELF.fetch(`https://planar.test/api/projects/${pid}/runs`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runnerId, kind: 'build', agentTool: 'claude', repoRef: 'repo_x', brief: 'list me' }),
+    })).json() as { run: { id: string } };
+
+    const listed = await SELF.fetch(`https://planar.test/api/projects/${pid}/runs`, { headers: { Cookie: cookie } });
+    expect(listed.status).toBe(200);
+    const { runs } = (await listed.json()) as { runs: Array<{ id: string; projectId: string; repoRef: string }> };
+    const mine = runs.find((r) => r.id === disp.run.id);
+    expect(mine).toBeDefined();
+    expect(mine!.projectId).toBe(pid);
+    expect(mine!.repoRef).toBe('repo_x');
+
+    // A user with no reach to this project is 404'd by the project-access middleware.
+    const otherCookie = await loginSession('rws-other@example.com', 'longenough1');
+    const denied = await SELF.fetch(`https://planar.test/api/projects/${pid}/runs`, { headers: { Cookie: otherCookie } });
+    expect(denied.status).toBe(404);
+  });
+
+  it('persists live run.telemetry (RUN-22) and surfaces spend + log tail on the runs list', async () => {
+    const res = await wsConnect(runnerId, { Authorization: `Bearer ${token}` });
+    const ws = res.webSocket!;
+    ws.accept();
+    ws.send(JSON.stringify({ type: 'hello', protocol: 1, label: 'ws-daemon' }));
+    await nextFrame(ws, (m) => m.type === 'registered');
+
+    const disp = await (await SELF.fetch(`https://planar.test/api/projects/${pid}/runs`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runnerId, kind: 'build', agentTool: 'claude', repoRef: 'repo_x', brief: 'telemetry' }),
+    })).json() as { run: { id: string } };
+    const runId = disp.run.id;
+
+    // Bring it live, then stream a non-transitional telemetry tick.
+    ws.send(JSON.stringify({ type: 'run.status', runId, status: 'running', at: new Date(0).toISOString() }));
+    await waitRunStatus(runId, 'running');
+    ws.send(JSON.stringify({ type: 'run.telemetry', runId, tokensUsed: 8100, usdSpent: 0.42, logTail: 'compiling module A...\nok', at: new Date().toISOString() }));
+
+    // Poll until the telemetry lands on the row (DO RPC is async).
+    let row: { t: number | null; u: number | null; l: string | null } | null = null;
+    for (let i = 0; i < 40; i++) {
+      row = await env.DB.prepare('SELECT tokens_used AS t, usd_spent AS u, log_tail AS l FROM runs WHERE id = ?')
+        .bind(runId).first<{ t: number | null; u: number | null; l: string | null }>();
+      if (row?.t != null) break;
+      await sleep(25);
+    }
+    expect(row!.t).toBe(8100);
+    expect(row!.u).toBeCloseTo(0.42);
+    expect(row!.l).toContain('compiling module A');
+    // Telemetry must NOT mint a status transition — the run stays running.
+    const st = await env.DB.prepare('SELECT status FROM runs WHERE id = ?').bind(runId).first<{ status: string }>();
+    expect(st!.status).toBe('running');
+
+    // And it comes back on the dashboard list projection.
+    const listed = await (await SELF.fetch(`https://planar.test/api/projects/${pid}/runs`, { headers: { Cookie: cookie } })).json() as {
+      runs: Array<{ id: string; tokensUsed: number | null; usdSpent: number | null; logTail: string | null }>;
+    };
+    const mine = listed.runs.find((r) => r.id === runId);
+    expect(mine!.tokensUsed).toBe(8100);
+    expect(mine!.usdSpent).toBeCloseTo(0.42);
+    expect(mine!.logTail).toContain('ok');
+    ws.close();
+  });
 });
 
 describe('steering-ack dedups the notices fallback (RUN-7)', () => {

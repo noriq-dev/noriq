@@ -2,8 +2,14 @@
 // tools validate against — so it cannot drift from the implementation. Served at
 // /reference.md (and /reference.json) alongside /skill.md.
 import { z } from 'zod';
-import { zodToJsonSchema } from 'zod-to-json-schema';
 import { mcpReferenceSpecs } from './mcp';
+
+// zod v4 ships JSON-Schema generation natively (z.toJSONSchema), so the external
+// zod-to-json-schema dep is gone. `io: 'input'` mirrors the old behavior — the
+// schema describes what a caller SENDS (fields with defaults are optional, not
+// required). unrepresentable:'any' keeps generation total for exotic types.
+const toJsonSchema = (shape: z.ZodType): JsonSchema =>
+  z.toJSONSchema(shape, { io: 'input', unrepresentable: 'any' }) as JsonSchema;
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type JsonSchema = {
@@ -71,7 +77,7 @@ export function renderMcpReference(baseUrl: string): string {
     out.push(`### \`${t.name}\``);
     out.push('');
     out.push(t.description);
-    const schema = zodToJsonSchema(z.object(t.inputSchema)) as JsonSchema;
+    const schema = toJsonSchema(z.object(t.inputSchema));
     const props = renderProps(schema);
     out.push('');
     out.push(props.length ? props.join('\n') : '_No parameters._');
@@ -92,7 +98,7 @@ export function renderMcpReference(baseUrl: string): string {
 export function mcpReferenceJson(): unknown {
   const { tools, resources } = mcpReferenceSpecs();
   return {
-    tools: tools.map((t) => ({ name: t.name, description: t.description, inputSchema: zodToJsonSchema(z.object(t.inputSchema)) })),
+    tools: tools.map((t) => ({ name: t.name, description: t.description, inputSchema: toJsonSchema(z.object(t.inputSchema)) })),
     resources,
   };
 }

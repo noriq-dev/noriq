@@ -19,6 +19,18 @@ export const USER_PROJECT_WHERE = `(
   OR (p.group_id IS NOT NULL AND p.group_id IN (SELECT group_id FROM user_groups WHERE user_id = ?1))
 )`;
 
+// Plan-level approval gate (RUN-23): a task belonging to a *proposed* plan (a scope
+// agent's un-approved output) is NOT claimable/dispatchable until a human approves
+// the plan (proposed → active). Gating is plan-level only for v1 — the task itself
+// stays `todo`; this clause hides it from the claimable surface until its plan is
+// active. Assumes the tasks table is aliased `t`. Use as: `AND ${TASK_NOT_IN_PROPOSED_PLAN}`.
+export const TASK_NOT_IN_PROPOSED_PLAN = `NOT EXISTS (
+  SELECT 1 FROM phase_tasks pt
+    JOIN phases ph ON ph.id = pt.phase_id
+    JOIN plans pl ON pl.id = ph.plan_id
+  WHERE pt.task_id = t.id AND pl.status = 'proposed'
+)`;
+
 /** Whether a user may access a specific project (owned / group / ownerless). */
 export async function userCanAccessProject(env: Env, userId: string, projectId: string): Promise<boolean> {
   const row = await env.DB.prepare(

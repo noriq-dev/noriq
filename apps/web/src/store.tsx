@@ -45,7 +45,7 @@ function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
   return { id: e.id, t: timeOf(e.createdAt), actor, actorKind: e.actorKind, verb, subject, taskId };
 }
 
-const VIEWS: ViewId[] = ['home', 'control', 'graph', 'board', 'plans', 'agents', 'settings', 'admin'];
+const VIEWS: ViewId[] = ['home', 'control', 'graph', 'board', 'plans', 'agents', 'runs', 'settings', 'admin'];
 
 function parseUrl(): { pid: string | null; view: ViewId; task: string | null } {
   const m = location.pathname.match(/^\/p\/([^/]+)(?:\/([a-z]+))?/);
@@ -519,6 +519,16 @@ export function useAppStore() {
     async deletePlan(planId: string) {
       if (!pidRef.current) return;
       await api.deletePlan(pidRef.current, planId);
+      refresh();
+    },
+    async approvePlan(planId: string) {
+      if (!pidRef.current) return;
+      await api.approvePlan(pidRef.current, planId);
+      refresh();
+    },
+    async rejectPlan(planId: string) {
+      if (!pidRef.current) return;
+      await api.rejectPlan(pidRef.current, planId);
       refresh();
     },
     async deleteTag(tagId: string) {

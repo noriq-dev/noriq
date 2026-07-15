@@ -5,7 +5,7 @@ import type { AgentIdentity } from './auth';
 import type { Actor } from './do/ProjectRoom';
 import { computeUpdates, formatNotices } from './sync';
 import { base64ToBytes, bytesToBase64, newId, nowIso, sha256Hex } from './lib/util';
-import { USER_PROJECT_WHERE, userCanAccessProject } from './lib/visibility';
+import { TASK_NOT_IN_PROPOSED_PLAN, USER_PROJECT_WHERE, userCanAccessProject } from './lib/visibility';
 
 const MAX_ATTACHMENT = 100 * 1024 * 1024;
 /** Stable resource URI for an attachment; agents read bytes back via resources/read. */
@@ -141,8 +141,11 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     // exact same zod schemas the tools validate against — it can't drift (PLNR-23).
     toolSpecs.push({ name, description, inputSchema });
     const annotations = TOOL_HINTS[name] ?? WRITE; // PLNR-88: proper read/write/destructive hints
+    // The SDK (1.29.0) accepts zod v4 at runtime (peer `^3.25 || ^4.0`) but types
+    // registerTool's inputSchema against v3's fuller ZodType, so v4's leaner raw
+    // shape needs a cast at this single funnel point. Runtime validation is unchanged.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return server.registerTool(name, { description, inputSchema, annotations }, cb as any);
+    return server.registerTool(name, { description, inputSchema: inputSchema as any, annotations }, cb as any);
   };
 
   // ---- orientation --------------------------------------------------------
@@ -456,6 +459,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
            AND NOT EXISTS (
              SELECT 1 FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id
              WHERE d.task_id = t.id AND dt.status NOT IN ('done','cancelled'))
+           AND ${TASK_NOT_IN_PROPOSED_PLAN}
          ORDER BY t.priority DESC, t."order" LIMIT 1`,
       ).bind(agent.userId, projectId ?? null).first();
       return row ? { task: row } : { task: null, note: 'nothing claimable right now — check my_updates for blockers' };
@@ -630,6 +634,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       title: z.string().min(1),
       description: z.string().optional().describe('One-line summary shown on the plan card'),
       body: z.string().optional().describe('The full plan document (markdown): goals, approach, constraints, exit gate'),
+      proposed: z.boolean().optional().describe('Emit as a PROPOSED plan awaiting human approval — its tasks are NOT claimable/dispatchable until someone approves it in the dashboard. Scope-mode Runner agents set this; a normal plan you intend to drain yourself does not.'),
       phases: z.array(
         z.object({
           title: z.string().min(1),
@@ -639,8 +644,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         }),
       ).min(1).max(12),
     },
-    tool(async ({ projectId, title, description, body, phases }) =>
-      room(env, projectId).createPlan(projectId, actor, { title, description, body, agentId: agent.id, phases }),
+    tool(async ({ projectId, title, description, body, proposed, phases }) =>
+      room(env, projectId).createPlan(projectId, actor, { title, description, body, proposed, agentId: agent.id, phases }),
     ),
   );
 

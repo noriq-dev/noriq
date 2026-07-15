@@ -110,6 +110,8 @@ export const api = {
   deleteMilestone: (pid: string, mid: string) => req('DELETE', `/api/projects/${pid}/milestones/${mid}`),
   deleteTag: (pid: string, tid: string) => req('DELETE', `/api/projects/${pid}/tags/${tid}`),
   deletePlan: (pid: string, plid: string) => req('DELETE', `/api/projects/${pid}/plans/${plid}`),
+  approvePlan: (pid: string, plid: string) => req<{ id: string; status: string; tasksUngated: number }>('POST', `/api/projects/${pid}/plans/${plid}/approve`),
+  rejectPlan: (pid: string, plid: string) => req<{ ok: boolean; cancelledTasks: number }>('POST', `/api/projects/${pid}/plans/${plid}/reject`),
   deleteTask: (pid: string, tid: string) => req('DELETE', `/api/projects/${pid}/tasks/${tid}`),
   deleteProject: (pid: string) => req('DELETE', `/api/projects/${pid}`),
   answerSignal: (pid: string, sid: string, response: string) =>
@@ -128,7 +130,80 @@ export const api = {
     req('POST', `/api/projects/${pid}/comments/${cid}/resolve`, { resolution, reply }),
   releaseTask: (pid: string, tid: string, toStatus?: string) =>
     req('POST', `/api/projects/${pid}/tasks/${tid}/release`, { toStatus }),
+
+  // --- runners / runs (RUN-22) ---
+  runners: () => req<{ runners: ApiRunner[] }>('GET', '/api/runners'),
+  runs: (pid: string) => req<{ runs: ApiRun[] }>('GET', `/api/projects/${pid}/runs`),
+  dispatchRun: (pid: string, body: DispatchInput) => req<{ run: ApiRun; delivered: boolean }>('POST', `/api/projects/${pid}/runs`, body),
+  cancelRun: (runId: string, reason?: string) => req<{ run: ApiRun }>('POST', `/api/runs/${runId}/cancel`, { reason }),
 };
+
+// Mirrors @noriq/shared RunnerRepo / Runner / Run — kept as plain interfaces so
+// the web app stays free of the zod dependency (matches the ApiTask style).
+export interface ApiRunnerRepo {
+  id: string;
+  projectKey: string;
+  projectId: string | null;
+  name: string;
+  defaultBranch: string | null;
+}
+export interface ApiRunner {
+  id: string;
+  projectId: string | null;
+  label: string;
+  status: 'online' | 'offline' | 'draining';
+  capabilities: { tools: string[]; kinds: string[]; maxConcurrency: number };
+  repos: ApiRunnerRepo[];
+  freeSlots: number;
+  lastHeartbeatAt: string | null;
+  createdAt: string;
+}
+export interface ApiRunBudget {
+  maxTokens: number | null;
+  maxUsd: number | null;
+  maxDurationSeconds: number | null;
+}
+export interface ApiRunExit {
+  outcome: 'done' | 'failed' | 'cancelled';
+  code: number | null;
+  signal: string | null;
+  reason: string | null;
+  finishedAt: string;
+}
+export type RunStatus = 'queued' | 'dispatched' | 'running' | 'blocked' | 'done' | 'failed' | 'cancelled';
+export interface ApiRun {
+  id: string;
+  projectId: string;
+  runnerId: string | null;
+  agentId: string | null;
+  kind: 'scope' | 'build' | 'verify';
+  anchor: { type: 'task'; taskId: string } | { type: 'plan'; planId: string } | null;
+  brief: string;
+  repoRef: string;
+  agentTool: string;
+  budget: Partial<ApiRunBudget>;
+  status: RunStatus;
+  exit: ApiRunExit | null;
+  worktreePath: string | null;
+  // Live telemetry (RUN-22): last-writer-wins spend + log tail from the daemon.
+  tokensUsed: number | null;
+  usdSpent: number | null;
+  logTail: string | null;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+  dispatchedAt: string | null;
+  startedAt: string | null;
+}
+export interface DispatchInput {
+  runnerId: string;
+  kind: string;
+  agentTool: string;
+  repoRef: string;
+  brief?: string;
+  anchor?: { type: 'task'; id: string } | { type: 'plan'; id: string } | null;
+  budget?: Partial<ApiRunBudget>;
+}
 
 export interface ApiProject {
   id: string;
@@ -196,7 +271,7 @@ export interface ApiSnapshot {
   agents: Array<{ id: string; name: string; role: string; status: string; lastSeenAt: string | null; ownerName: string | null; parentAgentId: string | null }>;
   milestones: Array<{ id: string; title: string; dueAt: string | null; order: number }>;
   boards: Array<{ id: string; name: string; order: number }>;
-  plans: Array<{ id: string; agentId: string | null; title: string; description: string; body: string; createdAt: string }>;
+  plans: Array<{ id: string; agentId: string | null; title: string; description: string; body: string; status: string; createdAt: string }>;
   phases: Array<{ id: string; planId: string; title: string; body: string; order: number }>;
   phaseTasks: Array<{ phaseId: string; taskId: string }>;
   tags: Array<{ id: string; name: string; color: string; order: number }>;

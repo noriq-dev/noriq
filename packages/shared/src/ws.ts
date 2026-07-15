@@ -122,6 +122,21 @@ export const RunnerClientMessage = z.discriminatedUnion('type', [
     at: z.string().datetime(),
   }),
 
+  // Live run telemetry (RUN-22): a high-frequency, non-transitional heartbeat of
+  // spend + a rolling log tail, so the dashboard can show token/USD burn and the
+  // latest output WITHOUT minting a status transition per tick. The daemon is the
+  // only source of this (it owns the process); the server last-writer-wins persists
+  // it on the run row. Distinct from run.status so telemetry never gates lifecycle.
+  z.object({
+    type: z.literal('run.telemetry'),
+    runId: z.string(),
+    tokensUsed: z.number().int().nonnegative().nullable().default(null),
+    usdSpent: z.number().nonnegative().nullable().default(null),
+    // Tail of the agent's combined output, tail-capped by the daemon (last wins).
+    logTail: z.string().nullable().default(null),
+    at: z.string().datetime(),
+  }),
+
   // The ack contract: sent after the daemon attempts to inject a steer. Echoes
   // steerId (dedup), reports where it landed, and advances the server's per-Run
   // notice cursor so the same steer is not re-surfaced via the MCP notices block.

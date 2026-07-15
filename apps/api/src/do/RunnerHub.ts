@@ -101,6 +101,22 @@ export class RunnerHub extends DurableObject<Env> {
         return;
       }
 
+      case 'run.telemetry': {
+        // Non-transitional spend/log-tail tick (RUN-22). Persist on the run row via
+        // the owning project's authority; the runner may only report its OWN runs.
+        const row = await this.env.DB.prepare('SELECT project_id AS pid, runner_id AS rid FROM runs WHERE id = ?')
+          .bind(msg.runId).first<{ pid: string; rid: string | null }>();
+        if (!row || row.rid !== runnerId) return;
+        try {
+          await this.room(row.pid).recordRunTelemetry(row.pid, msg.runId, {
+            tokensUsed: msg.tokensUsed,
+            usdSpent: msg.usdSpent,
+            logTail: msg.logTail,
+          });
+        } catch { /* best-effort telemetry — never fatal */ }
+        return;
+      }
+
       case 'steer.ack': {
         // The runtime-channel dedup ack (RUN-17). Look up the steer we sent to map
         // steerId → (agent, source id); on a live runtime delivery, record it in

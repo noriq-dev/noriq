@@ -44,7 +44,7 @@ export const NoriqEvent = z.object({
   verb: EventVerb,
   subjectType: z.enum(['project', 'milestone', 'task', 'comment', 'message', 'agent', 'run']),
   subjectId: z.string(),
-  payload: z.record(z.unknown()).default({}),
+  payload: z.record(z.string(), z.unknown()).default({}), // zod v4: record requires an explicit key type
   createdAt: z.string().datetime(),
 });
 export type NoriqEvent = z.infer<typeof NoriqEvent>;

@@ -79,7 +79,10 @@ export const RunnerConfig = z.object({
   server: z.string().url(), // the Noriq server this runner dials (control plane)
   scanRoots: z.array(z.string()).min(1), // dirs walked to discover .noriq/project.toml markers
   concurrency: z.number().int().positive().default(1), // → Runner.capabilities.maxConcurrency
-  budget: RunBudget.default({}), // default ceilings applied to Runs lacking their own
+  // default ceilings applied to Runs lacking their own. zod v4: `.default({})` now
+  // wants the full OUTPUT value, so use `.prefault({})` — it parses `{}` through
+  // RunBudget, applying each field's inner default (the v3 `.default({})` behavior).
+  budget: RunBudget.prefault({}),
   // Installed drivers. Optional — the daemon may auto-detect; when set it pins
   // what this runner advertises (Runner.capabilities.tools).
   tools: z.array(AgentTool).nullable().default(null),

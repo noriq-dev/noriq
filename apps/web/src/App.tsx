@@ -9,6 +9,7 @@ import { Login } from './components/Login';
 import { Setup } from './components/Setup';
 import { PlansView } from './components/PlansView';
 import { AgentsView } from './components/AgentsView';
+import { RunsView } from './components/RunsView';
 import { ModalHost } from './components/modals';
 import { SettingsView } from './components/SettingsView';
 import { AdminView } from './components/AdminView';
@@ -98,6 +99,7 @@ export function App() {
               {store.view === 'graph' && <Graph store={store} />}
               {store.view === 'board' && <Board store={store} />}
               {store.view === 'plans' && <PlansView store={store} />}
+              {store.view === 'runs' && <RunsView store={store} />}
               {store.view === 'agents' && <AgentsView store={store} />}
             </>
           )}
