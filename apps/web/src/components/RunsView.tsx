@@ -130,13 +130,11 @@ export function RunsView({ store }: { store: AppStore }) {
                         ))}
                         {/* What code this box runs (RUN-36). You cannot support someone's
                             install without knowing what they are running — and unknown is a
-                            different fact from old, so it says so rather than guessing. */}
-                        <MonoTag
-                          color={r.outdated ? 'var(--amber, #f5a623)' : 'var(--text-faint)'}
-                          bg={r.outdated ? 'rgba(245,166,35,.12)' : 'var(--w-04)'}
-                          size={9}
-                        >
-                          {r.version ? `v${r.version}${r.outdated ? ' · update' : ''}` : 'version unknown'}
+                            different fact from old, so it says so rather than guessing.
+                            Whether it is CURRENT is the runner's business: it checks its own
+                            repo and says so on that box (RUN-37). */}
+                        <MonoTag color="var(--text-faint)" bg="var(--w-04)" size={9}>
+                          {r.version ? `v${r.version}` : 'version unknown'}
                         </MonoTag>
                       </div>
                       <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', marginTop: 2 }}>

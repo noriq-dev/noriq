@@ -9,7 +9,6 @@ import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot } from './backup';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, verifyPassword } from './lib/util';
 import { USER_PROJECT_WHERE, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
-import { MIN_RUNNER_VERSION, fetchLatestRunnerVersion, isOutdated } from './runner-release';
 import type { Actor } from './do/ProjectRoom';
 import { SKILL_MD } from './skill';
 import { issueTokens, metadataRoutes, oauth } from './oauth';
@@ -938,7 +937,7 @@ async function resolveRunnerRepos(
 
 // Map a runners row to the wire Runner shape (never leak owner_user_id), deriving
 // effective online/offline from heartbeat freshness.
-function runnerView(row: Record<string, unknown>, latest: string | null = null) {
+function runnerView(row: Record<string, unknown>) {
   const last = row.last_heartbeat_at as string | null;
   const stale = !last || Date.now() - Date.parse(last) > RUNNER_HEARTBEAT_TTL_MS;
   const offboardedAt = (row.offboarded_at as string | null) ?? null;
@@ -955,10 +954,10 @@ function runnerView(row: Record<string, unknown>, latest: string | null = null) 
     repos: JSON.parse(String(row.repos)),
     freeSlots: row.free_slots as number,
     lastHeartbeatAt: last,
+    // What the runner told us it is running. Noriq records it and shows it; it does not judge
+    // it. Deciding "current" would put the server in the release-distribution business for a
+    // number it does not own — the runner reads its own repo (RUN-37).
     version: (row.version as string | null) ?? null,
-    // Derived, not stored: "current" moves when a release is cut, so a stored flag would be
-    // wrong the moment one lands. Unknown on either side is not outdated — see isOutdated.
-    outdated: isOutdated((row.version as string | null) ?? null, latest),
     createdAt: row.created_at as string,
   };
 }
@@ -1031,22 +1030,6 @@ app.post('/api/runners/:id/heartbeat', agentAuth, async (c) => {
   return c.json({ ok: true });
 });
 
-/**
- * The current runner release (RUN-36). Public and cache-friendly so a human can curl it and
- * RUN-37's auto-update can poll it without a credential:
- *
- *   curl -s https://<noriq>/api/runner/latest
- *
- * See runner-release.ts for why this lives on the server rather than in git or npm — and for
- * the migration path to the npm registry once the package is published.
- */
-app.get('/api/runner/latest', async (c) => {
-  c.header('Cache-Control', 'public, max-age=300');
-  c.header('Access-Control-Allow-Origin', '*');
-  const version = await fetchLatestRunnerVersion();
-  return c.json({ version, minimum: MIN_RUNNER_VERSION });
-});
-
 app.get('/api/runners', userAuth, async (c) => {
   // A user sees their own runners; an admin may see all with ?all=1.
   const all = c.req.query('all') === '1' && c.var.user!.role === 'admin';
@@ -1054,9 +1037,7 @@ app.get('/api/runners', userAuth, async (c) => {
     ? c.env.DB.prepare('SELECT * FROM runners ORDER BY created_at DESC')
     : c.env.DB.prepare('SELECT * FROM runners WHERE owner_user_id = ? ORDER BY created_at DESC').bind(c.var.user!.id);
   const { results } = await stmt.all<Record<string, unknown>>();
-  // One lookup for the whole list (edge-cached), not one per runner.
-  const latest = await fetchLatestRunnerVersion();
-  return c.json({ runners: results.map((r) => runnerView(r, latest)) });
+  return c.json({ runners: results.map(runnerView) });
 });
 
 /** The owner's runner, or null. Every lifecycle route below is owner-scoped through this. */

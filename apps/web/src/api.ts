@@ -177,11 +177,10 @@ export interface ApiRunner {
   freeSlots: number;
   lastHeartbeatAt: string | null;
   offboardedAt: string | null;
-  /** The daemon's release version (RUN-36). Null = registered before version reporting. */
+  /** What the runner reported it is running (RUN-36). Null = registered before version
+   *  reporting. Noriq records it; whether it is CURRENT is the runner's own business — it
+   *  reads its own repo (RUN-37), and the server does not distribute releases. */
   version: string | null;
-  /** Derived server-side against the current release — never stored, since "current" moves
-   *  when the server ships. Unknown is not outdated. */
-  outdated: boolean;
   createdAt: string;
 }
 export interface ApiRunBudget {
