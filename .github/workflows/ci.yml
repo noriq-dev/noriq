@@ -25,10 +25,8 @@ jobs:
       - name: Install
         run: npm ci
 
-      # apps/web typechecks against @noriq-dev/shared's built types.
-      - name: Build shared package
-        run: npm run build --workspace @noriq-dev/shared
-
+      # @noriq-dev/shared is consumed as source (no build output), so nothing to
+      # build here — typecheck resolves it straight from packages/shared/src.
       - name: Typecheck
         run: npm run typecheck
 
