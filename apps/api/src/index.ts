@@ -1368,6 +1368,57 @@ app.post('/api/runs/:runId/agent', agentAuth, async (c) => {
 });
 
 /**
+ * Is this Run parked on a human, and have they answered? (RUN-30)
+ *
+ * The daemon calls this at exactly two moments, and the second is why it exists at all:
+ *
+ * 1. **When the agent's session ends.** An agent that called `request_input` normally ends its
+ *    turn right after, so "the session finished" is ambiguous — it means either "done" or "asked
+ *    a question and stopped". Reading the row disambiguates it, and does so WITHOUT a race:
+ *    `raiseSignal` commits `status='blocked'` inside blockConcurrencyWhile before the MCP call
+ *    returns, so the row is already authoritative by the time the agent could emit a result. A
+ *    pushed `run.parked` frame would be a coin-flip against that same instant; this cannot lose.
+ * 2. **On reconnect**, for each run it has parked locally — the durable half, mirroring
+ *    owed-merges. A human can answer while the box is off, and a fire-and-forget resume frame
+ *    would strand the run and its worktree forever.
+ *
+ * `answer` is non-null only once a human has actually responded; that is the daemon's cue to
+ * resume, and the text it hands the agent.
+ */
+app.get('/api/runs/:runId/park', agentAuth, async (c) => {
+  const runId = c.req.param('runId')!;
+  // Same ownership test as the run-agent endpoint: the run must belong to a runner this user
+  // owns. A daemon must not be able to read the state of runs that are not its own.
+  const run = await c.env.DB.prepare(
+    `SELECT r.id, r.status, r.agent_id AS agentId, r.project_id AS projectId, rn.owner_user_id AS owner
+       FROM runs r LEFT JOIN runners rn ON rn.id = r.runner_id WHERE r.id = ?`,
+  ).bind(runId).first<{ id: string; status: string; agentId: string | null; projectId: string; owner: string | null }>();
+  if (!run || run.owner !== c.var.connection!.userId) return c.json({ error: 'run not found' }, 404);
+  if (!(await tokenCanReachProject(c.env, c.var.connection!.tokenId, run.projectId))) {
+    return c.json({ error: 'run is outside this connection’s authorized projects' }, 403);
+  }
+  // The input_request this run's agent raised. Newest wins: an agent can ask more than once over
+  // a run's life, and the one that parked it is the one it is waiting on now.
+  const signal = run.agentId
+    ? await c.env.DB.prepare(
+        `SELECT id, title, body, status, response FROM signals
+          WHERE agent_id = ? AND type = 'input_request' AND status IN ('open','answered')
+          ORDER BY created_at DESC LIMIT 1`,
+      ).bind(run.agentId).first<{ id: string; title: string; body: string | null; status: string; response: string | null }>()
+    : null;
+  return c.json({
+    runId,
+    status: run.status,
+    blocked: run.status === 'blocked',
+    signalId: signal?.id ?? null,
+    question: signal ? [signal.title, signal.body].filter(Boolean).join('\n\n') : null,
+    // Only a real human response. An 'open' signal has no answer, and a resumed run must not be
+    // handed the empty string as though someone had spoken.
+    answer: signal?.status === 'answered' ? signal.response : null,
+  });
+});
+
+/**
  * Merge requests this runner still owes (RUN-28).
  *
  * The durable half of plan completion. The WS `plan.completed` frame is the fast path, and it is

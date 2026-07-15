@@ -178,6 +178,84 @@ describe('run lifecycle in ProjectRoom (RUN-6)', () => {
     expect(running!.status).toBe('running');
   });
 
+  it('tells the daemon a run parked, and hands back the answer once it lands (RUN-30)', async () => {
+    // The read the daemon makes when an agent's session ends. It exists because "the session
+    // finished" and "the agent asked a question and stopped" look identical from the daemon,
+    // which never sees the request_input — that call goes straight to the server over MCP.
+    // The project must belong to the same user createAgent() mints under, or the spawned agent
+    // cannot see it and request_input never fires (the RUN-18 test above does the same).
+    const ownerEmail = 'agent-mint@example.com';
+    const ownerToken = await mintTokenForUser(ownerEmail);
+    const mintCookie = await loginSession(ownerEmail, 'longenough1');
+    const pr = await SELF.fetch('https://planar.test/api/projects', {
+      method: 'POST', headers: { Cookie: mintCookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'PARK', name: 'park' }),
+    });
+    const parkPid = ((await pr.json()) as { id: string }).id;
+    // The token was minted before PARK existed, so it reaches nothing in it (RUN-38).
+    await authorizeForAllProjects(ownerToken);
+    const reg = await SELF.fetch('https://planar.test/api/runners', {
+      method: 'POST', headers: { Authorization: `Bearer ${ownerToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: 'park-daemon', maxConcurrency: 1 }),
+    });
+    const runnerId = ((await reg.json()) as { runner: { id: string } }).runner.id;
+
+    const spawned = await createAgent('park-agent');
+    await authorizeForAllProjects(spawned.apiKey);
+    const runId = `run_park_${crypto.randomUUID().slice(0, 8)}`;
+    await env.DB.prepare(
+      `INSERT INTO runs (id, project_id, runner_id, agent_id, kind, repo_ref, agent_tool, status, created_by)
+       VALUES (?, ?, ?, ?, 'build', 'r', 'claude', 'running', ?)`,
+    ).bind(runId, parkPid, runnerId, spawned.id, spawned.id).run();
+
+    const park = async () =>
+      (await (await SELF.fetch(`https://planar.test/api/runs/${runId}/park`, {
+        headers: { Authorization: `Bearer ${ownerToken}` },
+      })).json()) as { blocked: boolean; question: string | null; answer: string | null; status: string };
+
+    // Before anything: running, nothing to say.
+    expect(await park()).toMatchObject({ blocked: false, answer: null });
+
+    // The agent asks. The park is committed BEFORE this call returns to the agent — which is why
+    // the daemon can read it and never race the agent's own session ending.
+    await mcpCall(spawned.apiKey, 'request_input', {
+      projectId: parkPid, title: 'which approach?', body: 'A is faster, B is safer.',
+    });
+    const asked = await park();
+    expect(asked.blocked).toBe(true);
+    expect(asked.question).toContain('which approach?');
+    expect(asked.question).toContain('A is faster'); // the body too — the daemon replays it on resume
+    expect(asked.answer).toBeNull(); // nobody has spoken yet; a resume now would send an empty answer
+
+    // The human answers.
+    const sig = await env.DB.prepare(
+      "SELECT id FROM signals WHERE agent_id = ? AND type = 'input_request' ORDER BY created_at DESC LIMIT 1",
+    ).bind(spawned.id).first<{ id: string }>();
+    // mintCookie, not the file-level `cookie`: PARK belongs to the mint user, and the file-level
+    // one is a different person with no reach into this project at all.
+    const ansRes = await SELF.fetch(`https://planar.test/api/projects/${parkPid}/signals/${sig!.id}/answer`, {
+      method: 'POST', headers: { Cookie: mintCookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ response: 'go with B' }),
+    });
+    expect(ansRes.status).toBe(200); // asserted: a silent 404 here would hollow out the test below
+
+    // This is the durable half: a daemon that was OFF when the resume frame fired asks on
+    // reconnect and gets everything it needs to bring the run back.
+    const answered = await park();
+    expect(answered).toMatchObject({ blocked: false, status: 'running', answer: 'go with B' });
+  });
+
+  it('refuses to tell a runner about a run that is not its own (RUN-30)', async () => {
+    // A daemon reading park state for arbitrary runs would leak what other people's agents are
+    // asking. Same ownership test as the run-agent endpoint.
+    const stranger = await mintTokenForUser('park-stranger@example.com');
+    const run = await room(pid).createRun(pid, actor, { kind: 'build', repoRef: 'r', agentTool: 'claude' });
+    const res = await SELF.fetch(`https://planar.test/api/runs/${run.id}/park`, {
+      headers: { Authorization: `Bearer ${stranger}` },
+    });
+    expect(res.status).toBe(404);
+  });
+
   it('re-register (reconnect) reconciles the runner\'s orphaned runs over HTTP', async () => {
     const token = await mintTokenForUser('run-owner@example.com');
     const reg = await SELF.fetch('https://planar.test/api/runners', {

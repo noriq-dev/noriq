@@ -724,8 +724,11 @@ export class ProjectRoom extends DurableObject<Env> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const sig = await this.env.DB.prepare(
-        'SELECT id, task_id AS taskId, agent_id AS agentId, type, status, title FROM signals WHERE id = ? AND project_id = ?',
-      ).bind(signalId, this.projectId).first<{ id: string; taskId: string | null; agentId: string | null; type: string; status: string; title: string }>();
+        // `body` is here for the resume frame (RUN-30): the agent gets its own question back
+        // alongside the answer, because a session resumed after a night away should not have to
+        // infer what it asked from a bare reply.
+        'SELECT id, task_id AS taskId, agent_id AS agentId, type, status, title, body FROM signals WHERE id = ? AND project_id = ?',
+      ).bind(signalId, this.projectId).first<{ id: string; taskId: string | null; agentId: string | null; type: string; status: string; title: string; body: string | null }>();
       if (!sig) throw new Error('signal not found');
       if (sig.status !== 'open') return { ok: true, alreadyResolved: true };
       await this.env.DB.prepare("UPDATE signals SET status = 'answered', response = ?, responder_id = ?, resolved_at = ? WHERE id = ?")
@@ -739,15 +742,39 @@ export class ProjectRoom extends DurableObject<Env> {
           await this.env.DB.prepare("UPDATE tasks SET status = 'todo', updated_at = ? WHERE id = ?").bind(nowIso(), sig.taskId).run();
         }
       }
-      // Mirror to the Run (RUN-18): the answer returns a blocked Run to running so
-      // the spawned agent resumes (it picks up the answer via its own MCP notices).
+      // Mirror to the Run (RUN-18): the answer returns a blocked Run to running.
+      //
+      // RUN-30 changed what that means. It used to assume the agent process was still alive and
+      // would notice the answer through its own MCP notices — true only for a run parked for
+      // minutes. The daemon now ENDS the session on a park (a question can wait overnight, and a
+      // process holding a slot that long is a slot nobody else can use), so the row going back to
+      // 'running' is not enough on its own: something has to tell the machine to bring the agent
+      // back, and hand it the answer.
       if (sig.type === 'input_request' && sig.agentId) {
         const { results } = await this.env.DB.prepare(
-          "SELECT id FROM runs WHERE project_id = ? AND agent_id = ? AND status = 'blocked'",
-        ).bind(this.projectId, sig.agentId).all<{ id: string }>();
+          `SELECT id, runner_id AS runnerId FROM runs
+            WHERE project_id = ? AND agent_id = ? AND status = 'blocked'`,
+        ).bind(this.projectId, sig.agentId).all<{ id: string; runnerId: string | null }>();
         for (const r of results) {
           await this.env.DB.prepare("UPDATE runs SET status = 'running', updated_at = ? WHERE id = ?").bind(nowIso(), r.id).run();
           await this.emit(actor, 'run.status_changed', 'run', r.id, { from: 'blocked', to: 'running', reason: 'input_answered' });
+          if (!r.runnerId) continue;
+          // Fast path only — `signals` holds the answer, and the daemon re-asks
+          // (GET /api/runs/:id/park) for every run it parked, on every reconnect. A daemon that
+          // was off when this fired is the normal case, not the edge one.
+          try {
+            await this.env.RUNNER_HUB.get(this.env.RUNNER_HUB.idFromName(r.runnerId)).deliver(
+              JSON.stringify({
+                type: 'run.resume',
+                runId: r.id,
+                signalId: sig.id,
+                question: [sig.title, sig.body].filter(Boolean).join('\n\n') || null,
+                answer: response,
+              }),
+            );
+          } catch {
+            /* socket gone — the signal is answered on the row, and reconnect will ask */
+          }
         }
       }
       await this.emit(actor, 'signal.answered', sig.taskId ? 'task' : 'project', sig.taskId ?? this.projectId, {
