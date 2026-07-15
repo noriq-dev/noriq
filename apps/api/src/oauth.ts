@@ -205,13 +205,43 @@ async function validateClient(env: Env, p: AuthzParams): Promise<ClientCheck> {
   return { ok: true, name: client.name, redirectUris: uris, cimd: false };
 }
 
-// createConnectionAgent is gone (0026). A grant used to mint a "connection agent": an
-// agents row, project_id NULL forever, that never did any work and existed only so
-// oauth_codes/oauth_tokens had an agent_id to point at. It made every `claude mcp add`
-// look like a working identity in the dashboard, and it is half the reason `agents` meant
-// two incompatible things. A connection is now just its oauth_tokens row — owned by a
-// user, bound to no agent. Working identities are minted per MCP session (copilots) or by
-// a runner (agents).
+/**
+ * Mint the connection's copilot — the identity a `claude mcp add` registers as (PLNR-155).
+ *
+ * Read this next to 0026, which deleted the old "connection agent", because the shapes rhyme
+ * and the difference is the whole point. That row was a do-nothing placeholder: it existed
+ * only so oauth_codes/oauth_tokens had an agent_id to point at, it never did work, and it had
+ * no `kind` to tell it apart from one that did. THIS row is a real, labelled identity and the
+ * PARENT of every session copilot on the connection — so a chat still gets its own actor (and
+ * sub-agents still tree correctly), but nothing has to announce itself to exist.
+ *
+ * project_id stays NULL deliberately: a copilot roams. That is the same shape 0026's cleanup
+ * used to FIND the phantoms (session_id IS NULL), so it is now a legitimate, permanent shape —
+ * any future reaper keyed on it would eat these.
+ *
+ * No oauth_token_id back-pointer: the link is token -> copilot only. The reverse is the cycle
+ * 0026 broke, and it would dangle on refresh anyway.
+ */
+async function createConnectionCopilot(db: D1Database, userId: string, clientId: string): Promise<string> {
+  const meta = await db.prepare(
+    `SELECT (SELECT name FROM users WHERE id = ?1) AS userName,
+            COALESCE((SELECT name FROM oauth_clients WHERE id = ?2), 'MCP client') AS clientName`,
+  ).bind(userId, clientId).first<{ userName: string | null; clientName: string }>();
+  const first = (meta?.userName?.split(' ')[0] ?? 'user').toLowerCase();
+  const client = slugish(meta?.clientName ?? 'client');
+  // `label` is the friendly display ("montana-claude-code"); `name` is the globally-unique
+  // internal handle, which is why it carries the id suffix (PLNR-65 settled that split).
+  const label = `${first}-${client}`;
+  const id = newId('agt');
+  await db.prepare(
+    `INSERT INTO agents (id, name, label, role, status, kind, user_id, created_at)
+     VALUES (?, ?, ?, 'worker', 'idle', 'copilot', ?, ?)`,
+  ).bind(id, `${label}-${id.slice(-6)}`, label, userId, nowIso()).run();
+  return id;
+}
+
+const slugish = (s: string) =>
+  s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 20) || 'client';
 
 /** CIMD clients must exist as an oauth_clients row (FK target for codes/tokens). */
 async function ensureCimdClientRow(db: D1Database, clientId: string, name: string, redirectUris: string[]) {
@@ -729,6 +759,7 @@ async function deviceTokenGrant(c: Context<AppContext>, form: Record<string, unk
   const { tokenId: _dt, ...deviceGrant } = await issueTokens(
     c.env.DB, String(row.client_id), String(row.user_id), null, String(row.scope),
     JSON.parse(String(row.project_ids ?? '[]')) as string[], Number(row.scope_all ?? 0) === 1,
+    await createConnectionCopilot(c.env.DB, String(row.user_id), String(row.client_id)),
   );
   return c.json(deviceGrant);
 }
@@ -761,9 +792,14 @@ oauth.post('/token', async (c) => {
     // PKCE S256
     const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
     if (b64url(new Uint8Array(digest)) !== row.code_challenge) return c.json({ error: 'invalid_grant', error_description: 'PKCE verification failed' }, 400);
+    // The connection becomes real here, not at consent: a code that is never redeemed is not a
+    // connection, and minting on approval would leave an orphan copilot behind every abandoned
+    // flow. This is still "registered at authorize" from the human's side — it is one redirect
+    // later, automatic, and the copilot exists before the client's first MCP call.
+    const copilotId = await createConnectionCopilot(c.env.DB, row.user_id!, row.client_id!);
     const { tokenId: _ct, ...codeGrant } = await issueTokens(
       c.env.DB, row.client_id!, row.user_id!, null, row.scope!,
-      JSON.parse(row.project_ids ?? '[]') as string[], Number(row.scope_all ?? 0) === 1,
+      JSON.parse(row.project_ids ?? '[]') as string[], Number(row.scope_all ?? 0) === 1, copilotId,
     );
     return c.json(codeGrant);
   }
@@ -792,8 +828,12 @@ oauth.post('/token', async (c) => {
     // one. Dropping the flag here would rotate it into scoped-to-nothing — locking out a live
     // connection on its next refresh. The exact mirror of the widening rule above.
     const inheritedAll = !!row.scoped_at && Number(row.scope_all ?? 0) === 1;
+    // Carry the copilot too (PLNR-155). "A connection is simply its oauth_tokens row" stops
+    // being true right here — rotation swaps that row — so without this every refresh would
+    // orphan the connection's copilot and its session children would lose their parent.
     const { tokenId: _rt, ...refreshed } = await issueTokens(
       c.env.DB, row.client_id!, row.user_id!, row.agent_id ?? null, row.scope!, inherited, inheritedAll,
+      row.copilot_id ?? null,
     );
     return c.json(refreshed);
   }
@@ -828,14 +868,20 @@ export async function issueTokens(
    * a deliberate wide grant stays distinguishable from a grandfathered legacy one — see 0034.
    */
   scopeAll = false,
+  /**
+   * The connection's copilot (PLNR-155) — the parent every session copilot on this token hangs
+   * off. Independent of `agentId`: a human's connection has a copilot and no bound agent; a
+   * runner's per-run token has a bound agent and no copilot. Never both.
+   */
+  copilotId: string | null = null,
 ) {
   const access = randToken('plnrt_');
   const refresh = randToken('plnrr_');
   const tokenId = newId('oat');
   await db.prepare(
-    `INSERT INTO oauth_tokens (id, token_hash, refresh_hash, client_id, user_id, agent_id, scope, expires_at, refresh_expires_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).bind(tokenId, await sha256Hex(access), await sha256Hex(refresh), clientId, userId, agentId, scope,
+    `INSERT INTO oauth_tokens (id, token_hash, refresh_hash, client_id, user_id, agent_id, copilot_id, scope, expires_at, refresh_expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(tokenId, await sha256Hex(access), await sha256Hex(refresh), clientId, userId, agentId, copilotId, scope,
     new Date(Date.now() + ACCESS_TTL_S * 1000).toISOString(),
     new Date(Date.now() + REFRESH_TTL_S * 1000).toISOString()).run();
   // The scope, made real. Written after the token row so the FKs resolve. scoped_at is what

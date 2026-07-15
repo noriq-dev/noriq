@@ -1,0 +1,29 @@
+-- 0035: a connection registers its copilot, and sessions hang off it (PLNR-155).
+--
+-- Since 0026 a `claude mcp add` registered NOTHING: a copilot only came into being when some
+-- chat called initialize. So a connection was invisible until used, and there was nothing to
+-- attribute work to except a fresh anonymous row per chat (claude-code-324n4l, -6n5m1s, …).
+--
+-- This is NOT a revert of 0026. What 0026 deleted was a do-nothing row that existed only so
+-- oauth_tokens.agent_id had a target, with no `kind` to tell it from real work. This row is a
+-- real, labelled identity and the HEAD OF A TREE: each session copilot is parented to it, so
+-- per-chat and sub-agent attribution survives while nobody has to self-register.
+--
+-- WHY A NEW COLUMN INSTEAD OF REUSING agent_id — they are opposite meanings, and collapsing
+-- them would be silent. Post-0026 agent_id means BOUND: agentAuth turns it into
+-- connection.boundAgent and /mcp then acts as exactly that agent, never reaching
+-- resolveSessionAgent. Pointing it at a connection copilot would quietly make every chat on
+-- the connection one identity — the opposite of the tree this exists to build. agent_id stays
+-- runner-only; copilot_id is "the parent to hang sessions off", and the two are independent
+-- (a runner's token has agent_id and no copilot; a human's has copilot_id and no agent).
+--
+-- The direction matters too: oauth_tokens -> agents only. The copilot does NOT point back via
+-- agents.oauth_token_id, because that is the cycle 0026 broke and there is no reason to rebuild
+-- it — and because a refresh replaces the token row, so a back-pointer would dangle on rotation.
+-- issueTokens threads copilot_id across rotation for exactly that reason (as it already does
+-- for agent_id and scope_all): "a connection is simply its oauth_tokens row" stops being true
+-- the moment refresh_token swaps that row out.
+--
+-- Additive; NULL means what it always meant — no copilot bound to this token.
+ALTER TABLE oauth_tokens ADD COLUMN copilot_id TEXT REFERENCES agents(id);
+CREATE INDEX idx_oauth_tokens_copilot ON oauth_tokens (copilot_id) WHERE copilot_id IS NOT NULL;

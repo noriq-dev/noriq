@@ -70,6 +70,39 @@ describe('agents are per-session, project-local', () => {
     expect(names).not.toContain('roster-there');
   });
 
+  it('?kind=copilot lists copilots by OWNER, reaching the ones no project can see (PLNR-156)', async () => {
+    const cookie = await bootAdmin();
+    const get = async (qs: string) =>
+      ((await (await SELF.fetch(`https://planar.test/api/agents?${qs}`, { headers: { Cookie: cookie } })).json()) as {
+        agents: Array<{ id: string; kind: string; projectId?: string | null; parentAgentId: string | null; clientName?: string | null }>;
+      }).agents;
+
+    // A connection copilot has project_id NULL by design (PLNR-155), so the project-scoped
+    // roster CANNOT see it — that is the whole reason this is a separate read and not a filter.
+    const inProject = await get(`projectId=${projectId}`);
+    const copilots = await get('kind=copilot');
+
+    const connections = copilots.filter((a) => a.clientName);
+    expect(connections.length).toBeGreaterThan(0); // present here...
+    for (const conn0 of connections) {
+      expect(inProject.some((a) => a.id === conn0.id)).toBe(false); // ...and invisible there
+      expect(conn0.projectId ?? null).toBeNull();
+    }
+    // Only copilots come back — a runner's agent is the other tab's business.
+    expect(copilots.every((a) => a.kind === 'copilot')).toBe(true);
+
+    // And the tree is intact: some session hangs off a connection in the same list.
+    expect(copilots.some((a) => a.parentAgentId && copilots.some((p) => p.id === a.parentAgentId))).toBe(true);
+  });
+
+  it('?kind=agent narrows the project roster to runner-spawned agents (PLNR-156)', async () => {
+    const cookie = await bootAdmin();
+    const agents = ((await (await SELF.fetch(`https://planar.test/api/agents?projectId=${projectId}&kind=agent`, {
+      headers: { Cookie: cookie },
+    })).json()) as { agents: Array<{ kind: string }> }).agents;
+    expect(agents.every((a) => a.kind === 'agent')).toBe(true);
+  });
+
   it('a sub-agent is attributed to its parent', async () => {
     const parent = await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'lead', projectId }, 'sess-lead');
     const sub = await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'helper', projectId, parentAgentId: parent.body.actingAs.id }, 'sess-sub');
@@ -91,14 +124,31 @@ describe('copilot / agent split', () => {
     expect(b.body.you.kind).toBe('copilot');
   });
 
-  it('a connection is not an agent — the grant mints no identity of its own', async () => {
-    // Pre-0026 every `claude mcp add` created a "connection agent": project_id NULL, did no
-    // work, existed only so oauth_tokens.agent_id had a target — and showed up in the UI as
-    // an idle agent nobody created. Nothing sessionless should exist now.
+  it('a connection registers a copilot, but is still not an AGENT (PLNR-155)', async () => {
+    // This USED to assert nothing sessionless exists at all, because 0026 had just deleted the
+    // "connection agent": project_id NULL, did no work, existed only so oauth_tokens.agent_id
+    // had a target — an idle agent nobody created. PLNR-155 deliberately brings a sessionless
+    // row back, so the assertion moves to what actually distinguished the phantom: this one is
+    // LABELLED, it is OWNED by a connection, and it is the head of a tree.
     const { results } = await env.DB.prepare(
-      "SELECT id FROM agents WHERE session_id IS NULL AND kind = 'copilot'",
-    ).all();
-    expect(results).toHaveLength(0);
+      `SELECT a.id, a.label, a.project_id AS projectId,
+              (SELECT COUNT(*) FROM oauth_tokens t WHERE t.copilot_id = a.id) AS owners
+         FROM agents a WHERE a.session_id IS NULL AND a.kind = 'copilot'`,
+    ).all<{ id: string; label: string | null; projectId: string | null; owners: number }>();
+    expect(results.length).toBeGreaterThan(0); // the grant DOES register one now
+    for (const r of results) {
+      expect(r.label).toBeTruthy(); // a name a human recognises, not an anonymous placeholder
+      expect(r.owners).toBeGreaterThan(0); // it belongs to a connection; nothing dangles
+      expect(r.projectId).toBeNull(); // a copilot roams — it is not project-local
+    }
+
+    // The load-bearing half, unchanged: a human's grant must never BIND an agent. If it did,
+    // agentAuth would return connection.boundAgent and /mcp would act AS the connection —
+    // collapsing every chat on it into one identity. copilot_id and agent_id are never both.
+    const bound = await env.DB.prepare(
+      'SELECT COUNT(*) AS n FROM oauth_tokens WHERE copilot_id IS NOT NULL AND agent_id IS NOT NULL',
+    ).first<{ n: number }>();
+    expect(bound!.n).toBe(0);
   });
 
   it('refuses a sessionless call instead of inventing somebody to be', async () => {

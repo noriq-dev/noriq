@@ -1,4 +1,4 @@
-import { SELF } from 'cloudflare:test';
+import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { createAgent, createUser, loginSession, mcpCall, sessionFor, authorizeForAllProjects } from './helpers';
 
@@ -263,6 +263,85 @@ describe('oauth 2.1 for MCP', () => {
     const briefing = await mcpCall(t.access_token, 'get_briefing', {}, sessionFor(accessToken));
     expect(briefing.body.you.name).toBe('atlas-prime');
     expect(briefing.body.you.kind).toBe('copilot');
+  });
+});
+
+// --- the connection registers its copilot; sessions hang off it (PLNR-155) -----------------
+describe('connection copilot (PLNR-155)', () => {
+  const redirectUri = 'http://localhost:33418/callback';
+  let clientId: string;
+  const db = () => (env as unknown as { DB: D1Database }).DB;
+
+  const sha256Hex = async (s: string) => {
+    const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+    return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  };
+
+  beforeAll(async () => {
+    const res = await SELF.fetch('https://planar.test/oauth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_name: 'Copilot Client', redirect_uris: [redirectUri] }),
+    });
+    clientId = ((await res.json()) as { client_id: string }).client_id;
+  });
+
+  async function grant(email: string): Promise<{ access: string; refresh: string }> {
+    const cookie = await loginSession(email, 'longenough1').catch(async () => {
+      await createUser(email, 'Copilot Human', 'longenough1');
+      return loginSession(email, 'longenough1');
+    });
+    return consentFor(cookie, clientId, redirectUri, []);
+  }
+
+  const copilotOf = async (access: string) =>
+    (await db().prepare('SELECT copilot_id AS id FROM oauth_tokens WHERE token_hash = ?')
+      .bind(await sha256Hex(access)).first<{ id: string | null }>())!.id;
+
+  it('registers the copilot at authorize — before any MCP call', async () => {
+    const { access } = await grant('copilot-a@example.com');
+    const id = await copilotOf(access);
+    expect(id).toMatch(/^agt_/); // exists already: a `claude mcp add` is visible immediately
+
+    const row = await db().prepare(
+      'SELECT kind, label, project_id AS projectId, session_id AS sessionId, runner_id AS runnerId FROM agents WHERE id = ?',
+    ).bind(id).first<{ kind: string; label: string; projectId: string | null; sessionId: string | null; runnerId: string | null }>();
+    expect(row!.kind).toBe('copilot');
+    expect(row!.label).toContain('copilot-client'); // reads as "<human>-<client>", not an opaque id
+    expect(row!.projectId).toBeNull(); // a copilot roams; it is not project-local
+    expect(row!.sessionId).toBeNull(); // it is the CONNECTION's, not any one chat's
+    expect(row!.runnerId).toBeNull(); // 0026's CHECK: only kind='agent' is runner-owned
+  });
+
+  it('parents each session copilot to it, with nobody self-registering', async () => {
+    const { access } = await grant('copilot-b@example.com');
+    const parent = await copilotOf(access);
+
+    // No set_agent_identity anywhere — the session simply IS somebody (PLNR-157).
+    const briefing = await mcpCall(access, 'get_briefing', {});
+    const me = (briefing.body.you as { id: string; kind: string });
+    expect(me.kind).toBe('copilot');
+    expect(me.id).not.toBe(parent); // the chat is its own actor, not the connection itself
+
+    const child = await db().prepare('SELECT parent_agent_id AS parent FROM agents WHERE id = ?')
+      .bind(me.id).first<{ parent: string | null }>();
+    expect(child!.parent).toBe(parent); // ← the tree
+  });
+
+  it('survives a refresh — rotation must not orphan the copilot', async () => {
+    const { access, refresh } = await grant('copilot-c@example.com');
+    const before = await copilotOf(access);
+
+    const res = await SELF.fetch('https://planar.test/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refresh }).toString(),
+    });
+    const rotated = ((await res.json()) as { access_token: string }).access_token;
+
+    // "A connection is simply its oauth_tokens row" stops being true exactly here — refresh
+    // swaps the row. Drop the copilot and its session children lose their parent.
+    expect(await copilotOf(rotated)).toBe(before);
   });
 });
 

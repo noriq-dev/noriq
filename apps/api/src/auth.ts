@@ -29,6 +29,13 @@ export interface Connection {
    * where the working copilot is resolved per session instead.
    */
   boundAgent: AgentIdentity | null;
+  /**
+   * The connection's own copilot (PLNR-155) — minted when the grant was exchanged, and the
+   * PARENT that each session copilot hangs off. Independent of boundAgent, and never both:
+   * a human's connection has a copilot, a runner's per-run token has a bound agent.
+   * Null only for a token minted before PLNR-155 (its sessions simply have no parent).
+   */
+  copilotId: string | null;
 }
 
 export interface UserIdentity {
@@ -72,6 +79,7 @@ export async function agentAuth(c: Context<AppContext>, next: Next) {
   // is the normal case for a human's connection.
   const t = await c.env.DB.prepare(
     `SELECT t.id AS tokenId, t.user_id AS userId, t.client_id AS clientId, t.agent_id AS boundAgentId,
+            t.copilot_id AS copilotId,
             a.id AS agentId, COALESCE(a.label, a.name) AS agentName, a.role AS agentRole, a.kind AS agentKind,
             COALESCE(cl.name, 'MCP client') AS clientName
      FROM oauth_tokens t
@@ -81,6 +89,7 @@ export async function agentAuth(c: Context<AppContext>, next: Next) {
        AND t.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
   ).bind(hash).first<{
     tokenId: string; userId: string; clientId: string; clientName: string; boundAgentId: string | null;
+    copilotId: string | null;
     agentId: string | null; agentName: string | null; agentRole: 'orchestrator' | 'worker' | null;
     agentKind: AgentKind | null;
   }>();
@@ -95,7 +104,10 @@ export async function agentAuth(c: Context<AppContext>, next: Next) {
     ? { id: t.agentId, name: t.agentName ?? t.agentId, role: t.agentRole ?? 'worker', userId: t.userId, kind: t.agentKind ?? 'agent' }
     : null;
   c.set('oauthTokenId', t.tokenId);
-  c.set('connection', { tokenId: t.tokenId, userId: t.userId, clientId: t.clientId, clientName: t.clientName, boundAgent });
+  c.set('connection', {
+    tokenId: t.tokenId, userId: t.userId, clientId: t.clientId, clientName: t.clientName,
+    boundAgent, copilotId: t.copilotId,
+  });
   // No `agent` is set here. Routes that need one either read connection.boundAgent or resolve
   // it per MCP session; the runner's REST endpoints (register/heartbeat/steer-ack) need only
   // the connection's user.
@@ -108,8 +120,13 @@ const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(
 /**
  * Resolve the COPILOT for one MCP session (a chat, or a sub-agent) on a connection.
  * Each MCP client `initialize` gets its own session id, so this is one copilot per
- * session. Created unscoped (project_id NULL) and unnamed-ish; set_agent_identity or
- * the first claim gives it a real label + project.
+ * session — parented to the connection's own copilot (PLNR-155), which is what keeps a
+ * busy day legible: one named connection with its chats beneath it, rather than a flat
+ * wall of anonymous rows. Created unscoped (project_id NULL) because a copilot roams.
+ *
+ * Nothing here needs announcing itself: the parent was registered when the grant was
+ * exchanged and the child is named from the client, so an agent never has to invent an
+ * identity (PLNR-157). set_agent_identity survives only to RENAME one it already has.
  *
  * This path only ever mints copilots. A runner-spawned agent is created by the runner
  * and reached through a token bound to it (connection.boundAgent) — it never arrives
@@ -139,10 +156,12 @@ export async function resolveSessionAgent(env: Env, conn: Connection, sessionId:
   // set via set_agent_identity). The id suffix guarantees uniqueness. PLNR-65 settled this
   // split deliberately — name is not dead weight, it is the handle label falls back to.
   const name = `${slug(conn.clientName)}-${id.slice(-6)}`;
+  // parent_agent_id is the connection's copilot. Null only for a token minted before
+  // PLNR-155 — those sessions stay parentless rather than being adopted by a guess.
   await env.DB.prepare(
-    `INSERT INTO agents (id, name, role, status, kind, user_id, oauth_token_id, session_id, created_at)
-     VALUES (?, ?, 'worker', 'idle', 'copilot', ?, ?, ?, ?)`,
-  ).bind(id, name, conn.userId, conn.tokenId, sessionId, nowIso()).run();
+    `INSERT INTO agents (id, name, role, status, kind, user_id, oauth_token_id, session_id, parent_agent_id, created_at)
+     VALUES (?, ?, 'worker', 'idle', 'copilot', ?, ?, ?, ?, ?)`,
+  ).bind(id, name, conn.userId, conn.tokenId, sessionId, conn.copilotId, nowIso()).run();
   return { id, name, role: 'worker', userId: conn.userId, kind: 'copilot' };
 }
 

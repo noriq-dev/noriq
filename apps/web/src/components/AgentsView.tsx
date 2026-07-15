@@ -27,15 +27,20 @@ export function AgentsView({ store }: { store: AppStore }) {
   const [agents, setAgents] = useState<ApiAgent[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [events, setEvents] = useState<ApiAgentEvent[]>([]);
+  // The two kinds have opposite lifecycles (RUN-43), so they get separate views rather than
+  // one list that means two things. Agents are the project's runner-spawned processes;
+  // copilots are YOUR sessions and aren't project-local at all (PLNR-156).
+  const [kind, setKind] = useState<'agent' | 'copilot'>('agent');
   const isAdmin = store.user?.role === 'admin';
 
-  const load = () => api.agents(store.currentPid).then((r) => setAgents(r.agents)).catch(() => {});
+  const load = () => api.agents(store.currentPid, kind).then((r) => setAgents(r.agents)).catch(() => {});
   useEffect(() => {
+    setSelected(null); // a selection from the other tab isn't in this list
     load();
     const iv = setInterval(load, 15000);
     return () => clearInterval(iv);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [store.modal, store.currentPid]); // reload on project switch + after the new-agent modal closes
+  }, [store.modal, store.currentPid, kind]); // reload on project switch, tab switch, modal close
 
   useEffect(() => {
     if (selected) api.agentEvents(selected).then((r) => setEvents(r.events)).catch(() => setEvents([]));
@@ -48,11 +53,31 @@ export function AgentsView({ store }: { store: AppStore }) {
     <div className="agents-grid" style={{ position: 'absolute', inset: 0, display: 'grid', gridTemplateColumns: selected ? '1fr 380px' : '1fr', minHeight: 0 }}>
       <div style={{ overflowY: 'auto', padding: '18px 22px', minWidth: 0 }}>
         <div style={{ maxWidth: 860, margin: '0 auto' }}>
-          <div style={{ display: 'flex', alignItems: 'center', marginBottom: 14 }}>
-            <SectionLabel>Agents · {agents.filter((a) => a.status !== 'revoked').length}</SectionLabel>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 14 }}>
+            <SectionLabel>
+              {kind === 'agent' ? 'Agents' : 'Copilots'} · {agents.filter((a) => a.status !== 'revoked').length}
+            </SectionLabel>
+            <div style={{ display: 'flex', gap: 2, padding: 2, borderRadius: 9, background: 'var(--w-02)', border: '1px solid var(--w-07)' }}>
+              {(['agent', 'copilot'] as const).map((k) => (
+                <button
+                  key={k}
+                  onClick={() => setKind(k)}
+                  style={{
+                    fontFamily: 'var(--mono)', fontSize: 10, letterSpacing: '.04em', textTransform: 'uppercase',
+                    padding: '5px 11px', borderRadius: 7, border: 'none', cursor: 'pointer',
+                    background: kind === k ? 'var(--w-09)' : 'transparent',
+                    color: kind === k ? 'var(--text)' : 'var(--text-dim)',
+                  }}
+                >
+                  {k === 'agent' ? 'Agents' : 'Copilots'}
+                </button>
+              ))}
+            </div>
             <div style={{ flex: 1 }} />
             <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>
-              agents join via OAuth — connect a client from the homepage
+              {kind === 'agent'
+                ? 'runner-spawned — one run each, pinned to this project'
+                : 'your sessions — registered when you authorize a client'}
             </span>
           </div>
 
@@ -60,6 +85,11 @@ export function AgentsView({ store }: { store: AppStore }) {
             {agents.map((a) => {
               const revoked = a.status === 'revoked';
               const online = a.lastSeenAt !== null && Date.now() - new Date(a.lastSeenAt).getTime() < 5 * 60 * 1000;
+              // Copilots read as a tree: one named connection with its chats beneath it —
+              // otherwise a busy day is a wall of anonymous rows, which is the thing PLNR-155
+              // set out to fix. A session whose parent isn't in view (a token minted before
+              // that existed) just sits at top level rather than being faked into the tree.
+              const isChild = kind === 'copilot' && !!a.parentAgentId && agents.some((p) => p.id === a.parentAgentId);
               return (
                 <div
                   key={a.id}
@@ -68,6 +98,8 @@ export function AgentsView({ store }: { store: AppStore }) {
                   style={{
                     display: 'flex', alignItems: 'center', gap: 12, padding: '13px 15px',
                     borderRadius: 11, cursor: 'pointer',
+                    marginLeft: isChild ? 26 : 0,
+                    borderLeft: isChild ? '2px solid var(--w-18)' : undefined,
                     background: selected === a.id ? 'var(--w-045)' : 'var(--w-02)',
                     border: `1px solid ${selected === a.id ? 'var(--w-18)' : 'var(--w-07)'}`,
                     opacity: revoked ? 0.45 : 1,
@@ -96,9 +128,15 @@ export function AgentsView({ store }: { store: AppStore }) {
                           A quiet agent has no human behind it, and liveness is the signal. */}
                       {a.kind === 'agent'
                         ? `runner-spawned · last seen ${ago(a.lastSeenAt)} · `
-                        : a.ownerName
-                          ? `${a.ownerName}’s session · `
-                          : 'unowned (legacy) · '}
+                        : a.clientName
+                          // Only a connection copilot has a token pointing at it, so only it
+                          // can name the client it was authorized from (PLNR-155).
+                          ? `connection · authorized from ${a.clientName} · `
+                          : isChild
+                            ? 'session · '
+                            : a.ownerName
+                              ? `${a.ownerName}’s session · `
+                              : 'unowned (legacy) · '}
                       {a.totalClaims} claims lifetime
                     </div>
                   </div>

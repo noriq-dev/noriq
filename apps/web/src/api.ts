@@ -102,7 +102,15 @@ export const api = {
   deleteAttachment: (aid: string) => req('DELETE', `/api/attachments/${aid}`),
   createTag: (pid: string, name: string) => req<{ id: string }>('POST', `/api/projects/${pid}/tags`, { name }),
 
-  agents: (projectId?: string) => req<{ agents: ApiAgent[] }>('GET', projectId ? `/api/agents?projectId=${projectId}` : '/api/agents'),
+  /** kind='copilot' is a different read, not a filter: copilots aren't project-local, so they
+   *  scope to their owner and ignore projectId entirely (PLNR-156). */
+  agents: (projectId?: string, kind?: 'agent' | 'copilot') => {
+    const q = new URLSearchParams();
+    if (projectId && kind !== 'copilot') q.set('projectId', projectId);
+    if (kind) q.set('kind', kind);
+    const qs = q.toString();
+    return req<{ agents: ApiAgent[] }>('GET', qs ? `/api/agents?${qs}` : '/api/agents');
+  },
   agentEvents: (aid: string) => req<{ events: ApiAgentEvent[] }>('GET', `/api/agents/${aid}/events`),
   revokeAgent: (aid: string) => req('POST', `/api/agents/${aid}/revoke`),
 
@@ -291,7 +299,14 @@ export interface ApiAgent {
   totalClaims: number;
   ownerName: string | null;
   ownerUserId: string | null;
+  /** For a session copilot, the connection copilot it hangs off (PLNR-155). Null for the
+   *  connection copilot itself, and for sessions on a token minted before that existed. */
   parentAgentId: string | null;
+  /** kind='copilot' reads only: the project it roamed to (copilots aren't project-local), and
+   *  the client that authorized it — set only on a connection copilot, since only that one has
+   *  a token pointing at it. */
+  projectId?: string | null;
+  clientName?: string | null;
 }
 
 export interface ApiAgentEvent {

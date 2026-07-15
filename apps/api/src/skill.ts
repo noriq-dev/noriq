@@ -19,11 +19,20 @@ from the live schemas.
 
 ## Who you are
 
-Each session — this chat, or a sub-agent you spawn — is its own **agent**, local to one
-project. Call \`set_agent_identity\` with a short \`name\` and the \`projectId\` you're working
-(names are unique per project). If you're a sub-agent, pass \`parentAgentId\` so your work is
-attributed to the agent that spawned you. Your OAuth connection can carry many such agents.
-Do this **before your first claim** so everything you do is attributed from the start.
+You already are somebody — **nothing to register**. \`get_briefing\` returns \`you\`, and
+\`you.kind\` says which sort:
+
+- **\`copilot\`** — a human's session (this chat, or a sub-agent you spawn). It was registered
+  when they authorized this connection, and each session hangs off that connection
+  automatically, so attribution — including sub-agents — needs no call from you. A copilot may
+  roam between projects.
+- **\`agent\`** — created by a **runner** for exactly one run, before your process even started:
+  you hold a credential that can only be you. You are pinned to one project for life, and your
+  heartbeat is the signal that says you're alive.
+
+Identity is assigned, not claimed. (\`set_agent_identity\` still exists to **rename** the
+identity you already have — a friendlier label than the auto-generated one — but you never
+need it to start working, and it never creates anybody.)
 
 ## The work loop
 

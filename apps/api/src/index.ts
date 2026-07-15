@@ -831,8 +831,33 @@ app.delete('/api/groups/:gid/members/:uid', userAuth, async (c) => {
 
 app.get('/api/agents', userAuth, async (c) => {
   // Agents are project-local; scope the roster to a project when given (the Agents tab
-  // passes the current project). Connection default agents (project_id NULL) never show.
+  // passes the current project).
   const projectId = c.req.query('projectId');
+  // ?kind=copilot is a DIFFERENT read, not a filter (PLNR-156). A copilot is deliberately not
+  // project-local — it roams, and a connection's copilot has project_id NULL by design
+  // (PLNR-155) — so the project-scoped query below would return an empty list and read as
+  // broken. Copilots scope to their OWNER instead: yours are yours to see, no admin needed.
+  if (c.req.query('kind') === 'copilot') {
+    const isAdmin = c.var.user!.role === 'admin';
+    const stmt = c.env.DB.prepare(
+      `SELECT a.id, COALESCE(a.label, a.name) AS name, a.role, a.status, a.last_seen_at AS lastSeenAt,
+              a.created_at AS createdAt, a.kind, a.runner_id AS runnerId, a.project_id AS projectId,
+              a.parent_agent_id AS parentAgentId, u.name AS ownerName, u.id AS ownerUserId,
+              (SELECT COUNT(*) FROM tasks t WHERE t.claimed_by = a.id) AS heldTasks,
+              (SELECT COUNT(*) FROM claims cl WHERE cl.agent_id = a.id) AS totalClaims,
+              -- Which client authorized it; only a connection copilot has a token pointing at it.
+              (SELECT COALESCE(oc.name, 'MCP client') FROM oauth_tokens ot
+                 LEFT JOIN oauth_clients oc ON oc.id = ot.client_id
+                WHERE ot.copilot_id = a.id ORDER BY ot.expires_at DESC LIMIT 1) AS clientName
+         FROM agents a LEFT JOIN users u ON u.id = a.user_id
+        WHERE a.kind = 'copilot' AND a.status != 'revoked'${isAdmin ? '' : ' AND a.user_id = ?1'}
+        -- Group each connection copilot with its session children: same COALESCE key, parent
+        -- first (its own parent_agent_id is NULL), then children oldest-first.
+        ORDER BY COALESCE(a.parent_agent_id, a.id), a.parent_agent_id IS NOT NULL, a.created_at`,
+    );
+    const { results } = await (isAdmin ? stmt : stmt.bind(c.var.user!.id)).all();
+    return c.json({ agents: results });
+  }
   // PLNR-97: the roster is per-project — a non-admin must be able to reach it; the
   // cross-project view (no projectId) stays admin-only.
   if (projectId) {
@@ -840,7 +865,10 @@ app.get('/api/agents', userAuth, async (c) => {
   } else if (c.var.user!.role !== 'admin') {
     return c.json({ agents: [] });
   }
-  const where = projectId ? 'WHERE a.project_id = ?' : 'WHERE a.project_id IS NOT NULL';
+  // ?kind=agent narrows the project roster to runner-spawned agents. Absent, the roster stays
+  // exactly as it was (both kinds), so nothing that already calls this changes shape.
+  const agentsOnly = c.req.query('kind') === 'agent' ? " AND a.kind = 'agent'" : '';
+  const where = (projectId ? 'WHERE a.project_id = ?' : 'WHERE a.project_id IS NOT NULL') + agentsOnly;
   const stmt = c.env.DB.prepare(
     `SELECT a.id, COALESCE(a.label, a.name) AS name, a.role, a.status, a.last_seen_at AS lastSeenAt, a.created_at AS createdAt,
             a.kind, a.runner_id AS runnerId,

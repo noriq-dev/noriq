@@ -34,9 +34,11 @@ The contract: (1) call get_briefing first; (2) claim_task before working on anyt
 TTL is generous (30 min), so you never need to ping to stay alive. heartbeat exists only
 for the rare case where you'll go silent longer than that; (4) check and resolve open
 comments — humans steer you through them; (5) release_task (to review or done) when
-finished. Never work on a task you have not claimed. Each session (this chat, or a
-sub-agent) is its own agent, local to one project — call set_agent_identity with a name
-and the projectId you're working; sub-agents pass parentAgentId to attribute their work.`;
+finished. Never work on a task you have not claimed.
+You do not register yourself — you already are somebody, and get_briefing tells you who.
+Its \`you.kind\` says which: a "copilot" is a human's session (registered when they
+authorized this connection, and parented to it automatically), and an "agent" was created
+by a runner for exactly one run, pinned to one project. Sub-agent attribution is automatic.`;
 
 function room(env: Env, projectId: string) {
   return env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName(projectId));
@@ -184,7 +186,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         // one project for life, and expected to stay reachable.
         you: { id: agent.id, name: agent.name, role: agent.role, kind: agent.kind },
         playbook: [
-          'Name this session for the project with set_agent_identity before your first claim. Work loop: my_updates → pick from claimable (or next_claimable) → claim_task (just the one you are about to start) → do the work → resolve any comments → release_task {toStatus:"review"|"done"}. Every tool call renews your claim, so no periodic pinging — heartbeat only if you will be idle longer than the claim TTL.',
+          'You already have an identity — `you` above is it, and `you.kind` says whether you are a human\'s copilot or a runner-spawned agent. Nothing to register. Work loop: my_updates → pick from claimable (or next_claimable) → claim_task (just the one you are about to start) → do the work → resolve any comments → release_task {toStatus:"review"|"done"}. Every tool call renews your claim, so no periodic pinging — heartbeat only if you will be idle longer than the claim TTL.',
           'Humans steer via comments on tasks (kind: question/instruction). Acknowledge fast, resolve with resolve_comment (addressed|wont_do) + a reply. Unresolved comments should block you from finishing.',
           'Anything bigger than one task: plan first. create_plan writes the plan as a document — goals/approach in the body, then ordered phases over tasks (phase order enforced via auto-dependencies); or decompose_task for a quick subtree. Workers drain the plan via next_claimable; keep it current with update_plan.',
           'Claims are exclusive. If claim_task fails, the task is taken or blocked — pick another.',
@@ -207,7 +209,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
   if (opts.oauthTokenId) {
     defineTool(
       'set_agent_identity',
-      'Name THIS session as a distinct agent, scoped to the project you are about to work. Each chat/sub-agent is its own agent (keyed by MCP session), so pick a short name that reads well in that project — names are unique per project. Pass projectId to localize it (recommended; otherwise it scopes on your first claim). Sub-agents: pass parentAgentId to attribute your work to the agent that spawned you.',
+      'RENAME the identity you already have — it does NOT create one, and you never need it to start working. You are registered already (a copilot when your human authorized this connection; an agent when a runner spawned you), your parent is set automatically, and get_briefing tells you who you are. Use this only to swap the auto-generated label for one that reads better in a project — names are unique per project. projectId localizes a copilot to a project (a runner-spawned agent is already pinned and should not move).',
       {
         name: z.string().min(2).max(40).regex(/^[a-z0-9][a-z0-9._-]*$/i, 'letters/digits/._-'),
         role: z.enum(['worker', 'orchestrator']).optional(),
@@ -243,11 +245,16 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
              parent_agent_id = COALESCE(?, parent_agent_id), status = 'active', last_seen_at = ?
            WHERE id = ?`,
         ).bind(name, newRole, projectId ?? null, parentAgentId ?? null, nowIso(), agent.id).run();
+        // Read the parent back rather than echoing the argument: it is COALESCEd above, and
+        // since PLNR-155 a copilot already HAS a parent (its connection). Echoing `?? null`
+        // would report an orphan for every rename that didn't happen to pass one.
+        const after = await env.DB.prepare('SELECT parent_agent_id AS parentAgentId, project_id AS projectId FROM agents WHERE id = ?')
+          .bind(agent.id).first<{ parentAgentId: string | null; projectId: string | null }>();
         return {
           actingAs: { id: agent.id, name, role: newRole },
-          project: projectId ?? null,
-          parentAgentId: parentAgentId ?? null,
-          note: 'this session now acts as this agent; subsequent calls are attributed to it',
+          project: after?.projectId ?? null,
+          parentAgentId: after?.parentAgentId ?? null,
+          note: 'renamed — this identity now reads as that label; you were already this agent',
         };
       }),
     );
