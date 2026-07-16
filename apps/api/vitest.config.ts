@@ -8,6 +8,10 @@ export default defineWorkersConfig(async () => {
     resolve: { alias: { tslib: 'tslib/tslib.es6.js' } },
     test: {
       setupFiles: ['./test/apply-migrations.ts'],
+      // The suite runs OAuth-flow mints through a single shared worker, so late tests
+      // pay for all accumulated state — on GitHub runners the heaviest cases blow
+      // through vitest's default 5s (PLNR-169). Only a real hang should time out.
+      testTimeout: 30_000,
       // CJS deps (ajv via MCP SDK; tslib + ASN.1 libs via @simplewebauthn) break
       // the pool's ESM shim; pre-bundle them.
       deps: {
