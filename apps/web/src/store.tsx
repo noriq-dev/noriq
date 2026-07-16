@@ -83,8 +83,6 @@ export function useAppStore() {
 
   const pidRef = useRef(currentPid);
   pidRef.current = currentPid;
-  const archivedRef = useRef(showArchived);
-  archivedRef.current = showArchived;
   const boardRef = useRef(boardId);
   boardRef.current = boardId;
   const selRef = useRef(selectedTaskId);
@@ -161,7 +159,7 @@ export function useAppStore() {
   }, []);
 
   const loadSnapshot = useCallback(async (pid: string) => {
-    const snap = await api.snapshot(pid, archivedRef.current);
+    const snap = await api.snapshot(pid);
     if (pidRef.current !== pid) return;
     setSnapshot(snap);
     lastSeq.current = Math.max(0, ...snap.events.map((e) => e.seq));
@@ -334,17 +332,26 @@ export function useAppStore() {
   }, [projects, snapshot, comments, currentPid, selectedTaskId, tick]);
 
   const helpers = useMemo(() => {
-    const tasksOf = (pid: string) => data.tasks[pid] ?? [];
+    // PLNR-150: two lists, deliberately. `allTasksOf` is the truth — every task in the
+    // project, archived or not — and anything that *counts* (milestone chips, plan phase
+    // progress) must use it, or completed-and-archived work vanishes from both sides of
+    // the ratio and a finished milestone reads 0/0. `tasksOf` is the display list the
+    // board renders, which hides archived tasks unless the archive switch is on.
+    const allTasksOf = (pid: string) => data.tasks[pid] ?? [];
+    const tasksOf = (pid: string) =>
+      showArchived ? allTasksOf(pid) : allTasksOf(pid).filter((t) => t.archivedAt === null);
     const agentById = (pid: string, id: string) => (data.agents[pid] ?? []).find((a) => a.id === id) ?? null;
+    // Resolve deps against the full list: a dependency satisfied by a task that has since
+    // been archived is still satisfied, not unresolvable.
     const isBlocked = (pid: string, t: TaskVM) =>
       t.deps.some((d) => {
-        const dt = tasksOf(pid).find((x) => x.id === d);
+        const dt = allTasksOf(pid).find((x) => x.id === d);
         return dt !== undefined && dt.status !== 'done' && dt.status !== 'cancelled';
       });
     const effStatus = (pid: string, t: TaskVM): TaskStatus =>
       t.status === 'todo' && isBlocked(pid, t) ? 'blocked' : t.status;
-    return { tasksOf, agentById, isBlocked, effStatus };
-  }, [data]);
+    return { tasksOf, allTasksOf, agentById, isBlocked, effStatus };
+  }, [data, showArchived]);
 
   const refresh = useCallback(() => {
     if (pidRef.current) void loadSnapshot(pidRef.current);
@@ -504,12 +511,10 @@ export function useAppStore() {
       await api.restoreTask(pidRef.current, taskId);
       refresh();
     },
+    // Pure client-side now — the snapshot already carries archived tasks, so the switch
+    // is instant and costs no round-trip (PLNR-150).
     toggleArchived() {
-      setShowArchived((v) => {
-        archivedRef.current = !v;
-        if (pidRef.current) void loadSnapshot(pidRef.current);
-        return !v;
-      });
+      setShowArchived((v) => !v);
     },
     async deleteMilestone(milestoneId: string) {
       if (!pidRef.current) return;

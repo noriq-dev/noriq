@@ -17,6 +17,9 @@ const TYPE_ICON: Record<string, string> = { bug: '✕', chore: '⟳', research: 
 export function Board({ store }: { store: AppStore }) {
   const { currentPid, helpers, actions, draggedId, snapshot, showArchived, boardId } = store;
   const tasks = helpers.tasksOf(currentPid);
+  // Milestone progress counts the *whole* milestone, archived work included — otherwise
+  // finishing a milestone makes it read 0/0 as its done tasks auto-archive (PLNR-150).
+  const allTasks = helpers.allTasksOf(currentPid);
   const milestones = snapshot?.milestones ?? [];
   const tags = snapshot?.tags ?? [];
   const boards = snapshot?.boards ?? [];
@@ -87,8 +90,8 @@ export function Board({ store }: { store: AppStore }) {
           + milestone
         </button>
         {milestones.map((m) => {
-          const total = tasks.filter((t) => t.milestoneId === m.id).length;
-          const done = tasks.filter((t) => t.milestoneId === m.id && t.status === 'done').length;
+          const total = allTasks.filter((t) => t.milestoneId === m.id).length;
+          const done = allTasks.filter((t) => t.milestoneId === m.id && t.status === 'done').length;
           // Completed milestones stay out of the way unless actively selected.
           if (total > 0 && done === total && msFilter !== m.id) return null;
           return (

@@ -358,15 +358,19 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
   if (!visible) return c.json({ error: 'not found' }, 404);
   // Auto-archive done tasks untouched for >24h whenever the project is viewed.
   await room(c.env, pid).sweepArchive(pid).catch(() => {});
-  const includeArchived = c.req.query('archived') === '1';
   const [project, tasks, deps, agents, events, milestones, boards, plans, phases, phaseTasks, tags, taskTags, signals] = await Promise.all([
     c.env.DB.prepare('SELECT id, key, name, description, claim_ttl_seconds AS claimTtlSeconds, repo_url AS repoUrl FROM projects WHERE id = ?')
       .bind(pid).first(),
+    // PLNR-150: archived tasks ship too, flagged by archivedAt. Archiving is a *board
+    // display* concern — filtering it out here silently drained every derived aggregate
+    // (milestone chips, plan phase rails) of the tasks it was counting, so a milestone
+    // whose work was all done+archived read 0/0 instead of complete. The client hides
+    // archived tasks at render; anything that counts uses the full list.
     c.env.DB.prepare(
       `SELECT id, key, title, body, status, type, priority, claimed_by AS claimedBy, claim_expires_at AS claimExpiresAt,
               parent_task_id AS parentTaskId, milestone_id AS milestoneId, board_id AS boardId, archived_at AS archivedAt,
               open_comments AS openComments, "order"
-       FROM tasks WHERE project_id = ? ${includeArchived ? '' : 'AND archived_at IS NULL'} ORDER BY "order"`,
+       FROM tasks WHERE project_id = ? ORDER BY "order"`,
     ).bind(pid).all(),
     c.env.DB.prepare(
       `SELECT d.task_id AS taskId, d.depends_on_task_id AS dependsOnTaskId

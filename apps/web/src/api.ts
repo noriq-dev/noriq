@@ -33,7 +33,9 @@ export const api = {
     req<{ user: import('./types').UserVM }>('POST', `/api/reset/${token}`, { password }),
 
   projects: (scope?: 'all') => req<{ projects: ApiProject[]; admin: boolean }>('GET', scope === 'all' ? '/api/projects?scope=all' : '/api/projects'),
-  snapshot: (pid: string, includeArchived = false) => req<ApiSnapshot>('GET', `/api/projects/${pid}/snapshot${includeArchived ? '?archived=1' : ''}`),
+  // The snapshot always includes archived tasks (flagged by archivedAt); the store
+  // filters them for display (PLNR-150).
+  snapshot: (pid: string) => req<ApiSnapshot>('GET', `/api/projects/${pid}/snapshot`),
   archiveTask: (pid: string, tid: string) => req('POST', `/api/projects/${pid}/tasks/${tid}/archive`),
   restoreTask: (pid: string, tid: string) => req('POST', `/api/projects/${pid}/tasks/${tid}/restore`),
   taskDetail: (tid: string) => req<ApiTaskDetail>('GET', `/api/tasks/${tid}`),

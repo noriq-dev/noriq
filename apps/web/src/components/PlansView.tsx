@@ -14,7 +14,11 @@ export function PlansView({ store }: { store: AppStore }) {
   const plans = snapshot?.plans ?? [];
   const phases = snapshot?.phases ?? [];
   const phaseTasks = snapshot?.phaseTasks ?? [];
-  const tasks = helpers.tasksOf(currentPid);
+  // Every task, archived included (PLNR-150). Phase membership comes from phase_tasks,
+  // which never dropped archived rows — so resolving through a filtered list counted an
+  // archived task in the denominator but never as done, decaying a finished plan toward
+  // 0/N and pinning "active" on phase 1 forever.
+  const tasks = helpers.allTasksOf(currentPid);
   const taskById = new Map(tasks.map((t) => [t.id, t]));
 
   if (!plans.length) {
@@ -200,10 +204,14 @@ export function PlansView({ store }: { store: AppStore }) {
                                     style={{
                                       display: 'flex', alignItems: 'center', gap: 7, padding: '7px 9px',
                                       borderRadius: 8, background: 'var(--card)', border: '1px solid var(--w-07)', cursor: 'pointer',
+                                      opacity: t.archivedAt ? 0.55 : 1,
                                     }}
                                   >
                                     <span style={{ width: 7, height: 7, borderRadius: '50%', background: m.dot, flex: 'none' }} />
                                     <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: m.color, flex: 'none' }}>{t.key}</span>
+                                    {t.archivedAt && (
+                                      <span title="archived" style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)', flex: 'none' }}>🗄</span>
+                                    )}
                                     <span style={{ fontSize: 11.5, color: 'var(--text-soft)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.title}</span>
                                     <div style={{ flex: 1 }} />
                                     {holder && <AvatarChip name={holder.name} color={holder.color} size={16} radius={4} fontSize={7.5} />}
