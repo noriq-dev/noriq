@@ -265,6 +265,44 @@ describe('plans & groups', () => {
     expect(unblocked.isError).toBe(false);
   });
 
+  // ---- PLNR-133: create_plan writes plan + fully-attributed tasks in one call --
+  it('newTasks carry tags/milestone/type/estimate, with plan-level taskDefaults', async () => {
+    const ms = await mcpCall(planner.apiKey, 'create_milestone', { projectId, title: 'M-133' });
+    const plan = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId, title: 'One-call plan',
+      taskDefaults: { milestoneId: ms.body.id, tags: ['planwide'], type: 'chore', priority: 3 },
+      phases: [
+        { title: 'Only', newTasks: [
+          { title: 'inherits everything' },
+          { title: 'overrides type+prio', type: 'bug', priority: 4, estimate: 2, tags: ['special'] },
+        ] },
+      ],
+    });
+    expect(plan.isError).toBe(false);
+    const [inherited, overridden] = plan.body.phases[0].taskIds as [string, string];
+
+    const a = await mcpCall(planner.apiKey, 'get_task', { taskId: inherited });
+    expect(a.body.task.milestone_id).toBe(ms.body.id);
+    expect(a.body.task.type).toBe('chore');
+    expect(a.body.task.priority).toBe(3);
+
+    const b = await mcpCall(planner.apiKey, 'get_task', { taskId: overridden });
+    expect(b.body.task.type).toBe('bug');
+    expect(b.body.task.priority).toBe(4);
+    expect(b.body.task.estimate).toBe(2);
+    expect(b.body.task.milestone_id).toBe(ms.body.id); // default still fills the gap
+
+    // Ad-hoc dependsOn by KEY, on top of the phase chain.
+    const dep = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId, title: 'dep plan',
+      phases: [{ title: 'P', newTasks: [{ title: 'extra-gated', dependsOn: [a.body.task.key] }] }],
+    });
+    const gatedId = dep.body.phases[0].taskIds[0];
+    const claim = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: gatedId });
+    expect(claim.isError).toBe(true);
+    expect(claim.text).toContain('blocked');
+  });
+
   // ---- PLNR-154: plan structure is editable, and the edges follow it ----------
   it('update_plan restructures phases; the enforced ordering follows the new shape', async () => {
     const plan = await mcpCall(planner.apiKey, 'create_plan', {

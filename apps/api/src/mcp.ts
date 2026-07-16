@@ -12,6 +12,7 @@ import {
   tokenProjectWhere,
   userCanAccessProject,
 } from './lib/visibility';
+import { taskSearchFilters } from './lib/search';
 
 const MAX_ATTACHMENT = 100 * 1024 * 1024;
 /** Stable resource URI for an attachment; agents read bytes back via resources/read. */
@@ -49,6 +50,19 @@ function room(env: Env, projectId: string) {
  * to its canonical id, so callers can accept whichever the agent passes. The ProjectRoom
  * is strictly id-keyed, so claim/release resolve here before crossing into it.
  */
+/** The group-filing rule (PLNR-134, mirroring PLNR-93's REST rule): a user may file a
+ *  project under a group only if they created the group or belong to it. No admin
+ *  escalation here — an agent is scoped to its user, never to admin. Throws on an
+ *  unknown group so "no such group" and "not yours" read differently. */
+async function canUseGroup(env: Env, userId: string, groupId: string): Promise<boolean> {
+  const g = await env.DB.prepare('SELECT created_by AS createdBy FROM groups WHERE id = ?')
+    .bind(groupId).first<{ createdBy: string | null }>();
+  if (!g) throw new Error(`group ${groupId} not found`);
+  if (g.createdBy === userId) return true;
+  return !!(await env.DB.prepare('SELECT 1 FROM user_groups WHERE user_id = ? AND group_id = ?')
+    .bind(userId, groupId).first());
+}
+
 async function resolveTaskId(env: Env, projectId: string, taskId: string): Promise<string> {
   const row = await env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
     .bind(taskId, taskId, projectId).first<{ id: string }>();
@@ -72,11 +86,12 @@ const WRITE: ToolHints = { readOnlyHint: false, destructiveHint: false, idempote
 const WRITE_IDEMPOTENT: ToolHints = { ...WRITE, idempotentHint: true };
 const TOOL_HINTS: Record<string, ToolHints> = {
   // reads
-  get_briefing: READ, my_updates: READ, list_projects: READ, get_project: READ,
-  get_task: READ, next_claimable: READ, read_open_comments: READ, get_plans: READ,
+  get_briefing: READ, my_updates: READ, list_projects: READ, get_project: READ, list_groups: READ, list_agents: READ,
+  get_task: READ, search_tasks: READ, next_claimable: READ, read_open_comments: READ, get_plans: READ,
   // writes that are safe to repeat with the same args (renew/replace-in-place/insert-or-ignore)
-  heartbeat: WRITE_IDEMPOTENT, set_agent_identity: WRITE_IDEMPOTENT, update_task: WRITE_IDEMPOTENT,
+  heartbeat: WRITE_IDEMPOTENT, set_agent_identity: WRITE_IDEMPOTENT, update_task: WRITE_IDEMPOTENT, update_tasks: WRITE_IDEMPOTENT,
   update_plan: WRITE_IDEMPOTENT, add_dependency: WRITE_IDEMPOTENT, remove_dependency: WRITE_IDEMPOTENT, attach_ref: WRITE_IDEMPOTENT,
+  set_project_group: WRITE_IDEMPOTENT,
   // everything else → WRITE (additive, non-idempotent, non-destructive, closed-world)
 };
 
@@ -281,18 +296,25 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'create_project',
-    'Create a project. key is the short task-key prefix (e.g. "PLN" → PLN-1, PLN-2…).',
+    'Create a project. key is the short task-key prefix (e.g. "PLN" → PLN-1, PLN-2…). Pass groupId (see list_groups) to file it under a group at birth — grouping SHARES the project with that group\'s members.',
     {
       key: z.string().min(1).max(8).regex(/^[A-Z][A-Z0-9]*$/, 'uppercase letters/digits'),
       name: z.string().min(1),
       description: z.string().optional(),
       repoUrl: z.string().url().optional(),
+      groupId: z.string().optional().describe('Group to file the project under — you must be its creator or a member'),
     },
     tool(async (args) => {
+      // Same rule as the dashboard's group move (PLNR-93), minus the admin escalation —
+      // an agent is scoped to its user, never to admin: you may file a project into a
+      // group only if you created that group or already belong to it.
+      if (args.groupId && !(await canUseGroup(env, agent.userId, args.groupId))) {
+        throw new Error('you must be a member or the creator of the target group');
+      }
       const id = `prj_${args.key.toLowerCase()}`;
       await env.DB.prepare(
-        `INSERT INTO projects (id, key, name, description, status, repo_url, claim_ttl_seconds, owner_user_id, created_at) VALUES (?, ?, ?, ?, 'active', ?, 1800, ?, ?)`,
-      ).bind(id, args.key, args.name, args.description ?? '', args.repoUrl ?? null, agent.userId, nowIso()).run();
+        `INSERT INTO projects (id, key, name, description, status, repo_url, claim_ttl_seconds, owner_user_id, group_id, created_at) VALUES (?, ?, ?, ?, 'active', ?, 1800, ?, ?, ?)`,
+      ).bind(id, args.key, args.name, args.description ?? '', args.repoUrl ?? null, agent.userId, args.groupId ?? null, nowIso()).run();
       await room(env, id).createMilestone(id, actor, 'Backlog');
       await room(env, id).createBoard(id, actor, 'Main');
       // A scoped token joins the project it just created to its own scope (RUN-38). Otherwise
@@ -316,6 +338,61 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
   );
 
   defineTool(
+    'list_agents',
+    'Who else is on this project: active agents with role/kind, parent attribution (sub-agents), liveness, and the tasks each one holds right now. Use it to coordinate — find the orchestrator, see who owns what, resolve a name to the agent id that send_message needs. `you` marks your own entry.',
+    { projectId: z.string(), includeRevoked: z.boolean().optional().describe('Also list revoked agents (default false)') },
+    tool(async ({ projectId, includeRevoked }) => {
+      const [{ results: agents }, { results: heldRows }] = await Promise.all([
+        env.DB.prepare(
+          `SELECT a.id, COALESCE(a.label, a.name) AS name, a.role, a.kind, a.status,
+                  a.parent_agent_id AS parentAgentId, a.last_seen_at AS lastSeenAt
+           FROM agents a WHERE a.project_id = ?${includeRevoked ? '' : " AND a.status != 'revoked'"}
+           ORDER BY a.created_at`,
+        ).bind(projectId).all<{ id: string; name: string; role: string; kind: string; status: string; parentAgentId: string | null; lastSeenAt: string | null }>(),
+        env.DB.prepare(
+          'SELECT t.claimed_by AS agentId, t.key, t.title, t.status FROM tasks t WHERE t.project_id = ? AND t.claimed_by IS NOT NULL',
+        ).bind(projectId).all<{ agentId: string; key: string; title: string; status: string }>(),
+      ]);
+      const held = new Map<string, Array<{ key: string; title: string; status: string }>>();
+      for (const h of heldRows) held.set(h.agentId, [...(held.get(h.agentId) ?? []), { key: h.key, title: h.title, status: h.status }]);
+      return {
+        agents: agents.map((a) => ({ ...a, you: a.id === agent.id, heldTasks: held.get(a.id) ?? [] })),
+      };
+    }),
+  );
+
+  defineTool(
+    'set_project_group',
+    'File a project under a group, or null to ungroup it. Grouping SHARES the project: every member of the group can then see and work it; ungrouping narrows it back to its owner. You must be the group\'s creator or a member (see list_groups).',
+    { projectId: z.string(), groupId: z.string().nullable().describe('Target group id, or null to ungroup') },
+    tool(async ({ projectId, groupId }) => {
+      if (!(await userCanAccessProject(env, agent.userId, projectId))) {
+        throw new Error(`project ${projectId} not found`);
+      }
+      if (groupId !== null && !(await canUseGroup(env, agent.userId, groupId))) {
+        throw new Error('you must be a member or the creator of the target group');
+      }
+      await env.DB.prepare('UPDATE projects SET group_id = ? WHERE id = ?').bind(groupId, projectId).run();
+      return { ok: true, projectId, groupId };
+    }),
+  );
+
+  defineTool(
+    'list_groups',
+    'Groups in this instance, with whether you can file projects under each (creator or member). Resolve a group name to the id create_project/set_project_group need.',
+    {},
+    tool(async () => {
+      const { results } = await env.DB.prepare(
+        `SELECT g.id, g.name,
+                (g.created_by = ?1) AS mine,
+                EXISTS (SELECT 1 FROM user_groups ug WHERE ug.group_id = g.id AND ug.user_id = ?1) AS member
+         FROM groups g ORDER BY g.name`,
+      ).bind(agent.userId).all<{ id: string; name: string; mine: number; member: number }>();
+      return { groups: results.map((g) => ({ id: g.id, name: g.name, usable: !!g.mine || !!g.member })) };
+    }),
+  );
+
+  defineTool(
     'get_project',
     'Project snapshot: tasks (with status/holder/deps/board/open-comment counts), milestones, boards, agents active here.',
     { projectId: z.string() },
@@ -328,7 +405,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
                   (SELECT GROUP_CONCAT(g.name) FROM task_tags tt JOIN tags g ON g.id = tt.tag_id WHERE tt.task_id = t.id) AS tags
            FROM tasks t WHERE t.project_id = ? ORDER BY t."order"`,
         ).bind(projectId).all(),
-        env.DB.prepare('SELECT id, title, due_at AS dueAt FROM milestones WHERE project_id = ? ORDER BY "order"').bind(projectId).all(),
+        env.DB.prepare('SELECT id, title, due_at AS dueAt, description FROM milestones WHERE project_id = ? ORDER BY "order"').bind(projectId).all(),
         env.DB.prepare('SELECT id, name FROM boards WHERE project_id = ? ORDER BY "order", created_at').bind(projectId).all(),
         env.DB.prepare('SELECT id, key, name, description, repo_url AS repoUrl, claim_ttl_seconds AS claimTtlSeconds FROM projects WHERE id = ?')
           .bind(projectId).first(),
@@ -358,6 +435,75 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       boardId: z.string().optional().describe('Board to place the task on (see get_project.boards); defaults to the project’s default board'),
     },
     tool(async ({ projectId, ...input }) => room(env, projectId).createTask(projectId, actor, input)),
+  );
+
+  defineTool(
+    'create_tasks',
+    'Create MANY tasks in one call — the batch form of create_task, for building a backlog or a plan\'s inventory without one call per task. `defaults` fills fields every item shares (per-item values win). Give items a `ref` (any string unique in the batch) and read ids back by ref instead of by position; later items may name an earlier item\'s ref in dependsOn/parentTaskId. Items are created in order and a failed item does NOT roll back earlier ones — check each result for `error`.',
+    {
+      projectId: z.string(),
+      defaults: z.object({
+        milestoneId: z.string().optional(),
+        boardId: z.string().optional(),
+        priority: z.number().int().min(0).max(4).optional(),
+        estimate: z.number().int().min(0).optional(),
+        type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
+        tags: z.array(z.string()).optional(),
+      }).optional().describe('Shared fields applied to every item unless the item sets its own'),
+      tasks: z.array(
+        z.object({
+          ref: z.string().optional().describe('Caller-chosen handle, echoed back and addressable from later items\' dependsOn/parentTaskId'),
+          title: z.string().min(1),
+          body: z.string().optional(),
+          priority: z.number().int().min(0).max(4).optional(),
+          estimate: z.number().int().min(0).optional(),
+          milestoneId: z.string().optional(),
+          boardId: z.string().optional(),
+          type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
+          tags: z.array(z.string()).optional(),
+          parentTaskId: z.string().optional().describe('Existing task id/key, or an earlier item\'s ref'),
+          dependsOn: z.array(z.string()).optional().describe('Existing task ids/keys, or earlier items\' refs'),
+        }),
+      ).min(1).max(100),
+    },
+    tool(async ({ projectId, defaults, tasks }) => {
+      const r = room(env, projectId);
+      const byRef = new Map<string, string>(); // ref → created task id
+      // Resolve a dependsOn/parent entry: batch ref first, then id-or-key in this project.
+      const resolve = async (entry: string): Promise<string> => {
+        const fromBatch = byRef.get(entry);
+        if (fromBatch) return fromBatch;
+        const t = await env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+          .bind(entry, entry, projectId).first<{ id: string }>();
+        if (!t) throw new Error(`"${entry}" is neither an earlier ref in this batch nor a task in this project`);
+        return t.id;
+      };
+      const created: Array<{ ref?: string; title: string; id?: string; key?: string; error?: string }> = [];
+      for (const item of tasks) {
+        try {
+          const dependsOn = await Promise.all((item.dependsOn ?? []).map(resolve));
+          const parentTaskId = item.parentTaskId ? await resolve(item.parentTaskId) : undefined;
+          const res = await r.createTask(projectId, actor, {
+            title: item.title,
+            body: item.body,
+            priority: item.priority ?? defaults?.priority,
+            estimate: item.estimate ?? defaults?.estimate,
+            milestoneId: item.milestoneId ?? defaults?.milestoneId,
+            boardId: item.boardId ?? defaults?.boardId,
+            type: item.type ?? defaults?.type,
+            tags: item.tags ?? defaults?.tags,
+            parentTaskId,
+            dependsOn,
+          });
+          if (item.ref) byRef.set(item.ref, res.id);
+          created.push({ ref: item.ref, title: item.title, id: res.id, key: res.key });
+        } catch (e) {
+          created.push({ ref: item.ref, title: item.title, error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+      const failed = created.filter((c) => c.error).length;
+      return { created, count: created.length - failed, failed };
+    }),
   );
 
   defineTool(
@@ -402,12 +548,52 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       priority: z.number().int().min(0).max(4).optional(),
       estimate: z.number().int().min(0).nullable().optional().describe('Effort estimate in points; null clears it'),
       milestoneId: z.string().optional(),
-      tags: z.array(z.string()).optional().describe('REPLACES the tag set (auto-created; [] clears)'),
+      tags: z.array(z.string()).optional().describe('REPLACES the tag set (auto-created; [] clears) — prefer addTags/removeTags for edits'),
+      addTags: z.array(z.string()).optional().describe('Add these tags, keeping existing ones (auto-created if new)'),
+      removeTags: z.array(z.string()).optional().describe('Remove these tags, keeping the rest (unknown names ignored)'),
       type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
       boardId: z.string().optional().describe('Move the task to another board (see get_project.boards)'),
       parentTaskId: z.string().nullable().optional().describe('Re-parent under another task (id or key); null detaches it to a root. Lets you build the tree after creating tasks in key order.'),
     },
-    tool(async ({ projectId, taskId, ...patch }) => room(env, projectId).updateTask(projectId, actor, taskId, patch)),
+    tool(async ({ projectId, taskId, ...patch }) =>
+      room(env, projectId).updateTask(projectId, actor, await resolveTaskId(env, projectId, taskId), patch)),
+  );
+
+  defineTool(
+    'update_tasks',
+    'Apply ONE change to MANY tasks — bulk re-tag, re-prioritize, move to a milestone/board, or supervisor-style bulk status. `set` is applied to every task in taskIds (ids or keys); results are per-task, and one failure does not stop the rest. For tags, addTags/removeTags edit without clobbering; `tags` replaces outright.',
+    {
+      projectId: z.string(),
+      taskIds: z.array(z.string()).min(1).max(100).describe('Task ids or display keys'),
+      set: z.object({
+        status: z.enum(['todo', 'in_progress', 'blocked', 'review', 'done', 'cancelled']).optional(),
+        priority: z.number().int().min(0).max(4).optional(),
+        estimate: z.number().int().min(0).nullable().optional(),
+        milestoneId: z.string().nullable().optional(),
+        boardId: z.string().optional(),
+        type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
+        tags: z.array(z.string()).optional(),
+        addTags: z.array(z.string()).optional(),
+        removeTags: z.array(z.string()).optional(),
+        parentTaskId: z.string().nullable().optional(),
+      }).describe('The change applied to every task'),
+    },
+    tool(async ({ projectId, taskIds, set }) => {
+      if (!Object.keys(set).length) throw new Error('set is empty — nothing to apply');
+      const r = room(env, projectId);
+      const results: Array<{ taskId: string; key?: string; ok: boolean; error?: string }> = [];
+      for (const tid of taskIds) {
+        try {
+          // Spread per task: updateTask mutates its patch object (deletes tag fields).
+          const res = await r.updateTask(projectId, actor, await resolveTaskId(env, projectId, tid), { ...set });
+          results.push({ taskId: tid, key: res.key, ok: true });
+        } catch (e) {
+          results.push({ taskId: tid, ok: false, error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+      const failed = results.filter((x) => !x.ok).length;
+      return { results, count: results.length - failed, failed };
+    }),
   );
 
   defineTool(
@@ -447,6 +633,79 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       const withUris = attachments.results.map((a) => ({ ...a, resource: attachmentUri(String(a.id)) }));
       const sigs = signals.results.map((s) => ({ ...s, options: s.options ? JSON.parse(String(s.options)) : null }));
       return { task, dependencies: deps.results, comments: comments.results, refs: refs.results, attachments: withUris, signals: sigs };
+    }),
+  );
+
+  defineTool(
+    'handoff_task',
+    'Hand a task to a NAMED agent instead of releasing it into the pool — the directed form of delegation. Works on a task you hold (transfer) or an unclaimed claimable one (pre-assign); never steals another agent\'s claim. The target becomes the real holder with a fresh TTL (so a no-show just requeues normally) and is told via notices, with your `note` as the handoff briefing. Resolve names to ids with list_agents.',
+    {
+      projectId: z.string(),
+      taskId: z.string().describe('Task id or display key'),
+      toAgentId: z.string(),
+      note: z.string().optional().describe('Briefing for the receiving agent — context, what is done, what remains'),
+    },
+    tool(async ({ projectId, taskId, toAgentId, note }) =>
+      room(env, projectId).handoffTask(projectId, actor, await resolveTaskId(env, projectId, taskId), toAgentId, note)),
+  );
+
+  defineTool(
+    'move_task',
+    'Re-home a task into another project — same task row, new key, so comments/attachments/refs/history ride along. The move severs what cannot cross a project boundary: dependency edges (count reported back), plan phase membership, milestone, parent; the board becomes the target\'s default; tag NAMES carry over and re-resolve there. Refused while the task is claimed or has subtasks. Makes the "which project should this live in" decision reversible instead of delete-and-retype.',
+    { projectId: z.string(), taskId: z.string().describe('Task id or display key'), toProjectId: z.string() },
+    tool(async ({ projectId, taskId, toProjectId }) => {
+      // The per-call guard covers projectId; the TARGET needs the same two checks or a
+      // narrow token could exfiltrate a task into (or plant one in) a project it can't reach.
+      if (!(await userCanAccessProject(env, agent.userId, toProjectId))) {
+        throw new Error(`project ${toProjectId} not found`);
+      }
+      if (opts.oauthTokenId && !(await tokenCanReachProject(env, opts.oauthTokenId, toProjectId))) {
+        throw new Error(`project ${toProjectId} is outside this connection's authorized projects`);
+      }
+      const id = await resolveTaskId(env, projectId, taskId);
+      const res = await room(env, projectId).moveTask(projectId, actor, id, toProjectId);
+      // Arrival event through the TARGET room so its event seq stays DO-serialized;
+      // advisory — the move is already durable either way.
+      await room(env, toProjectId).noteTaskArrival(toProjectId, actor, id).catch(() => {});
+      return res;
+    }),
+  );
+
+  defineTool(
+    'search_tasks',
+    'Query tasks with filters instead of dumping the whole project — "review tasks tagged auth", "my in-progress work", "anything mentioning webhooks". Omit projectId to search every project you can reach. All filters AND together; `text` is a substring match over title/body/key. Returns up to `limit` matches ordered urgent-first, plus `matched` (the true total) so a truncated result is visible.',
+    {
+      projectId: z.string().optional().describe('Restrict to one project; omit for everything your credential reaches'),
+      status: z.enum(['todo', 'in_progress', 'blocked', 'review', 'done', 'cancelled']).optional(),
+      type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
+      tag: z.string().optional().describe('Tag name (exact, case-insensitive)'),
+      milestoneId: z.string().optional(),
+      holder: z.string().optional().describe("'me' (your claims), 'none' (unclaimed), or an agent id"),
+      text: z.string().optional().describe('Substring over title/body/key'),
+      includeArchived: z.boolean().optional(),
+      limit: z.number().int().min(1).max(200).optional().describe('Default 50'),
+    },
+    tool(async ({ projectId, status, type, tag, milestoneId, holder, text, includeArchived, limit }) => {
+      const { sql, binds } = taskSearchFilters({
+        status, type, tag, milestoneId, text, includeArchived,
+        holder: holder === 'me' ? agent.id : holder,
+      });
+      // Numbered params first (?1 user, ?2 project-or-null, ?3 token), THEN the filter
+      // fragment's bare `?`s — SQLite continues the positional counter from 3.
+      const base = `FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
+        WHERE ${USER_PROJECT_WHERE} AND ${tokenProjectWhere('?3')} AND (?2 IS NULL OR t.project_id = ?2)${sql}`;
+      const allBinds = [agent.userId, projectId ?? null, opts.oauthTokenId ?? null, ...binds];
+      const max = limit ?? 50;
+      const [rows, total] = await Promise.all([
+        env.DB.prepare(
+          `SELECT t.id, t.key, t.title, t.status, t.priority, t.estimate, t.type,
+                  t.project_id AS projectId, p.key AS projectKey, t.claimed_by AS claimedBy,
+                  t.milestone_id AS milestoneId, t.open_comments AS openComments, t.updated_at AS updatedAt
+           ${base} ORDER BY t.priority DESC, t.updated_at DESC LIMIT ${max}`,
+        ).bind(...allBinds).all(),
+        env.DB.prepare(`SELECT COUNT(*) AS n ${base}`).bind(...allBinds).first<{ n: number }>(),
+      ]);
+      return { tasks: rows.results, matched: total?.n ?? rows.results.length, returned: rows.results.length };
     }),
   );
 
@@ -695,17 +954,35 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       description: z.string().optional().describe('One-line summary shown on the plan card'),
       body: z.string().optional().describe('The full plan document (markdown): goals, approach, constraints, exit gate'),
       proposed: z.boolean().optional().describe('Emit as a PROPOSED plan awaiting human approval — its tasks are NOT claimable/dispatchable until someone approves it in the dashboard. Scope-mode Runner agents set this; a normal plan you intend to drain yourself does not.'),
+      taskDefaults: z.object({
+        milestoneId: z.string().optional(),
+        boardId: z.string().optional(),
+        priority: z.number().int().min(0).max(4).optional(),
+        estimate: z.number().int().min(0).optional(),
+        type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
+        tags: z.array(z.string()).optional(),
+      }).optional().describe('Shared fields applied to every newTask in every phase (a task\'s own value wins) — write plan + fully-attributed tasks in ONE call'),
       phases: z.array(
         z.object({
           title: z.string().min(1),
           body: z.string().optional().describe('Explicit details for this phase (markdown): what, how, done-when'),
           taskIds: z.array(z.string()).optional(),
-          newTasks: z.array(z.object({ title: z.string().min(1), body: z.string().optional(), priority: z.number().int().min(0).max(4).optional() })).optional(),
+          newTasks: z.array(z.object({
+            title: z.string().min(1),
+            body: z.string().optional(),
+            priority: z.number().int().min(0).max(4).optional(),
+            estimate: z.number().int().min(0).optional(),
+            milestoneId: z.string().optional(),
+            boardId: z.string().optional(),
+            type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
+            tags: z.array(z.string()).optional(),
+            dependsOn: z.array(z.string()).optional().describe('Ad-hoc extra edges beyond the enforced phase chain — existing task ids or keys'),
+          })).optional(),
         }),
       ).min(1).max(12),
     },
-    tool(async ({ projectId, title, description, body, proposed, phases }) =>
-      room(env, projectId).createPlan(projectId, actor, { title, description, body, proposed, agentId: agent.id, phases }),
+    tool(async ({ projectId, title, description, body, proposed, taskDefaults, phases }) =>
+      room(env, projectId).createPlan(projectId, actor, { title, description, body, proposed, agentId: agent.id, taskDefaults, phases }),
     ),
   );
 
@@ -772,9 +1049,14 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'create_milestone',
-    'Create a milestone in a project (assign tasks to it via update_task.milestoneId).',
-    { projectId: z.string(), title: z.string().min(1), dueAt: z.string().datetime().optional() },
-    tool(async ({ projectId, title, dueAt }) => room(env, projectId).createMilestone(projectId, actor, title, dueAt)),
+    'Create a milestone in a project. `description` is the goal — what "done" means. Assign tasks to it via update_task.milestoneId, or in bulk via create_tasks/create_plan taskDefaults.',
+    {
+      projectId: z.string(),
+      title: z.string().min(1),
+      dueAt: z.string().datetime().optional(),
+      description: z.string().optional().describe('The goal / exit criteria for this milestone'),
+    },
+    tool(async ({ projectId, title, dueAt, description }) => room(env, projectId).createMilestone(projectId, actor, title, dueAt, description)),
   );
 
   // ---- git awareness (Phase 4) --------------------------------------------

@@ -38,6 +38,8 @@ need it to start working, and it never creates anybody.)
 
 1. \`get_briefing\` — orient yourself.
 2. Pick work: use the \`claimable\` list, or \`next_claimable\` for the single best pick.
+   For anything more specific — "review tasks tagged auth", "my in-progress work" —
+   \`search_tasks\` filters instead of dumping the whole project.
 3. \`claim_task\` — you MUST claim before working, and claim only the **one** task you're
    about to start (don't batch-claim a list — an already-\`in_progress\` task is held, so
    re-claiming just errors). Claims are exclusive; a failed claim means pick something else.
@@ -91,7 +93,10 @@ and the dependency graph agree.
 
 For a quick subtree without the ceremony, \`decompose_task\`; for ad-hoc ordering,
 \`add_dependency\` (undo a wrong edge with \`remove_dependency\`); to coordinate
-mid-flight, \`send_message\`. Check progress with \`get_plans\`.
+mid-flight, \`send_message\`. See who else is on the project (and what they hold)
+with \`list_agents\`, and hand a task to a specific agent with \`handoff_task\` —
+directed delegation instead of releasing into the pool. Check progress with
+\`get_plans\`.
 
 ## Git
 

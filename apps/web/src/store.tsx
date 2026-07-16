@@ -42,6 +42,9 @@ function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
     case 'board.deleted': verb = 'board'; subject = 'deleted'; break;
     case 'dependency.added': verb = 'dep'; subject = `${p.key} depends on ${p.dependsOn}`; taskId = e.subjectId; break;
     case 'dependency.removed': verb = 'dep'; subject = `${p.key} no longer depends on ${p.dependsOn}`; taskId = e.subjectId; break;
+    case 'task.moved': verb = 'moved'; subject = `${p.key} → ${p.toKey} (another project)`; break;
+    case 'task.handed_off': verb = 'handoff'; subject = `${p.key} → ${p.toName ?? p.toAgentId}`; taskId = e.subjectId; break;
+    case 'task.moved_in': verb = 'moved in'; subject = `${p.key} · ${p.title ?? ''}`; taskId = e.subjectId; break;
     // The payload has carried name+color all along — the feed just fell through to the
     // raw-id default (PLNR-130).
     case 'tag.created': verb = 'tag'; subject = `created ${p.name ?? ''}`; dot = typeof p.color === 'string' ? p.color : undefined; break;

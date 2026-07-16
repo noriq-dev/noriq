@@ -133,6 +133,10 @@ export async function computeUpdates(
       notices.push(`New ${p.kind} on ${p.taskKey} (your task): "${p.body}"`);
     } else if (e.verb === 'message.sent' && !runtimeDelivered.has(e.subjectId) && (p.to === agent.id || (p.to === 'broadcast' && accessibleProjectIds.has(e.projectId)))) {
       notices.push(`Message from ${p.actorName ?? e.actorId}${p.refTaskId ? ` re ${p.refTaskId}` : ''}: "${p.body}"`);
+    } else if (e.verb === 'task.handed_off' && p.toAgentId === agent.id) {
+      // PLNR-122: directed handoff — the target must hear even mid-work, so this rides
+      // the notices channel like a comment does (not the idle-only nudge path).
+      notices.push(`${p.actorName ?? 'An agent'} handed you ${p.key}: "${p.title}"${p.note ? ` — ${p.note}` : ''}. It is claimed under your name — work it, or release it if you can't.`);
     } else if (e.verb === 'task.requeued' && p.previousHolder === agent.id) {
       notices.push(`Your claim on ${p.key} expired — the task was requeued (${p.reason}).`);
     } else if (e.verb === 'task.released' && p.previousHolder === agent.id) {

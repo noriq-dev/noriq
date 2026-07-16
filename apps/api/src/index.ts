@@ -8,6 +8,7 @@ import { buildMcpServer } from './mcp';
 import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot } from './backup';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, verifyPassword } from './lib/util';
+import { taskSearchFilters } from './lib/search';
 import { USER_PROJECT_WHERE, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
 import type { Actor } from './do/ProjectRoom';
 import { SKILL_MD } from './skill';
@@ -390,7 +391,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
               subject_id AS subjectId, payload, created_at AS createdAt
        FROM events WHERE project_id = ? ORDER BY seq DESC LIMIT 60`,
     ).bind(pid).all(),
-    c.env.DB.prepare('SELECT id, title, due_at AS dueAt, "order" FROM milestones WHERE project_id = ? ORDER BY "order"').bind(pid).all(),
+    c.env.DB.prepare('SELECT id, title, due_at AS dueAt, description, "order" FROM milestones WHERE project_id = ? ORDER BY "order"').bind(pid).all(),
     c.env.DB.prepare('SELECT id, name, "order" FROM boards WHERE project_id = ? ORDER BY "order", created_at').bind(pid).all(),
     c.env.DB.prepare('SELECT id, agent_id AS agentId, title, description, body, status, created_at AS createdAt FROM plans WHERE project_id = ? ORDER BY created_at DESC').bind(pid).all(),
     c.env.DB.prepare('SELECT ph.id, ph.plan_id AS planId, ph.title, ph.body, ph."order" FROM phases ph JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ? ORDER BY ph."order"').bind(pid).all(),
@@ -422,6 +423,33 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     signals: signals.results.map((s) => ({ ...s, options: s.options ? JSON.parse(String(s.options)) : null })),
     events: events.results.map((e) => ({ ...e, payload: JSON.parse(String(e.payload)) })),
   });
+});
+
+// Task search (PLNR-117) — the same filters the MCP search_tasks tool offers, for the
+// UI/scripts. Registered before /api/tasks/:tid so "search" isn't eaten as a task id.
+app.get('/api/tasks/search', userAuth, async (c) => {
+  const u = c.var.user!;
+  const q = c.req.query();
+  const { sql, binds } = taskSearchFilters({
+    status: q.status, type: q.type, tag: q.tag, milestoneId: q.milestoneId,
+    holder: q.holder, text: q.text, includeArchived: q.includeArchived === '1',
+  });
+  const limit = Math.min(Math.max(parseInt(q.limit ?? '50', 10) || 50, 1), 200);
+  const pid = q.projectId ?? null;
+  // VISIBILITY_WHERE and the filter fragment both use bare `?` — bind in textual order.
+  const base = `FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
+    WHERE ${VISIBILITY_WHERE} AND (? IS NULL OR t.project_id = ?)${sql}`;
+  const allBinds = [u.role, u.id, u.id, pid, pid, ...binds];
+  const [rows, total] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT t.id, t.key, t.title, t.status, t.priority, t.estimate, t.type,
+              t.project_id AS projectId, p.key AS projectKey, t.claimed_by AS claimedBy,
+              t.milestone_id AS milestoneId, t.open_comments AS openComments, t.updated_at AS updatedAt
+       ${base} ORDER BY t.priority DESC, t.updated_at DESC LIMIT ${limit}`,
+    ).bind(...allBinds).all(),
+    c.env.DB.prepare(`SELECT COUNT(*) AS n ${base}`).bind(...allBinds).first<{ n: number }>(),
+  ]);
+  return c.json({ tasks: rows.results, matched: total?.n ?? rows.results.length, returned: rows.results.length });
 });
 
 app.get('/api/tasks/:tid', userAuth, async (c) => {

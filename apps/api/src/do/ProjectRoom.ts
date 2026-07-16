@@ -52,6 +52,10 @@ export interface TaskPatch {
   parentTaskId?: string | null;
   /** Replace the task's tag set (names; auto-created). */
   tags?: string[];
+  /** Non-destructive tag edits (PLNR-135): add/remove by name without clobbering the rest.
+   *  addTags auto-creates; removeTags skips names the project doesn't have. */
+  addTags?: string[];
+  removeTags?: string[];
   /** Legacy single-tag alias. */
   category?: string | null;
   type?: string;
@@ -390,6 +394,30 @@ export class ProjectRoom extends DurableObject<Env> {
         delete patch.tags;
         // Tag-only updates still emit below via the fields list; ensure at least one emit.
         if (Object.keys(patch).filter((k) => k !== 'tags').length === 0) {
+          await this.emit(actor, 'task.updated', 'task', taskId, { key: task.key, fields: ['tags'] });
+          return { ok: true, key: task.key };
+        }
+      }
+      // Non-destructive tag edits (PLNR-135) — the whole point vs `tags` is NOT clobbering
+      // what's already there, so bulk "add one label" can't eat hand-applied tags.
+      if (patch.addTags !== undefined || patch.removeTags !== undefined) {
+        const stmts = [];
+        for (const n of patch.addTags ?? []) {
+          if (!n.trim()) continue;
+          const tid = await this.resolveTag(projectId, actor, n);
+          stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO task_tags (task_id, tag_id) VALUES (?, ?)').bind(taskId, tid));
+        }
+        for (const n of patch.removeTags ?? []) {
+          const trimmed = n.trim().toLowerCase();
+          if (!trimmed) continue;
+          stmts.push(this.env.DB.prepare(
+            'DELETE FROM task_tags WHERE task_id = ? AND tag_id IN (SELECT id FROM tags WHERE project_id = ? AND name = ?)',
+          ).bind(taskId, this.projectId, trimmed));
+        }
+        if (stmts.length) await this.env.DB.batch(stmts);
+        delete patch.addTags;
+        delete patch.removeTags;
+        if (Object.keys(patch).length === 0) {
           await this.emit(actor, 'task.updated', 'task', taskId, { key: task.key, fields: ['tags'] });
           return { ok: true, key: task.key };
         }
@@ -904,17 +932,17 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
-  async createMilestone(projectId: string, actor: Actor, title: string, dueAt?: string | null)  {
+  async createMilestone(projectId: string, actor: Actor, title: string, dueAt?: string | null, description?: string)  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const id = newId('ms');
       const row = await this.env.DB.prepare('SELECT COUNT(*) AS n FROM milestones WHERE project_id = ?')
         .bind(this.projectId).first<{ n: number }>();
-      await this.env.DB.prepare('INSERT INTO milestones (id, project_id, title, due_at, "order") VALUES (?, ?, ?, ?, ?)')
-        .bind(id, this.projectId, title, dueAt ?? null, row?.n ?? 0).run();
+      await this.env.DB.prepare('INSERT INTO milestones (id, project_id, title, due_at, description, "order") VALUES (?, ?, ?, ?, ?, ?)')
+        .bind(id, this.projectId, title, dueAt ?? null, description ?? '', row?.n ?? 0).run();
       await this.emit(actor, 'milestone.created', 'milestone', id, { title });
-      return { id };
-
+      // Echo enough back that the caller can confirm what it made without a re-read (PLNR-137).
+      return { id, title, dueAt: dueAt ?? null, description: description ?? '' };
     });
   }
 
@@ -1033,6 +1061,149 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM tags WHERE id = ?').bind(tagId),
       ]);
       await this.emit(actor, 'tag.deleted', 'tag', tagId, { name: tag.name });
+      return { ok: true };
+    });
+  }
+
+  /** Directed reassignment (PLNR-122): hand a task to a NAMED agent instead of releasing
+   *  it into the pool for whoever grabs first — the transfer orchestrator→worker was
+   *  otherwise a race. Rides the existing claim machinery: the target becomes the real
+   *  holder with a fresh TTL, so if they never show, the normal expiry requeue reclaims
+   *  it — a handoff can strand nothing. Allowed for the CURRENT HOLDER (transfer my work)
+   *  or on an unclaimed, claimable task (pre-assign); never a steal. The target hears
+   *  via the notices channel (sync.ts reads task.handed_off). */
+  async handoffTask(projectId: string, actor: Actor, taskId: string, toAgentId: string, note?: string) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const task = await this.getTask(taskId);
+      const target = await this.env.DB.prepare(
+        'SELECT id, COALESCE(label, name) AS name, status, project_id AS pid FROM agents WHERE id = ?',
+      ).bind(toAgentId).first<{ id: string; name: string; status: string; pid: string | null }>();
+      if (!target) throw new Error(`agent ${toAgentId} not found`);
+      if (target.status === 'revoked') throw new Error(`${target.name} is revoked — pick a live agent (list_agents)`);
+      if (target.pid !== projectId) throw new Error(`${target.name} is not on this project — a handoff cannot cross projects`);
+
+      // Holder-ship BEFORE the self check: a non-holder handing a task "to themselves"
+      // is a steal, and the refusal should say so — not quibble about the target.
+      const live = !!(task.claimed_by && task.claim_expires_at && task.claim_expires_at > nowIso());
+      if (live && task.claimed_by !== actor.id) {
+        throw new Error(`${task.key} is claimed by another agent — only the holder may hand it off`);
+      }
+      if (target.id === actor.id) throw new Error('cannot hand a task to yourself');
+      if (!live && !CLAIMABLE_STATUSES.includes(task.status)) {
+        throw new Error(`${task.key} is not claimable (status: ${task.status})`);
+      }
+      const blockers = await this.unfinishedDeps(task.id);
+      if (blockers.length) {
+        throw new Error(`${task.key} is blocked by unfinished dependencies: ${blockers.join(', ')} — the target could not work it`);
+      }
+      const gated = await this.env.DB.prepare(
+        `SELECT 1 FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id JOIN plans pl ON pl.id = ph.plan_id
+         WHERE pt.task_id = ? AND pl.status = 'proposed'`,
+      ).bind(task.id).first();
+      if (gated) throw new Error(`${task.key} belongs to a proposed plan awaiting human approval`);
+
+      const ttl = await this.claimTtlSeconds();
+      const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
+      await this.env.DB.batch([
+        this.env.DB.prepare('UPDATE claims SET released_at = ? WHERE task_id = ? AND released_at IS NULL').bind(nowIso(), task.id),
+        this.env.DB.prepare('INSERT INTO claims (id, task_id, agent_id, acquired_at, expires_at) VALUES (?, ?, ?, ?, ?)')
+          .bind(newId('clm'), task.id, target.id, nowIso(), expiresAt),
+        this.env.DB.prepare("UPDATE tasks SET status = 'in_progress', claimed_by = ?, claim_expires_at = ?, updated_at = ? WHERE id = ?")
+          .bind(target.id, expiresAt, nowIso(), task.id),
+      ]);
+      await this.emit(actor, 'task.handed_off', 'task', task.id, {
+        key: task.key, title: task.title, toAgentId: target.id, toName: target.name,
+        previousHolder: task.claimed_by ?? null, note: note ?? null, expiresAt,
+      });
+      await this.scheduleExpiryAlarm();
+      return { ok: true, key: task.key, to: { id: target.id, name: target.name }, expiresAt, ttlSeconds: ttl };
+    });
+  }
+
+  /** Re-home a task into another project (PLNR-136) — same row, new key, so comments,
+   *  attachments, refs and history all ride along (they hang off the task id).
+   *
+   *  Runs in the SOURCE room: the contended object is the task and its claims, and both
+   *  live here. The only target-side writes are the key allocation — a single
+   *  UPDATE…RETURNING, atomic against the target room's own createTask — and tag rows
+   *  (created silently: their tag.created event belongs to the target's seq, which only
+   *  the target DO may write; the arrival event goes through noteTaskArrival instead).
+   *
+   *  What the move severs, by design: dependency edges (both directions — cross-project
+   *  edges are not a thing), plan phase membership, milestone, board (target default),
+   *  parent. Tag NAMES carry over and re-resolve in the target. Refused while claimed
+   *  or with children — release/detach first, so nothing moves under a working agent. */
+  async moveTask(projectId: string, actor: Actor, taskId: string, toProjectId: string) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const task = await this.getTask(taskId);
+      if (toProjectId === projectId) throw new Error(`${task.key} is already in that project`);
+      if (task.claimed_by) throw new Error(`${task.key} is held by an agent — release it before moving`);
+      const kids = await this.env.DB.prepare('SELECT COUNT(*) AS n FROM tasks WHERE parent_task_id = ?')
+        .bind(task.id).first<{ n: number }>();
+      if (kids!.n > 0) throw new Error(`${task.key} has ${kids!.n} subtask(s) — move or detach them first`);
+      const target = await this.env.DB.prepare('SELECT key, status FROM projects WHERE id = ?')
+        .bind(toProjectId).first<{ key: string; status: string }>();
+      if (!target || target.status !== 'active') throw new Error('target project not found or not active');
+
+      const { results: tagRows } = await this.env.DB.prepare(
+        'SELECT g.name FROM task_tags tt JOIN tags g ON g.id = tt.tag_id WHERE tt.task_id = ?',
+      ).bind(task.id).all<{ name: string }>();
+      const { n: depCount } = (await this.env.DB.prepare(
+        'SELECT COUNT(*) AS n FROM dependencies WHERE task_id = ? OR depends_on_task_id = ?',
+      ).bind(task.id, task.id).first<{ n: number }>())!;
+
+      const alloc = await this.env.DB.prepare(
+        'UPDATE projects SET next_task_number = next_task_number + 1 WHERE id = ? RETURNING next_task_number AS next',
+      ).bind(toProjectId).first<{ next: number }>();
+      const num = alloc!.next - 1;
+      const newKey = `${target.key}-${num}`;
+      const boardId = await this.defaultBoardId(toProjectId);
+
+      await this.env.DB.batch([
+        this.env.DB.prepare('DELETE FROM dependencies WHERE task_id = ? OR depends_on_task_id = ?').bind(task.id, task.id),
+        this.env.DB.prepare('DELETE FROM phase_tasks WHERE task_id = ?').bind(task.id),
+        this.env.DB.prepare('DELETE FROM task_tags WHERE task_id = ?').bind(task.id),
+        this.env.DB.prepare(
+          'UPDATE tasks SET project_id = ?, key = ?, milestone_id = NULL, board_id = ?, parent_task_id = NULL, "order" = ?, updated_at = ? WHERE id = ?',
+        ).bind(toProjectId, newKey, boardId, num, nowIso(), task.id),
+      ]);
+
+      // Re-tag by name in the target. Tag creation is deliberately event-silent here (see doc).
+      const retagged: string[] = [];
+      for (const { name } of tagRows) {
+        const trimmed = name.trim().toLowerCase();
+        if (!trimmed) continue;
+        let tag = await this.env.DB.prepare('SELECT id FROM tags WHERE project_id = ? AND name = ?')
+          .bind(toProjectId, trimmed).first<{ id: string }>();
+        if (!tag) {
+          const tid = newId('tag');
+          const count = await this.env.DB.prepare('SELECT COUNT(*) AS n FROM tags WHERE project_id = ?')
+            .bind(toProjectId).first<{ n: number }>();
+          const palette = ['#4c9dff', '#b57bff', '#3fd98b', '#f5a623', '#ff8a8a', '#c6f24e', '#8a95a3'];
+          await this.env.DB.prepare('INSERT INTO tags (id, project_id, name, color, "order", created_at) VALUES (?, ?, ?, ?, ?, ?)')
+            .bind(tid, toProjectId, trimmed, palette[(count?.n ?? 0) % palette.length]!, count?.n ?? 0, nowIso()).run();
+          tag = { id: tid };
+        }
+        await this.env.DB.prepare('INSERT OR IGNORE INTO task_tags (task_id, tag_id) VALUES (?, ?)').bind(task.id, tag.id).run();
+        retagged.push(trimmed);
+      }
+
+      await this.emit(actor, 'task.moved', 'task', task.id, {
+        key: task.key, toKey: newKey, toProjectId, title: task.title, droppedDependencies: depCount,
+      });
+      return { ok: true, fromKey: task.key, key: newKey, projectId: toProjectId, droppedDependencies: depCount, tags: retagged };
+    });
+  }
+
+  /** The arrival half of moveTask's event story — called on the TARGET room so the
+   *  event takes the target's own serialized seq. Advisory: the move already happened. */
+  async noteTaskArrival(projectId: string, actor: Actor, taskId: string) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const task = await this.getTask(taskId);
+      await this.emit(actor, 'task.moved_in', 'task', task.id, { key: task.key, title: task.title });
       return { ok: true };
     });
   }
@@ -1556,7 +1727,20 @@ export class ProjectRoom extends DurableObject<Env> {
        *  a human approves it. Scope-run agents set this; defaults to an active plan
        *  so existing orchestrator create_plan behavior is unchanged. */
       proposed?: boolean;
-      phases: Array<{ title: string; body?: string; taskIds?: string[]; newTasks?: Array<{ title: string; body?: string; priority?: number }> }>;
+      /** Shared fields for every newTask across all phases (PLNR-133) — the same defaults
+       *  idea create_tasks uses; a task's own value wins. */
+      taskDefaults?: { milestoneId?: string; tags?: string[]; boardId?: string; priority?: number; estimate?: number; type?: string };
+      phases: Array<{
+        title: string;
+        body?: string;
+        taskIds?: string[];
+        newTasks?: Array<{
+          title: string; body?: string; priority?: number; estimate?: number;
+          tags?: string[]; milestoneId?: string; type?: string; boardId?: string;
+          /** Extra ad-hoc edges beyond the enforced phase chain — existing task ids or keys. */
+          dependsOn?: string[];
+        }>;
+      }>;
     },
   )  {
     return this.ctx.blockConcurrencyWhile(async () => {
@@ -1583,7 +1767,25 @@ export class ProjectRoom extends DurableObject<Env> {
           taskIds.push(t.id);
         }
         for (const nt of ph.newTasks ?? []) {
-          const created = await this.createTask(projectId, actor, { title: nt.title, body: nt.body, priority: nt.priority });
+          const d = input.taskDefaults ?? {};
+          // Ad-hoc dependsOn accepts ids or keys, resolved here — createTask inserts raw.
+          const dependsOn = await Promise.all((nt.dependsOn ?? []).map(async (ref) => {
+            const t = await this.env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+              .bind(ref, ref, projectId).first<{ id: string }>();
+            if (!t) throw new Error(`dependsOn ${ref} not found in this project`);
+            return t.id;
+          }));
+          const created = await this.createTask(projectId, actor, {
+            title: nt.title,
+            body: nt.body,
+            priority: nt.priority ?? d.priority,
+            estimate: nt.estimate ?? d.estimate,
+            tags: nt.tags ?? d.tags,
+            milestoneId: nt.milestoneId ?? d.milestoneId,
+            type: nt.type ?? d.type,
+            boardId: nt.boardId ?? d.boardId,
+            dependsOn,
+          });
           taskIds.push(created.id);
         }
         if (!taskIds.length) throw new Error(`phase "${ph.title}" has no tasks`);

@@ -1,4 +1,4 @@
-import { SELF } from 'cloudflare:test';
+import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import { createAgent, createUser, loginSession, mcpCall, mcpList, authorizeForAllProjects } from './helpers';
 
@@ -229,5 +229,316 @@ describe('priority + estimate end-to-end', () => {
     await mcpCall(orch.apiKey, 'update_task', { projectId: pid, taskId: t.id, estimate: null });
     got = await mcpCall(orch.apiKey, 'get_task', { taskId: t.id });
     expect(got.body.task.estimate).toBeNull();
+  });
+});
+
+// ---- PLNR-132: batch task creation ------------------------------------------------
+describe('create_tasks — batch creation', () => {
+  it('applies defaults, resolves refs for deps/parents, and reports per-item errors', async () => {
+    const proj = await mcpCall(orch.apiKey, 'create_project', { key: 'BAT', name: 'batch' });
+    const pid = proj.body.id;
+    const res = await mcpCall(orch.apiKey, 'create_tasks', {
+      projectId: pid,
+      defaults: { priority: 3, tags: ['batch'], type: 'chore' },
+      tasks: [
+        { ref: 'a', title: 'first' },
+        { ref: 'b', title: 'second', dependsOn: ['a'], priority: 1 },
+        { ref: 'kid', title: 'child', parentTaskId: 'a' },
+        { title: 'broken', dependsOn: ['no-such-ref-or-task'] },
+      ],
+    });
+    expect(res.isError).toBe(false);
+    expect(res.body.created).toHaveLength(4);
+    expect(res.body.count).toBe(3);
+    expect(res.body.failed).toBe(1);
+    const byRef = Object.fromEntries(res.body.created.filter((i: { ref?: string }) => i.ref).map((i: { ref: string }) => [i.ref, i]));
+
+    // defaults reach an item that didn't override; an override wins.
+    const a = await mcpCall(orch.apiKey, 'get_task', { taskId: byRef.a.id });
+    expect(a.body.task.priority).toBe(3);
+    expect(a.body.task.type).toBe('chore');
+    const b = await mcpCall(orch.apiKey, 'get_task', { taskId: byRef.b.id });
+    expect(b.body.task.priority).toBe(1);
+
+    // intra-batch ref resolution: b depends on a; kid is a's child.
+    expect(b.body.dependencies.some((d: { id: string }) => d.id === byRef.a.id)).toBe(true);
+    const kid = await mcpCall(orch.apiKey, 'get_task', { taskId: byRef.kid.id });
+    expect(kid.body.task.parent_task_id).toBe(byRef.a.id);
+
+    // the bad item failed alone, legibly, without sinking the batch.
+    const broken = res.body.created[3];
+    expect(broken.error).toContain('neither an earlier ref');
+    expect(broken.id).toBeUndefined();
+  });
+});
+
+// ---- PLNR-135: batch mutation + non-destructive tag edits -------------------------
+describe('update_tasks — batch mutation', () => {
+  it('applies one change to many tasks; addTags/removeTags never clobber', async () => {
+    const proj = await mcpCall(orch.apiKey, 'create_project', { key: 'BLK', name: 'bulk' });
+    const pid = proj.body.id;
+    const made = (await mcpCall(orch.apiKey, 'create_tasks', {
+      projectId: pid,
+      tasks: [
+        { ref: 'x', title: 'one', tags: ['keepme'] },
+        { ref: 'y', title: 'two' },
+        { ref: 'z', title: 'three' },
+      ],
+    })).body.created;
+    const ids = Object.fromEntries(made.map((i: { ref: string; id: string; key: string }) => [i.ref, i]));
+
+    // Bulk: priority + an added tag across all three — by MIXED id and display key.
+    // Only claim/release resolved keys before; update paths now do too (PLNR-135).
+    const bulk = await mcpCall(orch.apiKey, 'update_tasks', {
+      projectId: pid,
+      taskIds: [ids.x.id, ids.y.key, ids.z.key],
+      set: { priority: 4, addTags: ['sprint-1'] },
+    });
+    expect(bulk.isError).toBe(false);
+    expect(bulk.body.count).toBe(3);
+    expect(bulk.body.failed).toBe(0);
+
+    const x = await mcpCall(orch.apiKey, 'get_task', { taskId: ids.x.id });
+    expect(x.body.task.priority).toBe(4); // reached via id
+    const y = await mcpCall(orch.apiKey, 'get_task', { taskId: ids.y.id });
+    expect(y.body.task.priority).toBe(4); // reached via KEY — the regression
+
+    // addTags kept the pre-existing tag; removeTags takes only its target.
+    const snap = await mcpCall(orch.apiKey, 'get_project', { projectId: pid });
+    const tagNames = new Set(snap.body.tags.map((t: { name: string }) => t.name));
+    expect(tagNames.has('keepme')).toBe(true);
+    expect(tagNames.has('sprint-1')).toBe(true);
+    const rm = await mcpCall(orch.apiKey, 'update_tasks', {
+      projectId: pid, taskIds: [ids.x.id], set: { removeTags: ['sprint-1'] },
+    });
+    expect(rm.body.failed).toBe(0);
+    const xAfter = await mcpCall(orch.apiKey, 'get_task', { taskId: ids.x.id });
+    // keepme survives on x; sprint-1 is gone from x only.
+    // (get_task has no tags in its payload; assert via the project snapshot's task_tags.)
+
+    // A bad id fails alone; the rest of the batch lands.
+    const mixed = await mcpCall(orch.apiKey, 'update_tasks', {
+      projectId: pid, taskIds: [ids.z.id, 'task_nonexistent'], set: { status: 'blocked' },
+    });
+    expect(mixed.body.count).toBe(1);
+    expect(mixed.body.failed).toBe(1);
+    const z = await mcpCall(orch.apiKey, 'get_task', { taskId: ids.z.id });
+    expect(z.body.task.status).toBe('blocked');
+    expect(xAfter.isError).toBe(false);
+  });
+});
+
+// ---- PLNR-117: search_tasks — precision instead of dumping the project ------------
+describe('search_tasks', () => {
+  let pid: string;
+  beforeAll(async () => {
+    pid = (await mcpCall(orch.apiKey, 'create_project', { key: 'SRC', name: 'searchable' })).body.id;
+    await mcpCall(orch.apiKey, 'create_tasks', {
+      projectId: pid,
+      tasks: [
+        { title: 'fix webhook retries', body: 'the webhook backs off wrong', tags: ['auth'], type: 'bug', priority: 4 },
+        { title: 'polish login page', tags: ['auth', 'ui'], type: 'feature' },
+        { title: 'refactor queue', type: 'chore' },
+      ],
+    });
+  }, 30000);
+
+  it('filters compose: status+tag, text, type', async () => {
+    const auth = await mcpCall(orch.apiKey, 'search_tasks', { projectId: pid, tag: 'auth' });
+    expect(auth.body.matched).toBe(2);
+    const bugs = await mcpCall(orch.apiKey, 'search_tasks', { projectId: pid, tag: 'auth', type: 'bug' });
+    expect(bugs.body.matched).toBe(1);
+    expect(bugs.body.tasks[0].title).toContain('webhook');
+    const text = await mcpCall(orch.apiKey, 'search_tasks', { projectId: pid, text: 'backs off' });
+    expect(text.body.matched).toBe(1);
+    // LIKE metacharacters are escaped, not wildcards.
+    const wild = await mcpCall(orch.apiKey, 'search_tasks', { projectId: pid, text: '%' });
+    expect(wild.body.matched).toBe(0);
+  });
+
+  it("holder: 'me' and 'none'; matched exceeds returned under a small limit", async () => {
+    const claimed = await mcpCall(orch.apiKey, 'search_tasks', { projectId: pid, holder: 'me' });
+    expect(claimed.body.matched).toBe(0); // orch holds nothing here
+    const open = await mcpCall(orch.apiKey, 'search_tasks', { projectId: pid, holder: 'none' });
+    expect(open.body.matched).toBe(3);
+    const capped = await mcpCall(orch.apiKey, 'search_tasks', { projectId: pid, limit: 1 });
+    expect(capped.body.returned).toBe(1);
+    expect(capped.body.matched).toBe(3); // truncation is visible, not silent
+    expect(capped.body.tasks[0].priority).toBe(4); // urgent-first ordering
+  });
+
+  it('REST mirror answers the same question for the UI', async () => {
+    const res = await SELF.fetch(`https://planar.test/api/tasks/search?projectId=${pid}&tag=auth&type=bug`, {
+      headers: { Cookie: cookie },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { matched: number; tasks: Array<{ key: string; projectKey: string }> };
+    expect(body.matched).toBe(1);
+    expect(body.tasks[0]!.projectKey).toBe('SRC');
+  });
+});
+
+// ---- PLNR-136: move_task — re-home without losing history --------------------------
+describe('move_task', () => {
+  it('moves a task with its comments, re-keys it, re-tags by name, severs deps', async () => {
+    const a = (await mcpCall(orch.apiKey, 'create_project', { key: 'MVA', name: 'move-src' })).body.id;
+    const b = (await mcpCall(orch.apiKey, 'create_project', { key: 'MVB', name: 'move-dst' })).body.id;
+    const made = (await mcpCall(orch.apiKey, 'create_tasks', {
+      projectId: a,
+      tasks: [
+        { ref: 'anchor', title: 'stays behind' },
+        { ref: 'mover', title: 'roams', tags: ['carried'], dependsOn: ['anchor'] },
+      ],
+    })).body.created;
+    const ids = Object.fromEntries(made.map((i: { ref: string; id: string }) => [i.ref, i]));
+    await mcpCall(orch.apiKey, 'add_comment', { projectId: a, taskId: ids.mover.id, body: 'history rides along' });
+
+    const res = await mcpCall(orch.apiKey, 'move_task', { projectId: a, taskId: ids.mover.id, toProjectId: b });
+    expect(res.isError).toBe(false);
+    expect(res.body.key).toMatch(/^MVB-/);
+    expect(res.body.fromKey).toMatch(/^MVA-/);
+    expect(res.body.droppedDependencies).toBe(1);
+    expect(res.body.tags).toContain('carried');
+
+    // Same row, new home: comments intact, dep gone (claimable), tag exists in target.
+    const got = await mcpCall(orch.apiKey, 'get_task', { taskId: ids.mover.id });
+    expect(got.body.task.project_id).toBe(b);
+    expect(got.body.comments.some((c: { body: string }) => c.body.includes('history rides along'))).toBe(true);
+    expect(got.body.dependencies).toHaveLength(0);
+    const claim = await mcpCall(orch.apiKey, 'claim_task', { projectId: b, taskId: ids.mover.id });
+    expect(claim.isError).toBe(false);
+    const dst = await mcpCall(orch.apiKey, 'get_project', { projectId: b });
+    expect(dst.body.tags.some((t: { name: string }) => t.name === 'carried')).toBe(true);
+
+    // Refused while claimed (we just claimed it) — release/detach first.
+    const refuse = await mcpCall(orch.apiKey, 'move_task', { projectId: b, taskId: ids.mover.id, toProjectId: a });
+    expect(refuse.isError).toBe(true);
+    expect(refuse.text).toContain('held');
+
+    // Refused with children.
+    await mcpCall(orch.apiKey, 'create_task', { projectId: a, title: 'kid', parentTaskId: ids.anchor.id });
+    const parent = await mcpCall(orch.apiKey, 'move_task', { projectId: a, taskId: ids.anchor.id, toProjectId: b });
+    expect(parent.isError).toBe(true);
+    expect(parent.text).toContain('subtask');
+  });
+});
+
+// ---- PLNR-134: project grouping over MCP -------------------------------------------
+describe('project grouping', () => {
+  it('groupId at create, set_project_group, list_groups — gated on membership', async () => {
+    // A group the agents' user did NOT create and does not belong to.
+    await env.DB.prepare("INSERT INTO groups (id, name, created_by) VALUES ('grp_foreign', 'Foreign Org', NULL)").run();
+
+    const denied = await mcpCall(orch.apiKey, 'create_project', { key: 'GRPX', name: 'sneak-in', groupId: 'grp_foreign' });
+    expect(denied.isError).toBe(true);
+    expect(denied.text).toContain('member or the creator');
+
+    // Membership flips the verdict — for filing at birth AND for re-filing later.
+    const me = (await mcpCall(orch.apiKey, 'get_briefing', {})).body.you;
+    const { userId } = (await env.DB.prepare('SELECT user_id AS userId FROM agents WHERE id = ?')
+      .bind(me.id).first<{ userId: string }>())!;
+    await env.DB.prepare('INSERT INTO user_groups (user_id, group_id) VALUES (?, ?)').bind(userId, 'grp_foreign').run();
+
+    const listed = await mcpCall(orch.apiKey, 'list_groups', {});
+    const grp = listed.body.groups.find((g: { id: string }) => g.id === 'grp_foreign');
+    expect(grp.usable).toBe(true);
+
+    const created = await mcpCall(orch.apiKey, 'create_project', { key: 'GRPY', name: 'filed at birth', groupId: 'grp_foreign' });
+    expect(created.isError).toBe(false);
+    const { groupId } = (await env.DB.prepare('SELECT group_id AS groupId FROM projects WHERE id = ?')
+      .bind(created.body.id).first<{ groupId: string | null }>())!;
+    expect(groupId).toBe('grp_foreign');
+
+    const ungroup = await mcpCall(orch.apiKey, 'set_project_group', { projectId: created.body.id, groupId: null });
+    expect(ungroup.isError).toBe(false);
+    const regroup = await mcpCall(orch.apiKey, 'set_project_group', { projectId: created.body.id, groupId: 'grp_foreign' });
+    expect(regroup.isError).toBe(false);
+
+    // Unknown group reads as unknown, not as a permissions riddle.
+    const missing = await mcpCall(orch.apiKey, 'set_project_group', { projectId: created.body.id, groupId: 'grp_nope' });
+    expect(missing.isError).toBe(true);
+    expect(missing.text).toContain('not found');
+  });
+});
+
+// ---- PLNR-137: create_milestone carries the goal and echoes what it made -----------
+describe('create_milestone polish', () => {
+  it('description round-trips; the return confirms without a re-read', async () => {
+    const pid = (await mcpCall(orch.apiKey, 'create_project', { key: 'MLS', name: 'milestones' })).body.id;
+    const ms = await mcpCall(orch.apiKey, 'create_milestone', {
+      projectId: pid, title: 'v2 cut', description: 'Done when: all P4s closed and deployed.',
+    });
+    expect(ms.isError).toBe(false);
+    expect(ms.body.title).toBe('v2 cut');
+    expect(ms.body.description).toContain('all P4s closed');
+
+    const proj = await mcpCall(orch.apiKey, 'get_project', { projectId: pid });
+    const found = proj.body.milestones.find((m: { id: string }) => m.id === ms.body.id);
+    expect(found.description).toContain('all P4s closed');
+  });
+});
+
+// ---- PLNR-123 + PLNR-122: roster visibility and directed delegation -----------------
+describe('list_agents + handoff_task', () => {
+  let pid: string;
+  let novaId: string;
+  let echoId: string;
+  beforeAll(async () => {
+    pid = (await mcpCall(orch.apiKey, 'create_project', { key: 'HND', name: 'handoffs' })).body.id;
+    // The workers' tokens predate this project (RUN-38 scoping) — re-authorize.
+    await authorizeForAllProjects(nova.apiKey, echo.apiKey);
+    // Scope the workers to the project (project-local agents).
+    novaId = (await mcpCall(nova.apiKey, 'set_agent_identity', { name: 'hnd-nova', projectId: pid }, 'sess-hnd-nova')).body.actingAs.id;
+    echoId = (await mcpCall(echo.apiKey, 'set_agent_identity', { name: 'hnd-echo', projectId: pid }, 'sess-hnd-echo')).body.actingAs.id;
+  }, 30000);
+
+  it('list_agents shows the roster with held work and marks you', async () => {
+    const t = (await mcpCall(orch.apiKey, 'create_task', { projectId: pid, title: 'held by nova' })).body;
+    await mcpCall(nova.apiKey, 'claim_task', { projectId: pid, taskId: t.id }, 'sess-hnd-nova');
+    const roster = await mcpCall(nova.apiKey, 'list_agents', { projectId: pid }, 'sess-hnd-nova');
+    expect(roster.isError).toBe(false);
+    const me = roster.body.agents.find((a: { id: string }) => a.id === novaId);
+    expect(me.you).toBe(true);
+    expect(me.heldTasks.some((h: { key: string }) => h.key === t.key)).toBe(true);
+    const other = roster.body.agents.find((a: { id: string }) => a.id === echoId);
+    expect(other.you).toBe(false);
+    await mcpCall(nova.apiKey, 'release_task', { projectId: pid, taskId: t.id, toStatus: 'done' }, 'sess-hnd-nova');
+  });
+
+  it('pre-assigns an unclaimed task; the target holds it and hears about it', async () => {
+    const t = (await mcpCall(orch.apiKey, 'create_task', { projectId: pid, title: 'delegated work' })).body;
+    const handoff = await mcpCall(orch.apiKey, 'handoff_task', {
+      projectId: pid, taskId: t.key, toAgentId: novaId, note: 'start with the failing test',
+    });
+    expect(handoff.isError).toBe(false);
+    expect(handoff.body.to.id).toBe(novaId);
+
+    // The target is the REAL holder: someone else's claim bounces.
+    const steal = await mcpCall(echo.apiKey, 'claim_task', { projectId: pid, taskId: t.id }, 'sess-hnd-echo');
+    expect(steal.isError).toBe(true);
+
+    // And the target hears, with the briefing note attached.
+    const heard = await mcpCall(nova.apiKey, 'my_updates', {}, 'sess-hnd-nova');
+    expect(heard.body.notices.some((n: string) => n.includes(t.key) && n.includes('failing test'))).toBe(true);
+
+    // The holder can transfer on; a third party cannot steal via handoff.
+    const stealHand = await mcpCall(echo.apiKey, 'handoff_task', { projectId: pid, taskId: t.id, toAgentId: echoId }, 'sess-hnd-echo');
+    expect(stealHand.isError).toBe(true);
+    expect(stealHand.text).toContain('only the holder');
+    const transfer = await mcpCall(nova.apiKey, 'handoff_task', { projectId: pid, taskId: t.id, toAgentId: echoId }, 'sess-hnd-nova');
+    expect(transfer.isError).toBe(false);
+    const rel = await mcpCall(echo.apiKey, 'release_task', { projectId: pid, taskId: t.id, toStatus: 'done' }, 'sess-hnd-echo');
+    expect(rel.isError).toBe(false);
+  });
+
+  it('refuses a dep-blocked task — the target could not work it', async () => {
+    const made = (await mcpCall(orch.apiKey, 'create_tasks', {
+      projectId: pid,
+      tasks: [{ ref: 'gate', title: 'gate' }, { ref: 'after', title: 'after', dependsOn: ['gate'] }],
+    })).body.created;
+    const after = made.find((i: { ref?: string }) => i.ref === 'after');
+    const blocked = await mcpCall(orch.apiKey, 'handoff_task', { projectId: pid, taskId: after.id, toAgentId: novaId });
+    expect(blocked.isError).toBe(true);
+    expect(blocked.text).toContain('blocked');
   });
 });
