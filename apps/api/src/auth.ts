@@ -14,6 +14,13 @@ export interface AgentIdentity {
   /** copilot = a human's session (self-created, may hop projects, no heartbeat expectation).
    *  agent   = runner-spawned for one run (runner-owned, project-pinned, heartbeat matters). */
   kind: AgentKind;
+  /**
+   * The daemon-declared tool floor for a runner-spawned agent (RUN-47): the MCP server
+   * advertises only these tools, so the catalogue the model sees matches what the daemon's
+   * permission profile lets it call. NULL = no floor declared (every copilot; agents minted
+   * by a pre-RUN-47 daemon) → the full catalogue, the pre-existing behavior.
+   */
+  allowedTools?: string[] | null;
 }
 
 /** An authorized OAuth credential (one `claude mcp add`). Many copilots (sessions) share one.
@@ -57,6 +64,20 @@ export type Vars = {
 export type AppContext = { Bindings: Env; Variables: Vars };
 
 /**
+ * agents.allowed_tools is JSON the daemon wrote; a malformed value must degrade to
+ * "no floor" (full catalogue), never to a 500 on every request this agent makes.
+ */
+function parseAllowedTools(raw: string | null): string[] | null {
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) && v.every((x) => typeof x === 'string') ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Bearer auth for agents (MCP): OAuth 2.1 access tokens only (static API keys
  * were retired — PLNR-52). 401s advertise the OAuth resource metadata so MCP
  * clients can discover the authorization server.
@@ -81,6 +102,7 @@ export async function agentAuth(c: Context<AppContext>, next: Next) {
     `SELECT t.id AS tokenId, t.user_id AS userId, t.client_id AS clientId, t.agent_id AS boundAgentId,
             t.copilot_id AS copilotId,
             a.id AS agentId, COALESCE(a.label, a.name) AS agentName, a.role AS agentRole, a.kind AS agentKind,
+            a.allowed_tools AS agentAllowedTools,
             COALESCE(cl.name, 'MCP client') AS clientName
      FROM oauth_tokens t
      LEFT JOIN agents a ON a.id = t.agent_id AND a.status != 'revoked'
@@ -91,7 +113,7 @@ export async function agentAuth(c: Context<AppContext>, next: Next) {
     tokenId: string; userId: string; clientId: string; clientName: string; boundAgentId: string | null;
     copilotId: string | null;
     agentId: string | null; agentName: string | null; agentRole: 'orchestrator' | 'worker' | null;
-    agentKind: AgentKind | null;
+    agentKind: AgentKind | null; agentAllowedTools: string | null;
   }>();
   if (!t) return unauthorized('invalid, expired, or revoked token — connect via OAuth');
 
@@ -101,7 +123,11 @@ export async function agentAuth(c: Context<AppContext>, next: Next) {
   if (t.boundAgentId && !t.agentId) return unauthorized('this token’s agent was revoked');
 
   const boundAgent: AgentIdentity | null = t.agentId
-    ? { id: t.agentId, name: t.agentName ?? t.agentId, role: t.agentRole ?? 'worker', userId: t.userId, kind: t.agentKind ?? 'agent' }
+    ? {
+        id: t.agentId, name: t.agentName ?? t.agentId, role: t.agentRole ?? 'worker',
+        userId: t.userId, kind: t.agentKind ?? 'agent',
+        allowedTools: parseAllowedTools(t.agentAllowedTools),
+      }
     : null;
   c.set('oauthTokenId', t.tokenId);
   c.set('connection', {
