@@ -6,7 +6,7 @@
 // are not persisted server-side yet — the view surfaces the budget envelope and
 // the terminal exit instead (see the note in the Runs header).
 import { useEffect, useMemo, useState } from 'react';
-import { api, type ApiRun, type ApiRunner, type DispatchInput, type RunEffort, type RunStatus } from '../api';
+import { api, type ApiRun, type ApiRunLogSegment, type ApiRunner, type DispatchInput, type RunEffort, type RunStatus } from '../api';
 import type { AppStore } from '../store';
 import { Markdown } from './Markdown';
 import { LiveDot, MonoTag, SectionLabel } from './bits';
@@ -285,26 +285,14 @@ function RunRow({ run, runner, onCancel }: { run: ApiRun; runner: ApiRunner | nu
             : <span>budget {fmtBudget(run.budget)}</span>}
           <span>· {ago(run.startedAt ?? run.dispatchedAt ?? run.createdAt)}</span>
           {run.worktreePath && <span title={run.worktreePath}>· ⌥ {run.worktreePath.split('/').slice(-2).join('/')}</span>}
-          {run.logTail && (
-            <button
-              onClick={() => setShowLog((s) => !s)}
-              style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-mid)', background: 'var(--w-05)', border: '1px solid var(--w-08)', borderRadius: 5, padding: '1px 7px' }}
-            >
-              {showLog ? '▾ log' : '▸ log'}
-            </button>
-          )}
-        </div>
-        {showLog && run.logTail && (
-          <div
-            style={{
-              margin: '8px 0 2px', padding: '9px 11px', borderRadius: 8, maxHeight: 220, overflow: 'auto',
-              background: 'var(--bg)', border: '1px solid var(--w-07)', fontSize: 11.5, wordBreak: 'break-word',
-            }}
+          <button
+            onClick={() => setShowLog((s) => !s)}
+            style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-mid)', background: 'var(--w-05)', border: '1px solid var(--w-08)', borderRadius: 5, padding: '1px 7px' }}
           >
-            {/* Agent output is markdown prose (PLNR-151) — render it, don't dump it. */}
-            <Markdown source={run.logTail} compact />
-          </div>
-        )}
+            {showLog ? '▾ transcript' : '▸ transcript'}
+          </button>
+        </div>
+        {showLog && <RunTranscript run={run} live={!terminal} />}
         {terminal && run.exit && (
           <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: st.color, marginTop: 5 }}>
             exit: {run.exit.outcome}
@@ -334,6 +322,93 @@ function RunRow({ run, runner, onCancel }: { run: ApiRun; runner: ApiRunner | nu
           {killing ? '…' : 'kill'}
         </Button>
       )}
+    </div>
+  );
+}
+
+/** Who said each part of the transcript (RUN-74). `agent` is labeled by the run's own kind. */
+const ROLE_STYLE: Record<string, { color: string; bg: string }> = {
+  agent: { color: 'var(--blue)', bg: 'rgba(76,157,255,.1)' },
+  reviewer: { color: '#f5a623', bg: 'rgba(245,166,35,.14)' },
+  verify: { color: 'var(--green)', bg: 'rgba(63,217,139,.1)' },
+  system: { color: 'var(--text-dim)', bg: 'var(--w-05)' },
+};
+
+/**
+ * The run's transcript stream (RUN-74): build → reviewer round 1 → fix → reviewer round 2 → …
+ * Exists because the old log box showed only the core agent's tail — after a reviewer
+ * refusal, the WHY was invisible. Falls back to logTail for runs predating segments.
+ */
+function RunTranscript({ run, live }: { run: ApiRun; live: boolean }) {
+  const [segments, setSegments] = useState<ApiRunLogSegment[] | null>(null);
+  useEffect(() => {
+    let stop = false;
+    const load = async () => {
+      try {
+        const { segments } = await api.runLog(run.id);
+        if (!stop) setSegments(segments);
+      } catch {
+        /* transient — poll retries */
+      }
+    };
+    void load();
+    if (!live) return;
+    const iv = setInterval(() => void load(), 5000);
+    return () => {
+      stop = true;
+      clearInterval(iv);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [run.id, live]);
+
+  // Merge consecutive segments from the same voice into one block, so the stream reads as
+  // turns, not as the daemon's flush cadence.
+  const blocks: Array<{ role: string; round: number | null; text: string }> = [];
+  for (const s of segments ?? []) {
+    const last = blocks.at(-1);
+    if (last && last.role === s.role && last.round === s.round) last.text += s.text;
+    else blocks.push({ role: s.role, round: s.round, text: s.text });
+  }
+
+  if (!blocks.length) {
+    // Nothing streamed (old daemon, or nothing said yet) — the rolling tail is still honest.
+    if (!run.logTail) return null;
+    return (
+      <div style={{ margin: '8px 0 2px', padding: '9px 11px', borderRadius: 8, maxHeight: 220, overflow: 'auto', background: 'var(--bg)', border: '1px solid var(--w-07)', fontSize: 11.5, wordBreak: 'break-word' }}>
+        <Markdown source={run.logTail} compact />
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ margin: '8px 0 2px', maxHeight: 380, overflow: 'auto', display: 'flex', flexDirection: 'column', gap: 6 }}>
+      {blocks.map((b, i) => {
+        const st = ROLE_STYLE[b.role] ?? ROLE_STYLE.system!;
+        const label =
+          b.role === 'agent' ? run.kind
+          : b.role === 'reviewer' ? `reviewer${b.round ? ` · round ${b.round}` : ''}`
+          : b.role === 'verify' ? 'verify cmd'
+          : 'runner';
+        return (
+          // biome-ignore lint/suspicious/noArrayIndexKey: blocks are append-only and stable by position
+          <div key={i} style={{ borderRadius: 8, background: 'var(--bg)', border: '1px solid var(--w-07)' }}>
+            <div style={{ padding: '5px 10px 0' }}>
+              <span
+                style={{
+                  fontFamily: 'var(--mono)', fontSize: 9, fontWeight: 700, letterSpacing: '.05em', textTransform: 'uppercase',
+                  color: st.color, background: st.bg, padding: '2px 7px', borderRadius: 5,
+                }}
+              >
+                {label}
+              </span>
+            </div>
+            <div style={{ padding: '4px 11px 9px', fontSize: 11.5, wordBreak: 'break-word' }}>
+              {/* Agent output is markdown prose (PLNR-151) — render it, don't dump it. */}
+              <Markdown source={b.text} compact />
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }

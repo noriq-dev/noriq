@@ -2268,6 +2268,55 @@ export class ProjectRoom extends DurableObject<Env> {
   }
 
   /**
+   * Append transcript segments (RUN-74). Idempotent by construction — the daemon may resend a
+   * batch after a reconnect, and (run_id, seq) OR IGNORE makes that a no-op. No event emitted:
+   * this is telemetry-frequency data, and the event log is for facts humans subscribe to.
+   * Capped per run so a runaway agent cannot grow a row set without bound; the daemon already
+   * caps segment text, this caps count — beyond it, one system marker says the tail was cut.
+   */
+  async appendRunLog(
+    projectId: string,
+    runId: string,
+    segments: Array<{ seq: number; role: string; round?: number | null; text: string; at: string }>,
+  ): Promise<void> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const run = await this.env.DB.prepare('SELECT id FROM runs WHERE id = ? AND project_id = ?')
+        .bind(runId, projectId).first();
+      if (!run || !segments.length) return;
+      const CAP = 2000;
+      const stmts = segments
+        .filter((s) => s.seq < CAP)
+        .map((s) =>
+          this.env.DB.prepare(
+            'INSERT OR IGNORE INTO run_log_segments (run_id, seq, role, round, text, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+          ).bind(runId, s.seq, s.role, s.round ?? null, s.text, s.at),
+        );
+      if (segments.some((s) => s.seq >= CAP)) {
+        stmts.push(
+          this.env.DB.prepare(
+            'INSERT OR IGNORE INTO run_log_segments (run_id, seq, role, round, text, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+          ).bind(runId, CAP, 'system', null, '… transcript truncated (per-run segment cap reached)', nowIso()),
+        );
+      }
+      if (stmts.length) await this.env.DB.batch(stmts);
+    });
+  }
+
+  /** The transcript, in daemon order — the dashboard's run stream (RUN-74). */
+  async getRunLog(
+    projectId: string,
+    runId: string,
+  ): Promise<{ segments: Array<{ seq: number; role: string; round: number | null; text: string; at: string }> }> {
+    await this.setPid(projectId);
+    const { results } = await this.env.DB.prepare(
+      `SELECT seq, role, round, text, created_at AS at FROM run_log_segments
+       WHERE run_id = ? ORDER BY seq LIMIT 2001`,
+    ).bind(runId).all<{ seq: number; role: string; round: number | null; text: string; at: string }>();
+    return { segments: results };
+  }
+
+  /**
    * Phase-boundary verify gate (RUN-21). Interposes at review→done: `passed`
    * advances the phase (its review tasks → done, which unblocks the next phase via
    * the phase-dependency chain); a failure bounces the phase's tasks back to todo
