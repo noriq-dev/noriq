@@ -123,4 +123,10 @@ What deliberately still says planar, and why:
   (`60978d16-…`) and bucket `planar-files` (which also holds all pre-rename
   `backups/planar-*.json` snapshots — still valid restore sources). Delete only by explicit
   decision, and copy the old backups somewhere first.
+- **Durable Object namespace labels** on the original instance display as `planar_ProjectRoom`
+  etc. — the label is minted from the worker's name at namespace creation and has no rename knob
+  (dashboard, wrangler, or API). This is forced, not chosen: do NOT "fix" it with a
+  `deleted_classes` migration, which permanently wipes DO storage (notice cursors, runner
+  registration, armed alarms) for a cosmetic label. Fresh installs already mint `noriq_*` —
+  the class names are brand-neutral and the generic config's worker name is `noriq`.
 - The repo directory being called `planar` is a local path, not an identifier.
