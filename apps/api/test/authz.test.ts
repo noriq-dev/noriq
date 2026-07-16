@@ -14,7 +14,7 @@ let projectId: string;
 let taskId: string;
 
 const req = (path: string, cookie: string, method = 'GET', body?: unknown) =>
-  SELF.fetch(`https://planar.test${path}`, {
+  SELF.fetch(`https://noriq.test${path}`, {
     method,
     headers: { Cookie: cookie, 'Content-Type': 'application/json' },
     ...(body ? { body: JSON.stringify(body) } : {}),

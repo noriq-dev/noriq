@@ -7,11 +7,11 @@ import { createAgent, createUser, loginSession, mcpCall, authorizeForAllProjects
 
 describe('first-run setup', () => {
   it('reports and performs setup exactly once', async () => {
-    const before = await SELF.fetch('https://planar.test/api/setup/status');
+    const before = await SELF.fetch('https://noriq.test/api/setup/status');
     const status = (await before.json()) as { needsSetup: boolean };
 
     if (status.needsSetup) {
-      const res = await SELF.fetch('https://planar.test/api/setup', {
+      const res = await SELF.fetch('https://noriq.test/api/setup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: 'founder@example.com', name: 'Founder', password: 'longenough1' }),
@@ -21,9 +21,9 @@ describe('first-run setup', () => {
     }
 
     // Now configured: further setup attempts are refused.
-    const after = await SELF.fetch('https://planar.test/api/setup/status');
+    const after = await SELF.fetch('https://noriq.test/api/setup/status');
     expect(((await after.json()) as { needsSetup: boolean }).needsSetup).toBe(false);
-    const again = await SELF.fetch('https://planar.test/api/setup', {
+    const again = await SELF.fetch('https://noriq.test/api/setup', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: 'evil@example.com', name: 'X', password: 'hackhackhack' }),
@@ -109,7 +109,7 @@ describe('plans & groups', () => {
   });
 
   it('snapshot exposes plans/phases/phaseTasks for the UI', async () => {
-    const res = await SELF.fetch(`https://planar.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } });
+    const res = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } });
     const snap = (await res.json()) as any;
     expect(snap.plans).toHaveLength(1);
     expect(snap.phases).toHaveLength(3);
@@ -122,27 +122,27 @@ describe('plans & groups', () => {
   });
 
   it('groups can be created and projects assigned', async () => {
-    const g = await SELF.fetch('https://planar.test/api/groups', {
+    const g = await SELF.fetch('https://noriq.test/api/groups', {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: 'Platform' }),
     });
     expect(g.status).toBe(200);
     const { id: groupId } = (await g.json()) as { id: string };
-    const patch = await SELF.fetch(`https://planar.test/api/projects/${projectId}/meta`, {
+    const patch = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/meta`, {
       method: 'PATCH',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ groupId }),
     });
     expect(patch.status).toBe(200);
-    const list = await SELF.fetch('https://planar.test/api/projects', { headers: { Cookie: cookie } });
+    const list = await SELF.fetch('https://noriq.test/api/projects', { headers: { Cookie: cookie } });
     const { projects } = (await list.json()) as { projects: Array<{ id: string; groupId: string | null }> };
     expect(projects.find((p) => p.id === projectId)?.groupId).toBe(groupId);
   });
 
   it('static key issuance is gone; revoking an OAuth agent kills its access', async () => {
     // The old issuance endpoint must be dead (OAuth-only — PLNR-52).
-    const issue = await SELF.fetch('https://planar.test/api/agents', {
+    const issue = await SELF.fetch('https://noriq.test/api/agents', {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: 'ui-issued' }),
@@ -152,7 +152,7 @@ describe('plans & groups', () => {
     const doomed = await createAgent('doomed-agent');
     const before = await mcpCall(doomed.apiKey, 'get_briefing', {});
     expect(before.isError).toBe(false);
-    const revoked = await SELF.fetch(`https://planar.test/api/agents/${doomed.id}/revoke`, {
+    const revoked = await SELF.fetch(`https://noriq.test/api/agents/${doomed.id}/revoke`, {
       method: 'POST',
       headers: { Cookie: cookie },
     });
@@ -181,7 +181,7 @@ describe('plans & groups', () => {
     expect(nc.body.task?.id === taskId).toBeFalsy();
 
     // Approve → proposed → active → tasks ungate.
-    const appr = await SELF.fetch(`https://planar.test/api/projects/${projectId}/plans/${plan.body.id}/approve`, {
+    const appr = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/plans/${plan.body.id}/approve`, {
       method: 'POST', headers: { Cookie: cookie },
     });
     expect(appr.status).toBe(200);
@@ -194,7 +194,7 @@ describe('plans & groups', () => {
     expect(ok.isError).toBe(false);
 
     // Approving a non-proposed plan is refused.
-    const again = await SELF.fetch(`https://planar.test/api/projects/${projectId}/plans/${plan.body.id}/approve`, {
+    const again = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/plans/${plan.body.id}/approve`, {
       method: 'POST', headers: { Cookie: cookie },
     });
     expect(again.status).toBe(500); // "plan is active, not proposed"
@@ -208,7 +208,7 @@ describe('plans & groups', () => {
     const planId = plan.body.id;
     const taskId = plan.body.phases[0].taskIds[0];
 
-    const rej = await SELF.fetch(`https://planar.test/api/projects/${projectId}/plans/${planId}/reject`, {
+    const rej = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/plans/${planId}/reject`, {
       method: 'POST', headers: { Cookie: cookie },
     });
     expect(rej.status).toBe(200);
@@ -244,7 +244,7 @@ describe('plans & groups', () => {
     expect(gated.isError).toBe(true);
     expect(gated.text).toContain('blocked');
 
-    const del = await SELF.fetch(`https://planar.test/api/projects/${projectId}/plans/${plan.body.id}`, {
+    const del = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/plans/${plan.body.id}`, {
       method: 'DELETE', headers: { Cookie: cookie },
     });
     expect(del.status).toBe(200);
@@ -387,7 +387,7 @@ describe('plans & groups', () => {
     });
     const gated = plan.body.phases[1].taskIds[0];
 
-    const arch = await SELF.fetch(`https://planar.test/api/projects/${projectId}/plans/${plan.body.id}/archive`, {
+    const arch = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/plans/${plan.body.id}/archive`, {
       method: 'POST', headers: { Cookie: cookie },
     });
     expect(arch.status).toBe(200);
@@ -396,7 +396,7 @@ describe('plans & groups', () => {
     const listed = await mcpCall(planner.apiKey, 'get_plans', { projectId });
     expect(listed.body.plans.some((p: { id: string }) => p.id === plan.body.id)).toBe(false);
     // …but the snapshot ships it flagged, and the phase edge still gates.
-    const snap = (await (await SELF.fetch(`https://planar.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json()) as {
+    const snap = (await (await SELF.fetch(`https://noriq.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json()) as {
       plans: Array<{ id: string; archivedAt: string | null }>;
     };
     expect(snap.plans.find((p) => p.id === plan.body.id)?.archivedAt).toBeTruthy();
@@ -404,7 +404,7 @@ describe('plans & groups', () => {
     expect(stillGated.isError).toBe(true);
     expect(stillGated.text).toContain('blocked');
 
-    const rest = await SELF.fetch(`https://planar.test/api/projects/${projectId}/plans/${plan.body.id}/restore`, {
+    const rest = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/plans/${plan.body.id}/restore`, {
       method: 'POST', headers: { Cookie: cookie },
     });
     expect(rest.status).toBe(200);

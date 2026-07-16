@@ -14,7 +14,7 @@ const insertToken = async (id: string, token: string, userIdArg: string, msFromN
   env.DB.prepare('INSERT INTO password_resets (id, token_hash, user_id, expires_at) VALUES (?, ?, ?, ?)')
     .bind(id, await sha256Hex(token), userIdArg, new Date(Date.now() + msFromNow).toISOString()).run();
 const post = (path: string, body: unknown) =>
-  SELF.fetch(`https://planar.test${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  SELF.fetch(`https://noriq.test${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 
 beforeAll(async () => {
   userId = (await createUser('reset-me@example.com', 'Reset Me', 'oldpassword1')).id;
@@ -34,7 +34,7 @@ describe('forgot / reset password (PLNR-87)', () => {
     const oldCookie = await loginSession('reset-me@example.com', 'oldpassword1');
     await insertToken('pwr_ok', 'good-token-123', userId, 3600_000);
 
-    const info = await (await SELF.fetch('https://planar.test/api/reset/good-token-123')).json() as { email: string };
+    const info = await (await SELF.fetch('https://noriq.test/api/reset/good-token-123')).json() as { email: string };
     expect(info.email).toBe('reset-me@example.com');
 
     const res = await post('/api/reset/good-token-123', { password: 'brandnewpass1' });
@@ -45,13 +45,13 @@ describe('forgot / reset password (PLNR-87)', () => {
     expect(await loginSession('reset-me@example.com', 'brandnewpass1')).toBeTruthy();
     await expect(loginSession('reset-me@example.com', 'oldpassword1')).rejects.toThrow();
     expect((await post('/api/reset/good-token-123', { password: 'evenmorenew1' })).status).toBe(410);
-    expect((await SELF.fetch('https://planar.test/api/auth/me', { headers: { Cookie: oldCookie } })).status).toBe(401);
+    expect((await SELF.fetch('https://noriq.test/api/auth/me', { headers: { Cookie: oldCookie } })).status).toBe(401);
   });
 
   it('rejects invalid, expired, and short-password requests', async () => {
-    expect((await SELF.fetch('https://planar.test/api/reset/nope')).status).toBe(404);
+    expect((await SELF.fetch('https://noriq.test/api/reset/nope')).status).toBe(404);
     await insertToken('pwr_exp', 'expired-token', userId, -1000);
-    expect((await SELF.fetch('https://planar.test/api/reset/expired-token')).status).toBe(410);
+    expect((await SELF.fetch('https://noriq.test/api/reset/expired-token')).status).toBe(410);
     expect((await post('/api/reset/expired-token', { password: 'longenough1' })).status).toBe(410);
 
     await insertToken('pwr_short', 'short-pw-token', userId, 3600_000);

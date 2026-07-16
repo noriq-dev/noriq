@@ -6,11 +6,11 @@ import { createAgent, loginSession, mcpCall } from './helpers';
 const MINT_USER = 'agent-mint@example.com';
 
 async function sessions(cookie: string) {
-  const res = await SELF.fetch('https://planar.test/api/auth/sessions', { headers: { Cookie: cookie } });
+  const res = await SELF.fetch('https://noriq.test/api/auth/sessions', { headers: { Cookie: cookie } });
   return ((await res.json()) as { sessions: Array<{ id: string; clientName: string; agentCount: number }> }).sessions;
 }
 async function post(cookie: string, path: string) {
-  return SELF.fetch(`https://planar.test${path}`, { method: 'POST', headers: { Cookie: cookie } });
+  return SELF.fetch(`https://noriq.test${path}`, { method: 'POST', headers: { Cookie: cookie } });
 }
 
 describe('OAuth session management', () => {
@@ -42,7 +42,7 @@ describe('OAuth session management', () => {
   });
 
   it('requires a session', async () => {
-    const res = await SELF.fetch('https://planar.test/api/auth/sessions');
+    const res = await SELF.fetch('https://noriq.test/api/auth/sessions');
     expect(res.status).toBe(401);
   });
 });

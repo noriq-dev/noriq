@@ -38,7 +38,7 @@ const runEvents = async (projectId: string) => {
 beforeAll(async () => {
   await createUser('run-owner@example.com', 'Run Owner', 'longenough1', 'member').catch(() => {});
   cookie = await loginSession('run-owner@example.com', 'longenough1');
-  const p = await SELF.fetch('https://planar.test/api/projects', {
+  const p = await SELF.fetch('https://noriq.test/api/projects', {
     method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
     body: JSON.stringify({ key: 'RUNL', name: 'runl' }),
   });
@@ -193,7 +193,7 @@ describe('run lifecycle in ProjectRoom (RUN-6)', () => {
   it('mirrors a spawned agent request_input to Run blocked, and the answer back to running (RUN-18)', async () => {
     const spawned = await createAgent('run18-agent');
     const mintCookie = await loginSession('agent-mint@example.com', 'longenough1');
-    const pr = await SELF.fetch('https://planar.test/api/projects', {
+    const pr = await SELF.fetch('https://noriq.test/api/projects', {
       method: 'POST', headers: { Cookie: mintCookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ key: 'RB18', name: 'rb18' }),
     });
@@ -214,7 +214,7 @@ describe('run lifecycle in ProjectRoom (RUN-6)', () => {
     // Human answers → Run returns to running.
     const sig = await env.DB.prepare("SELECT id FROM signals WHERE agent_id = ? AND type = 'input_request' ORDER BY created_at DESC LIMIT 1")
       .bind(spawned.id).first<{ id: string }>();
-    const ans = await SELF.fetch(`https://planar.test/api/projects/${rbPid}/signals/${sig!.id}/answer`, {
+    const ans = await SELF.fetch(`https://noriq.test/api/projects/${rbPid}/signals/${sig!.id}/answer`, {
       method: 'POST', headers: { Cookie: mintCookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ response: 'go with option B' }),
     });
@@ -232,14 +232,14 @@ describe('run lifecycle in ProjectRoom (RUN-6)', () => {
     const ownerEmail = 'agent-mint@example.com';
     const ownerToken = await mintTokenForUser(ownerEmail);
     const mintCookie = await loginSession(ownerEmail, 'longenough1');
-    const pr = await SELF.fetch('https://planar.test/api/projects', {
+    const pr = await SELF.fetch('https://noriq.test/api/projects', {
       method: 'POST', headers: { Cookie: mintCookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ key: 'PARK', name: 'park' }),
     });
     const parkPid = ((await pr.json()) as { id: string }).id;
     // The token was minted before PARK existed, so it reaches nothing in it (RUN-38).
     await authorizeForAllProjects(ownerToken);
-    const reg = await SELF.fetch('https://planar.test/api/runners', {
+    const reg = await SELF.fetch('https://noriq.test/api/runners', {
       method: 'POST', headers: { Authorization: `Bearer ${ownerToken}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ label: 'park-daemon', maxConcurrency: 1 }),
     });
@@ -254,7 +254,7 @@ describe('run lifecycle in ProjectRoom (RUN-6)', () => {
     ).bind(runId, parkPid, runnerId, spawned.id, spawned.id).run();
 
     const park = async () =>
-      (await (await SELF.fetch(`https://planar.test/api/runs/${runId}/park`, {
+      (await (await SELF.fetch(`https://noriq.test/api/runs/${runId}/park`, {
         headers: { Authorization: `Bearer ${ownerToken}` },
       })).json()) as { blocked: boolean; question: string | null; answer: string | null; status: string };
 
@@ -278,7 +278,7 @@ describe('run lifecycle in ProjectRoom (RUN-6)', () => {
     ).bind(spawned.id).first<{ id: string }>();
     // mintCookie, not the file-level `cookie`: PARK belongs to the mint user, and the file-level
     // one is a different person with no reach into this project at all.
-    const ansRes = await SELF.fetch(`https://planar.test/api/projects/${parkPid}/signals/${sig!.id}/answer`, {
+    const ansRes = await SELF.fetch(`https://noriq.test/api/projects/${parkPid}/signals/${sig!.id}/answer`, {
       method: 'POST', headers: { Cookie: mintCookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ response: 'go with B' }),
     });
@@ -295,7 +295,7 @@ describe('run lifecycle in ProjectRoom (RUN-6)', () => {
     // asking. Same ownership test as the run-agent endpoint.
     const stranger = await mintTokenForUser('park-stranger@example.com');
     const run = await room(pid).createRun(pid, actor, { kind: 'build', repoRef: 'r', agentTool: 'claude' });
-    const res = await SELF.fetch(`https://planar.test/api/runs/${run.id}/park`, {
+    const res = await SELF.fetch(`https://noriq.test/api/runs/${run.id}/park`, {
       headers: { Authorization: `Bearer ${stranger}` },
     });
     expect(res.status).toBe(404);
@@ -303,7 +303,7 @@ describe('run lifecycle in ProjectRoom (RUN-6)', () => {
 
   it('re-register (reconnect) reconciles the runner\'s orphaned runs over HTTP', async () => {
     const token = await mintTokenForUser('run-owner@example.com');
-    const reg = await SELF.fetch('https://planar.test/api/runners', {
+    const reg = await SELF.fetch('https://noriq.test/api/runners', {
       method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ label: 'recon-daemon', maxConcurrency: 2 }),
     });
@@ -312,7 +312,7 @@ describe('run lifecycle in ProjectRoom (RUN-6)', () => {
     await room(pid).transitionRun(pid, actor, run.id, { status: 'running' });
 
     // Reconnect: POST /api/runners again with the same runnerId.
-    await SELF.fetch('https://planar.test/api/runners', {
+    await SELF.fetch('https://noriq.test/api/runners', {
       method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ runnerId, label: 'recon-daemon', maxConcurrency: 2 }),
     });
@@ -368,7 +368,7 @@ describe('dispatch validates verifiesRunId (HTTP)', () => {
   });
 
   const dispatch = (body: Record<string, unknown>) =>
-    SELF.fetch(`https://planar.test/api/projects/${pid}/runs`, {
+    SELF.fetch(`https://noriq.test/api/projects/${pid}/runs`, {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify(body),

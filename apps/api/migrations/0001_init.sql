@@ -1,4 +1,4 @@
--- planar initial schema (ROADMAP §4)
+-- Noriq initial schema (ROADMAP §4)
 -- Single-tenant. All project-scoped writes go through the ProjectRoom DO.
 
 CREATE TABLE users (

@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Noriq (dir/worker/DB still named `planar` — see "Naming" below) is an AI-native project
-management system: an **MCP server for AI agents** plus a **React web app for the humans
-supervising them**, deployed as a single Cloudflare Worker. Open-source and self-hostable.
+Noriq is an AI-native project management system: an **MCP server for AI agents** plus a
+**React web app for the humans supervising them**, deployed as a single Cloudflare Worker.
+Open-source and self-hostable.
 
 ## Commands
 
@@ -102,31 +102,16 @@ for the components. (ARCHITECTURE.md calls it a "mock store" — that's stale; i
 
 - **A deployed change requires a hard browser refresh** — the open SPA tab caches the old JS bundle.
 
-## Naming (brand vs legacy)
+## Naming
 
-The product was renamed **planar → Noriq**, and the PLNR-143 cutover (2026-07-16) finished the
-rename at the infrastructure layer: the Worker, D1 database, R2 bucket (`noriq-files`), session
-cookie (`noriq_session`), localStorage keys (`noriq.*`), and backup snapshots
-(`backups/noriq-*.json`, marker `noriq: 'd1-snapshot'`) are all **noriq** now.
-`wrangler.production.jsonc` holds the real instance values and is gitignored.
+Everything is **Noriq**: the `@noriq-dev/*` packages, the MCP server name, `noriq://` resource
+URIs, the Worker / D1 / R2 names in the configs, the `noriq_session` cookie, `noriq.*`
+localStorage keys, and `backups/noriq-*.json` snapshots (marker `noriq: 'd1-snapshot'`).
+`wrangler.production.jsonc` holds the real instance values and is gitignored. Two rules:
 
-What deliberately still says planar, and why:
-
-- **Project key `PLNR` / `PLNR-##` task keys** — kept permanently; they're embedded in every
-  commit message, comment, and external link. Re-keying is its own decision task if ever wanted.
-- **Cookie dual-read** — reads accept the legacy `planar_session` (see `readSessionId` in
-  [auth.ts](apps/api/src/auth.ts)) so pre-rename sessions survive. Safe to drop after the last
-  30-day sessions age out (~2026-08-16).
-- **localStorage migrate-on-read** from `planar.*` ([prefs.ts](apps/web/src/prefs.ts)) — cheap,
-  keep indefinitely.
-- **Old live resources retained as rollback, not renamed**: the D1 database `planar`
-  (`60978d16-…`) and bucket `planar-files` (which also holds all pre-rename
-  `backups/planar-*.json` snapshots — still valid restore sources). Delete only by explicit
-  decision, and copy the old backups somewhere first.
-- **Durable Object namespace labels** on the original instance display as `planar_ProjectRoom`
-  etc. — the label is minted from the worker's name at namespace creation and has no rename knob
-  (dashboard, wrangler, or API). This is forced, not chosen: do NOT "fix" it with a
-  `deleted_classes` migration, which permanently wipes DO storage (notice cursors, runner
-  registration, armed alarms) for a cosmetic label. Fresh installs already mint `noriq_*` —
-  the class names are brand-neutral and the generic config's worker name is `noriq`.
-- The repo directory being called `planar` is a local path, not an identifier.
+- **The project key `PLNR` (and `PLNR-##` task keys) is a permanent identifier, not brand
+  copy** — it's embedded in every commit message, comment, and external link. Never re-key.
+- **Durable Object namespace labels are minted from the worker's name at namespace creation
+  and have no rename knob** (dashboard, wrangler, or API) — a long-lived instance can show
+  labels that don't match its current worker name. Cosmetic only; never "fix" a label with a
+  `deleted_classes` migration, which permanently wipes that namespace's storage.

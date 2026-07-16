@@ -3,7 +3,7 @@ import type { Context, Next } from 'hono';
 import { cors } from 'hono/cors';
 import { StreamableHTTPTransport } from '@hono/mcp';
 import type { Env } from './env';
-import { adminAuth, agentAuth, readSessionId, resolveSessionAgent, SESSION_CLEAR_COOKIES, sessionSetCookie, userAuth, type AppContext } from './auth';
+import { adminAuth, agentAuth, readSessionId, resolveSessionAgent, SESSION_CLEAR_COOKIE, sessionSetCookie, userAuth, type AppContext } from './auth';
 import { buildMcpServer } from './mcp';
 import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot } from './backup';
@@ -293,7 +293,7 @@ app.post('/api/auth/login', async (c) => {
 });
 
 app.post('/api/auth/logout', userAuth, async (c) => {
-  for (const cookie of SESSION_CLEAR_COOKIES) c.header('Set-Cookie', cookie, { append: true });
+  c.header('Set-Cookie', SESSION_CLEAR_COOKIE);
   return c.json({ ok: true });
 });
 

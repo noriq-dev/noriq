@@ -19,12 +19,12 @@ beforeAll(async () => {
 
 describe('auth', () => {
   it('rejects MCP calls without a key', async () => {
-    const res = await SELF.fetch('https://planar.test/mcp', { method: 'POST' });
+    const res = await SELF.fetch('https://noriq.test/mcp', { method: 'POST' });
     expect(res.status).toBe(401);
   });
 
   it('rejects bad session cookies on the UI API', async () => {
-    const res = await SELF.fetch('https://planar.test/api/projects', { headers: { Cookie: 'planar_session=nope' } });
+    const res = await SELF.fetch('https://noriq.test/api/projects', { headers: { Cookie: 'noriq_session=nope' } });
     expect(res.status).toBe(401);
   });
 
@@ -84,7 +84,7 @@ describe('coordination core', () => {
   });
 
   it('human comments flow to the claiming agent as notices; done is gated on resolution', async () => {
-    const post = await SELF.fetch(`https://planar.test/api/projects/${projectId}/tasks/${t1.id}/comments`, {
+    const post = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/tasks/${t1.id}/comments`, {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ kind: 'question', body: 'Does this handle the crash case?' }),
@@ -187,13 +187,13 @@ describe('coordination core', () => {
   });
 
   it('serves the agent skill', async () => {
-    const res = await SELF.fetch('https://planar.test/skill.md');
+    const res = await SELF.fetch('https://noriq.test/skill.md');
     expect(res.status).toBe(200);
     expect(await res.text()).toContain('get_briefing');
   });
 
   it('UI snapshot reflects everything live', async () => {
-    const res = await SELF.fetch(`https://planar.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } });
+    const res = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } });
     expect(res.status).toBe(200);
     const snap = (await res.json()) as any;
     expect(snap.tasks.length).toBeGreaterThanOrEqual(5);
@@ -218,7 +218,7 @@ describe('priority + estimate end-to-end', () => {
     expect(got.body.task.estimate).toBe(8);
 
     // The snapshot is what the board renders — both fields must reach it.
-    const snap = (await (await SELF.fetch(`https://planar.test/api/projects/${pid}/snapshot`, {
+    const snap = (await (await SELF.fetch(`https://noriq.test/api/projects/${pid}/snapshot`, {
       headers: { Cookie: cookie },
     })).json()) as { tasks: Array<{ id: string; priority: number; estimate: number | null }> };
     const row = snap.tasks.find((x) => x.id === t.id)!;
@@ -368,7 +368,7 @@ describe('search_tasks', () => {
   });
 
   it('REST mirror answers the same question for the UI', async () => {
-    const res = await SELF.fetch(`https://planar.test/api/tasks/search?projectId=${pid}&tag=auth&type=bug`, {
+    const res = await SELF.fetch(`https://noriq.test/api/tasks/search?projectId=${pid}&tag=auth&type=bug`, {
       headers: { Cookie: cookie },
     });
     expect(res.status).toBe(200);
@@ -587,7 +587,7 @@ describe('attention inbox', () => {
       projectId: pid, taskId: t.id, title: 'Which database?', options: ['sqlite', 'postgres'],
     });
 
-    const res = await SELF.fetch('https://planar.test/api/attention', { headers: { Cookie: cookie } });
+    const res = await SELF.fetch('https://noriq.test/api/attention', { headers: { Cookie: cookie } });
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
       signals: Array<{ projectKey: string; type: string; title: string; options: string[] | null }>;
@@ -610,32 +610,32 @@ describe('public projects', () => {
     await mcpCall(orch.apiKey, 'request_input', { projectId: pid, taskId: t.id, title: 'private decision' });
 
     // Off by default — anonymous gets nothing.
-    const closed = await SELF.fetch(`https://planar.test/api/public/projects/${pid}/snapshot`);
+    const closed = await SELF.fetch(`https://noriq.test/api/public/projects/${pid}/snapshot`);
     expect(closed.status).toBe(404);
 
     // A non-owner admin CAN flip it (admin escalation), but a random member cannot.
     await createUser('rando@example.com', 'Rando', 'longenough1', 'member').catch(() => {});
     const randoCookie = await loginSession('rando@example.com', 'longenough1');
-    const denied = await SELF.fetch(`https://planar.test/api/projects/${pid}/meta`, {
+    const denied = await SELF.fetch(`https://noriq.test/api/projects/${pid}/meta`, {
       method: 'PATCH', headers: { Cookie: randoCookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ public: true }),
     });
     expect([403, 404]).toContain(denied.status); // reach-gate or owner-gate, either refusal is right
 
-    const flipped = await SELF.fetch(`https://planar.test/api/projects/${pid}/meta`, {
+    const flipped = await SELF.fetch(`https://noriq.test/api/projects/${pid}/meta`, {
       method: 'PATCH', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ public: true }),
     });
     expect(flipped.status).toBe(200);
 
     // Anonymous read works now — and the payload is the REDUCED one: work, not signals.
-    const open = await SELF.fetch(`https://planar.test/api/public/projects/${pid}/snapshot`);
+    const open = await SELF.fetch(`https://noriq.test/api/public/projects/${pid}/snapshot`);
     expect(open.status).toBe(200);
     const body = (await open.json()) as Record<string, unknown> & { tasks: Array<{ key: string }> };
     expect(body.tasks.some((x) => x.key === t.key)).toBe(true);
     expect('signals' in body).toBe(false); // pending human decisions stay private
     // Writes stay authed regardless.
-    const write = await SELF.fetch(`https://planar.test/api/projects/${pid}/tasks`, {
+    const write = await SELF.fetch(`https://noriq.test/api/projects/${pid}/tasks`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: 'anonymous vandalism' }),
     });
@@ -665,10 +665,10 @@ describe('project docs', () => {
     expect(reread.body.body).toContain('snake_case');
 
     // REST list for the UI; human delete (no MCP delete tool exists — content deletion is human-only).
-    const rest = await SELF.fetch(`https://planar.test/api/projects/${pid}/docs`, { headers: { Cookie: cookie } });
+    const rest = await SELF.fetch(`https://noriq.test/api/projects/${pid}/docs`, { headers: { Cookie: cookie } });
     expect(rest.status).toBe(200);
     expect(((await rest.json()) as { docs: unknown[] }).docs).toHaveLength(1);
-    const del = await SELF.fetch(`https://planar.test/api/projects/${pid}/docs/${made.body.id}`, {
+    const del = await SELF.fetch(`https://noriq.test/api/projects/${pid}/docs/${made.body.id}`, {
       method: 'DELETE', headers: { Cookie: cookie },
     });
     expect(del.status).toBe(200);
@@ -725,11 +725,11 @@ describe('admin OAuth management', () => {
     await createUser('oauthrando@example.com', 'OAuth Rando', 'longenough1', 'member').catch(() => {});
     const member = await loginSession('oauthrando@example.com', 'longenough1');
     for (const [m, path] of [['GET', '/api/admin/oauth/connections'], ['GET', '/api/admin/oauth/clients']] as const) {
-      expect((await SELF.fetch(`https://planar.test${path}`, { method: m, headers: { Cookie: member } })).status).toBe(403);
+      expect((await SELF.fetch(`https://noriq.test${path}`, { method: m, headers: { Cookie: member } })).status).toBe(403);
     }
 
     // The admin sees connections across users (the agent fixtures' mint user included).
-    const conns = (await (await SELF.fetch('https://planar.test/api/admin/oauth/connections', {
+    const conns = (await (await SELF.fetch('https://noriq.test/api/admin/oauth/connections', {
       headers: { Cookie: cookie },
     })).json()) as { connections: Array<{ id: string; userEmail: string | null; agentCount: number }> };
     expect(conns.connections.length).toBeGreaterThan(0);
@@ -737,12 +737,12 @@ describe('admin OAuth management', () => {
     // Revoke a fresh victim's connection admin-side; its MCP access dies.
     const victim = await createAgent('admin-revoke-victim');
     await mcpCall(victim.apiKey, 'get_briefing', {});
-    const after = (await (await SELF.fetch('https://planar.test/api/admin/oauth/connections', {
+    const after = (await (await SELF.fetch('https://noriq.test/api/admin/oauth/connections', {
       headers: { Cookie: cookie },
     })).json()) as { connections: Array<{ id: string; agentCount: number; lastActive: string | null }> };
     const fresh = after.connections.find((x) => !conns.connections.some((o) => o.id === x.id));
     expect(fresh).toBeTruthy();
-    const rev = await SELF.fetch(`https://planar.test/api/admin/oauth/connections/${fresh!.id}/revoke`, {
+    const rev = await SELF.fetch(`https://noriq.test/api/admin/oauth/connections/${fresh!.id}/revoke`, {
       method: 'POST', headers: { Cookie: cookie },
     });
     expect(rev.status).toBe(200);
@@ -750,22 +750,22 @@ describe('admin OAuth management', () => {
     expect(String(dead)).toContain('401');
 
     // Clients list shows the shared test client with live connections → delete refused.
-    const clients = (await (await SELF.fetch('https://planar.test/api/admin/oauth/clients', {
+    const clients = (await (await SELF.fetch('https://noriq.test/api/admin/oauth/clients', {
       headers: { Cookie: cookie },
     })).json()) as { clients: Array<{ id: string; liveTokens: number }> };
     const busy = clients.clients.find((x) => x.liveTokens > 0)!;
     expect(busy).toBeTruthy();
-    const refuse = await SELF.fetch(`https://planar.test/api/admin/oauth/clients/${busy.id}`, {
+    const refuse = await SELF.fetch(`https://noriq.test/api/admin/oauth/clients/${busy.id}`, {
       method: 'DELETE', headers: { Cookie: cookie },
     });
     expect(refuse.status).toBe(409);
 
     // A fresh, unused client deletes cleanly.
-    const reg = (await (await SELF.fetch('https://planar.test/oauth/register', {
+    const reg = (await (await SELF.fetch('https://noriq.test/oauth/register', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ client_name: 'stale client', redirect_uris: ['http://localhost:1/cb'] }),
     })).json()) as { client_id: string };
-    const del = await SELF.fetch(`https://planar.test/api/admin/oauth/clients/${reg.client_id}`, {
+    const del = await SELF.fetch(`https://noriq.test/api/admin/oauth/clients/${reg.client_id}`, {
       method: 'DELETE', headers: { Cookie: cookie },
     });
     expect(del.status).toBe(200);

@@ -9,7 +9,7 @@ let outsiderCookie: string;
 let taskId: string;
 
 const upload = (tid: string, cookie: string, body: BodyInit, init: RequestInit = {}) =>
-  SELF.fetch(`https://planar.test/api/tasks/${tid}/attachments?filename=f.txt`, {
+  SELF.fetch(`https://noriq.test/api/tasks/${tid}/attachments?filename=f.txt`, {
     method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'text/plain' }, body, ...init,
   });
 
@@ -18,12 +18,12 @@ beforeAll(async () => {
   await createUser('up-out@example.com', 'UP Out', 'longenough1').catch(() => {});
   ownerCookie = await loginSession('up-owner@example.com', 'longenough1');
   outsiderCookie = await loginSession('up-out@example.com', 'longenough1');
-  const p = await SELF.fetch('https://planar.test/api/projects', {
+  const p = await SELF.fetch('https://noriq.test/api/projects', {
     method: 'POST', headers: { Cookie: ownerCookie, 'Content-Type': 'application/json' },
     body: JSON.stringify({ key: 'UPP', name: 'Upload' }),
   });
   const pid = (await p.json() as { id: string }).id;
-  const t = await SELF.fetch(`https://planar.test/api/projects/${pid}/tasks`, {
+  const t = await SELF.fetch(`https://noriq.test/api/projects/${pid}/tasks`, {
     method: 'POST', headers: { Cookie: ownerCookie, 'Content-Type': 'application/json' },
     body: JSON.stringify({ title: 'target' }),
   });

@@ -103,7 +103,7 @@ describe('CIMD OAuth wiring (PLNR-82)', () => {
   });
 
   it('discovery advertises client_id_metadata_document_supported (DCR kept too)', async () => {
-    const as = await SELF.fetch('https://planar.test/.well-known/oauth-authorization-server');
+    const as = await SELF.fetch('https://noriq.test/.well-known/oauth-authorization-server');
     const meta = (await as.json()) as Record<string, unknown>;
     expect(meta.client_id_metadata_document_supported).toBe(true);
     expect(meta.registration_endpoint).toContain('/oauth/register');
@@ -112,7 +112,7 @@ describe('CIMD OAuth wiring (PLNR-82)', () => {
   });
 
   it('the OIDC-discovery path also advertises CIMD (strict clients probe it — PLNR-82)', async () => {
-    const oidc = await SELF.fetch('https://planar.test/.well-known/openid-configuration');
+    const oidc = await SELF.fetch('https://noriq.test/.well-known/openid-configuration');
     expect(oidc.status).toBe(200);
     const meta = (await oidc.json()) as Record<string, unknown>;
     expect(meta.client_id_metadata_document_supported).toBe(true);
@@ -121,16 +121,16 @@ describe('CIMD OAuth wiring (PLNR-82)', () => {
 
   it('protected-resource metadata is served at both root and the /mcp-scoped path', async () => {
     for (const path of ['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp']) {
-      const rs = await SELF.fetch(`https://planar.test${path}`);
+      const rs = await SELF.fetch(`https://noriq.test${path}`);
       expect(rs.status).toBe(200);
       const meta = (await rs.json()) as { resource: string; authorization_servers: string[] };
       expect(meta.resource).toContain('/mcp');
-      expect(meta.authorization_servers[0]).toBe('https://planar.test');
+      expect(meta.authorization_servers[0]).toBe('https://noriq.test');
     }
   });
 
   it('CORS preflight is answered for /mcp', async () => {
-    const pre = await SELF.fetch('https://planar.test/mcp', {
+    const pre = await SELF.fetch('https://noriq.test/mcp', {
       method: 'OPTIONS',
       headers: { Origin: 'https://chatgpt.com', 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'authorization' },
     });
@@ -143,7 +143,7 @@ describe('CIMD OAuth wiring (PLNR-82)', () => {
       response_type: 'code', client_id: 'https://169.254.169.254/c.json', redirect_uri: 'https://x/cb',
       state: 's', code_challenge: 'x'.repeat(43), code_challenge_method: 'S256', scope: 'mcp',
     });
-    const res = await SELF.fetch(`https://planar.test/oauth/authorize?${q}`, { headers: { Cookie: cookie } });
+    const res = await SELF.fetch(`https://noriq.test/oauth/authorize?${q}`, { headers: { Cookie: cookie } });
     expect(res.status).toBe(400);
     expect(await res.text()).toMatch(/host is not permitted|client metadata/);
   });

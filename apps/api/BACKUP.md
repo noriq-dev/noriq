@@ -7,8 +7,7 @@ paths — pick either or both.
 
 The Worker has a cron trigger (`0 6 * * *`, 06:00 UTC — see `wrangler.jsonc`) that
 writes a full logical snapshot of every table to the R2 bucket bound as `FILES`,
-under `backups/noriq-<timestamp>.json`. (Snapshots taken before the
-planar→Noriq rename are keyed `backups/planar-*.json` — equally valid restore sources.)
+under `backups/noriq-<timestamp>.json`.
 
 - Requires R2 to be enabled and `FILES` bound (it already is in
   `wrangler.production.jsonc`). Without R2 the cron is a logged no-op — safe to leave on.
@@ -25,8 +24,7 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" \
   https://<your-host>/api/admin/export -o noriq-backup.json
 ```
 
-The snapshot is `{ noriq: "d1-snapshot", version, exportedAt, counts, tables }`
-(pre-rename snapshots use `planar` as the marker key),
+The snapshot is `{ noriq: "d1-snapshot", version, exportedAt, counts, tables }`,
 where `tables` maps each table name to its rows. Tables are discovered from
 `sqlite_master`, so the dump always follows the live schema.
 

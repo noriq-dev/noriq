@@ -36,24 +36,24 @@ beforeAll(async () => {
   // case needs a REST user here.)
   await createUser('mx-bob@example.com', 'MX Bob', 'longenough1').catch(() => {});
   const bobCookie = await loginSession('mx-bob@example.com', 'longenough1');
-  const bp = await SELF.fetch('https://planar.test/api/projects', {
+  const bp = await SELF.fetch('https://noriq.test/api/projects', {
     method: 'POST', headers: { Cookie: bobCookie, 'Content-Type': 'application/json' },
     body: JSON.stringify({ key: 'MXBOB', name: "Bob's" }),
   });
   bobPid = (await bp.json() as { id: string }).id;
   // Priority 4 so a cross-tenant next_claimable leak (if present) would sort first.
-  const bt = await SELF.fetch(`https://planar.test/api/projects/${bobPid}/tasks`, {
+  const bt = await SELF.fetch(`https://noriq.test/api/projects/${bobPid}/tasks`, {
     method: 'POST', headers: { Cookie: bobCookie, 'Content-Type': 'application/json' },
     body: JSON.stringify({ title: 'bob task', priority: 4 }),
   });
   const btj = await bt.json() as { id: string; key: string };
   bobTaskId = btj.id; bobTaskKey = btj.key;
   // A human steering comment on Bob's task (what read_open_comments would leak).
-  await SELF.fetch(`https://planar.test/api/projects/${bobPid}/tasks/${bobTaskId}/comments`, {
+  await SELF.fetch(`https://noriq.test/api/projects/${bobPid}/tasks/${bobTaskId}/comments`, {
     method: 'POST', headers: { Cookie: bobCookie, 'Content-Type': 'application/json' },
     body: JSON.stringify({ kind: 'question', body: 'bob-only steering question' }),
   });
-  const ba = await SELF.fetch(`https://planar.test/api/tasks/${bobTaskId}/attachments?filename=secret.txt`, {
+  const ba = await SELF.fetch(`https://noriq.test/api/tasks/${bobTaskId}/attachments?filename=secret.txt`, {
     method: 'POST', headers: { Cookie: bobCookie, 'Content-Type': 'text/plain' }, body: 'bob-secret-bytes',
   });
   bobAttId = (await ba.json() as { id: string }).id;

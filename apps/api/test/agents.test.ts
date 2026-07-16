@@ -35,7 +35,7 @@ describe('agents are per-session, project-local', () => {
     // scope one agent to the OTHER project
     await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'gamma', projectId: otherProjectId }, 'sess-C');
     const cookie = await bootAdmin();
-    const snap = await (await SELF.fetch(`https://planar.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json() as {
+    const snap = await (await SELF.fetch(`https://noriq.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json() as {
       agents: Array<{ name: string; parentAgentId: string | null }>;
     };
     const names = snap.agents.map((a) => a.name);
@@ -62,7 +62,7 @@ describe('agents are per-session, project-local', () => {
     await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'roster-here', projectId }, 'sess-r1');
     await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'roster-there', projectId: otherProjectId }, 'sess-r2');
     const cookie = await bootAdmin();
-    const roster = await (await SELF.fetch(`https://planar.test/api/agents?projectId=${projectId}`, { headers: { Cookie: cookie } })).json() as {
+    const roster = await (await SELF.fetch(`https://noriq.test/api/agents?projectId=${projectId}`, { headers: { Cookie: cookie } })).json() as {
       agents: Array<{ name: string }>;
     };
     const names = roster.agents.map((a) => a.name);
@@ -73,7 +73,7 @@ describe('agents are per-session, project-local', () => {
   it('?kind=copilot lists copilots by OWNER, reaching the ones no project can see (PLNR-156)', async () => {
     const cookie = await bootAdmin();
     const get = async (qs: string) =>
-      ((await (await SELF.fetch(`https://planar.test/api/agents?${qs}`, { headers: { Cookie: cookie } })).json()) as {
+      ((await (await SELF.fetch(`https://noriq.test/api/agents?${qs}`, { headers: { Cookie: cookie } })).json()) as {
         agents: Array<{ id: string; kind: string; projectId?: string | null; parentAgentId: string | null; clientName?: string | null }>;
       }).agents;
 
@@ -97,7 +97,7 @@ describe('agents are per-session, project-local', () => {
 
   it('?kind=agent narrows the project roster to runner-spawned agents (PLNR-156)', async () => {
     const cookie = await bootAdmin();
-    const agents = ((await (await SELF.fetch(`https://planar.test/api/agents?projectId=${projectId}&kind=agent`, {
+    const agents = ((await (await SELF.fetch(`https://noriq.test/api/agents?projectId=${projectId}&kind=agent`, {
       headers: { Cookie: cookie },
     })).json()) as { agents: Array<{ kind: string }> }).agents;
     expect(agents.every((a) => a.kind === 'agent')).toBe(true);
@@ -109,7 +109,7 @@ describe('agents are per-session, project-local', () => {
     expect(sub.body.parentAgentId).toBe(parent.body.actingAs.id);
 
     const cookie = await bootAdmin();
-    const snap = await (await SELF.fetch(`https://planar.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json() as {
+    const snap = await (await SELF.fetch(`https://noriq.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json() as {
       agents: Array<{ name: string; parentAgentId: string | null }>;
     };
     const helper = snap.agents.find((a) => a.name === 'helper');
@@ -152,7 +152,7 @@ describe('copilot / agent split', () => {
   });
 
   it('refuses a sessionless call instead of inventing somebody to be', async () => {
-    const res = await SELF.fetch('https://planar.test/mcp', {
+    const res = await SELF.fetch('https://noriq.test/mcp', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${conn.apiKey}`,
@@ -176,12 +176,12 @@ describe('copilot / agent split', () => {
     const agentId = before.body.you.id as string;
 
     const cookie = await bootAdmin();
-    const res = await SELF.fetch(`https://planar.test/api/agents/${agentId}/revoke`, {
+    const res = await SELF.fetch(`https://noriq.test/api/agents/${agentId}/revoke`, {
       method: 'POST', headers: { Cookie: cookie },
     });
     expect(res.status).toBe(200);
 
-    const after = await SELF.fetch('https://planar.test/mcp', {
+    const after = await SELF.fetch('https://noriq.test/mcp', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${victim.apiKey}`,

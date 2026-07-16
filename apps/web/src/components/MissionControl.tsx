@@ -6,7 +6,6 @@ import { QuestionForm } from './QuestionForm';
 import { Markdown } from './Markdown';
 import { AvatarChip, MonoTag, SectionLabel, WaveBars } from './bits';
 import { Composer } from './Composer';
-import { migratedGet } from '../prefs';
 
 export function MissionControl({ store }: { store: AppStore }) {
   return (
@@ -326,7 +325,7 @@ function EventFeed({ store }: { store: AppStore }) {
   // the bottom — the default); 'top' = classic activity feed (newest first). Sticky per
   // browser via localStorage.
   const [dir, setDir] = useState<'bottom' | 'top'>(
-    () => (migratedGet('noriq.feedDir') === 'top' ? 'top' : 'bottom'),
+    () => (localStorage.getItem('noriq.feedDir') === 'top' ? 'top' : 'bottom'),
   );
   const flip = () => {
     const next = dir === 'bottom' ? 'top' : 'bottom';

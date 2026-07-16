@@ -28,14 +28,14 @@ async function mintPair(projectIds: string[], verifierSeed = 'a'): Promise<{ acc
     decision: 'approve',
   });
   for (const id of projectIds) form.append('project_ids', id);
-  const approve = await SELF.fetch('https://planar.test/oauth/authorize', {
+  const approve = await SELF.fetch('https://noriq.test/oauth/authorize', {
     method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
     body: form.toString(), redirect: 'manual',
   });
   const loc = approve.headers.get('Location');
   if (!loc) throw new Error(`consent refused: ${approve.status}`);
   const code = new URL(loc).searchParams.get('code')!;
-  const tok = await SELF.fetch('https://planar.test/oauth/token', {
+  const tok = await SELF.fetch('https://noriq.test/oauth/token', {
     method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
       grant_type: 'authorization_code', code, redirect_uri: REDIRECT, client_id: clientId, code_verifier: verifier,
@@ -50,13 +50,13 @@ const mint = async (projectIds: string[], seed = 'a') => (await mintPair(project
 beforeAll(async () => {
   await createUser('scope-owner@example.com', 'Scope Owner', 'longenough1', 'member').catch(() => {});
   cookie = await loginSession('scope-owner@example.com', 'longenough1');
-  const reg = await SELF.fetch('https://planar.test/oauth/register', {
+  const reg = await SELF.fetch('https://noriq.test/oauth/register', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ client_name: 'scope-test', redirect_uris: [REDIRECT] }),
   });
   clientId = ((await reg.json()) as { client_id: string }).client_id;
   const mk = async (key: string, name: string) => {
-    const r = await SELF.fetch('https://planar.test/api/projects', {
+    const r = await SELF.fetch('https://noriq.test/api/projects', {
       method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ key, name }),
     });
@@ -75,7 +75,7 @@ describe('token project scope (RUN-38)', () => {
       response_type: 'code', client_id: clientId, redirect_uri: REDIRECT,
       code_challenge: await s256('x'.repeat(48)), code_challenge_method: 'S256', scope: 'mcp', decision: 'approve',
     });
-    const res = await SELF.fetch('https://planar.test/oauth/authorize', {
+    const res = await SELF.fetch('https://noriq.test/oauth/authorize', {
       method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
       body: form.toString(), redirect: 'manual',
     });
@@ -121,7 +121,7 @@ describe('token project scope (RUN-38)', () => {
     // a one-project laptop to the whole account. Driven through the real grant, because a test
     // that only inspects rows would pass while the grant itself was broken.
     const { refresh } = await mintPair([allowedPid], 'refresh');
-    const res = await SELF.fetch('https://planar.test/oauth/token', {
+    const res = await SELF.fetch('https://noriq.test/oauth/token', {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refresh }).toString(),
     });

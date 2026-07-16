@@ -38,14 +38,14 @@ async function consentFor(
   form.set('decision', 'approve');
   if (scope === 'all') form.set('scope_all', '1');
   else for (const id of scope) form.append('project_ids', id);
-  const approve = await SELF.fetch('https://planar.test/oauth/authorize', {
+  const approve = await SELF.fetch('https://noriq.test/oauth/authorize', {
     method: 'POST',
     headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
     body: form.toString(),
     redirect: 'manual',
   });
   const code = new URL(approve.headers.get('Location')!).searchParams.get('code')!;
-  const tok = await SELF.fetch('https://planar.test/oauth/token', {
+  const tok = await SELF.fetch('https://noriq.test/oauth/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
@@ -63,24 +63,24 @@ describe('oauth 2.1 for MCP', () => {
   let refreshToken: string;
 
   it('serves discovery metadata', async () => {
-    const as = await SELF.fetch('https://planar.test/.well-known/oauth-authorization-server');
+    const as = await SELF.fetch('https://noriq.test/.well-known/oauth-authorization-server');
     expect(as.status).toBe(200);
     const meta = (await as.json()) as Record<string, unknown>;
     expect(meta.registration_endpoint).toContain('/oauth/register');
     expect(meta.code_challenge_methods_supported).toEqual(['S256']);
 
-    const rs = await SELF.fetch('https://planar.test/.well-known/oauth-protected-resource');
+    const rs = await SELF.fetch('https://noriq.test/.well-known/oauth-protected-resource');
     expect(((await rs.json()) as { resource: string }).resource).toContain('/mcp');
   });
 
   it('401 on /mcp advertises the resource metadata', async () => {
-    const res = await SELF.fetch('https://planar.test/mcp', { method: 'POST' });
+    const res = await SELF.fetch('https://noriq.test/mcp', { method: 'POST' });
     expect(res.status).toBe(401);
     expect(res.headers.get('WWW-Authenticate')).toContain('oauth-protected-resource');
   });
 
   it('registers a client dynamically', async () => {
-    const res = await SELF.fetch('https://planar.test/oauth/register', {
+    const res = await SELF.fetch('https://noriq.test/oauth/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ client_name: 'Claude Code', redirect_uris: [redirectUri] }),
@@ -105,7 +105,7 @@ describe('oauth 2.1 for MCP', () => {
     });
 
     // consent page renders for a signed-in user
-    const page = await SELF.fetch(`https://planar.test/oauth/authorize?${q}`, { headers: { Cookie: cookie } });
+    const page = await SELF.fetch(`https://noriq.test/oauth/authorize?${q}`, { headers: { Cookie: cookie } });
     expect(page.status).toBe(200);
     expect(await page.text()).toContain('on your behalf');
 
@@ -113,7 +113,7 @@ describe('oauth 2.1 for MCP', () => {
     const form = new URLSearchParams(Object.fromEntries(q.entries()));
     form.set('decision', 'approve');
     form.set('agent_name', 'oauth-test-agent');
-    const approve = await SELF.fetch('https://planar.test/oauth/authorize', {
+    const approve = await SELF.fetch('https://noriq.test/oauth/authorize', {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
       body: form.toString(),
@@ -122,12 +122,12 @@ describe('oauth 2.1 for MCP', () => {
     expect(approve.status).toBe(302);
     const loc = new URL(approve.headers.get('Location')!);
     expect(loc.searchParams.get('state')).toBe('xyz');
-    expect(loc.searchParams.get('iss')).toBe('https://planar.test'); // RFC 9207
+    expect(loc.searchParams.get('iss')).toBe('https://noriq.test'); // RFC 9207
     const code = loc.searchParams.get('code')!;
     expect(code).toBeTruthy();
 
     // exchange
-    const token = await SELF.fetch('https://planar.test/oauth/token', {
+    const token = await SELF.fetch('https://noriq.test/oauth/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
@@ -219,14 +219,14 @@ describe('oauth 2.1 for MCP', () => {
     const form = new URLSearchParams(Object.fromEntries(q.entries()));
     form.set('decision', 'approve');
     form.set('agent_name', 'oauth-test-agent');
-    const approve = await SELF.fetch('https://planar.test/oauth/authorize', {
+    const approve = await SELF.fetch('https://noriq.test/oauth/authorize', {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
       body: form.toString(),
       redirect: 'manual',
     });
     const code = new URL(approve.headers.get('Location')!).searchParams.get('code')!;
-    const token = await SELF.fetch('https://planar.test/oauth/token', {
+    const token = await SELF.fetch('https://noriq.test/oauth/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
@@ -238,7 +238,7 @@ describe('oauth 2.1 for MCP', () => {
   });
 
   it('refresh rotates the token pair', async () => {
-    const res = await SELF.fetch('https://planar.test/oauth/token', {
+    const res = await SELF.fetch('https://noriq.test/oauth/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken }).toString(),
@@ -248,7 +248,7 @@ describe('oauth 2.1 for MCP', () => {
     expect(t.access_token).not.toBe(accessToken);
 
     // old refresh token is dead (rotation)
-    const replay = await SELF.fetch('https://planar.test/oauth/token', {
+    const replay = await SELF.fetch('https://noriq.test/oauth/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken }).toString(),
@@ -278,7 +278,7 @@ describe('connection copilot (PLNR-155)', () => {
   };
 
   beforeAll(async () => {
-    const res = await SELF.fetch('https://planar.test/oauth/register', {
+    const res = await SELF.fetch('https://noriq.test/oauth/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ client_name: 'Copilot Client', redirect_uris: [redirectUri] }),
@@ -332,7 +332,7 @@ describe('connection copilot (PLNR-155)', () => {
     const { access, refresh } = await grant('copilot-c@example.com');
     const before = await copilotOf(access);
 
-    const res = await SELF.fetch('https://planar.test/oauth/token', {
+    const res = await SELF.fetch('https://noriq.test/oauth/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refresh }).toString(),
@@ -361,7 +361,7 @@ describe('all-projects scope (RUN-58)', () => {
   }
 
   beforeAll(async () => {
-    const res = await SELF.fetch('https://planar.test/oauth/register', {
+    const res = await SELF.fetch('https://noriq.test/oauth/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ client_name: 'Scope All Client', redirect_uris: [redirectUri] }),
@@ -397,7 +397,7 @@ describe('all-projects scope (RUN-58)', () => {
     await mcpCall(mine.boot, 'create_project', { key: 'SAR', name: 'refresh me' });
     const granted = await consentFor(mine.cookie, clientId, redirectUri, 'all');
 
-    const res = await SELF.fetch('https://planar.test/oauth/token', {
+    const res = await SELF.fetch('https://noriq.test/oauth/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: granted.refresh }).toString(),

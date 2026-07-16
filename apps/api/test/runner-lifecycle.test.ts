@@ -12,16 +12,16 @@ let token: string;
 let cookie: string;
 
 const register = (tok: string, body: unknown) =>
-  SELF.fetch('https://planar.test/api/runners', {
+  SELF.fetch('https://noriq.test/api/runners', {
     method: 'POST', headers: { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
 const offboard = (id: string) =>
-  SELF.fetch(`https://planar.test/api/runners/${id}/offboard`, { method: 'POST', headers: { Cookie: cookie } });
+  SELF.fetch(`https://noriq.test/api/runners/${id}/offboard`, { method: 'POST', headers: { Cookie: cookie } });
 const del = (id: string) =>
-  SELF.fetch(`https://planar.test/api/runners/${id}`, { method: 'DELETE', headers: { Cookie: cookie } });
+  SELF.fetch(`https://noriq.test/api/runners/${id}`, { method: 'DELETE', headers: { Cookie: cookie } });
 const list = async () =>
-  ((await (await SELF.fetch('https://planar.test/api/runners', { headers: { Cookie: cookie } })).json()) as {
+  ((await (await SELF.fetch('https://noriq.test/api/runners', { headers: { Cookie: cookie } })).json()) as {
     runners: Array<{ id: string; status: string; label: string; offboardedAt: string | null }>;
   }).runners;
 
@@ -29,7 +29,7 @@ beforeAll(async () => {
   await createUser('lifecycle@example.com', 'Lifecycle', 'longenough1', 'member').catch(() => {});
   token = await mintTokenForUser('lifecycle@example.com');
   cookie = await loginSession('lifecycle@example.com', 'longenough1');
-  await SELF.fetch('https://planar.test/api/projects', {
+  await SELF.fetch('https://noriq.test/api/projects', {
     method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
     body: JSON.stringify({ key: 'LIFE', name: 'lifecycle' }),
   });
@@ -46,7 +46,7 @@ describe('runner offboard (RUN-35)', () => {
     // The token is dead for EVERYTHING it could do, which is the point: no register, no
     // heartbeat, no MCP. A runner marked gone while its credential still works stops nothing.
     expect((await register(token, { label: 'retry' })).status).toBe(401);
-    const hb = await SELF.fetch(`https://planar.test/api/runners/${id}/heartbeat`, {
+    const hb = await SELF.fetch(`https://noriq.test/api/runners/${id}/heartbeat`, {
       method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ freeSlots: 1 }),
     });
@@ -67,7 +67,7 @@ describe('runner offboard (RUN-35)', () => {
     await offboard(id);
     cookie = saved;
 
-    const res = await SELF.fetch('https://planar.test/oauth/token', {
+    const res = await SELF.fetch('https://noriq.test/oauth/token', {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refresh }).toString(),
     });
@@ -106,7 +106,7 @@ describe('runner offboard (RUN-35)', () => {
   it('fails its live runs rather than stranding them', async () => {
     const t = await mintTokenForUser('lifecycle-runs@example.com');
     const rc = await loginSession('lifecycle-runs@example.com', 'longenough1');
-    const p = await SELF.fetch('https://planar.test/api/projects', {
+    const p = await SELF.fetch('https://noriq.test/api/projects', {
       method: 'POST', headers: { Cookie: rc, 'Content-Type': 'application/json' },
       body: JSON.stringify({ key: 'LFRN', name: 'lifecycle-runs' }),
     });
@@ -135,7 +135,7 @@ describe('runner rename + prune (RUN-35)', () => {
   it('re-labels', async () => {
     const t = await mintTokenForUser('lifecycle@example.com');
     const id = ((await (await register(t, { label: 'before' })).json()) as { runner: { id: string } }).runner.id;
-    const res = await SELF.fetch(`https://planar.test/api/runners/${id}`, {
+    const res = await SELF.fetch(`https://noriq.test/api/runners/${id}`, {
       method: 'PATCH', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ label: 'after' }),
     });

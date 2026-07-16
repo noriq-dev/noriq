@@ -24,7 +24,7 @@ async function mintBoot() {
     });
   }
   if (!mintClientId) {
-    const res = await SELF.fetch('https://planar.test/oauth/register', {
+    const res = await SELF.fetch('https://noriq.test/oauth/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ client_name: 'test-mint', redirect_uris: [MINT_REDIRECT] }),
@@ -61,14 +61,14 @@ export async function createAgent(name: string, role: 'orchestrator' | 'worker' 
   const form = new URLSearchParams(Object.fromEntries(q.entries()));
   form.set('decision', 'approve');
   for (const id of await mintUserProjectIds()) form.append('project_ids', id);
-  const approve = await SELF.fetch('https://planar.test/oauth/authorize', {
+  const approve = await SELF.fetch('https://noriq.test/oauth/authorize', {
     method: 'POST',
     headers: { Cookie: mintCookie!, 'Content-Type': 'application/x-www-form-urlencoded' },
     body: form.toString(),
     redirect: 'manual',
   });
   const code = new URL(approve.headers.get('Location')!).searchParams.get('code')!;
-  const tokenRes = await SELF.fetch('https://planar.test/oauth/token', {
+  const tokenRes = await SELF.fetch('https://noriq.test/oauth/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
@@ -96,7 +96,7 @@ export async function mintPairForUser(
 ): Promise<{ access: string; refresh: string }> {
   await createUser(email, email, password).catch(() => {});
   const cookie = await loginSession(email, password);
-  const reg = await SELF.fetch('https://planar.test/oauth/register', {
+  const reg = await SELF.fetch('https://noriq.test/oauth/register', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ client_name: 'mint-user', redirect_uris: ['http://localhost:39990/cb'] }),
   });
@@ -110,12 +110,12 @@ export async function mintPairForUser(
   // Tick whatever exists at mint time. Anything this token creates later joins its scope
   // automatically; anything created later by someone ELSE needs authorizeForAllProjects.
   for (const id of await userProjectIds(email)) form.append('project_ids', id);
-  const approve = await SELF.fetch('https://planar.test/oauth/authorize', {
+  const approve = await SELF.fetch('https://noriq.test/oauth/authorize', {
     method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
     body: form.toString(), redirect: 'manual',
   });
   const code = new URL(approve.headers.get('Location')!).searchParams.get('code')!;
-  const tok = await SELF.fetch('https://planar.test/oauth/token', {
+  const tok = await SELF.fetch('https://noriq.test/oauth/token', {
     method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: 'http://localhost:39990/cb', client_id: clientId, code_verifier: verifier }).toString(),
   });
@@ -124,7 +124,7 @@ export async function mintPairForUser(
 }
 
 export async function createUser(email: string, name: string, password: string, role: 'admin' | 'member' = 'member') {
-  const res = await SELF.fetch('https://planar.test/api/admin/users', {
+  const res = await SELF.fetch('https://noriq.test/api/admin/users', {
     method: 'POST',
     headers: { Authorization: `Bearer ${ADMIN}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ email, name, password, role }),
@@ -167,7 +167,7 @@ export async function mcpCall(apiKey: string, tool: string, args: Record<string,
 }
 
 async function mcpCallOnce(apiKey: string, tool: string, args: Record<string, unknown> = {}, sessionId?: string) {
-  const res = await SELF.fetch('https://planar.test/mcp', {
+  const res = await SELF.fetch('https://noriq.test/mcp', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -199,7 +199,7 @@ async function mcpCallOnce(apiKey: string, tool: string, args: Record<string, un
 
 /** Raw JSON-RPC call (resources/read, resources/list, etc.) → parsed result. */
 export async function mcpRpc(apiKey: string, method: string, params: Record<string, unknown> = {}) {
-  const res = await SELF.fetch('https://planar.test/mcp', {
+  const res = await SELF.fetch('https://noriq.test/mcp', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -221,7 +221,7 @@ export async function mcpRpc(apiKey: string, method: string, params: Record<stri
  * pushed on the POST SSE stream — used to assert live delivery (PLNR-54).
  */
 export async function mcpCallStream(apiKey: string, tool: string, args: Record<string, unknown> = {}) {
-  const res = await SELF.fetch('https://planar.test/mcp', {
+  const res = await SELF.fetch('https://noriq.test/mcp', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -247,7 +247,7 @@ export async function mcpCallStream(apiKey: string, tool: string, args: Record<s
 }
 
 export async function mcpList(apiKey: string) {
-  const res = await SELF.fetch('https://planar.test/mcp', {
+  const res = await SELF.fetch('https://noriq.test/mcp', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -287,7 +287,7 @@ function safeParse(s: string): any {
 }
 
 export async function loginSession(email: string, password: string): Promise<string> {
-  const res = await SELF.fetch('https://planar.test/api/auth/login', {
+  const res = await SELF.fetch('https://noriq.test/api/auth/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email, password }),

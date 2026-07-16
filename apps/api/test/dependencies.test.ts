@@ -12,8 +12,8 @@ let cookie: string;
 async function apiDep(method: 'POST' | 'DELETE', tid: string, depId: string) {
   const url =
     method === 'POST'
-      ? `https://planar.test/api/projects/${projectId}/tasks/${tid}/dependencies`
-      : `https://planar.test/api/projects/${projectId}/tasks/${tid}/dependencies/${depId}`;
+      ? `https://noriq.test/api/projects/${projectId}/tasks/${tid}/dependencies`
+      : `https://noriq.test/api/projects/${projectId}/tasks/${tid}/dependencies/${depId}`;
   return SELF.fetch(url, {
     method,
     headers: { Cookie: cookie, 'Content-Type': 'application/json' },
@@ -33,7 +33,7 @@ beforeAll(async () => {
 
 describe('dependency management (PLNR-58)', () => {
   const depsOf = async (tid: string) => {
-    const snap = await (await SELF.fetch(`https://planar.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json() as {
+    const snap = await (await SELF.fetch(`https://noriq.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json() as {
       dependencies: Array<{ taskId: string; dependsOnTaskId: string }>;
     };
     return snap.dependencies.filter((d) => d.taskId === tid);
@@ -56,7 +56,7 @@ describe('dependency management (PLNR-58)', () => {
   });
 
   it('requires a session', async () => {
-    const res = await SELF.fetch(`https://planar.test/api/projects/${projectId}/tasks/${a}/dependencies`, {
+    const res = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/tasks/${a}/dependencies`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ dependsOnTaskId: b }),

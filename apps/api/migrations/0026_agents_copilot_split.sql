@@ -23,7 +23,7 @@
 -- `defer_foreign_keys` does not save you — deferred FK is a COUNTER, not a commit-time
 -- re-scan, so DROP+RENAME leaves it dirty and fails at commit. Established by PLNR-65 and
 -- re-confirmed here. What that costs us is tracked on PLNR-143, which folds the true
--- rebuild into the planar→noriq DB cutover (it pays the export/import cost anyway).
+-- rebuild into the PLNR-143 DB cutover (it pays the export/import cost anyway).
 --
 -- What we DID get without a rebuild, contrary to the pessimistic reading: ADD COLUMN
 -- accepts CHECK constraints, and a column CHECK may reference sibling columns. So the

@@ -9,25 +9,25 @@ let ownerCookie: string;
 let rnrxProjectId: string;
 
 const createProject = (cookie: string, key: string, name: string) =>
-  SELF.fetch('https://planar.test/api/projects', {
+  SELF.fetch('https://noriq.test/api/projects', {
     method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
     body: JSON.stringify({ key, name }),
   });
 
 const register = (token: string, body: unknown) =>
-  SELF.fetch('https://planar.test/api/runners', {
+  SELF.fetch('https://noriq.test/api/runners', {
     method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
 
 const heartbeat = (token: string, id: string, body: unknown) =>
-  SELF.fetch(`https://planar.test/api/runners/${id}/heartbeat`, {
+  SELF.fetch(`https://noriq.test/api/runners/${id}/heartbeat`, {
     method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
 
 const listRunners = (cookie: string, q = '') =>
-  SELF.fetch(`https://planar.test/api/runners${q}`, { headers: { Cookie: cookie } });
+  SELF.fetch(`https://noriq.test/api/runners${q}`, { headers: { Cookie: cookie } });
 
 beforeAll(async () => {
   await createUser('runner-owner@example.com', 'Runner Owner', 'longenough1', 'member').catch(() => {});
@@ -44,7 +44,7 @@ beforeAll(async () => {
 
 describe('runners (RUN-5)', () => {
   it('rejects registration without an OAuth bearer', async () => {
-    const res = await SELF.fetch('https://planar.test/api/runners', {
+    const res = await SELF.fetch('https://noriq.test/api/runners', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ label: 'x' }),
     });
@@ -130,7 +130,7 @@ function parseBriefing(raw: string): { you: { id: string; kind: string; name: st
 
 /** One JSON-RPC call to /mcp, SSE-framed response parsed back to the raw message. */
 async function mcpRpcRaw(token: string, method: string, params: unknown): Promise<unknown> {
-  const res = await SELF.fetch('https://planar.test/mcp', {
+  const res = await SELF.fetch('https://noriq.test/mcp', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
@@ -150,7 +150,7 @@ async function mcpRpc(token: string, method: string, params: unknown): Promise<u
 
 describe('run agent creation (RUN-43)', () => {
   const createAgentFor = (token: string, runId: string, body: unknown = {}) =>
-    SELF.fetch(`https://planar.test/api/runs/${runId}/agent`, {
+    SELF.fetch(`https://noriq.test/api/runs/${runId}/agent`, {
       method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
@@ -190,7 +190,7 @@ describe('run agent creation (RUN-43)', () => {
     expect(run!.agentId).toBe(body.agentId);
 
     // The token IS that agent: no MCP session needed, and no session can move it.
-    const mcp = await SELF.fetch('https://planar.test/mcp', {
+    const mcp = await SELF.fetch('https://noriq.test/mcp', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${body.token}`,
@@ -267,7 +267,7 @@ describe('run agent creation (RUN-43)', () => {
 
     // Left valid, this credential would outlive its run by the whole 7-day token TTL, with
     // no process, no supervision and no budget behind it.
-    const after = await SELF.fetch('https://planar.test/mcp', {
+    const after = await SELF.fetch('https://noriq.test/mcp', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${body.token}`,

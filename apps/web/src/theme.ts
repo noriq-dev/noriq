@@ -1,13 +1,12 @@
 // Theme preference: explicit choice in localStorage, else the system scheme.
 import { useEffect, useState } from 'react';
-import { migratedGet } from './prefs';
 
 const KEY = 'noriq.theme';
 
 export type Theme = 'dark' | 'light';
 
 export function resolveTheme(): Theme {
-  const stored = migratedGet(KEY);
+  const stored = localStorage.getItem(KEY);
   if (stored === 'dark' || stored === 'light') return stored;
   return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
 }
@@ -20,7 +19,7 @@ export function initTheme() {
   applyTheme(resolveTheme());
   // Follow system changes only while the user hasn't chosen explicitly.
   window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
-    if (!migratedGet(KEY)) applyTheme(resolveTheme());
+    if (!localStorage.getItem(KEY)) applyTheme(resolveTheme());
   });
 }
 

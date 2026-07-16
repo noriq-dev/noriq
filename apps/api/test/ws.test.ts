@@ -11,14 +11,14 @@ let outsiderCookie: string;
 let projectId: string;
 
 const wsFetch = (pid: string, headers: Record<string, string>) =>
-  SELF.fetch(`https://planar.test/ws/projects/${pid}`, { headers: { Upgrade: 'websocket', ...headers } });
+  SELF.fetch(`https://noriq.test/ws/projects/${pid}`, { headers: { Upgrade: 'websocket', ...headers } });
 
 beforeAll(async () => {
   await createUser('ws-owner@example.com', 'WS Owner', 'longenough1').catch(() => {});
   await createUser('ws-outsider@example.com', 'WS Outsider', 'longenough1').catch(() => {});
   ownerCookie = await loginSession('ws-owner@example.com', 'longenough1');
   outsiderCookie = await loginSession('ws-outsider@example.com', 'longenough1');
-  const p = await SELF.fetch('https://planar.test/api/projects', {
+  const p = await SELF.fetch('https://noriq.test/api/projects', {
     method: 'POST', headers: { Cookie: ownerCookie, 'Content-Type': 'application/json' },
     body: JSON.stringify({ key: 'WSP', name: 'WS project' }),
   });
@@ -48,7 +48,7 @@ describe('WebSocket upgrade is authenticated + authorized (PLNR-91)', () => {
   });
 
   it('still returns 426 for a non-upgrade GET', async () => {
-    const res = await SELF.fetch(`https://planar.test/ws/projects/${projectId}`, { headers: { Cookie: ownerCookie } });
+    const res = await SELF.fetch(`https://noriq.test/ws/projects/${projectId}`, { headers: { Cookie: ownerCookie } });
     expect(res.status).toBe(426);
   });
 });

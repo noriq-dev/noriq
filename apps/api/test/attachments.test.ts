@@ -78,11 +78,11 @@ describe('MCP attachments', () => {
       projectId, taskId, filename: 'notes.bin', data: btoa('bytes'), contentType: 'application/octet-stream',
     });
 
-    const pngRes = await SELF.fetch(`https://planar.test/api/attachments/${png.body.id}`, { headers: { Cookie: cookie } });
+    const pngRes = await SELF.fetch(`https://noriq.test/api/attachments/${png.body.id}`, { headers: { Cookie: cookie } });
     expect(pngRes.headers.get('Content-Type')).toBe('image/png');
     expect(pngRes.headers.get('Content-Disposition')).toMatch(/^inline/);
 
-    const logRes = await SELF.fetch(`https://planar.test/api/attachments/${log.body.id}`, { headers: { Cookie: cookie } });
+    const logRes = await SELF.fetch(`https://noriq.test/api/attachments/${log.body.id}`, { headers: { Cookie: cookie } });
     expect(logRes.headers.get('Content-Disposition')).toMatch(/^attachment/);
   });
 

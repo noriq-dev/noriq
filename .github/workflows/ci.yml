@@ -1,5 +1,5 @@
 # PLNR-22: quality gate for contributors. Runs the test suite + typecheck on every
-# PR (and pushes to main). No secrets, no deploy — planar is self-hosted, so each
+# PR (and pushes to main). No secrets, no deploy — Noriq is self-hosted, so each
 # operator runs their own `wrangler deploy`. This only stops regressions from merging.
 name: CI
 

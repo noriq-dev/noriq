@@ -11,7 +11,7 @@ let cookie: string;
 
 const asJson = { 'Content-Type': 'application/json' };
 const snapshot = async () =>
-  (await (await SELF.fetch(`https://planar.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json()) as {
+  (await (await SELF.fetch(`https://noriq.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json()) as {
     boards: Array<{ id: string; name: string }>;
     tasks: Array<{ id: string; boardId: string | null }>;
   };
@@ -34,7 +34,7 @@ describe('boards (PLNR-80)', () => {
   });
 
   it('creates a second board and moves a task onto it', async () => {
-    const created = await SELF.fetch(`https://planar.test/api/projects/${projectId}/boards`, {
+    const created = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/boards`, {
       method: 'POST', headers: { Cookie: cookie, ...asJson }, body: JSON.stringify({ name: 'Staging' }),
     });
     expect(created.status).toBe(200);
@@ -50,7 +50,7 @@ describe('boards (PLNR-80)', () => {
   it('renames a board', async () => {
     const s0 = await snapshot();
     const main = s0.boards.find((b) => b.name === 'Main')!;
-    const r = await SELF.fetch(`https://planar.test/api/projects/${projectId}/boards/${main.id}`, {
+    const r = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/boards/${main.id}`, {
       method: 'PATCH', headers: { Cookie: cookie, ...asJson }, body: JSON.stringify({ name: 'Production' }),
     });
     expect(r.status).toBe(200);
@@ -61,7 +61,7 @@ describe('boards (PLNR-80)', () => {
     const s0 = await snapshot();
     const staging = s0.boards.find((b) => b.name === 'Staging')!;
     const other = s0.boards.find((b) => b.id !== staging.id)!;
-    const del = await SELF.fetch(`https://planar.test/api/projects/${projectId}/boards/${staging.id}`, {
+    const del = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/boards/${staging.id}`, {
       method: 'DELETE', headers: { Cookie: cookie },
     });
     expect(del.status).toBe(200);
@@ -73,7 +73,7 @@ describe('boards (PLNR-80)', () => {
   it('refuses to delete the last remaining board', async () => {
     const s = await snapshot();
     expect(s.boards.length).toBe(1);
-    const del = await SELF.fetch(`https://planar.test/api/projects/${projectId}/boards/${s.boards[0]!.id}`, {
+    const del = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/boards/${s.boards[0]!.id}`, {
       method: 'DELETE', headers: { Cookie: cookie },
     });
     expect(del.status).toBe(400);

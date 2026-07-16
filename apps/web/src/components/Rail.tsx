@@ -6,11 +6,10 @@ import type { ProjectVM } from '../types';
 import { LiveDot } from './bits';
 import { ThemeButton } from './ThemeButton';
 import { Logo } from './Logo';
-import { migratedGet } from '../prefs';
 
 function loadCollapsed(): Record<string, boolean> {
   try {
-    return JSON.parse(migratedGet('noriq.sidebar.collapsed') ?? '{}');
+    return JSON.parse(localStorage.getItem('noriq.sidebar.collapsed') ?? '{}');
   } catch {
     return {};
   }

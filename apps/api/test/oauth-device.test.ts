@@ -3,7 +3,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { createUser, loginSession } from './helpers';
 
 const DEVICE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code';
-const BASE = 'https://planar.test';
+const BASE = 'https://noriq.test';
 
 let cookie: string;
 

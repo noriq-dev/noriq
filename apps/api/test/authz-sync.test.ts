@@ -14,21 +14,21 @@ beforeAll(async () => {
   // on his own private project, neither of which the agent should ever see.
   await createUser('sx-bob@example.com', 'SX Bob', 'longenough1').catch(() => {});
   const bobCookie = await loginSession('sx-bob@example.com', 'longenough1');
-  const bp = await SELF.fetch('https://planar.test/api/projects', {
+  const bp = await SELF.fetch('https://noriq.test/api/projects', {
     method: 'POST', headers: { Cookie: bobCookie, 'Content-Type': 'application/json' },
     body: JSON.stringify({ key: 'SXBOB', name: "Bob's sync" }),
   });
   const bobPid = (await bp.json() as { id: string }).id;
-  const t = await SELF.fetch(`https://planar.test/api/projects/${bobPid}/tasks`, {
+  const t = await SELF.fetch(`https://noriq.test/api/projects/${bobPid}/tasks`, {
     method: 'POST', headers: { Cookie: bobCookie, 'Content-Type': 'application/json' },
     body: JSON.stringify({ title: 'bob unclaimed task' }),
   });
   const tid = (await t.json() as { id: string }).id;
-  await SELF.fetch(`https://planar.test/api/projects/${bobPid}/tasks/${tid}/comments`, {
+  await SELF.fetch(`https://noriq.test/api/projects/${bobPid}/tasks/${tid}/comments`, {
     method: 'POST', headers: { Cookie: bobCookie, 'Content-Type': 'application/json' },
     body: JSON.stringify({ kind: 'question', body: 'BOB-SECRET-QUESTION' }),
   });
-  await SELF.fetch(`https://planar.test/api/projects/${bobPid}/messages`, {
+  await SELF.fetch(`https://noriq.test/api/projects/${bobPid}/messages`, {
     method: 'POST', headers: { Cookie: bobCookie, 'Content-Type': 'application/json' },
     body: JSON.stringify({ body: 'BOB-SECRET-BROADCAST' }),
   });

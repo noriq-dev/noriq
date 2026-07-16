@@ -12,7 +12,7 @@ let taskId: string;
 let attId: string;
 
 const get = (path: string, cookie: string) =>
-  SELF.fetch(`https://planar.test${path}`, { headers: { Cookie: cookie } });
+  SELF.fetch(`https://noriq.test${path}`, { headers: { Cookie: cookie } });
 
 beforeAll(async () => {
   await createUser('rd-owner@example.com', 'RD Owner', 'longenough1').catch(() => {});
@@ -22,17 +22,17 @@ beforeAll(async () => {
   outsiderCookie = await loginSession('rd-out@example.com', 'longenough1');
   adminCookie = await loginSession('rd-admin@example.com', 'longenough1');
 
-  const p = await SELF.fetch('https://planar.test/api/projects', {
+  const p = await SELF.fetch('https://noriq.test/api/projects', {
     method: 'POST', headers: { Cookie: ownerCookie, 'Content-Type': 'application/json' },
     body: JSON.stringify({ key: 'RDP', name: 'Reads' }),
   });
   projectId = (await p.json() as { id: string }).id;
-  const t = await SELF.fetch(`https://planar.test/api/projects/${projectId}/tasks`, {
+  const t = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/tasks`, {
     method: 'POST', headers: { Cookie: ownerCookie, 'Content-Type': 'application/json' },
     body: JSON.stringify({ title: 'private task' }),
   });
   taskId = (await t.json() as { id: string }).id;
-  const a = await SELF.fetch(`https://planar.test/api/tasks/${taskId}/attachments?filename=s.txt`, {
+  const a = await SELF.fetch(`https://noriq.test/api/tasks/${taskId}/attachments?filename=s.txt`, {
     method: 'POST', headers: { Cookie: ownerCookie, 'Content-Type': 'text/plain' }, body: 'secret',
   });
   attId = (await a.json() as { id: string }).id;

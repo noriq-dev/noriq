@@ -5,7 +5,7 @@ import { ADMIN } from './helpers';
 
 describe('D1 backup/export', () => {
   it('admin export returns a full snapshot of the live schema', async () => {
-    const res = await SELF.fetch('https://planar.test/api/admin/export', {
+    const res = await SELF.fetch('https://noriq.test/api/admin/export', {
       headers: { Authorization: `Bearer ${ADMIN}` },
     });
     expect(res.status).toBe(200);
@@ -23,7 +23,7 @@ describe('D1 backup/export', () => {
   });
 
   it('rejects non-admin callers', async () => {
-    const res = await SELF.fetch('https://planar.test/api/admin/export');
+    const res = await SELF.fetch('https://noriq.test/api/admin/export');
     expect(res.status).toBeGreaterThanOrEqual(401);
     expect(res.status).toBeLessThan(404);
   });

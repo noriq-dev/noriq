@@ -7,11 +7,11 @@ let agent: { id: string; apiKey: string };
 let cookie: string;
 
 const snap = async (pid: string) =>
-  await (await SELF.fetch(`https://planar.test/api/projects/${pid}/snapshot`, { headers: { Cookie: cookie } })).json() as {
+  await (await SELF.fetch(`https://noriq.test/api/projects/${pid}/snapshot`, { headers: { Cookie: cookie } })).json() as {
     tasks: Array<{ id: string; milestoneId: string | null }>; milestones: unknown[]; tags: unknown[]; plans: unknown[];
   };
 const del = (pid: string, path: string, ck = cookie) =>
-  SELF.fetch(`https://planar.test/api/projects/${pid}${path}`, { method: 'DELETE', headers: { Cookie: ck } });
+  SELF.fetch(`https://noriq.test/api/projects/${pid}${path}`, { method: 'DELETE', headers: { Cookie: ck } });
 
 beforeAll(async () => {
   agent = await createAgent('del-agent');
@@ -70,7 +70,7 @@ describe('deletion', () => {
     await mcpCall(agent.apiKey, 'claim_task', { projectId: p.id, taskId: t.id }); // scopes the agent
     expect((await del(p.id, '')).status).toBe(200);
     // snapshot 404s now
-    const s = await SELF.fetch(`https://planar.test/api/projects/${p.id}/snapshot`, { headers: { Cookie: cookie } });
+    const s = await SELF.fetch(`https://noriq.test/api/projects/${p.id}/snapshot`, { headers: { Cookie: cookie } });
     expect(s.status).toBe(404);
   });
 
@@ -118,7 +118,7 @@ describe('deletion', () => {
 
   it('project delete is refused for a non-owner member', async () => {
     // A REST-created project records an owner (the admin). A member can't delete it.
-    const create = await SELF.fetch('https://planar.test/api/projects', {
+    const create = await SELF.fetch('https://noriq.test/api/projects', {
       method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ key: 'DELO', name: 'owned' }),
     });

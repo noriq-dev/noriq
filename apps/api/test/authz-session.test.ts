@@ -16,7 +16,7 @@ async function s256(verifier: string): Promise<string> {
 async function mintTokenForUser(email: string): Promise<string> {
   await createUser(email, email, 'longenough1').catch(() => {});
   const cookie = await loginSession(email, 'longenough1');
-  const reg = await SELF.fetch('https://planar.test/oauth/register', {
+  const reg = await SELF.fetch('https://noriq.test/oauth/register', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ client_name: 'hijack-test', redirect_uris: [REDIRECT] }),
   });
@@ -26,12 +26,12 @@ async function mintTokenForUser(email: string): Promise<string> {
     response_type: 'code', client_id: clientId, redirect_uri: REDIRECT,
     code_challenge: await s256(verifier), code_challenge_method: 'S256', scope: 'mcp', state: 's', decision: 'approve',
   });
-  const approve = await SELF.fetch('https://planar.test/oauth/authorize', {
+  const approve = await SELF.fetch('https://noriq.test/oauth/authorize', {
     method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
     body: form.toString(), redirect: 'manual',
   });
   const code = new URL(approve.headers.get('Location')!).searchParams.get('code')!;
-  const tok = await SELF.fetch('https://planar.test/oauth/token', {
+  const tok = await SELF.fetch('https://noriq.test/oauth/token', {
     method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: REDIRECT, client_id: clientId, code_verifier: verifier }).toString(),
   });
@@ -40,7 +40,7 @@ async function mintTokenForUser(email: string): Promise<string> {
 
 /** Initialize an MCP session under a chosen (client-supplied) session id. */
 async function initSession(apiKey: string, sessionId: string): Promise<void> {
-  await SELF.fetch('https://planar.test/mcp', {
+  await SELF.fetch('https://noriq.test/mcp', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json',

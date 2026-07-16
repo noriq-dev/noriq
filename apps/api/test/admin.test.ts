@@ -11,7 +11,7 @@ let bobProjectId: string;
 let agent: { id: string; apiKey: string };
 
 const listProjects = async (cookie: string, scope?: string) =>
-  (await (await SELF.fetch(`https://planar.test/api/projects${scope ? `?scope=${scope}` : ''}`, { headers: { Cookie: cookie } })).json() as {
+  (await (await SELF.fetch(`https://noriq.test/api/projects${scope ? `?scope=${scope}` : ''}`, { headers: { Cookie: cookie } })).json() as {
     projects: Array<{ id: string; ownerName: string | null }>; admin: boolean;
   });
 
@@ -22,7 +22,7 @@ beforeAll(async () => {
   bobCookie = await loginSession('av-bob@example.com', 'longenough1');
 
   // Bob owns a project (created via the web REST path → owner_user_id = bob).
-  const p = await SELF.fetch('https://planar.test/api/projects', {
+  const p = await SELF.fetch('https://noriq.test/api/projects', {
     method: 'POST', headers: { Cookie: bobCookie, 'Content-Type': 'application/json' },
     body: JSON.stringify({ key: 'AVBOB', name: "Bob's private project" }),
   });
@@ -85,14 +85,14 @@ describe('grouped projects are shared with the group members only (PLNR-83)', ()
 
     // Bob makes a group (auto-joins), adds Charlie, and moves his project into it.
     // Admin is deliberately NOT a member, to prove grouped != globally visible.
-    const g = await SELF.fetch('https://planar.test/api/groups', {
+    const g = await SELF.fetch('https://noriq.test/api/groups', {
       method: 'POST', headers: { Cookie: bobCookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Team X' }),
     });
     const gid = (await g.json() as { id: string }).id;
-    await SELF.fetch(`https://planar.test/api/groups/${gid}/members`, {
+    await SELF.fetch(`https://noriq.test/api/groups/${gid}/members`, {
       method: 'POST', headers: { Cookie: bobCookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ userId: charlie!.id }),
     });
-    await SELF.fetch(`https://planar.test/api/projects/${bobProjectId}/meta`, {
+    await SELF.fetch(`https://noriq.test/api/projects/${bobProjectId}/meta`, {
       method: 'PATCH', headers: { Cookie: bobCookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ groupId: gid }),
     });
 
@@ -109,20 +109,20 @@ describe('grouped projects are shared with the group members only (PLNR-83)', ()
     await createUser('av-fred@example.com', 'AV Fred', 'longenough1').catch(() => {});
     const edCookie = await loginSession('av-ed@example.com', 'longenough1');
     const fredCookie = await loginSession('av-fred@example.com', 'longenough1');
-    const users = await (await SELF.fetch('https://planar.test/api/users', { headers: { Cookie: adminCookie } })).json() as { users: Array<{ id: string; email: string }> };
+    const users = await (await SELF.fetch('https://noriq.test/api/users', { headers: { Cookie: adminCookie } })).json() as { users: Array<{ id: string; email: string }> };
     const fredId = users.users.find((u) => u.email === 'av-fred@example.com')!.id;
     const mkProject = async (cookie: string, key: string) => {
-      const r = await SELF.fetch('https://planar.test/api/projects', {
+      const r = await SELF.fetch('https://noriq.test/api/projects', {
         method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ key, name: key }),
       });
       return (await r.json() as { id: string }).id;
     };
-    const setGroup = (cookie: string, pid: string, gid: string) => SELF.fetch(`https://planar.test/api/projects/${pid}/meta`, {
+    const setGroup = (cookie: string, pid: string, gid: string) => SELF.fetch(`https://noriq.test/api/projects/${pid}/meta`, {
       method: 'PATCH', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ groupId: gid }),
     });
 
     // Ed makes a group (auto-joins as creator) and can put his project in it.
-    const g = await SELF.fetch('https://planar.test/api/groups', {
+    const g = await SELF.fetch('https://noriq.test/api/groups', {
       method: 'POST', headers: { Cookie: edCookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Shared Nod' }),
     });
     const gid = (await g.json() as { id: string }).id;
@@ -135,7 +135,7 @@ describe('grouped projects are shared with the group members only (PLNR-83)', ()
     expect((await listProjects(fredCookie)).projects.some((p) => p.id === edProj)).toBe(false);
 
     // Ed (a member) adds Fred; now Fred may add his project, and co-members see each other's.
-    await SELF.fetch(`https://planar.test/api/groups/${gid}/members`, {
+    await SELF.fetch(`https://noriq.test/api/groups/${gid}/members`, {
       method: 'POST', headers: { Cookie: edCookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ userId: fredId }),
     });
     expect((await setGroup(fredCookie, fredProj, gid)).status).toBe(200);

@@ -227,19 +227,12 @@ export function getCookie(cookieHeader: string, name: string): string | null {
   return null;
 }
 
-// PLNR-143: the session cookie renamed planar_session → noriq_session. Reads accept
-// both so existing sessions survive the rename; writes emit only the new name. Drop
-// the legacy fallback once old 30-day sessions have aged out.
 export function readSessionId(cookieHeader: string): string | null {
-  return getCookie(cookieHeader, 'noriq_session') ?? getCookie(cookieHeader, 'planar_session');
+  return getCookie(cookieHeader, 'noriq_session');
 }
 
 export function sessionSetCookie(sid: string, expires: Date): string {
   return `noriq_session=${sid}; HttpOnly; Secure; SameSite=Lax; Path=/; Expires=${expires.toUTCString()}`;
 }
 
-/** Expire both cookie names — a logout must also kill a legacy planar_session. */
-export const SESSION_CLEAR_COOKIES = [
-  'noriq_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0',
-  'planar_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0',
-];
+export const SESSION_CLEAR_COOKIE = 'noriq_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0';

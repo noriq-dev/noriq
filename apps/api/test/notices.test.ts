@@ -10,7 +10,7 @@ let cookie: string;
 const openedComments: string[] = [];
 
 async function humanQuestion(pid: string, tid: string, body: string) {
-  const res = await SELF.fetch(`https://planar.test/api/projects/${pid}/tasks/${tid}/comments`, {
+  const res = await SELF.fetch(`https://noriq.test/api/projects/${pid}/tasks/${tid}/comments`, {
     method: 'POST',
     headers: { Cookie: cookie, 'Content-Type': 'application/json' },
     body: JSON.stringify({ kind: 'question', body }),
@@ -24,7 +24,7 @@ async function humanQuestion(pid: string, tid: string, body: string) {
 // ones this suite creates — otherwise they leak into other suites' idle agents.
 afterAll(async () => {
   for (const id of openedComments) {
-    await SELF.fetch(`https://planar.test/api/projects/${projectId}/comments/${id}/resolve`, {
+    await SELF.fetch(`https://noriq.test/api/projects/${projectId}/comments/${id}/resolve`, {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ resolution: 'addressed', reply: 'test cleanup' }),

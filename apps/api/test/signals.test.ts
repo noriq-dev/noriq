@@ -8,7 +8,7 @@ let projectId: string;
 let cookie: string;
 
 const snapshot = async () =>
-  (await (await SELF.fetch(`https://planar.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json()) as {
+  (await (await SELF.fetch(`https://noriq.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json()) as {
     signals: Array<{ id: string; type: string; severity: string; title: string; taskKey: string | null }>;
     tasks: Array<{ id: string; key: string; status: string }>;
   };
@@ -40,7 +40,7 @@ describe('input requests (decision gates)', () => {
 
     // Can't finish while the gate is open (task is blocked anyway, but assert the guard).
     // Human answers → task back to todo.
-    const ans = await SELF.fetch(`https://planar.test/api/projects/${projectId}/signals/${sig!.id}/answer`, {
+    const ans = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/signals/${sig!.id}/answer`, {
       method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ response: 'Use D1' }),
     });
     expect(ans.status).toBe(200);
@@ -82,7 +82,7 @@ describe('alerts (non-blocking)', () => {
 
   it('a human can acknowledge an alert', async () => {
     const a = (await mcpCall(agent.apiKey, 'raise_alert', { projectId, title: 'heads up' })).body;
-    const ack = await SELF.fetch(`https://planar.test/api/projects/${projectId}/signals/${a.id}/acknowledge`, {
+    const ack = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/signals/${a.id}/acknowledge`, {
       method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({}),
     });
     expect(ack.status).toBe(200);
@@ -116,7 +116,7 @@ describe('multi-question input requests', () => {
     const cookie = await loginSession('asker-admin@example.com', 'longenough1');
 
     // The batch structure reaches the snapshot (what all three UIs render).
-    const snap = (await (await SELF.fetch(`https://planar.test/api/projects/${pid}/snapshot`, {
+    const snap = (await (await SELF.fetch(`https://noriq.test/api/projects/${pid}/snapshot`, {
       headers: { Cookie: cookie },
     })).json()) as { signals: Array<{ id: string; questions: Array<{ question: string; multi?: boolean }> | null }> };
     const sig = snap.signals.find((x) => x.questions);
@@ -126,7 +126,7 @@ describe('multi-question input requests', () => {
 
     // Answer as the UI would: one formatted string for the whole batch.
     const answer = 'Which database? → postgres\nWhich caches? → redis, other: disk tier\nAnything else to consider? → keep it simple';
-    const res = await SELF.fetch(`https://planar.test/api/projects/${pid}/signals/${sig!.id}/answer`, {
+    const res = await SELF.fetch(`https://noriq.test/api/projects/${pid}/signals/${sig!.id}/answer`, {
       method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ response: answer }),
     });

@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest';
 
 describe('MCP tool reference', () => {
   it('/reference.md lists tools, params, and resources', async () => {
-    const res = await SELF.fetch('https://planar.test/reference.md');
+    const res = await SELF.fetch('https://noriq.test/reference.md');
     expect(res.status).toBe(200);
     expect(res.headers.get('Content-Type')).toContain('text/markdown');
     const md = await res.text();
@@ -20,7 +20,7 @@ describe('MCP tool reference', () => {
   });
 
   it('/reference.json exposes JSON Schema per tool', async () => {
-    const res = await SELF.fetch('https://planar.test/reference.json');
+    const res = await SELF.fetch('https://noriq.test/reference.json');
     expect(res.status).toBe(200);
     const doc = (await res.json()) as { tools: Array<{ name: string; inputSchema: any }>; resources: unknown[] };
     const claim = doc.tools.find((t) => t.name === 'claim_task');

@@ -13,11 +13,11 @@ let taskId: string;
 let cookie: string;
 
 const snapshot = async () =>
-  await (await SELF.fetch(`https://planar.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json() as {
+  await (await SELF.fetch(`https://noriq.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json() as {
     tasks: Array<{ id: string; status: string; milestoneId: string | null; archivedAt: string | null }>;
   };
 const tasksIn = async () => (await snapshot()).tasks;
-const post = (path: string) => SELF.fetch(`https://planar.test/api/projects/${projectId}${path}`, { method: 'POST', headers: { Cookie: cookie } });
+const post = (path: string) => SELF.fetch(`https://noriq.test/api/projects/${projectId}${path}`, { method: 'POST', headers: { Cookie: cookie } });
 
 beforeAll(async () => {
   agent = await createAgent('arch-agent');

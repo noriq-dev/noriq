@@ -55,7 +55,7 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
     await createUser('rws-owner@example.com', 'RWS Owner', 'longenough1', 'member').catch(() => {});
     token = await mintTokenForUser('rws-owner@example.com');
     cookie = await loginSession('rws-owner@example.com', 'longenough1');
-    const p = await SELF.fetch('https://planar.test/api/projects', {
+    const p = await SELF.fetch('https://noriq.test/api/projects', {
       method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ key: 'RWSP', name: 'rwsp' }),
     });
@@ -65,7 +65,7 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
     // registration resolves repo keys only within the TOKEN's projects, so without it every
     // repo resolves to null and nothing is dispatchable.
     await authorizeForAllProjects(token);
-    const reg = await SELF.fetch('https://planar.test/api/runners', {
+    const reg = await SELF.fetch('https://noriq.test/api/runners', {
       method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ label: 'ws-daemon', tools: ['claude'], kinds: ['build'], maxConcurrency: 2, repos: [{ id: 'repo_x', projectKey: 'RWSP' }] }),
     });
@@ -73,7 +73,7 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
   }, 60000);
 
   const wsConnect = (id: string, headers: Record<string, string>) =>
-    SELF.fetch(`https://planar.test/ws/runner/${id}`, { headers: { Upgrade: 'websocket', ...headers } });
+    SELF.fetch(`https://noriq.test/ws/runner/${id}`, { headers: { Upgrade: 'websocket', ...headers } });
 
   it('rejects the upgrade without a token (401) and for a non-owner (404)', async () => {
     expect((await wsConnect(runnerId, {})).status).toBe(401);
@@ -94,7 +94,7 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
 
     // Dispatch a brief; the run.assigned frame should arrive on the socket.
     const assignedP = nextFrame(ws, (m) => m.type === 'run.assigned');
-    const disp = await (await SELF.fetch(`https://planar.test/api/projects/${pid}/runs`, {
+    const disp = await (await SELF.fetch(`https://noriq.test/api/projects/${pid}/runs`, {
       method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ runnerId, kind: 'build', agentTool: 'claude', repoRef: 'repo_x', brief: 'do the thing' }),
     })).json() as { run: { id: string; status: string }; delivered: boolean };
@@ -110,7 +110,7 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
   });
 
   it('dispatch rejects a repoRef that does not resolve to the project', async () => {
-    const res = await SELF.fetch(`https://planar.test/api/projects/${pid}/runs`, {
+    const res = await SELF.fetch(`https://noriq.test/api/projects/${pid}/runs`, {
       method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ runnerId, kind: 'build', agentTool: 'claude', repoRef: 'nope' }),
     });
@@ -124,13 +124,13 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
     ws.send(JSON.stringify({ type: 'hello', protocol: 1, label: 'ws-daemon' }));
     await nextFrame(ws, (m) => m.type === 'registered');
 
-    const disp = await (await SELF.fetch(`https://planar.test/api/projects/${pid}/runs`, {
+    const disp = await (await SELF.fetch(`https://noriq.test/api/projects/${pid}/runs`, {
       method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ runnerId, kind: 'build', agentTool: 'claude', repoRef: 'repo_x' }),
     })).json() as { run: { id: string } };
 
     const cancelP = nextFrame(ws, (m) => m.type === 'run.cancel');
-    await SELF.fetch(`https://planar.test/api/runs/${disp.run.id}/cancel`, {
+    await SELF.fetch(`https://noriq.test/api/runs/${disp.run.id}/cancel`, {
       method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ reason: 'changed my mind' }),
     });
@@ -142,12 +142,12 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
 
   it('the dashboard runs list (RUN-22) returns this project\'s runs to the owner, 404 to a non-owner', async () => {
     // Dispatch one so the list is non-empty, then read it back over the GET surface.
-    const disp = await (await SELF.fetch(`https://planar.test/api/projects/${pid}/runs`, {
+    const disp = await (await SELF.fetch(`https://noriq.test/api/projects/${pid}/runs`, {
       method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ runnerId, kind: 'build', agentTool: 'claude', repoRef: 'repo_x', brief: 'list me' }),
     })).json() as { run: { id: string } };
 
-    const listed = await SELF.fetch(`https://planar.test/api/projects/${pid}/runs`, { headers: { Cookie: cookie } });
+    const listed = await SELF.fetch(`https://noriq.test/api/projects/${pid}/runs`, { headers: { Cookie: cookie } });
     expect(listed.status).toBe(200);
     const { runs } = (await listed.json()) as { runs: Array<{ id: string; projectId: string; repoRef: string }> };
     const mine = runs.find((r) => r.id === disp.run.id);
@@ -157,7 +157,7 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
 
     // A user with no reach to this project is 404'd by the project-access middleware.
     const otherCookie = await loginSession('rws-other@example.com', 'longenough1');
-    const denied = await SELF.fetch(`https://planar.test/api/projects/${pid}/runs`, { headers: { Cookie: otherCookie } });
+    const denied = await SELF.fetch(`https://noriq.test/api/projects/${pid}/runs`, { headers: { Cookie: otherCookie } });
     expect(denied.status).toBe(404);
   });
 
@@ -168,7 +168,7 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
     ws.send(JSON.stringify({ type: 'hello', protocol: 1, label: 'ws-daemon' }));
     await nextFrame(ws, (m) => m.type === 'registered');
 
-    const disp = await (await SELF.fetch(`https://planar.test/api/projects/${pid}/runs`, {
+    const disp = await (await SELF.fetch(`https://noriq.test/api/projects/${pid}/runs`, {
       method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ runnerId, kind: 'build', agentTool: 'claude', repoRef: 'repo_x', brief: 'telemetry' }),
     })).json() as { run: { id: string } };
@@ -195,7 +195,7 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
     expect(st!.status).toBe('running');
 
     // And it comes back on the dashboard list projection.
-    const listed = await (await SELF.fetch(`https://planar.test/api/projects/${pid}/runs`, { headers: { Cookie: cookie } })).json() as {
+    const listed = await (await SELF.fetch(`https://noriq.test/api/projects/${pid}/runs`, { headers: { Cookie: cookie } })).json() as {
       runs: Array<{ id: string; tokensUsed: number | null; usdSpent: number | null; logTail: string | null }>;
     };
     const mine = listed.runs.find((r) => r.id === runId);
@@ -212,7 +212,7 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
     ws.send(JSON.stringify({ type: 'hello', protocol: 1, label: 'ws-daemon' }));
     await nextFrame(ws, (m) => m.type === 'registered');
 
-    const disp = await (await SELF.fetch(`https://planar.test/api/projects/${pid}/runs`, {
+    const disp = await (await SELF.fetch(`https://noriq.test/api/projects/${pid}/runs`, {
       method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ runnerId, kind: 'build', agentTool: 'claude', repoRef: 'repo_x', brief: 'phase' }),
     })).json() as { run: { id: string } };
@@ -249,7 +249,7 @@ describe('steering-ack dedups the notices fallback (RUN-7)', () => {
     const A = await createAgent('steer-sender');
     const B = await createAgent('steer-target');
     const mintCookie = await loginSession('agent-mint@example.com', 'longenough1');
-    const p = await SELF.fetch('https://planar.test/api/projects', {
+    const p = await SELF.fetch('https://noriq.test/api/projects', {
       method: 'POST', headers: { Cookie: mintCookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ key: 'STEER', name: 'steer' }),
     });
@@ -259,7 +259,7 @@ describe('steering-ack dedups the notices fallback (RUN-7)', () => {
     await authorizeForAllProjects(A.apiKey, B.apiKey);
 
     // A runner + run owned by the mint user, so the steer-ack (agentAuth) authorizes.
-    const reg = await SELF.fetch('https://planar.test/api/runners', {
+    const reg = await SELF.fetch('https://noriq.test/api/runners', {
       method: 'POST', headers: { Authorization: `Bearer ${A.apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ label: 'steer-daemon' }),
     });
@@ -271,7 +271,7 @@ describe('steering-ack dedups the notices fallback (RUN-7)', () => {
 
     const m1 = (await mcpCall(A.apiKey, 'send_message', { projectId: pid, toAgentId: B.id, body: 'STEER-ONE-acked' })).body;
     // Ack m1 as delivered over the runtime channel → suppress the notices fallback.
-    const ack = await SELF.fetch(`https://planar.test/api/runs/${runId}/steer-ack`, {
+    const ack = await SELF.fetch(`https://noriq.test/api/runs/${runId}/steer-ack`, {
       method: 'POST', headers: { Authorization: `Bearer ${A.apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ messageId: m1.id, agentId: B.id, via: 'runtime' }),
     });
@@ -301,7 +301,7 @@ describe('WS steer → ack → notices dedup (RUN-17)', () => {
     const A = await createAgent('wsteer-sender');
     const B = await createAgent('wsteer-target');
     const mintCookie = await loginSession('agent-mint@example.com', 'longenough1');
-    const p = await SELF.fetch('https://planar.test/api/projects', {
+    const p = await SELF.fetch('https://noriq.test/api/projects', {
       method: 'POST', headers: { Cookie: mintCookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ key: 'WSTR', name: 'wstr' }),
     });
@@ -309,7 +309,7 @@ describe('WS steer → ack → notices dedup (RUN-17)', () => {
     // A and B were minted before this project existed, so their tokens are scoped to nothing
     // for it (RUN-38) — a human would authorize them on the consent page.
     await authorizeForAllProjects(A.apiKey, B.apiKey);
-    const reg = await SELF.fetch('https://planar.test/api/runners', {
+    const reg = await SELF.fetch('https://noriq.test/api/runners', {
       method: 'POST', headers: { Authorization: `Bearer ${A.apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ label: 'wsteer-daemon' }),
     });
@@ -320,7 +320,7 @@ describe('WS steer → ack → notices dedup (RUN-17)', () => {
     ).bind(runId, pid, runnerId, B.id, A.id).run();
 
     // Daemon connects its runner WS.
-    const res = await SELF.fetch(`https://planar.test/ws/runner/${runnerId}`, { headers: { Upgrade: 'websocket', Authorization: `Bearer ${A.apiKey}` } });
+    const res = await SELF.fetch(`https://noriq.test/ws/runner/${runnerId}`, { headers: { Upgrade: 'websocket', Authorization: `Bearer ${A.apiKey}` } });
     const ws = res.webSocket!;
     ws.accept();
     ws.send(JSON.stringify({ type: 'hello', protocol: 1, label: 'wsteer-daemon' }));
@@ -331,7 +331,7 @@ describe('WS steer → ack → notices dedup (RUN-17)', () => {
 
     // Human steers the run via HTTP → server pushes a steer down the socket.
     const steerP = nextFrame(ws, (m) => m.type === 'steer');
-    const steerRes = await SELF.fetch(`https://planar.test/api/runs/${runId}/steer`, {
+    const steerRes = await SELF.fetch(`https://noriq.test/api/runs/${runId}/steer`, {
       method: 'POST', headers: { Cookie: mintCookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ text: 'focus on auth', mode: 'soft', sourceMessageId: src.id }),
     });

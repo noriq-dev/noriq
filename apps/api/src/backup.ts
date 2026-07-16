@@ -4,8 +4,6 @@
 // sqlite_master so the dump follows the live schema (no drift as migrations land).
 import type { Env } from './env';
 
-// Snapshots taken before the PLNR-143 rename carry `planar: 'd1-snapshot'` as the
-// marker key instead — both generations are valid restore sources (see BACKUP.md).
 export type Snapshot = {
   noriq: 'd1-snapshot';
   version: 1;

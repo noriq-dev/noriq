@@ -12,7 +12,7 @@ let groupId: string;
 
 const asJson = { 'Content-Type': 'application/json' };
 const listGroups = async (cookie: string) =>
-  (await (await SELF.fetch('https://planar.test/api/groups', { headers: { Cookie: cookie } })).json() as {
+  (await (await SELF.fetch('https://noriq.test/api/groups', { headers: { Cookie: cookie } })).json() as {
     groups: Array<{ id: string; name: string; canEdit: number }>;
   }).groups;
 
@@ -26,11 +26,11 @@ beforeAll(async () => {
   memberAId = a!.id;
 
   // Admin creates a group and puts Member A in it (Member B stays out).
-  const g = await SELF.fetch('https://planar.test/api/groups', {
+  const g = await SELF.fetch('https://noriq.test/api/groups', {
     method: 'POST', headers: { Cookie: adminCookie, ...asJson }, body: JSON.stringify({ name: 'Env: staging' }),
   });
   groupId = (await g.json() as { id: string }).id;
-  await SELF.fetch(`https://planar.test/api/users/${memberAId}/groups`, {
+  await SELF.fetch(`https://noriq.test/api/users/${memberAId}/groups`, {
     method: 'PUT', headers: { Cookie: adminCookie, ...asJson }, body: JSON.stringify({ groupIds: [groupId] }),
   });
 });
@@ -48,18 +48,18 @@ describe('group authorization (PLNR-81)', () => {
   });
 
   it('a non-member is forbidden from renaming or deleting the group', async () => {
-    const patch = await SELF.fetch(`https://planar.test/api/groups/${groupId}`, {
+    const patch = await SELF.fetch(`https://noriq.test/api/groups/${groupId}`, {
       method: 'PATCH', headers: { Cookie: bCookie, ...asJson }, body: JSON.stringify({ name: 'hijacked' }),
     });
     expect(patch.status).toBe(403);
-    const del = await SELF.fetch(`https://planar.test/api/groups/${groupId}`, { method: 'DELETE', headers: { Cookie: bCookie } });
+    const del = await SELF.fetch(`https://noriq.test/api/groups/${groupId}`, { method: 'DELETE', headers: { Cookie: bCookie } });
     expect(del.status).toBe(403);
     // Untouched.
     expect((await listGroups(aCookie)).find((g) => g.id === groupId)?.name).toBe('Env: staging');
   });
 
   it('a member can rename the group', async () => {
-    const patch = await SELF.fetch(`https://planar.test/api/groups/${groupId}`, {
+    const patch = await SELF.fetch(`https://noriq.test/api/groups/${groupId}`, {
       method: 'PATCH', headers: { Cookie: aCookie, ...asJson }, body: JSON.stringify({ name: 'Env: prod' }),
     });
     expect(patch.status).toBe(200);
@@ -67,12 +67,12 @@ describe('group authorization (PLNR-81)', () => {
   });
 
   it('creating a group makes the creator a member who can then edit it', async () => {
-    const g = await SELF.fetch('https://planar.test/api/groups', {
+    const g = await SELF.fetch('https://noriq.test/api/groups', {
       method: 'POST', headers: { Cookie: bCookie, ...asJson }, body: JSON.stringify({ name: 'B owns this' }),
     });
     const bGroupId = (await g.json() as { id: string }).id;
     expect((await listGroups(bCookie)).some((x) => x.id === bGroupId)).toBe(true); // visible to creator
-    const patch = await SELF.fetch(`https://planar.test/api/groups/${bGroupId}`, {
+    const patch = await SELF.fetch(`https://noriq.test/api/groups/${bGroupId}`, {
       method: 'PATCH', headers: { Cookie: bCookie, ...asJson }, body: JSON.stringify({ description: 'mine' }),
     });
     expect(patch.status).toBe(200);
@@ -80,23 +80,23 @@ describe('group authorization (PLNR-81)', () => {
 
   it('members manage membership themselves; non-members are locked out (PLNR-83)', async () => {
     // Member A views membership and adds Member B to the group.
-    const list = await SELF.fetch(`https://planar.test/api/groups/${groupId}/members`, { headers: { Cookie: aCookie } });
+    const list = await SELF.fetch(`https://noriq.test/api/groups/${groupId}/members`, { headers: { Cookie: aCookie } });
     expect(list.status).toBe(200);
 
     // B (non-member) can't view or add.
-    expect((await SELF.fetch(`https://planar.test/api/groups/${groupId}/members`, { headers: { Cookie: bCookie } })).status).toBe(403);
+    expect((await SELF.fetch(`https://noriq.test/api/groups/${groupId}/members`, { headers: { Cookie: bCookie } })).status).toBe(403);
 
-    const bId = (await (await SELF.fetch('https://planar.test/api/users', { headers: { Cookie: aCookie } })).json() as {
+    const bId = (await (await SELF.fetch('https://noriq.test/api/users', { headers: { Cookie: aCookie } })).json() as {
       users: Array<{ id: string; email: string }>;
     }).users.find((u) => u.email === 'grp-b@example.com')!.id;
-    const add = await SELF.fetch(`https://planar.test/api/groups/${groupId}/members`, {
+    const add = await SELF.fetch(`https://noriq.test/api/groups/${groupId}/members`, {
       method: 'POST', headers: { Cookie: aCookie, ...asJson }, body: JSON.stringify({ userId: bId }),
     });
     expect(add.status).toBe(200);
 
     // B is now a member: sees the group as editable and can remove themself.
     expect((await listGroups(bCookie)).find((g) => g.id === groupId)?.canEdit).toBeTruthy();
-    const remove = await SELF.fetch(`https://planar.test/api/groups/${groupId}/members/${bId}`, {
+    const remove = await SELF.fetch(`https://noriq.test/api/groups/${groupId}/members/${bId}`, {
       method: 'DELETE', headers: { Cookie: bCookie },
     });
     expect(remove.status).toBe(200);
@@ -104,7 +104,7 @@ describe('group authorization (PLNR-81)', () => {
   });
 
   it('an admin can delete any group regardless of membership', async () => {
-    const del = await SELF.fetch(`https://planar.test/api/groups/${groupId}`, { method: 'DELETE', headers: { Cookie: adminCookie } });
+    const del = await SELF.fetch(`https://noriq.test/api/groups/${groupId}`, { method: 'DELETE', headers: { Cookie: adminCookie } });
     expect(del.status).toBe(200);
     expect((await listGroups(adminCookie)).some((g) => g.id === groupId)).toBe(false);
   });
