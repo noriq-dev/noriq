@@ -1199,7 +1199,19 @@ async function resolveRunnerRepos(
       `SELECT p.id AS id FROM projects p
        WHERE p.key = ?2 AND ${USER_PROJECT_WHERE} AND ${tokenProjectWhere('?3')}`,
     ).bind(ownerUserId, key, tokenId).first<{ id: string }>();
-    out.push({ ...r, projectKey: key, projectId: row?.id ?? null });
+    const projectId = row?.id ?? null;
+    // The board lock (RUN-71), resolved the same way the key is: committed NAME → per-server
+    // id, only within the repo's own resolved project. Case-insensitive because the marker is
+    // hand-typed and board names are display strings. No match → null, and the repo stays
+    // fully dispatchable — an unresolved board must not cost more than it locks.
+    let boardId: string | null = null;
+    if (projectId && r.board) {
+      const board = await env.DB.prepare(
+        'SELECT id FROM boards WHERE project_id = ? AND LOWER(name) = LOWER(?)',
+      ).bind(projectId, r.board.trim()).first<{ id: string }>();
+      boardId = board?.id ?? null;
+    }
+    out.push({ ...r, projectKey: key, projectId, board: r.board ?? null, boardId });
   }
   return out;
 }
