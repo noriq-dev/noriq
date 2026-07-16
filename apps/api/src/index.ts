@@ -1511,6 +1511,84 @@ app.get('/api/projects/:pid/runs', userAuth, async (c) => {
   return c.json({ runs });
 });
 
+// --- Plan dispatch (PLNR-170): dispatch a whole PLAN; the server fans out per-task runs ---
+// The dispatch primitive above stays the unit of execution — this creates a durable
+// orchestration record and a pump in the project's room turns ready tasks (dependency edges
+// satisfied) into task-anchored build runs, parallel up to the runner's capacity.
+const PlanDispatchApiBody = z.object({
+  runnerId: z.string(),
+  repoRef: z.string(), // must be one of the runner's advertised repos, resolving to this project
+  agentTool: AgentTool,
+  // Same rules as DispatchBody (RUN-33): model is the vendor's string, effort is our intent.
+  model: z.string().min(1).max(200).nullish(),
+  effort: RunEffort.nullish(),
+  // Applied to EVERY run the dispatch creates (per-run ceilings, not a shared pool).
+  budget: RunBudget.optional(),
+  // 'landed' (default): dependents unblock when the dependency's run lands (verify gate
+  // passed, code on the plan branch) even while its task awaits human review. 'approved':
+  // dependents wait for the human — the strict, slower gate.
+  gate: z.enum(['landed', 'approved']).default('landed'),
+});
+app.post('/api/projects/:pid/plans/:planId/dispatch', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const planId = c.req.param('planId')!;
+  const parsed = PlanDispatchApiBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid plan dispatch', detail: parsed.error.issues }, 400);
+  const b = parsed.data;
+  // Same door checks as a single-run dispatch: your runner, and a repo that resolves HERE.
+  const runner = await c.env.DB.prepare('SELECT repos FROM runners WHERE id = ? AND owner_user_id = ?')
+    .bind(b.runnerId, c.var.user!.id).first<{ repos: string }>();
+  if (!runner) return c.json({ error: 'runner not found' }, 404);
+  const repo = (JSON.parse(runner.repos) as Array<{ id: string; projectId: string | null }>).find((r) => r.id === b.repoRef);
+  if (!repo) return c.json({ error: 'unknown repoRef for this runner' }, 400);
+  if (repo.projectId !== pid) return c.json({ error: 'repo does not resolve to this project' }, 400);
+  try {
+    const dispatch = await room(c.env, pid).createPlanDispatch(pid, humanActor(c), {
+      planId, runnerId: b.runnerId, repoRef: b.repoRef, agentTool: b.agentTool,
+      model: b.model ?? null, effort: b.effort ?? null, budget: b.budget, gate: b.gate,
+    });
+    return c.json({ dispatch });
+  } catch (e) {
+    // The room's refusals (proposed plan, duplicate live dispatch, no open tasks) are the
+    // caller's to fix — surface them as a 409, not a 500.
+    return c.json({ error: e instanceof Error ? e.message : 'plan dispatch failed' }, 409);
+  }
+});
+
+app.get('/api/projects/:pid/plan-dispatches', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const planId = c.req.query('planId') ?? null;
+  const { dispatches } = await room(c.env, pid).listPlanDispatches(pid, planId);
+  return c.json({ dispatches });
+});
+
+app.post('/api/plan-dispatches/:id/cancel', userAuth, async (c) => {
+  const id = c.req.param('id')!;
+  const reason = ((await c.req.json<{ reason?: string }>().catch(() => ({}))) as { reason?: string }).reason ?? null;
+  const row = await c.env.DB.prepare('SELECT project_id AS pid FROM plan_dispatches WHERE id = ?')
+    .bind(id).first<{ pid: string }>();
+  if (!row) return c.json({ error: 'plan dispatch not found' }, 404);
+  if (!(await reachesProject(c, row.pid))) return c.json({ error: 'not found' }, 404);
+  const res = await room(c.env, row.pid).cancelPlanDispatch(row.pid, humanActor(c), id, reason);
+  return c.json(res);
+});
+
+// Re-arm tasks whose only attempts failed and pump again. The pump never retries on its
+// own — a failed agent run is a human's judgment call, and this endpoint is that judgment.
+app.post('/api/plan-dispatches/:id/retry', userAuth, async (c) => {
+  const id = c.req.param('id')!;
+  const row = await c.env.DB.prepare('SELECT project_id AS pid FROM plan_dispatches WHERE id = ?')
+    .bind(id).first<{ pid: string }>();
+  if (!row) return c.json({ error: 'plan dispatch not found' }, 404);
+  if (!(await reachesProject(c, row.pid))) return c.json({ error: 'not found' }, 404);
+  try {
+    const res = await room(c.env, row.pid).retryPlanDispatch(row.pid, humanActor(c), id);
+    return c.json(res);
+  } catch (e) {
+    return c.json({ error: e instanceof Error ? e.message : 'retry failed' }, 409);
+  }
+});
+
 // Cancel a Run (RUN-7): mark it cancelled in its project's authority and push
 // run.cancel down the runner's socket so the daemon SIGTERMs the process.
 app.post('/api/runs/:runId/cancel', userAuth, async (c) => {

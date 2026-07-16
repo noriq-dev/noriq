@@ -79,10 +79,27 @@ export class RunnerHub extends DurableObject<Env> {
         return;
       }
 
-      case 'heartbeat':
+      case 'heartbeat': {
         await this.env.DB.prepare("UPDATE runners SET free_slots = ?, status = 'online', last_heartbeat_at = ? WHERE id = ?")
           .bind(msg.freeSlots, new Date().toISOString(), runnerId).run();
+        // The plan-dispatch reconcile (PLNR-170). A shared runner's slots can free from
+        // ANOTHER project's runs — an event the waiting project's room never hears — so the
+        // periodic heartbeat is the wake-up that closes that gap. Best-effort: the rooms'
+        // pumps are idempotent and the next heartbeat asks again.
+        if (msg.freeSlots > 0) {
+          const { results } = await this.env.DB.prepare(
+            "SELECT DISTINCT project_id AS pid FROM plan_dispatches WHERE runner_id = ? AND status IN ('active','stalled')",
+          ).bind(runnerId).all<{ pid: string }>();
+          for (const r of results) {
+            try {
+              await this.room(r.pid).pumpProjectDispatches(r.pid);
+            } catch (err) {
+              console.warn(`plan dispatch pump via heartbeat failed for ${r.pid}: ${String(err)}`);
+            }
+          }
+        }
         return;
+      }
 
       case 'run.status': {
         // Forward to the owning project's ProjectRoom (the Run authority). The runner
