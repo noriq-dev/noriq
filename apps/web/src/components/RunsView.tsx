@@ -8,6 +8,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api, type ApiRun, type ApiRunner, type DispatchInput, type RunEffort, type RunStatus } from '../api';
 import type { AppStore } from '../store';
+import { Markdown } from './Markdown';
 import { LiveDot, MonoTag, SectionLabel } from './bits';
 import { Button, ErrorNote, Field, Select, TextArea, TextInput } from './ui';
 
@@ -294,15 +295,15 @@ function RunRow({ run, runner, onCancel }: { run: ApiRun; runner: ApiRunner | nu
           )}
         </div>
         {showLog && run.logTail && (
-          <pre
+          <div
             style={{
               margin: '8px 0 2px', padding: '9px 11px', borderRadius: 8, maxHeight: 220, overflow: 'auto',
-              background: 'var(--bg)', border: '1px solid var(--w-07)',
-              fontFamily: 'var(--mono)', fontSize: 10.5, lineHeight: 1.5, color: 'var(--text-soft)', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+              background: 'var(--bg)', border: '1px solid var(--w-07)', fontSize: 11.5, wordBreak: 'break-word',
             }}
           >
-            {run.logTail}
-          </pre>
+            {/* Agent output is markdown prose (PLNR-151) — render it, don't dump it. */}
+            <Markdown source={run.logTail} compact />
+          </div>
         )}
         {terminal && run.exit && (
           <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: st.color, marginTop: 5 }}>

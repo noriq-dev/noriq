@@ -54,7 +54,7 @@ function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
   return { id: e.id, t: timeOf(e.createdAt), actor, actorKind: e.actorKind, verb, subject, taskId, dot };
 }
 
-const VIEWS: ViewId[] = ['home', 'control', 'graph', 'board', 'plans', 'agents', 'runs', 'settings', 'admin'];
+const VIEWS: ViewId[] = ['home', 'control', 'graph', 'board', 'plans', 'review', 'agents', 'runs', 'settings', 'admin'];
 
 function parseUrl(): { pid: string | null; view: ViewId; task: string | null } {
   const m = location.pathname.match(/^\/p\/([^/]+)(?:\/([a-z]+))?/);
@@ -313,6 +313,7 @@ export function useAppStore() {
         ttlMax,
         priority: t.priority,
         estimate: t.estimate,
+        dueAt: t.dueAt,
         deps: depsByTask.get(t.id) ?? [],
         milestoneId: t.milestoneId,
         boardId: t.boardId,

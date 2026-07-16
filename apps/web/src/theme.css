@@ -165,6 +165,34 @@ button { all: unset; box-sizing: border-box; max-width: 100%; }
   .topbar-project { display: none !important; }
 }
 
+/* PLNR-145: second mobile pass — the surfaces added since PLNR-68, plus the classic
+   phone offenders (iOS auto-zoom on focus, cramped tap targets, notch insets). */
+@media (max-width: 860px) {
+  /* iOS Safari zooms the page when a focused input's font-size is < 16px — the single
+     biggest "awful on my phone" cause. Also gives fat-finger-friendly targets. */
+  input, select, textarea { font-size: 16px !important; }
+  button { min-height: 34px; }
+
+  /* Review queue rows: key/title/refs/actions wrap instead of clipping. */
+  .review-row { flex-wrap: wrap; }
+  .review-row > span:nth-child(2) { flex-basis: 100%; white-space: normal !important; }
+
+  /* Bulk-action bar: full-width dock above the thumb, controls wrap. */
+  .bulk-bar {
+    flex-wrap: wrap; justify-content: center;
+    left: 12px !important; right: 12px !important; transform: none !important;
+    width: auto; bottom: calc(10px + env(safe-area-inset-bottom)) !important;
+  }
+
+  /* Respect the notch / home indicator. */
+  .mobile-topbar { padding-top: env(safe-area-inset-top); height: calc(50px + env(safe-area-inset-top)); }
+  .rail { padding-bottom: env(safe-area-inset-bottom); }
+  .task-drawer { padding-bottom: env(safe-area-inset-bottom); }
+
+  /* Kanban columns: slightly narrower so the next column peeks (scroll affordance). */
+  .board-col { width: 258px !important; }
+}
+
 @media (max-width: 480px) {
   /* Two-up form grids stack on small phones. */
   .stack-sm { grid-template-columns: 1fr !important; }

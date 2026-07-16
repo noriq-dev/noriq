@@ -350,6 +350,40 @@ app.get('/api/projects', userAuth, async (c) => {
   return c.json({ projects: results, admin: u.role === 'admin' });
 });
 
+// Cross-project attention inbox (PLNR-121): everything that needs a HUMAN right now —
+// open decisions/alerts plus overdue-and-still-open tasks (PLNR-126) — across every
+// project the user can see, so "what needs me" is one call, not ten open tabs.
+app.get('/api/attention', userAuth, async (c) => {
+  const u = c.var.user!;
+  const [signals, overdue] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT s.id, s.project_id AS projectId, p.key AS projectKey, s.task_id AS taskId,
+              (SELECT key FROM tasks WHERE id = s.task_id) AS taskKey,
+              s.agent_name AS agentName, s.type, s.severity, s.title, s.body, s.options, s.questions, s.created_at AS createdAt
+       FROM signals s JOIN projects p ON p.id = s.project_id AND p.status = 'active'
+       WHERE s.status = 'open' AND ${VISIBILITY_WHERE}
+       ORDER BY CASE WHEN s.type = 'input_request' THEN 0 ELSE 1 END,
+                CASE s.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, s.created_at`,
+    ).bind(u.role, u.id, u.id).all(),
+    c.env.DB.prepare(
+      `SELECT t.id, t.key, t.title, t.due_at AS dueAt, t.status, t.project_id AS projectId, p.key AS projectKey
+       FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
+       WHERE ${VISIBILITY_WHERE}
+         AND t.due_at IS NOT NULL AND t.due_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         AND t.status NOT IN ('done','cancelled') AND t.archived_at IS NULL
+       ORDER BY t.due_at LIMIT 50`,
+    ).bind(u.role, u.id, u.id).all(),
+  ]);
+  return c.json({
+    signals: signals.results.map((s) => ({
+      ...s,
+      options: s.options ? JSON.parse(String(s.options)) : null,
+      questions: s.questions ? JSON.parse(String(s.questions)) : null,
+    })),
+    overdue: overdue.results,
+  });
+});
+
 app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
   const u = c.var.user!;
@@ -368,7 +402,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     // whose work was all done+archived read 0/0 instead of complete. The client hides
     // archived tasks at render; anything that counts uses the full list.
     c.env.DB.prepare(
-      `SELECT id, key, title, body, status, type, priority, estimate, claimed_by AS claimedBy, claim_expires_at AS claimExpiresAt,
+      `SELECT id, key, title, body, status, type, priority, estimate, due_at AS dueAt, claimed_by AS claimedBy, claim_expires_at AS claimExpiresAt,
               parent_task_id AS parentTaskId, milestone_id AS milestoneId, board_id AS boardId, archived_at AS archivedAt,
               open_comments AS openComments, "order"
        FROM tasks WHERE project_id = ? ORDER BY "order"`,
@@ -393,14 +427,14 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     ).bind(pid).all(),
     c.env.DB.prepare('SELECT id, title, due_at AS dueAt, description, "order" FROM milestones WHERE project_id = ? ORDER BY "order"').bind(pid).all(),
     c.env.DB.prepare('SELECT id, name, "order" FROM boards WHERE project_id = ? ORDER BY "order", created_at').bind(pid).all(),
-    c.env.DB.prepare('SELECT id, agent_id AS agentId, title, description, body, status, created_at AS createdAt FROM plans WHERE project_id = ? ORDER BY created_at DESC').bind(pid).all(),
+    c.env.DB.prepare('SELECT id, agent_id AS agentId, title, description, body, status, archived_at AS archivedAt, created_at AS createdAt FROM plans WHERE project_id = ? ORDER BY created_at DESC').bind(pid).all(),
     c.env.DB.prepare('SELECT ph.id, ph.plan_id AS planId, ph.title, ph.body, ph."order" FROM phases ph JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ? ORDER BY ph."order"').bind(pid).all(),
     c.env.DB.prepare('SELECT pt.phase_id AS phaseId, pt.task_id AS taskId FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ?').bind(pid).all(),
     c.env.DB.prepare('SELECT id, name, color, "order" FROM tags WHERE project_id = ? ORDER BY "order"').bind(pid).all(),
     c.env.DB.prepare('SELECT tt.task_id AS taskId, tt.tag_id AS tagId FROM task_tags tt JOIN tasks t ON t.id = tt.task_id WHERE t.project_id = ?').bind(pid).all(),
     c.env.DB.prepare(
       `SELECT s.id, s.task_id AS taskId, t.key AS taskKey, s.agent_id AS agentId, s.agent_name AS agentName,
-              s.type, s.severity, s.title, s.body, s.options, s.created_at AS createdAt
+              s.type, s.severity, s.title, s.body, s.options, s.questions, s.created_at AS createdAt
        FROM signals s LEFT JOIN tasks t ON t.id = s.task_id
        WHERE s.project_id = ? AND s.status = 'open' ORDER BY
          CASE s.type WHEN 'input_request' THEN 0 ELSE 1 END,
@@ -420,7 +454,11 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     phaseTasks: phaseTasks.results,
     tags: tags.results,
     taskTags: taskTags.results,
-    signals: signals.results.map((s) => ({ ...s, options: s.options ? JSON.parse(String(s.options)) : null })),
+    signals: signals.results.map((s) => ({
+      ...s,
+      options: s.options ? JSON.parse(String(s.options)) : null,
+      questions: s.questions ? JSON.parse(String(s.questions)) : null,
+    })),
     events: events.results.map((e) => ({ ...e, payload: JSON.parse(String(e.payload)) })),
   });
 });
@@ -432,7 +470,7 @@ app.get('/api/tasks/search', userAuth, async (c) => {
   const q = c.req.query();
   const { sql, binds } = taskSearchFilters({
     status: q.status, type: q.type, tag: q.tag, milestoneId: q.milestoneId,
-    holder: q.holder, text: q.text, includeArchived: q.includeArchived === '1',
+    holder: q.holder, text: q.text, includeArchived: q.includeArchived === '1', overdue: q.overdue === '1',
   });
   const limit = Math.min(Math.max(parseInt(q.limit ?? '50', 10) || 50, 1), 200);
   const pid = q.projectId ?? null;
@@ -442,7 +480,7 @@ app.get('/api/tasks/search', userAuth, async (c) => {
   const allBinds = [u.role, u.id, u.id, pid, pid, ...binds];
   const [rows, total] = await Promise.all([
     c.env.DB.prepare(
-      `SELECT t.id, t.key, t.title, t.status, t.priority, t.estimate, t.type,
+      `SELECT t.id, t.key, t.title, t.status, t.priority, t.estimate, t.due_at AS dueAt, t.type,
               t.project_id AS projectId, p.key AS projectKey, t.claimed_by AS claimedBy,
               t.milestone_id AS milestoneId, t.open_comments AS openComments, t.updated_at AS updatedAt
        ${base} ORDER BY t.priority DESC, t.updated_at DESC LIMIT ${limit}`,
@@ -520,7 +558,7 @@ app.delete('/api/projects/:pid/boards/:bid', userAuth, async (c) => {
 });
 
 app.post('/api/projects/:pid/tasks', userAuth, async (c) => {
-  const body = await c.req.json<{ title: string; body?: string; parentTaskId?: string; priority?: number; estimate?: number | null; dependsOn?: string[]; boardId?: string | null }>();
+  const body = await c.req.json<{ title: string; body?: string; parentTaskId?: string; priority?: number; estimate?: number | null; dueAt?: string | null; dependsOn?: string[]; boardId?: string | null }>();
   if (!body.title) return c.json({ error: 'title required' }, 400);
   const result = await room(c.env, c.req.param('pid')!).createTask(c.req.param('pid')!, humanActor(c), body);
   return c.json(result);
@@ -595,6 +633,12 @@ app.delete('/api/projects/:pid/tags/:tid', userAuth, async (c) =>
 
 app.delete('/api/projects/:pid/plans/:plid', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).deletePlan(c.req.param('pid')!, humanActor(c), c.req.param('plid')!)));
+
+// Archive / restore a plan (PLNR-148) — display-only; see setPlanArchived.
+app.post('/api/projects/:pid/plans/:plid/archive', userAuth, async (c) =>
+  c.json(await room(c.env, c.req.param('pid')!).setPlanArchived(c.req.param('pid')!, humanActor(c), c.req.param('plid')!, true)));
+app.post('/api/projects/:pid/plans/:plid/restore', userAuth, async (c) =>
+  c.json(await room(c.env, c.req.param('pid')!).setPlanArchived(c.req.param('pid')!, humanActor(c), c.req.param('plid')!, false)));
 
 // The mandatory human gate (RUN-23): approve a proposed plan → its tasks become
 // claimable/dispatchable; reject → discard the proposal (its un-started tasks are

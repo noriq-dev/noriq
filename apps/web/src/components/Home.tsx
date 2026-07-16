@@ -1,9 +1,124 @@
-// Home — the landing view: project directory, MCP connect, quick actions.
-import { useState } from 'react';
+// Home — the landing view: attention inbox, project directory, MCP connect.
+import { useEffect, useState } from 'react';
+import { api } from '../api';
 import type { AppStore } from '../store';
 import type { ProjectVM } from '../types';
-import { LiveDot, SectionLabel } from './bits';
+import { LiveDot, MonoTag, SectionLabel } from './bits';
 import { Button } from './ui';
+import { QuestionForm } from './QuestionForm';
+import { Markdown } from './Markdown';
+
+type Attention = Awaited<ReturnType<typeof api.attention>>;
+
+/** Cross-project "what needs me right now" (PLNR-121): open decisions/alerts with
+ *  inline answer/ack (no tab-hopping), plus overdue-and-open tasks (PLNR-126). */
+function AttentionSection({ store }: { store: AppStore }) {
+  const { actions } = store;
+  const [att, setAtt] = useState<Attention | null>(null);
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const load = () => api.attention().then(setAtt).catch(() => {});
+  useEffect(() => {
+    load();
+    const iv = setInterval(load, 45000);
+    return () => clearInterval(iv);
+  }, []);
+
+  if (!att || (att.signals.length === 0 && att.overdue.length === 0)) return null;
+  const sevColor: Record<string, string> = { critical: 'var(--red-soft)', warning: 'var(--amber)', info: 'var(--blue)' };
+
+  return (
+    <div style={{ marginBottom: 34 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+        <SectionLabel>Needs attention</SectionLabel>
+        <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--amber)' }}>
+          {att.signals.length + att.overdue.length}
+        </span>
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {att.signals.map((s) => {
+          const gate = s.type === 'input_request';
+          const accent = gate ? 'var(--accent)' : sevColor[s.severity] ?? 'var(--blue)';
+          return (
+            <div key={s.id} style={{ border: `1px solid ${accent}44`, borderLeft: `3px solid ${accent}`, borderRadius: 10, background: 'var(--card)', padding: '11px 13px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 5 }}>
+                <MonoTag color={accent} bg={`${accent}1a`} size={9}>{gate ? 'DECISION' : s.severity.toUpperCase()}</MonoTag>
+                <button
+                  onClick={() => actions.selectProject(s.projectId)}
+                  style={{ cursor: 'pointer', background: 'transparent', border: 'none', color: 'var(--text-mid)', fontFamily: 'var(--mono)', fontSize: 10, padding: 0 }}
+                >
+                  {s.projectKey}{s.taskKey ? ` · ${s.taskKey}` : ''}
+                </button>
+                <div style={{ flex: 1 }} />
+                <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>{s.agentName}</span>
+              </div>
+              <div style={{ fontSize: 12.5, fontWeight: 600 }}>{s.title}</div>
+              {s.body && <div style={{ fontSize: 11.5, color: 'var(--text-mid)', marginTop: 4, lineHeight: 1.5 }}><Markdown source={s.body} compact /></div>}
+              {gate && s.questions && s.questions.length > 0 ? (
+                <QuestionForm questions={s.questions} onSubmit={async (r) => { await api.answerSignal(s.projectId, s.id, r); load(); }} />
+              ) : gate ? (
+                <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {s.options && s.options.length > 0 && (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                      {s.options.map((opt) => (
+                        <button
+                          key={opt}
+                          onClick={async () => { await api.answerSignal(s.projectId, s.id, opt); load(); }}
+                          className="hover-bright"
+                          style={{ cursor: 'pointer', fontSize: 11.5, fontWeight: 500, color: 'var(--accent-ink)', background: 'rgba(198,242,78,.08)', border: '1px solid rgba(198,242,78,.35)', borderRadius: 7, padding: '4px 10px' }}
+                        >
+                          {opt}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <input
+                      value={answers[s.id] ?? ''}
+                      onChange={(e) => setAnswers((a) => ({ ...a, [s.id]: e.target.value }))}
+                      onKeyDown={async (e) => {
+                        if (e.key === 'Enter' && (answers[s.id] ?? '').trim()) { await api.answerSignal(s.projectId, s.id, answers[s.id]!); load(); }
+                      }}
+                      placeholder={s.options?.length ? 'or type a decision…' : 'your decision…'}
+                      style={{ flex: 1, minWidth: 0, background: 'var(--w-03)', border: '1px solid var(--w-1)', borderRadius: 7, padding: '5px 9px', color: 'var(--text)', fontSize: 12 }}
+                    />
+                    <button
+                      disabled={!(answers[s.id] ?? '').trim()}
+                      onClick={async () => { await api.answerSignal(s.projectId, s.id, answers[s.id]!); load(); }}
+                      style={{ cursor: (answers[s.id] ?? '').trim() ? 'pointer' : 'default', fontSize: 12, fontWeight: 600, color: '#0a0b0d', background: 'var(--accent)', border: 'none', borderRadius: 7, padding: '5px 12px', opacity: (answers[s.id] ?? '').trim() ? 1 : 0.4 }}
+                    >
+                      Answer
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
+                  <button onClick={async () => { await api.acknowledgeSignal(s.projectId, s.id); load(); }} style={{ cursor: 'pointer', fontSize: 11.5, fontWeight: 500, color: 'var(--text-soft)', background: 'var(--w-04)', border: '1px solid var(--w-1)', borderRadius: 7, padding: '4px 11px' }}>Acknowledge</button>
+                  <button onClick={async () => { await api.acknowledgeSignal(s.projectId, s.id, true); load(); }} style={{ cursor: 'pointer', fontSize: 11, color: 'var(--text-faint)', background: 'transparent', border: 'none', padding: '4px 4px' }}>dismiss</button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {att.overdue.map((t) => (
+          <div
+            key={t.id}
+            onClick={() => actions.selectProject(t.projectId)}
+            className="hover-border"
+            style={{ display: 'flex', alignItems: 'center', gap: 9, border: '1px solid rgba(255,92,92,.25)', borderLeft: '3px solid var(--red-soft)', borderRadius: 10, background: 'var(--card)', padding: '9px 13px', cursor: 'pointer' }}
+          >
+            <MonoTag color="var(--red-soft)" bg="rgba(255,92,92,.12)" size={9}>OVERDUE</MonoTag>
+            <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-mid)' }}>{t.projectKey} · {t.key}</span>
+            <span style={{ fontSize: 12.5, fontWeight: 600, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.title}</span>
+            <div style={{ flex: 1 }} />
+            <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--red-soft)', whiteSpace: 'nowrap' }}>
+              due {new Date(t.dueAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 export function Home({ store }: { store: AppStore }) {
   const { data, groups, actions } = store;
@@ -31,6 +146,8 @@ export function Home({ store }: { store: AppStore }) {
           {data.projects.reduce((n, p) => n + p.openTasks, 0)} open tasks ·{' '}
           {data.projects.filter((p) => p.hasLive).length} with live agents
         </div>
+
+        <AttentionSection store={store} />
 
         {/* projects */}
         <div style={{ display: 'flex', alignItems: 'center', marginBottom: 14 }}>

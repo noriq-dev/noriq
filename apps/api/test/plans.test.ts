@@ -375,4 +375,40 @@ describe('plans & groups', () => {
     expect(foreign.isError).toBe(true);
     expect(foreign.text).toContain('not part of this plan');
   });
+
+  // ---- PLNR-148: plans shelve without losing anything ---------------------------
+  it('archiving hides a plan from get_plans but keeps its edges enforced; restore returns it', async () => {
+    const plan = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId, title: 'Shelvable',
+      phases: [
+        { title: 'A', newTasks: [{ title: 'p148 first' }] },
+        { title: 'B', newTasks: [{ title: 'p148 second' }] },
+      ],
+    });
+    const gated = plan.body.phases[1].taskIds[0];
+
+    const arch = await SELF.fetch(`https://planar.test/api/projects/${projectId}/plans/${plan.body.id}/archive`, {
+      method: 'POST', headers: { Cookie: cookie },
+    });
+    expect(arch.status).toBe(200);
+
+    // Hidden from the agent read…
+    const listed = await mcpCall(planner.apiKey, 'get_plans', { projectId });
+    expect(listed.body.plans.some((p: { id: string }) => p.id === plan.body.id)).toBe(false);
+    // …but the snapshot ships it flagged, and the phase edge still gates.
+    const snap = (await (await SELF.fetch(`https://planar.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json()) as {
+      plans: Array<{ id: string; archivedAt: string | null }>;
+    };
+    expect(snap.plans.find((p) => p.id === plan.body.id)?.archivedAt).toBeTruthy();
+    const stillGated = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: gated });
+    expect(stillGated.isError).toBe(true);
+    expect(stillGated.text).toContain('blocked');
+
+    const rest = await SELF.fetch(`https://planar.test/api/projects/${projectId}/plans/${plan.body.id}/restore`, {
+      method: 'POST', headers: { Cookie: cookie },
+    });
+    expect(rest.status).toBe(200);
+    const back = await mcpCall(planner.apiKey, 'get_plans', { projectId });
+    expect(back.body.plans.some((p: { id: string }) => p.id === plan.body.id)).toBe(true);
+  });
 });

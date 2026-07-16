@@ -131,10 +131,23 @@ export const api = {
   deleteMilestone: (pid: string, mid: string) => req('DELETE', `/api/projects/${pid}/milestones/${mid}`),
   deleteTag: (pid: string, tid: string) => req('DELETE', `/api/projects/${pid}/tags/${tid}`),
   deletePlan: (pid: string, plid: string) => req('DELETE', `/api/projects/${pid}/plans/${plid}`),
+  archivePlan: (pid: string, plid: string) => req('POST', `/api/projects/${pid}/plans/${plid}/archive`),
+  restorePlan: (pid: string, plid: string) => req('POST', `/api/projects/${pid}/plans/${plid}/restore`),
   approvePlan: (pid: string, plid: string) => req<{ id: string; status: string; tasksUngated: number }>('POST', `/api/projects/${pid}/plans/${plid}/approve`),
   rejectPlan: (pid: string, plid: string) => req<{ ok: boolean; cancelledTasks: number }>('POST', `/api/projects/${pid}/plans/${plid}/reject`),
   deleteTask: (pid: string, tid: string) => req('DELETE', `/api/projects/${pid}/tasks/${tid}`),
   deleteProject: (pid: string) => req('DELETE', `/api/projects/${pid}`),
+  /** Cross-project "what needs me" (PLNR-121): open decisions/alerts + overdue tasks. */
+  attention: () =>
+    req<{
+      signals: Array<{
+        id: string; projectId: string; projectKey: string; taskId: string | null; taskKey: string | null;
+        agentName: string; type: 'input_request' | 'alert'; severity: 'info' | 'warning' | 'critical';
+        title: string; body: string | null; options: string[] | null;
+        questions: ApiSignalQuestion[] | null; createdAt: string;
+      }>;
+      overdue: Array<{ id: string; key: string; title: string; dueAt: string; status: string; projectId: string; projectKey: string }>;
+    }>('GET', '/api/attention'),
   answerSignal: (pid: string, sid: string, response: string) =>
     req('POST', `/api/projects/${pid}/signals/${sid}/answer`, { response }),
   acknowledgeSignal: (pid: string, sid: string, dismiss = false) =>
@@ -324,18 +337,26 @@ export interface ApiAgentEvent {
   createdAt: string;
 }
 
+/** One question in a batched input request (PLNR-131). No options = freeform. */
+export interface ApiSignalQuestion {
+  question: string;
+  header?: string;
+  multi?: boolean;
+  options?: string[];
+}
+
 export interface ApiSnapshot {
   project: { id: string; key: string; name: string; description: string; claimTtlSeconds: number };
   tasks: Array<{
     id: string; key: string; title: string; body: string; status: string; type: string; priority: number;
-    estimate: number | null; claimedBy: string | null; claimExpiresAt: string | null; parentTaskId: string | null;
+    estimate: number | null; dueAt: string | null; claimedBy: string | null; claimExpiresAt: string | null; parentTaskId: string | null;
     milestoneId: string | null; boardId: string | null; openComments: number; order: number; archivedAt: string | null;
   }>;
   dependencies: Array<{ taskId: string; dependsOnTaskId: string }>;
   agents: Array<{ id: string; name: string; role: string; status: string; lastSeenAt: string | null; ownerName: string | null; parentAgentId: string | null }>;
   milestones: Array<{ id: string; title: string; dueAt: string | null; order: number }>;
   boards: Array<{ id: string; name: string; order: number }>;
-  plans: Array<{ id: string; agentId: string | null; title: string; description: string; body: string; status: string; createdAt: string }>;
+  plans: Array<{ id: string; agentId: string | null; title: string; description: string; body: string; status: string; archivedAt: string | null; createdAt: string }>;
   phases: Array<{ id: string; planId: string; title: string; body: string; order: number }>;
   phaseTasks: Array<{ phaseId: string; taskId: string }>;
   tags: Array<{ id: string; name: string; color: string; order: number }>;
@@ -347,7 +368,8 @@ export interface ApiSnapshot {
   signals: Array<{
     id: string; taskId: string | null; taskKey: string | null; agentId: string | null; agentName: string;
     type: 'input_request' | 'alert'; severity: 'info' | 'warning' | 'critical';
-    title: string; body: string | null; options: string[] | null; createdAt: string;
+    title: string; body: string | null; options: string[] | null;
+    questions: ApiSignalQuestion[] | null; createdAt: string;
   }>;
 }
 

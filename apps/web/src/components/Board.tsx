@@ -1,5 +1,6 @@
 // Board — kanban with a two-row filter bar (milestones / tags) and breathing room.
 import { useState } from 'react';
+import { api } from '../api';
 import type { AppStore } from '../store';
 import type { TaskStatus } from '../types';
 import { statusMeta } from '../design';
@@ -27,6 +28,16 @@ export function Board({ store }: { store: AppStore }) {
   const [msFilter, setMsFilter] = useState<string | null>(null);
   const [tagFilter, setTagFilter] = useState<string | null>(null);
   const [query, setQuery] = useState('');
+  // Multi-select for bulk triage (PLNR-125): shift/cmd-click gathers cards; a plain
+  // click still opens the drawer, so the two gestures never fight.
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const toggleSelect = (id: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   const tagById = new Map(tags.map((c) => [c.id, c]));
   const msById = new Map(milestones.map((m) => [m.id, m]));
 
@@ -199,6 +210,7 @@ export function Board({ store }: { store: AppStore }) {
                   e.preventDefault();
                   if (draggedId != null) actions.moveTask(draggedId, st);
                 }}
+                className="board-col"
                 style={{ width: 282, flex: 'none', display: 'flex', flexDirection: 'column', minHeight: 0 }}
               >
                 <div style={{ padding: '2px 4px 12px', display: 'flex', alignItems: 'center', gap: 8, flex: 'none' }}>
@@ -225,12 +237,15 @@ export function Board({ store }: { store: AppStore }) {
                           e.dataTransfer.effectAllowed = 'move';
                         }}
                         onDragEnd={() => actions.setDraggedId(null)}
-                        onClick={() => actions.openTask(t.id)}
+                        onClick={(e) => {
+                          if (e.shiftKey || e.metaKey || e.ctrlKey) toggleSelect(t.id);
+                          else actions.openTask(t.id);
+                        }}
                         className="hover-border"
                         style={{
-                          background: 'var(--card)',
-                          border: '1px solid var(--w-06)',
-                          borderLeft: `3px solid ${taskTags[0]?.color ?? 'var(--w-08)'}`,
+                          background: selected.has(t.id) ? 'var(--w-06)' : 'var(--card)',
+                          border: `1px solid ${selected.has(t.id) ? 'var(--accent)' : 'var(--w-06)'}`,
+                          borderLeft: `3px solid ${selected.has(t.id) ? 'var(--accent)' : taskTags[0]?.color ?? 'var(--w-08)'}`,
                           borderRadius: 10,
                           padding: '12px 13px',
                           cursor: 'grab',
@@ -273,6 +288,22 @@ export function Board({ store }: { store: AppStore }) {
                               {t.estimate}pt
                             </span>
                           )}
+                          {t.dueAt && t.status !== 'done' && t.status !== 'cancelled' && (() => {
+                            const overdue = new Date(t.dueAt).getTime() < Date.now();
+                            return (
+                              <span
+                                title={`due ${new Date(t.dueAt).toLocaleString()}`}
+                                style={{
+                                  fontFamily: 'var(--mono)', fontSize: 9, fontWeight: overdue ? 700 : 400,
+                                  color: overdue ? 'var(--red-soft)' : 'var(--text-faint)',
+                                  border: `1px solid ${overdue ? 'rgba(255,92,92,.4)' : 'var(--w-1)'}`,
+                                  padding: '0 5px', borderRadius: 4, whiteSpace: 'nowrap',
+                                }}
+                              >
+                                {overdue ? '⚠ ' : ''}{new Date(t.dueAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                              </span>
+                            );
+                          })()}
                           {t.openComments > 0 && (
                             <MonoTag color="var(--amber)" bg="rgba(245,166,35,.12)" size={9.5}>{t.openComments} ?</MonoTag>
                           )}
@@ -325,6 +356,87 @@ export function Board({ store }: { store: AppStore }) {
           })}
         </div>
       </div>
+
+      {/* Bulk-action bar (PLNR-125): floats only while a selection exists. */}
+      {selected.size > 0 && (
+        <BulkBar
+          count={selected.size}
+          milestones={milestones}
+          boards={boards}
+          onStatus={async (st) => {
+            for (const id of selected) await api.updateTask(currentPid, id, { status: st });
+            setSelected(new Set());
+          }}
+          onMilestone={async (mid) => {
+            for (const id of selected) await api.updateTask(currentPid, id, { milestoneId: mid });
+            setSelected(new Set());
+          }}
+          onBoard={async (bid) => {
+            for (const id of selected) await api.updateTask(currentPid, id, { boardId: bid });
+            setSelected(new Set());
+          }}
+          onAddTag={async () => {
+            const name = window.prompt('Add tag to selected tasks:')?.trim();
+            if (!name) return;
+            // addTags keeps existing tags (PLNR-135) — bulk labelling can't clobber.
+            for (const id of selected) await api.updateTask(currentPid, id, { addTags: [name] });
+            setSelected(new Set());
+          }}
+          onArchive={async () => {
+            if (!confirm(`Archive ${selected.size} task(s)?`)) return;
+            for (const id of selected) await api.archiveTask(currentPid, id).catch(() => {});
+            setSelected(new Set());
+          }}
+          onClear={() => setSelected(new Set())}
+        />
+      )}
+    </div>
+  );
+}
+
+function BulkBar({ count, milestones, boards, onStatus, onMilestone, onBoard, onAddTag, onArchive, onClear }: {
+  count: number;
+  milestones: Array<{ id: string; title: string }>;
+  boards: Array<{ id: string; name: string }>;
+  onStatus: (st: TaskStatus) => void;
+  onMilestone: (mid: string) => void;
+  onBoard: (bid: string) => void;
+  onAddTag: () => void;
+  onArchive: () => void;
+  onClear: () => void;
+}) {
+  const sel: React.CSSProperties = {
+    background: 'var(--w-06)', border: '1px solid var(--w-1)', borderRadius: 7,
+    color: 'var(--text)', fontSize: 11.5, padding: '5px 8px', fontFamily: 'inherit', cursor: 'pointer',
+  };
+  return (
+    <div
+      className="bulk-bar"
+      style={{
+        position: 'absolute', bottom: 18, left: '50%', transform: 'translateX(-50%)',
+        display: 'flex', alignItems: 'center', gap: 9, padding: '9px 14px',
+        background: 'var(--bg-raised)', border: '1px solid var(--w-18)', borderRadius: 12,
+        boxShadow: '0 8px 28px rgba(0,0,0,.45)', zIndex: 40,
+      }}
+    >
+      <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--accent)', fontWeight: 700, whiteSpace: 'nowrap' }}>
+        {count} selected
+      </span>
+      <select style={sel} defaultValue="" onChange={(e) => e.target.value && onStatus(e.target.value as TaskStatus)}>
+        <option value="" disabled>status…</option>
+        {(['todo', 'review', 'done', 'cancelled'] as TaskStatus[]).map((s) => <option key={s} value={s}>{s}</option>)}
+      </select>
+      <select style={sel} defaultValue="" onChange={(e) => e.target.value && onMilestone(e.target.value)}>
+        <option value="" disabled>milestone…</option>
+        {milestones.map((m) => <option key={m.id} value={m.id}>{m.title}</option>)}
+      </select>
+      <select style={sel} defaultValue="" onChange={(e) => e.target.value && onBoard(e.target.value)}>
+        <option value="" disabled>board…</option>
+        {boards.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
+      </select>
+      <button style={{ ...sel }} onClick={onAddTag}>+ tag</button>
+      <button style={{ ...sel, color: 'var(--red-soft)' }} onClick={onArchive}>archive</button>
+      <button style={{ ...sel, color: 'var(--text-dim)', border: 'none', background: 'transparent' }} onClick={onClear}>✕</button>
     </div>
   );
 }

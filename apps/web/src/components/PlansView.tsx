@@ -2,6 +2,7 @@
 // Complexity is progressive: plans are cards with phase progress rails;
 // expanding a plan reveals task chips per phase.
 import { useState } from 'react';
+import { api } from '../api';
 import type { AppStore } from '../store';
 import { statusMeta } from '../design';
 import { AvatarChip, MonoTag, SectionLabel } from './bits';
@@ -11,7 +12,11 @@ import { Markdown } from './Markdown';
 export function PlansView({ store }: { store: AppStore }) {
   const { snapshot, currentPid, helpers, actions } = store;
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const plans = snapshot?.plans ?? [];
+  // Archived plans hide by default (PLNR-148) — a display concern, nothing else changes.
+  const [showArchived, setShowArchived] = useState(false);
+  const allPlans = snapshot?.plans ?? [];
+  const archivedCount = allPlans.filter((p) => p.archivedAt).length;
+  const plans = showArchived ? allPlans : allPlans.filter((p) => !p.archivedAt);
   const phases = snapshot?.phases ?? [];
   const phaseTasks = snapshot?.phaseTasks ?? [];
   // Every task, archived included (PLNR-150). Phase membership comes from phase_tasks,
@@ -21,7 +26,7 @@ export function PlansView({ store }: { store: AppStore }) {
   const tasks = helpers.allTasksOf(currentPid);
   const taskById = new Map(tasks.map((t) => [t.id, t]));
 
-  if (!plans.length) {
+  if (!allPlans.length) {
     return (
       <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 10 }}>
         <SectionLabel>No plans yet</SectionLabel>
@@ -37,6 +42,21 @@ export function PlansView({ store }: { store: AppStore }) {
   return (
     <div style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: '18px 22px' }}>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 14, maxWidth: 980, margin: '0 auto' }}>
+        {archivedCount > 0 && (
+          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+            <button
+              onClick={() => setShowArchived(!showArchived)}
+              style={{
+                cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 10, padding: '4px 10px', borderRadius: 8,
+                color: showArchived ? 'var(--accent-ink)' : 'var(--text-dim)',
+                background: showArchived ? 'rgba(198,242,78,.06)' : 'transparent',
+                border: `1px solid ${showArchived ? 'rgba(198,242,78,.35)' : 'var(--w-1)'}`,
+              }}
+            >
+              {showArchived ? 'hide' : 'show'} archived · {archivedCount}
+            </button>
+          </div>
+        )}
         {plans.map((plan) => {
           const planPhases = phases.filter((ph) => ph.planId === plan.id).sort((a, b) => a.order - b.order);
           const agent = plan.agentId ? helpers.agentById(currentPid, plan.agentId) : null;
@@ -57,6 +77,7 @@ export function PlansView({ store }: { store: AppStore }) {
                 borderRadius: 14,
                 background: proposed ? 'rgba(245,166,35,.05)' : 'var(--w-02)',
                 overflow: 'hidden',
+                opacity: plan.archivedAt ? 0.55 : 1,
               }}
             >
               {/* header */}
@@ -71,6 +92,7 @@ export function PlansView({ store }: { store: AppStore }) {
                   <div style={{ fontSize: 14.5, fontWeight: 600, letterSpacing: '-.01em', display: 'flex', alignItems: 'center', gap: 8 }}>
                     {plan.title}
                     {proposed && <MonoTag color="#f5a623" bg="rgba(245,166,35,.14)" size={9}>PROPOSED</MonoTag>}
+                    {plan.archivedAt && <MonoTag color="var(--text-faint)" bg="var(--w-05)" size={9}>ARCHIVED</MonoTag>}
                   </div>
                   <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {agent ? `planned by ${agent.name}` : 'planned by a human'} · {planPhases.length} phases · {doneCount}/{allTaskIds.length} tasks done
@@ -93,6 +115,19 @@ export function PlansView({ store }: { store: AppStore }) {
                     );
                   })}
                 </div>
+                <button
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    if (plan.archivedAt) await api.restorePlan(currentPid, plan.id);
+                    else await api.archivePlan(currentPid, plan.id);
+                    actions.refreshNow();
+                  }}
+                  title={plan.archivedAt ? 'Restore plan' : 'Archive plan (hides it; everything stays in force)'}
+                  className="drawer-x"
+                  style={{ cursor: 'pointer', color: 'var(--text-dim)', fontSize: 13, width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6, flex: 'none' }}
+                >
+                  {plan.archivedAt ? '↩' : '🗄'}
+                </button>
                 <button
                   onClick={(e) => {
                     e.stopPropagation();

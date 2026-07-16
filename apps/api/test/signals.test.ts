@@ -90,3 +90,55 @@ describe('alerts (non-blocking)', () => {
     expect(snap.signals.find((s) => s.id === a.id)).toBeUndefined();
   });
 });
+
+// ---- PLNR-131: batched, structured input requests ----------------------------------
+describe('multi-question input requests', () => {
+  it('questions ride the signal to every read; the formatted answer reaches the agent', async () => {
+    const { createAgent, mcpCall, authorizeForAllProjects, createUser, loginSession } = await import('./helpers');
+    const agent = await createAgent('batch-asker');
+    const pid = (await mcpCall(agent.apiKey, 'create_project', { key: 'ASKB', name: 'ask-batch' })).body.id;
+    await authorizeForAllProjects(agent.apiKey);
+    const t = (await mcpCall(agent.apiKey, 'create_task', { projectId: pid, title: 'needs decisions' })).body;
+    await mcpCall(agent.apiKey, 'claim_task', { projectId: pid, taskId: t.id });
+
+    const raised = await mcpCall(agent.apiKey, 'request_input', {
+      projectId: pid, taskId: t.id, title: 'Architecture decisions',
+      questions: [
+        { question: 'Which database?', header: 'DB', options: ['sqlite', 'postgres'] },
+        { question: 'Which caches?', multi: true, options: ['redis', 'memcached'] },
+        { question: 'Anything else to consider?' },
+      ],
+    });
+    expect(raised.isError).toBe(false);
+    expect(raised.body.parked).toBe(true);
+
+    await createUser('asker-admin@example.com', 'Asker', 'longenough1', 'admin').catch(() => {});
+    const cookie = await loginSession('asker-admin@example.com', 'longenough1');
+
+    // The batch structure reaches the snapshot (what all three UIs render).
+    const snap = (await (await SELF.fetch(`https://planar.test/api/projects/${pid}/snapshot`, {
+      headers: { Cookie: cookie },
+    })).json()) as { signals: Array<{ id: string; questions: Array<{ question: string; multi?: boolean }> | null }> };
+    const sig = snap.signals.find((x) => x.questions);
+    expect(sig).toBeTruthy();
+    expect(sig!.questions).toHaveLength(3);
+    expect(sig!.questions![1]!.multi).toBe(true);
+
+    // Answer as the UI would: one formatted string for the whole batch.
+    const answer = 'Which database? → postgres\nWhich caches? → redis, other: disk tier\nAnything else to consider? → keep it simple';
+    const res = await SELF.fetch(`https://planar.test/api/projects/${pid}/signals/${sig!.id}/answer`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ response: answer }),
+    });
+    expect(res.status).toBe(200);
+
+    // The agent hears the whole formatted answer and the task is back in the queue.
+    const upd = await mcpCall(agent.apiKey, 'my_updates', {});
+    const notice = upd.body.notices.find((n: string) => n.includes('Architecture decisions'));
+    expect(notice).toBeTruthy();
+    expect(notice).toContain('postgres');
+    expect(notice).toContain('disk tier');
+    const reclaim = await mcpCall(agent.apiKey, 'claim_task', { projectId: pid, taskId: t.id });
+    expect(reclaim.isError).toBe(false);
+  });
+});

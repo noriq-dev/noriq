@@ -542,3 +542,61 @@ describe('list_agents + handoff_task', () => {
     expect(blocked.text).toContain('blocked');
   });
 });
+
+// ---- PLNR-126: task deadlines and the overdue signal --------------------------------
+describe('due dates', () => {
+  it('dueAt round-trips, null clears, and search surfaces only true overdues', async () => {
+    const pid = (await mcpCall(orch.apiKey, 'create_project', { key: 'DUE', name: 'deadlines' })).body.id;
+    const past = '2020-01-01T00:00:00.000Z';
+    const future = '2099-01-01T00:00:00.000Z';
+    const made = (await mcpCall(orch.apiKey, 'create_tasks', {
+      projectId: pid,
+      tasks: [
+        { ref: 'late', title: 'slipped', dueAt: past },
+        { ref: 'fine', title: 'on track', dueAt: future },
+        { ref: 'doneLate', title: 'finished late', dueAt: past },
+        { ref: 'never', title: 'no deadline' },
+      ],
+    })).body.created;
+    const ids = Object.fromEntries(made.map((i: { ref: string; id: string }) => [i.ref, i]));
+    await mcpCall(orch.apiKey, 'update_tasks', { projectId: pid, taskIds: [ids.doneLate.id], set: { status: 'done' } });
+
+    const got = await mcpCall(orch.apiKey, 'get_task', { taskId: ids.late.id });
+    expect(got.body.task.due_at).toBe(past);
+
+    // Overdue = past-due AND still open. Done-late and future and undated all stay out.
+    const overdue = await mcpCall(orch.apiKey, 'search_tasks', { projectId: pid, overdue: true });
+    expect(overdue.body.matched).toBe(1);
+    expect(overdue.body.tasks[0].id).toBe(ids.late.id);
+    expect(overdue.body.tasks[0].dueAt).toBe(past);
+
+    // null clears the deadline.
+    await mcpCall(orch.apiKey, 'update_task', { projectId: pid, taskId: ids.late.id, dueAt: null });
+    const cleared = await mcpCall(orch.apiKey, 'search_tasks', { projectId: pid, overdue: true });
+    expect(cleared.body.matched).toBe(0);
+  });
+});
+
+// ---- PLNR-121: the cross-project attention inbox ------------------------------------
+describe('attention inbox', () => {
+  it('aggregates open signals and overdue tasks across visible projects', async () => {
+    const pid = (await mcpCall(orch.apiKey, 'create_project', { key: 'ATTN', name: 'attention' })).body.id;
+    const t = (await mcpCall(orch.apiKey, 'create_task', { projectId: pid, title: 'stuck work', dueAt: '2020-06-01T00:00:00.000Z' })).body;
+    await mcpCall(orch.apiKey, 'claim_task', { projectId: pid, taskId: t.id });
+    await mcpCall(orch.apiKey, 'request_input', {
+      projectId: pid, taskId: t.id, title: 'Which database?', options: ['sqlite', 'postgres'],
+    });
+
+    const res = await SELF.fetch('https://planar.test/api/attention', { headers: { Cookie: cookie } });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      signals: Array<{ projectKey: string; type: string; title: string; options: string[] | null }>;
+      overdue: Array<{ key: string; projectKey: string }>;
+    };
+    const sig = body.signals.find((s) => s.projectKey === 'ATTN');
+    expect(sig).toBeTruthy();
+    expect(sig!.type).toBe('input_request');
+    expect(sig!.options).toEqual(['sqlite', 'postgres']);
+    expect(body.overdue.some((o) => o.key === t.key && o.projectKey === 'ATTN')).toBe(true);
+  });
+});

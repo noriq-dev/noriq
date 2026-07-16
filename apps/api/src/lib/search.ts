@@ -12,6 +12,8 @@ export interface TaskSearchFilters {
   /** Substring match over title/body/key (LIKE, escaped). */
   text?: string;
   includeArchived?: boolean;
+  /** Past-due and still open (PLNR-126). */
+  overdue?: boolean;
 }
 
 export function taskSearchFilters(f: TaskSearchFilters): { sql: string; binds: unknown[] } {
@@ -34,6 +36,9 @@ export function taskSearchFilters(f: TaskSearchFilters): { sql: string; binds: u
     conds.push("(t.title LIKE ? ESCAPE '\\' OR t.body LIKE ? ESCAPE '\\' OR t.key LIKE ? ESCAPE '\\')");
     const pat = `%${f.text.replace(/[\\%_]/g, (m) => `\\${m}`)}%`;
     binds.push(pat, pat, pat);
+  }
+  if (f.overdue) {
+    conds.push("t.due_at IS NOT NULL AND t.due_at < strftime('%Y-%m-%dT%H:%M:%fZ','now') AND t.status NOT IN ('done','cancelled')");
   }
   if (!f.includeArchived) conds.push('t.archived_at IS NULL');
   return { sql: conds.map((c) => ` AND ${c}`).join(''), binds };

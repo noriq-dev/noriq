@@ -429,6 +429,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       milestoneId: z.string().optional(),
       priority: z.number().int().min(0).max(4).optional(),
       estimate: z.number().int().min(0).optional().describe('Effort estimate in points (team-defined scale)'),
+      dueAt: z.string().datetime().optional().describe('Deadline (ISO datetime) — overdue tasks are surfaced to humans'),
       dependsOn: z.array(z.string()).optional(),
       tags: z.array(z.string()).optional().describe('Tag names — auto-created for the project if new (e.g. ["backend", "auth"])'),
       type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
@@ -447,6 +448,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         boardId: z.string().optional(),
         priority: z.number().int().min(0).max(4).optional(),
         estimate: z.number().int().min(0).optional(),
+        dueAt: z.string().datetime().optional(),
         type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
         tags: z.array(z.string()).optional(),
       }).optional().describe('Shared fields applied to every item unless the item sets its own'),
@@ -457,6 +459,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           body: z.string().optional(),
           priority: z.number().int().min(0).max(4).optional(),
           estimate: z.number().int().min(0).optional(),
+          dueAt: z.string().datetime().optional(),
           milestoneId: z.string().optional(),
           boardId: z.string().optional(),
           type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
@@ -488,6 +491,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
             body: item.body,
             priority: item.priority ?? defaults?.priority,
             estimate: item.estimate ?? defaults?.estimate,
+            dueAt: item.dueAt ?? defaults?.dueAt,
             milestoneId: item.milestoneId ?? defaults?.milestoneId,
             boardId: item.boardId ?? defaults?.boardId,
             type: item.type ?? defaults?.type,
@@ -547,6 +551,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       status: z.enum(['todo', 'in_progress', 'blocked', 'review', 'done', 'cancelled']).optional(),
       priority: z.number().int().min(0).max(4).optional(),
       estimate: z.number().int().min(0).nullable().optional().describe('Effort estimate in points; null clears it'),
+      dueAt: z.string().datetime().nullable().optional().describe('Deadline (ISO datetime); null clears it'),
       milestoneId: z.string().optional(),
       tags: z.array(z.string()).optional().describe('REPLACES the tag set (auto-created; [] clears) — prefer addTags/removeTags for edits'),
       addTags: z.array(z.string()).optional().describe('Add these tags, keeping existing ones (auto-created if new)'),
@@ -569,6 +574,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         status: z.enum(['todo', 'in_progress', 'blocked', 'review', 'done', 'cancelled']).optional(),
         priority: z.number().int().min(0).max(4).optional(),
         estimate: z.number().int().min(0).nullable().optional(),
+        dueAt: z.string().datetime().nullable().optional(),
         milestoneId: z.string().nullable().optional(),
         boardId: z.string().optional(),
         type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
@@ -682,12 +688,13 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       milestoneId: z.string().optional(),
       holder: z.string().optional().describe("'me' (your claims), 'none' (unclaimed), or an agent id"),
       text: z.string().optional().describe('Substring over title/body/key'),
+      overdue: z.boolean().optional().describe('Only past-due, still-open tasks'),
       includeArchived: z.boolean().optional(),
       limit: z.number().int().min(1).max(200).optional().describe('Default 50'),
     },
-    tool(async ({ projectId, status, type, tag, milestoneId, holder, text, includeArchived, limit }) => {
+    tool(async ({ projectId, status, type, tag, milestoneId, holder, text, overdue, includeArchived, limit }) => {
       const { sql, binds } = taskSearchFilters({
-        status, type, tag, milestoneId, text, includeArchived,
+        status, type, tag, milestoneId, text, overdue, includeArchived,
         holder: holder === 'me' ? agent.id : holder,
       });
       // Numbered params first (?1 user, ?2 project-or-null, ?3 token), THEN the filter
@@ -698,7 +705,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       const max = limit ?? 50;
       const [rows, total] = await Promise.all([
         env.DB.prepare(
-          `SELECT t.id, t.key, t.title, t.status, t.priority, t.estimate, t.type,
+          `SELECT t.id, t.key, t.title, t.status, t.priority, t.estimate, t.due_at AS dueAt, t.type,
                   t.project_id AS projectId, p.key AS projectKey, t.claimed_by AS claimedBy,
                   t.milestone_id AS milestoneId, t.open_comments AS openComments, t.updated_at AS updatedAt
            ${base} ORDER BY t.priority DESC, t.updated_at DESC LIMIT ${max}`,
@@ -921,10 +928,18 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       taskId: z.string().optional().describe('The task this decision blocks (auto-parked to blocked). Omit for a standalone question.'),
       title: z.string().min(1).describe('The decision needed, in one line'),
       body: z.string().optional().describe('Context: what you tried, why you are blocked, trade-offs'),
-      options: z.array(z.string()).optional().describe('Discrete choices, if applicable'),
+      options: z.array(z.string()).optional().describe('Discrete choices for a SINGLE simple question — for anything richer use `questions`'),
+      questions: z.array(
+        z.object({
+          question: z.string().min(1).describe('The full question'),
+          header: z.string().max(20).optional().describe('Short chip label, e.g. "Auth method"'),
+          multi: z.boolean().optional().describe('true = the human may pick several options'),
+          options: z.array(z.string()).max(8).optional().describe('Choices; omit for a freeform text answer. The human ALWAYS also gets an "other" free-text escape.'),
+        }),
+      ).min(1).max(4).optional().describe('Batch up to 4 related questions in ONE gate (PLNR-131) — one park + one answer instead of four round-trips. The answer arrives as one formatted string: "Q → choice" per line.'),
     },
-    tool(async ({ projectId, taskId, title, body, options }) =>
-      room(env, projectId).raiseSignal(projectId, actor, { type: 'input_request', taskId: taskId ?? null, title, body, options }),
+    tool(async ({ projectId, taskId, title, body, options, questions }) =>
+      room(env, projectId).raiseSignal(projectId, actor, { type: 'input_request', taskId: taskId ?? null, title, body, options, questions }),
     ),
   );
 
@@ -1028,7 +1043,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     { projectId: z.string() },
     tool(async ({ projectId }) => {
       const { results: plans } = await env.DB.prepare(
-        'SELECT id, agent_id AS agentId, title, description, body, created_at AS createdAt FROM plans WHERE project_id = ? ORDER BY created_at DESC',
+        // Archived plans are shelved, not deleted (PLNR-148) — a worker must not drain one.
+        'SELECT id, agent_id AS agentId, title, description, body, created_at AS createdAt FROM plans WHERE project_id = ? AND archived_at IS NULL ORDER BY created_at DESC',
       ).bind(projectId).all();
       const enriched = [];
       for (const p of plans) {

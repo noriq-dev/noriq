@@ -1,4 +1,6 @@
 // Top bar — project identity, view tabs, live indicator, presence avatars.
+import { useEffect, useState } from 'react';
+import { api } from '../api';
 import type { AppStore } from '../store';
 import type { ViewId } from '../types';
 import { AvatarChip, LiveDot } from './bits';
@@ -8,6 +10,7 @@ const TABS: Array<{ id: ViewId; label: string }> = [
   { id: 'graph', label: 'Orchestration' },
   { id: 'board', label: 'Board' },
   { id: 'plans', label: 'Plans' },
+  { id: 'review', label: 'Review' },
   { id: 'runs', label: 'Runs' },
   { id: 'agents', label: 'Agents' },
 ];
@@ -15,6 +18,15 @@ const TABS: Array<{ id: ViewId; label: string }> = [
 export function TopBar({ store }: { store: AppStore }) {
   const { data, currentPid, view, helpers, actions } = store;
   const project = data.projects.find((p) => p.id === currentPid)!;
+  // Global attention count (PLNR-121) — pending decisions/alerts + overdue, fleet-wide.
+  // The bell is how a supervisor deep in one project hears the OTHER nine.
+  const [attnCount, setAttnCount] = useState(0);
+  useEffect(() => {
+    const load = () => api.attention().then((a) => setAttnCount(a.signals.length + a.overdue.length)).catch(() => {});
+    load();
+    const iv = setInterval(load, 45000);
+    return () => clearInterval(iv);
+  }, []);
   const agents = data.agents[currentPid] ?? [];
   const tasks = helpers.tasksOf(currentPid);
   const activeCount = agents.filter(
@@ -84,26 +96,51 @@ export function TopBar({ store }: { store: AppStore }) {
           marginLeft: 6,
         }}
       >
-        {TABS.map((t) => (
-          <button
-            key={t.id}
-            onClick={() => actions.setView(t.id)}
-            style={{
-              cursor: 'pointer',
-              padding: '5px 12px',
-              borderRadius: 6,
-              fontSize: 12.5,
-              fontWeight: 500,
-              background: view === t.id ? 'var(--w-1)' : 'transparent',
-              color: view === t.id ? 'var(--text)' : 'var(--text-mid)',
-            }}
-          >
-            {t.label}
-          </button>
-        ))}
+        {TABS.map((t) => {
+          // The queue's depth belongs on the tab — review is the human's backlog (PLNR-124).
+          const reviewCount = t.id === 'review' ? tasks.filter((x) => x.status === 'review' && !x.archivedAt).length : 0;
+          return (
+            <button
+              key={t.id}
+              onClick={() => actions.setView(t.id)}
+              style={{
+                cursor: 'pointer',
+                padding: '5px 12px',
+                borderRadius: 6,
+                fontSize: 12.5,
+                fontWeight: 500,
+                display: 'flex', alignItems: 'center', gap: 6,
+                background: view === t.id ? 'var(--w-1)' : 'transparent',
+                color: view === t.id ? 'var(--text)' : 'var(--text-mid)',
+              }}
+            >
+              {t.label}
+              {reviewCount > 0 && (
+                <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, fontWeight: 700, color: 'var(--amber)', background: 'rgba(245,166,35,.14)', padding: '1px 6px', borderRadius: 8 }}>
+                  {reviewCount}
+                </span>
+              )}
+            </button>
+          );
+        })}
       </div>
 
       <div style={{ flex: 1 }} />
+
+      {attnCount > 0 && (
+        <button
+          onClick={() => actions.setView('home')}
+          title={`${attnCount} item(s) need you across all projects — open Home`}
+          style={{
+            cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6,
+            background: 'rgba(245,166,35,.1)', border: '1px solid rgba(245,166,35,.3)',
+            borderRadius: 8, padding: '4px 10px', color: 'var(--amber)',
+            fontFamily: 'var(--mono)', fontSize: 11, fontWeight: 700,
+          }}
+        >
+          🔔 {attnCount}
+        </button>
+      )}
 
       <button
         onClick={() => actions.createTask()}

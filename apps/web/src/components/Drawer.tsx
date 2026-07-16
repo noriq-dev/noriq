@@ -4,6 +4,8 @@ import type { AppStore } from '../store';
 import { api, type ApiAgentEvent } from '../api';
 import { KIND_META, statusMeta, verbColors } from '../design';
 import { AvatarChip, MonoTag, SectionLabel } from './bits';
+import { QuestionForm } from './QuestionForm';
+import { Markdown } from './Markdown';
 import { Composer } from './Composer';
 import { Button, Select, TextArea, TextInput } from './ui';
 
@@ -20,6 +22,7 @@ export function Drawer({ store }: { store: AppStore }) {
   const [eTags, setETags] = useState('');
   const [eMilestone, setEMilestone] = useState('');
   const [eBoard, setEBoard] = useState('');
+  const [eDue, setEDue] = useState(''); // yyyy-mm-dd; '' = no deadline (PLNR-126)
   const [timeline, setTimeline] = useState<ApiAgentEvent[]>([]);
   const [addingTag, setAddingTag] = useState(false);
   const [newTag, setNewTag] = useState('');
@@ -66,6 +69,7 @@ export function Drawer({ store }: { store: AppStore }) {
     setETags(taskTags.map((t) => t.name).join(', '));
     setEMilestone(task.milestoneId ?? '');
     setEBoard(task.boardId ?? '');
+    setEDue(task.dueAt ? task.dueAt.slice(0, 10) : '');
     setEditing(true);
   };
 
@@ -76,6 +80,8 @@ export function Drawer({ store }: { store: AppStore }) {
       type: eType,
       tags: eTags.split(',').map((t) => t.trim()).filter(Boolean),
       milestoneId: eMilestone || null,
+      // End-of-day UTC so "due today" doesn't read overdue at 9am.
+      dueAt: eDue ? `${eDue}T23:59:59.000Z` : null,
       ...(eBoard ? { boardId: eBoard } : {}),
       ...(ePriority > 0 ? { priority: ePriority } : {}),
     });
@@ -109,6 +115,14 @@ export function Drawer({ store }: { store: AppStore }) {
             <MonoTag color={m.color} bg={m.bg} size={10.5}>{m.label}</MonoTag>
             <MonoTag color={task.type === 'bug' ? 'var(--red-soft)' : 'var(--text-mid)'} bg="var(--w-05)" size={10}>{task.type}</MonoTag>
             {milestone && <MonoTag color="var(--text-mid)" bg="var(--w-05)" size={10}>{milestone.title}</MonoTag>}
+            {task.dueAt && (() => {
+              const overdue = new Date(task.dueAt).getTime() < Date.now() && task.status !== 'done' && task.status !== 'cancelled';
+              return (
+                <MonoTag color={overdue ? 'var(--red-soft)' : 'var(--text-mid)'} bg={overdue ? 'rgba(255,92,92,.12)' : 'var(--w-05)'} size={10}>
+                  {overdue ? '⚠ overdue ' : 'due '}{new Date(task.dueAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                </MonoTag>
+              );
+            })()}
             {taskTags.map((t) => (
               <MonoTag key={t.id} color={t.color} bg="var(--w-04)" size={10}>{t.name}</MonoTag>
             ))}
@@ -222,13 +236,24 @@ export function Drawer({ store }: { store: AppStore }) {
                   <option value={1}>P1 · low</option>
                 </Select>
               </div>
-              <div style={{ marginTop: 10 }}>
+              <div style={{ marginTop: 10, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
                 <Select value={eMilestone} onChange={(e) => setEMilestone(e.target.value)}>
                   <option value="">— no milestone —</option>
                   {(snapshot?.milestones ?? []).map((mm) => (
                     <option key={mm.id} value={mm.id}>{mm.title}</option>
                   ))}
                 </Select>
+                <input
+                  type="date"
+                  value={eDue}
+                  onChange={(e) => setEDue(e.target.value)}
+                  title="due date — empty for none"
+                  style={{
+                    background: 'var(--w-04)', border: '1px solid var(--w-1)', borderRadius: 8,
+                    padding: '7px 10px', color: eDue ? 'var(--text)' : 'var(--text-dim)', fontSize: 12.5,
+                    outline: 'none', fontFamily: 'inherit', colorScheme: 'dark',
+                  }}
+                />
               </div>
               {(snapshot?.boards ?? []).length > 1 && (
                 <div style={{ marginTop: 10 }}>
@@ -254,7 +279,7 @@ export function Drawer({ store }: { store: AppStore }) {
               </div>
             </div>
           ) : (
-            <div style={{ fontSize: 13, lineHeight: 1.6, color: '#a9adb4', marginBottom: 18, whiteSpace: 'pre-wrap' }}>{task.body}</div>
+            <div style={{ marginBottom: 18 }}><Markdown source={task.body} /></div>
           )}
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 18 }}>
@@ -371,16 +396,19 @@ export function Drawer({ store }: { store: AppStore }) {
                         <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>{s.agentName}</span>
                       </div>
                       <div style={{ fontSize: 12.5, fontWeight: 600 }}>{s.title}</div>
-                      {s.body && <div style={{ fontSize: 11.5, color: 'var(--text-mid)', marginTop: 3, lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{s.body}</div>}
+                      {s.body && <div style={{ fontSize: 11.5, color: 'var(--text-mid)', marginTop: 3, lineHeight: 1.5 }}><Markdown source={s.body} compact /></div>}
+                      {gate && s.questions && s.questions.length > 0 && (
+                        <QuestionForm questions={s.questions} onSubmit={(r) => actions.answerSignal(s.id, r)} />
+                      )}
                       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
-                        {gate ? (
+                        {gate && !(s.questions && s.questions.length > 0) ? (
                           <>
                             {(s.options ?? []).map((opt) => (
                               <button key={opt} onClick={() => void actions.answerSignal(s.id, opt)} style={{ cursor: 'pointer', fontSize: 11, color: 'var(--accent-ink)', background: 'rgba(198,242,78,.08)', border: '1px solid rgba(198,242,78,.35)', borderRadius: 6, padding: '3px 9px' }}>{opt}</button>
                             ))}
                             <SignalAnswer onAnswer={(v) => void actions.answerSignal(s.id, v)} />
                           </>
-                        ) : (
+                        ) : gate ? null : (
                           <button onClick={() => void actions.acknowledgeSignal(s.id)} style={{ cursor: 'pointer', fontSize: 11, color: 'var(--text-soft)', background: 'var(--w-04)', border: '1px solid var(--w-1)', borderRadius: 6, padding: '3px 10px' }}>Acknowledge</button>
                         )}
                       </div>
@@ -490,10 +518,10 @@ export function Drawer({ store }: { store: AppStore }) {
                         background: c.role === 'agent' ? 'rgba(76,157,255,.06)' : 'var(--w-03)',
                         border: `1px solid ${c.role === 'agent' ? 'rgba(76,157,255,.18)' : 'var(--w-07)'}`,
                         borderRadius: 10, padding: '9px 12px',
-                        whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                        wordBreak: 'break-word',
                       }}
                     >
-                      {c.body}
+                      <Markdown source={c.body} compact />
                     </div>
                   </div>
                 </div>

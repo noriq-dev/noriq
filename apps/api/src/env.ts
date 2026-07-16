@@ -29,4 +29,12 @@ export interface Env {
    * SSRF-guarded). See PLNR-82.
    */
   CIMD_ALLOWED_HOSTS?: string;
+  /** Out-of-band signal delivery (PLNR-120): POST target for blocking input_requests
+   *  and critical alerts (Slack-compatible payload under `text`). Optional. */
+  SIGNAL_WEBHOOK_URL?: string;
+  /** HMAC-SHA256 secret for signing outbound signal webhooks (X-Noriq-Signature). */
+  SIGNAL_WEBHOOK_SECRET?: string;
+  /** Public URL of this instance (e.g. https://plan.example.com) — used for links in
+   *  out-of-band notifications, where no request origin is available. Optional. */
+  PUBLIC_ORIGIN?: string;
 }

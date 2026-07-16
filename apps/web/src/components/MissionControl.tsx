@@ -2,6 +2,8 @@
 import { useLayoutEffect, useRef, useState } from 'react';
 import type { AppStore } from '../store';
 import { agentFg, fmtTtl, initials, isGhostColor, statusMeta, verbColors, YOU_GRADIENT } from '../design';
+import { QuestionForm } from './QuestionForm';
+import { Markdown } from './Markdown';
 import { AvatarChip, MonoTag, SectionLabel, WaveBars } from './bits';
 import { Composer } from './Composer';
 
@@ -180,8 +182,20 @@ function Roster({ store }: { store: AppStore }) {
           const claim = tasks.find((t) => t.claimedBy === a.id && ['in_progress', 'claimed', 'review'].includes(t.status));
           const working = claim?.status === 'in_progress';
           const isOrch = a.role === 'orch';
+          // Derived status (PLNR-121): the states that actually matter beat the naive
+          // last-seen dot — parked on a decision first, then a claim about to lapse.
+          const decision = (store.snapshot?.signals ?? []).find((s) => s.agentId === a.id && s.type === 'input_request');
+          const stalling = !!claim && claim.ttl !== undefined && claim.ttl < 300;
           let statusText: string, statusColor: string, dot: string;
-          if (isOrch) {
+          if (decision) {
+            statusText = `⏸ blocked on decision${decision.taskKey ? ` · ${decision.taskKey}` : ''}`;
+            statusColor = 'var(--amber)';
+            dot = '#f5a623';
+          } else if (stalling) {
+            statusText = `${claim!.key} · claim expiring — stalled?`;
+            statusColor = 'var(--red-soft)';
+            dot = '#ff5c5c';
+          } else if (isOrch) {
             statusText = `decomposing · ${tasks.filter((t) => t.status === 'todo').length} open`;
             statusColor = 'var(--text-mid)';
             dot = '#c6f24e';
@@ -257,9 +271,11 @@ function AttentionInbox({ store }: { store: AppStore }) {
                 <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>{s.agentName}</span>
               </div>
               <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text)', lineHeight: 1.4 }}>{s.title}</div>
-              {s.body && <div style={{ fontSize: 11.5, color: 'var(--text-mid)', marginTop: 4, lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{s.body}</div>}
+              {s.body && <div style={{ fontSize: 11.5, color: 'var(--text-mid)', marginTop: 4, lineHeight: 1.5 }}><Markdown source={s.body} compact /></div>}
 
-              {gate ? (
+              {gate && s.questions && s.questions.length > 0 ? (
+                <QuestionForm questions={s.questions} onSubmit={(r) => actions.answerSignal(s.id, r)} />
+              ) : gate ? (
                 <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
                   {s.options && s.options.length > 0 && (
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
@@ -304,42 +320,49 @@ function AttentionInbox({ store }: { store: AppStore }) {
 const STICK_THRESHOLD = 60;
 
 function EventFeed({ store }: { store: AppStore }) {
-  const { data, currentPid, helpers, actions, selectedTaskId } = store;
+  const { data, currentPid, actions } = store;
+  // Direction toggle (PLNR-149): 'bottom' = chat-style (oldest top, newest arriving at
+  // the bottom — the default); 'top' = classic activity feed (newest first). Sticky per
+  // browser via localStorage (infra key stays planar.*, see CLAUDE.md naming).
+  const [dir, setDir] = useState<'bottom' | 'top'>(
+    () => (localStorage.getItem('planar.feedDir') === 'top' ? 'top' : 'bottom'),
+  );
+  const flip = () => {
+    const next = dir === 'bottom' ? 'top' : 'bottom';
+    setDir(next);
+    localStorage.setItem('planar.feedDir', next);
+  };
   // The store keeps events newest-first (Graph and the agent detail rely on that).
-  // The feed reads chat-style instead: oldest at the top, newest arriving at the bottom.
-  const events = [...(data.events[currentPid] ?? [])].reverse();
-  const tasks = helpers.tasksOf(currentPid);
-  const selTask = selectedTaskId != null ? tasks.find((t) => t.id === selectedTaskId) : null;
-  const holderName = selTask?.claimedBy ? helpers.agentById(currentPid, selTask.claimedBy)?.name : null;
+  const events = dir === 'bottom' ? [...(data.events[currentPid] ?? [])].reverse() : data.events[currentPid] ?? [];
 
   const scrollRef = useRef<HTMLDivElement>(null);
   // Track whether the user is pinned to the bottom, so incoming events don't yank
-  // the viewport while they're reading back through history.
+  // the viewport while they're reading back through history. (Bottom mode only —
+  // newest-first mode reads from the top and never needs to follow.)
   const stuckToBottom = useRef(true);
-  const newestId = events[events.length - 1]?.id ?? null;
+  const newestId = dir === 'bottom' ? events[events.length - 1]?.id ?? null : null;
 
   const onScroll = () => {
     const el = scrollRef.current;
-    if (!el) return;
+    if (!el || dir !== 'bottom') return;
     stuckToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight <= STICK_THRESHOLD;
   };
 
-  // Jump (no animation) to the bottom when the project changes — a fresh feed
-  // should open at the newest event, not mid-history.
+  // Jump (no animation) to the newest end when the project or direction changes.
   useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     stuckToBottom.current = true;
-    el.scrollTop = el.scrollHeight;
-  }, [currentPid]);
+    el.scrollTop = dir === 'bottom' ? el.scrollHeight : 0;
+  }, [currentPid, dir]);
 
   // Follow new events only while pinned to the bottom. Layout effect so the feed
   // lands at the newest row before paint instead of visibly jumping after it.
   useLayoutEffect(() => {
     const el = scrollRef.current;
-    if (!el || !stuckToBottom.current) return;
+    if (!el || dir !== 'bottom' || !stuckToBottom.current) return;
     el.scrollTop = el.scrollHeight;
-  }, [newestId]);
+  }, [newestId, dir]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, minWidth: 0, borderRight: '1px solid var(--line)' }}>
@@ -358,6 +381,16 @@ function EventFeed({ store }: { store: AppStore }) {
           <span style={{ position: 'absolute', inset: 0, borderRadius: '50%', background: 'var(--accent)', animation: 'pl-blink 1.4s infinite' }} />
         </span>
         <div style={{ flex: 1 }} />
+        <button
+          onClick={flip}
+          title={dir === 'bottom' ? 'newest at the bottom (chat) — click for newest first' : 'newest first — click for chat style'}
+          style={{
+            cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)',
+            background: 'var(--w-04)', border: '1px solid var(--w-08)', borderRadius: 6, padding: '2px 8px',
+          }}
+        >
+          {dir === 'bottom' ? '↓ newest last' : '↑ newest first'}
+        </button>
         <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>
           append-only · {1200 + events.length}
         </span>
@@ -418,19 +451,6 @@ function EventFeed({ store }: { store: AppStore }) {
             </div>
           );
         })}
-      </div>
-      <div
-        style={{
-          borderTop: '1px solid var(--line)',
-          padding: '12px 20px',
-          display: 'flex',
-          alignItems: 'center',
-          gap: 10,
-          background: 'var(--bg-raised)',
-          flex: 'none',
-        }}
-      >
-        <Composer store={store} placeholder={selTask ? `Steer ${holderName ?? 'the agent'}…` : 'Broadcast to all agents — anyone picks it up…'} />
       </div>
     </div>
   );

@@ -2,6 +2,7 @@ import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../env';
 import { newId, nowIso } from '../lib/util';
 import { userCanAccessProject } from '../lib/visibility';
+import { needsOutOfBand, sendSignalEmail, sendSignalWebhook } from '../lib/notify-out';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
 import { RunKind, AgentTool, RunStatus, type RunPhase, isTerminalRunStatus } from '@noriq-dev/shared';
 
@@ -30,6 +31,8 @@ export interface CreateTaskInput {
   milestoneId?: string | null;
   priority?: number;
   estimate?: number | null;
+  /** Deadline, ISO datetime (PLNR-126). */
+  dueAt?: string | null;
   dependsOn?: string[];
   /** Tags by name — auto-created for the project if they don't exist. */
   tags?: string[];
@@ -46,6 +49,7 @@ export interface TaskPatch {
   status?: string;
   priority?: number;
   estimate?: number | null;
+  dueAt?: string | null;
   milestoneId?: string | null;
   boardId?: string | null;
   /** Re-parent the task (PLNR-89); null detaches it to a root. Accepts an id or key. */
@@ -360,9 +364,9 @@ export class ProjectRoom extends DurableObject<Env> {
       const boardId = input.boardId ?? (await this.defaultBoardId(pid));
       const stmts = [
         this.env.DB.prepare(
-          `INSERT INTO tasks (id, project_id, key, milestone_id, board_id, parent_task_id, title, body, status, type, priority, estimate, "order", created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)`,
-        ).bind(id, pid, key, input.milestoneId ?? null, boardId, input.parentTaskId ?? null, input.title, input.body ?? '', input.type ?? 'feature', input.priority ?? 2, input.estimate ?? null, proj.n, now, now),
+          `INSERT INTO tasks (id, project_id, key, milestone_id, board_id, parent_task_id, title, body, status, type, priority, estimate, due_at, "order", created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?)`,
+        ).bind(id, pid, key, input.milestoneId ?? null, boardId, input.parentTaskId ?? null, input.title, input.body ?? '', input.type ?? 'feature', input.priority ?? 2, input.estimate ?? null, input.dueAt ?? null, proj.n, now, now),
         this.env.DB.prepare('UPDATE projects SET next_task_number = ? WHERE id = ?').bind(proj.n + 1, pid),
       ];
       for (const dep of input.dependsOn ?? []) {
@@ -426,7 +430,7 @@ export class ProjectRoom extends DurableObject<Env> {
       const binds: unknown[] = [];
       const fields: Array<[keyof TaskPatch, string]> = [
         ['title', 'title'], ['body', 'body'], ['priority', 'priority'], ['type', 'type'],
-        ['estimate', 'estimate'], ['milestoneId', 'milestone_id'], ['boardId', 'board_id'], ['order', '"order"'],
+        ['estimate', 'estimate'], ['dueAt', 'due_at'], ['milestoneId', 'milestone_id'], ['boardId', 'board_id'], ['order', '"order"'],
       ];
       for (const [k, col] of fields) {
         if (patch[k] !== undefined) {
@@ -709,7 +713,12 @@ export class ProjectRoom extends DurableObject<Env> {
   async raiseSignal(
     projectId: string,
     actor: Actor,
-    input: { type: 'input_request' | 'alert'; taskId?: string | null; title: string; body?: string; options?: string[]; severity?: string },
+    input: {
+      type: 'input_request' | 'alert'; taskId?: string | null; title: string; body?: string;
+      options?: string[]; severity?: string;
+      /** Batched questions (PLNR-131) — structure for the UI; the answer comes back as one formatted string. */
+      questions?: Array<{ question: string; header?: string; multi?: boolean; options?: string[] }>;
+    },
   )  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
@@ -717,12 +726,13 @@ export class ProjectRoom extends DurableObject<Env> {
       const id = newId('sig');
       const severity = input.type === 'input_request' ? 'info' : (input.severity ?? 'info');
       await this.env.DB.prepare(
-        `INSERT INTO signals (id, project_id, task_id, agent_id, agent_name, type, severity, title, body, options, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)`,
+        `INSERT INTO signals (id, project_id, task_id, agent_id, agent_name, type, severity, title, body, options, questions, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)`,
       ).bind(
         id, this.projectId, task?.id ?? null, actor.kind === 'agent' ? actor.id : null, actor.name,
         input.type, severity, input.title, input.body ?? null,
-        input.options && input.options.length ? JSON.stringify(input.options) : null, nowIso(),
+        input.options && input.options.length ? JSON.stringify(input.options) : null,
+        input.questions && input.questions.length ? JSON.stringify(input.questions) : null, nowIso(),
       ).run();
 
       let parked = false;
@@ -737,6 +747,23 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.emit(actor, 'signal.raised', task ? 'task' : 'project', task?.id ?? this.projectId, {
         signalId: id, sigType: input.type, severity, title: input.title, taskKey: task?.key ?? null, parked,
       });
+      // Out-of-band delivery (PLNR-120): a blocking decision or a critical alert must
+      // reach the supervisor even with no tab open. Best-effort — a notification
+      // failure never fails the signal.
+      if (needsOutOfBand(input.type, severity)) {
+        const owner = await this.env.DB.prepare(
+          'SELECT u.email, p.key AS projectKey FROM projects p LEFT JOIN users u ON u.id = p.owner_user_id WHERE p.id = ?',
+        ).bind(this.projectId).first<{ email: string | null; projectKey: string }>();
+        const n = {
+          projectId: this.projectId, projectKey: owner?.projectKey ?? '', type: input.type, severity,
+          title: input.title, body: input.body ?? null, taskKey: task?.key ?? null,
+          agentName: actor.name, options: input.options ?? null,
+        };
+        await Promise.all([
+          owner?.email ? sendSignalEmail(this.env, owner.email, n) : Promise.resolve(false),
+          sendSignalWebhook(this.env, n),
+        ]).catch(() => {});
+      }
       // Mirror to the Run (RUN-18): if this input_request comes from a spawned agent
       // driving a running Run, park the Run → blocked so the dashboard shows "waiting
       // on you", not a hung run. (Raw UPDATE, not transitionRun, to avoid nesting
@@ -1205,6 +1232,22 @@ export class ProjectRoom extends DurableObject<Env> {
       const task = await this.getTask(taskId);
       await this.emit(actor, 'task.moved_in', 'task', task.id, { key: task.key, title: task.title });
       return { ok: true };
+    });
+  }
+
+  /** Archive / restore a plan (PLNR-148) — display-only, mirroring task archive:
+   *  everything (phases, membership, minted edges, gating) stays in force; the default
+   *  Plans listing just hides it. Restore brings it back. */
+  async setPlanArchived(projectId: string, actor: Actor, planId: string, archived: boolean) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const plan = await this.env.DB.prepare('SELECT id, title FROM plans WHERE id = ? AND project_id = ?')
+        .bind(planId, projectId).first<{ id: string; title: string }>();
+      if (!plan) throw new Error('plan not found');
+      await this.env.DB.prepare('UPDATE plans SET archived_at = ? WHERE id = ?')
+        .bind(archived ? nowIso() : null, planId).run();
+      await this.emit(actor, archived ? 'plan.archived' : 'plan.restored', 'plan', planId, { title: plan.title });
+      return { ok: true, archived };
     });
   }
 

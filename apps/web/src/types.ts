@@ -59,6 +59,7 @@ export interface TaskVM {
   ttlMax?: number;
   priority: number;
   estimate: number | null;
+  dueAt: string | null;
   deps: string[];
   milestoneId: string | null;
   boardId: string | null;
@@ -81,7 +82,7 @@ export interface EventVM {
   dot?: string;
 }
 
-export type ViewId = 'home' | 'control' | 'graph' | 'board' | 'plans' | 'agents' | 'runs' | 'settings' | 'admin';
+export type ViewId = 'home' | 'control' | 'graph' | 'board' | 'plans' | 'review' | 'agents' | 'runs' | 'settings' | 'admin';
 
 export interface BoardVM {
   id: string;
