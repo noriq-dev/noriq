@@ -48,10 +48,12 @@ beforeAll(async () => {
   // 0026 it is a genuinely distinct KIND of actor: runner-spawned, so it must carry both a
   // runner and a project or the schema rejects the row outright. api_key_hash is gone (it
   // was vestigial NOT NULL filler left over from the retired static-key era).
-  await env.DB.prepare(
-    `INSERT OR IGNORE INTO agents (id, name, kind, runner_id, project_id)
-     VALUES ('agt_spawned', 'agt_spawned', 'agent', 'rnr_1', ?)`,
-  ).bind(pid).run();
+  for (const a of ['agt_spawned', 'agt_spawned_late', 'agt_x']) {
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO agents (id, name, kind, runner_id, project_id)
+       VALUES (?, ?, 'agent', 'rnr_1', ?)`,
+    ).bind(a, a, pid).run();
+  }
 }, 60000);
 
 describe('run lifecycle in ProjectRoom (RUN-6)', () => {
@@ -98,6 +100,49 @@ describe('run lifecycle in ProjectRoom (RUN-6)', () => {
     // sticky: a later transition that omits it keeps the path
     const done = await room(pid).transitionRun(pid, actor, run.id, { status: 'done' });
     expect(done.worktreePath).toBe('/home/mtuska/.noriq/worktrees/repo-run_1');
+  });
+
+  it('a SAME-status report is a patch, not a transition (RUN-45)', async () => {
+    // The daemon reports {status:'running', agentId} right after creating the run's agent
+    // (RUN-43) — running→running has no edge in the map, so this frame was rejected and the
+    // forwarder swallowed the throw. agent_id only survived because a REST call also wrote it;
+    // worktreePath from the same frame was silently dropped.
+    const run = await room(pid).createRun(pid, actor, { kind: 'build', repoRef: 'r', agentTool: 'claude', runnerId: 'rnr_1' });
+    await room(pid).transitionRun(pid, actor, run.id, { status: 'running' });
+
+    const patched = await room(pid).transitionRun(pid, actor, run.id, {
+      status: 'running', // same status — a patch
+      agentId: 'agt_spawned_late',
+      worktreePath: '/wt/run_x',
+    });
+    expect(patched.status).toBe('running');
+    expect(patched.agentId).toBe('agt_spawned_late');
+    expect(patched.worktreePath).toBe('/wt/run_x');
+  });
+
+  it('a same-status patch never touches exit or startedAt', async () => {
+    const run = await room(pid).createRun(pid, actor, { kind: 'build', repoRef: 'r', agentTool: 'claude', runnerId: 'rnr_1' });
+    const running = await room(pid).transitionRun(pid, actor, run.id, { status: 'running' });
+    const started = running.startedAt;
+
+    const patched = await room(pid).transitionRun(pid, actor, run.id, { status: 'running', agentId: 'agt_x' });
+    expect(patched.startedAt).toBe(started); // not re-stamped
+    expect(patched.exit).toBeNull(); // a patch cannot synthesize an exit
+
+    // Terminal same-status is a no-op patch too — a daemon retry of `done` must not rewrite
+    // the exit the first report synthesized.
+    const done = await room(pid).transitionRun(pid, actor, run.id, { status: 'done', reason: 'first' });
+    const retried = await room(pid).transitionRun(pid, actor, run.id, { status: 'done', reason: 'second' });
+    expect(retried.exit!.reason).toBe(done.exit!.reason);
+  });
+
+  it('a same-status patch appends no run.status_changed event — from===to is not a transition', async () => {
+    const run = await room(pid).createRun(pid, actor, { kind: 'build', repoRef: 'r', agentTool: 'claude', runnerId: 'rnr_1' });
+    await room(pid).transitionRun(pid, actor, run.id, { status: 'running' });
+    const before = (await runEvents(pid)).filter((e) => e.verb === 'run.status_changed').length;
+    await room(pid).transitionRun(pid, actor, run.id, { status: 'running', agentId: 'agt_x' });
+    const after = (await runEvents(pid)).filter((e) => e.verb === 'run.status_changed').length;
+    expect(after).toBe(before);
   });
 
   it('rejects an illegal transition (queued → done)', async () => {

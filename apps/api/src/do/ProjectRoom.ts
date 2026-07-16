@@ -1561,12 +1561,30 @@ export class ProjectRoom extends DurableObject<Env> {
     }
   }
 
-  /** Advance a Run's status (running/blocked/terminal). Enforces the transition map. */
+  /** Advance a Run's status (running/blocked/terminal). Enforces the transition map.
+   *
+   * A SAME-status report is a PATCH, not a transition (RUN-45). The daemon reports
+   * `{status:'running', agentId}` right after it creates the run's agent (RUN-43), and the
+   * transition map — correctly — has no running→running edge, so for months that frame was
+   * rejected here and swallowed by the forwarder: agent_id only survived because a REST call
+   * also wrote it, worktreePath was silently dropped, and the next field someone added would
+   * have joined it. A patch applies the identifying fields and appends no event: from===to is
+   * not a transition, and `exit`/`started_at` stay owned by real transitions.
+   */
   async transitionRun(projectId: string, actor: Actor, runId: string, patch: RunPatch): Promise<RunView> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const run = await this.loadRun(runId);
       const to = RunStatus.parse(patch.status);
+      if (to === run.status) {
+        const agentId = patch.agentId !== undefined ? patch.agentId : run.agent_id;
+        const worktreePath = patch.worktreePath !== undefined ? patch.worktreePath : run.worktree_path;
+        // Phase deliberately untouched: it rides the telemetry frame (RUN-31), and letting the
+        // patch lane also write it would recreate the two-writers race that frame exists to avoid.
+        await this.env.DB.prepare('UPDATE runs SET agent_id = ?, worktree_path = ?, updated_at = ? WHERE id = ?')
+          .bind(agentId, worktreePath, nowIso(), runId).run();
+        return this.runToWire(await this.loadRun(runId));
+      }
       if (!RUN_TRANSITIONS[run.status]?.includes(to)) {
         throw new Error(`illegal run transition ${run.status} -> ${to}`);
       }

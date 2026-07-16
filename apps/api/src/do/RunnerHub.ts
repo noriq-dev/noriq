@@ -97,7 +97,12 @@ export class RunnerHub extends DurableObject<Env> {
             exit: msg.exit ?? undefined,
             worktreePath: msg.worktreePath ?? undefined,
           });
-        } catch { /* illegal transition — ignore; the DO is authoritative */ }
+        } catch (err) {
+          // The DO is authoritative, so a rejected frame is dropped — but LOUDLY (RUN-45): this
+          // exact catch silently ate every same-status report for the whole life of RUN-43,
+          // which is how a dead frame kept looking load-bearing.
+          console.warn(`run.status rejected for ${msg.runId}: ${String(err)}`);
+        }
         return;
       }
 
