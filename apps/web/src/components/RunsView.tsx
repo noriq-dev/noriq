@@ -352,9 +352,13 @@ function DispatchForm({
   const repos = runner.repos.filter((r) => r.projectId === pid);
   const kinds = KINDS.filter((k) => runner.capabilities.kinds.includes(k));
   const tools = runner.capabilities.tools;
-  const tasks = store.helpers.tasksOf(pid);
 
   const [repoRef, setRepoRef] = useState(repos[0]?.id ?? '');
+  // The board lock (RUN-71): a locked repo's anchor list shows its own board's tasks —
+  // anchoring it to work that lives elsewhere is almost always a mis-click, and the lock
+  // exists precisely so this repo's work stays on its board.
+  const lockedBoard = repos.find((r) => r.id === repoRef)?.boardId ?? null;
+  const tasks = store.helpers.tasksOf(pid).filter((t) => !lockedBoard || t.boardId === lockedBoard);
   const [kind, setKind] = useState<ApiRun['kind']>(kinds[0] ?? 'build');
   const [agentTool, setAgentTool] = useState(tools[0] ?? '');
   const [brief, setBrief] = useState('');
@@ -412,7 +416,9 @@ function DispatchForm({
         <Field label="repo">
           <Select value={repoRef} onChange={(e) => setRepoRef(e.target.value)}>
             {repos.map((r) => (
-              <option key={r.id} value={r.id}>{r.name || r.projectKey}{r.defaultBranch ? ` (${r.defaultBranch})` : ''}</option>
+              <option key={r.id} value={r.id}>
+                {r.name || r.projectKey}{r.defaultBranch ? ` (${r.defaultBranch})` : ''}{r.board ? ` · board ${r.board}` : ''}
+              </option>
             ))}
           </Select>
         </Field>

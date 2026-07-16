@@ -423,8 +423,14 @@ export class ProjectRoom extends DurableObject<Env> {
       const id = newId('task');
       const key = `${proj.key}-${proj.n}`;
       const now = nowIso();
-      // Every task lands on a board; fall back to the project's default board.
-      const boardId = input.boardId ?? (await this.defaultBoardId(pid));
+      // Every task lands on a board; fall back to the creating agent's repo board lock
+      // (RUN-71), then the project's default board. The lock is consulted HERE — the one
+      // seam every creation path funnels through (create_task, create_plan's newTasks,
+      // decompose_task) — and only for run-spawned agents: a copilot or human has no run
+      // bound, so the lookup finds nothing and behavior is unchanged. A DEFAULT, not a
+      // fence: an explicit boardId still wins, because the lock is about where a repo's
+      // work lands uninstructed, not about forbidding instruction.
+      const boardId = input.boardId ?? (await this.actorRepoBoardId(actor)) ?? (await this.defaultBoardId(pid));
       const stmts = [
         this.env.DB.prepare(
           `INSERT INTO tasks (id, project_id, key, milestone_id, board_id, parent_task_id, title, body, status, type, priority, estimate, due_at, "order", created_at, updated_at)
@@ -1067,6 +1073,32 @@ export class ProjectRoom extends DurableObject<Env> {
       'SELECT id FROM boards WHERE project_id = ? ORDER BY "order", created_at LIMIT 1',
     ).bind(projectId).first<{ id: string }>();
     return row?.id ?? null;
+  }
+
+  /** The board lock of the actor's repo (RUN-71): if this actor is a run-spawned agent with a
+   *  live run, and that run's repo carries a resolved boardId, tasks it creates land there.
+   *  The repo binding lives in the runner's advertised repos JSON — one row, parsed here, only
+   *  on the create path of an agent actor, so nothing hot pays for it. Any miss (no run, no
+   *  runner row, repo gone from the advertisement, no lock) falls through to null. */
+  private async actorRepoBoardId(actor: Actor): Promise<string | null> {
+    if (actor.kind !== 'agent') return null;
+    const run = await this.env.DB.prepare(
+      `SELECT repo_ref AS repoRef, runner_id AS runnerId FROM runs
+       WHERE agent_id = ? AND status IN ('dispatched','running','blocked') LIMIT 1`,
+    ).bind(actor.id).first<{ repoRef: string; runnerId: string | null }>();
+    if (!run?.runnerId) return null;
+    const runner = await this.env.DB.prepare('SELECT repos FROM runners WHERE id = ?')
+      .bind(run.runnerId).first<{ repos: string }>();
+    if (!runner) return null;
+    try {
+      const repo = (JSON.parse(runner.repos) as Array<{ id: string; projectId: string | null; boardId?: string | null }>)
+        .find((r) => r.id === run.repoRef);
+      // The lock only binds within its own resolved project — a repo must never steer
+      // task placement in a project it doesn't belong to.
+      return repo && repo.projectId === this.projectId ? (repo.boardId ?? null) : null;
+    } catch {
+      return null; // malformed advertisement — behave as unlocked
+    }
   }
 
   async createBoard(projectId: string, actor: Actor, name: string)  {

@@ -210,6 +210,10 @@ export interface ApiRunnerRepo {
   id: string;
   projectKey: string;
   projectId: string | null;
+  /** The board lock (RUN-71): committed name from the marker + its per-server resolution.
+   *  boardId null while board is set = the name didn't resolve here (worth surfacing). */
+  board: string | null;
+  boardId: string | null;
   name: string;
   defaultBranch: string | null;
 }
