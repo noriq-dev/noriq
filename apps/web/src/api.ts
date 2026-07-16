@@ -193,6 +193,15 @@ export const api = {
   runs: (pid: string) => req<{ runs: ApiRun[] }>('GET', `/api/projects/${pid}/runs`),
   dispatchRun: (pid: string, body: DispatchInput) => req<{ run: ApiRun; delivered: boolean }>('POST', `/api/projects/${pid}/runs`, body),
   cancelRun: (runId: string, reason?: string) => req<{ run: ApiRun }>('POST', `/api/runs/${runId}/cancel`, { reason }),
+
+  // --- plan dispatch (PLNR-170): dispatch a whole plan; the server fans out per-task runs ---
+  planDispatches: (pid: string, planId?: string) =>
+    req<{ dispatches: ApiPlanDispatch[] }>('GET', `/api/projects/${pid}/plan-dispatches${planId ? `?planId=${planId}` : ''}`),
+  dispatchPlan: (pid: string, planId: string, body: PlanDispatchInput) =>
+    req<{ dispatch: ApiPlanDispatch }>('POST', `/api/projects/${pid}/plans/${planId}/dispatch`, body),
+  cancelPlanDispatch: (id: string, reason?: string) =>
+    req<{ ok: boolean; cancelledRuns: number }>('POST', `/api/plan-dispatches/${id}/cancel`, { reason }),
+  retryPlanDispatch: (id: string) => req<{ created: number }>('POST', `/api/plan-dispatches/${id}/retry`),
 };
 
 // Mirrors @noriq-dev/shared RunnerRepo / Runner / Run — kept as plain interfaces so
@@ -260,11 +269,49 @@ export interface ApiRun {
   tokensUsed: number | null;
   usdSpent: number | null;
   logTail: string | null;
+  /** The plan dispatch that fanned this run out (PLNR-170). Null = a one-off dispatch. */
+  planDispatchId: string | null;
   createdBy: string;
   createdAt: string;
   updatedAt: string;
   dispatchedAt: string | null;
   startedAt: string | null;
+}
+
+/** A whole-plan dispatch (PLNR-170): the durable record the server's pump works from. */
+export interface ApiPlanDispatch {
+  id: string;
+  projectId: string;
+  planId: string;
+  runnerId: string;
+  repoRef: string;
+  agentTool: string;
+  model: string | null;
+  effort: string | null;
+  budget: Partial<ApiRunBudget>;
+  /** 'landed': dependents unblock when the dependency's run lands (code on the plan branch),
+   *  human review pending. 'approved': dependents wait for the human — strict but slower. */
+  gate: 'landed' | 'approved';
+  /** 'stalled' is recoverable: the pump can't advance without a human (see stallReason);
+   *  answering/approving/retrying re-activates it. */
+  status: 'active' | 'stalled' | 'completed' | 'cancelled';
+  stallReason: string | null;
+  /** Every plan task with its latest run from THIS dispatch (null = not dispatched yet). */
+  tasks: Array<{ taskId: string; runId: string | null; runStatus: string | null }>;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+  finishedAt: string | null;
+}
+export interface PlanDispatchInput {
+  runnerId: string;
+  repoRef: string;
+  agentTool: string;
+  model?: string | null;
+  effort?: RunEffort | null;
+  /** Applied to every run the dispatch creates (per-run ceilings, not a shared pool). */
+  budget?: Partial<ApiRunBudget>;
+  gate?: 'landed' | 'approved';
 }
 export interface DispatchInput {
   runnerId: string;

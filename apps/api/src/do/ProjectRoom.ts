@@ -99,6 +99,8 @@ export interface CreateRunInput {
   runnerId?: string | null;
   /** Actor id credited as the dispatcher; defaults to the acting actor. */
   createdBy?: string;
+  /** The plan dispatch that fanned this run out (PLNR-170). Null = a one-off dispatch. */
+  planDispatchId?: string | null;
 }
 
 export interface RunPatch {
@@ -119,6 +121,7 @@ type RunRow = {
   exit: string | null;
   worktree_path: string | null;
   tokens_used: number | null; usd_spent: number | null; log_tail: string | null;
+  plan_dispatch_id: string | null;
   created_by: string; created_at: string; updated_at: string;
   dispatched_at: string | null; started_at: string | null;
 };
@@ -154,11 +157,71 @@ export interface RunView {
   tokensUsed: number | null;
   usdSpent: number | null;
   logTail: string | null;
+  /** The plan dispatch that fanned this run out (PLNR-170). Null = a one-off. The daemon's
+   *  Run schema doesn't know the field and strips it — orchestration is server/UI business. */
+  planDispatchId: string | null;
   createdBy: string;
   createdAt: string;
   updatedAt: string;
   dispatchedAt: string | null;
   startedAt: string | null;
+}
+
+// --- Plan dispatch (PLNR-170) -----------------------------------------------
+// "Dispatch a plan" = a durable orchestration record + a pump. The pump creates one
+// task-anchored BUILD run per ready task (dependency edges satisfied), up to the runner's
+// advertised capacity, and re-runs on every unblocking event: a run reaching terminal, a task
+// reaching done/cancelled, a runner heartbeat with free slots, or an explicit retry. No queue
+// object exists anywhere — the record plus re-derivation IS the scheduler, which is what lets
+// it survive deploys, DO evictions, and the runner being off (the lesson plan_landings taught).
+
+export interface CreatePlanDispatchInput {
+  planId: string;
+  runnerId: string;
+  repoRef: string;
+  agentTool: string;
+  model?: string | null;
+  effort?: string | null;
+  /** Applied to every run this dispatch creates. */
+  budget?: Record<string, unknown> | null;
+  /** 'landed' (default): a dependent unblocks once its dependency's run is done — code on the
+   *  plan branch, human approval still pending. 'approved': dependents wait for the human. */
+  gate?: 'landed' | 'approved';
+  createdBy?: string;
+}
+
+type PlanDispatchRow = {
+  id: string; project_id: string; plan_id: string; runner_id: string; repo_ref: string;
+  agent_tool: string; model: string | null; effort: string | null; budget: string;
+  gate: string; status: string; stall_reason: string | null;
+  created_by: string; created_at: string; updated_at: string; finished_at: string | null;
+};
+
+/** Per-task progress inside a dispatch, for the dashboard's plan card. */
+export interface PlanDispatchTaskView {
+  taskId: string;
+  runId: string | null; // latest run this dispatch created for the task; null = not yet dispatched
+  runStatus: string | null;
+}
+
+export interface PlanDispatchView {
+  id: string;
+  projectId: string;
+  planId: string;
+  runnerId: string;
+  repoRef: string;
+  agentTool: string;
+  model: string | null;
+  effort: string | null;
+  budget: Record<string, unknown>;
+  gate: 'landed' | 'approved';
+  status: 'active' | 'stalled' | 'completed' | 'cancelled';
+  stallReason: string | null;
+  tasks: PlanDispatchTaskView[];
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+  finishedAt: string | null;
 }
 
 // Legal Run status transitions. queued Runs were never sent to a daemon (no
@@ -481,6 +544,9 @@ export class ProjectRoom extends DurableObject<Env> {
         // dropped IS finished, and ignoring that strands its branch forever (RUN-28).
         if (patch.status === 'done' || patch.status === 'cancelled') {
           await this.maybeCompletePlan(taskId, actor);
+          // Same event, plan-dispatch side (PLNR-170): a human approving (or dropping) a task
+          // is exactly what an 'approved'-gated — or stalled — dispatch is waiting on.
+          await this.pumpLiveDispatches(actor);
         }
       } else {
         await this.emit(actor, 'task.updated', 'task', taskId, { key: task.key, fields: Object.keys(patch) });
@@ -539,9 +605,21 @@ export class ProjectRoom extends DurableObject<Env> {
       if (task.claimed_by && task.claim_expires_at && task.claim_expires_at > nowIso()) {
         throw new Error(`${task.key} is already claimed by another agent`);
       }
-      const blockers = await this.unfinishedDeps(taskId);
-      if (blockers.length) {
-        throw new Error(`${task.key} is blocked by unfinished dependencies: ${blockers.join(', ')}`);
+      // A run-anchored claim skips the dependency gate (PLNR-170): when THIS agent's live run
+      // was dispatched FOR this exact task, the dispatcher — a human, or the plan-dispatch pump
+      // applying its gate — already made the readiness call. Under gate='landed' a dependency
+      // is deliberately review-not-done (its code landed; sign-off pending), and the strict
+      // clause here would make the pump's dispatch unclaimable. The gate's pull-protection is
+      // for agents shopping the pool; a dispatched agent was SENT.
+      const anchored = await this.env.DB.prepare(
+        `SELECT 1 FROM runs WHERE agent_id = ? AND anchor_type = 'task' AND anchor_id = ?
+          AND status IN ('dispatched','running','blocked')`,
+      ).bind(agentId, taskId).first();
+      if (!anchored) {
+        const blockers = await this.unfinishedDeps(taskId);
+        if (blockers.length) {
+          throw new Error(`${task.key} is blocked by unfinished dependencies: ${blockers.join(', ')}`);
+        }
       }
       // RUN-23 gate (defense in depth — the claimable surface already hides these):
       // a task in a proposed plan can't be worked until a human approves the plan.
@@ -600,7 +678,12 @@ export class ProjectRoom extends DurableObject<Env> {
       }
       // A plan is finished when its last task is — check here rather than on a timer, so the
       // merge request follows the work instead of trailing it (RUN-28).
-      if (toStatus === 'done') await this.maybeCompletePlan(taskId, actor);
+      if (toStatus === 'done') {
+        await this.maybeCompletePlan(taskId, actor);
+        // A task reaching done (e.g. a human approving a review) may unblock a plan
+        // dispatch's dependents (PLNR-170). Never throws.
+        await this.pumpLiveDispatches(actor);
+      }
       return { ok: true, key: task.key, status: toStatus, commentId };
 
     });
@@ -1440,6 +1523,7 @@ export class ProjectRoom extends DurableObject<Env> {
       tokensUsed: r.tokens_used,
       usdSpent: r.usd_spent,
       logTail: r.log_tail,
+      planDispatchId: r.plan_dispatch_id,
       createdBy: r.created_by,
       createdAt: r.created_at,
       updatedAt: r.updated_at,
@@ -1459,42 +1543,49 @@ export class ProjectRoom extends DurableObject<Env> {
   async createRun(projectId: string, actor: Actor, input: CreateRunInput): Promise<RunView> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
-      // Validate against the shared contract; the DB CHECKs are the backstop.
-      RunKind.parse(input.kind);
-      AgentTool.parse(input.agentTool);
-      const id = newId('run');
-      const now = nowIso();
-      const anchorType = input.anchor?.type ?? null;
-      const anchorId = input.anchor?.id ?? null;
-      const runnerId = input.runnerId ?? null;
-      const status = runnerId ? 'dispatched' : 'queued';
-      // Only a verify run judges another run; carrying it elsewhere would be meaningless.
-      const verifiesRunId = input.kind === 'verify' ? (input.verifiesRunId ?? null) : null;
-      // Which plan does this run serve? (RUN-28) Resolved HERE because the daemon cannot: a
-      // plan-anchored run names its plan, but a task-anchored one only knows its task, and the
-      // task's plan membership is phase_tasks — server-side, and invisible to the runner.
-      // Stored rather than re-derived at landing time: a task can be re-parented and a plan
-      // deleted, but the branch a run landed on is a historical fact, not a live lookup.
-      const plan = await this.resolveRunPlan(anchorType, anchorId);
-      await this.env.DB.prepare(
-        `INSERT INTO runs (id, project_id, runner_id, kind, anchor_type, anchor_id, verifies_run_id,
-                           plan_id, plan_key, target_branch, brief, repo_ref, agent_tool, model, effort,
-                           budget, status, created_by, created_at, updated_at, dispatched_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).bind(
-        id, projectId, runnerId, input.kind, anchorType, anchorId, verifiesRunId,
-        plan?.id ?? null, plan ? this.planKey(plan) : null, input.targetBranch ?? null,
-        input.brief ?? '', input.repoRef,
-        input.agentTool, input.model ?? null, input.effort ?? null,
-        JSON.stringify(input.budget ?? {}), status, input.createdBy ?? actor.id, now, now,
-        runnerId ? now : null,
-      ).run();
-      await this.emit(actor, 'run.created', 'run', id, {
-        kind: input.kind, agentTool: input.agentTool, repoRef: input.repoRef, anchor: anchorType,
-      });
-      if (runnerId) await this.emit(actor, 'run.dispatched', 'run', id, { runnerId, to: 'dispatched' });
-      return this.runToWire(await this.loadRun(id));
+      return this.insertRun(actor, input);
     });
+  }
+
+  /** The unwrapped create: shared by createRun and the plan-dispatch pump (PLNR-170), which is
+   *  already inside blockConcurrencyWhile and inserts several runs in one serialized breath. */
+  private async insertRun(actor: Actor, input: CreateRunInput): Promise<RunView> {
+    // Validate against the shared contract; the DB CHECKs are the backstop.
+    RunKind.parse(input.kind);
+    AgentTool.parse(input.agentTool);
+    const id = newId('run');
+    const now = nowIso();
+    const anchorType = input.anchor?.type ?? null;
+    const anchorId = input.anchor?.id ?? null;
+    const runnerId = input.runnerId ?? null;
+    const status = runnerId ? 'dispatched' : 'queued';
+    // Only a verify run judges another run; carrying it elsewhere would be meaningless.
+    const verifiesRunId = input.kind === 'verify' ? (input.verifiesRunId ?? null) : null;
+    // Which plan does this run serve? (RUN-28) Resolved HERE because the daemon cannot: a
+    // plan-anchored run names its plan, but a task-anchored one only knows its task, and the
+    // task's plan membership is phase_tasks — server-side, and invisible to the runner.
+    // Stored rather than re-derived at landing time: a task can be re-parented and a plan
+    // deleted, but the branch a run landed on is a historical fact, not a live lookup.
+    const plan = await this.resolveRunPlan(anchorType, anchorId);
+    await this.env.DB.prepare(
+      `INSERT INTO runs (id, project_id, runner_id, kind, anchor_type, anchor_id, verifies_run_id,
+                         plan_id, plan_key, target_branch, brief, repo_ref, agent_tool, model, effort,
+                         budget, status, plan_dispatch_id, created_by, created_at, updated_at, dispatched_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      id, this.projectId, runnerId, input.kind, anchorType, anchorId, verifiesRunId,
+      plan?.id ?? null, plan ? this.planKey(plan) : null, input.targetBranch ?? null,
+      input.brief ?? '', input.repoRef,
+      input.agentTool, input.model ?? null, input.effort ?? null,
+      JSON.stringify(input.budget ?? {}), status, input.planDispatchId ?? null,
+      input.createdBy ?? actor.id, now, now,
+      runnerId ? now : null,
+    ).run();
+    await this.emit(actor, 'run.created', 'run', id, {
+      kind: input.kind, agentTool: input.agentTool, repoRef: input.repoRef, anchor: anchorType,
+    });
+    if (runnerId) await this.emit(actor, 'run.dispatched', 'run', id, { runnerId, to: 'dispatched' });
+    return this.runToWire(await this.loadRun(id));
   }
 
   /** Assign a queued Run to a runner and mark it dispatched. */
@@ -1514,6 +1605,390 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
+  // ---------------------------------------------------------------------------
+  // Plan dispatch (PLNR-170) — dispatch a whole plan; a pump fans out the runs.
+  //
+  // No scheduler object exists: the plan_dispatches row is the record, and the pump
+  // RE-DERIVES the ready set from the task/dependency/run tables on every unblocking
+  // event — a run reaching terminal, a task reaching done/cancelled, a runner
+  // heartbeat, an explicit retry. Record + re-derivation is what survives deploys,
+  // DO evictions, and the runner being off (the lesson plan_landings already taught;
+  // a queue in memory re-ships the fire-and-forget bug a third time).
+  // ---------------------------------------------------------------------------
+
+  async createPlanDispatch(
+    projectId: string,
+    actor: Actor,
+    input: CreatePlanDispatchInput,
+  ): Promise<PlanDispatchView> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      AgentTool.parse(input.agentTool);
+      const plan = await this.env.DB.prepare(
+        'SELECT id, title, status FROM plans WHERE id = ? AND project_id = ?',
+      ).bind(input.planId, projectId).first<{ id: string; title: string; status: string }>();
+      if (!plan) throw new Error('plan not found');
+      // The RUN-23 gate holds here too: a proposed plan's tasks are not real work yet.
+      if (plan.status === 'proposed') throw new Error('plan is proposed — approve it before dispatching');
+      // One live dispatch per plan: two pumps would race each other to the same ready tasks,
+      // and "which runner is working my plan" should have one answer.
+      const existing = await this.env.DB.prepare(
+        "SELECT id FROM plan_dispatches WHERE plan_id = ? AND status IN ('active','stalled')",
+      ).bind(input.planId).first();
+      if (existing) throw new Error('this plan already has a live dispatch — cancel it first');
+      const open = await this.env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM phase_tasks pt
+           JOIN phases ph ON ph.id = pt.phase_id
+           JOIN tasks t ON t.id = pt.task_id
+         WHERE ph.plan_id = ? AND t.status NOT IN ('done','cancelled')`,
+      ).bind(input.planId).first<{ n: number }>();
+      if (!open?.n) throw new Error('plan has no open tasks — nothing to dispatch');
+
+      const id = newId('pld');
+      const now = nowIso();
+      await this.env.DB.prepare(
+        `INSERT INTO plan_dispatches (id, project_id, plan_id, runner_id, repo_ref, agent_tool,
+                                      model, effort, budget, gate, status, created_by, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+      ).bind(
+        id, projectId, input.planId, input.runnerId, input.repoRef, input.agentTool,
+        input.model ?? null, input.effort ?? null, JSON.stringify(input.budget ?? {}),
+        input.gate ?? 'landed', input.createdBy ?? actor.id, now, now,
+      ).run();
+      await this.emit(actor, 'plan_dispatch.created', 'plan_dispatch', id, {
+        planId: plan.id, planTitle: plan.title, runnerId: input.runnerId, gate: input.gate ?? 'landed',
+        openTasks: open.n,
+      });
+      await this.pumpPlanDispatch(await this.loadPlanDispatch(id), actor);
+      return this.planDispatchToWire(await this.loadPlanDispatch(id));
+    });
+  }
+
+  /** Halt the pump and kill this dispatch's live runs. Idempotent on a finished dispatch. */
+  async cancelPlanDispatch(
+    projectId: string,
+    actor: Actor,
+    dispatchId: string,
+    reason?: string | null,
+  ): Promise<{ ok: boolean; cancelledRuns: number }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const d = await this.loadPlanDispatch(dispatchId);
+      if (d.status === 'completed' || d.status === 'cancelled') return { ok: true, cancelledRuns: 0 };
+      const { results: live } = await this.env.DB.prepare(
+        `SELECT * FROM runs WHERE plan_dispatch_id = ? AND status IN ('queued','dispatched','running','blocked')`,
+      ).bind(dispatchId).all<RunRow>();
+      const why = reason ?? 'plan dispatch cancelled';
+      for (const run of live) await this.cancelRunInner(run, actor, why);
+      const now = nowIso();
+      await this.env.DB.prepare(
+        "UPDATE plan_dispatches SET status = 'cancelled', stall_reason = NULL, finished_at = ?, updated_at = ? WHERE id = ?",
+      ).bind(now, now, dispatchId).run();
+      await this.emit(actor, 'plan_dispatch.cancelled', 'plan_dispatch', dispatchId, {
+        planId: d.plan_id, cancelledRuns: live.length, reason: reason ?? null,
+      });
+      // Best-effort fast path; the daemon also fails these runs itself on its next reconcile.
+      for (const run of live) {
+        if (!run.runner_id) continue;
+        try {
+          await this.env.RUNNER_HUB.get(this.env.RUNNER_HUB.idFromName(run.runner_id))
+            .deliver(JSON.stringify({ type: 'run.cancel', runId: run.id, hard: true, reason: why }));
+        } catch { /* socket gone — reconcile covers it */ }
+      }
+      return { ok: true, cancelledRuns: live.length };
+    });
+  }
+
+  /** Re-arm tasks whose only attempts failed (or were cancelled) and pump again. The pump
+   *  itself never retries — a failed agent run is a human's judgment call, this endpoint. */
+  async retryPlanDispatch(projectId: string, actor: Actor, dispatchId: string): Promise<{ created: number }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const d = await this.loadPlanDispatch(dispatchId);
+      if (d.status === 'completed' || d.status === 'cancelled') {
+        throw new Error(`dispatch is ${d.status} — nothing to retry`);
+      }
+      return this.pumpPlanDispatch(d, actor, { retry: true });
+    });
+  }
+
+  /** RunnerHub's heartbeat nudge (and any other cross-project wake): pump every live
+   *  dispatch in this project. Slots on a shared runner can free from ANOTHER project's
+   *  runs, which this room never hears about — the periodic heartbeat is the reconcile. */
+  async pumpProjectDispatches(projectId: string): Promise<{ created: number }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      return this.pumpLiveDispatches({ kind: 'system', id: 'system', name: 'plan-dispatch' });
+    });
+  }
+
+  async listPlanDispatches(projectId: string, planId?: string | null): Promise<{ dispatches: PlanDispatchView[] }> {
+    await this.setPid(projectId);
+    const { results } = planId
+      ? await this.env.DB.prepare(
+          'SELECT * FROM plan_dispatches WHERE project_id = ? AND plan_id = ? ORDER BY created_at DESC LIMIT 50',
+        ).bind(projectId, planId).all<PlanDispatchRow>()
+      : await this.env.DB.prepare(
+          'SELECT * FROM plan_dispatches WHERE project_id = ? ORDER BY created_at DESC LIMIT 50',
+        ).bind(projectId).all<PlanDispatchRow>();
+    const dispatches: PlanDispatchView[] = [];
+    for (const row of results) dispatches.push(await this.planDispatchToWire(row));
+    return { dispatches };
+  }
+
+  /** Pump every live dispatch in this project. Callers are already inside
+   *  blockConcurrencyWhile. Never throws: scheduling must not reject the daemon's
+   *  status report (or a task release) that happened to trigger it. */
+  private async pumpLiveDispatches(actor: Actor): Promise<{ created: number }> {
+    let created = 0;
+    try {
+      const { results } = await this.env.DB.prepare(
+        "SELECT * FROM plan_dispatches WHERE project_id = ? AND status IN ('active','stalled')",
+      ).bind(this.projectId).all<PlanDispatchRow>();
+      for (const d of results) {
+        try {
+          created += (await this.pumpPlanDispatch(d, actor)).created;
+        } catch (err) {
+          console.warn(`plan dispatch ${d.id} pump failed: ${String(err)}`);
+        }
+      }
+    } catch (err) {
+      console.warn(`plan dispatch sweep failed: ${String(err)}`);
+    }
+    return { created };
+  }
+
+  /**
+   * The scheduler. Recomputes the plan's READY set and turns it into task-anchored build
+   * runs, up to the runner's advertised concurrency.
+   *
+   * Ready = todo, unclaimed, every dependency satisfied, not already being run by anyone,
+   * and not already attempted by this dispatch (one attempt per task — see retry).
+   *
+   * Dependency satisfaction is where the gate lives. gate='landed' counts a dependency in
+   * REVIEW as satisfied iff a run anchored to it reached `done` — the verify gate passed and
+   * the code is on the plan's working branch, so the material dependency exists; only the
+   * human's sign-off is pending, and making dependents wait on that puts a person back in the
+   * middle of the pipeline as a synchronous lock (the exact thing autoPush/RUN-27 moved).
+   * gate='approved' keeps the strict rule: only done/cancelled satisfies.
+   *
+   * Capacity comes from the runs table (dispatched|running on that runner), NOT the
+   * heartbeat's free_slots — that number is seconds stale, and nothing else server-side
+   * prevents over-dispatch between heartbeats. `blocked` runs are excluded on purpose: a
+   * parked agent's process is gone and its daemon slot is free (RUN-30); its resume takes a
+   * slot like any new run, which this same arithmetic then counts.
+   */
+  private async pumpPlanDispatch(
+    d: PlanDispatchRow,
+    actor: Actor,
+    opts: { retry?: boolean } = {},
+  ): Promise<{ created: number }> {
+    if (d.status !== 'active' && d.status !== 'stalled') return { created: 0 };
+
+    const open = await this.env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM phase_tasks pt
+         JOIN phases ph ON ph.id = pt.phase_id
+         JOIN tasks t ON t.id = pt.task_id
+       WHERE ph.plan_id = ? AND t.status NOT IN ('done','cancelled')`,
+    ).bind(d.plan_id).first<{ n: number }>();
+    if (!open?.n) {
+      const now = nowIso();
+      await this.env.DB.prepare(
+        "UPDATE plan_dispatches SET status = 'completed', stall_reason = NULL, finished_at = ?, updated_at = ? WHERE id = ?",
+      ).bind(now, now, d.id).run();
+      await this.emit(actor, 'plan_dispatch.completed', 'plan_dispatch', d.id, { planId: d.plan_id });
+      return { created: 0 };
+    }
+
+    // A dependency BLOCKS unless done/cancelled — or, under gate='landed', unless it is in
+    // review with a landed run. SQL is composed from a fixed pair of literals, never input.
+    const landedException = d.gate === 'landed'
+      ? `AND NOT (dt.status = 'review' AND EXISTS (
+           SELECT 1 FROM runs dr
+           WHERE dr.anchor_type = 'task' AND dr.anchor_id = dt.id AND dr.status = 'done'))`
+      : '';
+    // One attempt per task per dispatch; retry re-arms tasks whose attempts all ended
+    // failed/cancelled (which includes an agent that punted the task back to todo).
+    const attempted = opts.retry
+      ? `AND ar.status NOT IN ('failed','cancelled')`
+      : '';
+    const { results: ready } = await this.env.DB.prepare(
+      `SELECT t.id FROM phase_tasks pt
+         JOIN phases ph ON ph.id = pt.phase_id
+         JOIN tasks t ON t.id = pt.task_id
+       WHERE ph.plan_id = ?1
+         AND t.status = 'todo' AND t.claimed_by IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM dependencies dp JOIN tasks dt ON dt.id = dp.depends_on_task_id
+           WHERE dp.task_id = t.id AND dt.status NOT IN ('done','cancelled') ${landedException})
+         AND NOT EXISTS (
+           SELECT 1 FROM runs lr WHERE lr.anchor_type = 'task' AND lr.anchor_id = t.id
+             AND lr.status IN ('queued','dispatched','running','blocked'))
+         AND NOT EXISTS (
+           SELECT 1 FROM runs ar WHERE ar.plan_dispatch_id = ?2
+             AND ar.anchor_type = 'task' AND ar.anchor_id = t.id ${attempted})
+       ORDER BY t.priority DESC, t."order"`,
+    ).bind(d.plan_id, d.id).all<{ id: string }>();
+
+    // Capacity: advertised max minus what the runs table says is on the box.
+    const runner = await this.env.DB.prepare('SELECT status, capabilities FROM runners WHERE id = ?')
+      .bind(d.runner_id).first<{ status: string; capabilities: string }>();
+    let slots = 0;
+    if (runner && runner.status !== 'offboarded') {
+      let maxC = 1;
+      try {
+        maxC = Number((JSON.parse(runner.capabilities || '{}') as { maxConcurrency?: number }).maxConcurrency ?? 1);
+      } catch { /* malformed capabilities → assume 1 */ }
+      const busy = await this.env.DB.prepare(
+        "SELECT COUNT(*) AS n FROM runs WHERE runner_id = ? AND status IN ('dispatched','running')",
+      ).bind(d.runner_id).first<{ n: number }>();
+      slots = Math.max(0, maxC - (busy?.n ?? 0));
+    }
+
+    let created = 0;
+    for (const t of ready.slice(0, slots)) {
+      const run = await this.insertRun(actor, {
+        kind: 'build',
+        anchor: { type: 'task', id: t.id },
+        repoRef: d.repo_ref,
+        agentTool: d.agent_tool,
+        model: d.model,
+        effort: d.effort,
+        budget: JSON.parse(d.budget || '{}'),
+        runnerId: d.runner_id,
+        createdBy: d.created_by,
+        planDispatchId: d.id,
+      });
+      created += 1;
+      // Fast path only: a frame the socket misses is redelivered on the daemon's next
+      // hello (RunnerHub redelivers every dispatched run), and the row is the truth.
+      try {
+        await this.env.RUNNER_HUB.get(this.env.RUNNER_HUB.idFromName(d.runner_id))
+          .deliver(JSON.stringify({ type: 'run.assigned', run }));
+      } catch { /* socket gone — hello redelivers */ }
+    }
+
+    const liveNow = await this.env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM runs WHERE plan_dispatch_id = ?
+        AND status IN ('queued','dispatched','running','blocked')`,
+    ).bind(d.id).first<{ n: number }>();
+    const anyLive = (liveNow?.n ?? 0) > 0;
+
+    if (anyLive || ready.length > created) {
+      // Forward progress exists, or work is merely waiting for a slot (capacity frees via a
+      // terminal run or the heartbeat nudge — no human is needed). Either way: active.
+      if (d.status === 'stalled') {
+        await this.env.DB.prepare(
+          "UPDATE plan_dispatches SET status = 'active', stall_reason = NULL, updated_at = ? WHERE id = ?",
+        ).bind(nowIso(), d.id).run();
+        await this.emit(actor, 'plan_dispatch.resumed', 'plan_dispatch', d.id, { planId: d.plan_id });
+      }
+    } else if (created === 0) {
+      // Nothing live, nothing dispatchable, plan still open: the pump cannot advance this
+      // without a human. Say why, so the dashboard is actionable rather than just amber.
+      const reason = await this.planDispatchStallReason(d);
+      if (d.status !== 'stalled') {
+        await this.env.DB.prepare(
+          "UPDATE plan_dispatches SET status = 'stalled', stall_reason = ?, updated_at = ? WHERE id = ?",
+        ).bind(reason, nowIso(), d.id).run();
+        await this.emit(actor, 'plan_dispatch.stalled', 'plan_dispatch', d.id, { planId: d.plan_id, reason });
+      } else if (d.stall_reason !== reason) {
+        await this.env.DB.prepare('UPDATE plan_dispatches SET stall_reason = ?, updated_at = ? WHERE id = ?')
+          .bind(reason, nowIso(), d.id).run();
+      }
+    }
+    return { created };
+  }
+
+  /** Why the pump is stuck, composed for a human. Best-effort taxonomy — the counts answer
+   *  "what do I click": retry failed runs, approve reviews, answer a parked question. */
+  private async planDispatchStallReason(d: PlanDispatchRow): Promise<string> {
+    const reasons: string[] = [];
+    const runner = await this.env.DB.prepare('SELECT status FROM runners WHERE id = ?')
+      .bind(d.runner_id).first<{ status: string }>();
+    if (!runner || runner.status === 'offboarded') reasons.push('the runner is offboarded');
+    const counts = await this.env.DB.prepare(
+      `SELECT
+         SUM(CASE WHEN t.status = 'review' THEN 1 ELSE 0 END) AS inReview,
+         SUM(CASE WHEN t.status = 'blocked' THEN 1 ELSE 0 END) AS parked,
+         SUM(CASE WHEN t.status = 'todo' AND EXISTS (
+           SELECT 1 FROM runs fr WHERE fr.plan_dispatch_id = ?1
+             AND fr.anchor_type = 'task' AND fr.anchor_id = t.id
+             AND fr.status IN ('failed','cancelled')) THEN 1 ELSE 0 END) AS failed,
+         SUM(CASE WHEN t.status IN ('in_progress','claimed') THEN 1 ELSE 0 END) AS held
+       FROM phase_tasks pt
+         JOIN phases ph ON ph.id = pt.phase_id
+         JOIN tasks t ON t.id = pt.task_id
+       WHERE ph.plan_id = ?2 AND t.status NOT IN ('done','cancelled')`,
+    ).bind(d.id, d.plan_id).first<{ inReview: number | null; parked: number | null; failed: number | null; held: number | null }>();
+    if (counts?.failed) reasons.push(`${counts.failed} task(s) failed — retry the dispatch or fix and re-dispatch`);
+    if (counts?.inReview) {
+      reasons.push(
+        d.gate === 'approved'
+          ? `${counts.inReview} task(s) awaiting your review (gate=approved holds dependents until you mark them done)`
+          : `${counts.inReview} task(s) in review`,
+      );
+    }
+    if (counts?.parked) reasons.push(`${counts.parked} task(s) parked on a question — answer the input request`);
+    if (counts?.held) reasons.push(`${counts.held} task(s) held by other agents`);
+    return reasons.length ? reasons.join('; ') : 'remaining tasks are dependency-blocked outside this plan';
+  }
+
+  /** Cancel one run without the public wrapper (callers hold the lock). Mirrors what
+   *  transitionRun does for a terminal 'cancelled' — kept small on purpose; if these drift,
+   *  drift shows up as a dispatch-cancelled run that still looks alive. */
+  private async cancelRunInner(run: RunRow, actor: Actor, reason: string): Promise<void> {
+    if (!RUN_TRANSITIONS[run.status]?.includes('cancelled')) return; // already terminal
+    const now = nowIso();
+    const exit = JSON.stringify({ outcome: 'cancelled', code: null, signal: null, reason, finishedAt: now });
+    await this.env.DB.prepare(
+      'UPDATE runs SET status = ?, exit = ?, phase = NULL, updated_at = ? WHERE id = ?',
+    ).bind('cancelled', exit, now, run.id).run();
+    if (run.agent_id) await this.retireRunAgent(run.agent_id);
+    await this.emit(actor, 'run.status_changed', 'run', run.id, { from: run.status, to: 'cancelled', reason });
+  }
+
+  private async loadPlanDispatch(id: string): Promise<PlanDispatchRow> {
+    const row = await this.env.DB.prepare('SELECT * FROM plan_dispatches WHERE id = ? AND project_id = ?')
+      .bind(id, this.projectId).first<PlanDispatchRow>();
+    if (!row) throw new Error('plan dispatch not found');
+    return row;
+  }
+
+  private async planDispatchToWire(row: PlanDispatchRow): Promise<PlanDispatchView> {
+    // Every plan task with its LATEST run from this dispatch — the dashboard's progress strip.
+    const { results: tasks } = await this.env.DB.prepare(
+      `SELECT t.id AS taskId, r.id AS runId, r.status AS runStatus
+       FROM phase_tasks pt
+         JOIN phases ph ON ph.id = pt.phase_id
+         JOIN tasks t ON t.id = pt.task_id
+         LEFT JOIN runs r ON r.id = (
+           SELECT r2.id FROM runs r2
+           WHERE r2.plan_dispatch_id = ?1 AND r2.anchor_type = 'task' AND r2.anchor_id = t.id
+           ORDER BY r2.created_at DESC LIMIT 1)
+       WHERE ph.plan_id = ?2
+       ORDER BY ph."order", t."order"`,
+    ).bind(row.id, row.plan_id).all<{ taskId: string; runId: string | null; runStatus: string | null }>();
+    return {
+      id: row.id,
+      projectId: row.project_id,
+      planId: row.plan_id,
+      runnerId: row.runner_id,
+      repoRef: row.repo_ref,
+      agentTool: row.agent_tool,
+      model: row.model,
+      effort: row.effort,
+      budget: JSON.parse(row.budget || '{}'),
+      gate: row.gate as 'landed' | 'approved',
+      status: row.status as PlanDispatchView['status'],
+      stallReason: row.stall_reason,
+      tasks: tasks.map((t) => ({ taskId: t.taskId, runId: t.runId, runStatus: t.runStatus })),
+      createdBy: row.created_by,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      finishedAt: row.finished_at,
+    };
+  }
 
   /**
    * A branch-safe, readable, stable key for a plan (RUN-28). Plans have no `key` column — only a
@@ -1659,6 +2134,10 @@ export class ProjectRoom extends DurableObject<Env> {
       ).bind(to, agentId, exitJson, worktreePath, phase, startedAt, now, runId).run();
       if (isTerminalRunStatus(to) && agentId) await this.retireRunAgent(agentId);
       await this.emit(actor, 'run.status_changed', 'run', runId, { from: run.status, to, reason: patch.reason ?? null });
+      // A terminal run is the plan-dispatch pump's main wake-up (PLNR-170): it freed a slot,
+      // and if it was `done` it may have landed the dependency some other task waits on.
+      // pumpLiveDispatches never throws — scheduling must not reject the daemon's report.
+      if (isTerminalRunStatus(to)) await this.pumpLiveDispatches(actor);
       return this.runToWire(await this.loadRun(runId));
     });
   }

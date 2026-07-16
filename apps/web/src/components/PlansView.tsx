@@ -1,12 +1,12 @@
 // Plans — how agents structure work: plan → ordered phases → tasks.
 // Complexity is progressive: plans are cards with phase progress rails;
 // expanding a plan reveals task chips per phase.
-import { useState } from 'react';
-import { api } from '../api';
+import { useEffect, useState } from 'react';
+import { api, type ApiPlanDispatch, type ApiRunner, type RunEffort } from '../api';
 import type { AppStore } from '../store';
 import { statusMeta } from '../design';
-import { AvatarChip, MonoTag, SectionLabel } from './bits';
-import { Button } from './ui';
+import { AvatarChip, LiveDot, MonoTag, SectionLabel } from './bits';
+import { Button, ErrorNote, Field, Select, TextInput } from './ui';
 import { Markdown } from './Markdown';
 
 export function PlansView({ store }: { store: AppStore }) {
@@ -14,6 +14,26 @@ export function PlansView({ store }: { store: AppStore }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   // Archived plans hide by default (PLNR-148) — a display concern, nothing else changes.
   const [showArchived, setShowArchived] = useState(false);
+  // Plan dispatch (PLNR-170): the orchestration records + the runner roster the form needs.
+  // Polled like RunsView — dispatches move on their own (the pump runs server-side).
+  const [dispatches, setDispatches] = useState<ApiPlanDispatch[]>([]);
+  const [runners, setRunners] = useState<ApiRunner[]>([]);
+  const loadDispatchState = async () => {
+    if (!currentPid) return;
+    try {
+      const [d, r] = await Promise.all([api.planDispatches(currentPid), api.runners()]);
+      setDispatches(d.dispatches);
+      setRunners(r.runners);
+    } catch {
+      /* transient — the poll retries */
+    }
+  };
+  useEffect(() => {
+    void loadDispatchState();
+    const iv = setInterval(() => void loadDispatchState(), 6000);
+    return () => clearInterval(iv);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentPid, snapshot]);
   const allPlans = snapshot?.plans ?? [];
   const archivedCount = allPlans.filter((p) => p.archivedAt).length;
   const plans = showArchived ? allPlans : allPlans.filter((p) => !p.archivedAt);
@@ -181,6 +201,23 @@ export function PlansView({ store }: { store: AppStore }) {
                 </div>
               )}
 
+              {/* plan dispatch (PLNR-170): hand the whole plan to a runner; the server pumps
+                  ready tasks into parallel per-task runs. Hidden for proposed/archived plans —
+                  a proposed plan's tasks are not real work yet, an archived plan is shelved. */}
+              {!proposed && !plan.archivedAt && currentPid && (
+                <PlanDispatchStrip
+                  pid={currentPid}
+                  planId={plan.id}
+                  dispatch={dispatches.find((d) => d.planId === plan.id) ?? null}
+                  runners={runners}
+                  openTasks={allTaskIds.filter((tid) => {
+                    const st = taskById.get(tid)?.status;
+                    return st !== 'done' && st !== 'cancelled';
+                  }).length}
+                  onChange={() => void loadDispatchState()}
+                />
+              )}
+
               {/* expanded: the plan document + stacked phases */}
               {open && (
                 <div style={{ borderTop: '1px solid var(--w-06)' }}>
@@ -264,6 +301,293 @@ export function PlansView({ store }: { store: AppStore }) {
             </div>
           );
         })}
+      </div>
+    </div>
+  );
+}
+
+/** Tool-agnostic intent (RUN-33) — mirrors RunsView's list; the daemon maps it per driver. */
+const EFFORTS: RunEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+/**
+ * The plan's execution strip (PLNR-170). One live dispatch per plan: while it runs, this is
+ * the progress readout + kill switch; otherwise it is the "dispatch plan" entry point. The
+ * per-task chips come from the dispatch record (each task's latest run), not the task board —
+ * a task can be `review` while its run is `done`, and the strip is about the RUNS.
+ */
+function PlanDispatchStrip({
+  pid,
+  planId,
+  dispatch,
+  runners,
+  openTasks,
+  onChange,
+}: {
+  pid: string;
+  planId: string;
+  dispatch: ApiPlanDispatch | null;
+  runners: ApiRunner[];
+  openTasks: number;
+  onChange: () => void;
+}) {
+  const [showForm, setShowForm] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const live = dispatch !== null && (dispatch.status === 'active' || dispatch.status === 'stalled');
+
+  if (live) {
+    const counts = { waiting: 0, running: 0, done: 0, failed: 0 };
+    for (const t of dispatch.tasks) {
+      if (!t.runStatus) counts.waiting += 1;
+      else if (t.runStatus === 'done') counts.done += 1;
+      else if (t.runStatus === 'failed' || t.runStatus === 'cancelled') counts.failed += 1;
+      else counts.running += 1;
+    }
+    const stalled = dispatch.status === 'stalled';
+    const runner = runners.find((r) => r.id === dispatch.runnerId);
+    const tone = stalled ? '#f5a623' : 'var(--green)';
+    return (
+      <div
+        style={{
+          display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', padding: '10px 18px',
+          borderTop: `1px solid ${stalled ? 'rgba(245,166,35,.2)' : 'rgba(63,217,139,.15)'}`,
+          background: stalled ? 'rgba(245,166,35,.05)' : 'rgba(63,217,139,.04)',
+        }}
+      >
+        <LiveDot color={tone} size={6} />
+        <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: tone }}>
+          {stalled ? 'dispatch stalled' : 'dispatching'} on {runner?.label ?? dispatch.runnerId}
+        </span>
+        <MonoTag color="var(--blue)" bg="rgba(76,157,255,.1)" size={9}>{dispatch.agentTool}</MonoTag>
+        <MonoTag color="var(--text-mid)" bg="var(--w-05)" size={9}>gate {dispatch.gate}</MonoTag>
+        <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>
+          {counts.running} running · {counts.done} done
+          {counts.failed ? ` · ${counts.failed} failed` : ''} · {counts.waiting} waiting
+        </span>
+        {stalled && dispatch.stallReason && (
+          <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: '#f5a623', flexBasis: '100%' }}>
+            ⏸ {dispatch.stallReason}
+          </span>
+        )}
+        <div style={{ flex: 1 }} />
+        {(stalled || counts.failed > 0) && (
+          <Button
+            variant="ghost"
+            disabled={busy}
+            style={{ padding: '5px 12px', fontSize: 11 }}
+            title="Re-arm tasks whose attempts failed and pump again"
+            onClick={async (e) => {
+              e.stopPropagation();
+              setBusy(true);
+              try {
+                await api.retryPlanDispatch(dispatch.id);
+                onChange();
+              } finally {
+                setBusy(false);
+              }
+            }}
+          >
+            retry
+          </Button>
+        )}
+        <Button
+          variant="danger"
+          disabled={busy}
+          style={{ padding: '5px 12px', fontSize: 11 }}
+          onClick={async (e) => {
+            e.stopPropagation();
+            if (!confirm('Stop dispatching this plan? Its live runs are killed; finished work stays on the plan branch.')) return;
+            setBusy(true);
+            try {
+              await api.cancelPlanDispatch(dispatch.id, 'cancelled from dashboard');
+              onChange();
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          stop
+        </Button>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ borderTop: '1px solid var(--w-05)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 18px' }}>
+        {dispatch && (
+          <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>
+            last dispatch {dispatch.status}
+          </span>
+        )}
+        <div style={{ flex: 1 }} />
+        {openTasks > 0 ? (
+          <Button
+            variant={showForm ? 'ghost' : 'primary'}
+            style={{ padding: '5px 14px', fontSize: 11.5 }}
+            title="Hand this plan to a runner — the server runs one agent per task, in parallel where dependencies allow"
+            onClick={(e) => {
+              e.stopPropagation();
+              setShowForm(!showForm);
+            }}
+          >
+            {showForm ? 'cancel' : '⚡ dispatch plan'}
+          </Button>
+        ) : (
+          <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-faint)' }}>all tasks closed</span>
+        )}
+      </div>
+      {showForm && (
+        <PlanDispatchForm
+          pid={pid}
+          planId={planId}
+          runners={runners}
+          onDone={() => {
+            setShowForm(false);
+            onChange();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function PlanDispatchForm({
+  pid,
+  planId,
+  runners,
+  onDone,
+}: {
+  pid: string;
+  planId: string;
+  runners: ApiRunner[];
+  onDone: () => void;
+}) {
+  // The pump creates BUILD runs, so the runner must advertise the kind and a repo that
+  // resolved to this project. Capacity is not gated here — the server throttles to slots.
+  const candidates = runners.filter(
+    (r) => r.status === 'online' && r.capabilities.kinds.includes('build') && r.repos.some((rp) => rp.projectId === pid),
+  );
+  const [runnerId, setRunnerId] = useState(candidates[0]?.id ?? '');
+  const runner = candidates.find((r) => r.id === runnerId) ?? null;
+  const repos = runner ? runner.repos.filter((rp) => rp.projectId === pid) : [];
+  const [repoRef, setRepoRef] = useState(repos[0]?.id ?? '');
+  const [agentTool, setAgentTool] = useState(runner?.capabilities.tools[0] ?? '');
+  const [model, setModel] = useState('');
+  const [effort, setEffort] = useState<RunEffort | ''>('');
+  const [gate, setGate] = useState<'landed' | 'approved'>('landed');
+  const [maxUsd, setMaxUsd] = useState('');
+  const [maxTokens, setMaxTokens] = useState('');
+  const [maxMinutes, setMaxMinutes] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  // Switching runner invalidates the repo/tool picks — re-seed them from the new one.
+  useEffect(() => {
+    const r = candidates.find((x) => x.id === runnerId) ?? null;
+    setRepoRef(r?.repos.find((rp) => rp.projectId === pid)?.id ?? '');
+    setAgentTool(r?.capabilities.tools[0] ?? '');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runnerId]);
+
+  const num = (s: string): number | null => {
+    const n = Number(s.trim());
+    return s.trim() && Number.isFinite(n) && n > 0 ? n : null;
+  };
+
+  const submit = async () => {
+    setErr(null);
+    if (!runnerId) return setErr('no online runner advertises a repo for this project (and the build kind)');
+    if (!repoRef) return setErr('pick a repo');
+    if (!agentTool) return setErr('this runner advertises no agent tools');
+    setBusy(true);
+    try {
+      await api.dispatchPlan(pid, planId, {
+        runnerId,
+        repoRef,
+        agentTool,
+        // Blank = don't override (RUN-33): '' would be a request for a model named "".
+        model: model.trim() || null,
+        effort: effort || null,
+        gate,
+        // Per-RUN ceilings — each task's agent gets this envelope, not a shared pool.
+        budget: { maxUsd: num(maxUsd), maxTokens: num(maxTokens), maxDurationSeconds: maxMinutes.trim() ? (num(maxMinutes) ?? 0) * 60 : null },
+      });
+      onDone();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'plan dispatch failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ margin: '0 18px 14px', padding: '14px 16px', borderRadius: 11, background: 'var(--w-04)', border: '1px solid var(--w-1)' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
+        <Field label="runner">
+          <Select value={runnerId} onChange={(e) => setRunnerId(e.target.value)}>
+            {candidates.map((r) => (
+              <option key={r.id} value={r.id}>{r.label} · {r.freeSlots}/{r.capabilities.maxConcurrency} slots</option>
+            ))}
+            {!candidates.length && <option value="">— no eligible runner online —</option>}
+          </Select>
+        </Field>
+        <Field label="repo">
+          <Select value={repoRef} onChange={(e) => setRepoRef(e.target.value)}>
+            {repos.map((r) => (
+              <option key={r.id} value={r.id}>{r.name || r.projectKey}{r.defaultBranch ? ` (${r.defaultBranch})` : ''}</option>
+            ))}
+          </Select>
+        </Field>
+        <Field label="agent">
+          <Select value={agentTool} onChange={(e) => setAgentTool(e.target.value)}>
+            {(runner?.capabilities.tools ?? []).map((t) => <option key={t} value={t}>{t}</option>)}
+          </Select>
+        </Field>
+        <Field label="model (optional)">
+          <TextInput
+            value={model}
+            onChange={(e: React.ChangeEvent<HTMLInputElement>) => setModel(e.target.value)}
+            placeholder="repo default"
+          />
+        </Field>
+        <Field label="effort (optional)">
+          <Select value={effort} onChange={(e) => setEffort(e.target.value as RunEffort | '')}>
+            <option value="">repo default</option>
+            {EFFORTS.map((x) => <option key={x} value={x}>{x}</option>)}
+          </Select>
+        </Field>
+        <Field label="review gate" hint="what unblocks a dependent task">
+          {/* The review-latency decision (PLNR-170). 'landed' keeps you as the reviewer without
+              making you a synchronous lock mid-pipeline; 'approved' holds dependents until you
+              mark each task done. */}
+          <Select value={gate} onChange={(e) => setGate(e.target.value as 'landed' | 'approved')}>
+            <option value="landed">landed — start dependents once code lands (review continues)</option>
+            <option value="approved">approved — dependents wait for my sign-off</option>
+          </Select>
+        </Field>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
+        <Field label="max $ per task" hint="optional">
+          <TextInput value={maxUsd} onChange={(e) => setMaxUsd(e.target.value)} inputMode="decimal" placeholder="—" />
+        </Field>
+        <Field label="max tokens per task" hint="optional">
+          <TextInput value={maxTokens} onChange={(e) => setMaxTokens(e.target.value)} inputMode="numeric" placeholder="—" />
+        </Field>
+        <Field label="max minutes per task" hint="optional">
+          <TextInput value={maxMinutes} onChange={(e) => setMaxMinutes(e.target.value)} inputMode="numeric" placeholder="—" />
+        </Field>
+      </div>
+
+      {err && <ErrorNote>{err}</ErrorNote>}
+
+      <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
+        <Button variant="primary" disabled={busy || !candidates.length} onClick={submit} style={{ padding: '8px 18px' }}>
+          {busy ? 'dispatching…' : 'dispatch plan'}
+        </Button>
+        <span style={{ flex: 1 }} />
+        <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)', alignSelf: 'center' }}>
+          one agent per task · parallel where dependencies allow
+        </span>
       </div>
     </div>
   );
