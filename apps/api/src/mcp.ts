@@ -109,6 +109,14 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
   const toolSpecs: ToolSpec[] = [];
   const resourceSpecs: ResourceSpec[] = [];
 
+  // RUN-47: a runner-spawned agent's tool floor, declared by the daemon when it created the
+  // agent. Advertising the full catalogue and letting the daemon's allowlist deny on use told
+  // the model a lie — it reported it COULD raise_alert because the server said so, then lost a
+  // turn to the refusal. Advertise only what the daemon will permit, so its allowlist and this
+  // catalogue are two views of one policy. Copilots (and agents from pre-RUN-47 daemons) carry
+  // no floor and see everything, as before.
+  const floor = agent.kind === 'agent' && agent.allowedTools ? new Set(agent.allowedTools) : null;
+
   // PLNR-54: in stateless Streamable HTTP there is NO standing GET SSE stream, so a
   // notification sent with no related request id is dropped by the transport. The fix
   // (per spec) is to ride the *current* tool call's POST SSE stream: tag the
@@ -171,6 +179,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     cb: (args: any, extra?: { requestId?: string | number }) => unknown,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
   ) => {
+    // Below the floor → not registered at all: absent from tools/list AND unknown on call,
+    // one consistent answer instead of advertise-then-deny. (The reference doc is unaffected:
+    // mcpReferenceSpecs builds with a floorless stub agent.)
+    if (floor && !floor.has(name)) return;
     // Capture the spec at definition time so the reference doc is generated from the
     // exact same zod schemas the tools validate against — it can't drift (PLNR-23).
     toolSpecs.push({ name, description, inputSchema });

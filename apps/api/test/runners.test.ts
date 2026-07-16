@@ -128,6 +128,26 @@ function parseBriefing(raw: string): { you: { id: string; kind: string; name: st
   return JSON.parse(msg.result.content[0]!.text);
 }
 
+/** One JSON-RPC call to /mcp, SSE-framed response parsed back to the raw message. */
+async function mcpRpcRaw(token: string, method: string, params: unknown): Promise<unknown> {
+  const res = await SELF.fetch('https://planar.test/mcp', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/event-stream',
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+  });
+  expect(res.status).toBe(200);
+  const line = (await res.text()).split('\n').find((l) => l.startsWith('data: '))!;
+  return JSON.parse(line.slice(6));
+}
+/** Same, unwrapped to `result` for calls expected to succeed. */
+async function mcpRpc(token: string, method: string, params: unknown): Promise<unknown> {
+  return (await mcpRpcRaw(token, method, params) as { result: unknown }).result;
+}
+
 describe('run agent creation (RUN-43)', () => {
   const createAgentFor = (token: string, runId: string, body: unknown = {}) =>
     SELF.fetch(`https://planar.test/api/runs/${runId}/agent`, {
@@ -183,6 +203,41 @@ describe('run agent creation (RUN-43)', () => {
     const briefing = parseBriefing(await mcp.text());
     expect(briefing.you.id).toBe(body.agentId);
     expect(briefing.you.kind).toBe('agent');
+  });
+
+  // RUN-47: the daemon declares its per-kind tool floor at agent creation, and the MCP
+  // server advertises exactly that — no more "here are 28 tools" followed by a denial.
+  it('advertises only the daemon-declared tool floor to the bound agent', async () => {
+    await seedRun('run_a47');
+    const floor = [
+      'set_agent_identity', 'get_briefing', 'get_task', 'get_plans', 'post_comment',
+      'read_open_comments', 'raise_alert', 'request_input', 'heartbeat',
+    ];
+    const res = await createAgentFor(ownerToken, 'run_a47', { allowedTools: floor });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { agentId: string; token: string };
+
+    const listed = await mcpRpc(body.token, 'tools/list', {});
+    const names = ((listed as { tools: Array<{ name: string }> }).tools).map((t) => t.name).sort();
+    expect(names).toEqual([...floor].sort());
+
+    // Below the floor → unknown on call, the same answer as the listing. The old behavior
+    // (advertise, then deny on use) is what cost an agent a turn and us a bug report.
+    const denied = await mcpRpcRaw(body.token, 'tools/call', { name: 'claim_task', arguments: { projectId: rnrxProjectId, taskId: 't' } });
+    expect(JSON.stringify(denied)).toMatch(/not found|unknown tool/i);
+
+    // Within the floor still works end to end.
+    const briefingRes = await mcpRpcRaw(body.token, 'tools/call', { name: 'get_briefing', arguments: {} });
+    const briefing = JSON.parse((briefingRes as { result: { content: Array<{ text: string }> } }).result.content[0]!.text);
+    expect(briefing.you.id).toBe(body.agentId);
+  });
+
+  it('an agent created without a floor sees the full catalogue (pre-RUN-47 daemons)', async () => {
+    await seedRun('run_a47b');
+    const body = (await (await createAgentFor(ownerToken, 'run_a47b')).json()) as { token: string };
+    const listed = await mcpRpc(body.token, 'tools/list', {});
+    // Not pinned to an exact count — the catalogue grows. The point is it is NOT a floor.
+    expect((listed as { tools: unknown[] }).tools.length).toBeGreaterThan(20);
   });
 
   it('refuses to issue a second credential for the same run', async () => {

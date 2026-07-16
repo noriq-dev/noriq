@@ -1422,6 +1422,11 @@ app.post('/api/runs/:runId/steer', userAuth, async (c) => {
 const RunAgentBody = z.object({
   label: z.string().min(1).max(60).optional(),
   role: z.enum(['orchestrator', 'worker']).default('worker'),
+  // RUN-47: the daemon's per-kind tool floor, declared at agent creation so the MCP server
+  // advertises exactly what the daemon will permit — one authority, one advertisement, no
+  // shared constant to drift. Optional: an older daemon that omits it gets the full
+  // catalogue, which is the pre-RUN-47 behavior it enforces against anyway.
+  allowedTools: z.array(z.string().min(1).max(64)).max(64).optional(),
 });
 app.post('/api/runs/:runId/agent', agentAuth, async (c) => {
   const runId = c.req.param('runId')!;
@@ -1464,9 +1469,12 @@ app.post('/api/runs/:runId/agent', agentAuth, async (c) => {
   // to the agent) → link back. 0026 made this cycle survivable by dropping NOT NULL from
   // oauth_tokens.agent_id; PLNR-143 is where the cycle stops existing at all.
   await c.env.DB.prepare(
-    `INSERT INTO agents (id, name, label, role, status, kind, user_id, project_id, runner_id, last_seen_at, created_at)
-     VALUES (?, ?, ?, ?, 'active', 'agent', ?, ?, ?, ?, ?)`,
-  ).bind(agentId, name, label, b.role, conn.userId, run.projectId, run.runnerId, nowIso(), nowIso()).run();
+    `INSERT INTO agents (id, name, label, role, status, kind, user_id, project_id, runner_id, allowed_tools, last_seen_at, created_at)
+     VALUES (?, ?, ?, ?, 'active', 'agent', ?, ?, ?, ?, ?, ?)`,
+  ).bind(
+    agentId, name, label, b.role, conn.userId, run.projectId, run.runnerId,
+    b.allowedTools ? JSON.stringify(b.allowedTools) : null, nowIso(), nowIso(),
+  ).run();
   const tokens = await issueTokens(c.env.DB, conn.clientId, conn.userId, agentId, 'mcp');
   await c.env.DB.batch([
     c.env.DB.prepare('UPDATE agents SET oauth_token_id = ? WHERE id = ?').bind(tokens.tokenId, agentId),
