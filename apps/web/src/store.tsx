@@ -224,6 +224,14 @@ export function useAppStore() {
     let retry = 0;
     let socket: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    // Liveness (PLNR-162): reconnect used to hinge entirely on `onclose`, but a socket
+    // killed by laptop sleep, a network change, or a proxy idle-timeout often dies
+    // WITHOUT a close frame — the tab believed it was live and went silently stale
+    // forever. Track real activity (any frame, incl. pong replies to our pings) and
+    // treat a quiet-too-long socket as dead.
+    let lastActivity = Date.now();
+    const PING_MS = 45_000;
+    const STALE_MS = PING_MS * 2 + 10_000; // two missed pongs + slack
 
     const connect = () => {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -231,9 +239,15 @@ export function useAppStore() {
       wsRef.current = socket;
       socket.onopen = () => {
         retry = 0;
+        lastActivity = Date.now();
+        // sinceSeq resume: the backlog replays anything missed while disconnected.
         socket?.send(JSON.stringify({ type: 'subscribe', projectId: currentPid, sinceSeq: lastSeq.current }));
       };
-      socket.onmessage = () => {
+      socket.onmessage = (ev) => {
+        lastActivity = Date.now();
+        try {
+          if ((JSON.parse(ev.data as string) as { type?: string }).type === 'pong') return; // liveness only
+        } catch { /* non-JSON frame — treat as an event */ }
         // Any event (or backlog) → debounced snapshot refresh; comments too if drawer open.
         if (refreshTimer.current) clearTimeout(refreshTimer.current);
         refreshTimer.current = setTimeout(() => {
@@ -247,9 +261,46 @@ export function useAppStore() {
         reconnectTimer = setTimeout(connect, Math.min(1000 * 2 ** retry, 15000));
       };
     };
+
+    /** If the socket is gone or has been quiet past the pong deadline, tear it down —
+     *  `onclose` then drives the normal backoff reconnect. */
+    const ensureLive = () => {
+      if (closed) return;
+      if (!socket || socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING) {
+        if (!reconnectTimer) connect();
+      } else if (socket.readyState === WebSocket.OPEN && Date.now() - lastActivity > STALE_MS) {
+        socket.close(); // silent corpse — bury it and let onclose reconnect
+      }
+    };
+
+    // Heartbeat: ping while visible. Background tabs throttle this interval — fine;
+    // the wake-up path below owns the resync when the tab comes back.
+    const heartbeat = setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      ensureLive();
+      if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'ping' }));
+    }, PING_MS);
+
+    // Wake-up resync: on returning to the tab (or the network returning), verify the
+    // socket AND refetch the snapshot outright — even a healthy socket can have had
+    // its debounced refresh throttled away while backgrounded.
+    const onWake = () => {
+      if (document.visibilityState !== 'visible') return;
+      ensureLive();
+      if (pidRef.current) void loadSnapshot(pidRef.current);
+      if (selRef.current) void loadComments(selRef.current);
+    };
+    document.addEventListener('visibilitychange', onWake);
+    window.addEventListener('focus', onWake);
+    window.addEventListener('online', onWake);
+
     connect();
     return () => {
       closed = true;
+      clearInterval(heartbeat);
+      document.removeEventListener('visibilitychange', onWake);
+      window.removeEventListener('focus', onWake);
+      window.removeEventListener('online', onWake);
       if (reconnectTimer) clearTimeout(reconnectTimer);
       socket?.close();
     };
