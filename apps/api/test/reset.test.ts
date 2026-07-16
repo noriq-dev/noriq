@@ -39,7 +39,7 @@ describe('forgot / reset password (PLNR-87)', () => {
 
     const res = await post('/api/reset/good-token-123', { password: 'brandnewpass1' });
     expect(res.status).toBe(200);
-    expect(res.headers.get('Set-Cookie')).toContain('planar_session=');
+    expect(res.headers.get('Set-Cookie')).toContain('noriq_session=');
 
     // new password works, old fails, token is single-use, old session is dead
     expect(await loginSession('reset-me@example.com', 'brandnewpass1')).toBeTruthy();

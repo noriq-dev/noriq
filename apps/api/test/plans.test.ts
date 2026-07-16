@@ -17,7 +17,7 @@ describe('first-run setup', () => {
         body: JSON.stringify({ email: 'founder@example.com', name: 'Founder', password: 'longenough1' }),
       });
       expect(res.status).toBe(200);
-      expect(res.headers.get('Set-Cookie')).toContain('planar_session=');
+      expect(res.headers.get('Set-Cookie')).toContain('noriq_session=');
     }
 
     // Now configured: further setup attempts are refused.

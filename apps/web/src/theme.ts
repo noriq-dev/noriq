@@ -1,12 +1,13 @@
 // Theme preference: explicit choice in localStorage, else the system scheme.
 import { useEffect, useState } from 'react';
+import { migratedGet } from './prefs';
 
-const KEY = 'planar.theme';
+const KEY = 'noriq.theme';
 
 export type Theme = 'dark' | 'light';
 
 export function resolveTheme(): Theme {
-  const stored = localStorage.getItem(KEY);
+  const stored = migratedGet(KEY);
   if (stored === 'dark' || stored === 'light') return stored;
   return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
 }
@@ -19,7 +20,7 @@ export function initTheme() {
   applyTheme(resolveTheme());
   // Follow system changes only while the user hasn't chosen explicitly.
   window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
-    if (!localStorage.getItem(KEY)) applyTheme(resolveTheme());
+    if (!migratedGet(KEY)) applyTheme(resolveTheme());
   });
 }
 
@@ -27,7 +28,7 @@ export function toggleTheme(): Theme {
   const next: Theme = resolveTheme() === 'dark' ? 'light' : 'dark';
   localStorage.setItem(KEY, next);
   applyTheme(next);
-  window.dispatchEvent(new CustomEvent('planar-theme', { detail: next }));
+  window.dispatchEvent(new CustomEvent('noriq-theme', { detail: next }));
   return next;
 }
 
@@ -36,8 +37,8 @@ export function useTheme(): [Theme, () => void] {
   const [theme, setTheme] = useState(resolveTheme());
   useEffect(() => {
     const onChange = () => setTheme(resolveTheme());
-    window.addEventListener('planar-theme', onChange);
-    return () => window.removeEventListener('planar-theme', onChange);
+    window.addEventListener('noriq-theme', onChange);
+    return () => window.removeEventListener('noriq-theme', onChange);
   }, []);
   return [theme, () => { toggleTheme(); }];
 }

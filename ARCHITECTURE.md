@@ -76,7 +76,7 @@ First-time setup on a Cloudflare account:
 ```sh
 wrangler login                       # or CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID
 cd apps/api
-wrangler d1 create planar            # then paste database_id into wrangler.jsonc
+wrangler d1 create noriq            # then paste database_id into wrangler.jsonc
 npm run db:migrate:remote
 npm run deploy                       # creates your domain's record + cert automatically
 ```

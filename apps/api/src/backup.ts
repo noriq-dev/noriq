@@ -4,8 +4,10 @@
 // sqlite_master so the dump follows the live schema (no drift as migrations land).
 import type { Env } from './env';
 
+// Snapshots taken before the PLNR-143 rename carry `planar: 'd1-snapshot'` as the
+// marker key instead — both generations are valid restore sources (see BACKUP.md).
 export type Snapshot = {
-  planar: 'd1-snapshot';
+  noriq: 'd1-snapshot';
   version: 1;
   exportedAt: string;
   tables: Record<string, unknown[]>;
@@ -31,14 +33,14 @@ export async function exportSnapshot(env: Env, exportedAt: string): Promise<Snap
     tables[t] = results;
     counts[t] = results.length;
   }
-  return { planar: 'd1-snapshot', version: 1, exportedAt, tables, counts };
+  return { noriq: 'd1-snapshot', version: 1, exportedAt, tables, counts };
 }
 
 /** Write a timestamped snapshot to R2 (backups/…); no-op if R2 isn't configured. */
 export async function backupToR2(env: Env, exportedAt: string): Promise<{ ok: boolean; key?: string; reason?: string }> {
   if (!env.FILES) return { ok: false, reason: 'R2 (FILES) not configured' };
   const snapshot = await exportSnapshot(env, exportedAt);
-  const key = `backups/planar-${exportedAt.replace(/[:.]/g, '-')}.json`;
+  const key = `backups/noriq-${exportedAt.replace(/[:.]/g, '-')}.json`;
   await env.FILES.put(key, JSON.stringify(snapshot), { httpMetadata: { contentType: 'application/json' } });
   return { ok: true, key };
 }

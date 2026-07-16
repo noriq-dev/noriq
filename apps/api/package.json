@@ -9,8 +9,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "cf-typegen": "wrangler types",
-    "db:migrate:local": "wrangler d1 migrations apply planar --local",
-    "db:migrate:remote": "sh -c 'wrangler d1 migrations apply planar --remote --config $([ -f wrangler.production.jsonc ] && echo wrangler.production.jsonc || echo wrangler.jsonc)'"
+    "db:migrate:local": "wrangler d1 migrations apply DB --local",
+    "db:migrate:remote": "sh -c 'wrangler d1 migrations apply DB --remote --config $([ -f wrangler.production.jsonc ] && echo wrangler.production.jsonc || echo wrangler.jsonc)'"
   },
   "dependencies": {
     "@hono/mcp": "^0.3.1",

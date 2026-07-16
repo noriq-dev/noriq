@@ -11,7 +11,7 @@ import {
 } from '@simplewebauthn/server';
 import type { AppContext } from './auth';
 import type { Env } from './env';
-import { userAuth } from './auth';
+import { sessionSetCookie, userAuth } from './auth';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex } from './lib/util';
 import { sendInviteEmail, sendPasswordResetEmail } from './email';
 
@@ -31,7 +31,7 @@ async function createSession(db: D1Database, userId: string): Promise<{ cookie: 
   const expires = new Date(Date.now() + 30 * 24 * 3600 * 1000);
   await db.prepare('INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)')
     .bind(await sha256Hex(sid), userId, expires.toISOString()).run();
-  return { cookie: `planar_session=${sid}; HttpOnly; Secure; SameSite=Lax; Path=/; Expires=${expires.toUTCString()}` };
+  return { cookie: sessionSetCookie(sid, expires) };
 }
 
 async function saveChallenge(db: D1Database, challenge: string, kind: 'register' | 'login', userId?: string) {

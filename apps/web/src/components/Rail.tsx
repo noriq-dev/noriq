@@ -6,10 +6,11 @@ import type { ProjectVM } from '../types';
 import { LiveDot } from './bits';
 import { ThemeButton } from './ThemeButton';
 import { Logo } from './Logo';
+import { migratedGet } from '../prefs';
 
 function loadCollapsed(): Record<string, boolean> {
   try {
-    return JSON.parse(localStorage.getItem('planar.sidebar.collapsed') ?? '{}');
+    return JSON.parse(migratedGet('noriq.sidebar.collapsed') ?? '{}');
   } catch {
     return {};
   }
@@ -35,7 +36,7 @@ export function Rail({ store, open, onNavigate }: { store: AppStore; open?: bool
   const toggle = (gid: string) => {
     setCollapsed((c) => {
       const next = { ...c, [gid]: !c[gid] };
-      localStorage.setItem('planar.sidebar.collapsed', JSON.stringify(next));
+      localStorage.setItem('noriq.sidebar.collapsed', JSON.stringify(next));
       return next;
     });
   };

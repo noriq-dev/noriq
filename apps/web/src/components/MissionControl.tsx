@@ -6,6 +6,7 @@ import { QuestionForm } from './QuestionForm';
 import { Markdown } from './Markdown';
 import { AvatarChip, MonoTag, SectionLabel, WaveBars } from './bits';
 import { Composer } from './Composer';
+import { migratedGet } from '../prefs';
 
 export function MissionControl({ store }: { store: AppStore }) {
   return (
@@ -323,14 +324,14 @@ function EventFeed({ store }: { store: AppStore }) {
   const { data, currentPid, actions } = store;
   // Direction toggle (PLNR-149): 'bottom' = chat-style (oldest top, newest arriving at
   // the bottom — the default); 'top' = classic activity feed (newest first). Sticky per
-  // browser via localStorage (infra key stays planar.*, see CLAUDE.md naming).
+  // browser via localStorage.
   const [dir, setDir] = useState<'bottom' | 'top'>(
-    () => (localStorage.getItem('planar.feedDir') === 'top' ? 'top' : 'bottom'),
+    () => (migratedGet('noriq.feedDir') === 'top' ? 'top' : 'bottom'),
   );
   const flip = () => {
     const next = dir === 'bottom' ? 'top' : 'bottom';
     setDir(next);
-    localStorage.setItem('planar.feedDir', next);
+    localStorage.setItem('noriq.feedDir', next);
   };
   // The store keeps events newest-first (Graph and the agent detail rely on that).
   const events = dir === 'bottom' ? [...(data.events[currentPid] ?? [])].reverse() : data.events[currentPid] ?? [];

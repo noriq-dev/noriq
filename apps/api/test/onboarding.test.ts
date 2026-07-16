@@ -48,7 +48,7 @@ describe('invites', () => {
       body: JSON.stringify({ password: 'newbiepass123' }),
     });
     expect(accept.status).toBe(200);
-    expect(accept.headers.get('Set-Cookie')).toContain('planar_session=');
+    expect(accept.headers.get('Set-Cookie')).toContain('noriq_session=');
 
     // token is single-use
     const again = await SELF.fetch(`https://planar.test/api/invites/${token}/accept`, { method: 'POST' });
@@ -56,7 +56,7 @@ describe('invites', () => {
 
     // the password works for normal login
     const cookie = await loginSession('newbie@example.com', 'newbiepass123');
-    expect(cookie).toContain('planar_session=');
+    expect(cookie).toContain('noriq_session=');
   });
 
   it('non-admins cannot invite', async () => {

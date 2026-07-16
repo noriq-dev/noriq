@@ -9,9 +9,9 @@ describe('D1 backup/export', () => {
       headers: { Authorization: `Bearer ${ADMIN}` },
     });
     expect(res.status).toBe(200);
-    expect(res.headers.get('Content-Disposition')).toMatch(/attachment; filename="planar-/);
-    const snap = (await res.json()) as { planar: string; tables: Record<string, unknown[]>; counts: Record<string, number> };
-    expect(snap.planar).toBe('d1-snapshot');
+    expect(res.headers.get('Content-Disposition')).toMatch(/attachment; filename="noriq-/);
+    const snap = (await res.json()) as { noriq: string; tables: Record<string, unknown[]>; counts: Record<string, number> };
+    expect(snap.noriq).toBe('d1-snapshot');
     // Core tables present, discovered from sqlite_master (not a hard-coded list).
     for (const t of ['users', 'projects', 'tasks', 'agents']) {
       const rows = snap.tables[t];

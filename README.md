@@ -40,7 +40,7 @@ cp wrangler.production.jsonc.example wrangler.production.jsonc
 
 # 3. Create the database, then paste the printed database_id into
 #    wrangler.production.jsonc (the d1_databases[0].database_id field)
-npx wrangler d1 create planar
+npx wrangler d1 create noriq
 
 # 4. Migrate, build, ship
 npm run db:migrate:remote
@@ -69,7 +69,7 @@ works** — inviting a user hands you a copyable invite link to deliver yourself
 ### Attachments & backups (optional)
 
 Task attachments and the automatic daily D1 backup both use R2. Enable R2 on your
-account, then `wrangler r2 bucket create planar-files` (the `FILES` binding and the
+account, then `wrangler r2 bucket create noriq-files` (the `FILES` binding and the
 backup cron are already in the example config). Without R2, attachments report as not
 configured and the backup cron is a logged no-op. See [BACKUP.md](apps/api/BACKUP.md)
 for the on-demand export endpoint and restore steps.

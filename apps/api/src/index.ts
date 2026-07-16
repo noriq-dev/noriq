@@ -3,7 +3,7 @@ import type { Context, Next } from 'hono';
 import { cors } from 'hono/cors';
 import { StreamableHTTPTransport } from '@hono/mcp';
 import type { Env } from './env';
-import { adminAuth, agentAuth, getCookie, resolveSessionAgent, userAuth, type AppContext } from './auth';
+import { adminAuth, agentAuth, readSessionId, resolveSessionAgent, SESSION_CLEAR_COOKIES, sessionSetCookie, userAuth, type AppContext } from './auth';
 import { buildMcpServer } from './mcp';
 import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot } from './backup';
@@ -162,7 +162,7 @@ app.get('/ws/projects/:projectId', async (c) => {
   // upgrade. Previously this forwarded straight to the DO with NO check, so anyone
   // could subscribe to any project's entire event log. Mirror VISIBILITY_WHERE
   // (owner / group member / admin); 404 (not 403) so project existence doesn't leak.
-  const sid = getCookie(c.req.header('Cookie') ?? '', 'planar_session');
+  const sid = readSessionId(c.req.header('Cookie') ?? '');
   const user = sid
     ? await c.env.DB.prepare(
         `SELECT u.id, u.role FROM sessions s JOIN users u ON u.id = s.user_id
@@ -203,7 +203,7 @@ app.get('/api/admin/export', adminAuth, async (c) => {
   const at = nowIso();
   const snapshot = await exportSnapshot(c.env, at);
   return c.json(snapshot, 200, {
-    'Content-Disposition': `attachment; filename="planar-${at.replace(/[:.]/g, '-')}.json"`,
+    'Content-Disposition': `attachment; filename="noriq-${at.replace(/[:.]/g, '-')}.json"`,
   });
 });
 
@@ -248,7 +248,7 @@ app.post('/api/setup', async (c) => {
   const expires = new Date(Date.now() + 30 * 24 * 3600 * 1000);
   await c.env.DB.prepare('INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)')
     .bind(await sha256Hex(sid), id, expires.toISOString()).run();
-  c.header('Set-Cookie', `planar_session=${sid}; HttpOnly; Secure; SameSite=Lax; Path=/; Expires=${expires.toUTCString()}`);
+  c.header('Set-Cookie', sessionSetCookie(sid, expires));
   return c.json({ user: { id, email: body.email, name: body.name, role: 'admin' } });
 });
 
@@ -270,7 +270,7 @@ app.post('/api/demo/login', async (c) => {
   const expires = new Date(Date.now() + 24 * 3600 * 1000); // demo sessions live one day
   await c.env.DB.prepare('INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)')
     .bind(await sha256Hex(sid), user!.id, expires.toISOString()).run();
-  c.header('Set-Cookie', `planar_session=${sid}; HttpOnly; Secure; SameSite=Lax; Path=/; Expires=${expires.toUTCString()}`);
+  c.header('Set-Cookie', sessionSetCookie(sid, expires));
   return c.json({ user });
 });
 
@@ -288,12 +288,12 @@ app.post('/api/auth/login', async (c) => {
   const expires = new Date(Date.now() + 30 * 24 * 3600 * 1000);
   await c.env.DB.prepare('INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)')
     .bind(await sha256Hex(sid), user.id, expires.toISOString()).run();
-  c.header('Set-Cookie', `planar_session=${sid}; HttpOnly; Secure; SameSite=Lax; Path=/; Expires=${expires.toUTCString()}`);
+  c.header('Set-Cookie', sessionSetCookie(sid, expires));
   return c.json({ user: { id: user.id, email: user.email, name: user.name, role: user.role } });
 });
 
 app.post('/api/auth/logout', userAuth, async (c) => {
-  c.header('Set-Cookie', 'planar_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0');
+  for (const cookie of SESSION_CLEAR_COOKIES) c.header('Set-Cookie', cookie, { append: true });
   return c.json({ ok: true });
 });
 

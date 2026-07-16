@@ -3,14 +3,14 @@
 // without it, the generic wrangler.jsonc deploys to <name>.workers.dev.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "planar",
+  "name": "noriq",
   "main": "src/index.ts",
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat"],
 
   // Your custom domain (zone must be on your Cloudflare account). Wrangler
   // creates the DNS record + certificate on deploy. Delete to use workers.dev.
-  "routes": [{ "pattern": "planar.example.com", "custom_domain": true }],
+  "routes": [{ "pattern": "noriq.example.com", "custom_domain": true }],
 
   "assets": {
     "directory": "../web/dist",
@@ -36,8 +36,8 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "planar",
-      "database_id": "<your d1 database id from: wrangler d1 create planar>",
+      "database_name": "noriq",
+      "database_id": "<your d1 database id from: wrangler d1 create noriq>",
       "migrations_dir": "migrations"
     }
   ],
@@ -45,12 +45,12 @@
   // OPTIONAL — email invites. Requires: wrangler email sending enable <your-domain>
   // Delete both if unused; invites fall back to copyable links.
   "send_email": [{ "name": "EMAIL" }],
-  "vars": { "EMAIL_FROM": "planar@example.com" },
+  "vars": { "EMAIL_FROM": "noriq@example.com" },
 
   // OPTIONAL — task attachments. Requires R2 enabled on the account, then:
-  //   wrangler r2 bucket create planar-files
+  //   wrangler r2 bucket create noriq-files
   // Delete if unused; the attachments UI reports it as not configured.
-  "r2_buckets": [{ "binding": "FILES", "bucket_name": "planar-files" }],
+  "r2_buckets": [{ "binding": "FILES", "bucket_name": "noriq-files" }],
 
 
   // Daily D1 backup to R2 at 06:00 UTC (PLNR-21); snapshots land under backups/ (see BACKUP.md).

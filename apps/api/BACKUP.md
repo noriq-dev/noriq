@@ -7,7 +7,8 @@ paths — pick either or both.
 
 The Worker has a cron trigger (`0 6 * * *`, 06:00 UTC — see `wrangler.jsonc`) that
 writes a full logical snapshot of every table to the R2 bucket bound as `FILES`,
-under `backups/planar-<timestamp>.json`.
+under `backups/noriq-<timestamp>.json`. (Snapshots taken before the
+planar→Noriq rename are keyed `backups/planar-*.json` — equally valid restore sources.)
 
 - Requires R2 to be enabled and `FILES` bound (it already is in
   `wrangler.production.jsonc`). Without R2 the cron is a logged no-op — safe to leave on.
@@ -24,7 +25,8 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" \
   https://<your-host>/api/admin/export -o noriq-backup.json
 ```
 
-The snapshot is `{ planar: "d1-snapshot", version, exportedAt, counts, tables }`,
+The snapshot is `{ noriq: "d1-snapshot", version, exportedAt, counts, tables }`
+(pre-rename snapshots use `planar` as the marker key),
 where `tables` maps each table name to its rows. Tables are discovered from
 `sqlite_master`, so the dump always follows the live schema.
 
@@ -37,10 +39,10 @@ than the JSON snapshot:
 
 ```sh
 # Back up (SQL):
-wrangler d1 export planar --remote --output planar.sql --config wrangler.production.jsonc
+wrangler d1 export noriq --remote --output noriq.sql --config wrangler.production.jsonc
 
 # Restore into a fresh/empty database:
-wrangler d1 execute planar --remote --file planar.sql --config wrangler.production.jsonc
+wrangler d1 execute noriq --remote --file noriq.sql --config wrangler.production.jsonc
 ```
 
 Keep a periodic `wrangler d1 export` in your own CI/cron if you want SQL-level backups
@@ -49,7 +51,7 @@ in addition to the R2 JSON snapshots.
 ### Option B — from a JSON snapshot
 
 The JSON snapshot (from the cron or `/api/admin/export`) is a logical dump. To restore
-it into an empty, freshly-migrated database (`wrangler d1 migrations apply planar`),
+it into an empty, freshly-migrated database (`wrangler d1 migrations apply noriq`),
 replay each table's rows as `INSERT`s in dependency order (parents before children —
 e.g. `users`, `groups`, `projects`, then `tasks`, then `comments`/`claims`/`events`…).
 A small script that reads the JSON and generates parameterized inserts per table is the

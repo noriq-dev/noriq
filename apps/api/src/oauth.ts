@@ -12,7 +12,7 @@ import { Hono } from 'hono';
 import type { Context } from 'hono';
 import type { AppContext } from './auth';
 import type { Env } from './env';
-import { getCookie } from './auth';
+import { readSessionId } from './auth';
 import { USER_PROJECT_WHERE } from './lib/visibility';
 import { newId, nowIso, sha256Hex } from './lib/util';
 import { isCimdId, redirectUriAllowed, resolveCimdClient } from './lib/cimd';
@@ -148,7 +148,7 @@ oauth.post('/register', async (c) => {
 
 // --- authorize + consent ------------------------------------------------------------
 async function currentUser(c: { env: { DB: D1Database }; req: { header: (n: string) => string | undefined } }) {
-  const sid = getCookie(c.req.header('Cookie') ?? '', 'planar_session');
+  const sid = readSessionId(c.req.header('Cookie') ?? '');
   if (!sid) return null;
   return await c.env.DB.prepare(
     `SELECT u.id, u.name, u.email FROM sessions s JOIN users u ON u.id = s.user_id
