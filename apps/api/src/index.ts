@@ -329,6 +329,75 @@ app.post('/api/auth/sessions/:id/revoke', userAuth, async (c) => {
   return c.json({ ok: true, revoked: r.meta.changes ?? 0 });
 });
 
+// --- Admin OAuth management (PLNR-160) --------------------------------------------
+// The per-user /api/auth/sessions view, widened instance-wide for admins: every live
+// connection (whose, from which client, reaching what), revocable; plus the registered
+// OAuth clients with cleanup for stale registrations.
+app.get('/api/admin/oauth/connections', userAuth, async (c) => {
+  if (c.var.user!.role !== 'admin') return c.json({ error: 'admin role required' }, 403);
+  const { results } = await c.env.DB.prepare(
+    `SELECT t.id, u.name AS userName, u.email AS userEmail,
+            COALESCE(cl.name, 'MCP client') AS clientName, t.created_at AS createdAt, t.expires_at AS expiresAt,
+            t.scoped_at IS NOT NULL AS scoped, t.scope_all AS scopeAll,
+            t.agent_id IS NOT NULL AS bound,
+            (SELECT GROUP_CONCAT(p.key) FROM oauth_token_projects otp JOIN projects p ON p.id = otp.project_id
+              WHERE otp.token_id = t.id) AS projectKeys,
+            (SELECT COUNT(*) FROM agents a WHERE a.oauth_token_id = t.id AND a.status != 'revoked') AS agentCount,
+            (SELECT MAX(a.last_seen_at) FROM agents a WHERE a.oauth_token_id = t.id) AS lastActive
+     FROM oauth_tokens t
+     LEFT JOIN oauth_clients cl ON cl.id = t.client_id
+     LEFT JOIN users u ON u.id = t.user_id
+     WHERE t.revoked_at IS NULL AND t.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     ORDER BY t.created_at DESC`,
+  ).all();
+  return c.json({ connections: results });
+});
+
+app.post('/api/admin/oauth/connections/:id/revoke', userAuth, async (c) => {
+  if (c.var.user!.role !== 'admin') return c.json({ error: 'admin role required' }, 403);
+  const r = await c.env.DB.prepare('UPDATE oauth_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL')
+    .bind(nowIso(), c.req.param('id')).run();
+  await c.env.DB.prepare("UPDATE agents SET status = 'offline' WHERE oauth_token_id = ? AND status = 'active'")
+    .bind(c.req.param('id')).run();
+  return c.json({ ok: true, revoked: r.meta.changes ?? 0 });
+});
+
+app.get('/api/admin/oauth/clients', userAuth, async (c) => {
+  if (c.var.user!.role !== 'admin') return c.json({ error: 'admin role required' }, 403);
+  const { results } = await c.env.DB.prepare(
+    `SELECT cl.id, cl.name, cl.redirect_uris AS redirectUris, cl.created_at AS createdAt,
+            (SELECT COUNT(*) FROM oauth_tokens t WHERE t.client_id = cl.id AND t.revoked_at IS NULL
+               AND t.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')) AS liveTokens
+     FROM oauth_clients cl ORDER BY cl.created_at DESC`,
+  ).all();
+  return c.json({ clients: results });
+});
+
+app.delete('/api/admin/oauth/clients/:id', userAuth, async (c) => {
+  if (c.var.user!.role !== 'admin') return c.json({ error: 'admin role required' }, 403);
+  const cid = c.req.param('id')!;
+  // A client with live tokens is in use — revoke the connections first, deliberately;
+  // deleting out from under them would strand rows and surprise the users involved.
+  const live = await c.env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM oauth_tokens WHERE client_id = ? AND revoked_at IS NULL
+       AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
+  ).bind(cid).first<{ n: number }>();
+  if ((live?.n ?? 0) > 0) return c.json({ error: `client has ${live!.n} live connection(s) — revoke them first` }, 409);
+  await c.env.DB.batch([
+    c.env.DB.prepare('DELETE FROM oauth_codes WHERE client_id = ?').bind(cid),
+    c.env.DB.prepare('DELETE FROM oauth_device_codes WHERE client_id = ?').bind(cid),
+    // Historical (revoked/expired) tokens FK the client, and agents.oauth_token_id FKs the
+    // tokens (0009) — unhook the agents first (they survive; a dead token grants nothing),
+    // then remove the token rows, then the client. D1 enforces FKs on execute, so order is
+    // load-bearing.
+    c.env.DB.prepare('UPDATE agents SET oauth_token_id = NULL WHERE oauth_token_id IN (SELECT id FROM oauth_tokens WHERE client_id = ?)').bind(cid),
+    c.env.DB.prepare('DELETE FROM oauth_token_projects WHERE token_id IN (SELECT id FROM oauth_tokens WHERE client_id = ?)').bind(cid),
+    c.env.DB.prepare('DELETE FROM oauth_tokens WHERE client_id = ?').bind(cid),
+    c.env.DB.prepare('DELETE FROM oauth_clients WHERE id = ?').bind(cid),
+  ]);
+  return c.json({ ok: true });
+});
+
 app.post('/api/auth/sessions/revoke-all', userAuth, async (c) => {
   const now = nowIso();
   const r = await c.env.DB.prepare("UPDATE oauth_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL")

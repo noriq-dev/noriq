@@ -717,3 +717,57 @@ describe('templates', () => {
     expect(first.body.task.type).toBe('feature');
   });
 });
+
+// ---- PLNR-160: admin OAuth management --------------------------------------------------
+describe('admin OAuth management', () => {
+  it('admin sees every connection, can revoke any; client delete refuses while live', async () => {
+    // A member is locked out of all four endpoints.
+    await createUser('oauthrando@example.com', 'OAuth Rando', 'longenough1', 'member').catch(() => {});
+    const member = await loginSession('oauthrando@example.com', 'longenough1');
+    for (const [m, path] of [['GET', '/api/admin/oauth/connections'], ['GET', '/api/admin/oauth/clients']] as const) {
+      expect((await SELF.fetch(`https://planar.test${path}`, { method: m, headers: { Cookie: member } })).status).toBe(403);
+    }
+
+    // The admin sees connections across users (the agent fixtures' mint user included).
+    const conns = (await (await SELF.fetch('https://planar.test/api/admin/oauth/connections', {
+      headers: { Cookie: cookie },
+    })).json()) as { connections: Array<{ id: string; userEmail: string | null; agentCount: number }> };
+    expect(conns.connections.length).toBeGreaterThan(0);
+
+    // Revoke a fresh victim's connection admin-side; its MCP access dies.
+    const victim = await createAgent('admin-revoke-victim');
+    await mcpCall(victim.apiKey, 'get_briefing', {});
+    const after = (await (await SELF.fetch('https://planar.test/api/admin/oauth/connections', {
+      headers: { Cookie: cookie },
+    })).json()) as { connections: Array<{ id: string; agentCount: number; lastActive: string | null }> };
+    const fresh = after.connections.find((x) => !conns.connections.some((o) => o.id === x.id));
+    expect(fresh).toBeTruthy();
+    const rev = await SELF.fetch(`https://planar.test/api/admin/oauth/connections/${fresh!.id}/revoke`, {
+      method: 'POST', headers: { Cookie: cookie },
+    });
+    expect(rev.status).toBe(200);
+    const dead = await mcpCall(victim.apiKey, 'get_briefing', {}).catch((e) => e);
+    expect(String(dead)).toContain('401');
+
+    // Clients list shows the shared test client with live connections → delete refused.
+    const clients = (await (await SELF.fetch('https://planar.test/api/admin/oauth/clients', {
+      headers: { Cookie: cookie },
+    })).json()) as { clients: Array<{ id: string; liveTokens: number }> };
+    const busy = clients.clients.find((x) => x.liveTokens > 0)!;
+    expect(busy).toBeTruthy();
+    const refuse = await SELF.fetch(`https://planar.test/api/admin/oauth/clients/${busy.id}`, {
+      method: 'DELETE', headers: { Cookie: cookie },
+    });
+    expect(refuse.status).toBe(409);
+
+    // A fresh, unused client deletes cleanly.
+    const reg = (await (await SELF.fetch('https://planar.test/oauth/register', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_name: 'stale client', redirect_uris: ['http://localhost:1/cb'] }),
+    })).json()) as { client_id: string };
+    const del = await SELF.fetch(`https://planar.test/api/admin/oauth/clients/${reg.client_id}`, {
+      method: 'DELETE', headers: { Cookie: cookie },
+    });
+    expect(del.status).toBe(200);
+  });
+});

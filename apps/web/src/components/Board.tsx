@@ -28,6 +28,10 @@ export function Board({ store }: { store: AppStore }) {
   const [msFilter, setMsFilter] = useState<string | null>(null);
   const [tagFilter, setTagFilter] = useState<string | null>(null);
   const [query, setQuery] = useState('');
+  // Attribute filters (PLNR-161): the triage axes the milestone/tag/text bar didn't cover.
+  const [prioFilter, setPrioFilter] = useState(0); // minimum priority; 0 = any
+  const [typeFilter, setTypeFilter] = useState('');
+  const [stateFilter, setStateFilter] = useState<'' | 'unblocked' | 'grabbable' | 'overdue'>('');
   // Multi-select for bulk triage (PLNR-125): shift/cmd-click gathers cards; a plain
   // click still opens the drawer, so the two gestures never fight.
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -47,11 +51,23 @@ export function Board({ store }: { store: AppStore }) {
     boardId === null || tBoardId === boardId || (tBoardId == null && boardId === firstBoardId);
 
   const q = query.trim().toLowerCase();
+  const stateOk = (t: (typeof tasks)[number]): boolean => {
+    if (!stateFilter) return true;
+    const openish = t.status !== 'done' && t.status !== 'cancelled';
+    if (stateFilter === 'overdue') return openish && !!t.dueAt && new Date(t.dueAt).getTime() < Date.now();
+    const unblocked = helpers.effStatus(currentPid, t) !== 'blocked';
+    if (stateFilter === 'unblocked') return openish && unblocked;
+    // grabbable = what an agent could claim right now.
+    return t.status === 'todo' && unblocked && !t.claimedBy;
+  };
   const visible = tasks.filter(
     (t) =>
       onBoard(t.boardId) &&
       (msFilter === null || t.milestoneId === msFilter) &&
       (tagFilter === null || t.tagIds.includes(tagFilter)) &&
+      (prioFilter === 0 || t.priority >= prioFilter) &&
+      (typeFilter === '' || t.type === typeFilter) &&
+      stateOk(t) &&
       (q === '' ||
         t.title.toLowerCase().includes(q) ||
         t.key.toLowerCase().includes(q) ||
@@ -189,6 +205,28 @@ export function Board({ store }: { store: AppStore }) {
               }}
             />
           ))}
+          <div style={{ flex: 1 }} />
+          {/* Attribute filters (PLNR-161) — compose with milestone/tag/text and with
+              multi-select: filter down, then shift-click + bulk act. */}
+          <FilterSelect value={String(prioFilter)} onChange={(v) => setPrioFilter(Number(v))} active={prioFilter > 0}>
+            <option value="0">priority: any</option>
+            <option value="4">P4 only</option>
+            <option value="3">P3 +</option>
+            <option value="2">P2 +</option>
+          </FilterSelect>
+          <FilterSelect value={typeFilter} onChange={setTypeFilter} active={typeFilter !== ''}>
+            <option value="">type: any</option>
+            <option value="feature">feature</option>
+            <option value="bug">bug</option>
+            <option value="chore">chore</option>
+            <option value="research">research</option>
+          </FilterSelect>
+          <FilterSelect value={stateFilter} onChange={(v) => setStateFilter(v as typeof stateFilter)} active={stateFilter !== ''}>
+            <option value="">state: any</option>
+            <option value="unblocked">unblocked</option>
+            <option value="grabbable">up for grabs</option>
+            <option value="overdue">overdue</option>
+          </FilterSelect>
         </div>
       )}
 
@@ -438,6 +476,27 @@ function BulkBar({ count, milestones, boards, onStatus, onMilestone, onBoard, on
       <button style={{ ...sel, color: 'var(--red-soft)' }} onClick={onArchive}>archive</button>
       <button style={{ ...sel, color: 'var(--text-dim)', border: 'none', background: 'transparent' }} onClick={onClear}>✕</button>
     </div>
+  );
+}
+
+function FilterSelect({ value, onChange, active, children }: {
+  value: string; onChange: (v: string) => void; active: boolean; children: React.ReactNode;
+}) {
+  return (
+    <select
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      style={{
+        flex: 'none', cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 10,
+        padding: '3px 6px', borderRadius: 8,
+        color: active ? 'var(--accent-ink)' : 'var(--text-dim)',
+        background: active ? 'rgba(198,242,78,.06)' : 'var(--w-03)',
+        border: `1px solid ${active ? 'rgba(198,242,78,.35)' : 'var(--w-08)'}`,
+        outline: 'none',
+      }}
+    >
+      {children}
+    </select>
   );
 }
 

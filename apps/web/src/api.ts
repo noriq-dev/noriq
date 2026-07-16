@@ -87,6 +87,17 @@ export const api = {
       }>;
     }>('GET', '/api/auth/sessions'),
   revokeSession: (id: string) => req('POST', `/api/auth/sessions/${id}/revoke`),
+  // Admin OAuth management (PLNR-160)
+  adminConnections: () =>
+    req<{ connections: Array<{
+      id: string; userName: string | null; userEmail: string | null; clientName: string;
+      createdAt: string; expiresAt: string; scoped: number; scopeAll: number; bound: number;
+      projectKeys: string | null; agentCount: number; lastActive: string | null;
+    }> }>('GET', '/api/admin/oauth/connections'),
+  adminRevokeConnection: (id: string) => req('POST', `/api/admin/oauth/connections/${id}/revoke`),
+  adminClients: () =>
+    req<{ clients: Array<{ id: string; name: string; redirectUris: string; createdAt: string; liveTokens: number }> }>('GET', '/api/admin/oauth/clients'),
+  adminDeleteClient: (id: string) => req('DELETE', `/api/admin/oauth/clients/${id}`),
   revokeAllSessions: () => req('POST', '/api/auth/sessions/revoke-all'),
 
   patchGroup: (gid: string, patch: { name?: string; description?: string }) => req('PATCH', `/api/groups/${gid}`, patch),
