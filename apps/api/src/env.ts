@@ -37,4 +37,7 @@ export interface Env {
   /** Public URL of this instance (e.g. https://plan.example.com) — used for links in
    *  out-of-band notifications, where no request origin is available. Optional. */
   PUBLIC_ORIGIN?: string;
+  /** Demo mode (PLNR-146): any truthy value enables one-click demo login + the nightly
+   *  demo-project reset. Meant for a dedicated demo deployment, not production. */
+  DEMO_MODE?: string;
 }

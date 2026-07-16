@@ -10,7 +10,9 @@ const TABS: Array<{ id: ViewId; label: string }> = [
   { id: 'graph', label: 'Orchestration' },
   { id: 'board', label: 'Board' },
   { id: 'plans', label: 'Plans' },
+  { id: 'roadmap', label: 'Roadmap' },
   { id: 'review', label: 'Review' },
+  { id: 'docs', label: 'Docs' },
   { id: 'runs', label: 'Runs' },
   { id: 'agents', label: 'Agents' },
 ];

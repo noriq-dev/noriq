@@ -1235,6 +1235,53 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
+  /** Project docs (PLNR-158) — freeform markdown reference material. Writes go through
+   *  the DO like every other mutation (evented + WS fanout); reads are direct D1. */
+  async createDoc(projectId: string, actor: Actor, input: { name: string; description?: string; body?: string }) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const id = newId('doc');
+      await this.env.DB.prepare(
+        'INSERT INTO docs (id, project_id, name, description, body, author_kind, author_name) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      ).bind(id, this.projectId, input.name, input.description ?? '', input.body ?? '', actor.kind, actor.name).run();
+      await this.emit(actor, 'doc.created', 'doc', id, { name: input.name });
+      return { id, name: input.name };
+    });
+  }
+
+  async updateDoc(projectId: string, actor: Actor, docId: string, patch: { name?: string; description?: string; body?: string }) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const doc = await this.env.DB.prepare('SELECT id, name FROM docs WHERE id = ? AND project_id = ?')
+        .bind(docId, this.projectId).first<{ id: string; name: string }>();
+      if (!doc) throw new Error('doc not found in this project');
+      const sets: string[] = [];
+      const binds: unknown[] = [];
+      if (patch.name !== undefined) { sets.push('name = ?'); binds.push(patch.name); }
+      if (patch.description !== undefined) { sets.push('description = ?'); binds.push(patch.description); }
+      if (patch.body !== undefined) { sets.push('body = ?'); binds.push(patch.body); }
+      if (!sets.length) return { ok: true };
+      sets.push('updated_at = ?');
+      binds.push(nowIso(), docId);
+      await this.env.DB.prepare(`UPDATE docs SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
+      await this.emit(actor, 'doc.updated', 'doc', docId, { name: patch.name ?? doc.name, fields: Object.keys(patch) });
+      return { ok: true };
+    });
+  }
+
+  /** Human-only surface (REST) — content deletion stays out of the MCP toolset. */
+  async deleteDoc(projectId: string, actor: Actor, docId: string) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const doc = await this.env.DB.prepare('SELECT id, name FROM docs WHERE id = ? AND project_id = ?')
+        .bind(docId, this.projectId).first<{ id: string; name: string }>();
+      if (!doc) throw new Error('doc not found in this project');
+      await this.env.DB.prepare('DELETE FROM docs WHERE id = ?').bind(docId).run();
+      await this.emit(actor, 'doc.deleted', 'doc', docId, { name: doc.name });
+      return { ok: true };
+    });
+  }
+
   /** Archive / restore a plan (PLNR-148) — display-only, mirroring task archive:
    *  everything (phases, membership, minted edges, gating) stays in force; the default
    *  Plans listing just hides it. Restore brings it back. */
@@ -1332,6 +1379,7 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM phases WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare('DELETE FROM plans WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM tags WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare('DELETE FROM docs WHERE project_id = ?').bind(pid),
         this.env.DB.prepare("UPDATE agents SET project_id = NULL, status = 'offline' WHERE project_id = ?").bind(pid),
         // Runs are project-scoped → delete (with any steer-delivery rows keyed to them).
         // Runners are machines (project_id optional, multi-project) → unpin, not delete;
@@ -1796,7 +1844,7 @@ export class ProjectRoom extends DurableObject<Env> {
         body?: string;
         taskIds?: string[];
         newTasks?: Array<{
-          title: string; body?: string; priority?: number; estimate?: number;
+          title: string; body?: string; priority?: number; estimate?: number; dueAt?: string;
           tags?: string[]; milestoneId?: string; type?: string; boardId?: string;
           /** Extra ad-hoc edges beyond the enforced phase chain — existing task ids or keys. */
           dependsOn?: string[];
@@ -1841,6 +1889,7 @@ export class ProjectRoom extends DurableObject<Env> {
             body: nt.body,
             priority: nt.priority ?? d.priority,
             estimate: nt.estimate ?? d.estimate,
+            dueAt: nt.dueAt,
             tags: nt.tags ?? d.tags,
             milestoneId: nt.milestoneId ?? d.milestoneId,
             type: nt.type ?? d.type,

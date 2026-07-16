@@ -101,6 +101,7 @@ function EditProjectModal({ store }: { store: AppStore }) {
   const [ownerId, setOwnerId] = useState<string>('');
   const [confirmName, setConfirmName] = useState('');
   const [delError, setDelError] = useState<string | null>(null);
+  const [isPublic, setIsPublic] = useState(!!project?.isPublic);
   const isAdmin = store.user?.role === 'admin';
   useEffect(() => {
     if (isAdmin) api.users().then((r) => setUsers(r.users)).catch(() => {});
@@ -112,6 +113,7 @@ function EditProjectModal({ store }: { store: AppStore }) {
       groupId: groupId || null,
       claimTtlSeconds: Math.max(1, Number(ttlMin) || 30) * 60,
       ...(isAdmin && ownerId ? { ownerUserId: ownerId } : {}),
+      ...(isPublic !== !!project?.isPublic ? { public: isPublic } : {}),
     });
   });
   if (!project) return null;
@@ -142,6 +144,15 @@ function EditProjectModal({ store }: { store: AppStore }) {
           ⚠ no group — only the owner (and admins) can see this project
         </div>
       )}
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.5, color: 'var(--text-soft)', marginBottom: 12, cursor: 'pointer' }}>
+        <input type="checkbox" checked={isPublic} onChange={(e) => setIsPublic(e.target.checked)} style={{ width: 'auto' }} />
+        <span>
+          Public read-only page{' '}
+          <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: isPublic ? 'var(--amber)' : 'var(--text-faint)' }}>
+            {isPublic ? `anyone with the link can VIEW this project (owner-only setting)` : 'off — members only'}
+          </span>
+        </span>
+      </label>
       {isAdmin && (
         <Field label="Owner" hint="ungrouped projects are visible only to their owner">
           <Select value={ownerId} onChange={(e) => setOwnerId(e.target.value)}>

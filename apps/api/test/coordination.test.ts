@@ -600,3 +600,120 @@ describe('attention inbox', () => {
     expect(body.overdue.some((o) => o.key === t.key && o.projectKey === 'ATTN')).toBe(true);
   });
 });
+
+// ---- PLNR-78: opt-in public read-only projects ---------------------------------------
+describe('public projects', () => {
+  it('404s until the OWNER opts in; then serves the reduced read-only payload', async () => {
+    const pid = (await mcpCall(orch.apiKey, 'create_project', { key: 'PUB', name: 'goes public' })).body.id;
+    const t = (await mcpCall(orch.apiKey, 'create_task', { projectId: pid, title: 'visible work' })).body;
+    await mcpCall(orch.apiKey, 'claim_task', { projectId: pid, taskId: t.id });
+    await mcpCall(orch.apiKey, 'request_input', { projectId: pid, taskId: t.id, title: 'private decision' });
+
+    // Off by default — anonymous gets nothing.
+    const closed = await SELF.fetch(`https://planar.test/api/public/projects/${pid}/snapshot`);
+    expect(closed.status).toBe(404);
+
+    // A non-owner admin CAN flip it (admin escalation), but a random member cannot.
+    await createUser('rando@example.com', 'Rando', 'longenough1', 'member').catch(() => {});
+    const randoCookie = await loginSession('rando@example.com', 'longenough1');
+    const denied = await SELF.fetch(`https://planar.test/api/projects/${pid}/meta`, {
+      method: 'PATCH', headers: { Cookie: randoCookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ public: true }),
+    });
+    expect([403, 404]).toContain(denied.status); // reach-gate or owner-gate, either refusal is right
+
+    const flipped = await SELF.fetch(`https://planar.test/api/projects/${pid}/meta`, {
+      method: 'PATCH', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ public: true }),
+    });
+    expect(flipped.status).toBe(200);
+
+    // Anonymous read works now — and the payload is the REDUCED one: work, not signals.
+    const open = await SELF.fetch(`https://planar.test/api/public/projects/${pid}/snapshot`);
+    expect(open.status).toBe(200);
+    const body = (await open.json()) as Record<string, unknown> & { tasks: Array<{ key: string }> };
+    expect(body.tasks.some((x) => x.key === t.key)).toBe(true);
+    expect('signals' in body).toBe(false); // pending human decisions stay private
+    // Writes stay authed regardless.
+    const write = await SELF.fetch(`https://planar.test/api/projects/${pid}/tasks`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'anonymous vandalism' }),
+    });
+    expect(write.status).toBe(401);
+  });
+});
+
+// ---- PLNR-158: project docs -----------------------------------------------------------
+describe('project docs', () => {
+  it('create → list index → read body → update; humans manage via REST; feed evented', async () => {
+    const pid = (await mcpCall(orch.apiKey, 'create_project', { key: 'DOCS', name: 'documented' })).body.id;
+    const made = await mcpCall(orch.apiKey, 'create_doc', {
+      projectId: pid, name: 'Conventions', description: 'how we name things', body: '# Naming\n\nkebab-case.',
+    });
+    expect(made.isError).toBe(false);
+
+    const listed = await mcpCall(orch.apiKey, 'list_docs', { projectId: pid });
+    expect(listed.body.docs).toHaveLength(1);
+    expect(listed.body.docs[0].description).toBe('how we name things');
+    expect(listed.body.docs[0].resource).toBe(`noriq://doc/${made.body.id}`);
+
+    const read = await mcpCall(orch.apiKey, 'get_doc', { projectId: pid, docId: made.body.id });
+    expect(read.body.body).toContain('kebab-case');
+
+    await mcpCall(orch.apiKey, 'update_doc', { projectId: pid, docId: made.body.id, body: '# Naming\n\nsnake_case now.' });
+    const reread = await mcpCall(orch.apiKey, 'get_doc', { projectId: pid, docId: made.body.id });
+    expect(reread.body.body).toContain('snake_case');
+
+    // REST list for the UI; human delete (no MCP delete tool exists — content deletion is human-only).
+    const rest = await SELF.fetch(`https://planar.test/api/projects/${pid}/docs`, { headers: { Cookie: cookie } });
+    expect(rest.status).toBe(200);
+    expect(((await rest.json()) as { docs: unknown[] }).docs).toHaveLength(1);
+    const del = await SELF.fetch(`https://planar.test/api/projects/${pid}/docs/${made.body.id}`, {
+      method: 'DELETE', headers: { Cookie: cookie },
+    });
+    expect(del.status).toBe(200);
+    const after = await mcpCall(orch.apiKey, 'list_docs', { projectId: pid });
+    expect(after.body.docs).toHaveLength(0);
+  });
+});
+
+// ---- PLNR-128: reusable work templates ------------------------------------------------
+describe('templates', () => {
+  it('save → list → stamp into a project as a live, ordered plan', async () => {
+    const saved = await mcpCall(orch.apiKey, 'save_template', {
+      name: 'Ship a feature',
+      description: 'API first, UI second',
+      spec: {
+        title: 'Ship: <feature>',
+        body: '# Approach\n\nAPI → UI → verify.',
+        taskDefaults: { type: 'feature', priority: 3, tags: ['shipit'] },
+        phases: [
+          { title: 'API', newTasks: [{ title: 'endpoint' }, { title: 'tests', type: 'chore' }] },
+          { title: 'UI', newTasks: [{ title: 'component' }] },
+        ],
+      },
+    });
+    expect(saved.isError).toBe(false);
+
+    const listed = await mcpCall(orch.apiKey, 'list_templates', {});
+    const tpl = listed.body.templates.find((t: { id: string }) => t.id === saved.body.id);
+    expect(tpl.phases).toEqual([{ title: 'API', tasks: 2 }, { title: 'UI', tasks: 1 }]);
+
+    const pid = (await mcpCall(orch.apiKey, 'create_project', { key: 'TPL', name: 'templated' })).body.id;
+    const plan = await mcpCall(orch.apiKey, 'create_plan_from_template', {
+      projectId: pid, templateId: saved.body.id, title: 'Ship: dark mode',
+    });
+    expect(plan.isError).toBe(false);
+    expect(plan.body.title).toBe('Ship: dark mode');
+    expect(plan.body.phases).toHaveLength(2);
+
+    // The stamped plan is REAL: phase 2 gated behind phase 1, defaults applied.
+    const uiTask = plan.body.phases[1].taskIds[0];
+    const gated = await mcpCall(orch.apiKey, 'claim_task', { projectId: pid, taskId: uiTask });
+    expect(gated.isError).toBe(true);
+    expect(gated.text).toContain('blocked');
+    const first = await mcpCall(orch.apiKey, 'get_task', { taskId: plan.body.phases[0].taskIds[0] });
+    expect(first.body.task.priority).toBe(3);
+    expect(first.body.task.type).toBe('feature');
+  });
+});

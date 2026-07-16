@@ -17,6 +17,8 @@ import { taskSearchFilters } from './lib/search';
 const MAX_ATTACHMENT = 100 * 1024 * 1024;
 /** Stable resource URI for an attachment; agents read bytes back via resources/read. */
 const attachmentUri = (id: string) => `noriq://attachment/${id}`;
+/** Stable resource URI for a project doc (PLNR-158). */
+const docUri = (id: string) => `noriq://doc/${id}`;
 
 /** Tool metadata captured at registration, used to generate the reference doc (PLNR-23). */
 export type ToolSpec = { name: string; description: string; inputSchema: z.ZodRawShape };
@@ -88,6 +90,7 @@ const TOOL_HINTS: Record<string, ToolHints> = {
   // reads
   get_briefing: READ, my_updates: READ, list_projects: READ, get_project: READ, list_groups: READ, list_agents: READ,
   get_task: READ, search_tasks: READ, next_claimable: READ, read_open_comments: READ, get_plans: READ,
+  list_docs: READ, get_doc: READ, update_doc: WRITE_IDEMPOTENT, list_templates: READ,
   // writes that are safe to repeat with the same args (renew/replace-in-place/insert-or-ignore)
   heartbeat: WRITE_IDEMPOTENT, set_agent_identity: WRITE_IDEMPOTENT, update_task: WRITE_IDEMPOTENT, update_tasks: WRITE_IDEMPOTENT,
   update_plan: WRITE_IDEMPOTENT, add_dependency: WRITE_IDEMPOTENT, remove_dependency: WRITE_IDEMPOTENT, attach_ref: WRITE_IDEMPOTENT,
@@ -393,11 +396,149 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
   );
 
   defineTool(
+    'save_template',
+    'Save a reusable work template — a plan skeleton (title/body/taskDefaults/phases with newTasks) you can stamp into ANY project later with create_plan_from_template. Save the shapes your team repeats: "ship a feature", "security review", "release checklist". Templates are yours (user-owned), not project-bound.',
+    {
+      name: z.string().min(1).max(80),
+      description: z.string().max(300).optional(),
+      spec: z.object({
+        title: z.string().min(1).describe('Default plan title (instantiation may override)'),
+        description: z.string().optional(),
+        body: z.string().optional().describe('The plan document (markdown)'),
+        taskDefaults: z.object({
+          priority: z.number().int().min(0).max(4).optional(),
+          estimate: z.number().int().min(0).optional(),
+          type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
+          tags: z.array(z.string()).optional(),
+        }).optional(),
+        phases: z.array(z.object({
+          title: z.string().min(1),
+          body: z.string().optional(),
+          newTasks: z.array(z.object({
+            title: z.string().min(1),
+            body: z.string().optional(),
+            priority: z.number().int().min(0).max(4).optional(),
+            estimate: z.number().int().min(0).optional(),
+            type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
+            tags: z.array(z.string()).optional(),
+          })).min(1),
+        })).min(1).max(12),
+      }).describe('The skeleton — same shape create_plan takes, minus concrete ids (no taskIds/milestones: those are per-project)'),
+    },
+    tool(async ({ name, description, spec }) => {
+      const id = newId('tpl');
+      await env.DB.prepare('INSERT INTO templates (id, user_id, name, description, spec) VALUES (?, ?, ?, ?, ?)')
+        .bind(id, agent.userId, name, description ?? '', JSON.stringify(spec)).run();
+      return { id, name };
+    }),
+  );
+
+  defineTool(
+    'list_templates',
+    'Your saved work templates (name + description + shape summary). Instantiate one with create_plan_from_template.',
+    {},
+    tool(async () => {
+      const { results } = await env.DB.prepare(
+        'SELECT id, name, description, spec, updated_at AS updatedAt FROM templates WHERE user_id = ? ORDER BY updated_at DESC',
+      ).bind(agent.userId).all<{ id: string; name: string; description: string; spec: string; updatedAt: string }>();
+      return {
+        templates: results.map((t) => {
+          const spec = JSON.parse(t.spec) as { phases: Array<{ title: string; newTasks: unknown[] }> };
+          return {
+            id: t.id, name: t.name, description: t.description, updatedAt: t.updatedAt,
+            phases: spec.phases.map((p) => ({ title: p.title, tasks: p.newTasks.length })),
+          };
+        }),
+      };
+    }),
+  );
+
+  defineTool(
+    'create_plan_from_template',
+    'Stamp a saved template into a project as a live plan (enforced phase ordering and all). Optionally override the title or park it as proposed for human approval.',
+    {
+      projectId: z.string(),
+      templateId: z.string(),
+      title: z.string().optional().describe('Override the template\'s default plan title'),
+      proposed: z.boolean().optional(),
+    },
+    tool(async ({ projectId, templateId, title, proposed }) => {
+      const row = await env.DB.prepare('SELECT spec FROM templates WHERE id = ? AND user_id = ?')
+        .bind(templateId, agent.userId).first<{ spec: string }>();
+      if (!row) throw new Error(`template ${templateId} not found`);
+      const spec = JSON.parse(row.spec) as {
+        title: string; description?: string; body?: string;
+        taskDefaults?: { priority?: number; estimate?: number; type?: string; tags?: string[] };
+        phases: Array<{ title: string; body?: string; newTasks: Array<{ title: string; body?: string; priority?: number; estimate?: number; type?: string; tags?: string[] }> }>;
+      };
+      return room(env, projectId).createPlan(projectId, actor, {
+        title: title ?? spec.title,
+        description: spec.description,
+        body: spec.body,
+        proposed,
+        agentId: agent.id,
+        taskDefaults: spec.taskDefaults,
+        phases: spec.phases,
+      });
+    }),
+  );
+
+  defineTool(
+    'list_docs',
+    'Project reference docs (PLNR-158): conventions, architecture notes, decisions — the material you should CHECK before working unfamiliar ground. Returns the index (name + description); read a body with get_doc.',
+    { projectId: z.string() },
+    tool(async ({ projectId }) => {
+      const { results } = await env.DB.prepare(
+        'SELECT id, name, description, author_name AS authorName, updated_at AS updatedAt FROM docs WHERE project_id = ? ORDER BY updated_at DESC',
+      ).bind(projectId).all();
+      return { docs: results.map((d) => ({ ...d, resource: docUri(String(d.id)) })) };
+    }),
+  );
+
+  defineTool(
+    'get_doc',
+    'Read a project doc in full (markdown). Accepts the doc id from list_docs.',
+    { projectId: z.string(), docId: z.string() },
+    tool(async ({ projectId, docId }) => {
+      const doc = await env.DB.prepare(
+        'SELECT id, name, description, body, author_name AS authorName, updated_at AS updatedAt FROM docs WHERE id = ? AND project_id = ?',
+      ).bind(docId, projectId).first();
+      if (!doc) throw new Error(`doc ${docId} not found in this project`);
+      return { ...doc, resource: docUri(String(doc.id)) };
+    }),
+  );
+
+  defineTool(
+    'create_doc',
+    'Write a project reference doc (markdown): conventions you established, architecture decisions, gotchas the next agent should know. Give it a clear name and a one-line description — that pair is what future agents scan in list_docs. For updating an existing doc use update_doc.',
+    {
+      projectId: z.string(),
+      name: z.string().min(1).max(120),
+      description: z.string().max(300).optional().describe('One line: what a reader finds inside'),
+      body: z.string().optional().describe('The document, markdown'),
+    },
+    tool(async ({ projectId, name, description, body }) => room(env, projectId).createDoc(projectId, actor, { name, description, body })),
+  );
+
+  defineTool(
+    'update_doc',
+    'Revise a project doc — pass the FULL new body (read it first via get_doc). Keep docs current: a stale doc misleads every agent that reads it.',
+    {
+      projectId: z.string(),
+      docId: z.string(),
+      name: z.string().min(1).max(120).optional(),
+      description: z.string().max(300).optional(),
+      body: z.string().optional().describe('Full replacement markdown'),
+    },
+    tool(async ({ projectId, docId, name, description, body }) => room(env, projectId).updateDoc(projectId, actor, docId, { name, description, body })),
+  );
+
+  defineTool(
     'get_project',
     'Project snapshot: tasks (with status/holder/deps/board/open-comment counts), milestones, boards, agents active here.',
     { projectId: z.string() },
     tool(async ({ projectId }) => {
-      const [tasks, milestones, boards, project, categories] = await Promise.all([
+      const [tasks, milestones, boards, project, categories, docs] = await Promise.all([
         env.DB.prepare(
           `SELECT t.id, t.key, t.title, t.status, t.type, t.priority, t.claimed_by AS claimedBy, t.parent_task_id AS parentTaskId,
                   t.milestone_id AS milestoneId, t.board_id AS boardId, t.open_comments AS openComments, t.claim_expires_at AS claimExpiresAt,
@@ -410,9 +551,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         env.DB.prepare('SELECT id, key, name, description, repo_url AS repoUrl, claim_ttl_seconds AS claimTtlSeconds FROM projects WHERE id = ?')
           .bind(projectId).first(),
         env.DB.prepare('SELECT id, name, color FROM tags WHERE project_id = ? ORDER BY "order"').bind(projectId).all(),
+        env.DB.prepare('SELECT id, name, description, updated_at AS updatedAt FROM docs WHERE project_id = ? ORDER BY updated_at DESC').bind(projectId).all(),
       ]);
       if (!project) throw new Error(`project ${projectId} not found`);
-      return { project, milestones: milestones.results, boards: boards.results, tags: categories.results, tasks: tasks.results };
+      return { project, milestones: milestones.results, boards: boards.results, tags: categories.results, tasks: tasks.results, docs: docs.results };
     }),
   );
 
@@ -1101,6 +1243,34 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   // ---- resources: read attachment bytes back ------------------------------
   // noriq://attachment/<id> — binary comes back as base64 `blob`, text as `text`.
+  resourceSpecs.push({
+    name: 'doc',
+    uriTemplate: 'noriq://doc/{id}',
+    description: 'A project reference doc (markdown) — conventions, architecture notes, decisions.',
+  });
+  server.registerResource(
+    'doc',
+    new ResourceTemplate('noriq://doc/{id}', {
+      list: async () => {
+        const { results } = await env.DB.prepare(
+          `SELECT d.id, d.name, d.description FROM docs d JOIN projects p ON p.id = d.project_id
+           WHERE p.status = 'active' AND ${USER_PROJECT_WHERE} AND ${tokenProjectWhere('?2')}
+           ORDER BY d.updated_at DESC LIMIT 50`,
+        ).bind(agent.userId, opts.oauthTokenId ?? null).all<{ id: string; name: string; description: string }>();
+        return { resources: results.map((d) => ({ uri: docUri(d.id), name: d.name, mimeType: 'text/markdown', description: d.description })) };
+      },
+    }),
+    { title: 'Project doc', description: 'A project reference doc (markdown).' },
+    async (uri, { id }) => {
+      const docId = Array.isArray(id) ? id[0]! : id;
+      const row = await env.DB.prepare('SELECT body, project_id AS pid FROM docs WHERE id = ?')
+        .bind(docId).first<{ body: string; pid: string }>();
+      if (!row) throw new Error(`doc ${docId} not found`);
+      if (!(await userCanAccessProject(env, agent.userId, row.pid))) throw new Error(`doc ${docId} not found`);
+      return { contents: [{ uri: uri.href, mimeType: 'text/markdown', text: row.body }] };
+    },
+  );
+
   resourceSpecs.push({
     name: 'attachment',
     uriTemplate: 'noriq://attachment/{id}',

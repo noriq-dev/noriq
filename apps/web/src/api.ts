@@ -44,7 +44,12 @@ export const api = {
     req<{ id: string; key: string }>('POST', '/api/projects', { key, name, description }),
   groups: () => req<{ groups: Array<{ id: string; name: string; description: string; canEdit: number }> }>('GET', '/api/groups'),
   createGroup: (name: string, description?: string) => req<{ id: string }>('POST', '/api/groups', { name, description }),
-  setProjectMeta: (pid: string, meta: { groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number; ownerUserId?: string | null }) =>
+  docs: (pid: string) => req<{ docs: Array<{ id: string; name: string; description: string; body: string; authorKind: string; authorName: string; updatedAt: string }> }>('GET', `/api/projects/${pid}/docs`),
+  createDoc: (pid: string, input: { name: string; description?: string; body?: string }) => req<{ id: string }>('POST', `/api/projects/${pid}/docs`, input),
+  updateDoc: (pid: string, did: string, patch: { name?: string; description?: string; body?: string }) => req('PATCH', `/api/projects/${pid}/docs/${did}`, patch),
+  deleteDoc: (pid: string, did: string) => req('DELETE', `/api/projects/${pid}/docs/${did}`),
+  publicSnapshot: (pid: string) => req<PublicSnapshot>('GET', `/api/public/projects/${pid}/snapshot`),
+  setProjectMeta: (pid: string, meta: { groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number; ownerUserId?: string | null; public?: boolean }) =>
     req('PATCH', `/api/projects/${pid}/meta`, meta),
 
   users: () => req<{ users: ApiUser[] }>('GET', '/api/users'),
@@ -282,6 +287,8 @@ export interface ApiProject {
   ownerUserId: string | null;
   ownerName: string | null;
   agentCount: number;
+  /** Opt-in public read-only visibility (PLNR-78). */
+  public: number;
 }
 
 export interface ApiUser {
@@ -338,6 +345,23 @@ export interface ApiAgentEvent {
 }
 
 /** One question in a batched input request (PLNR-131). No options = freeform. */
+/** The anonymous read-only payload (PLNR-78) — the authed snapshot minus signals and
+ *  operational agent detail. */
+export interface PublicSnapshot {
+  project: { id: string; key: string; name: string; description: string };
+  tasks: ApiSnapshot['tasks'];
+  dependencies: ApiSnapshot['dependencies'];
+  agents: Array<{ id: string; name: string; role: string; status: string }>;
+  events: ApiSnapshot['events'];
+  milestones: ApiSnapshot['milestones'];
+  boards: ApiSnapshot['boards'];
+  plans: ApiSnapshot['plans'];
+  phases: ApiSnapshot['phases'];
+  phaseTasks: ApiSnapshot['phaseTasks'];
+  tags: ApiSnapshot['tags'];
+  taskTags: ApiSnapshot['taskTags'];
+}
+
 export interface ApiSignalQuestion {
   question: string;
   header?: string;

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { startAuthentication } from '@simplewebauthn/browser';
 import { api } from '../api';
 import type { AppStore } from '../store';
@@ -10,6 +10,21 @@ export function Login({ store }: { store: AppStore }) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [resetSent, setResetSent] = useState(false);
+  // Demo mode (PLNR-146): the server says whether one-click demo login exists here.
+  const [demo, setDemo] = useState(false);
+  useEffect(() => {
+    fetch('/api/demo/status').then((r) => r.json()).then((d: { enabled: boolean }) => setDemo(!!d.enabled)).catch(() => {});
+  }, []);
+  const demoLogin = async () => {
+    setBusy(true);
+    try {
+      const r = await fetch('/api/demo/login', { method: 'POST', credentials: 'same-origin' });
+      if (r.ok) location.reload();
+      else setError('demo unavailable right now');
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const forgot = async () => {
     if (!email.trim()) { setError('enter your email above, then tap “Forgot password?”'); return; }
@@ -124,6 +139,19 @@ export function Login({ store }: { store: AppStore }) {
           >
             🔑 Sign in with a passkey
           </button>
+          {demo && (
+            <button
+              onClick={demoLogin}
+              className="hover-bright"
+              style={{
+                cursor: 'pointer', textAlign: 'center', background: 'rgba(198,242,78,.08)',
+                color: 'var(--accent-ink)', border: '1px solid rgba(198,242,78,.35)', fontWeight: 600,
+                fontSize: 13, padding: 11, borderRadius: 9, opacity: busy ? 0.6 : 1,
+              }}
+            >
+              ▶ Try the demo — no account needed
+            </button>
+          )}
         </div>
       </div>
     </div>

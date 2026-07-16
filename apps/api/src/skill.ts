@@ -98,6 +98,13 @@ with \`list_agents\`, and hand a task to a specific agent with \`handoff_task\` 
 directed delegation instead of releasing into the pool. Check progress with
 \`get_plans\`.
 
+## Project docs
+
+Projects carry reference docs — conventions, architecture notes, decisions. \`list_docs\`
+shows the index (check it before working unfamiliar ground); \`get_doc\` reads one.
+When you establish something durable the next agent should know, write it down with
+\`create_doc\` (or revise with \`update_doc\`) instead of leaving it buried in a comment.
+
 ## Git
 
 Attach your branch/PR to the task with \`attach_ref\` so humans see where the work

@@ -9,6 +9,9 @@ import { Login } from './components/Login';
 import { Setup } from './components/Setup';
 import { PlansView } from './components/PlansView';
 import { ReviewView } from './components/ReviewView';
+import { DocsView } from './components/DocsView';
+import { CommandPalette } from './components/CommandPalette';
+import { RoadmapView } from './components/RoadmapView';
 import { AgentsView } from './components/AgentsView';
 import { RunsView } from './components/RunsView';
 import { ModalHost } from './components/modals';
@@ -21,6 +24,7 @@ import { ThemeButton } from './components/ThemeButton';
 import { Home } from './components/Home';
 import { Invite } from './components/Invite';
 import { ResetPassword } from './components/ResetPassword';
+import { PublicView } from './components/PublicView';
 
 // Floating toggle for the unauthenticated screens (login / setup / invite) — no rail there.
 function FloatingTheme() {
@@ -45,6 +49,9 @@ function FloatingTheme() {
 export function App() {
   const store = useAppStore();
   const [railOpen, setRailOpen] = useState(false);
+  // Anonymous visitor on a project URL (PLNR-78): try the public read-only page before
+  // falling back to Login. `publicFailed` flips when the project isn't public.
+  const [publicFailed, setPublicFailed] = useState(false);
 
   const inviteMatch = location.pathname.match(/^\/invite\/([^/]+)/);
   if (inviteMatch) {
@@ -63,6 +70,10 @@ export function App() {
     return <div style={{ height: '100vh', background: 'var(--bg)' }} />;
   }
   if (!store.user) {
+    const pubMatch = location.pathname.match(/^\/p\/([^/]+)/);
+    if (pubMatch && !publicFailed) {
+      return <><FloatingTheme /><PublicView pid={decodeURIComponent(pubMatch[1]!)} onNotPublic={() => setPublicFailed(true)} /></>;
+    }
     return <><FloatingTheme /><Login store={store} /></>;
   }
 
@@ -101,6 +112,8 @@ export function App() {
               {store.view === 'board' && <Board store={store} />}
               {store.view === 'plans' && <PlansView store={store} />}
               {store.view === 'review' && <ReviewView store={store} />}
+              {store.view === 'docs' && <DocsView store={store} />}
+              {store.view === 'roadmap' && <RoadmapView store={store} />}
               {store.view === 'runs' && <RunsView store={store} />}
               {store.view === 'agents' && <AgentsView store={store} />}
             </>
@@ -109,6 +122,7 @@ export function App() {
       </div>
       <Drawer store={store} />
       <ModalHost store={store} />
+      <CommandPalette store={store} />
     </div>
   );
 }

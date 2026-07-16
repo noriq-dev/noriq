@@ -49,12 +49,15 @@ function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
     // raw-id default (PLNR-130).
     case 'tag.created': verb = 'tag'; subject = `created ${p.name ?? ''}`; dot = typeof p.color === 'string' ? p.color : undefined; break;
     case 'tag.deleted': verb = 'tag'; subject = `deleted ${p.name ?? ''}`; break;
+    case 'doc.created': verb = 'doc'; subject = `wrote "${p.name ?? ''}"`; break;
+    case 'doc.updated': verb = 'doc'; subject = `revised "${p.name ?? ''}"`; break;
+    case 'doc.deleted': verb = 'doc'; subject = `deleted "${p.name ?? ''}"`; break;
     default: subject = `${e.verb} ${e.subjectId}`;
   }
   return { id: e.id, t: timeOf(e.createdAt), actor, actorKind: e.actorKind, verb, subject, taskId, dot };
 }
 
-const VIEWS: ViewId[] = ['home', 'control', 'graph', 'board', 'plans', 'review', 'agents', 'runs', 'settings', 'admin'];
+const VIEWS: ViewId[] = ['home', 'control', 'graph', 'board', 'plans', 'roadmap', 'review', 'docs', 'agents', 'runs', 'settings', 'admin'];
 
 function parseUrl(): { pid: string | null; view: ViewId; task: string | null } {
   const m = location.pathname.match(/^\/p\/([^/]+)(?:\/([a-z]+))?/);
@@ -149,6 +152,7 @@ export function useAppStore() {
     doneTasks: p.doneTasks,
     ownerName: p.ownerName,
     agentCount: p.agentCount,
+    isPublic: !!p.public,
   });
 
   const loadProjects = useCallback(async () => {

@@ -253,6 +253,27 @@ app.post('/api/setup', async (c) => {
 });
 
 // --- human auth -----------------------------------------------------------------
+// Demo mode (PLNR-146): status for the login page, and the one-click session.
+app.get('/api/demo/status', (c) => c.json({ enabled: !!c.env.DEMO_MODE }));
+app.post('/api/demo/login', async (c) => {
+  if (!c.env.DEMO_MODE) return c.json({ error: 'not found' }, 404);
+  const rl = await rateLimit(c.env, `auth:${clientIp(c)}`, 10);
+  if (!rl.ok) return c.json(tooMany, 429, { 'Retry-After': String(rl.retryAfter) });
+  const { ensureDemoUser, resetDemo, DEMO_EMAIL } = await import('./lib/demo');
+  await ensureDemoUser(c.env);
+  // Seed lazily on first login so a fresh demo deployment works before the first cron.
+  const seeded = await c.env.DB.prepare("SELECT 1 FROM projects WHERE id = 'prj_demo'").first();
+  if (!seeded) await resetDemo(c.env);
+  const user = await c.env.DB.prepare('SELECT id, email, name, role FROM users WHERE email = ?')
+    .bind(DEMO_EMAIL).first<{ id: string; email: string; name: string; role: string }>();
+  const sid = crypto.randomUUID() + crypto.randomUUID().replace(/-/g, '');
+  const expires = new Date(Date.now() + 24 * 3600 * 1000); // demo sessions live one day
+  await c.env.DB.prepare('INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)')
+    .bind(await sha256Hex(sid), user!.id, expires.toISOString()).run();
+  c.header('Set-Cookie', `planar_session=${sid}; HttpOnly; Secure; SameSite=Lax; Path=/; Expires=${expires.toUTCString()}`);
+  return c.json({ user });
+});
+
 app.post('/api/auth/login', async (c) => {
   const rl = await rateLimit(c.env, `auth:${clientIp(c)}`, 10);
   if (!rl.ok) return c.json(tooMany, 429, { 'Retry-After': String(rl.retryAfter) });
@@ -335,7 +356,7 @@ app.get('/api/projects', userAuth, async (c) => {
   // noise); `?scope=all` opts into the admin-wide view. Non-admins always get the
   // user-scoped set. `admin` in the response tells the UI it may offer admin view.
   const adminAll = u.role === 'admin' && c.req.query('scope') === 'all';
-  const select = `SELECT p.id, p.key, p.name, p.description, p.status, p.repo_url AS repoUrl, p.group_id AS groupId,
+  const select = `SELECT p.id, p.key, p.name, p.description, p.status, p.repo_url AS repoUrl, p.group_id AS groupId, p.public,
             p.owner_user_id AS ownerUserId, ou.name AS ownerName,
             (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'in_progress') AS liveTasks,
             (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status NOT IN ('done','cancelled')) AS openTasks,
@@ -381,6 +402,49 @@ app.get('/api/attention', userAuth, async (c) => {
       questions: s.questions ? JSON.parse(String(s.questions)) : null,
     })),
     overdue: overdue.results,
+  });
+});
+
+// Public read-only snapshot (PLNR-78): NO auth, serves only when the owner explicitly
+// flipped `public` on. Reduced payload — signals (pending human decisions/alerts) and
+// operational agent detail stay private; the WORK (tasks/plans/boards/feed) is what a
+// public project shows. All writes remain session/OAuth-authed; this route reads only.
+app.get('/api/public/projects/:pid/snapshot', async (c) => {
+  const pid = c.req.param('pid')!;
+  const proj = await c.env.DB.prepare(
+    'SELECT id, key, name, description, public FROM projects WHERE id = ? AND status = ?',
+  ).bind(pid, 'active').first<{ id: string; key: string; name: string; description: string; public: number }>();
+  if (!proj || !proj.public) return c.json({ error: 'not found' }, 404);
+  const [tasks, deps, agents, events, milestones, boards, plans, phases, phaseTasks, tags, taskTags] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT id, key, title, body, status, type, priority, estimate, due_at AS dueAt, claimed_by AS claimedBy,
+              parent_task_id AS parentTaskId, milestone_id AS milestoneId, board_id AS boardId, archived_at AS archivedAt,
+              open_comments AS openComments, "order" FROM tasks WHERE project_id = ? ORDER BY "order"`,
+    ).bind(pid).all(),
+    c.env.DB.prepare(
+      'SELECT d.task_id AS taskId, d.depends_on_task_id AS dependsOnTaskId FROM dependencies d JOIN tasks t ON t.id = d.task_id WHERE t.project_id = ?',
+    ).bind(pid).all(),
+    c.env.DB.prepare(
+      "SELECT a.id, COALESCE(a.label, a.name) AS name, a.role, a.status FROM agents a WHERE a.project_id = ? AND a.status != 'revoked'",
+    ).bind(pid).all(),
+    c.env.DB.prepare(
+      'SELECT id, seq, actor_kind AS actorKind, actor_id AS actorId, verb, subject_type AS subjectType, subject_id AS subjectId, payload, created_at AS createdAt FROM events WHERE project_id = ? ORDER BY seq DESC LIMIT 60',
+    ).bind(pid).all(),
+    c.env.DB.prepare('SELECT id, title, due_at AS dueAt, description, "order" FROM milestones WHERE project_id = ? ORDER BY "order"').bind(pid).all(),
+    c.env.DB.prepare('SELECT id, name, "order" FROM boards WHERE project_id = ? ORDER BY "order"').bind(pid).all(),
+    c.env.DB.prepare('SELECT id, title, description, body, status, archived_at AS archivedAt, created_at AS createdAt FROM plans WHERE project_id = ? AND archived_at IS NULL ORDER BY created_at DESC').bind(pid).all(),
+    c.env.DB.prepare('SELECT ph.id, ph.plan_id AS planId, ph.title, ph.body, ph."order" FROM phases ph JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ? ORDER BY ph."order"').bind(pid).all(),
+    c.env.DB.prepare('SELECT pt.phase_id AS phaseId, pt.task_id AS taskId FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ?').bind(pid).all(),
+    c.env.DB.prepare('SELECT id, name, color, "order" FROM tags WHERE project_id = ?').bind(pid).all(),
+    c.env.DB.prepare('SELECT tt.task_id AS taskId, tt.tag_id AS tagId FROM task_tags tt JOIN tasks t ON t.id = tt.task_id WHERE t.project_id = ?').bind(pid).all(),
+  ]);
+  c.header('Cache-Control', 'public, max-age=30');
+  return c.json({
+    project: { id: proj.id, key: proj.key, name: proj.name, description: proj.description },
+    tasks: tasks.results, dependencies: deps.results, agents: agents.results,
+    events: events.results.map((e) => ({ ...e, payload: JSON.parse(String(e.payload)) })),
+    milestones: milestones.results, boards: boards.results, plans: plans.results,
+    phases: phases.results, phaseTasks: phaseTasks.results, tags: tags.results, taskTags: taskTags.results,
   });
 });
 
@@ -634,6 +698,27 @@ app.delete('/api/projects/:pid/tags/:tid', userAuth, async (c) =>
 app.delete('/api/projects/:pid/plans/:plid', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).deletePlan(c.req.param('pid')!, humanActor(c), c.req.param('plid')!)));
 
+// Project docs (PLNR-158) — reads direct, writes through the DO.
+app.get('/api/projects/:pid/docs', userAuth, async (c) => {
+  const u = c.var.user!;
+  const visible = await c.env.DB.prepare(`SELECT 1 FROM projects p WHERE p.id = ? AND ${VISIBILITY_WHERE}`)
+    .bind(c.req.param('pid')!, u.role, u.id, u.id).first();
+  if (!visible) return c.json({ error: 'not found' }, 404);
+  const { results } = await c.env.DB.prepare(
+    'SELECT id, name, description, body, author_kind AS authorKind, author_name AS authorName, updated_at AS updatedAt FROM docs WHERE project_id = ? ORDER BY updated_at DESC',
+  ).bind(c.req.param('pid')!).all();
+  return c.json({ docs: results });
+});
+app.post('/api/projects/:pid/docs', userAuth, async (c) => {
+  const body = await c.req.json<{ name: string; description?: string; body?: string }>();
+  if (!body.name?.trim()) return c.json({ error: 'name required' }, 400);
+  return c.json(await room(c.env, c.req.param('pid')!).createDoc(c.req.param('pid')!, humanActor(c), body));
+});
+app.patch('/api/projects/:pid/docs/:did', userAuth, async (c) =>
+  c.json(await room(c.env, c.req.param('pid')!).updateDoc(c.req.param('pid')!, humanActor(c), c.req.param('did')!, await c.req.json())));
+app.delete('/api/projects/:pid/docs/:did', userAuth, async (c) =>
+  c.json(await room(c.env, c.req.param('pid')!).deleteDoc(c.req.param('pid')!, humanActor(c), c.req.param('did')!)));
+
 // Archive / restore a plan (PLNR-148) — display-only; see setPlanArchived.
 app.post('/api/projects/:pid/plans/:plid/archive', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).setPlanArchived(c.req.param('pid')!, humanActor(c), c.req.param('plid')!, true)));
@@ -701,7 +786,7 @@ app.post('/api/groups', userAuth, async (c) => {
 });
 
 app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
-  const body = await c.req.json<{ groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number; ownerUserId?: string | null }>();
+  const body = await c.req.json<{ groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number; ownerUserId?: string | null; public?: boolean }>();
   const sets: string[] = [];
   const binds: unknown[] = [];
   if (body.groupId !== undefined) {
@@ -727,6 +812,16 @@ app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
   if (body.ownerUserId !== undefined) {
     if (c.var.user!.role !== 'admin') return c.json({ error: 'admin role required to reassign ownership' }, 403);
     sets.push('owner_user_id = ?'); binds.push(body.ownerUserId);
+  }
+  if (body.public !== undefined) {
+    // Publishing a project is the OWNER's call (or an admin's) — a group member must not
+    // be able to expose shared work to the internet (PLNR-78).
+    const own = await c.env.DB.prepare('SELECT owner_user_id AS o FROM projects WHERE id = ?')
+      .bind(c.req.param('pid')!).first<{ o: string | null }>();
+    if (c.var.user!.role !== 'admin' && own?.o !== c.var.user!.id) {
+      return c.json({ error: 'only the project owner may change public visibility' }, 403);
+    }
+    sets.push('public = ?'); binds.push(body.public ? 1 : 0);
   }
   if (!sets.length) return c.json({ ok: true });
   const pid = c.req.param('pid')!;
@@ -807,6 +902,7 @@ app.delete('/api/users/:uid', userAuth, async (c) => {
     c.env.DB.prepare('DELETE FROM passkeys WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('DELETE FROM user_groups WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('DELETE FROM oauth_codes WHERE user_id = ?').bind(uid),
+    c.env.DB.prepare('DELETE FROM templates WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('DELETE FROM oauth_tokens WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('UPDATE agents SET user_id = NULL WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('UPDATE projects SET owner_user_id = NULL WHERE owner_user_id = ?').bind(uid),
@@ -1755,6 +1851,10 @@ app.notFound((c) => {
 export default {
   fetch: app.fetch,
   async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext) {
+    // Demo deployments re-seed nightly (PLNR-146) so visitors always land on a clean board.
+    if (env.DEMO_MODE) {
+      ctx.waitUntil(import('./lib/demo').then(({ resetDemo }) => resetDemo(env)).catch(() => {}));
+    }
     ctx.waitUntil(
       backupToR2(env, new Date(event.scheduledTime).toISOString()).then((r) => {
         // eslint-disable-next-line no-console

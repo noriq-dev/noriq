@@ -26,6 +26,7 @@ export interface ProjectVM {
   doneTasks: number;
   ownerName?: string | null;
   agentCount?: number;
+  isPublic?: boolean;
 }
 
 export interface AgentVM {
@@ -82,7 +83,7 @@ export interface EventVM {
   dot?: string;
 }
 
-export type ViewId = 'home' | 'control' | 'graph' | 'board' | 'plans' | 'review' | 'agents' | 'runs' | 'settings' | 'admin';
+export type ViewId = 'home' | 'control' | 'graph' | 'board' | 'plans' | 'roadmap' | 'review' | 'docs' | 'agents' | 'runs' | 'settings' | 'admin';
 
 export interface BoardVM {
   id: string;
