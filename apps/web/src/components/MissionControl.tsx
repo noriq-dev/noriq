@@ -150,6 +150,7 @@ function AgentPanel({ store }: { store: AppStore }) {
                 <div key={ev.id} style={{ display: 'flex', gap: 8, alignItems: 'baseline', fontSize: 11 }}>
                   <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)', flex: 'none' }}>{ev.t}</span>
                   <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: vc.color, flex: 'none' }}>{ev.verb}</span>
+                  {ev.dot && <span style={{ width: 7, height: 7, borderRadius: '50%', background: ev.dot, flex: 'none', alignSelf: 'center' }} />}
                   <span style={{ color: 'var(--text-mid)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ev.subject}</span>
                 </div>
               );
@@ -409,6 +410,9 @@ function EventFeed({ store }: { store: AppStore }) {
                 <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: vc.color, background: vc.bg, padding: '1px 6px', borderRadius: 4 }}>
                   {ev.verb}
                 </span>{' '}
+                {ev.dot && (
+                  <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: ev.dot, marginRight: 5 }} />
+                )}
                 <span style={{ color: 'var(--text-mid)' }}>{ev.subject}</span>
               </div>
             </div>

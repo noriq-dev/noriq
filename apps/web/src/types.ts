@@ -57,6 +57,8 @@ export interface TaskVM {
   claimExpiresAt: string | null;
   ttl?: number;
   ttlMax?: number;
+  priority: number;
+  estimate: number | null;
   deps: string[];
   milestoneId: string | null;
   boardId: string | null;
@@ -75,6 +77,8 @@ export interface EventVM {
   verb: string;
   subject: string;
   taskId?: string;
+  /** Swatch rendered before the subject — e.g. a created tag's color (PLNR-130). */
+  dot?: string;
 }
 
 export type ViewId = 'home' | 'control' | 'graph' | 'board' | 'plans' | 'agents' | 'runs' | 'settings' | 'admin';

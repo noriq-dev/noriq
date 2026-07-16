@@ -367,7 +367,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     // whose work was all done+archived read 0/0 instead of complete. The client hides
     // archived tasks at render; anything that counts uses the full list.
     c.env.DB.prepare(
-      `SELECT id, key, title, body, status, type, priority, claimed_by AS claimedBy, claim_expires_at AS claimExpiresAt,
+      `SELECT id, key, title, body, status, type, priority, estimate, claimed_by AS claimedBy, claim_expires_at AS claimExpiresAt,
               parent_task_id AS parentTaskId, milestone_id AS milestoneId, board_id AS boardId, archived_at AS archivedAt,
               open_comments AS openComments, "order"
        FROM tasks WHERE project_id = ? ORDER BY "order"`,
@@ -492,7 +492,7 @@ app.delete('/api/projects/:pid/boards/:bid', userAuth, async (c) => {
 });
 
 app.post('/api/projects/:pid/tasks', userAuth, async (c) => {
-  const body = await c.req.json<{ title: string; body?: string; parentTaskId?: string; priority?: number; dependsOn?: string[]; boardId?: string | null }>();
+  const body = await c.req.json<{ title: string; body?: string; parentTaskId?: string; priority?: number; estimate?: number | null; dependsOn?: string[]; boardId?: string | null }>();
   if (!body.title) return c.json({ error: 'title required' }, 400);
   const result = await room(c.env, c.req.param('pid')!).createTask(c.req.param('pid')!, humanActor(c), body);
   return c.json(result);

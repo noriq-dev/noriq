@@ -328,7 +328,7 @@ export interface ApiSnapshot {
   project: { id: string; key: string; name: string; description: string; claimTtlSeconds: number };
   tasks: Array<{
     id: string; key: string; title: string; body: string; status: string; type: string; priority: number;
-    claimedBy: string | null; claimExpiresAt: string | null; parentTaskId: string | null;
+    estimate: number | null; claimedBy: string | null; claimExpiresAt: string | null; parentTaskId: string | null;
     milestoneId: string | null; boardId: string | null; openComments: number; order: number; archivedAt: string | null;
   }>;
   dependencies: Array<{ taskId: string; dependsOnTaskId: string }>;

@@ -60,10 +60,12 @@ const asActor = (a: AgentIdentity): Actor => ({ kind: 'agent', id: a.id, name: a
 
 // MCP tool annotations (PLNR-88). Without these, clients assume the spec defaults —
 // write + destructive + open-world — for every tool. Ours are more benign: reads are
-// marked read-only; writes are additive/coordination edits (no MCP tool deletes data —
-// deletion is human-only in the web app), so destructiveHint is false; some are
-// idempotent; and everything operates on this project system, never the open internet,
-// so openWorldHint is false. Unlisted tools fall back to a plain non-destructive write.
+// marked read-only; writes are additive/coordination edits (content deletion is
+// human-only in the web app; remove_dependency is the one deliberate exception and it
+// only drops a coordination edge add_dependency can recreate), so destructiveHint is
+// false; some are idempotent; and everything operates on this project system, never
+// the open internet, so openWorldHint is false. Unlisted tools fall back to a plain
+// non-destructive write.
 type ToolHints = { readOnlyHint?: boolean; destructiveHint?: boolean; idempotentHint?: boolean; openWorldHint?: boolean };
 const READ: ToolHints = { readOnlyHint: true, openWorldHint: false };
 const WRITE: ToolHints = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
@@ -74,7 +76,7 @@ const TOOL_HINTS: Record<string, ToolHints> = {
   get_task: READ, next_claimable: READ, read_open_comments: READ, get_plans: READ,
   // writes that are safe to repeat with the same args (renew/replace-in-place/insert-or-ignore)
   heartbeat: WRITE_IDEMPOTENT, set_agent_identity: WRITE_IDEMPOTENT, update_task: WRITE_IDEMPOTENT,
-  update_plan: WRITE_IDEMPOTENT, add_dependency: WRITE_IDEMPOTENT, attach_ref: WRITE_IDEMPOTENT,
+  update_plan: WRITE_IDEMPOTENT, add_dependency: WRITE_IDEMPOTENT, remove_dependency: WRITE_IDEMPOTENT, attach_ref: WRITE_IDEMPOTENT,
   // everything else → WRITE (additive, non-idempotent, non-destructive, closed-world)
 };
 
@@ -349,6 +351,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       parentTaskId: z.string().optional(),
       milestoneId: z.string().optional(),
       priority: z.number().int().min(0).max(4).optional(),
+      estimate: z.number().int().min(0).optional().describe('Effort estimate in points (team-defined scale)'),
       dependsOn: z.array(z.string()).optional(),
       tags: z.array(z.string()).optional().describe('Tag names — auto-created for the project if new (e.g. ["backend", "auth"])'),
       type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
@@ -397,6 +400,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       body: z.string().optional(),
       status: z.enum(['todo', 'in_progress', 'blocked', 'review', 'done', 'cancelled']).optional(),
       priority: z.number().int().min(0).max(4).optional(),
+      estimate: z.number().int().min(0).nullable().optional().describe('Effort estimate in points; null clears it'),
       milestoneId: z.string().optional(),
       tags: z.array(z.string()).optional().describe('REPLACES the tag set (auto-created; [] clears)'),
       type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
@@ -448,9 +452,16 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'add_dependency',
-    'Make one task depend on another (blocks claiming until the dependency is done). Cycles are rejected.',
+    'Make one task depend on another (blocks claiming until the dependency is done). Cycles are rejected. Undo with remove_dependency.',
     { projectId: z.string(), taskId: z.string(), dependsOnTaskId: z.string() },
     tool(async ({ projectId, taskId, dependsOnTaskId }) => room(env, projectId).addDependency(projectId, actor, taskId, dependsOnTaskId)),
+  );
+
+  defineTool(
+    'remove_dependency',
+    'Remove a dependency edge between two tasks (the inverse of add_dependency), unblocking the dependent task if that was its last unfinished dependency. Use it to undo a mistaken edge or to unstick a task whose blocker no longer applies — removing an edge minted by a plan changes that plan\'s enforced ordering, so be sure that is what you mean.',
+    { projectId: z.string(), taskId: z.string(), dependsOnTaskId: z.string() },
+    tool(async ({ projectId, taskId, dependsOnTaskId }) => room(env, projectId).removeDependency(projectId, actor, taskId, dependsOnTaskId)),
   );
 
   defineTool(
@@ -700,7 +711,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'update_plan',
-    'Revise a plan document as work progresses — append status updates, record findings/gotchas, mark the outcome. Pass the FULL new body (read it first via get_plans). updatePhase via phaseId to revise one phase.',
+    'Revise a plan as work progresses — append status updates, record findings/gotchas, mark the outcome. Pass the FULL new body (read it first via get_plans). updatePhase via phaseId to revise one phase. To change the plan\'s STRUCTURE (add/remove/move tasks between phases, add/drop/reorder phases), pass `phases` with the complete new shape, mirroring create_plan: keep a phase\'s existing id to keep it (and its verify-gate state), omit the id for a new phase, and any existing phase you leave out is dropped. The phase-ordering dependency edges are re-derived to match; hand-added edges are untouched. Keep the document in step with a structural edit — a plan that says one thing and enforces another is worse than no plan.',
     {
       projectId: z.string(),
       planId: z.string(),
@@ -710,8 +721,23 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       phaseId: z.string().optional().describe('If set, patch this phase instead of the plan'),
       phaseBody: z.string().optional(),
       phaseTitle: z.string().optional(),
+      phases: z.array(
+        z.object({
+          id: z.string().optional().describe('Existing phase id to keep it (preserves gate state); omit for a new phase'),
+          title: z.string().min(1),
+          body: z.string().optional().describe('Replacement phase body; omitted = keep the current one'),
+          taskIds: z.array(z.string()).min(1).describe('The phase\'s complete new membership (ids or keys)'),
+        }),
+      ).min(1).max(12).optional().describe('The plan\'s complete new structure — replaces phase membership wholesale and re-derives the ordering edges (PLNR-154)'),
     },
-    tool(async ({ projectId, planId, title, description, body, phaseId, phaseBody, phaseTitle }) => {
+    tool(async ({ projectId, planId, title, description, body, phaseId, phaseBody, phaseTitle, phases }) => {
+      if (phases) {
+        const restructured = await room(env, projectId).restructurePlan(projectId, actor, planId, phases);
+        if (title !== undefined || description !== undefined || body !== undefined) {
+          await room(env, projectId).updatePlan(projectId, actor, planId, { title, description, body });
+        }
+        return restructured;
+      }
       if (phaseId) {
         return room(env, projectId).updatePhase(projectId, actor, phaseId, { title: phaseTitle, body: phaseBody });
       }

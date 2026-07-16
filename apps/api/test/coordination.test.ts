@@ -201,3 +201,33 @@ describe('coordination core', () => {
     expect(snap.events[0].seq).toBeGreaterThan(snap.events[1].seq);
   });
 });
+
+// ---- PLNR-119: priority is visible and estimate actually plumbed -----------------
+describe('priority + estimate end-to-end', () => {
+  it('estimate survives create → update → get_task → snapshot, and null clears it', async () => {
+    const proj = await mcpCall(orch.apiKey, 'create_project', { key: 'EST', name: 'estimates' });
+    const pid = proj.body.id;
+    const t = (await mcpCall(orch.apiKey, 'create_task', { projectId: pid, title: 'sized work', priority: 4, estimate: 5 })).body;
+
+    let got = await mcpCall(orch.apiKey, 'get_task', { taskId: t.id });
+    expect(got.body.task.priority).toBe(4);
+    expect(got.body.task.estimate).toBe(5);
+
+    await mcpCall(orch.apiKey, 'update_task', { projectId: pid, taskId: t.id, estimate: 8 });
+    got = await mcpCall(orch.apiKey, 'get_task', { taskId: t.id });
+    expect(got.body.task.estimate).toBe(8);
+
+    // The snapshot is what the board renders — both fields must reach it.
+    const snap = (await (await SELF.fetch(`https://planar.test/api/projects/${pid}/snapshot`, {
+      headers: { Cookie: cookie },
+    })).json()) as { tasks: Array<{ id: string; priority: number; estimate: number | null }> };
+    const row = snap.tasks.find((x) => x.id === t.id)!;
+    expect(row.priority).toBe(4);
+    expect(row.estimate).toBe(8);
+
+    // Explicit null clears; omitting leaves it alone.
+    await mcpCall(orch.apiKey, 'update_task', { projectId: pid, taskId: t.id, estimate: null });
+    got = await mcpCall(orch.apiKey, 'get_task', { taskId: t.id });
+    expect(got.body.task.estimate).toBeNull();
+  });
+});

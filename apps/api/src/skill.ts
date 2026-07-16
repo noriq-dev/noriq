@@ -84,11 +84,14 @@ Phase order is **enforced**: every task in phase N auto-depends on all of phase 
 the plan becomes a dependency-ordered work tree — workers (you, later, or others) can
 only claim in sequence and drain it via \`next_claimable\`. Keep the document alive as you
 go with \`update_plan\` (status, findings, gotchas, final outcome; pass the full new body,
-or a \`phaseId\` to revise one phase).
+or a \`phaseId\` to revise one phase). Plans are restructurable too: pass \`phases\` with the
+complete new shape to add/remove/move tasks or phases — the enforced ordering follows.
+Never paper over a structural change with prose alone; fix the structure so the document
+and the dependency graph agree.
 
 For a quick subtree without the ceremony, \`decompose_task\`; for ad-hoc ordering,
-\`add_dependency\`; to coordinate mid-flight, \`send_message\`. Check progress with
-\`get_plans\`.
+\`add_dependency\` (undo a wrong edge with \`remove_dependency\`); to coordinate
+mid-flight, \`send_message\`. Check progress with \`get_plans\`.
 
 ## Git
 

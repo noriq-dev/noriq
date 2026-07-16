@@ -221,4 +221,120 @@ describe('plans & groups', () => {
     const plans = await mcpCall(planner.apiKey, 'get_plans', { projectId });
     expect(plans.body.plans.some((p: { id: string }) => p.id === planId)).toBe(false);
   });
+
+  // ---- PLNR-153: a deleted plan takes its minted dependency edges with it ------
+  it('deleting a plan frees its phase-ordering edges but never a manual one', async () => {
+    const plan = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId, title: 'Short-lived plan',
+      phases: [
+        { title: 'First', newTasks: [{ title: 'p153 groundwork' }, { title: 'p153 sibling' }] },
+        { title: 'Second', newTasks: [{ title: 'p153 follow-up' }] },
+      ],
+    });
+    const [taskA, taskB] = plan.body.phases[0].taskIds as [string, string];
+    const taskC = plan.body.phases[1].taskIds[0] as string;
+
+    // A manual edge between phase-1 siblings — no phase boundary between them, so the
+    // plan minted nothing here. It must outlive the plan: a human chose it.
+    const manual = await mcpCall(planner.apiKey, 'add_dependency', { projectId, taskId: taskB, dependsOnTaskId: taskA });
+    expect(manual.isError).toBe(false);
+
+    // Sanity: the phase edge blocks C while the plan lives.
+    const gated = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: taskC });
+    expect(gated.isError).toBe(true);
+    expect(gated.text).toContain('blocked');
+
+    const del = await SELF.fetch(`https://planar.test/api/projects/${projectId}/plans/${plan.body.id}`, {
+      method: 'DELETE', headers: { Cookie: cookie },
+    });
+    expect(del.status).toBe(200);
+
+    // The plan's enforced edges died with it — C is claimable with nothing done.
+    const freed = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: taskC });
+    expect(freed.isError).toBe(false);
+
+    // The manual edge survived — B is still blocked behind A.
+    const stillBlocked = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: taskB });
+    expect(stillBlocked.isError).toBe(true);
+    expect(stillBlocked.text).toContain('blocked');
+
+    // ---- PLNR-152: and an agent can now undo an edge itself, over MCP --------
+    const undo = await mcpCall(planner.apiKey, 'remove_dependency', { projectId, taskId: taskB, dependsOnTaskId: taskA });
+    expect(undo.isError).toBe(false);
+    const unblocked = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: taskB });
+    expect(unblocked.isError).toBe(false);
+  });
+
+  // ---- PLNR-154: plan structure is editable, and the edges follow it ----------
+  it('update_plan restructures phases; the enforced ordering follows the new shape', async () => {
+    const plan = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId, title: 'Restructure me',
+      phases: [
+        { title: 'One', newTasks: [{ title: 'p154 base' }, { title: 'p154 movee' }] },
+        { title: 'Two', newTasks: [{ title: 'p154 tail' }] },
+      ],
+    });
+    const phase1 = plan.body.phases[0];
+    const phase2 = plan.body.phases[1];
+    const [base, movee] = phase1.taskIds as [string, string];
+    const tail = phase2.taskIds[0] as string;
+
+    // A hand-added edge that must survive every restructure below.
+    await mcpCall(planner.apiKey, 'add_dependency', { projectId, taskId: tail, dependsOnTaskId: base });
+
+    // Move `movee` from phase 1 to phase 2, keeping both phase ids.
+    const move = await mcpCall(planner.apiKey, 'update_plan', {
+      projectId, planId: plan.body.id,
+      phases: [
+        { id: phase1.id, title: 'One', taskIds: [base] },
+        { id: phase2.id, title: 'Two', taskIds: [movee, tail] },
+      ],
+    });
+    expect(move.isError).toBe(false);
+
+    // movee now lives behind phase 1: blocked on base, where before it was claimable.
+    const gated = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: movee });
+    expect(gated.isError).toBe(true);
+    expect(gated.text).toContain('blocked');
+
+    // Now drop `movee` from the plan entirely (and with it, nothing else changes).
+    const drop = await mcpCall(planner.apiKey, 'update_plan', {
+      projectId, planId: plan.body.id,
+      phases: [
+        { id: phase1.id, title: 'One', taskIds: [base] },
+        { id: phase2.id, title: 'Two', taskIds: [tail] },
+      ],
+    });
+    expect(drop.isError).toBe(false);
+
+    // Out of the plan → out from under its edges: movee is claimable again.
+    const freed = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: movee });
+    expect(freed.isError).toBe(false);
+
+    // The manual edge (tail depends on base) is not the plan's to shed — still blocking.
+    const manualHolds = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: tail });
+    expect(manualHolds.isError).toBe(true);
+    expect(manualHolds.text).toContain('blocked');
+
+    // Collapsing to one phase drops phase 2 and every plan-minted edge with it; the
+    // structure reads back in the new shape. (tail keeps only its manual blocker.)
+    const collapse = await mcpCall(planner.apiKey, 'update_plan', {
+      projectId, planId: plan.body.id,
+      phases: [{ id: phase1.id, title: 'Only', taskIds: [base, tail] }],
+    });
+    expect(collapse.isError).toBe(false);
+    const after = await mcpCall(planner.apiKey, 'get_plans', { projectId });
+    const shape = after.body.plans.find((p: { id: string }) => p.id === plan.body.id);
+    expect(shape.phases).toHaveLength(1);
+    expect(shape.phases[0].title).toBe('Only');
+    expect(shape.phases[0].total).toBe(2);
+
+    // A phase id from some other plan is refused.
+    const foreign = await mcpCall(planner.apiKey, 'update_plan', {
+      projectId, planId: plan.body.id,
+      phases: [{ id: 'phs_not_mine', title: 'X', taskIds: [base] }],
+    });
+    expect(foreign.isError).toBe(true);
+    expect(foreign.text).toContain('not part of this plan');
+  });
 });

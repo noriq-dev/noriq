@@ -84,7 +84,29 @@ export async function computeUpdates(
        ORDER BY t.priority DESC, t."order" LIMIT 20`,
     ).bind(agent.userId, agentProjectId, tokenId).all<AgentUpdates['claimable'][number]>()
   ).results;
-  const claimableIds = new Set(claimable.map((t) => t.id));
+
+  // Nudge eligibility for freshly-created tasks (PLNR-90) is checked against the REAL
+  // claimability predicate, not the top-20 display list above — a new task that 20
+  // higher-priority ones outrank is still claimable, and an idle agent still wants to
+  // hear about it. Only the ids in this event window are checked, so it stays cheap.
+  const newTaskIds = [...new Set(rawEvents.filter((e) => e.verb === 'task.created' && e.actorId !== agent.id).map((e) => e.subjectId))];
+  const nudgeableIds = new Set<string>();
+  if (heldTaskIds.size === 0 && newTaskIds.length) {
+    const { results } = await env.DB.prepare(
+      `SELECT t.id
+       FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
+       WHERE t.id IN (${newTaskIds.map((_, i) => `?${i + 4}`).join(',')})
+         AND t.status = 'todo' AND t.claimed_by IS NULL
+         AND ${USER_PROJECT_WHERE}
+         AND ${tokenProjectWhere('?3')}
+         AND (?2 IS NULL OR t.project_id = ?2)
+         AND NOT EXISTS (
+           SELECT 1 FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id
+           WHERE d.task_id = t.id AND dt.status NOT IN ('done','cancelled'))
+         AND ${TASK_NOT_IN_PROPOSED_PLAN}`,
+    ).bind(agent.userId, agentProjectId, tokenId, ...newTaskIds).all<{ id: string }>();
+    for (const r of results) nudgeableIds.add(r.id);
+  }
 
   // Projects the agent's USER can reach — scopes broadcast messages/notices so an
   // agent never hears cross-tenant chatter (PLNR-96).
@@ -118,7 +140,7 @@ export async function computeUpdates(
     } else if (e.verb === 'signal.answered' && p.agentId === agent.id) {
       const where = p.taskKey ? ` (${p.taskKey} is back in the queue — re-claim to resume)` : '';
       notices.push(`Your input request "${p.title}" was answered: "${p.response}"${where}`);
-    } else if (e.verb === 'task.created' && heldTaskIds.size === 0 && claimableIds.has(e.subjectId)) {
+    } else if (e.verb === 'task.created' && heldTaskIds.size === 0 && nudgeableIds.has(e.subjectId)) {
       // PLNR-90: nudge AVAILABLE agents (holding nothing — i.e. not heads-down draining
       // a plan) about a new, immediately-claimable task, so ad-hoc work gets picked up
       // dynamically instead of waiting for someone to poll. Heads-down agents aren't

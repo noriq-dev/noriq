@@ -186,7 +186,8 @@ export function Board({ store }: { store: AppStore }) {
         <div style={{ display: 'flex', gap: 18, height: '100%', minWidth: 'min-content' }}>
           {COLUMNS.map(([st, label]) => {
             const m = statusMeta(st);
-            const list = visible.filter((t) => t.status === st);
+            // Urgent first; the stable sort keeps board order within a priority band (PLNR-119).
+            const list = visible.filter((t) => t.status === st).sort((a, b) => b.priority - a.priority);
             return (
               <div
                 key={st}
@@ -247,6 +248,31 @@ export function Board({ store }: { store: AppStore }) {
                             </span>
                           )}
                           <div style={{ flex: 1 }} />
+                          {/* Default (P2) stays quiet — a badge on every card says nothing (PLNR-119). */}
+                          {t.priority !== 2 && (
+                            <span
+                              title={`priority ${t.priority}`}
+                              style={{
+                                fontFamily: 'var(--mono)', fontSize: 9, fontWeight: 700,
+                                color: t.priority >= 4 ? 'var(--red-soft)' : t.priority === 3 ? 'var(--amber)' : 'var(--text-faint)',
+                                border: `1px solid ${t.priority >= 4 ? 'rgba(255,92,92,.4)' : t.priority === 3 ? 'rgba(245,166,35,.35)' : 'var(--w-1)'}`,
+                                padding: '0 5px', borderRadius: 4,
+                              }}
+                            >
+                              P{t.priority}
+                            </span>
+                          )}
+                          {t.estimate !== null && (
+                            <span
+                              title="estimate"
+                              style={{
+                                fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)',
+                                border: '1px solid var(--w-1)', padding: '0 5px', borderRadius: 4,
+                              }}
+                            >
+                              {t.estimate}pt
+                            </span>
+                          )}
                           {t.openComments > 0 && (
                             <MonoTag color="var(--amber)" bg="rgba(245,166,35,.12)" size={9.5}>{t.openComments} ?</MonoTag>
                           )}

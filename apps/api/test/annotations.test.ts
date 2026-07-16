@@ -31,7 +31,7 @@ describe('MCP tool annotations (PLNR-88)', () => {
       expect(by[w]?.destructiveHint, w).toBe(false);
     }
     // Idempotent writes are flagged as such.
-    for (const i of ['heartbeat', 'update_task', 'update_plan', 'set_agent_identity', 'add_dependency', 'attach_ref']) {
+    for (const i of ['heartbeat', 'update_task', 'update_plan', 'set_agent_identity', 'add_dependency', 'remove_dependency', 'attach_ref']) {
       expect(by[i]?.readOnlyHint, i).toBe(false);
       expect(by[i]?.idempotentHint, i).toBe(true);
     }

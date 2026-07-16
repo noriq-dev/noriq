@@ -1037,7 +1037,10 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
-  /** Delete a plan + its phases/phase-links. The underlying tasks survive. */
+  /** Delete a plan + its phases/phase-links, including the dependency edges it minted
+   *  to enforce phase order (PLNR-153) — a deleted plan must not leave tasks blocked by
+   *  debris nothing explains. Manual (NULL-provenance) edges survive; the underlying
+   *  tasks survive. */
   async deletePlan(projectId: string, actor: Actor, planId: string)  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
@@ -1045,6 +1048,9 @@ export class ProjectRoom extends DurableObject<Env> {
         .bind(planId, this.projectId).first<{ id: string; title: string }>();
       if (!plan) throw new Error('plan not found');
       await this.env.DB.batch([
+        this.env.DB.prepare('DELETE FROM dependencies WHERE created_by_plan_id = ?').bind(planId),
+        // Gate rows before phases — the subselect needs the phases still present.
+        this.env.DB.prepare('DELETE FROM phase_gates WHERE phase_id IN (SELECT id FROM phases WHERE plan_id = ?)').bind(planId),
         this.env.DB.prepare('DELETE FROM phase_tasks WHERE phase_id IN (SELECT id FROM phases WHERE plan_id = ?)').bind(planId),
         this.env.DB.prepare('DELETE FROM phases WHERE plan_id = ?').bind(planId),
         this.env.DB.prepare('DELETE FROM plans WHERE id = ?').bind(planId),
@@ -1561,7 +1567,6 @@ export class ProjectRoom extends DurableObject<Env> {
         'INSERT INTO plans (id, project_id, agent_id, title, description, body, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       ).bind(planId, projectId, input.agentId ?? null, input.title, input.description ?? '', input.body ?? '', status, nowIso()).run();
   
-      let prevPhaseTaskIds: string[] = [];
       const phases: Array<{ id: string; title: string; taskIds: string[] }> = [];
       for (let i = 0; i < input.phases.length; i++) {
         const ph = input.phases[i]!;
@@ -1583,26 +1588,131 @@ export class ProjectRoom extends DurableObject<Env> {
         }
         if (!taskIds.length) throw new Error(`phase "${ph.title}" has no tasks`);
   
-        const stmts = taskIds.map((tid) =>
+        await this.env.DB.batch(taskIds.map((tid) =>
           this.env.DB.prepare('INSERT OR IGNORE INTO phase_tasks (phase_id, task_id) VALUES (?, ?)').bind(phaseId, tid),
-        );
-        // Enforce phase ordering through the dependency graph.
-        for (const tid of taskIds) {
-          for (const prev of prevPhaseTaskIds) {
-            if (tid !== prev) {
-              stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO dependencies (task_id, depends_on_task_id) VALUES (?, ?)').bind(tid, prev));
-            }
-          }
-        }
-        await this.env.DB.batch(stmts);
-        prevPhaseTaskIds = taskIds;
+        ));
         phases.push({ id: phaseId, title: ph.title, taskIds });
       }
+      // Phase ordering is enforced through the dependency graph — derived in one place
+      // (remintPlanEdges) shared with restructurePlan, so the two can't drift (PLNR-154).
+      await this.remintPlanEdges(planId);
       await this.emit(actor, 'plan.created', 'plan', planId, {
         title: input.title, status, phases: phases.map((p) => ({ title: p.title, tasks: p.taskIds.length })),
       });
       return { id: planId, title: input.title, status, phases };
 
+    });
+  }
+
+  /** Re-derive the dependency edges a plan's phase order implies (PLNR-154).
+   *
+   *  The single source of truth for plan-minted edges: drop everything this plan created
+   *  (provenance column, 0036) and mint fresh from current membership — every task in
+   *  phase N depends on every task of phase N-1 (the chain gives transitivity). Manual
+   *  NULL-provenance edges are never touched, and OR IGNORE means a colliding manual
+   *  edge keeps its NULL — the human chose it, so it outlives the plan.
+   *
+   *  Deliberately no cycle check: phase edges form a chain by construction, and a manual
+   *  reverse edge could already contradict a NEW plan today — same exposure, same answer
+   *  (the human removes the manual edge). Callers hold blockConcurrencyWhile. */
+  private async remintPlanEdges(planId: string) {
+    const { results } = await this.env.DB.prepare(
+      `SELECT pt.task_id AS tid, ph."order" AS ord FROM phase_tasks pt
+       JOIN phases ph ON ph.id = pt.phase_id WHERE ph.plan_id = ? ORDER BY ph."order"`,
+    ).bind(planId).all<{ tid: string; ord: number }>();
+    const byPhase = new Map<number, string[]>();
+    for (const r of results) byPhase.set(r.ord, [...(byPhase.get(r.ord) ?? []), r.tid]);
+    const orders = [...byPhase.keys()].sort((a, b) => a - b);
+    const stmts = [this.env.DB.prepare('DELETE FROM dependencies WHERE created_by_plan_id = ?').bind(planId)];
+    for (let i = 1; i < orders.length; i++) {
+      for (const tid of byPhase.get(orders[i]!)!) {
+        for (const prev of byPhase.get(orders[i - 1]!)!) {
+          if (tid !== prev) {
+            stmts.push(this.env.DB.prepare(
+              'INSERT OR IGNORE INTO dependencies (task_id, depends_on_task_id, created_by_plan_id) VALUES (?, ?, ?)',
+            ).bind(tid, prev, planId));
+          }
+        }
+      }
+    }
+    await this.env.DB.batch(stmts);
+  }
+
+  /** Replace a plan's structure — phases and their task membership (PLNR-154).
+   *
+   *  Before this, phase_tasks was written only by createPlan: a plan whose shape was wrong
+   *  could have its prose corrected but never its structure, so document and reality drifted
+   *  (the RUN-39 incident). Semantics mirror create_plan: the argument IS the new structure.
+   *  A phase entry carrying its existing id is kept in place (its phase_gates verify state
+   *  survives); entries without an id are new; existing phases not mentioned are dropped.
+   *  Membership is rebuilt wholesale and the ordering edges re-derived via remintPlanEdges —
+   *  a task removed from the plan sheds the edges the plan minted for it, and nothing else. */
+  async restructurePlan(
+    projectId: string,
+    actor: Actor,
+    planId: string,
+    phases: Array<{ id?: string; title: string; body?: string; taskIds: string[] }>,
+  ) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const plan = await this.env.DB.prepare('SELECT id, title FROM plans WHERE id = ? AND project_id = ?')
+        .bind(planId, projectId).first<{ id: string; title: string }>();
+      if (!plan) throw new Error('plan not found in this project');
+
+      const resolved: Array<{ id: string | null; title: string; body?: string; taskIds: string[] }> = [];
+      for (const ph of phases) {
+        const taskIds: string[] = [];
+        for (const tid of ph.taskIds) {
+          const t = await this.env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+            .bind(tid, tid, projectId).first<{ id: string }>();
+          if (!t) throw new Error(`task ${tid} not found in this project`);
+          taskIds.push(t.id);
+        }
+        if (!taskIds.length) throw new Error(`phase "${ph.title}" has no tasks`);
+        resolved.push({ id: ph.id ?? null, title: ph.title, body: ph.body, taskIds });
+      }
+
+      const { results: existing } = await this.env.DB.prepare('SELECT id FROM phases WHERE plan_id = ?')
+        .bind(planId).all<{ id: string }>();
+      const existingIds = new Set(existing.map((r) => r.id));
+      for (const p of resolved) {
+        if (p.id && !existingIds.has(p.id)) throw new Error(`phase ${p.id} is not part of this plan`);
+      }
+      const keptIds = new Set(resolved.map((p) => p.id).filter((id): id is string => !!id));
+
+      const stmts = [
+        // Membership first, plan-wide — the subselect needs the doomed phases still present.
+        this.env.DB.prepare('DELETE FROM phase_tasks WHERE phase_id IN (SELECT id FROM phases WHERE plan_id = ?)').bind(planId),
+        ...existing.filter((e) => !keptIds.has(e.id)).flatMap((e) => [
+          this.env.DB.prepare('DELETE FROM phase_gates WHERE phase_id = ?').bind(e.id),
+          this.env.DB.prepare('DELETE FROM phases WHERE id = ?').bind(e.id),
+        ]),
+      ];
+      const out: Array<{ id: string; title: string; taskIds: string[] }> = [];
+      resolved.forEach((p, i) => {
+        const phaseId = p.id ?? newId('phs');
+        if (p.id) {
+          stmts.push(
+            p.body === undefined
+              ? this.env.DB.prepare('UPDATE phases SET title = ?, "order" = ? WHERE id = ?').bind(p.title, i, phaseId)
+              : this.env.DB.prepare('UPDATE phases SET title = ?, body = ?, "order" = ? WHERE id = ?').bind(p.title, p.body, i, phaseId),
+          );
+        } else {
+          stmts.push(this.env.DB.prepare('INSERT INTO phases (id, plan_id, title, body, "order") VALUES (?, ?, ?, ?, ?)')
+            .bind(phaseId, planId, p.title, p.body ?? '', i));
+        }
+        for (const tid of p.taskIds) {
+          stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO phase_tasks (phase_id, task_id) VALUES (?, ?)').bind(phaseId, tid));
+        }
+        out.push({ id: phaseId, title: p.title, taskIds: p.taskIds });
+      });
+      await this.env.DB.batch(stmts);
+      await this.remintPlanEdges(planId);
+
+      await this.emit(actor, 'plan.updated', 'plan', planId, {
+        title: plan.title, structural: true, phases: out.map((p) => ({ title: p.title, tasks: p.taskIds.length })),
+      });
+      return { id: planId, title: plan.title, phases: out };
     });
   }
 
@@ -1649,6 +1759,11 @@ export class ProjectRoom extends DurableObject<Env> {
             "UPDATE tasks SET status = 'cancelled', updated_at = ? WHERE id = ? AND status = 'todo' AND claimed_by IS NULL",
           ).bind(now, r.id),
         ),
+        // Same reap as deletePlan (PLNR-153): a rejected proposal's phase-order edges must
+        // not survive it — a pre-existing in-flight task it referenced would stay blocked
+        // by a plan that never happened. Gate rows before phases (subselect needs them).
+        this.env.DB.prepare('DELETE FROM dependencies WHERE created_by_plan_id = ?').bind(planId),
+        this.env.DB.prepare('DELETE FROM phase_gates WHERE phase_id IN (SELECT id FROM phases WHERE plan_id = ?)').bind(planId),
         this.env.DB.prepare('DELETE FROM phase_tasks WHERE phase_id IN (SELECT id FROM phases WHERE plan_id = ?)').bind(planId),
         this.env.DB.prepare('DELETE FROM phases WHERE plan_id = ?').bind(planId),
         this.env.DB.prepare('DELETE FROM plans WHERE id = ?').bind(planId),

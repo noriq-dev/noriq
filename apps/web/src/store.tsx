@@ -24,6 +24,7 @@ function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
   let verb = e.verb;
   let subject = '';
   let taskId: string | undefined;
+  let dot: string | undefined;
   switch (e.verb) {
     case 'task.claimed': verb = 'claimed'; subject = `${p.key} · ${p.title}`; taskId = e.subjectId; break;
     case 'task.released': verb = 'released'; subject = `${p.key} · was held by ${p.previousHolder ?? '—'} → ${p.toStatus}`; taskId = e.subjectId; break;
@@ -40,9 +41,14 @@ function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
     case 'board.updated': verb = 'board'; subject = `renamed → ${p.name ?? ''}`; break;
     case 'board.deleted': verb = 'board'; subject = 'deleted'; break;
     case 'dependency.added': verb = 'dep'; subject = `${p.key} depends on ${p.dependsOn}`; taskId = e.subjectId; break;
+    case 'dependency.removed': verb = 'dep'; subject = `${p.key} no longer depends on ${p.dependsOn}`; taskId = e.subjectId; break;
+    // The payload has carried name+color all along — the feed just fell through to the
+    // raw-id default (PLNR-130).
+    case 'tag.created': verb = 'tag'; subject = `created ${p.name ?? ''}`; dot = typeof p.color === 'string' ? p.color : undefined; break;
+    case 'tag.deleted': verb = 'tag'; subject = `deleted ${p.name ?? ''}`; break;
     default: subject = `${e.verb} ${e.subjectId}`;
   }
-  return { id: e.id, t: timeOf(e.createdAt), actor, actorKind: e.actorKind, verb, subject, taskId };
+  return { id: e.id, t: timeOf(e.createdAt), actor, actorKind: e.actorKind, verb, subject, taskId, dot };
 }
 
 const VIEWS: ViewId[] = ['home', 'control', 'graph', 'board', 'plans', 'agents', 'runs', 'settings', 'admin'];
@@ -302,6 +308,8 @@ export function useAppStore() {
         claimExpiresAt: t.claimExpiresAt,
         ttl,
         ttlMax,
+        priority: t.priority,
+        estimate: t.estimate,
         deps: depsByTask.get(t.id) ?? [],
         milestoneId: t.milestoneId,
         boardId: t.boardId,
