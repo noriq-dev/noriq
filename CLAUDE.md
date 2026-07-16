@@ -102,12 +102,25 @@ for the components. (ARCHITECTURE.md calls it a "mock store" — that's stale; i
 
 - **A deployed change requires a hard browser refresh** — the open SPA tab caches the old JS bundle.
 
-## Naming (brand vs infrastructure)
+## Naming (brand vs legacy)
 
-The product was renamed **planar → Noriq**. User-facing text, the logo/favicons, and cosmetic IDs
-(`@noriq-dev/*` packages, `NoriqEvent`, MCP server name, `noriq://` attachment URIs) are **Noriq**. But
-**infrastructure identifiers were intentionally left as `planar`** and must not be renamed (doing so
-orphans live resources): the Worker name, D1 database name (`planar`), R2 buckets (`planar-files`),
-the `planar_session` cookie, localStorage keys (`planar.theme`/`planar.sidebar`), and the backup
-snapshot marker + `backups/planar-*.json` key. The project key `PLNR` and `PLNR-##` task keys are
-also unchanged. `wrangler.production.jsonc` holds the real instance values and is gitignored.
+The product was renamed **planar → Noriq**, and the PLNR-143 cutover (2026-07-16) finished the
+rename at the infrastructure layer: the Worker, D1 database, R2 bucket (`noriq-files`), session
+cookie (`noriq_session`), localStorage keys (`noriq.*`), and backup snapshots
+(`backups/noriq-*.json`, marker `noriq: 'd1-snapshot'`) are all **noriq** now.
+`wrangler.production.jsonc` holds the real instance values and is gitignored.
+
+What deliberately still says planar, and why:
+
+- **Project key `PLNR` / `PLNR-##` task keys** — kept permanently; they're embedded in every
+  commit message, comment, and external link. Re-keying is its own decision task if ever wanted.
+- **Cookie dual-read** — reads accept the legacy `planar_session` (see `readSessionId` in
+  [auth.ts](apps/api/src/auth.ts)) so pre-rename sessions survive. Safe to drop after the last
+  30-day sessions age out (~2026-08-16).
+- **localStorage migrate-on-read** from `planar.*` ([prefs.ts](apps/web/src/prefs.ts)) — cheap,
+  keep indefinitely.
+- **Old live resources retained as rollback, not renamed**: the D1 database `planar`
+  (`60978d16-…`) and bucket `planar-files` (which also holds all pre-rename
+  `backups/planar-*.json` snapshots — still valid restore sources). Delete only by explicit
+  decision, and copy the old backups somewhere first.
+- The repo directory being called `planar` is a local path, not an identifier.

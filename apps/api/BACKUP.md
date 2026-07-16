@@ -41,9 +41,20 @@ than the JSON snapshot:
 # Back up (SQL):
 wrangler d1 export noriq --remote --output noriq.sql --config wrangler.production.jsonc
 
+# Reorder before restoring — REQUIRED, see below:
+python3 scripts/reorder-d1-dump.py noriq.sql noriq-ordered.sql
+
 # Restore into a fresh/empty database:
-wrangler d1 execute noriq --remote --file noriq.sql --config wrangler.production.jsonc
+wrangler d1 execute noriq --remote --file noriq-ordered.sql --config wrangler.production.jsonc
 ```
+
+> ⚠️ A raw export does **not** import back as-is (learned the hard way during the
+> PLNR-143 cutover): the dump lists tables alphabetically and D1's import API does
+> not honor its `PRAGMA defer_foreign_keys` across internal batching, so the first
+> INSERT that references a later table fails (`no such table: main.runners`).
+> `scripts/reorder-d1-dump.py` rewrites the dump into FK-dependency order, breaks
+> the agents↔oauth_tokens cycle via patch UPDATEs, preserves `events` rowids (the
+> agent notice-cursor), and self-verifies with a strict FK-on rehearsal.
 
 Keep a periodic `wrangler d1 export` in your own CI/cron if you want SQL-level backups
 in addition to the R2 JSON snapshots.
