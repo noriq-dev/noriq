@@ -23,7 +23,7 @@ describe('deletion', () => {
   it('milestone delete keeps its tasks (milestone_id nulled)', async () => {
     const p = (await mcpCall(agent.apiKey, 'create_project', { key: 'DELM', name: 'delm' })).body;
     const ms = (await mcpCall(agent.apiKey, 'create_milestone', { projectId: p.id, title: 'M1' })).body;
-    const t = (await mcpCall(agent.apiKey, 'create_task', { projectId: p.id, title: 'keep me', milestoneId: ms.id })).body;
+    const t = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId: p.id, title: 'keep me', milestoneId: ms.id })).body;
     expect((await del(p.id, `/milestones/${ms.id}`)).status).toBe(200);
     const s = await snap(p.id);
     expect(s.milestones.find((m) => (m as { id: string }).id === ms.id)).toBeUndefined();
@@ -47,9 +47,9 @@ describe('deletion', () => {
 
   it('task delete cascades deps/comments/attachments and orphans children', async () => {
     const p = (await mcpCall(agent.apiKey, 'create_project', { key: 'DELT', name: 'delt' })).body;
-    const parent = (await mcpCall(agent.apiKey, 'create_task', { projectId: p.id, title: 'parent' })).body;
-    const child = (await mcpCall(agent.apiKey, 'create_task', { projectId: p.id, title: 'child', parentTaskId: parent.id })).body;
-    const other = (await mcpCall(agent.apiKey, 'create_task', { projectId: p.id, title: 'other' })).body;
+    const parent = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId: p.id, title: 'parent' })).body;
+    const child = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId: p.id, title: 'child', parentTaskId: parent.id })).body;
+    const other = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId: p.id, title: 'other' })).body;
     await mcpCall(agent.apiKey, 'add_dependency', { projectId: p.id, taskId: other.id, dependsOnTaskId: parent.id });
     await mcpCall(agent.apiKey, 'add_attachment', { projectId: p.id, taskId: parent.id, filename: 'x.png', data: btoa('bytes'), contentType: 'image/png' });
     await mcpCall(agent.apiKey, 'request_input', { projectId: p.id, taskId: parent.id, title: 'q?' });
@@ -66,7 +66,7 @@ describe('deletion', () => {
 
   it('project delete removes everything and unscopes agents', async () => {
     const p = (await mcpCall(agent.apiKey, 'create_project', { key: 'DELX', name: 'delx' })).body;
-    const t = (await mcpCall(agent.apiKey, 'create_task', { projectId: p.id, title: 'doomed' })).body;
+    const t = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId: p.id, title: 'doomed' })).body;
     await mcpCall(agent.apiKey, 'claim_task', { projectId: p.id, taskId: t.id }); // scopes the agent
     expect((await del(p.id, '')).status).toBe(200);
     // snapshot 404s now

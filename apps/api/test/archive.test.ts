@@ -25,7 +25,7 @@ beforeAll(async () => {
   cookie = await loginSession('arch-human@example.com', 'longenough1');
   const p = await mcpCall(agent.apiKey, 'create_project', { key: 'ARCH', name: 'archive' });
   projectId = p.body.id;
-  taskId = (await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'archive me' })).body.id;
+  taskId = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'archive me' })).body.id;
 }, 60000);
 
 describe('task archive', () => {
@@ -53,7 +53,7 @@ describe('task archive', () => {
 
     const ids: string[] = [];
     for (const title of ['done one', 'done two']) {
-      const t = await mcpCall(agent.apiKey, 'create_task', { projectId, title, milestoneId: msId });
+      const t = await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title, milestoneId: msId });
       ids.push(t.body.id as string);
       await mcpCall(agent.apiKey, 'update_task', { projectId, taskId: t.body.id, status: 'done' });
       expect((await post(`/tasks/${t.body.id}/archive`)).status).toBe(200);

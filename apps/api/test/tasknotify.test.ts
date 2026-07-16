@@ -23,7 +23,7 @@ beforeAll(async () => {
   await authorizeForAllProjects(worker.apiKey, busy.apiKey, creator.apiKey);
 
   // Make `busy` heads-down: it claims a seed task.
-  const seed = (await mcpCall(creator.apiKey, 'create_task', { projectId, title: 'seed' })).body;
+  const seed = (await mcpCall(creator.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'seed' })).body;
   await mcpCall(busy.apiKey, 'claim_task', { projectId, taskId: seed.id });
   // Advance everyone's cursor past the setup so only tasks created below register as new.
   await notices(worker.apiKey);
@@ -33,23 +33,23 @@ beforeAll(async () => {
 
 describe('new-task notify (PLNR-90)', () => {
   it('an available (idle) agent is nudged about a newly claimable task', async () => {
-    const t = (await mcpCall(creator.apiKey, 'create_task', { projectId, title: 'dynamic work item' })).body;
+    const t = (await mcpCall(creator.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'dynamic work item' })).body;
     expect((await notices(worker.apiKey)).some((n) => n.includes(t.key) && /up for grabs/.test(n))).toBe(true);
   });
 
   it('a heads-down agent (holding a task) is NOT nudged', async () => {
-    const t = (await mcpCall(creator.apiKey, 'create_task', { projectId, title: 'while youre busy' })).body;
+    const t = (await mcpCall(creator.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'while youre busy' })).body;
     expect((await notices(busy.apiKey)).some((n) => n.includes(t.key))).toBe(false);
   });
 
   it('the creator is not nudged about their own new task', async () => {
-    const t = (await mcpCall(creator.apiKey, 'create_task', { projectId, title: 'my own task' })).body;
+    const t = (await mcpCall(creator.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'my own task' })).body;
     expect((await notices(creator.apiKey)).some((n) => n.includes(t.key))).toBe(false);
   });
 
   it('a task blocked by unfinished deps does not nudge (not claimable yet)', async () => {
-    const gate = (await mcpCall(creator.apiKey, 'create_task', { projectId, title: 'gate' })).body;
-    const blocked = (await mcpCall(creator.apiKey, 'create_task', { projectId, title: 'blocked', dependsOn: [gate.id] })).body;
+    const gate = (await mcpCall(creator.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'gate' })).body;
+    const blocked = (await mcpCall(creator.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'blocked', dependsOn: [gate.id] })).body;
     const ns = await notices(worker.apiKey);
     expect(ns.some((n) => n.includes(blocked.key))).toBe(false); // blocked → not up for grabs
     expect(ns.some((n) => n.includes(gate.key))).toBe(true);     // the gate itself is claimable

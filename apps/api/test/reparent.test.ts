@@ -17,9 +17,9 @@ const parentOf = async (key: string) => {
 beforeAll(async () => {
   agent = await createAgent('reparent-agent');
   projectId = (await mcpCall(agent.apiKey, 'create_project', { key: 'RP', name: 'reparent' })).body.id;
-  a = (await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'epic A' })).body;
-  b = (await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'epic B' })).body;
-  c = (await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'child C' })).body;
+  a = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'epic A' })).body;
+  b = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'epic B' })).body;
+  c = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'child C' })).body;
 }, 60000);
 
 describe('re-parent task (PLNR-89)', () => {

@@ -1,6 +1,6 @@
 import type { Env } from './env';
 import type { AgentIdentity } from './auth';
-import { TASK_NOT_IN_PROPOSED_PLAN, USER_PROJECT_WHERE, tokenProjectWhere } from './lib/visibility';
+import { TASK_NOT_IN_PROPOSED_PLAN, TASK_NOT_PHASE_BLOCKED, USER_PROJECT_WHERE, tokenProjectWhere } from './lib/visibility';
 
 /**
  * Agent-scoped delta sync (ROADMAP Phase 1).
@@ -81,6 +81,7 @@ export async function computeUpdates(
            SELECT 1 FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id
            WHERE d.task_id = t.id AND dt.status NOT IN ('done','cancelled'))
          AND ${TASK_NOT_IN_PROPOSED_PLAN}
+         AND ${TASK_NOT_PHASE_BLOCKED}
        ORDER BY t.priority DESC, t."order" LIMIT 20`,
     ).bind(agent.userId, agentProjectId, tokenId).all<AgentUpdates['claimable'][number]>()
   ).results;
@@ -103,7 +104,8 @@ export async function computeUpdates(
          AND NOT EXISTS (
            SELECT 1 FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id
            WHERE d.task_id = t.id AND dt.status NOT IN ('done','cancelled'))
-         AND ${TASK_NOT_IN_PROPOSED_PLAN}`,
+         AND ${TASK_NOT_IN_PROPOSED_PLAN}
+         AND ${TASK_NOT_PHASE_BLOCKED}`,
     ).bind(agent.userId, agentProjectId, tokenId, ...newTaskIds).all<{ id: string }>();
     for (const r of results) nudgeableIds.add(r.id);
   }

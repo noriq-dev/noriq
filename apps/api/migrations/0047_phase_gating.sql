@@ -1,0 +1,13 @@
+-- 0047 (PLNR-163): plans stop minting dependency edges — phase order gates directly.
+--
+-- Since 0036, creating or restructuring a plan materialized a task-dependency edge from
+-- every task in phase N to every task in phase N-1 (provenance: created_by_plan_id).
+-- That made a plan's ordering look like per-task configuration: dependency lists filled
+-- with edges nobody chose, and restructuring/deleting a plan meant reconciling rows.
+-- Gating is now computed from phase membership itself (TASK_NOT_PHASE_BLOCKED in
+-- lib/visibility.ts, mirrored in claim/handoff/dispatch predicates), so the plan IS the
+-- gate and a task's dependency list holds only human-chosen edges.
+--
+-- Delete the edges plans minted. The created_by_plan_id column stays (additive-only
+-- rule) but nothing writes it anymore.
+DELETE FROM dependencies WHERE created_by_plan_id IS NOT NULL;

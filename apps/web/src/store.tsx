@@ -353,6 +353,25 @@ export function useAppStore() {
     for (const tt of snapshot?.taskTags ?? []) {
       tagsByTask.set(tt.taskId, [...(tagsByTask.get(tt.taskId) ?? []), tt.tagId]);
     }
+    // Phase-order gating (PLNR-163): a task is blocked by every task in an earlier phase
+    // of its (non-rejected) plan — computed from phase membership, no dependency edges.
+    const phaseById = new Map((snapshot?.phases ?? []).map((p) => [p.id, p]));
+    const rejectedPlans = new Set((snapshot?.plans ?? []).filter((p) => p.status === 'rejected').map((p) => p.id));
+    const tasksByPhase = new Map<string, string[]>();
+    const phaseOfTask = new Map<string, string>();
+    for (const pt of snapshot?.phaseTasks ?? []) {
+      tasksByPhase.set(pt.phaseId, [...(tasksByPhase.get(pt.phaseId) ?? []), pt.taskId]);
+      phaseOfTask.set(pt.taskId, pt.phaseId);
+    }
+    const phaseDepsOf = (tid: string): string[] => {
+      const ph = phaseById.get(phaseOfTask.get(tid) ?? '');
+      if (!ph || rejectedPlans.has(ph.planId)) return [];
+      const out: string[] = [];
+      for (const [id, p] of phaseById) {
+        if (p.planId === ph.planId && p.order < ph.order) out.push(...(tasksByPhase.get(id) ?? []));
+      }
+      return out;
+    };
     const tasks: TaskVM[] = (snapshot?.tasks ?? []).map((t) => {
       const expires = t.claimExpiresAt ? new Date(t.claimExpiresAt).getTime() : null;
       const ttl = expires !== null ? Math.max(0, Math.round((expires - now) / 1000)) : undefined;
@@ -370,6 +389,7 @@ export function useAppStore() {
         estimate: t.estimate,
         dueAt: t.dueAt,
         deps: depsByTask.get(t.id) ?? [],
+        phaseDeps: phaseDepsOf(t.id),
         milestoneId: t.milestoneId,
         boardId: t.boardId,
         tagIds: tagsByTask.get(t.id) ?? [],
@@ -411,7 +431,7 @@ export function useAppStore() {
     // Resolve deps against the full list: a dependency satisfied by a task that has since
     // been archived is still satisfied, not unresolvable.
     const isBlocked = (pid: string, t: TaskVM) =>
-      t.deps.some((d) => {
+      [...t.deps, ...t.phaseDeps].some((d) => {
         const dt = allTasksOf(pid).find((x) => x.id === d);
         return dt !== undefined && dt.status !== 'done' && dt.status !== 'cancelled';
       });

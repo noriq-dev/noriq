@@ -1392,7 +1392,6 @@ export class ProjectRoom extends DurableObject<Env> {
         .bind(planId, this.projectId).first<{ id: string; title: string }>();
       if (!plan) throw new Error('plan not found');
       await this.env.DB.batch([
-        this.env.DB.prepare('DELETE FROM dependencies WHERE created_by_plan_id = ?').bind(planId),
         // Gate rows before phases — the subselect needs the phases still present.
         this.env.DB.prepare('DELETE FROM phase_gates WHERE phase_id IN (SELECT id FROM phases WHERE plan_id = ?)').bind(planId),
         this.env.DB.prepare('DELETE FROM phase_tasks WHERE phase_id IN (SELECT id FROM phases WHERE plan_id = ?)').bind(planId),
@@ -1800,7 +1799,8 @@ export class ProjectRoom extends DurableObject<Env> {
       return { created: 0 };
     }
 
-    // A dependency BLOCKS unless done/cancelled — or, under gate='landed', unless it is in
+    // A blocker (manual dependency edge, or any task in an earlier phase of this plan —
+    // PLNR-163) BLOCKS unless done/cancelled — or, under gate='landed', unless it is in
     // review with a landed run. SQL is composed from a fixed pair of literals, never input.
     const landedException = d.gate === 'landed'
       ? `AND NOT (dt.status = 'review' AND EXISTS (
@@ -1821,6 +1821,12 @@ export class ProjectRoom extends DurableObject<Env> {
          AND NOT EXISTS (
            SELECT 1 FROM dependencies dp JOIN tasks dt ON dt.id = dp.depends_on_task_id
            WHERE dp.task_id = t.id AND dt.status NOT IN ('done','cancelled') ${landedException})
+         AND NOT EXISTS (
+           SELECT 1 FROM phases prev
+             JOIN phase_tasks ppt ON ppt.phase_id = prev.id
+             JOIN tasks dt ON dt.id = ppt.task_id
+           WHERE prev.plan_id = ?1 AND prev."order" < ph."order"
+             AND dt.status NOT IN ('done','cancelled') ${landedException})
          AND NOT EXISTS (
            SELECT 1 FROM runs lr WHERE lr.anchor_type = 'task' AND lr.anchor_id = t.id
              AND lr.status IN ('queued','dispatched','running','blocked'))
@@ -2384,49 +2390,14 @@ export class ProjectRoom extends DurableObject<Env> {
         ));
         phases.push({ id: phaseId, title: ph.title, taskIds });
       }
-      // Phase ordering is enforced through the dependency graph — derived in one place
-      // (remintPlanEdges) shared with restructurePlan, so the two can't drift (PLNR-154).
-      await this.remintPlanEdges(planId);
+      // Phase ordering gates directly off phase membership (PLNR-163) — no dependency
+      // edges are minted; the claim/claimable/dispatch predicates read the phase graph.
       await this.emit(actor, 'plan.created', 'plan', planId, {
         title: input.title, status, phases: phases.map((p) => ({ title: p.title, tasks: p.taskIds.length })),
       });
       return { id: planId, title: input.title, status, phases };
 
     });
-  }
-
-  /** Re-derive the dependency edges a plan's phase order implies (PLNR-154).
-   *
-   *  The single source of truth for plan-minted edges: drop everything this plan created
-   *  (provenance column, 0036) and mint fresh from current membership — every task in
-   *  phase N depends on every task of phase N-1 (the chain gives transitivity). Manual
-   *  NULL-provenance edges are never touched, and OR IGNORE means a colliding manual
-   *  edge keeps its NULL — the human chose it, so it outlives the plan.
-   *
-   *  Deliberately no cycle check: phase edges form a chain by construction, and a manual
-   *  reverse edge could already contradict a NEW plan today — same exposure, same answer
-   *  (the human removes the manual edge). Callers hold blockConcurrencyWhile. */
-  private async remintPlanEdges(planId: string) {
-    const { results } = await this.env.DB.prepare(
-      `SELECT pt.task_id AS tid, ph."order" AS ord FROM phase_tasks pt
-       JOIN phases ph ON ph.id = pt.phase_id WHERE ph.plan_id = ? ORDER BY ph."order"`,
-    ).bind(planId).all<{ tid: string; ord: number }>();
-    const byPhase = new Map<number, string[]>();
-    for (const r of results) byPhase.set(r.ord, [...(byPhase.get(r.ord) ?? []), r.tid]);
-    const orders = [...byPhase.keys()].sort((a, b) => a - b);
-    const stmts = [this.env.DB.prepare('DELETE FROM dependencies WHERE created_by_plan_id = ?').bind(planId)];
-    for (let i = 1; i < orders.length; i++) {
-      for (const tid of byPhase.get(orders[i]!)!) {
-        for (const prev of byPhase.get(orders[i - 1]!)!) {
-          if (tid !== prev) {
-            stmts.push(this.env.DB.prepare(
-              'INSERT OR IGNORE INTO dependencies (task_id, depends_on_task_id, created_by_plan_id) VALUES (?, ?, ?)',
-            ).bind(tid, prev, planId));
-          }
-        }
-      }
-    }
-    await this.env.DB.batch(stmts);
   }
 
   /** Replace a plan's structure — phases and their task membership (PLNR-154).
@@ -2436,8 +2407,9 @@ export class ProjectRoom extends DurableObject<Env> {
    *  (the RUN-39 incident). Semantics mirror create_plan: the argument IS the new structure.
    *  A phase entry carrying its existing id is kept in place (its phase_gates verify state
    *  survives); entries without an id are new; existing phases not mentioned are dropped.
-   *  Membership is rebuilt wholesale and the ordering edges re-derived via remintPlanEdges —
-   *  a task removed from the plan sheds the edges the plan minted for it, and nothing else. */
+   *  Membership is rebuilt wholesale; phase-order gating follows automatically because the
+   *  gate reads phase membership live (PLNR-163) — a task removed from the plan sheds its
+   *  phase gate the moment the row is gone, and no task or dependency row is touched. */
   async restructurePlan(
     projectId: string,
     actor: Actor,
@@ -2498,7 +2470,6 @@ export class ProjectRoom extends DurableObject<Env> {
         out.push({ id: phaseId, title: p.title, taskIds: p.taskIds });
       });
       await this.env.DB.batch(stmts);
-      await this.remintPlanEdges(planId);
 
       await this.emit(actor, 'plan.updated', 'plan', planId, {
         title: plan.title, structural: true, phases: out.map((p) => ({ title: p.title, tasks: p.taskIds.length })),
@@ -2550,10 +2521,8 @@ export class ProjectRoom extends DurableObject<Env> {
             "UPDATE tasks SET status = 'cancelled', updated_at = ? WHERE id = ? AND status = 'todo' AND claimed_by IS NULL",
           ).bind(now, r.id),
         ),
-        // Same reap as deletePlan (PLNR-153): a rejected proposal's phase-order edges must
-        // not survive it — a pre-existing in-flight task it referenced would stay blocked
-        // by a plan that never happened. Gate rows before phases (subselect needs them).
-        this.env.DB.prepare('DELETE FROM dependencies WHERE created_by_plan_id = ?').bind(planId),
+        // Gate rows before phases (subselect needs them). Phase-order gating dies with the
+        // phase_tasks rows themselves (PLNR-163) — nothing else to reap.
         this.env.DB.prepare('DELETE FROM phase_gates WHERE phase_id IN (SELECT id FROM phases WHERE plan_id = ?)').bind(planId),
         this.env.DB.prepare('DELETE FROM phase_tasks WHERE phase_id IN (SELECT id FROM phases WHERE plan_id = ?)').bind(planId),
         this.env.DB.prepare('DELETE FROM phases WHERE plan_id = ?').bind(planId),
@@ -2644,10 +2613,21 @@ export class ProjectRoom extends DurableObject<Env> {
     return row;
   }
 
+  /** Everything standing between this task and workability: manual dependency edges,
+   *  plus unfinished tasks in earlier phases of its plan (PLNR-163 — phase order gates
+   *  directly; plans no longer mint dependency rows). */
   private async unfinishedDeps(taskId: string): Promise<string[]> {
     const { results } = await this.env.DB.prepare(
       `SELECT t.key FROM dependencies d JOIN tasks t ON t.id = d.depends_on_task_id
-       WHERE d.task_id = ? AND t.status NOT IN ('done','cancelled')`,
+       WHERE d.task_id = ?1 AND t.status NOT IN ('done','cancelled')
+       UNION
+       SELECT pdt.key FROM phase_tasks pt
+         JOIN phases ph   ON ph.id = pt.phase_id
+         JOIN plans  pl   ON pl.id = ph.plan_id AND pl.status != 'rejected'
+         JOIN phases prev ON prev.plan_id = ph.plan_id AND prev."order" < ph."order"
+         JOIN phase_tasks ppt ON ppt.phase_id = prev.id
+         JOIN tasks pdt   ON pdt.id = ppt.task_id
+       WHERE pt.task_id = ?1 AND pdt.status NOT IN ('done','cancelled')`,
     ).bind(taskId).all<{ key: string }>();
     return results.map((r) => r.key);
   }

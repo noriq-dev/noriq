@@ -411,4 +411,35 @@ describe('plans & groups', () => {
     const back = await mcpCall(planner.apiKey, 'get_plans', { projectId });
     expect(back.body.plans.some((p: { id: string }) => p.id === plan.body.id)).toBe(true);
   });
+
+  it('phase order gates without minting dependency edges (PLNR-163)', async () => {
+    const plan = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId,
+      title: 'Edge-free ordering',
+      description: 'phases gate directly',
+      body: '# Goal\n\nNo minted edges.',
+      phases: [
+        { title: 'First', newTasks: [{ title: 'edgefree base' }] },
+        { title: 'Second', newTasks: [{ title: 'edgefree dependent' }] },
+      ],
+    });
+    const base = plan.body.phases[0].taskIds[0];
+    const dependent = plan.body.phases[1].taskIds[0];
+
+    // The gate is real: phase-2 claim names the phase-1 blocker…
+    const gated = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: dependent });
+    expect(gated.isError).toBe(true);
+    expect(gated.text).toContain('blocked');
+
+    // …but the task carries NO dependency rows — the plan is the gate, not per-task config.
+    const detail = await mcpCall(planner.apiKey, 'get_task', { taskId: dependent });
+    expect(detail.body.dependencies ?? []).toHaveLength(0);
+
+    // Finishing phase 1 lifts the gate with zero task/dependency writes.
+    await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: base });
+    await mcpCall(worker.apiKey, 'release_task', { projectId, taskId: base, toStatus: 'done' });
+    const open = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: dependent });
+    expect(open.isError).toBe(false);
+    await mcpCall(worker.apiKey, 'release_task', { projectId, taskId: dependent, toStatus: 'done' });
+  });
 });

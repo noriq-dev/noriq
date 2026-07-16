@@ -22,7 +22,7 @@ beforeAll(async () => {
   cookie = await loginSession('board-human@example.com', 'longenough1');
   const p = await mcpCall(agent.apiKey, 'create_project', { key: 'BRD', name: 'boards' });
   projectId = p.body.id;
-  taskId = (await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'lands on default board' })).body.id;
+  taskId = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'lands on default board' })).body.id;
 }, 60000);
 
 describe('boards (PLNR-80)', () => {

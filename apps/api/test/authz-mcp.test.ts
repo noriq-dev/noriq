@@ -20,7 +20,7 @@ beforeAll(async () => {
   agent = await createAgent('mcp-authz-agent');
   // The agent's own project + attachment (positive cases).
   const proj = await mcpCall(agent.apiKey, 'create_project', { key: 'MXAGT', name: 'mine' });
-  const t = await mcpCall(agent.apiKey, 'create_task', { projectId: proj.body.id, title: 'mine' });
+  const t = await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId: proj.body.id, title: 'mine' });
   myTaskKey = t.body.key;
   // Claim it so this file doesn't leave a claimable task in the shared mint-user
   // pool (createAgent mints all agents under one user) — otherwise it perturbs

@@ -435,7 +435,7 @@ describe('tags', () => {
   });
 
   it('update_task replaces and clears the tag set', async () => {
-    const t = await mcpCall(agentKey, 'create_task', { projectId, title: 'docs thing' });
+    const t = await mcpCall(agentKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'docs thing' });
     await mcpCall(agentKey, 'update_task', { projectId, taskId: t.body.id, tags: ['docs'], type: 'chore' });
     let proj = await mcpCall(agentKey, 'get_project', { projectId });
     let task = proj.body.tasks.find((x: { id: string }) => x.id === t.body.id);

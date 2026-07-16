@@ -96,7 +96,7 @@ describe('token project scope (RUN-38)', () => {
     // the loop picks the project itself. Without the scope clause in its own query, a scoped
     // token would simply be handed work it was never authorized for.
     const owner = await mint([allowedPid, forbiddenPid], 'owner');
-    const t = await mcpCall(owner, 'create_task', { projectId: forbiddenPid, title: 'off-limits work' });
+    const t = await mcpCall(owner, 'create_task', { tags: ['test-fixture'], projectId: forbiddenPid, title: 'off-limits work' });
     expect(t.isError).toBe(false);
 
     const scoped = await mint([allowedPid], 'pull');

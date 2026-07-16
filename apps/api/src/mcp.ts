@@ -7,6 +7,7 @@ import { computeUpdates, formatNotices } from './sync';
 import { base64ToBytes, bytesToBase64, newId, nowIso, sha256Hex } from './lib/util';
 import {
   TASK_NOT_IN_PROPOSED_PLAN,
+  TASK_NOT_PHASE_BLOCKED,
   USER_PROJECT_WHERE,
   tokenCanReachProject,
   tokenProjectWhere,
@@ -38,6 +39,11 @@ TTL is generous (30 min), so you never need to ping to stay alive. heartbeat exi
 for the rare case where you'll go silent longer than that; (4) check and resolve open
 comments — humans steer you through them; (5) release_task (to review or done) when
 finished. Never work on a task you have not claimed.
+Tasks you create MUST carry descriptive tags (topic/area/component words like "oauth" or
+"board-filters"); the FIRST tag is the primary tag. Never tag with status/type/priority
+words — those have dedicated fields. Plans need no dependency wiring: phase order itself
+gates tasks (a task is claimable when every earlier phase is finished); use dependsOn
+only for real, hand-picked orderings.
 You do not register yourself — you already are somebody, and get_briefing tells you who.
 Its \`you.kind\` says which: a "copilot" is a human's session (registered when they
 authorized this connection, and parented to it automatically), and an "agent" was created
@@ -73,6 +79,30 @@ async function resolveTaskId(env: Env, projectId: string, taskId: string): Promi
 }
 
 const asActor = (a: AgentIdentity): Actor => ({ kind: 'agent', id: a.id, name: a.name });
+
+// PLNR-171: agent-created tasks must carry descriptive tags — tags[0] is the task's
+// PRIMARY tag (its main topical bucket). A tag restating status/type/priority/milestone
+// is rejected: those concepts have dedicated fields, and a tag copy of them is noise
+// that rots. The denylist is compared on a normalized form (lowercase, separators → '-').
+const NON_DESCRIPTIVE_TAGS = new Set([
+  'todo', 'in-progress', 'inprogress', 'blocked', 'review', 'in-review', 'done',
+  'cancelled', 'canceled', 'backlog', 'wip', 'in-flight',
+  'bug', 'feature', 'chore', 'research', 'task', 'epic', 'story', 'ticket',
+  'p0', 'p1', 'p2', 'p3', 'p4', 'priority', 'high', 'medium', 'low', 'high-priority',
+  'low-priority', 'urgent', 'critical', 'milestone',
+]);
+const TAG_GUIDANCE =
+  'tags must be descriptive topic/area/component words (e.g. "oauth", "board-filters", "ws-resume"); ' +
+  'the FIRST tag is the primary tag. Status, type, priority, and milestone have dedicated fields — never restate them as tags.';
+
+function requireDescriptiveTags(tags: string[] | undefined): void {
+  if (!tags?.length) throw new Error(`tags are required — ${TAG_GUIDANCE}`);
+  for (const raw of tags) {
+    const norm = raw.trim().toLowerCase().replace(/[\s_]+/g, '-');
+    if (!norm) throw new Error(`empty tag — ${TAG_GUIDANCE}`);
+    if (NON_DESCRIPTIVE_TAGS.has(norm)) throw new Error(`"${raw}" is not a descriptive tag — ${TAG_GUIDANCE}`);
+  }
+}
 
 // MCP tool annotations (PLNR-88). Without these, clients assume the spec defaults —
 // write + destructive + open-world — for every tool. Ours are more benign: reads are
@@ -220,7 +250,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         playbook: [
           'You already have an identity — `you` above is it, and `you.kind` says whether you are a human\'s copilot or a runner-spawned agent. Nothing to register. Work loop: my_updates → pick from claimable (or next_claimable) → claim_task (just the one you are about to start) → do the work → resolve any comments → release_task {toStatus:"review"|"done"}. Every tool call renews your claim, so no periodic pinging — heartbeat only if you will be idle longer than the claim TTL.',
           'Humans steer via comments on tasks (kind: question/instruction). Acknowledge fast, resolve with resolve_comment (addressed|wont_do) + a reply. Unresolved comments should block you from finishing.',
-          'Anything bigger than one task: plan first. create_plan writes the plan as a document — goals/approach in the body, then ordered phases over tasks (phase order enforced via auto-dependencies); or decompose_task for a quick subtree. Workers drain the plan via next_claimable; keep it current with update_plan.',
+          'Anything bigger than one task: plan first. create_plan writes the plan as a document — goals/approach in the body, then ordered phases over tasks. Phase order itself gates the work (tasks in phase N are claimable once every earlier phase is finished — no dependency wiring needed); or decompose_task for a quick subtree. Workers drain the plan via next_claimable; keep it current with update_plan.',
+          'Tasks you create MUST carry descriptive tags — topic/area/component words (e.g. "oauth", "board-filters"), FIRST tag = primary tag. Never status/type/priority words as tags; those have dedicated fields. Use dependsOn only for real, hand-picked orderings.',
           'Claims are exclusive. If claim_task fails, the task is taken or blocked — pick another.',
           'Blocked on a human decision? request_input (it auto-parks the task and frees you to work elsewhere) — do not guess or stall. Flag non-blocking concerns (deviations, risks) with raise_alert and keep going.',
           'Every tool result may end with a "--- notices ---" block: read it, it is addressed to you.',
@@ -574,7 +605,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'create_task',
-    'Create a task. Use parentTaskId to build a decomposition tree and dependsOn (task ids) to gate order. New tasks start as todo.',
+    'Create a task. `tags` is REQUIRED: 1+ descriptive topic/area tags, and the FIRST tag is the primary tag (e.g. ["oauth", "token-refresh"]) — never status/type/priority words, those have dedicated fields. Use parentTaskId to build a decomposition tree and dependsOn (task ids) to gate order. New tasks start as todo.',
     {
       projectId: z.string(),
       title: z.string().min(1),
@@ -585,16 +616,21 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       estimate: z.number().int().min(0).optional().describe('Effort estimate in points (team-defined scale)'),
       dueAt: z.string().datetime().optional().describe('Deadline (ISO datetime) — overdue tasks are surfaced to humans'),
       dependsOn: z.array(z.string()).optional(),
-      tags: z.array(z.string()).optional().describe('Tag names — auto-created for the project if new (e.g. ["backend", "auth"])'),
+      // Optional in the schema so a missing value reaches the handler's instructive error
+      // (protocol-level zod failures are generic); the contract is REQUIRED (PLNR-171).
+      tags: z.array(z.string()).optional().describe('REQUIRED. Descriptive topic/area tags, primary first (e.g. ["oauth", "token-refresh"]) — auto-created for the project if new. Never status/type/priority/milestone words.'),
       type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
       boardId: z.string().optional().describe('Board to place the task on (see get_project.boards); defaults to the project’s default board'),
     },
-    tool(async ({ projectId, ...input }) => room(env, projectId).createTask(projectId, actor, input)),
+    tool(async ({ projectId, ...input }) => {
+      requireDescriptiveTags(input.tags);
+      return room(env, projectId).createTask(projectId, actor, input);
+    }),
   );
 
   defineTool(
     'create_tasks',
-    'Create MANY tasks in one call — the batch form of create_task, for building a backlog or a plan\'s inventory without one call per task. `defaults` fills fields every item shares (per-item values win). Give items a `ref` (any string unique in the batch) and read ids back by ref instead of by position; later items may name an earlier item\'s ref in dependsOn/parentTaskId. Items are created in order and a failed item does NOT roll back earlier ones — check each result for `error`.',
+    'Create MANY tasks in one call — the batch form of create_task, for building a backlog or a plan\'s inventory without one call per task. Every item needs descriptive `tags` (its own, or via `defaults.tags`; first tag = primary, never status/type/priority words). `defaults` fills fields every item shares (per-item values win). Give items a `ref` (any string unique in the batch) and read ids back by ref instead of by position; later items may name an earlier item\'s ref in dependsOn/parentTaskId. Items are created in order and a failed item does NOT roll back earlier ones — check each result for `error`.',
     {
       projectId: z.string(),
       defaults: z.object({
@@ -638,6 +674,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       const created: Array<{ ref?: string; title: string; id?: string; key?: string; error?: string }> = [];
       for (const item of tasks) {
         try {
+          // PLNR-171: every item needs descriptive tags (its own, or the batch defaults).
+          // Checked per item so one untagged entry fails alone, matching batch semantics.
+          const effectiveTags = item.tags ?? defaults?.tags;
+          requireDescriptiveTags(effectiveTags);
           const dependsOn = await Promise.all((item.dependsOn ?? []).map(resolve));
           const parentTaskId = item.parentTaskId ? await resolve(item.parentTaskId) : undefined;
           const res = await r.createTask(projectId, actor, {
@@ -649,7 +689,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
             milestoneId: item.milestoneId ?? defaults?.milestoneId,
             boardId: item.boardId ?? defaults?.boardId,
             type: item.type ?? defaults?.type,
-            tags: item.tags ?? defaults?.tags,
+            tags: effectiveTags,
             parentTaskId,
             dependsOn,
           });
@@ -940,6 +980,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
              SELECT 1 FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id
              WHERE d.task_id = t.id AND dt.status NOT IN ('done','cancelled'))
            AND ${TASK_NOT_IN_PROPOSED_PLAN}
+           AND ${TASK_NOT_PHASE_BLOCKED}
          ORDER BY t.priority DESC, t."order" LIMIT 1`,
       ).bind(agent.userId, projectId ?? null, opts.oauthTokenId ?? null).first();
       return row ? { task: row } : { task: null, note: 'nothing claimable right now — check my_updates for blockers' };

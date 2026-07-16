@@ -58,7 +58,7 @@ describe('notices policy (PLNR-25)', () => {
   });
 
   it('a completed task no longer piggybacks a "done" notice on other agents', async () => {
-    const t = await mcpCall(idle.apiKey, 'create_task', { projectId, title: 'finish me' });
+    const t = await mcpCall(idle.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'finish me' });
     await mcpCall(busy.apiKey, 'claim_task', { projectId, taskId: t.body.id });
     await mcpCall(busy.apiKey, 'release_task', { projectId, taskId: t.body.id, toStatus: 'done' });
 
@@ -68,7 +68,7 @@ describe('notices policy (PLNR-25)', () => {
   });
 
   it('an unheld-task question reaches an IDLE agent on the piggyback', async () => {
-    const t = await mcpCall(idle.apiKey, 'create_task', { projectId, title: 'nobody holds this' });
+    const t = await mcpCall(idle.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'nobody holds this' });
     await humanQuestion(projectId, t.body.id, 'who can take this?');
     // idle agent (holds nothing) → sees the unassigned question in its notices block.
     const upd = await mcpCall(idle.apiKey, 'get_project', { projectId });
@@ -77,10 +77,10 @@ describe('notices policy (PLNR-25)', () => {
 
   it('a heads-down agent is NOT interrupted by unheld-task questions on the piggyback', async () => {
     // busy holds a task of its own.
-    const own = await mcpCall(busy.apiKey, 'create_task', { projectId, title: 'busy work' });
+    const own = await mcpCall(busy.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'busy work' });
     await mcpCall(busy.apiKey, 'claim_task', { projectId, taskId: own.body.id });
 
-    const other = await mcpCall(idle.apiKey, 'create_task', { projectId, title: 'unrelated unheld' });
+    const other = await mcpCall(idle.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'unrelated unheld' });
     await humanQuestion(projectId, other.body.id, 'unrelated question for whoever');
 
     const upd = await mcpCall(busy.apiKey, 'get_task', { taskId: own.body.id });

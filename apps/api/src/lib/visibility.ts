@@ -71,6 +71,23 @@ export const TASK_NOT_IN_PROPOSED_PLAN = `NOT EXISTS (
   WHERE pt.task_id = t.id AND pl.status = 'proposed'
 )`;
 
+// Phase-order gate (PLNR-163): a task in phase N of a live plan is not workable until
+// every task in the plan's earlier phases is done/cancelled. The gate is computed from
+// phase membership directly — plans no longer mint physical dependency edges (the
+// 0036-era `created_by_plan_id` rows), so restructuring or deleting a plan changes
+// gating with zero task writes, and a task's dependency list stays purely the edges a
+// human chose. Rejected plans don't gate (their structure is dead history). Assumes the
+// tasks table is aliased `t`. Use as: `AND ${TASK_NOT_PHASE_BLOCKED}`.
+export const TASK_NOT_PHASE_BLOCKED = `NOT EXISTS (
+  SELECT 1 FROM phase_tasks pt
+    JOIN phases ph   ON ph.id = pt.phase_id
+    JOIN plans  pl   ON pl.id = ph.plan_id AND pl.status != 'rejected'
+    JOIN phases prev ON prev.plan_id = ph.plan_id AND prev."order" < ph."order"
+    JOIN phase_tasks ppt ON ppt.phase_id = prev.id
+    JOIN tasks pdt   ON pdt.id = ppt.task_id
+  WHERE pt.task_id = t.id AND pdt.status NOT IN ('done','cancelled')
+)`;
+
 /** Whether a user may access a specific project (owned / group / ownerless). */
 export async function userCanAccessProject(env: Env, userId: string, projectId: string): Promise<boolean> {
   const row = await env.DB.prepare(

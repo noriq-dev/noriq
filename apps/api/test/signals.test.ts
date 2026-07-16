@@ -23,7 +23,7 @@ beforeAll(async () => {
 
 describe('input requests (decision gates)', () => {
   it('parks the held task, and answering returns it to the queue + notifies the agent', async () => {
-    const t = (await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'needs a call' })).body;
+    const t = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'needs a call' })).body;
     await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId: t.id });
 
     const req = await mcpCall(agent.apiKey, 'request_input', {
@@ -54,7 +54,7 @@ describe('input requests (decision gates)', () => {
   });
 
   it('blocks done while an input request is open', async () => {
-    const t = (await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'gated finish' })).body;
+    const t = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'gated finish' })).body;
     // Raise the request before claiming, so the task isn't auto-parked and stays claimable.
     await mcpCall(agent.apiKey, 'request_input', { projectId, taskId: t.id, title: 'ok to ship?' });
     await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId: t.id });
@@ -66,7 +66,7 @@ describe('input requests (decision gates)', () => {
 
 describe('alerts (non-blocking)', () => {
   it('raises an alert without parking anything', async () => {
-    const t = (await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'has a deviation' })).body;
+    const t = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'has a deviation' })).body;
     await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId: t.id });
     const a = await mcpCall(agent.apiKey, 'raise_alert', {
       projectId, taskId: t.id, title: 'API returns 500s intermittently', severity: 'critical',
@@ -98,7 +98,7 @@ describe('multi-question input requests', () => {
     const agent = await createAgent('batch-asker');
     const pid = (await mcpCall(agent.apiKey, 'create_project', { key: 'ASKB', name: 'ask-batch' })).body.id;
     await authorizeForAllProjects(agent.apiKey);
-    const t = (await mcpCall(agent.apiKey, 'create_task', { projectId: pid, title: 'needs decisions' })).body;
+    const t = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId: pid, title: 'needs decisions' })).body;
     await mcpCall(agent.apiKey, 'claim_task', { projectId: pid, taskId: t.id });
 
     const raised = await mcpCall(agent.apiKey, 'request_input', {

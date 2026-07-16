@@ -27,7 +27,7 @@ beforeAll(async () => {
 
 describe('claim arbiter under load', () => {
   it(`${RACERS} agents race ONE task → exactly one claim, clean rejections`, async () => {
-    const t = await mcpCall(agents[0]!.apiKey, 'create_task', { projectId, title: 'the contested task' });
+    const t = await mcpCall(agents[0]!.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'the contested task' });
     const start = Date.now();
     const results = await Promise.all(
       agents.map((a) => mcpCall(a.apiKey, 'claim_task', { projectId, taskId: t.body.id })),
@@ -50,7 +50,7 @@ describe('claim arbiter under load', () => {
   it(`${RACERS} agents claim ${RACERS} distinct tasks in parallel → all succeed`, async () => {
     const tasks: string[] = [];
     for (let i = 0; i < RACERS; i++) {
-      const t = await mcpCall(agents[0]!.apiKey, 'create_task', { projectId, title: `parallel work ${i}` });
+      const t = await mcpCall(agents[0]!.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: `parallel work ${i}` });
       tasks.push(t.body.id);
     }
     const start = Date.now();
@@ -71,7 +71,7 @@ describe('claim arbiter under load', () => {
   }, 30000);
 
   it('rapid claim/release cycling keeps state consistent', async () => {
-    const t = await mcpCall(agents[0]!.apiKey, 'create_task', { projectId, title: 'hot potato' });
+    const t = await mcpCall(agents[0]!.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'hot potato' });
     for (let round = 0; round < 5; round++) {
       const holder = agents[round % agents.length]!;
       const claim = await mcpCall(holder.apiKey, 'claim_task', { projectId, taskId: t.body.id });

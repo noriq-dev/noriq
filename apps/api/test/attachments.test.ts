@@ -15,7 +15,7 @@ beforeAll(async () => {
   agent = await createAgent('att-tester');
   const proj = await mcpCall(agent.apiKey, 'create_project', { key: 'ATT', name: 'attachments' });
   projectId = proj.body.id;
-  const t = await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'has a screenshot' });
+  const t = await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'has a screenshot' });
   taskId = t.body.id;
 }, 60000);
 

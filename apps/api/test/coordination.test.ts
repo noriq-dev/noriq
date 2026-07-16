@@ -51,9 +51,9 @@ describe('coordination core', () => {
     // say so, rather than let the old implicit "every token sees everything" creep back.
     await authorizeForAllProjects(orch.apiKey, nova.apiKey, echo.apiKey);
 
-    t1 = (await mcpCall(orch.apiKey, 'create_task', { projectId, title: 'Build the base' })).body;
+    t1 = (await mcpCall(orch.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'Build the base' })).body;
     expect(t1.key).toBe('TST-1');
-    t2 = (await mcpCall(orch.apiKey, 'create_task', { projectId, title: 'Build on top', dependsOn: [t1.id] })).body;
+    t2 = (await mcpCall(orch.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'Build on top', dependsOn: [t1.id] })).body;
     expect(t2.key).toBe('TST-2');
   });
 
@@ -120,7 +120,7 @@ describe('coordination core', () => {
   });
 
   it('add_comment leaves a non-blocking note (agent can still finish)', async () => {
-    const t = (await mcpCall(orch.apiKey, 'create_task', { projectId, title: 'note task' })).body;
+    const t = (await mcpCall(orch.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'note task' })).body;
     await mcpCall(nova.apiKey, 'claim_task', { projectId, taskId: t.id });
     const c = await mcpCall(nova.apiKey, 'add_comment', { projectId, taskId: t.id, body: 'note: found a gotcha in retry logic' });
     expect(c.isError).toBe(false);
@@ -134,7 +134,7 @@ describe('coordination core', () => {
   });
 
   it('claim_task and release_task accept the display key, not just the opaque id', async () => {
-    const t = (await mcpCall(orch.apiKey, 'create_task', { projectId, title: 'claim me by key' })).body;
+    const t = (await mcpCall(orch.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'claim me by key' })).body;
     const claim = await mcpCall(nova.apiKey, 'claim_task', { projectId, taskId: t.key });
     expect(claim.isError).toBe(false);
     expect(claim.body.key).toBe(t.key);
@@ -144,7 +144,7 @@ describe('coordination core', () => {
   });
 
   it('release_task can record closing thoughts in the same call', async () => {
-    const t = (await mcpCall(orch.apiKey, 'create_task', { projectId, title: 'note on release' })).body;
+    const t = (await mcpCall(orch.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'note on release' })).body;
     await mcpCall(nova.apiKey, 'claim_task', { projectId, taskId: t.id });
     const rel = await mcpCall(nova.apiKey, 'release_task', {
       projectId, taskId: t.id, toStatus: 'done', comment: 'shipped; watch the retry path under load',
@@ -159,7 +159,7 @@ describe('coordination core', () => {
   });
 
   it('decompose_task builds an ordered subtree', async () => {
-    const parent = (await mcpCall(orch.apiKey, 'create_task', { projectId, title: 'Epic' })).body;
+    const parent = (await mcpCall(orch.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'Epic' })).body;
     const dec = await mcpCall(orch.apiKey, 'decompose_task', {
       projectId,
       parentTaskId: parent.id,
@@ -207,7 +207,7 @@ describe('priority + estimate end-to-end', () => {
   it('estimate survives create → update → get_task → snapshot, and null clears it', async () => {
     const proj = await mcpCall(orch.apiKey, 'create_project', { key: 'EST', name: 'estimates' });
     const pid = proj.body.id;
-    const t = (await mcpCall(orch.apiKey, 'create_task', { projectId: pid, title: 'sized work', priority: 4, estimate: 5 })).body;
+    const t = (await mcpCall(orch.apiKey, 'create_task', { tags: ['test-fixture'], projectId: pid, title: 'sized work', priority: 4, estimate: 5 })).body;
 
     let got = await mcpCall(orch.apiKey, 'get_task', { taskId: t.id });
     expect(got.body.task.priority).toBe(4);
@@ -279,6 +279,7 @@ describe('update_tasks — batch mutation', () => {
     const pid = proj.body.id;
     const made = (await mcpCall(orch.apiKey, 'create_tasks', {
       projectId: pid,
+      defaults: { tags: ['test-fixture'] },
       tasks: [
         { ref: 'x', title: 'one', tags: ['keepme'] },
         { ref: 'y', title: 'two' },
@@ -338,7 +339,7 @@ describe('search_tasks', () => {
       tasks: [
         { title: 'fix webhook retries', body: 'the webhook backs off wrong', tags: ['auth'], type: 'bug', priority: 4 },
         { title: 'polish login page', tags: ['auth', 'ui'], type: 'feature' },
-        { title: 'refactor queue', type: 'chore' },
+        { title: 'refactor queue', tags: ['queue'], type: 'chore' },
       ],
     });
   }, 30000);
@@ -385,6 +386,7 @@ describe('move_task', () => {
     const b = (await mcpCall(orch.apiKey, 'create_project', { key: 'MVB', name: 'move-dst' })).body.id;
     const made = (await mcpCall(orch.apiKey, 'create_tasks', {
       projectId: a,
+      defaults: { tags: ['test-fixture'] },
       tasks: [
         { ref: 'anchor', title: 'stays behind' },
         { ref: 'mover', title: 'roams', tags: ['carried'], dependsOn: ['anchor'] },
@@ -416,7 +418,7 @@ describe('move_task', () => {
     expect(refuse.text).toContain('held');
 
     // Refused with children.
-    await mcpCall(orch.apiKey, 'create_task', { projectId: a, title: 'kid', parentTaskId: ids.anchor.id });
+    await mcpCall(orch.apiKey, 'create_task', { tags: ['test-fixture'], projectId: a, title: 'kid', parentTaskId: ids.anchor.id });
     const parent = await mcpCall(orch.apiKey, 'move_task', { projectId: a, taskId: ids.anchor.id, toProjectId: b });
     expect(parent.isError).toBe(true);
     expect(parent.text).toContain('subtask');
@@ -493,7 +495,7 @@ describe('list_agents + handoff_task', () => {
   }, 30000);
 
   it('list_agents shows the roster with held work and marks you', async () => {
-    const t = (await mcpCall(orch.apiKey, 'create_task', { projectId: pid, title: 'held by nova' })).body;
+    const t = (await mcpCall(orch.apiKey, 'create_task', { tags: ['test-fixture'], projectId: pid, title: 'held by nova' })).body;
     await mcpCall(nova.apiKey, 'claim_task', { projectId: pid, taskId: t.id }, 'sess-hnd-nova');
     const roster = await mcpCall(nova.apiKey, 'list_agents', { projectId: pid }, 'sess-hnd-nova');
     expect(roster.isError).toBe(false);
@@ -506,7 +508,7 @@ describe('list_agents + handoff_task', () => {
   });
 
   it('pre-assigns an unclaimed task; the target holds it and hears about it', async () => {
-    const t = (await mcpCall(orch.apiKey, 'create_task', { projectId: pid, title: 'delegated work' })).body;
+    const t = (await mcpCall(orch.apiKey, 'create_task', { tags: ['test-fixture'], projectId: pid, title: 'delegated work' })).body;
     const handoff = await mcpCall(orch.apiKey, 'handoff_task', {
       projectId: pid, taskId: t.key, toAgentId: novaId, note: 'start with the failing test',
     });
@@ -534,6 +536,7 @@ describe('list_agents + handoff_task', () => {
   it('refuses a dep-blocked task — the target could not work it', async () => {
     const made = (await mcpCall(orch.apiKey, 'create_tasks', {
       projectId: pid,
+      defaults: { tags: ['test-fixture'] },
       tasks: [{ ref: 'gate', title: 'gate' }, { ref: 'after', title: 'after', dependsOn: ['gate'] }],
     })).body.created;
     const after = made.find((i: { ref?: string }) => i.ref === 'after');
@@ -551,6 +554,7 @@ describe('due dates', () => {
     const future = '2099-01-01T00:00:00.000Z';
     const made = (await mcpCall(orch.apiKey, 'create_tasks', {
       projectId: pid,
+      defaults: { tags: ['test-fixture'] },
       tasks: [
         { ref: 'late', title: 'slipped', dueAt: past },
         { ref: 'fine', title: 'on track', dueAt: future },
@@ -581,7 +585,7 @@ describe('due dates', () => {
 describe('attention inbox', () => {
   it('aggregates open signals and overdue tasks across visible projects', async () => {
     const pid = (await mcpCall(orch.apiKey, 'create_project', { key: 'ATTN', name: 'attention' })).body.id;
-    const t = (await mcpCall(orch.apiKey, 'create_task', { projectId: pid, title: 'stuck work', dueAt: '2020-06-01T00:00:00.000Z' })).body;
+    const t = (await mcpCall(orch.apiKey, 'create_task', { tags: ['test-fixture'], projectId: pid, title: 'stuck work', dueAt: '2020-06-01T00:00:00.000Z' })).body;
     await mcpCall(orch.apiKey, 'claim_task', { projectId: pid, taskId: t.id });
     await mcpCall(orch.apiKey, 'request_input', {
       projectId: pid, taskId: t.id, title: 'Which database?', options: ['sqlite', 'postgres'],
@@ -605,7 +609,7 @@ describe('attention inbox', () => {
 describe('public projects', () => {
   it('404s until the OWNER opts in; then serves the reduced read-only payload', async () => {
     const pid = (await mcpCall(orch.apiKey, 'create_project', { key: 'PUB', name: 'goes public' })).body.id;
-    const t = (await mcpCall(orch.apiKey, 'create_task', { projectId: pid, title: 'visible work' })).body;
+    const t = (await mcpCall(orch.apiKey, 'create_task', { tags: ['test-fixture'], projectId: pid, title: 'visible work' })).body;
     await mcpCall(orch.apiKey, 'claim_task', { projectId: pid, taskId: t.id });
     await mcpCall(orch.apiKey, 'request_input', { projectId: pid, taskId: t.id, title: 'private decision' });
 

@@ -27,8 +27,8 @@ beforeAll(async () => {
   cookie = await loginSession('dep-human@example.com', 'longenough1');
   const proj = await mcpCall(agent.apiKey, 'create_project', { key: 'DEP', name: 'deps' });
   projectId = proj.body.id;
-  a = (await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'A' })).body.id;
-  b = (await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'B' })).body.id;
+  a = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'A' })).body.id;
+  b = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'B' })).body.id;
 }, 60000);
 
 describe('dependency management (PLNR-58)', () => {

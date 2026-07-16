@@ -62,6 +62,8 @@ export interface TaskVM {
   estimate: number | null;
   dueAt: string | null;
   deps: string[];
+  /** Task ids in earlier phases of this task's plan — phase-order gating (PLNR-163). */
+  phaseDeps: string[];
   milestoneId: string | null;
   boardId: string | null;
   tagIds: string[];

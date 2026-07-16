@@ -64,14 +64,14 @@ describe("an agent is scoped to its user, not admin (PLNR-83)", () => {
     expect(get.isError).toBe(true);
     expect(get.text).toMatch(/not found or not accessible|not found/);
 
-    const create = await mcpCall(agent.apiKey, 'create_task', { projectId: bobProjectId, title: 'sneaky' });
+    const create = await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId: bobProjectId, title: 'sneaky' });
     expect(create.isError).toBe(true);
   });
 
   it('a project the agent creates is owned by its user and workable', async () => {
     const p = await mcpCall(agent.apiKey, 'create_project', { key: 'AVAGT', name: 'agent project' });
     expect(p.isError).toBe(false);
-    const t = await mcpCall(agent.apiKey, 'create_task', { projectId: p.body.id, title: 'ok' });
+    const t = await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId: p.body.id, title: 'ok' });
     expect(t.isError).toBe(false);
   });
 });

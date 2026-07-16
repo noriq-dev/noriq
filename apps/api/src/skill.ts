@@ -56,6 +56,13 @@ need it to start working, and it never creates anybody.)
    You cannot release to done with unresolved comments.
 7. \`release_task\` with toStatus "review" (default for finished work) or "done".
 
+When you **create** tasks (\`create_task\` / \`create_tasks\`), tags are required and must
+be *descriptive* — topic/area/component words like \`oauth\`, \`board-filters\`,
+\`ws-resume\`. The **first tag is the primary tag** (the task's main topical bucket), so
+order them accordingly. Never tag with status, type, or priority words (\`bug\`,
+\`in-progress\`, \`p1\`, …) — those concepts live in dedicated fields and the server
+rejects them as tags.
+
 ## Human steering
 
 Humans post comments of kind **question** (answer it, keep working) and
@@ -82,14 +89,16 @@ The plan you'd write in plan mode maps onto \`create_plan\` one-to-one:
   (what / how / done-when) and its tasks: \`newTasks\` created inline (title, body,
   priority) or \`taskIds\` for ones that already exist.
 
-Phase order is **enforced**: every task in phase N auto-depends on all of phase N-1, so
-the plan becomes a dependency-ordered work tree — workers (you, later, or others) can
-only claim in sequence and drain it via \`next_claimable\`. Keep the document alive as you
-go with \`update_plan\` (status, findings, gotchas, final outcome; pass the full new body,
-or a \`phaseId\` to revise one phase). Plans are restructurable too: pass \`phases\` with the
-complete new shape to add/remove/move tasks or phases — the enforced ordering follows.
-Never paper over a structural change with prose alone; fix the structure so the document
-and the dependency graph agree.
+Phase order is **enforced by the phases themselves**: a task in phase N is claimable
+only once every task in earlier phases is finished — no dependency edges are created or
+needed, the plan IS the gate. Workers (you, later, or others) drain it in sequence via
+\`next_claimable\`. Keep the document alive as you go with \`update_plan\` (status,
+findings, gotchas, final outcome; pass the full new body, or a \`phaseId\` to revise one
+phase). Plans are restructurable too: pass \`phases\` with the complete new shape to
+add/remove/move tasks or phases — gating follows the new structure instantly. Never
+paper over a structural change with prose alone; fix the structure so the document and
+reality agree. Reserve \`dependsOn\`/\`add_dependency\` for real, hand-picked orderings
+outside the phase flow.
 
 For a quick subtree without the ceremony, \`decompose_task\`; for ad-hoc ordering,
 \`add_dependency\` (undo a wrong edge with \`remove_dependency\`); to coordinate
