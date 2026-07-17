@@ -375,7 +375,7 @@ function RunTranscript({ run, live }: { run: ApiRun; live: boolean }) {
     if (!run.logTail) return null;
     return (
       <div style={{ margin: '8px 0 2px', padding: '9px 11px', borderRadius: 8, maxHeight: 220, overflow: 'auto', background: 'var(--bg)', border: '1px solid var(--w-07)', fontSize: 11.5, wordBreak: 'break-word' }}>
-        <Markdown source={run.logTail} compact />
+        <Markdown source={run.logTail} compact breaks />
       </div>
     );
   }
@@ -403,8 +403,8 @@ function RunTranscript({ run, live }: { run: ApiRun; live: boolean }) {
               </span>
             </div>
             <div style={{ padding: '4px 11px 9px', fontSize: 11.5, wordBreak: 'break-word' }}>
-              {/* Agent output is markdown prose (PLNR-151) — render it, don't dump it. */}
-              <Markdown source={b.text} compact />
+              {/* Streamed conversational output — one newline = one line break (PLNR-172). */}
+              <Markdown source={b.text} compact breaks />
             </div>
           </div>
         );
