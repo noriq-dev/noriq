@@ -926,7 +926,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'remove_dependency',
-    'Remove a dependency edge between two tasks (the inverse of add_dependency), unblocking the dependent task if that was its last unfinished dependency. Use it to undo a mistaken edge or to unstick a task whose blocker no longer applies — removing an edge minted by a plan changes that plan\'s enforced ordering, so be sure that is what you mean.',
+    'Remove a manual dependency edge (the inverse of add_dependency), unblocking the dependent task if that was its last unfinished blocker. Remove an edge ONLY because the ordering itself is wrong — a dependency that should never have existed. NEVER remove one to get past a blocker you find inconvenient: that is not clearing the gate, it is deleting it, and it defeats the coordination this whole system exists to enforce. If the blocker is genuinely finished, mark the BLOCKER done (or cancelled) and the gate clears itself — do not touch the edge. If the blocker is NOT finished, the gate is doing its job; work something else or clear the blocker honestly. (A plan\'s phase order is not a dependency edge and can\'t be removed here — restructure the plan if the ordering is wrong.)',
     { projectId: z.string(), taskId: z.string(), dependsOnTaskId: z.string() },
     tool(async ({ projectId, taskId, dependsOnTaskId }) => room(env, projectId).removeDependency(projectId, actor, taskId, dependsOnTaskId)),
   );
