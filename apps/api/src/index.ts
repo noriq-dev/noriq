@@ -1537,10 +1537,12 @@ const PlanDispatchApiBody = z.object({
   effort: RunEffort.nullish(),
   // Applied to EVERY run the dispatch creates (per-run ceilings, not a shared pool).
   budget: RunBudget.optional(),
-  // 'landed' (default): dependents unblock when the dependency's run lands (verify gate
-  // passed, code on the plan branch) even while its task awaits human review. 'approved':
-  // dependents wait for the human — the strict, slower gate.
-  gate: z.enum(['landed', 'approved']).default('landed'),
+  // 'approved' (default, PLNR-176): dependents wait until the human marks each upstream
+  // task done — review is a real lock, and a kicked-back task can't already have
+  // dependents running on its rejected work. 'landed' unblocks dependents as soon as the
+  // upstream's run lands (verify passed, code on the plan branch) while review is still
+  // pending — faster, but an explicit opt-in to running ahead of sign-off.
+  gate: z.enum(['landed', 'approved']).default('approved'),
 });
 app.post('/api/projects/:pid/plans/:planId/dispatch', userAuth, async (c) => {
   const pid = c.req.param('pid')!;

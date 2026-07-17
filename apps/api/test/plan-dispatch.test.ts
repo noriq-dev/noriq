@@ -156,7 +156,7 @@ describe('the review gate (the design decision of PLNR-170)', () => {
   it("gate='landed': dependents start once the dependency's run is done, its task still in review", async () => {
     const runner = await seedRunner(2);
     const { planId, a, b, c } = await makePlan('landed');
-    const d = await createDispatch(runner, planId); // default gate: landed
+    const d = await createDispatch(runner, planId, { gate: 'landed' }); // explicit opt-in (PLNR-176 made 'approved' the default)
     const runs = await dispatchRuns(d.id);
 
     // Simulate both agents: claim, release to review (the build agent's normal exit), run lands.
@@ -200,10 +200,42 @@ describe('the review gate (the design decision of PLNR-170)', () => {
     expect(view.stallReason).toBeNull();
   });
 
+  it("the default gate is 'approved' — review locks the next phase unless the operator opts into 'landed' (PLNR-176)", async () => {
+    const runner = await seedRunner(2);
+    const { planId } = await makePlan('defgate');
+    const d = await createDispatch(runner, planId);
+    expect(d.gate).toBe('approved');
+  });
+
+  it('a pump-dispatched claim re-checks readiness — an upstream kicked back to todo refuses the claim (PLNR-176)', async () => {
+    const runner = await seedRunner(3);
+    const { planId, a, b, c } = await makePlan('stale');
+    const d = await createDispatch(runner, planId, { gate: 'landed' });
+    for (const run of await dispatchRuns(d.id)) {
+      const agent = await seedAgent(runner);
+      await room(pid).transitionRun(pid, actor, run.id, { status: 'running', agentId: agent });
+      await room(pid).claimTask(pid, actor, run.taskId, agent);
+      await room(pid).releaseTask(pid, { kind: 'agent', id: agent, name: agent }, run.taskId, { toStatus: 'review' });
+      await room(pid).transitionRun(pid, actor, run.id, { status: 'done' });
+    }
+    // Landed gate: c dispatches while a/b sit in review with landed runs.
+    const runC = (await dispatchRuns(d.id)).find((r) => r.taskId === c)!;
+    // The human reviews a and REJECTS it — back to todo. The dispatch-time readiness call
+    // is now stale; c's agent must not get to claim on top of rejected baseline work.
+    await room(pid).updateTask(pid, actor, a, { status: 'todo' });
+    const cAgent = await seedAgent(runner);
+    await room(pid).transitionRun(pid, actor, runC.id, { status: 'running', agentId: cAgent });
+    await expect(room(pid).claimTask(pid, actor, c, cAgent)).rejects.toThrow(/readiness changed since dispatch/);
+    // Re-approving a (done) clears the block for the same agent.
+    await room(pid).updateTask(pid, actor, a, { status: 'done' });
+    await expect(room(pid).claimTask(pid, actor, c, cAgent)).resolves.toMatchObject({ key: expect.any(String) });
+    void b;
+  });
+
   it('an agent claiming the task its run was dispatched FOR skips the dependency gate — nobody else does', async () => {
     const runner = await seedRunner(3);
     const { planId, a, b, c } = await makePlan('claims');
-    const d = await createDispatch(runner, planId);
+    const d = await createDispatch(runner, planId, { gate: 'landed' });
     for (const run of await dispatchRuns(d.id)) {
       const agent = await seedAgent(runner);
       await room(pid).transitionRun(pid, actor, run.id, { status: 'running', agentId: agent });

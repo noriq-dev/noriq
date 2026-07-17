@@ -475,7 +475,7 @@ function PlanDispatchForm({
   const [agentTool, setAgentTool] = useState(runner?.capabilities.tools[0] ?? '');
   const [model, setModel] = useState('');
   const [effort, setEffort] = useState<RunEffort | ''>('');
-  const [gate, setGate] = useState<'landed' | 'approved'>('landed');
+  const [gate, setGate] = useState<'landed' | 'approved'>('approved');
   const [maxUsd, setMaxUsd] = useState('');
   const [maxTokens, setMaxTokens] = useState('');
   const [maxMinutes, setMaxMinutes] = useState('');
@@ -558,12 +558,13 @@ function PlanDispatchForm({
           </Select>
         </Field>
         <Field label="review gate" hint="what unblocks a dependent task">
-          {/* The review-latency decision (PLNR-170). 'landed' keeps you as the reviewer without
-              making you a synchronous lock mid-pipeline; 'approved' holds dependents until you
-              mark each task done. */}
+          {/* The review-latency decision (PLNR-170; default flipped by PLNR-176). 'approved'
+              holds dependents until each task is marked done — review is a real lock, and a
+              kicked-back task can't have dependents already running on its rejected work.
+              'landed' trades that safety for pipeline speed; opt in deliberately. */}
           <Select value={gate} onChange={(e) => setGate(e.target.value as 'landed' | 'approved')}>
-            <option value="landed">landed — start dependents once code lands (review continues)</option>
-            <option value="approved">approved — dependents wait for my sign-off</option>
+            <option value="approved">approved — dependents wait for my sign-off (default)</option>
+            <option value="landed">landed — start dependents once code lands, review still pending</option>
           </Select>
         </Field>
       </div>

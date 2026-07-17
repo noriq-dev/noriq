@@ -295,8 +295,9 @@ export interface ApiPlanDispatch {
   model: string | null;
   effort: string | null;
   budget: Partial<ApiRunBudget>;
-  /** 'landed': dependents unblock when the dependency's run lands (code on the plan branch),
-   *  human review pending. 'approved': dependents wait for the human — strict but slower. */
+  /** 'approved' (default): dependents wait until the human marks each upstream done.
+   *  'landed': dependents start once the upstream's run lands, review still pending —
+   *  an explicit opt-in to running ahead of sign-off (PLNR-176). */
   gate: 'landed' | 'approved';
   /** 'stalled' is recoverable: the pump can't advance without a human (see stallReason);
    *  answering/approving/retrying re-activates it. */

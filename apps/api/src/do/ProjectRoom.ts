@@ -184,8 +184,9 @@ export interface CreatePlanDispatchInput {
   effort?: string | null;
   /** Applied to every run this dispatch creates. */
   budget?: Record<string, unknown> | null;
-  /** 'landed' (default): a dependent unblocks once its dependency's run is done — code on the
-   *  plan branch, human approval still pending. 'approved': dependents wait for the human. */
+  /** 'approved' (default, PLNR-176): dependents wait until the human marks each upstream task
+   *  done — review is a real lock. 'landed': dependents start once the upstream's run lands
+   *  (code on the plan branch) while review is still pending — explicit opt-in. */
   gate?: 'landed' | 'approved';
   createdBy?: string;
 }
@@ -611,20 +612,32 @@ export class ProjectRoom extends DurableObject<Env> {
       if (task.claimed_by && task.claim_expires_at && task.claim_expires_at > nowIso()) {
         throw new Error(`${task.key} is already claimed by another agent`);
       }
-      // A run-anchored claim skips the dependency gate (PLNR-170): when THIS agent's live run
-      // was dispatched FOR this exact task, the dispatcher — a human, or the plan-dispatch pump
-      // applying its gate — already made the readiness call. Under gate='landed' a dependency
-      // is deliberately review-not-done (its code landed; sign-off pending), and the strict
-      // clause here would make the pump's dispatch unclaimable. The gate's pull-protection is
-      // for agents shopping the pool; a dispatched agent was SENT.
+      // Run-anchored claims and the dependency gate (PLNR-170, tightened by PLNR-176):
+      // - A HUMAN dispatching a single task made an explicit, standing readiness call — full
+      //   bypass, as before.
+      // - A PUMP-dispatched run's readiness call is dispatch-time only, and it can go stale:
+      //   the human may kick an upstream task back to todo between dispatch and claim (the
+      //   RUN-59 incident). So the claim re-evaluates the same predicate the pump used, WITH
+      //   the dispatch's own gate — under 'landed' a review-with-landed-run upstream still
+      //   satisfies (that's what the operator opted into); anything less refuses the claim.
+      // - Pool claims (no anchored run) get the strict gate, as always.
       const anchored = await this.env.DB.prepare(
-        `SELECT 1 FROM runs WHERE agent_id = ? AND anchor_type = 'task' AND anchor_id = ?
-          AND status IN ('dispatched','running','blocked')`,
-      ).bind(agentId, taskId).first();
+        `SELECT plan_dispatch_id AS pdid FROM runs WHERE agent_id = ? AND anchor_type = 'task' AND anchor_id = ?
+          AND status IN ('dispatched','running','blocked') ORDER BY created_at DESC LIMIT 1`,
+      ).bind(agentId, taskId).first<{ pdid: string | null }>();
       if (!anchored) {
         const blockers = await this.unfinishedDeps(taskId);
         if (blockers.length) {
           throw new Error(`${task.key} is blocked by unfinished dependencies: ${blockers.join(', ')}`);
+        }
+      } else if (anchored.pdid) {
+        const d = await this.env.DB.prepare('SELECT gate FROM plan_dispatches WHERE id = ?')
+          .bind(anchored.pdid).first<{ gate: string }>();
+        const blockers = await this.unfinishedDeps(taskId, d?.gate === 'landed' ? 'landed' : 'strict');
+        if (blockers.length) {
+          throw new Error(
+            `${task.key} is blocked by unfinished dependencies: ${blockers.join(', ')} — readiness changed since dispatch (an upstream was sent back?)`,
+          );
         }
       }
       // RUN-23 gate (defense in depth — the claimable surface already hides these):
@@ -1684,10 +1697,10 @@ export class ProjectRoom extends DurableObject<Env> {
       ).bind(
         id, projectId, input.planId, input.runnerId, input.repoRef, input.agentTool,
         input.model ?? null, input.effort ?? null, JSON.stringify(input.budget ?? {}),
-        input.gate ?? 'landed', input.createdBy ?? actor.id, now, now,
+        input.gate ?? 'approved', input.createdBy ?? actor.id, now, now,
       ).run();
       await this.emit(actor, 'plan_dispatch.created', 'plan_dispatch', id, {
-        planId: plan.id, planTitle: plan.title, runnerId: input.runnerId, gate: input.gate ?? 'landed',
+        planId: plan.id, planTitle: plan.title, runnerId: input.runnerId, gate: input.gate ?? 'approved',
         openTasks: open.n,
       });
       await this.pumpPlanDispatch(await this.loadPlanDispatch(id), actor);
@@ -2694,13 +2707,20 @@ export class ProjectRoom extends DurableObject<Env> {
     return row;
   }
 
-  /** Everything standing between this task and workability: manual dependency edges,
-   *  plus unfinished tasks in earlier phases of its plan (PLNR-163 — phase order gates
-   *  directly; plans no longer mint dependency rows). */
-  private async unfinishedDeps(taskId: string): Promise<string[]> {
+  /** Everything standing between this task and workability: manual dependency edges plus
+   *  unfinished tasks in earlier phases of its plan (PLNR-163). Under gate='landed'
+   *  (PLNR-176: pump-dispatched claims re-checking their dispatch's gate) a blocker in
+   *  review whose run landed does not block — the same exception the pump applies. The
+   *  exception fragments are fixed literals composed per alias, never input. */
+  private async unfinishedDeps(taskId: string, gate: 'strict' | 'landed' = 'strict'): Promise<string[]> {
+    const landedOk = (alias: string) =>
+      gate === 'landed'
+        ? `AND NOT (${alias}.status = 'review' AND EXISTS (
+             SELECT 1 FROM runs dr WHERE dr.anchor_type = 'task' AND dr.anchor_id = ${alias}.id AND dr.status = 'done'))`
+        : '';
     const { results } = await this.env.DB.prepare(
       `SELECT t.key FROM dependencies d JOIN tasks t ON t.id = d.depends_on_task_id
-       WHERE d.task_id = ?1 AND t.status NOT IN ('done','cancelled')
+       WHERE d.task_id = ?1 AND t.status NOT IN ('done','cancelled') ${landedOk('t')}
        UNION
        SELECT pdt.key FROM phase_tasks pt
          JOIN phases ph   ON ph.id = pt.phase_id
@@ -2708,7 +2728,7 @@ export class ProjectRoom extends DurableObject<Env> {
          JOIN phases prev ON prev.plan_id = ph.plan_id AND prev."order" < ph."order"
          JOIN phase_tasks ppt ON ppt.phase_id = prev.id
          JOIN tasks pdt   ON pdt.id = ppt.task_id
-       WHERE pt.task_id = ?1 AND pdt.status NOT IN ('done','cancelled')`,
+       WHERE pt.task_id = ?1 AND pdt.status NOT IN ('done','cancelled') ${landedOk('pdt')}`,
     ).bind(taskId).all<{ key: string }>();
     return results.map((r) => r.key);
   }
