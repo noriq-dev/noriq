@@ -6,6 +6,7 @@ import { api } from '../api';
 import type { AppStore } from '../store';
 import { LiveDot, MonoTag } from './bits';
 import { GroupsSection, Section, UsersSection } from './SettingsView';
+import { confirm } from './Dialog';
 
 export function AdminView({ store }: { store: AppStore }) {
   useEffect(() => {
@@ -125,7 +126,7 @@ function OAuthSection() {
                     <Td right>
                       <button
                         onClick={async () => {
-                          if (confirm(`Revoke ${c.userName ?? 'this user'}'s ${c.clientName} connection? Its agents go offline.`)) {
+                          if (await confirm(`Revoke ${c.userName ?? 'this user'}'s ${c.clientName} connection? Its agents go offline.`)) {
                             await api.adminRevokeConnection(c.id);
                             load();
                           }
@@ -167,7 +168,7 @@ function OAuthSection() {
                         disabled={cl.liveTokens > 0}
                         title={cl.liveTokens > 0 ? 'revoke its live connections first' : 'delete this client registration'}
                         onClick={async () => {
-                          if (!confirm(`Delete client "${cl.name}"? Historical tokens are removed; agents survive.`)) return;
+                          if (!(await confirm(`Delete client "${cl.name}"? Historical tokens are removed; agents survive.`))) return;
                           setError(null);
                           try {
                             await api.adminDeleteClient(cl.id);

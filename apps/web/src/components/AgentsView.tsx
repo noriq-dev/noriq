@@ -5,6 +5,7 @@ import type { AppStore } from '../store';
 import { initials } from '../design';
 import { MonoTag, SectionLabel } from './bits';
 import { Button } from './ui';
+import { confirm } from './Dialog';
 
 const PALETTE = ['#4c9dff', '#b57bff', '#3fd98b', '#ff8a8a', '#c6f24e', '#f5a623'];
 const colorOf = (a: ApiAgent) => {
@@ -149,7 +150,7 @@ export function AgentsView({ store }: { store: AppStore }) {
                       style={{ padding: '5px 11px', fontSize: 11 }}
                       onClick={async (e) => {
                         e.stopPropagation();
-                        if (confirm(`Revoke ${a.name}'s key? Its claims will expire and requeue.`)) {
+                        if (await confirm(`Revoke ${a.name}'s key? Its claims will expire and requeue.`)) {
                           await api.revokeAgent(a.id);
                           load();
                         }

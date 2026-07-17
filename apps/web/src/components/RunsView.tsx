@@ -11,6 +11,7 @@ import type { AppStore } from '../store';
 import { Markdown } from './Markdown';
 import { LiveDot, MonoTag, SectionLabel } from './bits';
 import { Button, ErrorNote, Field, Select, TextArea, TextInput } from './ui';
+import { alert, confirm } from './Dialog';
 
 function ago(iso: string | null): string {
   if (!iso) return 'never';
@@ -166,12 +167,12 @@ export function RunsView({ store }: { store: AppStore }) {
                         variant="danger"
                         style={{ padding: '7px 12px', fontSize: 12 }}
                         onClick={async () => {
-                          if (!confirm(
+                          if (!(await confirm(
                             `Offboard "${r.label}"?\n\nThis revokes its token: no dispatch, no MCP, and its live runs fail.\n\n` +
                             'It does NOT stop the daemon touching that machine\'s repos — stop the process there too.',
-                          )) return;
+                          ))) return;
                           const res = await api.offboardRunner(r.id);
-                          if (res.warning) alert(res.warning);
+                          if (res.warning) await alert(res.warning);
                           await load();
                         }}
                       >
@@ -309,7 +310,7 @@ function RunRow({ run, runner, onCancel }: { run: ApiRun; runner: ApiRunner | nu
           disabled={killing}
           style={{ padding: '5px 12px', fontSize: 11, flex: 'none' }}
           onClick={async () => {
-            if (!confirm('Kill this Run? The daemon SIGTERMs the agent process; work so far stays on its branch.')) return;
+            if (!(await confirm('Kill this Run? The daemon SIGTERMs the agent process; work so far stays on its branch.'))) return;
             setKilling(true);
             try {
               await api.cancelRun(run.id, 'cancelled from dashboard');

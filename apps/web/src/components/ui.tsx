@@ -1,5 +1,5 @@
 // Shared UI kit: modal + form primitives, in the design language.
-import { useEffect, type CSSProperties, type ReactNode } from 'react';
+import { forwardRef, useEffect, type CSSProperties, type ReactNode } from 'react';
 
 export function Modal({ title, subtitle, onClose, children, width = 420 }: {
   title: string;
@@ -85,9 +85,10 @@ export function Field({ label, hint, children }: { label: string; hint?: string;
   );
 }
 
-export function TextInput(props: React.InputHTMLAttributes<HTMLInputElement>) {
-  return <input {...props} style={{ ...inputStyle, ...props.style }} />;
-}
+export const TextInput = forwardRef<HTMLInputElement, React.InputHTMLAttributes<HTMLInputElement>>(
+  (props, ref) => <input ref={ref} {...props} style={{ ...inputStyle, ...props.style }} />,
+);
+TextInput.displayName = 'TextInput';
 
 export function TextArea(props: React.TextareaHTMLAttributes<HTMLTextAreaElement>) {
   return <textarea {...props} style={{ ...inputStyle, minHeight: 74, resize: 'vertical', ...props.style }} />;

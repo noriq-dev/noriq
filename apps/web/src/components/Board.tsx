@@ -5,6 +5,7 @@ import type { AppStore } from '../store';
 import type { TaskStatus } from '../types';
 import { statusMeta } from '../design';
 import { AvatarChip, MonoTag } from './bits';
+import { confirm, prompt } from './Dialog';
 
 const COLUMNS: Array<[TaskStatus, string]> = [
   ['todo', 'Todo'],
@@ -82,16 +83,16 @@ export function Board({ store }: { store: AppStore }) {
         boards={boards}
         current={boardId}
         onSelect={(id) => actions.setBoard(id)}
-        onCreate={() => {
-          const name = window.prompt('New board name:')?.trim();
+        onCreate={async () => {
+          const name = (await prompt('New board name:'))?.trim();
           if (name) void actions.createBoard(name);
         }}
-        onRename={(id, cur) => {
-          const name = window.prompt('Rename board:', cur)?.trim();
+        onRename={async (id, cur) => {
+          const name = (await prompt('Rename board:', cur))?.trim();
           if (name && name !== cur) void actions.renameBoard(id, name);
         }}
-        onDelete={(id, name) => {
-          if (window.confirm(`Delete board "${name}"? Its tasks move to another board.`)) void actions.deleteBoard(id);
+        onDelete={async (id, name) => {
+          if (await confirm(`Delete board "${name}"? Its tasks move to another board.`)) void actions.deleteBoard(id);
         }}
       />
 
@@ -197,8 +198,8 @@ export function Board({ store }: { store: AppStore }) {
               small
               active={tagFilter === c.id}
               onClick={() => setTagFilter(tagFilter === c.id ? null : c.id)}
-              onDelete={() => {
-                if (confirm(`Delete tag "${c.name}"? It's removed from all tasks.`)) {
+              onDelete={async () => {
+                if (await confirm(`Delete tag "${c.name}"? It's removed from all tasks.`)) {
                   if (tagFilter === c.id) setTagFilter(null);
                   void actions.deleteTag(c.id);
                 }
@@ -414,14 +415,14 @@ export function Board({ store }: { store: AppStore }) {
             setSelected(new Set());
           }}
           onAddTag={async () => {
-            const name = window.prompt('Add tag to selected tasks:')?.trim();
+            const name = (await prompt('Add tag to selected tasks:'))?.trim();
             if (!name) return;
             // addTags keeps existing tags (PLNR-135) — bulk labelling can't clobber.
             for (const id of selected) await api.updateTask(currentPid, id, { addTags: [name] });
             setSelected(new Set());
           }}
           onArchive={async () => {
-            if (!confirm(`Archive ${selected.size} task(s)?`)) return;
+            if (!(await confirm(`Archive ${selected.size} task(s)?`))) return;
             for (const id of selected) await api.archiveTask(currentPid, id).catch(() => {});
             setSelected(new Set());
           }}

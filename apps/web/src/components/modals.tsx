@@ -4,6 +4,7 @@ import type { AppStore } from '../store';
 import { api, type ApiUser } from '../api';
 import { useEffect } from 'react';
 import { Button, ErrorNote, Field, Modal, Select, TextArea, TextInput } from './ui';
+import { confirm } from './Dialog';
 
 export function ModalHost({ store }: { store: AppStore }) {
   switch (store.modal) {
@@ -304,7 +305,7 @@ function CreateMilestoneModal({ store }: { store: AppStore }) {
           <Button
             variant="danger"
             onClick={async () => {
-              if (confirm(`Delete milestone "${editing.title}"? Its tasks stay, just unassigned.`)) {
+              if (await confirm(`Delete milestone "${editing.title}"? Its tasks stay, just unassigned.`)) {
                 await store.actions.deleteMilestone(editing.id);
                 store.actions.closeModal();
               }

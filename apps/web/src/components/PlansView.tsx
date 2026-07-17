@@ -8,6 +8,7 @@ import { statusMeta } from '../design';
 import { AvatarChip, LiveDot, MonoTag, SectionLabel } from './bits';
 import { Button, ErrorNote, Field, Select, TextInput } from './ui';
 import { Markdown } from './Markdown';
+import { confirm } from './Dialog';
 
 export function PlansView({ store }: { store: AppStore }) {
   const { snapshot, currentPid, helpers, actions } = store;
@@ -149,9 +150,9 @@ export function PlansView({ store }: { store: AppStore }) {
                   {plan.archivedAt ? '↩' : '🗄'}
                 </button>
                 <button
-                  onClick={(e) => {
+                  onClick={async (e) => {
                     e.stopPropagation();
-                    if (confirm(`Delete plan "${plan.title}"? Its phases are removed; the tasks themselves stay.`)) {
+                    if (await confirm(`Delete plan "${plan.title}"? Its phases are removed; the tasks themselves stay.`)) {
                       void store.actions.deletePlan(plan.id);
                     }
                   }}
@@ -191,7 +192,7 @@ export function PlansView({ store }: { store: AppStore }) {
                     style={{ padding: '6px 14px', fontSize: 12 }}
                     onClick={async (e) => {
                       e.stopPropagation();
-                      if (confirm(`Reject "${plan.title}"? Its un-started tasks are cancelled and the plan is discarded.`)) {
+                      if (await confirm(`Reject "${plan.title}"? Its un-started tasks are cancelled and the plan is discarded.`)) {
                         await store.actions.rejectPlan(plan.id);
                       }
                     }}
@@ -395,7 +396,7 @@ function PlanDispatchStrip({
           style={{ padding: '5px 12px', fontSize: 11 }}
           onClick={async (e) => {
             e.stopPropagation();
-            if (!confirm('Stop dispatching this plan? Its live runs are killed; finished work stays on the plan branch.')) return;
+            if (!(await confirm('Stop dispatching this plan? Its live runs are killed; finished work stays on the plan branch.'))) return;
             setBusy(true);
             try {
               await api.cancelPlanDispatch(dispatch.id, 'cancelled from dashboard');

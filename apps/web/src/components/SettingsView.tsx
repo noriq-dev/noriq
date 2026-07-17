@@ -5,6 +5,7 @@ import { api, type ApiUser } from '../api';
 import type { AppStore } from '../store';
 import { MonoTag, SectionLabel } from './bits';
 import { Button, ErrorNote, Field, Select, TextInput } from './ui';
+import { confirm, prompt } from './Dialog';
 
 export function SettingsView({ store }: { store: AppStore }) {
   // User management moved to the Admin menu (PLNR-83) — Settings is user-level only.
@@ -171,7 +172,7 @@ export function UsersSection({ store }: { store: AppStore }) {
                   <SmallAction
                     danger
                     onClick={async () => {
-                      if (confirm(`Permanently delete ${u.name}? Their sessions, passkeys, invites and tokens are removed; owned projects become unowned. History keeps their name.`)) {
+                      if (await confirm(`Permanently delete ${u.name}? Their sessions, passkeys, invites and tokens are removed; owned projects become unowned. History keeps their name.`)) {
                         await api.deleteUser(u.id);
                         load();
                       }
@@ -248,7 +249,7 @@ export function GroupsSection({ store, all }: { store: AppStore; all?: boolean }
                     <SmallAction onClick={() => setMembersFor(membersFor === g.id ? null : g.id)}>members</SmallAction>
                     <SmallAction
                       onClick={async () => {
-                        const name = window.prompt('Rename group:', g.name)?.trim();
+                        const name = (await prompt('Rename group:', g.name))?.trim();
                         if (name && name !== g.name) {
                           await api.patchGroup(g.id, { name });
                           location.reload();
@@ -259,7 +260,7 @@ export function GroupsSection({ store, all }: { store: AppStore; all?: boolean }
                     </SmallAction>
                     <SmallAction
                       onClick={async () => {
-                        const description = window.prompt('Group description:', g.description ?? '');
+                        const description = await prompt('Group description:', g.description ?? '');
                         if (description !== null && description !== g.description) {
                           await api.patchGroup(g.id, { description });
                           location.reload();
@@ -271,7 +272,7 @@ export function GroupsSection({ store, all }: { store: AppStore; all?: boolean }
                     <SmallAction
                       danger
                       onClick={async () => {
-                        if (window.confirm(`Delete group "${g.name}"? Projects become ungrouped.`)) {
+                        if (await confirm(`Delete group "${g.name}"? Projects become ungrouped.`)) {
                           await api.deleteGroup(g.id);
                           location.reload();
                         }
@@ -319,7 +320,7 @@ function GroupMembers({ store, groupId }: { store: AppStore; groupId: string }) 
           <SmallAction
             danger
             onClick={async () => {
-              if (m.id === me && !window.confirm('Remove yourself? You will lose management of this group.')) return;
+              if (m.id === me && !(await confirm('Remove yourself? You will lose management of this group.'))) return;
               await api.removeGroupMember(groupId, m.id);
               if (m.id === me) { location.reload(); return; }
               load();
@@ -410,7 +411,7 @@ function SessionsSection() {
       action={
         sessions.length > 0 ? (
           <SmallAction danger onClick={async () => {
-            if (confirm('Revoke ALL agent connections? Every Claude/Codex/Copilot session using this account will need to reconnect via OAuth.')) {
+            if (await confirm('Revoke ALL agent connections? Every Claude/Codex/Copilot session using this account will need to reconnect via OAuth.')) {
               await api.revokeAllSessions();
               load();
             }

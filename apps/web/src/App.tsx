@@ -15,6 +15,7 @@ import { RoadmapView } from './components/RoadmapView';
 import { AgentsView } from './components/AgentsView';
 import { RunsView } from './components/RunsView';
 import { ModalHost } from './components/modals';
+import { DialogHost } from './components/Dialog';
 import { SettingsView } from './components/SettingsView';
 import { AdminView } from './components/AdminView';
 import { Logo } from './components/Logo';
@@ -122,6 +123,7 @@ export function App() {
       </div>
       <Drawer store={store} />
       <ModalHost store={store} />
+      <DialogHost />
       <CommandPalette store={store} />
     </div>
   );

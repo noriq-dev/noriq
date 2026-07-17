@@ -8,6 +8,7 @@ import { QuestionForm } from './QuestionForm';
 import { Markdown } from './Markdown';
 import { Composer } from './Composer';
 import { Button, Select, TextArea, TextInput } from './ui';
+import { confirm } from './Dialog';
 
 export function Drawer({ store }: { store: AppStore }) {
   const { currentPid, selectedTaskId, helpers, actions, snapshot } = store;
@@ -190,8 +191,8 @@ export function Drawer({ store }: { store: AppStore }) {
             )}
             {!editing && (
               <button
-                onClick={() => {
-                  if (confirm(`Delete ${task.key} "${task.title}"? This removes its comments, attachments and dependency links. Child tasks are kept.`)) {
+                onClick={async () => {
+                  if (await confirm(`Delete ${task.key} "${task.title}"? This removes its comments, attachments and dependency links. Child tasks are kept.`)) {
                     void actions.deleteTask(task.id);
                   }
                 }}

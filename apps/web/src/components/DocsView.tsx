@@ -6,6 +6,7 @@ import type { AppStore } from '../store';
 import { Markdown } from './Markdown';
 import { SectionLabel } from './bits';
 import { Button, TextInput } from './ui';
+import { confirm } from './Dialog';
 
 interface Doc { id: string; name: string; description: string; body: string; authorKind: string; authorName: string; updatedAt: string }
 
@@ -98,7 +99,7 @@ export function DocsView({ store }: { store: AppStore }) {
                 variant="danger"
                 style={{ padding: '5px 12px', fontSize: 11.5 }}
                 onClick={async () => {
-                  if (confirm(`Delete doc "${sel.name}"?`)) {
+                  if (await confirm(`Delete doc "${sel.name}"?`)) {
                     await api.deleteDoc(currentPid, sel.id);
                     setSelected(null);
                     load();
