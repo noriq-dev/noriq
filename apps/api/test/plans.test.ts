@@ -442,4 +442,43 @@ describe('plans & groups', () => {
     expect(open.isError).toBe(false);
     await mcpCall(worker.apiKey, 'release_task', { projectId, taskId: dependent, toStatus: 'done' });
   });
+
+  it('can_claim reports the phase gate without claiming — the RUN-81 backstop probe (PLNR-177)', async () => {
+    const plan = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId,
+      title: 'Probe the gate',
+      description: 'can_claim',
+      body: '# Goal\n\nprobe.',
+      phases: [
+        { title: 'One', newTasks: [{ title: 'probe base' }] },
+        { title: 'Two', newTasks: [{ title: 'probe dependent' }] },
+      ],
+    });
+    const base = plan.body.phases[0].taskIds[0];
+    const baseKey = (await mcpCall(worker.apiKey, 'can_claim', { taskId: base })).body.taskKey;
+    const dependent = plan.body.phases[1].taskIds[0];
+
+    // Phase 2 is locked while phase 1 is unfinished — reported, not claimed.
+    const blocked = await mcpCall(worker.apiKey, 'can_claim', { taskId: dependent });
+    expect(blocked.isError).toBe(false);
+    expect(blocked.body.claimable).toBe(false);
+    expect(blocked.body.reason).toContain(baseKey);
+
+    // Phase 1 itself is claimable.
+    expect((await mcpCall(worker.apiKey, 'can_claim', { taskId: base })).body.claimable).toBe(true);
+
+    // A task only in review is not claimable (the RUN-59 shape: verifier passed, not approved).
+    await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: base });
+    await mcpCall(worker.apiKey, 'release_task', { projectId, taskId: base, toStatus: 'review' });
+    const inReview = await mcpCall(worker.apiKey, 'can_claim', { taskId: dependent });
+    expect(inReview.body.claimable).toBe(false); // phase 1 in review ≠ done → phase 2 stays locked
+    expect((await mcpCall(worker.apiKey, 'can_claim', { taskId: base })).body.reason).toContain('review');
+
+    // Approving phase 1 (done) opens phase 2.
+    await mcpCall(worker.apiKey, 'update_task', { projectId, taskId: base, status: 'done' });
+    expect((await mcpCall(worker.apiKey, 'can_claim', { taskId: dependent })).body.claimable).toBe(true);
+
+    // Unknown task → error, so the daemon's probe fails OPEN (never strands a run).
+    expect((await mcpCall(worker.apiKey, 'can_claim', { taskId: 'task_nope' })).isError).toBe(true);
+  });
 });

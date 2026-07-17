@@ -8,6 +8,7 @@ import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import type { Actor, CreatePlanDispatchInput, CreateRunInput, PlanDispatchView, RunPatch, RunView } from '../src/do/ProjectRoom';
 import type { Env } from '../src/env';
+import { taskClaimability } from '../src/lib/claimability';
 import { createUser, loginSession } from './helpers';
 
 const appEnv = env as unknown as Env;
@@ -229,6 +230,24 @@ describe('the review gate (the design decision of PLNR-170)', () => {
     // Re-approving a (done) clears the block for the same agent.
     await room(pid).updateTask(pid, actor, a, { status: 'done' });
     await expect(room(pid).claimTask(pid, actor, c, cAgent)).resolves.toMatchObject({ key: expect.any(String) });
+    void b;
+  });
+
+  it("can_claim resolves the task's dispatch gate — landed unlocks a phase-2 task strict would block (PLNR-177)", async () => {
+    const runner = await seedRunner(2);
+    const { planId, a, b, c } = await makePlan('ccgate');
+    const d = await createDispatch(runner, planId, { gate: 'landed' });
+    for (const run of await dispatchRuns(d.id)) {
+      const agent = await seedAgent(runner);
+      await room(pid).transitionRun(pid, actor, run.id, { status: 'running', agentId: agent });
+      await room(pid).claimTask(pid, actor, run.taskId, agent);
+      await room(pid).releaseTask(pid, { kind: 'agent', id: agent, name: agent }, run.taskId, { toStatus: 'review' });
+      await room(pid).transitionRun(pid, actor, run.id, { status: 'done' });
+    }
+    // a and b sit in review with landed runs. The probe reads the dispatch's landed gate, so
+    // c reads claimable — where under the strict default it would be blocked (plans.test.ts).
+    expect((await taskClaimability(env.DB, c)).claimable).toBe(true);
+    void a;
     void b;
   });
 

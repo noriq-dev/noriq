@@ -2,6 +2,7 @@ import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../env';
 import { newId, nowIso } from '../lib/util';
 import { userCanAccessProject } from '../lib/visibility';
+import { unfinishedDeps as unfinishedDepsLib } from '../lib/claimability';
 import { needsOutOfBand, sendSignalEmail, sendSignalWebhook } from '../lib/notify-out';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
 import { RunKind, AgentTool, RunStatus, type RunPhase, isTerminalRunStatus } from '@noriq-dev/shared';
@@ -2707,30 +2708,11 @@ export class ProjectRoom extends DurableObject<Env> {
     return row;
   }
 
-  /** Everything standing between this task and workability: manual dependency edges plus
-   *  unfinished tasks in earlier phases of its plan (PLNR-163). Under gate='landed'
-   *  (PLNR-176: pump-dispatched claims re-checking their dispatch's gate) a blocker in
-   *  review whose run landed does not block — the same exception the pump applies. The
-   *  exception fragments are fixed literals composed per alias, never input. */
-  private async unfinishedDeps(taskId: string, gate: 'strict' | 'landed' = 'strict'): Promise<string[]> {
-    const landedOk = (alias: string) =>
-      gate === 'landed'
-        ? `AND NOT (${alias}.status = 'review' AND EXISTS (
-             SELECT 1 FROM runs dr WHERE dr.anchor_type = 'task' AND dr.anchor_id = ${alias}.id AND dr.status = 'done'))`
-        : '';
-    const { results } = await this.env.DB.prepare(
-      `SELECT t.key FROM dependencies d JOIN tasks t ON t.id = d.depends_on_task_id
-       WHERE d.task_id = ?1 AND t.status NOT IN ('done','cancelled') ${landedOk('t')}
-       UNION
-       SELECT pdt.key FROM phase_tasks pt
-         JOIN phases ph   ON ph.id = pt.phase_id
-         JOIN plans  pl   ON pl.id = ph.plan_id AND pl.status != 'rejected'
-         JOIN phases prev ON prev.plan_id = ph.plan_id AND prev."order" < ph."order"
-         JOIN phase_tasks ppt ON ppt.phase_id = prev.id
-         JOIN tasks pdt   ON pdt.id = ppt.task_id
-       WHERE pt.task_id = ?1 AND pdt.status NOT IN ('done','cancelled') ${landedOk('pdt')}`,
-    ).bind(taskId).all<{ key: string }>();
-    return results.map((r) => r.key);
+  /** Blockers between this task and workability — manual dep edges + earlier-phase tasks.
+   *  Delegates to the shared lib (PLNR-177) so the mutating claim path and the read-only
+   *  can_claim probe enforce byte-identical gate logic. */
+  private unfinishedDeps(taskId: string, gate: 'strict' | 'landed' = 'strict'): Promise<string[]> {
+    return unfinishedDepsLib(this.env.DB, taskId, gate);
   }
 
   private async claimTtlSeconds(): Promise<number> {

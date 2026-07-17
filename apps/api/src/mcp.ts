@@ -15,6 +15,7 @@ import {
 } from './lib/visibility';
 import { taskSearchFilters } from './lib/search';
 import { signUploadToken } from './lib/upload-token';
+import { taskClaimability } from './lib/claimability';
 
 const MAX_ATTACHMENT = 100 * 1024 * 1024;
 // Inline base64 rides the model's context window at ~1 token/byte both ways, so it is only
@@ -126,7 +127,7 @@ const WRITE_IDEMPOTENT: ToolHints = { ...WRITE, idempotentHint: true };
 const TOOL_HINTS: Record<string, ToolHints> = {
   // reads
   get_briefing: READ, my_updates: READ, list_projects: READ, get_project: READ, list_groups: READ, list_agents: READ,
-  get_task: READ, search_tasks: READ, next_claimable: READ, read_open_comments: READ, get_plans: READ,
+  get_task: READ, search_tasks: READ, next_claimable: READ, read_open_comments: READ, get_plans: READ, can_claim: READ,
   list_docs: READ, get_doc: READ, update_doc: WRITE_IDEMPOTENT, list_templates: READ,
   // writes that are safe to repeat with the same args (renew/replace-in-place/insert-or-ignore)
   heartbeat: WRITE_IDEMPOTENT, set_agent_identity: WRITE_IDEMPOTENT, update_task: WRITE_IDEMPOTENT, update_tasks: WRITE_IDEMPOTENT,
@@ -929,6 +930,19 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     'Remove a manual dependency edge (the inverse of add_dependency), unblocking the dependent task if that was its last unfinished blocker. Remove an edge ONLY because the ordering itself is wrong — a dependency that should never have existed. NEVER remove one to get past a blocker you find inconvenient: that is not clearing the gate, it is deleting it, and it defeats the coordination this whole system exists to enforce. If the blocker is genuinely finished, mark the BLOCKER done (or cancelled) and the gate clears itself — do not touch the edge. If the blocker is NOT finished, the gate is doing its job; work something else or clear the blocker honestly. (A plan\'s phase order is not a dependency edge and can\'t be removed here — restructure the plan if the ordering is wrong.)',
     { projectId: z.string(), taskId: z.string(), dependsOnTaskId: z.string() },
     tool(async ({ projectId, taskId, dependsOnTaskId }) => room(env, projectId).removeDependency(projectId, actor, taskId, dependsOnTaskId)),
+  );
+
+  defineTool(
+    'can_claim',
+    'Read-only: would a claim of this task succeed RIGHT NOW? Returns {claimable, reason?}. It reports the plan/phase gate a normal claim faces — phase order (a phase stays locked until every earlier phase is done, unless the plan\'s dispatch opted into the landed gate), manual dependencies, and the proposed-plan lock — WITHOUT the anchored-run bypass, so a runner can check before spawning an agent on plan work whose earlier phase is not yet complete. reason is a short human string.',
+    { taskId: z.string() },
+    tool(async ({ taskId }) => {
+      const t = await env.DB.prepare('SELECT project_id AS pid FROM tasks WHERE id = ? OR key = ?')
+        .bind(taskId, taskId).first<{ pid: string }>();
+      if (!t) throw new Error(`task ${taskId} not found`);
+      if (!(await userCanAccessProject(env, agent.userId, t.pid))) throw new Error(`task ${taskId} not found`);
+      return taskClaimability(env.DB, taskId);
+    }),
   );
 
   defineTool(
