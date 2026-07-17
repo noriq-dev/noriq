@@ -14,8 +14,15 @@ import {
   userCanAccessProject,
 } from './lib/visibility';
 import { taskSearchFilters } from './lib/search';
+import { signUploadToken } from './lib/upload-token';
 
 const MAX_ATTACHMENT = 100 * 1024 * 1024;
+// Inline base64 rides the model's context window at ~1 token/byte both ways, so it is only
+// for genuinely small payloads (a log snippet, an icon). Anything real goes through
+// create_attachment_upload. 16 KB ≈ 22 KB base64 ≈ ~22K tokens each way — the practical
+// ceiling before it stops paying for itself (and won't round-trip under the Read cap).
+const MAX_INLINE_ATTACHMENT = 16 * 1024;
+const UPLOAD_TOKEN_TTL_MS = 15 * 60 * 1000;
 /** Stable resource URI for an attachment; agents read bytes back via resources/read. */
 const attachmentUri = (id: string) => `noriq://attachment/${id}`;
 /** Stable resource URI for a project doc (PLNR-158). */
@@ -128,7 +135,7 @@ const TOOL_HINTS: Record<string, ToolHints> = {
   // everything else → WRITE (additive, non-idempotent, non-destructive, closed-world)
 };
 
-export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthTokenId?: string; sessionId?: string } = {}): McpServer {
+export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthTokenId?: string; sessionId?: string; origin?: string } = {}): McpServer {
   const server = new McpServer(
     { name: 'noriq', version: '0.3.0' },
     {
@@ -926,12 +933,12 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'add_attachment',
-    'Attach a file (screenshot, image, log, etc.) to a task. Pass the bytes base64-encoded in `data` (max 100 MB). Read them back later via the returned resource URI (resources/read) — e.g. noriq://attachment/<id>.',
+    'Attach a SMALL file (≤16 KB — a log snippet, a tiny icon) to a task by passing its bytes base64-encoded in `data`. For anything larger (screenshots, images, real files) use create_attachment_upload instead: base64 here rides the model context at ~1 token/byte, so a real file is prohibitively expensive and may not fit. Read bytes back later via the returned resource URI (resources/read) — e.g. noriq://attachment/<id>.',
     {
       projectId: z.string(),
       taskId: z.string(),
       filename: z.string().min(1).max(120),
-      data: z.string().min(1).describe('file bytes, base64-encoded (up to 100 MB, transport limits permitting)'),
+      data: z.string().min(1).describe('file bytes, base64-encoded — ≤16 KB decoded; larger files go through create_attachment_upload'),
       contentType: z.string().optional().describe('MIME type, e.g. image/png — defaults to application/octet-stream'),
     },
     tool(async ({ projectId, taskId, filename, data, contentType }) => {
@@ -940,7 +947,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         .bind(taskId, taskId, projectId).first<{ id: string; pid: string; key: string }>();
       if (!task) throw new Error(`task ${taskId} not found in project ${projectId}`);
       const bytes = base64ToBytes(data);
-      if (bytes.length === 0 || bytes.length > MAX_ATTACHMENT) throw new Error('attachment must be 1 byte – 100 MB');
+      if (bytes.length === 0) throw new Error('attachment is empty');
+      if (bytes.length > MAX_INLINE_ATTACHMENT) {
+        throw new Error(`inline attachment is ${bytes.length} bytes; the inline limit is ${MAX_INLINE_ATTACHMENT} bytes — use create_attachment_upload for anything larger (it streams from disk, no base64 in context)`);
+      }
       const safeName = filename.replace(/[/\\]/g, '_').slice(0, 120);
       const ct = contentType ?? 'application/octet-stream';
       const id = newId('att');
@@ -952,6 +962,46 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       ).bind(id, task.id, safeName, ct, bytes.length, key, agent.id, nowIso()).run();
       await room(env, task.pid).noteAttachment(task.pid, actor, task.id, safeName, id);
       return { id, taskKey: task.key, filename: safeName, contentType: ct, size: bytes.length, resource: attachmentUri(id) };
+    }),
+  );
+
+  defineTool(
+    'create_attachment_upload',
+    'Get a one-shot upload URL to attach a real file (screenshot, image, log, up to 100 MB) WITHOUT routing its bytes through your context. Returns a ready-to-run `curl` that PUTs the file straight from disk to storage; the attachment is created when the upload lands, readable at the returned resourceUri (noriq://attachment/<id>). Use this for anything but the smallest payloads — the file must already be on disk (materialize a pasted image to a file first). The URL is short-lived (~15 min) and single-purpose.',
+    {
+      projectId: z.string(),
+      taskId: z.string(),
+      filename: z.string().min(1).max(120),
+      contentType: z.string().optional().describe('MIME type, e.g. image/png — defaults to application/octet-stream'),
+    },
+    tool(async ({ projectId, taskId, filename, contentType }) => {
+      if (!env.FILES) throw new Error('attachments not configured on this instance — enable R2 and bind FILES');
+      const secret = env.ATTACHMENT_UPLOAD_SECRET ?? env.ADMIN_TOKEN;
+      if (!secret) throw new Error('upload URLs are not enabled — set ATTACHMENT_UPLOAD_SECRET (or ADMIN_TOKEN); use add_attachment for files ≤16 KB');
+      const origin = env.PUBLIC_ORIGIN ?? opts.origin;
+      if (!origin) throw new Error('cannot build an absolute upload URL — set PUBLIC_ORIGIN');
+      const task = await env.DB.prepare('SELECT id, project_id AS pid, key FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+        .bind(taskId, taskId, projectId).first<{ id: string; pid: string; key: string }>();
+      if (!task) throw new Error(`task ${taskId} not found in project ${projectId}`);
+      const safeName = filename.replace(/[/\\]/g, '_').slice(0, 120);
+      const ct = contentType ?? 'application/octet-stream';
+      const id = newId('att');
+      const expMs = Date.now() + UPLOAD_TOKEN_TTL_MS;
+      const token = await signUploadToken(secret, {
+        aid: id, tid: task.id, pid: task.pid, fn: safeName, ct,
+        agentId: agent.id, max: MAX_ATTACHMENT, exp: Math.floor(expMs / 1000),
+      });
+      const uploadUrl = `${origin.replace(/\/$/, '')}/api/attachments/upload/${token}`;
+      return {
+        attachmentId: id,
+        uploadUrl,
+        method: 'PUT',
+        headers: { 'Content-Type': ct },
+        maxBytes: MAX_ATTACHMENT,
+        expiresAt: new Date(expMs).toISOString(),
+        resourceUri: attachmentUri(id),
+        curl: `curl -X PUT -H 'Content-Type: ${ct}' --data-binary @<FILE> '${uploadUrl}'`,
+      };
     }),
   );
 

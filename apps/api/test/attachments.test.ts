@@ -93,4 +93,54 @@ describe('MCP attachments', () => {
     expect(r.isError).toBe(true);
     expect(r.text).toMatch(/not found/);
   });
+
+  it('caps inline add_attachment and points oversized payloads at the upload tool (PLNR-173)', async () => {
+    const big = btoa('x'.repeat(17 * 1024)); // 17 KB decoded, over the 16 KB inline limit
+    const r = await mcpCall(agent.apiKey, 'add_attachment', { projectId, taskId, filename: 'big.bin', data: big });
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/create_attachment_upload/);
+  });
+});
+
+describe('capability-token attachment upload (PLNR-173)', () => {
+  const bytes = Uint8Array.from(atob(PNG_B64), (ch) => ch.charCodeAt(0));
+
+  it('mints an upload URL, PUT lands the file, and it reads back through the resource URI', async () => {
+    const mint = await mcpCall(agent.apiKey, 'create_attachment_upload', {
+      projectId, taskId, filename: 'huge.png', contentType: 'image/png',
+    });
+    expect(mint.isError).toBe(false);
+    expect(mint.body.uploadUrl).toContain('/api/attachments/upload/');
+    expect(mint.body.resourceUri).toBe(`noriq://attachment/${mint.body.attachmentId}`);
+    expect(mint.body.curl).toContain('--data-binary @<FILE>');
+
+    const put = await SELF.fetch(mint.body.uploadUrl, {
+      method: 'PUT', headers: { 'Content-Type': 'image/png' }, body: bytes,
+    });
+    expect(put.status).toBe(200);
+    expect(((await put.json()) as { size: number }).size).toBe(bytes.length);
+
+    // The bytes never touched an MCP tool call, but read back the same way.
+    const read = await mcpRpc(agent.apiKey, 'resources/read', { uri: mint.body.resourceUri });
+    expect(read.contents[0].blob).toBe(PNG_B64);
+
+    const gt = await mcpCall(agent.apiKey, 'get_task', { taskId });
+    expect(gt.body.attachments.some((a: { id: string }) => a.id === mint.body.attachmentId)).toBe(true);
+  });
+
+  it('a replayed PUT stays a single attachment row (idempotent on attachmentId)', async () => {
+    const mint = await mcpCall(agent.apiKey, 'create_attachment_upload', { projectId, taskId, filename: 'once.png', contentType: 'image/png' });
+    const put = () => SELF.fetch(mint.body.uploadUrl, { method: 'PUT', headers: { 'Content-Type': 'image/png' }, body: bytes });
+    expect((await put()).status).toBe(200);
+    expect((await put()).status).toBe(200);
+    const gt = await mcpCall(agent.apiKey, 'get_task', { taskId });
+    expect(gt.body.attachments.filter((a: { id: string }) => a.id === mint.body.attachmentId)).toHaveLength(1);
+  });
+
+  it('rejects a tampered or bogus token', async () => {
+    const mint = await mcpCall(agent.apiKey, 'create_attachment_upload', { projectId, taskId, filename: 'nope.png' });
+    const tampered = mint.body.uploadUrl.slice(0, -2) + (mint.body.uploadUrl.endsWith('AA') ? 'BB' : 'AA');
+    expect((await SELF.fetch(tampered, { method: 'PUT', body: bytes })).status).toBe(401);
+    expect((await SELF.fetch('https://noriq.test/api/attachments/upload/not.a.token', { method: 'PUT', body: bytes })).status).toBe(401);
+  });
 });

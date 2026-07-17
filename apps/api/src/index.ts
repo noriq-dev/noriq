@@ -9,6 +9,7 @@ import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot } from './backup';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, verifyPassword } from './lib/util';
 import { taskSearchFilters } from './lib/search';
+import { verifyUploadToken } from './lib/upload-token';
 import { USER_PROJECT_WHERE, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
 import type { Actor } from './do/ProjectRoom';
 import { SKILL_MD } from './skill';
@@ -130,7 +131,7 @@ app.all('/mcp', agentAuth, async (c) => {
     return c.json({ error: 'no MCP session — call initialize first (sessionless calls are not attributable)' }, 400);
   }
 
-  const server = buildMcpServer(c.env, agent, { oauthTokenId: conn.tokenId, sessionId });
+  const server = buildMcpServer(c.env, agent, { oauthTokenId: conn.tokenId, sessionId, origin: new URL(c.req.url).origin });
   const transport = new StreamableHTTPTransport();
   await server.connect(transport);
   return transport.handleRequest(c, raw ?? undefined);
@@ -1939,6 +1940,45 @@ app.post('/api/tasks/:tid/attachments', userAuth, async (c) => {
   ).bind(id, tid, filename, ct, size, key, c.var.user!.id, nowIso()).run();
   await room(c.env, task.pid).noteAttachment(task.pid, humanActor(c), tid, filename, id);
   return c.json({ id, filename, size });
+});
+
+// Agent upload via capability token (PLNR-173). No cookie/bearer — the signed token IS
+// the authorization, minted by create_attachment_upload for exactly this (agent, task,
+// file). Bytes stream straight to R2, never through the model context. Mirrors the POST
+// route above, including the PLNR-98 real-size check (Content-Length is client-controlled).
+app.put('/api/attachments/upload/:token', async (c) => {
+  if (!c.env.FILES) return c.json({ error: 'attachments not configured' }, 503);
+  const secret = c.env.ATTACHMENT_UPLOAD_SECRET ?? c.env.ADMIN_TOKEN;
+  if (!secret) return c.json({ error: 'uploads not enabled' }, 503);
+  const claims = await verifyUploadToken(secret, c.req.param('token')!, Math.floor(Date.now() / 1000));
+  if (!claims) return c.json({ error: 'invalid or expired upload token' }, 401);
+  // The task must still exist (deleted within the TTL, or a stale token) — checked so a
+  // dangling FK can't orphan an R2 object.
+  const task = await c.env.DB.prepare('SELECT id, project_id AS pid FROM tasks WHERE id = ?')
+    .bind(claims.tid).first<{ id: string; pid: string }>();
+  if (!task || task.pid !== claims.pid) return c.json({ error: 'task not found' }, 404);
+  if (Number(c.req.header('Content-Length') ?? '0') > claims.max) {
+    return c.json({ error: `attachment exceeds ${claims.max} bytes` }, 413);
+  }
+  const key = `att/${claims.pid}/${claims.aid}/${claims.fn}`;
+  const obj = await c.env.FILES.put(key, c.req.raw.body, { httpMetadata: { contentType: claims.ct } });
+  const size = obj?.size ?? 0;
+  if (!size || size > claims.max) {
+    await c.env.FILES.delete(key).catch(() => {});
+    return c.json({ error: `attachment must be 1 byte – ${claims.max} bytes` }, 413);
+  }
+  // Idempotent on the attachment id: a replayed PUT overwrites the same object and inserts
+  // nothing new, so it stays exactly one row (and one WS event).
+  const ins = await c.env.DB.prepare(
+    `INSERT OR IGNORE INTO attachments (id, task_id, filename, content_type, size, r2_key, uploaded_by_kind, uploaded_by, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'agent', ?, ?)`,
+  ).bind(claims.aid, claims.tid, claims.fn, claims.ct, size, key, claims.agentId, nowIso()).run();
+  if (ins.meta.changes > 0) {
+    const nm = await c.env.DB.prepare('SELECT COALESCE(label, name) AS name FROM agents WHERE id = ?')
+      .bind(claims.agentId).first<{ name: string }>();
+    await room(c.env, claims.pid).noteAttachment(claims.pid, { kind: 'agent', id: claims.agentId, name: nm?.name ?? 'agent' }, claims.tid, claims.fn, claims.aid);
+  }
+  return c.json({ id: claims.aid, filename: claims.fn, size });
 });
 
 app.get('/api/attachments/:aid', userAuth, async (c) => {

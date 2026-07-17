@@ -22,6 +22,11 @@ export interface Env {
   EMAIL_FROM?: string;
   /** Task attachments — optional; endpoints 503 until R2 is enabled + bound. */
   FILES?: R2Bucket;
+  /** HMAC key for signing agent attachment-upload capability tokens (PLNR-173). Optional:
+   *  falls back to ADMIN_TOKEN, so an instance with an admin token already supports agent
+   *  uploads with no extra config. If neither is set, create_attachment_upload is disabled
+   *  and agents fall back to inline add_attachment for small files. */
+  ATTACHMENT_UPLOAD_SECRET?: string;
   /**
    * Optional CIMD (Client ID Metadata Document) trust policy: a comma-separated
    * allowlist of hostnames permitted as URL-formatted client_ids (e.g.
