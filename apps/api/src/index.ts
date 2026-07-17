@@ -487,9 +487,11 @@ app.get('/api/public/projects/:pid/snapshot', async (c) => {
   if (!proj || !proj.public) return c.json({ error: 'not found' }, 404);
   const [tasks, deps, agents, events, milestones, boards, plans, phases, phaseTasks, tags, taskTags] = await Promise.all([
     c.env.DB.prepare(
-      `SELECT id, key, title, body, status, type, priority, estimate, due_at AS dueAt, claimed_by AS claimedBy,
+      `SELECT id, key, title, body,
+              CASE WHEN failed_at IS NOT NULL THEN 'failed' ELSE status END AS status,
+              type, priority, estimate, due_at AS dueAt, claimed_by AS claimedBy,
               parent_task_id AS parentTaskId, milestone_id AS milestoneId, board_id AS boardId, archived_at AS archivedAt,
-              open_comments AS openComments, "order" FROM tasks WHERE project_id = ? ORDER BY "order"`,
+              failed_at AS failedAt, open_comments AS openComments, "order" FROM tasks WHERE project_id = ? ORDER BY "order"`,
     ).bind(pid).all(),
     c.env.DB.prepare(
       'SELECT d.task_id AS taskId, d.depends_on_task_id AS dependsOnTaskId FROM dependencies d JOIN tasks t ON t.id = d.task_id WHERE t.project_id = ?',
@@ -536,9 +538,13 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     // whose work was all done+archived read 0/0 instead of complete. The client hides
     // archived tasks at render; anything that counts uses the full list.
     c.env.DB.prepare(
-      `SELECT id, key, title, body, status, type, priority, estimate, due_at AS dueAt, claimed_by AS claimedBy, claim_expires_at AS claimExpiresAt,
+      // status is DERIVED: a task with failed_at set reads as 'failed' (0049) — the column itself
+      // stays within its CHECK. Every task read that faces the wire applies this same CASE.
+      `SELECT id, key, title, body,
+              CASE WHEN failed_at IS NOT NULL THEN 'failed' ELSE status END AS status,
+              type, priority, estimate, due_at AS dueAt, claimed_by AS claimedBy, claim_expires_at AS claimExpiresAt,
               parent_task_id AS parentTaskId, milestone_id AS milestoneId, board_id AS boardId, archived_at AS archivedAt,
-              open_comments AS openComments, "order"
+              failed_at AS failedAt, open_comments AS openComments, "order"
        FROM tasks WHERE project_id = ? ORDER BY "order"`,
     ).bind(pid).all(),
     c.env.DB.prepare(
