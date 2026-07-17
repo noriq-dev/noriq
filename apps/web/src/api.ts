@@ -193,6 +193,8 @@ export const api = {
   runs: (pid: string) => req<{ runs: ApiRun[] }>('GET', `/api/projects/${pid}/runs`),
   dispatchRun: (pid: string, body: DispatchInput) => req<{ run: ApiRun; delivered: boolean }>('POST', `/api/projects/${pid}/runs`, body),
   cancelRun: (runId: string, reason?: string) => req<{ run: ApiRun }>('POST', `/api/runs/${runId}/cancel`, { reason }),
+  /** The run's transcript (RUN-74): every voice in the run, in order — the "why" surface. */
+  runLog: (runId: string) => req<{ segments: ApiRunLogSegment[] }>('GET', `/api/runs/${runId}/log`),
 
   // --- plan dispatch (PLNR-170): dispatch a whole plan; the server fans out per-task runs ---
   planDispatches: (pid: string, planId?: string) =>
@@ -316,6 +318,14 @@ export interface PlanDispatchInput {
   /** Applied to every run the dispatch creates (per-run ceilings, not a shared pool). */
   budget?: Partial<ApiRunBudget>;
   gate?: 'landed' | 'approved';
+}
+/** One transcript segment (RUN-74). Consecutive same-voice segments merge in the UI. */
+export interface ApiRunLogSegment {
+  seq: number;
+  role: 'agent' | 'reviewer' | 'verify' | 'system';
+  round: number | null;
+  text: string;
+  at: string;
 }
 export interface DispatchInput {
   runnerId: string;

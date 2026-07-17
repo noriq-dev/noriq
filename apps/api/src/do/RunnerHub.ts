@@ -140,6 +140,19 @@ export class RunnerHub extends DurableObject<Env> {
         return;
       }
 
+      case 'run.log': {
+        // Transcript segments (RUN-74): append-only, idempotent on (run_id, seq). Same
+        // ownership rule and same best-effort posture as telemetry — a transcript must
+        // never gate a run's lifecycle.
+        const row = await this.env.DB.prepare('SELECT project_id AS pid, runner_id AS rid FROM runs WHERE id = ?')
+          .bind(msg.runId).first<{ pid: string; rid: string | null }>();
+        if (!row || row.rid !== runnerId) return;
+        try {
+          await this.room(row.pid).appendRunLog(row.pid, msg.runId, msg.segments);
+        } catch { /* best-effort — never fatal */ }
+        return;
+      }
+
       case 'steer.ack': {
         // The runtime-channel dedup ack (RUN-17). Look up the steer we sent to map
         // steerId → (agent, source id); on a live runtime delivery, record it in

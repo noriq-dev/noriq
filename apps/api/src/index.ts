@@ -1601,6 +1601,19 @@ app.post('/api/plan-dispatches/:id/retry', userAuth, async (c) => {
   }
 });
 
+// The run TRANSCRIPT (RUN-74): the append-only, role-labeled stream of everything the run
+// said — builder turns, each reviewer round, verify output, daemon milestones. This is the
+// "why was it refused" surface; log_tail on the run row remains the collapsed live preview.
+app.get('/api/runs/:runId/log', userAuth, async (c) => {
+  const runId = c.req.param('runId')!;
+  const run = await c.env.DB.prepare('SELECT project_id AS pid FROM runs WHERE id = ?')
+    .bind(runId).first<{ pid: string }>();
+  if (!run) return c.json({ error: 'run not found' }, 404);
+  if (!(await reachesProject(c, run.pid))) return c.json({ error: 'not found' }, 404);
+  const { segments } = await room(c.env, run.pid).getRunLog(run.pid, runId);
+  return c.json({ segments });
+});
+
 // Cancel a Run (RUN-7): mark it cancelled in its project's authority and push
 // run.cancel down the runner's socket so the daemon SIGTERMs the process.
 app.post('/api/runs/:runId/cancel', userAuth, async (c) => {
