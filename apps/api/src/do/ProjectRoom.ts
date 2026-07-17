@@ -73,6 +73,7 @@ type TaskRow = {
   status: string;
   claimed_by: string | null;
   claim_expires_at: string | null;
+  failed_at: string | null;
   title: string;
 };
 
@@ -531,16 +532,27 @@ export class ProjectRoom extends DurableObject<Env> {
         sets.push('parent_task_id = ?');
         binds.push(parentId);
       }
+      // 'failed' is a DERIVED wire status (PLNR-178), never a stored one — the CHECK forbids
+      // it, and it is set only by a run's gate outcome (settleAnchorTask). A human dropping a
+      // task on the Failed column must be a no-op, not a 500.
+      if (patch.status === 'failed') delete patch.status;
       let statusChanged = false;
-      if (patch.status !== undefined && patch.status !== task.status) {
-        sets.push('status = ?');
-        binds.push(patch.status);
-        statusChanged = true;
-        if (patch.status === 'done' || patch.status === 'cancelled' || patch.status === 'todo') {
-          sets.push('claimed_by = NULL', 'claim_expires_at = NULL');
-          await this.env.DB.prepare('UPDATE claims SET released_at = ? WHERE task_id = ? AND released_at IS NULL')
-            .bind(nowIso(), taskId)
-            .run();
+      if (patch.status !== undefined) {
+        // A human explicitly restatusing a task RESOLVES any prior gate failure — whether they
+        // move it to review/done (accepting it) or back to todo (re-queuing). Clear failed_at
+        // even when the real status is unchanged (a failed task's real status is already 'todo',
+        // so a Failed→Todo drag changes nothing but the marker).
+        if (task.failed_at) sets.push('failed_at = NULL');
+        if (patch.status !== task.status) {
+          sets.push('status = ?');
+          binds.push(patch.status);
+          statusChanged = true;
+          if (patch.status === 'done' || patch.status === 'cancelled' || patch.status === 'todo') {
+            sets.push('claimed_by = NULL', 'claim_expires_at = NULL');
+            await this.env.DB.prepare('UPDATE claims SET released_at = ? WHERE task_id = ? AND released_at IS NULL')
+              .bind(nowIso(), taskId)
+              .run();
+          }
         }
       }
       if (!sets.length) return { ok: true, key: task.key };
@@ -2759,7 +2771,7 @@ export class ProjectRoom extends DurableObject<Env> {
 
   private async getTask(taskId: string): Promise<TaskRow> {
     const row = await this.env.DB.prepare(
-      'SELECT id, key, status, claimed_by, claim_expires_at, title FROM tasks WHERE id = ? AND project_id = ?',
+      'SELECT id, key, status, claimed_by, claim_expires_at, failed_at, title FROM tasks WHERE id = ? AND project_id = ?',
     ).bind(taskId, this.projectId).first<TaskRow>();
     if (!row) throw new Error(`task ${taskId} not found in this project`);
     return row;

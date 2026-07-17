@@ -23,6 +23,7 @@ interface RoomRpc {
   listRuns(projectId: string, opts?: { runnerId?: string; status?: string }): Promise<RunView[]>;
   getRun(projectId: string, runId: string): Promise<RunView>;
   claimTask(projectId: string, actor: Actor, taskId: string): Promise<unknown>;
+  updateTask(projectId: string, actor: Actor, taskId: string, patch: { status?: string }): Promise<{ ok: boolean; key: string }>;
 }
 const room = (projectId: string) =>
   appEnv.PROJECT_ROOM.get(appEnv.PROJECT_ROOM.idFromName(projectId)) as unknown as RoomRpc;
@@ -474,6 +475,32 @@ describe("a build run settles its anchor task from the gate outcome (RUN-83)", (
       "SELECT CASE WHEN failed_at IS NOT NULL THEN 'failed' ELSE status END AS s FROM tasks WHERE id = 'task_fail'",
     ).first<{ s: string }>();
     expect(wire!.s).toBe("failed");
+  });
+
+  it("a human 'move to failed' is a no-op, never a CHECK violation (PLNR-178)", async () => {
+    await env.DB.prepare(
+      "INSERT INTO tasks (id, project_id, key, title, status) VALUES ('task_nofail', ?, 'STL-NOFAIL', 't', 'review')",
+    ).bind(pid).run();
+    // 'failed' is derived, not writable — updateTask must silently drop it, not hit the CHECK.
+    await expect(room(pid).updateTask(pid, actor, "task_nofail", { status: "failed" })).resolves.toMatchObject({ ok: true });
+    expect((await taskRow("task_nofail"))!.status).toBe("review"); // unchanged
+  });
+
+  it("moving a failed task to a real column clears failed_at, incl. the same-real-status Failed→Todo drag (PLNR-178)", async () => {
+    // The shape settleAnchorTask leaves: real status todo + failed_at (wire 'failed').
+    await env.DB.prepare(
+      "INSERT INTO tasks (id, project_id, key, title, status, failed_at) VALUES ('task_unfail', ?, 'STL-UNFAIL', 't', 'todo', ?)",
+    ).bind(pid, "2026-07-17T00:00:00.000Z").run();
+    // Failed→Review: sets review AND clears the marker.
+    await room(pid).updateTask(pid, actor, "task_unfail", { status: "review" });
+    expect(await taskRow("task_unfail")).toMatchObject({ status: "review", failedAt: null });
+
+    // Failed→Todo: the real status is already todo, but the human dragging it out still clears
+    // the failure marker (else the wire would keep deriving 'failed').
+    await env.DB.prepare("UPDATE tasks SET status = 'todo', failed_at = ? WHERE id = 'task_unfail'")
+      .bind("2026-07-17T00:00:00.000Z").run();
+    await room(pid).updateTask(pid, actor, "task_unfail", { status: "todo" });
+    expect((await taskRow("task_unfail"))!.failedAt).toBeNull();
   });
 
   it("does not stomp a task a human already moved off the run (guard)", async () => {

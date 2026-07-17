@@ -568,6 +568,10 @@ export function useAppStore() {
     async moveTask(taskId: string, status: TaskStatus) {
       if (!pidRef.current) return;
       setDraggedId(null);
+      // 'failed' is a derived, system-set status (PLNR-178) — you can't drag a task INTO it.
+      // Dropping on the Failed column is a no-op; moving a failed task OUT (to any real column)
+      // clears its failure marker server-side.
+      if (status === 'failed') return;
       const t = (data.tasks[pidRef.current] ?? []).find((x) => x.id === taskId);
       if (!t || t.status === status) return;
       if (helpers.effStatus(pidRef.current, t) === 'blocked' && ['in_progress', 'review', 'done'].includes(status)) return;

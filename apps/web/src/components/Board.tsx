@@ -10,10 +10,11 @@ import { confirm, prompt } from './Dialog';
 const COLUMNS: Array<[TaskStatus, string]> = [
   ['todo', 'Todo'],
   ['in_progress', 'In progress'],
-  ['review', 'Review'],
-  // A gate-failed task (PLNR-178) gets its own column — the whole point is that it is NOT
-  // "awaiting review". Underneath it is a re-armable todo; here it reads as needing a human.
+  // A gate-failed task (PLNR-178) gets its own column BEFORE review — the whole point is that
+  // it is NOT "awaiting review". Underneath it is a re-armable todo; here it reads as needing a
+  // human. Not a drop target (store.moveTask rejects a drag into 'failed').
   ['failed', 'Failed'],
+  ['review', 'Review'],
   ['done', 'Done'],
 ];
 
@@ -246,11 +247,12 @@ export function Board({ store }: { store: AppStore }) {
                 key={st}
                 onDragOver={(e) => {
                   e.preventDefault();
-                  e.dataTransfer.dropEffect = 'move';
+                  // 'failed' is system-set (PLNR-178) — not a drop target; show the no-drop cursor.
+                  e.dataTransfer.dropEffect = st === 'failed' ? 'none' : 'move';
                 }}
                 onDrop={(e) => {
                   e.preventDefault();
-                  if (draggedId != null) actions.moveTask(draggedId, st);
+                  if (draggedId != null && st !== 'failed') actions.moveTask(draggedId, st);
                 }}
                 className="board-col"
                 style={{ width: 282, flex: 'none', display: 'flex', flexDirection: 'column', minHeight: 0 }}
