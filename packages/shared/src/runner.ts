@@ -55,7 +55,24 @@ export const RunModelMix = z.object({
 });
 export type RunModelMix = z.infer<typeof RunModelMix>;
 
-/** The full mix, keyed by model id (e.g. "claude-opus-4-8"). */
+/**
+ * The reserved key for spend that could NOT be attributed to a model (RUN-86). A codex session
+ * reports tokens but no per-model split and no cost; the runner used to drop the WHOLE run's mix
+ * over one such session (the all-or-nothing rule that made a Claude build show "not reported"
+ * because its reviewer was codex). Instead it now folds that spend into this one bucket, so the
+ * per-model parts still SUM to the run total — codex's tokens land here at $0 cost, matching that
+ * the run total already books codex at $0. A model can never be named this (the parens make it a
+ * non-id), so a consumer keys on it to render "unattributed" rather than a model.
+ */
+export const UNATTRIBUTED_MODEL_ID = '(unattributed)';
+
+/**
+ * The full mix, keyed by model id (e.g. "claude-opus-4-8"), plus possibly the reserved
+ * `UNATTRIBUTED_MODEL_ID` bucket (RUN-86). Empty/absent = the run reported no spend at all (or a
+ * telemetry-less tick) — THAT is the only "models not reported" case now; a run that spent
+ * anything carries at least the unattributed bucket. Every value's four token classes + cost sum,
+ * across all keys, to the run's displayed totals.
+ */
 export const RunModelUsage = z.record(z.string(), RunModelMix);
 export type RunModelUsage = z.infer<typeof RunModelUsage>;
 export type RunEffort = z.infer<typeof RunEffort>;
