@@ -275,6 +275,10 @@ export interface ApiRun {
   tokensUsed: number | null;
   usdSpent: number | null;
   logTail: string | null;
+  /** What the run ACTUALLY spent per model (RUN-59) — the SDK's authoritative breakdown,
+   *  keyed by model id. Null = not reported (codex, an old runner). `model` above is only
+   *  what was requested. */
+  modelUsage: Record<string, ApiRunModelMix> | null;
   /** The plan dispatch that fanned this run out (PLNR-170). Null = a one-off dispatch. */
   planDispatchId: string | null;
   createdBy: string;
@@ -282,6 +286,15 @@ export interface ApiRun {
   updatedAt: string;
   dispatchedAt: string | null;
   startedAt: string | null;
+}
+
+/** Per-model spend within a run (RUN-59) — the SDK's own field names, un-renamed. */
+export interface ApiRunModelMix {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  costUSD: number;
 }
 
 /** A whole-plan dispatch (PLNR-170): the durable record the server's pump works from. */

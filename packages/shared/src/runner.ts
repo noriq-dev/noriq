@@ -33,6 +33,31 @@ export type AgentTool = z.infer<typeof AgentTool>;
  * is wrong for someone no matter which one you pick.
  */
 export const RunEffort = z.enum(['low', 'medium', 'high', 'xhigh', 'max']);
+
+/**
+ * What a run ACTUALLY spent, per model (RUN-59). `runs.model` records what the dispatch
+ * ASKED for; this records the reality — an "opus" run already spends real tokens on a haiku
+ * sub-agent (RUN-34 measured it), and only keeping both makes "I asked for opus and got 30%
+ * haiku" visible.
+ *
+ * The SDK's own field names, un-renamed and authoritative (it bills from these). ALL FOUR
+ * token classes are kept, not just input/output: the run's displayed totals are computed
+ * from all four, so a per-model breakdown that omitted cache tokens would not sum to the
+ * number shown next to it — a user hovering each model and adding them up must land on the
+ * run total.
+ */
+export const RunModelMix = z.object({
+  inputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(),
+  cacheReadInputTokens: z.number().int().nonnegative(),
+  cacheCreationInputTokens: z.number().int().nonnegative(),
+  costUSD: z.number().nonnegative(),
+});
+export type RunModelMix = z.infer<typeof RunModelMix>;
+
+/** The full mix, keyed by model id (e.g. "claude-opus-4-8"). */
+export const RunModelUsage = z.record(z.string(), RunModelMix);
+export type RunModelUsage = z.infer<typeof RunModelUsage>;
 export type RunEffort = z.infer<typeof RunEffort>;
 
 // Run lifecycle: queued → dispatched → running → (blocked ⇄ running) → terminal.
@@ -145,6 +170,10 @@ export const Run = z.object({
   // work is happening (and the verify agent can reference the checkout). Machine-
   // local path; null until the daemon reports it.
   worktreePath: z.string().nullable().default(null),
+  // What the run actually spent per model (RUN-59) — the persisted runs.model_usage read
+  // path. Null = "not reported" (codex, an old runner, or a driver that can't break spend
+  // down by model). Never confuse with `model` above, which is only what was requested.
+  modelUsage: RunModelUsage.nullable().default(null),
   // Provenance + lifecycle timestamps.
   createdBy: z.string(), // actor id that dispatched the brief
   createdAt: z.string().datetime(),

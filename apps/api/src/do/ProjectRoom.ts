@@ -122,6 +122,7 @@ type RunRow = {
   exit: string | null;
   worktree_path: string | null;
   tokens_used: number | null; usd_spent: number | null; log_tail: string | null;
+  model_usage: string | null;
   plan_dispatch_id: string | null;
   created_by: string; created_at: string; updated_at: string;
   dispatched_at: string | null; started_at: string | null;
@@ -158,6 +159,8 @@ export interface RunView {
   tokensUsed: number | null;
   usdSpent: number | null;
   logTail: string | null;
+  /** What the run actually spent per model (RUN-59); null = not reported. */
+  modelUsage: Record<string, unknown> | null;
   /** The plan dispatch that fanned this run out (PLNR-170). Null = a one-off. The daemon's
    *  Run schema doesn't know the field and strips it — orchestration is server/UI business. */
   planDispatchId: string | null;
@@ -1568,6 +1571,7 @@ export class ProjectRoom extends DurableObject<Env> {
       tokensUsed: r.tokens_used,
       usdSpent: r.usd_spent,
       logTail: r.log_tail,
+      modelUsage: r.model_usage ? JSON.parse(r.model_usage) : null,
       planDispatchId: r.plan_dispatch_id,
       createdBy: r.created_by,
       createdAt: r.created_at,
@@ -2266,7 +2270,10 @@ export class ProjectRoom extends DurableObject<Env> {
   async recordRunTelemetry(
     projectId: string,
     runId: string,
-    t: { tokensUsed?: number | null; usdSpent?: number | null; logTail?: string | null; phase?: RunPhase | null },
+    t: {
+      tokensUsed?: number | null; usdSpent?: number | null; logTail?: string | null; phase?: RunPhase | null;
+      modelUsage?: Record<string, unknown> | null;
+    },
   ): Promise<void> {
     await this.setPid(projectId);
     // COALESCE, not a plain bind: null on this frame means "no news", never "set it back to
@@ -2279,6 +2286,15 @@ export class ProjectRoom extends DurableObject<Env> {
               log_tail = COALESCE(?, log_tail), phase = COALESCE(?, phase)
         WHERE id = ? AND project_id = ?`,
     ).bind(t.tokensUsed ?? null, t.usdSpent ?? null, t.logTail ?? null, t.phase ?? null, runId, projectId).run();
+    // model_usage is a TRI-STATE (RUN-59), which COALESCE cannot express: null/absent = no
+    // news (keep); {} = the daemon EXPLICITLY retracting an unattributable mix (store NULL);
+    // a non-empty object = the authoritative breakdown (store it). The empty-clear is the
+    // whole reason this can't ride the COALESCE above — a stale complete mix must be droppable.
+    if (t.modelUsage != null) {
+      const val = Object.keys(t.modelUsage).length ? JSON.stringify(t.modelUsage) : null;
+      await this.env.DB.prepare('UPDATE runs SET model_usage = ? WHERE id = ? AND project_id = ?')
+        .bind(val, runId, projectId).run();
+    }
   }
 
   /**

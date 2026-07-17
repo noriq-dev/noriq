@@ -59,6 +59,35 @@ function fmtBudget(b: ApiRun['budget']): string {
 
 const fmtTokens = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n));
 
+// "claude-opus-4-8" → "opus", "claude-haiku-4-5-20251001" → "haiku", "gpt-5.6-sol" → "gpt".
+const shortModel = (id: string): string => id.replace(/^claude-/, '').split(/[-.]/)[0] || id;
+
+// The model mix a run ACTUALLY spent (RUN-59): a % of cost per model, each hovering a
+// tooltip with that model's raw tokens + dollars — so a run dispatched as opus that quietly
+// spent 30% on haiku shows it. Percentage is by cost (this sits beside the dollar spend); the
+// tooltip carries the tokens the % doesn't. "not reported" when the driver couldn't break it
+// down (codex, an old runner) — never a fake "100% of the requested model".
+function ModelMix({ usage }: { usage: ApiRun['modelUsage'] }) {
+  const entries = usage ? Object.entries(usage) : [];
+  if (!entries.length) return <span style={{ color: 'var(--text-faint)' }}>models not reported</span>;
+  const totalCost = entries.reduce((s, [, m]) => s + (m.costUSD || 0), 0);
+  return (
+    <>
+      {entries
+        .sort((a, b) => b[1].costUSD - a[1].costUSD)
+        .map(([id, m], i) => (
+          <span
+            key={id}
+            title={`${id}\n${m.inputTokens.toLocaleString()} in · ${m.outputTokens.toLocaleString()} out tok · $${m.costUSD.toFixed(4)}`}
+            style={{ color: 'var(--text-dim)' }}
+          >
+            {i > 0 ? ' · ' : ''}{shortModel(id)} {totalCost > 0 ? Math.round((m.costUSD / totalCost) * 100) : 0}%
+          </span>
+        ))}
+    </>
+  );
+}
+
 // The live spend readout — tokens burned and USD, each against its ceiling when set.
 function fmtSpend(run: ApiRun): string | null {
   const parts: string[] = [];
@@ -284,6 +313,7 @@ function RunRow({ run, runner, onCancel }: { run: ApiRun; runner: ApiRunner | nu
           {spend
             ? <span style={{ color: st.live ? 'var(--text-soft)' : 'var(--text-dim)' }}>spent {spend}</span>
             : <span>budget {fmtBudget(run.budget)}</span>}
+          {spend && <span>· <ModelMix usage={run.modelUsage} /></span>}
           <span>· {ago(run.startedAt ?? run.dispatchedAt ?? run.createdAt)}</span>
           {run.worktreePath && <span title={run.worktreePath}>· ⌥ {run.worktreePath.split('/').slice(-2).join('/')}</span>}
           <button

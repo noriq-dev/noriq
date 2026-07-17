@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { Run, RunStatus, RunPhase, RunExit, AgentTool, RunKind, RunnerRepo } from './runner';
+import { Run, RunStatus, RunPhase, RunExit, AgentTool, RunKind, RunnerRepo, RunModelUsage } from './runner';
 
 // ---------------------------------------------------------------------------
 // The runtime channel (RUN plan, Phase 1) — a persistent WebSocket the daemon
@@ -172,6 +172,14 @@ export const RunnerClientMessage = z.discriminatedUnion('type', [
     // run.status would be actively wrong here — the transition map has no running →
     // running edge, so the server would reject a phase report as an illegal transition.
     phase: RunPhase.nullable().default(null),
+    // What the run has spent per model so far (RUN-59) — TRI-STATE, because a run's mix can
+    // become UNknowable mid-flight (an unattributed session spends), and null-means-no-news
+    // COALESCE cannot retract a now-stale mix:
+    //   • a mix object → the authoritative breakdown; store it (it sums to this frame's totals)
+    //   • {} (empty)   → telemetry present but not attributable → an EXPLICIT clear the server
+    //                    STORES (model_usage → null), not a COALESCE-skip
+    //   • null/absent  → no news (a phase-only tick); COALESCE-skip, keep what's stored
+    modelUsage: RunModelUsage.nullable().default(null),
     at: z.string().datetime(),
   }),
 

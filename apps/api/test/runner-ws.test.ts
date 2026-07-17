@@ -29,7 +29,7 @@ async function waitRunStatus(runId: string, want: string, tries = 40) {
 
 type RunRowPeek = {
   status: string; phase: string | null;
-  tokens_used: number | null; usd_spent: number | null; log_tail: string | null;
+  tokens_used: number | null; usd_spent: number | null; log_tail: string | null; model_usage: string | null;
 };
 /** Poll the run row until `want` holds. WS frames are fire-and-forget into an async DO RPC,
  *  so there is no reply to await — the row is the only observable. */
@@ -37,7 +37,7 @@ async function pollRun(runId: string, want: (r: RunRowPeek) => boolean, tries = 
   let last: RunRowPeek | null = null;
   for (let i = 0; i < tries; i++) {
     last = await env.DB.prepare(
-      'SELECT status, phase, tokens_used, usd_spent, log_tail FROM runs WHERE id = ?',
+      'SELECT status, phase, tokens_used, usd_spent, log_tail, model_usage FROM runs WHERE id = ?',
     ).bind(runId).first<RunRowPeek>();
     if (last && want(last)) return last;
     await sleep(25);
@@ -239,6 +239,49 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
     ws.send(JSON.stringify({ type: 'run.status', runId, status: 'done', at: new Date().toISOString() }));
     const finished = await pollRun(runId, (r) => r.status === 'done');
     expect(finished.phase).toBeNull(); // a done run that still reads "verifying" is worse than silent
+    ws.close();
+  });
+
+  it('records the per-model mix as a tri-state: store, no-news keeps, {} explicitly clears (RUN-59)', async () => {
+    const res = await wsConnect(runnerId, { Authorization: `Bearer ${token}` });
+    const ws = res.webSocket!;
+    ws.accept();
+    ws.send(JSON.stringify({ type: 'hello', protocol: 1, label: 'ws-daemon' }));
+    await nextFrame(ws, (m) => m.type === 'registered');
+    const disp = await (await SELF.fetch(`https://noriq.test/api/projects/${pid}/runs`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runnerId, kind: 'build', agentTool: 'claude', repoRef: 'repo_x', brief: 'mix' }),
+    })).json() as { run: { id: string } };
+    const runId = disp.run.id;
+    ws.send(JSON.stringify({ type: 'run.status', runId, status: 'running', at: new Date(0).toISOString() }));
+    await waitRunStatus(runId, 'running');
+
+    // The authoritative breakdown — an opus run that actually spent on a haiku sub-agent.
+    const mix = {
+      'claude-opus-4-8': { inputTokens: 540, outputTokens: 93, cacheReadInputTokens: 40554, cacheCreationInputTokens: 5332, costUSD: 0.0761 },
+      'claude-haiku-4-5': { inputTokens: 536, outputTokens: 23, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.0004 },
+    };
+    ws.send(JSON.stringify({ type: 'run.telemetry', runId, tokensUsed: 1000, modelUsage: mix, at: new Date().toISOString() }));
+    const stored = await pollRun(runId, (r) => r.model_usage != null);
+    expect(JSON.parse(stored.model_usage!)['claude-haiku-4-5'].inputTokens).toBe(536);
+
+    // A phase-only tick (no modelUsage) is no-news — the stored mix must survive it.
+    ws.send(JSON.stringify({ type: 'run.telemetry', runId, phase: 'verifying', at: new Date().toISOString() }));
+    const kept = await pollRun(runId, (r) => r.phase === 'verifying');
+    expect(kept.model_usage).not.toBeNull(); // COALESCE-style keep, not a wipe
+
+    // {} is the daemon retracting an unattributable mix — an EXPLICIT clear, stored as null.
+    ws.send(JSON.stringify({ type: 'run.telemetry', runId, modelUsage: {}, at: new Date().toISOString() }));
+    const cleared = await pollRun(runId, (r) => r.model_usage == null);
+    expect(cleared.model_usage).toBeNull();
+
+    // And the list projection parses it back to an object.
+    ws.send(JSON.stringify({ type: 'run.telemetry', runId, modelUsage: mix, at: new Date().toISOString() }));
+    await pollRun(runId, (r) => r.model_usage != null);
+    const listed = await (await SELF.fetch(`https://noriq.test/api/projects/${pid}/runs`, { headers: { Cookie: cookie } })).json() as {
+      runs: Array<{ id: string; modelUsage: Record<string, { costUSD: number }> | null }>;
+    };
+    expect(listed.runs.find((r) => r.id === runId)!.modelUsage!['claude-opus-4-8'].costUSD).toBeCloseTo(0.0761);
     ws.close();
   });
 });
