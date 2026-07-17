@@ -5,8 +5,9 @@
 // reload on project change. Live token/USD + log tail stream to the daemon and
 // are not persisted server-side yet — the view surfaces the budget envelope and
 // the terminal exit instead (see the note in the Runs header).
+import { UNATTRIBUTED_MODEL_ID } from '@noriq-dev/shared';
 import { useEffect, useMemo, useState } from 'react';
-import { api, type ApiRun, type ApiRunLogSegment, type ApiRunner, type DispatchInput, type RunEffort, type RunStatus } from '../api';
+import { api, type ApiRun, type ApiRunLogSegment, type ApiRunModelMix, type ApiRunner, type DispatchInput, type RunEffort, type RunStatus } from '../api';
 import type { AppStore } from '../store';
 import { Markdown } from './Markdown';
 import { LiveDot, MonoTag, SectionLabel } from './bits';
@@ -62,28 +63,44 @@ const fmtTokens = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(n >=
 // "claude-opus-4-8" → "opus", "claude-haiku-4-5-20251001" → "haiku", "gpt-5.6-sol" → "gpt".
 const shortModel = (id: string): string => id.replace(/^claude-/, '').split(/[-.]/)[0] || id;
 
-// The model mix a run ACTUALLY spent (RUN-59): a % of cost per model, each hovering a
-// tooltip with that model's raw tokens + dollars — so a run dispatched as opus that quietly
-// spent 30% on haiku shows it. Percentage is by cost (this sits beside the dollar spend); the
-// tooltip carries the tokens the % doesn't. "not reported" when the driver couldn't break it
-// down (codex, an old runner) — never a fake "100% of the requested model".
+// The model mix a run ACTUALLY spent (RUN-59/86): a share per model, each hovering a tooltip with
+// that model's raw tokens + dollars — so a run dispatched as opus that quietly spent 30% on haiku
+// shows it. Share is by WORK tokens (input+output), not cost: a codex session reports tokens but
+// NO cost, so a cost basis would render it as 0% — the token basis lets every contributor show,
+// and the tooltip still carries exact dollars for the models that have them. Spend that no driver
+// could attribute (codex, the claude usage-fallback) is folded into one UNATTRIBUTED bucket
+// (RUN-86) shown last, so the parts still sum to the run total. "not reported" survives for the
+// one honest case it names: a run that reported no spend at all.
+const workTokens = (m: ApiRunModelMix): number => m.inputTokens + m.outputTokens;
+
 function ModelMix({ usage }: { usage: ApiRun['modelUsage'] }) {
   const entries = usage ? Object.entries(usage) : [];
   if (!entries.length) return <span style={{ color: 'var(--text-faint)' }}>models not reported</span>;
-  const totalCost = entries.reduce((s, [, m]) => s + (m.costUSD || 0), 0);
+  const total = entries.reduce((s, [, m]) => s + workTokens(m), 0);
+  // Real models by work descending; the unattributed bucket is always pinned last.
+  const ordered = entries.sort((a, b) => {
+    if (a[0] === UNATTRIBUTED_MODEL_ID) return 1;
+    if (b[0] === UNATTRIBUTED_MODEL_ID) return -1;
+    return workTokens(b[1]) - workTokens(a[1]);
+  });
   return (
     <>
-      {entries
-        .sort((a, b) => b[1].costUSD - a[1].costUSD)
-        .map(([id, m], i) => (
+      {ordered.map(([id, m], i) => {
+        const unattributed = id === UNATTRIBUTED_MODEL_ID;
+        const pct = total > 0 ? Math.round((workTokens(m) / total) * 100) : 0;
+        const title = unattributed
+          ? `${m.inputTokens.toLocaleString()} in · ${m.outputTokens.toLocaleString()} out tok\nper-model split unavailable (e.g. a codex reviewer); cost not reported`
+          : `${id}\n${m.inputTokens.toLocaleString()} in · ${m.outputTokens.toLocaleString()} out tok · $${m.costUSD.toFixed(4)}`;
+        return (
           <span
             key={id}
-            title={`${id}\n${m.inputTokens.toLocaleString()} in · ${m.outputTokens.toLocaleString()} out tok · $${m.costUSD.toFixed(4)}`}
-            style={{ color: 'var(--text-dim)' }}
+            title={title}
+            style={{ color: unattributed ? 'var(--text-faint)' : 'var(--text-dim)' }}
           >
-            {i > 0 ? ' · ' : ''}{shortModel(id)} {totalCost > 0 ? Math.round((m.costUSD / totalCost) * 100) : 0}%
+            {i > 0 ? ' · ' : ''}{unattributed ? 'unattributed' : shortModel(id)} {pct}%
           </span>
-        ))}
+        );
+      })}
     </>
   );
 }
