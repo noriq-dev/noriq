@@ -19,6 +19,7 @@ interface RoomRpc {
   createRun(projectId: string, actor: Actor, input: CreateRunInput): Promise<RunView>;
   dispatchRun(projectId: string, actor: Actor, runId: string, runnerId: string): Promise<RunView>;
   transitionRun(projectId: string, actor: Actor, runId: string, patch: RunPatch): Promise<RunView>;
+  reopenRun(projectId: string, actor: Actor, runId: string, rounds: number | null): Promise<RunView>;
   reconcileRunnerRuns(projectId: string, actor: Actor, runnerId: string): Promise<{ failed: number }>;
   listRuns(projectId: string, opts?: { runnerId?: string; status?: string }): Promise<RunView[]>;
   getRun(projectId: string, runId: string): Promise<RunView>;
@@ -524,5 +525,160 @@ describe("a build run settles its anchor task from the gate outcome (RUN-83)", (
     const row = await taskRow("task_retry");
     expect(row!.status).toBe("in_progress");
     expect(row!.failedAt).toBeNull();
+  });
+});
+
+describe('continue a failed run — reopenRun (PLNR-180)', () => {
+  // A runner that is online AND still advertises the repo the run targets (its kept worktree is on
+  // that box). advertises=false / status seeds the guard cases.
+  const seedOnlineRunner = (id: string, repoRef: string, opts: { online?: boolean; advertises?: boolean } = {}) =>
+    env.DB.prepare('INSERT OR REPLACE INTO runners (id, label, status, repos) VALUES (?, ?, ?, ?)').bind(
+      id, id, opts.online === false ? 'offline' : 'online',
+      JSON.stringify(opts.advertises === false ? [] : [{ id: repoRef, projectId: pid }]),
+    ).run();
+  const mkTask = (id: string, key: string) =>
+    env.DB.prepare(
+      "INSERT INTO tasks (id, project_id, key, title, status, claimed_by) VALUES (?, ?, ?, 'a task', 'in_progress', 'agt_spawned')",
+    ).bind(id, pid, key).run();
+  const taskRow = (id: string) =>
+    env.DB.prepare('SELECT status, failed_at AS failedAt, claimed_by AS claimedBy FROM tasks WHERE id = ?')
+      .bind(id).first<{ status: string; failedAt: string | null; claimedBy: string | null }>();
+  // A failed, task-anchored build run on `runnerId`, targeting `repoRef` — the exact terminal shape
+  // Continue must re-open. Uses a fresh spawned-agent id per run (retireRunAgent revokes on fail).
+  const failedBuild = async (taskId: string, runnerId: string, repoRef: string) => {
+    const run = await room(pid).createRun(pid, actor, {
+      kind: 'build', repoRef, agentTool: 'claude', anchor: { type: 'task', id: taskId }, runnerId,
+      budget: { maxUsd: 5 },
+    });
+    await room(pid).transitionRun(pid, actor, run.id, { status: 'running', agentId: 'agt_spawned' });
+    await room(pid).transitionRun(pid, actor, run.id, { status: 'failed', reason: 'gate' });
+    return run;
+  };
+
+  it('re-opens the same run id to dispatched, clears exit/phase, carries the round budget, re-arms the task', async () => {
+    await seedRunner('rnr_cont');
+    await seedOnlineRunner('rnr_cont', 'repo_cont');
+    await mkTask('task_cont', 'CNT-1');
+    const run = await failedBuild('task_cont', 'rnr_cont', 'repo_cont');
+    // Precondition: the fail settled the task to the derived `failed` shape.
+    expect(await taskRow('task_cont')).toMatchObject({ status: 'todo', claimedBy: null });
+    expect((await taskRow('task_cont'))!.failedAt).toBeTruthy();
+
+    const reopened = await room(pid).reopenRun(pid, actor, run.id, 3);
+    expect(reopened.id).toBe(run.id); // SAME run id — history/telemetry continuity
+    expect(reopened.status).toBe('dispatched');
+    expect(reopened.exit).toBeNull();
+    expect(reopened.phase).toBeNull();
+    expect(reopened.runnerId).toBe('rnr_cont');
+    expect(reopened.budget.maxRounds).toBe(3); // the fresh reviewer-round budget rides budget JSON
+    expect(reopened.budget.maxUsd).toBe(5); // the prior ceiling is preserved
+
+    // The anchor task is re-armed: failed_at cleared, back to a claimable todo, claim cleared.
+    expect(await taskRow('task_cont')).toEqual({ status: 'todo', failedAt: null, claimedBy: null });
+
+    // The re-open is auditable and its terminal exit no longer round-trips from the row.
+    const evs = await runEvents(pid);
+    expect(evs.some((e) => e.subject_id === run.id)).toBe(true);
+  });
+
+  it('null rounds → budget.maxRounds null (the daemon falls back to its manifest default)', async () => {
+    await seedRunner('rnr_cont2');
+    await seedOnlineRunner('rnr_cont2', 'repo_cont2');
+    await mkTask('task_cont2', 'CNT-2');
+    const run = await failedBuild('task_cont2', 'rnr_cont2', 'repo_cont2');
+    const reopened = await room(pid).reopenRun(pid, actor, run.id, null);
+    expect(reopened.budget.maxRounds).toBeNull();
+  });
+
+  it('rejects a run that is not failed', async () => {
+    await seedRunner('rnr_cont3');
+    await seedOnlineRunner('rnr_cont3', 'repo_cont3');
+    const run = await room(pid).createRun(pid, actor, {
+      kind: 'build', repoRef: 'repo_cont3', agentTool: 'claude', anchor: { type: 'task', id: 'task_none' }, runnerId: 'rnr_cont3',
+    });
+    await expect(room(pid).reopenRun(pid, actor, run.id, null)).rejects.toThrow(/only a failed run/);
+  });
+
+  it("rejects when the run's runner is offline (kept worktree unreachable)", async () => {
+    await seedRunner('rnr_cont4');
+    await mkTask('task_cont4', 'CNT-4');
+    const run = await failedBuild('task_cont4', 'rnr_cont4', 'repo_cont4');
+    await seedOnlineRunner('rnr_cont4', 'repo_cont4', { online: false });
+    await expect(room(pid).reopenRun(pid, actor, run.id, null)).rejects.toThrow(/offline/);
+    // The task stays failed — a rejected continue must not half-arm it.
+    expect((await taskRow('task_cont4'))!.failedAt).toBeTruthy();
+  });
+
+  it('rejects when the runner no longer advertises the repo', async () => {
+    await seedRunner('rnr_cont5');
+    await mkTask('task_cont5', 'CNT-5');
+    const run = await failedBuild('task_cont5', 'rnr_cont5', 'repo_cont5');
+    await seedOnlineRunner('rnr_cont5', 'repo_cont5', { advertises: false });
+    await expect(room(pid).reopenRun(pid, actor, run.id, null)).rejects.toThrow(/no longer advertises/);
+  });
+
+  it('does not stomp a task a human already accepted (failed_at cleared) — run still re-opens', async () => {
+    await seedRunner('rnr_cont6');
+    await seedOnlineRunner('rnr_cont6', 'repo_cont6');
+    await mkTask('task_cont6', 'CNT-6');
+    const run = await failedBuild('task_cont6', 'rnr_cont6', 'repo_cont6');
+    // A human moves the failed task to review — updateTask clears failed_at.
+    await room(pid).updateTask(pid, actor, 'task_cont6', { status: 'review' });
+    const reopened = await room(pid).reopenRun(pid, actor, run.id, 2);
+    expect(reopened.status).toBe('dispatched'); // the run re-opens regardless
+    expect((await taskRow('task_cont6'))!.status).toBe('review'); // human's decision untouched
+  });
+
+  // The thin HTTP wrapper: auth + project reach + 409-mapping of the DO guards + delivery.
+  describe('POST /api/runs/:id/continue (HTTP)', () => {
+    beforeAll(async () => {
+      const u = await env.DB.prepare('SELECT id FROM users WHERE email = ?')
+        .bind('run-owner@example.com').first<{ id: string }>();
+      await env.DB.prepare(
+        "INSERT OR REPLACE INTO runners (id, label, owner_user_id, repos, status) VALUES ('rnr_cont_http', 'owned', ?, ?, 'online')",
+      ).bind(u!.id, JSON.stringify([{ id: 'repo_a', projectId: pid }])).run();
+    });
+    const cont = (runId: string, body: Record<string, unknown>, withCookie = true) =>
+      SELF.fetch(`https://noriq.test/api/runs/${runId}/continue`, {
+        method: 'POST',
+        headers: { ...(withCookie ? { Cookie: cookie } : {}), 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+    it('re-opens a failed run to dispatched with the round budget', async () => {
+      await env.DB.prepare(
+        "INSERT INTO tasks (id, project_id, key, title, status, claimed_by) VALUES ('task_http', ?, 'CNT-HTTP', 't', 'in_progress', 'agt_x')",
+      ).bind(pid).run();
+      const run = await room(pid).createRun(pid, actor, {
+        kind: 'build', repoRef: 'repo_a', agentTool: 'claude', anchor: { type: 'task', id: 'task_http' }, runnerId: 'rnr_cont_http',
+      });
+      await room(pid).transitionRun(pid, actor, run.id, { status: 'running', agentId: 'agt_x' });
+      await room(pid).transitionRun(pid, actor, run.id, { status: 'failed', reason: 'gate' });
+
+      const res = await cont(run.id, { rounds: 4 });
+      expect(res.status).toBe(200);
+      const { run: reopened } = (await res.json()) as { run: { status: string; budget: { maxRounds: number | null } } };
+      expect(reopened.status).toBe('dispatched');
+      expect(reopened.budget.maxRounds).toBe(4);
+    });
+
+    it('401 without a session', async () => {
+      const res = await cont('run_whatever', { rounds: 1 }, false);
+      expect(res.status).toBe(401);
+    });
+
+    it('404 for an unknown run', async () => {
+      const res = await cont('run_missing', { rounds: 1 });
+      expect(res.status).toBe(404);
+    });
+
+    it('409 when the DO guard rejects (run not failed)', async () => {
+      const run = await room(pid).createRun(pid, actor, {
+        kind: 'build', repoRef: 'repo_a', agentTool: 'claude', runnerId: 'rnr_cont_http',
+      });
+      const res = await cont(run.id, { rounds: 1 });
+      expect(res.status).toBe(409);
+      expect(JSON.stringify(await res.json())).toContain('only a failed run');
+    });
   });
 });

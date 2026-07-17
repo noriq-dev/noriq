@@ -12,7 +12,7 @@ import type { AppStore } from '../store';
 import { Markdown } from './Markdown';
 import { LiveDot, MonoTag, SectionLabel } from './bits';
 import { Button, ErrorNote, Field, Select, TextArea, TextInput } from './ui';
-import { alert, confirm } from './Dialog';
+import { alert, confirm, prompt } from './Dialog';
 
 function ago(iso: string | null): string {
   if (!iso) return 'never';
@@ -285,11 +285,16 @@ export function RunsView({ store }: { store: AppStore }) {
 
 function RunRow({ run, runner, onCancel }: { run: ApiRun; runner: ApiRunner | null; onCancel: () => void }) {
   const [killing, setKilling] = useState(false);
+  const [continuing, setContinuing] = useState(false);
   const [showLog, setShowLog] = useState(false);
   const st = STATUS_STYLE[run.status];
   const repo = runner?.repos.find((r) => r.id === run.repoRef);
   const terminal = TERMINAL.includes(run.status);
   const spend = fmtSpend(run);
+  // Continue is only meaningful for a gate-failed BUILD run whose kept worktree is still reachable:
+  // the same runner must be online and still advertise this repo (the worktree lives on that box).
+  const canContinue = run.status === 'failed' && run.kind === 'build';
+  const continueReady = canContinue && runner?.status === 'online' && !!runner.repos.find((r) => r.id === run.repoRef);
 
   return (
     <div
@@ -368,6 +373,46 @@ function RunRow({ run, runner, onCancel }: { run: ApiRun; runner: ApiRunner | nu
           }}
         >
           {killing ? '…' : 'kill'}
+        </Button>
+      )}
+
+      {canContinue && (
+        <Button
+          variant="primary"
+          disabled={continuing || !continueReady}
+          style={{ padding: '5px 12px', fontSize: 11, flex: 'none' }}
+          title={continueReady
+            ? 'Re-open this run with more reviewer rounds — the daemon picks up from its kept worktree'
+            : "the run's runner must be online and still advertise this repo — its kept worktree lives on that machine"}
+          onClick={async () => {
+            const ans = await prompt(
+              'Continue this failed run with how many more reviewer rounds? Leave blank for the repo’s default.',
+              '',
+              { title: 'Continue run', placeholder: 'e.g. 3' },
+            );
+            if (ans === null) return; // cancelled the dialog
+            const trimmed = ans.trim();
+            let rounds: number | null = null;
+            if (trimmed) {
+              const n = Number(trimmed);
+              if (!Number.isInteger(n) || n < 1) { await alert('Rounds must be a positive whole number.'); return; }
+              rounds = n;
+            }
+            setContinuing(true);
+            try {
+              const { delivered } = await api.continueRun(run.id, rounds);
+              if (!delivered) {
+                await alert('Re-opened — but the runner’s socket didn’t take the frame just now; it will pick the run up on its next reconnect.');
+              }
+              onCancel();
+            } catch (e) {
+              await alert(String(e instanceof Error ? e.message : e));
+            } finally {
+              setContinuing(false);
+            }
+          }}
+        >
+          {continuing ? '…' : 'continue →'}
         </Button>
       )}
     </div>

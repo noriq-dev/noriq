@@ -11,7 +11,7 @@ import { hashPassword, newApiKey, newId, nowIso, sha256Hex, verifyPassword } fro
 import { taskSearchFilters } from './lib/search';
 import { verifyUploadToken } from './lib/upload-token';
 import { USER_PROJECT_WHERE, taskWireStatus, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
-import type { Actor } from './do/ProjectRoom';
+import type { Actor, RunView } from './do/ProjectRoom';
 import { SKILL_MD } from './skill';
 import { issueTokens, metadataRoutes, oauth } from './oauth';
 import { errorPage, wantsHtml } from './errorPage';
@@ -1642,6 +1642,36 @@ app.post('/api/runs/:runId/cancel', userAuth, async (c) => {
     await hub(c.env, run.runnerId).deliver(JSON.stringify({ type: 'run.cancel', runId, hard: true, reason }));
   }
   return c.json({ run: updated });
+});
+
+// Continue a FAILED run (PLNR-180): re-open the SAME run id → dispatched with a fresh reviewer-
+// round budget, and re-hand it to the runner that still holds its kept worktree. The daemon
+// (RUN-91) picks up from that worktree instead of re-deriving from scratch. `rounds` is optional —
+// null lets the daemon fall back to its manifest `[verify.agent].maxRounds`. reopenRun enforces the
+// real guards (run is failed+build, its runner online and still advertising the repo) and re-arms
+// the anchor task in the same DO breath.
+const ContinueBody = z.object({ rounds: z.number().int().positive().nullable().default(null) });
+app.post('/api/runs/:runId/continue', userAuth, async (c) => {
+  const runId = c.req.param('runId')!;
+  const parsed = ContinueBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid continue', detail: parsed.error.issues }, 400);
+  const run = await c.env.DB.prepare('SELECT project_id AS pid, runner_id AS runnerId FROM runs WHERE id = ?')
+    .bind(runId).first<{ pid: string; runnerId: string | null }>();
+  if (!run) return c.json({ error: 'run not found' }, 404);
+  if (!(await reachesProject(c, run.pid))) return c.json({ error: 'not found' }, 404);
+  let reopened: RunView;
+  try {
+    reopened = await room(c.env, run.pid).reopenRun(run.pid, humanActor(c), runId, parsed.data.rounds);
+  } catch (err) {
+    // The DO owns the guards (offline runner, repo no longer advertised, not a failed build) — a
+    // rejection here is the human's answer, not a 500. 409: the run's state won't allow it now.
+    return c.json({ error: String(err instanceof Error ? err.message : err) }, 409);
+  }
+  // Fast path; a missed frame is redelivered on the daemon's next hello (RunnerHub) from the row.
+  const { delivered } = reopened.runnerId
+    ? await hub(c.env, reopened.runnerId).deliver(JSON.stringify({ type: 'run.assigned', run: reopened }))
+    : { delivered: false };
+  return c.json({ run: reopened, delivered });
 });
 
 // Steer a live Run (RUN-16/17): push a human's steer down the runner's socket so

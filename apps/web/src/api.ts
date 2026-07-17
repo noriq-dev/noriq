@@ -193,6 +193,10 @@ export const api = {
   runs: (pid: string) => req<{ runs: ApiRun[] }>('GET', `/api/projects/${pid}/runs`),
   dispatchRun: (pid: string, body: DispatchInput) => req<{ run: ApiRun; delivered: boolean }>('POST', `/api/projects/${pid}/runs`, body),
   cancelRun: (runId: string, reason?: string) => req<{ run: ApiRun }>('POST', `/api/runs/${runId}/cancel`, { reason }),
+  /** Continue a FAILED run (PLNR-180): re-open the same run id with N more reviewer rounds, back on
+   *  the runner that still holds its kept worktree. `rounds` null → the daemon's manifest default. */
+  continueRun: (runId: string, rounds: number | null) =>
+    req<{ run: ApiRun; delivered: boolean }>('POST', `/api/runs/${runId}/continue`, { rounds }),
   /** The run's transcript (RUN-74): every voice in the run, in order — the "why" surface. */
   runLog: (runId: string) => req<{ segments: ApiRunLogSegment[] }>('GET', `/api/runs/${runId}/log`),
 
@@ -241,6 +245,9 @@ export interface ApiRunBudget {
   maxTokens: number | null;
   maxUsd: number | null;
   maxDurationSeconds: number | null;
+  /** A per-dispatch reviewer-round override (PLNR-180) — null = the daemon's manifest default.
+   *  Carried on a "continue a failed run" dispatch. */
+  maxRounds: number | null;
 }
 export interface ApiRunExit {
   outcome: 'done' | 'failed' | 'cancelled';

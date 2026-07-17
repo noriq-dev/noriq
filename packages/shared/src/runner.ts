@@ -129,6 +129,12 @@ export const RunBudget = z.object({
   maxTokens: z.number().int().positive().nullable().default(null),
   maxUsd: z.number().positive().nullable().default(null),
   maxDurationSeconds: z.number().int().positive().nullable().default(null),
+  // A per-dispatch override of the reviewer ROUND budget (PLNR-180/RUN-91) — not a SIGTERM
+  // ceiling like the three above, but the same idea: a cap the run carries instead of leaving to
+  // the daemon's default. Null = the daemon uses its committed manifest `[verify.agent].maxRounds`
+  // (the server never reads that manifest — it stays the repo owner's authority, and clamps this).
+  // Set on a "continue a failed run" dispatch to hand the kept worktree N more reviewer rounds.
+  maxRounds: z.number().int().positive().nullable().default(null),
 });
 export type RunBudget = z.infer<typeof RunBudget>;
 

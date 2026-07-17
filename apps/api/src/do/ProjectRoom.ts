@@ -1668,6 +1668,77 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
+  /**
+   * Re-open a FAILED build run for another sitting — "continue a failed run" (PLNR-180).
+   *
+   * A gate-failed build is terminal today (`RUN_TRANSITIONS.failed = []`) even though the daemon
+   * KEEPS its worktree: the branch, the diff, and the last reviewer report are all still on the
+   * runner's disk. Continue hands the SAME run id back to the SAME runner (the worktree is
+   * machine-local) with a fresh reviewer-round budget, instead of forking history into a new run —
+   * telemetry (`model_usage`), the transcript (RUN-74), and adjudication continuity are all keyed
+   * on the id. This is the inverse of `settleAnchorTask(…, 'failed')`: it clears the run's terminal
+   * state (`exit`/`phase` → null, status → dispatched) AND the anchor task's `failed_at`, re-arming
+   * the task to a claimable `todo` so the fresh builder session re-claims it — one serialized DO
+   * breath, so the board and the run never disagree.
+   *
+   * Deliberately NOT `transitionRun`: that path owns terminal semantics (synthesizes `exit`,
+   * retires the agent) and its map forbids failed → dispatched. Re-opening is a distinct,
+   * server-initiated move, like `dispatchRun`. The daemon learns "this is a continuation, re-lease
+   * the kept worktree" from the run id's on-disk worktree (RUN-91), not a wire flag — which is what
+   * lets it survive a daemon restart between the fail and the continue. The only datum the wire
+   * carries is `budget.maxRounds`, folded into the persisted budget JSON so a RunnerHub redelivery
+   * (which rebuilds `run.assigned` from the row) carries it too; `null` ⇒ the manifest default.
+   */
+  async reopenRun(projectId: string, actor: Actor, runId: string, rounds: number | null): Promise<RunView> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const run = await this.loadRun(runId);
+      if (run.status !== 'failed') throw new Error(`only a failed run can be continued (this one is ${run.status})`);
+      if (run.kind !== 'build') throw new Error('only a build run keeps a worktree to continue');
+      if (!run.runner_id) throw new Error('run has no runner — nothing holds its worktree');
+      // The kept worktree is machine-local: continue MUST go back to the same runner, and only if
+      // it is still online and still advertises the repo — otherwise the worktree is unreachable.
+      const runner = await this.env.DB.prepare('SELECT status, repos FROM runners WHERE id = ?')
+        .bind(run.runner_id).first<{ status: string; repos: string }>();
+      if (!runner || runner.status !== 'online') {
+        throw new Error("the run's runner is offline — bring it online to continue");
+      }
+      let advertises = false;
+      try {
+        advertises = (JSON.parse(runner.repos || '[]') as Array<{ id: string }>).some((r) => r.id === run.repo_ref);
+      } catch { /* malformed repos JSON → treat as not advertised */ }
+      if (!advertises) throw new Error("the run's runner no longer advertises this repo — its worktree is unreachable");
+
+      const now = nowIso();
+      // Fold the round budget into the persisted budget JSON: RunnerHub redelivers a `dispatched`
+      // run as a plain run.assigned built from the row (RunnerHub.ts hello handler), so the datum
+      // has to live ON the run, not in the one-shot frame we push below.
+      const budget = { ...(JSON.parse(run.budget || '{}') as Record<string, unknown>), maxRounds: rounds };
+      await this.env.DB.prepare(
+        "UPDATE runs SET status = 'dispatched', exit = NULL, phase = NULL, budget = ?, dispatched_at = ?, updated_at = ? WHERE id = ?",
+      ).bind(JSON.stringify(budget), now, now, runId).run();
+      await this.emit(actor, 'run.status_changed', 'run', runId, { from: 'failed', to: 'dispatched', reason: 'continue', maxRounds: rounds });
+
+      // Re-arm the anchor task — the inverse of the failed settle. Clear `failed_at` and hand it
+      // back as a claimable `todo` (claim cleared) so the fresh builder session re-claims it; the
+      // board stops reading `failed` the instant the run re-dispatches. Guarded to `failed_at IS
+      // NOT NULL` so a human who already accepted/moved the task first is never stomped.
+      if (run.anchor_type === 'task' && run.anchor_id) {
+        const { meta } = await this.env.DB.prepare(
+          "UPDATE tasks SET status = 'todo', failed_at = NULL, claimed_by = NULL, claim_expires_at = NULL, updated_at = ? WHERE id = ? AND failed_at IS NOT NULL",
+        ).bind(now, run.anchor_id).run();
+        if (meta.changes) {
+          const t = await this.env.DB.prepare('SELECT key, title FROM tasks WHERE id = ?')
+            .bind(run.anchor_id).first<{ key: string; title: string }>();
+          await this.emit(actor, 'task.status_changed', 'task', run.anchor_id, {
+            key: t?.key, from: 'failed', to: 'todo', title: t?.title, reason: 'run_continued',
+          });
+        }
+      }
+      return this.runToWire(await this.loadRun(runId));
+    });
+  }
+
   // ---------------------------------------------------------------------------
   // Plan dispatch (PLNR-170) — dispatch a whole plan; a pump fans out the runs.
   //
