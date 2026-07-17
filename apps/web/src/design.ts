@@ -14,6 +14,10 @@ const STATUS: Record<TaskStatus, StatusMeta> = {
   in_progress: { label: 'in progress', color: '#4c9dff', bg: 'rgba(76,157,255,.14)', dot: '#4c9dff' },
   blocked: { label: 'blocked', color: '#ff5c5c', bg: 'rgba(255,92,92,.14)', dot: '#ff5c5c' },
   review: { label: 'review', color: '#b57bff', bg: 'rgba(181,123,255,.14)', dot: '#b57bff' },
+  // Failed the run's gate (PLNR-178) — a real 'todo' with failed_at set, derived to 'failed'
+  // on the wire. Deep red, distinct from blocked's alarm red, so "failed the gate" never reads
+  // as "awaiting review".
+  failed: { label: 'failed', color: '#e5484d', bg: 'rgba(229,72,77,.16)', dot: '#e5484d' },
   done: { label: 'done', color: '#3fd98b', bg: 'rgba(63,217,139,.14)', dot: '#3fd98b' },
   cancelled: { label: 'cancelled', color: '#6b7280', bg: 'rgba(107,114,128,.14)', dot: '#6b7280' },
 };

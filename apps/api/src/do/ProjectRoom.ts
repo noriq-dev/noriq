@@ -659,7 +659,9 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('UPDATE claims SET released_at = ? WHERE task_id = ? AND released_at IS NULL').bind(nowIso(), taskId),
         this.env.DB.prepare('INSERT INTO claims (id, task_id, agent_id, acquired_at, expires_at) VALUES (?, ?, ?, ?, ?)')
           .bind(claimId, taskId, agentId, nowIso(), expiresAt),
-        this.env.DB.prepare("UPDATE tasks SET status = 'in_progress', claimed_by = ?, claim_expires_at = ?, updated_at = ? WHERE id = ?")
+        // Clearing failed_at (RUN-83): claiming a task for a retry drops its prior gate failure,
+        // so the derived wire status returns to in_progress instead of lingering as `failed`.
+        this.env.DB.prepare("UPDATE tasks SET status = 'in_progress', claimed_by = ?, claim_expires_at = ?, failed_at = NULL, updated_at = ? WHERE id = ?")
           .bind(agentId, expiresAt, nowIso(), taskId),
       ]);
       await this.emit(actor, 'task.claimed', 'task', taskId, { key: task.key, title: task.title, agentId, expiresAt });
@@ -1268,7 +1270,7 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('UPDATE claims SET released_at = ? WHERE task_id = ? AND released_at IS NULL').bind(nowIso(), task.id),
         this.env.DB.prepare('INSERT INTO claims (id, task_id, agent_id, acquired_at, expires_at) VALUES (?, ?, ?, ?, ?)')
           .bind(newId('clm'), task.id, target.id, nowIso(), expiresAt),
-        this.env.DB.prepare("UPDATE tasks SET status = 'in_progress', claimed_by = ?, claim_expires_at = ?, updated_at = ? WHERE id = ?")
+        this.env.DB.prepare("UPDATE tasks SET status = 'in_progress', claimed_by = ?, claim_expires_at = ?, failed_at = NULL, updated_at = ? WHERE id = ?")
           .bind(target.id, expiresAt, nowIso(), task.id),
       ]);
       await this.emit(actor, 'task.handed_off', 'task', task.id, {
@@ -2189,6 +2191,13 @@ export class ProjectRoom extends DurableObject<Env> {
                 started_at = ?, updated_at = ? WHERE id = ?`,
       ).bind(to, agentId, exitJson, worktreePath, phase, startedAt, now, runId).run();
       if (isTerminalRunStatus(to) && agentId) await this.retireRunAgent(agentId);
+      // The RUN's terminal outcome now moves its anchor task — not the agent (RUN-83). The build
+      // agent used to release_task(review) when it finished, BEFORE the daemon's verify/reviewer
+      // gate ran, so a gate FAILURE stranded the task in `review`. Settle it here instead, before
+      // the pump reads task state below.
+      if (isTerminalRunStatus(to) && run.kind === 'build' && run.anchor_type === 'task' && run.anchor_id) {
+        await this.settleAnchorTask(run.anchor_id, to, now);
+      }
       await this.emit(actor, 'run.status_changed', 'run', runId, { from: run.status, to, reason: patch.reason ?? null });
       // A terminal run is the plan-dispatch pump's main wake-up (PLNR-170): it freed a slot,
       // and if it was `done` it may have landed the dependency some other task waits on.
@@ -2208,6 +2217,38 @@ export class ProjectRoom extends DurableObject<Env> {
    *
    * Copilots are untouched: a human's session is not owned by a run and must survive one.
    */
+  /**
+   * Move a build run's anchor task to match the run's terminal outcome (RUN-83): gate passed
+   * (`done`) → `review`; gate failed → `failed`; cancelled → back to the queue.
+   *
+   * `failed` is a DERIVED wire status: D1 cannot widen tasks.status's CHECK (0049), so a
+   * gate-failed task keeps a real status of `todo` — which is what lets the plan-dispatch RETRY
+   * path re-arm it — and carries `failed_at`, from which the wire renders `failed`. It is `todo`
+   * rather than `in_progress` on purpose: the pump's one-attempt-per-dispatch guard already
+   * blocks an AUTO re-dispatch (a failed run exists), so it sits failed until a human retries.
+   *
+   * Guarded to a task the run still owns (`in_progress`/`claimed`), so a human who moved it first
+   * is never stomped. The claim is cleared either way — the run is over.
+   */
+  private async settleAnchorTask(taskId: string, outcome: string, now: string): Promise<void> {
+    const owned = "status IN ('in_progress','claimed')";
+    const clear = 'claimed_by = NULL, claim_expires_at = NULL';
+    if (outcome === 'done') {
+      await this.env.DB.prepare(
+        `UPDATE tasks SET status = 'review', failed_at = NULL, ${clear}, updated_at = ? WHERE id = ? AND ${owned}`,
+      ).bind(now, taskId).run();
+    } else if (outcome === 'failed') {
+      await this.env.DB.prepare(
+        `UPDATE tasks SET status = 'todo', failed_at = ?, ${clear}, updated_at = ? WHERE id = ? AND ${owned}`,
+      ).bind(now, now, taskId).run();
+    } else {
+      // cancelled: hand it back to the queue, cleared of any prior failure.
+      await this.env.DB.prepare(
+        `UPDATE tasks SET status = 'todo', failed_at = NULL, ${clear}, updated_at = ? WHERE id = ? AND ${owned}`,
+      ).bind(now, taskId).run();
+    }
+  }
+
   private async retireRunAgent(agentId: string): Promise<void> {
     const agent = await this.env.DB.prepare("SELECT id FROM agents WHERE id = ? AND kind = 'agent'")
       .bind(agentId).first();

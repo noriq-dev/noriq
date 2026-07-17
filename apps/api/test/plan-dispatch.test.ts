@@ -275,6 +275,44 @@ describe('the review gate (the design decision of PLNR-170)', () => {
 });
 
 describe('failure, retry, cancel, completion', () => {
+  it('a gate-failed phase task becomes failed, holds the plan (blocks the next phase), and retry re-arms it (PLNR-178)', async () => {
+    const runner = await seedRunner(2);
+    const { planId, a, b, c } = await makePlan('failgate');
+    const d = await createDispatch(runner, planId); // approved (strict) — the default
+    const runA = (await dispatchRuns(d.id)).find((r) => r.taskId === a)!;
+    const agent = await seedAgent(runner);
+    // The agent claims a (→ in_progress), then its build run FAILS the daemon's gate.
+    await room(pid).transitionRun(pid, actor, runA.id, { status: 'running', agentId: agent });
+    await room(pid).claimTask(pid, actor, a, agent);
+    await room(pid).transitionRun(pid, actor, runA.id, { status: 'failed', reason: 'verify' });
+
+    // a is the derived 'failed' — a REAL todo (re-armable) carrying failed_at.
+    const rowA = await env.DB.prepare('SELECT status, failed_at AS f, claimed_by AS cb FROM tasks WHERE id = ?')
+      .bind(a).first<{ status: string; f: string | null; cb: string | null }>();
+    expect(rowA!.status).toBe('todo');
+    expect(rowA!.f).toBeTruthy();
+    expect(rowA!.cb).toBeNull(); // the claim was cleared — the run is over
+
+    // The failed (not done) phase-1 task holds the plan: phase 2 is not dispatched, and c is blocked.
+    expect((await dispatchRuns(d.id)).map((r) => r.taskId)).not.toContain(c);
+    expect((await taskClaimability(env.DB, c)).claimable).toBe(false);
+
+    // Retry re-arms the failed task with a fresh run (the pump's one-attempt guard blocked auto).
+    const before = (await dispatchRuns(d.id)).filter((r) => r.taskId === a).length;
+    const { created } = await room(pid).retryPlanDispatch(pid, actor, d.id);
+    expect(created).toBeGreaterThanOrEqual(1);
+    const runsA = (await dispatchRuns(d.id)).filter((r) => r.taskId === a);
+    expect(runsA.length).toBe(before + 1);
+
+    // Claiming the retry run clears failed_at, so it is not shown failed while it re-runs.
+    const agent2 = await seedAgent(runner);
+    await room(pid).transitionRun(pid, actor, runsA.at(-1)!.id, { status: 'running', agentId: agent2 });
+    await room(pid).claimTask(pid, actor, a, agent2);
+    const cleared = await env.DB.prepare('SELECT failed_at AS f FROM tasks WHERE id = ?').bind(a).first<{ f: string | null }>();
+    expect(cleared!.f).toBeNull();
+    void b;
+  });
+
   it('a failed run is NOT retried by the pump; /retry re-arms it', async () => {
     const runner = await seedRunner(2);
     const agent = await seedAgent(runner);

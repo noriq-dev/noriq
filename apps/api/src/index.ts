@@ -10,7 +10,7 @@ import { backupToR2, exportSnapshot } from './backup';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, verifyPassword } from './lib/util';
 import { taskSearchFilters } from './lib/search';
 import { verifyUploadToken } from './lib/upload-token';
-import { USER_PROJECT_WHERE, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
+import { USER_PROJECT_WHERE, taskWireStatus, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
 import type { Actor } from './do/ProjectRoom';
 import { SKILL_MD } from './skill';
 import { issueTokens, metadataRoutes, oauth } from './oauth';
@@ -457,7 +457,8 @@ app.get('/api/attention', userAuth, async (c) => {
                 CASE s.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, s.created_at`,
     ).bind(u.role, u.id, u.id).all(),
     c.env.DB.prepare(
-      `SELECT t.id, t.key, t.title, t.due_at AS dueAt, t.status, t.project_id AS projectId, p.key AS projectKey
+      `SELECT t.id, t.key, t.title, t.due_at AS dueAt, ${taskWireStatus('t')} AS status, t.failed_at AS failedAt,
+              t.project_id AS projectId, p.key AS projectKey
        FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
        WHERE ${VISIBILITY_WHERE}
          AND t.due_at IS NOT NULL AND t.due_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -487,9 +488,11 @@ app.get('/api/public/projects/:pid/snapshot', async (c) => {
   if (!proj || !proj.public) return c.json({ error: 'not found' }, 404);
   const [tasks, deps, agents, events, milestones, boards, plans, phases, phaseTasks, tags, taskTags] = await Promise.all([
     c.env.DB.prepare(
-      `SELECT id, key, title, body, status, type, priority, estimate, due_at AS dueAt, claimed_by AS claimedBy,
+      `SELECT id, key, title, body,
+              ${taskWireStatus()} AS status,
+              type, priority, estimate, due_at AS dueAt, claimed_by AS claimedBy,
               parent_task_id AS parentTaskId, milestone_id AS milestoneId, board_id AS boardId, archived_at AS archivedAt,
-              open_comments AS openComments, "order" FROM tasks WHERE project_id = ? ORDER BY "order"`,
+              failed_at AS failedAt, open_comments AS openComments, "order" FROM tasks WHERE project_id = ? ORDER BY "order"`,
     ).bind(pid).all(),
     c.env.DB.prepare(
       'SELECT d.task_id AS taskId, d.depends_on_task_id AS dependsOnTaskId FROM dependencies d JOIN tasks t ON t.id = d.task_id WHERE t.project_id = ?',
@@ -536,9 +539,13 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     // whose work was all done+archived read 0/0 instead of complete. The client hides
     // archived tasks at render; anything that counts uses the full list.
     c.env.DB.prepare(
-      `SELECT id, key, title, body, status, type, priority, estimate, due_at AS dueAt, claimed_by AS claimedBy, claim_expires_at AS claimExpiresAt,
+      // status is DERIVED (PLNR-178): failed_at set → 'failed'; the stored column stays within
+      // its CHECK. taskWireStatus() is the single source so every wire read stays consistent.
+      `SELECT id, key, title, body,
+              ${taskWireStatus()} AS status,
+              type, priority, estimate, due_at AS dueAt, claimed_by AS claimedBy, claim_expires_at AS claimExpiresAt,
               parent_task_id AS parentTaskId, milestone_id AS milestoneId, board_id AS boardId, archived_at AS archivedAt,
-              open_comments AS openComments, "order"
+              failed_at AS failedAt, open_comments AS openComments, "order"
        FROM tasks WHERE project_id = ? ORDER BY "order"`,
     ).bind(pid).all(),
     c.env.DB.prepare(
@@ -614,7 +621,7 @@ app.get('/api/tasks/search', userAuth, async (c) => {
   const allBinds = [u.role, u.id, u.id, pid, pid, ...binds];
   const [rows, total] = await Promise.all([
     c.env.DB.prepare(
-      `SELECT t.id, t.key, t.title, t.status, t.priority, t.estimate, t.due_at AS dueAt, t.type,
+      `SELECT t.id, t.key, t.title, ${taskWireStatus('t')} AS status, t.failed_at AS failedAt, t.priority, t.estimate, t.due_at AS dueAt, t.type,
               t.project_id AS projectId, p.key AS projectKey, t.claimed_by AS claimedBy,
               t.milestone_id AS milestoneId, t.open_comments AS openComments, t.updated_at AS updatedAt
        ${base} ORDER BY t.priority DESC, t.updated_at DESC LIMIT ${limit}`,
@@ -629,6 +636,10 @@ app.get('/api/tasks/:tid', userAuth, async (c) => {
   const task = await c.env.DB.prepare('SELECT * FROM tasks WHERE id = ?').bind(tid).first();
   if (!task) return c.json({ error: 'not found' }, 404);
   if (!(await reachesProject(c, String(task.project_id)))) return c.json({ error: 'not found' }, 404); // PLNR-97
+  // Derived status (PLNR-178): SELECT * gives the raw column, so apply the same rule as the
+  // wire SELECTs — a task with failed_at set reads as 'failed'. failedAt is already present.
+  if (task.failed_at) task.status = 'failed';
+  task.failedAt = task.failed_at;
   const [comments, refs, attachments, taskTagRows] = await Promise.all([
     c.env.DB.prepare(
       `SELECT id, author_kind AS authorKind, author_id AS authorId, kind, body, status, parent_comment_id AS parentCommentId, created_at AS createdAt

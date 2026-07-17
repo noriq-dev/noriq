@@ -11,6 +11,9 @@ const COLUMNS: Array<[TaskStatus, string]> = [
   ['todo', 'Todo'],
   ['in_progress', 'In progress'],
   ['review', 'Review'],
+  // A gate-failed task (PLNR-178) gets its own column — the whole point is that it is NOT
+  // "awaiting review". Underneath it is a re-armable todo; here it reads as needing a human.
+  ['failed', 'Failed'],
   ['done', 'Done'],
 ];
 

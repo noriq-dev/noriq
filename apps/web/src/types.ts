@@ -6,6 +6,7 @@ export type TaskStatus =
   | 'in_progress'
   | 'blocked'
   | 'review'
+  | 'failed'
   | 'done'
   | 'cancelled';
 

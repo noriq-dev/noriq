@@ -22,6 +22,7 @@ interface RoomRpc {
   reconcileRunnerRuns(projectId: string, actor: Actor, runnerId: string): Promise<{ failed: number }>;
   listRuns(projectId: string, opts?: { runnerId?: string; status?: string }): Promise<RunView[]>;
   getRun(projectId: string, runId: string): Promise<RunView>;
+  claimTask(projectId: string, actor: Actor, taskId: string): Promise<unknown>;
 }
 const room = (projectId: string) =>
   appEnv.PROJECT_ROOM.get(appEnv.PROJECT_ROOM.idFromName(projectId)) as unknown as RoomRpc;
@@ -436,5 +437,65 @@ describe('dispatch validates verifiesRunId (HTTP)', () => {
       runnerId: 'rnr_owned', kind: 'build', agentTool: 'claude', repoRef: 'repo_a', effort: 'ludicrous',
     });
     expect(res.status).toBe(400);
+  });
+});
+
+describe("a build run settles its anchor task from the gate outcome (RUN-83)", () => {
+  const mkTask = (id: string, key: string, status = "in_progress") =>
+    env.DB.prepare(
+      "INSERT INTO tasks (id, project_id, key, title, status, claimed_by) VALUES (?, ?, ?, 'a task', ?, 'agt_spawned')",
+    ).bind(id, pid, key, status).run();
+  const taskRow = (id: string) =>
+    env.DB.prepare("SELECT status, failed_at AS failedAt, claimed_by AS claimedBy FROM tasks WHERE id = ?")
+      .bind(id).first<{ status: string; failedAt: string | null; claimedBy: string | null }>();
+  const anchored = (taskId: string) =>
+    room(pid).createRun(pid, actor, {
+      kind: "build", repoRef: "r", agentTool: "claude", anchor: { type: "task", id: taskId }, runnerId: "rnr_1",
+    });
+
+  it("gate passed (run done) → task review, claim cleared", async () => {
+    await mkTask("task_pass", "STL-PASS");
+    const run = await anchored("task_pass");
+    await room(pid).transitionRun(pid, actor, run.id, { status: "running", agentId: "agt_spawned" });
+    await room(pid).transitionRun(pid, actor, run.id, { status: "done" });
+    expect(await taskRow("task_pass")).toEqual({ status: "review", failedAt: null, claimedBy: null });
+  });
+
+  it("gate failed (run failed) → derived `failed` (todo + failed_at), re-armable, claim cleared", async () => {
+    await mkTask("task_fail", "STL-FAIL");
+    const run = await anchored("task_fail");
+    await room(pid).transitionRun(pid, actor, run.id, { status: "running", agentId: "agt_spawned" });
+    await room(pid).transitionRun(pid, actor, run.id, { status: "failed", reason: "review" });
+    const row = await taskRow("task_fail");
+    expect(row!.status).toBe("todo"); // raw stays todo so the retry path can re-arm it
+    expect(row!.failedAt).toBeTruthy(); // the marker the wire derives `failed` from
+    expect(row!.claimedBy).toBeNull();
+    const wire = await env.DB.prepare(
+      "SELECT CASE WHEN failed_at IS NOT NULL THEN 'failed' ELSE status END AS s FROM tasks WHERE id = 'task_fail'",
+    ).first<{ s: string }>();
+    expect(wire!.s).toBe("failed");
+  });
+
+  it("does not stomp a task a human already moved off the run (guard)", async () => {
+    await mkTask("task_human", "STL-HUMAN", "done");
+    const run = await anchored("task_human");
+    await room(pid).transitionRun(pid, actor, run.id, { status: "running", agentId: "agt_spawned" });
+    await room(pid).transitionRun(pid, actor, run.id, { status: "failed" });
+    expect((await taskRow("task_human"))!.status).toBe("done"); // untouched
+  });
+
+  it("(re-)claiming a failed task clears failed_at so the retry is not shown failed", async () => {
+    // A failed task is `todo` + failed_at (the shape settleAnchorTask leaves). The claim UPDATE
+    // that both claimTask sites run must drop failed_at — asserted directly, since claimTask's
+    // full actor/identity path is exercised in coordination.test.ts, not here.
+    await env.DB.prepare(
+      "INSERT INTO tasks (id, project_id, key, title, status, failed_at) VALUES ('task_retry', ?, 'STL-RETRY', 't', 'todo', ?)",
+    ).bind(pid, "2026-07-17T00:00:00.000Z").run();
+    await env.DB.prepare(
+      "UPDATE tasks SET status = 'in_progress', claimed_by = ?, claim_expires_at = ?, failed_at = NULL, updated_at = ? WHERE id = 'task_retry'",
+    ).bind("agt_spawned", "2026-07-17T01:00:00.000Z", "2026-07-17T01:00:00.000Z").run();
+    const row = await taskRow("task_retry");
+    expect(row!.status).toBe("in_progress");
+    expect(row!.failedAt).toBeNull();
   });
 });

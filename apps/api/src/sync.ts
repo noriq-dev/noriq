@@ -73,7 +73,7 @@ export async function computeUpdates(
     await env.DB.prepare(
       `SELECT t.id, t.key, t.title, t.project_id AS projectId, t.priority
        FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
-       WHERE t.status = 'todo' AND t.claimed_by IS NULL
+       WHERE t.status = 'todo' AND t.claimed_by IS NULL AND t.failed_at IS NULL
          AND ${USER_PROJECT_WHERE}
          AND ${tokenProjectWhere('?3')}
          AND (?2 IS NULL OR t.project_id = ?2)
@@ -97,7 +97,7 @@ export async function computeUpdates(
       `SELECT t.id
        FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
        WHERE t.id IN (${newTaskIds.map((_, i) => `?${i + 4}`).join(',')})
-         AND t.status = 'todo' AND t.claimed_by IS NULL
+         AND t.status = 'todo' AND t.claimed_by IS NULL AND t.failed_at IS NULL
          AND ${USER_PROJECT_WHERE}
          AND ${tokenProjectWhere('?3')}
          AND (?2 IS NULL OR t.project_id = ?2)

@@ -461,6 +461,8 @@ export interface ApiSnapshot {
     id: string; key: string; title: string; body: string; status: string; type: string; priority: number;
     estimate: number | null; dueAt: string | null; claimedBy: string | null; claimExpiresAt: string | null; parentTaskId: string | null;
     milestoneId: string | null; boardId: string | null; openComments: number; order: number; archivedAt: string | null;
+    // 'failed' status is derived from failedAt (PLNR-178) — set when the anchor run's gate failed.
+    failedAt?: string | null;
   }>;
   dependencies: Array<{ taskId: string; dependsOnTaskId: string }>;
   agents: Array<{ id: string; name: string; role: string; status: string; lastSeenAt: string | null; ownerName: string | null; parentAgentId: string | null }>;

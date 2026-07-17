@@ -64,6 +64,16 @@ export async function tokenCanReachProject(env: Env, tokenId: string, projectId:
 // the plan (proposed → active). Gating is plan-level only for v1 — the task itself
 // stays `todo`; this clause hides it from the claimable surface until its plan is
 // active. Assumes the tasks table is aliased `t`. Use as: `AND ${TASK_NOT_IN_PROPOSED_PLAN}`.
+// Wire status for a task (PLNR-178): 'failed' is DERIVED from failed_at, never a stored
+// status value — tasks.status carries a CHECK and D1 cannot rebuild the FK-heavy tasks
+// table, so a gate-failed task stays a real `todo` (re-armable) with failed_at set, and
+// every wire-facing read renders it as 'failed'. Pass the table alias; use in a SELECT list
+// as `${taskWireStatus('t')} AS status` and select `failed_at AS failedAt` alongside.
+export const taskWireStatus = (alias = '') => {
+  const p = alias ? `${alias}.` : '';
+  return `CASE WHEN ${p}failed_at IS NOT NULL THEN 'failed' ELSE ${p}status END`;
+};
+
 export const TASK_NOT_IN_PROPOSED_PLAN = `NOT EXISTS (
   SELECT 1 FROM phase_tasks pt
     JOIN phases ph ON ph.id = pt.phase_id

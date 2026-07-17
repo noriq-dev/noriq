@@ -9,6 +9,7 @@ import {
   TASK_NOT_IN_PROPOSED_PLAN,
   TASK_NOT_PHASE_BLOCKED,
   USER_PROJECT_WHERE,
+  taskWireStatus,
   tokenCanReachProject,
   tokenProjectWhere,
   userCanAccessProject,
@@ -591,7 +592,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     tool(async ({ projectId }) => {
       const [tasks, milestones, boards, project, categories, docs] = await Promise.all([
         env.DB.prepare(
-          `SELECT t.id, t.key, t.title, t.status, t.type, t.priority, t.claimed_by AS claimedBy, t.parent_task_id AS parentTaskId,
+          `SELECT t.id, t.key, t.title, ${taskWireStatus('t')} AS status, t.failed_at AS failedAt, t.type, t.priority, t.claimed_by AS claimedBy, t.parent_task_id AS parentTaskId,
                   t.milestone_id AS milestoneId, t.board_id AS boardId, t.open_comments AS openComments, t.claim_expires_at AS claimExpiresAt,
                   (SELECT GROUP_CONCAT(dt.key) FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id WHERE d.task_id = t.id) AS dependsOn,
                   (SELECT GROUP_CONCAT(g.name) FROM task_tags tt JOIN tags g ON g.id = tt.tag_id WHERE tt.task_id = t.id) AS tags
@@ -818,6 +819,9 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       if (!(await userCanAccessProject(env, agent.userId, String(task.project_id)))) {
         throw new Error(`task ${taskId} not found`);
       }
+      // Derived status (PLNR-178): SELECT t.* gives the raw column; render 'failed' from failed_at.
+      if (task.failed_at) task.status = 'failed';
+      task.failedAt = task.failed_at;
       const id = String(task.id);
       const [deps, comments, refs, attachments, signals] = await Promise.all([
         env.DB.prepare(
@@ -907,7 +911,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       const max = limit ?? 50;
       const [rows, total] = await Promise.all([
         env.DB.prepare(
-          `SELECT t.id, t.key, t.title, t.status, t.priority, t.estimate, t.due_at AS dueAt, t.type,
+          `SELECT t.id, t.key, t.title, ${taskWireStatus('t')} AS status, t.failed_at AS failedAt, t.priority, t.estimate, t.due_at AS dueAt, t.type,
                   t.project_id AS projectId, p.key AS projectKey, t.claimed_by AS claimedBy,
                   t.milestone_id AS milestoneId, t.open_comments AS openComments, t.updated_at AS updatedAt
            ${base} ORDER BY t.priority DESC, t.updated_at DESC LIMIT ${max}`,
@@ -1037,7 +1041,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       const row = await env.DB.prepare(
         `SELECT t.id, t.key, t.title, t.body, t.priority, t.project_id AS projectId
          FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
-         WHERE t.status = 'todo' AND t.claimed_by IS NULL AND (?2 IS NULL OR t.project_id = ?2)
+         WHERE t.status = 'todo' AND t.claimed_by IS NULL AND t.failed_at IS NULL AND (?2 IS NULL OR t.project_id = ?2)
            AND ${USER_PROJECT_WHERE}
            AND ${tokenProjectWhere('?3')}
            AND NOT EXISTS (

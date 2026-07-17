@@ -281,7 +281,7 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
     const listed = await (await SELF.fetch(`https://noriq.test/api/projects/${pid}/runs`, { headers: { Cookie: cookie } })).json() as {
       runs: Array<{ id: string; modelUsage: Record<string, { costUSD: number }> | null }>;
     };
-    expect(listed.runs.find((r) => r.id === runId)!.modelUsage!['claude-opus-4-8'].costUSD).toBeCloseTo(0.0761);
+    expect(listed.runs.find((r) => r.id === runId)?.modelUsage?.['claude-opus-4-8']?.costUSD).toBeCloseTo(0.0761);
     ws.close();
   });
 });
