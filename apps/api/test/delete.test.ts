@@ -74,6 +74,30 @@ describe('deletion', () => {
     expect(s.status).toBe(404);
   });
 
+  it('project delete succeeds when a task carries a legacy category_id FK to a project tag — PLNR-108', async () => {
+    const p = (await mcpCall(agent.apiKey, 'create_project', { key: 'DELC', name: 'delc' })).body;
+    const t = (await mcpCall(agent.apiKey, 'create_task', { tags: ['legacy-cat'], projectId: p.id, title: 'legacy' })).body;
+    // Simulate pre-0055 data: the retired category_id still points at a live project tag.
+    const tag = await env.DB.prepare('SELECT id FROM tags WHERE project_id = ? LIMIT 1').bind(p.id).first<{ id: string }>();
+    await env.DB.prepare('UPDATE tasks SET category_id = ? WHERE id = ?').bind(tag!.id, t.id).run();
+    // Before the fix this FK-aborts the delete batch and leaves the project live.
+    expect((await del(p.id, '')).status).toBe(200);
+    const s = await SELF.fetch(`https://noriq.test/api/projects/${p.id}/snapshot`, { headers: { Cookie: cookie } });
+    expect(s.status).toBe(404);
+  });
+
+  it('tag delete succeeds when a task carries a legacy category_id FK to it — PLNR-108', async () => {
+    const p = (await mcpCall(agent.apiKey, 'create_project', { key: 'DELCT', name: 'delct' })).body;
+    const t = (await mcpCall(agent.apiKey, 'create_task', { tags: ['legacy-cat', 'other-tag'], projectId: p.id, title: 'legacy' })).body;
+    const tag = await env.DB.prepare("SELECT id FROM tags WHERE project_id = ? AND name = 'legacy-cat'").bind(p.id).first<{ id: string }>();
+    await env.DB.prepare('UPDATE tasks SET category_id = ? WHERE id = ?').bind(tag!.id, t.id).run();
+    expect((await del(p.id, `/tags/${tag!.id}`)).status).toBe(200);
+    // tag gone, task survives with category_id detached
+    const row = await env.DB.prepare('SELECT category_id FROM tasks WHERE id = ?').bind(t.id).first<{ category_id: string | null }>();
+    expect(row!.category_id).toBeNull();
+    await del(p.id, '');
+  });
+
   it('project delete removes its runs and unpins (keeps) its runners — RUN-4', async () => {
     const p = (await mcpCall(agent.apiKey, 'create_project', { key: 'DELR', name: 'delr' })).body;
     const runnerId = `rnr_del_${crypto.randomUUID().slice(0, 8)}`;

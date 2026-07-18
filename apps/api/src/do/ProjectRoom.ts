@@ -1440,6 +1440,9 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM task_tags WHERE tag_id = ?').bind(src.id),
         this.env.DB.prepare('INSERT OR IGNORE INTO doc_tags (doc_id, tag_id) SELECT doc_id, ? FROM doc_tags WHERE tag_id = ?').bind(dst.id, src.id),
         this.env.DB.prepare('DELETE FROM doc_tags WHERE tag_id = ?').bind(src.id),
+        // Re-point any legacy tasks.category_id FK from src→dst before deleting src, or the
+        // delete FK-aborts on old data (PLNR-108) — mirrors the task_tags re-point above.
+        this.env.DB.prepare('UPDATE tasks SET category_id = ? WHERE category_id = ?').bind(dst.id, src.id),
         this.env.DB.prepare('DELETE FROM tags WHERE id = ?').bind(src.id),
       ]);
       await this.emit(actor, 'tag.merged', 'tag', dst.id, {
@@ -1458,6 +1461,9 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.env.DB.batch([
         this.env.DB.prepare('DELETE FROM task_tags WHERE tag_id = ?').bind(tagId),
         this.env.DB.prepare('DELETE FROM doc_tags WHERE tag_id = ?').bind(tagId),
+        // Detach any legacy tasks.category_id FK to this tag first, or the delete FK-aborts
+        // on old data (PLNR-108). task_tags already carries the assignment; nulling loses nothing.
+        this.env.DB.prepare('UPDATE tasks SET category_id = NULL WHERE category_id = ?').bind(tagId),
         this.env.DB.prepare('DELETE FROM tags WHERE id = ?').bind(tagId),
       ]);
       await this.emit(actor, 'tag.deleted', 'tag', tagId, { name: tag.name });
@@ -1799,10 +1805,14 @@ export class ProjectRoom extends DurableObject<Env> {
       const proj = await this.env.DB.prepare('SELECT id, key, name FROM projects WHERE id = ?').bind(this.projectId).first<{ id: string; key: string; name: string }>();
       if (!proj) throw new Error('project not found');
       const pid = this.projectId;
-      // R2: every attachment on any task in the project.
+      // R2: every attachment on any task in the project. Snapshot the keys now, but delete
+      // the blobs only AFTER the D1 batch commits (PLNR-108): the batch is atomic, so a
+      // FK abort rolls it back — deleting blobs first would strand a live project whose
+      // attachment rows point at bytes that no longer exist.
+      let r2Keys: string[] = [];
       if (this.env.FILES) {
         const { results } = await this.env.DB.prepare('SELECT a.r2_key AS key FROM attachments a JOIN tasks t ON t.id = a.task_id WHERE t.project_id = ?').bind(pid).all<{ key: string }>();
-        for (const a of results) await this.env.FILES.delete(a.key).catch(() => {});
+        r2Keys = results.map((r) => r.key);
       }
       // Snapshot the searchable ids before the rows go — their vectors are dropped after.
       const [vecTasks, vecDocs, vecPlans] = await Promise.all([
@@ -1827,7 +1837,6 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM phase_gates WHERE phase_id IN (SELECT id FROM phases WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ?))').bind(pid),
         this.env.DB.prepare('DELETE FROM phases WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare('DELETE FROM plans WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('DELETE FROM tags WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM docs WHERE project_id = ?').bind(pid),
         this.env.DB.prepare("UPDATE agents SET project_id = NULL, status = 'offline' WHERE project_id = ?").bind(pid),
         // Runs are project-scoped → delete (with any steer-delivery rows keyed to them).
@@ -1839,10 +1848,15 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('UPDATE runners SET project_id = NULL WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('UPDATE tasks SET parent_task_id = NULL WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM tasks WHERE project_id = ?').bind(pid),
+        // Tags go AFTER tasks (PLNR-108): the legacy tasks.category_id column still holds a
+        // FK to tags(id) on old data, so dropping tags while tasks exist FK-aborts the batch.
+        this.env.DB.prepare('DELETE FROM tags WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM milestones WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM boards WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM projects WHERE id = ?').bind(pid),
       ]);
+      // Batch committed — now the attachment rows are gone, so it is safe to drop their blobs.
+      if (this.env.FILES) for (const key of r2Keys) await this.env.FILES.delete(key).catch(() => {});
       await this.ctx.storage.deleteAlarm().catch(() => {});
       this.dropSearch('task', ...vecTasks.results.map((r) => r.id));
       this.dropSearch('doc', ...vecDocs.results.map((r) => r.id));
