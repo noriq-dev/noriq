@@ -817,8 +817,21 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       addDocIds: z.array(z.string()).optional().describe('Link these docs, keeping existing links'),
       removeDocIds: z.array(z.string()).optional().describe('Unlink these docs, keeping the rest'),
     },
-    tool(async ({ projectId, taskId, ...patch }) =>
-      room(env, projectId).updateTask(projectId, actor, await resolveTaskId(env, projectId, taskId), patch)),
+    tool(async ({ projectId, taskId, ...patch }) => {
+      // A runner-spawned agent must not move its task's status (PLNR-192). RUN-83 took
+      // release_task off the build floor so the RUN's terminal outcome owns the move
+      // (settleAnchorTask: gate passed → review, failed → failed) — but this field was the
+      // adjacent door: a builder that "finished" moved its task to review, the gate then
+      // failed, and the settle's don't-stomp-a-human guard left the task stranded in review.
+      // Same discriminator as the RUN-47 tool floor; copilots and humans are unchanged.
+      if (agent.kind === 'agent' && patch.status !== undefined) {
+        throw new Error(
+          "run agents don't set task status: your run's outcome moves the task when it ends " +
+            '(gate passed → review, failed → failed). Drop the status field; the other edits are fine.',
+        );
+      }
+      return room(env, projectId).updateTask(projectId, actor, await resolveTaskId(env, projectId, taskId), patch);
+    }),
   );
 
   defineTool(

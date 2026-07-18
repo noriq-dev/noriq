@@ -2508,7 +2508,7 @@ export class ProjectRoom extends DurableObject<Env> {
       // gate ran, so a gate FAILURE stranded the task in `review`. Settle it here instead, before
       // the pump reads task state below.
       if (isTerminalRunStatus(to) && run.kind === 'build' && run.anchor_type === 'task' && run.anchor_id) {
-        await this.settleAnchorTask(run.anchor_id, to, now);
+        await this.settleAnchorTask(run.anchor_id, to, now, agentId);
       }
       await this.emit(actor, 'run.status_changed', 'run', runId, { from: run.status, to, reason: patch.reason ?? null });
       // A terminal run is the plan-dispatch pump's main wake-up (PLNR-170): it freed a slot,
@@ -2542,7 +2542,13 @@ export class ProjectRoom extends DurableObject<Env> {
    * Guarded to a task the run still owns (`in_progress`/`claimed`), so a human who moved it first
    * is never stomped. The claim is cleared either way — the run is over.
    */
-  private async settleAnchorTask(taskId: string, outcome: string, now: string): Promise<void> {
+  private async settleAnchorTask(
+    taskId: string,
+    outcome: string,
+    now: string,
+    /** The run's agent, whose claim is released regardless of the status guard (PLNR-192). */
+    agentId: string | null,
+  ): Promise<void> {
     const owned = "status IN ('in_progress','claimed')";
     const clear = 'claimed_by = NULL, claim_expires_at = NULL';
     if (outcome === 'done') {
@@ -2558,6 +2564,19 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.env.DB.prepare(
         `UPDATE tasks SET status = 'todo', failed_at = NULL, ${clear}, updated_at = ? WHERE id = ? AND ${owned}`,
       ).bind(now, taskId).run();
+    }
+    // The run's own claim dies with the run even when the status guard above refused
+    // (PLNR-192): the agent is retired and its token revoked, so a claim it still holds can
+    // only dangle until the TTL reaper. Scoped to THIS run's agent — a human who restatused
+    // the task keeps their status, and a fresh claim someone else took is not this run's to
+    // clear.
+    if (agentId) {
+      await this.env.DB.prepare(
+        `UPDATE tasks SET ${clear}, updated_at = ? WHERE id = ? AND claimed_by = ?`,
+      ).bind(now, taskId, agentId).run();
+      await this.env.DB.prepare(
+        'UPDATE claims SET released_at = ? WHERE task_id = ? AND agent_id = ? AND released_at IS NULL',
+      ).bind(now, taskId, agentId).run();
     }
   }
 
