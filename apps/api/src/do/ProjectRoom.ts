@@ -646,12 +646,17 @@ export class ProjectRoom extends DurableObject<Env> {
             .bind(patch.parentTaskId, patch.parentTaskId, this.projectId).first<{ id: string }>();
           if (!parent) throw new Error(`parent task ${patch.parentTaskId} not found in this project`);
           parentId = parent.id;
-          let cursor: string | null = parentId;
-          while (cursor) {
-            if (cursor === task.id) throw new Error('cannot re-parent a task under itself or a descendant (would create a cycle)');
-            const anc: { p: string | null } | null = await this.env.DB.prepare('SELECT parent_task_id AS p FROM tasks WHERE id = ?').bind(cursor).first<{ p: string | null }>();
-            cursor = anc?.p ?? null;
-          }
+          // Cycle guard: walk the new parent's ancestry (itself included) looking for task.id.
+          // A self-terminating recursive CTE like addDependency — UNION dedups, so a PRE-EXISTING
+          // cycle in the data (A→B→A from a restore/direct write) terminates instead of spinning
+          // forever inside blockConcurrencyWhile and wedging the DO (PLNR-110).
+          const { results } = await this.env.DB.prepare(
+            `WITH RECURSIVE up(id) AS (
+               SELECT ?
+               UNION SELECT t.parent_task_id FROM tasks t JOIN up ON t.id = up.id WHERE t.parent_task_id IS NOT NULL)
+             SELECT id FROM up WHERE id = ?`,
+          ).bind(parentId, task.id).all();
+          if (results.length) throw new Error('cannot re-parent a task under itself or a descendant (would create a cycle)');
         }
         sets.push('parent_task_id = ?');
         binds.push(parentId);
