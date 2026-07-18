@@ -44,6 +44,15 @@
 
   // Daily D1 backup to R2 at 06:00 UTC (PLNR-21). No-op until R2 (FILES) is bound;
   // safe to keep enabled. Snapshots land under backups/ — see BACKUP.md to restore.
+  // Semantic search (PLNR-184). AI = Workers AI embeddings (no provisioning needed).
+  // VECTORIZE is opt-in: create the index first, then uncomment (or add it to your
+  // wrangler.production.jsonc):
+  //   wrangler vectorize create noriq-search --dimensions=1024 --metric=cosine
+  //   wrangler vectorize create-metadata-index noriq-search --property-name=projectId --type=string
+  // Without both bindings, search transparently degrades to keyword matching.
+  "ai": { "binding": "AI" },
+  // "vectorize": [{ "binding": "VECTORIZE", "index_name": "noriq-search" }],
+
   "triggers": { "crons": ["0 6 * * *"] },
 
   "observability": { "enabled": true }

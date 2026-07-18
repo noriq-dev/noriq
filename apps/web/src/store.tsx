@@ -667,9 +667,9 @@ export function useAppStore() {
       refresh();
     },
 
-    async answerSignal(signalId: string, response: string) {
-      if (!pidRef.current || !response.trim()) return;
-      await api.answerSignal(pidRef.current, signalId, response.trim());
+    async answerSignal(signalId: string, response: string, answers?: import('./api').ApiSignalAnswer[]) {
+      if (!pidRef.current || (!response.trim() && !answers?.length)) return;
+      await api.answerSignal(pidRef.current, signalId, response.trim(), answers);
       refresh();
     },
 

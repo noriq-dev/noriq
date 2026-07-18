@@ -63,6 +63,20 @@ order them accordingly. Never tag with status, type, or priority words (\`bug\`,
 \`in-progress\`, \`p1\`, …) — those concepts live in dedicated fields and the server
 rejects them as tags.
 
+## Finding things
+
+Large projects hold hundreds of tasks, docs and plans — search, don't scroll, and
+**search before you file**: the task or doc you are about to create may already exist.
+
+- \`semantic_search\` — find by MEANING across tasks, docs AND plans ("how do we
+  handle payment retries" lands on the retry design doc and its tasks even when no
+  exact words match). Your first move when orienting on unfamiliar ground.
+- \`search_tasks\` — filter tasks by attributes (status, tag, holder, milestone,
+  overdue, exact substring). The two compose: discover with semantic_search, then
+  narrow with filters.
+- \`list_docs\` / \`get_project\` — the browsable indexes, when you want the shape of
+  the whole rather than an answer to a question.
+
 ## Human steering
 
 Humans post comments of kind **question** (answer it, keep working) and
@@ -73,6 +87,13 @@ When **you** need the human, pick the right channel: \`request_input\` to block 
 decision (tie it to the task), \`raise_alert\` when something is wrong and needs attention,
 \`send_message\` for a narrative progress update that wants no answer. Don't bury a blocking
 question inside a \`send_message\` — it reads as status and no one will reply.
+
+A \`request_input\` gate carries up to four typed questions in one park — each is
+pick-one, pick-several, freeform text, a number, or yes/no (\`kind\`), and the answers
+come back per-question. Ask everything the decision needs in round one; if an answer
+genuinely raises a new question, thread the next round with \`followUpTo\` (the prior
+gate id) — the human sees the earlier Q&A as context and the same task parks again.
+Rounds are for real follow-ups, not for drip-feeding questions you could have batched.
 
 ## Planning
 
@@ -109,10 +130,21 @@ directed delegation instead of releasing into the pool. Check progress with
 
 ## Project docs
 
-Projects carry reference docs — conventions, architecture notes, decisions. \`list_docs\`
-shows the index (check it before working unfamiliar ground); \`get_doc\` reads one.
-When you establish something durable the next agent should know, write it down with
-\`create_doc\` (or revise with \`update_doc\`) instead of leaving it buried in a comment.
+Projects carry a knowledge base of reference docs, and docs follow a hard contract:
+**a doc is a static, complete entity stating explicit design decisions and facts.**
+Nothing open-ended survives the write seam — TBD/TODO markers, open questions, and
+"we should discuss" phrasing are rejected with the offending lines listed. If a thing
+is still undecided it is not doc material: get the decision (\`request_input\`) or
+track the work (a task), then write the doc stating the outcome.
+
+\`list_docs\` shows the index (check it before working unfamiliar ground); \`get_doc\`
+reads one, including the tasks that cite it. Tasks and docs link both ways: pass
+\`docIds\` when creating or updating a task to cite the docs it implements or must
+follow, and READ a task's related docs (\`get_task\` → \`docs\`) before starting it —
+they are the design decisions your work is expected to honor. When you establish
+something durable the next agent should know, \`create_doc\` the outcome (or bring an
+existing doc to the current truth with \`update_doc\`) instead of leaving it buried in
+a comment.
 
 ## Git
 

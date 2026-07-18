@@ -11,7 +11,7 @@ import { confirm } from './Dialog';
 interface Doc { id: string; name: string; description: string; body: string; authorKind: string; authorName: string; updatedAt: string }
 
 export function DocsView({ store }: { store: AppStore }) {
-  const { currentPid } = store;
+  const { currentPid, snapshot, actions } = store;
   const [docs, setDocs] = useState<Doc[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
@@ -20,9 +20,23 @@ export function DocsView({ store }: { store: AppStore }) {
   const [eBody, setEBody] = useState('');
 
   const load = () => api.docs(currentPid).then((r) => { setDocs(r.docs); }).catch(() => {});
-  useEffect(() => { setSelected(null); setEditing(false); load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [currentPid]);
+  useEffect(() => {
+    // Deep link from the palette / task drawer (PLNR-186): open a specific doc on arrival.
+    const hint = sessionStorage.getItem('noriq.openDoc');
+    sessionStorage.removeItem('noriq.openDoc');
+    setSelected(hint || null);
+    setEditing(false);
+    load();
+    /* eslint-disable-next-line react-hooks/exhaustive-deps */
+  }, [currentPid]);
 
   const sel = docs.find((d) => d.id === selected) ?? null;
+  // Tasks citing the selected doc (PLNR-182) — from the live snapshot's link pairs.
+  const linkedTasks = sel
+    ? (snapshot?.taskDocs ?? []).filter((l) => l.docId === sel.id)
+        .map((l) => (snapshot?.tasks ?? []).find((t) => t.id === l.taskId))
+        .filter((t): t is NonNullable<typeof t> => !!t)
+    : [];
   const startNew = () => { setSelected(null); setEName(''); setEDesc(''); setEBody(''); setEditing(true); };
   const startEdit = () => { if (!sel) return; setEName(sel.name); setEDesc(sel.description); setEBody(sel.body); setEditing(true); };
   const save = async () => {
@@ -109,6 +123,24 @@ export function DocsView({ store }: { store: AppStore }) {
                 delete
               </Button>
             </div>
+            {linkedTasks.length > 0 && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginBottom: 14 }}>
+                <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)', textTransform: 'uppercase', letterSpacing: '.05em' }}>
+                  cited by {linkedTasks.length} task{linkedTasks.length === 1 ? '' : 's'}
+                </span>
+                {linkedTasks.map((t) => (
+                  <button
+                    key={t.id}
+                    onClick={() => actions.openTask(t.id)}
+                    className="hover-border"
+                    style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 6, background: 'var(--w-02)', border: '1px solid var(--w-07)', borderRadius: 7, padding: '3px 9px', color: 'var(--text-soft)', fontSize: 11 }}
+                  >
+                    <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>{t.key}</span>
+                    <span style={{ maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.title}</span>
+                  </button>
+                ))}
+              </div>
+            )}
             <Markdown source={sel.body || '_empty_'} />
           </div>
         ) : (

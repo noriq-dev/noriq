@@ -9,6 +9,7 @@ import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot } from './backup';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, verifyPassword } from './lib/util';
 import { taskSearchFilters } from './lib/search';
+import { search, searchBackend, reindexProject, type SearchKind } from './search';
 import { verifyUploadToken } from './lib/upload-token';
 import { USER_PROJECT_WHERE, taskWireStatus, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
 import type { Actor, RunView } from './do/ProjectRoom';
@@ -530,7 +531,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
   if (!visible) return c.json({ error: 'not found' }, 404);
   // Auto-archive done tasks untouched for >24h whenever the project is viewed.
   await room(c.env, pid).sweepArchive(pid).catch(() => {});
-  const [project, tasks, deps, agents, events, milestones, boards, plans, phases, phaseTasks, tags, taskTags, signals] = await Promise.all([
+  const [project, tasks, deps, agents, events, milestones, boards, plans, phases, phaseTasks, tags, taskTags, signals, taskDocs] = await Promise.all([
     c.env.DB.prepare('SELECT id, key, name, description, claim_ttl_seconds AS claimTtlSeconds, repo_url AS repoUrl FROM projects WHERE id = ?')
       .bind(pid).first(),
     // PLNR-150: archived tasks ship too, flagged by archivedAt. Archiving is a *board
@@ -575,12 +576,13 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     c.env.DB.prepare('SELECT tt.task_id AS taskId, tt.tag_id AS tagId FROM task_tags tt JOIN tasks t ON t.id = tt.task_id WHERE t.project_id = ?').bind(pid).all(),
     c.env.DB.prepare(
       `SELECT s.id, s.task_id AS taskId, t.key AS taskKey, s.agent_id AS agentId, s.agent_name AS agentName,
-              s.type, s.severity, s.title, s.body, s.options, s.questions, s.created_at AS createdAt
+              s.type, s.severity, s.title, s.body, s.options, s.questions, s.follow_up_to AS followUpTo, s.created_at AS createdAt
        FROM signals s LEFT JOIN tasks t ON t.id = s.task_id
        WHERE s.project_id = ? AND s.status = 'open' ORDER BY
          CASE s.type WHEN 'input_request' THEN 0 ELSE 1 END,
          CASE s.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, s.created_at DESC`,
     ).bind(pid).all(),
+    c.env.DB.prepare('SELECT td.task_id AS taskId, td.doc_id AS docId FROM task_docs td JOIN tasks t ON t.id = td.task_id WHERE t.project_id = ?').bind(pid).all(),
   ]);
   if (!project) return c.json({ error: 'not found' }, 404);
   return c.json({
@@ -595,6 +597,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     phaseTasks: phaseTasks.results,
     tags: tags.results,
     taskTags: taskTags.results,
+    taskDocs: taskDocs.results,
     signals: signals.results.map((s) => ({
       ...s,
       options: s.options ? JSON.parse(String(s.options)) : null,
@@ -640,7 +643,7 @@ app.get('/api/tasks/:tid', userAuth, async (c) => {
   // wire SELECTs — a task with failed_at set reads as 'failed'. failedAt is already present.
   if (task.failed_at) task.status = 'failed';
   task.failedAt = task.failed_at;
-  const [comments, refs, attachments, taskTagRows] = await Promise.all([
+  const [comments, refs, attachments, taskTagRows, docRows] = await Promise.all([
     c.env.DB.prepare(
       `SELECT id, author_kind AS authorKind, author_id AS authorId, kind, body, status, parent_comment_id AS parentCommentId, created_at AS createdAt
        FROM comments WHERE task_id = ? ORDER BY created_at`,
@@ -648,8 +651,9 @@ app.get('/api/tasks/:tid', userAuth, async (c) => {
     c.env.DB.prepare('SELECT kind, ref, url, state FROM task_refs WHERE task_id = ?').bind(tid).all(),
     c.env.DB.prepare('SELECT id, filename, content_type AS contentType, size, uploaded_by_kind AS uploaderKind, uploaded_by AS uploadedBy, created_at AS createdAt FROM attachments WHERE task_id = ? ORDER BY created_at').bind(tid).all(),
     c.env.DB.prepare('SELECT tag_id AS tagId FROM task_tags WHERE task_id = ?').bind(tid).all(),
+    c.env.DB.prepare('SELECT d.id, d.name, d.description FROM task_docs td JOIN docs d ON d.id = td.doc_id WHERE td.task_id = ? ORDER BY d.name').bind(tid).all(),
   ]);
-  return c.json({ task, comments: comments.results, refs: refs.results, attachments: attachments.results, tagIds: taskTagRows.results.map((r) => r.tagId) });
+  return c.json({ task, comments: comments.results, refs: refs.results, attachments: attachments.results, tagIds: taskTagRows.results.map((r) => r.tagId), docs: docRows.results });
 });
 
 // --- UI write API (all writes go through ProjectRoom; a human is just another actor) ---
@@ -750,11 +754,44 @@ app.delete('/api/projects/:pid/tasks/:tid/dependencies/:depId', userAuth, async 
 });
 
 // Signals — human answers a decision gate / acknowledges an alert (PLNR-67).
+// PLNR-185: `answers` is the structured per-question form ([{question, answer}], answer =
+// string | string[] | number | boolean); `response` stays the plain-text form. Either works.
 app.post('/api/projects/:pid/signals/:sid/answer', userAuth, async (c) => {
-  const { response } = await c.req.json<{ response: string }>();
-  if (!response?.trim()) return c.json({ error: 'response required' }, 400);
-  const result = await room(c.env, c.req.param('pid')!).answerSignal(c.req.param('pid')!, humanActor(c), c.req.param('sid')!, response.trim());
+  const { response, answers } = await c.req.json<{
+    response?: string;
+    answers?: Array<{ question: string; answer: string | string[] | number | boolean }>;
+  }>();
+  if (!response?.trim() && !answers?.length) return c.json({ error: 'response or answers required' }, 400);
+  const result = await room(c.env, c.req.param('pid')!).answerSignal(
+    c.req.param('pid')!, humanActor(c), c.req.param('sid')!, response?.trim() ?? '', answers,
+  );
   return c.json(result);
+});
+
+// The rounds of a threaded gate (PLNR-185): the signal itself plus every ancestor it
+// follows up on, oldest first — the UI renders prior Q&A above the open round.
+app.get('/api/projects/:pid/signals/:sid/thread', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const chain: unknown[] = [];
+  let cursor: string | null = c.req.param('sid')!;
+  for (let depth = 0; cursor && depth < 20; depth++) {
+    const row: { followUpTo: string | null } | null = await c.env.DB.prepare(
+      `SELECT id, task_id AS taskId, agent_name AS agentName, title, body, options, questions, status,
+              response, response_json AS responseJson, follow_up_to AS followUpTo, created_at AS createdAt, resolved_at AS resolvedAt
+       FROM signals WHERE id = ? AND project_id = ?`,
+    ).bind(cursor, pid).first();
+    if (!row) break;
+    const r = row as Record<string, unknown>;
+    chain.unshift({
+      ...r,
+      options: r.options ? JSON.parse(String(r.options)) : null,
+      questions: r.questions ? JSON.parse(String(r.questions)) : null,
+      responseJson: r.responseJson ? JSON.parse(String(r.responseJson)) : null,
+    });
+    cursor = row.followUpTo;
+  }
+  if (!chain.length) return c.json({ error: 'not found' }, 404);
+  return c.json({ thread: chain });
 });
 
 app.post('/api/projects/:pid/signals/:sid/acknowledge', userAuth, async (c) => {
@@ -799,6 +836,29 @@ app.patch('/api/projects/:pid/docs/:did', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).updateDoc(c.req.param('pid')!, humanActor(c), c.req.param('did')!, await c.req.json())));
 app.delete('/api/projects/:pid/docs/:did', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).deleteDoc(c.req.param('pid')!, humanActor(c), c.req.param('did')!)));
+
+// Project search (PLNR-184) — semantic when the AI+VECTORIZE bindings exist, keyword
+// otherwise; `mode` in the response says which ran. Covers tasks, docs and plans.
+app.get('/api/projects/:pid/search', userAuth, async (c) => {
+  const q = c.req.query('q')?.trim();
+  if (!q) return c.json({ error: 'q required' }, 400);
+  const kindsParam = c.req.query('kinds')?.split(',').filter((k): k is SearchKind => k === 'task' || k === 'doc' || k === 'plan');
+  const limit = Math.min(Math.max(parseInt(c.req.query('limit') ?? '12', 10) || 12, 1), 50);
+  const { mode, results } = await search(c.env, {
+    q, projectIds: [c.req.param('pid')!], kinds: kindsParam?.length ? kindsParam : undefined, limit,
+  });
+  return c.json({ mode, results });
+});
+
+// Backfill/repair the vector index (PLNR-184): walks the project's tasks/docs/plans and
+// re-embeds them. For content that predates the bindings (or drifted). Batched — call
+// again while `remaining > 0`. 503 without an embeddings backend.
+app.post('/api/projects/:pid/search/reindex', userAuth, async (c) => {
+  const backend = searchBackend(c.env);
+  if (!backend) return c.json({ error: 'no embeddings backend — AI + VECTORIZE bindings required' }, 503);
+  const offset = Math.max(parseInt(c.req.query('offset') ?? '0', 10) || 0, 0);
+  return c.json(await reindexProject(c.env, backend, c.req.param('pid')!, offset));
+});
 
 // Archive / restore a plan (PLNR-148) — display-only; see setPlanArchived.
 app.post('/api/projects/:pid/plans/:plid/archive', userAuth, async (c) =>

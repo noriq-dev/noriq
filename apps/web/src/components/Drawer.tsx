@@ -4,7 +4,7 @@ import type { AppStore } from '../store';
 import { api, type ApiAgentEvent } from '../api';
 import { KIND_META, statusMeta, verbColors } from '../design';
 import { AvatarChip, MonoTag, SectionLabel } from './bits';
-import { QuestionForm } from './QuestionForm';
+import { QuestionForm, SignalThreadHistory } from './QuestionForm';
 import { Markdown } from './Markdown';
 import { Composer } from './Composer';
 import { Button, Select, TextArea, TextInput } from './ui';
@@ -30,6 +30,8 @@ export function Drawer({ store }: { store: AppStore }) {
   const [addingDep, setAddingDep] = useState(false);
   const [depError, setDepError] = useState('');
   const [attachments, setAttachments] = useState<Array<{ id: string; filename: string; size: number; contentType?: string; createdAt: string }>>([]);
+  const [taskDocs, setTaskDocs] = useState<Array<{ id: string; name: string; description: string }>>([]);
+  const [allDocs, setAllDocs] = useState<Array<{ id: string; name: string }>>([]);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const allTags = snapshot?.tags ?? [];
@@ -39,9 +41,17 @@ export function Drawer({ store }: { store: AppStore }) {
     setEditing(false);
     if (selectedTaskId) {
       api.taskEvents(selectedTaskId).then((r) => setTimeline(r.events)).catch(() => setTimeline([]));
-      api.taskDetail(selectedTaskId).then((r) => setAttachments(r.attachments)).catch(() => setAttachments([]));
+      api.taskDetail(selectedTaskId)
+        .then((r) => { setAttachments(r.attachments); setTaskDocs(r.docs ?? []); })
+        .catch(() => { setAttachments([]); setTaskDocs([]); });
+      api.docs(currentPid).then((r) => setAllDocs(r.docs)).catch(() => setAllDocs([]));
     }
-  }, [selectedTaskId]);
+  }, [selectedTaskId, currentPid]);
+
+  const reloadDocs = async (tid: string) => {
+    const detail = await api.taskDetail(tid);
+    setTaskDocs(detail.docs ?? []);
+  };
 
   if (!task) return null;
 
@@ -398,8 +408,9 @@ export function Drawer({ store }: { store: AppStore }) {
                       </div>
                       <div style={{ fontSize: 12.5, fontWeight: 600 }}>{s.title}</div>
                       {s.body && <div style={{ fontSize: 11.5, color: 'var(--text-mid)', marginTop: 3, lineHeight: 1.5 }}><Markdown source={s.body} compact /></div>}
+                      {gate && s.followUpTo && <SignalThreadHistory pid={currentPid} signalId={s.id} />}
                       {gate && s.questions && s.questions.length > 0 && (
-                        <QuestionForm questions={s.questions} onSubmit={(r) => actions.answerSignal(s.id, r)} />
+                        <QuestionForm questions={s.questions} onSubmit={(r, a) => actions.answerSignal(s.id, r, a)} />
                       )}
                       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
                         {gate && !(s.questions && s.questions.length > 0) ? (
@@ -417,6 +428,54 @@ export function Drawer({ store }: { store: AppStore }) {
                   );
                 })}
               </div>
+            </div>
+          )}
+
+          {/* related docs (PLNR-182) — the design/decision docs this task implements */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 8 }}>
+            <SectionLabel>Related docs · {taskDocs.length}</SectionLabel>
+            <div style={{ flex: 1 }} />
+            {allDocs.some((d) => !taskDocs.some((td) => td.id === d.id)) && (
+              <select
+                value=""
+                onChange={async (e) => {
+                  if (!e.target.value) return;
+                  await api.updateTask(currentPid, task.id, { addDocIds: [e.target.value] });
+                  await reloadDocs(task.id);
+                }}
+                style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)', border: '1px dashed var(--w-15)', padding: '3px 6px', borderRadius: 6, background: 'transparent', maxWidth: 140 }}
+              >
+                <option value="">+ link doc</option>
+                {allDocs.filter((d) => !taskDocs.some((td) => td.id === d.id)).map((d) => (
+                  <option key={d.id} value={d.id}>{d.name}</option>
+                ))}
+              </select>
+            )}
+          </div>
+          {taskDocs.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginBottom: 18 }}>
+              {taskDocs.map((d) => (
+                <div key={d.id} style={{ display: 'flex', alignItems: 'center', gap: 8, borderRadius: 8, background: 'var(--w-02)', border: '1px solid var(--w-06)', padding: '7px 10px' }}>
+                  <span style={{ fontSize: 12 }}>📘</span>
+                  <button
+                    onClick={() => { sessionStorage.setItem('noriq.openDoc', d.id); actions.closeTask(); actions.setView('docs'); }}
+                    style={{ cursor: 'pointer', background: 'transparent', border: 'none', color: 'var(--text)', fontSize: 12, padding: 0, textAlign: 'left', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                  >
+                    {d.name}
+                  </button>
+                  {d.description && <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.description}</span>}
+                  <div style={{ flex: 1 }} />
+                  <button
+                    onClick={async () => {
+                      await api.updateTask(currentPid, task.id, { removeDocIds: [d.id] });
+                      await reloadDocs(task.id);
+                    }}
+                    style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--red-soft)', background: 'transparent', border: 'none' }}
+                  >
+                    ✕
+                  </button>
+                </div>
+              ))}
             </div>
           )}
 

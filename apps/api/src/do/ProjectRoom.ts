@@ -4,6 +4,8 @@ import { newId, nowIso } from '../lib/util';
 import { userCanAccessProject } from '../lib/visibility';
 import { unfinishedDeps as unfinishedDepsLib } from '../lib/claimability';
 import { needsOutOfBand, sendSignalEmail, sendSignalWebhook } from '../lib/notify-out';
+import { requireDecisionOnlyDoc } from '../lib/doclint';
+import { searchBackend, indexEntity, removeEntity, type SearchKind } from '../search';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
 import { RunKind, AgentTool, RunStatus, type RunPhase, isTerminalRunStatus } from '@noriq-dev/shared';
 
@@ -42,6 +44,8 @@ export interface CreateTaskInput {
   type?: string;
   /** Board this task lands on; defaults to the project's default board. */
   boardId?: string | null;
+  /** Related project docs (PLNR-182) — validated against this project's docs. */
+  docIds?: string[];
 }
 
 export interface TaskPatch {
@@ -65,6 +69,11 @@ export interface TaskPatch {
   category?: string | null;
   type?: string;
   order?: number;
+  /** Replace the task's related-doc set (PLNR-182). */
+  docIds?: string[];
+  /** Non-destructive doc-link edits, mirroring addTags/removeTags. */
+  addDocIds?: string[];
+  removeDocIds?: string[];
 }
 
 type TaskRow = {
@@ -444,6 +453,9 @@ export class ProjectRoom extends DurableObject<Env> {
         : (await this.parentBoardId(input.parentTaskId))
           ?? (await this.actorRepoBoardId(actor))
           ?? (await this.defaultBoardId(pid));
+      // Doc links (PLNR-182) validate BEFORE the insert batch so a bad doc id fails the
+      // whole create cleanly instead of leaving a task without its intended links.
+      const docIds = await this.requireProjectDocs(input.docIds);
       const stmts = [
         this.env.DB.prepare(
           `INSERT INTO tasks (id, project_id, key, milestone_id, board_id, parent_task_id, title, body, status, type, priority, estimate, due_at, "order", created_at, updated_at)
@@ -456,12 +468,16 @@ export class ProjectRoom extends DurableObject<Env> {
           this.env.DB.prepare('INSERT OR IGNORE INTO dependencies (task_id, depends_on_task_id) VALUES (?, ?)').bind(id, dep),
         );
       }
+      for (const docId of docIds) {
+        stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO task_docs (task_id, doc_id) VALUES (?, ?)').bind(id, docId));
+      }
       await this.env.DB.batch(stmts);
       const tagNames = [...(input.tags ?? []), ...(input.category ? [input.category] : [])];
       if (tagNames.length) await this.setTaskTags(pid, actor, id, tagNames);
       await this.emit(actor, 'task.created', 'task', id, {
         key, title: input.title, parentTaskId: input.parentTaskId ?? null,
       });
+      this.reindexSearch('task', id);
       return { id, key };
     
     });
@@ -481,6 +497,7 @@ export class ProjectRoom extends DurableObject<Env> {
         // Tag-only updates still emit below via the fields list; ensure at least one emit.
         if (Object.keys(patch).filter((k) => k !== 'tags').length === 0) {
           await this.emit(actor, 'task.updated', 'task', taskId, { key: task.key, fields: ['tags'] });
+          this.reindexSearch('task', taskId);
           return { ok: true, key: task.key };
         }
       }
@@ -505,6 +522,30 @@ export class ProjectRoom extends DurableObject<Env> {
         delete patch.removeTags;
         if (Object.keys(patch).length === 0) {
           await this.emit(actor, 'task.updated', 'task', taskId, { key: task.key, fields: ['tags'] });
+          return { ok: true, key: task.key };
+        }
+      }
+      // Doc links (PLNR-182), same shape as the tag edits: `docIds` replaces the set,
+      // addDocIds/removeDocIds edit it without clobbering. All ids validated project-local.
+      if (patch.docIds !== undefined || patch.addDocIds !== undefined || patch.removeDocIds !== undefined) {
+        const stmts = [];
+        if (patch.docIds !== undefined) {
+          const ids = await this.requireProjectDocs(patch.docIds);
+          stmts.push(this.env.DB.prepare('DELETE FROM task_docs WHERE task_id = ?').bind(taskId));
+          for (const d of ids) stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO task_docs (task_id, doc_id) VALUES (?, ?)').bind(taskId, d));
+        }
+        for (const d of await this.requireProjectDocs(patch.addDocIds)) {
+          stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO task_docs (task_id, doc_id) VALUES (?, ?)').bind(taskId, d));
+        }
+        for (const d of patch.removeDocIds ?? []) {
+          stmts.push(this.env.DB.prepare('DELETE FROM task_docs WHERE task_id = ? AND doc_id = ?').bind(taskId, d));
+        }
+        if (stmts.length) await this.env.DB.batch(stmts);
+        delete patch.docIds;
+        delete patch.addDocIds;
+        delete patch.removeDocIds;
+        if (Object.keys(patch).length === 0) {
+          await this.emit(actor, 'task.updated', 'task', taskId, { key: task.key, fields: ['docs'] });
           return { ok: true, key: task.key };
         }
       }
@@ -583,8 +624,9 @@ export class ProjectRoom extends DurableObject<Env> {
       } else {
         await this.emit(actor, 'task.updated', 'task', taskId, { key: task.key, fields: Object.keys(patch) });
       }
+      this.reindexSearch('task', taskId);
       return { ok: true, key: task.key };
-    
+
     });
   }
 
@@ -845,23 +887,38 @@ export class ProjectRoom extends DurableObject<Env> {
     input: {
       type: 'input_request' | 'alert'; taskId?: string | null; title: string; body?: string;
       options?: string[]; severity?: string;
-      /** Batched questions (PLNR-131) — structure for the UI; the answer comes back as one formatted string. */
-      questions?: Array<{ question: string; header?: string; multi?: boolean; options?: string[] }>;
+      /** Batched questions (PLNR-131, kinds PLNR-185) — structure for the UI. `kind`:
+       *  select (one of options) | multi (several) | text (freeform) | number | confirm
+       *  (yes/no). Legacy `multi: true` still reads as kind 'multi'. Answers come back
+       *  structured in response_json plus the derived formatted string in response. */
+      questions?: Array<{ question: string; header?: string; multi?: boolean; options?: string[]; kind?: 'select' | 'multi' | 'text' | 'number' | 'confirm' }>;
+      /** Threads a clarifying round onto an earlier gate (PLNR-185). Must name an
+       *  input_request in this project; the new gate inherits its task when taskId
+       *  is not given, so round two parks the same task round one did. */
+      followUpTo?: string | null;
     },
   )  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
-      const task = input.taskId ? await this.getTask(input.taskId) : null;
+      let parent: { id: string; taskId: string | null } | null = null;
+      if (input.type === 'input_request' && input.followUpTo) {
+        parent = await this.env.DB.prepare(
+          "SELECT id, task_id AS taskId FROM signals WHERE id = ? AND project_id = ? AND type = 'input_request'",
+        ).bind(input.followUpTo, this.projectId).first<{ id: string; taskId: string | null }>();
+        if (!parent) throw new Error(`followUpTo ${input.followUpTo} is not an input request in this project`);
+      }
+      const task = input.taskId ? await this.getTask(input.taskId) : (parent?.taskId ? await this.getTask(parent.taskId) : null);
       const id = newId('sig');
       const severity = input.type === 'input_request' ? 'info' : (input.severity ?? 'info');
       await this.env.DB.prepare(
-        `INSERT INTO signals (id, project_id, task_id, agent_id, agent_name, type, severity, title, body, options, questions, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)`,
+        `INSERT INTO signals (id, project_id, task_id, agent_id, agent_name, type, severity, title, body, options, questions, follow_up_to, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)`,
       ).bind(
         id, this.projectId, task?.id ?? null, actor.kind === 'agent' ? actor.id : null, actor.name,
         input.type, severity, input.title, input.body ?? null,
         input.options && input.options.length ? JSON.stringify(input.options) : null,
-        input.questions && input.questions.length ? JSON.stringify(input.questions) : null, nowIso(),
+        input.questions && input.questions.length ? JSON.stringify(input.questions) : null,
+        parent?.id ?? null, nowIso(),
       ).run();
 
       let parked = false;
@@ -911,8 +968,14 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
-  /** Human answers an input_request → unblocks its task (back to the queue) + notifies the requester. */
-  async answerSignal(projectId: string, actor: Actor, signalId: string, response: string)  {
+  /** Human answers an input_request → unblocks its task (back to the queue) + notifies
+   *  the requester. `answers` (PLNR-185) carries the structured per-question form; the
+   *  flat `response` string is derived from it when not given, so every downstream
+   *  reader (resume frames, notices, old clients) keeps working off text. */
+  async answerSignal(
+    projectId: string, actor: Actor, signalId: string, response: string,
+    answers?: Array<{ question: string; answer: string | string[] | number | boolean }>,
+  )  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const sig = await this.env.DB.prepare(
@@ -923,8 +986,12 @@ export class ProjectRoom extends DurableObject<Env> {
       ).bind(signalId, this.projectId).first<{ id: string; taskId: string | null; agentId: string | null; type: string; status: string; title: string; body: string | null }>();
       if (!sig) throw new Error('signal not found');
       if (sig.status !== 'open') return { ok: true, alreadyResolved: true };
-      await this.env.DB.prepare("UPDATE signals SET status = 'answered', response = ?, responder_id = ?, resolved_at = ? WHERE id = ?")
-        .bind(response, actor.id, nowIso(), signalId).run();
+      if (!response && answers?.length) {
+        const fmt = (a: string | string[] | number | boolean) => Array.isArray(a) ? a.join(', ') : String(a);
+        response = answers.map((a) => `${a.question} → ${fmt(a.answer)}`).join('\n');
+      }
+      await this.env.DB.prepare("UPDATE signals SET status = 'answered', response = ?, response_json = ?, responder_id = ?, resolved_at = ? WHERE id = ?")
+        .bind(response, answers?.length ? JSON.stringify(answers) : null, actor.id, nowIso(), signalId).run();
       // Return a parked task to the queue so the requester (or anyone) can resume it.
       let taskKey: string | null = null;
       if (sig.type === 'input_request' && sig.taskId) {
@@ -1123,6 +1190,56 @@ export class ProjectRoom extends DurableObject<Env> {
       .bind(boardId, this.projectId).first<{ id: string }>();
     if (!row) throw new Error(`board ${boardId} not found in this project (see get_project.boards)`);
     return row.id;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Search indexing (PLNR-184) — fire-and-forget from every content write seam.
+  // Never awaited on the write path and never throws: freshness is best-effort,
+  // and an instance without the AI/VECTORIZE bindings skips it entirely.
+  // ---------------------------------------------------------------------------
+
+  protected reindexSearch(kind: SearchKind, id: string): void {
+    const backend = searchBackend(this.env);
+    if (!backend) return;
+    void (async () => {
+      if (kind === 'task') {
+        const t = await this.env.DB.prepare(
+          `SELECT t.project_id AS pid, t.title, t.body,
+                  (SELECT GROUP_CONCAT(g.name, ' ') FROM task_tags tt JOIN tags g ON g.id = tt.tag_id WHERE tt.task_id = t.id) AS tags
+           FROM tasks t WHERE t.id = ?`,
+        ).bind(id).first<{ pid: string; title: string; body: string; tags: string | null }>();
+        if (t) await indexEntity(backend, { kind, id, projectId: t.pid, title: t.title, body: t.body, extra: t.tags });
+      } else if (kind === 'doc') {
+        const d = await this.env.DB.prepare('SELECT project_id AS pid, name, description, body FROM docs WHERE id = ?')
+          .bind(id).first<{ pid: string; name: string; description: string; body: string }>();
+        if (d) await indexEntity(backend, { kind, id, projectId: d.pid, title: d.name, body: d.body, extra: d.description });
+      } else {
+        const p = await this.env.DB.prepare('SELECT project_id AS pid, title, description, body FROM plans WHERE id = ?')
+          .bind(id).first<{ pid: string; title: string; description: string; body: string }>();
+        if (p) await indexEntity(backend, { kind, id, projectId: p.pid, title: p.title, body: p.body, extra: p.description });
+      }
+    })().catch(() => {});
+  }
+
+  protected dropSearch(kind: SearchKind, ...ids: string[]): void {
+    const backend = searchBackend(this.env);
+    if (!backend) return;
+    void (async () => { for (const id of ids) await removeEntity(backend, kind, id); })().catch(() => {});
+  }
+
+  /** Validate doc ids against THIS project's docs (PLNR-182): a typo or a foreign
+   *  project's doc id fails loudly with the full list of offenders. Returns the
+   *  deduplicated ids; [] for empty/undefined input. */
+  private async requireProjectDocs(docIds: string[] | undefined): Promise<string[]> {
+    const ids = [...new Set((docIds ?? []).filter(Boolean))];
+    if (!ids.length) return [];
+    const { results } = await this.env.DB.prepare(
+      `SELECT id FROM docs WHERE project_id = ? AND id IN (${ids.map(() => '?').join(',')})`,
+    ).bind(this.projectId, ...ids).all<{ id: string }>();
+    const found = new Set(results.map((r) => r.id));
+    const missing = ids.filter((d) => !found.has(d));
+    if (missing.length) throw new Error(`doc(s) not found in this project: ${missing.join(', ')} (see list_docs)`);
+    return ids;
   }
 
   /** The board a new subtask inherits (PLNR-181): its parent's, so a decomposed task's
@@ -1354,6 +1471,10 @@ export class ProjectRoom extends DurableObject<Env> {
       const { n: depCount } = (await this.env.DB.prepare(
         'SELECT COUNT(*) AS n FROM dependencies WHERE task_id = ? OR depends_on_task_id = ?',
       ).bind(task.id, task.id).first<{ n: number }>())!;
+      // Doc links are project-local (docs live in the source project) — severed like deps.
+      const { n: docLinkCount } = (await this.env.DB.prepare(
+        'SELECT COUNT(*) AS n FROM task_docs WHERE task_id = ?',
+      ).bind(task.id).first<{ n: number }>())!;
 
       const alloc = await this.env.DB.prepare(
         'UPDATE projects SET next_task_number = next_task_number + 1 WHERE id = ? RETURNING next_task_number AS next',
@@ -1366,6 +1487,7 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM dependencies WHERE task_id = ? OR depends_on_task_id = ?').bind(task.id, task.id),
         this.env.DB.prepare('DELETE FROM phase_tasks WHERE task_id = ?').bind(task.id),
         this.env.DB.prepare('DELETE FROM task_tags WHERE task_id = ?').bind(task.id),
+        this.env.DB.prepare('DELETE FROM task_docs WHERE task_id = ?').bind(task.id),
         this.env.DB.prepare(
           'UPDATE tasks SET project_id = ?, key = ?, milestone_id = NULL, board_id = ?, parent_task_id = NULL, "order" = ?, updated_at = ? WHERE id = ?',
         ).bind(toProjectId, newKey, boardId, num, nowIso(), task.id),
@@ -1394,7 +1516,8 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.emit(actor, 'task.moved', 'task', task.id, {
         key: task.key, toKey: newKey, toProjectId, title: task.title, droppedDependencies: depCount,
       });
-      return { ok: true, fromKey: task.key, key: newKey, projectId: toProjectId, droppedDependencies: depCount, tags: retagged };
+      this.reindexSearch('task', task.id); // metadata.projectId changed with the move
+      return { ok: true, fromKey: task.key, key: newKey, projectId: toProjectId, droppedDependencies: depCount, droppedDocLinks: docLinkCount, tags: retagged };
     });
   }
 
@@ -1414,11 +1537,13 @@ export class ProjectRoom extends DurableObject<Env> {
   async createDoc(projectId: string, actor: Actor, input: { name: string; description?: string; body?: string }) {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
+      requireDecisionOnlyDoc(input.body); // PLNR-183: docs state decisions, not questions
       const id = newId('doc');
       await this.env.DB.prepare(
         'INSERT INTO docs (id, project_id, name, description, body, author_kind, author_name) VALUES (?, ?, ?, ?, ?, ?, ?)',
       ).bind(id, this.projectId, input.name, input.description ?? '', input.body ?? '', actor.kind, actor.name).run();
       await this.emit(actor, 'doc.created', 'doc', id, { name: input.name });
+      this.reindexSearch('doc', id);
       return { id, name: input.name };
     });
   }
@@ -1429,6 +1554,7 @@ export class ProjectRoom extends DurableObject<Env> {
       const doc = await this.env.DB.prepare('SELECT id, name FROM docs WHERE id = ? AND project_id = ?')
         .bind(docId, this.projectId).first<{ id: string; name: string }>();
       if (!doc) throw new Error('doc not found in this project');
+      requireDecisionOnlyDoc(patch.body); // PLNR-183: docs state decisions, not questions
       const sets: string[] = [];
       const binds: unknown[] = [];
       if (patch.name !== undefined) { sets.push('name = ?'); binds.push(patch.name); }
@@ -1439,6 +1565,7 @@ export class ProjectRoom extends DurableObject<Env> {
       binds.push(nowIso(), docId);
       await this.env.DB.prepare(`UPDATE docs SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
       await this.emit(actor, 'doc.updated', 'doc', docId, { name: patch.name ?? doc.name, fields: Object.keys(patch) });
+      this.reindexSearch('doc', docId);
       return { ok: true };
     });
   }
@@ -1450,8 +1577,12 @@ export class ProjectRoom extends DurableObject<Env> {
       const doc = await this.env.DB.prepare('SELECT id, name FROM docs WHERE id = ? AND project_id = ?')
         .bind(docId, this.projectId).first<{ id: string; name: string }>();
       if (!doc) throw new Error('doc not found in this project');
-      await this.env.DB.prepare('DELETE FROM docs WHERE id = ?').bind(docId).run();
+      await this.env.DB.batch([
+        this.env.DB.prepare('DELETE FROM task_docs WHERE doc_id = ?').bind(docId),
+        this.env.DB.prepare('DELETE FROM docs WHERE id = ?').bind(docId),
+      ]);
       await this.emit(actor, 'doc.deleted', 'doc', docId, { name: doc.name });
+      this.dropSearch('doc', docId);
       return { ok: true };
     });
   }
@@ -1513,6 +1644,7 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM comments WHERE task_id = ?').bind(id),
         this.env.DB.prepare('DELETE FROM task_refs WHERE task_id = ?').bind(id),
         this.env.DB.prepare('DELETE FROM task_tags WHERE task_id = ?').bind(id),
+        this.env.DB.prepare('DELETE FROM task_docs WHERE task_id = ?').bind(id),
         this.env.DB.prepare('DELETE FROM attachments WHERE task_id = ?').bind(id),
         this.env.DB.prepare('DELETE FROM signals WHERE task_id = ?').bind(id),
         this.env.DB.prepare('UPDATE tasks SET parent_task_id = NULL WHERE parent_task_id = ?').bind(id),
@@ -1520,6 +1652,7 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM tasks WHERE id = ?').bind(id),
       ]);
       await this.emit(actor, 'task.deleted', 'task', id, { key: task.key, title: task.title });
+      this.dropSearch('task', id);
       return { ok: true, key: task.key };
     });
   }
@@ -1536,6 +1669,12 @@ export class ProjectRoom extends DurableObject<Env> {
         const { results } = await this.env.DB.prepare('SELECT a.r2_key AS key FROM attachments a JOIN tasks t ON t.id = a.task_id WHERE t.project_id = ?').bind(pid).all<{ key: string }>();
         for (const a of results) await this.env.FILES.delete(a.key).catch(() => {});
       }
+      // Snapshot the searchable ids before the rows go — their vectors are dropped after.
+      const [vecTasks, vecDocs, vecPlans] = await Promise.all([
+        this.env.DB.prepare('SELECT id FROM tasks WHERE project_id = ?').bind(pid).all<{ id: string }>(),
+        this.env.DB.prepare('SELECT id FROM docs WHERE project_id = ?').bind(pid).all<{ id: string }>(),
+        this.env.DB.prepare('SELECT id FROM plans WHERE project_id = ?').bind(pid).all<{ id: string }>(),
+      ]);
       const tasksSub = 'SELECT id FROM tasks WHERE project_id = ?';
       await this.env.DB.batch([
         this.env.DB.prepare(`DELETE FROM phase_tasks WHERE task_id IN (${tasksSub}) OR phase_id IN (SELECT id FROM phases WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ?))`).bind(pid, pid),
@@ -1543,6 +1682,7 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare(`DELETE FROM claims WHERE task_id IN (${tasksSub})`).bind(pid),
         this.env.DB.prepare(`DELETE FROM task_refs WHERE task_id IN (${tasksSub})`).bind(pid),
         this.env.DB.prepare(`DELETE FROM task_tags WHERE task_id IN (${tasksSub}) OR tag_id IN (SELECT id FROM tags WHERE project_id = ?)`).bind(pid, pid),
+        this.env.DB.prepare(`DELETE FROM task_docs WHERE task_id IN (${tasksSub}) OR doc_id IN (SELECT id FROM docs WHERE project_id = ?)`).bind(pid, pid),
         this.env.DB.prepare(`DELETE FROM comments WHERE task_id IN (${tasksSub})`).bind(pid),
         this.env.DB.prepare(`DELETE FROM attachments WHERE task_id IN (${tasksSub})`).bind(pid),
         this.env.DB.prepare('DELETE FROM signals WHERE project_id = ?').bind(pid),
@@ -1568,6 +1708,9 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM projects WHERE id = ?').bind(pid),
       ]);
       await this.ctx.storage.deleteAlarm().catch(() => {});
+      this.dropSearch('task', ...vecTasks.results.map((r) => r.id));
+      this.dropSearch('doc', ...vecDocs.results.map((r) => r.id));
+      this.dropSearch('plan', ...vecPlans.results.map((r) => r.id));
       return { ok: true, key: proj.key, name: proj.name };
     });
   }
@@ -2586,14 +2729,14 @@ export class ProjectRoom extends DurableObject<Env> {
       proposed?: boolean;
       /** Shared fields for every newTask across all phases (PLNR-133) — the same defaults
        *  idea create_tasks uses; a task's own value wins. */
-      taskDefaults?: { milestoneId?: string; tags?: string[]; boardId?: string; priority?: number; estimate?: number; type?: string };
+      taskDefaults?: { milestoneId?: string; tags?: string[]; boardId?: string; priority?: number; estimate?: number; type?: string; docIds?: string[] };
       phases: Array<{
         title: string;
         body?: string;
         taskIds?: string[];
         newTasks?: Array<{
           title: string; body?: string; priority?: number; estimate?: number; dueAt?: string;
-          tags?: string[]; milestoneId?: string; type?: string; boardId?: string;
+          tags?: string[]; milestoneId?: string; type?: string; boardId?: string; docIds?: string[];
           /** Extra ad-hoc edges beyond the enforced phase chain — existing task ids or keys. */
           dependsOn?: string[];
         }>;
@@ -2642,6 +2785,7 @@ export class ProjectRoom extends DurableObject<Env> {
             milestoneId: nt.milestoneId ?? d.milestoneId,
             type: nt.type ?? d.type,
             boardId: nt.boardId ?? d.boardId,
+            docIds: nt.docIds ?? d.docIds,
             dependsOn,
           });
           taskIds.push(created.id);
@@ -2658,6 +2802,7 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.emit(actor, 'plan.created', 'plan', planId, {
         title: input.title, status, phases: phases.map((p) => ({ title: p.title, tasks: p.taskIds.length })),
       });
+      this.reindexSearch('plan', planId);
       return { id: planId, title: input.title, status, phases };
 
     });
@@ -2839,6 +2984,7 @@ export class ProjectRoom extends DurableObject<Env> {
       binds.push(planId);
       await this.env.DB.prepare(`UPDATE plans SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
       await this.emit(actor, 'plan.updated', 'plan', planId, { title: patch.title ?? plan.title, fields: Object.keys(patch) });
+      this.reindexSearch('plan', planId);
       return { ok: true };
     
     });

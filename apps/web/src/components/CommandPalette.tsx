@@ -1,13 +1,17 @@
 // Command palette (PLNR-127) — ⌘K / Ctrl+K: jump to a task, switch view or project,
 // or fire a quick action without touching the mouse. Arrow keys + Enter; Esc closes.
+// PLNR-186: queries also hit the server search (semantic when the instance has an
+// embeddings backend, keyword otherwise) so docs, plans and task BODIES are findable —
+// the local list only knows task titles/keys.
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { api, type ApiSearchHit } from '../api';
 import type { AppStore } from '../store';
 import type { ViewId } from '../types';
 import { MonoTag } from './bits';
 
 interface Cmd {
   id: string;
-  kind: 'task' | 'view' | 'project' | 'action';
+  kind: 'task' | 'view' | 'project' | 'action' | 'doc' | 'plan';
   label: string;
   hint?: string;
   run: () => void;
@@ -23,8 +27,22 @@ export function CommandPalette({ store }: { store: AppStore }) {
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState('');
   const [idx, setIdx] = useState(0);
+  const [serverHits, setServerHits] = useState<ApiSearchHit[]>([]);
+  const [searchMode, setSearchMode] = useState<'semantic' | 'keyword' | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const { actions, helpers, currentPid, data } = store;
+
+  // Debounced server search alongside the instant local matches.
+  useEffect(() => {
+    if (!open || q.trim().length < 3 || !currentPid) { setServerHits([]); setSearchMode(null); return; }
+    const needle = q.trim();
+    const t = setTimeout(() => {
+      api.search(currentPid, needle, undefined, 8)
+        .then((r) => { setServerHits(r.results); setSearchMode(r.mode); })
+        .catch(() => { setServerHits([]); setSearchMode(null); });
+    }, 220);
+    return () => clearTimeout(t);
+  }, [open, q, currentPid]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -86,12 +104,34 @@ export function CommandPalette({ store }: { store: AppStore }) {
     return scored.slice(0, 12).map((x) => x.c);
   }, [q, commands]);
 
+  // Server hits appended below the instant local matches, deduped against them.
+  const allMatches = useMemo<Cmd[]>(() => {
+    if (!q.trim() || !serverHits.length) return matches;
+    const close = (fn: () => void) => () => { setOpen(false); fn(); };
+    const seen = new Set(matches.map((c) => c.id));
+    const extra: Cmd[] = [];
+    for (const h of serverHits) {
+      const id = `${h.kind}:${h.id}`;
+      if (seen.has(id) || seen.has(`task:${h.id}`)) continue;
+      extra.push({
+        id, kind: h.kind, label: h.title, hint: h.key ?? (h.kind === 'doc' ? 'doc' : 'plan'),
+        run: close(() => {
+          if (h.kind === 'task') actions.openTask(h.id);
+          else if (h.kind === 'doc') { sessionStorage.setItem('noriq.openDoc', h.id); actions.setView('docs'); }
+          else actions.setView('plans');
+        }),
+      });
+    }
+    return [...matches, ...extra].slice(0, 16);
+  }, [matches, serverHits, q, actions]);
+
   useEffect(() => setIdx(0), [q]);
 
   if (!open) return null;
 
   const KIND_COLOR: Record<Cmd['kind'], string> = {
     task: 'var(--blue)', view: 'var(--accent-ink)', project: 'var(--amber)', action: 'var(--text-mid)',
+    doc: 'var(--green, var(--accent-ink))', plan: 'var(--amber)',
   };
 
   return (
@@ -102,15 +142,15 @@ export function CommandPalette({ store }: { store: AppStore }) {
           value={q}
           onChange={(e) => setQ(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === 'ArrowDown') { e.preventDefault(); setIdx((i) => Math.min(i + 1, matches.length - 1)); }
+            if (e.key === 'ArrowDown') { e.preventDefault(); setIdx((i) => Math.min(i + 1, allMatches.length - 1)); }
             if (e.key === 'ArrowUp') { e.preventDefault(); setIdx((i) => Math.max(i - 1, 0)); }
-            if (e.key === 'Enter' && matches[idx]) matches[idx]!.run();
+            if (e.key === 'Enter' && allMatches[idx]) allMatches[idx]!.run();
           }}
-          placeholder="Jump to a task, view, project… or run an action"
+          placeholder="Jump to a task, view, project… or search tasks, docs & plans"
           style={{ width: '100%', boxSizing: 'border-box', background: 'transparent', border: 'none', borderBottom: '1px solid var(--w-08)', padding: '14px 18px', color: 'var(--text)', fontSize: 14.5, outline: 'none', fontFamily: 'inherit' }}
         />
         <div style={{ maxHeight: 380, overflowY: 'auto', padding: 6 }}>
-          {matches.map((c, i) => (
+          {allMatches.map((c, i) => (
             <div
               key={c.id}
               onClick={() => c.run()}
@@ -125,12 +165,13 @@ export function CommandPalette({ store }: { store: AppStore }) {
               <span style={{ fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.label}</span>
             </div>
           ))}
-          {!matches.length && (
+          {!allMatches.length && (
             <div style={{ padding: 22, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>nothing matches</div>
           )}
         </div>
         <div style={{ borderTop: '1px solid var(--w-05)', padding: '7px 14px', display: 'flex', gap: 14, fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>
           <span>↑↓ navigate</span><span>↵ open</span><span>esc close</span>
+          {searchMode && <span style={{ marginLeft: 'auto' }}>{searchMode} search</span>}
         </div>
       </div>
     </div>

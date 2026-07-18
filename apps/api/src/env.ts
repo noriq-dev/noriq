@@ -22,6 +22,13 @@ export interface Env {
   EMAIL_FROM?: string;
   /** Task attachments — optional; endpoints 503 until R2 is enabled + bound. */
   FILES?: R2Bucket;
+  /** Workers AI (PLNR-184) — embeddings for semantic search. Optional: without it (or
+   *  VECTORIZE) search degrades to keyword matching, nothing breaks. */
+  AI?: Ai;
+  /** Vectorize index for semantic search vectors (PLNR-184). Create with
+   *  `wrangler vectorize create noriq-search --dimensions=1024 --metric=cosine` and add a
+   *  metadata index: `wrangler vectorize create-metadata-index noriq-search --property-name=projectId --type=string`. */
+  VECTORIZE?: VectorizeIndex;
   /** HMAC key for signing agent attachment-upload capability tokens (PLNR-173). Optional:
    *  falls back to ADMIN_TOKEN, so an instance with an admin token already supports agent
    *  uploads with no extra config. If neither is set, create_attachment_upload is disabled

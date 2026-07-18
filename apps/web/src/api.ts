@@ -164,8 +164,22 @@ export const api = {
       }>;
       overdue: Array<{ id: string; key: string; title: string; dueAt: string; status: string; projectId: string; projectKey: string }>;
     }>('GET', '/api/attention'),
-  answerSignal: (pid: string, sid: string, response: string) =>
-    req('POST', `/api/projects/${pid}/signals/${sid}/answer`, { response }),
+  answerSignal: (pid: string, sid: string, response: string, answers?: ApiSignalAnswer[]) =>
+    req('POST', `/api/projects/${pid}/signals/${sid}/answer`, { response, answers }),
+  /** The rounds of a threaded gate (PLNR-185), oldest first. */
+  signalThread: (pid: string, sid: string) =>
+    req<{ thread: Array<{
+      id: string; title: string; body: string | null; status: string; agentName: string;
+      options: string[] | null; questions: ApiSignalQuestion[] | null;
+      response: string | null; responseJson: ApiSignalAnswer[] | null;
+      followUpTo: string | null; createdAt: string; resolvedAt: string | null;
+    }> }>('GET', `/api/projects/${pid}/signals/${sid}/thread`),
+  /** Project search (PLNR-184): semantic when the instance has embeddings, else keyword. */
+  search: (pid: string, q: string, kinds?: Array<'task' | 'doc' | 'plan'>, limit?: number) =>
+    req<{ mode: 'semantic' | 'keyword'; results: ApiSearchHit[] }>(
+      'GET',
+      `/api/projects/${pid}/search?q=${encodeURIComponent(q)}${kinds?.length ? `&kinds=${kinds.join(',')}` : ''}${limit ? `&limit=${limit}` : ''}`,
+    ),
   acknowledgeSignal: (pid: string, sid: string, dismiss = false) =>
     req('POST', `/api/projects/${pid}/signals/${sid}/acknowledge`, { dismiss }),
   addDependency: (pid: string, tid: string, dependsOnTaskId: string) =>
@@ -458,8 +472,29 @@ export interface PublicSnapshot {
 export interface ApiSignalQuestion {
   question: string;
   header?: string;
+  /** Legacy alias for kind 'multi'. */
   multi?: boolean;
   options?: string[];
+  /** PLNR-185 answer form; default select when options exist, else text. */
+  kind?: 'select' | 'multi' | 'text' | 'number' | 'confirm';
+}
+
+/** Structured per-question answer (PLNR-185). */
+export interface ApiSignalAnswer {
+  question: string;
+  answer: string | string[] | number | boolean;
+}
+
+/** One hit from /api/projects/:pid/search (PLNR-184). */
+export interface ApiSearchHit {
+  kind: 'task' | 'doc' | 'plan';
+  id: string;
+  projectId: string;
+  key?: string;
+  title: string;
+  snippet: string;
+  score: number;
+  status?: string;
 }
 
 export interface ApiSnapshot {
@@ -480,6 +515,8 @@ export interface ApiSnapshot {
   phaseTasks: Array<{ phaseId: string; taskId: string }>;
   tags: Array<{ id: string; name: string; color: string; order: number }>;
   taskTags: Array<{ taskId: string; tagId: string }>;
+  /** Task↔doc relations (PLNR-182). */
+  taskDocs: Array<{ taskId: string; docId: string }>;
   events: Array<{
     id: string; seq: number; actorKind: 'agent' | 'human' | 'system'; actorId: string; verb: string;
     subjectType: string; subjectId: string; payload: Record<string, unknown>; createdAt: string;
@@ -488,7 +525,7 @@ export interface ApiSnapshot {
     id: string; taskId: string | null; taskKey: string | null; agentId: string | null; agentName: string;
     type: 'input_request' | 'alert'; severity: 'info' | 'warning' | 'critical';
     title: string; body: string | null; options: string[] | null;
-    questions: ApiSignalQuestion[] | null; createdAt: string;
+    questions: ApiSignalQuestion[] | null; followUpTo: string | null; createdAt: string;
   }>;
 }
 
@@ -500,4 +537,6 @@ export interface ApiTaskDetail {
   refs: Array<{ kind: string; ref: string; url: string | null; state: string | null }>;
   attachments: Array<{ id: string; filename: string; contentType: string; size: number; uploaderKind: string; uploadedBy: string; createdAt: string }>;
   tagIds: string[];
+  /** Related project docs (PLNR-182). */
+  docs: Array<{ id: string; name: string; description: string }>;
 }

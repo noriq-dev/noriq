@@ -142,3 +142,80 @@ describe('multi-question input requests', () => {
     expect(reclaim.isError).toBe(false);
   });
 });
+
+// ---- PLNR-185: typed answer kinds, structured answers, multi-round threads -------------
+describe('request_input v2', () => {
+  it('typed questions round-trip; structured answers land in response_json and derive the text form', async () => {
+    const t = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'v2 decisions' })).body;
+    await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId: t.id });
+    const raised = await mcpCall(agent.apiKey, 'request_input', {
+      projectId, taskId: t.id, title: 'Sizing decisions',
+      questions: [
+        { question: 'Which tier?', kind: 'select', options: ['small', 'large'] },
+        { question: 'Max concurrent runs?', kind: 'number' },
+        { question: 'Enable autoscale?', kind: 'confirm' },
+      ],
+    });
+    expect(raised.isError).toBe(false);
+
+    // Structure (incl. kind) reaches the snapshot for the answer form.
+    const snap = (await (await SELF.fetch(`https://noriq.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json()) as {
+      signals: Array<{ id: string; title: string; questions: Array<{ kind?: string }> | null }>;
+    };
+    const sig = snap.signals.find((s) => s.title === 'Sizing decisions')!;
+    expect(sig.questions![1]!.kind).toBe('number');
+
+    // Human answers structurally; the flat text form is derived server-side.
+    const res = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/signals/${sig.id}/answer`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answers: [
+        { question: 'Which tier?', answer: 'large' },
+        { question: 'Max concurrent runs?', answer: 8 },
+        { question: 'Enable autoscale?', answer: true },
+      ] }),
+    });
+    expect(res.status).toBe(200);
+
+    // The agent sees both forms on the task's signal.
+    const detail = await mcpCall(agent.apiKey, 'get_task', { taskId: t.id });
+    const answered = detail.body.signals.find((s: { id: string }) => s.id === sig.id);
+    expect(answered.response).toContain('Which tier? → large');
+    expect(answered.response).toContain('Max concurrent runs? → 8');
+    expect(answered.responseJson).toHaveLength(3);
+    expect(answered.responseJson[2]).toEqual({ question: 'Enable autoscale?', answer: true });
+  });
+
+  it('followUpTo threads rounds, inherits the parked task, and serves the thread endpoint', async () => {
+    const t = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'multi-round' })).body;
+    await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId: t.id });
+    const round1 = (await mcpCall(agent.apiKey, 'request_input', {
+      projectId, taskId: t.id, title: 'Which region?', options: ['us', 'eu'],
+    })).body;
+    await SELF.fetch(`https://noriq.test/api/projects/${projectId}/signals/${round1.id}/answer`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ response: 'eu' }),
+    });
+
+    // Task returned to the queue; the follow-up round re-parks it WITHOUT taskId given.
+    await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId: t.id });
+    const round2 = await mcpCall(agent.apiKey, 'request_input', {
+      projectId, title: 'eu-west or eu-central?', options: ['eu-west', 'eu-central'], followUpTo: round1.id,
+    });
+    expect(round2.isError).toBe(false);
+    expect(round2.body.parked).toBe(true); // inherited the parent's task and parked it
+    expect(round2.body.taskKey).toBe(t.key);
+
+    const thread = (await (await SELF.fetch(`https://noriq.test/api/projects/${projectId}/signals/${round2.body.id}/thread`, {
+      headers: { Cookie: cookie },
+    })).json()) as { thread: Array<{ id: string; title: string; status: string; response: string | null }> };
+    expect(thread.thread.map((s) => s.title)).toEqual(['Which region?', 'eu-west or eu-central?']);
+    expect(thread.thread[0]!.status).toBe('answered');
+    expect(thread.thread[0]!.response).toBe('eu');
+
+    const bad = await mcpCall(agent.apiKey, 'request_input', {
+      projectId, title: 'dangling round', followUpTo: 'sig_missing',
+    });
+    expect(bad.isError).toBe(true);
+    expect(bad.text).toContain('not an input request in this project');
+  });
+});

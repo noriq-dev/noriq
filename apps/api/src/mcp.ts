@@ -15,6 +15,7 @@ import {
   userCanAccessProject,
 } from './lib/visibility';
 import { taskSearchFilters } from './lib/search';
+import { search, searchBackend, reindexProject } from './search';
 import { signUploadToken } from './lib/upload-token';
 import { taskClaimability } from './lib/claimability';
 
@@ -53,6 +54,13 @@ Tasks you create MUST carry descriptive tags (topic/area/component words like "o
 words — those have dedicated fields. Plans need no dependency wiring: phase order itself
 gates tasks (a task is claimable when every earlier phase is finished); use dependsOn
 only for real, hand-picked orderings.
+Project docs are the knowledge base: settled decisions and facts ONLY (enforced — a doc
+with TBDs or open questions is rejected). Check a task's related docs (get_task.docs)
+and list_docs before unfamiliar work; link the docs a task must follow via docIds at
+creation; when you settle something durable, create_doc the outcome. Undecided things
+are not docs — raise request_input, then document the answer.
+Search before you file: semantic_search finds tasks, docs and plans by meaning — the
+thing you are about to create may already exist. Use search_tasks for attribute filters.
 You do not register yourself — you already are somebody, and get_briefing tells you who.
 Its \`you.kind\` says which: a "copilot" is a human's session (registered when they
 authorized this connection, and parented to it automatically), and an "agent" was created
@@ -128,12 +136,12 @@ const WRITE_IDEMPOTENT: ToolHints = { ...WRITE, idempotentHint: true };
 const TOOL_HINTS: Record<string, ToolHints> = {
   // reads
   get_briefing: READ, my_updates: READ, list_projects: READ, get_project: READ, list_groups: READ, list_agents: READ,
-  get_task: READ, search_tasks: READ, next_claimable: READ, read_open_comments: READ, get_plans: READ, can_claim: READ,
+  get_task: READ, search_tasks: READ, semantic_search: READ, next_claimable: READ, read_open_comments: READ, get_plans: READ, can_claim: READ,
   list_docs: READ, get_doc: READ, update_doc: WRITE_IDEMPOTENT, list_templates: READ,
   // writes that are safe to repeat with the same args (renew/replace-in-place/insert-or-ignore)
   heartbeat: WRITE_IDEMPOTENT, set_agent_identity: WRITE_IDEMPOTENT, update_task: WRITE_IDEMPOTENT, update_tasks: WRITE_IDEMPOTENT,
   update_plan: WRITE_IDEMPOTENT, add_dependency: WRITE_IDEMPOTENT, remove_dependency: WRITE_IDEMPOTENT, attach_ref: WRITE_IDEMPOTENT,
-  set_project_group: WRITE_IDEMPOTENT,
+  set_project_group: WRITE_IDEMPOTENT, reindex_search: WRITE_IDEMPOTENT,
   // everything else → WRITE (additive, non-idempotent, non-destructive, closed-world)
 };
 
@@ -261,8 +269,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           'Humans steer via comments on tasks (kind: question/instruction). Acknowledge fast, resolve with resolve_comment (addressed|wont_do) + a reply. Unresolved comments should block you from finishing.',
           'Anything bigger than one task: plan first. create_plan writes the plan as a document — goals/approach in the body, then ordered phases over tasks. Phase order itself gates the work (tasks in phase N are claimable once every earlier phase is finished — no dependency wiring needed); or decompose_task for a quick subtree. Workers drain the plan via next_claimable; keep it current with update_plan.',
           'Tasks you create MUST carry descriptive tags — topic/area/component words (e.g. "oauth", "board-filters"), FIRST tag = primary tag. Never status/type/priority words as tags; those have dedicated fields. Use dependsOn only for real, hand-picked orderings.',
+          'Project docs are settled decisions and facts ONLY (enforced — open questions/TBDs are rejected). Read a task\'s related docs (get_task.docs) before starting; link the docs new tasks must follow via docIds; when you settle something durable, create_doc the outcome. Undecided → request_input first, then document the answer.',
+          'Search before you file or dig: semantic_search finds tasks, docs and plans by MEANING (the thing you are about to create may already exist); search_tasks filters by attributes. Prefer them over dumping get_project in large projects.',
           'Claims are exclusive. If claim_task fails, the task is taken or blocked — pick another.',
-          'Blocked on a human decision? request_input (it auto-parks the task and frees you to work elsewhere) — do not guess or stall. Flag non-blocking concerns (deviations, risks) with raise_alert and keep going.',
+          'Blocked on a human decision? request_input (it auto-parks the task and frees you to work elsewhere) — do not guess or stall. Batch every question the decision needs into its typed `questions` (select/multi/text/number/confirm) in ONE gate; thread a genuine follow-up round with followUpTo. Flag non-blocking concerns (deviations, risks) with raise_alert and keep going.',
           'Every tool result may end with a "--- notices ---" block: read it, it is addressed to you.',
         ],
         projects,
@@ -537,11 +547,13 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'list_docs',
-    'Project reference docs (PLNR-158): conventions, architecture notes, decisions — the material you should CHECK before working unfamiliar ground. Returns the index (name + description); read a body with get_doc.',
+    'The project\'s knowledge base: settled design decisions, conventions, architecture facts. CHECK IT before working unfamiliar ground — a task\'s related docs (get_task.docs) plus this index are your ground truth. Returns name + description + linkedTasks count; read a body with get_doc. Docs here are trustworthy BY CONTRACT: they contain only explicit decisions and facts, never open questions.',
     { projectId: z.string() },
     tool(async ({ projectId }) => {
       const { results } = await env.DB.prepare(
-        'SELECT id, name, description, author_name AS authorName, updated_at AS updatedAt FROM docs WHERE project_id = ? ORDER BY updated_at DESC',
+        `SELECT d.id, d.name, d.description, d.author_name AS authorName, d.updated_at AS updatedAt,
+                (SELECT COUNT(*) FROM task_docs td WHERE td.doc_id = d.id) AS linkedTasks
+         FROM docs d WHERE d.project_id = ? ORDER BY d.updated_at DESC`,
       ).bind(projectId).all();
       return { docs: results.map((d) => ({ ...d, resource: docUri(String(d.id)) })) };
     }),
@@ -549,20 +561,24 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'get_doc',
-    'Read a project doc in full (markdown). Accepts the doc id from list_docs.',
+    'Read a project doc in full (markdown), plus the tasks that cite it (linkedTasks). What it states is settled — build to it; if reality has moved on, update_doc it to the new truth rather than silently deviating. Accepts the doc id from list_docs.',
     { projectId: z.string(), docId: z.string() },
     tool(async ({ projectId, docId }) => {
       const doc = await env.DB.prepare(
         'SELECT id, name, description, body, author_name AS authorName, updated_at AS updatedAt FROM docs WHERE id = ? AND project_id = ?',
       ).bind(docId, projectId).first();
       if (!doc) throw new Error(`doc ${docId} not found in this project`);
-      return { ...doc, resource: docUri(String(doc.id)) };
+      const { results: tasks } = await env.DB.prepare(
+        `SELECT t.id, t.key, t.title, ${taskWireStatus('t')} AS status
+         FROM task_docs td JOIN tasks t ON t.id = td.task_id WHERE td.doc_id = ? ORDER BY t.key`,
+      ).bind(docId).all();
+      return { ...doc, resource: docUri(String(doc.id)), linkedTasks: tasks };
     }),
   );
 
   defineTool(
     'create_doc',
-    'Write a project reference doc (markdown): conventions you established, architecture decisions, gotchas the next agent should know. Give it a clear name and a one-line description — that pair is what future agents scan in list_docs. For updating an existing doc use update_doc.',
+    'Record a SETTLED decision or established fact as a project doc (markdown). The contract (enforced): docs are static, complete entities stating explicit design decisions and facts — no TBD/TODO, no open questions, no "we should discuss". If something is still undecided, it is not doc material yet: get the decision (request_input) or track the work (a task), THEN write the doc stating the outcome. Give it a clear name and one-line description (the pair future agents scan in list_docs), and link it to the tasks that implement it via create_task/update_task docIds. For revising an existing doc use update_doc.',
     {
       projectId: z.string(),
       name: z.string().min(1).max(120),
@@ -574,7 +590,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'update_doc',
-    'Revise a project doc — pass the FULL new body (read it first via get_doc). Keep docs current: a stale doc misleads every agent that reads it.',
+    'Revise a project doc to the CURRENT truth — pass the FULL new body (read it first via get_doc). A stale doc misleads every agent that reads it; when a decision changes, the doc changes with it, stating the new decision (not the deliberation). The same contract as create_doc is enforced: decisions and facts only, nothing open-ended.',
     {
       projectId: z.string(),
       docId: z.string(),
@@ -587,7 +603,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'get_project',
-    'Project snapshot: tasks (with status/holder/deps/board/open-comment counts), milestones, boards, agents active here.',
+    'Full project snapshot: every task (status/holder/deps/board/open-comment counts), milestones, boards, tags, the docs index, and agents active here. Heavy — use it to orient once or to resolve ids (boards, milestones, tags); for "find the thing about X" use semantic_search, and for filtered task lists use search_tasks.',
     { projectId: z.string() },
     tool(async ({ projectId }) => {
       const [tasks, milestones, boards, project, categories, docs] = await Promise.all([
@@ -614,7 +630,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'create_task',
-    'Create a task. `tags` is REQUIRED: 1+ descriptive topic/area tags, and the FIRST tag is the primary tag (e.g. ["oauth", "token-refresh"]) — never status/type/priority words, those have dedicated fields. Use parentTaskId to build a decomposition tree and dependsOn (task ids) to gate order. New tasks start as todo.',
+    'Create ONE task. `tags` is REQUIRED: 1+ descriptive topic/area tags, FIRST tag = primary (e.g. ["oauth", "token-refresh"]) — never status/type/priority words, those have dedicated fields. Set everything at creation: docIds for the design docs it must follow, boardId for placement, parentTaskId for a decomposition tree, dependsOn (task ids) to gate order. Before filing, semantic_search — the task may already exist. Creating several tasks? Use create_tasks (one call, shared defaults); structuring multi-phase work? create_plan. New tasks start as todo.',
     {
       projectId: z.string(),
       title: z.string().min(1),
@@ -630,6 +646,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       tags: z.array(z.string()).optional().describe('REQUIRED. Descriptive topic/area tags, primary first (e.g. ["oauth", "token-refresh"]) — auto-created for the project if new. Never status/type/priority/milestone words.'),
       type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
       boardId: z.string().optional().describe('Board to place the task on (see get_project.boards); defaults to the parent task’s board for subtasks, else the project’s default board'),
+      docIds: z.array(z.string()).optional().describe('Related project docs (ids from list_docs) — link the design/decision docs this task implements or must follow, so workers read them before starting'),
     },
     tool(async ({ projectId, ...input }) => {
       requireDescriptiveTags(input.tags);
@@ -650,6 +667,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         dueAt: z.string().datetime().optional(),
         type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
         tags: z.array(z.string()).optional(),
+        docIds: z.array(z.string()).optional(),
       }).optional().describe('Shared fields applied to every item unless the item sets its own'),
       tasks: z.array(
         z.object({
@@ -661,6 +679,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           dueAt: z.string().datetime().optional(),
           milestoneId: z.string().optional(),
           boardId: z.string().optional(),
+          docIds: z.array(z.string()).optional().describe('Related project docs (ids from list_docs)'),
           type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
           tags: z.array(z.string()).optional(),
           parentTaskId: z.string().optional().describe('Existing task id/key, or an earlier item\'s ref'),
@@ -697,6 +716,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
             dueAt: item.dueAt ?? defaults?.dueAt,
             milestoneId: item.milestoneId ?? defaults?.milestoneId,
             boardId: item.boardId ?? defaults?.boardId,
+            docIds: item.docIds ?? defaults?.docIds,
             type: item.type ?? defaults?.type,
             tags: effectiveTags,
             parentTaskId,
@@ -763,6 +783,9 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
       boardId: z.string().optional().describe('Move the task to another board (see get_project.boards)'),
       parentTaskId: z.string().nullable().optional().describe('Re-parent under another task (id or key); null detaches it to a root. Lets you build the tree after creating tasks in key order.'),
+      docIds: z.array(z.string()).optional().describe('REPLACES the related-doc set (ids from list_docs; [] clears) — prefer addDocIds/removeDocIds for edits'),
+      addDocIds: z.array(z.string()).optional().describe('Link these docs, keeping existing links'),
+      removeDocIds: z.array(z.string()).optional().describe('Unlink these docs, keeping the rest'),
     },
     tool(async ({ projectId, taskId, ...patch }) =>
       room(env, projectId).updateTask(projectId, actor, await resolveTaskId(env, projectId, taskId), patch)),
@@ -808,7 +831,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'get_task',
-    'Full task detail including body, dependencies, comments (open first), git refs, and claim state.',
+    'Full task detail including body, dependencies, comments (open first), git refs, related docs (READ them before starting — they carry the design decisions the task must follow), and claim state.',
     { taskId: z.string() },
     tool(async ({ taskId }) => {
       const task = await env.DB.prepare(
@@ -824,7 +847,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       if (task.failed_at) task.status = 'failed';
       task.failedAt = task.failed_at;
       const id = String(task.id);
-      const [deps, comments, refs, attachments, signals] = await Promise.all([
+      const [deps, comments, refs, attachments, signals, docs] = await Promise.all([
         env.DB.prepare(
           `SELECT dt.id, dt.key, dt.status FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id WHERE d.task_id = ?`,
         ).bind(id).all(),
@@ -838,14 +861,24 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
            FROM attachments WHERE task_id = ? ORDER BY created_at`,
         ).bind(id).all(),
         env.DB.prepare(
-          `SELECT id, type, severity, title, body, options, status, response, created_at AS createdAt, resolved_at AS resolvedAt
+          `SELECT id, type, severity, title, body, options, questions, status, response, response_json AS responseJson,
+                  follow_up_to AS followUpTo, created_at AS createdAt, resolved_at AS resolvedAt
            FROM signals WHERE task_id = ? ORDER BY CASE WHEN status = 'open' THEN 0 ELSE 1 END, created_at DESC`,
+        ).bind(id).all(),
+        env.DB.prepare(
+          `SELECT d.id, d.name, d.description FROM task_docs td JOIN docs d ON d.id = td.doc_id WHERE td.task_id = ? ORDER BY d.name`,
         ).bind(id).all(),
       ]);
       // Each attachment carries its resource URI — read the bytes with resources/read.
       const withUris = attachments.results.map((a) => ({ ...a, resource: attachmentUri(String(a.id)) }));
-      const sigs = signals.results.map((s) => ({ ...s, options: s.options ? JSON.parse(String(s.options)) : null }));
-      return { task, dependencies: deps.results, comments: comments.results, refs: refs.results, attachments: withUris, signals: sigs };
+      const sigs = signals.results.map((s) => ({
+        ...s,
+        options: s.options ? JSON.parse(String(s.options)) : null,
+        questions: s.questions ? JSON.parse(String(s.questions)) : null,
+        responseJson: s.responseJson ? JSON.parse(String(s.responseJson)) : null,
+      }));
+      const relatedDocs = docs.results.map((d) => ({ ...d, resource: docUri(String(d.id)) }));
+      return { task, dependencies: deps.results, comments: comments.results, refs: refs.results, attachments: withUris, signals: sigs, docs: relatedDocs };
     }),
   );
 
@@ -886,7 +919,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'search_tasks',
-    'Query tasks with filters instead of dumping the whole project — "review tasks tagged auth", "my in-progress work", "anything mentioning webhooks". Omit projectId to search every project you can reach. All filters AND together; `text` is a substring match over title/body/key. Returns up to `limit` matches ordered urgent-first, plus `matched` (the true total) so a truncated result is visible.',
+    'Filter tasks by ATTRIBUTES — "review tasks tagged auth", "my in-progress work", "overdue anywhere". Omit projectId to search every project you can reach. All filters AND together; `text` is an exact substring over title/body/key (NOT meaning — for loosely-phrased "find the thing about X", or to search docs and plans too, use semantic_search). Returns up to `limit` matches urgent-first, plus `matched` (the true total) so a truncated result is visible.',
     {
       projectId: z.string().optional().describe('Restrict to one project; omit for everything your credential reaches'),
       status: z.enum(['todo', 'in_progress', 'blocked', 'review', 'done', 'cancelled']).optional(),
@@ -920,6 +953,40 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         env.DB.prepare(`SELECT COUNT(*) AS n ${base}`).bind(...allBinds).first<{ n: number }>(),
       ]);
       return { tasks: rows.results, matched: total?.n ?? rows.results.length, returned: rows.results.length };
+    }),
+  );
+
+  defineTool(
+    'semantic_search',
+    'Search tasks, docs and plans by MEANING, not exact words — "how do we handle payment retries" finds the retry design doc and its tasks even when none contain that phrasing. Use this to orient in a large project: find the docs/tasks/plans relevant to what you are about to work on, before creating anything new (the thing you are about to file may already exist). For attribute filtering (status/tag/holder/overdue) use search_tasks instead — the two compose: discover here, then filter there. Falls back to keyword matching on instances without an embeddings backend (`mode` in the result says which ran).',
+    {
+      query: z.string().min(1).describe('Natural-language description of what you are looking for'),
+      projectId: z.string().optional().describe('Restrict to one project; omit to search every project you can reach'),
+      kinds: z.array(z.enum(['task', 'doc', 'plan'])).optional().describe('Restrict result types; default all three'),
+      limit: z.number().int().min(1).max(50).optional().describe('Default 12'),
+    },
+    tool(async ({ query, projectId, kinds, limit }) => {
+      const { results } = await env.DB.prepare(
+        `SELECT p.id FROM projects p WHERE p.status = 'active' AND ${USER_PROJECT_WHERE} AND ${tokenProjectWhere('?2')}`,
+      ).bind(agent.userId, opts.oauthTokenId ?? null).all<{ id: string }>();
+      let projectIds = results.map((r) => r.id);
+      if (projectId) projectIds = projectIds.filter((id) => id === projectId);
+      const { mode, results: hits } = await search(env, { q: query, projectIds, kinds, limit });
+      return { mode, results: hits, returned: hits.length };
+    }),
+  );
+
+  defineTool(
+    'reindex_search',
+    'Maintenance: rebuild the semantic-search vector index for one project (content that predates the embeddings backend, or drifted). Batched — call again with the returned offset while `remaining > 0`. Idempotent and safe to re-run; NOT part of any normal work loop (write-time indexing keeps the index fresh on its own). Errors when the instance has no embeddings backend.',
+    {
+      projectId: z.string(),
+      offset: z.number().int().min(0).optional().describe('Continue a previous pass from here (default 0)'),
+    },
+    tool(async ({ projectId, offset }) => {
+      const backend = searchBackend(env);
+      if (!backend) throw new Error('no embeddings backend — this instance runs keyword search only');
+      return reindexProject(env, backend, projectId, offset ?? 0);
     }),
   );
 
@@ -1170,7 +1237,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'send_message',
-    'Message another agent (toAgentId) or broadcast to the project (omit toAgentId). Recipients see it in my_updates/notices.',
+    'Message another agent (toAgentId, from list_agents) or broadcast to the project (omit toAgentId). Recipients see it in my_updates/notices. For narrative coordination only — a decision you need from a human is request_input (messages read as status and go unanswered), and a note that belongs on a task is add_comment (messages are not attached to tasks).',
     {
       projectId: z.string(),
       body: z.string().min(1),
@@ -1186,10 +1253,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'request_input',
-    'GATE: you need a human decision before you can proceed. Raise it here instead of guessing or stalling. If taskId is given, that task is auto-parked (released to blocked) so it does not lapse — then MOVE ON to other work via next_claimable; when a human answers you will see it in my_updates/notices and the task returns to the queue for you to re-claim. Give a clear title, the context in body, and options[] if it is a choice.',
+    'GATE: you need a human decision before you can proceed. Raise it here instead of guessing or stalling. If taskId is given, that task is auto-parked (released to blocked) so it does not lapse — then MOVE ON to other work via next_claimable; when a human answers you will see it in my_updates/notices and the task returns to the queue for you to re-claim. Batch every question the decision needs into ONE gate via `questions` (each with its own kind: pick-one, pick-several, freeform text, number, or yes/no) — one park + one answer beats four round-trips. Answers come back per-question ("Q → choice" lines). If the answer raises a NEW question, thread the next round with followUpTo (the prior gate id) — the human sees the earlier Q&A as context and the same task parks again. Ask everything you can foresee in round one; rounds are for genuine follow-ups, not drip-feeding.',
     {
       projectId: z.string(),
-      taskId: z.string().optional().describe('The task this decision blocks (auto-parked to blocked). Omit for a standalone question.'),
+      taskId: z.string().optional().describe('The task this decision blocks (auto-parked to blocked). Omit for a standalone question; a followUpTo round inherits its predecessor\'s task automatically.'),
       title: z.string().min(1).describe('The decision needed, in one line'),
       body: z.string().optional().describe('Context: what you tried, why you are blocked, trade-offs'),
       options: z.array(z.string()).optional().describe('Discrete choices for a SINGLE simple question — for anything richer use `questions`'),
@@ -1197,13 +1264,16 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         z.object({
           question: z.string().min(1).describe('The full question'),
           header: z.string().max(20).optional().describe('Short chip label, e.g. "Auth method"'),
-          multi: z.boolean().optional().describe('true = the human may pick several options'),
-          options: z.array(z.string()).max(8).optional().describe('Choices; omit for a freeform text answer. The human ALWAYS also gets an "other" free-text escape.'),
+          kind: z.enum(['select', 'multi', 'text', 'number', 'confirm']).optional()
+            .describe('Answer form: select = one of options; multi = several of options; text = freeform; number = numeric; confirm = yes/no. Default: select when options given, else text.'),
+          multi: z.boolean().optional().describe('Legacy alias for kind:"multi"'),
+          options: z.array(z.string()).max(8).optional().describe('Choices for select/multi. The human ALWAYS also gets an "other" free-text escape.'),
         }),
-      ).min(1).max(4).optional().describe('Batch up to 4 related questions in ONE gate (PLNR-131) — one park + one answer instead of four round-trips. The answer arrives as one formatted string: "Q → choice" per line.'),
+      ).min(1).max(4).optional().describe('Batch up to 4 related questions in ONE gate (PLNR-131/185). The human answers them as one form; you receive per-question answers.'),
+      followUpTo: z.string().optional().describe('Signal id of the gate this round follows up on (from the earlier request_input result or my_updates). Threads the rounds and re-parks the same task.'),
     },
-    tool(async ({ projectId, taskId, title, body, options, questions }) =>
-      room(env, projectId).raiseSignal(projectId, actor, { type: 'input_request', taskId: taskId ?? null, title, body, options, questions }),
+    tool(async ({ projectId, taskId, title, body, options, questions, followUpTo }) =>
+      room(env, projectId).raiseSignal(projectId, actor, { type: 'input_request', taskId: taskId ?? null, title, body, options, questions, followUpTo: followUpTo ?? null }),
     ),
   );
 
@@ -1240,6 +1310,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         estimate: z.number().int().min(0).optional(),
         type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
         tags: z.array(z.string()).optional(),
+        docIds: z.array(z.string()).optional().describe('Related project docs linked to every newTask — e.g. the design doc this plan implements'),
       }).optional().describe('Shared fields applied to every newTask in every phase (a task\'s own value wins) — write plan + fully-attributed tasks in ONE call'),
       phases: z.array(
         z.object({
@@ -1253,6 +1324,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
             estimate: z.number().int().min(0).optional(),
             milestoneId: z.string().optional(),
             boardId: z.string().optional(),
+            docIds: z.array(z.string()).optional().describe('Related project docs (ids from list_docs)'),
             type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
             tags: z.array(z.string()).optional(),
             dependsOn: z.array(z.string()).optional().describe('Ad-hoc extra edges beyond the enforced phase chain — existing task ids or keys'),

@@ -54,7 +54,7 @@ function AttentionSection({ store }: { store: AppStore }) {
               <div style={{ fontSize: 12.5, fontWeight: 600 }}>{s.title}</div>
               {s.body && <div style={{ fontSize: 11.5, color: 'var(--text-mid)', marginTop: 4, lineHeight: 1.5 }}><Markdown source={s.body} compact /></div>}
               {gate && s.questions && s.questions.length > 0 ? (
-                <QuestionForm questions={s.questions} onSubmit={async (r) => { await api.answerSignal(s.projectId, s.id, r); load(); }} />
+                <QuestionForm questions={s.questions} onSubmit={async (r, a) => { await api.answerSignal(s.projectId, s.id, r, a); load(); }} />
               ) : gate ? (
                 <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
                   {s.options && s.options.length > 0 && (

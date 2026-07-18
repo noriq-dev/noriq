@@ -2,7 +2,7 @@
 import { useLayoutEffect, useRef, useState } from 'react';
 import type { AppStore } from '../store';
 import { agentFg, fmtTtl, initials, isGhostColor, statusMeta, verbColors, YOU_GRADIENT } from '../design';
-import { QuestionForm } from './QuestionForm';
+import { QuestionForm, SignalThreadHistory } from './QuestionForm';
 import { Markdown } from './Markdown';
 import { AvatarChip, MonoTag, SectionLabel, WaveBars } from './bits';
 import { Composer } from './Composer';
@@ -273,8 +273,9 @@ function AttentionInbox({ store }: { store: AppStore }) {
               <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text)', lineHeight: 1.4 }}>{s.title}</div>
               {s.body && <div style={{ fontSize: 11.5, color: 'var(--text-mid)', marginTop: 4, lineHeight: 1.5 }}><Markdown source={s.body} compact /></div>}
 
+              {gate && s.followUpTo && <SignalThreadHistory pid={store.currentPid} signalId={s.id} />}
               {gate && s.questions && s.questions.length > 0 ? (
-                <QuestionForm questions={s.questions} onSubmit={(r) => actions.answerSignal(s.id, r)} />
+                <QuestionForm questions={s.questions} onSubmit={(r, a) => actions.answerSignal(s.id, r, a)} />
               ) : gate ? (
                 <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
                   {s.options && s.options.length > 0 && (
