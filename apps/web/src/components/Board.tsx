@@ -32,6 +32,8 @@ export function Board({ store }: { store: AppStore }) {
   const firstBoardId = boards[0]?.id ?? null;
   const [msFilter, setMsFilter] = useState<string | null>(null);
   const [tagFilter, setTagFilter] = useState<string | null>(null);
+  // Tag row collapse (PLNR-196): null = default (open unless the vocabulary is large).
+  const [tagsOpen, setTagsOpen] = useState<boolean | null>(null);
   const [query, setQuery] = useState('');
   // Attribute filters (PLNR-161): the triage axes the milestone/tag/text bar didn't cover.
   const [prioFilter, setPrioFilter] = useState(0); // minimum priority; 0 = any
@@ -49,6 +51,8 @@ export function Board({ store }: { store: AppStore }) {
     });
   const tagById = new Map(tags.map((c) => [c.id, c]));
   const msById = new Map(milestones.map((m) => [m.id, m]));
+  const tagsExpanded = tagsOpen ?? tags.length <= 25;
+  const activeTag = tagFilter ? tagById.get(tagFilter) ?? null : null;
 
   // A task shows on the selected board; tasks with no board (shouldn't happen post-
   // migration) fall onto the default board so nothing ever disappears.
@@ -157,6 +161,33 @@ export function Board({ store }: { store: AppStore }) {
           </button>
         )}
         </div>
+      </div>
+
+      {/* filter bar — row 2 (PLNR-196): the attribute filters with archive + search on
+          the same line, one consistent control strip above the tag chips. */}
+      <div style={{ flex: 'none', display: 'flex', alignItems: 'center', gap: 6, padding: '0 22px 8px' }}>
+        {/* Attribute filters (PLNR-161) — compose with milestone/tag/text and with
+            multi-select: filter down, then shift-click + bulk act. */}
+        <FilterSelect value={String(prioFilter)} onChange={(v) => setPrioFilter(Number(v))} active={prioFilter > 0}>
+          <option value="0">priority: any</option>
+          <option value="4">P4 only</option>
+          <option value="3">P3 +</option>
+          <option value="2">P2 +</option>
+        </FilterSelect>
+        <FilterSelect value={typeFilter} onChange={setTypeFilter} active={typeFilter !== ''}>
+          <option value="">type: any</option>
+          <option value="feature">feature</option>
+          <option value="bug">bug</option>
+          <option value="chore">chore</option>
+          <option value="research">research</option>
+        </FilterSelect>
+        <FilterSelect value={stateFilter} onChange={(v) => setStateFilter(v as typeof stateFilter)} active={stateFilter !== ''}>
+          <option value="">state: any</option>
+          <option value="unblocked">unblocked</option>
+          <option value="grabbable">up for grabs</option>
+          <option value="overdue">overdue</option>
+        </FilterSelect>
+        <div style={{ flex: 1 }} />
         <button
           onClick={() => actions.toggleArchived()}
           title={showArchived ? 'Hide archived tasks' : 'Show archived tasks'}
@@ -173,70 +204,70 @@ export function Board({ store }: { store: AppStore }) {
         <SearchBox value={query} onChange={setQuery} />
       </div>
 
-      {/* filter bar — row 2: tags + attribute filters (same wrapping rule, PLNR-189) */}
-      {(
-        <div
+      {/* filter bar — row 3: tags, collapsible (PLNR-196). Even a curated vocabulary can
+          be large, so past 25 tags the row starts collapsed; an active tag filter stays
+          visible so hidden state never silently filters the board. */}
+      <div
+        style={{
+          flex: 'none', display: 'flex', alignItems: 'center', gap: 6,
+          padding: '0 22px 10px', flexWrap: 'wrap', maxHeight: 96, overflowY: 'auto',
+          borderBottom: '1px solid var(--w-05)',
+        }}
+      >
+        <button
+          onClick={() => setTagsOpen(!tagsExpanded)}
+          title={tagsExpanded ? 'Collapse tags' : 'Expand tags'}
           style={{
-            flex: 'none', display: 'flex', alignItems: 'center', gap: 6,
-            padding: '0 22px 10px', flexWrap: 'wrap', maxHeight: 96, overflowY: 'auto',
-            borderBottom: '1px solid var(--w-05)',
+            cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5, flex: 'none',
+            fontFamily: 'var(--mono)', fontSize: 9, letterSpacing: '.07em', textTransform: 'uppercase',
+            color: 'var(--text-faint)', background: 'transparent', border: 'none', padding: '2px 0',
           }}
         >
-          <span style={{ fontFamily: 'var(--mono)', fontSize: 9, letterSpacing: '.07em', textTransform: 'uppercase', color: 'var(--text-faint)', flex: 'none', marginRight: 2 }}>
-            tags
-          </span>
-          <button
-            onClick={() => actions.openModal('tag')}
-            title="New tag"
-            className="rail-add"
-            style={{
-              cursor: 'pointer', flex: 'none', fontFamily: 'var(--mono)', fontSize: 10,
-              color: 'var(--text-dim)', border: '1px dashed var(--w-15)',
-              padding: '3px 9px', borderRadius: 8, background: 'transparent',
-            }}
-          >
-            + tag
-          </button>
-          {tags.map((c) => (
-            <FilterChip
-              key={c.id}
-              label={c.name}
-              dot={c.color}
-              small
-              active={tagFilter === c.id}
-              onClick={() => setTagFilter(tagFilter === c.id ? null : c.id)}
-              onDelete={async () => {
-                if (await confirm(`Delete tag "${c.name}"? It's removed from all tasks.`)) {
-                  if (tagFilter === c.id) setTagFilter(null);
-                  void actions.deleteTag(c.id);
-                }
+          <span>{tagsExpanded ? '▾' : '▸'}</span>
+          <span>tags · {tags.length}</span>
+        </button>
+        {!tagsExpanded && activeTag && (
+          <FilterChip
+            label={activeTag.name}
+            dot={activeTag.color}
+            small
+            active
+            onClick={() => setTagFilter(null)}
+          />
+        )}
+        {tagsExpanded && (
+          <>
+            <button
+              onClick={() => actions.openModal('tag')}
+              title="New tag"
+              className="rail-add"
+              style={{
+                cursor: 'pointer', flex: 'none', fontFamily: 'var(--mono)', fontSize: 10,
+                color: 'var(--text-dim)', border: '1px dashed var(--w-15)',
+                padding: '3px 9px', borderRadius: 8, background: 'transparent',
               }}
-            />
-          ))}
-          <div style={{ flex: 1 }} />
-          {/* Attribute filters (PLNR-161) — compose with milestone/tag/text and with
-              multi-select: filter down, then shift-click + bulk act. */}
-          <FilterSelect value={String(prioFilter)} onChange={(v) => setPrioFilter(Number(v))} active={prioFilter > 0}>
-            <option value="0">priority: any</option>
-            <option value="4">P4 only</option>
-            <option value="3">P3 +</option>
-            <option value="2">P2 +</option>
-          </FilterSelect>
-          <FilterSelect value={typeFilter} onChange={setTypeFilter} active={typeFilter !== ''}>
-            <option value="">type: any</option>
-            <option value="feature">feature</option>
-            <option value="bug">bug</option>
-            <option value="chore">chore</option>
-            <option value="research">research</option>
-          </FilterSelect>
-          <FilterSelect value={stateFilter} onChange={(v) => setStateFilter(v as typeof stateFilter)} active={stateFilter !== ''}>
-            <option value="">state: any</option>
-            <option value="unblocked">unblocked</option>
-            <option value="grabbable">up for grabs</option>
-            <option value="overdue">overdue</option>
-          </FilterSelect>
-        </div>
-      )}
+            >
+              + tag
+            </button>
+            {tags.map((c) => (
+              <FilterChip
+                key={c.id}
+                label={c.name}
+                dot={c.color}
+                small
+                active={tagFilter === c.id}
+                onClick={() => setTagFilter(tagFilter === c.id ? null : c.id)}
+                onDelete={async () => {
+                  if (await confirm(`Delete tag "${c.name}"? It's removed from all tasks.`)) {
+                    if (tagFilter === c.id) setTagFilter(null);
+                    void actions.deleteTag(c.id);
+                  }
+                }}
+              />
+            ))}
+          </>
+        )}
+      </div>
 
       {/* columns */}
       <div style={{ flex: 1, minHeight: 0, overflowX: 'auto', overflowY: 'hidden', padding: '16px 22px 18px' }}>
