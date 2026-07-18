@@ -5,8 +5,12 @@ import { TASK_NOT_IN_PROPOSED_PLAN, TASK_NOT_PHASE_BLOCKED, USER_PROJECT_WHERE, 
 /**
  * Agent-scoped delta sync (ROADMAP Phase 1).
  *
- * Cursor model: the global events-table rowid, stored server-side in the agent's
- * AgentSession DO. No ack — the cursor auto-advances on delivery. Open comments
+ * Cursor model: events.global_seq — a monotonic counter that only ever climbs
+ * (PLNR-111), stored server-side in the agent's AgentSession DO. No ack — the cursor
+ * auto-advances on delivery. (The table's rowid is NOT usable here: events.id is a
+ * TEXT PK so rowid is non-AUTOINCREMENT and gets REUSED after deleteProject removes the
+ * max row, which would silently exclude a later event from an agent already past it.)
+ * Open comments
  * are STATE, not events: they are returned sticky on every call until resolved.
  */
 
@@ -40,15 +44,15 @@ export async function computeUpdates(
   // A brand-new session (cursor 0) must NOT replay the whole event history as "new"
   // notices — start it at the current tip so it only hears about things going forward.
   if (cursor === 0) {
-    const tip = await env.DB.prepare('SELECT COALESCE(MAX(rowid), 0) AS m FROM events').first<{ m: number }>();
+    const tip = await env.DB.prepare('SELECT COALESCE(MAX(global_seq), 0) AS m FROM events').first<{ m: number }>();
     cursor = tip?.m ?? 0;
     if (opts.advanceCursor !== false) await session.advanceCursor(cursor);
   }
 
   // New events since the cursor that concern this agent.
   const { results: rawEvents } = await env.DB.prepare(
-    `SELECT e.rowid AS rid, e.verb, e.payload, e.actor_id AS actorId, e.subject_id AS subjectId, e.project_id AS projectId
-     FROM events e WHERE e.rowid > ? ORDER BY e.rowid LIMIT 500`,
+    `SELECT e.global_seq AS rid, e.verb, e.payload, e.actor_id AS actorId, e.subject_id AS subjectId, e.project_id AS projectId
+     FROM events e WHERE e.global_seq > ? ORDER BY e.global_seq LIMIT 500`,
   ).bind(cursor).all<{ rid: number; verb: string; payload: string; actorId: string; subjectId: string; projectId: string }>();
 
   const heldTaskIds = new Set<string>();

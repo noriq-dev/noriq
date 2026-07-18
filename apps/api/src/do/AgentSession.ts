@@ -6,7 +6,8 @@ import type { Env } from '../env';
  *
  * Holds the agent's server-side sync state so `my_updates` needs zero client
  * state (ROADMAP §5 Phase 1):
- *  - lastEventRowid: global events-table cursor (auto-advances on delivery; no ack).
+ *  - lastEventRowid: global events.global_seq cursor (auto-advances on delivery; no
+ *    ack). Named "rowid" for history; it now tracks the reuse-proof global_seq (PLNR-111).
  *  - lastSeenAt: presence.
  *
  * Open comments are intentionally NOT tracked here — they are state, not events,
