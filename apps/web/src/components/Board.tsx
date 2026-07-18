@@ -100,14 +100,17 @@ export function Board({ store }: { store: AppStore }) {
         }}
       />
 
-      {/* filter bar — row 1: milestones (scroll) + pinned search */}
+      {/* filter bar — row 1: milestones (wrapping, wheel-scrollable when tall) + pinned search.
+          PLNR-189: chips WRAP instead of overflowing horizontally — a horizontal overflow
+          strip can't be wheel-scrolled and runs off the page. Past ~2 lines the area
+          scrolls vertically, which the wheel handles natively. */}
       <div
         style={{
-          flex: 'none', display: 'flex', alignItems: 'center', gap: 8,
+          flex: 'none', display: 'flex', alignItems: 'flex-start', gap: 8,
           padding: '12px 22px 8px',
         }}
       >
-        <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 8, overflowX: 'auto' }}>
+        <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', maxHeight: 92, overflowY: 'auto' }}>
         <FilterChip label="All" active={msFilter === null} onClick={() => setMsFilter(null)} />
         <button
           onClick={() => actions.openModal('milestone')}
@@ -170,12 +173,12 @@ export function Board({ store }: { store: AppStore }) {
         <SearchBox value={query} onChange={setQuery} />
       </div>
 
-      {/* filter bar — row 2: tags */}
+      {/* filter bar — row 2: tags + attribute filters (same wrapping rule, PLNR-189) */}
       {(
         <div
           style={{
             flex: 'none', display: 'flex', alignItems: 'center', gap: 6,
-            padding: '0 22px 10px', overflowX: 'auto',
+            padding: '0 22px 10px', flexWrap: 'wrap', maxHeight: 96, overflowY: 'auto',
             borderBottom: '1px solid var(--w-05)',
           }}
         >
