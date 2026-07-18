@@ -392,6 +392,14 @@ async function readScope(db: D1Database, userId: string, form: Record<string, un
 
 oauth.get('/authorize', async (c) => {
   const p = readParams(new URL(c.req.url).searchParams);
+  // A URL-formatted client_id makes this endpoint drive an outbound metadata fetch
+  // (validateClient → resolveCimdClient). Rate-limit that SSRF-relevant path per IP so
+  // an unauthenticated caller can't use /authorize as a fetch amplifier. Plain (DB)
+  // client_ids skip this — they never leave the Worker.
+  if (isCimdId(p.client_id) && !c.env.DISABLE_RATE_LIMIT) {
+    const stub = c.env.RATE_LIMITER.get(c.env.RATE_LIMITER.idFromName(`cimd:${c.req.header('CF-Connecting-IP') ?? 'local'}`));
+    if (!(await stub.hit(10, 60_000)).ok) return c.text('too many client-metadata lookups — slow down', 429);
+  }
   const v = await validateClient(c.env, p);
   if (!v.ok) return c.text(`invalid authorization request: ${v.err}`, 400);
   const user = await currentUser(c);

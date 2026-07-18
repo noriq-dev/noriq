@@ -8,10 +8,23 @@
 import { SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/env';
-import { isCimdId, redirectUriAllowed, resolveCimdClient } from '../src/lib/cimd';
+import { ipIsBlocked, isCimdId, redirectUriAllowed, resolveCimdClient } from '../src/lib/cimd';
+import type { HostResolver } from '../src/lib/cimd';
 
 const env = (over: Partial<Env> = {}) => ({ ...over }) as Env;
 const CLIENT = 'https://client.example.com/oauth/client.json';
+/** Default resolver stub: every host resolves to a public IP (no network in tests). */
+const pub: HostResolver = async () => ['93.184.216.34'];
+/** Resolver that maps specific hosts to given IPs (for DNS-SSRF cases). */
+const resolveTo = (map: Record<string, string[]>): HostResolver => async (h) => map[h] ?? ['93.184.216.34'];
+/** A fetch stub that 302-redirects to `location`, then serves `body` on the next hop. */
+function redirectThenServe(location: string, body: unknown) {
+  let hop = 0;
+  return vi.fn(async () => {
+    if (hop++ === 0) return new Response(null, { status: 302, headers: { location } });
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as unknown as typeof fetch;
+}
 const validDoc = {
   client_id: CLIENT,
   client_name: 'ChatGPT (test)',
@@ -57,25 +70,54 @@ describe('resolveCimdClient (PLNR-82)', () => {
   });
 
   it('fetches + validates a well-formed document', async () => {
-    const c = await resolveCimdClient(env(), CLIENT, serve(200, validDoc));
+    const c = await resolveCimdClient(env(), CLIENT, serve(200, validDoc), pub);
     expect(c.name).toBe('ChatGPT (test)');
     expect(c.redirectUris).toContain('https://client.example.com/callback');
     expect(c.redirectUris).toContain('http://localhost:3000/cb'); // loopback http allowed
   });
 
   it('rejects when the document client_id ≠ the URL', async () => {
-    await expect(resolveCimdClient(env(), CLIENT, serve(200, { ...validDoc, client_id: 'https://client.example.com/OTHER.json' })))
+    await expect(resolveCimdClient(env(), CLIENT, serve(200, { ...validDoc, client_id: 'https://client.example.com/OTHER.json' }), pub))
       .rejects.toThrow(/does not match/);
   });
 
   it('drops disallowed redirect_uris and rejects when none remain', async () => {
-    await expect(resolveCimdClient(env(), CLIENT, serve(200, { ...validDoc, redirect_uris: ['http://evil.example.com/cb'] })))
+    await expect(resolveCimdClient(env(), CLIENT, serve(200, { ...validDoc, redirect_uris: ['http://evil.example.com/cb'] }), pub))
       .rejects.toThrow(/redirect_uris/);
   });
 
   it('rejects non-JSON and 404 documents', async () => {
-    await expect(resolveCimdClient(env(), CLIENT, serve(200, 'not json'))).rejects.toThrow(/valid JSON/);
-    await expect(resolveCimdClient(env(), CLIENT, serve(404, 'nope'))).rejects.toThrow(/returned 404/);
+    await expect(resolveCimdClient(env(), CLIENT, serve(200, 'not json'), pub)).rejects.toThrow(/valid JSON/);
+    await expect(resolveCimdClient(env(), CLIENT, serve(404, 'nope'), pub)).rejects.toThrow(/returned 404/);
+  });
+
+  it('SSRF: rejects a domain whose DNS resolves to a private/link-local IP (PLNR-100)', async () => {
+    // Literal-host guard passes (it is a plain domain), but the resolved A-record is internal.
+    const metadata = resolveTo({ 'client.example.com': ['169.254.169.254'] });
+    await expect(resolveCimdClient(env(), CLIENT, serve(200, validDoc), metadata))
+      .rejects.toThrow(/non-public address/);
+    const rfc1918 = resolveTo({ 'client.example.com': ['1.2.3.4', '10.0.0.5'] }); // one bad answer is enough
+    await expect(resolveCimdClient(env(), CLIENT, serve(200, validDoc), rfc1918))
+      .rejects.toThrow(/non-public address/);
+  });
+
+  it('SSRF: re-runs the guard on redirect hops — a redirect to an internal host is refused (PLNR-100)', async () => {
+    const fetchStub = redirectThenServe('https://evil.example.com/doc.json', validDoc);
+    const resolver = resolveTo({ 'evil.example.com': ['192.168.1.10'] });
+    await expect(resolveCimdClient(env(), CLIENT, fetchStub, resolver))
+      .rejects.toThrow(/non-public address/);
+  });
+
+  it('follows a redirect to another public host and validates there (PLNR-100)', async () => {
+    // client_id in the doc must still equal the ORIGINAL URL, so identity is preserved.
+    const fetchStub = redirectThenServe('https://cdn.example.net/doc.json', validDoc);
+    const c = await resolveCimdClient(env(), CLIENT, fetchStub, pub);
+    expect(c.name).toBe('ChatGPT (test)');
+  });
+
+  it('DoS: rejects a body that exceeds the size cap without buffering it whole (PLNR-100)', async () => {
+    const huge = 'x'.repeat(70 * 1024); // > 64 KiB
+    await expect(resolveCimdClient(env(), CLIENT, serve(200, huge), pub)).rejects.toThrow(/too large/);
   });
 
   it('SSRF: refuses IP-literal / local / non-https / path-less client_ids before fetching', async () => {
@@ -89,8 +131,18 @@ describe('resolveCimdClient (PLNR-82)', () => {
   it('honors an optional host allowlist', async () => {
     await expect(resolveCimdClient(env({ CIMD_ALLOWED_HOSTS: 'chatgpt.com, claude.ai' }), CLIENT, boom))
       .rejects.toThrow(/allowlist/);
-    const c = await resolveCimdClient(env({ CIMD_ALLOWED_HOSTS: 'client.example.com' }), CLIENT, serve(200, validDoc));
+    const c = await resolveCimdClient(env({ CIMD_ALLOWED_HOSTS: 'client.example.com' }), CLIENT, serve(200, validDoc), pub);
     expect(c.name).toBe('ChatGPT (test)');
+  });
+
+  it('ipIsBlocked flags private/reserved addresses and passes public ones', () => {
+    for (const bad of ['127.0.0.1', '10.0.0.1', '169.254.169.254', '172.16.0.1', '192.168.1.1',
+      '100.64.0.1', '0.0.0.0', '224.0.0.1', '::1', 'fd00::1', 'fe80::1', '::ffff:10.0.0.1']) {
+      expect(ipIsBlocked(bad)).toBe(true);
+    }
+    for (const ok of ['93.184.216.34', '1.1.1.1', '8.8.8.8', '2606:4700:4700::1111']) {
+      expect(ipIsBlocked(ok)).toBe(false);
+    }
   });
 });
 
