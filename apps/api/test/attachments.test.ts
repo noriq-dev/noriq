@@ -86,6 +86,23 @@ describe('MCP attachments', () => {
     expect(logRes.headers.get('Content-Disposition')).toMatch(/^attachment/);
   });
 
+  it('DELETE routes through the DO — the row and its R2 blob both go (PLNR-116)', async () => {
+    await createUser('att-del@example.com', 'Att Del', 'longenough1', 'admin').catch(() => {});
+    const cookie = await loginSession('att-del@example.com', 'longenough1');
+    const add = await mcpCall(agent.apiKey, 'add_attachment', {
+      projectId, taskId, filename: 'gone.png', data: PNG_B64, contentType: 'image/png',
+    });
+    const id = add.body.id;
+    const del = await SELF.fetch(`https://noriq.test/api/attachments/${id}`, { method: 'DELETE', headers: { Cookie: cookie } });
+    expect(del.status).toBe(200);
+    // Row gone (the DO deleted it + emitted attachment.removed): get_task no longer lists it.
+    const gt = await mcpCall(agent.apiKey, 'get_task', { taskId });
+    expect(gt.body.attachments.some((a: { id: string }) => a.id === id)).toBe(false);
+    // Blob gone too: the bytes are no longer fetchable.
+    const after = await SELF.fetch(`https://noriq.test/api/attachments/${id}`, { headers: { Cookie: cookie } });
+    expect(after.status).toBe(404);
+  });
+
   it('forces download for scriptable same-origin markup (PLNR-99)', async () => {
     await createUser('att-xss@example.com', 'Att XSS', 'longenough1', 'admin').catch(() => {});
     const cookie = await loginSession('att-xss@example.com', 'longenough1');

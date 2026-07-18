@@ -4,7 +4,11 @@
 // Phase order gates directly off phase membership since PLNR-163 (plans mint no dependency
 // rows); the 'landed' exception mirrors the plan-dispatch pump (PLNR-170/176).
 
-const CLAIMABLE_STATUSES = ['todo', 'claimed'];
+// Only a fresh `todo` surfaces as claimable to the read-only probe (PLNR-116 dropped the
+// vestigial `claimed` status that nothing ever set). The mutating arbiter in claim_task
+// additionally accepts an `in_progress` task whose claim has lapsed in the expiry→alarm
+// window; the probe stays conservative there — it never offered in_progress work anyway.
+const CLAIMABLE_STATUSES = ['todo'];
 
 /** Everything standing between this task and workability: manual dependency edges plus
  *  unfinished tasks in earlier phases of its plan. Under gate='landed' a blocker in review

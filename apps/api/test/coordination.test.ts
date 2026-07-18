@@ -533,6 +533,18 @@ describe('list_agents + handoff_task', () => {
     expect(rel.isError).toBe(false);
   });
 
+  it('a non-holder agent cannot release a peer\'s claim (PLNR-116)', async () => {
+    const t = (await mcpCall(orch.apiKey, 'create_task', { tags: ['test-fixture'], projectId: pid, title: 'held by nova, eyed by echo' })).body;
+    await mcpCall(nova.apiKey, 'claim_task', { projectId: pid, taskId: t.id }, 'sess-hnd-nova');
+    // Echo doesn't hold it — releasing it would be a claim steal.
+    const steal = await mcpCall(echo.apiKey, 'release_task', { projectId: pid, taskId: t.id, toStatus: 'todo' }, 'sess-hnd-echo');
+    expect(steal.isError).toBe(true);
+    expect(steal.text).toContain('another agent');
+    // The real holder can still release it.
+    const rel = await mcpCall(nova.apiKey, 'release_task', { projectId: pid, taskId: t.id, toStatus: 'done' }, 'sess-hnd-nova');
+    expect(rel.isError).toBe(false);
+  });
+
   it('refuses a dep-blocked task — the target could not work it', async () => {
     const made = (await mcpCall(orch.apiKey, 'create_tasks', {
       projectId: pid,
@@ -773,5 +785,29 @@ describe('admin OAuth management', () => {
       method: 'DELETE', headers: { Cookie: cookie },
     });
     expect(del.status).toBe(200);
+  });
+});
+
+// ---- PLNR-116: a live TTL change takes effect without evicting the room ---------------
+describe('claim TTL is invalidated in the live DO', () => {
+  it('PATCH /meta routes the TTL through the DO so the next claim uses the new value', async () => {
+    const pid = (await mcpCall(orch.apiKey, 'create_project', { key: 'TTL', name: 'ttl' })).body.id;
+    const a = (await mcpCall(orch.apiKey, 'create_task', { tags: ['test-fixture'], projectId: pid, title: 'before' })).body;
+    const b = (await mcpCall(orch.apiKey, 'create_task', { tags: ['test-fixture'], projectId: pid, title: 'after' })).body;
+
+    // First claim warms the room and caches the default TTL.
+    const c1 = await mcpCall(orch.apiKey, 'claim_task', { projectId: pid, taskId: a.id });
+    expect(c1.body.ttlSeconds).not.toBe(300);
+
+    // Change the TTL while the room is live; the old code memoized _ttl and kept issuing the
+    // stale value until eviction. Routing the write through the DO must reset the cache.
+    const patch = await SELF.fetch(`https://noriq.test/api/projects/${pid}/meta`, {
+      method: 'PATCH', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ claimTtlSeconds: 300 }),
+    });
+    expect(patch.status).toBe(200);
+
+    const c2 = await mcpCall(orch.apiKey, 'claim_task', { projectId: pid, taskId: b.id });
+    expect(c2.body.ttlSeconds).toBe(300);
   });
 });

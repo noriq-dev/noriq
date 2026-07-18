@@ -964,9 +964,12 @@ app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
   }
   if (body.description !== undefined) { sets.push('description = ?'); binds.push(body.description); }
   if (body.name !== undefined) { sets.push('name = ?'); binds.push(body.name); }
+  // TTL changes route through the DO (PLNR-116) instead of this batched UPDATE, so the live
+  // room resets its memoized this._ttl instead of issuing claims on the stale value.
+  let ttlToSet: number | undefined;
   if (body.claimTtlSeconds !== undefined) {
     if (body.claimTtlSeconds < 60 || body.claimTtlSeconds > 24 * 3600) return c.json({ error: 'claim TTL must be 60s–24h' }, 400);
-    sets.push('claim_ttl_seconds = ?'); binds.push(Math.round(body.claimTtlSeconds));
+    ttlToSet = Math.round(body.claimTtlSeconds);
   }
   if (body.ownerUserId !== undefined) {
     if (c.var.user!.role !== 'admin') return c.json({ error: 'admin role required to reassign ownership' }, 403);
@@ -987,10 +990,12 @@ app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
     }
     sets.push('public = ?'); binds.push(body.public ? 1 : 0);
   }
-  if (!sets.length) return c.json({ ok: true });
   const pid = c.req.param('pid')!;
-  binds.push(pid);
-  await c.env.DB.prepare(`UPDATE projects SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
+  if (sets.length) {
+    binds.push(pid);
+    await c.env.DB.prepare(`UPDATE projects SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
+  }
+  if (ttlToSet !== undefined) await room(c.env, pid).setClaimTtl(pid, ttlToSet);
   // No auto-join anymore (PLNR-93): the caller was required to already be a member or
   // the creator of the target group above, so their visibility is already correct —
   // and this closes the "join any group by dropping a project in" hole.
@@ -2155,12 +2160,14 @@ app.get('/api/attachments/:aid', userAuth, async (c) => {
 });
 
 app.delete('/api/attachments/:aid', userAuth, async (c) => {
-  const row = await c.env.DB.prepare('SELECT id, r2_key AS key, uploaded_by AS uploader FROM attachments WHERE id = ?')
-    .bind(c.req.param('aid')!).first<{ id: string; key: string; uploader: string }>();
+  // Auth here (uploader/admin), then route the delete through the DO (PLNR-116) so the row
+  // drop + R2 cleanup happen as a sole-writer mutation that emits attachment.removed.
+  const row = await c.env.DB.prepare(
+    'SELECT a.id, a.uploaded_by AS uploader, t.project_id AS pid FROM attachments a JOIN tasks t ON t.id = a.task_id WHERE a.id = ?',
+  ).bind(c.req.param('aid')!).first<{ id: string; uploader: string; pid: string }>();
   if (!row) return c.json({ error: 'not found' }, 404);
   if (c.var.user!.role !== 'admin' && row.uploader !== c.var.user!.id) return c.json({ error: 'not yours' }, 403);
-  if (c.env.FILES) await c.env.FILES.delete(row.key);
-  await c.env.DB.prepare('DELETE FROM attachments WHERE id = ?').bind(row.id).run();
+  await room(c.env, row.pid).removeAttachment(row.pid, humanActor(c), row.id);
   return c.json({ ok: true });
 });
 

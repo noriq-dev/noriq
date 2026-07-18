@@ -91,7 +91,11 @@ type TaskRow = {
   title: string;
 };
 
-const CLAIMABLE_STATUSES = ['todo', 'claimed'];
+// A task is claimable when it's a fresh `todo`, or an `in_progress` whose claim has lapsed
+// but the requeue alarm hasn't fired yet (the expiry→alarm window, PLNR-116). The live-claim
+// check below gates the in_progress case; everything else (blocked/review/done/cancelled) is
+// off-limits. (There is no stored `claimed` status — it was vestigial and is gone.)
+const CLAIMABLE_STATUSES = ['todo', 'in_progress'];
 
 // --- Runs (execution plane, RUN-6) -----------------------------------------
 export interface CreateRunInput {
@@ -399,9 +403,15 @@ export class ProjectRoom extends DurableObject<Env> {
   // Task CRUD (RPC from the Worker)
   // ---------------------------------------------------------------------------
 
-  /** Find or create a tag by name (per-project). */
+  /** Find or create a tag by name (per-project). Top-level entry point — wraps the lock.
+   *  Callers already inside a gated method use `_resolveTagLocked` to avoid nesting
+   *  blockConcurrencyWhile (PLNR-116). */
   async resolveTag(projectId: string, actor: Actor, name: string, allowNew = false): Promise<string>  {
-    return this.ctx.blockConcurrencyWhile(async () => {
+    return this.ctx.blockConcurrencyWhile(() => this._resolveTagLocked(projectId, actor, name, allowNew));
+  }
+
+  /** Body of resolveTag, WITHOUT the lock. Only call from inside blockConcurrencyWhile. */
+  private async _resolveTagLocked(projectId: string, actor: Actor, name: string, allowNew = false): Promise<string>  {
       await this.setPid(projectId);
       const trimmed = name.trim().toLowerCase();
       const existing = await this.env.DB.prepare('SELECT id FROM tags WHERE project_id = ? AND name = ?')
@@ -443,14 +453,12 @@ export class ProjectRoom extends DurableObject<Env> {
         .bind(id, this.projectId, trimmed, color, count?.n ?? 0, nowIso()).run();
       await this.emit(actor, 'tag.created', 'tag', id, { name: trimmed, color });
       return id;
-    
-    });
   }
 
   private async setTaskTags(projectId: string, actor: Actor, taskId: string, names: string[], allowNew = false) {
     const ids: string[] = [];
     for (const n of names) {
-      if (n.trim()) ids.push(await this.resolveTag(projectId, actor, n, allowNew));
+      if (n.trim()) ids.push(await this._resolveTagLocked(projectId, actor, n, allowNew));
     }
     const stmts = [this.env.DB.prepare('DELETE FROM task_tags WHERE task_id = ?').bind(taskId)];
     for (const tid of ids) {
@@ -459,8 +467,14 @@ export class ProjectRoom extends DurableObject<Env> {
     await this.env.DB.batch(stmts);
   }
 
+  /** Top-level entry point — wraps the lock. Callers already inside a gated method (e.g.
+   *  createPlan) use `_createTaskLocked` to avoid nesting blockConcurrencyWhile (PLNR-116). */
   async createTask(projectId: string, actor: Actor, input: CreateTaskInput)  {
-    return this.ctx.blockConcurrencyWhile(async () => {
+    return this.ctx.blockConcurrencyWhile(() => this._createTaskLocked(projectId, actor, input));
+  }
+
+  /** Body of createTask, WITHOUT the lock. Only call from inside blockConcurrencyWhile. */
+  private async _createTaskLocked(projectId: string, actor: Actor, input: CreateTaskInput)  {
       await this.setPid(projectId);
       const pid = this.projectId;
       const proj = await this.env.DB.prepare('SELECT key, next_task_number AS n FROM projects WHERE id = ?')
@@ -495,7 +509,7 @@ export class ProjectRoom extends DurableObject<Env> {
       const tagNames = [...(input.tags ?? []), ...(input.category ? [input.category] : [])];
       const tagIds: string[] = [];
       for (const n of tagNames) {
-        if (n.trim()) tagIds.push(await this.resolveTag(pid, actor, n, input.allowNewTags));
+        if (n.trim()) tagIds.push(await this._resolveTagLocked(pid, actor, n, input.allowNewTags));
       }
       // Dependencies resolve BEFORE the insert batch too (PLNR-109). `dependsOn` accepts
       // an id or a display key, but must be scoped to THIS project: `OR IGNORE` does NOT
@@ -535,8 +549,6 @@ export class ProjectRoom extends DurableObject<Env> {
       });
       this.reindexSearch('task', id);
       return { id, key };
-    
-    });
   }
 
   async updateTask(projectId: string, actor: Actor, taskId: string, patch: TaskPatch)  {
@@ -566,7 +578,7 @@ export class ProjectRoom extends DurableObject<Env> {
         const stmts = [];
         for (const n of patch.addTags ?? []) {
           if (!n.trim()) continue;
-          const tid = await this.resolveTag(projectId, actor, n, allowNewTags);
+          const tid = await this._resolveTagLocked(projectId, actor, n, allowNewTags);
           stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO task_tags (task_id, tag_id) VALUES (?, ?)').bind(taskId, tid));
         }
         for (const n of patch.removeTags ?? []) {
@@ -789,8 +801,12 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare("UPDATE tasks SET status = 'in_progress', claimed_by = ?, claim_expires_at = ?, failed_at = NULL, updated_at = ? WHERE id = ?")
           .bind(agentId, expiresAt, nowIso(), taskId),
       ]);
-      await this.emit(actor, 'task.claimed', 'task', taskId, { key: task.key, title: task.title, agentId, expiresAt });
+      // Schedule the requeue alarm BEFORE emit (PLNR-116): the claim is already committed by
+      // the batch above, and emit is a separate D1 write that can fail. If it did and the alarm
+      // hadn't been armed yet, a failed agent's claim would never expire — the task would stick
+      // in_progress forever. Arming first makes the TTL requeue the safety net it's meant to be.
       await this.scheduleExpiryAlarm();
+      await this.emit(actor, 'task.claimed', 'task', taskId, { key: task.key, title: task.title, agentId, expiresAt });
       const openComments = await this.openCommentsFor(taskId);
       return { claimId, key: task.key, expiresAt, ttlSeconds: ttl, openComments };
     
@@ -802,6 +818,12 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.setPid(projectId);
       const task = await this.getTask(taskId);
       if (!task.claimed_by) throw new Error(`${task.key} has no live claim`);
+      // Only the holder may release its own claim; a human is the override (PLNR-116). Without
+      // this, any agent could force-release a peer's in-flight task — fine as a supervisor
+      // action, but agent↔agent it's a claim steal.
+      if (actor.kind !== 'human' && task.claimed_by !== actor.id) {
+        throw new Error(`${task.key} is held by another agent — you can't release a claim you don't own`);
+      }
       const toStatus = opts.toStatus ?? 'todo';
       if (!['todo', 'review', 'done', 'blocked'].includes(toStatus)) throw new Error(`invalid release status: ${toStatus}`);
       await this.env.DB.batch([
@@ -908,6 +930,8 @@ export class ProjectRoom extends DurableObject<Env> {
   // Comments — the human steering channel
   // ---------------------------------------------------------------------------
 
+  /** Top-level entry point — wraps the lock. resolveComment (already gated) uses
+   *  `_postCommentLocked` to avoid nesting blockConcurrencyWhile (PLNR-116). */
   async postComment(
     projectId: string,
     actor: Actor,
@@ -916,7 +940,18 @@ export class ProjectRoom extends DurableObject<Env> {
     body: string,
     parentCommentId?: string | null,
   )  {
-    return this.ctx.blockConcurrencyWhile(async () => {
+    return this.ctx.blockConcurrencyWhile(() => this._postCommentLocked(projectId, actor, taskId, kind, body, parentCommentId));
+  }
+
+  /** Body of postComment, WITHOUT the lock. Only call from inside blockConcurrencyWhile. */
+  private async _postCommentLocked(
+    projectId: string,
+    actor: Actor,
+    taskId: string,
+    kind: 'comment' | 'question' | 'instruction' | 'reply',
+    body: string,
+    parentCommentId?: string | null,
+  )  {
       await this.setPid(projectId);
       const task = await this.getTask(taskId);
       const id = newId('cmt');
@@ -933,8 +968,6 @@ export class ProjectRoom extends DurableObject<Env> {
         taskId, taskKey: task.key, kind, body: body.slice(0, 140), holder: task.claimed_by,
       });
       return { id, taskKey: task.key, status };
-    
-    });
   }
 
   // ---------------------------------------------------------------------------
@@ -985,7 +1018,12 @@ export class ProjectRoom extends DurableObject<Env> {
 
       let parked = false;
       // Auto-park a held task behind an input gate: release the claim, mark it blocked.
+      // Only the holder (or a human) may park it (PLNR-116): parking another agent's
+      // in-flight task would strip its claim — a steal dressed up as a question.
       if (input.type === 'input_request' && task && task.claimed_by) {
+        if (actor.kind !== 'human' && task.claimed_by !== actor.id) {
+          throw new Error(`${task.key} is held by another agent — you can't park a claim you don't own`);
+        }
         await this.env.DB.batch([
           this.env.DB.prepare('UPDATE claims SET released_at = ? WHERE task_id = ? AND released_at IS NULL').bind(nowIso(), task.id),
           this.env.DB.prepare("UPDATE tasks SET status = 'blocked', claimed_by = NULL, claim_expires_at = NULL, updated_at = ? WHERE id = ?").bind(nowIso(), task.id),
@@ -1059,8 +1097,16 @@ export class ProjectRoom extends DurableObject<Env> {
       if (sig.type === 'input_request' && sig.taskId) {
         const task = await this.getTask(sig.taskId);
         taskKey = task.key;
+        // Only unblock once EVERY gate is answered (PLNR-116): a task can carry more than one
+        // open input_request (e.g. a batched follow-up round), and returning it to the queue
+        // while another decision is still pending would let it be re-claimed mid-question.
         if (task.status === 'blocked') {
-          await this.env.DB.prepare("UPDATE tasks SET status = 'todo', updated_at = ? WHERE id = ?").bind(nowIso(), sig.taskId).run();
+          const stillOpen = await this.env.DB.prepare(
+            "SELECT 1 FROM signals WHERE task_id = ? AND type = 'input_request' AND status = 'open' AND id != ? LIMIT 1",
+          ).bind(sig.taskId, signalId).first();
+          if (!stillOpen) {
+            await this.env.DB.prepare("UPDATE tasks SET status = 'todo', updated_at = ? WHERE id = ?").bind(nowIso(), sig.taskId).run();
+          }
         }
       }
       // Mirror to the Run (RUN-18): the answer returns a blocked Run to running.
@@ -1136,7 +1182,7 @@ export class ProjectRoom extends DurableObject<Env> {
         .run();
       let replyId: string | null = null;
       if (reply) {
-        replyId = (await this.postComment(projectId, actor, comment.taskId, 'reply', reply, commentId)).id;
+        replyId = (await this._postCommentLocked(projectId, actor, comment.taskId, 'reply', reply, commentId)).id;
       }
       await this.refreshOpenCommentCount(comment.taskId);
       await this.emit(actor, 'comment.resolved', 'comment', commentId, { taskKey: task.key, taskId: task.id, resolution });
@@ -1657,7 +1703,7 @@ export class ProjectRoom extends DurableObject<Env> {
   private async setDocTags(projectId: string, actor: Actor, docId: string, names: string[], allowNew = false) {
     const ids: string[] = [];
     for (const n of names) {
-      if (n.trim()) ids.push(await this.resolveTag(projectId, actor, n, allowNew));
+      if (n.trim()) ids.push(await this._resolveTagLocked(projectId, actor, n, allowNew));
     }
     const stmts = [this.env.DB.prepare('DELETE FROM doc_tags WHERE doc_id = ?').bind(docId)];
     for (const tid of ids) {
@@ -1703,7 +1749,7 @@ export class ProjectRoom extends DurableObject<Env> {
         const stmts = [];
         for (const n of patch.addTags ?? []) {
           if (!n.trim()) continue;
-          const tid = await this.resolveTag(projectId, actor, n, patch.allowNewTags);
+          const tid = await this._resolveTagLocked(projectId, actor, n, patch.allowNewTags);
           stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO doc_tags (doc_id, tag_id) VALUES (?, ?)').bind(docId, tid));
         }
         for (const n of patch.removeTags ?? []) {
@@ -2971,7 +3017,7 @@ export class ProjectRoom extends DurableObject<Env> {
             if (!t) throw new Error(`dependsOn ${ref} not found in this project`);
             return t.id;
           }));
-          const created = await this.createTask(projectId, actor, {
+          const created = await this._createTaskLocked(projectId, actor, {
             title: nt.title,
             body: nt.body,
             priority: nt.priority ?? d.priority,
@@ -3145,6 +3191,40 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.emit(actor, 'attachment.added', 'task', taskId, { key: task.key, filename, attachmentId });
       return { ok: true };
 
+    });
+  }
+
+  /** Delete an attachment: drop the D1 row, emit `attachment.removed` (WS fanout), then the
+   *  R2 blob — routed through the DO (PLNR-116) so removal is a sole-writer mutation with an
+   *  event, not a silent Worker-side write. D1 row first, blob last: a failed blob delete
+   *  leaves a harmless orphaned object, whereas the old order (R2 first, then D1) could leave
+   *  a live row pointing at bytes that no longer exist. */
+  async removeAttachment(projectId: string, actor: Actor, attachmentId: string)  {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const row = await this.env.DB.prepare(
+        `SELECT a.id, a.task_id AS taskId, a.filename, a.r2_key AS r2Key, t.key AS taskKey
+         FROM attachments a JOIN tasks t ON t.id = a.task_id WHERE a.id = ? AND t.project_id = ?`,
+      ).bind(attachmentId, this.projectId).first<{ id: string; taskId: string; filename: string; r2Key: string; taskKey: string }>();
+      if (!row) throw new Error('attachment not found in this project');
+      await this.env.DB.prepare('DELETE FROM attachments WHERE id = ?').bind(row.id).run();
+      await this.emit(actor, 'attachment.removed', 'task', row.taskId, { key: row.taskKey, filename: row.filename, attachmentId: row.id });
+      if (this.env.FILES) await this.env.FILES.delete(row.r2Key).catch(() => {});
+      return { ok: true };
+    });
+  }
+
+  /** Update the project's claim TTL through the DO (PLNR-116) and reset the memoized value.
+   *  A raw D1 write from the Worker (the old PATCH /meta path) left this._ttl pointing at the
+   *  stale number, so the live room kept issuing claims on the old TTL until eviction. The
+   *  caller validates the range (60s–24h); this is the single writer that also invalidates. */
+  async setClaimTtl(projectId: string, seconds: number)  {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      await this.env.DB.prepare('UPDATE projects SET claim_ttl_seconds = ? WHERE id = ?')
+        .bind(seconds, this.projectId).run();
+      this._ttl = seconds;
+      return { ok: true, claimTtlSeconds: seconds };
     });
   }
 
