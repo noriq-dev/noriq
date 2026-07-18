@@ -74,3 +74,12 @@ function timingSafeEqualHex(a: string, b: string): boolean {
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
 }
+
+/**
+ * Constant-time comparison for secrets/signatures/tokens of arbitrary length.
+ * Hashes both sides to fixed-length SHA-256 digests before comparing, so neither
+ * the byte differences nor the length of the expected value leak via timing.
+ */
+export async function timingSafeEqual(a: string, b: string): Promise<boolean> {
+  return timingSafeEqualHex(await sha256Hex(a), await sha256Hex(b));
+}

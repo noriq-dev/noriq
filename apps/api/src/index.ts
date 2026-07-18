@@ -7,7 +7,7 @@ import { adminAuth, agentAuth, readSessionId, resolveSessionAgent, SESSION_CLEAR
 import { buildMcpServer } from './mcp';
 import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot } from './backup';
-import { hashPassword, newApiKey, newId, nowIso, sha256Hex, verifyPassword } from './lib/util';
+import { hashPassword, newApiKey, newId, nowIso, sha256Hex, timingSafeEqual, verifyPassword } from './lib/util';
 import { taskSearchFilters } from './lib/search';
 import { search, searchBackend, reindexProject, type SearchKind } from './search';
 import { verifyUploadToken } from './lib/upload-token';
@@ -2126,13 +2126,16 @@ app.delete('/api/attachments/:aid', userAuth, async (c) => {
 // --- GitHub webhook (Phase 4: reflect PR/commit state onto tasks) ----------------
 app.post('/api/webhooks/github', async (c) => {
   const payload = await c.req.text();
-  if (c.env.GITHUB_WEBHOOK_SECRET) {
-    const sig = c.req.header('X-Hub-Signature-256') ?? '';
-    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(c.env.GITHUB_WEBHOOK_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-    const mac = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(payload));
-    const expected = 'sha256=' + [...new Uint8Array(mac)].map((b) => b.toString(16).padStart(2, '0')).join('');
-    if (sig !== expected) return c.json({ error: 'bad signature' }, 401);
-  }
+  // Fail closed: an unset secret is not a bypass. Without it we cannot verify the
+  // sender, so refuse the payload rather than trust an unauthenticated caller to
+  // flip task state across every project.
+  const secret = c.env.GITHUB_WEBHOOK_SECRET;
+  if (!secret) return c.json({ error: 'webhook not configured — set GITHUB_WEBHOOK_SECRET' }, 501);
+  const sig = c.req.header('X-Hub-Signature-256') ?? '';
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const mac = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(payload));
+  const expected = 'sha256=' + [...new Uint8Array(mac)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  if (!(await timingSafeEqual(sig, expected))) return c.json({ error: 'bad signature' }, 401);
   const event = c.req.header('X-GitHub-Event');
   if (event !== 'pull_request') return c.json({ ok: true, ignored: event });
   const body = JSON.parse(payload);

@@ -81,7 +81,7 @@ Set with `npx wrangler secret put <NAME> --config wrangler.production.jsonc`:
 | Secret | Purpose |
 |---|---|
 | `ADMIN_TOKEN` | optional — bootstrap the first users and hit `/api/admin/*` (incl. backup/export) without a browser session |
-| `GITHUB_WEBHOOK_SECRET` | optional — verify GitHub webhooks (PR state → task status) |
+| `GITHUB_WEBHOOK_SECRET` | required for GitHub webhooks (PR state → task status) — the `/api/webhooks/github` endpoint fails closed (501) until it is set, so an unauthenticated caller can never flip task state |
 
 Everything else (OAuth issuer, WebAuthn rpID, invite URLs, MCP connect snippets) derives
 from the request origin, so no per-instance configuration is needed in code. Agents
