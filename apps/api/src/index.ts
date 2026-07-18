@@ -1045,7 +1045,16 @@ app.patch('/api/users/:uid', userAuth, async (c) => {
   if (!sets.length) return c.json({ ok: true });
   binds.push(uid);
   await c.env.DB.prepare(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
-  if (body.disabled) await c.env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(uid).run();
+  if (body.disabled) {
+    // Disabling must be a real kill switch (PLNR-103): killing web sessions alone leaves every
+    // OAuth-connected agent with full MCP access for the token lifetime (≤7d) and refreshable to
+    // ≤90d. Revoke the user's tokens and agents too so containment is immediate.
+    await c.env.DB.batch([
+      c.env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(uid),
+      c.env.DB.prepare('UPDATE oauth_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL').bind(nowIso(), uid),
+      c.env.DB.prepare("UPDATE agents SET status = 'revoked' WHERE user_id = ? AND status != 'revoked'").bind(uid),
+    ]);
+  }
   return c.json({ ok: true });
 });
 
