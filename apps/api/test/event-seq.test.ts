@@ -8,12 +8,22 @@ import { env } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { createAgent, mcpCall } from './helpers';
 
+// events has UNIQUE(project_id, seq); create_project/milestone already appended some
+// events, so seed each project's counter above its current max seq before handing out more.
+const nextSeq = new Map<string, number>();
 const insertEvent = async (pid: string) => {
+  if (!nextSeq.has(pid)) {
+    const max = (await env.DB.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM events WHERE project_id = ?')
+      .bind(pid).first<{ m: number }>())!.m;
+    nextSeq.set(pid, max);
+  }
+  const seq = nextSeq.get(pid)! + 1;
+  nextSeq.set(pid, seq);
   const id = `ev_${crypto.randomUUID().slice(0, 16)}`;
   await env.DB.prepare(
     `INSERT INTO events (id, project_id, seq, actor_kind, actor_id, verb, subject_type, subject_id, payload)
-     VALUES (?, ?, 1, 'system', 'sys', 'test.evt', 'task', ?, '{}')`,
-  ).bind(id, pid, id).run();
+     VALUES (?, ?, ?, 'system', 'sys', 'test.evt', 'task', ?, '{}')`,
+  ).bind(id, pid, seq, id).run();
   return (await env.DB.prepare('SELECT rowid AS r, global_seq AS g FROM events WHERE id = ?')
     .bind(id).first<{ r: number; g: number }>())!;
 };
