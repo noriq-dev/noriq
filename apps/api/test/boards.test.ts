@@ -1,6 +1,6 @@
 // PLNR-80: multiple boards per project — default board, create/rename/delete,
 // moving tasks between boards, and the last-board guard.
-import { SELF } from 'cloudflare:test';
+import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import { createAgent, createUser, loginSession, mcpCall } from './helpers';
 
@@ -149,13 +149,25 @@ describe('board placement at creation (PLNR-181)', () => {
 // one) — the column allowlist blocks project_id but not a foreign milestone id, which
 // would corrupt cross-project references. Same guard as the boardId case above.
 describe('milestone same-project guard on update_task (PLNR-114)', () => {
-  it('rejects an unknown or foreign-project milestoneId with a readable error, not an FK 500', async () => {
-    // A milestone owned by a DIFFERENT project.
-    const other = await mcpCall(agent.apiKey, 'create_project', { key: 'OTH', name: 'other' });
-    const foreignMs = (await mcpCall(agent.apiKey, 'create_milestone', { projectId: other.body.id, title: 'foreign M' })).body;
+  // A real milestone owned by a DIFFERENT project. Seeded straight into D1 rather than via
+  // create_project/create_milestone: this whole suite shares one worker + D1, and creating a
+  // project mid-run can trip create_project's non-idempotent DO-invalidation retry (the row is
+  // inserted before the DO call that may fail, so the retry hits the UNIQUE(key) constraint).
+  // The foreign project is archived so it stays out of other files' active-project listings.
+  let foreignMilestoneId: string;
+  beforeAll(async () => {
+    const db = (env as unknown as { DB: D1Database }).DB;
+    const foreignProjectId = 'prj_foreign_114';
+    foreignMilestoneId = 'ms_foreign_114';
+    await db.batch([
+      db.prepare("INSERT INTO projects (id, key, name, status) VALUES (?, 'MSF114', 'foreign', 'archived')").bind(foreignProjectId),
+      db.prepare('INSERT INTO milestones (id, project_id, title) VALUES (?, ?, ?)').bind(foreignMilestoneId, foreignProjectId, 'foreign M'),
+    ]);
+  });
 
+  it('rejects a foreign-project or unknown milestoneId with a readable error, not an FK 500', async () => {
     const foreign = await mcpCall(agent.apiKey, 'update_task', {
-      projectId, taskId, milestoneId: foreignMs.id,
+      projectId, taskId, milestoneId: foreignMilestoneId,
     });
     expect(foreign.isError).toBe(true);
     expect(foreign.text).toContain('not found in this project');
