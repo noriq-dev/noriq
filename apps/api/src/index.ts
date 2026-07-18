@@ -820,6 +820,12 @@ app.post('/api/projects/:pid/tasks/:tid/restore', userAuth, async (c) =>
 app.delete('/api/projects/:pid/milestones/:mid', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).deleteMilestone(c.req.param('pid')!, humanActor(c), c.req.param('mid')!)));
 
+// Merge tag :tid INTO another tag (PLNR-194) — the vocabulary-cleanup primitive.
+app.post('/api/projects/:pid/tags/:tid/merge', userAuth, async (c) => {
+  const { into } = await c.req.json<{ into: string }>();
+  if (!into?.trim()) return c.json({ error: 'into required (target tag id or name)' }, 400);
+  return c.json(await room(c.env, c.req.param('pid')!).mergeTags(c.req.param('pid')!, humanActor(c), c.req.param('tid')!, into));
+});
 app.delete('/api/projects/:pid/tags/:tid', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).deleteTag(c.req.param('pid')!, humanActor(c), c.req.param('tid')!)));
 
@@ -939,7 +945,7 @@ app.post('/api/groups', userAuth, async (c) => {
 });
 
 app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
-  const body = await c.req.json<{ groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number; ownerUserId?: string | null; public?: boolean }>();
+  const body = await c.req.json<{ groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number; ownerUserId?: string | null; public?: boolean; tagPolicy?: 'open' | 'curated' }>();
   const sets: string[] = [];
   const binds: unknown[] = [];
   if (body.groupId !== undefined) {
@@ -965,6 +971,11 @@ app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
   if (body.ownerUserId !== undefined) {
     if (c.var.user!.role !== 'admin') return c.json({ error: 'admin role required to reassign ownership' }, 403);
     sets.push('owner_user_id = ?'); binds.push(body.ownerUserId);
+  }
+  if (body.tagPolicy !== undefined) {
+    // PLNR-194: 'curated' = only humans mint tags; agents must use the existing vocabulary.
+    if (body.tagPolicy !== 'open' && body.tagPolicy !== 'curated') return c.json({ error: 'tagPolicy must be "open" or "curated"' }, 400);
+    sets.push('tag_policy = ?'); binds.push(body.tagPolicy);
   }
   if (body.public !== undefined) {
     // Publishing a project is the OWNER's call (or an admin's) — a group member must not

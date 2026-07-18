@@ -16,6 +16,7 @@ import {
 } from './lib/visibility';
 import { taskSearchFilters } from './lib/search';
 import { search, searchBackend, reindexProject } from './search';
+import { nearDupeGroups } from './lib/tags';
 import { DOC_SKILL_MD } from './skill-docs';
 import { signUploadToken } from './lib/upload-token';
 import { taskClaimability } from './lib/claimability';
@@ -51,7 +52,9 @@ for the rare case where you'll go silent longer than that; (4) check and resolve
 comments — humans steer you through them; (5) release_task (to review or done) when
 finished. Never work on a task you have not claimed.
 Tasks you create MUST carry descriptive tags (topic/area/component words like "oauth" or
-"board-filters"); the FIRST tag is the primary tag. Never tag with status/type/priority
+"board-filters"); the FIRST tag is the primary tag. Tags are a shared filter vocabulary:
+reuse existing tags before minting new ones — near-duplicates are rejected, and curated
+projects accept no agent-minted tags at all. Never tag with status/type/priority
 words — those have dedicated fields. Plans need no dependency wiring: phase order itself
 gates tasks (a task is claimable when every earlier phase is finished); use dependsOn
 only for real, hand-picked orderings.
@@ -113,13 +116,18 @@ const TAG_GUIDANCE =
   'tags must be descriptive topic/area/component words (e.g. "oauth", "board-filters", "ws-resume"); ' +
   'the FIRST tag is the primary tag. Status, type, priority, and milestone have dedicated fields — never restate them as tags.';
 
-function requireDescriptiveTags(tags: string[] | undefined): void {
-  if (!tags?.length) throw new Error(`tags are required — ${TAG_GUIDANCE}`);
-  for (const raw of tags) {
+/** Validate tag NAMES when present (docs: tags optional but still descriptive, PLNR-194). */
+function validateTagNames(tags: string[] | undefined): void {
+  for (const raw of tags ?? []) {
     const norm = raw.trim().toLowerCase().replace(/[\s_]+/g, '-');
     if (!norm) throw new Error(`empty tag — ${TAG_GUIDANCE}`);
     if (NON_DESCRIPTIVE_TAGS.has(norm)) throw new Error(`"${raw}" is not a descriptive tag — ${TAG_GUIDANCE}`);
   }
+}
+
+function requireDescriptiveTags(tags: string[] | undefined): void {
+  if (!tags?.length) throw new Error(`tags are required — ${TAG_GUIDANCE}`);
+  validateTagNames(tags);
 }
 
 // MCP tool annotations (PLNR-88). Without these, clients assume the spec defaults —
@@ -137,7 +145,7 @@ const WRITE_IDEMPOTENT: ToolHints = { ...WRITE, idempotentHint: true };
 const TOOL_HINTS: Record<string, ToolHints> = {
   // reads
   get_briefing: READ, my_updates: READ, list_projects: READ, get_project: READ, list_groups: READ, list_agents: READ,
-  get_task: READ, search_tasks: READ, semantic_search: READ, next_claimable: READ, read_open_comments: READ, get_plans: READ, can_claim: READ,
+  get_task: READ, search_tasks: READ, semantic_search: READ, tag_report: READ, next_claimable: READ, read_open_comments: READ, get_plans: READ, can_claim: READ,
   list_docs: READ, get_doc: READ, update_doc: WRITE_IDEMPOTENT, list_templates: READ,
   // writes that are safe to repeat with the same args (renew/replace-in-place/insert-or-ignore)
   heartbeat: WRITE_IDEMPOTENT, set_agent_identity: WRITE_IDEMPOTENT, update_task: WRITE_IDEMPOTENT, update_tasks: WRITE_IDEMPOTENT,
@@ -269,7 +277,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           'You already have an identity — `you` above is it, and `you.kind` says whether you are a human\'s copilot or a runner-spawned agent. Nothing to register. Work loop: my_updates → pick from claimable (or next_claimable) → claim_task (just the one you are about to start) → do the work → resolve any comments → release_task {toStatus:"review"|"done"}. Every tool call renews your claim, so no periodic pinging — heartbeat only if you will be idle longer than the claim TTL.',
           'Humans steer via comments on tasks (kind: question/instruction). Acknowledge fast, resolve with resolve_comment (addressed|wont_do) + a reply. Unresolved comments should block you from finishing.',
           'Anything bigger than one task: plan first. create_plan writes the plan as a document — goals/approach in the body, then ordered phases over tasks. Phase order itself gates the work (tasks in phase N are claimable once every earlier phase is finished — no dependency wiring needed); or decompose_task for a quick subtree. Workers drain the plan via next_claimable; keep it current with update_plan.',
-          'Tasks you create MUST carry descriptive tags — topic/area/component words (e.g. "oauth", "board-filters"), FIRST tag = primary tag. Never status/type/priority words as tags; those have dedicated fields. Use dependsOn only for real, hand-picked orderings.',
+          'Tasks you create MUST carry descriptive tags — topic/area/component words (e.g. "oauth", "board-filters"), FIRST tag = primary tag. Tags are the project\'s SHARED filter vocabulary: reuse existing tags (get_project.tags) before minting — near-duplicates are rejected, and some projects are curated (agents cannot mint at all). Never status/type/priority words as tags. Use dependsOn only for real, hand-picked orderings.',
           'Project docs are settled decisions and facts ONLY (enforced — open questions/TBDs are rejected). Read a task\'s related docs (get_task.docs) before starting; link the docs new tasks must follow via docIds; when you settle something durable, create_doc the outcome. Undecided → request_input first, then document the answer.',
           'Search before you file or dig: semantic_search finds tasks, docs and plans by MEANING (the thing you are about to create may already exist); search_tasks filters by attributes. Prefer them over dumping get_project in large projects.',
           'Claims are exclusive. If claim_task fails, the task is taken or blocked — pick another.',
@@ -608,9 +616,13 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       description: z.string().max(300).optional().describe('One line: what a reader finds inside'),
       body: z.string().optional().describe('The document, markdown'),
       folder: z.string().max(200).optional().describe('Folder path for human browsing, e.g. "design/networking" — organizational only, the doc is always addressed by its id. Reuse existing folders (see list_docs) before minting new ones.'),
-      tags: z.array(z.string()).optional().describe('Descriptive topic/area tags, SAME vocabulary as task tags (auto-created) — how agents and humans filter the knowledge base. Tag every doc.'),
+      tags: z.array(z.string()).optional().describe('1-3 tags from the project vocabulary (get_project.tags / list_docs) — tags are shared FILTERS, so reuse before minting (near-duplicates are rejected) and only tag with words that group 3+ items. Never restate the folder or the title as a tag; finding one specific doc is semantic search\'s job.'),
+      allowNewTags: z.boolean().optional().describe('Mint a tag the near-duplicate guard flagged — only for genuinely distinct concepts'),
     },
-    tool(async ({ projectId, name, description, body, folder, tags }) => room(env, projectId).createDoc(projectId, actor, { name, description, body, folder, tags })),
+    tool(async ({ projectId, name, description, body, folder, tags, allowNewTags }) => {
+      validateTagNames(tags);
+      return room(env, projectId).createDoc(projectId, actor, { name, description, body, folder, tags, allowNewTags });
+    }),
   );
 
   defineTool(
@@ -623,12 +635,16 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       description: z.string().max(300).optional(),
       body: z.string().optional().describe('Full replacement markdown'),
       folder: z.string().max(200).optional().describe('Move the doc to this folder path ("" = root) — organizational only, links and ids are unaffected'),
-      tags: z.array(z.string()).optional().describe('REPLACES the tag set ([] clears) — prefer addTags/removeTags for edits'),
-      addTags: z.array(z.string()).optional().describe('Add these tags, keeping existing ones (auto-created if new)'),
+      tags: z.array(z.string()).optional().describe('REPLACES the tag set ([] clears) — prefer addTags/removeTags for edits. Reuse the project vocabulary; near-duplicates are rejected.'),
+      addTags: z.array(z.string()).optional().describe('Add these tags, keeping existing ones'),
       removeTags: z.array(z.string()).optional().describe('Remove these tags, keeping the rest'),
+      allowNewTags: z.boolean().optional().describe('Mint a tag the near-duplicate guard flagged — only for genuinely distinct concepts'),
     },
-    tool(async ({ projectId, docId, name, description, body, folder, tags, addTags, removeTags }) =>
-      room(env, projectId).updateDoc(projectId, actor, docId, { name, description, body, folder, tags, addTags, removeTags })),
+    tool(async ({ projectId, docId, name, description, body, folder, tags, addTags, removeTags, allowNewTags }) => {
+      validateTagNames(tags);
+      validateTagNames(addTags);
+      return room(env, projectId).updateDoc(projectId, actor, docId, { name, description, body, folder, tags, addTags, removeTags, allowNewTags });
+    }),
   );
 
   defineTool(
@@ -673,7 +689,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       dependsOn: z.array(z.string()).optional(),
       // Optional in the schema so a missing value reaches the handler's instructive error
       // (protocol-level zod failures are generic); the contract is REQUIRED (PLNR-171).
-      tags: z.array(z.string()).optional().describe('REQUIRED. Descriptive topic/area tags, primary first (e.g. ["oauth", "token-refresh"]) — auto-created for the project if new. Never status/type/priority/milestone words.'),
+      tags: z.array(z.string()).optional().describe('REQUIRED. Descriptive topic/area tags, primary first (e.g. ["oauth", "token-refresh"]). REUSE the project vocabulary (get_project.tags) — a tag is a shared filter, not a per-task keyword, and near-duplicates of existing tags are rejected. Never status/type/priority/milestone words.'),
+      allowNewTags: z.boolean().optional().describe('Mint a tag the near-duplicate guard flagged — only when it is genuinely a distinct concept, not a variant spelling'),
       type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
       boardId: z.string().optional().describe('Board to place the task on (see get_project.boards); defaults to the parent task’s board for subtasks, else the project’s default board'),
       docIds: z.array(z.string()).optional().describe('Related project docs (ids from list_docs) — link the design/decision docs this task implements or must follow, so workers read them before starting'),
@@ -699,6 +716,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         tags: z.array(z.string()).optional(),
         docIds: z.array(z.string()).optional(),
       }).optional().describe('Shared fields applied to every item unless the item sets its own'),
+      allowNewTags: z.boolean().optional().describe('Applies to every item: mint tags the near-duplicate guard flagged'),
       tasks: z.array(
         z.object({
           ref: z.string().optional().describe('Caller-chosen handle, echoed back and addressable from later items\' dependsOn/parentTaskId'),
@@ -717,7 +735,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         }),
       ).min(1).max(100),
     },
-    tool(async ({ projectId, defaults, tasks }) => {
+    tool(async ({ projectId, defaults, allowNewTags, tasks }) => {
       const r = room(env, projectId);
       const byRef = new Map<string, string>(); // ref → created task id
       // Resolve a dependsOn/parent entry: batch ref first, then id-or-key in this project.
@@ -749,6 +767,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
             docIds: item.docIds ?? defaults?.docIds,
             type: item.type ?? defaults?.type,
             tags: effectiveTags,
+            allowNewTags,
             parentTaskId,
             dependsOn,
           });
@@ -816,6 +835,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       docIds: z.array(z.string()).optional().describe('REPLACES the related-doc set (ids from list_docs; [] clears) — prefer addDocIds/removeDocIds for edits'),
       addDocIds: z.array(z.string()).optional().describe('Link these docs, keeping existing links'),
       removeDocIds: z.array(z.string()).optional().describe('Unlink these docs, keeping the rest'),
+      allowNewTags: z.boolean().optional().describe('Mint a tag the near-duplicate guard flagged — only for genuinely distinct concepts'),
     },
     tool(async ({ projectId, taskId, ...patch }) => {
       // A runner-spawned agent must not move its task's status (PLNR-192). RUN-83 took
@@ -1016,6 +1036,41 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       if (projectId) projectIds = projectIds.filter((id) => id === projectId);
       const { mode, results: hits } = await search(env, { q: query, projectIds, kinds, limit });
       return { mode, results: hits, returned: hits.length };
+    }),
+  );
+
+  defineTool(
+    'merge_tags',
+    'Vocabulary cleanup: merge tag `from` INTO tag `into` — every task and doc carrying `from` is re-pointed to `into`, then `from` is deleted. Supervisor-style maintenance for consolidating near-duplicates ("building-system" → "building"), NOT part of any normal work loop. The target must already exist; accepts ids or names. Survey the damage first with tag_report.',
+    {
+      projectId: z.string(),
+      from: z.string().describe('Tag to dissolve (id or name)'),
+      into: z.string().describe('Tag that absorbs it (id or name; must exist)'),
+    },
+    tool(async ({ projectId, from, into }) => room(env, projectId).mergeTags(projectId, actor, from, into)),
+  );
+
+  defineTool(
+    'tag_report',
+    'Tag-vocabulary health check: per-tag task/doc usage counts, single-use tags (no grouping value), unused tags, and near-duplicate clusters ("building"/"building-system"). Read-only — use it to plan a cleanup (merge_tags / human tag deletion) or to see whether the vocabulary needs curating.',
+    { projectId: z.string() },
+    tool(async ({ projectId }) => {
+      const { results } = await env.DB.prepare(
+        `SELECT g.id, g.name,
+                (SELECT COUNT(*) FROM task_tags tt WHERE tt.tag_id = g.id) AS tasks,
+                (SELECT COUNT(*) FROM doc_tags dt WHERE dt.tag_id = g.id) AS docs
+         FROM tags g WHERE g.project_id = ? ORDER BY g.name`,
+      ).bind(projectId).all<{ id: string; name: string; tasks: number; docs: number }>();
+      const withTotal = results.map((r) => ({ ...r, total: r.tasks + r.docs })).sort((a, b) => b.total - a.total);
+      const policy = await env.DB.prepare('SELECT tag_policy AS p FROM projects WHERE id = ?').bind(projectId).first<{ p: string }>();
+      return {
+        tagPolicy: policy?.p ?? 'open',
+        totalTags: withTotal.length,
+        tags: withTotal,
+        singleUse: withTotal.filter((t) => t.total === 1).map((t) => t.name),
+        unused: withTotal.filter((t) => t.total === 0).map((t) => t.name),
+        nearDuplicateGroups: nearDupeGroups(withTotal.map((t) => t.name)),
+      };
     }),
   );
 

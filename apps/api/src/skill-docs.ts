@@ -48,9 +48,14 @@ A doc IS NOT a home for anything that changes weekly or is still in motion:
    \`request_input\` only when the unresolved issue blocks the doc's CENTRAL
    decision; then write the outcome.
 3. **Place it.** Folder = where a human browses to it (reuse existing paths — see
-   list_docs — before minting new ones). Tags = how it is FOUND (same vocabulary as
-   task tags; tag every doc). Name + one-line description are the retrieval keys
-   future agents scan: "Vehicle mesh replication" beats "Networking notes".
+   list_docs — before minting new ones). Tags = the project's shared FILTER
+   vocabulary, the same one tasks use: 1–3 per doc, reused from the existing set
+   (get_project.tags), and a tag only deserves to exist if it will group 3+ items —
+   the server rejects near-duplicates, and curated projects reject agent-minted
+   tags entirely. Never restate the folder or the title as a tag: finding one
+   specific doc is semantic search's job, tags are for slicing the corpus. Name +
+   one-line description are the retrieval keys future agents scan: "Vehicle mesh
+   replication" beats "Networking notes".
 
 ## Writing the body
 

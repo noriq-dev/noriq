@@ -6,6 +6,7 @@ import { unfinishedDeps as unfinishedDepsLib } from '../lib/claimability';
 import { needsOutOfBand, sendSignalEmail, sendSignalWebhook } from '../lib/notify-out';
 import { requireDecisionOnlyDoc } from '../lib/doclint';
 import { searchBackend, indexEntity, removeEntity, type SearchKind } from '../search';
+import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
 import { RunKind, AgentTool, RunStatus, type RunPhase, isTerminalRunStatus } from '@noriq-dev/shared';
 
@@ -46,6 +47,8 @@ export interface CreateTaskInput {
   boardId?: string | null;
   /** Related project docs (PLNR-182) — validated against this project's docs. */
   docIds?: string[];
+  /** Permit minting genuinely-new tags past the near-duplicate guard (PLNR-194). */
+  allowNewTags?: boolean;
 }
 
 export interface TaskPatch {
@@ -74,6 +77,8 @@ export interface TaskPatch {
   /** Non-destructive doc-link edits, mirroring addTags/removeTags. */
   addDocIds?: string[];
   removeDocIds?: string[];
+  /** Permit minting genuinely-new tags past the near-duplicate guard (PLNR-194). */
+  allowNewTags?: boolean;
 }
 
 type TaskRow = {
@@ -395,13 +400,40 @@ export class ProjectRoom extends DurableObject<Env> {
   // ---------------------------------------------------------------------------
 
   /** Find or create a tag by name (per-project). */
-  async resolveTag(projectId: string, actor: Actor, name: string): Promise<string>  {
+  async resolveTag(projectId: string, actor: Actor, name: string, allowNew = false): Promise<string>  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const trimmed = name.trim().toLowerCase();
       const existing = await this.env.DB.prepare('SELECT id FROM tags WHERE project_id = ? AND name = ?')
         .bind(this.projectId, trimmed).first<{ id: string }>();
       if (existing) return existing.id;
+      // Minting a NEW tag (PLNR-194). Tags are a controlled filter vocabulary, and the
+      // sprawl failure mode is agents minting per-item keywords. Humans mint freely —
+      // they are the curators. Agents face two gates:
+      //   curated policy → no agent minting at all (use the existing vocabulary);
+      //   open policy    → a near-duplicate of an existing tag is rejected unless the
+      //                    caller explicitly says allowNewTags (genuinely-new names pass).
+      if (actor.kind !== 'human') {
+        const proj = await this.env.DB.prepare('SELECT tag_policy AS policy FROM projects WHERE id = ?')
+          .bind(this.projectId).first<{ policy: string }>();
+        const { results } = await this.env.DB.prepare('SELECT name FROM tags WHERE project_id = ?')
+          .bind(this.projectId).all<{ name: string }>();
+        const names = results.map((r) => r.name);
+        const near = findNearDupes(trimmed, names);
+        if (proj?.policy === 'curated') {
+          throw new Error(
+            `tag "${trimmed}" does not exist and this project's tag vocabulary is curated (agents cannot mint tags). ` +
+            (near.length ? `Closest existing: ${near.join(', ')}. ` : '') +
+            'Use an existing tag (get_project.tags), or ask a human to add it.',
+          );
+        }
+        if (near.length && !allowNew) {
+          throw new Error(
+            `tag "${trimmed}" is close to existing tag(s): ${near.join(', ')} — use one of those. ` +
+            'If it is genuinely a distinct concept, pass allowNewTags: true.',
+          );
+        }
+      }
       const id = newId('tag');
       const palette = ['#4c9dff', '#b57bff', '#3fd98b', '#f5a623', '#ff8a8a', '#c6f24e', '#8a95a3'];
       const count = await this.env.DB.prepare('SELECT COUNT(*) AS n FROM tags WHERE project_id = ?')
@@ -415,10 +447,10 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
-  private async setTaskTags(projectId: string, actor: Actor, taskId: string, names: string[]) {
+  private async setTaskTags(projectId: string, actor: Actor, taskId: string, names: string[], allowNew = false) {
     const ids: string[] = [];
     for (const n of names) {
-      if (n.trim()) ids.push(await this.resolveTag(projectId, actor, n));
+      if (n.trim()) ids.push(await this.resolveTag(projectId, actor, n, allowNew));
     }
     const stmts = [this.env.DB.prepare('DELETE FROM task_tags WHERE task_id = ?').bind(taskId)];
     for (const tid of ids) {
@@ -473,7 +505,7 @@ export class ProjectRoom extends DurableObject<Env> {
       }
       await this.env.DB.batch(stmts);
       const tagNames = [...(input.tags ?? []), ...(input.category ? [input.category] : [])];
-      if (tagNames.length) await this.setTaskTags(pid, actor, id, tagNames);
+      if (tagNames.length) await this.setTaskTags(pid, actor, id, tagNames, input.allowNewTags);
       await this.emit(actor, 'task.created', 'task', id, {
         key, title: input.title, parentTaskId: input.parentTaskId ?? null,
       });
@@ -487,12 +519,15 @@ export class ProjectRoom extends DurableObject<Env> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const task = await this.getTask(taskId);
+      // Consumed by the tag paths only — must not reach the generic field loop.
+      const allowNewTags = patch.allowNewTags;
+      delete patch.allowNewTags;
       if (patch.category !== undefined) {
         patch.tags = patch.category ? [patch.category] : [];
         delete patch.category;
       }
       if (patch.tags !== undefined) {
-        await this.setTaskTags(projectId, actor, taskId, patch.tags);
+        await this.setTaskTags(projectId, actor, taskId, patch.tags, allowNewTags);
         delete patch.tags;
         // Tag-only updates still emit below via the fields list; ensure at least one emit.
         if (Object.keys(patch).filter((k) => k !== 'tags').length === 0) {
@@ -507,7 +542,7 @@ export class ProjectRoom extends DurableObject<Env> {
         const stmts = [];
         for (const n of patch.addTags ?? []) {
           if (!n.trim()) continue;
-          const tid = await this.resolveTag(projectId, actor, n);
+          const tid = await this.resolveTag(projectId, actor, n, allowNewTags);
           stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO task_tags (task_id, tag_id) VALUES (?, ?)').bind(taskId, tid));
         }
         for (const n of patch.removeTags ?? []) {
@@ -1371,6 +1406,39 @@ export class ProjectRoom extends DurableObject<Env> {
   }
 
   /** Delete a tag; task_tags links removed, tasks survive. */
+  /** Merge tag `from` INTO tag `into` (PLNR-194): every task/doc carrying `from` is
+   *  re-pointed to `into` (deduped), then `from` is deleted. The vocabulary-cleanup
+   *  primitive — deleteTag alone can only detach, which loses the grouping. Accepts
+   *  ids or names. */
+  async mergeTags(projectId: string, actor: Actor, from: string, into: string)  {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const resolve = async (ref: string) =>
+        this.env.DB.prepare('SELECT id, name FROM tags WHERE project_id = ? AND (id = ? OR name = ?)')
+          .bind(this.projectId, ref, ref.trim().toLowerCase()).first<{ id: string; name: string }>();
+      const src = await resolve(from);
+      const dst = await resolve(into);
+      if (!src) throw new Error(`tag "${from}" not found in this project`);
+      if (!dst) throw new Error(`tag "${into}" not found in this project — merge targets must already exist`);
+      if (src.id === dst.id) throw new Error('cannot merge a tag into itself');
+      const [tasks, docs] = await Promise.all([
+        this.env.DB.prepare('SELECT COUNT(*) AS n FROM task_tags WHERE tag_id = ?').bind(src.id).first<{ n: number }>(),
+        this.env.DB.prepare('SELECT COUNT(*) AS n FROM doc_tags WHERE tag_id = ?').bind(src.id).first<{ n: number }>(),
+      ]);
+      await this.env.DB.batch([
+        this.env.DB.prepare('INSERT OR IGNORE INTO task_tags (task_id, tag_id) SELECT task_id, ? FROM task_tags WHERE tag_id = ?').bind(dst.id, src.id),
+        this.env.DB.prepare('DELETE FROM task_tags WHERE tag_id = ?').bind(src.id),
+        this.env.DB.prepare('INSERT OR IGNORE INTO doc_tags (doc_id, tag_id) SELECT doc_id, ? FROM doc_tags WHERE tag_id = ?').bind(dst.id, src.id),
+        this.env.DB.prepare('DELETE FROM doc_tags WHERE tag_id = ?').bind(src.id),
+        this.env.DB.prepare('DELETE FROM tags WHERE id = ?').bind(src.id),
+      ]);
+      await this.emit(actor, 'tag.merged', 'tag', dst.id, {
+        from: src.name, into: dst.name, retaggedTasks: tasks?.n ?? 0, retaggedDocs: docs?.n ?? 0,
+      });
+      return { ok: true, from: src.name, into: dst.name, retaggedTasks: tasks?.n ?? 0, retaggedDocs: docs?.n ?? 0 };
+    });
+  }
+
   async deleteTag(projectId: string, actor: Actor, tagId: string)  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
@@ -1544,10 +1612,10 @@ export class ProjectRoom extends DurableObject<Env> {
 
   /** Replace a doc's tag set (PLNR-188) — same vocabulary as task tags (resolveTag
    *  auto-creates), so one set of words filters both tasks and docs. */
-  private async setDocTags(projectId: string, actor: Actor, docId: string, names: string[]) {
+  private async setDocTags(projectId: string, actor: Actor, docId: string, names: string[], allowNew = false) {
     const ids: string[] = [];
     for (const n of names) {
-      if (n.trim()) ids.push(await this.resolveTag(projectId, actor, n));
+      if (n.trim()) ids.push(await this.resolveTag(projectId, actor, n, allowNew));
     }
     const stmts = [this.env.DB.prepare('DELETE FROM doc_tags WHERE doc_id = ?').bind(docId)];
     for (const tid of ids) {
@@ -1558,7 +1626,7 @@ export class ProjectRoom extends DurableObject<Env> {
 
   /** Project docs (PLNR-158) — freeform markdown reference material. Writes go through
    *  the DO like every other mutation (evented + WS fanout); reads are direct D1. */
-  async createDoc(projectId: string, actor: Actor, input: { name: string; description?: string; body?: string; folder?: string; tags?: string[] }) {
+  async createDoc(projectId: string, actor: Actor, input: { name: string; description?: string; body?: string; folder?: string; tags?: string[]; allowNewTags?: boolean }) {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       requireDecisionOnlyDoc(input.body); // PLNR-183: docs state decisions, not questions
@@ -1567,7 +1635,7 @@ export class ProjectRoom extends DurableObject<Env> {
         'INSERT INTO docs (id, project_id, name, description, body, folder, author_kind, author_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       ).bind(id, this.projectId, input.name, input.description ?? '', input.body ?? '',
         ProjectRoom.normalizeFolder(input.folder ?? ''), actor.kind, actor.name).run();
-      if (input.tags?.length) await this.setDocTags(projectId, actor, id, input.tags);
+      if (input.tags?.length) await this.setDocTags(projectId, actor, id, input.tags, input.allowNewTags);
       await this.emit(actor, 'doc.created', 'doc', id, { name: input.name });
       this.reindexSearch('doc', id);
       return { id, name: input.name };
@@ -1576,7 +1644,7 @@ export class ProjectRoom extends DurableObject<Env> {
 
   async updateDoc(
     projectId: string, actor: Actor, docId: string,
-    patch: { name?: string; description?: string; body?: string; folder?: string; tags?: string[]; addTags?: string[]; removeTags?: string[] },
+    patch: { name?: string; description?: string; body?: string; folder?: string; tags?: string[]; addTags?: string[]; removeTags?: string[]; allowNewTags?: boolean },
   ) {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
@@ -1587,13 +1655,13 @@ export class ProjectRoom extends DurableObject<Env> {
       let touched = false;
       // Tag edits (PLNR-188), mirroring the task patterns: `tags` replaces; add/remove edit.
       if (patch.tags !== undefined) {
-        await this.setDocTags(projectId, actor, docId, patch.tags);
+        await this.setDocTags(projectId, actor, docId, patch.tags, patch.allowNewTags);
         touched = true;
       } else if (patch.addTags?.length || patch.removeTags?.length) {
         const stmts = [];
         for (const n of patch.addTags ?? []) {
           if (!n.trim()) continue;
-          const tid = await this.resolveTag(projectId, actor, n);
+          const tid = await this.resolveTag(projectId, actor, n, patch.allowNewTags);
           stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO doc_tags (doc_id, tag_id) VALUES (?, ?)').bind(docId, tid));
         }
         for (const n of patch.removeTags ?? []) {

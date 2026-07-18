@@ -63,6 +63,14 @@ order them accordingly. Never tag with status, type, or priority words (\`bug\`,
 \`in-progress\`, \`p1\`, …) — those concepts live in dedicated fields and the server
 rejects them as tags.
 
+Tags are the project's **shared filter vocabulary**, not per-item keywords: reuse the
+existing set (\`get_project\` → tags) before minting, keep it to 1–3 per item, and only
+mint a name that will group several items. The server rejects near-duplicates of
+existing tags (\`building-system\` when \`building\` exists) unless you pass
+\`allowNewTags\` for a genuinely distinct concept — and on **curated** projects agents
+cannot mint tags at all. Health-check a vocabulary with \`tag_report\`; consolidate
+duplicates with \`merge_tags\` (maintenance, not routine).
+
 ## Finding things
 
 Large projects hold hundreds of tasks, docs and plans — search, don't scroll, and
@@ -140,7 +148,7 @@ blocks the doc's central claim, or narrow the doc's scope and ship what IS settl
 
 \`list_docs\` shows the index (check it before working unfamiliar ground); \`get_doc\`
 reads one, including the tasks that cite it. Docs are organized two ways: **tags**
-(the SAME vocabulary as task tags — tag every doc you write, filter with
+(the SAME shared vocabulary as task tags — 1–3 reused tags per doc, filter with
 \`list_docs {tag}\`) and a **folder** path ("design/networking") that exists purely
 for human browsing — you never need it to address a doc, the id does that; reuse
 existing folders rather than minting near-duplicates. Tasks and docs link both ways: pass
