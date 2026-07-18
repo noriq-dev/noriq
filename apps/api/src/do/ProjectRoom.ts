@@ -488,6 +488,15 @@ export class ProjectRoom extends DurableObject<Env> {
       // Doc links (PLNR-182) validate BEFORE the insert batch so a bad doc id fails the
       // whole create cleanly instead of leaving a task without its intended links.
       const docIds = await this.requireProjectDocs(input.docIds);
+      // Tags resolve BEFORE the insert too (PLNR-197): the mint guard can reject
+      // (near-duplicate / curated policy), and a post-insert rejection used to leave a
+      // half-created untagged task behind. Failing here fails the whole create; the
+      // worst leftover is a freshly-minted tag with zero uses, which is harmless.
+      const tagNames = [...(input.tags ?? []), ...(input.category ? [input.category] : [])];
+      const tagIds: string[] = [];
+      for (const n of tagNames) {
+        if (n.trim()) tagIds.push(await this.resolveTag(pid, actor, n, input.allowNewTags));
+      }
       const stmts = [
         this.env.DB.prepare(
           `INSERT INTO tasks (id, project_id, key, milestone_id, board_id, parent_task_id, title, body, status, type, priority, estimate, due_at, "order", created_at, updated_at)
@@ -503,9 +512,10 @@ export class ProjectRoom extends DurableObject<Env> {
       for (const docId of docIds) {
         stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO task_docs (task_id, doc_id) VALUES (?, ?)').bind(id, docId));
       }
+      for (const tid of tagIds) {
+        stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO task_tags (task_id, tag_id) VALUES (?, ?)').bind(id, tid));
+      }
       await this.env.DB.batch(stmts);
-      const tagNames = [...(input.tags ?? []), ...(input.category ? [input.category] : [])];
-      if (tagNames.length) await this.setTaskTags(pid, actor, id, tagNames, input.allowNewTags);
       await this.emit(actor, 'task.created', 'task', id, {
         key, title: input.title, parentTaskId: input.parentTaskId ?? null,
       });
