@@ -192,8 +192,17 @@ export function useAppStore() {
     const snap = await api.snapshot(pid);
     maybeReloadForNewVersion(snap.version);
     if (pidRef.current !== pid) return;
+    // PLNR-112: overlapping /snapshot fetches (a WS-triggered refresh racing an
+    // action refresh(), or two rapid WS events) can resolve out of order. Drop any
+    // response whose newest event seq is older than what we've already applied —
+    // otherwise a stale snapshot overwrites newer state AND regresses lastSeq, which
+    // is then sent as sinceSeq on the next WS resubscribe. seq is monotonic per
+    // project, so max-seq is a reliable freshness cursor. (A project switch resets
+    // lastSeq to 0 in selectProject, so a new project's first snapshot always applies.)
+    const maxSeq = Math.max(0, ...snap.events.map((e) => e.seq));
+    if (maxSeq < lastSeq.current) return;
     setSnapshot(snap);
-    lastSeq.current = Math.max(0, ...snap.events.map((e) => e.seq));
+    lastSeq.current = maxSeq;
   }, []);
 
   // A new deploy bumps the server's package version (see /api/health): reload the tab
