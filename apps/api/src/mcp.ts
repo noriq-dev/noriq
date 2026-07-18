@@ -377,7 +377,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       if (args.groupId && !(await canUseGroup(env, agent.userId, args.groupId))) {
         throw new Error('you must be a member or the creator of the target group');
       }
-      const id = `prj_${args.key.toLowerCase()}`;
+      // Random id, NOT prj_<key> (PLNR-106): a key-derived id is a cross-tenant existence
+      // oracle (guess prj_acme to learn ACME exists) and lowers the bar for any missing-
+      // projectId authz gap. key stays a label; the id is unguessable and looked up, never derived.
+      const id = newId('prj');
       await env.DB.prepare(
         `INSERT INTO projects (id, key, name, description, status, repo_url, claim_ttl_seconds, owner_user_id, group_id, created_at) VALUES (?, ?, ?, ?, 'active', ?, 1800, ?, ?, ?)`,
       ).bind(id, args.key, args.name, args.description ?? '', args.repoUrl ?? null, agent.userId, args.groupId ?? null, nowIso()).run();

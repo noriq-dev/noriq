@@ -666,7 +666,7 @@ app.get('/api/tasks/:tid', userAuth, async (c) => {
 app.post('/api/projects', userAuth, async (c) => {
   const body = await c.req.json<{ key: string; name: string; description?: string }>();
   if (!/^[A-Z][A-Z0-9]{0,7}$/.test(body.key ?? '')) return c.json({ error: 'key must be 1-8 uppercase letters/digits' }, 400);
-  const id = `prj_${body.key.toLowerCase()}`;
+  const id = newId('prj'); // random, not prj_<key> — see create_project in mcp.ts (PLNR-106)
   await c.env.DB.prepare(
     `INSERT INTO projects (id, key, name, description, status, claim_ttl_seconds, owner_user_id, created_at) VALUES (?, ?, ?, ?, 'active', 1800, ?, ?)`,
   ).bind(id, body.key, body.name, body.description ?? '', c.var.user!.id, nowIso()).run();
