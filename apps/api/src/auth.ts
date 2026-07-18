@@ -105,10 +105,12 @@ export async function agentAuth(c: Context<AppContext>, next: Next) {
             a.allowed_tools AS agentAllowedTools,
             COALESCE(cl.name, 'MCP client') AS clientName
      FROM oauth_tokens t
+     JOIN users u ON u.id = t.user_id
      LEFT JOIN agents a ON a.id = t.agent_id AND a.status != 'revoked'
      LEFT JOIN oauth_clients cl ON cl.id = t.client_id
      WHERE t.token_hash = ? AND t.revoked_at IS NULL
-       AND t.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
+       AND t.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       AND u.disabled = 0`,
   ).bind(hash).first<{
     tokenId: string; userId: string; clientId: string; clientName: string; boundAgentId: string | null;
     copilotId: string | null;
