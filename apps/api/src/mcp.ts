@@ -16,6 +16,7 @@ import {
 } from './lib/visibility';
 import { taskSearchFilters } from './lib/search';
 import { search, searchBackend, reindexProject } from './search';
+import { DOC_SKILL_MD } from './skill-docs';
 import { signUploadToken } from './lib/upload-token';
 import { taskClaimability } from './lib/claimability';
 
@@ -597,7 +598,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'create_doc',
-    'Record a SETTLED decision or established fact as a project doc (markdown). The contract (enforced): docs are static, complete entities stating explicit design decisions and facts — no TBD/TODO, no open questions, no "we should discuss". If something is still undecided, it is not doc material yet: get the decision (request_input) or track the work (a task), THEN write the doc stating the outcome. Give it a clear name and one-line description (the pair future agents scan in list_docs), and link it to the tasks that implement it via create_task/update_task docIds. For revising an existing doc use update_doc.',
+    'Record a SETTLED decision or established fact as a project doc (markdown). FIRST doc of your session? Read the authoring guide first — resources/read noriq://skill/doc-authoring (or GET /skill/docs.md) — it covers what belongs in a doc, the shapes that work, and placement. The contract (enforced): docs are static, complete entities stating explicit design decisions and facts — no TBD/TODO, no open questions, no "we should discuss". An undecided point is never encoded as fact: settle it (request_input) if it blocks the doc\'s central claim, or scope the doc to exclude it and ship what IS settled. Give it a clear name and one-line description (the pair future agents scan in list_docs), and link it to the tasks that implement it via create_task/update_task docIds. For revising an existing doc use update_doc.',
     {
       projectId: z.string(),
       name: z.string().min(1).max(120),
@@ -611,7 +612,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'update_doc',
-    'Revise a project doc to the CURRENT truth — pass the FULL new body (read it first via get_doc). A stale doc misleads every agent that reads it; when a decision changes, the doc changes with it, stating the new decision (not the deliberation). The same contract as create_doc is enforced: decisions and facts only, nothing open-ended.',
+    'Revise a project doc to the CURRENT truth — pass the FULL new body (read it first via get_doc). A stale doc misleads every agent that reads it; when a decision changes, the doc changes with it, stating the new decision (not the deliberation). The same contract as create_doc is enforced: decisions and facts only, nothing open-ended — for a substantial rewrite, read the authoring guide first (resources/read noriq://skill/doc-authoring).',
     {
       projectId: z.string(),
       docId: z.string(),
@@ -1544,6 +1545,20 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         : { uri: uri.href, mimeType, blob: bytesToBase64(bytes) };
       return { contents: [content] };
     },
+  );
+
+  // The doc-authoring skill (PLNR-190) as a static resource, for clients that browse
+  // resources; get_doc_guide is the reliable path (every MCP client can call tools).
+  resourceSpecs.push({
+    name: 'doc-authoring-skill',
+    uriTemplate: 'noriq://skill/doc-authoring',
+    description: 'The doc-authoring guide — how to write project docs that last (also via get_doc_guide or GET /skill/docs.md)',
+  });
+  server.registerResource(
+    'doc-authoring-skill',
+    'noriq://skill/doc-authoring',
+    { title: 'Doc-authoring guide', description: 'How to write Noriq project docs that last', mimeType: 'text/markdown' },
+    async (uri) => ({ contents: [{ uri: uri.href, mimeType: 'text/markdown', text: DOC_SKILL_MD }] }),
   );
 
   // Expose the captured specs so the reference doc can be generated from them.

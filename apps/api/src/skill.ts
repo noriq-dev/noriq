@@ -133,9 +133,10 @@ directed delegation instead of releasing into the pool. Check progress with
 Projects carry a knowledge base of reference docs, and docs follow a hard contract:
 **a doc is a static, complete entity stating explicit design decisions and facts.**
 Nothing open-ended survives the write seam — TBD/TODO markers, open questions, and
-"we should discuss" phrasing are rejected with the offending lines listed. If a thing
-is still undecided it is not doc material: get the decision (\`request_input\`) or
-track the work (a task), then write the doc stating the outcome.
+"we should discuss" phrasing are rejected with the offending lines listed. An
+undecided point is never encoded as fact: settle it (\`request_input\`) when it
+blocks the doc's central claim, or narrow the doc's scope and ship what IS settled
+— an open question elsewhere does not block documenting a settled component.
 
 \`list_docs\` shows the index (check it before working unfamiliar ground); \`get_doc\`
 reads one, including the tasks that cite it. Docs are organized two ways: **tags**
@@ -149,6 +150,10 @@ they are the design decisions your work is expected to honor. When you establish
 something durable the next agent should know, \`create_doc\` the outcome (or bring an
 existing doc to the current truth with \`update_doc\`) instead of leaving it buried in
 a comment.
+
+Before your first doc of a session, read the **doc-authoring guide** — what belongs
+in a doc, the shapes that work, and how to write bodies that last: the MCP resource
+\`noriq://skill/doc-authoring\` (resources/read), or \`GET /skill/docs.md\`.
 
 ## Git
 

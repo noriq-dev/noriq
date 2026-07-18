@@ -57,6 +57,7 @@ export function requireDecisionOnlyDoc(body: string | undefined): void {
   const more = violations.length > 8 ? `\n  …and ${violations.length - 8} more` : '';
   throw new Error(
     `doc rejected — docs are static, complete records of explicit decisions and facts, and this body is open-ended:\n${shown}${more}\n` +
-    'Resolve the open points first (ask a human via request_input, or track the work as a task), then write the doc stating the outcome.',
+    'Resolve the open points first (ask a human via request_input, or track the work as a task), then write the doc stating the outcome. ' +
+    'The full authoring guide is the resource noriq://skill/doc-authoring (or GET /skill/docs.md).',
   );
 }

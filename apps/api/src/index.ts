@@ -14,6 +14,7 @@ import { verifyUploadToken } from './lib/upload-token';
 import { USER_PROJECT_WHERE, taskWireStatus, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
 import type { Actor, RunView } from './do/ProjectRoom';
 import { SKILL_MD } from './skill';
+import { DOC_SKILL_MD } from './skill-docs';
 import { issueTokens, metadataRoutes, oauth } from './oauth';
 import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
@@ -140,6 +141,7 @@ app.all('/mcp', agentAuth, async (c) => {
 
 // --- agent skill (served by Noriq itself; ROADMAP Phase 5) -------------------
 app.get('/skill.md', (c) => c.text(SKILL_MD, 200, { 'Content-Type': 'text/markdown; charset=utf-8' }));
+app.get('/skill/docs.md', (c) => c.text(DOC_SKILL_MD, 200, { 'Content-Type': 'text/markdown; charset=utf-8' }));
 
 // --- MCP tool reference, generated from the zod schemas (PLNR-23) --------------
 app.get('/reference.md', (c) =>
