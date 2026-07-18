@@ -55,6 +55,21 @@ export async function verifyPassword(password: string, stored: string): Promise<
   return timingSafeEqualHex(hex(bits), hashHex);
 }
 
+// A well-formed dummy hash (correct scheme/iters/lengths so verifyPassword runs the full
+// PBKDF2) used to burn identical work when no account or password hash exists.
+const DUMMY_HASH = `pbkdf2$${PBKDF2_ITER}$${'0'.repeat(32)}$${'0'.repeat(64)}`;
+
+// Timing-side-channel-safe verify (PLNR-105): always runs one PBKDF2 verify regardless of
+// whether the account/hash exists, so the response time doesn't reveal account existence.
+// A missing hash verifies against a constant fake and always returns false.
+export async function verifyPasswordConstantTime(
+  password: string,
+  stored: string | null | undefined,
+): Promise<boolean> {
+  const ok = await verifyPassword(password, stored || DUMMY_HASH);
+  return stored ? ok : false;
+}
+
 async function pbkdf2(password: string, salt: Uint8Array, iterations = PBKDF2_ITER): Promise<Uint8Array> {
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
   const bits = await crypto.subtle.deriveBits(

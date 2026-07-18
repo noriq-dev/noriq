@@ -437,11 +437,13 @@ oauth.post('/authorize', async (c) => {
   let user = await currentUser(c);
   if (!user && form.decision === 'login') {
     // Inline login on the consent page (sets no session cookie; single-shot consent).
-    const { verifyPassword } = await import('./lib/util');
+    const { verifyPasswordConstantTime } = await import('./lib/util');
     const row = await c.env.DB.prepare('SELECT id, name, email, password_hash AS hash FROM users WHERE email = ? AND disabled = 0')
       .bind(String(form.email ?? '').toLowerCase()).first<{ id: string; name: string; email: string; hash: string | null }>();
-    if (row?.hash && (await verifyPassword(String(form.password ?? ''), row.hash))) {
-      user = row;
+    // Constant-time verify (PLNR-105): a dummy PBKDF2 runs when the account/hash is absent so
+    // timing doesn't reveal whether the email exists.
+    if (await verifyPasswordConstantTime(String(form.password ?? ''), row?.hash)) {
+      user = row!;
     } else {
       return c.html(consentPage(v.name, [], p, null, 'invalid credentials'), 401);
     }
@@ -672,13 +674,15 @@ oauth.post('/device', async (c) => {
   if (!user && decision === 'login') {
     // Inline login, mirroring the consent page: no session cookie is set — this is a
     // single-shot approval, not a browser sign-in.
-    const { verifyPassword } = await import('./lib/util');
+    const { verifyPasswordConstantTime } = await import('./lib/util');
     const row = await c.env.DB.prepare('SELECT id, name, email, password_hash AS hash FROM users WHERE email = ? AND disabled = 0')
       .bind(String(form.email ?? '').toLowerCase()).first<{ id: string; name: string; email: string; hash: string | null }>();
-    if (!row?.hash || !(await verifyPassword(String(form.password ?? ''), row.hash))) {
+    // Constant-time verify (PLNR-105): a dummy PBKDF2 runs when the account/hash is absent so
+    // timing doesn't reveal whether the email exists.
+    if (!(await verifyPasswordConstantTime(String(form.password ?? ''), row?.hash))) {
       return c.html(devicePage({ user: null, userCode, state: 'enter', error: 'invalid credentials' }), 401);
     }
-    user = row;
+    user = row!;
   }
   if (!user) return c.html(devicePage({ user: null, userCode, state: 'enter', error: 'sign in first' }), 401);
 

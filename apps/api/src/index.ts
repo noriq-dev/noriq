@@ -7,7 +7,7 @@ import { adminAuth, agentAuth, readSessionId, resolveSessionAgent, SESSION_CLEAR
 import { buildMcpServer } from './mcp';
 import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot } from './backup';
-import { hashPassword, newApiKey, newId, nowIso, sha256Hex, verifyPassword } from './lib/util';
+import { hashPassword, newApiKey, newId, nowIso, sha256Hex, verifyPassword, verifyPasswordConstantTime } from './lib/util';
 import { taskSearchFilters } from './lib/search';
 import { search, searchBackend, reindexProject, type SearchKind } from './search';
 import { verifyUploadToken } from './lib/upload-token';
@@ -285,7 +285,11 @@ app.post('/api/auth/login', async (c) => {
   const user = await c.env.DB.prepare('SELECT id, email, name, role, password_hash AS hash FROM users WHERE email = ? AND disabled = 0')
     .bind((email ?? '').toLowerCase())
     .first<{ id: string; email: string; name: string; role: string; hash: string | null }>();
-  if (!user?.hash || !(await verifyPassword(password ?? '', user.hash))) {
+  // Constant-time regardless of whether the account exists (PLNR-105): a dummy PBKDF2 verify
+  // runs even when there's no user/hash, so response timing doesn't enumerate accounts. The
+  // `!user` check comes after the verify so both branches pay the same cost.
+  const ok = await verifyPasswordConstantTime(password ?? '', user?.hash);
+  if (!ok || !user) {
     return c.json({ error: 'invalid credentials' }, 401);
   }
   const sid = crypto.randomUUID() + crypto.randomUUID().replace(/-/g, '');

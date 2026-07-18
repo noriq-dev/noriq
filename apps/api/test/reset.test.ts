@@ -24,9 +24,19 @@ describe('forgot / reset password (PLNR-87)', () => {
   it('forgot responds uniformly and mints a token only for a real account', async () => {
     const count = async () =>
       ((await env.DB.prepare('SELECT COUNT(*) AS n FROM password_resets WHERE user_id = ?').bind(userId).first<{ n: number }>())?.n) ?? 0;
+    // The token insert + email now happen off the response path (in waitUntil) to close the
+    // timing oracle (PLNR-105), so poll rather than reading the count synchronously.
+    const waitForCount = async (want: number) => {
+      for (let i = 0; i < 50; i++) {
+        if ((await count()) === want) return;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      return count();
+    };
     const before = await count();
     expect((await post('/api/auth/forgot', { email: 'reset-me@example.com' })).status).toBe(200);
     expect((await post('/api/auth/forgot', { email: 'ghost@example.com' })).status).toBe(200); // no enumeration
+    await waitForCount(before + 1);
     expect(await count()).toBe(before + 1); // only the real account got a token
   });
 

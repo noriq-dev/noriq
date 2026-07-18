@@ -133,17 +133,22 @@ const rateLimitAuth = async (c: { env: Env; req: { header: (n: string) => string
 onboarding.post('/api/auth/forgot', async (c) => {
   if (!(await rateLimitAuth(c))) return c.json({ error: 'too many attempts — slow down' }, 429);
   const { email } = await c.req.json<{ email?: string }>().catch(() => ({ email: undefined }));
-  const user = email
-    ? await c.env.DB.prepare('SELECT id, email, name FROM users WHERE email = ? AND disabled = 0')
-        .bind(email.toLowerCase()).first<{ id: string; email: string; name: string }>()
-    : null;
-  if (user) {
+  const origin = new URL(c.req.url).origin;
+  // Do the lookup + DB insert + email send OFF the response path (PLNR-105): the account
+  // lookup and the expensive email work only happen for existing accounts, so running them
+  // before responding would make the response measurably slower for real emails and leak
+  // existence via timing. waitUntil equalizes the response regardless of whether it exists.
+  c.executionCtx.waitUntil((async () => {
+    const user = email
+      ? await c.env.DB.prepare('SELECT id, email, name FROM users WHERE email = ? AND disabled = 0')
+          .bind(email.toLowerCase()).first<{ id: string; email: string; name: string }>()
+      : null;
+    if (!user) return;
     const token = newApiKey().replace('plnr_', 'plnrpw_');
     await c.env.DB.prepare('INSERT INTO password_resets (id, token_hash, user_id, expires_at) VALUES (?, ?, ?, ?)')
       .bind(newId('pwr'), await sha256Hex(token), user.id, new Date(Date.now() + RESET_TTL_MS).toISOString()).run();
-    const origin = new URL(c.req.url).origin;
     await sendPasswordResetEmail(c.env, { to: user.email, toName: user.name, resetUrl: `${origin}/reset/${token}`, origin });
-  }
+  })());
   // Uniform response regardless of whether the account exists (no enumeration).
   return c.json({ ok: true });
 });
