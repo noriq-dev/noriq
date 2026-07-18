@@ -232,6 +232,32 @@ describe('run agent creation (RUN-43)', () => {
     expect(briefing.you.id).toBe(body.agentId);
   });
 
+  it('a run agent cannot restatus its task via update_task — the run outcome owns the move (PLNR-192)', async () => {
+    // RUN-83 took release_task off the build floor so settleAnchorTask owns the move; but
+    // update_task.status was the adjacent door — a builder self-moved its task to review, the
+    // run then failed, and the settle guard left it stranded there. Copilots keep the override.
+    await seedRun('run_p192');
+    const body = (await (await createAgentFor(ownerToken, 'run_p192')).json()) as { agentId: string; token: string };
+    await env.DB.prepare(
+      "INSERT INTO tasks (id, project_id, key, title, status, claimed_by) VALUES ('task_p192', ?, 'RNRX-192', 't', 'in_progress', ?)",
+    ).bind(rnrxProjectId, body.agentId).run();
+
+    const refused = await mcpRpcRaw(body.token, 'tools/call', {
+      name: 'update_task', arguments: { projectId: rnrxProjectId, taskId: 'task_p192', status: 'review' },
+    });
+    expect(JSON.stringify(refused)).toMatch(/run agents don't set task status/);
+    const row = await env.DB.prepare("SELECT status FROM tasks WHERE id = 'task_p192'").first<{ status: string }>();
+    expect(row!.status).toBe('in_progress'); // unmoved
+
+    // The rest of update_task stays open to it — only the status override is closed.
+    const ok = await mcpRpcRaw(body.token, 'tools/call', {
+      name: 'update_task', arguments: { projectId: rnrxProjectId, taskId: 'task_p192', priority: 1 },
+    });
+    expect(JSON.stringify(ok)).not.toMatch(/run agents don't set task status/);
+    const after = await env.DB.prepare("SELECT priority FROM tasks WHERE id = 'task_p192'").first<{ priority: number }>();
+    expect(after!.priority).toBe(1);
+  });
+
   it('an agent created without a floor sees the full catalogue (pre-RUN-47 daemons)', async () => {
     await seedRun('run_a47b');
     const body = (await (await createAgentFor(ownerToken, 'run_a47b')).json()) as { token: string };

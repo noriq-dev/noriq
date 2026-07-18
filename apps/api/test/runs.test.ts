@@ -512,6 +512,32 @@ describe("a build run settles its anchor task from the gate outcome (RUN-83)", (
     expect((await taskRow("task_human"))!.status).toBe("done"); // untouched
   });
 
+  it("releases the run agent's claim even when the status guard refuses (PLNR-192)", async () => {
+    // The live stranding: the builder self-moved its task to review (pre-fix, via
+    // update_task.status), the run then FAILED, and the guard rightly left the status alone —
+    // but the retired agent's claim dangled until the TTL reaper. The claim is the run's own
+    // and must die with it, whatever the status guard decides.
+    await mkTask("task_dangle", "STL-DANGLE", "review");
+    const run = await anchored("task_dangle");
+    await room(pid).transitionRun(pid, actor, run.id, { status: "running", agentId: "agt_spawned" });
+    await room(pid).transitionRun(pid, actor, run.id, { status: "failed", reason: "land" });
+    const row = await taskRow("task_dangle");
+    expect(row!.status).toBe("review"); // the guard still holds — status not stomped
+    expect(row!.claimedBy).toBeNull(); // but the dead run's claim is gone
+  });
+
+  it("never clears a claim that is not the run's own (PLNR-192)", async () => {
+    // Human re-queued the task, ANOTHER agent claimed it, then the old run reached terminal:
+    // that fresh claim is someone else's work in flight, not this run's to release.
+    await env.DB.prepare(
+      "INSERT INTO tasks (id, project_id, key, title, status, claimed_by) VALUES ('task_other', ?, 'STL-OTHER', 't', 'review', 'agt_x')",
+    ).bind(pid).run();
+    const run = await anchored("task_other");
+    await room(pid).transitionRun(pid, actor, run.id, { status: "running", agentId: "agt_spawned" });
+    await room(pid).transitionRun(pid, actor, run.id, { status: "failed" });
+    expect((await taskRow("task_other"))!.claimedBy).toBe("agt_x"); // untouched
+  });
+
   it("(re-)claiming a failed task clears failed_at so the retry is not shown failed", async () => {
     // A failed task is `todo` + failed_at (the shape settleAnchorTask leaves). The claim UPDATE
     // that both claimTask sites run must drop failed_at — asserted directly, since claimTask's
