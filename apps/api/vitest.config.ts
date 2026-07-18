@@ -1,6 +1,13 @@
 import { defineWorkersConfig, readD1Migrations } from '@cloudflare/vitest-pool-workers/config';
 import path from 'node:path';
 
+// ROOT config: provides the shared TS/esbuild transform and pool defaults that every
+// workspace project inherits. The full suite runs through vitest.workspace.ts, which shards
+// the files across parallel pool projects (~10s vs ~4.5 min single-worker — see that file
+// for why sharding is the only parallelism knob available). load-test gating also lives
+// there. A workspace file, once present, governs every `vitest run` invocation — so this
+// config is not a separately-runnable serial mode; it exists to seed the transform pipeline
+// (a workspace with no root config can't transform the TS setup file) and the pool defaults.
 export default defineWorkersConfig(async () => {
   const migrations = await readD1Migrations(path.join(__dirname, 'migrations'));
   return {

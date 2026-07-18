@@ -21,12 +21,17 @@ npm run typecheck        # tsc --noEmit across workspaces
 npm test                 # all workspace tests
 ```
 
-API tests run in a real `workerd` via `@cloudflare/vitest-pool-workers` (DOs + D1 are exercised, not mocked):
+API tests run in a real `workerd` via `@cloudflare/vitest-pool-workers` (DOs + D1 are exercised, not mocked).
+The full run is **sharded across parallel pool projects** (`apps/api/vitest.workspace.ts`) — ~10s instead of
+~4.5 min single-worker (the pool can't parallelize within one project; see that file). Target one file by
+`cd`-ing in — a workspace, once present, governs every run, so `--root apps/api <file>` from the repo root no
+longer resolves the path:
 
 ```sh
-npm test --workspace @noriq-dev/api                          # full API suite
-npx vitest run --root apps/api test/oauth.test.ts        # a single test file
-npx vitest run --root apps/api test/oauth.test.ts -t "refresh"   # a single case by name
+npm test --workspace @noriq-dev/api                      # full API suite (sharded, ~10s)
+npm run test:load --workspace @noriq-dev/api             # the 28s claim-stampede stress test (off the default run)
+cd apps/api && npx vitest run test/oauth.test.ts         # a single test file
+cd apps/api && npx vitest run -t "refresh"               # a single case by name (across all shards)
 cd apps/api && npx tsc --noEmit                          # typecheck API (vitest uses esbuild — it does NOT catch type errors)
 ```
 
