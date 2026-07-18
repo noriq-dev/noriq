@@ -2,7 +2,7 @@
 // share. Humans edit here; agents read/write over MCP. Docs are organized by FOLDER
 // (a path string, purely for this view — everything addresses docs by id) and by TAGS
 // (the same vocabulary tasks use, for filtering).
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api';
 import type { AppStore } from '../store';
 import { Markdown } from './Markdown';
@@ -26,6 +26,7 @@ export function DocsView({ store }: { store: AppStore }) {
   const [eTags, setETags] = useState('');
 
   const load = () => api.docs(currentPid).then((r) => { setDocs(r.docs); }).catch(() => {});
+  const collapseInitFor = useRef<string | null>(null);
   useEffect(() => {
     // Deep link from the palette / task drawer (PLNR-186): open a specific doc on arrival.
     const hint = sessionStorage.getItem('noriq.openDoc');
@@ -34,9 +35,32 @@ export function DocsView({ store }: { store: AppStore }) {
     setEditing(false);
     setTagFilter(null);
     setCollapsed(new Set());
+    collapseInitFor.current = null;
     load();
     /* eslint-disable-next-line react-hooks/exhaustive-deps */
   }, [currentPid]);
+
+  // Live updates (PLNR-193): the WS invalidation refreshes the snapshot; ride that
+  // signal to re-fetch the docs list too, so agent-written docs appear without a
+  // manual refresh. Selection survives (matched by id); the editor's local draft
+  // state is untouched.
+  useEffect(() => {
+    if (snapshot) load();
+    /* eslint-disable-next-line react-hooks/exhaustive-deps */
+  }, [snapshot]);
+
+  // Past 5 docs, folders start collapsed so the list is navigable (PLNR-193) — once
+  // per project, so user toggles (and folders born later) are respected afterward.
+  // The selected doc's folder stays open so deep links land visible.
+  useEffect(() => {
+    if (!docs.length || collapseInitFor.current === currentPid) return;
+    collapseInitFor.current = currentPid;
+    if (docs.length > 5) {
+      const selFolder = docs.find((d) => d.id === selected)?.folder;
+      setCollapsed(new Set(docs.map((d) => d.folder).filter((f) => f && f !== selFolder)));
+    }
+    /* eslint-disable-next-line react-hooks/exhaustive-deps */
+  }, [docs, currentPid]);
 
   const sel = docs.find((d) => d.id === selected) ?? null;
   // Tasks citing the selected doc (PLNR-182) — from the live snapshot's link pairs.

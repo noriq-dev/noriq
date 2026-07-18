@@ -69,6 +69,17 @@ function parseUrl(): { pid: string | null; view: ViewId; task: string | null } {
   };
 }
 
+/** Reload the tab once when the server reports a newer deploy than this bundle
+ *  (PLNR-193). Guarded per server-version in sessionStorage so a cached index.html
+ *  can't cause a reload loop. */
+function maybeReloadForNewVersion(serverVersion: string | undefined) {
+  if (!serverVersion || serverVersion === __APP_VERSION__) return;
+  const key = 'noriq.reloadedFor';
+  if (sessionStorage.getItem(key) === serverVersion) return;
+  sessionStorage.setItem(key, serverVersion);
+  location.reload();
+}
+
 export function useAppStore() {
   const [user, setUser] = useState<UserVM | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
@@ -173,9 +184,21 @@ export function useAppStore() {
 
   const loadSnapshot = useCallback(async (pid: string) => {
     const snap = await api.snapshot(pid);
+    maybeReloadForNewVersion(snap.version);
     if (pidRef.current !== pid) return;
     setSnapshot(snap);
     lastSeq.current = Math.max(0, ...snap.events.map((e) => e.seq));
+  }, []);
+
+  // A new deploy bumps the server's package version (see /api/health): reload the tab
+  // ONCE so everyone runs the latest bundle (PLNR-193). The sessionStorage guard stops
+  // a reload loop if a cached index.html still serves the old bundle after reloading.
+  // Checked on every snapshot (active tabs) and on a slow health poll (idle tabs).
+  useEffect(() => {
+    const t = setInterval(() => {
+      api.health().then((h) => maybeReloadForNewVersion(h.version)).catch(() => {});
+    }, 5 * 60_000);
+    return () => clearInterval(t);
   }, []);
 
   const loadComments = useCallback(async (tid: string) => {

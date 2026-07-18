@@ -39,6 +39,7 @@ export const api = {
   archiveTask: (pid: string, tid: string) => req('POST', `/api/projects/${pid}/tasks/${tid}/archive`),
   restoreTask: (pid: string, tid: string) => req('POST', `/api/projects/${pid}/tasks/${tid}/restore`),
   taskDetail: (tid: string) => req<ApiTaskDetail>('GET', `/api/tasks/${tid}`),
+  health: () => req<{ ok: boolean; version?: string }>('GET', '/api/health'),
 
   createProject: (key: string, name: string, description?: string) =>
     req<{ id: string; key: string }>('POST', '/api/projects', { key, name, description }),
@@ -498,6 +499,8 @@ export interface ApiSearchHit {
 }
 
 export interface ApiSnapshot {
+  /** Server package version — deploy marker for the SPA's self-refresh (PLNR-193). */
+  version?: string;
   project: { id: string; key: string; name: string; description: string; claimTtlSeconds: number };
   tasks: Array<{
     id: string; key: string; title: string; body: string; status: string; type: string; priority: number;

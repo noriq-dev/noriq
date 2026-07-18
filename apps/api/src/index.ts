@@ -15,6 +15,7 @@ import { USER_PROJECT_WHERE, taskWireStatus, tokenCanReachProject, tokenProjectW
 import type { Actor, RunView } from './do/ProjectRoom';
 import { SKILL_MD } from './skill';
 import { DOC_SKILL_MD } from './skill-docs';
+import pkg from '../package.json';
 import { issueTokens, metadataRoutes, oauth } from './oauth';
 import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
@@ -87,12 +88,14 @@ async function requireProjectAccess(c: Context<AppContext>, next: Next) {
 app.use('/api/projects/:pid/*', userAuth, requireProjectAccess);
 
 // --- health -----------------------------------------------------------------
+// `version` comes from package.json (bumped every deploy) — the SPA compares it to
+// its own build-time version and reloads itself when a new deploy lands (PLNR-193).
 app.get('/api/health', async (c) => {
   const row = await c.env.DB.prepare('SELECT 1 AS ok').first<{ ok: number }>();
   return c.json({
     ok: row?.ok === 1,
     service: 'noriq',
-    version: '0.2.0',
+    version: pkg.version,
   });
 });
 
@@ -592,6 +595,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
   ]);
   if (!project) return c.json({ error: 'not found' }, 404);
   return c.json({
+    version: pkg.version, // deploy marker — the SPA reloads itself on mismatch (PLNR-193)
     project,
     tasks: tasks.results,
     dependencies: deps.results,
