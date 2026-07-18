@@ -22,7 +22,7 @@ describe('near-duplicate mint guard', () => {
     expect(dupe.isError).toBe(true);
     expect(dupe.text).toContain('building');
     expect(dupe.text).toContain('allowNewTags');
-    // PLNR-197: the rejection must fail the WHOLE create — no half-created untagged task.
+    // PLNR-194 hardening: the rejection must fail the WHOLE create — no half-created untagged task.
     const ghost = await mcpCall(agent.apiKey, 'search_tasks', { projectId, text: 'sprawl' });
     expect(ghost.body.matched).toBe(0);
 

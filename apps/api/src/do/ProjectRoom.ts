@@ -488,7 +488,7 @@ export class ProjectRoom extends DurableObject<Env> {
       // Doc links (PLNR-182) validate BEFORE the insert batch so a bad doc id fails the
       // whole create cleanly instead of leaving a task without its intended links.
       const docIds = await this.requireProjectDocs(input.docIds);
-      // Tags resolve BEFORE the insert too (PLNR-197): the mint guard can reject
+      // Tags resolve BEFORE the insert too (PLNR-194 hardening): the mint guard can reject
       // (near-duplicate / curated policy), and a post-insert rejection used to leave a
       // half-created untagged task behind. Failing here fails the whole create; the
       // worst leftover is a freshly-minted tag with zero uses, which is harmless.

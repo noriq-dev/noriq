@@ -460,9 +460,11 @@ function EventFeed({ store }: { store: AppStore }) {
 function Holds({ store }: { store: AppStore }) {
   const { currentPid, helpers, actions } = store;
   const tasks = helpers.tasksOf(currentPid);
+  // Only LIVE claims (PLNR-198): a hold is a task an agent currently owns — unclaimed,
+  // review, and blocked-but-unheld tasks belong to the board, not this panel.
   const rank = (s: string) => ({ in_progress: 0, review: 1, blocked: 2, todo: 3 })[s] ?? 4;
   const holds = tasks
-    .filter((t) => t.status !== 'done')
+    .filter((t) => !!t.claimedBy && t.status !== 'done' && t.status !== 'cancelled')
     .sort((a, b) => rank(helpers.effStatus(currentPid, a)) - rank(helpers.effStatus(currentPid, b)))
     .slice(0, 6);
 
@@ -472,6 +474,11 @@ function Holds({ store }: { store: AppStore }) {
         <SectionLabel>Who holds what</SectionLabel>
       </div>
       <div style={{ flex: 1, overflowY: 'auto', padding: '0 12px 14px', display: 'flex', flexDirection: 'column', gap: 9 }}>
+        {holds.length === 0 && (
+          <div style={{ padding: '18px 6px', textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>
+            no live claims — nobody is holding a task right now
+          </div>
+        )}
         {holds.map((t) => {
           const eff = helpers.effStatus(currentPid, t);
           const m = statusMeta(eff);
