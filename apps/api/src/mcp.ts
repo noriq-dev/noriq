@@ -676,7 +676,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'create_task',
-    'Create ONE task. `tags` is REQUIRED: 1+ descriptive topic/area tags, FIRST tag = primary (e.g. ["oauth", "token-refresh"]) — never status/type/priority words, those have dedicated fields. Set everything at creation: docIds for the design docs it must follow, boardId for placement, parentTaskId for a decomposition tree, dependsOn (task ids) to gate order. Before filing, semantic_search — the task may already exist. Creating several tasks? Use create_tasks (one call, shared defaults); structuring multi-phase work? create_plan. New tasks start as todo.',
+    'Create ONE task. `tags` is REQUIRED: 1+ descriptive topic/area tags, FIRST tag = primary (e.g. ["oauth", "token-refresh"]) — never status/type/priority words, those have dedicated fields. Set everything at creation: docIds for the design docs it must follow, boardId for placement, parentTaskId for a decomposition tree, dependsOn (task ids or keys in this project) to gate order. Before filing, semantic_search — the task may already exist. Creating several tasks? Use create_tasks (one call, shared defaults); structuring multi-phase work? create_plan. New tasks start as todo.',
     {
       projectId: z.string(),
       title: z.string().min(1),
@@ -686,7 +686,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       priority: z.number().int().min(0).max(4).optional(),
       estimate: z.number().int().min(0).optional().describe('Effort estimate in points (team-defined scale)'),
       dueAt: z.string().datetime().optional().describe('Deadline (ISO datetime) — overdue tasks are surfaced to humans'),
-      dependsOn: z.array(z.string()).optional(),
+      dependsOn: z.array(z.string()).optional().describe('Existing task ids or display keys in THIS project this task must wait on; cross-project or unknown refs are rejected'),
       // Optional in the schema so a missing value reaches the handler's instructive error
       // (protocol-level zod failures are generic); the contract is REQUIRED (PLNR-171).
       tags: z.array(z.string()).optional().describe('REQUIRED. Descriptive topic/area tags, primary first (e.g. ["oauth", "token-refresh"]). REUSE the project vocabulary (get_project.tags) — a tag is a shared filter, not a per-task keyword, and near-duplicates of existing tags are rejected. Never status/type/priority/milestone words.'),

@@ -497,6 +497,20 @@ export class ProjectRoom extends DurableObject<Env> {
       for (const n of tagNames) {
         if (n.trim()) tagIds.push(await this.resolveTag(pid, actor, n, input.allowNewTags));
       }
+      // Dependencies resolve BEFORE the insert batch too (PLNR-109). `dependsOn` accepts
+      // an id or a display key, but must be scoped to THIS project: `OR IGNORE` does NOT
+      // suppress FK violations, so a bad ref (e.g. a display key, or a task from another
+      // project) would abort the whole createTask batch as an opaque FK error — or, worse,
+      // a valid id from another project would satisfy the FK and silently create a
+      // cross-project dependency. Resolve each ref like createPlan / the re-parent path.
+      const depIds: string[] = [];
+      for (const ref of input.dependsOn ?? []) {
+        const dep = await this.env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+          .bind(ref, ref, pid)
+          .first<{ id: string }>();
+        if (!dep) throw new Error(`dependsOn ${ref} not found in this project`);
+        depIds.push(dep.id);
+      }
       const stmts = [
         this.env.DB.prepare(
           `INSERT INTO tasks (id, project_id, key, milestone_id, board_id, parent_task_id, title, body, status, type, priority, estimate, due_at, "order", created_at, updated_at)
@@ -504,7 +518,7 @@ export class ProjectRoom extends DurableObject<Env> {
         ).bind(id, pid, key, input.milestoneId ?? null, boardId, input.parentTaskId ?? null, input.title, input.body ?? '', input.type ?? 'feature', input.priority ?? 2, input.estimate ?? null, input.dueAt ?? null, proj.n, now, now),
         this.env.DB.prepare('UPDATE projects SET next_task_number = ? WHERE id = ?').bind(proj.n + 1, pid),
       ];
-      for (const dep of input.dependsOn ?? []) {
+      for (const dep of depIds) {
         stmts.push(
           this.env.DB.prepare('INSERT OR IGNORE INTO dependencies (task_id, depends_on_task_id) VALUES (?, ?)').bind(id, dep),
         );
@@ -2937,7 +2951,8 @@ export class ProjectRoom extends DurableObject<Env> {
         }
         for (const nt of ph.newTasks ?? []) {
           const d = input.taskDefaults ?? {};
-          // Ad-hoc dependsOn accepts ids or keys, resolved here — createTask inserts raw.
+          // Resolve dependsOn ids/keys up front so a bad ref fails the whole plan before any
+          // task is created. createTask re-validates+project-scopes each ref too (PLNR-109).
           const dependsOn = await Promise.all((nt.dependsOn ?? []).map(async (ref) => {
             const t = await this.env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
               .bind(ref, ref, projectId).first<{ id: string }>();
