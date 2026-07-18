@@ -23,7 +23,7 @@ describe('invites', () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { emailed: boolean; inviteUrl?: string };
     expect(body.emailed).toBe(false); // no EMAIL binding in tests → link fallback
-    expect(body.inviteUrl).toContain('/invite/plnri_');
+    expect(body.inviteUrl).toContain('/invite#plnri_'); // token in the #fragment (PLNR-115)
     inviteUrl = body.inviteUrl!;
   });
 
@@ -37,21 +37,29 @@ describe('invites', () => {
   });
 
   it('invite info is readable, accept sets password + signs in, reuse is refused', async () => {
-    const token = inviteUrl.split('/invite/')[1]!;
-    const info = await SELF.fetch(`https://noriq.test/api/invites/${token}`);
+    const token = inviteUrl.split('#')[1]!; // token now rides the #fragment (PLNR-115)
+    const info = await SELF.fetch('https://noriq.test/api/invites/info', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    });
     expect(info.status).toBe(200);
     expect(((await info.json()) as { email: string }).email).toBe('newbie@example.com');
 
-    const accept = await SELF.fetch(`https://noriq.test/api/invites/${token}/accept`, {
+    const accept = await SELF.fetch('https://noriq.test/api/invites/accept', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password: 'newbiepass123' }),
+      body: JSON.stringify({ token, password: 'newbiepass123' }),
     });
     expect(accept.status).toBe(200);
     expect(accept.headers.get('Set-Cookie')).toContain('noriq_session=');
 
     // token is single-use
-    const again = await SELF.fetch(`https://noriq.test/api/invites/${token}/accept`, { method: 'POST' });
+    const again = await SELF.fetch('https://noriq.test/api/invites/accept', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    });
     expect(again.status).toBe(410);
 
     // the password works for normal login

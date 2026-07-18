@@ -44,27 +44,28 @@ describe('forgot / reset password (PLNR-87)', () => {
     const oldCookie = await loginSession('reset-me@example.com', 'oldpassword1');
     await insertToken('pwr_ok', 'good-token-123', userId, 3600_000);
 
-    const info = await (await SELF.fetch('https://noriq.test/api/reset/good-token-123')).json() as { email: string };
+    // Token travels in the body now (PLNR-115), never the URL path.
+    const info = await (await post('/api/reset/info', { token: 'good-token-123' })).json() as { email: string };
     expect(info.email).toBe('reset-me@example.com');
 
-    const res = await post('/api/reset/good-token-123', { password: 'brandnewpass1' });
+    const res = await post('/api/reset', { token: 'good-token-123', password: 'brandnewpass1' });
     expect(res.status).toBe(200);
     expect(res.headers.get('Set-Cookie')).toContain('noriq_session=');
 
     // new password works, old fails, token is single-use, old session is dead
     expect(await loginSession('reset-me@example.com', 'brandnewpass1')).toBeTruthy();
     await expect(loginSession('reset-me@example.com', 'oldpassword1')).rejects.toThrow();
-    expect((await post('/api/reset/good-token-123', { password: 'evenmorenew1' })).status).toBe(410);
+    expect((await post('/api/reset', { token: 'good-token-123', password: 'evenmorenew1' })).status).toBe(410);
     expect((await SELF.fetch('https://noriq.test/api/auth/me', { headers: { Cookie: oldCookie } })).status).toBe(401);
   });
 
   it('rejects invalid, expired, and short-password requests', async () => {
-    expect((await SELF.fetch('https://noriq.test/api/reset/nope')).status).toBe(404);
+    expect((await post('/api/reset/info', { token: 'nope' })).status).toBe(404);
     await insertToken('pwr_exp', 'expired-token', userId, -1000);
-    expect((await SELF.fetch('https://noriq.test/api/reset/expired-token')).status).toBe(410);
-    expect((await post('/api/reset/expired-token', { password: 'longenough1' })).status).toBe(410);
+    expect((await post('/api/reset/info', { token: 'expired-token' })).status).toBe(410);
+    expect((await post('/api/reset', { token: 'expired-token', password: 'longenough1' })).status).toBe(410);
 
     await insertToken('pwr_short', 'short-pw-token', userId, 3600_000);
-    expect((await post('/api/reset/short-pw-token', { password: 'short' })).status).toBe(400);
+    expect((await post('/api/reset', { token: 'short-pw-token', password: 'short' })).status).toBe(400);
   });
 });

@@ -72,7 +72,9 @@ onboarding.post('/api/users/invite', userAuth, async (c) => {
     .bind(newId('inv'), await sha256Hex(token), userId, new Date(Date.now() + INVITE_TTL_MS).toISOString()).run();
 
   const origin = new URL(c.req.url).origin;
-  const inviteUrl = `${origin}/invite/${token}`;
+  // Token rides the URL #fragment (PLNR-115): the fragment is never sent to the server or any
+  // proxy, so it stays out of access logs; the SPA reads it client-side and POSTs it in a body.
+  const inviteUrl = `${origin}/invite#${token}`;
   const emailed = await sendInviteEmail(c.env, {
     to: body.email,
     toName: body.name,
@@ -85,11 +87,15 @@ onboarding.post('/api/users/invite', userAuth, async (c) => {
   return c.json({ userId, emailed, inviteUrl: emailed ? undefined : inviteUrl });
 });
 
-onboarding.get('/api/invites/:token', async (c) => {
+// Token arrives in the POST body (PLNR-115), never the URL path — so it stays out of server
+// and proxy access logs. The SPA reads it from the link's #fragment and posts it here.
+onboarding.post('/api/invites/info', async (c) => {
+  const { token } = await c.req.json<{ token?: string }>().catch(() => ({ token: undefined }));
+  if (!token) return c.json({ error: 'invalid invite' }, 404);
   const row = await c.env.DB.prepare(
     `SELECT i.expires_at AS exp, i.accepted_at AS accepted, u.name, u.email
      FROM invites i JOIN users u ON u.id = i.user_id WHERE i.token_hash = ?`,
-  ).bind(await sha256Hex(c.req.param('token')!)).first<{ exp: string; accepted: string | null; name: string; email: string }>();
+  ).bind(await sha256Hex(token)).first<{ exp: string; accepted: string | null; name: string; email: string }>();
   if (!row) return c.json({ error: 'invalid invite' }, 404);
   if (row.accepted) return c.json({ error: 'invite already used' }, 410);
   if (row.exp < nowIso()) return c.json({ error: 'invite expired' }, 410);
@@ -98,18 +104,18 @@ onboarding.get('/api/invites/:token', async (c) => {
 
 /** Accept: the token proves identity; optionally sets a password; signs in.
  *  The invite page then offers passkey enrollment on the fresh session. */
-onboarding.post('/api/invites/:token/accept', async (c) => {
+onboarding.post('/api/invites/accept', async (c) => {
   if (!c.env.DISABLE_RATE_LIMIT) {
     const stub = c.env.RATE_LIMITER.get(c.env.RATE_LIMITER.idFromName(`auth:${c.req.header('CF-Connecting-IP') ?? 'local'}`));
     if (!(await stub.hit(20, 60_000)).ok) return c.json({ error: 'too many attempts — slow down' }, 429);
   }
-  const tokenHash = await sha256Hex(c.req.param('token')!);
+  const { token, password } = await c.req.json<{ token?: string; password?: string }>().catch(() => ({ token: undefined, password: undefined }));
+  if (!token) return c.json({ error: 'invalid or expired invite' }, 410);
   const row = await c.env.DB.prepare(
     'SELECT i.id, i.user_id AS userId, i.expires_at AS exp, i.accepted_at AS accepted FROM invites i WHERE i.token_hash = ?',
-  ).bind(tokenHash).first<{ id: string; userId: string; exp: string; accepted: string | null }>();
+  ).bind(await sha256Hex(token)).first<{ id: string; userId: string; exp: string; accepted: string | null }>();
   if (!row || row.accepted || row.exp < nowIso()) return c.json({ error: 'invalid or expired invite' }, 410);
 
-  const { password } = await c.req.json<{ password?: string }>().catch(() => ({ password: undefined }));
   if (password !== undefined && password.length < 8) return c.json({ error: 'password must be 8+ chars' }, 400);
   if (password) {
     await c.env.DB.prepare('UPDATE users SET password_hash = ? WHERE id = ?')
@@ -147,18 +153,23 @@ onboarding.post('/api/auth/forgot', async (c) => {
     const token = newApiKey().replace('plnr_', 'plnrpw_');
     await c.env.DB.prepare('INSERT INTO password_resets (id, token_hash, user_id, expires_at) VALUES (?, ?, ?, ?)')
       .bind(newId('pwr'), await sha256Hex(token), user.id, new Date(Date.now() + RESET_TTL_MS).toISOString()).run();
-    await sendPasswordResetEmail(c.env, { to: user.email, toName: user.name, resetUrl: `${origin}/reset/${token}`, origin });
+    // Token in the #fragment (PLNR-115): never sent to the server/proxies, so it stays out of logs.
+    await sendPasswordResetEmail(c.env, { to: user.email, toName: user.name, resetUrl: `${origin}/reset#${token}`, origin });
   })());
   // Uniform response regardless of whether the account exists (no enumeration).
   return c.json({ ok: true });
 });
 
+// Token arrives in the POST body (PLNR-115), never the URL path — keeping it out of access
+// logs. The SPA reads it from the reset link's #fragment and posts it here.
 /** Show who a reset token is for (so the reset page can confirm the account). */
-onboarding.get('/api/reset/:token', async (c) => {
+onboarding.post('/api/reset/info', async (c) => {
+  const { token } = await c.req.json<{ token?: string }>().catch(() => ({ token: undefined }));
+  if (!token) return c.json({ error: 'invalid reset link' }, 404);
   const row = await c.env.DB.prepare(
     `SELECT r.expires_at AS exp, r.used_at AS used, u.email, u.name
      FROM password_resets r JOIN users u ON u.id = r.user_id WHERE r.token_hash = ?`,
-  ).bind(await sha256Hex(c.req.param('token')!)).first<{ exp: string; used: string | null; email: string; name: string }>();
+  ).bind(await sha256Hex(token)).first<{ exp: string; used: string | null; email: string; name: string }>();
   if (!row) return c.json({ error: 'invalid reset link' }, 404);
   if (row.used) return c.json({ error: 'this reset link was already used' }, 410);
   if (row.exp < nowIso()) return c.json({ error: 'this reset link has expired' }, 410);
@@ -166,13 +177,14 @@ onboarding.get('/api/reset/:token', async (c) => {
 });
 
 /** Consume the token, set the new password, kill other sessions, sign in. */
-onboarding.post('/api/reset/:token', async (c) => {
+onboarding.post('/api/reset', async (c) => {
   if (!(await rateLimitAuth(c))) return c.json({ error: 'too many attempts — slow down' }, 429);
+  const { token, password } = await c.req.json<{ token?: string; password?: string }>().catch(() => ({ token: undefined, password: undefined }));
+  if (!token) return c.json({ error: 'invalid or expired reset link' }, 410);
   const row = await c.env.DB.prepare(
     'SELECT id, user_id AS userId, expires_at AS exp, used_at AS used FROM password_resets WHERE token_hash = ?',
-  ).bind(await sha256Hex(c.req.param('token')!)).first<{ id: string; userId: string; exp: string; used: string | null }>();
+  ).bind(await sha256Hex(token)).first<{ id: string; userId: string; exp: string; used: string | null }>();
   if (!row || row.used || row.exp < nowIso()) return c.json({ error: 'invalid or expired reset link' }, 410);
-  const { password } = await c.req.json<{ password?: string }>().catch(() => ({ password: undefined }));
   if (!password || password.length < 8) return c.json({ error: 'password must be 8+ chars' }, 400);
 
   await c.env.DB.batch([

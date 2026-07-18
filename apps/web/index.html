@@ -4,6 +4,9 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
+    <!-- PLNR-115: never leak the URL (which can carry an invite/reset token in its #fragment)
+         in a Referer header to fonts.googleapis.com or any outbound request. -->
+    <meta name="referrer" content="no-referrer" />
     <title>Noriq</title>
 
     <!-- Favicons -->

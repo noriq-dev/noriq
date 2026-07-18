@@ -28,9 +28,10 @@ export const api = {
   logout: () => req('POST', '/api/auth/logout'),
 
   forgotPassword: (email: string) => req<{ ok: boolean }>('POST', '/api/auth/forgot', { email }),
-  resetInfo: (token: string) => req<{ email: string; name: string }>('GET', `/api/reset/${token}`),
+  // Token travels in the POST body, never the URL (PLNR-115), so it never lands in an access log.
+  resetInfo: (token: string) => req<{ email: string; name: string }>('POST', '/api/reset/info', { token }),
   submitReset: (token: string, password: string) =>
-    req<{ user: import('./types').UserVM }>('POST', `/api/reset/${token}`, { password }),
+    req<{ user: import('./types').UserVM }>('POST', '/api/reset', { token, password }),
 
   projects: (scope?: 'all') => req<{ projects: ApiProject[]; admin: boolean }>('GET', scope === 'all' ? '/api/projects?scope=all' : '/api/projects'),
   // The snapshot always includes archived tasks (flagged by archivedAt); the store
@@ -63,9 +64,10 @@ export const api = {
 
   invite: (email: string, name: string, role: string, groupIds: string[]) =>
     req<{ userId: string; emailed: boolean; inviteUrl?: string }>('POST', '/api/users/invite', { email, name, role, groupIds }),
-  inviteInfo: (token: string) => req<{ name: string; email: string }>('GET', `/api/invites/${token}`),
+  // Token in the POST body, never the URL (PLNR-115) — keeps it out of access logs.
+  inviteInfo: (token: string) => req<{ name: string; email: string }>('POST', '/api/invites/info', { token }),
   acceptInvite: (token: string, password?: string) =>
-    req<{ user: import('./types').UserVM }>('POST', `/api/invites/${token}/accept`, { password }),
+    req<{ user: import('./types').UserVM }>('POST', '/api/invites/accept', { token, password }),
   setUserGroups: (uid: string, groupIds: string[]) => req('PUT', `/api/users/${uid}/groups`, { groupIds }),
 
   registerOptions: () => req<Record<string, unknown>>('POST', '/api/webauthn/register/options'),

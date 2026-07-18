@@ -54,14 +54,17 @@ export function App() {
   // falling back to Login. `publicFailed` flips when the project isn't public.
   const [publicFailed, setPublicFailed] = useState(false);
 
-  const inviteMatch = location.pathname.match(/^\/invite\/([^/]+)/);
-  if (inviteMatch) {
-    return <><FloatingTheme /><Invite token={inviteMatch[1]!} onDone={() => { location.href = '/'; }} /></>;
-  }
-
-  const resetMatch = location.pathname.match(/^\/reset\/([^/]+)/);
-  if (resetMatch) {
-    return <><FloatingTheme /><ResetPassword token={resetMatch[1]!} onDone={() => { location.href = '/'; }} /></>;
+  // Invite / reset links now carry the token in the URL #fragment (PLNR-115), which is never
+  // sent to the server or any proxy — so it stays out of access logs and Referer headers. The
+  // token is read here client-side and POSTed in a request body. Older path-form links
+  // (/invite/<token>) still resolve via the fallback capture group.
+  const onboardMatch = location.pathname.match(/^\/(invite|reset)(?:\/([^/]+))?\/?$/);
+  if (onboardMatch) {
+    const token = location.hash.replace(/^#/, '') || onboardMatch[2] || '';
+    const onDone = () => { location.href = '/'; };
+    return onboardMatch[1] === 'invite'
+      ? <><FloatingTheme /><Invite token={token} onDone={onDone} /></>
+      : <><FloatingTheme /><ResetPassword token={token} onDone={onDone} /></>;
   }
 
   if (store.needsSetup) {
