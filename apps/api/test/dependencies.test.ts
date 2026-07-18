@@ -75,7 +75,7 @@ describe('create_task dependsOn resolution (PLNR-109)', () => {
   };
 
   it('accepts a display key and stores the resolved id', async () => {
-    const bKey = (await mcpCall(agent.apiKey, 'get_task', { projectId, taskId: b })).body.key as string;
+    const bKey = (await mcpCall(agent.apiKey, 'get_task', { projectId, taskId: b })).body.task.key as string;
     const created = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'depends-by-key', dependsOn: [bKey] })).body;
     expect(await depsOf(created.id)).toEqual([{ taskId: created.id, dependsOnTaskId: b }]);
   });
