@@ -629,7 +629,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       // (protocol-level zod failures are generic); the contract is REQUIRED (PLNR-171).
       tags: z.array(z.string()).optional().describe('REQUIRED. Descriptive topic/area tags, primary first (e.g. ["oauth", "token-refresh"]) — auto-created for the project if new. Never status/type/priority/milestone words.'),
       type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
-      boardId: z.string().optional().describe('Board to place the task on (see get_project.boards); defaults to the project’s default board'),
+      boardId: z.string().optional().describe('Board to place the task on (see get_project.boards); defaults to the parent task’s board for subtasks, else the project’s default board'),
     },
     tool(async ({ projectId, ...input }) => {
       requireDescriptiveTags(input.tags);
@@ -715,7 +715,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'decompose_task',
-    'Orchestrator tool: create several subtasks of a parent in one call. Each subtask may depend on earlier ones by index (dependsOnIndex) to express ordering.',
+    'Orchestrator tool: create several subtasks of a parent in one call. Each subtask may depend on earlier ones by index (dependsOnIndex) to express ordering. Subtasks land on the parent\'s board unless a subtask sets its own boardId.',
     {
       projectId: z.string(),
       parentTaskId: z.string(),
@@ -724,6 +724,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           title: z.string().min(1),
           body: z.string().optional(),
           priority: z.number().int().min(0).max(4).optional(),
+          boardId: z.string().optional().describe('Board for this subtask (see get_project.boards); defaults to the parent task\'s board'),
           dependsOnIndex: z.array(z.number().int().nonnegative()).optional(),
         }),
       ).min(1).max(20),
@@ -737,7 +738,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           if (!dep) throw new Error(`dependsOnIndex ${i} refers to a subtask not yet created`);
           return dep.id;
         });
-        created.push(await r.createTask(projectId, actor, { title: st.title, body: st.body, parentTaskId, priority: st.priority, dependsOn }));
+        created.push(await r.createTask(projectId, actor, { title: st.title, body: st.body, parentTaskId, priority: st.priority, boardId: st.boardId, dependsOn }));
       }
       return { created };
     }),

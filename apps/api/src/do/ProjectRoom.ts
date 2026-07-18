@@ -429,14 +429,21 @@ export class ProjectRoom extends DurableObject<Env> {
       const id = newId('task');
       const key = `${proj.key}-${proj.n}`;
       const now = nowIso();
-      // Every task lands on a board; fall back to the creating agent's repo board lock
-      // (RUN-71), then the project's default board. The lock is consulted HERE — the one
-      // seam every creation path funnels through (create_task, create_plan's newTasks,
-      // decompose_task) — and only for run-spawned agents: a copilot or human has no run
-      // bound, so the lookup finds nothing and behavior is unchanged. A DEFAULT, not a
-      // fence: an explicit boardId still wins, because the lock is about where a repo's
-      // work lands uninstructed, not about forbidding instruction.
-      const boardId = input.boardId ?? (await this.actorRepoBoardId(actor)) ?? (await this.defaultBoardId(pid));
+      // Every task lands on a board. Placement chain, decided HERE — the one seam every
+      // creation path funnels through (create_task, create_tasks, create_plan's newTasks,
+      // decompose_task): explicit boardId (validated — a typo or a foreign project's board
+      // id must fail loudly, not as an opaque FK error or a silent cross-project placement)
+      // → the parent task's board (a subtask sits beside its parent, PLNR-181) → the
+      // creating agent's repo board lock (RUN-71, run-spawned agents only; a copilot or
+      // human has no run bound, so the lookup finds nothing) → the project's default
+      // board. The lock is a DEFAULT, not a fence: it is about where a repo's work lands
+      // uninstructed, not about forbidding instruction — and a parent's board is
+      // instruction too, since someone placed that parent deliberately.
+      const boardId = input.boardId
+        ? await this.requireProjectBoard(input.boardId)
+        : (await this.parentBoardId(input.parentTaskId))
+          ?? (await this.actorRepoBoardId(actor))
+          ?? (await this.defaultBoardId(pid));
       const stmts = [
         this.env.DB.prepare(
           `INSERT INTO tasks (id, project_id, key, milestone_id, board_id, parent_task_id, title, body, status, type, priority, estimate, due_at, "order", created_at, updated_at)
@@ -501,6 +508,8 @@ export class ProjectRoom extends DurableObject<Env> {
           return { ok: true, key: task.key };
         }
       }
+      // Same guard as createTask: a board move must name a board of THIS project.
+      if (patch.boardId) patch.boardId = await this.requireProjectBoard(patch.boardId);
       const sets: string[] = [];
       const binds: unknown[] = [];
       const fields: Array<[keyof TaskPatch, string]> = [
@@ -1104,6 +1113,25 @@ export class ProjectRoom extends DurableObject<Env> {
       'SELECT id FROM boards WHERE project_id = ? ORDER BY "order", created_at LIMIT 1',
     ).bind(projectId).first<{ id: string }>();
     return row?.id ?? null;
+  }
+
+  /** Resolve an explicitly requested board or throw a readable error. The boards FK alone
+   *  can't do this: it doesn't know about projects, so another project's board id would
+   *  pass it and silently land the task on a foreign board. */
+  private async requireProjectBoard(boardId: string): Promise<string> {
+    const row = await this.env.DB.prepare('SELECT id FROM boards WHERE id = ? AND project_id = ?')
+      .bind(boardId, this.projectId).first<{ id: string }>();
+    if (!row) throw new Error(`board ${boardId} not found in this project (see get_project.boards)`);
+    return row.id;
+  }
+
+  /** The board a new subtask inherits (PLNR-181): its parent's, so a decomposed task's
+   *  children land beside it instead of on the default board. Null for root tasks. */
+  private async parentBoardId(parentTaskId: string | null | undefined): Promise<string | null> {
+    if (!parentTaskId) return null;
+    const row = await this.env.DB.prepare('SELECT board_id AS boardId FROM tasks WHERE id = ? AND project_id = ?')
+      .bind(parentTaskId, this.projectId).first<{ boardId: string | null }>();
+    return row?.boardId ?? null;
   }
 
   /** The board lock of the actor's repo (RUN-71): if this actor is a run-spawned agent with a
