@@ -1,6 +1,6 @@
 import type { Context, Next } from 'hono';
 import type { Env } from './env';
-import { newId, nowIso, sha256Hex } from './lib/util';
+import { newId, nowIso, sha256Hex, timingSafeEqual } from './lib/util';
 
 /** What kind of thing is working (RUN-43). See migration 0026 for the full contrast. */
 export type AgentKind = 'copilot' | 'agent';
@@ -197,7 +197,7 @@ export async function resolveSessionAgent(env: Env, conn: Connection, sessionId:
 export async function adminAuth(c: Context<AppContext>, next: Next) {
   const header = c.req.header('Authorization') ?? '';
   const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
-  if (!c.env.ADMIN_TOKEN || token !== c.env.ADMIN_TOKEN) {
+  if (!c.env.ADMIN_TOKEN || !(await timingSafeEqual(token, c.env.ADMIN_TOKEN))) {
     return c.json({ error: 'admin token required' }, 401);
   }
   await next();
