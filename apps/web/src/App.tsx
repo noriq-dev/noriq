@@ -1,4 +1,4 @@
-import { useAppStore } from './store';
+import { useAppStore, safeDecode } from './store';
 import { Rail } from './components/Rail';
 import { TopBar } from './components/TopBar';
 import { MissionControl } from './components/MissionControl';
@@ -73,7 +73,7 @@ export function App() {
   if (!store.user) {
     const pubMatch = location.pathname.match(/^\/p\/([^/]+)/);
     if (pubMatch && !publicFailed) {
-      return <><FloatingTheme /><PublicView pid={decodeURIComponent(pubMatch[1]!)} onNotPublic={() => setPublicFailed(true)} /></>;
+      return <><FloatingTheme /><PublicView pid={safeDecode(pubMatch[1]!)} onNotPublic={() => setPublicFailed(true)} /></>;
     }
     return <><FloatingTheme /><Login store={store} /></>;
   }

@@ -59,11 +59,17 @@ function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
 
 const VIEWS: ViewId[] = ['home', 'control', 'graph', 'board', 'plans', 'roadmap', 'review', 'docs', 'agents', 'runs', 'settings', 'admin'];
 
+/** decodeURIComponent throws URIError on malformed %-encoding (e.g. `/p/%`).
+ *  Unhandled during render/popstate this blanks the app (PLNR-113); fall back to the raw value. */
+export function safeDecode(s: string): string {
+  try { return decodeURIComponent(s); } catch { return s; }
+}
+
 function parseUrl(): { pid: string | null; view: ViewId; task: string | null } {
   const m = location.pathname.match(/^\/p\/([^/]+)(?:\/([a-z]+))?/);
   const view = location.pathname === '/settings' ? 'settings' : (m?.[2] as ViewId | undefined);
   return {
-    pid: m?.[1] ? decodeURIComponent(m[1]) : null,
+    pid: m?.[1] ? safeDecode(m[1]) : null,
     view: view && VIEWS.includes(view) ? view : m ? 'control' : 'home',
     task: new URLSearchParams(location.search).get('task'),
   };
