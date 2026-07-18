@@ -610,6 +610,9 @@ export class ProjectRoom extends DurableObject<Env> {
       }
       // Same guard as createTask: a board move must name a board of THIS project.
       if (patch.boardId) patch.boardId = await this.requireProjectBoard(patch.boardId);
+      // Ditto for milestones — the column allowlist blocks project_id but not a foreign
+      // project's milestone id, which would corrupt cross-project references (PLNR-114).
+      if (patch.milestoneId) patch.milestoneId = await this.requireProjectMilestone(patch.milestoneId);
       const sets: string[] = [];
       const binds: unknown[] = [];
       const fields: Array<[keyof TaskPatch, string]> = [
@@ -1248,6 +1251,15 @@ export class ProjectRoom extends DurableObject<Env> {
     const row = await this.env.DB.prepare('SELECT id FROM boards WHERE id = ? AND project_id = ?')
       .bind(boardId, this.projectId).first<{ id: string }>();
     if (!row) throw new Error(`board ${boardId} not found in this project (see get_project.boards)`);
+    return row.id;
+  }
+
+  /** Same-project guard for milestones (PLNR-114): a foreign project's milestone id would
+   *  otherwise pass straight through the column allowlist and land on the task. */
+  private async requireProjectMilestone(milestoneId: string): Promise<string> {
+    const row = await this.env.DB.prepare('SELECT id FROM milestones WHERE id = ? AND project_id = ?')
+      .bind(milestoneId, this.projectId).first<{ id: string }>();
+    if (!row) throw new Error(`milestone ${milestoneId} not found in this project (see get_project.milestones)`);
     return row.id;
   }
 

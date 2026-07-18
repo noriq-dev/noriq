@@ -144,3 +144,32 @@ describe('board placement at creation (PLNR-181)', () => {
     expect(s.tasks.find((t) => t.id === parentOnQa)?.boardId).toBe(qa);
   });
 });
+
+// PLNR-114: update_task must not accept a milestone from another project (or an unknown
+// one) — the column allowlist blocks project_id but not a foreign milestone id, which
+// would corrupt cross-project references. Same guard as the boardId case above.
+describe('milestone same-project guard on update_task (PLNR-114)', () => {
+  it('rejects an unknown or foreign-project milestoneId with a readable error, not an FK 500', async () => {
+    // A milestone owned by a DIFFERENT project.
+    const other = await mcpCall(agent.apiKey, 'create_project', { key: 'OTH', name: 'other' });
+    const foreignMs = (await mcpCall(agent.apiKey, 'create_milestone', { projectId: other.body.id, title: 'foreign M' })).body;
+
+    const foreign = await mcpCall(agent.apiKey, 'update_task', {
+      projectId, taskId, milestoneId: foreignMs.id,
+    });
+    expect(foreign.isError).toBe(true);
+    expect(foreign.text).toContain('not found in this project');
+
+    const unknown = await mcpCall(agent.apiKey, 'update_task', {
+      projectId, taskId, milestoneId: 'ms_nope',
+    });
+    expect(unknown.isError).toBe(true);
+    expect(unknown.text).toContain('not found in this project');
+
+    // and the task's milestone was not corrupted
+    const s = (await (await SELF.fetch(`https://noriq.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json()) as {
+      tasks: Array<{ id: string; milestoneId: string | null }>;
+    };
+    expect(s.tasks.find((t) => t.id === taskId)?.milestoneId ?? null).toBeNull();
+  });
+});
