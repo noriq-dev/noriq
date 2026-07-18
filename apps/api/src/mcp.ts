@@ -547,15 +547,31 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'list_docs',
-    'The project\'s knowledge base: settled design decisions, conventions, architecture facts. CHECK IT before working unfamiliar ground — a task\'s related docs (get_task.docs) plus this index are your ground truth. Returns name + description + linkedTasks count; read a body with get_doc. Docs here are trustworthy BY CONTRACT: they contain only explicit decisions and facts, never open questions.',
-    { projectId: z.string() },
-    tool(async ({ projectId }) => {
+    'The project\'s knowledge base: settled design decisions, conventions, architecture facts. CHECK IT before working unfamiliar ground — a task\'s related docs (get_task.docs) plus this index are your ground truth. Each doc carries tags (the same vocabulary as task tags — filter with `tag`) and a folder path (human organization only; never needed to address a doc, its id does that). Returns name + description + folder + tags + linkedTasks count; read a body with get_doc. Docs here are trustworthy BY CONTRACT: they contain only explicit decisions and facts, never open questions.',
+    {
+      projectId: z.string(),
+      tag: z.string().optional().describe('Only docs carrying this tag (exact name, case-insensitive)'),
+      folder: z.string().optional().describe('Only docs in this folder (exact path) and its subfolders'),
+    },
+    tool(async ({ projectId, tag, folder }) => {
+      const binds: unknown[] = [projectId];
+      let where = 'd.project_id = ?';
+      if (tag) {
+        where += ' AND EXISTS (SELECT 1 FROM doc_tags dt JOIN tags g ON g.id = dt.tag_id WHERE dt.doc_id = d.id AND g.name = ?)';
+        binds.push(tag.trim().toLowerCase());
+      }
+      if (folder) {
+        const f = String(folder).split('/').map((s: string) => s.trim()).filter(Boolean).join('/');
+        where += ' AND (d.folder = ? OR d.folder LIKE ?)';
+        binds.push(f, `${f}/%`);
+      }
       const { results } = await env.DB.prepare(
-        `SELECT d.id, d.name, d.description, d.author_name AS authorName, d.updated_at AS updatedAt,
-                (SELECT COUNT(*) FROM task_docs td WHERE td.doc_id = d.id) AS linkedTasks
-         FROM docs d WHERE d.project_id = ? ORDER BY d.updated_at DESC`,
-      ).bind(projectId).all();
-      return { docs: results.map((d) => ({ ...d, resource: docUri(String(d.id)) })) };
+        `SELECT d.id, d.name, d.description, d.folder, d.author_name AS authorName, d.updated_at AS updatedAt,
+                (SELECT COUNT(*) FROM task_docs td WHERE td.doc_id = d.id) AS linkedTasks,
+                (SELECT GROUP_CONCAT(g.name) FROM doc_tags dt JOIN tags g ON g.id = dt.tag_id WHERE dt.doc_id = d.id) AS tags
+         FROM docs d WHERE ${where} ORDER BY d.folder, d.updated_at DESC`,
+      ).bind(...binds).all();
+      return { docs: results.map((d) => ({ ...d, tags: d.tags ? String(d.tags).split(',') : [], resource: docUri(String(d.id)) })) };
     }),
   );
 
@@ -565,9 +581,12 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     { projectId: z.string(), docId: z.string() },
     tool(async ({ projectId, docId }) => {
       const doc = await env.DB.prepare(
-        'SELECT id, name, description, body, author_name AS authorName, updated_at AS updatedAt FROM docs WHERE id = ? AND project_id = ?',
+        `SELECT d.id, d.name, d.description, d.body, d.folder, d.author_name AS authorName, d.updated_at AS updatedAt,
+                (SELECT GROUP_CONCAT(g.name) FROM doc_tags dt JOIN tags g ON g.id = dt.tag_id WHERE dt.doc_id = d.id) AS tags
+         FROM docs d WHERE d.id = ? AND d.project_id = ?`,
       ).bind(docId, projectId).first();
       if (!doc) throw new Error(`doc ${docId} not found in this project`);
+      doc.tags = doc.tags ? String(doc.tags).split(',') : [];
       const { results: tasks } = await env.DB.prepare(
         `SELECT t.id, t.key, t.title, ${taskWireStatus('t')} AS status
          FROM task_docs td JOIN tasks t ON t.id = td.task_id WHERE td.doc_id = ? ORDER BY t.key`,
@@ -584,8 +603,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       name: z.string().min(1).max(120),
       description: z.string().max(300).optional().describe('One line: what a reader finds inside'),
       body: z.string().optional().describe('The document, markdown'),
+      folder: z.string().max(200).optional().describe('Folder path for human browsing, e.g. "design/networking" — organizational only, the doc is always addressed by its id. Reuse existing folders (see list_docs) before minting new ones.'),
+      tags: z.array(z.string()).optional().describe('Descriptive topic/area tags, SAME vocabulary as task tags (auto-created) — how agents and humans filter the knowledge base. Tag every doc.'),
     },
-    tool(async ({ projectId, name, description, body }) => room(env, projectId).createDoc(projectId, actor, { name, description, body })),
+    tool(async ({ projectId, name, description, body, folder, tags }) => room(env, projectId).createDoc(projectId, actor, { name, description, body, folder, tags })),
   );
 
   defineTool(
@@ -597,8 +618,13 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       name: z.string().min(1).max(120).optional(),
       description: z.string().max(300).optional(),
       body: z.string().optional().describe('Full replacement markdown'),
+      folder: z.string().max(200).optional().describe('Move the doc to this folder path ("" = root) — organizational only, links and ids are unaffected'),
+      tags: z.array(z.string()).optional().describe('REPLACES the tag set ([] clears) — prefer addTags/removeTags for edits'),
+      addTags: z.array(z.string()).optional().describe('Add these tags, keeping existing ones (auto-created if new)'),
+      removeTags: z.array(z.string()).optional().describe('Remove these tags, keeping the rest'),
     },
-    tool(async ({ projectId, docId, name, description, body }) => room(env, projectId).updateDoc(projectId, actor, docId, { name, description, body })),
+    tool(async ({ projectId, docId, name, description, body, folder, tags, addTags, removeTags }) =>
+      room(env, projectId).updateDoc(projectId, actor, docId, { name, description, body, folder, tags, addTags, removeTags })),
   );
 
   defineTool(

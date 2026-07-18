@@ -44,9 +44,9 @@ export const api = {
     req<{ id: string; key: string }>('POST', '/api/projects', { key, name, description }),
   groups: () => req<{ groups: Array<{ id: string; name: string; description: string; canEdit: number }> }>('GET', '/api/groups'),
   createGroup: (name: string, description?: string) => req<{ id: string }>('POST', '/api/groups', { name, description }),
-  docs: (pid: string) => req<{ docs: Array<{ id: string; name: string; description: string; body: string; authorKind: string; authorName: string; updatedAt: string }> }>('GET', `/api/projects/${pid}/docs`),
-  createDoc: (pid: string, input: { name: string; description?: string; body?: string }) => req<{ id: string }>('POST', `/api/projects/${pid}/docs`, input),
-  updateDoc: (pid: string, did: string, patch: { name?: string; description?: string; body?: string }) => req('PATCH', `/api/projects/${pid}/docs/${did}`, patch),
+  docs: (pid: string) => req<{ docs: Array<{ id: string; name: string; description: string; body: string; folder: string; tags: string[]; authorKind: string; authorName: string; updatedAt: string }> }>('GET', `/api/projects/${pid}/docs`),
+  createDoc: (pid: string, input: { name: string; description?: string; body?: string; folder?: string; tags?: string[] }) => req<{ id: string }>('POST', `/api/projects/${pid}/docs`, input),
+  updateDoc: (pid: string, did: string, patch: { name?: string; description?: string; body?: string; folder?: string; tags?: string[] }) => req('PATCH', `/api/projects/${pid}/docs/${did}`, patch),
   deleteDoc: (pid: string, did: string) => req('DELETE', `/api/projects/${pid}/docs/${did}`),
   publicSnapshot: (pid: string) => req<PublicSnapshot>('GET', `/api/public/projects/${pid}/snapshot`),
   setProjectMeta: (pid: string, meta: { groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number; ownerUserId?: string | null; public?: boolean }) =>

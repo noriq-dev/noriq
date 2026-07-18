@@ -284,8 +284,12 @@ export async function reindexProject(
               (SELECT GROUP_CONCAT(g.name, ' ') FROM task_tags tt JOIN tags g ON g.id = tt.tag_id WHERE tt.task_id = t.id) AS extra
        FROM tasks t WHERE t.project_id = ? ORDER BY t.created_at`,
     ).bind(projectId).all<{ id: string; title: string; body: string | null; extra: string | null }>(),
-    env.DB.prepare('SELECT id, name AS title, body, description AS extra FROM docs WHERE project_id = ? ORDER BY created_at')
-      .bind(projectId).all<{ id: string; title: string; body: string | null; extra: string | null }>(),
+    env.DB.prepare(
+      `SELECT d.id, d.name AS title, d.body,
+              (d.description || ' ' || d.folder || ' ' ||
+               COALESCE((SELECT GROUP_CONCAT(g.name, ' ') FROM doc_tags dt JOIN tags g ON g.id = dt.tag_id WHERE dt.doc_id = d.id), '')) AS extra
+       FROM docs d WHERE d.project_id = ? ORDER BY d.created_at`,
+    ).bind(projectId).all<{ id: string; title: string; body: string | null; extra: string | null }>(),
     env.DB.prepare('SELECT id, title, body, description AS extra FROM plans WHERE project_id = ? ORDER BY created_at')
       .bind(projectId).all<{ id: string; title: string; body: string | null; extra: string | null }>(),
   ]);

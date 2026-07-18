@@ -1210,9 +1210,12 @@ export class ProjectRoom extends DurableObject<Env> {
         ).bind(id).first<{ pid: string; title: string; body: string; tags: string | null }>();
         if (t) await indexEntity(backend, { kind, id, projectId: t.pid, title: t.title, body: t.body, extra: t.tags });
       } else if (kind === 'doc') {
-        const d = await this.env.DB.prepare('SELECT project_id AS pid, name, description, body FROM docs WHERE id = ?')
-          .bind(id).first<{ pid: string; name: string; description: string; body: string }>();
-        if (d) await indexEntity(backend, { kind, id, projectId: d.pid, title: d.name, body: d.body, extra: d.description });
+        const d = await this.env.DB.prepare(
+          `SELECT d.project_id AS pid, d.name, d.description, d.body, d.folder,
+                  (SELECT GROUP_CONCAT(g.name, ' ') FROM doc_tags dt JOIN tags g ON g.id = dt.tag_id WHERE dt.doc_id = d.id) AS tags
+           FROM docs d WHERE d.id = ?`,
+        ).bind(id).first<{ pid: string; name: string; description: string; body: string; folder: string; tags: string | null }>();
+        if (d) await indexEntity(backend, { kind, id, projectId: d.pid, title: d.name, body: d.body, extra: [d.description, d.folder, d.tags].filter(Boolean).join(' ') });
       } else {
         const p = await this.env.DB.prepare('SELECT project_id AS pid, title, description, body FROM plans WHERE id = ?')
           .bind(id).first<{ pid: string; title: string; description: string; body: string }>();
@@ -1376,6 +1379,7 @@ export class ProjectRoom extends DurableObject<Env> {
       if (!tag) throw new Error('tag not found');
       await this.env.DB.batch([
         this.env.DB.prepare('DELETE FROM task_tags WHERE tag_id = ?').bind(tagId),
+        this.env.DB.prepare('DELETE FROM doc_tags WHERE tag_id = ?').bind(tagId),
         this.env.DB.prepare('DELETE FROM tags WHERE id = ?').bind(tagId),
       ]);
       await this.emit(actor, 'tag.deleted', 'tag', tagId, { name: tag.name });
@@ -1532,35 +1536,87 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
+  /** Normalize a folder path (PLNR-188): trim segments, drop empties, join with '/'.
+   *  '' = root. Purely organizational — nothing addresses a doc by folder. */
+  private static normalizeFolder(folder: string): string {
+    return folder.split('/').map((s) => s.trim()).filter(Boolean).join('/');
+  }
+
+  /** Replace a doc's tag set (PLNR-188) — same vocabulary as task tags (resolveTag
+   *  auto-creates), so one set of words filters both tasks and docs. */
+  private async setDocTags(projectId: string, actor: Actor, docId: string, names: string[]) {
+    const ids: string[] = [];
+    for (const n of names) {
+      if (n.trim()) ids.push(await this.resolveTag(projectId, actor, n));
+    }
+    const stmts = [this.env.DB.prepare('DELETE FROM doc_tags WHERE doc_id = ?').bind(docId)];
+    for (const tid of ids) {
+      stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO doc_tags (doc_id, tag_id) VALUES (?, ?)').bind(docId, tid));
+    }
+    await this.env.DB.batch(stmts);
+  }
+
   /** Project docs (PLNR-158) — freeform markdown reference material. Writes go through
    *  the DO like every other mutation (evented + WS fanout); reads are direct D1. */
-  async createDoc(projectId: string, actor: Actor, input: { name: string; description?: string; body?: string }) {
+  async createDoc(projectId: string, actor: Actor, input: { name: string; description?: string; body?: string; folder?: string; tags?: string[] }) {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       requireDecisionOnlyDoc(input.body); // PLNR-183: docs state decisions, not questions
       const id = newId('doc');
       await this.env.DB.prepare(
-        'INSERT INTO docs (id, project_id, name, description, body, author_kind, author_name) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      ).bind(id, this.projectId, input.name, input.description ?? '', input.body ?? '', actor.kind, actor.name).run();
+        'INSERT INTO docs (id, project_id, name, description, body, folder, author_kind, author_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      ).bind(id, this.projectId, input.name, input.description ?? '', input.body ?? '',
+        ProjectRoom.normalizeFolder(input.folder ?? ''), actor.kind, actor.name).run();
+      if (input.tags?.length) await this.setDocTags(projectId, actor, id, input.tags);
       await this.emit(actor, 'doc.created', 'doc', id, { name: input.name });
       this.reindexSearch('doc', id);
       return { id, name: input.name };
     });
   }
 
-  async updateDoc(projectId: string, actor: Actor, docId: string, patch: { name?: string; description?: string; body?: string }) {
+  async updateDoc(
+    projectId: string, actor: Actor, docId: string,
+    patch: { name?: string; description?: string; body?: string; folder?: string; tags?: string[]; addTags?: string[]; removeTags?: string[] },
+  ) {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const doc = await this.env.DB.prepare('SELECT id, name FROM docs WHERE id = ? AND project_id = ?')
         .bind(docId, this.projectId).first<{ id: string; name: string }>();
       if (!doc) throw new Error('doc not found in this project');
       requireDecisionOnlyDoc(patch.body); // PLNR-183: docs state decisions, not questions
+      let touched = false;
+      // Tag edits (PLNR-188), mirroring the task patterns: `tags` replaces; add/remove edit.
+      if (patch.tags !== undefined) {
+        await this.setDocTags(projectId, actor, docId, patch.tags);
+        touched = true;
+      } else if (patch.addTags?.length || patch.removeTags?.length) {
+        const stmts = [];
+        for (const n of patch.addTags ?? []) {
+          if (!n.trim()) continue;
+          const tid = await this.resolveTag(projectId, actor, n);
+          stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO doc_tags (doc_id, tag_id) VALUES (?, ?)').bind(docId, tid));
+        }
+        for (const n of patch.removeTags ?? []) {
+          const trimmed = n.trim().toLowerCase();
+          if (!trimmed) continue;
+          stmts.push(this.env.DB.prepare(
+            'DELETE FROM doc_tags WHERE doc_id = ? AND tag_id IN (SELECT id FROM tags WHERE project_id = ? AND name = ?)',
+          ).bind(docId, this.projectId, trimmed));
+        }
+        if (stmts.length) { await this.env.DB.batch(stmts); touched = true; }
+      }
       const sets: string[] = [];
       const binds: unknown[] = [];
       if (patch.name !== undefined) { sets.push('name = ?'); binds.push(patch.name); }
       if (patch.description !== undefined) { sets.push('description = ?'); binds.push(patch.description); }
       if (patch.body !== undefined) { sets.push('body = ?'); binds.push(patch.body); }
-      if (!sets.length) return { ok: true };
+      if (patch.folder !== undefined) { sets.push('folder = ?'); binds.push(ProjectRoom.normalizeFolder(patch.folder)); }
+      if (!sets.length) {
+        if (!touched) return { ok: true };
+        await this.emit(actor, 'doc.updated', 'doc', docId, { name: doc.name, fields: ['tags'] });
+        this.reindexSearch('doc', docId);
+        return { ok: true };
+      }
       sets.push('updated_at = ?');
       binds.push(nowIso(), docId);
       await this.env.DB.prepare(`UPDATE docs SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
@@ -1579,6 +1635,7 @@ export class ProjectRoom extends DurableObject<Env> {
       if (!doc) throw new Error('doc not found in this project');
       await this.env.DB.batch([
         this.env.DB.prepare('DELETE FROM task_docs WHERE doc_id = ?').bind(docId),
+        this.env.DB.prepare('DELETE FROM doc_tags WHERE doc_id = ?').bind(docId),
         this.env.DB.prepare('DELETE FROM docs WHERE id = ?').bind(docId),
       ]);
       await this.emit(actor, 'doc.deleted', 'doc', docId, { name: doc.name });
@@ -1683,6 +1740,7 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare(`DELETE FROM task_refs WHERE task_id IN (${tasksSub})`).bind(pid),
         this.env.DB.prepare(`DELETE FROM task_tags WHERE task_id IN (${tasksSub}) OR tag_id IN (SELECT id FROM tags WHERE project_id = ?)`).bind(pid, pid),
         this.env.DB.prepare(`DELETE FROM task_docs WHERE task_id IN (${tasksSub}) OR doc_id IN (SELECT id FROM docs WHERE project_id = ?)`).bind(pid, pid),
+        this.env.DB.prepare('DELETE FROM doc_tags WHERE doc_id IN (SELECT id FROM docs WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare(`DELETE FROM comments WHERE task_id IN (${tasksSub})`).bind(pid),
         this.env.DB.prepare(`DELETE FROM attachments WHERE task_id IN (${tasksSub})`).bind(pid),
         this.env.DB.prepare('DELETE FROM signals WHERE project_id = ?').bind(pid),

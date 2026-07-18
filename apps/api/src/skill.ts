@@ -138,7 +138,11 @@ is still undecided it is not doc material: get the decision (\`request_input\`) 
 track the work (a task), then write the doc stating the outcome.
 
 \`list_docs\` shows the index (check it before working unfamiliar ground); \`get_doc\`
-reads one, including the tasks that cite it. Tasks and docs link both ways: pass
+reads one, including the tasks that cite it. Docs are organized two ways: **tags**
+(the SAME vocabulary as task tags — tag every doc you write, filter with
+\`list_docs {tag}\`) and a **folder** path ("design/networking") that exists purely
+for human browsing — you never need it to address a doc, the id does that; reuse
+existing folders rather than minting near-duplicates. Tasks and docs link both ways: pass
 \`docIds\` when creating or updating a task to cite the docs it implements or must
 follow, and READ a task's related docs (\`get_task\` → \`docs\`) before starting it —
 they are the design decisions your work is expected to honor. When you establish

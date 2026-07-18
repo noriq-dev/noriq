@@ -823,12 +823,14 @@ app.get('/api/projects/:pid/docs', userAuth, async (c) => {
     .bind(c.req.param('pid')!, u.role, u.id, u.id).first();
   if (!visible) return c.json({ error: 'not found' }, 404);
   const { results } = await c.env.DB.prepare(
-    'SELECT id, name, description, body, author_kind AS authorKind, author_name AS authorName, updated_at AS updatedAt FROM docs WHERE project_id = ? ORDER BY updated_at DESC',
+    `SELECT d.id, d.name, d.description, d.body, d.folder, d.author_kind AS authorKind, d.author_name AS authorName, d.updated_at AS updatedAt,
+            (SELECT GROUP_CONCAT(g.name) FROM doc_tags dt JOIN tags g ON g.id = dt.tag_id WHERE dt.doc_id = d.id) AS tags
+     FROM docs d WHERE d.project_id = ? ORDER BY d.folder, d.updated_at DESC`,
   ).bind(c.req.param('pid')!).all();
-  return c.json({ docs: results });
+  return c.json({ docs: results.map((d) => ({ ...d, tags: d.tags ? String(d.tags).split(',') : [] })) });
 });
 app.post('/api/projects/:pid/docs', userAuth, async (c) => {
-  const body = await c.req.json<{ name: string; description?: string; body?: string }>();
+  const body = await c.req.json<{ name: string; description?: string; body?: string; folder?: string; tags?: string[] }>();
   if (!body.name?.trim()) return c.json({ error: 'name required' }, 400);
   return c.json(await room(c.env, c.req.param('pid')!).createDoc(c.req.param('pid')!, humanActor(c), body));
 });
