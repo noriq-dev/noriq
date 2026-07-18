@@ -2096,10 +2096,13 @@ app.get('/api/attachments/:aid', userAuth, async (c) => {
   if (!c.env.FILES) return c.json({ error: 'attachments not configured' }, 503);
   const obj = await c.env.FILES.get(row.key);
   if (!obj) return c.json({ error: 'file missing from storage' }, 404);
-  // Show viewable types inline (images, PDF, text, media) so a click opens in the
-  // browser instead of forcing a download. SVG is excluded — as same-origin markup it
-  // can carry script — so it downloads. Everything else downloads too.
-  const inlineable = /^(image\/(?!svg)|application\/pdf$|text\/|audio\/|video\/|application\/json)/.test(row.ct);
+  // Show viewable types inline (images, PDF, plain text, media) so a click opens in the
+  // browser instead of forcing a download. This is a STRICT allowlist, not a broad prefix
+  // match: attachments are served same-origin with the SPA, so any type the browser will
+  // execute as markup (text/html, image/svg+xml, application/xhtml+xml, …) must download,
+  // not render — otherwise a client-supplied Content-Type is stored XSS (PLNR-99). Note
+  // `text/plain` only: `text/*` would let `text/html` through. Everything else downloads.
+  const inlineable = /^(image\/(png|jpe?g|gif|webp)|application\/pdf|text\/plain|audio\/|video\/)(;|$)/.test(row.ct);
   return new Response(obj.body, {
     headers: {
       'Content-Type': row.ct,

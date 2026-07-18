@@ -86,6 +86,33 @@ describe('MCP attachments', () => {
     expect(logRes.headers.get('Content-Disposition')).toMatch(/^attachment/);
   });
 
+  it('forces download for scriptable same-origin markup (PLNR-99)', async () => {
+    await createUser('att-xss@example.com', 'Att XSS', 'longenough1', 'admin').catch(() => {});
+    const cookie = await loginSession('att-xss@example.com', 'longenough1');
+
+    // text/html, svg and xhtml execute in the app origin if served inline — they MUST download.
+    const scriptable = [
+      { filename: 'evil.html', contentType: 'text/html' },
+      { filename: 'evil.svg', contentType: 'image/svg+xml' },
+      { filename: 'evil.xhtml', contentType: 'application/xhtml+xml' },
+      { filename: 'evil.html', contentType: 'text/html; charset=utf-8' },
+    ];
+    for (const s of scriptable) {
+      const att = await mcpCall(agent.apiKey, 'add_attachment', {
+        projectId, taskId, data: btoa('<script>alert(1)</script>'), ...s,
+      });
+      const res = await SELF.fetch(`https://noriq.test/api/attachments/${att.body.id}`, { headers: { Cookie: cookie } });
+      expect(res.headers.get('Content-Disposition'), s.contentType).toMatch(/^attachment/);
+    }
+
+    // A charset param on an allowlisted type still previews inline.
+    const txt = await mcpCall(agent.apiKey, 'add_attachment', {
+      projectId, taskId, filename: 'notes.txt', data: btoa('hello'), contentType: 'text/plain; charset=utf-8',
+    });
+    const txtRes = await SELF.fetch(`https://noriq.test/api/attachments/${txt.body.id}`, { headers: { Cookie: cookie } });
+    expect(txtRes.headers.get('Content-Disposition')).toMatch(/^inline/);
+  });
+
   it('rejects a bad task', async () => {
     const r = await mcpCall(agent.apiKey, 'add_attachment', {
       projectId, taskId: 'task_nope', filename: 'x.png', data: PNG_B64,
