@@ -989,6 +989,17 @@ app.post('/api/projects/:pid/tags', userAuth, async (c) => {
 const requireAdmin = (c: { var: { user?: { role: string } } }) => c.var.user?.role === 'admin';
 
 app.get('/api/users', userAuth, async (c) => {
+  // The full directory — role, disabled flag, group ids, passkey/owned-project counts — is
+  // admin-only PII (account enumeration / phishing / "find the admins"); the admin UI is the
+  // only surface that renders it. Non-admins still get a minimal directory (id, name, email,
+  // disabled) because a group member manages their group's membership and the add-member picker
+  // resolves candidates from it (PLNR-83) — but nothing role- or metadata-revealing.
+  if (!requireAdmin(c)) {
+    const { results } = await c.env.DB.prepare(
+      'SELECT id, name, email, disabled FROM users ORDER BY created_at',
+    ).all();
+    return c.json({ users: results });
+  }
   const { results } = await c.env.DB.prepare(
     `SELECT u.id, u.email, u.name, u.role, u.disabled, u.created_at AS createdAt,
             (u.password_hash IS NULL AND NOT EXISTS (SELECT 1 FROM passkeys p WHERE p.user_id = u.id)) AS pending,
