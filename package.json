@@ -14,7 +14,8 @@
     "build": "npm run build --workspace @noriq-dev/shared && npm run build --workspace @noriq-dev/web",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
-    "deploy": "npm run build && npm run deploy --workspace @noriq-dev/api"
+    "deploy": "npm run build && npm run deploy --workspace @noriq-dev/api",
+    "deploy:demo": "npm run build && npm run deploy:demo --workspace @noriq-dev/api"
   },
   "engines": {
     "node": ">=20"

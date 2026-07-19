@@ -39,7 +39,10 @@ export default defineWorkersConfig(async () => {
           miniflare: {
             // R2 for attachment tests (the generic wrangler.jsonc doesn't bind FILES).
             r2Buckets: ['FILES'],
-            bindings: { TEST_MIGRATIONS: migrations, ADMIN_TOKEN: 'test-admin-token', DISABLE_RATE_LIMIT: true, DEMO_MODE: '1' },
+            // DEMO_MODE is NOT set here: it flips global behavior (disables /api/setup,
+            // arms the demo lockdown), so it belongs only to the dedicated `demo` project in
+            // vitest.workspace.ts, not the shared default every test inherits (PLNR-199).
+            bindings: { TEST_MIGRATIONS: migrations, ADMIN_TOKEN: 'test-admin-token', DISABLE_RATE_LIMIT: true },
             // Tests run without built web assets.
             assets: { directory: './test/fixtures/empty-assets' },
           },

@@ -13,6 +13,7 @@ import type { Context } from 'hono';
 import type { AppContext } from './auth';
 import type { Env } from './env';
 import { readSessionId } from './auth';
+import { demoLocksDown } from './lib/demo';
 import { USER_PROJECT_WHERE } from './lib/visibility';
 import { newId, nowIso, sha256Hex } from './lib/util';
 import { isCimdId, redirectUriAllowed, resolveCimdClient } from './lib/cimd';
@@ -403,6 +404,12 @@ oauth.get('/authorize', async (c) => {
   const v = await validateClient(c.env, p);
   if (!v.ok) return c.text(`invalid authorization request: ${v.err}`, 400);
   const user = await currentUser(c);
+  // A demo visitor cannot authorize a connection (PLNR-199): an agent token is the one
+  // credential that would let the demo drive the MCP/runner plane. Show the disabled state
+  // rather than a working consent button.
+  if (user && demoLocksDown(c.env, user.email)) {
+    return c.html(consentPage(v.name, [], p, user, 'Connecting agents is disabled in the demo.'), 403);
+  }
   const projects = user ? await pickableProjects(c.env.DB, user.id) : [];
   return c.html(consentPage(v.name, projects, p, user));
 });
@@ -451,6 +458,11 @@ oauth.post('/authorize', async (c) => {
     return c.html(consentPage(v.name, await pickableProjects(c.env.DB, user.id), { ...p, ...({ _u: '' } as object) } as AuthzParams, user));
   }
   if (!user) return c.html(consentPage(v.name, [], p, null, 'sign in first'), 401);
+  // The demo account may never mint an agent token (PLNR-199) — refuse before a code is
+  // created. agentAuth also rejects any such token at use-time as defense in depth.
+  if (demoLocksDown(c.env, user.email)) {
+    return c.html(consentPage(v.name, [], p, user, 'Connecting agents is disabled in the demo.'), 403);
+  }
   if (form.decision !== 'approve') return c.html(consentPage(v.name, await pickableProjects(c.env.DB, user.id), p, user), 400);
 
   // The scope decision is REQUIRED, and enforced here rather than only by the form (RUN-38).
@@ -685,6 +697,11 @@ oauth.post('/device', async (c) => {
     user = row!;
   }
   if (!user) return c.html(devicePage({ user: null, userCode, state: 'enter', error: 'sign in first' }), 401);
+  // Same demo gate as the browser consent flow (PLNR-199): the device grant is the runner's
+  // OAuth entry point, so the demo account must not be able to approve one. Denials still pass.
+  if (demoLocksDown(c.env, user.email) && decision !== 'deny') {
+    return c.html(devicePage({ user, userCode, state: 'enter', error: 'Connecting agents is disabled in the demo.' }), 403);
+  }
 
   const found = await lookupDeviceCode(c.env.DB, userCode);
   if (!found.ok) return c.html(devicePage({ user, userCode, state: 'enter', error: found.err }), 400);

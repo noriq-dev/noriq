@@ -1,0 +1,78 @@
+// Demo instance config (PLNR-199) — a deliberately "poor" deployment for demo.noriq.dev.
+// Copy to wrangler.demo.jsonc (gitignored) and fill in your values, then:
+//   npm run deploy:demo --workspace @noriq-dev/api
+//
+// The whole point is to cost almost nothing and expose almost nothing:
+//
+//  * SEPARATE worker name + D1 → its own Durable Objects and database, fully isolated from
+//    your real instance (never share `name`/`database_id` with production — that would put
+//    demo traffic on prod's DOs).
+//  * DEMO_MODE=1 → the one-click "Try the demo" login + the nightly reseed cron, AND the
+//    resource lockdown (no OAuth connections/agents/runners, no new projects/groups, no
+//    passkeys, no project delete — see demoLocksDown in src/lib/demo.ts).
+//  * NO ai / vectorize / email / r2 bindings → semantic search degrades to keyword, invites
+//    fall back to copy-links, attachments report "not configured", and the nightly backup
+//    no-ops. Every one of those paths already guards on its binding, so omitting them is the
+//    resource guarantee; DEMO_MODE is the abuse/persistence guarantee. Keep them unset.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "noriq-demo",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // The demo hostname. The noriq.dev zone must be on your Cloudflare account; wrangler
+  // creates the DNS record + cert on deploy. Delete to use noriq-demo.workers.dev instead.
+  "routes": [{ "pattern": "demo.noriq.dev", "custom_domain": true }],
+
+  "vars": {
+    "DEMO_MODE": "1",
+    // Absolute-URL base for the few links that need one; harmless to set even though the
+    // demo doesn't send email.
+    "PUBLIC_ORIGIN": "https://demo.noriq.dev"
+  },
+
+  "assets": {
+    "directory": "../web/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/mcp", "/mcp/*", "/ws", "/ws/*", "/oauth/*", "/.well-known/*", "/skill.md", "/skill/*", "/reference.md", "/reference.json"]
+  },
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "PROJECT_ROOM", "class_name": "ProjectRoom" },
+      { "name": "AGENT_SESSION", "class_name": "AgentSession" },
+      { "name": "RATE_LIMITER", "class_name": "RateLimiter" },
+      { "name": "RUNNER_HUB", "class_name": "RunnerHub" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ProjectRoom", "AgentSession"] },
+    { "tag": "v2", "new_sqlite_classes": ["RateLimiter"] },
+    { "tag": "v3", "new_sqlite_classes": ["RunnerHub"] }
+  ],
+
+  // A DEDICATED, FRESH database — create it once, then paste its id here. This must NOT be a
+  // shared/production D1: the demo lockdown (PLNR-199) assumes the demo user is a member of
+  // only prj_demo, so pointing DEMO_MODE at a DB with other projects/users would let the demo
+  // session reach them. A fresh DB also means /api/setup (disabled under DEMO_MODE) never had
+  // a chance to mint a non-demo founder admin.
+  //   npx wrangler d1 create noriq-demo
+  //   npx wrangler d1 migrations apply DB --remote --config wrangler.demo.jsonc
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "noriq-demo",
+      "database_id": "REPLACE_WITH_noriq-demo_D1_ID",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  // Nightly reseed at 06:00 UTC (PLNR-146) — this is what wipes whatever visitors did and
+  // re-plants the clean sample board. Required for a demo; the backup half self-skips under
+  // DEMO_MODE.
+  "triggers": { "crons": ["0 6 * * *"] },
+
+  "observability": { "enabled": true }
+}

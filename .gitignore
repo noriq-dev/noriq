@@ -7,6 +7,7 @@ CLAUDE.local.md
 .DS_Store
 coverage/
 wrangler.production.jsonc
+wrangler.demo.jsonc
 # Provisional: the runner's local project marker. Revisit once the runner is ready —
 # the binding is meant to be committed (it's how a checkout names its Noriq project).
 .noriq/

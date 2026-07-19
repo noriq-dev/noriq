@@ -12,6 +12,7 @@ import {
 import type { AppContext } from './auth';
 import type { Env } from './env';
 import { sessionSetCookie, userAuth } from './auth';
+import { demoLocksDown } from './lib/demo';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex } from './lib/util';
 import { sendInviteEmail, sendPasswordResetEmail } from './email';
 
@@ -204,6 +205,10 @@ onboarding.post('/api/reset', async (c) => {
 // ---------------------------------------------------------------------------
 
 onboarding.post('/api/webauthn/register/options', userAuth, async (c) => {
+  // A passkey would turn the shared, one-day demo cookie into a durable, independent login on
+  // the seeded account (PLNR-199) — refuse registration on the demo. The one-click button is
+  // the only intended way in.
+  if (demoLocksDown(c.env, c.var.user?.email)) return c.json({ error: 'passkeys are disabled in the demo' }, 403);
   const { rpID, rpName } = rp(c);
   const existing = await c.env.DB.prepare('SELECT id, transports FROM passkeys WHERE user_id = ?')
     .bind(c.var.user!.id).all<{ id: string; transports: string }>();
@@ -221,6 +226,7 @@ onboarding.post('/api/webauthn/register/options', userAuth, async (c) => {
 });
 
 onboarding.post('/api/webauthn/register/verify', userAuth, async (c) => {
+  if (demoLocksDown(c.env, c.var.user?.email)) return c.json({ error: 'passkeys are disabled in the demo' }, 403);
   const { rpID, origin } = rp(c);
   const body = await c.req.json<{ response: RegistrationResponseJSON; name?: string }>();
   const clientData = JSON.parse(atob(body.response.response.clientDataJSON.replace(/-/g, '+').replace(/_/g, '/')));

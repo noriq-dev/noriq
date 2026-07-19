@@ -17,6 +17,7 @@ import { SKILL_MD } from './skill';
 import { DOC_SKILL_MD } from './skill-docs';
 import pkg from '../package.json';
 import { issueTokens, metadataRoutes, oauth } from './oauth';
+import { demoLocksDown } from './lib/demo';
 import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
 import { z } from 'zod';
@@ -60,6 +61,14 @@ const humanActor = (c: { var: { user?: { id: string; name: string } } }): Actor 
   id: c.var.user!.id,
   name: c.var.user!.name,
 });
+
+/** The "poor demo" gate for cookie routes (PLNR-199): returns a 403 Response to short-circuit
+ *  the handler when the demo visitor tries a locked-down action, or null to proceed. Requires
+ *  userAuth to have run (c.var.user set). See demoLocksDown for the policy. */
+const demoDenied = (c: Context<AppContext>): Response | null =>
+  demoLocksDown(c.env, c.get('user')?.email)
+    ? c.json({ error: 'This action is disabled in the demo.' }, 403)
+    : null;
 
 // Gate every project-scoped route (PLNR-92): being signed in is NOT enough — you
 // must be able to REACH this project. Mirrors VISIBILITY_WHERE (owner, a member of
@@ -194,10 +203,15 @@ app.get('/ws/runner/:id', async (c) => {
   const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
   if (!token) return c.text('missing bearer token', 401);
   const tok = await c.env.DB.prepare(
-    `SELECT t.user_id AS userId FROM oauth_tokens t
+    `SELECT t.user_id AS userId, u.email AS userEmail FROM oauth_tokens t
+     JOIN users u ON u.id = t.user_id
      WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
-  ).bind(await sha256Hex(token)).first<{ userId: string }>();
+  ).bind(await sha256Hex(token)).first<{ userId: string; userEmail: string }>();
   if (!tok) return c.text('invalid or expired token', 401);
+  // This route does its own bearer lookup (a Node client sets headers), so it bypasses
+  // agentAuth's demo kill switch — re-apply it here (PLNR-199) or a rotated legacy demo
+  // token could open a runner socket.
+  if (demoLocksDown(c.env, tok.userEmail)) return c.text('the demo account cannot use API tokens', 401);
   const id = c.req.param('id')!;
   const owned = await c.env.DB.prepare('SELECT id FROM runners WHERE id = ? AND owner_user_id = ?').bind(id, tok.userId).first();
   if (!owned) return c.text('not found', 404);
@@ -232,12 +246,18 @@ app.post('/api/admin/users', adminAuth, async (c) => {
 
 // --- first-run setup (self-install) ------------------------------------------------
 // Open until the first user exists; afterwards it's a no-op that reports configured.
+// DEMO_MODE disables it outright (PLNR-199): a demo D1 starts empty and its demo user is
+// seeded lazily, so an unguarded /api/setup would let the first visitor self-install as a
+// NON-demo admin (whom demoLocksDown never matches) before that seeding runs — a full
+// takeover of the demo instance. A demo has no legitimate founder flow.
 app.get('/api/setup/status', async (c) => {
+  if (c.env.DEMO_MODE) return c.json({ needsSetup: false });
   const row = await c.env.DB.prepare('SELECT COUNT(*) AS n FROM users').first<{ n: number }>();
   return c.json({ needsSetup: (row?.n ?? 0) === 0 });
 });
 
 app.post('/api/setup', async (c) => {
+  if (c.env.DEMO_MODE) return c.json({ error: 'setup is disabled in the demo' }, 403);
   const rl = await rateLimit(c.env, `auth:${clientIp(c)}`, 10);
   if (!rl.ok) return c.json(tooMany, 429, { 'Retry-After': String(rl.retryAfter) });
   const row = await c.env.DB.prepare('SELECT COUNT(*) AS n FROM users').first<{ n: number }>();
@@ -668,6 +688,8 @@ app.get('/api/tasks/:tid', userAuth, async (c) => {
 
 // --- UI write API (all writes go through ProjectRoom; a human is just another actor) ---
 app.post('/api/projects', userAuth, async (c) => {
+  const denied = demoDenied(c); // demo stays inside the seeded project (PLNR-199)
+  if (denied) return denied;
   const body = await c.req.json<{ key: string; name: string; description?: string }>();
   if (!/^[A-Z][A-Z0-9]{0,7}$/.test(body.key ?? '')) return c.json({ error: 'key must be 1-8 uppercase letters/digits' }, 400);
   const id = newId('prj'); // random, not prj_<key> — see create_project in mcp.ts (PLNR-106)
@@ -897,6 +919,10 @@ app.delete('/api/projects/:pid/tasks/:tid', userAuth, async (c) =>
 
 // Whole-project delete — owner or admin only. Irreversible.
 app.delete('/api/projects/:pid', userAuth, async (c) => {
+  // The demo user OWNS the seeded project, so the owner gate below would let it delete the
+  // whole demo out from under the nightly reset (PLNR-199). Refuse.
+  const denied = demoDenied(c);
+  if (denied) return denied;
   const pid = c.req.param('pid')!;
   const proj = await c.env.DB.prepare('SELECT owner_user_id AS owner FROM projects WHERE id = ?').bind(pid).first<{ owner: string | null }>();
   if (!proj) return c.json({ error: 'not found' }, 404);
@@ -933,6 +959,8 @@ app.get('/api/groups', userAuth, async (c) => {
 });
 
 app.post('/api/groups', userAuth, async (c) => {
+  const denied = demoDenied(c); // no new groups in the demo (PLNR-199)
+  if (denied) return denied;
   const body = await c.req.json<{ name: string; description?: string }>();
   if (!body.name) return c.json({ error: 'name required' }, 400);
   const id = newId('grp');
@@ -945,6 +973,12 @@ app.post('/api/groups', userAuth, async (c) => {
 });
 
 app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
+  // Project meta carries the sharing/visibility levers (group, public, owner) that would let
+  // the demo escape its seeded sandbox — and the whole endpoint is outside the "light
+  // in-project work" the demo allows (PLNR-199). Refuse it wholesale; the nightly reset owns
+  // the demo project's shape anyway.
+  const denied = demoDenied(c);
+  if (denied) return denied;
   const body = await c.req.json<{ groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number; ownerUserId?: string | null; public?: boolean; tagPolicy?: 'open' | 'curated' }>();
   const sets: string[] = [];
   const binds: unknown[] = [];
@@ -1125,6 +1159,8 @@ app.post('/api/auth/change-password', userAuth, async (c) => {
 
 // --- group management -----------------------------------------------------------------
 app.patch('/api/groups/:gid', userAuth, async (c) => {
+  const denied = demoDenied(c); // the demo touches no shared groups (PLNR-199)
+  if (denied) return denied;
   const u = c.var.user!;
   const gid = c.req.param('gid')!;
   if (u.role !== 'admin' && !(await isGroupMember(c.env, u.id, gid))) {
@@ -1142,6 +1178,8 @@ app.patch('/api/groups/:gid', userAuth, async (c) => {
 });
 
 app.delete('/api/groups/:gid', userAuth, async (c) => {
+  const denied = demoDenied(c);
+  if (denied) return denied;
   const u = c.var.user!;
   const gid = c.req.param('gid')!;
   if (u.role !== 'admin' && !(await isGroupMember(c.env, u.id, gid))) {
@@ -1172,6 +1210,8 @@ app.get('/api/groups/:gid/members', userAuth, async (c) => {
 });
 
 app.post('/api/groups/:gid/members', userAuth, async (c) => {
+  const denied = demoDenied(c);
+  if (denied) return denied;
   const gid = c.req.param('gid')!;
   if (!(await requireGroupMember(c, gid))) return c.json({ error: 'only a group member can add members' }, 403);
   const { userId } = await c.req.json<{ userId: string }>();
@@ -1182,6 +1222,8 @@ app.post('/api/groups/:gid/members', userAuth, async (c) => {
 });
 
 app.delete('/api/groups/:gid/members/:uid', userAuth, async (c) => {
+  const denied = demoDenied(c);
+  if (denied) return denied;
   const gid = c.req.param('gid')!;
   if (!(await requireGroupMember(c, gid))) return c.json({ error: 'only a group member can remove members' }, 403);
   await c.env.DB.prepare('DELETE FROM user_groups WHERE user_id = ? AND group_id = ?').bind(c.req.param('uid')!, gid).run();
@@ -1601,6 +1643,8 @@ const DispatchBody = z.object({
 // the project's ProjectRoom (authoritative, dispatched) and pushes run.assigned
 // down the runner's live socket. Under /api/projects/:pid/* → project reach gated.
 app.post('/api/projects/:pid/runs', userAuth, async (c) => {
+  const denied = demoDenied(c); // the demo drives no runners (PLNR-199)
+  if (denied) return denied;
   const pid = c.req.param('pid')!;
   const parsed = DispatchBody.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) return c.json({ error: 'invalid dispatch', detail: parsed.error.issues }, 400);
@@ -1664,6 +1708,8 @@ const PlanDispatchApiBody = z.object({
   gate: z.enum(['landed', 'approved']).default('approved'),
 });
 app.post('/api/projects/:pid/plans/:planId/dispatch', userAuth, async (c) => {
+  const denied = demoDenied(c);
+  if (denied) return denied;
   const pid = c.req.param('pid')!;
   const planId = c.req.param('planId')!;
   const parsed = PlanDispatchApiBody.safeParse(await c.req.json().catch(() => ({})));
@@ -1710,6 +1756,8 @@ app.post('/api/plan-dispatches/:id/cancel', userAuth, async (c) => {
 // Re-arm tasks whose only attempts failed and pump again. The pump never retries on its
 // own — a failed agent run is a human's judgment call, and this endpoint is that judgment.
 app.post('/api/plan-dispatches/:id/retry', userAuth, async (c) => {
+  const denied = demoDenied(c);
+  if (denied) return denied;
   const id = c.req.param('id')!;
   const row = await c.env.DB.prepare('SELECT project_id AS pid FROM plan_dispatches WHERE id = ?')
     .bind(id).first<{ pid: string }>();
@@ -1760,6 +1808,8 @@ app.post('/api/runs/:runId/cancel', userAuth, async (c) => {
 // the anchor task in the same DO breath.
 const ContinueBody = z.object({ rounds: z.number().int().positive().nullable().default(null) });
 app.post('/api/runs/:runId/continue', userAuth, async (c) => {
+  const denied = demoDenied(c);
+  if (denied) return denied;
   const runId = c.req.param('runId')!;
   const parsed = ContinueBody.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) return c.json({ error: 'invalid continue', detail: parsed.error.issues }, 400);
@@ -1796,6 +1846,8 @@ const SteerBody = z.object({
   noticeCursor: z.number().int().nonnegative().nullish(),
 });
 app.post('/api/runs/:runId/steer', userAuth, async (c) => {
+  const denied = demoDenied(c);
+  if (denied) return denied;
   const runId = c.req.param('runId')!;
   const parsed = SteerBody.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) return c.json({ error: 'invalid steer', detail: parsed.error.issues }, 400);
@@ -2231,15 +2283,18 @@ export default {
   fetch: app.fetch,
   async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext) {
     // Demo deployments re-seed nightly (PLNR-146) so visitors always land on a clean board.
+    // The demo's data is disposable, so skip the backup entirely (PLNR-199) — no point
+    // spending R2 on a board that gets dropped in the same cron.
     if (env.DEMO_MODE) {
       ctx.waitUntil(import('./lib/demo').then(({ resetDemo }) => resetDemo(env)).catch(() => {}));
+    } else {
+      ctx.waitUntil(
+        backupToR2(env, new Date(event.scheduledTime).toISOString()).then((r) => {
+          // eslint-disable-next-line no-console
+          console.log(r.ok ? `[backup] wrote ${r.key}` : `[backup] skipped: ${r.reason}`);
+        }),
+      );
     }
-    ctx.waitUntil(
-      backupToR2(env, new Date(event.scheduledTime).toISOString()).then((r) => {
-        // eslint-disable-next-line no-console
-        console.log(r.ok ? `[backup] wrote ${r.key}` : `[backup] skipped: ${r.reason}`);
-      }),
-    );
     // Backstop auto-archive for projects nobody has viewed (the snapshot sweeps viewed ones).
     ctx.waitUntil(
       env.DB.prepare(

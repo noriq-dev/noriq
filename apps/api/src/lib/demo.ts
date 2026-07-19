@@ -8,7 +8,24 @@ import type { ProjectRoom } from '../do/ProjectRoom';
 import { hashPassword, newId, nowIso } from './util';
 
 export const DEMO_EMAIL = 'demo@noriq.example';
-const DEMO_PROJECT_ID = 'prj_demo';
+export const DEMO_PROJECT_ID = 'prj_demo';
+
+/**
+ * The one gate the whole "poor demo" policy hangs off (PLNR-199): true only on a demo
+ * deployment AND for the seeded demo visitor. Guards the resource-heavy / persistent /
+ * external actions a public demo must refuse — completing OAuth (→ agent tokens → custom
+ * agents & runners), creating real projects/groups, registering passkeys, deleting the
+ * seeded project. Light in-project work (tasks/comments/docs/boards on prj_demo) stays
+ * open. Cheap: a string compare that short-circuits off DEMO_MODE, so a normal deploy
+ * (DEMO_MODE unset) pays nothing and behaves exactly as before.
+ *
+ * The heavier sinks — embeddings, email, attachment blobs, backups — are handled instead
+ * by simply NOT binding AI/VECTORIZE/EMAIL/FILES in the demo's wrangler config; every one
+ * of those paths already degrades to a no-op when its binding is absent.
+ */
+export function demoLocksDown(env: Env, email: string | null | undefined): boolean {
+  return !!env.DEMO_MODE && email === DEMO_EMAIL;
+}
 
 const room = (env: Env, pid: string): DurableObjectStub<ProjectRoom> =>
   env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName(pid));

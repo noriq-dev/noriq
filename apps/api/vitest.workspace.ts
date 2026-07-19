@@ -29,16 +29,23 @@ import fs from 'node:fs';
 // ~4 cores fine (shards just queue). Tune only if the file count grows a lot.
 const SHARDS = 8;
 
+// DEMO_MODE flips GLOBAL behavior (disables first-run /api/setup; arms the demo lockdown in
+// auth/oauth/index), so it can't ride the shared default — a shard running the setup happy
+// path needs it OFF while the demo tests need it ON. These two files get their own project
+// with DEMO_MODE set; everything else runs without it (PLNR-199).
+const DEMO_FILES = ['demo.test.ts', 'demo-gates.test.ts'];
+
 const testDir = path.join(__dirname, 'test');
 const testFiles = fs
   .readdirSync(testDir)
-  .filter((f) => f.endsWith('.test.ts') && f !== 'load.test.ts')
+  .filter((f) => f.endsWith('.test.ts') && f !== 'load.test.ts' && !DEMO_FILES.includes(f))
   .sort();
 const shards: string[][] = Array.from({ length: SHARDS }, () => []);
 testFiles.forEach((f, i) => shards[i % SHARDS]!.push(`test/${f}`));
 
-// One pool project per shard. Everything but the file list is identical across shards.
-const project = (name: string, include: string[]) =>
+// One pool project per shard. Everything but the file list (and the optional extra bindings
+// the `demo` project adds) is identical across projects.
+const project = (name: string, include: string[], extraBindings: Record<string, unknown> = {}) =>
   defineWorkersProject(async () => {
     const migrations = await readD1Migrations(path.join(__dirname, 'migrations'));
     return {
@@ -73,7 +80,7 @@ const project = (name: string, include: string[]) =>
             miniflare: {
               // R2 for attachment tests (the generic wrangler.jsonc doesn't bind FILES).
               r2Buckets: ['FILES'],
-              bindings: { TEST_MIGRATIONS: migrations, ADMIN_TOKEN: 'test-admin-token', DISABLE_RATE_LIMIT: true, DEMO_MODE: '1' },
+              bindings: { TEST_MIGRATIONS: migrations, ADMIN_TOKEN: 'test-admin-token', DISABLE_RATE_LIMIT: true, ...extraBindings },
               // Tests run without built web assets.
               assets: { directory: './test/fixtures/empty-assets' },
             },
@@ -85,5 +92,8 @@ const project = (name: string, include: string[]) =>
 
 export default [
   ...shards.filter((g) => g.length).map((include, k) => project(`shard-${k}`, include)),
+  // The demo suite runs under DEMO_MODE (its own project so the flag stays off everywhere
+  // else). `npm test` selects it explicitly alongside the shards.
+  project('demo', DEMO_FILES.map((f) => `test/${f}`), { DEMO_MODE: '1' }),
   project('load', ['test/load.test.ts']),
 ];

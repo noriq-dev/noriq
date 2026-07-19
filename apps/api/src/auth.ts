@@ -1,5 +1,6 @@
 import type { Context, Next } from 'hono';
 import type { Env } from './env';
+import { demoLocksDown } from './lib/demo';
 import { newId, nowIso, sha256Hex, timingSafeEqual } from './lib/util';
 
 /** What kind of thing is working (RUN-43). See migration 0026 for the full contrast. */
@@ -100,7 +101,7 @@ export async function agentAuth(c: Context<AppContext>, next: Next) {
   // is the normal case for a human's connection.
   const t = await c.env.DB.prepare(
     `SELECT t.id AS tokenId, t.user_id AS userId, t.client_id AS clientId, t.agent_id AS boundAgentId,
-            t.copilot_id AS copilotId,
+            t.copilot_id AS copilotId, u.email AS userEmail,
             a.id AS agentId, COALESCE(a.label, a.name) AS agentName, a.role AS agentRole, a.kind AS agentKind,
             a.allowed_tools AS agentAllowedTools,
             COALESCE(cl.name, 'MCP client') AS clientName
@@ -113,11 +114,18 @@ export async function agentAuth(c: Context<AppContext>, next: Next) {
        AND u.disabled = 0`,
   ).bind(hash).first<{
     tokenId: string; userId: string; clientId: string; clientName: string; boundAgentId: string | null;
-    copilotId: string | null;
+    copilotId: string | null; userEmail: string;
     agentId: string | null; agentName: string | null; agentRole: 'orchestrator' | 'worker' | null;
     agentKind: AgentKind | null; agentAllowedTools: string | null;
   }>();
   if (!t) return unauthorized('invalid, expired, or revoked token — connect via OAuth');
+
+  // Use-time kill switch for the demo (PLNR-199). The demo never mints agent tokens — the
+  // consent flow refuses the demo account — but any token minted before DEMO_MODE was set,
+  // or via a future issuance path we miss, must ALSO be refused here so the demo account can
+  // never drive the MCP / runner / agent plane. This one check closes /mcp and every
+  // agentAuth-gated runner endpoint at once.
+  if (demoLocksDown(c.env, t.userEmail)) return unauthorized('the demo account cannot use API tokens');
 
   // A token bound to an agent that is revoked (or gone) must FAIL, not silently degrade to
   // an unbound connection — otherwise revoking a runaway agent would hand its token back the

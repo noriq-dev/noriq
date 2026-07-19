@@ -6,8 +6,10 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "sh -c 'wrangler deploy --config $([ -f wrangler.production.jsonc ] && echo wrangler.production.jsonc || echo wrangler.jsonc)'",
+    "deploy:demo": "wrangler deploy --config wrangler.demo.jsonc",
+    "db:migrate:demo": "wrangler d1 migrations apply DB --remote --config wrangler.demo.jsonc",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --project 'shard*'",
+    "test": "vitest run --project 'shard*' --project demo",
     "test:load": "vitest run --project load",
     "cf-typegen": "wrangler types",
     "db:migrate:local": "wrangler d1 migrations apply DB --local",
