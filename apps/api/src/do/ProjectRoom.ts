@@ -1805,6 +1805,63 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
+  // ---- plan-local docs (PLNR-200) ------------------------------------------------------
+  // Working documents scoped to one plan. Unlike project docs these are NOT indexed (no
+  // reindexSearch/dropSearch — they stay out of the vector store) and NOT subject to the
+  // settled-only doc contract (no requireDecisionOnlyDoc) — they are allowed to be
+  // provisional and to change as the plan's design firms up. They live and die with the plan.
+
+  async createPlanDoc(projectId: string, actor: Actor, planId: string, input: { name: string; description?: string; body?: string }) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const plan = await this.env.DB.prepare('SELECT id FROM plans WHERE id = ? AND project_id = ?')
+        .bind(planId, this.projectId).first<{ id: string }>();
+      if (!plan) throw new Error('plan not found in this project');
+      const id = newId('pdoc');
+      await this.env.DB.prepare(
+        'INSERT INTO plan_docs (id, plan_id, project_id, name, description, body, author_kind, author_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      ).bind(id, planId, this.projectId, input.name, input.description ?? '', input.body ?? '', actor.kind, actor.name).run();
+      await this.emit(actor, 'plan_doc.created', 'plan_doc', id, { name: input.name, planId });
+      return { id, planId, name: input.name };
+    });
+  }
+
+  async updatePlanDoc(
+    projectId: string, actor: Actor, docId: string,
+    patch: { name?: string; description?: string; body?: string },
+  ) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const doc = await this.env.DB.prepare('SELECT id, plan_id AS planId, name FROM plan_docs WHERE id = ? AND project_id = ?')
+        .bind(docId, this.projectId).first<{ id: string; planId: string; name: string }>();
+      if (!doc) throw new Error('plan doc not found in this project');
+      // No doclint here on purpose (PLNR-200): a plan doc may hold open questions / TBDs.
+      const sets: string[] = [];
+      const binds: unknown[] = [];
+      if (patch.name !== undefined) { sets.push('name = ?'); binds.push(patch.name); }
+      if (patch.description !== undefined) { sets.push('description = ?'); binds.push(patch.description); }
+      if (patch.body !== undefined) { sets.push('body = ?'); binds.push(patch.body); }
+      if (!sets.length) return { ok: true };
+      sets.push('updated_at = ?');
+      binds.push(nowIso(), docId);
+      await this.env.DB.prepare(`UPDATE plan_docs SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
+      await this.emit(actor, 'plan_doc.updated', 'plan_doc', docId, { name: patch.name ?? doc.name, planId: doc.planId, fields: Object.keys(patch) });
+      return { ok: true };
+    });
+  }
+
+  async deletePlanDoc(projectId: string, actor: Actor, docId: string) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const doc = await this.env.DB.prepare('SELECT id, plan_id AS planId, name FROM plan_docs WHERE id = ? AND project_id = ?')
+        .bind(docId, this.projectId).first<{ id: string; planId: string; name: string }>();
+      if (!doc) throw new Error('plan doc not found in this project');
+      await this.env.DB.prepare('DELETE FROM plan_docs WHERE id = ?').bind(docId).run();
+      await this.emit(actor, 'plan_doc.deleted', 'plan_doc', docId, { name: doc.name, planId: doc.planId });
+      return { ok: true };
+    });
+  }
+
   /** Archive / restore a plan (PLNR-148) — display-only, mirroring task archive:
    *  everything (phases, membership, minted edges, gating) stays in force; the default
    *  Plans listing just hides it. Restore brings it back. */
@@ -1836,6 +1893,7 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM phase_gates WHERE phase_id IN (SELECT id FROM phases WHERE plan_id = ?)').bind(planId),
         this.env.DB.prepare('DELETE FROM phase_tasks WHERE phase_id IN (SELECT id FROM phases WHERE plan_id = ?)').bind(planId),
         this.env.DB.prepare('DELETE FROM phases WHERE plan_id = ?').bind(planId),
+        this.env.DB.prepare('DELETE FROM plan_docs WHERE plan_id = ?').bind(planId), // PLNR-200: plan-local docs die with the plan
         this.env.DB.prepare('DELETE FROM plans WHERE id = ?').bind(planId),
       ]);
       await this.emit(actor, 'plan.deleted', 'plan', planId, { title: plan.title });
@@ -1913,6 +1971,7 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM events WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM phase_gates WHERE phase_id IN (SELECT id FROM phases WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ?))').bind(pid),
         this.env.DB.prepare('DELETE FROM phases WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ?)').bind(pid),
+        this.env.DB.prepare('DELETE FROM plan_docs WHERE project_id = ?').bind(pid), // PLNR-200: before plans (FK target)
         this.env.DB.prepare('DELETE FROM plans WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM docs WHERE project_id = ?').bind(pid),
         this.env.DB.prepare("UPDATE agents SET project_id = NULL, status = 'offline' WHERE project_id = ?").bind(pid),
@@ -3181,6 +3240,7 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM phase_gates WHERE phase_id IN (SELECT id FROM phases WHERE plan_id = ?)').bind(planId),
         this.env.DB.prepare('DELETE FROM phase_tasks WHERE phase_id IN (SELECT id FROM phases WHERE plan_id = ?)').bind(planId),
         this.env.DB.prepare('DELETE FROM phases WHERE plan_id = ?').bind(planId),
+        this.env.DB.prepare('DELETE FROM plan_docs WHERE plan_id = ?').bind(planId), // PLNR-200
         this.env.DB.prepare('DELETE FROM plans WHERE id = ?').bind(planId),
       ];
       await this.env.DB.batch(stmts);

@@ -560,7 +560,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
   if (!visible) return c.json({ error: 'not found' }, 404);
   // Auto-archive done tasks untouched for >24h whenever the project is viewed.
   await room(c.env, pid).sweepArchive(pid).catch(() => {});
-  const [project, tasks, deps, agents, events, milestones, boards, plans, phases, phaseTasks, tags, taskTags, signals, taskDocs] = await Promise.all([
+  const [project, tasks, deps, agents, events, milestones, boards, plans, phases, phaseTasks, tags, taskTags, signals, taskDocs, planDocs] = await Promise.all([
     c.env.DB.prepare('SELECT id, key, name, description, claim_ttl_seconds AS claimTtlSeconds, repo_url AS repoUrl FROM projects WHERE id = ?')
       .bind(pid).first(),
     // PLNR-150: archived tasks ship too, flagged by archivedAt. Archiving is a *board
@@ -612,6 +612,9 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
          CASE s.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, s.created_at DESC`,
     ).bind(pid).all(),
     c.env.DB.prepare('SELECT td.task_id AS taskId, td.doc_id AS docId FROM task_docs td JOIN tasks t ON t.id = td.task_id WHERE t.project_id = ?').bind(pid).all(),
+    // Plan-local docs (PLNR-200): body included so the plan view renders/edits inline
+    // (mirrors plans/phases, which also carry full body in the snapshot). Not indexed.
+    c.env.DB.prepare('SELECT id, plan_id AS planId, name, description, body, author_kind AS authorKind, author_name AS authorName, created_at AS createdAt, updated_at AS updatedAt FROM plan_docs WHERE project_id = ? ORDER BY updated_at DESC').bind(pid).all(),
   ]);
   if (!project) return c.json({ error: 'not found' }, 404);
   return c.json({
@@ -628,6 +631,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     tags: tags.results,
     taskTags: taskTags.results,
     taskDocs: taskDocs.results,
+    planDocs: planDocs.results,
     signals: signals.results.map((s) => ({
       ...s,
       options: s.options ? JSON.parse(String(s.options)) : null,
@@ -876,6 +880,18 @@ app.patch('/api/projects/:pid/docs/:did', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).updateDoc(c.req.param('pid')!, humanActor(c), c.req.param('did')!, await c.req.json())));
 app.delete('/api/projects/:pid/docs/:did', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).deleteDoc(c.req.param('pid')!, humanActor(c), c.req.param('did')!)));
+
+// Plan-local docs (PLNR-200) — working documents scoped to one plan; read via the snapshot
+// (planDocs) or MCP get_plans/get_plan_doc. Under /api/projects/:pid/* → project-reach gated.
+app.post('/api/projects/:pid/plans/:plid/docs', userAuth, async (c) => {
+  const body = await c.req.json<{ name: string; description?: string; body?: string }>();
+  if (!body.name?.trim()) return c.json({ error: 'name required' }, 400);
+  return c.json(await room(c.env, c.req.param('pid')!).createPlanDoc(c.req.param('pid')!, humanActor(c), c.req.param('plid')!, body));
+});
+app.patch('/api/projects/:pid/plans/:plid/docs/:docId', userAuth, async (c) =>
+  c.json(await room(c.env, c.req.param('pid')!).updatePlanDoc(c.req.param('pid')!, humanActor(c), c.req.param('docId')!, await c.req.json())));
+app.delete('/api/projects/:pid/plans/:plid/docs/:docId', userAuth, async (c) =>
+  c.json(await room(c.env, c.req.param('pid')!).deletePlanDoc(c.req.param('pid')!, humanActor(c), c.req.param('docId')!)));
 
 // Project search (PLNR-184) — semantic when the AI+VECTORIZE bindings exist, keyword
 // otherwise; `mode` in the response says which ran. Covers tasks, docs and plans.

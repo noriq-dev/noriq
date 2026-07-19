@@ -52,6 +52,9 @@ function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
     case 'doc.created': verb = 'doc'; subject = `wrote "${p.name ?? ''}"`; break;
     case 'doc.updated': verb = 'doc'; subject = `revised "${p.name ?? ''}"`; break;
     case 'doc.deleted': verb = 'doc'; subject = `deleted "${p.name ?? ''}"`; break;
+    case 'plan_doc.created': verb = 'plan doc'; subject = `wrote "${p.name ?? ''}"`; break;
+    case 'plan_doc.updated': verb = 'plan doc'; subject = `revised "${p.name ?? ''}"`; break;
+    case 'plan_doc.deleted': verb = 'plan doc'; subject = `deleted "${p.name ?? ''}"`; break;
     default: subject = `${e.verb} ${e.subjectId}`;
   }
   return { id: e.id, t: timeOf(e.createdAt), actor, actorKind: e.actorKind, verb, subject, taskId, dot };
@@ -663,6 +666,21 @@ export function useAppStore() {
     async rejectPlan(planId: string) {
       if (!pidRef.current) return;
       await api.rejectPlan(pidRef.current, planId);
+      refresh();
+    },
+    async createPlanDoc(planId: string, input: { name: string; description?: string; body?: string }) {
+      if (!pidRef.current) return;
+      await api.createPlanDoc(pidRef.current, planId, input);
+      refresh();
+    },
+    async updatePlanDoc(planId: string, docId: string, patch: { name?: string; description?: string; body?: string }) {
+      if (!pidRef.current) return;
+      await api.updatePlanDoc(pidRef.current, planId, docId, patch);
+      refresh();
+    },
+    async deletePlanDoc(planId: string, docId: string) {
+      if (!pidRef.current) return;
+      await api.deletePlanDoc(pidRef.current, planId, docId);
       refresh();
     },
     async deleteTag(tagId: string) {

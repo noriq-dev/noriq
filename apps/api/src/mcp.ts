@@ -146,7 +146,7 @@ const TOOL_HINTS: Record<string, ToolHints> = {
   // reads
   get_briefing: READ, my_updates: READ, list_projects: READ, get_project: READ, list_groups: READ, list_agents: READ,
   get_task: READ, search_tasks: READ, semantic_search: READ, tag_report: READ, next_claimable: READ, read_open_comments: READ, get_plans: READ, can_claim: READ,
-  list_docs: READ, get_doc: READ, update_doc: WRITE_IDEMPOTENT, list_templates: READ,
+  list_docs: READ, get_doc: READ, update_doc: WRITE_IDEMPOTENT, list_templates: READ, get_plan_doc: READ, update_plan_doc: WRITE_IDEMPOTENT,
   // writes that are safe to repeat with the same args (renew/replace-in-place/insert-or-ignore)
   heartbeat: WRITE_IDEMPOTENT, set_agent_identity: WRITE_IDEMPOTENT, update_task: WRITE_IDEMPOTENT, update_tasks: WRITE_IDEMPOTENT,
   update_plan: WRITE_IDEMPOTENT, add_dependency: WRITE_IDEMPOTENT, remove_dependency: WRITE_IDEMPOTENT, attach_ref: WRITE_IDEMPOTENT,
@@ -1473,7 +1473,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'get_plans',
-    'Plans in a project with per-phase progress (done/total tasks) — see how the work program is advancing.',
+    'Plans in a project with per-phase progress (done/total tasks) — see how the work program is advancing. Each plan also lists its plan-local docs (id/name/description); read a full one with get_plan_doc.',
     { projectId: z.string() },
     tool(async ({ projectId }) => {
       const { results: plans } = await env.DB.prepare(
@@ -1489,9 +1489,62 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
                   (SELECT GROUP_CONCAT(t.key) FROM phase_tasks pt JOIN tasks t ON t.id = pt.task_id WHERE pt.phase_id = ph.id) AS taskKeys
            FROM phases ph WHERE ph.plan_id = ? ORDER BY ph."order"`,
         ).bind(p.id).all();
-        enriched.push({ ...p, phases: phasesRows });
+        // Plan-local docs (PLNR-200): summaries only — the body is fetched on demand via
+        // get_plan_doc so a plan with many working docs doesn't bloat every get_plans.
+        const { results: docRows } = await env.DB.prepare(
+          'SELECT id, name, description, updated_at AS updatedAt FROM plan_docs WHERE plan_id = ? ORDER BY updated_at DESC',
+        ).bind(p.id).all();
+        enriched.push({ ...p, phases: phasesRows, docs: docRows });
       }
       return { plans: enriched };
+    }),
+  );
+
+  // ---- plan-local docs (PLNR-200) -------------------------------------------------------
+  // Working docs that belong to ONE plan. Unlike project docs (create_doc) they are never
+  // indexed for semantic_search and carry NO settled-only contract — they may hold open
+  // questions and evolve freely. Use them for design notes and supporting material a plan
+  // needs, so the project knowledge base (create_doc) stays reserved for settled facts.
+  defineTool(
+    'create_plan_doc',
+    'Create a working document attached to a plan (PLNR-200). Distinct from create_doc: a plan doc is scoped to this plan, is NOT searchable/indexed, and has NO "settled decisions only" rule — it may hold open questions and change as the plan evolves. Use it for design notes, scratch, or supporting material the plan needs; reserve create_doc for settled project-wide facts.',
+    {
+      projectId: z.string(),
+      planId: z.string(),
+      name: z.string().min(1).max(120),
+      description: z.string().max(300).optional().describe('One line: what a reader finds inside'),
+      body: z.string().optional().describe('The document, markdown — may be provisional'),
+    },
+    tool(async ({ projectId, planId, name, description, body }) =>
+      room(env, projectId).createPlanDoc(projectId, actor, planId, { name, description, body })),
+  );
+
+  defineTool(
+    'update_plan_doc',
+    'Revise a plan-local doc (PLNR-200) — pass the full new body (read it first via get_plan_doc). No contract is enforced; a plan doc is expected to change as the design firms up.',
+    {
+      projectId: z.string(),
+      docId: z.string(),
+      name: z.string().min(1).max(120).optional(),
+      description: z.string().max(300).optional(),
+      body: z.string().optional().describe('Full replacement markdown'),
+    },
+    tool(async ({ projectId, docId, name, description, body }) =>
+      room(env, projectId).updatePlanDoc(projectId, actor, docId, { name, description, body })),
+  );
+
+  defineTool(
+    'get_plan_doc',
+    'Read one plan-local doc in full (PLNR-200). Discover their ids via get_plans (each plan lists its docs).',
+    { projectId: z.string(), docId: z.string() },
+    tool(async ({ projectId, docId }) => {
+      const doc = await env.DB.prepare(
+        `SELECT id, plan_id AS planId, name, description, body, author_kind AS authorKind, author_name AS authorName,
+                created_at AS createdAt, updated_at AS updatedAt
+         FROM plan_docs WHERE id = ? AND project_id = ?`,
+      ).bind(docId, projectId).first();
+      if (!doc) throw new Error('plan doc not found in this project');
+      return { doc };
     }),
   );
 

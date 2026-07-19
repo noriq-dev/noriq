@@ -34,6 +34,16 @@ A doc IS NOT a home for anything that changes weekly or is still in motion:
 - a brainstorm or option list → the plan body, until a decision is made
 - work to be done → tasks
 - a meeting-notes dump → distill the decisions into the relevant docs, drop the rest
+- provisional design notes / supporting material a PLAN needs → a **plan doc**
+  (\`create_plan_doc\`), NOT a project doc
+
+**Plan docs vs project docs.** A plan doc (\`create_plan_doc\` / \`update_plan_doc\` /
+\`get_plan_doc\`) is a working document scoped to one plan: it is NOT indexed for search,
+carries NO settled-only rule, and dies with the plan. Use it for the design notes and
+supporting material a plan generates while it works — things that are allowed to hold open
+questions and change as the design firms up. Keep project docs (\`create_doc\`) for what has
+settled and belongs to the project's long-term memory. When a plan doc's decision settles
+and matters beyond the plan, restate it as a project doc.
 
 ## Before you write
 

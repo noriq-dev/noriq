@@ -50,6 +50,13 @@ export const api = {
   createDoc: (pid: string, input: { name: string; description?: string; body?: string; folder?: string; tags?: string[] }) => req<{ id: string }>('POST', `/api/projects/${pid}/docs`, input),
   updateDoc: (pid: string, did: string, patch: { name?: string; description?: string; body?: string; folder?: string; tags?: string[] }) => req('PATCH', `/api/projects/${pid}/docs/${did}`, patch),
   deleteDoc: (pid: string, did: string) => req('DELETE', `/api/projects/${pid}/docs/${did}`),
+  // Plan-local docs (PLNR-200) — reads come from the snapshot (planDocs); these are the writes.
+  createPlanDoc: (pid: string, planId: string, input: { name: string; description?: string; body?: string }) =>
+    req<{ id: string }>('POST', `/api/projects/${pid}/plans/${planId}/docs`, input),
+  updatePlanDoc: (pid: string, planId: string, docId: string, patch: { name?: string; description?: string; body?: string }) =>
+    req('PATCH', `/api/projects/${pid}/plans/${planId}/docs/${docId}`, patch),
+  deletePlanDoc: (pid: string, planId: string, docId: string) =>
+    req('DELETE', `/api/projects/${pid}/plans/${planId}/docs/${docId}`),
   publicSnapshot: (pid: string) => req<PublicSnapshot>('GET', `/api/public/projects/${pid}/snapshot`),
   setProjectMeta: (pid: string, meta: { groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number; ownerUserId?: string | null; public?: boolean }) =>
     req('PATCH', `/api/projects/${pid}/meta`, meta),
@@ -522,6 +529,8 @@ export interface ApiSnapshot {
   taskTags: Array<{ taskId: string; tagId: string }>;
   /** Task↔doc relations (PLNR-182). */
   taskDocs: Array<{ taskId: string; docId: string }>;
+  /** Plan-local working docs (PLNR-200): scoped to a plan, not indexed, no settled-only rule. */
+  planDocs: Array<{ id: string; planId: string; name: string; description: string; body: string; authorKind: string; authorName: string; createdAt: string; updatedAt: string }>;
   events: Array<{
     id: string; seq: number; actorKind: 'agent' | 'human' | 'system'; actorId: string; verb: string;
     subjectType: string; subjectId: string; payload: Record<string, unknown>; createdAt: string;

@@ -6,7 +6,7 @@ import { api, type ApiPlanDispatch, type ApiRunner, type RunEffort } from '../ap
 import type { AppStore } from '../store';
 import { statusMeta } from '../design';
 import { AvatarChip, LiveDot, MonoTag, SectionLabel } from './bits';
-import { Button, ErrorNote, Field, Select, TextInput } from './ui';
+import { Button, ErrorNote, Field, Modal, Select, TextArea, TextInput } from './ui';
 import { Markdown } from './Markdown';
 import { confirm } from './Dialog';
 
@@ -40,6 +40,7 @@ export function PlansView({ store }: { store: AppStore }) {
   const plans = showArchived ? allPlans : allPlans.filter((p) => !p.archivedAt);
   const phases = snapshot?.phases ?? [];
   const phaseTasks = snapshot?.phaseTasks ?? [];
+  const planDocs = snapshot?.planDocs ?? [];
   // Every task, archived included (PLNR-150). Phase membership comes from phase_tasks,
   // which never dropped archived rows — so resolving through a filtered list counted an
   // archived task in the denominator but never as done, decaying a finished plan toward
@@ -297,12 +298,128 @@ export function PlansView({ store }: { store: AppStore }) {
                       );
                     })}
                   </div>
+                  <PlanDocsPanel planId={plan.id} docs={planDocs.filter((d) => d.planId === plan.id)} store={store} readOnly={!!plan.archivedAt} />
                 </div>
               )}
             </div>
           );
         })}
       </div>
+    </div>
+  );
+}
+
+// Plan-local docs (PLNR-200): working documents that belong to this plan — NOT project docs.
+// They aren't searchable/indexed and carry no "settled decisions only" rule, so a plan can
+// keep design notes and supporting material that evolve as it does, without touching the
+// project knowledge base.
+type PlanDoc = { id: string; planId: string; name: string; description: string; body: string; authorKind: string; authorName: string; updatedAt: string };
+function PlanDocsPanel({ planId, docs, store, readOnly }: { planId: string; docs: PlanDoc[]; store: AppStore; readOnly: boolean }) {
+  const [openId, setOpenId] = useState<string | null>(null);
+  // editing: null = closed, {} = new doc, {id...} = editing existing
+  const [editing, setEditing] = useState<{ id?: string; name: string; description: string; body: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const save = async () => {
+    if (!editing || !editing.name.trim()) { setErr('name required'); return; }
+    setBusy(true); setErr(null);
+    try {
+      if (editing.id) await store.actions.updatePlanDoc(planId, editing.id, { name: editing.name, description: editing.description, body: editing.body });
+      else await store.actions.createPlanDoc(planId, { name: editing.name, description: editing.description, body: editing.body });
+      setEditing(null);
+    } catch (e) { setErr(e instanceof Error ? e.message : 'save failed'); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div style={{ borderTop: '1px solid var(--w-06)', padding: '14px 18px 16px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: docs.length ? 10 : 0 }}>
+        <SectionLabel>Documents</SectionLabel>
+        <span title="Working docs scoped to this plan — not searchable, not project docs" style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>
+          plan-local · {docs.length}
+        </span>
+        <div style={{ flex: 1 }} />
+        {!readOnly && (
+          <button
+            onClick={() => { setEditing({ name: '', description: '', body: '' }); setErr(null); }}
+            className="hover-border"
+            style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 10, padding: '4px 10px', borderRadius: 8, color: 'var(--text-soft)', background: 'var(--w-02)', border: '1px solid var(--w-1)' }}
+          >
+            + document
+          </button>
+        )}
+      </div>
+
+      {!docs.length && (
+        <div style={{ fontSize: 11.5, color: 'var(--text-faint)', lineHeight: 1.6, maxWidth: 640 }}>
+          None yet. Plan docs are working notes and supporting material scoped to this plan — unlike project docs they aren't indexed for search and can hold open questions that change as the design firms up.
+        </div>
+      )}
+
+      {docs.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {docs.map((d) => {
+            const isOpen = openId === d.id;
+            return (
+              <div key={d.id} style={{ border: '1px solid var(--w-07)', borderRadius: 10, background: 'var(--w-015)', overflow: 'hidden' }}>
+                <div
+                  onClick={() => setOpenId(isOpen ? null : d.id)}
+                  className="hover-border"
+                  style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px', cursor: 'pointer', border: '1px solid transparent' }}
+                >
+                  <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-dim)', transform: isOpen ? 'rotate(90deg)' : 'none', transition: 'transform .15s' }}>▸</span>
+                  <span style={{ fontSize: 12.5, fontWeight: 600 }}>{d.name}</span>
+                  {d.description && <span style={{ fontSize: 11, color: 'var(--text-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.description}</span>}
+                  <div style={{ flex: 1 }} />
+                  {!readOnly && (
+                    <>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); setEditing({ id: d.id, name: d.name, description: d.description, body: d.body }); setErr(null); }}
+                        style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)', background: 'transparent', border: 'none', padding: '2px 6px' }}
+                      >edit</button>
+                      <button
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          if (await confirm(`Delete plan doc "${d.name}"?`)) await store.actions.deletePlanDoc(planId, d.id);
+                        }}
+                        className="drawer-x"
+                        style={{ cursor: 'pointer', color: 'var(--red-soft)', fontSize: 12, padding: '2px 6px', background: 'transparent', border: 'none' }}
+                      >🗑</button>
+                    </>
+                  )}
+                </div>
+                {isOpen && (
+                  <div style={{ padding: '4px 16px 14px', borderTop: '1px solid var(--w-05)', maxWidth: 760 }}>
+                    {d.body ? <Markdown source={d.body} compact /> : <span style={{ fontSize: 11.5, color: 'var(--text-faint)' }}>empty</span>}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {editing && (
+        <Modal title={editing.id ? 'Edit plan doc' : 'New plan doc'} subtitle="Working doc scoped to this plan — not indexed, may hold open questions" width={560} onClose={() => setEditing(null)}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <Field label="Name">
+              <TextInput autoFocus value={editing.name} onChange={(e) => setEditing({ ...editing, name: e.target.value })} placeholder="e.g. Payment gateway design notes" />
+            </Field>
+            <Field label="Description" hint="one line, optional">
+              <TextInput value={editing.description} onChange={(e) => setEditing({ ...editing, description: e.target.value })} placeholder="what a reader finds inside" />
+            </Field>
+            <Field label="Body" hint="markdown — provisional is fine">
+              <TextArea rows={12} value={editing.body} onChange={(e) => setEditing({ ...editing, body: e.target.value })} style={{ fontFamily: 'var(--mono)', fontSize: 12 }} />
+            </Field>
+            {err && <ErrorNote>{err}</ErrorNote>}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <Button variant="ghost" onClick={() => setEditing(null)}>Cancel</Button>
+              <Button variant="primary" disabled={busy} onClick={() => void save()}>{busy ? 'Saving…' : 'Save'}</Button>
+            </div>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }
