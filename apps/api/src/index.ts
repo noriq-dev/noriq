@@ -6,7 +6,7 @@ import type { Env } from './env';
 import { adminAuth, agentAuth, readSessionId, resolveSessionAgent, SESSION_CLEAR_COOKIE, sessionSetCookie, userAuth, type AppContext } from './auth';
 import { buildMcpServer } from './mcp';
 import { renderMcpReference, mcpReferenceJson } from './reference';
-import { backupToR2, exportSnapshot } from './backup';
+import { backupToR2, exportSnapshot, importSnapshot } from './backup';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, timingSafeEqual, verifyPassword, verifyPasswordConstantTime } from './lib/util';
 import { taskSearchFilters } from './lib/search';
 import { search, searchBackend, reindexProject, type SearchKind } from './search';
@@ -46,8 +46,10 @@ app.use('/oauth/*', cors({ allowMethods: ['GET', 'POST', 'OPTIONS'], maxAge: 864
 // reads stay live. Registered before every route so no handler can slip a write past it.
 // Exemptions: GET/HEAD/OPTIONS (reads); /mcp (gated per-tool instead — its reads must stay
 // live on the same POST endpoint); auth/OAuth/health/ws (bootstrap + observation, not the
-// acked coordination-write contract, and trivially redone if a session is lost).
-const FREEZE_EXEMPT_PREFIXES = ['/mcp', '/oauth/', '/.well-known/', '/api/auth/', '/api/reset', '/api/setup', '/api/health', '/ws/'];
+// acked coordination-write contract, and trivially redone if a session is lost); and
+// /api/admin/import — a restore is the one write you DO want under a freeze (a deliberate
+// admin DB replacement, with the freeze holding off the coordination writes that would race it).
+const FREEZE_EXEMPT_PREFIXES = ['/mcp', '/oauth/', '/.well-known/', '/api/auth/', '/api/reset', '/api/setup', '/api/health', '/ws/', '/api/admin/import'];
 app.use('*', async (c, next) => {
   if (!isMaintenanceMode(c.env)) return next();
   const method = c.req.method;
@@ -251,6 +253,19 @@ app.get('/api/admin/export', adminAuth, async (c) => {
 app.post('/api/admin/backup', adminAuth, async (c) => {
   const res = await backupToR2(c.env, nowIso());
   return c.json(res, res.ok ? 200 : 503);
+});
+
+// Restore a snapshot (PLNR-218) — the inverse of /export. DESTRUCTIVE: REPLACES all data
+// (it is not a merge), so ?confirm=replace guards the wipe. Admin-only; exempt from the
+// write-freeze so "freeze → import → unfreeze" is a clean cutover. Restore steps in BACKUP.md.
+app.post('/api/admin/import', adminAuth, async (c) => {
+  if (c.req.query('confirm') !== 'replace') {
+    return c.json({ error: 'refusing: /api/admin/import REPLACES all data. Re-POST with ?confirm=replace to proceed.' }, 400);
+  }
+  let raw: unknown;
+  try { raw = await c.req.json(); } catch { return c.json({ error: 'body must be the JSON snapshot from /api/admin/export' }, 400); }
+  const result = await importSnapshot(c.env, raw);
+  return c.json(result, result.ok ? 200 : 400);
 });
 
 app.post('/api/admin/users', adminAuth, async (c) => {

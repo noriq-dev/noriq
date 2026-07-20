@@ -57,15 +57,35 @@ wrangler d1 execute noriq --remote --file noriq-ordered.sql --config wrangler.pr
 Keep a periodic `wrangler d1 export` in your own CI/cron if you want SQL-level backups
 in addition to the R2 JSON snapshots.
 
-### Option B — from a JSON snapshot
+### Option B — from a JSON snapshot, via `POST /api/admin/import`
 
-The JSON snapshot (from the cron or `/api/admin/export`) is a logical dump. To restore
-it into an empty, freshly-migrated database (`wrangler d1 migrations apply noriq`),
-replay each table's rows as `INSERT`s in dependency order (parents before children —
-e.g. `users`, `groups`, `projects`, then `tasks`, then `comments`/`claims`/`events`…).
-A small script that reads the JSON and generates parameterized inserts per table is the
-simplest path; the `counts` field lets you verify row totals after import.
+The JSON snapshot (from the cron or `/api/admin/export`) restores through a live endpoint —
+the inverse of `/export`. Point it at a database already migrated to a **compatible schema**
+(`wrangler d1 migrations apply noriq`); the snapshot may predate a column (it takes the
+default) but must not carry one the schema lacks (rejected, so no data is silently dropped).
 
-> The JSON snapshot is best for inspection, migration between instances, and
-> partial/selective restore. For disaster recovery of a single instance, Option A is
-> simpler and exact.
+```sh
+curl -X 'POST' -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  --data-binary @noriq-backup.json \
+  'https://<your-host>/api/admin/import?confirm=replace'
+```
+
+- **Destructive — it REPLACES, it does not merge.** The database is made to match the
+  snapshot exactly: tables absent from the snapshot are emptied. `?confirm=replace` is the
+  required guard (without it: `400`, nothing touched). The response echoes per-table
+  `imported` counts to verify against the snapshot's `counts`.
+- **Atomic.** The whole delete + reload runs in one D1 transaction, so a failure rolls back
+  and the database is left untouched.
+- **FK ordering is handled for you.** Rows load parents-before-children in an order derived
+  from the live schema at import time, and the `agents`↔`oauth_tokens` cycle + self-references
+  (`tasks.parent_task_id`, `agents.parent_agent_id`) are broken automatically — the same
+  problem `scripts/reorder-d1-dump.py` solves for the SQL path, so no manual reordering.
+- **Restoring over a live instance?** Turn on the write-freeze (`MAINTENANCE_MODE=1`, PLNR-166)
+  first so concurrent coordination writes don't race the reload; `/api/admin/import` is exempt
+  from the freeze, so `freeze → import → unfreeze` is a clean cutover. Agents' notice cursors
+  live in the `AgentSession` DO (outside D1), so after a restore a working agent may see no
+  notices until the event `global_seq` climbs past where its cursor was — reconnecting resets it.
+
+> The JSON snapshot is best for inspection, migration between instances, and restoring over a
+> running instance. For very large databases prefer Option A (a single atomic import batch can
+> grow past D1's request limits — `/api/admin/import` fails cleanly and unchanged if it does).
