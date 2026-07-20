@@ -1384,9 +1384,9 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
   defineTool(
     'add_comment',
     'Leave your OWN note on a task — progress, findings, rationale, a heads-up for whoever picks it up. A plain comment: it is recorded as a note and blocks nothing (not a question, not a resolution). To ask a human for a decision use request_input; to answer a human\'s open question use resolve_comment.',
-    { projectId: z.string(), taskId: z.string(), body: z.string().min(1) },
+    { projectId: z.string(), taskId: z.string().describe('Task id or display key'), body: z.string().min(1) },
     tool(async ({ projectId, taskId, body }) =>
-      room(env, projectId).postComment(projectId, actor, taskId, 'comment', body),
+      room(env, projectId).postComment(projectId, actor, await resolveTaskId(env, projectId, taskId), 'comment', body),
     ),
   );
 
@@ -1395,13 +1395,13 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     'Post a comment or a question on a task. kind:"question" asks a human (stays open until resolved); kind:"comment" is your own note (non-blocking); kind:"reply" answers a thread. For a plain note, add_comment is simpler.',
     {
       projectId: z.string(),
-      taskId: z.string(),
+      taskId: z.string().describe('Task id or display key'),
       kind: z.enum(['comment', 'question', 'reply']).default('comment'),
       body: z.string().min(1),
       parentCommentId: z.string().optional(),
     },
     tool(async ({ projectId, taskId, kind, body, parentCommentId }) =>
-      room(env, projectId).postComment(projectId, actor, taskId, kind, body, parentCommentId),
+      room(env, projectId).postComment(projectId, actor, await resolveTaskId(env, projectId, taskId), kind, body, parentCommentId),
     ),
   );
 
@@ -1428,11 +1428,12 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       projectId: z.string(),
       body: z.string().min(1),
       toAgentId: z.string().optional(),
-      refTaskId: z.string().optional(),
+      refTaskId: z.string().optional().describe('Task id or display key this message references'),
     },
-    tool(async ({ projectId, body, toAgentId, refTaskId }) =>
-      room(env, projectId).sendMessage(projectId, actor, body, toAgentId, refTaskId),
-    ),
+    tool(async ({ projectId, body, toAgentId, refTaskId }) => {
+      const refId = refTaskId ? await resolveTaskId(env, projectId, refTaskId) : undefined;
+      return room(env, projectId).sendMessage(projectId, actor, body, toAgentId, refId);
+    }),
   );
 
   // ---- signals: ask a human / flag attention ------------------------------
@@ -1442,7 +1443,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     'GATE: you need a human decision before you can proceed. Raise it here instead of guessing or stalling. If taskId is given, that task is auto-parked (released to blocked) so it does not lapse — then MOVE ON to other work via next_claimable; when a human answers you will see it in my_updates/notices and the task returns to the queue for you to re-claim. Batch every question the decision needs into ONE gate via `questions` (each with its own kind: pick-one, pick-several, freeform text, number, or yes/no) — one park + one answer beats four round-trips. Answers come back per-question ("Q → choice" lines). If the answer raises a NEW question, thread the next round with followUpTo (the prior gate id) — the human sees the earlier Q&A as context and the same task parks again. Ask everything you can foresee in round one; rounds are for genuine follow-ups, not drip-feeding.',
     {
       projectId: z.string(),
-      taskId: z.string().optional().describe('The task this decision blocks (auto-parked to blocked). Omit for a standalone question; a followUpTo round inherits its predecessor\'s task automatically.'),
+      taskId: z.string().optional().describe('The task (id or display key) this decision blocks (auto-parked to blocked). Omit for a standalone question; a followUpTo round inherits its predecessor\'s task automatically.'),
       title: z.string().min(1).describe('The decision needed, in one line'),
       body: z.string().optional().describe('Context: what you tried, why you are blocked, trade-offs'),
       options: z.array(z.string()).optional().describe('Discrete choices for a SINGLE simple question — for anything richer use `questions`'),
@@ -1458,9 +1459,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       ).min(1).max(4).optional().describe('Batch up to 4 related questions in ONE gate (PLNR-131/185). The human answers them as one form; you receive per-question answers.'),
       followUpTo: z.string().optional().describe('Signal id of the gate this round follows up on (from the earlier request_input result or my_updates). Threads the rounds and re-parks the same task.'),
     },
-    tool(async ({ projectId, taskId, title, body, options, questions, followUpTo }) =>
-      room(env, projectId).raiseSignal(projectId, actor, { type: 'input_request', taskId: taskId ?? null, title, body, options, questions, followUpTo: followUpTo ?? null }),
-    ),
+    tool(async ({ projectId, taskId, title, body, options, questions, followUpTo }) => {
+      const refTaskId = taskId ? await resolveTaskId(env, projectId, taskId) : null;
+      return room(env, projectId).raiseSignal(projectId, actor, { type: 'input_request', taskId: refTaskId, title, body, options, questions, followUpTo: followUpTo ?? null });
+    }),
   );
 
   defineTool(
@@ -1468,14 +1470,15 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     'Flag something a human should SEE but that does not gate your work — a deviation from the plan, an unexpected finding, a risk, a heads-up. Non-blocking: keep working. Use severity critical sparingly for things that genuinely need prompt human attention.',
     {
       projectId: z.string(),
-      taskId: z.string().optional(),
+      taskId: z.string().optional().describe('Task id or display key'),
       title: z.string().min(1),
       body: z.string().optional(),
       severity: z.enum(['info', 'warning', 'critical']).optional().describe('default info'),
     },
-    tool(async ({ projectId, taskId, title, body, severity }) =>
-      room(env, projectId).raiseSignal(projectId, actor, { type: 'alert', taskId: taskId ?? null, title, body, severity }),
-    ),
+    tool(async ({ projectId, taskId, title, body, severity }) => {
+      const refTaskId = taskId ? await resolveTaskId(env, projectId, taskId) : null;
+      return room(env, projectId).raiseSignal(projectId, actor, { type: 'alert', taskId: refTaskId, title, body, severity });
+    }),
   );
 
   // ---- plans (an agent's work program over tasks) ---------------------------

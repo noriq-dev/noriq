@@ -811,3 +811,65 @@ describe('claim TTL is invalidated in the live DO', () => {
     expect(c2.body.ttlSeconds).toBe(300);
   });
 });
+
+// ---- PLNR-216: comment/signal/message tools resolve the display key, not just the id ----
+// These four handlers used to pass the raw ref straight into the DO, whose getTask is
+// strictly id-keyed — so a display key (e.g. REF-1) threw "not found" even though the task
+// existed, unlike update_task/claim_task which route through resolveTaskId. Make it uniform.
+describe('task-ref resolution is uniform across comment/signal/message tools', () => {
+  let pid: string;
+  let key: string; // e.g. REF-1
+  let id: string;
+  beforeAll(async () => {
+    pid = (await mcpCall(orch.apiKey, 'create_project', { key: 'REF', name: 'task-refs' })).body.id;
+    const t = (await mcpCall(orch.apiKey, 'create_task', { tags: ['test-fixture'], projectId: pid, title: 'reference me by key' })).body;
+    key = t.key;
+    id = t.id;
+  });
+
+  it('add_comment accepts the display key', async () => {
+    const c = await mcpCall(orch.apiKey, 'add_comment', { projectId: pid, taskId: key, body: 'noted by key' });
+    expect(c.isError).toBe(false);
+    expect(c.body.taskKey).toBe(key);
+    const gt = await mcpCall(orch.apiKey, 'get_task', { taskId: id });
+    expect(gt.body.comments.some((x: { body: string }) => x.body === 'noted by key')).toBe(true);
+  });
+
+  it('post_comment accepts the display key', async () => {
+    const c = await mcpCall(orch.apiKey, 'post_comment', { projectId: pid, taskId: key, kind: 'comment', body: 'posted by key' });
+    expect(c.isError).toBe(false);
+    expect(c.body.taskKey).toBe(key);
+  });
+
+  it('request_input accepts the display key and lands the gate on the right task', async () => {
+    await mcpCall(orch.apiKey, 'claim_task', { projectId: pid, taskId: id });
+    const sig = await mcpCall(orch.apiKey, 'request_input', {
+      projectId: pid, taskId: key, title: 'decide by key?', options: ['a', 'b'],
+    });
+    expect(sig.isError).toBe(false);
+    // The gate resolved key→id: it attached to the SAME task the id names.
+    const gt = await mcpCall(orch.apiKey, 'get_task', { taskId: id });
+    expect(gt.body.signals.some((s: { title: string; type: string }) => s.title === 'decide by key?' && s.type === 'input_request')).toBe(true);
+  });
+
+  it('raise_alert accepts the display key', async () => {
+    const a = await mcpCall(orch.apiKey, 'raise_alert', { projectId: pid, taskId: key, title: 'heads up by key', severity: 'info' });
+    expect(a.isError).toBe(false);
+    const gt = await mcpCall(orch.apiKey, 'get_task', { taskId: id });
+    expect(gt.body.signals.some((s: { title: string; type: string }) => s.title === 'heads up by key' && s.type === 'alert')).toBe(true);
+  });
+
+  it('send_message resolves refTaskId from the display key to the canonical id', async () => {
+    const m = await mcpCall(orch.apiKey, 'send_message', { projectId: pid, body: 'see this task', refTaskId: key });
+    expect(m.isError).toBe(false);
+    const row = await env.DB.prepare('SELECT ref_task_id AS refTaskId FROM messages WHERE body = ? ORDER BY created_at DESC')
+      .bind('see this task').first<{ refTaskId: string }>();
+    expect(row?.refTaskId).toBe(id); // stored as the id, not the raw key
+  });
+
+  it('an unknown key is still a clean error, not a silent no-op', async () => {
+    const c = await mcpCall(orch.apiKey, 'add_comment', { projectId: pid, taskId: 'REF-9999', body: 'nowhere' });
+    expect(c.isError).toBe(true);
+    expect(c.text).toContain('not found');
+  });
+});
