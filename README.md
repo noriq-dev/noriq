@@ -87,6 +87,38 @@ Everything else (OAuth issuer, WebAuthn rpID, invite URLs, MCP connect snippets)
 from the request origin, so no per-instance configuration is needed in code. Agents
 authenticate via OAuth 2.1 — there are no agent keys to issue.
 
+## Productionizing
+
+The defaults are tuned for zero-setup self-hosting: an open MCP server, no allowlists,
+rate limiting on. **Everything below is optional and off unless you set it** — these are
+the knobs to harden a real, multi-user, or public-facing instance. Set plain values under
+`vars` in `wrangler.production.jsonc`; set secrets with
+`npx wrangler secret put <NAME> --config wrangler.production.jsonc`.
+
+| Lever | Kind | What it does, and why production wants it |
+|---|---|---|
+| `CIMD_ALLOWED_HOSTS` | var | Allowlist the hostnames allowed as URL-form OAuth `client_id`s, e.g. `"chatgpt.com,claude.ai"`. Unset, any HTTPS client may register (still SSRF-guarded); set it to pin which agent front-ends can connect. |
+| `ATTACHMENT_UPLOAD_SECRET` | secret | Signs agents' file-upload capability tokens. Set it so uploads don't fall back to reusing `ADMIN_TOKEN`; without either, agents get only small inline attachments. |
+| `SIGNAL_WEBHOOK_URL` + `SIGNAL_WEBHOOK_SECRET` | var + secret | POSTs blocking `input_request`s and critical alerts out-of-band (Slack-compatible `text`), HMAC-signed — so a human is reached when no dashboard tab is open. |
+| `EMAIL` + `EMAIL_FROM` | binding + var | Sends invites (and, with the webhook, notifications) by email instead of copyable links. See **Email** above. |
+| `PUBLIC_ORIGIN` | var | The instance's canonical URL (e.g. `https://plan.example.com`), used to build absolute links in out-of-band notifications and agent upload URLs, where there is no request origin to derive from. |
+| `GITHUB_WEBHOOK_SECRET` | secret | Verifies GitHub webhook signatures; `/api/webhooks/github` fails closed (501) until set, so PR→task updates can't be spoofed. |
+| `AI` + `VECTORIZE` | bindings | Enable semantic-search embeddings; without them search degrades to keyword matching. Create the index per the note in [`env.ts`](apps/api/src/env.ts). |
+| Daily backups | binding + cron | The `0 6 * * *` cron snapshots D1 to the `noriq-files` R2 bucket (both already in the example config). Confirm R2 is enabled and drill the restore — see [BACKUP.md](apps/api/BACKUP.md). |
+| `MAINTENANCE_MODE` | var | Write-freeze for a DB cutover: set to `1` before a `d1 export`, clear it after the repoint. Writes then get a retryable 503 (agents park) while reads stay live, so no `ok` is acknowledged into a database about to be abandoned. |
+
+`ADMIN_TOKEN` (see **Secrets**) is optional; if you set it, treat it as a root credential —
+keep it to bootstrap and `/api/admin/*` use, store it only as a wrangler secret, and rotate
+it by putting a new value.
+
+**Leave these OFF in production** — they exist for tests and the hosted demo and weaken a
+real instance:
+
+- `DISABLE_RATE_LIMIT` — turns off the per-IP / per-connection limiter (a `RateLimiter`
+  Durable Object, on by default). Test-only.
+- `DEMO_MODE` — enables one-click demo login and a nightly project reset for a throwaway
+  demo deployment. Never set it on an instance holding real work.
+
 ## Connect an agent
 
 From the homepage, copy the snippet for your client — or by hand:
