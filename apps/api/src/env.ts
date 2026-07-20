@@ -52,4 +52,10 @@ export interface Env {
   /** Demo mode (PLNR-146): any truthy value enables one-click demo login + the nightly
    *  demo-project reset. Meant for a dedicated demo deployment, not production. */
   DEMO_MODE?: string;
+  /** Write-freeze / maintenance mode (PLNR-166): any truthy value ('1'/'true') pauses all
+   *  writes so no `ok` is acknowledged into a database about to be swapped out during a
+   *  cutover (the PLNR-164 incident). Reads stay live. Flip it on before a `d1 export`,
+   *  clear it after the repoint. Lives OUTSIDE the DB deliberately — the flag must not
+   *  depend on the thing being cut over. See lib/maintenance.ts. */
+  MAINTENANCE_MODE?: string;
 }

@@ -34,11 +34,14 @@ const SHARDS = 8;
 // path needs it OFF while the demo tests need it ON. These two files get their own project
 // with DEMO_MODE set; everything else runs without it (PLNR-199).
 const DEMO_FILES = ['demo.test.ts', 'demo-gates.test.ts'];
+// MAINTENANCE_MODE freezes writes globally (PLNR-166) — like DEMO_MODE it can't ride the
+// shared default, so this file gets its own project with the flag ON.
+const MAINTENANCE_FILES = ['maintenance.test.ts'];
 
 const testDir = path.join(__dirname, 'test');
 const testFiles = fs
   .readdirSync(testDir)
-  .filter((f) => f.endsWith('.test.ts') && f !== 'load.test.ts' && !DEMO_FILES.includes(f))
+  .filter((f) => f.endsWith('.test.ts') && f !== 'load.test.ts' && !DEMO_FILES.includes(f) && !MAINTENANCE_FILES.includes(f))
   .sort();
 const shards: string[][] = Array.from({ length: SHARDS }, () => []);
 testFiles.forEach((f, i) => shards[i % SHARDS]!.push(`test/${f}`));
@@ -95,5 +98,8 @@ export default [
   // The demo suite runs under DEMO_MODE (its own project so the flag stays off everywhere
   // else). `npm test` selects it explicitly alongside the shards.
   project('demo', DEMO_FILES.map((f) => `test/${f}`), { DEMO_MODE: '1' }),
+  // Write-freeze suite runs with MAINTENANCE_MODE ON (its own project so the flag stays off
+  // everywhere else). `npm test` selects it explicitly alongside the shards.
+  project('maintenance', MAINTENANCE_FILES.map((f) => `test/${f}`), { MAINTENANCE_MODE: '1' }),
   project('load', ['test/load.test.ts']),
 ];

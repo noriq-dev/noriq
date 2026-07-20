@@ -20,6 +20,7 @@ import { nearDupeGroups } from './lib/tags';
 import { DOC_SKILL_MD } from './skill-docs';
 import { signUploadToken } from './lib/upload-token';
 import { taskClaimability } from './lib/claimability';
+import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
 
 const MAX_ATTACHMENT = 100 * 1024 * 1024;
 // Inline base64 rides the model's context window at ~1 token/byte both ways, so it is only
@@ -255,11 +256,24 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     // exact same zod schemas the tools validate against — it can't drift (PLNR-23).
     toolSpecs.push({ name, description, inputSchema });
     const annotations = TOOL_HINTS[name] ?? WRITE; // PLNR-88: proper read/write/destructive hints
+    // Write-freeze (PLNR-166): during maintenance a write tool must not appear to succeed —
+    // return a retryable isError result naming the reason so the agent parks and retries,
+    // rather than believing a phantom ack. Reads (readOnlyHint) stay live. The gate wraps the
+    // callback so it is re-checked per call (MAINTENANCE_MODE can flip while a session is open).
+    const guarded = annotations.readOnlyHint === true
+      ? cb
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      : (async (args: any, extra?: { requestId?: string | number }) => {
+          if (isMaintenanceMode(env)) {
+            return { content: [{ type: 'text' as const, text: `Error: ${MAINTENANCE_MESSAGE}` }], isError: true };
+          }
+          return cb(args, extra);
+        });
     // The SDK (1.29.0) accepts zod v4 at runtime (peer `^3.25 || ^4.0`) but types
     // registerTool's inputSchema against v3's fuller ZodType, so v4's leaner raw
     // shape needs a cast at this single funnel point. Runtime validation is unchanged.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return server.registerTool(name, { description, inputSchema: inputSchema as any, annotations }, cb as any);
+    return server.registerTool(name, { description, inputSchema: inputSchema as any, annotations }, guarded as any);
   };
 
   // ---- orientation --------------------------------------------------------

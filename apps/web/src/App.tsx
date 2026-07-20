@@ -1,6 +1,7 @@
 import { useAppStore, safeDecode } from './store';
 import { Rail } from './components/Rail';
 import { TopBar } from './components/TopBar';
+import { MaintenanceBanner } from './components/MaintenanceBanner';
 import { MissionControl } from './components/MissionControl';
 import { Graph } from './components/Graph';
 import { Board } from './components/Board';
@@ -86,6 +87,7 @@ export function App() {
 
   return (
     <div style={{ height: '100vh', display: 'flex', background: 'var(--bg)' }}>
+      <MaintenanceBanner />
       {railOpen && <div className="rail-backdrop" onClick={() => setRailOpen(false)} />}
       <Rail store={store} open={railOpen} onNavigate={() => setRailOpen(false)} />
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>

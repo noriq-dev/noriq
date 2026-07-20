@@ -40,7 +40,7 @@ export const api = {
   archiveTask: (pid: string, tid: string) => req('POST', `/api/projects/${pid}/tasks/${tid}/archive`),
   restoreTask: (pid: string, tid: string) => req('POST', `/api/projects/${pid}/tasks/${tid}/restore`),
   taskDetail: (tid: string) => req<ApiTaskDetail>('GET', `/api/tasks/${tid}`),
-  health: () => req<{ ok: boolean; version?: string }>('GET', '/api/health'),
+  health: () => req<{ ok: boolean; version?: string; maintenance?: boolean }>('GET', '/api/health'),
 
   createProject: (key: string, name: string, description?: string) =>
     req<{ id: string; key: string }>('POST', '/api/projects', { key, name, description }),

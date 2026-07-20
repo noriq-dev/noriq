@@ -18,6 +18,7 @@ import { DOC_SKILL_MD } from './skill-docs';
 import pkg from '../package.json';
 import { issueTokens, metadataRoutes, oauth } from './oauth';
 import { demoLocksDown } from './lib/demo';
+import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
 import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
 import { z } from 'zod';
@@ -39,6 +40,22 @@ app.use('/mcp', cors({
   maxAge: 86400,
 }));
 app.use('/oauth/*', cors({ allowMethods: ['GET', 'POST', 'OPTIONS'], maxAge: 86400 }));
+
+// Write-freeze (PLNR-166): when MAINTENANCE_MODE is on, refuse mutating requests with a
+// retryable 503 so nothing is acked into a database about to be swapped out (PLNR-164);
+// reads stay live. Registered before every route so no handler can slip a write past it.
+// Exemptions: GET/HEAD/OPTIONS (reads); /mcp (gated per-tool instead — its reads must stay
+// live on the same POST endpoint); auth/OAuth/health/ws (bootstrap + observation, not the
+// acked coordination-write contract, and trivially redone if a session is lost).
+const FREEZE_EXEMPT_PREFIXES = ['/mcp', '/oauth/', '/.well-known/', '/api/auth/', '/api/reset', '/api/setup', '/api/health', '/ws/'];
+app.use('*', async (c, next) => {
+  if (!isMaintenanceMode(c.env)) return next();
+  const method = c.req.method;
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return next();
+  const path = new URL(c.req.url).pathname;
+  if (FREEZE_EXEMPT_PREFIXES.some((p) => path === p || path.startsWith(p))) return next();
+  return c.json({ error: MAINTENANCE_MESSAGE }, 503, { 'Retry-After': '30' });
+});
 
 // OAuth 2.1 AS for MCP clients: discovery + register/authorize/token.
 metadataRoutes(app);
@@ -105,6 +122,8 @@ app.get('/api/health', async (c) => {
     ok: row?.ok === 1,
     service: 'noriq',
     version: pkg.version,
+    // Surfaced so the dashboard can show a write-frozen banner (PLNR-166).
+    maintenance: isMaintenanceMode(c.env),
   });
 });
 
