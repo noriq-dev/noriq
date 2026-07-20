@@ -140,6 +140,24 @@ export function Rail({ store, open, onNavigate }: { store: AppStore; open?: bool
           </div>
           <ThemeButton size={28} />
         </div>
+        <div
+          style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            padding: '2px 8px 0', fontFamily: 'var(--mono)', fontSize: 8.5,
+            letterSpacing: '.04em', color: 'var(--text-faint)',
+          }}
+        >
+          <span>v{__APP_VERSION__}</span>
+          <a
+            href="https://noriq.dev"
+            target="_blank"
+            rel="noreferrer"
+            className="hover-bright"
+            style={{ color: 'var(--text-faint)', textDecoration: 'none' }}
+          >
+            noriq.dev →
+          </a>
+        </div>
       </div>
     </div>
   );
