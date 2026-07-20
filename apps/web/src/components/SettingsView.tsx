@@ -12,6 +12,7 @@ export function SettingsView({ store }: { store: AppStore }) {
   return (
     <div className="content-pad" style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: '20px 26px' }}>
       <div style={{ maxWidth: 760, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 28 }}>
+        <GroupInvitesSection />
         <GroupsSection store={store} />
         <PasskeysSection />
         <SessionsSection />
@@ -217,6 +218,34 @@ export function UsersSection({ store }: { store: AppStore }) {
 }
 
 /**
+ * Pending group invites for the current user (PLNR-138). A self-service add now creates a
+ * pending invite rather than adding someone outright; the target accepts or declines here.
+ * Hidden entirely when there are none.
+ */
+function GroupInvitesSection() {
+  const [invites, setInvites] = useState<Array<{ groupId: string; groupName: string; invitedByName: string | null; invitedAt: string | null }>>([]);
+  const load = () => api.groupInvites().then((r) => setInvites(r.invites)).catch(() => {});
+  useEffect(() => { load(); }, []);
+  if (!invites.length) return null;
+  return (
+    <Section title={`Group invites · ${invites.length}`}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {invites.map((inv) => (
+          <div key={inv.groupId} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 11px', borderRadius: 9, background: 'var(--w-02)', border: '1px solid var(--w-06)' }}>
+            <div style={{ minWidth: 0, flex: 1 }}>
+              <div style={{ fontSize: 12.5, fontWeight: 600 }}>{inv.groupName}</div>
+              <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)' }}>invited{inv.invitedByName ? ` by ${inv.invitedByName}` : ''}</div>
+            </div>
+            <Button variant="ghost" style={{ padding: '5px 12px', fontSize: 11.5 }} onClick={async () => { await api.acceptGroupInvite(inv.groupId); location.reload(); }}>accept</Button>
+            <SmallAction danger onClick={async () => { await api.declineGroupInvite(inv.groupId); load(); }}>decline</SmallAction>
+          </div>
+        ))}
+      </div>
+    </Section>
+  );
+}
+
+/**
  * Group management (PLNR-83). Self-service in Settings: users see only THEIR
  * groups and can create/rename/describe/delete them and manage members. The
  * Admin view passes `all` to get the same editing surface over every group.
@@ -296,7 +325,7 @@ export function GroupsSection({ store, all }: { store: AppStore; all?: boolean }
 
 /** Inline membership editor for one group: list + remove, and add from the user directory. */
 function GroupMembers({ store, groupId }: { store: AppStore; groupId: string }) {
-  const [members, setMembers] = useState<Array<{ id: string; name: string; email: string }>>([]);
+  const [members, setMembers] = useState<Array<{ id: string; name: string; email: string; status: string }>>([]);
   const [everyone, setEveryone] = useState<ApiUser[]>([]);
   const [adding, setAdding] = useState('');
   const load = () => api.groupMembers(groupId).then((r) => setMembers(r.members)).catch(() => {});
@@ -316,23 +345,26 @@ function GroupMembers({ store, groupId }: { store: AppStore; groupId: string }) 
         <div key={m.id} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <span style={{ fontSize: 12, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {m.name} <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)' }}>{m.email}{m.id === me ? ' (you)' : ''}</span>
+            {m.status !== 'accepted' && (
+              <span style={{ marginLeft: 6, fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--accent)' }}>· invited</span>
+            )}
           </span>
           <SmallAction
             danger
             onClick={async () => {
-              if (m.id === me && !(await confirm('Remove yourself? You will lose management of this group.'))) return;
+              if (m.id === me && m.status === 'accepted' && !(await confirm('Remove yourself? You will lose management of this group.'))) return;
               await api.removeGroupMember(groupId, m.id);
               if (m.id === me) { location.reload(); return; }
               load();
             }}
           >
-            remove
+            {m.status === 'accepted' ? 'remove' : 'cancel'}
           </SmallAction>
         </div>
       ))}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <Select value={adding} onChange={(e) => setAdding(e.target.value)} style={{ flex: 1 }}>
-          <option value="">+ add member…</option>
+          <option value="">+ invite member…</option>
           {candidates.map((u) => (
             <option key={u.id} value={u.id}>{u.name} · {u.email}</option>
           ))}
@@ -347,7 +379,7 @@ function GroupMembers({ store, groupId }: { store: AppStore; groupId: string }) 
             load();
           }}
         >
-          add
+          invite
         </Button>
       </div>
     </div>

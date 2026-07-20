@@ -83,8 +83,8 @@ describe('grouped projects are shared with the group members only (PLNR-83)', ()
     const charlieCookie = await loginSession('av-charlie@example.com', 'longenough1');
     const daveCookie = await loginSession('av-dave@example.com', 'longenough1');
 
-    // Bob makes a group (auto-joins), adds Charlie, and moves his project into it.
-    // Admin is deliberately NOT a member, to prove grouped != globally visible.
+    // Bob makes a group (auto-joins), invites Charlie (who accepts — PLNR-138), and moves
+    // his project into it. Admin is deliberately NOT a member, to prove grouped != globally visible.
     const g = await SELF.fetch('https://noriq.test/api/groups', {
       method: 'POST', headers: { Cookie: bobCookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Team X' }),
     });
@@ -92,6 +92,8 @@ describe('grouped projects are shared with the group members only (PLNR-83)', ()
     await SELF.fetch(`https://noriq.test/api/groups/${gid}/members`, {
       method: 'POST', headers: { Cookie: bobCookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ userId: charlie!.id }),
     });
+    // Consent-based membership: the invite is pending until Charlie accepts.
+    await SELF.fetch(`https://noriq.test/api/groups/${gid}/members/accept`, { method: 'POST', headers: { Cookie: charlieCookie } });
     await SELF.fetch(`https://noriq.test/api/projects/${bobProjectId}/meta`, {
       method: 'PATCH', headers: { Cookie: bobCookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ groupId: gid }),
     });
@@ -134,10 +136,12 @@ describe('grouped projects are shared with the group members only (PLNR-83)', ()
     expect((await setGroup(fredCookie, fredProj, gid)).status).toBe(403);
     expect((await listProjects(fredCookie)).projects.some((p) => p.id === edProj)).toBe(false);
 
-    // Ed (a member) adds Fred; now Fred may add his project, and co-members see each other's.
+    // Ed (a member) invites Fred, who accepts (PLNR-138); now Fred may add his project, and
+    // co-members see each other's. A pending invite alone would not grant this.
     await SELF.fetch(`https://noriq.test/api/groups/${gid}/members`, {
       method: 'POST', headers: { Cookie: edCookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ userId: fredId }),
     });
+    await SELF.fetch(`https://noriq.test/api/groups/${gid}/members/accept`, { method: 'POST', headers: { Cookie: fredCookie } });
     expect((await setGroup(fredCookie, fredProj, gid)).status).toBe(200);
     const fredSees = (await listProjects(fredCookie)).projects.map((p) => p.id);
     expect(fredSees).toContain(fredProj);

@@ -114,9 +114,13 @@ export const api = {
 
   patchGroup: (gid: string, patch: { name?: string; description?: string }) => req('PATCH', `/api/groups/${gid}`, patch),
   deleteGroup: (gid: string) => req('DELETE', `/api/groups/${gid}`),
-  groupMembers: (gid: string) => req<{ members: Array<{ id: string; name: string; email: string }> }>('GET', `/api/groups/${gid}/members`),
-  addGroupMember: (gid: string, userId: string) => req('POST', `/api/groups/${gid}/members`, { userId }),
+  groupMembers: (gid: string) => req<{ members: Array<{ id: string; name: string; email: string; status: string }> }>('GET', `/api/groups/${gid}/members`),
+  // Inviting creates a PENDING membership the target must accept (PLNR-138).
+  addGroupMember: (gid: string, userId: string) => req<{ ok: boolean; status: string }>('POST', `/api/groups/${gid}/members`, { userId }),
   removeGroupMember: (gid: string, uid: string) => req('DELETE', `/api/groups/${gid}/members/${uid}`),
+  groupInvites: () => req<{ invites: Array<{ groupId: string; groupName: string; invitedByName: string | null; invitedAt: string | null }> }>('GET', '/api/me/group-invites'),
+  acceptGroupInvite: (gid: string) => req('POST', `/api/groups/${gid}/members/accept`),
+  declineGroupInvite: (gid: string) => req('POST', `/api/groups/${gid}/members/decline`),
   deleteUser: (uid: string) => req('DELETE', `/api/users/${uid}`),
   taskEvents: (tid: string) => req<{ events: ApiAgentEvent[] }>('GET', `/api/tasks/${tid}/events`),
   uploadAttachment: async (tid: string, file: File) => {

@@ -447,7 +447,7 @@ app.post('/api/auth/sessions/revoke-all', userAuth, async (c) => {
 const VISIBILITY_WHERE = `(
   ? = 'admin'
   OR p.owner_user_id = ?
-  OR (p.group_id IS NOT NULL AND p.group_id IN (SELECT group_id FROM user_groups WHERE user_id = ?))
+  OR (p.group_id IS NOT NULL AND p.group_id IN (SELECT group_id FROM user_groups WHERE user_id = ? AND status = 'accepted'))
 )`;
 
 app.get('/api/projects', userAuth, async (c) => {
@@ -976,7 +976,8 @@ app.post('/api/projects/:pid/tasks/:tid/release', userAuth, async (c) => {
 // Authorization (PLNR-81): a group is adjustable only by its members (rows in
 // user_groups) or an admin. Non-members can't even see groups they don't belong to.
 const isGroupMember = async (env: Env, userId: string, gid: string) =>
-  !!(await env.DB.prepare('SELECT 1 FROM user_groups WHERE user_id = ? AND group_id = ?').bind(userId, gid).first());
+  // Consent-based (PLNR-138): a PENDING invite is not membership — only 'accepted' counts.
+  !!(await env.DB.prepare("SELECT 1 FROM user_groups WHERE user_id = ? AND group_id = ? AND status = 'accepted'").bind(userId, gid).first());
 
 app.get('/api/groups', userAuth, async (c) => {
   // Everyone sees every group (group names are needed to render the project
@@ -986,7 +987,7 @@ app.get('/api/groups', userAuth, async (c) => {
   const u = c.var.user!;
   const { results } = await c.env.DB.prepare(
     `SELECT g.id, g.name, g.description, g."order",
-            (CASE WHEN ?1 = 'admin' OR EXISTS (SELECT 1 FROM user_groups ug WHERE ug.group_id = g.id AND ug.user_id = ?2)
+            (CASE WHEN ?1 = 'admin' OR EXISTS (SELECT 1 FROM user_groups ug WHERE ug.group_id = g.id AND ug.user_id = ?2 AND ug.status = 'accepted')
                   THEN 1 ELSE 0 END) AS canEdit
      FROM groups g ORDER BY g."order", g.created_at`,
   ).bind(u.role, u.id).all();
@@ -1248,22 +1249,65 @@ const requireGroupMember = async (c: { env: Env; var: { user?: { id: string; rol
 app.get('/api/groups/:gid/members', userAuth, async (c) => {
   const gid = c.req.param('gid')!;
   if (!(await requireGroupMember(c, gid))) return c.json({ error: 'only a group member can view membership' }, 403);
+  // status lets the UI mark who's a member vs. who has a pending invite (PLNR-138).
   const { results } = await c.env.DB.prepare(
-    `SELECT u.id, u.name, u.email FROM user_groups ug JOIN users u ON u.id = ug.user_id
-     WHERE ug.group_id = ? ORDER BY u.name`,
+    `SELECT u.id, u.name, u.email, ug.status FROM user_groups ug JOIN users u ON u.id = ug.user_id
+     WHERE ug.group_id = ? ORDER BY ug.status = 'accepted' DESC, u.name`,
   ).bind(gid).all();
   return c.json({ members: results });
+});
+
+// A user's own pending group invites — the accept/decline surface in Settings (PLNR-138).
+app.get('/api/me/group-invites', userAuth, async (c) => {
+  const { results } = await c.env.DB.prepare(
+    `SELECT g.id AS groupId, g.name AS groupName, ug.invited_at AS invitedAt, iu.name AS invitedByName
+     FROM user_groups ug JOIN groups g ON g.id = ug.group_id
+     LEFT JOIN users iu ON iu.id = ug.invited_by
+     WHERE ug.user_id = ? AND ug.status = 'pending' ORDER BY ug.invited_at DESC`,
+  ).bind(c.var.user!.id).all();
+  return c.json({ invites: results });
 });
 
 app.post('/api/groups/:gid/members', userAuth, async (c) => {
   const denied = demoDenied(c);
   if (denied) return denied;
   const gid = c.req.param('gid')!;
-  if (!(await requireGroupMember(c, gid))) return c.json({ error: 'only a group member can add members' }, 403);
+  if (!(await requireGroupMember(c, gid))) return c.json({ error: 'only a group member can invite members' }, 403);
   const { userId } = await c.req.json<{ userId: string }>();
   const target = await c.env.DB.prepare('SELECT 1 FROM users WHERE id = ? AND disabled = 0').bind(userId ?? '').first();
   if (!target) return c.json({ error: 'user not found' }, 404);
-  await c.env.DB.prepare('INSERT OR IGNORE INTO user_groups (user_id, group_id) VALUES (?, ?)').bind(userId, gid).run();
+  // Consent-based (PLNR-138): create a PENDING invite the target must accept, rather than
+  // adding them outright. OR IGNORE leaves any existing row as-is — an accepted member is
+  // not downgraded to pending, and a standing invite is not duplicated or its inviter reset.
+  await c.env.DB.prepare(
+    "INSERT OR IGNORE INTO user_groups (user_id, group_id, status, invited_by, invited_at) VALUES (?, ?, 'pending', ?, ?)",
+  ).bind(userId, gid, c.var.user!.id, nowIso()).run();
+  // Report the resulting state so re-inviting an existing member reads honestly.
+  const row = await c.env.DB.prepare('SELECT status FROM user_groups WHERE user_id = ? AND group_id = ?')
+    .bind(userId, gid).first<{ status: string }>();
+  return c.json({ ok: true, status: row?.status ?? 'pending' });
+});
+
+// The invite target consents (PLNR-138). You act only on your OWN invite (keyed by your
+// user id), so there is no group-member gate — a pending invitee is not yet a member.
+app.post('/api/groups/:gid/members/accept', userAuth, async (c) => {
+  const denied = demoDenied(c);
+  if (denied) return denied;
+  const gid = c.req.param('gid')!;
+  const r = await c.env.DB.prepare(
+    "UPDATE user_groups SET status = 'accepted' WHERE user_id = ? AND group_id = ? AND status = 'pending'",
+  ).bind(c.var.user!.id, gid).run();
+  if (!r.meta.changes) return c.json({ error: 'no pending invite for you in this group' }, 404);
+  return c.json({ ok: true });
+});
+
+app.post('/api/groups/:gid/members/decline', userAuth, async (c) => {
+  const denied = demoDenied(c);
+  if (denied) return denied;
+  const gid = c.req.param('gid')!;
+  await c.env.DB.prepare(
+    "DELETE FROM user_groups WHERE user_id = ? AND group_id = ? AND status = 'pending'",
+  ).bind(c.var.user!.id, gid).run();
   return c.json({ ok: true });
 });
 
@@ -1271,8 +1315,13 @@ app.delete('/api/groups/:gid/members/:uid', userAuth, async (c) => {
   const denied = demoDenied(c);
   if (denied) return denied;
   const gid = c.req.param('gid')!;
-  if (!(await requireGroupMember(c, gid))) return c.json({ error: 'only a group member can remove members' }, 403);
-  await c.env.DB.prepare('DELETE FROM user_groups WHERE user_id = ? AND group_id = ?').bind(c.req.param('uid')!, gid).run();
+  // Removing yourself (declining a membership you hold, or leaving) needs no gate; removing
+  // someone else is group management, so it stays member-gated.
+  const uid = c.req.param('uid')!;
+  if (uid !== c.var.user!.id && !(await requireGroupMember(c, gid))) {
+    return c.json({ error: 'only a group member can remove members' }, 403);
+  }
+  await c.env.DB.prepare('DELETE FROM user_groups WHERE user_id = ? AND group_id = ?').bind(uid, gid).run();
   return c.json({ ok: true });
 });
 

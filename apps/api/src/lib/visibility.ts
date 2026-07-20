@@ -16,7 +16,7 @@ import type { Env } from '../env';
 
 export const USER_PROJECT_WHERE = `(
   p.owner_user_id = ?1
-  OR (p.group_id IS NOT NULL AND p.group_id IN (SELECT group_id FROM user_groups WHERE user_id = ?1))
+  OR (p.group_id IS NOT NULL AND p.group_id IN (SELECT group_id FROM user_groups WHERE user_id = ?1 AND status = 'accepted'))
 )`;
 
 /**
