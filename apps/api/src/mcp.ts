@@ -637,7 +637,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     {
       projectId: z.string(),
       name: z.string().min(1).max(120),
-      description: z.string().max(300).optional().describe('One line: what a reader finds inside'),
+      description: z.string().max(300).optional().describe('One line (max 300 chars): what a reader finds inside'),
       body: z.string().optional().describe('The document, markdown'),
       folder: z.string().max(200).optional().describe('Folder path for human browsing, e.g. "design/networking" — organizational only, the doc is always addressed by its id. Reuse existing folders (see list_docs) before minting new ones.'),
       tags: z.array(z.string()).optional().describe('1-3 tags from the project vocabulary (get_project.tags / list_docs) — tags are shared FILTERS, so reuse before minting (near-duplicates are rejected) and only tag with words that group 3+ items. Never restate the folder or the title as a tag; finding one specific doc is semantic search\'s job.'),
@@ -656,7 +656,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       projectId: z.string(),
       docId: z.string(),
       name: z.string().min(1).max(120).optional(),
-      description: z.string().max(300).optional(),
+      description: z.string().max(300).optional().describe('One line (max 300 chars): what a reader finds inside'),
       body: z.string().optional().describe('Full replacement markdown'),
       folder: z.string().max(200).optional().describe('Move the doc to this folder path ("" = root) — organizational only, links and ids are unaffected'),
       tags: z.array(z.string()).optional().describe('REPLACES the tag set ([] clears) — prefer addTags/removeTags for edits. Reuse the project vocabulary; near-duplicates are rejected.'),
@@ -1617,7 +1617,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       projectId: z.string(),
       planId: z.string(),
       name: z.string().min(1).max(120),
-      description: z.string().max(300).optional().describe('One line: what a reader finds inside'),
+      description: z.string().max(300).optional().describe('One line (max 300 chars): what a reader finds inside'),
       body: z.string().optional().describe('The document, markdown — may be provisional'),
     },
     tool(async ({ projectId, planId, name, description, body }) =>
@@ -1631,7 +1631,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       projectId: z.string(),
       docId: z.string(),
       name: z.string().min(1).max(120).optional(),
-      description: z.string().max(300).optional(),
+      description: z.string().max(300).optional().describe('One line (max 300 chars): what a reader finds inside'),
       body: z.string().optional().describe('Full replacement markdown'),
     },
     tool(async ({ projectId, docId, name, description, body }) =>
