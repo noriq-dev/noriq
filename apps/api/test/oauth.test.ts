@@ -73,6 +73,31 @@ describe('oauth 2.1 for MCP', () => {
     expect(((await rs.json()) as { resource: string }).resource).toContain('/mcp');
   });
 
+  it('omits the RFC 9207 iss advertisement only for opted-in Codex clients (PLNR-221)', async () => {
+    for (const path of ['/.well-known/oauth-authorization-server', '/.well-known/openid-configuration']) {
+      // Unmarked clients keep strict RFC 9207 — the advertisement stays.
+      const strict = await SELF.fetch(`https://noriq.test${path}`);
+      expect(((await strict.json()) as Record<string, unknown>).authorization_response_iss_parameter_supported).toBe(true);
+
+      // A Codex client that sends the exact compat header gets the advertisement dropped,
+      // so its issuer-less callback validation passes. The rest of the document is intact.
+      const codex = await SELF.fetch(`https://noriq.test${path}`, {
+        headers: { 'X-Noriq-Codex-OAuth-Compat': 'issuer-callback-v1' },
+      });
+      const meta = (await codex.json()) as Record<string, unknown>;
+      expect('authorization_response_iss_parameter_supported' in meta).toBe(false);
+      expect(meta.issuer).toBe('https://noriq.test');
+      expect(meta.code_challenge_methods_supported).toEqual(['S256']);
+      expect(codex.headers.get('Vary')).toContain('X-Noriq-Codex-OAuth-Compat');
+
+      // A wrong header value is not the opt-in — strict behavior is preserved.
+      const wrong = await SELF.fetch(`https://noriq.test${path}`, {
+        headers: { 'X-Noriq-Codex-OAuth-Compat': 'nope' },
+      });
+      expect(((await wrong.json()) as Record<string, unknown>).authorization_response_iss_parameter_supported).toBe(true);
+    }
+  });
+
   it('401 on /mcp advertises the resource metadata', async () => {
     const res = await SELF.fetch('https://noriq.test/mcp', { method: 'POST' });
     expect(res.status).toBe(401);

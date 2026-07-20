@@ -277,8 +277,12 @@ type Scope = 'project' | 'global';
 
 function clientSnippet(id: ClientId, scope: Scope): { intro: string; code: string } {
   const url = `${location.origin}/mcp`;
+  // The http_headers marker is a temporary shim for a Codex OAuth-callback bug
+  // (openai/codex#31573): Codex drops the RFC 9207 `iss` param, so Noriq omits the
+  // matching advertisement only for a client that sends this header. See PLNR-221.
   const codexToml = `[mcp_servers.noriq]
-url = "${url}"`;
+url = "${url}"
+http_headers = { "X-Noriq-Codex-OAuth-Compat" = "issuer-callback-v1" }`;
   const vscodeJson = `{
   "servers": {
     "noriq": { "type": "http", "url": "${url}" }
@@ -299,8 +303,8 @@ url = "${url}"`;
       return {
         intro:
           scope === 'global'
-            ? 'Add to ~/.codex/config.toml (OAuth prompt on first use):'
-            : 'Codex reads its config globally — add to ~/.codex/config.toml and tell the agent which Noriq project to work:',
+            ? 'Add to ~/.codex/config.toml (OAuth prompt on first use). The extra header works around a current Codex OAuth-callback bug:'
+            : 'Codex reads its config globally — add to ~/.codex/config.toml (the header works around a current Codex OAuth-callback bug) and tell the agent which Noriq project to work:',
         code: codexToml,
       };
     case 'copilot':

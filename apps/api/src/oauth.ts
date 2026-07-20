@@ -58,6 +58,24 @@ export function normalizeUserCode(raw: string): string {
   return bare.length > 4 ? `${bare.slice(0, 4)}-${bare.slice(4)}` : bare;
 }
 
+// --- Codex OAuth compatibility (PLNR-221) --------------------------------------
+// Codex 0.143.0+ parses the OAuth callback but discards the RFC 9207 `iss` parameter,
+// then runs its issuer-less validation — which fails precisely because we advertise
+// issuer support. It is still broken on Codex `main` (openai/codex#31573, reported
+// through 0.144.5 / 0.145 alphas; last unaffected stable is 0.142.5).
+//
+// A Codex client opts into a narrow exception by sending this exact header on its
+// discovery + MCP requests (static `http_headers` in ~/.codex/config.toml, which Codex
+// passes to OAuth discovery too): we then OMIT `authorization_response_iss_parameter_supported`
+// from the AS metadata so Codex's validation path stops expecting `iss`. Every UNMARKED
+// client still gets strict RFC 9207, and we keep returning `iss` on the callback
+// regardless — strict OpenAI/ChatGPT clients require it. The marked flow loses only issuer
+// mix-up validation, which Codex cannot currently perform anyway; PKCE/S256, state, redirect
+// validation, short-lived codes, and token scoping are untouched. Deliberate, documented,
+// and easily removed once Codex fixes its callback parser.
+export const CODEX_OAUTH_COMPAT_HEADER = 'X-Noriq-Codex-OAuth-Compat';
+export const CODEX_OAUTH_COMPAT_VALUE = 'issuer-callback-v1';
+
 // --- discovery -----------------------------------------------------------------
 // Discovery must be reachable by clients that follow the MCP 2025-11-25 spec to
 // the letter (e.g. OpenAI/ChatGPT): AS metadata is probed at BOTH the RFC 8414
@@ -98,7 +116,18 @@ export function metadataRoutes(app: Hono<AppContext>) {
   };
 
   // AS metadata — RFC 8414 path and the OIDC-discovery path (both spec-required).
-  const asHandler = (c: Context<AppContext>) => send(c, authServerMeta(new URL(c.req.url).origin));
+  const asHandler = (c: Context<AppContext>) => {
+    const meta = authServerMeta(new URL(c.req.url).origin);
+    // The response now depends on a request header, so a shared cache must key on it.
+    c.header('Vary', CODEX_OAUTH_COMPAT_HEADER);
+    // A marked Codex client can't validate the issuer it would receive — drop the
+    // advertisement for it alone (PLNR-221). See the note by the constants above.
+    if (c.req.header(CODEX_OAUTH_COMPAT_HEADER) === CODEX_OAUTH_COMPAT_VALUE) {
+      delete (meta as { authorization_response_iss_parameter_supported?: boolean })
+        .authorization_response_iss_parameter_supported;
+    }
+    return send(c, meta);
+  };
   app.get('/.well-known/oauth-authorization-server', asHandler);
   app.get('/.well-known/openid-configuration', asHandler);
 
