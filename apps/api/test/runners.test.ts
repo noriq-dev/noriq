@@ -65,11 +65,43 @@ describe('runners (RUN-5)', () => {
     expect(runner.id).toMatch(/^rnr_/);
     expect(runner.status).toBe('online');
     expect(runner.freeSlots).toBe(2);
-    expect(runner.capabilities).toEqual({ tools: ['claude', 'codex'], kinds: ['scope', 'build', 'verify'], maxConcurrency: 2 });
+    // A registration that sends no coordinate catalog (RUN-115) defaults `agents` to [] — the
+    // dashboard picker falls back to free-text for an older runner.
+    expect(runner.capabilities).toEqual({ tools: ['claude', 'codex'], kinds: ['scope', 'build', 'verify'], maxConcurrency: 2, agents: [] });
     const byId = Object.fromEntries(runner.repos.map((r: any) => [r.id, r]));
     expect(byId.repo_a.projectKey).toBe('RNRX'); // normalized
     expect(byId.repo_a.projectId).toBe(rnrxProjectId); // resolved
     expect(byId.repo_b.projectId).toBeNull(); // unresolved
+  });
+
+  it('reads the coordinate catalog + per-repo workflows and exposes them (RUN-115/121, PLNR-223)', async () => {
+    const res = await register(ownerToken, {
+      label: 'coords',
+      tools: ['claude', 'codex'], kinds: ['build'], maxConcurrency: 1,
+      // The per-tool coordinate menu the dashboard's agent picker reads.
+      agents: [
+        { tool: 'claude', models: ['claude-opus-4-8', 'claude-sonnet-5'], efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
+        { tool: 'codex', models: ['gpt-5.6-codex'], efforts: ['low', 'medium', 'high'] },
+      ],
+      repos: [{ id: 'repo_wf', projectKey: 'rnrx', workflows: ['docs', 'triage'] }],
+    });
+    expect(res.status).toBe(200);
+    const { runner } = (await res.json()) as { runner: any };
+    // Coordinate catalog rode the capabilities read (stored in the JSON, no column).
+    expect(runner.capabilities.agents).toEqual([
+      { tool: 'claude', models: ['claude-opus-4-8', 'claude-sonnet-5'], efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
+      { tool: 'codex', models: ['gpt-5.6-codex'], efforts: ['low', 'medium', 'high'] },
+    ]);
+    // The repo's custom workflow names survived resolution (the built-ins are implicit).
+    const repo = runner.repos.find((r: any) => r.id === 'repo_wf');
+    expect(repo.workflows).toEqual(['docs', 'triage']);
+    expect(repo.projectId).toBe(rnrxProjectId); // still resolved as before
+
+    // And they persist to the read side (GET /api/runners), not just the registration echo.
+    const listed = (await (await listRunners(ownerCookie)).json()) as { runners: any[] };
+    const fromList = listed.runners.find((r) => r.id === runner.id)!;
+    expect(fromList.capabilities.agents).toHaveLength(2);
+    expect(fromList.repos.find((r: any) => r.id === 'repo_wf').workflows).toEqual(['docs', 'triage']);
   });
 
   it('does not resolve a key for a project the owner cannot reach', async () => {

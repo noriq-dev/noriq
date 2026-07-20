@@ -70,6 +70,27 @@ describe('run lifecycle in ProjectRoom (RUN-6)', () => {
     expect(run.anchor).toEqual({ type: 'task', taskId: 'task_x' });
     expect(run.budget).toEqual({ maxTokens: 1000 });
     expect(run.runnerId).toBeNull();
+    // No coordinate/workflow given → both null; the daemon synthesizes a coordinate from the
+    // agentTool/model/effort triple and uses the built-in for `kind` (PLNR-223 / RUN-114/121).
+    expect(run.agent).toBeNull();
+    expect(run.workflow).toBeNull();
+  });
+
+  it('persists the dispatch agent coordinate + selected workflow (PLNR-223 / RUN-114/121)', async () => {
+    const run = await room(pid).createRun(pid, actor, {
+      kind: 'scope', repoRef: 'repo_a', agentTool: 'claude',
+      // A custom `docs` workflow based on scope: kind carries the (read-only) posture, workflow
+      // only overrides the prompt — so both ride the run together.
+      agent: 'claude.claude-opus-4_8.high', workflow: 'docs',
+    });
+    expect(run.agent).toBe('claude.claude-opus-4_8.high');
+    expect(run.workflow).toBe('docs');
+    expect(run.kind).toBe('scope'); // the base posture stays kind-driven
+    // Survives a reload from D1 (not just the create-path echo).
+    const reloaded = await room(pid).listRuns(pid);
+    const found = reloaded.find((r) => r.id === run.id)!;
+    expect(found.agent).toBe('claude.claude-opus-4_8.high');
+    expect(found.workflow).toBe('docs');
   });
 
   it('drives queued → dispatched → running → blocked → running → done, synthesizing exit', async () => {
@@ -430,6 +451,22 @@ describe('dispatch validates verifiesRunId (HTTP)', () => {
     const { run } = (await res.json()) as { run: { model: string | null; effort: string | null } };
     expect(run.model).toBeNull();
     expect(run.effort).toBeNull();
+  });
+
+  it('round-trips the agent coordinate + selected workflow onto the Run (PLNR-223 / RUN-114/121)', async () => {
+    // The dashboard sends the coordinate `agent` AND a custom workflow name; `kind` still carries
+    // the posture (the daemon keys permissions off it), so the base rides alongside the workflow.
+    const res = await dispatch({
+      runnerId: 'rnr_owned', kind: 'scope', agentTool: 'claude', repoRef: 'repo_a',
+      brief: 'run the docs workflow', agent: 'claude.claude-opus-4_8.high', workflow: 'docs',
+    });
+    expect(res.status).toBe(200);
+    const { run } = (await res.json()) as { run: { id: string; agent: string | null; workflow: string | null } };
+    expect(run.agent).toBe('claude.claude-opus-4_8.high');
+    expect(run.workflow).toBe('docs');
+    const row = await env.DB.prepare('SELECT agent, workflow FROM runs WHERE id = ?')
+      .bind(run.id).first<{ agent: string | null; workflow: string | null }>();
+    expect(row).toMatchObject({ agent: 'claude.claude-opus-4_8.high', workflow: 'docs' });
   });
 
   it('rejects an effort that is not one of ours (RUN-33)', async () => {

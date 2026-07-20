@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { AgentTool, RunBudget, RunEffort } from './runner';
+import { AgentTool, RunBudget, RunEffort, RunKind } from './runner';
 
 // ---------------------------------------------------------------------------
 // The two manifests (RUN plan, Phase 1). The daemon reads TOML off disk; these
@@ -61,6 +61,11 @@ export type KindPermissions = z.infer<typeof KindPermissions>;
  * an ordinary thing to want, and so is the reverse.
  */
 export const ModelDefault = z.object({
+  // The agent coordinate (RUN-113): `claude.opus-4_8.high` — the canonical per-kind selector.
+  // When set it WINS; `model`/`effort` below are the legacy triple, kept as the fallback for one
+  // deprecation window. A free string (the runner's coordinate parser validates it), not an enum —
+  // model ids are the vendor's and change weekly, exactly the reason `model` is a free string.
+  agent: z.string().nullable().default(null),
   model: z.string().nullable().default(null),
   effort: RunEffort.nullable().default(null),
 });
@@ -98,6 +103,10 @@ export const VerifyReviewer = z.object({
    * vendor's) — name `model` here or take the tool's own default. A tool with no driver on the
    * machine fails the gate loudly rather than silently reviewing with the builder's vendor.
    */
+  // The reviewer's agent coordinate (RUN-113): `codex.gpt-5_6-sol.high` names tool+model+effort in
+  // one string. When set it WINS over `tool`/`model`/`effort` below (the legacy triple), and its
+  // tool segment IS honored — a reviewer on a different vendor is the whole point of RUN-70.
+  agent: z.string().nullable().default(null),
   tool: AgentTool.nullable().default(null),
   model: z.string().nullable().default(null),
   effort: RunEffort.nullable().default(null),
@@ -207,6 +216,23 @@ export const LandPolicy = z.object({
 });
 export type LandPolicy = z.infer<typeof LandPolicy>;
 
+/**
+ * A repo-defined workflow (RUN-119): a NAMED variant of a built-in run kind. It inherits the
+ * built-in `base`'s security POSTURE verbatim — a `docs` workflow based on `scope` is read-only
+ * because scope is, and no field here can change that (the write floor is enforced in the runner,
+ * RUN-118). What a custom workflow may vary is the PROMPT the agent gets, so a repo can shape "how"
+ * a read-only exploration or a build is briefed without minting a new posture. The three built-ins
+ * (scope/build/verify) are always present and need no declaration.
+ */
+export const WorkflowDef = z.object({
+  // Which built-in posture this workflow IS — the floor-safe foundation it cannot escape.
+  base: RunKind,
+  // A prompt template name or inline text overriding the base's default brief (RUN-121). Null =
+  // use the base's own prompt, exactly as the built-in kind would.
+  prompt: z.string().nullable().default(null),
+});
+export type WorkflowDef = z.infer<typeof WorkflowDef>;
+
 // A committed KEY must satisfy the same shape as Project.key (short prefix).
 export const ProjectKey = z.string().min(1).max(8);
 
@@ -232,6 +258,10 @@ export const ProjectManifest = z.object({
   // still override per run. Not part of the security floor — unlike `permissions`, getting this
   // wrong costs money or quality, never safety.
   defaults: KindDefaults.prefault({}),
+  // Repo-defined workflows (RUN-119), keyed by name: named variants of a built-in kind with their
+  // own prompt. The three built-ins are always available and are NOT listed here; a name that
+  // collides with a built-in is ignored in favour of the built-in (a repo cannot redefine `build`).
+  workflows: z.record(z.string(), WorkflowDef).default({}),
 });
 export type ProjectManifest = z.infer<typeof ProjectManifest>;
 

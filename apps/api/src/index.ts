@@ -23,7 +23,7 @@ import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
 import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
 import { z } from 'zod';
-import { AgentTool, RunEffort, RunKind, RunnerRepo, RunBudget, normalizeProjectKey } from '@noriq-dev/shared';
+import { AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget, normalizeProjectKey } from '@noriq-dev/shared';
 
 export { ProjectRoom } from './do/ProjectRoom';
 export { AgentSession } from './do/AgentSession';
@@ -1471,6 +1471,10 @@ const RegisterRunnerBody = z.object({
   runnerId: z.string().optional(), // present on re-register (reconnect)
   label: z.string().min(1),
   tools: z.array(AgentTool).default([]),
+  // The coordinate catalog per installed tool (RUN-115) — models + efforts for the dashboard's
+  // agent picker. Additive to `tools`; an older runner omits it and the picker falls back to
+  // free-text. Persisted inside the `capabilities` JSON (no column), so it rides the existing read.
+  agents: z.array(AdvertisedAgent).default([]),
   kinds: z.array(RunKind).default([]),
   maxConcurrency: z.number().int().nonnegative().default(1),
   repos: z.array(RunnerRepo).default([]),
@@ -1561,7 +1565,7 @@ app.post('/api/runners', agentAuth, async (c) => {
   const b = parsed.data;
   const userId = c.var.connection!.userId;
   const repos = await resolveRunnerRepos(c.env, userId, b.repos, c.var.connection!.tokenId);
-  const capabilities = JSON.stringify({ tools: b.tools, kinds: b.kinds, maxConcurrency: b.maxConcurrency });
+  const capabilities = JSON.stringify({ tools: b.tools, kinds: b.kinds, maxConcurrency: b.maxConcurrency, agents: b.agents });
   const now = nowIso();
   let id = b.runnerId;
   if (id) {
@@ -1785,6 +1789,16 @@ const DispatchBody = z.object({
   // in the tool. `effort` IS closed, because it is a fixed intent we map per driver.
   model: z.string().min(1).max(200).nullish(),
   effort: RunEffort.nullish(),
+  // The agent COORDINATE (RUN-114): `claude.opus-4_8.high`, naming tool+model+effort in one string.
+  // When set the daemon prefers it over the triple; when null it synthesizes one from the triple, so
+  // this is a pure UI upgrade — an unconstrained string for the same reason `model` is (the daemon's
+  // coordinate parser is the validator, and model ids are the vendor's).
+  agent: z.string().min(1).max(200).nullish(),
+  // A repo-defined workflow name (RUN-121). The daemon resolves it against the repo's committed
+  // manifest (base + prompt); it only overrides the PROMPT, so `kind` above still carries the
+  // posture — the dispatcher must set `kind` to the workflow's base. Free string: the valid set
+  // lives in the manifest, invisible here; an unknown name falls back to the built-in for `kind`.
+  workflow: z.string().min(1).max(80).nullish(),
   budget: RunBudget.optional(),
 });
 
@@ -1822,6 +1836,7 @@ app.post('/api/projects/:pid/runs', userAuth, async (c) => {
     anchor: b.anchor ? { type: b.anchor.type, id: b.anchor.id } : null,
     verifiesRunId: b.verifiesRunId ?? null,
     targetBranch: b.targetBranch ?? null,
+    agent: b.agent ?? null, workflow: b.workflow ?? null,
     model: b.model ?? null, effort: b.effort ?? null,
     budget: b.budget, runnerId: b.runnerId,
   });

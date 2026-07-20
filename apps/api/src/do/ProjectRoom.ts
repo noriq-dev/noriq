@@ -132,6 +132,13 @@ export interface CreateRunInput {
   brief?: string;
   repoRef: string;
   agentTool: string; // AgentTool: claude|codex
+  /** The dispatch's agent COORDINATE (RUN-114): `claude.opus-4_8.high`. When set it WINS over the
+   *  agentTool/model/effort triple below; when null the daemon synthesizes one from that triple.
+   *  Free string — the daemon's coordinate parser validates it, not us. */
+  agent?: string | null;
+  /** The repo-defined workflow this run selects (RUN-121), or null for a plain kind run. A custom
+   *  workflow only overrides the PROMPT; `kind` still carries the posture, so the base must match. */
+  workflow?: string | null;
   /** Per-dispatch model + effort (RUN-33). Null = the repo's [defaults] for this kind, then
    *  the tool's own default. The daemon resolves that chain; it has the manifest, we don't. */
   model?: string | null;
@@ -158,7 +165,8 @@ type RunRow = {
   id: string; project_id: string; runner_id: string | null; agent_id: string | null;
   kind: string; anchor_type: string | null; anchor_id: string | null; verifies_run_id: string | null;
   plan_id: string | null; plan_key: string | null; target_branch: string | null; brief: string;
-  repo_ref: string; agent_tool: string; model: string | null; effort: string | null;
+  repo_ref: string; agent_tool: string; agent: string | null; workflow: string | null;
+  model: string | null; effort: string | null;
   budget: string; status: string; phase: string | null;
   exit: string | null;
   worktree_path: string | null;
@@ -187,6 +195,10 @@ export interface RunView {
   brief: string;
   repoRef: string;
   agentTool: string;
+  /** The dispatch's agent coordinate (RUN-114); null = synthesized from the triple below. */
+  agent: string | null;
+  /** The selected repo-defined workflow (RUN-121); null = the built-in for `kind`. */
+  workflow: string | null;
   /** Per-dispatch model + effort (RUN-33). Null = the repo's [defaults], then the tool's. */
   model: string | null;
   effort: string | null;
@@ -2385,6 +2397,8 @@ export class ProjectRoom extends DurableObject<Env> {
       brief: r.brief,
       repoRef: r.repo_ref,
       agentTool: r.agent_tool,
+      agent: r.agent,
+      workflow: r.workflow,
       model: r.model,
       effort: r.effort,
       budget: JSON.parse(r.budget || '{}'),
@@ -2445,14 +2459,16 @@ export class ProjectRoom extends DurableObject<Env> {
     const plan = await this.resolveRunPlan(anchorType, anchorId);
     await this.env.DB.prepare(
       `INSERT INTO runs (id, project_id, runner_id, kind, anchor_type, anchor_id, verifies_run_id,
-                         plan_id, plan_key, target_branch, brief, repo_ref, agent_tool, model, effort,
+                         plan_id, plan_key, target_branch, brief, repo_ref, agent_tool, agent, workflow,
+                         model, effort,
                          budget, status, plan_dispatch_id, created_by, created_at, updated_at, dispatched_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       id, this.projectId, runnerId, input.kind, anchorType, anchorId, verifiesRunId,
       plan?.id ?? null, plan ? this.planKey(plan) : null, input.targetBranch ?? null,
       input.brief ?? '', input.repoRef,
-      input.agentTool, input.model ?? null, input.effort ?? null,
+      input.agentTool, input.agent ?? null, input.workflow ?? null,
+      input.model ?? null, input.effort ?? null,
       JSON.stringify(input.budget ?? {}), status, input.planDispatchId ?? null,
       input.createdBy ?? actor.id, now, now,
       runnerId ? now : null,
