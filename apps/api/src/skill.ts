@@ -71,6 +71,33 @@ existing tags (\`building-system\` when \`building\` exists) unless you pass
 cannot mint tags at all. Health-check a vocabulary with \`tag_report\`; consolidate
 duplicates with \`merge_tags\` (maintenance, not routine).
 
+## File locks (when enabled)
+
+Git has no file locking, so two agents editing the same file on one project can clobber
+each other. Projects can opt in to **advisory file locks** (off by default). When a project
+has them on:
+
+1. Before you edit, create, delete, or **rename** a file, \`acquire_lock\` its path(s).
+   Pass **every** path the edit touches in ONE call — it is **all-or-nothing** (you get them
+   all or none, so you never hold half a set and deadlock). A rename locks {source, dest}.
+2. Scope it: pass \`branch\` (or \`allBranches:true\`) so you only contend with work on the
+   same branch, and \`taskId\` so the locks **auto-release when the task settles** — usually
+   you never call \`release_lock\` by hand.
+3. Paths can be an exact file (\`src/auth.ts\`), a directory (\`src/api/\`), or a glob
+   (\`src/**/*.ts\`). Hold the **smallest** scope that covers your edit — a whole-dir lock
+   blocks more peers than you need to.
+4. Re-acquiring paths you already hold just **renews** them (idempotent), so calling
+   \`acquire_lock\` before each edit keeps your active set held; paths you stop touching
+   expire on their own.
+5. \`check_locks\` looks without taking; \`list_locks\` shows who holds what. On a conflict,
+   \`acquire_lock\` returns the current holder (who, which task, when it expires) — coordinate
+   via \`send_message\` / \`handoff_task\`, or wait and retry. **Never** edit a file locked by
+   someone else.
+
+Locks are advisory: they stop a *cooperating* peer, not an uncooperative one. The contract
+is "successful acquire **before** you touch the file". (Runner-spawned agents may get this
+enforced automatically.)
+
 ## Finding things
 
 Large projects hold hundreds of tasks, docs and plans — search, don't scroll, and

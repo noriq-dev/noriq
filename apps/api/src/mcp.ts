@@ -58,6 +58,13 @@ projects accept no agent-minted tags at all. Never tag with status/type/priority
 words — those have dedicated fields. Plans need no dependency wiring: phase order itself
 gates tasks (a task is claimable when every earlier phase is finished); use dependsOn
 only for real, hand-picked orderings.
+When a project has file locking enabled (opt-in), acquire_lock the file paths you are about
+to edit/create/delete/rename BEFORE you touch them — pass the whole edit's paths in ONE call
+(it is all-or-nothing, so no half-held clashes), scoped to your branch, and linked to your
+task so they auto-release when it settles. Re-acquiring your own paths just renews them; hold
+the smallest scope that covers the edit and release_lock when done. check_locks looks without
+taking. On conflict, coordinate with the holder (send_message / handoff_task) or wait — never
+clobber a locked file. Git has no file locking; this is how agents avoid stepping on each other.
 Project docs are the knowledge base: settled decisions and facts ONLY (enforced — a doc
 with TBDs or open questions is rejected). Check a task's related docs (get_task.docs)
 and list_docs before unfamiliar work; link the docs a task must follow via docIds at
@@ -147,10 +154,12 @@ const TOOL_HINTS: Record<string, ToolHints> = {
   get_briefing: READ, my_updates: READ, list_projects: READ, get_project: READ, list_groups: READ, list_agents: READ,
   get_task: READ, search_tasks: READ, semantic_search: READ, tag_report: READ, next_claimable: READ, read_open_comments: READ, get_plans: READ, can_claim: READ,
   list_docs: READ, get_doc: READ, update_doc: WRITE_IDEMPOTENT, list_templates: READ, get_plan_doc: READ, update_plan_doc: WRITE_IDEMPOTENT,
+  check_locks: READ, list_locks: READ,
   // writes that are safe to repeat with the same args (renew/replace-in-place/insert-or-ignore)
   heartbeat: WRITE_IDEMPOTENT, set_agent_identity: WRITE_IDEMPOTENT, update_task: WRITE_IDEMPOTENT, update_tasks: WRITE_IDEMPOTENT,
   update_plan: WRITE_IDEMPOTENT, add_dependency: WRITE_IDEMPOTENT, remove_dependency: WRITE_IDEMPOTENT, attach_ref: WRITE_IDEMPOTENT,
   set_project_group: WRITE_IDEMPOTENT, reindex_search: WRITE_IDEMPOTENT,
+  acquire_lock: WRITE_IDEMPOTENT, release_lock: WRITE_IDEMPOTENT,
   // everything else → WRITE (additive, non-idempotent, non-destructive, closed-world)
 };
 
@@ -281,6 +290,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           'Project docs are settled decisions and facts ONLY (enforced — open questions/TBDs are rejected). Read a task\'s related docs (get_task.docs) before starting; link the docs new tasks must follow via docIds; when you settle something durable, create_doc the outcome. Undecided → request_input first, then document the answer.',
           'Search before you file or dig: semantic_search finds tasks, docs and plans by MEANING (the thing you are about to create may already exist); search_tasks filters by attributes. Prefer them over dumping get_project in large projects.',
           'Claims are exclusive. If claim_task fails, the task is taken or blocked — pick another.',
+          'When a project has file locking ON (opt-in), acquire_lock the file(s) you are about to edit/create/rename BEFORE touching them — all paths in ONE all-or-nothing call, scoped to your branch and linked to your task (they auto-release when it settles). Re-acquiring your own paths renews them; check_locks to look without taking; release_lock when done. On conflict, coordinate with the holder or wait — never clobber a locked file. Git has no file locking; this is how agents avoid stepping on each other.',
           'Blocked on a human decision? request_input (it auto-parks the task and frees you to work elsewhere) — do not guess or stall. Batch every question the decision needs into its typed `questions` (select/multi/text/number/confirm) in ONE gate; thread a genuine follow-up round with followUpTo. Flag non-blocking concerns (deviations, risks) with raise_alert and keep going.',
           'Every tool result may end with a "--- notices ---" block: read it, it is addressed to you.',
         ],
@@ -1268,6 +1278,84 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         }
       }
       return room(env, projectId).releaseTask(projectId, actor, id, { toStatus, comment });
+    }),
+  );
+
+  // ---- file locks (advisory path locks, PLNR-206) -------------------------
+  // Opt-in per project. The ProjectRoom is the race-free arbiter; these tools are the agent
+  // surface. Advisory: acquiring succeeds against a cooperating peer, not an uncooperative one —
+  // the contract is "acquire BEFORE you touch the file(s)".
+
+  defineTool(
+    'acquire_lock',
+    'Acquire an advisory lock on file path(s) BEFORE you edit/create/delete/rename them, so another '
+      + 'agent on this project cannot clobber your work (git has no file locking). Pass EVERY path in the '
+      + 'edit you are about to make in one call — it is all-or-nothing (you get them all or none, so no '
+      + 'half-held deadlocks); a rename locks {source, dest}. Paths accept an exact file ("src/auth.ts"), '
+      + 'a directory ("src/api/"), or a glob ("src/**/*.ts"). Give branch (or allBranches:true) so your '
+      + 'lock does not needlessly block work on other branches. Link taskId to auto-release when the task '
+      + 'settles. Re-acquiring paths you already hold just renews them (idempotent) — call it again before '
+      + 'each edit to keep the active set held; unlocked paths expire on their own. On conflict it returns '
+      + 'the current holder (who, which task, when it expires) so you coordinate (send_message / '
+      + 'handoff_task) or wait. Requires file locking to be enabled for the project.',
+    {
+      projectId: z.string(),
+      paths: z.array(z.string().min(1)).min(1).describe('Paths to lock: exact files, dirs (trailing /), or globs'),
+      branch: z.string().optional().describe('The branch you are editing on; conflicts are scoped to it'),
+      allBranches: z.boolean().optional().describe('Lock across all branches (use when no branch applies)'),
+      taskId: z.string().optional().describe('Link to the task you are working — the lock auto-releases when it settles'),
+    },
+    tool(async ({ projectId, paths, branch, allBranches, taskId }) => {
+      const resolvedTaskId = taskId ? await resolveTaskId(env, projectId, taskId) : null;
+      return room(env, projectId).acquireLocks(projectId, actor, agent.id, { paths, branch, allBranches, taskId: resolvedTaskId });
+    }),
+  );
+
+  defineTool(
+    'release_lock',
+    'Release advisory file locks your session holds — by lockIds or by paths — when you finish editing them. '
+      + 'Idempotent, and only ever releases YOUR locks (a peer\'s lock is untouchable; a human resolves a stuck '
+      + 'one from the dashboard). Locks linked to a task also auto-release when the task is released or done, so '
+      + 'you rarely need this explicitly.',
+    {
+      projectId: z.string(),
+      lockIds: z.array(z.string()).optional().describe('Lock ids returned by acquire_lock'),
+      paths: z.array(z.string()).optional().describe('Or release by the exact paths you locked'),
+    },
+    tool(async ({ projectId, lockIds, paths }) =>
+      room(env, projectId).releaseLocks(projectId, actor, agent.id, { lockIds, paths }),
+    ),
+  );
+
+  defineTool(
+    'check_locks',
+    'Look BEFORE you leap: without acquiring anything, check whether file path(s) you are about to touch are '
+      + 'held by another session (and which you already hold). Returns each conflicting holder + expiry so you '
+      + 'can coordinate or pick different work. Read-only. Returns enabled:false if the project has not turned '
+      + 'on file locking.',
+    {
+      projectId: z.string(),
+      paths: z.array(z.string().min(1)).min(1),
+      branch: z.string().optional(),
+      allBranches: z.boolean().optional(),
+    },
+    tool(async ({ projectId, paths, branch, allBranches }) =>
+      room(env, projectId).checkLocks(projectId, actor, agent.id, { paths, branch, allBranches }),
+    ),
+  );
+
+  defineTool(
+    'list_locks',
+    'List the advisory file locks currently held in a project — who holds what, for which task, on which '
+      + 'branch, and when each expires. Pass mine:true for only your own, or taskId to scope to one task. Read-only.',
+    {
+      projectId: z.string(),
+      taskId: z.string().optional(),
+      mine: z.boolean().optional().describe('Only locks held by your session'),
+    },
+    tool(async ({ projectId, taskId, mine }) => {
+      const resolvedTaskId = taskId ? await resolveTaskId(env, projectId, taskId) : undefined;
+      return room(env, projectId).listLocks(projectId, actor, { taskId: resolvedTaskId, agentId: mine ? agent.id : undefined });
     }),
   );
 

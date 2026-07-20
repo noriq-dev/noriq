@@ -560,8 +560,8 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
   if (!visible) return c.json({ error: 'not found' }, 404);
   // Auto-archive done tasks untouched for >24h whenever the project is viewed.
   await room(c.env, pid).sweepArchive(pid).catch(() => {});
-  const [project, tasks, deps, agents, events, milestones, boards, plans, phases, phaseTasks, tags, taskTags, signals, taskDocs, planDocs] = await Promise.all([
-    c.env.DB.prepare('SELECT id, key, name, description, claim_ttl_seconds AS claimTtlSeconds, repo_url AS repoUrl FROM projects WHERE id = ?')
+  const [project, tasks, deps, agents, events, milestones, boards, plans, phases, phaseTasks, tags, taskTags, signals, taskDocs, planDocs, locks] = await Promise.all([
+    c.env.DB.prepare('SELECT id, key, name, description, claim_ttl_seconds AS claimTtlSeconds, lock_ttl_seconds AS lockTtlSeconds, file_locking_enabled AS fileLockingEnabled, repo_url AS repoUrl FROM projects WHERE id = ?')
       .bind(pid).first(),
     // PLNR-150: archived tasks ship too, flagged by archivedAt. Archiving is a *board
     // display* concern — filtering it out here silently drained every derived aggregate
@@ -615,6 +615,16 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     // Plan-local docs (PLNR-200): body included so the plan view renders/edits inline
     // (mirrors plans/phases, which also carry full body in the snapshot). Not indexed.
     c.env.DB.prepare('SELECT id, plan_id AS planId, name, description, body, author_kind AS authorKind, author_name AS authorName, created_at AS createdAt, updated_at AS updatedAt FROM plan_docs WHERE project_id = ? ORDER BY updated_at DESC').bind(pid).all(),
+    // Live file locks (PLNR-212) — unreleased + unexpired (arbiter reads by server time; the alarm
+    // sweep lags), joined to holder + task for the locks panel + board chips.
+    c.env.DB.prepare(
+      `SELECT fl.id, fl.agent_id AS agentId, fl.task_id AS taskId, fl.kind, fl.canon_pattern AS path,
+              fl.branch, fl.all_branches AS allBranches, fl.acquired_at AS acquiredAt, fl.expires_at AS expiresAt,
+              a.name AS holderName, t.key AS taskKey, t.title AS taskTitle
+       FROM file_locks fl LEFT JOIN agents a ON a.id = fl.agent_id LEFT JOIN tasks t ON t.id = fl.task_id
+       WHERE fl.project_id = ? AND fl.released_at IS NULL AND fl.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       ORDER BY fl.acquired_at DESC`,
+    ).bind(pid).all(),
   ]);
   if (!project) return c.json({ error: 'not found' }, 404);
   return c.json({
@@ -632,6 +642,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     taskTags: taskTags.results,
     taskDocs: taskDocs.results,
     planDocs: planDocs.results,
+    locks: locks.results,
     signals: signals.results.map((s) => ({
       ...s,
       options: s.options ? JSON.parse(String(s.options)) : null,
@@ -893,6 +904,14 @@ app.patch('/api/projects/:pid/plans/:plid/docs/:docId', userAuth, async (c) =>
 app.delete('/api/projects/:pid/plans/:plid/docs/:docId', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).deletePlanDoc(c.req.param('pid')!, humanActor(c), c.req.param('docId')!)));
 
+// Human force-release of a stuck file lock (PLNR-213) — e.g. a dead agent's hold. Agent↔agent
+// force-release is forbidden in the DO; a human is the override.
+app.post('/api/projects/:pid/locks/:lockId/force-release', userAuth, async (c) => {
+  const denied = demoDenied(c);
+  if (denied) return denied;
+  return c.json(await room(c.env, c.req.param('pid')!).forceReleaseLock(c.req.param('pid')!, humanActor(c), c.req.param('lockId')!));
+});
+
 // Project search (PLNR-184) — semantic when the AI+VECTORIZE bindings exist, keyword
 // otherwise; `mode` in the response says which ran. Covers tasks, docs and plans.
 app.get('/api/projects/:pid/search', userAuth, async (c) => {
@@ -995,7 +1014,7 @@ app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
   // the demo project's shape anyway.
   const denied = demoDenied(c);
   if (denied) return denied;
-  const body = await c.req.json<{ groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number; ownerUserId?: string | null; public?: boolean; tagPolicy?: 'open' | 'curated' }>();
+  const body = await c.req.json<{ groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number; ownerUserId?: string | null; public?: boolean; tagPolicy?: 'open' | 'curated'; fileLocking?: boolean; lockTtlSeconds?: number | null }>();
   const sets: string[] = [];
   const binds: unknown[] = [];
   if (body.groupId !== undefined) {
@@ -1020,6 +1039,16 @@ app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
   if (body.claimTtlSeconds !== undefined) {
     if (body.claimTtlSeconds < 60 || body.claimTtlSeconds > 24 * 3600) return c.json({ error: 'claim TTL must be 60s–24h' }, 400);
     ttlToSet = Math.round(body.claimTtlSeconds);
+  }
+  // File locking (opt-in, PLNR-206) routes through the DO like the claim TTL, so the live room
+  // resets its memoized flag/TTL instead of running on the stale value.
+  const lockOpts: { enabled?: boolean; ttlSeconds?: number | null } = {};
+  if (body.fileLocking !== undefined) lockOpts.enabled = !!body.fileLocking;
+  if (body.lockTtlSeconds !== undefined) {
+    if (body.lockTtlSeconds !== null && (body.lockTtlSeconds < 60 || body.lockTtlSeconds > 24 * 3600)) {
+      return c.json({ error: 'lock TTL must be 60s–24h (or null to inherit the claim TTL)' }, 400);
+    }
+    lockOpts.ttlSeconds = body.lockTtlSeconds === null ? null : Math.round(body.lockTtlSeconds);
   }
   if (body.ownerUserId !== undefined) {
     if (c.var.user!.role !== 'admin') return c.json({ error: 'admin role required to reassign ownership' }, 403);
@@ -1046,6 +1075,7 @@ app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
     await c.env.DB.prepare(`UPDATE projects SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
   }
   if (ttlToSet !== undefined) await room(c.env, pid).setClaimTtl(pid, ttlToSet);
+  if (lockOpts.enabled !== undefined || lockOpts.ttlSeconds !== undefined) await room(c.env, pid).setFileLocking(pid, lockOpts);
   // No auto-join anymore (PLNR-93): the caller was required to already be a member or
   // the creator of the target group above, so their visibility is already correct —
   // and this closes the "join any group by dropping a project in" hole.

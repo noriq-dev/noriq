@@ -58,8 +58,10 @@ export const api = {
   deletePlanDoc: (pid: string, planId: string, docId: string) =>
     req('DELETE', `/api/projects/${pid}/plans/${planId}/docs/${docId}`),
   publicSnapshot: (pid: string) => req<PublicSnapshot>('GET', `/api/public/projects/${pid}/snapshot`),
-  setProjectMeta: (pid: string, meta: { groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number; ownerUserId?: string | null; public?: boolean }) =>
+  setProjectMeta: (pid: string, meta: { groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number; ownerUserId?: string | null; public?: boolean; fileLocking?: boolean; lockTtlSeconds?: number | null }) =>
     req('PATCH', `/api/projects/${pid}/meta`, meta),
+  // Human force-release of a stuck file lock (PLNR-213).
+  forceReleaseLock: (pid: string, lockId: string) => req<{ ok: boolean; path?: string }>('POST', `/api/projects/${pid}/locks/${lockId}/force-release`),
 
   users: () => req<{ users: ApiUser[] }>('GET', '/api/users'),
   createUser: (email: string, name: string, password: string, role: string) =>
@@ -510,7 +512,7 @@ export interface ApiSearchHit {
 export interface ApiSnapshot {
   /** Server package version — deploy marker for the SPA's self-refresh (PLNR-193). */
   version?: string;
-  project: { id: string; key: string; name: string; description: string; claimTtlSeconds: number };
+  project: { id: string; key: string; name: string; description: string; claimTtlSeconds: number; lockTtlSeconds?: number | null; fileLockingEnabled?: number };
   tasks: Array<{
     id: string; key: string; title: string; body: string; status: string; type: string; priority: number;
     estimate: number | null; dueAt: string | null; claimedBy: string | null; claimExpiresAt: string | null; parentTaskId: string | null;
@@ -531,6 +533,12 @@ export interface ApiSnapshot {
   taskDocs: Array<{ taskId: string; docId: string }>;
   /** Plan-local working docs (PLNR-200): scoped to a plan, not indexed, no settled-only rule. */
   planDocs: Array<{ id: string; planId: string; name: string; description: string; body: string; authorKind: string; authorName: string; createdAt: string; updatedAt: string }>;
+  /** Live file locks (PLNR-212): unreleased + unexpired, joined to holder + task. */
+  locks: Array<{
+    id: string; agentId: string; taskId: string | null; kind: string; path: string;
+    branch: string | null; allBranches: number; acquiredAt: string; expiresAt: string;
+    holderName: string | null; taskKey: string | null; taskTitle: string | null;
+  }>;
   events: Array<{
     id: string; seq: number; actorKind: 'agent' | 'human' | 'system'; actorId: string; verb: string;
     subjectType: string; subjectId: string; payload: Record<string, unknown>; createdAt: string;

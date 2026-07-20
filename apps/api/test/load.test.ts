@@ -1,10 +1,20 @@
 // PLNR-19: hammer the claim arbiter. The exactly-one-claim invariant is the
 // foundation everything else stands on — prove it holds under a concurrent
 // stampede, and that legitimate parallel work isn't serialized away.
+import { env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import { createAgent, mcpCall, authorizeForAllProjects } from './helpers';
+import type { Env } from '../src/env';
 
 const RACERS = 12;
+const appEnv = env as unknown as Env;
+const room = (pid: string) =>
+  appEnv.PROJECT_ROOM.get(appEnv.PROJECT_ROOM.idFromName(pid)) as unknown as {
+    setFileLocking(pid: string, opts: { enabled?: boolean }): Promise<unknown>;
+  };
+const liveLockCount = (pid: string, canon: string) =>
+  env.DB.prepare('SELECT COUNT(*) AS n FROM file_locks WHERE project_id = ? AND canon_pattern = ? AND released_at IS NULL')
+    .bind(pid, canon).first<{ n: number }>();
 
 let agents: Array<{ id: string; apiKey: string }> = [];
 let projectId: string;
@@ -83,5 +93,52 @@ describe('claim arbiter under load', () => {
     const row = proj.body.tasks.find((x: { id: string }) => x.id === t.body.id);
     expect(row.claimedBy).toBeNull();
     expect(row.status).toBe('todo');
+  }, 30000);
+});
+
+describe('file-lock arbiter under load (PLNR-214)', () => {
+  beforeAll(async () => {
+    await room(projectId).setFileLocking(projectId, { enabled: true });
+  }, 30000);
+
+  it(`${RACERS} agents race ONE path → exactly one lock granted, the rest denied`, async () => {
+    const start = Date.now();
+    const results = await Promise.all(
+      agents.map((a) => mcpCall(a.apiKey, 'acquire_lock', { projectId, paths: ['src/contested.ts'], branch: 'main' })),
+    );
+    const elapsed = Date.now() - start;
+    const wins = results.filter((r) => !r.isError && r.body?.ok === true);
+    const denials = results.filter((r) => !r.isError && r.body?.ok === false);
+    expect(wins).toHaveLength(1);
+    expect(denials).toHaveLength(RACERS - 1);
+    // The stored truth agrees: exactly ONE live lock on the contested path.
+    expect((await liveLockCount(projectId, 'src/contested.ts'))!.n).toBe(1);
+    // Every denial names the one holder + the same expiry.
+    for (const d of denials) expect(d.body.conflicts[0].path).toBe('src/contested.ts');
+    expect(elapsed).toBeLessThan(10_000);
+    // eslint-disable-next-line no-console
+    console.info(`[load] 1-path lock stampede: ${RACERS} racers in ${elapsed}ms (1 grant, ${denials.length} denials)`);
+  }, 30000);
+
+  it(`${RACERS} agents lock ${RACERS} DISTINCT paths in parallel → all granted`, async () => {
+    const start = Date.now();
+    const results = await Promise.all(
+      agents.map((a, i) => mcpCall(a.apiKey, 'acquire_lock', { projectId, paths: [`src/lane-${i}.ts`], branch: 'main' })),
+    );
+    const elapsed = Date.now() - start;
+    expect(results.filter((r) => !r.isError && r.body?.ok === true)).toHaveLength(RACERS);
+    for (let i = 0; i < RACERS; i++) expect((await liveLockCount(projectId, `src/lane-${i}.ts`))!.n).toBe(1);
+    expect(elapsed).toBeLessThan(10_000);
+    // eslint-disable-next-line no-console
+    console.info(`[load] parallel distinct-path locks: ${RACERS}/${RACERS} in ${elapsed}ms`);
+  }, 30000);
+
+  it('one agent hammering the same path concurrently is idempotent → one row', async () => {
+    const holder = agents[0]!;
+    const results = await Promise.all(
+      Array.from({ length: RACERS }, () => mcpCall(holder.apiKey, 'acquire_lock', { projectId, paths: ['src/idem-load.ts'], branch: 'main' })),
+    );
+    expect(results.every((r) => !r.isError && r.body?.ok === true)).toBe(true);
+    expect((await liveLockCount(projectId, 'src/idem-load.ts'))!.n).toBe(1); // renews in place, never duplicates
   }, 30000);
 });

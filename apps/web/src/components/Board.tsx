@@ -30,6 +30,8 @@ export function Board({ store }: { store: AppStore }) {
   const tags = snapshot?.tags ?? [];
   const boards = snapshot?.boards ?? [];
   const firstBoardId = boards[0]?.id ?? null;
+  // Tasks holding one or more file locks (PLNR-212) → a 🔒 chip on the card.
+  const lockedTaskIds = new Set((snapshot?.locks ?? []).map((l) => l.taskId).filter(Boolean) as string[]);
   const [msFilter, setMsFilter] = useState<string | null>(null);
   const [tagFilter, setTagFilter] = useState<string | null>(null);
   // Tag row collapse (PLNR-196): null = default (open unless the vocabulary is large).
@@ -384,6 +386,9 @@ export function Board({ store }: { store: AppStore }) {
                           })()}
                           {t.openComments > 0 && (
                             <MonoTag color="var(--amber)" bg="rgba(245,166,35,.12)" size={9.5}>{t.openComments} ?</MonoTag>
+                          )}
+                          {lockedTaskIds.has(t.id) && (
+                            <MonoTag color="var(--blue)" bg="rgba(76,157,255,.12)" size={9.5}>🔒</MonoTag>
                           )}
                         </div>
                         <div style={{ fontSize: 12.5, lineHeight: 1.45, color: 'var(--text)' }}>{t.title}</div>

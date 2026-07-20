@@ -1,0 +1,20 @@
+{
+  "//": "Noriq file-lock hook — copy these blocks into ~/.claude/settings.json (global) or a repo's .claude/settings.json (per-project), and replace ABSOLUTE_PATH with the checkout path of this repo. Config is via env (NORIQ_URL, NORIQ_TOKEN, NORIQ_PROJECT); see hooks/README.md.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          { "type": "command", "command": "node ABSOLUTE_PATH/hooks/noriq-lock.mjs" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node ABSOLUTE_PATH/hooks/noriq-lock.mjs" }
+        ]
+      }
+    ]
+  }
+}

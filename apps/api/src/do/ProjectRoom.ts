@@ -5,6 +5,10 @@ import { userCanAccessProject } from '../lib/visibility';
 import { unfinishedDeps as unfinishedDepsLib } from '../lib/claimability';
 import { needsOutOfBand, sendSignalEmail, sendSignalWebhook } from '../lib/notify-out';
 import { requireDecisionOnlyDoc } from '../lib/doclint';
+import {
+  normalizePattern, patternsOverlap, branchScopesOverlap, LOCK_LIMITS,
+  type NormalizedPattern, type BranchScope,
+} from '../lib/lockmatch';
 import { searchBackend, indexEntity, removeEntity, type SearchKind } from '../search';
 import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
@@ -26,6 +30,24 @@ export interface Actor {
   kind: 'agent' | 'human' | 'system';
   id: string;
   name: string;
+}
+
+const SYSTEM_ACTOR: Actor = { kind: 'system', id: 'system', name: 'system' };
+
+/** A live file lock joined to its holder + linked task, as loaded by the arbiter (PLNR-204). */
+interface LiveLockRow {
+  id: string;
+  agentId: string;
+  taskId: string | null;
+  kind: string;
+  rawPattern: string;
+  canonPattern: string;
+  branch: string | null;
+  allBranches: number;
+  acquiredAt: string;
+  expiresAt: string;
+  agentName: string | null;
+  taskKey: string | null;
 }
 
 export interface CreateTaskInput {
@@ -274,6 +296,12 @@ export class ProjectRoom extends DurableObject<Env> {
   // Claim TTL rarely changes; cache it per instance so the liveness renewal folded
   // into emit() doesn't add a D1 read to every agent action.
   private _ttl?: number;
+
+  // File-locking opt-in flag + its (separate) TTL, memoized like _ttl and invalidated by
+  // setFileLocking. _fileLocking lets the settlement paths short-circuit at zero cost when a
+  // project never enabled locking (PLNR-204).
+  private _fileLocking?: boolean;
+  private _lockTtl?: number;
 
   private get projectId(): string {
     if (!this._pid) throw new Error('ProjectRoom: projectId not bound');
@@ -689,6 +717,9 @@ export class ProjectRoom extends DurableObject<Env> {
       binds.push(nowIso(), taskId);
       await this.env.DB.prepare(`UPDATE tasks SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
       if (statusChanged) {
+        // Any transition out of active work releases the task's file locks (§5 auto-release) — this
+        // is the supervisor-override settlement path, distinct from releaseTask.
+        if (patch.status !== 'in_progress') await this.releaseLocksForTask(taskId, actor, `status → ${patch.status}`);
         await this.emit(actor, 'task.status_changed', 'task', taskId, { key: task.key, from: task.status, to: patch.status, title: task.title });
         // The second way a task reaches done — a supervisor override rather than an agent
         // releasing it. Both paths need the hook or a plan finished by hand would never open its
@@ -836,6 +867,8 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('UPDATE tasks SET status = ?, claimed_by = NULL, claim_expires_at = NULL, updated_at = ? WHERE id = ?')
           .bind(toStatus, nowIso(), taskId),
       ]);
+      // Releasing the task hands its file locks back too (§5 auto-release).
+      await this.releaseLocksForTask(taskId, actor, `task released to ${toStatus}`);
       await this.emit(actor, 'task.released', 'task', taskId, {
         key: task.key, title: task.title, by: actor.id, previousHolder: task.claimed_by, toStatus,
       });
@@ -909,26 +942,347 @@ export class ProjectRoom extends DurableObject<Env> {
           this.env.DB.prepare("UPDATE tasks SET status = 'todo', claimed_by = NULL, claim_expires_at = NULL, updated_at = ? WHERE id = ?")
             .bind(now, t.id),
         ]);
+        // A requeued task has left active work — drop its file locks too (PLNR-204).
+        await this.releaseLocksForTask(t.id, SYSTEM_ACTOR, 'claim TTL expired');
         // Logged as its own event so the timeline shows why a task went back to todo.
-        await this.emit({ kind: 'system', id: 'system', name: 'system' }, 'task.requeued', 'task', t.id, {
+        await this.emit(SYSTEM_ACTOR, 'task.requeued', 'task', t.id, {
           key: t.key, title: t.title, previousHolder: t.claimed_by, reason: 'claim TTL expired',
         });
       }
+      // Reap file locks whose own TTL lapsed (PLNR-204) — the holder went silent (§5).
+      await this.reapExpiredLocks(now);
       await this.scheduleExpiryAlarm();
     
     });
   }
 
   private async scheduleExpiryAlarm() {
-    const row = await this.env.DB.prepare(
-      `SELECT MIN(claim_expires_at) AS next FROM tasks WHERE project_id = ? AND claimed_by IS NOT NULL AND status = 'in_progress'`,
-    ).bind(this.projectId).first<{ next: string | null }>();
-    if (row?.next) {
-      // +2s grace so the heartbeat that renews right at the boundary wins.
-      await this.ctx.storage.setAlarm(new Date(row.next).getTime() + 2000);
+    // One alarm serves BOTH expiry sources (PLNR-204): the next claim TTL and the next lock TTL.
+    const [claimRow, lockRow] = await Promise.all([
+      this.env.DB.prepare(
+        `SELECT MIN(claim_expires_at) AS next FROM tasks WHERE project_id = ? AND claimed_by IS NOT NULL AND status = 'in_progress'`,
+      ).bind(this.projectId).first<{ next: string | null }>(),
+      this.env.DB.prepare(
+        `SELECT MIN(expires_at) AS next FROM file_locks WHERE project_id = ? AND released_at IS NULL`,
+      ).bind(this.projectId).first<{ next: string | null }>(),
+    ]);
+    const nexts = [claimRow?.next, lockRow?.next].filter((x): x is string => !!x);
+    if (nexts.length) {
+      // +2s grace so a renewal landing right at the boundary wins.
+      const soonest = nexts.reduce((a, b) => (a < b ? a : b));
+      await this.ctx.storage.setAlarm(new Date(soonest).getTime() + 2000);
     } else {
       await this.ctx.storage.deleteAlarm();
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // File locks — advisory path locks (PLNR-201/204). Same arbiter guarantees as claims:
+  // acquire is an atomic test-and-set under blockConcurrencyWhile; conflict = path-overlap ×
+  // branch-overlap × different holder × not-expired. Opt-in per project; the overlap engine is
+  // lib/lockmatch.ts. See the plan doc "Lock design — settled semantics & data model (v1)".
+  // ---------------------------------------------------------------------------
+
+  /** Reconstruct a NormalizedPattern from a stored lock row (canon + kind → segs/dir). */
+  private lockToPattern(l: LiveLockRow): NormalizedPattern {
+    return normalizePattern(l.kind === 'dir' ? `${l.canonPattern}/` : l.canonPattern);
+  }
+
+  /** All live (unreleased, unexpired) locks in the project, joined to holder + task. */
+  private async liveLocks(now: string): Promise<LiveLockRow[]> {
+    const { results } = await this.env.DB.prepare(
+      `SELECT fl.id, fl.agent_id AS agentId, fl.task_id AS taskId, fl.kind, fl.raw_pattern AS rawPattern,
+              fl.canon_pattern AS canonPattern, fl.branch, fl.all_branches AS allBranches,
+              fl.acquired_at AS acquiredAt, fl.expires_at AS expiresAt,
+              a.name AS agentName, t.key AS taskKey
+       FROM file_locks fl
+       LEFT JOIN agents a ON a.id = fl.agent_id
+       LEFT JOIN tasks  t ON t.id = fl.task_id
+       WHERE fl.project_id = ? AND fl.released_at IS NULL AND fl.expires_at > ?`,
+    ).bind(this.projectId, now).all<LiveLockRow>();
+    return results;
+  }
+
+  private scopeOf(l: LiveLockRow): BranchScope {
+    return { branch: l.branch, allBranches: !!l.allBranches };
+  }
+  private sameScope(l: LiveLockRow, s: BranchScope): boolean {
+    return !!l.allBranches === s.allBranches && l.branch === s.branch;
+  }
+  private conflictView(l: LiveLockRow) {
+    return {
+      lockId: l.id, path: l.canonPattern, kind: l.kind,
+      holderAgentId: l.agentId, holderName: l.agentName,
+      taskId: l.taskId, taskKey: l.taskKey,
+      branch: l.branch, allBranches: !!l.allBranches, expiresAt: l.expiresAt,
+    };
+  }
+
+  /** Reap file locks whose TTL lapsed — the holder went silent (§5). Called from alarm(). */
+  private async reapExpiredLocks(now: string): Promise<void> {
+    if (!(await this.fileLockingEnabled())) return;
+    const { results } = await this.env.DB.prepare(
+      'SELECT id, canon_pattern AS canonPattern, agent_id AS agentId, task_id AS taskId FROM file_locks WHERE project_id = ? AND released_at IS NULL AND expires_at < ?',
+    ).bind(this.projectId, now).all<{ id: string; canonPattern: string; agentId: string; taskId: string | null }>();
+    if (!results.length) return;
+    await this.env.DB.prepare('UPDATE file_locks SET released_at = ? WHERE project_id = ? AND released_at IS NULL AND expires_at < ?')
+      .bind(now, this.projectId, now).run();
+    await this.emit(SYSTEM_ACTOR, 'lock.expired', 'lock', this.projectId, {
+      count: results.length, ids: results.map((r) => r.id), paths: results.map((r) => r.canonPattern),
+      holders: results.map((r) => r.agentId), reason: 'lock TTL expired',
+    });
+  }
+
+  /** Release every live lock linked to a task — the ONE helper wired into every task-settlement
+   *  path (§5 auto-release): releaseTask, updateTask→settle, alarm requeue, settleAnchorTask.
+   *  Callers are already inside blockConcurrencyWhile (like the other `*Locked` bodies). */
+  private async releaseLocksForTask(taskId: string, actor: Actor, reason: string): Promise<void> {
+    if (!(await this.fileLockingEnabled())) return; // zero cost when locking is off
+    const now = nowIso();
+    const { results } = await this.env.DB.prepare(
+      'SELECT id, canon_pattern AS canonPattern FROM file_locks WHERE task_id = ? AND released_at IS NULL',
+    ).bind(taskId).all<{ id: string; canonPattern: string }>();
+    if (!results.length) return;
+    await this.env.DB.prepare('UPDATE file_locks SET released_at = ? WHERE task_id = ? AND released_at IS NULL')
+      .bind(now, taskId).run();
+    await this.emit(actor, 'lock.released', 'lock', taskId, {
+      taskId, reason, count: results.length, ids: results.map((r) => r.id), paths: results.map((r) => r.canonPattern),
+    });
+  }
+
+  /** Acquire an atomic, all-or-nothing set of path locks (§7). Hard-deny on any conflict, returning
+   *  the structured holder info; grant otherwise (idempotent renew for locks this holder already has). */
+  async acquireLocks(
+    projectId: string,
+    actor: Actor,
+    agentId: string,
+    input: { paths: string[]; branch?: string | null; allBranches?: boolean; taskId?: string | null },
+  ) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      if (!(await this.fileLockingEnabled())) throw new Error('file locking is not enabled for this project');
+      const paths = input.paths ?? [];
+      if (!paths.length) throw new Error('no paths to lock');
+      if (paths.length > LOCK_LIMITS.maxPathsPerAcquire) {
+        throw new Error(`too many paths in one acquire (max ${LOCK_LIMITS.maxPathsPerAcquire})`);
+      }
+      // Branch scope (§4): explicit branch OR explicit allBranches; else a safe global fallback,
+      // surfaced as a downgrade rather than a silent serialize.
+      let scope: BranchScope;
+      let downgraded = false;
+      if (input.allBranches) scope = { branch: null, allBranches: true };
+      else if (input.branch && input.branch.trim()) scope = { branch: input.branch.trim(), allBranches: false };
+      else { scope = { branch: null, allBranches: true }; downgraded = true; }
+
+      let taskKey: string | undefined;
+      if (input.taskId) taskKey = (await this.getTask(input.taskId)).key; // validates project-local
+
+      const wants = paths.map((p) => normalizePattern(p)); // may throw LockPatternError → surfaced
+      const now = nowIso();
+      // Sweep dead locks first (the alarm may not have fired yet), so a re-acquire over an expired
+      // lock doesn't trip the exact-file backstop index and liveLocks agrees with what's grantable.
+      await this.reapExpiredLocks(now);
+      const live = await this.liveLocks(now);
+
+      // Conflicts: overlap × branch-overlap × different holder.
+      const conflicts = [];
+      for (const w of wants) {
+        for (const l of live) {
+          if (l.agentId === agentId) continue; // own lock → not a conflict (idempotent renew below)
+          if (!branchScopesOverlap(scope, this.scopeOf(l))) continue;
+          if (patternsOverlap(w, this.lockToPattern(l))) conflicts.push({ requestedPath: w.canon, ...this.conflictView(l) });
+        }
+      }
+      if (conflicts.length) {
+        await this.emit(actor, 'lock.denied', 'lock', agentId, {
+          requested: wants.map((w) => w.canon), branch: scope.branch, allBranches: scope.allBranches, conflicts,
+        });
+        return { ok: false as const, conflicts };
+      }
+
+      // Cap checks (DoS guard, §6) — count what would be newly inserted (renewals don't grow).
+      const isNew = (w: NormalizedPattern) =>
+        !live.some((l) => l.agentId === agentId && l.canonPattern === w.canon && l.kind === w.kind && this.sameScope(l, scope));
+      const newCount = wants.filter(isNew).length;
+      const holderLive = live.filter((l) => l.agentId === agentId).length;
+      if (holderLive + newCount > LOCK_LIMITS.maxLocksPerHolder) throw new Error('too many locks held by this session');
+      if (live.length + newCount > LOCK_LIMITS.maxLocksPerProject) throw new Error('too many locks in this project');
+
+      // Grant. Idempotent per (holder, canon, kind, scope): renew in place, else insert.
+      const expiresAt = new Date(Date.parse(now) + (await this.lockTtlSeconds()) * 1000).toISOString();
+      const stmts: D1PreparedStatement[] = [];
+      const granted = [];
+      for (const w of wants) {
+        const existing = live.find(
+          (l) => l.agentId === agentId && l.canonPattern === w.canon && l.kind === w.kind && this.sameScope(l, scope),
+        );
+        if (existing) {
+          stmts.push(this.env.DB.prepare('UPDATE file_locks SET expires_at = ? WHERE id = ?').bind(expiresAt, existing.id));
+          granted.push({ id: existing.id, path: w.canon, kind: w.kind, renewed: true });
+        } else {
+          const id = newId('lok');
+          stmts.push(this.env.DB.prepare(
+            `INSERT INTO file_locks (id, project_id, agent_id, task_id, kind, raw_pattern, canon_pattern, branch, all_branches, mode, acquired_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'exclusive', ?, ?)`,
+          ).bind(id, this.projectId, agentId, input.taskId ?? null, w.kind, w.raw, w.canon, scope.branch, scope.allBranches ? 1 : 0, now, expiresAt));
+          granted.push({ id, path: w.canon, kind: w.kind, renewed: false });
+        }
+      }
+      await this.env.DB.batch(stmts);
+      // Arm the alarm before returning (a new lock may be the soonest expiry, §5).
+      await this.scheduleExpiryAlarm();
+      const fresh = granted.filter((g) => !g.renewed);
+      if (fresh.length) {
+        await this.emit(actor, 'lock.acquired', 'lock', input.taskId ?? agentId, {
+          agentId, taskId: input.taskId ?? null, taskKey, branch: scope.branch, allBranches: scope.allBranches,
+          paths: fresh.map((g) => g.path), lockIds: fresh.map((g) => g.id), expiresAt,
+        });
+      }
+      return { ok: true as const, locks: granted, branch: scope.branch, allBranches: scope.allBranches, downgraded, expiresAt };
+    });
+  }
+
+  /** Release locks this session holds, by lock id or by path (idempotent). Agent↔agent release is
+   *  refused — only the holder releases its own; a human uses forceReleaseLock (§7). */
+  async releaseLocks(projectId: string, actor: Actor, agentId: string, input: { lockIds?: string[]; paths?: string[] }) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const now = nowIso();
+      const mine = await this.env.DB.prepare(
+        'SELECT id, canon_pattern AS canonPattern, kind FROM file_locks WHERE project_id = ? AND agent_id = ? AND released_at IS NULL',
+      ).bind(this.projectId, agentId).all<{ id: string; canonPattern: string; kind: string }>();
+      const wantCanon = new Set((input.paths ?? []).map((p) => normalizePattern(p).canon));
+      const wantIds = new Set(input.lockIds ?? []);
+      const targets = mine.results.filter((l) => wantIds.has(l.id) || wantCanon.has(l.canonPattern));
+      if (!targets.length) return { ok: true as const, released: [] as string[] };
+      const ids = targets.map((t) => t.id);
+      await this.env.DB.prepare(
+        `UPDATE file_locks SET released_at = ? WHERE id IN (${ids.map(() => '?').join(',')})`,
+      ).bind(now, ...ids).run();
+      await this.emit(actor, 'lock.released', 'lock', agentId, {
+        agentId, count: ids.length, ids, paths: targets.map((t) => t.canonPattern),
+      });
+      await this.scheduleExpiryAlarm();
+      return { ok: true as const, released: ids };
+    });
+  }
+
+  /** Explicitly renew a held set by lock id (network-retry-idempotent). The primary renewal path is
+   *  re-acquire (§5); this exists for a client that tracks lock ids directly. */
+  async renewLocks(projectId: string, actor: Actor, agentId: string, input: { lockIds: string[] }) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const ids = input.lockIds ?? [];
+      if (!ids.length) return { ok: true as const, renewed: [] as string[], expiresAt: null };
+      const now = nowIso();
+      const expiresAt = new Date(Date.parse(now) + (await this.lockTtlSeconds()) * 1000).toISOString();
+      const { results } = await this.env.DB.prepare(
+        `SELECT id FROM file_locks WHERE agent_id = ? AND released_at IS NULL AND id IN (${ids.map(() => '?').join(',')})`,
+      ).bind(agentId, ...ids).all<{ id: string }>();
+      if (!results.length) return { ok: true as const, renewed: [] as string[], expiresAt };
+      const live = results.map((r) => r.id);
+      await this.env.DB.prepare(
+        `UPDATE file_locks SET expires_at = ? WHERE id IN (${live.map(() => '?').join(',')})`,
+      ).bind(expiresAt, ...live).run();
+      await this.scheduleExpiryAlarm();
+      await this.emit(actor, 'lock.renewed', 'lock', agentId, { agentId, ids: live, expiresAt });
+      return { ok: true as const, renewed: live, expiresAt };
+    });
+  }
+
+  /** Human override: force-release ANY lock (agent↔agent is forbidden). Audited (§7). */
+  async forceReleaseLock(projectId: string, actor: Actor, lockId: string) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      if (actor.kind !== 'human') throw new Error('only a human can force-release a lock');
+      const lock = await this.env.DB.prepare(
+        'SELECT id, canon_pattern AS canonPattern, agent_id AS agentId FROM file_locks WHERE id = ? AND project_id = ? AND released_at IS NULL',
+      ).bind(lockId, this.projectId).first<{ id: string; canonPattern: string; agentId: string }>();
+      if (!lock) return { ok: true as const }; // already gone / released — idempotent
+      await this.env.DB.prepare('UPDATE file_locks SET released_at = ? WHERE id = ?').bind(nowIso(), lock.id).run();
+      await this.emit(actor, 'lock.force_released', 'lock', lock.id, {
+        path: lock.canonPattern, previousHolder: lock.agentId,
+      });
+      await this.scheduleExpiryAlarm();
+      return { ok: true as const, path: lock.canonPattern };
+    });
+  }
+
+  /** Read-only advisory pre-check (§8 ladder rung 1): which of these paths are held by OTHERS, and
+   *  which do you already hold. No mutation → no lock needed. */
+  async checkLocks(
+    projectId: string,
+    _actor: Actor,
+    agentId: string,
+    input: { paths: string[]; branch?: string | null; allBranches?: boolean },
+  ) {
+    await this.setPid(projectId);
+    if (!(await this.fileLockingEnabled())) return { enabled: false as const, conflicts: [], yours: [] };
+    const scope: BranchScope = input.allBranches
+      ? { branch: null, allBranches: true }
+      : input.branch && input.branch.trim()
+        ? { branch: input.branch.trim(), allBranches: false }
+        : { branch: null, allBranches: true };
+    const wants = (input.paths ?? []).map((p) => normalizePattern(p));
+    const now = nowIso();
+    const live = await this.liveLocks(now);
+    const conflicts = [];
+    const yours = [];
+    for (const w of wants) {
+      for (const l of live) {
+        if (!branchScopesOverlap(scope, this.scopeOf(l))) continue;
+        if (!patternsOverlap(w, this.lockToPattern(l))) continue;
+        if (l.agentId === agentId) yours.push({ requestedPath: w.canon, ...this.conflictView(l) });
+        else conflicts.push({ requestedPath: w.canon, ...this.conflictView(l) });
+      }
+    }
+    return { enabled: true as const, conflicts, yours };
+  }
+
+  /** List live locks in the project (UI + agent situational awareness), newest first. */
+  async listLocks(projectId: string, _actor: Actor, filter: { taskId?: string; agentId?: string } = {}) {
+    await this.setPid(projectId);
+    if (!(await this.fileLockingEnabled())) return { enabled: false as const, locks: [] };
+    const now = nowIso();
+    const clauses = ['fl.project_id = ?', 'fl.released_at IS NULL', 'fl.expires_at > ?'];
+    const binds: unknown[] = [this.projectId, now];
+    if (filter.taskId) { clauses.push('fl.task_id = ?'); binds.push(filter.taskId); }
+    if (filter.agentId) { clauses.push('fl.agent_id = ?'); binds.push(filter.agentId); }
+    const { results } = await this.env.DB.prepare(
+      `SELECT fl.id, fl.agent_id AS agentId, fl.task_id AS taskId, fl.kind, fl.raw_pattern AS rawPattern,
+              fl.canon_pattern AS canonPattern, fl.branch, fl.all_branches AS allBranches,
+              fl.acquired_at AS acquiredAt, fl.expires_at AS expiresAt, a.name AS agentName, t.key AS taskKey
+       FROM file_locks fl
+       LEFT JOIN agents a ON a.id = fl.agent_id
+       LEFT JOIN tasks  t ON t.id = fl.task_id
+       WHERE ${clauses.join(' AND ')} ORDER BY fl.acquired_at DESC`,
+    ).bind(...binds).all<LiveLockRow>();
+    return { enabled: true as const, locks: results };
+  }
+
+  /** Toggle file locking for a project (opt-in, PLNR-204). Invalidates the memoized flag/TTL like
+   *  setClaimTtl. When disabling, release all live locks so nothing dangles. Worker gates to owner. */
+  async setFileLocking(projectId: string, opts: { enabled?: boolean; ttlSeconds?: number | null }) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const sets: string[] = [];
+      const binds: unknown[] = [];
+      if (opts.enabled !== undefined) { sets.push('file_locking_enabled = ?'); binds.push(opts.enabled ? 1 : 0); }
+      if (opts.ttlSeconds !== undefined) { sets.push('lock_ttl_seconds = ?'); binds.push(opts.ttlSeconds); }
+      if (sets.length) {
+        binds.push(this.projectId);
+        await this.env.DB.prepare(`UPDATE projects SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
+      }
+      if (opts.enabled !== undefined) this._fileLocking = opts.enabled;
+      if (opts.ttlSeconds !== undefined) this._lockTtl = undefined; // recompute (may fall back to claim TTL)
+      if (opts.enabled === false) {
+        // Disabling clears the board so a later re-enable starts clean and the alarm has nothing.
+        await this.env.DB.prepare('UPDATE file_locks SET released_at = ? WHERE project_id = ? AND released_at IS NULL')
+          .bind(nowIso(), this.projectId).run();
+        await this.scheduleExpiryAlarm();
+      }
+      return { ok: true, fileLockingEnabled: await this.fileLockingEnabled(), lockTtlSeconds: await this.lockTtlSeconds() };
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -1917,6 +2271,7 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM phase_tasks WHERE task_id = ?').bind(id),
         this.env.DB.prepare('DELETE FROM dependencies WHERE task_id = ? OR depends_on_task_id = ?').bind(id, id),
         this.env.DB.prepare('DELETE FROM claims WHERE task_id = ?').bind(id),
+        this.env.DB.prepare('DELETE FROM file_locks WHERE task_id = ?').bind(id), // PLNR-203: task's locks die with it
         this.env.DB.prepare('DELETE FROM comments WHERE task_id = ?').bind(id),
         this.env.DB.prepare('DELETE FROM task_refs WHERE task_id = ?').bind(id),
         this.env.DB.prepare('DELETE FROM task_tags WHERE task_id = ?').bind(id),
@@ -1960,6 +2315,7 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare(`DELETE FROM phase_tasks WHERE task_id IN (${tasksSub}) OR phase_id IN (SELECT id FROM phases WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ?))`).bind(pid, pid),
         this.env.DB.prepare(`DELETE FROM dependencies WHERE task_id IN (${tasksSub}) OR depends_on_task_id IN (${tasksSub})`).bind(pid, pid),
         this.env.DB.prepare(`DELETE FROM claims WHERE task_id IN (${tasksSub})`).bind(pid),
+        this.env.DB.prepare('DELETE FROM file_locks WHERE project_id = ?').bind(pid), // PLNR-203: before tasks/projects (FK targets)
         this.env.DB.prepare(`DELETE FROM task_refs WHERE task_id IN (${tasksSub})`).bind(pid),
         this.env.DB.prepare(`DELETE FROM task_tags WHERE task_id IN (${tasksSub}) OR tag_id IN (SELECT id FROM tags WHERE project_id = ?)`).bind(pid, pid),
         this.env.DB.prepare(`DELETE FROM task_docs WHERE task_id IN (${tasksSub}) OR doc_id IN (SELECT id FROM docs WHERE project_id = ?)`).bind(pid, pid),
@@ -2806,6 +3162,8 @@ export class ProjectRoom extends DurableObject<Env> {
         'UPDATE claims SET released_at = ? WHERE task_id = ? AND agent_id = ? AND released_at IS NULL',
       ).bind(now, taskId, agentId).run();
     }
+    // The run is settling this task — release its file locks too (§5 auto-release).
+    await this.releaseLocksForTask(taskId, SYSTEM_ACTOR, `run settled: ${outcome}`);
   }
 
   private async retireRunAgent(agentId: string): Promise<void> {
@@ -3375,6 +3733,22 @@ export class ProjectRoom extends DurableObject<Env> {
     const row = await this.env.DB.prepare('SELECT claim_ttl_seconds AS ttl FROM projects WHERE id = ?')
       .bind(this.projectId).first<{ ttl: number }>();
     return (this._ttl = row?.ttl ?? 1800);
+  }
+
+  /** Is file locking opt-in for this project? Memoized like _ttl; invalidated by setFileLocking. */
+  private async fileLockingEnabled(): Promise<boolean> {
+    if (this._fileLocking !== undefined) return this._fileLocking;
+    const row = await this.env.DB.prepare('SELECT file_locking_enabled AS enabled FROM projects WHERE id = ?')
+      .bind(this.projectId).first<{ enabled: number }>();
+    return (this._fileLocking = !!row?.enabled);
+  }
+
+  /** Lock TTL: its own knob, falling back to the claim TTL (then 1800s) when unset (§5). */
+  private async lockTtlSeconds(): Promise<number> {
+    if (this._lockTtl !== undefined) return this._lockTtl;
+    const row = await this.env.DB.prepare('SELECT lock_ttl_seconds AS lt, claim_ttl_seconds AS ct FROM projects WHERE id = ?')
+      .bind(this.projectId).first<{ lt: number | null; ct: number | null }>();
+    return (this._lockTtl = row?.lt ?? row?.ct ?? 1800);
   }
 
   private async openCommentsFor(taskId: string) {

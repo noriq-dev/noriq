@@ -530,7 +530,83 @@ function Holds({ store }: { store: AppStore }) {
             </div>
           );
         })}
+        <FileLocksSection store={store} />
       </div>
+    </div>
+  );
+}
+
+// PLNR-212/213: live file locks — who holds which paths, for which task, and a human force-release
+// for a stuck hold. Reads store.snapshot.locks (refetched on every lock.* WS event).
+function FileLocksSection({ store }: { store: AppStore }) {
+  const snap = store.snapshot;
+  const enabled = !!snap?.project?.fileLockingEnabled;
+  const locks = snap?.locks ?? [];
+  const secLeft = (iso: string) => Math.max(0, Math.round((new Date(iso).getTime() - Date.now()) / 1000));
+
+  return (
+    <div style={{ marginTop: 14, borderTop: '1px solid var(--w-05)', paddingTop: 12 }}>
+      <div style={{ display: 'flex', alignItems: 'center', marginBottom: 9 }}>
+        <SectionLabel>File locks</SectionLabel>
+        <div style={{ flex: 1 }} />
+        {enabled && (
+          <button
+            onClick={() => { if (confirm('Disable file locking? This releases every held lock.')) void store.actions.setFileLocking(false); }}
+            style={{ background: 'transparent', border: 'none', cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}
+          >disable</button>
+        )}
+      </div>
+      {!enabled && (
+        <div style={{ padding: '14px 6px', textAlign: 'center' }}>
+          <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)', marginBottom: 9 }}>
+            file locking is off for this project
+          </div>
+          <button
+            onClick={() => void store.actions.setFileLocking(true)}
+            className="hover-border"
+            style={{ border: '1px solid var(--w-09)', borderRadius: 8, background: 'var(--w-02)', padding: '5px 12px', cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-soft)' }}
+          >enable file locking</button>
+        </div>
+      )}
+      {enabled && locks.length === 0 && (
+        <div style={{ padding: '14px 6px', textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>
+          no files locked right now
+        </div>
+      )}
+      {enabled && locks.map((l) => {
+        const left = secLeft(l.expiresAt);
+        const soon = left < 300; // < 5 min left → near expiry / possibly a stuck hold
+        return (
+          <div
+            key={l.id}
+            style={{
+              border: `1px solid ${soon ? 'rgba(255,176,32,.30)' : 'var(--w-09)'}`,
+              borderRadius: 10, padding: 10, marginBottom: 8,
+              background: soon ? 'rgba(255,176,32,.05)' : 'var(--w-02)',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 6 }}>
+              <span style={{ fontFamily: 'var(--mono)', fontSize: 11.5, color: 'var(--text-soft)', wordBreak: 'break-all', flex: 1 }}>
+                {l.kind === 'dir' ? `${l.path}/` : l.path}
+              </span>
+              <button
+                onClick={() => { if (confirm(`Force-release the lock on ${l.path}?`)) void store.actions.forceReleaseLock(l.id); }}
+                title="Force-release (a dead agent's hold)"
+                style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--text-faint)', fontSize: 13, lineHeight: 1, padding: '0 2px' }}
+              >×</button>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>
+              <span>{l.holderName ?? l.agentId}</span>
+              {l.taskKey && <MonoTag color="var(--blue)" bg="rgba(76,157,255,.12)" size={9}>{l.taskKey}</MonoTag>}
+              <span>· {l.allBranches ? 'all branches' : l.branch ?? 'no branch'}</span>
+              <div style={{ flex: 1 }} />
+              <span style={{ color: soon ? '#ffb020' : 'var(--text-dim)' }}>
+                {left === 0 ? 'expiring' : `${fmtTtl(left)} left`}
+              </span>
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }

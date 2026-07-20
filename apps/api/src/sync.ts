@@ -150,6 +150,20 @@ export async function computeUpdates(
     } else if (e.verb === 'signal.answered' && p.agentId === agent.id) {
       const where = p.taskKey ? ` (${p.taskKey} is back in the queue — re-claim to resume)` : '';
       notices.push(`Your input request "${p.title}" was answered: "${p.response}"${where}`);
+    } else if (e.verb === 'lock.denied' && Array.isArray(p.conflicts)) {
+      // PLNR-207: a peer was blocked on a file YOU hold. Surface it to the holder (the event
+      // actor is the requester, already skipped above) so they can coordinate or release.
+      const mine = (p.conflicts as Array<{ holderAgentId?: string; path?: string; taskKey?: string | null }>).filter((c) => c.holderAgentId === agent.id);
+      if (mine.length) {
+        const paths = [...new Set(mine.map((c) => c.path))].join(', ');
+        const tk = mine.find((c) => c.taskKey)?.taskKey;
+        notices.push(`${p.actorName ?? 'Another agent'} is blocked on ${paths} — file(s) you hold a lock on${tk ? ` for ${tk}` : ''}. Coordinate (send_message / handoff_task) or release_lock when you're done.`);
+      }
+    } else if (e.verb === 'lock.force_released' && p.previousHolder === agent.id) {
+      notices.push(`Your file lock on ${p.path} was force-released by ${p.actorName ?? 'a supervisor'}.`);
+    } else if (e.verb === 'lock.expired' && Array.isArray(p.holders) && (p.holders as string[]).includes(agent.id)) {
+      const paths = Array.isArray(p.paths) ? (p.paths as string[]).filter((_, i) => (p.holders as string[])[i] === agent.id) : [];
+      notices.push(`Your file lock${paths.length === 1 ? '' : 's'} on ${paths.join(', ')} expired (idle past the lock TTL) — re-acquire before editing again.`);
     } else if (e.verb === 'task.created' && heldTaskIds.size === 0 && nudgeableIds.has(e.subjectId)) {
       // PLNR-90: nudge AVAILABLE agents (holding nothing — i.e. not heads-down draining
       // a plan) about a new, immediately-claimable task, so ad-hoc work gets picked up

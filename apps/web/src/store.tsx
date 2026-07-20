@@ -55,6 +55,12 @@ function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
     case 'plan_doc.created': verb = 'plan doc'; subject = `wrote "${p.name ?? ''}"`; break;
     case 'plan_doc.updated': verb = 'plan doc'; subject = `revised "${p.name ?? ''}"`; break;
     case 'plan_doc.deleted': verb = 'plan doc'; subject = `deleted "${p.name ?? ''}"`; break;
+    case 'lock.acquired': verb = 'lock'; subject = `held ${(p.paths as string[] | undefined)?.join(', ') ?? ''}${p.taskKey ? ` for ${p.taskKey}` : ''}`; break;
+    case 'lock.released': verb = 'lock'; subject = `released ${(p.paths as string[] | undefined)?.join(', ') ?? ''}`; break;
+    case 'lock.denied': verb = 'lock'; subject = `blocked ${(p.requested as string[] | undefined)?.join(', ') ?? ''} — held by another`; break;
+    case 'lock.force_released': verb = 'lock'; subject = `force-released ${p.path ?? ''}`; break;
+    case 'lock.expired': verb = 'lock'; subject = `${p.count ?? ''} lock(s) expired`; break;
+    case 'lock.renewed': verb = 'lock'; subject = 'renewed a lock'; break;
     default: subject = `${e.verb} ${e.subjectId}`;
   }
   return { id: e.id, t: timeOf(e.createdAt), actor, actorKind: e.actorKind, verb, subject, taskId, dot };
@@ -686,6 +692,17 @@ export function useAppStore() {
     async deleteTag(tagId: string) {
       if (!pidRef.current) return;
       await api.deleteTag(pidRef.current, tagId);
+      refresh();
+    },
+    // File locks (PLNR-213): a human force-releases a stuck hold; the WS event refetches the panel.
+    async forceReleaseLock(lockId: string) {
+      if (!pidRef.current) return;
+      await api.forceReleaseLock(pidRef.current, lockId);
+      refresh();
+    },
+    async setFileLocking(fileLocking: boolean, lockTtlSeconds?: number | null) {
+      if (!pidRef.current) return;
+      await api.setProjectMeta(pidRef.current, { fileLocking, ...(lockTtlSeconds !== undefined ? { lockTtlSeconds } : {}) });
       refresh();
     },
     async deleteProject(projectId: string) {
