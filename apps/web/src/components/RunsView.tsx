@@ -39,6 +39,17 @@ const KINDS: Array<ApiRun['kind']> = ['scope', 'build', 'verify'];
  *  the last two; the daemon does that translation, so this list stays what we MEAN. */
 const EFFORTS: RunEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 
+// Build an agent coordinate the way the daemon's parser reads it (RUN-114): `<tool>.<model>.<effort>`,
+// with the model's own dots escaped to underscores so they don't read as segment separators
+// (`claude` + `opus-4.8` + `high` → `claude.opus-4_8.high`). Kept in lockstep with the runner's
+// escapeModel/formatCoordinate; the daemon still accepts the legacy triple, so this is a UI upgrade.
+function formatCoordinate(tool: string, model: string | null, effort: RunEffort | ''): string {
+  const m = model ? model.replaceAll('.', '_') : '';
+  if (effort) return `${tool}.${m}.${effort}`;
+  if (m) return `${tool}.${m}`;
+  return tool;
+}
+
 /**
  * What the pill says (RUN-31). A running Run spends its last 60–90s in the verify gate and then
  * the landing rebase — agent process already gone, spend frozen — so a blanket "running" made a
@@ -318,6 +329,9 @@ function RunRow({ run, runner, onCancel }: { run: ApiRun; runner: ApiRunner | nu
       <div style={{ minWidth: 0, flex: 1 }}>
         <div style={{ fontSize: 13, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' }}>
           <MonoTag color="var(--accent-ink)" bg="rgba(198,242,78,.12)" size={9}>{run.kind}</MonoTag>
+          {/* A custom workflow (RUN-121) ran under `kind`'s posture but its own prompt — worth
+              showing, since two runs of the same kind can be very different work. */}
+          {run.workflow && <MonoTag color="var(--purple)" bg="rgba(167,139,250,.12)" size={9}>{run.workflow}</MonoTag>}
           <MonoTag color="var(--blue)" bg="rgba(76,157,255,.1)" size={9}>{run.agentTool}</MonoTag>
           <span style={{ color: 'var(--text-soft)' }}>{repo?.name ?? run.repoRef}</span>
           {run.anchor && (
@@ -520,6 +534,9 @@ function DispatchForm({
   const repos = runner.repos.filter((r) => r.projectId === pid);
   const kinds = KINDS.filter((k) => runner.capabilities.kinds.includes(k));
   const tools = runner.capabilities.tools;
+  // The coordinate catalog (RUN-115): what the model/effort pickers suggest. Absent on a runner
+  // that registered before it existed — then the model stays free-text and effort offers them all.
+  const catalog = runner.capabilities.agents ?? [];
 
   const [repoRef, setRepoRef] = useState(repos[0]?.id ?? '');
   // The board lock (RUN-71): a locked repo's anchor list shows its own board's tasks —
@@ -535,11 +552,31 @@ function DispatchForm({
   // '' = don't override (RUN-33): the repo's [defaults] for this kind, then the tool's own.
   const [model, setModel] = useState('');
   const [effort, setEffort] = useState<RunEffort | ''>('');
+  // '' = the built-in for `kind`; a custom workflow name (RUN-121) overrides only the prompt.
+  const [workflow, setWorkflow] = useState('');
   const [maxUsd, setMaxUsd] = useState('');
   const [maxTokens, setMaxTokens] = useState('');
   const [maxMinutes, setMaxMinutes] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+
+  // The selected tool's coordinate menu (RUN-115): model suggestions + the efforts it distinguishes
+  // (codex collapses xhigh/max into its own 'high', so it advertises fewer). Empty menu → free-text
+  // model and all five efforts, exactly as before the catalog existed.
+  const agentMenu = catalog.find((a) => a.tool === agentTool);
+  const modelSuggestions = agentMenu?.models ?? [];
+  const effortOptions = agentMenu?.efforts?.length ? agentMenu.efforts : EFFORTS;
+  // The selected repo's custom workflows (RUN-121); the three built-ins are always implicit.
+  const repoWorkflows = repos.find((r) => r.id === repoRef)?.workflows ?? [];
+
+  // A custom workflow belongs to one repo — drop the choice when the repo changes.
+  useEffect(() => { setWorkflow(''); }, [repoRef]);
+  // Drop an effort the newly-selected tool does not advertise (e.g. xhigh/max after switching to
+  // codex), so the field never shows a value the picker no longer offers.
+  useEffect(() => {
+    const efforts = runner.capabilities.agents?.find((a) => a.tool === agentTool)?.efforts;
+    if (efforts?.length) setEffort((e) => (e && !efforts.includes(e) ? '' : e));
+  }, [agentTool, runner.capabilities.agents]);
 
   const num = (s: string): number | null => {
     const n = Number(s.trim());
@@ -565,6 +602,13 @@ function DispatchForm({
       // travel as null. Sending '' would be a request for a model named "".
       model: model.trim() || null,
       effort: effort || null,
+      // The agent COORDINATE (RUN-114), emitted alongside the triple during the deprecation window:
+      // the daemon prefers it when set and falls back to the triple otherwise. Only sent when a
+      // model or effort is actually pinned — a bare-tool coordinate carries nothing the triple lacks.
+      agent: model.trim() || effort ? formatCoordinate(agentTool, model.trim() || null, effort) : null,
+      // A custom workflow (RUN-121) overrides only the prompt; `kind` above stays the posture, so
+      // the operator must set kind to the workflow's base. Guarded to the repo's advertised set.
+      workflow: repoWorkflows.includes(workflow) ? workflow : null,
       budget: { maxUsd: num(maxUsd), maxTokens: num(maxTokens), maxDurationSeconds: maxMinutes.trim() ? (num(maxMinutes) ?? 0) * 60 : null },
     };
     setBusy(true);
@@ -615,20 +659,40 @@ function DispatchForm({
         <Field label="model (optional)">
           {/* Free text, not a dropdown: model names belong to the vendor and change constantly,
               so a hardcoded list would go stale and would reject a model the operator's own CLI
-              supports. Blank = the repo's [defaults] for this kind, then the tool's own. */}
+              supports. The tool's advertised catalog (RUN-115) is offered as datalist SUGGESTIONS,
+              never a whitelist. Blank = the repo's [defaults] for this kind, then the tool's own. */}
           <TextInput
             value={model}
             onChange={(e: React.ChangeEvent<HTMLInputElement>) => setModel(e.target.value)}
             placeholder="repo default"
+            list={modelSuggestions.length ? `models-${runner.id}` : undefined}
           />
+          {modelSuggestions.length > 0 && (
+            <datalist id={`models-${runner.id}`}>
+              {modelSuggestions.map((m) => <option key={m} value={m} />)}
+            </datalist>
+          )}
         </Field>
         <Field label="effort (optional)">
           <Select value={effort} onChange={(e) => setEffort(e.target.value as RunEffort | '')}>
             <option value="">repo default</option>
-            {EFFORTS.map((x) => <option key={x} value={x}>{x}</option>)}
+            {effortOptions.map((x) => <option key={x} value={x}>{x}</option>)}
           </Select>
         </Field>
       </div>
+
+      {/* A repo-defined workflow (RUN-121): a named variant of a run kind that swaps in its own
+          prompt. Only shown when the selected repo advertises any — the built-ins need no picker.
+          The daemon keys permissions off `kind`, so this overrides the PROMPT only; the operator
+          sets `kind` to the workflow's base (the registration advertises names, not bases). */}
+      {repoWorkflows.length > 0 && (
+        <Field label="workflow (optional)" hint={`overrides the prompt; runs under the "${kind}" posture — set kind to its base`}>
+          <Select value={workflow} onChange={(e) => setWorkflow(e.target.value)}>
+            <option value="">— built-in {kind} —</option>
+            {repoWorkflows.map((w) => <option key={w} value={w}>{w}</option>)}
+          </Select>
+        </Field>
+      )}
 
       <Field label="brief" hint="what this Run should do (or anchor to a task below)">
         <TextArea value={brief} onChange={(e) => setBrief(e.target.value)} placeholder="e.g. implement the RunsView dispatch form and verify with tsc + tests" />

@@ -257,6 +257,16 @@ export interface ApiRunnerRepo {
   boardId: string | null;
   name: string;
   defaultBranch: string | null;
+  /** This repo's custom workflow NAMES (RUN-121) — offered on dispatch alongside the three
+   *  built-ins. Names only; the base + prompt stay the runner's authority (committed manifest). */
+  workflows: string[];
+}
+/** One installed driver's coordinate MENU (RUN-115): model ids + efforts for the agent picker.
+ *  `models` is a suggestion list, not a whitelist — the dispatch model field stays free-text. */
+export interface ApiAdvertisedAgent {
+  tool: string;
+  models: string[];
+  efforts: RunEffort[];
 }
 export interface ApiRunner {
   id: string;
@@ -265,7 +275,9 @@ export interface ApiRunner {
   /** 'offboarded' is a human's decision, not a liveness state (RUN-35) — it outranks the
    *  heartbeat, so a cut-off runner never reads as online, or as merely crashed. */
   status: 'online' | 'offline' | 'draining' | 'offboarded';
-  capabilities: { tools: string[]; kinds: string[]; maxConcurrency: number };
+  /** `agents` is the coordinate catalog (RUN-115). Optional: a runner that registered before it
+   *  existed has no entry in its stored capabilities JSON — the picker falls back to free-text. */
+  capabilities: { tools: string[]; kinds: string[]; maxConcurrency: number; agents?: ApiAdvertisedAgent[] };
   repos: ApiRunnerRepo[];
   freeSlots: number;
   lastHeartbeatAt: string | null;
@@ -307,6 +319,12 @@ export interface ApiRun {
   brief: string;
   repoRef: string;
   agentTool: string;
+  /** The dispatch's agent coordinate (RUN-114): `claude.opus-4_8.high`. Null = synthesized from
+   *  the agentTool/model/effort triple by the daemon. */
+  agent: string | null;
+  /** The selected repo-defined workflow (RUN-121); null = the built-in for `kind`. Overrides only
+   *  the prompt — `kind` still carries the posture. */
+  workflow: string | null;
   budget: Partial<ApiRunBudget>;
   status: RunStatus;
   /** What a `running` run is doing right now (RUN-31). Null when queued or terminal. */
@@ -399,6 +417,12 @@ export interface DispatchInput {
    *  the committed manifest. */
   model?: string | null;
   effort?: RunEffort | null;
+  /** The agent COORDINATE (RUN-114): `claude.opus-4_8.high`. Sent alongside the triple during the
+   *  deprecation window — the daemon prefers it when set, else synthesizes one from the triple. */
+  agent?: string | null;
+  /** A repo-defined workflow name (RUN-121). Overrides only the prompt, so `kind` must be set to
+   *  the workflow's base — the daemon keys permissions off `kind`. */
+  workflow?: string | null;
   budget?: Partial<ApiRunBudget>;
 }
 
