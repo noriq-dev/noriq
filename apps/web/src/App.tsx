@@ -11,6 +11,7 @@ import { Setup } from './components/Setup';
 import { PlansView } from './components/PlansView';
 import { ReviewView } from './components/ReviewView';
 import { DocsView } from './components/DocsView';
+import { AskView } from './components/AskView';
 import { CommandPalette } from './components/CommandPalette';
 import { RoadmapView } from './components/RoadmapView';
 import { AgentsView } from './components/AgentsView';
@@ -119,6 +120,7 @@ export function App() {
               {store.view === 'plans' && <PlansView store={store} />}
               {store.view === 'review' && <ReviewView store={store} />}
               {store.view === 'docs' && <DocsView store={store} />}
+              {store.view === 'ask' && <AskView store={store} />}
               {store.view === 'roadmap' && <RoadmapView store={store} />}
               {store.view === 'runs' && <RunsView store={store} />}
               {store.view === 'agents' && <AgentsView store={store} />}

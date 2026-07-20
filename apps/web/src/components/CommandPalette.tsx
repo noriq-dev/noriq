@@ -20,7 +20,7 @@ interface Cmd {
 const VIEW_LABELS: Array<[ViewId, string]> = [
   ['control', 'Mission Control'], ['graph', 'Orchestration'], ['board', 'Board'],
   ['plans', 'Plans'], ['roadmap', 'Roadmap'], ['review', 'Review queue'], ['docs', 'Docs'],
-  ['runs', 'Runs'], ['agents', 'Agents'], ['home', 'Home'],
+  ['ask', 'Ask'], ['runs', 'Runs'], ['agents', 'Agents'], ['home', 'Home'],
 ];
 
 export function CommandPalette({ store }: { store: AppStore }) {

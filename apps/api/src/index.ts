@@ -10,6 +10,7 @@ import { backupToR2, exportSnapshot, importSnapshot } from './backup';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, timingSafeEqual, verifyPassword, verifyPasswordConstantTime } from './lib/util';
 import { taskSearchFilters } from './lib/search';
 import { search, searchBackend, reindexProject, type SearchKind } from './search';
+import { answerQuestion, generationClient } from './ask';
 import { verifyUploadToken } from './lib/upload-token';
 import { USER_PROJECT_WHERE, taskWireStatus, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
 import type { Actor, RunView } from './do/ProjectRoom';
@@ -967,6 +968,26 @@ app.post('/api/projects/:pid/search/reindex', userAuth, async (c) => {
   if (!backend) return c.json({ error: 'no embeddings backend — AI + VECTORIZE bindings required' }, 503);
   const offset = Math.max(parseInt(c.req.query('offset') ?? '0', 10) || 0, 0);
   return c.json(await reindexProject(c.env, backend, c.req.param('pid')!, offset));
+});
+
+// "Ask the project" (PLNR-219) — read-only RAG Q&A for the humans: retrieval reuses /search
+// (semantic → keyword), generation runs on Workers AI, grounded only on the retrieved hits.
+// Requires the AI binding (retrieval can degrade to keyword, but there's no model to answer
+// with) → 503 without it. Creates nothing; returns the answer plus its sources. Project
+// reach is already gated by requireProjectAccess on /api/projects/:pid/*.
+app.post('/api/projects/:pid/ask', userAuth, async (c) => {
+  const gen = generationClient(c.env);
+  if (!gen) return c.json({ error: 'no AI backend — asking questions requires the Workers AI (AI) binding' }, 503);
+  const { question } = await c.req.json<{ question?: string }>().catch(() => ({ question: undefined }));
+  const q = question?.trim();
+  if (!q) return c.json({ error: 'question required' }, 400);
+  const pid = c.req.param('pid')!;
+  const project = await c.env.DB.prepare('SELECT name FROM projects WHERE id = ?').bind(pid).first<{ name: string }>();
+  try {
+    return c.json(await answerQuestion(c.env, gen, { question: q, projectId: pid, projectName: project?.name ?? 'this project' }));
+  } catch (e) {
+    return c.json({ error: `answer generation failed: ${e instanceof Error ? e.message : 'unknown error'}` }, 502);
+  }
 });
 
 // Archive / restore a plan (PLNR-148) — display-only; see setPlanArchived.

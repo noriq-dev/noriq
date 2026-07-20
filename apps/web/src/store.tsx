@@ -66,7 +66,7 @@ function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
   return { id: e.id, t: timeOf(e.createdAt), actor, actorKind: e.actorKind, verb, subject, taskId, dot };
 }
 
-const VIEWS: ViewId[] = ['home', 'control', 'graph', 'board', 'plans', 'roadmap', 'review', 'docs', 'agents', 'runs', 'settings', 'admin'];
+const VIEWS: ViewId[] = ['home', 'control', 'graph', 'board', 'plans', 'roadmap', 'review', 'docs', 'ask', 'agents', 'runs', 'settings', 'admin'];
 
 /** decodeURIComponent throws URIError on malformed %-encoding (e.g. `/p/%`).
  *  Unhandled during render/popstate this blanks the app (PLNR-113); fall back to the raw value. */
