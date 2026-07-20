@@ -3391,7 +3391,9 @@ export class ProjectRoom extends DurableObject<Env> {
        *  so existing orchestrator create_plan behavior is unchanged. */
       proposed?: boolean;
       /** Shared fields for every newTask across all phases (PLNR-133) — the same defaults
-       *  idea create_tasks uses; a task's own value wins. */
+       *  idea create_tasks uses; a task's own value wins. Applies ONLY to newTasks the plan
+       *  creates; existing tasks referenced via a phase's taskIds are placed as-is and keep
+       *  their own fields (PLNR-217) — re-home/re-tag those via update_task/move_task. */
       taskDefaults?: { milestoneId?: string; tags?: string[]; boardId?: string; priority?: number; estimate?: number; type?: string; docIds?: string[] };
       phases: Array<{
         title: string;

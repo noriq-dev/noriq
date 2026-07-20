@@ -1500,12 +1500,12 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
         tags: z.array(z.string()).optional(),
         docIds: z.array(z.string()).optional().describe('Related project docs linked to every newTask — e.g. the design doc this plan implements'),
-      }).optional().describe('Shared fields applied to every newTask in every phase (a task\'s own value wins) — write plan + fully-attributed tasks in ONE call'),
+      }).optional().describe('Shared fields applied to every newTask in every phase (a task\'s own value wins) — write plan + fully-attributed tasks in ONE call. Applies ONLY to newTasks the plan creates; existing tasks pulled in via taskIds keep their own fields (re-home/re-tag those separately with update_task/update_tasks/move_task).'),
       phases: z.array(
         z.object({
           title: z.string().min(1),
           body: z.string().optional().describe('Explicit details for this phase (markdown): what, how, done-when'),
-          taskIds: z.array(z.string()).optional(),
+          taskIds: z.array(z.string()).optional().describe('Existing tasks (ids or keys) to place in this phase as-is — only their phase membership is set; taskDefaults does NOT modify them'),
           newTasks: z.array(z.object({
             title: z.string().min(1),
             body: z.string().optional(),
