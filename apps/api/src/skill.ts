@@ -46,15 +46,19 @@ need it to start working, and it never creates anybody.)
    Identify the task by either its opaque \`task_…\` id or its \`PLN-##\` display key (both
    resolve), and pass \`projectId\` on every call. The response includes any open comments —
    read them first.
-4. Do the work. Your claim renews automatically on **every** Noriq tool call, and the
+4. If the project has file locking on (\`get_project\` → \`project.fileLocking\`),
+   \`acquire_lock\` every path your edit touches **before** you touch it — see
+   [File locks](#file-locks-mandatory-where-enabled). On a locking project this step is
+   not optional.
+5. Do the work. Your claim renews automatically on **every** Noriq tool call, and the
    TTL is generous (30 min by default), so there is no need to ping to stay alive — don't
    waste turns on periodic \`heartbeat\`. Reach for \`heartbeat\` only if you'll go silent
    longer than the TTL (e.g. a long external build) and want to keep holding the task.
-5. Watch the \`--- notices ---\` block on every tool result — new comments, messages,
+6. Watch the \`--- notices ---\` block on every tool result — new comments, messages,
    and requeues addressed to you appear there. Also \`my_updates\` after each step.
-6. Resolve every open comment with \`resolve_comment\` (addressed | wont_do) + a reply.
+7. Resolve every open comment with \`resolve_comment\` (addressed | wont_do) + a reply.
    You cannot release to done with unresolved comments.
-7. \`release_task\` with toStatus "review" (default for finished work) or "done".
+8. \`release_task\` with toStatus "review" (default for finished work) or "done".
 
 When you **create** tasks (\`create_task\` / \`create_tasks\`), tags are required and must
 be *descriptive* — topic/area/component words like \`oauth\`, \`board-filters\`,
@@ -71,11 +75,22 @@ existing tags (\`building-system\` when \`building\` exists) unless you pass
 cannot mint tags at all. Health-check a vocabulary with \`tag_report\`; consolidate
 duplicates with \`merge_tags\` (maintenance, not routine).
 
-## File locks (when enabled)
+## File locks (mandatory where enabled)
 
 Git has no file locking, so two agents editing the same file on one project can clobber
-each other. Projects can opt in to **advisory file locks** (off by default). When a project
-has them on:
+each other. Projects opt in to **file locks** (off by default). \`get_project\` →
+\`project.fileLocking\` tells you whether this project has them on — **check it before your
+first edit in an unfamiliar project.**
+
+**Where locking is on, it is a hard requirement, not a nicety.** Touching a file you do not
+hold a lock on is a coordination violation even if nothing breaks: every other agent reads
+"unlocked" as "free to take", so an unlocked edit is an invitation for a peer to overwrite
+you — and for you to overwrite them. No exceptions for "it's a one-line change", "I'm only
+adding a file", or "nobody else is working right now": you cannot see who is about to start.
+If you realize mid-edit that you never acquired the lock, stop, acquire it, and only then
+continue.
+
+When a project has locking on:
 
 1. Before you edit, create, delete, or **rename** a file, \`acquire_lock\` its path(s).
    Pass **every** path the edit touches in ONE call — it is **all-or-nothing** (you get them
@@ -94,9 +109,10 @@ has them on:
    via \`send_message\` / \`handoff_task\`, or wait and retry. **Never** edit a file locked by
    someone else.
 
-Locks are advisory: they stop a *cooperating* peer, not an uncooperative one. The contract
-is "successful acquire **before** you touch the file". (Runner-spawned agents may get this
-enforced automatically.)
+The mechanism is advisory — the server cannot physically stop a write — which is exactly why
+the contract binds you: it holds only because every agent keeps it. The rule is a **successful
+acquire before you touch the file**, and \`release_lock\` (or letting the task settle) as soon
+as you are done, so you are never the peer everyone else is queued behind.
 
 ## Finding things
 
@@ -110,7 +126,10 @@ Large projects hold hundreds of tasks, docs and plans — search, don't scroll, 
   overdue, exact substring). The two compose: discover with semantic_search, then
   narrow with filters.
 - \`list_docs\` / \`get_project\` — the browsable indexes, when you want the shape of
-  the whole rather than an answer to a question.
+  the whole rather than an answer to a question. \`get_project\` is the project
+  **scaffold**: ids you need (boards, milestones, tags), the docs index, the active
+  plans, the \`fileLocking\` flag, and only the **P4** (top-priority) open tasks — it is
+  deliberately not the backlog, so reach for \`search_tasks\` / \`next_claimable\` for that.
 
 ## Human steering
 

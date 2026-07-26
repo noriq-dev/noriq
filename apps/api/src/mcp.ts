@@ -59,13 +59,16 @@ projects accept no agent-minted tags at all. Never tag with status/type/priority
 words — those have dedicated fields. Plans need no dependency wiring: phase order itself
 gates tasks (a task is claimable when every earlier phase is finished); use dependsOn
 only for real, hand-picked orderings.
-When a project has file locking enabled (opt-in), acquire_lock the file paths you are about
-to edit/create/delete/rename BEFORE you touch them — pass the whole edit's paths in ONE call
+File locking is opt-in per project; get_project tells you whether it is on (project.fileLocking).
+When it is on it is MANDATORY, not advisory: acquire_lock the file paths you are about to
+edit/create/delete/rename BEFORE you touch them — pass the whole edit's paths in ONE call
 (it is all-or-nothing, so no half-held clashes), scoped to your branch, and linked to your
-task so they auto-release when it settles. Re-acquiring your own paths just renews them; hold
-the smallest scope that covers the edit and release_lock when done. check_locks looks without
-taking. On conflict, coordinate with the holder (send_message / handoff_task) or wait — never
-clobber a locked file. Git has no file locking; this is how agents avoid stepping on each other.
+task so they auto-release when it settles. Editing a file you have not locked on a locking
+project is a coordination violation — other agents assume an unlocked file is free. Re-acquiring
+your own paths just renews them; hold the smallest scope that covers the edit and release_lock
+when done. check_locks looks without taking. On conflict, coordinate with the holder
+(send_message / handoff_task) or wait — never clobber a locked file. Git has no file locking;
+this is how agents avoid stepping on each other.
 Project docs are the knowledge base: settled decisions and facts ONLY (enforced — a doc
 with TBDs or open questions is rejected). Check a task's related docs (get_task.docs)
 and list_docs before unfamiliar work; link the docs a task must follow via docIds at
@@ -302,9 +305,9 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           'Anything bigger than one task: plan first. create_plan writes the plan as a document — goals/approach in the body, then ordered phases over tasks. Phase order itself gates the work (tasks in phase N are claimable once every earlier phase is finished — no dependency wiring needed); or decompose_task for a quick subtree. Workers drain the plan via next_claimable; keep it current with update_plan.',
           'Tasks you create MUST carry descriptive tags — topic/area/component words (e.g. "oauth", "board-filters"), FIRST tag = primary tag. Tags are the project\'s SHARED filter vocabulary: reuse existing tags (get_project.tags) before minting — near-duplicates are rejected, and some projects are curated (agents cannot mint at all). Never status/type/priority words as tags. Use dependsOn only for real, hand-picked orderings.',
           'Project docs are settled decisions and facts ONLY (enforced — open questions/TBDs are rejected). Read a task\'s related docs (get_task.docs) before starting; link the docs new tasks must follow via docIds; when you settle something durable, create_doc the outcome. Undecided → request_input first, then document the answer.',
-          'Search before you file or dig: semantic_search finds tasks, docs and plans by MEANING (the thing you are about to create may already exist); search_tasks filters by attributes. Prefer them over dumping get_project in large projects.',
+          'Search before you file or dig: semantic_search finds tasks, docs and plans by MEANING (the thing you are about to create may already exist); search_tasks filters by attributes. get_project is the scaffold (ids, tags, boards, docs index, active plans, P4 tasks) — not a task list; never expect the whole backlog from it.',
           'Claims are exclusive. If claim_task fails, the task is taken or blocked — pick another.',
-          'When a project has file locking ON (opt-in), acquire_lock the file(s) you are about to edit/create/rename BEFORE touching them — all paths in ONE all-or-nothing call, scoped to your branch and linked to your task (they auto-release when it settles). Re-acquiring your own paths renews them; check_locks to look without taking; release_lock when done. On conflict, coordinate with the holder or wait — never clobber a locked file. Git has no file locking; this is how agents avoid stepping on each other.',
+          'File locking is opt-in per project — get_project.project.fileLocking says whether it is on here. When it is on it is MANDATORY: acquire_lock the file(s) you are about to edit/create/rename BEFORE touching them — all paths in ONE all-or-nothing call, scoped to your branch and linked to your task (they auto-release when it settles). Editing an unlocked file on a locking project is a coordination violation (others read "unlocked" as "free to take"). Re-acquiring your own paths renews them; check_locks to look without taking; release_lock when done. On conflict, coordinate with the holder or wait — never clobber a locked file. Git has no file locking; this is how agents avoid stepping on each other.',
           'Blocked on a human decision? request_input (it auto-parks the task and frees you to work elsewhere) — do not guess or stall. Batch every question the decision needs into its typed `questions` (select/multi/text/number/confirm) in ONE gate; thread a genuine follow-up round with followUpTo. Flag non-blocking concerns (deviations, risks) with raise_alert and keep going.',
           'Every tool result may end with a "--- notices ---" block: read it, it is addressed to you.',
         ],
@@ -673,26 +676,41 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'get_project',
-    'Full project snapshot: every task (status/holder/deps/board/open-comment counts), milestones, boards, tags, the docs index, and agents active here. Heavy — use it to orient once or to resolve ids (boards, milestones, tags); for "find the thing about X" use semantic_search, and for filtered task lists use search_tasks.',
+    'Project scaffold for orientation + id resolution — deliberately NOT the full task list. Returns: the project (incl. `fileLocking` — when true you MUST acquire_lock before editing any file here), milestones, boards, tags, the docs index, the active/pending plans (completed & archived plans omitted), and only the P4 (top-priority) still-open tasks. For the full or filtered task list use search_tasks; for the next thing to work use next_claimable; for "find the thing about X" use semantic_search; for a plan\'s detail use get_plans.',
     { projectId: z.string() },
     tool(async ({ projectId }) => {
-      const [tasks, milestones, boards, project, categories, docs] = await Promise.all([
+      const [tasks, milestones, boards, project, categories, docs, plans] = await Promise.all([
+        // Only the top-priority (P4) still-open tasks — get_project is for orientation, not a
+        // dump. The full/filtered list lives in search_tasks; the pull-loop in next_claimable.
         env.DB.prepare(
           `SELECT t.id, t.key, t.title, ${taskWireStatus('t')} AS status, t.failed_at AS failedAt, t.type, t.priority, t.claimed_by AS claimedBy, t.parent_task_id AS parentTaskId,
                   t.milestone_id AS milestoneId, t.board_id AS boardId, t.open_comments AS openComments, t.claim_expires_at AS claimExpiresAt,
                   (SELECT GROUP_CONCAT(dt.key) FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id WHERE d.task_id = t.id) AS dependsOn,
                   (SELECT GROUP_CONCAT(g.name) FROM task_tags tt JOIN tags g ON g.id = tt.tag_id WHERE tt.task_id = t.id) AS tags
-           FROM tasks t WHERE t.project_id = ? ORDER BY t."order"`,
+           FROM tasks t WHERE t.project_id = ? AND t.priority = 4 AND t.status NOT IN ('done','cancelled') ORDER BY t."order"`,
         ).bind(projectId).all(),
         env.DB.prepare('SELECT id, title, due_at AS dueAt, description FROM milestones WHERE project_id = ? ORDER BY "order"').bind(projectId).all(),
         env.DB.prepare('SELECT id, name FROM boards WHERE project_id = ? ORDER BY "order", created_at').bind(projectId).all(),
-        env.DB.prepare('SELECT id, key, name, description, repo_url AS repoUrl, claim_ttl_seconds AS claimTtlSeconds FROM projects WHERE id = ?')
-          .bind(projectId).first(),
+        env.DB.prepare('SELECT id, key, name, description, repo_url AS repoUrl, claim_ttl_seconds AS claimTtlSeconds, file_locking_enabled AS fileLocking FROM projects WHERE id = ?')
+          .bind(projectId).first<Record<string, unknown>>(),
         env.DB.prepare('SELECT id, name, color FROM tags WHERE project_id = ? ORDER BY "order"').bind(projectId).all(),
         env.DB.prepare('SELECT id, name, description, updated_at AS updatedAt FROM docs WHERE project_id = ? ORDER BY updated_at DESC').bind(projectId).all(),
+        // Active/pending plans only — a plan with tasks all done/cancelled is complete and
+        // skipped; a plan with no tasks yet counts as pending. Summaries only (id/title/desc +
+        // task progress); read a full plan with get_plans.
+        env.DB.prepare(
+          `SELECT pl.id, pl.title, pl.description,
+                  (SELECT COUNT(*) FROM phases ph JOIN phase_tasks pt ON pt.phase_id = ph.id WHERE ph.plan_id = pl.id) AS tasksTotal,
+                  (SELECT COUNT(*) FROM phases ph JOIN phase_tasks pt ON pt.phase_id = ph.id JOIN tasks t ON t.id = pt.task_id
+                    WHERE ph.plan_id = pl.id AND t.status IN ('done','cancelled')) AS tasksDone
+           FROM plans pl WHERE pl.project_id = ? AND pl.archived_at IS NULL ORDER BY pl.created_at DESC`,
+        ).bind(projectId).all<{ id: string; title: string; description: string; tasksTotal: number; tasksDone: number }>(),
       ]);
       if (!project) throw new Error(`project ${projectId} not found`);
-      return { project, milestones: milestones.results, boards: boards.results, tags: categories.results, tasks: tasks.results, docs: docs.results };
+      // D1 stores the flag as 0/1 — hand the agent a real boolean.
+      project.fileLocking = !!project.fileLocking;
+      const activePlans = plans.results.filter((p) => p.tasksTotal === 0 || p.tasksDone < p.tasksTotal);
+      return { project, milestones: milestones.results, boards: boards.results, tags: categories.results, tasks: tasks.results, plans: activePlans, docs: docs.results };
     }),
   );
 
@@ -922,7 +940,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     { taskId: z.string() },
     tool(async ({ taskId }) => {
       const task = await env.DB.prepare(
-        `SELECT t.*, t.claimed_by AS claimedBy, t.claim_expires_at AS claimExpiresAt, t.open_comments AS openComments
+        // `tags` is joined in here because get_project now returns only P4 tasks — this is
+        // the surface that answers "what is this task tagged" for everything else.
+        `SELECT t.*, t.claimed_by AS claimedBy, t.claim_expires_at AS claimExpiresAt, t.open_comments AS openComments,
+                (SELECT GROUP_CONCAT(g.name) FROM task_tags tt JOIN tags g ON g.id = tt.tag_id WHERE tt.task_id = t.id) AS tags
          FROM tasks t WHERE t.id = ? OR t.key = ?`,
       ).bind(taskId, taskId).first();
       if (!task) throw new Error(`task ${taskId} not found`);
@@ -934,14 +955,23 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       if (task.failed_at) task.status = 'failed';
       task.failedAt = task.failed_at;
       const id = String(task.id);
-      const [deps, comments, refs, attachments, signals, docs] = await Promise.all([
+      // Comment history is unbounded; cap it so a long-lived task can't spill the result.
+      // Open/acknowledged (what you must act on) always come first and in full; the resolved
+      // tail is capped to the most recent COMMENT_CAP, with `moreResolvedComments` for the rest.
+      const COMMENT_CAP = 60;
+      const [deps, comments, commentTotal, refs, attachments, signals, docs] = await Promise.all([
         env.DB.prepare(
           `SELECT dt.id, dt.key, dt.status FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id WHERE d.task_id = ?`,
         ).bind(id).all(),
         env.DB.prepare(
           `SELECT id, author_kind AS authorKind, author_id AS authorId, kind, body, status, parent_comment_id AS parentCommentId, created_at AS createdAt
-           FROM comments WHERE task_id = ? ORDER BY CASE WHEN status IN ('open','acknowledged') THEN 0 ELSE 1 END, created_at`,
+           FROM comments WHERE task_id = ?
+           ORDER BY CASE WHEN status IN ('open','acknowledged') THEN 0 ELSE 1 END,
+                    CASE WHEN status IN ('open','acknowledged') THEN created_at ELSE '' END ASC,
+                    created_at DESC
+           LIMIT ${COMMENT_CAP}`,
         ).bind(id).all(),
+        env.DB.prepare('SELECT COUNT(*) AS n FROM comments WHERE task_id = ?').bind(id).first<{ n: number }>(),
         env.DB.prepare('SELECT kind, ref, url, state FROM task_refs WHERE task_id = ?').bind(id).all(),
         env.DB.prepare(
           `SELECT id, filename, content_type AS contentType, size, uploaded_by_kind AS uploadedByKind, uploaded_by AS uploadedBy, created_at AS createdAt
@@ -965,7 +995,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         responseJson: s.responseJson ? JSON.parse(String(s.responseJson)) : null,
       }));
       const relatedDocs = docs.results.map((d) => ({ ...d, resource: docUri(String(d.id)) }));
-      return { task, dependencies: deps.results, comments: comments.results, refs: refs.results, attachments: withUris, signals: sigs, docs: relatedDocs };
+      const moreResolvedComments = Math.max(0, (commentTotal?.n ?? comments.results.length) - comments.results.length);
+      return { task, dependencies: deps.results, comments: comments.results, moreResolvedComments, refs: refs.results, attachments: withUris, signals: sigs, docs: relatedDocs };
     }),
   );
 

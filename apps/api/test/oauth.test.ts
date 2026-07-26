@@ -454,7 +454,8 @@ describe('tags', () => {
     expect(t2.isError).toBe(false);
     const proj = await mcpCall(agentKey, 'get_project', { projectId });
     expect(proj.body.tags.map((c: { name: string }) => c.name).sort()).toEqual(['auth', 'backend']);
-    const task1 = proj.body.tasks.find((x: { id: string }) => x.id === t1.body.id);
+    // Task detail (incl. tags) comes from get_task — get_project carries only P4 tasks.
+    const task1 = (await mcpCall(agentKey, 'get_task', { taskId: t1.body.id })).body.task;
     expect(task1.tags.split(',').sort()).toEqual(['auth', 'backend']);
     expect(task1.type).toBe('bug');
   });
@@ -462,13 +463,11 @@ describe('tags', () => {
   it('update_task replaces and clears the tag set', async () => {
     const t = await mcpCall(agentKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'docs thing' });
     await mcpCall(agentKey, 'update_task', { projectId, taskId: t.body.id, tags: ['docs'], type: 'chore' });
-    let proj = await mcpCall(agentKey, 'get_project', { projectId });
-    let task = proj.body.tasks.find((x: { id: string }) => x.id === t.body.id);
+    let task = (await mcpCall(agentKey, 'get_task', { taskId: t.body.id })).body.task;
     expect(task.tags).toBe('docs');
     expect(task.type).toBe('chore');
     await mcpCall(agentKey, 'update_task', { projectId, taskId: t.body.id, tags: [] });
-    proj = await mcpCall(agentKey, 'get_project', { projectId });
-    task = proj.body.tasks.find((x: { id: string }) => x.id === t.body.id);
+    task = (await mcpCall(agentKey, 'get_task', { taskId: t.body.id })).body.task;
     expect(task.tags).toBeNull();
   });
 });

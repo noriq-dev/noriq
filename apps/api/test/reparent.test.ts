@@ -9,9 +9,10 @@ let a: { id: string; key: string };
 let b: { id: string; key: string };
 let c: { id: string; key: string };
 
+// get_project returns only P4 tasks (orientation, not a dump) — read task detail via get_task.
 const parentOf = async (key: string) => {
-  const proj = await mcpCall(agent.apiKey, 'get_project', { projectId });
-  return (proj.body.tasks.find((t: { key: string }) => t.key === key)?.parentTaskId ?? null) as string | null;
+  const res = await mcpCall(agent.apiKey, 'get_task', { taskId: key });
+  return (res.body.task.parent_task_id ?? null) as string | null;
 };
 
 beforeAll(async () => {
