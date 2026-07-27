@@ -17,6 +17,7 @@ import {
 import { taskSearchFilters } from './lib/search';
 import { ExecutionSpec, type ExecutionSpecInput } from '@noriq-dev/shared';
 import { readExecutionSpec } from './lib/execution-spec';
+import { refuseSpecWrite, specWriteRefusalMessage } from './lib/spec-authority';
 import { search, searchBackend, reindexProject } from './search';
 import { nearDupeGroups } from './lib/tags';
 import { DOC_SKILL_MD } from './skill-docs';
@@ -25,6 +26,28 @@ import { taskClaimability } from './lib/claimability';
 import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
 
 const MAX_ATTACHMENT = 100 * 1024 * 1024;
+
+/**
+ * Which KIND of run a spawned agent belongs to (RUN-160), or null when it belongs to none.
+ *
+ * `agent.kind === 'agent'` says an actor is runner-spawned; it does not say what it was spawned to
+ * DO, and the difference decides who may rewrite an execution spec. A scope run authors specs — the
+ * planner stage is built on it — while the actors a spec is used to judge must not edit it.
+ *
+ * Null for a copilot, for an agent whose run has settled, and for a lookup that finds nothing: all
+ * three mean "not currently a run actor being judged", and the caller treats null as permitted.
+ * That is deliberately fail-OPEN, and defensible only because the strict half is the one that
+ * matters: an agent with no live run has no gate to talk its way past.
+ */
+async function runKindOf(env: Env, agentId: string): Promise<string | null> {
+  const row = await env.DB.prepare(
+    `SELECT kind FROM runs WHERE agent_id = ? AND status IN ('dispatched','running','blocked')
+     ORDER BY created_at DESC LIMIT 1`,
+  )
+    .bind(agentId)
+    .first<{ kind: string }>();
+  return row?.kind ?? null;
+}
 
 /**
  * What every task tool says about the execution spec (RUN-136).
@@ -331,7 +354,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           'You already have an identity — `you` above is it, and `you.kind` says whether you are a human\'s copilot or a runner-spawned agent. Nothing to register. Work loop: my_updates → pick from claimable (or next_claimable) → claim_task (just the one you are about to start) → do the work → resolve any comments → release_task {toStatus:"review"|"done"}. Every tool call renews your claim, so no periodic pinging — heartbeat only if you will be idle longer than the claim TTL.',
           'Humans steer via comments on tasks (kind: question/instruction). Acknowledge fast, resolve with resolve_comment (addressed|wont_do) + a reply. Unresolved comments should block you from finishing.',
           'Anything bigger than one task: plan first. create_plan writes the plan as a document — goals/approach in the body, then ordered phases over tasks. Phase order itself gates the work (tasks in phase N are claimable once every earlier phase is finished — no dependency wiring needed); or decompose_task for a quick subtree. Workers drain the plan via next_claimable; keep it current with update_plan.',
-          'Hand the NEXT agent what you learned: a task\'s executionSpec carries requirementIds, anticipated files, required reading, decisions already settled (do not relitigate), where it may use its own judgement, what is explicitly out of scope, and acceptance criteria written as truths rather than steps. Fill it in whenever you know more than the title and body say — on create_task/create_tasks, on a plan\'s newTasks, or later with update_task (which REPLACES the whole spec; read it first and send it back complete). Read it before you start (get_task.executionSpec): if it is there, its lockedDecisions bind you and its acceptance is your definition of done. If executionSpecUnreadable is set, the stored spec is corrupt — say so, do not treat it as absent.',
+          'Hand the NEXT agent what you learned: a task\'s executionSpec carries requirementIds, anticipated files, required reading, decisions already settled (do not relitigate), where it may use its own judgement, what is explicitly out of scope, and acceptance criteria written as truths rather than steps. Fill it in whenever you know more than the title and body say — on create_task/create_tasks, on a plan\'s newTasks, or later with update_task (which REPLACES the whole spec; read it first and send it back complete). Read it before you start (get_task.executionSpec): if it is there, its lockedDecisions bind you and its acceptance is your definition of done. If executionSpecUnreadable is set, the stored spec is corrupt — say so, do not treat it as absent. A build or verify run cannot REWRITE its own task\'s spec: it is what your work is judged against, so if it is wrong say so in a comment and let a human or a scope run correct it.',
           'Tasks you create MUST carry descriptive tags — topic/area/component words (e.g. "oauth", "board-filters"), FIRST tag = primary tag. Tags are the project\'s SHARED filter vocabulary: reuse existing tags (get_project.tags) before minting — near-duplicates are rejected, and some projects are curated (agents cannot mint at all). Never status/type/priority words as tags. Use dependsOn only for real, hand-picked orderings.',
           'Project docs are settled decisions and facts ONLY (enforced — open questions/TBDs are rejected). Read a task\'s related docs (get_task.docs) before starting; link the docs new tasks must follow via docIds; when you settle something durable, create_doc the outcome. Undecided → request_input first, then document the answer.',
           'Search before you file or dig: semantic_search finds tasks, docs and plans by MEANING (the thing you are about to create may already exist); search_tasks filters by attributes. get_project is the scaffold (ids, tags, boards, docs index, active plans, P4 tasks) — not a task list; never expect the whole backlog from it.',
@@ -941,13 +964,16 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
             '(gate passed → review, failed → failed). Drop the status field; the other edits are fine.',
         );
       }
-      // NOT guarded here, and it is a live question rather than an oversight (RUN-160): a run
-      // agent may rewrite its own task's `executionSpec`, including the lockedDecisions it is
-      // meant to be held to. A blanket ban is wrong — a scope run authoring specs is the point of
-      // this field — so the discriminator has to be the run's KIND, which this surface does not
-      // currently know. Nothing enforces a spec yet (the runner does not read one until RUN-138),
-      // so the exposure today is a builder confusing its own reviewer, not defeating a gate.
-      // Whoever wires the spec into the gate owns closing this.
+      // A BUILD or VERIFY agent must not rewrite the spec it is being held to (RUN-160) — the
+      // decision itself lives in `refuseSpecWrite`, where it can be reasoned about and tested
+      // without a live MCP session.
+      if (patch.executionSpec !== undefined) {
+        const refusal = refuseSpecWrite({
+          actorKind: agent.kind,
+          runKind: agent.kind === 'agent' ? await runKindOf(env, agent.id) : null,
+        });
+        if (refusal) throw new Error(specWriteRefusalMessage(refusal));
+      }
       return room(env, projectId).updateTask(projectId, actor, await resolveTaskId(env, projectId, taskId), patch);
     }),
   );

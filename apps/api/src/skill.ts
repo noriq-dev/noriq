@@ -208,6 +208,12 @@ Every field is optional — fill in what you actually know, and leave the rest e
 inventing it. Set it on \`create_task\`/\`create_tasks\`, on a plan's \`newTasks\`, or later
 with \`update_task\` (which REPLACES the whole spec — there is no field-level merge).
 
+**Who may write one.** Anyone planning: a human, a copilot, or a **scope** run filing the tasks it
+found. Not a **build** or **verify** run on its own task — the spec is what its work is judged
+against, and an actor that can edit the standard it is graded by can pass itself. If you are
+building and the spec is wrong, say so in a comment and let a human or a scope run correct it; that
+is a finding, not an obstacle.
+
 **Reading one:** \`get_task\` returns \`executionSpec\`. If it is there, its
 \`lockedDecisions\` bind you and its \`acceptance\` is your definition of done. If
 \`executionSpecUnreadable\` is set, the stored spec is corrupt — say so and ask; do not treat
