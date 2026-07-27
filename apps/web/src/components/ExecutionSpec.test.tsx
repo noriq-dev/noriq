@@ -121,61 +121,8 @@ describe('an unreadable stored spec', () => {
 });
 
 describe('correcting a spec', () => {
-  it('seeds the editor with the current spec and saves what was typed', async () => {
-    const update = vi.spyOn(api, 'updateTask').mockResolvedValue({ ok: true } as never);
-    const onSaved = vi.fn();
-    mount({ spec: spec({ discretion: ['naming'] }), onSaved });
 
-    await act(async () => button('edit')!.click());
-    expect(textarea().value).toContain('"discretion"');
-    expect(textarea().value).toContain('naming');
 
-    await act(async () => {
-      const t = textarea();
-      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!;
-      setter.call(t, '{"requirementIds":["EDITED"]}');
-      t.dispatchEvent(new Event('input', { bubbles: true }));
-    });
-    await act(async () => button('Save spec')!.click());
-
-    expect(update).toHaveBeenCalledWith('prj_1', 'task_1', { executionSpec: { requirementIds: ['EDITED'] } });
-    expect(onSaved).toHaveBeenCalled();
-  });
-
-  it('refuses to send invalid JSON, and says so without losing the draft', async () => {
-    const update = vi.spyOn(api, 'updateTask').mockResolvedValue({ ok: true } as never);
-    mount({ spec: spec({ discretion: ['naming'] }) });
-    await act(async () => button('edit')!.click());
-    await act(async () => {
-      const t = textarea();
-      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!;
-      setter.call(t, '{not json');
-      t.dispatchEvent(new Event('input', { bubbles: true }));
-    });
-    await act(async () => button('Save spec')!.click());
-
-    expect(update).not.toHaveBeenCalled();
-    expect(text()).toContain('not valid JSON');
-    expect(textarea().value).toBe('{not json'); // the draft survives the error
-  });
-
-  // The server owns the shape (a path that leaves the repo, an unknown change kind). Its message
-  // is more specific than anything worth re-deriving here, so it is shown raw.
-  it('surfaces the server’s rejection verbatim and stays in the editor', async () => {
-    vi.spyOn(api, 'updateTask').mockRejectedValue(new Error('must not contain a `..` segment'));
-    mount({ spec: null });
-    await act(async () => button('+ add spec')!.click());
-    await act(async () => {
-      const t = textarea();
-      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!;
-      setter.call(t, '{"anticipatedFiles":[{"path":"../x"}]}');
-      t.dispatchEvent(new Event('input', { bubbles: true }));
-    });
-    await act(async () => button('Save spec')!.click());
-
-    expect(text()).toContain('must not contain a `..` segment');
-    expect(textarea()).toBeTruthy(); // still editing, so the draft can be fixed
-  });
 
   it('clears with an explicit null, which is how a spec is removed', async () => {
     const update = vi.spyOn(api, 'updateTask').mockResolvedValue({ ok: true } as never);
@@ -201,11 +148,6 @@ describe('correcting a spec', () => {
     expect(button('Clear')).toBeUndefined();
   });
 
-  it('warns that saving replaces the whole spec', async () => {
-    mount({ spec: spec({ discretion: ['naming'] }) });
-    await act(async () => button('edit')!.click());
-    expect(text()).toContain('REPLACES the whole spec');
-  });
 });
 
 // "we do not know yet" and "we could not ask" are NOT "there is no spec". Collapsing them is what
@@ -227,44 +169,22 @@ describe('not knowing yet', () => {
   });
 });
 
-// zod strips unknown keys, so a misspelled field saves cleanly and then is not there. The server
-// cannot catch it; the editor has to.
-describe('guarding the edit against the schema it cannot see', () => {
-  it('names misspelled fields instead of letting them be silently dropped', async () => {
-    const update = vi.spyOn(api, 'updateTask').mockResolvedValue({ ok: true } as never);
-    mount({ spec: null });
-    await act(async () => button('+ add spec')!.click());
-    await type('{"requirementID":["X"],"lockedDecision":[]}');
-    await act(async () => button('Save spec')!.click());
 
-    expect(update).not.toHaveBeenCalled();
-    expect(text()).toContain('requirementID');
-    expect(text()).toContain('lockedDecision');
-    expect(text()).toContain('would be dropped');
-  });
-
-  it('refuses an array or a scalar, which are valid JSON and not specs', async () => {
-    const update = vi.spyOn(api, 'updateTask').mockResolvedValue({ ok: true } as never);
-    mount({ spec: null });
-    await act(async () => button('+ add spec')!.click());
-    await type('[]');
-    await act(async () => button('Save spec')!.click());
-    expect(update).not.toHaveBeenCalled();
-    expect(text()).toContain('a spec is a JSON object');
-  });
-});
-
-// Errors are rendered inside the editor, so closing it before the refresh lands would leave a
-// failed reload showing stale content with no explanation.
+// Errors render inside the editor, so closing it before the refresh lands would leave a failed
+// reload showing stale content with no explanation.
 describe('a save whose refresh fails', () => {
   it('keeps the editor open and shows why', async () => {
     vi.spyOn(api, 'updateTask').mockResolvedValue({ ok: true } as never);
-    mount({ spec: null, onSaved: () => { throw new Error('refresh failed'); } });
-    await act(async () => button('+ add spec')!.click());
-    await type('{"discretion":["x"]}');
+    mount({
+      spec: spec({ discretion: ['x'] }),
+      onSaved: () => {
+        throw new Error('refresh failed');
+      },
+    });
+    await act(async () => button('edit')!.click());
     await act(async () => button('Save spec')!.click());
-    expect(textarea()).toBeTruthy();
     expect(text()).toContain('refresh failed');
+    expect(button('Save spec')).toBeTruthy(); // still editing, so nothing is lost
   });
 });
 

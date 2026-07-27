@@ -18,8 +18,20 @@ import { useEffect, useState } from 'react';
 import { hasExecutionSpec, type ExecutionSpec } from '@noriq-dev/shared';
 import { api } from '../api';
 import { MonoTag, SectionLabel } from './bits';
-import { Button, TextArea } from './ui';
+import { Button } from './ui';
+import { type SpecDraft, SpecForm, pruneDraft } from './SpecForm';
 import { confirm } from './Dialog';
+
+/** The shape the form edits: every field present, so no row reasons about absence. */
+const EMPTY_DRAFT: SpecDraft = {
+  requirementIds: [],
+  anticipatedFiles: [],
+  requiredReading: [],
+  lockedDecisions: [],
+  discretion: [],
+  deferred: [],
+  acceptance: { observableTruths: [], artifacts: [], links: [] },
+};
 
 const CHANGE_COLOR: Record<string, string> = {
   create: 'var(--green, #6ee7a8)',
@@ -32,17 +44,6 @@ const CHANGE_COLOR: Record<string, string> = {
  *  reading that invites someone to write over a plan that already exists. */
 export type SpecLoad = 'loading' | 'loaded' | 'error';
 
-/** The contract's own field names. A key outside this set is a typo the server would silently
- *  drop, so the editor names it rather than letting the edit half-apply. */
-const SPEC_KEYS = [
-  'requirementIds',
-  'anticipatedFiles',
-  'requiredReading',
-  'lockedDecisions',
-  'discretion',
-  'deferred',
-  'acceptance',
-] as const;
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -191,7 +192,7 @@ export function ExecutionSpecPanel({
   onSaved: () => void | Promise<void>;
 }) {
   const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState('');
+  const [draft, setDraft] = useState<SpecDraft>(EMPTY_DRAFT);
   const [error, setError] = useState('');
   const [saving, setSaving] = useState(false);
 
@@ -199,42 +200,26 @@ export function ExecutionSpecPanel({
   // both are wanted: the key handles the drawer, this handles any other caller.
   useEffect(() => {
     setEditing(false);
-    setDraft('');
     setError('');
   }, [taskId]);
 
   const startEdit = () => {
-    setDraft(JSON.stringify(spec ?? {}, null, 2));
+    setDraft(spec ?? EMPTY_DRAFT);
     setError('');
     setEditing(true);
   };
 
   const save = async () => {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(draft);
-    } catch {
-      setError('not valid JSON');
-      return;
-    }
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-      setError('a spec is a JSON object');
-      return;
-    }
-    // The server accepts this silently and stores nothing under it — zod strips unknown keys — so
-    // a misspelled field would look like a successful save and then not be there.
-    const unknown = Object.keys(parsed).filter((k) => !(SPEC_KEYS as readonly string[]).includes(k));
-    if (unknown.length) {
-      setError(`unknown field(s): ${unknown.join(', ')} — they would be dropped. Expected: ${SPEC_KEYS.join(', ')}`);
-      return;
-    }
+    // Blank rows are dropped rather than sent: a form makes them easy to create by accident, and
+    // an anticipated file with no path is a row the contract refuses and a reader puzzles at.
+    const pruned = pruneDraft(draft);
     setSaving(true);
     try {
-      // The server is the authority on shape (paths that leave the repo, unknown change kinds).
-      // Its message is more specific than anything worth re-deriving here, so it is shown raw.
-      await api.updateTask(pid, taskId, { executionSpec: parsed });
-      // Close only once the reload has succeeded too: errors are rendered inside the editor, so
-      // closing first would leave a failed refresh showing stale content and no explanation.
+      // The server is still the authority on shape (a path that leaves the repo, a change kind
+      // that does not exist). Its message is more specific than anything worth re-deriving here.
+      await api.updateTask(pid, taskId, { executionSpec: pruned });
+      // Close only once the reload has succeeded too: errors render inside the editor, so closing
+      // first would leave a failed refresh showing stale content and no explanation.
       await onSaved();
       setEditing(false);
     } catch (e) {
@@ -318,35 +303,16 @@ export function ExecutionSpecPanel({
           )}
 
           {editing ? (
-            <div>
-              <TextArea
-                value={draft}
-                onChange={(e) => setDraft(e.target.value)}
-                spellCheck={false}
-                style={{ fontFamily: 'var(--mono)', fontSize: 11, minHeight: 220, lineHeight: 1.5 }}
-              />
-              {error && (
-                <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--red-soft)', marginTop: 6, whiteSpace: 'pre-wrap' }}>{error}</div>
-              )}
-              <div style={{ display: 'flex', gap: 7, marginTop: 8 }}>
-                <Button onClick={() => void save()} disabled={saving}>Save spec</Button>
-                <Button variant="ghost" onClick={() => setEditing(false)} disabled={saving}>Cancel</Button>
-                <div style={{ flex: 1 }} />
-                {(!empty || unreadable) && (
-                  <Button variant="danger" onClick={() => void clear()} disabled={saving}>Clear</Button>
-                )}
-              </div>
-              <div style={{ fontSize: 10.5, color: 'var(--text-faint)', marginTop: 7, lineHeight: 1.5 }}>
-                Saving REPLACES the whole spec — there is no field-level merge. Fields, all optional:
-                <code> requirementIds</code> [string],
-                <code> anticipatedFiles</code> [{'{path, change: create|modify|delete, why}'}],
-                <code> requiredReading</code> [string],
-                <code> lockedDecisions</code> [{'{decision, because, source}'}],
-                <code> discretion</code> [string],
-                <code> deferred</code> [string],
-                <code> acceptance</code> {'{observableTruths: [string], artifacts: [{path, provides, exports: [string]}], links: [{from, to, via}]}'}.
-              </div>
-            </div>
+            <SpecForm
+              draft={draft}
+              onChange={setDraft}
+              onSave={() => void save()}
+              onCancel={() => setEditing(false)}
+              onClear={() => void clear()}
+              saving={saving}
+              error={error}
+              canClear={!empty || Boolean(unreadable)}
+            />
           ) : empty && !unreadable ? (
             <div style={{ fontSize: 11.5, color: 'var(--text-faint)', lineHeight: 1.5 }}>
               No spec. Whoever picks this up works out its scope, required reading and definition of
