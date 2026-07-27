@@ -290,6 +290,48 @@ describe('run agent creation (RUN-43)', () => {
     expect(after!.priority).toBe(1);
   });
 
+  // RUN-167. update_task.status was the door PLNR-192 closed and update_tasks the detour RUN-160
+  // closed behind it — but release_task and handoff_task reach tasks.status by their own routes.
+  // Neither is on any declared tool floor, so no real daemon's agent can call them, and THAT is the
+  // reason to close it rather than leave it: the server was relying on the client's declaration to
+  // enforce a rule it states in its own code, and allowedTools is deliberately optional for
+  // pre-RUN-47 daemons. Same inversion RUN-118 rejected for the write floor.
+  it.each(['release_task', 'handoff_task'])('a run agent cannot call %s', async (tool) => {
+    const runId = `run_167_${tool}`;
+    await seedRun(runId);
+    const body = (await (await createAgentFor(ownerToken, runId)).json()) as { agentId: string; token: string };
+    await env.DB.prepare(
+      `INSERT INTO tasks (id, project_id, key, title, status, claimed_by) VALUES (?, ?, ?, 't', 'in_progress', ?)`,
+    ).bind(`task_167_${tool}`, rnrxProjectId, `RNRX-167-${tool}`, body.agentId).run();
+
+    const args =
+      tool === 'release_task'
+        ? { projectId: rnrxProjectId, taskId: `task_167_${tool}`, toStatus: 'review' }
+        : { projectId: rnrxProjectId, taskId: `task_167_${tool}`, toAgentId: body.agentId };
+    const refused = await mcpRpcRaw(body.token, 'tools/call', { name: tool, arguments: args });
+    expect(JSON.stringify(refused)).toMatch(new RegExp(`run agents don't call ${tool}`));
+    // The refusal names the door that IS open, or an agent works around it.
+    expect(JSON.stringify(refused)).toMatch(/request_input/);
+    const row = await env.DB.prepare('SELECT status FROM tasks WHERE id = ?')
+      .bind(`task_167_${tool}`).first<{ status: string }>();
+    expect(row!.status).toBe('in_progress'); // unmoved
+  });
+
+  // The lifecycle transitions a run agent legitimately makes are untouched: claim_task is on the
+  // build floor by design, and request_input is the sanctioned way to reach a human.
+  it('leaves claim_task open to a run agent', async () => {
+    await seedRun('run_167_claim');
+    const body = (await (await createAgentFor(ownerToken, 'run_167_claim')).json()) as { token: string };
+    await env.DB.prepare(
+      "INSERT INTO tasks (id, project_id, key, title, status) VALUES ('task_167_claim', ?, 'RNRX-1670', 't', 'todo')",
+    ).bind(rnrxProjectId).run();
+    const ok = await mcpRpcRaw(body.token, 'tools/call', {
+      name: 'claim_task',
+      arguments: { projectId: rnrxProjectId, taskId: 'task_167_claim' },
+    });
+    expect(JSON.stringify(ok)).not.toMatch(/run agents don't call/);
+  });
+
   it('an agent created without a floor sees the full catalogue (pre-RUN-47 daemons)', async () => {
     await seedRun('run_a47b');
     const body = (await (await createAgentFor(ownerToken, 'run_a47b')).json()) as { token: string };

@@ -935,6 +935,37 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
    * Copilots and humans are untouched: a human overriding a status or correcting a spec is the
    * point of both fields.
    */
+  /**
+   * The task-lifecycle tools a runner-spawned agent must not call at all (RUN-167).
+   *
+   * `update_task.status` was the door PLNR-192 closed and `update_tasks` the detour RUN-160 closed
+   * behind it — but `release_task` and `handoff_task` reach `tasks.status` by their own routes:
+   * `releaseTask` writes an arbitrary status directly, and `handoffTask` writes `in_progress` and
+   * replaces the claimant. A build agent could therefore move its anchor to `review` before the
+   * daemon's gate ran, which is precisely the pre-RUN-83 behaviour that left a gate-failed task
+   * stranded there, or hand its anchor to somebody else while its own run still owned settling it.
+   *
+   * Neither is on any kind's declared tool floor (`security.ts`), so no real daemon's agent can
+   * call them — and that is the reason to close this rather than to leave it. The server was
+   * relying on the CLIENT's declaration to enforce a rule the server states in its own code, and
+   * `allowedTools` is deliberately optional at agent creation for pre-RUN-47 daemons. It is the
+   * inversion RUN-118 rejected for the write floor: enforced in code, not by trusting the manifest.
+   *
+   * A flat refusal rather than a status clamp, because a run agent has no legitimate use of either.
+   * Giving a task back, finishing it, and blocking on a human are all things the RUN does — via
+   * settleAnchorTask, and via `request_input` for the last — so there is no narrower rule to write.
+   */
+  const refuseLifecycleCall = (tool: 'release_task' | 'handoff_task') => {
+    if (agent.kind !== 'agent') return;
+    const how =
+      tool === 'release_task'
+        ? "your run's outcome moves the task when it ends (gate passed → review, failed → failed)"
+        : 'a run owns its anchor until it settles, so it cannot pass it on mid-flight';
+    throw new Error(
+      `run agents don't call ${tool}: ${how}. If you are finished, just stop; if you need a human, use request_input.`,
+    );
+  };
+
   const refuseSelfJudgingEdits = async (patch: { status?: unknown; executionSpec?: unknown }) => {
     if (agent.kind !== 'agent') return;
     // A runner-spawned agent must not move its task's status (PLNR-192). RUN-83 took
@@ -1124,8 +1155,16 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       toAgentId: z.string(),
       note: z.string().optional().describe('Briefing for the receiving agent — context, what is done, what remains'),
     },
-    tool(async ({ projectId, taskId, toAgentId, note }) =>
-      room(env, projectId).handoffTask(projectId, actor, await resolveTaskId(env, projectId, taskId), toAgentId, note)),
+    tool(async ({ projectId, taskId, toAgentId, note }) => {
+      refuseLifecycleCall('handoff_task');
+      return room(env, projectId).handoffTask(
+        projectId,
+        actor,
+        await resolveTaskId(env, projectId, taskId),
+        toAgentId,
+        note,
+      );
+    }),
   );
 
   defineTool(
@@ -1422,6 +1461,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       comment: z.string().optional().describe('Closing thoughts / handoff notes to record on the task'),
     },
     tool(async ({ projectId, taskId, toStatus, comment }) => {
+      refuseLifecycleCall('release_task');
       const id = await resolveTaskId(env, projectId, taskId);
       if (toStatus === 'done') {
         const open = await env.DB.prepare(
