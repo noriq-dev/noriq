@@ -748,26 +748,46 @@ describe('continue a failed run — reopenRun (PLNR-180)', () => {
 });
 
 
-// RUN-166: what a run was actually briefed with, kept with the run.
-describe('the spec a run executed under', () => {
-  it('is written once and never replaced by a later frame', async () => {
+// RUN-166/172: what a run was actually briefed with, kept with the run.
+describe('the specs a run executed under', () => {
+  it('appends each distinct briefing, so a multi-sitting run keeps both', async () => {
     await seedRunner('rnr_x');
     const rid = (await room(pid).createRun(pid, actor, {
       kind: 'build', repoRef: 'r', agentTool: 'claude', runnerId: 'rnr_x',
     })).id;
     await room(pid).recordRunTelemetry(pid, rid, {
-      executedSpec: { acceptance: { observableTruths: ['the first answer'] } },
+      executedSpec: { acceptance: { observableTruths: ['the commission'] } },
     });
-    // A redelivered frame, or a daemon reporting again later, must not replace it: what a run was
-    // briefed with is a fact about a moment that has passed, and letting a later view overwrite it
-    // rebuilds the very inference this column exists to remove.
+    // A second sitting — a resume after the spec was corrected, or a continued failed run — is
+    // briefed afresh. Write-once recorded the first and the run was graded against the last, which
+    // is the mismatch this column exists to remove one level up.
     await room(pid).recordRunTelemetry(pid, rid, {
-      executedSpec: { acceptance: { observableTruths: ['a later, different answer'] } },
+      executedSpec: { acceptance: { observableTruths: ['what the last sitting was held to'] } },
     });
     // Read back through the API's own view, not raw SQL: a column nothing can read is a column
     // nobody notices going wrong, and the read path is half of what makes this a record.
-    const view = (await room(pid).getRun(pid, rid)) as { executedSpec?: { acceptance?: { observableTruths?: string[] } } };
-    expect(view.executedSpec?.acceptance?.observableTruths).toEqual(['the first answer']);
+    const view = (await room(pid).getRun(pid, rid)) as {
+      executedSpecs?: Array<{ acceptance?: { observableTruths?: string[] } }>;
+    };
+    expect(view.executedSpecs?.map((x) => x.acceptance?.observableTruths?.[0])).toEqual([
+      'the commission',
+      'what the last sitting was held to',
+    ]);
+  });
+
+  // The daemon re-sends until the frame lands (RUN-172), because this rides fire-and-forget
+  // telemetry and is sent when the spec resolves rather than repeatedly. Dedupe against the last
+  // entry is what makes that safe.
+  it('is a no-op when the same briefing arrives twice', async () => {
+    await seedRunner('rnr_x');
+    const rid = (await room(pid).createRun(pid, actor, {
+      kind: 'build', repoRef: 'r', agentTool: 'claude', runnerId: 'rnr_x',
+    })).id;
+    const spec = { acceptance: { observableTruths: ['once'] } };
+    await room(pid).recordRunTelemetry(pid, rid, { executedSpec: spec });
+    await room(pid).recordRunTelemetry(pid, rid, { executedSpec: spec });
+    const view = (await room(pid).getRun(pid, rid)) as { executedSpecs?: unknown[] };
+    expect(view.executedSpecs).toHaveLength(1);
   });
 
   // Null-means-no-news, like every other field on that frame: an ordinary spend tick must not
@@ -781,8 +801,7 @@ describe('the spec a run executed under', () => {
       executedSpec: { acceptance: { observableTruths: ['kept'] } },
     });
     await room(pid).recordRunTelemetry(pid, rid, { tokensUsed: 10 });
-    const row = await env.DB.prepare('SELECT executed_spec AS s FROM runs WHERE id = ?')
-      .bind(rid).first<{ s: string | null }>();
-    expect(row!.s).toContain('kept');
+    const view = (await room(pid).getRun(pid, rid)) as { executedSpecs?: unknown[] };
+    expect(JSON.stringify(view.executedSpecs)).toContain('kept');
   });
 });

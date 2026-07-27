@@ -219,10 +219,16 @@ type RunRow = {
 // DO-stub RPC return-type inference doesn't recurse on a large anonymous literal.
 export interface RunView {
   id: string;
-  /** The execution spec this run was actually briefed with (RUN-166) — what it was held to, as
-   *  distinct from whatever its task says now. Null for a run that executed under none, and for
-   *  every run that predates the column. */
-  executedSpec?: unknown;
+  /**
+   * Every execution spec this run was briefed with, in order (RUN-166/172) — what it was held to,
+   * as distinct from whatever its task says now.
+   *
+   * A list because a run can be briefed more than once: a park resumes and the spec may have been
+   * corrected while it waited, and a continued failed run is briefed afresh. The first entry is
+   * the commission; the last is what the final sitting was actually graded against. Empty for a
+   * run that executed under none, and for every run predating the column.
+   */
+  executedSpecs?: unknown[];
   projectId: string;
   runnerId: string | null;
   agentId: string | null;
@@ -2482,12 +2488,15 @@ export class ProjectRoom extends DurableObject<Env> {
   /** A stored spec, read leniently: a corrupt value degrades to null rather than failing the whole
    *  run view. The same posture `readExecutionSpec` takes, and for the same reason — one bad row
    *  must not make a run unreadable. */
-  private static parseSpec(raw: string | null): unknown {
-    if (!raw) return null;
+  private static parseSpecList(raw: string | null): unknown[] {
+    if (!raw) return [];
     try {
-      return JSON.parse(raw);
+      const v = JSON.parse(raw);
+      // Tolerates the single-object shape this column briefly held before RUN-172, so a row
+      // written in that window reads as a one-entry history rather than as corrupt.
+      return Array.isArray(v) ? v : [v];
     } catch {
-      return null;
+      return [];
     }
   }
 
@@ -2512,7 +2521,9 @@ export class ProjectRoom extends DurableObject<Env> {
       // answerable rather than merely stored: a column nothing can read is a column nobody
       // notices going wrong. Parsed leniently — a corrupt value degrades to null rather than
       // failing the whole run view, which is the same posture `readExecutionSpec` takes.
-      executedSpec: ProjectRoom.parseSpec(r.executed_spec),
+      // Every spec this run was briefed with, in order (RUN-172): the first is what it was
+      // commissioned with, the last is what its final sitting was held to.
+      executedSpecs: ProjectRoom.parseSpecList(r.executed_spec),
       targetBranch: r.target_branch,
       brief: r.brief,
       repoRef: r.repo_ref,
@@ -3403,15 +3414,29 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.env.DB.prepare('UPDATE runs SET model_usage = ? WHERE id = ? AND project_id = ?')
         .bind(val, runId, projectId).run();
     }
-    // WRITE-ONCE (RUN-166). What a run was briefed with is a fact about a moment that has passed,
-    // so a later frame must not overwrite it — a redelivered tick, or a daemon that reported twice,
-    // would otherwise replace the record with whatever it holds now, which is the very thing this
-    // column exists to stop being inferred. `WHERE executed_spec IS NULL` makes the first report
-    // the record and every later one a no-op.
+    // APPEND, deduped against the last entry (RUN-166, revised by RUN-172).
+    //
+    // Write-once was the first cut and it answered the wrong question. It was chosen for
+    // idempotency — a redelivered frame must not rewrite the record — but that quietly settled a
+    // different one: what a run briefed MORE THAN ONCE should say. A run can be. A park resumes and
+    // the spec may have been corrected while it waited (RUN-164); a continued failed run is briefed
+    // afresh. Write-once recorded the first and the run was then graded against the last, which is
+    // the mismatch this column exists to remove, one level up.
+    //
+    // A list answers both: the first entry is what the work was commissioned with, the last is what
+    // the final sitting was held to, and a third sitting does not force the choice again. Dedupe
+    // against the last entry keeps redelivery a no-op — which is also what lets the daemon re-send
+    // freely until the frame lands, since the record rides fire-and-forget telemetry.
     if (t.executedSpec != null) {
-      await this.env.DB.prepare(
-        'UPDATE runs SET executed_spec = ? WHERE id = ? AND project_id = ? AND executed_spec IS NULL',
-      ).bind(JSON.stringify(t.executedSpec), runId, projectId).run();
+      const row = await this.env.DB.prepare('SELECT executed_spec AS s FROM runs WHERE id = ? AND project_id = ?')
+        .bind(runId, projectId).first<{ s: string | null }>();
+      const history = ProjectRoom.parseSpecList(row?.s ?? null);
+      const incoming = JSON.stringify(t.executedSpec);
+      if (JSON.stringify(history.at(-1) ?? null) !== incoming) {
+        history.push(t.executedSpec);
+        await this.env.DB.prepare('UPDATE runs SET executed_spec = ? WHERE id = ? AND project_id = ?')
+          .bind(JSON.stringify(history), runId, projectId).run();
+      }
     }
   }
 
