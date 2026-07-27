@@ -764,10 +764,10 @@ describe('the spec a run executed under', () => {
     await room(pid).recordRunTelemetry(pid, rid, {
       executedSpec: { acceptance: { observableTruths: ['a later, different answer'] } },
     });
-    const row = await env.DB.prepare('SELECT executed_spec AS s FROM runs WHERE id = ?')
-      .bind(rid).first<{ s: string | null }>();
-    expect(row!.s).toContain('the first answer');
-    expect(row!.s).not.toContain('a later, different answer');
+    // Read back through the API's own view, not raw SQL: a column nothing can read is a column
+    // nobody notices going wrong, and the read path is half of what makes this a record.
+    const view = (await room(pid).getRun(pid, rid)) as { executedSpec?: { acceptance?: { observableTruths?: string[] } } };
+    expect(view.executedSpec?.acceptance?.observableTruths).toEqual(['the first answer']);
   });
 
   // Null-means-no-news, like every other field on that frame: an ordinary spend tick must not

@@ -209,6 +209,7 @@ type RunRow = {
   worktree_path: string | null;
   tokens_used: number | null; usd_spent: number | null; log_tail: string | null;
   model_usage: string | null;
+  executed_spec: string | null;
   plan_dispatch_id: string | null;
   created_by: string; created_at: string; updated_at: string;
   dispatched_at: string | null; started_at: string | null;
@@ -218,6 +219,10 @@ type RunRow = {
 // DO-stub RPC return-type inference doesn't recurse on a large anonymous literal.
 export interface RunView {
   id: string;
+  /** The execution spec this run was actually briefed with (RUN-166) — what it was held to, as
+   *  distinct from whatever its task says now. Null for a run that executed under none, and for
+   *  every run that predates the column. */
+  executedSpec?: unknown;
   projectId: string;
   runnerId: string | null;
   agentId: string | null;
@@ -2474,6 +2479,18 @@ export class ProjectRoom extends DurableObject<Env> {
   // daemon only *reports* transitions (RUN-7); this DO owns the truth.
   // ---------------------------------------------------------------------------
 
+  /** A stored spec, read leniently: a corrupt value degrades to null rather than failing the whole
+   *  run view. The same posture `readExecutionSpec` takes, and for the same reason — one bad row
+   *  must not make a run unreadable. */
+  private static parseSpec(raw: string | null): unknown {
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
   private runToWire(r: RunRow): RunView {
     return {
       id: r.id,
@@ -2491,6 +2508,11 @@ export class ProjectRoom extends DurableObject<Env> {
       verifiesRunId: r.verifies_run_id,
       // The plan this run serves (RUN-28) — the daemon uses it for the per-plan working branch.
       planKey: r.plan_key,
+      // The spec this run was actually briefed with (RUN-166). Read side, so the record is
+      // answerable rather than merely stored: a column nothing can read is a column nobody
+      // notices going wrong. Parsed leniently — a corrupt value degrades to null rather than
+      // failing the whole run view, which is the same posture `readExecutionSpec` takes.
+      executedSpec: ProjectRoom.parseSpec(r.executed_spec),
       targetBranch: r.target_branch,
       brief: r.brief,
       repoRef: r.repo_ref,
