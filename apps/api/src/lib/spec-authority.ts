@@ -53,6 +53,8 @@ export function refuseSpecWrite(writer: SpecWriter): SpecWriteRefusal | null {
 /** The message an agent gets. It names the door that IS open — a refusal with no alternative is a
  *  refusal an agent works around. */
 export const specWriteRefusalMessage = (r: SpecWriteRefusal): string =>
-  `a ${r.runKind} run does not rewrite its own task's execution spec: its lockedDecisions bind you ` +
-  'and its acceptance is what your work is judged against. If the spec is wrong, say so in a ' +
-  'comment (add_comment) and let a human or a scope run correct it.';
+  `a ${r.runKind} run does not rewrite execution specs — any of them, not just your own task's: ` +
+  'a spec\'s lockedDecisions bind you and its acceptance is what your work is judged against, and ' +
+  'nothing here can tell which task will end up judging it. If a spec is wrong, say so in a ' +
+  'comment (add_comment) and let a human or a scope run correct it. You may still give a spec to ' +
+  'a task you CREATE.';

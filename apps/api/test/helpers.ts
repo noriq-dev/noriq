@@ -113,7 +113,9 @@ export async function createRunAgent(
   kind: 'scope' | 'build' | 'verify',
   opts: { ownerEmail?: string; allowedTools?: string[] } = {},
 ): Promise<{ agentId: string; apiKey: string; runId: string; runnerId: string }> {
-  const email = opts.ownerEmail ?? 'agent-mint@example.com';
+  // Lowercased once, here: createUser lowercases the address, so an unnormalized key would give
+  // two spellings of one owner two cache entries and two runners.
+  const email = (opts.ownerEmail ?? 'agent-mint@example.com').toLowerCase();
   let ownerToken = runOwnerTokens.get(email);
   if (!ownerToken) {
     await createUser(email, email, 'longenough1', 'admin').catch(() => {});
@@ -127,10 +129,11 @@ export async function createRunAgent(
   const db = (env as unknown as { DB: D1Database }).DB;
   const owner = await db.prepare('SELECT id FROM users WHERE email = ?').bind(email).first<{ id: string }>();
   if (!owner) throw new Error(`createRunAgent: no such user ${email}`);
-  // Whole address, not a prefix: one runner per owner is the realistic shape, but a truncated
-  // key would silently map two owners onto the first one's runner and the second mint would
-  // then 404 depending on call order.
-  const runnerId = `rnr_fx_${email.replace(/[^a-z0-9]/gi, '_')}`;
+  // Hashed, not sanitized: one runner per owner is the realistic shape, but any lossy mapping
+  // from address to id (a prefix, or punctuation collapsed to `_`) lets two owners land on one
+  // runner, and `INSERT OR IGNORE` then keeps whichever ran first — so the second owner's mint
+  // 404s depending on test order. This is the only derivation that cannot do that.
+  const runnerId = `rnr_fx_${(await sha256HexTest(email)).slice(0, 16)}`;
   const runId = `run_fx${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
   await db.prepare('INSERT OR IGNORE INTO runners (id, label, owner_user_id) VALUES (?, ?, ?)')
     .bind(runnerId, runnerId, owner.id).run();

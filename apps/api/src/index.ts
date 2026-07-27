@@ -9,7 +9,7 @@ import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot, importSnapshot } from './backup';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, timingSafeEqual, verifyPassword, verifyPasswordConstantTime } from './lib/util';
 import { taskSearchFilters } from './lib/search';
-import type { ExecutionSpecInput } from '@noriq-dev/shared';
+import type { ExecutionSpecInput, RunStatus } from '@noriq-dev/shared';
 import { readExecutionSpec } from './lib/execution-spec';
 import { search, searchBackend, reindexProject, type SearchKind } from './search';
 import { answerQuestion, generationClient } from './ask';
@@ -25,7 +25,7 @@ import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
 import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
 import { z } from 'zod';
-import { AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget, normalizeProjectKey } from '@noriq-dev/shared';
+import { AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget, isTerminalRunStatus, normalizeProjectKey } from '@noriq-dev/shared';
 
 export { ProjectRoom } from './do/ProjectRoom';
 export { AgentSession } from './do/AgentSession';
@@ -2086,11 +2086,11 @@ app.post('/api/runs/:runId/agent', agentAuth, async (c) => {
   const b = parsed.data;
   const conn = c.var.connection!;
   const run = await c.env.DB.prepare(
-    `SELECT r.id, r.kind, r.project_id AS projectId, r.runner_id AS runnerId, r.agent_id AS agentId,
+    `SELECT r.id, r.kind, r.status, r.project_id AS projectId, r.runner_id AS runnerId, r.agent_id AS agentId,
             rn.owner_user_id AS owner
      FROM runs r LEFT JOIN runners rn ON rn.id = r.runner_id WHERE r.id = ?`,
   ).bind(runId).first<{
-    id: string; kind: string; projectId: string; runnerId: string | null;
+    id: string; kind: string; status: RunStatus; projectId: string; runnerId: string | null;
     agentId: string | null; owner: string | null;
   }>();
   // Same ownership test as steer-ack: the run must belong to a runner this user owns.
@@ -2107,6 +2107,18 @@ app.post('/api/runs/:runId/agent', agentAuth, async (c) => {
   // same run would mean two live processes could act as one identity, which is exactly the
   // ambiguity this task exists to remove.
   if (run.agentId) return c.json({ error: 'run already has an agent' }, 409);
+  // …and a run that is OVER gets none at all. The 409 above only covers a run that already
+  // minted one, so a run that reached a terminal status before its agent was created — a
+  // daemon restart reconciles dispatched runs to failed, and a human can cancel one in the
+  // same window — could still be handed a working credential with no process, no supervision
+  // and no budget behind it. Every terminal path takes an EXISTING credential away
+  // (retireRunAgent); this is the same rule pointed the other way, and without it that
+  // retirement is trivially undone by asking again. It also restores RUN-160: an agent whose
+  // run is not live has no attributable run kind, and a spec write we cannot attribute is
+  // permitted.
+  if (isTerminalRunStatus(run.status)) {
+    return c.json({ error: `run is already ${run.status} — it gets no agent` }, 409);
+  }
 
   const agentId = newId('agt');
   // The label is what a human reads in the dashboard; scope it to the run so two concurrent

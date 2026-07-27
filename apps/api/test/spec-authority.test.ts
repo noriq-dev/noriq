@@ -158,6 +158,11 @@ describe('rewriting an execution spec, end to end (RUN-160)', () => {
       executionSpec: { deferred: ['the bit I could not reach'] },
     });
     expect(made.isError).toBeFalsy();
+    // Not just "the call succeeded" — a silently dropped spec would satisfy that and leave the
+    // next agent with nothing, which is the outcome this permission exists to avoid.
+    const stored = await env.DB.prepare('SELECT execution_spec AS s FROM tasks WHERE id = ?')
+      .bind(made.body.id).first<{ s: string | null }>();
+    expect(stored!.s).toMatch(/the bit I could not reach/);
   });
 
   // The rule fails OPEN on an agent with no live run, and that is only defensible while "the run

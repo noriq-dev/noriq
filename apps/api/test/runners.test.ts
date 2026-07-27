@@ -305,6 +305,24 @@ describe('run agent creation (RUN-43)', () => {
     expect((await createAgentFor(ownerToken, 'run_a43b')).status).toBe(409);
   });
 
+  // The one-per-run rule only covers a run that already minted one. A run can reach a terminal
+  // status BEFORE its agent exists — a daemon restart reconciles dispatched runs to failed, and
+  // a human can cancel one in the same window — and issuing then hands out a working credential
+  // with no process, no supervision and no budget behind it. It would also undo retirement by
+  // simply asking again, and restore RUN-160's fail-open: an agent whose run is not live has no
+  // attributable run kind, and a spec write we cannot attribute to a live run is permitted.
+  it.each(['failed', 'done', 'cancelled'])('refuses a credential for a run that is already %s', async (status) => {
+    const runId = `run_term_${status}`;
+    await seedRun(runId);
+    await env.DB.prepare('UPDATE runs SET status = ? WHERE id = ?').bind(status, runId).run();
+    const res = await createAgentFor(ownerToken, runId);
+    expect(res.status).toBe(409);
+    expect(await res.text()).toMatch(new RegExp(`already ${status}`));
+    const row = await env.DB.prepare('SELECT agent_id AS agentId FROM runs WHERE id = ?').bind(runId)
+      .first<{ agentId: string | null }>();
+    expect(row!.agentId).toBeNull();
+  });
+
   it('refuses a run belonging to someone else’s runner', async () => {
     await seedRun('run_a43c');
     const intruder = await mintTokenForUser('runner-intruder@example.com');
