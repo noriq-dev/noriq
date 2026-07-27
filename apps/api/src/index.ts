@@ -9,6 +9,8 @@ import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot, importSnapshot } from './backup';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, timingSafeEqual, verifyPassword, verifyPasswordConstantTime } from './lib/util';
 import { taskSearchFilters } from './lib/search';
+import type { ExecutionSpecInput } from '@noriq-dev/shared';
+import { readExecutionSpec } from './lib/execution-spec';
 import { search, searchBackend, reindexProject, type SearchKind } from './search';
 import { answerQuestion, generationClient } from './ask';
 import { verifyUploadToken } from './lib/upload-token';
@@ -723,6 +725,14 @@ app.get('/api/tasks/:tid', userAuth, async (c) => {
   // wire SELECTs — a task with failed_at set reads as 'failed'. failedAt is already present.
   if (task.failed_at) task.status = 'failed';
   task.failedAt = task.failed_at;
+  // The execution spec (RUN-135) rides only on the DETAIL reads — a board snapshot ships every
+  // task in a project and renders none of this. `SELECT *` brought the raw JSON along, so the
+  // column is dropped rather than shipped beside its parsed form: unlike the scalars above, a
+  // duplicated spec doubles the payload for nothing.
+  const stored = readExecutionSpec(task.execution_spec, tid);
+  task.executionSpec = stored.spec;
+  if (stored.unreadable) task.executionSpecUnreadable = true;
+  delete task.execution_spec;
   const [comments, refs, attachments, taskTagRows, docRows] = await Promise.all([
     c.env.DB.prepare(
       `SELECT id, author_kind AS authorKind, author_id AS authorId, kind, body, status, parent_comment_id AS parentCommentId, created_at AS createdAt
@@ -789,7 +799,7 @@ app.delete('/api/projects/:pid/boards/:bid', userAuth, async (c) => {
 });
 
 app.post('/api/projects/:pid/tasks', userAuth, async (c) => {
-  const body = await c.req.json<{ title: string; body?: string; parentTaskId?: string; priority?: number; estimate?: number | null; dueAt?: string | null; dependsOn?: string[]; boardId?: string | null }>();
+  const body = await c.req.json<{ title: string; body?: string; parentTaskId?: string; priority?: number; estimate?: number | null; dueAt?: string | null; dependsOn?: string[]; boardId?: string | null; executionSpec?: ExecutionSpecInput | null }>();
   if (!body.title) return c.json({ error: 'title required' }, 400);
   const result = await room(c.env, c.req.param('pid')!).createTask(c.req.param('pid')!, humanActor(c), body);
   return c.json(result);

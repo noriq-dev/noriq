@@ -1,0 +1,21 @@
+-- RUN-135: a task may carry an execution spec — what a builder is told before it is allowed to
+-- spend anything (anticipated files, required reading, locked decisions, discretion, deferred
+-- work, and goal-backward acceptance criteria). The schema is `ExecutionSpec` in
+-- packages/shared/src/execution-spec.ts (RUN-134); this is where it lands.
+--
+-- ONE JSON COLUMN, not a table per list. The spec is read and written whole, and nothing queries
+-- across specs: no "which tasks anticipate src/foo.ts", no join, no aggregate. Normalising it
+-- would be six tables and six cascades in deleteProject to serve queries nobody makes. If a query
+-- across anticipated files is ever wanted, that is an index built from this column, not a reason
+-- to shred it now.
+--
+-- Additive and nullable, per the D1 constraint that every migration must be (FKs are enforced
+-- during apply and `tasks` has many inbound references, so the table can never be rebuilt).
+-- NULL means "no spec", which is what every existing row means and what a task created by any
+-- caller that predates this keeps meaning — no backfill, and none wanted. Nothing downstream
+-- distinguishes NULL from a stored-but-empty spec (`hasExecutionSpec` answers false to both);
+-- the column is NULL because that is what "no value" is, not to encode a distinction.
+--
+-- No index. Nothing filters or sorts on it, and an index on a JSON blob would cost writes to
+-- serve a query that does not exist.
+ALTER TABLE tasks ADD COLUMN execution_spec TEXT;

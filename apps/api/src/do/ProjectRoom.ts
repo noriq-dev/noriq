@@ -12,7 +12,8 @@ import {
 import { searchBackend, indexEntity, removeEntity, type SearchKind } from '../search';
 import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
-import { RunKind, AgentTool, RunStatus, type RunPhase, isTerminalRunStatus } from '@noriq-dev/shared';
+import { RunKind, AgentTool, RunStatus, type RunPhase, type ExecutionSpecInput, isTerminalRunStatus } from '@noriq-dev/shared';
+import { writeExecutionSpec } from '../lib/execution-spec';
 
 /**
  * ProjectRoom — one instance per project (idFromName(projectId)).
@@ -71,6 +72,9 @@ export interface CreateTaskInput {
   docIds?: string[];
   /** Permit minting genuinely-new tags past the near-duplicate guard (PLNR-194). */
   allowNewTags?: boolean;
+  /** What a builder is told before it spends anything (RUN-135). Omit or null = no spec, which
+   *  is what every task carried before this existed. Validated here, at the write seam. */
+  executionSpec?: ExecutionSpecInput | null;
 }
 
 export interface TaskPatch {
@@ -101,6 +105,9 @@ export interface TaskPatch {
   removeDocIds?: string[];
   /** Permit minting genuinely-new tags past the near-duplicate guard (PLNR-194). */
   allowNewTags?: boolean;
+  /** Replace the task's execution spec (RUN-135). Explicit null CLEARS it; omitting the key
+   *  leaves whatever is there, exactly like every other field in this patch. */
+  executionSpec?: ExecutionSpecInput | null;
 }
 
 type TaskRow = {
@@ -521,6 +528,12 @@ export class ProjectRoom extends DurableObject<Env> {
         .bind(pid)
         .first<{ key: string; n: number }>();
       if (!proj) throw new Error(`project ${pid} not found`);
+      // The execution spec validates FIRST — before anything durable happens (RUN-135).
+      // `blockConcurrencyWhile` serializes; it is not a transaction, so a throw part-way through
+      // leaves whatever already committed. Tag minting below is a real write (and emits
+      // `tag.created`), so validating after it would answer a bad spec with a freshly-minted tag
+      // and no task. Nothing here writes until the batch, so this is the safe place.
+      const executionSpec = writeExecutionSpec(input.executionSpec);
       const id = newId('task');
       const key = `${proj.key}-${proj.n}`;
       const now = nowIso();
@@ -567,9 +580,9 @@ export class ProjectRoom extends DurableObject<Env> {
       }
       const stmts = [
         this.env.DB.prepare(
-          `INSERT INTO tasks (id, project_id, key, milestone_id, board_id, parent_task_id, title, body, status, type, priority, estimate, due_at, "order", created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?)`,
-        ).bind(id, pid, key, input.milestoneId ?? null, boardId, input.parentTaskId ?? null, input.title, input.body ?? '', input.type ?? 'feature', input.priority ?? 2, input.estimate ?? null, input.dueAt ?? null, proj.n, now, now),
+          `INSERT INTO tasks (id, project_id, key, milestone_id, board_id, parent_task_id, title, body, status, type, priority, estimate, due_at, execution_spec, "order", created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).bind(id, pid, key, input.milestoneId ?? null, boardId, input.parentTaskId ?? null, input.title, input.body ?? '', input.type ?? 'feature', input.priority ?? 2, input.estimate ?? null, input.dueAt ?? null, executionSpec, proj.n, now, now),
         this.env.DB.prepare('UPDATE projects SET next_task_number = ? WHERE id = ?').bind(proj.n + 1, pid),
       ];
       for (const dep of depIds) {
@@ -595,6 +608,13 @@ export class ProjectRoom extends DurableObject<Env> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const task = await this.getTask(taskId);
+      // Same as createTask: the spec validates before ANY of this patch is applied (RUN-135).
+      // The tag and doc blocks below write and can return early, so a spec parsed at its own
+      // `sets.push` would answer `{tags:[...], executionSpec: <malformed>}` with the tags already
+      // changed and an error. `undefined` here means the patch did not mention the spec at all,
+      // which is distinct from an explicit null (clear it).
+      const executionSpec =
+        patch.executionSpec === undefined ? undefined : writeExecutionSpec(patch.executionSpec);
       // Consumed by the tag paths only — must not reach the generic field loop.
       const allowNewTags = patch.allowNewTags;
       delete patch.allowNewTags;
@@ -676,6 +696,16 @@ export class ProjectRoom extends DurableObject<Env> {
           sets.push(`${col} = ?`);
           binds.push(patch[k]);
         }
+      }
+      // The execution spec (RUN-135) is deliberately NOT in the list above: every field there
+      // binds its patch value straight through, and this one is an object that had to be
+      // validated and serialized before any of this ran. Left ON the patch rather than deleted,
+      // so a spec-only patch emits `task.updated` with `fields: ['executionSpec']` — a watcher
+      // has nothing else to key on. (A patch that ALSO changes status emits only
+      // `task.status_changed`, as it does for every other field; that is not new here.)
+      if (executionSpec !== undefined) {
+        sets.push('execution_spec = ?');
+        binds.push(executionSpec);
       }
       // Re-parent (PLNR-89): resolve the new parent by id-or-key, reject self-parenting
       // and cycles (the new parent must not be the task or one of its descendants).
@@ -3420,12 +3450,23 @@ export class ProjectRoom extends DurableObject<Env> {
           tags?: string[]; milestoneId?: string; type?: string; boardId?: string; docIds?: string[];
           /** Extra ad-hoc edges beyond the enforced phase chain — existing task ids or keys. */
           dependsOn?: string[];
+          /** This task's execution spec (RUN-135). PER TASK, not per phase and not in
+           *  `taskDefaults`: a spec names the files, decisions and acceptance criteria of ONE
+           *  piece of work, so a shared default would be wrong for every task that inherited it. */
+          executionSpec?: ExecutionSpecInput | null;
         }>;
       }>;
     },
   )  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
+      // EVERY task's spec validates before the plan row exists (RUN-135). A plan is written phase
+      // by phase and task by task, and this is not a transaction — a malformed spec on the fifth
+      // task would otherwise fail the call and leave a plan, its phases, and four tasks behind,
+      // which is worse than either outcome the caller expects.
+      for (const ph of input.phases) {
+        for (const nt of ph.newTasks ?? []) writeExecutionSpec(nt.executionSpec);
+      }
       const planId = newId('pln');
       const status = input.proposed ? 'proposed' : 'active';
       await this.env.DB.prepare(
@@ -3469,6 +3510,7 @@ export class ProjectRoom extends DurableObject<Env> {
             boardId: nt.boardId ?? d.boardId,
             docIds: nt.docIds ?? d.docIds,
             dependsOn,
+            executionSpec: nt.executionSpec,
           });
           taskIds.push(created.id);
         }

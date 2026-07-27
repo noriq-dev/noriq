@@ -15,6 +15,8 @@ import {
   userCanAccessProject,
 } from './lib/visibility';
 import { taskSearchFilters } from './lib/search';
+import { ExecutionSpec, type ExecutionSpecInput } from '@noriq-dev/shared';
+import { readExecutionSpec } from './lib/execution-spec';
 import { search, searchBackend, reindexProject } from './search';
 import { nearDupeGroups } from './lib/tags';
 import { DOC_SKILL_MD } from './skill-docs';
@@ -522,6 +524,11 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
             estimate: z.number().int().min(0).optional(),
             type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
             tags: z.array(z.string()).optional(),
+            // A template is a plan skeleton, and a spec is part of a task's shape rather than one
+            // of its concrete ids (RUN-135) — anticipated paths, decisions and acceptance criteria
+            // travel to any project. Omitting it here would silently drop the most valuable half
+            // of a saved plan: zod strips unknown keys before this is serialized.
+            executionSpec: ExecutionSpec.nullish().describe('This task\'s execution spec — travels with the template'),
           })).min(1),
         })).min(1).max(12),
       }).describe('The skeleton — same shape create_plan takes, minus concrete ids (no taskIds/milestones: those are per-project)'),
@@ -570,7 +577,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       const spec = JSON.parse(row.spec) as {
         title: string; description?: string; body?: string;
         taskDefaults?: { priority?: number; estimate?: number; type?: string; tags?: string[] };
-        phases: Array<{ title: string; body?: string; newTasks: Array<{ title: string; body?: string; priority?: number; estimate?: number; type?: string; tags?: string[] }> }>;
+        phases: Array<{ title: string; body?: string; newTasks: Array<{ title: string; body?: string; priority?: number; estimate?: number; type?: string; tags?: string[]; executionSpec?: ExecutionSpecInput | null }> }>;
       };
       return room(env, projectId).createPlan(projectId, actor, {
         title: title ?? spec.title,
@@ -955,6 +962,15 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       if (task.failed_at) task.status = 'failed';
       task.failedAt = task.failed_at;
       const id = String(task.id);
+      // The execution spec (RUN-135) — what this task tells a builder before it spends anything.
+      // Only on this DETAIL read: `next_claimable` and the list surfaces answer "which task", and
+      // shipping every spec through them would be the whole feature's payload paid on every poll.
+      // `SELECT t.*` brought the raw JSON along, so the column is dropped rather than sent beside
+      // its parsed form.
+      const storedSpec = readExecutionSpec(task.execution_spec, id);
+      task.executionSpec = storedSpec.spec;
+      if (storedSpec.unreadable) task.executionSpecUnreadable = true;
+      delete task.execution_spec;
       // Comment history is unbounded; cap it so a long-lived task can't spill the result.
       // Open/acknowledged (what you must act on) always come first and in full; the resolved
       // tail is capped to the most recent COMMENT_CAP, with `moreResolvedComments` for the rest.
@@ -1562,6 +1578,9 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
             type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
             tags: z.array(z.string()).optional(),
             dependsOn: z.array(z.string()).optional().describe('Ad-hoc extra edges beyond the enforced phase chain — existing task ids or keys'),
+            executionSpec: ExecutionSpec.nullish().describe(
+              'What a builder is told before it starts THIS task: anticipatedFiles, requiredReading, lockedDecisions (settled, do not relitigate), discretion (where it may choose), deferred (explicitly not this task), and acceptance (observableTruths / artifacts / links). Every field optional. Per task, never in taskDefaults — a spec names one piece of work.',
+            ),
           })).optional(),
         }),
       ).min(1).max(12),
