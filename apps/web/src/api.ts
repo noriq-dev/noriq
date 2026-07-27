@@ -398,6 +398,9 @@ export interface ApiRunLogSegment {
   seq: number;
   role: 'agent' | 'reviewer' | 'verify' | 'system';
   round: number | null;
+  /** Which step of a decomposed run was speaking (RUN-150). Null for an undecomposed run — most
+   *  of them — and for every segment written before the column existed. */
+  step: string | null;
   text: string;
   at: string;
 }

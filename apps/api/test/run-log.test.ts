@@ -58,6 +58,30 @@ describe('the run transcript (RUN-74)', () => {
     expect(segments[5]).toMatchObject({ round: 2 });
   });
 
+  // RUN-150. A five-step run read as one undifferentiated stream, so an operator watching it had
+  // no idea what was actually happening — which is the whole reason a decomposition is worth
+  // watching. The step rides ALONGSIDE the round rather than replacing it: a chain's step three can
+  // still be on its second reviewer round, and one label could not say which.
+  it('carries which step spoke, alongside the reviewer round', async () => {
+    const r3 = (await room(pid).createRun(pid, actor, {
+      kind: 'build', repoRef: 'r', agentTool: 'claude', runnerId: 'rnr_rl',
+    })).id;
+    await room(pid).appendRunLog(pid, r3, [
+      { seq: 0, role: 'agent', round: null, step: 's1', text: 'landing the contract', at: '2026-07-16T23:00:00.000Z' },
+      { seq: 1, role: 'agent', round: null, step: 's2', text: 'consuming it', at: '2026-07-16T23:00:00.000Z' },
+      { seq: 2, role: 'reviewer', round: 2, step: 's2', text: 'VERDICT: PASS', at: '2026-07-16T23:00:00.000Z' },
+    ]);
+    const { segments } = await room(pid).getRunLog(pid, r3);
+    expect(segments.map((x) => x.step)).toEqual(['s1', 's2', 's2']);
+    expect(segments[2]).toMatchObject({ round: 2, step: 's2' });
+  });
+
+  // Most runs are undecomposed, and every segment written before the column existed has no step.
+  it('is null for a run with no steps, rather than absent or empty', async () => {
+    const { segments } = await room(pid).getRunLog(pid, runId);
+    expect(segments.every((x) => x.step === null)).toBe(true);
+  });
+
   it('redelivery is a no-op — (run_id, seq) OR IGNORE, the same idempotency every daemon frame gets', async () => {
     await room(pid).appendRunLog(pid, runId, [seg(2, 'reviewer', 'REPLAYED DIFFERENT TEXT', 1)]);
     const { segments } = await room(pid).getRunLog(pid, runId);

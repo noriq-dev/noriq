@@ -3391,7 +3391,7 @@ export class ProjectRoom extends DurableObject<Env> {
   async appendRunLog(
     projectId: string,
     runId: string,
-    segments: Array<{ seq: number; role: string; round?: number | null; text: string; at: string }>,
+    segments: Array<{ seq: number; role: string; round?: number | null; step?: string | null; text: string; at: string }>,
   ): Promise<void> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
@@ -3403,14 +3403,14 @@ export class ProjectRoom extends DurableObject<Env> {
         .filter((s) => s.seq < CAP)
         .map((s) =>
           this.env.DB.prepare(
-            'INSERT OR IGNORE INTO run_log_segments (run_id, seq, role, round, text, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-          ).bind(runId, s.seq, s.role, s.round ?? null, s.text, s.at),
+            'INSERT OR IGNORE INTO run_log_segments (run_id, seq, role, round, step, text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          ).bind(runId, s.seq, s.role, s.round ?? null, s.step ?? null, s.text, s.at),
         );
       if (segments.some((s) => s.seq >= CAP)) {
         stmts.push(
           this.env.DB.prepare(
-            'INSERT OR IGNORE INTO run_log_segments (run_id, seq, role, round, text, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-          ).bind(runId, CAP, 'system', null, '… transcript truncated (per-run segment cap reached)', nowIso()),
+            'INSERT OR IGNORE INTO run_log_segments (run_id, seq, role, round, step, text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          ).bind(runId, CAP, 'system', null, null, '… transcript truncated (per-run segment cap reached)', nowIso()),
         );
       }
       if (stmts.length) await this.env.DB.batch(stmts);
@@ -3421,12 +3421,28 @@ export class ProjectRoom extends DurableObject<Env> {
   async getRunLog(
     projectId: string,
     runId: string,
-  ): Promise<{ segments: Array<{ seq: number; role: string; round: number | null; text: string; at: string }> }> {
+  ): Promise<{
+    segments: Array<{
+      seq: number;
+      role: string;
+      round: number | null;
+      step: string | null;
+      text: string;
+      at: string;
+    }>;
+  }> {
     await this.setPid(projectId);
     const { results } = await this.env.DB.prepare(
-      `SELECT seq, role, round, text, created_at AS at FROM run_log_segments
+      `SELECT seq, role, round, step, text, created_at AS at FROM run_log_segments
        WHERE run_id = ? ORDER BY seq LIMIT 2001`,
-    ).bind(runId).all<{ seq: number; role: string; round: number | null; text: string; at: string }>();
+    ).bind(runId).all<{
+      seq: number;
+      role: string;
+      round: number | null;
+      step: string | null;
+      text: string;
+      at: string;
+    }>();
     return { segments: results };
   }
 
