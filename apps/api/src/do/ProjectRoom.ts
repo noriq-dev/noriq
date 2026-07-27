@@ -3357,6 +3357,8 @@ export class ProjectRoom extends DurableObject<Env> {
     t: {
       tokensUsed?: number | null; usdSpent?: number | null; logTail?: string | null; phase?: RunPhase | null;
       modelUsage?: Record<string, unknown> | null;
+      /** The spec this run was actually briefed with (RUN-166) — reported once, then null. */
+      executedSpec?: unknown | null;
     },
   ): Promise<void> {
     await this.setPid(projectId);
@@ -3378,6 +3380,16 @@ export class ProjectRoom extends DurableObject<Env> {
       const val = Object.keys(t.modelUsage).length ? JSON.stringify(t.modelUsage) : null;
       await this.env.DB.prepare('UPDATE runs SET model_usage = ? WHERE id = ? AND project_id = ?')
         .bind(val, runId, projectId).run();
+    }
+    // WRITE-ONCE (RUN-166). What a run was briefed with is a fact about a moment that has passed,
+    // so a later frame must not overwrite it — a redelivered tick, or a daemon that reported twice,
+    // would otherwise replace the record with whatever it holds now, which is the very thing this
+    // column exists to stop being inferred. `WHERE executed_spec IS NULL` makes the first report
+    // the record and every later one a no-op.
+    if (t.executedSpec != null) {
+      await this.env.DB.prepare(
+        'UPDATE runs SET executed_spec = ? WHERE id = ? AND project_id = ? AND executed_spec IS NULL',
+      ).bind(JSON.stringify(t.executedSpec), runId, projectId).run();
     }
   }
 

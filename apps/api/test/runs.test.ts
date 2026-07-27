@@ -25,6 +25,7 @@ interface RoomRpc {
   getRun(projectId: string, runId: string): Promise<RunView>;
   claimTask(projectId: string, actor: Actor, taskId: string): Promise<unknown>;
   updateTask(projectId: string, actor: Actor, taskId: string, patch: { status?: string }): Promise<{ ok: boolean; key: string }>;
+  recordRunTelemetry(projectId: string, runId: string, t: Record<string, unknown>): Promise<void>;
 }
 const room = (projectId: string) =>
   appEnv.PROJECT_ROOM.get(appEnv.PROJECT_ROOM.idFromName(projectId)) as unknown as RoomRpc;
@@ -743,5 +744,45 @@ describe('continue a failed run — reopenRun (PLNR-180)', () => {
       expect(res.status).toBe(409);
       expect(JSON.stringify(await res.json())).toContain('only a failed run');
     });
+  });
+});
+
+
+// RUN-166: what a run was actually briefed with, kept with the run.
+describe('the spec a run executed under', () => {
+  it('is written once and never replaced by a later frame', async () => {
+    await seedRunner('rnr_x');
+    const rid = (await room(pid).createRun(pid, actor, {
+      kind: 'build', repoRef: 'r', agentTool: 'claude', runnerId: 'rnr_x',
+    })).id;
+    await room(pid).recordRunTelemetry(pid, rid, {
+      executedSpec: { acceptance: { observableTruths: ['the first answer'] } },
+    });
+    // A redelivered frame, or a daemon reporting again later, must not replace it: what a run was
+    // briefed with is a fact about a moment that has passed, and letting a later view overwrite it
+    // rebuilds the very inference this column exists to remove.
+    await room(pid).recordRunTelemetry(pid, rid, {
+      executedSpec: { acceptance: { observableTruths: ['a later, different answer'] } },
+    });
+    const row = await env.DB.prepare('SELECT executed_spec AS s FROM runs WHERE id = ?')
+      .bind(rid).first<{ s: string | null }>();
+    expect(row!.s).toContain('the first answer');
+    expect(row!.s).not.toContain('a later, different answer');
+  });
+
+  // Null-means-no-news, like every other field on that frame: an ordinary spend tick must not
+  // blank the record.
+  it('is untouched by a telemetry tick that carries none', async () => {
+    await seedRunner('rnr_x');
+    const rid = (await room(pid).createRun(pid, actor, {
+      kind: 'build', repoRef: 'r', agentTool: 'claude', runnerId: 'rnr_x',
+    })).id;
+    await room(pid).recordRunTelemetry(pid, rid, {
+      executedSpec: { acceptance: { observableTruths: ['kept'] } },
+    });
+    await room(pid).recordRunTelemetry(pid, rid, { tokensUsed: 10 });
+    const row = await env.DB.prepare('SELECT executed_spec AS s FROM runs WHERE id = ?')
+      .bind(rid).first<{ s: string | null }>();
+    expect(row!.s).toContain('kept');
   });
 });

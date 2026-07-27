@@ -13,7 +13,7 @@ const actor: Actor = { kind: 'human', id: 'usr_rl', name: 'Log Tester' };
 interface RoomRpc {
   createRun(projectId: string, actor: Actor, input: Record<string, unknown>): Promise<{ id: string }>;
   appendRunLog(projectId: string, runId: string, segments: Array<Record<string, unknown>>): Promise<void>;
-  getRunLog(projectId: string, runId: string): Promise<{ segments: Array<{ seq: number; role: string; round: number | null; text: string }> }>;
+  getRunLog(projectId: string, runId: string): Promise<{ segments: Array<{ seq: number; role: string; round: number | null; step: string | null; text: string }> }>;
 }
 const room = (pid: string) =>
   appEnv.PROJECT_ROOM.get(appEnv.PROJECT_ROOM.idFromName(pid)) as unknown as RoomRpc;
@@ -23,7 +23,7 @@ let pid: string;
 let runId: string;
 
 const seg = (seq: number, role: string, text: string, round: number | null = null) => ({
-  seq, role, round, text, at: '2026-07-16T23:00:00.000Z',
+  seq, role, round, step: null as string | null, text, at: '2026-07-16T23:00:00.000Z',
 });
 
 beforeAll(async () => {
