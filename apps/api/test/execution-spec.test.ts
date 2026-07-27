@@ -157,6 +157,15 @@ describe('ExecutionSpec — the full shape', () => {
     expect(() => ExecutionSpec.parse({ steps: [{ id: 's1' }] })).toThrow();
   });
 
+  // The id is what a transcript segment is labelled with, and the run.log frame caps that label at
+  // 64. An id the wire refuses would validate here and then make the server silently drop every
+  // segment the step ever emitted — transcript frames are fire-and-forget, so nothing would retry
+  // and nothing would say so. It is an identifier, not prose.
+  it('bounds the step id to what the transcript frame will carry', () => {
+    expect(() => ExecutionSpec.parse({ steps: [{ id: 'x'.repeat(64), title: 't' }] })).not.toThrow();
+    expect(() => ExecutionSpec.parse({ steps: [{ id: 'x'.repeat(65), title: 't' }] })).toThrow();
+  });
+
   // Orientation only — nothing branches on it today. `modify` is the default because it is both
   // the common case and the conservative one.
   it('defaults a file with no declared change to modify, and refuses an unknown one', () => {
