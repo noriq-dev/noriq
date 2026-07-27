@@ -3300,13 +3300,25 @@ export class ProjectRoom extends DurableObject<Env> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const { results } = await this.env.DB.prepare(
-        "SELECT id, status FROM runs WHERE project_id = ? AND runner_id = ? AND status IN ('dispatched','running','blocked')",
-      ).bind(projectId, runnerId).all<{ id: string; status: string }>();
+        `SELECT id, status, agent_id AS agentId FROM runs
+         WHERE project_id = ? AND runner_id = ? AND status IN ('dispatched','running','blocked')`,
+      ).bind(projectId, runnerId).all<{ id: string; status: string; agentId: string | null }>();
       const now = nowIso();
       for (const r of results) {
         const exit = JSON.stringify({ outcome: 'failed', code: null, signal: null, reason: 'daemon_restart', finishedAt: now });
         await this.env.DB.prepare("UPDATE runs SET status = 'failed', exit = ?, updated_at = ? WHERE id = ?")
           .bind(exit, now, r.id).run();
+        // This path writes a TERMINAL status directly instead of going through transitionRun,
+        // so it has to do transitionRun's retirement itself. Without it a daemon restart left
+        // every orphaned run's credential valid for the rest of its 7-day TTL — a token with no
+        // process, no supervision and no budget behind it, which is precisely what
+        // retireRunAgent exists to prevent.
+        //
+        // It also silently widened RUN-160: `runKindOf` finds no live run for such an agent, and
+        // a spec write it cannot attribute to a live run is PERMITTED. That fail-open is only
+        // defensible while "the run ended" implies "the credential died" — and here it did not,
+        // so a reconciled build agent could rewrite the spec it had just been judged against.
+        if (r.agentId) await this.retireRunAgent(r.agentId);
         await this.emit(actor, 'run.status_changed', 'run', r.id, { from: r.status, to: 'failed', reason: 'daemon_restart' });
       }
       return { failed: results.length };

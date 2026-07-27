@@ -69,11 +69,13 @@ describe('claim arbiter under load', () => {
     );
     const elapsed = Date.now() - start;
     expect(results.filter((r) => !r.isError)).toHaveLength(RACERS);
-    // Every claim is exclusive and attributed to the right agent.
-    const proj = await mcpCall(agents[0]!.apiKey, 'get_project', { projectId });
+    // Every claim is exclusive and attributed to the right agent. Read it back through get_task,
+    // not get_project: that surface is orientation and returns only the P4 still-open tasks, so
+    // these default-priority fixtures were never in its list — `find` returned undefined and the
+    // assertion could not fail for the reason it was written to catch.
     for (let i = 0; i < RACERS; i++) {
-      const row = proj.body.tasks.find((x: { id: string }) => x.id === tasks[i]);
-      expect(row.claimedBy).toBe(agents[i]!.id);
+      const got = await mcpCall(agents[0]!.apiKey, 'get_task', { taskId: tasks[i]! });
+      expect(got.body.task.claimedBy).toBe(agents[i]!.id);
     }
     // eslint-disable-next-line no-console
     console.info(`[load] parallel claims: ${RACERS}/${RACERS} in ${elapsed}ms`);
@@ -89,10 +91,10 @@ describe('claim arbiter under load', () => {
       const rel = await mcpCall(holder.apiKey, 'release_task', { projectId, taskId: t.body.id, toStatus: 'todo' });
       expect(rel.isError).toBe(false);
     }
-    const proj = await mcpCall(agents[0]!.apiKey, 'get_project', { projectId });
-    const row = proj.body.tasks.find((x: { id: string }) => x.id === t.body.id);
-    expect(row.claimedBy).toBeNull();
-    expect(row.status).toBe('todo');
+    // get_task, for the same reason as above — get_project carries only the P4 open tasks.
+    const got = await mcpCall(agents[0]!.apiKey, 'get_task', { taskId: t.body.id });
+    expect(got.body.task.claimedBy).toBeNull();
+    expect(got.body.task.status).toBe('todo');
   }, 30000);
 });
 

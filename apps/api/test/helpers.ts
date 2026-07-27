@@ -82,6 +82,87 @@ export async function createAgent(name: string, role: 'orchestrator' | 'worker' 
   return { id: set.body.actingAs.id as string, apiKey };
 }
 
+// ---------------------------------------------------------------------------
+// Acting as a RUNNER-SPAWNED agent (RUN-160).
+// ---------------------------------------------------------------------------
+
+const runOwnerTokens = new Map<string, string>();
+
+/**
+ * An agent with `agents.kind = 'agent'`, bound to a live run of a given kind, and the token that
+ * IS it.
+ *
+ * `createAgent` above cannot produce one and never will: that path mints COPILOTS, held there by
+ * a filter in `resolveSessionAgent` whose whole job is to stop a runner's agent being adopted by
+ * whoever presents a session id. The two identities are reached differently, too — a copilot is
+ * resolved per MCP session, while a run agent rides a token BOUND to it (`connection.boundAgent`)
+ * and no session can move it. So a test that needs to act as a build agent has to walk the real
+ * runner path: own a runner, seed the run, POST /api/runs/:id/agent. That is what this does, and
+ * walking it rather than seeding `agents` directly is the point — a fixture that hand-writes the
+ * row it wants would stop telling us whether the endpoint still hands out what it claims to.
+ *
+ * The owner defaults to the user `createAgent` mints under, so a project created by a copilot in
+ * the same suite is reachable with no extra grant: the endpoint refuses a run outside the
+ * connection's authorized projects (RUN-38), and that check is not decorative.
+ *
+ * `kind` is the three the schema allows — 0018's CHECK constrains `runs.kind` — so a test asking
+ * for a kind that cannot exist fails at the type, not with an opaque D1 error.
+ */
+export async function createRunAgent(
+  projectId: string,
+  kind: 'scope' | 'build' | 'verify',
+  opts: { ownerEmail?: string; allowedTools?: string[] } = {},
+): Promise<{ agentId: string; apiKey: string; runId: string; runnerId: string }> {
+  const email = opts.ownerEmail ?? 'agent-mint@example.com';
+  let ownerToken = runOwnerTokens.get(email);
+  if (!ownerToken) {
+    await createUser(email, email, 'longenough1', 'admin').catch(() => {});
+    ownerToken = await mintTokenForUser(email);
+    runOwnerTokens.set(email, ownerToken);
+  }
+  // Re-authorized on every call, not just at mint: the project under test is almost always
+  // created after the token, and a token scoped to nothing turns the mint into a 403 (RUN-38).
+  await authorizeForAllProjects(ownerToken);
+
+  const db = (env as unknown as { DB: D1Database }).DB;
+  const owner = await db.prepare('SELECT id FROM users WHERE email = ?').bind(email).first<{ id: string }>();
+  if (!owner) throw new Error(`createRunAgent: no such user ${email}`);
+  // Whole address, not a prefix: one runner per owner is the realistic shape, but a truncated
+  // key would silently map two owners onto the first one's runner and the second mint would
+  // then 404 depending on call order.
+  const runnerId = `rnr_fx_${email.replace(/[^a-z0-9]/gi, '_')}`;
+  const runId = `run_fx${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+  await db.prepare('INSERT OR IGNORE INTO runners (id, label, owner_user_id) VALUES (?, ?, ?)')
+    .bind(runnerId, runnerId, owner.id).run();
+  // Plain INSERT, not OR IGNORE: a seed that half-writes has to fail HERE rather than resurface
+  // as a mystery 404 from the endpoint under test.
+  await db.prepare(
+    `INSERT INTO runs (id, project_id, runner_id, kind, repo_ref, agent_tool, status, created_by)
+     VALUES (?, ?, ?, ?, 'repo_fx', 'claude', 'dispatched', ?)`,
+  ).bind(runId, projectId, runnerId, kind, owner.id).run();
+
+  const res = await SELF.fetch(`https://noriq.test/api/runs/${runId}/agent`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${ownerToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(opts.allowedTools ? { allowedTools: opts.allowedTools } : {}),
+  });
+  if (res.status !== 200) {
+    throw new Error(`createRunAgent: POST /api/runs/${runId}/agent → ${res.status}: ${await res.text()}`);
+  }
+  const body = (await res.json()) as { agentId: string; token: string };
+  return { agentId: body.agentId, apiKey: body.token, runId, runnerId };
+}
+
+/** The ProjectRoom for a project, for tests that need to drive a transition the HTTP surface
+ *  does not expose (run lifecycle, reconciliation). */
+export function projectRoom<T>(projectId: string): T {
+  const appEnv = env as unknown as { PROJECT_ROOM: DurableObjectNamespace };
+  return appEnv.PROJECT_ROOM.get(appEnv.PROJECT_ROOM.idFromName(projectId)) as unknown as T;
+}
+
+/** What a test means when it says "the system did this", not a person. */
+export const SYSTEM_ACTOR = { kind: 'system', id: 'system', name: 'system' };
+
 /** OAuth-mint an access token bound to a SPECIFIC user (createAgent mints all agents
  *  under one shared user). Registers a throwaway client and runs the full flow with
  *  that user's cookie — used for genuine cross-tenant tests. */

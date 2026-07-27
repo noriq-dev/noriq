@@ -925,6 +925,39 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     }),
   );
 
+  /**
+   * The two task edits a runner-spawned agent must not make to work it is being judged on.
+   *
+   * Hoisted out of `update_task` because `update_tasks` applies the very same patch, and a
+   * one-element `taskIds` is the same call by another name — a guard that lives on the singular
+   * tool is not a guard, it is a detour. Both doors close here or neither does.
+   *
+   * Copilots and humans are untouched: a human overriding a status or correcting a spec is the
+   * point of both fields.
+   */
+  const refuseSelfJudgingEdits = async (patch: { status?: unknown; executionSpec?: unknown }) => {
+    if (agent.kind !== 'agent') return;
+    // A runner-spawned agent must not move its task's status (PLNR-192). RUN-83 took
+    // release_task off the build floor so the RUN's terminal outcome owns the move
+    // (settleAnchorTask: gate passed → review, failed → failed) — but this field was the
+    // adjacent door: a builder that "finished" moved its task to review, the gate then
+    // failed, and the settle's don't-stomp-a-human guard left the task stranded in review.
+    // Same discriminator as the RUN-47 tool floor.
+    if (patch.status !== undefined) {
+      throw new Error(
+        "run agents don't set task status: your run's outcome moves the task when it ends " +
+          '(gate passed → review, failed → failed). Drop the status field; the other edits are fine.',
+      );
+    }
+    // A BUILD or VERIFY agent must not rewrite the spec it is being held to (RUN-160) — the
+    // decision itself lives in `refuseSpecWrite`, where it can be reasoned about and tested
+    // without a live MCP session.
+    if (patch.executionSpec !== undefined) {
+      const refusal = refuseSpecWrite({ actorKind: agent.kind, runKind: await runKindOf(env, agent.id) });
+      if (refusal) throw new Error(specWriteRefusalMessage(refusal));
+    }
+  };
+
   defineTool(
     'update_task',
     'Edit task fields. For claim-related status changes prefer claim_task/release_task; setting status directly here is a supervisor-style override. `executionSpec` REPLACES the whole spec (null clears it; omit to leave it alone) — there is no field-level merge, so read it first with get_task and send it back complete. ' +
@@ -952,28 +985,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       executionSpec: ExecutionSpec.nullish(),
     },
     tool(async ({ projectId, taskId, ...patch }) => {
-      // A runner-spawned agent must not move its task's status (PLNR-192). RUN-83 took
-      // release_task off the build floor so the RUN's terminal outcome owns the move
-      // (settleAnchorTask: gate passed → review, failed → failed) — but this field was the
-      // adjacent door: a builder that "finished" moved its task to review, the gate then
-      // failed, and the settle's don't-stomp-a-human guard left the task stranded in review.
-      // Same discriminator as the RUN-47 tool floor; copilots and humans are unchanged.
-      if (agent.kind === 'agent' && patch.status !== undefined) {
-        throw new Error(
-          "run agents don't set task status: your run's outcome moves the task when it ends " +
-            '(gate passed → review, failed → failed). Drop the status field; the other edits are fine.',
-        );
-      }
-      // A BUILD or VERIFY agent must not rewrite the spec it is being held to (RUN-160) — the
-      // decision itself lives in `refuseSpecWrite`, where it can be reasoned about and tested
-      // without a live MCP session.
-      if (patch.executionSpec !== undefined) {
-        const refusal = refuseSpecWrite({
-          actorKind: agent.kind,
-          runKind: agent.kind === 'agent' ? await runKindOf(env, agent.id) : null,
-        });
-        if (refusal) throw new Error(specWriteRefusalMessage(refusal));
-      }
+      await refuseSelfJudgingEdits(patch);
       return room(env, projectId).updateTask(projectId, actor, await resolveTaskId(env, projectId, taskId), patch);
     }),
   );
@@ -1008,6 +1020,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     },
     tool(async ({ projectId, taskIds, set }) => {
       if (!Object.keys(set).length) throw new Error('set is empty — nothing to apply');
+      // Before the loop, not inside it: `set` is ONE patch, so a forbidden field makes the whole
+      // call wrong, and refusing per task would report the same refusal N times while the
+      // permitted fields of that same patch had already landed on the tasks reached first.
+      await refuseSelfJudgingEdits(set);
       const r = room(env, projectId);
       const results: Array<{ taskId: string; key?: string; ok: boolean; error?: string }> = [];
       for (const tid of taskIds) {

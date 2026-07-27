@@ -9,6 +9,16 @@
  * rather than one more `agent.kind === 'agent'` check: a SCOPE run authoring specs for the tasks
  * it files is the entire point of the field, and the runner's planner stage is built on it. The
  * discriminator is what the run was spawned to DO, not that it was spawned.
+ *
+ * **Scope, stated plainly: this is a rule about the ACTOR, not about one task.** A build or verify
+ * agent may not rewrite ANY task's spec, not merely its own anchor's. That is deliberate and it is
+ * the narrower thing that is wrong: nothing here can tell which task will end up judging the work
+ * — a verify run grades a different run's output, a parent's acceptance criteria bind its
+ * children (RUN-148), and a sibling's spec can be edited to move a shared standard. Scoping to
+ * the anchor would leave every one of those open while reading as if it were closed. The cost is
+ * one real friction: an agent that wants to hand follow-up work a spec must do it when it CREATES
+ * the task, which stays unguarded on purpose — writing a contract for work nobody has started is
+ * not the same act as editing the one you are being measured by.
  */
 
 /** What the caller knows about the actor. `runKind` is null for a copilot, for a human, and for a
