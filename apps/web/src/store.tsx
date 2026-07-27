@@ -443,6 +443,7 @@ export function useAppStore() {
         type: t.type,
         openComments: t.openComments,
         archivedAt: t.archivedAt,
+        specPlanned: Boolean(t.specPlanned),
         comments: t.id === selectedTaskId ? comments : [],
       };
     });

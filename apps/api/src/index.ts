@@ -9,6 +9,8 @@ import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot, importSnapshot } from './backup';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, timingSafeEqual, verifyPassword, verifyPasswordConstantTime } from './lib/util';
 import { taskSearchFilters } from './lib/search';
+import type { ExecutionSpecInput, RunStatus } from '@noriq-dev/shared';
+import { readExecutionSpec } from './lib/execution-spec';
 import { search, searchBackend, reindexProject, type SearchKind } from './search';
 import { answerQuestion, generationClient } from './ask';
 import { verifyUploadToken } from './lib/upload-token';
@@ -23,7 +25,7 @@ import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
 import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
 import { z } from 'zod';
-import { AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget, normalizeProjectKey } from '@noriq-dev/shared';
+import { AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget, isTerminalRunStatus, normalizeProjectKey } from '@noriq-dev/shared';
 
 export { ProjectRoom } from './do/ProjectRoom';
 export { AgentSession } from './do/AgentSession';
@@ -610,7 +612,11 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
               ${taskWireStatus()} AS status,
               type, priority, estimate, due_at AS dueAt, claimed_by AS claimedBy, claim_expires_at AS claimExpiresAt,
               parent_task_id AS parentTaskId, milestone_id AS milestoneId, board_id AS boardId, archived_at AS archivedAt,
-              failed_at AS failedAt, open_comments AS openComments, "order"
+              failed_at AS failedAt, open_comments AS openComments, "order",
+              -- Whether there IS a spec, never the spec (RUN-162). Approving a plan approves what
+              -- its tasks say, so the board counts the unplanned ones; shipping every spec through
+              -- this poll to draw that number would be the whole feature's payload for it.
+              (execution_spec IS NOT NULL) AS specPlanned
        FROM tasks WHERE project_id = ? ORDER BY "order"`,
     ).bind(pid).all(),
     c.env.DB.prepare(
@@ -723,6 +729,14 @@ app.get('/api/tasks/:tid', userAuth, async (c) => {
   // wire SELECTs — a task with failed_at set reads as 'failed'. failedAt is already present.
   if (task.failed_at) task.status = 'failed';
   task.failedAt = task.failed_at;
+  // The execution spec (RUN-135) rides only on the DETAIL reads — a board snapshot ships every
+  // task in a project and renders none of this. `SELECT *` brought the raw JSON along, so the
+  // column is dropped rather than shipped beside its parsed form: unlike the scalars above, a
+  // duplicated spec doubles the payload for nothing.
+  const stored = readExecutionSpec(task.execution_spec, tid);
+  task.executionSpec = stored.spec;
+  if (stored.unreadable) task.executionSpecUnreadable = true;
+  delete task.execution_spec;
   const [comments, refs, attachments, taskTagRows, docRows] = await Promise.all([
     c.env.DB.prepare(
       `SELECT id, author_kind AS authorKind, author_id AS authorId, kind, body, status, parent_comment_id AS parentCommentId, created_at AS createdAt
@@ -789,7 +803,7 @@ app.delete('/api/projects/:pid/boards/:bid', userAuth, async (c) => {
 });
 
 app.post('/api/projects/:pid/tasks', userAuth, async (c) => {
-  const body = await c.req.json<{ title: string; body?: string; parentTaskId?: string; priority?: number; estimate?: number | null; dueAt?: string | null; dependsOn?: string[]; boardId?: string | null }>();
+  const body = await c.req.json<{ title: string; body?: string; parentTaskId?: string; priority?: number; estimate?: number | null; dueAt?: string | null; dependsOn?: string[]; boardId?: string | null; executionSpec?: ExecutionSpecInput | null }>();
   if (!body.title) return c.json({ error: 'title required' }, 400);
   const result = await room(c.env, c.req.param('pid')!).createTask(c.req.param('pid')!, humanActor(c), body);
   return c.json(result);
@@ -2072,11 +2086,11 @@ app.post('/api/runs/:runId/agent', agentAuth, async (c) => {
   const b = parsed.data;
   const conn = c.var.connection!;
   const run = await c.env.DB.prepare(
-    `SELECT r.id, r.kind, r.project_id AS projectId, r.runner_id AS runnerId, r.agent_id AS agentId,
+    `SELECT r.id, r.kind, r.status, r.project_id AS projectId, r.runner_id AS runnerId, r.agent_id AS agentId,
             rn.owner_user_id AS owner
      FROM runs r LEFT JOIN runners rn ON rn.id = r.runner_id WHERE r.id = ?`,
   ).bind(runId).first<{
-    id: string; kind: string; projectId: string; runnerId: string | null;
+    id: string; kind: string; status: RunStatus; projectId: string; runnerId: string | null;
     agentId: string | null; owner: string | null;
   }>();
   // Same ownership test as steer-ack: the run must belong to a runner this user owns.
@@ -2093,6 +2107,18 @@ app.post('/api/runs/:runId/agent', agentAuth, async (c) => {
   // same run would mean two live processes could act as one identity, which is exactly the
   // ambiguity this task exists to remove.
   if (run.agentId) return c.json({ error: 'run already has an agent' }, 409);
+  // …and a run that is OVER gets none at all. The 409 above only covers a run that already
+  // minted one, so a run that reached a terminal status before its agent was created — a
+  // daemon restart reconciles dispatched runs to failed, and a human can cancel one in the
+  // same window — could still be handed a working credential with no process, no supervision
+  // and no budget behind it. Every terminal path takes an EXISTING credential away
+  // (retireRunAgent); this is the same rule pointed the other way, and without it that
+  // retirement is trivially undone by asking again. It also restores RUN-160: an agent whose
+  // run is not live has no attributable run kind, and a spec write we cannot attribute is
+  // permitted.
+  if (isTerminalRunStatus(run.status)) {
+    return c.json({ error: `run is already ${run.status} — it gets no agent` }, 409);
+  }
 
   const agentId = newId('agt');
   // The label is what a human reads in the dashboard; scope it to the run so two concurrent

@@ -2,12 +2,14 @@
 import { useEffect, useRef, useState } from 'react';
 import type { AppStore } from '../store';
 import { api, type ApiAgentEvent } from '../api';
+import type { ExecutionSpec } from '@noriq-dev/shared';
 import { KIND_META, statusMeta, verbColors } from '../design';
 import { AvatarChip, MonoTag, SectionLabel } from './bits';
 import { QuestionForm, SignalThreadHistory } from './QuestionForm';
 import { Markdown } from './Markdown';
 import { Composer } from './Composer';
 import { Button, Select, TextArea, TextInput } from './ui';
+import { ExecutionSpecPanel, type SpecLoad } from './ExecutionSpec';
 import { confirm } from './Dialog';
 
 export function Drawer({ store }: { store: AppStore }) {
@@ -31,6 +33,17 @@ export function Drawer({ store }: { store: AppStore }) {
   const [depError, setDepError] = useState('');
   const [attachments, setAttachments] = useState<Array<{ id: string; filename: string; size: number; contentType?: string; createdAt: string }>>([]);
   const [taskDocs, setTaskDocs] = useState<Array<{ id: string; name: string; description: string }>>([]);
+  // The spec rides only on the DETAIL read (RUN-135) — the board snapshot deliberately omits it,
+  // so it cannot come from the store's task view-model. `load` is carried alongside because
+  // "still fetching" and "the fetch failed" must not render as "this task has no spec": that
+  // reading invites someone to write over a plan that already exists.
+  const [spec, setSpec] = useState<ExecutionSpec | null>(null);
+  const [specUnreadable, setSpecUnreadable] = useState(false);
+  const [specLoad, setSpecLoad] = useState<SpecLoad>('loading');
+  // Detail fetches race: select A, select B, and A's response can land last. Every read stamps
+  // the selection it was issued for and drops itself if the drawer has moved on — otherwise A's
+  // spec renders under B, and the next save writes it there.
+  const detailFor = useRef<string | null>(null);
   const [allDocs, setAllDocs] = useState<Array<{ id: string; name: string }>>([]);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -41,9 +54,28 @@ export function Drawer({ store }: { store: AppStore }) {
     setEditing(false);
     if (selectedTaskId) {
       api.taskEvents(selectedTaskId).then((r) => setTimeline(r.events)).catch(() => setTimeline([]));
-      api.taskDetail(selectedTaskId)
-        .then((r) => { setAttachments(r.attachments); setTaskDocs(r.docs ?? []); })
-        .catch(() => { setAttachments([]); setTaskDocs([]); });
+      const forTask = selectedTaskId;
+      detailFor.current = forTask;
+      setSpec(null);
+      setSpecUnreadable(false);
+      setSpecLoad('loading');
+      api.taskDetail(forTask)
+        .then((r) => {
+          if (detailFor.current !== forTask) return; // a later task won the race
+          setAttachments(r.attachments);
+          setTaskDocs(r.docs ?? []);
+          setSpec((r.task.executionSpec as ExecutionSpec | null) ?? null);
+          setSpecUnreadable(r.task.executionSpecUnreadable === true);
+          setSpecLoad('loaded');
+        })
+        .catch(() => {
+          if (detailFor.current !== forTask) return;
+          setAttachments([]);
+          setTaskDocs([]);
+          setSpec(null);
+          setSpecUnreadable(false);
+          setSpecLoad('error');
+        });
       api.docs(currentPid).then((r) => setAllDocs(r.docs)).catch(() => setAllDocs([]));
     }
   }, [selectedTaskId, currentPid]);
@@ -51,6 +83,14 @@ export function Drawer({ store }: { store: AppStore }) {
   const reloadDocs = async (tid: string) => {
     const detail = await api.taskDetail(tid);
     setTaskDocs(detail.docs ?? []);
+  };
+
+  const reloadSpec = async (tid: string) => {
+    const detail = await api.taskDetail(tid);
+    if (detailFor.current !== tid) return; // the drawer moved on while this was in flight
+    setSpec((detail.task.executionSpec as ExecutionSpec | null) ?? null);
+    setSpecUnreadable(detail.task.executionSpecUnreadable === true);
+    setSpecLoad('loaded');
   };
 
   if (!task) return null;
@@ -430,6 +470,22 @@ export function Drawer({ store }: { store: AppStore }) {
               </div>
             </div>
           )}
+
+          {/* the execution spec (RUN-137) — what this task tells a builder before it starts, and
+              the cheapest point at which a human can correct a wrong scope. Above the docs and
+              attachments because it is the thing to read first. */}
+          <ExecutionSpecPanel
+            // Remount per task: an open editor holding task A's draft must not survive a switch
+            // to B, where Save would write A's text onto B.
+            key={task.id}
+            pid={currentPid}
+            taskId={task.id}
+            load={specLoad}
+            spec={spec}
+            unreadable={specUnreadable}
+            inFlight={eff !== 'todo'}
+            onSaved={() => reloadSpec(task.id)}
+          />
 
           {/* related docs (PLNR-182) — the design/decision docs this task implements */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 8 }}>

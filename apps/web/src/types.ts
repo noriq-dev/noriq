@@ -71,6 +71,11 @@ export interface TaskVM {
   type: string;
   openComments: number;
   archivedAt: string | null;
+  /** Does this task carry an execution spec (RUN-162)? A BOOLEAN, not the spec: approving a plan
+   *  approves what its tasks say, so the board needs to count the unplanned ones — and shipping
+   *  every spec through the snapshot to draw a number would be the whole feature's payload for it.
+   *  The spec itself is a detail read. */
+  specPlanned: boolean;
   comments: CommentVM[]; // populated for the selected task
 }
 

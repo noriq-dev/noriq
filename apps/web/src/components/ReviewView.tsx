@@ -4,6 +4,8 @@
 // no reason just re-does the same thing.
 import { useEffect, useState } from 'react';
 import { api, type ApiTaskDetail } from '../api';
+import type { ExecutionSpec } from '@noriq-dev/shared';
+import { SpecView } from './ExecutionSpec';
 import type { AppStore } from '../store';
 import type { TaskVM } from '../types';
 import { MonoTag, SectionLabel } from './bits';
@@ -55,6 +57,16 @@ function ReviewRow({ task, store }: { task: TaskVM; store: AppStore }) {
 
   // The agent's parting words: last agent-authored comment (release_task notes land there).
   const releaseNote = detail?.comments.filter((c) => c.authorKind === 'agent').at(-1) ?? null;
+  // The acceptance criteria the work was commissioned against (RUN-137). "Accept" is a judgement,
+  // and a reviewer who cannot see the contract is judging from memory. READ-ONLY here on purpose:
+  // editing at the moment of acceptance is moving the goalposts, and the drawer is where a spec
+  // gets corrected — before the work, when it is still cheap.
+  const spec = (detail?.task.executionSpec as ExecutionSpec | null) ?? null;
+  const hasAcceptance =
+    !!spec &&
+    (spec.acceptance.observableTruths.length > 0 ||
+      spec.acceptance.artifacts.length > 0 ||
+      spec.acceptance.links.length > 0);
   const openQuestions = detail?.comments.filter((c) => c.status === 'open' || c.status === 'acknowledged') ?? [];
 
   const accept = async () => {
@@ -106,6 +118,15 @@ function ReviewRow({ task, store }: { task: TaskVM; store: AppStore }) {
           </>
         )}
       </div>
+
+      {hasAcceptance && spec && (
+        <div style={{ marginTop: 9 }}>
+          <div style={{ fontFamily: 'var(--mono)', fontSize: 9, letterSpacing: '.06em', textTransform: 'uppercase', color: 'var(--text-faint)', marginBottom: 4 }}>
+            Commissioned against
+          </div>
+          <SpecView spec={spec} only="acceptance" />
+        </div>
+      )}
 
       {releaseNote && (
         <div

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { Run, RunStatus, RunPhase, RunExit, AgentTool, RunKind, RunnerRepo, RunModelUsage } from './runner';
+import { ExecutionSpec } from './execution-spec';
 
 // ---------------------------------------------------------------------------
 // The runtime channel (RUN plan, Phase 1) — a persistent WebSocket the daemon
@@ -180,6 +181,21 @@ export const RunnerClientMessage = z.discriminatedUnion('type', [
     //                    STORES (model_usage → null), not a COALESCE-skip
     //   • null/absent  → no news (a phase-only tick); COALESCE-skip, keep what's stored
     modelUsage: RunModelUsage.nullable().default(null),
+    /**
+     * The execution spec this run was actually briefed with (RUN-166), reported ONCE when the
+     * daemon has resolved it — null on every other tick, which is null-means-no-news like the rest
+     * of this frame.
+     *
+     * The DAEMON is the writer, not the server at dispatch, and that is the decision rather than a
+     * convenience. A run whose task carried no spec gets one from the planner stage (RUN-140): a
+     * spec the server never sent and could not have recorded. Those are exactly the runs where
+     * "what was this agent told?" matters most, because nobody wrote the contract beforehand — so
+     * a server-side copy would be empty precisely where it is needed.
+     *
+     * Rides the telemetry frame because it is not a lifecycle transition: reporting it must not
+     * mint a status change, and `run.status` has no running → running edge to carry it on.
+     */
+    executedSpec: ExecutionSpec.nullable().default(null),
     at: z.string().datetime(),
   }),
 
@@ -201,6 +217,17 @@ export const RunnerClientMessage = z.discriminatedUnion('type', [
           // its round. verify = the deterministic cmd's output. system = daemon milestones.
           role: z.enum(['agent', 'reviewer', 'verify', 'system']),
           round: z.number().int().positive().nullable().default(null),
+          /**
+           * Which STEP of a decomposed run was speaking (RUN-150), or null for an undecomposed
+           * one — which is most runs, and every segment written before this existed.
+           *
+           * A second attribution dimension beside `round`, not a replacement for it: a chain's
+           * step three can still be on its second reviewer round, and collapsing the two into one
+           * label would make a transcript that cannot say which. Without it a five-step run reads
+           * as one long undifferentiated stream, and an operator watching it has no idea what is
+           * actually happening — which is the whole reason a decomposition is worth watching.
+           */
+          step: z.string().max(64).nullable().default(null),
           text: z.string().max(16384),
           at: z.string().datetime(),
         }),

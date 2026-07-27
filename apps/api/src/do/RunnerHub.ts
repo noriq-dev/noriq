@@ -136,6 +136,7 @@ export class RunnerHub extends DurableObject<Env> {
             logTail: msg.logTail,
             phase: msg.phase,
             modelUsage: msg.modelUsage,
+            executedSpec: msg.executedSpec,
           });
         } catch { /* best-effort telemetry — never fatal */ }
         return;

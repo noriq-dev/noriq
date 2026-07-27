@@ -12,7 +12,8 @@ import {
 import { searchBackend, indexEntity, removeEntity, type SearchKind } from '../search';
 import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
-import { RunKind, AgentTool, RunStatus, type RunPhase, isTerminalRunStatus } from '@noriq-dev/shared';
+import { RunKind, AgentTool, RunStatus, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus } from '@noriq-dev/shared';
+import { writeExecutionSpec } from '../lib/execution-spec';
 
 /**
  * ProjectRoom — one instance per project (idFromName(projectId)).
@@ -71,6 +72,9 @@ export interface CreateTaskInput {
   docIds?: string[];
   /** Permit minting genuinely-new tags past the near-duplicate guard (PLNR-194). */
   allowNewTags?: boolean;
+  /** What a builder is told before it spends anything (RUN-135). Omit or null = no spec, which
+   *  is what every task carried before this existed. Validated here, at the write seam. */
+  executionSpec?: ExecutionSpecInput | null;
 }
 
 export interface TaskPatch {
@@ -101,6 +105,39 @@ export interface TaskPatch {
   removeDocIds?: string[];
   /** Permit minting genuinely-new tags past the near-duplicate guard (PLNR-194). */
   allowNewTags?: boolean;
+  /** Replace the task's execution spec (RUN-135). Explicit null CLEARS it; omitting the key
+   *  leaves whatever is there, exactly like every other field in this patch. */
+  executionSpec?: ExecutionSpecInput | null;
+}
+
+/** What a create returns. `executionSpec` present iff the call set one, normalised as stored. */
+export type CreatedTask = { id: string; key: string; executionSpec?: ExecutionSpec };
+/** What an update returns. `executionSpec` present iff the patch mentioned it; null = cleared. */
+export type UpdatedTask = { ok: true; key: string; executionSpec?: ExecutionSpec | null };
+
+/**
+ * A one-line description of a stored spec, for the change event (RUN-162).
+ *
+ * Counts rather than contents: enough for a human or a reviewer to see THAT the contract moved and
+ * roughly how much, without turning the event log into a second copy of every spec ever written.
+ * Whoever needs the detail reads the task, which is the row that answers what it says now.
+ */
+function specSummary(stored: string | null): string {
+  if (!stored) return 'none';
+  try {
+    const s = JSON.parse(stored) as {
+      anticipatedFiles?: unknown[];
+      lockedDecisions?: unknown[];
+      acceptance?: { observableTruths?: unknown[]; artifacts?: unknown[]; links?: unknown[] };
+    };
+    const acc =
+      (s.acceptance?.observableTruths?.length ?? 0) +
+      (s.acceptance?.artifacts?.length ?? 0) +
+      (s.acceptance?.links?.length ?? 0);
+    return `${s.anticipatedFiles?.length ?? 0} file(s), ${s.lockedDecisions?.length ?? 0} decision(s), ${acc} acceptance criteri(a)`;
+  } catch {
+    return 'unreadable';
+  }
 }
 
 type TaskRow = {
@@ -172,6 +209,7 @@ type RunRow = {
   worktree_path: string | null;
   tokens_used: number | null; usd_spent: number | null; log_tail: string | null;
   model_usage: string | null;
+  executed_spec: string | null;
   plan_dispatch_id: string | null;
   created_by: string; created_at: string; updated_at: string;
   dispatched_at: string | null; started_at: string | null;
@@ -181,6 +219,16 @@ type RunRow = {
 // DO-stub RPC return-type inference doesn't recurse on a large anonymous literal.
 export interface RunView {
   id: string;
+  /**
+   * Every execution spec this run was briefed with, in order (RUN-166/172) — what it was held to,
+   * as distinct from whatever its task says now.
+   *
+   * A list because a run can be briefed more than once: a park resumes and the spec may have been
+   * corrected while it waited, and a continued failed run is briefed afresh. The first entry is
+   * the commission; the last is what the final sitting was actually graded against. Empty for a
+   * run that executed under none, and for every run predating the column.
+   */
+  executedSpecs?: unknown[];
   projectId: string;
   runnerId: string | null;
   agentId: string | null;
@@ -509,18 +557,26 @@ export class ProjectRoom extends DurableObject<Env> {
 
   /** Top-level entry point — wraps the lock. Callers already inside a gated method (e.g.
    *  createPlan) use `_createTaskLocked` to avoid nesting blockConcurrencyWhile (PLNR-116). */
-  async createTask(projectId: string, actor: Actor, input: CreateTaskInput)  {
+  /** The spec is echoed back only when the call SET one (RUN-136) — see `_createTaskLocked`. The
+   *  explicit annotation also keeps `ExecutionSpec`'s depth out of every caller's inference. */
+  async createTask(projectId: string, actor: Actor, input: CreateTaskInput): Promise<CreatedTask> {
     return this.ctx.blockConcurrencyWhile(() => this._createTaskLocked(projectId, actor, input));
   }
 
   /** Body of createTask, WITHOUT the lock. Only call from inside blockConcurrencyWhile. */
-  private async _createTaskLocked(projectId: string, actor: Actor, input: CreateTaskInput)  {
+  private async _createTaskLocked(projectId: string, actor: Actor, input: CreateTaskInput): Promise<CreatedTask> {
       await this.setPid(projectId);
       const pid = this.projectId;
       const proj = await this.env.DB.prepare('SELECT key, next_task_number AS n FROM projects WHERE id = ?')
         .bind(pid)
         .first<{ key: string; n: number }>();
       if (!proj) throw new Error(`project ${pid} not found`);
+      // The execution spec validates FIRST — before anything durable happens (RUN-135).
+      // `blockConcurrencyWhile` serializes; it is not a transaction, so a throw part-way through
+      // leaves whatever already committed. Tag minting below is a real write (and emits
+      // `tag.created`), so validating after it would answer a bad spec with a freshly-minted tag
+      // and no task. Nothing here writes until the batch, so this is the safe place.
+      const executionSpec = writeExecutionSpec(input.executionSpec);
       const id = newId('task');
       const key = `${proj.key}-${proj.n}`;
       const now = nowIso();
@@ -567,9 +623,9 @@ export class ProjectRoom extends DurableObject<Env> {
       }
       const stmts = [
         this.env.DB.prepare(
-          `INSERT INTO tasks (id, project_id, key, milestone_id, board_id, parent_task_id, title, body, status, type, priority, estimate, due_at, "order", created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?)`,
-        ).bind(id, pid, key, input.milestoneId ?? null, boardId, input.parentTaskId ?? null, input.title, input.body ?? '', input.type ?? 'feature', input.priority ?? 2, input.estimate ?? null, input.dueAt ?? null, proj.n, now, now),
+          `INSERT INTO tasks (id, project_id, key, milestone_id, board_id, parent_task_id, title, body, status, type, priority, estimate, due_at, execution_spec, "order", created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).bind(id, pid, key, input.milestoneId ?? null, boardId, input.parentTaskId ?? null, input.title, input.body ?? '', input.type ?? 'feature', input.priority ?? 2, input.estimate ?? null, input.dueAt ?? null, executionSpec, proj.n, now, now),
         this.env.DB.prepare('UPDATE projects SET next_task_number = ? WHERE id = ?').bind(proj.n + 1, pid),
       ];
       for (const dep of depIds) {
@@ -588,13 +644,24 @@ export class ProjectRoom extends DurableObject<Env> {
         key, title: input.title, parentTaskId: input.parentTaskId ?? null,
       });
       this.reindexSearch('task', id);
-      return { id, key };
+      // Echo the spec BACK when one was set (RUN-136), normalised as stored: defaults filled in,
+      // unknown keys dropped. Without it a caller cannot see what its spec became without a
+      // second round-trip per task, and normalisation is exactly the part it did not write.
+      // Absent when the task has none, so the common response is unchanged.
+      return executionSpec ? { id, key, executionSpec: JSON.parse(executionSpec) } : { id, key };
   }
 
-  async updateTask(projectId: string, actor: Actor, taskId: string, patch: TaskPatch)  {
+  async updateTask(projectId: string, actor: Actor, taskId: string, patch: TaskPatch): Promise<UpdatedTask> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const task = await this.getTask(taskId);
+      // Same as createTask: the spec validates before ANY of this patch is applied (RUN-135).
+      // The tag and doc blocks below write and can return early, so a spec parsed at its own
+      // `sets.push` would answer `{tags:[...], executionSpec: <malformed>}` with the tags already
+      // changed and an error. `undefined` here means the patch did not mention the spec at all,
+      // which is distinct from an explicit null (clear it).
+      const executionSpec =
+        patch.executionSpec === undefined ? undefined : writeExecutionSpec(patch.executionSpec);
       // Consumed by the tag paths only — must not reach the generic field loop.
       const allowNewTags = patch.allowNewTags;
       delete patch.allowNewTags;
@@ -677,6 +744,27 @@ export class ProjectRoom extends DurableObject<Env> {
           binds.push(patch[k]);
         }
       }
+      // The execution spec (RUN-135) is deliberately NOT in the list above: every field there
+      // binds its patch value straight through, and this one is an object that had to be
+      // validated and serialized before any of this ran. Left ON the patch rather than deleted,
+      // so a spec-only patch emits `task.updated` with `fields: ['executionSpec']` — a watcher
+      // has nothing else to key on. (A patch that ALSO changes status emits only
+      // `task.status_changed`, as it does for every other field; that is not new here.)
+      if (executionSpec !== undefined) {
+        sets.push('execution_spec = ?');
+        binds.push(executionSpec);
+      }
+      // What the spec WAS, read before the write, for the change event below (RUN-162). Read
+      // whether or not anything else in this patch changed, because the point is that a spec edit
+      // is visible on its own terms rather than as one field in a list.
+      const priorSpec =
+        executionSpec === undefined
+          ? null
+          : ((
+              await this.env.DB.prepare('SELECT execution_spec AS spec FROM tasks WHERE id = ?')
+                .bind(taskId)
+                .first<{ spec: string | null }>()
+            )?.spec ?? null);
       // Re-parent (PLNR-89): resolve the new parent by id-or-key, reject self-parenting
       // and cycles (the new parent must not be the task or one of its descendants).
       if (patch.parentTaskId !== undefined) {
@@ -746,7 +834,28 @@ export class ProjectRoom extends DurableObject<Env> {
       } else {
         await this.emit(actor, 'task.updated', 'task', taskId, { key: task.key, fields: Object.keys(patch) });
       }
+      // A spec change is its OWN event (RUN-162), emitted in addition to whatever the patch
+      // otherwise was. `task.updated` naming `executionSpec` among its fields is not enough: a
+      // reviewer asking "did the goalposts move while this was being built" should not have to
+      // read every edit to find out, and a combined `{status, executionSpec}` patch emits only
+      // `task.status_changed` — so the spec change would have had no event at all.
+      //
+      // A SUMMARY, never the specs themselves. The event log is a record of what happened; two
+      // copies of a spec in it would make it a second store of the data, and the task row is the
+      // one that answers "what does it say now".
+      if (executionSpec !== undefined) {
+        await this.emit(actor, 'task.spec_changed', 'task', taskId, {
+          key: task.key,
+          from: specSummary(priorSpec),
+          to: specSummary(executionSpec),
+        });
+      }
       this.reindexSearch('task', taskId);
+      // Same echo as createTask (RUN-136). `undefined` = the patch never mentioned the spec, so
+      // nothing is echoed; an explicit clear echoes null, which is the confirmation that matters.
+      if (executionSpec !== undefined) {
+        return { ok: true, key: task.key, executionSpec: executionSpec ? JSON.parse(executionSpec) : null };
+      }
       return { ok: true, key: task.key };
 
     });
@@ -2376,6 +2485,21 @@ export class ProjectRoom extends DurableObject<Env> {
   // daemon only *reports* transitions (RUN-7); this DO owns the truth.
   // ---------------------------------------------------------------------------
 
+  /** A stored spec, read leniently: a corrupt value degrades to null rather than failing the whole
+   *  run view. The same posture `readExecutionSpec` takes, and for the same reason — one bad row
+   *  must not make a run unreadable. */
+  private static parseSpecList(raw: string | null): unknown[] {
+    if (!raw) return [];
+    try {
+      const v = JSON.parse(raw);
+      // Tolerates the single-object shape this column briefly held before RUN-172, so a row
+      // written in that window reads as a one-entry history rather than as corrupt.
+      return Array.isArray(v) ? v : [v];
+    } catch {
+      return [];
+    }
+  }
+
   private runToWire(r: RunRow): RunView {
     return {
       id: r.id,
@@ -2393,6 +2517,13 @@ export class ProjectRoom extends DurableObject<Env> {
       verifiesRunId: r.verifies_run_id,
       // The plan this run serves (RUN-28) — the daemon uses it for the per-plan working branch.
       planKey: r.plan_key,
+      // The spec this run was actually briefed with (RUN-166). Read side, so the record is
+      // answerable rather than merely stored: a column nothing can read is a column nobody
+      // notices going wrong. Parsed leniently — a corrupt value degrades to null rather than
+      // failing the whole run view, which is the same posture `readExecutionSpec` takes.
+      // Every spec this run was briefed with, in order (RUN-172): the first is what it was
+      // commissioned with, the last is what its final sitting was held to.
+      executedSpecs: ProjectRoom.parseSpecList(r.executed_spec),
       targetBranch: r.target_branch,
       brief: r.brief,
       repoRef: r.repo_ref,
@@ -3202,13 +3333,25 @@ export class ProjectRoom extends DurableObject<Env> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const { results } = await this.env.DB.prepare(
-        "SELECT id, status FROM runs WHERE project_id = ? AND runner_id = ? AND status IN ('dispatched','running','blocked')",
-      ).bind(projectId, runnerId).all<{ id: string; status: string }>();
+        `SELECT id, status, agent_id AS agentId FROM runs
+         WHERE project_id = ? AND runner_id = ? AND status IN ('dispatched','running','blocked')`,
+      ).bind(projectId, runnerId).all<{ id: string; status: string; agentId: string | null }>();
       const now = nowIso();
       for (const r of results) {
         const exit = JSON.stringify({ outcome: 'failed', code: null, signal: null, reason: 'daemon_restart', finishedAt: now });
         await this.env.DB.prepare("UPDATE runs SET status = 'failed', exit = ?, updated_at = ? WHERE id = ?")
           .bind(exit, now, r.id).run();
+        // This path writes a TERMINAL status directly instead of going through transitionRun,
+        // so it has to do transitionRun's retirement itself. Without it a daemon restart left
+        // every orphaned run's credential valid for the rest of its 7-day TTL — a token with no
+        // process, no supervision and no budget behind it, which is precisely what
+        // retireRunAgent exists to prevent.
+        //
+        // It also silently widened RUN-160: `runKindOf` finds no live run for such an agent, and
+        // a spec write it cannot attribute to a live run is PERMITTED. That fail-open is only
+        // defensible while "the run ended" implies "the credential died" — and here it did not,
+        // so a reconciled build agent could rewrite the spec it had just been judged against.
+        if (r.agentId) await this.retireRunAgent(r.agentId);
         await this.emit(actor, 'run.status_changed', 'run', r.id, { from: r.status, to: 'failed', reason: 'daemon_restart' });
       }
       return { failed: results.length };
@@ -3247,6 +3390,8 @@ export class ProjectRoom extends DurableObject<Env> {
     t: {
       tokensUsed?: number | null; usdSpent?: number | null; logTail?: string | null; phase?: RunPhase | null;
       modelUsage?: Record<string, unknown> | null;
+      /** The spec this run was actually briefed with (RUN-166) — reported once, then null. */
+      executedSpec?: unknown | null;
     },
   ): Promise<void> {
     await this.setPid(projectId);
@@ -3269,6 +3414,30 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.env.DB.prepare('UPDATE runs SET model_usage = ? WHERE id = ? AND project_id = ?')
         .bind(val, runId, projectId).run();
     }
+    // APPEND, deduped against the last entry (RUN-166, revised by RUN-172).
+    //
+    // Write-once was the first cut and it answered the wrong question. It was chosen for
+    // idempotency — a redelivered frame must not rewrite the record — but that quietly settled a
+    // different one: what a run briefed MORE THAN ONCE should say. A run can be. A park resumes and
+    // the spec may have been corrected while it waited (RUN-164); a continued failed run is briefed
+    // afresh. Write-once recorded the first and the run was then graded against the last, which is
+    // the mismatch this column exists to remove, one level up.
+    //
+    // A list answers both: the first entry is what the work was commissioned with, the last is what
+    // the final sitting was held to, and a third sitting does not force the choice again. Dedupe
+    // against the last entry keeps redelivery a no-op — which is also what lets the daemon re-send
+    // freely until the frame lands, since the record rides fire-and-forget telemetry.
+    if (t.executedSpec != null) {
+      const row = await this.env.DB.prepare('SELECT executed_spec AS s FROM runs WHERE id = ? AND project_id = ?')
+        .bind(runId, projectId).first<{ s: string | null }>();
+      const history = ProjectRoom.parseSpecList(row?.s ?? null);
+      const incoming = JSON.stringify(t.executedSpec);
+      if (JSON.stringify(history.at(-1) ?? null) !== incoming) {
+        history.push(t.executedSpec);
+        await this.env.DB.prepare('UPDATE runs SET executed_spec = ? WHERE id = ? AND project_id = ?')
+          .bind(JSON.stringify(history), runId, projectId).run();
+      }
+    }
   }
 
   /**
@@ -3281,7 +3450,7 @@ export class ProjectRoom extends DurableObject<Env> {
   async appendRunLog(
     projectId: string,
     runId: string,
-    segments: Array<{ seq: number; role: string; round?: number | null; text: string; at: string }>,
+    segments: Array<{ seq: number; role: string; round?: number | null; step?: string | null; text: string; at: string }>,
   ): Promise<void> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
@@ -3293,14 +3462,14 @@ export class ProjectRoom extends DurableObject<Env> {
         .filter((s) => s.seq < CAP)
         .map((s) =>
           this.env.DB.prepare(
-            'INSERT OR IGNORE INTO run_log_segments (run_id, seq, role, round, text, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-          ).bind(runId, s.seq, s.role, s.round ?? null, s.text, s.at),
+            'INSERT OR IGNORE INTO run_log_segments (run_id, seq, role, round, step, text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          ).bind(runId, s.seq, s.role, s.round ?? null, s.step ?? null, s.text, s.at),
         );
       if (segments.some((s) => s.seq >= CAP)) {
         stmts.push(
           this.env.DB.prepare(
-            'INSERT OR IGNORE INTO run_log_segments (run_id, seq, role, round, text, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-          ).bind(runId, CAP, 'system', null, '… transcript truncated (per-run segment cap reached)', nowIso()),
+            'INSERT OR IGNORE INTO run_log_segments (run_id, seq, role, round, step, text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          ).bind(runId, CAP, 'system', null, null, '… transcript truncated (per-run segment cap reached)', nowIso()),
         );
       }
       if (stmts.length) await this.env.DB.batch(stmts);
@@ -3311,12 +3480,28 @@ export class ProjectRoom extends DurableObject<Env> {
   async getRunLog(
     projectId: string,
     runId: string,
-  ): Promise<{ segments: Array<{ seq: number; role: string; round: number | null; text: string; at: string }> }> {
+  ): Promise<{
+    segments: Array<{
+      seq: number;
+      role: string;
+      round: number | null;
+      step: string | null;
+      text: string;
+      at: string;
+    }>;
+  }> {
     await this.setPid(projectId);
     const { results } = await this.env.DB.prepare(
-      `SELECT seq, role, round, text, created_at AS at FROM run_log_segments
+      `SELECT seq, role, round, step, text, created_at AS at FROM run_log_segments
        WHERE run_id = ? ORDER BY seq LIMIT 2001`,
-    ).bind(runId).all<{ seq: number; role: string; round: number | null; text: string; at: string }>();
+    ).bind(runId).all<{
+      seq: number;
+      role: string;
+      round: number | null;
+      step: string | null;
+      text: string;
+      at: string;
+    }>();
     return { segments: results };
   }
 
@@ -3420,12 +3605,23 @@ export class ProjectRoom extends DurableObject<Env> {
           tags?: string[]; milestoneId?: string; type?: string; boardId?: string; docIds?: string[];
           /** Extra ad-hoc edges beyond the enforced phase chain — existing task ids or keys. */
           dependsOn?: string[];
+          /** This task's execution spec (RUN-135). PER TASK, not per phase and not in
+           *  `taskDefaults`: a spec names the files, decisions and acceptance criteria of ONE
+           *  piece of work, so a shared default would be wrong for every task that inherited it. */
+          executionSpec?: ExecutionSpecInput | null;
         }>;
       }>;
     },
   )  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
+      // EVERY task's spec validates before the plan row exists (RUN-135). A plan is written phase
+      // by phase and task by task, and this is not a transaction — a malformed spec on the fifth
+      // task would otherwise fail the call and leave a plan, its phases, and four tasks behind,
+      // which is worse than either outcome the caller expects.
+      for (const ph of input.phases) {
+        for (const nt of ph.newTasks ?? []) writeExecutionSpec(nt.executionSpec);
+      }
       const planId = newId('pln');
       const status = input.proposed ? 'proposed' : 'active';
       await this.env.DB.prepare(
@@ -3469,6 +3665,7 @@ export class ProjectRoom extends DurableObject<Env> {
             boardId: nt.boardId ?? d.boardId,
             docIds: nt.docIds ?? d.docIds,
             dependsOn,
+            executionSpec: nt.executionSpec,
           });
           taskIds.push(created.id);
         }

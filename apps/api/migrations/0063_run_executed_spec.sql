@@ -1,0 +1,15 @@
+-- RUN-166: the execution spec a run was actually EXECUTED under.
+--
+-- A task's `execution_spec` is a live row anyone may edit at any point, so "what was this builder
+-- told?" was inferred from the current row rather than answered. Once verification grades a run
+-- against per-acceptance-item evidence (RUN-145), which criteria applied to THIS run stops being a
+-- curiosity and becomes the input to a gate.
+--
+-- Written by the DAEMON, not by the server at dispatch, and that is the whole design decision. A
+-- run whose task carried no spec gets one from the planner stage (RUN-140) — a spec the server
+-- never sent and could not record. Those are precisely the runs where the question matters most,
+-- because nobody wrote the contract down beforehand, so a server-side copy would be empty exactly
+-- where it is needed. The daemon reports what it briefed the agent with.
+--
+-- Additive and nullable: null means the run predates this, or executed under no spec at all.
+ALTER TABLE runs ADD COLUMN executed_spec TEXT;

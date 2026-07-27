@@ -25,6 +25,7 @@ interface RoomRpc {
   getRun(projectId: string, runId: string): Promise<RunView>;
   claimTask(projectId: string, actor: Actor, taskId: string): Promise<unknown>;
   updateTask(projectId: string, actor: Actor, taskId: string, patch: { status?: string }): Promise<{ ok: boolean; key: string }>;
+  recordRunTelemetry(projectId: string, runId: string, t: Record<string, unknown>): Promise<void>;
 }
 const room = (projectId: string) =>
   appEnv.PROJECT_ROOM.get(appEnv.PROJECT_ROOM.idFromName(projectId)) as unknown as RoomRpc;
@@ -743,5 +744,64 @@ describe('continue a failed run — reopenRun (PLNR-180)', () => {
       expect(res.status).toBe(409);
       expect(JSON.stringify(await res.json())).toContain('only a failed run');
     });
+  });
+});
+
+
+// RUN-166/172: what a run was actually briefed with, kept with the run.
+describe('the specs a run executed under', () => {
+  it('appends each distinct briefing, so a multi-sitting run keeps both', async () => {
+    await seedRunner('rnr_x');
+    const rid = (await room(pid).createRun(pid, actor, {
+      kind: 'build', repoRef: 'r', agentTool: 'claude', runnerId: 'rnr_x',
+    })).id;
+    await room(pid).recordRunTelemetry(pid, rid, {
+      executedSpec: { acceptance: { observableTruths: ['the commission'] } },
+    });
+    // A second sitting — a resume after the spec was corrected, or a continued failed run — is
+    // briefed afresh. Write-once recorded the first and the run was graded against the last, which
+    // is the mismatch this column exists to remove one level up.
+    await room(pid).recordRunTelemetry(pid, rid, {
+      executedSpec: { acceptance: { observableTruths: ['what the last sitting was held to'] } },
+    });
+    // Read back through the API's own view, not raw SQL: a column nothing can read is a column
+    // nobody notices going wrong, and the read path is half of what makes this a record.
+    const view = (await room(pid).getRun(pid, rid)) as {
+      executedSpecs?: Array<{ acceptance?: { observableTruths?: string[] } }>;
+    };
+    expect(view.executedSpecs?.map((x) => x.acceptance?.observableTruths?.[0])).toEqual([
+      'the commission',
+      'what the last sitting was held to',
+    ]);
+  });
+
+  // The daemon re-sends until the frame lands (RUN-172), because this rides fire-and-forget
+  // telemetry and is sent when the spec resolves rather than repeatedly. Dedupe against the last
+  // entry is what makes that safe.
+  it('is a no-op when the same briefing arrives twice', async () => {
+    await seedRunner('rnr_x');
+    const rid = (await room(pid).createRun(pid, actor, {
+      kind: 'build', repoRef: 'r', agentTool: 'claude', runnerId: 'rnr_x',
+    })).id;
+    const spec = { acceptance: { observableTruths: ['once'] } };
+    await room(pid).recordRunTelemetry(pid, rid, { executedSpec: spec });
+    await room(pid).recordRunTelemetry(pid, rid, { executedSpec: spec });
+    const view = (await room(pid).getRun(pid, rid)) as { executedSpecs?: unknown[] };
+    expect(view.executedSpecs).toHaveLength(1);
+  });
+
+  // Null-means-no-news, like every other field on that frame: an ordinary spend tick must not
+  // blank the record.
+  it('is untouched by a telemetry tick that carries none', async () => {
+    await seedRunner('rnr_x');
+    const rid = (await room(pid).createRun(pid, actor, {
+      kind: 'build', repoRef: 'r', agentTool: 'claude', runnerId: 'rnr_x',
+    })).id;
+    await room(pid).recordRunTelemetry(pid, rid, {
+      executedSpec: { acceptance: { observableTruths: ['kept'] } },
+    });
+    await room(pid).recordRunTelemetry(pid, rid, { tokensUsed: 10 });
+    const view = (await room(pid).getRun(pid, rid)) as { executedSpecs?: unknown[] };
+    expect(JSON.stringify(view.executedSpecs)).toContain('kept');
   });
 });

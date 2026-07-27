@@ -470,11 +470,17 @@ function RunTranscript({ run, live }: { run: ApiRun; live: boolean }) {
 
   // Merge consecutive segments from the same voice into one block, so the stream reads as
   // turns, not as the daemon's flush cadence.
-  const blocks: Array<{ role: string; round: number | null; text: string }> = [];
+  // A STEP boundary breaks a block even when the voice is unchanged (RUN-150): two consecutive
+  // `agent` blocks from different steps are two different sessions with different context, and
+  // merging them would render a chain as the single long stream it exists not to be.
+  const blocks: Array<{ role: string; round: number | null; step: string | null; text: string }> = [];
   for (const s of segments ?? []) {
     const last = blocks.at(-1);
-    if (last && last.role === s.role && last.round === s.round) last.text += s.text;
-    else blocks.push({ role: s.role, round: s.round, text: s.text });
+    if (last && last.role === s.role && last.round === s.round && last.step === (s.step ?? null)) {
+      last.text += s.text;
+    } else {
+      blocks.push({ role: s.role, round: s.round, step: s.step ?? null, text: s.text });
+    }
   }
 
   if (!blocks.length) {
@@ -491,11 +497,14 @@ function RunTranscript({ run, live }: { run: ApiRun; live: boolean }) {
     <div style={{ margin: '8px 0 2px', maxHeight: 380, overflow: 'auto', display: 'flex', flexDirection: 'column', gap: 6 }}>
       {blocks.map((b, i) => {
         const st = ROLE_STYLE[b.role] ?? ROLE_STYLE.system!;
-        const label =
+        // The step rides ALONGSIDE the voice rather than replacing it — a chain's step three can
+        // still be on its second reviewer round, and one label could not say which.
+        const voice =
           b.role === 'agent' ? run.kind
           : b.role === 'reviewer' ? `reviewer${b.round ? ` · round ${b.round}` : ''}`
           : b.role === 'verify' ? 'verify cmd'
           : 'runner';
+        const label = b.step ? `${voice} · ${b.step}` : voice;
         return (
           // biome-ignore lint/suspicious/noArrayIndexKey: blocks are append-only and stable by position
           <div key={i} style={{ borderRadius: 8, background: 'var(--bg)', border: '1px solid var(--w-07)' }}>
