@@ -20,6 +20,7 @@ const draft = (over: Partial<ExecutionSpec> = {}): ExecutionSpec => ({
   discretion: [],
   deferred: [],
   acceptance: { observableTruths: [], artifacts: [], links: [] },
+  steps: [],
   ...over,
 });
 
@@ -74,6 +75,23 @@ describe('what a non-author can see without knowing the schema', () => {
   it('says what a truth is, since that is the field people get wrong', () => {
     mount();
     expect(text()).toMatch(/Truths, not steps/);
+  });
+
+  // The form does not edit `steps` (RUN-148) but saving replaces the WHOLE spec, so it has to both
+  // preserve them and say they are there — otherwise "saving replaces the whole spec" is a
+  // half-truth about a field the human cannot see, and correcting a typo destroys a decomposition.
+  it('preserves planner-authored steps it does not edit, and says they exist', () => {
+    const withSteps = draft({
+      steps: [{ id: 's1', title: 'the contract', anticipatedFiles: [], dependsOn: [], acceptance: { observableTruths: [], artifacts: [], links: [] } }],
+    });
+    mount({ draft: withSteps });
+    expect(text()).toMatch(/1 planner-authored step\(s\)/);
+    expect(pruneDraft(withSteps).steps).toEqual(withSteps.steps);
+  });
+
+  it('says nothing about steps when there are none — most specs have none', () => {
+    mount();
+    expect(text()).not.toMatch(/planner-authored/);
   });
 
   it('warns that saving replaces the whole spec', () => {

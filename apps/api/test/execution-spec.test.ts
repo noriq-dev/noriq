@@ -27,6 +27,9 @@ describe('ExecutionSpec — the empty shape', () => {
       discretion: [],
       deferred: [],
       acceptance: { observableTruths: [], artifacts: [], links: [] },
+      // Empty is the COMMON case and means one run, exactly as before (RUN-148). A planner
+      // declares steps only when it judges the work too big for one context.
+      steps: [],
     });
   });
 
@@ -129,7 +132,29 @@ describe('ExecutionSpec — the full shape', () => {
           { from: 'a', to: 'b', via: '' },
         ],
       },
+      steps: [],
     });
+  });
+
+  // A step is spec-shaped so a child run consumes it the way any run consumes a spec — the whole
+  // pre-execution machine applies to a child without a second implementation of any of it.
+  it('fills a step’s own defaults, so a planner may write only what it knows', () => {
+    const [step] = ExecutionSpec.parse({
+      steps: [{ id: 's1', title: 'the vendored contract' }],
+    }).steps;
+    expect(step).toEqual({
+      id: 's1',
+      title: 'the vendored contract',
+      anticipatedFiles: [],
+      dependsOn: [],
+      acceptance: { observableTruths: [], artifacts: [], links: [] },
+    });
+  });
+
+  // A step with no identity cannot be depended on, labelled in a transcript, or reported against.
+  it('refuses a step with no id or no title', () => {
+    expect(() => ExecutionSpec.parse({ steps: [{ title: 'x' }] })).toThrow();
+    expect(() => ExecutionSpec.parse({ steps: [{ id: 's1' }] })).toThrow();
   });
 
   // Orientation only — nothing branches on it today. `modify` is the default because it is both
@@ -177,6 +202,7 @@ describe('hasExecutionSpec separates "nobody planned this" from "planned, and it
       'lockedDecisions',
       'requiredReading',
       'requirementIds',
+      'steps',
     ]);
   });
 });

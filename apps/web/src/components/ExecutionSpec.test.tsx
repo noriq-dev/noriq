@@ -19,6 +19,7 @@ const spec = (over: Partial<ExecutionSpec> = {}): ExecutionSpec => ({
   discretion: [],
   deferred: [],
   acceptance: { observableTruths: [], artifacts: [], links: [] },
+  steps: [],
   ...over,
 });
 

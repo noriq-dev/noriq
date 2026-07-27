@@ -113,6 +113,7 @@ describe('a task carries an execution spec (RUN-135)', () => {
       discretion: ['everything'],
       deferred: [],
       acceptance: { observableTruths: [], artifacts: [], links: [] },
+      steps: [],
     });
 
     await patchTask(created.id, { executionSpec: null });

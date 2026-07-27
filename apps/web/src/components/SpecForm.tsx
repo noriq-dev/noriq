@@ -337,6 +337,16 @@ export function SpecForm({
       </div>
       <div style={{ fontSize: 10.5, color: 'var(--text-faint)', marginTop: 7, lineHeight: 1.5 }}>
         Saving REPLACES the whole spec — there is no field-level merge. Empty rows are dropped.
+        {draft.steps.length > 0 && (
+          // Said out loud because the sentence above is otherwise a half-truth: the spec holds a
+          // field this form does not show. It is preserved on save, and a human who is not told it
+          // exists has no way to know that.
+          <>
+            {' '}
+            This spec also carries <strong>{draft.steps.length} planner-authored step(s)</strong>,
+            which this form does not edit and does not discard.
+          </>
+        )}
       </div>
     </div>
   );
@@ -347,6 +357,10 @@ export function SpecForm({
 export function pruneDraft(d: SpecDraft): SpecDraft {
   const nonBlank = (xs: string[]) => xs.map((x) => x.trim()).filter(Boolean);
   return {
+    // Passed through untouched. `steps` (RUN-148) is the planner's decomposition and this form does
+    // not edit it — but saving REPLACES the whole spec, so dropping the field here would have a
+    // human silently destroy a decomposition by correcting a typo in an unrelated one.
+    steps: d.steps,
     requirementIds: nonBlank(d.requirementIds),
     anticipatedFiles: d.anticipatedFiles.filter((f) => f.path.trim()).map((f) => ({ ...f, path: f.path.trim() })),
     requiredReading: nonBlank(d.requiredReading),

@@ -24,6 +24,7 @@ import { confirm } from './Dialog';
 
 /** The shape the form edits: every field present, so no row reasons about absence. */
 const EMPTY_DRAFT: SpecDraft = {
+  steps: [],
   requirementIds: [],
   anticipatedFiles: [],
   requiredReading: [],
