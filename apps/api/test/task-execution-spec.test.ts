@@ -328,6 +328,45 @@ describe('a task carries an execution spec (RUN-135)', () => {
     }
   });
 
+  // RUN-162. "Somebody edited this task" and "somebody moved the goalposts" are different facts,
+  // and a reviewer asking the second should not have to read every edit to find out.
+  it('emits a spec change as its OWN event, with a before and an after', async () => {
+    const { body: created } = await createTask({ title: 'contract watcher', executionSpec: SPEC });
+    await patchTask(created.id, { executionSpec: { discretion: ['everything'] } });
+    const res = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/snapshot`, {
+      headers: { Cookie: cookie },
+    });
+    const snap = (await res.json()) as {
+      events: Array<{ verb: string; payload: { from?: string; to?: string } }>;
+    };
+    const changed = snap.events.find((e) => e.verb === 'task.spec_changed');
+    expect(changed).toBeDefined();
+    expect(changed?.payload.from).toMatch(/1 file\(s\), 1 decision\(s\)/);
+    expect(changed?.payload.to).toMatch(/0 file\(s\), 0 decision\(s\), 0 acceptance/);
+  });
+
+  // A combined patch emits only `task.status_changed`, so without its own event the spec change
+  // would have had none at all.
+  it('emits it even when the same patch changed the status', async () => {
+    const { body: created } = await createTask({ title: 'combined patch' });
+    await patchTask(created.id, { status: 'review', executionSpec: { requirementIds: ['R'] } });
+    const res = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/snapshot`, {
+      headers: { Cookie: cookie },
+    });
+    const snap = (await res.json()) as { events: Array<{ verb: string; subjectId?: string }> };
+    expect(snap.events.some((e) => e.verb === 'task.spec_changed')).toBe(true);
+  });
+
+  it('records a CLEARED spec as a change to none, not as silence', async () => {
+    const { body: created } = await createTask({ title: 'cleared', executionSpec: SPEC });
+    await patchTask(created.id, { executionSpec: null });
+    const res = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/snapshot`, {
+      headers: { Cookie: cookie },
+    });
+    const snap = (await res.json()) as { events: Array<{ verb: string; payload: { to?: string } }> };
+    expect(snap.events.some((e) => e.verb === 'task.spec_changed' && e.payload.to === 'none')).toBe(true);
+  });
+
   it('names the spec in the update event, so a watcher has something to key on', async () => {
     const { body: created } = await createTask({ title: 'event watcher' });
     await patchTask(created.id, { executionSpec: { discretion: ['anything'] } });

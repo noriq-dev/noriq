@@ -612,7 +612,11 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
               ${taskWireStatus()} AS status,
               type, priority, estimate, due_at AS dueAt, claimed_by AS claimedBy, claim_expires_at AS claimExpiresAt,
               parent_task_id AS parentTaskId, milestone_id AS milestoneId, board_id AS boardId, archived_at AS archivedAt,
-              failed_at AS failedAt, open_comments AS openComments, "order"
+              failed_at AS failedAt, open_comments AS openComments, "order",
+              -- Whether there IS a spec, never the spec (RUN-162). Approving a plan approves what
+              -- its tasks say, so the board counts the unplanned ones; shipping every spec through
+              -- this poll to draw that number would be the whole feature's payload for it.
+              (execution_spec IS NOT NULL) AS specPlanned
        FROM tasks WHERE project_id = ? ORDER BY "order"`,
     ).bind(pid).all(),
     c.env.DB.prepare(

@@ -562,6 +562,8 @@ export interface ApiSnapshot {
     milestoneId: string | null; boardId: string | null; openComments: number; order: number; archivedAt: string | null;
     // 'failed' status is derived from failedAt (PLNR-178) — set when the anchor run's gate failed.
     failedAt?: string | null;
+    /** 1/0 from SQLite — whether the task has an execution spec at all (RUN-162). */
+    specPlanned?: number | boolean;
   }>;
   dependencies: Array<{ taskId: string; dependsOnTaskId: string }>;
   agents: Array<{ id: string; name: string; role: string; status: string; lastSeenAt: string | null; ownerName: string | null; parentAgentId: string | null }>;

@@ -86,6 +86,13 @@ export function PlansView({ store }: { store: AppStore }) {
           const doneCount = allTaskIds.filter((tid) => taskById.get(tid)?.status === 'done').length;
           const open = expanded[plan.id] ?? false;
           const proposed = plan.status === 'proposed';
+          // Approving a plan approves what its tasks say (RUN-162). `specPlanned` rides on the
+          // snapshot as a BOOLEAN — the spec itself is a detail read, and shipping every one of
+          // them through the board's poll to draw a count would be the whole feature's payload for
+          // a number.
+          const unplanned = proposed
+            ? allTaskIds.filter((id) => !taskById.get(id)?.specPlanned).length
+            : 0;
           // The active phase = first phase with unfinished tasks.
           const activeIdx = planPhases.findIndex((ph) =>
             phaseTasks.filter((pt) => pt.phaseId === ph.id).some((pt) => taskById.get(pt.taskId)?.status !== 'done'),
@@ -176,6 +183,20 @@ export function PlansView({ store }: { store: AppStore }) {
                 >
                   <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: '#f5a623' }}>
                     ⏳ awaiting your approval — its {allTaskIds.length} task{allTaskIds.length === 1 ? '' : 's'} can't be claimed or dispatched until you approve
+                    {/* What is actually being approved (RUN-162). Approving a plan approves what
+                        its tasks SAY, and a task with no execution spec is one whose scope and
+                        definition of done its builder will decide for itself — which is a thing to
+                        know before clicking, not after. Counted from the snapshot, so it costs no
+                        request; the spec itself lives on the detail read and is read in the
+                        drawer. */}
+                    {unplanned > 0 && (
+                      <>
+                        {' · '}
+                        <span style={{ color: 'var(--text-mid)' }}>
+                          {unplanned} of them {unplanned === 1 ? 'has' : 'have'} no execution spec — whoever picks {unplanned === 1 ? 'it' : 'them'} up decides the scope
+                        </span>
+                      </>
+                    )}
                   </span>
                   <div style={{ flex: 1 }} />
                   <Button

@@ -115,6 +115,31 @@ export type CreatedTask = { id: string; key: string; executionSpec?: ExecutionSp
 /** What an update returns. `executionSpec` present iff the patch mentioned it; null = cleared. */
 export type UpdatedTask = { ok: true; key: string; executionSpec?: ExecutionSpec | null };
 
+/**
+ * A one-line description of a stored spec, for the change event (RUN-162).
+ *
+ * Counts rather than contents: enough for a human or a reviewer to see THAT the contract moved and
+ * roughly how much, without turning the event log into a second copy of every spec ever written.
+ * Whoever needs the detail reads the task, which is the row that answers what it says now.
+ */
+function specSummary(stored: string | null): string {
+  if (!stored) return 'none';
+  try {
+    const s = JSON.parse(stored) as {
+      anticipatedFiles?: unknown[];
+      lockedDecisions?: unknown[];
+      acceptance?: { observableTruths?: unknown[]; artifacts?: unknown[]; links?: unknown[] };
+    };
+    const acc =
+      (s.acceptance?.observableTruths?.length ?? 0) +
+      (s.acceptance?.artifacts?.length ?? 0) +
+      (s.acceptance?.links?.length ?? 0);
+    return `${s.anticipatedFiles?.length ?? 0} file(s), ${s.lockedDecisions?.length ?? 0} decision(s), ${acc} acceptance criteri(a)`;
+  } catch {
+    return 'unreadable';
+  }
+}
+
 type TaskRow = {
   id: string;
   key: string;
@@ -718,6 +743,17 @@ export class ProjectRoom extends DurableObject<Env> {
         sets.push('execution_spec = ?');
         binds.push(executionSpec);
       }
+      // What the spec WAS, read before the write, for the change event below (RUN-162). Read
+      // whether or not anything else in this patch changed, because the point is that a spec edit
+      // is visible on its own terms rather than as one field in a list.
+      const priorSpec =
+        executionSpec === undefined
+          ? null
+          : ((
+              await this.env.DB.prepare('SELECT execution_spec AS spec FROM tasks WHERE id = ?')
+                .bind(taskId)
+                .first<{ spec: string | null }>()
+            )?.spec ?? null);
       // Re-parent (PLNR-89): resolve the new parent by id-or-key, reject self-parenting
       // and cycles (the new parent must not be the task or one of its descendants).
       if (patch.parentTaskId !== undefined) {
@@ -786,6 +822,22 @@ export class ProjectRoom extends DurableObject<Env> {
         }
       } else {
         await this.emit(actor, 'task.updated', 'task', taskId, { key: task.key, fields: Object.keys(patch) });
+      }
+      // A spec change is its OWN event (RUN-162), emitted in addition to whatever the patch
+      // otherwise was. `task.updated` naming `executionSpec` among its fields is not enough: a
+      // reviewer asking "did the goalposts move while this was being built" should not have to
+      // read every edit to find out, and a combined `{status, executionSpec}` patch emits only
+      // `task.status_changed` — so the spec change would have had no event at all.
+      //
+      // A SUMMARY, never the specs themselves. The event log is a record of what happened; two
+      // copies of a spec in it would make it a second store of the data, and the task row is the
+      // one that answers "what does it say now".
+      if (executionSpec !== undefined) {
+        await this.emit(actor, 'task.spec_changed', 'task', taskId, {
+          key: task.key,
+          from: specSummary(priorSpec),
+          to: specSummary(executionSpec),
+        });
       }
       this.reindexSearch('task', taskId);
       // Same echo as createTask (RUN-136). `undefined` = the patch never mentioned the spec, so
