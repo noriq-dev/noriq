@@ -25,6 +25,28 @@ import { taskClaimability } from './lib/claimability';
 import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
 
 const MAX_ATTACHMENT = 100 * 1024 * 1024;
+
+/**
+ * What every task tool says about the execution spec (RUN-136).
+ *
+ * Appended to the TOOL description — a plain string — and not attached with `.describe()` on the
+ * field, because that metadata does not survive: the MCP SDK resolves its own zod (3.x) while this
+ * package and the shared contract are on 4.x, so a field's `description` is dropped in the
+ * zod→JSON-Schema conversion while its structure comes through. An agent would see a large
+ * anonymous object and nothing telling it when to fill it in, which is precisely the failure this
+ * text exists to prevent. Verified by asserting on the generated `tools/list` payload.
+ *
+ * Says WHEN to write one, not only what the fields are — a description that names the shape
+ * produces specs that name the shape.
+ */
+const EXECUTION_SPEC_DESC =
+  '`executionSpec` is what the agent that picks the task up is handed BEFORE it starts, so it does not spend its best context rediscovering the repo and then invent its own scope and definition of done. ' +
+  'Fields (all optional — fill in what you actually know): requirementIds; anticipatedFiles (paths it expects to touch, with change + why); requiredReading (repo paths or doc ids); ' +
+  'lockedDecisions (already settled — do NOT relitigate; give the `because`, so the constraint is understood rather than merely obeyed); ' +
+  'discretion (where it may choose for itself — without this an agent reads every gap as an oversight); ' +
+  'deferred (explicitly not this task, so a reviewer does not flag a known gap); ' +
+  'acceptance = observableTruths (statements that will be TRUE when it is done, never steps to perform), artifacts (path + what it provides + expected exports), links (from → to → via: the wiring that catches "every file present, nothing calling any of it"). ' +
+  'Write one whenever you know more about the work than its title and body say — which is almost always true of whoever just planned it, and almost never true of whoever claims it days later.';
 // Inline base64 rides the model's context window at ~1 token/byte both ways, so it is only
 // for genuinely small payloads (a log snippet, an icon). Anything real goes through
 // create_attachment_upload. 16 KB ≈ 22 KB base64 ≈ ~22K tokens each way — the practical
@@ -54,6 +76,10 @@ TTL is generous (30 min), so you never need to ping to stay alive. heartbeat exi
 for the rare case where you'll go silent longer than that; (4) check and resolve open
 comments — humans steer you through them; (5) release_task (to review or done) when
 finished. Never work on a task you have not claimed.
+When you file a task and already know more about the work than its title and body say — which
+files it touches, what to read first, what is already decided, what "done" looks like — put that
+in the task's executionSpec as well as in prose. It is what the agent that picks the task up is
+handed before it starts. A scoping run's findings belong there, not only in a summary.
 Tasks you create MUST carry descriptive tags (topic/area/component words like "oauth" or
 "board-filters"); the FIRST tag is the primary tag. Tags are a shared filter vocabulary:
 reuse existing tags before minting new ones — near-duplicates are rejected, and curated
@@ -305,6 +331,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           'You already have an identity — `you` above is it, and `you.kind` says whether you are a human\'s copilot or a runner-spawned agent. Nothing to register. Work loop: my_updates → pick from claimable (or next_claimable) → claim_task (just the one you are about to start) → do the work → resolve any comments → release_task {toStatus:"review"|"done"}. Every tool call renews your claim, so no periodic pinging — heartbeat only if you will be idle longer than the claim TTL.',
           'Humans steer via comments on tasks (kind: question/instruction). Acknowledge fast, resolve with resolve_comment (addressed|wont_do) + a reply. Unresolved comments should block you from finishing.',
           'Anything bigger than one task: plan first. create_plan writes the plan as a document — goals/approach in the body, then ordered phases over tasks. Phase order itself gates the work (tasks in phase N are claimable once every earlier phase is finished — no dependency wiring needed); or decompose_task for a quick subtree. Workers drain the plan via next_claimable; keep it current with update_plan.',
+          'Hand the NEXT agent what you learned: a task\'s executionSpec carries requirementIds, anticipated files, required reading, decisions already settled (do not relitigate), where it may use its own judgement, what is explicitly out of scope, and acceptance criteria written as truths rather than steps. Fill it in whenever you know more than the title and body say — on create_task/create_tasks, on a plan\'s newTasks, or later with update_task (which REPLACES the whole spec; read it first and send it back complete). Read it before you start (get_task.executionSpec): if it is there, its lockedDecisions bind you and its acceptance is your definition of done. If executionSpecUnreadable is set, the stored spec is corrupt — say so, do not treat it as absent.',
           'Tasks you create MUST carry descriptive tags — topic/area/component words (e.g. "oauth", "board-filters"), FIRST tag = primary tag. Tags are the project\'s SHARED filter vocabulary: reuse existing tags (get_project.tags) before minting — near-duplicates are rejected, and some projects are curated (agents cannot mint at all). Never status/type/priority words as tags. Use dependsOn only for real, hand-picked orderings.',
           'Project docs are settled decisions and facts ONLY (enforced — open questions/TBDs are rejected). Read a task\'s related docs (get_task.docs) before starting; link the docs new tasks must follow via docIds; when you settle something durable, create_doc the outcome. Undecided → request_input first, then document the answer.',
           'Search before you file or dig: semantic_search finds tasks, docs and plans by MEANING (the thing you are about to create may already exist); search_tasks filters by attributes. get_project is the scaffold (ids, tags, boards, docs index, active plans, P4 tasks) — not a task list; never expect the whole backlog from it.',
@@ -500,7 +527,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'save_template',
-    'Save a reusable work template — a plan skeleton (title/body/taskDefaults/phases with newTasks) you can stamp into ANY project later with create_plan_from_template. Save the shapes your team repeats: "ship a feature", "security review", "release checklist". Templates are yours (user-owned), not project-bound.',
+    'Save a reusable work template — a plan skeleton (title/body/taskDefaults/phases with newTasks) you can stamp into ANY project later with create_plan_from_template. Save the shapes your team repeats: "ship a feature", "security review", "release checklist". Templates are yours (user-owned), not project-bound. A task\'s executionSpec travels with the template — it is part of the shape, not a per-project id.',
     {
       name: z.string().min(1).max(80),
       description: z.string().max(300).optional(),
@@ -528,7 +555,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
             // of its concrete ids (RUN-135) — anticipated paths, decisions and acceptance criteria
             // travel to any project. Omitting it here would silently drop the most valuable half
             // of a saved plan: zod strips unknown keys before this is serialized.
-            executionSpec: ExecutionSpec.nullish().describe('This task\'s execution spec — travels with the template'),
+            executionSpec: ExecutionSpec.nullish(),
           })).min(1),
         })).min(1).max(12),
       }).describe('The skeleton — same shape create_plan takes, minus concrete ids (no taskIds/milestones: those are per-project)'),
@@ -725,7 +752,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'create_task',
-    'Create ONE task. `tags` is REQUIRED: 1+ descriptive topic/area tags, FIRST tag = primary (e.g. ["oauth", "token-refresh"]) — never status/type/priority words, those have dedicated fields. Set everything at creation: docIds for the design docs it must follow, boardId for placement, parentTaskId for a decomposition tree, dependsOn (task ids or keys in this project) to gate order. Before filing, semantic_search — the task may already exist. Creating several tasks? Use create_tasks (one call, shared defaults); structuring multi-phase work? create_plan. New tasks start as todo.',
+    'Create ONE task. `tags` is REQUIRED: 1+ descriptive topic/area tags, FIRST tag = primary (e.g. ["oauth", "token-refresh"]) — never status/type/priority words, those have dedicated fields. Set everything at creation: docIds for the design docs it must follow, boardId for placement, parentTaskId for a decomposition tree, dependsOn (task ids or keys in this project) to gate order. Before filing, semantic_search — the task may already exist. Creating several tasks? Use create_tasks (one call, shared defaults); structuring multi-phase work? create_plan. New tasks start as todo. ' +
+    EXECUTION_SPEC_DESC,
     {
       projectId: z.string(),
       title: z.string().min(1),
@@ -743,6 +771,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
       boardId: z.string().optional().describe('Board to place the task on (see get_project.boards); defaults to the parent task’s board for subtasks, else the project’s default board'),
       docIds: z.array(z.string()).optional().describe('Related project docs (ids from list_docs) — link the design/decision docs this task implements or must follow, so workers read them before starting'),
+      executionSpec: ExecutionSpec.nullish(),
     },
     tool(async ({ projectId, ...input }) => {
       requireDescriptiveTags(input.tags);
@@ -752,7 +781,9 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'create_tasks',
-    'Create MANY tasks in one call — the batch form of create_task, for building a backlog or a plan\'s inventory without one call per task. Every item needs descriptive `tags` (its own, or via `defaults.tags`; first tag = primary, never status/type/priority words). `defaults` fills fields every item shares (per-item values win). Give items a `ref` (any string unique in the batch) and read ids back by ref instead of by position; later items may name an earlier item\'s ref in dependsOn/parentTaskId. Items are created in order and a failed item does NOT roll back earlier ones — check each result for `error`.',
+    'Create MANY tasks in one call — the batch form of create_task, for building a backlog or a plan\'s inventory without one call per task. Every item needs descriptive `tags` (its own, or via `defaults.tags`; first tag = primary, never status/type/priority words). `defaults` fills fields every item shares (per-item values win). Give items a `ref` (any string unique in the batch) and read ids back by ref instead of by position; later items may name an earlier item\'s ref in dependsOn/parentTaskId. Items are created in order and a failed item does NOT roll back earlier ones — check each result for `error` (that applies to failures the server finds, like a bad ref or a rejected tag; a malformed field is caught by the schema and rejects the WHOLE call before anything is created). ' +
+    EXECUTION_SPEC_DESC +
+      " Per item AND in `defaults` — but a default spec is replaced wholesale by an item's own, never merged with it, and a spec usually names one piece of work.",
     {
       projectId: z.string(),
       defaults: z.object({
@@ -764,6 +795,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
         tags: z.array(z.string()).optional(),
         docIds: z.array(z.string()).optional(),
+        // Present so it is HONOURED rather than silently stripped: zod drops unknown keys, and the
+        // advertised schema has no `additionalProperties:false`, so an agent that sent one here
+        // would get a batch of unplanned tasks and a success response.
+        executionSpec: ExecutionSpec.nullish(),
       }).optional().describe('Shared fields applied to every item unless the item sets its own'),
       allowNewTags: z.boolean().optional().describe('Applies to every item: mint tags the near-duplicate guard flagged'),
       tasks: z.array(
@@ -781,6 +816,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           tags: z.array(z.string()).optional(),
           parentTaskId: z.string().optional().describe('Existing task id/key, or an earlier item\'s ref'),
           dependsOn: z.array(z.string()).optional().describe('Existing task ids/keys, or earlier items\' refs'),
+          // Per item, and deliberately absent from `defaults`: a spec names the files, decisions
+          // and acceptance criteria of ONE piece of work, so anything shared across a batch would
+          // be wrong for every item that inherited it (RUN-135).
+          executionSpec: ExecutionSpec.nullish(),
         }),
       ).min(1).max(100),
     },
@@ -819,6 +858,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
             allowNewTags,
             parentTaskId,
             dependsOn,
+            executionSpec: item.executionSpec ?? defaults?.executionSpec,
           });
           if (item.ref) byRef.set(item.ref, res.id);
           created.push({ ref: item.ref, title: item.title, id: res.id, key: res.key });
@@ -864,7 +904,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'update_task',
-    'Edit task fields. For claim-related status changes prefer claim_task/release_task; setting status directly here is a supervisor-style override.',
+    'Edit task fields. For claim-related status changes prefer claim_task/release_task; setting status directly here is a supervisor-style override. `executionSpec` REPLACES the whole spec (null clears it; omit to leave it alone) — there is no field-level merge, so read it first with get_task and send it back complete. ' +
+    EXECUTION_SPEC_DESC,
     {
       projectId: z.string(),
       taskId: z.string(),
@@ -885,6 +926,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       addDocIds: z.array(z.string()).optional().describe('Link these docs, keeping existing links'),
       removeDocIds: z.array(z.string()).optional().describe('Unlink these docs, keeping the rest'),
       allowNewTags: z.boolean().optional().describe('Mint a tag the near-duplicate guard flagged — only for genuinely distinct concepts'),
+      executionSpec: ExecutionSpec.nullish(),
     },
     tool(async ({ projectId, taskId, ...patch }) => {
       // A runner-spawned agent must not move its task's status (PLNR-192). RUN-83 took
@@ -899,13 +941,20 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
             '(gate passed → review, failed → failed). Drop the status field; the other edits are fine.',
         );
       }
+      // NOT guarded here, and it is a live question rather than an oversight (RUN-160): a run
+      // agent may rewrite its own task's `executionSpec`, including the lockedDecisions it is
+      // meant to be held to. A blanket ban is wrong — a scope run authoring specs is the point of
+      // this field — so the discriminator has to be the run's KIND, which this surface does not
+      // currently know. Nothing enforces a spec yet (the runner does not read one until RUN-138),
+      // so the exposure today is a builder confusing its own reviewer, not defeating a gate.
+      // Whoever wires the spec into the gate owns closing this.
       return room(env, projectId).updateTask(projectId, actor, await resolveTaskId(env, projectId, taskId), patch);
     }),
   );
 
   defineTool(
     'update_tasks',
-    'Apply ONE change to MANY tasks — bulk re-tag, re-prioritize, move to a milestone/board, or supervisor-style bulk status. `set` is applied to every task in taskIds (ids or keys); results are per-task, and one failure does not stop the rest. For tags, addTags/removeTags edit without clobbering; `tags` replaces outright.',
+    'Apply ONE change to MANY tasks — bulk re-tag, re-prioritize, move to a milestone/board, or supervisor-style bulk status. `set` is applied to every task in taskIds (ids or keys); results are per-task, and one failure does not stop the rest. For tags, addTags/removeTags edit without clobbering; `tags` replaces outright. `executionSpec` replaces the whole spec on every listed task (null clears them) — reach for it when the specs genuinely coincide, e.g. one architecture decision or one required reading list across a phase; a spec that names files or acceptance criteria describes ONE piece of work and will be wrong for every task but one.',
     {
       projectId: z.string(),
       taskIds: z.array(z.string()).min(1).max(100).describe('Task ids or display keys'),
@@ -921,6 +970,14 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         addTags: z.array(z.string()).optional(),
         removeTags: z.array(z.string()).optional(),
         parentTaskId: z.string().nullable().optional(),
+        // A whole spec, same as every other field here — replaced, not merged. A first cut
+        // accepted only `null` (a bulk clear) on the grounds that a spec names ONE piece of work;
+        // review rejected that, correctly. Shared required reading, one architecture decision, an
+        // epic-level `deferred` note — those genuinely coincide across a phase, bulk status and
+        // bulk tag replacement are no less dangerous and are not second-guessed, and refusing
+        // also rejected a one-task call for no reason. The warning belongs in the description,
+        // not in the schema.
+        executionSpec: ExecutionSpec.nullish(),
       }).describe('The change applied to every task'),
     },
     tool(async ({ projectId, taskIds, set }) => {
@@ -943,7 +1000,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'get_task',
-    'Full task detail including body, dependencies, comments (open first), git refs, related docs (READ them before starting — they carry the design decisions the task must follow), and claim state.',
+    'Full task detail including body, dependencies, comments (open first), git refs, related docs (READ them before starting — they carry the design decisions the task must follow), claim state, and `executionSpec` — what this task tells you before you start. If it is there, its lockedDecisions bind you and its acceptance is your definition of done. If `executionSpecUnreadable` is set, the stored spec is corrupt: say so, and do not treat it as absent.',
     { taskId: z.string() },
     tool(async ({ taskId }) => {
       const task = await env.DB.prepare(
@@ -1546,7 +1603,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'create_plan',
-    'Write your plan as a real document, then structure the work. body = your full written readout in markdown: goals, context, approach, constraints, risks, and an exit gate — what a teammate would need to pick this up. Each phase gets its own body (explicit details for that stage) plus its tasks (existing ids/keys via taskIds, or created inline via newTasks). Phase order is ENFORCED — every task in phase N auto-depends on all of phase N-1. Humans read the document and watch progress in the Plans view; append status updates later with update_plan.',
+    'Write your plan as a real document, then structure the work. body = your full written readout in markdown: goals, context, approach, constraints, risks, and an exit gate — what a teammate would need to pick this up. Each phase gets its own body (explicit details for that stage) plus its tasks (existing ids/keys via taskIds, or created inline via newTasks). Phase order is ENFORCED — every task in phase N auto-depends on all of phase N-1. Humans read the document and watch progress in the Plans view; append status updates later with update_plan. ' +
+    EXECUTION_SPEC_DESC + ' Per newTask, never in taskDefaults — a spec names ONE piece of work, so a shared one would be wrong for every task that inherited it. This is how a scoping pass hands real execution detail forward instead of prose alone.',
     {
       projectId: z.string(),
       title: z.string().min(1),
@@ -1578,9 +1636,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
             type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
             tags: z.array(z.string()).optional(),
             dependsOn: z.array(z.string()).optional().describe('Ad-hoc extra edges beyond the enforced phase chain — existing task ids or keys'),
-            executionSpec: ExecutionSpec.nullish().describe(
-              'What a builder is told before it starts THIS task: anticipatedFiles, requiredReading, lockedDecisions (settled, do not relitigate), discretion (where it may choose), deferred (explicitly not this task), and acceptance (observableTruths / artifacts / links). Every field optional. Per task, never in taskDefaults — a spec names one piece of work.',
-            ),
+            executionSpec: ExecutionSpec.nullish(),
           })).optional(),
         }),
       ).min(1).max(12),

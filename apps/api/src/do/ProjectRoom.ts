@@ -12,7 +12,7 @@ import {
 import { searchBackend, indexEntity, removeEntity, type SearchKind } from '../search';
 import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
-import { RunKind, AgentTool, RunStatus, type RunPhase, type ExecutionSpecInput, isTerminalRunStatus } from '@noriq-dev/shared';
+import { RunKind, AgentTool, RunStatus, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus } from '@noriq-dev/shared';
 import { writeExecutionSpec } from '../lib/execution-spec';
 
 /**
@@ -109,6 +109,11 @@ export interface TaskPatch {
    *  leaves whatever is there, exactly like every other field in this patch. */
   executionSpec?: ExecutionSpecInput | null;
 }
+
+/** What a create returns. `executionSpec` present iff the call set one, normalised as stored. */
+export type CreatedTask = { id: string; key: string; executionSpec?: ExecutionSpec };
+/** What an update returns. `executionSpec` present iff the patch mentioned it; null = cleared. */
+export type UpdatedTask = { ok: true; key: string; executionSpec?: ExecutionSpec | null };
 
 type TaskRow = {
   id: string;
@@ -516,12 +521,14 @@ export class ProjectRoom extends DurableObject<Env> {
 
   /** Top-level entry point — wraps the lock. Callers already inside a gated method (e.g.
    *  createPlan) use `_createTaskLocked` to avoid nesting blockConcurrencyWhile (PLNR-116). */
-  async createTask(projectId: string, actor: Actor, input: CreateTaskInput)  {
+  /** The spec is echoed back only when the call SET one (RUN-136) — see `_createTaskLocked`. The
+   *  explicit annotation also keeps `ExecutionSpec`'s depth out of every caller's inference. */
+  async createTask(projectId: string, actor: Actor, input: CreateTaskInput): Promise<CreatedTask> {
     return this.ctx.blockConcurrencyWhile(() => this._createTaskLocked(projectId, actor, input));
   }
 
   /** Body of createTask, WITHOUT the lock. Only call from inside blockConcurrencyWhile. */
-  private async _createTaskLocked(projectId: string, actor: Actor, input: CreateTaskInput)  {
+  private async _createTaskLocked(projectId: string, actor: Actor, input: CreateTaskInput): Promise<CreatedTask> {
       await this.setPid(projectId);
       const pid = this.projectId;
       const proj = await this.env.DB.prepare('SELECT key, next_task_number AS n FROM projects WHERE id = ?')
@@ -601,10 +608,14 @@ export class ProjectRoom extends DurableObject<Env> {
         key, title: input.title, parentTaskId: input.parentTaskId ?? null,
       });
       this.reindexSearch('task', id);
-      return { id, key };
+      // Echo the spec BACK when one was set (RUN-136), normalised as stored: defaults filled in,
+      // unknown keys dropped. Without it a caller cannot see what its spec became without a
+      // second round-trip per task, and normalisation is exactly the part it did not write.
+      // Absent when the task has none, so the common response is unchanged.
+      return executionSpec ? { id, key, executionSpec: JSON.parse(executionSpec) } : { id, key };
   }
 
-  async updateTask(projectId: string, actor: Actor, taskId: string, patch: TaskPatch)  {
+  async updateTask(projectId: string, actor: Actor, taskId: string, patch: TaskPatch): Promise<UpdatedTask> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const task = await this.getTask(taskId);
@@ -777,6 +788,11 @@ export class ProjectRoom extends DurableObject<Env> {
         await this.emit(actor, 'task.updated', 'task', taskId, { key: task.key, fields: Object.keys(patch) });
       }
       this.reindexSearch('task', taskId);
+      // Same echo as createTask (RUN-136). `undefined` = the patch never mentioned the spec, so
+      // nothing is echoed; an explicit clear echoes null, which is the confirmation that matters.
+      if (executionSpec !== undefined) {
+        return { ok: true, key: task.key, executionSpec: executionSpec ? JSON.parse(executionSpec) : null };
+      }
       return { ok: true, key: task.key };
 
     });

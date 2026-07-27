@@ -175,6 +175,44 @@ paper over a structural change with prose alone; fix the structure so the docume
 reality agree. Reserve \`dependsOn\`/\`add_dependency\` for real, hand-picked orderings
 outside the phase flow.
 
+### The execution spec
+
+A task's \`executionSpec\` is what the agent that picks it up is handed *before* it starts.
+Fill it in whenever you know more about the work than its title and body say — that is almost
+always true of the person who just planned it, and almost never true of the agent who claims it
+three days later. Without one, every builder spends its earliest and most valuable context
+rediscovering the repo, then invents its own scope and its own definition of done.
+
+It carries:
+
+- \`requirementIds\` — what this work satisfies (Noriq task keys, or an external tracker's
+  ids), so a line of the diff can be traced back to why it exists.
+- \`anticipatedFiles\` — the paths the work is expected to touch (\`path\`, \`change\`,
+  \`why\`). Declaring them is how a reviewer, and a human scanning the plan, can see the blast
+  radius before anything is spent.
+- \`requiredReading\` — repo paths or Noriq doc ids, in the order they help.
+- \`lockedDecisions\` — already settled; **do not relitigate**. Give the \`because\`, so the
+  constraint is understood rather than merely obeyed: an agent that knows *why* can tell when a
+  case genuinely falls outside it.
+- \`discretion\` — where the agent may choose for itself. Say it out loud: without it, every
+  gap reads as an oversight rather than an invitation.
+- \`deferred\` — explicitly not this task's problem, so a reviewer does not flag a known,
+  accepted gap as an omission.
+- \`acceptance\` — goal-backward, not step-by-step. \`observableTruths\` are statements that
+  will be TRUE when the work is done ("a dispatch with no spec still runs"), never steps to
+  perform ("run the tests"). \`artifacts\` name a path, what it provides, and the exports it
+  must offer. \`links\` (\`from\` → \`to\` → \`via\`) are the wiring, and they catch the
+  classic half-done build: every file present, every export defined, nothing calling any of it.
+
+Every field is optional — fill in what you actually know, and leave the rest empty rather than
+inventing it. Set it on \`create_task\`/\`create_tasks\`, on a plan's \`newTasks\`, or later
+with \`update_task\` (which REPLACES the whole spec — there is no field-level merge).
+
+**Reading one:** \`get_task\` returns \`executionSpec\`. If it is there, its
+\`lockedDecisions\` bind you and its \`acceptance\` is your definition of done. If
+\`executionSpecUnreadable\` is set, the stored spec is corrupt — say so and ask; do not treat
+it as "no spec" and plan over it.
+
 For a quick subtree without the ceremony, \`decompose_task\`; for ad-hoc ordering,
 \`add_dependency\` (undo a wrong edge with \`remove_dependency\`); to coordinate
 mid-flight, \`send_message\`. See who else is on the project (and what they hold)
