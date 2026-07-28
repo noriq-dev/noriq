@@ -606,6 +606,54 @@ describe("a build run settles its anchor task from the gate outcome (RUN-83)", (
     expect(Date.parse(after!.exp)).toBeGreaterThan(Date.parse(nearly)); // and pushed out
   });
 
+  it("a telemetry tick renews the run agent's FILE LOCKS too (RUN-184)", async () => {
+    // Locks carry their own TTL, defaulted to the same 1800s as the claim. Without this a
+    // ~50-minute build keeps its task claim while losing its locks at the 30-minute mark —
+    // voiding RUN-105's held-through-the-merge guarantee for exactly the runs long enough to
+    // need it. Keyed on the agent, not the anchor: a brief-only run holds locks too.
+    await env.DB.prepare(
+      "INSERT INTO tasks (id, project_id, key, title, status) VALUES ('task_lockrenew', ?, 'STL-LOCKR', 't', 'todo')",
+    ).bind(pid).run();
+    const run = await anchored("task_lockrenew");
+    await room(pid).claimAnchorTaskOnMint(pid, run.id, "agt_spawned");
+    await room(pid).transitionRun(pid, actor, run.id, { status: "running", agentId: "agt_spawned" });
+    const nearly = new Date(Date.now() + 5_000).toISOString();
+    await env.DB.prepare(
+      `INSERT INTO file_locks (id, project_id, agent_id, task_id, kind, raw_pattern, canon_pattern, branch, acquired_at, expires_at)
+       VALUES ('lk_renew', ?, 'agt_spawned', 'task_lockrenew', 'file', 'src/a.ts', 'src/a.ts', 'main', ?, ?)`,
+    ).bind(pid, new Date().toISOString(), nearly).run();
+    // …and one held by a DIFFERENT agent, which this run's heartbeat must not touch.
+    await env.DB.prepare(
+      `INSERT INTO file_locks (id, project_id, agent_id, kind, raw_pattern, canon_pattern, branch, acquired_at, expires_at)
+       VALUES ('lk_other', ?, 'agt_x', 'file', 'src/b.ts', 'src/b.ts', 'main', ?, ?)`,
+    ).bind(pid, new Date().toISOString(), nearly).run();
+
+    await room(pid).recordRunTelemetry(pid, run.id, { tokensUsed: 100 });
+
+    const mine = await env.DB.prepare("SELECT expires_at AS e FROM file_locks WHERE id = 'lk_renew'").first<{ e: string }>();
+    const theirs = await env.DB.prepare("SELECT expires_at AS e FROM file_locks WHERE id = 'lk_other'").first<{ e: string }>();
+    expect(Date.parse(mine!.e)).toBeGreaterThan(Date.parse(nearly)); // renewed
+    expect(theirs!.e).toBe(nearly); // untouched
+  });
+
+  it("a BRIEF-only run renews its locks too — they key on the agent, not the anchor (RUN-184)", async () => {
+    // A run with no task anchor has no settle hook for its locks; the tick is the only thing
+    // keeping them honest, so the renewal must not be gated on an anchor existing.
+    const run = await room(pid).createRun(pid, actor, {
+      kind: "build", repoRef: "r", agentTool: "claude", brief: "just do it", runnerId: "rnr_1",
+    });
+    await env.DB.prepare("UPDATE runs SET agent_id = 'agt_spawned' WHERE id = ?").bind(run.id).run();
+    await room(pid).transitionRun(pid, actor, run.id, { status: "running", agentId: "agt_spawned" });
+    const nearly = new Date(Date.now() + 5_000).toISOString();
+    await env.DB.prepare(
+      `INSERT INTO file_locks (id, project_id, agent_id, kind, raw_pattern, canon_pattern, branch, acquired_at, expires_at)
+       VALUES ('lk_brief', ?, 'agt_spawned', 'file', 'src/c.ts', 'src/c.ts', 'main', ?, ?)`,
+    ).bind(pid, new Date().toISOString(), nearly).run();
+    await room(pid).recordRunTelemetry(pid, run.id, { tokensUsed: 10 });
+    const after = await env.DB.prepare("SELECT expires_at AS e FROM file_locks WHERE id = 'lk_brief'").first<{ e: string }>();
+    expect(Date.parse(after!.e)).toBeGreaterThan(Date.parse(nearly));
+  });
+
   it("a telemetry tick never renews somebody ELSE's claim (RUN-181)", async () => {
     // The renewal is scoped to the claim the RUN holds. A task that moved on to another agent
     // must not have its lease extended by an unrelated run's heartbeat.

@@ -1099,11 +1099,18 @@ export class ProjectRoom extends DurableObject<Env> {
          WHERE project_id = ? AND claimed_by IS NOT NULL AND claim_expires_at < ? AND status = 'in_progress'`,
       ).bind(this.projectId, now).all<TaskRow & { title: string }>();
       for (const t of results) {
-        await this.env.DB.batch([
-          this.env.DB.prepare('UPDATE claims SET released_at = ? WHERE task_id = ? AND released_at IS NULL').bind(now, t.id),
-          this.env.DB.prepare("UPDATE tasks SET status = 'todo', claimed_by = NULL, claim_expires_at = NULL, updated_at = ? WHERE id = ?")
-            .bind(now, t.id),
-        ]);
+        // Guarded, and the guard decides everything after it: a run's telemetry tick renews the
+        // claim (RUN-181/184) and can land between the SELECT above and this write. The
+        // destructive half must re-check what it read — same holder, still expired — or a renewal
+        // loses to a stale sweep: the reaper would requeue a task whose run just proved itself
+        // alive, and then release that run's file locks mid-merge on the strength of a snapshot.
+        const requeued = await this.env.DB.prepare(
+          `UPDATE tasks SET status = 'todo', claimed_by = NULL, claim_expires_at = NULL, updated_at = ?
+            WHERE id = ? AND claimed_by = ? AND claim_expires_at < ?`,
+        ).bind(now, t.id, t.claimed_by, now).run();
+        if (!requeued.meta.changes) continue; // renewed (or re-claimed) since the SELECT — not ours
+        await this.env.DB.prepare('UPDATE claims SET released_at = ? WHERE task_id = ? AND released_at IS NULL')
+          .bind(now, t.id).run();
         // A requeued task has left active work — drop its file locks too (PLNR-204).
         await this.releaseLocksForTask(t.id, SYSTEM_ACTOR, 'claim TTL expired');
         // Logged as its own event so the timeline shows why a task went back to todo.
@@ -1187,11 +1194,22 @@ export class ProjectRoom extends DurableObject<Env> {
       'SELECT id, canon_pattern AS canonPattern, agent_id AS agentId, task_id AS taskId FROM file_locks WHERE project_id = ? AND released_at IS NULL AND expires_at < ?',
     ).bind(this.projectId, now).all<{ id: string; canonPattern: string; agentId: string; taskId: string | null }>();
     if (!results.length) return;
-    await this.env.DB.prepare('UPDATE file_locks SET released_at = ? WHERE project_id = ? AND released_at IS NULL AND expires_at < ?')
-      .bind(now, this.projectId, now).run();
+    // Released ONE BY ONE, each re-checking expiry, and the event reports only what actually
+    // released. A telemetry tick renews a live run's locks (RUN-184) and can land between the
+    // SELECT above and the write — a single sweep UPDATE still behaves (its WHERE re-checks), but
+    // an event emitted from the stale SELECT would announce expiries that never happened, and a
+    // false `lock.expired` is an invitation to take a file a live run still holds.
+    const reaped: typeof results = [];
+    for (const r of results) {
+      const gone = await this.env.DB.prepare(
+        'UPDATE file_locks SET released_at = ? WHERE id = ? AND released_at IS NULL AND expires_at < ?',
+      ).bind(now, r.id, now).run();
+      if (gone.meta.changes) reaped.push(r);
+    }
+    if (!reaped.length) return;
     await this.emit(SYSTEM_ACTOR, 'lock.expired', 'lock', this.projectId, {
-      count: results.length, ids: results.map((r) => r.id), paths: results.map((r) => r.canonPattern),
-      holders: results.map((r) => r.agentId), reason: 'lock TTL expired',
+      count: reaped.length, ids: reaped.map((r) => r.id), paths: reaped.map((r) => r.canonPattern),
+      holders: reaped.map((r) => r.agentId), reason: 'lock TTL expired',
     });
   }
 
@@ -3560,27 +3578,52 @@ export class ProjectRoom extends DurableObject<Env> {
     // reaper: a daemon that dies silently must still let the claim lapse, and it is the absence of
     // these ticks that says so.
     const renewedTo = new Date(Date.now() + (await this.claimTtlSeconds()) * 1000).toISOString();
-    // Scoped to THIS project on both sides. `runs.anchor_id` is a soft reference and run creation
-    // does not prove the anchor belongs to the run's project, so an unscoped renewal could reach
-    // across into another project's task.
-    const anchor = await this.env.DB.prepare(
-      `SELECT r.anchor_id AS taskId, r.agent_id AS agentId FROM runs r
-        JOIN tasks t ON t.id = r.anchor_id AND t.project_id = r.project_id
-        WHERE r.id = ? AND r.project_id = ? AND r.anchor_type = 'task'
-          AND r.status IN ('running','blocked') AND r.agent_id IS NOT NULL`,
-    ).bind(runId, projectId).first<{ taskId: string; agentId: string }>();
-    if (anchor) {
-      // BOTH lease records, not just the one the reaper happens to read. `tasks.claim_expires_at`
-      // is what `alarm()` sweeps, but `claims.expires_at` is the canonical row every other renewal
-      // path keeps in step; letting them drift would leave two answers to "when does this lapse".
-      await this.env.DB.batch([
-        this.env.DB.prepare(
-          'UPDATE tasks SET claim_expires_at = ?, updated_at = ? WHERE id = ? AND claimed_by = ?',
-        ).bind(renewedTo, nowIso(), anchor.taskId, anchor.agentId),
-        this.env.DB.prepare(
-          'UPDATE claims SET expires_at = ? WHERE task_id = ? AND agent_id = ? AND released_at IS NULL',
-        ).bind(renewedTo, anchor.taskId, anchor.agentId),
-      ]);
+    // Every lease the LIVE run holds, in one place — the tick that proves the run alive is the
+    // answer to what every TTL is asking. Keyed on the run's AGENT, not its anchor: file locks
+    // belong to the agent whether or not the run is task-anchored (a brief-only run holds them
+    // too, and its locks have no settle hook — the tick is the only thing keeping them honest).
+    const live = await this.env.DB.prepare(
+      `SELECT r.agent_id AS agentId, r.anchor_type AS anchorType, r.anchor_id AS anchorId FROM runs r
+        WHERE r.id = ? AND r.project_id = ? AND r.status IN ('running','blocked')
+          AND r.agent_id IS NOT NULL`,
+    ).bind(runId, projectId).first<{ agentId: string; anchorType: string | null; anchorId: string | null }>();
+    if (live) {
+      // Only a TASK anchor names a claim to renew. `anchor_id` is a soft reference, so without
+      // this a plan-anchored run whose anchor id happened to collide with a task id would renew
+      // that task's claim — typed id prefixes make it unlikely, not impossible.
+      const taskId = live.anchorType === 'task' ? live.anchorId : null;
+      // File locks first (RUN-184): they carry their own TTL — their OWN, read from
+      // `lockTtlSeconds`, which every acquire/renew path uses; borrowing the claim TTL here would
+      // silently widen or shorten leases whenever the two are configured apart. A ~50-minute
+      // build otherwise keeps its task claim while losing its locks at the 30-minute mark —
+      // voiding RUN-105's held-through-the-merge guarantee for exactly the runs long enough to
+      // need it. Scoped to this agent in this project; the reaper still collects the moment the
+      // ticks stop.
+      const lockRenewedTo = new Date(Date.now() + (await this.lockTtlSeconds()) * 1000).toISOString();
+      await this.env.DB.prepare(
+        'UPDATE file_locks SET expires_at = ? WHERE project_id = ? AND agent_id = ? AND released_at IS NULL',
+      ).bind(lockRenewedTo, projectId, live.agentId).run();
+      // The anchor-task claim, when there is one. Scoped to THIS project on both sides:
+      // `runs.anchor_id` is a soft reference and run creation does not prove the anchor belongs
+      // to the run's project, so an unscoped renewal could reach across into another project's
+      // task. BOTH lease records move, not just the one the reaper happens to read —
+      // `tasks.claim_expires_at` is what `alarm()` sweeps, but `claims.expires_at` is the
+      // canonical row every other renewal path keeps in step, and two answers to "when does this
+      // lapse" is not a state worth creating.
+      const anchored = taskId
+        ? await this.env.DB.prepare('SELECT 1 AS ok FROM tasks WHERE id = ? AND project_id = ?')
+            .bind(taskId, projectId).first<{ ok: number }>()
+        : null;
+      if (anchored && taskId) {
+        await this.env.DB.batch([
+          this.env.DB.prepare(
+            'UPDATE tasks SET claim_expires_at = ?, updated_at = ? WHERE id = ? AND claimed_by = ?',
+          ).bind(renewedTo, nowIso(), taskId, live.agentId),
+          this.env.DB.prepare(
+            'UPDATE claims SET expires_at = ? WHERE task_id = ? AND agent_id = ? AND released_at IS NULL',
+          ).bind(renewedTo, taskId, live.agentId),
+        ]);
+      }
     }
     // model_usage is a TRI-STATE (RUN-59), which COALESCE cannot express: null/absent = no
     // news (keep); {} = the daemon EXPLICITLY retracting an unattributable mix (store NULL);
