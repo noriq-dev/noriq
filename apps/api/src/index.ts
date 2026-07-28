@@ -148,7 +148,14 @@ app.all('/mcp', agentAuth, async (c) => {
   const raw = await c.req.json().catch(() => null);
   const msgs = raw == null ? [] : Array.isArray(raw) ? raw : [raw];
   const isInit = msgs.some((m) => m?.method === 'initialize');
-  let sessionId = c.req.header('mcp-session-id') || undefined;
+  // OpenAI app bridges may create a fresh MCP transport session for each tool
+  // invocation. Their stable conversation identity is carried on tools/call as
+  // `_meta["openai/session"]`; prefer it so one Codex/ChatGPT thread remains one
+  // Noriq copilot even when Mcp-Session-Id changes underneath it.
+  const openAiSession = msgs
+    .map((m) => m?.params?._meta?.['openai/session'])
+    .find((value) => typeof value === 'string' && value.length > 0) as string | undefined;
+  let sessionId = openAiSession ? `openai:${openAiSession}` : c.req.header('mcp-session-id') || undefined;
   if (isInit && !sessionId) sessionId = crypto.randomUUID();
   let agent = conn.boundAgent;
   if (!agent && sessionId) {
@@ -2165,18 +2172,6 @@ app.post('/api/runs/:runId/agent', agentAuth, async (c) => {
     c.env.DB.prepare('UPDATE agents SET oauth_token_id = ? WHERE id = ?').bind(tokens.tokenId, agentId),
     c.env.DB.prepare('UPDATE runs SET agent_id = ? WHERE id = ?').bind(agentId, runId),
   ]);
-  // The run takes its anchor task's CLAIM here, at the one moment that happens exactly once per
-  // sitting (RUN-181). RUN-83 moved the task lifecycle from the agent to the run's outcome but
-  // left the claim with the agent — builders are told to call `claim_task` and nothing enforces
-  // it, so a run whose builder skipped it owned nothing, and a run that passed the gate, landed
-  // and pushed left its task reading as never started and still claimable over merged code.
-  //
-  // Best-effort: a run must still get its credential if the claim cannot be taken (the task may
-  // legitimately be somebody else's, or parked by a human). `settleAnchorTask` reports having
-  // moved nothing via `task.settle_skipped`, which is where that shows up.
-  await room(c.env, run.projectId)
-    .claimAnchorTaskOnMint(run.projectId, runId, agentId)
-    .catch(() => {});
 
   return c.json({
     agentId,
@@ -2528,3 +2523,4 @@ export default {
     );
   },
 };
+

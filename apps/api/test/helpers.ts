@@ -240,17 +240,29 @@ export const sessionFor = (apiKey: string): string => {
 
 /** Call an MCP tool over Streamable HTTP and return the parsed result body + notices.
  *  Pass a sessionId to act as a distinct MCP session (a chat / sub-agent). */
-export async function mcpCall(apiKey: string, tool: string, args: Record<string, unknown> = {}, sessionId?: string) {
-  const first = await mcpCallOnce(apiKey, tool, args, sessionId);
+export async function mcpCall(
+  apiKey: string,
+  tool: string,
+  args: Record<string, unknown> = {},
+  sessionId?: string,
+  meta?: Record<string, unknown>,
+) {
+  const first = await mcpCallOnce(apiKey, tool, args, sessionId, meta);
   // vitest-pool-workers reloads the bundle between files, breaking in-flight DO
   // stubs exactly once ("invalidating this Durable Object ... Please retry").
   if (first.isError && first.text.includes('invalidating this Durable Object')) {
-    return mcpCallOnce(apiKey, tool, args, sessionId);
+    return mcpCallOnce(apiKey, tool, args, sessionId, meta);
   }
   return first;
 }
 
-async function mcpCallOnce(apiKey: string, tool: string, args: Record<string, unknown> = {}, sessionId?: string) {
+async function mcpCallOnce(
+  apiKey: string,
+  tool: string,
+  args: Record<string, unknown> = {},
+  sessionId?: string,
+  meta?: Record<string, unknown>,
+) {
   const res = await SELF.fetch('https://noriq.test/mcp', {
     method: 'POST',
     headers: {
@@ -263,7 +275,7 @@ async function mcpCallOnce(apiKey: string, tool: string, args: Record<string, un
       jsonrpc: '2.0',
       id: rpcId++,
       method: 'tools/call',
-      params: { name: tool, arguments: args },
+      params: { name: tool, arguments: args, ...(meta ? { _meta: meta } : {}) },
     }),
   });
   const raw = await res.text();
@@ -417,3 +429,4 @@ async function sha256HexTest(s: string): Promise<string> {
   const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
   return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
+

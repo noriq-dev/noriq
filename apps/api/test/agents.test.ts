@@ -31,6 +31,22 @@ describe('agents are per-session, project-local', () => {
     expect(first.body.you.name).toBe('alpha');
   });
 
+  it('uses the OpenAI conversation id when transport sessions change', async () => {
+    const meta = { 'openai/session': 'conversation-stable' };
+    const first = await mcpCall(conn.apiKey, 'get_briefing', {}, 'transport-A', meta);
+    const second = await mcpCall(conn.apiKey, 'get_briefing', {}, 'transport-B', meta);
+    const another = await mcpCall(
+      conn.apiKey,
+      'get_briefing',
+      {},
+      'transport-B',
+      { 'openai/session': 'conversation-other' },
+    );
+
+    expect(first.body.you.id).toBe(second.body.you.id);
+    expect(another.body.you.id).not.toBe(first.body.you.id);
+  });
+
   it('project snapshot lists only that project’s agents', async () => {
     // scope one agent to the OTHER project
     await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'gamma', projectId: otherProjectId }, 'sess-C');
@@ -223,3 +239,4 @@ async function bootAdmin(): Promise<string> {
   adminCookie = await loginSession('remodel-admin@example.com', 'longenough1');
   return adminCookie;
 }
+
