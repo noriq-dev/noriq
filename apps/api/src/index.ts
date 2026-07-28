@@ -2103,27 +2103,57 @@ app.post('/api/runs/:runId/agent', agentAuth, async (c) => {
   if (!(await tokenCanReachProject(c.env, conn.tokenId, run.projectId))) {
     return c.json({ error: 'run is outside this connection’s authorized projects' }, 403);
   }
-  // One agent per run, and it is not re-issuable: handing out a second credential for the
-  // same run would mean two live processes could act as one identity, which is exactly the
-  // ambiguity this task exists to remove.
-  if (run.agentId) return c.json({ error: 'run already has an agent' }, 409);
-  // …and a run that is OVER gets none at all. The 409 above only covers a run that already
-  // minted one, so a run that reached a terminal status before its agent was created — a
-  // daemon restart reconciles dispatched runs to failed, and a human can cancel one in the
-  // same window — could still be handed a working credential with no process, no supervision
-  // and no budget behind it. Every terminal path takes an EXISTING credential away
-  // (retireRunAgent); this is the same rule pointed the other way, and without it that
-  // retirement is trivially undone by asking again. It also restores RUN-160: an agent whose
-  // run is not live has no attributable run kind, and a spec write we cannot attribute is
-  // permitted.
+  // A run that is OVER gets no credential at all, and this is asked FIRST so a finished run says
+  // so plainly rather than being refused for the incidental reason that it already had an agent.
+  // A run can reach a terminal status before its agent was ever created — a daemon restart
+  // reconciles dispatched runs to failed, and a human can cancel one in the same window — and
+  // would otherwise be handed a working credential with no process, no supervision and no budget
+  // behind it. Every terminal path takes an EXISTING credential away (retireRunAgent); this is the
+  // same rule pointed the other way, and without it that retirement is trivially undone by asking
+  // again. It also restores RUN-160: an agent whose run is not live has no attributable run kind.
   if (isTerminalRunStatus(run.status)) {
     return c.json({ error: `run is already ${run.status} — it gets no agent` }, 409);
+  }
+  // One LIVE agent per run. What must never happen is two live processes acting as one identity —
+  // so the test is whether the existing agent is still LIVE, not whether one ever existed
+  // (RUN-182). Existence was the wrong test and it made continuing a failed run impossible:
+  // `reopenRun` re-dispatches the SAME run id, `runs.agent_id` still points at the agent retired
+  // when it failed, and the daemon — which cannot act without a credential — was refused on the
+  // strength of a dead one.
+  //
+  // Two conditions, and the second is not redundant. A retired agent is offline WITH no unrevoked
+  // token, which `retireRunAgent` guarantees on every terminal path. But a HUMAN revoking a
+  // misbehaving run agent (Settings → Agent connections) produces that identical tuple while the
+  // run keeps `running` — so without the `dispatched` test the runner could answer a revocation by
+  // minting itself a replacement, and the kill switch would be decorative. `dispatched` is exactly
+  // where `reopenRun` puts a continued run, and where a fresh dispatch sits when the daemon asks.
+  if (run.agentId) {
+    const reusable =
+      run.status === 'dispatched' &&
+      (await c.env.DB.prepare(
+        `SELECT 1 AS ok FROM agents a
+          WHERE a.id = ? AND a.status = 'offline'
+            AND NOT EXISTS (SELECT 1 FROM oauth_tokens t WHERE t.agent_id = a.id AND t.revoked_at IS NULL)`,
+      ).bind(run.agentId).first<{ ok: number }>());
+    if (!reusable) return c.json({ error: 'run already has an agent' }, 409);
   }
 
   const agentId = newId('agt');
   // The label is what a human reads in the dashboard; scope it to the run so two concurrent
   // runs in one project cannot collide (label uniqueness is per-project).
-  const label = b.label ?? `${run.kind}-${runId.slice(-6)}`;
+  const base = b.label ?? `${run.kind}-${runId.slice(-6)}`;
+  // A CONTINUED run mints a second time under the same run id, and the default label is derived
+  // from that id — so it would collide with the retired agent's under the UNIQUE (project_id,
+  // label) index (migration 0045) and fail the insert outright. Distinguish the SITTING, which a
+  // human needs anyway: two agents did work on this run, and a reader has to know which one a
+  // transcript or a claim belongs to.
+  //
+  // Suffixed with the new agent's own id rather than a counted `#2`. Counting reads better but is
+  // wrong in three ways at once: it races (two mints count the same rows and pick the same
+  // number), an unrelated agent already labelled `<base>#3` makes the count select a taken name,
+  // and a caller-supplied label containing `%` or `_` turns the LIKE into a wildcard that matches
+  // strangers. The agent id is unique by construction, so none of those exist.
+  const label = run.agentId ? `${base}#${agentId.slice(-6)}` : base;
   const name = `runner-${agentId.slice(-6)}`;
 
   // Order matters here and it is not arbitrary: agents.oauth_token_id and oauth_tokens.agent_id

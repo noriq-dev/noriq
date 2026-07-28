@@ -3280,21 +3280,47 @@ export class ProjectRoom extends DurableObject<Env> {
     /** The run's agent, whose claim is released regardless of the status guard (PLNR-192). */
     agentId: string | null,
   ): Promise<void> {
-    const owned = "status IN ('in_progress','claimed')";
+    // A task the RUN still owns — and ownership is the CLAIM, not the status alone (RUN-181).
+    //
+    // Status-only was not enough, and the gap is reachable rather than theoretical: a task can
+    // legitimately move on mid-run. The TTL reaper requeues an expired claim, and a human can hand
+    // a task back — both leave it unclaimed `todo` — after which another agent may claim it and be
+    // working when the original run finally settles. On status alone that run then reversed
+    // somebody else's decision: it moved their task, cleared their claim, and released their file
+    // locks. Checking `claimed_by` is what makes "still ours" mean what it says.
+    //
+    // Deliberately NOT widened to an unclaimed `todo`. That was tried, and it cannot tell a
+    // builder that never called `claim_task` from a task a human or the reaper deliberately
+    // requeued — the two states are byte-identical, so admitting one admits reversing the other.
+    // The fix for the never-claimed case belongs where the gap is: the DAEMON takes the claim when
+    // the run starts, instead of the run's authority resting on the agent remembering to.
     const clear = 'claimed_by = NULL, claim_expires_at = NULL';
+    // Built as ONE statement so there is exactly one place that can notice it changed nothing.
+    let set: string;
+    const pre: string[] = [];
     if (outcome === 'done') {
-      await this.env.DB.prepare(
-        `UPDATE tasks SET status = 'review', failed_at = NULL, ${clear}, updated_at = ? WHERE id = ? AND ${owned}`,
-      ).bind(now, taskId).run();
+      set = "status = 'review', failed_at = NULL";
     } else if (outcome === 'failed') {
-      await this.env.DB.prepare(
-        `UPDATE tasks SET status = 'todo', failed_at = ?, ${clear}, updated_at = ? WHERE id = ? AND ${owned}`,
-      ).bind(now, now, taskId).run();
+      set = "status = 'todo', failed_at = ?";
+      pre.push(now);
     } else {
       // cancelled: hand it back to the queue, cleared of any prior failure.
-      await this.env.DB.prepare(
-        `UPDATE tasks SET status = 'todo', failed_at = NULL, ${clear}, updated_at = ? WHERE id = ? AND ${owned}`,
-      ).bind(now, taskId).run();
+      set = "status = 'todo', failed_at = NULL";
+    }
+    const settled = await this.env.DB.prepare(
+      `UPDATE tasks SET ${set}, ${clear}, updated_at = ?
+        WHERE id = ? AND status IN ('in_progress','claimed')
+          AND (claimed_by IS NULL OR claimed_by = ?)`,
+    ).bind(...pre, now, taskId, agentId).run();
+    // A guarded UPDATE that matches nothing is indistinguishable from one that worked, which is
+    // exactly how RUN-181 stayed invisible — a landed run silently failed to close its task. This
+    // is a legitimate outcome (a human moved it off the run), not an error, but it has to be
+    // legible rather than silent.
+    if (!settled.meta.changes) {
+      await this.emit(SYSTEM_ACTOR, 'task.settle_skipped', 'task', taskId, {
+        outcome,
+        reason: 'the task was no longer the run’s to move',
+      });
     }
     // The run's own claim dies with the run even when the status guard above refused
     // (PLNR-192): the agent is retired and its token revoked, so a claim it still holds can

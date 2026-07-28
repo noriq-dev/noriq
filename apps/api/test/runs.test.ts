@@ -542,6 +542,40 @@ describe("a build run settles its anchor task from the gate outcome (RUN-83)", (
     expect((await taskRow("task_unfail"))!.failedAt).toBeNull();
   });
 
+  it("does not stomp a task ANOTHER agent claimed after a requeue (RUN-181)", async () => {
+    // The reachable race, and the state the real claim path actually produces: run A's claim
+    // lapses (TTL reaper → unclaimed todo) or a human hands the task back, agent B claims it and
+    // is working, and only then does run A settle. On a status-only guard, A moved B's task,
+    // cleared B's claim and released B's locks. Ownership has to mean the CLAIM.
+    await mkTask("task_raced", "STL-RACED", "in_progress"); // seeded claimed_by agt_spawned
+    const run = await anchored("task_raced");
+    await room(pid).transitionRun(pid, actor, run.id, { status: "running", agentId: "agt_spawned" });
+    // …the task moves on to somebody else while the run is still going.
+    await env.DB.prepare("UPDATE tasks SET claimed_by = 'agt_x' WHERE id = 'task_raced'").run();
+    await room(pid).transitionRun(pid, actor, run.id, { status: "done" });
+    const row = await taskRow("task_raced");
+    expect(row!.status).toBe("in_progress"); // not promoted to review over B's head
+    expect(row!.claimedBy).toBe("agt_x"); // and B still holds it
+  });
+
+  it("says on the timeline when it settled nothing, instead of passing silently (RUN-181)", async () => {
+    // A guarded UPDATE that matches nothing reads exactly like one that worked, and that silence
+    // is how a landed run failing to close its task went unnoticed at all. This is the live case:
+    // the builder never called claim_task, so the task sat unclaimed in `todo` and the run's
+    // outcome had nothing to move. Legitimate, but it must be legible.
+    await env.DB.prepare(
+      "INSERT INTO tasks (id, project_id, key, title, status) VALUES ('task_quiet', ?, 'STL-QUIET', 't', 'todo')",
+    ).bind(pid).run();
+    const run = await anchored("task_quiet");
+    await room(pid).transitionRun(pid, actor, run.id, { status: "running", agentId: "agt_spawned" });
+    await room(pid).transitionRun(pid, actor, run.id, { status: "done" });
+    expect((await taskRow("task_quiet"))!.status).toBe("todo"); // untouched — nothing was owned
+    const ev = await env.DB.prepare(
+      "SELECT verb FROM events WHERE subject_id = 'task_quiet' AND verb = 'task.settle_skipped'",
+    ).first<{ verb: string }>();
+    expect(ev?.verb).toBe("task.settle_skipped");
+  });
+
   it("does not stomp a task a human already moved off the run (guard)", async () => {
     await mkTask("task_human", "STL-HUMAN", "done");
     const run = await anchored("task_human");
@@ -803,5 +837,113 @@ describe('the specs a run executed under', () => {
     await room(pid).recordRunTelemetry(pid, rid, { tokensUsed: 10 });
     const view = (await room(pid).getRun(pid, rid)) as { executedSpecs?: unknown[] };
     expect(JSON.stringify(view.executedSpecs)).toContain('kept');
+  });
+});
+
+// A continued run re-dispatches the SAME run id, so `runs.agent_id` still points at the agent
+// retired when it failed. Guarding the mint on that field's EXISTENCE meant the daemon — which
+// cannot do anything without a credential — was refused on the strength of a dead one, and
+// continuing a failed run was impossible end to end (RUN-182).
+describe('a continued run mints a fresh agent (RUN-182)', () => {
+  const RNR = 'rnr_cont182';
+  let tok: string;
+  let seq = 0;
+
+  beforeAll(async () => {
+    // The project's own owner, so the mint passes the project-reach check (RUN-38); and a runner
+    // that BELONGS to them, since the endpoint's ownership test reads runners.owner_user_id.
+    tok = await mintTokenForUser('run-owner@example.com', 'longenough1');
+    await authorizeForAllProjects(tok);
+    const u = await env.DB.prepare('SELECT id FROM users WHERE email = ?')
+      .bind('run-owner@example.com').first<{ id: string }>();
+    await env.DB.prepare(
+      'INSERT OR IGNORE INTO runners (id, label, owner_user_id, status, repos) VALUES (?, ?, ?, ?, ?)',
+    ).bind(RNR, RNR, u!.id, 'online', JSON.stringify([{ id: 'repo_fx' }])).run();
+  }, 60000);
+
+  /** A dispatched build run on that runner — the state a daemon asks for a credential from. */
+  const seedRun = async (): Promise<string> => {
+    const id = `run_c182_${seq++}`;
+    await env.DB.prepare(
+      `INSERT INTO runs (id, project_id, runner_id, kind, repo_ref, agent_tool, status, created_by)
+       VALUES (?, ?, ?, 'build', 'repo_fx', 'claude', 'dispatched', 'usr_runtest')`,
+    ).bind(id, pid, RNR).run();
+    return id;
+  };
+  const mintAgent = (runId: string) =>
+    SELF.fetch(`https://noriq.test/api/runs/${runId}/agent`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+
+  it('still refuses a second credential while the first agent is LIVE', async () => {
+    // The invariant that matters is unchanged: two live processes must never act as one identity.
+    const runId = await seedRun();
+    expect((await mintAgent(runId)).status).toBe(200);
+    const again = await mintAgent(runId);
+    expect(again.status).toBe(409);
+    expect(await again.text()).toContain('already has an agent');
+  });
+
+  it('mints a NEW identity once the run is continued and its old agent retired', async () => {
+    const runId = await seedRun();
+    const first = (await (await mintAgent(runId)).json()) as { agentId: string };
+
+    await room(pid).transitionRun(pid, actor, runId, { status: 'running', agentId: first.agentId });
+    await room(pid).transitionRun(pid, actor, runId, { status: 'failed', reason: 'review' });
+    // The terminal path retired the agent: token revoked AND status offline. Both are what the
+    // new guard requires before it will mint again, so assert them rather than assume.
+    const dead = await env.DB.prepare(
+      `SELECT a.status, (SELECT COUNT(*) FROM oauth_tokens t WHERE t.agent_id = a.id AND t.revoked_at IS NULL) AS live
+         FROM agents a WHERE a.id = ?`,
+    ).bind(first.agentId).first<{ status: string; live: number }>();
+    expect(dead).toMatchObject({ status: 'offline', live: 0 });
+
+    await room(pid).reopenRun(pid, actor, runId, 2);
+    const res = await mintAgent(runId);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { agentId: string };
+    expect(body.agentId).not.toBe(first.agentId); // a fresh identity, never the dead one revived
+
+    // …and it carries a DISTINCT label. The default is derived from the run id, so without this
+    // the second sitting collides with the retired agent under UNIQUE (project_id, label) and the
+    // insert fails outright — the liveness guard alone does not make a continuation possible.
+    const labels = await env.DB.prepare('SELECT id, label FROM agents WHERE id IN (?, ?)')
+      .bind(first.agentId, body.agentId).all<{ id: string; label: string }>();
+    const byId = new Map(labels.results.map((r) => [r.id, r.label]));
+    // Suffixed with the agent's own id, not a counted `#2`: unique by construction, so it cannot
+    // race two mints onto one name or collide with an unrelated agent already called `<base>#2`.
+    expect(byId.get(body.agentId)).toBe(`${byId.get(first.agentId)}#${body.agentId.slice(-6)}`);
+  });
+
+  it('a revoked agent on a RUNNING run does not get replaced — revocation is a kill switch', async () => {
+    // Revoking a misbehaving run agent by hand leaves exactly the tuple the liveness guard reads
+    // as retired: token revoked, agent offline. Without the `dispatched` test the runner could
+    // answer a revocation by minting itself a fresh credential, which would make the kill switch
+    // decorative. A continued run is `dispatched`; a revoked-mid-flight one is `running`.
+    const runId = await seedRun();
+    const first = (await (await mintAgent(runId)).json()) as { agentId: string };
+    await room(pid).transitionRun(pid, actor, runId, { status: 'running', agentId: first.agentId });
+    await env.DB.batch([
+      env.DB.prepare('UPDATE oauth_tokens SET revoked_at = ? WHERE agent_id = ?')
+        .bind(new Date().toISOString(), first.agentId),
+      env.DB.prepare("UPDATE agents SET status = 'offline' WHERE id = ?").bind(first.agentId),
+    ]);
+    const res = await mintAgent(runId);
+    expect(res.status).toBe(409);
+    expect(await res.text()).toContain('already has an agent');
+  });
+
+  it('a run that is OVER still gets nothing — retired is not the same as continuable', async () => {
+    // The terminal-status check is what stops the liveness guard widening anything else: an agent
+    // retired by a run that is finished must not become re-mintable merely by being dead.
+    const runId = await seedRun();
+    const first = (await (await mintAgent(runId)).json()) as { agentId: string };
+    await room(pid).transitionRun(pid, actor, runId, { status: 'running', agentId: first.agentId });
+    await room(pid).transitionRun(pid, actor, runId, { status: 'failed', reason: 'review' });
+    const res = await mintAgent(runId); // NOT reopened
+    expect(res.status).toBe(409);
+    expect(await res.text()).toContain('already failed');
   });
 });
