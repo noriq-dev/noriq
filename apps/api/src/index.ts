@@ -2172,6 +2172,22 @@ app.post('/api/runs/:runId/agent', agentAuth, async (c) => {
     c.env.DB.prepare('UPDATE agents SET oauth_token_id = ? WHERE id = ?').bind(tokens.tokenId, agentId),
     c.env.DB.prepare('UPDATE runs SET agent_id = ? WHERE id = ?').bind(agentId, runId),
   ]);
+  // The run takes its anchor task's CLAIM here, at the one moment that happens exactly once per
+  // sitting (RUN-181). RUN-83 moved the task lifecycle from the agent to the run's outcome but
+  // left the claim with the agent — builders are told to call `claim_task` and nothing enforces
+  // it, so a run whose builder skipped it owned nothing, and a run that passed the gate, landed
+  // and pushed left its task reading as never started and still claimable over merged code.
+  //
+  // Best-effort: a run must still get its credential if the claim cannot be taken (the task may
+  // legitimately be somebody else's, or parked by a human). `settleAnchorTask` reports having
+  // moved nothing via `task.settle_skipped`, which is where that shows up.
+  //
+  // RUN-185: this call was dropped by 31582d6 and no test noticed, because the suite exercised
+  // `claimAnchorTaskOnMint` on the DO directly. The endpoint-level test in runs.test.ts is what
+  // holds this line in place now — it fails if this call goes missing again.
+  await room(c.env, run.projectId)
+    .claimAnchorTaskOnMint(run.projectId, runId, agentId)
+    .catch(() => {});
 
   return c.json({
     agentId,

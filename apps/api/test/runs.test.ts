@@ -1016,6 +1016,32 @@ describe('a continued run mints a fresh agent (RUN-182)', () => {
       body: '{}',
     });
 
+  // RUN-185: the ENDPOINT takes the claim, not just the DO method. Every other claim-at-mint test
+  // calls `claimAnchorTaskOnMint` on the room directly, so when 31582d6 deleted the call site from
+  // POST /api/runs/:runId/agent the whole suite stayed green and RUN-181 shipped inert a third
+  // time. This drives the HTTP path a daemon actually calls, so the wiring cannot go missing
+  // silently again — delete the call in index.ts and this test fails.
+  it('the MINT ENDPOINT takes the anchor task\'s claim, not just the DO method (RUN-185)', async () => {
+    await env.DB.prepare(
+      "INSERT INTO tasks (id, project_id, key, title, status) VALUES ('task_mintep', ?, 'STL-MINTEP', 't', 'todo')",
+    ).bind(pid).run();
+    const runId = `run_c182_ep_${seq++}`;
+    await env.DB.prepare(
+      `INSERT INTO runs (id, project_id, runner_id, kind, repo_ref, agent_tool, status, created_by, anchor_type, anchor_id)
+       VALUES (?, ?, ?, 'build', 'repo_fx', 'claude', 'dispatched', 'usr_runtest', 'task', 'task_mintep')`,
+    ).bind(runId, pid, RNR).run();
+
+    const res = await mintAgent(runId);
+    expect(res.status).toBe(200);
+    const { agentId } = (await res.json()) as { agentId: string };
+
+    // The builder never called claim_task — the mint is what owns the task.
+    const row = await env.DB.prepare(
+      'SELECT status, claimed_by AS claimedBy FROM tasks WHERE id = ?',
+    ).bind('task_mintep').first<{ status: string; claimedBy: string | null }>();
+    expect(row).toMatchObject({ status: 'in_progress', claimedBy: agentId });
+  });
+
   it('still refuses a second credential while the first agent is LIVE', async () => {
     // The invariant that matters is unchanged: two live processes must never act as one identity.
     const runId = await seedRun();
