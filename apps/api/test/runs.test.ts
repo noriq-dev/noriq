@@ -558,6 +558,26 @@ describe("a build run settles its anchor task from the gate outcome (RUN-83)", (
     expect(await taskRow("task_selfclaim")).toEqual({ status: "review", failedAt: null, claimedBy: null });
   });
 
+  it("takes the claim when the agent id arrives on a SAME-STATUS patch (RUN-181)", async () => {
+    // The sequence a real daemon produces, and the one that made the first fix dead code: it
+    // reports dispatched→running BEFORE the agent exists (nothing to claim FOR), then reports
+    // running→running once it has minted one. That second report is a PATCH, not a transition, so
+    // a claim hook living only on the transition never runs for any real build.
+    await env.DB.prepare(
+      "INSERT INTO tasks (id, project_id, key, title, status) VALUES ('task_patch', ?, 'STL-PATCH', 't', 'todo')",
+    ).bind(pid).run();
+    const run = await anchored("task_patch");
+    await room(pid).transitionRun(pid, actor, run.id, { status: "running", worktreePath: "/wt/x" });
+    expect((await taskRow("task_patch"))!.claimedBy).toBeNull(); // no agent yet — nothing to claim for
+    await room(pid).transitionRun(pid, actor, run.id, { status: "running", agentId: "agt_spawned" });
+    const held = await taskRow("task_patch");
+    expect(held!.status).toBe("in_progress");
+    expect(held!.claimedBy).toBe("agt_spawned");
+    // …and the run can now settle what it owns.
+    await room(pid).transitionRun(pid, actor, run.id, { status: "done" });
+    expect(await taskRow("task_patch")).toEqual({ status: "review", failedAt: null, claimedBy: null });
+  });
+
   it("never takes a task a human parked elsewhere (RUN-181)", async () => {
     // Only an unclaimed `todo` is taken. A task in review/blocked is a human's decision and the
     // run must not quietly drag it back into progress just because it is anchored to it.
@@ -944,6 +964,24 @@ describe('a continued run mints a fresh agent (RUN-182)', () => {
     // Suffixed with the agent's own id, not a counted `#2`: unique by construction, so it cannot
     // race two mints onto one name or collide with an unrelated agent already called `<base>#2`.
     expect(byId.get(body.agentId)).toBe(`${byId.get(first.agentId)}#${body.agentId.slice(-6)}`);
+  });
+
+  it('mints even though the daemon reports RUNNING before it asks for a credential', async () => {
+    // The live failure the first fix missed. `prepare` reports dispatched→running with no agentId
+    // and only THEN mints, so by the time the endpoint is asked the run is `running`, not
+    // `dispatched`. A guard narrowed to `dispatched` refused precisely the case it existed to
+    // allow — which is why the answer is clearing `agent_id` on reopen rather than reading the
+    // run's status at mint time at all.
+    const runId = await seedRun();
+    const first = (await (await mintAgent(runId)).json()) as { agentId: string };
+    await room(pid).transitionRun(pid, actor, runId, { status: 'running', agentId: first.agentId });
+    await room(pid).transitionRun(pid, actor, runId, { status: 'failed', reason: 'review' });
+    await room(pid).reopenRun(pid, actor, runId, 2);
+    // The daemon leases its workspace and announces itself BEFORE it has an identity.
+    await room(pid).transitionRun(pid, actor, runId, { status: 'running', worktreePath: '/wt/cont' });
+    const res = await mintAgent(runId);
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { agentId: string }).agentId).not.toBe(first.agentId);
   });
 
   it('a revoked agent on a RUNNING run does not get replaced — revocation is a kill switch', async () => {

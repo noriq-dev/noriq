@@ -2715,8 +2715,21 @@ export class ProjectRoom extends DurableObject<Env> {
       // run as a plain run.assigned built from the row (RunnerHub.ts hello handler), so the datum
       // has to live ON the run, not in the one-shot frame we push below.
       const budget = { ...(JSON.parse(run.budget || '{}') as Record<string, unknown>), maxRounds: rounds };
+      // `agent_id` is CLEARED, and that is what makes continuing possible at all (RUN-182). The
+      // agent that ran the failed sitting was retired when it failed — token revoked, marked
+      // offline — but the run still pointed at it, and the mint endpoint refuses a run that
+      // already has one. So the daemon, which cannot act without a credential, was turned away on
+      // the strength of a dead identity and the feature could never complete a single run.
+      //
+      // Clearing it here rather than teaching the endpoint to tolerate a retired agent is the
+      // narrower fix, and the safer one: a human revoking a misbehaving agent mid-run produces the
+      // very same retired tuple, and anything that reads that as "mintable" lets the runner answer
+      // a revocation with a replacement credential. A REOPEN is the one event that genuinely means
+      // "this run gets a new sitting", so it is the one place the slate is wiped. The previous
+      // sitting's identity is not lost by this — the next mint overwrites the column regardless.
       await this.env.DB.prepare(
-        "UPDATE runs SET status = 'dispatched', exit = NULL, phase = NULL, budget = ?, dispatched_at = ?, updated_at = ? WHERE id = ?",
+        `UPDATE runs SET status = 'dispatched', exit = NULL, phase = NULL, agent_id = NULL,
+                budget = ?, dispatched_at = ?, updated_at = ? WHERE id = ?`,
       ).bind(JSON.stringify(budget), now, now, runId).run();
       await this.emit(actor, 'run.status_changed', 'run', runId, { from: 'failed', to: 'dispatched', reason: 'continue', maxRounds: rounds });
 
@@ -3248,6 +3261,19 @@ export class ProjectRoom extends DurableObject<Env> {
         // patch lane also write it would recreate the two-writers race that frame exists to avoid.
         await this.env.DB.prepare('UPDATE runs SET agent_id = ?, worktree_path = ?, updated_at = ? WHERE id = ?')
           .bind(agentId, worktreePath, nowIso(), runId).run();
+        // The run takes its anchor's claim HERE too, and this branch is the one that matters
+        // (RUN-181). The daemon reports `running` twice: first on the real dispatched→running
+        // transition, before the agent exists, and again once it has minted one — and that second
+        // report is running→running, which lands here. Putting the claim only on the transition
+        // made it dead code for every real run: the first report has no agentId to claim FOR, and
+        // the second never reached it. Guarded to the moment the id becomes known, so an ordinary
+        // worktree-path patch does not re-run it.
+        if (
+          run.kind === 'build' && run.anchor_type === 'task' && run.anchor_id &&
+          agentId && !run.agent_id && !isTerminalRunStatus(to)
+        ) {
+          await this.claimAnchorTaskForRun(run.anchor_id, agentId, nowIso());
+        }
         return this.runToWire(await this.loadRun(runId));
       }
       if (!RUN_TRANSITIONS[run.status]?.includes(to)) {
