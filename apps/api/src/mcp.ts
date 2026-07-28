@@ -1766,7 +1766,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'get_plans',
-    'Plans in a project with per-phase progress (done/total tasks) — see how the work program is advancing. Each plan also lists its plan-local docs (id/name/description); read a full one with get_plan_doc.',
+    'Plans in a project with per-phase progress — see how the work program is advancing. Each phase reports `total`, `done` (shipped) and `settled` (done + cancelled): a phase is FINISHED, and the next one open, when `settled === total` — a cancelled task is never coming back, so it gates nothing. Each plan also lists its plan-local docs (id/name/description); read a full one with get_plan_doc.',
     { projectId: z.string() },
     tool(async ({ projectId }) => {
       const { results: plans } = await env.DB.prepare(
@@ -1779,6 +1779,11 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           `SELECT ph.id, ph.title, ph.body, ph."order",
                   (SELECT COUNT(*) FROM phase_tasks pt WHERE pt.phase_id = ph.id) AS total,
                   (SELECT COUNT(*) FROM phase_tasks pt JOIN tasks t ON t.id = pt.task_id WHERE pt.phase_id = ph.id AND t.status = 'done') AS done,
+                  -- settled is what gates the next phase, and it is NOT done (PLNR-229): a
+                  -- cancelled task will never be worked, so it holds nothing open. Both are
+                  -- reported because they answer different questions — how much SHIPPED vs how
+                  -- much is still owed — and a phase is finished when settled === total.
+                  (SELECT COUNT(*) FROM phase_tasks pt JOIN tasks t ON t.id = pt.task_id WHERE pt.phase_id = ph.id AND t.status IN ('done','cancelled')) AS settled,
                   (SELECT GROUP_CONCAT(t.key) FROM phase_tasks pt JOIN tasks t ON t.id = pt.task_id WHERE pt.phase_id = ph.id) AS taskKeys
            FROM phases ph WHERE ph.plan_id = ? ORDER BY ph."order"`,
         ).bind(p.id).all();

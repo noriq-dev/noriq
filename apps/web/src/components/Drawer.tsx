@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { AppStore } from '../store';
 import { api, type ApiAgentEvent } from '../api';
-import type { ExecutionSpec } from '@noriq-dev/shared';
+import { isSettledTaskStatus, type ExecutionSpec } from '@noriq-dev/shared';
 import { KIND_META, statusMeta, verbColors } from '../design';
 import { AvatarChip, MonoTag, SectionLabel } from './bits';
 import { QuestionForm, SignalThreadHistory } from './QuestionForm';
@@ -344,7 +344,10 @@ export function Drawer({ store }: { store: AppStore }) {
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, alignItems: 'center' }}>
                 {deps.map((d) => {
                   const sm = statusMeta(d.status);
-                  const done = d.status === 'done';
+                  // Settled, not merely done (PLNR-229): the server's claim gate clears a
+                  // dependency that is done OR cancelled, so marking a cancelled one "blocking"
+                  // told the reader the task was held up by something that had already gone away.
+                  const done = isSettledTaskStatus(d.status);
                   return (
                     <span
                       key={d.id}

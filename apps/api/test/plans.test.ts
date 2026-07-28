@@ -443,6 +443,33 @@ describe('plans & groups', () => {
     await mcpCall(worker.apiKey, 'release_task', { projectId, taskId: dependent, toStatus: 'done' });
   });
 
+  it('a CANCELLED phase-1 task does not gate phase 2 — cancelled is finished (PLNR-229)', async () => {
+    const plan = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId,
+      title: 'Cancelled does not block',
+      description: 'PLNR-229',
+      body: '# Goal\n\nA dropped task must not wedge the plan.',
+      phases: [
+        { title: 'First', newTasks: [{ title: 'cancelled base' }, { title: 'done base' }] },
+        { title: 'Second', newTasks: [{ title: 'cancel-gated dependent' }] },
+      ],
+    });
+    const [cancelled, finished] = plan.body.phases[0].taskIds as string[];
+    const dependent = plan.body.phases[1].taskIds[0];
+
+    // Phase 1 is settled by two different routes: one task done, the other abandoned.
+    await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: finished });
+    await mcpCall(worker.apiKey, 'release_task', { projectId, taskId: finished, toStatus: 'done' });
+    await mcpCall(planner.apiKey, 'update_task', { projectId, taskId: cancelled, status: 'cancelled' });
+
+    // Nothing in phase 1 is still going to happen, so phase 2 must open.
+    const probe = await mcpCall(worker.apiKey, 'can_claim', { taskId: dependent });
+    expect(probe.body.claimable).toBe(true);
+    const open = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: dependent });
+    expect(open.isError).toBe(false);
+    await mcpCall(worker.apiKey, 'release_task', { projectId, taskId: dependent, toStatus: 'done' });
+  });
+
   it('can_claim reports the phase gate without claiming — the RUN-81 backstop probe (PLNR-177)', async () => {
     const plan = await mcpCall(planner.apiKey, 'create_plan', {
       projectId,

@@ -2,6 +2,7 @@
 // Complexity is progressive: plans are cards with phase progress rails;
 // expanding a plan reveals task chips per phase.
 import { useEffect, useState } from 'react';
+import { isSettledTaskStatus } from '@noriq-dev/shared';
 import { api, type ApiPlanDispatch, type ApiRunner, type RunEffort } from '../api';
 import type { AppStore } from '../store';
 import { statusMeta } from '../design';
@@ -9,6 +10,29 @@ import { AvatarChip, LiveDot, MonoTag, SectionLabel } from './bits';
 import { Button, ErrorNote, Field, Modal, Select, TextArea, TextInput } from './ui';
 import { Markdown } from './Markdown';
 import { confirm } from './Dialog';
+
+/**
+ * The active phase = the first phase still holding unfinished work.
+ *
+ * "Unfinished" has to mean here exactly what it means in the server's phase-order gate
+ * (PLNR-229). It did not: the gate reads `NOT IN ('done','cancelled')` while this view asked
+ * `!== 'done'`, so a single CANCELLED task pinned a plan to its phase permanently — the server
+ * had long since opened the next one, but the UI showed the plan stuck behind work that was
+ * never coming back. Exported (and pure) so the rule is testable on its own rather than only
+ * observable through a rendered plan card.
+ *
+ * Returns -1 when every phase is settled, which `findIndex` gives us and callers read as
+ * "no phase is active" — a finished plan highlights nothing.
+ */
+export function activePhaseIndex(
+  phases: { id: string }[],
+  phaseTasks: { phaseId: string; taskId: string }[],
+  statusOf: (taskId: string) => string | undefined,
+): number {
+  return phases.findIndex((ph) =>
+    phaseTasks.filter((pt) => pt.phaseId === ph.id).some((pt) => !isSettledTaskStatus(statusOf(pt.taskId))),
+  );
+}
 
 export function PlansView({ store }: { store: AppStore }) {
   const { snapshot, currentPid, helpers, actions } = store;
@@ -83,7 +107,7 @@ export function PlansView({ store }: { store: AppStore }) {
           const planPhases = phases.filter((ph) => ph.planId === plan.id).sort((a, b) => a.order - b.order);
           const agent = plan.agentId ? helpers.agentById(currentPid, plan.agentId) : null;
           const allTaskIds = planPhases.flatMap((ph) => phaseTasks.filter((pt) => pt.phaseId === ph.id).map((pt) => pt.taskId));
-          const doneCount = allTaskIds.filter((tid) => taskById.get(tid)?.status === 'done').length;
+          const doneCount = allTaskIds.filter((tid) => isSettledTaskStatus(taskById.get(tid)?.status)).length;
           const open = expanded[plan.id] ?? false;
           const proposed = plan.status === 'proposed';
           // Approving a plan approves what its tasks say (RUN-162). `specPlanned` rides on the
@@ -93,10 +117,7 @@ export function PlansView({ store }: { store: AppStore }) {
           const unplanned = proposed
             ? allTaskIds.filter((id) => !taskById.get(id)?.specPlanned).length
             : 0;
-          // The active phase = first phase with unfinished tasks.
-          const activeIdx = planPhases.findIndex((ph) =>
-            phaseTasks.filter((pt) => pt.phaseId === ph.id).some((pt) => taskById.get(pt.taskId)?.status !== 'done'),
-          );
+          const activeIdx = activePhaseIndex(planPhases, phaseTasks, (tid) => taskById.get(tid)?.status);
 
           return (
             <div
@@ -124,7 +145,7 @@ export function PlansView({ store }: { store: AppStore }) {
                     {plan.archivedAt && <MonoTag color="var(--text-faint)" bg="var(--w-05)" size={9}>ARCHIVED</MonoTag>}
                   </div>
                   <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {agent ? `planned by ${agent.name}` : 'planned by a human'} · {planPhases.length} phases · {doneCount}/{allTaskIds.length} tasks done
+                    {agent ? `planned by ${agent.name}` : 'planned by a human'} · {planPhases.length} phases · {doneCount}/{allTaskIds.length} tasks settled
                     {plan.description ? ` · ${plan.description}` : ''}
                   </div>
                 </div>
@@ -132,7 +153,7 @@ export function PlansView({ store }: { store: AppStore }) {
                 <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
                   {planPhases.map((ph, i) => {
                     const ids = phaseTasks.filter((pt) => pt.phaseId === ph.id).map((pt) => pt.taskId);
-                    const done = ids.filter((tid) => taskById.get(tid)?.status === 'done').length;
+                    const done = ids.filter((tid) => isSettledTaskStatus(taskById.get(tid)?.status)).length;
                     const pct = ids.length ? done / ids.length : 0;
                     const isActive = i === activeIdx;
                     return (
@@ -252,7 +273,7 @@ export function PlansView({ store }: { store: AppStore }) {
                   <div style={{ padding: '14px 18px 16px', display: 'flex', flexDirection: 'column', gap: 12 }}>
                     {planPhases.map((ph, i) => {
                       const ids = phaseTasks.filter((pt) => pt.phaseId === ph.id).map((pt) => pt.taskId);
-                      const phaseDone = ids.filter((tid) => taskById.get(tid)?.status === 'done').length;
+                      const phaseDone = ids.filter((tid) => isSettledTaskStatus(taskById.get(tid)?.status)).length;
                       const isActive = i === activeIdx;
                       const complete = ids.length > 0 && phaseDone === ids.length;
                       return (
