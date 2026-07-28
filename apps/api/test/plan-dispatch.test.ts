@@ -15,7 +15,8 @@ const appEnv = env as unknown as Env;
 const actor: Actor = { kind: 'human', id: 'usr_pd', name: 'Plan Dispatcher' };
 
 interface RoomRpc {
-  createPlan(projectId: string, actor: Actor, input: Record<string, unknown>): Promise<{ id: string; phases: Array<{ taskIds: string[] }> }>;
+  createPlan(projectId: string, actor: Actor, input: Record<string, unknown>): Promise<{ id: string; phases: Array<{ id: string; taskIds: string[] }> }>;
+  restructurePlan(projectId: string, actor: Actor, planId: string, phases: Array<{ id?: string; title: string; taskIds: string[] }>): Promise<unknown>;
   createPlanDispatch(projectId: string, actor: Actor, input: CreatePlanDispatchInput): Promise<PlanDispatchView>;
   cancelPlanDispatch(projectId: string, actor: Actor, id: string, reason?: string | null): Promise<{ ok: boolean; cancelledRuns: number }>;
   retryPlanDispatch(projectId: string, actor: Actor, id: string): Promise<{ created: number }>;
@@ -60,7 +61,7 @@ async function seedAgent(runnerId: string): Promise<string> {
   return id;
 }
 
-/** Two phases: [a, b] then [c]. remintPlanEdges makes c depend on BOTH a and b. */
+/** Two phases: [a, b] then [c]. Phase order is computed live (PLNR-163) — c waits on the whole of phase 1, no edges minted. */
 async function makePlan(title: string) {
   const plan = await room(pid).createPlan(pid, actor, {
     title,
@@ -121,7 +122,7 @@ describe('fan-out respects the dependency graph and the runner capacity', () => 
     const { planId, a, b, c } = await makePlan('par');
     const d = await createDispatch(runner, planId);
     const runs = await dispatchRuns(d.id);
-    // Both dependency-free tasks at once; c waits on its edges, not on a phase label.
+    // Both phase-1 tasks at once; c waits on the computed phase order, not on minted edges.
     expect(runs.map((r) => r.taskId).sort()).toEqual([a, b].sort());
     expect(runs.map((r) => r.taskId)).not.toContain(c);
   });
@@ -150,6 +151,66 @@ describe('fan-out respects the dependency graph and the runner capacity', () => 
     const d = await createDispatch(runner, planId);
     const runs = await dispatchRuns(d.id);
     expect(runs.map((r) => r.taskId)).not.toContain(a);
+  });
+});
+
+describe('a restructure mid-flight regates the pump live (PLNR-163 / RUN-187)', () => {
+  it('a kept phase moved LATER waits for the phases inserted in front of it', async () => {
+    // The live incident, at the level it actually bit: a plan already dispatched, its later
+    // phase KEPT by id but pushed back behind newly inserted work. Phase order is computed from
+    // the structure at read time — no edges exist to go stale — so the pump must see the new
+    // shape on its very next wake-up, not the shape the dispatch was created under.
+    const runner = await seedRunner(1);
+    const agent = await seedAgent(runner);
+    const plan = await room(pid).createPlan(pid, actor, {
+      title: 'restructure-live',
+      phases: [
+        { title: 'first', newTasks: [{ title: 'rsl a' }] },
+        { title: 'last', newTasks: [{ title: 'rsl z' }] },
+      ],
+    });
+    const ph1 = plan.phases[0]!;
+    const ph2 = plan.phases[1]!;
+    const a = ph1.taskIds[0]!;
+    const z = ph2.taskIds[0]!;
+    // gate='landed' so finishing a's RUN unlocks the next phase without a human review click —
+    // the same gate the incident ran under.
+    const d = await createDispatch(runner, plan.id, { gate: 'landed' });
+    const [runA] = await dispatchRuns(d.id);
+    expect(runA!.taskId).toBe(a);
+
+    // Mid-flight, a new phase is inserted in front of the kept last phase.
+    await env.DB.prepare(
+      "INSERT INTO tasks (id, project_id, key, title, status) VALUES ('task_rsl_m', ?, 'PDRS-M', 'rsl m', 'todo')",
+    ).bind(pid).run();
+    await room(pid).restructurePlan(pid, actor, plan.id, [
+      { id: ph1.id, title: 'first', taskIds: [a] },
+      { title: 'inserted', taskIds: ['task_rsl_m'] },
+      { id: ph2.id, title: 'last', taskIds: [z] },
+    ]);
+
+    // a's run finishing is the pump's wake-up. Under the OLD shape z would be next; under the
+    // restructured shape the inserted phase gates it.
+    // Claim as the run's agent before finishing — what claim-at-mint (RUN-181) does for every
+    // real run. Without the claim the settle owns nothing, the task stays `todo`, and it blocks
+    // its own phase: the exact behaviour this suite's DO-driven runs must model to be realistic.
+    await room(pid).claimTask(pid, actor, a, agent);
+    await finishRun(runA!.id, agent);
+    const afterA = await dispatchRuns(d.id);
+    expect(afterA.map((r) => r.taskId)).toContain('task_rsl_m');
+    expect(afterA.map((r) => r.taskId)).not.toContain(z);
+
+    // …and once the inserted phase's run lands, z is finally dispatched.
+    const runM = afterA.find((r) => r.taskId === 'task_rsl_m')!;
+    // A FRESH agent — finishing a's run retired the first one, as production would. Bound to its
+    // run BEFORE claiming: an anchored claim resolves the dispatch's landed gate (a in
+    // review-with-landed-run satisfies), where an unanchored one gets the strict gate and is
+    // refused. The same dance the dispatched-FOR test below models.
+    const agentM = await seedAgent(runner);
+    await room(pid).transitionRun(pid, actor, runM.id, { status: 'running', agentId: agentM });
+    await room(pid).claimTask(pid, actor, 'task_rsl_m', agentM);
+    await room(pid).transitionRun(pid, actor, runM.id, { status: 'done' });
+    expect((await dispatchRuns(d.id)).map((r) => r.taskId)).toContain(z);
   });
 });
 

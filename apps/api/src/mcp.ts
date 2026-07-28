@@ -1685,7 +1685,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'create_plan',
-    'Write your plan as a real document, then structure the work. body = your full written readout in markdown: goals, context, approach, constraints, risks, and an exit gate — what a teammate would need to pick this up. Each phase gets its own body (explicit details for that stage) plus its tasks (existing ids/keys via taskIds, or created inline via newTasks). Phase order is ENFORCED — every task in phase N auto-depends on all of phase N-1. Humans read the document and watch progress in the Plans view; append status updates later with update_plan. ' +
+    'Write your plan as a real document, then structure the work. body = your full written readout in markdown: goals, context, approach, constraints, risks, and an exit gate — what a teammate would need to pick this up. Each phase gets its own body (explicit details for that stage) plus its tasks (existing ids/keys via taskIds, or created inline via newTasks). Phase order is ENFORCED — computed live from the structure (PLNR-163), no edges minted: every task in phase N waits until all of phase N-1 is finished. Humans read the document and watch progress in the Plans view; append status updates later with update_plan. ' +
     EXECUTION_SPEC_DESC + ' Per newTask, never in taskDefaults — a spec names ONE piece of work, so a shared one would be wrong for every task that inherited it. This is how a scoping pass hands real execution detail forward instead of prose alone.',
     {
       projectId: z.string(),
@@ -1717,7 +1717,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
             docIds: z.array(z.string()).optional().describe('Related project docs (ids from list_docs)'),
             type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
             tags: z.array(z.string()).optional(),
-            dependsOn: z.array(z.string()).optional().describe('Ad-hoc extra edges beyond the enforced phase chain — existing task ids or keys'),
+            dependsOn: z.array(z.string()).optional().describe('Ad-hoc extra edges beyond the computed phase order — existing task ids or keys'),
             executionSpec: ExecutionSpec.nullish(),
           })).optional(),
         }),
@@ -1730,7 +1730,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'update_plan',
-    'Revise a plan as work progresses — append status updates, record findings/gotchas, mark the outcome. Pass the FULL new body (read it first via get_plans). updatePhase via phaseId to revise one phase. To change the plan\'s STRUCTURE (add/remove/move tasks between phases, add/drop/reorder phases), pass `phases` with the complete new shape, mirroring create_plan: keep a phase\'s existing id to keep it (and its verify-gate state), omit the id for a new phase, and any existing phase you leave out is dropped. The phase-ordering dependency edges are re-derived to match; hand-added edges are untouched. Keep the document in step with a structural edit — a plan that says one thing and enforces another is worse than no plan.',
+    'Revise a plan as work progresses — append status updates, record findings/gotchas, mark the outcome. Pass the FULL new body (read it first via get_plans). updatePhase via phaseId to revise one phase. To change the plan\'s STRUCTURE (add/remove/move tasks between phases, add/drop/reorder phases), pass `phases` with the complete new shape, mirroring create_plan: keep a phase\'s existing id to keep it (and its verify-gate state), omit the id for a new phase, and any existing phase you leave out is dropped. Phase ordering is COMPUTED from the structure at read time — no dependency edges exist for it, so the new shape gates claims immediately and the dispatch pump at its next wake-up; hand-added dependsOn edges are separate and untouched. NOTE the pump wakes on terminal runs and on tasks marked done/cancelled: if you are also finishing tasks, restructure FIRST, or the pump may legitimately dispatch under the shape you were about to change. Keep the document in step with a structural edit — a plan that says one thing and enforces another is worse than no plan.',
     {
       projectId: z.string(),
       planId: z.string(),
@@ -1747,7 +1747,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           body: z.string().optional().describe('Replacement phase body; omitted = keep the current one'),
           taskIds: z.array(z.string()).min(1).describe('The phase\'s complete new membership (ids or keys)'),
         }),
-      ).min(1).max(12).optional().describe('The plan\'s complete new structure — replaces phase membership wholesale and re-derives the ordering edges (PLNR-154)'),
+      ).min(1).max(12).optional().describe('The plan\'s complete new structure — replaces phase membership wholesale; ordering is computed from it live, nothing to re-derive (PLNR-154/163)'),
     },
     tool(async ({ projectId, planId, title, description, body, phaseId, phaseBody, phaseTitle, phases }) => {
       if (phases) {

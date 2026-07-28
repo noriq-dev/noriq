@@ -3794,8 +3794,12 @@ export class ProjectRoom extends DurableObject<Env> {
 
   // ---------------------------------------------------------------------------
   // Plans — an agent's work program over existing (or inline-created) tasks.
-  // Phase order is ENFORCED: every task in phase N gains a dependency on every
-  // task in phase N-1, so the claim arbiter gates the sequence automatically.
+  // Phase order is COMPUTED, never wired (PLNR-163): no dependency edges are
+  // minted — the claim arbiter, the claimable surface and the dispatch pump all
+  // read the phase graph live, so a restructure regates everything the moment it
+  // lands and there is nothing to drift. (This header once described materialized
+  // per-task edges; that prose outlived the mechanism and sent a live debugging
+  // session hunting a re-derivation bug that could not exist — RUN-187.)
   // ---------------------------------------------------------------------------
 
   async createPlan(
