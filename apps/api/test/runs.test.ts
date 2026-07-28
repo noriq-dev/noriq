@@ -542,6 +542,35 @@ describe("a build run settles its anchor task from the gate outcome (RUN-83)", (
     expect((await taskRow("task_unfail"))!.failedAt).toBeNull();
   });
 
+  it("TAKES the claim when the run starts, so a builder that never claimed still settles (RUN-181)", async () => {
+    // The live failure, end to end: the builder skipped claim_task, so nothing owned the task and
+    // a run that landed and PUSHED left it reading as never started. The run takes the claim
+    // itself now, which is what makes the settle below have something to move.
+    await env.DB.prepare(
+      "INSERT INTO tasks (id, project_id, key, title, status) VALUES ('task_selfclaim', ?, 'STL-SELF', 't', 'todo')",
+    ).bind(pid).run();
+    const run = await anchored("task_selfclaim");
+    await room(pid).transitionRun(pid, actor, run.id, { status: "running", agentId: "agt_spawned" });
+    const mid = await taskRow("task_selfclaim");
+    expect(mid!.status).toBe("in_progress"); // the RUN owns it, not the agent's good manners
+    expect(mid!.claimedBy).toBe("agt_spawned");
+    await room(pid).transitionRun(pid, actor, run.id, { status: "done" });
+    expect(await taskRow("task_selfclaim")).toEqual({ status: "review", failedAt: null, claimedBy: null });
+  });
+
+  it("never takes a task a human parked elsewhere (RUN-181)", async () => {
+    // Only an unclaimed `todo` is taken. A task in review/blocked is a human's decision and the
+    // run must not quietly drag it back into progress just because it is anchored to it.
+    await env.DB.prepare(
+      "INSERT INTO tasks (id, project_id, key, title, status) VALUES ('task_parked', ?, 'STL-PARKED', 't', 'blocked')",
+    ).bind(pid).run();
+    const run = await anchored("task_parked");
+    await room(pid).transitionRun(pid, actor, run.id, { status: "running", agentId: "agt_spawned" });
+    const row = await taskRow("task_parked");
+    expect(row!.status).toBe("blocked");
+    expect(row!.claimedBy).toBeNull();
+  });
+
   it("does not stomp a task ANOTHER agent claimed after a requeue (RUN-181)", async () => {
     // The reachable race, and the state the real claim path actually produces: run A's claim
     // lapses (TTL reaper → unclaimed todo) or a human hands the task back, agent B claims it and
@@ -560,16 +589,16 @@ describe("a build run settles its anchor task from the gate outcome (RUN-83)", (
 
   it("says on the timeline when it settled nothing, instead of passing silently (RUN-181)", async () => {
     // A guarded UPDATE that matches nothing reads exactly like one that worked, and that silence
-    // is how a landed run failing to close its task went unnoticed at all. This is the live case:
-    // the builder never called claim_task, so the task sat unclaimed in `todo` and the run's
-    // outcome had nothing to move. Legitimate, but it must be legible.
+    // is how a landed run failing to close its task went unnoticed at all. The run cannot claim a
+    // task a human parked in `review`, so it owns nothing and settles nothing — legitimate, but it
+    // has to be legible.
     await env.DB.prepare(
-      "INSERT INTO tasks (id, project_id, key, title, status) VALUES ('task_quiet', ?, 'STL-QUIET', 't', 'todo')",
+      "INSERT INTO tasks (id, project_id, key, title, status) VALUES ('task_quiet', ?, 'STL-QUIET', 't', 'review')",
     ).bind(pid).run();
     const run = await anchored("task_quiet");
     await room(pid).transitionRun(pid, actor, run.id, { status: "running", agentId: "agt_spawned" });
     await room(pid).transitionRun(pid, actor, run.id, { status: "done" });
-    expect((await taskRow("task_quiet"))!.status).toBe("todo"); // untouched — nothing was owned
+    expect((await taskRow("task_quiet"))!.status).toBe("review"); // untouched — nothing was owned
     const ev = await env.DB.prepare(
       "SELECT verb FROM events WHERE subject_id = 'task_quiet' AND verb = 'task.settle_skipped'",
     ).first<{ verb: string }>();

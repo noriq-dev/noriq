@@ -904,11 +904,21 @@ export class ProjectRoom extends DurableObject<Env> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const task = await this.getTask(taskId);
-      if (!CLAIMABLE_STATUSES.includes(task.status)) {
-        throw new Error(`${task.key} is not claimable (status: ${task.status})`);
-      }
-      if (task.claimed_by && task.claim_expires_at && task.claim_expires_at > nowIso()) {
-        throw new Error(`${task.key} is already claimed by another agent`);
+      // Re-claiming your OWN task is a RENEWAL, not a conflict (RUN-181). This became reachable
+      // when the run started taking its anchor's claim at `running`: the builder is still told to
+      // call claim_task, and without this it is refused its own task by a message naming it as
+      // "another agent". It is the right answer regardless of who claimed first — an agent
+      // re-asserting a claim it already holds is exactly how the lock surface already behaves.
+      // Answered before the status gate too, since the task is `in_progress` by then and that is
+      // not in CLAIMABLE_STATUSES.
+      const renewing = task.claimed_by === agentId;
+      if (!renewing) {
+        if (!CLAIMABLE_STATUSES.includes(task.status)) {
+          throw new Error(`${task.key} is not claimable (status: ${task.status})`);
+        }
+        if (task.claimed_by && task.claim_expires_at && task.claim_expires_at > nowIso()) {
+          throw new Error(`${task.key} is already claimed by another agent`);
+        }
       }
       // Run-anchored claims and the dependency gate (PLNR-170, tightened by PLNR-176):
       // - A HUMAN dispatching a single task made an explicit, standing readiness call — full
@@ -947,6 +957,37 @@ export class ProjectRoom extends DurableObject<Env> {
       if (gated) throw new Error(`${task.key} belongs to a proposed plan awaiting human approval`);
       const ttl = await this.claimTtlSeconds();
       const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
+      // Re-claiming a task you ALREADY hold is a renewal, not a conflict (RUN-181) — reachable now
+      // that the run takes its anchor's claim at `running`, after which the builder's own
+      // claim_task would otherwise be refused its own task by a message naming it "another agent".
+      //
+      // Placed HERE, below every readiness gate, deliberately: renewal skips the status and
+      // holder checks (the task is `in_progress` and held — by us), but must NOT skip the
+      // dependency/plan-gate re-check. PLNR-176 exists because a dispatch's readiness can go stale
+      // when a human kicks an upstream back, and a renewal is exactly as capable of being stale as
+      // a first claim.
+      if (renewing) {
+        const held = await this.env.DB.prepare(
+          `SELECT id FROM claims WHERE task_id = ? AND agent_id = ? AND released_at IS NULL
+            ORDER BY acquired_at DESC LIMIT 1`,
+        ).bind(taskId, agentId).first<{ id: string }>();
+        const heldId = held?.id ?? newId('clm');
+        await this.env.DB.batch([
+          held
+            ? this.env.DB.prepare('UPDATE claims SET expires_at = ? WHERE id = ?').bind(expiresAt, heldId)
+            : this.env.DB.prepare(
+                'INSERT INTO claims (id, task_id, agent_id, acquired_at, expires_at) VALUES (?, ?, ?, ?, ?)',
+              ).bind(heldId, taskId, agentId, nowIso(), expiresAt),
+          this.env.DB.prepare(
+            "UPDATE tasks SET status = 'in_progress', claim_expires_at = ?, failed_at = NULL, updated_at = ? WHERE id = ?",
+          ).bind(expiresAt, nowIso(), taskId),
+        ]);
+        await this.scheduleExpiryAlarm();
+        return {
+          claimId: heldId, key: task.key, expiresAt, ttlSeconds: ttl,
+          openComments: await this.openCommentsFor(taskId),
+        };
+      }
       const claimId = newId('clm');
       await this.env.DB.batch([
         // Defensive release of any stale claim row before granting.
@@ -3234,6 +3275,15 @@ export class ProjectRoom extends DurableObject<Env> {
                 started_at = ?, updated_at = ? WHERE id = ?`,
       ).bind(to, agentId, exitJson, worktreePath, phase, startedAt, now, runId).run();
       if (isTerminalRunStatus(to) && agentId) await this.retireRunAgent(agentId);
+      // The RUN takes its anchor task's claim when it starts (RUN-181) — the counterpart to
+      // settling it below. RUN-83 moved the task lifecycle from the agent to the run's outcome but
+      // left the CLAIM with the agent: a builder is TOLD to call claim_task and nothing enforces
+      // it. One that skipped it left its task in `todo`, so when the run passed the gate, landed
+      // and pushed, `settleAnchorTask` owned nothing — the task read as never started and stayed
+      // claimable over already-merged code. A run's authority cannot rest on the agent remembering.
+      if (to === 'running' && run.kind === 'build' && run.anchor_type === 'task' && run.anchor_id && agentId) {
+        await this.claimAnchorTaskForRun(run.anchor_id, agentId, now);
+      }
       // The RUN's terminal outcome now moves its anchor task — not the agent (RUN-83). The build
       // agent used to release_task(review) when it finished, BEFORE the daemon's verify/reviewer
       // gate ran, so a gate FAILURE stranded the task in `review`. Settle it here instead, before
@@ -3273,6 +3323,45 @@ export class ProjectRoom extends DurableObject<Env> {
    * Guarded to a task the run still owns (`in_progress`/`claimed`), so a human who moved it first
    * is never stomped. The claim is cleared either way — the run is over.
    */
+  /**
+   * Take the anchor task's claim for the run's own agent, so the run genuinely owns what it is
+   * about to settle (RUN-181).
+   *
+   * Narrow on purpose: only an unclaimed `todo`, which is the state a task sits in when its
+   * builder never claimed it. It never takes a task somebody else holds and never disturbs one a
+   * human parked in review/blocked/cancelled — the same restraint `settleAnchorTask` shows at the
+   * other end. Taking nothing is a legitimate outcome; the run then owns nothing, settles nothing,
+   * and says so via `task.settle_skipped` rather than silently.
+   *
+   * It does NOT re-run `claimTask`'s dependency and plan gates, and that is deliberate rather than
+   * an oversight. Two reasons: the daemon already probed `can_claim` before spawning (RUN-81) and
+   * the server itself dispatched this run, so readiness was decided twice already; and by the time
+   * a run reports `running` its agent is alive and working, so refusing the claim would not stop
+   * the work — it would only leave the task misdescribed. Recording who is working on it is the
+   * honest move. `claimTask` also wraps itself in `blockConcurrencyWhile`, which this is already
+   * inside, so calling it here would risk a deadlock rather than reuse.
+   */
+  private async claimAnchorTaskForRun(taskId: string, agentId: string, now: string): Promise<void> {
+    const ttl = await this.claimTtlSeconds();
+    const expiresAt = new Date(Date.parse(now) + ttl * 1000).toISOString();
+    const claimed = await this.env.DB.prepare(
+      `UPDATE tasks SET status = 'in_progress', claimed_by = ?, claim_expires_at = ?, failed_at = NULL,
+              updated_at = ?
+        WHERE id = ? AND status = 'todo' AND claimed_by IS NULL`,
+    ).bind(agentId, expiresAt, now, taskId).run();
+    if (!claimed.meta.changes) return; // already claimed, or a human has it somewhere else
+    await this.env.DB.batch([
+      this.env.DB.prepare('UPDATE claims SET released_at = ? WHERE task_id = ? AND released_at IS NULL')
+        .bind(now, taskId),
+      this.env.DB.prepare('INSERT INTO claims (id, task_id, agent_id, acquired_at, expires_at) VALUES (?, ?, ?, ?, ?)')
+        .bind(newId('clm'), taskId, agentId, now, expiresAt),
+    ]);
+    // Armed BEFORE the event, for the reason claimTask states: the claim is already committed, and
+    // an unarmed alarm would leave a dead agent's claim never expiring.
+    await this.scheduleExpiryAlarm();
+    await this.emit(SYSTEM_ACTOR, 'task.claimed', 'task', taskId, { agentId, expiresAt, by: 'run' });
+  }
+
   private async settleAnchorTask(
     taskId: string,
     outcome: string,
