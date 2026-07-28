@@ -18,6 +18,9 @@ const STATUS: Record<TaskStatus, StatusMeta> = {
   // on the wire. Deep red, distinct from blocked's alarm red, so "failed the gate" never reads
   // as "awaiting review".
   failed: { label: 'failed', color: '#e5484d', bg: 'rgba(229,72,77,.16)', dot: '#e5484d' },
+  // A run agent's proposed spin-off (PLNR-230) — a real 'todo' with proposed_at set, derived
+  // to 'proposed' on the wire. Amber: it is waiting on a human accept/reject, not on an agent.
+  proposed: { label: 'proposed', color: '#f5a623', bg: 'rgba(245,166,35,.14)', dot: '#f5a623' },
   done: { label: 'done', color: '#3fd98b', bg: 'rgba(63,217,139,.14)', dot: '#3fd98b' },
   cancelled: { label: 'cancelled', color: '#6b7280', bg: 'rgba(107,114,128,.14)', dot: '#6b7280' },
 };

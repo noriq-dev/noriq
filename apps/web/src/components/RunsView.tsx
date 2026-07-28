@@ -339,6 +339,13 @@ function RunRow({ run, runner, onCancel }: { run: ApiRun; runner: ApiRunner | nu
               {run.anchor.type === 'task' ? `task ${run.anchor.taskId.slice(-6)}` : `plan ${run.anchor.planId.slice(-6)}`}
             </MonoTag>
           )}
+          {/* Spin-off volume (PLNR-230): how many tasks this run filed as adjacent work — the
+              guard that makes ten spin-offs dodging ten findings visible at a glance. */}
+          {(run.spinoffs ?? 0) > 0 && (
+            <MonoTag color="var(--amber)" bg="rgba(245,166,35,.12)" size={9}>
+              ⑂ {run.spinoffs} spin-off{run.spinoffs === 1 ? '' : 's'}
+            </MonoTag>
+          )}
         </div>
         {run.brief && (
           <div style={{ fontSize: 12, color: 'var(--text-mid)', marginTop: 4, lineHeight: 1.45, overflow: 'hidden', textOverflow: 'ellipsis', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>

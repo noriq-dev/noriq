@@ -620,6 +620,10 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
               type, priority, estimate, due_at AS dueAt, claimed_by AS claimedBy, claim_expires_at AS claimExpiresAt,
               parent_task_id AS parentTaskId, milestone_id AS milestoneId, board_id AS boardId, archived_at AS archivedAt,
               failed_at AS failedAt, open_comments AS openComments, "order",
+              -- Spin-off surface (PLNR-230): proposedAt drives the approval UI; run/source/finding
+              -- are the provenance the drawer shows a human deciding accept vs reject.
+              proposed_at AS proposedAt, spinoff_run_id AS spinoffRunId,
+              spinoff_source_task_id AS spinoffSourceTaskId, spinoff_finding AS spinoffFinding,
               -- Whether there IS a spec, never the spec (RUN-162). Approving a plan approves what
               -- its tasks say, so the board counts the unplanned ones; shipping every spec through
               -- this poll to draw that number would be the whole feature's payload for it.
@@ -736,6 +740,12 @@ app.get('/api/tasks/:tid', userAuth, async (c) => {
   // wire SELECTs — a task with failed_at set reads as 'failed'. failedAt is already present.
   if (task.failed_at) task.status = 'failed';
   task.failedAt = task.failed_at;
+  // Derived 'proposed' + spin-off provenance (PLNR-230), mirroring MCP get_task.
+  if (task.proposed_at && task.status === 'todo') task.status = 'proposed';
+  task.proposedAt = task.proposed_at;
+  task.spinoffRunId = task.spinoff_run_id;
+  task.spinoffSourceTaskId = task.spinoff_source_task_id;
+  task.spinoffFinding = task.spinoff_finding;
   // The execution spec (RUN-135) rides only on the DETAIL reads — a board snapshot ships every
   // task in a project and renders none of this. `SELECT *` brought the raw JSON along, so the
   // column is dropped rather than shipped beside its parsed form: unlike the scalars above, a
@@ -1024,6 +1034,14 @@ app.post('/api/projects/:pid/plans/:plid/approve', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).approvePlan(c.req.param('pid')!, humanActor(c), c.req.param('plid')!)));
 app.post('/api/projects/:pid/plans/:plid/reject', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).rejectPlan(c.req.param('pid')!, humanActor(c), c.req.param('plid')!)));
+
+// The spin-off gate's task-level twin (PLNR-230): accept a run agent's proposed spin-off
+// (→ plain claimable todo) or reject it (→ cancelled; provenance kept). Same project-reach
+// gating as the plan gate above.
+app.post('/api/projects/:pid/tasks/:tid/spinoff/accept', userAuth, async (c) =>
+  c.json(await room(c.env, c.req.param('pid')!).acceptSpinoff(c.req.param('pid')!, humanActor(c), c.req.param('tid')!)));
+app.post('/api/projects/:pid/tasks/:tid/spinoff/reject', userAuth, async (c) =>
+  c.json(await room(c.env, c.req.param('pid')!).rejectSpinoff(c.req.param('pid')!, humanActor(c), c.req.param('tid')!)));
 
 app.delete('/api/projects/:pid/tasks/:tid', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).deleteTask(c.req.param('pid')!, humanActor(c), c.req.param('tid')!)));

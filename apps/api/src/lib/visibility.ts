@@ -69,9 +69,14 @@ export async function tokenCanReachProject(env: Env, tokenId: string, projectId:
 // table, so a gate-failed task stays a real `todo` (re-armable) with failed_at set, and
 // every wire-facing read renders it as 'failed'. Pass the table alias; use in a SELECT list
 // as `${taskWireStatus('t')} AS status` and select `failed_at AS failedAt` alongside.
+// 'proposed' (PLNR-230) is derived the same way from proposed_at: a spun-off task stays a
+// real `todo` in storage while it awaits the human accept/reject, and renders as 'proposed'.
+// The status='todo' guard keeps a rejected (cancelled) spin-off reading as cancelled.
 export const taskWireStatus = (alias = '') => {
   const p = alias ? `${alias}.` : '';
-  return `CASE WHEN ${p}failed_at IS NOT NULL THEN 'failed' ELSE ${p}status END`;
+  return `CASE WHEN ${p}failed_at IS NOT NULL THEN 'failed'
+               WHEN ${p}proposed_at IS NOT NULL AND ${p}status = 'todo' THEN 'proposed'
+               ELSE ${p}status END`;
 };
 
 export const TASK_NOT_IN_PROPOSED_PLAN = `NOT EXISTS (
@@ -80,6 +85,12 @@ export const TASK_NOT_IN_PROPOSED_PLAN = `NOT EXISTS (
     JOIN plans pl ON pl.id = ph.plan_id
   WHERE pt.task_id = t.id AND pl.status = 'proposed'
 )`;
+
+// Spin-off gate (PLNR-230): a run agent's spun-off task is PROPOSED — visible on the board,
+// inert to every agent path — until a human accepts it (accept clears proposed_at). The
+// task-level twin of the RUN-23 plan-level clause above; every claimable surface composes
+// both. Assumes the tasks table is aliased `t`. Use as: `AND ${TASK_NOT_PROPOSED_SPINOFF}`.
+export const TASK_NOT_PROPOSED_SPINOFF = `t.proposed_at IS NULL`;
 
 // Phase-order gate (PLNR-163): a task in phase N of a live plan is not workable until
 // every task in the plan's earlier phases is done/cancelled. The gate is computed from

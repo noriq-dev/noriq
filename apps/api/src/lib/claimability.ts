@@ -54,13 +54,17 @@ export interface Claimability {
  *  anchored-agent bypass. This is exactly the gate the backstop must surface. */
 export async function taskClaimability(db: D1Database, taskId: string): Promise<Claimability> {
   const task = await db
-    .prepare('SELECT id, key, status FROM tasks WHERE id = ? OR key = ?')
+    .prepare('SELECT id, key, status, proposed_at AS proposedAt FROM tasks WHERE id = ? OR key = ?')
     .bind(taskId, taskId)
-    .first<{ id: string; key: string; status: string }>();
+    .first<{ id: string; key: string; status: string; proposedAt: string | null }>();
   if (!task) throw new Error(`task ${taskId} not found`);
 
   if (!CLAIMABLE_STATUSES.includes(task.status)) {
     return { claimable: false, taskKey: task.key, reason: `not claimable yet (status: ${task.status})` };
+  }
+  // Spin-off gate (PLNR-230): the task-level twin of the proposed-plan gate below.
+  if (task.proposedAt) {
+    return { claimable: false, taskKey: task.key, reason: 'it is a proposed spin-off — awaiting human acceptance' };
   }
   const proposed = await db
     .prepare(

@@ -8,6 +8,7 @@ import { base64ToBytes, bytesToBase64, newId, nowIso, sha256Hex } from './lib/ut
 import {
   TASK_NOT_IN_PROPOSED_PLAN,
   TASK_NOT_PHASE_BLOCKED,
+  TASK_NOT_PROPOSED_SPINOFF,
   USER_PROJECT_WHERE,
   taskWireStatus,
   tokenCanReachProject,
@@ -127,6 +128,10 @@ creation; when you settle something durable, create_doc the outcome. Undecided t
 are not docs — raise request_input, then document the answer.
 Search before you file: semantic_search finds tasks, docs and plans by meaning — the
 thing you are about to create may already exist. Use search_tasks for attribute filters.
+Working a run and found REAL work that is not your task's? File it with spin_off_task —
+it becomes a PROPOSED task (board-visible, unclaimable, undispatchable) until a human
+accepts it, with your run, task and finding recorded as provenance. Do not fold adjacent
+work into your diff, and do not raise_alert it (alerts are concerns that are NOT work).
 You do not register yourself — you already are somebody, and get_briefing tells you who.
 Its \`you.kind\` says which: a "copilot" is a human's session (registered when they
 authorized this connection, and parented to it automatically), and an "agent" was created
@@ -361,6 +366,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           'Claims are exclusive. If claim_task fails, the task is taken or blocked — pick another.',
           'File locking is opt-in per project — get_project.project.fileLocking says whether it is on here. When it is on it is MANDATORY: acquire_lock the file(s) you are about to edit/create/rename BEFORE touching them — all paths in ONE all-or-nothing call, scoped to your branch and linked to your task (they auto-release when it settles). Editing an unlocked file on a locking project is a coordination violation (others read "unlocked" as "free to take"). Re-acquiring your own paths renews them; check_locks to look without taking; release_lock when done. On conflict, coordinate with the holder or wait — never clobber a locked file. Git has no file locking; this is how agents avoid stepping on each other.',
           'Blocked on a human decision? request_input (it auto-parks the task and frees you to work elsewhere) — do not guess or stall. Batch every question the decision needs into its typed `questions` (select/multi/text/number/confirm) in ONE gate; thread a genuine follow-up round with followUpTo. Flag non-blocking concerns (deviations, risks) with raise_alert and keep going.',
+          'Working a run and found REAL work that is not your task\'s? spin_off_task it — the finding becomes its own PROPOSED task (board-visible but unclaimable and undispatchable until a human accepts it), with your run, your task and the finding text recorded as provenance. Neither fold adjacent work into your diff nor raise_alert it: an alert is a concern that is NOT work, a spin-off is work that is not YOURS.',
           'Every tool result may end with a "--- notices ---" block: read it, it is addressed to you.',
         ],
         projects,
@@ -1091,6 +1097,26 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       // Derived status (PLNR-178): SELECT t.* gives the raw column; render 'failed' from failed_at.
       if (task.failed_at) task.status = 'failed';
       task.failedAt = task.failed_at;
+      // Derived 'proposed' + spin-off provenance (PLNR-230): a spun-off task surfaces WHO filed
+      // it and WHY, durably — the runner's adjudicator verifies "real, out of scope, tracked
+      // THERE" pointers against exactly this block, so it rides the detail read.
+      if (task.proposed_at && task.status === 'todo') task.status = 'proposed';
+      task.proposedAt = task.proposed_at;
+      if (task.spinoff_run_id) {
+        const srcKey = task.spinoff_source_task_id
+          ? await env.DB.prepare('SELECT key FROM tasks WHERE id = ?')
+              .bind(task.spinoff_source_task_id).first<{ key: string }>()
+          : null;
+        task.spinoff = {
+          runId: task.spinoff_run_id,
+          sourceTaskId: task.spinoff_source_task_id,
+          sourceTaskKey: srcKey?.key ?? null,
+          finding: task.spinoff_finding,
+        };
+      }
+      delete task.spinoff_run_id;
+      delete task.spinoff_source_task_id;
+      delete task.spinoff_finding;
       const id = String(task.id);
       // The execution spec (RUN-135) — what this task tells a builder before it spends anything.
       // Only on this DETAIL read: `next_claimable` and the list surfaces answer "which task", and
@@ -1194,7 +1220,9 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     'Filter tasks by ATTRIBUTES — "review tasks tagged auth", "my in-progress work", "overdue anywhere". Omit projectId to search every project you can reach. All filters AND together; `text` is an exact substring over title/body/key (NOT meaning — for loosely-phrased "find the thing about X", or to search docs and plans too, use semantic_search). Returns up to `limit` matches urgent-first, plus `matched` (the true total) so a truncated result is visible.',
     {
       projectId: z.string().optional().describe('Restrict to one project; omit for everything your credential reaches'),
-      status: z.enum(['todo', 'in_progress', 'blocked', 'review', 'done', 'cancelled']).optional(),
+      // The WIRE vocabulary, derived statuses included: the filter matches what the results
+      // are labeled with ('failed' from failed_at, 'proposed' from proposed_at — PLNR-230).
+      status: z.enum(['todo', 'in_progress', 'blocked', 'review', 'failed', 'proposed', 'done', 'cancelled']).optional(),
       type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
       tag: z.string().optional().describe('Tag name (exact, case-insensitive)'),
       milestoneId: z.string().optional(),
@@ -1423,6 +1451,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
              SELECT 1 FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id
              WHERE d.task_id = t.id AND dt.status NOT IN ('done','cancelled'))
            AND ${TASK_NOT_IN_PROPOSED_PLAN}
+           AND ${TASK_NOT_PROPOSED_SPINOFF}
            AND ${TASK_NOT_PHASE_BLOCKED}
          ORDER BY t.priority DESC, t."order" LIMIT 1`,
       ).bind(agent.userId, projectId ?? null, opts.oauthTokenId ?? null).first();
@@ -1678,6 +1707,45 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     tool(async ({ projectId, taskId, title, body, severity }) => {
       const refTaskId = taskId ? await resolveTaskId(env, projectId, taskId) : null;
       return room(env, projectId).raiseSignal(projectId, actor, { type: 'alert', taskId: refTaskId, title, body, severity });
+    }),
+  );
+
+  defineTool(
+    'spin_off_task',
+    'RUN AGENTS ONLY (PLNR-230): you found real work that is NOT your task\'s — file it as its own task instead of doing it, growing your diff, or letting it vanish. The task is created PROPOSED: visible on the board but inert to every agent (not claimable, not dispatched, hidden from next_claimable) until a human accepts it (→ todo) or rejects it (→ cancelled). `finding` is the evidence — what you saw, where, and why it is out of your scope; it is stored durably with your run id and your task id, and reviewers verify "out of scope, tracked there" claims against it. Distinct from raise_alert (a concern that is NOT work) and from create_task (immediately-claimable work — this tool exists precisely so your discoveries cannot skip the human gate). Same tag contract as create_task: descriptive topic/area tags, first = primary.',
+    {
+      projectId: z.string(),
+      title: z.string().min(1),
+      body: z.string().optional().describe('The task body a future worker starts from — context, pointers, expected shape of the fix'),
+      finding: z.string().min(1).describe('The finding this task tracks: what you observed, where (files/behavior), and why it is outside your current task'),
+      tags: z.array(z.string()).optional().describe('REQUIRED. Descriptive topic/area tags, primary first — same contract as create_task'),
+      allowNewTags: z.boolean().optional().describe('Mint a tag the near-duplicate guard flagged — only for genuinely distinct concepts'),
+      priority: z.number().int().min(0).max(4).optional(),
+      type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
+    },
+    tool(async ({ projectId, title, body, finding, tags, allowNewTags, priority, type }) => {
+      requireDescriptiveTags(tags);
+      // Provenance is DERIVED, never claimed: the live run bound to this agent names the run id,
+      // and its task anchor names the source task. A copilot (or an agent whose run settled) has
+      // no run to attribute the finding to — it files ordinary work instead.
+      const run = await env.DB.prepare(
+        `SELECT id, anchor_type AS anchorType, anchor_id AS anchorId FROM runs
+         WHERE agent_id = ? AND project_id = ? AND status IN ('dispatched','running','blocked')
+         ORDER BY created_at DESC LIMIT 1`,
+      ).bind(agent.id, projectId).first<{ id: string; anchorType: string | null; anchorId: string | null }>();
+      if (!run) {
+        throw new Error(
+          'spin_off_task is for agents working a live run: no run in this project is bound to you. File the work with create_task instead.',
+        );
+      }
+      return room(env, projectId).createTask(projectId, actor, {
+        title, body, tags, allowNewTags, priority, type,
+        spinoff: {
+          runId: run.id,
+          sourceTaskId: run.anchorType === 'task' ? run.anchorId : null,
+          finding,
+        },
+      });
     }),
   );
 

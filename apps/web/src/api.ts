@@ -167,6 +167,9 @@ export const api = {
   restorePlan: (pid: string, plid: string) => req('POST', `/api/projects/${pid}/plans/${plid}/restore`),
   approvePlan: (pid: string, plid: string) => req<{ id: string; status: string; tasksUngated: number }>('POST', `/api/projects/${pid}/plans/${plid}/approve`),
   rejectPlan: (pid: string, plid: string) => req<{ ok: boolean; cancelledTasks: number }>('POST', `/api/projects/${pid}/plans/${plid}/reject`),
+  // Spin-off gate (PLNR-230): accept → plain claimable todo; reject → cancelled (provenance kept).
+  acceptSpinoff: (pid: string, tid: string) => req<{ id: string; key: string; status: string }>('POST', `/api/projects/${pid}/tasks/${tid}/spinoff/accept`),
+  rejectSpinoff: (pid: string, tid: string) => req<{ id: string; key: string; status: string }>('POST', `/api/projects/${pid}/tasks/${tid}/spinoff/reject`),
   deleteTask: (pid: string, tid: string) => req('DELETE', `/api/projects/${pid}/tasks/${tid}`),
   deleteProject: (pid: string) => req('DELETE', `/api/projects/${pid}`),
   /** Cross-project "what needs me" (PLNR-121): open decisions/alerts + overdue tasks. */
@@ -346,6 +349,8 @@ export interface ApiRun {
   updatedAt: string;
   dispatchedAt: string | null;
   startedAt: string | null;
+  /** How many tasks this run spun off (PLNR-230) — accepted or not; the volume guard. */
+  spinoffs?: number;
 }
 
 /** Per-model spend within a run (RUN-59) — the SDK's own field names, un-renamed. */
@@ -567,6 +572,12 @@ export interface ApiSnapshot {
     failedAt?: string | null;
     /** 1/0 from SQLite — whether the task has an execution spec at all (RUN-162). */
     specPlanned?: number | boolean;
+    /** Spin-off surface (PLNR-230): 'proposed' status derives from proposedAt; the rest is the
+     *  provenance the approval UI shows — which run filed it, from which task, on what finding. */
+    proposedAt?: string | null;
+    spinoffRunId?: string | null;
+    spinoffSourceTaskId?: string | null;
+    spinoffFinding?: string | null;
   }>;
   dependencies: Array<{ taskId: string; dependsOnTaskId: string }>;
   agents: Array<{ id: string; name: string; role: string; status: string; lastSeenAt: string | null; ownerName: string | null; parentAgentId: string | null }>;

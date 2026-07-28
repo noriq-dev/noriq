@@ -18,6 +18,11 @@ export const TaskStatus = z.enum([
   // stays within its CHECK (D1 cannot rebuild tasks to widen it; see 0049) — exactly as
   // RunnerStatus carries 'offboarded', derived from offboarded_at.
   'failed',
+  // A spun-off task awaiting human acceptance (0064 / PLNR-230). WIRE-only, derived from
+  // tasks.proposed_at while the stored status is still `todo` — same pattern as 'failed'.
+  // Inert to every agent path (claim/next_claimable/pump) until a human accepts (→ todo)
+  // or rejects (→ cancelled).
+  'proposed',
 ]);
 export type TaskStatus = z.infer<typeof TaskStatus>;
 

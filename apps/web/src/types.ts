@@ -7,6 +7,9 @@ export type TaskStatus =
   | 'blocked'
   | 'review'
   | 'failed'
+  // A run agent's spun-off task awaiting human accept/reject (PLNR-230) — derived
+  // server-side from proposedAt; inert to agents until accepted.
+  | 'proposed'
   | 'done'
   | 'cancelled';
 
@@ -76,6 +79,12 @@ export interface TaskVM {
    *  every spec through the snapshot to draw a number would be the whole feature's payload for it.
    *  The spec itself is a detail read. */
   specPlanned: boolean;
+  /** Spin-off surface (PLNR-230): set only on a task filed via spin_off_task. proposedAt
+   *  non-null = still awaiting the human accept/reject decision. */
+  proposedAt: string | null;
+  spinoffRunId: string | null;
+  spinoffSourceTaskId: string | null;
+  spinoffFinding: string | null;
   comments: CommentVM[]; // populated for the selected task
 }
 

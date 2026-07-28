@@ -5,9 +5,14 @@ import type { AppStore } from '../store';
 import type { TaskStatus } from '../types';
 import { statusMeta } from '../design';
 import { AvatarChip, MonoTag } from './bits';
+import { Button } from './ui';
 import { confirm, prompt } from './Dialog';
 
 const COLUMNS: Array<[TaskStatus, string]> = [
+  // A run agent's proposed spin-off (PLNR-230) sits BEFORE todo: it is not yet work, it is a
+  // question — accept (→ todo) or reject (→ cancelled) from the card/drawer. Not a drop
+  // target in either direction (store.moveTask refuses); the buttons are the only doors.
+  ['proposed', 'Proposed'],
   ['todo', 'Todo'],
   ['in_progress', 'In progress'],
   // A gate-failed task (PLNR-178) gets its own column BEFORE review — the whole point is that
@@ -274,7 +279,11 @@ export function Board({ store }: { store: AppStore }) {
       {/* columns */}
       <div style={{ flex: 1, minHeight: 0, overflowX: 'auto', overflowY: 'hidden', padding: '16px 22px 18px' }}>
         <div style={{ display: 'flex', gap: 18, height: '100%', minWidth: 'min-content' }}>
-          {COLUMNS.map(([st, label]) => {
+          {COLUMNS.filter(
+            // The Proposed column exists only while there is a decision to make (PLNR-230) —
+            // spin-offs are the exception, not a lane every board pays for.
+            ([st]) => st !== 'proposed' || visible.some((t) => t.status === 'proposed'),
+          ).map(([st, label]) => {
             const m = statusMeta(st);
             // Urgent first; the stable sort keeps board order within a priority band (PLNR-119).
             const list = visible.filter((t) => t.status === st).sort((a, b) => b.priority - a.priority);
@@ -392,6 +401,31 @@ export function Board({ store }: { store: AppStore }) {
                           )}
                         </div>
                         <div style={{ fontSize: 12.5, lineHeight: 1.45, color: 'var(--text)' }}>{t.title}</div>
+                        {/* The spin-off decision (PLNR-230): accept → todo, reject → cancelled.
+                            These buttons (and the drawer's) are the ONLY doors out of proposed. */}
+                        {t.status === 'proposed' && (
+                          <div style={{ display: 'flex', gap: 6, marginTop: 9 }}>
+                            <Button
+                              variant="primary"
+                              style={{ fontSize: 10.5, padding: '3px 10px' }}
+                              onClick={(e) => { e.stopPropagation(); void actions.acceptSpinoff(t.id); }}
+                            >
+                              ✓ accept
+                            </Button>
+                            <Button
+                              variant="danger"
+                              style={{ fontSize: 10.5, padding: '3px 10px' }}
+                              onClick={async (e) => {
+                                e.stopPropagation();
+                                if (await confirm(`Reject spin-off ${t.key}? The task is cancelled (its finding stays on record).`)) {
+                                  void actions.rejectSpinoff(t.id);
+                                }
+                              }}
+                            >
+                              ✕ reject
+                            </Button>
+                          </div>
+                        )}
                         {(taskTags.length > 0 || ag || blocked || (ms && msFilter === null)) && (
                           <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 9, flexWrap: 'wrap' }}>
                             {taskTags.map((tg) => (

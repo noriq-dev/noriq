@@ -149,6 +149,13 @@ genuinely raises a new question, thread the next round with \`followUpTo\` (the 
 gate id) — the human sees the earlier Q&A as context and the same task parks again.
 Rounds are for real follow-ups, not for drip-feeding questions you could have batched.
 
+Working a **run** and found real work that is not your task's? \`spin_off_task\` it:
+the finding becomes its own **proposed** task — visible on the board but unclaimable
+and undispatchable until a human accepts it (accept → todo) or rejects it (→
+cancelled) — with your run id, your task and the finding text recorded as durable
+provenance. Neither fold adjacent work into your diff nor \`raise_alert\` it: an alert
+is a concern that is NOT work, a spin-off is work that is not YOURS.
+
 ## Planning
 
 Anything bigger than a single task starts with a **plan** — don't open-loop into

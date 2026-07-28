@@ -333,6 +333,67 @@ export function Drawer({ store }: { store: AppStore }) {
             <div style={{ marginBottom: 18 }}><Markdown source={task.body} /></div>
           )}
 
+          {/* Spin-off provenance + decision (PLNR-230). The panel persists after the decision —
+              which run filed it, from which task, on what finding is the durable record the
+              adjudicator (and any reviewer) checks "tracked there" claims against. The
+              accept/reject buttons render only while the task is still proposed. */}
+          {task.spinoffRunId && (() => {
+            const src = task.spinoffSourceTaskId ? tasks.find((x) => x.id === task.spinoffSourceTaskId) : null;
+            return (
+              <div
+                style={{
+                  marginBottom: 18, padding: '12px 14px', borderRadius: 10,
+                  background: 'rgba(245,166,35,.06)', border: '1px solid rgba(245,166,35,.25)',
+                }}
+              >
+                <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--amber)', marginBottom: 6 }}>
+                  ⑂ spin-off · filed by run {task.spinoffRunId.slice(-6)}
+                  {src && (
+                    <>
+                      {' · found while working '}
+                      <button
+                        onClick={() => actions.openTask(src.id)}
+                        className="hover-bright"
+                        style={{ cursor: 'pointer', background: 'transparent', border: 'none', color: 'inherit', padding: 0, font: 'inherit', textDecoration: 'underline' }}
+                      >
+                        {src.key}
+                      </button>
+                    </>
+                  )}
+                </div>
+                {task.spinoffFinding && (
+                  <div style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-soft)', whiteSpace: 'pre-wrap' }}>{task.spinoffFinding}</div>
+                )}
+                {task.status === 'proposed' && (
+                  <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+                    <span style={{ fontSize: 11.5, color: 'var(--amber)', alignSelf: 'center' }}>
+                      ⏳ awaiting your decision — no agent can claim this until you accept
+                    </span>
+                    <div style={{ flex: 1 }} />
+                    <Button
+                      variant="primary"
+                      style={{ padding: '5px 14px', fontSize: 12 }}
+                      onClick={() => void actions.acceptSpinoff(task.id)}
+                    >
+                      Accept
+                    </Button>
+                    <Button
+                      variant="danger"
+                      style={{ padding: '5px 12px', fontSize: 12 }}
+                      onClick={async () => {
+                        if (await confirm(`Reject spin-off ${task.key}? The task is cancelled (its finding stays on record).`)) {
+                          void actions.rejectSpinoff(task.id);
+                        }
+                      }}
+                    >
+                      Reject
+                    </Button>
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 18 }}>
             <MetaCell label="Claimed by">
               <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>

@@ -75,6 +75,11 @@ export interface CreateTaskInput {
   /** What a builder is told before it spends anything (RUN-135). Omit or null = no spec, which
    *  is what every task carried before this existed. Validated here, at the write seam. */
   executionSpec?: ExecutionSpecInput | null;
+  /** Spin-off provenance (PLNR-230): set only by spin_off_task. Its presence makes the task
+   *  PROPOSED (proposed_at set) — board-visible but inert to every agent path until a human
+   *  accepts it. runId/sourceTaskId are derived from the calling agent's live run, never
+   *  caller-claimed; `finding` is the evidence the adjudicator checks pointers against. */
+  spinoff?: { runId: string; sourceTaskId: string | null; finding: string };
 }
 
 export interface TaskPatch {
@@ -110,8 +115,10 @@ export interface TaskPatch {
   executionSpec?: ExecutionSpecInput | null;
 }
 
-/** What a create returns. `executionSpec` present iff the call set one, normalised as stored. */
-export type CreatedTask = { id: string; key: string; executionSpec?: ExecutionSpec };
+/** What a create returns. `executionSpec` present iff the call set one, normalised as stored.
+ *  `status: 'proposed'` present iff the create was a spin-off (PLNR-230), so the filing agent
+ *  is told in the same breath that its task awaits a human and no agent can act on it. */
+export type CreatedTask = { id: string; key: string; status?: 'proposed'; executionSpec?: ExecutionSpec };
 /** What an update returns. `executionSpec` present iff the patch mentioned it; null = cleared. */
 export type UpdatedTask = { ok: true; key: string; executionSpec?: ExecutionSpec | null };
 
@@ -147,6 +154,7 @@ type TaskRow = {
   claimed_by: string | null;
   claim_expires_at: string | null;
   failed_at: string | null;
+  proposed_at: string | null;
   title: string;
 };
 
@@ -270,6 +278,10 @@ export interface RunView {
   updatedAt: string;
   dispatchedAt: string | null;
   startedAt: string | null;
+  /** How many tasks this run spun off (PLNR-230) — the volume guard: ten spin-offs dodging
+   *  ten findings must be visible on the run, accepted or not. Set on the list/detail reads
+   *  (listRuns/getRun); absent on transition echoes, which nothing renders a count from. */
+  spinoffs?: number;
 }
 
 // --- Plan dispatch (PLNR-170) -----------------------------------------------
@@ -622,10 +634,15 @@ export class ProjectRoom extends DurableObject<Env> {
         depIds.push(dep.id);
       }
       const stmts = [
+        // A spin-off (PLNR-230) is stored as a real `todo` with proposed_at set — the derived
+        // 'proposed' wire status and every agent-path gate key off that column, exactly the
+        // failed_at pattern (tasks.status carries a CHECK D1 cannot widen).
         this.env.DB.prepare(
-          `INSERT INTO tasks (id, project_id, key, milestone_id, board_id, parent_task_id, title, body, status, type, priority, estimate, due_at, execution_spec, "order", created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).bind(id, pid, key, input.milestoneId ?? null, boardId, input.parentTaskId ?? null, input.title, input.body ?? '', input.type ?? 'feature', input.priority ?? 2, input.estimate ?? null, input.dueAt ?? null, executionSpec, proj.n, now, now),
+          `INSERT INTO tasks (id, project_id, key, milestone_id, board_id, parent_task_id, title, body, status, type, priority, estimate, due_at, execution_spec, proposed_at, spinoff_run_id, spinoff_source_task_id, spinoff_finding, "order", created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).bind(id, pid, key, input.milestoneId ?? null, boardId, input.parentTaskId ?? null, input.title, input.body ?? '', input.type ?? 'feature', input.priority ?? 2, input.estimate ?? null, input.dueAt ?? null, executionSpec,
+          input.spinoff ? now : null, input.spinoff?.runId ?? null, input.spinoff?.sourceTaskId ?? null, input.spinoff?.finding ?? null,
+          proj.n, now, now),
         this.env.DB.prepare('UPDATE projects SET next_task_number = ? WHERE id = ?').bind(proj.n + 1, pid),
       ];
       for (const dep of depIds) {
@@ -640,15 +657,34 @@ export class ProjectRoom extends DurableObject<Env> {
         stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO task_tags (task_id, tag_id) VALUES (?, ?)').bind(id, tid));
       }
       await this.env.DB.batch(stmts);
-      await this.emit(actor, 'task.created', 'task', id, {
-        key, title: input.title, parentTaskId: input.parentTaskId ?? null,
-      });
+      if (input.spinoff) {
+        // Its own verb, not task.created: the feed must show "a run filed adjacent work" as a
+        // distinct fact (it awaits a human decision), and the PLNR-90 "up for grabs" nudge
+        // must never fire for a task no agent may claim.
+        const src = input.spinoff.sourceTaskId
+          ? await this.env.DB.prepare('SELECT key FROM tasks WHERE id = ?')
+              .bind(input.spinoff.sourceTaskId).first<{ key: string }>()
+          : null;
+        await this.emit(actor, 'task.spun_off', 'task', id, {
+          key, title: input.title, runId: input.spinoff.runId,
+          sourceTaskId: input.spinoff.sourceTaskId, sourceTaskKey: src?.key ?? null,
+          finding: input.spinoff.finding,
+        });
+      } else {
+        await this.emit(actor, 'task.created', 'task', id, {
+          key, title: input.title, parentTaskId: input.parentTaskId ?? null,
+        });
+      }
       this.reindexSearch('task', id);
       // Echo the spec BACK when one was set (RUN-136), normalised as stored: defaults filled in,
       // unknown keys dropped. Without it a caller cannot see what its spec became without a
       // second round-trip per task, and normalisation is exactly the part it did not write.
       // Absent when the task has none, so the common response is unchanged.
-      return executionSpec ? { id, key, executionSpec: JSON.parse(executionSpec) } : { id, key };
+      const created: CreatedTask = executionSpec ? { id, key, executionSpec: JSON.parse(executionSpec) } : { id, key };
+      // A spin-off says its state out loud (PLNR-230): the filing agent must not read `{id, key}`
+      // as "created, someone will pick it up" — nobody can until a human accepts.
+      if (input.spinoff) created.status = 'proposed';
+      return created;
   }
 
   async updateTask(projectId: string, actor: Actor, taskId: string, patch: TaskPatch): Promise<UpdatedTask> {
@@ -955,6 +991,11 @@ export class ProjectRoom extends DurableObject<Env> {
          WHERE pt.task_id = ? AND pl.status = 'proposed'`,
       ).bind(taskId).first();
       if (gated) throw new Error(`${task.key} belongs to a proposed plan awaiting human approval`);
+      // Spin-off gate (PLNR-230), same defense-in-depth: a proposed spin-off is inert to every
+      // agent path — including an anchored run's bypass — until a human accepts it.
+      if (task.proposed_at) {
+        throw new Error(`${task.key} is a proposed spin-off awaiting human acceptance — it cannot be claimed until accepted`);
+      }
       const ttl = await this.claimTtlSeconds();
       const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
       // Re-claiming a task you ALREADY hold is a renewal, not a conflict (RUN-181) — reachable now
@@ -2119,6 +2160,11 @@ export class ProjectRoom extends DurableObject<Env> {
          WHERE pt.task_id = ? AND pl.status = 'proposed'`,
       ).bind(task.id).first();
       if (gated) throw new Error(`${task.key} belongs to a proposed plan awaiting human approval`);
+      // Spin-off gate (PLNR-230): a handoff is a claim by another door — a proposed spin-off
+      // cannot be pre-assigned around the human decision it exists to wait for.
+      if (task.proposed_at) {
+        throw new Error(`${task.key} is a proposed spin-off awaiting human acceptance — it cannot be handed off until accepted`);
+      }
 
       const ttl = await this.claimTtlSeconds();
       const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
@@ -2984,7 +3030,7 @@ export class ProjectRoom extends DurableObject<Env> {
          JOIN phases ph ON ph.id = pt.phase_id
          JOIN tasks t ON t.id = pt.task_id
        WHERE ph.plan_id = ?1
-         AND t.status = 'todo' AND t.claimed_by IS NULL
+         AND t.status = 'todo' AND t.claimed_by IS NULL AND t.proposed_at IS NULL
          AND NOT EXISTS (
            SELECT 1 FROM dependencies dp JOIN tasks dt ON dt.id = dp.depends_on_task_id
            WHERE dp.task_id = t.id AND dt.status NOT IN ('done','cancelled') ${landedException})
@@ -3529,12 +3575,23 @@ export class ProjectRoom extends DurableObject<Env> {
     const { results } = await this.env.DB.prepare(
       `SELECT * FROM runs WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC`,
     ).bind(...binds).all<RunRow>();
-    return results.map((r) => this.runToWire(r));
+    // Spin-off volume per run (PLNR-230), one grouped query for the whole list. Counts every
+    // spin-off ever filed by the run — rejection must not shrink the number, or ten dodged
+    // findings would read as zero.
+    const { results: spun } = await this.env.DB.prepare(
+      'SELECT spinoff_run_id AS rid, COUNT(*) AS n FROM tasks WHERE project_id = ? AND spinoff_run_id IS NOT NULL GROUP BY spinoff_run_id',
+    ).bind(projectId).all<{ rid: string; n: number }>();
+    const spinoffsByRun = new Map(spun.map((s) => [s.rid, s.n]));
+    return results.map((r) => ({ ...this.runToWire(r), spinoffs: spinoffsByRun.get(r.id) ?? 0 }));
   }
 
   async getRun(projectId: string, runId: string): Promise<RunView> {
     await this.setPid(projectId);
-    return this.runToWire(await this.loadRun(runId));
+    const run = this.runToWire(await this.loadRun(runId));
+    const spun = await this.env.DB.prepare(
+      'SELECT COUNT(*) AS n FROM tasks WHERE spinoff_run_id = ?',
+    ).bind(run.id).first<{ n: number }>();
+    return { ...run, spinoffs: spun?.n ?? 0 };
   }
 
   /**
@@ -4046,6 +4103,36 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
+  /** Accept a PROPOSED spin-off (PLNR-230): clear proposed_at so the task becomes a plain
+   *  claimable `todo`. The human gate a spun-off task waits behind — the task-level twin of
+   *  approvePlan above. Provenance (spinoff_run_id / source task / finding) is kept forever. */
+  async acceptSpinoff(projectId: string, actor: Actor, taskId: string) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const task = await this.getTask(taskId);
+      if (!task.proposed_at) throw new Error(`${task.key} is not a proposed spin-off — nothing to accept`);
+      await this.env.DB.prepare('UPDATE tasks SET proposed_at = NULL, updated_at = ? WHERE id = ?')
+        .bind(nowIso(), task.id).run();
+      await this.emit(actor, 'task.spinoff_accepted', 'task', task.id, { key: task.key, title: task.title });
+      return { id: task.id, key: task.key, status: 'todo' };
+    });
+  }
+
+  /** Reject a PROPOSED spin-off (PLNR-230): the finding does not become work — the task is
+   *  cancelled, with provenance kept so "this run proposed N, M were rejected" stays queryable.
+   *  proposed_at clears too: non-NULL means exactly "awaiting the decision", and it was made. */
+  async rejectSpinoff(projectId: string, actor: Actor, taskId: string) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const task = await this.getTask(taskId);
+      if (!task.proposed_at) throw new Error(`${task.key} is not a proposed spin-off — nothing to reject`);
+      await this.env.DB.prepare("UPDATE tasks SET proposed_at = NULL, status = 'cancelled', updated_at = ? WHERE id = ?")
+        .bind(nowIso(), task.id).run();
+      await this.emit(actor, 'task.spinoff_rejected', 'task', task.id, { key: task.key, title: task.title });
+      return { id: task.id, key: task.key, status: 'cancelled' };
+    });
+  }
+
   async noteAttachment(projectId: string, actor: Actor, taskId: string, filename: string, attachmentId: string)  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
@@ -4154,7 +4241,7 @@ export class ProjectRoom extends DurableObject<Env> {
 
   private async getTask(taskId: string): Promise<TaskRow> {
     const row = await this.env.DB.prepare(
-      'SELECT id, key, status, claimed_by, claim_expires_at, failed_at, title FROM tasks WHERE id = ? AND project_id = ?',
+      'SELECT id, key, status, claimed_by, claim_expires_at, failed_at, proposed_at, title FROM tasks WHERE id = ? AND project_id = ?',
     ).bind(taskId, this.projectId).first<TaskRow>();
     if (!row) throw new Error(`task ${taskId} not found in this project`);
     return row;

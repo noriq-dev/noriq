@@ -2,6 +2,7 @@
 // two surfaces can't drift. Produces an `AND …` fragment with BARE `?` placeholders +
 // its binds — the caller supplies the visibility scoping and must place this fragment
 // textually AFTER any numbered (?N) params so SQLite's positional counter lines up.
+import { taskWireStatus } from './visibility';
 export interface TaskSearchFilters {
   status?: string;
   type?: string;
@@ -19,7 +20,11 @@ export interface TaskSearchFilters {
 export function taskSearchFilters(f: TaskSearchFilters): { sql: string; binds: unknown[] } {
   const conds: string[] = [];
   const binds: unknown[] = [];
-  if (f.status) { conds.push('t.status = ?'); binds.push(f.status); }
+  // Match the WIRE status, not the raw column (PLNR-230): both search surfaces LABEL results
+  // with the derived status ('failed' from failed_at, 'proposed' from proposed_at), so the
+  // filter must speak the same vocabulary — status:"proposed" has to find the tasks the
+  // results would call proposed, and status:"todo" must not sweep in gated spin-offs.
+  if (f.status) { conds.push(`${taskWireStatus('t')} = ?`); binds.push(f.status); }
   if (f.type) { conds.push('t.type = ?'); binds.push(f.type); }
   if (f.milestoneId) { conds.push('t.milestone_id = ?'); binds.push(f.milestoneId); }
   if (f.holder === 'none') {
