@@ -26,6 +26,7 @@ interface RoomRpc {
   claimTask(projectId: string, actor: Actor, taskId: string): Promise<unknown>;
   updateTask(projectId: string, actor: Actor, taskId: string, patch: { status?: string }): Promise<{ ok: boolean; key: string }>;
   recordRunTelemetry(projectId: string, runId: string, t: Record<string, unknown>): Promise<void>;
+  claimAnchorTaskOnMint(projectId: string, runId: string, agentId: string): Promise<void>;
 }
 const room = (projectId: string) =>
   appEnv.PROJECT_ROOM.get(appEnv.PROJECT_ROOM.idFromName(projectId)) as unknown as RoomRpc;
@@ -542,40 +543,81 @@ describe("a build run settles its anchor task from the gate outcome (RUN-83)", (
     expect((await taskRow("task_unfail"))!.failedAt).toBeNull();
   });
 
-  it("TAKES the claim when the run starts, so a builder that never claimed still settles (RUN-181)", async () => {
+  it("TAKES the claim when its credential is minted, so a builder that never claimed still settles (RUN-181)", async () => {
     // The live failure, end to end: the builder skipped claim_task, so nothing owned the task and
-    // a run that landed and PUSHED left it reading as never started. The run takes the claim
-    // itself now, which is what makes the settle below have something to move.
+    // a run that landed and PUSHED left it reading as never started. The claim is taken at the
+    // MINT — the one moment that happens exactly once per sitting — which is what gives the settle
+    // below something to move.
     await env.DB.prepare(
       "INSERT INTO tasks (id, project_id, key, title, status) VALUES ('task_selfclaim', ?, 'STL-SELF', 't', 'todo')",
     ).bind(pid).run();
     const run = await anchored("task_selfclaim");
-    await room(pid).transitionRun(pid, actor, run.id, { status: "running", agentId: "agt_spawned" });
+    await room(pid).claimAnchorTaskOnMint(pid, run.id, "agt_spawned");
     const mid = await taskRow("task_selfclaim");
     expect(mid!.status).toBe("in_progress"); // the RUN owns it, not the agent's good manners
     expect(mid!.claimedBy).toBe("agt_spawned");
+    await room(pid).transitionRun(pid, actor, run.id, { status: "running", agentId: "agt_spawned" });
     await room(pid).transitionRun(pid, actor, run.id, { status: "done" });
     expect(await taskRow("task_selfclaim")).toEqual({ status: "review", failedAt: null, claimedBy: null });
   });
 
-  it("takes the claim when the agent id arrives on a SAME-STATUS patch (RUN-181)", async () => {
-    // The sequence a real daemon produces, and the one that made the first fix dead code: it
-    // reports dispatched→running BEFORE the agent exists (nothing to claim FOR), then reports
-    // running→running once it has minted one. That second report is a PATCH, not a transition, so
-    // a claim hook living only on the transition never runs for any real build.
+  it("a REPLAYED running report cannot re-take a task a human just released (RUN-181)", async () => {
+    // Why the claim lives at the mint rather than on the daemon's `running` report. That report is
+    // redelivered after a reconnect, and a claim hanging off it would silently undo a human who
+    // had released the task back to `todo` mid-run — reaching across exactly the decision the
+    // settle guard is careful to respect.
     await env.DB.prepare(
-      "INSERT INTO tasks (id, project_id, key, title, status) VALUES ('task_patch', ?, 'STL-PATCH', 't', 'todo')",
+      "INSERT INTO tasks (id, project_id, key, title, status) VALUES ('task_replay', ?, 'STL-REPLAY', 't', 'todo')",
     ).bind(pid).run();
-    const run = await anchored("task_patch");
-    await room(pid).transitionRun(pid, actor, run.id, { status: "running", worktreePath: "/wt/x" });
-    expect((await taskRow("task_patch"))!.claimedBy).toBeNull(); // no agent yet — nothing to claim for
+    const run = await anchored("task_replay");
+    await room(pid).claimAnchorTaskOnMint(pid, run.id, "agt_spawned");
     await room(pid).transitionRun(pid, actor, run.id, { status: "running", agentId: "agt_spawned" });
-    const held = await taskRow("task_patch");
-    expect(held!.status).toBe("in_progress");
-    expect(held!.claimedBy).toBe("agt_spawned");
-    // …and the run can now settle what it owns.
-    await room(pid).transitionRun(pid, actor, run.id, { status: "done" });
-    expect(await taskRow("task_patch")).toEqual({ status: "review", failedAt: null, claimedBy: null });
+    // A human takes it back while the run is still going.
+    await env.DB.prepare(
+      "UPDATE tasks SET status = 'todo', claimed_by = NULL, claim_expires_at = NULL WHERE id = 'task_replay'",
+    ).run();
+    // …and the daemon's report is redelivered.
+    await room(pid).transitionRun(pid, actor, run.id, { status: "running", agentId: "agt_spawned" });
+    const after = await taskRow("task_replay");
+    expect(after!.status).toBe("todo"); // the human's decision stands
+    expect(after!.claimedBy).toBeNull();
+  });
+
+  it("RENEWS the claim on a telemetry tick, so a long run does not lose its own task (RUN-181)", async () => {
+    // The claim TTL is 30 minutes; real builds in this project run about 50. Without renewal the
+    // reaper requeues the anchor MID-RUN — which does not just lose the settle, it releases the
+    // run's file locks and puts the task back on the claimable surface while the agent is still
+    // writing. Telemetry is the run proving it is alive, which is what the TTL is asking about.
+    await env.DB.prepare(
+      "INSERT INTO tasks (id, project_id, key, title, status) VALUES ('task_renew', ?, 'STL-RENEW', 't', 'todo')",
+    ).bind(pid).run();
+    const run = await anchored("task_renew");
+    await room(pid).claimAnchorTaskOnMint(pid, run.id, "agt_spawned");
+    await room(pid).transitionRun(pid, actor, run.id, { status: "running", agentId: "agt_spawned" });
+
+    // Wind the claim to the brink, as a long run would.
+    const nearly = new Date(Date.now() + 5_000).toISOString();
+    await env.DB.prepare("UPDATE tasks SET claim_expires_at = ? WHERE id = 'task_renew'").bind(nearly).run();
+    await room(pid).recordRunTelemetry(pid, run.id, { tokensUsed: 100 });
+
+    const after = await env.DB.prepare("SELECT claim_expires_at AS exp, claimed_by AS by FROM tasks WHERE id = 'task_renew'")
+      .first<{ exp: string; by: string }>();
+    expect(after!.by).toBe("agt_spawned"); // still ours
+    expect(Date.parse(after!.exp)).toBeGreaterThan(Date.parse(nearly)); // and pushed out
+  });
+
+  it("a telemetry tick never renews somebody ELSE's claim (RUN-181)", async () => {
+    // The renewal is scoped to the claim the RUN holds. A task that moved on to another agent
+    // must not have its lease extended by an unrelated run's heartbeat.
+    await env.DB.prepare(
+      "INSERT INTO tasks (id, project_id, key, title, status, claimed_by, claim_expires_at) VALUES ('task_notours', ?, 'STL-NOTOURS', 't', 'in_progress', 'agt_x', ?)",
+    ).bind(pid, "2026-07-28T00:00:00.000Z").run();
+    const run = await anchored("task_notours");
+    await env.DB.prepare("UPDATE runs SET agent_id = 'agt_spawned' WHERE id = ?").bind(run.id).run();
+    await room(pid).recordRunTelemetry(pid, run.id, { tokensUsed: 100 });
+    const after = await env.DB.prepare("SELECT claim_expires_at AS exp FROM tasks WHERE id = 'task_notours'")
+      .first<{ exp: string }>();
+    expect(after!.exp).toBe("2026-07-28T00:00:00.000Z"); // untouched
   });
 
   it("never takes a task a human parked elsewhere (RUN-181)", async () => {

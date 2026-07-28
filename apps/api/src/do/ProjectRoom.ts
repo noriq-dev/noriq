@@ -3261,19 +3261,6 @@ export class ProjectRoom extends DurableObject<Env> {
         // patch lane also write it would recreate the two-writers race that frame exists to avoid.
         await this.env.DB.prepare('UPDATE runs SET agent_id = ?, worktree_path = ?, updated_at = ? WHERE id = ?')
           .bind(agentId, worktreePath, nowIso(), runId).run();
-        // The run takes its anchor's claim HERE too, and this branch is the one that matters
-        // (RUN-181). The daemon reports `running` twice: first on the real dispatched→running
-        // transition, before the agent exists, and again once it has minted one — and that second
-        // report is running→running, which lands here. Putting the claim only on the transition
-        // made it dead code for every real run: the first report has no agentId to claim FOR, and
-        // the second never reached it. Guarded to the moment the id becomes known, so an ordinary
-        // worktree-path patch does not re-run it.
-        if (
-          run.kind === 'build' && run.anchor_type === 'task' && run.anchor_id &&
-          agentId && !run.agent_id && !isTerminalRunStatus(to)
-        ) {
-          await this.claimAnchorTaskForRun(run.anchor_id, agentId, nowIso());
-        }
         return this.runToWire(await this.loadRun(runId));
       }
       if (!RUN_TRANSITIONS[run.status]?.includes(to)) {
@@ -3301,15 +3288,6 @@ export class ProjectRoom extends DurableObject<Env> {
                 started_at = ?, updated_at = ? WHERE id = ?`,
       ).bind(to, agentId, exitJson, worktreePath, phase, startedAt, now, runId).run();
       if (isTerminalRunStatus(to) && agentId) await this.retireRunAgent(agentId);
-      // The RUN takes its anchor task's claim when it starts (RUN-181) — the counterpart to
-      // settling it below. RUN-83 moved the task lifecycle from the agent to the run's outcome but
-      // left the CLAIM with the agent: a builder is TOLD to call claim_task and nothing enforces
-      // it. One that skipped it left its task in `todo`, so when the run passed the gate, landed
-      // and pushed, `settleAnchorTask` owned nothing — the task read as never started and stayed
-      // claimable over already-merged code. A run's authority cannot rest on the agent remembering.
-      if (to === 'running' && run.kind === 'build' && run.anchor_type === 'task' && run.anchor_id && agentId) {
-        await this.claimAnchorTaskForRun(run.anchor_id, agentId, now);
-      }
       // The RUN's terminal outcome now moves its anchor task — not the agent (RUN-83). The build
       // agent used to release_task(review) when it finished, BEFORE the daemon's verify/reviewer
       // gate ran, so a gate FAILURE stranded the task in `review`. Settle it here instead, before
@@ -3349,6 +3327,30 @@ export class ProjectRoom extends DurableObject<Env> {
    * Guarded to a task the run still owns (`in_progress`/`claimed`), so a human who moved it first
    * is never stomped. The claim is cleared either way — the run is over.
    */
+  /**
+   * Take a run's anchor-task claim, called ONCE from the mint path when the run's credential is
+   * issued (RUN-181). Public because that path lives in the Worker, not here.
+   *
+   * The mint is the right moment and the two earlier attempts prove why. Both hung this off the
+   * daemon's `running` report and both were dead code for a different reason — the first report
+   * carries no agent id, the second is a same-status patch, and by then `runs.agent_id` is already
+   * set by the mint itself. Worse, a report can be REDELIVERED after a reconnect, and a replayed
+   * claim would silently undo a human who had just released the task back to `todo`. Minting
+   * happens exactly once per sitting, needs no ordering assumption about the daemon, and cannot
+   * replay.
+   */
+  async claimAnchorTaskOnMint(projectId: string, runId: string, agentId: string): Promise<void> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const run = await this.env.DB.prepare(
+        `SELECT kind, anchor_type AS anchorType, anchor_id AS anchorId FROM runs
+          WHERE id = ? AND project_id = ?`,
+      ).bind(runId, projectId).first<{ kind: string; anchorType: string | null; anchorId: string | null }>();
+      if (!run || run.kind !== 'build' || run.anchorType !== 'task' || !run.anchorId) return;
+      await this.claimAnchorTaskForRun(run.anchorId, agentId, nowIso());
+    });
+  }
+
   /**
    * Take the anchor task's claim for the run's own agent, so the run genuinely owns what it is
    * about to settle (RUN-181).
@@ -3546,6 +3548,40 @@ export class ProjectRoom extends DurableObject<Env> {
               log_tail = COALESCE(?, log_tail), phase = COALESCE(?, phase)
         WHERE id = ? AND project_id = ?`,
     ).bind(t.tokensUsed ?? null, t.usdSpent ?? null, t.logTail ?? null, t.phase ?? null, runId, projectId).run();
+    // A live run RENEWS the claim it holds (RUN-181). Without this the run takes a claim it cannot
+    // keep: the TTL is 30 minutes by default and real builds here run ~50, so the reaper requeued
+    // the anchor mid-run — which does not merely lose the settle, it releases the run's file locks
+    // (the reaper calls releaseLocksForTask) and puts the task back on the claimable surface while
+    // its agent is still writing to the worktree. Taking a claim without holding it is worse than
+    // never taking one.
+    //
+    // Telemetry is the right heartbeat because it is the run PROVING it is alive, which is exactly
+    // what the TTL is asking. It is also why this must not simply exempt run-held claims from the
+    // reaper: a daemon that dies silently must still let the claim lapse, and it is the absence of
+    // these ticks that says so.
+    const renewedTo = new Date(Date.now() + (await this.claimTtlSeconds()) * 1000).toISOString();
+    // Scoped to THIS project on both sides. `runs.anchor_id` is a soft reference and run creation
+    // does not prove the anchor belongs to the run's project, so an unscoped renewal could reach
+    // across into another project's task.
+    const anchor = await this.env.DB.prepare(
+      `SELECT r.anchor_id AS taskId, r.agent_id AS agentId FROM runs r
+        JOIN tasks t ON t.id = r.anchor_id AND t.project_id = r.project_id
+        WHERE r.id = ? AND r.project_id = ? AND r.anchor_type = 'task'
+          AND r.status IN ('running','blocked') AND r.agent_id IS NOT NULL`,
+    ).bind(runId, projectId).first<{ taskId: string; agentId: string }>();
+    if (anchor) {
+      // BOTH lease records, not just the one the reaper happens to read. `tasks.claim_expires_at`
+      // is what `alarm()` sweeps, but `claims.expires_at` is the canonical row every other renewal
+      // path keeps in step; letting them drift would leave two answers to "when does this lapse".
+      await this.env.DB.batch([
+        this.env.DB.prepare(
+          'UPDATE tasks SET claim_expires_at = ?, updated_at = ? WHERE id = ? AND claimed_by = ?',
+        ).bind(renewedTo, nowIso(), anchor.taskId, anchor.agentId),
+        this.env.DB.prepare(
+          'UPDATE claims SET expires_at = ? WHERE task_id = ? AND agent_id = ? AND released_at IS NULL',
+        ).bind(renewedTo, anchor.taskId, anchor.agentId),
+      ]);
+    }
     // model_usage is a TRI-STATE (RUN-59), which COALESCE cannot express: null/absent = no
     // news (keep); {} = the daemon EXPLICITLY retracting an unattributable mix (store NULL);
     // a non-empty object = the authoritative breakdown (store it). The empty-clear is the
