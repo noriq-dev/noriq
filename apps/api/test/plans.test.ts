@@ -689,6 +689,45 @@ describe('plans & groups', () => {
     expect(listed.body.plans.some((p: { id: string }) => p.id === planId)).toBe(false);
   });
 
+  it('a RESTORED plan stays restored — the sweep does not immediately re-archive it (PLNR-225)', async () => {
+    // Restoring only cleared archived_at, and the sweep reads none of that: it re-derived
+    // "completed, settled >24h ago" from the same untouched task timestamps and archived the plan
+    // again on the very next snapshot. The human's decision lasted one poll.
+    const plan = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId, title: 'PLNR-225 restore sticks',
+      phases: [{ title: 'A', newTasks: [{ title: 'p225 restore task' }] }],
+    });
+    const planId = plan.body.id as string;
+    const only = plan.body.phases[0].taskIds[0];
+    await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: only });
+    await mcpCall(worker.apiKey, 'release_task', { projectId, taskId: only, toStatus: 'done' });
+    await backdate(planId);
+    expect((await snapshotPlans()).plans.find((p) => p.id === planId)?.archivedAt).toBeTruthy();
+
+    // The human pulls it back out of the archive.
+    const restore = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/plans/${planId}/restore`, {
+      method: 'POST',
+      headers: { Cookie: cookie },
+    });
+    expect(restore.status).toBe(200);
+
+    // The work is still old and still settled, so the sweep sees exactly what it saw before —
+    // and must now leave it alone, across repeated snapshots.
+    expect((await snapshotPlans()).plans.find((p) => p.id === planId)?.archivedAt).toBeNull();
+    expect((await snapshotPlans()).plans.find((p) => p.id === planId)?.archivedAt).toBeNull();
+    const listed = await mcpCall(planner.apiKey, 'get_plans', { projectId });
+    expect(listed.body.plans.some((p: { id: string }) => p.id === planId)).toBe(true);
+
+    // But it is not pinned out of the sweep forever: once the work MOVES after the restore and
+    // that new activity itself ages past the cutoff, the plan is an ordinary candidate again.
+    // Modelled by putting the restore further back than the work — restored 3 days ago, worked
+    // 2 days ago — since the test cannot wait a day for the real ordering to arise.
+    await env.DB.prepare('UPDATE plans SET archive_restored_at = ? WHERE id = ?')
+      .bind(new Date(Date.now() - 3 * 24 * 3600 * 1000).toISOString(), planId).run();
+    await backdate(planId); // member tasks → 2 days ago, i.e. after the restore, before the cutoff
+    expect((await snapshotPlans()).plans.find((p) => p.id === planId)?.archivedAt).toBeTruthy();
+  });
+
   it('never auto-archives a plan with an unsettled task, even aged past 24h (PLNR-225)', async () => {
     const plan = await mcpCall(planner.apiKey, 'create_plan', {
       projectId, title: 'PLNR-225 half-done',

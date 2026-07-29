@@ -9,6 +9,14 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { authorizeForAllProjects, createAgent, createRunAgent, loginSession, mcpCall } from './helpers';
 
 const db = () => (env as unknown as { DB: D1Database }).DB;
+/** Direct DO access, for asserting the mint-claim predicate itself rather than a route that
+ *  happens to call it (PLNR-230 follow-up). Mirrors the handle in runs.test.ts. */
+interface RoomRpc {
+  claimAnchorTaskOnMint(projectId: string, runId: string, agentId: string): Promise<void>;
+}
+const room = (projectId: string) =>
+  (env as unknown as { PROJECT_ROOM: DurableObjectNamespace }).PROJECT_ROOM
+    .get((env as unknown as { PROJECT_ROOM: DurableObjectNamespace }).PROJECT_ROOM.idFromName(projectId)) as unknown as RoomRpc;
 
 describe('spin_off_task (PLNR-230)', () => {
   let copilot: { id: string; apiKey: string };
@@ -179,6 +187,57 @@ describe('spin_off_task (PLNR-230)', () => {
     expect((proposed.body.tasks as Array<{ id: string }>).map((t) => t.id)).toContain(made.id);
     const todo = await mcpCall(copilot.apiKey, 'search_tasks', { projectId, status: 'todo' });
     expect((todo.body.tasks as Array<{ id: string }>).map((t) => t.id)).not.toContain(made.id);
+  });
+
+  // The gate was on every surface that OFFERS work, but a run reaches its anchor without asking
+  // any of them: createRun took the anchor on trust and claimAnchorTaskForRun matched raw
+  // `status='todo'` — which is exactly how a proposed spin-off is stored. So a human could
+  // dispatch a run straight at an un-accepted proposal and it would be claimed and worked.
+  it('a run cannot be dispatched at a PROPOSED spin-off', async () => {
+    const made = await fileSpinoff('must not be dispatchable');
+    // runs.runner_id is a real FK, and the route validates the body before the DO sees it — so a
+    // genuine runner is needed to reach the gate this test is about.
+    const owner = await db().prepare("SELECT id FROM users WHERE email = 'agent-mint@example.com'").first<{ id: string }>();
+    await db().prepare("INSERT OR IGNORE INTO runners (id, label, owner_user_id, status, capabilities, repos) VALUES ('rnr_spn', 'rnr_spn', ?, 'online', '{}', ?)")
+      .bind(owner!.id, JSON.stringify([{ id: 'repo_x', projectId, projectKey: 'SPN' }])).run();
+    const res = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/runs`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        kind: 'build', repoRef: 'repo_x', agentTool: 'claude', runnerId: 'rnr_spn',
+        anchor: { type: 'task', id: made.id },
+      }),
+    });
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(await res.text()).toContain('proposed spin-off');
+  });
+
+  it('the run-mint claim cannot take a PROPOSED spin-off even if one is reached directly', async () => {
+    // Defence in depth for the same hole: the DO predicate itself must refuse, so no future
+    // caller that skips createRun's check can quietly claim a proposal.
+    const made = await fileSpinoff('mint must not claim this');
+    const runId = `run_spn_${made.key}`;
+    await db().prepare(
+      `INSERT INTO runs (id, project_id, runner_id, kind, repo_ref, agent_tool, status, created_by, anchor_type, anchor_id)
+       VALUES (?, ?, NULL, 'build', 'repo_x', 'claude', 'dispatched', 'usr_t', 'task', ?)`,
+    ).bind(runId, projectId, made.id).run();
+    await room(projectId).claimAnchorTaskOnMint(projectId, runId, build.agentId);
+    const row = await db().prepare('SELECT status, claimed_by AS claimedBy, proposed_at AS proposedAt FROM tasks WHERE id = ?')
+      .bind(made.id).first<{ status: string; claimedBy: string | null; proposedAt: string | null }>();
+    expect(row!.claimedBy).toBeNull();
+    expect(row!.status).toBe('todo'); // still the raw storage of "proposed", untouched
+    expect(row!.proposedAt).toBeTruthy();
+  });
+
+  it('an agent cannot restatus a PROPOSED spin-off — accept/reject is the human decision', async () => {
+    const made = await fileSpinoff('not yours to close');
+    const res = await mcpCall(copilot.apiKey, 'update_task', { projectId, taskId: made.id, status: 'done' });
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain('proposed spin-off');
+    const row = await db().prepare('SELECT status, proposed_at AS proposedAt FROM tasks WHERE id = ?')
+      .bind(made.id).first<{ status: string; proposedAt: string | null }>();
+    expect(row!.status).toBe('todo');
+    expect(row!.proposedAt).toBeTruthy();
   });
 
   it('the board snapshot renders it as proposed with the provenance fields', async () => {

@@ -2503,14 +2503,27 @@ app.post('/api/webhooks/github', async (c) => {
   const state = pr.merged ? 'merged' : pr.state; // open | closed | merged
   const updated: string[] = [];
   for (const key of keys) {
-    const task = await c.env.DB.prepare('SELECT id, project_id AS pid, key, status FROM tasks WHERE key = ?')
-      .bind(key).first<{ id: string; pid: string; key: string; status: string }>();
+    const task = await c.env.DB.prepare('SELECT id, project_id AS pid, key, status, claimed_by AS claimedBy FROM tasks WHERE key = ?')
+      .bind(key).first<{ id: string; pid: string; key: string; status: string; claimedBy: string | null }>();
     if (!task) continue;
     await c.env.DB.prepare(
       `INSERT INTO task_refs (id, task_id, kind, ref, url, state, created_at) VALUES (?, ?, 'pr', ?, ?, ?, ?)
        ON CONFLICT (task_id, kind, ref) DO UPDATE SET state = excluded.state, url = excluded.url`,
     ).bind(`ref_${crypto.randomUUID().slice(0, 12)}`, task.id, String(pr.number), pr.html_url ?? null, state, nowIso()).run();
     const sys: Actor = { kind: 'system', id: 'github', name: 'github' };
+    // A CLAIMED task is somebody's live work, and this webhook must not restatus it (PLNR-226).
+    // The claim guard in updateTask discriminates on `actor.kind === 'agent'`, which reads as
+    // "via MCP" and deliberately exempts humans and `system` — but that exemption was written for
+    // the ask-flow/demo writers, not for this: GitHub is a `system` actor too, so a PR opening
+    // moved a live run's in_progress anchor to `review` underneath it. That is not a cosmetic
+    // stomp. `settleAnchorTask` only matches `status IN ('in_progress','claimed')`, so when the
+    // run finished it could no longer move its own task — a failed run left the task sitting in
+    // `review` as though it had passed, which is exactly the stranding PLNR-226 exists to stop.
+    // The PR ref is still recorded above either way; only the status move is withheld.
+    if (task.claimedBy) {
+      updated.push(`${key} (ref only — claimed)`);
+      continue;
+    }
     if (state === 'merged' && !['done', 'cancelled'].includes(task.status)) {
       await room(c.env, task.pid).updateTask(task.pid, sys, task.id, { status: 'done' });
     } else if (state === 'open' && task.status === 'in_progress') {

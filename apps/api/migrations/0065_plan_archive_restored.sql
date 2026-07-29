@@ -1,0 +1,17 @@
+-- PLNR-225 follow-up: when a human RESTORES an auto-archived plan, the restore has to stick.
+--
+-- The auto-sweep archives a completed plan whose member tasks all settled >24h ago, using
+-- MAX(tasks.updated_at) as the completion proxy (plans have no completed_at). Restoring only
+-- cleared `archived_at`, which changes nothing the sweep reads — so the very next snapshot
+-- re-derived "completed, settled long ago" and archived it again. The human's decision lasted
+-- until the next poll.
+--
+-- This records WHEN the restore happened, so the sweep can require the plan's work to have moved
+-- since: re-archive only once MAX(tasks.updated_at) is newer than the restore. A restored plan
+-- therefore stays visible until something actually happens to it and settles again — which is the
+-- behaviour a human asking for it back is asking for, without pinning it out of the sweep forever.
+--
+-- Additive and nullable, per the D1 constraint that every migration must be (FKs are enforced
+-- during apply AND execute, so `plans` — referenced by phases — can never be rebuilt). NULL means
+-- "never restored", which is what every existing row means.
+ALTER TABLE plans ADD COLUMN archive_restored_at TEXT;

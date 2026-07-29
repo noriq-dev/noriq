@@ -732,6 +732,16 @@ export class ProjectRoom extends DurableObject<Env> {
             : `${task.key} is claimed by another agent — the claim protects its in-flight work. Wait for the release, or ask a human to override.`,
         );
       }
+      // A PROPOSED spin-off is inert to every agent path until a human decides on it (PLNR-230),
+      // and "inert" has to include restatusing it. The task stores as a real `todo` — only the wire
+      // status is derived — so nothing above stopped an agent marking somebody else's un-accepted
+      // proposal `done`, which both fires the completion path and settles a question that was never
+      // asked. Accept/reject are the human's, and they are the only things that clear proposed_at.
+      if (actor.kind === 'agent' && patch.status !== undefined && task.proposed_at) {
+        throw new Error(
+          `${task.key} is a proposed spin-off awaiting a human decision — its status is not yours to move. Leave it for the accept/reject.`,
+        );
+      }
       // Same as createTask: the spec validates before ANY of this patch is applied (RUN-135).
       // The tag and doc blocks below write and can return early, so a spec parsed at its own
       // `sets.push` would answer `{tags:[...], executionSpec: <malformed>}` with the tags already
@@ -2115,6 +2125,13 @@ export class ProjectRoom extends DurableObject<Env> {
                HAVING COUNT(*) > 0
                   AND SUM(CASE WHEN t.status IN ('done','cancelled') THEN 0 ELSE 1 END) = 0
                   AND MAX(t.updated_at) < ?
+                  -- A plan a human pulled back out of the archive is not swept again until its
+                  -- work actually MOVES (PLNR-225). Without this the restore lasted one poll:
+                  -- nothing a restore touches is anything this predicate reads, so the next
+                  -- snapshot re-derived the same "completed long ago" and re-archived it.
+                  -- The plans. prefix is the OUTER row being updated (a correlated reference), not
+                  -- a second copy of the table: this subquery joins only phases/phase_tasks/tasks.
+                  AND (plans.archive_restored_at IS NULL OR MAX(t.updated_at) > plans.archive_restored_at)
              )`,
       ).bind(nowIso(), this.projectId, cutoff).run();
       return { archived: meta.changes ?? 0 };
@@ -2526,8 +2543,13 @@ export class ProjectRoom extends DurableObject<Env> {
       const plan = await this.env.DB.prepare('SELECT id, title FROM plans WHERE id = ? AND project_id = ?')
         .bind(planId, projectId).first<{ id: string; title: string }>();
       if (!plan) throw new Error('plan not found');
-      await this.env.DB.prepare('UPDATE plans SET archived_at = ? WHERE id = ?')
-        .bind(archived ? nowIso() : null, planId).run();
+      // A RESTORE stamps archive_restored_at so it survives the auto-sweep (PLNR-225). The sweep
+      // reads MAX(tasks.updated_at) as its completion proxy, and a restore moves none of that —
+      // so without this marker the next snapshot re-derived "completed, settled long ago" and
+      // re-archived the plan the human had just pulled back, within one poll. Archiving clears
+      // the marker again so the pair stays a straight answer to "which happened last".
+      await this.env.DB.prepare('UPDATE plans SET archived_at = ?, archive_restored_at = ? WHERE id = ?')
+        .bind(archived ? nowIso() : null, archived ? null : nowIso(), planId).run();
       await this.emit(actor, archived ? 'plan.archived' : 'plan.restored', 'plan', planId, { title: plan.title });
       return { ok: true, archived };
     });
@@ -2758,6 +2780,20 @@ export class ProjectRoom extends DurableObject<Env> {
     const now = nowIso();
     const anchorType = input.anchor?.type ?? null;
     const anchorId = input.anchor?.id ?? null;
+    // A PROPOSED spin-off is not dispatchable work yet (PLNR-230). Refused here rather than left
+    // to the mint's claim predicate: that would dispatch the run, spin up an agent and brief it on
+    // the task, and only silently fail to claim — the agent works it anyway, having been told to,
+    // and the human never accepted it. The gate belongs where the work is committed to.
+    if (anchorType === 'task' && anchorId) {
+      const proposed = await this.env.DB.prepare(
+        'SELECT key FROM tasks WHERE id = ? AND project_id = ? AND proposed_at IS NOT NULL',
+      ).bind(anchorId, this.projectId).first<{ key: string }>();
+      if (proposed) {
+        throw new Error(
+          `${proposed.key} is a proposed spin-off awaiting a human decision — accept it before dispatching a run at it`,
+        );
+      }
+    }
     const runnerId = input.runnerId ?? null;
     const status = runnerId ? 'dispatched' : 'queued';
     // Only a verify run judges another run; carrying it elsewhere would be meaningless.
@@ -3514,9 +3550,14 @@ export class ProjectRoom extends DurableObject<Env> {
     const claimed = await this.env.DB.prepare(
       `UPDATE tasks SET status = 'in_progress', claimed_by = ?, claim_expires_at = ?, failed_at = NULL,
               updated_at = ?
-        WHERE id = ? AND status = 'todo' AND claimed_by IS NULL`,
+        WHERE id = ? AND status = 'todo' AND claimed_by IS NULL AND proposed_at IS NULL`,
     ).bind(agentId, expiresAt, now, taskId).run();
-    if (!claimed.meta.changes) return; // already claimed, or a human has it somewhere else
+    // `proposed_at IS NULL` is load-bearing (PLNR-230): a proposed spin-off is STORED as a real
+    // `todo` — only the wire status is derived — so without it this predicate matched one exactly
+    // like any other task, and a run anchored to a spin-off claimed and worked it before the human
+    // it was filed for ever saw it. Every agent-facing surface gates on proposed_at; this is the
+    // one path that reaches a task without going through them.
+    if (!claimed.meta.changes) return; // already claimed, proposed, or a human has it somewhere else
     await this.env.DB.batch([
       this.env.DB.prepare('UPDATE claims SET released_at = ? WHERE task_id = ? AND released_at IS NULL')
         .bind(now, taskId),
