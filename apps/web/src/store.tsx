@@ -67,7 +67,7 @@ function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
     case 'lock.renewed': verb = 'lock'; subject = 'renewed a lock'; break;
     default: subject = `${e.verb} ${e.subjectId}`;
   }
-  return { id: e.id, t: timeOf(e.createdAt), actor, actorKind: e.actorKind, verb, subject, taskId, dot };
+  return { id: e.id, t: timeOf(e.createdAt), createdAt: e.createdAt, actor, actorKind: e.actorKind, verb, subject, taskId, dot };
 }
 
 const VIEWS: ViewId[] = ['home', 'control', 'graph', 'board', 'plans', 'roadmap', 'review', 'docs', 'ask', 'agents', 'runs', 'settings', 'admin'];

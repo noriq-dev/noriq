@@ -1,5 +1,5 @@
 // Mission Control — agent roster | live event feed | agent detail or who-holds-what.
-import { useLayoutEffect, useRef, useState } from 'react';
+import { Fragment, useLayoutEffect, useRef, useState } from 'react';
 import type { AppStore } from '../store';
 import { agentFg, fmtTtl, initials, isGhostColor, statusMeta, verbColors, YOU_GRADIENT } from '../design';
 import { QuestionForm, SignalThreadHistory } from './QuestionForm';
@@ -320,6 +320,11 @@ function AttentionInbox({ store }: { store: AppStore }) {
 /** How close to the bottom (px) still counts as "pinned" for auto-scroll. */
 const STICK_THRESHOLD = 60;
 
+/** Stable per-calendar-day key from an event's ISO createdAt, for detecting day boundaries (PLNR-227). */
+const dayKey = (iso: string): string => new Date(iso).toDateString();
+/** Short calendar date shown on a day-break separator, e.g. "Jul 28" (PLNR-227). */
+const dayLabel = (iso: string): string => new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+
 function EventFeed({ store }: { store: AppStore }) {
   const { data, currentPid, actions } = store;
   // Direction toggle (PLNR-149): 'bottom' = chat-style (oldest top, newest arriving at
@@ -398,14 +403,25 @@ function EventFeed({ store }: { store: AppStore }) {
       </div>
       <AttentionInbox store={store} />
       <div ref={scrollRef} onScroll={onScroll} style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: '8px 0' }}>
-        {events.map((ev) => {
+        {events.map((ev, i) => {
           const ag = (data.agents[currentPid] ?? []).find((a) => a.name === ev.actor || a.id === ev.actor) ?? null;
           const isYou = ev.actorKind === 'human';
           const isSystem = ev.actorKind === 'system';
           const vc = verbColors(ev.verb);
+          // Break between calendar days so times read against the right date. The first row
+          // also gets a label. Works in both directions — `events` is already in render order.
+          const prev = events[i - 1];
+          const showBreak = !prev || dayKey(prev.createdAt) !== dayKey(ev.createdAt);
           return (
+            <Fragment key={ev.id}>
+              {showBreak && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 20px 4px' }}>
+                  <div style={{ flex: 1, borderBottom: '1px solid var(--line)' }} />
+                  <SectionLabel>{dayLabel(ev.createdAt)}</SectionLabel>
+                  <div style={{ flex: 1, borderBottom: '1px solid var(--line)' }} />
+                </div>
+              )}
             <div
-              key={ev.id}
               onClick={ev.taskId != null ? () => actions.openTask(ev.taskId!) : undefined}
               className="event-row"
               style={{
@@ -450,6 +466,7 @@ function EventFeed({ store }: { store: AppStore }) {
                 <span style={{ color: 'var(--text-mid)' }}>{ev.subject}</span>
               </div>
             </div>
+            </Fragment>
           );
         })}
       </div>
