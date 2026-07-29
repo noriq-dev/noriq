@@ -800,6 +800,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
       boardId: z.string().optional().describe('Board to place the task on (see get_project.boards); defaults to the parent task’s board for subtasks, else the project’s default board'),
       docIds: z.array(z.string()).optional().describe('Related project docs (ids from list_docs) — link the design/decision docs this task implements or must follow, so workers read them before starting'),
+      phaseId: z.string().optional().describe('Attach this task to a plan phase (a phase id from get_plans) in THIS project — it joins the plan and phase-order gating applies; foreign or unknown phase ids are rejected'),
       executionSpec: ExecutionSpec.nullish(),
     },
     tool(async ({ projectId, ...input }) => {
@@ -824,6 +825,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
         tags: z.array(z.string()).optional(),
         docIds: z.array(z.string()).optional(),
+        phaseId: z.string().optional().describe('Attach every item to this plan phase (a phase id from get_plans) unless the item sets its own; foreign/unknown phase ids are rejected'),
         // Present so it is HONOURED rather than silently stripped: zod drops unknown keys, and the
         // advertised schema has no `additionalProperties:false`, so an agent that sent one here
         // would get a batch of unplanned tasks and a success response.
@@ -843,6 +845,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           docIds: z.array(z.string()).optional().describe('Related project docs (ids from list_docs)'),
           type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
           tags: z.array(z.string()).optional(),
+          phaseId: z.string().optional().describe('Attach this item to a plan phase (a phase id from get_plans) in THIS project; foreign/unknown phase ids are rejected'),
           parentTaskId: z.string().optional().describe('Existing task id/key, or an earlier item\'s ref'),
           dependsOn: z.array(z.string()).optional().describe('Existing task ids/keys, or earlier items\' refs'),
           // Per item, and deliberately absent from `defaults`: a spec names the files, decisions
@@ -882,6 +885,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
             milestoneId: item.milestoneId ?? defaults?.milestoneId,
             boardId: item.boardId ?? defaults?.boardId,
             docIds: item.docIds ?? defaults?.docIds,
+            phaseId: item.phaseId ?? defaults?.phaseId,
             type: item.type ?? defaults?.type,
             tags: effectiveTags,
             allowNewTags,

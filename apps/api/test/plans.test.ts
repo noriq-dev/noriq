@@ -508,4 +508,131 @@ describe('plans & groups', () => {
     // Unknown task → error, so the daemon's probe fails OPEN (never strands a run).
     expect((await mcpCall(worker.apiKey, 'can_claim', { taskId: 'task_nope' })).isError).toBe(true);
   });
+
+  // ---- PLNR-228: create a task straight into a plan phase -----------------------
+  const keyNum = (k: string) => Number(k.split('-')[1]);
+  const phaseFromPlans = async (planId: string, phaseId: string) => {
+    const plans = await mcpCall(planner.apiKey, 'get_plans', { projectId });
+    const plan = plans.body.plans.find((p: { id: string }) => p.id === planId);
+    return plan.phases.find((ph: { id: string }) => ph.id === phaseId);
+  };
+
+  it('create_task with a phaseId joins that phase and is counted in get_plans (PLNR-228)', async () => {
+    const plan = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId, title: 'Attach here',
+      phases: [
+        { title: 'Alpha', newTasks: [{ title: 'p228 seed' }] },
+        { title: 'Beta', newTasks: [{ title: 'p228 later' }] },
+      ],
+    });
+    const alpha = plan.body.phases[0];
+    expect((await phaseFromPlans(plan.body.id, alpha.id)).total).toBe(1);
+
+    const created = await mcpCall(planner.apiKey, 'create_task', {
+      projectId, title: 'discovered mid-plan', tags: ['p228'], phaseId: alpha.id,
+    });
+    expect(created.isError).toBe(false);
+
+    const after = await phaseFromPlans(plan.body.id, alpha.id);
+    expect(after.total).toBe(2);
+    expect(after.taskKeys).toContain(created.body.key);
+
+    // Phase membership gates it just like any phase task: Beta (phase 2) still waits on
+    // Alpha, which now includes the freshly-attached, unfinished task — no dependency row minted.
+    const detail = await mcpCall(planner.apiKey, 'get_task', { taskId: created.body.id });
+    expect(detail.body.dependencies ?? []).toHaveLength(0);
+
+    // A task created with NO phaseId joins nothing — unchanged behaviour.
+    const loose = await mcpCall(planner.apiKey, 'create_task', {
+      projectId, title: 'unattached', tags: ['p228'],
+    });
+    const stillTwo = await phaseFromPlans(plan.body.id, alpha.id);
+    expect(stillTwo.total).toBe(2);
+    expect(stillTwo.taskKeys).not.toContain(loose.body.key);
+  });
+
+  it('create_task rejects an unknown or cross-project phaseId and writes nothing (PLNR-228)', async () => {
+    // Baseline: two consecutive valid creates must have consecutive keys — a rejected create
+    // between them that consumed a task number (or wrote a row) would open a gap.
+    const before = await mcpCall(planner.apiKey, 'create_task', { projectId, title: 'p228 before', tags: ['p228'] });
+
+    const unknown = await mcpCall(planner.apiKey, 'create_task', {
+      projectId, title: 'never lands', tags: ['p228'], phaseId: 'phs_nope',
+    });
+    expect(unknown.isError).toBe(true);
+    expect(unknown.text).toContain('not found in this project');
+
+    // A real phase id, but from ANOTHER project — the FK would be satisfied silently, so
+    // project scoping must reject it explicitly.
+    const other = await mcpCall(planner.apiKey, 'create_project', { key: 'PLZ2', name: 'other-plan-project' });
+    const otherPlan = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId: other.body.id, title: 'Foreign', phases: [{ title: 'X', newTasks: [{ title: 'foreign task' }] }],
+    });
+    const foreignPhase = otherPlan.body.phases[0].id;
+    const cross = await mcpCall(planner.apiKey, 'create_task', {
+      projectId, title: 'wrong project', tags: ['p228'], phaseId: foreignPhase,
+    });
+    expect(cross.isError).toBe(true);
+    expect(cross.text).toContain('not found in this project');
+
+    // Neither rejected create wrote a task: the next number follows `before` with no gap.
+    const after = await mcpCall(planner.apiKey, 'create_task', { projectId, title: 'p228 after', tags: ['p228'] });
+    expect(keyNum(after.body.key)).toBe(keyNum(before.body.key) + 1);
+  });
+
+  it('create_tasks places items into a phase, per-item and via defaults (PLNR-228)', async () => {
+    const plan = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId, title: 'Batch into phases',
+      phases: [
+        { title: 'One', newTasks: [{ title: 'p228 batch seed a' }] },
+        { title: 'Two', newTasks: [{ title: 'p228 batch seed b' }] },
+      ],
+    });
+    const phaseOne = plan.body.phases[0];
+    const phaseTwo = plan.body.phases[1];
+
+    const res = await mcpCall(planner.apiKey, 'create_tasks', {
+      projectId,
+      defaults: { tags: ['p228'], phaseId: phaseOne.id },
+      tasks: [
+        { title: 'into one by default' },
+        { title: 'into one too' },
+        { title: 'overrides to two', phaseId: phaseTwo.id },
+      ],
+    });
+    expect(res.body.failed).toBe(0);
+    expect(res.body.count).toBe(3);
+
+    const one = await phaseFromPlans(plan.body.id, phaseOne.id);
+    const two = await phaseFromPlans(plan.body.id, phaseTwo.id);
+    // Two items inherited phaseOne (1 seed + 2 = 3); the per-item override landed in phaseTwo.
+    expect(one.total).toBe(3);
+    expect(two.total).toBe(2);
+    for (const c of res.body.created) {
+      const target = c.title === 'overrides to two' ? two : one;
+      expect(target.taskKeys).toContain(c.key);
+    }
+  });
+
+  it('create_tasks reports a per-item error for a bad phaseId without failing the batch (PLNR-228)', async () => {
+    const plan = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId, title: 'Batch partial',
+      phases: [{ title: 'Solo', newTasks: [{ title: 'p228 partial seed' }] }],
+    });
+    const solo = plan.body.phases[0];
+    const res = await mcpCall(planner.apiKey, 'create_tasks', {
+      projectId,
+      defaults: { tags: ['p228'] },
+      tasks: [
+        { title: 'good one', phaseId: solo.id },
+        { title: 'bad phase', phaseId: 'phs_nope' },
+      ],
+    });
+    expect(res.body.count).toBe(1);
+    expect(res.body.failed).toBe(1);
+    const bad = res.body.created.find((c: { title: string }) => c.title === 'bad phase');
+    expect(bad.error).toContain('not found in this project');
+    // The good item still attached.
+    expect((await phaseFromPlans(plan.body.id, solo.id)).total).toBe(2);
+  });
 });

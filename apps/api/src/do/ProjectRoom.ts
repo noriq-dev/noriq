@@ -70,6 +70,10 @@ export interface CreateTaskInput {
   boardId?: string | null;
   /** Related project docs (PLNR-182) — validated against this project's docs. */
   docIds?: string[];
+  /** Attach the created task to a plan phase (PLNR-228) — a phase id in a plan in THIS
+   *  project, validated here; membership alone gates claimability by phase order (no
+   *  dependency edges are minted). Omit/null = not attached, byte-identical to before. */
+  phaseId?: string | null;
   /** Permit minting genuinely-new tags past the near-duplicate guard (PLNR-194). */
   allowNewTags?: boolean;
   /** What a builder is told before it spends anything (RUN-135). Omit or null = no spec, which
@@ -633,6 +637,19 @@ export class ProjectRoom extends DurableObject<Env> {
         if (!dep) throw new Error(`dependsOn ${ref} not found in this project`);
         depIds.push(dep.id);
       }
+      // Phase attachment (PLNR-228) resolves BEFORE the insert batch, like dependsOn/docIds.
+      // Phases carry no display key, so a phaseId is an id only — validate via a JOIN to plans
+      // so project scoping is real: `INSERT OR IGNORE` does NOT suppress FK violations, and a
+      // valid phase id from ANOTHER project would satisfy the FK silently. A bad/foreign ref
+      // fails the whole create and writes nothing.
+      let phaseId: string | null = null;
+      if (input.phaseId != null) {
+        const ph = await this.env.DB.prepare(
+          'SELECT ph.id FROM phases ph JOIN plans pl ON pl.id = ph.plan_id WHERE ph.id = ? AND pl.project_id = ?',
+        ).bind(input.phaseId, pid).first<{ id: string }>();
+        if (!ph) throw new Error(`phase ${input.phaseId} not found in this project`);
+        phaseId = ph.id;
+      }
       const stmts = [
         // A spin-off (PLNR-230) is stored as a real `todo` with proposed_at set — the derived
         // 'proposed' wire status and every agent-path gate key off that column, exactly the
@@ -655,6 +672,11 @@ export class ProjectRoom extends DurableObject<Env> {
       }
       for (const tid of tagIds) {
         stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO task_tags (task_id, tag_id) VALUES (?, ?)').bind(id, tid));
+      }
+      if (phaseId) {
+        // Phase membership is the whole attachment (PLNR-228/PLNR-163): one phase_tasks row,
+        // exactly as createPlan writes it — no task.status change and no dependency edge.
+        stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO phase_tasks (phase_id, task_id) VALUES (?, ?)').bind(phaseId, id));
       }
       await this.env.DB.batch(stmts);
       if (input.spinoff) {
