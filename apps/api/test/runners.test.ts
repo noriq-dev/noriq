@@ -267,7 +267,8 @@ describe('run agent creation (RUN-43)', () => {
   it('a run agent cannot restatus its task via update_task — the run outcome owns the move (PLNR-192)', async () => {
     // RUN-83 took release_task off the build floor so settleAnchorTask owns the move; but
     // update_task.status was the adjacent door — a builder self-moved its task to review, the
-    // run then failed, and the settle guard left it stranded there. Copilots keep the override.
+    // run then failed, and the settle guard left it stranded there. Copilots keep the override
+    // on UNCLAIMED tasks only (PLNR-226 closed it for claimed ones — see claimed-status.test.ts).
     await seedRun('run_p192');
     const body = (await (await createAgentFor(ownerToken, 'run_p192')).json()) as { agentId: string; token: string };
     await env.DB.prepare(

@@ -691,6 +691,25 @@ export class ProjectRoom extends DurableObject<Env> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const task = await this.getTask(taskId);
+      // A claimed task's status is not editable via MCP (PLNR-226): the claim protects
+      // in-flight work, and an agent restatusing it — even to the "right" status — stomps the
+      // holder's work loop. Agent actors only: `actor.kind === 'agent'` is exactly "via MCP"
+      // (both MCP tools pass asActor; REST passes humanActor — the supervisor override IS the
+      // human path's point — and the ask-flow/demo writers are `system`). Same discrimination
+      // as releaseTask's holder check below. Raw `claimed_by` rather than the live-claim test
+      // claimTask uses: between claim expiry and the alarm sweep a status stomp is still a
+      // stomp, and moveTask's claimed-task refusal already reads it raw. No holder exemption:
+      // release_task (todo/review/done/blocked) and handoff_task cover every legitimate holder
+      // move. Placed here, before ANY of the patch is applied (the RUN-135 rule stated below) —
+      // the tag/doc blocks write and return early, so a guard at the status block would land a
+      // {tags, status} patch's tags and then refuse.
+      if (actor.kind === 'agent' && patch.status !== undefined && task.claimed_by) {
+        throw new Error(
+          task.claimed_by === actor.id
+            ? `${task.key} is claimed — status doesn't move through update_task while a claim is live. Use release_task (todo/review/done/blocked), which carries the claim with it.`
+            : `${task.key} is claimed by another agent — the claim protects its in-flight work. Wait for the release, or ask a human to override.`,
+        );
+      }
       // Same as createTask: the spec validates before ANY of this patch is applied (RUN-135).
       // The tag and doc blocks below write and can return early, so a spec parsed at its own
       // `sets.push` would answer `{tags:[...], executionSpec: <malformed>}` with the tags already

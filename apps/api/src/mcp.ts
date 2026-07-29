@@ -938,8 +938,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
    * one-element `taskIds` is the same call by another name — a guard that lives on the singular
    * tool is not a guard, it is a detour. Both doors close here or neither does.
    *
-   * Copilots and humans are untouched: a human overriding a status or correcting a spec is the
-   * point of both fields.
+   * Copilots and humans are untouched HERE: a human overriding a status or correcting a spec is
+   * the point of both fields. A copilot's status override is further narrowed at the DO, though —
+   * refused while the task is claimed (PLNR-226, `updateTask` in ProjectRoom), where the claim
+   * read is race-free. Only the REST/human path keeps the unconditional override.
    */
   /**
    * The task-lifecycle tools a runner-spawned agent must not call at all (RUN-167).
@@ -997,7 +999,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'update_task',
-    'Edit task fields. For claim-related status changes prefer claim_task/release_task; setting status directly here is a supervisor-style override. `executionSpec` REPLACES the whole spec (null clears it; omit to leave it alone) — there is no field-level merge, so read it first with get_task and send it back complete. ' +
+    'Edit task fields. For claim-related status changes prefer claim_task/release_task; setting status directly here is a supervisor-style override for UNCLAIMED tasks only — status is refused while the task is claimed (the holder moves it with release_task). `executionSpec` REPLACES the whole spec (null clears it; omit to leave it alone) — there is no field-level merge, so read it first with get_task and send it back complete. ' +
     EXECUTION_SPEC_DESC,
     {
       projectId: z.string(),
@@ -1029,7 +1031,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'update_tasks',
-    'Apply ONE change to MANY tasks — bulk re-tag, re-prioritize, move to a milestone/board, or supervisor-style bulk status. `set` is applied to every task in taskIds (ids or keys); results are per-task, and one failure does not stop the rest. For tags, addTags/removeTags edit without clobbering; `tags` replaces outright. `executionSpec` replaces the whole spec on every listed task (null clears them) — reach for it when the specs genuinely coincide, e.g. one architecture decision or one required reading list across a phase; a spec that names files or acceptance criteria describes ONE piece of work and will be wrong for every task but one.',
+    'Apply ONE change to MANY tasks — bulk re-tag, re-prioritize, move to a milestone/board, or supervisor-style bulk status (unclaimed tasks only — a claimed task refuses the status in its per-task result). `set` is applied to every task in taskIds (ids or keys); results are per-task, and one failure does not stop the rest. For tags, addTags/removeTags edit without clobbering; `tags` replaces outright. `executionSpec` replaces the whole spec on every listed task (null clears them) — reach for it when the specs genuinely coincide, e.g. one architecture decision or one required reading list across a phase; a spec that names files or acceptance criteria describes ONE piece of work and will be wrong for every task but one.',
     {
       projectId: z.string(),
       taskIds: z.array(z.string()).min(1).max(100).describe('Task ids or display keys'),
@@ -1061,7 +1063,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       // call wrong, and refusing per task would report the same refusal N times while the
       // permitted fields of that same patch had already landed on the tasks reached first.
       await refuseSelfJudgingEdits(set);
-      const r = room(env, projectId);
+      let r = room(env, projectId);
       const results: Array<{ taskId: string; key?: string; ok: boolean; error?: string }> = [];
       for (const tid of taskIds) {
         try {
@@ -1070,6 +1072,12 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           results.push({ taskId: tid, key: res.key, ok: true });
         } catch (e) {
           results.push({ taskId: tid, ok: false, error: e instanceof Error ? e.message : String(e) });
+          // A rejection that crosses blockConcurrencyWhile terminates the DO instance, and the
+          // stub it arrived on replays that same error to every later call — so one refused task
+          // (e.g. the PLNR-226 claimed-status guard) would falsely fail the rest of the list with
+          // ITS message. A fresh stub reaches the restarted instance and keeps this tool's
+          // documented contract: one failure does not stop the rest.
+          r = room(env, projectId);
         }
       }
       const failed = results.filter((x) => !x.ok).length;

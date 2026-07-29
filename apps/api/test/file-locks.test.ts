@@ -37,8 +37,13 @@ let pidOff: string; // locking OFF
 async function seedAgent(pidFor: string, id: string): Promise<Actor> {
   // A copilot (a human's MCP session) — a natural lock holder, and needs no runner (the agents
   // CHECK requires kind='agent' rows to be runner-owned; PLNR-204 keys the holder on agent_id
-  // regardless of kind).
-  await env.DB.prepare("INSERT INTO agents (id, name, kind, project_id) VALUES (?, ?, 'copilot', ?)").bind(id, id, pidFor).run();
+  // regardless of kind). session_id + label are set because a SESSION copilot has both — a
+  // sessionless, label-less copilot is the PLNR-155 connection shape, and agents.test.ts
+  // asserts a whole-DB invariant over those rows (shards share one D1, so which files
+  // coexist is decided by the round-robin in vitest.workspace.ts, not by this file).
+  await env.DB.prepare(
+    "INSERT INTO agents (id, name, label, session_id, kind, project_id) VALUES (?, ?, ?, ?, 'copilot', ?)",
+  ).bind(id, id, id, `sess-${id}`, pidFor).run();
   return { kind: 'agent', id, name: id };
 }
 const liveRows = (pidFor: string, canon: string) =>
