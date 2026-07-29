@@ -604,6 +604,8 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
   if (!visible) return c.json({ error: 'not found' }, 404);
   // Auto-archive done tasks untouched for >24h whenever the project is viewed.
   await room(c.env, pid).sweepArchive(pid).catch(() => {});
+  // PLNR-225: same opportunistic sweep for completed plans (all member tasks settled >24h ago).
+  await room(c.env, pid).sweepPlanArchive(pid).catch(() => {});
   const [project, tasks, deps, agents, events, milestones, boards, plans, phases, phaseTasks, tags, taskTags, signals, taskDocs, planDocs, locks] = await Promise.all([
     c.env.DB.prepare('SELECT id, key, name, description, claim_ttl_seconds AS claimTtlSeconds, lock_ttl_seconds AS lockTtlSeconds, file_locking_enabled AS fileLockingEnabled, repo_url AS repoUrl FROM projects WHERE id = ?')
       .bind(pid).first(),

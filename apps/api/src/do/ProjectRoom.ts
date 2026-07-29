@@ -2087,6 +2087,40 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
+  /** Auto-archive completed plans whose work settled >24h ago (PLNR-225). Mirrors
+   *  sweepArchive(): display-only (phases, membership and phase-order gating stay in
+   *  force — like manual plan archive, PLNR-148), emits no event, and relies on the
+   *  same-request snapshot re-read. Returns how many were swept.
+   *
+   *  A plan is completed when every member task is *settled* (status in done/cancelled —
+   *  NOT failed/proposed, which store as 'todo'; matches isSettledTaskStatus). Plans have
+   *  no completed_at column, so MAX(tasks.updated_at) over the members is the completion
+   *  proxy — the same column, with the same 24h cutoff, the task sweep leans on (every
+   *  claim/release/update writes updated_at = nowIso()). Guards: only 'active' plans
+   *  (never 'proposed', which is not real work yet) and COUNT(*) > 0 via the INNER JOINs
+   *  (a plan with zero member tasks is never swept). */
+  async sweepPlanArchive(projectId: string)  {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const cutoff = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+      const { meta } = await this.env.DB.prepare(
+        `UPDATE plans SET archived_at = ?
+           WHERE project_id = ? AND status = 'active' AND archived_at IS NULL
+             AND id IN (
+               SELECT ph.plan_id
+                 FROM phases ph
+                 JOIN phase_tasks pt ON pt.phase_id = ph.id
+                 JOIN tasks t ON t.id = pt.task_id
+                GROUP BY ph.plan_id
+               HAVING COUNT(*) > 0
+                  AND SUM(CASE WHEN t.status IN ('done','cancelled') THEN 0 ELSE 1 END) = 0
+                  AND MAX(t.updated_at) < ?
+             )`,
+      ).bind(nowIso(), this.projectId, cutoff).run();
+      return { archived: meta.changes ?? 0 };
+    });
+  }
+
   // ---------------------------------------------------------------------------
   // Deletion (PLNR-70). D1 enforces FKs, so children go before parents. R2 objects
   // for attachments are removed out-of-band before the rows.

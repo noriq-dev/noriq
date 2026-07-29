@@ -1,4 +1,4 @@
-import { SELF } from 'cloudflare:test';
+import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { createAgent, createUser, loginSession, mcpCall, authorizeForAllProjects } from './helpers';
 
@@ -634,5 +634,107 @@ describe('plans & groups', () => {
     expect(bad.error).toContain('not found in this project');
     // The good item still attached.
     expect((await phaseFromPlans(plan.body.id, solo.id)).total).toBe(2);
+  });
+
+  // ---- PLNR-225: completed plans auto-archive after 1 day ------------------------
+  // The sweep fires opportunistically inside /snapshot (like the task sweep). Plans have
+  // no completed_at column, so it reads MAX(tasks.updated_at) over the members as the
+  // completion proxy and requires it < now-24h. We can't wait a day, so tests shove the
+  // member tasks' updated_at back with a direct D1 write (same shared DB the worker reads).
+  const backdate = (planId: string) =>
+    env.DB.prepare(
+      `UPDATE tasks SET updated_at = ? WHERE id IN (
+         SELECT pt.task_id FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE ph.plan_id = ?)`,
+    ).bind(new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString(), planId).run();
+  const snapshotPlans = async () =>
+    ((await (await SELF.fetch(`https://noriq.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json()) as {
+      plans: Array<{ id: string; archivedAt: string | null }>;
+      phases: Array<{ planId: string }>;
+    });
+
+  it('auto-archives a plan whose every task settled >24h ago; fresh completion stays put (PLNR-225)', async () => {
+    const plan = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId, title: 'PLNR-225 sweep',
+      phases: [
+        { title: 'A', newTasks: [{ title: 'p225 first' }] },
+        { title: 'B', newTasks: [{ title: 'p225 second' }] },
+      ],
+    });
+    const planId = plan.body.id as string;
+    const first = plan.body.phases[0].taskIds[0];
+    const second = plan.body.phases[1].taskIds[0];
+
+    // Settle both phases (done + done) — one via review→done to exercise the normal path.
+    await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: first });
+    await mcpCall(worker.apiKey, 'release_task', { projectId, taskId: first, toStatus: 'done' });
+    await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: second });
+    await mcpCall(worker.apiKey, 'release_task', { projectId, taskId: second, toStatus: 'done' });
+
+    // Just completed (<24h): the snapshot fires the sweep but must NOT archive it yet.
+    const fresh = await snapshotPlans();
+    expect(fresh.plans.find((p) => p.id === planId)?.archivedAt).toBeNull();
+    const listedFresh = await mcpCall(planner.apiKey, 'get_plans', { projectId });
+    expect(listedFresh.body.plans.some((p: { id: string }) => p.id === planId)).toBe(true);
+
+    // Age the completion past the 24h cutoff, then the next snapshot sweeps it.
+    await backdate(planId);
+    const swept = await snapshotPlans();
+    // Still shipped in the authenticated snapshot, now flagged by archivedAt…
+    expect(swept.plans.find((p) => p.id === planId)?.archivedAt).toBeTruthy();
+    // …with its phase structure untouched (display-only archive; PLNR-148's manual-archive
+    // test proves the same archived_at column keeps the phase-order gate enforced).
+    expect(swept.phases.some((ph) => ph.planId === planId)).toBe(true);
+    // …and the agent read drops it (get_plans filters archived_at IS NULL).
+    const listed = await mcpCall(planner.apiKey, 'get_plans', { projectId });
+    expect(listed.body.plans.some((p: { id: string }) => p.id === planId)).toBe(false);
+  });
+
+  it('never auto-archives a plan with an unsettled task, even aged past 24h (PLNR-225)', async () => {
+    const plan = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId, title: 'PLNR-225 half-done',
+      phases: [
+        { title: 'A', newTasks: [{ title: 'p225 done leg' }] },
+        { title: 'B', newTasks: [{ title: 'p225 open leg' }] },
+      ],
+    });
+    const planId = plan.body.id as string;
+    const done = plan.body.phases[0].taskIds[0];
+    await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: done });
+    await mcpCall(worker.apiKey, 'release_task', { projectId, taskId: done, toStatus: 'done' });
+    // Age every member task; phase-2's task is still todo (unsettled), so the plan is not
+    // completed and must be left alone. (todo stands in for any non-settled wire status —
+    // failed/proposed store as 'todo' too, so the same `status IN (done,cancelled)` test skips them.)
+    await backdate(planId);
+    const snap = await snapshotPlans();
+    expect(snap.plans.find((p) => p.id === planId)?.archivedAt).toBeNull();
+  });
+
+  it('never auto-archives a proposed plan, even fully settled and aged (PLNR-225)', async () => {
+    const plan = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId, title: 'PLNR-225 proposed', proposed: true,
+      phases: [{ title: 'A', newTasks: [{ title: 'p225 proposed task' }] }],
+    });
+    const planId = plan.body.id as string;
+    const taskId = plan.body.phases[0].taskIds[0];
+    // Force the member task settled + aged directly (a proposed plan's tasks are inert to the
+    // claim path). status stays 'proposed' on the plan, so the sweep must ignore it.
+    await env.DB.prepare('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?')
+      .bind('done', new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString(), taskId).run();
+    const snap = await snapshotPlans();
+    expect(snap.plans.find((p) => p.id === planId)?.archivedAt).toBeNull();
+  });
+
+  it('never auto-archives a plan with zero member tasks (PLNR-225)', async () => {
+    const plan = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId, title: 'PLNR-225 emptied',
+      phases: [{ title: 'A', newTasks: [{ title: 'p225 soon-orphaned' }] }],
+    });
+    const planId = plan.body.id as string;
+    // Strip its membership so the plan has phases but no tasks — the COUNT(*)>0 join guard
+    // must keep it out of the sweep (there is no completion over an empty member set).
+    await env.DB.prepare('DELETE FROM phase_tasks WHERE phase_id IN (SELECT id FROM phases WHERE plan_id = ?)')
+      .bind(planId).run();
+    const snap = await snapshotPlans();
+    expect(snap.plans.find((p) => p.id === planId)?.archivedAt).toBeNull();
   });
 });
