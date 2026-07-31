@@ -43,7 +43,8 @@ export function Board({ store }: { store: AppStore }) {
   const [tagsOpen, setTagsOpen] = useState<boolean | null>(null);
   const [query, setQuery] = useState('');
   // Attribute filters (PLNR-161): the triage axes the milestone/tag/text bar didn't cover.
-  const [prioFilter, setPrioFilter] = useState(0); // minimum priority; 0 = any
+  const [prioFilter, setPrioFilter] = useState(5); // most-urgent-first scale: keep tasks with
+  // priority <= this. 5 = any, since 0 is now P0, a real value (PLNR-231).
   const [typeFilter, setTypeFilter] = useState('');
   const [stateFilter, setStateFilter] = useState<'' | 'unblocked' | 'grabbable' | 'overdue'>('');
   // Multi-select for bulk triage (PLNR-125): shift/cmd-click gathers cards; a plain
@@ -81,7 +82,7 @@ export function Board({ store }: { store: AppStore }) {
       onBoard(t.boardId) &&
       (msFilter === null || t.milestoneId === msFilter) &&
       (tagFilter === null || t.tagIds.includes(tagFilter)) &&
-      (prioFilter === 0 || t.priority >= prioFilter) &&
+      (prioFilter >= 5 || t.priority <= prioFilter) &&
       (typeFilter === '' || t.type === typeFilter) &&
       stateOk(t) &&
       (q === '' ||
@@ -175,10 +176,12 @@ export function Board({ store }: { store: AppStore }) {
       <div style={{ flex: 'none', display: 'flex', alignItems: 'center', gap: 6, padding: '0 22px 8px' }}>
         {/* Attribute filters (PLNR-161) — compose with milestone/tag/text and with
             multi-select: filter down, then shift-click + bulk act. */}
-        <FilterSelect value={String(prioFilter)} onChange={(v) => setPrioFilter(Number(v))} active={prioFilter > 0}>
-          <option value="0">priority: any</option>
-          <option value="4">P4 only</option>
-          <option value="3">P3 +</option>
+        {/* "at least this urgent" is now priority <= N (PLNR-231), and the any-sentinel is 5:
+            0 is a real value (P0), so it can no longer stand for "no filter". */}
+        <FilterSelect value={String(prioFilter)} onChange={(v) => setPrioFilter(Number(v))} active={prioFilter < 5}>
+          <option value="5">priority: any</option>
+          <option value="0">P0 only</option>
+          <option value="1">P1 +</option>
           <option value="2">P2 +</option>
         </FilterSelect>
         <FilterSelect value={typeFilter} onChange={setTypeFilter} active={typeFilter !== ''}>
@@ -286,7 +289,8 @@ export function Board({ store }: { store: AppStore }) {
           ).map(([st, label]) => {
             const m = statusMeta(st);
             // Urgent first; the stable sort keeps board order within a priority band (PLNR-119).
-            const list = visible.filter((t) => t.status === st).sort((a, b) => b.priority - a.priority);
+            // Ascending, because 0 is the most urgent (PLNR-231).
+            const list = visible.filter((t) => t.status === st).sort((a, b) => a.priority - b.priority);
             return (
               <div
                 key={st}
@@ -358,8 +362,8 @@ export function Board({ store }: { store: AppStore }) {
                               title={`priority ${t.priority}`}
                               style={{
                                 fontFamily: 'var(--mono)', fontSize: 9, fontWeight: 700,
-                                color: t.priority >= 4 ? 'var(--red-soft)' : t.priority === 3 ? 'var(--amber)' : 'var(--text-faint)',
-                                border: `1px solid ${t.priority >= 4 ? 'rgba(255,92,92,.4)' : t.priority === 3 ? 'rgba(245,166,35,.35)' : 'var(--w-1)'}`,
+                                color: t.priority <= 0 ? 'var(--red-soft)' : t.priority === 1 ? 'var(--amber)' : 'var(--text-faint)',
+                                border: `1px solid ${t.priority <= 0 ? 'rgba(255,92,92,.4)' : t.priority === 1 ? 'rgba(245,166,35,.35)' : 'var(--w-1)'}`,
                                 padding: '0 5px', borderRadius: 4,
                               }}
                             >

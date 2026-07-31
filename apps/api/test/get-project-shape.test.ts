@@ -1,5 +1,5 @@
 // PLNR-224: get_project is the project SCAFFOLD, not a task dump — it blew the MCP
-// tool-result token budget on mature projects. It now returns only P4 (top-priority) OPEN
+// tool-result token budget on mature projects. It now returns only P0 (most urgent) OPEN
 // tasks, only active/pending plans (completed ones skipped), and the fileLocking flag so an
 // agent knows locking is mandatory here.
 import { SELF } from 'cloudflare:test';
@@ -10,29 +10,29 @@ describe('get_project shape (PLNR-224)', () => {
   let agent: { id: string; apiKey: string };
   let pid: string;
   let cookie: string;
-  let p4: { id: string; key: string };
+  let p0: { id: string; key: string };
   let p2: { id: string; key: string };
-  let p4done: { id: string; key: string };
+  let p0done: { id: string; key: string };
 
   beforeAll(async () => {
     agent = await createAgent('shape-agent');
     pid = (await mcpCall(agent.apiKey, 'create_project', { key: 'SHP', name: 'shape' })).body.id;
-    p4 = (await mcpCall(agent.apiKey, 'create_task', { projectId: pid, title: 'urgent open', tags: ['shape'], priority: 4 })).body;
+    p0 = (await mcpCall(agent.apiKey, 'create_task', { projectId: pid, title: 'urgent open', tags: ['shape'], priority: 0 })).body;
     p2 = (await mcpCall(agent.apiKey, 'create_task', { projectId: pid, title: 'normal', tags: ['shape'], priority: 2 })).body;
-    p4done = (await mcpCall(agent.apiKey, 'create_task', { projectId: pid, title: 'urgent finished', tags: ['shape'], priority: 4 })).body;
-    await mcpCall(agent.apiKey, 'claim_task', { projectId: pid, taskId: p4done.id });
-    await mcpCall(agent.apiKey, 'release_task', { projectId: pid, taskId: p4done.id, toStatus: 'done' });
+    p0done = (await mcpCall(agent.apiKey, 'create_task', { projectId: pid, title: 'urgent finished', tags: ['shape'], priority: 0 })).body;
+    await mcpCall(agent.apiKey, 'claim_task', { projectId: pid, taskId: p0done.id });
+    await mcpCall(agent.apiKey, 'release_task', { projectId: pid, taskId: p0done.id, toStatus: 'done' });
     cookie = await loginSession('agent-mint@example.com', 'longenough1').catch(async () => {
       await createUser('agent-mint@example.com', 'Agent Mint', 'longenough1', 'admin');
       return loginSession('agent-mint@example.com', 'longenough1');
     });
   }, 60000);
 
-  it('returns only P4 open tasks — not the whole backlog', async () => {
+  it('returns only P0 open tasks — not the whole backlog', async () => {
     const keys = (await mcpCall(agent.apiKey, 'get_project', { projectId: pid })).body.tasks.map((t: { key: string }) => t.key);
-    expect(keys).toContain(p4.key);
+    expect(keys).toContain(p0.key);
     expect(keys).not.toContain(p2.key); // lower priority — use search_tasks
-    expect(keys).not.toContain(p4done.key); // P4 but finished
+    expect(keys).not.toContain(p0done.key); // P0 but finished
   });
 
   it('reports fileLocking as a boolean, following the REST opt-in', async () => {

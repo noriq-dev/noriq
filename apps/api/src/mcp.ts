@@ -111,6 +111,9 @@ projects accept no agent-minted tags at all. Never tag with status/type/priority
 words — those have dedicated fields. Plans need no dependency wiring: phase order itself
 gates tasks (a task is claimable when every earlier phase is finished); use dependsOn
 only for real, hand-picked orderings.
+Priority runs 0 = MOST urgent to 4 = someday, as P0/P1 read everywhere else: P0 means drop
+everything, 2 is the default "normal". The number goes DOWN as urgency goes UP, so filing
+real work as P4 buries it.
 File locking is opt-in per project; get_project tells you whether it is on (project.fileLocking).
 When it is on it is MANDATORY, not advisory: acquire_lock the file paths you are about to
 edit/create/delete/rename BEFORE you touch them — pass the whole edit's paths in ONE call
@@ -362,7 +365,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           'Hand the NEXT agent what you learned: a task\'s executionSpec carries requirementIds, anticipated files, required reading, decisions already settled (do not relitigate), where it may use its own judgement, what is explicitly out of scope, and acceptance criteria written as truths rather than steps. Fill it in whenever you know more than the title and body say — on create_task/create_tasks, on a plan\'s newTasks, or later with update_task (which REPLACES the whole spec; read it first and send it back complete). Read it before you start (get_task.executionSpec): if it is there, its lockedDecisions bind you and its acceptance is your definition of done. If executionSpecUnreadable is set, the stored spec is corrupt — say so, do not treat it as absent. A build or verify run cannot REWRITE its own task\'s spec: it is what your work is judged against, so if it is wrong say so in a comment and let a human or a scope run correct it.',
           'Tasks you create MUST carry descriptive tags — topic/area/component words (e.g. "oauth", "board-filters"), FIRST tag = primary tag. Tags are the project\'s SHARED filter vocabulary: reuse existing tags (get_project.tags) before minting — near-duplicates are rejected, and some projects are curated (agents cannot mint at all). Never status/type/priority words as tags. Use dependsOn only for real, hand-picked orderings.',
           'Project docs are settled decisions and facts ONLY (enforced — open questions/TBDs are rejected). Read a task\'s related docs (get_task.docs) before starting; link the docs new tasks must follow via docIds; when you settle something durable, create_doc the outcome. Undecided → request_input first, then document the answer.',
-          'Search before you file or dig: semantic_search finds tasks, docs and plans by MEANING (the thing you are about to create may already exist); search_tasks filters by attributes. get_project is the scaffold (ids, tags, boards, docs index, active plans, P4 tasks) — not a task list; never expect the whole backlog from it.',
+          'Search before you file or dig: semantic_search finds tasks, docs and plans by MEANING (the thing you are about to create may already exist); search_tasks filters by attributes. get_project is the scaffold (ids, tags, boards, docs index, active plans, P0 tasks) — not a task list; never expect the whole backlog from it.',
+          'Priority runs 0 = MOST urgent to 4 = someday (P0 means drop everything; 2 is the default "normal"). The number goes DOWN as urgency goes UP — filing real work as P4 buries it, and the top of a queue is its LOWEST priority number.',
           'Claims are exclusive. If claim_task fails, the task is taken or blocked — pick another.',
           'File locking is opt-in per project — get_project.project.fileLocking says whether it is on here. When it is on it is MANDATORY: acquire_lock the file(s) you are about to edit/create/rename BEFORE touching them — all paths in ONE all-or-nothing call, scoped to your branch and linked to your task (they auto-release when it settles). Editing an unlocked file on a locking project is a coordination violation (others read "unlocked" as "free to take"). Re-acquiring your own paths renews them; check_locks to look without taking; release_lock when done. On conflict, coordinate with the holder or wait — never clobber a locked file. Git has no file locking; this is how agents avoid stepping on each other.',
           'Blocked on a human decision? request_input (it auto-parks the task and frees you to work elsewhere) — do not guess or stall. Batch every question the decision needs into its typed `questions` (select/multi/text/number/confirm) in ONE gate; thread a genuine follow-up round with followUpTo. Flag non-blocking concerns (deviations, risks) with raise_alert and keep going.',
@@ -565,7 +569,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         description: z.string().optional(),
         body: z.string().optional().describe('The plan document (markdown)'),
         taskDefaults: z.object({
-          priority: z.number().int().min(0).max(4).optional(),
+          priority: z.number().int().min(0).max(4).optional().describe('0 = most urgent (drop everything), 2 = normal (default), 4 = someday — P0 is the TOP of the scale, not the bottom'),
           estimate: z.number().int().min(0).optional(),
           type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
           tags: z.array(z.string()).optional(),
@@ -576,7 +580,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           newTasks: z.array(z.object({
             title: z.string().min(1),
             body: z.string().optional(),
-            priority: z.number().int().min(0).max(4).optional(),
+            priority: z.number().int().min(0).max(4).optional().describe('0 = most urgent (drop everything), 2 = normal (default), 4 = someday — P0 is the TOP of the scale, not the bottom'),
             estimate: z.number().int().min(0).optional(),
             type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
             tags: z.array(z.string()).optional(),
@@ -739,18 +743,18 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'get_project',
-    'Project scaffold for orientation + id resolution — deliberately NOT the full task list. Returns: the project (incl. `fileLocking` — when true you MUST acquire_lock before editing any file here), milestones, boards, tags, the docs index, the active/pending plans (completed & archived plans omitted), and only the P4 (top-priority) still-open tasks. For the full or filtered task list use search_tasks; for the next thing to work use next_claimable; for "find the thing about X" use semantic_search; for a plan\'s detail use get_plans.',
+    'Project scaffold for orientation + id resolution — deliberately NOT the full task list. Returns: the project (incl. `fileLocking` — when true you MUST acquire_lock before editing any file here), milestones, boards, tags, the docs index, the active/pending plans (completed & archived plans omitted), and only the P0 (most urgent — the scale runs 0 = drop everything to 4 = someday) still-open tasks. For the full or filtered task list use search_tasks; for the next thing to work use next_claimable; for "find the thing about X" use semantic_search; for a plan\'s detail use get_plans.',
     { projectId: z.string() },
     tool(async ({ projectId }) => {
       const [tasks, milestones, boards, project, categories, docs, plans] = await Promise.all([
-        // Only the top-priority (P4) still-open tasks — get_project is for orientation, not a
+        // Only the most-urgent (P0) still-open tasks — get_project is for orientation, not a
         // dump. The full/filtered list lives in search_tasks; the pull-loop in next_claimable.
         env.DB.prepare(
           `SELECT t.id, t.key, t.title, ${taskWireStatus('t')} AS status, t.failed_at AS failedAt, t.type, t.priority, t.claimed_by AS claimedBy, t.parent_task_id AS parentTaskId,
                   t.milestone_id AS milestoneId, t.board_id AS boardId, t.open_comments AS openComments, t.claim_expires_at AS claimExpiresAt,
                   (SELECT GROUP_CONCAT(dt.key) FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id WHERE d.task_id = t.id) AS dependsOn,
                   (SELECT GROUP_CONCAT(g.name) FROM task_tags tt JOIN tags g ON g.id = tt.tag_id WHERE tt.task_id = t.id) AS tags
-           FROM tasks t WHERE t.project_id = ? AND t.priority = 4 AND t.status NOT IN ('done','cancelled') ORDER BY t."order"`,
+           FROM tasks t WHERE t.project_id = ? AND t.priority = 0 AND t.status NOT IN ('done','cancelled') ORDER BY t."order"`,
         ).bind(projectId).all(),
         env.DB.prepare('SELECT id, title, due_at AS dueAt, description FROM milestones WHERE project_id = ? ORDER BY "order"').bind(projectId).all(),
         env.DB.prepare('SELECT id, name FROM boards WHERE project_id = ? ORDER BY "order", created_at').bind(projectId).all(),
@@ -789,7 +793,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       body: z.string().optional(),
       parentTaskId: z.string().optional(),
       milestoneId: z.string().optional(),
-      priority: z.number().int().min(0).max(4).optional(),
+      priority: z.number().int().min(0).max(4).optional().describe('0 = most urgent (drop everything), 2 = normal (default), 4 = someday — P0 is the TOP of the scale, not the bottom'),
       estimate: z.number().int().min(0).optional().describe('Effort estimate in points (team-defined scale)'),
       dueAt: z.string().datetime().optional().describe('Deadline (ISO datetime) — overdue tasks are surfaced to humans'),
       dependsOn: z.array(z.string()).optional().describe('Existing task ids or display keys in THIS project this task must wait on; cross-project or unknown refs are rejected'),
@@ -819,7 +823,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       defaults: z.object({
         milestoneId: z.string().optional(),
         boardId: z.string().optional(),
-        priority: z.number().int().min(0).max(4).optional(),
+        priority: z.number().int().min(0).max(4).optional().describe('0 = most urgent (drop everything), 2 = normal (default), 4 = someday — P0 is the TOP of the scale, not the bottom'),
         estimate: z.number().int().min(0).optional(),
         dueAt: z.string().datetime().optional(),
         type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
@@ -837,7 +841,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           ref: z.string().optional().describe('Caller-chosen handle, echoed back and addressable from later items\' dependsOn/parentTaskId'),
           title: z.string().min(1),
           body: z.string().optional(),
-          priority: z.number().int().min(0).max(4).optional(),
+          priority: z.number().int().min(0).max(4).optional().describe('0 = most urgent (drop everything), 2 = normal (default), 4 = someday — P0 is the TOP of the scale, not the bottom'),
           estimate: z.number().int().min(0).optional(),
           dueAt: z.string().datetime().optional(),
           milestoneId: z.string().optional(),
@@ -914,7 +918,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         z.object({
           title: z.string().min(1),
           body: z.string().optional(),
-          priority: z.number().int().min(0).max(4).optional(),
+          priority: z.number().int().min(0).max(4).optional().describe('0 = most urgent (drop everything), 2 = normal (default), 4 = someday — P0 is the TOP of the scale, not the bottom'),
           boardId: z.string().optional().describe('Board for this subtask (see get_project.boards); defaults to the parent task\'s board'),
           dependsOnIndex: z.array(z.number().int().nonnegative()).optional(),
         }),
@@ -1011,7 +1015,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       title: z.string().optional(),
       body: z.string().optional(),
       status: z.enum(['todo', 'in_progress', 'blocked', 'review', 'done', 'cancelled']).optional(),
-      priority: z.number().int().min(0).max(4).optional(),
+      priority: z.number().int().min(0).max(4).optional().describe('0 = most urgent (drop everything), 2 = normal (default), 4 = someday — P0 is the TOP of the scale, not the bottom'),
       estimate: z.number().int().min(0).nullable().optional().describe('Effort estimate in points; null clears it'),
       dueAt: z.string().datetime().nullable().optional().describe('Deadline (ISO datetime); null clears it'),
       milestoneId: z.string().optional(),
@@ -1041,7 +1045,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       taskIds: z.array(z.string()).min(1).max(100).describe('Task ids or display keys'),
       set: z.object({
         status: z.enum(['todo', 'in_progress', 'blocked', 'review', 'done', 'cancelled']).optional(),
-        priority: z.number().int().min(0).max(4).optional(),
+        priority: z.number().int().min(0).max(4).optional().describe('0 = most urgent (drop everything), 2 = normal (default), 4 = someday — P0 is the TOP of the scale, not the bottom'),
         estimate: z.number().int().min(0).nullable().optional(),
         dueAt: z.string().datetime().nullable().optional(),
         milestoneId: z.string().nullable().optional(),
@@ -1095,7 +1099,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     { taskId: z.string() },
     tool(async ({ taskId }) => {
       const task = await env.DB.prepare(
-        // `tags` is joined in here because get_project now returns only P4 tasks — this is
+        // `tags` is joined in here because get_project now returns only P0 tasks — this is
         // the surface that answers "what is this task tagged" for everything else.
         `SELECT t.*, t.claimed_by AS claimedBy, t.claim_expires_at AS claimExpiresAt, t.open_comments AS openComments,
                 (SELECT GROUP_CONCAT(g.name) FROM task_tags tt JOIN tags g ON g.id = tt.tag_id WHERE tt.task_id = t.id) AS tags
@@ -1260,7 +1264,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           `SELECT t.id, t.key, t.title, ${taskWireStatus('t')} AS status, t.failed_at AS failedAt, t.priority, t.estimate, t.due_at AS dueAt, t.type,
                   t.project_id AS projectId, p.key AS projectKey, t.claimed_by AS claimedBy,
                   t.milestone_id AS milestoneId, t.open_comments AS openComments, t.updated_at AS updatedAt
-           ${base} ORDER BY t.priority DESC, t.updated_at DESC LIMIT ${max}`,
+           ${base} ORDER BY t.priority ASC, t.updated_at DESC LIMIT ${max}`,
         ).bind(...allBinds).all(),
         env.DB.prepare(`SELECT COUNT(*) AS n ${base}`).bind(...allBinds).first<{ n: number }>(),
       ]);
@@ -1465,7 +1469,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
            AND ${TASK_NOT_IN_PROPOSED_PLAN}
            AND ${TASK_NOT_PROPOSED_SPINOFF}
            AND ${TASK_NOT_PHASE_BLOCKED}
-         ORDER BY t.priority DESC, t."order" LIMIT 1`,
+         -- ASC is most-urgent-first: priority 0 is P0 (PLNR-231), not the bottom of the scale.
+         ORDER BY t.priority ASC, t."order" LIMIT 1`,
       ).bind(agent.userId, projectId ?? null, opts.oauthTokenId ?? null).first();
       return row ? { task: row } : { task: null, note: 'nothing claimable right now — check my_updates for blockers' };
     }),
@@ -1732,7 +1737,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       finding: z.string().min(1).describe('The finding this task tracks: what you observed, where (files/behavior), and why it is outside your current task'),
       tags: z.array(z.string()).optional().describe('REQUIRED. Descriptive topic/area tags, primary first — same contract as create_task'),
       allowNewTags: z.boolean().optional().describe('Mint a tag the near-duplicate guard flagged — only for genuinely distinct concepts'),
-      priority: z.number().int().min(0).max(4).optional(),
+      priority: z.number().int().min(0).max(4).optional().describe('0 = most urgent (drop everything), 2 = normal (default), 4 = someday — P0 is the TOP of the scale, not the bottom'),
       type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
     },
     tool(async ({ projectId, title, body, finding, tags, allowNewTags, priority, type }) => {
@@ -1776,7 +1781,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       taskDefaults: z.object({
         milestoneId: z.string().optional(),
         boardId: z.string().optional(),
-        priority: z.number().int().min(0).max(4).optional(),
+        priority: z.number().int().min(0).max(4).optional().describe('0 = most urgent (drop everything), 2 = normal (default), 4 = someday — P0 is the TOP of the scale, not the bottom'),
         estimate: z.number().int().min(0).optional(),
         type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
         tags: z.array(z.string()).optional(),
@@ -1790,7 +1795,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           newTasks: z.array(z.object({
             title: z.string().min(1),
             body: z.string().optional(),
-            priority: z.number().int().min(0).max(4).optional(),
+            priority: z.number().int().min(0).max(4).optional().describe('0 = most urgent (drop everything), 2 = normal (default), 4 = someday — P0 is the TOP of the scale, not the bottom'),
             estimate: z.number().int().min(0).optional(),
             milestoneId: z.string().optional(),
             boardId: z.string().optional(),

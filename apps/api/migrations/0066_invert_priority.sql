@@ -1,0 +1,23 @@
+-- PLNR-231: invert the priority scale so 0 is the MOST urgent, not the least.
+--
+-- The scale was 0-4 with 4 = most urgent, which is backwards from the convention every reader
+-- arrives with (Jira, Linear, Google: P0 = drop everything). The UI said "P0 · someday" and an
+-- agent told to work "the P0" picked up the least urgent thing in the project. The numbers were
+-- never wrong in themselves — their MEANING was — so this rewrites the stored values rather than
+-- redefining them in place: every task keeps the urgency a human actually gave it, and only the
+-- number naming that urgency changes.
+--
+--   old 4 (urgent)  -> new 0        old 1 -> new 3
+--   old 3 (high)    -> new 1        old 0 (someday) -> new 4
+--   old 2 (normal)  -> new 2        (the midpoint is unchanged, and so is the column default)
+--
+-- A DATA migration, not a structural one, so it does not run into the D1 additive-only rule
+-- (nothing is dropped or rebuilt; `priority` is NOT NULL DEFAULT 2, so no row is skipped and no
+-- NULL arithmetic is possible). It is NOT idempotent — applying it twice returns every row to the
+-- old scale — which is safe only because the d1_migrations tracker applies each file exactly once.
+-- Never re-run this by hand with `d1 execute`.
+--
+-- The column default stays 2: "normal" is the midpoint of a five-point scale from either end.
+-- Every ORDER BY over priority flips DESC -> ASC in the same change; a deploy that lands one half
+-- without the other ranks the whole backlog upside down.
+UPDATE tasks SET priority = 4 - priority;

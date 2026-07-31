@@ -73,12 +73,12 @@ export async function resetDemo(env: Env): Promise<void> {
     taskDefaults: { milestoneId: ms.id },
     phases: [
       { title: 'Payment API', newTasks: [
-        { title: 'Design payment-intent schema', type: 'chore', priority: 3, tags: ['api'] },
-        { title: 'Implement gateway adapter', type: 'feature', priority: 3, tags: ['api'] },
+        { title: 'Design payment-intent schema', type: 'chore', priority: 1, tags: ['api'] },
+        { title: 'Implement gateway adapter', type: 'feature', priority: 1, tags: ['api'] },
       ] },
       { title: 'Checkout UI', newTasks: [
         { title: 'Cart summary component', type: 'feature', priority: 2, tags: ['ui'] },
-        { title: 'Payment form with validation', type: 'feature', priority: 3, tags: ['ui'] },
+        { title: 'Payment form with validation', type: 'feature', priority: 1, tags: ['ui'] },
       ] },
       { title: 'Cutover', newTasks: [
         { title: 'Feature-flag rollout plan', type: 'chore', priority: 2, tags: ['ops'], dueAt: new Date(Date.now() + 10 * 86400_000).toISOString() },
@@ -92,7 +92,7 @@ export async function resetDemo(env: Env): Promise<void> {
 
   // Loose tasks in the other columns, one overdue — the badges have something to show.
   const rev = await r.createTask(DEMO_PROJECT_ID, sys, {
-    title: 'Add retry/backoff to webhook consumer', type: 'feature', priority: 4, tags: ['api'], milestoneId: ms.id,
+    title: 'Add retry/backoff to webhook consumer', type: 'feature', priority: 0, tags: ['api'], milestoneId: ms.id,
   });
   await r.updateTask(DEMO_PROJECT_ID, sys, rev.id, { status: 'review' });
   await r.createTask(DEMO_PROJECT_ID, sys, {

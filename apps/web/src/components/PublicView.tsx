@@ -60,7 +60,7 @@ export function PublicView({ pid, onNotPublic }: { pid: string; onNotPublic: () 
         {/* board, read-only */}
         <div style={{ display: 'flex', gap: 14, overflowX: 'auto', paddingBottom: 8 }}>
           {COLUMNS.map(([st, label]) => {
-            const list = tasks.filter((t) => t.status === st).sort((a, b) => b.priority - a.priority);
+            const list = tasks.filter((t) => t.status === st).sort((a, b) => a.priority - b.priority); // 0 = most urgent (PLNR-231)
             return (
               <div key={st} style={{ width: 250, flex: 'none' }}>
                 <div style={{ display: 'flex', gap: 7, alignItems: 'baseline', padding: '2px 2px 10px' }}>

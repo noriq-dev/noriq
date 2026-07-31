@@ -3157,7 +3157,7 @@ export class ProjectRoom extends DurableObject<Env> {
          AND NOT EXISTS (
            SELECT 1 FROM runs ar WHERE ar.plan_dispatch_id = ?2
              AND ar.anchor_type = 'task' AND ar.anchor_id = t.id ${attempted})
-       ORDER BY t.priority DESC, t."order"`,
+       ORDER BY t.priority ASC, t."order"`,
     ).bind(d.plan_id, d.id).all<{ id: string }>();
 
     // Capacity: advertised max minus what the runs table says is on the box.

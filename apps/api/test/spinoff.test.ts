@@ -51,7 +51,7 @@ describe('spin_off_task (PLNR-230)', () => {
       body: 'seen while working the anchor — deserves its own task',
       finding: 'refresh tokens are logged in cleartext in oauth.ts — real, but not my task',
       tags: ['spinoff-oauth'], allowNewTags: true,
-      priority: 4, // outranks everything, so the claimable surfaces would offer it if ungated
+      priority: 0, // P0 outranks everything (PLNR-231), so the claimable surfaces would offer it first if ungated
     });
     expect(res.isError).toBeFalsy();
     return res.body as { id: string; key: string; status?: string };

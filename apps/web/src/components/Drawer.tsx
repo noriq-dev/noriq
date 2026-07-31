@@ -116,7 +116,8 @@ export function Drawer({ store }: { store: AppStore }) {
     setETitle(task.title);
     setEBody(task.body);
     setEType(task.type);
-    setEPriority(0); // priority isn't in the VM snapshot list; leave unchanged unless touched
+    setEPriority(-1); // -1 = keep: priority isn't in the VM snapshot list, and 0 is now a real
+    // value (P0, the most urgent), so 'unchanged' has to live off the scale (PLNR-231).
     setETags(taskTags.map((t) => t.name).join(', '));
     setEMilestone(task.milestoneId ?? '');
     setEBoard(task.boardId ?? '');
@@ -134,7 +135,7 @@ export function Drawer({ store }: { store: AppStore }) {
       // End-of-day UTC so "due today" doesn't read overdue at 9am.
       dueAt: eDue ? `${eDue}T23:59:59.000Z` : null,
       ...(eBoard ? { boardId: eBoard } : {}),
-      ...(ePriority > 0 ? { priority: ePriority } : {}),
+      ...(ePriority >= 0 ? { priority: ePriority } : {}),
     });
     setEditing(false);
     actions.refreshNow();
@@ -280,11 +281,14 @@ export function Drawer({ store }: { store: AppStore }) {
                   <option value="research">research</option>
                 </Select>
                 <Select value={ePriority} onChange={(e) => setEPriority(Number(e.target.value))}>
-                  <option value={0}>priority — keep</option>
-                  <option value={4}>P4 · urgent</option>
-                  <option value={3}>P3 · high</option>
+                  {/* The "keep" sentinel is -1, OFF the scale (PLNR-231): 0 is now P0, the most
+                      urgent value there is, so a 0 sentinel made the top priority unsettable. */}
+                  <option value={-1}>priority — keep</option>
+                  <option value={0}>P0 · urgent</option>
+                  <option value={1}>P1 · high</option>
                   <option value={2}>P2 · normal</option>
-                  <option value={1}>P1 · low</option>
+                  <option value={3}>P3 · low</option>
+                  <option value={4}>P4 · someday</option>
                 </Select>
               </div>
               <div style={{ marginTop: 10, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>

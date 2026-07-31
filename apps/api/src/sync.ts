@@ -87,7 +87,8 @@ export async function computeUpdates(
          AND ${TASK_NOT_IN_PROPOSED_PLAN}
          AND ${TASK_NOT_PROPOSED_SPINOFF}
          AND ${TASK_NOT_PHASE_BLOCKED}
-       ORDER BY t.priority DESC, t."order" LIMIT 20`,
+       -- ASC is most-urgent-first: priority 0 is P0 (PLNR-231), not the bottom of the scale.
+       ORDER BY t.priority ASC, t."order" LIMIT 20`,
     ).bind(agent.userId, agentProjectId, tokenId).all<AgentUpdates['claimable'][number]>()
   ).results;
 

@@ -116,6 +116,10 @@ export const Task = z.object({
   title: z.string().min(1),
   body: z.string().default(''),
   status: TaskStatus,
+  // 0 = MOST urgent, 4 = least (PLNR-231). P0 means "drop everything", as it does in Jira,
+  // Linear and Google — the scale used to run the other way, which read as "P0 · someday" and
+  // sent an agent asked for "the P0" to the least important task in the project. Consequence
+  // for anything sorting by it: most-urgent-first is ORDER BY priority ASC, not DESC.
   priority: z.number().int().min(0).max(4).default(2),
   estimate: z.number().nullable(),
   /** Per-task deadline (PLNR-126); overdue = dueAt < now while not done/cancelled. */

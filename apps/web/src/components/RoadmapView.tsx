@@ -58,7 +58,7 @@ export function RoadmapView({ store }: { store: AppStore }) {
               {open.length > 0 && (
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
                   {open
-                    .sort((a, b) => b.priority - a.priority)
+                    .sort((a, b) => a.priority - b.priority) // urgent first: 0 = P0 (PLNR-231)
                     .map((t) => {
                       const m = statusMeta(helpers.effStatus(currentPid, t));
                       return (

@@ -231,11 +231,11 @@ function CreateTaskModal({ store }: { store: AppStore }) {
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
         <Field label="Priority">
           <Select value={priority} onChange={(e) => setPriority(Number(e.target.value))}>
-            <option value={4}>P4 · urgent</option>
-            <option value={3}>P3 · high</option>
+            <option value={0}>P0 · urgent</option>
+            <option value={1}>P1 · high</option>
             <option value={2}>P2 · normal</option>
-            <option value={1}>P1 · low</option>
-            <option value={0}>P0 · someday</option>
+            <option value={3}>P3 · low</option>
+            <option value={4}>P4 · someday</option>
           </Select>
         </Field>
         <Field label="Milestone" hint="optional">

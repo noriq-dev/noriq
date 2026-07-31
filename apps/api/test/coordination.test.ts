@@ -365,7 +365,12 @@ describe('search_tasks', () => {
     const capped = await mcpCall(orch.apiKey, 'search_tasks', { projectId: pid, limit: 1 });
     expect(capped.body.returned).toBe(1);
     expect(capped.body.matched).toBe(3); // truncation is visible, not silent
-    expect(capped.body.tasks[0].priority).toBe(4); // urgent-first ordering
+    // Urgent-first, and since PLNR-231 that means the LOWEST priority number (0 = P0 = drop
+    // everything). Asserted against the actual minimum rather than a literal, so the test states
+    // the ordering rule instead of a fixture's value.
+    const all = await mcpCall(orch.apiKey, 'search_tasks', { projectId: pid });
+    const mostUrgent = Math.min(...(all.body.tasks as Array<{ priority: number }>).map((t) => t.priority));
+    expect(capped.body.tasks[0].priority).toBe(mostUrgent);
   });
 
   it('REST mirror answers the same question for the UI', async () => {

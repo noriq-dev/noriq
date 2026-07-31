@@ -128,8 +128,15 @@ Large projects hold hundreds of tasks, docs and plans — search, don't scroll, 
 - \`list_docs\` / \`get_project\` — the browsable indexes, when you want the shape of
   the whole rather than an answer to a question. \`get_project\` is the project
   **scaffold**: ids you need (boards, milestones, tags), the docs index, the active
-  plans, the \`fileLocking\` flag, and only the **P4** (top-priority) open tasks — it is
+  plans, the \`fileLocking\` flag, and only the **P0** (most urgent) open tasks — it is
   deliberately not the backlog, so reach for \`search_tasks\` / \`next_claimable\` for that.
+
+## Priority
+
+\`priority\` runs **0 = most urgent to 4 = someday**, the way P0/P1 read everywhere else:
+**P0 means drop everything**, P2 is the default "normal", P4 is "someday". Sorting
+most-urgent-first is therefore *ascending*. When you set a priority, remember the number
+goes DOWN as the urgency goes up — filing real work as P4 buries it.
 
 ## Human steering
 
