@@ -89,3 +89,24 @@ curl -X 'POST' -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: applica
 > The JSON snapshot is best for inspection, migration between instances, and restoring over a
 > running instance. For very large databases prefer Option A (a single atomic import batch can
 > grow past D1's request limits — `/api/admin/import` fails cleanly and unchanged if it does).
+
+## Data-rewrite migrations vs old snapshots — check before restoring
+
+A restore replaces table **data**, but `d1_migrations` (and the schema) stay at the live
+database's state. Additive column migrations are immune — a snapshot that predates a column
+just takes the default. **Migrations that rewrite VALUES are not.** A snapshot taken before
+such a migration carries the old encoding, and restoring it loads that old encoding into a
+database whose tracker says the rewrite already ran — nothing will ever re-apply it.
+
+Value-rewrite migrations to date:
+
+- **`0066_invert_priority` (2026-07-31, PLNR-231)** — inverted `tasks.priority` from
+  4-is-urgent to 0-is-urgent (`priority = 4 - priority`). Any snapshot exported **before**
+  this date holds old-scale priorities; restoring one silently ranks the entire backlog
+  upside down. After restoring a pre-0066 snapshot, re-apply the rewrite by hand:
+  `wrangler d1 execute DB --remote --command "UPDATE tasks SET priority = 4 - priority"`
+  (once — it is an involution, so running it twice undoes it). The same applies to
+  pre-rename `backups/planar-*.json` snapshots in the old R2 bucket.
+
+When adding a future value-rewrite migration, list it here and consider whether the
+snapshot's `version` field should gate the import.
