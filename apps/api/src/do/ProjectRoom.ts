@@ -611,6 +611,10 @@ export class ProjectRoom extends DurableObject<Env> {
         : (await this.parentBoardId(input.parentTaskId))
           ?? (await this.actorRepoBoardId(actor))
           ?? (await this.defaultBoardId(pid));
+      // Milestones validate like boards (PLNR-232): unvalidated, an unknown or foreign-project
+      // milestone id aborted the insert batch as an opaque FK error — atomically here, but from
+      // create_plan's task loop it was a mid-plan throw, i.e. a partial plan left behind.
+      if (input.milestoneId) await this.requireProjectMilestone(input.milestoneId);
       // Doc links (PLNR-182) validate BEFORE the insert batch so a bad doc id fails the
       // whole create cleanly instead of leaving a task without its intended links.
       const docIds = await this.requireProjectDocs(input.docIds);
@@ -4012,13 +4016,76 @@ export class ProjectRoom extends DurableObject<Env> {
   )  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
-      // EVERY task's spec validates before the plan row exists (RUN-135). A plan is written phase
-      // by phase and task by task, and this is not a transaction — a malformed spec on the fifth
-      // task would otherwise fail the call and leave a plan, its phases, and four tasks behind,
-      // which is worse than either outcome the caller expects.
-      for (const ph of input.phases) {
-        for (const nt of ph.newTasks ?? []) writeExecutionSpec(nt.executionSpec);
+      // A live same-titled plan created moments ago is a RETRY, not a second plan (PLNR-232).
+      // create_plan is the one call an agent re-issues wholesale after a timeout or an error, and
+      // both retry shapes end in duplicates: a response that never arrived (the call succeeded),
+      // and — before the pass-1 rule below — a mid-plan rejection that left a partial plan
+      // behind. Name the twin instead of minting it again; a genuinely distinct plan can say so
+      // with a distinct title.
+      const twin = await this.env.DB.prepare(
+        'SELECT id, created_at AS createdAt FROM plans WHERE project_id = ? AND title = ? AND archived_at IS NULL AND created_at >= ? ORDER BY created_at DESC LIMIT 1',
+      ).bind(projectId, input.title, new Date(Date.now() - 15 * 60 * 1000).toISOString()).first<{ id: string; createdAt: string }>();
+      if (twin) {
+        const ageS = Math.max(0, Math.round((Date.now() - Date.parse(twin.createdAt)) / 1000));
+        throw new Error(
+          `a plan titled "${input.title}" already exists in this project — created ${ageS}s ago (${twin.id}). `
+          + 'If your earlier create_plan call errored or timed out, it may still have succeeded: get_plans to inspect it, '
+          + 'update_plan to revise it. If this is genuinely a different plan, give it a distinct title.',
+        );
       }
+
+      // ---- PASS 1 (PLNR-232): validate and resolve EVERYTHING fallible before anything durable
+      // is written. blockConcurrencyWhile serializes this whole method, so what pass 1 proves
+      // still holds when pass 2 writes — nothing can interleave between them. Each task's create
+      // is internally atomic (_createTaskLocked validates-then-batches), but the PLAN is written
+      // plan → phases → task-by-task with no transaction around the sequence: the live incident
+      // was the curated-tag guard rejecting the FOURTH task of a plan whose row, phases and first
+      // three tasks were already committed — the caller fixed the tag, retried, and got a full
+      // duplicate set. RUN-135 fixed exactly this failure for execution specs ("validates before
+      // the plan row exists"); tags, milestones, boards and doc links were still throwing
+      // mid-loop. A tag minted here and orphaned by a later pass-1 throw is the accepted harmless
+      // leftover (PLNR-194); everything else below is read-only.
+      const d = input.taskDefaults ?? {};
+      const resolvedExisting: string[][] = [];
+      const resolvedDeps: string[][][] = [];
+      for (const ph of input.phases) {
+        const existing: string[] = [];
+        for (const tid of ph.taskIds ?? []) {
+          // Accept ids or keys; validate the task belongs to this project.
+          const t = await this.env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+            .bind(tid, tid, projectId).first<{ id: string }>();
+          if (!t) throw new Error(`task ${tid} not found in this project`);
+          existing.push(t.id);
+        }
+        const newTasks = ph.newTasks ?? [];
+        if (!existing.length && !newTasks.length) throw new Error(`phase "${ph.title}" has no tasks`);
+        const phaseDeps: string[][] = [];
+        for (const nt of newTasks) {
+          writeExecutionSpec(nt.executionSpec);
+          // Same strict mint semantics as the real create: create_plan carries no allowNewTags.
+          for (const n of nt.tags ?? d.tags ?? []) {
+            if (n.trim()) await this._resolveTagLocked(this.projectId, actor, n, false);
+          }
+          const boardId = nt.boardId ?? d.boardId;
+          if (boardId) await this.requireProjectBoard(boardId);
+          const milestoneId = nt.milestoneId ?? d.milestoneId;
+          if (milestoneId) await this.requireProjectMilestone(milestoneId);
+          await this.requireProjectDocs(nt.docIds ?? d.docIds);
+          const depIds: string[] = [];
+          for (const ref of nt.dependsOn ?? []) {
+            const t = await this.env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+              .bind(ref, ref, projectId).first<{ id: string }>();
+            if (!t) throw new Error(`dependsOn ${ref} not found in this project`);
+            depIds.push(t.id);
+          }
+          phaseDeps.push(depIds);
+        }
+        resolvedExisting.push(existing);
+        resolvedDeps.push(phaseDeps);
+      }
+
+      // ---- PASS 2: write. Every validation above already passed and nothing can have changed
+      // under the serialization, so a throw below this line is infrastructure, not input.
       const planId = newId('pln');
       const status = input.proposed ? 'proposed' : 'active';
       await this.env.DB.prepare(
@@ -4032,24 +4099,13 @@ export class ProjectRoom extends DurableObject<Env> {
         await this.env.DB.prepare('INSERT INTO phases (id, plan_id, title, body, "order") VALUES (?, ?, ?, ?, ?)')
           .bind(phaseId, planId, ph.title, ph.body ?? '', i).run();
   
-        const taskIds: string[] = [];
-        for (const tid of ph.taskIds ?? []) {
-          // Accept ids or keys; validate the task belongs to this project.
-          const t = await this.env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
-            .bind(tid, tid, projectId).first<{ id: string }>();
-          if (!t) throw new Error(`task ${tid} not found in this project`);
-          taskIds.push(t.id);
-        }
-        for (const nt of ph.newTasks ?? []) {
-          const d = input.taskDefaults ?? {};
-          // Resolve dependsOn ids/keys up front so a bad ref fails the whole plan before any
-          // task is created. createTask re-validates+project-scopes each ref too (PLNR-109).
-          const dependsOn = await Promise.all((nt.dependsOn ?? []).map(async (ref) => {
-            const t = await this.env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
-              .bind(ref, ref, projectId).first<{ id: string }>();
-            if (!t) throw new Error(`dependsOn ${ref} not found in this project`);
-            return t.id;
-          }));
+        // Ids were resolved and validated in pass 1; consuming those answers (rather than
+        // re-querying) keeps the two passes provably the same check.
+        const taskIds: string[] = [...resolvedExisting[i]!];
+        const phNewTasks = ph.newTasks ?? [];
+        for (let j = 0; j < phNewTasks.length; j++) {
+          const nt = phNewTasks[j]!;
+          const dependsOn = resolvedDeps[i]![j]!;
           const created = await this._createTaskLocked(projectId, actor, {
             title: nt.title,
             body: nt.body,
