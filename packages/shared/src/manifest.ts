@@ -256,19 +256,67 @@ export const SetupSpec = z.object({
 export type SetupSpec = z.infer<typeof SetupSpec>;
 
 /**
- * A repo-defined workflow (RUN-119): a NAMED variant of a built-in run kind. It inherits the
+ * Per-stage configuration inside a workflow (PLNR-238 / the runner's Workflows v3 plan).
+ *
+ * `agent` is the coordinate (RUN-113: `claude.fable-5.high`) this stage's actor runs under —
+ * INCLUDING the adversary stages (plan-check, review, verify-agent), which is the point: a repo
+ * can plan with one model, build with a cheaper one, and be judged by a third. A coordinate
+ * chooses a MODEL and never a posture: the write floor (RUN-118) and the stage clamp (RUN-132)
+ * are runner-side and unreachable from here. Free string, not an enum — model ids are the
+ * vendor's and change weekly; the runner's coordinate parser validates it.
+ */
+export const WorkflowStageDef = z.object({
+  agent: z.string().min(1).nullable().default(null),
+});
+export type WorkflowStageDef = z.infer<typeof WorkflowStageDef>;
+
+/**
+ * A workflow's declared pipeline (PLNR-238). Two spellings of one fact, because TOML cannot put
+ * an array and a `[stages.<name>]` table on the same key:
+ *
+ *   stages = ["plan", "plan-check", "execute"]        — names only, nothing per-stage
+ *   [stages.plan-check] agent = "claude.fable-5.high" — the same declaration, keyed, with config
+ *
+ * A SET, not a sequence: order always comes from the machine's RUN_STAGES ("reviews before it
+ * integrates" is a security ordering, not a preference — RUN-132), so the table form's
+ * unordered keys lose nothing. The runner clamps exactly as today: (mandatory ∪ declared) ∩
+ * appliesTo — a declaration can decline an optional stage, never enable one its posture may not
+ * run, never shed a mandatory one.
+ */
+export const WorkflowStages = z.union([
+  z.array(z.string().min(1)),
+  z.record(z.string().min(1), WorkflowStageDef),
+]);
+export type WorkflowStages = z.infer<typeof WorkflowStages>;
+
+/**
+ * A repo-defined workflow (RUN-119, contract v2 in PLNR-238): a NAMED variant of a built-in run
+ * kind. Its NAME is not a field — it is the file the workflow lives in (`.noriq/workflows/<name>.toml`,
+ * Workflows v3) or its key under `[workflows.<name>]` in the project manifest. It inherits the
  * built-in `base`'s security POSTURE verbatim — a `docs` workflow based on `scope` is read-only
  * because scope is, and no field here can change that (the write floor is enforced in the runner,
- * RUN-118). What a custom workflow may vary is the PROMPT the agent gets, so a repo can shape "how"
- * a read-only exploration or a build is briefed without minting a new posture. The three built-ins
- * (scope/build/verify) are always present and need no declaration.
+ * RUN-118). What a workflow may vary: the PROMPT its agents get, which OPTIONAL stages run, and
+ * which agent coordinate does each stage's work. The three built-ins (scope/build/verify) are
+ * always present and need no declaration.
+ *
+ * v1 compatibility is a hard rule: `{base, prompt: "text"}` parses byte-identically (prompt's
+ * string arm), every v2 field is optional, and unknown keys pass through un-strictly — the
+ * vendored-contract ordering (VENDORED-CONTRACT.md) means this schema must never reject a
+ * manifest an older daemon wrote.
  */
 export const WorkflowDef = z.object({
   // Which built-in posture this workflow IS — the floor-safe foundation it cannot escape.
   base: RunKind,
-  // A prompt template name or inline text overriding the base's default brief (RUN-121). Null =
-  // use the base's own prompt, exactly as the built-in kind would.
-  prompt: z.string().nullable().default(null),
+  // The brief: inline template text / template name (the v1 string form, RUN-121), or
+  // `{ file = "plan.md" }` — a file the DAEMON resolves relative to the workflow's own
+  // directory and confines there (the same no-escaping-the-root rule as ProjectContext).
+  // Null = the base's own prompt, exactly as the built-in kind would.
+  prompt: z.union([z.string(), z.object({ file: z.string().min(1) })]).nullable().default(null),
+  // The declared pipeline (see WorkflowStages). Null = the base's own stage list, unchanged.
+  stages: WorkflowStages.nullable().default(null),
+  // One line for humans choosing a workflow at dispatch (PLNR-240 advertises {name, base,
+  // description} per repo). Cosmetic — nothing executes it.
+  description: z.string().nullable().default(null),
 });
 export type WorkflowDef = z.infer<typeof WorkflowDef>;
 
