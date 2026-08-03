@@ -93,7 +93,7 @@ export type ResourceSpec = { name: string; uriTemplate: string; description: str
  * block so working agents get pushed-feeling updates without polling.
  */
 
-const INSTRUCTIONS = `Noriq coordinates multiple AI agents working the same project.
+export const INSTRUCTIONS = `Noriq coordinates multiple AI agents working the same project.
 The contract: (1) call get_briefing first; (2) claim_task before working on anything;
 (3) just keep working — every Noriq tool call renews your claim automatically, and the
 TTL is generous (30 min), so you never need to ping to stay alive. heartbeat exists only
@@ -226,9 +226,13 @@ const TOOL_HINTS: Record<string, ToolHints> = {
   // everything else → WRITE (additive, non-idempotent, non-destructive, closed-world)
 };
 
+/** Self-reported server identity — sent in legacy `initialize` results and mirrored into
+ *  every modern (2026-07-28) result's `_meta` serverInfo by the compat layer. */
+export const SERVER_INFO = { name: 'noriq', version: '0.3.0' };
+
 export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthTokenId?: string; sessionId?: string; origin?: string } = {}): McpServer {
   const server = new McpServer(
-    { name: 'noriq', version: '0.3.0' },
+    SERVER_INFO,
     {
       instructions: INSTRUCTIONS,
       // logging → standard notifications/message (any client); experimental claude/channel

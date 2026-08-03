@@ -5,6 +5,7 @@ import { StreamableHTTPTransport } from '@hono/mcp';
 import type { Env } from './env';
 import { adminAuth, agentAuth, readSessionId, resolveSessionAgent, SESSION_CLEAR_COOKIE, sessionSetCookie, userAuth, type AppContext } from './auth';
 import { buildMcpServer } from './mcp';
+import { handleModernMcp, isModernMcpRequest } from './mcp-2026';
 import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot, importSnapshot } from './backup';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, timingSafeEqual, verifyPassword, verifyPasswordConstantTime } from './lib/util';
@@ -147,6 +148,12 @@ app.all('/mcp', agentAuth, async (c) => {
   //    echoes it back (Mcp-Session-Id).
   const raw = await c.req.json().catch(() => null);
   const msgs = raw == null ? [] : Array.isArray(raw) ? raw : [raw];
+  // Dual-era fork (PLNR-233): a request carrying modern per-request `_meta` (2026-07-28,
+  // stateless — no initialize, no Mcp-Session-Id) is served by the compat layer; an
+  // `initialize` opening (or a bare session-id request) selects the legacy path below.
+  if (c.req.method === 'POST' && isModernMcpRequest(c.req.header('mcp-protocol-version'), msgs)) {
+    return handleModernMcp(c, c.env, conn, msgs);
+  }
   const isInit = msgs.some((m) => m?.method === 'initialize');
   // OpenAI app bridges may create a fresh MCP transport session for each tool
   // invocation. Their stable conversation identity is carried on tools/call as
