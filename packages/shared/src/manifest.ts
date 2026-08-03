@@ -231,6 +231,31 @@ export const LandPolicy = z.object({
 export type LandPolicy = z.infer<typeof LandPolicy>;
 
 /**
+ * Mechanical workspace bootstrap (PLNR-242): commands the DAEMON runs, in order, to make a
+ * fresh worktree ready before any agent starts — `npm install`, codegen, submodule init.
+ *
+ * Exists because of a live dogfood cost: a fresh worktree has no node_modules, so every agent
+ * spent its first (most valuable) turns bootstrapping an environment — and sometimes failed
+ * under a restricted-network profile — doing work the machine could have done for free before
+ * the run began. Mechanical setup is not agent work.
+ *
+ * Schema half only: execution semantics (working dir, env, failure handling, caching, whether
+ * a failed setup blocks the run) are the RUNNER's own contract, defined where they are
+ * enforced. This section just carries the words. Not part of the security floor in the way
+ * `permissions` is — but note these commands run OUTSIDE any agent sandbox, daemon-privileged,
+ * from a COMMITTED file: cloning a repo and running its runner executes its [setup]. That is
+ * the same trust boundary `verify.cmd` already crosses, no wider.
+ */
+export const SetupSpec = z.object({
+  // Run in order; each must exit 0. Empty = nothing to do (same as omitting the section).
+  cmds: z.array(z.string().min(1)).default([]),
+  // Per-COMMAND ceiling, seconds. The default absorbs a cold `npm install` on a slow link;
+  // repos with heavier bootstraps (toolchain downloads, large codegen) raise it explicitly.
+  timeoutSeconds: z.number().int().positive().default(600),
+});
+export type SetupSpec = z.infer<typeof SetupSpec>;
+
+/**
  * A repo-defined workflow (RUN-119): a NAMED variant of a built-in run kind. It inherits the
  * built-in `base`'s security POSTURE verbatim — a `docs` workflow based on `scope` is read-only
  * because scope is, and no field here can change that (the write floor is enforced in the runner,
@@ -310,6 +335,9 @@ export const ProjectManifest = z.object({
   // silently rebound. Null = the project's default board, exactly as before.
   board: z.string().min(1).max(80).nullable().default(null),
   verify: VerifySpec.nullable().default(null),
+  // Workspace bootstrap the daemon runs before any agent (PLNR-242). Null = nothing to run,
+  // byte-identical to every manifest written before this existed.
+  setup: SetupSpec.nullable().default(null),
   // What the repo tells every agent about itself before it starts (RUN-128). Empty = today's
   // behaviour, a brief carrying only the task. Not part of the security floor: getting this
   // wrong costs an agent orientation, never safety.
