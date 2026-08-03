@@ -46,6 +46,7 @@ function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
     case 'board.deleted': verb = 'board'; subject = 'deleted'; break;
     case 'dependency.added': verb = 'dep'; subject = `${p.key} depends on ${p.dependsOn}`; taskId = e.subjectId; break;
     case 'dependency.removed': verb = 'dep'; subject = `${p.key} no longer depends on ${p.dependsOn}`; taskId = e.subjectId; break;
+    case 'dependency.unblocked': verb = 'dep'; subject = `${p.key} unblocked — ${p.blockerKey} settled`; taskId = e.subjectId; break;
     case 'task.moved': verb = 'moved'; subject = `${p.key} → ${p.toKey} (another project)`; break;
     case 'task.handed_off': verb = 'handoff'; subject = `${p.key} → ${p.toName ?? p.toAgentId}`; taskId = e.subjectId; break;
     case 'task.moved_in': verb = 'moved in'; subject = `${p.key} · ${p.title ?? ''}`; taskId = e.subjectId; break;
@@ -484,17 +485,23 @@ export function useAppStore() {
     const tasksOf = (pid: string) =>
       showArchived ? allTasksOf(pid) : allTasksOf(pid).filter((t) => t.archivedAt === null);
     const agentById = (pid: string, id: string) => (data.agents[pid] ?? []).find((a) => a.id === id) ?? null;
+    // Cross-project blockers (PLNR-241): not in this project's task list, but the snapshot
+    // ships their status so blocked state stays computable across the boundary.
+    const externalDeps = new Map((snapshot?.externalTasks ?? []).map((e) => [e.id, e]));
     // Resolve deps against the full list: a dependency satisfied by a task that has since
-    // been archived is still satisfied, not unresolvable.
+    // been archived is still satisfied, not unresolvable. A dep found in NEITHER list is a
+    // deleted blocker — its edge died with it server-side, so treat it as satisfied.
     const isBlocked = (pid: string, t: TaskVM) =>
       [...t.deps, ...t.phaseDeps].some((d) => {
         const dt = allTasksOf(pid).find((x) => x.id === d);
-        return dt !== undefined && dt.status !== 'done' && dt.status !== 'cancelled';
+        if (dt !== undefined) return dt.status !== 'done' && dt.status !== 'cancelled';
+        const ext = externalDeps.get(d);
+        return ext !== undefined && ext.status !== 'done' && ext.status !== 'cancelled';
       });
     const effStatus = (pid: string, t: TaskVM): TaskStatus =>
       t.status === 'todo' && isBlocked(pid, t) ? 'blocked' : t.status;
     return { tasksOf, allTasksOf, agentById, isBlocked, effStatus };
-  }, [data, showArchived]);
+  }, [data, snapshot, showArchived]);
 
   const refresh = useCallback(() => {
     if (pidRef.current) void loadSnapshot(pidRef.current);

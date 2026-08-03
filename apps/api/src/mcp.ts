@@ -110,7 +110,9 @@ reuse existing tags before minting new ones — near-duplicates are rejected, an
 projects accept no agent-minted tags at all. Never tag with status/type/priority
 words — those have dedicated fields. Plans need no dependency wiring: phase order itself
 gates tasks (a task is claimable when every earlier phase is finished); use dependsOn
-only for real, hand-picked orderings.
+only for real, hand-picked orderings. A dependency may cross projects: ids and display
+keys are globally unique, so dependsOn/add_dependency accept a blocker from any project
+you can access, and the claim gate works identically across the boundary.
 Priority runs 0 = MOST urgent to 4 = someday, as P0/P1 read everywhere else: P0 means drop
 everything, 2 is the default "normal". The number goes DOWN as urgency goes UP, so filing
 real work as P4 buries it.
@@ -167,6 +169,26 @@ async function resolveTaskId(env: Env, projectId: string, taskId: string): Promi
     .bind(taskId, taskId, projectId).first<{ id: string }>();
   if (!row) throw new Error(`task ${taskId} not found in project ${projectId}`);
   return String(row.id);
+}
+
+/** Resolve a dependency BLOCKER ref — id or display key, both globally unique — for
+ *  cross-project dependencies (PLNR-241). A ref in the dependent's own project always
+ *  resolves; a ref in another project resolves only when this agent's USER can reach that
+ *  project AND this TOKEN was authorized for it (the same two limits the per-call wrapper
+ *  enforces on `projectId`, which a second project in the arguments would otherwise skip
+ *  straight past). Unknown and inaccessible collapse into ONE error on purpose: a rejected
+ *  ref must not confirm that a task exists somewhere the caller cannot see. */
+async function resolveBlockerRef(
+  env: Env, agent: AgentIdentity, oauthTokenId: string | undefined, projectId: string, ref: string,
+): Promise<string> {
+  const t = await env.DB.prepare('SELECT id, project_id AS pid FROM tasks WHERE id = ? OR key = ?')
+    .bind(ref, ref).first<{ id: string; pid: string }>();
+  if (t && (t.pid === projectId
+      || ((await userCanAccessProject(env, agent.userId, t.pid))
+        && (!oauthTokenId || (await tokenCanReachProject(env, oauthTokenId, t.pid)))))) {
+    return String(t.id);
+  }
+  throw new Error(`dependsOn ${ref} not found or not accessible to you`);
 }
 
 const asActor = (a: AgentIdentity): Actor => ({ kind: 'agent', id: a.id, name: a.name });
@@ -367,7 +389,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           'Humans steer via comments on tasks (kind: question/instruction). Acknowledge fast, resolve with resolve_comment (addressed|wont_do) + a reply. Unresolved comments should block you from finishing.',
           'Anything bigger than one task: plan first. create_plan writes the plan as a document — goals/approach in the body, then ordered phases over tasks. Phase order itself gates the work (tasks in phase N are claimable once every earlier phase is finished — no dependency wiring needed); or decompose_task for a quick subtree. Workers drain the plan via next_claimable; keep it current with update_plan.',
           'Hand the NEXT agent what you learned: a task\'s executionSpec carries requirementIds, anticipated files, required reading, decisions already settled (do not relitigate), where it may use its own judgement, what is explicitly out of scope, and acceptance criteria written as truths rather than steps. Fill it in whenever you know more than the title and body say — on create_task/create_tasks, on a plan\'s newTasks, or later with update_task (which REPLACES the whole spec; read it first and send it back complete). Read it before you start (get_task.executionSpec): if it is there, its lockedDecisions bind you and its acceptance is your definition of done. If executionSpecUnreadable is set, the stored spec is corrupt — say so, do not treat it as absent. A build or verify run cannot REWRITE its own task\'s spec: it is what your work is judged against, so if it is wrong say so in a comment and let a human or a scope run correct it.',
-          'Tasks you create MUST carry descriptive tags — topic/area/component words (e.g. "oauth", "board-filters"), FIRST tag = primary tag. Tags are the project\'s SHARED filter vocabulary: reuse existing tags (get_project.tags) before minting — near-duplicates are rejected, and some projects are curated (agents cannot mint at all). Never status/type/priority words as tags. Use dependsOn only for real, hand-picked orderings.',
+          'Tasks you create MUST carry descriptive tags — topic/area/component words (e.g. "oauth", "board-filters"), FIRST tag = primary tag. Tags are the project\'s SHARED filter vocabulary: reuse existing tags (get_project.tags) before minting — near-duplicates are rejected, and some projects are curated (agents cannot mint at all). Never status/type/priority words as tags. Use dependsOn only for real, hand-picked orderings — the blocker may live in another project you can access (ids and display keys are globally unique; the gate crosses the boundary unchanged).',
           'Project docs are settled decisions and facts ONLY (enforced — open questions/TBDs are rejected). Read a task\'s related docs (get_task.docs) before starting; link the docs new tasks must follow via docIds; when you settle something durable, create_doc the outcome. Undecided → request_input first, then document the answer.',
           'Search before you file or dig: semantic_search finds tasks, docs and plans by MEANING (the thing you are about to create may already exist); search_tasks filters by attributes. get_project is the scaffold (ids, tags, boards, docs index, active plans, P0 tasks) — not a task list; never expect the whole backlog from it.',
           'Priority runs 0 = MOST urgent to 4 = someday (P0 means drop everything; 2 is the default "normal"). The number goes DOWN as urgency goes UP — filing real work as P4 buries it, and the top of a queue is its LOWEST priority number.',
@@ -800,7 +822,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       priority: z.number().int().min(0).max(4).optional().describe('0 = most urgent (drop everything), 2 = normal (default), 4 = someday — P0 is the TOP of the scale, not the bottom'),
       estimate: z.number().int().min(0).optional().describe('Effort estimate in points (team-defined scale)'),
       dueAt: z.string().datetime().optional().describe('Deadline (ISO datetime) — overdue tasks are surfaced to humans'),
-      dependsOn: z.array(z.string()).optional().describe('Existing task ids or display keys in THIS project this task must wait on; cross-project or unknown refs are rejected'),
+      dependsOn: z.array(z.string()).optional().describe('Existing task ids or display keys this task must wait on — in this project, or in any project you can access (cross-project gating works identically); unknown or inaccessible refs are rejected'),
       // Optional in the schema so a missing value reaches the handler's instructive error
       // (protocol-level zod failures are generic); the contract is REQUIRED (PLNR-171).
       tags: z.array(z.string()).optional().describe('REQUIRED. Descriptive topic/area tags, primary first (e.g. ["oauth", "token-refresh"]). REUSE the project vocabulary (get_project.tags) — a tag is a shared filter, not a per-task keyword, and near-duplicates of existing tags are rejected. Never status/type/priority/milestone words.'),
@@ -813,7 +835,13 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     },
     tool(async ({ projectId, ...input }) => {
       requireDescriptiveTags(input.tags);
-      return room(env, projectId).createTask(projectId, actor, input);
+      // Blocker refs resolve HERE, not just in the DO: a foreign ref must pass the same
+      // user+token limits the wrapper applies to projectId (PLNR-241) — the DO has no
+      // caller identity to apply them with.
+      const dependsOn = input.dependsOn
+        ? await Promise.all(input.dependsOn.map((ref: string) => resolveBlockerRef(env, agent, opts.oauthTokenId, projectId, ref)))
+        : undefined;
+      return room(env, projectId).createTask(projectId, actor, { ...input, dependsOn });
     }),
   );
 
@@ -854,8 +882,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
           tags: z.array(z.string()).optional(),
           phaseId: z.string().optional().describe('Attach this item to a plan phase (a phase id from get_plans) in THIS project; foreign/unknown phase ids are rejected'),
-          parentTaskId: z.string().optional().describe('Existing task id/key, or an earlier item\'s ref'),
-          dependsOn: z.array(z.string()).optional().describe('Existing task ids/keys, or earlier items\' refs'),
+          parentTaskId: z.string().optional().describe('Existing task id/key in this project, or an earlier item\'s ref'),
+          dependsOn: z.array(z.string()).optional().describe('Existing task ids/keys (this project or any project you can access), or earlier items\' refs'),
           // Per item, and deliberately absent from `defaults`: a spec names the files, decisions
           // and acceptance criteria of ONE piece of work, so anything shared across a batch would
           // be wrong for every item that inherited it (RUN-135).
@@ -866,7 +894,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     tool(async ({ projectId, defaults, allowNewTags, tasks }) => {
       const r = room(env, projectId);
       const byRef = new Map<string, string>(); // ref → created task id
-      // Resolve a dependsOn/parent entry: batch ref first, then id-or-key in this project.
+      // Resolve a parent entry: batch ref first, then id-or-key in this project — a parent
+      // is a decomposition tree node and never crosses projects.
       const resolve = async (entry: string): Promise<string> => {
         const fromBatch = byRef.get(entry);
         if (fromBatch) return fromBatch;
@@ -875,6 +904,13 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         if (!t) throw new Error(`"${entry}" is neither an earlier ref in this batch nor a task in this project`);
         return t.id;
       };
+      // A dependsOn entry may additionally point at a task in ANOTHER project the caller can
+      // reach (PLNR-241) — batch refs still win, so a ref shadowing a foreign key stays local.
+      const resolveDep = async (entry: string): Promise<string> => {
+        const fromBatch = byRef.get(entry);
+        if (fromBatch) return fromBatch;
+        return resolveBlockerRef(env, agent, opts.oauthTokenId, projectId, entry);
+      };
       const created: Array<{ ref?: string; title: string; id?: string; key?: string; error?: string }> = [];
       for (const item of tasks) {
         try {
@@ -882,7 +918,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           // Checked per item so one untagged entry fails alone, matching batch semantics.
           const effectiveTags = item.tags ?? defaults?.tags;
           requireDescriptiveTags(effectiveTags);
-          const dependsOn = await Promise.all((item.dependsOn ?? []).map(resolve));
+          const dependsOn = await Promise.all((item.dependsOn ?? []).map(resolveDep));
           const parentTaskId = item.parentTaskId ? await resolve(item.parentTaskId) : undefined;
           const res = await r.createTask(projectId, actor, {
             title: item.title,
@@ -1153,7 +1189,11 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       const COMMENT_CAP = 60;
       const [deps, comments, commentTotal, refs, attachments, signals, docs] = await Promise.all([
         env.DB.prepare(
-          `SELECT dt.id, dt.key, dt.status FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id WHERE d.task_id = ?`,
+          // projectId/projectKey say WHERE each blocker lives (PLNR-241) — same project for
+          // most edges, but a cross-project blocker must be legible as one.
+          `SELECT dt.id, dt.key, dt.status, dt.project_id AS projectId, dp.key AS projectKey
+           FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id
+           JOIN projects dp ON dp.id = dt.project_id WHERE d.task_id = ?`,
         ).bind(id).all(),
         env.DB.prepare(
           `SELECT id, author_kind AS authorKind, author_id AS authorId, kind, body, status, parent_comment_id AS parentCommentId, created_at AS createdAt
@@ -1215,7 +1255,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'move_task',
-    'Re-home a task into another project — same task row, new key, so comments/attachments/refs/history ride along. The move severs what cannot cross a project boundary: dependency edges (count reported back), plan phase membership, milestone, parent; the board becomes the target\'s default; tag NAMES carry over and re-resolve there. Refused while the task is claimed or has subtasks. Makes the "which project should this live in" decision reversible instead of delete-and-retype.',
+    'Re-home a task into another project — same task row, new key, so comments/attachments/refs/history AND dependency edges ride along (edges hang off the task id; a local edge simply becomes a cross-project one, and the gating is unchanged). The move severs what cannot cross a project boundary: plan phase membership, milestone, parent, doc links; the board becomes the target\'s default; tag NAMES carry over and re-resolve there. Refused while the task is claimed or has subtasks. Makes the "which project should this live in" decision reversible instead of delete-and-retype.',
     { projectId: z.string(), taskId: z.string().describe('Task id or display key'), toProjectId: z.string() },
     tool(async ({ projectId, taskId, toProjectId }) => {
       // The per-call guard covers projectId; the TARGET needs the same two checks or a
@@ -1347,16 +1387,30 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'add_dependency',
-    'Make one task depend on another (blocks claiming until the dependency is done). Cycles are rejected. Undo with remove_dependency.',
-    { projectId: z.string(), taskId: z.string(), dependsOnTaskId: z.string() },
-    tool(async ({ projectId, taskId, dependsOnTaskId }) => room(env, projectId).addDependency(projectId, actor, taskId, dependsOnTaskId)),
+    'Make one task depend on another (blocks claiming until the dependency is done). The blocker may live in ANOTHER project you can access — ids and display keys are both globally unique, so pass either — and the gate works identically across the boundary (the dependent stays unclaimable until the foreign blocker is done/cancelled). Cycles are rejected, including cycles spanning projects. Undo with remove_dependency.',
+    {
+      projectId: z.string().describe("The DEPENDENT task's project"),
+      taskId: z.string().describe('Task id or display key in this project — the task that must wait'),
+      dependsOnTaskId: z.string().describe('Blocker task id or display key — in this project or any project you can access'),
+    },
+    tool(async ({ projectId, taskId, dependsOnTaskId }) =>
+      room(env, projectId).addDependency(
+        projectId, actor,
+        await resolveTaskId(env, projectId, taskId),
+        await resolveBlockerRef(env, agent, opts.oauthTokenId, projectId, dependsOnTaskId),
+      )),
   );
 
   defineTool(
     'remove_dependency',
-    'Remove a manual dependency edge (the inverse of add_dependency), unblocking the dependent task if that was its last unfinished blocker. Remove an edge ONLY because the ordering itself is wrong — a dependency that should never have existed. NEVER remove one to get past a blocker you find inconvenient: that is not clearing the gate, it is deleting it, and it defeats the coordination this whole system exists to enforce. If the blocker is genuinely finished, mark the BLOCKER done (or cancelled) and the gate clears itself — do not touch the edge. If the blocker is NOT finished, the gate is doing its job; work something else or clear the blocker honestly. (A plan\'s phase order is not a dependency edge and can\'t be removed here — restructure the plan if the ordering is wrong.)',
-    { projectId: z.string(), taskId: z.string(), dependsOnTaskId: z.string() },
-    tool(async ({ projectId, taskId, dependsOnTaskId }) => room(env, projectId).removeDependency(projectId, actor, taskId, dependsOnTaskId)),
+    'Remove a manual dependency edge (the inverse of add_dependency), unblocking the dependent task if that was its last unfinished blocker. Works on cross-project edges too (you need access only to the DEPENDENT\'s project — the edge is its row). Remove an edge ONLY because the ordering itself is wrong — a dependency that should never have existed. NEVER remove one to get past a blocker you find inconvenient: that is not clearing the gate, it is deleting it, and it defeats the coordination this whole system exists to enforce. If the blocker is genuinely finished, mark the BLOCKER done (or cancelled) and the gate clears itself — do not touch the edge. If the blocker is NOT finished, the gate is doing its job; work something else or clear the blocker honestly. (A plan\'s phase order is not a dependency edge and can\'t be removed here — restructure the plan if the ordering is wrong.)',
+    {
+      projectId: z.string().describe("The DEPENDENT task's project"),
+      taskId: z.string().describe('Task id or display key in this project'),
+      dependsOnTaskId: z.string().describe('The blocker end of the edge to drop — task id or display key'),
+    },
+    tool(async ({ projectId, taskId, dependsOnTaskId }) =>
+      room(env, projectId).removeDependency(projectId, actor, await resolveTaskId(env, projectId, taskId), dependsOnTaskId)),
   );
 
   defineTool(

@@ -234,7 +234,10 @@ is a finding, not an obstacle.
 it as "no spec" and plan over it.
 
 For a quick subtree without the ceremony, \`decompose_task\`; for ad-hoc ordering,
-\`add_dependency\` (undo a wrong edge with \`remove_dependency\`); to coordinate
+\`add_dependency\` (undo a wrong edge with \`remove_dependency\`). A dependency may
+cross projects: task ids and display keys are globally unique, so \`dependsOn\` and
+\`add_dependency\` accept a blocker from any project you can access, and the claim
+gate holds across the boundary exactly as within it. To coordinate
 mid-flight, \`send_message\`. See who else is on the project (and what they hold)
 with \`list_agents\`, and hand a task to a specific agent with \`handoff_task\` —
 directed delegation instead of releasing into the pool. Check progress with

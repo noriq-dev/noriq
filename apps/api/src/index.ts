@@ -105,6 +105,17 @@ const demoDenied = (c: Context<AppContext>): Response | null =>
 const reachesProject = (c: Context<AppContext>, pid: string): Promise<boolean> =>
   c.var.user!.role === 'admin' ? Promise.resolve(true) : userCanAccessProject(c.env, c.var.user!.id, pid);
 
+/** Resolve a dependency BLOCKER ref on the human path (PLNR-241): id or display key (both
+ *  globally unique), in this project or any project this session can reach — the REST twin
+ *  of the MCP layer's resolveBlockerRef. Unknown and unreachable collapse into ONE error so
+ *  a rejected ref never confirms that a task exists somewhere the caller cannot see. */
+async function resolveBlockerRefRest(c: Context<AppContext>, pid: string, ref: string): Promise<string> {
+  const t = await c.env.DB.prepare('SELECT id, project_id AS tpid FROM tasks WHERE id = ? OR key = ?')
+    .bind(ref, ref).first<{ id: string; tpid: string }>();
+  if (t && (t.tpid === pid || (await reachesProject(c, t.tpid)))) return String(t.id);
+  throw new Error(`dependsOn ${ref} not found or not accessible`);
+}
+
 async function requireProjectAccess(c: Context<AppContext>, next: Next) {
   // Path shape: /api/projects/<pid>/<sub>... — derive pid directly (robust
   // regardless of how Hono resolves params for wildcard middleware). Only the
@@ -567,7 +578,7 @@ app.get('/api/public/projects/:pid/snapshot', async (c) => {
     'SELECT id, key, name, description, public FROM projects WHERE id = ? AND status = ?',
   ).bind(pid, 'active').first<{ id: string; key: string; name: string; description: string; public: number }>();
   if (!proj || !proj.public) return c.json({ error: 'not found' }, 404);
-  const [tasks, deps, agents, events, milestones, boards, plans, phases, phaseTasks, tags, taskTags] = await Promise.all([
+  const [tasks, deps, extDeps, agents, events, milestones, boards, plans, phases, phaseTasks, tags, taskTags] = await Promise.all([
     c.env.DB.prepare(
       `SELECT id, key, title, body,
               ${taskWireStatus()} AS status,
@@ -577,6 +588,15 @@ app.get('/api/public/projects/:pid/snapshot', async (c) => {
     ).bind(pid).all(),
     c.env.DB.prepare(
       'SELECT d.task_id AS taskId, d.depends_on_task_id AS dependsOnTaskId FROM dependencies d JOIN tasks t ON t.id = d.task_id WHERE t.project_id = ?',
+    ).bind(pid).all(),
+    // Cross-project blockers, ANONYMIZED (PLNR-241): id + status only. The status must ship
+    // or a genuinely gated task renders claimable, but a public project must not leak even
+    // the display key of a task in a project that never opted into being public.
+    c.env.DB.prepare(
+      `SELECT DISTINCT dt.id, ${taskWireStatus('dt')} AS status
+       FROM dependencies d JOIN tasks t ON t.id = d.task_id
+         JOIN tasks dt ON dt.id = d.depends_on_task_id
+       WHERE t.project_id = ?1 AND dt.project_id != ?1`,
     ).bind(pid).all(),
     c.env.DB.prepare(
       "SELECT a.id, COALESCE(a.label, a.name) AS name, a.role, a.status FROM agents a WHERE a.project_id = ? AND a.status != 'revoked'",
@@ -595,7 +615,7 @@ app.get('/api/public/projects/:pid/snapshot', async (c) => {
   c.header('Cache-Control', 'public, max-age=30');
   return c.json({
     project: { id: proj.id, key: proj.key, name: proj.name, description: proj.description },
-    tasks: tasks.results, dependencies: deps.results, agents: agents.results,
+    tasks: tasks.results, dependencies: deps.results, externalTasks: extDeps.results, agents: agents.results,
     events: events.results.map((e) => ({ ...e, payload: JSON.parse(String(e.payload)) })),
     milestones: milestones.results, boards: boards.results, plans: plans.results,
     phases: phases.results, phaseTasks: phaseTasks.results, tags: tags.results, taskTags: taskTags.results,
@@ -613,7 +633,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
   await room(c.env, pid).sweepArchive(pid).catch(() => {});
   // PLNR-225: same opportunistic sweep for completed plans (all member tasks settled >24h ago).
   await room(c.env, pid).sweepPlanArchive(pid).catch(() => {});
-  const [project, tasks, deps, agents, events, milestones, boards, plans, phases, phaseTasks, tags, taskTags, signals, taskDocs, planDocs, locks] = await Promise.all([
+  const [project, tasks, deps, extDeps, agents, events, milestones, boards, plans, phases, phaseTasks, tags, taskTags, signals, taskDocs, planDocs, locks] = await Promise.all([
     c.env.DB.prepare('SELECT id, key, name, description, claim_ttl_seconds AS claimTtlSeconds, lock_ttl_seconds AS lockTtlSeconds, file_locking_enabled AS fileLockingEnabled, repo_url AS repoUrl FROM projects WHERE id = ?')
       .bind(pid).first(),
     // PLNR-150: archived tasks ship too, flagged by archivedAt. Archiving is a *board
@@ -642,6 +662,18 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     c.env.DB.prepare(
       `SELECT d.task_id AS taskId, d.depends_on_task_id AS dependsOnTaskId
        FROM dependencies d JOIN tasks t ON t.id = d.task_id WHERE t.project_id = ?`,
+    ).bind(pid).all(),
+    // Foreign blockers behind cross-project edges (PLNR-241): just enough of each to
+    // compute blocked state and label the chip. Redacted below for projects this
+    // session cannot reach — the STATUS still ships (the gate is real either way; hiding
+    // it would render a genuinely blocked task as claimable), the identity does not.
+    c.env.DB.prepare(
+      `SELECT DISTINCT dt.id, dt.key, dt.title, ${taskWireStatus('dt')} AS status,
+              dt.project_id AS projectId, dp.key AS projectKey
+       FROM dependencies d JOIN tasks t ON t.id = d.task_id
+         JOIN tasks dt ON dt.id = d.depends_on_task_id
+         JOIN projects dp ON dp.id = dt.project_id
+       WHERE t.project_id = ?1 AND dt.project_id != ?1`,
     ).bind(pid).all(),
     c.env.DB.prepare(
       // Project-local agents only (PLNR agent re-model): an agent belongs to the
@@ -688,11 +720,20 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     ).bind(pid).all(),
   ]);
   if (!project) return c.json({ error: 'not found' }, 404);
+  // Redact foreign blockers in projects this session cannot reach (PLNR-241): status only.
+  const extPids = [...new Set(extDeps.results.map((r) => String(r.projectId)))];
+  const reachablePids = new Set(
+    (await Promise.all(extPids.map(async (p) => ((await reachesProject(c, p)) ? p : null)))).filter(Boolean),
+  );
+  const externalTasks = extDeps.results.map((r) =>
+    reachablePids.has(String(r.projectId)) ? r : { id: r.id, status: r.status },
+  );
   return c.json({
     version: pkg.version, // deploy marker — the SPA reloads itself on mismatch (PLNR-193)
     project,
     tasks: tasks.results,
     dependencies: deps.results,
+    externalTasks,
     agents: agents.results,
     milestones: milestones.results,
     boards: boards.results,
@@ -829,9 +870,19 @@ app.delete('/api/projects/:pid/boards/:bid', userAuth, async (c) => {
 });
 
 app.post('/api/projects/:pid/tasks', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
   const body = await c.req.json<{ title: string; body?: string; parentTaskId?: string; priority?: number; estimate?: number | null; dueAt?: string | null; dependsOn?: string[]; boardId?: string | null; executionSpec?: ExecutionSpecInput | null }>();
   if (!body.title) return c.json({ error: 'title required' }, 400);
-  const result = await room(c.env, c.req.param('pid')!).createTask(c.req.param('pid')!, humanActor(c), body);
+  // Blocker refs resolve at the edge (PLNR-241): a cross-project ref must pass this
+  // session's reach check, which the DO cannot apply for us.
+  if (body.dependsOn?.length) {
+    try {
+      body.dependsOn = await Promise.all(body.dependsOn.map((ref) => resolveBlockerRefRest(c, pid, ref)));
+    } catch (e) {
+      return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
+    }
+  }
+  const result = await room(c.env, pid).createTask(pid, humanActor(c), body);
   return c.json(result);
 });
 
@@ -863,11 +914,19 @@ app.post('/api/projects/:pid/comments/:cid/resolve', userAuth, async (c) => {
 });
 
 // Dependency management from the UI (PLNR-58). Cycles are rejected in addDependency.
+// The blocker may live in another project this session can reach (PLNR-241).
 app.post('/api/projects/:pid/tasks/:tid/dependencies', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
   const { dependsOnTaskId } = await c.req.json<{ dependsOnTaskId: string }>();
   if (!dependsOnTaskId) return c.json({ error: 'dependsOnTaskId required' }, 400);
-  const result = await room(c.env, c.req.param('pid')!).addDependency(c.req.param('pid')!, humanActor(c), c.req.param('tid')!, dependsOnTaskId);
-  return c.json(result);
+  try {
+    const blockerId = await resolveBlockerRefRest(c, pid, dependsOnTaskId);
+    const result = await room(c.env, pid).addDependency(pid, humanActor(c), c.req.param('tid')!, blockerId);
+    return c.json(result);
+  } catch (e) {
+    // Cycle / self-edge / resolution failures are caller errors, matching neighbor routes.
+    return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
+  }
 });
 
 app.delete('/api/projects/:pid/tasks/:tid/dependencies/:depId', userAuth, async (c) => {

@@ -1,6 +1,7 @@
 // Task detail drawer — view/edit, tags, comments, attachments, event timeline.
 import { useEffect, useRef, useState } from 'react';
 import type { AppStore } from '../store';
+import type { TaskStatus } from '../types';
 import { api, type ApiAgentEvent } from '../api';
 import { isSettledTaskStatus, type ExecutionSpec } from '@noriq-dev/shared';
 import { KIND_META, statusMeta, verbColors } from '../design';
@@ -100,11 +101,15 @@ export function Drawer({ store }: { store: AppStore }) {
   const ag = task.claimedBy ? helpers.agentById(currentPid, task.claimedBy) : null;
   const deps = task.deps.map((d) => {
     const dt = tasks.find((x) => x.id === d);
-    return dt
-      ? { id: dt.id, key: dt.key, title: dt.title, status: helpers.effStatus(currentPid, dt), found: true as const }
-      : { id: d, key: `#${d.slice(0, 8)}`, title: '', status: 'todo' as const, found: false as const };
+    if (dt) return { id: dt.id, key: dt.key, title: dt.title, status: helpers.effStatus(currentPid, dt), found: true as const, external: false, projectKey: null as string | null };
+    // Cross-project blocker (PLNR-241): labeled from the snapshot's externalTasks. A viewer
+    // without reach into the blocker's project gets status only — the chip stays anonymous.
+    const ext = (snapshot?.externalTasks ?? []).find((x) => x.id === d);
+    if (ext) return { id: d, key: ext.key ?? 'external task', title: ext.title ?? '', status: (ext.status || 'todo') as TaskStatus, found: false as const, external: true, projectKey: (ext.projectKey ?? null) as string | null };
+    return { id: d, key: `#${d.slice(0, 8)}`, title: '', status: 'todo' as const, found: false as const, external: false, projectKey: null as string | null };
   });
-  // Tasks eligible as a new dependency: same project, not self, not already a dep.
+  // Tasks eligible as a new dependency via the picker: same project, not self, not already a
+  // dep. A cross-project dependency is added by KEY instead (the input beside the picker).
   const eligibleDeps = tasks.filter((t) => t.id !== task.id && !task.deps.includes(t.id));
   const canRelease = !!task.claimedBy;
   const holder = ag ? ag.name : eff === 'blocked' ? '— (blocked)' : '— (unclaimed)';
@@ -426,12 +431,17 @@ export function Drawer({ store }: { store: AppStore }) {
                       <button
                         onClick={() => d.found && actions.openTask(d.id)}
                         disabled={!d.found}
-                        title={d.found ? `${d.title} — ${sm.label}${done ? '' : ' (blocking)'}` : 'task not in this view'}
+                        title={
+                          d.found ? `${d.title} — ${sm.label}${done ? '' : ' (blocking)'}`
+                          : d.external ? `${d.title || d.key} — ${sm.label}${done ? '' : ' (blocking)'} · in ${d.projectKey ?? 'another project'}`
+                          : 'task not in this view'
+                        }
                         className={d.found ? 'hover-bright' : undefined}
                         style={{ cursor: d.found ? 'pointer' : 'default', display: 'inline-flex', alignItems: 'center', gap: 5, background: 'transparent', color: 'inherit', border: 'none', padding: 0, font: 'inherit' }}
                       >
                         <span style={{ width: 6, height: 6, borderRadius: '50%', background: sm.dot, flex: 'none' }} />
                         {d.key}
+                        {d.external && <span style={{ color: 'var(--text-faint)', fontSize: 9 }}>↗</span>}
                         <span style={{ color: 'var(--text-faint)' }}>{done ? '✓' : '⟂'}</span>
                       </button>
                       <button
@@ -446,35 +456,61 @@ export function Drawer({ store }: { store: AppStore }) {
                   );
                 })}
                 {addingDep ? (
-                  <select
-                    autoFocus
-                    defaultValue=""
-                    onChange={async (e) => {
-                      const depId = e.target.value;
-                      if (!depId) return;
-                      setDepError('');
-                      try {
-                        await actions.addDependency(task.id, depId);
-                        setAddingDep(false);
-                      } catch (err) {
-                        setDepError(err instanceof Error ? err.message : 'could not add dependency');
-                      }
-                    }}
-                    onBlur={() => setAddingDep(false)}
-                    style={{ fontFamily: 'var(--mono)', fontSize: 10.5, maxWidth: 180, padding: '2px 4px', borderRadius: 6 }}
-                  >
-                    <option value="" disabled>depends on…</option>
-                    {eligibleDeps.map((t) => (
-                      <option key={t.id} value={t.id}>{t.key} — {t.title.slice(0, 40)}</option>
-                    ))}
-                  </select>
+                  <>
+                    <select
+                      autoFocus
+                      defaultValue=""
+                      onChange={async (e) => {
+                        const depId = e.target.value;
+                        if (!depId) return;
+                        setDepError('');
+                        try {
+                          await actions.addDependency(task.id, depId);
+                          setAddingDep(false);
+                        } catch (err) {
+                          setDepError(err instanceof Error ? err.message : 'could not add dependency');
+                        }
+                      }}
+                      style={{ fontFamily: 'var(--mono)', fontSize: 10.5, maxWidth: 180, padding: '2px 4px', borderRadius: 6 }}
+                    >
+                      <option value="" disabled>depends on…</option>
+                      {eligibleDeps.map((t) => (
+                        <option key={t.id} value={t.id}>{t.key} — {t.title.slice(0, 40)}</option>
+                      ))}
+                    </select>
+                    {/* Cross-project dependencies (PLNR-241): any project's task, by display key. */}
+                    <input
+                      placeholder="or key (any project)"
+                      onKeyDown={async (e) => {
+                        if (e.key === 'Escape') { setAddingDep(false); return; }
+                        if (e.key !== 'Enter') return;
+                        const ref = (e.target as HTMLInputElement).value.trim();
+                        if (!ref) return;
+                        setDepError('');
+                        try {
+                          await actions.addDependency(task.id, ref);
+                          setAddingDep(false);
+                        } catch (err) {
+                          setDepError(err instanceof Error ? err.message : 'could not add dependency');
+                        }
+                      }}
+                      style={{ fontFamily: 'var(--mono)', fontSize: 10.5, width: 130, padding: '2px 6px', borderRadius: 6, background: 'var(--w-03)', border: '1px solid var(--w-15)', color: 'var(--text)' }}
+                    />
+                    <button
+                      onClick={() => { setAddingDep(false); setDepError(''); }}
+                      title="Cancel"
+                      className="hover-bright"
+                      style={{ cursor: 'pointer', background: 'transparent', border: 'none', color: 'var(--text-faint)', padding: '0 1px', fontSize: 11, lineHeight: 1 }}
+                    >
+                      ✕
+                    </button>
+                  </>
                 ) : (
                   <button
                     onClick={() => { setDepError(''); setAddingDep(true); }}
-                    disabled={eligibleDeps.length === 0}
-                    title={eligibleDeps.length ? 'Add a dependency' : 'no other tasks to depend on'}
+                    title="Add a dependency — pick a task here, or enter any project's task key"
                     className="rail-add"
-                    style={{ cursor: eligibleDeps.length ? 'pointer' : 'default', fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', border: '1px dashed var(--w-15)', padding: '2px 7px', borderRadius: 6, background: 'transparent' }}
+                    style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', border: '1px dashed var(--w-15)', padding: '2px 7px', borderRadius: 6, background: 'transparent' }}
                   >
                     {deps.length ? '+ dep' : '+ add dependency'}
                   </button>

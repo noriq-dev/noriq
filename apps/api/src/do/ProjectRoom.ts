@@ -628,17 +628,17 @@ export class ProjectRoom extends DurableObject<Env> {
         if (n.trim()) tagIds.push(await this._resolveTagLocked(pid, actor, n, input.allowNewTags));
       }
       // Dependencies resolve BEFORE the insert batch too (PLNR-109). `dependsOn` accepts
-      // an id or a display key, but must be scoped to THIS project: `OR IGNORE` does NOT
-      // suppress FK violations, so a bad ref (e.g. a display key, or a task from another
-      // project) would abort the whole createTask batch as an opaque FK error — or, worse,
-      // a valid id from another project would satisfy the FK and silently create a
-      // cross-project dependency. Resolve each ref like createPlan / the re-parent path.
+      // an id or a display key — both globally unique — and since PLNR-241 the blocker may
+      // live in ANY project (the MCP/REST edges have already checked the caller can reach a
+      // foreign blocker's project; this resolve is the existence check). It still cannot be
+      // skipped: `OR IGNORE` does NOT suppress FK violations, so an unresolved ref would
+      // abort the whole createTask batch as an opaque FK error.
       const depIds: string[] = [];
       for (const ref of input.dependsOn ?? []) {
-        const dep = await this.env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
-          .bind(ref, ref, pid)
+        const dep = await this.env.DB.prepare('SELECT id FROM tasks WHERE id = ? OR key = ?')
+          .bind(ref, ref)
           .first<{ id: string }>();
-        if (!dep) throw new Error(`dependsOn ${ref} not found in this project`);
+        if (!dep) throw new Error(`dependsOn ${ref} not found`);
         depIds.push(dep.id);
       }
       // Phase attachment (PLNR-228) resolves BEFORE the insert batch, like dependsOn/docIds.
@@ -921,6 +921,8 @@ export class ProjectRoom extends DurableObject<Env> {
           // Same event, plan-dispatch side (PLNR-170): a human approving (or dropping) a task
           // is exactly what an 'approved'-gated — or stalled — dispatch is waiting on.
           await this.pumpLiveDispatches(actor);
+          // …and the cross-project side (PLNR-241): dependents in other projects hear too.
+          this.notifyExternalDependents(await this.externalDependentsOf(taskId), { id: taskId, key: task.key });
         }
       } else {
         await this.emit(actor, 'task.updated', 'task', taskId, { key: task.key, fields: Object.keys(patch) });
@@ -952,23 +954,47 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
+  /** The blocker side of an edge may live in ANY project (PLNR-241): task ids and display
+   *  keys are globally unique, so a bare `id OR key` lookup is unambiguous. The edge row is
+   *  owned by the DEPENDENT task's room (this one) — the blocker is only ever read, so the
+   *  sole-writer-per-project invariant holds. ACCESS to the blocker's project is the caller's
+   *  problem (the MCP/REST edges check it before crossing into the DO); this lookup is the
+   *  existence check, not the fence. */
+  private async getBlockerTask(ref: string): Promise<{ id: string; key: string; project_id: string; status: string }> {
+    const row = await this.env.DB.prepare(
+      'SELECT id, key, project_id, status FROM tasks WHERE id = ? OR key = ?',
+    ).bind(ref, ref).first<{ id: string; key: string; project_id: string; status: string }>();
+    if (!row) throw new Error(`task ${ref} not found`);
+    return row;
+  }
+
   async addDependency(projectId: string, actor: Actor, taskId: string, dependsOnTaskId: string)  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
-      if (taskId === dependsOnTaskId) throw new Error('a task cannot depend on itself');
-      const [task, dep] = await Promise.all([this.getTask(taskId), this.getTask(dependsOnTaskId)]);
-      // Cycle guard: walk dep's transitive deps looking for taskId.
+      const [task, dep] = await Promise.all([this.getTask(taskId), this.getBlockerTask(dependsOnTaskId)]);
+      if (task.id === dep.id) throw new Error('a task cannot depend on itself');
+      // Cycle guard: walk dep's transitive deps looking for taskId. The CTE is global —
+      // dependencies has no project column — so it sees cross-project chains too. A cycle
+      // built by TWO rooms adding opposing edges in the same instant can in principle slip
+      // both checks (each room serializes only its own writes); accepted rather than solved
+      // (PLNR-241): the result is a mutual block, visible in both boards and undone with one
+      // remove_dependency, never data corruption.
       const { results } = await this.env.DB.prepare(
         `WITH RECURSIVE up(id) AS (
            SELECT depends_on_task_id FROM dependencies WHERE task_id = ?
            UNION SELECT d.depends_on_task_id FROM dependencies d JOIN up ON d.task_id = up.id)
          SELECT id FROM up WHERE id = ?`,
-      ).bind(dependsOnTaskId, taskId).all();
+      ).bind(dep.id, task.id).all();
       if (results.length) throw new Error('dependency would create a cycle');
       await this.env.DB.prepare('INSERT OR IGNORE INTO dependencies (task_id, depends_on_task_id) VALUES (?, ?)')
-        .bind(taskId, dependsOnTaskId)
+        .bind(task.id, dep.id)
         .run();
-      await this.emit(actor, 'dependency.added', 'task', taskId, { key: task.key, dependsOn: dep.key });
+      // Same-project payload stays byte-identical to before; the cross-project fields ride
+      // only when the edge actually crosses, so existing feed renderers see nothing new.
+      await this.emit(actor, 'dependency.added', 'task', task.id, {
+        key: task.key, dependsOn: dep.key,
+        ...(dep.project_id !== projectId ? { dependsOnProjectId: dep.project_id } : {}),
+      });
       return { ok: true };
 
     });
@@ -977,13 +1003,83 @@ export class ProjectRoom extends DurableObject<Env> {
   async removeDependency(projectId: string, actor: Actor, taskId: string, dependsOnTaskId: string)  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
-      const [task, dep] = await Promise.all([this.getTask(taskId), this.getTask(dependsOnTaskId)]);
+      const task = await this.getTask(taskId);
+      const dep = await this.getBlockerTask(dependsOnTaskId);
+      // No-leak rule (PLNR-241): removal needs no access to the blocker's project — the edge
+      // is this project's row, and a revoked grant must not orphan it — but a FOREIGN ref
+      // resolves only against an edge this task actually has. Otherwise remove_dependency
+      // would confirm any task key in the instance by erroring differently. A same-project
+      // ref without an edge stays the idempotent no-op it has always been.
+      if (dep.project_id !== projectId) {
+        const edge = await this.env.DB.prepare(
+          'SELECT 1 FROM dependencies WHERE task_id = ? AND depends_on_task_id = ?',
+        ).bind(task.id, dep.id).first();
+        if (!edge) throw new Error(`task ${dependsOnTaskId} not found`);
+      }
       await this.env.DB.prepare('DELETE FROM dependencies WHERE task_id = ? AND depends_on_task_id = ?')
-        .bind(taskId, dependsOnTaskId)
+        .bind(task.id, dep.id)
         .run();
-      await this.emit(actor, 'dependency.removed', 'task', taskId, { key: task.key, dependsOn: dep.key });
+      await this.emit(actor, 'dependency.removed', 'task', task.id, {
+        key: task.key, dependsOn: dep.key,
+        ...(dep.project_id !== projectId ? { dependsOnProjectId: dep.project_id } : {}),
+      });
       return { ok: true };
 
+    });
+  }
+
+  /** Cross-project dependents of a settling task (PLNR-241): the WHO. Same-project
+   *  dependents need nothing — this room's own event + pump already cover them. */
+  private async externalDependentsOf(taskId: string): Promise<Array<{ id: string; pid: string }>> {
+    const { results } = await this.env.DB.prepare(
+      `SELECT t.id, t.project_id AS pid FROM dependencies d JOIN tasks t ON t.id = d.task_id
+       WHERE d.depends_on_task_id = ? AND t.project_id != ?`,
+    ).bind(taskId, this.projectId).all<{ id: string; pid: string }>();
+    return results;
+  }
+
+  /** Tell every foreign project holding a dependent of this task that its blocker settled
+   *  (PLNR-241). Correctness never rides on this: the claim gate and the pump both re-read
+   *  D1, which is global — this is pure liveness (the dependent's board hears an event, its
+   *  plan-dispatch pump wakes) in a project whose room otherwise never learns. Fire-and-forget
+   *  by design: awaiting a sibling room from inside blockConcurrencyWhile invites a mutual
+   *  wait when two rooms settle each other's blockers in the same breath, and a lost wake-up
+   *  costs only latency (the runner heartbeat's pumpProjectDispatches is the reconcile).
+   *  `rows` lets deletion paths pass dependents snapshotted BEFORE their edges were dropped. */
+  private notifyExternalDependents(rows: Array<{ id: string; pid: string }>, blocker: { id: string; key: string }) {
+    const byPid = new Map<string, string[]>();
+    for (const r of rows) byPid.set(r.pid, [...(byPid.get(r.pid) ?? []), r.id]);
+    for (const [pid, dependentIds] of byPid) {
+      void this.env.PROJECT_ROOM.get(this.env.PROJECT_ROOM.idFromName(pid))
+        .onExternalBlockerSettled(pid, { blockerId: blocker.id, blockerKey: blocker.key, dependentIds })
+        .catch((err) => console.warn(`cross-project dependent notify to ${pid} failed: ${String(err)}`));
+    }
+  }
+
+  /** The receiving half of notifyExternalDependents — runs in the DEPENDENT's room so the
+   *  event takes this project's own serialized seq (the same split as moveTask/noteTaskArrival).
+   *  Emits dependency.unblocked only for a dependent whose LAST blocker just cleared — "a
+   *  blocker settled but three remain" is not a fact a board needs — then pumps live plan
+   *  dispatches, which re-derive readiness from D1 wholesale. */
+  async onExternalBlockerSettled(
+    projectId: string,
+    info: { blockerId: string; blockerKey: string; dependentIds: string[] },
+  ): Promise<{ ok: true }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      for (const depId of info.dependentIds) {
+        const t = await this.env.DB.prepare(
+          'SELECT id, key, title, status FROM tasks WHERE id = ? AND project_id = ?',
+        ).bind(depId, projectId).first<{ id: string; key: string; title: string; status: string }>();
+        if (!t || t.status !== 'todo') continue; // gone, moved, or already past the gate's reach
+        const remaining = await this.unfinishedDeps(t.id);
+        if (remaining.length) continue;
+        await this.emit(SYSTEM_ACTOR, 'dependency.unblocked', 'task', t.id, {
+          key: t.key, title: t.title, blockerKey: info.blockerKey,
+        });
+      }
+      await this.pumpLiveDispatches(SYSTEM_ACTOR);
+      return { ok: true as const };
     });
   }
 
@@ -1151,6 +1247,8 @@ export class ProjectRoom extends DurableObject<Env> {
         // A task reaching done (e.g. a human approving a review) may unblock a plan
         // dispatch's dependents (PLNR-170). Never throws.
         await this.pumpLiveDispatches(actor);
+        // …and any dependents in OTHER projects (PLNR-241).
+        this.notifyExternalDependents(await this.externalDependentsOf(taskId), { id: taskId, key: task.key });
       }
       return { ok: true, key: task.key, status: toStatus, commentId };
 
@@ -2289,9 +2387,11 @@ export class ProjectRoom extends DurableObject<Env> {
    *  (created silently: their tag.created event belongs to the target's seq, which only
    *  the target DO may write; the arrival event goes through noteTaskArrival instead).
    *
-   *  What the move severs, by design: dependency edges (both directions — cross-project
-   *  edges are not a thing), plan phase membership, milestone, board (target default),
-   *  parent. Tag NAMES carry over and re-resolve in the target. Refused while claimed
+   *  What the move severs, by design: plan phase membership, milestone, board (target
+   *  default), parent, doc links (docs are project-local). Dependency edges are KEPT, both
+   *  directions — cross-project edges are first-class since PLNR-241, so a move simply turns
+   *  a local edge into a cross-project one (edges hang off the task id, which the move never
+   *  changes). Tag NAMES carry over and re-resolve in the target. Refused while claimed
    *  or with children — release/detach first, so nothing moves under a working agent. */
   async moveTask(projectId: string, actor: Actor, taskId: string, toProjectId: string) {
     return this.ctx.blockConcurrencyWhile(async () => {
@@ -2312,7 +2412,7 @@ export class ProjectRoom extends DurableObject<Env> {
       const { n: depCount } = (await this.env.DB.prepare(
         'SELECT COUNT(*) AS n FROM dependencies WHERE task_id = ? OR depends_on_task_id = ?',
       ).bind(task.id, task.id).first<{ n: number }>())!;
-      // Doc links are project-local (docs live in the source project) — severed like deps.
+      // Doc links are project-local (docs live in the source project) — severed, unlike deps.
       const { n: docLinkCount } = (await this.env.DB.prepare(
         'SELECT COUNT(*) AS n FROM task_docs WHERE task_id = ?',
       ).bind(task.id).first<{ n: number }>())!;
@@ -2325,7 +2425,6 @@ export class ProjectRoom extends DurableObject<Env> {
       const boardId = await this.defaultBoardId(toProjectId);
 
       await this.env.DB.batch([
-        this.env.DB.prepare('DELETE FROM dependencies WHERE task_id = ? OR depends_on_task_id = ?').bind(task.id, task.id),
         this.env.DB.prepare('DELETE FROM phase_tasks WHERE task_id = ?').bind(task.id),
         this.env.DB.prepare('DELETE FROM task_tags WHERE task_id = ?').bind(task.id),
         this.env.DB.prepare('DELETE FROM task_docs WHERE task_id = ?').bind(task.id),
@@ -2355,10 +2454,10 @@ export class ProjectRoom extends DurableObject<Env> {
       }
 
       await this.emit(actor, 'task.moved', 'task', task.id, {
-        key: task.key, toKey: newKey, toProjectId, title: task.title, droppedDependencies: depCount,
+        key: task.key, toKey: newKey, toProjectId, title: task.title, keptDependencies: depCount,
       });
       this.reindexSearch('task', task.id); // metadata.projectId changed with the move
-      return { ok: true, fromKey: task.key, key: newKey, projectId: toProjectId, droppedDependencies: depCount, droppedDocLinks: docLinkCount, tags: retagged };
+      return { ok: true, fromKey: task.key, key: newKey, projectId: toProjectId, keptDependencies: depCount, droppedDocLinks: docLinkCount, tags: retagged };
     });
   }
 
@@ -2594,6 +2693,9 @@ export class ProjectRoom extends DurableObject<Env> {
         for (const a of results) await this.env.FILES.delete(a.key).catch(() => {});
       }
       const id = task.id;
+      // Cross-project dependents snapshotted BEFORE the batch drops their edges (PLNR-241):
+      // a deleted blocker unblocks them, and their rooms need telling after the commit.
+      const externalDependents = await this.externalDependentsOf(id);
       await this.env.DB.batch([
         this.env.DB.prepare('DELETE FROM phase_tasks WHERE task_id = ?').bind(id),
         this.env.DB.prepare('DELETE FROM dependencies WHERE task_id = ? OR depends_on_task_id = ?').bind(id, id),
@@ -2610,6 +2712,7 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM tasks WHERE id = ?').bind(id),
       ]);
       await this.emit(actor, 'task.deleted', 'task', id, { key: task.key, title: task.title });
+      this.notifyExternalDependents(externalDependents, { id, key: task.key });
       this.dropSearch('task', id);
       return { ok: true, key: task.key };
     });
@@ -2637,6 +2740,14 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('SELECT id FROM docs WHERE project_id = ?').bind(pid).all<{ id: string }>(),
         this.env.DB.prepare('SELECT id FROM plans WHERE project_id = ?').bind(pid).all<{ id: string }>(),
       ]);
+      // Dependents in OTHER projects blocked by tasks about to die with this one (PLNR-241) —
+      // snapshotted before the batch severs their edges, notified after it commits.
+      const { results: externalDependents } = await this.env.DB.prepare(
+        `SELECT t.id, t.project_id AS pid FROM dependencies d
+           JOIN tasks bt ON bt.id = d.depends_on_task_id
+           JOIN tasks t  ON t.id  = d.task_id
+         WHERE bt.project_id = ? AND t.project_id != ?`,
+      ).bind(pid, pid).all<{ id: string; pid: string }>();
       const tasksSub = 'SELECT id FROM tasks WHERE project_id = ?';
       await this.env.DB.batch([
         this.env.DB.prepare(`DELETE FROM phase_tasks WHERE task_id IN (${tasksSub}) OR phase_id IN (SELECT id FROM phases WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ?))`).bind(pid, pid),
@@ -2676,6 +2787,8 @@ export class ProjectRoom extends DurableObject<Env> {
       ]);
       // Batch committed — now the attachment rows are gone, so it is safe to drop their blobs.
       if (this.env.FILES) for (const key of r2Keys) await this.env.FILES.delete(key).catch(() => {});
+      // The deleted project's key stands in for a blocker id nothing can resolve anymore.
+      this.notifyExternalDependents(externalDependents, { id: '', key: proj.key });
       await this.ctx.storage.deleteAlarm().catch(() => {});
       this.dropSearch('task', ...vecTasks.results.map((r) => r.id));
       this.dropSearch('doc', ...vecDocs.results.map((r) => r.id));

@@ -511,6 +511,8 @@ export interface PublicSnapshot {
   project: { id: string; key: string; name: string; description: string };
   tasks: ApiSnapshot['tasks'];
   dependencies: ApiSnapshot['dependencies'];
+  /** Cross-project blockers, anonymized to {id, status} for anonymous viewers (PLNR-241). */
+  externalTasks?: ApiSnapshot['externalTasks'];
   agents: Array<{ id: string; name: string; role: string; status: string }>;
   events: ApiSnapshot['events'];
   milestones: ApiSnapshot['milestones'];
@@ -580,6 +582,11 @@ export interface ApiSnapshot {
     spinoffFinding?: string | null;
   }>;
   dependencies: Array<{ taskId: string; dependsOnTaskId: string }>;
+  /** Foreign blockers behind cross-project dependency edges (PLNR-241): enough to compute
+   *  blocked state and label the chip. Identity fields are ABSENT when the viewer cannot
+   *  reach the blocker's project (and always absent on the public snapshot) — the status
+   *  still ships, because the gate is real either way. */
+  externalTasks?: Array<{ id: string; status: string; key?: string; title?: string; projectId?: string; projectKey?: string }>;
   agents: Array<{ id: string; name: string; role: string; status: string; lastSeenAt: string | null; ownerName: string | null; parentAgentId: string | null }>;
   milestones: Array<{ id: string; title: string; dueAt: string | null; order: number }>;
   boards: Array<{ id: string; name: string; order: number }>;

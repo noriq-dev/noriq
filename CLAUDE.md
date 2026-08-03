@@ -164,6 +164,16 @@ for the components. (ARCHITECTURE.md calls it a "mock store" — that's stale; i
   **description string** instead (see `EXECUTION_SPEC_DESC` in mcp.ts, asserted against the
   generated `tools/list` payload in tests).
 
+- **Dependency edges may cross projects (PLNR-241), and the `dependencies` table has no
+  `project_id` — an edge is owned by the DEPENDENT task's project.** Task ids AND display
+  keys are globally unique, so blocker refs resolve globally; access to a foreign blocker's
+  project is enforced at the MCP/REST edges (`resolveBlockerRef` / `resolveBlockerRefRest`),
+  never in the DO. When a task settles (done/cancelled) or is deleted, its room fire-and-forgets
+  `onExternalBlockerSettled` into each foreign dependent's room (event + dispatch pump) —
+  best-effort only; claim gates and pumps re-read global D1, so correctness never depends on
+  it. `move_task` keeps dependency edges (they just become cross-project); plan phase gating
+  remains intra-project by construction.
+
 - **Two event cursors exist — don't conflate them.** Per-project `events.seq` is the WS resume
   cursor; `events.global_seq` (trigger-assigned from the singleton `event_seq` table, migration
   0056) is the `my_updates` notices cursor. rowid is unusable — `events.id` is a TEXT PK, so

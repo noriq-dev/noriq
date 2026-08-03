@@ -265,9 +265,10 @@ describe('create_tasks — batch creation', () => {
     const kid = await mcpCall(orch.apiKey, 'get_task', { taskId: byRef.kid.id });
     expect(kid.body.task.parent_task_id).toBe(byRef.a.id);
 
-    // the bad item failed alone, legibly, without sinking the batch.
+    // the bad item failed alone, legibly, without sinking the batch. (dependsOn refs use the
+    // PLNR-241 cross-project resolver, whose miss reads "not found or not accessible".)
     const broken = res.body.created[3];
-    expect(broken.error).toContain('neither an earlier ref');
+    expect(broken.error).toContain('not found or not accessible');
     expect(broken.id).toBeUndefined();
   });
 });
@@ -386,7 +387,7 @@ describe('search_tasks', () => {
 
 // ---- PLNR-136: move_task — re-home without losing history --------------------------
 describe('move_task', () => {
-  it('moves a task with its comments, re-keys it, re-tags by name, severs deps', async () => {
+  it('moves a task with its comments, re-keys it, re-tags by name, keeps deps (now cross-project)', async () => {
     const a = (await mcpCall(orch.apiKey, 'create_project', { key: 'MVA', name: 'move-src' })).body.id;
     const b = (await mcpCall(orch.apiKey, 'create_project', { key: 'MVB', name: 'move-dst' })).body.id;
     const made = (await mcpCall(orch.apiKey, 'create_tasks', {
@@ -404,14 +405,20 @@ describe('move_task', () => {
     expect(res.isError).toBe(false);
     expect(res.body.key).toMatch(/^MVB-/);
     expect(res.body.fromKey).toMatch(/^MVA-/);
-    expect(res.body.droppedDependencies).toBe(1);
+    expect(res.body.keptDependencies).toBe(1); // PLNR-241: the edge survives, now cross-project
     expect(res.body.tags).toContain('carried');
 
-    // Same row, new home: comments intact, dep gone (claimable), tag exists in target.
+    // Same row, new home: comments intact, dep KEPT (still gating from the old project),
+    // tag exists in target.
     const got = await mcpCall(orch.apiKey, 'get_task', { taskId: ids.mover.id });
     expect(got.body.task.project_id).toBe(b);
     expect(got.body.comments.some((c: { body: string }) => c.body.includes('history rides along'))).toBe(true);
-    expect(got.body.dependencies).toHaveLength(0);
+    expect(got.body.dependencies).toHaveLength(1);
+    expect(got.body.dependencies[0].projectKey).toBe('MVA');
+    const gated = await mcpCall(orch.apiKey, 'claim_task', { projectId: b, taskId: ids.mover.id });
+    expect(gated.isError).toBe(true);
+    expect(gated.text).toContain('MVA-');
+    await mcpCall(orch.apiKey, 'update_task', { projectId: a, taskId: ids.anchor.id, status: 'done' });
     const claim = await mcpCall(orch.apiKey, 'claim_task', { projectId: b, taskId: ids.mover.id });
     expect(claim.isError).toBe(false);
     const dst = await mcpCall(orch.apiKey, 'get_project', { projectId: b });
