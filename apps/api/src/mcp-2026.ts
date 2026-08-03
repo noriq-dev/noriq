@@ -3,6 +3,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { Env } from './env';
 import { resolveSessionAgent, type AppContext, type Connection } from './auth';
 import { buildMcpServer, INSTRUCTIONS, SERVER_INFO } from './mcp';
+import { handleSubscriptionsListen } from './mcp-listen';
 
 /**
  * MCP 2026-07-28 ("modern") compatibility layer — PLNR-233.
@@ -53,9 +54,9 @@ const PARSE_ERROR = -32700;
 /** Legacy resource-not-found; 2026-07-28 forbids emitting it (replaced by -32602). */
 const LEGACY_RESOURCE_NOT_FOUND = -32002;
 
-/** Methods the modern layer forwards into the SDK server. Anything else — including the
- *  removed `ping`/`logging/setLevel` and the unimplemented `subscriptions/listen` (we
- *  advertise no listChanged capabilities) — is 404 + -32601 per the transport spec. */
+/** Methods the modern layer forwards into the SDK server. `subscriptions/listen` is
+ *  handled natively (mcp-listen.ts); anything else — including the removed `ping` and
+ *  `logging/setLevel` — is 404 + -32601 per the transport spec. */
 const FORWARDED_METHODS = new Set(['tools/list', 'tools/call', 'resources/list', 'resources/read', 'resources/templates/list']);
 
 /** Freshness hints for CacheableResult methods. All private: tools/list varies with the
@@ -184,13 +185,20 @@ export async function handleModernMcp(c: Context<AppContext>, env: Env, conn: Co
         supportedVersions: SUPPORTED_PROTOCOL_VERSIONS,
         // Matches what the legacy initialize result advertises (registration adds
         // tools/resources; logging is deprecated in 2026-07-28 so it is not offered here).
-        capabilities: { tools: {}, resources: {}, experimental: { 'claude/channel': {} } },
+        // listChanged/subscribe are honored on a subscriptions/listen stream (PLNR-234).
+        capabilities: { tools: {}, resources: { listChanged: true, subscribe: true }, experimental: { 'claude/channel': {} } },
         instructions: INSTRUCTIONS,
         ttlMs: 3_600_000,
         cacheScope: 'private' as const,
         _meta: { [META_SERVER_INFO]: SERVER_INFO },
       },
     }, 200);
+  }
+
+  // Long-lived change-notification stream — handled natively, scoped by the token
+  // itself (no per-session identity to resolve; visibility is user ∩ token).
+  if (method === 'subscriptions/listen') {
+    return handleSubscriptionsListen(c, env, conn, { id, params: msg.params as Record<string, unknown> | undefined });
   }
 
   // Unknown-method must be 404 + -32601 on modern requests — the JSON-RPC body is what

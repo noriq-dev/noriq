@@ -173,7 +173,8 @@ describe('validation errors (modern JSON-RPC error bodies — what era detection
   });
 
   it('unknown modern method → 404 + -32601 (ping and logging/setLevel are gone)', async () => {
-    for (const method of ['ping', 'logging/setLevel', 'subscriptions/listen']) {
+    // subscriptions/listen is NOT here: it is implemented (PLNR-234, mcp-listen.test.ts).
+    for (const method of ['ping', 'logging/setLevel']) {
       const { status, body } = await modern(apiKey, method, {});
       expect(status).toBe(404);
       expect(body.error.code).toBe(-32601);

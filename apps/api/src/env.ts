@@ -12,6 +12,9 @@ export interface Env {
   RUNNER_HUB: DurableObjectNamespace<RunnerHub>;
   /** Set in tests to bypass rate limiting. */
   DISABLE_RATE_LIMIT?: boolean;
+  /** Poll interval (ms) for the subscriptions/listen event stream (PLNR-234).
+   *  Default 5000; tests set it low so change notifications arrive within a tick. */
+  LISTEN_POLL_MS?: string;
   /** Bootstrap secret for issuing agent keys / creating users. Set via `wrangler secret put ADMIN_TOKEN`. */
   ADMIN_TOKEN?: string;
   /** Optional shared secret for GitHub webhook signature verification. */

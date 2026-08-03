@@ -83,7 +83,9 @@ const project = (name: string, include: string[], extraBindings: Record<string, 
             miniflare: {
               // R2 for attachment tests (the generic wrangler.jsonc doesn't bind FILES).
               r2Buckets: ['FILES'],
-              bindings: { TEST_MIGRATIONS: migrations, ADMIN_TOKEN: 'test-admin-token', DISABLE_RATE_LIMIT: true, ...extraBindings },
+              // LISTEN_POLL_MS: the subscriptions/listen stream polls fast in tests so
+              // change notifications arrive within one assertion window (PLNR-234).
+              bindings: { TEST_MIGRATIONS: migrations, ADMIN_TOKEN: 'test-admin-token', DISABLE_RATE_LIMIT: true, LISTEN_POLL_MS: '150', ...extraBindings },
               // Tests run without built web assets.
               assets: { directory: './test/fixtures/empty-assets' },
             },
