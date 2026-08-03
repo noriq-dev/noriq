@@ -23,13 +23,16 @@ npm test                 # all workspace tests
 
 API tests run in a real `workerd` via `@cloudflare/vitest-pool-workers` (DOs + D1 are exercised, not mocked).
 The full run is **sharded across parallel pool projects** (`apps/api/vitest.workspace.ts`) — ~10s instead of
-~4.5 min single-worker (the pool can't parallelize within one project; see that file). Target one file by
-`cd`-ing in — a workspace, once present, governs every run, so `--root apps/api <file>` from the repo root no
-longer resolves the path:
+~4.5 min single-worker (the pool can't parallelize within one project; see that file). Besides the `shard-*`
+projects there are dedicated `demo` and `maintenance` projects: `DEMO_MODE`/`MAINTENANCE_MODE` flip global
+behavior, so those suites can't ride the shared default binding set. Target one file by `cd`-ing in — a
+workspace, once present, governs every run, so `--root apps/api <file>` from the repo root no longer
+resolves the path:
 
 ```sh
-npm test --workspace @noriq-dev/api                      # full API suite (sharded, ~10s)
+npm test --workspace @noriq-dev/api                      # full API suite (shard* + demo + maintenance, ~10s)
 npm run test:load --workspace @noriq-dev/api             # the 28s claim-stampede stress test (off the default run)
+npm run test:hooks                                       # the file-lock Claude Code hook suite (node --test, not vitest)
 cd apps/api && npx vitest run test/oauth.test.ts         # a single test file
 cd apps/api && npx vitest run -t "refresh"               # a single case by name (across all shards)
 cd apps/api && npx tsc --noEmit                          # typecheck API (vitest uses esbuild — it does NOT catch type errors)
@@ -39,37 +42,57 @@ Deploy + migrations (production actions — only run when explicitly asked):
 
 ```sh
 npm run deploy                                    # build + wrangler deploy (uses wrangler.production.jsonc if present)
+npm run deploy:demo                               # build + deploy the DEMO_MODE instance (wrangler.demo.jsonc)
 npm run db:migrate:local --workspace @noriq-dev/api   # apply migrations to the local D1
 npm run db:migrate:remote --workspace @noriq-dev/api  # apply migrations to the REMOTE (prod) D1
+npm run db:migrate:demo --workspace @noriq-dev/api    # apply migrations to the demo instance's D1
 ```
 
 ## Architecture
 
 **One Worker does everything.** `apps/api/src/index.ts` is a Hono router that serves `/api/*`
-(REST for the SPA), `/mcp` (agents), `/ws/*` (live updates), `/oauth/*` + `/.well-known/*`
-(OAuth 2.1 AS), and falls through to Workers Assets for the SPA. `run_worker_first` in the
-wrangler config keeps the dynamic paths on the Worker while static assets are served directly.
+(REST for the SPA), `/mcp` (agents), `/ws/*` (live updates — including `/ws/runner/:id`, the
+Bearer-authenticated runner-daemon channel), `/oauth/*` + `/.well-known/*` (OAuth 2.1 AS),
+`/skill.md` + `/skill/docs.md` + `/reference.md` + `/reference.json` (served agent guidance),
+and falls through to Workers Assets for the SPA. `run_worker_first` in the wrangler config keeps
+the dynamic paths on the Worker while static assets are served directly.
 
-**`ProjectRoom` (Durable Object) is the sole writer per project** — [apps/api/src/do/ProjectRoom.ts](apps/api/src/do/ProjectRoom.ts).
-All mutations (create/claim/release tasks, comments, milestones, boards, deletes) go through it,
-wrapped in `blockConcurrencyWhile`, so there are no double-claims or read-modify-write races, and
-every mutation appends to a per-project **event log** (monotonic `seq`, also the WS resume cursor)
-and fans out over WebSocket. **Reads go straight to D1** (e.g. the `/snapshot` endpoint); only
-writes cross into the DO. Humans and agents are the same `Actor` path — a human is just another actor.
+**Four Durable Objects.** **`ProjectRoom` is the sole writer per project** —
+[apps/api/src/do/ProjectRoom.ts](apps/api/src/do/ProjectRoom.ts). All mutations (create/claim/release
+tasks, comments, milestones, boards, deletes) go through it, wrapped in `blockConcurrencyWhile`, so
+there are no double-claims or read-modify-write races, and every mutation appends to a per-project
+**event log** (monotonic `seq`, also the WS resume cursor) and fans out over WebSocket. **Reads go
+straight to D1** (e.g. the `/snapshot` endpoint); only writes cross into the DO. Humans and agents
+are the same `Actor` path — a human is just another actor. The others: `AgentSession` (per-agent
+notices cursor + presence), `RateLimiter`, and `RunnerHub` (one per runner daemon, holds its
+`/ws/runner/:id` socket — pure transport; run **authority** stays in `ProjectRoom`).
 
 **MCP server** — [apps/api/src/mcp.ts](apps/api/src/mcp.ts). Streamable HTTP via `@hono/mcp`, **stateless**:
-a fresh `McpServer` is built per request, bound to the authenticated agent. Tools double as docs
-(descriptions teach the workflow); every tool result piggybacks a `--- notices ---` block computed
-in [sync.ts](apps/api/src/sync.ts) from a server-side cursor stored in the `AgentSession` DO, so
-working agents get pushed-feeling updates without polling.
+a fresh `McpServer` is built per request, bound to the authenticated agent. Two protocol eras share
+`/mcp`: the legacy path (`initialize` + `Mcp-Session-Id`, ≤2025-11-25) goes through the SDK, while
+the **2026-07-28 modern path** ([mcp-2026.ts](apps/api/src/mcp-2026.ts)) sits in front of it — the
+TS SDK tops out at 2025-11-25, so it validates the modern envelope itself, answers `server/discover`
+directly, and bridges an allowlist of methods into the same `buildMcpServer` over an in-memory
+transport (JSON-only responses, no sessions, no notifications). `subscriptions/listen`
+([mcp-listen.ts](apps/api/src/mcp-listen.ts)) is the one long-lived push stream — see constraints.
+Tools double as docs (descriptions teach the workflow); every tool result piggybacks a
+`--- notices ---` block computed in [sync.ts](apps/api/src/sync.ts) from a server-side cursor stored
+in the `AgentSession` DO, so working agents get pushed-feeling updates without polling.
 
 **Agent identity model:** user → OAuth connection (one per `claude mcp add`) → agent (one per MCP
-session, keyed by `Mcp-Session-Id`) → sub-agents (`parent_agent_id`). Agents are **project-local**.
+session, keyed by `Mcp-Session-Id`; an `openai/session` `_meta` key takes precedence when present)
+→ sub-agents (`parent_agent_id`). Agents are **project-local** and carry a `kind`: **copilot**
+(human-authorized connection) vs **agent** (runner-spawned — minted per run via
+`POST /api/runs/:runId/agent`, one live agent per run, with reduced authority; see constraints).
 Auth lives in [auth.ts](apps/api/src/auth.ts) (agents: OAuth-only, no static keys) and
-[oauth.ts](apps/api/src/oauth.ts) (the AS: authz-code + PKCE/S256, DCR + CIMD client registration).
+[oauth.ts](apps/api/src/oauth.ts) (the AS: authz-code + PKCE/S256, DCR + CIMD client registration,
+plus the RFC 8628 device grant for headless runners).
 
-**Shared zod schemas** — [packages/shared/src](packages/shared/src) — are the single source of truth for
-the data model and the event/WS protocol, consumed by MCP tools, REST, and the UI.
+**Shared zod schemas** — [packages/shared/src](packages/shared/src) — are the single source of truth,
+consumed by MCP tools, REST, and the UI: `model.ts` (data model), `events.ts` (event log),
+`ws.ts` (browser + runner WS protocols), `runner.ts` (runs: kind/tool/effort/budget/spend),
+`manifest.ts` (the `.noriq/project.toml` and `~/.noriq/runner.toml` manifests, validated as parsed
+objects — shared deliberately has no TOML parser), and `execution-spec.ts` (the ExecutionSpec contract).
 
 **Web app** — [apps/web/src/store.tsx](apps/web/src/store.tsx) is the live store: it loads REST
 `/snapshot`s and invalidates on WS events, deriving view-model types ([types.ts](apps/web/src/types.ts))
@@ -83,29 +106,77 @@ for the components. (ARCHITECTURE.md calls it a "mock store" — that's stale; i
   When adding a table that other tables reference, order the statements so FK targets exist first,
   and update the `deleteProject` cascade in `ProjectRoom` (FK-ordered deletes) for any new table.
 
-- **MCP notifications only deliver on the in-flight request's SSE stream.** In stateless Streamable
-  HTTP there is no standing GET stream, so `server.notification()` with no `relatedRequestId` is
-  dropped. Always pass `extra.requestId` as `relatedRequestId` (see `pushChannel` in mcp.ts). A fully
-  idle agent cannot be pushed to — the notices text-block is the reliable fallback.
+- **MCP push has three distinct delivery paths — know which one you're on.** (1) Legacy path:
+  notifications only deliver on the in-flight request's SSE stream — there is no standing GET
+  stream, so `server.notification()` with no `relatedRequestId` is dropped; always pass
+  `extra.requestId` as `relatedRequestId` (see `pushChannel` in mcp.ts). (2) Modern 2026-07-28
+  path: notifications are **never forwarded**, by design (JSON-only responses). (3)
+  `subscriptions/listen` ([mcp-listen.ts](apps/api/src/mcp-listen.ts)) is a real long-lived SSE
+  stream, but narrow: docs/attachments change events only (D1-polled every `LISTEN_POLL_MS`,
+  default 5s), resource subscriptions limited to `noriq://doc/{id}`, forward-only and not
+  resumable. It carries **no** task/comment/message coordination — the notices text-block
+  remains the reliable fallback for a working agent, and a fully idle legacy agent still
+  cannot be pushed to.
 
-- **Agent-facing guidance lives in three overlapping places that must be kept in sync.** The
-  MCP `instructions` string (`INSTRUCTIONS` in [mcp.ts](apps/api/src/mcp.ts), sent once on
-  `initialize`), the `playbook` array returned by `get_briefing` (same file), and `SKILL_MD`
-  ([skill.ts](apps/api/src/skill.ts), served at `/skill.md`). The duplication is intentional —
-  the inline playbook spares a working agent a second fetch, and the skill is not registered as
-  an MCP resource, so a bare "read the skill" pointer would dangle for MCP clients. **When you
-  change the work-loop contract (claim/release, identity, planning, escalation), update all
-  three** — they drift silently otherwise.
+- **Agent-facing guidance lives in four overlapping places that must be kept in sync.** The
+  MCP `instructions` string (`INSTRUCTIONS` in [mcp.ts](apps/api/src/mcp.ts), sent on legacy
+  `initialize` and in the modern `server/discover` result), the `playbook` array returned by
+  `get_briefing` (same file), `SKILL_MD` ([skill.ts](apps/api/src/skill.ts), served at
+  `/skill.md`), and `DOC_SKILL_MD` ([skill-docs.ts](apps/api/src/skill-docs.ts), the
+  doc-authoring contract — served at `/skill/docs.md`, as MCP resource
+  `noriq://skill/doc-authoring`, and via the `get_doc_guide` tool). The duplication is
+  intentional — the inline playbook spares a working agent a second fetch, and the skill is not
+  registered as an MCP resource, so a bare "read the skill" pointer would dangle. **When you
+  change the work-loop contract (claim/release, identity, planning, escalation), update
+  INSTRUCTIONS + playbook + SKILL_MD; when you change the docs contract, also DOC_SKILL_MD** —
+  they drift silently otherwise. `/reference.md` + `/reference.json` are *generated* from the
+  live tool schemas and never need manual sync.
 
 - **`fetchMock` from `cloudflare:test` only intercepts the test isolate, not the worker isolate
   reached via `SELF.fetch()`.** To test code that makes outbound `fetch` from within the Worker,
   inject the fetch function (see `resolveCimdClient(env, id, doFetch)` in [lib/cimd.ts](apps/api/src/lib/cimd.ts))
   and unit-test it directly, rather than driving it through an HTTP route.
 
-- **Task- vs project-scoped tables:** `comments` and `attachments` are **task-scoped** (no
-  `project_id` column — join through `tasks`). `signals`, `messages`, `events` have `project_id`.
+- **Task- vs project-scoped tables:** `comments`, `attachments`, and `task_docs` are
+  **task-scoped** (no `project_id` column — join through `tasks`); `run_log_segments` is
+  run-scoped. `signals`, `messages`, `events`, `docs`, `plan_docs`, `file_locks`,
+  `plan_dispatches`, `plan_landings` have `project_id`. `templates` is user-scoped and
+  `event_seq` is a global singleton — `deleteProject` must never touch either.
 
-- **A deployed change requires a hard browser refresh** — the open SPA tab caches the old JS bundle.
+- **The priority scale is INVERTED as of migration 0066 (PLNR-231): 0 = most urgent, 4 = someday,
+  default 2.** Every priority sort is `ORDER BY priority ASC`. The migration is a
+  `priority = 4 - priority` **data** migration — NOT idempotent; re-running it by hand via
+  `d1 execute` silently flips the whole backlog. Pre-0066 backup snapshots carry the old scale
+  (see [BACKUP.md](apps/api/BACKUP.md)).
+
+- **Runner-spawned agents (`kind === 'agent'`) have deliberately reduced authority, enforced in
+  server code (not the daemon's tool manifest):** they cannot set task `status` via
+  `update_task`/`update_tasks`, cannot call `release_task`/`handoff_task` (the run's terminal
+  outcome settles its anchor task), and `build`/`verify` run agents cannot rewrite **any** task's
+  execution spec ([lib/spec-authority.ts](apps/api/src/lib/spec-authority.ts) — only `scope` runs
+  author specs). Separately, **a claimed task's status is not editable via MCP at all**
+  (PLNR-226, enforced in the DO), and the GitHub webhook records a PR ref on a claimed task
+  without restatusing it. Their `allowedTools` floor means unlisted tools are **not registered**
+  (absent from `tools/list`), not advertise-then-deny.
+
+- **The MCP SDK resolves zod 3.x while this repo is on zod 4.x, so `.describe()` field metadata
+  is dropped in the zod→JSON-Schema conversion.** Per-field guidance must go in the tool
+  **description string** instead (see `EXECUTION_SPEC_DESC` in mcp.ts, asserted against the
+  generated `tools/list` payload in tests).
+
+- **Two event cursors exist — don't conflate them.** Per-project `events.seq` is the WS resume
+  cursor; `events.global_seq` (trigger-assigned from the singleton `event_seq` table, migration
+  0056) is the `my_updates` notices cursor. rowid is unusable — `events.id` is a TEXT PK, so
+  SQLite reuses rowids after `deleteProject` (PLNR-111).
+
+- **Project `docs` and `plan_docs` are different beasts:** project docs are settled-decisions-only
+  (enforced by [lib/doclint.ts](apps/api/src/lib/doclint.ts) — TBD/open-question phrasing is
+  rejected) and vector-indexed; plan-local docs (PLNR-200) are working documents — never indexed,
+  never linted, deliberately a separate table.
+
+- **A deployed change no longer needs a hard browser refresh by default** — the SPA compares its
+  build-time `__APP_VERSION__` against `/api/health` and the snapshot version and reloads itself
+  once per server version (PLNR-193). A hard refresh is the fallback if that guard misfires.
 
 ## Naming
 
