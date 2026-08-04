@@ -390,7 +390,9 @@ describe('dispatch validates verifiesRunId (HTTP)', () => {
     await env.DB.prepare(
       `INSERT OR REPLACE INTO runners (id, label, owner_user_id, repos, status)
        VALUES ('rnr_owned', 'owned', ?, ?, 'online')`,
-    ).bind(u!.id, JSON.stringify([{ id: 'repo_a', projectId: pid }])).run();
+    // `docs` is advertised because PLNR-240 made the menu load-bearing: a dispatch naming a
+    // workflow the repo does not advertise is now refused at the door, not silently run.
+    ).bind(u!.id, JSON.stringify([{ id: 'repo_a', projectId: pid, workflows: ['docs'] }])).run();
   });
 
   const dispatch = (body: Record<string, unknown>) =>

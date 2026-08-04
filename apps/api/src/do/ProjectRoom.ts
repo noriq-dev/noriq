@@ -2,6 +2,7 @@ import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../env';
 import { newId, nowIso } from '../lib/util';
 import { userCanAccessProject } from '../lib/visibility';
+import { advertisedWorkflowNames } from '../lib/workflows';
 import { unfinishedDeps as unfinishedDepsLib } from '../lib/claimability';
 import { needsOutOfBand, sendSignalEmail, sendSignalWebhook } from '../lib/notify-out';
 import { requireDecisionOnlyDoc } from '../lib/doclint';
@@ -117,6 +118,9 @@ export interface TaskPatch {
   /** Replace the task's execution spec (RUN-135). Explicit null CLEARS it; omitting the key
    *  leaves whatever is there, exactly like every other field in this patch. */
   executionSpec?: ExecutionSpecInput | null;
+  /** The workflow the plan-dispatch pump runs this task under (PLNR-240). Null clears (back to
+   *  the dispatch default, then the built-in). Validated at dispatch time, not here. */
+  workflow?: string | null;
 }
 
 /** What a create returns. `executionSpec` present iff the call set one, normalised as stored.
@@ -309,13 +313,17 @@ export interface CreatePlanDispatchInput {
    *  done — review is a real lock. 'landed': dependents start once the upstream's run lands
    *  (code on the plan branch) while review is still pending — explicit opt-in. */
   gate?: 'landed' | 'approved';
+  /** Dispatch-level workflow default (PLNR-240): every run the pump creates runs under it
+   *  unless the task names its own. Validated against the repo's advertised set at the REST
+   *  door; the pump re-validates per task against the runner's CURRENT advertisement. */
+  workflow?: string | null;
   createdBy?: string;
 }
 
 type PlanDispatchRow = {
   id: string; project_id: string; plan_id: string; runner_id: string; repo_ref: string;
   agent_tool: string; model: string | null; effort: string | null; budget: string;
-  gate: string; status: string; stall_reason: string | null;
+  gate: string; status: string; stall_reason: string | null; workflow: string | null;
   created_by: string; created_at: string; updated_at: string; finished_at: string | null;
 };
 
@@ -339,6 +347,8 @@ export interface PlanDispatchView {
   gate: 'landed' | 'approved';
   status: 'active' | 'stalled' | 'completed' | 'cancelled';
   stallReason: string | null;
+  /** The dispatch-level workflow default (PLNR-240); null = the built-in build. */
+  workflow: string | null;
   tasks: PlanDispatchTaskView[];
   createdBy: string;
   createdAt: string;
@@ -828,6 +838,10 @@ export class ProjectRoom extends DurableObject<Env> {
       const fields: Array<[keyof TaskPatch, string]> = [
         ['title', 'title'], ['body', 'body'], ['priority', 'priority'], ['type', 'type'],
         ['estimate', 'estimate'], ['dueAt', 'due_at'], ['milestoneId', 'milestone_id'], ['boardId', 'board_id'], ['order', '"order"'],
+        // The dispatch-workflow override (PLNR-240): a free string here — the valid set is
+        // per-runner advertise state, so it is enforced where a dispatch actually happens
+        // (the REST doors, and the pump, which stalls legibly on an unadvertised name).
+        ['workflow', 'workflow'],
       ];
       for (const [k, col] of fields) {
         if (patch[k] !== undefined) {
@@ -3088,12 +3102,12 @@ export class ProjectRoom extends DurableObject<Env> {
       const now = nowIso();
       await this.env.DB.prepare(
         `INSERT INTO plan_dispatches (id, project_id, plan_id, runner_id, repo_ref, agent_tool,
-                                      model, effort, budget, gate, status, created_by, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+                                      model, effort, budget, gate, workflow, status, created_by, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
       ).bind(
         id, projectId, input.planId, input.runnerId, input.repoRef, input.agentTool,
         input.model ?? null, input.effort ?? null, JSON.stringify(input.budget ?? {}),
-        input.gate ?? 'approved', input.createdBy ?? actor.id, now, now,
+        input.gate ?? 'approved', input.workflow ?? null, input.createdBy ?? actor.id, now, now,
       ).run();
       await this.emit(actor, 'plan_dispatch.created', 'plan_dispatch', id, {
         planId: plan.id, planTitle: plan.title, runnerId: input.runnerId, gate: input.gate ?? 'approved',
@@ -3254,7 +3268,7 @@ export class ProjectRoom extends DurableObject<Env> {
       ? `AND ar.status NOT IN ('failed','cancelled')`
       : '';
     const { results: ready } = await this.env.DB.prepare(
-      `SELECT t.id FROM phase_tasks pt
+      `SELECT t.id, t.workflow FROM phase_tasks pt
          JOIN phases ph ON ph.id = pt.phase_id
          JOIN tasks t ON t.id = pt.task_id
        WHERE ph.plan_id = ?1
@@ -3275,11 +3289,27 @@ export class ProjectRoom extends DurableObject<Env> {
            SELECT 1 FROM runs ar WHERE ar.plan_dispatch_id = ?2
              AND ar.anchor_type = 'task' AND ar.anchor_id = t.id ${attempted})
        ORDER BY t.priority ASC, t."order"`,
-    ).bind(d.plan_id, d.id).all<{ id: string }>();
+    ).bind(d.plan_id, d.id).all<{ id: string; workflow: string | null }>();
 
     // Capacity: advertised max minus what the runs table says is on the box.
-    const runner = await this.env.DB.prepare('SELECT status, capabilities FROM runners WHERE id = ?')
-      .bind(d.runner_id).first<{ status: string; capabilities: string }>();
+    const runner = await this.env.DB.prepare('SELECT status, capabilities, repos FROM runners WHERE id = ?')
+      .bind(d.runner_id).first<{ status: string; capabilities: string; repos: string }>();
+
+    // Each run's workflow: the task's own name, else the dispatch's default (PLNR-240). A name
+    // the repo no longer advertises makes the task UNDISPATCHABLE — set aside here and said out
+    // loud in the stall reason, never silently run under the built-in prompt: a run built under
+    // the wrong posture's brief is worse than one that didn't start. Re-checked every pump
+    // because the advertisement is live state (a repo edit + daemon refresh changes it).
+    let advertised = new Set<string>(['scope', 'build', 'verify']);
+    try {
+      const repo = (JSON.parse(runner?.repos || '[]') as Array<{ id: string; workflows?: Array<string | { name: string }> }>)
+        .find((r) => r.id === d.repo_ref);
+      if (repo) advertised = advertisedWorkflowNames(repo);
+    } catch { /* malformed repos JSON → built-ins only */ }
+    const withWorkflow = ready.map((t) => ({ ...t, effectiveWorkflow: t.workflow ?? d.workflow ?? null }));
+    const dispatchable = withWorkflow.filter((t) => !t.effectiveWorkflow || advertised.has(t.effectiveWorkflow));
+    const wfBlocked = withWorkflow.filter((t) => t.effectiveWorkflow && !advertised.has(t.effectiveWorkflow));
+
     let slots = 0;
     if (runner && runner.status !== 'offboarded') {
       let maxC = 1;
@@ -3293,7 +3323,7 @@ export class ProjectRoom extends DurableObject<Env> {
     }
 
     let created = 0;
-    for (const t of ready.slice(0, slots)) {
+    for (const t of dispatchable.slice(0, slots)) {
       const run = await this.insertRun(actor, {
         kind: 'build',
         anchor: { type: 'task', id: t.id },
@@ -3301,6 +3331,7 @@ export class ProjectRoom extends DurableObject<Env> {
         agentTool: d.agent_tool,
         model: d.model,
         effort: d.effort,
+        workflow: t.effectiveWorkflow,
         budget: JSON.parse(d.budget || '{}'),
         runnerId: d.runner_id,
         createdBy: d.created_by,
@@ -3321,9 +3352,11 @@ export class ProjectRoom extends DurableObject<Env> {
     ).bind(d.id).first<{ n: number }>();
     const anyLive = (liveNow?.n ?? 0) > 0;
 
-    if (anyLive || ready.length > created) {
+    if (anyLive || dispatchable.length > created) {
       // Forward progress exists, or work is merely waiting for a slot (capacity frees via a
       // terminal run or the heartbeat nudge — no human is needed). Either way: active.
+      // Deliberately NOT counting wfBlocked as "waiting": a slot will never fix an
+      // unadvertised workflow — only a human (or a daemon refresh) can.
       if (d.status === 'stalled') {
         await this.env.DB.prepare(
           "UPDATE plan_dispatches SET status = 'active', stall_reason = NULL, updated_at = ? WHERE id = ?",
@@ -3333,7 +3366,10 @@ export class ProjectRoom extends DurableObject<Env> {
     } else if (created === 0) {
       // Nothing live, nothing dispatchable, plan still open: the pump cannot advance this
       // without a human. Say why, so the dashboard is actionable rather than just amber.
-      const reason = await this.planDispatchStallReason(d);
+      const wfNames = [...new Set(wfBlocked.map((t) => t.effectiveWorkflow))].join(', ');
+      const reason = await this.planDispatchStallReason(d, wfBlocked.length
+        ? [`${wfBlocked.length} ready task(s) name a workflow this repo does not advertise (${wfNames}) — refresh the runner, fix the name, or clear the selection`]
+        : []);
       if (d.status !== 'stalled') {
         await this.env.DB.prepare(
           "UPDATE plan_dispatches SET status = 'stalled', stall_reason = ?, updated_at = ? WHERE id = ?",
@@ -3349,8 +3385,10 @@ export class ProjectRoom extends DurableObject<Env> {
 
   /** Why the pump is stuck, composed for a human. Best-effort taxonomy — the counts answer
    *  "what do I click": retry failed runs, approve reviews, answer a parked question. */
-  private async planDispatchStallReason(d: PlanDispatchRow): Promise<string> {
-    const reasons: string[] = [];
+  private async planDispatchStallReason(d: PlanDispatchRow, extra: string[] = []): Promise<string> {
+    // `extra` carries facts only the pump's pass knows (PLNR-240: ready tasks set aside over an
+    // unadvertised workflow) — first, because they name the most actionable click.
+    const reasons: string[] = [...extra];
     const runner = await this.env.DB.prepare('SELECT status FROM runners WHERE id = ?')
       .bind(d.runner_id).first<{ status: string }>();
     if (!runner || runner.status === 'offboarded') reasons.push('the runner is offboarded');
@@ -3429,6 +3467,7 @@ export class ProjectRoom extends DurableObject<Env> {
       gate: row.gate as 'landed' | 'approved',
       status: row.status as PlanDispatchView['status'],
       stallReason: row.stall_reason,
+      workflow: row.workflow,
       tasks: tasks.map((t) => ({ taskId: t.taskId, runId: t.runId, runStatus: t.runStatus })),
       createdBy: row.created_by,
       createdAt: row.created_at,

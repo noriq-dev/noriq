@@ -7,7 +7,7 @@
 // the terminal exit instead (see the note in the Runs header).
 import { UNATTRIBUTED_MODEL_ID } from '@noriq-dev/shared';
 import { useEffect, useMemo, useState } from 'react';
-import { api, type ApiRun, type ApiRunLogSegment, type ApiRunModelMix, type ApiRunner, type DispatchInput, type RunEffort, type RunStatus } from '../api';
+import { advertisedWorkflow, api, type ApiRun, type ApiRunLogSegment, type ApiRunModelMix, type ApiRunner, type DispatchInput, type RunEffort, type RunStatus } from '../api';
 import type { AppStore } from '../store';
 import { Markdown } from './Markdown';
 import { LiveDot, MonoTag, SectionLabel } from './bits';
@@ -582,11 +582,19 @@ function DispatchForm({
   const agentMenu = catalog.find((a) => a.tool === agentTool);
   const modelSuggestions = agentMenu?.models ?? [];
   const effortOptions = agentMenu?.efforts?.length ? agentMenu.efforts : EFFORTS;
-  // The selected repo's custom workflows (RUN-121); the three built-ins are always implicit.
-  const repoWorkflows = repos.find((r) => r.id === repoRef)?.workflows ?? [];
+  // The selected repo's custom workflows (RUN-121/PLNR-240); the three built-ins are always
+  // implicit. Normalized: a bare name (pre-PLNR-240 daemon) has no known base or description.
+  const repoWorkflows = (repos.find((r) => r.id === repoRef)?.workflows ?? []).map(advertisedWorkflow);
 
   // A custom workflow belongs to one repo — drop the choice when the repo changes.
   useEffect(() => { setWorkflow(''); }, [repoRef]);
+  // Selecting a workflow whose base is advertised (PLNR-240) sets `kind` to that posture —
+  // the operator no longer has to know it. A bare-name advertisement changes nothing.
+  const pickWorkflow = (name: string) => {
+    setWorkflow(name);
+    const base = repoWorkflows.find((w) => w.name === name)?.base;
+    if (base && kinds.includes(base)) setKind(base);
+  };
   // Drop an effort the newly-selected tool does not advertise (e.g. xhigh/max after switching to
   // codex), so the field never shows a value the picker no longer offers.
   useEffect(() => {
@@ -622,9 +630,9 @@ function DispatchForm({
       // the daemon prefers it when set and falls back to the triple otherwise. Only sent when a
       // model or effort is actually pinned — a bare-tool coordinate carries nothing the triple lacks.
       agent: model.trim() || effort ? formatCoordinate(agentTool, model.trim() || null, effort) : null,
-      // A custom workflow (RUN-121) overrides only the prompt; `kind` above stays the posture, so
-      // the operator must set kind to the workflow's base. Guarded to the repo's advertised set.
-      workflow: repoWorkflows.includes(workflow) ? workflow : null,
+      // A custom workflow (RUN-121/PLNR-240). Guarded to the repo's advertised set — the server
+      // refuses an unadvertised name outright rather than silently running the built-in.
+      workflow: repoWorkflows.some((w) => w.name === workflow) ? workflow : null,
       budget: { maxUsd: num(maxUsd), maxTokens: num(maxTokens), maxDurationSeconds: maxMinutes.trim() ? (num(maxMinutes) ?? 0) * 60 : null },
     };
     setBusy(true);
@@ -697,15 +705,19 @@ function DispatchForm({
         </Field>
       </div>
 
-      {/* A repo-defined workflow (RUN-121): a named variant of a run kind that swaps in its own
-          prompt. Only shown when the selected repo advertises any — the built-ins need no picker.
-          The daemon keys permissions off `kind`, so this overrides the PROMPT only; the operator
-          sets `kind` to the workflow's base (the registration advertises names, not bases). */}
+      {/* A repo-defined workflow (RUN-121/PLNR-240): a named variant of a run kind. Only shown
+          when the selected repo advertises any — the built-ins need no picker. Picking one whose
+          base is advertised sets `kind` to that posture automatically; a bare-name entry (older
+          daemon) still needs the operator to set kind to its base by hand. */}
       {repoWorkflows.length > 0 && (
-        <Field label="workflow (optional)" hint={`overrides the prompt; runs under the "${kind}" posture — set kind to its base`}>
-          <Select value={workflow} onChange={(e) => setWorkflow(e.target.value)}>
+        <Field label="workflow (optional)" hint={`runs under the "${kind}" posture${workflow && !repoWorkflows.find((w) => w.name === workflow)?.base ? ' — set kind to its base' : ''}`}>
+          <Select value={workflow} onChange={(e) => pickWorkflow(e.target.value)}>
             <option value="">— built-in {kind} —</option>
-            {repoWorkflows.map((w) => <option key={w} value={w}>{w}</option>)}
+            {repoWorkflows.map((w) => (
+              <option key={w.name} value={w.name} title={w.description ?? undefined}>
+                {w.name}{w.base ? ` (${w.base})` : ''}{w.description ? ` — ${w.description.slice(0, 60)}` : ''}
+              </option>
+            ))}
           </Select>
         </Field>
       )}

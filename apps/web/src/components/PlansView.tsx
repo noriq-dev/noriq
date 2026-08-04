@@ -3,7 +3,7 @@
 // expanding a plan reveals task chips per phase.
 import { useEffect, useState } from 'react';
 import { isSettledTaskStatus } from '@noriq-dev/shared';
-import { api, type ApiPlanDispatch, type ApiRunner, type RunEffort } from '../api';
+import { advertisedWorkflow, api, type ApiPlanDispatch, type ApiRunner, type RunEffort } from '../api';
 import type { AppStore } from '../store';
 import { statusMeta } from '../design';
 import { AvatarChip, LiveDot, MonoTag, SectionLabel } from './bits';
@@ -519,6 +519,8 @@ function PlanDispatchStrip({
         </span>
         <MonoTag color="var(--blue)" bg="rgba(76,157,255,.1)" size={9}>{dispatch.agentTool}</MonoTag>
         <MonoTag color="var(--text-mid)" bg="var(--w-05)" size={9}>gate {dispatch.gate}</MonoTag>
+        {/* The dispatch-level workflow default (PLNR-240); per-task overrides still win. */}
+        {dispatch.workflow && <MonoTag color="var(--purple)" bg="rgba(167,139,250,.12)" size={9}>{dispatch.workflow}</MonoTag>}
         <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>
           {counts.running} running · {counts.done} done
           {counts.failed ? ` · ${counts.failed} failed` : ''} · {counts.waiting} waiting
@@ -635,6 +637,13 @@ function PlanDispatchForm({
   const [model, setModel] = useState('');
   const [effort, setEffort] = useState<RunEffort | ''>('');
   const [gate, setGate] = useState<'landed' | 'approved'>('approved');
+  // The dispatch-level workflow default (PLNR-240): every pump-created run selects it unless
+  // the task names its own. Only BUILD-based workflows make sense — the pump mints build runs —
+  // but bare-name advertisements (older daemons) carry no base, so they stay offered.
+  const [workflow, setWorkflow] = useState('');
+  const repoWorkflows = (repos.find((r) => r.id === repoRef)?.workflows ?? [])
+    .map(advertisedWorkflow)
+    .filter((w) => w.base === 'build' || w.base === null);
   const [maxUsd, setMaxUsd] = useState('');
   const [maxTokens, setMaxTokens] = useState('');
   const [maxMinutes, setMaxMinutes] = useState('');
@@ -648,6 +657,8 @@ function PlanDispatchForm({
     setAgentTool(r?.capabilities.tools[0] ?? '');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runnerId]);
+  // A workflow belongs to one repo — drop the choice when the repo changes (PLNR-240).
+  useEffect(() => { setWorkflow(''); }, [repoRef]);
 
   const num = (s: string): number | null => {
     const n = Number(s.trim());
@@ -669,6 +680,8 @@ function PlanDispatchForm({
         model: model.trim() || null,
         effort: effort || null,
         gate,
+        // '' = the built-in build. The server refuses an unadvertised name (PLNR-240).
+        workflow: repoWorkflows.some((w) => w.name === workflow) ? workflow : null,
         // Per-RUN ceilings — each task's agent gets this envelope, not a shared pool.
         budget: { maxUsd: num(maxUsd), maxTokens: num(maxTokens), maxDurationSeconds: maxMinutes.trim() ? (num(maxMinutes) ?? 0) * 60 : null },
       });
@@ -726,6 +739,21 @@ function PlanDispatchForm({
             <option value="landed">landed — start dependents once code lands, review still pending</option>
           </Select>
         </Field>
+        {/* The workflow every pump-created run builds under (PLNR-240) unless a task names its
+            own. Only shown when the repo advertises any; the server refuses an unadvertised
+            name, so a stale menu fails legibly rather than dispatching under the wrong brief. */}
+        {repoWorkflows.length > 0 && (
+          <Field label="workflow (optional)" hint="every task builds under it — a task's own choice wins">
+            <Select value={workflow} onChange={(e) => setWorkflow(e.target.value)}>
+              <option value="">— built-in build —</option>
+              {repoWorkflows.map((w) => (
+                <option key={w.name} value={w.name} title={w.description ?? undefined}>
+                  {w.name}{w.description ? ` — ${w.description.slice(0, 60)}` : ''}
+                </option>
+              ))}
+            </Select>
+          </Field>
+        )}
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
         <Field label="max $ per task" hint="optional">

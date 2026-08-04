@@ -27,6 +27,7 @@ export function Drawer({ store }: { store: AppStore }) {
   const [eMilestone, setEMilestone] = useState('');
   const [eBoard, setEBoard] = useState('');
   const [eDue, setEDue] = useState(''); // yyyy-mm-dd; '' = no deadline (PLNR-126)
+  const [eWorkflow, setEWorkflow] = useState(''); // dispatch-workflow override (PLNR-240); '' = none
   const [timeline, setTimeline] = useState<ApiAgentEvent[]>([]);
   const [addingTag, setAddingTag] = useState(false);
   const [newTag, setNewTag] = useState('');
@@ -127,6 +128,7 @@ export function Drawer({ store }: { store: AppStore }) {
     setEMilestone(task.milestoneId ?? '');
     setEBoard(task.boardId ?? '');
     setEDue(task.dueAt ? task.dueAt.slice(0, 10) : '');
+    setEWorkflow(task.workflow ?? '');
     setEditing(true);
   };
 
@@ -141,6 +143,9 @@ export function Drawer({ store }: { store: AppStore }) {
       dueAt: eDue ? `${eDue}T23:59:59.000Z` : null,
       ...(eBoard ? { boardId: eBoard } : {}),
       ...(ePriority >= 0 ? { priority: ePriority } : {}),
+      // The dispatch-workflow override (PLNR-240): validated at dispatch time, not here — a
+      // repo's advertised set is runner-scoped state the drawer doesn't know.
+      workflow: eWorkflow.trim() || null,
     });
     setEditing(false);
     actions.refreshNow();
@@ -171,6 +176,8 @@ export function Drawer({ store }: { store: AppStore }) {
             <MonoTag color={m.color} bg={m.bg} size={11}>{task.key}</MonoTag>
             <MonoTag color={m.color} bg={m.bg} size={10.5}>{m.label}</MonoTag>
             <MonoTag color={task.type === 'bug' ? 'var(--red-soft)' : 'var(--text-mid)'} bg="var(--w-05)" size={10}>{task.type}</MonoTag>
+            {/* Dispatch-workflow override (PLNR-240) — same purple family as the run's chip. */}
+            {task.workflow && <MonoTag color="var(--purple)" bg="rgba(167,139,250,.12)" size={10}>⚙ {task.workflow}</MonoTag>}
             {milestone && <MonoTag color="var(--text-mid)" bg="var(--w-05)" size={10}>{milestone.title}</MonoTag>}
             {task.dueAt && (() => {
               const overdue = new Date(task.dueAt).getTime() < Date.now() && task.status !== 'done' && task.status !== 'cancelled';
@@ -331,6 +338,17 @@ export function Drawer({ store }: { store: AppStore }) {
                     <option key={t.id} value={t.name} />
                   ))}
                 </datalist>
+              </div>
+              <div style={{ marginTop: 10 }}>
+                {/* PLNR-240: the workflow the plan pump dispatches THIS task under, overriding the
+                    dispatch default. Free text — the valid names are per-repo (see the dispatch
+                    form); an unadvertised name stalls the dispatch legibly rather than running. */}
+                <TextInput
+                  value={eWorkflow}
+                  onChange={(e) => setEWorkflow(e.target.value)}
+                  placeholder="dispatch workflow (optional, e.g. build-codex)"
+                  title="Workflow the plan dispatch pump runs this task under — blank for the dispatch's default"
+                />
               </div>
               <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
                 <Button variant="ghost" onClick={() => setEditing(false)}>cancel</Button>

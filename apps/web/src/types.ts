@@ -85,6 +85,9 @@ export interface TaskVM {
   spinoffRunId: string | null;
   spinoffSourceTaskId: string | null;
   spinoffFinding: string | null;
+  /** Dispatch-workflow override (PLNR-240): the plan pump runs this task under it; null =
+   *  the dispatch's default, then the built-in build. */
+  workflow: string | null;
   comments: CommentVM[]; // populated for the selected task
 }
 

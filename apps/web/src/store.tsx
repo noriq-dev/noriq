@@ -453,6 +453,7 @@ export function useAppStore() {
         spinoffRunId: t.spinoffRunId ?? null,
         spinoffSourceTaskId: t.spinoffSourceTaskId ?? null,
         spinoffFinding: t.spinoffFinding ?? null,
+        workflow: t.workflow ?? null,
         comments: t.id === selectedTaskId ? comments : [],
       };
     });

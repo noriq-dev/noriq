@@ -260,10 +260,20 @@ export interface ApiRunnerRepo {
   boardId: string | null;
   name: string;
   defaultBranch: string | null;
-  /** This repo's custom workflow NAMES (RUN-121) — offered on dispatch alongside the three
-   *  built-ins. Names only; the base + prompt stay the runner's authority (committed manifest). */
-  workflows: string[];
+  /** This repo's custom workflows, offered on dispatch alongside the three built-ins. Two entry
+   *  shapes (PLNR-240): a bare NAME from a pre-PLNR-240 daemon (RUN-121), or {name, base,
+   *  description} — base lets the selector default the run's kind to the workflow's posture.
+   *  Prompt/stages stay the runner's authority (committed manifest). */
+  workflows: Array<string | ApiAdvertisedWorkflow>;
 }
+export interface ApiAdvertisedWorkflow {
+  name: string;
+  base: 'scope' | 'build' | 'verify';
+  description?: string | null;
+}
+/** Normalize an advertised workflow entry (PLNR-240): a bare RUN-121 name has no known base. */
+export const advertisedWorkflow = (w: string | ApiAdvertisedWorkflow): { name: string; base: 'scope' | 'build' | 'verify' | null; description: string | null } =>
+  typeof w === 'string' ? { name: w, base: null, description: null } : { name: w.name, base: w.base, description: w.description ?? null };
 /** One installed driver's coordinate MENU (RUN-115): model ids + efforts for the agent picker.
  *  `models` is a suggestion list, not a whitelist — the dispatch model field stays free-text. */
 export interface ApiAdvertisedAgent {
@@ -381,6 +391,9 @@ export interface ApiPlanDispatch {
    *  answering/approving/retrying re-activates it. */
   status: 'active' | 'stalled' | 'completed' | 'cancelled';
   stallReason: string | null;
+  /** The dispatch-level workflow default (PLNR-240); null = the built-in build. A task's own
+   *  `workflow` overrides it per run. */
+  workflow: string | null;
   /** Every plan task with its latest run from THIS dispatch (null = not dispatched yet). */
   tasks: Array<{ taskId: string; runId: string | null; runStatus: string | null }>;
   createdBy: string;
@@ -397,6 +410,9 @@ export interface PlanDispatchInput {
   /** Applied to every run the dispatch creates (per-run ceilings, not a shared pool). */
   budget?: Partial<ApiRunBudget>;
   gate?: 'landed' | 'approved';
+  /** Workflow every pump-created run selects unless the task names its own (PLNR-240).
+   *  Must be advertised by the chosen repo; the server refuses an unknown name. */
+  workflow?: string | null;
 }
 /** One transcript segment (RUN-74). Consecutive same-voice segments merge in the UI. */
 export interface ApiRunLogSegment {
@@ -580,6 +596,8 @@ export interface ApiSnapshot {
     spinoffRunId?: string | null;
     spinoffSourceTaskId?: string | null;
     spinoffFinding?: string | null;
+    /** Dispatch-workflow override (PLNR-240): the plan pump runs this task under it. */
+    workflow?: string | null;
   }>;
   dependencies: Array<{ taskId: string; dependsOnTaskId: string }>;
   /** Foreign blockers behind cross-project dependency edges (PLNR-241): enough to compute

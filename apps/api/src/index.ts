@@ -16,6 +16,7 @@ import { search, searchBackend, reindexProject, type SearchKind } from './search
 import { answerQuestion, generationClient } from './ask';
 import { verifyUploadToken } from './lib/upload-token';
 import { USER_PROJECT_WHERE, taskWireStatus, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
+import { advertisedWorkflowNames } from './lib/workflows';
 import type { Actor, RunView } from './do/ProjectRoom';
 import { SKILL_MD } from './skill';
 import { DOC_SKILL_MD } from './skill-docs';
@@ -656,7 +657,9 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
               -- Whether there IS a spec, never the spec (RUN-162). Approving a plan approves what
               -- its tasks say, so the board counts the unplanned ones; shipping every spec through
               -- this poll to draw that number would be the whole feature's payload for it.
-              (execution_spec IS NOT NULL) AS specPlanned
+              (execution_spec IS NOT NULL) AS specPlanned,
+              -- The dispatch-workflow override (PLNR-240) — the Plans surface reads and sets it.
+              workflow
        FROM tasks WHERE project_id = ? ORDER BY "order"`,
     ).bind(pid).all(),
     c.env.DB.prepare(
@@ -1902,12 +1905,15 @@ const DispatchBody = z.object({
   // coordinate parser is the validator, and model ids are the vendor's).
   agent: z.string().min(1).max(200).nullish(),
   // A repo-defined workflow name (RUN-121). The daemon resolves it against the repo's committed
-  // manifest (base + prompt); it only overrides the PROMPT, so `kind` above still carries the
-  // posture — the dispatcher must set `kind` to the workflow's base. Free string: the valid set
-  // lives in the manifest, invisible here; an unknown name falls back to the built-in for `kind`.
+  // manifest; `kind` above still carries the posture — the dispatcher sets `kind` to the
+  // workflow's base (the advertised entry names it, PLNR-240). Free string, but VALIDATED at
+  // dispatch against the repo's advertised set: an unknown name is refused legibly here rather
+  // than silently falling back to the built-in — a run built under the wrong posture's prompt
+  // is worse than one that didn't start.
   workflow: z.string().min(1).max(80).nullish(),
   budget: RunBudget.optional(),
 });
+
 
 // Dispatch a brief → a Run on a runner (RUN-7). The dispatch primitive is the
 // *intent*: kind + repo + brief (+ optional task/plan anchor). Creates the Run in
@@ -1924,9 +1930,15 @@ app.post('/api/projects/:pid/runs', userAuth, async (c) => {
   const runner = await c.env.DB.prepare('SELECT repos FROM runners WHERE id = ? AND owner_user_id = ?')
     .bind(b.runnerId, c.var.user!.id).first<{ repos: string }>();
   if (!runner) return c.json({ error: 'runner not found' }, 404);
-  const repo = (JSON.parse(runner.repos) as Array<{ id: string; projectId: string | null }>).find((r) => r.id === b.repoRef);
+  const repo = (JSON.parse(runner.repos) as Array<{ id: string; projectId: string | null; workflows?: Array<string | { name: string }> }>).find((r) => r.id === b.repoRef);
   if (!repo) return c.json({ error: 'unknown repoRef for this runner' }, 400);
   if (repo.projectId !== pid) return c.json({ error: 'repo does not resolve to this project' }, 400);
+
+  // A named workflow must be on the repo's advertised menu (PLNR-240) — refuse legibly, never
+  // silently fall back to the built-in.
+  if (b.workflow && !advertisedWorkflowNames(repo).has(b.workflow)) {
+    return c.json({ error: `workflow "${b.workflow}" is not advertised by this repo — refresh the runner or pick another` }, 400);
+  }
 
   // A verify run must judge a real build in THIS project — otherwise the daemon would
   // branch its worktree from a ref that doesn't exist (or, worse, another tenant's).
@@ -1978,6 +1990,10 @@ const PlanDispatchApiBody = z.object({
   // upstream's run lands (verify passed, code on the plan branch) while review is still
   // pending — faster, but an explicit opt-in to running ahead of sign-off.
   gate: z.enum(['landed', 'approved']).default('approved'),
+  // The dispatch-level workflow DEFAULT (PLNR-240): every run the pump creates runs under it
+  // unless the task names its own. Validated against the repo's advertised set at the door,
+  // same as the single-run dispatch; a task-level name is validated by the pump per task.
+  workflow: z.string().min(1).max(80).nullish(),
 });
 app.post('/api/projects/:pid/plans/:planId/dispatch', userAuth, async (c) => {
   const denied = demoDenied(c);
@@ -1991,13 +2007,17 @@ app.post('/api/projects/:pid/plans/:planId/dispatch', userAuth, async (c) => {
   const runner = await c.env.DB.prepare('SELECT repos FROM runners WHERE id = ? AND owner_user_id = ?')
     .bind(b.runnerId, c.var.user!.id).first<{ repos: string }>();
   if (!runner) return c.json({ error: 'runner not found' }, 404);
-  const repo = (JSON.parse(runner.repos) as Array<{ id: string; projectId: string | null }>).find((r) => r.id === b.repoRef);
+  const repo = (JSON.parse(runner.repos) as Array<{ id: string; projectId: string | null; workflows?: Array<string | { name: string }> }>).find((r) => r.id === b.repoRef);
   if (!repo) return c.json({ error: 'unknown repoRef for this runner' }, 400);
   if (repo.projectId !== pid) return c.json({ error: 'repo does not resolve to this project' }, 400);
+  if (b.workflow && !advertisedWorkflowNames(repo).has(b.workflow)) {
+    return c.json({ error: `workflow "${b.workflow}" is not advertised by this repo — refresh the runner or pick another` }, 400);
+  }
   try {
     const dispatch = await room(c.env, pid).createPlanDispatch(pid, humanActor(c), {
       planId, runnerId: b.runnerId, repoRef: b.repoRef, agentTool: b.agentTool,
       model: b.model ?? null, effort: b.effort ?? null, budget: b.budget, gate: b.gate,
+      workflow: b.workflow ?? null,
     });
     return c.json({ dispatch });
   } catch (e) {
