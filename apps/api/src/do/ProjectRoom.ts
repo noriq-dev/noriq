@@ -2777,19 +2777,27 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM signals WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM messages WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM events WHERE project_id = ?').bind(pid),
+        // Runs and their children go BEFORE plans (PLNR-236): runs.plan_id (0030) and
+        // runs.plan_dispatch_id (0046) are FKs, so deleting plans/plan_dispatches while any
+        // run still points at them aborts the whole batch — which is exactly what happened to
+        // every project that ever had a plan-anchored or pump-dispatched run. Same ordering
+        // rule inside the block: run children first (run_log_segments 0048, runtime_deliveries,
+        // steers), then runs, then the dispatch/landing records, then plans below.
+        // Runners are machines (project_id optional, multi-project) → unpin, not delete;
+        // the daemon's heartbeat keeps its status.
+        this.env.DB.prepare('DELETE FROM run_log_segments WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
+        this.env.DB.prepare('DELETE FROM runtime_deliveries WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
+        this.env.DB.prepare('DELETE FROM steers WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
+        this.env.DB.prepare('DELETE FROM runs WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare('DELETE FROM plan_dispatches WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare('DELETE FROM plan_landings WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare('UPDATE runners SET project_id = NULL WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM phase_gates WHERE phase_id IN (SELECT id FROM phases WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ?))').bind(pid),
         this.env.DB.prepare('DELETE FROM phases WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare('DELETE FROM plan_docs WHERE project_id = ?').bind(pid), // PLNR-200: before plans (FK target)
         this.env.DB.prepare('DELETE FROM plans WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM docs WHERE project_id = ?').bind(pid),
         this.env.DB.prepare("UPDATE agents SET project_id = NULL, status = 'offline' WHERE project_id = ?").bind(pid),
-        // Runs are project-scoped → delete (with any steer-delivery rows keyed to them).
-        // Runners are machines (project_id optional, multi-project) → unpin, not delete;
-        // the daemon's heartbeat keeps its status.
-        this.env.DB.prepare('DELETE FROM runtime_deliveries WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
-        this.env.DB.prepare('DELETE FROM steers WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
-        this.env.DB.prepare('DELETE FROM runs WHERE project_id = ?').bind(pid),
-        this.env.DB.prepare('UPDATE runners SET project_id = NULL WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('UPDATE tasks SET parent_task_id = NULL WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM tasks WHERE project_id = ?').bind(pid),
         // Tags go AFTER tasks (PLNR-108): the legacy tasks.category_id column still holds a

@@ -121,6 +121,51 @@ describe('deletion', () => {
     await env.DB.prepare('DELETE FROM runners WHERE id = ?').bind(runnerId).run();
   });
 
+  it('project delete survives a full execution history: plan runs, dispatches, landings, log segments — PLNR-236', async () => {
+    // The cascade used to FK-abort on any of three counts: run_log_segments / plan_dispatches /
+    // plan_landings were never deleted at all, and plans were deleted BEFORE runs even though
+    // runs.plan_id (0030) and runs.plan_dispatch_id (0046) both reference forward. Build the
+    // full lattice and prove the whole thing goes.
+    const p = (await mcpCall(agent.apiKey, 'create_project', { key: 'DELX', name: 'delx' })).body;
+    const plan = (await mcpCall(agent.apiKey, 'create_plan', {
+      projectId: p.id, title: 'executed plan', phases: [{ title: 'P1', newTasks: [{ title: 'ran' }] }],
+    })).body;
+    const runnerId = `rnr_delx_${crypto.randomUUID().slice(0, 8)}`;
+    const dispatchId = `pld_delx_${crypto.randomUUID().slice(0, 8)}`;
+    const runId = `run_delx_${crypto.randomUUID().slice(0, 8)}`;
+    await env.DB.prepare('INSERT INTO runners (id, project_id, label, status) VALUES (?, ?, ?, ?)')
+      .bind(runnerId, p.id, 'delx-runner', 'online').run();
+    await env.DB.prepare(
+      `INSERT INTO plan_dispatches (id, project_id, plan_id, runner_id, repo_ref, agent_tool, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'repo_x', 'claude', ?, ?, ?)`,
+    ).bind(dispatchId, p.id, plan.id, runnerId, agent.id, new Date().toISOString(), new Date().toISOString()).run();
+    await env.DB.prepare(
+      `INSERT INTO runs (id, project_id, runner_id, kind, repo_ref, agent_tool, status, created_by, plan_id, plan_dispatch_id)
+       VALUES (?, ?, ?, 'build', 'repo_x', 'claude', 'done', ?, ?, ?)`,
+    ).bind(runId, p.id, runnerId, agent.id, plan.id, dispatchId).run();
+    await env.DB.prepare(
+      "INSERT INTO run_log_segments (run_id, seq, role, text, created_at) VALUES (?, 1, 'agent', 'did the thing', ?)",
+    ).bind(runId, new Date().toISOString()).run();
+    await env.DB.prepare(
+      'INSERT INTO plan_landings (plan_id, project_id, completed_at) VALUES (?, ?, ?)',
+    ).bind(plan.id, p.id, new Date().toISOString()).run();
+
+    expect((await del(p.id, '')).status).toBe(200);
+
+    // Nothing referencing a deleted row survives.
+    for (const [table, where, bind] of [
+      ['runs', 'id = ?', runId],
+      ['run_log_segments', 'run_id = ?', runId],
+      ['plan_dispatches', 'id = ?', dispatchId],
+      ['plan_landings', 'plan_id = ?', plan.id],
+      ['plans', 'id = ?', plan.id],
+      ['projects', 'id = ?', p.id],
+    ] as const) {
+      expect(await env.DB.prepare(`SELECT 1 FROM ${table} WHERE ${where}`).bind(bind).first(), table).toBeNull();
+    }
+    await env.DB.prepare('DELETE FROM runners WHERE id = ?').bind(runnerId).run(); // fixture cleanup
+  });
+
   it('plans.status gate: defaults active, accepts proposed, rejects bogus — RUN-4', async () => {
     const p = (await mcpCall(agent.apiKey, 'create_project', { key: 'DELS', name: 'dels' })).body;
     const plan = await mcpCall(agent.apiKey, 'create_plan', {
