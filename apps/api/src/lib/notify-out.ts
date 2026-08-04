@@ -23,8 +23,11 @@ export interface SignalNotification {
 
 /** Only what genuinely blocks progress goes out-of-band — everything else would train
  *  the recipient to ignore the channel. */
-export function needsOutOfBand(type: string, severity: string): boolean {
-  return type === 'input_request' || severity === 'critical';
+export function needsOutOfBand(type: string, severity: string, blocking = true): boolean {
+  // A NON-blocking input_request (PLNR-237) is deliberately not out-of-band: the agent said
+  // "answer when convenient" by choosing not to park, and paging the supervisor for it would
+  // erase the distinction the flag exists to make. Critical alerts page regardless.
+  return (type === 'input_request' && blocking) || severity === 'critical';
 }
 
 /** Email the project owner. Same optional-send design as invites (email.ts). */

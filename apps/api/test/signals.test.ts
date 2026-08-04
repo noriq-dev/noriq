@@ -53,6 +53,59 @@ describe('input requests (decision gates)', () => {
     expect(upd.notices ?? '').toMatch(/Use D1|input request/);
   });
 
+  it('blocking:false asks WITHOUT parking — claim kept, answer lands as a task comment — PLNR-237', async () => {
+    const t = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'soft question' })).body;
+    await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId: t.id });
+
+    const req = await mcpCall(agent.apiKey, 'request_input', {
+      projectId, taskId: t.id, title: 'Name preference?', body: 'either works', blocking: false,
+    });
+    expect(req.isError).toBe(false);
+    expect(req.body.parked).toBe(false);
+    expect(req.body.blocking).toBe(false);
+
+    // Nothing parked: the task keeps its status AND its claim; the signal is open like any other.
+    let snap = await snapshot();
+    expect(snap.tasks.find((x) => x.id === t.id)!.status).toBe('in_progress');
+    const sig = snap.signals.find((s) => s.title === 'Name preference?');
+    expect(sig).toBeDefined();
+    expect((sig as { blocking?: number }).blocking).toBe(0);
+
+    // Answering restatuses nothing — the agent never stopped. With no live run to steer,
+    // the answer lands as an already-addressed comment on the task.
+    const ans = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/signals/${sig!.id}/answer`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ response: 'call it Fred' }),
+    });
+    expect(ans.status).toBe(200);
+    snap = await snapshot();
+    expect(snap.tasks.find((x) => x.id === t.id)!.status).toBe('in_progress'); // untouched
+    expect(snap.signals.find((s) => s.id === sig!.id)).toBeUndefined(); // answered, no longer open
+
+    const detail = await mcpCall(agent.apiKey, 'get_task', { taskId: t.id });
+    const note = (detail.body.comments as Array<{ body: string; status: string }>).find((c) => c.body.includes('call it Fred'));
+    expect(note).toBeDefined();
+    expect(note!.status).toBe('addressed'); // an answer, never a gate on `done`
+  });
+
+  it('an open non-blocking gate does not hold a parked task hostage — PLNR-237', async () => {
+    const t = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'two gates' })).body;
+    await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId: t.id });
+    // A soft question first, then a hard gate that parks the task.
+    await mcpCall(agent.apiKey, 'request_input', { projectId, taskId: t.id, title: 'soft aside', blocking: false });
+    await mcpCall(agent.apiKey, 'request_input', { projectId, taskId: t.id, title: 'hard stop' });
+    let snap = await snapshot();
+    expect(snap.tasks.find((x) => x.id === t.id)!.status).toBe('blocked');
+    const hard = snap.signals.find((s) => s.title === 'hard stop')!;
+    // Answering the HARD gate returns the task to the queue even though the soft one is
+    // still open — a question that parked nothing gates nothing.
+    await SELF.fetch(`https://noriq.test/api/projects/${projectId}/signals/${hard.id}/answer`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ response: 'proceed' }),
+    });
+    snap = await snapshot();
+    expect(snap.tasks.find((x) => x.id === t.id)!.status).toBe('todo');
+    expect(snap.signals.find((s) => s.title === 'soft aside')).toBeDefined(); // still open, still answerable
+  });
+
   it('blocks done while an input request is open', async () => {
     const t = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'gated finish' })).body;
     // Raise the request before claiming, so the task isn't auto-parked and stays claimable.

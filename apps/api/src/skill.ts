@@ -156,6 +156,12 @@ genuinely raises a new question, thread the next round with \`followUpTo\` (the 
 gate id) — the human sees the earlier Q&A as context and the same task parks again.
 Rounds are for real follow-ups, not for drip-feeding questions you could have batched.
 
+The pause is **your choice**: pass \`blocking: false\` when you want a human's answer
+but can keep working meanwhile — nothing parks, you keep your claim, and the answer
+reaches you mid-session (or as a comment on the task if your session ended first).
+The default stays blocking — "I cannot proceed" — and is the right call whenever the
+answer changes what you would build next.
+
 Working a **run** and found real work that is not your task's? \`spin_off_task\` it:
 the finding becomes its own **proposed** task — visible on the board but unclaimable
 and undispatchable until a human accepts it (accept → todo) or rejects it (→

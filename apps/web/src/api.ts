@@ -631,7 +631,9 @@ export interface ApiSnapshot {
     id: string; taskId: string | null; taskKey: string | null; agentId: string | null; agentName: string;
     type: 'input_request' | 'alert'; severity: 'info' | 'warning' | 'critical';
     title: string; body: string | null; options: string[] | null;
-    questions: ApiSignalQuestion[] | null; followUpTo: string | null; createdAt: string;
+    questions: ApiSignalQuestion[] | null; followUpTo: string | null;
+    /** 0 = a non-blocking question (PLNR-237): nothing parked; answer at leisure. */
+    blocking?: number; createdAt: string;
   }>;
 }
 

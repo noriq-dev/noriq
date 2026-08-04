@@ -701,7 +701,8 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
     c.env.DB.prepare('SELECT tt.task_id AS taskId, tt.tag_id AS tagId FROM task_tags tt JOIN tasks t ON t.id = tt.task_id WHERE t.project_id = ?').bind(pid).all(),
     c.env.DB.prepare(
       `SELECT s.id, s.task_id AS taskId, t.key AS taskKey, s.agent_id AS agentId, s.agent_name AS agentName,
-              s.type, s.severity, s.title, s.body, s.options, s.questions, s.follow_up_to AS followUpTo, s.created_at AS createdAt
+              s.type, s.severity, s.title, s.body, s.options, s.questions, s.follow_up_to AS followUpTo,
+              s.blocking, s.created_at AS createdAt
        FROM signals s LEFT JOIN tasks t ON t.id = s.task_id
        WHERE s.project_id = ? AND s.status = 'open' ORDER BY
          CASE s.type WHEN 'input_request' THEN 0 ELSE 1 END,

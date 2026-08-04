@@ -1738,10 +1738,17 @@ export class ProjectRoom extends DurableObject<Env> {
        *  input_request in this project; the new gate inherits its task when taskId
        *  is not given, so round two parks the same task round one did. */
       followUpTo?: string | null;
+      /** PLNR-237: the pause is the AGENT'S choice. false = the question opens (visible,
+       *  answerable exactly like today) but nothing parks — task and run keep going, and the
+       *  answer reaches the still-live session over the steer channel (or lands as a task
+       *  comment if the run has since ended). Default true: the RUN-30 park contract,
+       *  unchanged for every existing caller. Only meaningful on input_request. */
+      blocking?: boolean;
     },
   )  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
+      const blocking = input.blocking !== false;
       let parent: { id: string; taskId: string | null } | null = null;
       if (input.type === 'input_request' && input.followUpTo) {
         parent = await this.env.DB.prepare(
@@ -1753,21 +1760,22 @@ export class ProjectRoom extends DurableObject<Env> {
       const id = newId('sig');
       const severity = input.type === 'input_request' ? 'info' : (input.severity ?? 'info');
       await this.env.DB.prepare(
-        `INSERT INTO signals (id, project_id, task_id, agent_id, agent_name, type, severity, title, body, options, questions, follow_up_to, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)`,
+        `INSERT INTO signals (id, project_id, task_id, agent_id, agent_name, type, severity, title, body, options, questions, follow_up_to, blocking, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)`,
       ).bind(
         id, this.projectId, task?.id ?? null, actor.kind === 'agent' ? actor.id : null, actor.name,
         input.type, severity, input.title, input.body ?? null,
         input.options && input.options.length ? JSON.stringify(input.options) : null,
         input.questions && input.questions.length ? JSON.stringify(input.questions) : null,
-        parent?.id ?? null, nowIso(),
+        parent?.id ?? null, blocking ? 1 : 0, nowIso(),
       ).run();
 
       let parked = false;
       // Auto-park a held task behind an input gate: release the claim, mark it blocked.
       // Only the holder (or a human) may park it (PLNR-116): parking another agent's
       // in-flight task would strip its claim — a steal dressed up as a question.
-      if (input.type === 'input_request' && task && task.claimed_by) {
+      // A non-blocking gate (PLNR-237) parks NOTHING — that is its entire meaning.
+      if (blocking && input.type === 'input_request' && task && task.claimed_by) {
         if (actor.kind !== 'human' && task.claimed_by !== actor.id) {
           throw new Error(`${task.key} is held by another agent — you can't park a claim you don't own`);
         }
@@ -1779,11 +1787,12 @@ export class ProjectRoom extends DurableObject<Env> {
       }
       await this.emit(actor, 'signal.raised', task ? 'task' : 'project', task?.id ?? this.projectId, {
         signalId: id, sigType: input.type, severity, title: input.title, taskKey: task?.key ?? null, parked,
+        ...(blocking ? {} : { blocking: false }),
       });
       // Out-of-band delivery (PLNR-120): a blocking decision or a critical alert must
       // reach the supervisor even with no tab open. Best-effort — a notification
-      // failure never fails the signal.
-      if (needsOutOfBand(input.type, severity)) {
+      // failure never fails the signal. A non-blocking question waits politely (PLNR-237).
+      if (needsOutOfBand(input.type, severity, blocking)) {
         const owner = await this.env.DB.prepare(
           'SELECT u.email, p.key AS projectKey FROM projects p LEFT JOIN users u ON u.id = p.owner_user_id WHERE p.id = ?',
         ).bind(this.projectId).first<{ email: string | null; projectKey: string }>();
@@ -1800,8 +1809,9 @@ export class ProjectRoom extends DurableObject<Env> {
       // Mirror to the Run (RUN-18): if this input_request comes from a spawned agent
       // driving a running Run, park the Run → blocked so the dashboard shows "waiting
       // on you", not a hung run. (Raw UPDATE, not transitionRun, to avoid nesting
-      // blockConcurrencyWhile; running→blocked is a legal transition.)
-      if (input.type === 'input_request' && actor.kind === 'agent') {
+      // blockConcurrencyWhile; running→blocked is a legal transition.) A non-blocking
+      // question leaves the run running — the daemon must not end the session (PLNR-237).
+      if (blocking && input.type === 'input_request' && actor.kind === 'agent') {
         const { results } = await this.env.DB.prepare(
           "SELECT id FROM runs WHERE project_id = ? AND agent_id = ? AND status = 'running'",
         ).bind(this.projectId, actor.id).all<{ id: string }>();
@@ -1810,7 +1820,7 @@ export class ProjectRoom extends DurableObject<Env> {
           await this.emit(actor, 'run.status_changed', 'run', r.id, { from: 'running', to: 'blocked', reason: 'request_input' });
         }
       }
-      return { id, type: input.type, taskKey: task?.key ?? null, parked };
+      return { id, type: input.type, taskKey: task?.key ?? null, parked, blocking };
 
     });
   }
@@ -1828,9 +1838,9 @@ export class ProjectRoom extends DurableObject<Env> {
       const sig = await this.env.DB.prepare(
         // `body` is here for the resume frame (RUN-30): the agent gets its own question back
         // alongside the answer, because a session resumed after a night away should not have to
-        // infer what it asked from a bare reply.
-        'SELECT id, task_id AS taskId, agent_id AS agentId, type, status, title, body FROM signals WHERE id = ? AND project_id = ?',
-      ).bind(signalId, this.projectId).first<{ id: string; taskId: string | null; agentId: string | null; type: string; status: string; title: string; body: string | null }>();
+        // infer what it asked from a bare reply. `blocking` (PLNR-237) picks the delivery path.
+        'SELECT id, task_id AS taskId, agent_id AS agentId, type, status, title, body, blocking FROM signals WHERE id = ? AND project_id = ?',
+      ).bind(signalId, this.projectId).first<{ id: string; taskId: string | null; agentId: string | null; type: string; status: string; title: string; body: string | null; blocking: number }>();
       if (!sig) throw new Error('signal not found');
       if (sig.status !== 'open') return { ok: true, alreadyResolved: true };
       if (!response && answers?.length) {
@@ -1844,12 +1854,16 @@ export class ProjectRoom extends DurableObject<Env> {
       if (sig.type === 'input_request' && sig.taskId) {
         const task = await this.getTask(sig.taskId);
         taskKey = task.key;
-        // Only unblock once EVERY gate is answered (PLNR-116): a task can carry more than one
-        // open input_request (e.g. a batched follow-up round), and returning it to the queue
-        // while another decision is still pending would let it be re-claimed mid-question.
-        if (task.status === 'blocked') {
+        // Unpark only for BLOCKING gates (PLNR-237): a non-blocking one never parked the
+        // task, so its answer must not restatus it — if the task reads blocked, something
+        // else parked it and that something owns the unpark. And only once EVERY blocking
+        // gate is answered (PLNR-116): a task can carry more than one open input_request
+        // (e.g. a batched follow-up round), and returning it to the queue while another
+        // decision is still pending would let it be re-claimed mid-question. Open
+        // NON-blocking gates deliberately don't hold it back — they never parked anything.
+        if (sig.blocking && task.status === 'blocked') {
           const stillOpen = await this.env.DB.prepare(
-            "SELECT 1 FROM signals WHERE task_id = ? AND type = 'input_request' AND status = 'open' AND id != ? LIMIT 1",
+            "SELECT 1 FROM signals WHERE task_id = ? AND type = 'input_request' AND status = 'open' AND blocking = 1 AND id != ? LIMIT 1",
           ).bind(sig.taskId, signalId).first();
           if (!stillOpen) {
             await this.env.DB.prepare("UPDATE tasks SET status = 'todo', updated_at = ? WHERE id = ?").bind(nowIso(), sig.taskId).run();
@@ -1864,7 +1878,7 @@ export class ProjectRoom extends DurableObject<Env> {
       // process holding a slot that long is a slot nobody else can use), so the row going back to
       // 'running' is not enough on its own: something has to tell the machine to bring the agent
       // back, and hand it the answer.
-      if (sig.type === 'input_request' && sig.agentId) {
+      if (sig.type === 'input_request' && sig.agentId && sig.blocking) {
         const { results } = await this.env.DB.prepare(
           `SELECT id, runner_id AS runnerId FROM runs
             WHERE project_id = ? AND agent_id = ? AND status = 'blocked'`,
@@ -1889,6 +1903,52 @@ export class ProjectRoom extends DurableObject<Env> {
           } catch {
             /* socket gone — the signal is answered on the row, and reconnect will ask */
           }
+        }
+      }
+      // A NON-blocking gate's answer (PLNR-237) has nothing to resume — the session never
+      // parked. Two delivery paths, tried in order: a still-LIVE run gets it as a steer (the
+      // same channel a human's mid-run nudge already rides, so the daemon injects it into the
+      // live session — RUN-191 is the runner half); when no live session took it, it lands as
+      // an already-addressed comment on the anchor task, where the next sitting reads it.
+      // Copilot requesters need neither: signal.answered reaches them on the notices surface.
+      if (sig.type === 'input_request' && sig.agentId && !sig.blocking) {
+        const { results } = await this.env.DB.prepare(
+          `SELECT id, runner_id AS runnerId FROM runs
+            WHERE project_id = ? AND agent_id = ? AND status = 'running'`,
+        ).bind(this.projectId, sig.agentId).all<{ id: string; runnerId: string | null }>();
+        let delivered = false;
+        for (const r of results) {
+          if (!r.runnerId) continue;
+          const steerId = newId('str');
+          // The signal id as source_id: the same dedup contract steers already keep with
+          // comments/messages — the daemon's ack marks it delivered-via-runtime.
+          await this.env.DB.prepare(
+            "INSERT INTO steers (id, run_id, agent_id, source_id, mode) VALUES (?, ?, ?, ?, 'soft')",
+          ).bind(steerId, r.id, sig.agentId, sig.id).run();
+          try {
+            const res = await this.env.RUNNER_HUB.get(this.env.RUNNER_HUB.idFromName(r.runnerId)).deliver(
+              JSON.stringify({
+                type: 'steer', runId: r.id, steerId, mode: 'soft',
+                body: `Your question "${sig.title}" was answered:\n${response}`,
+                sourceCommentId: null, sourceMessageId: null, noticeCursor: null,
+                issuedAt: nowIso(),
+              }),
+            );
+            delivered = delivered || res?.delivered === true;
+          } catch { /* socket gone — the comment below carries it */ }
+        }
+        if (!delivered && sig.taskId) {
+          // Recorded already-addressed, like a release note: it is an ANSWER, not a question,
+          // and must never block a later `done` waiting on its own resolution.
+          const commentId = newId('cmt');
+          const note = `Answer to "${sig.title}":\n\n${response}`;
+          await this.env.DB.prepare(
+            `INSERT INTO comments (id, task_id, author_kind, author_id, kind, body, status, created_at)
+             VALUES (?, ?, ?, ?, 'comment', ?, 'addressed', ?)`,
+          ).bind(commentId, sig.taskId, actor.kind, actor.id, note, nowIso()).run();
+          await this.emit(actor, 'comment.posted', 'comment', commentId, {
+            taskId: sig.taskId, taskKey, kind: 'comment', body: note.slice(0, 140), holder: null,
+          });
         }
       }
       await this.emit(actor, 'signal.answered', sig.taskId ? 'task' : 'project', sig.taskId ?? this.projectId, {
