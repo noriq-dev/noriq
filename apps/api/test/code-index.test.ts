@@ -41,16 +41,39 @@ function fakeStore() {
   return { store, vectors };
 }
 
+interface StagedNodeRow { kind: 'node'; uri: string; type: string; label: string; content?: string | null }
+
 interface MemRpc {
-  activateCodeGeneration(
-    pid: string,
-    input: { repositoryKey: string; generationId: string; branch: string; baseId: string; entities?: CodeEntity[]; deletedUris?: string[] },
-  ): Promise<{ activated: string; superseded: string[] }>;
+  beginIndexIngest(pid: string, manifest: {
+    generationId: string; projectId: string; repositoryKey: string; branch: string; baseId: string;
+    indexerVersion: string; batchCount: number; fileCount: number; contentHash: string; deletions: string[]; createdAt: string;
+  }): Promise<{ ok: true }>;
+  ingestIndexBatch(pid: string, batch: { generationId: string; batchNumber: number; batchHash: string }, rows: StagedNodeRow[]): Promise<{ ok: true; deduped: boolean }>;
+  completeIndexIngest(pid: string, generationId: string): Promise<{ ok: true; batchesReceived: number; validation: { ok: boolean; problems: string[] } }>;
+  activateIndexGeneration(pid: string, generationId: string): Promise<{ activated: string; superseded: string[] }>;
   pruneSupersededGenerations(pid: string, maxAgeMs: number): Promise<number>;
   _seedSupersededIndexGenerationForTest(pid: string, repositoryKey: string, activatedAt: string): Promise<string>;
   _getIndexGenerationStatusForTest(pid: string, generationId: string): Promise<string | null>;
 }
 const memory = (pid: string) => appEnv.PROJECT_MEMORY.get(appEnv.PROJECT_MEMORY.idFromName(pid)) as unknown as MemRpc;
+
+/** Drive one file-only generation through the whole PLNR-261 stage/validate/promote sequence in
+ *  a single batch — the shape every activateIndexGeneration test below needs. */
+async function stageAndActivate(
+  projectId: string,
+  opts: { generationId: string; repositoryKey: string; branch: string; baseId: string; entities: StagedNodeRow[]; deletions?: string[] },
+) {
+  const m = memory(projectId);
+  await m.beginIndexIngest(projectId, {
+    generationId: opts.generationId, projectId, repositoryKey: opts.repositoryKey, branch: opts.branch, baseId: opts.baseId,
+    indexerVersion: 'test', batchCount: 1, fileCount: opts.entities.filter((e) => e.type === 'file').length,
+    contentHash: 'sha256:test', deletions: opts.deletions ?? [], createdAt: new Date().toISOString(),
+  });
+  await m.ingestIndexBatch(projectId, { generationId: opts.generationId, batchNumber: 0, batchHash: 'unused-in-fake-test-path' }, opts.entities);
+  const completed = await m.completeIndexIngest(projectId, opts.generationId);
+  if (!completed.validation.ok) throw new Error(`validation failed: ${completed.validation.problems.join('; ')}`);
+  return m.activateIndexGeneration(projectId, opts.generationId);
+}
 
 async function newOwnedProject(email: string, key: string) {
   const user = await createUser(email, 'Owner', 'longenough1');
@@ -159,20 +182,20 @@ describe('rebuildCodeIndex — resumable and idempotent, mirroring reindexProjec
   });
 });
 
-describe('activateCodeGeneration — real index_generations status transitions', () => {
+describe('activateIndexGeneration — real index_generations status transitions (PLNR-261 stage/validate/promote)', () => {
   it('supersedes the previously-active generation for the same repository and activates the new one', async () => {
     const { projectId } = await newOwnedProject('code-idx-1@example.com', 'CIDX1');
-    const first = await memory(projectId).activateCodeGeneration(projectId, {
-      repositoryKey: 'repo-a', generationId: 'gen_first', branch: 'main', baseId: 'sha_1',
-      entities: [{ uri: 'noriq://file/CIDX1/repo-a/a.ts', projectId, repositoryKey: 'repo-a', generationId: 'gen_first', type: 'file', label: 'a.ts' }],
+    const first = await stageAndActivate(projectId, {
+      generationId: 'gen_first', repositoryKey: 'repo-a', branch: 'main', baseId: 'sha_1',
+      entities: [{ kind: 'node', uri: 'noriq://file/CIDX1/repo-a/a.ts', type: 'file', label: 'a.ts' }],
     });
     expect(first).toEqual({ activated: 'gen_first', superseded: [] });
     expect(await memory(projectId)._getIndexGenerationStatusForTest(projectId, 'gen_first')).toBe('active');
 
-    const second = await memory(projectId).activateCodeGeneration(projectId, {
-      repositoryKey: 'repo-a', generationId: 'gen_second', branch: 'main', baseId: 'sha_2',
-      entities: [{ uri: 'noriq://file/CIDX1/repo-a/a.ts', projectId, repositoryKey: 'repo-a', generationId: 'gen_second', type: 'file', label: 'a.ts (unchanged)' }],
-      deletedUris: ['noriq://file/CIDX1/repo-a/removed.ts'],
+    const second = await stageAndActivate(projectId, {
+      generationId: 'gen_second', repositoryKey: 'repo-a', branch: 'main', baseId: 'sha_2',
+      entities: [{ kind: 'node', uri: 'noriq://file/CIDX1/repo-a/a.ts', type: 'file', label: 'a.ts (unchanged)' }],
+      deletions: ['removed.ts'],
     });
     expect(second).toEqual({ activated: 'gen_second', superseded: ['gen_first'] });
     expect(await memory(projectId)._getIndexGenerationStatusForTest(projectId, 'gen_first')).toBe('superseded');
@@ -183,7 +206,7 @@ describe('activateCodeGeneration — real index_generations status transitions',
     const { projectId } = await newOwnedProject('code-idx-2@example.com', 'CIDX2');
     // No AI/CODE_VECTORIZE bound in the workerd test env — this must not throw.
     await expect(
-      memory(projectId).activateCodeGeneration(projectId, { repositoryKey: 'repo-b', generationId: 'gen_x', branch: 'main', baseId: 'sha_1' }),
+      stageAndActivate(projectId, { generationId: 'gen_x', repositoryKey: 'repo-b', branch: 'main', baseId: 'sha_1', entities: [] }),
     ).resolves.toEqual({ activated: 'gen_x', superseded: [] });
   });
 });

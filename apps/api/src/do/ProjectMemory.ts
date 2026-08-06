@@ -9,13 +9,13 @@ import { deleteAllProjectBackups, sizeStatus, type EraseReport, type EraseStepRe
 import { MEMORY_MIGRATIONS } from '../memory/migrations';
 import { validateMemoryScope, validateEvidenceRef, memoryContentHash, evidenceHash, clampAuthority, type MemoryScope } from '../memory/writes';
 import { searchBackend, indexEntity, removeEntity } from '../search';
-import { codeSearchBackend, indexCodeEntity, removeCodeEntity, type CodeEntity } from '../memory/code-index';
+import { codeSearchBackend, indexCodeEntity, removeCodeEntity, type CodeEntityType } from '../memory/code-index';
 import {
-  beginIngestGeneration, applyIngestBatch, completeIngestGeneration, abortIngestGeneration, type IngestGenerationState,
+  parseStagedRow,
   beginIngestEpisode, applyIngestEpisodeBatch, completeIngestEpisode, abortIngestEpisode, type IngestEpisodeState,
   type EpisodeUploadManifest,
 } from '../memory/ingest';
-import type { IndexGenerationManifest, IndexBatch } from '@noriq-dev/shared';
+import { IndexGenerationManifest, type IndexBatch } from '@noriq-dev/shared';
 import {
   applyMemoryFilters, rankCandidates, RETRIEVAL_DEFAULTS,
   type RetrievalHit, type RetrievalStage, type RankedHit,
@@ -70,6 +70,12 @@ export interface ProjectMemoryHealth {
 export const SCHEMA_TABLES = [
   'repositories',
   'index_generations',
+  // PLNR-261's staged-generation tables: children of index_generations by convention (no real
+  // FK — see the migration's comment), so they must come right after it here too, both for
+  // backup/restore's generic parent-first/child-first ordering and for erase()'s reverse pass.
+  'index_batches',
+  'index_staged_entities',
+  'index_staged_edges',
   'nodes',
   'edges',
   'memory_items',
@@ -508,6 +514,14 @@ export class ProjectMemory extends DurableObject<Env> {
       .toArray();
     if (abandoned.length === 0) return 0;
     this.ctx.storage.transactionSync(() => {
+      // PLNR-261's staged children carry no real FK to index_generations(id) (see the
+      // migration's comment) — delete them explicitly, child-before-parent, rather than relying
+      // on a cascade DO SQLite doesn't provide.
+      for (const { id } of abandoned) {
+        this.ctx.storage.sql.exec(`DELETE FROM index_staged_edges WHERE generation_id = ?1`, id);
+        this.ctx.storage.sql.exec(`DELETE FROM index_staged_entities WHERE generation_id = ?1`, id);
+        this.ctx.storage.sql.exec(`DELETE FROM index_batches WHERE generation_id = ?1`, id);
+      }
       this.ctx.storage.sql.exec(`DELETE FROM index_generations WHERE status = 'staged' AND created_at < ?1`, cutoff);
     });
     return abandoned.length;
@@ -563,69 +577,11 @@ export class ProjectMemory extends DurableObject<Env> {
   // exactly like every other write RPC's fire-and-forget indexing here.
   // ---------------------------------------------------------------------------
 
-  /**
-   * Activate a code-index generation for one repository: mark any currently-active generation
-   * for it 'superseded' and this one 'active' (reusing `index_generations`, inserting it if it
-   * doesn't already exist as a staged row), then best-effort publish `entities` and retire
-   * `deletedUris`. Vector id = each entity's stable URI (generation-free, §18), so a surviving
-   * entity re-indexed under the new generationId is a plain upsert at the SAME id — the only
-   * real "superseded vector" case is an entity the new generation's manifest reports as
-   * deleted, which is exactly what `deletedUris` is for.
-   */
-  async activateCodeGeneration(
-    projectId: string,
-    input: {
-      repositoryKey: string;
-      generationId: string;
-      branch: string;
-      baseId: string;
-      indexerVersion?: string;
-      contentHash?: string;
-      entities?: CodeEntity[];
-      deletedUris?: string[];
-    },
-  ): Promise<{ activated: string; superseded: string[] }> {
-    await this.assertProjectId(projectId);
-    const now = nowIso();
-    const superseded = this.ctx.storage.sql
-      .exec<{ id: string }>(`SELECT id FROM index_generations WHERE repository_key = ?1 AND status = 'active'`, input.repositoryKey)
-      .toArray()
-      .map((r) => r.id);
-    this.ctx.storage.transactionSync(() => {
-      this.ctx.storage.sql.exec(
-        `INSERT INTO repositories (repository_key, created_at) VALUES (?1, ?2) ON CONFLICT (repository_key) DO NOTHING`,
-        input.repositoryKey,
-        now,
-      );
-      for (const id of superseded) {
-        this.ctx.storage.sql.exec(`UPDATE index_generations SET status = 'superseded' WHERE id = ?1`, id);
-      }
-      this.ctx.storage.sql.exec(
-        `INSERT INTO index_generations (id, repository_key, branch, base_id, indexer_version, batch_count, file_count, content_hash, status, created_at, activated_at)
-         VALUES (?1,?2,?3,?4,?5,0,?6,?7,'active',?8,?8)
-         ON CONFLICT (id) DO UPDATE SET status = 'active', branch = excluded.branch, base_id = excluded.base_id, activated_at = excluded.activated_at`,
-        input.generationId,
-        input.repositoryKey,
-        input.branch,
-        input.baseId,
-        input.indexerVersion ?? 'unknown',
-        input.entities?.length ?? 0,
-        input.contentHash ?? 'unknown',
-        now,
-      );
-    });
-
-    const backend = codeSearchBackend(this.env);
-    if (backend) {
-      for (const e of input.entities ?? []) {
-        void indexCodeEntity(backend, e).catch((err) => console.warn(`ProjectMemory code-index for ${e.uri} failed: ${String(err)}`));
-      }
-      for (const uri of input.deletedUris ?? []) {
-        void removeCodeEntity(backend, uri).catch((err) => console.warn(`ProjectMemory code-deindex for ${uri} failed: ${String(err)}`));
-      }
-    }
-    return { activated: input.generationId, superseded };
-  }
+  // `activateCodeGeneration` (PLNR-256) used to live here: it inserted a generation DIRECTLY as
+  // 'active' given caller-supplied entities, with no staging and no validation. PLNR-261
+  // REFACTORED it into the stage (beginIndexIngest/ingestIndexBatch) -> validate
+  // (completeIndexIngest) -> promote (activateIndexGeneration, below) sequence — the same RPC
+  // surface, not a parallel one, now reading staged rows instead of trusting a direct parameter.
 
   /**
    * Bookkeeping GC for 'superseded' `index_generations` rows past their retention window —
@@ -653,53 +609,282 @@ export class ProjectMemory extends DurableObject<Env> {
   }
 
   // ---------------------------------------------------------------------------
-  // Repository-index + episode ingest (PLNR-260) — TRANSPORT only. State here is deliberately
-  // in-memory (never ctx.storage): staged-generation semantics — real entity counts, content
-  // hashes, graph-reference validation, and atomic activation — are PLNR-261's, which replaces
-  // this bridge with durable staging tables without changing memory/ingest.ts's pure functions.
-  // Losing this state to a DO eviction mid-upload is equivalent to an abandoned upload — the
-  // Runner's own upload journal (RUN-221) is what makes that resumable, not durability here.
+  // Repository-index ingest — staged generations and atomic activation (PLNR-260/261).
+  //
+  // Unlike episode ingest below (still an in-memory bridge — PLNR-263 owns real episode
+  // semantics), index-generation state is REAL and durable: `index_generations` (already existed,
+  // PLNR-256) gains three children — index_batches, index_staged_entities, index_staged_edges —
+  // and three additive columns (deletions, sealed_at, validation_problems). A generation's
+  // manifest fields (batch_count/file_count/indexer_version/content_hash) are written ONCE, at
+  // beginIndexIngest, from the REAL manifest — replacing the old activateCodeGeneration's
+  // placeholders (0/entities.length/'unknown') that this refactor retires.
+  //
+  // Lifecycle: begin (insert 'staged', idempotent resume) -> batch* (idempotent per
+  // (generationId, batchNumber), rejected once sealed) -> complete (seals; runs structural +
+  // referential validation, recording `validation_problems`) -> activate (the ONLY promotion
+  // path — refuses an unsealed or invalid generation; re-checks the current active generation
+  // for this repository INSIDE the one transactionSync, so two concurrent activations cannot
+  // both supersede the same prior row — reinforced by idx_index_generations_one_active, a
+  // partial unique index making the invariant a real constraint, not just a code discipline).
+  // Vector publish (best-effort, outside the transaction — a Vectorize upsert cannot join a
+  // SQLite transaction, PLNR-256) is the only side effect of activation; PLNR-262 owns
+  // projecting staged rows into `nodes`/`edges`.
   // ---------------------------------------------------------------------------
-  private ingestGenerations = new Map<string, IngestGenerationState>();
   private ingestEpisodes = new Map<string, IngestEpisodeState>();
+
+  private getIndexGenerationRow(generationId: string) {
+    return this.ctx.storage.sql
+      .exec<{
+        repository_key: string; branch: string; base_id: string; status: string;
+        batch_count: number; file_count: number; sealed_at: string | null; validation_problems: string | null; deletions: string;
+      }>(
+        `SELECT repository_key, branch, base_id, status, batch_count, file_count, sealed_at, validation_problems, deletions
+         FROM index_generations WHERE id = ?1`,
+        generationId,
+      )
+      .toArray()[0];
+  }
+
+  /** Anti-join over the STAGED tables (mirrors the restore path's stagingIntegrityProblems in
+   *  spirit, over a different pair of tables): a staged edge whose from/to uri is absent from
+   *  this SAME generation's staged entities fails validation before anything activates. */
+  private indexStagingIntegrityProblems(generationId: string): string[] {
+    const dangling = this.ctx.storage.sql
+      .exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM index_staged_edges e
+         WHERE e.generation_id = ?1
+           AND (NOT EXISTS (SELECT 1 FROM index_staged_entities n WHERE n.generation_id = ?1 AND n.uri = e.from_uri)
+             OR NOT EXISTS (SELECT 1 FROM index_staged_entities n2 WHERE n2.generation_id = ?1 AND n2.uri = e.to_uri))`,
+        generationId,
+      )
+      .toArray()[0]?.n ?? 0;
+    return dangling > 0 ? [`${dangling} staged edge(s) reference a missing staged node`] : [];
+  }
+
+  /** Resolve a project's committed KEY from its projectId — a plain D1 read (env.DB is a normal
+   *  binding; this isn't a coordination mutation, so it does not need to go through ProjectRoom).
+   *  Needed because buildEntityUri's repository-scoped kinds take the project KEY, never the id
+   *  (a projectId-shaped URI would parse, store, and never match anything real). */
+  private async resolveProjectKey(projectId: string): Promise<string> {
+    const row = await this.env.DB.prepare('SELECT key FROM projects WHERE id = ?').bind(projectId).first<{ key: string }>();
+    if (!row) throw new Error(`project ${projectId} not found`);
+    return row.key;
+  }
 
   async beginIndexIngest(projectId: string, manifest: IndexGenerationManifest): Promise<{ ok: true }> {
     await this.assertProjectId(projectId);
-    this.ingestGenerations.set(manifest.generationId, beginIngestGeneration(this.ingestGenerations.get(manifest.generationId), manifest));
+    IndexGenerationManifest.parse(manifest);
+    const existing = this.getIndexGenerationRow(manifest.generationId);
+    if (existing && (existing.status !== 'staged' || existing.sealed_at)) {
+      throw new Error(`generation ${manifest.generationId} already ${existing.sealed_at ? 'completed' : existing.status} — this purpose cannot be reopened`);
+    }
+    const now = nowIso();
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO repositories (repository_key, created_at) VALUES (?1, ?2) ON CONFLICT (repository_key) DO NOTHING`,
+        manifest.repositoryKey,
+        now,
+      );
+      this.ctx.storage.sql.exec(
+        `INSERT INTO index_generations
+           (id, repository_key, branch, base_id, indexer_version, batch_count, file_count, content_hash, deletions, status, created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'staged',?10)
+         ON CONFLICT (id) DO UPDATE SET
+           branch = excluded.branch, base_id = excluded.base_id, indexer_version = excluded.indexer_version,
+           batch_count = excluded.batch_count, file_count = excluded.file_count, content_hash = excluded.content_hash,
+           deletions = excluded.deletions`,
+        manifest.generationId,
+        manifest.repositoryKey,
+        manifest.branch,
+        manifest.baseId,
+        manifest.indexerVersion,
+        manifest.batchCount,
+        manifest.fileCount,
+        manifest.contentHash,
+        JSON.stringify(manifest.deletions),
+        now,
+      );
+    });
     return { ok: true };
   }
 
   async ingestIndexBatch(projectId: string, batch: IndexBatch, rows: Array<Record<string, unknown>>): Promise<{ ok: true; deduped: boolean }> {
     await this.assertProjectId(projectId);
-    const state = this.ingestGenerations.get(batch.generationId);
-    if (!state) throw new Error(`no ingest in progress for generation ${batch.generationId} — call beginIndexIngest first`);
-    const { deduped } = applyIngestBatch(state, batch, rows);
-    return { ok: true, deduped };
+    const gen = this.getIndexGenerationRow(batch.generationId);
+    if (!gen) throw new Error(`no ingest in progress for generation ${batch.generationId} — call beginIndexIngest first`);
+    if (gen.sealed_at || gen.status !== 'staged') {
+      throw new Error(`generation ${batch.generationId} is already ${gen.sealed_at ? 'completed' : gen.status} — refusing a batch for a completed purpose`);
+    }
+    const already = this.ctx.storage.sql
+      .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM index_batches WHERE generation_id = ?1 AND batch_number = ?2`, batch.generationId, batch.batchNumber)
+      .toArray()[0]!.n;
+    if (already > 0) return { ok: true, deduped: true };
+    const parsedRows = rows.map(parseStagedRow);
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO index_batches (generation_id, batch_number, batch_hash, row_count, received_at) VALUES (?1,?2,?3,?4,?5)`,
+        batch.generationId,
+        batch.batchNumber,
+        batch.batchHash,
+        rows.length,
+        nowIso(),
+      );
+      for (const row of parsedRows) {
+        if (row.kind === 'node') {
+          this.ctx.storage.sql.exec(
+            `INSERT INTO index_staged_entities (generation_id, uri, type, label, content) VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT (generation_id, uri) DO UPDATE SET type = excluded.type, label = excluded.label, content = excluded.content`,
+            batch.generationId,
+            row.uri,
+            row.type,
+            row.label,
+            row.content,
+          );
+        } else {
+          this.ctx.storage.sql.exec(
+            `INSERT INTO index_staged_edges (generation_id, type, from_uri, to_uri) VALUES (?1,?2,?3,?4)
+             ON CONFLICT (generation_id, type, from_uri, to_uri) DO NOTHING`,
+            batch.generationId,
+            row.type,
+            row.from,
+            row.to,
+          );
+        }
+      }
+    });
+    return { ok: true, deduped: false };
   }
 
-  async completeIndexIngest(projectId: string, generationId: string): Promise<{ ok: true; batchesReceived: number; rowCount: number }> {
+  /** The VALIDATE step. Seals the generation (no further batches accepted) and records
+   *  `validation_problems` — actionable, naming what disagreed — without activating anything.
+   *  Idempotent: calling it again re-reports the same recorded result rather than re-validating. */
+  async completeIndexIngest(
+    projectId: string,
+    generationId: string,
+  ): Promise<{ ok: true; batchesReceived: number; validation: { ok: boolean; problems: string[] } }> {
     await this.assertProjectId(projectId);
-    const state = this.ingestGenerations.get(generationId);
-    if (!state) throw new Error(`no ingest in progress for generation ${generationId}`);
-    completeIngestGeneration(state);
-    return { ok: true, batchesReceived: state.receivedBatches.size, rowCount: state.rowCount };
+    const gen = this.getIndexGenerationRow(generationId);
+    if (!gen) throw new Error(`no ingest in progress for generation ${generationId}`);
+    if (gen.status !== 'staged') throw new Error(`generation ${generationId} is already ${gen.status}`);
+    const received = this.ctx.storage.sql
+      .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM index_batches WHERE generation_id = ?1`, generationId)
+      .toArray()[0]!.n;
+    if (gen.sealed_at) {
+      const problems: string[] = gen.validation_problems ? JSON.parse(gen.validation_problems) : [];
+      return { ok: true, batchesReceived: received, validation: { ok: problems.length === 0, problems } };
+    }
+    const problems: string[] = [];
+    if (received !== gen.batch_count) problems.push(`expected ${gen.batch_count} batches, received ${received}`);
+    const fileEntities = this.ctx.storage.sql
+      .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM index_staged_entities WHERE generation_id = ?1 AND type = 'file'`, generationId)
+      .toArray()[0]!.n;
+    if (fileEntities !== gen.file_count) problems.push(`manifest declares fileCount ${gen.file_count}, staged ${fileEntities} file entities`);
+    problems.push(...this.indexStagingIntegrityProblems(generationId));
+    this.ctx.storage.sql.exec(
+      `UPDATE index_generations SET sealed_at = ?2, validation_problems = ?3 WHERE id = ?1`,
+      generationId,
+      nowIso(),
+      problems.length ? JSON.stringify(problems) : null,
+    );
+    return { ok: true, batchesReceived: received, validation: { ok: problems.length === 0, problems } };
   }
 
+  /** The PROMOTE step — the ONLY writer of `status = 'active'`. Refuses a generation that has
+   *  not completed ingest (no `sealed_at`) or that failed validation; activates exactly once
+   *  (re-activating an already-active generation is refused, matching its `status` check). */
+  async activateIndexGeneration(projectId: string, generationId: string): Promise<{ activated: string; superseded: string[] }> {
+    await this.assertProjectId(projectId);
+    const gen = this.getIndexGenerationRow(generationId);
+    if (!gen) throw new Error(`generation ${generationId} not found`);
+    if (gen.status !== 'staged') throw new Error(`generation ${generationId} is already ${gen.status}`);
+    if (!gen.sealed_at) throw new Error(`generation ${generationId} has not completed ingest — call completeIndexIngest first`);
+    if (gen.validation_problems) throw new Error(`generation ${generationId} failed validation: ${gen.validation_problems}`);
+
+    let superseded: string[] = [];
+    this.ctx.storage.transactionSync(() => {
+      // The read of the currently-active generation happens INSIDE the transaction — moved here
+      // from where the old activateCodeGeneration read it (before its own transactionSync), which
+      // let two concurrent activations both observe the same prior active row and both promote.
+      const active = this.ctx.storage.sql
+        .exec<{ id: string }>(`SELECT id FROM index_generations WHERE repository_key = ?1 AND status = 'active'`, gen.repository_key)
+        .toArray();
+      superseded = active.map((r) => r.id);
+      for (const id of superseded) {
+        this.ctx.storage.sql.exec(`UPDATE index_generations SET status = 'superseded' WHERE id = ?1`, id);
+      }
+      this.ctx.storage.sql.exec(`UPDATE index_generations SET status = 'active', activated_at = ?2 WHERE id = ?1`, generationId, nowIso());
+    });
+
+    // Best-effort vector publish, OUTSIDE the transaction (PLNR-256: a Vectorize upsert cannot
+    // join a SQLite transaction; correctness comes from query-time generation filtering, never
+    // from "we deleted the old vectors").
+    const backend = codeSearchBackend(this.env);
+    if (backend) {
+      const staged = this.ctx.storage.sql
+        .exec<{ uri: string; type: string; label: string; content: string | null }>(
+          `SELECT uri, type, label, content FROM index_staged_entities WHERE generation_id = ?1`,
+          generationId,
+        )
+        .toArray();
+      for (const e of staged) {
+        void indexCodeEntity(backend, {
+          uri: e.uri, projectId, repositoryKey: gen.repository_key, generationId, type: e.type as CodeEntityType, label: e.label, content: e.content,
+        }).catch((err) => console.warn(`ProjectMemory code-index for ${e.uri} failed: ${String(err)}`));
+      }
+      const deletions: string[] = JSON.parse(gen.deletions || '[]');
+      if (deletions.length) {
+        const projectKey = await this.resolveProjectKey(projectId);
+        for (const path of deletions) {
+          const uri = buildEntityUri({ kind: 'file', projectKey, repositoryKey: gen.repository_key, path });
+          void removeCodeEntity(backend, uri).catch((err) => console.warn(`ProjectMemory code-deindex for ${uri} failed: ${String(err)}`));
+        }
+      }
+    }
+
+    // D1-side active-generation PROJECTION (PLNR-259) — DO -> ProjectRoom -> D1, mirroring
+    // upsertMemoryHealth/updateMemoryBackupStatus/setMemoryVectorDirty. Best-effort: the DO's own
+    // index_generations.status is authority regardless of whether this projection lands.
+    await this.env.PROJECT_ROOM.get(this.env.PROJECT_ROOM.idFromName(projectId))
+      .setRepositoryActiveGeneration(projectId, gen.repository_key, generationId)
+      .catch((err) => console.warn(`ProjectMemory active-generation projection for ${projectId}/${gen.repository_key} failed: ${String(err)}`));
+
+    return { activated: generationId, superseded };
+  }
+
+  /** Abort a still-staged generation, dropping its staged rows. Refuses once active/superseded —
+   *  there is no undo for a promotion; a sealed-but-not-yet-activated (validated or not)
+   *  generation may still be aborted. */
   async abortIndexIngest(projectId: string, generationId: string): Promise<{ ok: true }> {
     await this.assertProjectId(projectId);
-    const state = this.ingestGenerations.get(generationId);
-    if (state) abortIngestGeneration(state);
+    const gen = this.getIndexGenerationRow(generationId);
+    if (!gen) return { ok: true };
+    if (gen.status !== 'staged') throw new Error(`generation ${generationId} is already ${gen.status} — cannot abort`);
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(`DELETE FROM index_staged_edges WHERE generation_id = ?1`, generationId);
+      this.ctx.storage.sql.exec(`DELETE FROM index_staged_entities WHERE generation_id = ?1`, generationId);
+      this.ctx.storage.sql.exec(`DELETE FROM index_batches WHERE generation_id = ?1`, generationId);
+      this.ctx.storage.sql.exec(`DELETE FROM index_generations WHERE id = ?1`, generationId);
+    });
     return { ok: true };
   }
 
   async indexIngestStatus(
     projectId: string,
     generationId: string,
-  ): Promise<{ status: 'unknown' | 'pending' | 'complete' | 'aborted'; batchesReceived: number; batchesExpected: number | null }> {
+  ): Promise<{ status: 'unknown' | 'staged' | 'active' | 'superseded'; sealed: boolean; batchesReceived: number; batchesExpected: number | null; validation: { ok: boolean; problems: string[] } | null }> {
     await this.assertProjectId(projectId);
-    const state = this.ingestGenerations.get(generationId);
-    if (!state) return { status: 'unknown', batchesReceived: 0, batchesExpected: null };
-    return { status: state.status, batchesReceived: state.receivedBatches.size, batchesExpected: state.manifest.batchCount };
+    const gen = this.getIndexGenerationRow(generationId);
+    if (!gen) return { status: 'unknown', sealed: false, batchesReceived: 0, batchesExpected: null, validation: null };
+    const received = this.ctx.storage.sql
+      .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM index_batches WHERE generation_id = ?1`, generationId)
+      .toArray()[0]!.n;
+    return {
+      status: gen.status as 'staged' | 'active' | 'superseded',
+      sealed: !!gen.sealed_at,
+      batchesReceived: received,
+      batchesExpected: gen.batch_count,
+      validation: gen.sealed_at ? { ok: !gen.validation_problems, problems: gen.validation_problems ? JSON.parse(gen.validation_problems) : [] } : null,
+    };
   }
 
   async beginEpisodeIngest(projectId: string, manifest: EpisodeUploadManifest): Promise<{ ok: true }> {
@@ -803,7 +988,6 @@ export class ProjectMemory extends DurableObject<Env> {
         }
         this.ctx.storage.sql.exec(`UPDATE _meta SET value = '0' WHERE key = 'has_prior_generation'`);
       });
-      this.ingestGenerations.clear();
       this.ingestEpisodes.clear();
       steps.push({ step: 'store', ok: true, detail: 'rows and any generation debris cleared' });
     } catch (err) {
@@ -821,9 +1005,11 @@ export class ProjectMemory extends DurableObject<Env> {
     // PLNR-260's capabilities are stateless HMAC tokens (§8) — there is no revocation list to
     // clear; a token minted before erasure stays verifiable for the rest of its own short TTL
     // (INGEST_TOKEN_TTL_SECONDS, ~15 min), scoped only to a project that no longer exists to
-    // accept its writes (assertProjectId above already refuses any RPC for it). In-flight
-    // upload STATE (this.ingestGenerations/ingestEpisodes) is real and is cleared in the 'store'
-    // step above — this step is honest about the token itself, not silent about the state.
+    // accept its writes (assertProjectId above already refuses any RPC for it). In-flight upload
+    // STATE is real and is cleared in the 'store' step above — index-generation staging rows go
+    // with the rest of SCHEMA_TABLES via erase(), and this.ingestEpisodes is cleared explicitly
+    // (it is in-memory, not a SQL table) — this step is honest about the token itself, not
+    // silent about the state.
     steps.push({
       step: 'ingest-capabilities',
       ok: true,

@@ -94,20 +94,21 @@ describe('index generation ingest — full flow', () => {
   it('begins, uploads one batch, completes, and reports status', async () => {
     const cap = await (await mintCap(ownerToken, { projectId, repositoryKey: 'ingx-repo', purpose: 'index', scopeId: 'gen_full', runnerId })).json() as { token: string };
     expect((await begin(cap.token, { ...baseManifest, generationId: 'gen_full' })).status).toBe(200);
-    const { bytes, hash } = await makeBatch([{ uri: 'noriq://file/INGX/ingx-repo/a.ts' }]);
+    const { bytes, hash } = await makeBatch([{ kind: 'node', uri: 'noriq://file/INGX/ingx-repo/a.ts', type: 'file', label: 'a.ts' }]);
     const putRes = await putBatch(cap.token, 0, bytes, hash);
     expect(putRes.status).toBe(200);
     expect(await putRes.json()).toEqual({ ok: true, deduped: false });
     const completeRes = await complete(cap.token);
     expect(completeRes.status).toBe(200);
-    const st = await (await status(cap.token)).json() as { status: string; batchesReceived: number };
-    expect(st).toEqual({ status: 'complete', batchesReceived: 1, batchesExpected: 1 });
+    expect(await completeRes.json()).toEqual({ ok: true, batchesReceived: 1, validation: { ok: true, problems: [] } });
+    const st = await (await status(cap.token)).json() as { status: string; sealed: boolean; batchesReceived: number; batchesExpected: number };
+    expect(st).toEqual({ status: 'staged', sealed: true, batchesReceived: 1, batchesExpected: 1, validation: { ok: true, problems: [] } });
   });
 
   it('re-uploading the SAME batch of an in-flight generation is harmless and converges', async () => {
     const cap = await (await mintCap(ownerToken, { projectId, repositoryKey: 'ingx-repo', purpose: 'index', scopeId: 'gen_replay', runnerId })).json() as { token: string };
     await begin(cap.token, { ...baseManifest, generationId: 'gen_replay', batchCount: 2 });
-    const { bytes, hash } = await makeBatch([{ uri: 'x' }]);
+    const { bytes, hash } = await makeBatch([{ kind: 'node', uri: 'noriq://file/INGX/ingx-repo/x.ts', type: 'file', label: 'x.ts' }]);
     const first = await (await putBatch(cap.token, 0, bytes, hash)).json() as { deduped: boolean };
     const second = await (await putBatch(cap.token, 0, bytes, hash)).json() as { deduped: boolean };
     expect(first.deduped).toBe(false);
@@ -117,7 +118,7 @@ describe('index generation ingest — full flow', () => {
   it('presenting a capability for a purpose that already completed is refused explicitly, not silently absorbed', async () => {
     const cap = await (await mintCap(ownerToken, { projectId, repositoryKey: 'ingx-repo', purpose: 'index', scopeId: 'gen_done', runnerId })).json() as { token: string };
     await begin(cap.token, { ...baseManifest, generationId: 'gen_done', batchCount: 1 });
-    const { bytes, hash } = await makeBatch([{ uri: 'x' }]);
+    const { bytes, hash } = await makeBatch([{ kind: 'node', uri: 'noriq://file/INGX/ingx-repo/x.ts', type: 'file', label: 'x.ts' }]);
     await putBatch(cap.token, 0, bytes, hash);
     await complete(cap.token);
     // Same capability, same batch, after completion — refused, not idempotently accepted.
@@ -128,7 +129,7 @@ describe('index generation ingest — full flow', () => {
   it('a batch whose checksum does not match is rejected before its rows are parsed', async () => {
     const cap = await (await mintCap(ownerToken, { projectId, repositoryKey: 'ingx-repo', purpose: 'index', scopeId: 'gen_bad_hash', runnerId })).json() as { token: string };
     await begin(cap.token, { ...baseManifest, generationId: 'gen_bad_hash' });
-    const { bytes } = await makeBatch([{ uri: 'x' }]);
+    const { bytes } = await makeBatch([{ kind: 'node', uri: 'noriq://file/INGX/ingx-repo/x.ts', type: 'file', label: 'x.ts' }]);
     const res = await putBatch(cap.token, 0, bytes, 'deadbeef'.repeat(8));
     expect(res.status).toBe(413);
     const st = await (await status(cap.token)).json() as { batchesReceived: number };
@@ -155,7 +156,7 @@ describe('index generation ingest — full flow', () => {
     expect(res.status).toBe(200);
     // The generation that actually landed is keyed by the TOKEN's scopeId, not the forged body —
     // status against the real scopeId reports it; the forged generationId was never created.
-    expect((await (await status(cap.token)).json() as { status: string }).status).toBe('pending');
+    expect((await (await status(cap.token)).json() as { status: string }).status).toBe('staged');
   });
 });
 
