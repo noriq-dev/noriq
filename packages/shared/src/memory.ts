@@ -471,6 +471,27 @@ export const EntityRef = z.discriminatedUnion('kind', [
     path: RepoPath,
     name: z.string().min(1),
   }),
+  // api/database_entity (PLNR-278) — added so PLNR-262 can project CodeEntityType's api and
+  // database_entity kinds; `nodes.type`'s CHECK constraint already permits both (0001), so this
+  // is a pure schema widening with no migration. An API endpoint is declared at a path like a
+  // symbol, so it takes the same {path}#{name} shape; a database entity (a table, a schema
+  // object) is not reliably one-file-one-entity, so it stays path-free — a repository-scoped
+  // name only. The first stored URI locks the shape, so this is a deliberate choice, not a
+  // placeholder: revisit only by adding a NEW kind, never by editing these arms once anything
+  // has stored a URI built from them.
+  z.object({
+    kind: z.literal('api'),
+    projectKey: EntityProjectKey,
+    repositoryKey: RepositoryKey,
+    path: RepoPath,
+    name: z.string().min(1),
+  }),
+  z.object({
+    kind: z.literal('database_entity'),
+    projectKey: EntityProjectKey,
+    repositoryKey: RepositoryKey,
+    name: z.string().min(1),
+  }),
 ]);
 export type EntityRef = z.infer<typeof EntityRef>;
 
@@ -488,7 +509,20 @@ const GLOBAL_KIND_SET: ReadonlySet<string> = new Set([
   'unknown',
 ]);
 
-/** Build a stable entity URI from a ref. The inverse of `parseEntityUri`. */
+/**
+ * Build a stable entity URI from a ref. The inverse of `parseEntityUri`.
+ *
+ * Fragment convention (settled here for PLNR-262 to respect, PLNR-278): the FIRST `#` in the
+ * rest-of-URI separates a repository-scoped kind's `path` from its `name` — `symbol`, `test`,
+ * and now `api` all use it. This is a PRE-EXISTING collision the code index's chunk ids must
+ * not make worse: `code-index.ts`'s `vecId` appends `#<n>` to a chunk-0-elided uri, so a
+ * multi-chunk symbol/test/api entity's vector id already looks like `…#name#3`, and
+ * `entityRefCandidate` (splitting on the FIRST `#`) reads that back as `name: "name#3"`. Fixing
+ * that chunk-id/name collision is PLNR-262's job (it must use a separator its own chunk suffix
+ * cannot produce, e.g. one that never appears in a `#name` fragment) — this file only fixes the
+ * kind-segment regex so an UNDERSCORED kind can be parsed at all; it does not change what `#`
+ * itself means.
+ */
 export function buildEntityUri(ref: EntityRef): string {
   switch (ref.kind) {
     case 'repository':
@@ -497,13 +531,19 @@ export function buildEntityUri(ref: EntityRef): string {
       return `noriq://file/${ref.projectKey}/${ref.repositoryKey}/${ref.path}`;
     case 'symbol':
     case 'test':
+    case 'api':
       return `noriq://${ref.kind}/${ref.projectKey}/${ref.repositoryKey}/${ref.path}#${ref.name}`;
+    case 'database_entity':
+      return `noriq://database_entity/${ref.projectKey}/${ref.repositoryKey}/${ref.name}`;
     default:
       return `noriq://${ref.kind}/${ref.id}`;
   }
 }
 
-const ENTITY_URI_RE = /^noriq:\/\/([a-z]+)\/(.*)$/;
+// `[a-z_]+` (not `[a-z]+`) — the ORIGINAL blocker for `database_entity`: an arm alone is not
+// enough, because this regex captured the kind segment and a non-matching URI silently became
+// `{ kind: '__malformed__' }` rather than failing at the actual bug (a missing underscore).
+const ENTITY_URI_RE = /^noriq:\/\/([a-z_]+)\/(.*)$/;
 
 /**
  * Decompose a URI string into a candidate object for `EntityRef.parse` — never
@@ -526,12 +566,16 @@ function entityRefCandidate(uri: string): unknown {
     const [projectKey, repositoryKey, ...pathParts] = rest.split('/');
     return { kind, projectKey, repositoryKey, path: pathParts.join('/') };
   }
-  if (kind === 'symbol' || kind === 'test') {
+  if (kind === 'symbol' || kind === 'test' || kind === 'api') {
     const hashIndex = rest.indexOf('#');
     const withoutName = hashIndex === -1 ? rest : rest.slice(0, hashIndex);
     const name = hashIndex === -1 ? undefined : rest.slice(hashIndex + 1);
     const [projectKey, repositoryKey, ...pathParts] = withoutName.split('/');
     return { kind, projectKey, repositoryKey, path: pathParts.join('/'), name };
+  }
+  if (kind === 'database_entity') {
+    const [projectKey, repositoryKey, ...nameParts] = rest.split('/');
+    return { kind, projectKey, repositoryKey, name: nameParts.join('/') };
   }
   return { kind: '__malformed__' };
 }
@@ -550,4 +594,43 @@ export function parseEntityUri(uri: string): EntityRef {
 function safeParseEntityUri(uri: string): EntityRef | null {
   const result = EntityRef.safeParse(entityRefCandidate(uri));
   return result.success ? result.data : null;
+}
+
+// ---------------------------------------------------------------------------
+// MemoryNodeType <-> EntityRef drift guard (PLNR-278)
+//
+// The two vocabularies had silently diverged: MemoryNodeType had 21 values, EntityRef only 15
+// arms, and `hazard` was an EntityRef kind that isn't a node type at all. A node type with
+// neither an EntityRef arm nor a recorded exemption below now fails at MODULE LOAD (the first
+// request on any server that imports this file), rather than being rediscovered as a bug later.
+// ---------------------------------------------------------------------------
+
+/**
+ * Node types that are graph-only internal nodes with no addressable EntityRef arm YET.
+ * Deliberately not designed speculatively: the first URI ever built from a new arm locks its
+ * shape forever (byte-identical, no migration path — see `buildEntityUri`'s doc comment), so
+ * each of these gets a shape only when a real writer exists to need one:
+ *   - `agent`, `error` — projected from episodes, Phase 6 onward (PLNR-263+).
+ *   - `branch`, `revision` — no writer anywhere in this codebase yet.
+ *   - `project` — the project itself is addressed by its D1 id/key everywhere else in this
+ *     system; nothing needs it as a graph-addressable entity today.
+ * Adding an arm removes the exemption in the SAME change — do not carry both.
+ */
+export const EXEMPT_NODE_TYPES: ReadonlySet<MemoryNodeType> = new Set(['project', 'branch', 'revision', 'agent', 'error']);
+
+/**
+ * The mirror-image asymmetry, recorded rather than "fixed": `hazard` is an EntityRef kind (a
+ * `memory_items` row addressable as an entity) but deliberately NOT a MemoryNodeType — a hazard
+ * is projected, if at all, as a `memory` graph node, not a distinct node type. Adding it to
+ * MemoryNodeType would need a `nodes.type` CHECK migration for a node type nothing needs.
+ */
+const ENTITY_REF_KINDS: ReadonlySet<string> = new Set(EntityRef.options.map((option) => option.shape.kind.value));
+
+for (const nodeType of MemoryNodeType.options) {
+  if (!ENTITY_REF_KINDS.has(nodeType) && !EXEMPT_NODE_TYPES.has(nodeType)) {
+    throw new Error(
+      `MemoryNodeType "${nodeType}" has neither an EntityRef arm nor a recorded EXEMPT_NODE_TYPES entry — ` +
+      'the entity-URI and graph-node vocabularies have drifted (PLNR-278)',
+    );
+  }
 }

@@ -324,6 +324,68 @@ describe('Entity URIs — stable across index rebuilds (§18)', () => {
   });
 });
 
+describe('api/database_entity entity URIs (PLNR-278)', () => {
+  it('an api URI round-trips build -> parse', () => {
+    const api: EntityRef = {
+      kind: 'api', projectKey: 'PLNR', repositoryKey: 'noriq-web',
+      path: 'apps/api/src/index.ts', name: 'POST /api/runners',
+    };
+    expect(parseEntityUri(buildEntityUri(api))).toEqual(api);
+  });
+
+  it('a database_entity URI round-trips build -> parse — the underscored kind that the ORIGINAL [a-z]+ regex could not parse even with a correct arm', () => {
+    const dbEntity: EntityRef = { kind: 'database_entity', projectKey: 'PLNR', repositoryKey: 'noriq-web', name: 'tasks' };
+    const uri = buildEntityUri(dbEntity);
+    expect(uri).toBe('noriq://database_entity/PLNR/noriq-web/tasks');
+    expect(parseEntityUri(uri)).toEqual(dbEntity);
+  });
+
+  it('every pre-existing kind\'s buildEntityUri output is byte-identical to before this task', () => {
+    expect(buildEntityUri({ kind: 'task', id: 'task_1' })).toBe('noriq://task/task_1');
+    expect(buildEntityUri({ kind: 'plan', id: 'pln_1' })).toBe('noriq://plan/pln_1');
+    expect(buildEntityUri({ kind: 'run', id: 'run_1' })).toBe('noriq://run/run_1');
+    expect(buildEntityUri({ kind: 'decision', id: 'dec_1' })).toBe('noriq://decision/dec_1');
+    expect(buildEntityUri({ kind: 'memory', id: 'mem_1' })).toBe('noriq://memory/mem_1');
+    expect(buildEntityUri({ kind: 'episode', id: 'ep_1' })).toBe('noriq://episode/ep_1');
+    expect(buildEntityUri({ kind: 'requirement', id: 'req_1' })).toBe('noriq://requirement/req_1');
+    expect(buildEntityUri({ kind: 'procedure', id: 'proc_1' })).toBe('noriq://procedure/proc_1');
+    expect(buildEntityUri({ kind: 'hazard', id: 'haz_1' })).toBe('noriq://hazard/haz_1');
+    expect(buildEntityUri({ kind: 'artifact', id: 'art_1' })).toBe('noriq://artifact/art_1');
+    expect(buildEntityUri({ kind: 'unknown', id: 'unk_1' })).toBe('noriq://unknown/unk_1');
+    expect(buildEntityUri({ kind: 'repository', projectKey: 'PLNR', repositoryKey: 'noriq-web' })).toBe('noriq://repository/PLNR/noriq-web');
+    expect(buildEntityUri({ kind: 'file', projectKey: 'PLNR', repositoryKey: 'noriq-web', path: 'a.ts' })).toBe('noriq://file/PLNR/noriq-web/a.ts');
+    expect(buildEntityUri({ kind: 'symbol', projectKey: 'PLNR', repositoryKey: 'noriq-web', path: 'a.ts', name: 'foo' })).toBe('noriq://symbol/PLNR/noriq-web/a.ts#foo');
+    expect(buildEntityUri({ kind: 'test', projectKey: 'PLNR', repositoryKey: 'noriq-web', path: 'a.test.ts', name: 'it works' })).toBe('noriq://test/PLNR/noriq-web/a.test.ts#it works');
+  });
+
+  it('a malformed URI and an unknown-kind URI both still produce zod\'s own invalid-discriminator error (no hand-rolled message)', () => {
+    expect(() => parseEntityUri('noriq://database_entity/PLNR')).toThrowError(/invalid/i);
+    expect(() => parseEntityUri('noriq://not-a-real-kind/PLNR/x')).toThrowError(/invalid/i);
+  });
+});
+
+describe('MemoryNodeType <-> EntityRef drift guard (PLNR-278)', () => {
+  it('every MemoryNodeType value has an EntityRef arm or a recorded EXEMPT_NODE_TYPES entry', async () => {
+    const { MemoryNodeType, EXEMPT_NODE_TYPES } = await import('@noriq-dev/shared');
+    const entityKinds = new Set<string>(EntityRef.options.map((o) => o.shape.kind.value));
+    const exempt = EXEMPT_NODE_TYPES as ReadonlySet<string>;
+    for (const nodeType of MemoryNodeType.options as string[]) {
+      expect(entityKinds.has(nodeType) || exempt.has(nodeType)).toBe(true);
+    }
+  });
+
+  it('hazard remains an EntityRef kind and NOT a MemoryNodeType', async () => {
+    const { MemoryNodeType } = await import('@noriq-dev/shared');
+    expect(MemoryNodeType.options).not.toContain('hazard');
+    expect(EntityRef.options.map((o) => o.shape.kind.value)).toContain('hazard');
+  });
+
+  it('the exemption list is exactly the five node types with no current EntityRef arm', async () => {
+    const { EXEMPT_NODE_TYPES } = await import('@noriq-dev/shared');
+    expect([...EXEMPT_NODE_TYPES].sort()).toEqual(['agent', 'branch', 'error', 'project', 'revision']);
+  });
+});
+
 describe('MemoryNode — rejects malformed and cross-project URIs (§5, §18)', () => {
   it('accepts a node whose uri belongs to its own project', () => {
     const node = MemoryNode.parse({

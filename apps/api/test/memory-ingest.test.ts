@@ -42,7 +42,7 @@ const begin = (ingestToken: string, body: unknown) =>
 
 const putBatch = (ingestToken: string, n: number, bytes: Uint8Array, hash: string, extraHeaders: Record<string, string> = {}) =>
   SELF.fetch(`https://noriq.test/api/memory-ingest/${ingestToken}/batch/${n}`, {
-    method: 'PUT', headers: { 'X-Batch-Hash': hash, ...extraHeaders }, body: bytes,
+    method: 'PUT', headers: { 'X-Batch-Hash': hash, ...extraHeaders }, body: bytes as BodyInit,
   });
 
 const complete = (ingestToken: string) =>
