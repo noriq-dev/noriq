@@ -55,7 +55,11 @@ app.use('/oauth/*', cors({ allowMethods: ['GET', 'POST', 'OPTIONS'], maxAge: 864
 // acked coordination-write contract, and trivially redone if a session is lost); and
 // /api/admin/import — a restore is the one write you DO want under a freeze (a deliberate
 // admin DB replacement, with the freeze holding off the coordination writes that would race it).
-const FREEZE_EXEMPT_PREFIXES = ['/mcp', '/oauth/', '/.well-known/', '/api/auth/', '/api/reset', '/api/setup', '/api/health', '/ws/', '/api/admin/import'];
+// /api/admin/memory-restore is the same exception for ProjectMemory (PLNR-249) — matches both
+// the restore route and its /rollback sibling by prefix; /api/admin/memory-backup is NOT
+// exempt, matching /api/admin/backup/export above it (an export is safe to defer, not something
+// you need mid-freeze).
+const FREEZE_EXEMPT_PREFIXES = ['/mcp', '/oauth/', '/.well-known/', '/api/auth/', '/api/reset', '/api/setup', '/api/health', '/ws/', '/api/admin/import', '/api/admin/memory-restore'];
 app.use('*', async (c, next) => {
   if (!isMaintenanceMode(c.env)) return next();
   const method = c.req.method;
@@ -287,12 +291,38 @@ app.post('/api/admin/backup', adminAuth, async (c) => {
 
 // On-demand ProjectMemory portable snapshot (PLNR-248) — the per-project analogue of
 // /api/admin/backup, above. Admin-only; same graceful-degradation shape when R2 isn't bound.
-// See BACKUP.md for the R2 layout and what a manifest carries.
-app.post('/api/admin/projects/:projectId/memory-backup', adminAuth, async (c) => {
+// projectId is a trailing segment (not nested under /projects/:id/...) so the flat path shape
+// matches /api/admin/import and lets memory-restore's freeze exemption below match by prefix
+// without also matching this read-mostly route. See BACKUP.md for the R2 layout.
+app.post('/api/admin/memory-backup/:projectId', adminAuth, async (c) => {
   const projectId = c.req.param('projectId')!;
   const tier = c.req.query('tier') === 'full' ? 'full' : 'core';
   const res = await c.env.PROJECT_MEMORY.get(c.env.PROJECT_MEMORY.idFromName(projectId)).exportSnapshot(projectId, { tier });
   return c.json(res, res.ok ? 200 : 503);
+});
+
+// Restore a ProjectMemory snapshot (PLNR-249) — the per-project analogue of /api/admin/import.
+// DESTRUCTIVE in the same sense: it replaces this project's ACTIVE generation (though never by
+// deleting it first — see ProjectMemory.restoreSnapshot), so ?confirm=replace guards it and it
+// is exempt from the write-freeze below, exactly like /api/admin/import: "freeze → restore →
+// unfreeze" is a clean cutover. Restore + rollback runbook in BACKUP.md.
+app.post('/api/admin/memory-restore/:projectId', adminAuth, async (c) => {
+  if (c.req.query('confirm') !== 'replace') {
+    return c.json({ error: 'refusing: this REPLACES the project\'s active memory generation. Re-POST with ?confirm=replace to proceed.' }, 400);
+  }
+  const projectId = c.req.param('projectId')!;
+  const exportedAt = c.req.query('exportedAt');
+  if (!exportedAt) return c.json({ error: 'exportedAt query param is required — the timestamp of the backup to restore' }, 400);
+  const res = await c.env.PROJECT_MEMORY.get(c.env.PROJECT_MEMORY.idFromName(projectId)).restoreSnapshot(projectId, { exportedAt });
+  return c.json(res, res.ok ? 200 : 400);
+});
+
+// Roll back to the retained prior generation (PLNR-249) — no R2 read, no re-upload. Single-
+// level undo: only the immediately preceding generation is ever retained.
+app.post('/api/admin/memory-restore/:projectId/rollback', adminAuth, async (c) => {
+  const projectId = c.req.param('projectId')!;
+  const res = await c.env.PROJECT_MEMORY.get(c.env.PROJECT_MEMORY.idFromName(projectId)).rollback(projectId);
+  return c.json(res, res.ok ? 200 : 400);
 });
 
 // Restore a snapshot (PLNR-218) — the inverse of /export. DESTRUCTIVE: REPLACES all data

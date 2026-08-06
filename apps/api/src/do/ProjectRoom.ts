@@ -2866,6 +2866,23 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
+  /** Mark (or clear) this project's derived-vector staleness (PLNR-249/0071) — set after a
+   *  restore activates a new generation, since a snapshot's vectors, if any existed, never
+   *  travel with it; cleared once a real rebuild (Phase 4) actually re-embeds from canonical
+   *  rows. Visibility only — nothing in this repo yet reads it to gate behavior. */
+  async setMemoryVectorDirty(projectId: string, dirty: boolean): Promise<{ ok: true }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const now = nowIso();
+      await this.env.DB.prepare(
+        `INSERT INTO project_memory_registry (project_id, vector_dirty, created_at, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT (project_id) DO UPDATE SET vector_dirty = excluded.vector_dirty, updated_at = excluded.updated_at`,
+      ).bind(projectId, dirty ? 1 : 0, now, now).run();
+      return { ok: true };
+    });
+  }
+
   /**
    * The receiving half of ProjectMemory's outbox (PLNR-247): accept a compact memory-change
    * delivery, dedupe it durably by operation id, and — for an unseen id only — append it to

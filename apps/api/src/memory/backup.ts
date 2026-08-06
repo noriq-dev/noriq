@@ -23,22 +23,19 @@ export const MEMORY_BACKUP_FORMAT_VERSION = 1;
  *  never holds more than one chunk's worth of one table's rows in memory at a time. */
 const DEFAULT_CHUNK_ROWS = 500;
 
-const backupPrefix = (projectId: string, exportedAt: string): string =>
+// Exported for restore.ts (PLNR-249) — it reads exactly what this file writes, so the prefix
+// convention, the compression codec, and the checksum algorithm are shared, not re-derived.
+export const backupPrefix = (projectId: string, exportedAt: string): string =>
   `memory-backups/${projectId}/${exportedAt.replace(/[:.]/g, '-')}`;
 
-async function gzip(text: string): Promise<Uint8Array> {
-  const cs = new CompressionStream('gzip');
-  const writer = cs.writable.getWriter();
-  const bytesIn = new TextEncoder().encode(text);
-  const writeDone = writer.write(bytesIn).then(() => writer.close());
+async function drainStream(readable: ReadableStream<Uint8Array>): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
-  const reader = cs.readable.getReader();
+  const reader = readable.getReader();
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
     chunks.push(value);
   }
-  await writeDone;
   const total = chunks.reduce((n, c) => n + c.length, 0);
   const out = new Uint8Array(total);
   let offset = 0;
@@ -49,7 +46,27 @@ async function gzip(text: string): Promise<Uint8Array> {
   return out;
 }
 
-async function sha256HexBytes(bytes: Uint8Array): Promise<string> {
+export async function gzip(text: string): Promise<Uint8Array> {
+  const cs = new CompressionStream('gzip');
+  const writer = cs.writable.getWriter();
+  const writeDone = writer.write(new TextEncoder().encode(text)).then(() => writer.close());
+  const out = await drainStream(cs.readable);
+  await writeDone;
+  return out;
+}
+
+export async function gunzip(bytes: Uint8Array): Promise<string> {
+  const ds = new DecompressionStream('gzip');
+  const writer = ds.writable.getWriter();
+  // Same ArrayBufferLike/ArrayBuffer generic mismatch as sha256HexBytes above — bytes here are
+  // always a freshly allocated ArrayBuffer (R2's arrayBuffer() produces one).
+  const writeDone = writer.write(bytes as unknown as Uint8Array<ArrayBuffer>).then(() => writer.close());
+  const out = await drainStream(ds.readable);
+  await writeDone;
+  return new TextDecoder().decode(out);
+}
+
+export async function sha256HexBytes(bytes: Uint8Array): Promise<string> {
   // TS's DOM lib types Uint8Array's `buffer` as possibly-SharedArrayBuffer, which digest()'s
   // BufferSource rejects; these bytes are always a freshly allocated ArrayBuffer (gzip() and
   // R2's arrayBuffer() both produce one), so the cast is safe, not a type-check bypass.

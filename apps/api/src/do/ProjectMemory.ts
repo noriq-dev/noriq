@@ -4,6 +4,7 @@ import { newId, nowIso } from '../lib/util';
 import { buildEntityUri, type MemoryBackupManifest } from '@noriq-dev/shared';
 import { projectCoordinationEvents, type ProjectedEvent } from '../lib/memory-projector';
 import { exportMemorySnapshot } from '../memory/backup';
+import { fetchManifest, readSnapshotChunks, checkManifestHeader } from '../memory/restore';
 
 /**
  * ProjectMemory — one instance per project (idFromName(projectId)), canonical
@@ -391,6 +392,210 @@ export class ProjectMemory extends DurableObject<Env> {
       .catch((err) => console.warn(`ProjectMemory backup-status report for ${projectId} failed: ${String(err)}`));
   }
 
+  // ---------------------------------------------------------------------------
+  // Generation-based restore + rollback (PLNR-249)
+  //
+  // Restore NEVER deletes the active dataset first. Every table is imported into a `staging_`
+  // twin (same CREATE TABLE, same CHECK constraints — just a different name), validated in
+  // full, and only then does ONE transactionSync do the entire switch: the live table becomes
+  // `prev_<table>` (retained for rollback — at most one generation back, never a stack) and
+  // `staging_<table>` becomes the live table. A validation failure at any point drops the
+  // staging tables and leaves the active generation byte-identical. FK enforcement is turned
+  // OFF for the duration of staging import (both staged and live tables share one connection,
+  // and a staging table's declared REFERENCES still point at the LIVE table names — rewriting
+  // them is unnecessary because integrity is checked explicitly, via anti-joins, below).
+  // ---------------------------------------------------------------------------
+
+  private readonly VALID_COLUMN_NAME = /^[a-z_][a-z0-9_]*$/;
+
+  private tableCreateSql(table: string): string {
+    const row = this.ctx.storage.sql
+      .exec<{ sql: string }>(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1`, table)
+      .toArray()[0];
+    if (!row) throw new Error(`unknown table: ${table}`);
+    return row.sql;
+  }
+
+  private createStagingTable(table: string): void {
+    const liveSql = this.tableCreateSql(table);
+    // Textual rename of the CREATE TABLE's own name only — a word-boundary match on `CREATE
+    // TABLE <table>` so a substring collision (e.g. `nodes` inside some other identifier)
+    // can't mis-rename.
+    const stagingSql = liveSql.replace(new RegExp(`CREATE TABLE ${table}\\b`), `CREATE TABLE staging_${table}`);
+    if (stagingSql === liveSql) throw new Error(`could not derive staging schema for ${table}`);
+    this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS staging_${table}`);
+    this.ctx.storage.sql.exec(stagingSql);
+  }
+
+  private insertStagingRow(table: string, row: Record<string, unknown>): void {
+    const cols = Object.keys(row);
+    for (const c of cols) {
+      if (!this.VALID_COLUMN_NAME.test(c)) throw new Error(`refusing malformed column name in snapshot row: ${c}`);
+    }
+    const placeholders = cols.map((_, i) => `?${i + 1}`).join(', ');
+    this.ctx.storage.sql.exec(
+      `INSERT INTO staging_${table} (${cols.join(', ')}) VALUES (${placeholders})`,
+      ...cols.map((c) => row[c]),
+    );
+  }
+
+  private countRows(tablePrefix: string, table: string): number {
+    return this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${tablePrefix}${table}`).toArray()[0]?.n ?? 0;
+  }
+
+  /** Anti-join graph/evidence integrity over the STAGED tables — an edge or evidence row
+   *  pointing at a node/memory item that doesn't exist in the same staged import fails the
+   *  restore before any switch happens. */
+  private stagingIntegrityProblems(): string[] {
+    const problems: string[] = [];
+    const danglingEdges = this.ctx.storage.sql
+      .exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM staging_edges e
+         WHERE NOT EXISTS (SELECT 1 FROM staging_nodes n WHERE n.id = e.from_node_id)
+            OR NOT EXISTS (SELECT 1 FROM staging_nodes n2 WHERE n2.id = e.to_node_id)`,
+      )
+      .toArray()[0]?.n ?? 0;
+    if (danglingEdges > 0) problems.push(`${danglingEdges} staged edge(s) reference a missing node`);
+    const danglingEvidence = this.ctx.storage.sql
+      .exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM staging_evidence ev
+         WHERE NOT EXISTS (SELECT 1 FROM staging_memory_items m WHERE m.id = ev.memory_item_id)`,
+      )
+      .toArray()[0]?.n ?? 0;
+    if (danglingEvidence > 0) problems.push(`${danglingEvidence} staged evidence row(s) reference a missing memory item`);
+    return problems;
+  }
+
+  private dropStagingTables(tables: readonly string[]): void {
+    for (const table of tables) this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS staging_${table}`);
+  }
+
+  /**
+   * Restore this project's canonical memory from a portable snapshot (PLNR-248's export).
+   * Fetches and validates the manifest, imports every chunk into staging (chunk-at-a-time,
+   * never the whole snapshot in memory), verifies row counts and graph/evidence integrity
+   * against staging, and only on success performs the one atomic generation switch. Marks
+   * derived vectors dirty on success — a snapshot's vectors, if any existed, never travel
+   * with it (§9); the real rebuild is Phase 4's, this only flags it.
+   */
+  async restoreSnapshot(
+    projectId: string,
+    opts: { exportedAt: string },
+  ): Promise<{ ok: true; tableCounts: Record<string, number> } | { ok: false; reason: string }> {
+    await this.assertProjectId(projectId);
+    if (!this.env.FILES) return { ok: false, reason: 'R2 (FILES) not configured' };
+    let manifest;
+    try {
+      manifest = await fetchManifest(this.env, projectId, opts.exportedAt);
+    } catch (err) {
+      return { ok: false, reason: `could not fetch manifest: ${String(err)}` };
+    }
+    const header = checkManifestHeader(manifest, projectId, this.readSchemaVersion());
+    if (!header.ok) return { ok: false, reason: header.problems.join('; ') };
+
+    const importedTables = new Set<string>();
+    try {
+      this.ctx.storage.sql.exec('PRAGMA foreign_keys = OFF');
+      for await (const chunk of readSnapshotChunks(this.env, manifest)) {
+        if (!importedTables.has(chunk.table)) {
+          this.createStagingTable(chunk.table);
+          importedTables.add(chunk.table);
+        }
+        this.ctx.storage.transactionSync(() => {
+          for (const row of chunk.rows) this.insertStagingRow(chunk.table, row);
+        });
+      }
+
+      const countProblems: string[] = [];
+      for (const [table, expected] of Object.entries(manifest.tableCounts)) {
+        const actual = importedTables.has(table) ? this.countRows('staging_', table) : 0;
+        if (actual !== expected) countProblems.push(`${table}: expected ${expected} rows, staged ${actual}`);
+      }
+      const integrityProblems = importedTables.has('edges') || importedTables.has('evidence') ? this.stagingIntegrityProblems() : [];
+      const problems = [...countProblems, ...integrityProblems];
+      if (problems.length > 0) {
+        this.dropStagingTables([...importedTables]);
+        return { ok: false, reason: problems.join('; ') };
+      }
+
+      this.ctx.storage.transactionSync(() => {
+        for (const table of importedTables) {
+          this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS prev_${table}`);
+          this.ctx.storage.sql.exec(`ALTER TABLE ${table} RENAME TO prev_${table}`);
+          this.ctx.storage.sql.exec(`ALTER TABLE staging_${table} RENAME TO ${table}`);
+        }
+        this.ctx.storage.sql.exec(
+          `INSERT INTO _meta (key, value) VALUES ('has_prior_generation', '1')
+           ON CONFLICT (key) DO UPDATE SET value = '1'`,
+        );
+      });
+
+      await this.reportVectorDirty(projectId, true);
+      const tableCounts: Record<string, number> = {};
+      for (const table of importedTables) tableCounts[table] = this.countRows('', table);
+      return { ok: true, tableCounts };
+    } catch (err) {
+      // A chunk that failed its own checksum (readSnapshotChunks throws rather than yielding
+      // untrusted rows) lands here too — drop whatever staging tables got as far as being
+      // created and report failure. The active generation was never touched: the switch above
+      // is the only place that renames a live table, and we never reached it.
+      this.dropStagingTables([...importedTables]);
+      return { ok: false, reason: String(err) };
+    } finally {
+      this.ctx.storage.sql.exec('PRAGMA foreign_keys = ON');
+    }
+  }
+
+  /** Swap the retained prior generation back to active — no R2 read, no re-validation; it was
+   *  already trusted when it was live. Single-level undo: rolling back consumes the retained
+   *  generation, so a second rollback has nothing left to swap. */
+  async rollback(projectId: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+    await this.assertProjectId(projectId);
+    const flag = this.ctx.storage.sql.exec<{ value: string }>(`SELECT value FROM _meta WHERE key = 'has_prior_generation'`).toArray()[0];
+    if (flag?.value !== '1') return { ok: false, reason: 'no retained prior generation to roll back to' };
+    this.ctx.storage.transactionSync(() => {
+      for (const table of BACKUP_TABLES) {
+        const hasPrev = this.ctx.storage.sql.exec<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1`, `prev_${table}`).toArray().length > 0;
+        if (!hasPrev) continue;
+        this.ctx.storage.sql.exec(`ALTER TABLE ${table} RENAME TO rolled_back_${table}`);
+        this.ctx.storage.sql.exec(`ALTER TABLE prev_${table} RENAME TO ${table}`);
+        this.ctx.storage.sql.exec(`DROP TABLE rolled_back_${table}`);
+      }
+      this.ctx.storage.sql.exec(`UPDATE _meta SET value = '0' WHERE key = 'has_prior_generation'`);
+    });
+    await this.reportVectorDirty(projectId, true);
+    return { ok: true };
+  }
+
+  /** Explicitly discard the retained prior generation once its rollback window has passed —
+   *  PLNR-250's scheduled sweep calls this; a manual call here is enough for this task. */
+  async pruneRetainedGeneration(projectId: string): Promise<{ ok: true }> {
+    await this.assertProjectId(projectId);
+    this.ctx.storage.transactionSync(() => {
+      for (const table of BACKUP_TABLES) this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS prev_${table}`);
+      this.ctx.storage.sql.exec(`UPDATE _meta SET value = '0' WHERE key = 'has_prior_generation'`);
+    });
+    return { ok: true };
+  }
+
+  private async reportVectorDirty(projectId: string, dirty: boolean): Promise<void> {
+    await this.env.PROJECT_ROOM.get(this.env.PROJECT_ROOM.idFromName(projectId))
+      .setMemoryVectorDirty(projectId, dirty)
+      .catch((err) => console.warn(`ProjectMemory vector-dirty report for ${projectId} failed: ${String(err)}`));
+  }
+
+  /** The rebuild hook Phase 4 (PLNR-256) fills in. No memory Vectorize index exists yet, so
+   *  this is an honest no-op regardless of whether VECTORIZE is bound — it does NOT clear the
+   *  dirty flag, because there is nothing yet that actually rebuilds anything from it. */
+  async rebuildVectorIndex(projectId: string): Promise<{ ok: true; rebuilt: false; reason: string }> {
+    await this.assertProjectId(projectId);
+    const reason = this.env.VECTORIZE
+      ? 'VECTORIZE is bound, but no memory vector index exists yet (Phase 4) — nothing to rebuild'
+      : 'VECTORIZE is not bound — nothing to rebuild';
+    console.log(`ProjectMemory rebuildVectorIndex(${projectId}): ${reason}`);
+    return { ok: true, rebuilt: false, reason };
+  }
+
   /**
    * Best-effort wipe of every row (PLNR-246), called fire-and-forget from
    * ProjectRoom.deleteProject once the D1 registry rows are already gone. Full
@@ -590,5 +795,72 @@ export class ProjectMemory extends DurableObject<Env> {
   async _countNodes(projectId: string): Promise<number> {
     await this.assertProjectId(projectId);
     return this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM nodes`).toArray()[0]?.n ?? 0;
+  }
+
+  /** Test/seed-only: a typed edge between two already-seeded nodes (PLNR-249's restore
+   *  round-trip needs graph data beyond bare nodes). Not the real write surface — PLNR-251. */
+  async _seedEdge(projectId: string, type: string, fromNodeId: string, toNodeId: string): Promise<string> {
+    await this.assertProjectId(projectId);
+    const id = newId('edge');
+    this.ctx.storage.sql.exec(
+      `INSERT INTO edges (id, type, from_node_id, to_node_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5)`,
+      id,
+      type,
+      fromNodeId,
+      toNodeId,
+      nowIso(),
+    );
+    return id;
+  }
+
+  /** Test/seed-only: a bare memory item. See _seedEdge. */
+  async _seedMemoryItem(projectId: string, kind: string, statement: string): Promise<string> {
+    await this.assertProjectId(projectId);
+    const id = newId('mem');
+    this.ctx.storage.sql.exec(
+      `INSERT INTO memory_items (id, kind, statement, recorded_at) VALUES (?1, ?2, ?3, ?4)`,
+      id,
+      kind,
+      statement,
+      nowIso(),
+    );
+    return id;
+  }
+
+  /** Test/seed-only: an evidence row citing an already-seeded memory item. See _seedEdge. */
+  async _seedEvidence(projectId: string, memoryItemId: string, repositoryKey: string, branch: string, baseId: string, path: string): Promise<string> {
+    await this.assertProjectId(projectId);
+    const id = newId('ev');
+    this.ctx.storage.sql.exec(
+      `INSERT INTO evidence (id, memory_item_id, repository_key, branch, base_id, path, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+      id,
+      memoryItemId,
+      repositoryKey,
+      branch,
+      baseId,
+      path,
+      nowIso(),
+    );
+    return id;
+  }
+
+  /** Test-only: one-hop graph traversal from a node, via edges of the given type. Exists so
+   *  PLNR-249's restore round-trip can prove a restored graph still answers the SAME traversal
+   *  as the pre-restore one, without exposing a general query surface. */
+  async _traverseFrom(projectId: string, fromNodeId: string, type: string): Promise<string[]> {
+    await this.assertProjectId(projectId);
+    return this.ctx.storage.sql
+      .exec<{ to_node_id: string }>(`SELECT to_node_id FROM edges WHERE from_node_id = ?1 AND type = ?2 ORDER BY to_node_id`, fromNodeId, type)
+      .toArray()
+      .map((r) => r.to_node_id);
+  }
+
+  /** Test-only: evidence paths cited by one memory item, for the same reason as _traverseFrom. */
+  async _evidencePathsFor(projectId: string, memoryItemId: string): Promise<string[]> {
+    await this.assertProjectId(projectId);
+    return this.ctx.storage.sql
+      .exec<{ path: string }>(`SELECT path FROM evidence WHERE memory_item_id = ?1 ORDER BY path`, memoryItemId)
+      .toArray()
+      .map((r) => r.path);
   }
 }

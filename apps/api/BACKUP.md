@@ -58,7 +58,7 @@ memory-backups/<projectId>/<exportedAt>/<table>/chunk-<n>.jsonl.gz
 
 ```sh
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
-  "https://<your-host>/api/admin/projects/<projectId>/memory-backup"
+  "https://<your-host>/api/admin/memory-backup/<projectId>"
 ```
 
 Add `?tier=full` for the full tier (currently equivalent to core). Without R2 bound, this
@@ -71,7 +71,47 @@ compact D1 `project_memory_registry` — a project that hasn't has nothing in Pr
 worth backing up). Each project's export is independent; one failing never blocks another's.
 Recent status is visible in that same registry row (`backup_status`, `last_backup_at`).
 
-Restoring a ProjectMemory snapshot is covered separately once that capability lands (PLNR-249).
+### Restoring a ProjectMemory snapshot (PLNR-249)
+
+Restore is **generation-based, never delete-first**: every table from the snapshot imports into
+a staging copy inside the project's own store, gets fully validated there (row counts against
+the manifest, checksums on every chunk, and edges/evidence pointing at rows that actually
+exist), and only then does one atomic switch make it active. If validation fails at any point,
+the active generation is untouched — nothing was ever deleted to make room for the restore.
+
+```sh
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "https://<your-host>/api/admin/memory-restore/<projectId>?confirm=replace&exportedAt=<exportedAt>"
+```
+
+`exportedAt` is the timestamp segment from the backup you want (the same value that appears in
+its R2 prefix, `memory-backups/<projectId>/<exportedAt>/`). Refuses without `?confirm=replace`.
+Exempt from the write-freeze, like `/api/admin/import` — `freeze → restore → unfreeze` is a
+clean cutover here too.
+
+**Rollback** — the generation that was active immediately before the restore is retained (not
+deleted) until explicitly pruned, so you can undo without re-uploading or re-validating anything:
+
+```sh
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "https://<your-host>/api/admin/memory-restore/<projectId>/rollback"
+```
+
+This is a **single-level** undo — only the immediately preceding generation is kept, so rolling
+back twice in a row does nothing the second time (there's nothing left to swap back to). The
+retained generation is pruned automatically on a policy timer (PLNR-250) or can be discarded
+manually.
+
+**Derived vectors after a restore:** a snapshot's rows never carry trusted vector embeddings —
+after activation the project is marked vector-dirty (visible in `project_memory_registry`) and
+must be re-embedded from the restored canonical rows. There is no memory Vectorize index to
+rebuild from yet (that lands in a later phase); the flag exists now so that pipeline has
+something to read once it does.
+
+**Schema compatibility:** a snapshot from a *newer* server than the one restoring it is refused
+outright — there's nothing to safely migrate it forward from. A snapshot from an older schema
+version is accepted (today there is only one schema version, so this path is dormant until a
+second one exists).
 
 ## 3. Restore
 
