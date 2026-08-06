@@ -14,6 +14,7 @@ import {
   type CodeEntity, type CodeSearchBackend,
 } from '../src/memory/code-index';
 import { indexEntity as indexOperationalEntity, type SearchBackend, type EmbeddingClient, type VectorStore } from '../src/search';
+import { buildEntityUri, parseEntityUri } from '@noriq-dev/shared';
 
 const appEnv = env as unknown as Env;
 
@@ -102,6 +103,26 @@ describe('vector id scheme — generation-free, entity-URI keyed', () => {
     await indexCodeEntity(backend, { uri, projectId: 'p1', repositoryKey: 'repo-a', generationId: 'gen-b', type: 'file', label: 'index.ts (revised)' });
     expect(vectors.size).toBe(1); // same id — an upsert, not a second vector
     expect(vectors.get(uri)!.metadata.generationId).toBe('gen-b'); // metadata advanced
+  });
+
+  it('a multi-chunk symbol\'s chunk suffix does not corrupt its #name fragment (PLNR-262)', async () => {
+    const { store, vectors } = fakeStore();
+    const backend: CodeSearchBackend = { embedder: fakeEmbedder, store };
+    const ref = { kind: 'symbol' as const, projectKey: 'PLNR', repositoryKey: 'repo-a', path: 'src/big.ts', name: 'bigFunction' };
+    const uri = buildEntityUri(ref);
+    await indexCodeEntity(backend, {
+      uri, projectId: 'p1', repositoryKey: 'repo-a', generationId: 'gen-a', type: 'symbol', label: 'bigFunction',
+      content: `${'x'.repeat(1400)}\n\n${'y'.repeat(1400)}`,
+    });
+    const ids = [...vectors.keys()];
+    expect(ids).toContain(uri); // chunk 0 — the bare uri
+    const chunk1 = ids.find((id) => id !== uri)!;
+    expect(chunk1.startsWith(`${uri}#`)).toBe(false); // the OLD scheme would have appended #1 here
+    // Stripping the chunk suffix (whatever it is) and parsing what's left recovers the SAME ref
+    // that buildEntityUri produced — the collision the old `#${chunk}` scheme would have caused.
+    const base = chunk1.slice(0, uri.length);
+    expect(base).toBe(uri);
+    expect(parseEntityUri(base)).toEqual(ref);
 
     await removeCodeEntity(backend, uri);
     expect(vectors.size).toBe(0);
@@ -114,7 +135,10 @@ describe('vector id scheme — generation-free, entity-URI keyed', () => {
       uri: 'noriq://file/PLNR/repo-a/big.ts', projectId: 'p1', repositoryKey: 'repo-a', generationId: 'gen-a', type: 'file', label: 'big.ts',
       content: `${'x'.repeat(1400)}\n\n${'y'.repeat(1400)}`,
     });
-    expect([...vectors.keys()]).toEqual(['noriq://file/PLNR/repo-a/big.ts', 'noriq://file/PLNR/repo-a/big.ts#1']);
+    // PLNR-262: the chunk separator is U+241E (␞), not `#` — `#` is reserved for a repository-
+    // scoped entity's own {path}#{name} fragment (symbol/test/api), so a chunk suffix must never
+    // collide with it.
+    expect([...vectors.keys()]).toEqual(['noriq://file/PLNR/repo-a/big.ts', 'noriq://file/PLNR/repo-a/big.ts␞1']);
   });
 });
 

@@ -16,6 +16,7 @@ import {
   type EpisodeUploadManifest,
 } from '../memory/ingest';
 import { IndexGenerationManifest, type IndexBatch } from '@noriq-dev/shared';
+import { planProjection, changedFileUris, coChangePairs, CO_CHANGE_PAIR_CAP } from '../memory/projection';
 import {
   applyMemoryFilters, rankCandidates, RETRIEVAL_DEFAULTS,
   type RetrievalHit, type RetrievalStage, type RankedHit,
@@ -849,6 +850,170 @@ export class ProjectMemory extends DurableObject<Env> {
       .catch((err) => console.warn(`ProjectMemory active-generation projection for ${projectId}/${gen.repository_key} failed: ${String(err)}`));
 
     return { activated: generationId, superseded };
+  }
+
+  /**
+   * Project an ALREADY-ACTIVE generation's staged entities/edges into the live graph
+   * (`nodes`/`edges`) — PLNR-262. Staging (PLNR-261) never writes here, which is what keeps a
+   * staged-but-unvalidated generation invisible to every query surface; this is the one place
+   * that promotes staged rows into current project knowledge.
+   *
+   * Bulk, not per-row: a single `transactionSync` upserts every valid entity and edge and emits
+   * ONE summary outbox event, never one per entity/edge (writeNode/writeEdge's per-call outbox +
+   * memory_revision + applied_operations + alarm would flood the coordination event log on a
+   * real repository).
+   *
+   * Stable identity is free: `buildEntityUri` is generation-free (§18) and the upsert is
+   * `ON CONFLICT (uri) DO UPDATE`, so an unchanged entity re-projected under a new generationId
+   * keeps its existing node id automatically — no version key needed.
+   *
+   * Retirement: an entity present in the PREVIOUS active generation for this repository but
+   * absent from this one has its live EDGES severed (not its node deleted — edges FK-reference
+   * nodes and Durable Object SQLite enforces that always; the node row survives so evidence/
+   * episodes citing its uri by string still resolve). Every current graph-traversal query
+   * surface (dependencyNeighborhood et al., PLNR-258) walks edges from a seed, so a retired
+   * entity stops appearing as "current" without its history being erased.
+   */
+  async projectActiveGeneration(
+    projectId: string,
+    generationId: string,
+  ): Promise<{ nodesWritten: number; edgesWritten: number; entitiesSkipped: number; edgesSkipped: number; retired: number; coChangeEdges: number }> {
+    await this.assertProjectId(projectId);
+    const gen = this.getIndexGenerationRow(generationId);
+    if (!gen) throw new Error(`generation ${generationId} not found`);
+    if (gen.status !== 'active') throw new Error(`generation ${generationId} is ${gen.status} — only an active generation may be projected`);
+    const projectKey = await this.resolveProjectKey(projectId);
+
+    const stagedEntities = this.ctx.storage.sql
+      .exec<{ uri: string; type: string; label: string; content: string | null }>(
+        `SELECT uri, type, label, content FROM index_staged_entities WHERE generation_id = ?1`,
+        generationId,
+      )
+      .toArray();
+    const stagedEdges = this.ctx.storage.sql
+      .exec<{ type: string; from_uri: string; to_uri: string }>(`SELECT type, from_uri, to_uri FROM index_staged_edges WHERE generation_id = ?1`, generationId)
+      .toArray();
+
+    const plan = planProjection(
+      projectKey,
+      stagedEntities,
+      stagedEdges.map((e) => ({ type: e.type, fromUri: e.from_uri, toUri: e.to_uri })),
+    );
+    for (const bad of plan.invalidEntities) console.warn(`ProjectMemory projection(${generationId}): skipping invalid staged entity ${bad.uri}: ${bad.reason}`);
+    for (const bad of plan.invalidEdges) console.warn(`ProjectMemory projection(${generationId}): skipping invalid staged edge: ${bad.reason}`);
+
+    // The most recently superseded generation for this repository — its still-present staged
+    // rows (PLNR-261 never deletes them on supersession) are the "previous" side of both
+    // retirement and the co-change signal below.
+    const prevGen = this.ctx.storage.sql
+      .exec<{ id: string }>(
+        `SELECT id FROM index_generations WHERE repository_key = ?1 AND status = 'superseded' AND id != ?2 ORDER BY activated_at DESC LIMIT 1`,
+        gen.repository_key,
+        generationId,
+      )
+      .toArray()[0];
+
+    let retired = 0;
+    let coChangeEdges = 0;
+
+    this.ctx.storage.transactionSync(() => {
+      const now = nowIso();
+      for (const e of plan.validEntities) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO nodes (id, type, uri, label, created_at) VALUES (?1,?2,?3,?4,?5)
+           ON CONFLICT (uri) DO UPDATE SET label = excluded.label, type = excluded.type`,
+          newId('node'),
+          e.type,
+          e.uri,
+          e.label,
+          now,
+        );
+      }
+      const nodeIdByUri = (uri: string): string | undefined =>
+        this.ctx.storage.sql.exec<{ id: string }>(`SELECT id FROM nodes WHERE uri = ?1`, uri).toArray()[0]?.id;
+
+      for (const e of plan.validEdges) {
+        const fromId = nodeIdByUri(e.fromUri);
+        const toId = nodeIdByUri(e.toUri);
+        if (!fromId || !toId) continue; // defensive — planProjection already filtered to valid uris
+        this.ctx.storage.sql.exec(
+          `INSERT INTO edges (id, type, from_node_id, to_node_id, created_at) VALUES (?1,?2,?3,?4,?5)
+           ON CONFLICT (type, from_node_id, to_node_id) DO NOTHING`,
+          newId('edge'),
+          e.type,
+          fromId,
+          toId,
+          now,
+        );
+      }
+
+      if (prevGen) {
+        const prevEntities = this.ctx.storage.sql
+          .exec<{ uri: string; type: string }>(`SELECT uri, type FROM index_staged_entities WHERE generation_id = ?1`, prevGen.id)
+          .toArray();
+        const prevFileUris = new Set(prevEntities.filter((e) => e.type === 'file').map((e) => e.uri));
+        const newFileUris = new Set(plan.validEntities.filter((e) => e.type === 'file').map((e) => e.uri));
+
+        const removedUris = [...prevFileUris].filter((u) => !newFileUris.has(u));
+        for (const uri of removedUris) {
+          const node = nodeIdByUri(uri);
+          if (!node) continue;
+          this.ctx.storage.sql.exec(`DELETE FROM edges WHERE from_node_id = ?1 OR to_node_id = ?1`, node);
+          retired++;
+        }
+
+        const changed = changedFileUris(prevFileUris, newFileUris);
+        const pairs = coChangePairs(changed);
+        if (changed.length > CO_CHANGE_PAIR_CAP) {
+          console.warn(
+            `ProjectMemory projection(${generationId}): ${changed.length} files changed together — exceeds the co-change pairing cap (${CO_CHANGE_PAIR_CAP}); skipping pairwise edges this round`,
+          );
+        }
+        for (const [a, b] of pairs) {
+          const aId = nodeIdByUri(a);
+          const bId = nodeIdByUri(b);
+          if (!aId || !bId) continue; // one side was retired/never projected — nothing to link
+          this.ctx.storage.sql.exec(
+            `INSERT INTO edges (id, type, from_node_id, to_node_id, created_at) VALUES (?1,'commonly_changes_with',?2,?3,?4)
+             ON CONFLICT (type, from_node_id, to_node_id) DO NOTHING`,
+            newId('edge'),
+            aId,
+            bId,
+            now,
+          );
+          coChangeEdges++;
+        }
+      }
+
+      // ONE summary outbox event for the whole projection — never one per entity/edge.
+      const operationId = newId('op');
+      this.ctx.storage.sql.exec(
+        `INSERT INTO outbox (id, operation_id, verb, subject_type, subject_id, payload, created_at) VALUES (?1,?2,'memory.changed','memory',?3,?4,?5)`,
+        newId('obx'),
+        operationId,
+        generationId,
+        JSON.stringify({ operationId, entityType: 'generation-projection', generationId, nodesWritten: plan.validEntities.length, edgesWritten: plan.validEdges.length }),
+        now,
+      );
+      this.ctx.storage.sql.exec(`UPDATE memory_revision SET value = value + 1 WHERE id = 0`);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO applied_operations (operation_id, applied_at, subject_type, subject_id, result) VALUES (?1,?2,'generation-projection',?3,?4)`,
+        operationId,
+        now,
+        generationId,
+        JSON.stringify({ nodesWritten: plan.validEntities.length, edgesWritten: plan.validEdges.length }),
+      );
+    });
+    this.ctx.storage.setAlarm(Date.now()).catch(() => {});
+
+    return {
+      nodesWritten: plan.validEntities.length,
+      edgesWritten: plan.validEdges.length,
+      entitiesSkipped: plan.invalidEntities.length,
+      edgesSkipped: plan.invalidEdges.length,
+      retired,
+      coChangeEdges,
+    };
   }
 
   /** Abort a still-staged generation, dropping its staged rows. Refuses once active/superseded —

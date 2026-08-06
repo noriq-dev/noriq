@@ -43,9 +43,12 @@ export interface Env {
    *  none of which is true of authored memory. Optional: without it (or `AI`), code retrieval
    *  degrades to lexical + graph (§20); reindexing code never touches an operational memory/
    *  episode vector either way (see memory/code-index.ts). Create with
-   *  `wrangler vectorize create noriq-code --dimensions=1024 --metric=cosine` and BOTH metadata
-   *  indexes the adapter filters on:
+   *  `wrangler vectorize create noriq-code --dimensions=1024 --metric=cosine` and ALL THREE
+   *  metadata indexes the adapter filters on (queryCodeIndex filters server-side on
+   *  `repositoryKey` too, PLNR-262 — an unprovisioned property passes every test against the
+   *  fake store here but is rejected or silently ignored by a REAL Vectorize index):
    *  `wrangler vectorize create-metadata-index noriq-code --property-name=projectId --type=string`
+   *  `wrangler vectorize create-metadata-index noriq-code --property-name=repositoryKey --type=string`
    *  `wrangler vectorize create-metadata-index noriq-code --property-name=generationId --type=string`. */
   CODE_VECTORIZE?: VectorizeIndex;
   /** HMAC key for signing agent attachment-upload capability tokens (PLNR-173). Optional:

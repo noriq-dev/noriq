@@ -79,7 +79,17 @@ export interface CodeEntity {
   content?: string | null;
 }
 
-const vecId = (uri: string, chunk: number) => (chunk === 0 ? uri : `${uri}#${chunk}`);
+// PLNR-262: the chunk separator is NOT `#` — symbol/test/api URIs already end in `#{name}`
+// (PLNR-278's fragment convention), so a multi-chunk entity's OLD `${uri}#${chunk}` id produced
+// `noriq://symbol/K/repo/x.ts#foo#3`, and parseEntityUri (splitting on the FIRST `#`) read that
+// back as `name: "foo#3"`. Chunk 0 was always safe (it IS the bare uri), which is why this was
+// invisible until an entity's content exceeded one chunk. U+241E (SYMBOL FOR RECORD SEPARATOR)
+// cannot appear in a real path or identifier, so appending it never collides with a `#name`
+// fragment or a path segment — nothing in this codebase parses a vector id back through
+// parseEntityUri today (queryCodeIndex reads the real uri from vector METADATA, never the id),
+// but this keeps that reconstructable rather than silently ambiguous.
+const CHUNK_SEPARATOR = '␞';
+const vecId = (uri: string, chunk: number) => (chunk === 0 ? uri : `${uri}${CHUNK_SEPARATOR}${chunk}`);
 
 function entityChunks(e: CodeEntity): string[] {
   const head = e.label;
