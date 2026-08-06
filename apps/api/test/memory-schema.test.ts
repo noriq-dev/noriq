@@ -380,9 +380,10 @@ describe('MemoryNodeType <-> EntityRef drift guard (PLNR-278)', () => {
     expect(EntityRef.options.map((o) => o.shape.kind.value)).toContain('hazard');
   });
 
-  it('the exemption list is exactly the five node types with no current EntityRef arm', async () => {
+  it('the exemption list is exactly the four node types with no current EntityRef arm', async () => {
+    // 'agent' graduated out of this set in PLNR-263: episodes' `owned_by` edge is a real writer.
     const { EXEMPT_NODE_TYPES } = await import('@noriq-dev/shared');
-    expect([...EXEMPT_NODE_TYPES].sort()).toEqual(['agent', 'branch', 'error', 'project', 'revision']);
+    expect([...EXEMPT_NODE_TYPES].sort()).toEqual(['branch', 'error', 'project', 'revision']);
   });
 });
 

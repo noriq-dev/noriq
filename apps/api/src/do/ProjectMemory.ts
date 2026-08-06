@@ -1,9 +1,12 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../env';
 import { newId, nowIso } from '../lib/util';
-import { buildEntityUri, AUTHORITY_HYPOTHESIS, AUTHORITY_HUMAN_APPROVED, AUTHORITY_VERIFIED_MERGED, type MemoryBackupManifest } from '@noriq-dev/shared';
+import {
+  buildEntityUri, AUTHORITY_HYPOTHESIS, AUTHORITY_HUMAN_APPROVED, AUTHORITY_VERIFIED_MERGED,
+  EffortEpisode, EpisodeSelfSummary, type MemoryBackupManifest,
+} from '@noriq-dev/shared';
 import { projectCoordinationEvents, type ProjectedEvent } from '../lib/memory-projector';
-import { exportMemorySnapshot } from '../memory/backup';
+import { exportMemorySnapshot, sha256HexBytes } from '../memory/backup';
 import { fetchManifest, readSnapshotChunks, checkManifestHeader } from '../memory/restore';
 import { deleteAllProjectBackups, sizeStatus, type EraseReport, type EraseStepResult } from '../memory/lifecycle';
 import { MEMORY_MIGRATIONS } from '../memory/migrations';
@@ -26,6 +29,7 @@ import {
   type GraphEntityRef, type DependencyNeighborhoodResult, type ValidatingTestsResult,
   type ImplementingWorkResult, type DecisionLineageResult, type ChangeImpactResult,
 } from '../memory/graph-queries';
+import { parseExit } from '../memory/episodes';
 
 /**
  * ProjectMemory — one instance per project (idFromName(projectId)), canonical
@@ -68,6 +72,44 @@ export interface ProjectMemoryHealth {
   sizeStatus: 'ok' | 'warn' | 'critical';
 }
 
+/**
+ * `recordEpisode`'s input (PLNR-263) — the deterministic skeleton's fields (matching
+ * `memory/episodes.ts`'s `EpisodeSkeleton` one-for-one) PLUS the two things a skeleton alone
+ * cannot carry: `agentId`/`runKind`/`outcome`/`startedAt`/`finishedAt` are the run's OWN
+ * identity, always resolved by the CALLER from `runs` (never trusted from an uploaded payload —
+ * `completeEpisodeIngest`, the other caller, does its own tiny `runs` lookup before calling
+ * this, exactly like `recordEpisodeForRun` does), and `selfSummary`/`actor` are the two fields
+ * only a daemon upload or an agent can supply. `taskTitle` is a label hint for the task node,
+ * never persisted as its own column.
+ */
+interface RecordEpisodeInput {
+  runId: string;
+  agentId: string | null;
+  runKind: string;
+  outcome: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  taskId: string | null;
+  taskTitle?: string | null;
+  repositoryKey: string | null;
+  baseId: string | null;
+  timeline: Array<{ at: string; label: string }>;
+  filesTouched: string[];
+  commands: string[];
+  testsRun: string[];
+  failures: string[];
+  findings: Array<{ summary: string; severity?: string }>;
+  reviewRounds: number;
+  tokenUsage: Record<string, unknown>;
+  costUSD: number;
+  acceptanceCoverage: number | null;
+  steeringEvents: string[];
+  landingOutcome: string;
+  remainingWork: string[];
+  selfSummary?: unknown;
+  actor: { kind: string; id: string | null };
+}
+
 export const SCHEMA_TABLES = [
   'repositories',
   'index_generations',
@@ -102,11 +144,23 @@ export const OPERATIONAL_TABLES = ['applied_operations', 'memory_revision', 'pro
 export const BACKUP_TABLES = [...SCHEMA_TABLES, ...OPERATIONAL_TABLES] as const;
 
 /**
- * PLNR-255: the embedding/display text derived from an episode's `body` JSON blob (nothing
- * writes real episodes before PLNR-263 — see the module comment on `_seedEpisodeForTest`).
- * Picks the human-legible bits: the self-summary's approach and durable learnings, and each
- * finding's summary. Malformed/absent JSON degrades to a fixed string rather than throwing —
- * an episode this can't summarize should still index and hydrate, just without a preview.
+ * The shape of one accumulated episode-upload row (PLNR-263): an `EffortEpisode`, minus the
+ * three fields the SERVER always owns rather than trusting a daemon-supplied value — `id` and
+ * `createdAt` are minted by `recordEpisode` itself (see its own doc comment on why `episodeId`
+ * is resolved once, synchronously, rather than trusted from a payload), and `projectId` is
+ * already the RPC's own first parameter. A row that fails this parse is skipped, not fatal to
+ * the rest of the upload — the same per-row tolerance `planProjection` applies to staged index
+ * rows.
+ */
+const UPLOADED_EPISODE_SHAPE = EffortEpisode.omit({ id: true, projectId: true, createdAt: true });
+
+/**
+ * PLNR-255: the embedding/display text derived from an episode's `body` JSON blob — `body` is
+ * written by `recordEpisode` (PLNR-263), the canonical (and, since that task, only) episode
+ * writer. Picks the human-legible bits: the self-summary's approach and durable learnings, and
+ * each finding's summary. Malformed/absent JSON degrades to a fixed string rather than
+ * throwing — an episode this can't summarize should still index and hydrate, just without a
+ * preview.
  */
 function summarizeEpisodeBody(bodyJson: string): string {
   try {
@@ -1052,6 +1106,200 @@ export class ProjectMemory extends DurableObject<Env> {
     };
   }
 
+  /**
+   * The canonical episode writer (PLNR-263, §14). ONE episode per run: UPSERTs on `run_id`
+   * (0006's unique index), which is what makes duplicate delivery idempotent without an
+   * operation-id ledger lookup — a re-recorded skeleton (a replay, or the same run settling
+   * twice through two different callers) just overwrites the same row.
+   *
+   * Skeleton fields always win: every column below except `body.selfSummary` is set from THIS
+   * call's input, never merged with a prior write. `selfSummary` is the one exception (§14) — a
+   * present, valid value wins; an absent or invalid one PRESERVES whatever was already recorded,
+   * so a later skeleton-only write (a replay, or the server's own automatic recording arriving
+   * after a richer daemon upload already enriched the row) can never erase enrichment that
+   * already landed.
+   *
+   * Bulk graph write, ONE transaction, ONE outbox event — the same discipline
+   * `projectActiveGeneration`'s doc comment states and for the same reason: per-edge
+   * writeNode/writeEdge calls would emit an outbox row and bump `memory_revision` once per edge
+   * for one logical "this run produced an episode" fact.
+   *
+   * The five edges this writes, and only these (locked — see the task's execution spec):
+   *   episode --derived_from--> run
+   *   episode --related_to--> task        (if this run has a task anchor)
+   *   episode --owned_by--> agent         (if this run minted an agent)
+   *   episode --modifies--> file          (one per `filesTouched`, only when `repositoryKey` is
+   *                                         known — an unqualified path cannot become a URI)
+   *   episode --related_to--> memory      (every `memory_items` row this run's OWN agent
+   *                                         recorded — a runner-spawned agent lives for exactly
+   *                                         one run, RUN-43, so `recorded_by_agent_id = agentId`
+   *                                         IS "recorded during this run", no time-window needed)
+   */
+  async recordEpisode(
+    projectId: string,
+    input: RecordEpisodeInput,
+  ): Promise<{ episodeId: string; runId: string; created: boolean; nodesWritten: number; edgesWritten: number }> {
+    await this.assertProjectId(projectId);
+    if (!['done', 'failed', 'cancelled'].includes(input.outcome)) {
+      throw new Error(`recordEpisode: outcome "${input.outcome}" is not one of done/failed/cancelled`);
+    }
+    const now = nowIso();
+
+    // Absent OR malformed both leave the episode valid (§14) — `.catch(null)` swallows a bad
+    // self-summary rather than rejecting the whole record, reusing the SAME tolerance
+    // `EffortEpisode.selfSummary` already declares (see that field's doc comment in memory.ts).
+    const providedSelfSummary = EpisodeSelfSummary.nullable().catch(null).parse(input.selfSummary ?? null);
+
+    // Read BEFORE building the new body — the one piece of "existing" state this write can
+    // depend on, per the merge rule above: the STABLE id (a PK must never change across an
+    // upsert) and the prior self-summary to preserve. A plain read needs no transactionSync
+    // (nothing else can run inside this DO concurrently); the transactionSync below is for the
+    // WRITE.
+    const existingRow = this.ctx.storage.sql
+      .exec<{ id: string; body: string; created_at: string }>(`SELECT id, body, created_at FROM episodes WHERE run_id = ?1`, input.runId)
+      .toArray()[0];
+    let existingSelfSummary: unknown = null;
+    if (existingRow) {
+      try {
+        existingSelfSummary = (JSON.parse(existingRow.body) as { selfSummary?: unknown }).selfSummary ?? null;
+      } catch { /* an unreadable prior body is treated as "no prior self-summary", not an error */ }
+    }
+    const mergedSelfSummary = providedSelfSummary ?? EpisodeSelfSummary.nullable().catch(null).parse(existingSelfSummary);
+    const createdAt = existingRow?.created_at ?? now;
+    // Resolved ONCE, synchronously, before either the hash or the write — never re-derived from
+    // an ON CONFLICT clause's excluded/target ambiguity, so `body.id` and the row's own `id`
+    // column can never disagree.
+    const episodeId = existingRow?.id ?? newId('epi');
+    const created = !existingRow;
+
+    // Validated (and default-filled) through the SAME shared schema the wire contract uses —
+    // the full EffortEpisode rides `body` as JSON (locked decision; the table's own header
+    // comment already settles this), so this is the one construction site for that JSON, not a
+    // hand-rolled shape a second place could drift from.
+    const bodyObject = EffortEpisode.parse({
+      id: episodeId,
+      projectId,
+      runId: input.runId,
+      taskId: input.taskId,
+      repositoryKey: input.repositoryKey,
+      baseId: input.baseId,
+      timeline: input.timeline,
+      filesTouched: input.filesTouched,
+      commands: input.commands,
+      testsRun: input.testsRun,
+      failures: input.failures,
+      findings: input.findings,
+      reviewRounds: input.reviewRounds,
+      tokenUsage: input.tokenUsage,
+      costUSD: input.costUSD,
+      acceptanceCoverage: input.acceptanceCoverage,
+      steeringEvents: input.steeringEvents,
+      landingOutcome: input.landingOutcome,
+      remainingWork: input.remainingWork,
+      selfSummary: mergedSelfSummary,
+      createdAt,
+    });
+    const finalBody = JSON.stringify(bodyObject);
+    const contentHash = await sha256HexBytes(new TextEncoder().encode(finalBody));
+
+    // Only needed to build file URIs (§18's repository-scoped shape) — skip the D1 round trip
+    // when there is nothing to link.
+    const projectKey = input.repositoryKey && input.filesTouched.length ? await this.resolveProjectKey(projectId) : null;
+
+    let nodesWritten = 0;
+    let edgesWritten = 0;
+    this.ctx.storage.transactionSync(() => {
+      if (this._forceWriteFailure) throw new Error('injected write failure (test)');
+      // `episodeId` (from `existingRow.id`, when present) is ALSO what conflicts on `run_id`
+      // below — so on an update this re-supplies the SAME id the row already has, never a
+      // fresh one; on a first write it is the only id anyone has ever assigned. Either way the
+      // `id` column itself is never in the UPDATE SET list, matching writeNode/writeEdge's own
+      // "never move a stable id" convention.
+      this.ctx.storage.sql.exec(
+        `INSERT INTO episodes
+           (id, run_id, task_id, repository_key, base_id, landing_outcome, review_rounds, cost_usd,
+            acceptance_coverage, body, created_at, agent_id, run_kind, outcome, started_at, finished_at, content_hash)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+         ON CONFLICT (run_id) DO UPDATE SET
+           task_id = excluded.task_id, repository_key = excluded.repository_key, base_id = excluded.base_id,
+           landing_outcome = excluded.landing_outcome, review_rounds = excluded.review_rounds,
+           cost_usd = excluded.cost_usd, acceptance_coverage = excluded.acceptance_coverage, body = excluded.body,
+           agent_id = excluded.agent_id, run_kind = excluded.run_kind, outcome = excluded.outcome,
+           started_at = excluded.started_at, finished_at = excluded.finished_at, content_hash = excluded.content_hash`,
+        episodeId, input.runId, input.taskId, input.repositoryKey, input.baseId, input.landingOutcome,
+        input.reviewRounds, input.costUSD, input.acceptanceCoverage, finalBody, createdAt,
+        input.agentId, input.runKind, input.outcome, input.startedAt, input.finishedAt, contentHash,
+      );
+
+      const upsertNode = (type: string, uri: string, label: string): string => {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO nodes (id, type, uri, label, created_at) VALUES (?1,?2,?3,?4,?5)
+           ON CONFLICT (uri) DO UPDATE SET label = excluded.label`,
+          newId('node'), type, uri, label, now,
+        );
+        nodesWritten++;
+        return this.ctx.storage.sql.exec<{ id: string }>(`SELECT id FROM nodes WHERE uri = ?1`, uri).toArray()[0]!.id;
+      };
+      const linkEdge = (type: string, fromNodeId: string, toNodeId: string): void => {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO edges (id, type, from_node_id, to_node_id, created_at) VALUES (?1,?2,?3,?4,?5)
+           ON CONFLICT (type, from_node_id, to_node_id) DO NOTHING`,
+          newId('edge'), type, fromNodeId, toNodeId, now,
+        );
+        edgesWritten++;
+      };
+
+      const episodeNodeId = upsertNode('episode', buildEntityUri({ kind: 'episode', id: episodeId }), `${input.runKind} episode (${input.outcome})`);
+      const runNodeId = upsertNode('run', buildEntityUri({ kind: 'run', id: input.runId }), `${input.runKind} run`);
+      linkEdge('derived_from', episodeNodeId, runNodeId);
+
+      if (input.taskId) {
+        const taskNodeId = upsertNode('task', buildEntityUri({ kind: 'task', id: input.taskId }), input.taskTitle ?? input.taskId);
+        linkEdge('related_to', episodeNodeId, taskNodeId);
+      }
+      if (input.agentId) {
+        const agentNodeId = upsertNode('agent', buildEntityUri({ kind: 'agent', id: input.agentId }), input.agentId);
+        linkEdge('owned_by', episodeNodeId, agentNodeId);
+      }
+      if (projectKey && input.repositoryKey) {
+        for (const path of input.filesTouched) {
+          const fileNodeId = upsertNode('file', buildEntityUri({ kind: 'file', projectKey, repositoryKey: input.repositoryKey, path }), path);
+          linkEdge('modifies', episodeNodeId, fileNodeId);
+        }
+      }
+      if (input.agentId) {
+        const recordedMemories = this.ctx.storage.sql
+          .exec<{ id: string; kind: string }>(`SELECT id, kind FROM memory_items WHERE recorded_by_agent_id = ?1`, input.agentId)
+          .toArray();
+        for (const m of recordedMemories) {
+          const memoryNodeId = upsertNode('memory', buildEntityUri({ kind: 'memory', id: m.id }), m.kind);
+          linkEdge('related_to', episodeNodeId, memoryNodeId);
+        }
+      }
+
+      // ONE summary outbox event for the whole write — never one per node/edge.
+      const operationId = newId('op');
+      this.ctx.storage.sql.exec(
+        `INSERT INTO outbox (id, operation_id, verb, subject_type, subject_id, payload, created_at) VALUES (?1,?2,'memory.changed','memory',?3,?4,?5)`,
+        newId('obx'), operationId, episodeId,
+        JSON.stringify({ operationId, entityType: 'episode', runId: input.runId, outcome: input.outcome, nodesWritten, edgesWritten }),
+        now,
+      );
+      this.ctx.storage.sql.exec(`UPDATE memory_revision SET value = value + 1 WHERE id = 0`);
+    });
+    this.ctx.storage.setAlarm(Date.now()).catch(() => {});
+
+    // PLNR-255: index/re-index this episode the same way `rebuildVectorIndex` does — fire-and-
+    // forget, must never fail or slow the write it derives from.
+    const backend = searchBackend(this.env);
+    if (backend) {
+      void indexEntity(backend, { kind: 'episode', id: episodeId, projectId, title: `episode ${input.runId}`, body: summarizeEpisodeBody(finalBody) })
+        .catch((err) => console.warn(`ProjectMemory episode-index for ${episodeId} failed: ${String(err)}`));
+    }
+
+    return { episodeId, runId: input.runId, created, nodesWritten, edgesWritten };
+  }
+
   async beginEpisodeIngest(projectId: string, manifest: EpisodeUploadManifest): Promise<{ ok: true }> {
     await this.assertProjectId(projectId);
     this.ingestEpisodes.set(manifest.scopeId, beginIngestEpisode(this.ingestEpisodes.get(manifest.scopeId), manifest));
@@ -1071,12 +1319,79 @@ export class ProjectMemory extends DurableObject<Env> {
     return { ok: true, deduped };
   }
 
-  async completeEpisodeIngest(projectId: string, scopeId: string): Promise<{ ok: true; batchesReceived: number; rowCount: number }> {
+  /**
+   * Seals the upload, then parses each accumulated row as an `EffortEpisode` and hands it to
+   * the real writer (PLNR-263) — the episode-upload half of `recordEpisode`'s two callers (the
+   * other is `memory/episodes.ts`'s `recordEpisodeForRun`, from `ProjectRoom`'s terminal-run
+   * fire-and-forget). `agentId`/`runKind`/`outcome`/`startedAt` are resolved from THIS project's
+   * OWN `runs` row, never trusted from the upload — the same reason `recordEpisodeForRun` never
+   * lets a daemon supply them (see `RecordEpisodeInput`'s doc comment): a compromised or merely
+   * confused daemon must not be able to claim an outcome, agent, or run kind the server's own
+   * coordination state disagrees with. A row naming a run that does not exist in this project,
+   * or one with no terminal exit yet, is skipped rather than failing the whole completion —
+   * consistent with `planProjection`'s per-row tolerance.
+   */
+  async completeEpisodeIngest(
+    projectId: string,
+    scopeId: string,
+  ): Promise<{ ok: true; batchesReceived: number; rowCount: number; recorded: number; skipped: number }> {
     await this.assertProjectId(projectId);
     const state = this.ingestEpisodes.get(scopeId);
     if (!state) throw new Error(`no episode ingest in progress for ${scopeId}`);
     completeIngestEpisode(state);
-    return { ok: true, batchesReceived: state.receivedBatches.size, rowCount: state.rowCount };
+
+    let recorded = 0;
+    let skipped = 0;
+    for (const row of state.rows) {
+      const parsed = UPLOADED_EPISODE_SHAPE.safeParse(row);
+      if (!parsed.success) {
+        console.warn(`ProjectMemory episode-ingest(${scopeId}): skipping malformed uploaded row: ${parsed.error.issues[0]?.message ?? 'invalid'}`);
+        skipped++;
+        continue;
+      }
+      const runRow = await this.env.DB.prepare(`SELECT agent_id, kind, exit, started_at FROM runs WHERE id = ? AND project_id = ?`)
+        .bind(parsed.data.runId, projectId)
+        .first<{ agent_id: string | null; kind: string; exit: string | null; started_at: string | null }>();
+      if (!runRow) {
+        console.warn(`ProjectMemory episode-ingest(${scopeId}): uploaded row names run ${parsed.data.runId}, unknown in project ${projectId} — skipping`);
+        skipped++;
+        continue;
+      }
+      if (!runRow.exit) {
+        console.warn(`ProjectMemory episode-ingest(${scopeId}): run ${parsed.data.runId} has no terminal exit yet — skipping`);
+        skipped++;
+        continue;
+      }
+      const { outcome, finishedAt } = parseExit(runRow.exit);
+      await this.recordEpisode(projectId, {
+        runId: parsed.data.runId,
+        agentId: runRow.agent_id,
+        runKind: runRow.kind,
+        outcome,
+        startedAt: runRow.started_at,
+        finishedAt,
+        taskId: parsed.data.taskId,
+        repositoryKey: parsed.data.repositoryKey,
+        baseId: parsed.data.baseId,
+        timeline: parsed.data.timeline,
+        filesTouched: parsed.data.filesTouched,
+        commands: parsed.data.commands,
+        testsRun: parsed.data.testsRun,
+        failures: parsed.data.failures,
+        findings: parsed.data.findings,
+        reviewRounds: parsed.data.reviewRounds,
+        tokenUsage: parsed.data.tokenUsage,
+        costUSD: parsed.data.costUSD,
+        acceptanceCoverage: parsed.data.acceptanceCoverage,
+        steeringEvents: parsed.data.steeringEvents,
+        landingOutcome: parsed.data.landingOutcome,
+        remainingWork: parsed.data.remainingWork,
+        selfSummary: parsed.data.selfSummary,
+        actor: { kind: 'agent', id: runRow.agent_id },
+      });
+      recorded++;
+    }
+    return { ok: true, batchesReceived: state.receivedBatches.size, rowCount: state.rows.length, recorded, skipped };
   }
 
   async abortEpisodeIngest(projectId: string, scopeId: string): Promise<{ ok: true }> {
@@ -2870,41 +3185,4 @@ export class ProjectMemory extends DurableObject<Env> {
     this.ctx.storage.sql.exec(`UPDATE memory_items SET recorded_at = ?1 WHERE id = ?2`, recordedAt, memoryId);
   }
 
-  /** Test-only: seed an episode row directly. No write RPC produces real episodes before
-   *  PLNR-263 (effort-episode ingest) — this exists so PLNR-255's search/hydration work has
-   *  something to index and hydrate in the meantime, the same reason `_seedStagedIndexGeneration`
-   *  exists ahead of Phase 5's ingest pipeline. */
-  async _seedEpisodeForTest(
-    projectId: string,
-    input: {
-      runId: string;
-      taskId?: string | null;
-      repositoryKey?: string | null;
-      baseId?: string | null;
-      landingOutcome?: string;
-      reviewRounds?: number;
-      costUsd?: number;
-      acceptanceCoverage?: number | null;
-      body: Record<string, unknown>;
-    },
-  ): Promise<string> {
-    await this.assertProjectId(projectId);
-    const id = newId('epi');
-    this.ctx.storage.sql.exec(
-      `INSERT INTO episodes (id, run_id, task_id, repository_key, base_id, landing_outcome, review_rounds, cost_usd, acceptance_coverage, body, created_at)
-       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)`,
-      id,
-      input.runId,
-      input.taskId ?? null,
-      input.repositoryKey ?? null,
-      input.baseId ?? null,
-      input.landingOutcome ?? 'pending',
-      input.reviewRounds ?? 0,
-      input.costUsd ?? 0,
-      input.acceptanceCoverage ?? null,
-      JSON.stringify(input.body ?? {}),
-      nowIso(),
-    );
-    return id;
-  }
 }

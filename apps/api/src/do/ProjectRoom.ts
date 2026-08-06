@@ -15,6 +15,7 @@ import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
 import { RunKind, AgentTool, RunStatus, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey } from '@noriq-dev/shared';
 import { writeExecutionSpec } from '../lib/execution-spec';
+import { recordEpisodeForRun } from '../memory/episodes';
 
 /**
  * ProjectRoom — one instance per project (idFromName(projectId)).
@@ -3968,6 +3969,15 @@ export class ProjectRoom extends DurableObject<Env> {
       // the pump reads task state below.
       if (isTerminalRunStatus(to) && run.kind === 'build' && run.anchor_type === 'task' && run.anchor_id) {
         await this.settleAnchorTask(run.anchor_id, to, now, agentId);
+      }
+      // Every terminal run produces a deterministic episode (§14, PLNR-263) — fired AFTER the
+      // UPDATE above commits, and never awaited (§19: ProjectRoom never waits for episode
+      // enrichment). Same shape as the memory-erase fire-and-forget in deleteProject: a failed
+      // or slow ProjectMemory must never fail or delay the daemon's own status report.
+      if (isTerminalRunStatus(to)) {
+        void recordEpisodeForRun(this.env, projectId, runId).catch((err) =>
+          console.warn(`episode recording for run ${runId} failed: ${String(err)}`),
+        );
       }
       await this.emit(actor, 'run.status_changed', 'run', runId, { from: run.status, to, reason: patch.reason ?? null });
       // A terminal run is the plan-dispatch pump's main wake-up (PLNR-170): it freed a slot,

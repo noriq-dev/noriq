@@ -103,10 +103,15 @@ export function parseStagedRow(row: Record<string, unknown>): StagedRow {
 
 // ---------------------------------------------------------------------------
 // Episode ingest (§14) — the same begin/batch/complete/abort/status shape, deliberately not
-// sharing IndexGenerationManifest: an episode upload has no repository/branch/baseId, and this
-// task lands only the ENDPOINT (deferred: real episode RECORD semantics — the deterministic
-// skeleton, self-summary enrichment, and the episodes table's writer — are PLNR-263's;
-// `_seedEpisodeForTest` remains the only episode writer until then).
+// sharing IndexGenerationManifest: an episode upload has no repository/branch/baseId. This
+// remains an IN-MEMORY bridge (rows accumulate on the `IngestEpisodeState` instance, not in
+// SQL staging tables like index ingest's PLNR-261 upgrade) — that is fine for episodes because
+// nothing here needs to survive a hibernation eviction mid-upload the way a multi-hour repo
+// index does; a dropped in-flight upload just gets re-POSTed. PLNR-263 is the real episode
+// RECORD writer: `rows` accumulated here are parsed as `EffortEpisode` records and handed to
+// `ProjectMemory.recordEpisode` by `completeEpisodeIngest`, which is also reachable from
+// `ProjectRoom`'s terminal-run fire-and-forget via `memory/episodes.ts`'s `recordEpisodeForRun`
+// — the two paths converge on the SAME upsert-by-run_id writer (see episodes.ts).
 // ---------------------------------------------------------------------------
 
 export interface EpisodeUploadManifest {
@@ -118,7 +123,12 @@ export interface EpisodeUploadManifest {
 export interface IngestEpisodeState {
   manifest: EpisodeUploadManifest;
   receivedBatches: Set<number>;
-  rowCount: number;
+  /** Accumulated across every accepted batch, in receipt order — read back by
+   *  `completeEpisodeIngest` to parse each row as an `EffortEpisode`. Never the raw transcript:
+   *  a row here is whatever the daemon's episode-upload payload shapes it as (§18), and nothing
+   *  in this module inspects its fields — that parsing is PLNR-263's `recordEpisodeForRun`/
+   *  `ProjectMemory.recordEpisode`'s job, not this transport layer's. */
+  rows: Array<Record<string, unknown>>;
   status: IngestStatus;
 }
 
@@ -129,7 +139,7 @@ export function beginIngestEpisode(existing: IngestEpisodeState | undefined, man
   if (!manifest.scopeId || !Number.isInteger(manifest.batchCount) || manifest.batchCount < 1) {
     throw new Error('invalid episode upload manifest');
   }
-  return existing ?? { manifest, receivedBatches: new Set(), rowCount: 0, status: 'pending' };
+  return existing ?? { manifest, receivedBatches: new Set(), rows: [], status: 'pending' };
 }
 
 export function applyIngestEpisodeBatch(
@@ -142,7 +152,7 @@ export function applyIngestEpisodeBatch(
   }
   if (state.receivedBatches.has(batchNumber)) return { deduped: true };
   state.receivedBatches.add(batchNumber);
-  state.rowCount += rows.length;
+  state.rows.push(...rows);
   return { deduped: false };
 }
 

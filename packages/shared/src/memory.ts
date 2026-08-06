@@ -450,6 +450,14 @@ export const EntityRef = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('hazard'), id: GlobalEntityId }),
   z.object({ kind: z.literal('artifact'), id: GlobalEntityId }),
   z.object({ kind: z.literal('unknown'), id: GlobalEntityId }),
+  // agent (PLNR-263) — added so an episode's `owned_by` edge has an addressable target. Agent
+  // ids are already globally unique (one row per MCP session/run, never project-scoped by
+  // construction — see CLAUDE.md's identity model), so the GLOBAL shape is correct: no
+  // projectKey/repositoryKey segment, exactly like task/run/decision above. `nodes.type`'s CHECK
+  // constraint already permits 'agent' (0001), so — like PLNR-278's api/database_entity — this is
+  // a pure widening with no migration. First stored URI locks the shape forever (buildEntityUri's
+  // doc comment): never re-shape this arm after this change.
+  z.object({ kind: z.literal('agent'), id: GlobalEntityId }),
   z.object({ kind: z.literal('repository'), projectKey: EntityProjectKey, repositoryKey: RepositoryKey }),
   z.object({
     kind: z.literal('file'),
@@ -507,6 +515,7 @@ const GLOBAL_KIND_SET: ReadonlySet<string> = new Set([
   'hazard',
   'artifact',
   'unknown',
+  'agent',
 ]);
 
 /**
@@ -610,13 +619,15 @@ function safeParseEntityUri(uri: string): EntityRef | null {
  * Deliberately not designed speculatively: the first URI ever built from a new arm locks its
  * shape forever (byte-identical, no migration path — see `buildEntityUri`'s doc comment), so
  * each of these gets a shape only when a real writer exists to need one:
- *   - `agent`, `error` — projected from episodes, Phase 6 onward (PLNR-263+).
+ *   - `error` — episodes (PLNR-263) keep `failures`/error strings in `body` rather than
+ *     inventing an error node/edge for a free-form string (deferred — see the task's notes).
  *   - `branch`, `revision` — no writer anywhere in this codebase yet.
  *   - `project` — the project itself is addressed by its D1 id/key everywhere else in this
  *     system; nothing needs it as a graph-addressable entity today.
+ * `agent` graduated out of this set in PLNR-263: episodes' `owned_by` edge is a real writer.
  * Adding an arm removes the exemption in the SAME change — do not carry both.
  */
-export const EXEMPT_NODE_TYPES: ReadonlySet<MemoryNodeType> = new Set(['project', 'branch', 'revision', 'agent', 'error']);
+export const EXEMPT_NODE_TYPES: ReadonlySet<MemoryNodeType> = new Set(['project', 'branch', 'revision', 'error']);
 
 /**
  * The mirror-image asymmetry, recorded rather than "fixed": `hazard` is an EntityRef kind (a

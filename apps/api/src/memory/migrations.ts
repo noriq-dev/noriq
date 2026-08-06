@@ -50,6 +50,7 @@ import sql0002 from '../../memory-migrations/0002_memory_write_apis.sql';
 import sql0003 from '../../memory-migrations/0003_decision_approval.sql';
 import sql0004 from '../../memory-migrations/0004_feedback_and_validity.sql';
 import sql0005 from '../../memory-migrations/0005_index_staging.sql';
+import sql0006 from '../../memory-migrations/0006_episodes.sql';
 
 export interface MemoryMigration {
   /** 1-based, contiguous, and equal to this entry's array index + 1. */
@@ -66,6 +67,7 @@ export const MEMORY_MIGRATIONS: readonly MemoryMigration[] = [
   { version: 3, name: '0003_decision_approval', sql: sql0003 },
   { version: 4, name: '0004_feedback_and_validity', sql: sql0004 },
   { version: 5, name: '0005_index_staging', sql: sql0005 },
+  { version: 6, name: '0006_episodes', sql: sql0006 },
 ];
 
 /** The schema version a freshly-migrated store lands on. */

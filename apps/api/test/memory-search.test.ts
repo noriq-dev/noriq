@@ -50,7 +50,17 @@ interface MemRpc {
   ): Promise<{ ok: true }>;
   decayLowAuthorityMemories(pid: string, input: { maxAgeMs: number; authorityCeiling: number }): Promise<{ decayed: string[] }>;
   _setMemoryRecordedAtForTest(pid: string, memoryId: string, recordedAt: string): Promise<void>;
-  _seedEpisodeForTest(pid: string, input: { runId: string; landingOutcome?: string; body: Record<string, unknown> }): Promise<string>;
+  recordEpisode(
+    pid: string,
+    input: {
+      runId: string; agentId: string | null; runKind: string; outcome: string; startedAt: string | null; finishedAt: string | null;
+      taskId: string | null; repositoryKey: string | null; baseId: string | null; timeline: Array<{ at: string; label: string }>;
+      filesTouched: string[]; commands: string[]; testsRun: string[]; failures: string[];
+      findings: Array<{ summary: string; severity?: string }>; reviewRounds: number; tokenUsage: Record<string, unknown>; costUSD: number;
+      acceptanceCoverage: number | null; steeringEvents: string[]; landingOutcome: string; remainingWork: string[];
+      actor: { kind: string; id: string | null };
+    },
+  ): Promise<{ episodeId: string; runId: string; created: boolean }>;
   hydrateSearchHits(
     pid: string,
     refs: Array<{ kind: 'memory' | 'episode'; id: string }>,
@@ -202,9 +212,12 @@ describe('keyword fallback (no backend) covers memories and episodes', () => {
 
   it('finds a seeded episode by substring in its body', async () => {
     const projectId = await newProject('MSRCH5');
-    const episodeId = await memory(projectId)._seedEpisodeForTest(projectId, {
-      runId: 'run_abc123', landingOutcome: 'landed',
-      body: { findings: [{ summary: 'discovered the webhook retries indefinitely without backoff' }] },
+    const { episodeId } = await memory(projectId).recordEpisode(projectId, {
+      runId: 'run_abc123', agentId: null, runKind: 'build', outcome: 'done', startedAt: null, finishedAt: null,
+      taskId: null, repositoryKey: null, baseId: null, timeline: [], filesTouched: [], commands: [], testsRun: [], failures: [],
+      findings: [{ summary: 'discovered the webhook retries indefinitely without backoff' }],
+      reviewRounds: 0, tokenUsage: {}, costUSD: 0, acceptanceCoverage: null, steeringEvents: [],
+      landingOutcome: 'landed', remainingWork: [], actor: { kind: 'system', id: null },
     });
 
     const { mode, results } = await search(appEnv, { q: 'webhook retries', projectIds: [projectId], kinds: ['episode'] });
