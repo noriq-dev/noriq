@@ -1335,11 +1335,11 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'semantic_search',
-    'Search tasks, docs and plans by MEANING, not exact words — "how do we handle payment retries" finds the retry design doc and its tasks even when none contain that phrasing. Use this to orient in a large project: find the docs/tasks/plans relevant to what you are about to work on, before creating anything new (the thing you are about to file may already exist). For attribute filtering (status/tag/holder/overdue) use search_tasks instead — the two compose: discover here, then filter there. Falls back to keyword matching on instances without an embeddings backend (`mode` in the result says which ran).',
+    'Search tasks, docs, plans, and this project\'s recorded memory (learnings, decisions, procedures, requirements, hazards, unknowns) and effort episodes — by MEANING, not exact words. "how do we handle payment retries" finds the retry design doc and its tasks even when none contain that phrasing; it also surfaces a prior decision or failed approach recorded via record_memory. Use this to orient in a large project: find what is already known or already tried before creating anything new. Memory/episode hits carry `authority` and `validity` read live from the canonical record — a low-authority or stale hit is a LEAD, not a settled answer. For attribute filtering (status/tag/holder/overdue) use search_tasks instead — the two compose: discover here, then filter there. Falls back to keyword matching on instances without an embeddings backend (`mode` in the result says which ran).',
     {
       query: z.string().min(1).describe('Natural-language description of what you are looking for'),
       projectId: z.string().optional().describe('Restrict to one project; omit to search every project you can reach'),
-      kinds: z.array(z.enum(['task', 'doc', 'plan'])).optional().describe('Restrict result types; default all three'),
+      kinds: z.array(z.enum(['task', 'doc', 'plan', 'memory', 'episode'])).optional().describe('Restrict result types; default all five'),
       limit: z.number().int().min(1).max(50).optional().describe('Default 12'),
     },
     tool(async ({ query, projectId, kinds, limit }) => {
@@ -1390,7 +1390,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'reindex_search',
-    'Maintenance: rebuild the semantic-search vector index for one project (content that predates the embeddings backend, or drifted). Batched — call again with the returned offset while `remaining > 0`. Idempotent and safe to re-run; NOT part of any normal work loop (write-time indexing keeps the index fresh on its own). Errors when the instance has no embeddings backend.',
+    'Maintenance: rebuild the semantic-search vector index for one project\'s tasks, docs and plans (content that predates the embeddings backend, or drifted). Batched — call again with the returned offset while `remaining > 0`. Idempotent and safe to re-run; NOT part of any normal work loop (write-time indexing keeps the index fresh on its own). Errors when the instance has no embeddings backend. Recorded memory/episodes are a separate store with their own rebuild (ProjectMemory\'s rebuildVectorIndex) — this tool does not touch them.',
     {
       projectId: z.string(),
       offset: z.number().int().min(0).optional().describe('Continue a previous pass from here (default 0)'),

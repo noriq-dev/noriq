@@ -68,15 +68,19 @@ export interface AskResult {
  *  answer from). Grouped by kind, one query each; preserves the ranked order and falls back
  *  to the snippet for any row that lost its body between indexing and now. */
 async function contextBlocks(db: D1Database, hits: SearchHit[]): Promise<Array<{ hit: SearchHit; text: string }>> {
-  const ids: Record<SearchHit['kind'], string[]> = { task: [], doc: [], plan: [] };
-  for (const h of hits) ids[h.kind].push(h.id);
+  // Partial, not a full Record: Ask only ever retrieves task/doc/plan (see answerQuestion's
+  // explicit `kinds` filter below) — memory/episode content never reaches D1, so this stays
+  // narrow rather than growing a fourth/fifth `load()` this function has no use for.
+  const ids: Partial<Record<SearchHit['kind'], string[]>> = {};
+  for (const h of hits) (ids[h.kind] ??= []).push(h.id);
   const body = new Map<string, string>();
   const inList = (a: string[]) => a.map(() => '?').join(',');
   const load = async (kind: SearchHit['kind'], table: string) => {
-    if (!ids[kind].length) return;
+    const kindIds = ids[kind];
+    if (!kindIds?.length) return;
     const { results } = await db
-      .prepare(`SELECT id, substr(body, 1, ${CONTEXT_CHARS}) AS body FROM ${table} WHERE id IN (${inList(ids[kind])})`)
-      .bind(...ids[kind])
+      .prepare(`SELECT id, substr(body, 1, ${CONTEXT_CHARS}) AS body FROM ${table} WHERE id IN (${inList(kindIds)})`)
+      .bind(...kindIds)
       .all<{ id: string; body: string | null }>();
     for (const r of results) body.set(`${kind}:${r.id}`, r.body ?? '');
   };
@@ -122,7 +126,11 @@ export interface AskOptions {
 /** Retrieve → ground → generate. Returns the answer plus the sources it was grounded on. */
 export async function answerQuestion(env: Env, gen: GenerationClient, opts: AskOptions): Promise<AskResult> {
   const question = opts.question.trim().slice(0, MAX_QUESTION_CHARS);
-  const { mode, results } = await search(env, { q: question, projectIds: [opts.projectId], limit: CONTEXT_HITS });
+  // PLNR-255 widened search() to also retrieve memory/episode hits; Ask deliberately keeps its
+  // existing task/doc/plan-only scope (see PLNR-257's locked decision: Ask's retrieval-layer
+  // rewiring is PLNR-269's, contested by PLNR-243's open proposal to drop Ask outright — this
+  // is not the place to pick a side).
+  const { mode, results } = await search(env, { q: question, projectIds: [opts.projectId], kinds: ['task', 'doc', 'plan'], limit: CONTEXT_HITS });
   const blocks = await contextBlocks(env.DB, results);
   const answer = await gen.generate(buildMessages(question, opts.projectName, blocks), { maxTokens: MAX_ANSWER_TOKENS });
   const sources: AskSource[] = results.map((h) => ({

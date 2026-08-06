@@ -80,6 +80,22 @@ export interface ProjectMemoryStub {
     projectId: string,
     input: { repositoryKey: string; branch: string; mergedBaseId: string },
   ): Promise<{ promoted: string[]; skipped: number }>;
+  /** PLNR-255: re-embed this project's memories/episodes into the operational search index and
+   *  clear `project_memory_registry.vector_dirty` on success (Phase 4's fill-in of the Phase
+   *  2/3 no-op hook). No-ops honestly when no embeddings backend is bound. */
+  rebuildVectorIndex(projectId: string): Promise<{ ok: true; rebuilt: boolean; reason?: string; reindexed?: number }>;
+  /** PLNR-255: fill display fields (+ LIVE authority/validity) for memory/episode vector
+   *  matches — search.ts's hydrate() calls this once per distinct projectId in a match set. */
+  hydrateSearchHits(
+    projectId: string,
+    refs: Array<{ kind: 'memory' | 'episode'; id: string }>,
+  ): Promise<Array<{ kind: 'memory' | 'episode'; id: string; title: string; snippet: string; status?: string; authority?: number; validity?: string }>>;
+  /** PLNR-255: the no-Vectorize lexical fallback over memory_items/episodes — memory content
+   *  never reaches D1, so this scan runs INSIDE ProjectMemory rather than as a D1 query. */
+  searchMemoryLexical(
+    projectId: string,
+    opts: { q: string; kinds?: Array<'memory' | 'episode'>; limit?: number },
+  ): Promise<Array<{ kind: 'memory' | 'episode'; id: string; title: string; snippet: string; score: number; status?: string; authority?: number; validity?: string }>>;
 }
 
 /**

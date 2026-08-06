@@ -13,7 +13,7 @@ import { hashPassword, newApiKey, newId, nowIso, sha256Hex, timingSafeEqual, ver
 import { taskSearchFilters } from './lib/search';
 import type { ExecutionSpecInput, RunStatus } from '@noriq-dev/shared';
 import { readExecutionSpec } from './lib/execution-spec';
-import { search, searchBackend, reindexProject, type SearchKind } from './search';
+import { search, searchBackend, reindexProject, ALL_KINDS, type SearchKind } from './search';
 import { answerQuestion, generationClient } from './ask';
 import { verifyUploadToken } from './lib/upload-token';
 import { USER_PROJECT_WHERE, taskWireStatus, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
@@ -1150,11 +1150,14 @@ app.post('/api/projects/:pid/locks/:lockId/force-release', userAuth, async (c) =
 });
 
 // Project search (PLNR-184) — semantic when the AI+VECTORIZE bindings exist, keyword
-// otherwise; `mode` in the response says which ran. Covers tasks, docs and plans.
+// otherwise; `mode` in the response says which ran. Covers tasks, docs, plans, and (PLNR-255)
+// recorded memory + effort episodes. Validated against ALL_KINDS (not a hand-written literal
+// list) so a widened SearchKind can't silently drop a kind here (CLAUDE.md: this union has
+// five independent hand-written copies and a missed one fails silently).
 app.get('/api/projects/:pid/search', userAuth, async (c) => {
   const q = c.req.query('q')?.trim();
   if (!q) return c.json({ error: 'q required' }, 400);
-  const kindsParam = c.req.query('kinds')?.split(',').filter((k): k is SearchKind => k === 'task' || k === 'doc' || k === 'plan');
+  const kindsParam = c.req.query('kinds')?.split(',').filter((k): k is SearchKind => (ALL_KINDS as readonly string[]).includes(k));
   const limit = Math.min(Math.max(parseInt(c.req.query('limit') ?? '12', 10) || 12, 1), 50);
   const { mode, results } = await search(c.env, {
     q, projectIds: [c.req.param('pid')!], kinds: kindsParam?.length ? kindsParam : undefined, limit,

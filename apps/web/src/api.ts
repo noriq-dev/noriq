@@ -194,7 +194,7 @@ export const api = {
       followUpTo: string | null; createdAt: string; resolvedAt: string | null;
     }> }>('GET', `/api/projects/${pid}/signals/${sid}/thread`),
   /** Project search (PLNR-184): semantic when the instance has embeddings, else keyword. */
-  search: (pid: string, q: string, kinds?: Array<'task' | 'doc' | 'plan'>, limit?: number) =>
+  search: (pid: string, q: string, kinds?: Array<'task' | 'doc' | 'plan' | 'memory' | 'episode'>, limit?: number) =>
     req<{ mode: 'semantic' | 'keyword'; results: ApiSearchHit[] }>(
       'GET',
       `/api/projects/${pid}/search?q=${encodeURIComponent(q)}${kinds?.length ? `&kinds=${kinds.join(',')}` : ''}${limit ? `&limit=${limit}` : ''}`,
@@ -566,9 +566,9 @@ export interface ApiAskSource {
   score: number;
 }
 
-/** One hit from /api/projects/:pid/search (PLNR-184). */
+/** One hit from /api/projects/:pid/search (PLNR-184; memory/episode kinds added PLNR-255). */
 export interface ApiSearchHit {
-  kind: 'task' | 'doc' | 'plan';
+  kind: 'task' | 'doc' | 'plan' | 'memory' | 'episode';
   id: string;
   projectId: string;
   key?: string;
@@ -576,6 +576,10 @@ export interface ApiSearchHit {
   snippet: string;
   score: number;
   status?: string;
+  /** memory/episode only — current authority (1-5), read live at query time. */
+  authority?: number;
+  /** memory only — current validity ('active' | 'stale' | 'invalid'), read live. */
+  validity?: string;
 }
 
 export interface ApiSnapshot {

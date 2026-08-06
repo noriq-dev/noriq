@@ -1,26 +1,38 @@
-// PLNR-184: semantic search over tasks, docs and plans.
+// PLNR-184: semantic search over tasks, docs and plans. Widened by PLNR-255 to also cover
+// operational memory (memory_items — learnings, decisions, procedures, requirements, hazards,
+// unknowns) and effort episodes, both canonically owned by the per-project ProjectMemory DO.
 //
 // Two layers, both optional-degrading:
 //   1. SEMANTIC — Workers AI embeddings (@cf/baai/bge-m3) + a Vectorize index, when the
-//      `AI` and `VECTORIZE` bindings exist. Entities are embedded at write time from the
-//      ProjectRoom seams (fire-and-forget — indexing never fails or slows a write) with
-//      deterministic vector ids, so re-indexing is an upsert and deletes are exact.
-//   2. KEYWORD — a LIKE-based scan of the same three tables. Always available: it is the
-//      fallback for self-hosted instances without the bindings (and for the workerd test
-//      environment), and the guarantee that search never 503s.
+//      `AI` and `VECTORIZE` bindings exist. Entities are embedded at write time — tasks/docs/
+//      plans from the ProjectRoom seams, memories/episodes from ProjectMemory's own write RPCs
+//      (recordMemory, approveDecision, promoteMemoriesOnMerge, decayLowAuthorityMemories) —
+//      fire-and-forget in both cases, so indexing never fails or slows a write. Deterministic
+//      vector ids make re-indexing an upsert and deletes exact.
+//   2. KEYWORD — a LIKE-based scan. Tasks/docs/plans scan D1 directly; memories/episodes never
+//      reach D1 (§3/§4), so their lexical fallback is a LIKE scan run INSIDE ProjectMemory
+//      (`searchMemoryLexical`) and merged in here. Always available: it is the fallback for
+//      self-hosted instances without the bindings (and for the workerd test environment), and
+//      the guarantee that search never 503s.
 //
-// Vector id scheme: `task:<id>` and `plan:<id>` are single vectors; docs are chunked as
-// `doc:<id>#<n>` (chunks of ~CHUNK_CHARS). Reindexing a doc upserts its current chunks
-// and blind-deletes the id range above them (deleting a nonexistent id is a no-op), so
-// no chunk-count bookkeeping is needed. Metadata carries {projectId, kind, id} — queries
-// filter on projectId server-side and post-filter kind from the id prefix.
+// Vector id scheme: `task:<id>`, `plan:<id>`, `memory:<id>` and `episode:<id>` are single
+// vectors; docs are chunked as `doc:<id>#<n>` (chunks of ~CHUNK_CHARS). Reindexing a doc upserts
+// its current chunks and blind-deletes the id range above them (deleting a nonexistent id is a
+// no-op), so no chunk-count bookkeeping is needed. Metadata carries {projectId, kind, id} —
+// queries filter on projectId server-side and post-filter kind from the id prefix.
+//
+// Hydration is split by store: task/doc/plan hit D1 directly; memory/episode fan out to one
+// ProjectMemory stub per distinct projectId in the match set (the operational index spans
+// projects) and read authority/validity LIVE from the canonical row — never from vector
+// metadata, so a promotion or validity transition is visible without re-indexing (§1, §12).
 //
 // The embedding/store dependencies are narrow interfaces so tests inject fakes (the same
 // pattern as resolveCimdClient's doFetch): the Workers bindings only appear in fromEnv().
 
 import type { Env } from './env';
+import type { ProjectMemoryStub } from './lib/project-memory';
 
-export type SearchKind = 'task' | 'doc' | 'plan';
+export type SearchKind = 'task' | 'doc' | 'plan' | 'memory' | 'episode';
 
 export interface SearchHit {
   kind: SearchKind;
@@ -32,6 +44,10 @@ export interface SearchHit {
   snippet: string;
   score: number;
   status?: string;
+  /** memory/episode only — current authority (1-5), read live from the canonical row. */
+  authority?: number;
+  /** memory only — current validity ('active' | 'stale' | 'invalid'), read live. */
+  validity?: string;
 }
 
 export interface EmbeddingClient {
@@ -148,11 +164,13 @@ export interface SearchOptions {
   limit?: number;
 }
 
-const ALL_KINDS: SearchKind[] = ['task', 'doc', 'plan'];
+export const ALL_KINDS: readonly SearchKind[] = ['task', 'doc', 'plan', 'memory', 'episode'];
+
+const isMemoryKind = (k: SearchKind): k is 'memory' | 'episode' => k === 'memory' || k === 'episode';
 
 /** Semantic query: embed, over-fetch, post-filter to allowed projects/kinds, dedupe doc
- *  chunks to their best-scoring chunk, hydrate display fields from D1. */
-export async function semanticSearch(db: D1Database, backend: SearchBackend, opts: SearchOptions): Promise<SearchHit[]> {
+ *  chunks to their best-scoring chunk, hydrate display fields from D1 or ProjectMemory. */
+export async function semanticSearch(env: Env, backend: SearchBackend, opts: SearchOptions): Promise<SearchHit[]> {
   const limit = opts.limit ?? 12;
   const kinds = opts.kinds?.length ? opts.kinds : ALL_KINDS;
   const [vector] = await backend.embedder.embed([opts.q]);
@@ -172,17 +190,22 @@ export async function semanticSearch(db: D1Database, backend: SearchBackend, opt
     if (!prev || m.score > prev.score) best.set(`${kind}:${entityId}`, { kind, id: entityId, projectId, score: m.score });
   }
   const ranked = [...best.values()].sort((a, b) => b.score - a.score).slice(0, limit);
-  return hydrate(db, ranked);
+  return hydrate(env, ranked);
+}
+
+function memoryStubFor(env: Env, projectId: string): ProjectMemoryStub {
+  return env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)) as unknown as ProjectMemoryStub;
 }
 
 async function hydrate(
-  db: D1Database,
+  env: Env,
   refs: Array<{ kind: SearchKind; id: string; projectId: string; score: number }>,
 ): Promise<SearchHit[]> {
-  const byKind: Record<SearchKind, string[]> = { task: [], doc: [], plan: [] };
+  const byKind: Record<SearchKind, string[]> = { task: [], doc: [], plan: [], memory: [], episode: [] };
   for (const r of refs) byKind[r.kind].push(r.id);
-  const rows = new Map<string, { title: string; snippet: string; key?: string; status?: string }>();
+  const rows = new Map<string, { title: string; snippet: string; key?: string; status?: string; authority?: number; validity?: string }>();
   const inList = (ids: string[]) => ids.map(() => '?').join(',');
+  const db = env.DB;
   if (byKind.task.length) {
     const { results } = await db.prepare(
       `SELECT id, key, title, substr(body, 1, 200) AS snippet, CASE WHEN failed_at IS NOT NULL THEN 'failed' ELSE status END AS status
@@ -202,6 +225,26 @@ async function hydrate(
     ).bind(...byKind.plan).all<{ id: string; title: string; description: string; snippet: string; status: string }>();
     for (const p of results) rows.set(`plan:${p.id}`, { title: p.title, snippet: p.description || p.snippet || '', status: p.status });
   }
+  // Memory/episode rows never reach D1 (§3/§4) — fan out to one ProjectMemory stub per
+  // distinct projectId the match set touches, and read authority/validity LIVE rather than
+  // from vector metadata (§1, §12: a promotion or validity transition must be visible without
+  // re-indexing). Cross-project leakage is guarded here, not inside the DO (see search's own
+  // per-project isolation contract): a ref is only ever hydrated against ITS OWN projectId.
+  const memRefs = refs.filter((r) => isMemoryKind(r.kind));
+  if (memRefs.length) {
+    const byProject = new Map<string, Array<{ kind: 'memory' | 'episode'; id: string }>>();
+    for (const r of memRefs) {
+      const list = byProject.get(r.projectId) ?? [];
+      list.push({ kind: r.kind as 'memory' | 'episode', id: r.id });
+      byProject.set(r.projectId, list);
+    }
+    const perProject = await Promise.all(
+      [...byProject.entries()].map(([pid, projRefs]) => memoryStubFor(env, pid).hydrateSearchHits(pid, projRefs)),
+    );
+    for (const list of perProject) {
+      for (const r of list) rows.set(`${r.kind}:${r.id}`, { title: r.title, snippet: r.snippet, status: r.status, authority: r.authority, validity: r.validity });
+    }
+  }
   const hits: SearchHit[] = [];
   for (const r of refs) {
     const row = rows.get(`${r.kind}:${r.id}`);
@@ -211,11 +254,12 @@ async function hydrate(
   return hits;
 }
 
-/** Keyword fallback: term-wise LIKE over the same three tables — every term must appear
- *  somewhere in the row (any column), so "payment retry" finds a doc whose NAME says
- *  payment and whose BODY says retries. Title hits rank above body-only hits. Same
- *  result shape as semanticSearch. */
-export async function keywordSearch(db: D1Database, opts: SearchOptions): Promise<SearchHit[]> {
+/** Keyword fallback: term-wise LIKE over tasks/docs/plans (D1) plus memories/episodes (each
+ *  ProjectMemory this query touches — memory content never reaches D1, §3/§4). Every term must
+ *  appear somewhere in the row (any column), so "payment retry" finds a doc whose NAME says
+ *  payment and whose BODY says retries. Title hits rank above body-only hits. Same result shape
+ *  as semanticSearch. */
+export async function keywordSearch(env: Env, opts: SearchOptions): Promise<SearchHit[]> {
   const limit = opts.limit ?? 12;
   const kinds = opts.kinds?.length ? opts.kinds : ALL_KINDS;
   if (!opts.projectIds.length) return [];
@@ -224,6 +268,7 @@ export async function keywordSearch(db: D1Database, opts: SearchOptions): Promis
   const likes = terms.map((t) => `%${t}%`);
   const pids = opts.projectIds;
   const inPids = pids.map(() => '?').join(',');
+  const db = env.DB;
   const hits: SearchHit[] = [];
 
   const run = async (cols: { title: string; body: string[]; table: string; select: string; order: string }) => {
@@ -268,6 +313,16 @@ export async function keywordSearch(db: D1Database, opts: SearchOptions): Promis
       hits.push({ kind: 'plan', id: p.id, projectId: p.projectId, title: p.title, snippet: p.description || p.snippet || '', status: p.status, score: (p.rank + 1) / (terms.length + 1) });
     }
   }
+  const memoryKinds = kinds.filter(isMemoryKind);
+  if (memoryKinds.length) {
+    const perProject = await Promise.all(
+      pids.map((pid) => memoryStubFor(env, pid).searchMemoryLexical(pid, { q: opts.q, kinds: memoryKinds, limit })),
+    );
+    for (const [i, rowsForProject] of perProject.entries()) {
+      const pid = pids[i]!;
+      for (const r of rowsForProject) hits.push({ ...r, projectId: pid });
+    }
+  }
   return hits.sort((a, b) => b.score - a.score).slice(0, limit);
 }
 
@@ -308,10 +363,10 @@ export async function search(env: Env, opts: SearchOptions): Promise<{ mode: 'se
   const backend = searchBackend(env);
   if (backend) {
     try {
-      return { mode: 'semantic', results: await semanticSearch(env.DB, backend, opts) };
+      return { mode: 'semantic', results: await semanticSearch(env, backend, opts) };
     } catch {
       // Embedding/index hiccups must not take search down — degrade to keyword.
     }
   }
-  return { mode: 'keyword', results: await keywordSearch(env.DB, opts) };
+  return { mode: 'keyword', results: await keywordSearch(env, opts) };
 }

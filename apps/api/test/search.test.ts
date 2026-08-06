@@ -4,10 +4,13 @@
 import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import { createAgent, createUser, loginSession, mcpCall } from './helpers';
+import type { Env } from '../src/env';
 import {
   chunkText, entityChunks, indexEntity, removeEntity, semanticSearch,
   type EmbeddingClient, type SearchBackend, type VectorStore,
 } from '../src/search';
+
+const appEnv = env as unknown as Env;
 
 // ---------------------------------------------------------------------------------------
 // Unit: chunking + fake-backed index/query
@@ -140,7 +143,7 @@ describe('semanticSearch end-to-end against a fake backend + real D1', () => {
     const task = await env.DB.prepare('SELECT id FROM tasks WHERE project_id = ? LIMIT 1').bind(projectId).first<{ id: string }>();
     await indexEntity(backend, { kind: 'doc', id: doc!.id, projectId, title: 'Payment gateway design', body: `${'x'.repeat(1400)}\n\n${'y'.repeat(1400)}` });
     await indexEntity(backend, { kind: 'task', id: task!.id, projectId, title: 'retry task', body: 'b' });
-    const hits = await semanticSearch(env.DB as unknown as D1Database, backend, { q: 'retries', projectIds: [projectId] });
+    const hits = await semanticSearch(appEnv, backend, { q: 'retries', projectIds: [projectId] });
     // 3 vectors (2 doc chunks + 1 task) → 2 entities after chunk-dedupe.
     expect(hits).toHaveLength(2);
     const docHit = hits.find((h) => h.kind === 'doc')!;

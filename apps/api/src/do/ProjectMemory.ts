@@ -8,6 +8,7 @@ import { fetchManifest, readSnapshotChunks, checkManifestHeader } from '../memor
 import { deleteAllProjectBackups, sizeStatus, type EraseReport, type EraseStepResult } from '../memory/lifecycle';
 import { MEMORY_MIGRATIONS } from '../memory/migrations';
 import { validateMemoryScope, validateEvidenceRef, memoryContentHash, evidenceHash, clampAuthority, type MemoryScope } from '../memory/writes';
+import { searchBackend, indexEntity, removeEntity } from '../search';
 
 /**
  * ProjectMemory — one instance per project (idFromName(projectId)), canonical
@@ -76,6 +77,30 @@ export const OPERATIONAL_TABLES = ['applied_operations', 'memory_revision', 'pro
  *  operational singletons (memory_revision, projector_cursor are one row each, chunked the same
  *  way as everything else rather than carved into bespoke manifest fields). */
 export const BACKUP_TABLES = [...SCHEMA_TABLES, ...OPERATIONAL_TABLES] as const;
+
+/**
+ * PLNR-255: the embedding/display text derived from an episode's `body` JSON blob (nothing
+ * writes real episodes before PLNR-263 — see the module comment on `_seedEpisodeForTest`).
+ * Picks the human-legible bits: the self-summary's approach and durable learnings, and each
+ * finding's summary. Malformed/absent JSON degrades to a fixed string rather than throwing —
+ * an episode this can't summarize should still index and hydrate, just without a preview.
+ */
+function summarizeEpisodeBody(bodyJson: string): string {
+  try {
+    const body = JSON.parse(bodyJson) as {
+      findings?: Array<{ summary?: string }>;
+      selfSummary?: { approachSummary?: string; durableLearnings?: string[] } | null;
+    };
+    const parts = [
+      body.selfSummary?.approachSummary,
+      ...(body.findings ?? []).map((f) => f.summary),
+      ...(body.selfSummary?.durableLearnings ?? []),
+    ].filter((p): p is string => !!p && p.trim().length > 0);
+    return parts.length ? parts.join(' — ') : '(no episode summary recorded)';
+  } catch {
+    return '(unreadable episode body)';
+  }
+}
 
 export class ProjectMemory extends DurableObject<Env> {
   // Bound on first call — from ctx.id.name when the runtime exposes it (every
@@ -478,16 +503,36 @@ export class ProjectMemory extends DurableObject<Env> {
       .catch((err) => console.warn(`ProjectMemory vector-dirty report for ${projectId} failed: ${String(err)}`));
   }
 
-  /** The rebuild hook Phase 4 (PLNR-256) fills in. No memory Vectorize index exists yet, so
-   *  this is an honest no-op regardless of whether VECTORIZE is bound — it does NOT clear the
-   *  dirty flag, because there is nothing yet that actually rebuilds anything from it. */
-  async rebuildVectorIndex(projectId: string): Promise<{ ok: true; rebuilt: false; reason: string }> {
+  /**
+   * PLNR-255: the memory half of Phase 4's rebuild — re-embeds every memory item and episode
+   * this project holds into the operational `noriq-search` index, then clears
+   * `project_memory_registry.vector_dirty` (a restore or rollback sets it; nothing before this
+   * task could ever clear it). PLNR-256 grows the CODE half onto the same method. An honest
+   * no-op when no embeddings backend is bound — the dirty flag is left alone in that case,
+   * since nothing was actually rebuilt from it.
+   */
+  async rebuildVectorIndex(projectId: string): Promise<{ ok: true; rebuilt: boolean; reason?: string; reindexed?: number }> {
     await this.assertProjectId(projectId);
-    const reason = this.env.VECTORIZE
-      ? 'VECTORIZE is bound, but no memory vector index exists yet (Phase 4) — nothing to rebuild'
-      : 'VECTORIZE is not bound — nothing to rebuild';
-    console.log(`ProjectMemory rebuildVectorIndex(${projectId}): ${reason}`);
-    return { ok: true, rebuilt: false, reason };
+    const backend = searchBackend(this.env);
+    if (!backend) {
+      const reason = 'VECTORIZE is not bound — nothing to rebuild';
+      console.log(`ProjectMemory rebuildVectorIndex(${projectId}): ${reason}`);
+      return { ok: true, rebuilt: false, reason };
+    }
+    const items = this.ctx.storage.sql
+      .exec<{ id: string; kind: string; statement: string }>(`SELECT id, kind, statement FROM memory_items`)
+      .toArray();
+    for (const m of items) {
+      await indexEntity(backend, { kind: 'memory', id: m.id, projectId, title: m.kind, body: m.statement });
+    }
+    const episodes = this.ctx.storage.sql
+      .exec<{ id: string; run_id: string; body: string }>(`SELECT id, run_id, body FROM episodes`)
+      .toArray();
+    for (const e of episodes) {
+      await indexEntity(backend, { kind: 'episode', id: e.id, projectId, title: `episode ${e.run_id}`, body: summarizeEpisodeBody(e.body) });
+    }
+    await this.reportVectorDirty(projectId, false);
+    return { ok: true, rebuilt: true, reindexed: items.length + episodes.length };
   }
 
   /**
@@ -715,6 +760,17 @@ export class ProjectMemory extends DurableObject<Env> {
       );
     });
     this.ctx.storage.setAlarm(Date.now()).catch(() => {});
+    // PLNR-255: index the new version (and de-index the one it supersedes, so the old
+    // statement stops out-ranking its replacement — the row itself stays fully readable via
+    // getMemoryItem, only its vector is dropped). Fire-and-forget, same as every other write
+    // side-effect here: indexing must never fail or slow down the write it derives from.
+    const searchBackendForIndex = searchBackend(this.env);
+    if (searchBackendForIndex) {
+      const supersedes = input.supersedesMemoryId ?? null;
+      void indexEntity(searchBackendForIndex, { kind: 'memory', id: memoryId, projectId, title: input.kind, body: input.statement })
+        .then(() => (supersedes ? removeEntity(searchBackendForIndex, 'memory', supersedes) : undefined))
+        .catch((err) => console.warn(`ProjectMemory memory-index for ${memoryId} failed: ${String(err)}`));
+    }
     return { memoryId, operationId, deduped: false };
   }
 
@@ -1074,6 +1130,15 @@ export class ProjectMemory extends DurableObject<Env> {
       );
     });
     this.ctx.storage.setAlarm(Date.now()).catch(() => {});
+    // PLNR-255: decay is the one path that hard-deletes memory rows — their vectors must be
+    // dropped too, or they hydrate to nothing forever (hydrate's silent-skip would just make
+    // them vanish from results, but the vector itself would sit in the index permanently).
+    const searchBackendForIndex = searchBackend(this.env);
+    if (searchBackendForIndex) {
+      for (const id of decayed) {
+        void removeEntity(searchBackendForIndex, 'memory', id).catch((err) => console.warn(`ProjectMemory memory-deindex for ${id} failed: ${String(err)}`));
+      }
+    }
     return { decayed };
   }
 
@@ -1151,6 +1216,102 @@ export class ProjectMemory extends DurableObject<Env> {
         verificationState: e.verification_state,
       })),
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Operational search integration (PLNR-255) — the two read RPCs search.ts's hydrate() and
+  // keywordSearch() drive for memory/episode kinds. Both are read-only: no memory_revision
+  // bump, no outbox row — a query is not a canonical mutation.
+  // ---------------------------------------------------------------------------
+
+  /** Fill display fields for memory/episode VECTOR matches — called once per distinct
+   *  projectId a match set touches. Authority and validity are read from the canonical row
+   *  HERE, at query time, never carried in vector metadata (§1/§12): a promotion or validity
+   *  transition is visible immediately, with no re-index required. A ref for a row deleted
+   *  since indexing (e.g. by decay) is silently absent from the result, same as D1 hydration. */
+  async hydrateSearchHits(
+    projectId: string,
+    refs: Array<{ kind: 'memory' | 'episode'; id: string }>,
+  ): Promise<Array<{ kind: 'memory' | 'episode'; id: string; title: string; snippet: string; status?: string; authority?: number; validity?: string }>> {
+    await this.assertProjectId(projectId);
+    const out: Array<{ kind: 'memory' | 'episode'; id: string; title: string; snippet: string; status?: string; authority?: number; validity?: string }> = [];
+    const memIds = refs.filter((r) => r.kind === 'memory').map((r) => r.id);
+    const epIds = refs.filter((r) => r.kind === 'episode').map((r) => r.id);
+    if (memIds.length) {
+      const rows = this.ctx.storage.sql
+        .exec<{ id: string; kind: string; statement: string; authority: number; validity: string }>(
+          `SELECT id, kind, statement, authority, validity FROM memory_items WHERE id IN (${memIds.map(() => '?').join(',')})`,
+          ...memIds,
+        )
+        .toArray();
+      for (const r of rows) out.push({ kind: 'memory', id: r.id, title: r.kind, snippet: r.statement.slice(0, 200), authority: r.authority, validity: r.validity });
+    }
+    if (epIds.length) {
+      const rows = this.ctx.storage.sql
+        .exec<{ id: string; run_id: string; landing_outcome: string; body: string }>(
+          `SELECT id, run_id, landing_outcome, body FROM episodes WHERE id IN (${epIds.map(() => '?').join(',')})`,
+          ...epIds,
+        )
+        .toArray();
+      for (const r of rows) {
+        out.push({
+          kind: 'episode',
+          id: r.id,
+          title: `episode ${r.run_id} (${r.landing_outcome})`,
+          snippet: summarizeEpisodeBody(r.body).slice(0, 200),
+          status: r.landing_outcome,
+        });
+      }
+    }
+    return out;
+  }
+
+  /** The no-Vectorize lexical fallback (§20) — memory content never reaches D1 (§3/§4), so this
+   *  LIKE scan runs INSIDE ProjectMemory rather than as a D1 query, and search.ts's
+   *  keywordSearch merges it with the D1 task/doc/plan results. Same AND-every-term contract as
+   *  the D1 scan; score mirrors its (matched+1)/(terms+1) shape (every returned row matched
+   *  every term, so this is always 1 — ties break on recency). */
+  async searchMemoryLexical(
+    projectId: string,
+    opts: { q: string; kinds?: Array<'memory' | 'episode'>; limit?: number },
+  ): Promise<Array<{ kind: 'memory' | 'episode'; id: string; title: string; snippet: string; score: number; status?: string; authority?: number; validity?: string }>> {
+    await this.assertProjectId(projectId);
+    const limit = opts.limit ?? 12;
+    const kinds = opts.kinds?.length ? opts.kinds : (['memory', 'episode'] as const);
+    const terms = opts.q.replace(/[%_]/g, ' ').trim().split(/\s+/).filter(Boolean).slice(0, 8);
+    if (!terms.length) return [];
+    const likes = terms.map((t) => `%${t}%`);
+    const hits: Array<{ kind: 'memory' | 'episode'; id: string; title: string; snippet: string; score: number; status?: string; authority?: number; validity?: string }> = [];
+    if (kinds.includes('memory')) {
+      const where = likes.map(() => `statement LIKE ?`).join(' AND ');
+      const rows = this.ctx.storage.sql
+        .exec<{ id: string; kind: string; statement: string; authority: number; validity: string }>(
+          `SELECT id, kind, statement, authority, validity FROM memory_items WHERE ${where} ORDER BY recorded_at DESC LIMIT ${limit}`,
+          ...likes,
+        )
+        .toArray();
+      for (const r of rows) hits.push({ kind: 'memory', id: r.id, title: r.kind, snippet: r.statement.slice(0, 200), score: 1, authority: r.authority, validity: r.validity });
+    }
+    if (kinds.includes('episode')) {
+      const where = likes.map(() => `body LIKE ?`).join(' AND ');
+      const rows = this.ctx.storage.sql
+        .exec<{ id: string; run_id: string; landing_outcome: string; body: string }>(
+          `SELECT id, run_id, landing_outcome, body FROM episodes WHERE ${where} ORDER BY created_at DESC LIMIT ${limit}`,
+          ...likes,
+        )
+        .toArray();
+      for (const r of rows) {
+        hits.push({
+          kind: 'episode',
+          id: r.id,
+          title: `episode ${r.run_id} (${r.landing_outcome})`,
+          snippet: summarizeEpisodeBody(r.body).slice(0, 200),
+          score: 1,
+          status: r.landing_outcome,
+        });
+      }
+    }
+    return hits.slice(0, limit);
   }
 
   // ---------------------------------------------------------------------------
@@ -1303,6 +1464,13 @@ export class ProjectMemory extends DurableObject<Env> {
       );
     });
     this.ctx.storage.setAlarm(Date.now()).catch(() => {});
+    // PLNR-255: index the new authority-5 version, de-index the proposed one it supersedes.
+    const searchBackendForIndex = searchBackend(this.env);
+    if (searchBackendForIndex) {
+      void indexEntity(searchBackendForIndex, { kind: 'memory', id: approvedMemoryId, projectId, title: original.kind, body: original.statement })
+        .then(() => removeEntity(searchBackendForIndex, 'memory', input.memoryItemId))
+        .catch((err) => console.warn(`ProjectMemory memory-index for ${approvedMemoryId} failed: ${String(err)}`));
+    }
     return { approvedMemoryId, transitionId };
   }
 
@@ -1372,6 +1540,7 @@ export class ProjectMemory extends DurableObject<Env> {
     const candidates = this.ctx.storage.sql
       .exec<{ id: string }>(`SELECT id FROM memory_items WHERE authority < ?1`, AUTHORITY_VERIFIED_MERGED)
       .toArray();
+    const searchBackendForIndex = searchBackend(this.env);
     const promoted: string[] = [];
     let skipped = 0;
     for (const { id } of candidates) {
@@ -1438,6 +1607,12 @@ export class ProjectMemory extends DurableObject<Env> {
           JSON.stringify({ promotedId, transitionId }),
         );
       });
+      // PLNR-255: index the new authority-4 version, de-index the one it supersedes.
+      if (searchBackendForIndex) {
+        void indexEntity(searchBackendForIndex, { kind: 'memory', id: promotedId, projectId, title: original.kind, body: original.statement })
+          .then(() => removeEntity(searchBackendForIndex, 'memory', id))
+          .catch((err) => console.warn(`ProjectMemory memory-index for ${promotedId} failed: ${String(err)}`));
+      }
       promoted.push(promotedId);
     }
     if (promoted.length > 0) this.ctx.storage.setAlarm(Date.now()).catch(() => {});
@@ -1624,5 +1799,43 @@ export class ProjectMemory extends DurableObject<Env> {
   async _setMemoryRecordedAtForTest(projectId: string, memoryId: string, recordedAt: string): Promise<void> {
     await this.assertProjectId(projectId);
     this.ctx.storage.sql.exec(`UPDATE memory_items SET recorded_at = ?1 WHERE id = ?2`, recordedAt, memoryId);
+  }
+
+  /** Test-only: seed an episode row directly. No write RPC produces real episodes before
+   *  PLNR-263 (effort-episode ingest) — this exists so PLNR-255's search/hydration work has
+   *  something to index and hydrate in the meantime, the same reason `_seedStagedIndexGeneration`
+   *  exists ahead of Phase 5's ingest pipeline. */
+  async _seedEpisodeForTest(
+    projectId: string,
+    input: {
+      runId: string;
+      taskId?: string | null;
+      repositoryKey?: string | null;
+      baseId?: string | null;
+      landingOutcome?: string;
+      reviewRounds?: number;
+      costUsd?: number;
+      acceptanceCoverage?: number | null;
+      body: Record<string, unknown>;
+    },
+  ): Promise<string> {
+    await this.assertProjectId(projectId);
+    const id = newId('epi');
+    this.ctx.storage.sql.exec(
+      `INSERT INTO episodes (id, run_id, task_id, repository_key, base_id, landing_outcome, review_rounds, cost_usd, acceptance_coverage, body, created_at)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)`,
+      id,
+      input.runId,
+      input.taskId ?? null,
+      input.repositoryKey ?? null,
+      input.baseId ?? null,
+      input.landingOutcome ?? 'pending',
+      input.reviewRounds ?? 0,
+      input.costUsd ?? 0,
+      input.acceptanceCoverage ?? null,
+      JSON.stringify(input.body ?? {}),
+      nowIso(),
+    );
+    return id;
   }
 }

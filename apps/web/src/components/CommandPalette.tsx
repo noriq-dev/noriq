@@ -111,6 +111,9 @@ export function CommandPalette({ store }: { store: AppStore }) {
     const seen = new Set(matches.map((c) => c.id));
     const extra: Cmd[] = [];
     for (const h of serverHits) {
+      // The palette only knows how to jump to task/doc/plan; memory/episode hits (PLNR-255)
+      // are for the memory explorer UI (Phase 8), not quick-open here.
+      if (h.kind !== 'task' && h.kind !== 'doc' && h.kind !== 'plan') continue;
       const id = `${h.kind}:${h.id}`;
       if (seen.has(id) || seen.has(`task:${h.id}`)) continue;
       extra.push({
