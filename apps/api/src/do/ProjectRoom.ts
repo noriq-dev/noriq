@@ -2842,6 +2842,34 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
+  /**
+   * The receiving half of ProjectMemory's outbox (PLNR-247): accept a compact memory-change
+   * delivery, dedupe it durably by operation id, and — for an unseen id only — append it to
+   * this project's event log as actorKind 'system'. Delivering as 'system' rather than 'agent'
+   * matters: emit()'s liveness piggyback below renews claims/last_seen ONLY for actor.kind ===
+   * 'agent', and outbox delivery must never have that side effect. No memory work happens
+   * here — parsing, graph writes, and retries all live on the ProjectMemory side; this method
+   * only dedupes, emits, and returns, keeping ProjectRoom off the memory-processing critical
+   * path (§19).
+   */
+  async receiveMemoryEvent(
+    projectId: string,
+    delivery: { operationId: string; verb: string; subjectType: string; subjectId: string; payload?: Record<string, unknown> },
+  ): Promise<{ ok: true; deduped: boolean }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const seen = await this.env.DB.prepare('SELECT 1 FROM memory_event_dedup WHERE operation_id = ?')
+        .bind(delivery.operationId)
+        .first();
+      if (seen) return { ok: true, deduped: true };
+      await this.env.DB.prepare('INSERT INTO memory_event_dedup (operation_id, project_id, applied_at) VALUES (?, ?, ?)')
+        .bind(delivery.operationId, projectId, nowIso())
+        .run();
+      await this.emit(SYSTEM_ACTOR, delivery.verb, delivery.subjectType, delivery.subjectId, delivery.payload ?? {});
+      return { ok: true, deduped: false };
+    });
+  }
+
   /** Delete an entire project and every row under it. Irreversible. */
   async deleteProject(projectId: string, actor: Actor)  {
     return this.ctx.blockConcurrencyWhile(async () => {
@@ -2920,6 +2948,7 @@ export class ProjectRoom extends DurableObject<Env> {
         // lives in the ProjectMemory DO, not D1, so it cannot ride this batch.
         this.env.DB.prepare('DELETE FROM project_repositories WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM project_memory_registry WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare('DELETE FROM memory_event_dedup WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM projects WHERE id = ?').bind(pid),
       ]);
       // Batch committed — now the attachment rows are gone, so it is safe to drop their blobs.

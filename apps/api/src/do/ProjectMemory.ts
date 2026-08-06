@@ -1,6 +1,8 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../env';
 import { newId, nowIso } from '../lib/util';
+import { buildEntityUri } from '@noriq-dev/shared';
+import { projectCoordinationEvents, type ProjectedEvent } from '../lib/memory-projector';
 
 /**
  * ProjectMemory — one instance per project (idFromName(projectId)), canonical
@@ -14,10 +16,20 @@ import { newId, nowIso } from '../lib/util';
  * canonical store; D1 keeps only compact routing/registry rows (PLNR-246), and
  * nothing here parses or normalizes a VCS `baseId` (PLNR-244 keeps that opaque).
  *
- * SCOPE OF THIS FILE (PLNR-245): the store and its migrator only. Outbox
- * DELIVERY and the D1 projector are PLNR-247; the real memory/evidence/graph
- * write APIs are PLNR-251 onward. The tables below exist so those tasks have
- * somewhere to write.
+ * PLNR-247 adds the outbox<->coordination bridge: a canonical mutation writes
+ * its outbox row in the SAME SQLite transaction (`_mutate`, a deliberately
+ * minimal stand-in for PLNR-251's real write APIs); `drainOutbox` delivers
+ * pending rows to ProjectRoom (idempotent — retrying is safe, the receiver
+ * dedupes); `runProjector` reads D1 coordination events past this project's
+ * durable `global_seq` cursor and projects a minimal set of them into the
+ * graph, advancing the cursor atomically with each projection write. No
+ * Queues/Workflows binding exists in this repo (env.ts declares none), so a
+ * DO alarm plus the explicit `reconcile` RPC are the whole delivery mechanism
+ * — correctness rests on the durable cursor and outbox replay alone, never on
+ * a wakeup actually arriving.
+ *
+ * The real memory/evidence/graph write APIs are PLNR-251 onward. The tables
+ * below exist so those tasks have somewhere to write.
  */
 
 /**
@@ -337,6 +349,158 @@ export class ProjectMemory extends DurableObject<Env> {
       this.ctx.storage.sql.exec(`UPDATE projector_cursor SET global_seq = 0 WHERE id = 0`);
     });
     return { ok: true };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Outbox delivery + D1 event projector (PLNR-247)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Test-only fault injection: force the next `drainOutbox` delivery attempt
+   * to fail before it ever reaches ProjectRoom. Lets a test prove the outbox
+   * row survives a failed delivery and a later `reconcile` closes the gap,
+   * without fighting the runtime for a real transport failure.
+   */
+  private _forceDeliveryFailure = false;
+  async _setForceDeliveryFailure(projectId: string, fail: boolean): Promise<void> {
+    await this.assertProjectId(projectId);
+    this._forceDeliveryFailure = fail;
+  }
+
+  /**
+   * A deliberately minimal stand-in for PLNR-251's real write APIs — just
+   * enough of a canonical mutation to exercise the outbox. Writes the outbox
+   * row in the SAME SQLite transaction as the (trivial) mutation it represents
+   * and bumps `memory_revision`, exactly as any future real write must.
+   */
+  async _mutate(
+    projectId: string,
+    verb: string,
+    subjectType: string,
+    subjectId: string,
+    summary: Record<string, unknown> = {},
+  ): Promise<{ operationId: string }> {
+    await this.assertProjectId(projectId);
+    const operationId = newId('op');
+    const now = nowIso();
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO outbox (id, operation_id, verb, subject_type, subject_id, payload, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+        newId('obx'),
+        operationId,
+        verb,
+        subjectType,
+        subjectId,
+        JSON.stringify({ operationId, ...summary }),
+        now,
+      );
+      this.ctx.storage.sql.exec(`UPDATE memory_revision SET value = value + 1 WHERE id = 0`);
+    });
+    // Best-effort nudge — never awaited, never load-bearing: `reconcile`/`drainOutbox` are
+    // the correctness path if this alarm is lost or the isolate recycles before it fires.
+    this.ctx.storage.setAlarm(Date.now()).catch(() => {});
+    return { operationId };
+  }
+
+  /**
+   * Deliver every undelivered outbox row to ProjectRoom, oldest first. At-least-once and
+   * idempotent to retry: ProjectRoom's `memory_event_dedup` recognizes an already-applied
+   * operation id and acknowledges it without a second event, so calling this again after a
+   * partial run (or a full success) is always safe. A delivery failure stops that row from
+   * being marked delivered and this simply returns — the row is retried on the next drain.
+   */
+  async drainOutbox(projectId: string): Promise<{ delivered: number; failed: number }> {
+    await this.assertProjectId(projectId);
+    const pending = this.ctx.storage.sql
+      .exec<{ id: string; operation_id: string; verb: string; subject_type: string; subject_id: string; payload: string }>(
+        `SELECT id, operation_id, verb, subject_type, subject_id, payload FROM outbox
+         WHERE delivered_at IS NULL ORDER BY created_at ASC`,
+      )
+      .toArray();
+    let delivered = 0;
+    let failed = 0;
+    for (const row of pending) {
+      try {
+        if (this._forceDeliveryFailure) throw new Error('injected delivery failure (test)');
+        await this.env.PROJECT_ROOM.get(this.env.PROJECT_ROOM.idFromName(projectId)).receiveMemoryEvent(projectId, {
+          operationId: row.operation_id,
+          verb: row.verb,
+          subjectType: row.subject_type,
+          subjectId: row.subject_id,
+          payload: JSON.parse(row.payload) as Record<string, unknown>,
+        });
+        this.ctx.storage.sql.exec(`UPDATE outbox SET delivered_at = ?1 WHERE id = ?2`, nowIso(), row.id);
+        delivered++;
+      } catch (err) {
+        failed++;
+        console.warn(`ProjectMemory outbox delivery failed for ${projectId}/${row.operation_id}: ${String(err)}`);
+      }
+    }
+    return { delivered, failed };
+  }
+
+  private readProjectorCursor(): number {
+    const row = this.ctx.storage.sql.exec<{ global_seq: number }>(`SELECT global_seq FROM projector_cursor WHERE id = 0`).toArray()[0];
+    return row?.global_seq ?? 0;
+  }
+
+  /**
+   * A deliberately minimal projection: today only `task.created` creates a graph node (type
+   * 'task', a stable entity URI). Every other coordination verb is acknowledged (the cursor
+   * still advances past it) with no projection write — the full projection matrix grows with
+   * Phases 3-6. `ON CONFLICT DO NOTHING` on the URI makes a re-applied event a no-op rather
+   * than a duplicate node, which matters because the cursor advance and this write commit in
+   * the SAME transaction — replaying a range this already consumed must stay side-effect-free.
+   */
+  private applyCoordinationEvent(ev: ProjectedEvent): void {
+    if (ev.verb === 'task.created') {
+      const uri = buildEntityUri({ kind: 'task', id: ev.subjectId });
+      const label = typeof ev.payload.title === 'string' ? ev.payload.title : ev.subjectId;
+      this.ctx.storage.sql.exec(
+        `INSERT INTO nodes (id, type, uri, label, created_at) VALUES (?1, 'task', ?2, ?3, ?4)
+         ON CONFLICT (uri) DO NOTHING`,
+        newId('node'),
+        uri,
+        label,
+        ev.createdAt,
+      );
+    }
+  }
+
+  /**
+   * Project this project's D1 coordination events past the durable `global_seq` cursor into
+   * the graph, one event at a time — each projection write and its cursor advance commit in
+   * ONE SQLite transaction, so a crash between them is impossible by construction, and
+   * re-running over an already-consumed range applies nothing new (the cursor predicate and
+   * the projection's own idempotent write both guarantee it).
+   */
+  async runProjector(projectId: string): Promise<{ applied: number; cursor: number }> {
+    await this.assertProjectId(projectId);
+    const events = await projectCoordinationEvents(this.env, projectId, this.readProjectorCursor());
+    for (const ev of events) {
+      this.ctx.storage.transactionSync(() => {
+        this.applyCoordinationEvent(ev);
+        this.ctx.storage.sql.exec(`UPDATE projector_cursor SET global_seq = ?1 WHERE id = 0`, ev.globalSeq);
+      });
+    }
+    return { applied: events.length, cursor: this.readProjectorCursor() };
+  }
+
+  /** The explicit reconciliation entry point (§19/§20 — no Queues/Workflows binding exists in
+   *  this repo, so this plus the alarm below are the whole delivery mechanism): drains any
+   *  outbox backlog, then catches this project's memory up on any coordination events it
+   *  missed. Safe to call any time, from anywhere — both halves are independently idempotent. */
+  async reconcile(projectId: string): Promise<{ delivered: number; failed: number; applied: number; cursor: number }> {
+    const drain = await this.drainOutbox(projectId);
+    const project = await this.runProjector(projectId);
+    return { ...drain, ...project };
+  }
+
+  override async alarm(): Promise<void> {
+    const pid = this._pid ?? (await this.ctx.storage.get<string>('pid'));
+    if (!pid) return;
+    await this.drainOutbox(pid).catch((err) => console.warn(`ProjectMemory alarm drain failed: ${String(err)}`));
   }
 
   /**
