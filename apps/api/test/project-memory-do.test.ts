@@ -10,17 +10,18 @@ const appEnv = env as unknown as Env;
 
 interface ProjectMemoryRpc {
   health(pid: string): Promise<ProjectMemoryHealth>;
-  _seedNode(pid: string, uri: string, label: string): Promise<string>;
+  writeNode(pid: string, input: { type: string; uri: string; label: string; actor: { kind: string; id: string | null } }): Promise<{ nodeId: string }>;
   _countNodes(pid: string): Promise<number>;
 }
 
 const memory = (pid: string) => appEnv.PROJECT_MEMORY.get(appEnv.PROJECT_MEMORY.idFromName(pid)) as unknown as ProjectMemoryRpc;
+const SYSTEM = { kind: 'system', id: null };
 
 describe('ProjectMemory — schema migrator', () => {
   it('initializes to schema version 1 with every table empty', async () => {
     const pid = 'prj_pm_fresh';
     const h = await memory(pid).health(pid);
-    expect(h.schemaVersion).toBe(1);
+    expect(h.schemaVersion).toBe(2);
     expect(h.memoryRevision).toBe(0);
     expect(Object.values(h.tableCounts).every((n) => n === 0)).toBe(true);
     expect(h.tableCounts.nodes).toBe(0);
@@ -29,12 +30,12 @@ describe('ProjectMemory — schema migrator', () => {
   it('is repeatable: re-touching an already-migrated store preserves seeded data', async () => {
     const pid = 'prj_pm_repeat';
     await memory(pid).health(pid); // first construction — runs the migrator
-    await memory(pid)._seedNode(pid, `noriq://unknown/seed_1`, 'seeded node');
+    await memory(pid).writeNode(pid, { type: 'unknown', uri: `noriq://unknown/seed_1`, label: 'seeded node', actor: SYSTEM });
 
     // A second stub handle for the SAME idFromName — whether the runtime reuses the live
     // instance or reconstructs it from storage, the migrator must not re-run destructively.
     const again = await memory(pid).health(pid);
-    expect(again.schemaVersion).toBe(1);
+    expect(again.schemaVersion).toBe(2);
     expect(again.tableCounts.nodes).toBe(1);
 
     const count = await memory(pid)._countNodes(pid);
@@ -45,7 +46,7 @@ describe('ProjectMemory — schema migrator', () => {
     const pid = 'prj_pm_no_optional_bindings';
     expect(appEnv.VECTORIZE).toBeUndefined();
     const h = await memory(pid).health(pid);
-    expect(h.schemaVersion).toBe(1);
+    expect(h.schemaVersion).toBe(2);
   });
 });
 
@@ -53,8 +54,8 @@ describe('ProjectMemory — project isolation', () => {
   it('two project ids are physically isolated stores', async () => {
     const pidA = 'prj_pm_iso_a';
     const pidB = 'prj_pm_iso_b';
-    await memory(pidA)._seedNode(pidA, 'noriq://unknown/a', 'a');
-    await memory(pidA)._seedNode(pidA, 'noriq://unknown/a2', 'a2');
+    await memory(pidA).writeNode(pidA, { type: 'unknown', uri: 'noriq://unknown/a', label: 'a', actor: SYSTEM });
+    await memory(pidA).writeNode(pidA, { type: 'unknown', uri: 'noriq://unknown/a2', label: 'a2', actor: SYSTEM });
 
     const healthA = await memory(pidA).health(pidA);
     const healthB = await memory(pidB).health(pidB);
@@ -67,6 +68,6 @@ describe('ProjectMemory — project isolation', () => {
     const pidB = 'prj_pm_wrong_b';
     const stub = memory(pidA);
     await stub.health(pidA); // binds this instance to pidA
-    await expect(stub._seedNode(pidB, 'noriq://unknown/x', 'x')).rejects.toThrow(/projectId mismatch/);
+    await expect(stub.writeNode(pidB, { type: 'unknown', uri: 'noriq://unknown/x', label: 'x', actor: SYSTEM })).rejects.toThrow(/projectId mismatch/);
   });
 });

@@ -1,12 +1,13 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../env';
 import { newId, nowIso } from '../lib/util';
-import { buildEntityUri, type MemoryBackupManifest } from '@noriq-dev/shared';
+import { buildEntityUri, AUTHORITY_HYPOTHESIS, type MemoryBackupManifest } from '@noriq-dev/shared';
 import { projectCoordinationEvents, type ProjectedEvent } from '../lib/memory-projector';
 import { exportMemorySnapshot } from '../memory/backup';
 import { fetchManifest, readSnapshotChunks, checkManifestHeader } from '../memory/restore';
 import { deleteAllProjectBackups, sizeStatus, type EraseReport, type EraseStepResult } from '../memory/lifecycle';
 import { MEMORY_MIGRATIONS } from '../memory/migrations';
+import { validateMemoryScope, validateEvidenceRef, memoryContentHash, evidenceHash, clampAuthority, type MemoryScope } from '../memory/writes';
 
 /**
  * ProjectMemory — one instance per project (idFromName(projectId)), canonical
@@ -20,20 +21,18 @@ import { MEMORY_MIGRATIONS } from '../memory/migrations';
  * canonical store; D1 keeps only compact routing/registry rows (PLNR-246), and
  * nothing here parses or normalizes a VCS `baseId` (PLNR-244 keeps that opaque).
  *
- * PLNR-247 adds the outbox<->coordination bridge: a canonical mutation writes
- * its outbox row in the SAME SQLite transaction (`_mutate`, a deliberately
- * minimal stand-in for PLNR-251's real write APIs); `drainOutbox` delivers
- * pending rows to ProjectRoom (idempotent — retrying is safe, the receiver
- * dedupes); `runProjector` reads D1 coordination events past this project's
- * durable `global_seq` cursor and projects a minimal set of them into the
- * graph, advancing the cursor atomically with each projection write. No
- * Queues/Workflows binding exists in this repo (env.ts declares none), so a
- * DO alarm plus the explicit `reconcile` RPC are the whole delivery mechanism
- * — correctness rests on the durable cursor and outbox replay alone, never on
- * a wakeup actually arriving.
+ * PLNR-247 adds the outbox<->coordination bridge: a canonical mutation writes its outbox row in
+ * the SAME SQLite transaction as the mutation itself; `drainOutbox` delivers pending rows to
+ * ProjectRoom (idempotent — retrying is safe, the receiver dedupes); `runProjector` reads D1
+ * coordination events past this project's durable `global_seq` cursor and projects a minimal set
+ * of them into the graph, advancing the cursor atomically with each projection write. No
+ * Queues/Workflows binding exists in this repo (env.ts declares none), so a DO alarm plus the
+ * explicit `reconcile` RPC are the whole delivery mechanism — correctness rests on the durable
+ * cursor and outbox replay alone, never on a wakeup actually arriving.
  *
- * The real memory/evidence/graph write APIs are PLNR-251 onward. The tables
- * below exist so those tasks have somewhere to write.
+ * PLNR-251 adds the real memory/evidence/graph write APIs (`recordMemory`, `writeNode`,
+ * `writeEdge`, `addContradiction`) — see the block comment above that section for their shared
+ * shape. Later phases (retrieval, ingest, episodes, approval) build on top of these.
  */
 
 // This DO's internal SQLite schema lives in apps/api/memory-migrations — real `.sql` files, one
@@ -59,6 +58,7 @@ export const SCHEMA_TABLES = [
   'memory_items',
   'evidence',
   'feedback',
+  'contradiction_sets',
   'contradictions',
   'episodes',
   'outbox',
@@ -580,40 +580,376 @@ export class ProjectMemory extends DurableObject<Env> {
     this._forceDeliveryFailure = fail;
   }
 
-  /**
-   * A deliberately minimal stand-in for PLNR-251's real write APIs — just
-   * enough of a canonical mutation to exercise the outbox. Writes the outbox
-   * row in the SAME SQLite transaction as the (trivial) mutation it represents
-   * and bumps `memory_revision`, exactly as any future real write must.
-   */
-  async _mutate(
-    projectId: string,
-    verb: string,
-    subjectType: string,
-    subjectId: string,
-    summary: Record<string, unknown> = {},
-  ): Promise<{ operationId: string }> {
+  // ---------------------------------------------------------------------------
+  // Real memory/evidence/graph write APIs (PLNR-251) — replaces the old `_mutate` stand-in.
+  //
+  // Every write here shares one shape: resolve an operation id, check `applied_operations` for
+  // a prior application of it (idempotent replay), and — for a genuinely new operation — run ONE
+  // `transactionSync` that performs the mutation, writes the outbox row, bumps `memory_revision`,
+  // and records the operation as applied together with the id it produced. All four commit or
+  // none do (§4) — that is what makes a retried write with the same operation id safe rather
+  // than merely detected-after-the-fact.
+  //
+  // The outbox always emits verb 'memory.changed' / subjectType 'memory' — the ONE compact verb
+  // ProjectRoom's closed `EventVerb`/subjectType enums carry for every memory-subsystem change
+  // (see events.ts). Which kind of record changed rides the payload's `entityType`, never the
+  // verb or subjectType themselves.
+  // ---------------------------------------------------------------------------
+
+  private lookupAppliedOperation(operationId: string): { subject_type: string; subject_id: string; result: string } | null {
+    const row = this.ctx.storage.sql
+      .exec<{ subject_type: string; subject_id: string; result: string }>(
+        `SELECT subject_type, subject_id, result FROM applied_operations WHERE operation_id = ?1`,
+        operationId,
+      )
+      .toArray()[0];
+    return row ?? null;
+  }
+
+  /** Test-only fault injection: force the next write RPC's transaction to throw mid-commit,
+   *  proving the mutation, its outbox row, and its revision bump are one atomic unit rather
+   *  than three separate writes that could partially land. Mirrors `_setForceDeliveryFailure`
+   *  / `_setForceEraseFailure` (same reason: a real SQLite failure isn't reproducible on demand). */
+  private _forceWriteFailure = false;
+  async _setForceWriteFailure(projectId: string, fail: boolean): Promise<void> {
     await this.assertProjectId(projectId);
-    const operationId = newId('op');
+    this._forceWriteFailure = fail;
+  }
+
+  async recordMemory(
+    projectId: string,
+    input: {
+      operationId?: string;
+      kind: string;
+      statement: string;
+      authority?: number;
+      confidence?: number | null;
+      evidence?: unknown[];
+      supersedesMemoryId?: string | null;
+      scope?: unknown;
+      actor: { kind: string; id: string | null };
+    },
+  ): Promise<{ memoryId: string; operationId: string; deduped: boolean }> {
+    await this.assertProjectId(projectId);
+    if (input.operationId) {
+      const existing = this.lookupAppliedOperation(input.operationId);
+      if (existing) return { memoryId: (JSON.parse(existing.result) as { memoryId: string }).memoryId, operationId: input.operationId, deduped: true };
+    }
+    const scope = validateMemoryScope(input.scope ?? {});
+    const evidenceRefs = (input.evidence ?? []).map((e) => validateEvidenceRef(e));
+    const evidenceHashes = await Promise.all(evidenceRefs.map((e) => evidenceHash(e)));
+    const contentHash = await memoryContentHash(input.kind, input.statement, scope);
+
+    const operationId = input.operationId ?? newId('op');
+    const authority = clampAuthority(input.authority ?? AUTHORITY_HYPOTHESIS, input.actor.kind);
+    const memoryId = newId('mem');
     const now = nowIso();
+
     this.ctx.storage.transactionSync(() => {
+      if (this._forceWriteFailure) throw new Error('injected write failure (test)');
+      if (scope.repositoryKey) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO repositories (repository_key, created_at) VALUES (?1, ?2) ON CONFLICT (repository_key) DO NOTHING`,
+          scope.repositoryKey,
+          now,
+        );
+      }
       this.ctx.storage.sql.exec(
-        `INSERT INTO outbox (id, operation_id, verb, subject_type, subject_id, payload, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+        `INSERT INTO memory_items
+           (id, kind, statement, authority, confidence, content_hash, repository_key, branch, base_id, supersedes_memory_id, recorded_by_agent_id, recorded_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)`,
+        memoryId,
+        input.kind,
+        input.statement,
+        authority,
+        input.confidence ?? null,
+        contentHash,
+        scope.repositoryKey ?? null,
+        scope.branch ?? null,
+        scope.baseId ?? null,
+        input.supersedesMemoryId ?? null,
+        input.actor.id ?? null,
+        now,
+      );
+      evidenceRefs.forEach((ref, i) => {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO evidence
+             (id, memory_item_id, repository_key, branch, base_id, path, symbol, content_hash, evidence_hash, verification_state, created_at)
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)`,
+          newId('ev'),
+          memoryId,
+          ref.repositoryKey,
+          ref.branch,
+          ref.baseId,
+          ref.path,
+          ref.symbol,
+          ref.contentHash,
+          evidenceHashes[i]!,
+          ref.verificationState,
+          now,
+        );
+      });
+      this.ctx.storage.sql.exec(
+        `INSERT INTO outbox (id, operation_id, verb, subject_type, subject_id, payload, created_at) VALUES (?1,?2,'memory.changed','memory',?3,?4,?5)`,
         newId('obx'),
         operationId,
-        verb,
-        subjectType,
-        subjectId,
-        JSON.stringify({ operationId, ...summary }),
+        memoryId,
+        JSON.stringify({ operationId, entityType: 'memory_item', kind: input.kind, authority }),
         now,
       );
       this.ctx.storage.sql.exec(`UPDATE memory_revision SET value = value + 1 WHERE id = 0`);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO applied_operations (operation_id, applied_at, subject_type, subject_id, result) VALUES (?1,?2,'memory_item',?3,?4)`,
+        operationId,
+        now,
+        memoryId,
+        JSON.stringify({ memoryId }),
+      );
     });
-    // Best-effort nudge — never awaited, never load-bearing: `reconcile`/`drainOutbox` are
-    // the correctness path if this alarm is lost or the isolate recycles before it fires.
     this.ctx.storage.setAlarm(Date.now()).catch(() => {});
-    return { operationId };
+    return { memoryId, operationId, deduped: false };
+  }
+
+  async writeNode(
+    projectId: string,
+    input: { operationId?: string; type: string; uri: string; label: string; actor: { kind: string; id: string | null } },
+  ): Promise<{ nodeId: string; operationId: string; deduped: boolean }> {
+    await this.assertProjectId(projectId);
+    if (input.operationId) {
+      const existing = this.lookupAppliedOperation(input.operationId);
+      if (existing) return { nodeId: (JSON.parse(existing.result) as { nodeId: string }).nodeId, operationId: input.operationId, deduped: true };
+    }
+    const operationId = input.operationId ?? newId('op');
+    const candidateId = newId('node');
+    const now = nowIso();
+    let nodeId = candidateId;
+    this.ctx.storage.transactionSync(() => {
+      if (this._forceWriteFailure) throw new Error('injected write failure (test)');
+      this.ctx.storage.sql.exec(
+        `INSERT INTO nodes (id, type, uri, label, created_at) VALUES (?1,?2,?3,?4,?5)
+         ON CONFLICT (uri) DO UPDATE SET label = excluded.label`,
+        candidateId,
+        input.type,
+        input.uri,
+        input.label,
+        now,
+      );
+      nodeId = this.ctx.storage.sql.exec<{ id: string }>(`SELECT id FROM nodes WHERE uri = ?1`, input.uri).toArray()[0]!.id;
+      this.ctx.storage.sql.exec(
+        `INSERT INTO outbox (id, operation_id, verb, subject_type, subject_id, payload, created_at) VALUES (?1,?2,'memory.changed','memory',?3,?4,?5)`,
+        newId('obx'),
+        operationId,
+        nodeId,
+        JSON.stringify({ operationId, entityType: 'node', nodeType: input.type }),
+        now,
+      );
+      this.ctx.storage.sql.exec(`UPDATE memory_revision SET value = value + 1 WHERE id = 0`);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO applied_operations (operation_id, applied_at, subject_type, subject_id, result) VALUES (?1,?2,'node',?3,?4)`,
+        operationId,
+        now,
+        nodeId,
+        JSON.stringify({ nodeId }),
+      );
+    });
+    this.ctx.storage.setAlarm(Date.now()).catch(() => {});
+    return { nodeId, operationId, deduped: false };
+  }
+
+  async writeEdge(
+    projectId: string,
+    input: { operationId?: string; type: string; fromNodeId: string; toNodeId: string; actor: { kind: string; id: string | null } },
+  ): Promise<{ edgeId: string; operationId: string; deduped: boolean }> {
+    await this.assertProjectId(projectId);
+    if (input.operationId) {
+      const existing = this.lookupAppliedOperation(input.operationId);
+      if (existing) return { edgeId: (JSON.parse(existing.result) as { edgeId: string }).edgeId, operationId: input.operationId, deduped: true };
+    }
+    const operationId = input.operationId ?? newId('op');
+    const candidateId = newId('edge');
+    const now = nowIso();
+    let edgeId = candidateId;
+    this.ctx.storage.transactionSync(() => {
+      if (this._forceWriteFailure) throw new Error('injected write failure (test)');
+      this.ctx.storage.sql.exec(
+        `INSERT INTO edges (id, type, from_node_id, to_node_id, created_at) VALUES (?1,?2,?3,?4,?5)
+         ON CONFLICT (type, from_node_id, to_node_id) DO NOTHING`,
+        candidateId,
+        input.type,
+        input.fromNodeId,
+        input.toNodeId,
+        now,
+      );
+      edgeId = this.ctx.storage.sql
+        .exec<{ id: string }>(`SELECT id FROM edges WHERE type = ?1 AND from_node_id = ?2 AND to_node_id = ?3`, input.type, input.fromNodeId, input.toNodeId)
+        .toArray()[0]!.id;
+      this.ctx.storage.sql.exec(
+        `INSERT INTO outbox (id, operation_id, verb, subject_type, subject_id, payload, created_at) VALUES (?1,?2,'memory.changed','memory',?3,?4,?5)`,
+        newId('obx'),
+        operationId,
+        edgeId,
+        JSON.stringify({ operationId, entityType: 'edge', edgeType: input.type }),
+        now,
+      );
+      this.ctx.storage.sql.exec(`UPDATE memory_revision SET value = value + 1 WHERE id = 0`);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO applied_operations (operation_id, applied_at, subject_type, subject_id, result) VALUES (?1,?2,'edge',?3,?4)`,
+        operationId,
+        now,
+        edgeId,
+        JSON.stringify({ edgeId }),
+      );
+    });
+    this.ctx.storage.setAlarm(Date.now()).catch(() => {});
+    return { edgeId, operationId, deduped: false };
+  }
+
+  /** Link two memories as contradicting each other, addressable as one named set (§12). Passing
+   *  an existing `setId` folds a third (or later) memory into the same disagreement rather than
+   *  starting a new one. */
+  async addContradiction(
+    projectId: string,
+    input: {
+      operationId?: string;
+      memoryItemId: string;
+      contradictsMemoryItemId: string;
+      setId?: string | null;
+      actor: { kind: string; id: string | null };
+    },
+  ): Promise<{ setId: string; contradictionId: string; operationId: string; deduped: boolean }> {
+    await this.assertProjectId(projectId);
+    if (input.operationId) {
+      const existing = this.lookupAppliedOperation(input.operationId);
+      if (existing) {
+        const result = JSON.parse(existing.result) as { setId: string; contradictionId: string };
+        return { ...result, operationId: input.operationId, deduped: true };
+      }
+    }
+    const operationId = input.operationId ?? newId('op');
+    const setId = input.setId ?? newId('cset');
+    const contradictionId = newId('contra');
+    const now = nowIso();
+    this.ctx.storage.transactionSync(() => {
+      if (this._forceWriteFailure) throw new Error('injected write failure (test)');
+      if (!input.setId) {
+        this.ctx.storage.sql.exec(`INSERT INTO contradiction_sets (id, created_at) VALUES (?1, ?2)`, setId, now);
+      }
+      this.ctx.storage.sql.exec(
+        `INSERT INTO contradictions (id, memory_item_id, contradicts_memory_item_id, set_id, created_at) VALUES (?1,?2,?3,?4,?5)`,
+        contradictionId,
+        input.memoryItemId,
+        input.contradictsMemoryItemId,
+        setId,
+        now,
+      );
+      this.ctx.storage.sql.exec(
+        `INSERT INTO outbox (id, operation_id, verb, subject_type, subject_id, payload, created_at) VALUES (?1,?2,'memory.changed','memory',?3,?4,?5)`,
+        newId('obx'),
+        operationId,
+        contradictionId,
+        JSON.stringify({ operationId, entityType: 'contradiction', setId }),
+        now,
+      );
+      this.ctx.storage.sql.exec(`UPDATE memory_revision SET value = value + 1 WHERE id = 0`);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO applied_operations (operation_id, applied_at, subject_type, subject_id, result) VALUES (?1,?2,'contradiction',?3,?4)`,
+        operationId,
+        now,
+        contradictionId,
+        JSON.stringify({ setId, contradictionId }),
+      );
+    });
+    this.ctx.storage.setAlarm(Date.now()).catch(() => {});
+    return { setId, contradictionId, operationId, deduped: false };
+  }
+
+  /** Every memory item currently in a named contradiction set — the set is the addressable
+   *  unit a caller resolves, not the individual pairwise rows. */
+  async getContradictionSet(projectId: string, setId: string): Promise<{ setId: string; memoryItemIds: string[]; resolvedAt: string | null }> {
+    await this.assertProjectId(projectId);
+    const rows = this.ctx.storage.sql
+      .exec<{ memory_item_id: string; contradicts_memory_item_id: string }>(
+        `SELECT memory_item_id, contradicts_memory_item_id FROM contradictions WHERE set_id = ?1`,
+        setId,
+      )
+      .toArray();
+    const ids = new Set<string>();
+    for (const r of rows) {
+      ids.add(r.memory_item_id);
+      ids.add(r.contradicts_memory_item_id);
+    }
+    const setRow = this.ctx.storage.sql.exec<{ resolved_at: string | null }>(`SELECT resolved_at FROM contradiction_sets WHERE id = ?1`, setId).toArray()[0];
+    return { setId, memoryItemIds: [...ids], resolvedAt: setRow?.resolved_at ?? null };
+  }
+
+  /** A memory item in full — statement, authority, scope, and its evidence — exactly as
+   *  recorded. A superseded item is reachable through this the same way its replacement is;
+   *  supersession never mutates or hides the row it links back to (§12). */
+  async getMemoryItem(projectId: string, memoryId: string): Promise<{
+    id: string;
+    kind: string;
+    statement: string;
+    authority: number;
+    confidence: number | null;
+    contentHash: string | null;
+    repositoryKey: string | null;
+    branch: string | null;
+    baseId: string | null;
+    validity: string;
+    supersedesMemoryId: string | null;
+    recordedByAgentId: string | null;
+    recordedAt: string;
+    evidence: Array<{ id: string; repositoryKey: string; branch: string; baseId: string; path: string; symbol: string | null; verificationState: string }>;
+  } | null> {
+    await this.assertProjectId(projectId);
+    const row = this.ctx.storage.sql
+      .exec<{
+        id: string;
+        kind: string;
+        statement: string;
+        authority: number;
+        confidence: number | null;
+        content_hash: string | null;
+        repository_key: string | null;
+        branch: string | null;
+        base_id: string | null;
+        validity: string;
+        supersedes_memory_id: string | null;
+        recorded_by_agent_id: string | null;
+        recorded_at: string;
+      }>(`SELECT * FROM memory_items WHERE id = ?1`, memoryId)
+      .toArray()[0];
+    if (!row) return null;
+    const evidence = this.ctx.storage.sql
+      .exec<{ id: string; repository_key: string; branch: string; base_id: string; path: string; symbol: string | null; verification_state: string }>(
+        `SELECT id, repository_key, branch, base_id, path, symbol, verification_state FROM evidence WHERE memory_item_id = ?1 ORDER BY created_at`,
+        memoryId,
+      )
+      .toArray();
+    return {
+      id: row.id,
+      kind: row.kind,
+      statement: row.statement,
+      authority: row.authority,
+      confidence: row.confidence,
+      contentHash: row.content_hash,
+      repositoryKey: row.repository_key,
+      branch: row.branch,
+      baseId: row.base_id,
+      validity: row.validity,
+      supersedesMemoryId: row.supersedes_memory_id,
+      recordedByAgentId: row.recorded_by_agent_id,
+      recordedAt: row.recorded_at,
+      evidence: evidence.map((e) => ({
+        id: e.id,
+        repositoryKey: e.repository_key,
+        branch: e.branch,
+        baseId: e.base_id,
+        path: e.path,
+        symbol: e.symbol,
+        verificationState: e.verification_state,
+      })),
+    };
   }
 
   /**
@@ -716,77 +1052,9 @@ export class ProjectMemory extends DurableObject<Env> {
     await this.drainOutbox(pid).catch((err) => console.warn(`ProjectMemory alarm drain failed: ${String(err)}`));
   }
 
-  /**
-   * Test/seed-only helper: insert a bare-minimum graph node under this
-   * project's store. Exists so PLNR-245's migrator-repeatability test can
-   * prove seeded data survives across a re-migration without reaching into
-   * the DO's private SQL surface from outside. The real write surface
-   * (memory items, evidence, versioning) is PLNR-251 — this is deliberately
-   * not that.
-   */
-  async _seedNode(projectId: string, uri: string, label: string): Promise<string> {
-    await this.assertProjectId(projectId);
-    const id = newId('node');
-    this.ctx.storage.sql.exec(
-      `INSERT INTO nodes (id, type, uri, label, created_at) VALUES (?1, 'unknown', ?2, ?3, ?4)`,
-      id,
-      uri,
-      label,
-      nowIso(),
-    );
-    return id;
-  }
-
   async _countNodes(projectId: string): Promise<number> {
     await this.assertProjectId(projectId);
     return this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM nodes`).toArray()[0]?.n ?? 0;
-  }
-
-  /** Test/seed-only: a typed edge between two already-seeded nodes (PLNR-249's restore
-   *  round-trip needs graph data beyond bare nodes). Not the real write surface — PLNR-251. */
-  async _seedEdge(projectId: string, type: string, fromNodeId: string, toNodeId: string): Promise<string> {
-    await this.assertProjectId(projectId);
-    const id = newId('edge');
-    this.ctx.storage.sql.exec(
-      `INSERT INTO edges (id, type, from_node_id, to_node_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5)`,
-      id,
-      type,
-      fromNodeId,
-      toNodeId,
-      nowIso(),
-    );
-    return id;
-  }
-
-  /** Test/seed-only: a bare memory item. See _seedEdge. */
-  async _seedMemoryItem(projectId: string, kind: string, statement: string): Promise<string> {
-    await this.assertProjectId(projectId);
-    const id = newId('mem');
-    this.ctx.storage.sql.exec(
-      `INSERT INTO memory_items (id, kind, statement, recorded_at) VALUES (?1, ?2, ?3, ?4)`,
-      id,
-      kind,
-      statement,
-      nowIso(),
-    );
-    return id;
-  }
-
-  /** Test/seed-only: an evidence row citing an already-seeded memory item. See _seedEdge. */
-  async _seedEvidence(projectId: string, memoryItemId: string, repositoryKey: string, branch: string, baseId: string, path: string): Promise<string> {
-    await this.assertProjectId(projectId);
-    const id = newId('ev');
-    this.ctx.storage.sql.exec(
-      `INSERT INTO evidence (id, memory_item_id, repository_key, branch, base_id, path, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
-      id,
-      memoryItemId,
-      repositoryKey,
-      branch,
-      baseId,
-      path,
-      nowIso(),
-    );
-    return id;
   }
 
   /** Test-only: one-hop graph traversal from a node, via edges of the given type. Exists so

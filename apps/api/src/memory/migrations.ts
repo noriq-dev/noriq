@@ -46,6 +46,7 @@
 //   • src/sql-modules.d.ts  `declare module '*.sql'` — the typecheck path.
 // If a `.sql` import ever fails, it is one of the latter two.
 import sql0001 from '../../memory-migrations/0001_initial.sql';
+import sql0002 from '../../memory-migrations/0002_memory_write_apis.sql';
 
 export interface MemoryMigration {
   /** 1-based, contiguous, and equal to this entry's array index + 1. */
@@ -58,6 +59,7 @@ export interface MemoryMigration {
 
 export const MEMORY_MIGRATIONS: readonly MemoryMigration[] = [
   { version: 1, name: '0001_initial', sql: sql0001 },
+  { version: 2, name: '0002_memory_write_apis', sql: sql0002 },
 ];
 
 /** The schema version a freshly-migrated store lands on. */

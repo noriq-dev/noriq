@@ -12,7 +12,15 @@ const appEnv = env as unknown as Env;
 
 interface MemoryRpc {
   health(pid: string): Promise<{ schemaVersion: number; memoryRevision: number; tableCounts: Record<string, number> }>;
-  _mutate(pid: string, verb: string, subjectType: string, subjectId: string, summary?: Record<string, unknown>): Promise<{ operationId: string }>;
+  recordMemory(
+    pid: string,
+    input: {
+      kind: string;
+      statement: string;
+      evidence?: Array<{ repositoryKey: string; branch: string; baseId: string; path: string }>;
+      actor: { kind: string; id: string | null };
+    },
+  ): Promise<{ memoryId: string; operationId: string; deduped: boolean }>;
   drainOutbox(pid: string): Promise<{ delivered: number; failed: number }>;
   runProjector(pid: string): Promise<{ applied: number; cursor: number }>;
   exportSnapshot(pid: string, opts?: { tier?: 'core' | 'full' }): Promise<
@@ -24,14 +32,16 @@ interface MemoryRpc {
   rollback(pid: string): Promise<{ ok: true } | { ok: false; reason: string }>;
   rebuildVectorIndex(pid: string): Promise<{ ok: true; rebuilt: false; reason: string }>;
   erase(pid: string): Promise<{ ok: true }>;
-  _seedNode(pid: string, uri: string, label: string): Promise<string>;
-  _seedEdge(pid: string, type: string, from: string, to: string): Promise<string>;
-  _seedMemoryItem(pid: string, kind: string, statement: string): Promise<string>;
-  _seedEvidence(pid: string, memoryItemId: string, repositoryKey: string, branch: string, baseId: string, path: string): Promise<string>;
+  writeNode(pid: string, input: { type: string; uri: string; label: string; actor: { kind: string; id: string | null } }): Promise<{ nodeId: string }>;
+  writeEdge(
+    pid: string,
+    input: { type: string; fromNodeId: string; toNodeId: string; actor: { kind: string; id: string | null } },
+  ): Promise<{ edgeId: string }>;
   _traverseFrom(pid: string, from: string, type: string): Promise<string[]>;
   _evidencePathsFor(pid: string, memoryItemId: string): Promise<string[]>;
   _tableDdl(pid: string, table: string): Promise<string>;
 }
+const SYSTEM = { kind: 'system', id: null };
 
 const memory = (pid: string) => appEnv.PROJECT_MEMORY.get(appEnv.PROJECT_MEMORY.idFromName(pid)) as unknown as MemoryRpc;
 
@@ -86,16 +96,24 @@ describe('restoreSnapshot — round trip reproduces canonical state', () => {
     // (the delivered memory.changed), so the projector must run AGAIN after it to consume that
     // too — otherwise the snapshot exports with a cursor already behind the live event log.
     await memory(projectId).runProjector(projectId);
-    const { operationId } = await memory(projectId)._mutate(projectId, 'memory.changed', 'memory', 'mem_pre', {});
+    const { operationId } = await memory(projectId).recordMemory(projectId, { kind: 'learning', statement: 'pre-export marker', actor: SYSTEM });
     void operationId;
     await memory(projectId).drainOutbox(projectId);
     await memory(projectId).runProjector(projectId);
 
-    const nodeA = await memory(projectId)._seedNode(projectId, 'noriq://unknown/a', 'a');
-    const nodeB = await memory(projectId)._seedNode(projectId, 'noriq://unknown/b', 'b');
-    await memory(projectId)._seedEdge(projectId, 'related_to', nodeA, nodeB);
-    const memItem = await memory(projectId)._seedMemoryItem(projectId, 'learning', 'evidence-backed learning');
-    await memory(projectId)._seedEvidence(projectId, memItem, 'repo-x', 'main', 'a1b2c3', 'README.md');
+    const { nodeId: nodeA } = await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/a', label: 'a', actor: SYSTEM });
+    const { nodeId: nodeB } = await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/b', label: 'b', actor: SYSTEM });
+    await memory(projectId).writeEdge(projectId, { type: 'related_to', fromNodeId: nodeA, toNodeId: nodeB, actor: SYSTEM });
+    const { memoryId: memItem } = await memory(projectId).recordMemory(projectId, {
+      kind: 'learning',
+      statement: 'evidence-backed learning',
+      evidence: [{ repositoryKey: 'repo-x', branch: 'main', baseId: 'a1b2c3', path: 'README.md' }],
+      actor: SYSTEM,
+    });
+    // Every write above (node/edge/memory) queued its own outbox row — drain and project again
+    // so the ledgers are caught up before export, matching the comment above.
+    await memory(projectId).drainOutbox(projectId);
+    await memory(projectId).runProjector(projectId);
 
     const beforeHealth = await memory(projectId).health(projectId);
     const beforeTraversal = await memory(projectId)._traverseFrom(projectId, nodeA, 'related_to');
@@ -133,7 +151,7 @@ describe('restoreSnapshot — round trip reproduces canonical state', () => {
 
   it('rollback returns to the pre-restore state without touching R2, and is single-level', async () => {
     const { projectId } = await newOwnedProject('pm-restore-rollback@example.com', 'PMRSTRB');
-    await memory(projectId)._seedNode(projectId, 'noriq://unknown/keep', 'keep');
+    await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/keep', label: 'keep', actor: SYSTEM });
     const exported = await memory(projectId).exportSnapshot(projectId);
     if (!exported.ok) throw new Error(`export failed: ${exported.reason}`);
 
@@ -156,7 +174,7 @@ describe('restoreSnapshot — round trip reproduces canonical state', () => {
 
   it('a corrupted chunk fails validation and leaves the active generation untouched', async () => {
     const { projectId } = await newOwnedProject('pm-restore-corrupt@example.com', 'PMRSTCRP');
-    await memory(projectId)._seedNode(projectId, 'noriq://unknown/for-snapshot', 'for-snapshot');
+    await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/for-snapshot', label: 'for-snapshot', actor: SYSTEM });
     const exported = await memory(projectId).exportSnapshot(projectId);
     if (!exported.ok) throw new Error(`export failed: ${exported.reason}`);
 
@@ -165,7 +183,7 @@ describe('restoreSnapshot — round trip reproduces canonical state', () => {
     await appEnv.FILES!.put(nodesChunkKey, new TextEncoder().encode('corrupted'));
 
     // Live state diverges from the (now-corrupted) snapshot after export.
-    await memory(projectId)._seedNode(projectId, 'noriq://unknown/live-only', 'live-only');
+    await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/live-only', label: 'live-only', actor: SYSTEM });
     const liveCountBefore = (await memory(projectId).health(projectId)).tableCounts.nodes;
 
     const restored = await memory(projectId).restoreSnapshot(projectId, { exportedAt: exported.manifest.exportedAt });
@@ -181,9 +199,9 @@ describe('restoreSnapshot — round trip reproduces canonical state', () => {
   // "no such table: staging_evidence". A graph without evidence is an entirely ordinary shape.
   it('restores a project that has edges but NO evidence rows', async () => {
     const { projectId } = await newOwnedProject('pm-restore-noev@example.com', 'PMRSTNEV');
-    const a = await memory(projectId)._seedNode(projectId, 'noriq://unknown/ne-a', 'ne-a');
-    const b = await memory(projectId)._seedNode(projectId, 'noriq://unknown/ne-b', 'ne-b');
-    await memory(projectId)._seedEdge(projectId, 'related_to', a, b);
+    const { nodeId: a } = await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/ne-a', label: 'ne-a', actor: SYSTEM });
+    const { nodeId: b } = await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/ne-b', label: 'ne-b', actor: SYSTEM });
+    await memory(projectId).writeEdge(projectId, { type: 'related_to', fromNodeId: a, toNodeId: b, actor: SYSTEM });
 
     const exported = await memory(projectId).exportSnapshot(projectId);
     if (!exported.ok) throw new Error('export failed');
@@ -206,11 +224,15 @@ describe('restoreSnapshot — round trip reproduces canonical state', () => {
   // drift.
   it('restores twice in a row without schema drift', async () => {
     const { projectId } = await newOwnedProject('pm-restore-twice@example.com', 'PMRSTTWC');
-    const a = await memory(projectId)._seedNode(projectId, 'noriq://unknown/tw-a', 'tw-a');
-    const b = await memory(projectId)._seedNode(projectId, 'noriq://unknown/tw-b', 'tw-b');
-    await memory(projectId)._seedEdge(projectId, 'related_to', a, b);
-    const mem = await memory(projectId)._seedMemoryItem(projectId, 'learning', 'twice');
-    await memory(projectId)._seedEvidence(projectId, mem, 'repo-x', 'main', 'base1', 'README.md');
+    const { nodeId: a } = await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/tw-a', label: 'tw-a', actor: SYSTEM });
+    const { nodeId: b } = await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/tw-b', label: 'tw-b', actor: SYSTEM });
+    await memory(projectId).writeEdge(projectId, { type: 'related_to', fromNodeId: a, toNodeId: b, actor: SYSTEM });
+    await memory(projectId).recordMemory(projectId, {
+      kind: 'learning',
+      statement: 'twice',
+      evidence: [{ repositoryKey: 'repo-x', branch: 'main', baseId: 'base1', path: 'README.md' }],
+      actor: SYSTEM,
+    });
 
     const first = await memory(projectId).exportSnapshot(projectId);
     if (!first.ok) throw new Error('export 1 failed');
@@ -253,7 +275,7 @@ describe('restoreSnapshot — round trip reproduces canonical state', () => {
       JSON.stringify(mismatched),
     );
 
-    await memory(honestProjectId)._seedNode(honestProjectId, 'noriq://unknown/untouched', 'untouched');
+    await memory(honestProjectId).writeNode(honestProjectId, { type: 'unknown', uri: 'noriq://unknown/untouched', label: 'untouched', actor: SYSTEM });
     const before = await memory(honestProjectId).health(honestProjectId);
 
     const result = await memory(honestProjectId).restoreSnapshot(honestProjectId, { exportedAt: fixedExportedAt });

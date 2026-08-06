@@ -35,7 +35,7 @@ interface MemoryRpc {
   erase(pid: string): Promise<{ ok: true }>;
   eraseAll(pid: string): Promise<{ ok: boolean; steps: Array<{ step: string; ok: boolean; detail: string }> }>;
   _setForceEraseFailure(pid: string, fail: boolean): Promise<void>;
-  _seedNode(pid: string, uri: string, label: string): Promise<string>;
+  writeNode(pid: string, input: { type: string; uri: string; label: string; actor: { kind: string; id: string | null } }): Promise<{ nodeId: string }>;
   _seedStagedIndexGeneration(pid: string, repositoryKey: string, createdAt: string): Promise<string>;
   _countIndexGenerations(pid: string): Promise<number>;
   _setMetaForTest(pid: string, key: string, value: string): Promise<void>;
@@ -48,6 +48,7 @@ interface RoomRpc {
 
 const memory = (pid: string) => appEnv.PROJECT_MEMORY.get(appEnv.PROJECT_MEMORY.idFromName(pid)) as unknown as MemoryRpc;
 const room = (pid: string) => projectRoom<RoomRpc>(pid);
+const SYSTEM = { kind: 'system', id: null };
 
 async function newOwnedProject(email: string, key: string) {
   const user = await createUser(email, 'Owner', 'longenough1');
@@ -78,7 +79,7 @@ describe('health() surfaces real size visibility', () => {
 describe('auditable deletion sequence', () => {
   it('deleting a project clears the DO store, its R2 backups, and every registry row', async () => {
     const { projectId } = await newOwnedProject('pm-life-delete@example.com', 'PMLFDEL');
-    await memory(projectId)._seedNode(projectId, 'noriq://unknown/to-delete', 'to-delete');
+    await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/to-delete', label: 'to-delete', actor: SYSTEM });
     const exported = await memory(projectId).exportSnapshot(projectId);
     if (!exported.ok) throw new Error('export failed');
 
@@ -106,7 +107,7 @@ describe('auditable deletion sequence', () => {
 
   it('a failed erasure attempt leaves the tombstone standing; the sweep retries and clears it', async () => {
     const { projectId } = await newOwnedProject('pm-life-fail@example.com', 'PMLFFAIL');
-    await memory(projectId)._seedNode(projectId, 'noriq://unknown/x', 'x');
+    await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/x', label: 'x', actor: SYSTEM });
     await memory(projectId)._setForceEraseFailure(projectId, true);
 
     await room(projectId).deleteProject(projectId, actor);
@@ -152,7 +153,7 @@ describe('debris pruning', () => {
 
   it('prunes a retained restore generation once its rollback window has passed', async () => {
     const { projectId } = await newOwnedProject('pm-life-retained@example.com', 'PMLFRTN');
-    await memory(projectId)._seedNode(projectId, 'noriq://unknown/pre-restore', 'pre-restore');
+    await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/pre-restore', label: 'pre-restore', actor: SYSTEM });
     const exported = await memory(projectId).exportSnapshot(projectId);
     if (!exported.ok) throw new Error('export failed');
     await memory(projectId).erase(projectId);
@@ -173,7 +174,7 @@ describe('debris pruning', () => {
 
   it('prunes backup generations beyond the retention count', async () => {
     const { projectId } = await newOwnedProject('pm-life-retain@example.com', 'PMLFRTC');
-    await memory(projectId)._seedNode(projectId, 'noriq://unknown/y', 'y');
+    await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/y', label: 'y', actor: SYSTEM });
     for (let i = 0; i < 3; i++) {
       const res = await memory(projectId).exportSnapshot(projectId);
       if (!res.ok) throw new Error('export failed');
@@ -211,8 +212,8 @@ describe('debris pruning', () => {
 describe('rehearsed disaster recovery — portable snapshot path', () => {
   it('export -> erase -> restore reproduces canonical state end to end', async () => {
     const { projectId } = await newOwnedProject('pm-life-dr@example.com', 'PMLFDR');
-    await memory(projectId)._seedNode(projectId, 'noriq://unknown/dr-1', 'dr-1');
-    await memory(projectId)._seedNode(projectId, 'noriq://unknown/dr-2', 'dr-2');
+    await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/dr-1', label: 'dr-1', actor: SYSTEM });
+    await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/dr-2', label: 'dr-2', actor: SYSTEM });
 
     const exported = await memory(projectId).exportSnapshot(projectId);
     if (!exported.ok) throw new Error('export failed');

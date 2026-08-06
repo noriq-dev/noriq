@@ -71,7 +71,7 @@ describe('projectMemory() routing — authorizes before routing, never the other
     const { userId, projectId } = await newOwnedProject('pm-route-owner@example.com', 'PMROUTE1');
     const stub = await projectMemory(appEnv, userId, projectId);
     const h = await stub.health(projectId);
-    expect(h.schemaVersion).toBe(1);
+    expect(h.schemaVersion).toBe(2);
   });
 
   it('refuses a user who cannot access the project — a registry row grants nothing by itself', async () => {
@@ -88,11 +88,11 @@ describe('project deletion cascade (PLNR-246)', () => {
     await room(projectId).registerRepository(projectId, actor, 'to-be-deleted');
     await room(projectId).upsertMemoryHealth(projectId, { schemaVersion: 1, memoryRevision: 0 });
     await memory(projectId).health(projectId); // touch the DO so it has a live store to erase
-    // Seed a node directly so erase() has something to prove it removed.
+    // Write a node directly so erase() has something to prove it removed.
     const stub = appEnv.PROJECT_MEMORY.get(appEnv.PROJECT_MEMORY.idFromName(projectId)) as unknown as {
-      _seedNode(pid: string, uri: string, label: string): Promise<string>;
+      writeNode(pid: string, input: { type: string; uri: string; label: string; actor: { kind: string; id: string | null } }): Promise<{ nodeId: string }>;
     };
-    await stub._seedNode(projectId, 'noriq://unknown/pre-delete', 'pre-delete');
+    await stub.writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/pre-delete', label: 'pre-delete', actor: { kind: 'system', id: null } });
 
     await room(projectId).deleteProject(projectId, actor);
 

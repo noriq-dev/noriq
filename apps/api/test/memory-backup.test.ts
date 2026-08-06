@@ -13,17 +13,21 @@ const appEnv = env as unknown as Env;
 
 interface MemoryRpc {
   health(pid: string): Promise<{ schemaVersion: number; memoryRevision: number; tableCounts: Record<string, number> }>;
-  _mutate(pid: string, verb: string, subjectType: string, subjectId: string, summary?: Record<string, unknown>): Promise<{ operationId: string }>;
+  recordMemory(
+    pid: string,
+    input: { kind: string; statement: string; actor: { kind: string; id: string | null } },
+  ): Promise<{ memoryId: string; operationId: string; deduped: boolean }>;
   drainOutbox(pid: string): Promise<{ delivered: number; failed: number }>;
   runProjector(pid: string): Promise<{ applied: number; cursor: number }>;
   exportSnapshot(pid: string, opts?: { tier?: 'core' | 'full' }): Promise<
     { ok: true; manifest: unknown; manifestKey: string } | { ok: false; reason: string }
   >;
-  _seedNode(pid: string, uri: string, label: string): Promise<string>;
+  writeNode(pid: string, input: { type: string; uri: string; label: string; actor: { kind: string; id: string | null } }): Promise<{ nodeId: string }>;
 }
 interface RoomRpc {
   updateMemoryBackupStatus(pid: string, outcome: { ok: boolean }): Promise<{ ok: true }>;
 }
+const SYSTEM = { kind: 'system', id: null };
 
 const memory = (pid: string) => appEnv.PROJECT_MEMORY.get(appEnv.PROJECT_MEMORY.idFromName(pid)) as unknown as MemoryRpc;
 const room = (pid: string) => projectRoom<RoomRpc>(pid);
@@ -39,9 +43,9 @@ async function newOwnedProject(email: string, key: string) {
 describe('exportSnapshot — end to end via the DO RPC', () => {
   it('produces chunks + a manifest, and the manifest parses as the shared MemoryBackupManifest', async () => {
     const { projectId } = await newOwnedProject('pm-backup-e2e@example.com', 'PMBKE2E');
-    await memory(projectId)._seedNode(projectId, 'noriq://unknown/seed_a', 'seed a');
-    await memory(projectId)._seedNode(projectId, 'noriq://unknown/seed_b', 'seed b');
-    await memory(projectId)._mutate(projectId, 'memory.changed', 'memory', 'mem_1', { kind: 'learning' });
+    await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/seed_a', label: 'seed a', actor: SYSTEM });
+    await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/seed_b', label: 'seed b', actor: SYSTEM });
+    await memory(projectId).recordMemory(projectId, { kind: 'learning', statement: 'seed memory', actor: SYSTEM });
 
     const result = await memory(projectId).exportSnapshot(projectId);
     expect(result.ok).toBe(true);
@@ -67,7 +71,7 @@ describe('exportSnapshot — end to end via the DO RPC', () => {
 
   it('verifies cleanly right after export, and reports backup_status=ok in the D1 registry', async () => {
     const { projectId } = await newOwnedProject('pm-backup-verify@example.com', 'PMBKVRFY');
-    await memory(projectId)._seedNode(projectId, 'noriq://unknown/x', 'x');
+    await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/x', label: 'x', actor: SYSTEM });
     const result = await memory(projectId).exportSnapshot(projectId);
     if (!result.ok) throw new Error('unreachable');
 
@@ -83,8 +87,8 @@ describe('exportSnapshot — end to end via the DO RPC', () => {
 
   it('detects a corrupted chunk and a missing chunk from the manifest alone', async () => {
     const { projectId } = await newOwnedProject('pm-backup-tamper@example.com', 'PMBKTMPR');
-    await memory(projectId)._seedNode(projectId, 'noriq://unknown/y1', 'y1');
-    await memory(projectId)._seedNode(projectId, 'noriq://unknown/y2', 'y2');
+    await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/y1', label: 'y1', actor: SYSTEM });
+    await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/y2', label: 'y2', actor: SYSTEM });
     const result = await memory(projectId).exportSnapshot(projectId);
     if (!result.ok) throw new Error('unreachable');
     const manifest = MemoryBackupManifest.parse(result.manifest);

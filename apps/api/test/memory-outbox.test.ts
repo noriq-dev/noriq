@@ -10,12 +10,16 @@ const appEnv = env as unknown as Env;
 
 interface MemoryRpc {
   health(pid: string): Promise<{ schemaVersion: number; memoryRevision: number; tableCounts: Record<string, number> }>;
-  _mutate(pid: string, verb: string, subjectType: string, subjectId: string, summary?: Record<string, unknown>): Promise<{ operationId: string }>;
+  recordMemory(
+    pid: string,
+    input: { operationId?: string; kind: string; statement: string; actor: { kind: string; id: string | null } },
+  ): Promise<{ memoryId: string; operationId: string; deduped: boolean }>;
   drainOutbox(pid: string): Promise<{ delivered: number; failed: number }>;
   runProjector(pid: string): Promise<{ applied: number; cursor: number }>;
   reconcile(pid: string): Promise<{ delivered: number; failed: number; applied: number; cursor: number }>;
   _setForceDeliveryFailure(pid: string, fail: boolean): Promise<void>;
 }
+const SYSTEM = { kind: 'system', id: null };
 interface RoomRpc {
   receiveMemoryEvent(
     pid: string,
@@ -45,8 +49,14 @@ async function memoryEvents(pid: string): Promise<Array<EventRow & { payload: Re
 describe('outbox delivery — forward direction is idempotent', () => {
   it('replaying the same delivery N times yields exactly one appended event', async () => {
     const { projectId } = await newOwnedProject('pm-outbox-fwd@example.com', 'PMOBXF');
-    const { operationId } = await memory(projectId)._mutate(projectId, 'memory.changed', 'memory', 'mem_1', { kind: 'learning' });
-    const delivery = { operationId, verb: 'memory.changed', subjectType: 'memory', subjectId: 'mem_1', payload: { operationId, kind: 'learning' } };
+    const { memoryId, operationId } = await memory(projectId).recordMemory(projectId, { kind: 'learning', statement: 'a learning', actor: SYSTEM });
+    const delivery = {
+      operationId,
+      verb: 'memory.changed',
+      subjectType: 'memory',
+      subjectId: memoryId,
+      payload: { operationId, entityType: 'memory_item', kind: 'learning', authority: 1 },
+    };
 
     const r1 = await room(projectId).receiveMemoryEvent(projectId, delivery);
     const r2 = await room(projectId).receiveMemoryEvent(projectId, delivery);
@@ -56,18 +66,18 @@ describe('outbox delivery — forward direction is idempotent', () => {
     const events = await memoryEvents(projectId);
     expect(events).toHaveLength(1);
     expect(events[0]!.actor_kind).toBe('system');
-    expect(events[0]!.subject_id).toBe('mem_1');
+    expect(events[0]!.subject_id).toBe(memoryId);
     // Compact payload only — no memory body (statement/evidence) ever rides the event log.
     // actorName rides every event's payload (emit()'s own convention); everything else here
-    // is exactly what _mutate's summary carried, nothing more.
-    expect(events[0]!.payload).toEqual({ operationId, kind: 'learning', actorName: 'system' });
+    // is exactly what the outbox row's summary carried, nothing more.
+    expect(events[0]!.payload).toEqual({ operationId, entityType: 'memory_item', kind: 'learning', authority: 1, actorName: 'system' });
     expect(events[0]!.payload.statement).toBeUndefined();
     expect(events[0]!.payload.evidence).toBeUndefined();
   });
 
   it('drainOutbox actually delivers a pending row end to end', async () => {
     const { projectId } = await newOwnedProject('pm-outbox-drain@example.com', 'PMOBXD');
-    await memory(projectId)._mutate(projectId, 'memory.changed', 'memory', 'mem_drain', { kind: 'decision' });
+    await memory(projectId).recordMemory(projectId, { kind: 'decision', statement: 'a decision', actor: SYSTEM });
     const result = await memory(projectId).drainOutbox(projectId);
     expect(result).toEqual({ delivered: 1, failed: 0 });
     expect(await memoryEvents(projectId)).toHaveLength(1);
@@ -82,7 +92,7 @@ describe('outbox delivery — forward direction is idempotent', () => {
 describe('injected delivery failure + reconciliation', () => {
   it('a failed delivery leaves canonical state correct; reconcile closes the gap', async () => {
     const { projectId } = await newOwnedProject('pm-outbox-fail@example.com', 'PMOBXFL');
-    await memory(projectId)._mutate(projectId, 'memory.changed', 'memory', 'mem_fail', { kind: 'hazard' });
+    await memory(projectId).recordMemory(projectId, { kind: 'hazard', statement: 'a hazard', actor: SYSTEM });
 
     await memory(projectId)._setForceDeliveryFailure(projectId, true);
     const failedAttempt = await memory(projectId).drainOutbox(projectId);
@@ -133,7 +143,7 @@ describe('memory delivery never touches agent liveness', () => {
       .first<{ claim_expires_at: string }>();
     expect(before?.claim_expires_at).toBeTruthy();
 
-    await memory(projectId)._mutate(projectId, 'memory.changed', 'memory', 'mem_liveness', {});
+    await memory(projectId).recordMemory(projectId, { kind: 'learning', statement: 'liveness probe', actor: SYSTEM });
     await memory(projectId).drainOutbox(projectId);
 
     const after = await appEnv.DB.prepare('SELECT claim_expires_at FROM tasks WHERE id = ?')
