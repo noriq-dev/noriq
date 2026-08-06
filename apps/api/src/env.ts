@@ -2,6 +2,7 @@ import type { ProjectRoom } from './do/ProjectRoom';
 import type { AgentSession } from './do/AgentSession';
 import type { RateLimiter } from './do/RateLimiter';
 import type { RunnerHub } from './do/RunnerHub';
+import type { ProjectMemory } from './do/ProjectMemory';
 
 export interface Env {
   DB: D1Database;
@@ -10,6 +11,9 @@ export interface Env {
   AGENT_SESSION: DurableObjectNamespace<AgentSession>;
   RATE_LIMITER: DurableObjectNamespace<RateLimiter>;
   RUNNER_HUB: DurableObjectNamespace<RunnerHub>;
+  /** ProjectMemory (PLNR-245) — one per project (idFromName(projectId)), canonical writer/
+   *  query authority for cognitive memory. Separate from PROJECT_ROOM by design (§2, §19). */
+  PROJECT_MEMORY: DurableObjectNamespace<ProjectMemory>;
   /** Set in tests to bypass rate limiting. */
   DISABLE_RATE_LIMIT?: boolean;
   /** Poll interval (ms) for the subscriptions/listen event stream (PLNR-234).

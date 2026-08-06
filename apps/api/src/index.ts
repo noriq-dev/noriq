@@ -33,6 +33,7 @@ export { ProjectRoom } from './do/ProjectRoom';
 export { AgentSession } from './do/AgentSession';
 export { RateLimiter } from './do/RateLimiter';
 export { RunnerHub } from './do/RunnerHub';
+export { ProjectMemory } from './do/ProjectMemory';
 
 const app = new Hono<AppContext>();
 
