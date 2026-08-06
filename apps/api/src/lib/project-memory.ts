@@ -1,0 +1,61 @@
+// PLNR-246: the routing seam onto ProjectMemory (PLNR-245) — authorize, THEN route. Registry
+// rows in D1 (migration 0069) route to the right DO; they never authorize by themselves.
+// Possessing or forging a project_repositories row grants nothing — the check below always
+// runs first, at the Worker boundary, before env.PROJECT_MEMORY.get() is ever called.
+import type { Env } from '../env';
+import type { ProjectMemoryHealth } from '../do/ProjectMemory';
+import { userCanAccessProject } from './visibility';
+
+/** The subset of ProjectMemory's RPC surface this phase needs. Later phases (PLNR-251+) widen
+ *  this as the DO grows real write APIs — the stub itself is untyped RPC, this is just the
+ *  slice callers here are allowed to see. */
+export interface ProjectMemoryStub {
+  health(projectId: string): Promise<ProjectMemoryHealth>;
+  erase(projectId: string): Promise<{ ok: true }>;
+}
+
+/**
+ * Resolve a ProjectMemory stub for `projectId`, but only after confirming `userId` can reach
+ * that project. Throws (not-found, matching the rest of the codebase's leak-free style — see
+ * mcp.ts's `userCanAccessProject` call sites) rather than distinguishing "no access" from
+ * "doesn't exist".
+ */
+export async function projectMemory(env: Env, userId: string, projectId: string): Promise<ProjectMemoryStub> {
+  if (!(await userCanAccessProject(env, userId, projectId))) {
+    throw new Error(`project ${projectId} not found`);
+  }
+  return env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)) as unknown as ProjectMemoryStub;
+}
+
+export interface ProjectRepositoryRow {
+  id: string;
+  projectId: string;
+  repositoryKey: string;
+  indexingEnabled: boolean;
+  ingestStatus: 'none' | 'staged' | 'active' | 'failed';
+  createdAt: string;
+}
+
+/** Straight D1 read (CLAUDE.md: reads go straight to D1; only writes cross into a DO) — no
+ *  access check here, same as every other read helper in lib/. Callers guard access themselves
+ *  (REST/MCP edges already do this for every other project-scoped read). */
+export async function listProjectRepositories(env: Env, projectId: string): Promise<ProjectRepositoryRow[]> {
+  const { results } = await env.DB.prepare(
+    'SELECT id, project_id, repository_key, indexing_enabled, ingest_status, created_at FROM project_repositories WHERE project_id = ? ORDER BY created_at',
+  ).bind(projectId).all<{
+    id: string;
+    project_id: string;
+    repository_key: string;
+    indexing_enabled: number;
+    ingest_status: string;
+    created_at: string;
+  }>();
+  return results.map((r) => ({
+    id: r.id,
+    projectId: r.project_id,
+    repositoryKey: r.repository_key,
+    indexingEnabled: !!r.indexing_enabled,
+    ingestStatus: r.ingest_status as ProjectRepositoryRow['ingestStatus'],
+    createdAt: r.created_at,
+  }));
+}

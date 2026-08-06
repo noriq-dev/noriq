@@ -317,6 +317,29 @@ export class ProjectMemory extends DurableObject<Env> {
   }
 
   /**
+   * Best-effort wipe of every row (PLNR-246), called fire-and-forget from
+   * ProjectRoom.deleteProject once the D1 registry rows are already gone. Full
+   * retention/quota/disaster-recovery policy is PLNR-250's — this is the
+   * scheduling hook it hangs off of, not that policy itself. Deletes
+   * children before parents (the reverse of SCHEMA_TABLES' creation order)
+   * so it stays FK-safe even on a connection where `PRAGMA foreign_keys = ON`
+   * is in effect. Schema and migration state are left intact — this empties
+   * the store, it does not destroy it.
+   */
+  async erase(projectId: string): Promise<{ ok: true }> {
+    await this.assertProjectId(projectId);
+    this.ctx.storage.transactionSync(() => {
+      for (const table of [...SCHEMA_TABLES].reverse()) {
+        this.ctx.storage.sql.exec(`DELETE FROM ${table}`);
+      }
+      this.ctx.storage.sql.exec(`DELETE FROM applied_operations`);
+      this.ctx.storage.sql.exec(`UPDATE memory_revision SET value = 0 WHERE id = 0`);
+      this.ctx.storage.sql.exec(`UPDATE projector_cursor SET global_seq = 0 WHERE id = 0`);
+    });
+    return { ok: true };
+  }
+
+  /**
    * Test/seed-only helper: insert a bare-minimum graph node under this
    * project's store. Exists so PLNR-245's migrator-repeatability test can
    * prove seeded data survives across a re-migration without reaching into

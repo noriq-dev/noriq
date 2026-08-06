@@ -2792,6 +2792,56 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
+  // ---------------------------------------------------------------------------
+  // Project Memory registry (PLNR-246) — compact D1 routing/health rows only.
+  // The complete memory graph lives in the ProjectMemory DO (PLNR-245); these
+  // mutations go through the room like every other project mutation, keeping
+  // it the sole D1 writer per project. Registry rows ROUTE — they never
+  // authorize; that check happens at the Worker boundary before a caller ever
+  // reaches these methods (see lib/project-memory.ts).
+  // ---------------------------------------------------------------------------
+
+  /** Register a canonical, project-local repository key. Unique per project — the same key
+   *  may be registered again in a DIFFERENT project (a fork, a different server instance). */
+  async registerRepository(projectId: string, actor: Actor, repositoryKey: string): Promise<{ id: string }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const dup = await this.env.DB.prepare(
+        'SELECT id FROM project_repositories WHERE project_id = ? AND repository_key = ?',
+      ).bind(projectId, repositoryKey).first<{ id: string }>();
+      if (dup) throw new Error(`repository key "${repositoryKey}" is already registered in this project`);
+      const id = newId('repo');
+      await this.env.DB.prepare(
+        'INSERT INTO project_repositories (id, project_id, repository_key, indexing_enabled, ingest_status, created_at) VALUES (?, ?, ?, 0, ?, ?)',
+      ).bind(id, projectId, repositoryKey, 'none', nowIso()).run();
+      await this.emit(actor, 'project.updated', 'project', projectId, { repositoryRegistered: repositoryKey });
+      return { id };
+    });
+  }
+
+  /** Upsert this project's memory-health projection (PLNR-246). A thin write path — the full
+   *  health-refresh lifecycle (who calls this, how often) belongs to a later phase; this exists
+   *  so the registry mechanics are provable now. */
+  async upsertMemoryHealth(
+    projectId: string,
+    health: { schemaVersion: number; memoryRevision: number },
+  ): Promise<{ ok: true }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const now = nowIso();
+      await this.env.DB.prepare(
+        `INSERT INTO project_memory_registry (project_id, schema_version, memory_revision, last_health_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT (project_id) DO UPDATE SET
+           schema_version = excluded.schema_version,
+           memory_revision = excluded.memory_revision,
+           last_health_at = excluded.last_health_at,
+           updated_at = excluded.updated_at`,
+      ).bind(projectId, health.schemaVersion, health.memoryRevision, now, now, now).run();
+      return { ok: true };
+    });
+  }
+
   /** Delete an entire project and every row under it. Irreversible. */
   async deleteProject(projectId: string, actor: Actor)  {
     return this.ctx.blockConcurrencyWhile(async () => {
@@ -2865,12 +2915,25 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM tags WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM milestones WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM boards WHERE project_id = ?').bind(pid),
+        // Project Memory registry (PLNR-246): compact rows only, before the projects row they
+        // FK-reference. The canonical memory graph itself is erased separately, below — it
+        // lives in the ProjectMemory DO, not D1, so it cannot ride this batch.
+        this.env.DB.prepare('DELETE FROM project_repositories WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare('DELETE FROM project_memory_registry WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM projects WHERE id = ?').bind(pid),
       ]);
       // Batch committed — now the attachment rows are gone, so it is safe to drop their blobs.
       if (this.env.FILES) for (const key of r2Keys) await this.env.FILES.delete(key).catch(() => {});
       // The deleted project's key stands in for a blocker id nothing can resolve anymore.
       this.notifyExternalDependents(externalDependents, { id: '', key: proj.key });
+      // Canonical memory erasure (PLNR-246): best-effort, fire-and-forget — the same shape as
+      // notifyExternalDependents. The D1 batch above already committed the registry deletion,
+      // so a lost signal here costs only an orphaned (and now unreachable — no registry row
+      // points at it) ProjectMemory store, never an inconsistent D1. Full retention/quota
+      // policy is PLNR-250's; this is the scheduling hook it hangs off of.
+      void this.env.PROJECT_MEMORY.get(this.env.PROJECT_MEMORY.idFromName(pid))
+        .erase(pid)
+        .catch((err) => console.warn(`ProjectMemory erase for ${pid} failed: ${String(err)}`));
       await this.ctx.storage.deleteAlarm().catch(() => {});
       this.dropSearch('task', ...vecTasks.results.map((r) => r.id));
       this.dropSearch('doc', ...vecDocs.results.map((r) => r.id));
