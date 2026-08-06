@@ -23,10 +23,13 @@ async function restGet(cookie: string, path: string) {
 }
 
 describe('record_memory — registration and guidance', () => {
-  it('registers exactly one new memory tool, and its description carries the per-op/per-field guidance', async () => {
+  it('registers exactly one new memory-WRITE tool, and its description carries the per-op/per-field guidance', async () => {
     const { token } = await newOwnedProject('pm-mcp-list@example.com', 'PMMCPLST');
     const tools = await mcpList(token);
-    const memoryTools = tools.filter((t) => t.name.includes('memory') || t.name === 'record_memory');
+    // search_project_memory (PLNR-257) is the read half, registered alongside record_memory —
+    // this test is about record_memory's OWN registration/description, so it excludes it here
+    // rather than widening the equality to two names every future memory tool would then break.
+    const memoryTools = tools.filter((t) => (t.name.includes('memory') || t.name === 'record_memory') && t.name !== 'search_project_memory');
     expect(memoryTools.map((t) => t.name)).toEqual(['record_memory']);
 
     const desc = memoryTools[0]!.description;

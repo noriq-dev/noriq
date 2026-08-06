@@ -1102,6 +1102,19 @@ app.get('/api/projects/:pid/memory/contradictions/:setId', userAuth, async (c) =
   return c.json(await memoryStub(c.env, pid).getContradictionSet(pid, c.req.param('setId')!));
 });
 
+// Hybrid memory retrieval (PLNR-257) — the human-facing twin of the search_project_memory MCP
+// tool; same DO RPC, same result shape. POST (not GET) because the filter set is a body, not a
+// couple of query params, matching /api/projects/:pid/ask's shape.
+app.post('/api/projects/:pid/memory/search', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const body = await c.req.json<{
+    query?: string; memoryItemId?: string; episodeId?: string; taskId?: string; seedEntityUri?: string;
+    edgeTypes?: string[]; maxDepth?: number; repositoryKey?: string; branch?: string; kind?: string;
+    minAuthority?: number; validity?: string; limit?: number;
+  }>().catch(() => ({}) as Record<string, never>);
+  return c.json(await memoryStub(c.env, pid).searchProjectMemory(pid, body));
+});
+
 // Proposed-decision approval (PLNR-253) — HUMAN-only, never an MCP tool (§12/§13: an agent must
 // never be the one that approves its own or another agent's claim). Mirrors the spin-off
 // accept/reject route shape (/api/projects/:pid/tasks/:tid/spinoff/accept|reject).

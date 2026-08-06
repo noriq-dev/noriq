@@ -37,9 +37,26 @@ interface MemoryRpc {
     pid: string,
     input: { type: string; fromNodeId: string; toNodeId: string; actor: { kind: string; id: string | null } },
   ): Promise<{ edgeId: string }>;
-  _traverseFrom(pid: string, from: string, type: string): Promise<string[]>;
-  _evidencePathsFor(pid: string, memoryItemId: string): Promise<string[]>;
+  getMemoryItem(pid: string, memoryId: string): Promise<{ evidence: Array<{ path: string }> } | null>;
+  traverseGraph(
+    pid: string,
+    input: { seedNodeIds: string[]; edgeTypes?: string[]; maxDepth?: number; maxResults?: number },
+  ): Promise<Array<{ nodeId: string; uri: string; type: string; label: string; depth: number; edgePath: string }>>;
   _tableDdl(pid: string, table: string): Promise<string>;
+}
+
+/** The real read API `_traverseFrom` was a narrow test-only stand-in for (PLNR-257) — one-hop
+ *  traversal via edges of a given type, extracted to the shape these tests were already
+ *  written against (a plain array of reached node ids). */
+async function traverseOneHop(pid: string, fromNodeId: string, edgeType: string): Promise<string[]> {
+  const hits = await memory(pid).traverseGraph(pid, { seedNodeIds: [fromNodeId], edgeTypes: [edgeType], maxDepth: 1 });
+  return hits.map((h) => h.nodeId);
+}
+
+/** Likewise for `_evidencePathsFor` — the real read API is getMemoryItem's `.evidence`. */
+async function evidencePathsFor(pid: string, memoryItemId: string): Promise<string[]> {
+  const item = await memory(pid).getMemoryItem(pid, memoryItemId);
+  return (item?.evidence ?? []).map((e) => e.path).sort();
 }
 const SYSTEM = { kind: 'system', id: null };
 
@@ -116,8 +133,8 @@ describe('restoreSnapshot — round trip reproduces canonical state', () => {
     await memory(projectId).runProjector(projectId);
 
     const beforeHealth = await memory(projectId).health(projectId);
-    const beforeTraversal = await memory(projectId)._traverseFrom(projectId, nodeA, 'related_to');
-    const beforeEvidence = await memory(projectId)._evidencePathsFor(projectId, memItem);
+    const beforeTraversal = await traverseOneHop(projectId, nodeA, 'related_to');
+    const beforeEvidence = await evidencePathsFor(projectId, memItem);
 
     const exported = await memory(projectId).exportSnapshot(projectId);
     if (!exported.ok) throw new Error(`export failed: ${exported.reason}`);
@@ -131,8 +148,8 @@ describe('restoreSnapshot — round trip reproduces canonical state', () => {
     expect(afterHealth.memoryRevision).toBe(beforeHealth.memoryRevision);
     expect(afterHealth.tableCounts).toEqual(beforeHealth.tableCounts);
 
-    expect(await memory(projectId)._traverseFrom(projectId, nodeA, 'related_to')).toEqual(beforeTraversal);
-    expect(await memory(projectId)._evidencePathsFor(projectId, memItem)).toEqual(beforeEvidence);
+    expect(await traverseOneHop(projectId, nodeA, 'related_to')).toEqual(beforeTraversal);
+    expect(await evidencePathsFor(projectId, memItem)).toEqual(beforeEvidence);
 
     // Ledger idempotency: nothing left to deliver or project — the restored ledgers already
     // reflect the pre-export catch-up state.
@@ -213,7 +230,7 @@ describe('restoreSnapshot — round trip reproduces canonical state', () => {
     expect(h.tableCounts.nodes).toBe(2);
     expect(h.tableCounts.edges).toBe(1);
     expect(h.tableCounts.evidence).toBe(0);
-    expect(await memory(projectId)._traverseFrom(projectId, a, 'related_to')).toEqual([b]);
+    expect(await traverseOneHop(projectId, a, 'related_to')).toEqual([b]);
   });
 
   // Regression: the original mechanism activated by RENAMING tables. SQLite stores a renamed
@@ -249,7 +266,7 @@ describe('restoreSnapshot — round trip reproduces canonical state', () => {
     expect(h.tableCounts.nodes).toBe(2);
     expect(h.tableCounts.edges).toBe(1);
     expect(h.tableCounts.evidence).toBe(1);
-    expect(await memory(projectId)._traverseFrom(projectId, a, 'related_to')).toEqual([b]);
+    expect(await traverseOneHop(projectId, a, 'related_to')).toEqual([b]);
 
     // …and the live schema is still the ORIGINAL schema: `edges` references `nodes`, never a
     // `prev_`/`staging_` table, and its name is not a renamed artifact.

@@ -10,6 +10,10 @@ import { MEMORY_MIGRATIONS } from '../memory/migrations';
 import { validateMemoryScope, validateEvidenceRef, memoryContentHash, evidenceHash, clampAuthority, type MemoryScope } from '../memory/writes';
 import { searchBackend, indexEntity, removeEntity } from '../search';
 import { codeSearchBackend, indexCodeEntity, removeCodeEntity, type CodeEntity } from '../memory/code-index';
+import {
+  applyMemoryFilters, rankCandidates, RETRIEVAL_DEFAULTS,
+  type RetrievalHit, type RetrievalStage, type RankedHit,
+} from '../memory/retrieval';
 
 /**
  * ProjectMemory — one instance per project (idFromName(projectId)), canonical
@@ -1417,6 +1421,303 @@ export class ProjectMemory extends DurableObject<Env> {
   }
 
   // ---------------------------------------------------------------------------
+  // Hybrid retrieval (PLNR-257) — exact lookup, lexical scan, semantic candidates, and bounded
+  // graph expansion, combined and reranked by memory/retrieval.ts (which never opens storage;
+  // this class supplies the rows). Read-only: no memory_revision bump, no outbox row, no
+  // applied_operations entry — a query is not a canonical mutation (§4).
+  // ---------------------------------------------------------------------------
+
+  private evidenceVerificationStates(memoryItemId: string): string[] {
+    return this.ctx.storage.sql
+      .exec<{ verification_state: string }>(`SELECT verification_state FROM evidence WHERE memory_item_id = ?1 ORDER BY created_at`, memoryItemId)
+      .toArray()
+      .map((r) => r.verification_state);
+  }
+
+  private memoryRowToHit(
+    row: { id: string; kind: string; statement: string; authority: number; validity: string; repository_key: string | null; branch: string | null },
+    stage: RetrievalStage,
+    score: number,
+  ): RetrievalHit {
+    return {
+      entityType: 'memory',
+      id: row.id,
+      kind: row.kind,
+      title: row.kind,
+      snippet: row.statement.slice(0, 200),
+      stage,
+      score,
+      repositoryKey: row.repository_key,
+      branch: row.branch,
+      authority: row.authority,
+      validity: row.validity,
+      evidenceVerification: this.evidenceVerificationStates(row.id),
+    };
+  }
+
+  private episodeRowToHit(
+    row: { id: string; run_id: string; repository_key: string | null; landing_outcome: string; body: string },
+    stage: RetrievalStage,
+    score: number,
+  ): RetrievalHit {
+    return {
+      entityType: 'episode',
+      id: row.id,
+      title: `episode ${row.run_id} (${row.landing_outcome})`,
+      snippet: summarizeEpisodeBody(row.body).slice(0, 200),
+      stage,
+      score,
+      repositoryKey: row.repository_key,
+      status: row.landing_outcome,
+    };
+  }
+
+  /** Exact-id lookup for a single memory item — the 'exact' stage. */
+  private lookupMemoryHit(memoryItemId: string): RetrievalHit | null {
+    const row = this.ctx.storage.sql
+      .exec<{ id: string; kind: string; statement: string; authority: number; validity: string; repository_key: string | null; branch: string | null }>(
+        `SELECT id, kind, statement, authority, validity, repository_key, branch FROM memory_items WHERE id = ?1`,
+        memoryItemId,
+      )
+      .toArray()[0];
+    return row ? this.memoryRowToHit(row, 'exact', 1) : null;
+  }
+
+  /** Exact-id lookup for a single episode — the 'exact' stage. */
+  private lookupEpisodeHit(episodeId: string): RetrievalHit | null {
+    const row = this.ctx.storage.sql
+      .exec<{ id: string; run_id: string; repository_key: string | null; landing_outcome: string; body: string }>(
+        `SELECT id, run_id, repository_key, landing_outcome, body FROM episodes WHERE id = ?1`,
+        episodeId,
+      )
+      .toArray()[0];
+    return row ? this.episodeRowToHit(row, 'exact', 1) : null;
+  }
+
+  /** Term-wise LIKE scan over memory_items AND episodes, same AND-every-term contract as
+   *  search.ts's keyword fallback — the 'lexical' stage, always available (§20). */
+  private lexicalRetrievalRows(q: string, opts: { kind?: string; limit: number }): RetrievalHit[] {
+    const terms = q.replace(/[%_]/g, ' ').trim().split(/\s+/).filter(Boolean).slice(0, 8);
+    if (!terms.length) return [];
+    const likes = terms.map((t) => `%${t}%`);
+    const hits: RetrievalHit[] = [];
+
+    const memWhere = likes.map(() => `statement LIKE ?`).join(' AND ');
+    const memBinds: unknown[] = [...likes];
+    let memKindFilter = '';
+    if (opts.kind) {
+      memKindFilter = `AND kind = ?${memBinds.length + 1}`;
+      memBinds.push(opts.kind);
+    }
+    const memRows = this.ctx.storage.sql
+      .exec<{ id: string; kind: string; statement: string; authority: number; validity: string; repository_key: string | null; branch: string | null }>(
+        `SELECT id, kind, statement, authority, validity, repository_key, branch FROM memory_items WHERE ${memWhere} ${memKindFilter} ORDER BY recorded_at DESC LIMIT ${opts.limit}`,
+        ...memBinds,
+      )
+      .toArray();
+    for (const r of memRows) hits.push(this.memoryRowToHit(r, 'lexical', 1));
+
+    const epWhere = likes.map(() => `body LIKE ?`).join(' AND ');
+    const epRows = this.ctx.storage.sql
+      .exec<{ id: string; run_id: string; repository_key: string | null; landing_outcome: string; body: string }>(
+        `SELECT id, run_id, repository_key, landing_outcome, body FROM episodes WHERE ${epWhere} ORDER BY created_at DESC LIMIT ${opts.limit}`,
+        ...likes,
+      )
+      .toArray();
+    for (const r of epRows) hits.push(this.episodeRowToHit(r, 'lexical', 1));
+
+    return hits;
+  }
+
+  /** Semantic candidates over the operational index (PLNR-255's vectors), hydrated from the
+   *  CANONICAL row here rather than trusted from vector metadata — the 'semantic' stage. Null
+   *  when no embeddings backend is bound (§20 — caller falls back to exact+lexical+graph). */
+  private async semanticRetrievalRows(projectId: string, q: string, limit: number): Promise<RetrievalHit[]> {
+    const backend = searchBackend(this.env);
+    if (!backend) return [];
+    const [vector] = await backend.embedder.embed([q]);
+    if (!vector) return [];
+    const { matches } = await backend.store.query(vector, { topK: Math.min(limit * 5, 100), filter: { projectId: { $eq: projectId } } });
+    const hits: RetrievalHit[] = [];
+    for (const m of matches) {
+      const kind = String(m.id).split(':')[0];
+      // Belt-and-suspenders project check, matching search.ts's own isolation contract — the
+      // server-side filter above already scopes the query, this guards a filter that silently
+      // failed to apply.
+      if (String(m.metadata?.projectId ?? '') !== projectId) continue;
+      if (kind === 'memory') {
+        const entityId = (m.metadata?.entityId as string) ?? String(m.id).slice('memory:'.length);
+        const hit = this.lookupMemoryHit(entityId);
+        if (hit) hits.push({ ...hit, stage: 'semantic', score: m.score });
+      } else if (kind === 'episode') {
+        const entityId = (m.metadata?.entityId as string) ?? String(m.id).slice('episode:'.length);
+        const hit = this.lookupEpisodeHit(entityId);
+        if (hit) hits.push({ ...hit, stage: 'semantic', score: m.score });
+      }
+    }
+    return hits;
+  }
+
+  /** Bounded recursive-CTE traversal from a seed node set (this is the FIRST use of
+   *  WITH RECURSIVE against Durable Object SQLite in this repo, rather than D1 — verified to
+   *  execute here by memory-retrieval.test.ts). Depth is capped structurally
+   *  (`WHERE depth < maxDepth` bounds the recursion itself, not just the output) and the
+   *  final row count is capped by `maxResults` — both from named constants, never a literal at
+   *  the call site. Deduped in JS by nodeId, keeping the SHALLOWEST occurrence (`ORDER BY depth
+   *  ASC` guarantees the first-seen row per id is the shortest path). */
+  private rawTraverseGraph(
+    seedNodeIds: string[],
+    opts: { edgeTypes?: string[]; maxDepth?: number; maxResults?: number },
+  ): Array<{ nodeId: string; uri: string; type: string; label: string; depth: number; edgePath: string }> {
+    if (!seedNodeIds.length) return [];
+    const maxDepth = Math.min(Math.max(opts.maxDepth ?? RETRIEVAL_DEFAULTS.maxDepth, 1), RETRIEVAL_DEFAULTS.maxDepthCeiling);
+    const maxResults = Math.min(Math.max(opts.maxResults ?? RETRIEVAL_DEFAULTS.maxGraphResults, 1), RETRIEVAL_DEFAULTS.maxGraphResultsCeiling);
+
+    const binds: unknown[] = [...seedNodeIds];
+    const seedPlaceholders = seedNodeIds.map((_, i) => `?${i + 1}`).join(',');
+    let edgeFilterSql = '';
+    if (opts.edgeTypes?.length) {
+      const start = binds.length + 1;
+      edgeFilterSql = `AND e.type IN (${opts.edgeTypes.map((_, i) => `?${start + i}`).join(',')})`;
+      binds.push(...opts.edgeTypes);
+    }
+    const depthPh = binds.length + 1;
+    binds.push(maxDepth);
+    const limitPh = binds.length + 1;
+    binds.push(maxResults);
+
+    const rows = this.ctx.storage.sql
+      .exec<{ nodeId: string; uri: string; type: string; label: string; depth: number; edgePath: string }>(
+        `WITH RECURSIVE reach(node_id, depth, path) AS (
+           SELECT id, 0, '' FROM nodes WHERE id IN (${seedPlaceholders})
+           UNION
+           SELECT e.to_node_id, r.depth + 1,
+                  CASE WHEN r.path = '' THEN (e.from_node_id || '>' || e.type || '>' || e.to_node_id)
+                       ELSE (r.path || ';' || e.from_node_id || '>' || e.type || '>' || e.to_node_id) END
+           FROM reach r JOIN edges e ON e.from_node_id = r.node_id
+           WHERE r.depth < ?${depthPh} ${edgeFilterSql}
+         )
+         SELECT n.id AS nodeId, n.uri AS uri, n.type AS type, n.label AS label, reach.depth AS depth, reach.path AS edgePath
+         FROM reach JOIN nodes n ON n.id = reach.node_id
+         WHERE reach.depth > 0
+         ORDER BY reach.depth ASC
+         LIMIT ?${limitPh}`,
+        ...binds,
+      )
+      .toArray();
+
+    const seen = new Set<string>();
+    const deduped: typeof rows = [];
+    for (const r of rows) {
+      if (seen.has(r.nodeId)) continue;
+      seen.add(r.nodeId);
+      deduped.push(r);
+    }
+    return deduped;
+  }
+
+  /** The general graph-traversal read API (replaces the old `_traverseFrom` test shim — this
+   *  IS the general query surface it was deliberately narrow to avoid preempting). Bounded
+   *  multi-hop expansion from one or more seed nodes, each hit carrying the edge path back to
+   *  its seed. */
+  async traverseGraph(
+    projectId: string,
+    input: { seedNodeIds: string[]; edgeTypes?: string[]; maxDepth?: number; maxResults?: number },
+  ): Promise<Array<{ nodeId: string; uri: string; type: string; label: string; depth: number; edgePath: string }>> {
+    await this.assertProjectId(projectId);
+    return this.rawTraverseGraph(input.seedNodeIds, input);
+  }
+
+  /**
+   * The hybrid retrieval entry point (§10): exact lookup + lexical scan + semantic candidates
+   * + bounded graph expansion, filtered (repository/branch/kind/authority/validity), reranked,
+   * and lead-labelled by memory/retrieval.ts. `taskId`/`seedEntityUri` seed graph expansion —
+   * "what does the project know connected to this task/entity" — rather than acting as a
+   * post-hoc filter. Cross-project leakage is guarded at the semantic stage (the shared
+   * multi-project vector index is the one real leak surface — see the stage's own project
+   * check) and is structurally impossible at the lexical/exact/graph stages (this DO instance
+   * IS one project). Read-only throughout.
+   */
+  async searchProjectMemory(
+    projectId: string,
+    opts: {
+      query?: string;
+      memoryItemId?: string;
+      episodeId?: string;
+      taskId?: string;
+      seedEntityUri?: string;
+      edgeTypes?: string[];
+      maxDepth?: number;
+      repositoryKey?: string;
+      branch?: string;
+      kind?: string;
+      minAuthority?: number;
+      validity?: string;
+      limit?: number;
+    },
+  ): Promise<{ mode: 'semantic' | 'keyword'; results: RankedHit[] }> {
+    await this.assertProjectId(projectId);
+    const limit = Math.min(Math.max(opts.limit ?? RETRIEVAL_DEFAULTS.maxResults, 1), RETRIEVAL_DEFAULTS.maxResultsCeiling);
+    const candidates: RetrievalHit[] = [];
+    let mode: 'semantic' | 'keyword' = 'keyword';
+
+    if (opts.memoryItemId) {
+      const hit = this.lookupMemoryHit(opts.memoryItemId);
+      if (hit) candidates.push(hit);
+    }
+    if (opts.episodeId) {
+      const hit = this.lookupEpisodeHit(opts.episodeId);
+      if (hit) candidates.push(hit);
+    }
+
+    if (opts.query?.trim()) {
+      candidates.push(...this.lexicalRetrievalRows(opts.query, { kind: opts.kind, limit }));
+      const semanticHits = await this.semanticRetrievalRows(projectId, opts.query, limit);
+      if (semanticHits.length || searchBackend(this.env)) mode = 'semantic';
+      candidates.push(...semanticHits);
+    }
+
+    const seedNodeIds: string[] = [];
+    const resolveSeed = (uri: string) => this.ctx.storage.sql.exec<{ id: string }>(`SELECT id FROM nodes WHERE uri = ?1`, uri).toArray()[0]?.id;
+    if (opts.taskId) {
+      const id = resolveSeed(buildEntityUri({ kind: 'task', id: opts.taskId }));
+      if (id) seedNodeIds.push(id);
+    }
+    if (opts.seedEntityUri) {
+      const id = resolveSeed(opts.seedEntityUri);
+      if (id) seedNodeIds.push(id);
+    }
+    if (seedNodeIds.length) {
+      const graphRows = this.rawTraverseGraph(seedNodeIds, { edgeTypes: opts.edgeTypes, maxDepth: opts.maxDepth, maxResults: RETRIEVAL_DEFAULTS.maxGraphResults });
+      for (const g of graphRows) {
+        candidates.push({
+          entityType: 'node',
+          id: g.nodeId,
+          uri: g.uri,
+          kind: g.type,
+          title: g.label,
+          snippet: g.label,
+          stage: 'graph',
+          score: 1 / (1 + g.depth),
+          seedNodeId: seedNodeIds[0],
+          edgePath: g.edgePath,
+          depth: g.depth,
+        });
+      }
+    }
+
+    const filtered = applyMemoryFilters(candidates, {
+      repositoryKey: opts.repositoryKey,
+      branch: opts.branch,
+      kind: opts.kind,
+      minAuthority: opts.minAuthority,
+      validity: opts.validity,
+    });
+    const results = rankCandidates(filtered, { limit, preferBranch: opts.branch });
+    return { mode, results };
+  }
+
+  // ---------------------------------------------------------------------------
   // Proposed-decision approval and authority promotion (PLNR-253)
   //
   // Neither path ever mutates an existing memory_items row's authority in place — that column,
@@ -1824,26 +2125,6 @@ export class ProjectMemory extends DurableObject<Env> {
   async _countNodes(projectId: string): Promise<number> {
     await this.assertProjectId(projectId);
     return this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM nodes`).toArray()[0]?.n ?? 0;
-  }
-
-  /** Test-only: one-hop graph traversal from a node, via edges of the given type. Exists so
-   *  PLNR-249's restore round-trip can prove a restored graph still answers the SAME traversal
-   *  as the pre-restore one, without exposing a general query surface. */
-  async _traverseFrom(projectId: string, fromNodeId: string, type: string): Promise<string[]> {
-    await this.assertProjectId(projectId);
-    return this.ctx.storage.sql
-      .exec<{ to_node_id: string }>(`SELECT to_node_id FROM edges WHERE from_node_id = ?1 AND type = ?2 ORDER BY to_node_id`, fromNodeId, type)
-      .toArray()
-      .map((r) => r.to_node_id);
-  }
-
-  /** Test-only: evidence paths cited by one memory item, for the same reason as _traverseFrom. */
-  async _evidencePathsFor(projectId: string, memoryItemId: string): Promise<string[]> {
-    await this.assertProjectId(projectId);
-    return this.ctx.storage.sql
-      .exec<{ path: string }>(`SELECT path FROM evidence WHERE memory_item_id = ?1 ORDER BY path`, memoryItemId)
-      .toArray()
-      .map((r) => r.path);
   }
 
   /** Test-only: a table's stored CREATE TABLE text. Exists so a restore test can assert the

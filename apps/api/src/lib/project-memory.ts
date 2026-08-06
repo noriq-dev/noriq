@@ -4,6 +4,7 @@
 // runs first, at the Worker boundary, before env.PROJECT_MEMORY.get() is ever called.
 import type { Env } from '../env';
 import type { ProjectMemoryHealth } from '../do/ProjectMemory';
+import type { RankedHit } from '../memory/retrieval';
 import { userCanAccessProject } from './visibility';
 
 /** An evidence citation as the write RPCs accept it — validated server-side (writes.ts) against
@@ -80,6 +81,33 @@ export interface ProjectMemoryStub {
     projectId: string,
     input: { repositoryKey: string; branch: string; mergedBaseId: string },
   ): Promise<{ promoted: string[]; skipped: number }>;
+  /** PLNR-257: bounded multi-hop graph traversal from one or more seed nodes, each hit carrying
+   *  the edge path back to its seed — the general read API `_traverseFrom` was a narrow
+   *  test-only stand-in for. */
+  traverseGraph(
+    projectId: string,
+    input: { seedNodeIds: string[]; edgeTypes?: string[]; maxDepth?: number; maxResults?: number },
+  ): Promise<Array<{ nodeId: string; uri: string; type: string; label: string; depth: number; edgePath: string }>>;
+  /** PLNR-257: the hybrid retrieval entry point — exact + lexical + semantic + bounded graph
+   *  expansion, filtered/reranked/lead-labelled. Read-only. */
+  searchProjectMemory(
+    projectId: string,
+    opts: {
+      query?: string;
+      memoryItemId?: string;
+      episodeId?: string;
+      taskId?: string;
+      seedEntityUri?: string;
+      edgeTypes?: string[];
+      maxDepth?: number;
+      repositoryKey?: string;
+      branch?: string;
+      kind?: string;
+      minAuthority?: number;
+      validity?: string;
+      limit?: number;
+    },
+  ): Promise<{ mode: 'semantic' | 'keyword'; results: RankedHit[] }>;
   /** PLNR-255: re-embed this project's memories/episodes into the operational search index and
    *  clear `project_memory_registry.vector_dirty` on success (Phase 4's fill-in of the Phase
    *  2/3 no-op hook). No-ops honestly when no embeddings backend is bound. */
