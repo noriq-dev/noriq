@@ -285,6 +285,16 @@ app.post('/api/admin/backup', adminAuth, async (c) => {
   return c.json(res, res.ok ? 200 : 503);
 });
 
+// On-demand ProjectMemory portable snapshot (PLNR-248) — the per-project analogue of
+// /api/admin/backup, above. Admin-only; same graceful-degradation shape when R2 isn't bound.
+// See BACKUP.md for the R2 layout and what a manifest carries.
+app.post('/api/admin/projects/:projectId/memory-backup', adminAuth, async (c) => {
+  const projectId = c.req.param('projectId')!;
+  const tier = c.req.query('tier') === 'full' ? 'full' : 'core';
+  const res = await c.env.PROJECT_MEMORY.get(c.env.PROJECT_MEMORY.idFromName(projectId)).exportSnapshot(projectId, { tier });
+  return c.json(res, res.ok ? 200 : 503);
+});
+
 // Restore a snapshot (PLNR-218) — the inverse of /export. DESTRUCTIVE: REPLACES all data
 // (it is not a merge), so ?confirm=replace guards the wipe. Admin-only; exempt from the
 // write-freeze so "freeze → import → unfreeze" is a clean cutover. Restore steps in BACKUP.md.
@@ -2650,6 +2660,28 @@ export default {
           // eslint-disable-next-line no-console
           console.log(r.ok ? `[backup] wrote ${r.key}` : `[backup] skipped: ${r.reason}`);
         }),
+      );
+      // ProjectMemory portable snapshots (PLNR-248): one per project that has ever touched its
+      // memory store (a project_memory_registry row exists — PLNR-246). A project that hasn't
+      // has nothing in ProjectMemory yet worth a backup. Each project's export is independent —
+      // one failure never blocks another's.
+      ctx.waitUntil(
+        env.DB.prepare('SELECT project_id FROM project_memory_registry')
+          .all<{ project_id: string }>()
+          .then(({ results }) =>
+            Promise.all(
+              results.map((r) =>
+                env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(r.project_id))
+                  .exportSnapshot(r.project_id)
+                  .then((res) => {
+                    // eslint-disable-next-line no-console
+                    console.log(res.ok ? `[memory-backup] ${r.project_id} wrote ${res.manifestKey}` : `[memory-backup] ${r.project_id} skipped: ${res.reason}`);
+                  })
+                  .catch((err) => console.warn(`[memory-backup] ${r.project_id} failed: ${String(err)}`)),
+              ),
+            ),
+          )
+          .catch((err) => console.warn(`[memory-backup] sweep failed: ${String(err)}`)),
       );
     }
     // Backstop auto-archive for projects nobody has viewed (the snapshot sweeps viewed ones).

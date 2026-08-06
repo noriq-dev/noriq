@@ -394,6 +394,12 @@ export const MemoryBackupManifest = z.object({
   projectId: z.string(),
   memoryRevision: z.number().int().nonnegative(),
   exportedAt: z.string().datetime(),
+  // core = authored/historical memory, evidence, decisions, episodes, feedback, graph, cursors,
+  // and the index-generation REGISTRY rows. full additionally includes active code-index
+  // generation CONTENT (§17) — which does not exist before Phase 5, so `full` today carries
+  // exactly what `core` does; the flag exists so the manifest format never has to change shape
+  // when Phase 5 fills that tier in.
+  tier: z.enum(['core', 'full']).default('core'),
   tableCounts: z.record(z.string(), z.number().int().nonnegative()),
   checksums: z.record(z.string(), z.string()),
   activeIndexGenerations: z

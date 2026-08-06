@@ -28,6 +28,51 @@ The snapshot is `{ noriq: "d1-snapshot", version, exportedAt, counts, tables }`,
 where `tables` maps each table name to its rows. Tables are discovered from
 `sqlite_master`, so the dump always follows the live schema.
 
+## ProjectMemory portable snapshots (PLNR-248)
+
+Separate from the D1 backup above: each project's cognitive memory (the graph, evidence,
+decisions, episodes, and outbox/cursor state) lives in its own `ProjectMemory` Durable Object,
+not in D1 — see [CLAUDE.md](../CLAUDE.md) and the "Project Memory — settled architecture
+decisions" project doc for why. It gets its own portable snapshot mechanism, exported to the
+same `FILES` R2 bucket under a different prefix so the two never collide:
+
+```
+memory-backups/<projectId>/<exportedAt>/manifest.json
+memory-backups/<projectId>/<exportedAt>/<table>/chunk-<n>.jsonl.gz
+```
+
+- Namespaced by project, so one project's backup can never overwrite another's, even with
+  identical timestamps.
+- Each chunk is gzip-compressed JSONL, bounded to a few hundred rows — exporting never holds
+  a whole table (or the whole store) in memory at once, so it scales to a large project.
+- `manifest.json` is written **last**. Its presence is what marks the backup complete; a crash
+  mid-export leaves orphaned chunks but no manifest, and nothing should treat that as
+  restorable. It carries the format/schema versions, the memory revision, per-table row counts,
+  a sha256 checksum for every chunk, and the chunk keys (`r2EvidenceRefs`) — enough for a
+  restore to detect a corrupted or missing chunk before trusting any of it.
+- `tier` in the manifest is `core` or `full`. Today they're identical — `full`'s additional
+  active code-index generation *content* doesn't exist until a later phase — the field just
+  keeps the manifest shape stable for when it does.
+
+**Trigger it:**
+
+```sh
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "https://<your-host>/api/admin/projects/<projectId>/memory-backup"
+```
+
+Add `?tier=full` for the full tier (currently equivalent to core). Without R2 bound, this
+returns `503` with a reason — every other ProjectMemory operation (reads, writes, the outbox)
+keeps working regardless; backup is the one optional-binding feature here.
+
+**Schedule:** the same daily cron that runs the D1 backup (`0 6 * * *`) also exports a fresh
+snapshot for every project that has ever touched its memory store (i.e. has a row in the
+compact D1 `project_memory_registry` — a project that hasn't has nothing in ProjectMemory yet
+worth backing up). Each project's export is independent; one failing never blocks another's.
+Recent status is visible in that same registry row (`backup_status`, `last_backup_at`).
+
+Restoring a ProjectMemory snapshot is covered separately once that capability lands (PLNR-249).
+
 ## 3. Restore
 
 ### Option A — full fidelity via wrangler (recommended)

@@ -2842,6 +2842,30 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
+  /** Record a memory-backup attempt's outcome (PLNR-248) into the same registry row
+   *  upsertMemoryHealth writes — `ok` sets backup_status='ok' with a fresh last_backup_at;
+   *  a failure sets 'failed' and leaves last_backup_at at its last successful value. */
+  async updateMemoryBackupStatus(projectId: string, outcome: { ok: boolean }): Promise<{ ok: true }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const now = nowIso();
+      if (outcome.ok) {
+        await this.env.DB.prepare(
+          `INSERT INTO project_memory_registry (project_id, backup_status, last_backup_at, created_at, updated_at)
+           VALUES (?, 'ok', ?, ?, ?)
+           ON CONFLICT (project_id) DO UPDATE SET backup_status = 'ok', last_backup_at = excluded.last_backup_at, updated_at = excluded.updated_at`,
+        ).bind(projectId, now, now, now).run();
+      } else {
+        await this.env.DB.prepare(
+          `INSERT INTO project_memory_registry (project_id, backup_status, created_at, updated_at)
+           VALUES (?, 'failed', ?, ?)
+           ON CONFLICT (project_id) DO UPDATE SET backup_status = 'failed', updated_at = excluded.updated_at`,
+        ).bind(projectId, now, now).run();
+      }
+      return { ok: true };
+    });
+  }
+
   /**
    * The receiving half of ProjectMemory's outbox (PLNR-247): accept a compact memory-change
    * delivery, dedupe it durably by operation id, and — for an unseen id only — append it to

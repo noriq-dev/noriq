@@ -1,8 +1,9 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../env';
 import { newId, nowIso } from '../lib/util';
-import { buildEntityUri } from '@noriq-dev/shared';
+import { buildEntityUri, type MemoryBackupManifest } from '@noriq-dev/shared';
 import { projectCoordinationEvents, type ProjectedEvent } from '../lib/memory-projector';
+import { exportMemorySnapshot } from '../memory/backup';
 
 /**
  * ProjectMemory — one instance per project (idFromName(projectId)), canonical
@@ -237,7 +238,7 @@ export interface ProjectMemoryHealth {
   tableCounts: Record<string, number>;
 }
 
-const SCHEMA_TABLES = [
+export const SCHEMA_TABLES = [
   'repositories',
   'index_generations',
   'nodes',
@@ -249,6 +250,18 @@ const SCHEMA_TABLES = [
   'episodes',
   'outbox',
 ] as const;
+
+// Operational ledgers (PLNR-247) that are not part of SCHEMA_TABLES' health/erase accounting
+// (health counts them separately below; erase clears them explicitly) but that a faithful
+// backup/restore (PLNR-248/249) must carry — a restore missing these would re-project already
+// consumed coordination events and re-deliver already-emitted operations on the next reconcile.
+export const OPERATIONAL_TABLES = ['applied_operations', 'memory_revision', 'projector_cursor'] as const;
+
+/** Every table a backup (PLNR-248) exports and a restore (PLNR-249) imports, parents before
+ *  children — the same generic per-table chunking applies to both graph data and the
+ *  operational singletons (memory_revision, projector_cursor are one row each, chunked the same
+ *  way as everything else rather than carved into bespoke manifest fields). */
+export const BACKUP_TABLES = [...SCHEMA_TABLES, ...OPERATIONAL_TABLES] as const;
 
 export class ProjectMemory extends DurableObject<Env> {
   // Bound on first call — from ctx.id.name when the runtime exposes it (every
@@ -326,6 +339,56 @@ export class ProjectMemory extends DurableObject<Env> {
       memoryRevision: this.readMemoryRevision(),
       tableCounts,
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Portable snapshot export (PLNR-248)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Export this project's canonical memory to R2 in bounded, checksummed chunks (see
+   * lib/memory/backup.ts for the pipeline itself — this method only supplies the two
+   * synchronous SQLite callbacks and the current schema/revision header fields; only this DO
+   * can read its own SQLite, so the pipeline can never open storage itself). Degrades
+   * gracefully with `{ ok: false, reason }` rather than throwing when R2 (FILES) is unbound —
+   * every other RPC on this DO keeps working with zero optional bindings (§20).
+   */
+  async exportSnapshot(
+    projectId: string,
+    opts: { tier?: 'core' | 'full' } = {},
+  ): Promise<{ ok: true; manifest: MemoryBackupManifest; manifestKey: string } | { ok: false; reason: string }> {
+    await this.assertProjectId(projectId);
+    if (!this.env.FILES) return { ok: false, reason: 'R2 (FILES) not configured' };
+    try {
+      const result = await exportMemorySnapshot({
+        env: this.env,
+        projectId,
+        schemaVersion: this.readSchemaVersion(),
+        memoryRevision: this.readMemoryRevision(),
+        tier: opts.tier ?? 'core',
+        exportedAt: nowIso(),
+        tables: BACKUP_TABLES,
+        readBatch: (table, offset, limit) =>
+          this.ctx.storage.sql.exec(`SELECT * FROM ${table} LIMIT ?1 OFFSET ?2`, limit, offset).toArray(),
+        tableCount: (table) => this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`).toArray()[0]?.n ?? 0,
+      });
+      await this.reportBackupStatus(projectId, true);
+      return { ok: true, manifest: result.manifest, manifestKey: result.manifestKey };
+    } catch (err) {
+      await this.reportBackupStatus(projectId, false);
+      return { ok: false, reason: String(err) };
+    }
+  }
+
+  /** Project the backup outcome into the D1 registry via ProjectRoom (sole D1 writer per
+   *  project) — awaited, not fire-and-forget: unlike erase()'s post-delete notification, the
+   *  project here is still very much alive, so the caller (admin route, cron) should see a
+   *  settled registry row by the time exportSnapshot resolves. Never lets a registry-write
+   *  failure mask the export's own result. */
+  private async reportBackupStatus(projectId: string, ok: boolean): Promise<void> {
+    await this.env.PROJECT_ROOM.get(this.env.PROJECT_ROOM.idFromName(projectId))
+      .updateMemoryBackupStatus(projectId, { ok })
+      .catch((err) => console.warn(`ProjectMemory backup-status report for ${projectId} failed: ${String(err)}`));
   }
 
   /**
