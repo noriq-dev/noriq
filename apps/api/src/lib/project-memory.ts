@@ -33,6 +33,8 @@ export interface MemoryItemRecord {
   supersedesMemoryId: string | null;
   recordedByAgentId: string | null;
   recordedAt: string;
+  proposedAt: string | null;
+  rejectedAt: string | null;
   evidence: Array<{ id: string; repositoryKey: string; branch: string; baseId: string; path: string; symbol: string | null; verificationState: string }>;
 }
 
@@ -66,6 +68,18 @@ export interface ProjectMemoryStub {
   ): Promise<{ feedbackId: string; operationId: string; deduped: boolean }>;
   getMemoryItem(projectId: string, memoryId: string): Promise<MemoryItemRecord | null>;
   getContradictionSet(projectId: string, setId: string): Promise<{ setId: string; memoryItemIds: string[]; resolvedAt: string | null }>;
+  listProposedDecisions(
+    projectId: string,
+  ): Promise<Array<{ id: string; statement: string; authority: number; recordedByAgentId: string | null; recordedAt: string; proposedAt: string }>>;
+  approveDecision(
+    projectId: string,
+    input: { memoryItemId: string; actorUserId: string; note?: string | null; revision?: string | null },
+  ): Promise<{ approvedMemoryId: string; transitionId: string }>;
+  rejectDecision(projectId: string, input: { memoryItemId: string; actorUserId: string; note?: string | null }): Promise<{ ok: true; transitionId: string }>;
+  promoteMemoriesOnMerge(
+    projectId: string,
+    input: { repositoryKey: string; branch: string; mergedBaseId: string },
+  ): Promise<{ promoted: string[]; skipped: number }>;
 }
 
 /**

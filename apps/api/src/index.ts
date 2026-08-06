@@ -28,7 +28,7 @@ import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
 import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
 import { z } from 'zod';
-import type { ProjectMemoryStub } from './lib/project-memory';
+import { listProjectRepositories, type ProjectMemoryStub } from './lib/project-memory';
 import { AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget, isTerminalRunStatus, normalizeProjectKey } from '@noriq-dev/shared';
 
 export { ProjectRoom } from './do/ProjectRoom';
@@ -1100,6 +1100,33 @@ app.get('/api/projects/:pid/memory/items/:id', userAuth, async (c) => {
 app.get('/api/projects/:pid/memory/contradictions/:setId', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
   return c.json(await memoryStub(c.env, pid).getContradictionSet(pid, c.req.param('setId')!));
+});
+
+// Proposed-decision approval (PLNR-253) — HUMAN-only, never an MCP tool (§12/§13: an agent must
+// never be the one that approves its own or another agent's claim). Mirrors the spin-off
+// accept/reject route shape (/api/projects/:pid/tasks/:tid/spinoff/accept|reject).
+app.get('/api/projects/:pid/memory/proposed-decisions', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  return c.json({ decisions: await memoryStub(c.env, pid).listProposedDecisions(pid) });
+});
+app.post('/api/projects/:pid/memory/items/:id/approve', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const body = await c.req.json<{ note?: string; revision?: string }>().catch(() => ({}) as { note?: string; revision?: string });
+  return c.json(
+    await memoryStub(c.env, pid).approveDecision(pid, {
+      memoryItemId: c.req.param('id')!,
+      actorUserId: c.var.user!.id,
+      note: body.note ?? null,
+      revision: body.revision ?? null,
+    }),
+  );
+});
+app.post('/api/projects/:pid/memory/items/:id/reject', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const body = await c.req.json<{ note?: string }>().catch(() => ({}) as { note?: string });
+  return c.json(
+    await memoryStub(c.env, pid).rejectDecision(pid, { memoryItemId: c.req.param('id')!, actorUserId: c.var.user!.id, note: body.note ?? null }),
+  );
 });
 
 // Plan-local docs (PLNR-200) — working documents scoped to one plan; read via the snapshot
@@ -2689,6 +2716,30 @@ app.post('/api/webhooks/github', async (c) => {
       await room(c.env, task.pid).updateTask(task.pid, sys, task.id, { status: 'review' });
     }
     updated.push(key);
+  }
+  // Merge-evidence authority promotion (PLNR-253, §12) — best-effort, never blocks the webhook's
+  // own response. Scoped to a project only when it has EXACTLY ONE registered repository: the
+  // webhook payload carries no Noriq repositoryKey, so a project with zero or several registered
+  // repos is ambiguous and is left alone rather than guessed at (the thorough per-repository
+  // correlation is Phase 5 ingest's job).
+  if (state === 'merged') {
+    const projectIds = [...new Set(updated.length ? (await Promise.all(keys.map(async (key) => {
+      const t = await c.env.DB.prepare('SELECT project_id AS pid FROM tasks WHERE key = ?').bind(key).first<{ pid: string }>();
+      return t?.pid ?? null;
+    }))).filter((pid): pid is string => !!pid) : [])];
+    for (const pid of projectIds) {
+      try {
+        const repos = await listProjectRepositories(c.env, pid);
+        if (repos.length !== 1) continue;
+        await memoryStub(c.env, pid).promoteMemoriesOnMerge(pid, {
+          repositoryKey: repos[0]!.repositoryKey,
+          branch: pr.base?.ref ?? 'main',
+          mergedBaseId: pr.merge_commit_sha ?? String(pr.number),
+        });
+      } catch (err) {
+        console.warn(`memory merge-promotion for ${pid} failed: ${String(err)}`);
+      }
+    }
   }
   return c.json({ ok: true, updated });
 });

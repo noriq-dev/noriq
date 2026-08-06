@@ -21,7 +21,7 @@ describe('ProjectMemory — schema migrator', () => {
   it('initializes to schema version 1 with every table empty', async () => {
     const pid = 'prj_pm_fresh';
     const h = await memory(pid).health(pid);
-    expect(h.schemaVersion).toBe(2);
+    expect(h.schemaVersion).toBe(3);
     expect(h.memoryRevision).toBe(0);
     expect(Object.values(h.tableCounts).every((n) => n === 0)).toBe(true);
     expect(h.tableCounts.nodes).toBe(0);
@@ -35,7 +35,7 @@ describe('ProjectMemory — schema migrator', () => {
     // A second stub handle for the SAME idFromName — whether the runtime reuses the live
     // instance or reconstructs it from storage, the migrator must not re-run destructively.
     const again = await memory(pid).health(pid);
-    expect(again.schemaVersion).toBe(2);
+    expect(again.schemaVersion).toBe(3);
     expect(again.tableCounts.nodes).toBe(1);
 
     const count = await memory(pid)._countNodes(pid);
@@ -46,7 +46,7 @@ describe('ProjectMemory — schema migrator', () => {
     const pid = 'prj_pm_no_optional_bindings';
     expect(appEnv.VECTORIZE).toBeUndefined();
     const h = await memory(pid).health(pid);
-    expect(h.schemaVersion).toBe(2);
+    expect(h.schemaVersion).toBe(3);
   });
 });
 

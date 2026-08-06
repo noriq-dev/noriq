@@ -1,7 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../env';
 import { newId, nowIso } from '../lib/util';
-import { buildEntityUri, AUTHORITY_HYPOTHESIS, type MemoryBackupManifest } from '@noriq-dev/shared';
+import { buildEntityUri, AUTHORITY_HYPOTHESIS, AUTHORITY_HUMAN_APPROVED, AUTHORITY_VERIFIED_MERGED, type MemoryBackupManifest } from '@noriq-dev/shared';
 import { projectCoordinationEvents, type ProjectedEvent } from '../lib/memory-projector';
 import { exportMemorySnapshot } from '../memory/backup';
 import { fetchManifest, readSnapshotChunks, checkManifestHeader } from '../memory/restore';
@@ -60,6 +60,7 @@ export const SCHEMA_TABLES = [
   'feedback',
   'contradiction_sets',
   'contradictions',
+  'memory_authority_transitions',
   'episodes',
   'outbox',
 ] as const;
@@ -656,8 +657,8 @@ export class ProjectMemory extends DurableObject<Env> {
       }
       this.ctx.storage.sql.exec(
         `INSERT INTO memory_items
-           (id, kind, statement, authority, confidence, content_hash, repository_key, branch, base_id, supersedes_memory_id, recorded_by_agent_id, recorded_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)`,
+           (id, kind, statement, authority, confidence, content_hash, repository_key, branch, base_id, supersedes_memory_id, recorded_by_agent_id, recorded_at, proposed_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)`,
         memoryId,
         input.kind,
         input.statement,
@@ -670,6 +671,13 @@ export class ProjectMemory extends DurableObject<Env> {
         input.supersedesMemoryId ?? null,
         input.actor.id ?? null,
         now,
+        // A decision an AGENT records enters the approval queue automatically (§12/PLNR-253) —
+        // it is already non-authoritative (clamped above), and "proposed" is what makes it
+        // visible-but-inert until a human decides, the SAME derived-state pattern spin-off tasks
+        // use (migrations/0064). A human/system-recorded decision (there is no such path yet,
+        // but the field is actor-general) is not auto-proposed — only an untrusted AI claim needs
+        // the gate.
+        input.kind === 'decision' && input.actor.kind === 'agent' ? now : null,
       );
       evidenceRefs.forEach((ref, i) => {
         this.ctx.storage.sql.exec(
@@ -947,6 +955,8 @@ export class ProjectMemory extends DurableObject<Env> {
     supersedesMemoryId: string | null;
     recordedByAgentId: string | null;
     recordedAt: string;
+    proposedAt: string | null;
+    rejectedAt: string | null;
     evidence: Array<{ id: string; repositoryKey: string; branch: string; baseId: string; path: string; symbol: string | null; verificationState: string }>;
   } | null> {
     await this.assertProjectId(projectId);
@@ -965,6 +975,8 @@ export class ProjectMemory extends DurableObject<Env> {
         supersedes_memory_id: string | null;
         recorded_by_agent_id: string | null;
         recorded_at: string;
+        proposed_at: string | null;
+        rejected_at: string | null;
       }>(`SELECT * FROM memory_items WHERE id = ?1`, memoryId)
       .toArray()[0];
     if (!row) return null;
@@ -988,6 +1000,8 @@ export class ProjectMemory extends DurableObject<Env> {
       supersedesMemoryId: row.supersedes_memory_id,
       recordedByAgentId: row.recorded_by_agent_id,
       recordedAt: row.recorded_at,
+      proposedAt: row.proposed_at,
+      rejectedAt: row.rejected_at,
       evidence: evidence.map((e) => ({
         id: e.id,
         repositoryKey: e.repository_key,
@@ -998,6 +1012,297 @@ export class ProjectMemory extends DurableObject<Env> {
         verificationState: e.verification_state,
       })),
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Proposed-decision approval and authority promotion (PLNR-253)
+  //
+  // Neither path ever mutates an existing memory_items row's authority in place — that column,
+  // once written by recordMemory, never changes again. A promotion instead creates a NEW row
+  // (authority 5 for human approval, 4 for merge evidence) linked back via
+  // supersedes_memory_id — the SAME versioning mechanism PLNR-251 uses for a plain correction —
+  // and records one immutable memory_authority_transitions row as the durable "who/when/why".
+  // Authority 5 is reachable ONLY from approveDecision, which only userAuth REST calls (never an
+  // MCP tool); nothing here trusts a caller-supplied authority value.
+  // ---------------------------------------------------------------------------
+
+  /** Every kind='decision' memory still awaiting a human's accept/reject — the human governance
+   *  queue. Visible, but (being authority <= 2, per recordMemory's agent clamp) never
+   *  authoritative until acted on. */
+  async listProposedDecisions(projectId: string): Promise<
+    Array<{ id: string; statement: string; authority: number; recordedByAgentId: string | null; recordedAt: string; proposedAt: string }>
+  > {
+    await this.assertProjectId(projectId);
+    return this.ctx.storage.sql
+      .exec<{
+        id: string;
+        statement: string;
+        authority: number;
+        recorded_by_agent_id: string | null;
+        recorded_at: string;
+        proposed_at: string;
+      }>(
+        `SELECT id, statement, authority, recorded_by_agent_id, recorded_at, proposed_at
+         FROM memory_items WHERE kind = 'decision' AND proposed_at IS NOT NULL ORDER BY proposed_at`,
+      )
+      .toArray()
+      .map((r) => ({
+        id: r.id,
+        statement: r.statement,
+        authority: r.authority,
+        recordedByAgentId: r.recorded_by_agent_id,
+        recordedAt: r.recorded_at,
+        proposedAt: r.proposed_at,
+      }));
+  }
+
+  private loadMemoryRow(memoryId: string): { id: string; kind: string; proposed_at: string | null; authority: number } | undefined {
+    return this.ctx.storage.sql
+      .exec<{ id: string; kind: string; proposed_at: string | null; authority: number }>(
+        `SELECT id, kind, proposed_at, authority FROM memory_items WHERE id = ?1`,
+        memoryId,
+      )
+      .toArray()[0];
+  }
+
+  /** Copy a memory item's evidence rows onto a NEW memory item id — used by both promotion
+   *  paths so the superseding version carries the same citations as the one it replaces,
+   *  rather than reading as unevidenced. */
+  private copyEvidence(fromMemoryId: string, toMemoryId: string, now: string): void {
+    const rows = this.ctx.storage.sql
+      .exec<{ repository_key: string; branch: string; base_id: string; path: string; symbol: string | null; content_hash: string | null; evidence_hash: string | null; verification_state: string }>(
+        `SELECT repository_key, branch, base_id, path, symbol, content_hash, evidence_hash, verification_state FROM evidence WHERE memory_item_id = ?1`,
+        fromMemoryId,
+      )
+      .toArray();
+    for (const r of rows) {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO evidence (id, memory_item_id, repository_key, branch, base_id, path, symbol, content_hash, evidence_hash, verification_state, created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)`,
+        newId('ev'),
+        toMemoryId,
+        r.repository_key,
+        r.branch,
+        r.base_id,
+        r.path,
+        r.symbol,
+        r.content_hash,
+        r.evidence_hash,
+        r.verification_state,
+        now,
+      );
+    }
+  }
+
+  /** Human-only (userAuth REST calls this; no MCP tool ever does) approval of a proposed
+   *  decision — the ONLY path to authority 5 (§12). Creates a new authority-5 version
+   *  superseding the proposed one, an immutable transition record, and clears proposed_at on
+   *  the original (which itself is never otherwise touched — its authority column stays
+   *  whatever it was recorded at). */
+  async approveDecision(
+    projectId: string,
+    input: { memoryItemId: string; actorUserId: string; note?: string | null; revision?: string | null },
+  ): Promise<{ approvedMemoryId: string; transitionId: string }> {
+    await this.assertProjectId(projectId);
+    const row = this.loadMemoryRow(input.memoryItemId);
+    if (!row) throw new Error(`memory item ${input.memoryItemId} not found`);
+    if (row.kind !== 'decision') throw new Error(`memory item ${input.memoryItemId} is not a decision`);
+    if (!row.proposed_at) throw new Error(`memory item ${input.memoryItemId} is not a pending proposed decision`);
+
+    const original = await this.getMemoryItem(projectId, input.memoryItemId);
+    if (!original) throw new Error(`memory item ${input.memoryItemId} not found`);
+    const approvedMemoryId = newId('mem');
+    const transitionId = newId('atr');
+    const operationId = newId('op');
+    const now = nowIso();
+    this.ctx.storage.transactionSync(() => {
+      if (this._forceWriteFailure) throw new Error('injected write failure (test)');
+      this.ctx.storage.sql.exec(
+        `INSERT INTO memory_items
+           (id, kind, statement, authority, confidence, content_hash, repository_key, branch, base_id, supersedes_memory_id, recorded_by_agent_id, recorded_at)
+         VALUES (?1,'decision',?2,?3,?4,?5,?6,?7,?8,?9,NULL,?10)`,
+        approvedMemoryId,
+        original.statement,
+        AUTHORITY_HUMAN_APPROVED,
+        original.confidence,
+        original.contentHash,
+        original.repositoryKey,
+        original.branch,
+        original.baseId,
+        input.memoryItemId,
+        now,
+      );
+      this.copyEvidence(input.memoryItemId, approvedMemoryId, now);
+      this.ctx.storage.sql.exec(`UPDATE memory_items SET proposed_at = NULL WHERE id = ?1`, input.memoryItemId);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO memory_authority_transitions (id, memory_item_id, resulting_memory_id, outcome, new_authority, actor_kind, actor_id, revision, note, created_at)
+         VALUES (?1,?2,?3,'approved',?4,'human',?5,?6,?7,?8)`,
+        transitionId,
+        input.memoryItemId,
+        approvedMemoryId,
+        AUTHORITY_HUMAN_APPROVED,
+        input.actorUserId,
+        input.revision ?? null,
+        input.note ?? null,
+        now,
+      );
+      this.ctx.storage.sql.exec(
+        `INSERT INTO outbox (id, operation_id, verb, subject_type, subject_id, payload, created_at) VALUES (?1,?2,'memory.changed','memory',?3,?4,?5)`,
+        newId('obx'),
+        operationId,
+        transitionId,
+        JSON.stringify({ operationId, entityType: 'authority_transition', outcome: 'approved', memoryItemId: input.memoryItemId, resultingMemoryId: approvedMemoryId, actorKind: 'human', actorId: input.actorUserId }),
+        now,
+      );
+      this.ctx.storage.sql.exec(`UPDATE memory_revision SET value = value + 1 WHERE id = 0`);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO applied_operations (operation_id, applied_at, subject_type, subject_id, result) VALUES (?1,?2,'authority_transition',?3,?4)`,
+        operationId,
+        now,
+        transitionId,
+        JSON.stringify({ approvedMemoryId, transitionId }),
+      );
+    });
+    this.ctx.storage.setAlarm(Date.now()).catch(() => {});
+    return { approvedMemoryId, transitionId };
+  }
+
+  /** Human-only rejection of a proposed decision. No new version, no authority change — the
+   *  original row is left exactly as recorded, `proposed_at` is cleared, and `rejected_at` is
+   *  set so the decision remains historically visible as rejected rather than reading like it
+   *  is still awaiting review. */
+  async rejectDecision(
+    projectId: string,
+    input: { memoryItemId: string; actorUserId: string; note?: string | null },
+  ): Promise<{ ok: true; transitionId: string }> {
+    await this.assertProjectId(projectId);
+    const row = this.loadMemoryRow(input.memoryItemId);
+    if (!row) throw new Error(`memory item ${input.memoryItemId} not found`);
+    if (row.kind !== 'decision') throw new Error(`memory item ${input.memoryItemId} is not a decision`);
+    if (!row.proposed_at) throw new Error(`memory item ${input.memoryItemId} is not a pending proposed decision`);
+
+    const transitionId = newId('atr');
+    const operationId = newId('op');
+    const now = nowIso();
+    this.ctx.storage.transactionSync(() => {
+      if (this._forceWriteFailure) throw new Error('injected write failure (test)');
+      this.ctx.storage.sql.exec(`UPDATE memory_items SET proposed_at = NULL, rejected_at = ?2 WHERE id = ?1`, input.memoryItemId, now);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO memory_authority_transitions (id, memory_item_id, resulting_memory_id, outcome, new_authority, actor_kind, actor_id, revision, note, created_at)
+         VALUES (?1,?2,NULL,'rejected',NULL,'human',?3,NULL,?4,?5)`,
+        transitionId,
+        input.memoryItemId,
+        input.actorUserId,
+        input.note ?? null,
+        now,
+      );
+      this.ctx.storage.sql.exec(
+        `INSERT INTO outbox (id, operation_id, verb, subject_type, subject_id, payload, created_at) VALUES (?1,?2,'memory.changed','memory',?3,?4,?5)`,
+        newId('obx'),
+        operationId,
+        transitionId,
+        JSON.stringify({ operationId, entityType: 'authority_transition', outcome: 'rejected', memoryItemId: input.memoryItemId, actorKind: 'human', actorId: input.actorUserId }),
+        now,
+      );
+      this.ctx.storage.sql.exec(`UPDATE memory_revision SET value = value + 1 WHERE id = 0`);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO applied_operations (operation_id, applied_at, subject_type, subject_id, result) VALUES (?1,?2,'authority_transition',?3,?4)`,
+        operationId,
+        now,
+        transitionId,
+        JSON.stringify({ transitionId }),
+      );
+    });
+    this.ctx.storage.setAlarm(Date.now()).catch(() => {});
+    return { ok: true, transitionId };
+  }
+
+  /**
+   * GitHub-merge-evidence promotion (§12): every memory below authority 4 whose evidence is
+   * ENTIRELY within the given repository/branch is promoted to a new authority-4 version citing
+   * the merged revision. A memory with no evidence, or evidence citing any OTHER
+   * repository/branch, is left untouched — a merge is not blanket proof for claims it does not
+   * actually back. This is the "cheap server-side check" the task allows for now; the thorough
+   * worktree-tier re-verification is PLNR-265's.
+   */
+  async promoteMemoriesOnMerge(
+    projectId: string,
+    input: { repositoryKey: string; branch: string; mergedBaseId: string },
+  ): Promise<{ promoted: string[]; skipped: number }> {
+    await this.assertProjectId(projectId);
+    const candidates = this.ctx.storage.sql
+      .exec<{ id: string }>(`SELECT id FROM memory_items WHERE authority < ?1`, AUTHORITY_VERIFIED_MERGED)
+      .toArray();
+    const promoted: string[] = [];
+    let skipped = 0;
+    for (const { id } of candidates) {
+      const evidenceRows = this.ctx.storage.sql
+        .exec<{ repository_key: string; branch: string }>(`SELECT repository_key, branch FROM evidence WHERE memory_item_id = ?1`, id)
+        .toArray();
+      const verified = evidenceRows.length > 0 && evidenceRows.every((e) => e.repository_key === input.repositoryKey && e.branch === input.branch);
+      if (!verified) {
+        skipped++;
+        continue;
+      }
+      const original = await this.getMemoryItem(projectId, id);
+      if (!original) {
+        skipped++;
+        continue;
+      }
+      const promotedId = newId('mem');
+      const transitionId = newId('atr');
+      const operationId = newId('op');
+      const now = nowIso();
+      this.ctx.storage.transactionSync(() => {
+        if (this._forceWriteFailure) throw new Error('injected write failure (test)');
+        this.ctx.storage.sql.exec(
+          `INSERT INTO memory_items
+             (id, kind, statement, authority, confidence, content_hash, repository_key, branch, base_id, supersedes_memory_id, recorded_by_agent_id, recorded_at)
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,NULL,?11)`,
+          promotedId,
+          original.kind,
+          original.statement,
+          AUTHORITY_VERIFIED_MERGED,
+          original.confidence,
+          original.contentHash,
+          original.repositoryKey,
+          original.branch,
+          original.baseId,
+          id,
+          now,
+        );
+        this.copyEvidence(id, promotedId, now);
+        this.ctx.storage.sql.exec(
+          `INSERT INTO memory_authority_transitions (id, memory_item_id, resulting_memory_id, outcome, new_authority, actor_kind, actor_id, revision, note, created_at)
+           VALUES (?1,?2,?3,'merge_promoted',?4,'system',NULL,?5,NULL,?6)`,
+          transitionId,
+          id,
+          promotedId,
+          AUTHORITY_VERIFIED_MERGED,
+          input.mergedBaseId,
+          now,
+        );
+        this.ctx.storage.sql.exec(
+          `INSERT INTO outbox (id, operation_id, verb, subject_type, subject_id, payload, created_at) VALUES (?1,?2,'memory.changed','memory',?3,?4,?5)`,
+          newId('obx'),
+          operationId,
+          transitionId,
+          JSON.stringify({ operationId, entityType: 'authority_transition', outcome: 'merge_promoted', memoryItemId: id, resultingMemoryId: promotedId, actorKind: 'system', actorId: null, revision: input.mergedBaseId }),
+          now,
+        );
+        this.ctx.storage.sql.exec(`UPDATE memory_revision SET value = value + 1 WHERE id = 0`);
+        this.ctx.storage.sql.exec(
+          `INSERT INTO applied_operations (operation_id, applied_at, subject_type, subject_id, result) VALUES (?1,?2,'authority_transition',?3,?4)`,
+          operationId,
+          now,
+          transitionId,
+          JSON.stringify({ promotedId, transitionId }),
+        );
+      });
+      promoted.push(promotedId);
+    }
+    if (promoted.length > 0) this.ctx.storage.setAlarm(Date.now()).catch(() => {});
+    return { promoted, skipped };
   }
 
   /**
