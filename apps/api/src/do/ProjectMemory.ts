@@ -6,7 +6,7 @@ import { projectCoordinationEvents, type ProjectedEvent } from '../lib/memory-pr
 import { exportMemorySnapshot } from '../memory/backup';
 import { fetchManifest, readSnapshotChunks, checkManifestHeader } from '../memory/restore';
 import { deleteAllProjectBackups, sizeStatus, type EraseReport, type EraseStepResult } from '../memory/lifecycle';
-import { MEMORY_MIGRATIONS } from '../../memory-migrations';
+import { MEMORY_MIGRATIONS } from '../memory/migrations';
 
 /**
  * ProjectMemory — one instance per project (idFromName(projectId)), canonical
@@ -37,10 +37,10 @@ import { MEMORY_MIGRATIONS } from '../../memory-migrations';
  */
 
 // This DO's internal SQLite schema lives in apps/api/memory-migrations — real `.sql` files, one
-// per version, assembled into an ordered manifest by that directory's index.ts. Adding a
+// per version and nothing else, ordered by the manifest in ../memory/migrations.ts. Adding a
 // migration is a new file plus one manifest entry; the rules (never edit a shipped migration;
-// stay additive) are documented there. Note it is a SIBLING of apps/api/migrations, which is
-// D1's and is applied by the wrangler CLI — the two must never be mixed.
+// stay additive) are documented there. Note that directory is a SIBLING of apps/api/migrations,
+// which is D1's and is applied by the wrangler CLI — the two must never be mixed.
 
 export interface ProjectMemoryHealth {
   projectId: string;

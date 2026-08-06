@@ -3,7 +3,8 @@
 -- Applied INSIDE the ProjectMemory Durable Object at construction (see
 -- ../src/do/ProjectMemory.ts migrate()), gated by a durable `_meta.schema_version`.
 -- This is NOT a D1 migration: it must never live in ../migrations, which wrangler and
--- the test harness apply wholesale to D1. See index.ts in this directory.
+-- the test harness apply wholesale to D1. The ordered manifest that loads this file is
+-- ../src/memory/migrations.ts.
 --
 -- The whole file is executed as ONE multi-statement `SqlStorage.exec()` call (exec
 -- accepts several `;`-separated statements — verified against workerd), so there is no

@@ -186,8 +186,9 @@ for the components. (ARCHITECTURE.md calls it a "mock store" — that's stale; i
   Object's own SQLite schema** — applied *inside* the DO at construction, gated by a durable
   `_meta.schema_version`, so it ships in the Worker bundle (a Worker has no runtime filesystem).
   Putting a memory migration in `migrations/` would create the memory tables in D1 and record
-  them in `d1_migrations`. Both are real `.sql` files; `memory-migrations/index.ts` is the
-  ordered manifest and documents how to add one. `.sql` imports need **no** wrangler config
+  them in `d1_migrations`. Both directories hold **only** `.sql` files; the ordered manifest that
+  loads the memory ones is [src/memory/migrations.ts](apps/api/src/memory/migrations.ts), which
+  documents how to add one. `.sql` imports need **no** wrangler config
   (it ships a default Text rule for `**/*.sql` — adding your own `rules` entry *shadows* that
   default and fails the build unless it sets `fallthrough: true`), but the vitest pool builds
   with vite and needs the `sql-as-text` plugin in `vitest.workspace.ts`.

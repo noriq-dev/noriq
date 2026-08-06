@@ -1,21 +1,27 @@
-// ProjectMemory's internal SQLite migrations (PLNR-245) — one `.sql` file per version.
+// The ordered manifest of ProjectMemory's internal SQLite migrations (PLNR-245).
 //
-// This directory is a SIBLING of `../migrations`, not part of it, and the distinction is
+// The migrations themselves are real `.sql` files in `apps/api/memory-migrations/`, which holds
+// NOTHING ELSE — same convention as `apps/api/migrations/`. This manifest is code, so it lives
+// here in `src/` beside the rest of the memory subsystem (backup/restore/lifecycle) rather than
+// polluting a SQL directory with a TypeScript file.
+//
+// `memory-migrations/` is a SIBLING of `migrations/`, not part of it, and the distinction is
 // load-bearing:
 //
-//   ../migrations/*.sql      D1's schema. Applied by the wrangler CLI at deploy time
-//                            (`migrations_dir` in wrangler.jsonc) and by readD1Migrations()
-//                            in the test harness — i.e. applied WHOLESALE to D1.
-//   ./*.sql (here)           The ProjectMemory Durable Object's OWN SQLite schema. Applied
-//                            inside the DO at construction, gated by a durable
-//                            `_meta.schema_version`, so it has to be carried in the Worker
-//                            bundle (a Worker has no filesystem to read at runtime).
+//   apps/api/migrations/*.sql         D1's schema. Applied by the wrangler CLI at deploy time
+//                                     (`migrations_dir` in wrangler.jsonc) and by
+//                                     readD1Migrations() in the test harness — i.e. applied
+//                                     WHOLESALE to D1.
+//   apps/api/memory-migrations/*.sql  The ProjectMemory Durable Object's OWN SQLite schema.
+//                                     Applied inside the DO at construction, gated by a durable
+//                                     `_meta.schema_version`, so it has to be carried in the
+//                                     Worker bundle (a Worker has no runtime filesystem).
 //
-// Putting these files in ../migrations would make wrangler create the memory tables in D1 and
-// record them in `d1_migrations` — never do that.
+// Putting a memory migration in `migrations/` would make wrangler create the memory tables in D1
+// and record them in `d1_migrations` — never do that.
 //
 // TO ADD A MIGRATION:
-//   1. Create `NNNN_short_name.sql` beside 0001.
+//   1. Create `apps/api/memory-migrations/NNNN_short_name.sql` beside 0001.
 //   2. `import` it below and append one entry to MEMORY_MIGRATIONS. `version` MUST equal the
 //      entry's array index + 1 (asserted at module load).
 //   3. Never edit an already-shipped migration's SQL — a store that already ran it will not
@@ -39,7 +45,7 @@
 //                the SQL as JavaScript.
 //   • src/sql-modules.d.ts  `declare module '*.sql'` — the typecheck path.
 // If a `.sql` import ever fails, it is one of the latter two.
-import sql0001 from './0001_initial.sql';
+import sql0001 from '../../memory-migrations/0001_initial.sql';
 
 export interface MemoryMigration {
   /** 1-based, contiguous, and equal to this entry's array index + 1. */
