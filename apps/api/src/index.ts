@@ -1115,6 +1115,38 @@ app.post('/api/projects/:pid/memory/search', userAuth, async (c) => {
   return c.json(await memoryStub(c.env, pid).searchProjectMemory(pid, body));
 });
 
+// Named graph-query primitives (PLNR-258) — the human-facing twin of explain_project_area;
+// shaped for Phase 8's graph/ego-network view but no UI ships here. One route, `focus`
+// discriminates the primitive, same shape as the MCP tool.
+app.post('/api/projects/:pid/memory/explain', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const body = await c.req.json<{
+    focus?: 'dependencies' | 'tests' | 'implementers' | 'decision' | 'impact';
+    entityUri?: string; decisionUri?: string; entityUris?: string[];
+    edgeTypes?: string[]; maxDepth?: number; maxResults?: number;
+  }>().catch(() => ({}) as Record<string, never>);
+  const stub = memoryStub(c.env, pid);
+  switch (body.focus) {
+    case 'dependencies':
+      if (!body.entityUri) return c.json({ error: 'entityUri is required for focus="dependencies"' }, 400);
+      return c.json(await stub.dependencyNeighborhood(pid, { entityUri: body.entityUri, edgeTypes: body.edgeTypes, maxDepth: body.maxDepth, maxResults: body.maxResults }));
+    case 'tests':
+      if (!body.entityUri) return c.json({ error: 'entityUri is required for focus="tests"' }, 400);
+      return c.json(await stub.validatingTests(pid, { entityUri: body.entityUri, maxDepth: body.maxDepth, maxResults: body.maxResults }));
+    case 'implementers':
+      if (!body.entityUri) return c.json({ error: 'entityUri is required for focus="implementers"' }, 400);
+      return c.json(await stub.implementingWork(pid, { entityUri: body.entityUri, maxDepth: body.maxDepth, maxResults: body.maxResults }));
+    case 'decision':
+      if (!body.decisionUri) return c.json({ error: 'decisionUri is required for focus="decision"' }, 400);
+      return c.json(await stub.decisionLineage(pid, { decisionUri: body.decisionUri, maxDepth: body.maxDepth, maxResults: body.maxResults }));
+    case 'impact':
+      if (!body.entityUris?.length) return c.json({ error: 'entityUris is required for focus="impact"' }, 400);
+      return c.json(await stub.changeImpact(pid, { entityUris: body.entityUris, maxDepth: body.maxDepth, maxResults: body.maxResults }));
+    default:
+      return c.json({ error: 'focus must be one of dependencies|tests|implementers|decision|impact' }, 400);
+  }
+});
+
 // Proposed-decision approval (PLNR-253) — HUMAN-only, never an MCP tool (§12/§13: an agent must
 // never be the one that approves its own or another agent's claim). Mirrors the spin-off
 // accept/reject route shape (/api/projects/:pid/tasks/:tid/spinoff/accept|reject).

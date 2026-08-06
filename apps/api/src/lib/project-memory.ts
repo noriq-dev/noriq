@@ -5,6 +5,9 @@
 import type { Env } from '../env';
 import type { ProjectMemoryHealth } from '../do/ProjectMemory';
 import type { RankedHit } from '../memory/retrieval';
+import type {
+  DependencyNeighborhoodResult, ValidatingTestsResult, ImplementingWorkResult, DecisionLineageResult, ChangeImpactResult,
+} from '../memory/graph-queries';
 import { userCanAccessProject } from './visibility';
 
 /** An evidence citation as the write RPCs accept it — validated server-side (writes.ts) against
@@ -108,6 +111,16 @@ export interface ProjectMemoryStub {
       limit?: number;
     },
   ): Promise<{ mode: 'semantic' | 'keyword'; results: RankedHit[] }>;
+  /** PLNR-258: named graph-query primitives — see memory/graph-queries.ts for the shared
+   *  completeness-marker contract every one of these returns. */
+  dependencyNeighborhood(
+    projectId: string,
+    input: { entityUri: string; edgeTypes?: string[]; maxDepth?: number; maxResults?: number },
+  ): Promise<DependencyNeighborhoodResult>;
+  validatingTests(projectId: string, input: { entityUri: string; maxDepth?: number; maxResults?: number }): Promise<ValidatingTestsResult>;
+  implementingWork(projectId: string, input: { entityUri: string; maxDepth?: number; maxResults?: number }): Promise<ImplementingWorkResult>;
+  decisionLineage(projectId: string, input: { decisionUri: string; maxDepth?: number; maxResults?: number }): Promise<DecisionLineageResult>;
+  changeImpact(projectId: string, input: { entityUris: string[]; maxDepth?: number; maxResults?: number }): Promise<ChangeImpactResult>;
   /** PLNR-255: re-embed this project's memories/episodes into the operational search index and
    *  clear `project_memory_registry.vector_dirty` on success (Phase 4's fill-in of the Phase
    *  2/3 no-op hook). No-ops honestly when no embeddings backend is bound. */

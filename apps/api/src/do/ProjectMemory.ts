@@ -14,6 +14,11 @@ import {
   applyMemoryFilters, rankCandidates, RETRIEVAL_DEFAULTS,
   type RetrievalHit, type RetrievalStage, type RankedHit,
 } from '../memory/retrieval';
+import {
+  dependencyNeighborhood, validatingTests, implementingWork, decisionLineage, changeImpact,
+  type GraphEntityRef, type DependencyNeighborhoodResult, type ValidatingTestsResult,
+  type ImplementingWorkResult, type DecisionLineageResult, type ChangeImpactResult,
+} from '../memory/graph-queries';
 
 /**
  * ProjectMemory — one instance per project (idFromName(projectId)), canonical
@@ -1565,13 +1570,23 @@ export class ProjectMemory extends DurableObject<Env> {
    *  final row count is capped by `maxResults` — both from named constants, never a literal at
    *  the call site. Deduped in JS by nodeId, keeping the SHALLOWEST occurrence (`ORDER BY depth
    *  ASC` guarantees the first-seen row per id is the shortest path). */
+  /**
+   * Bounded recursive-CTE traversal, `direction`-aware (PLNR-258 grows PLNR-257's
+   * forward-only original into both directions): 'downstream' follows `from_node_id → to_node_id`
+   * (what this node points AT); 'upstream' follows the SAME edges backward, `to_node_id →
+   * from_node_id` (what points AT this node) — the recorded edge path always shows the edge's
+   * REAL direction regardless of which way it was walked. Fetches one row past `maxResults` to
+   * report `truncated` honestly (a bounded result may not be the whole neighborhood) rather than
+   * guessing from a suspiciously-round row count.
+   */
   private rawTraverseGraph(
     seedNodeIds: string[],
-    opts: { edgeTypes?: string[]; maxDepth?: number; maxResults?: number },
-  ): Array<{ nodeId: string; uri: string; type: string; label: string; depth: number; edgePath: string }> {
-    if (!seedNodeIds.length) return [];
+    opts: { edgeTypes?: string[]; maxDepth?: number; maxResults?: number; direction?: 'downstream' | 'upstream' },
+  ): { rows: Array<{ nodeId: string; uri: string; type: string; label: string; depth: number; edgePath: string }>; truncated: boolean } {
+    if (!seedNodeIds.length) return { rows: [], truncated: false };
     const maxDepth = Math.min(Math.max(opts.maxDepth ?? RETRIEVAL_DEFAULTS.maxDepth, 1), RETRIEVAL_DEFAULTS.maxDepthCeiling);
     const maxResults = Math.min(Math.max(opts.maxResults ?? RETRIEVAL_DEFAULTS.maxGraphResults, 1), RETRIEVAL_DEFAULTS.maxGraphResultsCeiling);
+    const [startCol, nextCol] = (opts.direction ?? 'downstream') === 'downstream' ? ['from_node_id', 'to_node_id'] : ['to_node_id', 'from_node_id'];
 
     const binds: unknown[] = [...seedNodeIds];
     const seedPlaceholders = seedNodeIds.map((_, i) => `?${i + 1}`).join(',');
@@ -1584,17 +1599,17 @@ export class ProjectMemory extends DurableObject<Env> {
     const depthPh = binds.length + 1;
     binds.push(maxDepth);
     const limitPh = binds.length + 1;
-    binds.push(maxResults);
+    binds.push(maxResults + 1); // +1 so truncation is detected, not guessed
 
     const rows = this.ctx.storage.sql
       .exec<{ nodeId: string; uri: string; type: string; label: string; depth: number; edgePath: string }>(
         `WITH RECURSIVE reach(node_id, depth, path) AS (
            SELECT id, 0, '' FROM nodes WHERE id IN (${seedPlaceholders})
            UNION
-           SELECT e.to_node_id, r.depth + 1,
+           SELECT e.${nextCol}, r.depth + 1,
                   CASE WHEN r.path = '' THEN (e.from_node_id || '>' || e.type || '>' || e.to_node_id)
                        ELSE (r.path || ';' || e.from_node_id || '>' || e.type || '>' || e.to_node_id) END
-           FROM reach r JOIN edges e ON e.from_node_id = r.node_id
+           FROM reach r JOIN edges e ON e.${startCol} = r.node_id
            WHERE r.depth < ?${depthPh} ${edgeFilterSql}
          )
          SELECT n.id AS nodeId, n.uri AS uri, n.type AS type, n.label AS label, reach.depth AS depth, reach.path AS edgePath
@@ -1606,14 +1621,15 @@ export class ProjectMemory extends DurableObject<Env> {
       )
       .toArray();
 
+    const truncated = rows.length > maxResults;
     const seen = new Set<string>();
     const deduped: typeof rows = [];
-    for (const r of rows) {
+    for (const r of rows.slice(0, maxResults)) {
       if (seen.has(r.nodeId)) continue;
       seen.add(r.nodeId);
       deduped.push(r);
     }
-    return deduped;
+    return { rows: deduped, truncated };
   }
 
   /** The general graph-traversal read API (replaces the old `_traverseFrom` test shim — this
@@ -1625,7 +1641,47 @@ export class ProjectMemory extends DurableObject<Env> {
     input: { seedNodeIds: string[]; edgeTypes?: string[]; maxDepth?: number; maxResults?: number },
   ): Promise<Array<{ nodeId: string; uri: string; type: string; label: string; depth: number; edgePath: string }>> {
     await this.assertProjectId(projectId);
-    return this.rawTraverseGraph(input.seedNodeIds, input);
+    return this.rawTraverseGraph(input.seedNodeIds, input).rows;
+  }
+
+  /** Resolve one node by its stable entity URI — the seed-lookup every PLNR-258 primitive
+   *  starts from. Null when the URI has no matching node (e.g. a file/symbol URI before
+   *  Phase 5's ingest has ever run). */
+  private resolveNodeByUri(uri: string): { nodeId: string; uri: string; type: string; label: string } | null {
+    const row = this.ctx.storage.sql
+      .exec<{ id: string; uri: string; type: string; label: string }>(`SELECT id, uri, type, label FROM nodes WHERE uri = ?1`, uri)
+      .toArray()[0];
+    return row ? { nodeId: row.id, uri: row.uri, type: row.type, label: row.label } : null;
+  }
+
+  /** Which of `candidateTypes` have NEVER been written as an edge anywhere in this project —
+   *  the concrete "why" behind a completeness marker of 'no-writer-yet' (PLNR-258 §2: absence
+   *  of an edge is never evidence of absence of the relationship when nothing writes that edge
+   *  type at all yet). */
+  private edgeTypesWithNoWriter(candidateTypes: string[]): string[] {
+    if (!candidateTypes.length) return [];
+    const placeholders = candidateTypes.map((_, i) => `?${i + 1}`).join(',');
+    const present = new Set(
+      this.ctx.storage.sql
+        .exec<{ type: string }>(`SELECT DISTINCT type FROM edges WHERE type IN (${placeholders})`, ...candidateTypes)
+        .toArray()
+        .map((r) => r.type),
+    );
+    return candidateTypes.filter((t) => !present.has(t));
+  }
+
+  /** True once this project's graph holds at least one node beyond coordination's own 'task'
+   *  type — i.e. Phase 5/6 ingest has populated something. Always false today (the projector is
+   *  the only node writer in src/), which is exactly what makes every PLNR-258 primitive's
+   *  completeness marker honest rather than a formality. */
+  private isCodeGraphPopulated(): boolean {
+    return (
+      this.ctx.storage.sql
+        .exec<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM nodes WHERE type IN ('file', 'symbol', 'api', 'test', 'database_entity')`,
+        )
+        .toArray()[0]?.n ?? 0
+    ) > 0;
   }
 
   /**
@@ -1688,7 +1744,7 @@ export class ProjectMemory extends DurableObject<Env> {
       if (id) seedNodeIds.push(id);
     }
     if (seedNodeIds.length) {
-      const graphRows = this.rawTraverseGraph(seedNodeIds, { edgeTypes: opts.edgeTypes, maxDepth: opts.maxDepth, maxResults: RETRIEVAL_DEFAULTS.maxGraphResults });
+      const graphRows = this.rawTraverseGraph(seedNodeIds, { edgeTypes: opts.edgeTypes, maxDepth: opts.maxDepth, maxResults: RETRIEVAL_DEFAULTS.maxGraphResults }).rows;
       for (const g of graphRows) {
         candidates.push({
           entityType: 'node',
@@ -1715,6 +1771,141 @@ export class ProjectMemory extends DurableObject<Env> {
     });
     const results = rankCandidates(filtered, { limit, preferBranch: opts.branch });
     return { mode, results };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Named graph-query primitives (PLNR-258) — dependency neighborhoods, validating tests,
+  // implementing work, decision lineage, and change impact. Each executes bounded traversals
+  // over this project's own SQLite (never the embedder/Vectorize — §20/task acceptance: these
+  // are pure graph facts) and hands the raw rows to memory/graph-queries.ts to shape into
+  // addressable entities with an honest completeness marker. Read-only, same as PLNR-257.
+  // ---------------------------------------------------------------------------
+
+  private edgeCoverageInputs(seed: { nodeId: string } | null, edgeTypes: string[], truncated: boolean): {
+    codeGraphPopulated: boolean; edgeTypesWithNoWriter: string[]; truncated: boolean; seedMissing: boolean;
+  } {
+    return {
+      codeGraphPopulated: this.isCodeGraphPopulated(),
+      edgeTypesWithNoWriter: this.edgeTypesWithNoWriter(edgeTypes),
+      truncated,
+      seedMissing: !seed,
+    };
+  }
+
+  /** A file/symbol/schema-entity's upstream/downstream neighborhood via depends_on/imports/
+   *  calls (default) — bounded by the SAME depth/row constants PLNR-257's retrieval uses. */
+  async dependencyNeighborhood(
+    projectId: string,
+    input: { entityUri: string; edgeTypes?: string[]; maxDepth?: number; maxResults?: number },
+  ): Promise<DependencyNeighborhoodResult> {
+    await this.assertProjectId(projectId);
+    const edgeTypes = input.edgeTypes?.length ? input.edgeTypes : ['depends_on', 'imports', 'calls'];
+    const seed = this.resolveNodeByUri(input.entityUri);
+    const seedIds = seed ? [seed.nodeId] : [];
+    const down = this.rawTraverseGraph(seedIds, { edgeTypes, maxDepth: input.maxDepth, maxResults: input.maxResults, direction: 'downstream' });
+    const up = this.rawTraverseGraph(seedIds, { edgeTypes, maxDepth: input.maxDepth, maxResults: input.maxResults, direction: 'upstream' });
+    return dependencyNeighborhood(seed, down.rows, up.rows, this.edgeCoverageInputs(seed, edgeTypes, down.truncated || up.truncated));
+  }
+
+  /** Tests connected to an entity via tests/validated_by (either direction — no writer has
+   *  established a convention yet, see graph-queries.ts's module comment). */
+  async validatingTests(
+    projectId: string,
+    input: { entityUri: string; maxDepth?: number; maxResults?: number },
+  ): Promise<ValidatingTestsResult> {
+    await this.assertProjectId(projectId);
+    const edgeTypes = ['tests', 'validated_by'];
+    const seed = this.resolveNodeByUri(input.entityUri);
+    const seedIds = seed ? [seed.nodeId] : [];
+    const fwd = this.rawTraverseGraph(seedIds, { edgeTypes, maxDepth: input.maxDepth, maxResults: input.maxResults, direction: 'downstream' });
+    const bwd = this.rawTraverseGraph(seedIds, { edgeTypes, maxDepth: input.maxDepth, maxResults: input.maxResults, direction: 'upstream' });
+    return validatingTests(seed, fwd.rows, bwd.rows, this.edgeCoverageInputs(seed, edgeTypes, fwd.truncated || bwd.truncated));
+  }
+
+  /** Tasks implementing an entity (requirement, decision, procedure, …) via `implements`,
+   *  either direction merged. */
+  async implementingWork(
+    projectId: string,
+    input: { entityUri: string; maxDepth?: number; maxResults?: number },
+  ): Promise<ImplementingWorkResult> {
+    await this.assertProjectId(projectId);
+    const edgeTypes = ['implements'];
+    const seed = this.resolveNodeByUri(input.entityUri);
+    const seedIds = seed ? [seed.nodeId] : [];
+    const fwd = this.rawTraverseGraph(seedIds, { edgeTypes, maxDepth: input.maxDepth, maxResults: input.maxResults, direction: 'downstream' });
+    const bwd = this.rawTraverseGraph(seedIds, { edgeTypes, maxDepth: input.maxDepth, maxResults: input.maxResults, direction: 'upstream' });
+    return implementingWork(seed, fwd.rows, bwd.rows, this.edgeCoverageInputs(seed, edgeTypes, fwd.truncated || bwd.truncated));
+  }
+
+  /** A decision's implementing tasks, the code entities those tasks touch (`implements` then
+   *  `modifies` — composing existing edges rather than inventing an "affects" one), and any
+   *  decision that supersedes it. `decisionUri` is `noriq://decision/<memoryItemId>` (§18) —
+   *  its backing memory's evidence rides the answer per §1's contract. */
+  async decisionLineage(
+    projectId: string,
+    input: { decisionUri: string; maxDepth?: number; maxResults?: number },
+  ): Promise<DecisionLineageResult> {
+    await this.assertProjectId(projectId);
+    const implementsTypes = ['implements'];
+    const supersedesTypes = ['supersedes'];
+    const seed = this.resolveNodeByUri(input.decisionUri);
+    const seedIds = seed ? [seed.nodeId] : [];
+
+    const implFwd = this.rawTraverseGraph(seedIds, { edgeTypes: implementsTypes, maxDepth: 1, maxResults: input.maxResults, direction: 'downstream' });
+    const implBwd = this.rawTraverseGraph(seedIds, { edgeTypes: implementsTypes, maxDepth: 1, maxResults: input.maxResults, direction: 'upstream' });
+    const implementingTaskIds = [...new Set([...implFwd.rows, ...implBwd.rows].map((r) => r.nodeId))];
+    const affected = this.rawTraverseGraph(implementingTaskIds, { edgeTypes: ['modifies'], maxDepth: 1, maxResults: input.maxResults, direction: 'downstream' });
+
+    const superFwd = this.rawTraverseGraph(seedIds, { edgeTypes: supersedesTypes, maxDepth: input.maxDepth, maxResults: input.maxResults, direction: 'downstream' });
+    const superBwd = this.rawTraverseGraph(seedIds, { edgeTypes: supersedesTypes, maxDepth: input.maxDepth, maxResults: input.maxResults, direction: 'upstream' });
+
+    // §18: a decision node's uri IS noriq://decision/<memoryItemId> — the backing memory's
+    // evidence rides the graph claim, same contract PLNR-257's retrieval results carry.
+    let evidence: DecisionLineageResult['evidence'] = [];
+    const decisionIdMatch = /^noriq:\/\/decision\/(.+)$/.exec(input.decisionUri);
+    if (decisionIdMatch) {
+      const backing = await this.getMemoryItem(projectId, decisionIdMatch[1]!);
+      if (backing) evidence = backing.evidence.map((e) => ({ repositoryKey: e.repositoryKey, branch: e.branch, baseId: e.baseId, path: e.path, verificationState: e.verificationState }));
+    }
+
+    const truncated = implFwd.truncated || implBwd.truncated || affected.truncated || superFwd.truncated || superBwd.truncated;
+    return decisionLineage(
+      seed,
+      implFwd.rows,
+      implBwd.rows,
+      affected.rows,
+      superFwd.rows,
+      superBwd.rows,
+      evidence,
+      this.edgeCoverageInputs(seed, [...implementsTypes, 'modifies', ...supersedesTypes], truncated),
+    );
+  }
+
+  /** Impacted tests for a proposed set of changed entities (by stable URI) — an unresolved URI
+   *  (no matching node, e.g. a file never indexed) becomes an UNCERTAIN edge, never a silent
+   *  "no impact". */
+  async changeImpact(
+    projectId: string,
+    input: { entityUris: string[]; maxDepth?: number; maxResults?: number },
+  ): Promise<ChangeImpactResult> {
+    await this.assertProjectId(projectId);
+    const edgeTypes = ['tests', 'validated_by'];
+    const resolved: GraphEntityRef[] = [];
+    const unresolved: string[] = [];
+    for (const uri of input.entityUris) {
+      const node = this.resolveNodeByUri(uri);
+      if (node) resolved.push(node);
+      else unresolved.push(uri);
+    }
+    const seedIds = resolved.map((r) => r.nodeId);
+    const fwd = this.rawTraverseGraph(seedIds, { edgeTypes, maxDepth: input.maxDepth, maxResults: input.maxResults, direction: 'downstream' });
+    const bwd = this.rawTraverseGraph(seedIds, { edgeTypes, maxDepth: input.maxDepth, maxResults: input.maxResults, direction: 'upstream' });
+    return changeImpact(resolved, unresolved, fwd.rows, bwd.rows, {
+      codeGraphPopulated: this.isCodeGraphPopulated(),
+      edgeTypesWithNoWriter: this.edgeTypesWithNoWriter(edgeTypes),
+      truncated: fwd.truncated || bwd.truncated,
+      seedMissing: resolved.length === 0,
+    });
   }
 
   // ---------------------------------------------------------------------------

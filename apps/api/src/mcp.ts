@@ -259,7 +259,7 @@ const WRITE_IDEMPOTENT: ToolHints = { ...WRITE, idempotentHint: true };
 const TOOL_HINTS: Record<string, ToolHints> = {
   // reads
   get_briefing: READ, my_updates: READ, list_projects: READ, get_project: READ, list_groups: READ, list_agents: READ,
-  get_task: READ, search_tasks: READ, semantic_search: READ, search_project_memory: READ, tag_report: READ, next_claimable: READ, read_open_comments: READ, get_plans: READ, can_claim: READ,
+  get_task: READ, search_tasks: READ, semantic_search: READ, search_project_memory: READ, explain_project_area: READ, tag_report: READ, next_claimable: READ, read_open_comments: READ, get_plans: READ, can_claim: READ,
   list_docs: READ, get_doc: READ, update_doc: WRITE_IDEMPOTENT, list_templates: READ, get_plan_doc: READ, update_plan_doc: WRITE_IDEMPOTENT,
   check_locks: READ, list_locks: READ,
   // writes that are safe to repeat with the same args (renew/replace-in-place/insert-or-ignore)
@@ -2125,6 +2125,43 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       limit: z.number().int().min(1).max(RETRIEVAL_DEFAULTS.maxResultsCeiling).optional().describe(`Default ${RETRIEVAL_DEFAULTS.maxResults}`),
     },
     tool(async ({ projectId, ...rest }) => memoryStub(env, projectId).searchProjectMemory(projectId, rest)),
+  );
+
+  defineTool(
+    'explain_project_area',
+    'Explain a specific area of the project graph — dependency neighborhoods, validating tests, implementing work, decision lineage, and proposed-change impact — as bounded, addressable graph facts. This is NOT semantic search (use search_project_memory to find things by meaning); it answers "what is connected to THIS specific entity" once you already have its URI. Pick `focus`: "dependencies" (an entity\'s upstream/downstream neighborhood via depends_on/imports/calls, or your own `edgeTypes`) needs `entityUri`; "tests" (tests connected to an entity) needs `entityUri`; "implementers" (tasks implementing a requirement/decision/procedure) needs `entityUri`; "decision" (a decision\'s implementing tasks, the code its tasks touch, and any decision superseding it — plus its backing memory\'s evidence) needs `decisionUri` (noriq://decision/<memoryItemId>); "impact" (impacted tests for a proposed change) needs `entityUris` (the changed entities). EVERY response carries a REQUIRED `coverage` field — {complete, reasons[]} — because this graph is built up gradually: `code-graph-empty` means no file/symbol/test node exists yet (true on most projects today), `no-writer-yet` names edge types nothing has written, `row-limit-reached` means the bounded traversal was truncated. An empty result with `coverage.complete: false` means "this graph cannot answer that yet" — it is NEVER the same claim as "nothing is related", so do not present it that way.',
+    {
+      projectId: z.string(),
+      focus: z.enum(['dependencies', 'tests', 'implementers', 'decision', 'impact']).describe('Which primitive to run — see the tool description for what each needs'),
+      entityUri: z.string().optional().describe('Required for focus="dependencies"/"tests"/"implementers" — the stable entity URI to explain'),
+      decisionUri: z.string().optional().describe('Required for focus="decision" — noriq://decision/<memoryItemId>'),
+      entityUris: z.array(z.string()).optional().describe('Required for focus="impact" — the entity URIs a proposed change touches'),
+      edgeTypes: z.array(MemoryEdgeType).optional().describe('focus="dependencies" only: restrict to these edge types; default depends_on/imports/calls'),
+      maxDepth: z.number().int().min(1).max(RETRIEVAL_DEFAULTS.maxDepthCeiling).optional().describe(`Default ${RETRIEVAL_DEFAULTS.maxDepth}`),
+      maxResults: z.number().int().min(1).max(RETRIEVAL_DEFAULTS.maxGraphResultsCeiling).optional().describe(`Default ${RETRIEVAL_DEFAULTS.maxGraphResults}`),
+    },
+    tool(async ({ projectId, focus, entityUri, decisionUri, entityUris, edgeTypes, maxDepth, maxResults }) => {
+      const stub = memoryStub(env, projectId);
+      if (focus === 'dependencies') {
+        if (!entityUri) throw new Error('entityUri is required for focus="dependencies"');
+        return stub.dependencyNeighborhood(projectId, { entityUri, edgeTypes, maxDepth, maxResults });
+      }
+      if (focus === 'tests') {
+        if (!entityUri) throw new Error('entityUri is required for focus="tests"');
+        return stub.validatingTests(projectId, { entityUri, maxDepth, maxResults });
+      }
+      if (focus === 'implementers') {
+        if (!entityUri) throw new Error('entityUri is required for focus="implementers"');
+        return stub.implementingWork(projectId, { entityUri, maxDepth, maxResults });
+      }
+      if (focus === 'decision') {
+        if (!decisionUri) throw new Error('decisionUri is required for focus="decision"');
+        return stub.decisionLineage(projectId, { decisionUri, maxDepth, maxResults });
+      }
+      // focus === 'impact'
+      if (!entityUris?.length) throw new Error('entityUris is required for focus="impact"');
+      return stub.changeImpact(projectId, { entityUris, maxDepth, maxResults });
+    }),
   );
 
   // ---- git awareness (Phase 4) --------------------------------------------
