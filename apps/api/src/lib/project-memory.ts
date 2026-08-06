@@ -137,6 +137,19 @@ export interface ProjectMemoryStub {
     projectId: string,
     opts: { q: string; kinds?: Array<'memory' | 'episode'>; limit?: number },
   ): Promise<Array<{ kind: 'memory' | 'episode'; id: string; title: string; snippet: string; score: number; status?: string; authority?: number; validity?: string }>>;
+  /** PLNR-260: repository-index ingest — TRANSPORT only, in-memory bridge state (PLNR-261 adds
+   *  the durable staged-generation tables this will drive instead). */
+  beginIndexIngest(projectId: string, manifest: { generationId: string; projectId: string; repositoryKey: string; branch: string; baseId: string; indexerVersion: string; batchCount: number; fileCount: number; contentHash: string; deletions: string[]; createdAt: string }): Promise<{ ok: true }>;
+  ingestIndexBatch(projectId: string, batch: { generationId: string; batchNumber: number; batchHash: string }, rows: Array<Record<string, unknown>>): Promise<{ ok: true; deduped: boolean }>;
+  completeIndexIngest(projectId: string, generationId: string): Promise<{ ok: true; batchesReceived: number; rowCount: number }>;
+  abortIndexIngest(projectId: string, generationId: string): Promise<{ ok: true }>;
+  indexIngestStatus(projectId: string, generationId: string): Promise<{ status: 'unknown' | 'pending' | 'complete' | 'aborted'; batchesReceived: number; batchesExpected: number | null }>;
+  /** PLNR-260: episode ingest — endpoint only; real episode RECORD semantics are PLNR-263's. */
+  beginEpisodeIngest(projectId: string, manifest: { scopeId: string; projectId: string; batchCount: number }): Promise<{ ok: true }>;
+  ingestEpisodeBatch(projectId: string, scopeId: string, batchNumber: number, rows: Array<Record<string, unknown>>): Promise<{ ok: true; deduped: boolean }>;
+  completeEpisodeIngest(projectId: string, scopeId: string): Promise<{ ok: true; batchesReceived: number; rowCount: number }>;
+  abortEpisodeIngest(projectId: string, scopeId: string): Promise<{ ok: true }>;
+  episodeIngestStatus(projectId: string, scopeId: string): Promise<{ status: 'unknown' | 'pending' | 'complete' | 'aborted'; batchesReceived: number; batchesExpected: number | null }>;
 }
 
 /**

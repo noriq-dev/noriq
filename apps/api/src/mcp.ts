@@ -24,7 +24,7 @@ import { refuseSpecWrite, specWriteRefusalMessage } from './lib/spec-authority';
 import { search, searchBackend, reindexProject } from './search';
 import { nearDupeGroups } from './lib/tags';
 import { DOC_SKILL_MD } from './skill-docs';
-import { signUploadToken } from './lib/upload-token';
+import { signUploadToken, resolveUploadSecret } from './lib/upload-token';
 import { taskClaimability } from './lib/claimability';
 import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
 
@@ -1494,7 +1494,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     },
     tool(async ({ projectId, taskId, filename, contentType }) => {
       if (!env.FILES) throw new Error('attachments not configured on this instance — enable R2 and bind FILES');
-      const secret = env.ATTACHMENT_UPLOAD_SECRET ?? env.ADMIN_TOKEN;
+      const secret = resolveUploadSecret(env);
       if (!secret) throw new Error('upload URLs are not enabled — set ATTACHMENT_UPLOAD_SECRET (or ADMIN_TOKEN); use add_attachment for files ≤16 KB');
       const origin = env.PUBLIC_ORIGIN ?? opts.origin;
       if (!origin) throw new Error('cannot build an absolute upload URL — set PUBLIC_ORIGIN');
@@ -1506,6 +1506,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       const id = newId('att');
       const expMs = Date.now() + UPLOAD_TOKEN_TTL_MS;
       const token = await signUploadToken(secret, {
+        typ: 'attachment',
         aid: id, tid: task.id, pid: task.pid, fn: safeName, ct,
         agentId: agent.id, max: MAX_ATTACHMENT, exp: Math.floor(expMs / 1000),
       });

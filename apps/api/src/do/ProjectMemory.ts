@@ -11,6 +11,12 @@ import { validateMemoryScope, validateEvidenceRef, memoryContentHash, evidenceHa
 import { searchBackend, indexEntity, removeEntity } from '../search';
 import { codeSearchBackend, indexCodeEntity, removeCodeEntity, type CodeEntity } from '../memory/code-index';
 import {
+  beginIngestGeneration, applyIngestBatch, completeIngestGeneration, abortIngestGeneration, type IngestGenerationState,
+  beginIngestEpisode, applyIngestEpisodeBatch, completeIngestEpisode, abortIngestEpisode, type IngestEpisodeState,
+  type EpisodeUploadManifest,
+} from '../memory/ingest';
+import type { IndexGenerationManifest, IndexBatch } from '@noriq-dev/shared';
+import {
   applyMemoryFilters, rankCandidates, RETRIEVAL_DEFAULTS,
   type RetrievalHit, type RetrievalStage, type RankedHit,
 } from '../memory/retrieval';
@@ -646,6 +652,100 @@ export class ProjectMemory extends DurableObject<Env> {
     return rows.length;
   }
 
+  // ---------------------------------------------------------------------------
+  // Repository-index + episode ingest (PLNR-260) — TRANSPORT only. State here is deliberately
+  // in-memory (never ctx.storage): staged-generation semantics — real entity counts, content
+  // hashes, graph-reference validation, and atomic activation — are PLNR-261's, which replaces
+  // this bridge with durable staging tables without changing memory/ingest.ts's pure functions.
+  // Losing this state to a DO eviction mid-upload is equivalent to an abandoned upload — the
+  // Runner's own upload journal (RUN-221) is what makes that resumable, not durability here.
+  // ---------------------------------------------------------------------------
+  private ingestGenerations = new Map<string, IngestGenerationState>();
+  private ingestEpisodes = new Map<string, IngestEpisodeState>();
+
+  async beginIndexIngest(projectId: string, manifest: IndexGenerationManifest): Promise<{ ok: true }> {
+    await this.assertProjectId(projectId);
+    this.ingestGenerations.set(manifest.generationId, beginIngestGeneration(this.ingestGenerations.get(manifest.generationId), manifest));
+    return { ok: true };
+  }
+
+  async ingestIndexBatch(projectId: string, batch: IndexBatch, rows: Array<Record<string, unknown>>): Promise<{ ok: true; deduped: boolean }> {
+    await this.assertProjectId(projectId);
+    const state = this.ingestGenerations.get(batch.generationId);
+    if (!state) throw new Error(`no ingest in progress for generation ${batch.generationId} — call beginIndexIngest first`);
+    const { deduped } = applyIngestBatch(state, batch, rows);
+    return { ok: true, deduped };
+  }
+
+  async completeIndexIngest(projectId: string, generationId: string): Promise<{ ok: true; batchesReceived: number; rowCount: number }> {
+    await this.assertProjectId(projectId);
+    const state = this.ingestGenerations.get(generationId);
+    if (!state) throw new Error(`no ingest in progress for generation ${generationId}`);
+    completeIngestGeneration(state);
+    return { ok: true, batchesReceived: state.receivedBatches.size, rowCount: state.rowCount };
+  }
+
+  async abortIndexIngest(projectId: string, generationId: string): Promise<{ ok: true }> {
+    await this.assertProjectId(projectId);
+    const state = this.ingestGenerations.get(generationId);
+    if (state) abortIngestGeneration(state);
+    return { ok: true };
+  }
+
+  async indexIngestStatus(
+    projectId: string,
+    generationId: string,
+  ): Promise<{ status: 'unknown' | 'pending' | 'complete' | 'aborted'; batchesReceived: number; batchesExpected: number | null }> {
+    await this.assertProjectId(projectId);
+    const state = this.ingestGenerations.get(generationId);
+    if (!state) return { status: 'unknown', batchesReceived: 0, batchesExpected: null };
+    return { status: state.status, batchesReceived: state.receivedBatches.size, batchesExpected: state.manifest.batchCount };
+  }
+
+  async beginEpisodeIngest(projectId: string, manifest: EpisodeUploadManifest): Promise<{ ok: true }> {
+    await this.assertProjectId(projectId);
+    this.ingestEpisodes.set(manifest.scopeId, beginIngestEpisode(this.ingestEpisodes.get(manifest.scopeId), manifest));
+    return { ok: true };
+  }
+
+  async ingestEpisodeBatch(
+    projectId: string,
+    scopeId: string,
+    batchNumber: number,
+    rows: Array<Record<string, unknown>>,
+  ): Promise<{ ok: true; deduped: boolean }> {
+    await this.assertProjectId(projectId);
+    const state = this.ingestEpisodes.get(scopeId);
+    if (!state) throw new Error(`no episode ingest in progress for ${scopeId} — call beginEpisodeIngest first`);
+    const { deduped } = applyIngestEpisodeBatch(state, batchNumber, rows);
+    return { ok: true, deduped };
+  }
+
+  async completeEpisodeIngest(projectId: string, scopeId: string): Promise<{ ok: true; batchesReceived: number; rowCount: number }> {
+    await this.assertProjectId(projectId);
+    const state = this.ingestEpisodes.get(scopeId);
+    if (!state) throw new Error(`no episode ingest in progress for ${scopeId}`);
+    completeIngestEpisode(state);
+    return { ok: true, batchesReceived: state.receivedBatches.size, rowCount: state.rowCount };
+  }
+
+  async abortEpisodeIngest(projectId: string, scopeId: string): Promise<{ ok: true }> {
+    await this.assertProjectId(projectId);
+    const state = this.ingestEpisodes.get(scopeId);
+    if (state) abortIngestEpisode(state);
+    return { ok: true };
+  }
+
+  async episodeIngestStatus(
+    projectId: string,
+    scopeId: string,
+  ): Promise<{ status: 'unknown' | 'pending' | 'complete' | 'aborted'; batchesReceived: number; batchesExpected: number | null }> {
+    await this.assertProjectId(projectId);
+    const state = this.ingestEpisodes.get(scopeId);
+    if (!state) return { status: 'unknown', batchesReceived: 0, batchesExpected: null };
+    return { status: state.status, batchesReceived: state.receivedBatches.size, batchesExpected: state.manifest.batchCount };
+  }
+
   /**
    * Best-effort wipe of every row (PLNR-246), called fire-and-forget from
    * ProjectRoom.deleteProject once the D1 registry rows are already gone. Full
@@ -703,6 +803,8 @@ export class ProjectMemory extends DurableObject<Env> {
         }
         this.ctx.storage.sql.exec(`UPDATE _meta SET value = '0' WHERE key = 'has_prior_generation'`);
       });
+      this.ingestGenerations.clear();
+      this.ingestEpisodes.clear();
       steps.push({ step: 'store', ok: true, detail: 'rows and any generation debris cleared' });
     } catch (err) {
       steps.push({ step: 'store', ok: false, detail: String(err) });
@@ -716,7 +818,17 @@ export class ProjectMemory extends DurableObject<Env> {
     }
 
     steps.push({ step: 'vectors', ok: true, detail: 'no memory vector index exists yet (Phase 4) — nothing to delete' });
-    steps.push({ step: 'ingest-capabilities', ok: true, detail: 'no ingest capabilities exist yet (Phase 5) — nothing to revoke' });
+    // PLNR-260's capabilities are stateless HMAC tokens (§8) — there is no revocation list to
+    // clear; a token minted before erasure stays verifiable for the rest of its own short TTL
+    // (INGEST_TOKEN_TTL_SECONDS, ~15 min), scoped only to a project that no longer exists to
+    // accept its writes (assertProjectId above already refuses any RPC for it). In-flight
+    // upload STATE (this.ingestGenerations/ingestEpisodes) is real and is cleared in the 'store'
+    // step above — this step is honest about the token itself, not silent about the state.
+    steps.push({
+      step: 'ingest-capabilities',
+      ok: true,
+      detail: 'stateless HMAC capabilities cannot be revoked — bounded by their own short TTL; in-flight upload state was cleared in the store step',
+    });
 
     return { ok: steps.every((s) => s.ok), steps };
   }

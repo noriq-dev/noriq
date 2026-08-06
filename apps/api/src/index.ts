@@ -15,7 +15,7 @@ import type { ExecutionSpecInput, RunStatus } from '@noriq-dev/shared';
 import { readExecutionSpec } from './lib/execution-spec';
 import { search, searchBackend, reindexProject, ALL_KINDS, type SearchKind } from './search';
 import { answerQuestion, generationClient } from './ask';
-import { verifyUploadToken } from './lib/upload-token';
+import { verifyUploadToken, resolveUploadSecret, signIngestToken, verifyIngestToken, type IngestClaims } from './lib/upload-token';
 import { USER_PROJECT_WHERE, taskWireStatus, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
 import { advertisedWorkflowNames } from './lib/workflows';
 import type { Actor, RunView } from './do/ProjectRoom';
@@ -28,8 +28,9 @@ import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
 import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
 import { z } from 'zod';
-import { listProjectRepositories, listRepositoryCheckouts, type ProjectMemoryStub } from './lib/project-memory';
-import { AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget, isTerminalRunStatus, normalizeProjectKey } from '@noriq-dev/shared';
+import { listProjectRepositories, listRepositoryCheckouts, resolveRepositoryByKey, type ProjectMemoryStub } from './lib/project-memory';
+import { readBoundedBody, verifyBatchChecksum, decodeBatchRows, MAX_INGEST_BATCH_BYTES, INGEST_TOKEN_TTL_SECONDS } from './memory/ingest';
+import { AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget, isTerminalRunStatus, normalizeProjectKey, IndexGenerationManifest } from '@noriq-dev/shared';
 
 export { ProjectRoom } from './do/ProjectRoom';
 export { AgentSession } from './do/AgentSession';
@@ -2678,7 +2679,7 @@ app.post('/api/tasks/:tid/attachments', userAuth, async (c) => {
 // route above, including the PLNR-98 real-size check (Content-Length is client-controlled).
 app.put('/api/attachments/upload/:token', async (c) => {
   if (!c.env.FILES) return c.json({ error: 'attachments not configured' }, 503);
-  const secret = c.env.ATTACHMENT_UPLOAD_SECRET ?? c.env.ADMIN_TOKEN;
+  const secret = resolveUploadSecret(c.env);
   if (!secret) return c.json({ error: 'uploads not enabled' }, 503);
   const claims = await verifyUploadToken(secret, c.req.param('token')!, Math.floor(Date.now() / 1000));
   if (!claims) return c.json({ error: 'invalid or expired upload token' }, 401);
@@ -2709,6 +2710,153 @@ app.put('/api/attachments/upload/:token', async (c) => {
     await room(c.env, claims.pid).noteAttachment(claims.pid, { kind: 'agent', id: claims.agentId, name: nm?.name ?? 'agent' }, claims.tid, claims.fn, claims.aid);
   }
   return c.json({ id: claims.aid, filename: claims.fn, size });
+});
+
+// --- Repository-index + episode ingest (PLNR-260, §8): short-lived, single-purpose capability
+// tokens minted for a RUNNER, then five flat token-authenticated routes — no separate agentAuth
+// on those five, same posture as the attachment upload PUT above: the token IS the
+// authorization. RunnerHub carries none of this (no bulk frame added to packages/shared/src/ws.ts)
+// — it is HTTP-only, mirroring memory/backup.ts's bounded-chunk, checksum-before-parse, and
+// manifest-last conventions. Staged-generation validation (real entity counts/hashes, graph
+// references, atomic activation) is PLNR-261's; this is transport + authorization only.
+const MintIngestCapabilityBody = z.object({
+  projectId: z.string(),
+  repositoryKey: z.string(),
+  purpose: z.enum(['index', 'episode']),
+  scopeId: z.string().min(1), // an IndexGenerationManifest.generationId (index) or a caller-chosen episode upload id
+  runnerId: z.string(),
+  maxBytes: z.number().int().positive().max(MAX_INGEST_BATCH_BYTES).optional(),
+});
+
+app.post('/api/runner-ingest/capability', agentAuth, async (c) => {
+  const parsed = MintIngestCapabilityBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid capability request', detail: parsed.error.issues }, 400);
+  const b = parsed.data;
+  const conn = c.var.connection!;
+  // Same two gates as POST /api/runs/:runId/agent and GET /api/runs/:runId/park: the runner must
+  // be owned by this connection's user, and the connection's TOKEN must be authorized for the
+  // project — an unscoped run-agent token would otherwise treat this as reaching every project.
+  const owned = await c.env.DB.prepare('SELECT id FROM runners WHERE id = ? AND owner_user_id = ?').bind(b.runnerId, conn.userId).first<{ id: string }>();
+  if (!owned) return c.json({ error: 'runner not found' }, 404);
+  if (!(await tokenCanReachProject(c.env, conn.tokenId, b.projectId))) {
+    return c.json({ error: 'runner is outside this connection’s authorized projects' }, 403);
+  }
+  // The repository key must resolve to a canonical repository IN THIS project (PLNR-259) —
+  // refused, without disclosing whether the key exists elsewhere, rather than minting a
+  // capability scoped to nothing.
+  const repo = await resolveRepositoryByKey(c.env, b.projectId, b.repositoryKey);
+  if (!repo) return c.json({ error: `no repository registered for key "${b.repositoryKey}" in this project` }, 404);
+  const secret = resolveUploadSecret(c.env);
+  if (!secret) return c.json({ error: 'ingest capabilities are not enabled — set ATTACHMENT_UPLOAD_SECRET (or ADMIN_TOKEN)' }, 503);
+  const max = Math.min(b.maxBytes ?? MAX_INGEST_BATCH_BYTES, MAX_INGEST_BATCH_BYTES);
+  const expSec = Math.floor(Date.now() / 1000) + INGEST_TOKEN_TTL_SECONDS;
+  const token = await signIngestToken(secret, {
+    typ: 'ingest', pid: b.projectId, repositoryKey: b.repositoryKey, purpose: b.purpose, scopeId: b.scopeId, runnerId: b.runnerId, max, exp: expSec,
+  });
+  return c.json({ token, maxBytes: max, expiresAt: new Date(expSec * 1000).toISOString() });
+});
+
+/** Verify an ingest capability, or a Response to return as-is on failure. Every one of the five
+ *  routes below calls this first — the token is the whole authorization; there is no cookie or
+ *  bearer on these routes. */
+async function requireIngestCap(c: Context<AppContext>, token: string): Promise<IngestClaims | Response> {
+  const secret = resolveUploadSecret(c.env);
+  if (!secret) return c.json({ error: 'ingest not enabled' }, 503);
+  const claims = await verifyIngestToken(secret, token, Math.floor(Date.now() / 1000));
+  if (!claims) return c.json({ error: 'invalid or expired ingest token' }, 401);
+  return claims;
+}
+
+app.post('/api/memory-ingest/:token/begin', async (c) => {
+  const claims = await requireIngestCap(c, c.req.param('token')!);
+  if (claims instanceof Response) return claims;
+  const stub = memoryStub(c.env, claims.pid);
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}) as Record<string, unknown>);
+  try {
+    if (claims.purpose === 'index') {
+      const manifest = IndexGenerationManifest.parse({
+        ...body, generationId: claims.scopeId, projectId: claims.pid, repositoryKey: claims.repositoryKey,
+      });
+      await stub.beginIndexIngest(claims.pid, manifest);
+    } else {
+      const batchCount = typeof body.batchCount === 'number' ? body.batchCount : 1;
+      await stub.beginEpisodeIngest(claims.pid, { scopeId: claims.scopeId, projectId: claims.pid, batchCount });
+    }
+  } catch (err) {
+    return c.json({ error: String(err) }, 409);
+  }
+  return c.json({ ok: true });
+});
+
+app.put('/api/memory-ingest/:token/batch/:batchNumber', async (c) => {
+  const claims = await requireIngestCap(c, c.req.param('token')!);
+  if (claims instanceof Response) return claims;
+  const batchNumber = Number(c.req.param('batchNumber'));
+  if (!Number.isInteger(batchNumber) || batchNumber < 0) return c.json({ error: 'batchNumber must be a non-negative integer' }, 400);
+  const batchHash = c.req.header('X-Batch-Hash');
+  if (!batchHash) return c.json({ error: 'X-Batch-Hash header is required' }, 400);
+  // Early reject on an honest oversized Content-Length; the REAL bound is enforced below by
+  // readBoundedBody, which never buffers past claims.max regardless of what the header claims
+  // (PLNR-98's streaming precedent — a chunked body has no Content-Length at all).
+  if (Number(c.req.header('Content-Length') ?? '0') > claims.max) {
+    return c.json({ error: `batch exceeds ${claims.max} bytes` }, 413);
+  }
+  let bytes: Uint8Array;
+  try {
+    bytes = await readBoundedBody(c.req.raw.body, claims.max);
+    await verifyBatchChecksum(bytes, batchHash);
+  } catch (err) {
+    return c.json({ error: String(err) }, 413);
+  }
+  let rows: Array<Record<string, unknown>>;
+  try {
+    rows = await decodeBatchRows(bytes);
+  } catch (err) {
+    return c.json({ error: `malformed batch: ${String(err)}` }, 400);
+  }
+  const stub = memoryStub(c.env, claims.pid);
+  try {
+    const result = claims.purpose === 'index'
+      ? await stub.ingestIndexBatch(claims.pid, { generationId: claims.scopeId, batchNumber, batchHash }, rows)
+      : await stub.ingestEpisodeBatch(claims.pid, claims.scopeId, batchNumber, rows);
+    return c.json(result);
+  } catch (err) {
+    return c.json({ error: String(err) }, 409);
+  }
+});
+
+app.post('/api/memory-ingest/:token/complete', async (c) => {
+  const claims = await requireIngestCap(c, c.req.param('token')!);
+  if (claims instanceof Response) return claims;
+  const stub = memoryStub(c.env, claims.pid);
+  try {
+    const result = claims.purpose === 'index'
+      ? await stub.completeIndexIngest(claims.pid, claims.scopeId)
+      : await stub.completeEpisodeIngest(claims.pid, claims.scopeId);
+    return c.json(result);
+  } catch (err) {
+    return c.json({ error: String(err) }, 409);
+  }
+});
+
+app.post('/api/memory-ingest/:token/abort', async (c) => {
+  const claims = await requireIngestCap(c, c.req.param('token')!);
+  if (claims instanceof Response) return claims;
+  const stub = memoryStub(c.env, claims.pid);
+  const result = claims.purpose === 'index'
+    ? await stub.abortIndexIngest(claims.pid, claims.scopeId)
+    : await stub.abortEpisodeIngest(claims.pid, claims.scopeId);
+  return c.json(result);
+});
+
+app.get('/api/memory-ingest/:token/status', async (c) => {
+  const claims = await requireIngestCap(c, c.req.param('token')!);
+  if (claims instanceof Response) return claims;
+  const stub = memoryStub(c.env, claims.pid);
+  const result = claims.purpose === 'index'
+    ? await stub.indexIngestStatus(claims.pid, claims.scopeId)
+    : await stub.episodeIngestStatus(claims.pid, claims.scopeId);
+  return c.json(result);
 });
 
 app.get('/api/attachments/:aid', userAuth, async (c) => {
