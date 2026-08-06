@@ -894,26 +894,58 @@ export class ProjectMemory extends DurableObject<Env> {
    *  separate agent tool). 0001's `feedback.vote` is CHECK-constrained to exactly these two
    *  values; PLNR-254 widens the vocabulary (useful/incorrect/outdated/harmful/unverifiable)
    *  with its own additive migration — this RPC does not anticipate that shape. */
+  /** Feedback kind -> vote, when a caller supplies `kind` but not `vote` (§11/PLNR-254): the
+   *  richer vocabulary still lands in the plain up/down bucket every existing reader (and the
+   *  0001-era `vote` NOT NULL constraint) expects, without forcing every caller to state both. */
+  private static readonly FEEDBACK_KIND_VOTE: Record<string, 'up' | 'down'> = {
+    useful: 'up',
+    incorrect: 'down',
+    outdated: 'down',
+    harmful: 'down',
+    unverifiable: 'down',
+  };
+
+  /**
+   * Record feedback on a memory (§11 — an operation on the memory surface, never a separate
+   * agent tool). Influences ranking/presentation ONLY: it never touches the target's statement,
+   * evidence, or authority — a correction is a NEW version (recordMemory + supersedesMemoryId),
+   * not an edit here. `kind` (PLNR-254) carries the five-value vocabulary useful / incorrect /
+   * outdated / harmful / unverifiable; `vote` (0001) stays the plain up/down signal every
+   * existing caller already sends. At least one of the two is required; the other is derived
+   * when omitted.
+   */
   async recordFeedback(
     projectId: string,
-    input: { operationId?: string; memoryItemId: string; vote: 'up' | 'down'; reason?: string | null; actor: { kind: string; id: string | null } },
+    input: {
+      operationId?: string;
+      memoryItemId: string;
+      vote?: 'up' | 'down';
+      kind?: 'useful' | 'incorrect' | 'outdated' | 'harmful' | 'unverifiable';
+      reason?: string | null;
+      actor: { kind: string; id: string | null };
+    },
   ): Promise<{ feedbackId: string; operationId: string; deduped: boolean }> {
     await this.assertProjectId(projectId);
     if (input.operationId) {
       const existing = this.lookupAppliedOperation(input.operationId);
       if (existing) return { feedbackId: (JSON.parse(existing.result) as { feedbackId: string }).feedbackId, operationId: input.operationId, deduped: true };
     }
+    if (!input.vote && !input.kind) throw new Error('recordFeedback requires vote and/or kind');
+    const vote = input.vote ?? ProjectMemory.FEEDBACK_KIND_VOTE[input.kind!]!;
+    const kind = input.kind ?? null;
+
     const operationId = input.operationId ?? newId('op');
     const feedbackId = newId('fbk');
     const now = nowIso();
     this.ctx.storage.transactionSync(() => {
       if (this._forceWriteFailure) throw new Error('injected write failure (test)');
       this.ctx.storage.sql.exec(
-        `INSERT INTO feedback (id, memory_item_id, actor_id, vote, reason, created_at) VALUES (?1,?2,?3,?4,?5,?6)`,
+        `INSERT INTO feedback (id, memory_item_id, actor_id, vote, kind, reason, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)`,
         feedbackId,
         input.memoryItemId,
         input.actor.id ?? 'system',
-        input.vote,
+        vote,
+        kind,
         input.reason ?? null,
         now,
       );
@@ -922,7 +954,7 @@ export class ProjectMemory extends DurableObject<Env> {
         newId('obx'),
         operationId,
         feedbackId,
-        JSON.stringify({ operationId, entityType: 'feedback', memoryItemId: input.memoryItemId, vote: input.vote }),
+        JSON.stringify({ operationId, entityType: 'feedback', memoryItemId: input.memoryItemId, vote, kind }),
         now,
       );
       this.ctx.storage.sql.exec(`UPDATE memory_revision SET value = value + 1 WHERE id = 0`);
@@ -936,6 +968,113 @@ export class ProjectMemory extends DurableObject<Env> {
     });
     this.ctx.storage.setAlarm(Date.now()).catch(() => {});
     return { feedbackId, operationId, deduped: false };
+  }
+
+  /**
+   * Transition a memory's own presentation validity (§15) — 'active' | 'stale' | 'invalid'.
+   * Deliberately separate from `evidence.verification_state` (per-citation freshness, 0001):
+   * this is the memory's OWN state, and setting it never touches any evidence row's own value.
+   * Recorded as a state change alongside canonical history, never a deletion — the memory stays
+   * fully readable at every validity, exactly like a superseded or rejected one.
+   */
+  async transitionMemoryValidity(
+    projectId: string,
+    input: { memoryItemId: string; validity: 'active' | 'stale' | 'invalid'; reason?: string | null; actor: { kind: string; id: string | null } },
+  ): Promise<{ ok: true }> {
+    await this.assertProjectId(projectId);
+    const row = this.loadMemoryRow(input.memoryItemId);
+    if (!row) throw new Error(`memory item ${input.memoryItemId} not found`);
+    const operationId = newId('op');
+    const now = nowIso();
+    this.ctx.storage.transactionSync(() => {
+      if (this._forceWriteFailure) throw new Error('injected write failure (test)');
+      this.ctx.storage.sql.exec(`UPDATE memory_items SET validity = ?2 WHERE id = ?1`, input.memoryItemId, input.validity);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO outbox (id, operation_id, verb, subject_type, subject_id, payload, created_at) VALUES (?1,?2,'memory.changed','memory',?3,?4,?5)`,
+        newId('obx'),
+        operationId,
+        input.memoryItemId,
+        JSON.stringify({ operationId, entityType: 'validity_transition', memoryItemId: input.memoryItemId, validity: input.validity, reason: input.reason ?? null }),
+        now,
+      );
+      this.ctx.storage.sql.exec(`UPDATE memory_revision SET value = value + 1 WHERE id = 0`);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO applied_operations (operation_id, applied_at, subject_type, subject_id, result) VALUES (?1,?2,'validity_transition',?3,'{}')`,
+        operationId,
+        now,
+        input.memoryItemId,
+      );
+    });
+    this.ctx.storage.setAlarm(Date.now()).catch(() => {});
+    return { ok: true };
+  }
+
+  /**
+   * Bounded retention for unused low-authority hypotheses (§18/PLNR-254). A candidate is
+   * decayed only when ALL of: authority below `authorityCeiling`, recorded before the cutoff,
+   * no feedback of any kind has ever been recorded on it (feedback IS usage — a memory somebody
+   * reacted to is not "unused"), it is not part of any authority-transition history (never
+   * approved, rejected, or merge-promoted, and never itself the RESULT of one), and nothing
+   * supersedes it (a memory another version links back to is history, not a cache entry).
+   * Unlike supersession/rejection, decay actually DELETES the row — recoverable only by
+   * restoring a pre-decay snapshot (PLNR-248/249), which is what "reversible from backup" means
+   * here, not an in-store undo. One compact outbox audit event covers the whole run; no memory
+   * body rides it. Safe to call repeatedly: a project with nothing left to decay is a no-op.
+   *
+   * NOTE on "unused": no retrieval/usage-counter infrastructure exists yet (that is Phase 4's
+   * retrieval work) — absence of feedback plus age is the only honest signal available today.
+   * A real usage counter can replace or narrow this once retrieval exists.
+   */
+  async decayLowAuthorityMemories(
+    projectId: string,
+    input: { maxAgeMs: number; authorityCeiling: number },
+  ): Promise<{ decayed: string[] }> {
+    await this.assertProjectId(projectId);
+    const cutoff = new Date(Date.now() - input.maxAgeMs).toISOString();
+    const candidates = this.ctx.storage.sql
+      .exec<{ id: string }>(
+        `SELECT id FROM memory_items m
+         WHERE authority < ?1 AND recorded_at < ?2
+           AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.memory_item_id = m.id)
+           AND NOT EXISTS (SELECT 1 FROM memory_items m2 WHERE m2.supersedes_memory_id = m.id)
+           AND NOT EXISTS (
+             SELECT 1 FROM memory_authority_transitions t
+             WHERE t.memory_item_id = m.id OR t.resulting_memory_id = m.id
+           )`,
+        input.authorityCeiling,
+        cutoff,
+      )
+      .toArray();
+    if (candidates.length === 0) return { decayed: [] };
+
+    const decayed = candidates.map((c) => c.id);
+    const operationId = newId('op');
+    const now = nowIso();
+    this.ctx.storage.transactionSync(() => {
+      if (this._forceWriteFailure) throw new Error('injected write failure (test)');
+      for (const id of decayed) {
+        this.ctx.storage.sql.exec(`DELETE FROM feedback WHERE memory_item_id = ?1`, id);
+        this.ctx.storage.sql.exec(`DELETE FROM evidence WHERE memory_item_id = ?1`, id);
+        this.ctx.storage.sql.exec(`DELETE FROM memory_items WHERE id = ?1`, id);
+      }
+      this.ctx.storage.sql.exec(
+        `INSERT INTO outbox (id, operation_id, verb, subject_type, subject_id, payload, created_at) VALUES (?1,?2,'memory.changed','memory',?3,?4,?5)`,
+        newId('obx'),
+        operationId,
+        projectId,
+        JSON.stringify({ operationId, entityType: 'decay', count: decayed.length, decayedIds: decayed }),
+        now,
+      );
+      this.ctx.storage.sql.exec(`UPDATE memory_revision SET value = value + 1 WHERE id = 0`);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO applied_operations (operation_id, applied_at, subject_type, subject_id, result) VALUES (?1,?2,'decay',?3,'{}')`,
+        operationId,
+        now,
+        projectId,
+      );
+    });
+    this.ctx.storage.setAlarm(Date.now()).catch(() => {});
+    return { decayed };
   }
 
   /** A memory item in full — statement, authority, scope, and its evidence — exactly as
@@ -1477,5 +1616,13 @@ export class ProjectMemory extends DurableObject<Env> {
   async _setMetaForTest(projectId: string, key: string, value: string): Promise<void> {
     await this.assertProjectId(projectId);
     this.ctx.storage.sql.exec(`UPDATE _meta SET value = ?1 WHERE key = ?2`, value, key);
+  }
+
+  /** Test-only: backdate a memory item's `recorded_at` — so decay-age eligibility (PLNR-254)
+   *  can be tested without waiting out the real retention window. Same reason as
+   *  `_setMetaForTest`/`_seedStagedIndexGeneration`'s custom `createdAt`. */
+  async _setMemoryRecordedAtForTest(projectId: string, memoryId: string, recordedAt: string): Promise<void> {
+    await this.assertProjectId(projectId);
+    this.ctx.storage.sql.exec(`UPDATE memory_items SET recorded_at = ?1 WHERE id = ?2`, recordedAt, memoryId);
   }
 }

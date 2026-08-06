@@ -71,7 +71,7 @@ describe('projectMemory() routing — authorizes before routing, never the other
     const { userId, projectId } = await newOwnedProject('pm-route-owner@example.com', 'PMROUTE1');
     const stub = await projectMemory(appEnv, userId, projectId);
     const h = await stub.health(projectId);
-    expect(h.schemaVersion).toBe(3);
+    expect(h.schemaVersion).toBe(4);
   });
 
   it('refuses a user who cannot access the project — a registry row grants nothing by itself', async () => {

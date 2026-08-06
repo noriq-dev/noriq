@@ -1,0 +1,15 @@
+-- ProjectMemory schema v4 (PLNR-254) — the five-kind feedback vocabulary. Never edit
+-- 0001/0002/0003; additive only.
+--
+-- 0001's `feedback.vote` is CHECK (vote IN ('up','down')) and cannot express useful / incorrect
+-- / outdated / harmful / unverifiable. Widened ADDITIVELY: a nullable `kind` column carries the
+-- richer vocabulary when present; `vote` stays required (NOT NULL, unchanged) so every existing
+-- row and caller keeps working — the write RPC derives a sensible vote from `kind` when only
+-- `kind` is given (useful -> up; incorrect/outdated/harmful/unverifiable -> down), rather than
+-- forcing every caller to supply both.
+--
+-- Memory-level validity (stale/invalid) already has its column — memory_items.validity, added in
+-- 0002 for exactly this purpose. This migration adds nothing further for it; PLNR-254's
+-- transitionMemoryValidity RPC just starts writing to a column that has been sitting ready since
+-- Phase 3's first write-API task.
+ALTER TABLE feedback ADD COLUMN kind TEXT CHECK (kind IS NULL OR kind IN ('useful', 'incorrect', 'outdated', 'harmful', 'unverifiable'));

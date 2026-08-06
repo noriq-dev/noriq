@@ -21,6 +21,12 @@ export const RETAINED_GENERATION_MAX_AGE_MS = 7 * 24 * 3600 * 1000;
 /** Visibility thresholds only (§18) — nothing here refuses a write at either line. */
 export const DB_SIZE_WARN_BYTES = 500 * 1024 * 1024;
 export const DB_SIZE_CRITICAL_BYTES = 1024 * 1024 * 1024;
+/** PLNR-254: an authority-1/2 hypothesis with no feedback and no place in any approval/merge/
+ *  supersession history is decay-eligible once it is this old. Never touches authority 3+. */
+export const MEMORY_HYPOTHESIS_DECAY_MAX_AGE_MS = 30 * 24 * 3600 * 1000;
+/** Decay never reaches authority 3 ("repeated successful observation") or above — only bare
+ *  hypotheses and single-agent observations are cache-like enough to prune. */
+export const MEMORY_HYPOTHESIS_DECAY_AUTHORITY_CEILING = 3;
 
 export function sizeStatus(databaseSize: number): 'ok' | 'warn' | 'critical' {
   if (databaseSize >= DB_SIZE_CRITICAL_BYTES) return 'critical';
@@ -122,24 +128,30 @@ export interface ProjectCleanupResult {
   prunedStagedGenerations: number;
   prunedRetainedGeneration: boolean;
   prunedBackupGenerations: number;
+  decayedMemories: number;
 }
 
 /** Per-project debris cleanup for every project with a memory registry row: abandoned staged
- *  index generations, an expired retained restore generation, and backups beyond the
- *  retention count. Also refreshes the visible size status in the D1 registry — this sweep is
- *  the natural place for it: a periodic pass over every registered project, not an extra write
- *  on every health() read. Each project is independent — one failing never blocks the rest. */
+ *  index generations, an expired retained restore generation, backups beyond the retention
+ *  count, and (PLNR-254) unused low-authority memory hypotheses past their decay age. Also
+ *  refreshes the visible size status in the D1 registry — this sweep is the natural place for
+ *  it: a periodic pass over every registered project, not an extra write on every health()
+ *  read. Each project is independent — one failing never blocks the rest. */
 export async function sweepProjectDebris(env: Env): Promise<ProjectCleanupResult[]> {
   const { results } = await env.DB.prepare('SELECT project_id FROM project_memory_registry').all<{ project_id: string }>();
   const outcomes: ProjectCleanupResult[] = [];
   for (const { project_id: projectId } of results) {
     const stub = env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId));
-    const [prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations] = await Promise.all([
+    const [prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations, decayedMemories] = await Promise.all([
       stub.pruneAbandonedStagedGenerations(projectId, STAGED_GENERATION_MAX_AGE_MS).catch(() => 0),
       stub.pruneRetainedGenerationIfExpired(projectId, RETAINED_GENERATION_MAX_AGE_MS).catch(() => false),
       pruneBackupRetention(env, projectId).catch(() => 0),
+      stub
+        .decayLowAuthorityMemories(projectId, { maxAgeMs: MEMORY_HYPOTHESIS_DECAY_MAX_AGE_MS, authorityCeiling: MEMORY_HYPOTHESIS_DECAY_AUTHORITY_CEILING })
+        .then((r) => r.decayed.length)
+        .catch(() => 0),
     ]);
-    outcomes.push({ projectId, prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations });
+    outcomes.push({ projectId, prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations, decayedMemories });
     await stub
       .health(projectId)
       .then((h) =>
