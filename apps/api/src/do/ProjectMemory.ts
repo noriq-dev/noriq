@@ -81,9 +81,17 @@ export interface ProjectMemoryHealth {
  * this, exactly like `recordEpisodeForRun` does), and `selfSummary`/`actor` are the two fields
  * only a daemon upload or an agent can supply. `taskTitle` is a label hint for the task node,
  * never persisted as its own column.
+ *
+ * `sitting` (correction, migration 0075/0007): an episode's identity is (run_id, sitting), NOT
+ * run_id alone. `ProjectRoom.reopenRun` reuses one run id across multiple sittings (RUN-182) —
+ * without this, a reopened run's terminal transition would upsert straight over the failed
+ * sitting's episode, destroying evidence §14 requires stay retrievable. Always the run's OWN
+ * `runs.sitting` value, resolved by the caller the same way the other identity fields are —
+ * never trusted from an uploaded payload.
  */
 interface RecordEpisodeInput {
   runId: string;
+  sitting: number;
   agentId: string | null;
   runKind: string;
   outcome: string;
@@ -1107,10 +1115,13 @@ export class ProjectMemory extends DurableObject<Env> {
   }
 
   /**
-   * The canonical episode writer (PLNR-263, §14). ONE episode per run: UPSERTs on `run_id`
-   * (0006's unique index), which is what makes duplicate delivery idempotent without an
-   * operation-id ledger lookup — a re-recorded skeleton (a replay, or the same run settling
-   * twice through two different callers) just overwrites the same row.
+   * The canonical episode writer (PLNR-263, §14). ONE episode per (run, sitting): UPSERTs on
+   * `(run_id, sitting)` (0007's unique index — corrected from 0006's run_id-only index, which
+   * let `ProjectRoom.reopenRun`'s second sitting of a build overwrite the first sitting's
+   * episode; RUN-182's reopen reuses one run id across sittings, it does not mint a new run),
+   * which is what makes duplicate delivery idempotent without an operation-id ledger lookup — a
+   * re-recorded skeleton (a replay, or the same sitting settling twice through two different
+   * callers) just overwrites the same row, while a NEW sitting gets its own.
    *
    * Skeleton fields always win: every column below except `body.selfSummary` is set from THIS
    * call's input, never merged with a prior write. `selfSummary` is the one exception (§14) — a
@@ -1152,11 +1163,16 @@ export class ProjectMemory extends DurableObject<Env> {
 
     // Read BEFORE building the new body — the one piece of "existing" state this write can
     // depend on, per the merge rule above: the STABLE id (a PK must never change across an
-    // upsert) and the prior self-summary to preserve. A plain read needs no transactionSync
-    // (nothing else can run inside this DO concurrently); the transactionSync below is for the
-    // WRITE.
+    // upsert) and the prior self-summary to preserve. Keyed on (run_id, sitting) — a DIFFERENT
+    // sitting of the same run must find no existing row here, which is exactly what makes it a
+    // fresh episode rather than an overwrite of an earlier sitting's. A plain read needs no
+    // transactionSync (nothing else can run inside this DO concurrently); the transactionSync
+    // below is for the WRITE.
     const existingRow = this.ctx.storage.sql
-      .exec<{ id: string; body: string; created_at: string }>(`SELECT id, body, created_at FROM episodes WHERE run_id = ?1`, input.runId)
+      .exec<{ id: string; body: string; created_at: string }>(
+        `SELECT id, body, created_at FROM episodes WHERE run_id = ?1 AND sitting = ?2`,
+        input.runId, input.sitting,
+      )
       .toArray()[0];
     let existingSelfSummary: unknown = null;
     if (existingRow) {
@@ -1210,23 +1226,26 @@ export class ProjectMemory extends DurableObject<Env> {
     let edgesWritten = 0;
     this.ctx.storage.transactionSync(() => {
       if (this._forceWriteFailure) throw new Error('injected write failure (test)');
-      // `episodeId` (from `existingRow.id`, when present) is ALSO what conflicts on `run_id`
-      // below — so on an update this re-supplies the SAME id the row already has, never a
-      // fresh one; on a first write it is the only id anyone has ever assigned. Either way the
-      // `id` column itself is never in the UPDATE SET list, matching writeNode/writeEdge's own
-      // "never move a stable id" convention.
+      // `episodeId` (from `existingRow.id`, when present) is ALSO what conflicts on
+      // `(run_id, sitting)` below — so on an update this re-supplies the SAME id the row already
+      // has, never a fresh one; on a first write of this sitting it is the only id anyone has
+      // ever assigned. Either way the `id` column itself is never in the UPDATE SET list,
+      // matching writeNode/writeEdge's own "never move a stable id" convention. A DIFFERENT
+      // sitting of the same run conflicts on neither `id` (a fresh `newId('epi')`, since
+      // `existingRow` above found nothing for THIS sitting) nor `run_id` alone (0007 dropped that
+      // unique index) — it inserts a brand-new row.
       this.ctx.storage.sql.exec(
         `INSERT INTO episodes
-           (id, run_id, task_id, repository_key, base_id, landing_outcome, review_rounds, cost_usd,
+           (id, run_id, sitting, task_id, repository_key, base_id, landing_outcome, review_rounds, cost_usd,
             acceptance_coverage, body, created_at, agent_id, run_kind, outcome, started_at, finished_at, content_hash)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
-         ON CONFLICT (run_id) DO UPDATE SET
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+         ON CONFLICT (run_id, sitting) DO UPDATE SET
            task_id = excluded.task_id, repository_key = excluded.repository_key, base_id = excluded.base_id,
            landing_outcome = excluded.landing_outcome, review_rounds = excluded.review_rounds,
            cost_usd = excluded.cost_usd, acceptance_coverage = excluded.acceptance_coverage, body = excluded.body,
            agent_id = excluded.agent_id, run_kind = excluded.run_kind, outcome = excluded.outcome,
            started_at = excluded.started_at, finished_at = excluded.finished_at, content_hash = excluded.content_hash`,
-        episodeId, input.runId, input.taskId, input.repositoryKey, input.baseId, input.landingOutcome,
+        episodeId, input.runId, input.sitting, input.taskId, input.repositoryKey, input.baseId, input.landingOutcome,
         input.reviewRounds, input.costUSD, input.acceptanceCoverage, finalBody, createdAt,
         input.agentId, input.runKind, input.outcome, input.startedAt, input.finishedAt, contentHash,
       );
@@ -1349,9 +1368,13 @@ export class ProjectMemory extends DurableObject<Env> {
         skipped++;
         continue;
       }
-      const runRow = await this.env.DB.prepare(`SELECT agent_id, kind, exit, started_at FROM runs WHERE id = ? AND project_id = ?`)
+      // `sitting` is read straight off the run row, like agent_id/kind/exit below — an uploading
+      // daemon can only ever be reporting on the sitting it just ran, i.e. the run's CURRENT
+      // (highest) sitting. There is no wire field for it: `EffortEpisode` (the uploaded row's
+      // shape) predates sittings and does not need to grow one — the server already knows.
+      const runRow = await this.env.DB.prepare(`SELECT agent_id, kind, exit, started_at, sitting FROM runs WHERE id = ? AND project_id = ?`)
         .bind(parsed.data.runId, projectId)
-        .first<{ agent_id: string | null; kind: string; exit: string | null; started_at: string | null }>();
+        .first<{ agent_id: string | null; kind: string; exit: string | null; started_at: string | null; sitting: number }>();
       if (!runRow) {
         console.warn(`ProjectMemory episode-ingest(${scopeId}): uploaded row names run ${parsed.data.runId}, unknown in project ${projectId} — skipping`);
         skipped++;
@@ -1365,6 +1388,7 @@ export class ProjectMemory extends DurableObject<Env> {
       const { outcome, finishedAt } = parseExit(runRow.exit);
       await this.recordEpisode(projectId, {
         runId: parsed.data.runId,
+        sitting: runRow.sitting,
         agentId: runRow.agent_id,
         runKind: runRow.kind,
         outcome,

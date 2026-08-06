@@ -1,0 +1,14 @@
+-- PLNR-263 (correction): a Run can be CONTINUED (RUN-182's reopenRun) without minting a new
+-- run id — the daemon keeps the same machine-local worktree, and reopenRun explicitly clears
+-- `exit`/`agent_id` and re-dispatches the SAME `runs.id`. reopenRun's own comment already names
+-- what that produces: "this run gets a new SITTING". Until now nothing counted sittings, so a
+-- continued run's second (or third) attempt was indistinguishable from its first at the run-id
+-- level — which is exactly the fact PLNR-263's episode writer needs and did not have: an episode
+-- keyed by run_id alone would have the reopened run's next terminal transition OVERWRITE the
+-- failed sitting's episode, destroying evidence §14 says must remain retrievable.
+--
+-- Additive, nullable-free (DEFAULT 1 covers every existing row — a run that has never been
+-- reopened is trivially "on its first sitting"). reopenRun bumps this in the SAME UPDATE that
+-- clears `exit`/`agent_id` (ProjectRoom.ts) — that is already the one place documented as "the
+-- slate is wiped" for a new sitting, so incrementing here needs no new call site.
+ALTER TABLE runs ADD COLUMN sitting INTEGER NOT NULL DEFAULT 1;

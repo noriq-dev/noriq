@@ -21,11 +21,12 @@ interface RoomRpc {
   createRun(projectId: string, actor: Actor, input: CreateRunInput): Promise<RunView>;
   dispatchRun(projectId: string, actor: Actor, runId: string, runnerId: string): Promise<RunView>;
   transitionRun(projectId: string, actor: Actor, runId: string, patch: RunPatch): Promise<RunView>;
+  reopenRun(projectId: string, actor: Actor, runId: string, rounds: number | null): Promise<RunView>;
 }
 const room = (projectId: string) => appEnv.PROJECT_ROOM.get(appEnv.PROJECT_ROOM.idFromName(projectId)) as unknown as RoomRpc;
 
 interface RecordEpisodeInput {
-  runId: string; agentId: string | null; runKind: string; outcome: string; startedAt: string | null; finishedAt: string | null;
+  runId: string; sitting: number; agentId: string | null; runKind: string; outcome: string; startedAt: string | null; finishedAt: string | null;
   taskId: string | null; taskTitle?: string | null; repositoryKey: string | null; baseId: string | null;
   timeline: Array<{ at: string; label: string }>; filesTouched: string[]; commands: string[]; testsRun: string[]; failures: string[];
   findings: Array<{ summary: string; severity?: string }>; reviewRounds: number; tokenUsage: Record<string, unknown>; costUSD: number;
@@ -70,7 +71,7 @@ const memory = (pid: string) => appEnv.PROJECT_MEMORY.get(appEnv.PROJECT_MEMORY.
  *  it needs, so a test reads as "what's different" rather than restating the whole shape. */
 function baseEpisodeInput(runId: string, overrides: Partial<RecordEpisodeInput> = {}): RecordEpisodeInput {
   return {
-    runId, agentId: null, runKind: 'build', outcome: 'done', startedAt: null, finishedAt: null,
+    runId, sitting: 1, agentId: null, runKind: 'build', outcome: 'done', startedAt: null, finishedAt: null,
     taskId: null, repositoryKey: null, baseId: null, timeline: [], filesTouched: [], commands: [],
     testsRun: [], failures: [], findings: [], reviewRounds: 0, tokenUsage: {}, costUSD: 0,
     acceptanceCoverage: null, steeringEvents: [], landingOutcome: 'pending', remainingWork: [],
@@ -269,6 +270,82 @@ describe('a terminal Run produces its deterministic episode (ProjectRoom → rec
       await memory(projectId)._setForceWriteFailure(projectId, false);
     }
   });
+
+  // PLNR-263 correction: `reopenRun` (RUN-182, "continue a failed run") reuses the SAME run id
+  // for a second sitting — it does NOT mint a new run. Before migration 0075/0007, the reopened
+  // sitting's terminal transition would upsert straight over the failed sitting's episode (both
+  // shared one `run_id`), destroying it. Episode identity is now (run_id, sitting), so the failed
+  // sitting's episode must survive a reopen-then-succeed cycle intact, and the successful
+  // sitting must get its OWN episode — both reachable from the one task they share.
+  it('a failed sitting keeps its own episode across a reopen — the next sitting gets its own, both linked to the same task', async () => {
+    const projectId = await newProject('MEPISIT');
+    const made = await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'task worked across two sittings', tags: ['episode-test'] });
+    const taskId = made.body.id as string;
+    const runnerId = 'rnr_epi_sit';
+    const agentSitting1 = 'agt_epi_sit1';
+    const agentSitting2 = 'agt_epi_sit2';
+    await seedRunner(runnerId);
+    // reopenRun (unlike a fresh dispatch) insists the SAME runner is still online and still
+    // advertises the repo — it is reclaiming a machine-local worktree, not picking a new home.
+    await env.DB.prepare(`UPDATE runners SET status = 'online', repos = ? WHERE id = ?`)
+      .bind(JSON.stringify([{ id: 'r' }]), runnerId).run();
+    await seedAgent(agentSitting1, runnerId, projectId);
+    await seedAgent(agentSitting2, runnerId, projectId);
+
+    const run = await room(projectId).createRun(projectId, actor, {
+      kind: 'build', repoRef: 'r', agentTool: 'claude', anchor: { type: 'task', id: taskId },
+    });
+    await room(projectId).dispatchRun(projectId, actor, run.id, runnerId);
+    await room(projectId).transitionRun(projectId, actor, run.id, { status: 'running', agentId: agentSitting1 });
+    const failed = await room(projectId).transitionRun(projectId, actor, run.id, { status: 'failed' });
+    expect(failed.status).toBe('failed');
+
+    const runUri = buildEntityUri({ kind: 'run', id: run.id });
+    const episodeUrisAfter = async (count: number): Promise<string[]> => {
+      let uris: string[] = [];
+      for (let i = 0; i < 20 && uris.length < count; i++) {
+        const neighborhood = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: runUri, edgeTypes: ['derived_from'] });
+        uris = neighborhood.upstream.filter((e) => e.type === 'episode').map((e) => e.uri);
+        if (uris.length < count) await new Promise((r) => setTimeout(r, 50));
+      }
+      return uris;
+    };
+
+    // Sitting 1's episode lands (fire-and-forget) before we reopen.
+    const afterSitting1 = await episodeUrisAfter(1);
+    expect(afterSitting1).toHaveLength(1);
+    const episodeId1 = afterSitting1[0]!.split('/').pop()!;
+    const failedHit = await memory(projectId).searchProjectMemory(projectId, { episodeId: episodeId1 });
+    expect(failedHit.results[0]).toMatchObject({ id: episodeId1, status: 'failed' });
+
+    // Continue the failed run — RUN-182's reopenRun, same run id, new sitting.
+    await room(projectId).reopenRun(projectId, actor, run.id, null);
+    await room(projectId).transitionRun(projectId, actor, run.id, { status: 'running', agentId: agentSitting2 });
+    const done = await room(projectId).transitionRun(projectId, actor, run.id, { status: 'done' });
+    expect(done.status).toBe('done');
+
+    // Sitting 2 produces its OWN episode — now TWO, both hanging off the same run node — and
+    // sitting 1's episode is untouched (still 'failed'), not overwritten by sitting 2's 'done'.
+    const afterSitting2 = await episodeUrisAfter(2);
+    expect(afterSitting2).toHaveLength(2);
+    expect(afterSitting2).toContain(afterSitting1[0]);
+    const episodeId2 = afterSitting2.find((u) => u !== afterSitting1[0])!.split('/').pop()!;
+
+    const stillFailedHit = await memory(projectId).searchProjectMemory(projectId, { episodeId: episodeId1 });
+    expect(stillFailedHit.results[0]).toMatchObject({ id: episodeId1, status: 'failed' });
+    const newHit = await memory(projectId).searchProjectMemory(projectId, { episodeId: episodeId2 });
+    // 'pending' (not 'failed'): a done sitting with no merged PR is "awaiting review", the
+    // ordinary state — see landingOutcomeFor's doc comment in memory/episodes.ts.
+    expect(newHit.results[0]).toMatchObject({ id: episodeId2, status: 'pending' });
+
+    // Both episodes are reachable from the ONE task they share — the acceptance line's "linked
+    // to the earlier one" is this shared task neighborhood, not a direct episode-to-episode edge.
+    const taskNeighborhood = await memory(projectId).dependencyNeighborhood(projectId, {
+      entityUri: buildEntityUri({ kind: 'task', id: taskId }), edgeTypes: ['related_to'],
+    });
+    const linkedEpisodeUris = taskNeighborhood.upstream.filter((e) => e.type === 'episode').map((e) => e.uri);
+    expect(linkedEpisodeUris).toEqual(expect.arrayContaining(afterSitting2));
+  });
 });
 
 describe('episode upload ingest — completeEpisodeIngest parses rows as EffortEpisode and calls the real writer', () => {
@@ -297,8 +374,8 @@ describe('episode upload ingest — completeEpisodeIngest parses rows as EffortE
     const episodeUri = neighborhood.upstream.find((e) => e.type === 'episode')!.uri;
     const episodeId = episodeUri.split('/').pop()!;
     const { results } = await memory(projectId).searchProjectMemory(projectId, { episodeId });
-    // Enriches the automatically-recorded skeleton from the SAME run (whichever call landed
-    // first) — one row either way, per the run_id UNIQUE index.
+    // Enriches the automatically-recorded skeleton from the SAME run+sitting (whichever call
+    // landed first) — one row either way, per the (run_id, sitting) UNIQUE index.
     expect(results[0]!.snippet).toContain('the daemon observed a slow query in the diff');
   });
 

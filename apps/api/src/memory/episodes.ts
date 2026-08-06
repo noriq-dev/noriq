@@ -13,7 +13,14 @@
 // filesTouched/selfSummary) genuinely can only come from the daemon — that is exactly what the
 // episode-upload path (`ingest.ts`'s `beginEpisodeIngest`/.../`completeEpisodeIngest`, deferred
 // to the Runner-side work this task does not build) enriches on top of the same row, via the
-// SAME `ProjectMemory.recordEpisode` upsert-by-run_id writer this module also calls.
+// SAME `ProjectMemory.recordEpisode` writer this module also calls.
+//
+// CORRECTION (migration 0075/0007): episode identity is (run_id, sitting), not run_id alone.
+// `ProjectRoom.reopenRun` (RUN-182, "continue a failed run") reuses the SAME run id for a second
+// sitting rather than minting a new run — its own comment calls this "a new sitting" — so a
+// skeleton keyed by run_id alone would have the reopened sitting's terminal transition overwrite
+// the failed sitting's episode, destroying evidence §14 says must remain retrievable. `sitting`
+// is read straight off the `runs` row below, exactly like every other identity field here.
 import type { Env } from '../env';
 import { EpisodeLandingOutcome, RunModelUsage } from '@noriq-dev/shared';
 
@@ -33,6 +40,9 @@ export interface RunRowForEpisode {
   started_at: string | null;
   usd_spent: number | null;
   model_usage: string | null; // JSON RunModelUsage
+  /** This run's current sitting (migration 0075) — 1 unless `reopenRun` has bumped it. Part of
+   *  the episode's identity (run_id, sitting), never just display metadata. */
+  sitting: number;
 }
 
 export interface TaskRefRowForEpisode {
@@ -68,6 +78,7 @@ export interface EpisodeSkeletonInput {
  *  that RPC's server-derived half. */
 export interface EpisodeSkeleton {
   runId: string;
+  sitting: number;
   agentId: string | null;
   runKind: string;
   outcome: 'done' | 'failed' | 'cancelled';
@@ -163,6 +174,7 @@ export function buildEpisodeSkeleton(input: EpisodeSkeletonInput): EpisodeSkelet
   }
   return {
     runId: input.run.id,
+    sitting: input.run.sitting,
     agentId: input.run.agent_id,
     runKind: input.run.kind,
     outcome,
@@ -199,7 +211,7 @@ export function buildEpisodeSkeleton(input: EpisodeSkeletonInput): EpisodeSkelet
 export async function recordEpisodeForRun(env: Env, projectId: string, runId: string): Promise<void> {
   const run = await env.DB.prepare(
     `SELECT id, agent_id, kind, runner_id, repo_ref, anchor_type, anchor_id, exit, created_at,
-            dispatched_at, started_at, usd_spent, model_usage
+            dispatched_at, started_at, usd_spent, model_usage, sitting
        FROM runs WHERE id = ? AND project_id = ?`,
   ).bind(runId, projectId).first<RunRowForEpisode>();
   if (!run) throw new Error(`run ${runId} not found in project ${projectId}`);

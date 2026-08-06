@@ -3377,9 +3377,14 @@ export class ProjectRoom extends DurableObject<Env> {
       // a revocation with a replacement credential. A REOPEN is the one event that genuinely means
       // "this run gets a new sitting", so it is the one place the slate is wiped. The previous
       // sitting's identity is not lost by this — the next mint overwrites the column regardless.
+      //
+      // `sitting` is bumped in this SAME UPDATE (PLNR-263 correction, migration 0075): this really
+      // is a new sitting under one run id, and the episode writer keys an episode on
+      // (run_id, sitting) precisely so the failed sitting's episode is never overwritten by the
+      // one this reopened attempt eventually produces.
       await this.env.DB.prepare(
         `UPDATE runs SET status = 'dispatched', exit = NULL, phase = NULL, agent_id = NULL,
-                budget = ?, dispatched_at = ?, updated_at = ? WHERE id = ?`,
+                sitting = sitting + 1, budget = ?, dispatched_at = ?, updated_at = ? WHERE id = ?`,
       ).bind(JSON.stringify(budget), now, now, runId).run();
       await this.emit(actor, 'run.status_changed', 'run', runId, { from: 'failed', to: 'dispatched', reason: 'continue', maxRounds: rounds });
 

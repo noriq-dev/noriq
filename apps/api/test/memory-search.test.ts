@@ -53,7 +53,7 @@ interface MemRpc {
   recordEpisode(
     pid: string,
     input: {
-      runId: string; agentId: string | null; runKind: string; outcome: string; startedAt: string | null; finishedAt: string | null;
+      runId: string; sitting: number; agentId: string | null; runKind: string; outcome: string; startedAt: string | null; finishedAt: string | null;
       taskId: string | null; repositoryKey: string | null; baseId: string | null; timeline: Array<{ at: string; label: string }>;
       filesTouched: string[]; commands: string[]; testsRun: string[]; failures: string[];
       findings: Array<{ summary: string; severity?: string }>; reviewRounds: number; tokenUsage: Record<string, unknown>; costUSD: number;
@@ -213,7 +213,7 @@ describe('keyword fallback (no backend) covers memories and episodes', () => {
   it('finds a seeded episode by substring in its body', async () => {
     const projectId = await newProject('MSRCH5');
     const { episodeId } = await memory(projectId).recordEpisode(projectId, {
-      runId: 'run_abc123', agentId: null, runKind: 'build', outcome: 'done', startedAt: null, finishedAt: null,
+      runId: 'run_abc123', sitting: 1, agentId: null, runKind: 'build', outcome: 'done', startedAt: null, finishedAt: null,
       taskId: null, repositoryKey: null, baseId: null, timeline: [], filesTouched: [], commands: [], testsRun: [], failures: [],
       findings: [{ summary: 'discovered the webhook retries indefinitely without backoff' }],
       reviewRounds: 0, tokenUsage: {}, costUSD: 0, acceptanceCoverage: null, steeringEvents: [],
