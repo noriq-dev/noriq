@@ -179,6 +179,30 @@ for the components. (ARCHITECTURE.md calls it a "mock store" — that's stale; i
   0056) is the `my_updates` notices cursor. rowid is unusable — `events.id` is a TEXT PK, so
   SQLite reuses rowids after `deleteProject` (PLNR-111).
 
+- **There are TWO migration directories, and mixing them is destructive.**
+  [apps/api/migrations/](apps/api/migrations/) is **D1's** — applied wholesale by the wrangler
+  CLI (`migrations_dir`) and by `readD1Migrations()` in the test harness.
+  [apps/api/memory-migrations/](apps/api/memory-migrations/) is the **ProjectMemory Durable
+  Object's own SQLite schema** — applied *inside* the DO at construction, gated by a durable
+  `_meta.schema_version`, so it ships in the Worker bundle (a Worker has no runtime filesystem).
+  Putting a memory migration in `migrations/` would create the memory tables in D1 and record
+  them in `d1_migrations`. Both are real `.sql` files; `memory-migrations/index.ts` is the
+  ordered manifest and documents how to add one. `.sql` imports need **no** wrangler config
+  (it ships a default Text rule for `**/*.sql` — adding your own `rules` entry *shadows* that
+  default and fails the build unless it sets `fallthrough: true`), but the vitest pool builds
+  with vite and needs the `sql-as-text` plugin in `vitest.workspace.ts`.
+
+- **Durable Object SQLite enforces foreign keys ALWAYS and ignores `PRAGMA foreign_keys`.**
+  `PRAGMA foreign_keys = OFF` still reads back `1` and a dangling insert still raises
+  `SQLITE_CONSTRAINT` (verified against workerd) — the mirror image of D1, which ignores the
+  pragma in the other direction. Anything that needs to load rows in an FK-violating order must
+  therefore use constraint-free tables, not a pragma. Two related traps in the same API:
+  `ALTER TABLE … RENAME TO` **rewrites the old name inside other tables' FK clauses** (renaming
+  `nodes` silently repoints `edges.from_node_id` at the new name) and stores the renamed table
+  **quoted** (`CREATE TABLE "edges"`), which breaks textual `CREATE TABLE <t>` matching. This is
+  why `ProjectMemory`'s restore stages into `CREATE TABLE … AS SELECT * … WHERE 0` copies and
+  swaps *contents* inside one transaction rather than renaming tables (PLNR-249/250).
+
 - **Project `docs` and `plan_docs` are different beasts:** project docs are settled-decisions-only
   (enforced by [lib/doclint.ts](apps/api/src/lib/doclint.ts) — TBD/open-question phrasing is
   rejected) and vector-indexed; plan-local docs (PLNR-200) are working documents — never indexed,

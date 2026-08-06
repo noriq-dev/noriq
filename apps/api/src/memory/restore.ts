@@ -62,16 +62,28 @@ export async function* readSnapshotChunks(env: Env, manifest: Manifest): AsyncGe
   if (!env.FILES) throw new Error('R2 (FILES) not configured');
   const files = env.FILES;
   const prefix = backupPrefix(manifest.projectId, manifest.exportedAt);
-  // relKey shape is "<table>/chunk-<n>.jsonl.gz" (backup.ts's own naming). Sort NUMERICALLY by
-  // chunk index within a table — a lexical string sort would put "chunk-10" before "chunk-2"
-  // once a table passes 10 chunks, corrupting import order for any table over ~5000 rows.
-  const ordered = Object.keys(manifest.checksums)
-    .map((relKey) => {
-      const match = /^(.+)\/chunk-(\d+)\.jsonl\.gz$/.exec(relKey);
-      if (!match) throw new Error(`unrecognized chunk key in manifest: ${relKey}`);
-      return { relKey, table: match[1]!, chunkIndex: Number(match[2]) };
-    })
-    .sort((a, b) => (a.table === b.table ? a.chunkIndex - b.chunkIndex : a.table < b.table ? -1 : 1));
+  // relKey shape is "<table>/chunk-<n>.jsonl.gz" (backup.ts's own naming).
+  //
+  // TABLE order is the manifest's own key order, which is the order the exporter wrote them in —
+  // i.e. BACKUP_TABLES, parents before children. Preserved rather than re-sorted: JS keeps
+  // string-key insertion order and JSON.parse preserves it, so the manifest already carries the
+  // right answer. (This used to sort alphabetically, which silently yielded `edges` before
+  // `nodes` — harmless for today's constraint-free staging tables, but it read as though the
+  // order were meaningful while actually inverting the exporter's careful one.)
+  //
+  // CHUNK order within a table is sorted NUMERICALLY: a lexical sort puts "chunk-10" before
+  // "chunk-2" once a table passes ten chunks.
+  const byTable = new Map<string, Array<{ relKey: string; chunkIndex: number }>>();
+  for (const relKey of Object.keys(manifest.checksums)) {
+    const match = /^(.+)\/chunk-(\d+)\.jsonl\.gz$/.exec(relKey);
+    if (!match) throw new Error(`unrecognized chunk key in manifest: ${relKey}`);
+    const table = match[1]!;
+    if (!byTable.has(table)) byTable.set(table, []);
+    byTable.get(table)!.push({ relKey, chunkIndex: Number(match[2]) });
+  }
+  const ordered = [...byTable.entries()].flatMap(([table, chunks]) =>
+    chunks.sort((a, b) => a.chunkIndex - b.chunkIndex).map((c) => ({ ...c, table })),
+  );
   for (const { relKey, table, chunkIndex } of ordered) {
     const obj = await files.get(`${prefix}/${relKey}`);
     if (!obj) throw new Error(`missing chunk: ${relKey}`);

@@ -6,6 +6,7 @@ import { projectCoordinationEvents, type ProjectedEvent } from '../lib/memory-pr
 import { exportMemorySnapshot } from '../memory/backup';
 import { fetchManifest, readSnapshotChunks, checkManifestHeader } from '../memory/restore';
 import { deleteAllProjectBackups, sizeStatus, type EraseReport, type EraseStepResult } from '../memory/lifecycle';
+import { MEMORY_MIGRATIONS } from '../../memory-migrations';
 
 /**
  * ProjectMemory — one instance per project (idFromName(projectId)), canonical
@@ -35,203 +36,11 @@ import { deleteAllProjectBackups, sizeStatus, type EraseReport, type EraseStepRe
  * below exist so those tasks have somewhere to write.
  */
 
-/**
- * Ordered, additive migrations, applied once each. Each entry is a list of
- * individual statements (never a single multi-statement string — `exec()` is
- * one statement per call, exactly like the DO's own SQL API expects). NEVER
- * edit an entry once shipped; add a new one, exactly like D1's numbered
- * migration files.
- */
-const MIGRATIONS: readonly (readonly string[])[] = [
-  // v1 (PLNR-245) — the canonical schema. FK targets are created before their
-  // referrers. Column vocabularies (kind/type/authority/verification enums)
-  // are the CHECK-constraint mirror of @noriq-dev/shared's memory.ts zod
-  // enums, the same convention D1's own migrations already use for status
-  // columns — never re-declare them as a second source of truth elsewhere.
-  [
-    // Real SQLite (not D1), so FK enforcement is ours to turn on — unlike D1,
-    // which ignores this pragma outright (CLAUDE.md).
-    `PRAGMA foreign_keys = ON`,
-
-    `CREATE TABLE _meta (
-       key   TEXT PRIMARY KEY,
-       value TEXT NOT NULL
-     )`,
-
-    // A monotonic counter bumped by every canonical mutation (PLNR-247+) — what
-    // a health check and a backup manifest's memoryRevision report.
-    `CREATE TABLE memory_revision (
-       id    INTEGER PRIMARY KEY CHECK (id = 0),
-       value INTEGER NOT NULL DEFAULT 0
-     )`,
-    `INSERT INTO memory_revision (id, value) VALUES (0, 0)`,
-
-    // The durable D1-event-log cursor the projector (PLNR-247) advances —
-    // events.global_seq, never rowid (reused after deleteProject, PLNR-111)
-    // and never the per-project seq (that one's the WS resume cursor).
-    `CREATE TABLE projector_cursor (
-       id         INTEGER PRIMARY KEY CHECK (id = 0),
-       global_seq INTEGER NOT NULL DEFAULT 0
-     )`,
-    `INSERT INTO projector_cursor (id, global_seq) VALUES (0, 0)`,
-
-    // Idempotency ledger for canonical mutations delivered outward (PLNR-247):
-    // a redelivered operation id is recognized and skipped rather than
-    // re-applied.
-    `CREATE TABLE applied_operations (
-       operation_id TEXT PRIMARY KEY,
-       applied_at   TEXT NOT NULL
-     )`,
-
-    // Compact change events awaiting delivery to ProjectRoom (PLNR-247). No
-    // memory body ever rides here — verb + subject + a summary payload only,
-    // the same discipline the D1 event log itself already follows.
-    `CREATE TABLE outbox (
-       id             TEXT PRIMARY KEY,
-       operation_id   TEXT NOT NULL,
-       verb           TEXT NOT NULL,
-       subject_type   TEXT NOT NULL,
-       subject_id     TEXT NOT NULL,
-       payload        TEXT NOT NULL,
-       created_at     TEXT NOT NULL,
-       delivered_at   TEXT
-     )`,
-    `CREATE INDEX idx_outbox_pending ON outbox (created_at) WHERE delivered_at IS NULL`,
-
-    // Repositories this project's memory has ever indexed. The CANONICAL
-    // project<->repository association lives in D1 (PLNR-246, §3); this is
-    // just the local FK anchor for index generations and evidence.
-    `CREATE TABLE repositories (
-       repository_key TEXT PRIMARY KEY,
-       created_at     TEXT NOT NULL
-     )`,
-
-    `CREATE TABLE index_generations (
-       id               TEXT PRIMARY KEY,
-       repository_key   TEXT NOT NULL REFERENCES repositories(repository_key),
-       branch           TEXT NOT NULL,
-       base_id          TEXT NOT NULL,
-       indexer_version  TEXT NOT NULL,
-       batch_count      INTEGER NOT NULL,
-       file_count       INTEGER NOT NULL,
-       content_hash     TEXT NOT NULL,
-       status           TEXT NOT NULL DEFAULT 'staged' CHECK (status IN ('staged', 'active', 'superseded')),
-       created_at       TEXT NOT NULL,
-       activated_at     TEXT
-     )`,
-    `CREATE INDEX idx_index_generations_repo ON index_generations (repository_key, status)`,
-
-    // The project knowledge graph (§5). `uri` is the stable entity URI
-    // (buildEntityUri, PLNR-244) — durable identity, never a generation or
-    // baseId.
-    `CREATE TABLE nodes (
-       id         TEXT PRIMARY KEY,
-       type       TEXT NOT NULL CHECK (type IN (
-                    'project', 'repository', 'branch', 'revision', 'file', 'symbol', 'api',
-                    'database_entity', 'test', 'task', 'plan', 'run', 'agent', 'decision',
-                    'memory', 'error', 'requirement', 'procedure', 'episode', 'artifact', 'unknown'
-                  )),
-       uri        TEXT NOT NULL UNIQUE,
-       label      TEXT NOT NULL,
-       created_at TEXT NOT NULL
-     )`,
-    `CREATE INDEX idx_nodes_type ON nodes (type)`,
-
-    `CREATE TABLE edges (
-       id           TEXT PRIMARY KEY,
-       type         TEXT NOT NULL CHECK (type IN (
-                      'declares', 'calls', 'imports', 'depends_on', 'tests', 'implements', 'modifies',
-                      'observed_in', 'decided_by', 'supersedes', 'contradicts', 'blocks', 'related_to',
-                      'failed_because', 'validated_by', 'owned_by', 'commonly_changes_with', 'derived_from'
-                    )),
-       from_node_id TEXT NOT NULL REFERENCES nodes(id),
-       to_node_id   TEXT NOT NULL REFERENCES nodes(id),
-       created_at   TEXT NOT NULL
-     )`,
-    `CREATE INDEX idx_edges_from ON edges (from_node_id)`,
-    `CREATE INDEX idx_edges_to ON edges (to_node_id)`,
-
-    // The one kind-driven recording surface (§11). `supersedes_memory_id`
-    // links a new version back rather than overwriting — history is never
-    // destructively erased (§12).
-    `CREATE TABLE memory_items (
-       id                     TEXT PRIMARY KEY,
-       kind                   TEXT NOT NULL CHECK (kind IN (
-                                'learning', 'decision', 'failed_approach', 'procedure',
-                                'requirement', 'hazard', 'unknown'
-                              )),
-       statement              TEXT NOT NULL,
-       authority              INTEGER NOT NULL DEFAULT 1 CHECK (authority BETWEEN 1 AND 5),
-       confidence             REAL,
-       supersedes_memory_id   TEXT REFERENCES memory_items(id),
-       recorded_by_agent_id   TEXT,
-       recorded_at            TEXT NOT NULL
-     )`,
-    `CREATE INDEX idx_memory_items_kind ON memory_items (kind)`,
-
-    // Repository citations backing a memory (§1). `verification_state`
-    // degrades a memory to a lead the moment its evidence stops checking out.
-    `CREATE TABLE evidence (
-       id                   TEXT PRIMARY KEY,
-       memory_item_id       TEXT NOT NULL REFERENCES memory_items(id),
-       repository_key       TEXT NOT NULL,
-       branch               TEXT NOT NULL,
-       base_id              TEXT NOT NULL,
-       path                 TEXT NOT NULL,
-       symbol               TEXT,
-       content_hash         TEXT,
-       verification_state   TEXT NOT NULL DEFAULT 'unverifiable' CHECK (verification_state IN (
-                              'valid', 'moved', 'changed', 'missing', 'unverifiable'
-                            )),
-       created_at           TEXT NOT NULL
-     )`,
-    `CREATE INDEX idx_evidence_memory_item ON evidence (memory_item_id)`,
-
-    // Feedback and contradiction are OPERATIONS on a memory item (§11), not
-    // separate kinds — but they are still durable rows a later phase
-    // (PLNR-254) reads and writes.
-    `CREATE TABLE feedback (
-       id              TEXT PRIMARY KEY,
-       memory_item_id  TEXT NOT NULL REFERENCES memory_items(id),
-       actor_id        TEXT NOT NULL,
-       vote            TEXT NOT NULL CHECK (vote IN ('up', 'down')),
-       reason          TEXT,
-       created_at      TEXT NOT NULL
-     )`,
-    `CREATE INDEX idx_feedback_memory_item ON feedback (memory_item_id)`,
-
-    `CREATE TABLE contradictions (
-       id                          TEXT PRIMARY KEY,
-       memory_item_id              TEXT NOT NULL REFERENCES memory_items(id),
-       contradicts_memory_item_id  TEXT NOT NULL REFERENCES memory_items(id),
-       resolved_at                 TEXT,
-       created_at                  TEXT NOT NULL
-     )`,
-    `CREATE INDEX idx_contradictions_memory_item ON contradictions (memory_item_id)`,
-
-    // Every terminal run (§14). The deterministic skeleton's queryable columns
-    // are pulled out; the full record (timeline, findings, self-summary, …)
-    // rides in `body` as JSON, the same "payload TEXT" convention the D1 event
-    // log already uses for its own variable-shape data.
-    `CREATE TABLE episodes (
-       id                    TEXT PRIMARY KEY,
-       run_id                TEXT NOT NULL,
-       task_id               TEXT,
-       repository_key        TEXT,
-       base_id               TEXT,
-       landing_outcome       TEXT NOT NULL DEFAULT 'pending' CHECK (landing_outcome IN (
-                               'landed', 'not_landed', 'failed', 'pending'
-                             )),
-       review_rounds         INTEGER NOT NULL DEFAULT 0,
-       cost_usd              REAL NOT NULL DEFAULT 0,
-       acceptance_coverage   REAL,
-       body                  TEXT NOT NULL,
-       created_at            TEXT NOT NULL
-     )`,
-    `CREATE INDEX idx_episodes_run ON episodes (run_id)`,
-    `CREATE INDEX idx_episodes_task ON episodes (task_id)`,
-  ],
-];
+// This DO's internal SQLite schema lives in apps/api/memory-migrations — real `.sql` files, one
+// per version, assembled into an ordered manifest by that directory's index.ts. Adding a
+// migration is a new file plus one manifest entry; the rules (never edit a shipped migration;
+// stay additive) are documented there. Note it is a SIBLING of apps/api/migrations, which is
+// D1's and is applied by the wrangler CLI — the two must never be mixed.
 
 export interface ProjectMemoryHealth {
   projectId: string;
@@ -300,18 +109,19 @@ export class ProjectMemory extends DurableObject<Env> {
     const metaTable = this.ctx.storage.sql
       .exec<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_meta'`)
       .toArray();
-    const hasMeta = metaTable.length > 0;
-    const current = hasMeta ? this.readSchemaVersion() : 0;
-    for (let version = current + 1; version <= MIGRATIONS.length; version++) {
-      const statements = MIGRATIONS[version - 1]!;
+    const current = metaTable.length > 0 ? this.readSchemaVersion() : 0;
+    for (const migration of MEMORY_MIGRATIONS) {
+      if (migration.version <= current) continue;
+      // One transaction per migration, and one `exec()` for its whole SQL blob — exec accepts
+      // several `;`-separated statements in a single call, so a migration file reads as plain
+      // SQL instead of an array of fragments. The version bump commits with the DDL, so a
+      // partially-applied migration is impossible.
       this.ctx.storage.transactionSync(() => {
-        for (const stmt of statements) {
-          this.ctx.storage.sql.exec(stmt);
-        }
+        this.ctx.storage.sql.exec(migration.sql);
         this.ctx.storage.sql.exec(
           `INSERT INTO _meta (key, value) VALUES ('schema_version', ?1)
            ON CONFLICT (key) DO UPDATE SET value = ?1`,
-          String(version),
+          String(migration.version),
         );
       });
     }
@@ -404,36 +214,50 @@ export class ProjectMemory extends DurableObject<Env> {
   // ---------------------------------------------------------------------------
   // Generation-based restore + rollback (PLNR-249)
   //
-  // Restore NEVER deletes the active dataset first. Every table is imported into a `staging_`
-  // twin (same CREATE TABLE, same CHECK constraints — just a different name), validated in
-  // full, and only then does ONE transactionSync do the entire switch: the live table becomes
-  // `prev_<table>` (retained for rollback — at most one generation back, never a stack) and
-  // `staging_<table>` becomes the live table. A validation failure at any point drops the
-  // staging tables and leaves the active generation byte-identical. FK enforcement is turned
-  // OFF for the duration of staging import (both staged and live tables share one connection,
-  // and a staging table's declared REFERENCES still point at the LIVE table names — rewriting
-  // them is unnecessary because integrity is checked explicitly, via anti-joins, below).
+  // Restore NEVER deletes the active dataset first, and — as of the PLNR-250 follow-up — never
+  // RENAMES a live table either. Two platform facts forced that:
+  //
+  //   1. `ALTER TABLE x RENAME TO y` rewrites x's name in OTHER tables' FK clauses. Renaming
+  //      `nodes` to `prev_nodes` silently repointed `edges.from_node_id` at `prev_nodes`, so a
+  //      restore corrupted the schema it was restoring.
+  //   2. That rename also stores the new name QUOTED (`CREATE TABLE "edges"`), which broke the
+  //      textual `CREATE TABLE <t>` munging used to derive a staging schema — a SECOND restore
+  //      failed outright with "could not derive staging schema".
+  //
+  // Neither was caught by the original tests because a single restore of a store that happened
+  // to have evidence rows is the one path that worked. So the mechanism is now copy-based and
+  // touches no table identity at all:
+  //
+  //   staging_<t>  — `CREATE TABLE … AS SELECT * FROM <t> WHERE 0`: same columns, and
+  //                  deliberately NO constraints. Import order and FK enforcement (which is
+  //                  permanently ON here — `PRAGMA foreign_keys = OFF` is ignored by DO SQLite,
+  //                  verified against workerd) therefore cannot affect staging at all.
+  //   prev_<t>     — `CREATE TABLE … AS SELECT * FROM <t>`: a constraint-free holding copy of
+  //                  the outgoing generation, for rollback. One generation back, never a stack.
+  //
+  // Activation is ONE transactionSync that snapshots live→prev_, empties live child-first, and
+  // refills it from staging parent-first. Because the LIVE tables keep their real schema, that
+  // refill is checked against the real FKs and CHECKs — a corrupt snapshot fails the restore
+  // instead of loading quietly — and because it is one transaction, any throw rolls the whole
+  // thing back, leaving the active generation byte-identical.
   // ---------------------------------------------------------------------------
+
+  /** Parent-first (FK-safe insert order) is BACKUP_TABLES; child-first (FK-safe delete order)
+   *  is its reverse. Both matter now that refills hit the real constrained tables. */
+  private static readonly PARENT_FIRST = BACKUP_TABLES;
 
   private readonly VALID_COLUMN_NAME = /^[a-z_][a-z0-9_]*$/;
 
-  private tableCreateSql(table: string): string {
-    const row = this.ctx.storage.sql
-      .exec<{ sql: string }>(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1`, table)
-      .toArray()[0];
-    if (!row) throw new Error(`unknown table: ${table}`);
-    return row.sql;
-  }
-
-  private createStagingTable(table: string): void {
-    const liveSql = this.tableCreateSql(table);
-    // Textual rename of the CREATE TABLE's own name only — a word-boundary match on `CREATE
-    // TABLE <table>` so a substring collision (e.g. `nodes` inside some other identifier)
-    // can't mis-rename.
-    const stagingSql = liveSql.replace(new RegExp(`CREATE TABLE ${table}\\b`), `CREATE TABLE staging_${table}`);
-    if (stagingSql === liveSql) throw new Error(`could not derive staging schema for ${table}`);
-    this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS staging_${table}`);
-    this.ctx.storage.sql.exec(stagingSql);
+  /** Empty, constraint-free twins of every backup table. Created for ALL of them up front, not
+   *  just the ones the snapshot has chunks for: that is what makes the integrity anti-joins
+   *  below unconditional. (The previous version created them lazily per-chunk and then queried
+   *  `staging_evidence` whenever EITHER edges or evidence was present — so restoring any project
+   *  that had edges but no evidence died on "no such table: staging_evidence".) */
+  private createEmptyStagingTables(): void {
+    for (const table of ProjectMemory.PARENT_FIRST) {
+      this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS staging_${table}`);
+      this.ctx.storage.sql.exec(`CREATE TABLE staging_${table} AS SELECT * FROM ${table} WHERE 0`);
+    }
   }
 
   private insertStagingRow(table: string, row: Record<string, unknown>): void {
@@ -453,8 +277,10 @@ export class ProjectMemory extends DurableObject<Env> {
   }
 
   /** Anti-join graph/evidence integrity over the STAGED tables — an edge or evidence row
-   *  pointing at a node/memory item that doesn't exist in the same staged import fails the
-   *  restore before any switch happens. */
+   *  pointing at a node/memory item the same snapshot doesn't contain fails the restore before
+   *  anything is activated. The live tables' real FKs would also catch this during the refill,
+   *  but checking here gives a precise count and a message, and does it before the outgoing
+   *  generation has been disturbed at all. */
   private stagingIntegrityProblems(): string[] {
     const problems: string[] = [];
     const danglingEdges = this.ctx.storage.sql
@@ -475,17 +301,44 @@ export class ProjectMemory extends DurableObject<Env> {
     return problems;
   }
 
-  private dropStagingTables(tables: readonly string[]): void {
-    for (const table of tables) this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS staging_${table}`);
+  private dropStagingTables(): void {
+    for (const table of ProjectMemory.PARENT_FIRST) this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS staging_${table}`);
+  }
+
+  /** Replace every live table's contents from same-named tables carrying `fromPrefix`, keeping
+   *  the live schema (and therefore its FKs and CHECKs) untouched. Delete child-first, insert
+   *  parent-first, so the real FK constraints are satisfied at every step. Caller MUST wrap this
+   *  in a transaction — that wrapping is what makes a failed activation leave nothing behind. */
+  private replaceLiveContentsFrom(fromPrefix: string): void {
+    for (const table of [...ProjectMemory.PARENT_FIRST].reverse()) {
+      this.ctx.storage.sql.exec(`DELETE FROM ${table}`);
+    }
+    for (const table of ProjectMemory.PARENT_FIRST) {
+      const source = `${fromPrefix}${table}`;
+      const exists = this.ctx.storage.sql
+        .exec<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1`, source)
+        .toArray().length > 0;
+      // A source table that doesn't exist means the snapshot genuinely had no such table (e.g.
+      // it predates one). Emptying the live table is the correct reading of that: the snapshot
+      // is the truth being restored, not a partial overlay on top of current data.
+      if (exists) this.ctx.storage.sql.exec(`INSERT INTO ${table} SELECT * FROM ${source}`);
+    }
+  }
+
+  private snapshotLiveInto(prefix: string): void {
+    for (const table of ProjectMemory.PARENT_FIRST) {
+      this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS ${prefix}${table}`);
+      this.ctx.storage.sql.exec(`CREATE TABLE ${prefix}${table} AS SELECT * FROM ${table}`);
+    }
   }
 
   /**
    * Restore this project's canonical memory from a portable snapshot (PLNR-248's export).
-   * Fetches and validates the manifest, imports every chunk into staging (chunk-at-a-time,
-   * never the whole snapshot in memory), verifies row counts and graph/evidence integrity
-   * against staging, and only on success performs the one atomic generation switch. Marks
-   * derived vectors dirty on success — a snapshot's vectors, if any existed, never travel
-   * with it (§9); the real rebuild is Phase 4's, this only flags it.
+   * Fetches and validates the manifest, imports every chunk into constraint-free staging tables
+   * (chunk-at-a-time, never the whole snapshot in memory), verifies row counts and
+   * graph/evidence integrity against staging, and only on success performs one atomic
+   * activation. Marks derived vectors dirty on success — a snapshot's vectors, if any existed,
+   * never travel with it (§9); the real rebuild is Phase 4's, this only flags it.
    */
   async restoreSnapshot(
     projectId: string,
@@ -502,37 +355,35 @@ export class ProjectMemory extends DurableObject<Env> {
     const header = checkManifestHeader(manifest, projectId, this.readSchemaVersion());
     if (!header.ok) return { ok: false, reason: header.problems.join('; ') };
 
-    const importedTables = new Set<string>();
     try {
-      this.ctx.storage.sql.exec('PRAGMA foreign_keys = OFF');
+      this.createEmptyStagingTables();
       for await (const chunk of readSnapshotChunks(this.env, manifest)) {
-        if (!importedTables.has(chunk.table)) {
-          this.createStagingTable(chunk.table);
-          importedTables.add(chunk.table);
+        if (!ProjectMemory.PARENT_FIRST.includes(chunk.table as (typeof BACKUP_TABLES)[number])) {
+          throw new Error(`snapshot contains an unknown table: ${chunk.table}`);
         }
         this.ctx.storage.transactionSync(() => {
           for (const row of chunk.rows) this.insertStagingRow(chunk.table, row);
         });
       }
 
-      const countProblems: string[] = [];
+      const problems: string[] = [];
       for (const [table, expected] of Object.entries(manifest.tableCounts)) {
-        const actual = importedTables.has(table) ? this.countRows('staging_', table) : 0;
-        if (actual !== expected) countProblems.push(`${table}: expected ${expected} rows, staged ${actual}`);
+        const staged = ProjectMemory.PARENT_FIRST.includes(table as (typeof BACKUP_TABLES)[number])
+          ? this.countRows('staging_', table)
+          : 0;
+        if (staged !== expected) problems.push(`${table}: expected ${expected} rows, staged ${staged}`);
       }
-      const integrityProblems = importedTables.has('edges') || importedTables.has('evidence') ? this.stagingIntegrityProblems() : [];
-      const problems = [...countProblems, ...integrityProblems];
+      problems.push(...this.stagingIntegrityProblems());
       if (problems.length > 0) {
-        this.dropStagingTables([...importedTables]);
+        this.dropStagingTables();
         return { ok: false, reason: problems.join('; ') };
       }
 
+      // One transaction for the whole activation: retain the outgoing generation, then replace
+      // live contents from staging. A constraint violation anywhere rolls all of it back.
       this.ctx.storage.transactionSync(() => {
-        for (const table of importedTables) {
-          this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS prev_${table}`);
-          this.ctx.storage.sql.exec(`ALTER TABLE ${table} RENAME TO prev_${table}`);
-          this.ctx.storage.sql.exec(`ALTER TABLE staging_${table} RENAME TO ${table}`);
-        }
+        this.snapshotLiveInto('prev_');
+        this.replaceLiveContentsFrom('staging_');
         this.ctx.storage.sql.exec(
           `INSERT INTO _meta (key, value) VALUES ('has_prior_generation', '1')
            ON CONFLICT (key) DO UPDATE SET value = '1'`,
@@ -543,20 +394,18 @@ export class ProjectMemory extends DurableObject<Env> {
           nowIso(),
         );
       });
+      this.dropStagingTables();
 
       await this.reportVectorDirty(projectId, true);
       const tableCounts: Record<string, number> = {};
-      for (const table of importedTables) tableCounts[table] = this.countRows('', table);
+      for (const table of ProjectMemory.PARENT_FIRST) tableCounts[table] = this.countRows('', table);
       return { ok: true, tableCounts };
     } catch (err) {
       // A chunk that failed its own checksum (readSnapshotChunks throws rather than yielding
-      // untrusted rows) lands here too — drop whatever staging tables got as far as being
-      // created and report failure. The active generation was never touched: the switch above
-      // is the only place that renames a live table, and we never reached it.
-      this.dropStagingTables([...importedTables]);
+      // untrusted rows) lands here too. Nothing live was touched: staging is separate, and
+      // activation is a single transaction that either committed or rolled back whole.
+      this.dropStagingTables();
       return { ok: false, reason: String(err) };
-    } finally {
-      this.ctx.storage.sql.exec('PRAGMA foreign_keys = ON');
     }
   }
 
@@ -567,14 +416,12 @@ export class ProjectMemory extends DurableObject<Env> {
     await this.assertProjectId(projectId);
     const flag = this.ctx.storage.sql.exec<{ value: string }>(`SELECT value FROM _meta WHERE key = 'has_prior_generation'`).toArray()[0];
     if (flag?.value !== '1') return { ok: false, reason: 'no retained prior generation to roll back to' };
+    // Same copy-based shape as activation, in the other direction and in one transaction: refill
+    // live from the retained `prev_` copies, then discard them (rollback CONSUMES the retained
+    // generation — that is what makes this single-level rather than a stack).
     this.ctx.storage.transactionSync(() => {
-      for (const table of BACKUP_TABLES) {
-        const hasPrev = this.ctx.storage.sql.exec<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1`, `prev_${table}`).toArray().length > 0;
-        if (!hasPrev) continue;
-        this.ctx.storage.sql.exec(`ALTER TABLE ${table} RENAME TO rolled_back_${table}`);
-        this.ctx.storage.sql.exec(`ALTER TABLE prev_${table} RENAME TO ${table}`);
-        this.ctx.storage.sql.exec(`DROP TABLE rolled_back_${table}`);
-      }
+      this.replaceLiveContentsFrom('prev_');
+      for (const table of ProjectMemory.PARENT_FIRST) this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS prev_${table}`);
       this.ctx.storage.sql.exec(`UPDATE _meta SET value = '0' WHERE key = 'has_prior_generation'`);
     });
     await this.reportVectorDirty(projectId, true);
@@ -960,6 +807,18 @@ export class ProjectMemory extends DurableObject<Env> {
       .exec<{ path: string }>(`SELECT path FROM evidence WHERE memory_item_id = ?1 ORDER BY path`, memoryItemId)
       .toArray()
       .map((r) => r.path);
+  }
+
+  /** Test-only: a table's stored CREATE TABLE text. Exists so a restore test can assert the
+   *  live SCHEMA is unchanged, not just the row counts — the original rename-based activation
+   *  corrupted FK clauses and quoted table names while leaving every count correct. */
+  async _tableDdl(projectId: string, table: string): Promise<string> {
+    await this.assertProjectId(projectId);
+    return (
+      this.ctx.storage.sql
+        .exec<{ sql: string }>(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1`, table)
+        .toArray()[0]?.sql ?? '(no such table)'
+    );
   }
 
   /** Test-only: a staged (never activated) index generation with a caller-chosen created_at,

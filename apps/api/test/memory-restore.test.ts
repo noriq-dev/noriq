@@ -30,6 +30,7 @@ interface MemoryRpc {
   _seedEvidence(pid: string, memoryItemId: string, repositoryKey: string, branch: string, baseId: string, path: string): Promise<string>;
   _traverseFrom(pid: string, from: string, type: string): Promise<string[]>;
   _evidencePathsFor(pid: string, memoryItemId: string): Promise<string[]>;
+  _tableDdl(pid: string, table: string): Promise<string>;
 }
 
 const memory = (pid: string) => appEnv.PROJECT_MEMORY.get(appEnv.PROJECT_MEMORY.idFromName(pid)) as unknown as MemoryRpc;
@@ -172,6 +173,68 @@ describe('restoreSnapshot — round trip reproduces canonical state', () => {
 
     const liveCountAfter = (await memory(projectId).health(projectId)).tableCounts.nodes;
     expect(liveCountAfter).toBe(liveCountBefore); // untouched — nothing was ever deleted to make room
+  });
+
+  // Regression: the original staging mechanism created a staging_ twin lazily per imported
+  // chunk, then ran BOTH integrity anti-joins whenever EITHER edges or evidence was present —
+  // so restoring a project that had edges but no evidence died on
+  // "no such table: staging_evidence". A graph without evidence is an entirely ordinary shape.
+  it('restores a project that has edges but NO evidence rows', async () => {
+    const { projectId } = await newOwnedProject('pm-restore-noev@example.com', 'PMRSTNEV');
+    const a = await memory(projectId)._seedNode(projectId, 'noriq://unknown/ne-a', 'ne-a');
+    const b = await memory(projectId)._seedNode(projectId, 'noriq://unknown/ne-b', 'ne-b');
+    await memory(projectId)._seedEdge(projectId, 'related_to', a, b);
+
+    const exported = await memory(projectId).exportSnapshot(projectId);
+    if (!exported.ok) throw new Error('export failed');
+    await memory(projectId).erase(projectId);
+
+    const restored = await memory(projectId).restoreSnapshot(projectId, { exportedAt: exported.manifest.exportedAt });
+    expect(restored.ok).toBe(true);
+    const h = await memory(projectId).health(projectId);
+    expect(h.tableCounts.nodes).toBe(2);
+    expect(h.tableCounts.edges).toBe(1);
+    expect(h.tableCounts.evidence).toBe(0);
+    expect(await memory(projectId)._traverseFrom(projectId, a, 'related_to')).toEqual([b]);
+  });
+
+  // Regression: the original mechanism activated by RENAMING tables. SQLite stores a renamed
+  // table's name QUOTED (`CREATE TABLE "edges"`), which broke the textual `CREATE TABLE <t>`
+  // munging used to derive the staging schema — so a SECOND restore failed with "could not
+  // derive staging schema for edges". The rename also rewrote OTHER tables' FK clauses, leaving
+  // `edges` pointing at `prev_nodes`. Restoring twice must simply work, and the schema must not
+  // drift.
+  it('restores twice in a row without schema drift', async () => {
+    const { projectId } = await newOwnedProject('pm-restore-twice@example.com', 'PMRSTTWC');
+    const a = await memory(projectId)._seedNode(projectId, 'noriq://unknown/tw-a', 'tw-a');
+    const b = await memory(projectId)._seedNode(projectId, 'noriq://unknown/tw-b', 'tw-b');
+    await memory(projectId)._seedEdge(projectId, 'related_to', a, b);
+    const mem = await memory(projectId)._seedMemoryItem(projectId, 'learning', 'twice');
+    await memory(projectId)._seedEvidence(projectId, mem, 'repo-x', 'main', 'base1', 'README.md');
+
+    const first = await memory(projectId).exportSnapshot(projectId);
+    if (!first.ok) throw new Error('export 1 failed');
+    const r1 = await memory(projectId).restoreSnapshot(projectId, { exportedAt: first.manifest.exportedAt });
+    expect(r1.ok).toBe(true);
+
+    const second = await memory(projectId).exportSnapshot(projectId);
+    if (!second.ok) throw new Error('export 2 failed');
+    const r2 = await memory(projectId).restoreSnapshot(projectId, { exportedAt: second.manifest.exportedAt });
+    expect(r2.ok).toBe(true);
+
+    // Data intact after two round trips, and the graph still traverses.
+    const h = await memory(projectId).health(projectId);
+    expect(h.tableCounts.nodes).toBe(2);
+    expect(h.tableCounts.edges).toBe(1);
+    expect(h.tableCounts.evidence).toBe(1);
+    expect(await memory(projectId)._traverseFrom(projectId, a, 'related_to')).toEqual([b]);
+
+    // …and the live schema is still the ORIGINAL schema: `edges` references `nodes`, never a
+    // `prev_`/`staging_` table, and its name is not a renamed artifact.
+    const edgesDdl = await memory(projectId)._tableDdl(projectId, 'edges');
+    expect(edgesDdl).toContain('REFERENCES nodes(id)');
+    expect(edgesDdl).not.toContain('prev_');
+    expect(edgesDdl).not.toContain('staging_');
   });
 
   it('a manifest with a mismatched projectId (placed under this project by mistake) is refused before any staging write', async () => {

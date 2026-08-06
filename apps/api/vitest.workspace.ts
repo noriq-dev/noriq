@@ -48,12 +48,28 @@ testFiles.forEach((f, i) => shards[i % SHARDS]!.push(`test/${f}`));
 
 // One pool project per shard. Everything but the file list (and the optional extra bindings
 // the `demo` project adds) is identical across projects.
+// `.sql` files import as raw text (memory-migrations/*.sql — ProjectMemory's own schema).
+// Wrangler gets this for free from its DEFAULT Text module rule for **/*.sql, but the pool
+// builds with VITE, which knows nothing about wrangler's rules and would try to parse a .sql
+// file as JavaScript ("Failed to parse source for import analysis"). This is vite's half of that
+// contract. `enforce: 'pre'` is required so the transform runs BEFORE vite's import-analysis
+// plugin sees the file.
+const sqlAsText = {
+  name: 'sql-as-text',
+  enforce: 'pre' as const,
+  transform(code: string, id: string) {
+    if (!id.endsWith('.sql')) return null;
+    return { code: `export default ${JSON.stringify(code)};`, map: null };
+  },
+};
+
 const project = (name: string, include: string[], extraBindings: Record<string, unknown> = {}) =>
   defineWorkersProject(async () => {
     const migrations = await readD1Migrations(path.join(__dirname, 'migrations'));
     return {
       // tslib's CJS default-export shape confuses the workers pool; force the ESM build.
       resolve: { alias: { tslib: 'tslib/tslib.es6.js' } },
+      plugins: [sqlAsText],
       test: {
         name,
         include,
