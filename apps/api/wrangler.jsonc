@@ -52,8 +52,20 @@
   //   wrangler vectorize create noriq-search --dimensions=1024 --metric=cosine
   //   wrangler vectorize create-metadata-index noriq-search --property-name=projectId --type=string
   // Without both bindings, search transparently degrades to keyword matching.
+  //
+  // Code-intelligence search (PLNR-256, §9) is a SEPARATE, independently optional index — files,
+  // symbols, APIs, tests, config/schema entities, repository docs. Missing it (or AI) degrades
+  // code retrieval to lexical + graph; missing it never affects the noriq-search index above.
+  // See env.ts's CODE_VECTORIZE doc comment for its two required metadata-index commands
+  // (projectId AND generationId).
+  //   wrangler vectorize create noriq-code --dimensions=1024 --metric=cosine
+  //   wrangler vectorize create-metadata-index noriq-code --property-name=projectId --type=string
+  //   wrangler vectorize create-metadata-index noriq-code --property-name=generationId --type=string
   "ai": { "binding": "AI" },
-  // "vectorize": [{ "binding": "VECTORIZE", "index_name": "noriq-search" }],
+  // "vectorize": [
+  //   { "binding": "VECTORIZE", "index_name": "noriq-search" },
+  //   { "binding": "CODE_VECTORIZE", "index_name": "noriq-code" }
+  // ],
 
   "triggers": { "crons": ["0 6 * * *"] },
 

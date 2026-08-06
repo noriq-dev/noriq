@@ -36,6 +36,18 @@ export interface Env {
    *  `wrangler vectorize create noriq-search --dimensions=1024 --metric=cosine` and add a
    *  metadata index: `wrangler vectorize create-metadata-index noriq-search --property-name=projectId --type=string`. */
   VECTORIZE?: VectorizeIndex;
+  /** SEPARATE code-intelligence Vectorize index (PLNR-256, §9) — files, symbols, APIs, tests,
+   *  configuration/schema entities, and repository docs. Deliberately its own index, not a
+   *  `kind` partition of `noriq-search`: it churns on every repository reindex, is wholly
+   *  rebuildable from repositories, and may later use a code-specialized embedding model —
+   *  none of which is true of authored memory. Optional: without it (or `AI`), code retrieval
+   *  degrades to lexical + graph (§20); reindexing code never touches an operational memory/
+   *  episode vector either way (see memory/code-index.ts). Create with
+   *  `wrangler vectorize create noriq-code --dimensions=1024 --metric=cosine` and BOTH metadata
+   *  indexes the adapter filters on:
+   *  `wrangler vectorize create-metadata-index noriq-code --property-name=projectId --type=string`
+   *  `wrangler vectorize create-metadata-index noriq-code --property-name=generationId --type=string`. */
+  CODE_VECTORIZE?: VectorizeIndex;
   /** HMAC key for signing agent attachment-upload capability tokens (PLNR-173). Optional:
    *  falls back to ADMIN_TOKEN, so an instance with an admin token already supports agent
    *  uploads with no extra config. If neither is set, create_attachment_upload is disabled

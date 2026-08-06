@@ -9,6 +9,7 @@ import { deleteAllProjectBackups, sizeStatus, type EraseReport, type EraseStepRe
 import { MEMORY_MIGRATIONS } from '../memory/migrations';
 import { validateMemoryScope, validateEvidenceRef, memoryContentHash, evidenceHash, clampAuthority, type MemoryScope } from '../memory/writes';
 import { searchBackend, indexEntity, removeEntity } from '../search';
+import { codeSearchBackend, indexCodeEntity, removeCodeEntity, type CodeEntity } from '../memory/code-index';
 
 /**
  * ProjectMemory — one instance per project (idFromName(projectId)), canonical
@@ -533,6 +534,107 @@ export class ProjectMemory extends DurableObject<Env> {
     }
     await this.reportVectorDirty(projectId, false);
     return { ok: true, rebuilt: true, reindexed: items.length + episodes.length };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Code-intelligence generation activation (PLNR-256)
+  //
+  // The code graph is empty today (PLNR-262 populates file/symbol/api/test nodes) — these two
+  // RPCs are the ProjectMemory half of Phase 5's future ingest pipeline, which owns discovering
+  // `entities`/`deletedUris` from a repository; this reuses the EXISTING `index_generations`
+  // registry (migration 0001) rather than a parallel notion of "current generation", and adds
+  // no new table. Activation's status transition is a real transactionSync (Vectorize writes
+  // cannot join it — §4/§8); publishing/retiring vectors is best-effort outside that transaction,
+  // exactly like every other write RPC's fire-and-forget indexing here.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Activate a code-index generation for one repository: mark any currently-active generation
+   * for it 'superseded' and this one 'active' (reusing `index_generations`, inserting it if it
+   * doesn't already exist as a staged row), then best-effort publish `entities` and retire
+   * `deletedUris`. Vector id = each entity's stable URI (generation-free, §18), so a surviving
+   * entity re-indexed under the new generationId is a plain upsert at the SAME id — the only
+   * real "superseded vector" case is an entity the new generation's manifest reports as
+   * deleted, which is exactly what `deletedUris` is for.
+   */
+  async activateCodeGeneration(
+    projectId: string,
+    input: {
+      repositoryKey: string;
+      generationId: string;
+      branch: string;
+      baseId: string;
+      indexerVersion?: string;
+      contentHash?: string;
+      entities?: CodeEntity[];
+      deletedUris?: string[];
+    },
+  ): Promise<{ activated: string; superseded: string[] }> {
+    await this.assertProjectId(projectId);
+    const now = nowIso();
+    const superseded = this.ctx.storage.sql
+      .exec<{ id: string }>(`SELECT id FROM index_generations WHERE repository_key = ?1 AND status = 'active'`, input.repositoryKey)
+      .toArray()
+      .map((r) => r.id);
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO repositories (repository_key, created_at) VALUES (?1, ?2) ON CONFLICT (repository_key) DO NOTHING`,
+        input.repositoryKey,
+        now,
+      );
+      for (const id of superseded) {
+        this.ctx.storage.sql.exec(`UPDATE index_generations SET status = 'superseded' WHERE id = ?1`, id);
+      }
+      this.ctx.storage.sql.exec(
+        `INSERT INTO index_generations (id, repository_key, branch, base_id, indexer_version, batch_count, file_count, content_hash, status, created_at, activated_at)
+         VALUES (?1,?2,?3,?4,?5,0,?6,?7,'active',?8,?8)
+         ON CONFLICT (id) DO UPDATE SET status = 'active', branch = excluded.branch, base_id = excluded.base_id, activated_at = excluded.activated_at`,
+        input.generationId,
+        input.repositoryKey,
+        input.branch,
+        input.baseId,
+        input.indexerVersion ?? 'unknown',
+        input.entities?.length ?? 0,
+        input.contentHash ?? 'unknown',
+        now,
+      );
+    });
+
+    const backend = codeSearchBackend(this.env);
+    if (backend) {
+      for (const e of input.entities ?? []) {
+        void indexCodeEntity(backend, e).catch((err) => console.warn(`ProjectMemory code-index for ${e.uri} failed: ${String(err)}`));
+      }
+      for (const uri of input.deletedUris ?? []) {
+        void removeCodeEntity(backend, uri).catch((err) => console.warn(`ProjectMemory code-deindex for ${uri} failed: ${String(err)}`));
+      }
+    }
+    return { activated: input.generationId, superseded };
+  }
+
+  /**
+   * Bookkeeping GC for 'superseded' `index_generations` rows past their retention window —
+   * mirrors `pruneAbandonedStagedGenerations`'s shape exactly. This does NOT retire vectors —
+   * those are retired eagerly (best-effort) at activation via `deletedUris` above; a surviving
+   * entity's vector is never orphaned because it is re-upserted at the same id under the new
+   * generation. This only clears the now-inert registry row so `index_generations` does not
+   * grow forever. Uses `activated_at` (when THIS generation itself went active) as the age
+   * reference — there is no separate "superseded_at" column (adding one would mean a schema
+   * migration this task does not need), so a long-lived generation becomes prunable
+   * immediately once superseded rather than after its own separate grace period; the tradeoff
+   * is documented here rather than hidden behind a precise-sounding column that doesn't exist.
+   */
+  async pruneSupersededGenerations(projectId: string, maxAgeMs: number): Promise<number> {
+    await this.assertProjectId(projectId);
+    const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
+    const rows = this.ctx.storage.sql
+      .exec<{ id: string }>(`SELECT id FROM index_generations WHERE status = 'superseded' AND activated_at < ?1`, cutoff)
+      .toArray();
+    if (rows.length === 0) return 0;
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(`DELETE FROM index_generations WHERE status = 'superseded' AND activated_at < ?1`, cutoff);
+    });
+    return rows.length;
   }
 
   /**
@@ -1782,6 +1884,38 @@ export class ProjectMemory extends DurableObject<Env> {
   async _countIndexGenerations(projectId: string): Promise<number> {
     await this.assertProjectId(projectId);
     return this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM index_generations`).toArray()[0]?.n ?? 0;
+  }
+
+  /** Test-only: a 'superseded' index generation with a caller-chosen `activatedAt`, so
+   *  PLNR-256's `pruneSupersededGenerations` can be tested without waiting out its real max
+   *  age — same reason as `_seedStagedIndexGeneration`. */
+  async _seedSupersededIndexGenerationForTest(projectId: string, repositoryKey: string, activatedAt: string): Promise<string> {
+    await this.assertProjectId(projectId);
+    const id = newId('gen');
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO repositories (repository_key, created_at) VALUES (?1, ?2) ON CONFLICT (repository_key) DO NOTHING`,
+        repositoryKey,
+        activatedAt,
+      );
+      this.ctx.storage.sql.exec(
+        `INSERT INTO index_generations (id, repository_key, branch, base_id, indexer_version, batch_count, file_count, content_hash, status, created_at, activated_at)
+         VALUES (?1, ?2, 'main', 'deadbeef', 'test', 1, 1, 'sha256:test', 'superseded', ?3, ?3)`,
+        id,
+        repositoryKey,
+        activatedAt,
+      );
+    });
+    return id;
+  }
+
+  /** Test-only: this generation's current status — so PLNR-256's activation tests can assert
+   *  the transition (active → superseded, new → active) without a wider query surface. */
+  async _getIndexGenerationStatusForTest(projectId: string, generationId: string): Promise<string | null> {
+    await this.assertProjectId(projectId);
+    return (
+      this.ctx.storage.sql.exec<{ status: string }>(`SELECT status FROM index_generations WHERE id = ?1`, generationId).toArray()[0]?.status ?? null
+    );
   }
 
   /** Test-only: overwrite a `_meta` value directly — used to backdate

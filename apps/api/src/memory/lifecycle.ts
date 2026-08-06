@@ -15,6 +15,12 @@ export const DEFAULT_BACKUP_RETENTION_COUNT = 7;
 /** A staged index generation older than this with no activation is abandoned debris — nothing
  *  stages into `index_generations` before Phase 5, so this prunes zero rows until then. */
 export const STAGED_GENERATION_MAX_AGE_MS = 24 * 3600 * 1000;
+/** PLNR-256: a 'superseded' index generation older than this (by its own `activated_at` — see
+ *  `pruneSupersededGenerations`'s doc comment for why there is no separate "superseded_at")
+ *  is inert registry debris the sweep discards. This does NOT retire vectors — those are
+ *  retired eagerly at activation time (`activateCodeGeneration`'s `deletedUris`); this only
+ *  clears the now-inert `index_generations` row. */
+export const SUPERSEDED_GENERATION_MAX_AGE_MS = 24 * 3600 * 1000;
 /** How long a restore's retained prior generation stays available for rollback before the
  *  sweep discards it. */
 export const RETAINED_GENERATION_MAX_AGE_MS = 7 * 24 * 3600 * 1000;
@@ -129,6 +135,9 @@ export interface ProjectCleanupResult {
   prunedRetainedGeneration: boolean;
   prunedBackupGenerations: number;
   decayedMemories: number;
+  /** PLNR-256: superseded index-generation registry rows discarded (no second scheduler — see
+   *  SUPERSEDED_GENERATION_MAX_AGE_MS's doc comment for what this does and does not clean up). */
+  prunedSupersededGenerations: number;
 }
 
 /** Per-project debris cleanup for every project with a memory registry row: abandoned staged
@@ -142,7 +151,7 @@ export async function sweepProjectDebris(env: Env): Promise<ProjectCleanupResult
   const outcomes: ProjectCleanupResult[] = [];
   for (const { project_id: projectId } of results) {
     const stub = env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId));
-    const [prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations, decayedMemories] = await Promise.all([
+    const [prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations, decayedMemories, prunedSupersededGenerations] = await Promise.all([
       stub.pruneAbandonedStagedGenerations(projectId, STAGED_GENERATION_MAX_AGE_MS).catch(() => 0),
       stub.pruneRetainedGenerationIfExpired(projectId, RETAINED_GENERATION_MAX_AGE_MS).catch(() => false),
       pruneBackupRetention(env, projectId).catch(() => 0),
@@ -150,8 +159,9 @@ export async function sweepProjectDebris(env: Env): Promise<ProjectCleanupResult
         .decayLowAuthorityMemories(projectId, { maxAgeMs: MEMORY_HYPOTHESIS_DECAY_MAX_AGE_MS, authorityCeiling: MEMORY_HYPOTHESIS_DECAY_AUTHORITY_CEILING })
         .then((r) => r.decayed.length)
         .catch(() => 0),
+      stub.pruneSupersededGenerations(projectId, SUPERSEDED_GENERATION_MAX_AGE_MS).catch(() => 0),
     ]);
-    outcomes.push({ projectId, prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations, decayedMemories });
+    outcomes.push({ projectId, prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations, decayedMemories, prunedSupersededGenerations });
     await stub
       .health(projectId)
       .then((h) =>

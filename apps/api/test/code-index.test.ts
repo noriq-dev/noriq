@@ -1,0 +1,208 @@
+// PLNR-256: the code-intelligence Vectorize adapter — a SEPARATE index from PLNR-184/255's
+// operational `noriq-search`. Two layers, same technique as search.test.ts/memory-search.test.ts:
+//   - the pure indexCodeEntity/removeCodeEntity/queryCodeIndex/rebuildCodeIndex functions,
+//     driven directly with a fake embedder/store (neither AI nor CODE_VECTORIZE is bound in
+//     workerd tests);
+//   - the real ProjectMemory RPCs (activateCodeGeneration, pruneSupersededGenerations) that
+//     drive the `index_generations` registry's status transitions.
+import { env } from 'cloudflare:test';
+import { describe, expect, it } from 'vitest';
+import type { Env } from '../src/env';
+import { createUser, mintTokenForUser, mcpCall } from './helpers';
+import {
+  codeSearchBackend, indexCodeEntity, removeCodeEntity, queryCodeIndex, rebuildCodeIndex,
+  type CodeEntity, type CodeSearchBackend,
+} from '../src/memory/code-index';
+import { indexEntity as indexOperationalEntity, type SearchBackend, type EmbeddingClient, type VectorStore } from '../src/search';
+
+const appEnv = env as unknown as Env;
+
+const fakeEmbedder: EmbeddingClient = {
+  async embed(texts) { return texts.map((t) => [t.length % 97, t.charCodeAt(0) % 89, 1]); },
+};
+
+function fakeStore() {
+  const vectors = new Map<string, { values: number[]; metadata: Record<string, string> }>();
+  const store: VectorStore = {
+    async upsert(vs) { for (const v of vs) vectors.set(v.id, { values: v.values, metadata: v.metadata }); },
+    async deleteByIds(ids) { for (const id of ids) vectors.delete(id); },
+    async query(_vector, opts) {
+      const matches = [...vectors.entries()]
+        .filter(([, v]) => {
+          const f = opts.filter as { projectId?: { $eq: string }; repositoryKey?: { $eq: string } } | undefined;
+          if (f?.projectId && v.metadata.projectId !== f.projectId.$eq) return false;
+          if (f?.repositoryKey && v.metadata.repositoryKey !== f.repositoryKey.$eq) return false;
+          return true;
+        })
+        .map(([id, v], i) => ({ id, score: 1 - i * 0.01, metadata: v.metadata }));
+      return { matches: matches.slice(0, opts.topK) };
+    },
+  };
+  return { store, vectors };
+}
+
+interface MemRpc {
+  activateCodeGeneration(
+    pid: string,
+    input: { repositoryKey: string; generationId: string; branch: string; baseId: string; entities?: CodeEntity[]; deletedUris?: string[] },
+  ): Promise<{ activated: string; superseded: string[] }>;
+  pruneSupersededGenerations(pid: string, maxAgeMs: number): Promise<number>;
+  _seedSupersededIndexGenerationForTest(pid: string, repositoryKey: string, activatedAt: string): Promise<string>;
+  _getIndexGenerationStatusForTest(pid: string, generationId: string): Promise<string | null>;
+}
+const memory = (pid: string) => appEnv.PROJECT_MEMORY.get(appEnv.PROJECT_MEMORY.idFromName(pid)) as unknown as MemRpc;
+
+async function newOwnedProject(email: string, key: string) {
+  const user = await createUser(email, 'Owner', 'longenough1');
+  const token = await mintTokenForUser(email);
+  const proj = await mcpCall(token, 'create_project', { key, name: `${key} project` });
+  if (proj.isError) throw new Error(`create_project(${key}) failed: ${proj.text}`);
+  return { userId: user.id, token, projectId: proj.body.id as string };
+}
+
+describe('codeSearchBackend degrades cleanly without bindings', () => {
+  it('returns null when AI or CODE_VECTORIZE is unbound (the default workerd state)', () => {
+    expect(codeSearchBackend({} as Env)).toBeNull();
+    expect(codeSearchBackend({ AI: {} } as unknown as Env)).toBeNull();
+  });
+});
+
+describe('vector id scheme — generation-free, entity-URI keyed', () => {
+  it('re-indexing the same uri under a LATER generation is a plain upsert at the same id', async () => {
+    const { store, vectors } = fakeStore();
+    const backend: CodeSearchBackend = { embedder: fakeEmbedder, store };
+    const uri = 'noriq://file/PLNR/repo-a/src/index.ts';
+    await indexCodeEntity(backend, { uri, projectId: 'p1', repositoryKey: 'repo-a', generationId: 'gen-a', type: 'file', label: 'index.ts' });
+    expect([...vectors.keys()]).toEqual([uri]);
+    expect(vectors.get(uri)!.metadata.generationId).toBe('gen-a');
+
+    await indexCodeEntity(backend, { uri, projectId: 'p1', repositoryKey: 'repo-a', generationId: 'gen-b', type: 'file', label: 'index.ts (revised)' });
+    expect(vectors.size).toBe(1); // same id — an upsert, not a second vector
+    expect(vectors.get(uri)!.metadata.generationId).toBe('gen-b'); // metadata advanced
+
+    await removeCodeEntity(backend, uri);
+    expect(vectors.size).toBe(0);
+  });
+
+  it('file content chunks (like search.ts docs); a bare label with no content is one vector', async () => {
+    const { store, vectors } = fakeStore();
+    const backend: CodeSearchBackend = { embedder: fakeEmbedder, store };
+    await indexCodeEntity(backend, {
+      uri: 'noriq://file/PLNR/repo-a/big.ts', projectId: 'p1', repositoryKey: 'repo-a', generationId: 'gen-a', type: 'file', label: 'big.ts',
+      content: `${'x'.repeat(1400)}\n\n${'y'.repeat(1400)}`,
+    });
+    expect([...vectors.keys()]).toEqual(['noriq://file/PLNR/repo-a/big.ts', 'noriq://file/PLNR/repo-a/big.ts#1']);
+  });
+});
+
+describe('indexing code entities never churns the operational noriq-search index', () => {
+  it('two independent fake stores prove non-interference', async () => {
+    const operational = fakeStore();
+    const operationalBackend: SearchBackend = { embedder: fakeEmbedder, store: operational.store };
+    const code = fakeStore();
+    const codeBackend: CodeSearchBackend = { embedder: fakeEmbedder, store: code.store };
+
+    await indexOperationalEntity(operationalBackend, { kind: 'memory', id: 'mem_1', projectId: 'p1', title: 'decision', body: 'use postgres' });
+    const beforeOperational = new Map(operational.vectors);
+
+    await indexCodeEntity(codeBackend, { uri: 'noriq://file/PLNR/repo-a/x.ts', projectId: 'p1', repositoryKey: 'repo-a', generationId: 'gen-a', type: 'file', label: 'x.ts' });
+
+    expect(operational.vectors).toEqual(beforeOperational); // byte-identical — untouched
+    expect(operational.vectors.has('noriq://file/PLNR/repo-a/x.ts')).toBe(false);
+    expect(code.vectors.has('memory:mem_1')).toBe(false);
+  });
+});
+
+describe('queryCodeIndex filters query-time on the active generation', () => {
+  it('a vector from a superseded generation is excluded once another is active, even though it was never deleted', async () => {
+    const { store } = fakeStore();
+    const backend: CodeSearchBackend = { embedder: fakeEmbedder, store };
+    await indexCodeEntity(backend, { uri: 'noriq://file/PLNR/repo-a/old.ts', projectId: 'p1', repositoryKey: 'repo-a', generationId: 'gen-a', type: 'file', label: 'old.ts' });
+    await indexCodeEntity(backend, { uri: 'noriq://file/PLNR/repo-a/new.ts', projectId: 'p1', repositoryKey: 'repo-a', generationId: 'gen-b', type: 'file', label: 'new.ts' });
+
+    const activeOnly = await queryCodeIndex(backend, { q: 'ts', projectId: 'p1', activeGenerationIds: ['gen-b'] });
+    expect(activeOnly.map((h) => h.uri)).toEqual(['noriq://file/PLNR/repo-a/new.ts']);
+
+    const both = await queryCodeIndex(backend, { q: 'ts', projectId: 'p1' }); // no generation filter — sees everything
+    expect(both.map((h) => h.uri).sort()).toEqual(['noriq://file/PLNR/repo-a/new.ts', 'noriq://file/PLNR/repo-a/old.ts']);
+  });
+
+  it('never returns a vector belonging to a different project, even sharing the same store', async () => {
+    const { store } = fakeStore();
+    const backend: CodeSearchBackend = { embedder: fakeEmbedder, store };
+    await indexCodeEntity(backend, { uri: 'noriq://file/AAA/repo-a/x.ts', projectId: 'pA', repositoryKey: 'repo-a', generationId: 'gen-a', type: 'file', label: 'x.ts' });
+    await indexCodeEntity(backend, { uri: 'noriq://file/BBB/repo-a/x.ts', projectId: 'pB', repositoryKey: 'repo-a', generationId: 'gen-a', type: 'file', label: 'x.ts' });
+    const hits = await queryCodeIndex(backend, { q: 'x.ts', projectId: 'pA' });
+    expect(hits.map((h) => h.uri)).toEqual(['noriq://file/AAA/repo-a/x.ts']);
+  });
+});
+
+describe('rebuildCodeIndex — resumable and idempotent, mirroring reindexProject\'s contract', () => {
+  it('resumes from its returned offset and produces the same vector set on a second full run', async () => {
+    const { store, vectors } = fakeStore();
+    const backend: CodeSearchBackend = { embedder: fakeEmbedder, store };
+    const entities: CodeEntity[] = Array.from({ length: 5 }, (_, i) => ({
+      uri: `noriq://file/PLNR/repo-a/f${i}.ts`, projectId: 'p1', repositoryKey: 'repo-a', generationId: 'gen-a', type: 'file', label: `f${i}.ts`,
+    }));
+
+    let progress = await rebuildCodeIndex(backend, entities, 0, 2);
+    expect(progress).toEqual({ indexed: 2, offset: 0, total: 5, remaining: 3 });
+    progress = await rebuildCodeIndex(backend, entities, progress.offset + progress.indexed, 2);
+    expect(progress).toEqual({ indexed: 2, offset: 2, total: 5, remaining: 1 });
+    progress = await rebuildCodeIndex(backend, entities, progress.offset + progress.indexed, 2);
+    expect(progress).toEqual({ indexed: 1, offset: 4, total: 5, remaining: 0 });
+    expect(vectors.size).toBe(5);
+
+    // Running the whole thing again from scratch upserts — same 5 vectors, not 10.
+    await rebuildCodeIndex(backend, entities, 0, 100);
+    expect(vectors.size).toBe(5);
+  });
+});
+
+describe('activateCodeGeneration — real index_generations status transitions', () => {
+  it('supersedes the previously-active generation for the same repository and activates the new one', async () => {
+    const { projectId } = await newOwnedProject('code-idx-1@example.com', 'CIDX1');
+    const first = await memory(projectId).activateCodeGeneration(projectId, {
+      repositoryKey: 'repo-a', generationId: 'gen_first', branch: 'main', baseId: 'sha_1',
+      entities: [{ uri: 'noriq://file/CIDX1/repo-a/a.ts', projectId, repositoryKey: 'repo-a', generationId: 'gen_first', type: 'file', label: 'a.ts' }],
+    });
+    expect(first).toEqual({ activated: 'gen_first', superseded: [] });
+    expect(await memory(projectId)._getIndexGenerationStatusForTest(projectId, 'gen_first')).toBe('active');
+
+    const second = await memory(projectId).activateCodeGeneration(projectId, {
+      repositoryKey: 'repo-a', generationId: 'gen_second', branch: 'main', baseId: 'sha_2',
+      entities: [{ uri: 'noriq://file/CIDX1/repo-a/a.ts', projectId, repositoryKey: 'repo-a', generationId: 'gen_second', type: 'file', label: 'a.ts (unchanged)' }],
+      deletedUris: ['noriq://file/CIDX1/repo-a/removed.ts'],
+    });
+    expect(second).toEqual({ activated: 'gen_second', superseded: ['gen_first'] });
+    expect(await memory(projectId)._getIndexGenerationStatusForTest(projectId, 'gen_first')).toBe('superseded');
+    expect(await memory(projectId)._getIndexGenerationStatusForTest(projectId, 'gen_second')).toBe('active');
+  });
+
+  it('works with no CODE_VECTORIZE bound — the status transition is unconditional; only vector publish/retire degrades', async () => {
+    const { projectId } = await newOwnedProject('code-idx-2@example.com', 'CIDX2');
+    // No AI/CODE_VECTORIZE bound in the workerd test env — this must not throw.
+    await expect(
+      memory(projectId).activateCodeGeneration(projectId, { repositoryKey: 'repo-b', generationId: 'gen_x', branch: 'main', baseId: 'sha_1' }),
+    ).resolves.toEqual({ activated: 'gen_x', superseded: [] });
+  });
+});
+
+describe('pruneSupersededGenerations — registry-row GC, mirrors pruneAbandonedStagedGenerations', () => {
+  it('discards a superseded generation past its retention window; idempotent at zero', async () => {
+    const { projectId } = await newOwnedProject('code-idx-3@example.com', 'CIDX3');
+    const old = new Date(Date.now() - 25 * 3600 * 1000).toISOString(); // > 24h default
+    await memory(projectId)._seedSupersededIndexGenerationForTest(projectId, 'repo-c', old);
+
+    const pruned = await memory(projectId).pruneSupersededGenerations(projectId, 24 * 3600 * 1000);
+    expect(pruned).toBe(1);
+    const again = await memory(projectId).pruneSupersededGenerations(projectId, 24 * 3600 * 1000);
+    expect(again).toBe(0);
+  });
+
+  it('leaves a recently-superseded generation alone', async () => {
+    const { projectId } = await newOwnedProject('code-idx-4@example.com', 'CIDX4');
+    await memory(projectId)._seedSupersededIndexGenerationForTest(projectId, 'repo-d', new Date().toISOString());
+    expect(await memory(projectId).pruneSupersededGenerations(projectId, 24 * 3600 * 1000)).toBe(0);
+  });
+});
