@@ -6,12 +6,66 @@ import type { Env } from '../env';
 import type { ProjectMemoryHealth } from '../do/ProjectMemory';
 import { userCanAccessProject } from './visibility';
 
-/** The subset of ProjectMemory's RPC surface this phase needs. Later phases (PLNR-251+) widen
- *  this as the DO grows real write APIs — the stub itself is untyped RPC, this is just the
- *  slice callers here are allowed to see. */
+/** An evidence citation as the write RPCs accept it — validated server-side (writes.ts) against
+ *  the shared RepositoryKey/BranchRef/BaseId/RepoPath schemas; not re-validated here. */
+export interface MemoryEvidenceInput {
+  repositoryKey: string;
+  branch: string;
+  baseId: string;
+  path: string;
+  symbol?: string | null;
+}
+export interface MemoryActorRef {
+  kind: string;
+  id: string | null;
+}
+export interface MemoryItemRecord {
+  id: string;
+  kind: string;
+  statement: string;
+  authority: number;
+  confidence: number | null;
+  contentHash: string | null;
+  repositoryKey: string | null;
+  branch: string | null;
+  baseId: string | null;
+  validity: string;
+  supersedesMemoryId: string | null;
+  recordedByAgentId: string | null;
+  recordedAt: string;
+  evidence: Array<{ id: string; repositoryKey: string; branch: string; baseId: string; path: string; symbol: string | null; verificationState: string }>;
+}
+
+/** The subset of ProjectMemory's RPC surface callers outside the DO reach through. Widened as
+ *  each phase adds a real API (PLNR-251's write APIs, PLNR-252's agent-facing tool + human
+ *  reads) — the stub itself is untyped RPC, this is just the slice callers here are allowed to see. */
 export interface ProjectMemoryStub {
   health(projectId: string): Promise<ProjectMemoryHealth>;
   erase(projectId: string): Promise<{ ok: true }>;
+  recordMemory(
+    projectId: string,
+    input: {
+      operationId?: string;
+      kind: string;
+      statement: string;
+      authority?: number;
+      confidence?: number | null;
+      evidence?: MemoryEvidenceInput[];
+      supersedesMemoryId?: string | null;
+      scope?: { repositoryKey?: string; branch?: string; baseId?: string };
+      actor: MemoryActorRef;
+    },
+  ): Promise<{ memoryId: string; operationId: string; deduped: boolean }>;
+  addContradiction(
+    projectId: string,
+    input: { operationId?: string; memoryItemId: string; contradictsMemoryItemId: string; setId?: string | null; actor: MemoryActorRef },
+  ): Promise<{ setId: string; contradictionId: string; operationId: string; deduped: boolean }>;
+  recordFeedback(
+    projectId: string,
+    input: { operationId?: string; memoryItemId: string; vote: 'up' | 'down'; reason?: string | null; actor: MemoryActorRef },
+  ): Promise<{ feedbackId: string; operationId: string; deduped: boolean }>;
+  getMemoryItem(projectId: string, memoryId: string): Promise<MemoryItemRecord | null>;
+  getContradictionSet(projectId: string, setId: string): Promise<{ setId: string; memoryItemIds: string[]; resolvedAt: string | null }>;
 }
 
 /**

@@ -276,6 +276,29 @@ Before your first doc of a session, read the **doc-authoring guide** — what be
 in a doc, the shapes that work, and how to write bodies that last: the MCP resource
 \`noriq://skill/doc-authoring\` (resources/read), or \`GET /skill/docs.md\`.
 
+## Project memory
+
+Docs are settled facts; **project memory is the other thing** — durable learnings,
+decisions, failed approaches, procedures, requirements, hazards, and open unknowns,
+each carrying its own authority and confidence rather than being presented as
+settled. Record one with \`record_memory\` whenever you learn something a future
+agent working this project should know and it is not already a doc: a
+\`kind\` (\`learning\` | \`decision\` | \`failed_approach\` | \`procedure\` | \`requirement\` |
+\`hazard\` | \`unknown\`), a \`statement\` in your own words, and — when you have
+one — the \`evidence\` backing it (repository, branch, revision, path). Anything you
+record enters at low authority and stays **provisional**: it is never handed to a
+future agent as an instruction, only as quoted, cited evidence it can weigh for
+itself. You cannot raise your own authority — that happens only through a separate
+human-approval step or verified merged-code evidence.
+
+The same tool carries three more operations via \`op\`, so the agent-facing surface
+never multiplies: \`op="contradict"\` links two memories that disagree so both stay
+visible as a named, addressable disagreement instead of one silently winning;
+\`op="feedback"\` votes a memory useful/not without touching its statement or
+evidence; and setting \`supersedesMemoryId\` on a fresh \`op="record"\` call is how you
+**correct** an earlier memory — the old one is never edited or deleted, only
+superseded, so history stays inspectable.
+
 ## Git
 
 Attach your branch/PR to the task with \`attach_ref\` so humans see where the work

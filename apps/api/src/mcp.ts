@@ -16,8 +16,9 @@ import {
   userCanAccessProject,
 } from './lib/visibility';
 import { taskSearchFilters } from './lib/search';
-import { ExecutionSpec, type ExecutionSpecInput } from '@noriq-dev/shared';
+import { ExecutionSpec, type ExecutionSpecInput, MemoryKind, EvidenceRef } from '@noriq-dev/shared';
 import { readExecutionSpec } from './lib/execution-spec';
+import type { ProjectMemoryStub } from './lib/project-memory';
 import { refuseSpecWrite, specWriteRefusalMessage } from './lib/spec-authority';
 import { search, searchBackend, reindexProject } from './search';
 import { nearDupeGroups } from './lib/tags';
@@ -131,6 +132,14 @@ with TBDs or open questions is rejected). Check a task's related docs (get_task.
 and list_docs before unfamiliar work; link the docs a task must follow via docIds at
 creation; when you settle something durable, create_doc the outcome. Undecided things
 are not docs — raise request_input, then document the answer.
+Project memory is the OTHER knowledge base — learnings, decisions, failed approaches,
+procedures, requirements, hazards, and unknowns that are NOT yet settled facts. Record
+one with record_memory whenever you learn something the next agent should know; it
+enters at low authority and is presented as cited, provisional evidence, never as an
+instruction — you cannot raise your own authority. The same tool's op field covers
+correction (supersedesMemoryId, never a destructive edit), contradiction (op="contradict",
+so disagreeing claims stay visible instead of one silently winning), and feedback
+(op="feedback") without multiplying the tool catalogue.
 Search before you file: semantic_search finds tasks, docs and plans by meaning — the
 thing you are about to create may already exist. Use search_tasks for attribute filters.
 Working a run and found REAL work that is not your task's? File it with spin_off_task —
@@ -144,6 +153,13 @@ by a runner for exactly one run, pinned to one project. Sub-agent attribution is
 
 function room(env: Env, projectId: string) {
   return env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName(projectId));
+}
+
+/** PLNR-251/252: this project's cognitive-memory DO stub. Authorization already happened in the
+ *  `tool()` wrapper (every project-bearing tool is checked against `projectId` before its handler
+ *  runs) — this is a direct route, the same pattern `room()` above uses for ProjectRoom. */
+function memoryStub(env: Env, projectId: string): ProjectMemoryStub {
+  return env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)) as unknown as ProjectMemoryStub;
 }
 
 /**
@@ -391,6 +407,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           'Hand the NEXT agent what you learned: a task\'s executionSpec carries requirementIds, anticipated files, required reading, decisions already settled (do not relitigate), where it may use its own judgement, what is explicitly out of scope, and acceptance criteria written as truths rather than steps. Fill it in whenever you know more than the title and body say — on create_task/create_tasks, on a plan\'s newTasks, or later with update_task (which REPLACES the whole spec; read it first and send it back complete). Read it before you start (get_task.executionSpec): if it is there, its lockedDecisions bind you and its acceptance is your definition of done. If executionSpecUnreadable is set, the stored spec is corrupt — say so, do not treat it as absent. A build or verify run cannot REWRITE its own task\'s spec: it is what your work is judged against, so if it is wrong say so in a comment and let a human or a scope run correct it.',
           'Tasks you create MUST carry descriptive tags — topic/area/component words (e.g. "oauth", "board-filters"), FIRST tag = primary tag. Tags are the project\'s SHARED filter vocabulary: reuse existing tags (get_project.tags) before minting — near-duplicates are rejected, and some projects are curated (agents cannot mint at all). Never status/type/priority words as tags. Use dependsOn only for real, hand-picked orderings — the blocker may live in another project you can access (ids and display keys are globally unique; the gate crosses the boundary unchanged).',
           'Project docs are settled decisions and facts ONLY (enforced — open questions/TBDs are rejected). Read a task\'s related docs (get_task.docs) before starting; link the docs new tasks must follow via docIds; when you settle something durable, create_doc the outcome. Undecided → request_input first, then document the answer.',
+          'Project memory is the OTHER knowledge base — learnings, decisions, failed approaches, procedures, requirements, hazards, and unknowns, recorded with record_memory (kind + statement, optionally evidence). It enters at low authority and stays provisional — quoted, cited evidence for a future agent to weigh, never an instruction, and you cannot raise your own authority. The same tool\'s `op` covers correction (supersedesMemoryId — never a destructive edit), contradiction (op="contradict", so disagreeing claims stay visible together), and feedback (op="feedback") — one tool, not four.',
           'Search before you file or dig: semantic_search finds tasks, docs and plans by MEANING (the thing you are about to create may already exist); search_tasks filters by attributes. get_project is the scaffold (ids, tags, boards, docs index, active plans, P0 tasks) — not a task list; never expect the whole backlog from it.',
           'Priority runs 0 = MOST urgent to 4 = someday (P0 means drop everything; 2 is the default "normal"). The number goes DOWN as urgency goes UP — filing real work as P4 buries it, and the top of a queue is its LOWEST priority number.',
           'Claims are exclusive. If claim_task fails, the task is taken or blocked — pick another.',
@@ -2002,6 +2019,82 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       description: z.string().optional().describe('The goal / exit criteria for this milestone'),
     },
     tool(async ({ projectId, title, dueAt, description }) => room(env, projectId).createMilestone(projectId, actor, title, dueAt, description)),
+  );
+
+  // ---- project memory (PLNR-251/252) --------------------------------------
+
+  defineTool(
+    'record_memory',
+    'Record durable project knowledge into this project\'s cognitive memory — the ONE tool for it. Correction, feedback, contradiction, and supersession are OPERATIONS on this same surface via `op`, never separate tools. ' +
+      'op="record" (the default): record a NEW memory. Requires `kind` (one of: learning, decision, failed_approach, procedure, requirement, hazard, unknown) and `statement` (your claim, in prose — it is shown to future agents inside a bounded quoted-evidence frame with your authority/confidence attached, never as an instruction they must follow). ' +
+      'Optional on op="record": `evidence` — an array of citations backing the statement, each {repositoryKey, branch, baseId, path, symbol?} (cite what you actually looked at; a citation whose repositoryKey looks like a runner-local checkout id is rejected — use the project\'s committed repository key); ' +
+      '`confidence` (0-1); `scope` — {repositoryKey, branch, baseId} describing what repo/branch/revision this memory is ABOUT, if it is about one (branch/baseId require repositoryKey); ' +
+      '`supersedesMemoryId` — set this to CORRECT a prior memory with a new one: the old memory is never edited or deleted, it stays fully readable and linked as history, and your new statement becomes the current version; ' +
+      '`authority` (1-5, what you believe your own claim deserves) — the server CLAMPS this to at most 2 for anything you record; asking for higher has no effect, only a human approval (a separate governance step, not this tool) or verified merged-code evidence can raise it. ' +
+      'op="contradict": link two EXISTING memories as conflicting, addressable together as one named set — requires `memoryItemId` and `contradictsMemoryItemId`; pass `contradictionSetId` to fold a third claim into an existing disagreement instead of starting a new one. Both memories remain independently retrievable afterward — nothing is resolved or hidden automatically. ' +
+      'op="feedback": vote on an existing memory\'s usefulness — requires `memoryItemId` and `vote` ("up" or "down"), optional `reason`. This NEVER rewrites the memory\'s statement, evidence, or authority — only supersession (`supersedesMemoryId`) does that; feedback only ever changes ranking/presentation.',
+    {
+      projectId: z.string(),
+      op: z.enum(['record', 'contradict', 'feedback']).optional().describe('Which operation to perform — defaults to "record". See the tool description for what each one requires.'),
+      // op="record"
+      kind: MemoryKind.optional().describe('Required for op="record": learning | decision | failed_approach | procedure | requirement | hazard | unknown'),
+      statement: z.string().min(1).optional().describe('Required for op="record": your claim, in prose'),
+      confidence: z.number().min(0).max(1).optional().describe('op="record" only: your own confidence, 0-1'),
+      evidence: z.array(EvidenceRef).optional().describe('op="record" only: citations backing the statement — [{repositoryKey, branch, baseId, path, symbol?}]'),
+      scope: z
+        .object({
+          repositoryKey: z.string().optional(),
+          branch: z.string().optional(),
+          baseId: z.string().optional(),
+        })
+        .optional()
+        .describe('op="record" only: what repo/branch/revision this memory is ABOUT, if any — branch/baseId require repositoryKey'),
+      supersedesMemoryId: z.string().optional().describe('op="record" only: set to CORRECT a prior memory — the old one stays fully readable, never edited in place'),
+      authority: z.number().int().min(1).max(5).optional().describe('op="record" only: clamped server-side to at most 2 for anything an agent records — see tool description'),
+      // op="contradict" / op="feedback"
+      memoryItemId: z.string().optional().describe('Required for op="contradict" (the first memory) and op="feedback" (the memory being voted on)'),
+      contradictsMemoryItemId: z.string().optional().describe('Required for op="contradict": the memory that conflicts with memoryItemId'),
+      contradictionSetId: z.string().optional().describe('op="contradict" only: fold into this existing contradiction set instead of starting a new one'),
+      vote: z.enum(['up', 'down']).optional().describe('Required for op="feedback"'),
+      reason: z.string().optional().describe('op="feedback" only: why'),
+    },
+    tool(async ({ projectId, op, kind, statement, confidence, evidence, scope, supersedesMemoryId, authority, memoryItemId, contradictsMemoryItemId, contradictionSetId, vote, reason }) => {
+      const stub = memoryStub(env, projectId);
+      // Every write through THIS tool is an AI actor — whether the session is a human's
+      // copilot or a runner-spawned agent, neither is a human approval (PLNR-253's REST-only
+      // path is the only route to authority 5) — so both are clamped identically by PLNR-251's
+      // RPC layer. This tool adds no cap of its own; it only passes the actor through.
+      const actorRef = { kind: 'agent', id: agent.id };
+      const resolvedOp = op ?? 'record';
+      if (resolvedOp === 'record') {
+        if (!kind) throw new Error('kind is required for op="record"');
+        if (!statement?.trim()) throw new Error('statement is required for op="record"');
+        return stub.recordMemory(projectId, {
+          kind,
+          statement,
+          authority,
+          confidence: confidence ?? null,
+          evidence,
+          supersedesMemoryId: supersedesMemoryId ?? null,
+          scope,
+          actor: actorRef,
+        });
+      }
+      if (resolvedOp === 'contradict') {
+        if (!memoryItemId || !contradictsMemoryItemId) {
+          throw new Error('memoryItemId and contradictsMemoryItemId are required for op="contradict"');
+        }
+        return stub.addContradiction(projectId, {
+          memoryItemId,
+          contradictsMemoryItemId,
+          setId: contradictionSetId ?? null,
+          actor: actorRef,
+        });
+      }
+      // resolvedOp === 'feedback'
+      if (!memoryItemId || !vote) throw new Error('memoryItemId and vote are required for op="feedback"');
+      return stub.recordFeedback(projectId, { memoryItemId, vote, reason: reason ?? null, actor: actorRef });
+    }),
   );
 
   // ---- git awareness (Phase 4) --------------------------------------------

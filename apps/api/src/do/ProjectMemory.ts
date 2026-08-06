@@ -882,6 +882,54 @@ export class ProjectMemory extends DurableObject<Env> {
     return { setId, memoryItemIds: [...ids], resolvedAt: setRow?.resolved_at ?? null };
   }
 
+  /** Basic up/down feedback on a memory (§11 — an operation on the memory surface, not a
+   *  separate agent tool). 0001's `feedback.vote` is CHECK-constrained to exactly these two
+   *  values; PLNR-254 widens the vocabulary (useful/incorrect/outdated/harmful/unverifiable)
+   *  with its own additive migration — this RPC does not anticipate that shape. */
+  async recordFeedback(
+    projectId: string,
+    input: { operationId?: string; memoryItemId: string; vote: 'up' | 'down'; reason?: string | null; actor: { kind: string; id: string | null } },
+  ): Promise<{ feedbackId: string; operationId: string; deduped: boolean }> {
+    await this.assertProjectId(projectId);
+    if (input.operationId) {
+      const existing = this.lookupAppliedOperation(input.operationId);
+      if (existing) return { feedbackId: (JSON.parse(existing.result) as { feedbackId: string }).feedbackId, operationId: input.operationId, deduped: true };
+    }
+    const operationId = input.operationId ?? newId('op');
+    const feedbackId = newId('fbk');
+    const now = nowIso();
+    this.ctx.storage.transactionSync(() => {
+      if (this._forceWriteFailure) throw new Error('injected write failure (test)');
+      this.ctx.storage.sql.exec(
+        `INSERT INTO feedback (id, memory_item_id, actor_id, vote, reason, created_at) VALUES (?1,?2,?3,?4,?5,?6)`,
+        feedbackId,
+        input.memoryItemId,
+        input.actor.id ?? 'system',
+        input.vote,
+        input.reason ?? null,
+        now,
+      );
+      this.ctx.storage.sql.exec(
+        `INSERT INTO outbox (id, operation_id, verb, subject_type, subject_id, payload, created_at) VALUES (?1,?2,'memory.changed','memory',?3,?4,?5)`,
+        newId('obx'),
+        operationId,
+        feedbackId,
+        JSON.stringify({ operationId, entityType: 'feedback', memoryItemId: input.memoryItemId, vote: input.vote }),
+        now,
+      );
+      this.ctx.storage.sql.exec(`UPDATE memory_revision SET value = value + 1 WHERE id = 0`);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO applied_operations (operation_id, applied_at, subject_type, subject_id, result) VALUES (?1,?2,'feedback',?3,?4)`,
+        operationId,
+        now,
+        feedbackId,
+        JSON.stringify({ feedbackId }),
+      );
+    });
+    this.ctx.storage.setAlarm(Date.now()).catch(() => {});
+    return { feedbackId, operationId, deduped: false };
+  }
+
   /** A memory item in full — statement, authority, scope, and its evidence — exactly as
    *  recorded. A superseded item is reachable through this the same way its replacement is;
    *  supersession never mutates or hides the row it links back to (§12). */

@@ -28,6 +28,7 @@ import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
 import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
 import { z } from 'zod';
+import type { ProjectMemoryStub } from './lib/project-memory';
 import { AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget, isTerminalRunStatus, normalizeProjectKey } from '@noriq-dev/shared';
 
 export { ProjectRoom } from './do/ProjectRoom';
@@ -1079,6 +1080,27 @@ app.patch('/api/projects/:pid/docs/:did', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).updateDoc(c.req.param('pid')!, humanActor(c), c.req.param('did')!, await c.req.json())));
 app.delete('/api/projects/:pid/docs/:did', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).deleteDoc(c.req.param('pid')!, humanActor(c), c.req.param('did')!)));
+
+// Project memory (PLNR-251/252) — human-facing READS only; recording happens through the
+// agent-facing record_memory MCP tool. Access is already gated by requireProjectAccess on
+// /api/projects/:pid/* (line 138), same as every other route in this block.
+const memoryStub = (env: Env, pid: string): ProjectMemoryStub =>
+  env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(pid)) as unknown as ProjectMemoryStub;
+
+app.get('/api/projects/:pid/memory/health', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  return c.json(await memoryStub(c.env, pid).health(pid));
+});
+app.get('/api/projects/:pid/memory/items/:id', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const row = await memoryStub(c.env, pid).getMemoryItem(pid, c.req.param('id')!);
+  if (!row) return c.json({ error: 'not found' }, 404);
+  return c.json(row);
+});
+app.get('/api/projects/:pid/memory/contradictions/:setId', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  return c.json(await memoryStub(c.env, pid).getContradictionSet(pid, c.req.param('setId')!));
+});
 
 // Plan-local docs (PLNR-200) — working documents scoped to one plan; read via the snapshot
 // (planDocs) or MCP get_plans/get_plan_doc. Under /api/projects/:pid/* → project-reach gated.
