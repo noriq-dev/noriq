@@ -2824,20 +2824,22 @@ export class ProjectRoom extends DurableObject<Env> {
    *  so the registry mechanics are provable now. */
   async upsertMemoryHealth(
     projectId: string,
-    health: { schemaVersion: number; memoryRevision: number },
+    health: { schemaVersion: number; memoryRevision: number; sizeBytes?: number; sizeStatus?: 'ok' | 'warn' | 'critical' },
   ): Promise<{ ok: true }> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const now = nowIso();
       await this.env.DB.prepare(
-        `INSERT INTO project_memory_registry (project_id, schema_version, memory_revision, last_health_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO project_memory_registry (project_id, schema_version, memory_revision, size_bytes, size_status, last_health_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (project_id) DO UPDATE SET
            schema_version = excluded.schema_version,
            memory_revision = excluded.memory_revision,
+           size_bytes = excluded.size_bytes,
+           size_status = excluded.size_status,
            last_health_at = excluded.last_health_at,
            updated_at = excluded.updated_at`,
-      ).bind(projectId, health.schemaVersion, health.memoryRevision, now, now, now).run();
+      ).bind(projectId, health.schemaVersion, health.memoryRevision, health.sizeBytes ?? null, health.sizeStatus ?? 'ok', now, now, now).run();
       return { ok: true };
     });
   }
@@ -2990,20 +2992,36 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM project_repositories WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM project_memory_registry WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM memory_event_dedup WHERE project_id = ?').bind(pid),
+        // A durable erasure tombstone (PLNR-250) — deliberately NOT deleted here, and not an
+        // FK target of `projects`: it must outlive the row this batch is about to remove, the
+        // same exemption `templates`/`event_seq` get and for the same reason (see CLAUDE.md).
+        // Written in this SAME atomic batch so the record of "this project's memory must be
+        // erased" can never be lost even if the fire-and-forget attempt below never lands.
+        this.env.DB.prepare(
+          `INSERT INTO memory_erasure_tombstones (project_id, requested_at) VALUES (?, ?)
+           ON CONFLICT (project_id) DO NOTHING`,
+        ).bind(pid, nowIso()),
         this.env.DB.prepare('DELETE FROM projects WHERE id = ?').bind(pid),
       ]);
       // Batch committed — now the attachment rows are gone, so it is safe to drop their blobs.
       if (this.env.FILES) for (const key of r2Keys) await this.env.FILES.delete(key).catch(() => {});
       // The deleted project's key stands in for a blocker id nothing can resolve anymore.
       this.notifyExternalDependents(externalDependents, { id: '', key: proj.key });
-      // Canonical memory erasure (PLNR-246): best-effort, fire-and-forget — the same shape as
-      // notifyExternalDependents. The D1 batch above already committed the registry deletion,
-      // so a lost signal here costs only an orphaned (and now unreachable — no registry row
-      // points at it) ProjectMemory store, never an inconsistent D1. Full retention/quota
-      // policy is PLNR-250's; this is the scheduling hook it hangs off of.
+      // Canonical memory erasure (PLNR-250): best-effort, fire-and-forget — the same shape as
+      // notifyExternalDependents. The tombstone inserted above is the durability backstop: if
+      // this attempt succeeds, clear it now so the common case doesn't wait for the scheduled
+      // sweep (lib/memory/lifecycle.ts); if it's lost or fails, the sweep retries it later —
+      // correctness never depends on this call landing.
       void this.env.PROJECT_MEMORY.get(this.env.PROJECT_MEMORY.idFromName(pid))
-        .erase(pid)
-        .catch((err) => console.warn(`ProjectMemory erase for ${pid} failed: ${String(err)}`));
+        .eraseAll(pid)
+        .then(async (report) => {
+          if (report.ok) {
+            await this.env.DB.prepare('DELETE FROM memory_erasure_tombstones WHERE project_id = ?').bind(pid).run();
+          } else {
+            console.warn(`ProjectMemory eraseAll for ${pid} reported failures: ${JSON.stringify(report.steps.filter((s) => !s.ok))}`);
+          }
+        })
+        .catch((err) => console.warn(`ProjectMemory eraseAll for ${pid} failed: ${String(err)}`));
       await this.ctx.storage.deleteAlarm().catch(() => {});
       this.dropSearch('task', ...vecTasks.results.map((r) => r.id));
       this.dropSearch('doc', ...vecDocs.results.map((r) => r.id));

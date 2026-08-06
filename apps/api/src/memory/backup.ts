@@ -23,10 +23,12 @@ export const MEMORY_BACKUP_FORMAT_VERSION = 1;
  *  never holds more than one chunk's worth of one table's rows in memory at a time. */
 const DEFAULT_CHUNK_ROWS = 500;
 
-// Exported for restore.ts (PLNR-249) — it reads exactly what this file writes, so the prefix
-// convention, the compression codec, and the checksum algorithm are shared, not re-derived.
+// Exported for restore.ts (PLNR-249) and lifecycle.ts (PLNR-250) — they read/enumerate exactly
+// what this file writes, so the prefix convention, the compression codec, and the checksum
+// algorithm are shared, not re-derived.
+export const projectBackupsPrefix = (projectId: string): string => `memory-backups/${projectId}/`;
 export const backupPrefix = (projectId: string, exportedAt: string): string =>
-  `memory-backups/${projectId}/${exportedAt.replace(/[:.]/g, '-')}`;
+  `${projectBackupsPrefix(projectId)}${exportedAt.replace(/[:.]/g, '-')}`;
 
 async function drainStream(readable: ReadableStream<Uint8Array>): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];

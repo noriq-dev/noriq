@@ -8,6 +8,7 @@ import { buildMcpServer } from './mcp';
 import { handleModernMcp, isModernMcpRequest } from './mcp-2026';
 import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot, importSnapshot } from './backup';
+import { sweepPendingErasures, sweepProjectDebris } from './memory/lifecycle';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, timingSafeEqual, verifyPassword, verifyPasswordConstantTime } from './lib/util';
 import { taskSearchFilters } from './lib/search';
 import type { ExecutionSpecInput, RunStatus } from '@noriq-dev/shared';
@@ -323,6 +324,14 @@ app.post('/api/admin/memory-restore/:projectId/rollback', adminAuth, async (c) =
   const projectId = c.req.param('projectId')!;
   const res = await c.env.PROJECT_MEMORY.get(c.env.PROJECT_MEMORY.idFromName(projectId)).rollback(projectId);
   return c.json(res, res.ok ? 200 : 400);
+});
+
+// On-demand trigger of the same lifecycle sweep the cron runs (PLNR-250) — retries any standing
+// erasure tombstone and prunes per-project debris. Safe to call any time; both halves are
+// independently idempotent, same as the scheduled() version.
+app.post('/api/admin/memory-lifecycle-sweep', adminAuth, async (c) => {
+  const [erasures, debris] = await Promise.all([sweepPendingErasures(c.env), sweepProjectDebris(c.env)]);
+  return c.json({ erasures, debris });
 });
 
 // Restore a snapshot (PLNR-218) — the inverse of /export. DESTRUCTIVE: REPLACES all data
@@ -2712,6 +2721,17 @@ export default {
             ),
           )
           .catch((err) => console.warn(`[memory-backup] sweep failed: ${String(err)}`)),
+      );
+      // ProjectMemory lifecycle sweep (PLNR-250): retry any standing erasure tombstone, then
+      // prune per-project debris (abandoned staged index generations, an expired retained
+      // restore generation, backups beyond the retention count) and refresh visible size
+      // status. Independent of the backup sweep above — a failure in one never blocks the
+      // other, since both are separately-caught waitUntil branches.
+      ctx.waitUntil(
+        Promise.all([
+          sweepPendingErasures(env).then((r) => console.log(`[memory-lifecycle] erasure sweep: ${r.length} tombstone(s) processed`)),
+          sweepProjectDebris(env).then((r) => console.log(`[memory-lifecycle] debris sweep: ${r.length} project(s) processed`)),
+        ]).catch((err) => console.warn(`[memory-lifecycle] sweep failed: ${String(err)}`)),
       );
     }
     // Backstop auto-archive for projects nobody has viewed (the snapshot sweeps viewed ones).

@@ -1,0 +1,156 @@
+// PLNR-250: retention, cleanup, and erasure orchestration for ProjectMemory.
+//
+// This file, like backup.ts/restore.ts, never opens a DO's SQLite storage directly — it either
+// operates on R2 (backup retention, whole-project erasure of backups) or calls RPCs on a
+// ProjectMemory stub through `env.PROJECT_MEMORY` (staged-generation pruning, retained-
+// generation pruning, the auditable erase sequence). Because `Env.PROJECT_MEMORY` is already
+// typed as `DurableObjectNamespace<ProjectMemory>`, every stub call here is fully typed without
+// this file importing the DO class itself — keeping the dependency one-way (ProjectMemory.ts
+// imports FROM this file for thresholds and the R2 helpers below, never the reverse).
+import type { Env } from '../env';
+import { projectBackupsPrefix } from './backup';
+
+/** How many backup generations (distinct exportedAt prefixes) to keep per project. */
+export const DEFAULT_BACKUP_RETENTION_COUNT = 7;
+/** A staged index generation older than this with no activation is abandoned debris — nothing
+ *  stages into `index_generations` before Phase 5, so this prunes zero rows until then. */
+export const STAGED_GENERATION_MAX_AGE_MS = 24 * 3600 * 1000;
+/** How long a restore's retained prior generation stays available for rollback before the
+ *  sweep discards it. */
+export const RETAINED_GENERATION_MAX_AGE_MS = 7 * 24 * 3600 * 1000;
+/** Visibility thresholds only (§18) — nothing here refuses a write at either line. */
+export const DB_SIZE_WARN_BYTES = 500 * 1024 * 1024;
+export const DB_SIZE_CRITICAL_BYTES = 1024 * 1024 * 1024;
+
+export function sizeStatus(databaseSize: number): 'ok' | 'warn' | 'critical' {
+  if (databaseSize >= DB_SIZE_CRITICAL_BYTES) return 'critical';
+  if (databaseSize >= DB_SIZE_WARN_BYTES) return 'warn';
+  return 'ok';
+}
+
+async function deleteR2Prefix(env: Env, prefix: string): Promise<number> {
+  if (!env.FILES) return 0;
+  const files = env.FILES;
+  let deleted = 0;
+  let cursor: string | undefined;
+  do {
+    const page = await files.list({ prefix, cursor, limit: 1000 });
+    if (page.objects.length > 0) {
+      await files.delete(page.objects.map((o) => o.key));
+      deleted += page.objects.length;
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  return deleted;
+}
+
+/** Delete every R2 object under a project's memory-backups prefix. Idempotent — an
+ *  already-empty (or never-created) prefix deletes zero objects without error. */
+export async function deleteAllProjectBackups(env: Env, projectId: string): Promise<number> {
+  return deleteR2Prefix(env, projectBackupsPrefix(projectId));
+}
+
+/** This project's backup generations (the `<exportedAt>` slug segment), newest first. Reads
+ *  via `delimiter: '/'` so R2 groups keys by that segment instead of listing every chunk. */
+export async function listProjectBackupGenerations(env: Env, projectId: string): Promise<string[]> {
+  if (!env.FILES) return [];
+  const prefix = projectBackupsPrefix(projectId);
+  const page = await env.FILES.list({ prefix, delimiter: '/' });
+  // ISO-derived slugs (colons/dots replaced with '-') are fixed-width and sort chronologically
+  // as plain strings — no date parsing needed to order them.
+  return page.delimitedPrefixes
+    .map((p) => p.slice(prefix.length).replace(/\/$/, ''))
+    .sort()
+    .reverse();
+}
+
+/** Prune backup generations beyond `keepLast` (oldest first). Returns how many were pruned.
+ *  Idempotent — a project at or under the limit prunes nothing. */
+export async function pruneBackupRetention(env: Env, projectId: string, keepLast = DEFAULT_BACKUP_RETENTION_COUNT): Promise<number> {
+  const generations = await listProjectBackupGenerations(env, projectId);
+  const toPrune = generations.slice(keepLast);
+  for (const slug of toPrune) {
+    await deleteR2Prefix(env, `${projectBackupsPrefix(projectId)}${slug}/`);
+  }
+  return toPrune.length;
+}
+
+export interface EraseStepResult {
+  step: string;
+  ok: boolean;
+  detail: string;
+}
+export interface EraseReport {
+  ok: boolean;
+  steps: EraseStepResult[];
+}
+
+export interface TombstoneSweepResult {
+  projectId: string;
+  cleared: boolean;
+  report: EraseReport;
+}
+
+/**
+ * Retry every pending erasure tombstone (PLNR-250, migration 0072): for each, run the DO's
+ * full auditable erase sequence and the R2 backup-prefix delete, then clear the tombstone only
+ * if every step succeeded. A tombstone that fails again just accumulates an attempt count —
+ * the sweep is safe to run as often as the cron likes; a completed erasure is a no-op the next
+ * time (erase() tolerates empty tables, deleteR2Prefix tolerates an empty prefix).
+ */
+export async function sweepPendingErasures(env: Env): Promise<TombstoneSweepResult[]> {
+  const { results } = await env.DB.prepare('SELECT project_id FROM memory_erasure_tombstones').all<{ project_id: string }>();
+  const outcomes: TombstoneSweepResult[] = [];
+  for (const { project_id: projectId } of results) {
+    const report = await env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)).eraseAll(projectId);
+    if (report.ok) {
+      await env.DB.prepare('DELETE FROM memory_erasure_tombstones WHERE project_id = ?').bind(projectId).run();
+    } else {
+      await env.DB.prepare(
+        `UPDATE memory_erasure_tombstones
+         SET attempts = attempts + 1, last_error = ?, last_attempt_at = ?
+         WHERE project_id = ?`,
+      ).bind(JSON.stringify(report.steps.filter((s) => !s.ok)), new Date().toISOString(), projectId).run();
+    }
+    outcomes.push({ projectId, cleared: report.ok, report });
+  }
+  return outcomes;
+}
+
+export interface ProjectCleanupResult {
+  projectId: string;
+  prunedStagedGenerations: number;
+  prunedRetainedGeneration: boolean;
+  prunedBackupGenerations: number;
+}
+
+/** Per-project debris cleanup for every project with a memory registry row: abandoned staged
+ *  index generations, an expired retained restore generation, and backups beyond the
+ *  retention count. Also refreshes the visible size status in the D1 registry — this sweep is
+ *  the natural place for it: a periodic pass over every registered project, not an extra write
+ *  on every health() read. Each project is independent — one failing never blocks the rest. */
+export async function sweepProjectDebris(env: Env): Promise<ProjectCleanupResult[]> {
+  const { results } = await env.DB.prepare('SELECT project_id FROM project_memory_registry').all<{ project_id: string }>();
+  const outcomes: ProjectCleanupResult[] = [];
+  for (const { project_id: projectId } of results) {
+    const stub = env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId));
+    const [prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations] = await Promise.all([
+      stub.pruneAbandonedStagedGenerations(projectId, STAGED_GENERATION_MAX_AGE_MS).catch(() => 0),
+      stub.pruneRetainedGenerationIfExpired(projectId, RETAINED_GENERATION_MAX_AGE_MS).catch(() => false),
+      pruneBackupRetention(env, projectId).catch(() => 0),
+    ]);
+    outcomes.push({ projectId, prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations });
+    await stub
+      .health(projectId)
+      .then((h) =>
+        env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName(projectId)).upsertMemoryHealth(projectId, {
+          schemaVersion: h.schemaVersion,
+          memoryRevision: h.memoryRevision,
+          sizeBytes: h.databaseSize,
+          sizeStatus: h.sizeStatus,
+        }),
+      )
+      .catch((err) => console.warn(`ProjectMemory health refresh for ${projectId} failed: ${String(err)}`));
+  }
+  return outcomes;
+}

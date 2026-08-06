@@ -195,3 +195,69 @@ Value-rewrite migrations to date:
 
 When adding a future value-rewrite migration, list it here and consider whether the
 snapshot's `version` field should gate the import.
+
+## ProjectMemory disaster recovery (PLNR-250)
+
+Two independent recovery tiers exist for each project's `ProjectMemory` store, for two
+different failure modes:
+
+**Tier 1 — native Durable Object point-in-time recovery.** Cloudflare's SQLite-backed Durable
+Objects keep a rolling history of the storage state, independent of anything Noriq does. It
+covers *operational* rollback — "this project's memory looks wrong as of an hour ago, put it
+back" — over roughly a **30-day window**. It is accessed through the storage bookmark API:
+
+- `storage.getCurrentBookmark()` — a bookmark for right now.
+- `storage.getBookmarkForTime(timestamp)` — the bookmark closest to a point in the window.
+- `storage.onNextSessionRestoreBookmark(bookmark)` — arms the DO to restore to that bookmark the
+  next time it starts a session (i.e. on its next request).
+
+This is Cloudflare-side recovery, not something Noriq's application code drives end to end —
+there is no admin route for it here. It is the right tool for "someone fat-fingered a restore
+five minutes ago", not for long-term retention, migrating between instances, or recovering from
+losing the Durable Object namespace entirely (see the limitation below — PITR does not survive
+that).
+
+**Tier 2 — portable R2 snapshots (PLNR-248/249).** The `memory-backup`/`memory-restore` routes
+documented above. This is the tier for long retention, migrating a project to a different
+Noriq instance, and recovering after the DO's own storage is gone (namespace loss, see below) —
+anything PITR's 30-day, this-instance-only window can't reach.
+
+**Rehearsed:** the portable tier (export → destroy → restore → verify) is exercised end to end
+in `test/memory-lifecycle.test.ts`, in the same workerd test environment this whole suite runs
+in — real gzip, real R2 (miniflare's simulator), real SQLite generation switch. The PITR tier's
+bookmark API is **not** exercised by that test: `getCurrentBookmark`/`getBookmarkForTime` are
+smoke-tested for availability where the test harness supports it, but a true point-in-time
+*restore* — verifying data actually reverts — has only been exercised against production
+Cloudflare infrastructure, not rehearsed in this repository's test suite. Treat the portable
+tier as the one with automated proof; treat PITR as production-verified-only until that changes.
+
+**Limitation — Durable Object namespace deletion is unrecoverable by either tier.** A
+`deleted_classes` entry in `wrangler.jsonc`'s DO migrations permanently wipes every instance's
+storage in that namespace — PITR's rolling history is gone with it, and there is nothing to
+restore from unless a portable R2 snapshot happens to already exist from before the deletion.
+**Never** add a `deleted_classes` migration to "fix" a cosmetic issue (a namespace label, a
+rename) — see [CLAUDE.md](../CLAUDE.md)'s Naming section. The only durable protection against
+this class of mistake is having portable snapshots in R2 *before* it happens, which is exactly
+what the daily cron (PLNR-248) is for.
+
+## ProjectMemory lifecycle: deletion, retention, and size (PLNR-250)
+
+Deleting a project schedules erasure of its `ProjectMemory` store via a durable tombstone
+(`memory_erasure_tombstones`, migration 0072) written in the SAME atomic batch as the rest of
+the deletion cascade — so even if the immediate best-effort erasure attempt is lost (an
+unreachable DO, a recycled isolate), the record that this project's memory MUST be erased
+survives. A scheduled sweep (part of the same daily cron as the backups above) retries any
+standing tombstone until every step of the erasure — the DO's own rows, its entire
+`memory-backups/<projectId>/` R2 prefix, and (once they exist in later phases) its vector
+entities and ingest capabilities — reports complete, then clears the tombstone. Trigger the
+sweep on demand: `POST /api/admin/memory-lifecycle-sweep`.
+
+The same sweep prunes debris on a policy timer: abandoned staged index generations, a restore's
+retained prior generation once its rollback window has passed, and backups beyond a keep-last-N
+retention count. All of it is idempotent — running the sweep twice in a row does nothing new
+the second time.
+
+Per-project size is visible via `health()` (`databaseSize`, `sizeStatus`) and projected into
+`project_memory_registry.size_bytes`/`size_status` (migration 0073) by the same sweep. This is
+**visibility only** — crossing the warn or critical threshold does not refuse writes; the goal
+is a warning appearing before a store becomes operationally unsafe, not an enforced quota.

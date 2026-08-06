@@ -5,6 +5,7 @@ import { buildEntityUri, type MemoryBackupManifest } from '@noriq-dev/shared';
 import { projectCoordinationEvents, type ProjectedEvent } from '../lib/memory-projector';
 import { exportMemorySnapshot } from '../memory/backup';
 import { fetchManifest, readSnapshotChunks, checkManifestHeader } from '../memory/restore';
+import { deleteAllProjectBackups, sizeStatus, type EraseReport, type EraseStepResult } from '../memory/lifecycle';
 
 /**
  * ProjectMemory — one instance per project (idFromName(projectId)), canonical
@@ -237,6 +238,8 @@ export interface ProjectMemoryHealth {
   schemaVersion: number;
   memoryRevision: number;
   tableCounts: Record<string, number>;
+  databaseSize: number;
+  sizeStatus: 'ok' | 'warn' | 'critical';
 }
 
 export const SCHEMA_TABLES = [
@@ -326,7 +329,10 @@ export class ProjectMemory extends DurableObject<Env> {
     return row?.value ?? 0;
   }
 
-  /** Health/schema-version RPC (PLNR-246 projects this into the D1 registry). */
+  /** Health/schema-version RPC (PLNR-246 projects this into the D1 registry). `databaseSize`
+   *  and `sizeStatus` (PLNR-250, §18) are visibility only — nothing here refuses a write at
+   *  either threshold; the point is a warning surfaces before the store becomes operationally
+   *  unsafe, not that it gets blocked. */
   async health(projectId: string): Promise<ProjectMemoryHealth> {
     await this.assertProjectId(projectId);
     const tableCounts: Record<string, number> = {};
@@ -334,11 +340,14 @@ export class ProjectMemory extends DurableObject<Env> {
       const row = this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`).toArray()[0];
       tableCounts[table] = row?.n ?? 0;
     }
+    const databaseSize = this.ctx.storage.sql.databaseSize;
     return {
       projectId,
       schemaVersion: this.readSchemaVersion(),
       memoryRevision: this.readMemoryRevision(),
       tableCounts,
+      databaseSize,
+      sizeStatus: sizeStatus(databaseSize),
     };
   }
 
@@ -528,6 +537,11 @@ export class ProjectMemory extends DurableObject<Env> {
           `INSERT INTO _meta (key, value) VALUES ('has_prior_generation', '1')
            ON CONFLICT (key) DO UPDATE SET value = '1'`,
         );
+        this.ctx.storage.sql.exec(
+          `INSERT INTO _meta (key, value) VALUES ('prior_generation_created_at', ?1)
+           ON CONFLICT (key) DO UPDATE SET value = ?1`,
+          nowIso(),
+        );
       });
 
       await this.reportVectorDirty(projectId, true);
@@ -567,8 +581,8 @@ export class ProjectMemory extends DurableObject<Env> {
     return { ok: true };
   }
 
-  /** Explicitly discard the retained prior generation once its rollback window has passed —
-   *  PLNR-250's scheduled sweep calls this; a manual call here is enough for this task. */
+  /** Unconditionally discard the retained prior generation — a manual escape hatch. The
+   *  scheduled sweep uses the age-gated `pruneRetainedGenerationIfExpired` below instead. */
   async pruneRetainedGeneration(projectId: string): Promise<{ ok: true }> {
     await this.assertProjectId(projectId);
     this.ctx.storage.transactionSync(() => {
@@ -576,6 +590,38 @@ export class ProjectMemory extends DurableObject<Env> {
       this.ctx.storage.sql.exec(`UPDATE _meta SET value = '0' WHERE key = 'has_prior_generation'`);
     });
     return { ok: true };
+  }
+
+  /** PLNR-250's scheduled sweep calls this: discard the retained prior generation only once its
+   *  rollback window has passed. Idempotent — nothing to prune reports false, cheaply. */
+  async pruneRetainedGenerationIfExpired(projectId: string, maxAgeMs: number): Promise<boolean> {
+    await this.assertProjectId(projectId);
+    const flag = this.ctx.storage.sql.exec<{ value: string }>(`SELECT value FROM _meta WHERE key = 'has_prior_generation'`).toArray()[0];
+    if (flag?.value !== '1') return false;
+    const createdAtRow = this.ctx.storage.sql
+      .exec<{ value: string }>(`SELECT value FROM _meta WHERE key = 'prior_generation_created_at'`)
+      .toArray()[0];
+    const age = createdAtRow ? Date.now() - new Date(createdAtRow.value).getTime() : Infinity;
+    if (age < maxAgeMs) return false;
+    await this.pruneRetainedGeneration(projectId);
+    return true;
+  }
+
+  /** PLNR-250's scheduled sweep calls this: drop staged (never activated) index generations
+   *  older than `maxAgeMs`. Nothing stages into `index_generations` before Phase 5's ingest
+   *  pipeline exists, so this prunes zero rows until then — the method exists now so that
+   *  pipeline has a cleanup path already wired rather than one someone has to remember to add. */
+  async pruneAbandonedStagedGenerations(projectId: string, maxAgeMs: number): Promise<number> {
+    await this.assertProjectId(projectId);
+    const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
+    const abandoned = this.ctx.storage.sql
+      .exec<{ id: string }>(`SELECT id FROM index_generations WHERE status = 'staged' AND created_at < ?1`, cutoff)
+      .toArray();
+    if (abandoned.length === 0) return 0;
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(`DELETE FROM index_generations WHERE status = 'staged' AND created_at < ?1`, cutoff);
+    });
+    return abandoned.length;
   }
 
   private async reportVectorDirty(projectId: string, dirty: boolean): Promise<void> {
@@ -617,6 +663,58 @@ export class ProjectMemory extends DurableObject<Env> {
       this.ctx.storage.sql.exec(`UPDATE projector_cursor SET global_seq = 0 WHERE id = 0`);
     });
     return { ok: true };
+  }
+
+  /**
+   * The full auditable erasure sequence (PLNR-250) — what a durable tombstone (migration 0072)
+   * is retried against until every step reports complete. Order: (1) this DO's own rows,
+   * including any generation debris a restore left behind (retained `prev_` tables, any
+   * `staging_` tables from an import that never finished); (2) this project's entire R2
+   * memory-backups prefix; (3)/(4) the vector and ingest-capability seams, shipped as explicit
+   * "nothing to do yet" steps — no memory Vectorize entity exists before Phase 4 and no ingest
+   * capability exists before Phase 5, so pretending to delete either would be theater. Each
+   * step is independently idempotent: re-running on an already-erased project reports ok on
+   * every step at effectively zero cost.
+   */
+  /** Test-only fault injection: force the next eraseAll's "store" step to fail — mirrors
+   *  _setForceDeliveryFailure (PLNR-247), same reason: proves the tombstone survives a failed
+   *  attempt and a later sweep completes it, without fighting the runtime for a real failure. */
+  private _forceEraseFailure = false;
+  async _setForceEraseFailure(projectId: string, fail: boolean): Promise<void> {
+    await this.assertProjectId(projectId);
+    this._forceEraseFailure = fail;
+  }
+
+  async eraseAll(projectId: string): Promise<EraseReport> {
+    await this.assertProjectId(projectId);
+    const steps: EraseStepResult[] = [];
+
+    try {
+      if (this._forceEraseFailure) throw new Error('injected erase failure (test)');
+      await this.erase(projectId);
+      this.ctx.storage.transactionSync(() => {
+        for (const table of BACKUP_TABLES) {
+          this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS prev_${table}`);
+          this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS staging_${table}`);
+        }
+        this.ctx.storage.sql.exec(`UPDATE _meta SET value = '0' WHERE key = 'has_prior_generation'`);
+      });
+      steps.push({ step: 'store', ok: true, detail: 'rows and any generation debris cleared' });
+    } catch (err) {
+      steps.push({ step: 'store', ok: false, detail: String(err) });
+    }
+
+    try {
+      const deleted = await deleteAllProjectBackups(this.env, projectId);
+      steps.push({ step: 'r2-backups', ok: true, detail: this.env.FILES ? `${deleted} object(s) deleted` : 'R2 not configured — nothing to delete' });
+    } catch (err) {
+      steps.push({ step: 'r2-backups', ok: false, detail: String(err) });
+    }
+
+    steps.push({ step: 'vectors', ok: true, detail: 'no memory vector index exists yet (Phase 4) — nothing to delete' });
+    steps.push({ step: 'ingest-capabilities', ok: true, detail: 'no ingest capabilities exist yet (Phase 5) — nothing to revoke' });
+
+    return { ok: steps.every((s) => s.ok), steps };
   }
 
   // ---------------------------------------------------------------------------
@@ -862,5 +960,42 @@ export class ProjectMemory extends DurableObject<Env> {
       .exec<{ path: string }>(`SELECT path FROM evidence WHERE memory_item_id = ?1 ORDER BY path`, memoryItemId)
       .toArray()
       .map((r) => r.path);
+  }
+
+  /** Test-only: a staged (never activated) index generation with a caller-chosen created_at,
+   *  so PLNR-250's staged-generation pruning can be tested without waiting out its real max
+   *  age. Seeds the repository row too if it doesn't already exist (the FK target). */
+  async _seedStagedIndexGeneration(projectId: string, repositoryKey: string, createdAt: string): Promise<string> {
+    await this.assertProjectId(projectId);
+    const id = newId('gen');
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO repositories (repository_key, created_at) VALUES (?1, ?2) ON CONFLICT (repository_key) DO NOTHING`,
+        repositoryKey,
+        createdAt,
+      );
+      this.ctx.storage.sql.exec(
+        `INSERT INTO index_generations (id, repository_key, branch, base_id, indexer_version, batch_count, file_count, content_hash, status, created_at)
+         VALUES (?1, ?2, 'main', 'deadbeef', 'test', 1, 1, 'sha256:test', 'staged', ?3)`,
+        id,
+        repositoryKey,
+        createdAt,
+      );
+    });
+    return id;
+  }
+
+  async _countIndexGenerations(projectId: string): Promise<number> {
+    await this.assertProjectId(projectId);
+    return this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM index_generations`).toArray()[0]?.n ?? 0;
+  }
+
+  /** Test-only: overwrite a `_meta` value directly — used to backdate
+   *  `prior_generation_created_at` so retained-generation pruning can be tested without waiting
+   *  out its real rollback window. Deliberately narrow (one table, key/value only), not a
+   *  general query surface. */
+  async _setMetaForTest(projectId: string, key: string, value: string): Promise<void> {
+    await this.assertProjectId(projectId);
+    this.ctx.storage.sql.exec(`UPDATE _meta SET value = ?1 WHERE key = ?2`, value, key);
   }
 }
