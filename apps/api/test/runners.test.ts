@@ -2,7 +2,12 @@
 // key→projectId resolution scoped to what the owning user may reach.
 import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
-import { createUser, loginSession, mintTokenForUser, authorizeForAllProjects } from './helpers';
+import { createUser, loginSession, mintTokenForUser, authorizeForAllProjects, projectRoom, SYSTEM_ACTOR } from './helpers';
+import type { Env } from '../src/env';
+import type { Actor } from '../src/do/ProjectRoom';
+import { resolveRepositoryByKey, listRepositoryCheckouts } from '../src/lib/project-memory';
+
+const appEnv = env as unknown as Env;
 
 let ownerToken: string;
 let ownerCookie: string;
@@ -111,6 +116,20 @@ describe('runners (RUN-5)', () => {
     const res = await register(ownerToken, { label: 'l', repos: [{ id: 'r', projectKey: 'OTHR' }] });
     const { runner } = (await res.json()) as { runner: any };
     expect(runner.repos[0].projectId).toBeNull(); // owner can't reach OTHR → not resolved
+  });
+
+  it('registration carrying a committed repositoryKey associates the checkout with its canonical repository (PLNR-259)', async () => {
+    const repoRoom = projectRoom<{ registerRepository(pid: string, actor: Actor, key: string): Promise<{ id: string }> }>(rnrxProjectId);
+    await repoRoom.registerRepository(rnrxProjectId, SYSTEM_ACTOR as Actor, 'rnrx-canonical');
+    const res = await register(ownerToken, {
+      label: 'checkout-declares-key',
+      repos: [{ id: 'repo_declares_key', projectKey: 'rnrx', repositoryKey: 'rnrx-canonical' }],
+    });
+    expect(res.status).toBe(200);
+    const canonical = await resolveRepositoryByKey(appEnv, rnrxProjectId, 'rnrx-canonical');
+    expect(canonical).not.toBeNull();
+    const checkouts = await listRepositoryCheckouts(appEnv, canonical!.id);
+    expect(checkouts.map((c) => c.checkoutId)).toContain('repo_declares_key');
   });
 
   it('heartbeat updates capacity; owner sees it, non-owner does not', async () => {

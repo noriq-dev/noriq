@@ -13,7 +13,7 @@ import {
 import { searchBackend, indexEntity, removeEntity, type SearchKind } from '../search';
 import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
-import { RunKind, AgentTool, RunStatus, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus } from '@noriq-dev/shared';
+import { RunKind, AgentTool, RunStatus, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey } from '@noriq-dev/shared';
 import { writeExecutionSpec } from '../lib/execution-spec';
 
 /**
@@ -2802,20 +2802,140 @@ export class ProjectRoom extends DurableObject<Env> {
   // ---------------------------------------------------------------------------
 
   /** Register a canonical, project-local repository key. Unique per project — the same key
-   *  may be registered again in a DIFFERENT project (a fork, a different server instance). */
-  async registerRepository(projectId: string, actor: Actor, repositoryKey: string): Promise<{ id: string }> {
+   *  may be registered again in a DIFFERENT project (a fork, a different server instance).
+   *  `repositoryKey` is validated against @noriq-dev/shared's `RepositoryKey` (its `.refine`
+   *  is what rejects a `ckt_`-prefixed runner-local checkout id being promoted to canonical
+   *  identity) — the schema's own message is thrown, not a hand-rolled one. */
+  async registerRepository(
+    projectId: string,
+    actor: Actor,
+    repositoryKey: string,
+    opts?: { defaultBranch?: string | null; vcsKind?: string | null },
+  ): Promise<{ id: string }> {
+    const parsed = RepositoryKey.safeParse(repositoryKey);
+    if (!parsed.success) throw new Error(parsed.error.issues[0]?.message ?? 'invalid repository key');
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
+      // UNIQUE (project_id, repository_key) (0069) is the real guarantee this asserts against;
+      // this pre-check only turns the constraint violation into a message naming the key.
       const dup = await this.env.DB.prepare(
         'SELECT id FROM project_repositories WHERE project_id = ? AND repository_key = ?',
       ).bind(projectId, repositoryKey).first<{ id: string }>();
       if (dup) throw new Error(`repository key "${repositoryKey}" is already registered in this project`);
       const id = newId('repo');
+      const now = nowIso();
       await this.env.DB.prepare(
-        'INSERT INTO project_repositories (id, project_id, repository_key, indexing_enabled, ingest_status, created_at) VALUES (?, ?, ?, 0, ?, ?)',
-      ).bind(id, projectId, repositoryKey, 'none', nowIso()).run();
+        `INSERT INTO project_repositories
+           (id, project_id, repository_key, indexing_enabled, ingest_status, default_branch, vcs_kind, created_at, updated_at)
+         VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)`,
+      ).bind(id, projectId, repositoryKey, 'none', opts?.defaultBranch ?? null, opts?.vcsKind ?? null, now, now).run();
       await this.emit(actor, 'project.updated', 'project', projectId, { repositoryRegistered: repositoryKey });
       return { id };
+    });
+  }
+
+  /** Update mutable repository identity fields — the real write path `indexing_enabled` and
+   *  `ingest_status` never had (both were hardcoded at insert and never touched again). VCS kind
+   *  and `baseId` are OPAQUE strings here: no parsing, no normalization, no case-folding — a
+   *  Perforce changelist is as valid as a Git SHA. `branchClasses` is a JSON array column. */
+  async updateRepository(
+    projectId: string,
+    actor: Actor,
+    repositoryKey: string,
+    patch: {
+      defaultBranch?: string | null;
+      vcsKind?: string | null;
+      branchClasses?: string[];
+      latestObservedBase?: string | null;
+      indexingEnabled?: boolean;
+      ingestStatus?: 'none' | 'staged' | 'active' | 'failed';
+    },
+  ): Promise<{ ok: true }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const row = await this.env.DB.prepare(
+        'SELECT id FROM project_repositories WHERE project_id = ? AND repository_key = ?',
+      ).bind(projectId, repositoryKey).first<{ id: string }>();
+      if (!row) throw new Error(`no repository registered for key "${repositoryKey}" in this project`);
+      const sets: string[] = [];
+      const vals: unknown[] = [];
+      if ('defaultBranch' in patch) { sets.push('default_branch = ?'); vals.push(patch.defaultBranch ?? null); }
+      if ('vcsKind' in patch) { sets.push('vcs_kind = ?'); vals.push(patch.vcsKind ?? null); }
+      if (patch.branchClasses) { sets.push('branch_classes = ?'); vals.push(JSON.stringify(patch.branchClasses)); }
+      if ('latestObservedBase' in patch) { sets.push('latest_observed_base = ?'); vals.push(patch.latestObservedBase ?? null); }
+      if (patch.indexingEnabled !== undefined) { sets.push('indexing_enabled = ?'); vals.push(patch.indexingEnabled ? 1 : 0); }
+      if (patch.ingestStatus) { sets.push('ingest_status = ?'); vals.push(patch.ingestStatus); }
+      if (!sets.length) return { ok: true };
+      sets.push('updated_at = ?');
+      vals.push(nowIso());
+      vals.push(row.id);
+      await this.env.DB.prepare(`UPDATE project_repositories SET ${sets.join(', ')} WHERE id = ?`).bind(...vals).run();
+      await this.emit(actor, 'project.updated', 'project', projectId, { repositoryUpdated: repositoryKey });
+      return { ok: true };
+    });
+  }
+
+  /** The D1-side active-generation field is a PROJECTION, never authority — mirrors the existing
+   *  upsertMemoryHealth/updateMemoryBackupStatus/setMemoryVectorDirty direction (DO -> ProjectRoom
+   *  -> D1). Authority stays `index_generations.status='active'` inside the ProjectMemory DO;
+   *  nothing here decides activation (PLNR-261 does), it only mirrors the outcome for D1 readers. */
+  async setRepositoryActiveGeneration(projectId: string, repositoryKey: string, generationId: string | null): Promise<{ ok: true }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const row = await this.env.DB.prepare(
+        'SELECT id FROM project_repositories WHERE project_id = ? AND repository_key = ?',
+      ).bind(projectId, repositoryKey).first<{ id: string }>();
+      if (!row) throw new Error(`no repository registered for key "${repositoryKey}" in this project`);
+      await this.env.DB.prepare(
+        'UPDATE project_repositories SET active_generation_id = ?, updated_at = ? WHERE id = ?',
+      ).bind(generationId, nowIso(), row.id).run();
+      return { ok: true };
+    });
+  }
+
+  /**
+   * Associate a runner-local checkout with its canonical repository (§4/§6). `checkoutId` is
+   * RunnerRepo.id ("stable per (runner, repo), e.g. hash of the root path") — display/association
+   * data only, never canonical identity. Two checkouts whose committed key matches converge on
+   * ONE canonical row automatically (each resolves `repositoryKey` independently). An unresolved
+   * key, or a checkout already bound to a DIFFERENT canonical repository, is surfaced rather than
+   * silently rebound — mirroring resolveRunnerRepos' "visible null" and the GitHub webhook's
+   * `repos.length !== 1` guard.
+   */
+  async associateCheckout(
+    projectId: string,
+    actor: Actor,
+    input: { repositoryKey: string; runnerId: string; checkoutId: string },
+  ): Promise<{ associated: true; projectRepositoryId: string } | { associated: false; reason: string }> {
+    const parsed = RepositoryKey.safeParse(input.repositoryKey);
+    if (!parsed.success) throw new Error(parsed.error.issues[0]?.message ?? 'invalid repository key');
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const repo = await this.env.DB.prepare(
+        'SELECT id FROM project_repositories WHERE project_id = ? AND repository_key = ?',
+      ).bind(projectId, input.repositoryKey).first<{ id: string }>();
+      if (!repo) {
+        return { associated: false, reason: `no repository registered for key "${input.repositoryKey}" in this project` };
+      }
+      const existing = await this.env.DB.prepare(
+        'SELECT id, project_repository_id AS projectRepositoryId FROM repository_checkouts WHERE runner_id = ? AND checkout_id = ?',
+      ).bind(input.runnerId, input.checkoutId).first<{ id: string; projectRepositoryId: string }>();
+      const now = nowIso();
+      if (existing) {
+        if (existing.projectRepositoryId !== repo.id) {
+          return {
+            associated: false,
+            reason: `this checkout is already associated with a different repository — not rebinding`,
+          };
+        }
+        await this.env.DB.prepare('UPDATE repository_checkouts SET updated_at = ? WHERE id = ?').bind(now, existing.id).run();
+        return { associated: true, projectRepositoryId: repo.id };
+      }
+      await this.env.DB.prepare(
+        'INSERT INTO repository_checkouts (id, project_repository_id, runner_id, checkout_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+      ).bind(newId('rcko'), repo.id, input.runnerId, input.checkoutId, now, now).run();
+      await this.emit(actor, 'project.updated', 'project', projectId, { checkoutAssociated: input.repositoryKey });
+      return { associated: true, projectRepositoryId: repo.id };
     });
   }
 
@@ -2989,6 +3109,10 @@ export class ProjectRoom extends DurableObject<Env> {
         // Project Memory registry (PLNR-246): compact rows only, before the projects row they
         // FK-reference. The canonical memory graph itself is erased separately, below — it
         // lives in the ProjectMemory DO, not D1, so it cannot ride this batch.
+        // repository_checkouts (PLNR-259) FK-references project_repositories — delete first.
+        this.env.DB.prepare(
+          'DELETE FROM repository_checkouts WHERE project_repository_id IN (SELECT id FROM project_repositories WHERE project_id = ?)',
+        ).bind(pid),
         this.env.DB.prepare('DELETE FROM project_repositories WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM project_memory_registry WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM memory_event_dedup WHERE project_id = ?').bind(pid),

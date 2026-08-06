@@ -28,7 +28,7 @@ import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
 import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
 import { z } from 'zod';
-import { listProjectRepositories, type ProjectMemoryStub } from './lib/project-memory';
+import { listProjectRepositories, listRepositoryCheckouts, type ProjectMemoryStub } from './lib/project-memory';
 import { AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget, isTerminalRunStatus, normalizeProjectKey } from '@noriq-dev/shared';
 
 export { ProjectRoom } from './do/ProjectRoom';
@@ -1091,6 +1091,15 @@ app.get('/api/projects/:pid/memory/health', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
   return c.json(await memoryStub(c.env, pid).health(pid));
 });
+// Canonical repository identity + checkout associations (PLNR-259) — straight D1 reads (CLAUDE.md:
+// reads go straight to D1), not a ProjectMemory DO RPC; registration/association happen through
+// ProjectRoom (runner registration/heartbeat sync them automatically — see syncRepositoryCheckouts).
+app.get('/api/projects/:pid/memory/repositories', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const repos = await listProjectRepositories(c.env, pid);
+  const withCheckouts = await Promise.all(repos.map(async (r) => ({ ...r, checkouts: await listRepositoryCheckouts(c.env, r.id) })));
+  return c.json({ repositories: withCheckouts });
+});
 app.get('/api/projects/:pid/memory/items/:id', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
   const row = await memoryStub(c.env, pid).getMemoryItem(pid, c.req.param('id')!);
@@ -1790,6 +1799,32 @@ async function resolveRunnerRepos(
   return out;
 }
 
+/**
+ * Associate each resolved repo's committed `repositoryKey` with its canonical project_repositories
+ * row (PLNR-259, §4/§6) — the "one round trip" option: a checkout declares its key on the SAME
+ * POST /api/runners (or heartbeat) call that already resolves projectKey -> projectId, rather than
+ * a separate associate endpoint. Best-effort per repo: an unresolved project, a missing
+ * repositoryKey, or an association ProjectRoom refuses (unknown key, conflicting checkout) is
+ * skipped silently here — visible instead through GET /api/projects/:pid/memory/repositories —
+ * because a checkout-association hiccup must never fail runner registration/heartbeat itself.
+ */
+async function syncRepositoryCheckouts(env: Env, runnerId: string, repos: Array<z.infer<typeof RunnerRepo>>): Promise<void> {
+  const sysActor: Actor = { kind: 'system', id: 'system', name: 'system' };
+  for (const r of repos) {
+    if (!r.projectId || !r.repositoryKey) continue;
+    try {
+      await room(env, r.projectId).associateCheckout(r.projectId, sysActor, {
+        repositoryKey: r.repositoryKey,
+        runnerId,
+        checkoutId: r.id,
+      });
+    } catch {
+      // Malformed repositoryKey (e.g. a ckt_-prefixed value) — surfaced nowhere but ignored here;
+      // registration/heartbeat must succeed regardless.
+    }
+  }
+}
+
 // Map a runners row to the wire Runner shape (never leak owner_user_id), deriving
 // effective online/offline from heartbeat freshness.
 function runnerView(row: Record<string, unknown>) {
@@ -1858,6 +1893,7 @@ app.post('/api/runners', agentAuth, async (c) => {
        VALUES (?, ?, ?, 'online', ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(id, userId, b.label, capabilities, JSON.stringify(repos), b.maxConcurrency, now, c.var.connection!.tokenId, b.version ?? null, now).run();
   }
+  await syncRepositoryCheckouts(c.env, id, repos);
   const row = await c.env.DB.prepare('SELECT * FROM runners WHERE id = ?').bind(id).first<Record<string, unknown>>();
   return c.json({ runner: runnerView(row!) });
 });
@@ -1878,6 +1914,7 @@ app.post('/api/runners/:id/heartbeat', agentAuth, async (c) => {
     const repos = await resolveRunnerRepos(c.env, userId, b.repos, c.var.connection!.tokenId);
     await c.env.DB.prepare('UPDATE runners SET free_slots = ?, status = ?, repos = ?, last_heartbeat_at = ? WHERE id = ?')
       .bind(b.freeSlots, b.status, JSON.stringify(repos), nowIso(), id).run();
+    await syncRepositoryCheckouts(c.env, id, repos);
   } else {
     await c.env.DB.prepare('UPDATE runners SET free_slots = ?, status = ?, last_heartbeat_at = ? WHERE id = ?')
       .bind(b.freeSlots, b.status, nowIso(), id).run();

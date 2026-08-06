@@ -158,7 +158,25 @@ export interface ProjectRepositoryRow {
   repositoryKey: string;
   indexingEnabled: boolean;
   ingestStatus: 'none' | 'staged' | 'active' | 'failed';
+  defaultBranch: string | null;
+  vcsKind: string | null;
+  branchClasses: string[];
+  latestObservedBase: string | null;
+  /** A D1-side PROJECTION of the ProjectMemory DO's index_generations.status='active' — never
+   *  authority; mirrored DO -> ProjectRoom -> D1 (see ProjectRoom.setRepositoryActiveGeneration). */
+  activeGenerationId: string | null;
   createdAt: string;
+  updatedAt: string | null;
+}
+
+export interface RepositoryCheckoutRow {
+  id: string;
+  projectRepositoryId: string;
+  runnerId: string;
+  /** RunnerRepo.id — display/association data only, never canonical identity. */
+  checkoutId: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 /** Straight D1 read (CLAUDE.md: reads go straight to D1; only writes cross into a DO) — no
@@ -166,14 +184,23 @@ export interface ProjectRepositoryRow {
  *  (REST/MCP edges already do this for every other project-scoped read). */
 export async function listProjectRepositories(env: Env, projectId: string): Promise<ProjectRepositoryRow[]> {
   const { results } = await env.DB.prepare(
-    'SELECT id, project_id, repository_key, indexing_enabled, ingest_status, created_at FROM project_repositories WHERE project_id = ? ORDER BY created_at',
+    `SELECT id, project_id, repository_key, indexing_enabled, ingest_status,
+            default_branch, vcs_kind, branch_classes, latest_observed_base, active_generation_id,
+            created_at, updated_at
+     FROM project_repositories WHERE project_id = ? ORDER BY created_at`,
   ).bind(projectId).all<{
     id: string;
     project_id: string;
     repository_key: string;
     indexing_enabled: number;
     ingest_status: string;
+    default_branch: string | null;
+    vcs_kind: string | null;
+    branch_classes: string;
+    latest_observed_base: string | null;
+    active_generation_id: string | null;
     created_at: string;
+    updated_at: string | null;
   }>();
   return results.map((r) => ({
     id: r.id,
@@ -181,6 +208,38 @@ export async function listProjectRepositories(env: Env, projectId: string): Prom
     repositoryKey: r.repository_key,
     indexingEnabled: !!r.indexing_enabled,
     ingestStatus: r.ingest_status as ProjectRepositoryRow['ingestStatus'],
+    defaultBranch: r.default_branch,
+    vcsKind: r.vcs_kind,
+    branchClasses: JSON.parse(r.branch_classes || '[]'),
+    latestObservedBase: r.latest_observed_base,
+    activeGenerationId: r.active_generation_id,
     createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  }));
+}
+
+/** Resolve one repository by its committed key within a project — the read side of
+ *  registerRepository/associateCheckout, and how a caller (e.g. the ingest endpoints in
+ *  PLNR-260) turns a repositoryKey into the canonical row before minting a scoped capability. */
+export async function resolveRepositoryByKey(env: Env, projectId: string, repositoryKey: string): Promise<ProjectRepositoryRow | null> {
+  const rows = await listProjectRepositories(env, projectId);
+  return rows.find((r) => r.repositoryKey === repositoryKey) ?? null;
+}
+
+/** Straight D1 read of a canonical repository's checkout associations — the human-facing view
+ *  of which runner-local checkouts converge on it. */
+export async function listRepositoryCheckouts(env: Env, projectRepositoryId: string): Promise<RepositoryCheckoutRow[]> {
+  const { results } = await env.DB.prepare(
+    'SELECT id, project_repository_id, runner_id, checkout_id, created_at, updated_at FROM repository_checkouts WHERE project_repository_id = ? ORDER BY created_at',
+  ).bind(projectRepositoryId).all<{
+    id: string; project_repository_id: string; runner_id: string; checkout_id: string; created_at: string; updated_at: string;
+  }>();
+  return results.map((r) => ({
+    id: r.id,
+    projectRepositoryId: r.project_repository_id,
+    runnerId: r.runner_id,
+    checkoutId: r.checkout_id,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
   }));
 }
