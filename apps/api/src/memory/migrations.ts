@@ -53,6 +53,7 @@ import sql0005 from '../../memory-migrations/0005_index_staging.sql';
 import sql0006 from '../../memory-migrations/0006_episodes.sql';
 import sql0007 from '../../memory-migrations/0007_episode_sitting.sql';
 import sql0008 from '../../memory-migrations/0008_evidence_verification.sql';
+import sql0009 from '../../memory-migrations/0009_guidance_drift.sql';
 
 export interface MemoryMigration {
   /** 1-based, contiguous, and equal to this entry's array index + 1. */
@@ -75,6 +76,11 @@ export const MEMORY_MIGRATIONS: readonly MemoryMigration[] = [
   // was already taken by PLNR-263's episode-sitting fix by the time this task started. The
   // directory listing is authoritative over the spec's filename (see the .sql file's own comment).
   { version: 8, name: '0008_evidence_verification', sql: sql0008 },
+  // PLNR-266: named 0009, not the execution spec's literal "0008_guidance_drift.sql" — 0008 was
+  // already taken by PLNR-265's evidence-verification migration by the time this task started.
+  // The directory listing is authoritative over the spec's filename (same pattern one task
+  // earlier; see 0008's own comment).
+  { version: 9, name: '0009_guidance_drift', sql: sql0009 },
 ];
 
 /** The schema version a freshly-migrated store lands on. */

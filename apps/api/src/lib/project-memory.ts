@@ -9,8 +9,25 @@ import type { DuplicateWarning, EffortSummary } from '../memory/similar-effort';
 import type {
   DependencyNeighborhoodResult, ValidatingTestsResult, ImplementingWorkResult, DecisionLineageResult, ChangeImpactResult,
 } from '../memory/graph-queries';
+import type { SurfaceId } from '../memory/guidance-drift';
 import { userCanAccessProject } from './visibility';
 import { readExecutionSpec } from './execution-spec';
+
+/** PLNR-266: one stored, deduplicated guidance-drift finding — see ProjectMemory.
+ *  listGuidanceDriftFindings and memory/guidance-drift.ts's DriftFinding for the full shape this
+ *  is read back from. */
+export interface GuidanceDriftFindingRecord {
+  id: string;
+  ruleId: string;
+  description: string;
+  presentSurfaces: SurfaceId[];
+  missingSurfaces: SurfaceId[];
+  unavailableSurfaces: SurfaceId[];
+  quotes: Partial<Record<SurfaceId, string>>;
+  recommendedEdit: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+}
 
 /** An evidence citation as the write RPCs accept it — validated server-side (writes.ts) against
  *  the shared RepositoryKey/BranchRef/BaseId/RepoPath schemas; not re-validated here. */
@@ -107,10 +124,25 @@ export interface ProjectMemoryStub {
     input: { memoryItemId: string; actorUserId: string; note?: string | null; revision?: string | null },
   ): Promise<{ approvedMemoryId: string; transitionId: string }>;
   rejectDecision(projectId: string, input: { memoryItemId: string; actorUserId: string; note?: string | null }): Promise<{ ok: true; transitionId: string }>;
+  /** PLNR-266: merge-evidence promotion, gated on PLNR-265's verification path — a candidate's
+   *  citations must verify (verifiedForBase) at the merged (branch, baseId), not merely cite the
+   *  right repository/branch. A skipped candidate is reported with its reason (no evidence, wrong
+   *  repository/branch, or citations that do not verify at the merged base); never promotes past
+   *  authority 4 (AUTHORITY_VERIFIED_MERGED) — see ProjectMemory's own doc comment. */
   promoteMemoriesOnMerge(
     projectId: string,
     input: { repositoryKey: string; branch: string; mergedBaseId: string },
-  ): Promise<{ promoted: string[]; skipped: number }>;
+  ): Promise<{ promoted: string[]; skipped: Array<{ memoryItemId: string; reason: string }> }>;
+  /** PLNR-266: run the guidance-drift scan (memory/guidance-drift.ts's compareSurfaces) against
+   *  caller-supplied surface text and persist deduplicated findings. This DO never reads
+   *  INSTRUCTIONS/SKILL_MD/DOC_SKILL_MD itself — the caller (index.ts) owns importing the MCP
+   *  layer's exports, keeping ProjectMemory ignorant of it. */
+  recordGuidanceDriftScan(
+    projectId: string,
+    surfaces: Partial<Record<SurfaceId, string | null>>,
+  ): Promise<{ findings: number; newFindings: number }>;
+  /** PLNR-266: the stored, deduplicated guidance-drift findings for this project — read-only. */
+  listGuidanceDriftFindings(projectId: string): Promise<GuidanceDriftFindingRecord[]>;
   /** PLNR-257: bounded multi-hop graph traversal from one or more seed nodes, each hit carrying
    *  the edge path back to its seed — the general read API `_traverseFrom` was a narrow
    *  test-only stand-in for. */

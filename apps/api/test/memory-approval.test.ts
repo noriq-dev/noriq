@@ -8,9 +8,16 @@ import type { Env } from '../src/env';
 import type { Actor } from '../src/do/ProjectRoom';
 import { createUser, mintTokenForUser, mcpCall, mcpList, loginSession, projectRoom, SYSTEM_ACTOR } from './helpers';
 import worker from '../src/index';
+import { buildEntityUri } from '@noriq-dev/shared';
 
 const appEnv = env as unknown as Env;
 type FetchEnv = Parameters<typeof worker.fetch>[1];
+
+interface IndexManifestInput {
+  generationId: string; projectId: string; repositoryKey: string; branch: string; baseId: string;
+  indexerVersion: string; batchCount: number; fileCount: number; contentHash: string; deletions: string[]; createdAt: string;
+}
+interface StagedRow { kind: 'node' | 'edge'; uri?: string; type?: string; label?: string; content?: string | null; from?: string; to?: string }
 
 interface MemoryRpc {
   health(pid: string): Promise<{ schemaVersion: number; memoryRevision: number; tableCounts: Record<string, number> }>;
@@ -31,9 +38,19 @@ interface MemoryRpc {
   listProposedDecisions(pid: string): Promise<Array<{ id: string; statement: string; authority: number; proposedAt: string }>>;
   approveDecision(pid: string, input: { memoryItemId: string; actorUserId: string; note?: string | null }): Promise<{ approvedMemoryId: string; transitionId: string }>;
   rejectDecision(pid: string, input: { memoryItemId: string; actorUserId: string; note?: string | null }): Promise<{ ok: true; transitionId: string }>;
-  promoteMemoriesOnMerge(pid: string, input: { repositoryKey: string; branch: string; mergedBaseId: string }): Promise<{ promoted: string[]; skipped: number }>;
+  // PLNR-266: promotion is now gated on PLNR-265's verification path — `skipped` carries a
+  // reason per skipped candidate instead of a bare count.
+  promoteMemoriesOnMerge(
+    pid: string,
+    input: { repositoryKey: string; branch: string; mergedBaseId: string },
+  ): Promise<{ promoted: string[]; skipped: Array<{ memoryItemId: string; reason: string }> }>;
   drainOutbox(pid: string): Promise<{ delivered: number; failed: number }>;
   _setForceWriteFailure(pid: string, fail: boolean): Promise<void>;
+  beginIndexIngest(pid: string, manifest: IndexManifestInput): Promise<{ ok: true }>;
+  ingestIndexBatch(pid: string, batch: { generationId: string; batchNumber: number; batchHash: string }, rows: StagedRow[]): Promise<{ ok: true; deduped: boolean }>;
+  completeIndexIngest(pid: string, generationId: string): Promise<{ ok: true; batchesReceived: number; validation: { ok: boolean; problems: string[] } }>;
+  activateIndexGeneration(pid: string, generationId: string): Promise<{ activated: string; superseded: string[] }>;
+  projectActiveGeneration(pid: string, generationId: string): Promise<{ nodesWritten: number }>;
 }
 interface RoomRpc {
   registerRepository(pid: string, actor: Actor, repositoryKey: string): Promise<{ id: string }>;
@@ -43,6 +60,27 @@ const memory = (pid: string) => appEnv.PROJECT_MEMORY.get(appEnv.PROJECT_MEMORY.
 const room = (pid: string) => projectRoom<RoomRpc>(pid);
 const AGENT = { kind: 'agent', id: 'agt_test' };
 const actor = SYSTEM_ACTOR as Actor;
+
+function manifestFor(over: Partial<IndexManifestInput> & Pick<IndexManifestInput, 'generationId' | 'projectId' | 'repositoryKey' | 'branch' | 'baseId'>): IndexManifestInput {
+  return { indexerVersion: 'v1', batchCount: 1, fileCount: 1, contentHash: 'sha256:x', deletions: [], createdAt: new Date().toISOString(), ...over };
+}
+
+/** Stage one batch and drive it all the way to a projected, active generation — same technique
+ *  memory-verification.test.ts uses. Promotion (PLNR-266) verifies citations against the ACTIVE
+ *  generation's graph before promoting, so a positive promotion test needs one of these covering
+ *  the cited path at the merged (repositoryKey, branch, baseId). */
+async function stageAndProject(projectId: string, opts: { generationId: string; repositoryKey: string; branch: string; baseId: string; rows: StagedRow[] }) {
+  const m = memory(projectId);
+  await m.beginIndexIngest(projectId, manifestFor({
+    generationId: opts.generationId, projectId, repositoryKey: opts.repositoryKey, branch: opts.branch, baseId: opts.baseId,
+    fileCount: opts.rows.filter((r) => r.kind === 'node' && r.type === 'file').length,
+  }));
+  await m.ingestIndexBatch(projectId, { generationId: opts.generationId, batchNumber: 0, batchHash: 'h' }, opts.rows);
+  const completed = await m.completeIndexIngest(projectId, opts.generationId);
+  if (!completed.validation.ok) throw new Error(`validation failed: ${completed.validation.problems.join('; ')}`);
+  await m.activateIndexGeneration(projectId, opts.generationId);
+  return m.projectActiveGeneration(projectId, opts.generationId);
+}
 
 async function newOwnedProject(email: string, key: string) {
   const user = await createUser(email, 'Owner', 'longenough1');
@@ -163,9 +201,17 @@ describe('human approval — the only path to authority 5', () => {
 });
 
 describe('no non-human path reaches authority 5', () => {
-  it('merge promotion caps at authority 4, never 5', async () => {
+  it('merge promotion caps at authority 4, never 5 — even when the candidate genuinely verifies at the merged base', async () => {
     const { projectId } = await newOwnedProject('pm-appr-cap@example.com', 'PMAPRCAP');
     await room(projectId).registerRepository(projectId, actor, 'repo-cap');
+    // PLNR-266: promotion now requires the citation to VERIFY at the merged base — an active
+    // generation for repo-cap/main/merged-sha carrying the cited file is what makes the
+    // verification gate pass, so this test isolates "caps at 4" from "verification failed".
+    const fileUri = buildEntityUri({ kind: 'file', projectKey: 'PMAPRCAP', repositoryKey: 'repo-cap', path: 'a.ts' });
+    await stageAndProject(projectId, {
+      generationId: 'gen_cap1', repositoryKey: 'repo-cap', branch: 'main', baseId: 'merged-sha',
+      rows: [{ kind: 'node', uri: fileUri, type: 'file', label: 'a.ts' }],
+    });
     await memory(projectId).recordMemory(projectId, {
       kind: 'learning',
       statement: 'verified by merge',
@@ -174,12 +220,14 @@ describe('no non-human path reaches authority 5', () => {
     });
     const result = await memory(projectId).promoteMemoriesOnMerge(projectId, { repositoryKey: 'repo-cap', branch: 'main', mergedBaseId: 'merged-sha' });
     expect(result.promoted).toHaveLength(1);
+    expect(result.skipped).toEqual([]);
     const promoted = await memory(projectId).getMemoryItem(projectId, result.promoted[0]!);
     expect(promoted!.authority).toBe(4);
+    expect(promoted!.authority).toBeLessThan(5); // the load-bearing assertion this describe block exists for
   });
 });
 
-describe('merge promotion — verification against the merged repository/branch', () => {
+describe('merge promotion — verification against the merged repository/branch (PLNR-266)', () => {
   it('does not promote when cited evidence is for a DIFFERENT repository', async () => {
     const { projectId } = await newOwnedProject('pm-appr-nomatch@example.com', 'PMAPRNMT');
     await memory(projectId).recordMemory(projectId, {
@@ -190,14 +238,17 @@ describe('merge promotion — verification against the merged repository/branch'
     });
     const result = await memory(projectId).promoteMemoriesOnMerge(projectId, { repositoryKey: 'repo-cap', branch: 'main', mergedBaseId: 'merged-sha' });
     expect(result.promoted).toHaveLength(0);
-    expect(result.skipped).toBe(1);
+    expect(result.skipped).toHaveLength(1);
+    expect(result.skipped[0]!.reason).toMatch(/different repository or branch/);
   });
 
-  it('does not promote a memory with no evidence at all', async () => {
+  it('does not promote a memory with no evidence at all — skipped with its own reason', async () => {
     const { projectId } = await newOwnedProject('pm-appr-noev@example.com', 'PMAPRNEV');
     await memory(projectId).recordMemory(projectId, { kind: 'learning', statement: 'unevidenced', actor: AGENT });
     const result = await memory(projectId).promoteMemoriesOnMerge(projectId, { repositoryKey: 'repo-cap', branch: 'main', mergedBaseId: 'merged-sha' });
     expect(result.promoted).toHaveLength(0);
+    expect(result.skipped).toHaveLength(1);
+    expect(result.skipped[0]!.reason).toMatch(/no repository evidence/);
   });
 
   it('does not re-promote something already at or above authority 4', async () => {
@@ -212,6 +263,71 @@ describe('merge promotion — verification against the merged repository/branch'
     const { approvedMemoryId } = await memory(projectId).approveDecision(projectId, { memoryItemId: proposed.id, actorUserId: 'usr_x' });
     const result = await memory(projectId).promoteMemoriesOnMerge(projectId, { repositoryKey: 'repo-cap', branch: 'main', mergedBaseId: 'merged-sha' });
     expect(result.promoted).not.toContain(approvedMemoryId);
+  });
+
+  it("promotes a memory whose citations VERIFY at the merged base — the stated acceptance's positive case", async () => {
+    const { projectId } = await newOwnedProject('pm-appr-verifies@example.com', 'PMAPRVFY');
+    const fileUri = buildEntityUri({ kind: 'file', projectKey: 'PMAPRVFY', repositoryKey: 'repo-v', path: 'lib/thing.ts' });
+    await stageAndProject(projectId, {
+      generationId: 'gen_v1', repositoryKey: 'repo-v', branch: 'main', baseId: 'merged-sha-v',
+      rows: [{ kind: 'node', uri: fileUri, type: 'file', label: 'thing.ts' }],
+    });
+    const { memoryId } = await memory(projectId).recordMemory(projectId, {
+      kind: 'learning',
+      statement: 'the thing lives in lib/thing.ts',
+      evidence: [{ repositoryKey: 'repo-v', branch: 'main', baseId: 'old-sha', path: 'lib/thing.ts' }],
+      actor: AGENT,
+    });
+    const result = await memory(projectId).promoteMemoriesOnMerge(projectId, { repositoryKey: 'repo-v', branch: 'main', mergedBaseId: 'merged-sha-v' });
+    expect(result.promoted).toEqual([expect.any(String)]);
+    expect(result.skipped).toEqual([]);
+    const promoted = await memory(projectId).getMemoryItem(projectId, result.promoted[0]!);
+    expect(promoted!.authority).toBe(4);
+    expect(promoted!.supersedesMemoryId).toBe(memoryId);
+    // The superseded original is still fully readable with its own (lower) authority intact.
+    const original = await memory(projectId).getMemoryItem(projectId, memoryId);
+    expect(original).not.toBeNull();
+    expect(original!.statement).toBe('the thing lives in lib/thing.ts');
+  });
+
+  it("does NOT promote an otherwise-identical memory whose citations do NOT verify at the merged base — matches the repository/branch but the file simply isn't in that generation's graph", async () => {
+    const { projectId } = await newOwnedProject('pm-appr-noverify@example.com', 'PMAPRNVF');
+    // An active generation exists for repo-v/main/merged-sha-v (something real to check
+    // against), but it projects no node for the cited path — same shape as memory-
+    // verification.test.ts's "missing" case, just reached through the promotion path instead.
+    await stageAndProject(projectId, {
+      generationId: 'gen_nv1', repositoryKey: 'repo-v', branch: 'main', baseId: 'merged-sha-v', rows: [],
+    });
+    await memory(projectId).recordMemory(projectId, {
+      kind: 'learning',
+      statement: 'the thing lives in lib/gone.ts',
+      evidence: [{ repositoryKey: 'repo-v', branch: 'main', baseId: 'old-sha', path: 'lib/gone.ts' }],
+      actor: AGENT,
+    });
+    const result = await memory(projectId).promoteMemoriesOnMerge(projectId, { repositoryKey: 'repo-v', branch: 'main', mergedBaseId: 'merged-sha-v' });
+    expect(result.promoted).toHaveLength(0);
+    expect(result.skipped).toHaveLength(1);
+    expect(result.skipped[0]!.reason).toMatch(/do not verify at the merged base/);
+  });
+
+  it('citations verified at a DIFFERENT base than the one just merged are skipped, not promoted — merge alone never promotes unsupported claims', async () => {
+    const { projectId } = await newOwnedProject('pm-appr-stalebase@example.com', 'PMAPRSTB');
+    const fileUri = buildEntityUri({ kind: 'file', projectKey: 'PMAPRSTB', repositoryKey: 'repo-v', path: 'lib/thing.ts' });
+    // The active generation is for an OLDER base — a prior merge, not the one this call names.
+    await stageAndProject(projectId, {
+      generationId: 'gen_old1', repositoryKey: 'repo-v', branch: 'main', baseId: 'older-sha',
+      rows: [{ kind: 'node', uri: fileUri, type: 'file', label: 'thing.ts' }],
+    });
+    await memory(projectId).recordMemory(projectId, {
+      kind: 'learning',
+      statement: 'the thing lives in lib/thing.ts',
+      evidence: [{ repositoryKey: 'repo-v', branch: 'main', baseId: 'ancient-sha', path: 'lib/thing.ts' }],
+      actor: AGENT,
+    });
+    const result = await memory(projectId).promoteMemoriesOnMerge(projectId, { repositoryKey: 'repo-v', branch: 'main', mergedBaseId: 'brand-new-sha' });
+    expect(result.promoted).toHaveLength(0);
+    expect(result.skipped).toHaveLength(1);
+    expect(result.skipped[0]!.reason).toContain('brand-new-sha');
   });
 });
 
@@ -275,7 +391,7 @@ describe('GitHub webhook triggers merge promotion end to end', () => {
     return res;
   }
 
-  it("promotes memory whose evidence matches the project's single registered repository/branch", async () => {
+  it("promotes memory whose evidence matches the project's single registered repository/branch AND verifies at the merged commit", async () => {
     const { token, projectId } = await newOwnedProject('pm-appr-webhook@example.com', 'PMAPRWHK');
     await room(projectId).registerRepository(projectId, actor, 'repo-wh');
     const task = await mcpCall(token, 'create_task', { projectId, title: 'ship it', tags: ['memory-approval-test'], allowNewTags: true });
@@ -285,6 +401,14 @@ describe('GitHub webhook triggers merge promotion end to end', () => {
       statement: 'the fix lives in lib/x.ts',
       evidence: [{ repositoryKey: 'repo-wh', branch: 'main', baseId: 'old-sha', path: 'lib/x.ts' }],
       actor: AGENT,
+    });
+    // PLNR-266: the webhook hands promoteMemoriesOnMerge the PR's merge_commit_sha as the
+    // verification base — an active generation must already cover it (indexing has caught up
+    // to the merge by the time this runs, in the real flow) for the citation to verify.
+    const fileUri = buildEntityUri({ kind: 'file', projectKey: 'PMAPRWHK', repositoryKey: 'repo-wh', path: 'lib/x.ts' });
+    await stageAndProject(projectId, {
+      generationId: 'gen_wh1', repositoryKey: 'repo-wh', branch: 'main', baseId: 'new-merged-sha',
+      rows: [{ kind: 'node', uri: fileUri, type: 'file', label: 'x.ts' }],
     });
     const beforeCount = (await memory(projectId).health(projectId)).tableCounts.memory_items;
 
@@ -301,6 +425,33 @@ describe('GitHub webhook triggers merge promotion end to end', () => {
     // response is sent) — no polling needed, unlike the fire-and-forget deletion paths elsewhere.
     const afterCount = (await memory(projectId).health(projectId)).tableCounts.memory_items;
     expect(afterCount).toBe((beforeCount ?? 0) + 1);
+  });
+
+  it('does NOT promote via the webhook when the merged commit has no verifying index generation yet', async () => {
+    const { token, projectId } = await newOwnedProject('pm-appr-webhook-unverified@example.com', 'PMAPRWUV');
+    await room(projectId).registerRepository(projectId, actor, 'repo-whu');
+    const task = await mcpCall(token, 'create_task', { projectId, title: 'ship it unverified', tags: ['memory-approval-test'], allowNewTags: true });
+    if (task.isError) throw new Error(`create_task failed: ${task.text}`);
+    await memory(projectId).recordMemory(projectId, {
+      kind: 'learning',
+      statement: 'the fix lives in lib/z.ts',
+      evidence: [{ repositoryKey: 'repo-whu', branch: 'main', baseId: 'old-sha', path: 'lib/z.ts' }],
+      actor: AGENT,
+    });
+    const beforeCount = (await memory(projectId).health(projectId)).tableCounts.memory_items;
+
+    // No index generation staged at all this time — indexing has not caught up to the merge.
+    const payload = JSON.stringify({
+      pull_request: {
+        title: 'PMAPRWUV-1 ship it unverified', number: 11, state: 'closed', merged: true,
+        html_url: 'https://gh/pr/11', head: { ref: 'feat/z' }, base: { ref: 'main' }, merge_commit_sha: 'unverified-sha',
+      },
+    });
+    const res = await sendWebhook(payload);
+    expect(res.status).toBe(200);
+
+    const afterCount = (await memory(projectId).health(projectId)).tableCounts.memory_items;
+    expect(afterCount).toBe(beforeCount); // merge evidence alone never promotes an unsupported claim
   });
 
   it('does NOT promote when the project has no single registered repository to correlate against', async () => {

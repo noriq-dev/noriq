@@ -38,6 +38,7 @@ import {
   citationVerdict, verifiedForBase, rollUpValidity,
   type CitationCheck, type CallerBaseScope, type VerificationReport,
 } from '../memory/verification';
+import { compareSurfaces, findingHash, type SurfaceId } from '../memory/guidance-drift';
 
 /**
  * ProjectMemory — one instance per project (idFromName(projectId)), canonical
@@ -3320,36 +3321,70 @@ export class ProjectMemory extends DurableObject<Env> {
   }
 
   /**
-   * GitHub-merge-evidence promotion (§12): every memory below authority 4 whose evidence is
-   * ENTIRELY within the given repository/branch is promoted to a new authority-4 version citing
-   * the merged revision. A memory with no evidence, or evidence citing any OTHER
-   * repository/branch, is left untouched — a merge is not blanket proof for claims it does not
-   * actually back. This is the "cheap server-side check" the task allows for now; the thorough
-   * worktree-tier re-verification is PLNR-265's.
+   * GitHub-merge-evidence promotion (§12, PLNR-266). Every memory below authority 4 whose
+   * evidence is ENTIRELY within the given repository/branch is a CANDIDATE — but repository/
+   * branch scoping alone is no longer sufficient (PLNR-253's own comment already flagged this as
+   * provisional pending this task's verification gate): each candidate's citations must actually
+   * VERIFY at the merged baseId before promotion, reusing PLNR-265's own verification path
+   * rather than re-deriving a check. `verifyMemoryCitations` refreshes each citation against
+   * the CURRENT active index generation (in the real flow, indexing has caught up to the just-
+   * merged commit by the time this runs), and `verifiedForBase` — built exactly for "is this
+   * genuinely valid AND scoped to the caller's own branch/base" — gates on the merged
+   * (branch, baseId) specifically, not just on whatever base happened to be last checked. A
+   * candidate that fails either check is SKIPPED with a recorded reason: promotion is an upgrade
+   * path, and failing to earn one is not evidence of being wrong (that is PLNR-265's own
+   * verification sweep's job, which has the base scope to justify a demotion — this path never
+   * demotes). This never promotes past AUTHORITY_VERIFIED_MERGED (4); human approval
+   * (`approveDecision`) remains the only path to 5 — see `memory-approval.test.ts`'s explicit cap
+   * assertion.
    */
   async promoteMemoriesOnMerge(
     projectId: string,
     input: { repositoryKey: string; branch: string; mergedBaseId: string },
-  ): Promise<{ promoted: string[]; skipped: number }> {
+  ): Promise<{ promoted: string[]; skipped: Array<{ memoryItemId: string; reason: string }> }> {
     await this.assertProjectId(projectId);
     const candidates = this.ctx.storage.sql
       .exec<{ id: string }>(`SELECT id FROM memory_items WHERE authority < ?1`, AUTHORITY_VERIFIED_MERGED)
       .toArray();
     const searchBackendForIndex = searchBackend(this.env);
     const promoted: string[] = [];
-    let skipped = 0;
+    const skipped: Array<{ memoryItemId: string; reason: string }> = [];
     for (const { id } of candidates) {
       const evidenceRows = this.ctx.storage.sql
         .exec<{ repository_key: string; branch: string }>(`SELECT repository_key, branch FROM evidence WHERE memory_item_id = ?1`, id)
         .toArray();
-      const verified = evidenceRows.length > 0 && evidenceRows.every((e) => e.repository_key === input.repositoryKey && e.branch === input.branch);
-      if (!verified) {
-        skipped++;
+      if (evidenceRows.length === 0) {
+        skipped.push({ memoryItemId: id, reason: 'no repository evidence to verify' });
+        continue;
+      }
+      if (!evidenceRows.every((e) => e.repository_key === input.repositoryKey && e.branch === input.branch)) {
+        skipped.push({ memoryItemId: id, reason: 'evidence cites a different repository or branch than the merged PR' });
+        continue;
+      }
+      // Refresh this memory's citations against the current active graph (PLNR-265's own RPC —
+      // not a re-derived check) before judging them: a candidate's evidence rows may still carry
+      // a PRE-merge verification state from an earlier sweep, and this is what brings them
+      // current before the merged-base gate below reads them.
+      await this.verifyMemoryCitations(projectId, { memoryItemId: id });
+      const verifiedRows = this.ctx.storage.sql
+        .exec<{ verification_state: string; last_verified_base_id: string | null; last_verified_branch: string | null }>(
+          `SELECT verification_state, last_verified_base_id, last_verified_branch FROM evidence WHERE memory_item_id = ?1`,
+          id,
+        )
+        .toArray();
+      const verifiedAtMergedBase = verifiedRows.every((r) =>
+        verifiedForBase(
+          { verificationState: r.verification_state, lastVerifiedBaseId: r.last_verified_base_id, lastVerifiedBranch: r.last_verified_branch },
+          { baseId: input.mergedBaseId, branch: input.branch },
+        ),
+      );
+      if (!verifiedAtMergedBase) {
+        skipped.push({ memoryItemId: id, reason: `citations do not verify at the merged base ${input.mergedBaseId}` });
         continue;
       }
       const original = await this.getMemoryItem(projectId, id);
       if (!original) {
-        skipped++;
+        skipped.push({ memoryItemId: id, reason: 'memory item vanished between candidate selection and promotion' });
         continue;
       }
       const promotedId = newId('mem');
@@ -3412,6 +3447,99 @@ export class ProjectMemory extends DurableObject<Env> {
     }
     if (promoted.length > 0) this.ctx.storage.setAlarm(Date.now()).catch(() => {});
     return { promoted, skipped };
+  }
+
+  // ---------------------------------------------------------------------------
+  // PLNR-266: guidance-drift scanning. `memory/guidance-drift.ts`'s `compareSurfaces` is
+  // storage-free and rule-driven; this DO only supplies persistence. It deliberately never reads
+  // INSTRUCTIONS/GET_BRIEFING_PLAYBOOK/SKILL_MD/DOC_SKILL_MD itself — those live in mcp.ts/
+  // skill.ts/skill-docs.ts, one layer up, and ProjectMemory has no business importing the MCP
+  // surface; the caller (index.ts) gathers the live text and passes it in. A finding is a
+  // maintenance defect report about NORIQ'S OWN guidance surfaces, never project knowledge — see
+  // 0009_guidance_drift.sql's own comment for why it is a dedicated table, not a memory_items row.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Compare the given surface texts against the fixed rule table and persist any findings,
+   * deduplicated by `findingHash` (ruleId + sorted present/missing surfaces + quotes). Hashes are
+   * computed BEFORE the transaction (they need `crypto.subtle`, which is async and cannot run
+   * inside `transactionSync`'s synchronous callback); the transaction itself only reads/writes
+   * SQLite. A finding whose hash already exists has its `last_seen_at` touched instead of being
+   * re-inserted — a re-scan of an unchanged repository therefore adds zero rows (stated
+   * acceptance: "running the same scan twice produces the same finding set and adds no duplicate
+   * rows"), while a genuinely NEW finding (a rule that just started/stopped drifting) still gets
+   * its own row alongside any still-open older ones.
+   */
+  async recordGuidanceDriftScan(
+    projectId: string,
+    surfaces: Partial<Record<SurfaceId, string | null>>,
+  ): Promise<{ findings: number; newFindings: number }> {
+    await this.assertProjectId(projectId);
+    const findings = compareSurfaces(surfaces);
+    const withHashes = await Promise.all(findings.map(async (f) => ({ finding: f, hash: await findingHash(f) })));
+    const now = nowIso();
+    let newFindings = 0;
+    this.ctx.storage.transactionSync(() => {
+      if (this._forceWriteFailure) throw new Error('injected write failure (test)');
+      for (const { finding, hash } of withHashes) {
+        const existing = this.ctx.storage.sql.exec<{ id: string }>(`SELECT id FROM guidance_drift_findings WHERE hash = ?1`, hash).toArray()[0];
+        if (existing) {
+          this.ctx.storage.sql.exec(`UPDATE guidance_drift_findings SET last_seen_at = ?2 WHERE id = ?1`, existing.id, now);
+          continue;
+        }
+        this.ctx.storage.sql.exec(
+          `INSERT INTO guidance_drift_findings
+             (id, hash, rule_id, description, present_surfaces, missing_surfaces, unavailable_surfaces, quotes, recommended_edit, first_seen_at, last_seen_at)
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)`,
+          newId('gdf'),
+          hash,
+          finding.ruleId,
+          finding.description,
+          JSON.stringify(finding.presentSurfaces),
+          JSON.stringify(finding.missingSurfaces),
+          JSON.stringify(finding.unavailableSurfaces),
+          JSON.stringify(finding.quotes),
+          finding.recommendedEdit,
+          now,
+          now,
+        );
+        newFindings++;
+      }
+    });
+    return { findings: withHashes.length, newFindings };
+  }
+
+  /** The stored, deduplicated guidance-drift findings for this project — read-only; nothing in
+   *  this codebase writes to a guidance file, doc, or task from this data (locked decision). */
+  async listGuidanceDriftFindings(projectId: string): Promise<
+    Array<{
+      id: string; ruleId: string; description: string; presentSurfaces: SurfaceId[]; missingSurfaces: SurfaceId[];
+      unavailableSurfaces: SurfaceId[]; quotes: Partial<Record<SurfaceId, string>>; recommendedEdit: string;
+      firstSeenAt: string; lastSeenAt: string;
+    }>
+  > {
+    await this.assertProjectId(projectId);
+    return this.ctx.storage.sql
+      .exec<{
+        id: string; rule_id: string; description: string; present_surfaces: string; missing_surfaces: string;
+        unavailable_surfaces: string; quotes: string; recommended_edit: string; first_seen_at: string; last_seen_at: string;
+      }>(
+        `SELECT id, rule_id, description, present_surfaces, missing_surfaces, unavailable_surfaces, quotes, recommended_edit, first_seen_at, last_seen_at
+         FROM guidance_drift_findings ORDER BY first_seen_at`,
+      )
+      .toArray()
+      .map((r) => ({
+        id: r.id,
+        ruleId: r.rule_id,
+        description: r.description,
+        presentSurfaces: JSON.parse(r.present_surfaces) as SurfaceId[],
+        missingSurfaces: JSON.parse(r.missing_surfaces) as SurfaceId[],
+        unavailableSurfaces: JSON.parse(r.unavailable_surfaces) as SurfaceId[],
+        quotes: JSON.parse(r.quotes) as Partial<Record<SurfaceId, string>>,
+        recommendedEdit: r.recommended_edit,
+        firstSeenAt: r.first_seen_at,
+        lastSeenAt: r.last_seen_at,
+      }));
   }
 
   /**

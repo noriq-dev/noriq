@@ -4,7 +4,7 @@ import { cors } from 'hono/cors';
 import { StreamableHTTPTransport } from '@hono/mcp';
 import type { Env } from './env';
 import { adminAuth, agentAuth, readSessionId, resolveSessionAgent, SESSION_CLEAR_COOKIE, sessionSetCookie, userAuth, type AppContext } from './auth';
-import { buildMcpServer } from './mcp';
+import { buildMcpServer, INSTRUCTIONS, GET_BRIEFING_PLAYBOOK } from './mcp';
 import { handleModernMcp, isModernMcpRequest } from './mcp-2026';
 import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot, importSnapshot } from './backup';
@@ -1198,6 +1198,29 @@ app.post('/api/projects/:pid/memory/items/:id/reject', userAuth, async (c) => {
   return c.json(
     await memoryStub(c.env, pid).rejectDecision(pid, { memoryItemId: c.req.param('id')!, actorUserId: c.var.user!.id, note: body.note ?? null }),
   );
+});
+
+// Guidance-drift scanning (PLNR-266) — admin-only, same trailing-:projectId shape as
+// /api/admin/memory-backup/:projectId: this compares NORIQ'S OWN agent-guidance surfaces
+// (never project data), but a project's ProjectMemory DO is where findings persist, so a scan
+// still names a project. This route is the ONLY place that gathers the four live surface
+// texts — memory/guidance-drift.ts and ProjectMemory itself deliberately never import
+// mcp.ts/skill.ts/skill-docs.ts (see ProjectMemory.recordGuidanceDriftScan's own comment).
+// Recommendations are DATA: nothing here (or anywhere in this task) writes to a guidance file,
+// opens a PR, or edits a doc/task.
+app.post('/api/admin/memory-guidance-drift/:projectId/scan', adminAuth, async (c) => {
+  const projectId = c.req.param('projectId')!;
+  const surfaces = {
+    instructions: INSTRUCTIONS,
+    playbook: GET_BRIEFING_PLAYBOOK.join('\n\n'),
+    skill_md: SKILL_MD,
+    doc_skill_md: DOC_SKILL_MD,
+  };
+  return c.json(await memoryStub(c.env, projectId).recordGuidanceDriftScan(projectId, surfaces));
+});
+app.get('/api/admin/memory-guidance-drift/:projectId', adminAuth, async (c) => {
+  const projectId = c.req.param('projectId')!;
+  return c.json({ findings: await memoryStub(c.env, projectId).listGuidanceDriftFindings(projectId) });
 });
 
 // Plan-local docs (PLNR-200) — working documents scoped to one plan; read via the snapshot

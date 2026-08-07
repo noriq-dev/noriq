@@ -6,8 +6,15 @@ import { describe, expect, it } from 'vitest';
 import type { Env } from '../src/env';
 import { createUser, mintTokenForUser, mcpCall } from './helpers';
 import { sweepProjectDebris, MEMORY_HYPOTHESIS_DECAY_MAX_AGE_MS, MEMORY_HYPOTHESIS_DECAY_AUTHORITY_CEILING } from '../src/memory/lifecycle';
+import { buildEntityUri } from '@noriq-dev/shared';
 
 const appEnv = env as unknown as Env;
+
+interface IndexManifestInput {
+  generationId: string; projectId: string; repositoryKey: string; branch: string; baseId: string;
+  indexerVersion: string; batchCount: number; fileCount: number; contentHash: string; deletions: string[]; createdAt: string;
+}
+interface StagedRow { kind: 'node' | 'edge'; uri?: string; type?: string; label?: string; content?: string | null; from?: string; to?: string }
 
 interface MemoryRpc {
   health(pid: string): Promise<{ schemaVersion: number; memoryRevision: number; tableCounts: Record<string, number> }>;
@@ -44,6 +51,11 @@ interface MemoryRpc {
   restoreSnapshot(pid: string, opts: { exportedAt: string }): Promise<{ ok: true } | { ok: false; reason: string }>;
   drainOutbox(pid: string): Promise<{ delivered: number; failed: number }>;
   _setMemoryRecordedAtForTest(pid: string, memoryId: string, recordedAt: string): Promise<void>;
+  beginIndexIngest(pid: string, manifest: IndexManifestInput): Promise<{ ok: true }>;
+  ingestIndexBatch(pid: string, batch: { generationId: string; batchNumber: number; batchHash: string }, rows: StagedRow[]): Promise<{ ok: true; deduped: boolean }>;
+  completeIndexIngest(pid: string, generationId: string): Promise<{ ok: true; batchesReceived: number; validation: { ok: boolean; problems: string[] } }>;
+  activateIndexGeneration(pid: string, generationId: string): Promise<{ activated: string; superseded: string[] }>;
+  projectActiveGeneration(pid: string, generationId: string): Promise<{ nodesWritten: number }>;
 }
 
 const memory = (pid: string) => appEnv.PROJECT_MEMORY.get(appEnv.PROJECT_MEMORY.idFromName(pid)) as unknown as MemoryRpc;
@@ -55,6 +67,26 @@ async function newOwnedProject(email: string, key: string) {
   const proj = await mcpCall(token, 'create_project', { key, name: `${key} project` });
   if (proj.isError) throw new Error(`create_project(${key}) failed: ${proj.text}`);
   return { userId: user.id, token, projectId: proj.body.id as string };
+}
+
+function manifestFor(over: Partial<IndexManifestInput> & Pick<IndexManifestInput, 'generationId' | 'projectId' | 'repositoryKey' | 'branch' | 'baseId'>): IndexManifestInput {
+  return { indexerVersion: 'v1', batchCount: 1, fileCount: 1, contentHash: 'sha256:x', deletions: [], createdAt: new Date().toISOString(), ...over };
+}
+
+/** Stage one batch and drive it all the way to a projected, active generation (same technique
+ *  memory-verification.test.ts/memory-approval.test.ts use) — PLNR-266's promotion gate needs a
+ *  real active generation covering the cited path at the merged base before it will promote. */
+async function stageAndProject(projectId: string, opts: { generationId: string; repositoryKey: string; branch: string; baseId: string; rows: StagedRow[] }) {
+  const m = memory(projectId);
+  await m.beginIndexIngest(projectId, manifestFor({
+    generationId: opts.generationId, projectId, repositoryKey: opts.repositoryKey, branch: opts.branch, baseId: opts.baseId,
+    fileCount: opts.rows.filter((r) => r.kind === 'node' && r.type === 'file').length,
+  }));
+  await m.ingestIndexBatch(projectId, { generationId: opts.generationId, batchNumber: 0, batchHash: 'h' }, opts.rows);
+  const completed = await m.completeIndexIngest(projectId, opts.generationId);
+  if (!completed.validation.ok) throw new Error(`validation failed: ${completed.validation.problems.join('; ')}`);
+  await m.activateIndexGeneration(projectId, opts.generationId);
+  return m.projectActiveGeneration(projectId, opts.generationId);
 }
 
 const old = () => new Date(Date.now() - MEMORY_HYPOTHESIS_DECAY_MAX_AGE_MS - 1000).toISOString();
@@ -187,6 +219,14 @@ describe('decayLowAuthorityMemories — bounded, policy-driven, reversible from 
 
   it('never decays an authority-4 merge-promoted memory or the original it superseded', async () => {
     const { projectId } = await newOwnedProject('pm-maint-decay-merge@example.com', 'PMMNTDMG');
+    // PLNR-266: promotion now requires the citation to VERIFY at the merged base — an active
+    // generation covering the cited path at repo-merge/main/post is what makes promotion (and
+    // therefore this test's whole premise) actually happen.
+    const fileUri = buildEntityUri({ kind: 'file', projectKey: 'PMMNTDMG', repositoryKey: 'repo-merge', path: 'a.ts' });
+    await stageAndProject(projectId, {
+      generationId: 'gen_decaymerge1', repositoryKey: 'repo-merge', branch: 'main', baseId: 'post',
+      rows: [{ kind: 'node', uri: fileUri, type: 'file', label: 'a.ts' }],
+    });
     const { memoryId } = await memory(projectId).recordMemory(projectId, {
       kind: 'learning',
       statement: 'verified by merge',
@@ -194,6 +234,7 @@ describe('decayLowAuthorityMemories — bounded, policy-driven, reversible from 
       actor: AGENT,
     });
     const { promoted } = await memory(projectId).promoteMemoriesOnMerge(projectId, { repositoryKey: 'repo-merge', branch: 'main', mergedBaseId: 'post' });
+    expect(promoted).toHaveLength(1); // sanity: promotion actually happened, or the rest of this test proves nothing
     const promotedId = promoted[0]!;
     await memory(projectId)._setMemoryRecordedAtForTest(projectId, promotedId, old());
     await memory(projectId)._setMemoryRecordedAtForTest(projectId, memoryId, old());
