@@ -41,7 +41,32 @@ export interface MemoryItemRecord {
   recordedAt: string;
   proposedAt: string | null;
   rejectedAt: string | null;
-  evidence: Array<{ id: string; repositoryKey: string; branch: string; baseId: string; path: string; symbol: string | null; verificationState: string }>;
+  evidence: Array<{
+    id: string; repositoryKey: string; branch: string; baseId: string; path: string; symbol: string | null;
+    verificationState: string;
+    /** The citation's stable identity (writes.ts's evidenceHash) — what a Runner verification
+     *  report addresses this citation by (see VerificationReportCitationInput below). */
+    evidenceHash: string | null;
+    /** PLNR-265: when/against-what/by-whom this citation was last checked — null across the
+     *  board for a citation no sweep or Runner report has ever reached. */
+    lastVerifiedAt: string | null;
+    lastVerifiedBaseId: string | null;
+    lastVerifiedBranch: string | null;
+    verificationSource: string | null;
+    observedPath: string | null;
+  }>;
+}
+/** One citation's verdict from a Runner's worktree-leased verification pass — see
+ *  memory/verification.ts's `VerificationReportCitation` for the full field-by-field rationale.
+ *  Re-declared here (not imported) because this is the STUB's own narrow view of the shape, the
+ *  same convention `MemoryEvidenceInput` above already follows for evidence. */
+export interface VerificationReportCitationInput {
+  memoryItemId: string;
+  evidenceHash: string;
+  state: 'valid' | 'moved' | 'changed' | 'missing' | 'unverifiable';
+  baseId: string;
+  branch: string;
+  observedPath?: string | null;
 }
 
 /** The subset of ProjectMemory's RPC surface callers outside the DO reach through. Widened as
@@ -107,12 +132,31 @@ export interface ProjectMemoryStub {
       maxDepth?: number;
       repositoryKey?: string;
       branch?: string;
+      /** PLNR-265: the caller's own opaque VCS revision — string-compared only, scopes whether a
+       *  'valid' citation reads as verified FOR THIS CALLER (`evidence-base-mismatch`). */
+      baseId?: string;
       kind?: string;
       minAuthority?: number;
       validity?: string;
       limit?: number;
     },
   ): Promise<{ mode: 'semantic' | 'keyword'; results: RankedHit[] }>;
+  /** PLNR-265: the cheap server-side citation-verification tier — one memory (`memoryItemId`) or
+   *  a bounded oldest/never-verified sweep (`limit`) when omitted. See ProjectMemory's own doc
+   *  comment for what a 'valid'/'missing'/'changed'/'unverifiable' verdict does and does not
+   *  prove. Never throws for a repository with no active index generation. */
+  verifyMemoryCitations(
+    projectId: string,
+    input: { memoryItemId?: string; limit?: number },
+  ): Promise<{ checked: number; updated: number; results: Array<{ evidenceId: string; memoryItemId: string; verificationState: string }> }>;
+  /** PLNR-265: the Runner worktree-verification (thorough) tier's landing point. Idempotent by
+   *  (evidenceHash, reported base, reported state) — see ProjectMemory.acceptVerificationReport's
+   *  own doc comment. */
+  acceptVerificationReport(
+    projectId: string,
+    report: { citations: VerificationReportCitationInput[]; source: string },
+    actor: MemoryActorRef,
+  ): Promise<{ applied: number; skipped: number; touchedMemoryIds: string[] }>;
   /** PLNR-264: has this task's likely area of work already been attempted? Read-only —
    *  see ProjectMemory.similarEffort's own doc comment for the full retrieval story. */
   similarEffort(

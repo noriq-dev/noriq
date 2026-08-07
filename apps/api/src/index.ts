@@ -30,6 +30,7 @@ import { onboarding } from './onboarding';
 import { z } from 'zod';
 import { listProjectRepositories, listRepositoryCheckouts, resolveRepositoryByKey, loadPriorEffort, type ProjectMemoryStub } from './lib/project-memory';
 import { readBoundedBody, verifyBatchChecksum, decodeBatchRows, MAX_INGEST_BATCH_BYTES, INGEST_TOKEN_TTL_SECONDS } from './memory/ingest';
+import { normalizeVerificationReport } from './memory/verification';
 import { AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget, isTerminalRunStatus, normalizeProjectKey, IndexGenerationManifest } from '@noriq-dev/shared';
 
 export { ProjectRoom } from './do/ProjectRoom';
@@ -2638,6 +2639,37 @@ app.post('/api/runs/:runId/steer-ack', agentAuth, async (c) => {
     ).bind(agentId, b.messageId, runId).run();
   }
   return c.json({ ok: true, suppressed: b.via === 'runtime' });
+});
+
+// PLNR-265: the Runner worktree-verification (thorough) tier's landing point (§15). Deliberately
+// on the ordinary agentAuth run surface, NOT PLNR-260's capability-token ingest routes (locked
+// decision) — a verification report is small and belongs where every other run-scoped agent
+// action already lives; capability tokens exist for BULK payloads (§8), and widening them here
+// would add a second trust path for no size benefit. Authenticates as the RUN'S OWN agent
+// specifically (never a bare copilot connection, never a DIFFERENT run's agent) — the same
+// "is this caller who it claims to be for THIS run" check `steer-ack`/`park` apply via ownership,
+// tightened here to the exact bound agent because a verification report is written attributed to
+// an actor, not merely gated by project reach.
+app.post('/api/runs/:runId/verification-report', agentAuth, async (c) => {
+  const runId = c.req.param('runId')!;
+  let report: ReturnType<typeof normalizeVerificationReport>;
+  try {
+    report = normalizeVerificationReport(await c.req.json());
+  } catch (e) {
+    return c.json({ error: 'invalid verification report', detail: e instanceof Error ? e.message : String(e) }, 400);
+  }
+  const conn = c.var.connection!;
+  const run = await c.env.DB.prepare('SELECT project_id AS projectId, agent_id AS agentId FROM runs WHERE id = ?')
+    .bind(runId).first<{ projectId: string; agentId: string | null }>();
+  if (!run) return c.json({ error: 'run not found' }, 404);
+  if (!conn.boundAgent || conn.boundAgent.id !== run.agentId) {
+    return c.json({ error: 'this run has no live agent matching the caller' }, 403);
+  }
+  if (!(await tokenCanReachProject(c.env, conn.tokenId, run.projectId))) {
+    return c.json({ error: 'run is outside this connection’s authorized projects' }, 403);
+  }
+  const result = await memoryStub(c.env, run.projectId).acceptVerificationReport(run.projectId, report, { kind: 'agent', id: conn.boundAgent.id });
+  return c.json(result);
 });
 
 // --- per-task event timeline (PLNR-34) ----------------------------------------------

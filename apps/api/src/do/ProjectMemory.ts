@@ -34,6 +34,10 @@ import {
   effortSignals, duplicateWarnings, summarizeEffort,
   type TaskEffortInput, type EffortCandidate, type DuplicateWarning, type EffortSummary,
 } from '../memory/similar-effort';
+import {
+  citationVerdict, verifiedForBase, rollUpValidity,
+  type CitationCheck, type CallerBaseScope, type VerificationReport,
+} from '../memory/verification';
 
 /**
  * ProjectMemory — one instance per project (idFromName(projectId)), canonical
@@ -1982,6 +1986,221 @@ export class ProjectMemory extends DurableObject<Env> {
     return { ok: true };
   }
 
+  // ---------------------------------------------------------------------------
+  // PLNR-265: server-side citation verification. Two tiers, ONE downstream path
+  // (`rollUpAndTransitionValidity` below) — a memory's OWN validity always changes through
+  // `transitionMemoryValidity` above, never a direct UPDATE, so a verification-driven demotion
+  // stays canonical history exactly like a human/approval-driven one (locked decision: "written
+  // through the EXISTING transitionMemoryValidity RPC, not a new direct UPDATE").
+  //   - `verifyMemoryCitations` — the CHEAP tier (§15): checks citations against the ACTIVE index
+  //     generation's graph only. No network calls (locked decision: no GitHub client exists in
+  //     this codebase, and outbound fetch from the worker isolate reached via SELF.fetch cannot
+  //     be intercepted by `fetchMock` — CLAUDE.md — so that path is a named seam, not built here).
+  //   - `acceptVerificationReport` — the THOROUGH tier's landing point: a Runner's worktree
+  //     verification pass. Idempotent by (evidenceHash, reported base, reported state): a citation
+  //     already at the reported values is left untouched, so a daemon retry after a dropped
+  //     response changes nothing.
+  // Neither path ever deletes a memory, its evidence, or its history (§12/§15) — every write here
+  // is an UPDATE of 0008's verification columns on an EXISTING evidence row.
+  // ---------------------------------------------------------------------------
+
+  /** The active generation's (branch, baseId) for one repository, memoized per verification call
+   *  — many citations in one sweep typically share a repository, and this would otherwise be one
+   *  SELECT per citation. `null` when the repository has no active generation at all (no index
+   *  has ever run, or one is only staged) — the honest "nothing to check against" case. */
+  private activeGenerationScope(
+    repositoryKey: string,
+    cache: Map<string, { branch: string; baseId: string } | null>,
+  ): { branch: string; baseId: string } | null {
+    if (!cache.has(repositoryKey)) {
+      const gen = this.ctx.storage.sql
+        .exec<{ branch: string; base_id: string }>(`SELECT branch, base_id FROM index_generations WHERE repository_key = ?1 AND status = 'active'`, repositoryKey)
+        .toArray()[0];
+      cache.set(repositoryKey, gen ? { branch: gen.branch, baseId: gen.base_id } : null);
+    }
+    return cache.get(repositoryKey)!;
+  }
+
+  /** Does the CURRENT graph carry a `file`/`symbol` node for this citation? Only meaningful once
+   *  a caller has confirmed an active generation exists for the repository — see `citationVerdict`
+   *  for what a `null` (no generation) result means instead. */
+  private checkCitationAgainstGraph(projectKey: string, citation: { repository_key: string; path: string; symbol: string | null }): CitationCheck {
+    const fileUri = buildEntityUri({ kind: 'file', projectKey, repositoryKey: citation.repository_key, path: citation.path });
+    const pathPresent = !!this.ctx.storage.sql.exec<{ id: string }>(`SELECT id FROM nodes WHERE uri = ?1`, fileUri).toArray()[0];
+    let symbolPresent: boolean | null = null;
+    if (citation.symbol) {
+      const symbolUri = buildEntityUri({ kind: 'symbol', projectKey, repositoryKey: citation.repository_key, path: citation.path, name: citation.symbol });
+      symbolPresent = !!this.ctx.storage.sql.exec<{ id: string }>(`SELECT id FROM nodes WHERE uri = ?1`, symbolUri).toArray()[0];
+    }
+    return { pathPresent, symbolPresent };
+  }
+
+  /** Recompute one memory's validity from its CURRENT evidence rows (`rollUpValidity`) and, only
+   *  when it actually differs from what is stored, write it through `transitionMemoryValidity` —
+   *  the same choke point every other validity change goes through. Doing nothing when nothing
+   *  changed is what makes both verification RPCs idempotent: a repeated sweep/report that alters
+   *  no evidence row never calls this at all (its caller only invokes this for a memory whose
+   *  evidence it just touched), and even if it did, a same-answer rollup is a no-op here too. */
+  private async rollUpAndTransitionValidity(
+    projectId: string,
+    memoryItemId: string,
+    reason: string,
+    actor: { kind: string; id: string | null },
+  ): Promise<void> {
+    const states = this.ctx.storage.sql
+      .exec<{ verification_state: string }>(`SELECT verification_state FROM evidence WHERE memory_item_id = ?1`, memoryItemId)
+      .toArray()
+      .map((r) => r.verification_state);
+    const rollup = rollUpValidity(states);
+    if (rollup === null) return; // no repository evidence at all — never demoted by this path (locked decision)
+    const current = this.ctx.storage.sql.exec<{ validity: string }>(`SELECT validity FROM memory_items WHERE id = ?1`, memoryItemId).toArray()[0];
+    if (!current || current.validity === rollup) return;
+    await this.transitionMemoryValidity(projectId, { memoryItemId, validity: rollup, reason, actor });
+  }
+
+  /**
+   * The cheap server-side tier (§15): verify one memory's citations (`memoryItemId`), or a
+   * bounded sweep of the project's oldest/never-verified citations (`limit`, default 25, capped
+   * 200) when no `memoryItemId` is given — both forms share this one RPC (discretion). Never
+   * throws for a repository with no active generation or a project with no index at all; every
+   * such citation simply reads 'unverifiable' (§1) rather than 'valid' or 'missing'.
+   *
+   * An evidence row is updated ONLY when its verdict/base/branch/source actually changed from
+   * what is already stored — an unchanged citation is left byte-identical (no new
+   * `last_verified_at`), which is what keeps a repeated sweep over an unindexed project from
+   * endlessly bumping timestamps for no new information.
+   */
+  async verifyMemoryCitations(
+    projectId: string,
+    input: { memoryItemId?: string; limit?: number },
+  ): Promise<{ checked: number; updated: number; results: Array<{ evidenceId: string; memoryItemId: string; verificationState: string }> }> {
+    await this.assertProjectId(projectId);
+    const limit = Math.min(Math.max(input.limit ?? 25, 1), 200);
+    type EvidenceRow = {
+      id: string; memory_item_id: string; repository_key: string; path: string; symbol: string | null;
+      verification_state: string; last_verified_at: string | null; last_verified_base_id: string | null;
+      last_verified_branch: string | null; verification_source: string | null; observed_path: string | null;
+    };
+    const cols = `id, memory_item_id, repository_key, path, symbol, verification_state,
+                  last_verified_at, last_verified_base_id, last_verified_branch, verification_source, observed_path`;
+    const rows = input.memoryItemId
+      ? this.ctx.storage.sql.exec<EvidenceRow>(`SELECT ${cols} FROM evidence WHERE memory_item_id = ?1 ORDER BY created_at`, input.memoryItemId).toArray()
+      // Oldest/never-verified first — a bounded sweep with no target memory makes forward
+      // progress across the whole project rather than re-checking the same head-of-table rows
+      // every call. `last_verified_at IS NOT NULL` sorts every never-verified row (NULL) first.
+      : this.ctx.storage.sql.exec<EvidenceRow>(`SELECT ${cols} FROM evidence ORDER BY last_verified_at IS NOT NULL, last_verified_at ASC LIMIT ?1`, limit).toArray();
+    if (!rows.length) return { checked: 0, updated: 0, results: [] };
+
+    const projectKey = await this.resolveProjectKey(projectId);
+    const genCache = new Map<string, { branch: string; baseId: string } | null>();
+    const now = nowIso();
+    const source = 'server-index';
+    const results: Array<{ evidenceId: string; memoryItemId: string; verificationState: string }> = [];
+    const touchedMemoryIds = new Set<string>();
+    let updated = 0;
+
+    this.ctx.storage.transactionSync(() => {
+      if (this._forceWriteFailure) throw new Error('injected write failure (test)');
+      for (const row of rows) {
+        const gen = this.activeGenerationScope(row.repository_key, genCache);
+        const check = gen ? this.checkCitationAgainstGraph(projectKey, row) : null;
+        const verdict = citationVerdict(check);
+        const baseId = gen?.baseId ?? null;
+        const branch = gen?.branch ?? null;
+        results.push({ evidenceId: row.id, memoryItemId: row.memory_item_id, verificationState: verdict });
+        const unchanged =
+          row.verification_state === verdict && row.last_verified_base_id === baseId &&
+          row.last_verified_branch === branch && row.verification_source === source && row.observed_path === null;
+        if (unchanged) continue;
+        this.ctx.storage.sql.exec(
+          `UPDATE evidence SET verification_state = ?2, last_verified_at = ?3, last_verified_base_id = ?4,
+                  last_verified_branch = ?5, verification_source = ?6, observed_path = NULL WHERE id = ?1`,
+          row.id,
+          verdict,
+          now,
+          baseId,
+          branch,
+          source,
+        );
+        touchedMemoryIds.add(row.memory_item_id);
+        updated++;
+      }
+    });
+
+    for (const memoryItemId of touchedMemoryIds) {
+      await this.rollUpAndTransitionValidity(projectId, memoryItemId, 'server-side citation verification sweep', { kind: 'system', id: null });
+    }
+    return { checked: rows.length, updated, results };
+  }
+
+  /**
+   * The Runner's thorough tier lands here (§15). `report` is assumed already validated/normalized
+   * by the caller (`normalizeVerificationReport` — the REST route's job, matching
+   * `validateEvidenceRef`'s split for `record_memory`) — this RPC trusts the SHAPE but not the
+   * CONTENT: a citation naming a `(memoryItemId, evidenceHash)` pair this project no longer has
+   * (superseded, decayed) is silently skipped, never a fatal error for the rest of the report.
+   *
+   * Idempotent by construction (locked decision — "idempotency keys off the citation's
+   * evidence_hash plus the reported base and state"): a citation whose state/baseId/branch/
+   * source/observedPath ALL already match the evidence row's current values is left completely
+   * untouched — no write, no outbox event, no validity transition — so a daemon retry after a
+   * dropped response is free. A report that changes NOTHING therefore also transitions NO
+   * memory's validity, which is what makes repeated identical reports produce zero extra events.
+   */
+  async acceptVerificationReport(
+    projectId: string,
+    report: VerificationReport,
+    actor: { kind: string; id: string | null },
+  ): Promise<{ applied: number; skipped: number; touchedMemoryIds: string[] }> {
+    await this.assertProjectId(projectId);
+    type EvidenceRow = {
+      id: string; memory_item_id: string; verification_state: string; last_verified_base_id: string | null;
+      last_verified_branch: string | null; verification_source: string | null; observed_path: string | null;
+    };
+    const now = nowIso();
+    const touchedMemoryIds = new Set<string>();
+    let applied = 0;
+    let skipped = 0;
+
+    this.ctx.storage.transactionSync(() => {
+      if (this._forceWriteFailure) throw new Error('injected write failure (test)');
+      for (const citation of report.citations) {
+        const row = this.ctx.storage.sql
+          .exec<EvidenceRow>(
+            `SELECT id, memory_item_id, verification_state, last_verified_base_id, last_verified_branch, verification_source, observed_path
+             FROM evidence WHERE memory_item_id = ?1 AND evidence_hash = ?2`,
+            citation.memoryItemId,
+            citation.evidenceHash,
+          )
+          .toArray()[0];
+        if (!row) { skipped++; continue; } // report cites evidence this project no longer has — tolerate, never fail the whole report
+        const observedPath = citation.observedPath ?? null;
+        const unchanged =
+          row.verification_state === citation.state && row.last_verified_base_id === citation.baseId &&
+          row.last_verified_branch === citation.branch && row.verification_source === report.source && row.observed_path === observedPath;
+        if (unchanged) { skipped++; continue; }
+        this.ctx.storage.sql.exec(
+          `UPDATE evidence SET verification_state = ?2, last_verified_at = ?3, last_verified_base_id = ?4,
+                  last_verified_branch = ?5, verification_source = ?6, observed_path = ?7 WHERE id = ?1`,
+          row.id,
+          citation.state,
+          now,
+          citation.baseId,
+          citation.branch,
+          report.source,
+          observedPath,
+        );
+        touchedMemoryIds.add(row.memory_item_id);
+        applied++;
+      }
+    });
+
+    for (const memoryItemId of touchedMemoryIds) {
+      await this.rollUpAndTransitionValidity(projectId, memoryItemId, `verification report (${report.source})`, actor);
+    }
+    return { applied, skipped, touchedMemoryIds: [...touchedMemoryIds] };
+  }
+
   /**
    * Bounded retention for unused low-authority hypotheses (§18/PLNR-254). A candidate is
    * decayed only when ALL of: authority below `authorityCeiling`, recorded before the cutoff,
@@ -2078,7 +2297,25 @@ export class ProjectMemory extends DurableObject<Env> {
     recordedAt: string;
     proposedAt: string | null;
     rejectedAt: string | null;
-    evidence: Array<{ id: string; repositoryKey: string; branch: string; baseId: string; path: string; symbol: string | null; verificationState: string }>;
+    evidence: Array<{
+      id: string; repositoryKey: string; branch: string; baseId: string; path: string; symbol: string | null;
+      verificationState: string;
+      // The citation's stable identity (writes.ts's evidenceHash — repository/branch/baseId/
+      // path/symbol) — PLNR-265's Runner verification report addresses a citation by
+      // (memoryItemId, evidenceHash), never this row's internal `id`, so exposing it here is
+      // what lets a human (or a future Runner integration) build a report without recomputing
+      // the hash independently.
+      evidenceHash: string | null;
+      // PLNR-265: when/against-what/by-whom this citation was last checked (§15's stated
+      // acceptance — "verification source and timestamp are inspectable"). All null for a
+      // citation no sweep or Runner report has ever reached yet — never implied 'valid' by their
+      // absence, which is exactly the failure mode a silently-defaulted timestamp would create.
+      lastVerifiedAt: string | null;
+      lastVerifiedBaseId: string | null;
+      lastVerifiedBranch: string | null;
+      verificationSource: string | null;
+      observedPath: string | null;
+    }>;
   } | null> {
     await this.assertProjectId(projectId);
     const row = this.ctx.storage.sql
@@ -2102,8 +2339,14 @@ export class ProjectMemory extends DurableObject<Env> {
       .toArray()[0];
     if (!row) return null;
     const evidence = this.ctx.storage.sql
-      .exec<{ id: string; repository_key: string; branch: string; base_id: string; path: string; symbol: string | null; verification_state: string }>(
-        `SELECT id, repository_key, branch, base_id, path, symbol, verification_state FROM evidence WHERE memory_item_id = ?1 ORDER BY created_at`,
+      .exec<{
+        id: string; repository_key: string; branch: string; base_id: string; path: string; symbol: string | null;
+        verification_state: string; evidence_hash: string | null; last_verified_at: string | null; last_verified_base_id: string | null;
+        last_verified_branch: string | null; verification_source: string | null; observed_path: string | null;
+      }>(
+        `SELECT id, repository_key, branch, base_id, path, symbol, verification_state, evidence_hash,
+                last_verified_at, last_verified_base_id, last_verified_branch, verification_source, observed_path
+         FROM evidence WHERE memory_item_id = ?1 ORDER BY created_at`,
         memoryId,
       )
       .toArray();
@@ -2131,6 +2374,12 @@ export class ProjectMemory extends DurableObject<Env> {
         path: e.path,
         symbol: e.symbol,
         verificationState: e.verification_state,
+        evidenceHash: e.evidence_hash,
+        lastVerifiedAt: e.last_verified_at,
+        lastVerifiedBaseId: e.last_verified_base_id,
+        lastVerifiedBranch: e.last_verified_branch,
+        verificationSource: e.verification_source,
+        observedPath: e.observed_path,
       })),
     };
   }
@@ -2238,18 +2487,32 @@ export class ProjectMemory extends DurableObject<Env> {
   // applied_operations entry — a query is not a canonical mutation (§4).
   // ---------------------------------------------------------------------------
 
-  private evidenceVerificationStates(memoryItemId: string): string[] {
-    return this.ctx.storage.sql
-      .exec<{ verification_state: string }>(`SELECT verification_state FROM evidence WHERE memory_item_id = ?1 ORDER BY created_at`, memoryItemId)
-      .toArray()
-      .map((r) => r.verification_state);
+  /** Both halves PLNR-265's base-scoped lead reason needs, from ONE query: each citation's raw
+   *  `verification_state` (unchanged contract) and, index-aligned, whether that SAME citation is
+   *  `verifiedForBase` for `caller` — the retrieval-time answer to "is this verified for the
+   *  branch/base THIS caller asked about", not just "was it ever found valid". */
+  private evidenceVerificationInfo(memoryItemId: string, caller: CallerBaseScope): { states: string[]; verifiedForCaller: boolean[] } {
+    const rows = this.ctx.storage.sql
+      .exec<{ verification_state: string; last_verified_base_id: string | null; last_verified_branch: string | null }>(
+        `SELECT verification_state, last_verified_base_id, last_verified_branch FROM evidence WHERE memory_item_id = ?1 ORDER BY created_at`,
+        memoryItemId,
+      )
+      .toArray();
+    return {
+      states: rows.map((r) => r.verification_state),
+      verifiedForCaller: rows.map((r) =>
+        verifiedForBase({ verificationState: r.verification_state, lastVerifiedBaseId: r.last_verified_base_id, lastVerifiedBranch: r.last_verified_branch }, caller),
+      ),
+    };
   }
 
   private memoryRowToHit(
     row: { id: string; kind: string; statement: string; authority: number; validity: string; repository_key: string | null; branch: string | null },
     stage: RetrievalStage,
     score: number,
+    caller: CallerBaseScope = {},
   ): RetrievalHit {
+    const { states, verifiedForCaller } = this.evidenceVerificationInfo(row.id, caller);
     return {
       entityType: 'memory',
       id: row.id,
@@ -2262,7 +2525,8 @@ export class ProjectMemory extends DurableObject<Env> {
       branch: row.branch,
       authority: row.authority,
       validity: row.validity,
-      evidenceVerification: this.evidenceVerificationStates(row.id),
+      evidenceVerification: states,
+      evidenceVerifiedForCaller: verifiedForCaller,
     };
   }
 
@@ -2284,14 +2548,14 @@ export class ProjectMemory extends DurableObject<Env> {
   }
 
   /** Exact-id lookup for a single memory item — the 'exact' stage. */
-  private lookupMemoryHit(memoryItemId: string): RetrievalHit | null {
+  private lookupMemoryHit(memoryItemId: string, caller: CallerBaseScope = {}): RetrievalHit | null {
     const row = this.ctx.storage.sql
       .exec<{ id: string; kind: string; statement: string; authority: number; validity: string; repository_key: string | null; branch: string | null }>(
         `SELECT id, kind, statement, authority, validity, repository_key, branch FROM memory_items WHERE id = ?1`,
         memoryItemId,
       )
       .toArray()[0];
-    return row ? this.memoryRowToHit(row, 'exact', 1) : null;
+    return row ? this.memoryRowToHit(row, 'exact', 1, caller) : null;
   }
 
   /** Exact-id lookup for a single episode — the 'exact' stage. */
@@ -2307,7 +2571,7 @@ export class ProjectMemory extends DurableObject<Env> {
 
   /** Term-wise LIKE scan over memory_items AND episodes, same AND-every-term contract as
    *  search.ts's keyword fallback — the 'lexical' stage, always available (§20). */
-  private lexicalRetrievalRows(q: string, opts: { kind?: string; limit: number }): RetrievalHit[] {
+  private lexicalRetrievalRows(q: string, opts: { kind?: string; limit: number }, caller: CallerBaseScope = {}): RetrievalHit[] {
     const terms = q.replace(/[%_]/g, ' ').trim().split(/\s+/).filter(Boolean).slice(0, 8);
     if (!terms.length) return [];
     const likes = terms.map((t) => `%${t}%`);
@@ -2326,7 +2590,7 @@ export class ProjectMemory extends DurableObject<Env> {
         ...memBinds,
       )
       .toArray();
-    for (const r of memRows) hits.push(this.memoryRowToHit(r, 'lexical', 1));
+    for (const r of memRows) hits.push(this.memoryRowToHit(r, 'lexical', 1, caller));
 
     const epWhere = likes.map(() => `body LIKE ?`).join(' AND ');
     const epRows = this.ctx.storage.sql
@@ -2343,7 +2607,7 @@ export class ProjectMemory extends DurableObject<Env> {
   /** Semantic candidates over the operational index (PLNR-255's vectors), hydrated from the
    *  CANONICAL row here rather than trusted from vector metadata — the 'semantic' stage. Null
    *  when no embeddings backend is bound (§20 — caller falls back to exact+lexical+graph). */
-  private async semanticRetrievalRows(projectId: string, q: string, limit: number): Promise<RetrievalHit[]> {
+  private async semanticRetrievalRows(projectId: string, q: string, limit: number, caller: CallerBaseScope = {}): Promise<RetrievalHit[]> {
     const backend = searchBackend(this.env);
     if (!backend) return [];
     const [vector] = await backend.embedder.embed([q]);
@@ -2358,7 +2622,7 @@ export class ProjectMemory extends DurableObject<Env> {
       if (String(m.metadata?.projectId ?? '') !== projectId) continue;
       if (kind === 'memory') {
         const entityId = (m.metadata?.entityId as string) ?? String(m.id).slice('memory:'.length);
-        const hit = this.lookupMemoryHit(entityId);
+        const hit = this.lookupMemoryHit(entityId, caller);
         if (hit) hits.push({ ...hit, stage: 'semantic', score: m.score });
       } else if (kind === 'episode') {
         const entityId = (m.metadata?.entityId as string) ?? String(m.id).slice('episode:'.length);
@@ -2512,6 +2776,12 @@ export class ProjectMemory extends DurableObject<Env> {
       maxDepth?: number;
       repositoryKey?: string;
       branch?: string;
+      /** The caller's own opaque VCS revision (PLNR-265, §6) — string-compared only, never
+       *  parsed. Purely a verification-scoping input: unlike `branch` (which ALSO drives the
+       *  `preferBranch` rerank penalty below), a `baseId` mismatch never excludes or reranks a
+       *  candidate — it only stops a 'valid' citation checked against a DIFFERENT base from
+       *  reading as verified FOR this caller (`classifyLead`'s `evidence-base-mismatch`). */
+      baseId?: string;
       kind?: string;
       minAuthority?: number;
       validity?: string;
@@ -2520,11 +2790,12 @@ export class ProjectMemory extends DurableObject<Env> {
   ): Promise<{ mode: 'semantic' | 'keyword'; results: RankedHit[] }> {
     await this.assertProjectId(projectId);
     const limit = Math.min(Math.max(opts.limit ?? RETRIEVAL_DEFAULTS.maxResults, 1), RETRIEVAL_DEFAULTS.maxResultsCeiling);
+    const caller: CallerBaseScope = { baseId: opts.baseId ?? null, branch: opts.branch ?? null };
     const candidates: RetrievalHit[] = [];
     let mode: 'semantic' | 'keyword' = 'keyword';
 
     if (opts.memoryItemId) {
-      const hit = this.lookupMemoryHit(opts.memoryItemId);
+      const hit = this.lookupMemoryHit(opts.memoryItemId, caller);
       if (hit) candidates.push(hit);
     }
     if (opts.episodeId) {
@@ -2533,8 +2804,8 @@ export class ProjectMemory extends DurableObject<Env> {
     }
 
     if (opts.query?.trim()) {
-      candidates.push(...this.lexicalRetrievalRows(opts.query, { kind: opts.kind, limit }));
-      const semanticHits = await this.semanticRetrievalRows(projectId, opts.query, limit);
+      candidates.push(...this.lexicalRetrievalRows(opts.query, { kind: opts.kind, limit }, caller));
+      const semanticHits = await this.semanticRetrievalRows(projectId, opts.query, limit, caller);
       if (semanticHits.length || searchBackend(this.env)) mode = 'semantic';
       candidates.push(...semanticHits);
     }

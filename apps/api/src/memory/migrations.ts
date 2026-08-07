@@ -52,6 +52,7 @@ import sql0004 from '../../memory-migrations/0004_feedback_and_validity.sql';
 import sql0005 from '../../memory-migrations/0005_index_staging.sql';
 import sql0006 from '../../memory-migrations/0006_episodes.sql';
 import sql0007 from '../../memory-migrations/0007_episode_sitting.sql';
+import sql0008 from '../../memory-migrations/0008_evidence_verification.sql';
 
 export interface MemoryMigration {
   /** 1-based, contiguous, and equal to this entry's array index + 1. */
@@ -70,6 +71,10 @@ export const MEMORY_MIGRATIONS: readonly MemoryMigration[] = [
   { version: 5, name: '0005_index_staging', sql: sql0005 },
   { version: 6, name: '0006_episodes', sql: sql0006 },
   { version: 7, name: '0007_episode_sitting', sql: sql0007 },
+  // PLNR-265: named 0008, not the execution spec's literal "0007_evidence_verification" — 0007
+  // was already taken by PLNR-263's episode-sitting fix by the time this task started. The
+  // directory listing is authoritative over the spec's filename (see the .sql file's own comment).
+  { version: 8, name: '0008_evidence_verification', sql: sql0008 },
 ];
 
 /** The schema version a freshly-migrated store lands on. */

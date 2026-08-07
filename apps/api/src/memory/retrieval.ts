@@ -39,6 +39,13 @@ export interface RetrievalHit {
   status?: string;
   /** memory only — each citation's current verification_state. */
   evidenceVerification?: string[];
+  /** memory only — index-aligned with `evidenceVerification` (PLNR-265): whether that SAME
+   *  citation is verified `verifiedForBase` — i.e. actually 'valid' AND (when the caller supplied
+   *  a branch/base) checked against that same branch/base. A citation can read 'valid' here and
+   *  `false` there — verified, just not for THIS caller's branch/base — which is exactly the
+   *  distinction `classifyLead`'s `evidence-base-mismatch` reason exists to surface. Absent
+   *  entirely for a hit with no evidence of its own (episodes, graph nodes). */
+  evidenceVerifiedForCaller?: boolean[];
   /** graph hits only — the node id expansion started from. */
   seedNodeId?: string;
   /** graph hits only — the edge chain from the seed to this node, `from>type>to` per hop,
@@ -86,11 +93,22 @@ const AUTHORITY_WEIGHT = 0.08;
 const BRANCH_MISMATCH_PENALTY = 0.3;
 
 /** Is this candidate a lead — never a settled answer? See `RankedHit.isLead`'s doc comment. */
-export function classifyLead(item: Pick<RetrievalHit, 'authority' | 'validity' | 'evidenceVerification'>): { isLead: boolean; leadReasons: string[] } {
+export function classifyLead(
+  item: Pick<RetrievalHit, 'authority' | 'validity' | 'evidenceVerification' | 'evidenceVerifiedForCaller'>,
+): { isLead: boolean; leadReasons: string[] } {
   const reasons: string[] = [];
   if (item.authority !== undefined && item.authority <= 2) reasons.push('low-authority');
   if (item.validity !== undefined && item.validity !== 'active') reasons.push(`validity-${item.validity}`);
   if (item.evidenceVerification?.some((v) => v !== 'valid')) reasons.push('unverified-evidence');
+  // PLNR-265: a citation can read 'valid' in its OWN row yet have been checked against a
+  // DIFFERENT branch/base than the one THIS caller asked about — never let that read as verified
+  // for them (the task's own load-bearing acceptance line). Distinct from 'unverified-evidence'
+  // above: the citation genuinely verified successfully, just not against the base this caller
+  // cares about, so it gets its own named reason rather than being folded into the generic one.
+  if (item.evidenceVerification && item.evidenceVerifiedForCaller) {
+    const baseMismatch = item.evidenceVerification.some((v, i) => v === 'valid' && item.evidenceVerifiedForCaller![i] === false);
+    if (baseMismatch) reasons.push('evidence-base-mismatch');
+  }
   return { isLead: reasons.length > 0, leadReasons: reasons };
 }
 
