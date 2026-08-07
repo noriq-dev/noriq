@@ -65,8 +65,8 @@ const MAX_CANDIDATES_PER_SECTION = 8;
 // own doc comment; it is allocated its own unbounded floor before this table is ever consulted.
 // ---------------------------------------------------------------------------------------------
 
-export interface SectionSpec {
-  id: ContextPackSectionId;
+export interface SectionSpec<Id extends string = ContextPackSectionId> {
+  id: Id;
   /** Baseline relative share of the budget LEFT OVER after the task's required facts. Decisions/
    *  hazards/failed-approaches/relevant-memories/similar-episodes are the highest-value LEADS a
    *  working agent weighs first, so they get the largest shares; graph/test/neighboring-work
@@ -107,8 +107,15 @@ const ROLE_WEIGHT_MULTIPLIERS: Partial<Record<ContextPackRole, Partial<Record<Co
   human: {},
 };
 
-function weightFor(role: ContextPackRole, id: ContextPackSectionId, baseWeight: number): number {
-  return baseWeight * (ROLE_WEIGHT_MULTIPLIERS[role]?.[id] ?? 1);
+// PLNR-268: generalized from `id: ContextPackSectionId` to any string `Id` — get_briefing's
+// project-memory pulse (sync.ts) reuses this exact greedy budget-splitting rule for its OWN,
+// unrelated section vocabulary rather than re-deriving it. `ROLE_WEIGHT_MULTIPLIERS` above still
+// only knows `ContextPackSectionId`, so a foreign `Id` simply finds no entry (multiplier 1, i.e.
+// no reweight) — exactly get_briefing's baseline, which has no `role` concept of its own. Every
+// EXISTING call site (context-pack.ts's own `SECTION_ORDER`, all `ContextPackSectionId`) keeps
+// its exact prior behavior: the default type parameter makes this widening source-compatible.
+function weightFor<Id extends string>(role: ContextPackRole, id: Id, baseWeight: number): number {
+  return baseWeight * (ROLE_WEIGHT_MULTIPLIERS[role]?.[id as ContextPackSectionId] ?? 1);
 }
 
 /**
@@ -118,17 +125,17 @@ function weightFor(role: ContextPackRole, id: ContextPackSectionId, baseWeight: 
  * determinism (stated acceptance) all the way down to how a leftover character is placed. No I/O,
  * no DO: the "pure budgeting half" the task's own acceptance requires be unit-testable alone.
  */
-export function allocateBudget(
+export function allocateBudget<Id extends string = ContextPackSectionId>(
   remainingChars: number,
-  sections: readonly SectionSpec[] = SECTION_ORDER,
+  sections: readonly SectionSpec<Id>[] = SECTION_ORDER as readonly SectionSpec<Id>[],
   role: ContextPackRole = 'human',
-): Record<string, number> {
+): Record<Id, number> {
   const clamped = Math.max(0, Math.floor(remainingChars));
   const weights = sections.map((s) => Math.max(0, weightFor(role, s.id, s.weight)));
   const totalWeight = weights.reduce((a, b) => a + b, 0);
   const result: Record<string, number> = {};
   for (const s of sections) result[s.id] = 0;
-  if (clamped === 0 || totalWeight <= 0) return result;
+  if (clamped === 0 || totalWeight <= 0) return result as Record<Id, number>;
   const floors = weights.map((w) => Math.floor((clamped * w) / totalWeight));
   sections.forEach((s, i) => { result[s.id] = floors[i]!; });
   let remainder = clamped - floors.reduce((a, b) => a + b, 0);
@@ -137,7 +144,7 @@ export function allocateBudget(
     result[id] = (result[id] ?? 0) + 1;
     remainder--;
   }
-  return result;
+  return result as Record<Id, number>;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -148,7 +155,9 @@ export function allocateBudget(
  *  excerpt/entity/item built below is a freshly-constructed object with a fixed key order, so
  *  `JSON.stringify` is deterministic across calls with the same content — which is exactly what
  *  "identical inputs produce a byte-identical pack" (stated acceptance) needs from this function. */
-function charSize(value: unknown): number {
+// Exported (PLNR-268): get_briefing's project-memory pulse (sync.ts) measures its own,
+// unrelated candidate shapes with the SAME deterministic rule rather than a second one.
+export function charSize(value: unknown): number {
   return JSON.stringify(value).length;
 }
 
@@ -160,7 +169,8 @@ function charSize(value: unknown): number {
  * went unused so the caller can roll it forward into the NEXT section in `SECTION_ORDER` (fixed
  * order — nothing here spends a later section's share early).
  */
-function fillGreedy<T>(candidates: readonly T[], cap: number): { taken: T[]; used: number; truncated: boolean } {
+// Exported (PLNR-268): same "reuse the section/budget machinery" reason as `charSize` above.
+export function fillGreedy<T>(candidates: readonly T[], cap: number): { taken: T[]; used: number; truncated: boolean } {
   const taken: T[] = [];
   let used = 0;
   for (const c of candidates) {

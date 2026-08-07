@@ -315,6 +315,15 @@ repository contents, and passing tests always outrank stored memory. Filters
 and compose together. Falls back to keyword + graph on an instance with no
 embeddings backend — it still answers (\`mode\` says which ran).
 
+Once you are localized to a project, \`get_briefing\` also carries a small, bounded
+\`memory\` block: recently changed decisions/hazards/unresolved unknowns, stale-memory
+warnings, and who else is actively claiming work nearby — a session-start pulse, not a
+substitute for \`search_project_memory\` on a specific question. \`my_updates\` carries a
+lighter \`memoryChanges\` delta of the same underlying feed between \`get_briefing\` calls.
+Both are simply absent, not an error, when you have no localized project yet or the
+memory store cannot answer quickly, and every item in either still carries its own
+authority/validity for you to weigh.
+
 ## Git
 
 Attach your branch/PR to the task with \`attach_ref\` so humans see where the work

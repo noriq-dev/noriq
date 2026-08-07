@@ -1,6 +1,23 @@
 import type { Env } from './env';
 import type { AgentIdentity } from './auth';
 import { TASK_NOT_IN_PROPOSED_PLAN, TASK_NOT_PHASE_BLOCKED, TASK_NOT_PROPOSED_SPINOFF, USER_PROJECT_WHERE, tokenProjectWhere } from './lib/visibility';
+import type { ProjectMemoryStub, MemoryItemRecord } from './lib/project-memory';
+import { nowIso } from './lib/util';
+import { allocateBudget, fillGreedy, type SectionSpec } from './memory/context-pack';
+import { classifyLead } from './memory/retrieval';
+import { verifiedForBase, type CallerBaseScope } from './memory/verification';
+import type {
+  AuthorityLevel,
+  ContextPackCitation,
+  ContextPackMemoryExcerpt,
+  ContextPackNotice,
+  MemoryKind,
+  ProjectMemoryChangeSummary,
+  ProjectMemoryNearbyWork,
+  ProjectMemoryPulse,
+  ProjectMemoryPulseSectionId,
+  ProjectMemoryStaleWarning,
+} from '@noriq-dev/shared';
 
 /**
  * Agent-scoped delta sync (ROADMAP Phase 1).
@@ -26,7 +43,24 @@ export interface AgentUpdates {
   messages: Array<{ id: string; from: string; body: string; refTaskId: string | null; createdAt: string }>;
   /** Input requests this agent raised that are still awaiting a human decision. */
   pendingInputRequests: Array<{ id: string; taskKey: string | null; title: string; createdAt: string }>;
+  /** PLNR-268: this agent's own localized project — the SAME scoping computeUpdates already
+   *  applies internally to claimable/messages/comments above, exposed so get_briefing can scope
+   *  its separately-bounded memory pulse (`assembleProjectMemoryPulse`) to it without a second
+   *  query. `null` for a copilot that has never localized (roams every accessible project) — a
+   *  memory pulse genuinely has no single project to be about then, not a failed fetch. */
+  agentProjectId: string | null;
+  /** PLNR-268: memory-subsystem changes since this agent's OWN cursor — the SAME events.global_seq
+   *  cursor every notice above already advances on (CLAUDE.md: never a second cursor). Compact
+   *  metadata only (entityType/kind/memoryItemId/timestamp) — no memory STATEMENT text ever rides
+   *  this field (§13): it sits next to `notices`, close enough to plain status prose that
+   *  untrusted memory content must stay out of it. get_briefing's separately-assembled `memory`
+   *  block carries the full, clearly-evidence-framed excerpt instead. */
+  memoryChanges: ProjectMemoryChangeSummary[];
 }
+
+/** Bounded — mirrors how many other-verb notices already cap themselves (e.g. unassignedComments
+ *  LIMIT 10 below); a burst of memory activity should not crowd out the rest of this delta. */
+const MEMORY_CHANGES_LIMIT = 10;
 
 export async function computeUpdates(
   env: Env,
@@ -51,9 +85,9 @@ export async function computeUpdates(
 
   // New events since the cursor that concern this agent.
   const { results: rawEvents } = await env.DB.prepare(
-    `SELECT e.global_seq AS rid, e.verb, e.payload, e.actor_id AS actorId, e.subject_id AS subjectId, e.project_id AS projectId
+    `SELECT e.global_seq AS rid, e.verb, e.payload, e.actor_id AS actorId, e.subject_id AS subjectId, e.project_id AS projectId, e.created_at AS createdAt
      FROM events e WHERE e.global_seq > ? ORDER BY e.global_seq LIMIT 500`,
-  ).bind(cursor).all<{ rid: number; verb: string; payload: string; actorId: string; subjectId: string; projectId: string }>();
+  ).bind(cursor).all<{ rid: number; verb: string; payload: string; actorId: string; subjectId: string; projectId: string; createdAt: string }>();
 
   const heldTaskIds = new Set<string>();
   const heldRows = await env.DB.prepare(
@@ -133,6 +167,7 @@ export async function computeUpdates(
   );
 
   const notices: string[] = [];
+  const memoryChanges: ProjectMemoryChangeSummary[] = [];
   let maxRid = cursor;
   for (const e of rawEvents) {
     maxRid = Math.max(maxRid, e.rid);
@@ -173,6 +208,25 @@ export async function computeUpdates(
       // dynamically instead of waiting for someone to poll. Heads-down agents aren't
       // distracted; the claimable list stays the authoritative queue for them.
       notices.push(`New task ${p.key} is up for grabs: "${p.title}" — claim_task it if you can take it on.`);
+    } else if (
+      e.verb === 'memory.changed' && memoryChanges.length < MEMORY_CHANGES_LIMIT
+      && accessibleProjectIds.has(e.projectId) && (agentProjectId === null || e.projectId === agentProjectId)
+    ) {
+      // PLNR-268: per-agent memory-change cursoring, reusing this SAME events.global_seq cursor
+      // (CLAUDE.md: never a second one) — the memory outbox already delivers every canonical
+      // change here (PLNR-247), so this is compact metadata only, NOT the `notices` prose channel
+      // (§13: no memory statement text belongs anywhere close to instruction-adjacent status text).
+      const entityType = typeof p.entityType === 'string' ? p.entityType : 'unknown';
+      memoryChanges.push({
+        entityType,
+        kind: typeof p.kind === 'string' ? p.kind : null,
+        // `memory_item` creation carries the new memory's id as the outbox row's OWN subject_id
+        // (do/ProjectMemory.ts's recordMemory), never in its payload — every other entityType that
+        // names one at all (validity_transition/authority_transition/feedback) puts it in the
+        // payload instead.
+        memoryItemId: entityType === 'memory_item' ? e.subjectId : (typeof p.memoryItemId === 'string' ? p.memoryItemId : null),
+        at: e.createdAt,
+      });
     }
     // NB (PLNR-25): we deliberately do NOT notice every task.done here. It fired for
     // every completed task to every agent — noise — and the claimable list is the
@@ -229,7 +283,10 @@ export async function computeUpdates(
   }
   await session.touch();
 
-  return { notices, openComments, unassignedComments, heldTasks: heldRows.results, claimable, messages, pendingInputRequests };
+  return {
+    notices, openComments, unassignedComments, heldTasks: heldRows.results, claimable, messages, pendingInputRequests,
+    agentProjectId, memoryChanges,
+  };
 }
 
 /**
@@ -259,4 +316,260 @@ export function formatNotices(u: AgentUpdates): string | null {
   }
   if (!lines.length) return null;
   return `--- notices ---\n${lines.join('\n')}`;
+}
+
+// ---------------------------------------------------------------------------------------------
+// PLNR-268: get_briefing's bounded, project-scoped "memory pulse" — recent project-memory
+// activity surfaced at session start, ALONGSIDE (never instead of) the coordination facts
+// `computeUpdates` above already returns. Reuses context-pack.ts's (PLNR-267) section/budget
+// machinery rather than re-deriving it, but this is NOT a small ContextPack: get_briefing has no
+// task to anchor a graph seed or a similarity search to (it is the FIRST call of a session,
+// before any task is claimed), so this composes a project-WIDE "what changed / what's active /
+// what's still unresolved" pulse from the `events` table's own `memory.changed` deliveries
+// (PLNR-247) instead.
+//
+// WHY EVENTS, NOT A NEW ProjectMemory RPC (discretion, resolved): `searchProjectMemory` only
+// returns candidates for a query/seed/id it is given (see its own source in do/ProjectMemory.ts)
+// — there is no "list current decisions" RPC, and this task's own anticipatedFiles deliberately
+// exclude do/ProjectMemory.ts. The `events` table already carries every `memory.changed` outbox
+// delivery with the SAME global_seq cursor `computeUpdates` reads above — a bounded recency query
+// against it is real retrieval composed from what already ships, not a heuristic and not a new
+// store or cursor.
+// ---------------------------------------------------------------------------------------------
+
+// Small and FIXED, unlike context-pack.ts's caller-tunable `tokenBudget`: get_briefing takes no
+// arguments (it must stay a zero-friction "call this first"), and runs once per SESSION rather
+// than once per task, so there is no per-call budget to honor — a smaller fixed cap is right.
+export const BRIEFING_PULSE_CHAR_BUDGET = 4_000;
+// Recent `memory.changed` rows scanned for candidates — bounded regardless of a project's total
+// history, and deliberately larger than any one section's own item cap (below) so a run of
+// same-kind events (e.g. a burst of hazards) doesn't starve every other section's candidates.
+const PULSE_EVENT_WINDOW = 40;
+// Distinct memoryItemIds enriched via getMemoryItem before section caps and the character budget
+// trim further — the SAME "candidate ceiling distinct from the character budget" split
+// context-pack.ts's MAX_CANDIDATES_PER_SECTION uses, sized for the whole pulse (one small event
+// window feeds every section here, unlike context-pack's per-section retrieval calls).
+const PULSE_MAX_CANDIDATES = 20;
+// Fixed per-section item ceiling, enforced BEFORE the character budget trims further (locked
+// decision: "a fixed maximum item count per section and a fixed character budget ... before
+// assembly rather than trimmed after").
+const PULSE_MAX_ITEMS_PER_SECTION = 5;
+
+const PULSE_SECTION_ORDER: readonly SectionSpec<ProjectMemoryPulseSectionId>[] = [
+  { id: 'active_decisions', weight: 3 },
+  { id: 'known_hazards', weight: 2 },
+  { id: 'unresolved_unknowns', weight: 2 },
+  { id: 'stale_warnings', weight: 2 },
+  { id: 'active_nearby_work', weight: 1 },
+  { id: 'recent_changes', weight: 1 },
+];
+
+/** Which memoryItemId(s), if any, a `memory.changed` event's own (entityType, payload) names —
+ *  read straight from the outbox row's own fields (see do/ProjectMemory.ts's outbox INSERTs),
+ *  never guessed. `contradiction`/`node`/`edge`/`episode`/`generation-projection` carry no single
+ *  memory-item id worth re-fetching here and are simply not candidates. */
+function candidateMemoryIds(entityType: string, subjectId: string, payload: Record<string, unknown>): string[] {
+  switch (entityType) {
+    case 'memory_item':
+      return [subjectId]; // recordMemory's outbox row uses the new memory's own id as subject_id
+    case 'validity_transition':
+    case 'authority_transition':
+    case 'feedback':
+      return typeof payload.memoryItemId === 'string' ? [payload.memoryItemId] : [];
+    case 'decay':
+      return Array.isArray(payload.decayedIds) ? (payload.decayedIds as unknown[]).filter((x): x is string => typeof x === 'string') : [];
+    default:
+      return [];
+  }
+}
+
+/** `MemoryItemRecord` (the stub's own live-read shape) -> `ContextPackMemoryExcerpt` (the shared,
+ *  self-contained wire shape §13 renders memory in) — the SAME conversion context-pack.ts's
+ *  `buildMemoryExcerpt` performs, reusing the SAME `classifyLead`/`verifiedForBase` primitives
+ *  rather than a second judgment of what counts as a lead. get_briefing has no caller
+ *  branch/baseId of its own (it takes no arguments) — `{ baseId: null, branch: null }` is the same
+ *  "no scoping penalty, no scoping credit either" default `verifiedForBase` already documents for
+ *  a plain query with no worktree behind it. */
+function toMemoryExcerpt(row: MemoryItemRecord): ContextPackMemoryExcerpt {
+  const caller: CallerBaseScope = { baseId: null, branch: null };
+  const evidence: ContextPackCitation[] = row.evidence.map((e) => ({
+    repositoryKey: e.repositoryKey,
+    branch: e.branch,
+    baseId: e.baseId,
+    path: e.path,
+    symbol: e.symbol,
+    verificationState: e.verificationState as ContextPackCitation['verificationState'],
+    lastVerifiedAt: e.lastVerifiedAt,
+    lastVerifiedBaseId: e.lastVerifiedBaseId,
+    lastVerifiedBranch: e.lastVerifiedBranch,
+    verifiedForCaller: verifiedForBase(
+      { verificationState: e.verificationState, lastVerifiedBaseId: e.lastVerifiedBaseId, lastVerifiedBranch: e.lastVerifiedBranch },
+      caller,
+    ),
+  }));
+  const { isLead, leadReasons } = classifyLead({
+    authority: row.authority,
+    validity: row.validity,
+    evidenceVerification: row.evidence.map((e) => e.verificationState),
+    evidenceVerifiedForCaller: evidence.map((e) => e.verifiedForCaller),
+  });
+  return {
+    excerptKind: 'memory',
+    id: row.id,
+    memoryKind: row.kind as MemoryKind,
+    statement: row.statement,
+    authority: row.authority as AuthorityLevel,
+    confidence: row.confidence,
+    validity: row.validity,
+    isLead,
+    leadReasons,
+    recordedByAgentId: row.recordedByAgentId,
+    recordedAt: row.recordedAt,
+    supersedesMemoryId: row.supersedesMemoryId,
+    evidence,
+  };
+}
+
+/**
+ * Assemble get_briefing's bounded `memory` block for `projectId` (locked decision: exactly ONE
+ * project — the caller's own localized one, never every project an agent can reach, which is what
+ * keeps this bounded regardless of how many projects a copilot roams). NEVER THROWS: every
+ * failure mode — a D1 error, the ProjectMemory DO throwing or being unreachable, a malformed event
+ * payload — degrades to `null`, "no memory block", exactly like `loadPriorEffort` (lib/project-
+ * memory.ts, §19) degrades `claim_task`'s `priorEffort`. get_briefing therefore needs NO try/catch
+ * of its own around this call — this function's own contract already is one.
+ *
+ * "Active nearby work" is a plain D1 read (another agent's current claim), not memory retrieval —
+ * it is assembled inside this SAME try/catch anyway (locked decision: "the whole memory block is
+ * skipped if the ProjectMemory call fails", read here as one predictable degrade-together unit
+ * rather than a partially-degraded one a client would have to reason about field by field).
+ */
+export async function assembleProjectMemoryPulse(env: Env, projectId: string, agentId: string): Promise<ProjectMemoryPulse | null> {
+  try {
+    const stub = env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)) as unknown as ProjectMemoryStub;
+
+    // 1. Recent `memory.changed` events for this project — a bounded RECENCY window, not the
+    // agent's own cursor (unlike `computeUpdates`'s `memoryChanges` delta above): get_briefing is
+    // an orientation snapshot, the same for a brand-new agent as one resuming a long session.
+    const { results: rawEvents } = await env.DB.prepare(
+      `SELECT subject_id AS subjectId, payload, created_at AS createdAt
+       FROM events WHERE project_id = ? AND verb = 'memory.changed'
+       ORDER BY global_seq DESC LIMIT ?`,
+    ).bind(projectId, PULSE_EVENT_WINDOW).all<{ subjectId: string; payload: string; createdAt: string }>();
+
+    const recentChanges: ProjectMemoryChangeSummary[] = [];
+    const candidateIds: string[] = [];
+    const seenCandidates = new Set<string>();
+    const transitionReasons = new Map<string, string | null>();
+
+    for (const e of rawEvents) {
+      let p: Record<string, unknown>;
+      try { p = JSON.parse(e.payload) as Record<string, unknown>; } catch { continue; } // malformed row — skip, don't fail the pulse
+      const entityType = typeof p.entityType === 'string' ? p.entityType : 'unknown';
+      if (recentChanges.length < PULSE_MAX_ITEMS_PER_SECTION) {
+        recentChanges.push({
+          entityType,
+          kind: typeof p.kind === 'string' ? p.kind : null,
+          memoryItemId: entityType === 'memory_item' ? e.subjectId : (typeof p.memoryItemId === 'string' ? p.memoryItemId : null),
+          at: e.createdAt,
+        });
+      }
+      if (entityType === 'validity_transition' && typeof p.memoryItemId === 'string' && !transitionReasons.has(p.memoryItemId)) {
+        transitionReasons.set(p.memoryItemId, typeof p.reason === 'string' ? p.reason : null);
+      }
+      for (const id of candidateMemoryIds(entityType, e.subjectId, p)) {
+        if (seenCandidates.has(id) || seenCandidates.size >= PULSE_MAX_CANDIDATES) continue;
+        seenCandidates.add(id);
+        candidateIds.push(id);
+      }
+    }
+
+    // 2. Enrich the bounded candidate set from the CANONICAL row — never from the event's own
+    // (possibly stale-by-now) snapshot, same discipline as context-pack.ts's `buildMemoryExcerpt`.
+    const rows = await Promise.all(candidateIds.map((id) => stub.getMemoryItem(projectId, id)));
+
+    const decisionCandidates: ContextPackMemoryExcerpt[] = [];
+    const hazardCandidates: ContextPackMemoryExcerpt[] = [];
+    const unknownCandidates: ContextPackMemoryExcerpt[] = [];
+    const staleCandidates: ProjectMemoryStaleWarning[] = [];
+    for (const row of rows) {
+      if (!row) continue; // decayed/erased between the event firing and this read — degrade, don't fail
+      if (row.validity !== 'active') {
+        // A memory that fell off 'active' surfaces ONLY as a stale warning — showing it again in
+        // its kind-bucket as if still current would contradict the very label this section exists
+        // to carry (locked decision: canonical validity, one truth, never two).
+        staleCandidates.push({
+          memoryItemId: row.id,
+          kind: row.kind as MemoryKind,
+          statement: row.statement,
+          validity: row.validity,
+          reason: transitionReasons.get(row.id) ?? null,
+          at: row.recordedAt,
+        });
+        continue;
+      }
+      const excerpt = toMemoryExcerpt(row);
+      if (row.kind === 'decision') decisionCandidates.push(excerpt);
+      else if (row.kind === 'hazard') hazardCandidates.push(excerpt);
+      else if (row.kind === 'unknown') unknownCandidates.push(excerpt);
+      // learning/procedure/requirement/failed_approach: not surfaced in the briefing pulse today
+      // (discretion: "fewer, genuinely useful sections beat all seven thin ones") — fully
+      // available via search_project_memory/get_task_context once real work starts on a task.
+    }
+
+    // 3. Active nearby work — plain D1 (see this function's own doc comment for why it lives
+    // inside this same try/catch rather than being unconditionally available).
+    const { results: activeNearbyWorkRows } = await env.DB.prepare(
+      `SELECT t.id AS taskId, t.key AS taskKey, t.title, t.claimed_by AS claimedByAgentId, t.status
+       FROM tasks t WHERE t.project_id = ? AND t.claimed_by IS NOT NULL AND t.claimed_by != ?
+       ORDER BY t.claim_expires_at DESC LIMIT ?`,
+    ).bind(projectId, agentId, PULSE_MAX_ITEMS_PER_SECTION).all<ProjectMemoryNearbyWork>();
+
+    // 4. Character-budget the sections — the SAME greedy, order-preserving fill context-pack.ts
+    // uses (reused via its exports, not re-derived): a fixed per-section item cap first, then a
+    // fixed character budget, and unused characters roll forward to the NEXT section in
+    // PULSE_SECTION_ORDER so an empty early section doesn't waste its share.
+    const allotments = allocateBudget(BRIEFING_PULSE_CHAR_BUDGET, PULSE_SECTION_ORDER);
+    const notices: ContextPackNotice[] = [];
+    let pool = 0;
+    let charsUsed = 0;
+
+    function fit<T>(id: ProjectMemoryPulseSectionId, candidates: T[]): T[] {
+      const cap = (allotments[id] ?? 0) + pool;
+      const { taken, used, truncated } = fillGreedy(candidates.slice(0, PULSE_MAX_ITEMS_PER_SECTION), cap);
+      if (truncated) {
+        notices.push({ kind: 'truncated', reason: `${id}: ${candidates.length - taken.length} more item(s) did not fit in ${cap} characters` });
+      }
+      pool = Math.max(0, cap - used);
+      charsUsed += used;
+      return taken;
+    }
+
+    // Fixed order (locked-decision-adjacent: "declared as data", context-pack.ts's own framing) —
+    // matches PULSE_SECTION_ORDER exactly, so the rolling `pool` above lands on the section that
+    // actually comes next.
+    const activeDecisions = fit('active_decisions', decisionCandidates);
+    const knownHazards = fit('known_hazards', hazardCandidates);
+    const unresolvedUnknowns = fit('unresolved_unknowns', unknownCandidates);
+    const staleWarnings = fit('stale_warnings', staleCandidates);
+    const activeNearbyWork = fit('active_nearby_work', activeNearbyWorkRows);
+    const recentChangesFit = fit('recent_changes', recentChanges);
+
+    return {
+      projectId,
+      generatedAt: nowIso(),
+      charBudget: BRIEFING_PULSE_CHAR_BUDGET,
+      charsUsed,
+      activeDecisions,
+      knownHazards,
+      unresolvedUnknowns,
+      staleWarnings,
+      activeNearbyWork,
+      recentChanges: recentChangesFit,
+      notices,
+    };
+  } catch (err) {
+    console.warn(`assembleProjectMemoryPulse failed for project ${projectId}: ${String(err)}`);
+    return null;
+  }
 }

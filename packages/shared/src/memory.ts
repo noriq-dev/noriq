@@ -610,6 +610,99 @@ export const ContextPack = z.object({
 export type ContextPack = z.infer<typeof ContextPack>;
 
 // ---------------------------------------------------------------------------
+// Briefing memory pulse (§1/§13/§20, PLNR-268)
+//
+// get_briefing is the FIRST call of every session — before any task is claimed, so there is no
+// task to anchor a ContextPack to. This is a lighter, project-scoped sibling: not one task's
+// working context, but "what's recently changed / active / unresolved in this project" — bounded
+// the same way (fixed item caps + a fixed character budget, enforced before assembly, never
+// trimmed after) and carrying the same authority/validity/citation shape (`ContextPackMemoryExcerpt`)
+// so a memory item reads identically here and inside a `ContextPack`. See
+// `apps/api/src/sync.ts`'s `assembleProjectMemoryPulse` for the assembler.
+// ---------------------------------------------------------------------------
+
+/** The fixed, priority-ordered section list for the briefing pulse — deliberately smaller than
+ *  `ContextPackSectionId`'s ten: get_briefing has no task/query/branch to anchor a similarity or
+ *  graph-neighborhood search to, so `similar_episodes`/`graph_neighborhood`/`affected_tests` are
+ *  not attempted here at all (discretion: "fewer, genuinely useful sections beat all seven thin
+ *  ones") — they remain fully available via `search_project_memory`/`get_task_context` once real
+ *  work starts. */
+export const ProjectMemoryPulseSectionId = z.enum([
+  'active_decisions',
+  'known_hazards',
+  'unresolved_unknowns',
+  'stale_warnings',
+  'active_nearby_work',
+  'recent_changes',
+]);
+export type ProjectMemoryPulseSectionId = z.infer<typeof ProjectMemoryPulseSectionId>;
+
+/** One compact "something changed" line, read straight off a `memory.changed` outbox event's own
+ *  payload (PLNR-247) — never a second query beyond the `events` row itself. Deliberately carries
+ *  no `statement`/free text: this is the ONE briefing field close enough to plain status prose
+ *  (rendered next to `notices`) that untrusted memory content must never ride it (§13) — the
+ *  richer, clearly-evidence-framed excerpt lives in `activeDecisions`/`knownHazards`/
+ *  `unresolvedUnknowns`/`staleWarnings` instead. */
+export const ProjectMemoryChangeSummary = z.object({
+  entityType: z.string(),
+  kind: z.string().nullable(),
+  memoryItemId: z.string().nullable(),
+  at: z.string().datetime(),
+});
+export type ProjectMemoryChangeSummary = z.infer<typeof ProjectMemoryChangeSummary>;
+
+/** A stale-memory warning, reported from the memory's own CANONICAL `validity` at read time —
+ *  never a heuristic recomputed here (locked decision: PLNR-254/265 already own validity and
+ *  verification). `reason` is the transition's own recorded reason when the outbox event carried
+ *  one, `null` otherwise (e.g. an automatic low-authority decay has no per-item reason). */
+export const ProjectMemoryStaleWarning = z.object({
+  memoryItemId: z.string(),
+  kind: MemoryKind.nullable(),
+  statement: z.string().nullable(),
+  validity: z.string(),
+  reason: z.string().nullable(),
+  at: z.string().datetime(),
+});
+export type ProjectMemoryStaleWarning = z.infer<typeof ProjectMemoryStaleWarning>;
+
+/** "Someone else is actively working near here" — a plain D1 coordination read (another agent's
+ *  current claim in the same project), not memory retrieval at all. Assembled inside the SAME
+ *  bounded block as the memory sections above (one predictable degrade-together unit) rather than
+ *  as its own always-available field — see the assembler's own doc comment for why. */
+export const ProjectMemoryNearbyWork = z.object({
+  taskId: z.string(),
+  taskKey: z.string(),
+  title: z.string(),
+  claimedByAgentId: z.string(),
+  status: z.string(),
+});
+export type ProjectMemoryNearbyWork = z.infer<typeof ProjectMemoryNearbyWork>;
+
+/**
+ * The bounded block `get_briefing` additively carries under a new top-level `memory` key
+ * (ADDITIVE — every pre-existing get_briefing field is untouched by this type's existence).
+ * Supplemental evidence only (locked decision, §1): nothing in here ever changes a coordination
+ * fact elsewhere in the response, and every memory item carries its own authority/validity/
+ * evidence so a consumer never has to trust it blindly. `null` (not an error) is the honest
+ * degraded state — the agent has no localized project to scope this to, or ProjectMemory itself
+ * threw/was unreachable (§19/§20): get_briefing's OTHER fields are entirely unaffected either way.
+ */
+export const ProjectMemoryPulse = z.object({
+  projectId: z.string(),
+  generatedAt: z.string().datetime(),
+  charBudget: z.number().int().positive(),
+  charsUsed: z.number().int().nonnegative(),
+  activeDecisions: z.array(ContextPackMemoryExcerpt).default([]),
+  knownHazards: z.array(ContextPackMemoryExcerpt).default([]),
+  unresolvedUnknowns: z.array(ContextPackMemoryExcerpt).default([]),
+  staleWarnings: z.array(ProjectMemoryStaleWarning).default([]),
+  activeNearbyWork: z.array(ProjectMemoryNearbyWork).default([]),
+  recentChanges: z.array(ProjectMemoryChangeSummary).default([]),
+  notices: z.array(ContextPackNotice).default([]),
+});
+export type ProjectMemoryPulse = z.infer<typeof ProjectMemoryPulse>;
+
+// ---------------------------------------------------------------------------
 // Backup manifests (§17)
 // ---------------------------------------------------------------------------
 
