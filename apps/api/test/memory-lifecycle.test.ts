@@ -17,6 +17,7 @@ import {
   STAGED_GENERATION_MAX_AGE_MS,
   RETAINED_GENERATION_MAX_AGE_MS,
 } from '../src/memory/lifecycle';
+import type { SurfaceId } from '../src/memory/guidance-drift';
 
 const appEnv = env as unknown as Env;
 const actor = SYSTEM_ACTOR as Actor;
@@ -41,6 +42,8 @@ interface MemoryRpc {
   _setMetaForTest(pid: string, key: string, value: string): Promise<void>;
   pruneAbandonedStagedGenerations(pid: string, maxAgeMs: number): Promise<number>;
   pruneRetainedGenerationIfExpired(pid: string, maxAgeMs: number): Promise<boolean>;
+  recordGuidanceDriftScan(pid: string, surfaces: Partial<Record<SurfaceId, string | null>>): Promise<{ findings: number; newFindings: number }>;
+  listGuidanceDriftFindings(pid: string): Promise<Array<{ id: string; ruleId: string }>>;
 }
 interface RoomRpc {
   deleteProject(pid: string, actor: Actor): Promise<{ ok: true; key: string; name: string }>;
@@ -103,6 +106,20 @@ describe('auditable deletion sequence', () => {
       const row = await appEnv.DB.prepare(`SELECT 1 FROM ${table} WHERE project_id = ?`).bind(projectId).first();
       expect(row).toBeNull();
     }
+  });
+
+  it("erase() clears guidance_drift_findings too — it lives outside SCHEMA_TABLES (re-derivable, never backed up) but the tombstone's \"every row\" promise still covers it", async () => {
+    const { projectId } = await newOwnedProject('pm-life-drift-erase@example.com', 'PMLFDRE');
+    // Any mismatch across two surfaces produces at least one persisted finding — the exact
+    // rule doesn't matter here, only that a row lands in guidance_drift_findings before erase().
+    const withRule = 'claim_task before you start; release_task when you finish.';
+    const scan = await memory(projectId).recordGuidanceDriftScan(projectId, { instructions: withRule, playbook: 'nothing relevant here' });
+    expect(scan.newFindings).toBeGreaterThan(0);
+    expect(await memory(projectId).listGuidanceDriftFindings(projectId)).not.toEqual([]);
+
+    await memory(projectId).erase(projectId);
+
+    expect(await memory(projectId).listGuidanceDriftFindings(projectId)).toEqual([]);
   });
 
   it('a failed erasure attempt leaves the tombstone standing; the sweep retries and clears it', async () => {

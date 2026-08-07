@@ -1463,6 +1463,12 @@ export class ProjectMemory extends DurableObject<Env> {
       this.ctx.storage.sql.exec(`DELETE FROM applied_operations`);
       this.ctx.storage.sql.exec(`UPDATE memory_revision SET value = 0 WHERE id = 0`);
       this.ctx.storage.sql.exec(`UPDATE projector_cursor SET global_seq = 0 WHERE id = 0`);
+      // PLNR-266: guidance_drift_findings is deliberately OUTSIDE SCHEMA_TABLES (it is
+      // re-derivable from a fresh scan and never authoritative project knowledge, so it is
+      // excluded from backup/restore) — but erase()'s "every row" promise (PLNR-250's eraseAll
+      // sells this as complete) still applies to it, so it is cleared here explicitly, the same
+      // way applied_operations/memory_revision/projector_cursor are handled just above.
+      this.ctx.storage.sql.exec(`DELETE FROM guidance_drift_findings`);
     });
     return { ok: true };
   }
