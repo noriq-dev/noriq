@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { RepoPath } from './execution-spec';
+import { RepoPath, ExecutionSpec } from './execution-spec';
 import { RunModelUsage } from './runner';
 
 // ---------------------------------------------------------------------------
@@ -353,14 +353,219 @@ export const IndexBatch = z.object({
 export type IndexBatch = z.infer<typeof IndexBatch>;
 
 // ---------------------------------------------------------------------------
-// Context packs (§10)
+// Context packs (§10, PLNR-267)
 // ---------------------------------------------------------------------------
+
+/** Which run kind (or a human) the pack was assembled for (task's own locked decision: role only
+ *  REWEIGHTS section budgets — authority is a property of the record (§12), never of who asked). */
+export const ContextPackRole = z.enum(['scope', 'build', 'verify', 'human']);
+export type ContextPackRole = z.infer<typeof ContextPackRole>;
+
+/** Mirrors `searchProjectMemory`'s own `mode` (§20: "surface it rather than inventing a second
+ *  signal") — 'keyword' names the degraded (no Vectorize/AI binding) path honestly. */
+export const ContextPackMode = z.enum(['semantic', 'keyword']);
+export type ContextPackMode = z.infer<typeof ContextPackMode>;
+
+/**
+ * Which retrieval stage produced a section's content. Shares its four retrieval-stage values
+ * with `apps/api/src/memory/retrieval.ts`'s `RetrievalStage` BY CONVENTION, not by import —
+ * shared has no dependency on the Worker's internal modules. `coordination` is a plain D1 read
+ * (file locks, not memory retrieval); `similar-effort` is PLNR-264's own composed primitive;
+ * `required` marks the task's own facts (never a retrieval result); `none` marks a section with
+ * nothing to show because there was genuinely nothing to retrieve (NOT the same claim as a
+ * `ContextPackNotice` of kind 'unanswerable' — see that type's own comment).
+ */
+export const ContextPackProvenance = z.enum([
+  'exact', 'lexical', 'semantic', 'graph', 'coordination', 'similar-effort', 'required', 'none',
+]);
+export type ContextPackProvenance = z.infer<typeof ContextPackProvenance>;
+
+/**
+ * One evidence citation as rendered inside an excerpt (§1/§12/§13/§15, PLNR-265) — always read
+ * live from the canonical `evidence` row at assembly time (never from vector metadata), and
+ * always carrying the base/branch it was ACTUALLY last checked against, so `verifiedForCaller`
+ * can never be confused with "verified somewhere, at some point" — the load-bearing distinction
+ * the task's own acceptance names ("a memory whose citations were verified at a different base is
+ * not presented as verified for the caller's base").
+ */
+export const ContextPackCitation = z.object({
+  repositoryKey: z.string(),
+  branch: z.string(),
+  baseId: z.string(),
+  path: z.string(),
+  symbol: z.string().nullable(),
+  verificationState: VerificationState,
+  lastVerifiedAt: z.string().nullable(),
+  lastVerifiedBaseId: z.string().nullable(),
+  lastVerifiedBranch: z.string().nullable(),
+  /** `memory/verification.ts`'s `verifiedForBase`, evaluated against THIS caller's own
+   *  branch/baseId at assembly time — not merely `verificationState === 'valid'`. */
+  verifiedForCaller: z.boolean(),
+});
+export type ContextPackCitation = z.infer<typeof ContextPackCitation>;
+
+/**
+ * A memory item as it appears inside a context pack. Self-contained by construction (locked
+ * decision): authority, validity, and every citation's evidence travel WITH the excerpt, so a
+ * consumer never has to cross-reference another section of the pack to judge whether to trust it.
+ * `statement` is untrusted model output the moment it was written by anyone but a human (§13) —
+ * PLNR-270 is the deferred quoted-evidence RENDERER that wraps this; this schema is only the
+ * structured seam it wraps, deliberately not pre-flattened into prose.
+ */
+export const ContextPackMemoryExcerpt = z.object({
+  excerptKind: z.literal('memory'),
+  id: z.string(),
+  memoryKind: MemoryKind,
+  statement: z.string(),
+  authority: AuthorityLevel,
+  confidence: z.number().min(0).max(1).nullable(),
+  validity: z.string(),
+  isLead: z.boolean(),
+  leadReasons: z.array(z.string()),
+  evidence: z.array(ContextPackCitation),
+  // Carried straight from the canonical row (never fabricated at assembly time) — determinism
+  // (stated acceptance: "identical inputs produce a byte-identical pack") requires this, since a
+  // freshly-minted timestamp on every call would make two assemblies of the SAME memory differ.
+  recordedByAgentId: z.string().nullable(),
+  recordedAt: z.string().datetime(),
+  supersedesMemoryId: z.string().nullable(),
+});
+export type ContextPackMemoryExcerpt = z.infer<typeof ContextPackMemoryExcerpt>;
+
+/**
+ * An effort episode as it appears inside a context pack (§14, PLNR-264). `support` IS this
+ * excerpt's evidence — `memory/similar-effort.ts`'s own contract is that every support entry
+ * resolves back to a real, inspectable overlap — so an episode excerpt carries the same
+ * self-contained property as a memory excerpt without being forced into memory's
+ * authority/validity vocabulary, which episodes structurally do not have.
+ */
+export const ContextPackEpisodeExcerpt = z.object({
+  excerptKind: z.literal('episode'),
+  id: z.string(),
+  runId: z.string(),
+  taskId: z.string().nullable(),
+  taskKey: z.string().nullable(),
+  runKind: z.string(),
+  outcome: z.string(),
+  landingOutcome: EpisodeLandingOutcome,
+  whatWasAttempted: z.string(),
+  whatFailed: z.array(z.string()),
+  whatRemainsUncertain: z.array(z.string()),
+  support: z.array(z.object({ kind: z.string(), detail: z.string() })),
+});
+export type ContextPackEpisodeExcerpt = z.infer<typeof ContextPackEpisodeExcerpt>;
+
+export const ContextPackExcerpt = z.discriminatedUnion('excerptKind', [ContextPackMemoryExcerpt, ContextPackEpisodeExcerpt]);
+export type ContextPackExcerpt = z.infer<typeof ContextPackExcerpt>;
+
+/** A graph entity as it appears inside a context pack — the same addressable shape
+ *  `memory/graph-queries.ts`'s `RelatedEntity` already returns, re-declared here (shared has no
+ *  dependency on apps/api) rather than imported. `edgePath` is the same raw `from>type>to;...`
+ *  wire string `searchProjectMemory`'s hits already carry. */
+export const ContextPackGraphEntity = z.object({
+  uri: z.string(),
+  type: z.string(),
+  label: z.string(),
+  depth: z.number().int().nonnegative(),
+  edgePath: z.string(),
+});
+export type ContextPackGraphEntity = z.infer<typeof ContextPackGraphEntity>;
+
+/** `memory/graph-queries.ts`'s own completeness marker (§2), re-declared for the same
+ *  no-apps/api-dependency-from-shared reason as `ContextPackGraphEntity` above. `complete: false`
+ *  means "this graph cannot fully answer that yet" — never conflate it with "nothing is related"
+ *  (the same honesty rule every `ContextPackNotice` below also carries). */
+export const ContextPackCoverage = z.object({
+  complete: z.boolean(),
+  reasons: z.array(z.string()),
+  edgeTypesWithNoWriter: z.array(z.string()).optional(),
+});
+export type ContextPackCoverage = z.infer<typeof ContextPackCoverage>;
+
+/**
+ * The honesty layer every section carries (locked decision, and the same distinction
+ * `explain_project_area`'s `coverage` field already enforces): a section with nothing in it
+ * either genuinely found nothing (`notice: null` — an answerable question with an empty answer)
+ * or could not be answered at all (`kind: 'unanswerable'` — the question itself could not be put
+ * to this project, e.g. file locking is off, or the graph has no seed to expand from). `truncated`
+ * fires whenever the section's character budget cut real, retrieved content, independent of
+ * whether anything survived to be shown.
+ */
+export const ContextPackNoticeKind = z.enum(['truncated', 'unanswerable']);
+export type ContextPackNoticeKind = z.infer<typeof ContextPackNoticeKind>;
+export const ContextPackNotice = z.object({ kind: ContextPackNoticeKind, reason: z.string() });
+export type ContextPackNotice = z.infer<typeof ContextPackNotice>;
+
+/** The fixed, priority-ordered section list (locked decision: "declared as data ... not implied
+ *  by statement order in the code") — see `apps/api/src/memory/context-pack.ts`'s `SECTION_ORDER`
+ *  for the actual fill order and per-section budget weights this vocabulary is filled against. */
+export const ContextPackSectionId = z.enum([
+  'active_decisions',
+  'known_hazards',
+  'failed_approaches',
+  'relevant_memories',
+  'similar_episodes',
+  'graph_neighborhood',
+  'affected_tests',
+  'active_neighboring_work',
+  'uncertainty',
+  'source_excerpts',
+]);
+export type ContextPackSectionId = z.infer<typeof ContextPackSectionId>;
+
+export const ContextPackSection = z.object({
+  id: ContextPackSectionId,
+  provenance: z.array(ContextPackProvenance),
+  notice: ContextPackNotice.nullable(),
+  charsAllotted: z.number().int().nonnegative(),
+  charsUsed: z.number().int().nonnegative(),
+  excerpts: z.array(ContextPackExcerpt).default([]),
+  graphEntities: z.array(ContextPackGraphEntity).default([]),
+  coverage: ContextPackCoverage.nullable().default(null),
+  /** Structured content that fits neither `excerpts` nor `graphEntities` — currently only
+   *  `active_neighboring_work`'s file-lock/task summaries. Kept as opaque JSON-safe records
+   *  rather than growing the union for one ad hoc shape. */
+  items: z.array(z.record(z.string(), z.unknown())).default([]),
+});
+export type ContextPackSection = z.infer<typeof ContextPackSection>;
+
+/**
+ * The task's own required facts (locked decision: allocated budget FIRST, from a reserved floor,
+ * and never displaced or truncated by anything else in the pack). Deliberately NOT a
+ * `ContextPackSection` and NOT a member of `ContextPack.sections` — so nothing that walks
+ * `sections` to reason about remaining budget can accidentally treat this as compressible.
+ */
+export const ContextPackTaskFacts = z.object({
+  taskId: z.string(),
+  key: z.string(),
+  title: z.string(),
+  body: z.string().nullable(),
+  status: z.string(),
+  priority: z.number().int(),
+  claimedBy: z.string().nullable(),
+  claimExpiresAt: z.string().nullable(),
+  openComments: z.array(z.object({
+    id: z.string(), kind: z.string(), body: z.string(),
+    authorKind: z.string(), authorId: z.string().nullable(), createdAt: z.string(),
+  })),
+  executionSpec: ExecutionSpec.nullable(),
+  executionSpecUnreadable: z.boolean(),
+});
+export type ContextPackTaskFacts = z.infer<typeof ContextPackTaskFacts>;
 
 /**
  * The assembled result of `get_task_context(taskId, branch, baseId,
  * tokenBudget)` (§10) — bounded working memory for one task, not a bag of
  * disconnected vector chunks. Entities are referenced by their stable URIs so
  * a consumer can re-fetch or cite them.
+ *
+ * PLNR-267 is this schema's FIRST real consumer (it shipped in PLNR-244 unused) and extends it
+ * additively per that task's locked decision: every pre-existing field name and shape below is
+ * unchanged, now populated with real content, plus the FULL rich structure — provenance, honesty
+ * notices, self-contained excerpts with live evidence, and the task's own required facts — in the
+ * new fields beneath them. `verifiedDecisions`/`knownHazards` stay `MemoryItem[]` (that schema has
+ * no `validity`/`isLead` of its own) as lightweight, pre-existing-shape pointers; the rich picture
+ * (authority, validity, per-citation base-scoped verification, lead reasons) lives in `sections`.
  */
 export const ContextPack = z.object({
   taskId: z.string(),
@@ -376,6 +581,17 @@ export const ContextPack = z.object({
   activeNeighboringWork: z.array(z.string().min(1)).default([]), // task ids
   staleWarnings: z.array(z.string().min(1)).default([]),
   generatedAt: z.string().datetime(),
+  // --- PLNR-267 additive extension ------------------------------------------------------------
+  role: ContextPackRole.default('human'),
+  mode: ContextPackMode.default('keyword'),
+  /** The enforced character budget this pack was assembled against — `tokenBudget * a named
+   *  chars-per-token constant`, or a fixed default when the caller supplied no `tokenBudget` at
+   *  all. See `apps/api/src/memory/context-pack.ts`'s `CHARS_PER_TOKEN` for why characters, never
+   *  a real tokenizer (§20, locked decision: deterministic, no optional-binding dependency). */
+  charBudget: z.number().int().positive(),
+  charsUsed: z.number().int().nonnegative(),
+  taskFacts: ContextPackTaskFacts,
+  sections: z.array(ContextPackSection),
 });
 export type ContextPack = z.infer<typeof ContextPack>;
 

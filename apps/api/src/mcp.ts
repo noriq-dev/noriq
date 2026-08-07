@@ -16,8 +16,9 @@ import {
   userCanAccessProject,
 } from './lib/visibility';
 import { taskSearchFilters } from './lib/search';
-import { ExecutionSpec, type ExecutionSpecInput, MemoryKind, MemoryEdgeType, EvidenceRef } from '@noriq-dev/shared';
+import { ExecutionSpec, type ExecutionSpecInput, MemoryKind, MemoryEdgeType, EvidenceRef, ContextPackRole } from '@noriq-dev/shared';
 import { RETRIEVAL_DEFAULTS } from './memory/retrieval';
+import { assembleContextPack } from './memory/context-pack';
 import { readExecutionSpec } from './lib/execution-spec';
 import type { ProjectMemoryStub } from './lib/project-memory';
 import { loadPriorEffort } from './lib/project-memory';
@@ -286,7 +287,7 @@ const WRITE_IDEMPOTENT: ToolHints = { ...WRITE, idempotentHint: true };
 const TOOL_HINTS: Record<string, ToolHints> = {
   // reads
   get_briefing: READ, my_updates: READ, list_projects: READ, get_project: READ, list_groups: READ, list_agents: READ,
-  get_task: READ, search_tasks: READ, semantic_search: READ, search_project_memory: READ, explain_project_area: READ, tag_report: READ, next_claimable: READ, read_open_comments: READ, get_plans: READ, can_claim: READ,
+  get_task: READ, search_tasks: READ, semantic_search: READ, search_project_memory: READ, explain_project_area: READ, get_task_context: READ, tag_report: READ, next_claimable: READ, read_open_comments: READ, get_plans: READ, can_claim: READ,
   list_docs: READ, get_doc: READ, update_doc: WRITE_IDEMPOTENT, list_templates: READ, get_plan_doc: READ, update_plan_doc: WRITE_IDEMPOTENT,
   check_locks: READ, list_locks: READ,
   // writes that are safe to repeat with the same args (renew/replace-in-place/insert-or-ignore)
@@ -2190,6 +2191,27 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       // focus === 'impact'
       if (!entityUris?.length) throw new Error('entityUris is required for focus="impact"');
       return stub.changeImpact(projectId, { entityUris, maxDepth, maxResults });
+    }),
+  );
+
+  defineTool(
+    'get_task_context',
+    'The primary ASSEMBLED context interface for one task (§10) — call this instead of chaining get_task + search_project_memory + explain_project_area yourself before starting non-trivial work. Returns one bounded, deterministic pack: the task\'s own required facts (title/body/executionSpec/acceptance/open comments/claim state — ALWAYS present in full, at any budget, and never displaced by anything below), then as much as the budget allows of: active decisions, known hazards, failed-approach records, other relevant memory, similar prior episodes (duplicate-work warnings), the task\'s dependency-graph neighborhood, tests it may affect, other work currently touching the same files (file-lock overlap — only answerable on locking projects), an uncertainty section (open `unknown`-kind memory plus prior episodes\' unresolved questions), and a source-excerpts rollup of every citation shown above. `budgetTokens` is enforced deterministically on CHARACTERS (no tokenizer) — a small budget only shrinks the RETRIEVED sections, never the required facts. Every section reports which retrieval stage(s) produced it and, when it is empty, WHY: `notice.kind === "unanswerable"` means the question itself could not be asked (e.g. no graph seed, file locking off) — never read that the same as "nothing is related", which is a bare empty section with no notice. `mode` (top-level) says whether this instance ran semantic search or degraded to keyword+graph only — it still answers either way. Every memory/episode excerpt carries its OWN authority/validity/evidence — a citation\'s `verifiedForCaller` is scoped to the `branch`/`baseId` YOU pass, so a citation verified elsewhere never reads as verified for you. `role` defaults from your own agent kind (a build/verify run\'s current run kind, or "human" for a copilot) and only reweights which sections get more room — it never changes which facts are authoritative. Read-only: assembling a pack never changes memory, validity, verification state, or emits an event.',
+    {
+      projectId: z.string(),
+      taskId: z.string().describe('Task id or display key'),
+      repositoryKey: z.string().optional().describe('Canonical repository key (§6) — resolves the task\'s own anticipatedFiles into file-level graph queries; omitted, those sections fall back to the task\'s own graph node'),
+      branch: z.string().optional().describe('Your current branch/branch class — scopes which citations read as verified FOR YOU'),
+      baseId: z.string().optional().describe('Your current opaque VCS revision (§6) — scopes which citations read as verified FOR YOU'),
+      role: ContextPackRole.optional().describe('Reweights section budgets toward what that role needs most (scope/build/verify/human); defaults from your own agent kind'),
+      budgetTokens: z.number().int().positive().optional().describe('Approximate token budget, converted to a character budget deterministically (no tokenizer); omitted uses a generous fixed default'),
+    },
+    tool(async ({ projectId, taskId, repositoryKey, branch, baseId, role, budgetTokens }) => {
+      const resolvedTaskId = await resolveTaskId(env, projectId, taskId);
+      const resolvedRole = role ?? (agent.kind === 'agent' ? ((await runKindOf(env, agent.id)) ?? 'build') : 'human');
+      return assembleContextPack(env, projectId, resolvedTaskId, {
+        repositoryKey, branch, baseId, role: resolvedRole, tokenBudget: budgetTokens ?? null,
+      });
     }),
   );
 

@@ -231,6 +231,9 @@ describe('IndexGenerationManifest and MemoryBackupManifest (§8, §17)', () => {
 
 describe('ContextPack (§10)', () => {
   it('round-trips an assembled task context pack', () => {
+    // PLNR-267 is this schema's first real consumer — see memory-context-pack.test.ts for the
+    // full assembler acceptance suite. This test only pins the WIRE SHAPE: every pre-existing
+    // (PLNR-244) field still parses byte-for-byte, plus the additive fields that task introduced.
     const pack = ContextPack.parse({
       taskId: 'task_1',
       projectId: 'prj_plnr',
@@ -239,9 +242,18 @@ describe('ContextPack (§10)', () => {
       tokenBudget: 8000,
       relevantEntities: ['noriq://file/PLNR/noriq-web/apps/api/src/mcp.ts'],
       generatedAt: '2026-08-06T00:00:00.000Z',
+      charBudget: 24000,
+      charsUsed: 120,
+      taskFacts: {
+        taskId: 'task_1', key: 'PLNR-1', title: 'x', body: null, status: 'todo', priority: 2,
+        claimedBy: null, claimExpiresAt: null, openComments: [], executionSpec: null, executionSpecUnreadable: false,
+      },
+      sections: [],
     });
     expect(pack.verifiedDecisions).toEqual([]);
     expect(pack.relevantEntities).toHaveLength(1);
+    expect(pack.role).toBe('human'); // defaults
+    expect(pack.mode).toBe('keyword'); // defaults
   });
 });
 

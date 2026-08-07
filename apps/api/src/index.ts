@@ -29,6 +29,7 @@ import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
 import { z } from 'zod';
 import { listProjectRepositories, listRepositoryCheckouts, resolveRepositoryByKey, loadPriorEffort, type ProjectMemoryStub } from './lib/project-memory';
+import { assembleContextPack } from './memory/context-pack';
 import { readBoundedBody, verifyBatchChecksum, decodeBatchRows, MAX_INGEST_BATCH_BYTES, INGEST_TOKEN_TTL_SECONDS } from './memory/ingest';
 import { normalizeVerificationReport } from './memory/verification';
 import { AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget, isTerminalRunStatus, normalizeProjectKey, IndexGenerationManifest } from '@noriq-dev/shared';
@@ -1171,6 +1172,26 @@ app.post('/api/projects/:pid/memory/explain', userAuth, async (c) => {
     default:
       return c.json({ error: 'focus must be one of dependencies|tests|implementers|decision|impact' }, 400);
   }
+});
+
+// Task-aware context packs (PLNR-267) — the human-facing twin of get_task_context; same
+// assembler, same shape. `role` defaults to 'human' here (there is no agent-kind to derive it
+// from on this side of the API — that inference is get_task_context's own job).
+app.post('/api/projects/:pid/memory/context', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const body = await c.req.json<{
+    taskId?: string; repositoryKey?: string; branch?: string; baseId?: string;
+    role?: 'scope' | 'build' | 'verify' | 'human'; budgetTokens?: number;
+  }>().catch(() => ({}) as Record<string, never>);
+  if (!body.taskId) return c.json({ error: 'taskId required' }, 400);
+  const task = await c.env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+    .bind(body.taskId, body.taskId, pid).first<{ id: string }>();
+  if (!task) return c.json({ error: 'not found' }, 404);
+  const pack = await assembleContextPack(c.env, pid, task.id, {
+    repositoryKey: body.repositoryKey, branch: body.branch, baseId: body.baseId,
+    role: body.role ?? 'human', tokenBudget: body.budgetTokens ?? null,
+  });
+  return c.json(pack);
 });
 
 // Proposed-decision approval (PLNR-253) — HUMAN-only, never an MCP tool (§12/§13: an agent must
