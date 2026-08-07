@@ -2,8 +2,8 @@ import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../env';
 import { newId, nowIso } from '../lib/util';
 import {
-  buildEntityUri, AUTHORITY_HYPOTHESIS, AUTHORITY_HUMAN_APPROVED, AUTHORITY_VERIFIED_MERGED,
-  EffortEpisode, EpisodeSelfSummary, type MemoryBackupManifest,
+  buildEntityUri, parseEntityUri, AUTHORITY_HYPOTHESIS, AUTHORITY_HUMAN_APPROVED, AUTHORITY_VERIFIED_MERGED,
+  EffortEpisode, EpisodeSelfSummary, type EpisodeLandingOutcome, type MemoryBackupManifest,
 } from '@noriq-dev/shared';
 import { projectCoordinationEvents, type ProjectedEvent } from '../lib/memory-projector';
 import { exportMemorySnapshot, sha256HexBytes } from '../memory/backup';
@@ -30,6 +30,10 @@ import {
   type ImplementingWorkResult, type DecisionLineageResult, type ChangeImpactResult,
 } from '../memory/graph-queries';
 import { parseExit } from '../memory/episodes';
+import {
+  effortSignals, duplicateWarnings, summarizeEffort,
+  type TaskEffortInput, type EffortCandidate, type DuplicateWarning, type EffortSummary,
+} from '../memory/similar-effort';
 
 /**
  * ProjectMemory — one instance per project (idFromName(projectId)), canonical
@@ -2573,6 +2577,130 @@ export class ProjectMemory extends DurableObject<Env> {
     });
     const results = rankCandidates(filtered, { limit, preferBranch: opts.branch });
     return { mode, results };
+  }
+
+  /**
+   * PLNR-264: has this task's likely area of work already been attempted? Gathers episode
+   * candidates the SAME way `searchProjectMemory` does — `lexicalRetrievalRows` +
+   * `semanticRetrievalRows` over the task's own title/body, plus bounded graph expansion from
+   * the task's own node when one already exists (an earlier episode/memory linked it) — then
+   * hands them to `memory/similar-effort.ts`'s pure classifier/gate/summarizer rather than
+   * forking a second ranking pipeline. Read-only throughout (locked decision): no row written,
+   * no validity transition, no outbox event. Callers (`can_claim`/`claim_task` in mcp.ts) call
+   * this AFTER ProjectRoom returns and swallow a failure into "no priorEffort block" — never let
+   * it touch the claim itself (§19).
+   */
+  async similarEffort(
+    projectId: string,
+    input: TaskEffortInput & { taskId: string; limit?: number },
+  ): Promise<{ warnings: DuplicateWarning[]; summary: EffortSummary; consideredCount: number }> {
+    await this.assertProjectId(projectId);
+    const limit = Math.min(Math.max(input.limit ?? RETRIEVAL_DEFAULTS.maxResults, 1), RETRIEVAL_DEFAULTS.maxResultsCeiling);
+    const signals = effortSignals(input);
+
+    // episodeId -> best-known provenance across every stage that found it. A graph hit's
+    // edgePath is never discarded in favor of a later text hit — it is the ONLY source of the
+    // graph-neighborhood/shared-decision support kinds (memory/similar-effort.ts) — otherwise
+    // the higher raw score wins.
+    const provenance = new Map<string, { stage: RetrievalStage; score: number; edgePath?: string }>();
+    const consider = (id: string, stage: RetrievalStage, score: number, edgePath?: string) => {
+      const prev = provenance.get(id);
+      if (!prev) { provenance.set(id, { stage, score, edgePath }); return; }
+      if (edgePath && !prev.edgePath) { provenance.set(id, { stage, score: Math.max(prev.score, score), edgePath }); return; }
+      if (score > prev.score) provenance.set(id, { ...prev, score });
+    };
+
+    if (signals.queryText.trim()) {
+      for (const hit of this.lexicalRetrievalRows(signals.queryText, { limit })) {
+        if (hit.entityType === 'episode') consider(hit.id, hit.stage, hit.score);
+      }
+      for (const hit of await this.semanticRetrievalRows(projectId, signals.queryText, limit)) {
+        if (hit.entityType === 'episode') consider(hit.id, hit.stage, hit.score);
+      }
+    }
+    // Graph expansion seeded at the TASK's own node — reachable only once something has already
+    // linked this task into the graph (recordEpisode's own related_to edge, most commonly). A
+    // brand-new task with no prior episode of its own simply contributes no graph candidates,
+    // same "absence is not an error" posture as the rest of this file.
+    const taskNode = this.resolveNodeByUri(buildEntityUri({ kind: 'task', id: input.taskId }));
+    if (taskNode) {
+      const seedIds = [taskNode.nodeId];
+      const graphOpts = { maxResults: RETRIEVAL_DEFAULTS.maxGraphResults };
+      const rows = [
+        ...this.rawTraverseGraph(seedIds, { ...graphOpts, direction: 'downstream' }).rows,
+        ...this.rawTraverseGraph(seedIds, { ...graphOpts, direction: 'upstream' }).rows,
+      ];
+      for (const row of rows) {
+        if (row.type !== 'episode') continue;
+        const ref = parseEntityUri(row.uri);
+        if (ref.kind === 'episode') consider(ref.id, 'graph', 1 / (1 + row.depth), row.edgePath);
+      }
+    }
+
+    const episodeIds = [...provenance.keys()];
+    if (!episodeIds.length) return { warnings: [], summary: summarizeEffort([]), consideredCount: 0 };
+
+    const placeholders = episodeIds.map((_, i) => `?${i + 1}`).join(',');
+    const rows = this.ctx.storage.sql
+      .exec<{
+        id: string; run_id: string; task_id: string | null; landing_outcome: string; review_rounds: number;
+        cost_usd: number; body: string; run_kind: string | null; outcome: string | null;
+        started_at: string | null; finished_at: string | null;
+      }>(
+        `SELECT id, run_id, task_id, landing_outcome, review_rounds, cost_usd, body, run_kind, outcome, started_at, finished_at
+         FROM episodes WHERE id IN (${placeholders})`,
+        ...episodeIds,
+      )
+      .toArray();
+
+    // Batch-resolve display keys for each candidate's anchor task — ProjectMemory holds no task
+    // rows of its own (coordination lives in D1); the same "plain D1 read, not a coordination
+    // mutation" precedent `resolveProjectKey` already sets.
+    const taskIds = [...new Set(rows.map((r) => r.task_id).filter((t): t is string => !!t))];
+    const taskKeyById = new Map<string, string>();
+    if (taskIds.length) {
+      const tphs = taskIds.map((_, i) => `?${i + 1}`).join(',');
+      const { results } = await this.env.DB.prepare(`SELECT id, key FROM tasks WHERE id IN (${tphs})`).bind(...taskIds).all<{ id: string; key: string }>();
+      for (const r of results) taskKeyById.set(r.id, r.key);
+    }
+
+    const candidates: EffortCandidate[] = rows.map((row) => {
+      // Same tolerance `summarizeEpisodeBody` already applies — an unreadable body degrades to
+      // empty fields rather than dropping the candidate (its deterministic columns are still
+      // real evidence: run id, task, landing outcome, cost, review rounds).
+      let body: Partial<EffortEpisode> = {};
+      try { body = JSON.parse(row.body) as EffortEpisode; } catch { /* degrade to empty fields below */ }
+      const prov = provenance.get(row.id)!;
+      return {
+        episodeId: row.id,
+        runId: row.run_id,
+        taskId: row.task_id,
+        taskKey: row.task_id ? (taskKeyById.get(row.task_id) ?? null) : null,
+        runKind: row.run_kind ?? 'build',
+        outcome: row.outcome ?? 'done',
+        landingOutcome: (row.landing_outcome as EpisodeLandingOutcome) ?? 'pending',
+        filesTouched: body.filesTouched ?? [],
+        failures: body.failures ?? [],
+        findings: body.findings ?? [],
+        approachSummary: body.selfSummary?.approachSummary || null,
+        unresolvedQuestions: body.selfSummary?.unresolvedQuestions ?? [],
+        reviewRounds: row.review_rounds,
+        costUSD: row.cost_usd,
+        tokenUsage: body.tokenUsage ?? {},
+        startedAt: row.started_at,
+        finishedAt: row.finished_at,
+        stage: prov.stage,
+        score: prov.score,
+        edgePath: prov.edgePath,
+      };
+    });
+
+    const warnings = duplicateWarnings(candidates, signals, { limit });
+    // The summary always covers EXACTLY the episodes the warnings above it cite — never a
+    // silently broader "everything considered" set (memory/similar-effort.ts's own contract).
+    const warnedIds = new Set(warnings.map((w) => w.episodeId));
+    const summary = summarizeEffort(candidates.filter((c) => warnedIds.has(c.episodeId)));
+    return { warnings, summary, consideredCount: candidates.length };
   }
 
   // ---------------------------------------------------------------------------

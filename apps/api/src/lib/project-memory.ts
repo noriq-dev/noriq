@@ -5,10 +5,12 @@
 import type { Env } from '../env';
 import type { ProjectMemoryHealth } from '../do/ProjectMemory';
 import type { RankedHit } from '../memory/retrieval';
+import type { DuplicateWarning, EffortSummary } from '../memory/similar-effort';
 import type {
   DependencyNeighborhoodResult, ValidatingTestsResult, ImplementingWorkResult, DecisionLineageResult, ChangeImpactResult,
 } from '../memory/graph-queries';
 import { userCanAccessProject } from './visibility';
+import { readExecutionSpec } from './execution-spec';
 
 /** An evidence citation as the write RPCs accept it — validated server-side (writes.ts) against
  *  the shared RepositoryKey/BranchRef/BaseId/RepoPath schemas; not re-validated here. */
@@ -111,6 +113,12 @@ export interface ProjectMemoryStub {
       limit?: number;
     },
   ): Promise<{ mode: 'semantic' | 'keyword'; results: RankedHit[] }>;
+  /** PLNR-264: has this task's likely area of work already been attempted? Read-only —
+   *  see ProjectMemory.similarEffort's own doc comment for the full retrieval story. */
+  similarEffort(
+    projectId: string,
+    input: { taskId: string; title: string; body?: string | null; anticipatedFiles?: string[]; limit?: number },
+  ): Promise<{ warnings: DuplicateWarning[]; summary: EffortSummary; consideredCount: number }>;
   /** PLNR-258: named graph-query primitives — see memory/graph-queries.ts for the shared
    *  completeness-marker contract every one of these returns. */
   dependencyNeighborhood(
@@ -163,6 +171,31 @@ export async function projectMemory(env: Env, userId: string, projectId: string)
     throw new Error(`project ${projectId} not found`);
   }
   return env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)) as unknown as ProjectMemoryStub;
+}
+
+export type SimilarEffortResult = { warnings: DuplicateWarning[]; summary: EffortSummary; consideredCount: number };
+
+/**
+ * PLNR-264: the ONE place `can_claim`/`claim_task` (mcp.ts) and the human REST twin (index.ts)
+ * call into `ProjectMemory.similarEffort` — so the two surfaces can't drift on how a task's
+ * title/body/anticipatedFiles become the RPC's input. Never throws: a memory failure (the DO
+ * unreachable, a malformed stored execution spec) degrades to `null` — "no priorEffort block" —
+ * per this task's own locked decision that memory retrieval must never touch a claim (§19).
+ */
+export async function loadPriorEffort(
+  env: Env,
+  projectId: string,
+  task: { id: string; title: string; body: string | null; executionSpec: string | null },
+): Promise<SimilarEffortResult | null> {
+  try {
+    const stored = readExecutionSpec(task.executionSpec, task.id);
+    const anticipatedFiles = stored.spec?.anticipatedFiles?.map((f) => f.path) ?? [];
+    const stub = env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)) as unknown as ProjectMemoryStub;
+    return await stub.similarEffort(projectId, { taskId: task.id, title: task.title, body: task.body, anticipatedFiles });
+  } catch (err) {
+    console.warn(`similarEffort lookup failed for task ${task.id} in project ${projectId}: ${String(err)}`);
+    return null;
+  }
 }
 
 export interface ProjectRepositoryRow {

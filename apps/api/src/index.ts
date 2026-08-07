@@ -28,7 +28,7 @@ import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
 import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
 import { z } from 'zod';
-import { listProjectRepositories, listRepositoryCheckouts, resolveRepositoryByKey, type ProjectMemoryStub } from './lib/project-memory';
+import { listProjectRepositories, listRepositoryCheckouts, resolveRepositoryByKey, loadPriorEffort, type ProjectMemoryStub } from './lib/project-memory';
 import { readBoundedBody, verifyBatchChecksum, decodeBatchRows, MAX_INGEST_BATCH_BYTES, INGEST_TOKEN_TTL_SECONDS } from './memory/ingest';
 import { AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget, isTerminalRunStatus, normalizeProjectKey, IndexGenerationManifest } from '@noriq-dev/shared';
 
@@ -1123,6 +1123,21 @@ app.post('/api/projects/:pid/memory/search', userAuth, async (c) => {
     minAuthority?: number; validity?: string; limit?: number;
   }>().catch(() => ({}) as Record<string, never>);
   return c.json(await memoryStub(c.env, pid).searchProjectMemory(pid, body));
+});
+
+// Similar-effort retrieval (PLNR-264) — the human-facing twin of the priorEffort block
+// can_claim/claim_task attach; same loadPriorEffort() glue so the two surfaces can't drift on
+// how a task's title/body/anticipatedFiles become ProjectMemory.similarEffort's input.
+app.post('/api/projects/:pid/memory/similar-effort', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const body = await c.req.json<{ taskId?: string }>().catch(() => ({}) as { taskId?: string });
+  if (!body.taskId) return c.json({ error: 'taskId required' }, 400);
+  const task = await c.env.DB.prepare('SELECT id, title, body, execution_spec AS executionSpec FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+    .bind(body.taskId, body.taskId, pid).first<{ id: string; title: string; body: string | null; executionSpec: string | null }>();
+  if (!task) return c.json({ error: 'not found' }, 404);
+  const result = await loadPriorEffort(c.env, pid, task);
+  if (!result) return c.json({ error: 'project memory unavailable' }, 502);
+  return c.json(result);
 });
 
 // Named graph-query primitives (PLNR-258) — the human-facing twin of explain_project_area;

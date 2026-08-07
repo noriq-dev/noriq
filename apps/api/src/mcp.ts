@@ -20,6 +20,7 @@ import { ExecutionSpec, type ExecutionSpecInput, MemoryKind, MemoryEdgeType, Evi
 import { RETRIEVAL_DEFAULTS } from './memory/retrieval';
 import { readExecutionSpec } from './lib/execution-spec';
 import type { ProjectMemoryStub } from './lib/project-memory';
+import { loadPriorEffort } from './lib/project-memory';
 import { refuseSpecWrite, specWriteRefusalMessage } from './lib/spec-authority';
 import { search, searchBackend, reindexProject } from './search';
 import { nearDupeGroups } from './lib/tags';
@@ -1438,14 +1439,20 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'can_claim',
-    'Read-only: would a claim of this task succeed RIGHT NOW? Returns {claimable, reason?}. It reports the plan/phase gate a normal claim faces — phase order (a phase stays locked until every earlier phase is done, unless the plan\'s dispatch opted into the landed gate), manual dependencies, and the proposed-plan lock — WITHOUT the anchored-run bypass, so a runner can check before spawning an agent on plan work whose earlier phase is not yet complete. reason is a short human string.',
+    'Read-only: would a claim of this task succeed RIGHT NOW? Returns {claimable, reason?, priorEffort?}. It reports the plan/phase gate a normal claim faces — phase order (a phase stays locked until every earlier phase is done, unless the plan\'s dispatch opted into the landed gate), manual dependencies, and the proposed-plan lock — WITHOUT the anchored-run bypass, so a runner can check before spawning an agent on plan work whose earlier phase is not yet complete. reason is a short human string. `priorEffort`, when present, is ADVISORY only — it never changes `claimable`/`reason` — see claim_task\'s description for what it means and how to read it.',
     { taskId: z.string() },
     tool(async ({ taskId }) => {
-      const t = await env.DB.prepare('SELECT project_id AS pid FROM tasks WHERE id = ? OR key = ?')
-        .bind(taskId, taskId).first<{ pid: string }>();
+      const t = await env.DB.prepare('SELECT id, project_id AS pid, title, body, execution_spec AS executionSpec FROM tasks WHERE id = ? OR key = ?')
+        .bind(taskId, taskId).first<{ id: string; pid: string; title: string; body: string | null; executionSpec: string | null }>();
       if (!t) throw new Error(`task ${taskId} not found`);
       if (!(await userCanAccessProject(env, agent.userId, t.pid))) throw new Error(`task ${taskId} not found`);
-      return taskClaimability(env.DB, taskId);
+      const claimability = await taskClaimability(env.DB, taskId);
+      // Attached only when there is something to weigh (locked decision: "priorEffort is
+      // always absent (not empty)") — a successful lookup that simply found nothing similar
+      // is not advisory content, and forcing every caller to check `.warnings.length` on an
+      // always-present block would be noise, not a lead.
+      const priorEffort = await loadPriorEffort(env, t.pid, t);
+      return priorEffort?.warnings.length ? { ...claimability, priorEffort } : claimability;
     }),
   );
 
@@ -1560,7 +1567,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'claim_task',
-    'Claim exclusive ownership before working. Fails if held, blocked, or not claimable. Returns the TTL and any open comments — read them before you start. Your claim renews on every Noriq tool call, so just keep working; no periodic heartbeat needed.',
+    'Claim exclusive ownership before working. Fails if held, blocked, or not claimable. Returns the TTL and any open comments — read them before you start. Your claim renews on every Noriq tool call, so just keep working; no periodic heartbeat needed. May also return `priorEffort`: prior work this project\'s memory found similar or related, each entry citing the exact prior task/run/episode and a `support` list showing WHY it was surfaced (shared files, a shared failure signature, graph proximity, a shared decision or unresolved question, or text similarity) — never on text similarity alone. This is a LEAD to weigh, never an instruction: a `failed` prior effort is there because it disproved something, not because it blocks you. `priorEffort` is OMITTED (not sent as an empty block) whenever there is nothing to weigh — no similar prior work, or memory unavailable — either way your claim proceeds exactly as if this field did not exist.',
     { projectId: z.string(), taskId: z.string() },
     tool(async ({ projectId, taskId }) => {
       const id = await resolveTaskId(env, projectId, taskId);
@@ -1568,7 +1575,17 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       // An agent that hasn't localized itself yet adopts the project it first works in.
       await env.DB.prepare("UPDATE agents SET project_id = ?, status = 'active' WHERE id = ? AND project_id IS NULL")
         .bind(projectId, agent.id).run();
-      return result;
+      // §19 (locked decision): the memory read happens HERE, after ProjectRoom already
+      // committed the claim — never inside claimTask's own DO mutation — and a failure degrades
+      // to no priorEffort block rather than touching the claim that already succeeded.
+      const taskRow = await env.DB.prepare('SELECT id, title, body, execution_spec AS executionSpec FROM tasks WHERE id = ?')
+        .bind(id).first<{ id: string; title: string; body: string | null; executionSpec: string | null }>();
+      // Empty warnings is "nothing worth surfacing", not advisory content — same "absent, not
+      // empty" contract as can_claim above. `result` is cast for the spread only — the DO's RPC
+      // return type resolves too broadly for TS to see it as spreadable object shape; it is a
+      // plain object at runtime (ProjectRoom.claimTask's own literal return).
+      const priorEffort = taskRow ? await loadPriorEffort(env, projectId, taskRow) : null;
+      return priorEffort?.warnings.length ? { ...(result as Record<string, unknown>), priorEffort } : result;
     }),
   );
 
