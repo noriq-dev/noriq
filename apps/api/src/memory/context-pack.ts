@@ -332,6 +332,20 @@ export async function assembleContextPack(env: Env, projectId: string, taskId: s
   const remaining = Math.max(0, charBudget - taskFactsChars);
   const allotments = allocateBudget(remaining, SECTION_ORDER, role);
 
+  // The required-facts floor can legitimately be bigger than what the caller asked for — the
+  // precedence is intentional (task facts are never displaced or truncated), but a caller
+  // assembling a prompt against a real token ceiling needs to be TOLD, not left to infer an
+  // overrun by comparing `charBudget` against `charsUsed` itself. Pack-level, not a section
+  // notice: nothing here was truncated (no content was cut to fit) and nothing was unanswerable
+  // (the question WAS answered, in full) — it is its own distinguishable claim.
+  const packNotices: ContextPackNotice[] = [];
+  if (taskFactsChars > charBudget) {
+    packNotices.push({
+      kind: 'required_facts_exceeded_budget',
+      reason: `requested budget: ${charBudget} characters; the task's required facts alone are ${taskFactsChars} characters — task facts are never displaced by budget, so this pack exceeds the requested budget by ${taskFactsChars - charBudget} characters.`,
+    });
+  }
+
   // ---- 2. Fetch everything the memory half needs, in parallel where independent -------------
   const signals = effortSignals({ title: row.title, body: row.body, anticipatedFiles });
   const taskUri = buildEntityUri({ kind: 'task', id: row.id });
@@ -651,6 +665,7 @@ export async function assembleContextPack(env: Env, projectId: string, taskId: s
     charsUsed: taskFactsChars + sections.reduce((sum, s) => sum + s.charsUsed, 0),
     taskFacts,
     sections,
+    notices: packNotices,
   };
   return pack;
 }

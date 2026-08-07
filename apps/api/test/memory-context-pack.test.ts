@@ -141,12 +141,27 @@ describe('assembleContextPack — required facts are never displaced, at any bud
     // A budget far smaller than even the task's OWN required facts — the pathological case where
     // honoring the floor necessarily means going over the nominal budget. That is intended: the
     // required facts win regardless (locked decision), and every retrieved section is starved to
-    // zero rather than borrowing room from taskFacts.
+    // zero rather than borrowing room from taskFacts. But the overrun must not be SILENT — a
+    // caller assembling a prompt against a real token ceiling needs a pack-level notice, not just
+    // two numbers (charBudget vs charsUsed) to compare and guess at.
     const pack = await assembleContextPack(appEnv, projectId, taskId, { tokenBudget: 1 });
     expect(pack.taskFacts.executionSpec?.acceptance.observableTruths).toEqual(['pooling no longer deadlocks under load']);
     for (const section of pack.sections) {
       expect(section.excerpts.length + section.graphEntities.length + section.items.length).toBe(0);
     }
+    expect(pack.charsUsed).toBeGreaterThan(pack.charBudget);
+    expect(pack.notices).toHaveLength(1);
+    expect(pack.notices[0]!.kind).toBe('required_facts_exceeded_budget'); // distinguishable from 'truncated' — nothing was cut
+    expect(pack.notices[0]!.reason).toContain(`requested budget: ${pack.charBudget} characters`);
+    expect(pack.notices[0]!.reason).toContain('task facts are never displaced by budget');
+  });
+
+  it('carries NO pack-level notice when the required facts fit comfortably within the requested budget', async () => {
+    const projectId = await newProject('MCP2B');
+    const made = await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'A small, ordinary task', tags: ['context-pack-test'] });
+    const pack = await assembleContextPack(appEnv, projectId, made.body.id as string, { tokenBudget: 5000 });
+    expect(pack.charsUsed).toBeLessThanOrEqual(pack.charBudget);
+    expect(pack.notices).toEqual([]);
   });
 
   it('identical inputs at the same budget produce a byte-identical pack (generatedAt excluded — the one deliberate wall-clock field)', async () => {

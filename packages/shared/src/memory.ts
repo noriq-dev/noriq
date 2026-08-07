@@ -491,7 +491,16 @@ export type ContextPackCoverage = z.infer<typeof ContextPackCoverage>;
  * fires whenever the section's character budget cut real, retrieved content, independent of
  * whether anything survived to be shown.
  */
-export const ContextPackNoticeKind = z.enum(['truncated', 'unanswerable']);
+/**
+ * `required_facts_exceeded_budget` is a PACK-level notice, never a section one (locked decision:
+ * required task facts are never displaced or truncated by budget) — distinguishable on purpose
+ * from `truncated` (content was cut to fit) and `unanswerable` (a question could not be put to
+ * this project at all): here nothing was cut and nothing was unanswerable — the mandatory floor
+ * itself is simply bigger than what the caller asked for, and a consumer building a prompt
+ * against a real token ceiling needs to know that distinction, not infer it by comparing
+ * `charBudget` against `charsUsed`.
+ */
+export const ContextPackNoticeKind = z.enum(['truncated', 'unanswerable', 'required_facts_exceeded_budget']);
 export type ContextPackNoticeKind = z.infer<typeof ContextPackNoticeKind>;
 export const ContextPackNotice = z.object({ kind: ContextPackNoticeKind, reason: z.string() });
 export type ContextPackNotice = z.infer<typeof ContextPackNotice>;
@@ -592,6 +601,11 @@ export const ContextPack = z.object({
   charsUsed: z.number().int().nonnegative(),
   taskFacts: ContextPackTaskFacts,
   sections: z.array(ContextPackSection),
+  /** Pack-level honesty notices — the same `notice` mechanism `sections[]` carries, at the whole-
+   *  pack level. Today the only producer is `required_facts_exceeded_budget` (the required-facts
+   *  floor is bigger than `charBudget`), but this is a list, not a single nullable field, so a
+   *  later pack-level notice has somewhere to go without another additive schema change. */
+  notices: z.array(ContextPackNotice).default([]),
 });
 export type ContextPack = z.infer<typeof ContextPack>;
 
