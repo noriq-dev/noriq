@@ -1341,6 +1341,18 @@ app.post('/api/projects/:pid/memory/explain', userAuth, async (c) => {
   }
 });
 
+// The bounded constellation feeding the memory star map (PLNR-284, §5) — POST (not GET) to match
+// /memory/search's and /memory/explain's shape immediately above, even though this endpoint
+// takes no body today: a future filter (node type, kind, authority floor, repository, time
+// window — the task's own discretion list) belongs in a JSON body, not a growing query string,
+// and changing the HTTP method later would be the breaking change, not adding fields to an
+// already-POST route. Read-only, same userAuth + requireProjectAccess gate as every memory route
+// in this block (line 138) — never widens what the browser can reach.
+app.post('/api/projects/:pid/memory/constellation', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  return c.json(await memoryStub(c.env, pid).constellation(pid));
+});
+
 // Task-aware context packs (PLNR-267) — the human-facing twin of get_task_context; same
 // assembler, same shape. `role` defaults to 'human' here (there is no agent-kind to derive it
 // from on this side of the API — that inference is get_task_context's own job).

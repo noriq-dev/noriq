@@ -298,6 +298,12 @@ export const api = {
   memoryChangeImpact: (pid: string, input: { entityUris: string[]; maxDepth?: number; maxResults?: number }, signal?: AbortSignal) =>
     req<ApiChangeImpact>('POST', `/api/projects/${pid}/memory/explain`, { focus: 'impact', ...input }, signal),
 
+  // The bounded, deterministic whole-project projection behind the memory star map (PLNR-284).
+  // POST with no body today (see index.ts route comment on why POST anyway) — `signal` matches
+  // the ego-network methods above: a canvas-driving fetch is exactly the kind of request a
+  // navigating-away human wants to cancel mid-flight.
+  memoryConstellation: (pid: string, signal?: AbortSignal) => req<ApiConstellation>('POST', `/api/projects/${pid}/memory/constellation`, undefined, signal),
+
   // --- Repository index / backup / restore / memory-health operations (PLNR-273). READS are
   // reachable by any project member; the ACTION methods 403 server-side for a non-admin (the
   // server's own guard is authority — this view only hides the affordance, per the locked
@@ -941,7 +947,7 @@ export interface ApiMemoryHistory {
 // primitive returns (§2 of the Project Memory doc): `complete: false` means "this graph cannot
 // answer that yet", never "nothing is related" — render the two differently. ---
 
-export type ApiGraphCoverageReason = 'seed-not-found' | 'code-graph-empty' | 'no-writer-yet' | 'row-limit-reached';
+export type ApiGraphCoverageReason = 'seed-not-found' | 'code-graph-empty' | 'no-writer-yet' | 'row-limit-reached' | 'graph-empty';
 
 export interface ApiGraphCoverage {
   complete: boolean;
@@ -1000,5 +1006,51 @@ export interface ApiChangeImpact {
   resolvedSeeds: ApiGraphEntityRef[];
   uncertainEdges: ApiUncertainEdge[];
   impactedTests: ApiRelatedEntity[];
+  coverage: ApiGraphCoverage;
+}
+
+// --- The memory star map's constellation (PLNR-284) — mirrors
+// apps/api/src/memory/graph-queries.ts's `Constellation*` shapes exactly (same plain-interface
+// convention as the rest of this file). `coverage` reuses `ApiGraphCoverage` above verbatim —
+// its `graph-empty` reason (new here) is the authoritative "the whole map is empty" signal;
+// `code-graph-empty` alone (no `graph-empty`) means "unindexed project" — real coordination/
+// memory nodes exist, there is just no repository code index yet. An unreachable store is NOT a
+// field on this shape at all: it is a rejected `memoryConstellation` promise (a non-2xx/network
+// failure), the same "unreachable, not empty" distinction memoryHealth already relies on. ---
+
+export interface ApiConstellationNode {
+  nodeId: string;
+  uri: string;
+  type: string;
+  kind: string | null;
+  label: string;
+  authority: number | null;
+  validity: string | null;
+  isLead: boolean | null;
+  leadReasons: string[] | null;
+  degree: number;
+  groupKey: string;
+}
+
+export interface ApiConstellationEdge {
+  type: string;
+  fromNodeId: string;
+  toNodeId: string;
+  provenance: string | null;
+}
+
+export interface ApiConstellationOmitted {
+  nodes: number;
+  edges: number;
+  edgesDanglingPruned: number;
+}
+
+export interface ApiConstellation {
+  memoryRevision: number;
+  nodeCeiling: number;
+  edgeCeiling: number;
+  nodes: ApiConstellationNode[];
+  edges: ApiConstellationEdge[];
+  omitted: ApiConstellationOmitted;
   coverage: ApiGraphCoverage;
 }

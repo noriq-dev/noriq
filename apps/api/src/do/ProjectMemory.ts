@@ -31,9 +31,9 @@ import {
   type RetrievalHit, type RetrievalStage, type RankedHit,
 } from '../memory/retrieval';
 import {
-  dependencyNeighborhood, validatingTests, implementingWork, decisionLineage, changeImpact,
+  dependencyNeighborhood, validatingTests, implementingWork, decisionLineage, changeImpact, constellation,
   type GraphEntityRef, type DependencyNeighborhoodResult, type ValidatingTestsResult,
-  type ImplementingWorkResult, type DecisionLineageResult, type ChangeImpactResult,
+  type ImplementingWorkResult, type DecisionLineageResult, type ChangeImpactResult, type ConstellationResult,
 } from '../memory/graph-queries';
 import { parseExit } from '../memory/episodes';
 import {
@@ -3431,6 +3431,40 @@ export class ProjectMemory extends DurableObject<Env> {
       truncated: fwd.truncated || bwd.truncated,
       seedMissing: resolved.length === 0,
     });
+  }
+
+  /**
+   * PLNR-284: the bounded constellation feeding the memory star map (§5) — reads this project's
+   * ENTIRE node/edge/memory_items/episodes rows (unsorted, unfiltered — see graph-queries.ts's
+   * `constellation` doc comment for why sampling fairly needs the whole population) and hands
+   * them to memory/graph-queries.ts's `constellation` to score, sample under hard ceilings, and
+   * classify coverage. Read-only: no memory_revision bump, no outbox row, same discipline as
+   * every other PLNR-257/258 query above. `memory_revision` rides the response so a client can
+   * cheaply detect an unchanged map (locked decision: exposed as a body field here, not an ETag —
+   * this DO has no HTTP layer of its own to attach one to; index.ts's route is free to ALSO turn
+   * it into an ETag if a future task wants that).
+   */
+  async constellation(projectId: string): Promise<ConstellationResult> {
+    await this.assertProjectId(projectId);
+    const nodes = this.ctx.storage.sql
+      .exec<{ id: string; type: string; uri: string; label: string; created_at: string }>(`SELECT id, type, uri, label, created_at FROM nodes`)
+      .toArray()
+      .map((r) => ({ nodeId: r.id, type: r.type, uri: r.uri, label: r.label, createdAt: r.created_at }));
+    const edges = this.ctx.storage.sql
+      .exec<{ id: string; type: string; from_node_id: string; to_node_id: string; provenance: string | null }>(
+        `SELECT id, type, from_node_id, to_node_id, provenance FROM edges`,
+      )
+      .toArray()
+      .map((r) => ({ edgeId: r.id, type: r.type, fromNodeId: r.from_node_id, toNodeId: r.to_node_id, provenance: r.provenance }));
+    const memoryItems = this.ctx.storage.sql
+      .exec<{ id: string; kind: string; authority: number; validity: string }>(`SELECT id, kind, authority, validity FROM memory_items`)
+      .toArray();
+    const episodes = this.ctx.storage.sql
+      .exec<{ id: string; landing_outcome: string }>(`SELECT id, landing_outcome FROM episodes`)
+      .toArray()
+      .map((r) => ({ id: r.id, landingOutcome: r.landing_outcome }));
+
+    return constellation(this.readMemoryRevision(), { nodes, edges, memoryItems, episodes }, { codeGraphPopulated: this.isCodeGraphPopulated() });
   }
 
   // ---------------------------------------------------------------------------

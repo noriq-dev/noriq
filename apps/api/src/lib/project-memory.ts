@@ -7,7 +7,7 @@ import type { ProjectMemoryHealth } from '../do/ProjectMemory';
 import type { RankedHit } from '../memory/retrieval';
 import type { DuplicateWarning, EffortSummary } from '../memory/similar-effort';
 import type {
-  DependencyNeighborhoodResult, ValidatingTestsResult, ImplementingWorkResult, DecisionLineageResult, ChangeImpactResult,
+  DependencyNeighborhoodResult, ValidatingTestsResult, ImplementingWorkResult, DecisionLineageResult, ChangeImpactResult, ConstellationResult,
 } from '../memory/graph-queries';
 import type { SurfaceId } from '../memory/guidance-drift';
 import { renderEvidenceFrame, type EvidenceFrameItem, type EvidenceFrameResult } from '../memory/evidence-frame';
@@ -238,6 +238,10 @@ export interface ProjectMemoryStub {
   implementingWork(projectId: string, input: { entityUri: string; maxDepth?: number; maxResults?: number }): Promise<ImplementingWorkResult>;
   decisionLineage(projectId: string, input: { decisionUri: string; maxDepth?: number; maxResults?: number }): Promise<DecisionLineageResult>;
   changeImpact(projectId: string, input: { entityUris: string[]; maxDepth?: number; maxResults?: number }): Promise<ChangeImpactResult>;
+  /** PLNR-284: the bounded, server-sampled whole-project projection behind the memory star map —
+   *  see memory/graph-queries.ts's `constellation` for the sampling rule, tie-break, and coverage
+   *  contract. Read-only, no input beyond the project id (no seed — this is the whole map). */
+  constellation(projectId: string): Promise<ConstellationResult>;
   /** PLNR-255: re-embed this project's memories/episodes into the operational search index and
    *  clear `project_memory_registry.vector_dirty` on success (Phase 4's fill-in of the Phase
    *  2/3 no-op hook). No-ops honestly when no embeddings backend is bound. */
