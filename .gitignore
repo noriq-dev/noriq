@@ -3,12 +3,17 @@ dist/
 .wrangler/
 .dev.vars
 .env
+# `.env` alone does NOT match `.env.prod`/`.env.staging` — these hold real ADMIN_TOKENs, so
+# match every suffixed variant explicitly rather than relying on the bare name.
+.env.*
+!.env.example
 *.local
 CLAUDE.local.md
 .DS_Store
 coverage/
 wrangler.production.jsonc
 wrangler.demo.jsonc
+wrangler.staging.jsonc
 # Provisional: the runner's local project marker. Revisit once the runner is ready —
 # the binding is meant to be committed (it's how a checkout names its Noriq project).
 .noriq/

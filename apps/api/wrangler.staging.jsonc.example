@@ -1,0 +1,109 @@
+// Staging instance config — a FULL-CAPABILITY duplicate of your production instance, on its own
+// worker/D1/DOs/R2/Vectorize, for verifying changes against real behaviour before prod.
+// Copy to wrangler.staging.jsonc (gitignored), fill in the ids, then:
+//   npm run deploy:staging --workspace @noriq-dev/api
+//
+// This is deliberately NOT wrangler.demo.jsonc. The demo config omits ai/vectorize/r2 and sets
+// DEMO_MODE=1 (resource lockdown + nightly reseed), so it CANNOT exercise semantic search,
+// attachments, backup/restore, repository indexing, or OAuth-connected agents — i.e. most of what
+// Project Memory is. Staging is the opposite posture: same bindings as prod, DEMO_MODE unset,
+// separate everything.
+//
+// WHAT MUST DIFFER FROM PRODUCTION, AND WHY
+//
+//  * `name` — Durable Object namespaces are created per worker SCRIPT. A different name is what
+//    gives staging its own ProjectRoom/ProjectMemory/AgentSession/RunnerHub instances. Sharing the
+//    name would put staging traffic on prod's DOs, which is unrecoverable, not just messy.
+//    (Note: namespace LABELS are minted from the worker name at creation and can never be renamed
+//    — cosmetic only. Never "fix" one with a deleted_classes migration; that wipes the storage.)
+//  * `database_id` — a fresh D1. Never point staging at prod's database.
+//  * `r2_buckets` — a separate bucket. Both the D1 snapshot (`backups/`) and every ProjectMemory
+//    portable snapshot (`memory-backups/<projectId>/`) live in the bucket bound as FILES, and the
+//    ops UI can trigger restore/erase against it. A shared bucket would let a staging operator
+//    action reach prod's only backups.
+//  * `vectorize` — separate indexes. Staging repository reindexing churns the code index
+//    constantly and `rebuildVectorIndex` deletes-then-reinserts; both would burn prod's index
+//    quota and mix staging vectors into prod retrieval.
+//  * NO `send_email` — staging must not be able to email real people. Invites degrade to
+//    copyable links (PLNR-115), which is what you want here anyway.
+//  * DEMO_MODE stays UNSET — staging should behave exactly like prod.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "noriq-staging",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Defaults to noriq-staging.workers.dev — no DNS work, and it is a real HTTPS origin, so
+  // OAuth/MCP (`claude mcp add`) and the runner daemon all work against it unchanged.
+  // For a custom hostname instead, uncomment and set PUBLIC_ORIGIN to match:
+  // "routes": [{ "pattern": "staging.example.com", "custom_domain": true }],
+
+  "vars": {
+    // Used for links in out-of-band notifications, where there is no request origin to read.
+    "PUBLIC_ORIGIN": "https://noriq-staging.<your-subdomain>.workers.dev"
+  },
+
+  "assets": {
+    "directory": "../web/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/mcp", "/mcp/*", "/ws", "/ws/*", "/oauth/*", "/.well-known/*", "/skill.md", "/skill/*", "/reference.md", "/reference.json"]
+  },
+
+  // All FIVE Durable Objects. PROJECT_MEMORY is REQUIRED (env.ts declares it non-optional, unlike
+  // the genuinely optional AI/VECTORIZE/FILES bindings): without it every memory path throws
+  // rather than degrading, so a config missing it is broken, not merely reduced.
+  "durable_objects": {
+    "bindings": [
+      { "name": "PROJECT_ROOM", "class_name": "ProjectRoom" },
+      { "name": "AGENT_SESSION", "class_name": "AgentSession" },
+      { "name": "RATE_LIMITER", "class_name": "RateLimiter" },
+      { "name": "RUNNER_HUB", "class_name": "RunnerHub" },
+      { "name": "PROJECT_MEMORY", "class_name": "ProjectMemory" }
+    ]
+  },
+  // Migration tags are per-worker and must stay append-only, in this order. A fresh worker still
+  // replays v1..v4 — that is how each class gets created — so never renumber or collapse them.
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ProjectRoom", "AgentSession"] },
+    { "tag": "v2", "new_sqlite_classes": ["RateLimiter"] },
+    { "tag": "v3", "new_sqlite_classes": ["RunnerHub"] },
+    { "tag": "v4", "new_sqlite_classes": ["ProjectMemory"] }
+  ],
+
+  //   npx wrangler d1 create noriq-staging
+  //   npm run db:migrate:staging --workspace @noriq-dev/api
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "noriq-staging",
+      "database_id": "REPLACE_WITH_noriq-staging_D1_ID",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  //   npx wrangler r2 bucket create noriq-staging-files
+  "r2_buckets": [{ "binding": "FILES", "bucket_name": "noriq-staging-files" }],
+
+  // Workers AI needs no provisioning. The two Vectorize indexes DO — and each needs its metadata
+  // indexes created before first use: an unprovisioned filter property passes every test against
+  // the in-memory fake but is rejected or silently ignored by a real index (see env.ts).
+  //   npx wrangler vectorize create noriq-staging-search --dimensions=1024 --metric=cosine
+  //   npx wrangler vectorize create-metadata-index noriq-staging-search --property-name=projectId --type=string
+  //   npx wrangler vectorize create noriq-staging-code --dimensions=1024 --metric=cosine
+  //   npx wrangler vectorize create-metadata-index noriq-staging-code --property-name=projectId --type=string
+  //   npx wrangler vectorize create-metadata-index noriq-staging-code --property-name=repositoryKey --type=string
+  //   npx wrangler vectorize create-metadata-index noriq-staging-code --property-name=generationId --type=string
+  "ai": { "binding": "AI" },
+  "vectorize": [
+    { "binding": "VECTORIZE", "index_name": "noriq-staging-search" },
+    { "binding": "CODE_VECTORIZE", "index_name": "noriq-staging-code" }
+  ],
+
+  // Daily D1 snapshot → R2 at 06:00 UTC. Worth keeping on staging: it is one of the mechanisms
+  // the Phase 8 operations UI drives, so leaving it enabled means you are testing the real thing.
+  "triggers": { "crons": ["0 6 * * *"] },
+
+  "observability": { "enabled": true }
+}

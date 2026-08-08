@@ -43,10 +43,22 @@ Deploy + migrations (production actions — only run when explicitly asked):
 ```sh
 npm run deploy                                    # build + wrangler deploy (uses wrangler.production.jsonc if present)
 npm run deploy:demo                               # build + deploy the DEMO_MODE instance (wrangler.demo.jsonc)
+npm run deploy:staging                            # build + deploy the full-capability staging instance (wrangler.staging.jsonc)
 npm run db:migrate:local --workspace @noriq-dev/api   # apply migrations to the local D1
 npm run db:migrate:remote --workspace @noriq-dev/api  # apply migrations to the REMOTE (prod) D1
 npm run db:migrate:demo --workspace @noriq-dev/api    # apply migrations to the demo instance's D1
+npm run db:migrate:staging --workspace @noriq-dev/api # apply migrations to the staging instance's D1
 ```
+
+**Staging is not the demo.** `wrangler.demo.jsonc` deliberately omits `ai`/`vectorize`/`r2` and sets
+`DEMO_MODE=1` (resource lockdown + nightly reseed), so it cannot exercise semantic search,
+attachments, backup/restore, repository indexing, or OAuth-connected agents. `wrangler.staging.jsonc`
+(see `wrangler.staging.jsonc.example`) is the opposite posture — prod's bindings, `DEMO_MODE` unset,
+separate worker/D1/R2/Vectorize. Every one of those must differ from prod: **DO namespaces are created
+per worker SCRIPT**, so a shared `name` puts staging traffic on prod's Durable Objects, and a shared
+`FILES` bucket lets a staging restore/erase reach prod's only backups (both `backups/` and
+`memory-backups/<projectId>/` live there). Note that after a deploy, an already-running Durable Object
+keeps serving OLD code until it restarts — a DO-backed path can lag a Worker-side path by a minute.
 
 ## Architecture
 

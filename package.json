@@ -16,7 +16,8 @@
     "test": "npm run test --workspaces --if-present",
     "test:hooks": "node --test hooks/*.test.mjs",
     "deploy": "npm run build && npm run deploy --workspace @noriq-dev/api",
-    "deploy:demo": "npm run build && npm run deploy:demo --workspace @noriq-dev/api"
+    "deploy:demo": "npm run build && npm run deploy:demo --workspace @noriq-dev/api",
+    "deploy:staging": "npm run build && npm run deploy:staging --workspace @noriq-dev/api"
   },
   "engines": {
     "node": ">=20"
