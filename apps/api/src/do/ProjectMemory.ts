@@ -2391,6 +2391,138 @@ export class ProjectMemory extends DurableObject<Env> {
     };
   }
 
+  /**
+   * PLNR-271: the human explorer's "what is this memory's lineage, and what has been said about
+   * it" read. Walks the `supersedes_memory_id` chain in BOTH directions from `memoryItemId` —
+   * ancestors (what this version corrected) and descendants (what corrected it, possibly more
+   * than one if two independent corrections were ever recorded) — so a human opening ANY version
+   * in a lineage sees the whole thread, not just one hop. Bounded (`MAX_CHAIN`) the same way
+   * every graph walk in this file is bounded (locked decision: never an unbounded traversal).
+   *
+   * Read-only: no memory_revision bump, no outbox row, same as the PLNR-255 hydration RPCs above.
+   * Returns `null` only when `memoryItemId` itself does not exist — every OTHER field is an
+   * empty array rather than an error, the same "absence is not a failure" posture the rest of
+   * this file uses (a memory with no transitions/contradictions/feedback is the common case, not
+   * a broken one).
+   */
+  async getMemoryHistory(
+    projectId: string,
+    memoryItemId: string,
+  ): Promise<{
+    versions: Array<{
+      id: string; kind: string; statement: string; authority: number; validity: string;
+      recordedByAgentId: string | null; recordedAt: string; proposedAt: string | null; rejectedAt: string | null;
+      supersedesMemoryId: string | null; supersededByMemoryId: string | null;
+    }>;
+    transitions: Array<{
+      id: string; memoryItemId: string; resultingMemoryId: string | null; outcome: string;
+      newAuthority: number | null; actorKind: string; actorId: string | null; revision: string | null;
+      note: string | null; createdAt: string;
+    }>;
+    contradictions: Array<{ setId: string; memoryItemIds: string[]; resolvedAt: string | null }>;
+    feedback: Array<{ id: string; actorId: string; vote: string; kind: string | null; reason: string | null; createdAt: string }>;
+  } | null> {
+    await this.assertProjectId(projectId);
+    const root = this.loadMemoryRow(memoryItemId);
+    if (!root) return null;
+
+    const MAX_CHAIN = 100;
+    const ids = new Set<string>([memoryItemId]);
+    const queue = [memoryItemId];
+    while (queue.length && ids.size < MAX_CHAIN) {
+      const cur = queue.shift()!;
+      const row = this.ctx.storage.sql.exec<{ supersedes_memory_id: string | null }>(
+        `SELECT supersedes_memory_id FROM memory_items WHERE id = ?1`, cur,
+      ).toArray()[0];
+      if (row?.supersedes_memory_id && !ids.has(row.supersedes_memory_id)) {
+        ids.add(row.supersedes_memory_id);
+        queue.push(row.supersedes_memory_id);
+      }
+      const children = this.ctx.storage.sql.exec<{ id: string }>(
+        `SELECT id FROM memory_items WHERE supersedes_memory_id = ?1`, cur,
+      ).toArray();
+      for (const ch of children) {
+        if (!ids.has(ch.id)) { ids.add(ch.id); queue.push(ch.id); }
+      }
+    }
+
+    const idList = [...ids];
+    const placeholders = idList.map((_, i) => `?${i + 1}`).join(',');
+    const versionRows = this.ctx.storage.sql
+      .exec<{
+        id: string; kind: string; statement: string; authority: number; validity: string;
+        recorded_by_agent_id: string | null; recorded_at: string; proposed_at: string | null;
+        rejected_at: string | null; supersedes_memory_id: string | null;
+      }>(
+        `SELECT id, kind, statement, authority, validity, recorded_by_agent_id, recorded_at, proposed_at, rejected_at, supersedes_memory_id
+         FROM memory_items WHERE id IN (${placeholders}) ORDER BY recorded_at`,
+        ...idList,
+      )
+      .toArray();
+    const supersededByOf = new Map<string, string>();
+    for (const v of versionRows) if (v.supersedes_memory_id) supersededByOf.set(v.supersedes_memory_id, v.id);
+    const versions = versionRows.map((v) => ({
+      id: v.id,
+      kind: v.kind,
+      statement: v.statement,
+      authority: v.authority,
+      validity: v.validity,
+      recordedByAgentId: v.recorded_by_agent_id,
+      recordedAt: v.recorded_at,
+      proposedAt: v.proposed_at,
+      rejectedAt: v.rejected_at,
+      supersedesMemoryId: v.supersedes_memory_id,
+      supersededByMemoryId: supersededByOf.get(v.id) ?? null,
+    }));
+
+    const transitions = this.ctx.storage.sql
+      .exec<{
+        id: string; memory_item_id: string; resulting_memory_id: string | null; outcome: string;
+        new_authority: number | null; actor_kind: string; actor_id: string | null; revision: string | null;
+        note: string | null; created_at: string;
+      }>(
+        `SELECT id, memory_item_id, resulting_memory_id, outcome, new_authority, actor_kind, actor_id, revision, note, created_at
+         FROM memory_authority_transitions WHERE memory_item_id IN (${placeholders}) OR resulting_memory_id IN (${placeholders})
+         ORDER BY created_at`,
+        ...idList,
+        ...idList,
+      )
+      .toArray()
+      .map((t) => ({
+        id: t.id,
+        memoryItemId: t.memory_item_id,
+        resultingMemoryId: t.resulting_memory_id,
+        outcome: t.outcome,
+        newAuthority: t.new_authority,
+        actorKind: t.actor_kind,
+        actorId: t.actor_id,
+        revision: t.revision,
+        note: t.note,
+        createdAt: t.created_at,
+      }));
+
+    const contradictionRows = this.ctx.storage.sql
+      .exec<{ set_id: string }>(
+        `SELECT DISTINCT set_id FROM contradictions WHERE memory_item_id IN (${placeholders}) OR contradicts_memory_item_id IN (${placeholders})`,
+        ...idList,
+        ...idList,
+      )
+      .toArray();
+    const contradictions = await Promise.all(
+      contradictionRows.map((r) => this.getContradictionSet(projectId, r.set_id)),
+    );
+
+    const feedback = this.ctx.storage.sql
+      .exec<{ id: string; actor_id: string; vote: string; kind: string | null; reason: string | null; created_at: string }>(
+        `SELECT id, actor_id, vote, kind, reason, created_at FROM feedback WHERE memory_item_id = ?1 ORDER BY created_at DESC`,
+        memoryItemId,
+      )
+      .toArray()
+      .map((f) => ({ id: f.id, actorId: f.actor_id, vote: f.vote, kind: f.kind, reason: f.reason, createdAt: f.created_at }));
+
+    return { versions, transitions, contradictions, feedback };
+  }
+
   // ---------------------------------------------------------------------------
   // Operational search integration (PLNR-255) — the two read RPCs search.ts's hydrate() and
   // keywordSearch() drive for memory/episode kinds. Both are read-only: no memory_revision

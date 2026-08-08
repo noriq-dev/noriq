@@ -16,6 +16,7 @@ import { CommandPalette } from './components/CommandPalette';
 import { RoadmapView } from './components/RoadmapView';
 import { AgentsView } from './components/AgentsView';
 import { RunsView } from './components/RunsView';
+import { MemoryView } from './components/MemoryView';
 import { ModalHost } from './components/modals';
 import { DialogHost } from './components/Dialog';
 import { SettingsView } from './components/SettingsView';
@@ -124,6 +125,7 @@ export function App() {
               {store.view === 'roadmap' && <RoadmapView store={store} />}
               {store.view === 'runs' && <RunsView store={store} />}
               {store.view === 'agents' && <AgentsView store={store} />}
+              {store.view === 'memory' && <MemoryView store={store} />}
             </>
           )}
         </div>

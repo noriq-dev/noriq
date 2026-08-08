@@ -246,6 +246,37 @@ export const api = {
   cancelPlanDispatch: (id: string, reason?: string) =>
     req<{ ok: boolean; cancelledRuns: number }>('POST', `/api/plan-dispatches/${id}/cancel`, { reason }),
   retryPlanDispatch: (id: string) => req<{ created: number }>('POST', `/api/plan-dispatches/${id}/retry`),
+
+  // --- Project Memory explorer (PLNR-271) — REST reads/writes the DO never exposes directly;
+  // the web app reaches it only through these routes (apps/api/src/index.ts ~line 1093+). ---
+  /** A dedicated reachability + size probe (PLNR-271's "unreachable, not empty" acceptance line):
+   *  callers use a failed promise here to distinguish "the memory store is down" from "it answered
+   *  with zero results." */
+  memoryHealth: (pid: string) => req<ApiMemoryHealth>('GET', `/api/projects/${pid}/memory/health`),
+  memoryRepositories: (pid: string) => req<{ repositories: ApiMemoryRepository[] }>('GET', `/api/projects/${pid}/memory/repositories`),
+  memoryItem: (pid: string, id: string) => req<ApiMemoryItem>('GET', `/api/projects/${pid}/memory/items/${id}`),
+  memoryHistory: (pid: string, id: string) => req<ApiMemoryHistory>('GET', `/api/projects/${pid}/memory/items/${id}/history`),
+  memoryContradictionSet: (pid: string, setId: string) =>
+    req<{ setId: string; memoryItemIds: string[]; resolvedAt: string | null }>('GET', `/api/projects/${pid}/memory/contradictions/${setId}`),
+  memorySearch: (pid: string, filters: ApiMemorySearchFilters) =>
+    req<ApiMemorySearchResult>('POST', `/api/projects/${pid}/memory/search`, filters),
+  /** Five-kind human feedback (§11, migration 0004) — influences ranking/presentation only;
+   *  never touches the target's statement, evidence, or authority. */
+  memoryFeedback: (pid: string, id: string, kind: ApiMemoryFeedbackKind, reason?: string) =>
+    req<{ feedbackId: string }>('POST', `/api/projects/${pid}/memory/items/${id}/feedback`, { kind, reason }),
+  /** Records a NEW version linked back via supersedesMemoryId — never edits the original in
+   *  place (locked decision: no destructive "edit memory" affordance exists in this UI). */
+  memoryCorrect: (pid: string, id: string, statement: string) =>
+    req<{ memoryId: string }>('POST', `/api/projects/${pid}/memory/items/${id}/correct`, { statement }),
+  memoryProposedDecisions: (pid: string) =>
+    req<{ decisions: Array<{ id: string; statement: string; authority: number; recordedByAgentId: string | null; recordedAt: string; proposedAt: string }> }>(
+      'GET', `/api/projects/${pid}/memory/proposed-decisions`,
+    ),
+  /** Authority 5 is reachable ONLY through this path (§12) — never a direct authority write. */
+  memoryApproveDecision: (pid: string, id: string, note?: string) =>
+    req<{ approvedMemoryId: string; transitionId: string }>('POST', `/api/projects/${pid}/memory/items/${id}/approve`, { note }),
+  memoryRejectDecision: (pid: string, id: string, note?: string) =>
+    req<{ ok: boolean; transitionId: string }>('POST', `/api/projects/${pid}/memory/items/${id}/reject`, { note }),
 };
 
 // Mirrors @noriq-dev/shared RunnerRepo / Runner / Run — kept as plain interfaces so
@@ -651,4 +682,149 @@ export interface ApiTaskDetail {
   tagIds: string[];
   /** Related project docs (PLNR-182). */
   docs: Array<{ id: string; name: string; description: string }>;
+}
+
+// --- Project Memory explorer (PLNR-271) — mirrors apps/api/src/{lib/project-memory.ts,
+// do/ProjectMemory.ts, memory/{retrieval,evidence-frame}.ts} response shapes exactly; kept as
+// plain interfaces (no zod) matching the rest of this file's convention. ---
+
+/** Mirrors ProjectMemoryHealth (apps/api/src/do/ProjectMemory.ts). */
+export interface ApiMemoryHealth {
+  projectId: string;
+  schemaVersion: number;
+  memoryRevision: number;
+  tableCounts: Record<string, number>;
+  databaseSize: number;
+  sizeStatus: 'ok' | 'warn' | 'critical';
+}
+
+/** Mirrors ProjectRepositoryRow + its checkouts (GET /memory/repositories). */
+export interface ApiMemoryRepository {
+  id: string;
+  projectId: string;
+  repositoryKey: string;
+  indexingEnabled: boolean;
+  ingestStatus: 'none' | 'staged' | 'active' | 'failed';
+  defaultBranch: string | null;
+  vcsKind: string | null;
+  branchClasses: string[];
+  latestObservedBase: string | null;
+  activeGenerationId: string | null;
+  createdAt: string;
+  updatedAt: string | null;
+  checkouts: Array<{ id: string; projectRepositoryId: string; runnerId: string; checkoutId: string; createdAt: string; updatedAt: string }>;
+}
+
+/** Mirrors memory/retrieval.ts's RankedHit — the shape every /memory/search result carries.
+ *  `isLead`/`leadReasons`/`authority`/`validity` are the server's OWN classification
+ *  (`classifyLead`) — this view displays them and computes none of it itself (locked decision). */
+export interface ApiMemoryHit {
+  entityType: 'memory' | 'episode' | 'node';
+  id: string;
+  uri?: string;
+  kind?: string;
+  title: string;
+  snippet: string;
+  stage: 'exact' | 'lexical' | 'semantic' | 'graph';
+  score: number;
+  repositoryKey?: string | null;
+  branch?: string | null;
+  authority?: number;
+  validity?: string;
+  status?: string;
+  evidenceVerification?: string[];
+  evidenceVerifiedForCaller?: boolean[];
+  seedNodeId?: string;
+  edgePath?: string;
+  depth?: number;
+  isLead: boolean;
+  leadReasons: string[];
+  finalScore: number;
+}
+
+/** Mirrors memory/evidence-frame.ts's EvidenceFrameResult — the ONE bounded, quoted-evidence
+ *  rendering of untrusted memory/episode text (§13). Never re-rendered client-side: `text` is
+ *  shown verbatim, including any "SUSPICIOUS" label the server attached. */
+export interface ApiMemoryEvidenceFrame {
+  text: string;
+  itemsIncluded: number;
+  itemsOmitted: number;
+  truncated: boolean;
+  charsUsed: number;
+  suspiciousCount: number;
+}
+
+export interface ApiMemorySearchFilters {
+  query?: string;
+  memoryItemId?: string;
+  episodeId?: string;
+  taskId?: string;
+  seedEntityUri?: string;
+  edgeTypes?: string[];
+  maxDepth?: number;
+  repositoryKey?: string;
+  branch?: string;
+  kind?: string;
+  minAuthority?: number;
+  validity?: string;
+  limit?: number;
+}
+
+export interface ApiMemorySearchResult {
+  mode: 'semantic' | 'keyword';
+  results: ApiMemoryHit[];
+  /** PLNR-271: the REST twin now renders the SAME evidence frame the search_project_memory MCP
+   *  tool has since PLNR-270 (see index.ts's /memory/search route comment) — one bounded block
+   *  covering every memory/episode hit in `results`. Passing ONLY `memoryItemId` in the request
+   *  yields a single-item frame, which is how the inspector gets one memory's quoted statement. */
+  evidenceFrame: ApiMemoryEvidenceFrame;
+}
+
+/** Mirrors MemoryItemRecord (apps/api/src/lib/project-memory.ts) — GET /memory/items/:id. */
+export interface ApiMemoryItem {
+  id: string;
+  kind: string;
+  statement: string;
+  authority: number;
+  confidence: number | null;
+  contentHash: string | null;
+  repositoryKey: string | null;
+  branch: string | null;
+  baseId: string | null;
+  validity: string;
+  supersedesMemoryId: string | null;
+  recordedByAgentId: string | null;
+  recordedAt: string;
+  proposedAt: string | null;
+  rejectedAt: string | null;
+  evidence: Array<{
+    id: string; repositoryKey: string; branch: string; baseId: string; path: string; symbol: string | null;
+    verificationState: 'valid' | 'moved' | 'changed' | 'missing' | 'unverifiable';
+    evidenceHash: string | null;
+    lastVerifiedAt: string | null;
+    lastVerifiedBaseId: string | null;
+    lastVerifiedBranch: string | null;
+    verificationSource: string | null;
+    observedPath: string | null;
+  }>;
+}
+
+export type ApiMemoryFeedbackKind = 'useful' | 'incorrect' | 'outdated' | 'harmful' | 'unverifiable';
+
+/** Mirrors ProjectMemory.getMemoryHistory's return (GET /memory/items/:id/history) — a memory's
+ *  full lineage in both directions of supersedes_memory_id, its authority transitions, the
+ *  contradiction sets it participates in, and its own feedback. */
+export interface ApiMemoryHistory {
+  versions: Array<{
+    id: string; kind: string; statement: string; authority: number; validity: string;
+    recordedByAgentId: string | null; recordedAt: string; proposedAt: string | null; rejectedAt: string | null;
+    supersedesMemoryId: string | null; supersededByMemoryId: string | null;
+  }>;
+  transitions: Array<{
+    id: string; memoryItemId: string; resultingMemoryId: string | null; outcome: 'approved' | 'rejected' | 'merge_promoted';
+    newAuthority: number | null; actorKind: string; actorId: string | null; revision: string | null;
+    note: string | null; createdAt: string;
+  }>;
+  contradictions: Array<{ setId: string; memoryItemIds: string[]; resolvedAt: string | null }>;
+  feedback: Array<{ id: string; actorId: string; vote: string; kind: ApiMemoryFeedbackKind | null; reason: string | null; createdAt: string }>;
 }

@@ -17,12 +17,12 @@ import {
 } from './lib/visibility';
 import { taskSearchFilters } from './lib/search';
 import { ExecutionSpec, type ExecutionSpecInput, MemoryKind, MemoryEdgeType, EvidenceRef, ContextPackRole } from '@noriq-dev/shared';
-import { RETRIEVAL_DEFAULTS, type RankedHit } from './memory/retrieval';
+import { RETRIEVAL_DEFAULTS } from './memory/retrieval';
 import { assembleContextPack } from './memory/context-pack';
 import { renderEvidenceFrame, type EvidenceFrameItem } from './memory/evidence-frame';
 import { readExecutionSpec } from './lib/execution-spec';
 import type { ProjectMemoryStub } from './lib/project-memory';
-import { loadPriorEffort } from './lib/project-memory';
+import { loadPriorEffort, searchHitToEvidenceItem } from './lib/project-memory';
 import { refuseSpecWrite, specWriteRefusalMessage } from './lib/spec-authority';
 import { search, searchBackend, reindexProject } from './search';
 import { nearDupeGroups } from './lib/tags';
@@ -2150,35 +2150,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
   );
 
   // ---- project memory retrieval (PLNR-257) --------------------------------
-
-  // PLNR-270 (§13): a memory/episode hit's `snippet` is untrusted prose the same way a context
-  // pack's `statement` is — a graph/'node' hit carries no authored prose of its own (its `snippet`
-  // mirrors a structural node label, never agent-recorded text) and is deliberately excluded here.
-  // Citations are lighter than a context pack's (this endpoint returns ranked hits, not full
-  // canonical rows) — `repositoryKey`/`branch` are the hit's own scope fields, `path`/`symbol` are
-  // not carried on a `RankedHit` at all, so they read `null` rather than being fabricated.
-  function searchHitToEvidenceItem(hit: RankedHit): EvidenceFrameItem | null {
-    if (hit.entityType !== 'memory' && hit.entityType !== 'episode') return null;
-    const citations = hit.evidenceVerification?.map((state, i) => ({
-      repositoryKey: hit.repositoryKey ?? null,
-      branch: hit.branch ?? null,
-      baseId: null,
-      path: null,
-      symbol: null,
-      verificationState: state,
-      verifiedForCaller: hit.evidenceVerifiedForCaller?.[i] ?? null,
-    }));
-    return {
-      id: hit.id,
-      label: hit.kind ?? hit.entityType,
-      text: hit.snippet,
-      authority: hit.authority ?? null,
-      validity: hit.validity ?? null,
-      isLead: hit.isLead,
-      leadReasons: hit.leadReasons,
-      citations,
-    };
-  }
+  // searchHitToEvidenceItem moved to lib/project-memory.ts (PLNR-271) so the REST search twin
+  // can render the same evidence frame — see its own doc comment.
 
   defineTool(
     'search_project_memory',

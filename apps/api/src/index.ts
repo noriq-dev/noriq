@@ -28,7 +28,8 @@ import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
 import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
 import { z } from 'zod';
-import { listProjectRepositories, listRepositoryCheckouts, resolveRepositoryByKey, loadPriorEffort, type ProjectMemoryStub } from './lib/project-memory';
+import { listProjectRepositories, listRepositoryCheckouts, resolveRepositoryByKey, loadPriorEffort, searchHitToEvidenceItem, type ProjectMemoryStub } from './lib/project-memory';
+import { renderEvidenceFrame, type EvidenceFrameItem } from './memory/evidence-frame';
 import { assembleContextPack } from './memory/context-pack';
 import { readBoundedBody, verifyBatchChecksum, decodeBatchRows, MAX_INGEST_BATCH_BYTES, INGEST_TOKEN_TTL_SECONDS } from './memory/ingest';
 import { normalizeVerificationReport } from './memory/verification';
@@ -1117,6 +1118,12 @@ app.get('/api/projects/:pid/memory/contradictions/:setId', userAuth, async (c) =
 // Hybrid memory retrieval (PLNR-257) — the human-facing twin of the search_project_memory MCP
 // tool; same DO RPC, same result shape. POST (not GET) because the filter set is a body, not a
 // couple of query params, matching /api/projects/:pid/ask's shape.
+//
+// PLNR-271/§13: the MCP tool has rendered its hits through `renderEvidenceFrame` since PLNR-270
+// (a human reading agent-recorded memory is still reading untrusted content — §13 draws no
+// human/agent line); this REST twin did not carry the same `evidenceFrame` until the Project
+// Memory explorer needed it. `searchHitToEvidenceItem` now lives in lib/project-memory.ts
+// precisely so both callers render the identical frame rather than the explorer growing its own.
 app.post('/api/projects/:pid/memory/search', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
   const body = await c.req.json<{
@@ -1124,7 +1131,9 @@ app.post('/api/projects/:pid/memory/search', userAuth, async (c) => {
     edgeTypes?: string[]; maxDepth?: number; repositoryKey?: string; branch?: string; kind?: string;
     minAuthority?: number; validity?: string; limit?: number;
   }>().catch(() => ({}) as Record<string, never>);
-  return c.json(await memoryStub(c.env, pid).searchProjectMemory(pid, body));
+  const result = await memoryStub(c.env, pid).searchProjectMemory(pid, body);
+  const evidenceItems = result.results.map(searchHitToEvidenceItem).filter((i): i is EvidenceFrameItem => i !== null);
+  return c.json({ ...result, evidenceFrame: renderEvidenceFrame(evidenceItems) });
 });
 
 // Similar-effort retrieval (PLNR-264) — the human-facing twin of the priorEffort block
@@ -1219,6 +1228,60 @@ app.post('/api/projects/:pid/memory/items/:id/reject', userAuth, async (c) => {
   return c.json(
     await memoryStub(c.env, pid).rejectDecision(pid, { memoryItemId: c.req.param('id')!, actorUserId: c.var.user!.id, note: body.note ?? null }),
   );
+});
+
+// Memory lineage (PLNR-271) — the human explorer's version/authority-transition/contradiction/
+// feedback read for ONE memory item. Same DO RPC output whether `:id` names the root, a middle
+// correction, or the latest version — getMemoryHistory walks supersedes_memory_id both ways.
+app.get('/api/projects/:pid/memory/items/:id/history', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const history = await memoryStub(c.env, pid).getMemoryHistory(pid, c.req.param('id')!);
+  if (!history) return c.json({ error: 'not found' }, 404);
+  return c.json(history);
+});
+
+// Human feedback (PLNR-271, §11) — an operation on the memory surface, not an edit: the five-kind
+// vocabulary (migration 0004) via the SAME recordFeedback RPC record_memory's op="feedback" uses.
+app.post('/api/projects/:pid/memory/items/:id/feedback', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const body = await c.req.json<{ kind?: 'useful' | 'incorrect' | 'outdated' | 'harmful' | 'unverifiable'; reason?: string }>()
+    .catch(() => ({}) as Record<string, never>);
+  if (!body.kind) return c.json({ error: 'kind required' }, 400);
+  return c.json(
+    await memoryStub(c.env, pid).recordFeedback(pid, {
+      memoryItemId: c.req.param('id')!,
+      kind: body.kind,
+      reason: body.reason ?? null,
+      actor: { kind: 'human', id: c.var.user!.id },
+    }),
+  );
+});
+
+// Human correction (PLNR-271, §12) — records a NEW version linked back via supersedesMemoryId;
+// never edits the original in place. `authority` is deliberately never forwarded: recordMemory's
+// clampAuthority only restricts actor.kind==='agent', so leaving it unset is what keeps a human
+// correction landing at the same low default an unspecified agent write gets — authority 5 stays
+// reachable ONLY through /approve (locked decision: nothing here sets an authority directly).
+// `kind`/scope are copied from the memory being corrected so the new version stays comparable.
+app.post('/api/projects/:pid/memory/items/:id/correct', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const body = await c.req.json<{ statement?: string }>().catch(() => ({}) as { statement?: string });
+  const statement = body.statement?.trim();
+  if (!statement) return c.json({ error: 'statement required' }, 400);
+  const original = await memoryStub(c.env, pid).getMemoryItem(pid, c.req.param('id')!);
+  if (!original) return c.json({ error: 'not found' }, 404);
+  const scope: { repositoryKey?: string; branch?: string; baseId?: string } = {};
+  if (original.repositoryKey) scope.repositoryKey = original.repositoryKey;
+  if (original.branch) scope.branch = original.branch;
+  if (original.baseId) scope.baseId = original.baseId;
+  const result = await memoryStub(c.env, pid).recordMemory(pid, {
+    kind: original.kind,
+    statement,
+    supersedesMemoryId: original.id,
+    scope,
+    actor: { kind: 'human', id: c.var.user!.id },
+  });
+  return c.json(result);
 });
 
 // Guidance-drift scanning (PLNR-266) — admin-only, same trailing-:projectId shape as

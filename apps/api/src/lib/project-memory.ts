@@ -113,9 +113,41 @@ export interface ProjectMemoryStub {
   ): Promise<{ setId: string; contradictionId: string; operationId: string; deduped: boolean }>;
   recordFeedback(
     projectId: string,
-    input: { operationId?: string; memoryItemId: string; vote: 'up' | 'down'; reason?: string | null; actor: MemoryActorRef },
+    input: {
+      operationId?: string;
+      memoryItemId: string;
+      /** At least one of vote/kind is required (the DO derives the missing one) — widened here
+       *  (PLNR-271) so the human REST feedback control can send the five-kind vocabulary
+       *  (useful/incorrect/outdated/harmful/unverifiable, migration 0004) directly rather than
+       *  pre-deriving up/down itself and duplicating `FEEDBACK_KIND_VOTE`. */
+      vote?: 'up' | 'down';
+      kind?: 'useful' | 'incorrect' | 'outdated' | 'harmful' | 'unverifiable';
+      reason?: string | null;
+      actor: MemoryActorRef;
+    },
   ): Promise<{ feedbackId: string; operationId: string; deduped: boolean }>;
   getMemoryItem(projectId: string, memoryId: string): Promise<MemoryItemRecord | null>;
+  /** PLNR-271: a memory's full lineage (both directions of the `supersedes_memory_id` chain),
+   *  its authority transitions, the contradiction sets it participates in, and its own feedback —
+   *  the human explorer's "why does this exist, what replaced/contradicts it" read. `null` only
+   *  when `memoryItemId` itself does not exist. */
+  getMemoryHistory(
+    projectId: string,
+    memoryItemId: string,
+  ): Promise<{
+    versions: Array<{
+      id: string; kind: string; statement: string; authority: number; validity: string;
+      recordedByAgentId: string | null; recordedAt: string; proposedAt: string | null; rejectedAt: string | null;
+      supersedesMemoryId: string | null; supersededByMemoryId: string | null;
+    }>;
+    transitions: Array<{
+      id: string; memoryItemId: string; resultingMemoryId: string | null; outcome: string;
+      newAuthority: number | null; actorKind: string; actorId: string | null; revision: string | null;
+      note: string | null; createdAt: string;
+    }>;
+    contradictions: Array<{ setId: string; memoryItemIds: string[]; resolvedAt: string | null }>;
+    feedback: Array<{ id: string; actorId: string; vote: string; kind: string | null; reason: string | null; createdAt: string }>;
+  } | null>;
   getContradictionSet(projectId: string, setId: string): Promise<{ setId: string; memoryItemIds: string[]; resolvedAt: string | null }>;
   listProposedDecisions(
     projectId: string,
@@ -248,6 +280,43 @@ export async function projectMemory(env: Env, userId: string, projectId: string)
     throw new Error(`project ${projectId} not found`);
   }
   return env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)) as unknown as ProjectMemoryStub;
+}
+
+/**
+ * PLNR-270 (§13): a memory/episode hit's `snippet` is untrusted prose the same way a context
+ * pack's `statement` is — a graph/'node' hit carries no authored prose of its own (its `snippet`
+ * mirrors a structural node label, never agent-recorded text) and is deliberately excluded here.
+ * Citations are lighter than a context pack's (a `RankedHit` is a ranked search hit, not a full
+ * canonical row) — `repositoryKey`/`branch` are the hit's own scope fields, `path`/`symbol` are
+ * not carried on a `RankedHit` at all, so they read `null` rather than being fabricated.
+ *
+ * Exported here (moved from mcp.ts, PLNR-271) so BOTH `search_project_memory` (the agent-facing
+ * MCP tool) and `/api/projects/:pid/memory/search` (the human-facing REST twin) render the exact
+ * same hits through the exact same quoted-evidence frame — a human reading agent-recorded memory
+ * is still reading untrusted content (§13 draws no human/agent line), so the REST route gets the
+ * same `evidenceFrame` treatment the MCP tool has had since PLNR-270, not a second hand-rolled one.
+ */
+export function searchHitToEvidenceItem(hit: RankedHit): EvidenceFrameItem | null {
+  if (hit.entityType !== 'memory' && hit.entityType !== 'episode') return null;
+  const citations = hit.evidenceVerification?.map((state, i) => ({
+    repositoryKey: hit.repositoryKey ?? null,
+    branch: hit.branch ?? null,
+    baseId: null,
+    path: null,
+    symbol: null,
+    verificationState: state,
+    verifiedForCaller: hit.evidenceVerifiedForCaller?.[i] ?? null,
+  }));
+  return {
+    id: hit.id,
+    label: hit.kind ?? hit.entityType,
+    text: hit.snippet,
+    authority: hit.authority ?? null,
+    validity: hit.validity ?? null,
+    isLead: hit.isLead,
+    leadReasons: hit.leadReasons,
+    citations,
+  };
 }
 
 export type SimilarEffortResult = { warnings: DuplicateWarning[]; summary: EffortSummary; consideredCount: number };
