@@ -10,6 +10,7 @@ import type {
   DependencyNeighborhoodResult, ValidatingTestsResult, ImplementingWorkResult, DecisionLineageResult, ChangeImpactResult,
 } from '../memory/graph-queries';
 import type { SurfaceId } from '../memory/guidance-drift';
+import { renderEvidenceFrame, type EvidenceFrameItem, type EvidenceFrameResult } from '../memory/evidence-frame';
 import { userCanAccessProject } from './visibility';
 import { readExecutionSpec } from './execution-spec';
 
@@ -251,23 +252,51 @@ export async function projectMemory(env: Env, userId: string, projectId: string)
 
 export type SimilarEffortResult = { warnings: DuplicateWarning[]; summary: EffortSummary; consideredCount: number };
 
+// PLNR-270 (§13): `whatWasAttempted`/`whatFailed`/`whatRemainsUncertain` are past-agent prose —
+// untrusted the same way a memory statement is — and `priorEffort` hands them to an agent at the
+// MOMENT it starts work, before anything else. Mirrors `context-pack.ts`'s
+// `episodeExcerptToEvidenceItem` (the SAME `DuplicateWarning` shape, produced by the SAME
+// `ProjectMemory.similarEffort` RPC) as its own small adapter rather than a shared export: the two
+// call sites key episodes differently (`id` vs `episodeId`) and a shared helper would need to
+// bridge that for no real savings. `renderEvidenceFrame` itself is NOT reimplemented here — same
+// renderer, imported, same as every other surface.
+function duplicateWarningToEvidenceItem(w: DuplicateWarning): EvidenceFrameItem {
+  const parts = [w.whatWasAttempted];
+  if (w.whatFailed.length) parts.push(`What failed:\n- ${w.whatFailed.join('\n- ')}`);
+  if (w.whatRemainsUncertain.length) parts.push(`Remains uncertain:\n- ${w.whatRemainsUncertain.join('\n- ')}`);
+  if (w.support.length) parts.push(`Support:\n${w.support.map((s) => `- ${s.kind}: ${s.detail}`).join('\n')}`);
+  return {
+    id: w.episodeId,
+    label: 'episode',
+    text: `outcome: ${w.outcome} (landing: ${w.landingOutcome})\n\n${parts.join('\n\n')}`,
+  };
+}
+
 /**
  * PLNR-264: the ONE place `can_claim`/`claim_task` (mcp.ts) and the human REST twin (index.ts)
  * call into `ProjectMemory.similarEffort` — so the two surfaces can't drift on how a task's
  * title/body/anticipatedFiles become the RPC's input. Never throws: a memory failure (the DO
  * unreachable, a malformed stored execution spec) degrades to `null` — "no priorEffort block" —
  * per this task's own locked decision that memory retrieval must never touch a claim (§19).
+ *
+ * PLNR-270: `evidenceFrame` is ADDITIVE, same pattern as `assembleContextPack`/
+ * `assembleProjectMemoryPulse`/`search_project_memory` — the raw `warnings[]` fields stay in
+ * place for programmatic/UI inspection (a `support` entry's `detail` is genuinely useful to show
+ * structured), but a caller building an agent-facing PROMPT should read `evidenceFrame`, never the
+ * raw text fields, as the untrusted-content presentation.
  */
 export async function loadPriorEffort(
   env: Env,
   projectId: string,
   task: { id: string; title: string; body: string | null; executionSpec: string | null },
-): Promise<SimilarEffortResult | null> {
+): Promise<(SimilarEffortResult & { evidenceFrame: EvidenceFrameResult }) | null> {
   try {
     const stored = readExecutionSpec(task.executionSpec, task.id);
     const anticipatedFiles = stored.spec?.anticipatedFiles?.map((f) => f.path) ?? [];
     const stub = env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)) as unknown as ProjectMemoryStub;
-    return await stub.similarEffort(projectId, { taskId: task.id, title: task.title, body: task.body, anticipatedFiles });
+    const result = await stub.similarEffort(projectId, { taskId: task.id, title: task.title, body: task.body, anticipatedFiles });
+    const evidenceFrame = renderEvidenceFrame(result.warnings.map(duplicateWarningToEvidenceItem));
+    return { ...result, evidenceFrame };
   } catch (err) {
     console.warn(`similarEffort lookup failed for task ${task.id} in project ${projectId}: ${String(err)}`);
     return null;
