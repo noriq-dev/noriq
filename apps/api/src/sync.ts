@@ -6,6 +6,7 @@ import { nowIso } from './lib/util';
 import { allocateBudget, fillGreedy, type SectionSpec } from './memory/context-pack';
 import { classifyLead } from './memory/retrieval';
 import { verifiedForBase, type CallerBaseScope } from './memory/verification';
+import { renderEvidenceFrame, type EvidenceFrameItem, type EvidenceFrameResult } from './memory/evidence-frame';
 import type {
   AuthorityLevel,
   ContextPackCitation,
@@ -444,7 +445,33 @@ function toMemoryExcerpt(row: MemoryItemRecord): ContextPackMemoryExcerpt {
  * skipped if the ProjectMemory call fails", read here as one predictable degrade-together unit
  * rather than a partially-degraded one a client would have to reason about field by field).
  */
-export async function assembleProjectMemoryPulse(env: Env, projectId: string, agentId: string): Promise<ProjectMemoryPulse | null> {
+function memoryExcerptToEvidenceItem(e: ContextPackMemoryExcerpt): EvidenceFrameItem {
+  return {
+    id: e.id,
+    label: e.memoryKind,
+    text: e.statement,
+    authority: e.authority,
+    confidence: e.confidence,
+    validity: e.validity,
+    isLead: e.isLead,
+    leadReasons: e.leadReasons,
+    citations: e.evidence.map((c) => ({
+      repositoryKey: c.repositoryKey, branch: c.branch, baseId: c.baseId, path: c.path, symbol: c.symbol,
+      verificationState: c.verificationState, verifiedForCaller: c.verifiedForCaller,
+    })),
+    recordedAt: e.recordedAt,
+    recordedByAgentId: e.recordedByAgentId,
+  };
+}
+
+function staleWarningToEvidenceItem(w: ProjectMemoryStaleWarning): EvidenceFrameItem | null {
+  if (w.statement == null) return null; // nothing untrusted to frame — the item degrades, not fails
+  return { id: w.memoryItemId, label: w.kind ? `${w.kind}_stale_warning` : 'stale_warning', text: w.statement, validity: w.validity };
+}
+
+export async function assembleProjectMemoryPulse(
+  env: Env, projectId: string, agentId: string,
+): Promise<(ProjectMemoryPulse & { evidenceFrame: EvidenceFrameResult }) | null> {
   try {
     const stub = env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)) as unknown as ProjectMemoryStub;
 
@@ -555,6 +582,24 @@ export async function assembleProjectMemoryPulse(env: Env, projectId: string, ag
     const activeNearbyWork = fit('active_nearby_work', activeNearbyWorkRows);
     const recentChangesFit = fit('recent_changes', recentChanges);
 
+    // PLNR-270 (§13, locked decision): the same ONE renderer context-pack.ts uses, applied to
+    // every prose-bearing bucket this pulse carries — active decisions/hazards/unresolved unknowns
+    // (full ContextPackMemoryExcerpts, same shape get_task_context renders) plus stale-warning
+    // statements (a lighter shape with no citations/authority of its own, still untrusted text —
+    // `staleWarningToEvidenceItem` degrades a `null` statement to "nothing to frame" rather than
+    // failing). `recentChanges`/`activeNearbyWork` carry no free-form authored prose (compact
+    // metadata and a plain D1 coordination read respectively — see their own doc comments) and are
+    // therefore not wrapped. Budgeted independently of `charBudget`/`charsUsed` above (its own,
+    // separate untrusted-content budget) — exhausting it can shrink or empty this ONE field; it has
+    // no path back into the sections already built above.
+    const evidenceItems: EvidenceFrameItem[] = [
+      ...activeDecisions.map(memoryExcerptToEvidenceItem),
+      ...knownHazards.map(memoryExcerptToEvidenceItem),
+      ...unresolvedUnknowns.map(memoryExcerptToEvidenceItem),
+      ...staleWarnings.map(staleWarningToEvidenceItem).filter((i): i is EvidenceFrameItem => i !== null),
+    ];
+    const evidenceFrame = renderEvidenceFrame(evidenceItems);
+
     return {
       projectId,
       generatedAt: nowIso(),
@@ -567,6 +612,7 @@ export async function assembleProjectMemoryPulse(env: Env, projectId: string, ag
       activeNearbyWork,
       recentChanges: recentChangesFit,
       notices,
+      evidenceFrame,
     };
   } catch (err) {
     console.warn(`assembleProjectMemoryPulse failed for project ${projectId}: ${String(err)}`);

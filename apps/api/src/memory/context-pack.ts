@@ -28,6 +28,7 @@ import type { ProjectMemoryStub } from '../lib/project-memory';
 import { RETRIEVAL_DEFAULTS, type RankedHit, type RetrievalStage } from './retrieval';
 import { effortSignals } from './similar-effort';
 import { verifiedForBase, type CallerBaseScope } from './verification';
+import { renderEvidenceFrame, type EvidenceFrameItem, type EvidenceFrameResult } from './evidence-frame';
 import {
   buildEntityUri,
   type ContextPack,
@@ -295,7 +296,9 @@ interface OpenCommentRow {
  * Assembling a pack changes no memory row, no validity, no verification state, and emits no
  * outbox event.
  */
-export async function assembleContextPack(env: Env, projectId: string, taskId: string, input: ContextPackInput = {}): Promise<ContextPack> {
+export async function assembleContextPack(
+  env: Env, projectId: string, taskId: string, input: ContextPackInput = {},
+): Promise<ContextPack & { evidenceFrame: EvidenceFrameResult }> {
   const stub = env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)) as unknown as ProjectMemoryStub;
   const role: ContextPackRole = input.role ?? 'human';
   const caller: CallerBaseScope = { baseId: input.baseId ?? null, branch: input.branch ?? null };
@@ -677,5 +680,88 @@ export async function assembleContextPack(env: Env, projectId: string, taskId: s
     sections,
     notices: packNotices,
   };
-  return pack;
+  // PLNR-270 (§13, locked decision — "ONE renderer, no surface hand-rolls its own framing"): the
+  // pack's structured fields above are unchanged (PLNR-267's own comment on `ContextPackMemoryExcerpt`
+  // calls them "the structured seam" this task wraps, deliberately not pre-flattened into prose —
+  // the UI explorer and REST twin still want raw, addressable fields). `evidenceFrame` is the
+  // ADDITIVE agent-facing presentation: every decision/hazard/failed-approach/relevant-memory/
+  // episode/uncertainty item, quoted, labelled, and budgeted SEPARATELY from everything above —
+  // exhausting it can shrink or empty this one field; it has no path to `taskFacts` or any
+  // section's own already-computed content, because it is built AFTER, and only reads, this pack.
+  const evidenceFrame = renderEvidenceFrame(collectContextPackEvidenceItems(pack));
+  return { ...pack, evidenceFrame };
+}
+
+// ---------------------------------------------------------------------------------------------
+// PLNR-270: gather every section that carries agent- or repository-authored prose for
+// `renderEvidenceFrame` (§13). Deliberately excludes `source_excerpts` (a de-duplicated ROLLUP of
+// excerpts already rendered from their OWN section above — rendering it too would show the same
+// evidence twice) and the graph/test/neighboring-work sections (structural facts — uri/type/label
+// triples from the coordination or code graph, not free-form authored prose; see this task's own
+// discretion note on repository-derived text).
+// ---------------------------------------------------------------------------------------------
+
+function memoryExcerptToEvidenceItem(e: ContextPackMemoryExcerpt): EvidenceFrameItem {
+  return {
+    id: e.id,
+    label: e.memoryKind,
+    text: e.statement,
+    authority: e.authority,
+    confidence: e.confidence,
+    validity: e.validity,
+    isLead: e.isLead,
+    leadReasons: e.leadReasons,
+    citations: e.evidence.map((c) => ({
+      repositoryKey: c.repositoryKey, branch: c.branch, baseId: c.baseId, path: c.path, symbol: c.symbol,
+      verificationState: c.verificationState, verifiedForCaller: c.verifiedForCaller,
+    })),
+    recordedAt: e.recordedAt,
+    recordedByAgentId: e.recordedByAgentId,
+  };
+}
+
+function episodeExcerptToEvidenceItem(e: ContextPackEpisodeExcerpt): EvidenceFrameItem {
+  // Episodes carry no authority/validity of their own (§14 — a structurally different vocabulary
+  // than memory's §12 scale) — every self-authored field (whatWasAttempted/whatFailed/
+  // whatRemainsUncertain/support[].detail) is untrusted the same way a memory statement is (§13),
+  // so it all goes inside the ONE quoted body rather than being split across renderer-owned lines
+  // that don't exist for episodes.
+  const parts = [e.whatWasAttempted];
+  if (e.whatFailed.length) parts.push(`What failed:\n- ${e.whatFailed.join('\n- ')}`);
+  if (e.whatRemainsUncertain.length) parts.push(`Remains uncertain:\n- ${e.whatRemainsUncertain.join('\n- ')}`);
+  if (e.support.length) parts.push(`Support:\n${e.support.map((s) => `- ${s.kind}: ${s.detail}`).join('\n')}`);
+  return {
+    id: e.id,
+    label: 'episode',
+    text: `outcome: ${e.outcome} (landing: ${e.landingOutcome})\n\n${parts.join('\n\n')}`,
+  };
+}
+
+/** Pure function of an already-assembled pack (locked decision: reads values the sections already
+ *  computed — authority, validity, lead reasons, verification — never re-derives them). Exported
+ *  so the adversarial test suite can drive it directly with hand-built packs, without a DO. */
+export function collectContextPackEvidenceItems(pack: ContextPack): EvidenceFrameItem[] {
+  const items: EvidenceFrameItem[] = [];
+  const memorySectionIds: ContextPackSectionId[] = ['active_decisions', 'known_hazards', 'failed_approaches', 'relevant_memories'];
+  for (const sectionId of memorySectionIds) {
+    const section = pack.sections.find((s) => s.id === sectionId);
+    for (const e of section?.excerpts ?? []) {
+      if (e.excerptKind === 'memory') items.push(memoryExcerptToEvidenceItem(e));
+    }
+  }
+  const episodes = pack.sections.find((s) => s.id === 'similar_episodes');
+  for (const e of episodes?.excerpts ?? []) {
+    if (e.excerptKind === 'episode') items.push(episodeExcerptToEvidenceItem(e));
+  }
+  const uncertainty = pack.sections.find((s) => s.id === 'uncertainty');
+  for (const e of uncertainty?.excerpts ?? []) {
+    if (e.excerptKind === 'memory') items.push(memoryExcerptToEvidenceItem(e));
+  }
+  for (const rawItem of uncertainty?.items ?? []) {
+    const question = typeof rawItem.question === 'string' ? rawItem.question : null;
+    if (question == null) continue; // a shape this section never actually produces beyond {question, source} — degrade, don't fail
+    const source = typeof rawItem.source === 'string' ? rawItem.source : 'a prior episode';
+    items.push({ id: `uncertainty:${items.length}`, label: 'uncertainty_question', text: `${question} (source: ${source})` });
+  }
+  return items;
 }
