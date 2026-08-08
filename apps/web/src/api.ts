@@ -259,8 +259,12 @@ export const api = {
   memoryHistory: (pid: string, id: string) => req<ApiMemoryHistory>('GET', `/api/projects/${pid}/memory/items/${id}/history`),
   memoryContradictionSet: (pid: string, setId: string) =>
     req<{ setId: string; memoryItemIds: string[]; resolvedAt: string | null }>('GET', `/api/projects/${pid}/memory/contradictions/${setId}`),
-  memorySearch: (pid: string, filters: ApiMemorySearchFilters) =>
-    req<ApiMemorySearchResult>('POST', `/api/projects/${pid}/memory/search`, filters),
+  // `signal` (PLNR-286) lets a caller abort an in-flight search — the star map's search bar is
+  // debounced and cancellable, and a superseded query's late response must never repaint a
+  // highlight set (the same last-write-wins need `memoryDependencyNeighborhood`/etc. below
+  // already have; this method just didn't take one yet).
+  memorySearch: (pid: string, filters: ApiMemorySearchFilters, signal?: AbortSignal) =>
+    req<ApiMemorySearchResult>('POST', `/api/projects/${pid}/memory/search`, filters, signal),
   /** Five-kind human feedback (§11, migration 0004) — influences ranking/presentation only;
    *  never touches the target's statement, evidence, or authority. */
   memoryFeedback: (pid: string, id: string, kind: ApiMemoryFeedbackKind, reason?: string) =>

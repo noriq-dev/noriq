@@ -23,15 +23,26 @@
 // ambient animation here is purely a time-based brightness modulation, never a position change,
 // and is fully disabled under `prefers-reduced-motion: reduce`.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, ApiError, type ApiConstellation } from '../api';
+import { api, ApiError, type ApiConstellation, type ApiMemoryHit, type ApiMemoryRepository } from '../api';
 import {
-  applyPins, DEFAULT_CAMERA, DEFAULT_STAR_MAP_PREFS, decodeStarMapPrefs, encodeStarMapPrefs, fitCamera, hitTest,
-  screenToWorld, selectLabels, starShapeFor, worldToScreen, clampZoom, type Camera, type ComputedStarMap,
-  type LayoutStar, type StarMapPrefs, type Viewport, computeStarMap,
+  applyPins, computeHighlight, DEFAULT_CAMERA, DEFAULT_STAR_MAP_PREFS,
+  decodeStarMapPrefs, decodeStarMapSearchState, encodeStarMapPrefs, encodeStarMapSearchState, fitCamera,
+  highlightAlphaMultiplier, highlightStateFor, hitTest, screenToWorld, selectLabels, starShapeFor, worldToScreen,
+  clampZoom, type Camera, type ComputedStarMap, type LayoutStar, type StarMapHighlight, type StarMapPrefs,
+  type StarMapSearchState, type Viewport, computeStarMap,
 } from './starmap-layout';
-import { Button } from './ui';
+import { Button, Select, TextInput } from './ui';
 import { SectionLabel, MonoTag } from './bits';
 import { useTheme } from '../theme';
+
+// The kind vocabulary record_memory's CHECK constraint accepts (memory-migrations/0001) — mirrors
+// MemoryView.tsx ExploreTab's own `MEMORY_KINDS` (locked decision: reuse that filter vocabulary
+// rather than minting a second one). Duplicated as a plain literal, not imported, matching how
+// AUTHORITY_LABELS is already duplicated client/server per the repo's own convention — the two
+// arrays must stay byte-identical to the CHECK constraint, not to each other's module.
+const MEMORY_KINDS = ['learning', 'decision', 'failed_approach', 'procedure', 'requirement', 'hazard', 'unknown'] as const;
+
+const SEARCH_DEBOUNCE_MS = 250;
 
 const prefsKey = (pid: string) => `noriq.starmap.${pid}`;
 
@@ -127,6 +138,11 @@ interface DrawState {
   palette: Palette;
   reducedMotion: boolean;
   startTime: number;
+  /** PLNR-286: ignite/dim. `null` = no active query — every star draws exactly as PLNR-285 did.
+   *  Non-null = the join result: `highlightStateFor(highlight, star.uri)` decides the alpha
+   *  multiplier below, per-star, every frame — the SET itself is computed once (in
+   *  starmap-layout.ts) whenever the hit list changes, never recomputed inside this loop. */
+  highlight: StarMapHighlight | null;
 }
 
 function draw(canvas: HTMLCanvasElement, s: DrawState, now: number) {
@@ -197,6 +213,12 @@ function draw(canvas: HTMLCanvasElement, s: DrawState, now: number) {
       brightness = Math.max(0.25, Math.min(1, brightness + Math.sin(t * 0.6 + phase) * 0.08));
     }
 
+    // PLNR-286: ignite/dim — MULTIPLY the existing authority-driven brightness, never replace it,
+    // so a query still respects PLNR-285's encoding underneath. `null` (no active query) is a 1x
+    // no-op, byte-identical to before this task.
+    const highlightState = s.highlight ? highlightStateFor(s.highlight, star.uri) : null;
+    brightness *= highlightAlphaMultiplier(highlightState);
+
     ctx.save();
     ctx.translate(p.x, p.y);
     ctx.globalAlpha = brightness;
@@ -220,6 +242,18 @@ function draw(canvas: HTMLCanvasElement, s: DrawState, now: number) {
       // Hollow = lead (locked: never colour-only — the ABSENCE of fill is the signal).
       ctx.lineWidth = 1.8 / s.camera.zoom;
       ctx.strokeStyle = color;
+      ctx.stroke();
+    }
+
+    // PLNR-286: a search MATCH gets its own outer ring, independent of and layered under the
+    // selection/hover ring below (both can be true at once — a matched star can also be
+    // selected). Never colour-only: brightness (above) plus this extra ring plus the results list
+    // are three separate signals a match carries, not one hue.
+    if (highlightState === 'match') {
+      ctx.lineWidth = 1.6 / s.camera.zoom;
+      ctx.strokeStyle = s.palette.text;
+      ctx.globalAlpha = 1;
+      drawShape(ctx, star.visual.shape, star.visual.radius + 6);
       ctx.stroke();
     }
 
@@ -406,6 +440,60 @@ export function MemoryStarMap({
   const rawLayout = useMemo(() => (data ? computeStarMap(data.nodes, data.edges) : null), [data]);
   const layout = useMemo(() => (rawLayout ? applyPins(rawLayout, prefs.pins) : null), [rawLayout, prefs.pins]);
 
+  // --- Search (PLNR-286): query/facets/selection live in URL state, deliberately separate from
+  // the localStorage prefs above (camera/pins) — a shared link should carry the QUESTION, not the
+  // recipient's camera position. Decoded once on mount and again whenever `pid` changes (matching
+  // the prefs effect just above), so a link to a different project's search re-reads cleanly. -----
+  const [search, setSearch] = useState<StarMapSearchState>(() => decodeStarMapSearchState(location.search));
+  useEffect(() => setSearch(decodeStarMapSearchState(location.search)), [pid]);
+  const patchSearch = useCallback((patch: Partial<StarMapSearchState>) => setSearch((s) => ({ ...s, ...patch })), []);
+  useEffect(() => {
+    const next = encodeStarMapSearchState(location.search, search);
+    if (next !== location.search) history.replaceState(null, '', location.pathname + next);
+  }, [search]);
+
+  const [repositories, setRepositories] = useState<ApiMemoryRepository[]>([]);
+  useEffect(() => { api.memoryRepositories(pid).then((r) => setRepositories(r.repositories)).catch(() => {}); }, [pid]);
+
+  const [searchHits, setSearchHits] = useState<ApiMemoryHit[] | null>(null); // null = no active query
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const hasQuery = search.query.trim().length > 0;
+
+  // Debounced, cancellable, last-write-wins: a superseded query's late response must never
+  // repaint the highlight set (locked decision). The effect cleanup both clears the pending
+  // timeout AND aborts any in-flight fetch, so a fast retype never lets an earlier request win.
+  useEffect(() => {
+    if (!hasQuery) { setSearchHits(null); setSearchError(null); setSearchLoading(false); return; }
+    const controller = new AbortController();
+    setSearchLoading(true);
+    setSearchError(null);
+    const t = setTimeout(() => {
+      api.memorySearch(pid, {
+        query: search.query.trim(),
+        kind: search.kind || undefined,
+        minAuthority: search.minAuthority ? Number(search.minAuthority) : undefined,
+        validity: search.validity || undefined,
+        repositoryKey: search.repositoryKey || undefined,
+        branch: search.branch || undefined,
+        limit: 60,
+      }, controller.signal)
+        .then((r) => { setSearchHits(r.results); setSearchLoading(false); })
+        .catch((err: unknown) => {
+          if (controller.signal.aborted) return; // cancelled — no spinner, no spurious error
+          setSearchError(err instanceof ApiError ? err.message : 'search failed');
+          setSearchLoading(false);
+        });
+    }, SEARCH_DEBOUNCE_MS);
+    return () => { clearTimeout(t); controller.abort(); };
+  }, [pid, hasQuery, search.query, search.kind, search.minAuthority, search.validity, search.repositoryKey, search.branch]);
+
+  // The join: exact uri equality against `layout.byUri`, computed fresh whenever the hit list or
+  // layout changes — cheap (linear, bounded), unlike `computeStarMap` which runs once per fetch.
+  // `null` (no active query) means draw()/selectLabels() treat every star at plain brightness —
+  // clearing the query needs no refetch and no relayout, just this memo going back to null.
+  const highlight = useMemo(() => (layout && searchHits ? computeHighlight(layout, searchHits) : null), [layout, searchHits]);
+
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [viewport, setViewport] = useState<Viewport>({ width: 800, height: 500 });
@@ -437,6 +525,17 @@ export function MemoryStarMap({
 
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Resolve a `?sel=<uri>` from the URL into a nodeId once the layout carrying that uri exists —
+  // a nodeId is only as durable as one fetched response, so the URL carries the uri and this
+  // resolves it exactly like a search hit does (byUri, exact equality). Runs once per pid: a
+  // later manual deselect (clicking empty space) must not be overridden by this re-firing.
+  const urlSelectionResolved = useRef(false);
+  useEffect(() => { urlSelectionResolved.current = false; }, [pid]);
+  useEffect(() => {
+    if (urlSelectionResolved.current || !layout || !search.selectedUri) return;
+    const star = layout.byUri.get(search.selectedUri);
+    if (star) { urlSelectionResolved.current = true; setSelectedId(star.nodeId); }
+  }, [layout, search.selectedUri]);
   const [showAccessibleList, setShowAccessibleList] = useState(false);
   const [reducedMotion, setReducedMotion] = useState(() => window.matchMedia('(prefers-reduced-motion: reduce)').matches);
   useEffect(() => {
@@ -462,11 +561,11 @@ export function MemoryStarMap({
   useEffect(() => {
     stateRef.current = {
       layout, camera, viewport, hiddenGroups, showEdges: prefs.showEdges, hoveredId, selectedId,
-      dragOverride, palette: paletteRef.current, reducedMotion, startTime: startTimeRef.current,
+      dragOverride, palette: paletteRef.current, reducedMotion, startTime: startTimeRef.current, highlight,
     };
     if (canvasRef.current) draw(canvasRef.current, stateRef.current, performance.now());
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [layout, camera, viewport, hiddenGroups, prefs.showEdges, hoveredId, selectedId, dragOverride, theme, reducedMotion]);
+  }, [layout, camera, viewport, hiddenGroups, prefs.showEdges, hoveredId, selectedId, dragOverride, theme, reducedMotion, highlight]);
 
   useEffect(() => {
     if (reducedMotion) return; // no ambient loop at all — a static draw already happened above
@@ -561,8 +660,19 @@ export function MemoryStarMap({
 
   const selectedStar = selectedId ? layout?.byNodeId.get(selectedId) ?? null : null;
   const hoveredStar = hoveredId && hoveredId !== selectedId ? layout?.byNodeId.get(hoveredId) ?? null : null;
-  const labelIds = useMemo(() => (layout ? selectLabels(layout.stars, camera, viewport, LABEL_BUDGET) : new Set<string>()),
-    [layout, camera, viewport]);
+  // The reverse of "resolve ?sel= into selectedId" above: once the user's OWN action changes the
+  // selection (click a star, click a result, close the panel), write it back to the URL so a
+  // reload or a shared link lands on the same star. Guarded so this does NOT fire on mount before
+  // the resolve effect above has had its chance — otherwise a fresh `?sel=<uri>` link would get
+  // wiped back to empty on the very first render, before the map has even loaded.
+  useEffect(() => {
+    if (!urlSelectionResolved.current && search.selectedUri && !selectedStar) return;
+    patchSearch({ selectedUri: selectedStar?.uri ?? null });
+  }, [selectedStar?.uri, patchSearch, search.selectedUri]);
+  const labelIds = useMemo(
+    () => (layout ? selectLabels(layout.stars, camera, viewport, LABEL_BUDGET, highlight?.matched) : new Set<string>()),
+    [layout, camera, viewport, highlight],
+  );
 
   const groupKeys = useMemo(() => {
     if (!layout) return [];
@@ -583,7 +693,12 @@ export function MemoryStarMap({
     <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
       <div style={{ flex: 'none', padding: '8px 16px', display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', borderBottom: '1px solid var(--line)' }}>
         <SectionLabel>Constellation</SectionLabel>
-        {data && <MonoTag color="var(--text-dim)" bg="var(--w-04)" size={9}>{layout?.stars.length ?? 0} stars · {layout?.edges.length ?? 0} lines</MonoTag>}
+        {data && (
+          <MonoTag color="var(--text-dim)" bg="var(--w-04)" size={9}>
+            {layout?.stars.length ?? 0} stars · {layout?.edges.length ?? 0} lines
+            {highlight && ` · ${highlight.matched.size} ignited`}
+          </MonoTag>
+        )}
         <div style={{ flex: 1 }} />
         {groupKeys.length > 0 && <GroupFilter groupKeys={groupKeys} hidden={hiddenGroups} onToggle={toggleGroup} />}
         <Button variant="ghost" onClick={() => patchPrefs({ showEdges: !prefs.showEdges })}>{prefs.showEdges ? 'hide lines' : 'show lines'}</Button>
@@ -597,6 +712,14 @@ export function MemoryStarMap({
           {showAccessibleList ? 'hide list' : 'accessible list'}
         </Button>
       </div>
+
+      <SearchBar
+        search={search}
+        onPatch={patchSearch}
+        repositories={repositories}
+        hasQuery={hasQuery}
+        loading={searchLoading}
+      />
 
       <div ref={containerRef} style={{ position: 'relative', flex: 1, minHeight: 0, overflow: 'hidden' }}>
         {loading && <CenteredNote icon="✦" title="Charting the constellation…" body="Fetching the bounded project map." />}
@@ -622,7 +745,8 @@ export function MemoryStarMap({
             {layout && [...labelIds].map((id) => {
               const star = layout.byNodeId.get(id);
               if (!star) return null;
-              return <StarLabel key={id} star={star} camera={camera} viewport={viewport} dim={!!selectedId && selectedId !== id} />;
+              const dim = (!!selectedId && selectedId !== id) || (!!highlight && highlightStateFor(highlight, star.uri) === 'dim');
+              return <StarLabel key={id} star={star} camera={camera} viewport={viewport} dim={dim} />;
             })}
             {selectedStar && <FocusRing star={selectedStar} camera={camera} viewport={viewport} />}
             {hoveredStar && <Tooltip star={hoveredStar} camera={camera} viewport={viewport} />}
@@ -643,7 +767,19 @@ export function MemoryStarMap({
                 )}
               </div>
             )}
-            {showAccessibleList && layout && (
+            {hasQuery && layout && (
+              <SearchResultsPanel
+                hits={searchHits}
+                loading={searchLoading}
+                error={searchError}
+                layout={layout}
+                highlight={highlight}
+                selectedId={selectedId}
+                onSelect={(id) => setSelectedId(id)}
+                onOpenInspector={onOpenInspector}
+              />
+            )}
+            {!hasQuery && showAccessibleList && layout && (
               <AccessibleList stars={layout.stars} selectedId={selectedId} onSelect={(id) => setSelectedId(id)} onClose={() => setShowAccessibleList(false)} />
             )}
           </>
@@ -711,6 +847,163 @@ function AccessibleList({ stars, selectedId, onSelect, onClose }: {
           </li>
         ))}
       </ul>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// PLNR-286: search bar + facets + results list. Facet vocabulary (kind/authority/validity/
+// repository/branch) deliberately mirrors MemoryView.tsx ExploreTab's — reusing the same field
+// set rather than minting a second one (locked decision). Runs the SAME hybrid `/memory/search`
+// route ExploreTab drives; this file adds no ranking or matching logic of its own.
+// ---------------------------------------------------------------------------------------------
+
+function SearchBar({
+  search, onPatch, repositories, hasQuery, loading,
+}: {
+  search: StarMapSearchState;
+  onPatch: (patch: Partial<StarMapSearchState>) => void;
+  repositories: ApiMemoryRepository[];
+  hasQuery: boolean;
+  loading: boolean;
+}) {
+  const [showMore, setShowMore] = useState(false);
+  return (
+    <div style={{ flex: 'none', padding: '8px 16px', display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', borderBottom: '1px solid var(--line)' }}>
+      <div style={{ position: 'relative', flex: '1 1 240px', minWidth: 200 }}>
+        <TextInput
+          placeholder="search memory by meaning — ignites matching stars, dims the rest"
+          value={search.query}
+          onChange={(e) => onPatch({ query: e.target.value })}
+          style={{ width: '100%' }}
+        />
+        {loading && (
+          <span style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>
+            searching…
+          </span>
+        )}
+      </div>
+      <Select value={search.kind} onChange={(e) => onPatch({ kind: e.target.value })} title="kind (memory items only)" style={{ width: 128 }}>
+        <option value="">any kind</option>
+        {MEMORY_KINDS.map((k) => <option key={k} value={k}>{k}</option>)}
+      </Select>
+      <Select value={search.minAuthority} onChange={(e) => onPatch({ minAuthority: e.target.value })} title="minimum authority" style={{ width: 108 }}>
+        <option value="">any authority</option>
+        {[5, 4, 3, 2, 1].map((n) => <option key={n} value={n}>min {n}/5</option>)}
+      </Select>
+      <Select value={search.validity} onChange={(e) => onPatch({ validity: e.target.value })} style={{ width: 108 }}>
+        <option value="">any validity</option>
+        <option value="active">active</option>
+        <option value="stale">stale</option>
+        <option value="invalid">invalid</option>
+      </Select>
+      <button
+        onClick={() => setShowMore((v) => !v)}
+        style={{ cursor: 'pointer', background: 'transparent', border: 'none', color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 10.5 }}
+      >
+        {showMore ? '▾ fewer' : '▸ repository / branch'}
+      </button>
+      {showMore && (
+        <>
+          <Select value={search.repositoryKey} onChange={(e) => onPatch({ repositoryKey: e.target.value })} style={{ width: 150 }}>
+            <option value="">any repository</option>
+            {repositories.map((r) => <option key={r.id} value={r.repositoryKey}>{r.repositoryKey}</option>)}
+          </Select>
+          <TextInput placeholder="branch (exact match)" value={search.branch} onChange={(e) => onPatch({ branch: e.target.value })} style={{ width: 140 }} />
+        </>
+      )}
+      {hasQuery && (
+        <Button variant="ghost" onClick={() => onPatch({ query: '', kind: '', minAuthority: '', validity: '', repositoryKey: '', branch: '' })}>
+          clear
+        </Button>
+      )}
+    </div>
+  );
+}
+
+/** The results list — the read side of the join. Every row states its authority/validity/lead
+ *  from the server's own fields (never bare statement text, locked decision), and whether it
+ *  landed a star: a hit with no star (no uri, or a uri outside this bounded sample) still shows —
+ *  counted and explained, never hidden — but is not independently clickable-to-select since there
+ *  is no star to select; it can still open the inspector directly by uri when one exists. */
+function SearchResultsPanel({
+  hits, loading, error, layout, highlight, selectedId, onSelect, onOpenInspector,
+}: {
+  hits: ApiMemoryHit[] | null;
+  loading: boolean;
+  error: string | null;
+  layout: ComputedStarMap;
+  highlight: StarMapHighlight | null;
+  selectedId: string | null;
+  onSelect: (nodeId: string) => void;
+  onOpenInspector?: (uri: string) => void;
+}) {
+  // Read straight from the same StarMapHighlight draw() consumes — never a second, independently
+  // recomputed count, so the panel's numbers cannot drift from what actually ignited on screen.
+  const onSampled = highlight?.matchedHitCount ?? 0;
+  const offSampled = highlight?.unmatchedCount ?? 0;
+  return (
+    <div
+      style={{
+        position: 'absolute', left: 12, top: 12, bottom: 12, width: 320, overflowY: 'auto', zIndex: 6,
+        padding: '10px 12px', borderRadius: 12, background: 'var(--card)', border: '1px solid var(--w-14)', boxShadow: '0 12px 34px rgba(0,0,0,.4)',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8, flexWrap: 'wrap' }}>
+        <SectionLabel>
+          {hits == null ? 'searching…' : `${hits.length} hit${hits.length === 1 ? '' : 's'}`}
+        </SectionLabel>
+        {hits != null && hits.length > 0 && (
+          <MonoTag color="var(--text-dim)" bg="var(--w-04)" size={8.5}>
+            {onSampled} on map{offSampled > 0 ? ` · ${offSampled} outside sampled field` : ''}
+          </MonoTag>
+        )}
+      </div>
+      {error && (
+        <div style={{ padding: '10px 8px', fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--red-soft)', lineHeight: 1.6 }}>
+          search failed — {error}
+        </div>
+      )}
+      {!error && loading && hits == null && (
+        <div style={{ padding: '10px 8px', fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>Searching…</div>
+      )}
+      {!error && hits != null && hits.length === 0 && (
+        <div style={{ padding: 20, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>
+          nothing matched
+        </div>
+      )}
+      {!error && hits != null && hits.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+          {hits.map((hit) => {
+            const star = hit.uri ? layout.byUri.get(hit.uri) : undefined;
+            const clickable = !!star || (!!hit.uri && !!onOpenInspector && hit.entityType === 'memory');
+            return (
+              <div
+                key={`${hit.entityType}:${hit.id}`}
+                onClick={clickable ? () => { if (star) onSelect(star.nodeId); else if (hit.uri && onOpenInspector) onOpenInspector(hit.uri); } : undefined}
+                className={clickable ? 'hover-border' : undefined}
+                style={{
+                  padding: '9px 12px', borderRadius: 10, cursor: clickable ? 'pointer' : 'default',
+                  background: star && selectedId === star.nodeId ? 'var(--w-045)' : 'var(--w-02)',
+                  border: `1px solid ${star && selectedId === star.nodeId ? 'var(--w-18)' : 'var(--w-07)'}`,
+                  opacity: clickable ? 1 : 0.75,
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 5, flexWrap: 'wrap' }}>
+                  <MonoTag color="var(--text-mid)" bg="var(--w-05)" size={9}>{hit.entityType === 'memory' ? (hit.kind ?? 'memory') : hit.entityType}</MonoTag>
+                  {hit.entityType === 'memory' && <LeadTag isLead={hit.isLead} />}
+                  <AuthorityTag authority={hit.authority ?? null} />
+                  <ValidityTag validity={hit.validity ?? null} />
+                  {!star && <MonoTag color="var(--text-faint)" bg="var(--w-03)" size={8.5}>not on map</MonoTag>}
+                </div>
+                <div style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-soft)', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
+                  {hit.snippet || hit.title}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

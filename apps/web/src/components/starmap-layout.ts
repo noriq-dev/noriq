@@ -390,13 +390,26 @@ export function hitTest(stars: LayoutStar[], camera: Camera, viewport: Viewport,
 /** Which stars get a text label at the current camera, out of a fixed on-screen budget. Ranked by
  *  degree then authority (server-provided importance signals, never re-derived classification) —
  *  then a simple greedy screen-space collision pass so labels never stack. Purely a function of
- *  (stars, camera, viewport, budget); the caller re-derives screen positions for the chosen set. */
-export function selectLabels(stars: LayoutStar[], camera: Camera, viewport: Viewport, budget: number): Set<string> {
+ *  (stars, camera, viewport, budget); the caller re-derives screen positions for the chosen set.
+ *
+ *  `priorityUris` (PLNR-286, optional — omitting it reproduces PLNR-285's exact ranking) puts
+ *  every star whose uri is in the set at the FRONT of the ranking, ahead of degree/authority —
+ *  during an active search, a match should get its label even if a higher-degree unrelated star
+ *  would otherwise have won the budget. Ties within the priority group still break by
+ *  degree/authority/nodeId, same as everything else. */
+export function selectLabels(
+  stars: LayoutStar[], camera: Camera, viewport: Viewport, budget: number, priorityUris?: ReadonlySet<string>,
+): Set<string> {
   const visible = stars.filter((s) => {
     const p = worldToScreen(s, camera, viewport);
     return p.x >= -40 && p.x <= viewport.width + 40 && p.y >= -40 && p.y <= viewport.height + 40;
   });
   const ranked = [...visible].sort((a, b) => {
+    if (priorityUris) {
+      const ap = priorityUris.has(a.uri) ? 1 : 0;
+      const bp = priorityUris.has(b.uri) ? 1 : 0;
+      if (ap !== bp) return bp - ap;
+    }
     if (b.degree !== a.degree) return b.degree - a.degree;
     const authDiff = (b.authority ?? 0) - (a.authority ?? 0);
     if (authDiff !== 0) return authDiff;
@@ -459,4 +472,156 @@ export function applyPins(map: ComputedStarMap, pins: Record<string, { x: number
   const byNodeId = new Map(stars.map((s) => [s.nodeId, s]));
   const byUri = new Map(stars.map((s) => [s.uri, s]));
   return { ...map, stars, byNodeId, byUri };
+}
+
+// --- Search highlight (PLNR-286): ignite matched stars, dim everything else -------------------
+//
+// Pure functions over (ComputedStarMap, hits) — same DOM/canvas-free discipline as the rest of
+// this module (jsdom has no canvas 2D context, so anything the render loop reads must be provable
+// out here). The component only reads the returned sets and modulates `ctx.globalAlpha`; it never
+// re-derives which stars matched.
+//
+// Locked decisions this encodes: (1) the join is EXACT uri equality against `byUri` — never a
+// label or id-substring heuristic, because a fuzzy join would ignite the WRONG star, which is
+// worse than igniting none; (2) a hit with no uri, or whose uri is absent from `byUri`, is real
+// work (the constellation is a bounded SAMPLE) and is counted in `unmatchedCount`, never silently
+// dropped or silently matched; (3) non-matching stars DIM, they are never removed from `stars` —
+// the caller still iterates every star in the layout, just at reduced alpha.
+
+/** The minimal shape this module needs from a search hit — structurally compatible with
+ *  `ApiMemoryHit` (api.ts) rather than importing it, matching `StarMapInputNode`'s own
+ *  zero-dependency convention so this file stays unit-testable with plain object literals. */
+export interface SearchHitRef {
+  uri?: string | null;
+}
+
+export interface StarMapHighlight {
+  /** uris of stars that are themselves a search hit, joined by exact `byUri` equality. Deduped —
+   *  two hits sharing a uri ignite the same star once, not twice, so this can be SMALLER than
+   *  `matchedHitCount` below. */
+  matched: ReadonlySet<string>;
+  /** uris of stars that are a one-hop neighbour of a matched star (via a real edge), excluding
+   *  any star already in `matched` — the "context that makes a match meaningful". */
+  halo: ReadonlySet<string>;
+  /** How many HITS (not deduped stars) carried a uri that resolved to a star — a per-hit count,
+   *  so `matchedHitCount + unmatchedCount === hitCount` always, exactly (the invariant "the count
+   *  shown equals the hits returned" checks against). */
+  matchedHitCount: number;
+  /** Hits with no uri, or a uri absent from `byUri` — a real search hit legitimately outside the
+   *  sampled field. Never hidden: the UI states this count rather than pretending it is 0. */
+  unmatchedCount: number;
+  /** Total hits the search returned. Always `matchedHitCount + unmatchedCount`. */
+  hitCount: number;
+}
+
+/** The one entry point: join `hits` to `map.byUri` by exact equality, then expand one hop over
+ *  `map.edges` to find the halo. Call this whenever the hit list changes — it is cheap (linear in
+ *  hits + edges, both bounded) and holds no state of its own, unlike `computeStarMap` which is
+ *  call-once-per-fetched-response. */
+export function computeHighlight(map: ComputedStarMap, hits: readonly SearchHitRef[]): StarMapHighlight {
+  const matched = new Set<string>();
+  let matchedHitCount = 0;
+  let unmatchedCount = 0;
+  for (const hit of hits) {
+    const uri = hit.uri;
+    if (uri && map.byUri.has(uri)) { matched.add(uri); matchedHitCount++; }
+    else unmatchedCount++;
+  }
+
+  const halo = new Set<string>();
+  if (matched.size > 0) {
+    for (const e of map.edges) {
+      const a = map.byNodeId.get(e.fromNodeId);
+      const b = map.byNodeId.get(e.toNodeId);
+      if (!a || !b) continue;
+      if (matched.has(a.uri) && !matched.has(b.uri)) halo.add(b.uri);
+      if (matched.has(b.uri) && !matched.has(a.uri)) halo.add(a.uri);
+    }
+  }
+
+  return { matched, halo, matchedHitCount, unmatchedCount, hitCount: hits.length };
+}
+
+export type StarHighlightState = 'match' | 'halo' | 'dim';
+
+/** A star's highlight state given an active `StarMapHighlight`, or `null` when no query is active
+ *  (the caller draws every star at its plain, un-modulated brightness in that case — "clearing the
+ *  query restores the full field", not "every star quietly stays at dim's alpha"). */
+export function highlightStateFor(highlight: StarMapHighlight | null, uri: string): StarHighlightState | null {
+  if (!highlight) return null;
+  if (highlight.matched.has(uri)) return 'match';
+  if (highlight.halo.has(uri)) return 'halo';
+  return 'dim';
+}
+
+/** Alpha multipliers applied ON TOP of a star's existing authority-driven brightness (multiply,
+ *  never replace — PLNR-285's brightness channel keeps meaning a query is active) — dim is faint
+ *  but never fully invisible (never removed, per the locked decision), halo sits just under full
+ *  strength so a genuine match still reads as the brightest thing on screen. */
+export const HIGHLIGHT_ALPHA_MULTIPLIER: Record<StarHighlightState, number> = {
+  match: 1,
+  halo: 0.82,
+  dim: 0.15,
+};
+
+/** `null` (no active query) multiplies by 1 — every star draws exactly as PLNR-285 already did. */
+export function highlightAlphaMultiplier(state: StarHighlightState | null): number {
+  return state ? HIGHLIGHT_ALPHA_MULTIPLIER[state] : 1;
+}
+
+// --- Search/facet/selection URL state (PLNR-286) — encode/decode only, exactly the split
+// `StarMapPrefs` above already uses: this module never reads `location` or calls `history.*`
+// (DOM APIs), the component does, but the STRING <-> STATE mapping is a pure function so it is
+// testable without mounting anything and without jsdom's canvas gap ever entering into it. -------
+
+export interface StarMapSearchState {
+  query: string;
+  kind: string;
+  minAuthority: string;
+  validity: string;
+  repositoryKey: string;
+  branch: string;
+  /** The selected star's stable uri, never its nodeId — a nodeId is only as durable as one
+   *  fetched response, a uri is the thing worth putting in a link. */
+  selectedUri: string | null;
+}
+
+export const DEFAULT_STAR_MAP_SEARCH_STATE: StarMapSearchState = {
+  query: '', kind: '', minAuthority: '', validity: '', repositoryKey: '', branch: '', selectedUri: null,
+};
+
+/** Reads only the params this module owns out of a full query string (e.g. `location.search`) —
+ *  every other param (the board view's `?task=`, etc.) is simply not looked at. */
+export function decodeStarMapSearchState(search: string): StarMapSearchState {
+  const params = new URLSearchParams(search);
+  return {
+    query: params.get('q') ?? '',
+    kind: params.get('kind') ?? '',
+    minAuthority: params.get('authority') ?? '',
+    validity: params.get('validity') ?? '',
+    repositoryKey: params.get('repo') ?? '',
+    branch: params.get('branch') ?? '',
+    selectedUri: params.get('sel'),
+  };
+}
+
+/** Merges this module's own params onto an EXISTING query string, preserving every param it does
+ *  not own — never a blind replace of `location.search`, so a link built while some other view's
+ *  param is present does not silently drop it. An unset field deletes its key rather than writing
+ *  an empty value, so a cleared search produces a clean URL, not `?q=&kind=&...`. */
+export function encodeStarMapSearchState(search: string, state: StarMapSearchState): string {
+  const params = new URLSearchParams(search);
+  const setOrDelete = (key: string, value: string) => {
+    if (value) params.set(key, value);
+    else params.delete(key);
+  };
+  setOrDelete('q', state.query);
+  setOrDelete('kind', state.kind);
+  setOrDelete('authority', state.minAuthority);
+  setOrDelete('validity', state.validity);
+  setOrDelete('repo', state.repositoryKey);
+  setOrDelete('branch', state.branch);
+  setOrDelete('sel', state.selectedUri ?? '');
+  const qs = params.toString();
+  return qs ? `?${qs}` : '';
 }
