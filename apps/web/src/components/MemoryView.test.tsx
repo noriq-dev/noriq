@@ -4,10 +4,18 @@
 // with its replacement linked from it. These are exactly the acceptance lines that would silently
 // regress if the view started re-deriving `isLead`/`validity` itself or dropped the "unreachable"
 // distinction — everything else here is supporting plumbing (typing into filters, opening a row).
+//
+// PLNR-287 restructured the view so the star map (not Explore) is what a human lands on; the
+// three behaviours above now live one tab-click into Explore — `switchTab('Explore')` is the new
+// step every one of those tests takes before doing what it always did. The new describe blocks at
+// the bottom cover what PLNR-287 itself is accountable for: the map is the landing surface, every
+// Phase 8 surface (Explore/Graph/Operations) stays exactly one click away, and a star's own
+// "open evidence inspector" / "open in ego-network" hand off through MemoryStarMap's existing
+// onOpenInspector(uri) / onOpenEgoNetwork(uri) props into the right tab, pre-seeded.
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { api, type ApiMemoryHistory, type ApiMemoryItem } from '../api';
+import { api, type ApiConstellation, type ApiGraphCoverageReason, type ApiMemoryHistory, type ApiMemoryItem } from '../api';
 import { MemoryView } from './MemoryView';
 import type { AppStore } from '../store';
 
@@ -33,6 +41,7 @@ afterEach(() => {
   container?.remove();
   root = null;
   vi.restoreAllMocks();
+  history.replaceState(null, '', '/'); // the star map writes q/facet/selection params
 });
 
 const text = () => container.textContent ?? '';
@@ -48,15 +57,147 @@ const setInputValue = (input: HTMLInputElement, value: string) => {
 
 const queryInput = () => container.querySelector('input[placeholder^="search memory"]') as HTMLInputElement;
 
+/** The sub-tab strip (Map/Explore/Graph/Operations) — clicking is the "one extra interaction"
+ *  every Phase 8 surface is now reachable through from the map landing surface. */
+const switchTab = (label: 'Map' | 'Explore' | 'Graph' | 'Operations') => {
+  const btn = [...container.querySelectorAll('button')].find((b) => b.textContent === label);
+  if (!btn) throw new Error(`no "${label}" tab button found`);
+  act(() => { btn.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
+};
+
 const emptyFrame = { text: '', itemsIncluded: 0, itemsOmitted: 0, truncated: false, charsUsed: 0, suspiciousCount: 0 };
+
+/** Map is now the landing surface, so it mounts (and fetches) in every test regardless of which
+ *  tab the test actually cares about — a bare empty-graph response keeps that fetch harmless and
+ *  deterministic rather than hitting the network (and, incidentally, keeps jsdom's canvas-less
+ *  `getContext` warning off tests that never look at the canvas anyway). */
+const baseCoverage = { complete: true, reasons: ['graph-empty'] as ApiGraphCoverageReason[] };
+function emptyConstellation(overrides: Partial<ApiConstellation> = {}): ApiConstellation {
+  return {
+    memoryRevision: 1, nodeCeiling: 300, edgeCeiling: 600,
+    nodes: [], edges: [], omitted: { nodes: 0, edges: 0, edgesDanglingPruned: 0 },
+    coverage: baseCoverage, ...overrides,
+  };
+}
+
+describe('the memory view lands on the map (PLNR-287)', () => {
+  it('shows the map, search-focused, with Explore/Graph/Operations each one tab away', async () => {
+    vi.spyOn(api, 'memoryConstellation').mockResolvedValue(emptyConstellation());
+    vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });
+
+    mount();
+    await tick();
+
+    // The map's own search bar, not Explore's — same placeholder prefix, different copy after
+    // the em dash (asserted exactly so this doesn't silently pass if Explore were still default).
+    expect(queryInput().placeholder).toContain('ignites matching stars');
+    expect(document.activeElement).toBe(queryInput()); // "search focused" — no click needed
+    expect(text()).toContain('Nothing has been recorded yet'); // the honest empty-graph state
+
+    // Every Phase 8 surface is reachable — the tab strip itself proves "at most one interaction".
+    expect([...container.querySelectorAll('button')].some((b) => b.textContent === 'Explore')).toBe(true);
+    expect([...container.querySelectorAll('button')].some((b) => b.textContent === 'Graph')).toBe(true);
+    expect([...container.querySelectorAll('button')].some((b) => b.textContent === 'Operations')).toBe(true);
+  });
+
+  it('Explore remains a deliberately reachable textual mode, not only a failure fallback', async () => {
+    vi.spyOn(api, 'memoryConstellation').mockResolvedValue(emptyConstellation());
+    vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });
+    vi.spyOn(api, 'memoryHealth').mockResolvedValue({
+      projectId: 'prj_1', schemaVersion: 1, memoryRevision: 1, tableCounts: {}, databaseSize: 0, sizeStatus: 'ok', hasPriorGeneration: false,
+    });
+
+    mount();
+    await tick();
+    switchTab('Explore');
+    await tick(); // Explore's own health probe
+
+    expect(queryInput().placeholder).toContain('how do we handle X'); // Explore's own copy, not the map's
+    expect(text()).not.toContain('unreachable'); // reached deliberately, nothing failed to get here
+  });
+});
+
+describe('a selected star hands off by URI, through the existing onOpenInspector/onOpenEgoNetwork props', () => {
+  const starNode = {
+    nodeId: 'n1', uri: 'noriq://memory/mem_star', type: 'memory', kind: 'learning', label: 'A learning worth checking',
+    authority: 3, validity: 'active', isLead: false, leadReasons: [], degree: 0, groupKey: 'memory',
+  };
+
+  it('opening the evidence inspector switches to Explore, pre-selected on that exact entity', async () => {
+    vi.spyOn(api, 'memoryConstellation').mockResolvedValue(emptyConstellation({ nodes: [starNode], coverage: { complete: true, reasons: [] } }));
+    vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });
+    vi.spyOn(api, 'memoryHealth').mockResolvedValue({
+      projectId: 'prj_1', schemaVersion: 1, memoryRevision: 1, tableCounts: {}, databaseSize: 0, sizeStatus: 'ok', hasPriorGeneration: false,
+    });
+    vi.spyOn(api, 'memoryItem').mockResolvedValue({
+      id: 'mem_star', kind: 'learning', statement: 'the statement', authority: 3, confidence: null,
+      contentHash: null, repositoryKey: null, branch: null, baseId: null, validity: 'active',
+      supersedesMemoryId: null, recordedByAgentId: 'agt_1', recordedAt: '2026-01-01T00:00:00.000Z',
+      proposedAt: null, rejectedAt: null, evidence: [],
+    });
+    vi.spyOn(api, 'memorySearch').mockResolvedValue({ mode: 'keyword', results: [], evidenceFrame: { ...emptyFrame, text: 'quoted evidence for mem_star' } });
+    vi.spyOn(api, 'memoryHistory').mockResolvedValue({ versions: [], transitions: [], contradictions: [], feedback: [] });
+
+    mount();
+    await tick(); // map's constellation + repositories fetch
+
+    // Reach the star via the accessible list (DOM/keyboard path, per the locked "canvas is never
+    // the only path to any information" decision) rather than canvas hit-testing.
+    const listBtn = [...container.querySelectorAll('button')].find((b) => b.textContent === 'accessible list');
+    expect(listBtn).toBeTruthy();
+    act(() => { listBtn!.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
+    const starRow = [...container.querySelectorAll('button')].find((b) => b.textContent?.includes('A learning worth checking'));
+    expect(starRow).toBeTruthy();
+    act(() => { starRow!.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
+
+    const openInspectorBtn = [...container.querySelectorAll('button')].find((b) => b.textContent?.includes('Open evidence inspector'));
+    expect(openInspectorBtn).toBeTruthy();
+    act(() => { openInspectorBtn!.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
+    await tick(); // Explore mounts fresh + its item/history/evidence-frame fetches
+
+    // Landed on Explore (the "at most one extra interaction" tab), already showing this exact
+    // memory's evidence — not a blank Explore the human has to re-search from scratch.
+    expect(queryInput().placeholder).toContain('how do we handle X');
+    expect(text()).toContain('quoted evidence for mem_star');
+    expect(api.memoryItem).toHaveBeenCalledWith('prj_1', 'mem_star');
+  });
+
+  it('opening the ego-network switches to Graph, seeded with that exact entity URI', async () => {
+    vi.spyOn(api, 'memoryConstellation').mockResolvedValue(emptyConstellation({ nodes: [starNode], coverage: { complete: true, reasons: [] } }));
+    vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });
+    const neighborhood = vi.spyOn(api, 'memoryDependencyNeighborhood').mockResolvedValue({
+      seed: null, downstream: [], upstream: [], coverage: { complete: true, reasons: [] },
+    });
+
+    mount();
+    await tick();
+
+    const listBtn = [...container.querySelectorAll('button')].find((b) => b.textContent === 'accessible list');
+    act(() => { listBtn!.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
+    const starRow = [...container.querySelectorAll('button')].find((b) => b.textContent?.includes('A learning worth checking'));
+    act(() => { starRow!.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
+
+    const openEgoBtn = [...container.querySelectorAll('button')].find((b) => b.textContent?.includes('Open in ego-network'));
+    expect(openEgoBtn).toBeTruthy();
+    act(() => { openEgoBtn!.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
+    await tick(200); // Graph mounts fresh + its debounced neighborhood fetch
+
+    // Landed on Graph, already seeded — never a blank "pick a task or paste a URI" empty state.
+    expect(text()).not.toContain('there is no whole-project view here');
+    expect(neighborhood).toHaveBeenCalledWith('prj_1', expect.objectContaining({ entityUri: 'noriq://memory/mem_star' }), expect.anything());
+  });
+});
 
 describe('an unreachable memory store', () => {
   it('says so, rather than rendering as though there were nothing to find', async () => {
-    vi.spyOn(api, 'memoryHealth').mockRejectedValue(new Error('DO unreachable'));
+    vi.spyOn(api, 'memoryConstellation').mockResolvedValue(emptyConstellation());
     vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });
+    vi.spyOn(api, 'memoryHealth').mockRejectedValue(new Error('DO unreachable'));
     const search = vi.spyOn(api, 'memorySearch');
 
     mount();
+    await tick();
+    switchTab('Explore');
     await tick();
 
     expect(text()).toContain('Project memory is unreachable');
@@ -69,10 +210,11 @@ describe('an unreachable memory store', () => {
 
 describe('lead vs. approved decision', () => {
   it('carries the distinction in a text label, not colour alone', async () => {
+    vi.spyOn(api, 'memoryConstellation').mockResolvedValue(emptyConstellation());
+    vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });
     vi.spyOn(api, 'memoryHealth').mockResolvedValue({
       projectId: 'prj_1', schemaVersion: 1, memoryRevision: 1, tableCounts: {}, databaseSize: 0, sizeStatus: 'ok', hasPriorGeneration: false,
     });
-    vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });
     vi.spyOn(api, 'memorySearch').mockResolvedValue({
       mode: 'keyword',
       evidenceFrame: emptyFrame,
@@ -89,6 +231,8 @@ describe('lead vs. approved decision', () => {
     });
 
     mount();
+    await tick();
+    switchTab('Explore');
     await tick(); // health + repositories
 
     act(() => setInputValue(queryInput(), 'payment retries'));
@@ -120,10 +264,11 @@ describe('a correction', () => {
   };
 
   it('leaves the original memory readable, with its replacement linked from it', async () => {
+    vi.spyOn(api, 'memoryConstellation').mockResolvedValue(emptyConstellation());
+    vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });
     vi.spyOn(api, 'memoryHealth').mockResolvedValue({
       projectId: 'prj_1', schemaVersion: 1, memoryRevision: 1, tableCounts: {}, databaseSize: 0, sizeStatus: 'ok', hasPriorGeneration: false,
     });
-    vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });
     vi.spyOn(api, 'memorySearch').mockImplementation(async (_pid, filters) => {
       if (filters.memoryItemId) return { mode: 'keyword', results: [], evidenceFrame: { ...emptyFrame, text: 'quoted statement' } };
       return {
@@ -139,6 +284,8 @@ describe('a correction', () => {
     vi.spyOn(api, 'memoryHistory').mockResolvedValue(history);
 
     mount();
+    await tick();
+    switchTab('Explore');
     await tick(); // health + repositories
 
     act(() => setInputValue(queryInput(), 'old statement'));

@@ -287,7 +287,7 @@ function EmptyNote({ text }: { text: string }) {
 // Main component
 // ---------------------------------------------------------------------------------------------
 
-export function MemoryGraph({ pid, store }: { pid: string; store: AppStore }) {
+export function MemoryGraph({ pid, store, initialSeedUri }: { pid: string; store: AppStore; initialSeedUri?: string | null }) {
   const [prefs, setPrefs] = useState<GraphPrefs>(() => loadPrefs(pid));
   useEffect(() => setPrefs(loadPrefs(pid)), [pid]);
   useEffect(() => savePrefs(pid, prefs), [pid, prefs]);
@@ -295,9 +295,12 @@ export function MemoryGraph({ pid, store }: { pid: string; store: AppStore }) {
 
   // Seed selection — no request is ever issued until a human names ONE seed (this is HOW "initial
   // load never attempts a whole-project layout" holds: there is no code path that runs without a
-  // seedUri).
-  const [seedUri, setSeedUri] = useState('');
-  const [seedInput, setSeedInput] = useState('');
+  // seedUri). `initialSeedUri` (PLNR-287: the star map's "open in ego-network" pivot) is a
+  // one-shot mount-time initializer, not a controlled prop — MemoryView remounts this component
+  // fresh on every tab switch, so it only ever applies once per pivot, exactly like picking a task
+  // or pasting a URI by hand.
+  const [seedUri, setSeedUri] = useState(initialSeedUri ?? '');
+  const [seedInput, setSeedInput] = useState(initialSeedUri ?? '');
   const [taskPick, setTaskPick] = useState('');
   const [seedHistory, setSeedHistory] = useState<string[]>([]);
   const tasks = store.helpers.tasksOf(pid);

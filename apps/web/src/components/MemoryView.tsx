@@ -1,12 +1,17 @@
-// Project Memory explorer (PLNR-271) — Phase 8's ONE new project view. Carries an in-view
-// three-tab strip (locked decision, see the task's execution spec): Explore (this file's own
-// tab), Graph (PLNR-272, MemoryGraph.tsx) and Operations (PLNR-273, MemoryOps.tsx).
-// Sub-tab selection is view-local state, never a ViewId or a store field.
+// Project Memory explorer (PLNR-271, restructured by PLNR-287) — Phase 8's ONE new project view.
+// Carries an in-view four-tab strip (view-local state, never a ViewId or a store field, per the
+// PLNR-271 locked decision that survives this restructuring): Map (PLNR-285/286's star map — the
+// PRIMARY landing surface as of PLNR-287, §5's "searchable constellation"), Explore (this file's
+// own tab — the deliberately-reachable textual mode, same answers, same evidence inspector),
+// Graph (PLNR-272, MemoryGraph.tsx — the ego-network exploration §5 requires) and Operations
+// (PLNR-273, MemoryOps.tsx). Nothing Phase 8 shipped was removed; the map became the front door
+// and the other three are each one tab-click away.
 //
 // The central question this view answers for a human, for ONE memory: why does it exist, what
 // supports it, is that evidence currently verified, and what replaced or contradicts it. Every
 // number/label displayed here (authority, validity, isLead, verificationState) is read straight
 // from the API — this file never re-derives `classifyLead` or `verifiedForBase` itself.
+import { parseEntityUri } from '@noriq-dev/shared';
 import { useEffect, useMemo, useState } from 'react';
 import {
   api,
@@ -16,11 +21,13 @@ import type { AppStore } from '../store';
 import { MonoTag, SectionLabel } from './bits';
 import { MemoryGraph } from './MemoryGraph';
 import { MemoryOps } from './MemoryOps';
+import { MemoryStarMap } from './MemoryStarMap';
 import { Button, Select, TextArea, TextInput } from './ui';
 
-type MemorySubTab = 'explore' | 'graph' | 'operations';
+type MemorySubTab = 'map' | 'explore' | 'graph' | 'operations';
 
 const SUB_TABS: Array<{ id: MemorySubTab; label: string }> = [
+  { id: 'map', label: 'Map' },
   { id: 'explore', label: 'Explore' },
   { id: 'graph', label: 'Graph' },
   { id: 'operations', label: 'Operations' },
@@ -53,7 +60,21 @@ const FEEDBACK_KINDS: Array<{ id: ApiMemoryFeedbackKind; label: string }> = [
 const shortId = (id: string) => id.slice(-8);
 
 export function MemoryView({ store }: { store: AppStore }) {
-  const [tab, setTab] = useState<MemorySubTab>('explore');
+  // Map is the landing surface (PLNR-287): the searchable whole-project constellation, §5's
+  // secondary-but-primary-entry-point view. Explore/Graph/Operations are each one tab-click away —
+  // nothing Phase 8 shipped lost a hop.
+  const [tab, setTab] = useState<MemorySubTab>('map');
+
+  // Pivot targets: a star's URI, carried across the tab switch as a fresh-mount initializer
+  // (mirroring how `?task=` seeds MemoryGraph's own picker) rather than a controlled prop, so
+  // MemoryStarMap's prop surface stays exactly `{ pid, onOpenEgoNetwork?, onOpenInspector? }`
+  // (locked decision) — this file supplies the callbacks, it does not reach into the map.
+  const [graphSeedUri, setGraphSeedUri] = useState<string | null>(null);
+  const [inspectorUri, setInspectorUri] = useState<string | null>(null);
+
+  const openEgoNetwork = (uri: string) => { setGraphSeedUri(uri); setTab('graph'); };
+  const openInspector = (uri: string) => { setInspectorUri(uri); setTab('explore'); };
+
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
       <div style={{ flex: 'none', padding: '12px 20px 0', borderBottom: '1px solid var(--line)' }}>
@@ -74,12 +95,33 @@ export function MemoryView({ store }: { store: AppStore }) {
         </div>
       </div>
       <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
-        {tab === 'explore' && <ExploreTab pid={store.currentPid} store={store} />}
-        {tab === 'graph' && <MemoryGraph pid={store.currentPid} store={store} />}
+        {tab === 'map' && <MemoryStarMap pid={store.currentPid} onOpenEgoNetwork={openEgoNetwork} onOpenInspector={openInspector} />}
+        {tab === 'explore' && <ExploreTab pid={store.currentPid} store={store} initialSelectionUri={inspectorUri} />}
+        {tab === 'graph' && <MemoryGraph pid={store.currentPid} store={store} initialSeedUri={graphSeedUri} />}
         {tab === 'operations' && <MemoryOps pid={store.currentPid} store={store} />}
       </div>
     </div>
   );
+}
+
+/** The star map hands off by stable entity URI only (locked decision); this is the one place
+ *  that URI is resolved back into the `Selection` the Explore tab's evidence Inspector already
+ *  understands. `onOpenInspector` is only ever invoked by MemoryStarMap for a `memory`-kind star
+ *  or search hit (see MemoryStarMap.tsx's own gating), so the non-memory arm here is defensive,
+ *  not a real path — a malformed or foreign-kind URI opens Explore with nothing pre-selected
+ *  rather than guessing. The placeholder text/snippet fields are never read: Inspector's fetch
+ *  effect only branches on `hit.entityType`/`hit.id` for a memory hit; title/snippet only matter
+ *  for the episode/node arm, which this path never takes. */
+function selectionFromUri(uri: string): Selection | null {
+  let ref;
+  try { ref = parseEntityUri(uri); } catch { return null; }
+  if (ref.kind !== 'memory') return null;
+  return {
+    hit: {
+      entityType: 'memory', id: ref.id, uri, title: '', snippet: '',
+      stage: 'exact', score: 1, isLead: false, leadReasons: [], finalScore: 1,
+    },
+  };
 }
 
 function UnreachableBanner({ detail }: { detail?: string }) {
@@ -161,7 +203,7 @@ function VerificationBadge({ state }: { state: string }) {
 
 interface Selection { hit: ApiMemoryHit }
 
-function ExploreTab({ pid, store }: { pid: string; store: AppStore }) {
+function ExploreTab({ pid, store, initialSelectionUri }: { pid: string; store: AppStore; initialSelectionUri?: string | null }) {
   const [reachable, setReachable] = useState<boolean | null>(null); // null = still probing
   const [reachError, setReachError] = useState<string | undefined>(undefined);
   const [repositories, setRepositories] = useState<ApiMemoryRepository[]>([]);
@@ -178,7 +220,10 @@ function ExploreTab({ pid, store }: { pid: string; store: AppStore }) {
   const [mode, setMode] = useState<'semantic' | 'keyword' | null>(null);
   const [results, setResults] = useState<ApiMemoryHit[] | null>(null); // null = nothing searched yet
   const [searchFailed, setSearchFailed] = useState(false);
-  const [selected, setSelected] = useState<Selection | null>(null);
+  // A pivot from the star map (PLNR-287) arrives as a one-shot mount-time initializer, matching
+  // MemoryGraph's `initialSeedUri` precedent — the Explore tab remounts fresh every time it's
+  // switched to (MemoryView conditionally renders it), so this only ever resolves once per pivot.
+  const [selected, setSelected] = useState<Selection | null>(() => (initialSelectionUri ? selectionFromUri(initialSelectionUri) : null));
 
   const tasks = store.helpers.tasksOf(pid);
 

@@ -89,6 +89,22 @@ function parseUrl(): { pid: string | null; view: ViewId; task: string | null } {
   };
 }
 
+/** Builds the URL<->state sync effect's target search string (PLNR-36, fixed for PLNR-287): it
+ *  MERGES into `currentSearch` rather than replacing it wholesale. Before this fix the effect
+ *  built `location.search` from scratch as `?task=<id>` or `''`, which silently stripped any
+ *  param this store doesn't own — e.g. the star map's `q`/`kind`/`authority`/`validity`/`repo`/
+ *  `branch`/`sel` — every time view/pid/selectedTaskId changed, including on the very first render
+ *  after a reload. `task` is the only param this store writes; every other param present in
+ *  `currentSearch` is carried through untouched. Exported so the merge behaviour is directly
+ *  testable without mounting the whole store (see store.test.tsx). */
+export function buildUrlSearch(currentSearch: string, selectedTaskId: string | null): string {
+  const params = new URLSearchParams(currentSearch);
+  if (selectedTaskId) params.set('task', selectedTaskId);
+  else params.delete('task');
+  const qs = params.toString();
+  return qs ? `?${qs}` : '';
+}
+
 /** Reload the tab once when the server reports a newer deploy than this bundle
  *  (PLNR-193). Guarded per server-version in sessionStorage so a cached index.html
  *  can't cause a reload loop. */
@@ -363,8 +379,7 @@ export function useAppStore() {
   useEffect(() => {
     if (!user) return;
     const path = view === 'settings' ? '/settings' : view === 'home' || !currentPid ? '/' : `/p/${encodeURIComponent(currentPid)}/${view}`;
-    const search = selectedTaskId ? `?task=${encodeURIComponent(selectedTaskId)}` : '';
-    const target = path + search;
+    const target = path + buildUrlSearch(location.search, selectedTaskId);
     if (location.pathname + location.search !== target) {
       if (popping.current) {
         popping.current = false;

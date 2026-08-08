@@ -876,6 +876,10 @@ function SearchBar({
           value={search.query}
           onChange={(e) => onPatch({ query: e.target.value })}
           style={{ width: '100%' }}
+          // PLNR-287: the memory view lands here — search focused, so typing works immediately
+          // without a click. A one-time mount behaviour only (React sets DOM autofocus on mount),
+          // never re-fired by a re-render, so it never steals focus back mid-search.
+          autoFocus
         />
         {loading && (
           <span style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>
