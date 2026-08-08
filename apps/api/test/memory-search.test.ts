@@ -9,11 +9,12 @@
 import { env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import type { Env } from '../src/env';
-import { createAgent, mcpCall } from './helpers';
+import { assertVectorizeTopKOk, createAgent, mcpCall } from './helpers';
 import {
   indexEntity, removeEntity, semanticSearch, keywordSearch, search,
   type EmbeddingClient, type SearchBackend, type VectorStore,
 } from '../src/search';
+import { RETRIEVAL_DEFAULTS } from '../src/memory/retrieval';
 
 const appEnv = env as unknown as Env;
 
@@ -27,6 +28,8 @@ function fakeStore() {
     async upsert(vs) { for (const v of vs) vectors.set(v.id, { values: v.values, metadata: v.metadata }); },
     async deleteByIds(ids) { for (const id of ids) vectors.delete(id); },
     async query(_vector, opts) {
+      // PLNR-281: the real service throws before ever looking at the vectors — do the same.
+      assertVectorizeTopKOk(opts.topK);
       const matches = [...vectors.entries()]
         .filter(([, v]) => {
           const f = opts.filter as { projectId?: { $eq: string } } | undefined;
@@ -237,5 +240,27 @@ describe('keyword fallback (no backend) covers memories and episodes', () => {
     const kinds = new Set(results.map((h) => h.kind));
     expect(kinds.has('task')).toBe(true);
     expect(kinds.has('memory')).toBe(true);
+  });
+});
+
+describe('search_project_memory\'s DEFAULT limit does not exceed the real topK ceiling (PLNR-281)', () => {
+  it('RETRIEVAL_DEFAULTS.maxResults (20) — the over-fetch product (x5=100) used to exceed Vectorize\'s 50-max-topK and throw', async () => {
+    // do/ProjectMemory.ts's own semanticRetrievalRows (searchProjectMemory's/get_task_context's
+    // actual call site — see its PLNR-281 comment) shares the exact same clamp helper this
+    // module's semanticSearch uses, so proving the clamp holds at limit=20 here covers the
+    // shared arithmetic even though the DO's private method can't take an injected fake backend
+    // (DO RPC args are structurally cloned — a closure-bearing fake can't cross that boundary).
+    const projectId = await newProject('MSRCH7');
+    const rec = await mcpCall(agent.apiKey, 'record_memory', {
+      projectId, kind: 'learning', statement: 'exponential backoff prevents PSP retry storms',
+    });
+    const memoryId = rec.body.memoryId as string;
+    const { store } = fakeStore();
+    const backend: SearchBackend = { embedder: fakeEmbedder, store };
+    await indexEntity(backend, { kind: 'memory', id: memoryId, projectId, title: 'learning', body: 'exponential backoff prevents PSP retry storms' });
+    const hits = await semanticSearch(appEnv, backend, {
+      q: 'retry storms', projectIds: [projectId], kinds: ['memory'], limit: RETRIEVAL_DEFAULTS.maxResults,
+    });
+    expect(hits).toHaveLength(1);
   });
 });

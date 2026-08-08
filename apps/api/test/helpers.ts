@@ -1,6 +1,27 @@
 import { SELF, env } from 'cloudflare:test';
+import { VECTORIZE_METADATA_TOPK_MAX } from '../src/search';
 
 export const ADMIN = 'test-admin-token';
+
+// ---------------------------------------------------------------------------
+// PLNR-281: the real Vectorize service rejects `topK > 50` whenever a query asks for
+// `returnValues: true` or `returnMetadata: 'all'` — VECTOR_QUERY_ERROR, code 40025. Every
+// hand-rolled fake VectorStore in search.test.ts/memory-search.test.ts/code-index.test.ts
+// stands in for an adapter that ALWAYS asks for 'all' (searchBackend/codeSearchBackend never
+// use 'indexed'), so a fake's `query` can enforce the ceiling unconditionally — no need to
+// thread `returnMetadata` through the fake `VectorStore` interface just to branch on it. This
+// is the durable half of the PLNR-281 fix: the bug survived 1103 tests purely because these
+// fakes were more permissive than the real service, and a shared assert here means the next
+// fake store written against this pattern gets it right instead of re-omitting the check.
+// ---------------------------------------------------------------------------
+
+export function assertVectorizeTopKOk(topK: number): void {
+  if (topK > VECTORIZE_METADATA_TOPK_MAX) {
+    throw new Error(
+      `VECTOR_QUERY_ERROR (code = 40025): with returnValues=true or returnMetadata=all, max top K is 50, but got ${topK}; for a top K up to 100, retry with returnValues=false and returnMetadata=indexed`,
+    );
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Agent minting via the REAL OAuth flow (static keys are retired — PLNR-52):

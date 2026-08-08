@@ -11,7 +11,7 @@ import { fetchManifest, readSnapshotChunks, checkManifestHeader } from '../memor
 import { deleteAllProjectBackups, sizeStatus, type EraseReport, type EraseStepResult } from '../memory/lifecycle';
 import { MEMORY_MIGRATIONS } from '../memory/migrations';
 import { validateMemoryScope, validateEvidenceRef, memoryContentHash, evidenceHash, clampAuthority, type MemoryScope } from '../memory/writes';
-import { searchBackend, indexEntity, removeEntity } from '../search';
+import { searchBackend, indexEntity, removeEntity, clampMetadataTopK } from '../search';
 import { codeSearchBackend, indexCodeEntity, removeCodeEntity, type CodeEntityType } from '../memory/code-index';
 import {
   parseStagedRow,
@@ -2810,7 +2810,12 @@ export class ProjectMemory extends DurableObject<Env> {
     if (!backend) return [];
     const [vector] = await backend.embedder.embed([q]);
     if (!vector) return [];
-    const { matches } = await backend.store.query(vector, { topK: Math.min(limit * 5, 100), filter: { projectId: { $eq: projectId } } });
+    // PLNR-281: a THIRD call site sharing search.ts's exact bug shape — this is what
+    // search_project_memory's/get_task_context's default limits actually run through
+    // (searchProjectMemory/similarEffort both call this method), so it is fixed here too even
+    // though it isn't one of the two call sites the original bug report named. Clamp the
+    // PRODUCT via the shared helper — see search.ts's clampMetadataTopK doc comment.
+    const { matches } = await backend.store.query(vector, { topK: clampMetadataTopK(limit * 5), filter: { projectId: { $eq: projectId } } });
     const hits: RetrievalHit[] = [];
     for (const m of matches) {
       const kind = String(m.id).split(':')[0];

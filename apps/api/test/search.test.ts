@@ -3,7 +3,7 @@
 // works); the semantic layer is unit-tested with injected fakes, same pattern as cimd.
 import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
-import { createAgent, createUser, loginSession, mcpCall } from './helpers';
+import { assertVectorizeTopKOk, createAgent, createUser, loginSession, mcpCall } from './helpers';
 import type { Env } from '../src/env';
 import {
   chunkText, entityChunks, indexEntity, removeEntity, semanticSearch,
@@ -27,6 +27,8 @@ function fakeStore() {
     async upsert(vs) { for (const v of vs) vectors.set(v.id, { values: v.values, metadata: v.metadata }); },
     async deleteByIds(ids) { for (const id of ids) vectors.delete(id); },
     async query(_vector, opts) {
+      // PLNR-281: the real service throws before ever looking at the vectors — do the same.
+      assertVectorizeTopKOk(opts.topK);
       // Return everything (optionally filtered), best "score" first by insertion order.
       const matches = [...vectors.entries()]
         .filter(([, v]) => {
@@ -136,6 +138,21 @@ describe('REST /api/projects/:pid/search', () => {
 });
 
 describe('semanticSearch end-to-end against a fake backend + real D1', () => {
+  it('the DEFAULT limit (12) does not exceed the real Vectorize topK ceiling (PLNR-281)', async () => {
+    // No `limit` passed — semanticSearch's own default (12) over-fetches at 5x, landing on a
+    // topK of 60. That is exactly what broke prod: 60 exceeds Vectorize's real 50-max-topK
+    // ceiling for returnMetadata:'all' queries, and used to throw VECTOR_QUERY_ERROR (40025)
+    // instead of returning fewer results. A test pinned to a small explicit limit (as every
+    // other test in this file uses) would never have caught it — this one exercises the
+    // untouched default deliberately.
+    const { store } = fakeStore();
+    const backend: SearchBackend = { embedder: fakeEmbedder, store };
+    const task = await env.DB.prepare('SELECT id FROM tasks WHERE project_id = ? LIMIT 1').bind(projectId).first<{ id: string }>();
+    await indexEntity(backend, { kind: 'task', id: task!.id, projectId, title: 'retry task', body: 'b' });
+    const hits = await semanticSearch(appEnv, backend, { q: 'retries', projectIds: [projectId] });
+    expect(hits).toHaveLength(1);
+  });
+
   it('hydrates matches from D1 and dedupes doc chunks to the best entity hit', async () => {
     const { store } = fakeStore();
     const backend: SearchBackend = { embedder: fakeEmbedder, store };

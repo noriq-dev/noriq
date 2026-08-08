@@ -69,6 +69,25 @@ const EMBEDDING_MODEL = '@cf/baai/bge-m3';
 const CHUNK_CHARS = 1500;
 const MAX_DOC_CHUNKS = 32; // ~48k chars of a doc get embedded; beyond that is ignored
 
+// PLNR-281: Vectorize hard-rejects `topK > 50` whenever a query asks for `returnValues: true`
+// or `returnMetadata: 'all'` (VECTOR_QUERY_ERROR, code 40025) — every adapter here always asks
+// for 'all' (switching to 'indexed' would silently drop `entityId`, which is NOT a provisioned
+// metadata index on noriq-search — see env.ts's VECTORIZE doc comment — and fall through to the
+// fragile id-parsing fallback, PLNR-278's hazard). A bare `50` at each call site is how this
+// codebase already has THREE of them (here, memory/code-index.ts, do/ProjectMemory.ts) — one
+// named constant so a fourth call site can't get it wrong.
+export const VECTORIZE_METADATA_TOPK_MAX = 50;
+
+/** Over-fetch topK for a `returnMetadata: 'all'` Vectorize query, clamped to the real ceiling.
+ *  Clamps the PRODUCT, not the caller's limit/multiplier — the multiplier exists to survive
+ *  post-filtering (project/kind filtering, doc-chunk dedupe to best-scoring chunk), so lowering
+ *  the limit instead would silently shrink recall in a way no test asserts. Below the ceiling
+ *  this is a no-op (full over-fetch survives); above it, retrieval degrades to fewer raw
+ *  candidates rather than throwing (§20 — retrieval degrades, it never errors). */
+export function clampMetadataTopK(candidateTopK: number): number {
+  return Math.min(candidateTopK, VECTORIZE_METADATA_TOPK_MAX);
+}
+
 /** The live backend from Worker bindings, or null → keyword fallback. */
 export function searchBackend(env: Env): SearchBackend | null {
   if (!env.AI || !env.VECTORIZE) return null;
@@ -177,7 +196,7 @@ export async function semanticSearch(env: Env, backend: SearchBackend, opts: Sea
   if (!vector) return [];
   // Single-project queries filter server-side; multi-project post-filters an over-fetch.
   const filter = opts.projectIds.length === 1 ? { projectId: { $eq: opts.projectIds[0] } } : undefined;
-  const { matches } = await backend.store.query(vector, { topK: Math.min(limit * 5, 100), filter });
+  const { matches } = await backend.store.query(vector, { topK: clampMetadataTopK(limit * 5), filter });
   const allowed = new Set(opts.projectIds);
   const best = new Map<string, { kind: SearchKind; id: string; projectId: string; score: number }>();
   for (const m of matches) {

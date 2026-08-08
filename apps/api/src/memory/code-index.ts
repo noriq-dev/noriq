@@ -25,7 +25,7 @@
 // and fails only in production.
 
 import type { Env } from '../env';
-import { chunkText, type EmbeddingClient, type VectorStore } from '../search';
+import { chunkText, clampMetadataTopK, type EmbeddingClient, type VectorStore } from '../search';
 
 const CODE_EMBEDDING_MODEL = '@cf/baai/bge-m3'; // same model as the operational index today;
 // §9 anticipates a code-specialized one later — this seam (a narrow EmbeddingClient) is what
@@ -160,7 +160,10 @@ export async function queryCodeIndex(backend: CodeSearchBackend, opts: CodeQuery
   if (!vector) return [];
   const filter: Record<string, unknown> = { projectId: { $eq: opts.projectId } };
   if (opts.repositoryKey) filter.repositoryKey = { $eq: opts.repositoryKey };
-  const { matches } = await backend.store.query(vector, { topK: Math.min(topK * 3, 100), filter });
+  // PLNR-281: clamp the PRODUCT (see search.ts's clampMetadataTopK) — this adapter always asks
+  // for returnMetadata: 'all' (line ~59 above), so an uncapped topK*3 hits Vectorize's real
+  // topK<=50 ceiling and throws once topK reaches 17.
+  const { matches } = await backend.store.query(vector, { topK: clampMetadataTopK(topK * 3), filter });
   const allowedGenerations = opts.activeGenerationIds ? new Set(opts.activeGenerationIds) : null;
   const best = new Map<string, CodeSearchHit>();
   for (const m of matches) {

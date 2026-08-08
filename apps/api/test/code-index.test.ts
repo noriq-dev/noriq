@@ -8,7 +8,7 @@
 import { env } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import type { Env } from '../src/env';
-import { createUser, mintTokenForUser, mcpCall } from './helpers';
+import { assertVectorizeTopKOk, createUser, mintTokenForUser, mcpCall } from './helpers';
 import {
   codeSearchBackend, indexCodeEntity, removeCodeEntity, queryCodeIndex, rebuildCodeIndex,
   type CodeEntity, type CodeSearchBackend,
@@ -28,6 +28,8 @@ function fakeStore() {
     async upsert(vs) { for (const v of vs) vectors.set(v.id, { values: v.values, metadata: v.metadata }); },
     async deleteByIds(ids) { for (const id of ids) vectors.delete(id); },
     async query(_vector, opts) {
+      // PLNR-281: the real service throws before ever looking at the vectors — do the same.
+      assertVectorizeTopKOk(opts.topK);
       const matches = [...vectors.entries()]
         .filter(([, v]) => {
           const f = opts.filter as { projectId?: { $eq: string }; repositoryKey?: { $eq: string } } | undefined;
@@ -172,6 +174,17 @@ describe('queryCodeIndex filters query-time on the active generation', () => {
 
     const both = await queryCodeIndex(backend, { q: 'ts', projectId: 'p1' }); // no generation filter — sees everything
     expect(both.map((h) => h.uri).sort()).toEqual(['noriq://file/PLNR/repo-a/new.ts', 'noriq://file/PLNR/repo-a/old.ts']);
+  });
+
+  it('a topK of 17 no longer exceeds the real Vectorize ceiling (17*3=51 > 50) (PLNR-281)', async () => {
+    // 17 is the smallest topK argument that reproduces the bug: the x3 over-fetch multiplier
+    // puts the naive request at 51, one past Vectorize's real 50-max-topK for a
+    // returnMetadata:'all' query (this adapter always asks for 'all' — see module comment).
+    const { store } = fakeStore();
+    const backend: CodeSearchBackend = { embedder: fakeEmbedder, store };
+    await indexCodeEntity(backend, { uri: 'noriq://file/PLNR/repo-a/x.ts', projectId: 'p1', repositoryKey: 'repo-a', generationId: 'gen-a', type: 'file', label: 'x.ts' });
+    const hits = await queryCodeIndex(backend, { q: 'x.ts', projectId: 'p1', topK: 17 });
+    expect(hits.map((h) => h.uri)).toEqual(['noriq://file/PLNR/repo-a/x.ts']);
   });
 
   it('never returns a vector belonging to a different project, even sharing the same store', async () => {
