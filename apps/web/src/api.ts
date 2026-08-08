@@ -297,6 +297,35 @@ export const api = {
     req<ApiValidatingTests>('POST', `/api/projects/${pid}/memory/explain`, { focus: 'tests', ...input }, signal),
   memoryChangeImpact: (pid: string, input: { entityUris: string[]; maxDepth?: number; maxResults?: number }, signal?: AbortSignal) =>
     req<ApiChangeImpact>('POST', `/api/projects/${pid}/memory/explain`, { focus: 'impact', ...input }, signal),
+
+  // --- Repository index / backup / restore / memory-health operations (PLNR-273). READS are
+  // reachable by any project member; the ACTION methods 403 server-side for a non-admin (the
+  // server's own guard is authority — this view only hides the affordance, per the locked
+  // decision that a control which would 403 on click is worse than one honestly absent). ---
+  memoryOpsStatus: (pid: string) => req<ApiMemoryOpsStatus>('GET', `/api/projects/${pid}/memory/ops-status`),
+  memoryBackupsList: (pid: string) => req<{ backups: string[]; r2Available: boolean }>('GET', `/api/projects/${pid}/memory/backups`),
+  memoryTriggerBackup: (pid: string, tier: 'core' | 'full' = 'core') =>
+    req<{ ok: true; manifestKey: string } | { ok: false; reason: string }>('POST', `/api/projects/${pid}/memory/backup?tier=${tier}`),
+  /** The server's `?confirm=replace` guard is never pre-supplied by a caller that hasn't already
+   *  gone through this app's own destructive-confirmation Dialog (locked decision) — it is
+   *  appended here only because MemoryOps always confirms first, never as a default. */
+  memoryRestore: (pid: string, exportedAt: string) =>
+    req<{ ok: true; tableCounts: Record<string, number> } | { ok: false; reason: string }>(
+      'POST', `/api/projects/${pid}/memory/restore?confirm=replace&exportedAt=${encodeURIComponent(exportedAt)}`,
+    ),
+  memoryRollback: (pid: string) => req<{ ok: true } | { ok: false; reason: string }>('POST', `/api/projects/${pid}/memory/restore/rollback`),
+  memoryPruneRetainedGeneration: (pid: string) => req<{ ok: true }>('POST', `/api/projects/${pid}/memory/generations/prune-retained`),
+  memoryActivateGeneration: (pid: string, generationId: string) =>
+    req<{ activated: string; superseded: string[] }>('POST', `/api/projects/${pid}/memory/generations/${generationId}/activate`),
+  memoryAbortGeneration: (pid: string, generationId: string) =>
+    req<{ ok: true }>('POST', `/api/projects/${pid}/memory/generations/${generationId}/abort`),
+  memoryRebuildVectors: (pid: string) =>
+    req<{ ok: true; rebuilt: boolean; reason?: string; reindexed?: number }>('POST', `/api/projects/${pid}/memory/vectors/rebuild`),
+  memoryLifecycleSweep: (pid: string) =>
+    req<{
+      projectId: string; prunedStagedGenerations: number; prunedRetainedGeneration: boolean;
+      prunedBackupGenerations: number; decayedMemories: number; prunedSupersededGenerations: number;
+    }>('POST', `/api/projects/${pid}/memory/lifecycle-sweep`),
 };
 
 // Mirrors @noriq-dev/shared RunnerRepo / Runner / Run — kept as plain interfaces so
@@ -716,9 +745,35 @@ export interface ApiMemoryHealth {
   tableCounts: Record<string, number>;
   databaseSize: number;
   sizeStatus: 'ok' | 'warn' | 'critical';
+  /** PLNR-273: a retained rollback generation exists — gates the Rollback/discard controls. */
+  hasPriorGeneration: boolean;
 }
 
-/** Mirrors ProjectRepositoryRow + its checkouts (GET /memory/repositories). */
+/** Mirrors IndexGenerationSummary (apps/api/src/do/ProjectMemory.ts), plus the `validated`
+ *  flag GET /memory/repositories computes server-side for staged generations only (locked
+ *  decision: this view never re-derives it — a generation with `validated: false` offers no
+ *  activation control, full stop). */
+export interface ApiIndexGeneration {
+  id: string;
+  repositoryKey: string;
+  branch: string;
+  baseId: string;
+  indexerVersion: string;
+  status: 'staged' | 'active' | 'superseded';
+  batchCount: number;
+  fileCount: number;
+  sealedAt: string | null;
+  validationProblems: string[];
+  createdAt: string;
+  activatedAt: string | null;
+}
+export interface ApiStagedGeneration extends ApiIndexGeneration {
+  validated: boolean;
+}
+
+/** Mirrors ProjectRepositoryRow + its checkouts (GET /memory/repositories), widened by
+ *  PLNR-273 with per-repository generation state and the two server-computed failure flags
+ *  (`stale`, `failedIngest`) the Operations panel renders directly. */
 export interface ApiMemoryRepository {
   id: string;
   projectId: string;
@@ -733,6 +788,37 @@ export interface ApiMemoryRepository {
   createdAt: string;
   updatedAt: string | null;
   checkouts: Array<{ id: string; projectRepositoryId: string; runnerId: string; checkoutId: string; createdAt: string; updatedAt: string }>;
+  activeGeneration: ApiIndexGeneration | null;
+  stagedGenerations: ApiStagedGeneration[];
+  stale: boolean;
+  failedIngest: boolean;
+  failedIngestProblems: string[];
+}
+
+/** Mirrors MemoryRegistrySummary (apps/api/src/lib/project-memory.ts) — the compact D1
+ *  projection; `null` means the project has never touched its memory store. */
+export interface ApiMemoryRegistry {
+  backupStatus: 'none' | 'pending' | 'ok' | 'failed';
+  lastBackupAt: string | null;
+  vectorDirty: boolean;
+  sizeBytes: number | null;
+  sizeStatus: 'ok' | 'warn' | 'critical';
+}
+
+/** Mirrors MemoryCapabilities (apps/api/src/lib/project-memory.ts) — which optional Cloudflare
+ *  bindings are actually configured on THIS deployment. No queues/workflows fields: this repo
+ *  declares no such bindings in Env at all, so there is nothing to report either way. */
+export interface ApiMemoryCapabilities {
+  r2: boolean;
+  vectorize: boolean;
+  workersAI: boolean;
+  codeVectorize: boolean;
+}
+
+export interface ApiMemoryOpsStatus {
+  health: ApiMemoryHealth;
+  registry: ApiMemoryRegistry | null;
+  capabilities: ApiMemoryCapabilities;
 }
 
 /** Mirrors memory/retrieval.ts's RankedHit — the shape every /memory/search result carries.

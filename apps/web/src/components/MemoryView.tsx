@@ -1,6 +1,6 @@
 // Project Memory explorer (PLNR-271) — Phase 8's ONE new project view. Carries an in-view
 // three-tab strip (locked decision, see the task's execution spec): Explore (this file's own
-// tab), Graph (PLNR-272) and Operations (PLNR-273) are placeholders naming their task keys.
+// tab), Graph (PLNR-272, MemoryGraph.tsx) and Operations (PLNR-273, MemoryOps.tsx).
 // Sub-tab selection is view-local state, never a ViewId or a store field.
 //
 // The central question this view answers for a human, for ONE memory: why does it exist, what
@@ -15,6 +15,7 @@ import {
 import type { AppStore } from '../store';
 import { MonoTag, SectionLabel } from './bits';
 import { MemoryGraph } from './MemoryGraph';
+import { MemoryOps } from './MemoryOps';
 import { Button, Select, TextArea, TextInput } from './ui';
 
 type MemorySubTab = 'explore' | 'graph' | 'operations';
@@ -75,25 +76,7 @@ export function MemoryView({ store }: { store: AppStore }) {
       <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
         {tab === 'explore' && <ExploreTab pid={store.currentPid} store={store} />}
         {tab === 'graph' && <MemoryGraph pid={store.currentPid} store={store} />}
-        {tab === 'operations' && (
-          <Placeholder
-            title="Operations"
-            taskKey="PLNR-273"
-            description="Repository index, backup/restore, and memory-health operations land here — this shell just reserves the tab."
-          />
-        )}
-      </div>
-    </div>
-  );
-}
-
-function Placeholder({ title, taskKey, description }: { title: string; taskKey: string; description: string }) {
-  return (
-    <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-      <div style={{ textAlign: 'center', maxWidth: 360 }}>
-        <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>{title}</div>
-        <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-dim)', marginBottom: 10 }}>{description}</div>
-        <MonoTag color="var(--text-mid)" bg="var(--w-05)" size={10}>{taskKey}</MonoTag>
+        {tab === 'operations' && <MemoryOps pid={store.currentPid} store={store} />}
       </div>
     </div>
   );

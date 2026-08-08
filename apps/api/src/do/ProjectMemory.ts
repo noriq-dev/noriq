@@ -79,6 +79,29 @@ export interface ProjectMemoryHealth {
   tableCounts: Record<string, number>;
   databaseSize: number;
   sizeStatus: 'ok' | 'warn' | 'critical';
+  /** PLNR-273: whether a retained prior generation exists to roll back to (the same
+   *  `_meta.has_prior_generation` flag `rollback()` itself checks) — surfaced so an operator
+   *  panel can disable-and-explain rollback/discard controls instead of offering one that would
+   *  return `{ ok: false }`. */
+  hasPriorGeneration: boolean;
+}
+
+/** PLNR-273: one `index_generations` row as an operator-facing read — everything a human needs
+ *  to judge whether a staged generation is safe to activate, without re-deriving validity
+ *  client-side. `validationProblems` is always an array (never the raw JSON-or-null column). */
+export interface IndexGenerationSummary {
+  id: string;
+  repositoryKey: string;
+  branch: string;
+  baseId: string;
+  indexerVersion: string;
+  status: 'staged' | 'active' | 'superseded';
+  batchCount: number;
+  fileCount: number;
+  sealedAt: string | null;
+  validationProblems: string[];
+  createdAt: string;
+  activatedAt: string | null;
 }
 
 /**
@@ -271,6 +294,7 @@ export class ProjectMemory extends DurableObject<Env> {
       tableCounts[table] = row?.n ?? 0;
     }
     const databaseSize = this.ctx.storage.sql.databaseSize;
+    const priorGenFlag = this.ctx.storage.sql.exec<{ value: string }>(`SELECT value FROM _meta WHERE key = 'has_prior_generation'`).toArray()[0];
     return {
       projectId,
       schemaVersion: this.readSchemaVersion(),
@@ -278,6 +302,7 @@ export class ProjectMemory extends DurableObject<Env> {
       tableCounts,
       databaseSize,
       sizeStatus: sizeStatus(databaseSize),
+      hasPriorGeneration: priorGenFlag?.value === '1',
     };
   }
 
@@ -1121,6 +1146,40 @@ export class ProjectMemory extends DurableObject<Env> {
       batchesExpected: gen.batch_count,
       validation: gen.sealed_at ? { ok: !gen.validation_problems, problems: gen.validation_problems ? JSON.parse(gen.validation_problems) : [] } : null,
     };
+  }
+
+  /** PLNR-273: every `index_generations` row for this project (staged, active, and superseded),
+   *  newest first — the operator panel's source for per-repository generation history, ingest
+   *  progress/errors, and which staged generations are (and are not) safe to offer for
+   *  activation. A straight read; it does not filter by repository or status, matching this DO's
+   *  other list RPCs (the caller narrows). */
+  async listIndexGenerations(projectId: string): Promise<IndexGenerationSummary[]> {
+    await this.assertProjectId(projectId);
+    const rows = this.ctx.storage.sql
+      .exec<{
+        id: string; repository_key: string; branch: string; base_id: string; indexer_version: string;
+        status: string; batch_count: number; file_count: number; sealed_at: string | null;
+        validation_problems: string | null; created_at: string; activated_at: string | null;
+      }>(
+        `SELECT id, repository_key, branch, base_id, indexer_version, status, batch_count, file_count,
+                sealed_at, validation_problems, created_at, activated_at
+         FROM index_generations ORDER BY created_at DESC`,
+      )
+      .toArray();
+    return rows.map((r) => ({
+      id: r.id,
+      repositoryKey: r.repository_key,
+      branch: r.branch,
+      baseId: r.base_id,
+      indexerVersion: r.indexer_version,
+      status: r.status as IndexGenerationSummary['status'],
+      batchCount: r.batch_count,
+      fileCount: r.file_count,
+      sealedAt: r.sealed_at,
+      validationProblems: r.validation_problems ? (JSON.parse(r.validation_problems) as string[]) : [],
+      createdAt: r.created_at,
+      activatedAt: r.activated_at,
+    }));
   }
 
   /**

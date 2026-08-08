@@ -70,7 +70,7 @@ describe('an unreachable memory store', () => {
 describe('lead vs. approved decision', () => {
   it('carries the distinction in a text label, not colour alone', async () => {
     vi.spyOn(api, 'memoryHealth').mockResolvedValue({
-      projectId: 'prj_1', schemaVersion: 1, memoryRevision: 1, tableCounts: {}, databaseSize: 0, sizeStatus: 'ok',
+      projectId: 'prj_1', schemaVersion: 1, memoryRevision: 1, tableCounts: {}, databaseSize: 0, sizeStatus: 'ok', hasPriorGeneration: false,
     });
     vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });
     vi.spyOn(api, 'memorySearch').mockResolvedValue({
@@ -121,7 +121,7 @@ describe('a correction', () => {
 
   it('leaves the original memory readable, with its replacement linked from it', async () => {
     vi.spyOn(api, 'memoryHealth').mockResolvedValue({
-      projectId: 'prj_1', schemaVersion: 1, memoryRevision: 1, tableCounts: {}, databaseSize: 0, sizeStatus: 'ok',
+      projectId: 'prj_1', schemaVersion: 1, memoryRevision: 1, tableCounts: {}, databaseSize: 0, sizeStatus: 'ok', hasPriorGeneration: false,
     });
     vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });
     vi.spyOn(api, 'memorySearch').mockImplementation(async (_pid, filters) => {

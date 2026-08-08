@@ -8,7 +8,7 @@ import { buildMcpServer, INSTRUCTIONS, GET_BRIEFING_PLAYBOOK } from './mcp';
 import { handleModernMcp, isModernMcpRequest } from './mcp-2026';
 import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot, importSnapshot } from './backup';
-import { sweepPendingErasures, sweepProjectDebris } from './memory/lifecycle';
+import { sweepPendingErasures, sweepProjectDebris, sweepProjectDebrisForProject, listProjectBackupGenerations } from './memory/lifecycle';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, timingSafeEqual, verifyPassword, verifyPasswordConstantTime } from './lib/util';
 import { taskSearchFilters } from './lib/search';
 import type { ExecutionSpecInput, RunStatus } from '@noriq-dev/shared';
@@ -28,7 +28,10 @@ import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
 import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
 import { z } from 'zod';
-import { listProjectRepositories, listRepositoryCheckouts, resolveRepositoryByKey, loadPriorEffort, searchHitToEvidenceItem, type ProjectMemoryStub } from './lib/project-memory';
+import {
+  listProjectRepositories, listRepositoryCheckouts, resolveRepositoryByKey, loadPriorEffort, searchHitToEvidenceItem,
+  getMemoryRegistry, memoryCapabilities, type ProjectMemoryStub,
+} from './lib/project-memory';
 import { renderEvidenceFrame, type EvidenceFrameItem } from './memory/evidence-frame';
 import { assembleContextPack } from './memory/context-pack';
 import { readBoundedBody, verifyBatchChecksum, decodeBatchRows, MAX_INGEST_BATCH_BYTES, INGEST_TOKEN_TTL_SECONDS } from './memory/ingest';
@@ -1091,6 +1094,15 @@ app.delete('/api/projects/:pid/docs/:did', userAuth, async (c) =>
 const memoryStub = (env: Env, pid: string): ProjectMemoryStub =>
   env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(pid)) as unknown as ProjectMemoryStub;
 
+// The FULLY-typed DO stub (env.PROJECT_MEMORY is DurableObjectNamespace<ProjectMemory> — see
+// env.ts) rather than the narrow ProjectMemoryStub interface above, for the PLNR-273 operator
+// routes below: they reach RPCs (listIndexGenerations, exportSnapshot, restoreSnapshot, rollback,
+// activateIndexGeneration, abortIndexIngest, rebuildVectorIndex, pruneRetainedGeneration) that
+// ProjectMemoryStub was never widened to include, and adding ten more single-use method
+// signatures to that manually-maintained interface would cost more than it buys here — this
+// matches the existing /api/admin/memory-backup|restore routes' own style (line ~303 below).
+const memoryDO = (env: Env, pid: string) => env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(pid));
+
 app.get('/api/projects/:pid/memory/health', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
   return c.json(await memoryStub(c.env, pid).health(pid));
@@ -1098,11 +1110,145 @@ app.get('/api/projects/:pid/memory/health', userAuth, async (c) => {
 // Canonical repository identity + checkout associations (PLNR-259) — straight D1 reads (CLAUDE.md:
 // reads go straight to D1), not a ProjectMemory DO RPC; registration/association happen through
 // ProjectRoom (runner registration/heartbeat sync them automatically — see syncRepositoryCheckouts).
+// PLNR-273 widens this with each repository's index-generation state (active/staged, with
+// per-generation ingest progress and validation problems) and two server-computed booleans —
+// `stale` and `failedIngest` — so the operations panel never re-derives them client-side (§18's
+// "the number shown is the number the server enforces against").
 app.get('/api/projects/:pid/memory/repositories', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
-  const repos = await listProjectRepositories(c.env, pid);
-  const withCheckouts = await Promise.all(repos.map(async (r) => ({ ...r, checkouts: await listRepositoryCheckouts(c.env, r.id) })));
+  const [repos, generations] = await Promise.all([listProjectRepositories(c.env, pid), memoryDO(c.env, pid).listIndexGenerations(pid)]);
+  const withCheckouts = await Promise.all(repos.map(async (r) => {
+    const checkouts = await listRepositoryCheckouts(c.env, r.id);
+    const repoGenerations = generations.filter((g) => g.repositoryKey === r.repositoryKey);
+    const activeGeneration = repoGenerations.find((g) => g.status === 'active') ?? null;
+    const stagedGenerations = repoGenerations
+      .filter((g) => g.status === 'staged')
+      .map((g) => ({ ...g, validated: !!g.sealedAt && g.validationProblems.length === 0 }));
+    // Stale: the repository has moved past the base the active generation was built from — a
+    // straight equality check over two already-stored values (PLNR-259's latestObservedBase,
+    // this generation's own baseId), never a derived age/threshold.
+    const stale = !!(activeGeneration && r.latestObservedBase && activeGeneration.baseId !== r.latestObservedBase);
+    // Failed ingest: either the D1 projection already says so, or a staged generation completed
+    // ingest (sealed) and failed its own validation — surfaced with the actual problems, not a
+    // bare boolean.
+    const failedStaged = stagedGenerations.find((g) => g.sealedAt && g.validationProblems.length > 0) ?? null;
+    const failedIngest = r.ingestStatus === 'failed' || !!failedStaged;
+    return { ...r, checkouts, activeGeneration, stagedGenerations, stale, failedIngest, failedIngestProblems: failedStaged?.validationProblems ?? [] };
+  }));
   return c.json({ repositories: withCheckouts });
+});
+
+// PLNR-273: assembled operator status — the DO's own health() plus the compact D1 registry
+// projection (backup status, vector-dirty, size) plus which optional bindings are actually
+// configured on THIS deployment. Never a client-computed rollup (§18/locked decision): every
+// field here is exactly what health()/the registry/env already report. A DO that cannot be
+// reached throws through to Hono's default error handling — the same "unreachable, not empty"
+// distinction ExploreTab's reachability probe already relies on (memoryHealth in api.ts).
+app.get('/api/projects/:pid/memory/ops-status', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const [health, registry] = await Promise.all([memoryDO(c.env, pid).health(pid), getMemoryRegistry(c.env, pid)]);
+  return c.json({ health, registry, capabilities: memoryCapabilities(c.env) });
+});
+
+// PLNR-273: this project's backup generations (exportedAt slugs, newest first) — the picker for
+// the restore control below. `listProjectBackupGenerations` already degrades to [] with R2
+// unbound; `r2Available` lets the UI say so explicitly rather than reading an empty list as "no
+// backups yet exist" on a self-hosted instance that simply has no R2 bucket.
+app.get('/api/projects/:pid/memory/backups', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const backups = await listProjectBackupGenerations(c.env, pid);
+  return c.json({ backups, r2Available: !!c.env.FILES });
+});
+
+// --- Below this point: authorized operator ACTIONS (PLNR-273). Every route additionally
+// requires the admin role (requireAdmin, defined further down this file — referenced here as a
+// closure, evaluated at request time, well after the whole module — including that const — has
+// loaded). These are session-cookie routes for the web app; they call the SAME DO/lib functions
+// as the pre-existing ADMIN_TOKEN routes (/api/admin/memory-backup|restore|...) rather than
+// duplicating logic, but cannot reuse those routes directly — adminAuth checks a static bearer
+// token against env.ADMIN_TOKEN, which a browser session can never supply. ---
+
+app.post('/api/projects/:pid/memory/backup', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  const pid = c.req.param('pid')!;
+  const tier = c.req.query('tier') === 'full' ? 'full' : 'core';
+  const res = await memoryDO(c.env, pid).exportSnapshot(pid, { tier });
+  return c.json(res, res.ok ? 200 : 503);
+});
+
+// The ?confirm=replace guard is the SAME safety catch the ADMIN_TOKEN route enforces — never
+// pre-supplied here. The web control that calls this only appends it after its own Dialog
+// confirmation, so the guard still does real work against an unconfirmed call (a stray retry, a
+// scripted mistake), it is just no longer the ONLY confirmation a human sees.
+app.post('/api/projects/:pid/memory/restore', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  if (c.req.query('confirm') !== 'replace') {
+    return c.json({ error: "refusing: this REPLACES the project's active memory generation. Re-POST with ?confirm=replace to proceed." }, 400);
+  }
+  const pid = c.req.param('pid')!;
+  const exportedAt = c.req.query('exportedAt');
+  if (!exportedAt) return c.json({ error: 'exportedAt query param is required — the timestamp of the backup to restore' }, 400);
+  const res = await memoryDO(c.env, pid).restoreSnapshot(pid, { exportedAt });
+  return c.json(res, res.ok ? 200 : 400);
+});
+
+app.post('/api/projects/:pid/memory/restore/rollback', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  const pid = c.req.param('pid')!;
+  const res = await memoryDO(c.env, pid).rollback(pid);
+  return c.json(res, res.ok ? 200 : 400);
+});
+
+// Unconditional discard of the retained rollback generation — distinct from rollback itself:
+// this gives up the ability to roll back at all, freeing its storage immediately rather than
+// waiting for the sweep's age-gated prune. `health().hasPriorGeneration` is what the UI disables
+// this control against.
+app.post('/api/projects/:pid/memory/generations/prune-retained', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  const pid = c.req.param('pid')!;
+  return c.json(await memoryDO(c.env, pid).pruneRetainedGeneration(pid));
+});
+
+// activateIndexGeneration throws (rather than returning {ok:false}) on an unsealed or
+// validation-failed generation — the DO's guard is the authority (locked decision: the UI does
+// not re-implement it), this route only translates that throw into an HTTP 409 for the client.
+app.post('/api/projects/:pid/memory/generations/:generationId/activate', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  const pid = c.req.param('pid')!;
+  try {
+    return c.json(await memoryDO(c.env, pid).activateIndexGeneration(pid, c.req.param('generationId')!));
+  } catch (err) {
+    return c.json({ error: String(err) }, 409);
+  }
+});
+
+// Cancel a still-staged generation (e.g. one that failed validation) and drop its staged rows —
+// abortIndexIngest already refuses once active/superseded.
+app.post('/api/projects/:pid/memory/generations/:generationId/abort', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  const pid = c.req.param('pid')!;
+  try {
+    return c.json(await memoryDO(c.env, pid).abortIndexIngest(pid, c.req.param('generationId')!));
+  } catch (err) {
+    return c.json({ error: String(err) }, 409);
+  }
+});
+
+// rebuildVectorIndex is an honest no-op (`{ ok: true, rebuilt: false, reason }`) with VECTORIZE
+// unbound — never an error — matching §20's reduced-capability contract.
+app.post('/api/projects/:pid/memory/vectors/rebuild', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  const pid = c.req.param('pid')!;
+  return c.json(await memoryDO(c.env, pid).rebuildVectorIndex(pid));
+});
+
+// The same idempotent per-project sweep the daily cron already runs (sweepProjectDebrisForProject,
+// extracted from sweepProjectDebris for exactly this on-demand use) — an operator-triggered
+// "clean up now" rather than a parallel cleanup mechanism.
+app.post('/api/projects/:pid/memory/lifecycle-sweep', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  const pid = c.req.param('pid')!;
+  return c.json(await sweepProjectDebrisForProject(c.env, pid));
 });
 app.get('/api/projects/:pid/memory/items/:id', userAuth, async (c) => {
   const pid = c.req.param('pid')!;

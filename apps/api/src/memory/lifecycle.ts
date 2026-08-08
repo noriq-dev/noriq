@@ -140,6 +140,37 @@ export interface ProjectCleanupResult {
   prunedSupersededGenerations: number;
 }
 
+/** The single-project body of `sweepProjectDebris` below, extracted (PLNR-273) so an operator
+ *  can trigger the same idempotent cleanup on demand for ONE project (a REST action) without
+ *  waiting for the cron's pass over every registered project. Behavior is identical either
+ *  way — this is the only place the actual pruning happens now. */
+export async function sweepProjectDebrisForProject(env: Env, projectId: string): Promise<ProjectCleanupResult> {
+  const stub = env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId));
+  const [prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations, decayedMemories, prunedSupersededGenerations] = await Promise.all([
+    stub.pruneAbandonedStagedGenerations(projectId, STAGED_GENERATION_MAX_AGE_MS).catch(() => 0),
+    stub.pruneRetainedGenerationIfExpired(projectId, RETAINED_GENERATION_MAX_AGE_MS).catch(() => false),
+    pruneBackupRetention(env, projectId).catch(() => 0),
+    stub
+      .decayLowAuthorityMemories(projectId, { maxAgeMs: MEMORY_HYPOTHESIS_DECAY_MAX_AGE_MS, authorityCeiling: MEMORY_HYPOTHESIS_DECAY_AUTHORITY_CEILING })
+      .then((r) => r.decayed.length)
+      .catch(() => 0),
+    stub.pruneSupersededGenerations(projectId, SUPERSEDED_GENERATION_MAX_AGE_MS).catch(() => 0),
+  ]);
+  const outcome: ProjectCleanupResult = { projectId, prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations, decayedMemories, prunedSupersededGenerations };
+  await stub
+    .health(projectId)
+    .then((h) =>
+      env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName(projectId)).upsertMemoryHealth(projectId, {
+        schemaVersion: h.schemaVersion,
+        memoryRevision: h.memoryRevision,
+        sizeBytes: h.databaseSize,
+        sizeStatus: h.sizeStatus,
+      }),
+    )
+    .catch((err) => console.warn(`ProjectMemory health refresh for ${projectId} failed: ${String(err)}`));
+  return outcome;
+}
+
 /** Per-project debris cleanup for every project with a memory registry row: abandoned staged
  *  index generations, an expired retained restore generation, backups beyond the retention
  *  count, and (PLNR-254) unused low-authority memory hypotheses past their decay age. Also
@@ -150,29 +181,7 @@ export async function sweepProjectDebris(env: Env): Promise<ProjectCleanupResult
   const { results } = await env.DB.prepare('SELECT project_id FROM project_memory_registry').all<{ project_id: string }>();
   const outcomes: ProjectCleanupResult[] = [];
   for (const { project_id: projectId } of results) {
-    const stub = env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId));
-    const [prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations, decayedMemories, prunedSupersededGenerations] = await Promise.all([
-      stub.pruneAbandonedStagedGenerations(projectId, STAGED_GENERATION_MAX_AGE_MS).catch(() => 0),
-      stub.pruneRetainedGenerationIfExpired(projectId, RETAINED_GENERATION_MAX_AGE_MS).catch(() => false),
-      pruneBackupRetention(env, projectId).catch(() => 0),
-      stub
-        .decayLowAuthorityMemories(projectId, { maxAgeMs: MEMORY_HYPOTHESIS_DECAY_MAX_AGE_MS, authorityCeiling: MEMORY_HYPOTHESIS_DECAY_AUTHORITY_CEILING })
-        .then((r) => r.decayed.length)
-        .catch(() => 0),
-      stub.pruneSupersededGenerations(projectId, SUPERSEDED_GENERATION_MAX_AGE_MS).catch(() => 0),
-    ]);
-    outcomes.push({ projectId, prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations, decayedMemories, prunedSupersededGenerations });
-    await stub
-      .health(projectId)
-      .then((h) =>
-        env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName(projectId)).upsertMemoryHealth(projectId, {
-          schemaVersion: h.schemaVersion,
-          memoryRevision: h.memoryRevision,
-          sizeBytes: h.databaseSize,
-          sizeStatus: h.sizeStatus,
-        }),
-      )
-      .catch((err) => console.warn(`ProjectMemory health refresh for ${projectId} failed: ${String(err)}`));
+    outcomes.push(await sweepProjectDebrisForProject(env, projectId));
   }
   return outcomes;
 }

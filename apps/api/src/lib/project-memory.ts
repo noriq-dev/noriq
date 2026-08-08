@@ -463,3 +463,50 @@ export async function listRepositoryCheckouts(env: Env, projectRepositoryId: str
     updatedAt: r.updated_at,
   }));
 }
+
+/** PLNR-273: the compact D1 registry row (migration 0069/0071/0073) projected for the operator
+ *  panel — backup status/vector-dirty/size are written here by ProjectRoom (upsertMemoryHealth /
+ *  updateMemoryBackupStatus / setMemoryVectorDirty), never read from the DO directly, matching
+ *  §3's "D1 holds only a compact memory registry" split. `null` means the project has never
+ *  touched its memory store (no row yet) — distinct from a row whose fields are all defaults. */
+export interface MemoryRegistrySummary {
+  backupStatus: 'none' | 'pending' | 'ok' | 'failed';
+  lastBackupAt: string | null;
+  vectorDirty: boolean;
+  sizeBytes: number | null;
+  sizeStatus: 'ok' | 'warn' | 'critical';
+}
+
+export async function getMemoryRegistry(env: Env, projectId: string): Promise<MemoryRegistrySummary | null> {
+  const row = await env.DB.prepare(
+    `SELECT backup_status, last_backup_at, vector_dirty, size_bytes, size_status FROM project_memory_registry WHERE project_id = ?`,
+  ).bind(projectId).first<{
+    backup_status: string; last_backup_at: string | null; vector_dirty: number; size_bytes: number | null; size_status: string;
+  }>();
+  if (!row) return null;
+  return {
+    backupStatus: row.backup_status as MemoryRegistrySummary['backupStatus'],
+    lastBackupAt: row.last_backup_at,
+    vectorDirty: !!row.vector_dirty,
+    sizeBytes: row.size_bytes,
+    sizeStatus: row.size_status as MemoryRegistrySummary['sizeStatus'],
+  };
+}
+
+/** PLNR-273 (§20): which optional Cloudflare bindings are present, named individually rather
+ *  than rolled into one boolean — a self-hoster missing R2 keeps using Vectorize/Workers AI
+ *  fine, and vice versa. Queues and Workflows are deliberately absent from this shape: this repo
+ *  declares no such bindings in `Env` at all (see ProjectMemory.ts's own doc comment on the
+ *  outbox/projector) — they are not a configuration a self-hoster can add, so reporting them
+ *  here would read as a gap to close rather than the "not applicable to this deployment" that
+ *  it actually is. */
+export interface MemoryCapabilities {
+  r2: boolean;
+  vectorize: boolean;
+  workersAI: boolean;
+  codeVectorize: boolean;
+}
+
+export function memoryCapabilities(env: Env): MemoryCapabilities {
+  return { r2: !!env.FILES, vectorize: !!env.VECTORIZE, workersAI: !!env.AI, codeVectorize: !!env.CODE_VECTORIZE };
+}
