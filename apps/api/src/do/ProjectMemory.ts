@@ -21,7 +21,7 @@ import {
 import { IndexGenerationManifest, type IndexBatch } from '@noriq-dev/shared';
 import { planProjection, changedFileUris, coChangePairs, CO_CHANGE_PAIR_CAP } from '../memory/projection';
 import {
-  applyMemoryFilters, rankCandidates, RETRIEVAL_DEFAULTS,
+  applyMemoryFilters, dedupeCandidates, rankCandidates, RETRIEVAL_DEFAULTS,
   type RetrievalHit, type RetrievalStage, type RankedHit,
 } from '../memory/retrieval';
 import {
@@ -3042,7 +3042,13 @@ export class ProjectMemory extends DurableObject<Env> {
       }
     }
 
-    const filtered = applyMemoryFilters(candidates, {
+    // PLNR-282: collapse a candidate matched by more than one stage (or an explicit
+    // memoryItemId/episodeId that ALSO matches `query`) into one, BEFORE filtering/ranking — see
+    // dedupeCandidates' own doc comment for why order matters. Without this, `rankCandidates`
+    // saw two entries for one memory and both survived into `limit`, each numbered separately by
+    // evidenceFrame as if they were independent corroborating items.
+    const deduped = dedupeCandidates(candidates);
+    const filtered = applyMemoryFilters(deduped, {
       repositoryKey: opts.repositoryKey,
       branch: opts.branch,
       kind: opts.kind,
@@ -3076,6 +3082,14 @@ export class ProjectMemory extends DurableObject<Env> {
     // edgePath is never discarded in favor of a later text hit — it is the ONLY source of the
     // graph-neighborhood/shared-decision support kinds (memory/similar-effort.ts) — otherwise
     // the higher raw score wins.
+    //
+    // PLNR-282: this is the same rule `memory/retrieval.ts`'s `dedupeCandidates` now applies for
+    // `searchProjectMemory`, deliberately NOT consolidated here (discretion, not an oversight):
+    // this map is keyed on bare episode id with `entityType` assumed constant, and its graph rows
+    // are pre-resolved to the episode's OWN id via `parseEntityUri` before `consider` ever sees
+    // them — a shape `dedupeCandidates`'s `RetrievalHit[]` (graph hits carry a synthetic node id
+    // in `entityType: 'node'`) doesn't accept without first re-deriving that resolution here
+    // anyway. Two call sites implementing one documented rule beats forcing a shape mismatch.
     const provenance = new Map<string, { stage: RetrievalStage; score: number; edgePath?: string }>();
     const consider = (id: string, stage: RetrievalStage, score: number, edgePath?: string) => {
       const prev = provenance.get(id);

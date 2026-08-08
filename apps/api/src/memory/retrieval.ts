@@ -54,6 +54,15 @@ export interface RetrievalHit {
   edgePath?: string;
   /** graph hits only — hop count from the nearest seed. */
   depth?: number;
+  /** PLNR-282: every OTHER stage that also found this exact candidate, beyond the primary
+   *  `stage` above — populated only by `dedupeCandidates` when a merge actually happened, and
+   *  omitted (never an empty array) on an untouched single-stage hit, so a hit's shape is
+   *  byte-identical to before this field existed unless a collapse actually occurred. `stage`
+   *  itself stays a scalar rather than becoming a list (locked decision) — it is read by
+   *  similar-effort.ts, evidence-frame.ts, and the REST/MCP surfaces, and re-typing a shipped
+   *  field for a bug fix would be a breaking change none of those need. This is the additive
+   *  answer to "was this ALSO found another way" instead. */
+  alsoFoundBy?: RetrievalStage[];
 }
 
 export interface RankedHit extends RetrievalHit {
@@ -110,6 +119,73 @@ export function classifyLead(
     if (baseMismatch) reasons.push('evidence-base-mismatch');
   }
   return { isLead: reasons.length > 0, leadReasons: reasons };
+}
+
+/**
+ * PLNR-282: collapse candidates that name the SAME entity before anything else touches them —
+ * `searchProjectMemory` pushes exact/lexical/semantic/graph rows into one flat array with no
+ * dedupe, so a memory matched by two stages (or by an explicit `memoryItemId` that ALSO matches
+ * the caller's `query`) used to survive into `rankCandidates` twice, consuming two of the
+ * caller's `limit` slots for one real memory and rendering as false corroboration once
+ * `evidenceFrame` numbers it `[1]` and `[2]`. Must run BEFORE `applyMemoryFilters`/
+ * `rankCandidates` (locked decision) — deduping after ranking would still let a duplicate eat a
+ * slot inside the `limit` slice, which is half the defect, and would rank on a candidate's
+ * WORST-seen evidence instead of its best.
+ *
+ * Keyed on `(entityType, id)` — real identity, never on similar content (locked decision: a
+ * memory and the DIFFERENT memory that supersedes it, §12, must both keep surviving; they simply
+ * never share an id). `entityType` is part of the key because a graph hit's `id` today is a
+ * synthetic node id living in a different namespace than a memory/episode's own primary key
+ * (`RetrievalHit`'s own doc comment on `entityType: 'node'`) — collapsing only on `id` could
+ * accidentally fuse two unrelated entities that happen to share one.
+ *
+ * The merge itself reuses `similarEffort`'s own already-shipped rule (ProjectMemory.ts) rather
+ * than inventing a second one: whichever side carries an `edgePath` supplies the surviving
+ * record's identity-bearing fields (so `seedNodeId`/`edgePath`/`depth` are never dropped in
+ * favor of a later text hit — they are the ONLY source of similar-effort.ts's
+ * graph-neighborhood/shared-decision support kinds), the higher raw score always survives, and
+ * every stage that contributed is recorded in `alsoFoundBy` rather than silently discarded — a
+ * memory found by both lexical AND semantic search is genuinely better-evidenced than one found
+ * by a single stage, and the result must be able to say so (stated acceptance).
+ */
+export function dedupeCandidates(candidates: RetrievalHit[]): RetrievalHit[] {
+  const merged = new Map<string, RetrievalHit>();
+  const order: string[] = [];
+  for (const hit of candidates) {
+    const key = `${hit.entityType}:${hit.id}`;
+    const prev = merged.get(key);
+    if (!prev) {
+      merged.set(key, hit);
+      order.push(key);
+      continue;
+    }
+    merged.set(key, mergeRetrievalHits(prev, hit));
+  }
+  return order.map((key) => merged.get(key)!);
+}
+
+/** Merge two hits already known to name the same entity. See `dedupeCandidates`'s doc comment
+ *  for the rule; this is its pairwise step, folded left-to-right across every stage that found
+ *  the same entity (so a THIRD/fourth match keeps accumulating into `a`'s side correctly). */
+function mergeRetrievalHits(a: RetrievalHit, b: RetrievalHit): RetrievalHit {
+  const stagesSoFar = new Set<RetrievalStage>([a.stage, ...(a.alsoFoundBy ?? []), b.stage, ...(b.alsoFoundBy ?? [])]);
+
+  // similarEffort's own rule, reused verbatim (ProjectMemory.ts's `consider`): whichever side
+  // carries an edgePath wins the base record — title/snippet/kind/seedNodeId/depth all come from
+  // it — because edgePath can only be re-derived by re-running the graph traversal, while every
+  // other field is a live read of the same canonical row from either side. The score is always
+  // the max of the two, whether or not edgePath decided the base.
+  let base: RetrievalHit;
+  if (b.edgePath && !a.edgePath) base = b;
+  else if (a.edgePath && !b.edgePath) base = a;
+  else base = b.score > a.score ? b : a;
+
+  const alsoFoundBy = [...stagesSoFar].filter((s) => s !== base.stage);
+  return {
+    ...base,
+    score: Math.max(a.score, b.score),
+    alsoFoundBy: alsoFoundBy.length ? alsoFoundBy : undefined,
+  };
 }
 
 export interface MemoryFilters {

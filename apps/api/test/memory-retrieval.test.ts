@@ -6,6 +6,7 @@ import { env } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import type { Env } from '../src/env';
 import { createUser, mintTokenForUser, mcpCall, mcpList, createRunAgent } from './helpers';
+import { dedupeCandidates, type RetrievalHit } from '../src/memory/retrieval';
 
 const appEnv = env as unknown as Env;
 const SYSTEM = { kind: 'system', id: null };
@@ -28,6 +29,7 @@ interface RankedHit {
   seedNodeId?: string;
   edgePath?: string;
   depth?: number;
+  alsoFoundBy?: string[];
   isLead: boolean;
   leadReasons: string[];
   finalScore: number;
@@ -70,6 +72,116 @@ async function newOwnedProject(email: string, key: string) {
   if (proj.isError) throw new Error(`create_project(${key}) failed: ${proj.text}`);
   return { token, projectId: proj.body.id as string };
 }
+
+describe('dedupeCandidates — pure cross-stage collapse (PLNR-282)', () => {
+  function hit(overrides: Partial<RetrievalHit> & Pick<RetrievalHit, 'entityType' | 'id' | 'stage' | 'score'>): RetrievalHit {
+    return { title: 't', snippet: 's', ...overrides };
+  }
+
+  it('collapses the same entity found by lexical AND semantic into one hit, retaining both stages', () => {
+    const lexical = hit({ entityType: 'memory', id: 'mem_1', stage: 'lexical', score: 1 });
+    const semantic = hit({ entityType: 'memory', id: 'mem_1', stage: 'semantic', score: 0.5702917 });
+    const result = dedupeCandidates([lexical, semantic]);
+    expect(result).toHaveLength(1);
+    expect(result[0]!.score).toBe(1); // max across stages survives
+    expect(new Set([result[0]!.stage, ...(result[0]!.alsoFoundBy ?? [])])).toEqual(new Set(['lexical', 'semantic']));
+  });
+
+  it('an exact lookup merged with a lexical hit for the same memory reports both stages', () => {
+    const exact = hit({ entityType: 'memory', id: 'mem_2', stage: 'exact', score: 1 });
+    const lexical = hit({ entityType: 'memory', id: 'mem_2', stage: 'lexical', score: 1 });
+    const result = dedupeCandidates([exact, lexical]);
+    expect(result).toHaveLength(1);
+    expect(new Set([result[0]!.stage, ...(result[0]!.alsoFoundBy ?? [])])).toEqual(new Set(['exact', 'lexical']));
+  });
+
+  it('a graph hit merged with a text hit for the SAME entity retains edgePath/seedNodeId/depth regardless of arrival order', () => {
+    const text = hit({ entityType: 'episode', id: 'ep_1', stage: 'lexical', score: 0.9 });
+    const graph = hit({
+      entityType: 'episode', id: 'ep_1', stage: 'graph', score: 0.3,
+      seedNodeId: 'node_seed', edgePath: 'node_seed>related_to>node_ep_1', depth: 1,
+    });
+
+    // similar-effort.ts treats edgePath as the ONLY source of its graph-neighborhood/
+    // shared-decision support kinds — losing it in a merge, in either arrival order, would
+    // silently weaken PLNR-264's duplicate-work warnings.
+    const textThenGraph = dedupeCandidates([text, graph])[0]!;
+    expect(textThenGraph.edgePath).toBe('node_seed>related_to>node_ep_1');
+    expect(textThenGraph.seedNodeId).toBe('node_seed');
+    expect(textThenGraph.depth).toBe(1);
+    expect(textThenGraph.score).toBe(0.9); // higher raw score still wins, even though it came from the non-graph side
+    expect(textThenGraph.alsoFoundBy).toContain('lexical');
+
+    const graphThenText = dedupeCandidates([graph, text])[0]!;
+    expect(graphThenText.edgePath).toBe('node_seed>related_to>node_ep_1');
+    expect(graphThenText.seedNodeId).toBe('node_seed');
+    expect(graphThenText.depth).toBe(1);
+    expect(graphThenText.score).toBe(0.9);
+  });
+
+  it('never collapses across different entityTypes even when ids coincide', () => {
+    const memory = hit({ entityType: 'memory', id: 'shared_id', stage: 'lexical', score: 1 });
+    const episode = hit({ entityType: 'episode', id: 'shared_id', stage: 'lexical', score: 1 });
+    expect(dedupeCandidates([memory, episode])).toHaveLength(2);
+  });
+
+  it('never collapses a memory with a DIFFERENT memory that supersedes it — collapse keys on identity, never on similar content (§12)', () => {
+    const original = hit({ entityType: 'memory', id: 'mem_old', stage: 'lexical', score: 0.5, snippet: 'old statement' });
+    const superseding = hit({ entityType: 'memory', id: 'mem_new', stage: 'lexical', score: 0.9, snippet: 'corrected statement' });
+    const result = dedupeCandidates([original, superseding]);
+    expect(result.map((r) => r.id).sort()).toEqual(['mem_new', 'mem_old']);
+  });
+
+  it('a candidate found by all three text/exact stages accumulates every one in alsoFoundBy', () => {
+    const exact = hit({ entityType: 'memory', id: 'mem_3', stage: 'exact', score: 1 });
+    const lexical = hit({ entityType: 'memory', id: 'mem_3', stage: 'lexical', score: 0.8 });
+    const semantic = hit({ entityType: 'memory', id: 'mem_3', stage: 'semantic', score: 0.6 });
+    const result = dedupeCandidates([exact, lexical, semantic]);
+    expect(result).toHaveLength(1);
+    expect(new Set([result[0]!.stage, ...(result[0]!.alsoFoundBy ?? [])])).toEqual(new Set(['exact', 'lexical', 'semantic']));
+  });
+
+  it('a distinct, single-stage hit is passed through with no alsoFoundBy added', () => {
+    const solo = hit({ entityType: 'memory', id: 'mem_4', stage: 'lexical', score: 1 });
+    const result = dedupeCandidates([solo]);
+    expect(result).toHaveLength(1);
+    expect(result[0]!.alsoFoundBy).toBeUndefined();
+  });
+});
+
+describe('duplicate collapse across stages, end-to-end through searchProjectMemory (PLNR-282)', () => {
+  it('an exact memoryItemId lookup combined with a query matching the SAME memory yields one result, not two', async () => {
+    const { projectId } = await newOwnedProject('pm-retr-dedupe1@example.com', 'PMRDDP1');
+    const { memoryId } = await memory(projectId).recordMemory(projectId, {
+      kind: 'decision', statement: 'retry storms need exponential backoff', actor: { kind: 'agent', id: 'agt_x' },
+    });
+
+    const { results } = await memory(projectId).searchProjectMemory(projectId, { memoryItemId: memoryId, query: 'exponential backoff' });
+    const matches = results.filter((r) => r.id === memoryId);
+    expect(matches).toHaveLength(1);
+    expect(matches[0]!.stage).toBe('exact');
+    expect(matches[0]!.alsoFoundBy).toContain('lexical');
+  });
+
+  it('a duplicate no longer consumes a limit slot — a `limit: N` query still returns N DISTINCT memories', async () => {
+    const { projectId } = await newOwnedProject('pm-retr-dedupe2@example.com', 'PMRDDP2');
+    const { memoryId: memA } = await memory(projectId).recordMemory(projectId, {
+      kind: 'decision', statement: 'retry storms need exponential backoff', actor: { kind: 'agent', id: 'agt_x' },
+    });
+    const { memoryId: memB } = await memory(projectId).recordMemory(projectId, {
+      kind: 'learning', statement: 'circuit breakers prevent retry storms cascading', actor: { kind: 'agent', id: 'agt_x' },
+    });
+
+    // memA matches BOTH the exact memoryItemId lookup and the lexical scan (the query shares its
+    // words); memB matches only the lexical scan. Pre-fix, memA's two candidate rows both
+    // survived ranking untouched and a limit of 2 could return [memA, memA] — memB never got a
+    // slot despite genuinely matching too.
+    const { results } = await memory(projectId).searchProjectMemory(projectId, {
+      memoryItemId: memA, query: 'retry storms', limit: 2,
+    });
+    expect(results.map((r) => r.id).sort()).toEqual([memA, memB].sort());
+  });
+});
 
 describe('search_project_memory — registration and MCP floor gating', () => {
   it('appears in tools/list with its guidance intact, and is absent for a floor that omits it', async () => {

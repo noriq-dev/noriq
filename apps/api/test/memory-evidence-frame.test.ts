@@ -533,4 +533,34 @@ describe('get_task_context (MCP) and search_project_memory (MCP) — the frame r
       expect(lines(frame.text).filter((l) => l === FRAME_CLOSE_LINE)).toHaveLength(1);
     }
   });
+
+  // PLNR-282: a memory matched by BOTH the exact `memoryItemId` lookup and the lexical scan
+  // (the same defect shape reported live: one memory matching two retrieval stages) used to
+  // survive `rankCandidates` twice, so `searchHitToEvidenceItem`/`renderEvidenceFrame` numbered
+  // it `[1]` and `[2]` — two independently-labelled AUTHORITY/VALIDITY headers for one statement,
+  // reading as corroboration when it is one memory found two ways. `dedupeCandidates` now
+  // collapses it upstream of both `results` and this frame, so only ONE numbered item — `[1]` —
+  // can ever appear for it.
+  it('a memory matched by two stages produces exactly ONE numbered item in the evidenceFrame, not two', async () => {
+    const projectId = await newProject('EVFR6');
+    const rec = await mcpCall(agent.apiKey, 'record_memory', {
+      projectId, kind: 'learning', statement: 'evidence-frame dedupe probe: retry storms need exponential backoff',
+    });
+    const memoryId = rec.body.memoryId as string;
+
+    const res = await mcpCall(agent.apiKey, 'search_project_memory', {
+      projectId, memoryItemId: memoryId, query: 'evidence-frame dedupe probe',
+    });
+    expect(res.isError).toBeFalsy();
+    const results = res.body.results as Array<{ id: string; stage: string; alsoFoundBy?: string[] }>;
+    const matches = results.filter((r) => r.id === memoryId);
+    expect(matches).toHaveLength(1);
+    expect(matches[0]!.alsoFoundBy).toContain('lexical');
+
+    const frame = res.body.evidenceFrame as { text: string };
+    // The renderer numbers items `[1]`, `[2]`, … — a duplicate would show up as a second
+    // `[digit]` header line quoting the SAME statement. Only one header line should exist at all.
+    const headerLines = lines(frame.text).filter((l) => /^\[\d+\]/.test(l));
+    expect(headerLines).toHaveLength(1);
+  });
 });
