@@ -6,12 +6,13 @@ export class ApiError extends Error {
   }
 }
 
-async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
+async function req<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   const res = await fetch(path, {
     method,
     headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
     body: body !== undefined ? JSON.stringify(body) : undefined,
     credentials: 'same-origin',
+    signal,
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new ApiError(res.status, (data as { error?: string }).error ?? res.statusText);
@@ -277,6 +278,25 @@ export const api = {
     req<{ approvedMemoryId: string; transitionId: string }>('POST', `/api/projects/${pid}/memory/items/${id}/approve`, { note }),
   memoryRejectDecision: (pid: string, id: string, note?: string) =>
     req<{ ok: boolean; transitionId: string }>('POST', `/api/projects/${pid}/memory/items/${id}/reject`, { note }),
+
+  // --- Ego-network graph + change-impact views (PLNR-272) — the human-facing twins of the named
+  // graph-query primitives (PLNR-258), same `/memory/explain` route MemoryView's requiredReading
+  // already documents, discriminated by `focus`. `signal` lets a caller abort an in-flight
+  // expansion (acceptance: "an in-flight expansion can be cancelled") — every other method in
+  // this file fires-and-forgets because nothing else in the app issues a request a human is
+  // likely to want to cancel mid-flight; a bounded but potentially slow graph traversal is the
+  // first one that does. `dependencyNeighborhood`'s `edgeTypes` is caller-supplied (defaults to
+  // depends_on/imports/calls only when omitted — see ProjectMemory.ts) so it doubles as the
+  // GENERAL bidirectional bounded-neighborhood primitive MemoryGraph needs: unlike
+  // `/memory/search`'s seedEntityUri expansion (forward-only, ranked in with text/semantic hits),
+  // this returns upstream/downstream separately with real edge-path provenance per hop — exactly
+  // what "every visible edge shows its type and provenance" needs.
+  memoryDependencyNeighborhood: (pid: string, input: ApiGraphNeighborhoodInput, signal?: AbortSignal) =>
+    req<ApiDependencyNeighborhood>('POST', `/api/projects/${pid}/memory/explain`, { focus: 'dependencies', ...input }, signal),
+  memoryValidatingTests: (pid: string, input: { entityUri: string; maxDepth?: number; maxResults?: number }, signal?: AbortSignal) =>
+    req<ApiValidatingTests>('POST', `/api/projects/${pid}/memory/explain`, { focus: 'tests', ...input }, signal),
+  memoryChangeImpact: (pid: string, input: { entityUris: string[]; maxDepth?: number; maxResults?: number }, signal?: AbortSignal) =>
+    req<ApiChangeImpact>('POST', `/api/projects/${pid}/memory/explain`, { focus: 'impact', ...input }, signal),
 };
 
 // Mirrors @noriq-dev/shared RunnerRepo / Runner / Run — kept as plain interfaces so
@@ -827,4 +847,72 @@ export interface ApiMemoryHistory {
   }>;
   contradictions: Array<{ setId: string; memoryItemIds: string[]; resolvedAt: string | null }>;
   feedback: Array<{ id: string; actorId: string; vote: string; kind: ApiMemoryFeedbackKind | null; reason: string | null; createdAt: string }>;
+}
+
+// --- Ego-network graph + change-impact views (PLNR-272) — mirrors
+// apps/api/src/memory/graph-queries.ts's exported shapes exactly (same plain-interface
+// convention as the rest of this file). `coverage` is the non-optional completeness marker every
+// primitive returns (§2 of the Project Memory doc): `complete: false` means "this graph cannot
+// answer that yet", never "nothing is related" — render the two differently. ---
+
+export type ApiGraphCoverageReason = 'seed-not-found' | 'code-graph-empty' | 'no-writer-yet' | 'row-limit-reached';
+
+export interface ApiGraphCoverage {
+  complete: boolean;
+  reasons: ApiGraphCoverageReason[];
+  edgeTypesWithNoWriter?: string[];
+}
+
+/** A node as ProjectMemory's `nodes` table carries it — always addressable by its stable
+ *  entity URI (§18 locked decision: never a display label or generation-scoped id). */
+export interface ApiGraphEntityRef {
+  nodeId: string;
+  uri: string;
+  type: string;
+  label: string;
+}
+
+/** One real edge on the path from a seed to a related entity — `fromNodeId`/`toNodeId` are the
+ *  edge's ACTUAL direction, regardless of which way the traversal walked to find it. */
+export interface ApiEdgeHop {
+  fromNodeId: string;
+  edgeType: string;
+  toNodeId: string;
+}
+
+export interface ApiRelatedEntity extends ApiGraphEntityRef {
+  depth: number;
+  edgePath: ApiEdgeHop[];
+}
+
+export interface ApiGraphNeighborhoodInput {
+  entityUri: string;
+  edgeTypes?: string[];
+  maxDepth?: number;
+  maxResults?: number;
+}
+
+export interface ApiDependencyNeighborhood {
+  seed: ApiGraphEntityRef | null;
+  downstream: ApiRelatedEntity[];
+  upstream: ApiRelatedEntity[];
+  coverage: ApiGraphCoverage;
+}
+
+export interface ApiValidatingTests {
+  seed: ApiGraphEntityRef | null;
+  tests: ApiRelatedEntity[];
+  coverage: ApiGraphCoverage;
+}
+
+export interface ApiUncertainEdge {
+  entityUri: string;
+  reason: 'not-yet-indexed';
+}
+
+export interface ApiChangeImpact {
+  resolvedSeeds: ApiGraphEntityRef[];
+  uncertainEdges: ApiUncertainEdge[];
+  impactedTests: ApiRelatedEntity[];
+  coverage: ApiGraphCoverage;
 }

@@ -14,6 +14,7 @@ import {
 } from '../api';
 import type { AppStore } from '../store';
 import { MonoTag, SectionLabel } from './bits';
+import { MemoryGraph } from './MemoryGraph';
 import { Button, Select, TextArea, TextInput } from './ui';
 
 type MemorySubTab = 'explore' | 'graph' | 'operations';
@@ -73,13 +74,7 @@ export function MemoryView({ store }: { store: AppStore }) {
       </div>
       <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
         {tab === 'explore' && <ExploreTab pid={store.currentPid} store={store} />}
-        {tab === 'graph' && (
-          <Placeholder
-            title="Graph explorer"
-            taskKey="PLNR-272"
-            description="Ego-network graph exploration and change-impact views land here — this shell just reserves the tab."
-          />
-        )}
+        {tab === 'graph' && <MemoryGraph pid={store.currentPid} store={store} />}
         {tab === 'operations' && (
           <Placeholder
             title="Operations"
