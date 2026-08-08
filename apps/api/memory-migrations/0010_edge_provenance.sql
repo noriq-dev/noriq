@@ -1,0 +1,21 @@
+-- ProjectMemory schema v10 (PLNR-283) — edge provenance, additive only.
+--
+-- Never edit 0001-0009; this only adds a column. See src/memory/migrations.ts's header comment
+-- for the full how-to-add-a-migration contract this follows.
+--
+-- `edges.provenance` names what CAUSED an edge — a short, parseable source tag such as
+-- `evidence:<memoryId>` or `coordination:<tag>`, never free prose and never a duplicate of the
+-- edge's own `type` — for a human asking "why does the graph believe this" and for PLNR-284's
+-- constellation payload. Nullable: existing edges, and any edge whose writer never records a
+-- cause (recordEpisode, projectActiveGeneration — untouched by this task), keep NULL, which is
+-- the honest value for "the cause was never recorded" (PLNR-283's execution spec explicitly
+-- defers backfilling provenance onto edges that already exist).
+--
+-- The edge-triple uniqueness PLNR-283's execution spec anticipated adding here — `(type,
+-- from_node_id, to_node_id)`, so a re-run backfill or a replayed event range can never double an
+-- edge — ALREADY EXISTS: 0002's `idx_edges_unique`, shipped for exactly this "a literal duplicate
+-- edge is never meaningful graph data" reason. Every edge writer (writeEdge, recordEpisode,
+-- projectActiveGeneration, and this task's new writers) already relies on it via
+-- `ON CONFLICT (type, from_node_id, to_node_id)`. Nothing left to add here — this migration is
+-- the single ALTER TABLE below and nothing more.
+ALTER TABLE edges ADD COLUMN provenance TEXT;

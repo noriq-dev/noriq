@@ -1250,6 +1250,18 @@ app.post('/api/projects/:pid/memory/lifecycle-sweep', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
   return c.json(await sweepProjectDebrisForProject(c.env, pid));
 });
+
+// PLNR-283: the idempotent full-state graph backfill — projects this project's LIVE tasks/
+// plans/docs/milestones/agents (plus the task<->plan/task<->doc relationships the board already
+// knows) into nodes/edges, straight from D1, never event replay. Safe to re-run any time: every
+// write is idempotent by uri/triple (stated acceptance — same counts, no changed ids). Exists so
+// a project whose event log predates this task can still get a connected memory graph without an
+// operator hand-replaying its projector cursor from zero.
+app.post('/api/projects/:pid/memory/graph/rebuild', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  const pid = c.req.param('pid')!;
+  return c.json(await memoryDO(c.env, pid).rebuildProjection(pid));
+});
 app.get('/api/projects/:pid/memory/items/:id', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
   const row = await memoryStub(c.env, pid).getMemoryItem(pid, c.req.param('id')!);

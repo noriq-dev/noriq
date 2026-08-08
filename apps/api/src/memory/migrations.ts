@@ -54,6 +54,7 @@ import sql0006 from '../../memory-migrations/0006_episodes.sql';
 import sql0007 from '../../memory-migrations/0007_episode_sitting.sql';
 import sql0008 from '../../memory-migrations/0008_evidence_verification.sql';
 import sql0009 from '../../memory-migrations/0009_guidance_drift.sql';
+import sql0010 from '../../memory-migrations/0010_edge_provenance.sql';
 
 export interface MemoryMigration {
   /** 1-based, contiguous, and equal to this entry's array index + 1. */
@@ -81,6 +82,10 @@ export const MEMORY_MIGRATIONS: readonly MemoryMigration[] = [
   // The directory listing is authoritative over the spec's filename (same pattern one task
   // earlier; see 0008's own comment).
   { version: 9, name: '0009_guidance_drift', sql: sql0009 },
+  // PLNR-283: edges.provenance — the one schema change this task is permitted (see the .sql
+  // file's own header comment for why the edge-triple uniqueness it also anticipated needs no
+  // new index).
+  { version: 10, name: '0010_edge_provenance', sql: sql0010 },
 ];
 
 /** The schema version a freshly-migrated store lands on. */

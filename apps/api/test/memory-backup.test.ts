@@ -53,7 +53,8 @@ describe('exportSnapshot — end to end via the DO RPC', () => {
 
     const manifest = MemoryBackupManifest.parse(result.manifest);
     expect(manifest.projectId).toBe(projectId);
-    expect(manifest.tableCounts.nodes).toBe(2);
+    // 2 explicit seed nodes + the memory's OWN node (PLNR-283: recordMemory always writes one).
+    expect(manifest.tableCounts.nodes).toBe(3);
     expect(manifest.tableCounts.outbox).toBeGreaterThan(0);
     expect(manifest.tier).toBe('core');
     expect(Object.keys(manifest.checksums).length).toBeGreaterThan(0);

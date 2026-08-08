@@ -261,10 +261,12 @@ describe('restoreSnapshot — round trip reproduces canonical state', () => {
     const r2 = await memory(projectId).restoreSnapshot(projectId, { exportedAt: second.manifest.exportedAt });
     expect(r2.ok).toBe(true);
 
-    // Data intact after two round trips, and the graph still traverses.
+    // Data intact after two round trips, and the graph still traverses. 2 explicit nodes (a, b)
+    // + the memory's own node + its repository citation's file node (PLNR-283: recordMemory now
+    // writes both); 1 explicit edge (a->b) + the memory's own observed_in edge to that file node.
     const h = await memory(projectId).health(projectId);
-    expect(h.tableCounts.nodes).toBe(2);
-    expect(h.tableCounts.edges).toBe(1);
+    expect(h.tableCounts.nodes).toBe(4);
+    expect(h.tableCounts.edges).toBe(2);
     expect(h.tableCounts.evidence).toBe(1);
     expect(await traverseOneHop(projectId, a, 'related_to')).toEqual([b]);
 

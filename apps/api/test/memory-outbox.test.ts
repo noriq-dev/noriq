@@ -4,6 +4,7 @@
 import { env } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import type { Env } from '../src/env';
+import { buildEntityUri } from '@noriq-dev/shared';
 import { createUser, mintTokenForUser, mcpCall, projectRoom } from './helpers';
 
 const appEnv = env as unknown as Env;
@@ -18,6 +19,11 @@ interface MemoryRpc {
   runProjector(pid: string): Promise<{ applied: number; cursor: number }>;
   reconcile(pid: string): Promise<{ delivered: number; failed: number; applied: number; cursor: number }>;
   _setForceDeliveryFailure(pid: string, fail: boolean): Promise<void>;
+  _countNodes(pid: string): Promise<number>;
+  dependencyNeighborhood(
+    pid: string,
+    input: { entityUri: string; edgeTypes?: string[]; maxDepth?: number; maxResults?: number },
+  ): Promise<{ coverage: { complete: boolean; reasons: string[] }; upstream: unknown[]; downstream: unknown[] }>;
 }
 const SYSTEM = { kind: 'system', id: null };
 interface RoomRpc {
@@ -127,6 +133,41 @@ describe('D1 event projector — reverse direction is idempotent', () => {
     expect(healthAfterSecond.tableCounts.nodes).toBe(healthAfterFirst.tableCounts.nodes);
 
     void taskId; // the projected node's uri embeds this; asserted via table count above
+  });
+
+  it('PLNR-283: widens to plan.created/doc.created/milestone.created, each an addressable node', async () => {
+    const { token, projectId } = await newOwnedProject('pm-projector-wide@example.com', 'PMPROJW');
+    const plan = await mcpCall(token, 'create_plan', {
+      projectId, title: 'projected plan',
+      phases: [{ title: 'phase 1', newTasks: [{ title: 'phase task' }] }],
+    });
+    if (plan.isError) throw new Error(`create_plan failed: ${plan.text}`);
+    const planId = plan.body.id as string;
+
+    const doc = await mcpCall(token, 'create_doc', { projectId, name: 'projected doc', body: 'settled content.' });
+    if (doc.isError) throw new Error(`create_doc failed: ${doc.text}`);
+    const docId = doc.body.id as string;
+
+    const milestone = await mcpCall(token, 'create_milestone', { projectId, title: 'projected milestone' });
+    if (milestone.isError) throw new Error(`create_milestone failed: ${milestone.text}`);
+    const milestoneId = milestone.body.id as string;
+
+    const first = await memory(projectId).runProjector(projectId);
+    expect(first.applied).toBeGreaterThan(0);
+
+    const planNode = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: buildEntityUri({ kind: 'plan', id: planId }) });
+    expect(planNode.coverage.reasons).not.toContain('seed-not-found');
+    const docNode = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: buildEntityUri({ kind: 'artifact', id: docId }) });
+    expect(docNode.coverage.reasons).not.toContain('seed-not-found');
+    const milestoneNode = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: buildEntityUri({ kind: 'unknown', id: milestoneId }) });
+    expect(milestoneNode.coverage.reasons).not.toContain('seed-not-found');
+
+    // Re-running over the now-fully-consumed range writes nothing new — same idempotency
+    // guarantee as the task.created case above, now exercised across every widened verb.
+    const nodesAfterFirst = await memory(projectId)._countNodes(projectId);
+    const second = await memory(projectId).runProjector(projectId);
+    expect(second.applied).toBe(0);
+    expect(await memory(projectId)._countNodes(projectId)).toBe(nodesAfterFirst);
   });
 });
 

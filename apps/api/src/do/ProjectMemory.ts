@@ -10,7 +10,10 @@ import { exportMemorySnapshot, sha256HexBytes } from '../memory/backup';
 import { fetchManifest, readSnapshotChunks, checkManifestHeader } from '../memory/restore';
 import { deleteAllProjectBackups, sizeStatus, type EraseReport, type EraseStepResult } from '../memory/lifecycle';
 import { MEMORY_MIGRATIONS } from '../memory/migrations';
-import { validateMemoryScope, validateEvidenceRef, memoryContentHash, evidenceHash, clampAuthority, type MemoryScope } from '../memory/writes';
+import {
+  validateMemoryScope, classifyEvidenceCitation, memoryContentHash, evidenceHash, clampAuthority,
+  type MemoryScope, type EvidenceCitation,
+} from '../memory/writes';
 import { searchBackend, indexEntity, removeEntity, clampMetadataTopK } from '../search';
 import { codeSearchBackend, indexCodeEntity, removeCodeEntity, type CodeEntityType } from '../memory/code-index';
 import {
@@ -19,7 +22,10 @@ import {
   type EpisodeUploadManifest,
 } from '../memory/ingest';
 import { IndexGenerationManifest, type IndexBatch } from '@noriq-dev/shared';
-import { planProjection, changedFileUris, coChangePairs, CO_CHANGE_PAIR_CAP } from '../memory/projection';
+import {
+  planProjection, changedFileUris, coChangePairs, CO_CHANGE_PAIR_CAP,
+  mapCoordinationEvent, evidenceCitationNodes, EVIDENCE_EDGE_TYPE,
+} from '../memory/projection';
 import {
   applyMemoryFilters, dedupeCandidates, rankCandidates, RETRIEVAL_DEFAULTS,
   type RetrievalHit, type RetrievalStage, type RankedHit,
@@ -1649,6 +1655,48 @@ export class ProjectMemory extends DurableObject<Env> {
     this._forceWriteFailure = fail;
   }
 
+  /**
+   * PLNR-283: idempotent-by-uri node upsert, INSIDE the caller's transaction — the same idiom
+   * `recordEpisode`'s local `upsertNode` closure establishes (kept a class METHOD here, not a
+   * third local closure, because `recordMemory`, `applyCoordinationEvent`, and
+   * `rebuildProjection` all need it and none of them track a running node/edge count the way
+   * `recordEpisode`'s own RPC result does). Never bumps `memory_revision` or writes an outbox
+   * row itself — every caller owns that once per logical mutation.
+   */
+  private upsertGraphNode(type: string, uri: string, label: string, now: string): string {
+    this.ctx.storage.sql.exec(
+      `INSERT INTO nodes (id, type, uri, label, created_at) VALUES (?1,?2,?3,?4,?5)
+       ON CONFLICT (uri) DO UPDATE SET label = excluded.label`,
+      newId('node'),
+      type,
+      uri,
+      label,
+      now,
+    );
+    return this.ctx.storage.sql.exec<{ id: string }>(`SELECT id FROM nodes WHERE uri = ?1`, uri).toArray()[0]!.id;
+  }
+
+  /**
+   * PLNR-283: idempotent-by-triple edge upsert — 0002's `idx_edges_unique` already enforces
+   * `(type, from_node_id, to_node_id)` uniqueness (this task's own migration, 0010, only adds
+   * `provenance`; see that file's header comment). `provenance` is written on the FIRST insert
+   * of a triple only — `ON CONFLICT ... DO NOTHING` never touches an existing row's provenance,
+   * so a later idempotent replay can never overwrite it and make the audit trail lie about which
+   * write actually caused the edge.
+   */
+  private linkGraphEdge(type: string, fromNodeId: string, toNodeId: string, now: string, provenance: string | null = null): void {
+    this.ctx.storage.sql.exec(
+      `INSERT INTO edges (id, type, from_node_id, to_node_id, created_at, provenance) VALUES (?1,?2,?3,?4,?5,?6)
+       ON CONFLICT (type, from_node_id, to_node_id) DO NOTHING`,
+      newId('edge'),
+      type,
+      fromNodeId,
+      toNodeId,
+      now,
+      provenance,
+    );
+  }
+
   async recordMemory(
     projectId: string,
     input: {
@@ -1669,9 +1717,19 @@ export class ProjectMemory extends DurableObject<Env> {
       if (existing) return { memoryId: (JSON.parse(existing.result) as { memoryId: string }).memoryId, operationId: input.operationId, deduped: true };
     }
     const scope = validateMemoryScope(input.scope ?? {});
-    const evidenceRefs = (input.evidence ?? []).map((e) => validateEvidenceRef(e));
-    const evidenceHashes = await Promise.all(evidenceRefs.map((e) => evidenceHash(e)));
+    // PLNR-283: an evidence array entry is either the existing repository-scoped citation
+    // (verified per branch/baseId, written to `evidence`) or a bare entity reference (task/
+    // plan/run/decision/episode/artifact/agent/…) naming a durable entity the statement is
+    // about — a graph fact, never an `evidence` row (nothing to re-verify against a worktree).
+    const citations = (input.evidence ?? []).map((e) => classifyEvidenceCitation(e));
+    const repoCitations = citations
+      .filter((c): c is Extract<EvidenceCitation, { source: 'repository' }> => c.source === 'repository')
+      .map((c) => c.ref);
+    const evidenceHashes = await Promise.all(repoCitations.map((e) => evidenceHash(e)));
     const contentHash = await memoryContentHash(input.kind, input.statement, scope);
+    // Only needed to build file/symbol uris (§18's repository-scoped shape) — skip the D1 round
+    // trip when nothing here cites a repository (matches `recordEpisode`'s own gating).
+    const projectKey = repoCitations.length ? await this.resolveProjectKey(projectId) : null;
 
     const operationId = input.operationId ?? newId('op');
     const authority = clampAuthority(input.authority ?? AUTHORITY_HYPOTHESIS, input.actor.kind);
@@ -1711,24 +1769,48 @@ export class ProjectMemory extends DurableObject<Env> {
         // the gate.
         input.kind === 'decision' && input.actor.kind === 'agent' ? now : null,
       );
-      evidenceRefs.forEach((ref, i) => {
-        this.ctx.storage.sql.exec(
-          `INSERT INTO evidence
-             (id, memory_item_id, repository_key, branch, base_id, path, symbol, content_hash, evidence_hash, verification_state, created_at)
-           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)`,
-          newId('ev'),
-          memoryId,
-          ref.repositoryKey,
-          ref.branch,
-          ref.baseId,
-          ref.path,
-          ref.symbol,
-          ref.contentHash,
-          evidenceHashes[i]!,
-          ref.verificationState,
-          now,
-        );
-      });
+      // PLNR-283 (§5/§11): the memory's own graph node, and typed edges to every entity its
+      // evidence cites — SAME transaction, SAME single outbox row below (never a second
+      // mutation, never a per-edge outbox row — the locked decision this task's execution spec
+      // states verbatim). The node is written even with zero citations: a memory is always a
+      // node. ONE pass over `citations` (not two) so a repository citation's freshly-minted
+      // `evidence` row id is on hand to become that citation's edge provenance — `evidence:
+      // <evidenceId>` (locked decision's own example grammar); an entity citation gets no
+      // `evidence` row to point at, so its provenance names the memory itself.
+      const memoryNodeId = this.upsertGraphNode('memory', buildEntityUri({ kind: 'memory', id: memoryId }), input.kind, now);
+      let repoCitationIndex = 0;
+      for (const citation of citations) {
+        let provenance: string;
+        if (citation.source === 'repository') {
+          const ref = citation.ref;
+          const evidenceId = newId('ev');
+          this.ctx.storage.sql.exec(
+            `INSERT INTO evidence
+               (id, memory_item_id, repository_key, branch, base_id, path, symbol, content_hash, evidence_hash, verification_state, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)`,
+            evidenceId,
+            memoryId,
+            ref.repositoryKey,
+            ref.branch,
+            ref.baseId,
+            ref.path,
+            ref.symbol,
+            ref.contentHash,
+            evidenceHashes[repoCitationIndex]!,
+            ref.verificationState,
+            now,
+          );
+          repoCitationIndex++;
+          provenance = `evidence:${evidenceId}`;
+        } else {
+          provenance = `evidence:${memoryId}`;
+        }
+        for (const node of evidenceCitationNodes(projectKey ?? '', citation)) {
+          const targetNodeId = this.upsertGraphNode(node.type, node.uri, node.label, now);
+          this.linkGraphEdge(EVIDENCE_EDGE_TYPE, memoryNodeId, targetNodeId, now, provenance);
+        }
+      }
+
       this.ctx.storage.sql.exec(
         `INSERT INTO outbox (id, operation_id, verb, subject_type, subject_id, payload, created_at) VALUES (?1,?2,'memory.changed','memory',?3,?4,?5)`,
         newId('obx'),
@@ -2070,33 +2152,49 @@ export class ProjectMemory extends DurableObject<Env> {
   // is an UPDATE of 0008's verification columns on an EXISTING evidence row.
   // ---------------------------------------------------------------------------
 
-  /** The active generation's (branch, baseId) for one repository, memoized per verification call
-   *  — many citations in one sweep typically share a repository, and this would otherwise be one
-   *  SELECT per citation. `null` when the repository has no active generation at all (no index
-   *  has ever run, or one is only staged) — the honest "nothing to check against" case. */
+  /** The active generation's (id, branch, baseId) for one repository, memoized per verification
+   *  call — many citations in one sweep typically share a repository, and this would otherwise
+   *  be one SELECT per citation. `null` when the repository has no active generation at all (no
+   *  index has ever run, or one is only staged) — the honest "nothing to check against" case. */
   private activeGenerationScope(
     repositoryKey: string,
-    cache: Map<string, { branch: string; baseId: string } | null>,
-  ): { branch: string; baseId: string } | null {
+    cache: Map<string, { id: string; branch: string; baseId: string } | null>,
+  ): { id: string; branch: string; baseId: string } | null {
     if (!cache.has(repositoryKey)) {
       const gen = this.ctx.storage.sql
-        .exec<{ branch: string; base_id: string }>(`SELECT branch, base_id FROM index_generations WHERE repository_key = ?1 AND status = 'active'`, repositoryKey)
+        .exec<{ id: string; branch: string; base_id: string }>(
+          `SELECT id, branch, base_id FROM index_generations WHERE repository_key = ?1 AND status = 'active'`,
+          repositoryKey,
+        )
         .toArray()[0];
-      cache.set(repositoryKey, gen ? { branch: gen.branch, baseId: gen.base_id } : null);
+      cache.set(repositoryKey, gen ? { id: gen.id, branch: gen.branch, baseId: gen.base_id } : null);
     }
     return cache.get(repositoryKey)!;
   }
 
-  /** Does the CURRENT graph carry a `file`/`symbol` node for this citation? Only meaningful once
-   *  a caller has confirmed an active generation exists for the repository — see `citationVerdict`
-   *  for what a `null` (no generation) result means instead. */
-  private checkCitationAgainstGraph(projectKey: string, citation: { repository_key: string; path: string; symbol: string | null }): CitationCheck {
+  /**
+   * Did THIS ACTIVE GENERATION actually stage a `file`/`symbol` entity for this citation? Reads
+   * `index_staged_entities` (keyed `(generation_id, uri)`, retained for the life of the
+   * generation — PLNR-261 never deletes staged rows on supersession), never the live `nodes`
+   * table. PLNR-283: `nodes` is no longer a reliable proxy for "the index actually found this
+   * file at this base" once `recordMemory` also upserts a `file`/`symbol` node for any
+   * repository-scoped evidence citation, real or not — a citation naming a file the repository
+   * has actually deleted must still verify `missing` even though the memory citing it just
+   * caused that same uri to exist as a node. Only meaningful once a caller has confirmed an
+   * active generation exists for the repository — see `citationVerdict` for what a `null` (no
+   * generation) result means instead.
+   */
+  private checkCitationAgainstGraph(generationId: string, projectKey: string, citation: { repository_key: string; path: string; symbol: string | null }): CitationCheck {
     const fileUri = buildEntityUri({ kind: 'file', projectKey, repositoryKey: citation.repository_key, path: citation.path });
-    const pathPresent = !!this.ctx.storage.sql.exec<{ id: string }>(`SELECT id FROM nodes WHERE uri = ?1`, fileUri).toArray()[0];
+    const pathPresent = !!this.ctx.storage.sql
+      .exec<{ x: number }>(`SELECT 1 AS x FROM index_staged_entities WHERE generation_id = ?1 AND uri = ?2`, generationId, fileUri)
+      .toArray()[0];
     let symbolPresent: boolean | null = null;
     if (citation.symbol) {
       const symbolUri = buildEntityUri({ kind: 'symbol', projectKey, repositoryKey: citation.repository_key, path: citation.path, name: citation.symbol });
-      symbolPresent = !!this.ctx.storage.sql.exec<{ id: string }>(`SELECT id FROM nodes WHERE uri = ?1`, symbolUri).toArray()[0];
+      symbolPresent = !!this.ctx.storage.sql
+        .exec<{ x: number }>(`SELECT 1 AS x FROM index_staged_entities WHERE generation_id = ?1 AND uri = ?2`, generationId, symbolUri)
+        .toArray()[0];
     }
     return { pathPresent, symbolPresent };
   }
@@ -2158,7 +2256,7 @@ export class ProjectMemory extends DurableObject<Env> {
     if (!rows.length) return { checked: 0, updated: 0, results: [] };
 
     const projectKey = await this.resolveProjectKey(projectId);
-    const genCache = new Map<string, { branch: string; baseId: string } | null>();
+    const genCache = new Map<string, { id: string; branch: string; baseId: string } | null>();
     const now = nowIso();
     const source = 'server-index';
     const results: Array<{ evidenceId: string; memoryItemId: string; verificationState: string }> = [];
@@ -2169,7 +2267,7 @@ export class ProjectMemory extends DurableObject<Env> {
       if (this._forceWriteFailure) throw new Error('injected write failure (test)');
       for (const row of rows) {
         const gen = this.activeGenerationScope(row.repository_key, genCache);
-        const check = gen ? this.checkCitationAgainstGraph(projectKey, row) : null;
+        const check = gen ? this.checkCitationAgainstGraph(gen.id, projectKey, row) : null;
         const verdict = citationVerdict(check);
         const baseId = gen?.baseId ?? null;
         const branch = gen?.branch ?? null;
@@ -2714,6 +2812,11 @@ export class ProjectMemory extends DurableObject<Env> {
     return {
       entityType: 'memory',
       id: row.id,
+      // PLNR-283: now that `recordMemory` writes every memory's own graph node, its hit carries
+      // the SAME uri that node was written under — the join key PLNR-284's constellation and
+      // PLNR-286's search-to-star-map wiring both depend on (§18: "a search hit and a rendered
+      // node refer to the same entity by uri equality").
+      uri: buildEntityUri({ kind: 'memory', id: row.id }),
       kind: row.kind,
       title: row.kind,
       snippet: row.statement.slice(0, 200),
@@ -2736,6 +2839,10 @@ export class ProjectMemory extends DurableObject<Env> {
     return {
       entityType: 'episode',
       id: row.id,
+      // PLNR-283: episodes have carried a graph node since PLNR-263 (`recordEpisode`'s own
+      // `episode` node) — parity was simply never wired into retrieval hits. Same join-key
+      // reasoning as the memory hit above.
+      uri: buildEntityUri({ kind: 'episode', id: row.id }),
       title: `episode ${row.run_id} (${row.landing_outcome})`,
       snippet: summarizeEpisodeBody(row.body).slice(0, 200),
       stage,
@@ -3801,26 +3908,17 @@ export class ProjectMemory extends DurableObject<Env> {
   }
 
   /**
-   * A deliberately minimal projection: today only `task.created` creates a graph node (type
-   * 'task', a stable entity URI). Every other coordination verb is acknowledged (the cursor
-   * still advances past it) with no projection write — the full projection matrix grows with
-   * Phases 3-6. `ON CONFLICT DO NOTHING` on the URI makes a re-applied event a no-op rather
-   * than a duplicate node, which matters because the cursor advance and this write commit in
-   * the SAME transaction — replaying a range this already consumed must stay side-effect-free.
+   * PLNR-247's `task.created`-only projection, widened by PLNR-283 to `plan.created`/
+   * `doc.created`/`milestone.created` — see `mapCoordinationEvent` (memory/projection.ts, the
+   * pure decision of what to write) for which verbs project a node and why. `upsertGraphNode`'s
+   * `ON CONFLICT (uri) DO UPDATE` makes a re-applied event a no-op node-identity-wise rather than
+   * a duplicate, which matters because the cursor advance and this write commit in the SAME
+   * transaction — replaying a range this already consumed must stay side-effect-free.
    */
   private applyCoordinationEvent(ev: ProjectedEvent): void {
-    if (ev.verb === 'task.created') {
-      const uri = buildEntityUri({ kind: 'task', id: ev.subjectId });
-      const label = typeof ev.payload.title === 'string' ? ev.payload.title : ev.subjectId;
-      this.ctx.storage.sql.exec(
-        `INSERT INTO nodes (id, type, uri, label, created_at) VALUES (?1, 'task', ?2, ?3, ?4)
-         ON CONFLICT (uri) DO NOTHING`,
-        newId('node'),
-        uri,
-        label,
-        ev.createdAt,
-      );
-    }
+    const projected = mapCoordinationEvent({ verb: ev.verb, subjectId: ev.subjectId, payload: ev.payload });
+    if (!projected) return;
+    this.upsertGraphNode(projected.type, projected.uri, projected.label, ev.createdAt);
   }
 
   /**
@@ -3852,6 +3950,110 @@ export class ProjectMemory extends DurableObject<Env> {
     return { ...drain, ...project };
   }
 
+  /**
+   * PLNR-283's backfill: an idempotent full-state graph rebuild, sourced from this project's
+   * LIVE D1 coordination tables — never event replay — so a project whose event log predates
+   * this task (or that the incremental projector never fully caught up on) still gains a
+   * connected graph without hand-replaying its cursor from zero. Projects every task/plan/doc/
+   * milestone/agent this project currently has, plus the task<->plan (`phase_tasks`) and
+   * task<->doc (`task_docs`) relationships the board already knows — `applyCoordinationEvent`
+   * cannot draw these from a single event's payload (a `plan.created` event carries phase task
+   * COUNTS, not ids; there is no event at all for "this task was added to a plan/doc"), and a
+   * `ctx.storage.transactionSync` block cannot await a second D1 read mid-transaction, so this
+   * reads everything up front, then writes it all in ONE transaction.
+   *
+   * Deliberately does NOT touch `projector_cursor` — that stays `runProjector`'s own concern.
+   * Every write here is idempotent (uri for nodes, the `(type, from, to)` triple for edges), so
+   * running this and the incremental projector in any order, any number of times, is always
+   * safe: re-running produces identical node/edge counts and no changed ids (stated acceptance).
+   */
+  async rebuildProjection(projectId: string): Promise<{ nodesWritten: number; edgesWritten: number }> {
+    await this.assertProjectId(projectId);
+    const now = nowIso();
+    const [tasks, plans, docs, milestones, agents, taskPlanLinks, taskDocLinks] = await Promise.all([
+      this.env.DB.prepare('SELECT id, title FROM tasks WHERE project_id = ?').bind(projectId).all<{ id: string; title: string }>(),
+      this.env.DB.prepare('SELECT id, title FROM plans WHERE project_id = ?').bind(projectId).all<{ id: string; title: string }>(),
+      this.env.DB.prepare('SELECT id, name FROM docs WHERE project_id = ?').bind(projectId).all<{ id: string; name: string }>(),
+      this.env.DB.prepare('SELECT id, title FROM milestones WHERE project_id = ?').bind(projectId).all<{ id: string; title: string }>(),
+      this.env.DB.prepare('SELECT id, name FROM agents WHERE project_id = ?').bind(projectId).all<{ id: string; name: string }>(),
+      this.env.DB.prepare(
+        `SELECT pt.task_id AS taskId, ph.plan_id AS planId FROM phase_tasks pt
+         JOIN phases ph ON ph.id = pt.phase_id JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ?`,
+      ).bind(projectId).all<{ taskId: string; planId: string }>(),
+      this.env.DB.prepare(
+        `SELECT td.task_id AS taskId, td.doc_id AS docId FROM task_docs td
+         JOIN tasks t ON t.id = td.task_id WHERE t.project_id = ?`,
+      ).bind(projectId).all<{ taskId: string; docId: string }>(),
+    ]);
+
+    let nodesWritten = 0;
+    let edgesWritten = 0;
+    this.ctx.storage.transactionSync(() => {
+      if (this._forceWriteFailure) throw new Error('injected write failure (test)');
+      const taskNodeId = new Map<string, string>();
+      for (const t of tasks.results) {
+        taskNodeId.set(t.id, this.upsertGraphNode('task', buildEntityUri({ kind: 'task', id: t.id }), t.title, now));
+        nodesWritten++;
+      }
+      const planNodeId = new Map<string, string>();
+      for (const p of plans.results) {
+        planNodeId.set(p.id, this.upsertGraphNode('plan', buildEntityUri({ kind: 'plan', id: p.id }), p.title, now));
+        nodesWritten++;
+      }
+      const docNodeId = new Map<string, string>();
+      for (const d of docs.results) {
+        docNodeId.set(d.id, this.upsertGraphNode('artifact', buildEntityUri({ kind: 'artifact', id: d.id }), d.name, now));
+        nodesWritten++;
+      }
+      for (const m of milestones.results) {
+        this.upsertGraphNode('unknown', buildEntityUri({ kind: 'unknown', id: m.id }), m.title, now);
+        nodesWritten++;
+      }
+      for (const a of agents.results) {
+        this.upsertGraphNode('agent', buildEntityUri({ kind: 'agent', id: a.id }), a.name, now);
+        nodesWritten++;
+      }
+      for (const link of taskPlanLinks.results) {
+        const fromId = taskNodeId.get(link.taskId);
+        const toId = planNodeId.get(link.planId);
+        if (fromId && toId) {
+          this.linkGraphEdge('related_to', fromId, toId, now, 'coordination:phase_tasks');
+          edgesWritten++;
+        }
+      }
+      for (const link of taskDocLinks.results) {
+        const fromId = taskNodeId.get(link.taskId);
+        const toId = docNodeId.get(link.docId);
+        if (fromId && toId) {
+          this.linkGraphEdge('related_to', fromId, toId, now, 'coordination:task_docs');
+          edgesWritten++;
+        }
+      }
+
+      // ONE summary outbox event for the whole rebuild — never one per node/edge (the same
+      // discipline `recordEpisode` and `projectActiveGeneration` already establish).
+      const operationId = newId('op');
+      this.ctx.storage.sql.exec(
+        `INSERT INTO outbox (id, operation_id, verb, subject_type, subject_id, payload, created_at) VALUES (?1,?2,'memory.changed','memory',?3,?4,?5)`,
+        newId('obx'),
+        operationId,
+        projectId,
+        JSON.stringify({ operationId, entityType: 'projection-rebuild', nodesWritten, edgesWritten }),
+        now,
+      );
+      this.ctx.storage.sql.exec(`UPDATE memory_revision SET value = value + 1 WHERE id = 0`);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO applied_operations (operation_id, applied_at, subject_type, subject_id, result) VALUES (?1,?2,'projection-rebuild',?3,?4)`,
+        operationId,
+        now,
+        projectId,
+        JSON.stringify({ nodesWritten, edgesWritten }),
+      );
+    });
+    this.ctx.storage.setAlarm(Date.now()).catch(() => {});
+    return { nodesWritten, edgesWritten };
+  }
+
   override async alarm(): Promise<void> {
     const pid = this._pid ?? (await this.ctx.storage.get<string>('pid'));
     if (!pid) return;
@@ -3861,6 +4063,32 @@ export class ProjectMemory extends DurableObject<Env> {
   async _countNodes(projectId: string): Promise<number> {
     await this.assertProjectId(projectId);
     return this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM nodes`).toArray()[0]?.n ?? 0;
+  }
+
+  async _countEdges(projectId: string): Promise<number> {
+    await this.assertProjectId(projectId);
+    return this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM edges`).toArray()[0]?.n ?? 0;
+  }
+
+  /** Test-only: an edge's stored `provenance` (0010, PLNR-283), resolved by its `(type,
+   *  from-uri, to-uri)` triple — so provenance-tagging tests can assert without a wider query
+   *  surface. `null` both when the edge carries no provenance and when either endpoint/the edge
+   *  itself does not exist — callers that need to tell those apart assert existence separately. */
+  async _edgeProvenance(projectId: string, type: string, fromUri: string, toUri: string): Promise<string | null> {
+    await this.assertProjectId(projectId);
+    const from = this.resolveNodeByUri(fromUri);
+    const to = this.resolveNodeByUri(toUri);
+    if (!from || !to) return null;
+    return (
+      this.ctx.storage.sql
+        .exec<{ provenance: string | null }>(
+          `SELECT provenance FROM edges WHERE type = ?1 AND from_node_id = ?2 AND to_node_id = ?3`,
+          type,
+          from.nodeId,
+          to.nodeId,
+        )
+        .toArray()[0]?.provenance ?? null
+    );
   }
 
   /** Test-only: a table's stored CREATE TABLE text. Exists so a restore test can assert the
