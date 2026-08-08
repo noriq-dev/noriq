@@ -87,4 +87,24 @@ if (typeof window !== 'undefined') {
       configurable: true,
     });
   }
+
+  // PLNR-285: jsdom implements no `window.matchMedia` at all (unlike browsers, which always have
+  // it) — any component reading a media query (theme.ts's dark/light resolution, the star map's
+  // `prefers-reduced-motion` check) throws on mount under this test environment otherwise. Only
+  // installed when genuinely missing, so a real implementation (should jsdom ever add one) is
+  // never shadowed. `matches` defaults to false — "no explicit preference" — since no test needs
+  // this stub to report a media feature as active by default; a test that cares about a specific
+  // query mocks `window.matchMedia` itself for that one case.
+  if (typeof window.matchMedia !== 'function') {
+    window.matchMedia = ((query: string) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    })) as typeof window.matchMedia;
+  }
 }
