@@ -33,6 +33,7 @@ import { MEMORY_SKILL_MD } from './skill-memory';
 import { signUploadToken, resolveUploadSecret } from './lib/upload-token';
 import { taskClaimability } from './lib/claimability';
 import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
+import pkg from '../package.json';
 import {
   projectRoleAllows,
   recordAuthorizationAudit,
@@ -345,7 +346,11 @@ const minimumMcpAction = (
 
 /** Self-reported server identity — sent in legacy `initialize` results and mirrored into
  *  every modern (2026-07-28) result's `_meta` serverInfo by the compat layer. */
-export const SERVER_INFO = { name: 'noriq', version: '0.3.0' };
+// The server version is also the MCP catalogue revision. Copilot hosts may cache tools/list, so
+// pinning this to an old protocol-era value makes newly deployed tools look permanently absent.
+// The application version is bumped for every deploy and is the cache invalidator every host can
+// observe without understanding a Noriq-specific extension.
+export const SERVER_INFO = { name: 'noriq', version: pkg.version };
 
 export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthTokenId?: string; sessionId?: string; origin?: string } = {}): McpServer {
   const server = new McpServer(
@@ -354,7 +359,11 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       instructions: INSTRUCTIONS,
       // logging → standard notifications/message (any client); experimental claude/channel
       // → Claude's richer surfacing. Both ride the live POST SSE stream (PLNR-54/45).
-      capabilities: { logging: {}, experimental: { 'claude/channel': {} } },
+      capabilities: {
+        tools: { listChanged: true },
+        logging: {},
+        experimental: { 'claude/channel': {} },
+      },
     },
   );
   const actor = asActor(agent);

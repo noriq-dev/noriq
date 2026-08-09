@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { SELF } from 'cloudflare:test';
 import { createAgent, mcpCall } from './helpers';
+import pkg from '../package.json';
+import { mcpReferenceSpecs } from '../src/mcp';
 
 /**
  * MCP 2026-07-28 ("modern") compat layer — PLNR-233.
@@ -84,11 +86,13 @@ describe('server/discover', () => {
     expect(r.supportedVersions).toContain('2025-11-25');
     expect(r.supportedVersions).toContain('2025-03-26');
     expect(r.capabilities.tools).toBeDefined();
+    expect(r.capabilities.tools.listChanged).toBe(true);
     expect(r.capabilities.resources).toBeDefined();
     expect(r.instructions).toContain('Noriq');
     expect(r.ttlMs).toBeGreaterThan(0);
     expect(r.cacheScope).toBe('private');
     expect(r._meta[SERVER_INFO_KEY].name).toBe('noriq');
+    expect(r._meta[SERVER_INFO_KEY].version).toBe(pkg.version);
   });
 
   it('works without the required-for-other-methods _meta fields (it is the probe)', async () => {
@@ -120,9 +124,25 @@ describe('stateless requests (no initialize, no session)', () => {
     const { status, body } = await modern(apiKey, 'tools/list', {});
     expect(status).toBe(200);
     expect(body.result.resultType).toBe('complete');
-    expect(body.result.ttlMs).toBeGreaterThan(0);
+    expect(body.result.ttlMs).toBe(60_000);
     expect(body.result.cacheScope).toBe('private');
     expect(body.result.tools.length).toBeGreaterThan(10);
+  });
+
+  it('serves the complete versioned Copilot catalogue with current input shapes', async () => {
+    const { status, body } = await modern(apiKey, 'tools/list', {});
+    expect(status).toBe(200);
+    expect(body.result._meta[SERVER_INFO_KEY].version).toBe(pkg.version);
+
+    const expected = mcpReferenceSpecs().tools.map((tool) => tool.name).sort();
+    const actual = body.result.tools.map((tool: { name: string }) => tool.name).sort();
+    expect(actual).toEqual(expected);
+    for (const required of ['spin_off_task', 'record_memory', 'search_project_memory', 'explain_project_area', 'get_task_context']) {
+      expect(actual).toContain(required);
+    }
+
+    const requestInput = body.result.tools.find((tool: { name: string }) => tool.name === 'request_input');
+    expect(requestInput.inputSchema.properties.blocking.type).toBe('boolean');
   });
 
   it('accepts a notification with 202 and no body', async () => {

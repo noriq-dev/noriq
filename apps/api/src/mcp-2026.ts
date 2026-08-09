@@ -62,7 +62,9 @@ const FORWARDED_METHODS = new Set(['tools/list', 'tools/call', 'resources/list',
 /** Freshness hints for CacheableResult methods. All private: tools/list varies with the
  *  agent's tool floor and every read is behind the caller's token. */
 const CACHE_TTLS: Record<string, number> = {
-  'tools/list': 3_600_000, // per-agent catalogue changes only on deploy or run re-dispatch
+  // A deploy can change the catalogue. SERVER_INFO.version is the durable cache revision, while
+  // this short TTL keeps hosts that ignore it from holding a stale Copilot surface for an hour.
+  'tools/list': 60_000,
   'resources/list': 60_000,
   'resources/read': 0, // docs are mutable; attachments are cheap to re-read
   'resources/templates/list': 3_600_000,
@@ -186,9 +188,9 @@ export async function handleModernMcp(c: Context<AppContext>, env: Env, conn: Co
         // Matches what the legacy initialize result advertises (registration adds
         // tools/resources; logging is deprecated in 2026-07-28 so it is not offered here).
         // listChanged/subscribe are honored on a subscriptions/listen stream (PLNR-234).
-        capabilities: { tools: {}, resources: { listChanged: true, subscribe: true }, experimental: { 'claude/channel': {} } },
+        capabilities: { tools: { listChanged: true }, resources: { listChanged: true, subscribe: true }, experimental: { 'claude/channel': {} } },
         instructions: INSTRUCTIONS,
-        ttlMs: 3_600_000,
+        ttlMs: 60_000,
         cacheScope: 'private' as const,
         _meta: { [META_SERVER_INFO]: SERVER_INFO },
       },
