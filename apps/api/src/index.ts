@@ -23,6 +23,10 @@ import {
 } from './ask-chats';
 import { verifyUploadToken, resolveUploadSecret, signIngestToken, verifyIngestToken, type IngestClaims } from './lib/upload-token';
 import { USER_PROJECT_WHERE, taskWireStatus, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
+import {
+  groupRoleAllows, projectRoleAllows, resolveAccountCapabilities, resolveGroupRole, resolveProjectAccess,
+  recordAuthorizationAudit, userCanCreateGroup, userCanCreateProject, type ProjectAction,
+} from './lib/authorization';
 import { advertisedWorkflowNames } from './lib/workflows';
 import type { Actor, RunView } from './do/ProjectRoom';
 import { SKILL_MD, SKILL_REFERENCES, SKILL_MD_SURFACE } from './skill';
@@ -44,6 +48,7 @@ import { readBoundedBody, verifyBatchChecksum, decodeBatchRows, MAX_INGEST_BATCH
 import { normalizeVerificationReport } from './memory/verification';
 import { sweepPendingEpisodeJobs } from './memory/episodes';
 import { AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget, isTerminalRunStatus, normalizeProjectKey, IndexGenerationManifest, ContextPackRole, type RunnerIndexCursor } from '@noriq-dev/shared';
+import { auditAuthorizationParity, reconcileLegacyGroupGrants } from './lib/authorization-parity';
 
 export { ProjectRoom } from './do/ProjectRoom';
 export { AgentSession } from './do/AgentSession';
@@ -52,6 +57,29 @@ export { RunnerHub } from './do/RunnerHub';
 export { ProjectMemory } from './do/ProjectMemory';
 
 const app = new Hono<AppContext>();
+
+const userWithCapabilities = async (
+  env: Env,
+  user: { id: string; email: string; name: string; role: string },
+) => {
+  const capabilities = await resolveAccountCapabilities(env.DB, user.id);
+  return {
+    ...user,
+    accessMode: capabilities.accessMode,
+    canCreateProjects: capabilities.canCreateProjects,
+    canCreateGroups: capabilities.canCreateGroups,
+  };
+};
+
+const projectAccessFields = (access: Awaited<ReturnType<typeof resolveProjectAccess>>) => ({
+  effectiveRole: access.role,
+  accessSource: access.source,
+  cappedByReadOnly: access.cappedByReadOnly,
+  canView: projectRoleAllows(access.role, 'view'),
+  canContribute: projectRoleAllows(access.role, 'contribute'),
+  canManage: projectRoleAllows(access.role, 'manage'),
+  canOwn: projectRoleAllows(access.role, 'own'),
+});
 
 // CORS for the MCP + OAuth surface so browser-based and cross-origin MCP clients
 // can preflight (PLNR-82). Registered before the handlers so it wraps them.
@@ -122,10 +150,61 @@ const demoDenied = (c: Context<AppContext>): Response | null =>
 // write route can forget the check (the mass-IDOR hole this closes came from the
 // check living only on the MCP path). userAuth runs first (idempotent) to populate
 // c.var.user; the route-level userAuth then no-ops.
-/** Human-path project reach (PLNR-92/97): an admin sees everything; everyone else
- *  must own the project or be a member of its group. */
-const reachesProject = (c: Context<AppContext>, pid: string): Promise<boolean> =>
-  c.var.user!.role === 'admin' ? Promise.resolve(true) : userCanAccessProject(c.env, c.var.user!.id, pid);
+/** Human-path project reach. Human admins may opt into the explicit override; credentials and
+ * agent paths never call this helper and therefore never inherit it. */
+const reachesProject = async (c: Context<AppContext>, pid: string): Promise<boolean> => {
+  const access = await resolveProjectAccess(c.env.DB, c.var.user!.id, pid, { allowAdminOverride: true });
+  return projectRoleAllows(access.role, 'view');
+};
+
+/** Stable human-path denial for routes whose project id is discovered from another row and
+ * therefore sit outside the central /api/projects/:pid/* policy middleware. */
+const humanProjectActionDenied = async (
+  c: Context<AppContext>,
+  pid: string,
+  action: ProjectAction,
+): Promise<Response | null> => {
+  const access = await resolveProjectAccess(c.env.DB, c.var.user!.id, pid, { allowAdminOverride: true });
+  if (!projectRoleAllows(access.role, 'view')) return c.json({ error: 'not found' }, 404);
+  if (!projectRoleAllows(access.role, action)) {
+    return c.json({
+      error: `project ${action === 'contribute' ? 'contributor' : action} role required`,
+      code: 'project_action_denied',
+      action,
+      role: access.role,
+      reason: access.cappedByReadOnly ? 'account_read_only' : 'insufficient_project_role',
+    }, 403);
+  }
+  return null;
+};
+
+// POST is ordinarily a mutation, but these query-shaped endpoints use POST for bounded request
+// bodies and remain viewer actions. Everything else maps to a stable minimum action here; more
+// sensitive per-field owner checks (publication/transfer) remain inside their handlers.
+const VIEWER_POST_ROUTES = [
+  /\/memory\/(search|similar-effort|explain|constellation|context)$/,
+];
+const MANAGER_ROUTES = [
+  /\/meta$/,
+  /\/access(?:\/.*)?$/,
+  /\/runs$/,
+  /\/plans\/[^/]+\/dispatch$/,
+  /\/plans\/[^/]+\/(approve|reject)$/,
+  /\/tasks\/[^/]+\/spinoff\/(accept|reject)$/,
+  /\/locks\/[^/]+\/force-release$/,
+  /\/search\/reindex$/,
+  /\/memory\/repositories(?:\/[^/]+)?$/,
+  /\/memory\/(backup|restore(?:\/rollback)?|lifecycle-sweep|graph\/rebuild)$/,
+  /\/memory\/generations(?:\/[^/]+\/(?:activate|abort)|\/prune-retained)$/,
+  /\/memory\/vectors\/rebuild$/,
+  /\/memory\/items\/[^/]+\/(approve|reject)$/,
+];
+
+const projectActionForRequest = (method: string, pathname: string): ProjectAction => {
+  if (method === 'GET' || method === 'HEAD' || VIEWER_POST_ROUTES.some((re) => re.test(pathname))) return 'view';
+  if (MANAGER_ROUTES.some((re) => re.test(pathname))) return 'manage';
+  return 'contribute';
+};
 
 /** Resolve a dependency BLOCKER ref on the human path (PLNR-241): id or display key (both
  *  globally unique), in this project or any project this session can reach — the REST twin
@@ -145,8 +224,31 @@ async function requireProjectAccess(c: Context<AppContext>, next: Next) {
   // DELETE) is out of scope — it keeps its own owner/admin gate (403).
   const parts = new URL(c.req.url).pathname.split('/');
   const pid = parts[3];
-  if (pid && parts.length > 4 && !(await reachesProject(c, pid))) {
-    return c.json({ error: 'not found' }, 404);
+  if (pid && parts.length > 4) {
+    const action = projectActionForRequest(c.req.method, new URL(c.req.url).pathname);
+    const access = await resolveProjectAccess(c.env.DB, c.var.user!.id, pid, { allowAdminOverride: true });
+    if (!access.exists || !projectRoleAllows(access.role, 'view')) {
+      await recordAuthorizationAudit(c.env.DB, {
+        actorKind: 'human', actorId: c.var.user!.id, action: 'project.action', resourceType: 'project', resourceId: pid,
+        decision: 'deny', reason: access.exists ? 'no_project_access' : 'project_not_found', metadata: { requiredAction: action, transport: 'rest' },
+      }).catch(() => {});
+      return c.json({ error: 'not found' }, 404);
+    }
+    if (!projectRoleAllows(access.role, action)) {
+      const requiredRole = action === 'contribute' ? 'contributor' : action === 'manage' ? 'manager' : action === 'own' ? 'owner' : 'viewer';
+      await recordAuthorizationAudit(c.env.DB, {
+        actorKind: 'human', actorId: c.var.user!.id, action: 'project.action', resourceType: 'project', resourceId: pid,
+        decision: 'deny', reason: access.cappedByReadOnly ? 'account_read_only' : 'insufficient_project_role',
+        metadata: { requiredAction: action, effectiveRole: access.role, transport: 'rest' },
+      }).catch(() => {});
+      return c.json({
+        error: `project ${requiredRole} role required`,
+        code: 'project_action_denied',
+        action,
+        role: access.role,
+        reason: access.cappedByReadOnly ? 'account is read-only' : 'insufficient project role',
+      }, 403);
+    }
   }
   await next();
 }
@@ -252,10 +354,9 @@ app.get('/ws/projects/:projectId', async (c) => {
     try { originHost = new URL(origin).host; } catch { originHost = null; } // malformed → treat as cross-origin
     if (originHost !== new URL(c.req.url).host) return c.text('cross-origin websocket refused', 403);
   }
-  // Authenticate + authorize the handshake (PLNR-91): the session cookie rides the
-  // upgrade. Previously this forwarded straight to the DO with NO check, so anyone
-  // could subscribe to any project's entire event log. Mirror VISIBILITY_WHERE
-  // (owner / group member / admin); 404 (not 403) so project existence doesn't leak.
+  // Authenticate + authorize the handshake. The DO receives only a server-authenticated
+  // identity attachment and re-checks it on subscribe and broadcast so revocation closes an
+  // already-open socket before it receives another event.
   const sid = readSessionId(c.req.header('Cookie') ?? '');
   const user = sid
     ? await c.env.DB.prepare(
@@ -265,10 +366,12 @@ app.get('/ws/projects/:projectId', async (c) => {
     : null;
   if (!user) return c.text('not signed in', 401);
   const pid = c.req.param('projectId');
-  if (user.role !== 'admin' && !(await userCanAccessProject(c.env, user.id, pid))) {
-    return c.text('not found', 404);
-  }
-  return room(c.env, pid).fetch(c.req.raw);
+  const access = await resolveProjectAccess(c.env.DB, user.id, pid, { allowAdminOverride: true });
+  if (!projectRoleAllows(access.role, 'view')) return c.text('not found', 404);
+  const headers = new Headers(c.req.raw.headers);
+  headers.set('X-Noriq-Authorized-User', user.id);
+  headers.set('X-Noriq-Admin-Override', user.role === 'admin' ? '1' : '0');
+  return room(c.env, pid).fetch(new Request(c.req.raw, { headers }));
 });
 
 // The runtime channel (RUN-7): the daemon dials this per-runner WS. Unlike the
@@ -281,10 +384,11 @@ app.get('/ws/runner/:id', async (c) => {
   const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
   if (!token) return c.text('missing bearer token', 401);
   const tok = await c.env.DB.prepare(
-    `SELECT t.user_id AS userId, u.email AS userEmail FROM oauth_tokens t
+    `SELECT t.id AS tokenId, t.user_id AS userId, u.email AS userEmail FROM oauth_tokens t
      JOIN users u ON u.id = t.user_id
-     WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
-  ).bind(await sha256Hex(token)).first<{ userId: string; userEmail: string }>();
+     WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       AND u.disabled = 0`,
+  ).bind(await sha256Hex(token)).first<{ tokenId: string; userId: string; userEmail: string }>();
   if (!tok) return c.text('invalid or expired token', 401);
   // This route does its own bearer lookup (a Node client sets headers), so it bypasses
   // agentAuth's demo kill switch — re-apply it here (PLNR-199) or a rotated legacy demo
@@ -293,7 +397,12 @@ app.get('/ws/runner/:id', async (c) => {
   const id = c.req.param('id')!;
   const owned = await c.env.DB.prepare('SELECT id FROM runners WHERE id = ? AND owner_user_id = ?').bind(id, tok.userId).first();
   if (!owned) return c.text('not found', 404);
-  return c.env.RUNNER_HUB.get(c.env.RUNNER_HUB.idFromName(id)).fetch(c.req.raw);
+  const account = await resolveAccountCapabilities(c.env.DB, tok.userId);
+  if (account.accessMode !== 'read_write') return c.text('account is read-only', 403);
+  const headers = new Headers(c.req.raw.headers);
+  headers.set('X-Noriq-Authorized-User', tok.userId);
+  headers.set('X-Noriq-Authorized-Token', tok.tokenId);
+  return c.env.RUNNER_HUB.get(c.env.RUNNER_HUB.idFromName(id)).fetch(new Request(c.req.raw, { headers }));
 });
 
 // --- admin bootstrap (users; agent key issuance retired — agents arrive via OAuth) --
@@ -411,7 +520,7 @@ app.post('/api/setup', async (c) => {
   await c.env.DB.prepare('INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)')
     .bind(await sha256Hex(sid), id, expires.toISOString()).run();
   c.header('Set-Cookie', sessionSetCookie(sid, expires));
-  return c.json({ user: { id, email: body.email, name: body.name, role: 'admin' } });
+  return c.json({ user: await userWithCapabilities(c.env, { id, email: body.email, name: body.name, role: 'admin' }) });
 });
 
 // --- human auth -----------------------------------------------------------------
@@ -433,7 +542,7 @@ app.post('/api/demo/login', async (c) => {
   await c.env.DB.prepare('INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)')
     .bind(await sha256Hex(sid), user!.id, expires.toISOString()).run();
   c.header('Set-Cookie', sessionSetCookie(sid, expires));
-  return c.json({ user });
+  return c.json({ user: await userWithCapabilities(c.env, user!) });
 });
 
 app.post('/api/auth/login', async (c) => {
@@ -455,7 +564,7 @@ app.post('/api/auth/login', async (c) => {
   await c.env.DB.prepare('INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)')
     .bind(await sha256Hex(sid), user.id, expires.toISOString()).run();
   c.header('Set-Cookie', sessionSetCookie(sid, expires));
-  return c.json({ user: { id: user.id, email: user.email, name: user.name, role: user.role } });
+  return c.json({ user: await userWithCapabilities(c.env, user) });
 });
 
 app.post('/api/auth/logout', userAuth, async (c) => {
@@ -575,16 +684,6 @@ app.post('/api/auth/sessions/revoke-all', userAuth, async (c) => {
 });
 
 // --- UI read API (session-authed) -------------------------------------------------
-/** Visibility (PLNR-48/83): a private (ungrouped) project is owner-only; a GROUPED
- *  project is shared with that group's MEMBERS; admins see everything. Every project
- *  has an owner (migration 0014), so there is no ownerless/global-visible case.
- *  Binds: ?=role, ?=userId (owner), ?=userId (member). */
-const VISIBILITY_WHERE = `(
-  ? = 'admin'
-  OR p.owner_user_id = ?
-  OR (p.group_id IS NOT NULL AND p.group_id IN (SELECT group_id FROM user_groups WHERE user_id = ? AND status = 'accepted'))
-)`;
-
 app.get('/api/projects', userAuth, async (c) => {
   const u = c.var.user!;
   // PLNR-83: admins see only their own projects by default (owning all of them is
@@ -602,8 +701,14 @@ app.get('/api/projects', userAuth, async (c) => {
   const stmt = adminAll
     ? c.env.DB.prepare(`${select} WHERE p.status = 'active' ORDER BY p.created_at`)
     : c.env.DB.prepare(`${select} WHERE p.status = 'active' AND ${USER_PROJECT_WHERE} ORDER BY p.created_at`).bind(u.id);
-  const { results } = await stmt.all();
-  return c.json({ projects: results, admin: u.role === 'admin' });
+  const { results } = await stmt.all<Record<string, unknown> & { id: string }>();
+  const projects = await Promise.all(results.map(async (project) => ({
+    ...project,
+    ...projectAccessFields(await resolveProjectAccess(c.env.DB, u.id, project.id, {
+      allowAdminOverride: adminAll,
+    })),
+  })));
+  return c.json({ projects, admin: u.role === 'admin' });
 });
 
 // Cross-project attention inbox (PLNR-121): everything that needs a HUMAN right now —
@@ -611,25 +716,27 @@ app.get('/api/projects', userAuth, async (c) => {
 // project the user can see, so "what needs me" is one call, not ten open tabs.
 app.get('/api/attention', userAuth, async (c) => {
   const u = c.var.user!;
+  const visibleProjects = u.role === 'admin' ? '1 = 1' : USER_PROJECT_WHERE;
+  const scopeBinds = u.role === 'admin' ? [] : [u.id];
   const [signals, overdue] = await Promise.all([
     c.env.DB.prepare(
       `SELECT s.id, s.project_id AS projectId, p.key AS projectKey, s.task_id AS taskId,
               (SELECT key FROM tasks WHERE id = s.task_id) AS taskKey,
               s.agent_name AS agentName, s.type, s.severity, s.title, s.body, s.options, s.questions, s.created_at AS createdAt
        FROM signals s JOIN projects p ON p.id = s.project_id AND p.status = 'active'
-       WHERE s.status = 'open' AND ${VISIBILITY_WHERE}
+       WHERE s.status = 'open' AND ${visibleProjects}
        ORDER BY CASE WHEN s.type = 'input_request' THEN 0 ELSE 1 END,
                 CASE s.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, s.created_at`,
-    ).bind(u.role, u.id, u.id).all(),
+    ).bind(...scopeBinds).all(),
     c.env.DB.prepare(
       `SELECT t.id, t.key, t.title, t.due_at AS dueAt, ${taskWireStatus('t')} AS status, t.failed_at AS failedAt,
               t.project_id AS projectId, p.key AS projectKey
        FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
-       WHERE ${VISIBILITY_WHERE}
+       WHERE ${visibleProjects}
          AND t.due_at IS NOT NULL AND t.due_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')
          AND t.status NOT IN ('done','cancelled') AND t.archived_at IS NULL
        ORDER BY t.due_at LIMIT 50`,
-    ).bind(u.role, u.id, u.id).all(),
+    ).bind(...scopeBinds).all(),
   ]);
   return c.json({
     signals: signals.results.map((s) => ({
@@ -697,11 +804,7 @@ app.get('/api/public/projects/:pid/snapshot', async (c) => {
 
 app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
-  const u = c.var.user!;
-  const visible = await c.env.DB.prepare(
-    `SELECT 1 FROM projects p WHERE p.id = ? AND ${VISIBILITY_WHERE}`,
-  ).bind(pid, u.role, u.id, u.id).first();
-  if (!visible) return c.json({ error: 'not found' }, 404);
+  const effectiveAccess = await resolveProjectAccess(c.env.DB, c.var.user!.id, pid, { allowAdminOverride: true });
   // Auto-archive done tasks untouched for >24h whenever the project is viewed.
   await room(c.env, pid).sweepArchive(pid).catch(() => {});
   // PLNR-225: same opportunistic sweep for completed plans (all member tasks settled >24h ago).
@@ -806,7 +909,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
   );
   return c.json({
     version: pkg.version, // deploy marker — the SPA reloads itself on mismatch (PLNR-193)
-    project,
+    project: { ...(project as Record<string, unknown>), ...projectAccessFields(effectiveAccess) },
     tasks: tasks.results,
     dependencies: deps.results,
     externalTasks,
@@ -841,10 +944,10 @@ app.get('/api/tasks/search', userAuth, async (c) => {
   });
   const limit = Math.min(Math.max(parseInt(q.limit ?? '50', 10) || 50, 1), 200);
   const pid = q.projectId ?? null;
-  // VISIBILITY_WHERE and the filter fragment both use bare `?` — bind in textual order.
+  const visibleProjects = u.role === 'admin' ? '1 = 1' : USER_PROJECT_WHERE;
   const base = `FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
-    WHERE ${VISIBILITY_WHERE} AND (? IS NULL OR t.project_id = ?)${sql}`;
-  const allBinds = [u.role, u.id, u.id, pid, pid, ...binds];
+    WHERE ${visibleProjects} AND (? IS NULL OR t.project_id = ?)${sql}`;
+  const allBinds = [...(u.role === 'admin' ? [] : [u.id]), pid, pid, ...binds];
   const [rows, total] = await Promise.all([
     c.env.DB.prepare(
       `SELECT t.id, t.key, t.title, ${taskWireStatus('t')} AS status, t.failed_at AS failedAt, t.priority, t.estimate, t.due_at AS dueAt, t.type,
@@ -898,6 +1001,13 @@ app.post('/api/projects', userAuth, async (c) => {
   const denied = demoDenied(c); // demo stays inside the seeded project (PLNR-199)
   if (denied) return denied;
   const body = await c.req.json<{ key: string; name: string; description?: string }>();
+  if (!(await userCanCreateProject(c.env, c.var.user!.id))) {
+    return c.json({
+      error: 'your account is not allowed to create projects',
+      code: 'project_creation_denied',
+      capability: 'canCreateProjects',
+    }, 403);
+  }
   if (!/^[A-Z][A-Z0-9]{0,7}$/.test(body.key ?? '')) return c.json({ error: 'key must be 1-8 uppercase letters/digits' }, 400);
   const id = newId('prj'); // random, not prj_<key> — see create_project in mcp.ts (PLNR-106)
   await c.env.DB.prepare(
@@ -1081,10 +1191,6 @@ app.delete('/api/projects/:pid/plans/:plid', userAuth, async (c) =>
 
 // Project docs (PLNR-158) — reads direct, writes through the DO.
 app.get('/api/projects/:pid/docs', userAuth, async (c) => {
-  const u = c.var.user!;
-  const visible = await c.env.DB.prepare(`SELECT 1 FROM projects p WHERE p.id = ? AND ${VISIBILITY_WHERE}`)
-    .bind(c.req.param('pid')!, u.role, u.id, u.id).first();
-  if (!visible) return c.json({ error: 'not found' }, 404);
   const { results } = await c.env.DB.prepare(
     `SELECT d.id, d.name, d.description, d.body, d.folder, d.author_kind AS authorKind, d.author_name AS authorName, d.updated_at AS updatedAt,
             (SELECT GROUP_CONCAT(g.name) FROM doc_tags dt JOIN tags g ON g.id = dt.tag_id WHERE dt.doc_id = d.id) AS tags
@@ -1767,10 +1873,9 @@ app.delete('/api/projects/:pid', userAuth, async (c) => {
   const denied = demoDenied(c);
   if (denied) return denied;
   const pid = c.req.param('pid')!;
-  const proj = await c.env.DB.prepare('SELECT owner_user_id AS owner FROM projects WHERE id = ?').bind(pid).first<{ owner: string | null }>();
-  if (!proj) return c.json({ error: 'not found' }, 404);
-  const u = c.var.user!;
-  if (u.role !== 'admin' && proj.owner && proj.owner !== u.id) return c.json({ error: 'only the project owner or an admin can delete a project' }, 403);
+  const access = await resolveProjectAccess(c.env.DB, c.var.user!.id, pid, { allowAdminOverride: true });
+  if (!access.exists || !projectRoleAllows(access.role, 'view')) return c.json({ error: 'not found' }, 404);
+  if (!projectRoleAllows(access.role, 'own')) return c.json({ error: 'project owner role required', code: 'project_action_denied', action: 'own' }, 403);
   return c.json(await room(c.env, pid).deleteProject(pid, humanActor(c)));
 });
 
@@ -1781,8 +1886,8 @@ app.post('/api/projects/:pid/tasks/:tid/release', userAuth, async (c) => {
 });
 
 // --- groups (collections of projects) ----------------------------------------------
-// Authorization (PLNR-81): a group is adjustable only by its members (rows in
-// user_groups) or an admin. Non-members can't even see groups they don't belong to.
+// Authorization (PLNR-327): accepted membership permits group use and roster reads; only a
+// manager/owner (or a human system admin) may administer the group or other members.
 const isGroupMember = async (env: Env, userId: string, gid: string) =>
   // Consent-based (PLNR-138): a PENDING invite is not membership — only 'accepted' counts.
   !!(await env.DB.prepare("SELECT 1 FROM user_groups WHERE user_id = ? AND group_id = ? AND status = 'accepted'").bind(userId, gid).first());
@@ -1795,7 +1900,10 @@ app.get('/api/groups', userAuth, async (c) => {
   const u = c.var.user!;
   const { results } = await c.env.DB.prepare(
     `SELECT g.id, g.name, g.description, g."order",
-            (CASE WHEN ?1 = 'admin' OR EXISTS (SELECT 1 FROM user_groups ug WHERE ug.group_id = g.id AND ug.user_id = ?2 AND ug.status = 'accepted')
+            (SELECT ug.role FROM user_groups ug WHERE ug.group_id = g.id AND ug.user_id = ?2 AND ug.status = 'accepted') AS myRole,
+            (CASE WHEN ?1 = 'admin' OR EXISTS (SELECT 1 FROM user_groups ug
+                                                WHERE ug.group_id = g.id AND ug.user_id = ?2
+                                                  AND ug.status = 'accepted' AND ug.role IN ('owner', 'manager'))
                   THEN 1 ELSE 0 END) AS canEdit
      FROM groups g ORDER BY g."order", g.created_at`,
   ).bind(u.role, u.id).all();
@@ -1806,14 +1914,142 @@ app.post('/api/groups', userAuth, async (c) => {
   const denied = demoDenied(c); // no new groups in the demo (PLNR-199)
   if (denied) return denied;
   const body = await c.req.json<{ name: string; description?: string }>();
+  if (!(await userCanCreateGroup(c.env, c.var.user!.id))) {
+    return c.json({
+      error: 'your account is not allowed to create groups',
+      code: 'group_creation_denied',
+      capability: 'canCreateGroups',
+    }, 403);
+  }
   if (!body.name) return c.json({ error: 'name required' }, 400);
   const id = newId('grp');
-  await c.env.DB.prepare('INSERT INTO groups (id, name, description, created_by, created_at) VALUES (?, ?, ?, ?, ?)')
-    .bind(id, body.name, body.description ?? '', c.var.user!.id, nowIso()).run();
-  // The creator becomes a member so they can manage (and see) the group they made.
-  await c.env.DB.prepare('INSERT OR IGNORE INTO user_groups (user_id, group_id) VALUES (?, ?)')
-    .bind(c.var.user!.id, id).run();
+  // Create the group and its first owner atomically; a crash must never leave a new group with
+  // no administrative principal.
+  await c.env.DB.batch([
+    c.env.DB.prepare('INSERT INTO groups (id, name, description, created_by, created_at) VALUES (?, ?, ?, ?, ?)')
+      .bind(id, body.name, body.description ?? '', c.var.user!.id, nowIso()),
+    c.env.DB.prepare("INSERT INTO user_groups (user_id, group_id, role) VALUES (?, ?, 'owner')")
+      .bind(c.var.user!.id, id),
+  ]);
   return c.json({ id, name: body.name });
+});
+
+const ProjectGrantBody = z.object({
+  principalType: z.enum(['user', 'group']),
+  principalId: z.string().min(1),
+  role: z.enum(['manager', 'contributor', 'viewer']),
+});
+
+app.get('/api/projects/:pid/access', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const access = await resolveProjectAccess(c.env.DB, c.var.user!.id, pid, { allowAdminOverride: true });
+  if (!projectRoleAllows(access.role, 'manage')) {
+    return c.json({
+      self: projectAccessFields(access),
+      grants: [],
+      owner: null,
+      canManageAccess: false,
+      canTransferOwnership: projectRoleAllows(access.role, 'own'),
+    });
+  }
+  const [owner, grants] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT u.id, u.name, u.email FROM projects p JOIN users u ON u.id = p.owner_user_id
+        WHERE p.id = ?`,
+    ).bind(pid).first<{ id: string; name: string; email: string }>(),
+    c.env.DB.prepare(
+      `SELECT pg.principal_type AS principalType, pg.principal_id AS principalId, pg.role, pg.source,
+              COALESCE(u.name, g.name, pg.principal_id) AS principalName,
+              u.email AS principalEmail, pg.created_at AS createdAt, pg.updated_at AS updatedAt
+         FROM project_grants pg
+         LEFT JOIN users u ON pg.principal_type = 'user' AND u.id = pg.principal_id
+         LEFT JOIN groups g ON pg.principal_type = 'group' AND g.id = pg.principal_id
+        WHERE pg.project_id = ?
+        ORDER BY pg.principal_type, principalName`,
+    ).bind(pid).all(),
+  ]);
+  return c.json({
+    self: projectAccessFields(access),
+    owner,
+    grants: grants.results,
+    canManageAccess: true,
+    canTransferOwnership: projectRoleAllows(access.role, 'own'),
+  });
+});
+
+app.put('/api/projects/:pid/access/grants', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const parsed = ProjectGrantBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid project grant', detail: parsed.error.issues }, 400);
+  const grant = parsed.data;
+  const principal = grant.principalType === 'user'
+    ? await c.env.DB.prepare('SELECT id FROM users WHERE id = ? AND disabled = 0').bind(grant.principalId).first()
+    : await c.env.DB.prepare('SELECT id FROM groups WHERE id = ?').bind(grant.principalId).first();
+  if (!principal) return c.json({ error: `${grant.principalType} not found` }, 404);
+  const project = await c.env.DB.prepare('SELECT owner_user_id AS ownerId FROM projects WHERE id = ?')
+    .bind(pid).first<{ ownerId: string }>();
+  if (grant.principalType === 'user' && project?.ownerId === grant.principalId) {
+    return c.json({ error: 'the project owner already has owner access' }, 409);
+  }
+  await c.env.DB.prepare(
+    `INSERT INTO project_grants
+      (project_id, principal_type, principal_id, role, source, created_by, updated_at)
+     VALUES (?, ?, ?, ?, 'explicit', ?, ?)
+     ON CONFLICT (project_id, principal_type, principal_id) DO UPDATE SET
+       role = excluded.role, source = 'explicit', updated_at = excluded.updated_at`,
+  ).bind(pid, grant.principalType, grant.principalId, grant.role, c.var.user!.id, nowIso()).run();
+  await recordAuthorizationAudit(c.env.DB, {
+    actorKind: 'human', actorId: c.var.user!.id, action: 'project.grant.set',
+    resourceType: 'project', resourceId: pid, decision: 'allow', reason: 'project_manager',
+    metadata: grant,
+  });
+  return c.json({ ok: true, grant });
+});
+
+app.delete('/api/projects/:pid/access/grants/:principalType/:principalId', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const principalType = c.req.param('principalType');
+  if (principalType !== 'user' && principalType !== 'group') return c.json({ error: 'invalid principal type' }, 400);
+  const principalId = c.req.param('principalId')!;
+  const result = await c.env.DB.prepare(
+    'DELETE FROM project_grants WHERE project_id = ? AND principal_type = ? AND principal_id = ?',
+  ).bind(pid, principalType, principalId).run();
+  await recordAuthorizationAudit(c.env.DB, {
+    actorKind: 'human', actorId: c.var.user!.id, action: 'project.grant.revoke',
+    resourceType: 'project', resourceId: pid, decision: 'allow', reason: 'project_manager',
+    metadata: { principalType, principalId, removed: result.meta.changes ?? 0 },
+  });
+  return c.json({ ok: true, removed: result.meta.changes ?? 0 });
+});
+
+app.post('/api/projects/:pid/access/transfer-owner', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const access = await resolveProjectAccess(c.env.DB, c.var.user!.id, pid, { allowAdminOverride: true });
+  if (!projectRoleAllows(access.role, 'own')) return c.json({ error: 'project owner role required' }, 403);
+  const { ownerUserId } = await c.req.json<{ ownerUserId?: string }>().catch((): { ownerUserId?: string } => ({}));
+  if (!ownerUserId) return c.json({ error: 'ownerUserId required' }, 400);
+  const [project, owner] = await Promise.all([
+    c.env.DB.prepare('SELECT owner_user_id AS ownerId FROM projects WHERE id = ?').bind(pid).first<{ ownerId: string }>(),
+    c.env.DB.prepare('SELECT id FROM users WHERE id = ? AND disabled = 0').bind(ownerUserId).first<{ id: string }>(),
+  ]);
+  if (!project || !owner) return c.json({ error: 'new project owner must be an active user' }, 400);
+  if (project.ownerId === ownerUserId) return c.json({ ok: true, ownerUserId });
+  await c.env.DB.batch([
+    c.env.DB.prepare('UPDATE projects SET owner_user_id = ? WHERE id = ?').bind(ownerUserId, pid),
+    c.env.DB.prepare("DELETE FROM project_grants WHERE project_id = ? AND principal_type = 'user' AND principal_id = ?")
+      .bind(pid, ownerUserId),
+    c.env.DB.prepare(
+      `INSERT INTO project_grants (project_id, principal_type, principal_id, role, source, created_by)
+       VALUES (?, 'user', ?, 'manager', 'explicit', ?)
+       ON CONFLICT (project_id, principal_type, principal_id) DO UPDATE SET role = 'manager', source = 'explicit', updated_at = excluded.updated_at`,
+    ).bind(pid, project.ownerId, c.var.user!.id),
+  ]);
+  await recordAuthorizationAudit(c.env.DB, {
+    actorKind: 'human', actorId: c.var.user!.id, action: 'project.owner.transfer',
+    resourceType: 'project', resourceId: pid, decision: 'allow', reason: 'project_owner',
+    metadata: { fromUserId: project.ownerId, toUserId: ownerUserId },
+  });
+  return c.json({ ok: true, ownerUserId });
 });
 
 app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
@@ -1823,20 +2059,28 @@ app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
   // the demo project's shape anyway.
   const denied = demoDenied(c);
   if (denied) return denied;
+  const pid = c.req.param('pid')!;
+  // PLNR-327: reach is not management. A group-linked project gives ordinary members a
+  // contributor role, which is enough for project work but never enough to regroup it or
+  // change settings. Human admins opt into the explicit override here; agents never do.
+  const access = await resolveProjectAccess(c.env.DB, c.var.user!.id, pid, { allowAdminOverride: true });
+  if (!projectRoleAllows(access.role, 'manage')) {
+    return c.json({ error: 'project manager role required to change project settings' }, 403);
+  }
   const body = await c.req.json<{ groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number; ownerUserId?: string | null; public?: boolean; tagPolicy?: 'open' | 'curated'; fileLocking?: boolean; lockTtlSeconds?: number | null }>();
   const sets: string[] = [];
   const binds: unknown[] = [];
   if (body.groupId !== undefined) {
     // PLNR-93 ("closed + self-join"): you may move a project into a group only if you
-    // CREATED it or already belong to it (or you're an admin) — you can't join
+    // already belong to it (or you're an admin) — you can't join
     // someone else's group by dropping a project into it. (The reach-check on the
     // project itself is handled by the requireProjectAccess middleware.)
-    if (body.groupId !== null && c.var.user!.role !== 'admin') {
-      const g = await c.env.DB.prepare('SELECT created_by AS createdBy FROM groups WHERE id = ?')
-        .bind(body.groupId).first<{ createdBy: string | null }>();
+    if (body.groupId !== null) {
+      const g = await c.env.DB.prepare('SELECT 1 FROM groups WHERE id = ?').bind(body.groupId).first();
       if (!g) return c.json({ error: 'group not found' }, 404);
-      const allowed = g.createdBy === c.var.user!.id || await isGroupMember(c.env, c.var.user!.id, body.groupId);
-      if (!allowed) return c.json({ error: 'you must be a member or the creator of the target group' }, 403);
+      if (c.var.user!.role !== 'admin' && !(await isGroupMember(c.env, c.var.user!.id, body.groupId))) {
+        return c.json({ error: 'you must be an accepted member of the target group' }, 403);
+      }
     }
     sets.push('group_id = ?'); binds.push(body.groupId);
   }
@@ -1861,6 +2105,10 @@ app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
   }
   if (body.ownerUserId !== undefined) {
     if (c.var.user!.role !== 'admin') return c.json({ error: 'admin role required to reassign ownership' }, 403);
+    if (body.ownerUserId === null) return c.json({ error: 'project ownership cannot be cleared; transfer it to an active user' }, 400);
+    const newOwner = await c.env.DB.prepare('SELECT 1 FROM users WHERE id = ? AND disabled = 0')
+      .bind(body.ownerUserId).first();
+    if (!newOwner) return c.json({ error: 'new project owner must be an active user' }, 400);
     sets.push('owner_user_id = ?'); binds.push(body.ownerUserId);
   }
   if (body.tagPolicy !== undefined) {
@@ -1871,22 +2119,35 @@ app.patch('/api/projects/:pid/meta', userAuth, async (c) => {
   if (body.public !== undefined) {
     // Publishing a project is the OWNER's call (or an admin's) — a group member must not
     // be able to expose shared work to the internet (PLNR-78).
-    const own = await c.env.DB.prepare('SELECT owner_user_id AS o FROM projects WHERE id = ?')
-      .bind(c.req.param('pid')!).first<{ o: string | null }>();
-    if (c.var.user!.role !== 'admin' && own?.o !== c.var.user!.id) {
+    if (!projectRoleAllows(access.role, 'own')) {
       return c.json({ error: 'only the project owner may change public visibility' }, 403);
     }
     sets.push('public = ?'); binds.push(body.public ? 1 : 0);
   }
-  const pid = c.req.param('pid')!;
   if (sets.length) {
     binds.push(pid);
-    await c.env.DB.prepare(`UPDATE projects SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
+    const stmts = [c.env.DB.prepare(`UPDATE projects SET ${sets.join(', ')} WHERE id = ?`).bind(...binds)];
+    if (body.groupId !== undefined) {
+      // The organizational group link is not authority by itself. Dual-write its contributor
+      // grant before the request completes; source tagging lets ungrouping remove only the
+      // link-derived grant and preserve separately-managed explicit access.
+      stmts.push(c.env.DB.prepare(
+        "DELETE FROM project_grants WHERE project_id = ? AND source = 'legacy_group'",
+      ).bind(pid));
+      if (body.groupId !== null) {
+        stmts.push(c.env.DB.prepare(
+          `INSERT INTO project_grants (project_id, principal_type, principal_id, role, source, created_by)
+           VALUES (?, 'group', ?, 'contributor', 'legacy_group', ?)
+           ON CONFLICT (project_id, principal_type, principal_id) DO NOTHING`,
+        ).bind(pid, body.groupId, c.var.user!.id));
+      }
+    }
+    await c.env.DB.batch(stmts);
   }
   if (ttlToSet !== undefined) await room(c.env, pid).setClaimTtl(pid, ttlToSet);
   if (lockOpts.enabled !== undefined || lockOpts.ttlSeconds !== undefined) await room(c.env, pid).setFileLocking(pid, lockOpts);
   // No auto-join anymore (PLNR-93): the caller was required to already be a member or
-  // the creator of the target group above, so their visibility is already correct —
+  // an accepted member of the target group above, so their visibility is already correct —
   // and this closes the "join any group by dropping a project in" hole.
   return c.json({ ok: true });
 });
@@ -1907,7 +2168,7 @@ app.get('/api/users', userAuth, async (c) => {
   // The full directory — role, disabled flag, group ids, passkey/owned-project counts — is
   // admin-only PII (account enumeration / phishing / "find the admins"); the admin UI is the
   // only surface that renders it. Non-admins still get a minimal directory (id, name, email,
-  // disabled) because a group member manages their group's membership and the add-member picker
+  // disabled) because a group manager manages their group's membership and the add-member picker
   // resolves candidates from it (PLNR-83) — but nothing role- or metadata-revealing.
   if (!requireAdmin(c)) {
     const { results } = await c.env.DB.prepare(
@@ -1916,12 +2177,17 @@ app.get('/api/users', userAuth, async (c) => {
     return c.json({ users: results });
   }
   const { results } = await c.env.DB.prepare(
-    `SELECT u.id, u.email, u.name, u.role, u.disabled, u.created_at AS createdAt,
+    `SELECT u.id, u.email, u.name, u.role, u.disabled, u.access_mode AS accessMode,
+            u.can_create_projects AS canCreateProjectsOverride, u.can_create_groups AS canCreateGroupsOverride,
+            COALESCE(u.can_create_projects, s.default_can_create_projects, 1) AS canCreateProjects,
+            COALESCE(u.can_create_groups, s.default_can_create_groups, 1) AS canCreateGroups,
+            u.created_at AS createdAt,
             (u.password_hash IS NULL AND NOT EXISTS (SELECT 1 FROM passkeys p WHERE p.user_id = u.id)) AS pending,
             (SELECT COUNT(*) FROM passkeys p WHERE p.user_id = u.id) AS passkeys,
-            (SELECT GROUP_CONCAT(g.id) FROM user_groups ug JOIN groups g ON g.id = ug.group_id WHERE ug.user_id = u.id) AS groupIds,
+            (SELECT GROUP_CONCAT(g.id) FROM user_groups ug JOIN groups g ON g.id = ug.group_id
+              WHERE ug.user_id = u.id AND ug.status = 'accepted') AS groupIds,
             (SELECT COUNT(*) FROM projects p WHERE p.owner_user_id = u.id AND p.status = 'active') AS ownedProjects
-     FROM users u ORDER BY u.created_at`,
+     FROM users u LEFT JOIN authorization_settings s ON s.id = 1 ORDER BY u.created_at`,
   ).all();
   return c.json({ users: results });
 });
@@ -1942,7 +2208,10 @@ app.post('/api/users', userAuth, async (c) => {
 app.patch('/api/users/:uid', userAuth, async (c) => {
   if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
   const uid = c.req.param('uid')!;
-  const body = await c.req.json<{ role?: 'admin' | 'member'; disabled?: boolean; name?: string }>();
+  const body = await c.req.json<{
+    role?: 'admin' | 'member'; disabled?: boolean; name?: string;
+    accessMode?: 'read_write' | 'read_only'; canCreateProjects?: boolean | null; canCreateGroups?: boolean | null;
+  }>();
   if (uid === c.var.user!.id && (body.role === 'member' || body.disabled)) {
     return c.json({ error: 'cannot demote or disable yourself' }, 400);
   }
@@ -1951,6 +2220,9 @@ app.patch('/api/users/:uid', userAuth, async (c) => {
   if (body.role !== undefined) { sets.push('role = ?'); binds.push(body.role); }
   if (body.disabled !== undefined) { sets.push('disabled = ?'); binds.push(body.disabled ? 1 : 0); }
   if (body.name !== undefined) { sets.push('name = ?'); binds.push(body.name); }
+  if (body.accessMode !== undefined) { sets.push('access_mode = ?'); binds.push(body.accessMode); }
+  if (body.canCreateProjects !== undefined) { sets.push('can_create_projects = ?'); binds.push(body.canCreateProjects === null ? null : body.canCreateProjects ? 1 : 0); }
+  if (body.canCreateGroups !== undefined) { sets.push('can_create_groups = ?'); binds.push(body.canCreateGroups === null ? null : body.canCreateGroups ? 1 : 0); }
   if (!sets.length) return c.json({ ok: true });
   binds.push(uid);
   await c.env.DB.prepare(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
@@ -1964,7 +2236,114 @@ app.patch('/api/users/:uid', userAuth, async (c) => {
       c.env.DB.prepare("UPDATE agents SET status = 'revoked' WHERE user_id = ? AND status != 'revoked'").bind(uid),
     ]);
   }
+  if (body.accessMode !== undefined || body.canCreateProjects !== undefined || body.canCreateGroups !== undefined) {
+    await recordAuthorizationAudit(c.env.DB, {
+      actorKind: 'human', actorId: c.var.user!.id, action: 'account.authorization.update',
+      resourceType: 'user', resourceId: uid, decision: 'allow', reason: 'system_admin',
+      metadata: {
+        accessMode: body.accessMode ?? null,
+        canCreateProjects: body.canCreateProjects ?? null,
+        canCreateGroups: body.canCreateGroups ?? null,
+      },
+    });
+  }
   return c.json({ ok: true });
+});
+
+app.get('/api/admin/authorization', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  const [settings, accounts, projects, groups, audit] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT default_can_create_projects AS defaultCanCreateProjects,
+              default_can_create_groups AS defaultCanCreateGroups, updated_at AS updatedAt
+         FROM authorization_settings WHERE id = 1`,
+    ).first(),
+    c.env.DB.prepare(
+      `SELECT u.id, u.name, u.email, u.role, u.disabled, u.access_mode AS accessMode,
+              u.can_create_projects AS canCreateProjectsOverride, u.can_create_groups AS canCreateGroupsOverride,
+              COALESCE(u.can_create_projects, s.default_can_create_projects, 1) AS canCreateProjects,
+              COALESCE(u.can_create_groups, s.default_can_create_groups, 1) AS canCreateGroups
+         FROM users u LEFT JOIN authorization_settings s ON s.id = 1 ORDER BY u.name`,
+    ).all(),
+    c.env.DB.prepare(
+      `SELECT p.id, p.key, p.name, p.owner_user_id AS ownerUserId, u.name AS ownerName,
+              p.group_id AS legacyGroupId,
+              (SELECT COUNT(*) FROM project_grants pg WHERE pg.project_id = p.id) AS grantCount
+         FROM projects p LEFT JOIN users u ON u.id = p.owner_user_id
+        WHERE p.status = 'active' ORDER BY p.name`,
+    ).all(),
+    c.env.DB.prepare(
+      `SELECT g.id, g.name,
+              (SELECT COUNT(*) FROM user_groups ug WHERE ug.group_id = g.id AND ug.status = 'accepted') AS memberCount,
+              (SELECT COUNT(*) FROM user_groups ug WHERE ug.group_id = g.id AND ug.status = 'accepted' AND ug.role = 'owner') AS ownerCount,
+              (SELECT COUNT(*) FROM project_grants pg WHERE pg.principal_type = 'group' AND pg.principal_id = g.id) AS projectGrantCount
+         FROM groups g ORDER BY g.name`,
+    ).all(),
+    c.env.DB.prepare(
+      `SELECT id, actor_kind AS actorKind, actor_id AS actorId, action, resource_type AS resourceType,
+              resource_id AS resourceId, decision, reason, metadata, created_at AS createdAt
+         FROM authorization_audit_events ORDER BY created_at DESC LIMIT 200`,
+    ).all(),
+  ]);
+  return c.json({
+    settings,
+    accounts: accounts.results,
+    projects: projects.results,
+    groups: groups.results,
+    audit: audit.results.map((event) => ({ ...event, metadata: JSON.parse(String(event.metadata)) })),
+  });
+});
+
+app.patch('/api/admin/authorization/settings', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  const body = await c.req.json<{ defaultCanCreateProjects?: boolean; defaultCanCreateGroups?: boolean }>();
+  const sets: string[] = [];
+  const binds: unknown[] = [];
+  if (body.defaultCanCreateProjects !== undefined) { sets.push('default_can_create_projects = ?'); binds.push(body.defaultCanCreateProjects ? 1 : 0); }
+  if (body.defaultCanCreateGroups !== undefined) { sets.push('default_can_create_groups = ?'); binds.push(body.defaultCanCreateGroups ? 1 : 0); }
+  if (!sets.length) return c.json({ ok: true });
+  sets.push('updated_by = ?', 'updated_at = ?'); binds.push(c.var.user!.id, nowIso(), 1);
+  await c.env.DB.prepare(`UPDATE authorization_settings SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
+  await recordAuthorizationAudit(c.env.DB, {
+    actorKind: 'human', actorId: c.var.user!.id, action: 'instance.authorization.update',
+    resourceType: 'instance', resourceId: 'authorization', decision: 'allow', reason: 'system_admin',
+    metadata: {
+      defaultCanCreateProjects: body.defaultCanCreateProjects ?? null,
+      defaultCanCreateGroups: body.defaultCanCreateGroups ?? null,
+    },
+  });
+  return c.json({ ok: true });
+});
+
+app.post('/api/admin/authorization/override/:pid', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  const pid = c.req.param('pid')!;
+  const project = await c.env.DB.prepare('SELECT id FROM projects WHERE id = ?').bind(pid).first();
+  if (!project) return c.json({ error: 'project not found' }, 404);
+  await recordAuthorizationAudit(c.env.DB, {
+    actorKind: 'human', actorId: c.var.user!.id, action: 'admin.project.override',
+    resourceType: 'project', resourceId: pid, decision: 'allow', reason: 'explicit_admin_override',
+  });
+  return c.json({ ok: true, projectId: pid });
+});
+
+app.post('/api/admin/authorization/parity-audit', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  const { reconcile = false } = await c.req.json<{ reconcile?: boolean }>().catch(() => ({ reconcile: false }));
+  const before = await auditAuthorizationParity(c.env.DB);
+  const inserted = reconcile ? await reconcileLegacyGroupGrants(c.env.DB) : 0;
+  const report = reconcile ? await auditAuthorizationParity(c.env.DB) : before;
+  await recordAuthorizationAudit(c.env.DB, {
+    actorKind: 'human', actorId: c.var.user!.id, action: reconcile ? 'authorization.parity.reconcile' : 'authorization.parity.audit',
+    resourceType: 'instance', resourceId: 'authorization', decision: 'allow', reason: report.readyToRetireLegacy ? 'parity_gate_pass' : 'parity_gate_blocked',
+    metadata: { compared: report.compared, broadened: report.broadened, lost: report.lost, inserted },
+  });
+  return c.json({
+    ...report,
+    inserted,
+    rolloutGate: report.readyToRetireLegacy ? 'pass' : 'blocked',
+    rollback: 'If lost reach is detected, run reconcile to restore missing group-link grants before changing memberships or project access. projects.group_id is not an authorization fallback.',
+  });
 });
 
 app.delete('/api/users/:uid', userAuth, async (c) => {
@@ -1974,18 +2353,30 @@ app.delete('/api/users/:uid', userAuth, async (c) => {
   const target = await c.env.DB.prepare('SELECT disabled FROM users WHERE id = ?').bind(uid).first<{ disabled: number }>();
   if (!target) return c.json({ error: 'not found' }, 404);
   if (!target.disabled) return c.json({ error: 'disable the user first — delete is only available for disabled users' }, 400);
+  // PLNR-327: ownership is an invariant, not historical attribution. Refuse deletion until an
+  // admin explicitly transfers or deletes every owned project; silently nulling the owner turns
+  // private projects into unmanageable records and destroys the authorization root.
+  const { results: ownedProjects } = await c.env.DB.prepare(
+    'SELECT id, key, name, status FROM projects WHERE owner_user_id = ? ORDER BY created_at',
+  ).bind(uid).all<{ id: string; key: string; name: string; status: string }>();
+  if (ownedProjects.length) {
+    return c.json({
+      error: 'user still owns projects; transfer or delete them before deleting the user',
+      ownedProjects,
+    }, 409);
+  }
   await c.env.DB.batch([
     c.env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('DELETE FROM invites WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('DELETE FROM passkeys WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('DELETE FROM user_groups WHERE user_id = ?').bind(uid),
+    c.env.DB.prepare("DELETE FROM project_grants WHERE principal_type = 'user' AND principal_id = ?").bind(uid),
     c.env.DB.prepare('DELETE FROM oauth_codes WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('DELETE FROM templates WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('DELETE FROM ask_messages WHERE thread_id IN (SELECT id FROM ask_threads WHERE user_id = ?)').bind(uid),
     c.env.DB.prepare('DELETE FROM ask_threads WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('DELETE FROM oauth_tokens WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('UPDATE agents SET user_id = NULL WHERE user_id = ?').bind(uid),
-    c.env.DB.prepare('UPDATE projects SET owner_user_id = NULL WHERE owner_user_id = ?').bind(uid),
     c.env.DB.prepare('DELETE FROM users WHERE id = ?').bind(uid),
   ]);
   // Historical attribution in events/comments keeps the raw id — intentionally preserved.
@@ -2020,8 +2411,8 @@ app.patch('/api/groups/:gid', userAuth, async (c) => {
   if (denied) return denied;
   const u = c.var.user!;
   const gid = c.req.param('gid')!;
-  if (u.role !== 'admin' && !(await isGroupMember(c.env, u.id, gid))) {
-    return c.json({ error: 'only a group member can edit this group' }, 403);
+  if (u.role !== 'admin' && !groupRoleAllows(await resolveGroupRole(c.env.DB, u.id, gid), 'manage')) {
+    return c.json({ error: 'group manager role required to edit this group' }, 403);
   }
   const { name, description } = await c.req.json<{ name?: string; description?: string }>();
   const sets: string[] = [];
@@ -2039,29 +2430,33 @@ app.delete('/api/groups/:gid', userAuth, async (c) => {
   if (denied) return denied;
   const u = c.var.user!;
   const gid = c.req.param('gid')!;
-  if (u.role !== 'admin' && !(await isGroupMember(c.env, u.id, gid))) {
-    return c.json({ error: 'only a group member can delete this group' }, 403);
+  if (u.role !== 'admin' && !groupRoleAllows(await resolveGroupRole(c.env.DB, u.id, gid), 'own')) {
+    return c.json({ error: 'group owner role required to delete this group' }, 403);
   }
   await c.env.DB.batch([
     c.env.DB.prepare('UPDATE projects SET group_id = NULL WHERE group_id = ?').bind(gid),
+    c.env.DB.prepare("DELETE FROM project_grants WHERE principal_type = 'group' AND principal_id = ?").bind(gid),
     c.env.DB.prepare('DELETE FROM user_groups WHERE group_id = ?').bind(gid),
     c.env.DB.prepare('DELETE FROM groups WHERE id = ?').bind(gid),
   ]);
   return c.json({ ok: true });
 });
 
-// Per-group membership, self-service (PLNR-83): a group's members (or an admin)
-// manage who's in it. This is what lets a regular user run their own group
-// without the admin-only PUT /users/:uid/groups.
-const requireGroupMember = async (c: { env: Env; var: { user?: { id: string; role: string } } }, gid: string) =>
-  c.var.user!.role === 'admin' || (await isGroupMember(c.env, c.var.user!.id, gid));
+// Per-group membership: accepted members may view the roster; managers/owners (or a human
+// system admin) may invite and remove other people.
+const requireGroupRole = async (
+  c: { env: Env; var: { user?: { id: string; role: string } } },
+  gid: string,
+  action: 'view' | 'manage',
+) => c.var.user!.role === 'admin'
+  || groupRoleAllows(await resolveGroupRole(c.env.DB, c.var.user!.id, gid), action);
 
 app.get('/api/groups/:gid/members', userAuth, async (c) => {
   const gid = c.req.param('gid')!;
-  if (!(await requireGroupMember(c, gid))) return c.json({ error: 'only a group member can view membership' }, 403);
+  if (!(await requireGroupRole(c, gid, 'view'))) return c.json({ error: 'only an accepted group member can view membership' }, 403);
   // status lets the UI mark who's a member vs. who has a pending invite (PLNR-138).
   const { results } = await c.env.DB.prepare(
-    `SELECT u.id, u.name, u.email, ug.status FROM user_groups ug JOIN users u ON u.id = ug.user_id
+    `SELECT u.id, u.name, u.email, ug.status, ug.role FROM user_groups ug JOIN users u ON u.id = ug.user_id
      WHERE ug.group_id = ? ORDER BY ug.status = 'accepted' DESC, u.name`,
   ).bind(gid).all();
   return c.json({ members: results });
@@ -2082,20 +2477,54 @@ app.post('/api/groups/:gid/members', userAuth, async (c) => {
   const denied = demoDenied(c);
   if (denied) return denied;
   const gid = c.req.param('gid')!;
-  if (!(await requireGroupMember(c, gid))) return c.json({ error: 'only a group member can invite members' }, 403);
-  const { userId } = await c.req.json<{ userId: string }>();
+  if (!(await requireGroupRole(c, gid, 'manage'))) return c.json({ error: 'group manager role required to invite members' }, 403);
+  const { userId, role = 'member' } = await c.req.json<{ userId: string; role?: 'owner' | 'manager' | 'member' }>();
+  const callerRole = c.var.user!.role === 'admin' ? 'owner' : await resolveGroupRole(c.env.DB, c.var.user!.id, gid);
+  if (role === 'owner' && !groupRoleAllows(callerRole, 'own')) {
+    return c.json({ error: 'only a group owner may invite another owner' }, 403);
+  }
   const target = await c.env.DB.prepare('SELECT 1 FROM users WHERE id = ? AND disabled = 0').bind(userId ?? '').first();
   if (!target) return c.json({ error: 'user not found' }, 404);
   // Consent-based (PLNR-138): create a PENDING invite the target must accept, rather than
   // adding them outright. OR IGNORE leaves any existing row as-is — an accepted member is
   // not downgraded to pending, and a standing invite is not duplicated or its inviter reset.
   await c.env.DB.prepare(
-    "INSERT OR IGNORE INTO user_groups (user_id, group_id, status, invited_by, invited_at) VALUES (?, ?, 'pending', ?, ?)",
-  ).bind(userId, gid, c.var.user!.id, nowIso()).run();
+    "INSERT OR IGNORE INTO user_groups (user_id, group_id, status, role, invited_by, invited_at) VALUES (?, ?, 'pending', ?, ?, ?)",
+  ).bind(userId, gid, role, c.var.user!.id, nowIso()).run();
   // Report the resulting state so re-inviting an existing member reads honestly.
   const row = await c.env.DB.prepare('SELECT status FROM user_groups WHERE user_id = ? AND group_id = ?')
     .bind(userId, gid).first<{ status: string }>();
   return c.json({ ok: true, status: row?.status ?? 'pending' });
+});
+
+app.patch('/api/groups/:gid/members/:uid', userAuth, async (c) => {
+  const denied = demoDenied(c);
+  if (denied) return denied;
+  const gid = c.req.param('gid')!;
+  const uid = c.req.param('uid')!;
+  const { role } = await c.req.json<{ role?: 'owner' | 'manager' | 'member' }>().catch((): { role?: 'owner' | 'manager' | 'member' } => ({}));
+  if (!role) return c.json({ error: 'role must be owner, manager, or member' }, 400);
+  const callerRole = c.var.user!.role === 'admin' ? 'owner' : await resolveGroupRole(c.env.DB, c.var.user!.id, gid);
+  if (!groupRoleAllows(callerRole, 'manage')) return c.json({ error: 'group manager role required' }, 403);
+  const target = await c.env.DB.prepare('SELECT role, status FROM user_groups WHERE group_id = ? AND user_id = ?')
+    .bind(gid, uid).first<{ role: 'owner' | 'manager' | 'member'; status: string }>();
+  if (!target) return c.json({ error: 'group member not found' }, 404);
+  if ((target.role === 'owner' || role === 'owner') && !groupRoleAllows(callerRole, 'own')) {
+    return c.json({ error: 'only a group owner may change owner roles' }, 403);
+  }
+  if (target.role === 'owner' && role !== 'owner' && target.status === 'accepted') {
+    const owners = await c.env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM user_groups WHERE group_id = ? AND status = 'accepted' AND role = 'owner'",
+    ).bind(gid).first<{ n: number }>();
+    if ((owners?.n ?? 0) <= 1) return c.json({ error: 'a group must keep at least one accepted owner', code: 'last_group_owner' }, 409);
+  }
+  await c.env.DB.prepare('UPDATE user_groups SET role = ? WHERE group_id = ? AND user_id = ?').bind(role, gid, uid).run();
+  await recordAuthorizationAudit(c.env.DB, {
+    actorKind: 'human', actorId: c.var.user!.id, action: 'group.member.role', resourceType: 'group', resourceId: gid,
+    decision: 'allow', reason: groupRoleAllows(callerRole, 'own') ? 'group_owner' : 'group_manager',
+    metadata: { userId: uid, fromRole: target.role, toRole: role },
+  });
+  return c.json({ ok: true, userId: uid, role });
 });
 
 // The invite target consents (PLNR-138). You act only on your OWN invite (keyed by your
@@ -2126,12 +2555,28 @@ app.delete('/api/groups/:gid/members/:uid', userAuth, async (c) => {
   if (denied) return denied;
   const gid = c.req.param('gid')!;
   // Removing yourself (declining a membership you hold, or leaving) needs no gate; removing
-  // someone else is group management, so it stays member-gated.
+  // someone else is group management, so it is manager/owner-gated.
   const uid = c.req.param('uid')!;
-  if (uid !== c.var.user!.id && !(await requireGroupMember(c, gid))) {
-    return c.json({ error: 'only a group member can remove members' }, 403);
+  if (uid !== c.var.user!.id && !(await requireGroupRole(c, gid, 'manage'))) {
+    return c.json({ error: 'group manager role required to remove members' }, 403);
+  }
+  const target = await c.env.DB.prepare('SELECT role, status FROM user_groups WHERE user_id = ? AND group_id = ?')
+    .bind(uid, gid).first<{ role: string; status: string }>();
+  if (target?.role === 'owner' && target.status === 'accepted') {
+    const callerRole = c.var.user!.role === 'admin' ? 'owner' : await resolveGroupRole(c.env.DB, c.var.user!.id, gid);
+    if (uid !== c.var.user!.id && !groupRoleAllows(callerRole, 'own')) {
+      return c.json({ error: 'only a group owner may remove another owner' }, 403);
+    }
+    const owners = await c.env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM user_groups WHERE group_id = ? AND status = 'accepted' AND role = 'owner'",
+    ).bind(gid).first<{ n: number }>();
+    if ((owners?.n ?? 0) <= 1) return c.json({ error: 'a group must keep at least one accepted owner', code: 'last_group_owner' }, 409);
   }
   await c.env.DB.prepare('DELETE FROM user_groups WHERE user_id = ? AND group_id = ?').bind(uid, gid).run();
+  await recordAuthorizationAudit(c.env.DB, {
+    actorKind: 'human', actorId: c.var.user!.id, action: 'group.member.remove', resourceType: 'group', resourceId: gid,
+    decision: 'allow', reason: uid === c.var.user!.id ? 'self_leave' : 'group_manager', metadata: { userId: uid },
+  });
   return c.json({ ok: true });
 });
 
@@ -2270,7 +2715,10 @@ async function resolveRunnerRepos(
       `SELECT p.id AS id FROM projects p
        WHERE p.key = ?2 AND ${USER_PROJECT_WHERE} AND ${tokenProjectWhere('?3')}`,
     ).bind(ownerUserId, key, tokenId).first<{ id: string }>();
-    const projectId = row?.id ?? null;
+    const access = row?.id ? await resolveProjectAccess(env.DB, ownerUserId, row.id) : null;
+    // A runner can observe a viewer project through the ordinary API, but cannot bind a repo
+    // that will ingest memory, dispatch work, or report run state into it.
+    const projectId = projectRoleAllows(access?.role ?? null, 'contribute') ? row!.id : null;
     // The board lock (RUN-71), resolved the same way the key is: committed NAME → per-server
     // id, only within the repo's own resolved project. Case-insensitive because the marker is
     // hand-typed and board names are display strings. No match → null, and the repo stays
@@ -2348,7 +2796,39 @@ function runnerView(row: Record<string, unknown>) {
   };
 }
 
+const connectionWriteDenied = async (c: Context<AppContext>): Promise<Response | null> => {
+  const account = await resolveAccountCapabilities(c.env.DB, c.var.connection!.userId);
+  return account.accessMode === 'read_write' && !account.disabled
+    ? null
+    : c.json({ error: 'account is read-only', code: 'account_read_only' }, 403);
+};
+
+/** OAuth/Runner project authorization. Deliberately excludes the human admin override and
+ * composes account role with the token's narrower project scope. */
+const runnerProjectActionDenied = async (
+  c: Context<AppContext>,
+  projectId: string,
+  action: ProjectAction,
+): Promise<Response | null> => {
+  const conn = c.var.connection!;
+  const access = await resolveProjectAccess(c.env.DB, conn.userId, projectId);
+  if (!projectRoleAllows(access.role, 'view')) return c.json({ error: 'project not found' }, 404);
+  if (!projectRoleAllows(access.role, action)) {
+    return c.json({
+      error: `project ${action === 'contribute' ? 'contributor' : action} role required`,
+      code: 'project_action_denied', action, role: access.role,
+      reason: access.cappedByReadOnly ? 'account_read_only' : 'insufficient_project_role',
+    }, 403);
+  }
+  if (!(await tokenCanReachProject(c.env, conn.tokenId, projectId))) {
+    return c.json({ error: 'project is outside this connection’s authorized projects', code: 'token_scope_denied' }, 403);
+  }
+  return null;
+};
+
 app.post('/api/runners', agentAuth, async (c) => {
+  const accountDenied = await connectionWriteDenied(c);
+  if (accountDenied) return accountDenied;
   const parsed = RegisterRunnerBody.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) return c.json({ error: 'invalid runner registration', detail: parsed.error.issues }, 400);
   const b = parsed.data;
@@ -2395,6 +2875,8 @@ app.post('/api/runners', agentAuth, async (c) => {
 });
 
 app.post('/api/runners/:id/heartbeat', agentAuth, async (c) => {
+  const accountDenied = await connectionWriteDenied(c);
+  if (accountDenied) return accountDenied;
   const parsed = HeartbeatBody.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) return c.json({ error: 'invalid heartbeat', detail: parsed.error.issues }, 400);
   const userId = c.var.connection!.userId;
@@ -2721,7 +3203,9 @@ app.post('/api/plan-dispatches/:id/cancel', userAuth, async (c) => {
   const row = await c.env.DB.prepare('SELECT project_id AS pid FROM plan_dispatches WHERE id = ?')
     .bind(id).first<{ pid: string }>();
   if (!row) return c.json({ error: 'plan dispatch not found' }, 404);
-  if (!(await reachesProject(c, row.pid))) return c.json({ error: 'not found' }, 404);
+  const access = await resolveProjectAccess(c.env.DB, c.var.user!.id, row.pid, { allowAdminOverride: true });
+  if (!projectRoleAllows(access.role, 'view')) return c.json({ error: 'not found' }, 404);
+  if (!projectRoleAllows(access.role, 'manage')) return c.json({ error: 'project manager role required', code: 'project_action_denied', action: 'manage' }, 403);
   const res = await room(c.env, row.pid).cancelPlanDispatch(row.pid, humanActor(c), id, reason);
   return c.json(res);
 });
@@ -2735,7 +3219,8 @@ app.post('/api/plan-dispatches/:id/retry', userAuth, async (c) => {
   const row = await c.env.DB.prepare('SELECT project_id AS pid FROM plan_dispatches WHERE id = ?')
     .bind(id).first<{ pid: string }>();
   if (!row) return c.json({ error: 'plan dispatch not found' }, 404);
-  if (!(await reachesProject(c, row.pid))) return c.json({ error: 'not found' }, 404);
+  const actionDenied = await humanProjectActionDenied(c, row.pid, 'manage');
+  if (actionDenied) return actionDenied;
   try {
     const res = await room(c.env, row.pid).retryPlanDispatch(row.pid, humanActor(c), id);
     return c.json(res);
@@ -2765,7 +3250,8 @@ app.post('/api/runs/:runId/cancel', userAuth, async (c) => {
   const run = await c.env.DB.prepare('SELECT project_id AS pid, runner_id AS runnerId FROM runs WHERE id = ?')
     .bind(runId).first<{ pid: string; runnerId: string | null }>();
   if (!run) return c.json({ error: 'run not found' }, 404);
-  if (!(await reachesProject(c, run.pid))) return c.json({ error: 'not found' }, 404);
+  const actionDenied = await humanProjectActionDenied(c, run.pid, 'manage');
+  if (actionDenied) return actionDenied;
   const updated = await room(c.env, run.pid).transitionRun(run.pid, humanActor(c), runId, { status: 'cancelled', reason });
   if (run.runnerId) {
     await hub(c.env, run.runnerId).deliver(JSON.stringify({ type: 'run.cancel', runId, hard: true, reason }));
@@ -2789,7 +3275,8 @@ app.post('/api/runs/:runId/continue', userAuth, async (c) => {
   const run = await c.env.DB.prepare('SELECT project_id AS pid, runner_id AS runnerId FROM runs WHERE id = ?')
     .bind(runId).first<{ pid: string; runnerId: string | null }>();
   if (!run) return c.json({ error: 'run not found' }, 404);
-  if (!(await reachesProject(c, run.pid))) return c.json({ error: 'not found' }, 404);
+  const actionDenied = await humanProjectActionDenied(c, run.pid, 'manage');
+  if (actionDenied) return actionDenied;
   let reopened: RunView;
   try {
     reopened = await room(c.env, run.pid).reopenRun(run.pid, humanActor(c), runId, parsed.data.rounds);
@@ -2828,7 +3315,8 @@ app.post('/api/runs/:runId/steer', userAuth, async (c) => {
   const run = await c.env.DB.prepare('SELECT project_id AS pid, runner_id AS runnerId, agent_id AS agentId FROM runs WHERE id = ?')
     .bind(runId).first<{ pid: string; runnerId: string | null; agentId: string | null }>();
   if (!run) return c.json({ error: 'run not found' }, 404);
-  if (!(await reachesProject(c, run.pid))) return c.json({ error: 'not found' }, 404);
+  const actionDenied = await humanProjectActionDenied(c, run.pid, 'manage');
+  if (actionDenied) return actionDenied;
   if (!run.runnerId) return c.json({ error: 'run has no runner to steer' }, 409);
 
   const steerId = newId('str');
@@ -2890,13 +3378,8 @@ app.post('/api/runs/:runId/agent', agentAuth, async (c) => {
   // Same ownership test as steer-ack: the run must belong to a runner this user owns.
   if (!run || run.owner !== conn.userId) return c.json({ error: 'run not found' }, 404);
   if (!run.runnerId) return c.json({ error: 'run has no runner yet' }, 400);
-  // The runner's token must be authorized for the run's project (RUN-38). Without this a
-  // scoped runner could mint itself an agent — and a working credential — inside a project it
-  // was never granted, which would make the whole scope decorative. Repo resolution normally
-  // stops such a run existing; this is the check that does not depend on that having worked.
-  if (!(await tokenCanReachProject(c.env, conn.tokenId, run.projectId))) {
-    return c.json({ error: 'run is outside this connection’s authorized projects' }, 403);
-  }
+  const actionDenied = await runnerProjectActionDenied(c, run.projectId, 'manage');
+  if (actionDenied) return actionDenied;
   // A run that is OVER gets no credential at all, and this is asked FIRST so a finished run says
   // so plainly rather than being refused for the incidental reason that it already had an agent.
   // A run can reach a terminal status before its agent was ever created — a daemon restart
@@ -3012,9 +3495,8 @@ app.get('/api/runs/:runId/park', agentAuth, async (c) => {
        FROM runs r LEFT JOIN runners rn ON rn.id = r.runner_id WHERE r.id = ?`,
   ).bind(runId).first<{ id: string; status: string; agentId: string | null; projectId: string; owner: string | null }>();
   if (!run || run.owner !== c.var.connection!.userId) return c.json({ error: 'run not found' }, 404);
-  if (!(await tokenCanReachProject(c.env, c.var.connection!.tokenId, run.projectId))) {
-    return c.json({ error: 'run is outside this connection’s authorized projects' }, 403);
-  }
+  const actionDenied = await runnerProjectActionDenied(c, run.projectId, 'view');
+  if (actionDenied) return actionDenied;
   // The input_request this run's agent raised. Newest wins: an agent can ask more than once over
   // a run's life, and the one that parked it is the one it is waiting on now.
   const signal = run.agentId
@@ -3060,8 +3542,14 @@ app.get('/api/runners/:id/owed-merges', agentAuth, async (c) => {
      WHERE pl.merge_requested_at IS NULL
        AND EXISTS (SELECT 1 FROM runs r WHERE r.plan_id = pl.plan_id AND r.runner_id = ?1)
      ORDER BY pl.completed_at`,
-  ).bind(id).all();
-  return c.json({ owed: results });
+  ).bind(id).all<{ projectId: string } & Record<string, unknown>>();
+  const owed: Array<Record<string, unknown>> = [];
+  for (const landing of results) {
+    const access = await resolveProjectAccess(c.env.DB, c.var.connection!.userId, landing.projectId);
+    if (projectRoleAllows(access.role, 'manage')
+        && await tokenCanReachProject(c.env, c.var.connection!.tokenId, landing.projectId)) owed.push(landing);
+  }
+  return c.json({ owed });
 });
 
 /**
@@ -3084,6 +3572,15 @@ app.post('/api/runners/:id/owed-merges/report', agentAuth, async (c) => {
     .bind(id, c.var.connection!.userId).first();
   if (!owned) return c.json({ error: 'runner not found' }, 404);
   const b = parsed.data;
+  const landing = await c.env.DB.prepare(
+    `SELECT pl.project_id AS projectId FROM plan_landings pl
+      WHERE pl.plan_id = ? AND EXISTS (
+        SELECT 1 FROM runs r WHERE r.plan_id = pl.plan_id AND r.runner_id = ?
+      )`,
+  ).bind(b.planId, id).first<{ projectId: string }>();
+  if (!landing) return c.json({ error: 'plan landing not found' }, 404);
+  const actionDenied = await runnerProjectActionDenied(c, landing.projectId, 'manage');
+  if (actionDenied) return actionDenied;
   await c.env.DB.prepare(
     'UPDATE plan_landings SET merge_requested_at = ?, merge_request_url = ?, failed_detail = ? WHERE plan_id = ?',
   ).bind(nowIso(), b.url, b.failed, b.planId).run();
@@ -3104,10 +3601,12 @@ app.post('/api/runs/:runId/steer-ack', agentAuth, async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid steer-ack', detail: parsed.error.issues }, 400);
   const b = parsed.data;
   const run = await c.env.DB.prepare(
-    `SELECT r.agent_id AS agentId, rn.owner_user_id AS owner
+    `SELECT r.agent_id AS agentId, r.project_id AS projectId, rn.owner_user_id AS owner
      FROM runs r LEFT JOIN runners rn ON rn.id = r.runner_id WHERE r.id = ?`,
-  ).bind(runId).first<{ agentId: string | null; owner: string | null }>();
+  ).bind(runId).first<{ agentId: string | null; projectId: string; owner: string | null }>();
   if (!run || run.owner !== c.var.connection!.userId) return c.json({ error: 'run not found' }, 404);
+  const actionDenied = await runnerProjectActionDenied(c, run.projectId, 'contribute');
+  if (actionDenied) return actionDenied;
   // Only a live runtime delivery suppresses the notices fallback; fallback/dropped
   // leave the notice to fire normally.
   if (b.via === 'runtime') {
@@ -3144,9 +3643,8 @@ app.post('/api/runs/:runId/verification-report', agentAuth, async (c) => {
   if (!conn.boundAgent || conn.boundAgent.id !== run.agentId) {
     return c.json({ error: 'this run has no live agent matching the caller' }, 403);
   }
-  if (!(await tokenCanReachProject(c.env, conn.tokenId, run.projectId))) {
-    return c.json({ error: 'run is outside this connection’s authorized projects' }, 403);
-  }
+  const actionDenied = await runnerProjectActionDenied(c, run.projectId, 'contribute');
+  if (actionDenied) return actionDenied;
   const result = await memoryStub(c.env, run.projectId).acceptVerificationReport(run.projectId, report, { kind: 'agent', id: conn.boundAgent.id });
   return c.json(result);
 });
@@ -3264,9 +3762,8 @@ app.post('/api/runner-ingest/capability', agentAuth, async (c) => {
   // project — an unscoped run-agent token would otherwise treat this as reaching every project.
   const owned = await c.env.DB.prepare('SELECT id FROM runners WHERE id = ? AND owner_user_id = ?').bind(b.runnerId, conn.userId).first<{ id: string }>();
   if (!owned) return c.json({ error: 'runner not found' }, 404);
-  if (!(await tokenCanReachProject(c.env, conn.tokenId, b.projectId))) {
-    return c.json({ error: 'runner is outside this connection’s authorized projects' }, 403);
-  }
+  const actionDenied = await runnerProjectActionDenied(c, b.projectId, 'contribute');
+  if (actionDenied) return actionDenied;
   // The repository key must resolve to a canonical repository IN THIS project (PLNR-259) —
   // refused, without disclosing whether the key exists elsewhere, rather than minting a
   // capability scoped to nothing.
@@ -3299,10 +3796,7 @@ async function runnerMemoryGateDenied(c: Context<AppContext>, runnerId: string, 
   const conn = c.var.connection!;
   const owned = await c.env.DB.prepare('SELECT id FROM runners WHERE id = ? AND owner_user_id = ?').bind(runnerId, conn.userId).first<{ id: string }>();
   if (!owned) return c.json({ error: 'runner not found' }, 404);
-  if (!(await tokenCanReachProject(c.env, conn.tokenId, projectId))) {
-    return c.json({ error: 'runner is outside this connection’s authorized projects' }, 403);
-  }
-  return null;
+  return runnerProjectActionDenied(c, projectId, 'view');
 }
 
 const RunnerMemoryCursorBody = z.object({

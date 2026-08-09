@@ -98,6 +98,7 @@ export function Board({ store }: { store: AppStore }) {
       <BoardTabs
         boards={boards}
         current={boardId}
+        editable={store.permissions.canContribute}
         onSelect={(id) => actions.setBoard(id)}
         onCreate={async () => {
           const name = (await prompt('New board name:'))?.trim();
@@ -124,7 +125,7 @@ export function Board({ store }: { store: AppStore }) {
       >
         <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', maxHeight: 92, overflowY: 'auto' }}>
         <FilterChip label="All" active={msFilter === null} onClick={() => setMsFilter(null)} />
-        <button
+        {store.permissions.canContribute && <button
           onClick={() => actions.openModal('milestone')}
           title="New milestone"
           className="rail-add"
@@ -135,7 +136,7 @@ export function Board({ store }: { store: AppStore }) {
           }}
         >
           + milestone
-        </button>
+        </button>}
         {milestones.map((m) => {
           const total = allTasks.filter((t) => t.milestoneId === m.id).length;
           const done = allTasks.filter((t) => t.milestoneId === m.id && t.status === 'done').length;
@@ -152,7 +153,7 @@ export function Board({ store }: { store: AppStore }) {
             />
           );
         })}
-        {msFilter !== null && (
+        {msFilter !== null && store.permissions.canContribute && (
           <button
             onClick={() => {
               const m = msById.get(msFilter);
@@ -247,7 +248,7 @@ export function Board({ store }: { store: AppStore }) {
         )}
         {tagsExpanded && (
           <>
-            <button
+            {store.permissions.canContribute && <button
               onClick={() => actions.openModal('tag')}
               title="New tag"
               className="rail-add"
@@ -258,7 +259,7 @@ export function Board({ store }: { store: AppStore }) {
               }}
             >
               + tag
-            </button>
+            </button>}
             {tags.map((c) => (
               <FilterChip
                 key={c.id}
@@ -267,12 +268,12 @@ export function Board({ store }: { store: AppStore }) {
                 small
                 active={tagFilter === c.id}
                 onClick={() => setTagFilter(tagFilter === c.id ? null : c.id)}
-                onDelete={async () => {
+                onDelete={store.permissions.canContribute ? async () => {
                   if (await confirm(`Delete tag "${c.name}"? It's removed from all tasks.`)) {
                     if (tagFilter === c.id) setTagFilter(null);
                     void actions.deleteTag(c.id);
                   }
-                }}
+                } : undefined}
               />
             ))}
           </>
@@ -301,7 +302,7 @@ export function Board({ store }: { store: AppStore }) {
                 }}
                 onDrop={(e) => {
                   e.preventDefault();
-                  if (draggedId != null && st !== 'failed') actions.moveTask(draggedId, st);
+                  if (store.permissions.canContribute && draggedId != null && st !== 'failed') actions.moveTask(draggedId, st);
                 }}
                 className="board-col"
                 style={{ width: 282, flex: 'none', display: 'flex', flexDirection: 'column', minHeight: 0 }}
@@ -324,8 +325,9 @@ export function Board({ store }: { store: AppStore }) {
                     return (
                       <div
                         key={t.id}
-                        draggable
+                        draggable={store.permissions.canContribute}
                         onDragStart={(e) => {
+                          if (!store.permissions.canContribute) return;
                           actions.setDraggedId(t.id);
                           e.dataTransfer.effectAllowed = 'move';
                         }}
@@ -341,7 +343,7 @@ export function Board({ store }: { store: AppStore }) {
                           borderLeft: `3px solid ${selected.has(t.id) ? 'var(--accent)' : taskTags[0]?.color ?? 'var(--w-08)'}`,
                           borderRadius: 10,
                           padding: '12px 13px',
-                          cursor: 'grab',
+                          cursor: store.permissions.canContribute ? 'grab' : 'pointer',
                           opacity: draggedId === t.id ? 0.4 : t.archivedAt ? 0.5 : 1,
                         }}
                       >
@@ -407,7 +409,7 @@ export function Board({ store }: { store: AppStore }) {
                         <div style={{ fontSize: 12.5, lineHeight: 1.45, color: 'var(--text)' }}>{t.title}</div>
                         {/* The spin-off decision (PLNR-230): accept → todo, reject → cancelled.
                             These buttons (and the drawer's) are the ONLY doors out of proposed. */}
-                        {t.status === 'proposed' && (
+                        {t.status === 'proposed' && store.permissions.canManage && (
                           <div style={{ display: 'flex', gap: 6, marginTop: 9 }}>
                             <Button
                               variant="primary"
@@ -479,7 +481,7 @@ export function Board({ store }: { store: AppStore }) {
       </div>
 
       {/* Bulk-action bar (PLNR-125): floats only while a selection exists. */}
-      {selected.size > 0 && (
+      {selected.size > 0 && store.permissions.canContribute && (
         <BulkBar
           count={selected.size}
           milestones={milestones}
@@ -583,9 +585,10 @@ function FilterSelect({ value, onChange, active, children }: {
   );
 }
 
-function BoardTabs({ boards, current, onSelect, onCreate, onRename, onDelete }: {
+function BoardTabs({ boards, current, editable, onSelect, onCreate, onRename, onDelete }: {
   boards: Array<{ id: string; name: string }>;
   current: string | null;
+  editable: boolean;
   onSelect: (id: string) => void;
   onCreate: () => void;
   onRename: (id: string, name: string) => void;
@@ -615,7 +618,7 @@ function BoardTabs({ boards, current, onSelect, onCreate, onRename, onDelete }: 
             }}
           >
             {b.name}
-            {active && (
+            {active && editable && (
               <>
                 <span
                   role="button"
@@ -642,7 +645,7 @@ function BoardTabs({ boards, current, onSelect, onCreate, onRename, onDelete }: 
           </div>
         );
       })}
-      <button
+      {editable && <button
         onClick={onCreate}
         title="New board"
         className="rail-add"
@@ -653,7 +656,7 @@ function BoardTabs({ boards, current, onSelect, onCreate, onRename, onDelete }: 
         }}
       >
         + board
-      </button>
+      </button>}
     </div>
   );
 }

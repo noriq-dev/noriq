@@ -31,6 +31,13 @@ export interface ProjectVM {
   ownerName?: string | null;
   agentCount?: number;
   isPublic?: boolean;
+  effectiveRole: 'owner' | 'manager' | 'contributor' | 'viewer' | null;
+  accessSource: string;
+  canView: boolean;
+  canContribute: boolean;
+  canManage: boolean;
+  canOwn: boolean;
+  cappedByReadOnly: boolean;
 }
 
 export interface AgentVM {
@@ -125,4 +132,7 @@ export interface UserVM {
   email: string;
   name: string;
   role: string;
+  accessMode: 'read_write' | 'read_only';
+  canCreateProjects: boolean;
+  canCreateGroups: boolean;
 }

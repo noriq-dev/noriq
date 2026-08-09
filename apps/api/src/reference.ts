@@ -76,6 +76,8 @@ export function renderMcpReference(baseUrl: string): string {
     out.push('');
     out.push(`### \`${t.name}\``);
     out.push('');
+    out.push(`Minimum authorization: \`${t.minimumProjectAction}\`.`);
+    out.push('');
     out.push(t.description);
     const schema = toJsonSchema(z.object(t.inputSchema));
     const props = renderProps(schema);
@@ -88,6 +90,8 @@ export function renderMcpReference(baseUrl: string): string {
     out.push('');
     out.push(`### \`${r.uriTemplate}\``);
     out.push('');
+    out.push(`Minimum authorization: \`${r.minimumProjectAction}\`.`);
+    out.push('');
     out.push(r.description);
   }
   out.push('');
@@ -98,7 +102,12 @@ export function renderMcpReference(baseUrl: string): string {
 export function mcpReferenceJson(): unknown {
   const { tools, resources } = mcpReferenceSpecs();
   return {
-    tools: tools.map((t) => ({ name: t.name, description: t.description, inputSchema: toJsonSchema(z.object(t.inputSchema)) })),
+    tools: tools.map((t) => ({
+      name: t.name,
+      description: t.description,
+      minimumProjectAction: t.minimumProjectAction,
+      inputSchema: toJsonSchema(z.object(t.inputSchema)),
+    })),
     resources,
   };
 }

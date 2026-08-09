@@ -3,7 +3,7 @@
 // Regression for the mass-IDOR write hole surfaced by the multi-agent review:
 // writes went through room(pid) with only userAuth, so any logged-in user could
 // create/update/delete/message in any project (ids are the guessable prj_<key>).
-import { SELF } from 'cloudflare:test';
+import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { createUser, loginSession } from './helpers';
 
@@ -58,6 +58,63 @@ describe('project write routes require project access (PLNR-92)', () => {
 
   it('an admin retains access to any project (escalation preserved)', async () => {
     expect((await req(`/api/projects/${projectId}/tasks`, adminCookie, 'POST', { title: 'admin ok' })).status).toBe(200);
+  });
+
+  it('project reach does not let a group contributor change project settings', async () => {
+    const p = await req('/api/projects', ownerCookie, 'POST', { key: 'AZROLE', name: 'Role boundary' });
+    const pid = (await p.json() as { id: string }).id;
+    const g = await req('/api/groups', ownerCookie, 'POST', { name: 'AZ role group' });
+    const gid = (await g.json() as { id: string }).id;
+    const outsider = await env.DB.prepare("SELECT id FROM users WHERE email = 'az-outsider@example.com'")
+      .first<{ id: string }>();
+    expect((await req(`/api/groups/${gid}/members`, ownerCookie, 'POST', { userId: outsider!.id })).status).toBe(200);
+    expect((await req(`/api/groups/${gid}/members/accept`, outsiderCookie, 'POST')).status).toBe(200);
+    expect((await req(`/api/projects/${pid}/meta`, ownerCookie, 'PATCH', { groupId: gid })).status).toBe(200);
+
+    // Accepted group membership gives contributor reach, not project management.
+    expect((await req(`/api/projects/${pid}/meta`, outsiderCookie, 'PATCH', { name: 'contributor hijack' })).status).toBe(403);
+
+    await env.DB.prepare(
+      "INSERT INTO project_grants (project_id, principal_type, principal_id, role) VALUES (?, 'user', ?, 'manager')",
+    ).bind(pid, outsider!.id).run();
+    expect((await req(`/api/projects/${pid}/meta`, outsiderCookie, 'PATCH', { name: 'manager change' })).status).toBe(200);
+    const snap = await (await req(`/api/projects/${pid}/snapshot`, ownerCookie)).json() as { project: { name: string } };
+    expect(snap.project.name).toBe('manager change');
+  });
+
+  it('honors direct viewer grants and caps read-only owners at viewer actions', async () => {
+    const outsider = await env.DB.prepare("SELECT id FROM users WHERE email = 'az-outsider@example.com'")
+      .first<{ id: string }>();
+    await env.DB.prepare(
+      "INSERT INTO project_grants (project_id, principal_type, principal_id, role) VALUES (?, 'user', ?, 'viewer')",
+    ).bind(projectId, outsider!.id).run();
+    const viewerSnapshot = await req(`/api/projects/${projectId}/snapshot`, outsiderCookie);
+    expect(viewerSnapshot.status).toBe(200);
+    expect((await viewerSnapshot.json() as { project: Record<string, unknown> }).project).toMatchObject({
+      effectiveRole: 'viewer', accessSource: 'user_grant', canView: true, canContribute: false, canManage: false, canOwn: false,
+    });
+    const viewerDirectory = await (await req('/api/projects', outsiderCookie)).json() as { projects: Array<Record<string, unknown>> };
+    expect(viewerDirectory.projects.find((p) => p.id === projectId)).toMatchObject({
+      effectiveRole: 'viewer', canView: true, canContribute: false,
+    });
+    const viewerWrite = await req(`/api/projects/${projectId}/tasks`, outsiderCookie, 'POST', { title: 'viewer write' });
+    expect(viewerWrite.status).toBe(403);
+    expect((await viewerWrite.json() as { code: string; action: string }).code).toBe('project_action_denied');
+
+    const owner = await env.DB.prepare("SELECT id FROM users WHERE email = 'az-owner@example.com'")
+      .first<{ id: string }>();
+    await env.DB.prepare("UPDATE users SET access_mode = 'read_only' WHERE id = ?").bind(owner!.id).run();
+    const me = await (await req('/api/auth/me', ownerCookie)).json() as { user: Record<string, unknown> };
+    expect(me.user).toMatchObject({ accessMode: 'read_only', canCreateProjects: false, canCreateGroups: false });
+    expect((await req(`/api/projects/${projectId}/snapshot`, ownerCookie)).status).toBe(200);
+    const readonlyWrite = await req(`/api/projects/${projectId}/tasks`, ownerCookie, 'POST', { title: 'read-only write' });
+    expect(readonlyWrite.status).toBe(403);
+    expect((await readonlyWrite.json() as { reason: string }).reason).toBe('account is read-only');
+    await env.DB.batch([
+      env.DB.prepare("UPDATE users SET access_mode = 'read_write' WHERE id = ?").bind(owner!.id),
+      env.DB.prepare("DELETE FROM project_grants WHERE project_id = ? AND principal_type = 'user' AND principal_id = ?")
+        .bind(projectId, outsider!.id),
+    ]);
   });
 
   it("none of the outsider's attempts mutated the owner's task or project name", async () => {

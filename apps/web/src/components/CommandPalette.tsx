@@ -73,8 +73,8 @@ export function CommandPalette({ store }: { store: AppStore }) {
     for (const p of data.projects) {
       cmds.push({ id: `proj:${p.id}`, kind: 'project', label: `Open ${p.name}`, hint: p.key, run: close(() => actions.selectProject(p.id)) });
     }
-    cmds.push({ id: 'act:new-task', kind: 'action', label: 'New task', run: close(() => actions.createTask()) });
-    cmds.push({ id: 'act:new-project', kind: 'action', label: 'New project', run: close(() => actions.createProject()) });
+    if (store.permissions.canContribute) cmds.push({ id: 'act:new-task', kind: 'action', label: 'New task', run: close(() => actions.createTask()) });
+    if (store.permissions.canCreateProjects) cmds.push({ id: 'act:new-project', kind: 'action', label: 'New project', run: close(() => actions.createProject()) });
     cmds.push({ id: 'act:toggle-archived', kind: 'action', label: 'Toggle archived tasks', run: close(() => actions.toggleArchived()) });
     for (const t of helpers.tasksOf(currentPid)) {
       cmds.push({
@@ -83,7 +83,7 @@ export function CommandPalette({ store }: { store: AppStore }) {
       });
     }
     return cmds;
-  }, [open, data.projects, currentPid, helpers, actions]);
+  }, [open, data.projects, currentPid, helpers, actions, store.permissions.canContribute, store.permissions.canCreateProjects]);
 
   const matches = useMemo(() => {
     const needle = q.trim().toLowerCase();

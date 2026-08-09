@@ -2,6 +2,8 @@ import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../env';
 import type { Actor } from './ProjectRoom';
 import { RunnerClientMessage, RUNNER_PROTOCOL_VERSION } from '@noriq-dev/shared';
+import { projectRoleAllows, resolveAccountCapabilities, resolveProjectAccess } from '../lib/authorization';
+import { tokenCanReachProject } from '../lib/visibility';
 
 /**
  * RunnerHub — one instance per runner (idFromName(runnerId)).
@@ -14,6 +16,7 @@ import { RunnerClientMessage, RUNNER_PROTOCOL_VERSION } from '@noriq-dev/shared'
  * forwarded here (token → runner owner), mirroring /ws/projects.
  */
 const SYS: Actor = { kind: 'system', id: 'system', name: 'system' };
+type RunnerSocketAuth = { userId: string; tokenId: string };
 
 export class RunnerHub extends DurableObject<Env> {
   private _runnerId?: string;
@@ -35,8 +38,12 @@ export class RunnerHub extends DurableObject<Env> {
     }
     const m = new URL(request.url).pathname.match(/\/ws\/runner\/([^/]+)/);
     if (m) await this.setRunnerId(decodeURIComponent(m[1]!));
+    const userId = request.headers.get('X-Noriq-Authorized-User');
+    const tokenId = request.headers.get('X-Noriq-Authorized-Token');
+    if (!userId || !tokenId) return Response.json({ error: 'authorization required' }, { status: 401 });
     const pair = new WebSocketPair();
     this.ctx.acceptWebSocket(pair[1]);
+    pair[1].serializeAttachment({ userId, tokenId } satisfies RunnerSocketAuth);
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
@@ -44,7 +51,12 @@ export class RunnerHub extends DurableObject<Env> {
   async deliver(json: string): Promise<{ delivered: boolean }> {
     let delivered = false;
     for (const ws of this.ctx.getWebSockets()) {
-      try { ws.send(json); delivered = true; } catch { /* socket gone */ }
+      try {
+        const auth = await this.authorizeSocket(ws);
+        if (!auth) continue;
+        ws.send(json);
+        delivered = true;
+      } catch { /* socket gone */ }
     }
     return { delivered };
   }
@@ -53,6 +65,8 @@ export class RunnerHub extends DurableObject<Env> {
     if (typeof message !== 'string') return;
     const runnerId = await this.loadRunnerId();
     if (!runnerId) return;
+    const auth = await this.authorizeSocket(ws);
+    if (!auth) return;
     let parsed;
     try {
       parsed = RunnerClientMessage.safeParse(JSON.parse(message));
@@ -62,19 +76,20 @@ export class RunnerHub extends DurableObject<Env> {
 
     switch (msg.type) {
       case 'ping':
-        ws.send(JSON.stringify({ type: 'pong' }));
+        this.sendIfOpen(ws, JSON.stringify({ type: 'pong' }));
         return;
 
       case 'hello': {
-        ws.send(JSON.stringify({ type: 'registered', runnerId, protocol: RUNNER_PROTOCOL_VERSION, serverTime: new Date().toISOString() }));
+        if (!this.sendIfOpen(ws, JSON.stringify({ type: 'registered', runnerId, protocol: RUNNER_PROTOCOL_VERSION, serverTime: new Date().toISOString() }))) return;
         // Redeliver Runs already dispatched to this runner but not yet started — they
         // may have been assigned while the socket was down (dispatch-before-connect).
         const { results } = await this.env.DB.prepare(
-          "SELECT id FROM runs WHERE runner_id = ? AND status = 'dispatched'",
-        ).bind(runnerId).all<{ id: string }>();
+          "SELECT id, project_id AS pid FROM runs WHERE runner_id = ? AND status = 'dispatched'",
+        ).bind(runnerId).all<{ id: string; pid: string }>();
         for (const r of results) {
+          if (!(await this.authorizeProject(ws, auth, r.pid))) return;
           const run = await this.runView(r.id);
-          if (run) ws.send(JSON.stringify({ type: 'run.assigned', run }));
+          if (run && !this.sendIfOpen(ws, JSON.stringify({ type: 'run.assigned', run }))) return;
         }
         return;
       }
@@ -107,6 +122,7 @@ export class RunnerHub extends DurableObject<Env> {
         const row = await this.env.DB.prepare('SELECT project_id AS pid, runner_id AS rid FROM runs WHERE id = ?')
           .bind(msg.runId).first<{ pid: string; rid: string | null }>();
         if (!row || row.rid !== runnerId) return;
+        if (!(await this.authorizeProject(ws, auth, row.pid))) return;
         try {
           await this.room(row.pid).transitionRun(row.pid, SYS, msg.runId, {
             status: msg.status,
@@ -129,6 +145,7 @@ export class RunnerHub extends DurableObject<Env> {
         const row = await this.env.DB.prepare('SELECT project_id AS pid, runner_id AS rid FROM runs WHERE id = ?')
           .bind(msg.runId).first<{ pid: string; rid: string | null }>();
         if (!row || row.rid !== runnerId) return;
+        if (!(await this.authorizeProject(ws, auth, row.pid))) return;
         try {
           await this.room(row.pid).recordRunTelemetry(row.pid, msg.runId, {
             tokensUsed: msg.tokensUsed,
@@ -149,6 +166,7 @@ export class RunnerHub extends DurableObject<Env> {
         const row = await this.env.DB.prepare('SELECT project_id AS pid, runner_id AS rid FROM runs WHERE id = ?')
           .bind(msg.runId).first<{ pid: string; rid: string | null }>();
         if (!row || row.rid !== runnerId) return;
+        if (!(await this.authorizeProject(ws, auth, row.pid))) return;
         try {
           await this.room(row.pid).appendRunLog(row.pid, msg.runId, msg.segments);
         } catch { /* best-effort — never fatal */ }
@@ -161,8 +179,10 @@ export class RunnerHub extends DurableObject<Env> {
         // runtime_deliveries so computeUpdates suppresses the notices fallback for
         // that source (dedup by the stable source id).
         const steer = await this.env.DB.prepare(
-          'SELECT agent_id AS agentId, source_id AS sourceId, run_id AS runId FROM steers WHERE id = ?',
-        ).bind(msg.steerId).first<{ agentId: string | null; sourceId: string | null; runId: string }>();
+          `SELECT s.agent_id AS agentId, s.source_id AS sourceId, s.run_id AS runId, r.project_id AS pid
+             FROM steers s JOIN runs r ON r.id = s.run_id WHERE s.id = ?`,
+        ).bind(msg.steerId).first<{ agentId: string | null; sourceId: string | null; runId: string; pid: string }>();
+        if (!steer || !(await this.authorizeProject(ws, auth, steer.pid))) return;
         await this.env.DB.prepare('UPDATE steers SET delivered_via = ?, acked_at = ? WHERE id = ?')
           .bind(msg.via, new Date().toISOString(), msg.steerId).run();
         if (steer && msg.via === 'runtime' && msg.delivered && steer.agentId && steer.sourceId) {
@@ -175,8 +195,60 @@ export class RunnerHub extends DurableObject<Env> {
     }
   }
 
+  override async webSocketClose(ws: WebSocket) {
+    ws.close();
+  }
+
   private room(projectId: string) {
     return this.env.PROJECT_ROOM.get(this.env.PROJECT_ROOM.idFromName(projectId));
+  }
+
+  /** Async authorization/redelivery work may outlive a peer-initiated close. Treat that as an
+   * ordinary disconnected socket, not an unhandled Durable Object exception. */
+  private sendIfOpen(ws: WebSocket, message: string): boolean {
+    try {
+      if (ws.readyState !== WebSocket.OPEN) return false;
+      ws.send(message);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** A runner credential never inherits a human administrator override. Re-check the OAuth
+   * connection and account ceiling for every frame so revocation/read-only changes take effect
+   * without waiting for the socket to reconnect. */
+  private async authorizeSocket(ws: WebSocket): Promise<RunnerSocketAuth | null> {
+    const auth = ws.deserializeAttachment() as RunnerSocketAuth | null;
+    if (!auth?.userId || !auth.tokenId) {
+      ws.close(1008, 'authorization required');
+      return null;
+    }
+    const [token, account] = await Promise.all([
+      this.env.DB.prepare(
+        `SELECT 1 AS ok FROM oauth_tokens
+          WHERE id = ? AND user_id = ? AND revoked_at IS NULL
+            AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
+      ).bind(auth.tokenId, auth.userId).first<{ ok: number }>(),
+      resolveAccountCapabilities(this.env.DB, auth.userId),
+    ]);
+    if (!token || account.disabled || account.accessMode !== 'read_write') {
+      ws.close(1008, 'runner authorization revoked');
+      return null;
+    }
+    return auth;
+  }
+
+  private async authorizeProject(ws: WebSocket, auth: RunnerSocketAuth, projectId: string): Promise<boolean> {
+    const [access, tokenReach] = await Promise.all([
+      resolveProjectAccess(this.env.DB, auth.userId, projectId),
+      tokenCanReachProject(this.env, auth.tokenId, projectId),
+    ]);
+    if (!projectRoleAllows(access.role, 'contribute') || !tokenReach) {
+      ws.close(1008, 'project authorization revoked');
+      return false;
+    }
+    return true;
   }
 
   /** Fetch a Run as the wire shape via its project's authority. */

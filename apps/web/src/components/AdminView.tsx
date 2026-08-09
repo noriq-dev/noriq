@@ -42,7 +42,11 @@ export function AdminView({ store }: { store: AppStore }) {
                   {projects.map((p) => (
                     <tr
                       key={p.id}
-                      onClick={() => store.actions.selectProject(p.id)}
+                      onClick={async () => {
+                        if (!(await confirm(`Open ${p.key} using the system administrator override? This access is audited.`))) return;
+                        await api.beginAdminProjectOverride(p.id);
+                        store.actions.selectProject(p.id);
+                      }}
                       className="hover-bright"
                       style={{ cursor: 'pointer', borderTop: '1px solid var(--w-05)' }}
                     >
@@ -67,6 +71,8 @@ export function AdminView({ store }: { store: AppStore }) {
           )}
         </Section>
 
+        <AuthorizationSection />
+
         <OAuthSection />
 
         <UsersSection store={store} />
@@ -74,6 +80,72 @@ export function AdminView({ store }: { store: AppStore }) {
       </div>
     </div>
   );
+}
+
+function AuthorizationSection() {
+  const [state, setState] = useState<Awaited<ReturnType<typeof api.adminAuthorization>> | null>(null);
+  const [parity, setParity] = useState<Awaited<ReturnType<typeof api.authorizationParityAudit>> | null>(null);
+  const load = () => api.adminAuthorization().then(setState).catch(() => {});
+  useEffect(() => { void load(); }, []);
+  if (!state) return <Section title="Authorization policy"><div style={{ color: 'var(--text-dim)' }}>loading…</div></Section>;
+  const updateAccount = async (id: string, patch: Parameters<typeof api.patchUser>[1]) => {
+    await api.patchUser(id, patch);
+    load();
+  };
+  return (
+    <>
+      <Section title="Authorization defaults">
+        <div style={{ display: 'flex', gap: 20, fontSize: 12.5 }}>
+          <label><input type="checkbox" checked={!!state.settings.defaultCanCreateProjects} onChange={async (e) => { await api.setAuthorizationDefaults({ defaultCanCreateProjects: e.target.checked }); load(); }} /> Accounts may create projects by default</label>
+          <label><input type="checkbox" checked={!!state.settings.defaultCanCreateGroups} onChange={async (e) => { await api.setAuthorizationDefaults({ defaultCanCreateGroups: e.target.checked }); load(); }} /> Accounts may create groups by default</label>
+        </div>
+      </Section>
+      <Section title="Migration parity gate">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 12 }}>
+          <button onClick={() => void api.authorizationParityAudit(false).then(setParity)}>Run shadow audit</button>
+          <button onClick={async () => {
+            if (!(await confirm('Reconcile missing compatibility grants, then rerun the parity audit?'))) return;
+            setParity(await api.authorizationParityAudit(true));
+            load();
+          }}>Reconcile lost access</button>
+          {parity && <span style={{ color: parity.readyToRetireLegacy ? 'var(--green)' : 'var(--amber)', fontFamily: 'var(--mono)' }}>
+            {parity.rolloutGate.toUpperCase()} · {parity.compared} pairs · {parity.broadened} broadened · {parity.lost} lost · {parity.inserted} inserted
+          </span>}
+        </div>
+        {parity && !parity.readyToRetireLegacy && <div style={{ marginTop: 8, color: 'var(--text-mid)', fontSize: 11 }}>{parity.rollback}</div>}
+      </Section>
+      <Section title={`Account policy · ${state.accounts.length}`}>
+        <div style={{ overflowX: 'auto' }}><table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+          <thead><tr><Th>Account</Th><Th>Access</Th><Th>Project creation</Th><Th>Group creation</Th></tr></thead>
+          <tbody>{state.accounts.map((u) => <tr key={u.id} style={{ borderTop: '1px solid var(--w-05)' }}>
+            <Td><b>{u.name}</b> <span style={{ color: 'var(--text-faint)', fontFamily: 'var(--mono)', fontSize: 9.5 }}>{u.email}</span></Td>
+            <Td><select value={u.accessMode ?? 'read_write'} onChange={(e) => void updateAccount(u.id, { accessMode: e.target.value as 'read_write' | 'read_only' })}><option value="read_write">Read/write</option><option value="read_only">Read-only</option></select></Td>
+            <Td><PolicySelect value={u.canCreateProjectsOverride} onChange={(v) => updateAccount(u.id, { canCreateProjects: v })} /></Td>
+            <Td><PolicySelect value={u.canCreateGroupsOverride} onChange={(v) => updateAccount(u.id, { canCreateGroups: v })} /></Td>
+          </tr>)}</tbody>
+        </table></div>
+      </Section>
+      <Section title={`Access inventory · ${state.projects.length} projects · ${state.groups.length} groups`}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, fontSize: 11.5 }}>
+          <div>{state.projects.map((p) => <div key={p.id} style={{ padding: '5px 0', borderBottom: '1px solid var(--w-05)' }}><b>{p.key}</b> · {p.ownerName} · {p.grantCount} grant(s){p.legacyGroupId ? ' · legacy group link' : ''}</div>)}</div>
+          <div>{state.groups.map((g) => <div key={g.id} style={{ padding: '5px 0', borderBottom: '1px solid var(--w-05)' }}><b>{g.name}</b> · {g.ownerCount} owner(s) · {g.memberCount} member(s) · {g.projectGrantCount} project grant(s)</div>)}</div>
+        </div>
+      </Section>
+      <Section title={`Authorization audit · latest ${state.audit.length}`}>
+        <div style={{ maxHeight: 260, overflowY: 'auto', fontFamily: 'var(--mono)', fontSize: 10 }}>
+          {state.audit.map((e) => <div key={e.id} style={{ display: 'grid', gridTemplateColumns: '140px 1fr 90px 1fr', gap: 8, padding: '5px 0', borderBottom: '1px solid var(--w-04)' }}>
+            <span style={{ color: 'var(--text-faint)' }}>{new Date(e.createdAt).toLocaleString()}</span><span>{e.action}</span><span>{e.decision} · {e.reason}</span><span style={{ color: 'var(--text-dim)' }}>{e.resourceType}:{e.resourceId ?? '—'}</span>
+          </div>)}
+        </div>
+      </Section>
+    </>
+  );
+}
+
+function PolicySelect({ value, onChange }: { value?: number | null; onChange: (value: boolean | null) => Promise<void> }) {
+  return <select value={value == null ? 'inherit' : value ? 'allow' : 'deny'} onChange={(e) => void onChange(e.target.value === 'inherit' ? null : e.target.value === 'allow')}>
+    <option value="inherit">Inherit default</option><option value="allow">Allow</option><option value="deny">Deny</option>
+  </select>;
 }
 
 /** Admin OAuth management (PLNR-160): every live connection instance-wide, revocable,

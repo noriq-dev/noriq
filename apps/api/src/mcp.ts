@@ -33,6 +33,14 @@ import { MEMORY_SKILL_MD } from './skill-memory';
 import { signUploadToken, resolveUploadSecret } from './lib/upload-token';
 import { taskClaimability } from './lib/claimability';
 import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
+import {
+  projectRoleAllows,
+  recordAuthorizationAudit,
+  resolveAccountCapabilities,
+  resolveProjectAccess,
+  userCanCreateProject,
+  type ProjectAction,
+} from './lib/authorization';
 
 const MAX_ATTACHMENT = 100 * 1024 * 1024;
 
@@ -91,8 +99,8 @@ const attachmentUri = (id: string) => `noriq://attachment/${id}`;
 const docUri = (id: string) => `noriq://doc/${id}`;
 
 /** Tool metadata captured at registration, used to generate the reference doc (PLNR-23). */
-export type ToolSpec = { name: string; description: string; inputSchema: z.ZodRawShape };
-export type ResourceSpec = { name: string; uriTemplate: string; description: string };
+export type ToolSpec = { name: string; description: string; inputSchema: z.ZodRawShape; minimumProjectAction: ProjectAction | 'account' };
+export type ResourceSpec = { name: string; uriTemplate: string; description: string; minimumProjectAction: 'view' };
 
 /**
  * Noriq MCP server — Streamable HTTP, stateless (a fresh server per request,
@@ -224,16 +232,16 @@ function memoryStub(env: Env, projectId: string): ProjectMemoryStub {
  * to its canonical id, so callers can accept whichever the agent passes. The ProjectRoom
  * is strictly id-keyed, so claim/release resolve here before crossing into it.
  */
-/** The group-filing rule (PLNR-134, mirroring PLNR-93's REST rule): a user may file a
- *  project under a group only if they created the group or belong to it. No admin
+/** The group-filing rule (PLNR-134/327, mirroring the REST rule): a user may file a
+ *  project under a group only if they are an accepted member. No admin
  *  escalation here — an agent is scoped to its user, never to admin. Throws on an
  *  unknown group so "no such group" and "not yours" read differently. */
 async function canUseGroup(env: Env, userId: string, groupId: string): Promise<boolean> {
-  const g = await env.DB.prepare('SELECT created_by AS createdBy FROM groups WHERE id = ?')
-    .bind(groupId).first<{ createdBy: string | null }>();
+  const g = await env.DB.prepare('SELECT 1 FROM groups WHERE id = ?').bind(groupId).first();
   if (!g) throw new Error(`group ${groupId} not found`);
-  if (g.createdBy === userId) return true;
-  return !!(await env.DB.prepare('SELECT 1 FROM user_groups WHERE user_id = ? AND group_id = ?')
+  return !!(await env.DB.prepare(
+    "SELECT 1 FROM user_groups WHERE user_id = ? AND group_id = ? AND status = 'accepted'",
+  )
     .bind(userId, groupId).first());
 }
 
@@ -319,6 +327,20 @@ const TOOL_HINTS: Record<string, ToolHints> = {
   set_project_group: WRITE_IDEMPOTENT, reindex_search: WRITE_IDEMPOTENT,
   acquire_lock: WRITE_IDEMPOTENT, release_lock: WRITE_IDEMPOTENT,
   // everything else → WRITE (additive, non-idempotent, non-destructive, closed-world)
+};
+
+const MCP_MANAGER_TOOLS = new Set(['set_project_group', 'reindex_search']);
+
+const minimumMcpAction = (
+  name: string,
+  hints: ToolHints,
+  inputSchema: z.ZodRawShape,
+): ProjectAction | 'account' => {
+  if (hints.readOnlyHint === true) return 'view';
+  if (MCP_MANAGER_TOOLS.has(name)) return 'manage';
+  // Tools without projectId (templates, identity, project creation) are still account writes;
+  // the read-only ceiling applies even though no project role can be resolved.
+  return Object.prototype.hasOwnProperty.call(inputSchema, 'projectId') ? 'contribute' : 'account';
 };
 
 /** Self-reported server identity — sent in legacy `initialize` results and mirrored into
@@ -415,21 +437,53 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     if (floor && !floor.has(name)) return;
     // Capture the spec at definition time so the reference doc is generated from the
     // exact same zod schemas the tools validate against — it can't drift (PLNR-23).
-    toolSpecs.push({ name, description, inputSchema });
     const annotations = TOOL_HINTS[name] ?? WRITE; // PLNR-88: proper read/write/destructive hints
+    const minimumAction = minimumMcpAction(name, annotations, inputSchema);
+    toolSpecs.push({ name, description, inputSchema, minimumProjectAction: minimumAction });
     // Write-freeze (PLNR-166): during maintenance a write tool must not appear to succeed —
     // return a retryable isError result naming the reason so the agent parks and retries,
     // rather than believing a phantom ack. Reads (readOnlyHint) stay live. The gate wraps the
     // callback so it is re-checked per call (MAINTENANCE_MODE can flip while a session is open).
-    const guarded = annotations.readOnlyHint === true
-      ? cb
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      : (async (args: any, extra?: { requestId?: string | number }) => {
-          if (isMaintenanceMode(env)) {
-            return { content: [{ type: 'text' as const, text: `Error: ${MAINTENANCE_MESSAGE}` }], isError: true };
-          }
-          return cb(args, extra);
-        });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const guarded = async (args: any, extra?: { requestId?: string | number }) => {
+      const pid = args && typeof args === 'object' ? (args as { projectId?: unknown }).projectId : undefined;
+      const deny = async (message: string, reason: string) => {
+        await recordAuthorizationAudit(env.DB, {
+          actorKind: 'agent', actorId: agent.id, action: 'mcp.tool',
+          resourceType: typeof pid === 'string' && pid ? 'project' : 'account',
+          resourceId: typeof pid === 'string' && pid ? pid : agent.userId,
+          decision: 'deny', reason,
+          // Tool identity and required policy are useful for operations without retaining
+          // arguments, prompt text, request bodies, credentials, or resource content.
+          metadata: { tool: name, requiredAction: minimumAction, transport: 'mcp' },
+        }).catch(() => {});
+        return { content: [{ type: 'text' as const, text: `Error: ${message}` }], isError: true };
+      };
+      if (annotations.readOnlyHint !== true) {
+        const account = await resolveAccountCapabilities(env.DB, agent.userId);
+        if (account.accessMode === 'read_only' || account.disabled) {
+          return deny('account is read-only', account.disabled ? 'account_disabled' : 'account_read_only');
+        }
+      }
+      if (typeof pid === 'string' && pid) {
+        // Never pass allowAdminOverride here: MCP and Runner credentials do not inherit a
+        // human administrator's ambient authority.
+        const access = await resolveProjectAccess(env.DB, agent.userId, pid);
+        if (!access.exists || !projectRoleAllows(access.role, 'view')) {
+          return deny(`project ${pid} not found or not accessible to you`, access.exists ? 'no_project_access' : 'project_not_found');
+        }
+        const action = minimumAction === 'account' ? 'view' : minimumAction;
+        if (!projectRoleAllows(access.role, action)) {
+          const requiredRole = action === 'contribute' ? 'contributor' : action === 'manage' ? 'manager' : action === 'own' ? 'owner' : 'viewer';
+          return deny(`project ${requiredRole} role required`, 'insufficient_project_role');
+        }
+        if (opts.oauthTokenId && !(await tokenCanReachProject(env, opts.oauthTokenId, pid))) {
+          return deny(`project ${pid} is outside this connection's authorized projects`, 'oauth_project_scope');
+        }
+      }
+      if (annotations.readOnlyHint !== true && isMaintenanceMode(env)) return deny(MAINTENANCE_MESSAGE, 'maintenance_mode');
+      return cb(args, extra);
+    };
     // The SDK (1.29.0) accepts zod v4 at runtime (peer `^3.25 || ^4.0`) but types
     // registerTool's inputSchema against v3's fuller ZodType, so v4's leaner raw
     // shape needs a cast at this single funnel point. Runtime validation is unchanged.
@@ -558,22 +612,31 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       name: z.string().min(1),
       description: z.string().optional(),
       repoUrl: z.string().url().optional(),
-      groupId: z.string().optional().describe('Group to file the project under — you must be its creator or a member'),
+      groupId: z.string().optional().describe('Group to file the project under — you must be an accepted member'),
     },
     tool(async (args) => {
+      if (!(await userCanCreateProject(env, agent.userId))) {
+        throw new Error('project creation denied: your account is not allowed to create projects');
+      }
       // Same rule as the dashboard's group move (PLNR-93), minus the admin escalation —
-      // an agent is scoped to its user, never to admin: you may file a project into a
-      // group only if you created that group or already belong to it.
+      // an agent is scoped to its user, never to admin: an accepted membership is required.
       if (args.groupId && !(await canUseGroup(env, agent.userId, args.groupId))) {
-        throw new Error('you must be a member or the creator of the target group');
+        throw new Error('you must be an accepted member of the target group');
       }
       // Random id, NOT prj_<key> (PLNR-106): a key-derived id is a cross-tenant existence
       // oracle (guess prj_acme to learn ACME exists) and lowers the bar for any missing-
       // projectId authz gap. key stays a label; the id is unguessable and looked up, never derived.
       const id = newId('prj');
-      await env.DB.prepare(
+      const createStatements = [env.DB.prepare(
         `INSERT INTO projects (id, key, name, description, status, repo_url, claim_ttl_seconds, owner_user_id, group_id, created_at) VALUES (?, ?, ?, ?, 'active', ?, 1800, ?, ?, ?)`,
-      ).bind(id, args.key, args.name, args.description ?? '', args.repoUrl ?? null, agent.userId, args.groupId ?? null, nowIso()).run();
+      ).bind(id, args.key, args.name, args.description ?? '', args.repoUrl ?? null, agent.userId, args.groupId ?? null, nowIso())];
+      if (args.groupId) {
+        createStatements.push(env.DB.prepare(
+          `INSERT INTO project_grants (project_id, principal_type, principal_id, role, source, created_by)
+           VALUES (?, 'group', ?, 'contributor', 'legacy_group', ?)`,
+        ).bind(id, args.groupId, agent.userId));
+      }
+      await env.DB.batch(createStatements);
       await room(env, id).createMilestone(id, actor, 'Backlog');
       await room(env, id).createBoard(id, actor, 'Main');
       // A scoped token joins the project it just created to its own scope (RUN-38). Otherwise
@@ -622,32 +685,47 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'set_project_group',
-    'File a project under a group, or null to ungroup it. Grouping SHARES the project: every member of the group can then see and work it; ungrouping narrows it back to its owner. You must be the group\'s creator or a member (see list_groups).',
+    'File a project under a group, or null to ungroup it. Grouping SHARES the project: every member of the group can then see and work it; ungrouping narrows it back to its owner. You must be an accepted group member (see list_groups).',
     { projectId: z.string(), groupId: z.string().nullable().describe('Target group id, or null to ungroup') },
     tool(async ({ projectId, groupId }) => {
-      if (!(await userCanAccessProject(env, agent.userId, projectId))) {
+      const access = await resolveProjectAccess(env.DB, agent.userId, projectId);
+      if (!access.exists || !access.role) {
         throw new Error(`project ${projectId} not found`);
       }
-      if (groupId !== null && !(await canUseGroup(env, agent.userId, groupId))) {
-        throw new Error('you must be a member or the creator of the target group');
+      if (!projectRoleAllows(access.role, 'manage')) {
+        throw new Error('project manager role required to change project grouping');
       }
-      await env.DB.prepare('UPDATE projects SET group_id = ? WHERE id = ?').bind(groupId, projectId).run();
+      if (groupId !== null && !(await canUseGroup(env, agent.userId, groupId))) {
+        throw new Error('you must be an accepted member of the target group');
+      }
+      const statements = [
+        env.DB.prepare('UPDATE projects SET group_id = ? WHERE id = ?').bind(groupId, projectId),
+        env.DB.prepare("DELETE FROM project_grants WHERE project_id = ? AND source = 'legacy_group'").bind(projectId),
+      ];
+      if (groupId !== null) {
+        statements.push(env.DB.prepare(
+          `INSERT INTO project_grants (project_id, principal_type, principal_id, role, source, created_by)
+           VALUES (?, 'group', ?, 'contributor', 'legacy_group', ?)
+           ON CONFLICT (project_id, principal_type, principal_id) DO NOTHING`,
+        ).bind(projectId, groupId, agent.userId));
+      }
+      await env.DB.batch(statements);
       return { ok: true, projectId, groupId };
     }),
   );
 
   defineTool(
     'list_groups',
-    'Groups in this instance, with whether you can file projects under each (creator or member). Resolve a group name to the id create_project/set_project_group need.',
+    'Groups in this instance, with whether you are an accepted member and may file projects under each. Resolve a group name to the id create_project/set_project_group need.',
     {},
     tool(async () => {
       const { results } = await env.DB.prepare(
         `SELECT g.id, g.name,
-                (g.created_by = ?1) AS mine,
-                EXISTS (SELECT 1 FROM user_groups ug WHERE ug.group_id = g.id AND ug.user_id = ?1) AS member
+                EXISTS (SELECT 1 FROM user_groups ug
+                         WHERE ug.group_id = g.id AND ug.user_id = ?1 AND ug.status = 'accepted') AS member
          FROM groups g ORDER BY g.name`,
-      ).bind(agent.userId).all<{ id: string; name: string; mine: number; member: number }>();
-      return { groups: results.map((g) => ({ id: g.id, name: g.name, usable: !!g.mine || !!g.member })) };
+      ).bind(agent.userId).all<{ id: string; name: string; member: number }>();
+      return { groups: results.map((g) => ({ id: g.id, name: g.name, usable: !!g.member })) };
     }),
   );
 
@@ -2284,6 +2362,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     name: 'doc',
     uriTemplate: 'noriq://doc/{id}',
     description: 'A project reference doc (markdown) — conventions, architecture notes, decisions.',
+    minimumProjectAction: 'view',
   });
   server.registerResource(
     'doc',
@@ -2304,6 +2383,9 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         .bind(docId).first<{ body: string; pid: string }>();
       if (!row) throw new Error(`doc ${docId} not found`);
       if (!(await userCanAccessProject(env, agent.userId, row.pid))) throw new Error(`doc ${docId} not found`);
+      if (opts.oauthTokenId && !(await tokenCanReachProject(env, opts.oauthTokenId, row.pid))) {
+        throw new Error(`doc ${docId} not found`);
+      }
       return { contents: [{ uri: uri.href, mimeType: 'text/markdown', text: row.body }] };
     },
   );
@@ -2312,6 +2394,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     name: 'attachment',
     uriTemplate: 'noriq://attachment/{id}',
     description: 'Bytes of a file attached to a task (image, log, etc.). Binary returns as base64 blob; text/json/xml/yaml as text.',
+    minimumProjectAction: 'view',
   });
   server.registerResource(
     'attachment',
@@ -2350,6 +2433,9 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       ).bind(attId).first<{ key: string; ct: string; pid: string }>();
       if (!row) throw new Error(`attachment ${attId} not found`);
       if (!(await userCanAccessProject(env, agent.userId, row.pid))) throw new Error(`attachment ${attId} not found`);
+      if (opts.oauthTokenId && !(await tokenCanReachProject(env, opts.oauthTokenId, row.pid))) {
+        throw new Error(`attachment ${attId} not found`);
+      }
       const obj = await env.FILES.get(row.key);
       if (!obj) throw new Error('file missing from storage');
       const bytes = new Uint8Array(await obj.arrayBuffer());
@@ -2371,6 +2457,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     name: 'doc-authoring-skill',
     uriTemplate: 'noriq://skill/doc-authoring',
     description: 'The doc-authoring guide — how to write project docs that last (also GET /skill/docs.md)',
+    minimumProjectAction: 'view',
   });
   server.registerResource(
     'doc-authoring-skill',
@@ -2386,6 +2473,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     name: 'file-locks-skill',
     uriTemplate: 'noriq://skill/file-locks',
     description: 'The file-locking protocol — acquire/release, scope, conflict handling (also GET /skill/file-locks.md)',
+    minimumProjectAction: 'view',
   });
   server.registerResource(
     'file-locks-skill',
@@ -2398,6 +2486,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     name: 'planning-skill',
     uriTemplate: 'noriq://skill/planning',
     description: 'Planning and execution-spec reference — create_plan, phase gating, writing/reading an executionSpec (also GET /skill/planning.md)',
+    minimumProjectAction: 'view',
   });
   server.registerResource(
     'planning-skill',
@@ -2410,6 +2499,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     name: 'memory-skill',
     uriTemplate: 'noriq://skill/memory',
     description: 'Project-memory reference — record_memory, search_project_memory, get_task_context, explain_project_area (also GET /skill/memory.md)',
+    minimumProjectAction: 'view',
   });
   server.registerResource(
     'memory-skill',

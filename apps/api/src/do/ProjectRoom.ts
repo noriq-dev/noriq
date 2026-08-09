@@ -2,6 +2,7 @@ import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../env';
 import { newId, nowIso } from '../lib/util';
 import { userCanAccessProject } from '../lib/visibility';
+import { projectRoleAllows, resolveProjectAccess } from '../lib/authorization';
 import { advertisedWorkflowNames } from '../lib/workflows';
 import { unfinishedDeps as unfinishedDepsLib } from '../lib/claimability';
 import { needsOutOfBand, sendSignalEmail, sendSignalWebhook } from '../lib/notify-out';
@@ -460,13 +461,25 @@ export class ProjectRoom extends DurableObject<Env> {
       actorKind: actor.kind, actorId: actor.id, actorName: actor.name,
       verb, subjectType, subjectId, payload, createdAt,
     };
-    this.broadcast(JSON.stringify({ type: 'event', event }));
+    void this.broadcast(JSON.stringify({ type: 'event', event }));
     return event;
   }
 
-  broadcast(data: string) {
+  async broadcast(data: string) {
     for (const ws of this.ctx.getWebSockets()) {
       try {
+        const auth = ws.deserializeAttachment() as { userId?: string; allowAdminOverride?: boolean } | null;
+        if (!auth?.userId) {
+          ws.close(1008, 'authorization required');
+          continue;
+        }
+        const access = await resolveProjectAccess(this.env.DB, auth.userId, this.projectId, {
+          allowAdminOverride: auth.allowAdminOverride === true,
+        });
+        if (!projectRoleAllows(access.role, 'view')) {
+          ws.close(1008, 'project access revoked');
+          continue;
+        }
         ws.send(data);
       } catch {
         /* socket gone; hibernation API cleans up */
@@ -482,8 +495,14 @@ export class ProjectRoom extends DurableObject<Env> {
     if (request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
       const m = new URL(request.url).pathname.match(/\/ws\/projects\/([^/]+)/);
       if (m) await this.setPid(decodeURIComponent(m[1]!));
+      const userId = request.headers.get('X-Noriq-Authorized-User');
+      if (!userId) return Response.json({ error: 'authorization required' }, { status: 401 });
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1]);
+      pair[1].serializeAttachment({
+        userId,
+        allowAdminOverride: request.headers.get('X-Noriq-Admin-Override') === '1',
+      });
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
     return Response.json({ error: 'not found' }, { status: 404 });
@@ -494,9 +513,19 @@ export class ProjectRoom extends DurableObject<Env> {
     try {
       const msg = JSON.parse(message);
       if (msg.type === 'ping') {
+        const auth = ws.deserializeAttachment() as { userId?: string; allowAdminOverride?: boolean } | null;
+        const access = auth?.userId
+          ? await resolveProjectAccess(this.env.DB, auth.userId, this.projectId, { allowAdminOverride: auth.allowAdminOverride === true })
+          : null;
+        if (!projectRoleAllows(access?.role ?? null, 'view')) return ws.close(1008, 'project access revoked');
         ws.send(JSON.stringify({ type: 'pong' }));
       } else if (msg.type === 'subscribe') {
         await this.loadPid();
+        const auth = ws.deserializeAttachment() as { userId?: string; allowAdminOverride?: boolean } | null;
+        const access = auth?.userId
+          ? await resolveProjectAccess(this.env.DB, auth.userId, this.projectId, { allowAdminOverride: auth.allowAdminOverride === true })
+          : null;
+        if (!projectRoleAllows(access?.role ?? null, 'view')) return ws.close(1008, 'project access revoked');
         const since = typeof msg.sinceSeq === 'number' ? msg.sinceSeq : 0;
         const { results } = await this.env.DB.prepare(
           `SELECT id, seq, actor_kind AS actorKind, actor_id AS actorId, verb,
@@ -3321,6 +3350,9 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM project_repositories WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM project_memory_registry WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM memory_event_dedup WHERE project_id = ?').bind(pid),
+        // PLNR-326: explicit access grants FK-reference projects and must go before the
+        // project row. Authorization audit rows are soft historical evidence and survive.
+        this.env.DB.prepare('DELETE FROM project_grants WHERE project_id = ?').bind(pid),
         // A durable erasure tombstone (PLNR-250) — deliberately NOT deleted here, and not an
         // FK target of `projects`: it must outlive the row this batch is about to remove, the
         // same exemption `templates`/`event_seq` get and for the same reason (see CLAUDE.md).

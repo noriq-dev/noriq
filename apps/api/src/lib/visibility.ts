@@ -1,10 +1,9 @@
 // Project visibility helpers (PLNR-48 / PLNR-83).
 //
-// USER_PROJECT_WHERE is the set of projects a *user* may reach: ones they own
-// (private), plus ones in a group they belong to (shared with that group's
-// members — NOT with everyone). There is intentionally no "ownerless → everyone"
-// escape hatch; every project has an owner (migration 0014 / create_project), so a
-// project you don't own and whose group you aren't in is simply not visible.
+// USER_PROJECT_WHERE is the set of projects a *user* may reach: ones they own plus
+// explicit user/group principals in project_grants. projects.group_id is only an
+// organizational link; group assignment writes a tagged project grant, and this
+// visibility predicate never infers authority from that metadata.
 //
 // It deliberately OMITS the admin-sees-all escalation — an agent (even an admin's,
 // over MCP) is scoped to what the user can reach, never to admin. The web UI adds
@@ -16,7 +15,16 @@ import type { Env } from '../env';
 
 export const USER_PROJECT_WHERE = `(
   p.owner_user_id = ?1
-  OR (p.group_id IS NOT NULL AND p.group_id IN (SELECT group_id FROM user_groups WHERE user_id = ?1 AND status = 'accepted'))
+  OR EXISTS (
+    SELECT 1 FROM project_grants pg
+     WHERE pg.project_id = p.id AND pg.principal_type = 'user' AND pg.principal_id = ?1
+  )
+  OR EXISTS (
+    SELECT 1 FROM project_grants pg
+      JOIN user_groups ug ON ug.group_id = pg.principal_id
+     WHERE pg.project_id = p.id AND pg.principal_type = 'group'
+       AND ug.user_id = ?1 AND ug.status = 'accepted'
+  )
 )`;
 
 /**

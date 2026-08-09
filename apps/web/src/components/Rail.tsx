@@ -134,7 +134,7 @@ export function Rail({ store, open, onNavigate }: { store: AppStore; open?: bool
 
       {/* footer */}
       <div style={{ flex: 'none', borderTop: '1px solid var(--w-06)', padding: 8 }}>
-        <FooterRow icon="+" label="New project" onClick={() => actions.createProject()} />
+        {store.permissions.canCreateProjects && <FooterRow icon="+" label="New project" onClick={() => actions.createProject()} />}
         {store.isAdmin && <FooterRow icon="◈" label="Admin" onClick={() => actions.openAdmin()} />}
         <FooterRow icon="⚙" label="Settings" onClick={() => actions.setView('settings')} />
         <div style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 8px' }}>
@@ -152,7 +152,9 @@ export function Rail({ store, open, onNavigate }: { store: AppStore; open?: bool
             <div style={{ fontSize: 12, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {store.user?.name ?? 'you'}
             </div>
-            <div style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>{store.user?.role ?? 'supervisor'}</div>
+            <div style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>
+              {store.user?.accessMode === 'read_only' ? 'read only' : (store.user?.role ?? 'supervisor')}
+            </div>
           </div>
           <ThemeButton size={28} />
         </div>

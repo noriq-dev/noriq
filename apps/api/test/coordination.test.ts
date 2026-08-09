@@ -445,12 +445,36 @@ describe('project grouping', () => {
 
     const denied = await mcpCall(orch.apiKey, 'create_project', { key: 'GRPX', name: 'sneak-in', groupId: 'grp_foreign' });
     expect(denied.isError).toBe(true);
-    expect(denied.text).toContain('member or the creator');
+    expect(denied.text).toContain('accepted member');
 
     // Membership flips the verdict — for filing at birth AND for re-filing later.
     const me = (await mcpCall(orch.apiKey, 'get_briefing', {})).body.you;
     const { userId } = (await env.DB.prepare('SELECT user_id AS userId FROM agents WHERE id = ?')
       .bind(me.id).first<{ userId: string }>())!;
+    // Legacy creator metadata is not an access grant. Old rows may predate the invariant
+    // that group creation also writes an owner membership.
+    await env.DB.prepare("INSERT INTO groups (id, name, created_by) VALUES ('grp_creator_only', 'Creator Only', ?)")
+      .bind(userId).run();
+    const creatorOnlyListed = await mcpCall(orch.apiKey, 'list_groups', {});
+    expect(creatorOnlyListed.body.groups.find((g: { id: string }) => g.id === 'grp_creator_only')?.usable).toBe(false);
+    const creatorOnlyCreate = await mcpCall(orch.apiKey, 'create_project', {
+      key: 'GRPC', name: 'creator metadata is not membership', groupId: 'grp_creator_only',
+    });
+    expect(creatorOnlyCreate.isError).toBe(true);
+    expect(creatorOnlyCreate.text).toContain('accepted member');
+
+    await env.DB.prepare("INSERT INTO groups (id, name, created_by) VALUES ('grp_pending_mcp', 'Pending MCP Org', NULL)").run();
+    await env.DB.prepare(
+      "INSERT INTO user_groups (user_id, group_id, status) VALUES (?, 'grp_pending_mcp', 'pending')",
+    ).bind(userId).run();
+    const pendingListed = await mcpCall(orch.apiKey, 'list_groups', {});
+    expect(pendingListed.body.groups.find((g: { id: string }) => g.id === 'grp_pending_mcp')?.usable).toBe(false);
+    const pendingCreate = await mcpCall(orch.apiKey, 'create_project', {
+      key: 'GRPZ', name: 'pending is not membership', groupId: 'grp_pending_mcp',
+    });
+    expect(pendingCreate.isError).toBe(true);
+    expect(pendingCreate.text).toContain('accepted member');
+
     await env.DB.prepare('INSERT INTO user_groups (user_id, group_id) VALUES (?, ?)').bind(userId, 'grp_foreign').run();
 
     const listed = await mcpCall(orch.apiKey, 'list_groups', {});
@@ -462,16 +486,32 @@ describe('project grouping', () => {
     const { groupId } = (await env.DB.prepare('SELECT group_id AS groupId FROM projects WHERE id = ?')
       .bind(created.body.id).first<{ groupId: string | null }>())!;
     expect(groupId).toBe('grp_foreign');
+    const legacyGrant = () => env.DB.prepare(
+      "SELECT principal_id AS groupId, source FROM project_grants WHERE project_id = ? AND source = 'legacy_group'",
+    ).bind(created.body.id).first<{ groupId: string; source: string }>();
+    expect((await legacyGrant())?.groupId).toBe('grp_foreign');
 
     const ungroup = await mcpCall(orch.apiKey, 'set_project_group', { projectId: created.body.id, groupId: null });
     expect(ungroup.isError).toBe(false);
+    expect(await legacyGrant()).toBeNull();
     const regroup = await mcpCall(orch.apiKey, 'set_project_group', { projectId: created.body.id, groupId: 'grp_foreign' });
     expect(regroup.isError).toBe(false);
+    expect((await legacyGrant())?.groupId).toBe('grp_foreign');
 
     // Unknown group reads as unknown, not as a permissions riddle.
     const missing = await mcpCall(orch.apiKey, 'set_project_group', { projectId: created.body.id, groupId: 'grp_nope' });
     expect(missing.isError).toBe(true);
     expect(missing.text).toContain('not found');
+
+    // Project reach through the group is contributor access, not permission to regroup it.
+    const otherOwner = await env.DB.prepare('SELECT id FROM users WHERE id != ? AND disabled = 0 LIMIT 1')
+      .bind(userId).first<{ id: string }>();
+    await env.DB.prepare('UPDATE projects SET owner_user_id = ? WHERE id = ?').bind(otherOwner!.id, created.body.id).run();
+    const contributorRegroup = await mcpCall(orch.apiKey, 'set_project_group', {
+      projectId: created.body.id, groupId: null,
+    });
+    expect(contributorRegroup.isError).toBe(true);
+    expect(contributorRegroup.text).toContain('project manager role required');
   });
 });
 

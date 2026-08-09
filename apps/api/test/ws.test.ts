@@ -2,7 +2,7 @@
 // Previously it forwarded straight to the ProjectRoom DO with no check, so an
 // anonymous client could `subscribe` and stream any project's entire event log
 // (task/comment/message bodies) — ids are the guessable prj_<key>.
-import { SELF } from 'cloudflare:test';
+import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { createUser, loginSession } from './helpers';
 
@@ -45,6 +45,32 @@ describe('WebSocket upgrade is authenticated + authorized (PLNR-91)', () => {
   it('lets the owner complete the upgrade (101)', async () => {
     const res = await wsFetch(projectId, { Cookie: ownerCookie });
     expect(res.status).toBe(101); // upgrade accepted for a project the user can reach
+  });
+
+  it('accepts an explicit viewer grant and closes the live socket after revocation', async () => {
+    const outsider = await env.DB.prepare("SELECT id FROM users WHERE email = 'ws-outsider@example.com'")
+      .first<{ id: string }>();
+    await env.DB.prepare(
+      "INSERT INTO project_grants (project_id, principal_type, principal_id, role) VALUES (?, 'user', ?, 'viewer')",
+    ).bind(projectId, outsider!.id).run();
+    const res = await wsFetch(projectId, { Cookie: outsiderCookie });
+    expect(res.status).toBe(101);
+    const ws = res.webSocket!;
+    ws.accept();
+
+    const closed = new Promise<CloseEvent>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('socket did not close after revocation')), 3000);
+      ws.addEventListener('close', (event) => { clearTimeout(timeout); resolve(event); }, { once: true });
+    });
+    await env.DB.prepare(
+      "DELETE FROM project_grants WHERE project_id = ? AND principal_type = 'user' AND principal_id = ?",
+    ).bind(projectId, outsider!.id).run();
+    // Any subsequent project event re-authorizes every subscriber before delivery.
+    await SELF.fetch(`https://noriq.test/api/projects/${projectId}/tasks`, {
+      method: 'POST', headers: { Cookie: ownerCookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'revocation trigger' }),
+    });
+    expect((await closed).code).toBe(1008);
   });
 
   it('still returns 426 for a non-upgrade GET', async () => {

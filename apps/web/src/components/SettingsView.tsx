@@ -256,7 +256,7 @@ export function GroupsSection({ store, all }: { store: AppStore; all?: boolean }
   return (
     <Section
       title={all ? `All groups · ${groups.length}` : `Your groups · ${groups.length}`}
-      action={<Button variant="ghost" style={{ padding: '5px 12px', fontSize: 11.5 }} onClick={() => store.actions.openModal('group')}>+ new group</Button>}
+      action={store.permissions.canCreateGroups ? <Button variant="ghost" style={{ padding: '5px 12px', fontSize: 11.5 }} onClick={() => store.actions.openModal('group')}>+ new group</Button> : undefined}
     >
       {groups.length === 0 && (
         <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>
@@ -298,7 +298,7 @@ export function GroupsSection({ store, all }: { store: AppStore; all?: boolean }
                     >
                       describe
                     </SmallAction>
-                    <SmallAction
+                    {(store.user?.role === 'admin' || g.myRole === 'owner') && <SmallAction
                       danger
                       onClick={async () => {
                         if (await confirm(`Delete group "${g.name}"? Projects become ungrouped.`)) {
@@ -308,13 +308,13 @@ export function GroupsSection({ store, all }: { store: AppStore; all?: boolean }
                       }}
                     >
                       delete
-                    </SmallAction>
+                    </SmallAction>}
                   </>
                 ) : (
                   <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)' }}>member-only</span>
                 )}
               </div>
-              {membersFor === g.id && g.canEdit && <GroupMembers store={store} groupId={g.id} />}
+              {membersFor === g.id && g.canEdit && <GroupMembers store={store} groupId={g.id} callerRole={store.user?.role === 'admin' ? 'owner' : g.myRole} />}
             </div>
           );
         })}
@@ -324,10 +324,11 @@ export function GroupsSection({ store, all }: { store: AppStore; all?: boolean }
 }
 
 /** Inline membership editor for one group: list + remove, and add from the user directory. */
-function GroupMembers({ store, groupId }: { store: AppStore; groupId: string }) {
-  const [members, setMembers] = useState<Array<{ id: string; name: string; email: string; status: string }>>([]);
+function GroupMembers({ store, groupId, callerRole }: { store: AppStore; groupId: string; callerRole: 'owner' | 'manager' | 'member' | null }) {
+  const [members, setMembers] = useState<Array<{ id: string; name: string; email: string; status: string; role: 'owner' | 'manager' | 'member' }>>([]);
   const [everyone, setEveryone] = useState<ApiUser[]>([]);
   const [adding, setAdding] = useState('');
+  const [inviteRole, setInviteRole] = useState<'owner' | 'manager' | 'member'>('member');
   const load = () => api.groupMembers(groupId).then((r) => setMembers(r.members)).catch(() => {});
   useEffect(() => {
     load();
@@ -349,6 +350,20 @@ function GroupMembers({ store, groupId }: { store: AppStore; groupId: string }) 
               <span style={{ marginLeft: 6, fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--accent)' }}>· invited</span>
             )}
           </span>
+          {m.status === 'accepted' && (
+            <Select
+              value={m.role}
+              disabled={callerRole !== 'owner' && m.role === 'owner'}
+              onChange={async (e) => {
+                await api.setGroupMemberRole(groupId, m.id, e.target.value as typeof m.role);
+                load();
+              }}
+              style={{ width: 104 }}
+            >
+              <option value="member">Member</option><option value="manager">Manager</option>
+              {callerRole === 'owner' && <option value="owner">Owner</option>}
+            </Select>
+          )}
           <SmallAction
             danger
             onClick={async () => {
@@ -369,12 +384,16 @@ function GroupMembers({ store, groupId }: { store: AppStore; groupId: string }) 
             <option key={u.id} value={u.id}>{u.name} · {u.email}</option>
           ))}
         </Select>
+        <Select value={inviteRole} onChange={(e) => setInviteRole(e.target.value as typeof inviteRole)} style={{ width: 110 }}>
+          <option value="member">Member</option><option value="manager">Manager</option>
+          {callerRole === 'owner' && <option value="owner">Owner</option>}
+        </Select>
         <Button
           variant="ghost"
           disabled={!adding}
           style={{ padding: '5px 12px', fontSize: 11.5 }}
           onClick={async () => {
-            await api.addGroupMember(groupId, adding);
+            await api.addGroupMember(groupId, adding, inviteRole);
             setAdding('');
             load();
           }}

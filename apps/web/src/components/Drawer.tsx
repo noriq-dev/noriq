@@ -232,7 +232,7 @@ export function Drawer({ store }: { store: AppStore }) {
               ))}
             </datalist>
             <div style={{ flex: 1 }} />
-            {!editing && (
+            {!editing && store.permissions.canContribute && (
               <button
                 onClick={startEdit}
                 title="Edit task"
@@ -242,7 +242,7 @@ export function Drawer({ store }: { store: AppStore }) {
                 ✎
               </button>
             )}
-            {!editing && (
+            {!editing && store.permissions.canContribute && (
               <button
                 onClick={() => void (task.archivedAt ? actions.restoreTask(task.id) : actions.archiveTask(task.id))}
                 title={task.archivedAt ? 'Restore from archive' : 'Archive task'}
@@ -252,7 +252,7 @@ export function Drawer({ store }: { store: AppStore }) {
                 {task.archivedAt ? '⤴' : '🗄'}
               </button>
             )}
-            {!editing && (
+            {!editing && store.permissions.canContribute && (
               <button
                 onClick={async () => {
                   if (await confirm(`Delete ${task.key} "${task.title}"? This removes its comments, attachments and dependency links. Child tasks are kept.`)) {
@@ -391,7 +391,7 @@ export function Drawer({ store }: { store: AppStore }) {
                 {task.spinoffFinding && (
                   <div style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-soft)', whiteSpace: 'pre-wrap' }}>{task.spinoffFinding}</div>
                 )}
-                {task.status === 'proposed' && (
+                {task.status === 'proposed' && store.permissions.canManage && (
                   <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
                     <span style={{ fontSize: 11.5, color: 'var(--amber)', alignSelf: 'center' }}>
                       ⏳ awaiting your decision — no agent can claim this until you accept
@@ -446,7 +446,7 @@ export function Drawer({ store }: { store: AppStore }) {
                         padding: '2px 4px 2px 7px', borderRadius: 6,
                       }}
                     >
-                      <button
+                      {store.permissions.canContribute && <button
                         onClick={() => d.found && actions.openTask(d.id)}
                         disabled={!d.found}
                         title={
@@ -461,7 +461,7 @@ export function Drawer({ store }: { store: AppStore }) {
                         {d.key}
                         {d.external && <span style={{ color: 'var(--text-faint)', fontSize: 9 }}>↗</span>}
                         <span style={{ color: 'var(--text-faint)' }}>{done ? '✓' : '⟂'}</span>
-                      </button>
+                      </button>}
                       <button
                         onClick={() => void actions.removeDependency(task.id, d.id)}
                         title="Remove dependency"
@@ -540,7 +540,7 @@ export function Drawer({ store }: { store: AppStore }) {
             </MetaCell>
           </div>
 
-          {canRelease && (
+          {canRelease && store.permissions.canManage && (
             <button
               onClick={() => actions.claimToggle(task.id)}
               className="hover-bright"
@@ -740,7 +740,7 @@ export function Drawer({ store }: { store: AppStore }) {
                       <span style={{ fontSize: 12.5, fontWeight: 600 }}>{isHuman ? 'you' : cag?.name ?? c.author}</span>
                       <MonoTag color={kind.color} bg={kind.bg} size={9}>{c.kind}</MonoTag>
                       <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: statusColor }}>{c.status}</span>
-                      {(c.status === 'open' || c.status === 'acknowledged') && (
+                      {store.permissions.canContribute && (c.status === 'open' || c.status === 'acknowledged') && (
                         <button
                           onClick={() => actions.resolveComment(c.id, 'addressed')}
                           title="mark addressed"

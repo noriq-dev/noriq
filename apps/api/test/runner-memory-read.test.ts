@@ -96,13 +96,11 @@ describe('auth boundary (PLNR-306)', () => {
     expect(res.status).toBe(404);
   });
 
-  it('a token scoped to another project gets 403 asking about it', async () => {
-    await createUser('rmread-other@example.com', 'RM Other', 'longenough1').catch(() => {});
-    const otherCookie = await loginSession('rmread-other@example.com', 'longenough1');
-    const otherProj = await createProject(otherCookie, 'RMOTHR', 'rmothr');
+  it('a token scoped before another owned project was created gets 403 asking about it', async () => {
+    const otherProj = await createProject(ownerCookie, 'RMOTHR', 'rmothr');
     const otherPid = ((await otherProj.json()) as { id: string }).id;
-    // ownerToken was scoped (authorizeForAllProjects) only to what ITS user can reach — never
-    // RMOTHR, owned by a different user entirely.
+    // ownerToken was scoped before RMOTHR existed. Its user owns the project, so project access
+    // passes and the credential's strictly narrower scope is the reason for the 403.
     const res = await cursor(ownerToken, { projectId: otherPid, repositoryKey: 'rmread-repo', runnerId, checkoutId: 'ckt_scope' });
     expect(res.status).toBe(403);
   });

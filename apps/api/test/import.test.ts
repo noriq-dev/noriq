@@ -54,6 +54,9 @@ describe('D1 import / restore (PLNR-218)', () => {
     expect(before.counts.agents).toBeGreaterThan(0);
     expect(before.counts.oauth_tokens).toBeGreaterThan(0);
     expect(before.tables.tasks!.some((t) => t.parent_task_id != null)).toBe(true);
+    for (const table of ['project_grants', 'authorization_settings', 'authorization_audit_events']) {
+      expect(before.tables[table]).toBeDefined();
+    }
 
     const res = await importSnap(before);
     expect(res.status).toBe(200);

@@ -15,8 +15,19 @@ import { sessionSetCookie, userAuth } from './auth';
 import { demoLocksDown } from './lib/demo';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex } from './lib/util';
 import { sendInviteEmail, sendPasswordResetEmail } from './email';
+import { resolveAccountCapabilities } from './lib/authorization';
 
 export const onboarding = new Hono<AppContext>();
+
+async function userPayload(env: Env, user: { id: string; email: string; name: string; role: string }) {
+  const capabilities = await resolveAccountCapabilities(env.DB, user.id);
+  return {
+    ...user,
+    accessMode: capabilities.accessMode,
+    canCreateProjects: capabilities.canCreateProjects,
+    canCreateGroups: capabilities.canCreateGroups,
+  };
+}
 
 const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 const INVITE_TTL_MS = 7 * 24 * 3600 * 1000;
@@ -126,7 +137,7 @@ onboarding.post('/api/invites/accept', async (c) => {
   const { cookie } = await createSession(c.env.DB, row.userId);
   c.header('Set-Cookie', cookie);
   const user = await c.env.DB.prepare('SELECT id, email, name, role FROM users WHERE id = ?').bind(row.userId).first();
-  return c.json({ user });
+  return c.json({ user: await userPayload(c.env, user as { id: string; email: string; name: string; role: string }) });
 });
 
 // --- forgot / reset password (PLNR-87) -----------------------------------------------
@@ -197,7 +208,7 @@ onboarding.post('/api/reset', async (c) => {
   const { cookie } = await createSession(c.env.DB, row.userId);
   c.header('Set-Cookie', cookie);
   const user = await c.env.DB.prepare('SELECT id, email, name, role FROM users WHERE id = ?').bind(row.userId).first();
-  return c.json({ user });
+  return c.json({ user: await userPayload(c.env, user as { id: string; email: string; name: string; role: string }) });
 });
 
 // ---------------------------------------------------------------------------
@@ -312,7 +323,7 @@ onboarding.post('/api/webauthn/login/verify', async (c) => {
     .bind(verification.authenticationInfo.newCounter, passkey.id).run();
   const { cookie } = await createSession(c.env.DB, passkey.userId);
   c.header('Set-Cookie', cookie);
-  return c.json({ user: { id: passkey.userId, email: passkey.email, name: passkey.name, role: passkey.role } });
+  return c.json({ user: await userPayload(c.env, { id: passkey.userId, email: passkey.email, name: passkey.name, role: passkey.role }) });
 });
 
 // ---------------------------------------------------------------------------
@@ -323,10 +334,25 @@ onboarding.put('/api/users/:uid/groups', userAuth, async (c) => {
   if (c.var.user!.role !== 'admin') return c.json({ error: 'admin role required' }, 403);
   const { groupIds } = await c.req.json<{ groupIds: string[] }>();
   const uid = c.req.param('uid')!;
-  const stmts = [c.env.DB.prepare('DELETE FROM user_groups WHERE user_id = ?').bind(uid)];
-  for (const gid of groupIds ?? []) {
-    stmts.push(c.env.DB.prepare('INSERT OR IGNORE INTO user_groups (user_id, group_id) VALUES (?, ?)').bind(uid, gid));
+  const selected = [...new Set(groupIds ?? [])];
+  const wanted = new Set(selected);
+  const { results: existing } = await c.env.DB.prepare(
+    'SELECT group_id AS groupId FROM user_groups WHERE user_id = ?',
+  ).bind(uid).all<{ groupId: string }>();
+  const stmts: D1PreparedStatement[] = [];
+  for (const row of existing) {
+    if (!wanted.has(row.groupId)) {
+      stmts.push(c.env.DB.prepare('DELETE FROM user_groups WHERE user_id = ? AND group_id = ?').bind(uid, row.groupId));
+    }
   }
-  await c.env.DB.batch(stmts);
+  for (const gid of selected) {
+    // Keep an existing owner/manager role intact. The old delete-and-reinsert implementation
+    // silently demoted every retained administrator to member whenever the admin UI saved.
+    stmts.push(c.env.DB.prepare('INSERT OR IGNORE INTO user_groups (user_id, group_id) VALUES (?, ?)').bind(uid, gid));
+    stmts.push(c.env.DB.prepare(
+      "UPDATE user_groups SET status = 'accepted' WHERE user_id = ? AND group_id = ?",
+    ).bind(uid, gid));
+  }
+  if (stmts.length) await c.env.DB.batch(stmts);
   return c.json({ ok: true });
 });

@@ -153,9 +153,11 @@ export function Home({ store }: { store: AppStore }) {
         <div style={{ display: 'flex', alignItems: 'center', marginBottom: 14 }}>
           <SectionLabel>Projects</SectionLabel>
           <div style={{ flex: 1 }} />
-          <Button variant="ghost" style={{ padding: '6px 13px', fontSize: 12 }} onClick={() => actions.createProject()}>
-            + new project
-          </Button>
+          {store.permissions.canCreateProjects && (
+            <Button variant="ghost" style={{ padding: '6px 13px', fontSize: 12 }} onClick={() => actions.createProject()}>
+              + new project
+            </Button>
+          )}
         </div>
 
         {data.projects.length === 0 ? (
@@ -166,7 +168,9 @@ export function Home({ store }: { store: AppStore }) {
             }}
           >
             <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-dim)', marginBottom: 12 }}>no projects yet</div>
-            <Button onClick={() => actions.createProject()}>Create the first project</Button>
+            {store.permissions.canCreateProjects
+              ? <Button onClick={() => actions.createProject()}>Create the first project</Button>
+              : <div style={{ color: 'var(--text-mid)', fontSize: 12 }}>No projects have been shared with you yet.</div>}
           </div>
         ) : (
           <>

@@ -284,6 +284,24 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
     expect(listed.runs.find((r) => r.id === runId)?.modelUsage?.['claude-opus-4-8']?.costUSD).toBeCloseTo(0.0761);
     ws.close();
   });
+
+  it('closes a live runner socket immediately when its account becomes read-only', async () => {
+    const res = await wsConnect(runnerId, { Authorization: `Bearer ${token}` });
+    expect(res.status).toBe(101);
+    const ws = res.webSocket!;
+    ws.accept();
+    ws.send(JSON.stringify({ type: 'hello', protocol: 1, label: 'ws-daemon' }));
+    await nextFrame(ws, (m) => m.type === 'registered');
+    const owner = await env.DB.prepare("SELECT id FROM users WHERE email = 'rws-owner@example.com'").first<{ id: string }>();
+    const closed = new Promise<CloseEvent>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('runner socket did not close')), 3000);
+      ws.addEventListener('close', (event) => { clearTimeout(timer); resolve(event); }, { once: true });
+    });
+    await env.DB.prepare("UPDATE users SET access_mode = 'read_only' WHERE id = ?").bind(owner!.id).run();
+    ws.send(JSON.stringify({ type: 'ping' }));
+    expect((await closed).code).toBe(1008);
+    await env.DB.prepare("UPDATE users SET access_mode = 'read_write' WHERE id = ?").bind(owner!.id).run();
+  });
 });
 
 describe('steering-ack dedups the notices fallback (RUN-7)', () => {

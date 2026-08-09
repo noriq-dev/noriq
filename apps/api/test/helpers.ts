@@ -435,7 +435,16 @@ export async function authorizeForAllProjects(...apiKeys: string[]): Promise<voi
     const { results } = await db.prepare(
       `SELECT p.id FROM projects p
        WHERE p.status = 'active' AND (p.owner_user_id = ?1
-         OR (p.group_id IS NOT NULL AND p.group_id IN (SELECT group_id FROM user_groups WHERE user_id = ?1)))`,
+         OR EXISTS (
+           SELECT 1 FROM project_grants pg
+            WHERE pg.project_id = p.id AND pg.principal_type = 'user' AND pg.principal_id = ?1
+         )
+         OR EXISTS (
+           SELECT 1 FROM project_grants pg
+             JOIN user_groups ug ON ug.group_id = pg.principal_id
+            WHERE pg.project_id = p.id AND pg.principal_type = 'group'
+              AND ug.user_id = ?1 AND ug.status = 'accepted'
+         ))`,
     ).bind(tok.userId).all<{ id: string }>();
     if (!results.length) continue;
     await db.batch(
@@ -450,4 +459,3 @@ async function sha256HexTest(s: string): Promise<string> {
   const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
   return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
-

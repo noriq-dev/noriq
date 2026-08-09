@@ -13,7 +13,7 @@ describe('D1 backup/export', () => {
     const snap = (await res.json()) as { noriq: string; tables: Record<string, unknown[]>; counts: Record<string, number> };
     expect(snap.noriq).toBe('d1-snapshot');
     // Core tables present, discovered from sqlite_master (not a hard-coded list).
-    for (const t of ['users', 'projects', 'tasks', 'agents']) {
+    for (const t of ['users', 'projects', 'tasks', 'agents', 'project_grants', 'authorization_settings', 'authorization_audit_events']) {
       const rows = snap.tables[t];
       expect(Array.isArray(rows)).toBe(true);
       expect(snap.counts[t]).toBe(rows!.length);

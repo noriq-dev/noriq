@@ -53,10 +53,10 @@ export function TopBar({ store }: { store: AppStore }) {
       }}
     >
       <div
-        onClick={() => actions.openModal('project-edit')}
-        title="Edit project settings"
+        onClick={store.permissions.canManage ? () => actions.openModal('project-edit') : undefined}
+        title={store.permissions.canManage ? 'Edit project settings' : `Project access: ${store.permissions.effectiveRole ?? 'none'}`}
         className="hover-border topbar-project"
-        style={{ display: 'flex', alignItems: 'center', gap: 9, width: 240, flex: 'none', minWidth: 0, overflow: 'hidden', cursor: 'pointer', padding: '4px 8px', margin: '-4px -8px', borderRadius: 8, border: '1px solid transparent' }}
+        style={{ display: 'flex', alignItems: 'center', gap: 9, width: 240, flex: 'none', minWidth: 0, overflow: 'hidden', cursor: store.permissions.canManage ? 'pointer' : 'default', padding: '4px 8px', margin: '-4px -8px', borderRadius: 8, border: '1px solid transparent' }}
       >
         <span
           style={{
@@ -132,6 +132,12 @@ export function TopBar({ store }: { store: AppStore }) {
 
       <div style={{ flex: 1 }} />
 
+      {!store.permissions.canContribute && (
+        <span title={store.permissions.cappedByReadOnly ? 'Your account is read-only' : 'Your project role is view-only'} style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)', border: '1px solid var(--w-1)', borderRadius: 7, padding: '4px 8px' }}>
+          {store.permissions.cappedByReadOnly ? 'READ ONLY' : `${(store.permissions.effectiveRole ?? 'viewer').toUpperCase()}`}
+        </span>
+      )}
+
       {attnCount > 0 && (
         <button
           onClick={() => actions.setView('home')}
@@ -147,7 +153,7 @@ export function TopBar({ store }: { store: AppStore }) {
         </button>
       )}
 
-      <button
+      {store.permissions.canContribute && <button
         onClick={() => actions.createTask()}
         className="hover-bright"
         title="New task"
@@ -163,7 +169,7 @@ export function TopBar({ store }: { store: AppStore }) {
         }}
       >
         + task
-      </button>
+      </button>}
 
       <div
         style={{

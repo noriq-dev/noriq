@@ -67,11 +67,15 @@ describe('deletion', () => {
   it('project delete removes everything and unscopes agents', async () => {
     const p = (await mcpCall(agent.apiKey, 'create_project', { key: 'DELX', name: 'delx' })).body;
     const t = (await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId: p.id, title: 'doomed' })).body;
+    await env.DB.prepare(
+      "INSERT INTO project_grants (project_id, principal_type, principal_id, role) VALUES (?, 'group', 'grp_deleted_with_project', 'viewer')",
+    ).bind(p.id).run();
     await mcpCall(agent.apiKey, 'claim_task', { projectId: p.id, taskId: t.id }); // scopes the agent
     expect((await del(p.id, '')).status).toBe(200);
     // snapshot 404s now
     const s = await SELF.fetch(`https://noriq.test/api/projects/${p.id}/snapshot`, { headers: { Cookie: cookie } });
     expect(s.status).toBe(404);
+    expect(await env.DB.prepare('SELECT 1 FROM project_grants WHERE project_id = ?').bind(p.id).first()).toBeNull();
   });
 
   it('project delete succeeds when a task carries a legacy category_id FK to a project tag — PLNR-108', async () => {
@@ -192,9 +196,12 @@ describe('deletion', () => {
       body: JSON.stringify({ key: 'DELO', name: 'owned' }),
     });
     const proj = (await create.json()) as { id: string };
-    await createUser('del-member@example.com', 'Member', 'longenough1', 'member').catch(() => {});
+    const member = await createUser('del-member@example.com', 'Member', 'longenough1', 'member').catch(async () =>
+      (await env.DB.prepare("SELECT id FROM users WHERE email = 'del-member@example.com'").first<{ id: string }>())!);
+    await env.DB.prepare(
+      "INSERT OR REPLACE INTO project_grants (project_id, principal_type, principal_id, role) VALUES (?, 'user', ?, 'viewer')",
+    ).bind(proj.id, member.id).run();
     const memberCk = await loginSession('del-member@example.com', 'longenough1');
     expect((await del(proj.id, '', memberCk)).status).toBe(403);
   });
 });
-

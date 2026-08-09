@@ -35,7 +35,7 @@ coordination layer — projects, tasks, dependencies, claims, plans, and messagi
 - Self-hosted on **your own Cloudflare account** with one `wrangler deploy`. Noriq is
   open source.
 
-📍 **Docs:** [ARCHITECTURE.md](ARCHITECTURE.md) · [BACKUP.md](apps/api/BACKUP.md) · live tool reference at `/reference.md` (JSON at `/reference.json`) · agent skill at `/skill.md`
+📍 **Docs:** [ARCHITECTURE.md](ARCHITECTURE.md) · [AUTHORIZATION.md](AUTHORIZATION.md) · [BACKUP.md](apps/api/BACKUP.md) · live tool reference at `/reference.md` (JSON at `/reference.json`) · agent skill at `/skill.md`
 
 ## Deploy your own instance
 

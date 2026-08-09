@@ -126,7 +126,7 @@ export function useAppStore() {
   const [needsSetup, setNeedsSetup] = useState(false);
   const [modal, setModal] = useState<null | 'project' | 'project-edit' | 'task' | 'group' | 'milestone' | 'tag'>(null);
   const [editMilestone, setEditMilestone] = useState<{ id: string; title: string; dueAt: string | null } | null>(null);
-  const [groups, setGroups] = useState<Array<{ id: string; name: string; description: string; canEdit: number }>>([]);
+  const [groups, setGroups] = useState<Array<{ id: string; name: string; description: string; canEdit: number; myRole: 'owner' | 'manager' | 'member' | null }>>([]);
   const initialUrl = useRef(parseUrl());
   const [currentPid, setCurrentPid] = useState<string | null>(initialUrl.current.pid);
   const [view, setView] = useState<ViewId>(initialUrl.current.view);
@@ -204,6 +204,13 @@ export function useAppStore() {
     ownerName: p.ownerName,
     agentCount: p.agentCount,
     isPublic: !!p.public,
+    effectiveRole: p.effectiveRole,
+    accessSource: p.accessSource,
+    canView: p.canView,
+    canContribute: p.canContribute,
+    canManage: p.canManage,
+    canOwn: p.canOwn,
+    cappedByReadOnly: p.cappedByReadOnly,
   });
 
   const loadProjects = useCallback(async () => {
@@ -534,6 +541,19 @@ export function useAppStore() {
     if (selRef.current) void loadComments(selRef.current);
   }, [loadSnapshot, loadComments]);
 
+  const directoryProject = projects.find((p) => p.id === currentPid);
+  const permissions = {
+    accessMode: user?.accessMode ?? 'read_only',
+    canCreateProjects: user?.canCreateProjects ?? false,
+    canCreateGroups: user?.canCreateGroups ?? false,
+    effectiveRole: snapshot?.project.effectiveRole ?? directoryProject?.effectiveRole ?? null,
+    canView: snapshot?.project.canView ?? directoryProject?.canView ?? false,
+    canContribute: snapshot?.project.canContribute ?? directoryProject?.canContribute ?? false,
+    canManage: snapshot?.project.canManage ?? directoryProject?.canManage ?? false,
+    canOwn: snapshot?.project.canOwn ?? directoryProject?.canOwn ?? false,
+    cappedByReadOnly: snapshot?.project.cappedByReadOnly ?? directoryProject?.cappedByReadOnly ?? false,
+  };
+
   const actions = {
     login,
     goHome() {
@@ -572,7 +592,7 @@ export function useAppStore() {
     selectAgent: (id: string | null) => setSelectedAgentId(id),
 
     async sendMessage(body: string, toAgentId?: string) {
-      if (!pidRef.current || !body.trim()) return;
+      if (!pidRef.current || !body.trim() || !permissions.canContribute) return;
       await api.sendMessage(pidRef.current, body.trim(), toAgentId);
       refresh();
     },
@@ -586,13 +606,20 @@ export function useAppStore() {
 
     completeSetupDeferred,
     finishSetup,
-    openModal: setModal,
+    openModal(next: typeof modal) {
+      if (next === 'project' && !permissions.canCreateProjects) return;
+      if (next === 'group' && !permissions.canCreateGroups) return;
+      if (next === 'project-edit' && !permissions.canManage) return;
+      if (next && !['project', 'group', 'project-edit'].includes(next) && !permissions.canContribute) return;
+      setModal(next);
+    },
     closeModal: () => { setModal(null); setEditMilestone(null); },
 
-    createProject: () => setModal('project'),
-    createTask: () => setModal('task'),
+    createProject: () => { if (permissions.canCreateProjects) setModal('project'); },
+    createTask: () => { if (permissions.canContribute) setModal('task'); },
 
     async submitProject(input: { key: string; name: string; description?: string; groupId?: string }) {
+      if (!permissions.canCreateProjects) return;
       const r = await api.createProject(input.key, input.name, input.description);
       if (input.groupId) await api.setProjectMeta(r.id, { groupId: input.groupId });
       await loadProjects();
@@ -603,7 +630,7 @@ export function useAppStore() {
     },
 
     async submitTask(input: { title: string; body?: string; priority?: number; milestoneId?: string; tags?: string[]; type?: string }) {
-      if (!pidRef.current) return;
+      if (!pidRef.current || !permissions.canContribute) return;
       // New tasks land on the board you're currently viewing (falls back to default server-side).
       await api.createTask(pidRef.current, { ...input, ...(boardRef.current ? { boardId: boardRef.current } : {}) });
       setModal(null);
@@ -629,7 +656,7 @@ export function useAppStore() {
     },
 
     async submitProjectMeta(meta: { name?: string; description?: string; groupId?: string | null; claimTtlSeconds?: number }) {
-      if (!pidRef.current) return;
+      if (!pidRef.current || !permissions.canManage) return;
       await api.setProjectMeta(pidRef.current, meta);
       await loadProjects();
       setModal(null);
@@ -644,6 +671,7 @@ export function useAppStore() {
     },
 
     async submitGroup(name: string, description?: string) {
+      if (!permissions.canCreateGroups) return;
       await api.createGroup(name, description);
       const r = await api.groups();
       setGroups(r.groups);
@@ -844,7 +872,7 @@ export function useAppStore() {
 
   return {
     user, authChecked, needsSetup, modal, editMilestone, groups, snapshot, showArchived, boardId,
-    isAdmin, adminProjects,
+    isAdmin, adminProjects, permissions,
     currentPid: currentPid ?? '', view, selectedTaskId, selectedAgentId, draftKind, draftText, draggedId,
     data, helpers, actions,
   };

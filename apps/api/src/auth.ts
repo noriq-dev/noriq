@@ -2,6 +2,7 @@ import type { Context, Next } from 'hono';
 import type { Env } from './env';
 import { demoLocksDown } from './lib/demo';
 import { newId, nowIso, sha256Hex, timingSafeEqual } from './lib/util';
+import { resolveAccountCapabilities } from './lib/authorization';
 
 /** What kind of thing is working (RUN-43). See migration 0026 for the full contrast. */
 export type AgentKind = 'copilot' | 'agent';
@@ -51,6 +52,9 @@ export interface UserIdentity {
   email: string;
   name: string;
   role: 'admin' | 'member';
+  accessMode: 'read_write' | 'read_only';
+  canCreateProjects: boolean;
+  canCreateGroups: boolean;
 }
 
 export type Vars = {
@@ -225,7 +229,13 @@ export async function userAuth(c: Context<AppContext>, next: Next) {
     .bind(await sha256Hex(sid))
     .first<UserIdentity>();
   if (!row) return c.json({ error: 'session expired' }, 401);
-  c.set('user', row);
+  const capabilities = await resolveAccountCapabilities(c.env.DB, row.id);
+  c.set('user', {
+    ...row,
+    accessMode: capabilities.accessMode,
+    canCreateProjects: capabilities.canCreateProjects,
+    canCreateGroups: capabilities.canCreateGroups,
+  });
   await next();
 }
 

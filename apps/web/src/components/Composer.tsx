@@ -13,6 +13,9 @@ export function Composer({ store, placeholder, compact }: { store: AppStore; pla
     const el = taRef.current;
     if (el) { el.style.height = 'auto'; el.style.height = `${Math.min(el.scrollHeight, 160)}px`; }
   }, [draftText]);
+  if (!store.permissions.canContribute) {
+    return <div style={{ color: 'var(--text-dim)', fontSize: 11.5, padding: '8px 2px' }}>View-only access — commenting and coordination actions are disabled.</div>;
+  }
   return (
     <div style={{ display: 'flex', alignItems: 'flex-end', gap: 10, minWidth: 0, flex: 1 }}>
       <div

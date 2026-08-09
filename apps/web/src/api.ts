@@ -121,7 +121,7 @@ export const api = {
 
   createProject: (key: string, name: string, description?: string) =>
     req<{ id: string; key: string }>('POST', '/api/projects', { key, name, description }),
-  groups: () => req<{ groups: Array<{ id: string; name: string; description: string; canEdit: number }> }>('GET', '/api/groups'),
+  groups: () => req<{ groups: Array<{ id: string; name: string; description: string; canEdit: number; myRole: 'owner' | 'manager' | 'member' | null }> }>('GET', '/api/groups'),
   createGroup: (name: string, description?: string) => req<{ id: string }>('POST', '/api/groups', { name, description }),
   docs: (pid: string) => req<{ docs: Array<{ id: string; name: string; description: string; body: string; folder: string; tags: string[]; authorKind: string; authorName: string; updatedAt: string }> }>('GET', `/api/projects/${pid}/docs`),
   createDoc: (pid: string, input: { name: string; description?: string; body?: string; folder?: string; tags?: string[] }) => req<{ id: string }>('POST', `/api/projects/${pid}/docs`, input),
@@ -137,14 +137,48 @@ export const api = {
   publicSnapshot: (pid: string) => req<PublicSnapshot>('GET', `/api/public/projects/${pid}/snapshot`),
   setProjectMeta: (pid: string, meta: { groupId?: string | null; description?: string; name?: string; claimTtlSeconds?: number; ownerUserId?: string | null; public?: boolean; fileLocking?: boolean; lockTtlSeconds?: number | null }) =>
     req('PATCH', `/api/projects/${pid}/meta`, meta),
+  projectAccess: (pid: string) => req<{
+    self: { effectiveRole: string | null; accessSource: string; cappedByReadOnly: boolean };
+    owner: { id: string; name: string; email: string } | null;
+    grants: Array<{
+      principalType: 'user' | 'group'; principalId: string; principalName: string;
+      principalEmail: string | null; role: 'manager' | 'contributor' | 'viewer'; source: string;
+    }>;
+    canManageAccess: boolean; canTransferOwnership: boolean;
+  }>('GET', `/api/projects/${pid}/access`),
+  setProjectGrant: (pid: string, grant: { principalType: 'user' | 'group'; principalId: string; role: 'manager' | 'contributor' | 'viewer' }) =>
+    req('PUT', `/api/projects/${pid}/access/grants`, grant),
+  revokeProjectGrant: (pid: string, principalType: 'user' | 'group', principalId: string) =>
+    req('DELETE', `/api/projects/${pid}/access/grants/${principalType}/${encodeURIComponent(principalId)}`),
+  transferProjectOwner: (pid: string, ownerUserId: string) =>
+    req('POST', `/api/projects/${pid}/access/transfer-owner`, { ownerUserId }),
   // Human force-release of a stuck file lock (PLNR-213).
   forceReleaseLock: (pid: string, lockId: string) => req<{ ok: boolean; path?: string }>('POST', `/api/projects/${pid}/locks/${lockId}/force-release`),
 
   users: () => req<{ users: ApiUser[] }>('GET', '/api/users'),
   createUser: (email: string, name: string, password: string, role: string) =>
     req<{ id: string }>('POST', '/api/users', { email, name, password, role }),
-  patchUser: (uid: string, patch: { role?: string; disabled?: boolean; name?: string }) =>
+  patchUser: (uid: string, patch: {
+    role?: string; disabled?: boolean; name?: string; accessMode?: 'read_write' | 'read_only';
+    canCreateProjects?: boolean | null; canCreateGroups?: boolean | null;
+  }) =>
     req('PATCH', `/api/users/${uid}`, patch),
+  adminAuthorization: () => req<{
+    settings: { defaultCanCreateProjects: number; defaultCanCreateGroups: number; updatedAt: string };
+    accounts: Array<ApiUser>;
+    projects: Array<{ id: string; key: string; name: string; ownerName: string; grantCount: number; legacyGroupId: string | null }>;
+    groups: Array<{ id: string; name: string; memberCount: number; ownerCount: number; projectGrantCount: number }>;
+    audit: Array<{ id: string; actorKind: string; actorId: string | null; action: string; resourceType: string; resourceId: string | null; decision: string; reason: string; metadata: Record<string, unknown>; createdAt: string }>;
+  }>('GET', '/api/admin/authorization'),
+  setAuthorizationDefaults: (settings: { defaultCanCreateProjects?: boolean; defaultCanCreateGroups?: boolean }) =>
+    req('PATCH', '/api/admin/authorization/settings', settings),
+  beginAdminProjectOverride: (pid: string) => req('POST', `/api/admin/authorization/override/${pid}`),
+  authorizationParityAudit: (reconcile = false) => req<{
+    compared: number; broadened: number; lost: number; readyToRetireLegacy: boolean; inserted: number;
+    rolloutGate: 'pass' | 'blocked'; truncated: boolean;
+    differences: Array<{ userEmail: string; projectKey: string; legacyReach: boolean; grantReach: boolean }>;
+    rollback: string;
+  }>('POST', '/api/admin/authorization/parity-audit', { reconcile }),
   resetPassword: (uid: string) => req<{ tempPassword: string }>('POST', `/api/users/${uid}/reset-password`),
   changePassword: (current: string, next: string) => req('POST', '/api/auth/change-password', { current, next }),
 
@@ -191,9 +225,10 @@ export const api = {
 
   patchGroup: (gid: string, patch: { name?: string; description?: string }) => req('PATCH', `/api/groups/${gid}`, patch),
   deleteGroup: (gid: string) => req('DELETE', `/api/groups/${gid}`),
-  groupMembers: (gid: string) => req<{ members: Array<{ id: string; name: string; email: string; status: string }> }>('GET', `/api/groups/${gid}/members`),
+  groupMembers: (gid: string) => req<{ members: Array<{ id: string; name: string; email: string; status: string; role: 'owner' | 'manager' | 'member' }> }>('GET', `/api/groups/${gid}/members`),
   // Inviting creates a PENDING membership the target must accept (PLNR-138).
-  addGroupMember: (gid: string, userId: string) => req<{ ok: boolean; status: string }>('POST', `/api/groups/${gid}/members`, { userId }),
+  addGroupMember: (gid: string, userId: string, role: 'owner' | 'manager' | 'member' = 'member') => req<{ ok: boolean; status: string }>('POST', `/api/groups/${gid}/members`, { userId, role }),
+  setGroupMemberRole: (gid: string, uid: string, role: 'owner' | 'manager' | 'member') => req('PATCH', `/api/groups/${gid}/members/${uid}`, { role }),
   removeGroupMember: (gid: string, uid: string) => req('DELETE', `/api/groups/${gid}/members/${uid}`),
   groupInvites: () => req<{ invites: Array<{ groupId: string; groupName: string; invitedByName: string | null; invitedAt: string | null }> }>('GET', '/api/me/group-invites'),
   acceptGroupInvite: (gid: string) => req('POST', `/api/groups/${gid}/members/accept`),
@@ -652,6 +687,13 @@ export interface ApiProject {
   agentCount: number;
   /** Opt-in public read-only visibility (PLNR-78). */
   public: number;
+  effectiveRole: 'owner' | 'manager' | 'contributor' | 'viewer' | null;
+  accessSource: string;
+  canView: boolean;
+  canContribute: boolean;
+  canManage: boolean;
+  canOwn: boolean;
+  cappedByReadOnly: boolean;
 }
 
 export interface ApiUser {
@@ -665,6 +707,11 @@ export interface ApiUser {
   passkeys: number;
   groupIds: string | null;
   ownedProjects: number;
+  accessMode?: 'read_write' | 'read_only';
+  canCreateProjectsOverride?: number | null;
+  canCreateGroupsOverride?: number | null;
+  canCreateProjects?: number;
+  canCreateGroups?: number;
 }
 
 export interface ApiAgent {
@@ -807,7 +854,13 @@ export interface ApiSearchHit {
 export interface ApiSnapshot {
   /** Server package version — deploy marker for the SPA's self-refresh (PLNR-193). */
   version?: string;
-  project: { id: string; key: string; name: string; description: string; claimTtlSeconds: number; lockTtlSeconds?: number | null; fileLockingEnabled?: number };
+  project: {
+    id: string; key: string; name: string; description: string; claimTtlSeconds: number;
+    lockTtlSeconds?: number | null; fileLockingEnabled?: number;
+    effectiveRole: 'owner' | 'manager' | 'contributor' | 'viewer' | null;
+    accessSource: string; canView: boolean; canContribute: boolean; canManage: boolean; canOwn: boolean;
+    cappedByReadOnly: boolean;
+  };
   tasks: Array<{
     id: string; key: string; title: string; body: string; status: string; type: string; priority: number;
     estimate: number | null; dueAt: string | null; claimedBy: string | null; claimExpiresAt: string | null; parentTaskId: string | null;

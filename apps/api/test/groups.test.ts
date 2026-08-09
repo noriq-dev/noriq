@@ -1,5 +1,5 @@
-// PLNR-81: group authorization — only a group's members (or an admin) may see,
-// rename, or delete it. Previously any authenticated user could edit any group.
+// PLNR-81/327: every user may discover groups, but only managers, owners, or an
+// administrator may mutate them. Accepted members retain read access.
 import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import { createUser, loginSession } from './helpers';
@@ -33,9 +33,13 @@ beforeAll(async () => {
   await SELF.fetch(`https://noriq.test/api/users/${memberAId}/groups`, {
     method: 'PUT', headers: { Cookie: adminCookie, ...asJson }, body: JSON.stringify({ groupIds: [groupId] }),
   });
+  // The admin assignment creates an ordinary member. Promote A explicitly so the management
+  // tests exercise manager authority rather than the old "every member is an admin" behavior.
+  await env.DB.prepare("UPDATE user_groups SET role = 'manager' WHERE user_id = ? AND group_id = ?")
+    .bind(memberAId, groupId).run();
 });
 
-describe('group authorization (PLNR-81)', () => {
+describe('group authorization (PLNR-81/327)', () => {
   it('everyone sees every group, but canEdit reflects membership (PLNR-81 regression)', async () => {
     // A non-member must still SEE the group — the project directory needs group
     // names to resolve, or projects in unseen groups vanish from the UI.
@@ -43,7 +47,7 @@ describe('group authorization (PLNR-81)', () => {
     expect(bView).toBeTruthy();
     expect(bView!.canEdit).toBeFalsy(); // …but no edit rights
 
-    expect((await listGroups(aCookie)).find((g) => g.id === groupId)?.canEdit).toBeTruthy(); // member
+    expect((await listGroups(aCookie)).find((g) => g.id === groupId)?.canEdit).toBeTruthy(); // manager
     expect((await listGroups(adminCookie)).find((g) => g.id === groupId)?.canEdit).toBeTruthy(); // admin
   });
 
@@ -58,7 +62,7 @@ describe('group authorization (PLNR-81)', () => {
     expect((await listGroups(aCookie)).find((g) => g.id === groupId)?.name).toBe('Env: staging');
   });
 
-  it('a member can rename the group', async () => {
+  it('a manager can rename the group', async () => {
     const patch = await SELF.fetch(`https://noriq.test/api/groups/${groupId}`, {
       method: 'PATCH', headers: { Cookie: aCookie, ...asJson }, body: JSON.stringify({ name: 'Env: prod' }),
     });
@@ -66,11 +70,26 @@ describe('group authorization (PLNR-81)', () => {
     expect((await listGroups(aCookie)).find((g) => g.id === groupId)?.name).toBe('Env: prod');
   });
 
+  it('admin membership assignment preserves an existing manager role', async () => {
+    const save = await SELF.fetch(`https://noriq.test/api/users/${memberAId}/groups`, {
+      method: 'PUT', headers: { Cookie: adminCookie, ...asJson }, body: JSON.stringify({ groupIds: [groupId] }),
+    });
+    expect(save.status).toBe(200);
+    const row = await env.DB.prepare('SELECT role FROM user_groups WHERE user_id = ? AND group_id = ?')
+      .bind(memberAId, groupId).first<{ role: string }>();
+    expect(row?.role).toBe('manager');
+  });
+
   it('creating a group makes the creator a member who can then edit it', async () => {
     const g = await SELF.fetch('https://noriq.test/api/groups', {
       method: 'POST', headers: { Cookie: bCookie, ...asJson }, body: JSON.stringify({ name: 'B owns this' }),
     });
     const bGroupId = (await g.json() as { id: string }).id;
+    const creator = await env.DB.prepare("SELECT id FROM users WHERE email = 'grp-b@example.com'").first<{ id: string }>();
+    const membership = await env.DB.prepare('SELECT role FROM user_groups WHERE user_id = ? AND group_id = ?')
+      .bind(creator!.id, bGroupId)
+      .first<{ role: string }>();
+    expect(membership?.role).toBe('owner');
     expect((await listGroups(bCookie)).some((x) => x.id === bGroupId)).toBe(true); // visible to creator
     const patch = await SELF.fetch(`https://noriq.test/api/groups/${bGroupId}`, {
       method: 'PATCH', headers: { Cookie: bCookie, ...asJson }, body: JSON.stringify({ description: 'mine' }),
@@ -106,6 +125,10 @@ describe('group authorization (PLNR-81)', () => {
       `INSERT OR IGNORE INTO projects (id, key, name, description, status, claim_ttl_seconds, owner_user_id, group_id, created_at)
        VALUES (?, 'GRPCON', 'grouped project', '', 'active', 1800, ?, ?, ?)`,
     ).bind(groupProjectId, memberAId, groupId, new Date().toISOString()).run();
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO project_grants (project_id, principal_type, principal_id, role, source, created_by)
+       VALUES (?, 'group', ?, 'contributor', 'legacy_group', ?)`,
+    ).bind(groupProjectId, groupId, memberAId).run();
 
     const add = await SELF.fetch(`https://noriq.test/api/groups/${groupId}/members`, {
       method: 'POST', headers: { Cookie: aCookie, ...asJson }, body: JSON.stringify({ userId: bId }),
@@ -119,19 +142,33 @@ describe('group authorization (PLNR-81)', () => {
 
     // But B sees the invite waiting for them, and A's roster shows B as pending.
     expect((await memberInvites(bCookie)).some((i) => i.groupId === groupId)).toBe(true);
+    const adminDirectory = await (await SELF.fetch('https://noriq.test/api/users', {
+      headers: { Cookie: adminCookie },
+    })).json() as { users: Array<{ id: string; groupIds: string | null }> };
+    expect((adminDirectory.users.find((u) => u.id === bId)?.groupIds ?? '').split(',')).not.toContain(groupId);
     const roster = (await (await SELF.fetch(`https://noriq.test/api/groups/${groupId}/members`, { headers: { Cookie: aCookie } })).json() as {
-      members: Array<{ id: string; status: string }>;
+      members: Array<{ id: string; status: string; role: string }>;
     }).members;
     expect(roster.find((m) => m.id === bId)?.status).toBe('pending');
+    expect(roster.find((m) => m.id === bId)?.role).toBe('member');
   });
 
   it('accepting the invite makes B a member with access; declining/leaving reverses it', async () => {
-    // Accept: now a real member — editable, sees the group project, invite list clears.
+    // Accept: now a real member — can use/read the group, but cannot administer it.
     const accept = await SELF.fetch(`https://noriq.test/api/groups/${groupId}/members/accept`, { method: 'POST', headers: { Cookie: bCookie } });
     expect(accept.status).toBe(200);
-    expect((await listGroups(bCookie)).find((g) => g.id === groupId)?.canEdit).toBeTruthy();
+    expect((await listGroups(bCookie)).find((g) => g.id === groupId)?.canEdit).toBeFalsy();
     expect(await seesProject(bCookie, groupProjectId)).toBe(true);
     expect((await memberInvites(bCookie)).some((i) => i.groupId === groupId)).toBe(false);
+    expect((await SELF.fetch(`https://noriq.test/api/groups/${groupId}`, {
+      method: 'PATCH', headers: { Cookie: bCookie, ...asJson }, body: JSON.stringify({ name: 'member hijack' }),
+    })).status).toBe(403);
+    expect((await SELF.fetch(`https://noriq.test/api/groups/${groupId}`, {
+      method: 'DELETE', headers: { Cookie: bCookie },
+    })).status).toBe(403);
+    expect((await SELF.fetch(`https://noriq.test/api/groups/${groupId}/members/${memberAId}`, {
+      method: 'DELETE', headers: { Cookie: bCookie },
+    })).status).toBe(403);
 
     // B leaves (removes their own accepted membership) — access is gone again.
     const leave = await SELF.fetch(`https://noriq.test/api/groups/${groupId}/members/${bId}`, { method: 'DELETE', headers: { Cookie: bCookie } });
