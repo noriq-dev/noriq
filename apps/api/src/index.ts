@@ -49,6 +49,7 @@ import { normalizeVerificationReport } from './memory/verification';
 import { sweepPendingEpisodeJobs } from './memory/episodes';
 import { AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget, isTerminalRunStatus, normalizeProjectKey, IndexGenerationManifest, ContextPackRole, type RunnerIndexCursor } from '@noriq-dev/shared';
 import { auditAuthorizationParity, reconcileLegacyGroupGrants } from './lib/authorization-parity';
+import { evaluateMemoryAcceptance } from './memory/acceptance';
 
 export { ProjectRoom } from './do/ProjectRoom';
 export { AgentSession } from './do/AgentSession';
@@ -182,7 +183,7 @@ const humanProjectActionDenied = async (
 // bodies and remain viewer actions. Everything else maps to a stable minimum action here; more
 // sensitive per-field owner checks (publication/transfer) remain inside their handlers.
 const VIEWER_POST_ROUTES = [
-  /\/memory\/(search|similar-effort|explain|constellation|entities|context)$/,
+  /\/memory\/(search|similar-effort|explain|constellation|entities|context|acceptance)$/,
 ];
 const MANAGER_ROUTES = [
   /\/meta$/,
@@ -1578,6 +1579,34 @@ app.post('/api/projects/:pid/memory/context', userAuth, async (c) => {
     role: body.role ?? 'human', tokenBudget: body.budgetTokens ?? null,
   });
   return c.json(pack);
+});
+
+// Production acceptance gate (PLNR-346). This is intentionally a viewer-safe read: it gathers
+// the same live repository state and task context normal humans/agents consume, evaluates named
+// deterministic thresholds, and returns failed/unanswerable criteria rather than filling gaps
+// from fixtures. scripts/memory-acceptance.mjs drives this route for representative projects.
+app.post('/api/projects/:pid/memory/acceptance', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const body = await c.req.json<{
+    taskId?: string; repositoryKey?: string; branch?: string; baseId?: string; budgetTokens?: number;
+  }>().catch(() => ({}) as Record<string, never>);
+  if (!body.taskId) return c.json({ error: 'taskId required' }, 400);
+  const task = await c.env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+    .bind(body.taskId, body.taskId, pid).first<{ id: string }>();
+  if (!task) return c.json({ error: 'not found' }, 404);
+  const [repositories, generations] = await Promise.all([
+    listProjectRepositories(c.env, pid),
+    memoryDO(c.env, pid).listIndexGenerations(pid),
+  ]);
+  const repository = body.repositoryKey ? repositories.find((candidate) => candidate.repositoryKey === body.repositoryKey) ?? null : null;
+  const repositoryState = repository ? { ...repository, ...deriveRepositoryMemoryState(repository, generations) } : null;
+  const pack = await assembleContextPack(c.env, pid, task.id, {
+    repositoryKey: body.repositoryKey, branch: body.branch, baseId: body.baseId,
+    role: 'verify', tokenBudget: body.budgetTokens ?? 4_000,
+  });
+  return c.json(evaluateMemoryAcceptance({
+    pack, repository: repositoryState, requested: body, proof: 'live-environment',
+  }));
 });
 
 // Proposed-decision approval (PLNR-253) — HUMAN-only, never an MCP tool (§12/§13: an agent must
