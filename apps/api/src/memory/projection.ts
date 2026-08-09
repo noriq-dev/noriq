@@ -142,10 +142,23 @@ export interface ProjectedEdgeDescriptor {
  * no edges (unchanged from before this task), edges with no new top-level node (the edge's own
  * endpoint descriptors already carry `upsertGraphNode` everything it needs), or, in principle,
  * both.
+ *
+ * `removeNodeUri` (PLNR-317) is the third, mutually-exclusive shape: a `*.deleted`/`.rejected`
+ * arm for a coordination entity whose D1 row is genuinely gone sets ONLY this — `node`/`edges`
+ * stay null/empty, since there is nothing left to create or link. Optional rather than a required
+ * third field alongside `node`: only the handful of delete arms below ever set it, and every
+ * pre-existing arm's `{ node, edges }` literal is unaffected. `ProjectMemory.applyCoordinationEvent`
+ * removes the node's every incident edge before the node row itself (the DO's `edges` table has a
+ * `NOT NULL REFERENCES nodes(id)` on both endpoints, and Durable Object SQLite enforces foreign
+ * keys unconditionally — CLAUDE.md — so the edges must go first or the node delete itself would
+ * raise `SQLITE_CONSTRAINT`). Never set for `memory` (§12: a memory is superseded or invalidated,
+ * never destructively erased) — no delete verb below names a memory's uri, so that boundary holds
+ * by construction, not by a runtime check here.
  */
 export interface CoordinationProjection {
   node: ProjectedNodeDescriptor | null;
   edges: ProjectedEdgeDescriptor[];
+  removeNodeUri?: string;
 }
 
 export interface CoordinationEventForProjection {
@@ -239,6 +252,38 @@ export interface CoordinationEventForProjection {
  *     rebuild-vs-incremental convergence gap already exists for every run edge independent of
  *     this change; closing it is a pre-existing gap, not one this task introduces, and is left
  *     to whoever gives `rebuildProjection` run coverage.
+ *
+ * PLNR-317 adds the delete side: `task.deleted`/`doc.deleted`/`plan.deleted`/`milestone.deleted`
+ * each set `removeNodeUri` to the exact uri their own `*.created` arm above would have built for
+ * the same `ev.subjectId` — every one of these emit sites (`ProjectRoom.ts`) names the deleted
+ * row's own id as `subjectId` (verified at each call site, not assumed), so no payload field is
+ * needed at all, only the verb and the subject id already on every event. `plan.rejected` gets
+ * the SAME treatment as `plan.deleted` (discretion, chosen, and a deliberate widening beyond this
+ * task's own body text): `ProjectRoom.ts.rejectPlan` hard-deletes the `plans` row exactly like
+ * `deletePlan` does — same `DELETE FROM plans WHERE id = ?` — but names the row's death
+ * `plan.rejected`, not `plan.deleted`; leaving that arm unhandled would keep the exact dangling
+ * star this task exists to close for the one plan lifecycle path (proposal → rejected) that
+ * hard-deletes without the `.deleted` verb. `plan_doc.deleted` is deliberately NOT handled: no
+ * `plan_doc.created` arm exists above (plan-local docs are never indexed, never projected —
+ * CLAUDE.md), so no plan-doc node is ever written for `plan_doc.deleted` to remove — handling it
+ * would be a no-op arm for a node that never existed (discretion: "only verbs whose nodes the
+ * projector actually creates").
+ *
+ * `ProjectRoom.ts`'s own delete sites (`deleteTask`/`deleteDoc`/`deletePlan`/`rejectPlan`) ALSO
+ * emit `plan.tasks_unlinked`/`task.docs_unlinked` for the same deletion (PLNR-319) — at every one
+ * of those call sites the `.deleted`/`.rejected` verb is emitted BEFORE the unlink verb (verified
+ * at each site), so the projector (which consumes a project's events strictly in `global_seq`
+ * order) always applies node removal FIRST. By the time the later unlink event is applied, this
+ * node and every edge incident on it — including the very `related_to` edge the unlink event
+ * would have unlinked — are already gone: `applyCoordinationEdge`'s unlink branch looks its
+ * endpoints up (never stubs them) and does nothing when either is missing, so the redundant
+ * unlink event lands as a harmless, already-idempotent no-op, not a second mechanism that could
+ * disagree with this one. Kept rather than simplified away in `ProjectRoom.ts` (discretion,
+ * chosen): they are a real defence-in-depth floor for the two relationship types the constellation
+ * most needs correct if node removal itself ever regresses or a future verb hard-deletes a row
+ * via a path this function does not yet cover, and removing them would touch a file (`ProjectRoom.ts`)
+ * and an event shape outside this task's own footprint for a benefit (fewer no-op rows) that does
+ * not offset the risk of silently dropping that floor.
  */
 export function mapCoordinationEvent(ev: CoordinationEventForProjection): CoordinationProjection | null {
   const label = (key: string): string => {
@@ -352,6 +397,18 @@ export function mapCoordinationEvent(ev: CoordinationEventForProjection): Coordi
       }
       return { node: null, edges };
     }
+    // PLNR-317: the delete side — see this function's own doc comment for the ordering guarantee
+    // with `plan.tasks_unlinked`/`task.docs_unlinked`, why `plan.rejected` gets the same
+    // treatment as `plan.deleted`, and why `plan_doc.deleted` is deliberately absent.
+    case 'task.deleted':
+      return { node: null, edges: [], removeNodeUri: buildEntityUri({ kind: 'task', id: ev.subjectId }) };
+    case 'doc.deleted':
+      return { node: null, edges: [], removeNodeUri: buildEntityUri({ kind: 'artifact', id: ev.subjectId }) };
+    case 'plan.deleted':
+    case 'plan.rejected':
+      return { node: null, edges: [], removeNodeUri: buildEntityUri({ kind: 'plan', id: ev.subjectId }) };
+    case 'milestone.deleted':
+      return { node: null, edges: [], removeNodeUri: buildEntityUri({ kind: 'unknown', id: ev.subjectId }) };
     default:
       return null;
   }

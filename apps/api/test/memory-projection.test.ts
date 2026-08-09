@@ -23,6 +23,9 @@ interface RoomRpc {
   deletePlan(projectId: string, actor: Actor, planId: string): Promise<{ ok: true }>;
   deleteDoc(projectId: string, actor: Actor, docId: string): Promise<{ ok: true }>;
   moveTask(projectId: string, actor: Actor, taskId: string, toProjectId: string): Promise<{ ok: true }>;
+  // PLNR-317: same "exercised directly" reasoning as the PLNR-319 RPCs above.
+  deleteMilestone(projectId: string, actor: Actor, milestoneId: string): Promise<{ ok: true }>;
+  rejectPlan(projectId: string, actor: Actor, planId: string): Promise<{ ok: true; cancelledTasks: number }>;
 }
 const room = (projectId: string) => appEnv.PROJECT_ROOM.get(appEnv.PROJECT_ROOM.idFromName(projectId)) as unknown as RoomRpc;
 const SYSTEM_ACTOR: Actor = { kind: 'system', id: 'system', name: 'system' };
@@ -62,6 +65,8 @@ interface MemRpc {
   _countNodes(pid: string): Promise<number>;
   _countEdges(pid: string): Promise<number>;
   _edgeProvenance(pid: string, type: string, fromUri: string, toUri: string): Promise<string | null>;
+  _nodeByUriForTest(pid: string, uri: string): Promise<{ nodeId: string; type: string; label: string } | null>;
+  _rewindProjectorCursorForTest(pid: string, globalSeq: number): Promise<void>;
   recordMemory(pid: string, input: RecordMemoryInput): Promise<{ memoryId: string; operationId: string; deduped: boolean }>;
   rebuildProjection(pid: string): Promise<{ nodesWritten: number; edgesWritten: number }>;
   searchProjectMemory(pid: string, opts: Record<string, unknown>): Promise<{ mode: string; results: Array<{ entityType: string; id: string; uri?: string }> }>;
@@ -502,6 +507,37 @@ describe('mapCoordinationEvent — pure mapping (PLNR-316)', () => {
 
   it('dependency.unblocked still projects nothing — no new relationship (the depends_on edge already exists; unblocking is a readiness change, not a graph change)', () => {
     expect(mapCoordinationEvent({ verb: 'dependency.unblocked', subjectId: 'task_abc', payload: { key: 'PM-1', title: 'a task', blockerKey: 'PM-2' } })).toBeNull();
+  });
+});
+
+describe('mapCoordinationEvent — delete verbs project removeNodeUri, no node/edges (PLNR-317)', () => {
+  it('task.deleted removes the same uri task.created would have built for the same subjectId', () => {
+    const projected = mapCoordinationEvent({ verb: 'task.deleted', subjectId: 'task_abc', payload: { key: 'PM-1', title: 'doomed task' } });
+    expect(projected).toEqual({ node: null, edges: [], removeNodeUri: buildEntityUri({ kind: 'task', id: 'task_abc' }) });
+  });
+
+  it('doc.deleted removes the artifact uri', () => {
+    const projected = mapCoordinationEvent({ verb: 'doc.deleted', subjectId: 'doc_abc', payload: { name: 'doomed doc' } });
+    expect(projected).toEqual({ node: null, edges: [], removeNodeUri: buildEntityUri({ kind: 'artifact', id: 'doc_abc' }) });
+  });
+
+  it('plan.deleted removes the plan uri', () => {
+    const projected = mapCoordinationEvent({ verb: 'plan.deleted', subjectId: 'plan_abc', payload: { title: 'doomed plan' } });
+    expect(projected).toEqual({ node: null, edges: [], removeNodeUri: buildEntityUri({ kind: 'plan', id: 'plan_abc' }) });
+  });
+
+  it('plan.rejected removes the SAME plan uri as plan.deleted — rejectPlan hard-deletes the plans row too, just under a different verb name', () => {
+    const projected = mapCoordinationEvent({ verb: 'plan.rejected', subjectId: 'plan_abc', payload: { title: 'rejected plan', cancelledTasks: 0 } });
+    expect(projected).toEqual({ node: null, edges: [], removeNodeUri: buildEntityUri({ kind: 'plan', id: 'plan_abc' }) });
+  });
+
+  it('milestone.deleted removes the unknown-kind uri milestone.created would have built', () => {
+    const projected = mapCoordinationEvent({ verb: 'milestone.deleted', subjectId: 'ms_abc', payload: { title: 'doomed milestone' } });
+    expect(projected).toEqual({ node: null, edges: [], removeNodeUri: buildEntityUri({ kind: 'unknown', id: 'ms_abc' }) });
+  });
+
+  it('plan_doc.deleted projects nothing — no plan_doc.created arm ever writes a node for one to remove', () => {
+    expect(mapCoordinationEvent({ verb: 'plan_doc.deleted', subjectId: 'pd_abc', payload: { name: 'doomed plan doc', planId: 'plan_abc' } })).toBeNull();
   });
 });
 
@@ -956,7 +992,7 @@ describe('phase_tasks/task_docs draw real edges end to end, converging with rebu
     expect(upstreamUris).not.toContain(t2Uri);
   });
 
-  it('deleteTask unlinks its plan and doc edges (the task graph NODE itself is a pre-existing gap this task does not close)', async () => {
+  it('deleteTask unlinks its plan and doc edges, and (PLNR-317) removes the task graph NODE itself — the gap this describe block\'s title used to call out is closed', async () => {
     const { token, projectId } = await newOwnedProject('pm-319-deltask@example.com', 'PM319DT');
     const doc = await mcpCall(token, 'create_doc', { projectId, name: 'del task doc', body: 'Settled: a fact.' });
     if (doc.isError) throw new Error(`create_doc failed: ${doc.text}`);
@@ -974,11 +1010,16 @@ describe('phase_tasks/task_docs draw real edges end to end, converging with rebu
     const docUri = buildEntityUri({ kind: 'artifact', id: docId });
     expect((await memory(projectId).dependencyNeighborhood(projectId, { entityUri: taskUri, edgeTypes: ['related_to'] })).downstream.map((n) => n.uri).sort())
       .toEqual([docUri, planUri].sort());
+    expect(await memory(projectId)._nodeByUriForTest(projectId, taskUri)).not.toBeNull();
 
     await room(projectId).deleteTask(projectId, HUMAN_ACTOR, taskId);
     const applied = await memory(projectId).runProjector(projectId);
     expect(applied.applied).toBeGreaterThan(0);
     expect((await memory(projectId).dependencyNeighborhood(projectId, { entityUri: taskUri, edgeTypes: ['related_to'] })).downstream).toEqual([]);
+    // PLNR-317: the star itself is gone, not just its edges — task.deleted's node removal runs
+    // BEFORE the plan.tasks_unlinked/task.docs_unlinked events this same deletion also emits
+    // (PLNR-319), so those later unlink events found no node to unlink and no-opped harmlessly.
+    expect(await memory(projectId)._nodeByUriForTest(projectId, taskUri)).toBeNull();
   });
 
   it('deleteDoc unlinks every task it was attached to', async () => {
@@ -999,6 +1040,7 @@ describe('phase_tasks/task_docs draw real edges end to end, converging with rebu
     const applied = await memory(projectId).runProjector(projectId);
     expect(applied.applied).toBeGreaterThan(0);
     expect((await memory(projectId).dependencyNeighborhood(projectId, { entityUri: taskUri, edgeTypes: ['related_to'] })).downstream).toEqual([]);
+    expect(await memory(projectId)._nodeByUriForTest(projectId, docUri)).toBeNull(); // PLNR-317
   });
 
   it('deletePlan unlinks every task still in it', async () => {
@@ -1017,6 +1059,7 @@ describe('phase_tasks/task_docs draw real edges end to end, converging with rebu
     const applied = await memory(projectId).runProjector(projectId);
     expect(applied.applied).toBeGreaterThan(0);
     expect((await memory(projectId).dependencyNeighborhood(projectId, { entityUri: taskUri, edgeTypes: ['related_to'] })).downstream).toEqual([]);
+    expect(await memory(projectId)._nodeByUriForTest(projectId, planUri)).toBeNull(); // PLNR-317
   });
 
   it('moveTask unlinks its plan and doc edges in the SOURCE project', async () => {
@@ -1041,5 +1084,139 @@ describe('phase_tasks/task_docs draw real edges end to end, converging with rebu
     const applied = await memory(projectId).runProjector(projectId);
     expect(applied.applied).toBeGreaterThan(0);
     expect((await memory(projectId).dependencyNeighborhood(projectId, { entityUri: taskUri, edgeTypes: ['related_to'] })).downstream).toEqual([]);
+  });
+});
+
+describe('deleting a coordination entity removes its node and every edge incident on it (PLNR-317)', () => {
+  it('deleting a claimed, doc-linked, plan-linked task removes the node AND every edge touching it in EITHER direction — owned_by (task is the FROM side) and related_to (task is also the FROM side to both doc and plan)', async () => {
+    const { token, projectId } = await newOwnedProject('pm-317-full@example.com', 'PM317FL');
+    const doc = await mcpCall(token, 'create_doc', { projectId, name: 'full doc', body: 'Settled: a fact.' });
+    if (doc.isError) throw new Error(`create_doc failed: ${doc.text}`);
+    const docId = doc.body.id as string;
+    const plan = await mcpCall(token, 'create_plan', {
+      projectId, title: 'full plan', phases: [{ title: 'phase 1', newTasks: [{ title: 'to be fully deleted', docIds: [docId] }] }],
+    });
+    if (plan.isError) throw new Error(`create_plan failed: ${plan.text}`);
+    const taskId = (plan.body.phases as Array<{ taskIds: string[] }>)[0]!.taskIds[0]!;
+    const claim = await mcpCall(token, 'claim_task', { projectId, taskId });
+    if (claim.isError) throw new Error(`claim_task failed: ${claim.text}`);
+
+    await memory(projectId).runProjector(projectId);
+    const taskUri = buildEntityUri({ kind: 'task', id: taskId });
+    expect(await memory(projectId)._nodeByUriForTest(projectId, taskUri)).not.toBeNull();
+    const beforeEdges = await memory(projectId)._countEdges(projectId);
+    expect(beforeEdges).toBeGreaterThanOrEqual(3); // owned_by + related_to(doc) + related_to(plan)
+
+    await room(projectId).deleteTask(projectId, HUMAN_ACTOR, taskId);
+    const applied = await memory(projectId).runProjector(projectId);
+    expect(applied.applied).toBeGreaterThan(0);
+
+    expect(await memory(projectId)._nodeByUriForTest(projectId, taskUri)).toBeNull();
+    // No edge anywhere still references the removed node's id — not just the ones this test
+    // happened to query by uri above.
+    expect(await memory(projectId)._countEdges(projectId)).toBe(beforeEdges - 3);
+  });
+
+  it('deleting a task a memory cited as evidence leaves the memory node and its evidence row intact — only the observed_in edge to the task goes', async () => {
+    const { token, projectId } = await newOwnedProject('pm-317-evidence@example.com', 'PM317EV');
+    const task = await mcpCall(token, 'create_task', { projectId, title: 'cited then deleted', tags: ['pm-317'], allowNewTags: true });
+    if (task.isError) throw new Error(`create_task failed: ${task.text}`);
+    const taskId = task.body.id as string;
+
+    const before = await memory(projectId).health(projectId);
+    const { memoryId } = await memory(projectId).recordMemory(projectId, {
+      kind: 'learning',
+      statement: 'observed while working the doomed task, backed by a repo citation too',
+      evidence: [
+        { kind: 'task', id: taskId },
+        { repositoryKey: 'repo-a', branch: 'main', baseId: 'sha_1', path: 'src/a.ts' },
+      ],
+      actor: SYSTEM,
+    });
+    const afterRecord = await memory(projectId).health(projectId);
+    const evidenceRowsWritten = (afterRecord.tableCounts.evidence ?? 0) - (before.tableCounts.evidence ?? 0);
+    expect(evidenceRowsWritten).toBe(1); // only the repository citation writes an `evidence` row
+
+    const memoryUri = buildEntityUri({ kind: 'memory', id: memoryId });
+    const taskUri = buildEntityUri({ kind: 'task', id: taskId });
+    expect(await memory(projectId)._edgeProvenance(projectId, 'observed_in', memoryUri, taskUri)).toMatch(/^evidence:/);
+
+    await room(projectId).deleteTask(projectId, HUMAN_ACTOR, taskId);
+    await memory(projectId).runProjector(projectId);
+
+    // Locked decision: no memory node is ever removed by the projector.
+    expect(await memory(projectId)._nodeByUriForTest(projectId, memoryUri)).not.toBeNull();
+    // Locked decision: the evidence row survives — it has no column referencing `nodes` at all.
+    const afterDelete = await memory(projectId).health(projectId);
+    expect(afterDelete.tableCounts.evidence).toBe(afterRecord.tableCounts.evidence);
+    // But the edge the deleted task's node carried IS gone — findGraphNodeId(taskUri) now finds
+    // nothing, so `dependencyNeighborhood` from the memory no longer reaches it.
+    expect(await memory(projectId)._nodeByUriForTest(projectId, taskUri)).toBeNull();
+    const fromMemory = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: memoryUri, edgeTypes: ['observed_in'] });
+    expect(fromMemory.downstream.map((n) => n.uri)).not.toContain(taskUri);
+  });
+
+  it('rejectPlan hard-deletes the plans row under `plan.rejected`, not `plan.deleted` — its node is removed all the same', async () => {
+    const { token, projectId } = await newOwnedProject('pm-317-reject@example.com', 'PM317RJ');
+    const plan = await mcpCall(token, 'create_plan', {
+      projectId, title: 'rejected plan', proposed: true, phases: [{ title: 'phase 1', newTasks: [{ title: 'orphaned by rejection' }] }],
+    });
+    if (plan.isError) throw new Error(`create_plan failed: ${plan.text}`);
+    const planId = plan.body.id as string;
+
+    await memory(projectId).runProjector(projectId);
+    const planUri = buildEntityUri({ kind: 'plan', id: planId });
+    expect(await memory(projectId)._nodeByUriForTest(projectId, planUri)).not.toBeNull();
+
+    await room(projectId).rejectPlan(projectId, HUMAN_ACTOR, planId);
+    const applied = await memory(projectId).runProjector(projectId);
+    expect(applied.applied).toBeGreaterThan(0);
+    expect(await memory(projectId)._nodeByUriForTest(projectId, planUri)).toBeNull();
+  });
+
+  it('deleteMilestone removes the unknown-kind node milestone.created wrote', async () => {
+    const { token, projectId } = await newOwnedProject('pm-317-milestone@example.com', 'PM317MS');
+    const milestone = await mcpCall(token, 'create_milestone', { projectId, title: 'doomed milestone' });
+    if (milestone.isError) throw new Error(`create_milestone failed: ${milestone.text}`);
+    const milestoneId = milestone.body.id as string;
+
+    await memory(projectId).runProjector(projectId);
+    const msUri = buildEntityUri({ kind: 'unknown', id: milestoneId });
+    expect(await memory(projectId)._nodeByUriForTest(projectId, msUri)).not.toBeNull();
+
+    await room(projectId).deleteMilestone(projectId, HUMAN_ACTOR, milestoneId);
+    const applied = await memory(projectId).runProjector(projectId);
+    expect(applied.applied).toBeGreaterThan(0);
+    expect(await memory(projectId)._nodeByUriForTest(projectId, msUri)).toBeNull();
+  });
+
+  it('replaying a project\'s full event history (including an already-applied task.deleted) is a no-op — node stays removed, edge/node counts unchanged', async () => {
+    const { token, projectId } = await newOwnedProject('pm-317-replay@example.com', 'PM317RP');
+    const doc = await mcpCall(token, 'create_doc', { projectId, name: 'replay doc', body: 'Settled: a fact.' });
+    if (doc.isError) throw new Error(`create_doc failed: ${doc.text}`);
+    const docId = doc.body.id as string;
+    const task = await mcpCall(token, 'create_task', { projectId, title: 'replay task', docIds: [docId], tags: ['pm-317'], allowNewTags: true });
+    if (task.isError) throw new Error(`create_task failed: ${task.text}`);
+    const taskId = task.body.id as string;
+
+    await room(projectId).deleteTask(projectId, HUMAN_ACTOR, taskId);
+    await memory(projectId).runProjector(projectId); // consumes create + link + delete + unlink, in order
+
+    const taskUri = buildEntityUri({ kind: 'task', id: taskId });
+    expect(await memory(projectId)._nodeByUriForTest(projectId, taskUri)).toBeNull();
+    const nodesBefore = await memory(projectId)._countNodes(projectId);
+    const edgesBefore = await memory(projectId)._countEdges(projectId);
+
+    // Rewind to before this project's very first event and replay everything —
+    // task.created (re-stub), task.docs_linked (re-link), task.deleted (re-remove),
+    // task.docs_unlinked (no-op, node already gone) — the SAME idempotent guarantee every other
+    // projected write in this file already relies on (`ON CONFLICT` for upsert/link).
+    await memory(projectId)._rewindProjectorCursorForTest(projectId, 0);
+    const replay = await memory(projectId).runProjector(projectId);
+    expect(replay.applied).toBeGreaterThan(0); // it really did re-consume events, not skip them
+
+    expect(await memory(projectId)._nodeByUriForTest(projectId, taskUri)).toBeNull();
+    expect(await memory(projectId)._countNodes(projectId)).toBe(nodesBefore);
+    expect(await memory(projectId)._countEdges(projectId)).toBe(edgesBefore);
   });
 });

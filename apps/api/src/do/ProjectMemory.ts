@@ -1814,6 +1814,36 @@ export class ProjectMemory extends DurableObject<Env> {
     this.ctx.storage.sql.exec(`DELETE FROM edges WHERE type = ?1 AND from_node_id = ?2 AND to_node_id = ?3`, type, fromNodeId, toNodeId);
   }
 
+  /**
+   * PLNR-317: remove a node and every edge incident on it — the projection of a `*.deleted`/
+   * `.rejected` coordination event (`mapCoordinationEvent`'s `removeNodeUri`), for an entity whose
+   * D1 row is genuinely gone. Idempotent by construction, same idiom as every other write in this
+   * file: a uri with no node (already removed by an earlier apply of the same event, or a stub
+   * that was simply never written) is a no-op, not an error. Edges go FIRST, deliberately — 0001's
+   * `edges` table declares `from_node_id`/`to_node_id` as `NOT NULL REFERENCES nodes(id)`, and
+   * Durable Object SQLite enforces foreign keys unconditionally (CLAUDE.md), so deleting the node
+   * row first would raise `SQLITE_CONSTRAINT` on any surviving edge. `idx_edges_from`/
+   * `idx_edges_to` (0001) already index both columns — no new index needed for either `DELETE`
+   * below to be a lookup, not a scan.
+   *
+   * `memory` nodes are never reachable here — no delete verb `mapCoordinationEvent` handles ever
+   * sets `removeNodeUri` for a memory's own uri (§12: superseded/invalidated, never destructively
+   * erased) — so this method trusts its caller rather than special-casing `type = 'memory'` for a
+   * path nothing can reach.
+   *
+   * `evidence` rows are untouched, structurally: 0001's `evidence` table has no column referencing
+   * `nodes` at all (`memory_item_id` -> `memory_items` only) — a repository citation's evidence row
+   * survives this by construction, same as an entity citation (task/plan/doc/…) never had one to
+   * begin with (`recordMemory` writes those as a bare `observed_in` EDGE, which — being incident on
+   * the removed node — IS one of the edges the `DELETE FROM edges` below correctly drops).
+   */
+  private removeGraphNode(uri: string): void {
+    const node = this.ctx.storage.sql.exec<{ id: string }>(`SELECT id FROM nodes WHERE uri = ?1`, uri).toArray()[0];
+    if (!node) return;
+    this.ctx.storage.sql.exec(`DELETE FROM edges WHERE from_node_id = ?1 OR to_node_id = ?1`, node.id);
+    this.ctx.storage.sql.exec(`DELETE FROM nodes WHERE id = ?1`, node.id);
+  }
+
   /** PLNR-314: a canvas label is unreadable past ~80 chars, so this is the bound every memory
    *  node's label is held to — both here (a freshly written or re-touched node) and in
    *  memory-migration 0011's one-time backfill of nodes written before this fix, which mirrors
@@ -4115,6 +4145,13 @@ export class ProjectMemory extends DurableObject<Env> {
     for (const edge of projected.edges) {
       this.applyCoordinationEdge(edge, ev.createdAt);
     }
+    // PLNR-317: mutually exclusive with node/edges above (a delete verb sets ONLY this) — removes
+    // the node and every edge incident on it. Ordering within one event never matters here since
+    // no verb sets both, but this runs last so a future verb that DID project edges alongside a
+    // removal (none does today) could not have those edges silently survive the removal.
+    if (projected.removeNodeUri) {
+      this.removeGraphNode(projected.removeNodeUri);
+    }
   }
 
   /** PLNR-316: one edge from a coordination event's projection — see `ProjectedEdgeDescriptor`'s
@@ -4150,6 +4187,14 @@ export class ProjectMemory extends DurableObject<Env> {
       });
     }
     return { applied: events.length, cursor: this.readProjectorCursor() };
+  }
+
+  /** Test-only: rewind the projector cursor so a test can force `runProjector` to RE-CONSUME an
+   *  already-applied range — the only way to prove replay idempotency (PLNR-317's acceptance:
+   *  "replaying an already-applied delete event is a no-op") without a second production RPC. */
+  async _rewindProjectorCursorForTest(projectId: string, globalSeq: number): Promise<void> {
+    await this.assertProjectId(projectId);
+    this.ctx.storage.sql.exec(`UPDATE projector_cursor SET global_seq = ?1 WHERE id = 0`, globalSeq);
   }
 
   /** The explicit reconciliation entry point (§19/§20 — no Queues/Workflows binding exists in
