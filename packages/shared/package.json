@@ -1,7 +1,7 @@
 {
   "name": "@noriq-dev/shared",
   "private": true,
-  "version": "0.29.0",
+  "version": "0.30.0",
   "type": "module",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
