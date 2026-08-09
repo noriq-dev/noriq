@@ -76,6 +76,7 @@ interface MemRpc {
     phaseTasks: { expected: number; missing: number };
     taskDocs: { expected: number; missing: number };
     dependencies: { expected: number; missing: number };
+    runs: { expected: number; missing: number };
     totalMissing: number;
   }>;
   _allEdgesForTest(pid: string): Promise<Array<{ type: string; fromUri: string; toUri: string; provenance: string | null }>>;
@@ -353,6 +354,64 @@ describe('rebuildProjection — idempotent full-state backfill (PLNR-283)', () =
     expect(second).toEqual(first); // identical counts, re-running is a pure no-op count-wise
     expect(await memory(projectId)._countNodes(projectId)).toBe(nodesAfterFirst);
     expect(await memory(projectId)._countEdges(projectId)).toBe(edgesAfterFirst);
+  });
+
+  // PLNR-325: the case that actually matters in production — the one-time backfill IS the
+  // rebuild-from-empty case. `run.created` fired in the past and the projector cursor is long
+  // past it, so ONLY `rebuildProjection`'s own live-D1 read can give an already-existing run its
+  // node and anchor edge. Deliberately never calls runProjector first.
+  it('rebuildProjection against an EMPTY graph gives a pre-existing anchored run a node and a related_to edge to its anchor task', async () => {
+    const { token, projectId } = await newOwnedProject('pm-325-rebuild-run@example.com', 'PM325RR');
+    const task = await mcpCall(token, 'create_task', { projectId, title: 'run anchor task', tags: ['pm-325'], allowNewTags: true });
+    if (task.isError) throw new Error(`create_task failed: ${task.text}`);
+    const taskId = task.body.id as string;
+
+    const run = await room(projectId).createRun(projectId, SYSTEM_ACTOR, {
+      kind: 'build', repoRef: 'repo_a', agentTool: 'claude', anchor: { type: 'task', id: taskId },
+    } as CreateRunInput);
+
+    expect(await memory(projectId)._countEdges(projectId)).toBe(0); // confirms: genuinely empty graph, no incremental projection ran
+
+    const rebuilt = await memory(projectId).rebuildProjection(projectId);
+    expect(rebuilt.edgesWritten).toBeGreaterThan(0);
+
+    const runUri = buildEntityUri({ kind: 'run', id: run.id });
+    const taskUri = buildEntityUri({ kind: 'task', id: taskId });
+    const runNode = await memory(projectId)._nodeByUriForTest(projectId, runUri);
+    expect(runNode).toMatchObject({ type: 'run', label: 'build run' });
+    expect(await memory(projectId)._edgeProvenance(projectId, 'related_to', runUri, taskUri)).toBe('coordination:runs');
+  });
+
+  it('rebuildProjection gives an unanchored run a node and no edge', async () => {
+    const { projectId } = await newOwnedProject('pm-325-rebuild-unanchored@example.com', 'PM325RU');
+    const run = await room(projectId).createRun(projectId, SYSTEM_ACTOR, {
+      kind: 'scope', repoRef: 'repo_a', agentTool: 'claude', anchor: null,
+    } as CreateRunInput);
+
+    await memory(projectId).rebuildProjection(projectId);
+    const runUri = buildEntityUri({ kind: 'run', id: run.id });
+    const runNode = await memory(projectId)._nodeByUriForTest(projectId, runUri);
+    expect(runNode).toMatchObject({ type: 'run', label: 'scope run' });
+    const edges = await memory(projectId)._allEdgesForTest(projectId);
+    expect(edges.some((e) => e.fromUri === runUri || e.toUri === runUri)).toBe(false);
+  });
+
+  it('rebuildProjection does not fabricate an edge for a run whose anchor task no longer resolves', async () => {
+    const { token, projectId } = await newOwnedProject('pm-325-rebuild-dangling@example.com', 'PM325RD');
+    const task = await mcpCall(token, 'create_task', { projectId, title: 'anchor to be deleted', tags: ['pm-325'], allowNewTags: true });
+    if (task.isError) throw new Error(`create_task failed: ${task.text}`);
+    const taskId = task.body.id as string;
+    const run = await room(projectId).createRun(projectId, SYSTEM_ACTOR, {
+      kind: 'build', repoRef: 'repo_a', agentTool: 'claude', anchor: { type: 'task', id: taskId },
+    } as CreateRunInput);
+    await room(projectId).deleteTask(projectId, SYSTEM_ACTOR, taskId); // anchor_id is now a dangling soft ref
+
+    await memory(projectId).rebuildProjection(projectId);
+    const runUri = buildEntityUri({ kind: 'run', id: run.id });
+    const runNode = await memory(projectId)._nodeByUriForTest(projectId, runUri);
+    expect(runNode).toMatchObject({ type: 'run', label: 'build run' }); // the run itself is still real
+    const edges = await memory(projectId)._allEdgesForTest(projectId);
+    expect(edges.some((e) => e.fromUri === runUri)).toBe(false); // but no edge to a node that should not exist
   });
 
   it('a project with no repository index and no episodes still produces a connected graph from memories, tasks, plans and docs alone', async () => {
@@ -1233,11 +1292,14 @@ describe('deleting a coordination entity removes its node and every edge inciden
 // PLNR-320: the centrepiece. Prior tasks proved convergence one relationship kind at a time
 // (dependency.added/removed, phase_tasks, task_docs each got their own "rebuild adds nothing
 // new" assertion). This proves it for the WHOLE graph at once, mutated through every kind
-// simultaneously — including a run edge, which `rebuildProjection` cannot itself draw (documented
-// gap on that method) — and asserts the edge set is BYTE-IDENTICAL, not just equal in count. A
-// count-only check could not catch "rebuild deleted edge X and added a different edge Y" or "the
-// same triples survived but a provenance string got overwritten" — `_allEdgesForTest` captures
-// (type, fromUri, toUri, provenance) for every edge so `toEqual` catches both.
+// simultaneously — including a run edge, which `rebuildProjection` can now ALSO draw itself
+// (PLNR-325 gave it run coverage) — and asserts the edge set is BYTE-IDENTICAL, not just equal in
+// count. A count-only check could not catch "rebuild deleted edge X and added a different edge Y"
+// or "the same triples survived but a provenance string got overwritten" — `_allEdgesForTest`
+// captures (type, fromUri, toUri, provenance) for every edge so `toEqual` catches both. Since the
+// incremental projector runs FIRST here (below), the run edge's provenance stays
+// `event:run.created` — `rebuildProjection`'s own attempt at the identical triple is a no-op
+// (`ON CONFLICT DO NOTHING`), same ordering guarantee `backfillProjectionOnce` documents.
 describe('PLNR-320: rebuildProjection converges — a rebuild after full incremental projection changes nothing', () => {
   it('claim, dependency, phase-task, task-doc and run edges all survive a rebuild byte-identical', async () => {
     const { token, projectId } = await newOwnedProject('pm-320-converge@example.com', 'PM320CV');
@@ -1262,10 +1324,10 @@ describe('PLNR-320: rebuildProjection converges — a rebuild after full increme
     const claim = await mcpCall(token, 'claim_task', { projectId, taskId: blockerId });
     if (claim.isError) throw new Error(`claim_task failed: ${claim.text}`);
 
-    // A run edge — deliberately included: rebuildProjection does NOT project run nodes/edges at
-    // all (its own documented gap), so this also proves a rebuild never DROPS an edge outside its
-    // own coverage, not merely that it reproduces the ones inside it.
-    await room(projectId).createRun(projectId, SYSTEM_ACTOR, {
+    // A run edge — rebuildProjection now covers run edges too (PLNR-325), so this proves
+    // convergence holds for them exactly like every other kind: the incremental path draws it
+    // first, and the rebuild's own attempt at the same triple changes nothing.
+    const run = await room(projectId).createRun(projectId, SYSTEM_ACTOR, {
       kind: 'build', repoRef: 'repo_a', agentTool: 'claude', anchor: { type: 'task', id: taskId },
     } as CreateRunInput);
 
@@ -1281,6 +1343,12 @@ describe('PLNR-320: rebuildProjection converges — a rebuild after full increme
 
     const after = await memory(projectId)._allEdgesForTest(projectId);
     expect(after).toEqual(before); // THE assertion — byte-identical, not just same length
+
+    // The run edge's provenance in particular stays event:run.created — the incremental path got
+    // there first, so rebuildProjection's own 'coordination:runs' attempt never wins the race.
+    const runUri = buildEntityUri({ kind: 'run', id: run.id });
+    const taskUri = buildEntityUri({ kind: 'task', id: taskId });
+    expect(await memory(projectId)._edgeProvenance(projectId, 'related_to', runUri, taskUri)).toBe('event:run.created');
   });
 });
 
@@ -1365,6 +1433,7 @@ describe('PLNR-320: projection drift is reported, never auto-repaired', () => {
       phaseTasks: { expected: 1, missing: 0 },
       taskDocs: { expected: 1, missing: 0 },
       dependencies: { expected: 1, missing: 0 },
+      runs: { expected: 0, missing: 0 },
       totalMissing: 0,
     });
   });
@@ -1426,5 +1495,38 @@ describe('PLNR-320: projection drift is reported, never auto-repaired', () => {
     const drift = await memory(a.projectId).projectionDrift(a.projectId);
     expect(drift.dependencies).toEqual({ expected: 0, missing: 0 });
     expect(drift.totalMissing).toBe(0);
+  });
+
+  // PLNR-325: rebuildProjection now covers run edges, so projectionDrift can usefully report on
+  // them too — an anchored run the projector hasn't drawn yet reads as missing, and an unanchored
+  // run (or one whose anchor no longer resolves) is correctly never expected to have one.
+  it('an anchored run the projector has not yet drawn reads as missing; an unanchored run and a dangling anchor are never expected', async () => {
+    const { token, projectId } = await newOwnedProject('pm-325-drift-runs@example.com', 'PM325DR');
+    const task = await mcpCall(token, 'create_task', { projectId, title: 'drift run anchor', tags: ['pm-325'], allowNewTags: true });
+    if (task.isError) throw new Error(`create_task failed: ${task.text}`);
+    const taskId = task.body.id as string;
+    const doomed = await mcpCall(token, 'create_task', { projectId, title: 'drift dangling anchor', tags: ['pm-325'], allowNewTags: true });
+    if (doomed.isError) throw new Error(`create_task failed: ${doomed.text}`);
+    const doomedId = doomed.body.id as string;
+
+    await room(projectId).createRun(projectId, SYSTEM_ACTOR, {
+      kind: 'build', repoRef: 'repo_a', agentTool: 'claude', anchor: { type: 'task', id: taskId },
+    } as CreateRunInput);
+    await room(projectId).createRun(projectId, SYSTEM_ACTOR, {
+      kind: 'scope', repoRef: 'repo_a', agentTool: 'claude', anchor: null,
+    } as CreateRunInput);
+    await room(projectId).createRun(projectId, SYSTEM_ACTOR, {
+      kind: 'build', repoRef: 'repo_a', agentTool: 'claude', anchor: { type: 'task', id: doomedId },
+    } as CreateRunInput);
+    await room(projectId).deleteTask(projectId, SYSTEM_ACTOR, doomedId);
+
+    // Never projected at all — only the anchored, still-resolving run counts.
+    const drift = await memory(projectId).projectionDrift(projectId);
+    expect(drift.runs).toEqual({ expected: 1, missing: 1 });
+    expect(drift.totalMissing).toBe(1);
+
+    await memory(projectId).runProjector(projectId);
+    const caughtUp = await memory(projectId).projectionDrift(projectId);
+    expect(caughtUp.runs).toEqual({ expected: 1, missing: 0 });
   });
 });

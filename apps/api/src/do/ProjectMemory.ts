@@ -102,13 +102,17 @@ export interface ProjectionDriftCategory {
   missing: number;
 }
 
-/** PLNR-320: `ProjectMemory.projectionDrift`'s full report — one category per relationship kind
- *  `rebuildProjection` itself covers (deliberately NOT run edges — see that method's own
- *  documented gap) plus a convenience total. Surfaced on `GET /memory/ops-status`. */
+/** PLNR-320/PLNR-325: `ProjectMemory.projectionDrift`'s full report — one category per
+ *  relationship kind `rebuildProjection` itself covers, plus a convenience total. `runs` covers
+ *  the run -> anchor `related_to` edge (PLNR-325 gave `rebuildProjection` run coverage, so drift
+ *  can now usefully point at it — an unanchored run, or one whose anchor no longer resolves,
+ *  contributes no `expected` entry, same as a cross-project dependency blocker). Surfaced on
+ *  `GET /memory/ops-status`. */
 export interface ProjectionDriftReport {
   phaseTasks: ProjectionDriftCategory;
   taskDocs: ProjectionDriftCategory;
   dependencies: ProjectionDriftCategory;
+  runs: ProjectionDriftCategory;
   totalMissing: number;
 }
 
@@ -4318,8 +4322,16 @@ export class ProjectMemory extends DurableObject<Env> {
     taskPlanLinks: { results: Array<{ taskId: string; planId: string }> };
     taskDocLinks: { results: Array<{ taskId: string; docId: string }> };
     taskDependencies: { results: Array<{ taskId: string; dependsOnId: string }> };
+    // PLNR-325: every run this project has ever created, regardless of status — nothing prunes
+    // individual `runs` rows short of `deleteProject` (checked: only that cascade touches this
+    // table), and `run.created`/`recordEpisode` project a run node unconditionally too, so a
+    // terminal/cancelled run is projected the same as a live one. `anchorType`/`anchorId` are
+    // read straight off the soft ref (migration 0018's CHECK keeps them null-together); whether
+    // the anchor still resolves is decided by the caller against the `tasks`/`plans` rows above,
+    // never here.
+    runs: { results: Array<{ id: string; kind: string; anchorType: string | null; anchorId: string | null }> };
   }> {
-    const [tasks, plans, docs, milestones, agents, taskPlanLinks, taskDocLinks, taskDependencies] = await Promise.all([
+    const [tasks, plans, docs, milestones, agents, taskPlanLinks, taskDocLinks, taskDependencies, runs] = await Promise.all([
       this.env.DB.prepare('SELECT id, title FROM tasks WHERE project_id = ?').bind(projectId).all<{ id: string; title: string }>(),
       this.env.DB.prepare('SELECT id, title FROM plans WHERE project_id = ?').bind(projectId).all<{ id: string; title: string }>(),
       this.env.DB.prepare('SELECT id, name FROM docs WHERE project_id = ?').bind(projectId).all<{ id: string; name: string }>(),
@@ -4337,8 +4349,11 @@ export class ProjectMemory extends DurableObject<Env> {
         `SELECT d.task_id AS taskId, d.depends_on_task_id AS dependsOnId FROM dependencies d
          JOIN tasks t ON t.id = d.task_id WHERE t.project_id = ?`,
       ).bind(projectId).all<{ taskId: string; dependsOnId: string }>(),
+      this.env.DB.prepare(
+        `SELECT id, kind, anchor_type AS anchorType, anchor_id AS anchorId FROM runs WHERE project_id = ?`,
+      ).bind(projectId).all<{ id: string; kind: string; anchorType: string | null; anchorId: string | null }>(),
     ]);
-    return { tasks, plans, docs, milestones, agents, taskPlanLinks, taskDocLinks, taskDependencies };
+    return { tasks, plans, docs, milestones, agents, taskPlanLinks, taskDocLinks, taskDependencies, runs };
   }
 
   /**
@@ -4355,17 +4370,21 @@ export class ProjectMemory extends DurableObject<Env> {
    * second D1 read mid-transaction, so this reads everything up front (`loadCoordinationRelationships`),
    * then writes it all in ONE transaction.
    *
-   * KNOWN GAP, left deliberately undiscussed no longer (PLNR-320): this method does not project
-   * RUN nodes or the `run.created` -> anchor edge at all — only `recordEpisode` creates run
-   * nodes, and only well after `run.created` fires. That asymmetry pre-dates this task. It does
-   * NOT break convergence in the direction PLNR-320 tests (a rebuild adds nothing new and never
-   * deletes, so a run edge the incremental path already drew simply survives a rebuild
-   * untouched — proven by this task's own convergence test, which deliberately includes a run
-   * among the mutated relationship kinds). It DOES mean "rebuild as repair tool" is incomplete
-   * for run edges specifically: if the incremental path ever failed to draw a `run.created` edge
-   * (a bug, not a documented skip like the cross-project case below), this rebuild cannot repair
-   * it, and `projectionDrift` below does not claim to measure it either — extending both to cover
-   * runs is future work, not silently assumed to already work.
+   * PLNR-325 closed the gap PLNR-320 left open here: this method now also projects a `run` node
+   * per row in this project's `runs` table, plus the `related_to` run -> anchor edge for every
+   * ANCHORED run whose anchor still resolves against the live `tasks`/`plans` rows loaded above
+   * (`anchor_id` is a soft ref, migration 0018 — a run anchored to a since-deleted task/plan gets
+   * its node and no edge, same as a genuinely unanchored run; fabricating an edge to a node that
+   * should not exist would be worse than the gap this closes). This is exactly the case that
+   * matters in production: the one-time backfill (`backfillProjectionOnce` below) IS the
+   * rebuild-from-empty case, and a `run.created` event that fired before the projector cursor
+   * ever reached it will otherwise never draw its node/edge any other way. All runs are
+   * projected regardless of `status` — nothing prunes a terminal/cancelled run's row short of
+   * `deleteProject` (checked), and neither `run.created` nor `recordEpisode` filter by status
+   * either, so matching them here keeps all three writers converging on the same shape. The
+   * label mirrors `recordEpisode`'s existing run-node convention (`"<kind> run"`); the edge's
+   * provenance follows the `coordination:<table>` grammar every other rebuild-drawn edge already
+   * uses (`coordination:runs`).
    *
    * Deliberately does NOT touch `projector_cursor` — that stays `runProjector`'s own concern.
    * Every write here is idempotent (uri for nodes, the `(type, from, to)` triple for edges), so
@@ -4375,7 +4394,7 @@ export class ProjectMemory extends DurableObject<Env> {
   async rebuildProjection(projectId: string): Promise<{ nodesWritten: number; edgesWritten: number }> {
     await this.assertProjectId(projectId);
     const now = nowIso();
-    const { tasks, plans, docs, milestones, agents, taskPlanLinks, taskDocLinks, taskDependencies } =
+    const { tasks, plans, docs, milestones, agents, taskPlanLinks, taskDocLinks, taskDependencies, runs } =
       await this.loadCoordinationRelationships(projectId);
 
     let nodesWritten = 0;
@@ -4433,6 +4452,22 @@ export class ProjectMemory extends DurableObject<Env> {
         }
       }
 
+      // PLNR-325: a `run` node per row, always — an unanchored run (or one whose anchor no
+      // longer resolves against the live `tasks`/`plans` maps above) simply gets no edge, never
+      // a fabricated one. Label matches `recordEpisode`'s existing `"<kind> run"` convention.
+      for (const r of runs.results) {
+        const runNodeId = this.upsertGraphNode('run', buildEntityUri({ kind: 'run', id: r.id }), `${r.kind} run`, now);
+        nodesWritten++;
+        const anchorNodeId =
+          r.anchorType === 'task' && r.anchorId ? taskNodeId.get(r.anchorId)
+          : r.anchorType === 'plan' && r.anchorId ? planNodeId.get(r.anchorId)
+          : undefined;
+        if (anchorNodeId) {
+          this.linkGraphEdge('related_to', runNodeId, anchorNodeId, now, 'coordination:runs');
+          edgesWritten++;
+        }
+      }
+
       // ONE summary outbox event for the whole rebuild — never one per node/edge (the same
       // discipline `recordEpisode` and `projectActiveGeneration` already establish).
       const operationId = newId('op');
@@ -4480,15 +4515,20 @@ export class ProjectMemory extends DurableObject<Env> {
    * missing. `mapCoordinationEvent`'s `dependency.added`/`.removed` arms make the identical
    * choice (CLAUDE.md).
    *
-   * Wrinkle 2 (run edges): deliberately absent from this report — `rebuildProjection` does not
-   * cover run nodes/edges (see its own doc comment), so there is no repair path this report
-   * could usefully point at for them. Reporting drift for something nothing can currently fix
-   * would be misleading, not merely incomplete.
+   * Wrinkle 2 (run edges, PLNR-325): now covered, deliberately, now that `rebuildProjection` can
+   * actually draw them — drift's whole purpose is to detect a writer falling behind what the
+   * repair tool can fix, and reporting nothing here once the repair path exists would itself be
+   * misleading. Expected run edges are filtered the same way wrinkle 3 filters cross-project
+   * dependency blockers: only ANCHORED runs whose anchor still resolves against this project's
+   * live `tasks`/`plans` rows (the `taskIds`/`planIds` sets below) are expected to have an edge —
+   * an unanchored run, or one anchored to a since-deleted task/plan, contributes nothing to
+   * `expected`, never a false "missing".
    */
   async projectionDrift(projectId: string): Promise<ProjectionDriftReport> {
     await this.assertProjectId(projectId);
-    const { tasks, taskPlanLinks, taskDocLinks, taskDependencies } = await this.loadCoordinationRelationships(projectId);
+    const { tasks, plans, taskPlanLinks, taskDocLinks, taskDependencies, runs } = await this.loadCoordinationRelationships(projectId);
     const taskIds = new Set(tasks.results.map((t) => t.id));
+    const planIds = new Set(plans.results.map((p) => p.id));
 
     const phaseTasks = this.driftCategory(
       taskPlanLinks.results.map((l) => ({
@@ -4507,7 +4547,17 @@ export class ProjectMemory extends DurableObject<Env> {
           type: 'depends_on', fromUri: buildEntityUri({ kind: 'task', id: d.taskId }), toUri: buildEntityUri({ kind: 'task', id: d.dependsOnId }),
         })),
     );
-    return { phaseTasks, taskDocs, dependencies, totalMissing: phaseTasks.missing + taskDocs.missing + dependencies.missing };
+    const runEdges = this.driftCategory(
+      runs.results
+        .filter((r) => (r.anchorType === 'task' && r.anchorId) ? taskIds.has(r.anchorId) : (r.anchorType === 'plan' && r.anchorId) ? planIds.has(r.anchorId) : false)
+        .map((r) => ({
+          type: 'related_to', fromUri: buildEntityUri({ kind: 'run', id: r.id }), toUri: buildEntityUri({ kind: r.anchorType as 'task' | 'plan', id: r.anchorId! }),
+        })),
+    );
+    return {
+      phaseTasks, taskDocs, dependencies, runs: runEdges,
+      totalMissing: phaseTasks.missing + taskDocs.missing + dependencies.missing + runEdges.missing,
+    };
   }
 
   /** One category's drift subtotal: for each expected (type, fromUri, toUri) triple, missing
