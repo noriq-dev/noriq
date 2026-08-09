@@ -3298,7 +3298,7 @@ export class ProjectMemory extends DurableObject<Env> {
    *  `verification_state` (unchanged contract) and, index-aligned, whether that SAME citation is
    *  `verifiedForBase` for `caller` — the retrieval-time answer to "is this verified for the
    *  branch/base THIS caller asked about", not just "was it ever found valid". */
-  private evidenceVerificationInfo(memoryItemId: string, caller: CallerBaseScope): { states: string[]; verifiedForCaller: boolean[] } {
+  private evidenceVerificationInfo(memoryItemId: string, caller: CallerBaseScope): { states: string[]; verifiedForCaller: Array<boolean | null> } {
     const rows = this.ctx.storage.sql
       .exec<{ verification_state: string; last_verified_base_id: string | null; last_verified_branch: string | null }>(
         `SELECT verification_state, last_verified_base_id, last_verified_branch FROM evidence WHERE memory_item_id = ?1 ORDER BY created_at`,
@@ -3307,9 +3307,9 @@ export class ProjectMemory extends DurableObject<Env> {
       .toArray();
     return {
       states: rows.map((r) => r.verification_state),
-      verifiedForCaller: rows.map((r) =>
-        verifiedForBase({ verificationState: r.verification_state, lastVerifiedBaseId: r.last_verified_base_id, lastVerifiedBranch: r.last_verified_branch }, caller),
-      ),
+      verifiedForCaller: rows.map((r) => caller.baseId == null && caller.branch == null
+        ? null
+        : verifiedForBase({ verificationState: r.verification_state, lastVerifiedBaseId: r.last_verified_base_id, lastVerifiedBranch: r.last_verified_branch }, caller)),
     };
   }
 

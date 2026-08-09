@@ -13,7 +13,7 @@
 import { env, SELF } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import type { Env } from '../src/env';
-import { createUser, mintTokenForUser, mcpCall, createRunAgent } from './helpers';
+import { createUser, mintTokenForUser, mcpCall, createRunAgent, loginSession } from './helpers';
 import { buildEntityUri } from '@noriq-dev/shared';
 import { citationVerdict, verifiedForBase, rollUpValidity, normalizeVerificationReport } from '../src/memory/verification';
 
@@ -155,7 +155,7 @@ interface RankedHit {
   authority?: number;
   validity?: string;
   evidenceVerification?: string[];
-  evidenceVerifiedForCaller?: boolean[];
+  evidenceVerifiedForCaller?: Array<boolean | null>;
   isLead: boolean;
   leadReasons: string[];
 }
@@ -232,7 +232,7 @@ async function stageAndProject(projectId: string, opts: { generationId: string; 
 
 describe('verifyMemoryCitations — the cheap server-side tier', () => {
   it('the load-bearing acceptance: valid at branch A / base X is not verified for a caller at branch B / base Y — it surfaces as a lead naming the base mismatch', async () => {
-    const { projectId } = await newOwnedProject('pm-verify-basemismatch@example.com', 'PMVBM1');
+    const { token, projectId } = await newOwnedProject('pm-verify-basemismatch@example.com', 'PMVBM1');
     const fileUri = buildEntityUri({ kind: 'file', projectKey: 'PMVBM1', repositoryKey: 'repo-a', path: 'src/a.ts' });
     await stageAndProject(projectId, {
       generationId: 'gen_bm1', repositoryKey: 'repo-a', branch: 'main', baseId: 'sha_1',
@@ -274,9 +274,27 @@ describe('verifyMemoryCitations — the cheap server-side tier', () => {
     const otherBranch = await memory(projectId).searchProjectMemory(projectId, { memoryItemId: memoryId, branch: 'feature-x', baseId: 'sha_1' });
     expect(otherBranch.results[0]!.leadReasons).toContain('evidence-base-mismatch');
 
-    // No branch/baseId supplied at all — nothing to compare against, so no mismatch penalty.
+    // No branch/baseId supplied at all — never imply exact-revision verification.
     const noScope = await memory(projectId).searchProjectMemory(projectId, { memoryItemId: memoryId });
-    expect(noScope.results[0]!.leadReasons).toEqual([]);
+    expect(noScope.results[0]!.evidenceVerifiedForCaller).toEqual([null]);
+    expect(noScope.results[0]!.leadReasons).toContain('evidence-scope-unspecified');
+
+    // The two public direct-search surfaces pass the opaque base through unchanged.
+    const mcpSame = await mcpCall(token, 'search_project_memory', {
+      projectId, memoryItemId: memoryId, branch: 'main', baseId: 'sha_1',
+    });
+    expect(mcpSame.isError).toBe(false);
+    expect((mcpSame.body.results as RankedHit[])[0]!.evidenceVerifiedForCaller).toEqual([true]);
+
+    const cookie = await loginSession('pm-verify-basemismatch@example.com', 'longenough1');
+    const restMismatch = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/memory/search`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ memoryItemId: memoryId, branch: 'main', baseId: 'sha_2' }),
+    });
+    expect(restMismatch.status).toBe(200);
+    const restBody = await restMismatch.json<{ results: RankedHit[] }>();
+    expect(restBody.results[0]!.evidenceVerifiedForCaller).toEqual([false]);
+    expect(restBody.results[0]!.leadReasons).toContain('evidence-base-mismatch');
   });
 
   it("a citation whose file no longer exists at the verified base is 'missing'; validity is demoted but the memory, its statement, its evidence, and its authority all stay fully readable", async () => {

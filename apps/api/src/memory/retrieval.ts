@@ -45,7 +45,7 @@ export interface RetrievalHit {
    *  `false` there — verified, just not for THIS caller's branch/base — which is exactly the
    *  distinction `classifyLead`'s `evidence-base-mismatch` reason exists to surface. Absent
    *  entirely for a hit with no evidence of its own (episodes, graph nodes). */
-  evidenceVerifiedForCaller?: boolean[];
+  evidenceVerifiedForCaller?: Array<boolean | null>;
   /** graph hits only — the node id expansion started from. */
   seedNodeId?: string;
   /** graph hits only — the edge chain from the seed to this node, `from>type>to` per hop,
@@ -115,7 +115,9 @@ export function classifyLead(
   // above: the citation genuinely verified successfully, just not against the base this caller
   // cares about, so it gets its own named reason rather than being folded into the generic one.
   if (item.evidenceVerification && item.evidenceVerifiedForCaller) {
+    const scopeUnspecified = item.evidenceVerification.some((v, i) => v === 'valid' && item.evidenceVerifiedForCaller![i] === null);
     const baseMismatch = item.evidenceVerification.some((v, i) => v === 'valid' && item.evidenceVerifiedForCaller![i] === false);
+    if (scopeUnspecified) reasons.push('evidence-scope-unspecified');
     if (baseMismatch) reasons.push('evidence-base-mismatch');
   }
   return { isLead: reasons.length > 0, leadReasons: reasons };

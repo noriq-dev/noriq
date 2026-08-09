@@ -192,6 +192,8 @@ describe('search_project_memory — registration and MCP floor gating', () => {
     expect(tool!.description).toContain('isLead');
     expect(tool!.description.toLowerCase()).toContain('lead');
     expect(tool!.description).toContain('taskId');
+    expect(tool!.description).toContain('baseId');
+    expect((tool as unknown as { inputSchema: { properties: Record<string, unknown> } }).inputSchema.properties).toHaveProperty('baseId');
   });
 
   it('is absent from tools/list for a floor that omits it, present and callable for one that includes it', async () => {
