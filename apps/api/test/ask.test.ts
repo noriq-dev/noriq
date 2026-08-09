@@ -5,7 +5,7 @@ import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import { createAgent, createUser, loginSession, mcpCall } from './helpers';
 import {
-  answerQuestion, askEventStream, buildMessages, extractGeneratedText, extractReasoningSummaryDelta, extractStreamDelta,
+  answerQuestion, askEventStream, buildMessages, extractFinishState, extractGeneratedText, extractReasoningSummaryDelta, extractStreamDelta,
   generationClient, normalizeHistory, type ChatMessage, type GenerationClient, type PreparedAsk,
 } from '../src/ask';
 import type { SearchHit } from '../src/search';
@@ -45,8 +45,18 @@ describe('buildMessages (unit)', () => {
     ]);
     expect(msgs[1]).toEqual({ role: 'user', content: 'earlier question' });
     expect(msgs[2]).toEqual({ role: 'assistant', content: 'earlier answer' });
-    expect(msgs[3]!.content).toContain('[1] ASK / TASK ASK-1 (retry work, todo)');
+    expect(msgs[3]!.content).toContain('SOURCE_REF: ASK / ASK-1');
+    expect(msgs[3]!.content).toContain('ASK / TASK ASK-1 (retry work, todo)');
     expect(msgs[3]!.content).toContain('the fuller body text');
+  });
+
+  it('labels completed task bodies as historical and requires exact stable source references', () => {
+    const hit: SearchHit = { kind: 'task', id: 't9', projectId: 'p', key: 'ASK-9', title: 'fixed incident', snippet: '', score: 1, status: 'done' };
+    const msgs = buildMessages('is this still broken?', projects, [{ hit, text: '[HISTORICAL TASK BODY]\nThe route was missing.' }]);
+    expect(msgs[0]!.content).toMatch(/done or cancelled task body is historical/i);
+    expect(msgs[0]!.content).toContain('exact SOURCE_REF');
+    expect(msgs.at(-1)!.content).toContain('SOURCE_REF: ASK / ASK-9');
+    expect(msgs.at(-1)!.content).toContain('HISTORICAL');
   });
 
   it('drops client-supplied system messages and bounds retained history', () => {
@@ -84,6 +94,13 @@ describe('Workers AI response adapters', () => {
     expect(extractReasoningSummaryDelta({ type: 'response.reasoning_text.delta', delta: 'private chain' })).toBe('');
   });
 
+  it('normalizes token-limit and ordinary finish metadata', () => {
+    expect(extractFinishState({ choices: [{ finish_reason: 'length' }] })).toEqual({ finishReason: 'length', truncated: true });
+    expect(extractFinishState({ type: 'response.completed', response: { status: 'completed' } })).toEqual({ finishReason: 'stop', truncated: false });
+    expect(extractFinishState({ type: 'response.incomplete', response: { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } } }))
+      .toEqual({ finishReason: 'max_output_tokens', truncated: true });
+  });
+
   it('turns upstream SSE into stable meta/status/delta/done events', async () => {
     const upstream = [
       'data: {"type":"response.reasoning_text.delta","delta":"private"}\n\n',
@@ -105,7 +122,7 @@ describe('Workers AI response adapters', () => {
     const prepared: PreparedAsk = {
       messages: [{ role: 'user', content: 'q' }], sources: [], mode: 'semantic', model: '@cf/openai/gpt-oss-120b', graphEnhanced: false,
     };
-    let completed: { answer: string; reasoning: string } | undefined;
+    let completed: { answer: string; reasoning: string; finishReason: string | null; truncated: boolean } | undefined;
     const output = await new Response(askEventStream(gen, prepared, {
       thread: { id: 'chat_1', title: 'Chat one' },
       onComplete: async (result) => { completed = result; },
@@ -120,7 +137,20 @@ describe('Workers AI response adapters', () => {
     expect(output).toContain('"text":"world"');
     expect(output).not.toContain('private');
     expect(output).toContain('event: done');
-    expect(completed).toEqual({ answer: 'Hello world', reasoning: 'Checked the evidence.' });
+    expect(completed).toEqual({ answer: 'Hello world', reasoning: 'Checked the evidence.', finishReason: null, truncated: false });
+  });
+
+  it('exposes a token-limited upstream completion instead of reporting an ordinary done', async () => {
+    const gen = { async stream() { return new Response([
+      'data: {"type":"response.output_text.delta","delta":"Partial answer"}\n\n',
+      'data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}\n\n',
+      'data: [DONE]\n\n',
+    ].join('')).body!; } };
+    const prepared: PreparedAsk = { messages: [{ role: 'user', content: 'q' }], sources: [], mode: 'semantic', model: 'm', graphEnhanced: false };
+    const output = await new Response(askEventStream(gen, prepared)).text();
+    expect(output).toContain('event: done');
+    expect(output).toContain('"finishReason":"max_output_tokens"');
+    expect(output).toContain('"truncated":true');
   });
 
   it('reports an error rather than completing with a blank answer', async () => {

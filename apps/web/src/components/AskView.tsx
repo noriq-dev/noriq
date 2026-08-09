@@ -150,6 +150,7 @@ export function AskView({ store }: { store: AppStore }) {
     const activeThreadId = threadId;
     let streamedThreadId: string | null = null;
     const controller = new AbortController();
+    let completion = { finishReason: null as string | null, truncated: false };
     abortRef.current = controller;
     setMessages((current) => [
       ...current,
@@ -201,10 +202,11 @@ export function AskView({ store }: { store: AppStore }) {
           index === current.length - 1 && message.role === 'assistant'
             ? { ...message, content: message.content + delta }
             : message)),
+        onDone: (result) => { completion = result; },
       }, controller.signal);
       setMessages((current) => current.map((message, index) =>
         index === current.length - 1 && message.role === 'assistant'
-          ? { ...message, trace: [...(message.trace ?? []), 'Response complete.'] }
+          ? { ...message, trace: [...(message.trace ?? []), completion.truncated ? `Response truncated (${completion.finishReason ?? 'token limit'}).` : 'Response complete.'] }
           : message));
       await refreshThreadLists(false);
     } catch (e) {
@@ -414,6 +416,8 @@ export function AskView({ store }: { store: AppStore }) {
                                     <MonoTag color={KIND_COLOR[source.kind]} bg="var(--w-04)" size={8}>{source.kind.toUpperCase()}</MonoTag>
                                     <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>{source.projectKey}</span>
                                     {source.key && <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>{source.key}</span>}
+                                    {source.historical && <MonoTag color="var(--text-faint)" bg="var(--w-04)" size={8}>HISTORICAL</MonoTag>}
+                                    {source.isLead && <MonoTag color="var(--amber)" bg="var(--w-04)" size={8}>LEAD</MonoTag>}
                                     <span style={{ fontSize: 11.5, maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{source.title}</span>
                                     {(source.retrieval === 'graph' || source.retrieval === 'hybrid') && <span style={{ color: 'var(--accent)', fontSize: 9 }}>◇</span>}
                                   </button>

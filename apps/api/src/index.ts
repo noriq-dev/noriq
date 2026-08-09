@@ -1828,17 +1828,16 @@ app.post('/api/ask/stream', userAuth, async (c) => {
     const trace = [
       `Selected ${prepared.sources.length} ${retrieval} source${prepared.sources.length === 1 ? '' : 's'} across ${projectCount} project${projectCount === 1 ? '' : 's'}.`,
       'Generated a grounded response.',
-      'Response complete.',
     ];
     return new Response(askEventStream(gen, prepared, {
       thread: { id: thread.id, title: thread.title },
-      onComplete: async ({ answer, reasoning }) => {
+      onComplete: async ({ answer, reasoning, finishReason, truncated }) => {
         await appendAskMessage(c.env.DB, userId, thread.id, {
           role: 'assistant',
           content: answer,
           sources: prepared.sources,
           reasoning,
-          trace,
+          trace: [...trace, truncated ? `Response truncated (${finishReason ?? 'token limit'}).` : 'Response complete.'],
           mode: prepared.mode,
           model: prepared.model,
         });

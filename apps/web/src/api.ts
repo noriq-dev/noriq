@@ -32,6 +32,7 @@ export interface ApiAskStreamHandlers {
   onStatus?: (phase: 'generating') => void;
   onReasoning?: (text: string) => void;
   onDelta: (text: string) => void;
+  onDone?: (result: { finishReason: string | null; truncated: boolean }) => void;
 }
 
 async function askStream(
@@ -74,7 +75,13 @@ async function askStream(
     else if (event === 'reasoning' && typeof payload.text === 'string') handlers.onReasoning?.(payload.text);
     else if (event === 'delta' && typeof payload.text === 'string') handlers.onDelta(payload.text);
     else if (event === 'error') throw new Error(typeof payload.error === 'string' ? payload.error : 'Answer generation failed');
-    else if (event === 'done') doneEvent = true;
+    else if (event === 'done') {
+      doneEvent = true;
+      handlers.onDone?.({
+        finishReason: typeof payload.finishReason === 'string' ? payload.finishReason : null,
+        truncated: payload.truncated === true,
+      });
+    }
   };
 
   try {
@@ -811,6 +818,11 @@ export interface ApiAskSource {
   projectName: string;
   authority?: number;
   validity?: string;
+  isLead?: boolean;
+  leadReasons?: string[];
+  historical?: boolean;
+  graphPath?: string;
+  evidenceVerifiedForCaller?: Array<boolean | null>;
   retrieval: 'semantic' | 'keyword' | 'graph' | 'hybrid';
 }
 

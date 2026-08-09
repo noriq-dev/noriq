@@ -211,7 +211,7 @@ describe('Ask SSE transport', () => {
     const wire = [
       'event: thread\ndata: {"id":"chat_1","title":"Question"}\n\nevent: meta\ndata: {"sources":[],"mode":"semantic","model":"m","graphEnhanced":true}\n\nevent: status\nda',
       'ta: {"phase":"generating"}\n\nevent: reasoning\ndata: {"text":"Summary"}\n\nevent: delta\ndata: {"text":"Hello "}\n\nevent: del',
-      'ta\ndata: {"text":"world"}\n\nevent: done\ndata: {}\n\n',
+      'ta\ndata: {"text":"world"}\n\nevent: done\ndata: {"finishReason":"stop","truncated":false}\n\n',
     ];
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new ReadableStream<Uint8Array>({
       start(controller) {
@@ -227,8 +227,9 @@ describe('Ask SSE transport', () => {
       onStatus: (phase) => seen.push(`status:${phase}`),
       onReasoning: (text) => seen.push(`reasoning:${text}`),
       onDelta: (text) => seen.push(`delta:${text}`),
+      onDone: (result) => seen.push(`done:${result.finishReason}:${result.truncated}`),
     });
 
-    expect(seen).toEqual(['thread:chat_1', 'meta:m:true', 'status:generating', 'reasoning:Summary', 'delta:Hello ', 'delta:world']);
+    expect(seen).toEqual(['thread:chat_1', 'meta:m:true', 'status:generating', 'reasoning:Summary', 'delta:Hello ', 'delta:world', 'done:stop:false']);
   });
 });
