@@ -2097,10 +2097,10 @@ export class ProjectRoom extends DurableObject<Env> {
       if (!comment) throw new Error('comment not found');
       const task = await this.getTask(comment.taskId); // also proves the comment belongs here
       if (comment.status === 'acknowledged') {
-        return { ok: true, alreadyAcknowledged: true, taskId: task.id, taskKey: task.key };
+        return { ok: true, alreadyAcknowledged: true, taskId: task.id, taskKey: task.key, nextAction: 'continue the work; resolve_comment only when substantively addressed' };
       }
       if (comment.status === 'addressed' || comment.status === 'wont_do') {
-        return { ok: true, alreadyResolved: true, taskId: task.id, taskKey: task.key };
+        return { ok: true, alreadyResolved: true, taskId: task.id, taskKey: task.key, nextAction: 'continue the task work loop' };
       }
       const { meta } = await this.env.DB.prepare(
         "UPDATE comments SET status = 'acknowledged' WHERE id = ? AND status = 'open'",
@@ -2108,7 +2108,7 @@ export class ProjectRoom extends DurableObject<Env> {
       if (meta.changes > 0) {
         await this.emit(actor, 'comment.acknowledged', 'comment', commentId, { taskKey: task.key, taskId: task.id });
       }
-      return { ok: true, acknowledged: meta.changes === 1, taskId: task.id, taskKey: task.key };
+      return { ok: true, acknowledged: meta.changes === 1, taskId: task.id, taskKey: task.key, nextAction: 'continue the work; resolve_comment only when substantively addressed' };
     
     });
   }

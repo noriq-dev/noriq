@@ -100,7 +100,13 @@ const attachmentUri = (id: string) => `noriq://attachment/${id}`;
 const docUri = (id: string) => `noriq://doc/${id}`;
 
 /** Tool metadata captured at registration, used to generate the reference doc (PLNR-23). */
-export type ToolSpec = { name: string; description: string; inputSchema: z.ZodRawShape; minimumProjectAction: ProjectAction | 'account' };
+export type ToolSpec = {
+  name: string;
+  description: string;
+  inputSchema: z.ZodRawShape;
+  minimumProjectAction: ProjectAction | 'account';
+  annotations: ToolHints;
+};
 export type ResourceSpec = { name: string; uriTemplate: string; description: string; minimumProjectAction: 'view' };
 
 /**
@@ -318,28 +324,54 @@ type ToolHints = { readOnlyHint?: boolean; destructiveHint?: boolean; idempotent
 const READ: ToolHints = { readOnlyHint: true, openWorldHint: false };
 const WRITE: ToolHints = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
 const WRITE_IDEMPOTENT: ToolHints = { ...WRITE, idempotentHint: true };
-const TOOL_HINTS: Record<string, ToolHints> = {
-  // reads
-  get_briefing: READ, my_updates: READ, focus_project: READ, list_projects: READ, get_project: READ, list_groups: READ, list_agents: READ,
-  get_task: READ, search_tasks: READ, semantic_search: READ, search_project_memory: READ, explain_project_area: READ, get_task_context: READ, tag_report: READ, next_claimable: READ, read_open_comments: READ, get_plans: READ, can_claim: READ,
-  list_docs: READ, get_doc: READ, update_doc: WRITE_IDEMPOTENT, list_templates: READ, get_plan_doc: READ, update_plan_doc: WRITE_IDEMPOTENT,
-  check_locks: READ, list_locks: READ,
-  // writes that are safe to repeat with the same args (renew/replace-in-place/insert-or-ignore)
-  heartbeat: WRITE_IDEMPOTENT, set_agent_identity: WRITE_IDEMPOTENT, acknowledge_comment: WRITE_IDEMPOTENT, update_task: WRITE_IDEMPOTENT, update_tasks: WRITE_IDEMPOTENT,
-  update_plan: WRITE_IDEMPOTENT, add_dependency: WRITE_IDEMPOTENT, remove_dependency: WRITE_IDEMPOTENT, attach_ref: WRITE_IDEMPOTENT,
-  set_project_group: WRITE_IDEMPOTENT, reindex_search: WRITE_IDEMPOTENT,
+const WRITE_DESTRUCTIVE: ToolHints = { ...WRITE, destructiveHint: true };
+
+/**
+ * Explicit policy for EVERY MCP tool. The old sparse map silently assigned WRITE to a newly
+ * registered tool, which meant an omitted entry could mis-advertise a read as a write (or a
+ * destructive maintenance operation as benign) until somebody happened to inspect tools/list.
+ * mcp-tool-audit.test.ts compares this inventory with the real registered catalogue.
+ */
+export const MCP_TOOL_POLICIES: Record<string, ToolHints> = {
+  get_briefing: READ, my_updates: READ, list_projects: READ, list_agents: READ, list_groups: READ,
+  list_templates: READ, list_docs: READ, get_doc: READ, get_project: READ, get_task: READ,
+  search_tasks: READ, semantic_search: READ, tag_report: READ, can_claim: READ,
+  next_claimable: READ, check_locks: READ, list_locks: READ, read_open_comments: READ,
+  get_plans: READ, get_plan_doc: READ, search_project_memory: READ, explain_project_area: READ,
+  get_task_context: READ,
+
+  focus_project: WRITE_IDEMPOTENT, set_agent_identity: WRITE_IDEMPOTENT,
+  set_project_group: WRITE_IDEMPOTENT, update_doc: WRITE_IDEMPOTENT,
+  update_task: WRITE_IDEMPOTENT, update_tasks: WRITE_IDEMPOTENT,
+  reindex_search: WRITE_IDEMPOTENT, add_dependency: WRITE_IDEMPOTENT,
+  remove_dependency: WRITE_IDEMPOTENT, heartbeat: WRITE_IDEMPOTENT,
   acquire_lock: WRITE_IDEMPOTENT, release_lock: WRITE_IDEMPOTENT,
-  // everything else → WRITE (additive, non-idempotent, non-destructive, closed-world)
+  acknowledge_comment: WRITE_IDEMPOTENT, resolve_comment: WRITE_IDEMPOTENT,
+  update_plan: WRITE_IDEMPOTENT, update_plan_doc: WRITE_IDEMPOTENT,
+  attach_ref: WRITE_IDEMPOTENT,
+
+  create_project: WRITE, save_template: WRITE, create_plan_from_template: WRITE,
+  create_doc: WRITE, create_task: WRITE, create_tasks: WRITE, decompose_task: WRITE,
+  handoff_task: WRITE, add_attachment: WRITE, create_attachment_upload: WRITE,
+  claim_task: WRITE, release_task: WRITE, add_comment: WRITE, post_comment: WRITE,
+  send_message: WRITE, request_input: WRITE, raise_alert: WRITE, spin_off_task: WRITE,
+  create_plan: WRITE, create_plan_doc: WRITE, create_milestone: WRITE, record_memory: WRITE,
+
+  // Both operations discard relationships or vocabulary that cannot be reconstructed from the
+  // result alone. Their descriptions explain the exact loss, so clients can confirm appropriately.
+  move_task: WRITE_DESTRUCTIVE,
+  merge_tags: WRITE_DESTRUCTIVE,
 };
 
-const MCP_MANAGER_TOOLS = new Set(['set_project_group', 'reindex_search']);
+const MCP_VIEW_TOOLS = new Set(['focus_project']);
+const MCP_MANAGER_TOOLS = new Set(['set_project_group', 'reindex_search', 'merge_tags']);
 
 const minimumMcpAction = (
   name: string,
   hints: ToolHints,
   inputSchema: z.ZodRawShape,
 ): ProjectAction | 'account' => {
-  if (hints.readOnlyHint === true) return 'view';
+  if (hints.readOnlyHint === true || MCP_VIEW_TOOLS.has(name)) return 'view';
   if (MCP_MANAGER_TOOLS.has(name)) return 'manage';
   // Tools without projectId (templates, identity, project creation) are still account writes;
   // the read-only ceiling applies even though no project role can be resolved.
@@ -448,9 +480,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     if (floor && !floor.has(name)) return;
     // Capture the spec at definition time so the reference doc is generated from the
     // exact same zod schemas the tools validate against — it can't drift (PLNR-23).
-    const annotations = TOOL_HINTS[name] ?? WRITE; // PLNR-88: proper read/write/destructive hints
+    const annotations = MCP_TOOL_POLICIES[name];
+    if (!annotations) throw new Error(`MCP tool ${name} has no explicit policy`);
     const minimumAction = minimumMcpAction(name, annotations, inputSchema);
-    toolSpecs.push({ name, description, inputSchema, minimumProjectAction: minimumAction });
+    toolSpecs.push({ name, description, inputSchema, minimumProjectAction: minimumAction, annotations });
     // Write-freeze (PLNR-166): during maintenance a write tool must not appear to succeed —
     // return a retryable isError result naming the reason so the agent parks and retries,
     // rather than believing a phantom ack. Reads (readOnlyHint) stay live. The gate wraps the
@@ -624,7 +657,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'list_projects',
-    'List active projects with task counts.',
+    'List active projects visible to this Copilot, including their open task counts.',
     {},
     tool(async () => {
       const { results } = await env.DB.prepare(
@@ -1438,8 +1471,12 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     tool(async ({ projectId, taskId, toProjectId }) => {
       // The per-call guard covers projectId; the TARGET needs the same two checks or a
       // narrow token could exfiltrate a task into (or plant one in) a project it can't reach.
-      if (!(await userCanAccessProject(env, agent.userId, toProjectId))) {
+      const targetAccess = await resolveProjectAccess(env.DB, agent.userId, toProjectId);
+      if (!targetAccess.exists || !projectRoleAllows(targetAccess.role, 'view')) {
         throw new Error(`project ${toProjectId} not found`);
+      }
+      if (!projectRoleAllows(targetAccess.role, 'contribute')) {
+        throw new Error('target project contributor role required to move a task into it');
       }
       if (opts.oauthTokenId && !(await tokenCanReachProject(env, opts.oauthTokenId, toProjectId))) {
         throw new Error(`project ${toProjectId} is outside this connection's authorized projects`);
@@ -1746,7 +1783,11 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       // return type resolves too broadly for TS to see it as spreadable object shape; it is a
       // plain object at runtime (ProjectRoom.claimTask's own literal return).
       const priorEffort = taskRow ? await loadPriorEffort(env, projectId, taskRow) : null;
-      return priorEffort?.warnings.length ? { ...(result as Record<string, unknown>), priorEffort } : result;
+      const claimed = {
+        ...(result as Record<string, unknown>),
+        nextAction: 'call get_task_context before non-trivial work, then acknowledge any open human comments before editing',
+      };
+      return priorEffort?.warnings.length ? { ...claimed, priorEffort } : claimed;
     }),
   );
 
@@ -1869,7 +1910,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'read_open_comments',
-    'Unresolved comments/questions on a task. Humans steer you here — treat instructions as scope changes and questions as blocking asks.',
+    'Unresolved comments/questions on a task. Humans steer you here: acknowledge each new item promptly with acknowledge_comment; an instruction may change scope and require re-planning, while a question needs a substantive answer. Open and acknowledged comments block task completion, but they do not automatically require you to stop independent work.',
     { taskId: z.string() },
     tool(async ({ taskId }) => {
       // Authorize (PLNR-95): resolve the task (id or key) and require the agent's
@@ -1898,7 +1939,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'post_comment',
-    'Post a comment or a question on a task. kind:"question" asks a human (stays open until resolved); kind:"comment" is your own note (non-blocking); kind:"reply" answers a thread. For a plain note, add_comment is simpler.',
+    'Post a comment or reply on a task. kind:"comment" is your own non-blocking note; kind:"reply" answers a thread. kind:"question" is the legacy open-comment path — do NOT use it for a new human decision you need; request_input is the Noriq gate with typed answers, notifications, and correct park/continue behavior. For a plain note, add_comment is simpler.',
     {
       projectId: z.string(),
       taskId: z.string().describe('Task id or display key'),
@@ -1922,7 +1963,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'resolve_comment',
-    'Resolve an open comment on your task: addressed (you did/answered it) or wont_do (explain why). Always include a reply — the human is waiting.',
+    'Resolve a human comment only AFTER you acted on it: addressed (you did/answered it) or wont_do (explain why). Acknowledge it first with acknowledge_comment when it arrives; acknowledgement is the receipt, resolution is the completed outcome. Always include a substantive reply — the human is waiting.',
     {
       projectId: z.string(),
       commentId: z.string(),
@@ -1977,7 +2018,13 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     },
     tool(async ({ projectId, taskId, title, body, options, questions, followUpTo, blocking }) => {
       const refTaskId = taskId ? await resolveTaskId(env, projectId, taskId) : null;
-      return room(env, projectId).raiseSignal(projectId, actor, { type: 'input_request', taskId: refTaskId, title, body, options, questions, followUpTo: followUpTo ?? null, blocking });
+      const result = await room(env, projectId).raiseSignal(projectId, actor, { type: 'input_request', taskId: refTaskId, title, body, options, questions, followUpTo: followUpTo ?? null, blocking });
+      return {
+        ...result,
+        nextAction: blocking === false
+          ? 'continue the current task; check notices or my_updates for the answer'
+          : 'do not wait in chat; call next_claimable now and work something else until the answer requeues this task',
+      };
     }),
   );
 

@@ -23,12 +23,17 @@ describe('MCP tool reference', () => {
     const res = await SELF.fetch('https://noriq.test/reference.json');
     expect(res.status).toBe(200);
     const doc = (await res.json()) as {
-      tools: Array<{ name: string; minimumProjectAction: string; inputSchema: any }>;
+      serverInfo: { name: string; version: string };
+      catalog: { valid: boolean; toolCount: number; findings: unknown[] };
+      tools: Array<{ name: string; minimumProjectAction: string; annotations: Record<string, unknown>; inputSchema: any }>;
       resources: Array<{ minimumProjectAction: string }>;
     };
+    expect(doc.serverInfo.name).toBe('noriq');
+    expect(doc.catalog).toMatchObject({ valid: true, toolCount: 64, findings: [] });
     const claim = doc.tools.find((t) => t.name === 'claim_task');
     expect(claim).toBeTruthy();
     expect(claim!.minimumProjectAction).toBe('contribute');
+    expect(claim!.annotations.openWorldHint).toBe(false);
     expect(claim!.inputSchema.properties.taskId.type).toBe('string');
     expect(doc.resources.length).toBeGreaterThanOrEqual(1);
     expect(doc.resources.every((r) => r.minimumProjectAction === 'view')).toBe(true);

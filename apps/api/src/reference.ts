@@ -2,7 +2,8 @@
 // tools validate against — so it cannot drift from the implementation. Served at
 // /reference.md (and /reference.json) alongside /skill.md.
 import { z } from 'zod';
-import { mcpReferenceSpecs } from './mcp';
+import { mcpReferenceSpecs, SERVER_INFO } from './mcp';
+import { auditMcpCatalog } from './mcp-tool-audit';
 
 // zod v4 ships JSON-Schema generation natively (z.toJSONSchema), so the external
 // zod-to-json-schema dep is gone. `io: 'input'` mirrors the old behavior — the
@@ -101,11 +102,15 @@ export function renderMcpReference(baseUrl: string): string {
 /** Machine-readable variant: names, descriptions, and JSON Schema per tool. */
 export function mcpReferenceJson(): unknown {
   const { tools, resources } = mcpReferenceSpecs();
+  const audit = auditMcpCatalog({ tools, resources });
   return {
+    serverInfo: SERVER_INFO,
+    catalog: audit,
     tools: tools.map((t) => ({
       name: t.name,
       description: t.description,
       minimumProjectAction: t.minimumProjectAction,
+      annotations: t.annotations,
       inputSchema: toJsonSchema(z.object(t.inputSchema)),
     })),
     resources,
