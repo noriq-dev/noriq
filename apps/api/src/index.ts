@@ -1135,6 +1135,44 @@ app.get('/api/projects/:pid/memory/repositories', userAuth, async (c) => {
   return c.json({ repositories: withCheckouts });
 });
 
+const RegisterRepositoryBody = z.object({
+  repositoryKey: z.string().min(1),
+  defaultBranch: z.string().nullable().optional(),
+  vcsKind: z.string().nullable().optional(),
+});
+
+// PLNR-311: registration is a HUMAN action — this route lives under /api/projects/:pid/* (userAuth
+// + requireProjectAccess, line ~147), which a Bearer-authenticated runner/agent connection can
+// never present a session cookie for, so no runner- or agent-authenticated path can reach this
+// route (§4/§6 locked decision: humans declare identity, daemons only associate against it — see
+// this task's executionSpec). The write goes through ProjectRoom.registerRepository — the sole D1
+// writer for this table (CLAUDE.md) — never a Worker-side INSERT. `RepositoryKey`'s own validation
+// (including the ckt_-prefixed-checkout-id rejection) already lives in the DO method; this route
+// does not re-validate the key shape, it only relays the DO's own message on failure. The DO
+// throws on an EXACT duplicate key (memory-registry.test.ts pins that as its own contract) — this
+// route absorbs that specific conflict into an idempotent 200 by re-resolving the existing row
+// (`created: false`), rather than surfacing an error a human re-running setup does not expect;
+// any other failure (invalid key shape) still surfaces as 400 with the DO's own message.
+app.post('/api/projects/:pid/memory/repositories', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const parsed = RegisterRepositoryBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid repository registration request', detail: parsed.error.issues }, 400);
+  const { repositoryKey, defaultBranch, vcsKind } = parsed.data;
+  let created = true;
+  try {
+    await room(c.env, pid).registerRepository(pid, humanActor(c), repositoryKey, {
+      defaultBranch: defaultBranch ?? null,
+      vcsKind: vcsKind ?? null,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!/already registered/.test(message)) return c.json({ error: message }, 400);
+    created = false; // idempotent re-register: fall through to re-resolve the existing row
+  }
+  const repo = await resolveRepositoryByKey(c.env, pid, repositoryKey);
+  return c.json({ repository: repo, created }, created ? 201 : 200);
+});
+
 // PLNR-273: assembled operator status — the DO's own health() plus the compact D1 registry
 // projection (backup status, vector-dirty, size) plus which optional bindings are actually
 // configured on THIS deployment. Never a client-computed rollup (§18/locked decision): every

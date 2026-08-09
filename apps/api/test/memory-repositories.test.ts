@@ -2,11 +2,11 @@
 // memory-registry.test.ts already established for registerRepository/deleteProject with the
 // new identity fields, the checkout-association RPC, ckt_ rejection through the real write
 // path, opaque VCS/baseId round-trips, and the D1 active-generation projection.
-import { env } from 'cloudflare:test';
+import { env, SELF } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import type { Env } from '../src/env';
 import type { Actor } from '../src/do/ProjectRoom';
-import { projectRoom, createUser, mintTokenForUser, mcpCall, SYSTEM_ACTOR } from './helpers';
+import { projectRoom, createUser, mintTokenForUser, mcpCall, SYSTEM_ACTOR, loginSession, createAgent, authorizeForAllProjects } from './helpers';
 import { listProjectRepositories, resolveRepositoryByKey, listRepositoryCheckouts } from '../src/lib/project-memory';
 
 const appEnv = env as unknown as Env;
@@ -134,6 +134,123 @@ describe('checkout association (PLNR-259)', () => {
     await expect(
       room(projectId).associateCheckout(projectId, actor, { repositoryKey: 'ckt_bad', runnerId: runnerA, checkoutId: 'ckt_x' }),
     ).rejects.toThrow(/checkout id/);
+  });
+});
+
+describe('POST /api/projects/:pid/memory/repositories — HTTP registration (PLNR-311)', () => {
+  const post = (pid: string, cookie: string, body: unknown) =>
+    SELF.fetch(`https://noriq.test/api/projects/${pid}/memory/repositories`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+  const get = (pid: string, cookie: string) =>
+    SELF.fetch(`https://noriq.test/api/projects/${pid}/memory/repositories`, { headers: { Cookie: cookie } });
+  const mintCap = (token: string, body: unknown) =>
+    SELF.fetch('https://noriq.test/api/runner-ingest/capability', {
+      method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+  async function newMemberProject(email: string, key: string): Promise<{ cookie: string; pid: string }> {
+    await createUser(email, 'Member', 'longenough1').catch(() => {});
+    const cookie = await loginSession(email, 'longenough1');
+    const p = await SELF.fetch('https://noriq.test/api/projects', {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key, name: `${key} project` }),
+    });
+    const pid = ((await p.json()) as { id: string }).id;
+    return { cookie, pid };
+  }
+
+  it('a project member can register a repository over HTTP, and it appears in GET /memory/repositories', async () => {
+    const { cookie, pid } = await newMemberProject('pm311-reg@example.com', 'PM311REG');
+
+    const res = await post(pid, cookie, { repositoryKey: 'http-repo' });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { repository: { repositoryKey: string }; created: boolean };
+    expect(body.created).toBe(true);
+    expect(body.repository.repositoryKey).toBe('http-repo');
+
+    const listed = (await (await get(pid, cookie)).json()) as { repositories: Array<{ repositoryKey: string }> };
+    expect(listed.repositories.map((r) => r.repositoryKey)).toContain('http-repo');
+
+    // The payoff this task exists for: resolveRepositoryByKey (the read side every consumer —
+    // ingest capability, index-cursor, associateCheckout, record_memory citations — keys off)
+    // now resolves what only a route, not a raw D1 read, could have produced.
+    expect(await resolveRepositoryByKey(appEnv, pid, 'http-repo')).not.toBeNull();
+  });
+
+  it('registering the same key twice succeeds idempotently and produces exactly one row', async () => {
+    const { cookie, pid } = await newMemberProject('pm311-idem@example.com', 'PM311IDM');
+
+    const first = await post(pid, cookie, { repositoryKey: 'idem-http-repo' });
+    expect(first.status).toBe(201);
+    expect(((await first.json()) as { created: boolean }).created).toBe(true);
+
+    const second = await post(pid, cookie, { repositoryKey: 'idem-http-repo' });
+    expect(second.status).toBe(200);
+    expect(((await second.json()) as { created: boolean }).created).toBe(false);
+
+    const rows = await listProjectRepositories(appEnv, pid);
+    expect(rows.filter((r) => r.repositoryKey === 'idem-http-repo')).toHaveLength(1);
+  });
+
+  it('a ckt_-prefixed checkout id is rejected with a message explaining what a repository key is', async () => {
+    const { cookie, pid } = await newMemberProject('pm311-ckt@example.com', 'PM311CKT');
+
+    const res = await post(pid, cookie, { repositoryKey: 'ckt_totally_a_checkout' });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/checkout id/);
+
+    expect(await resolveRepositoryByKey(appEnv, pid, 'ckt_totally_a_checkout')).toBeNull();
+  });
+
+  it('a caller without access to the project is refused exactly as the sibling GET route refuses them', async () => {
+    const { pid } = await newMemberProject('pm311-owner@example.com', 'PM311OWN');
+    await createUser('pm311-outsider@example.com', 'Outsider', 'longenough1').catch(() => {});
+    const outsiderCookie = await loginSession('pm311-outsider@example.com', 'longenough1');
+
+    const getRes = await get(pid, outsiderCookie);
+    const postRes = await post(pid, outsiderCookie, { repositoryKey: 'should-not-land' });
+    expect(getRes.status).toBe(404);
+    expect(postRes.status).toBe(404);
+    expect(await resolveRepositoryByKey(appEnv, pid, 'should-not-land')).toBeNull();
+  });
+
+  it('no agent- or runner-authenticated (Bearer, no session cookie) path can register a repository', async () => {
+    const { pid } = await newMemberProject('pm311-bearer@example.com', 'PM311BER');
+    const { apiKey } = await createAgent('pm311-agent');
+
+    const res = await SELF.fetch(`https://noriq.test/api/projects/${pid}/memory/repositories`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repositoryKey: 'agent-should-not-register' }),
+    });
+    expect(res.status).toBe(401);
+    expect(await resolveRepositoryByKey(appEnv, pid, 'agent-should-not-register')).toBeNull();
+  });
+
+  it('registering over HTTP unblocks POST /api/runner-ingest/capability, which 404d before registration', async () => {
+    const { cookie, pid } = await newMemberProject('pm311-ingest@example.com', 'PM311ING');
+    const ownerToken = await mintTokenForUser('pm311-ingest@example.com');
+    await authorizeForAllProjects(ownerToken);
+    const regRes = await SELF.fetch('https://noriq.test/api/runners', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${ownerToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: 'pm311-runner' }),
+    });
+    const runnerId = ((await regRes.json()) as { runner: { id: string } }).runner.id;
+
+    const before = await mintCap(ownerToken, { projectId: pid, repositoryKey: 'ingest-http-repo', purpose: 'index', scopeId: 'gen_pm311', runnerId });
+    expect(before.status).toBe(404);
+
+    const registered = await post(pid, cookie, { repositoryKey: 'ingest-http-repo' });
+    expect(registered.status).toBe(201);
+
+    const after = await mintCap(ownerToken, { projectId: pid, repositoryKey: 'ingest-http-repo', purpose: 'index', scopeId: 'gen_pm311', runnerId });
+    expect(after.status).toBe(200);
+    const capBody = (await after.json()) as { token: string };
+    expect(capBody.token).toContain('.');
   });
 });
 

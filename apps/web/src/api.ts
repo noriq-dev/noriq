@@ -255,6 +255,12 @@ export const api = {
    *  with zero results." */
   memoryHealth: (pid: string) => req<ApiMemoryHealth>('GET', `/api/projects/${pid}/memory/health`),
   memoryRepositories: (pid: string) => req<{ repositories: ApiMemoryRepository[] }>('GET', `/api/projects/${pid}/memory/repositories`),
+  /** PLNR-311: registers a canonical repository — the ONE write in this file open to any project
+   *  member, not gated to admin (unlike every action below): registration is a human declaring
+   *  identity, not an operator action against live index/backup state. Idempotent — registering
+   *  an already-registered key succeeds and returns `created: false`. */
+  registerRepository: (pid: string, repositoryKey: string, opts?: { defaultBranch?: string | null; vcsKind?: string | null }) =>
+    req<{ repository: ApiMemoryRepository; created: boolean }>('POST', `/api/projects/${pid}/memory/repositories`, { repositoryKey, ...opts }),
   memoryItem: (pid: string, id: string) => req<ApiMemoryItem>('GET', `/api/projects/${pid}/memory/items/${id}`),
   memoryHistory: (pid: string, id: string) => req<ApiMemoryHistory>('GET', `/api/projects/${pid}/memory/items/${id}/history`),
   memoryContradictionSet: (pid: string, setId: string) =>

@@ -110,6 +110,9 @@ export function MemoryOps({ pid, store }: { pid: string; store: AppStore }) {
   const [lastBackup, setLastBackup] = useState<{ manifestKey: string } | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionBusy, setActionBusy] = useState<string | null>(null); // which control is in flight
+  const [newRepoKey, setNewRepoKey] = useState('');
+  const [registerBusy, setRegisterBusy] = useState(false);
+  const [registerError, setRegisterError] = useState<string | null>(null);
 
   const refresh = useCallback(() => {
     setLoading(true);
@@ -129,6 +132,27 @@ export function MemoryOps({ pid, store }: { pid: string; store: AppStore }) {
   }, [pid]);
 
   useEffect(() => { refresh(); }, [refresh]);
+
+  // PLNR-311: the ONE control in this panel open to any project member, not just admins —
+  // registering a canonical repository is a human declaring identity (§4/§6 locked decision),
+  // not an operator action against live index/backup state, so it does not share `isAdmin`'s
+  // gate with the actions below. Idempotent server-side: re-registering the same key is not an
+  // error, so this never needs to special-case "already registered" here.
+  const registerRepo = useCallback(async () => {
+    const key = newRepoKey.trim();
+    if (!key) return;
+    setRegisterBusy(true);
+    setRegisterError(null);
+    try {
+      await api.registerRepository(pid, key);
+      setNewRepoKey('');
+      refresh();
+    } catch (err) {
+      setRegisterError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRegisterBusy(false);
+    }
+  }, [pid, newRepoKey, refresh]);
 
   const runAction = useCallback(async (key: string, fn: () => Promise<unknown>) => {
     setActionBusy(key);
@@ -227,11 +251,11 @@ export function MemoryOps({ pid, store }: { pid: string; store: AppStore }) {
 
         <Section title={`Repositories · ${repositories.length}`}>
           {repositories.length === 0 ? (
-            <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>
+            <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', marginBottom: 12 }}>
               No repository is registered against this project's memory yet.
             </div>
           ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginBottom: 14 }}>
               {repositories.map((r) => (
                 <RepositoryCard
                   key={r.id}
@@ -243,6 +267,25 @@ export function MemoryOps({ pid, store }: { pid: string; store: AppStore }) {
                 />
               ))}
             </div>
+          )}
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <input
+              value={newRepoKey}
+              onChange={(e) => setNewRepoKey(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter' && !registerBusy) registerRepo(); }}
+              placeholder="repository key (e.g. web-app) — the .noriq/project.toml repositoryKey"
+              disabled={registerBusy}
+              style={{
+                flex: '1 1 320px', fontFamily: 'var(--mono)', fontSize: 11, padding: '6px 9px', borderRadius: 7,
+                background: 'var(--w-03)', border: '1px solid var(--w-08)', color: 'var(--text)',
+              }}
+            />
+            <Button onClick={registerRepo} disabled={registerBusy || !newRepoKey.trim()}>
+              {registerBusy ? 'registering…' : 'register repository'}
+            </Button>
+          </div>
+          {registerError && (
+            <div style={{ marginTop: 8, fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--red-soft)' }}>{registerError}</div>
           )}
         </Section>
 

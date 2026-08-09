@@ -207,6 +207,65 @@ describe('a staged generation the server has not validated offers no activation 
   });
 });
 
+describe('registering a canonical repository (PLNR-311)', () => {
+  it('is offered to a NON-admin project member — unlike every other action in this panel', async () => {
+    mockClean();
+    mount(fakeStore({ isAdmin: false }));
+    await tick();
+
+    expect(button('register repository')).toBeDefined();
+    expect(button('register repository')!.disabled).toBe(true); // empty input
+  });
+
+  it('registers the typed key, clears the input, and refreshes the list', async () => {
+    mockClean();
+    const register = vi.spyOn(api, 'registerRepository').mockResolvedValue({
+      repository: {
+        id: 'pr_new', projectId: 'prj_1', repositoryKey: 'web-app', indexingEnabled: false, ingestStatus: 'none',
+        defaultBranch: null, vcsKind: null, branchClasses: [], latestObservedBase: null, activeGenerationId: null,
+        createdAt: '2026-01-01T00:00:00.000Z', updatedAt: null, checkouts: [],
+        activeGeneration: null, stagedGenerations: [], stale: false, failedIngest: false, failedIngestProblems: [],
+      },
+      created: true,
+    });
+
+    mount();
+    await tick();
+
+    const input = container.querySelector('input[placeholder^="repository key"]') as HTMLInputElement;
+    const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
+    await act(async () => {
+      setValue.call(input, 'web-app');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await act(async () => { button('register repository')!.click(); });
+
+    expect(register).toHaveBeenCalledWith('prj_1', 'web-app');
+    expect(input.value).toBe('');
+  });
+
+  it('shows the server error on rejection (e.g. a ckt_-prefixed checkout id) without clearing the input', async () => {
+    mockClean();
+    vi.spyOn(api, 'registerRepository').mockRejectedValue(
+      new Error('looks like a runner-local checkout id (§6/§16), not a canonical repository key'),
+    );
+
+    mount();
+    await tick();
+
+    const input = container.querySelector('input[placeholder^="repository key"]') as HTMLInputElement;
+    const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
+    await act(async () => {
+      setValue.call(input, 'ckt_abc123');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await act(async () => { button('register repository')!.click(); });
+
+    expect(text()).toContain('checkout id');
+    expect(input.value).toBe('ckt_abc123');
+  });
+});
+
 describe('a non-admin sees status without destructive action controls', () => {
   it('offers no backup/restore/rollback/activate/discard/sweep controls, but still reads status', async () => {
     mockClean();
