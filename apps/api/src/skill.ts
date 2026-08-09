@@ -99,7 +99,9 @@ need it to start working, and it never creates anybody.)
    longer than the TTL (e.g. a long external build) and want to keep holding the task.
 6. Watch the \`--- notices ---\` block on every tool result — new comments, messages,
    and requeues addressed to you appear there. Also \`my_updates\` after each step.
-7. Resolve every open comment with \`resolve_comment\` (addressed | wont_do) + a reply.
+7. When a human steering comment arrives, call \`acknowledge_comment\` promptly so they know it
+   was seen. This leaves it unresolved and still blocking. After you actually act on it, resolve
+   it with \`resolve_comment\` (addressed | wont_do) + a substantive reply.
    You cannot release to done with unresolved comments.
 8. \`release_task\` with toStatus "review" (default for finished work) or "done".
 
@@ -145,8 +147,10 @@ goes DOWN as the urgency goes up — filing real work as P4 buries it.
 ## Human steering
 
 Humans post comments of kind **question** (answer it, keep working) and
-**instruction** (it may change your scope — re-plan before continuing).
-Acknowledge fast, resolve with a substantive reply. The human is waiting.
+**instruction** (it may change your scope — re-plan before continuing). Call
+\`acknowledge_comment\` as soon as you have seen one; acknowledgement is not resolution and the
+comment stays open. Call \`resolve_comment\` only after the work or answer is real, with a
+substantive reply. The human is waiting.
 
 When **you** need the human, pick the right channel: \`request_input\` to block on a
 decision (tie it to the task), \`raise_alert\` when something is wrong and needs attention,

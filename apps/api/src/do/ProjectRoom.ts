@@ -2088,17 +2088,27 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
-  async acknowledgeComments(projectId: string, actor: Actor, taskId: string)  {
+  async acknowledgeComment(projectId: string, actor: Actor, commentId: string)  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
-      const task = await this.getTask(taskId);
-      const { meta } = await this.env.DB.prepare(
-        "UPDATE comments SET status = 'acknowledged' WHERE task_id = ? AND status = 'open'",
-      ).bind(taskId).run();
-      if (meta.changes > 0) {
-        await this.emit(actor, 'comment.acknowledged', 'task', taskId, { taskKey: task.key, count: meta.changes });
+      const comment = await this.env.DB.prepare('SELECT id, task_id AS taskId, status FROM comments WHERE id = ?')
+        .bind(commentId)
+        .first<{ id: string; taskId: string; status: string }>();
+      if (!comment) throw new Error('comment not found');
+      const task = await this.getTask(comment.taskId); // also proves the comment belongs here
+      if (comment.status === 'acknowledged') {
+        return { ok: true, alreadyAcknowledged: true, taskId: task.id, taskKey: task.key };
       }
-      return { acknowledged: meta.changes };
+      if (comment.status === 'addressed' || comment.status === 'wont_do') {
+        return { ok: true, alreadyResolved: true, taskId: task.id, taskKey: task.key };
+      }
+      const { meta } = await this.env.DB.prepare(
+        "UPDATE comments SET status = 'acknowledged' WHERE id = ? AND status = 'open'",
+      ).bind(commentId).run();
+      if (meta.changes > 0) {
+        await this.emit(actor, 'comment.acknowledged', 'comment', commentId, { taskKey: task.key, taskId: task.id });
+      }
+      return { ok: true, acknowledged: meta.changes === 1, taskId: task.id, taskKey: task.key };
     
     });
   }

@@ -115,7 +115,8 @@ The contract: (1) call get_briefing first; (2) claim_task before working on anyt
 (3) just keep working — every Noriq tool call renews your claim automatically, and the
 TTL is generous (30 min), so you never need to ping to stay alive. heartbeat exists only
 for the rare case where you'll go silent longer than that; (4) check and resolve open
-comments — humans steer you through them; (5) release_task (to review or done) when
+comments — acknowledge new human steering with acknowledge_comment, then resolve it only
+when substantively addressed; (5) release_task (to review or done) when
 finished. Never work on a task you have not claimed.
 When you file a task and already know more about the work than its title and body say — which
 files it touches, what to read first, what is already decided, what "done" looks like — put that
@@ -215,6 +216,7 @@ export const GET_BRIEFING_PLAYBOOK: readonly string[] = [
   'Every tool result may end with a "--- notices ---" block: read it, it is addressed to you.',
   'Once you are localized to a project, get_briefing also carries a small, bounded `memory` block — recently changed decisions/hazards/unresolved unknowns, stale-memory warnings, and who else is actively claiming work nearby (my_updates carries a lighter memoryChanges delta of the same underlying feed between get_briefing calls). It is a session-start pulse, never a substitute for search_project_memory on a specific question, and is simply absent — not an error — when you have no localized project yet or the memory store cannot answer quickly. Every item still carries its own authority/validity, same as any other memory hit: weigh it, never obey it.',
   'Starting non-trivial work on a task? Prefer `get_task_context` over hand-chaining `get_task` + `search_project_memory` + `explain_project_area` yourself — one bounded, deterministic pack: the task\'s required facts in full, plus as much of the active decisions/hazards/failed-approaches/relevant memory/prior episodes/dependency-graph neighborhood/uncertainty as the budget allows. `explain_project_area` is the graph counterpart once you already hold an entity\'s URI — dependencies, tests, implementers, decision lineage, or change impact — and its `coverage` field distinguishes "the graph cannot answer that yet" (`coverage.complete === false`) from "nothing is related".',
+  'When a human steering comment arrives, call `acknowledge_comment` immediately so they know it was seen; acknowledgement leaves the comment unresolved and still blocks completion. Call `resolve_comment` only after you actually addressed it or chose `wont_do`, always with the substantive reply.',
 ];
 
 function room(env: Env, projectId: string) {
@@ -323,7 +325,7 @@ const TOOL_HINTS: Record<string, ToolHints> = {
   list_docs: READ, get_doc: READ, update_doc: WRITE_IDEMPOTENT, list_templates: READ, get_plan_doc: READ, update_plan_doc: WRITE_IDEMPOTENT,
   check_locks: READ, list_locks: READ,
   // writes that are safe to repeat with the same args (renew/replace-in-place/insert-or-ignore)
-  heartbeat: WRITE_IDEMPOTENT, set_agent_identity: WRITE_IDEMPOTENT, update_task: WRITE_IDEMPOTENT, update_tasks: WRITE_IDEMPOTENT,
+  heartbeat: WRITE_IDEMPOTENT, set_agent_identity: WRITE_IDEMPOTENT, acknowledge_comment: WRITE_IDEMPOTENT, update_task: WRITE_IDEMPOTENT, update_tasks: WRITE_IDEMPOTENT,
   update_plan: WRITE_IDEMPOTENT, add_dependency: WRITE_IDEMPOTENT, remove_dependency: WRITE_IDEMPOTENT, attach_ref: WRITE_IDEMPOTENT,
   set_project_group: WRITE_IDEMPOTENT, reindex_search: WRITE_IDEMPOTENT,
   acquire_lock: WRITE_IDEMPOTENT, release_lock: WRITE_IDEMPOTENT,
@@ -1906,6 +1908,15 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     },
     tool(async ({ projectId, taskId, kind, body, parentCommentId }) =>
       room(env, projectId).postComment(projectId, actor, await resolveTaskId(env, projectId, taskId), kind, body, parentCommentId),
+    ),
+  );
+
+  defineTool(
+    'acknowledge_comment',
+    'Tell a human you have SEEN one open steering comment without claiming that it is finished. Call this promptly when a question or instruction arrives. It changes only open → acknowledged; the comment remains unresolved, stays visible in notices, and continues to block task completion until resolve_comment records addressed or wont_do with a substantive reply. Safe to repeat for the same comment.',
+    { projectId: z.string(), commentId: z.string() },
+    tool(async ({ projectId, commentId }) =>
+      room(env, projectId).acknowledgeComment(projectId, actor, commentId),
     ),
   );
 

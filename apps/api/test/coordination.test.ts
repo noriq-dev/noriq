@@ -31,7 +31,7 @@ describe('auth', () => {
   it('exposes the coordination tools', async () => {
     const tools = await mcpList(orch.apiKey);
     const names = tools.map((t) => t.name);
-    for (const required of ['get_briefing', 'my_updates', 'claim_task', 'release_task', 'heartbeat', 'next_claimable', 'resolve_comment', 'decompose_task']) {
+    for (const required of ['get_briefing', 'my_updates', 'claim_task', 'release_task', 'heartbeat', 'next_claimable', 'acknowledge_comment', 'resolve_comment', 'decompose_task']) {
       expect(names).toContain(required);
     }
   });
@@ -95,6 +95,15 @@ describe('coordination core', () => {
     // The holder sees it in notices on the next tool call.
     const hb = await mcpCall(nova.apiKey, 'heartbeat', { projectId });
     expect(hb.notices).toContain('Does this handle the crash case?');
+
+    // Acknowledgement is a distinct, idempotent receipt — the human knows it was seen, while the
+    // substantive work remains honestly unresolved and completion is still gated.
+    const ack = await mcpCall(nova.apiKey, 'acknowledge_comment', { projectId, commentId });
+    expect(ack.body).toMatchObject({ ok: true, acknowledged: true, taskId: t1.id, taskKey: t1.key });
+    const ackAgain = await mcpCall(nova.apiKey, 'acknowledge_comment', { projectId, commentId });
+    expect(ackAgain.body.alreadyAcknowledged).toBe(true);
+    const afterAck = await mcpCall(orch.apiKey, 'get_task', { taskId: t1.id });
+    expect(afterAck.body.comments.find((c: { id: string }) => c.id === commentId).status).toBe('acknowledged');
 
     // Finishing with an unresolved comment is refused.
     const refuse = await mcpCall(nova.apiKey, 'release_task', { projectId, taskId: t1.id, toStatus: 'done' });
