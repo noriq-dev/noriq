@@ -108,7 +108,7 @@ export function parseStagedRow(row: Record<string, unknown>): StagedRow {
 // SQL staging tables like index ingest's PLNR-261 upgrade) — that is fine for episodes because
 // nothing here needs to survive a hibernation eviction mid-upload the way a multi-hour repo
 // index does; a dropped in-flight upload just gets re-POSTed. PLNR-263 is the real episode
-// RECORD writer: `rows` accumulated here are parsed as `EffortEpisode` records and handed to
+// RECORD writer: `rows` accumulated here are parsed as partial episode enrichments and handed to
 // `ProjectMemory.recordEpisode` by `completeEpisodeIngest`, which is also reachable from
 // `ProjectRoom`'s durable terminal-run job via `memory/episodes.ts`'s `recordEpisodeForRun`
 // — the two paths converge on the SAME upsert-by-run_id writer (see episodes.ts).
@@ -124,7 +124,7 @@ export interface IngestEpisodeState {
   manifest: EpisodeUploadManifest;
   receivedBatches: Set<number>;
   /** Accumulated across every accepted batch, in receipt order — read back by
-   *  `completeEpisodeIngest` to parse each row as an `EffortEpisode`. Never the raw transcript:
+   *  `completeEpisodeIngest` to parse each row as a partial enrichment. Never the raw transcript:
    *  a row here is whatever the daemon's episode-upload payload shapes it as (§18), and nothing
    *  in this module inspects its fields — that parsing is PLNR-263's `recordEpisodeForRun`/
    *  `ProjectMemory.recordEpisode`'s job, not this transport layer's. */

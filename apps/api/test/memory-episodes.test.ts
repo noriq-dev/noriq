@@ -13,7 +13,7 @@ import type { Actor, CreateRunInput, RunPatch, RunView } from '../src/do/Project
 import type { Env } from '../src/env';
 import { buildEntityUri } from '@noriq-dev/shared';
 import { createAgent, mcpCall } from './helpers';
-import { sweepPendingEpisodeJobs } from '../src/memory/episodes';
+import { recordEpisodeForRun, sweepPendingEpisodeJobs } from '../src/memory/episodes';
 
 const appEnv = env as unknown as Env;
 const actor: Actor = { kind: 'human', id: 'usr_epi_test', name: 'Episode Tester' };
@@ -32,7 +32,7 @@ interface RecordEpisodeInput {
   timeline: Array<{ at: string; label: string }>; filesTouched: string[]; commands: string[]; testsRun: string[]; failures: string[];
   findings: Array<{ summary: string; severity?: string }>; reviewRounds: number; tokenUsage: Record<string, unknown>; costUSD: number;
   acceptanceCoverage: number | null; steeringEvents: string[]; landingOutcome: string; remainingWork: string[]; selfSummary?: unknown;
-  actor: { kind: string; id: string | null };
+  actor: { kind: string; id: string | null }; writeMode?: 'replace' | 'skeleton' | 'enrichment';
 }
 interface EpisodeUploadRow {
   runId: string; taskId?: string | null; repositoryKey?: string | null; baseId?: string | null;
@@ -66,6 +66,7 @@ interface MemRpc {
     pid: string,
     scopeId: string,
   ): Promise<{ ok: true; batchesReceived: number; rowCount: number; recorded: number; skipped: number }>;
+  _getEpisodeForTest(pid: string, runId: string, sitting?: number): Promise<Record<string, unknown> | null>;
 }
 const memory = (pid: string) => appEnv.PROJECT_MEMORY.get(appEnv.PROJECT_MEMORY.idFromName(pid)) as unknown as MemRpc;
 
@@ -373,38 +374,124 @@ describe('a terminal Run produces its deterministic episode (ProjectRoom → rec
   });
 });
 
-describe('episode upload ingest — completeEpisodeIngest parses rows as EffortEpisode and calls the real writer', () => {
-  it('records a real episode from an uploaded row, resolving identity from the run itself (never trusting the payload)', async () => {
+describe('episode upload ingest — completeEpisodeIngest merges partial enrichment over the server skeleton', () => {
+  it('preserves every server-built field while applying daemon enrichment and ignoring forged skeleton fields', async () => {
     const projectId = await newProject('MEPIING1');
     const runnerId = 'rnr_epi_ing1';
     const agentId = 'agt_epi_ing1';
+    const made = await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'authoritative episode task', tags: ['episode-test'] });
+    const taskId = made.body.id as string;
+    await mcpCall(agent.apiKey, 'attach_ref', { taskId, kind: 'commit', ref: 'server-base-sha' });
     await seedRunner(runnerId);
     await seedAgent(agentId, runnerId, projectId);
-    const run = await room(projectId).createRun(projectId, actor, { kind: 'build', repoRef: 'r', agentTool: 'claude' });
+    const now = new Date().toISOString();
+    await appEnv.DB.prepare(
+      `INSERT INTO project_repositories (id, project_id, repository_key, indexing_enabled, ingest_status, created_at, updated_at)
+       VALUES (?, ?, 'repo1', 0, 'none', ?, ?)`,
+    ).bind('prp_epi_ing1', projectId, now, now).run();
+    await appEnv.DB.prepare(
+      `INSERT INTO repository_checkouts (id, project_repository_id, runner_id, checkout_id, created_at, updated_at)
+       VALUES ('ckt_epi_ing1', 'prp_epi_ing1', ?, 'r', ?, ?)`,
+    ).bind(runnerId, now, now).run();
+    const run = await room(projectId).createRun(projectId, actor, {
+      kind: 'build', repoRef: 'r', agentTool: 'claude', anchor: { type: 'task', id: taskId },
+    });
     await room(projectId).dispatchRun(projectId, actor, run.id, runnerId);
     await room(projectId).transitionRun(projectId, actor, run.id, { status: 'running', agentId });
+    const modelUsage = {
+      'test-model': { inputTokens: 21, outputTokens: 8, cacheReadInputTokens: 5, cacheCreationInputTokens: 3, costUSD: 4.25 },
+    };
+    await appEnv.DB.prepare('UPDATE runs SET usd_spent = 4.25, model_usage = ? WHERE id = ?')
+      .bind(JSON.stringify(modelUsage), run.id).run();
+    await appEnv.DB.prepare(
+      `INSERT INTO steers (id, run_id, agent_id, mode, delivered_via, created_at)
+       VALUES ('str_epi_ing1', ?, ?, 'hard', 'runtime', ?)`,
+    ).bind(run.id, agentId, now).run();
+    await appEnv.DB.prepare(
+      `INSERT INTO run_log_segments (run_id, seq, role, round, text, created_at)
+       VALUES (?, 1, 'reviewer', 3, 'review transcript must not enter the episode', ?)`,
+    ).bind(run.id, now).run();
     await room(projectId).transitionRun(projectId, actor, run.id, { status: 'done' });
+    // Make the pre-upload skeleton deterministic even if the transition's background delivery
+    // has not run yet. A later background replay uses skeleton mode and must preserve enrichment.
+    await recordEpisodeForRun(appEnv, projectId, run.id);
 
     const scopeId = run.id;
     await memory(projectId).beginEpisodeIngest(projectId, { scopeId, projectId, batchCount: 1 });
     await memory(projectId).ingestEpisodeBatch(projectId, scopeId, 0, [
-      { runId: run.id, findings: [{ summary: 'the daemon observed a slow query in the diff' }], filesTouched: ['src/slow.ts'] },
+      {
+        runId: run.id,
+        filesTouched: ['src/slow.ts'],
+        commands: ['npm test'],
+        testsRun: ['memory-episodes.test.ts'],
+        failures: ['first attempt timed out'],
+        findings: [{ summary: 'the daemon observed a slow query in the diff' }],
+        selfSummary: { approachSummary: 'profiled before changing the query' },
+        // Legacy/full clients may still send these. Every value is forged and must be ignored.
+        taskId: null,
+        repositoryKey: 'forged-repository',
+        baseId: 'forged-base',
+        timeline: [],
+        reviewRounds: 0,
+        tokenUsage: {},
+        costUSD: 0,
+        acceptanceCoverage: 0.99,
+        steeringEvents: [],
+        landingOutcome: 'not-a-real-outcome',
+        remainingWork: ['forged remaining work'],
+      },
     ]);
     const completed = await memory(projectId).completeEpisodeIngest(projectId, scopeId);
     expect(completed.recorded).toBe(1);
     expect(completed.skipped).toBe(0);
 
-    const runUri = buildEntityUri({ kind: 'run', id: run.id });
-    const neighborhood = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: runUri, edgeTypes: ['derived_from'] });
-    const episodeUri = neighborhood.upstream.find((e) => e.type === 'episode')!.uri;
-    const episodeId = episodeUri.split('/').pop()!;
-    const { results } = await memory(projectId).searchProjectMemory(projectId, { episodeId });
-    // Enriches the automatically-recorded skeleton from the SAME run+sitting (whichever call
-    // landed first) — one row either way, per the (run_id, sitting) UNIQUE index.
-    expect(results[0]!.snippet).toContain('the daemon observed a slow query in the diff');
+    const episode = await memory(projectId)._getEpisodeForTest(projectId, run.id);
+    expect(episode).toMatchObject({
+      runId: run.id,
+      taskId,
+      repositoryKey: 'repo1',
+      baseId: 'server-base-sha',
+      reviewRounds: 3,
+      tokenUsage: modelUsage,
+      costUSD: 4.25,
+      acceptanceCoverage: null,
+      steeringEvents: ['hard steer (runtime)'],
+      landingOutcome: 'pending',
+      remainingWork: [],
+      filesTouched: ['src/slow.ts'],
+      commands: ['npm test'],
+      testsRun: ['memory-episodes.test.ts'],
+      failures: ['first attempt timed out'],
+      findings: [{ summary: 'the daemon observed a slow query in the diff' }],
+      selfSummary: expect.objectContaining({ approachSummary: 'profiled before changing the query' }),
+    });
+    expect((episode!.timeline as Array<{ label: string }>).map((entry) => entry.label)).toEqual([
+      'queued', 'dispatched to runner', 'agent started', 'run done',
+    ]);
+
+    // A later partial enrichment changes only what it names; schema defaults must not turn
+    // omitted arrays into destructive explicit clears.
+    const partialScopeId = `${run.id}_partial`;
+    await memory(projectId).beginEpisodeIngest(projectId, { scopeId: partialScopeId, projectId, batchCount: 1 });
+    await memory(projectId).ingestEpisodeBatch(projectId, partialScopeId, 0, [
+      { runId: run.id, findings: [{ summary: 'the follow-up review confirmed the query fix' }] },
+    ]);
+    expect(await memory(projectId).completeEpisodeIngest(projectId, partialScopeId)).toMatchObject({ recorded: 1, skipped: 0 });
+    expect(await memory(projectId)._getEpisodeForTest(projectId, run.id)).toMatchObject({
+      filesTouched: ['src/slow.ts'],
+      commands: ['npm test'],
+      testsRun: ['memory-episodes.test.ts'],
+      findings: [{ summary: 'the follow-up review confirmed the query fix' }],
+    });
+
+    // A terminal-job retry after enrichment must not clear the daemon-owned half either.
+    await recordEpisodeForRun(appEnv, projectId, run.id);
+    expect(await memory(projectId)._getEpisodeForTest(projectId, run.id)).toMatchObject({
+      filesTouched: ['src/slow.ts'], commands: ['npm test'], findings: [{ summary: 'the follow-up review confirmed the query fix' }],
+    });
   });
 
-  it('skips a malformed uploaded row and one naming an unknown run, without failing the rest of the batch', async () => {
+  it('skips malformed, unknown-run, and non-terminal rows without failing the rest of the batch', async () => {
     const projectId = await newProject('MEPIING2');
     const runnerId = 'rnr_epi_ing2';
     const agentId = 'agt_epi_ing2';
@@ -414,15 +501,17 @@ describe('episode upload ingest — completeEpisodeIngest parses rows as EffortE
     await room(projectId).dispatchRun(projectId, actor, run.id, runnerId);
     await room(projectId).transitionRun(projectId, actor, run.id, { status: 'running', agentId });
     await room(projectId).transitionRun(projectId, actor, run.id, { status: 'done' });
+    const nonterminal = await room(projectId).createRun(projectId, actor, { kind: 'build', repoRef: 'r', agentTool: 'claude' });
 
     const scopeId = `${run.id}_batch2`;
     await memory(projectId).beginEpisodeIngest(projectId, { scopeId, projectId, batchCount: 1 });
     await memory(projectId).ingestEpisodeBatch(projectId, scopeId, 0, [
-      { runId: run.id, landingOutcome: 'not-a-real-outcome' as unknown as string }, // fails EffortEpisode's enum
+      { runId: run.id, findings: [{ summary: '' }] }, // malformed daemon-owned enrichment
       { runId: 'run_does_not_exist' }, // parses fine, but no such run in this project
+      { runId: nonterminal.id, commands: ['must not record yet'] },
     ]);
     const completed = await memory(projectId).completeEpisodeIngest(projectId, scopeId);
     expect(completed.recorded).toBe(0);
-    expect(completed.skipped).toBe(2);
+    expect(completed.skipped).toBe(3);
   });
 });

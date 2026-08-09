@@ -200,19 +200,20 @@ export function buildEpisodeSkeleton(input: EpisodeSkeletonInput): EpisodeSkelet
 }
 
 /**
- * The D1-reading half: load one run's state and everything the skeleton needs, then call
- * `ProjectMemory.recordEpisode` through the `PROJECT_MEMORY` stub. The terminal transition's
- * durable job processor calls it outside the run's critical path; errors are retained on the D1
- * job for the scheduled sweep rather than changing the already-committed run outcome.
+ * The D1-reading half shared by BOTH episode writers. The terminal job and daemon enrichment
+ * must start from exactly the same authoritative snapshot; otherwise the latter can accidentally
+ * replace server-owned evidence with wire defaults.
  */
-export async function recordEpisodeForRun(env: Env, projectId: string, runId: string): Promise<void> {
+export class EpisodeSkeletonUnavailableError extends Error {}
+
+export async function loadEpisodeSkeleton(env: Env, projectId: string, runId: string): Promise<EpisodeSkeleton> {
   const run = await env.DB.prepare(
     `SELECT id, agent_id, kind, runner_id, repo_ref, anchor_type, anchor_id, exit, created_at,
             dispatched_at, started_at, usd_spent, model_usage, sitting
        FROM runs WHERE id = ? AND project_id = ?`,
   ).bind(runId, projectId).first<RunRowForEpisode>();
-  if (!run) throw new Error(`run ${runId} not found in project ${projectId}`);
-  if (!run.exit) throw new Error(`run ${runId} has no terminal exit yet — recordEpisodeForRun must only be called after a terminal transition`);
+  if (!run) throw new EpisodeSkeletonUnavailableError(`run ${runId} not found in project ${projectId}`);
+  if (!run.exit) throw new EpisodeSkeletonUnavailableError(`run ${runId} has no terminal exit yet`);
 
   const taskId = run.anchor_type === 'task' ? run.anchor_id : null;
   const [taskRow, taskRefsResult, steersResult, reviewRoundsRow, repoRow] = await Promise.all([
@@ -232,7 +233,7 @@ export async function recordEpisodeForRun(env: Env, projectId: string, runId: st
       : Promise.resolve(null),
   ]);
 
-  const skeleton = buildEpisodeSkeleton({
+  return buildEpisodeSkeleton({
     run,
     taskTitle: taskRow?.title ?? null,
     repositoryKey: repoRow?.repositoryKey ?? null,
@@ -240,10 +241,20 @@ export async function recordEpisodeForRun(env: Env, projectId: string, runId: st
     steers: steersResult.results,
     reviewRounds: reviewRoundsRow?.maxRound ?? 0,
   });
+}
+
+/**
+ * Load one run's authoritative skeleton, then record it through the ProjectMemory DO. The
+ * terminal transition's durable job processor calls this outside the run's critical path;
+ * errors remain on the D1 job for the scheduled sweep rather than changing the committed run.
+ */
+export async function recordEpisodeForRun(env: Env, projectId: string, runId: string): Promise<void> {
+  const skeleton = await loadEpisodeSkeleton(env, projectId, runId);
 
   await env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)).recordEpisode(projectId, {
     ...skeleton,
     actor: { kind: 'system', id: null },
+    writeMode: 'skeleton',
   });
 }
 

@@ -3,7 +3,8 @@ import type { Env } from '../env';
 import { newId, nowIso } from '../lib/util';
 import {
   buildEntityUri, parseEntityUri, AUTHORITY_HYPOTHESIS, AUTHORITY_HUMAN_APPROVED, AUTHORITY_VERIFIED_MERGED,
-  EffortEpisode, EpisodeSelfSummary, type EpisodeLandingOutcome, type MemoryBackupManifest,
+  EffortEpisode, EpisodeSelfSummary, type EffortEpisode as EffortEpisodeData,
+  type EpisodeLandingOutcome, type MemoryBackupManifest,
 } from '@noriq-dev/shared';
 import { projectCoordinationEvents, type ProjectedEvent } from '../lib/memory-projector';
 import { exportMemorySnapshot, sha256HexBytes } from '../memory/backup';
@@ -37,7 +38,7 @@ import {
   type ImplementingWorkResult, type DecisionLineageResult, type ChangeImpactResult, type ConstellationResult, type ConstellationOptions,
   type GraphEntityPage, type GraphEntityPageInput, type ConstellationInputRows,
 } from '../memory/graph-queries';
-import { parseExit } from '../memory/episodes';
+import { EpisodeSkeletonUnavailableError, loadEpisodeSkeleton } from '../memory/episodes';
 import {
   effortSignals, duplicateWarnings, summarizeEffort,
   type TaskEffortInput, type EffortCandidate, type DuplicateWarning, type EffortSummary,
@@ -196,14 +197,11 @@ export interface IndexGenerationSummary {
 }
 
 /**
- * `recordEpisode`'s input (PLNR-263) — the deterministic skeleton's fields (matching
- * `memory/episodes.ts`'s `EpisodeSkeleton` one-for-one) PLUS the two things a skeleton alone
- * cannot carry: `agentId`/`runKind`/`outcome`/`startedAt`/`finishedAt` are the run's OWN
- * identity, always resolved by the CALLER from `runs` (never trusted from an uploaded payload —
- * `completeEpisodeIngest`, the other caller, does its own tiny `runs` lookup before calling
- * this, exactly like `recordEpisodeForRun` does), and `selfSummary`/`actor` are the two fields
- * only a daemon upload or an agent can supply. `taskTitle` is a label hint for the task node,
- * never persisted as its own column.
+ * `recordEpisode`'s input (PLNR-263/340): the deterministic skeleton (matching
+ * `memory/episodes.ts`'s `EpisodeSkeleton`) plus daemon-owned enrichment, provenance, and an
+ * explicit merge mode. Identity and skeleton evidence are always resolved from `runs` and its
+ * related D1 rows, never trusted from an upload. `taskTitle` is only a label hint for the task
+ * node; it is not persisted in the episode body.
  *
  * `sitting` (correction, migration 0075/0007): an episode's identity is (run_id, sitting), NOT
  * run_id alone. `ProjectRoom.reopenRun` reuses one run id across multiple sittings (RUN-182) —
@@ -225,11 +223,11 @@ interface RecordEpisodeInput {
   repositoryKey: string | null;
   baseId: string | null;
   timeline: Array<{ at: string; label: string }>;
-  filesTouched: string[];
-  commands: string[];
-  testsRun: string[];
-  failures: string[];
-  findings: Array<{ summary: string; severity?: string }>;
+  filesTouched?: string[];
+  commands?: string[];
+  testsRun?: string[];
+  failures?: string[];
+  findings?: Array<{ summary: string; severity?: string }>;
   reviewRounds: number;
   tokenUsage: Record<string, unknown>;
   costUSD: number;
@@ -239,6 +237,9 @@ interface RecordEpisodeInput {
   remainingWork: string[];
   selfSummary?: unknown;
   actor: { kind: string; id: string | null };
+  /** Direct callers replace enrichment by default. Skeleton replays preserve it; daemon
+   * uploads replace only enrichment fields they actually supplied. */
+  writeMode?: 'replace' | 'skeleton' | 'enrichment';
 }
 
 export const SCHEMA_TABLES = [
@@ -275,15 +276,19 @@ export const OPERATIONAL_TABLES = ['applied_operations', 'memory_revision', 'pro
 export const BACKUP_TABLES = [...SCHEMA_TABLES, ...OPERATIONAL_TABLES] as const;
 
 /**
- * The shape of one accumulated episode-upload row (PLNR-263): an `EffortEpisode`, minus the
- * three fields the SERVER always owns rather than trusting a daemon-supplied value — `id` and
- * `createdAt` are minted by `recordEpisode` itself (see its own doc comment on why `episodeId`
- * is resolved once, synchronously, rather than trusted from a payload), and `projectId` is
- * already the RPC's own first parameter. A row that fails this parse is skipped, not fatal to
- * the rest of the upload — the same per-row tolerance `planProjection` applies to staged index
- * rows.
+ * A daemon upload is deliberately a PARTIAL enrichment, not an `EffortEpisode` replacement.
+ * D1 owns identity, lifecycle, task/repository association, cost and review evidence. Unknown
+ * keys are stripped, so even a legacy/full payload cannot forge those server-owned fields.
  */
-const UPLOADED_EPISODE_SHAPE = EffortEpisode.omit({ id: true, projectId: true, createdAt: true });
+const UPLOADED_EPISODE_SHAPE = EffortEpisode.pick({
+  runId: true,
+  filesTouched: true,
+  commands: true,
+  testsRun: true,
+  failures: true,
+  findings: true,
+  selfSummary: true,
+}).partial().extend({ runId: EffortEpisode.shape.runId });
 
 /**
  * PLNR-255: the embedding/display text derived from an episode's `body` JSON blob — `body` is
@@ -1358,12 +1363,11 @@ export class ProjectMemory extends DurableObject<Env> {
    * re-recorded skeleton (a replay, or the same sitting settling twice through two different
    * callers) just overwrites the same row, while a NEW sitting gets its own.
    *
-   * Skeleton fields always win: every column below except `body.selfSummary` is set from THIS
-   * call's input, never merged with a prior write. `selfSummary` is the one exception (§14) — a
-   * present, valid value wins; an absent or invalid one PRESERVES whatever was already recorded,
-   * so a later skeleton-only write (a replay, or the server's own automatic recording arriving
-   * after a richer daemon upload already enriched the row) can never erase enrichment that
-   * already landed.
+   * Server-owned skeleton fields always win. The optional daemon-owned enrichment fields merge
+   * according to `writeMode`: skeleton replays preserve all prior enrichment; enrichment uploads
+   * replace only fields actually present in the upload; direct callers retain replace semantics.
+   * A present, valid selfSummary wins while an absent or malformed one always preserves the
+   * existing value.
    *
    * Bulk graph write, ONE transaction, ONE outbox event — the same discipline
    * `projectActiveGeneration`'s doc comment states and for the same reason: per-edge
@@ -1396,9 +1400,8 @@ export class ProjectMemory extends DurableObject<Env> {
     // `EffortEpisode.selfSummary` already declares (see that field's doc comment in memory.ts).
     const providedSelfSummary = EpisodeSelfSummary.nullable().catch(null).parse(input.selfSummary ?? null);
 
-    // Read BEFORE building the new body — the one piece of "existing" state this write can
-    // depend on, per the merge rule above: the STABLE id (a PK must never change across an
-    // upsert) and the prior self-summary to preserve. Keyed on (run_id, sitting) — a DIFFERENT
+    // Read BEFORE building the new body: merge modes need the prior daemon enrichment and every
+    // upsert needs its STABLE id. Keyed on (run_id, sitting) — a DIFFERENT
     // sitting of the same run must find no existing row here, which is exactly what makes it a
     // fresh episode rather than an overwrite of an earlier sitting's. A plain read needs no
     // transactionSync (nothing else can run inside this DO concurrently); the transactionSync
@@ -1409,13 +1412,29 @@ export class ProjectMemory extends DurableObject<Env> {
         input.runId, input.sitting,
       )
       .toArray()[0];
-    let existingSelfSummary: unknown = null;
+    let existingBody: Partial<EffortEpisodeData> = {};
     if (existingRow) {
       try {
-        existingSelfSummary = (JSON.parse(existingRow.body) as { selfSummary?: unknown }).selfSummary ?? null;
-      } catch { /* an unreadable prior body is treated as "no prior self-summary", not an error */ }
+        const parsedExisting = EffortEpisode.safeParse(JSON.parse(existingRow.body));
+        if (parsedExisting.success) existingBody = parsedExisting.data;
+      } catch { /* an unreadable prior body is treated as no prior enrichment, not an error */ }
     }
-    const mergedSelfSummary = providedSelfSummary ?? EpisodeSelfSummary.nullable().catch(null).parse(existingSelfSummary);
+    const mergedSelfSummary = providedSelfSummary ?? existingBody.selfSummary ?? null;
+    const mode = input.writeMode ?? 'replace';
+    const mergeEnrichment = <K extends 'filesTouched' | 'commands' | 'testsRun' | 'failures' | 'findings'>(
+      key: K,
+      fallback: NonNullable<RecordEpisodeInput[K]>,
+    ): NonNullable<RecordEpisodeInput[K]> => {
+      const provided = input[key];
+      if (mode === 'skeleton') return (existingBody[key] as NonNullable<RecordEpisodeInput[K]> | undefined) ?? provided ?? fallback;
+      if (mode === 'enrichment') return provided ?? (existingBody[key] as NonNullable<RecordEpisodeInput[K]> | undefined) ?? fallback;
+      return provided ?? fallback;
+    };
+    const filesTouched = mergeEnrichment('filesTouched', []);
+    const commands = mergeEnrichment('commands', []);
+    const testsRun = mergeEnrichment('testsRun', []);
+    const failures = mergeEnrichment('failures', []);
+    const findings = mergeEnrichment('findings', []);
     const createdAt = existingRow?.created_at ?? now;
     // Resolved ONCE, synchronously, before either the hash or the write — never re-derived from
     // an ON CONFLICT clause's excluded/target ambiguity, so `body.id` and the row's own `id`
@@ -1435,11 +1454,11 @@ export class ProjectMemory extends DurableObject<Env> {
       repositoryKey: input.repositoryKey,
       baseId: input.baseId,
       timeline: input.timeline,
-      filesTouched: input.filesTouched,
-      commands: input.commands,
-      testsRun: input.testsRun,
-      failures: input.failures,
-      findings: input.findings,
+      filesTouched,
+      commands,
+      testsRun,
+      failures,
+      findings,
       reviewRounds: input.reviewRounds,
       tokenUsage: input.tokenUsage,
       costUSD: input.costUSD,
@@ -1455,7 +1474,7 @@ export class ProjectMemory extends DurableObject<Env> {
 
     // Only needed to build file URIs (§18's repository-scoped shape) — skip the D1 round trip
     // when there is nothing to link.
-    const projectKey = input.repositoryKey && input.filesTouched.length ? await this.resolveProjectKey(projectId) : null;
+    const projectKey = input.repositoryKey && bodyObject.filesTouched.length ? await this.resolveProjectKey(projectId) : null;
 
     let nodesWritten = 0;
     let edgesWritten = 0;
@@ -1516,7 +1535,7 @@ export class ProjectMemory extends DurableObject<Env> {
         linkEdge('owned_by', episodeNodeId, agentNodeId);
       }
       if (projectKey && input.repositoryKey) {
-        for (const path of input.filesTouched) {
+        for (const path of bodyObject.filesTouched) {
           const fileNodeId = upsertNode('file', buildEntityUri({ kind: 'file', projectKey, repositoryKey: input.repositoryKey, path }), path);
           linkEdge('modifies', episodeNodeId, fileNodeId);
         }
@@ -1574,16 +1593,10 @@ export class ProjectMemory extends DurableObject<Env> {
   }
 
   /**
-   * Seals the upload, then parses each accumulated row as an `EffortEpisode` and hands it to
-   * the real writer (PLNR-263) — the episode-upload half of `recordEpisode`'s two callers (the
-   * other is `memory/episodes.ts`'s `recordEpisodeForRun`, from `ProjectRoom`'s terminal-run
-   * fire-and-forget). `agentId`/`runKind`/`outcome`/`startedAt` are resolved from THIS project's
-   * OWN `runs` row, never trusted from the upload — the same reason `recordEpisodeForRun` never
-   * lets a daemon supply them (see `RecordEpisodeInput`'s doc comment): a compromised or merely
-   * confused daemon must not be able to claim an outcome, agent, or run kind the server's own
-   * coordination state disagrees with. A row naming a run that does not exist in this project,
-   * or one with no terminal exit yet, is skipped rather than failing the whole completion —
-   * consistent with `planProjection`'s per-row tolerance.
+   * Seals the upload, parses each row as partial daemon enrichment, and overlays it on the exact
+   * same D1-built skeleton used by the terminal job. No lifecycle, identity, task, repository,
+   * cost, review, or landing field is trusted from the payload. Unknown and non-terminal runs
+   * remain per-row skips rather than failing the batch.
    */
   async completeEpisodeIngest(
     projectId: string,
@@ -1603,50 +1616,30 @@ export class ProjectMemory extends DurableObject<Env> {
         skipped++;
         continue;
       }
-      // `sitting` is read straight off the run row, like agent_id/kind/exit below — an uploading
-      // daemon can only ever be reporting on the sitting it just ran, i.e. the run's CURRENT
-      // (highest) sitting. There is no wire field for it: `EffortEpisode` (the uploaded row's
-      // shape) predates sittings and does not need to grow one — the server already knows.
-      const runRow = await this.env.DB.prepare(`SELECT agent_id, kind, exit, started_at, sitting FROM runs WHERE id = ? AND project_id = ?`)
-        .bind(parsed.data.runId, projectId)
-        .first<{ agent_id: string | null; kind: string; exit: string | null; started_at: string | null; sitting: number }>();
-      if (!runRow) {
-        console.warn(`ProjectMemory episode-ingest(${scopeId}): uploaded row names run ${parsed.data.runId}, unknown in project ${projectId} — skipping`);
+      let skeleton: Awaited<ReturnType<typeof loadEpisodeSkeleton>>;
+      try {
+        skeleton = await loadEpisodeSkeleton(this.env, projectId, parsed.data.runId);
+      } catch (error) {
+        if (!(error instanceof EpisodeSkeletonUnavailableError)) throw error;
+        console.warn(`ProjectMemory episode-ingest(${scopeId}): ${error.message} — skipping`);
         skipped++;
         continue;
       }
-      if (!runRow.exit) {
-        console.warn(`ProjectMemory episode-ingest(${scopeId}): run ${parsed.data.runId} has no terminal exit yet — skipping`);
-        skipped++;
-        continue;
-      }
-      const { outcome, finishedAt } = parseExit(runRow.exit);
+      // Zod retains the shared EffortEpisode defaults inside `.partial()`. Presence must
+      // therefore come from the raw row, otherwise an omitted array parses as [] and becomes an
+      // accidental clear — the exact PLNR-340 data-loss bug this boundary fixes.
+      const supplied = <K extends 'filesTouched' | 'commands' | 'testsRun' | 'failures' | 'findings' | 'selfSummary'>(key: K) =>
+        Object.prototype.hasOwnProperty.call(row, key) ? parsed.data[key] : undefined;
       await this.recordEpisode(projectId, {
-        runId: parsed.data.runId,
-        sitting: runRow.sitting,
-        agentId: runRow.agent_id,
-        runKind: runRow.kind,
-        outcome,
-        startedAt: runRow.started_at,
-        finishedAt,
-        taskId: parsed.data.taskId,
-        repositoryKey: parsed.data.repositoryKey,
-        baseId: parsed.data.baseId,
-        timeline: parsed.data.timeline,
-        filesTouched: parsed.data.filesTouched,
-        commands: parsed.data.commands,
-        testsRun: parsed.data.testsRun,
-        failures: parsed.data.failures,
-        findings: parsed.data.findings,
-        reviewRounds: parsed.data.reviewRounds,
-        tokenUsage: parsed.data.tokenUsage,
-        costUSD: parsed.data.costUSD,
-        acceptanceCoverage: parsed.data.acceptanceCoverage,
-        steeringEvents: parsed.data.steeringEvents,
-        landingOutcome: parsed.data.landingOutcome,
-        remainingWork: parsed.data.remainingWork,
-        selfSummary: parsed.data.selfSummary,
-        actor: { kind: 'agent', id: runRow.agent_id },
+        ...skeleton,
+        filesTouched: supplied('filesTouched'),
+        commands: supplied('commands'),
+        testsRun: supplied('testsRun'),
+        failures: supplied('failures'),
+        findings: supplied('findings'),
+        selfSummary: supplied('selfSummary'),
+        actor: { kind: 'agent', id: skeleton.agentId },
+        writeMode: 'enrichment',
       });
       recorded++;
     }
@@ -5154,6 +5147,16 @@ export class ProjectMemory extends DurableObject<Env> {
     return (
       this.ctx.storage.sql.exec<{ status: string }>(`SELECT status FROM index_generations WHERE id = ?1`, generationId).toArray()[0]?.status ?? null
     );
+  }
+
+  /** Test-only: return one episode body so merge regressions can assert fields that the public
+   * retrieval projection intentionally does not expose. */
+  async _getEpisodeForTest(projectId: string, runId: string, sitting = 1): Promise<EffortEpisodeData | null> {
+    await this.assertProjectId(projectId);
+    const row = this.ctx.storage.sql
+      .exec<{ body: string }>(`SELECT body FROM episodes WHERE run_id = ?1 AND sitting = ?2`, runId, sitting)
+      .toArray()[0];
+    return row ? EffortEpisode.parse(JSON.parse(row.body)) : null;
   }
 
   /** Test-only: overwrite a `_meta` value directly — used to backdate
