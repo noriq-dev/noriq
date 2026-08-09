@@ -414,6 +414,14 @@ export const api = {
     req<{ decisions: Array<{ id: string; statement: string; authority: number; recordedByAgentId: string | null; recordedAt: string; proposedAt: string }> }>(
       'GET', `/api/projects/${pid}/memory/proposed-decisions`,
     ),
+  memoryReviewQueue: (pid: string, input: { reason?: ApiMemoryReviewReason; limit?: number; offset?: number } = {}) => {
+    const params = new URLSearchParams();
+    if (input.reason) params.set('reason', input.reason);
+    if (input.limit != null) params.set('limit', String(input.limit));
+    if (input.offset != null) params.set('offset', String(input.offset));
+    const query = params.size ? `?${params}` : '';
+    return req<ApiMemoryReviewQueue>('GET', `/api/projects/${pid}/memory/review-queue${query}`);
+  },
   /** Authority 5 is reachable ONLY through this path (§12) — never a direct authority write. */
   memoryApproveDecision: (pid: string, id: string, note?: string) =>
     req<{ approvedMemoryId: string; transitionId: string }>('POST', `/api/projects/${pid}/memory/items/${id}/approve`, { note }),
@@ -1126,6 +1134,34 @@ export interface ApiMemoryItem {
 }
 
 export type ApiMemoryFeedbackKind = 'useful' | 'incorrect' | 'outdated' | 'harmful' | 'unverifiable';
+export type ApiMemoryReviewReason = 'proposed_decision' | 'contradiction' | 'stale_invalid' | 'recent_negative_feedback' | 'low_authority';
+
+export interface ApiMemoryReviewQueueItem {
+  id: string;
+  kind: string;
+  statement: string;
+  authority: number;
+  validity: string;
+  recordedAt: string;
+  recordedByAgentId: string | null;
+  proposedAt: string | null;
+  repositoryKey: string | null;
+  branch: string | null;
+  baseId: string | null;
+  reasons: ApiMemoryReviewReason[];
+  contradictionSetIds: string[];
+  recentNegativeFeedbackCount: number;
+  latestNegativeFeedbackAt: string | null;
+}
+
+export interface ApiMemoryReviewQueue {
+  items: ApiMemoryReviewQueueItem[];
+  counts: Record<ApiMemoryReviewReason, number>;
+  overallTotal: number;
+  total: number;
+  offset: number;
+  nextOffset: number | null;
+}
 
 /** Mirrors ProjectMemory.getMemoryHistory's return (GET /memory/items/:id/history) — a memory's
  *  full lineage in both directions of supersedes_memory_id, its authority transitions, the

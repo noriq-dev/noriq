@@ -47,6 +47,7 @@ import {
   type CitationCheck, type CallerBaseScope, type VerificationReport,
 } from '../memory/verification';
 import { compareSurfaces, findingHash, type SurfaceId } from '../memory/guidance-drift';
+import type { MemoryReviewQueue, MemoryReviewReason } from '../lib/project-memory';
 
 /**
  * ProjectMemory — one instance per project (idFromName(projectId)), canonical
@@ -4039,6 +4040,85 @@ export class ProjectMemory extends DurableObject<Env> {
         recordedAt: r.recorded_at,
         proposedAt: r.proposed_at,
       }));
+  }
+
+  /** Canonical human-governance queue. Only current leaf memories are actionable: an item that
+   * has already been superseded, or a decision a human already rejected, remains in history but
+   * does not keep paging the review desk forever. Classification lives here so every human sees
+   * the same reasons and counts regardless of client version. */
+  async reviewMemoryQueue(
+    projectId: string,
+    input: { reason?: MemoryReviewReason; limit?: number; offset?: number } = {},
+  ): Promise<MemoryReviewQueue> {
+    await this.assertProjectId(projectId);
+    type Reason = MemoryReviewReason;
+    type Row = {
+      id: string; kind: string; statement: string; authority: number; validity: string;
+      recorded_at: string; recorded_by_agent_id: string | null; proposed_at: string | null;
+      repository_key: string | null; branch: string | null; base_id: string | null;
+    };
+    const rows = this.ctx.storage.sql.exec<Row>(
+      `SELECT m.id, m.kind, m.statement, m.authority, m.validity, m.recorded_at,
+              m.recorded_by_agent_id, m.proposed_at, m.repository_key, m.branch, m.base_id
+       FROM memory_items m
+       WHERE m.rejected_at IS NULL
+         AND NOT EXISTS (SELECT 1 FROM memory_items newer WHERE newer.supersedes_memory_id = m.id)`,
+    ).toArray();
+    const contradictionSets = new Map<string, Set<string>>();
+    for (const row of this.ctx.storage.sql.exec<{ memory_item_id: string; contradicts_memory_item_id: string; set_id: string }>(
+      `SELECT c.memory_item_id, c.contradicts_memory_item_id, c.set_id
+       FROM contradictions c JOIN contradiction_sets s ON s.id = c.set_id
+       WHERE s.resolved_at IS NULL`,
+    ).toArray()) {
+      for (const id of [row.memory_item_id, row.contradicts_memory_item_id]) {
+        const sets = contradictionSets.get(id) ?? new Set<string>();
+        sets.add(row.set_id);
+        contradictionSets.set(id, sets);
+      }
+    }
+    const negativeFeedback = new Map<string, { count: number; latest: string }>();
+    const recentCutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1_000).toISOString();
+    for (const row of this.ctx.storage.sql.exec<{ memory_item_id: string; count: number; latest: string }>(
+      `SELECT memory_item_id, COUNT(*) AS count, MAX(created_at) AS latest
+       FROM feedback
+       WHERE vote = 'down' AND created_at >= ?1
+       GROUP BY memory_item_id`,
+      recentCutoff,
+    ).toArray()) negativeFeedback.set(row.memory_item_id, { count: Number(row.count), latest: row.latest });
+
+    const priority: Record<Reason, number> = {
+      proposed_decision: 0, contradiction: 1, stale_invalid: 2,
+      recent_negative_feedback: 3, low_authority: 4,
+    };
+    const classified = rows.flatMap((row) => {
+      const reasons: Reason[] = [];
+      if (row.proposed_at) reasons.push('proposed_decision');
+      if (contradictionSets.has(row.id)) reasons.push('contradiction');
+      if (row.validity !== 'active') reasons.push('stale_invalid');
+      if (negativeFeedback.has(row.id)) reasons.push('recent_negative_feedback');
+      if (row.authority <= 2) reasons.push('low_authority');
+      if (!reasons.length) return [];
+      const feedback = negativeFeedback.get(row.id);
+      return [{
+        id: row.id, kind: row.kind, statement: row.statement, authority: row.authority,
+        validity: row.validity, recordedAt: row.recorded_at, recordedByAgentId: row.recorded_by_agent_id,
+        proposedAt: row.proposed_at, repositoryKey: row.repository_key, branch: row.branch,
+        baseId: row.base_id, reasons, contradictionSetIds: [...(contradictionSets.get(row.id) ?? [])].sort(),
+        recentNegativeFeedbackCount: feedback?.count ?? 0, latestNegativeFeedbackAt: feedback?.latest ?? null,
+      }];
+    });
+    const reasons = Object.keys(priority) as Reason[];
+    const counts = Object.fromEntries(reasons.map((reason) => [reason, classified.filter((item) => item.reasons.includes(reason)).length])) as Record<Reason, number>;
+    const filtered = input.reason ? classified.filter((item) => item.reasons.includes(input.reason!)) : classified;
+    filtered.sort((a, b) => {
+      const aPriority = Math.min(...a.reasons.map((reason) => priority[reason]));
+      const bPriority = Math.min(...b.reasons.map((reason) => priority[reason]));
+      return aPriority - bPriority || b.recordedAt.localeCompare(a.recordedAt) || a.id.localeCompare(b.id);
+    });
+    const offset = Math.max(0, Math.floor(input.offset ?? 0));
+    const limit = Math.max(1, Math.min(100, Math.floor(input.limit ?? 50)));
+    const items = filtered.slice(offset, offset + limit);
+    return { items, counts, overallTotal: classified.length, total: filtered.length, offset, nextOffset: offset + items.length < filtered.length ? offset + items.length : null };
   }
 
   private loadMemoryRow(memoryId: string): { id: string; kind: string; proposed_at: string | null; authority: number } | undefined {

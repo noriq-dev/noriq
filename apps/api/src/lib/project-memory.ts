@@ -75,6 +75,40 @@ export interface MemoryItemRecord {
     observedPath: string | null;
   }>;
 }
+
+export type MemoryReviewReason =
+  | 'proposed_decision'
+  | 'contradiction'
+  | 'stale_invalid'
+  | 'recent_negative_feedback'
+  | 'low_authority';
+
+export interface MemoryReviewQueueItem {
+  id: string;
+  kind: string;
+  statement: string;
+  authority: number;
+  validity: string;
+  recordedAt: string;
+  recordedByAgentId: string | null;
+  proposedAt: string | null;
+  repositoryKey: string | null;
+  branch: string | null;
+  baseId: string | null;
+  reasons: MemoryReviewReason[];
+  contradictionSetIds: string[];
+  recentNegativeFeedbackCount: number;
+  latestNegativeFeedbackAt: string | null;
+}
+
+export interface MemoryReviewQueue {
+  items: MemoryReviewQueueItem[];
+  counts: Record<MemoryReviewReason, number>;
+  overallTotal: number;
+  total: number;
+  offset: number;
+  nextOffset: number | null;
+}
 /** One citation's verdict from a Runner's worktree-leased verification pass — see
  *  memory/verification.ts's `VerificationReportCitation` for the full field-by-field rationale.
  *  Re-declared here (not imported) because this is the STUB's own narrow view of the shape, the
@@ -153,6 +187,10 @@ export interface ProjectMemoryStub {
   listProposedDecisions(
     projectId: string,
   ): Promise<Array<{ id: string; statement: string; authority: number; recordedByAgentId: string | null; recordedAt: string; proposedAt: string }>>;
+  reviewMemoryQueue(
+    projectId: string,
+    input?: { reason?: MemoryReviewReason; limit?: number; offset?: number },
+  ): Promise<MemoryReviewQueue>;
   approveDecision(
     projectId: string,
     input: { memoryItemId: string; actorUserId: string; note?: string | null; revision?: string | null },

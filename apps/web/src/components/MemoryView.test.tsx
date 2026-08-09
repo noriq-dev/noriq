@@ -14,27 +14,36 @@
 // onOpenInspector(uri) / onOpenEgoNetwork(uri) props into the right tab, pre-seeded.
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { api, type ApiConstellation, type ApiGraphCoverageReason, type ApiMemoryHistory, type ApiMemoryItem } from '../api';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { api, type ApiConstellation, type ApiGraphCoverageReason, type ApiMemoryHistory, type ApiMemoryItem, type ApiMemoryReviewQueue } from '../api';
 import { MemoryView } from './MemoryView';
 import type { AppStore } from '../store';
 
 let container: HTMLDivElement;
 let root: Root | null = null;
 
-function fakeStore(): AppStore {
+function fakeStore(canManage = true): AppStore {
   return {
     currentPid: 'prj_1',
     helpers: { tasksOf: () => [] },
+    permissions: { canManage, canContribute: canManage, cappedByReadOnly: !canManage },
   } as unknown as AppStore;
 }
 
-function mount() {
+function mount(store = fakeStore()) {
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
-  act(() => root!.render(<MemoryView store={fakeStore()} />));
+  act(() => root!.render(<MemoryView store={store} />));
 }
+
+beforeEach(() => {
+  vi.spyOn(api, 'memoryReviewQueue').mockResolvedValue({
+    items: [],
+    counts: { proposed_decision: 0, contradiction: 0, stale_invalid: 0, recent_negative_feedback: 0, low_authority: 0 },
+    overallTotal: 0, total: 0, offset: 0, nextOffset: null,
+  });
+});
 
 afterEach(() => {
   act(() => root?.unmount());
@@ -59,8 +68,8 @@ const queryInput = () => container.querySelector('input[placeholder^="search mem
 
 /** The sub-tab strip (Map/Explore/Graph/Operations) — clicking is the "one extra interaction"
  *  every Phase 8 surface is now reachable through from the map landing surface. */
-const switchTab = (label: 'Map' | 'Explore' | 'Graph' | 'Operations') => {
-  const btn = [...container.querySelectorAll('button')].find((b) => b.textContent === label);
+const switchTab = (label: 'Map' | 'Review' | 'Explore' | 'Graph' | 'Operations') => {
+  const btn = [...container.querySelectorAll('button')].find((b) => b.textContent?.startsWith(label));
   if (!btn) throw new Error(`no "${label}" tab button found`);
   act(() => { btn.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
 };
@@ -115,6 +124,55 @@ describe('the memory view lands on the map (PLNR-287)', () => {
 
     expect(queryInput().placeholder).toContain('how do we handle X'); // Explore's own copy, not the map's
     expect(text()).not.toContain('unreachable'); // reached deliberately, nothing failed to get here
+  });
+});
+
+describe('the human memory review queue', () => {
+  const pending: ApiMemoryReviewQueue['items'][number] = {
+    id: 'mem_pending', kind: 'decision', statement: 'Use a single retry budget.', authority: 2,
+    validity: 'active', recordedAt: '2026-08-09T12:00:00.000Z', recordedByAgentId: 'agt_1',
+    proposedAt: '2026-08-09T12:00:00.000Z', repositoryKey: 'repo', branch: 'main', baseId: 'abc123',
+    reasons: ['proposed_decision', 'low_authority'], contradictionSetIds: [],
+    recentNegativeFeedbackCount: 0, latestNegativeFeedbackAt: null,
+  };
+  const queue: ApiMemoryReviewQueue = {
+    items: [pending],
+    counts: { proposed_decision: 1, contradiction: 0, stale_invalid: 0, recent_negative_feedback: 0, low_authority: 1 },
+    overallTotal: 1, total: 1, offset: 0, nextOffset: null,
+  };
+
+  it('draws managers to actionable proposed decisions and settles them with an explicit confirmation', async () => {
+    vi.mocked(api.memoryReviewQueue).mockResolvedValue(queue);
+    const approve = vi.spyOn(api, 'memoryApproveDecision').mockResolvedValue({ approvedMemoryId: 'mem_approved', transitionId: 'atr_1' });
+    vi.spyOn(api, 'memoryConstellation').mockResolvedValue(emptyConstellation());
+    mount(fakeStore(true));
+    await tick();
+    expect(text()).toContain('Review · 1');
+
+    switchTab('Review');
+    await tick();
+    expect(text()).toContain('Human governance');
+    expect(text()).toContain('Use a single retry budget.');
+    const approveButton = [...container.querySelectorAll('button')].find((button) => button.textContent === 'Approve decision')!;
+    act(() => approveButton.dispatchEvent(new MouseEvent('click', { bubbles: true })));
+    expect(text()).toContain('Approve this as a settled decision');
+    const confirm = [...container.querySelectorAll('button')].find((button) => button.textContent === 'Confirm approve')!;
+    await act(async () => { confirm.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
+    await tick();
+    expect(approve).toHaveBeenCalledWith('prj_1', 'mem_pending', undefined);
+  });
+
+  it('lets read-only humans inspect the same queue without rendering mutation controls', async () => {
+    vi.mocked(api.memoryReviewQueue).mockResolvedValue(queue);
+    vi.spyOn(api, 'memoryConstellation').mockResolvedValue(emptyConstellation());
+    mount(fakeStore(false));
+    await tick();
+    switchTab('Review');
+    await tick();
+    expect(text()).toContain('READ-ONLY REVIEW');
+    expect(text()).toContain('Inspect evidence & history');
+    expect(text()).not.toContain('Approve decision');
+    expect(text()).not.toContain('Reject');
   });
 });
 

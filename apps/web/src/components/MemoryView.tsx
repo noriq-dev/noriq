@@ -1,11 +1,11 @@
 // Project Memory explorer (PLNR-271, restructured by PLNR-287) — Phase 8's ONE new project view.
-// Carries an in-view four-tab strip (view-local state, never a ViewId or a store field, per the
+// Carries an in-view tab strip (view-local state, never a ViewId or a store field, per the
 // PLNR-271 locked decision that survives this restructuring): Map (PLNR-285/286's star map — the
 // PRIMARY landing surface as of PLNR-287, §5's "searchable constellation"), Explore (this file's
 // own tab — the deliberately-reachable textual mode, same answers, same evidence inspector),
 // Graph (PLNR-272, MemoryGraph.tsx — the ego-network exploration §5 requires) and Operations
 // (PLNR-273, MemoryOps.tsx). Nothing Phase 8 shipped was removed; the map became the front door
-// and the other three are each one tab-click away.
+// and the governance queue plus the other three surfaces are each one tab-click away.
 //
 // The central question this view answers for a human, for ONE memory: why does it exist, what
 // supports it, is that evidence currently verified, and what replaced or contradicts it. Every
@@ -22,13 +22,15 @@ import type { AppStore } from '../store';
 import { MonoTag, SectionLabel } from './bits';
 import { MemoryGraph } from './MemoryGraph';
 import { MemoryOps } from './MemoryOps';
+import { MemoryReview } from './MemoryReview';
 import { MemoryStarMap } from './MemoryStarMap';
 import { Button, Select, TextArea, TextInput } from './ui';
 
-type MemorySubTab = 'map' | 'explore' | 'graph' | 'operations';
+type MemorySubTab = 'map' | 'review' | 'explore' | 'graph' | 'operations';
 
 const SUB_TABS: Array<{ id: MemorySubTab; label: string }> = [
   { id: 'map', label: 'Map' },
+  { id: 'review', label: 'Review' },
   { id: 'explore', label: 'Explore' },
   { id: 'graph', label: 'Graph' },
   { id: 'operations', label: 'Operations' },
@@ -72,6 +74,16 @@ export function MemoryView({ store }: { store: AppStore }) {
   // (locked decision) — this file supplies the callbacks, it does not reach into the map.
   const [graphSeedUri, setGraphSeedUri] = useState<string | null>(null);
   const [inspectorUri, setInspectorUri] = useState<string | null>(null);
+  const [reviewCount, setReviewCount] = useState<number | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setReviewCount(null);
+    void api.memoryReviewQueue(store.currentPid, { limit: 1 }).then((queue) => {
+      if (!cancelled) setReviewCount(queue.overallTotal);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [store.currentPid]);
 
   useEffect(() => {
     const memoryId = sessionStorage.getItem('noriq.openMemory');
@@ -98,13 +110,14 @@ export function MemoryView({ store }: { store: AppStore }) {
                 color: tab === t.id ? 'var(--text)' : 'var(--text-mid)',
               }}
             >
-              {t.label}
+              {t.label}{t.id === 'review' && reviewCount != null && reviewCount > 0 ? ` · ${reviewCount}` : ''}
             </button>
           ))}
         </div>
       </div>
       <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
         {tab === 'map' && <MemoryStarMap pid={store.currentPid} onOpenEgoNetwork={openEgoNetwork} onOpenInspector={openInspector} />}
+        {tab === 'review' && <MemoryReview pid={store.currentPid} store={store} onOpenInspector={openInspector} onQueueChange={setReviewCount} />}
         {tab === 'explore' && <ExploreTab pid={store.currentPid} store={store} initialSelectionUri={inspectorUri} onOpenEgoNetwork={openEgoNetwork} />}
         {tab === 'graph' && <MemoryGraph pid={store.currentPid} store={store} initialSeedUri={graphSeedUri} />}
         {tab === 'operations' && <MemoryOps pid={store.currentPid} store={store} />}

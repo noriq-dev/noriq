@@ -40,7 +40,7 @@ import { onboarding } from './onboarding';
 import { z } from 'zod';
 import {
   listProjectRepositories, listRepositoryCheckouts, resolveRepositoryByKey, loadPriorEffort, searchHitToEvidenceItem,
-  getMemoryRegistry, memoryCapabilities, deriveRepositoryMemoryState, checkoutAssociationState, type ProjectMemoryStub,
+  getMemoryRegistry, memoryCapabilities, deriveRepositoryMemoryState, checkoutAssociationState, type ProjectMemoryStub, type MemoryReviewReason,
 } from './lib/project-memory';
 import { renderEvidenceFrame, type EvidenceFrameItem } from './memory/evidence-frame';
 import { assembleContextPack } from './memory/context-pack';
@@ -1586,6 +1586,17 @@ app.post('/api/projects/:pid/memory/context', userAuth, async (c) => {
 app.get('/api/projects/:pid/memory/proposed-decisions', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
   return c.json({ decisions: await memoryStub(c.env, pid).listProposedDecisions(pid) });
+});
+app.get('/api/projects/:pid/memory/review-queue', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const reason = c.req.query('reason') as MemoryReviewReason | undefined;
+  const allowed = new Set(['proposed_decision', 'contradiction', 'stale_invalid', 'recent_negative_feedback', 'low_authority']);
+  if (reason && !allowed.has(reason)) return c.json({ error: 'invalid review reason' }, 400);
+  const limit = Number(c.req.query('limit') ?? 50);
+  const offset = Number(c.req.query('offset') ?? 0);
+  return c.json(await memoryStub(c.env, pid).reviewMemoryQueue(pid, {
+    reason, limit: Number.isFinite(limit) ? limit : 50, offset: Number.isFinite(offset) ? offset : 0,
+  }));
 });
 app.post('/api/projects/:pid/memory/items/:id/approve', userAuth, async (c) => {
   const pid = c.req.param('pid')!;

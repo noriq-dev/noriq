@@ -36,6 +36,13 @@ interface MemoryRpc {
     id: string; statement: string; authority: number; supersedesMemoryId: string | null; proposedAt: string | null; rejectedAt: string | null;
   } | null>;
   listProposedDecisions(pid: string): Promise<Array<{ id: string; statement: string; authority: number; proposedAt: string }>>;
+  reviewMemoryQueue(pid: string, input?: { reason?: string; limit?: number; offset?: number }): Promise<{
+    items: Array<{ id: string; reasons: string[]; contradictionSetIds: string[]; recentNegativeFeedbackCount: number }>;
+    counts: Record<string, number>; overallTotal: number; total: number; nextOffset: number | null;
+  }>;
+  addContradiction(pid: string, input: { memoryItemId: string; contradictsMemoryItemId: string; actor: { kind: string; id: string | null } }): Promise<{ setId: string }>;
+  recordFeedback(pid: string, input: { memoryItemId: string; vote: 'up' | 'down'; actor: { kind: string; id: string | null } }): Promise<{ feedbackId: string }>;
+  transitionMemoryValidity(pid: string, input: { memoryItemId: string; validity: 'active' | 'stale' | 'invalid'; actor: { kind: string; id: string | null } }): Promise<{ ok: true }>;
   approveDecision(pid: string, input: { memoryItemId: string; actorUserId: string; note?: string | null }): Promise<{ approvedMemoryId: string; transitionId: string }>;
   rejectDecision(pid: string, input: { memoryItemId: string; actorUserId: string; note?: string | null }): Promise<{ ok: true; transitionId: string }>;
   // PLNR-266: promotion is now gated on PLNR-265's verification path — `skipped` carries a
@@ -110,6 +117,33 @@ describe('agent-recorded decisions are proposed and non-authoritative', () => {
     const { memoryId } = await memory(projectId).recordMemory(projectId, { kind: 'learning', statement: 'a plain learning', actor: AGENT });
     const row = await memory(projectId).getMemoryItem(projectId, memoryId);
     expect(row!.proposedAt).toBeNull();
+  });
+});
+
+describe('human memory review queue', () => {
+  it('classifies only current memories by every actionable governance reason and paginates deterministically', async () => {
+    const { projectId } = await newOwnedProject('pm-review-queue@example.com', 'PMRVWQ');
+    const m = memory(projectId);
+    const proposed = await m.recordMemory(projectId, { kind: 'decision', statement: 'proposed retry policy', actor: AGENT });
+    const stale = await m.recordMemory(projectId, { kind: 'learning', statement: 'old deployment fact', actor: AGENT });
+    const left = await m.recordMemory(projectId, { kind: 'requirement', statement: 'requests must retry', actor: AGENT });
+    const right = await m.recordMemory(projectId, { kind: 'requirement', statement: 'requests must never retry', actor: AGENT });
+    const flagged = await m.recordMemory(projectId, { kind: 'hazard', statement: 'the warning may be wrong', actor: AGENT });
+    await m.transitionMemoryValidity(projectId, { memoryItemId: stale.memoryId, validity: 'stale', actor: { kind: 'human', id: 'usr_reviewer' } });
+    const contradiction = await m.addContradiction(projectId, { memoryItemId: left.memoryId, contradictsMemoryItemId: right.memoryId, actor: AGENT });
+    await m.recordFeedback(projectId, { memoryItemId: flagged.memoryId, vote: 'down', actor: { kind: 'human', id: 'usr_reviewer' } });
+
+    const queue = await m.reviewMemoryQueue(projectId, { limit: 2 });
+    expect(queue.overallTotal).toBe(5);
+    expect(queue.counts).toMatchObject({ proposed_decision: 1, contradiction: 2, stale_invalid: 1, recent_negative_feedback: 1, low_authority: 5 });
+    expect(queue.items[0]).toMatchObject({ id: proposed.memoryId, reasons: expect.arrayContaining(['proposed_decision', 'low_authority']) });
+    expect(queue.items).toHaveLength(2);
+    expect(queue.nextOffset).toBe(2);
+
+    const contradictions = await m.reviewMemoryQueue(projectId, { reason: 'contradiction', limit: 10 });
+    expect(contradictions.total).toBe(2);
+    expect(contradictions.items.map((item) => item.id).sort()).toEqual([left.memoryId, right.memoryId].sort());
+    expect(contradictions.items.every((item) => item.contradictionSetIds.includes(contradiction.setId))).toBe(true);
   });
 });
 
@@ -370,6 +404,25 @@ describe('approve/reject exist only under userAuth REST — no MCP tool reaches 
     const afterList = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/memory/proposed-decisions`, { headers: { Cookie: cookie } });
     const afterBody = (await afterList.json()) as { decisions: unknown[] };
     expect(afterBody.decisions).toHaveLength(0); // both decided, neither still pending
+  });
+
+  it('lets viewers read the governance queue but denies its manager-only decision mutations', async () => {
+    const { projectId } = await newOwnedProject('pm-review-owner@example.com', 'PMRVWAU');
+    const viewer = await createUser('pm-review-viewer@example.com', 'Review Viewer', 'longenough1');
+    const viewerCookie = await loginSession('pm-review-viewer@example.com', 'longenough1');
+    await appEnv.DB.prepare(
+      "INSERT INTO project_grants (project_id, principal_type, principal_id, role) VALUES (?, 'user', ?, 'viewer')",
+    ).bind(projectId, viewer.id).run();
+    const { memoryId } = await memory(projectId).recordMemory(projectId, { kind: 'decision', statement: 'manager decision', actor: AGENT });
+
+    const queue = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/memory/review-queue`, { headers: { Cookie: viewerCookie } });
+    expect(queue.status).toBe(200);
+    expect((await queue.json() as { items: Array<{ id: string }> }).items.map((item) => item.id)).toContain(memoryId);
+    const approve = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/memory/items/${memoryId}/approve`, {
+      method: 'POST', headers: { Cookie: viewerCookie, 'Content-Type': 'application/json' }, body: '{}',
+    });
+    expect(approve.status).toBe(403);
+    expect(await approve.json()).toMatchObject({ code: 'project_action_denied', action: 'manage' });
   });
 });
 
