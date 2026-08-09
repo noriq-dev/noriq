@@ -2732,6 +2732,19 @@ export class ProjectMemory extends DurableObject<Env> {
         const verdict = citationVerdict(check);
         const baseId = gen?.baseId ?? null;
         const branch = gen?.branch ?? null;
+        // A Runner/worktree report is the thorough tier (§15). While it describes the same
+        // active base the cheap index check is looking at, preserve its richer verdict (notably
+        // `moved`) and observed path. The source remains a free label for verifier identity;
+        // `server-index` is the sole cheap-tier label, so every other non-null source has higher
+        // fidelity. Once the active base advances, this guard naturally expires and the cheap
+        // tier may establish a verdict for the new generation.
+        const preserveThoroughVerdict =
+          row.verification_source !== null && row.verification_source !== source &&
+          row.last_verified_base_id === baseId;
+        if (preserveThoroughVerdict) {
+          results.push({ evidenceId: row.id, memoryItemId: row.memory_item_id, verificationState: row.verification_state });
+          continue;
+        }
         results.push({ evidenceId: row.id, memoryItemId: row.memory_item_id, verificationState: verdict });
         const unchanged =
           row.verification_state === verdict && row.last_verified_base_id === baseId &&

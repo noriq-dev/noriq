@@ -322,6 +322,43 @@ describe('verifyMemoryCitations — the cheap server-side tier', () => {
     expect(after!.evidence[0]!.verificationSource).toBe('server-index');
   });
 
+  it("does not overwrite a thorough Runner verdict for the active base, but may replace it after the active base advances", async () => {
+    const { projectId } = await newOwnedProject('pm-verify-precedence@example.com', 'PMVPREC');
+    await stageAndProject(projectId, {
+      generationId: 'gen_prec1', repositoryKey: 'repo-a', branch: 'main', baseId: 'sha_1', rows: [],
+    });
+    const { memoryId } = await memory(projectId).recordMemory(projectId, {
+      kind: 'learning', statement: 'the helper moved to src/new.ts', authority: 3,
+      evidence: [{ repositoryKey: 'repo-a', branch: 'main', baseId: 'sha_1', path: 'src/old.ts' }],
+      actor: { kind: 'human', id: 'user_1' },
+    });
+    const evidenceHash = (await memory(projectId).getMemoryItem(projectId, memoryId))!.evidence[0]!.evidenceHash!;
+    await memory(projectId).acceptVerificationReport(projectId, {
+      citations: [{
+        memoryItemId: memoryId, evidenceHash, state: 'moved', baseId: 'sha_1', branch: 'main', observedPath: 'src/new.ts',
+      }],
+      source: 'runner-report',
+    }, { kind: 'agent', id: 'agt_runner' });
+
+    const sameBase = await memory(projectId).verifyMemoryCitations(projectId, { memoryItemId: memoryId });
+    expect(sameBase.updated).toBe(0);
+    expect(sameBase.results[0]!.verificationState).toBe('moved');
+    const preserved = (await memory(projectId).getMemoryItem(projectId, memoryId))!.evidence[0]!;
+    expect(preserved.verificationSource).toBe('runner-report');
+    expect(preserved.observedPath).toBe('src/new.ts');
+
+    await stageAndProject(projectId, {
+      generationId: 'gen_prec2', repositoryKey: 'repo-a', branch: 'main', baseId: 'sha_2', rows: [],
+    });
+    const nextBase = await memory(projectId).verifyMemoryCitations(projectId, { memoryItemId: memoryId });
+    expect(nextBase.updated).toBe(1);
+    expect(nextBase.results[0]!.verificationState).toBe('missing');
+    const replaced = (await memory(projectId).getMemoryItem(projectId, memoryId))!.evidence[0]!;
+    expect(replaced.lastVerifiedBaseId).toBe('sha_2');
+    expect(replaced.verificationSource).toBe('server-index');
+    expect(replaced.observedPath).toBeNull();
+  });
+
   it('a memory with no repository evidence keeps its validity through every verification sweep', async () => {
     const { projectId } = await newOwnedProject('pm-verify-noevidence@example.com', 'PMVNOEV');
     const { memoryId } = await memory(projectId).recordMemory(projectId, {
