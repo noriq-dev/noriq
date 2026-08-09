@@ -71,13 +71,29 @@ export function Rail({ store, open, onNavigate }: { store: AppStore; open?: bool
       </button>
 
       <div style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: '2px 8px 8px', minHeight: 0 }}>
+        <button
+          onClick={() => actions.setView('ask')}
+          className="hover-bright"
+          aria-current={store.view === 'ask' ? 'page' : undefined}
+          style={{
+            cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 9, width: '100%',
+            padding: '8px', margin: '2px 0 7px', borderRadius: 8, textAlign: 'left',
+            background: store.view === 'ask' ? 'rgba(198,242,78,.09)' : 'transparent',
+            border: `1px solid ${store.view === 'ask' ? 'rgba(198,242,78,.25)' : 'transparent'}`,
+            color: store.view === 'ask' ? 'var(--text)' : 'var(--text-soft)',
+          }}
+        >
+          <span style={{ width: 26, textAlign: 'center', color: 'var(--accent)', fontSize: 15, lineHeight: 1 }}>✦</span>
+          <span style={{ fontSize: 12.5, fontWeight: 600 }}>Ask</span>
+        </button>
+
         {ungrouped.length > 0 && (
           <div style={{ marginBottom: 6 }}>
             <div style={{ fontFamily: 'var(--mono)', fontSize: 9, letterSpacing: '.08em', textTransform: 'uppercase', color: 'var(--text-faint)', padding: '8px 8px 5px' }}>
               your projects
             </div>
             {ungrouped.map((p) => (
-              <ProjectRow key={p.id} p={p} active={p.id === currentPid} onSelect={() => actions.selectProject(p.id)} />
+              <ProjectRow key={p.id} p={p} active={store.view !== 'ask' && p.id === currentPid} onSelect={() => actions.selectProject(p.id)} />
             ))}
           </div>
         )}
@@ -109,7 +125,7 @@ export function Rail({ store, open, onNavigate }: { store: AppStore; open?: bool
                 {isCollapsed && liveCount > 0 && <LiveDot size={5} />}
               </button>
               {!isCollapsed && projects.map((p) => (
-                <ProjectRow key={p.id} p={p} active={p.id === currentPid} onSelect={() => actions.selectProject(p.id)} />
+                <ProjectRow key={p.id} p={p} active={store.view !== 'ask' && p.id === currentPid} onSelect={() => actions.selectProject(p.id)} />
               ))}
             </div>
           );

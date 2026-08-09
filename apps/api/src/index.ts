@@ -14,7 +14,7 @@ import { taskSearchFilters } from './lib/search';
 import type { ExecutionSpecInput, RunStatus } from '@noriq-dev/shared';
 import { readExecutionSpec } from './lib/execution-spec';
 import { search, searchBackend, reindexProject, ALL_KINDS, type SearchKind } from './search';
-import { answerQuestion, generationClient } from './ask';
+import { answerQuestion, generationClient, normalizeHistory } from './ask';
 import { verifyUploadToken, resolveUploadSecret, signIngestToken, verifyIngestToken, type IngestClaims } from './lib/upload-token';
 import { USER_PROJECT_WHERE, taskWireStatus, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
 import { advertisedWorkflowNames } from './lib/workflows';
@@ -1356,7 +1356,7 @@ app.get('/api/projects/:pid/memory/contradictions/:setId', userAuth, async (c) =
 
 // Hybrid memory retrieval (PLNR-257) — the human-facing twin of the search_project_memory MCP
 // tool; same DO RPC, same result shape. POST (not GET) because the filter set is a body, not a
-// couple of query params, matching /api/projects/:pid/ask's shape.
+// couple of query params.
 //
 // PLNR-271/§13: the MCP tool has rendered its hits through `renderEvidenceFrame` since PLNR-270
 // (a human reading agent-recorded memory is still reading untrusted content — §13 draws no
@@ -1608,21 +1608,29 @@ app.post('/api/projects/:pid/search/reindex', userAuth, async (c) => {
   return c.json(await reindexProject(c.env, backend, c.req.param('pid')!, offset));
 });
 
-// "Ask the project" (PLNR-219) — read-only RAG Q&A for the humans: retrieval reuses /search
-// (semantic → keyword), generation runs on Workers AI, grounded only on the retrieved hits.
-// Requires the AI binding (retrieval can degrade to keyword, but there's no model to answer
-// with) → 503 without it. Creates nothing; returns the answer plus its sources. Project
-// reach is already gated by requireProjectAccess on /api/projects/:pid/*.
-app.post('/api/projects/:pid/ask', userAuth, async (c) => {
+// Global Ask — general multi-turn chat enriched with tasks/docs/plans from every active project
+// the signed-in user can reach. This route intentionally sits outside /api/projects/:pid/*:
+// it derives its complete retrieval scope from USER_PROJECT_WHERE on every request instead of
+// trusting project ids from the browser. Admins get their normal user-scoped set, not admin-all.
+app.post('/api/ask', userAuth, async (c) => {
+  const rl = await rateLimit(c.env, `ask:${c.var.user!.id}`, 20);
+  if (!rl.ok) return c.json(tooMany, 429, { 'Retry-After': String(rl.retryAfter) });
   const gen = generationClient(c.env);
   if (!gen) return c.json({ error: 'no AI backend — asking questions requires the Workers AI (AI) binding' }, 503);
-  const { question } = await c.req.json<{ question?: string }>().catch(() => ({ question: undefined }));
+  const { question, history } = await c.req.json<{ question?: string; history?: unknown }>().catch(() => ({ question: undefined, history: undefined }));
   const q = question?.trim();
   if (!q) return c.json({ error: 'question required' }, 400);
-  const pid = c.req.param('pid')!;
-  const project = await c.env.DB.prepare('SELECT name FROM projects WHERE id = ?').bind(pid).first<{ name: string }>();
+  const { results: projects } = await c.env.DB.prepare(
+    `SELECT p.id, p.key, p.name FROM projects p
+     WHERE p.status = 'active' AND ${USER_PROJECT_WHERE}
+     ORDER BY p.created_at`,
+  ).bind(c.var.user!.id).all<{ id: string; key: string; name: string }>();
   try {
-    return c.json(await answerQuestion(c.env, gen, { question: q, projectId: pid, projectName: project?.name ?? 'this project' }));
+    return c.json(await answerQuestion(c.env, gen, {
+      question: q,
+      projects,
+      history: normalizeHistory(history),
+    }));
   } catch (e) {
     return c.json({ error: `answer generation failed: ${e instanceof Error ? e.message : 'unknown error'}` }, 502);
   }

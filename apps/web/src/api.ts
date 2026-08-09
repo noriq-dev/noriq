@@ -200,11 +200,11 @@ export const api = {
       'GET',
       `/api/projects/${pid}/search?q=${encodeURIComponent(q)}${kinds?.length ? `&kinds=${kinds.join(',')}` : ''}${limit ? `&limit=${limit}` : ''}`,
     ),
-  /** Ask a natural-language question about the project (PLNR-219): RAG over tasks/docs/plans,
-   *  answered by Workers AI, grounded on the returned sources. 503 without the AI binding. */
-  ask: (pid: string, question: string) =>
-    req<{ answer: string; mode: 'semantic' | 'keyword'; sources: ApiAskSource[] }>(
-      'POST', `/api/projects/${pid}/ask`, { question }),
+  /** Global, multi-turn Ask chat. Project scope is derived server-side from the session; the
+   *  browser sends conversation history but can never choose or broaden retrieval access. */
+  ask: (question: string, history: ApiAskHistoryMessage[]) =>
+    req<{ answer: string; mode: 'semantic' | 'keyword'; model: string; sources: ApiAskSource[] }>(
+      'POST', '/api/ask', { question, history }),
   acknowledgeSignal: (pid: string, sid: string, dismiss = false) =>
     req('POST', `/api/projects/${pid}/signals/${sid}/acknowledge`, { dismiss }),
   addDependency: (pid: string, tid: string, dependsOnTaskId: string) =>
@@ -660,7 +660,12 @@ export interface ApiSignalAnswer {
   answer: string | string[] | number | boolean;
 }
 
-/** One grounding source behind an /ask answer (PLNR-219). */
+export interface ApiAskHistoryMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+/** One cross-project grounding source behind a global /ask answer. */
 export interface ApiAskSource {
   kind: 'task' | 'doc' | 'plan';
   id: string;
@@ -668,6 +673,9 @@ export interface ApiAskSource {
   title: string;
   status?: string;
   score: number;
+  projectId: string;
+  projectKey: string;
+  projectName: string;
 }
 
 /** One hit from /api/projects/:pid/search (PLNR-184; memory/episode kinds added PLNR-255). */

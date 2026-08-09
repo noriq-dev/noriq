@@ -13,7 +13,6 @@ const TABS: Array<{ id: ViewId; label: string }> = [
   { id: 'roadmap', label: 'Roadmap' },
   { id: 'review', label: 'Review' },
   { id: 'docs', label: 'Docs' },
-  { id: 'ask', label: 'Ask' },
   // Project Memory explorer (PLNR-271/272/273) — ONE tab for the whole feature; Explore/
   // Graph/Operations are an in-view sub-tab strip (MemoryView.tsx), not three TopBar entries.
   { id: 'memory', label: 'Memory' },

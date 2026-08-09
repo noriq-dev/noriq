@@ -79,13 +79,17 @@ export function safeDecode(s: string): string {
   try { return decodeURIComponent(s); } catch { return s; }
 }
 
-function parseUrl(): { pid: string | null; view: ViewId; task: string | null } {
+export function parseUrl(): { pid: string | null; view: ViewId; task: string | null } {
   const m = location.pathname.match(/^\/p\/([^/]+)(?:\/([a-z]+))?/);
-  const view = location.pathname === '/settings' ? 'settings' : (m?.[2] as ViewId | undefined);
+  const view = location.pathname === '/settings'
+    ? 'settings'
+    : location.pathname === '/ask'
+      ? 'ask'
+      : (m?.[2] as ViewId | undefined);
   return {
     pid: m?.[1] ? safeDecode(m[1]) : null,
     view: view && VIEWS.includes(view) ? view : m ? 'control' : 'home',
-    task: new URLSearchParams(location.search).get('task'),
+    task: view === 'ask' ? null : new URLSearchParams(location.search).get('task'),
   };
 }
 
@@ -378,7 +382,13 @@ export function useAppStore() {
   const popping = useRef(false);
   useEffect(() => {
     if (!user) return;
-    const path = view === 'settings' ? '/settings' : view === 'home' || !currentPid ? '/' : `/p/${encodeURIComponent(currentPid)}/${view}`;
+    const path = view === 'settings'
+      ? '/settings'
+      : view === 'ask'
+        ? '/ask'
+        : view === 'home' || !currentPid
+          ? '/'
+          : `/p/${encodeURIComponent(currentPid)}/${view}`;
     const target = path + buildUrlSearch(location.search, selectedTaskId);
     if (location.pathname + location.search !== target) {
       if (popping.current) {
@@ -535,17 +545,20 @@ export function useAppStore() {
       if (id === pidRef.current) {
         // Re-selecting the current project (e.g. from Settings): don't blank the
         // snapshot — the load effect won't re-fire for an unchanged pid (PLNR-37).
-        setView((v) => (v === 'settings' || v === 'admin' || v === 'agents' || v === 'home' ? 'control' : v));
+        setView((v) => (v === 'settings' || v === 'admin' || v === 'agents' || v === 'home' || v === 'ask' ? 'control' : v));
         refresh();
         return;
       }
       setCurrentPid(id);
       setSelectedTaskId(null);
       setSnapshot(null);
-      setView((v) => (v === 'settings' || v === 'admin' || v === 'home' ? 'control' : v));
+      setView((v) => (v === 'settings' || v === 'admin' || v === 'home' || v === 'ask' ? 'control' : v));
       lastSeq.current = 0;
     },
-    setView,
+    setView(next: ViewId) {
+      setView(next);
+      if (next === 'ask') setSelectedTaskId(null);
+    },
     openAdmin() {
       setView('admin');
       setSelectedTaskId(null);

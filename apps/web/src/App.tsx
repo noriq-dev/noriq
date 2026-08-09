@@ -85,7 +85,7 @@ export function App() {
   }
 
   const project = store.data.projects.find((p) => p.id === store.currentPid);
-  const projectView = project && !['home', 'settings', 'admin'].includes(store.view);
+  const projectView = project && !['home', 'settings', 'admin', 'ask'].includes(store.view);
 
   return (
     <div style={{ height: '100vh', display: 'flex', background: 'var(--bg)' }}>
@@ -103,16 +103,17 @@ export function App() {
           </button>
           <Logo size={22} radius={6} />
           <span style={{ fontWeight: 700, fontSize: 14.5, letterSpacing: '-.01em', color: 'var(--text)' }}>
-            {project && projectView ? project.name : 'Noriq'}
+            {store.view === 'ask' ? 'Ask' : project && projectView ? project.name : 'Noriq'}
           </span>
           <div style={{ flex: 1 }} />
           <ThemeButton size={34} />
         </div>
         {projectView && <TopBar store={store} />}
         <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
-          {(store.view === 'home' || (!project && store.view !== 'settings' && store.view !== 'admin')) && <Home store={store} />}
+          {(store.view === 'home' || (!project && !['settings', 'admin', 'ask'].includes(store.view))) && <Home store={store} />}
           {store.view === 'settings' && <SettingsView store={store} />}
           {store.view === 'admin' && <AdminView store={store} />}
+          {store.view === 'ask' && <AskView store={store} />}
           {projectView && (
             <>
               {store.view === 'control' && <MissionControl store={store} />}
@@ -121,7 +122,6 @@ export function App() {
               {store.view === 'plans' && <PlansView store={store} />}
               {store.view === 'review' && <ReviewView store={store} />}
               {store.view === 'docs' && <DocsView store={store} />}
-              {store.view === 'ask' && <AskView store={store} />}
               {store.view === 'roadmap' && <RoadmapView store={store} />}
               {store.view === 'runs' && <RunsView store={store} />}
               {store.view === 'agents' && <AgentsView store={store} />}
@@ -137,4 +137,3 @@ export function App() {
     </div>
   );
 }
-

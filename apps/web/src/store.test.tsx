@@ -2,7 +2,7 @@
 // Called during hook init and on popstate, an unhandled throw blanked the whole app.
 // safeDecode must never throw — it falls back to the raw value.
 import { describe, expect, it } from 'vitest';
-import { buildUrlSearch, safeDecode } from './store';
+import { buildUrlSearch, parseUrl, safeDecode } from './store';
 
 describe('safeDecode (PLNR-113)', () => {
   it('decodes valid percent-encoding', () => {
@@ -14,6 +14,14 @@ describe('safeDecode (PLNR-113)', () => {
     expect(() => safeDecode('%')).not.toThrow();
     expect(safeDecode('%')).toBe('%');
     expect(safeDecode('%E0%A4%A')).toBe('%E0%A4%A');
+  });
+});
+
+describe('global Ask route', () => {
+  it('parses /ask without requiring a selected project', () => {
+    history.replaceState(null, '', '/ask?task=stale_project_task');
+    expect(parseUrl()).toEqual({ pid: null, view: 'ask', task: null });
+    history.replaceState(null, '', '/');
   });
 });
 
