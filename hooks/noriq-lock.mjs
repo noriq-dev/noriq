@@ -15,13 +15,12 @@
 //   NORIQ_BRANCH   branch scope for the lock       (default: current git branch, then .noriq)
 //   NORIQ_SESSION  lock-holder session id          (default: stable per-repo id)
 //   NORIQ_TASK     link acquired locks to this task id/key (optional)
+//
+// PLNR-308: the config/transport/session helpers below (git, .noriq marker, MCP tools/call, project
+// resolution) moved into lib.mjs so hooks/noriq-memory.mjs can share them — this file's own
+// behavior is unchanged (see hooks/lib.test.mjs + hooks/integration.test.mjs, both unmodified).
 
-import { execFileSync } from 'node:child_process';
-import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { extractPaths, toRepoRelative, denyReason } from './lib.mjs';
+import { extractPaths, toRepoRelative, denyReason, git, readNoriqMarker, readStdinPayload, defaultSessionId, callTool, resolveProjectId } from './lib.mjs';
 
 const ALLOW = 0;
 const DENY = 2; // PreToolUse: exit 2 blocks the tool and feeds stderr back to Claude
@@ -31,66 +30,8 @@ function deny(reason) { process.stderr.write(reason + '\n'); process.exit(DENY);
 /** Fail-open: warn (non-fatally) and allow. */
 function bail(msg) { process.stderr.write(`[noriq-lock] ${msg} — allowing (advisory).\n`); process.exit(ALLOW); }
 
-function git(args, cwd) {
-  try { return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); }
-  catch { return null; }
-}
-
-/** Tiny .noriq/project.toml reader — just the two scalars we use, no TOML dep. */
-function readNoriqMarker(gitRoot) {
-  try {
-    const txt = readFileSync(join(gitRoot, '.noriq', 'project.toml'), 'utf8');
-    const key = txt.match(/^\s*key\s*=\s*"([^"]+)"/m)?.[1] ?? null;
-    const defaultBranch = txt.match(/^\s*defaultBranch\s*=\s*"([^"]+)"/m)?.[1] ?? null;
-    return { key, defaultBranch };
-  } catch { return { key: null, defaultBranch: null }; }
-}
-
-async function callTool(cfg, name, args) {
-  const res = await fetch(`${cfg.url}/mcp`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${cfg.token}`,
-      'Content-Type': 'application/json',
-      Accept: 'application/json, text/event-stream',
-      'Mcp-Session-Id': cfg.session,
-    },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }),
-  });
-  const raw = await res.text();
-  if (res.status !== 200) throw new Error(`${name} → HTTP ${res.status}`);
-  // Response is JSON or an SSE frame carrying the JSON-RPC message.
-  let msg;
-  if ((res.headers.get('content-type') || '').includes('text/event-stream')) {
-    const data = raw.split('\n').filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trim()).join('');
-    msg = JSON.parse(data);
-  } else {
-    msg = JSON.parse(raw);
-  }
-  if (msg.error) throw new Error(`${name} rpc: ${JSON.stringify(msg.error)}`);
-  const text = msg.result?.content?.[0]?.text ?? '';
-  const jsonPart = text.split('\n\n--- notices ---\n')[0];
-  return { isError: msg.result?.isError === true, text, body: safeJson(jsonPart) };
-}
-
-const safeJson = (s) => { try { return JSON.parse(s); } catch { return null; } };
-
-/** Resolve NORIQ_PROJECT (id or key) → prj_ id, caching key→id lookups per (url,key). */
-async function resolveProjectId(cfg, projectRef) {
-  if (!projectRef) return null;
-  if (projectRef.startsWith('prj_')) return projectRef;
-  const cacheDir = join(tmpdir(), 'noriq-lock');
-  const cacheFile = join(cacheDir, createHash('sha1').update(`${cfg.url}::${projectRef}`).digest('hex') + '.json');
-  try { return JSON.parse(readFileSync(cacheFile, 'utf8')).id; } catch { /* miss */ }
-  const listed = await callTool(cfg, 'list_projects', {});
-  const match = (listed.body?.projects ?? []).find((p) => p.key === projectRef || p.id === projectRef);
-  if (!match) return null;
-  try { mkdirSync(cacheDir, { recursive: true }); writeFileSync(cacheFile, JSON.stringify({ id: match.id })); } catch { /* non-fatal */ }
-  return match.id;
-}
-
 async function main() {
-  const payload = safeJson(readFileSync(0, 'utf8')) ?? {}; // hook JSON on stdin (fd 0)
+  const payload = readStdinPayload();
   const event = payload.hook_event_name;
   const cwd = payload.cwd || process.cwd();
   const gitRoot = git(['rev-parse', '--show-toplevel'], cwd);
@@ -100,7 +41,7 @@ async function main() {
   const token = process.env.NORIQ_TOKEN;
   if (!url || !token) bail('NORIQ_URL / NORIQ_TOKEN not set');
   const marker = readNoriqMarker(gitRoot);
-  const session = process.env.NORIQ_SESSION || `noriq-lock-${createHash('sha1').update(gitRoot).digest('hex').slice(0, 16)}`;
+  const session = process.env.NORIQ_SESSION || defaultSessionId('noriq-lock', gitRoot);
   const cfg = { url: url.replace(/\/$/, ''), token, session };
 
   const projectId = await resolveProjectId(cfg, process.env.NORIQ_PROJECT || marker.key);

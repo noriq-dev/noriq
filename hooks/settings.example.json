@@ -1,6 +1,13 @@
 {
-  "//": "Noriq file-lock hook — copy these blocks into ~/.claude/settings.json (global) or a repo's .claude/settings.json (per-project), and replace ABSOLUTE_PATH with the checkout path of this repo. Config is via env (NORIQ_URL, NORIQ_TOKEN, NORIQ_PROJECT); see hooks/README.md.",
+  "//": "Noriq Claude Code hooks — copy these blocks into ~/.claude/settings.json (global) or a repo's .claude/settings.json (per-project), and replace ABSOLUTE_PATH with the checkout path of this repo. Config is via env (NORIQ_URL, NORIQ_TOKEN, NORIQ_PROJECT, ...); see hooks/README.md. Both hooks are OPT-IN — nothing here is wired unless you copy it into a settings.json yourself.",
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node ABSOLUTE_PATH/hooks/noriq-memory.mjs" }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
@@ -11,8 +18,10 @@
     ],
     "Stop": [
       {
+        "//": "Both hooks are wired to Stop and COMPOSE — Claude Code runs every entry in this array, in order, on every Stop event. Do not replace one hook's entry with the other's; add both.",
         "hooks": [
-          { "type": "command", "command": "node ABSOLUTE_PATH/hooks/noriq-lock.mjs" }
+          { "type": "command", "command": "node ABSOLUTE_PATH/hooks/noriq-lock.mjs" },
+          { "type": "command", "command": "node ABSOLUTE_PATH/hooks/noriq-memory.mjs" }
         ]
       }
     ]
