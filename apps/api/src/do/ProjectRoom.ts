@@ -13,7 +13,7 @@ import {
 import { searchBackend, indexEntity, removeEntity, type SearchKind } from '../search';
 import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
-import { RunKind, AgentTool, RunStatus, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey } from '@noriq-dev/shared';
+import { RunKind, AgentTool, RunStatus, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType } from '@noriq-dev/shared';
 import { writeExecutionSpec } from '../lib/execution-spec';
 import { processPendingEpisodeJob } from '../memory/episodes';
 
@@ -415,8 +415,8 @@ export class ProjectRoom extends DurableObject<Env> {
 
   private async emit(
     actor: Actor,
-    verb: string,
-    subjectType: string,
+    verb: EventVerb,
+    subjectType: EventSubjectType,
     subjectId: string,
     payload: Record<string, unknown> = {},
     atomicPrefix: D1PreparedStatement[] = [],
@@ -3086,10 +3086,15 @@ export class ProjectRoom extends DurableObject<Env> {
       // The marker and event append share emit()'s D1 batch. If event insertion or sequence
       // advancement fails, the marker rolls back too, so the next outbox delivery really retries
       // the event instead of mistaking a partial receive for a completed one.
+      // delivery.verb/subjectType arrive as plain strings across the DO RPC boundary from
+      // ProjectMemory's `outbox` table (SQLite has no enum column type to carry EventVerb
+      // through); the outbox writer always inserts the literal pair 'memory.changed'/'memory'
+      // (PLNR-318 — see ProjectMemory.ts's outbox INSERTs), so this cast reflects that fixed
+      // convention rather than widening emit()'s real contract.
       await this.emit(
         SYSTEM_ACTOR,
-        delivery.verb,
-        delivery.subjectType,
+        delivery.verb as EventVerb,
+        delivery.subjectType as EventSubjectType,
         delivery.subjectId,
         delivery.payload ?? {},
         [this.env.DB.prepare(

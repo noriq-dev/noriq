@@ -7,11 +7,18 @@ import { ActorKind } from './model';
 // and subscribed agents.
 // ---------------------------------------------------------------------------
 
+// PLNR-318: this list is derived from ProjectRoom's actual `this.emit(...)` call sites, not
+// curated — the enum is the contract `emit()` is typed against (see ProjectRoom.emit's `verb:
+// EventVerb` parameter), so a verb that isn't emitted anywhere has no reason to be here. Five
+// prior members were confirmed dead (nothing in the repo ever emits them) and were dropped
+// rather than kept for cosmetic completeness: `project.created`, `task.claim_expired`,
+// `agent.registered`, `agent.online`, `agent.offline`. `agent.registered` was already flagged
+// unreachable in memory/projection.ts before this pass.
 export const EventVerb = z.enum([
-  'project.created',
   'project.updated',
   'milestone.created',
   'milestone.updated',
+  'milestone.deleted',
   'task.created',
   'task.updated',
   'task.status_changed',
@@ -23,8 +30,19 @@ export const EventVerb = z.enum([
   'task.spec_changed',
   'task.claimed',
   'task.released',
-  'task.claim_expired',
   'task.requeued',
+  'task.deleted',
+  'task.moved',
+  'task.moved_in',
+  'task.handed_off',
+  // Spin-offs (PLNR-230): a run filed adjacent work as its own PROPOSED task; a human then
+  // accepts or rejects it.
+  'task.spun_off',
+  'task.spinoff_accepted',
+  'task.spinoff_rejected',
+  'task.archived',
+  'task.restored',
+  'task.settle_skipped',
   'dependency.added',
   'dependency.removed',
   // A task's LAST unfinished blocker settled from another project (PLNR-241). Same-project
@@ -36,9 +54,6 @@ export const EventVerb = z.enum([
   'comment.acknowledged',
   'comment.resolved',
   'message.sent',
-  'agent.registered',
-  'agent.online',
-  'agent.offline',
   // Run lifecycle (execution plane) — authoritative in ProjectRoom (RUN-6).
   'run.created',
   'run.dispatched',
@@ -48,8 +63,56 @@ export const EventVerb = z.enum([
   // payload's summary, never the memory body itself (§3/§4: D1 never holds memory content).
   // Delivered as actorKind 'system', not 'agent' — it must never renew a claim or presence.
   'memory.changed',
+  'tag.created',
+  'tag.deleted',
+  'tag.merged',
+  'lock.acquired',
+  'lock.denied',
+  'lock.released',
+  'lock.renewed',
+  'lock.force_released',
+  'lock.expired',
+  'signal.raised',
+  'signal.answered',
+  'signal.acknowledged',
+  'board.created',
+  'board.updated',
+  'board.deleted',
+  'doc.created',
+  'doc.updated',
+  'doc.deleted',
+  'plan.created',
+  'plan.updated',
+  'plan.approved',
+  'plan.rejected',
+  'plan.completed',
+  'plan.archived',
+  'plan.restored',
+  'plan.deleted',
+  'plan_doc.created',
+  'plan_doc.updated',
+  'plan_doc.deleted',
+  'plan_dispatch.created',
+  'plan_dispatch.cancelled',
+  'plan_dispatch.completed',
+  'plan_dispatch.resumed',
+  'plan_dispatch.stalled',
+  'attachment.added',
+  'attachment.removed',
+  'ref.attached',
 ]);
 export type EventVerb = z.infer<typeof EventVerb>;
+
+// PLNR-318: widened alongside EventVerb — derived from the subjectType literal actually passed
+// at each `this.emit(...)` call site. `agent` was dropped: it rode only the now-removed dead
+// agent.* verbs, and nothing in the repo ever emits a subjectType of `agent`. `memory` covers
+// ProjectMemory's outbox delivery (subjectType is always `'memory'` there — see
+// ProjectRoom.receiveMemoryEvent).
+export const EventSubjectType = z.enum([
+  'project', 'milestone', 'task', 'comment', 'message', 'run', 'memory',
+  'tag', 'lock', 'board', 'doc', 'plan', 'plan_dispatch', 'plan_doc',
+]);
+export type EventSubjectType = z.infer<typeof EventSubjectType>;
 
 export const NoriqEvent = z.object({
   id: z.string(),
@@ -58,7 +121,7 @@ export const NoriqEvent = z.object({
   actorKind: ActorKind,
   actorId: z.string(),
   verb: EventVerb,
-  subjectType: z.enum(['project', 'milestone', 'task', 'comment', 'message', 'agent', 'run', 'memory']),
+  subjectType: EventSubjectType,
   subjectId: z.string(),
   payload: z.record(z.string(), z.unknown()).default({}), // zod v4: record requires an explicit key type
   createdAt: z.string().datetime(),
