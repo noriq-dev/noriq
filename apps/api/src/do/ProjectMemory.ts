@@ -32,9 +32,10 @@ import {
   type RetrievalHit, type RetrievalStage, type RankedHit,
 } from '../memory/retrieval';
 import {
-  dependencyNeighborhood, validatingTests, implementingWork, decisionLineage, changeImpact, constellation,
+  dependencyNeighborhood, validatingTests, implementingWork, decisionLineage, changeImpact, constellation, listGraphEntities,
   type GraphEntityRef, type DependencyNeighborhoodResult, type ValidatingTestsResult,
-  type ImplementingWorkResult, type DecisionLineageResult, type ChangeImpactResult, type ConstellationResult,
+  type ImplementingWorkResult, type DecisionLineageResult, type ChangeImpactResult, type ConstellationResult, type ConstellationOptions,
+  type GraphEntityPage, type GraphEntityPageInput, type ConstellationInputRows,
 } from '../memory/graph-queries';
 import { parseExit } from '../memory/episodes';
 import {
@@ -3915,15 +3916,20 @@ export class ProjectMemory extends DurableObject<Env> {
    * this DO has no HTTP layer of its own to attach one to; index.ts's route is free to ALSO turn
    * it into an ETag if a future task wants that).
    */
-  async constellation(projectId: string): Promise<ConstellationResult> {
-    await this.assertProjectId(projectId);
+  private readConstellationRows(eligibleOnly = false): ConstellationInputRows {
     const nodes = this.ctx.storage.sql
-      .exec<{ id: string; type: string; uri: string; label: string; created_at: string }>(`SELECT id, type, uri, label, created_at FROM nodes`)
+      .exec<{ id: string; type: string; uri: string; label: string; created_at: string }>(
+        `SELECT id, type, uri, label, created_at FROM nodes${eligibleOnly ? ` WHERE type != 'symbol'` : ''}`,
+      )
       .toArray()
       .map((r) => ({ nodeId: r.id, type: r.type, uri: r.uri, label: r.label, createdAt: r.created_at }));
     const edges = this.ctx.storage.sql
       .exec<{ id: string; type: string; from_node_id: string; to_node_id: string; provenance: string | null }>(
-        `SELECT id, type, from_node_id, to_node_id, provenance FROM edges`,
+        eligibleOnly
+          ? `SELECT e.id, e.type, e.from_node_id, e.to_node_id, e.provenance
+             FROM edges e JOIN nodes f ON f.id = e.from_node_id JOIN nodes t ON t.id = e.to_node_id
+             WHERE f.type != 'symbol' AND t.type != 'symbol'`
+          : `SELECT id, type, from_node_id, to_node_id, provenance FROM edges`,
       )
       .toArray()
       .map((r) => ({ edgeId: r.id, type: r.type, fromNodeId: r.from_node_id, toNodeId: r.to_node_id, provenance: r.provenance }));
@@ -3935,7 +3941,21 @@ export class ProjectMemory extends DurableObject<Env> {
       .toArray()
       .map((r) => ({ id: r.id, landingOutcome: r.landing_outcome }));
 
-    return constellation(this.readMemoryRevision(), { nodes, edges, memoryItems, episodes }, { codeGraphPopulated: this.isCodeGraphPopulated() });
+    return { nodes, edges, memoryItems, episodes };
+  }
+
+  async constellation(projectId: string, options: ConstellationOptions = {}): Promise<ConstellationResult> {
+    await this.assertProjectId(projectId);
+    return constellation(this.readMemoryRevision(), this.readConstellationRows(), { codeGraphPopulated: this.isCodeGraphPopulated() }, options);
+  }
+
+  /** PLNR-339: ordered, cursor-paginated companion to the bounded canvas. This intentionally reads
+   *  the same canonical rows and applies the same eligibility/degree rules as constellation(). */
+  async listGraphEntities(projectId: string, input: GraphEntityPageInput = {}): Promise<GraphEntityPage> {
+    await this.assertProjectId(projectId);
+    // The catalogue never reports excluded-symbol coverage, so avoid loading the usually much
+    // larger symbol population and its incident edges for every 50-row page.
+    return listGraphEntities(this.readMemoryRevision(), this.readConstellationRows(true), input);
   }
 
   // ---------------------------------------------------------------------------

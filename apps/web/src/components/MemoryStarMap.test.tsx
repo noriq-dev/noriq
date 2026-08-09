@@ -98,7 +98,7 @@ describe('the four honest states', () => {
     expect(text()).toMatch(/4 edge/);
   });
 
-  it('reports excluded code entities (PLNR-315) without the row-limit-reached banner when nothing was truncated by the ceiling', async () => {
+  it('reports excluded symbols while making clear that files remain visible', async () => {
     const node = {
       nodeId: 'n1', uri: 'noriq://task/t1', type: 'task', kind: null, label: 'A task',
       authority: null, validity: null, isLead: null, leadReasons: null, degree: 0, groupKey: 'task',
@@ -110,8 +110,26 @@ describe('the four honest states', () => {
     }));
     mount();
     await tick();
-    expect(text()).toMatch(/4,?200 code entit(y|ies)/i);
+    expect(text()).toMatch(/4,?200 symbols/i);
+    expect(text()).toMatch(/files are included/i);
     expect(text()).not.toMatch(/truncated sample/i);
+  });
+
+  it('defaults to connected + memories and can explicitly request isolated entities', async () => {
+    const spy = vi.spyOn(api, 'memoryConstellation').mockResolvedValue(response({
+      omitted: { nodes: 0, edges: 0, edgesDanglingPruned: 0, codeEntitiesExcluded: 0, isolatedHidden: 12 },
+      coverage: { complete: true, reasons: [] },
+    }));
+    mount();
+    await tick();
+    expect(text()).toMatch(/12 unconnected entities/i);
+    expect(text()).toMatch(/No connected entities yet/i);
+
+    const show = [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('show isolated'));
+    expect(show).toBeTruthy();
+    act(() => show!.dispatchEvent(new MouseEvent('click', { bubbles: true })));
+    await tick();
+    expect(spy).toHaveBeenLastCalledWith('prj_1', { includeIsolated: true }, expect.anything());
   });
 });
 
@@ -120,9 +138,9 @@ describe('localStorage persistence (locked decision: noriq.* convention, never w
     const spy = vi.spyOn(api, 'memoryConstellation').mockResolvedValue(response({}));
     mount('prj_write_check');
     await tick();
-    expect(spy).toHaveBeenCalledWith('prj_write_check', expect.anything());
-    // Only ever called with (pid, signal) — never handed prefs/camera/filters to send anywhere.
-    expect(spy.mock.calls[0]).toHaveLength(2);
+    expect(spy).toHaveBeenCalledWith('prj_write_check', { includeIsolated: false }, expect.anything());
+    // Only the explicit overview policy is sent — never camera/pins/type visibility preferences.
+    expect(spy.mock.calls[0]).toHaveLength(3);
   });
 
   it('persists filter/camera preferences under a noriq.starmap.<pid> localStorage key, not any other key', async () => {
@@ -160,5 +178,26 @@ describe('mounting is safe without a canvas 2D context (jsdom has none)', () => 
     expect(() => mount('prj_4')).not.toThrow();
     await tick();
     expect(text()).toMatch(/1 stars/);
+  });
+});
+
+describe('the accessible sampled catalogue', () => {
+  it('labels the bounded sample truthfully and defaults to most-connected order', async () => {
+    const base = { type: 'task', kind: null, authority: null, validity: null, isLead: null, leadReasons: null, groupKey: 'task' };
+    vi.spyOn(api, 'memoryConstellation').mockResolvedValue(response({
+      nodes: [
+        { ...base, nodeId: 'n_a', uri: 'noriq://task/a', label: 'Alphabetical first', degree: 1 },
+        { ...base, nodeId: 'n_z', uri: 'noriq://task/z', label: 'Connected first', degree: 7 },
+      ],
+    }));
+    mount();
+    await tick();
+    const listButton = [...container.querySelectorAll('button')].find((button) => button.textContent === 'accessible list');
+    act(() => listButton!.dispatchEvent(new MouseEvent('click', { bubbles: true })));
+
+    expect(text()).toContain('Sampled entities · 2');
+    expect((container.querySelector('select[aria-label="entity ordering"]') as HTMLSelectElement).value).toBe('connected');
+    const rows = [...container.querySelectorAll('ul[aria-label="Star map entities"] li')].map((row) => row.textContent);
+    expect(rows).toEqual([expect.stringContaining('Connected first'), expect.stringContaining('Alphabetical first')]);
   });
 });

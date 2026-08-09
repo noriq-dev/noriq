@@ -106,6 +106,7 @@ describe('the memory view lands on the map (PLNR-287)', () => {
     vi.spyOn(api, 'memoryHealth').mockResolvedValue({
       projectId: 'prj_1', schemaVersion: 1, memoryRevision: 1, tableCounts: {}, databaseSize: 0, sizeStatus: 'ok', hasPriorGeneration: false,
     });
+    vi.spyOn(api, 'memoryEntities').mockResolvedValue({ memoryRevision: 1, sort: 'newest', items: [], nextCursor: null, total: 0, byType: {} });
 
     mount();
     await tick();
@@ -114,6 +115,38 @@ describe('the memory view lands on the map (PLNR-287)', () => {
 
     expect(queryInput().placeholder).toContain('how do we handle X'); // Explore's own copy, not the map's
     expect(text()).not.toContain('unreachable'); // reached deliberately, nothing failed to get here
+  });
+});
+
+describe('PLNR-339 ordered catalogue', () => {
+  it('browses memories newest-first without a query and advances with the returned cursor', async () => {
+    vi.spyOn(api, 'memoryConstellation').mockResolvedValue(emptyConstellation());
+    vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });
+    vi.spyOn(api, 'memoryHealth').mockResolvedValue({
+      projectId: 'prj_1', schemaVersion: 1, memoryRevision: 1, tableCounts: {}, databaseSize: 0, sizeStatus: 'ok', hasPriorGeneration: false,
+    });
+    const first = {
+      nodeId: 'n_new', uri: 'noriq://memory/mem_new', type: 'memory', kind: 'learning', label: 'Newest memory', createdAt: '2026-08-09T00:00:00.000Z',
+      authority: 2, validity: 'active', isLead: true, leadReasons: ['low-authority'], degree: 1, groupKey: 'memory',
+    };
+    const second = { ...first, nodeId: 'n_old', uri: 'noriq://memory/mem_old', label: 'Older memory', createdAt: '2026-08-08T00:00:00.000Z' };
+    const browse = vi.spyOn(api, 'memoryEntities').mockImplementation(async (_pid, input) => input.cursor
+      ? { memoryRevision: 1, sort: 'newest', items: [second], nextCursor: null, total: 2, byType: { memory: 2 } }
+      : { memoryRevision: 1, sort: 'newest', items: [first], nextCursor: first.uri, total: 2, byType: { memory: 2 } });
+
+    mount();
+    await tick();
+    switchTab('Explore');
+    await tick();
+
+    expect(browse).toHaveBeenCalledWith('prj_1', expect.objectContaining({ type: 'memory', sort: 'newest', limit: 50 }), expect.anything());
+    expect(text()).toContain('Newest memory');
+    const next = [...container.querySelectorAll('button')].find((button) => button.textContent === 'next →');
+    expect(next).toBeTruthy();
+    act(() => next!.dispatchEvent(new MouseEvent('click', { bubbles: true })));
+    await tick();
+    expect(browse).toHaveBeenLastCalledWith('prj_1', expect.objectContaining({ cursor: first.uri }), expect.anything());
+    expect(text()).toContain('Older memory');
   });
 });
 
@@ -185,6 +218,35 @@ describe('a selected star hands off by URI, through the existing onOpenInspector
     // Landed on Graph, already seeded — never a blank "pick a task or paste a URI" empty state.
     expect(text()).not.toContain('there is no whole-project view here');
     expect(neighborhood).toHaveBeenCalledWith('prj_1', expect.objectContaining({ entityUri: 'noriq://memory/mem_star' }), expect.anything());
+  });
+
+  it('opens an off-sample search result as a focused ego-network instead of leaving it unreachable', async () => {
+    vi.spyOn(api, 'memoryConstellation').mockResolvedValue(emptyConstellation({ nodes: [starNode], coverage: { complete: true, reasons: [] } }));
+    vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });
+    vi.spyOn(api, 'memorySearch').mockResolvedValue({
+      mode: 'keyword', evidenceFrame: emptyFrame,
+      results: [{
+        entityType: 'node', id: 'file_off_map', uri: 'noriq://file/PLNR/repo/src/off-map.ts', kind: 'file',
+        title: 'Off-map file', snippet: 'Off-map file', stage: 'lexical', score: 1,
+        isLead: false, leadReasons: [], finalScore: 1,
+      }],
+    });
+    const neighborhood = vi.spyOn(api, 'memoryDependencyNeighborhood').mockResolvedValue({
+      seed: null, downstream: [], upstream: [], coverage: { complete: true, reasons: [] },
+    });
+
+    mount();
+    await tick();
+    act(() => setInputValue(queryInput(), 'off map'));
+    await tick(300);
+    const result = [...container.querySelectorAll('div')].find((element) => element.textContent === 'Off-map file');
+    expect(result).toBeTruthy();
+    act(() => result!.dispatchEvent(new MouseEvent('click', { bubbles: true })));
+    await tick(200);
+
+    expect(neighborhood).toHaveBeenCalledWith(
+      'prj_1', expect.objectContaining({ entityUri: 'noriq://file/PLNR/repo/src/off-map.ts' }), expect.anything(),
+    );
   });
 });
 

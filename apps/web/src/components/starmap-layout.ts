@@ -44,6 +44,7 @@ export interface StarMapInputNode {
   type: string;
   kind: string | null;
   label: string;
+  createdAt?: string;
   authority: number | null;
   validity: string | null;
   isLead: boolean | null;

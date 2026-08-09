@@ -182,7 +182,7 @@ const humanProjectActionDenied = async (
 // bodies and remain viewer actions. Everything else maps to a stable minimum action here; more
 // sensitive per-field owner checks (publication/transfer) remain inside their handlers.
 const VIEWER_POST_ROUTES = [
-  /\/memory\/(search|similar-effort|explain|constellation|context)$/,
+  /\/memory\/(search|similar-effort|explain|constellation|entities|context)$/,
 ];
 const MANAGER_ROUTES = [
   /\/meta$/,
@@ -1536,14 +1536,28 @@ app.post('/api/projects/:pid/memory/explain', userAuth, async (c) => {
 
 // The bounded constellation feeding the memory star map (PLNR-284, §5) — POST (not GET) to match
 // /memory/search's and /memory/explain's shape immediately above, even though this endpoint
-// takes no body today: a future filter (node type, kind, authority floor, repository, time
-// window — the task's own discretion list) belongs in a JSON body, not a growing query string,
-// and changing the HTTP method later would be the breaking change, not adding fields to an
-// already-POST route. Read-only, same userAuth + requireProjectAccess gate as every memory route
+// takes a small policy body (`includeIsolated`) and leaves room for future overview filters without
+// a growing query string. Read-only, same userAuth + requireProjectAccess gate as every memory route
 // in this block (line 138) — never widens what the browser can reach.
 app.post('/api/projects/:pid/memory/constellation', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
-  return c.json(await memoryStub(c.env, pid).constellation(pid));
+  const body: { includeIsolated?: boolean } = await c.req.json<{ includeIsolated?: boolean }>().catch(() => ({}));
+  return c.json(await memoryStub(c.env, pid).constellation(pid, { includeIsolated: body.includeIsolated === true }));
+});
+
+// PLNR-339: exhaustive ordered catalogue behind Explore and the accessible map list. Kept
+// separate from the bounded canvas response so pagination never fragments the visual graph.
+app.post('/api/projects/:pid/memory/entities', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const body: {
+    cursor?: string; limit?: number; sort?: 'newest' | 'connected' | 'authority' | 'label'; type?: string; connectedOnly?: boolean;
+    kind?: string; minAuthority?: number; validity?: string;
+  } = await c.req.json<{
+    cursor?: string; limit?: number; sort?: 'newest' | 'connected' | 'authority' | 'label'; type?: string; connectedOnly?: boolean;
+    kind?: string; minAuthority?: number; validity?: string;
+  }>().catch(() => ({}));
+  if (body.sort && !['newest', 'connected', 'authority', 'label'].includes(body.sort)) return c.json({ error: 'invalid sort' }, 400);
+  return c.json(await memoryStub(c.env, pid).listGraphEntities(pid, body));
 });
 
 // Task-aware context packs (PLNR-267) — the human-facing twin of get_task_context; same

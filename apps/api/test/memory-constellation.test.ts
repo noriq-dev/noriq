@@ -14,7 +14,7 @@ import { describe, expect, it } from 'vitest';
 import type { Env } from '../src/env';
 import { buildEntityUri, parseEntityUri } from '@noriq-dev/shared';
 import {
-  constellation, CONSTELLATION_NODE_CEILING, CONSTELLATION_EDGE_CEILING,
+  constellation, listGraphEntities, CONSTELLATION_NODE_CEILING, CONSTELLATION_EDGE_CEILING, CONSTELLATION_MEMORY_RESERVE,
   type ConstellationRawNode, type ConstellationRawEdge,
 } from '../src/memory/graph-queries';
 import { createUser, mintTokenForUser, mcpCall, loginSession } from './helpers';
@@ -39,7 +39,7 @@ describe('constellation (pure) — bounding', () => {
     // Zero-padded ids sort lexicographically identically to numerically — with every OTHER
     // scoring input tied, the uri ASC tie-break alone decides which 1000 of 1005 survive.
     const nodes = Array.from({ length: total }, (_, i) => node(`noriq://task/n${String(i).padStart(4, '0')}`, 'task'));
-    const result = constellation(1, { nodes, edges: [], memoryItems: [], episodes: [] }, { codeGraphPopulated: true });
+    const result = constellation(1, { nodes, edges: [], memoryItems: [], episodes: [] }, { codeGraphPopulated: true }, { includeIsolated: true });
 
     expect(result.nodes).toHaveLength(CONSTELLATION_NODE_CEILING);
     expect(result.omitted.nodes).toBe(5);
@@ -86,8 +86,8 @@ describe('constellation (pure) — determinism and the explicit tie-break', () =
       node('noriq://task/b', 'task'),
     ];
     const edges = [edge('related_to', 'noriq://task/a', 'noriq://task/b', 'coordination:seq-1')];
-    const r1 = constellation(7, { nodes, edges, memoryItems: [], episodes: [] }, { codeGraphPopulated: true });
-    const r2 = constellation(7, { nodes: [...nodes].reverse(), edges, memoryItems: [], episodes: [] }, { codeGraphPopulated: true });
+    const r1 = constellation(7, { nodes, edges, memoryItems: [], episodes: [] }, { codeGraphPopulated: true }, { includeIsolated: true });
+    const r2 = constellation(7, { nodes: [...nodes].reverse(), edges, memoryItems: [], episodes: [] }, { codeGraphPopulated: true }, { includeIsolated: true });
 
     expect(r1).toEqual(r2);
     // Every input row here ties on degree/authority/validity/createdAt — uri ASC alone orders them.
@@ -99,7 +99,7 @@ describe('constellation (pure) — determinism and the explicit tie-break', () =
       node('noriq://task/older', 'task', { createdAt: '2026-01-01T00:00:00.000Z' }),
       node('noriq://task/newer', 'task', { createdAt: '2026-06-01T00:00:00.000Z' }),
     ];
-    const result = constellation(1, { nodes, edges: [], memoryItems: [], episodes: [] }, { codeGraphPopulated: true });
+    const result = constellation(1, { nodes, edges: [], memoryItems: [], episodes: [] }, { codeGraphPopulated: true }, { includeIsolated: true });
     expect(result.nodes.map((n) => n.uri)).toEqual(['noriq://task/newer', 'noriq://task/older']);
   });
 
@@ -122,12 +122,86 @@ describe('constellation (pure) — determinism and the explicit tie-break', () =
         episodes: [],
       },
       { codeGraphPopulated: true },
+      { includeIsolated: true },
     );
     const order = result.nodes.map((n) => n.uri);
     // hub (degree 4) outranks the authority-5 decision (degree 0), which outranks the
     // authority-1 hypothesis (degree 0) — degree is the primary signal, authority the bonus.
     expect(order.indexOf('noriq://task/hub')).toBeLessThan(order.indexOf('noriq://memory/mem-strong'));
     expect(order.indexOf('noriq://memory/mem-strong')).toBeLessThan(order.indexOf('noriq://memory/mem-weak'));
+  });
+});
+
+describe('constellation (pure) — PLNR-339 relationship and memory preservation', () => {
+  it('reserves memory representation even when connected coordination nodes would otherwise fill the ceiling', () => {
+    const memories = Array.from({ length: 400 }, (_, i) => node(`noriq://memory/m${String(i).padStart(4, '0')}`, 'memory'));
+    const tasks = Array.from({ length: 1000 }, (_, i) => node(`noriq://task/t${String(i).padStart(4, '0')}`, 'task'));
+    const edges = Array.from({ length: 500 }, (_, i) => edge('related_to', tasks[i * 2]!.uri, tasks[i * 2 + 1]!.uri));
+    const memoryItems = memories.map((_, i) => ({ id: `m${String(i).padStart(4, '0')}`, kind: 'learning', authority: 1, validity: 'active' }));
+
+    const result = constellation(1, { nodes: [...tasks, ...memories], edges, memoryItems, episodes: [] }, { codeGraphPopulated: true });
+
+    expect(result.nodes.filter((n) => n.type === 'memory')).toHaveLength(CONSTELLATION_MEMORY_RESERVE);
+    expect(result.sampling.byType.memory).toMatchObject({ total: 400, selected: CONSTELLATION_MEMORY_RESERVE });
+  });
+
+  it('keeps every memory when memories fit and the connected core leaves capacity', () => {
+    const memories = Array.from({ length: CONSTELLATION_MEMORY_RESERVE + 25 }, (_, i) => node(`noriq://memory/m${i}`, 'memory'));
+    const memoryItems = memories.map((_, i) => ({ id: `m${i}`, kind: 'learning', authority: 1, validity: 'active' }));
+    const result = constellation(1, { nodes: memories, edges: [], memoryItems, episodes: [] }, { codeGraphPopulated: true });
+    expect(result.nodes).toHaveLength(memories.length);
+    expect(result.omitted.nodes).toBe(0);
+  });
+
+  it('selects connected nodes with an endpoint so every returned connected star retains a visible relationship', () => {
+    const nodes = Array.from({ length: 1200 }, (_, i) => node(`noriq://task/t${String(i).padStart(4, '0')}`, 'task'));
+    const edges = Array.from({ length: 600 }, (_, i) => edge('related_to', nodes[i * 2]!.uri, nodes[i * 2 + 1]!.uri));
+    const result = constellation(1, { nodes, edges, memoryItems: [], episodes: [] }, { codeGraphPopulated: true });
+    const endpoints = new Set(result.edges.flatMap((e) => [e.fromNodeId, e.toNodeId]));
+
+    expect(result.nodes).toHaveLength(CONSTELLATION_NODE_CEILING);
+    expect(result.nodes.every((n) => endpoints.has(n.nodeId))).toBe(true);
+    expect(result.sampling.selectedConnectedNodes).toBe(CONSTELLATION_NODE_CEILING);
+  });
+});
+
+describe('listGraphEntities (pure) — ordered cursor catalogue', () => {
+  it('includes files, excludes symbols, sorts explicitly, and advances by stable URI cursor', () => {
+    const older = node('noriq://memory/older', 'memory', { createdAt: '2026-01-01T00:00:00.000Z' });
+    const newer = node('noriq://memory/newer', 'memory', { createdAt: '2026-02-01T00:00:00.000Z' });
+    const file = node('noriq://file/PLNR/repo/a.ts', 'file', { createdAt: '2026-03-01T00:00:00.000Z' });
+    const symbol = node('noriq://symbol/PLNR/repo/a.ts#A', 'symbol', { createdAt: '2026-04-01T00:00:00.000Z' });
+    const rows = {
+      nodes: [older, newer, file, symbol], edges: [], episodes: [],
+      memoryItems: [
+        { id: 'older', kind: 'learning', authority: 2, validity: 'active' },
+        { id: 'newer', kind: 'decision', authority: 5, validity: 'active' },
+      ],
+    };
+
+    const first = listGraphEntities(9, rows, { sort: 'newest', limit: 2 });
+    expect(first.items.map((item) => item.uri)).toEqual([file.uri, newer.uri]);
+    expect(first.nextCursor).toBe(newer.uri);
+    expect(first.byType).toEqual({ memory: 2, file: 1 });
+
+    const second = listGraphEntities(9, rows, { sort: 'newest', limit: 2, cursor: first.nextCursor! });
+    expect(second.items.map((item) => item.uri)).toEqual([older.uri]);
+    expect(second.nextCursor).toBeNull();
+  });
+
+  it('supports a memory-only authority order and memory filters', () => {
+    const low = node('noriq://memory/low', 'memory');
+    const high = node('noriq://memory/high', 'memory');
+    const rows = {
+      nodes: [low, high], edges: [], episodes: [],
+      memoryItems: [
+        { id: 'low', kind: 'learning', authority: 1, validity: 'active' },
+        { id: 'high', kind: 'decision', authority: 5, validity: 'active' },
+      ],
+    };
+    const page = listGraphEntities(1, rows, { type: 'memory', sort: 'authority', minAuthority: 3 });
+    expect(page.total).toBe(1);
+    expect(page.items[0]).toMatchObject({ uri: high.uri, authority: 5, kind: 'decision' });
   });
 });
 
@@ -186,6 +260,7 @@ describe('constellation (pure) — per-node kind/authority/validity/isLead/degre
       1,
       { nodes: [epNode], edges: [], memoryItems: [], episodes: [{ id: 'ep-1', landingOutcome: 'landed' }] },
       { codeGraphPopulated: true },
+      { includeIsolated: true },
     );
     const n = result.nodes[0]!;
     expect(n.kind).toBe('landed');
@@ -195,7 +270,7 @@ describe('constellation (pure) — per-node kind/authority/validity/isLead/degre
     expect(n.leadReasons).toBeNull();
   });
 
-  it('a coordination node (task/plan/artifact/…) carries null kind/authority/validity/isLead and degree over the FULL graph', () => {
+  it('a coordination node (task/plan/artifact/…) carries null kind/authority/validity/isLead and degree over the eligible graph', () => {
     const a = node('noriq://task/a', 'task');
     const b = node('noriq://task/b', 'task');
     const c = node('noriq://task/c', 'task');
@@ -222,83 +297,100 @@ describe('constellation (pure) — the four distinct coverage states', () => {
 
   it('an unindexed-but-populated project reports code-graph-empty WITHOUT graph-empty', () => {
     const task = node('noriq://task/t1', 'task');
-    const result = constellation(1, { nodes: [task], edges: [], memoryItems: [], episodes: [] }, { codeGraphPopulated: false });
+    const result = constellation(1, { nodes: [task], edges: [], memoryItems: [], episodes: [] }, { codeGraphPopulated: false }, { includeIsolated: true });
     expect(result.nodes).toHaveLength(1);
     expect(result.coverage.reasons).toEqual(['code-graph-empty']);
     expect(result.coverage.reasons).not.toContain('graph-empty');
   });
 
-  it('a fully populated, indexed project reports complete coverage, and its file node is excluded per PLNR-315', () => {
+  it('a fully populated, indexed project reports complete coverage and includes file landmarks', () => {
     const task = node('noriq://task/t1', 'task');
     const file = node('noriq://file/PROJ/repo-x/a.ts', 'file');
-    const result = constellation(1, { nodes: [task, file], edges: [], memoryItems: [], episodes: [] }, { codeGraphPopulated: true });
+    const result = constellation(1, { nodes: [task, file], edges: [], memoryItems: [], episodes: [] }, { codeGraphPopulated: true }, { includeIsolated: true });
     expect(result.coverage).toEqual({ complete: true, reasons: [] });
-    expect(result.nodes).toHaveLength(1);
-    expect(result.nodes[0]!.uri).toBe('noriq://task/t1');
-    expect(result.omitted.codeEntitiesExcluded).toBe(1);
+    expect(result.nodes.map((n) => n.type).sort()).toEqual(['file', 'task']);
+    expect(result.omitted.codeEntitiesExcluded).toBe(0);
   });
 });
 
 // ---------------------------------------------------------------------------------------
-// PLNR-315: file/symbol nodes are excluded from the whole-project constellation, server-side and
-// BEFORE scoring — so they can never eat the node ceiling — and their exclusion is reported
-// rather than silent. Ego-network expansion and explain_project_area (retrieval.ts) are untouched
-// by this task; nothing here exercises those primitives.
+// PLNR-339: files are first-class landmarks; symbols alone stay excluded. Degree is calculated
+// over this eligible graph, so an edge only to a symbol cannot create a fake connected star.
 // ---------------------------------------------------------------------------------------
-describe('constellation (pure) — PLNR-315 code entity exclusion', () => {
-  it('excludes every file and symbol node from the returned set, regardless of how well-connected or important they score', () => {
+describe('constellation (pure) — PLNR-339 file inclusion and symbol exclusion', () => {
+  it('includes files and their relationships while excluding symbol detail', () => {
     const task = node('noriq://task/t1', 'task');
     const file = node('noriq://file/PROJ/repo-x/a.ts', 'file');
     const symbol = node('noriq://symbol/PROJ/repo-x/a.ts#Foo', 'symbol');
     const edges = [edge('depends_on', 'noriq://task/t1', file.uri), edge('imports', file.uri, symbol.uri)];
     const result = constellation(1, { nodes: [task, file, symbol], edges, memoryItems: [], episodes: [] }, { codeGraphPopulated: true });
 
-    expect(result.nodes.map((n) => n.type)).toEqual(['task']);
-    expect(result.nodes.some((n) => n.type === 'file' || n.type === 'symbol')).toBe(false);
+    expect(result.nodes.map((n) => n.type).sort()).toEqual(['file', 'task']);
+    expect(result.nodes.some((n) => n.type === 'symbol')).toBe(false);
+    expect(result.edges).toEqual([expect.objectContaining({ type: 'depends_on' })]);
   });
 
-  it('reports the excluded count via omitted.codeEntitiesExcluded rather than silently dropping them', () => {
+  it('reports excluded symbols by type without counting files as excluded', () => {
     const task = node('noriq://task/t1', 'task');
     const files = Array.from({ length: 7 }, (_, i) => node(`noriq://file/PROJ/repo-x/f${i}.ts`, 'file'));
     const symbols = Array.from({ length: 3 }, (_, i) => node(`noriq://symbol/PROJ/repo-x/s${i}`, 'symbol'));
     const result = constellation(1, { nodes: [task, ...files, ...symbols], edges: [], memoryItems: [], episodes: [] }, { codeGraphPopulated: true });
 
-    expect(result.omitted.codeEntitiesExcluded).toBe(10);
-    expect(result.nodes).toHaveLength(1);
+    expect(result.omitted.codeEntitiesExcluded).toBe(3);
+    expect(result.sampling.excludedByType).toEqual({ symbol: 3 });
+    expect(result.omitted.isolatedHidden).toBe(8); // task + seven files; symbols are not eligible
   });
 
-  it('excluded code entities never consume the node ceiling — a task/memory population under the ceiling survives whole even when code entities vastly outnumber it', () => {
+  it('isolated files can be explicitly included and consume the ordinary overview budget', () => {
     const coordinationNodes = Array.from({ length: 5 }, (_, i) => node(`noriq://task/t${i}`, 'task'));
     // Far more file nodes than CONSTELLATION_NODE_CEILING — if exclusion happened AFTER sampling
     // (or client-side), these would crowd out every coordination node instead.
     const codeNodes = Array.from({ length: CONSTELLATION_NODE_CEILING * 3 }, (_, i) => node(`noriq://file/PROJ/repo-x/f${i}.ts`, 'file'));
-    const result = constellation(1, { nodes: [...coordinationNodes, ...codeNodes], edges: [], memoryItems: [], episodes: [] }, { codeGraphPopulated: true });
+    const result = constellation(1, { nodes: [...coordinationNodes, ...codeNodes], edges: [], memoryItems: [], episodes: [] }, { codeGraphPopulated: true }, { includeIsolated: true });
 
-    expect(result.nodes).toHaveLength(5);
-    expect(result.nodes.every((n) => n.type === 'task')).toBe(true);
-    expect(result.omitted.nodes).toBe(0); // no ceiling casualty among the eligible population
-    expect(result.omitted.codeEntitiesExcluded).toBe(CONSTELLATION_NODE_CEILING * 3);
-    expect(result.coverage.reasons).not.toContain('row-limit-reached');
+    expect(result.nodes).toHaveLength(CONSTELLATION_NODE_CEILING);
+    expect(result.nodes.some((n) => n.type === 'file')).toBe(true);
+    expect(result.omitted.nodes).toBe(CONSTELLATION_NODE_CEILING * 2 + 5);
+    expect(result.omitted.codeEntitiesExcluded).toBe(0);
+    expect(result.coverage.reasons).toContain('row-limit-reached');
   });
 
-  it('prunes an edge to an excluded code entity as dangling, exactly like an edge to an unsampled node — no separate counter', () => {
+  it('retains an eligible task-to-file edge and reports eligible degree', () => {
     const task = node('noriq://task/t1', 'task');
     const file = node('noriq://file/PROJ/repo-x/a.ts', 'file');
     const edges = [edge('modifies', task.uri, file.uri)];
     const result = constellation(1, { nodes: [task, file], edges, memoryItems: [], episodes: [] }, { codeGraphPopulated: true });
 
-    expect(result.edges).toEqual([]);
-    expect(result.omitted.edgesDanglingPruned).toBe(1);
-    expect(result.omitted.edges).toBe(0); // not a ceiling casualty
+    expect(result.edges).toEqual([expect.objectContaining({ type: 'modifies' })]);
+    expect(result.nodes.map((n) => n.degree)).toEqual([1, 1]);
+    expect(result.omitted.edgesDanglingPruned).toBe(0);
   });
 
-  it('a project with ONLY code entities is not graph-empty — that reason is reserved for a project with zero nodes at all', () => {
+  it('a project with only an isolated file is non-empty but hidden by the default overview policy', () => {
     const file = node('noriq://file/PROJ/repo-x/a.ts', 'file');
     const result = constellation(1, { nodes: [file], edges: [], memoryItems: [], episodes: [] }, { codeGraphPopulated: true });
 
     expect(result.nodes).toEqual([]);
-    expect(result.omitted.codeEntitiesExcluded).toBe(1);
+    expect(result.omitted.codeEntitiesExcluded).toBe(0);
+    expect(result.omitted.isolatedHidden).toBe(1);
     expect(result.coverage.reasons).not.toContain('graph-empty');
+  });
+
+  it('does not count a file-to-symbol edge toward the file\'s visible degree', () => {
+    const file = node('noriq://file/PROJ/repo-x/a.ts', 'file');
+    const symbol = node('noriq://symbol/PROJ/repo-x/a.ts#Foo', 'symbol');
+    const result = constellation(
+      1,
+      { nodes: [file, symbol], edges: [edge('declares', file.uri, symbol.uri)], memoryItems: [], episodes: [] },
+      { codeGraphPopulated: true },
+      { includeIsolated: true },
+    );
+    expect(result.nodes).toHaveLength(1);
+    expect(result.nodes[0]!.type).toBe('file');
+    expect(result.nodes[0]!.degree).toBe(0);
+    expect(result.sampling.totalEligibleEdges).toBe(0);
+    expect(result.omitted.edgesExcludedEndpoint).toBe(1);
+    expect(result.omitted.edgesDanglingPruned).toBe(0);
   });
 
   it('a genuinely empty project (zero rows) still reports graph-empty, and codeEntitiesExcluded is zero, not silently omitted', () => {
@@ -319,13 +411,13 @@ interface MemRpc {
   ): Promise<{ memoryId: string }>;
   rebuildProjection(pid: string): Promise<{ nodesWritten: number; edgesWritten: number }>;
   searchProjectMemory(pid: string, opts: { memoryItemId?: string }): Promise<{ results: Array<{ uri?: string }> }>;
-  constellation(pid: string): Promise<{
+  constellation(pid: string, options?: { includeIsolated?: boolean }): Promise<{
     memoryRevision: number;
     nodeCeiling: number;
     edgeCeiling: number;
     nodes: Array<{ nodeId: string; uri: string; type: string; label: string; provenance?: unknown }>;
     edges: Array<{ type: string; fromNodeId: string; toNodeId: string; provenance: string | null }>;
-    omitted: { nodes: number; edges: number; edgesDanglingPruned: number; codeEntitiesExcluded: number };
+    omitted: { nodes: number; edges: number; edgesDanglingPruned: number; edgesExcludedEndpoint: number; codeEntitiesExcluded: number; isolatedHidden: number };
     coverage: { complete: boolean; reasons: string[] };
   }>;
 }
@@ -392,7 +484,7 @@ describe('ProjectMemory.constellation (real DO) — URI parity and provenance pa
 describe('ProjectMemory.constellation (real DO) — degraded states', () => {
   it('a brand-new project reports graph-empty', async () => {
     const { projectId } = await newOwnedProject('pm-const-empty@example.com', 'PMCONEMP');
-    const result = await memory(projectId).constellation(projectId);
+    const result = await memory(projectId).constellation(projectId, { includeIsolated: true });
     expect(result.nodes).toEqual([]);
     expect(result.edges).toEqual([]);
     expect(result.coverage.reasons).toContain('graph-empty');
@@ -403,7 +495,7 @@ describe('ProjectMemory.constellation (real DO) — degraded states', () => {
     await mcpCall(token, 'create_task', { tags: ['test-fixture'], projectId, title: 'unindexed project task' });
     await memory(projectId).rebuildProjection(projectId);
 
-    const result = await memory(projectId).constellation(projectId);
+    const result = await memory(projectId).constellation(projectId, { includeIsolated: true });
     expect(result.nodes.length).toBeGreaterThan(0);
     expect(result.coverage.reasons).toContain('code-graph-empty');
     expect(result.coverage.reasons).not.toContain('graph-empty');
@@ -448,5 +540,27 @@ describe('POST /api/projects/:pid/memory/constellation (REST)', () => {
     const outsiderCookie = await loginSession('pm-const-outsider@example.com', 'longenough1');
     const res = await SELF.fetch(`https://noriq.test/api/projects/${pid}/memory/constellation`, { method: 'POST', headers: { Cookie: outsiderCookie } });
     expect(res.status).toBe(404); // requireProjectAccess's own "unknown and unreachable collapse into one" convention
+  });
+});
+
+describe('POST /api/projects/:pid/memory/entities (REST)', () => {
+  it('returns an explicitly ordered memory page with a stable cursor shape', async () => {
+    await createUser('pm-entities-rest@example.com', 'Member', 'longenough1').catch(() => {});
+    const cookie = await loginSession('pm-entities-rest@example.com', 'longenough1');
+    const projRes = await SELF.fetch('https://noriq.test/api/projects', {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'PMERST', name: 'PMERST project' }),
+    });
+    const pid = ((await projRes.json()) as { id: string }).id;
+    await memory(pid).recordMemory(pid, { kind: 'learning', statement: 'catalogued memory', actor: SYSTEM });
+
+    const res = await SELF.fetch(`https://noriq.test/api/projects/${pid}/memory/entities`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'memory', sort: 'newest', limit: 50 }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { sort: string; total: number; items: Array<{ type: string; label: string }>; nextCursor: string | null };
+    expect(body).toMatchObject({ sort: 'newest', total: 1, nextCursor: null });
+    expect(body.items).toEqual([expect.objectContaining({ type: 'memory', label: 'catalogued memory' })]);
   });
 });

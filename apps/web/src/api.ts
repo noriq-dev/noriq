@@ -436,7 +436,10 @@ export const api = {
   // POST with no body today (see index.ts route comment on why POST anyway) — `signal` matches
   // the ego-network methods above: a canvas-driving fetch is exactly the kind of request a
   // navigating-away human wants to cancel mid-flight.
-  memoryConstellation: (pid: string, signal?: AbortSignal) => req<ApiConstellation>('POST', `/api/projects/${pid}/memory/constellation`, undefined, signal),
+  memoryConstellation: (pid: string, options?: { includeIsolated?: boolean }, signal?: AbortSignal) =>
+    req<ApiConstellation>('POST', `/api/projects/${pid}/memory/constellation`, options ?? {}, signal),
+  memoryEntities: (pid: string, input: ApiGraphEntityPageInput, signal?: AbortSignal) =>
+    req<ApiGraphEntityPage>('POST', `/api/projects/${pid}/memory/entities`, input, signal),
 
   // --- Repository index / backup / restore / memory-health operations (PLNR-273). READS are
   // reachable by any project member; the ACTION methods 403 server-side for a non-admin (the
@@ -1213,6 +1216,7 @@ export interface ApiConstellationNode {
   type: string;
   kind: string | null;
   label: string;
+  createdAt?: string;
   authority: number | null;
   validity: string | null;
   isLead: boolean | null;
@@ -1232,9 +1236,31 @@ export interface ApiConstellationOmitted {
   nodes: number;
   edges: number;
   edgesDanglingPruned: number;
-  /** PLNR-315: `file`/`symbol` nodes excluded from this whole-project view before scoring —
-   *  reported so their absence reads as "this view doesn't show that", never "nothing is there". */
+  edgesExcludedEndpoint?: number;
+  /** Legacy aggregate retained for rolling clients. PLNR-339 excludes symbols only; prefer
+   *  `sampling.excludedByType` for a truthful breakdown. */
   codeEntitiesExcluded: number;
+  isolatedHidden?: number;
+}
+
+export interface ApiConstellationTypeCounts {
+  total: number;
+  selected: number;
+  connected: number;
+  selectedConnected: number;
+}
+
+export interface ApiConstellationSampling {
+  policy: 'connected-memory-v1';
+  includeIsolated: boolean;
+  totalEligibleNodes: number;
+  totalEligibleEdges: number;
+  connectedNodes: number;
+  isolatedNodes: number;
+  selectedConnectedNodes: number;
+  selectedIsolatedNodes: number;
+  byType: Record<string, ApiConstellationTypeCounts>;
+  excludedByType: Record<string, number>;
 }
 
 export interface ApiConstellation {
@@ -1244,5 +1270,27 @@ export interface ApiConstellation {
   nodes: ApiConstellationNode[];
   edges: ApiConstellationEdge[];
   omitted: ApiConstellationOmitted;
+  /** Optional during rolling deploys from pre-PLNR-339 API workers. */
+  sampling?: ApiConstellationSampling;
   coverage: ApiGraphCoverage;
+}
+
+export type ApiGraphEntitySort = 'newest' | 'connected' | 'authority' | 'label';
+export interface ApiGraphEntityPageInput {
+  cursor?: string;
+  limit?: number;
+  sort?: ApiGraphEntitySort;
+  type?: string;
+  connectedOnly?: boolean;
+  kind?: string;
+  minAuthority?: number;
+  validity?: string;
+}
+export interface ApiGraphEntityPage {
+  memoryRevision: number;
+  sort: ApiGraphEntitySort;
+  items: ApiConstellationNode[];
+  nextCursor: string | null;
+  total: number;
+  byType: Record<string, number>;
 }

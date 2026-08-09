@@ -15,6 +15,7 @@ import { parseEntityUri } from '@noriq-dev/shared';
 import { useEffect, useMemo, useState } from 'react';
 import {
   api,
+  type ApiConstellationNode, type ApiGraphEntityPage, type ApiGraphEntitySort,
   type ApiMemoryFeedbackKind, type ApiMemoryHistory, type ApiMemoryHit, type ApiMemoryItem, type ApiMemoryRepository,
 } from '../api';
 import type { AppStore } from '../store';
@@ -104,7 +105,7 @@ export function MemoryView({ store }: { store: AppStore }) {
       </div>
       <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
         {tab === 'map' && <MemoryStarMap pid={store.currentPid} onOpenEgoNetwork={openEgoNetwork} onOpenInspector={openInspector} />}
-        {tab === 'explore' && <ExploreTab pid={store.currentPid} store={store} initialSelectionUri={inspectorUri} />}
+        {tab === 'explore' && <ExploreTab pid={store.currentPid} store={store} initialSelectionUri={inspectorUri} onOpenEgoNetwork={openEgoNetwork} />}
         {tab === 'graph' && <MemoryGraph pid={store.currentPid} store={store} initialSeedUri={graphSeedUri} />}
         {tab === 'operations' && <MemoryOps pid={store.currentPid} store={store} />}
       </div>
@@ -129,6 +130,29 @@ function selectionFromUri(uri: string): Selection | null {
       entityType: 'memory', id: ref.id, uri, title: '', snippet: '',
       stage: 'exact', score: 1, isLead: false, leadReasons: [], finalScore: 1,
     },
+  };
+}
+
+function hitFromEntity(item: ApiConstellationNode): ApiMemoryHit {
+  let id = item.nodeId;
+  try {
+    const ref = parseEntityUri(item.uri);
+    if ('id' in ref) id = ref.id;
+  } catch { /* keep the stable graph id */ }
+  return {
+    entityType: item.type === 'memory' ? 'memory' : item.type === 'episode' ? 'episode' : 'node',
+    id,
+    uri: item.uri,
+    kind: item.kind ?? item.type,
+    title: item.label,
+    snippet: item.label,
+    stage: 'exact',
+    score: 1,
+    authority: item.authority ?? undefined,
+    validity: item.validity ?? undefined,
+    isLead: item.isLead ?? false,
+    leadReasons: item.leadReasons ?? [],
+    finalScore: 1,
   };
 }
 
@@ -211,7 +235,9 @@ function VerificationBadge({ state }: { state: string }) {
 
 interface Selection { hit: ApiMemoryHit }
 
-function ExploreTab({ pid, store, initialSelectionUri }: { pid: string; store: AppStore; initialSelectionUri?: string | null }) {
+function ExploreTab({ pid, store, initialSelectionUri, onOpenEgoNetwork }: {
+  pid: string; store: AppStore; initialSelectionUri?: string | null; onOpenEgoNetwork: (uri: string) => void;
+}) {
   const [reachable, setReachable] = useState<boolean | null>(null); // null = still probing
   const [reachError, setReachError] = useState<string | undefined>(undefined);
   const [repositories, setRepositories] = useState<ApiMemoryRepository[]>([]);
@@ -224,6 +250,13 @@ function ExploreTab({ pid, store, initialSelectionUri }: { pid: string; store: A
   const [branch, setBranch] = useState('');
   const [taskId, setTaskId] = useState('');
   const [showMore, setShowMore] = useState(false);
+  const [browseType, setBrowseType] = useState('memory');
+  const [browseSort, setBrowseSort] = useState<ApiGraphEntitySort>('newest');
+  const [browseCursor, setBrowseCursor] = useState<string | null>(null);
+  const [browseBack, setBrowseBack] = useState<Array<string | null>>([]);
+  const [browsePage, setBrowsePage] = useState<ApiGraphEntityPage | null>(null);
+  const [browseLoading, setBrowseLoading] = useState(false);
+  const [browseFailed, setBrowseFailed] = useState(false);
 
   const [mode, setMode] = useState<'semantic' | 'keyword' | null>(null);
   const [results, setResults] = useState<ApiMemoryHit[] | null>(null); // null = nothing searched yet
@@ -252,6 +285,31 @@ function ExploreTab({ pid, store, initialSelectionUri }: { pid: string; store: A
   // candidates a query or a task-graph-seed already produced, they don't browse a bare table),
   // so an empty query with no task selected intentionally issues no request.
   const hasSeed = query.trim().length > 0 || taskId.length > 0;
+
+  useEffect(() => {
+    setBrowseCursor(null);
+    setBrowseBack([]);
+    setBrowsePage(null);
+  }, [pid, browseType, browseSort, kind, minAuthority, validity]);
+
+  useEffect(() => {
+    if (reachable !== true || hasSeed) return;
+    const controller = new AbortController();
+    setBrowseLoading(true);
+    setBrowseFailed(false);
+    api.memoryEntities(pid, {
+      cursor: browseCursor ?? undefined,
+      limit: 50,
+      sort: browseSort,
+      type: browseType || undefined,
+      kind: kind || undefined,
+      minAuthority: minAuthority ? Number(minAuthority) : undefined,
+      validity: validity || undefined,
+    }, controller.signal)
+      .then((page) => { setBrowsePage(page); setBrowseLoading(false); })
+      .catch(() => { if (!controller.signal.aborted) { setBrowseFailed(true); setBrowseLoading(false); } });
+    return () => controller.abort();
+  }, [pid, reachable, hasSeed, browseCursor, browseType, browseSort, kind, minAuthority, validity]);
 
   useEffect(() => {
     if (reachable !== true || !hasSeed) { setResults(null); setMode(null); setSearchFailed(false); return; }
@@ -322,10 +380,67 @@ function ExploreTab({ pid, store, initialSelectionUri }: { pid: string; store: A
         </div>
 
         {!hasSeed && (
-          <div style={{ padding: '24px 8px', textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', lineHeight: 1.7 }}>
-            Type a search query, or pick a task to expand its graph neighborhood — kind/authority/
-            validity/repository/branch then narrow whatever that turns up.
-          </div>
+          <>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 10 }}>
+              <Select value={browseType} onChange={(e) => setBrowseType(e.target.value)} aria-label="entity type">
+                <option value="memory">memories</option>
+                <option value="">all entities</option>
+                {Object.keys(browsePage?.byType ?? {}).filter((type) => type !== 'memory').sort().map((type) => (
+                  <option key={type} value={type}>{type} · {browsePage!.byType[type]}</option>
+                ))}
+              </Select>
+              <Select value={browseSort} onChange={(e) => setBrowseSort(e.target.value as ApiGraphEntitySort)} aria-label="browse ordering">
+                <option value="newest">newest first</option>
+                <option value="connected">most connected</option>
+                <option value="authority">highest authority</option>
+                <option value="label">label A–Z</option>
+              </Select>
+            </div>
+            {browseFailed && (
+              <div style={{ padding: 20, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--red-soft)' }}>
+                The ordered catalogue could not be loaded. Search remains available.
+              </div>
+            )}
+            {!browseFailed && browseLoading && !browsePage && (
+              <div style={{ padding: 20, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>Loading ordered catalogue…</div>
+            )}
+            {!browseFailed && browsePage && (
+              <>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                  <SectionLabel>{browsePage.total} {browseType || 'eligible'} entit{browsePage.total === 1 ? 'y' : 'ies'}</SectionLabel>
+                  <MonoTag color="var(--text-dim)" bg="var(--w-04)" size={8.5}>{browsePage.sort}</MonoTag>
+                  {browseLoading && <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>refreshing…</span>}
+                </div>
+                {browsePage.items.length === 0 && (
+                  <div style={{ padding: 20, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>nothing matches these browse filters</div>
+                )}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+                  {browsePage.items.map((item) => {
+                    const hit = hitFromEntity(item);
+                    return <ResultRow
+                      key={item.nodeId}
+                      hit={hit}
+                      selected={selected?.hit.uri === item.uri}
+                      onClick={() => item.type === 'memory' ? setSelected({ hit }) : onOpenEgoNetwork(item.uri)}
+                    />;
+                  })}
+                </div>
+                {(browseBack.length > 0 || browsePage.nextCursor) && (
+                  <div style={{ display: 'flex', gap: 8, justifyContent: 'space-between', marginTop: 12 }}>
+                    <Button variant="ghost" disabled={browseBack.length === 0} onClick={() => {
+                      const previous = browseBack.at(-1) ?? null;
+                      setBrowseBack((stack) => stack.slice(0, -1));
+                      setBrowseCursor(previous);
+                    }}>← previous</Button>
+                    <Button variant="ghost" disabled={!browsePage.nextCursor} onClick={() => {
+                      setBrowseBack((stack) => [...stack, browseCursor]);
+                      setBrowseCursor(browsePage.nextCursor);
+                    }}>next →</Button>
+                  </div>
+                )}
+              </>
+            )}
+          </>
         )}
         {hasSeed && searchFailed && <UnreachableBanner />}
         {hasSeed && !searchFailed && results != null && (

@@ -265,16 +265,16 @@ export function changeImpact(
 export const CONSTELLATION_NODE_CEILING = 1000;
 export const CONSTELLATION_EDGE_CEILING = 2000;
 
-/** PLNR-315: `file`/`symbol` nodes never enter the constellation at all — filtered out of the
- *  candidate population BEFORE scoring/sampling (locked decision), not after. Once a repository
- *  index lands, code entities outnumber memories/tasks/docs/plans by orders of magnitude and would
- *  otherwise eat the entire node ceiling, leaving this bounded OVERVIEW technically full and
- *  practically empty of the things a human opened it to see. This is a constraint on the whole-
- *  project projection only — ego-network expansion and `explain_project_area` (retrieval.ts) are
- *  untouched, since code entities are the point of those surfaces. A hardcoded set, not a
- *  parameter: there is no filter UI for this (deliberately deferred), so nothing downstream needs
- *  it to vary. */
-const CONSTELLATION_EXCLUDED_NODE_TYPES: ReadonlySet<string> = new Set(['file', 'symbol']);
+/** PLNR-339: files are useful constellation landmarks and are therefore eligible again. Symbols
+ *  remain excluded: an indexed repository can contain orders of magnitude more symbols than every
+ *  other entity combined, while a file is the stable, human-readable unit the overview needs.
+ *  Symbol neighborhoods remain available through the seeded graph explorer. */
+const CONSTELLATION_EXCLUDED_NODE_TYPES: ReadonlySet<string> = new Set(['symbol']);
+
+/** A bounded but meaningful share of the overview is reserved for project memory. Without this
+ *  tier, even an authority-5 memory loses to two-degree coordination/code nodes and a busy project
+ *  can produce a 1000-node "memory" map containing no memories at all. */
+export const CONSTELLATION_MEMORY_RESERVE = 300;
 
 export interface ConstellationRawNode {
   nodeId: string;
@@ -324,6 +324,7 @@ export interface ConstellationNode {
    *  (discretionary simplification, not an oversight). */
   kind: string | null;
   label: string;
+  createdAt: string;
   /** memory nodes only, live from `memory_items.authority` (1-5) — null for every other type. */
   authority: number | null;
   /** memory nodes only, live from `memory_items.validity` — null for every other type. */
@@ -370,17 +371,38 @@ export interface ConstellationOmitted {
    *  the pruned ones into coverage"). A human reads the two differently: "there was more graph
    *  than fit" versus "this edge's other end wasn't important enough to make the cut". An edge
    *  touching NEITHER selected node is not counted anywhere — it was never a candidate for this
-   *  response at all. Also where an edge to an EXCLUDED code entity lands (PLNR-315) — an excluded
-   *  node is simply never a candidate for node selection, so the existing dangling-prune semantics
-   *  already apply to it unchanged; no separate counter needed for that case. */
+   *  response at all. Edges into deliberately excluded symbol detail use the separate counter
+   *  below, so this number now means an eligible endpoint was actually lost to sampling. */
   edgesDanglingPruned: number;
-  /** PLNR-315: `file`/`symbol` nodes that existed in the project but were excluded from this
-   *  whole-project view BEFORE scoring/sampling — reported so their absence reads as "this view
-   *  deliberately does not show that" rather than "nothing is there" (§20 coverage discipline).
-   *  These never consumed the node ceiling and are NOT counted in `nodes` above (that field is
-   *  ceiling casualties among the ELIGIBLE population only — a different claim). Zero on a project
-   *  with no repository index, since there is nothing of these types to exclude. */
+  /** Edges dropped because their other endpoint is an intentionally excluded entity type (today,
+   *  a symbol), rather than because an eligible endpoint lost the node-ceiling sample. */
+  edgesExcludedEndpoint: number;
+  /** Legacy aggregate retained for wire compatibility. Under connected-memory-v1 it counts only
+   *  excluded symbols; `sampling.excludedByType` is the authoritative breakdown. */
   codeEntitiesExcluded: number;
+  /** Eligible isolated nodes deliberately hidden by the default connected+memories policy. These
+   *  are not ceiling casualties and therefore do not make coverage incomplete. */
+  isolatedHidden: number;
+}
+
+export interface ConstellationTypeCounts {
+  total: number;
+  selected: number;
+  connected: number;
+  selectedConnected: number;
+}
+
+export interface ConstellationSampling {
+  policy: 'connected-memory-v1';
+  includeIsolated: boolean;
+  totalEligibleNodes: number;
+  totalEligibleEdges: number;
+  connectedNodes: number;
+  isolatedNodes: number;
+  selectedConnectedNodes: number;
+  selectedIsolatedNodes: number;
+  byType: Record<string, ConstellationTypeCounts>;
+  excludedByType: Record<string, number>;
 }
 
 export interface ConstellationResult {
@@ -390,7 +412,14 @@ export interface ConstellationResult {
   nodes: ConstellationNode[];
   edges: ConstellationEdge[];
   omitted: ConstellationOmitted;
+  sampling: ConstellationSampling;
   coverage: Coverage;
+}
+
+export interface ConstellationOptions {
+  /** False by default: the overview shows relationships plus memories. The UI can explicitly ask
+   *  for isolated filler without turning it into the only representation available. */
+  includeIsolated?: boolean;
 }
 
 const MEMORY_URI_PREFIX = 'noriq://memory/';
@@ -453,12 +482,16 @@ function compareNodesForSelection(a: ScoredNode, b: ScoredNode): number {
  * `constellation` RPC is the one place that reads that much in one call, and it is a read-only,
  * off-the-coordination-path query (§19), never a per-second poll.
  */
-export function constellation(memoryRevision: number, rows: ConstellationInputRows, coverageInputs: { codeGraphPopulated: boolean }): ConstellationResult {
+export function constellation(
+  memoryRevision: number,
+  rows: ConstellationInputRows,
+  coverageInputs: { codeGraphPopulated: boolean },
+  options: ConstellationOptions = {},
+): ConstellationResult {
   const memoryById = new Map(rows.memoryItems.map((m) => [m.id, m]));
   const episodeById = new Map(rows.episodes.map((e) => [e.id, e]));
 
-  // PLNR-315: code entities are filtered out of the candidate population here, before ANY scoring
-  // or sampling runs — so they can never displace a memory/task/doc/plan for a ceiling slot. Uses
+  // PLNR-339: excluded entity types are filtered out before scoring or sampling. Uses
   // the RAW row count (`rows.nodes.length`, below) for `graph-empty`, not this filtered count: a
   // project that has ONLY an indexed repository (zero coordination/memory nodes) is genuinely
   // non-empty, just entirely excluded from this one view — conflating the two would misreport a
@@ -466,8 +499,13 @@ export function constellation(memoryRevision: number, rows: ConstellationInputRo
   const eligibleNodes = rows.nodes.filter((n) => !CONSTELLATION_EXCLUDED_NODE_TYPES.has(n.type));
   const codeEntitiesExcluded = rows.nodes.length - eligibleNodes.length;
 
+  const eligibleIds = new Set(eligibleNodes.map((n) => n.nodeId));
+  const excludedIds = new Set(rows.nodes.filter((n) => CONSTELLATION_EXCLUDED_NODE_TYPES.has(n.type)).map((n) => n.nodeId));
+  // PLNR-339: score what this overview can actually draw. Counting an edge to an excluded symbol
+  // made its file/task endpoint rank as connected and then render isolated after edge pruning.
+  const eligibleEdges = rows.edges.filter((e) => eligibleIds.has(e.fromNodeId) && eligibleIds.has(e.toNodeId));
   const degreeByNodeId = new Map<string, number>();
-  for (const e of rows.edges) {
+  for (const e of eligibleEdges) {
     degreeByNodeId.set(e.fromNodeId, (degreeByNodeId.get(e.fromNodeId) ?? 0) + 1);
     degreeByNodeId.set(e.toNodeId, (degreeByNodeId.get(e.toNodeId) ?? 0) + 1);
   }
@@ -491,21 +529,91 @@ export function constellation(memoryRevision: number, rows: ConstellationInputRo
   });
   scored.sort(compareNodesForSelection);
 
-  const totalNodes = scored.length;
-  const selected = scored.slice(0, CONSTELLATION_NODE_CEILING);
-  const omittedNodes = Math.max(0, totalNodes - selected.length);
+  const includeIsolated = options.includeIsolated === true;
+  const visiblePool = includeIsolated ? scored : scored.filter((n) => n.degree > 0 || n.type === 'memory');
+  const isolatedHidden = includeIsolated ? 0 : scored.filter((n) => n.degree === 0 && n.type !== 'memory').length;
 
-  const selectedIds = new Set(selected.map((n) => n.nodeId));
+  // Select a deterministic memory-aware, edge-preserving sample. Memory nodes are reserved first;
+  // for every connected memory we immediately retain its strongest neighbor. Remaining connected
+  // candidates enter as a pair when necessary, so a sampled connected node is not made visually
+  // isolated merely because its endpoint lost an independent top-N contest.
+  const selected: ScoredNode[] = [];
+  const selectedIds = new Set<string>();
+  const scoredById = new Map(scored.map((n) => [n.nodeId, n]));
+  const adjacency = new Map<string, ScoredNode[]>();
+  for (const e of eligibleEdges) {
+    const from = scoredById.get(e.fromNodeId);
+    const to = scoredById.get(e.toNodeId);
+    if (!from || !to) continue;
+    const fromNeighbors = adjacency.get(from.nodeId) ?? [];
+    fromNeighbors.push(to);
+    adjacency.set(from.nodeId, fromNeighbors);
+    const toNeighbors = adjacency.get(to.nodeId) ?? [];
+    toNeighbors.push(from);
+    adjacency.set(to.nodeId, toNeighbors);
+  }
+  for (const neighbors of adjacency.values()) neighbors.sort(compareNodesForSelection);
+
+  const addNode = (n: ScoredNode | undefined): boolean => {
+    if (!n || selectedIds.has(n.nodeId) || selected.length >= CONSTELLATION_NODE_CEILING) return false;
+    selectedIds.add(n.nodeId);
+    selected.push(n);
+    return true;
+  };
+
+  const memories = scored.filter((n) => n.type === 'memory').slice(0, CONSTELLATION_MEMORY_RESERVE);
+  for (const memory of memories) addNode(memory);
+  for (const memory of memories) {
+    if (selected.length >= CONSTELLATION_NODE_CEILING) break;
+    addNode(adjacency.get(memory.nodeId)?.[0]);
+  }
+
+  for (const candidate of visiblePool) {
+    if (selected.length >= CONSTELLATION_NODE_CEILING) break;
+    if (selectedIds.has(candidate.nodeId) || candidate.degree === 0) continue;
+    const neighbors = adjacency.get(candidate.nodeId) ?? [];
+    if (neighbors.some((n) => selectedIds.has(n.nodeId))) {
+      addNode(candidate);
+    } else if (selected.length <= CONSTELLATION_NODE_CEILING - 2) {
+      addNode(candidate);
+      addNode(neighbors[0]);
+    }
+  }
+
+  // The reserve is a floor, not a cap: if the connected core did not consume the budget, retain
+  // every additional memory that fits before considering ordinary isolated filler.
+  for (const candidate of visiblePool) {
+    if (selected.length >= CONSTELLATION_NODE_CEILING) break;
+    if (candidate.type === 'memory') addNode(candidate);
+  }
+
+  if (includeIsolated) {
+    for (const candidate of visiblePool) {
+      if (selected.length >= CONSTELLATION_NODE_CEILING) break;
+      addNode(candidate);
+    }
+  }
+
+  // Preserve the documented importance order on the wire; selection order is an implementation
+  // detail, while deterministic ordering is part of the endpoint contract and its tests.
+  selected.sort(compareNodesForSelection);
+  const omittedNodes = Math.max(0, visiblePool.length - selected.length);
+
   const uriByNodeId = new Map(selected.map((n) => [n.nodeId, n.uri]));
 
   let edgesDanglingPruned = 0;
+  let edgesExcludedEndpoint = 0;
   const surviving: Array<ConstellationRawEdge & { fromUri: string; toUri: string }> = [];
   for (const e of rows.edges) {
     const fromOk = selectedIds.has(e.fromNodeId);
     const toOk = selectedIds.has(e.toNodeId);
     if (!fromOk && !toOk) continue; // touches neither selected node — never a candidate here
     if (fromOk && toOk) surviving.push({ ...e, fromUri: uriByNodeId.get(e.fromNodeId)!, toUri: uriByNodeId.get(e.toNodeId)! });
-    else edgesDanglingPruned++; // exactly one endpoint survived node sampling
+    else {
+      const otherId = fromOk ? e.toNodeId : e.fromNodeId;
+      if (excludedIds.has(otherId)) edgesExcludedEndpoint++;
+      else edgesDanglingPruned++;
+    }
   }
   // Explicit total-order tie-break, same discipline as node selection: type ASC, then both
   // endpoints' URIs ASC. `edgeId` as a final key is defensive only — (type, fromNodeId,
@@ -519,6 +627,29 @@ export function constellation(memoryRevision: number, rows: ConstellationInputRo
   });
   const selectedEdges = surviving.slice(0, CONSTELLATION_EDGE_CEILING);
   const omittedEdges = Math.max(0, surviving.length - selectedEdges.length);
+
+  const selectedByType = new Map<string, { selected: number; selectedConnected: number }>();
+  for (const n of selected) {
+    const counts = selectedByType.get(n.type) ?? { selected: 0, selectedConnected: 0 };
+    counts.selected++;
+    if (n.degree > 0) counts.selectedConnected++;
+    selectedByType.set(n.type, counts);
+  }
+  const byType: Record<string, ConstellationTypeCounts> = {};
+  for (const n of scored) {
+    const counts = byType[n.type] ?? { total: 0, selected: 0, connected: 0, selectedConnected: 0 };
+    counts.total++;
+    if (n.degree > 0) counts.connected++;
+    byType[n.type] = counts;
+  }
+  for (const [type, selectedCounts] of selectedByType) Object.assign(byType[type]!, selectedCounts);
+  const excludedByType: Record<string, number> = {};
+  for (const n of rows.nodes) {
+    if (!CONSTELLATION_EXCLUDED_NODE_TYPES.has(n.type)) continue;
+    excludedByType[n.type] = (excludedByType[n.type] ?? 0) + 1;
+  }
+  const connectedNodes = scored.filter((n) => n.degree > 0).length;
+  const selectedConnectedNodes = selected.filter((n) => n.degree > 0).length;
 
   const coverage = buildCoverage({
     codeGraphPopulated: coverageInputs.codeGraphPopulated,
@@ -540,6 +671,7 @@ export function constellation(memoryRevision: number, rows: ConstellationInputRo
         type: n.type,
         kind: n.kind,
         label: n.label,
+        createdAt: n.createdAt,
         authority: n.authority,
         validity: n.validity,
         isLead: lead?.isLead ?? null,
@@ -549,7 +681,122 @@ export function constellation(memoryRevision: number, rows: ConstellationInputRo
       };
     }),
     edges: selectedEdges.map((e) => ({ type: e.type, fromNodeId: e.fromNodeId, toNodeId: e.toNodeId, provenance: e.provenance })),
-    omitted: { nodes: omittedNodes, edges: omittedEdges, edgesDanglingPruned, codeEntitiesExcluded },
+    omitted: { nodes: omittedNodes, edges: omittedEdges, edgesDanglingPruned, edgesExcludedEndpoint, codeEntitiesExcluded, isolatedHidden },
+    sampling: {
+      policy: 'connected-memory-v1',
+      includeIsolated,
+      totalEligibleNodes: scored.length,
+      totalEligibleEdges: eligibleEdges.length,
+      connectedNodes,
+      isolatedNodes: scored.length - connectedNodes,
+      selectedConnectedNodes,
+      selectedIsolatedNodes: selected.length - selectedConnectedNodes,
+      byType,
+      excludedByType,
+    },
     coverage,
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// PLNR-339: exhaustive entity catalogue. The canvas is deliberately a bounded overview; this is
+// the separately pageable, explicitly ordered path to every eligible entity (including files).
+// ---------------------------------------------------------------------------------------------
+
+export type GraphEntitySort = 'newest' | 'connected' | 'authority' | 'label';
+
+export interface GraphEntityPageInput {
+  cursor?: string;
+  limit?: number;
+  sort?: GraphEntitySort;
+  type?: string;
+  connectedOnly?: boolean;
+  kind?: string;
+  minAuthority?: number;
+  validity?: string;
+}
+
+export interface GraphEntityPage {
+  memoryRevision: number;
+  sort: GraphEntitySort;
+  items: ConstellationNode[];
+  nextCursor: string | null;
+  total: number;
+  byType: Record<string, number>;
+}
+
+export function listGraphEntities(memoryRevision: number, rows: ConstellationInputRows, input: GraphEntityPageInput = {}): GraphEntityPage {
+  const memoryById = new Map(rows.memoryItems.map((m) => [m.id, m]));
+  const episodeById = new Map(rows.episodes.map((e) => [e.id, e]));
+  const eligibleNodes = rows.nodes.filter((n) => !CONSTELLATION_EXCLUDED_NODE_TYPES.has(n.type));
+  const eligibleIds = new Set(eligibleNodes.map((n) => n.nodeId));
+  const degreeByNodeId = new Map<string, number>();
+  for (const e of rows.edges) {
+    if (!eligibleIds.has(e.fromNodeId) || !eligibleIds.has(e.toNodeId)) continue;
+    degreeByNodeId.set(e.fromNodeId, (degreeByNodeId.get(e.fromNodeId) ?? 0) + 1);
+    degreeByNodeId.set(e.toNodeId, (degreeByNodeId.get(e.toNodeId) ?? 0) + 1);
+  }
+
+  const allItems: ConstellationNode[] = eligibleNodes.map((n) => {
+    const memory = n.type === 'memory' ? memoryById.get(memoryIdFromUri(n.uri) ?? '') : undefined;
+    const episode = n.type === 'episode' ? episodeById.get(episodeIdFromUri(n.uri) ?? '') : undefined;
+    const authority = memory?.authority ?? null;
+    const validity = memory?.validity ?? null;
+    const lead = authority !== null || validity !== null
+      ? classifyLead({ authority: authority ?? undefined, validity: validity ?? undefined })
+      : null;
+    return {
+      nodeId: n.nodeId,
+      uri: n.uri,
+      type: n.type,
+      kind: memory?.kind ?? episode?.landingOutcome ?? null,
+      label: n.label,
+      createdAt: n.createdAt,
+      authority,
+      validity,
+      isLead: lead?.isLead ?? null,
+      leadReasons: lead?.leadReasons ?? null,
+      degree: degreeByNodeId.get(n.nodeId) ?? 0,
+      groupKey: n.type,
+    };
+  });
+
+  const byType: Record<string, number> = {};
+  for (const item of allItems) byType[item.type] = (byType[item.type] ?? 0) + 1;
+  const filtered = allItems.filter((item) =>
+    (!input.type || item.type === input.type)
+    && (!input.connectedOnly || item.degree > 0)
+    && (!input.kind || item.kind === input.kind)
+    && (input.minAuthority == null || (item.authority ?? 0) >= input.minAuthority)
+    && (!input.validity || item.validity === input.validity));
+  const sort = input.sort ?? 'newest';
+  const compareText = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
+  filtered.sort((a, b) => {
+    if (sort === 'connected') {
+      const degree = b.degree - a.degree;
+      if (degree) return degree;
+    } else if (sort === 'authority') {
+      const authority = (b.authority ?? 0) - (a.authority ?? 0);
+      if (authority) return authority;
+    } else if (sort === 'label') {
+      const label = compareText(a.label.toLowerCase(), b.label.toLowerCase());
+      if (label) return label;
+    }
+    if (sort !== 'label' && a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? 1 : -1;
+    return compareText(a.uri, b.uri);
+  });
+
+  const limit = Math.max(1, Math.min(100, Math.floor(input.limit ?? 50)));
+  const cursorIndex = input.cursor ? filtered.findIndex((item) => item.uri === input.cursor) : -1;
+  const start = cursorIndex >= 0 ? cursorIndex + 1 : 0;
+  const pageItems = filtered.slice(start, start + limit);
+  const hasMore = start + pageItems.length < filtered.length;
+  return {
+    memoryRevision,
+    sort,
+    items: pageItems,
+    nextCursor: hasMore ? pageItems.at(-1)?.uri ?? null : null,
+    total: filtered.length,
+    byType,
   };
 }

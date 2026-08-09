@@ -4,7 +4,7 @@
 // memory look like", never replaces the seeded neighborhood view.
 //
 // Rendering split (locked decision): the star FIELD — every star and every constellation line, up
-// to the endpoint's 300-node/600-edge ceiling — draws to a single <canvas> 2D context in one pass
+// to the endpoint's 1000-node/2000-edge ceiling — draws to a single <canvas> 2D context in one pass
 // per frame. A DOM/SVG overlay carries ONLY labels (a bounded, budgeted subset — see
 // starmap-layout.ts's `selectLabels`), the selection focus ring, the hover tooltip, and the
 // accessible node list. Nothing here computes layout, encoding, or hit-testing itself — all of
@@ -420,6 +420,7 @@ export function MemoryStarMap({
   const patchPrefs = useCallback((patch: Partial<StarMapPrefs>) => setPrefs((p) => ({ ...p, ...patch })), []);
 
   const [data, setData] = useState<ApiConstellation | null>(null);
+  const [includeIsolated, setIncludeIsolated] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -427,7 +428,7 @@ export function MemoryStarMap({
     const controller = new AbortController();
     setLoading(true);
     setError(null);
-    api.memoryConstellation(pid, controller.signal)
+    api.memoryConstellation(pid, { includeIsolated }, controller.signal)
       .then((r) => { setData(r); setLoading(false); })
       .catch((err: unknown) => {
         if (controller.signal.aborted) return;
@@ -435,7 +436,7 @@ export function MemoryStarMap({
         setLoading(false);
       });
     return () => controller.abort();
-  }, [pid]);
+  }, [pid, includeIsolated]);
 
   const rawLayout = useMemo(() => (data ? computeStarMap(data.nodes, data.edges) : null), [data]);
   const layout = useMemo(() => (rawLayout ? applyPins(rawLayout, prefs.pins) : null), [rawLayout, prefs.pins]);
@@ -688,11 +689,11 @@ export function MemoryStarMap({
   const isEmpty = reasons.includes('graph-empty');
   const isUnindexed = reasons.includes('code-graph-empty') && !isEmpty;
   const isTruncated = reasons.includes('row-limit-reached') && (data?.omitted.nodes ?? 0) + (data?.omitted.edges ?? 0) > 0;
-  // PLNR-315: file/symbol nodes are excluded server-side before scoring, so their absence needs
-  // its own note — distinct from `isTruncated` (a ceiling casualty), since this can be nonzero on
-  // a project that is otherwise nowhere near either ceiling.
-  const excludedCodeEntities = data?.omitted.codeEntitiesExcluded ?? 0;
+  // Symbols stay out of this project-scale overview; files are visible landmarks as of PLNR-339.
+  const excludedCodeEntities = data?.sampling?.excludedByType.symbol ?? data?.omitted.codeEntitiesExcluded ?? 0;
   const hasExcludedCodeEntities = excludedCodeEntities > 0;
+  const hiddenIsolated = data?.omitted.isolatedHidden ?? 0;
+  const memoryCounts = data?.sampling?.byType.memory;
 
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
@@ -704,8 +705,18 @@ export function MemoryStarMap({
             {highlight && ` · ${highlight.matched.size} ignited`}
           </MonoTag>
         )}
+        {memoryCounts && (
+          <MonoTag color="var(--amber)" bg="rgba(245,166,35,.10)" size={9}>
+            {memoryCounts.selected}/{memoryCounts.total} memories
+          </MonoTag>
+        )}
         <div style={{ flex: 1 }} />
         {groupKeys.length > 0 && <GroupFilter groupKeys={groupKeys} hidden={hiddenGroups} onToggle={toggleGroup} />}
+        {(includeIsolated || hiddenIsolated > 0) && (
+          <Button variant="ghost" onClick={() => setIncludeIsolated((v) => !v)}>
+            {includeIsolated ? 'hide isolated' : `show isolated (${hiddenIsolated.toLocaleString()})`}
+          </Button>
+        )}
         <Button variant="ghost" onClick={() => patchPrefs({ showEdges: !prefs.showEdges })}>{prefs.showEdges ? 'hide lines' : 'show lines'}</Button>
         <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
           <Button variant="ghost" onClick={() => zoomBy(1 / 1.3)} style={{ padding: '4px 9px' }}>−</Button>
@@ -747,6 +758,9 @@ export function MemoryStarMap({
               role="img"
               aria-label={`Memory star map: ${layout?.stars.length ?? 0} entities, ${layout?.edges.length ?? 0} relationships. Use the accessible list toggle to browse by keyboard.`}
             />
+            {layout && layout.stars.length === 0 && hiddenIsolated > 0 && (
+              <CenteredNote icon="✦" title="No connected entities yet" body={`${hiddenIsolated.toLocaleString()} unconnected entities are hidden by this overview. Use “show isolated” to include them.`} />
+            )}
             {layout && [...labelIds].map((id) => {
               const star = layout.byNodeId.get(id);
               if (!star) return null;
@@ -758,7 +772,7 @@ export function MemoryStarMap({
             {selectedStar && (
               <DetailPanel star={selectedStar} onClose={() => setSelectedId(null)} onOpenEgoNetwork={onOpenEgoNetwork} onOpenInspector={onOpenInspector} />
             )}
-            {(isUnindexed || isTruncated || hasExcludedCodeEntities) && (
+            {(isUnindexed || isTruncated || hasExcludedCodeEntities || hiddenIsolated > 0) && (
               <div style={{ position: 'absolute', left: 12, bottom: 12, maxWidth: 380, padding: '9px 12px', borderRadius: 10, background: 'rgba(245,166,35,.08)', border: '1px solid rgba(245,166,35,.3)' }}>
                 {isUnindexed && (
                   <div style={{ fontSize: 11, color: 'var(--text-soft)', lineHeight: 1.5 }}>
@@ -772,7 +786,13 @@ export function MemoryStarMap({
                 )}
                 {hasExcludedCodeEntities && (
                   <div style={{ fontSize: 11, color: 'var(--text-soft)', lineHeight: 1.5, marginTop: isUnindexed || isTruncated ? 6 : 0 }}>
-                    {excludedCodeEntities.toLocaleString()} code entit{excludedCodeEntities === 1 ? 'y' : 'ies'} (file/symbol) not shown — this whole-project map excludes code entities to keep the overview readable. Open ego-network exploration on a task or memory to see them.
+                    {excludedCodeEntities.toLocaleString()} symbol{excludedCodeEntities === 1 ? '' : 's'} not shown — files are included as project landmarks, while symbol detail remains available in ego-network exploration.
+                    {(data!.omitted.edgesExcludedEndpoint ?? 0) > 0 && ` ${(data!.omitted.edgesExcludedEndpoint ?? 0).toLocaleString()} relationship${data!.omitted.edgesExcludedEndpoint === 1 ? '' : 's'} lead into that hidden symbol detail.`}
+                  </div>
+                )}
+                {hiddenIsolated > 0 && (
+                  <div style={{ fontSize: 11, color: 'var(--text-soft)', lineHeight: 1.5, marginTop: isUnindexed || isTruncated || hasExcludedCodeEntities ? 6 : 0 }}>
+                    {hiddenIsolated.toLocaleString()} unconnected entit{hiddenIsolated === 1 ? 'y is' : 'ies are'} hidden by the connected + memories overview. Use “show isolated” to include them.
                   </div>
                 )}
               </div>
@@ -787,6 +807,7 @@ export function MemoryStarMap({
                 selectedId={selectedId}
                 onSelect={(id) => setSelectedId(id)}
                 onOpenInspector={onOpenInspector}
+                onOpenEgoNetwork={onOpenEgoNetwork}
               />
             )}
             {!hasQuery && showAccessibleList && layout && (
@@ -826,7 +847,12 @@ function GroupFilter({ groupKeys, hidden, onToggle }: { groupKeys: string[]; hid
 function AccessibleList({ stars, selectedId, onSelect, onClose }: {
   stars: LayoutStar[]; selectedId: string | null; onSelect: (id: string) => void; onClose: () => void;
 }) {
-  const sorted = useMemo(() => [...stars].sort((a, b) => a.label.localeCompare(b.label)), [stars]);
+  const [sort, setSort] = useState<'connected' | 'newest' | 'label'>('connected');
+  const sorted = useMemo(() => [...stars].sort((a, b) => {
+    if (sort === 'connected') return b.degree - a.degree || a.label.localeCompare(b.label) || a.uri.localeCompare(b.uri);
+    if (sort === 'newest') return (b.createdAt ?? '').localeCompare(a.createdAt ?? '') || a.uri.localeCompare(b.uri);
+    return a.label.localeCompare(b.label) || a.uri.localeCompare(b.uri);
+  }), [stars, sort]);
   return (
     <div
       style={{
@@ -835,10 +861,15 @@ function AccessibleList({ stars, selectedId, onSelect, onClose }: {
       }}
     >
       <div style={{ display: 'flex', alignItems: 'center', marginBottom: 8 }}>
-        <SectionLabel>All entities · {sorted.length}</SectionLabel>
+        <SectionLabel>Sampled entities · {sorted.length}</SectionLabel>
         <div style={{ flex: 1 }} />
         <button onClick={onClose} className="drawer-x" style={{ cursor: 'pointer', color: 'var(--text-dim)', fontSize: 14, width: 22, height: 22, borderRadius: 6 }}>✕</button>
       </div>
+      <Select value={sort} onChange={(e) => setSort(e.target.value as typeof sort)} aria-label="entity ordering" style={{ width: '100%', marginBottom: 8 }}>
+        <option value="connected">most connected</option>
+        <option value="label">label A–Z</option>
+        <option value="newest">newest first</option>
+      </Select>
       <ul role="list" aria-label="Star map entities" style={{ listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 4 }}>
         {sorted.map((s) => (
           <li key={s.nodeId}>
@@ -941,7 +972,7 @@ function SearchBar({
  *  counted and explained, never hidden — but is not independently clickable-to-select since there
  *  is no star to select; it can still open the inspector directly by uri when one exists. */
 function SearchResultsPanel({
-  hits, loading, error, layout, highlight, selectedId, onSelect, onOpenInspector,
+  hits, loading, error, layout, highlight, selectedId, onSelect, onOpenInspector, onOpenEgoNetwork,
 }: {
   hits: ApiMemoryHit[] | null;
   loading: boolean;
@@ -951,6 +982,7 @@ function SearchResultsPanel({
   selectedId: string | null;
   onSelect: (nodeId: string) => void;
   onOpenInspector?: (uri: string) => void;
+  onOpenEgoNetwork?: (uri: string) => void;
 }) {
   // Read straight from the same StarMapHighlight draw() consumes — never a second, independently
   // recomputed count, so the panel's numbers cannot drift from what actually ignited on screen.
@@ -990,11 +1022,15 @@ function SearchResultsPanel({
         <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
           {hits.map((hit) => {
             const star = hit.uri ? layout.byUri.get(hit.uri) : undefined;
-            const clickable = !!star || (!!hit.uri && !!onOpenInspector && hit.entityType === 'memory');
+            const clickable = !!star || (!!hit.uri && (!!onOpenEgoNetwork || (!!onOpenInspector && hit.entityType === 'memory')));
             return (
               <div
                 key={`${hit.entityType}:${hit.id}`}
-                onClick={clickable ? () => { if (star) onSelect(star.nodeId); else if (hit.uri && onOpenInspector) onOpenInspector(hit.uri); } : undefined}
+                onClick={clickable ? () => {
+                  if (star) onSelect(star.nodeId);
+                  else if (hit.uri && onOpenEgoNetwork) onOpenEgoNetwork(hit.uri);
+                  else if (hit.uri && onOpenInspector) onOpenInspector(hit.uri);
+                } : undefined}
                 className={clickable ? 'hover-border' : undefined}
                 style={{
                   padding: '9px 12px', borderRadius: 10, cursor: clickable ? 'pointer' : 'default',
