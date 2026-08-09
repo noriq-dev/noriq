@@ -1094,7 +1094,11 @@ export class ProjectMemory extends DurableObject<Env> {
     // retirement and the co-change signal below.
     const prevGen = this.ctx.storage.sql
       .exec<{ id: string }>(
-        `SELECT id FROM index_generations WHERE repository_key = ?1 AND status = 'superseded' AND id != ?2 ORDER BY activated_at DESC LIMIT 1`,
+        // PLNR-323: this picks exactly ONE "most recently superseded" generation, so an
+        // activated_at tie (same millisecond-resolution issue as memory_items.recorded_at) would
+        // pick an unspecified one rather than merely reordering a display list — add `id DESC` so
+        // the pick is deterministic.
+        `SELECT id FROM index_generations WHERE repository_key = ?1 AND status = 'superseded' AND id != ?2 ORDER BY activated_at DESC, id DESC LIMIT 1`,
         gen.repository_key,
         generationId,
       )
@@ -1787,6 +1791,17 @@ export class ProjectMemory extends DurableObject<Env> {
     this._forceWriteFailure = fail;
   }
 
+  /** Test-only clock override: pin `recordMemory`'s `recorded_at` to an exact instant instead of
+   *  `nowIso()`. PLNR-323's flake (two versions racing to the SAME millisecond) needs genuine CPU
+   *  contention to reproduce on demand — this makes the tie deterministic so a regression test can
+   *  force it every run rather than occasionally, the same "not reproducible on demand" reasoning
+   *  as `_setForceWriteFailure` above. `null` restores the real clock. */
+  private _forceRecordedAt: string | null = null;
+  async _setForceRecordedAt(projectId: string, iso: string | null): Promise<void> {
+    await this.assertProjectId(projectId);
+    this._forceRecordedAt = iso;
+  }
+
   /**
    * PLNR-283: idempotent-by-uri node upsert, INSIDE the caller's transaction — the same idiom
    * `recordEpisode`'s local `upsertNode` closure establishes (kept a class METHOD here, not a
@@ -1936,7 +1951,7 @@ export class ProjectMemory extends DurableObject<Env> {
     const operationId = input.operationId ?? newId('op');
     const authority = clampAuthority(input.authority ?? AUTHORITY_HYPOTHESIS, input.actor.kind);
     const memoryId = newId('mem');
-    const now = nowIso();
+    const now = this._forceRecordedAt ?? nowIso();
 
     this.ctx.storage.transactionSync(() => {
       if (this._forceWriteFailure) throw new Error('injected write failure (test)');
@@ -2818,13 +2833,49 @@ export class ProjectMemory extends DurableObject<Env> {
         recorded_by_agent_id: string | null; recorded_at: string; proposed_at: string | null;
         rejected_at: string | null; supersedes_memory_id: string | null;
       }>(
+        // PLNR-323: `recorded_at` is millisecond-resolution and a supersession's original +
+        // correction can be recorded back-to-back in the SAME millisecond under contention —
+        // SQLite's tie-break for equal ORDER BY values is unspecified, so without `id` this
+        // query alone was flaky. `id` (Crockford-ish: ms timestamp + RANDOM suffix, newId() in
+        // lib/util.ts) makes the SQL order total and reproducible, but its suffix is random, not
+        // a counter, so it does NOT reliably resolve ties in the "correct" (oldest-first)
+        // direction — that correction happens below, from the supersession graph itself.
         `SELECT id, kind, statement, authority, validity, recorded_by_agent_id, recorded_at, proposed_at, rejected_at, supersedes_memory_id
-         FROM memory_items WHERE id IN (${placeholders}) ORDER BY recorded_at`,
+         FROM memory_items WHERE id IN (${placeholders}) ORDER BY recorded_at, id`,
         ...idList,
       )
       .toArray();
     const supersededByOf = new Map<string, string>();
     for (const v of versionRows) if (v.supersedes_memory_id) supersededByOf.set(v.supersedes_memory_id, v.id);
+
+    // Re-sort by chain depth (hops back to a "local root" — a version whose predecessor is
+    // outside this result set, usually because it has none). Unlike a recorded_at tiebreak, this
+    // is not a coin flip: a version can never have been recorded before what it supersedes, so
+    // ordering by depth is STRUCTURALLY guaranteed oldest-first, immune to clock resolution
+    // entirely — which is what "returns the whole chain, oldest first" actually needs. Only
+    // versions at the SAME depth (independent corrections of the same parent — the schema
+    // allows branching, though nothing in this codebase creates it today) fall back to the
+    // recorded_at/id order already established above; a defensive `seen` guard means a
+    // (should-never-happen) cycle in supersedes_memory_id degrades to that same fallback rather
+    // than infinite-looping.
+    const byId = new Map(versionRows.map((v) => [v.id, v]));
+    const depthOf = new Map<string, number>();
+    const chainDepth = (id: string, seen: Set<string>): number => {
+      if (depthOf.has(id)) return depthOf.get(id)!;
+      if (seen.has(id)) return 0;
+      const parentId = byId.get(id)?.supersedes_memory_id;
+      const parent = parentId ? byId.get(parentId) : undefined;
+      const depth = parent ? chainDepth(parent.id, new Set(seen).add(id)) + 1 : 0;
+      depthOf.set(id, depth);
+      return depth;
+    };
+    for (const v of versionRows) chainDepth(v.id, new Set());
+    versionRows.sort((a, b) =>
+      (depthOf.get(a.id)! - depthOf.get(b.id)!) ||
+      a.recorded_at.localeCompare(b.recorded_at) ||
+      a.id.localeCompare(b.id),
+    );
+
     const versions = versionRows.map((v) => ({
       id: v.id,
       kind: v.kind,
@@ -2850,9 +2901,11 @@ export class ProjectMemory extends DurableObject<Env> {
         // supplies 2N bindings for N declared parameters and SQLite rejects the whole statement
         // with "Wrong number of parameter bindings for SQL query", which 500'd this endpoint for
         // every memory (even a single id with no chain: one `?1`, two bindings).
+        // PLNR-323: same millisecond-tie hazard as the versions query above — add `id` so two
+        // transitions logged in the same millisecond return in a fixed, reproducible order.
         `SELECT id, memory_item_id, resulting_memory_id, outcome, new_authority, actor_kind, actor_id, revision, note, created_at
          FROM memory_authority_transitions WHERE memory_item_id IN (${placeholders}) OR resulting_memory_id IN (${placeholders})
-         ORDER BY created_at`,
+         ORDER BY created_at, id`,
         ...idList,
       )
       .toArray()
@@ -2882,7 +2935,9 @@ export class ProjectMemory extends DurableObject<Env> {
 
     const feedback = this.ctx.storage.sql
       .exec<{ id: string; actor_id: string; vote: string; kind: string | null; reason: string | null; created_at: string }>(
-        `SELECT id, actor_id, vote, kind, reason, created_at FROM feedback WHERE memory_item_id = ?1 ORDER BY created_at DESC`,
+        // PLNR-323: same millisecond-tie hazard — `id DESC` keeps two same-millisecond feedback
+        // rows in a fixed, reproducible order (matching the primary column's DESC direction).
+        `SELECT id, actor_id, vote, kind, reason, created_at FROM feedback WHERE memory_item_id = ?1 ORDER BY created_at DESC, id DESC`,
         memoryItemId,
       )
       .toArray()
@@ -3706,8 +3761,10 @@ export class ProjectMemory extends DurableObject<Env> {
         recorded_at: string;
         proposed_at: string;
       }>(
+        // PLNR-323: same millisecond-tie hazard — `id` keeps two decisions proposed in the same
+        // millisecond in a fixed, reproducible queue order for the human reviewing them.
         `SELECT id, statement, authority, recorded_by_agent_id, recorded_at, proposed_at
-         FROM memory_items WHERE kind = 'decision' AND proposed_at IS NOT NULL ORDER BY proposed_at`,
+         FROM memory_items WHERE kind = 'decision' AND proposed_at IS NOT NULL ORDER BY proposed_at, id`,
       )
       .toArray()
       .map((r) => ({

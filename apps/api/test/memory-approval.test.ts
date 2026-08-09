@@ -46,6 +46,7 @@ interface MemoryRpc {
   ): Promise<{ promoted: string[]; skipped: Array<{ memoryItemId: string; reason: string }> }>;
   drainOutbox(pid: string): Promise<{ delivered: number; failed: number }>;
   _setForceWriteFailure(pid: string, fail: boolean): Promise<void>;
+  _setForceRecordedAt(pid: string, iso: string | null): Promise<void>;
   beginIndexIngest(pid: string, manifest: IndexManifestInput): Promise<{ ok: true }>;
   ingestIndexBatch(pid: string, batch: { generationId: string; batchNumber: number; batchHash: string }, rows: StagedRow[]): Promise<{ ok: true; deduped: boolean }>;
   completeIndexIngest(pid: string, generationId: string): Promise<{ ok: true; batchesReceived: number; validation: { ok: boolean; problems: string[] } }>;
@@ -530,6 +531,96 @@ describe('memory history (PLNR-271 surface, PLNR-312 regression)', () => {
         versions: Array<{ id: string; supersedesMemoryId: string | null; supersededByMemoryId: string | null }>;
       };
       expect(body.versions.map((v) => v.id)).toEqual([original, correction]); // ORDER BY recorded_at
+      const [older, newer] = body.versions;
+      expect(older?.supersededByMemoryId).toBe(correction);
+      expect(newer?.supersedesMemoryId).toBe(original);
+    }
+  });
+
+  it('orders a chain oldest-first even when both versions land in the SAME millisecond (PLNR-323)', async () => {
+    // The original flake needed real CPU contention to land two `recordMemory` calls in the same
+    // millisecond — occasional, not reproducible on demand. `_setForceRecordedAt` pins the clock
+    // so the tie happens on every run. (Verified empirically: this exact tie alone does NOT
+    // reproduce wrong ordering against the pre-fix `ORDER BY recorded_at` in this harness — a
+    // fresh two-row table's scan/sort here happens to preserve insertion order, and insertion
+    // order is FK-forced correct for a supersession pair since the superseded row must already
+    // exist. The real flake needed genuine multi-shard resource contention this test cannot
+    // manufacture. Kept anyway as a literal regression test of the reported symptom and to lock
+    // in full SQL-level determinism; the test below is the one that actually falsifies a
+    // recorded_at-based fix.)
+    const { cookie, projectId } = await newOwnedProject('pm-hist-tie@example.com', 'PMHISTTI');
+    const m = memory(projectId);
+    const tiedInstant = '2026-01-01T00:00:00.000Z';
+    await m._setForceRecordedAt(projectId, tiedInstant);
+    let original: string, correction: string;
+    try {
+      ({ memoryId: original } = await m.recordMemory(projectId, {
+        kind: 'learning', statement: 'the original claim, clock pinned', actor: AGENT,
+      }));
+      ({ memoryId: correction } = await m.recordMemory(projectId, {
+        kind: 'learning', statement: 'the corrected claim, clock pinned', supersedesMemoryId: original, actor: AGENT,
+      }));
+    } finally {
+      await m._setForceRecordedAt(projectId, null); // restore the real clock
+    }
+
+    for (const seed of [original, correction]) {
+      const res = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/memory/items/${seed}/history`, {
+        headers: { Cookie: cookie },
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        versions: Array<{ id: string; recordedAt: string; supersedesMemoryId: string | null; supersededByMemoryId: string | null }>;
+      };
+      // Prove the tie actually landed — otherwise this test would pass even against the old,
+      // tiebreaker-free `ORDER BY recorded_at` and demonstrate nothing.
+      expect(body.versions.map((v) => v.recordedAt)).toEqual([tiedInstant, tiedInstant]);
+      expect(body.versions.map((v) => v.id)).toEqual([original, correction]);
+      const [older, newer] = body.versions;
+      expect(older?.supersededByMemoryId).toBe(correction);
+      expect(newer?.supersedesMemoryId).toBe(original);
+    }
+  });
+
+  it('orders a chain oldest-first from the supersession graph, not recorded_at, even when the clock reads backwards (PLNR-323)', async () => {
+    // The stronger, actually-falsifying version of the test above: force the CORRECTION's
+    // recorded_at to read EARLIER than the ORIGINAL's. Any fix that sorts by recorded_at — with
+    // or without a tiebreaker column — gets this backwards every single time; only a fix that
+    // orders from the supersedes_memory_id graph itself (a version can never precede what it
+    // supersedes) gets it right. This is what makes the ordering "genuinely total": correct
+    // because of the chain's structure, not because of who happened to win a coin flip on a tied
+    // millisecond.
+    const { cookie, projectId } = await newOwnedProject('pm-hist-skew@example.com', 'PMHISTSK');
+    const m = memory(projectId);
+    let original: string, correction: string;
+    try {
+      await m._setForceRecordedAt(projectId, '2026-01-01T00:00:00.900Z');
+      ({ memoryId: original } = await m.recordMemory(projectId, {
+        kind: 'learning', statement: 'the original claim, clock reads LATER', actor: AGENT,
+      }));
+      await m._setForceRecordedAt(projectId, '2026-01-01T00:00:00.100Z');
+      ({ memoryId: correction } = await m.recordMemory(projectId, {
+        kind: 'learning', statement: 'the corrected claim, clock reads EARLIER', supersedesMemoryId: original, actor: AGENT,
+      }));
+    } finally {
+      await m._setForceRecordedAt(projectId, null);
+    }
+
+    for (const seed of [original, correction]) {
+      const res = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/memory/items/${seed}/history`, {
+        headers: { Cookie: cookie },
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        versions: Array<{ id: string; recordedAt: string; supersedesMemoryId: string | null; supersededByMemoryId: string | null }>;
+      };
+      // Confirm the clock really does read backwards — otherwise this test proves nothing either.
+      const originalRecordedAt = body.versions.find((v) => v.id === original)?.recordedAt;
+      const correctionRecordedAt = body.versions.find((v) => v.id === correction)?.recordedAt;
+      expect(originalRecordedAt).toBeTruthy();
+      expect(correctionRecordedAt).toBeTruthy();
+      expect(originalRecordedAt! > correctionRecordedAt!).toBe(true);
+      expect(body.versions.map((v) => v.id)).toEqual([original, correction]); // still oldest-first
       const [older, newer] = body.versions;
       expect(older?.supersededByMemoryId).toBe(correction);
       expect(newer?.supersedesMemoryId).toBe(original);
