@@ -54,7 +54,9 @@ interface MemoryRpc {
   beginIndexIngest(pid: string, manifest: IndexManifestInput): Promise<{ ok: true }>;
   ingestIndexBatch(pid: string, batch: { generationId: string; batchNumber: number; batchHash: string }, rows: StagedRow[]): Promise<{ ok: true; deduped: boolean }>;
   completeIndexIngest(pid: string, generationId: string): Promise<{ ok: true; batchesReceived: number; validation: { ok: boolean; problems: string[] } }>;
-  activateIndexGeneration(pid: string, generationId: string): Promise<{ activated: string; superseded: string[] }>;
+  activateIndexGeneration(pid: string, generationId: string): Promise<{
+    activated: string; superseded: string[]; projection: { nodesWritten: number };
+  }>;
   projectActiveGeneration(pid: string, generationId: string): Promise<{ nodesWritten: number }>;
 }
 
@@ -85,8 +87,7 @@ async function stageAndProject(projectId: string, opts: { generationId: string; 
   await m.ingestIndexBatch(projectId, { generationId: opts.generationId, batchNumber: 0, batchHash: 'h' }, opts.rows);
   const completed = await m.completeIndexIngest(projectId, opts.generationId);
   if (!completed.validation.ok) throw new Error(`validation failed: ${completed.validation.problems.join('; ')}`);
-  await m.activateIndexGeneration(projectId, opts.generationId);
-  return m.projectActiveGeneration(projectId, opts.generationId);
+  return (await m.activateIndexGeneration(projectId, opts.generationId)).projection;
 }
 
 const old = () => new Date(Date.now() - MEMORY_HYPOTHESIS_DECAY_MAX_AGE_MS - 1000).toISOString();

@@ -37,6 +37,7 @@ interface MemoryItemRecord {
 }
 interface MemoryRpc {
   health(pid: string): Promise<{ schemaVersion: number; memoryRevision: number; tableCounts: Record<string, number> }>;
+  runProjector(pid: string): Promise<{ applied: number; cursor: number }>;
   recordMemory(
     pid: string,
     input: {
@@ -98,6 +99,8 @@ describe('recordMemory — operation-id idempotency', () => {
 describe('writeNode / writeEdge — operation-id idempotency', () => {
   it('replaying the same operation id creates no second node or edge', async () => {
     const { projectId } = await newOwnedProject('pm-writes-graph-idem@example.com', 'PMWGIDEM');
+    await memory(projectId).runProjector(projectId);
+    const baselineNodes = (await memory(projectId).health(projectId)).tableCounts.nodes ?? 0;
     const nodeOp = 'op-node-1';
     const n1 = await memory(projectId).writeNode(projectId, { operationId: nodeOp, type: 'file', uri: 'noriq://file/PMWGIDEM/repo/x.ts', label: 'x.ts', actor: SYSTEM });
     const n2 = await memory(projectId).writeNode(projectId, { operationId: nodeOp, type: 'file', uri: 'noriq://file/PMWGIDEM/repo/x.ts', label: 'x.ts', actor: SYSTEM });
@@ -112,7 +115,7 @@ describe('writeNode / writeEdge — operation-id idempotency', () => {
     expect(e2.edgeId).toBe(e1.edgeId);
 
     const h = await memory(projectId).health(projectId);
-    expect(h.tableCounts.nodes).toBe(2);
+    expect(h.tableCounts.nodes).toBe(baselineNodes + 2);
     expect(h.tableCounts.edges).toBe(1);
   });
 

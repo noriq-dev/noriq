@@ -226,7 +226,7 @@ describe('activateIndexGeneration — real index_generations status transitions 
       generationId: 'gen_first', repositoryKey: 'repo-a', branch: 'main', baseId: 'sha_1',
       entities: [{ kind: 'node', uri: 'noriq://file/CIDX1/repo-a/a.ts', type: 'file', label: 'a.ts' }],
     });
-    expect(first).toEqual({ activated: 'gen_first', superseded: [] });
+    expect(first).toMatchObject({ activated: 'gen_first', superseded: [] });
     expect(await memory(projectId)._getIndexGenerationStatusForTest(projectId, 'gen_first')).toBe('active');
 
     const second = await stageAndActivate(projectId, {
@@ -234,7 +234,7 @@ describe('activateIndexGeneration — real index_generations status transitions 
       entities: [{ kind: 'node', uri: 'noriq://file/CIDX1/repo-a/a.ts', type: 'file', label: 'a.ts (unchanged)' }],
       deletions: ['removed.ts'],
     });
-    expect(second).toEqual({ activated: 'gen_second', superseded: ['gen_first'] });
+    expect(second).toMatchObject({ activated: 'gen_second', superseded: ['gen_first'] });
     expect(await memory(projectId)._getIndexGenerationStatusForTest(projectId, 'gen_first')).toBe('superseded');
     expect(await memory(projectId)._getIndexGenerationStatusForTest(projectId, 'gen_second')).toBe('active');
   });
@@ -244,7 +244,7 @@ describe('activateIndexGeneration — real index_generations status transitions 
     // No AI/CODE_VECTORIZE bound in the workerd test env — this must not throw.
     await expect(
       stageAndActivate(projectId, { generationId: 'gen_x', repositoryKey: 'repo-b', branch: 'main', baseId: 'sha_1', entities: [] }),
-    ).resolves.toEqual({ activated: 'gen_x', superseded: [] });
+    ).resolves.toMatchObject({ activated: 'gen_x', superseded: [] });
   });
 });
 

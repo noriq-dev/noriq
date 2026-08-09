@@ -15,6 +15,7 @@ let runnerId: string;
 
 interface RepoRpc {
   registerRepository(pid: string, actor: Actor, key: string): Promise<{ id: string }>;
+  deleteProject(pid: string, actor: Actor): Promise<{ ok: true }>;
 }
 
 const createProject = (cookie: string, key: string, name: string) =>
@@ -87,6 +88,23 @@ describe('capability minting scope', () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { token: string; maxBytes: number };
     expect(body.token).toContain('.');
+  });
+
+  it('a capability minted before project deletion cannot recreate memory afterward', async () => {
+    const p = await createProject(ownerCookie, 'INGDEL', 'ingest deletion');
+    const deletedProjectId = ((await p.json()) as { id: string }).id;
+    await authorizeForAllProjects(ownerToken);
+    await projectRoom<RepoRpc>(deletedProjectId).registerRepository(
+      deletedProjectId, SYSTEM_ACTOR as Actor, 'deleted-repo',
+    );
+    const capRes = await mintCap(ownerToken, {
+      projectId: deletedProjectId, repositoryKey: 'deleted-repo', purpose: 'index', scopeId: 'gen_deleted', runnerId,
+    });
+    expect(capRes.status).toBe(200);
+    const cap = await capRes.json() as { token: string };
+
+    await projectRoom<RepoRpc>(deletedProjectId).deleteProject(deletedProjectId, SYSTEM_ACTOR as Actor);
+    expect((await begin(cap.token, { ...baseManifest, generationId: 'gen_deleted' })).status).toBe(401);
   });
 });
 

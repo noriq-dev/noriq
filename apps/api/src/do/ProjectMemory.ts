@@ -330,24 +330,42 @@ export class ProjectMemory extends DurableObject<Env> {
   ): Promise<{ ok: true; manifest: MemoryBackupManifest; manifestKey: string } | { ok: false; reason: string }> {
     await this.assertProjectId(projectId);
     if (!this.env.FILES) return { ok: false, reason: 'R2 (FILES) not configured' };
+    // R2 writes yield between chunks, so paging directly over the live tables can otherwise
+    // mix revisions (and OFFSET can skip/duplicate rows as concurrent writes land). Materialize
+    // one constraint-free, point-in-time copy first; both header fields are captured in the same
+    // SQLite transaction as the rows they describe. A unique prefix also makes concurrent export
+    // calls independent.
+    const copyPrefix = `${newId('export')}_`;
+    let schemaVersion = 0;
+    let memoryRevision = 0;
     try {
+      this.ctx.storage.transactionSync(() => {
+        schemaVersion = this.readSchemaVersion();
+        memoryRevision = this.readMemoryRevision();
+        this.snapshotLiveInto(copyPrefix);
+      });
       const result = await exportMemorySnapshot({
         env: this.env,
         projectId,
-        schemaVersion: this.readSchemaVersion(),
-        memoryRevision: this.readMemoryRevision(),
+        schemaVersion,
+        memoryRevision,
         tier: opts.tier ?? 'core',
         exportedAt: nowIso(),
         tables: BACKUP_TABLES,
         readBatch: (table, offset, limit) =>
-          this.ctx.storage.sql.exec(`SELECT * FROM ${table} LIMIT ?1 OFFSET ?2`, limit, offset).toArray(),
-        tableCount: (table) => this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`).toArray()[0]?.n ?? 0,
+          this.ctx.storage.sql.exec(`SELECT * FROM ${copyPrefix}${table} ORDER BY rowid LIMIT ?1 OFFSET ?2`, limit, offset).toArray(),
+        tableCount: (table) =>
+          this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${copyPrefix}${table}`).toArray()[0]?.n ?? 0,
       });
       await this.reportBackupStatus(projectId, true);
       return { ok: true, manifest: result.manifest, manifestKey: result.manifestKey };
     } catch (err) {
       await this.reportBackupStatus(projectId, false);
       return { ok: false, reason: String(err) };
+    } finally {
+      this.ctx.storage.transactionSync(() => {
+        for (const table of BACKUP_TABLES) this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS ${copyPrefix}${table}`);
+      });
     }
   }
 
@@ -893,18 +911,26 @@ export class ProjectMemory extends DurableObject<Env> {
   }
 
   /** The PROMOTE step — the ONLY writer of `status = 'active'`. Refuses a generation that has
-   *  not completed ingest (no `sealed_at`) or that failed validation; activates exactly once
-   *  (re-activating an already-active generation is refused, matching its `status` check). */
-  async activateIndexGeneration(projectId: string, generationId: string): Promise<{ activated: string; superseded: string[] }> {
+   *  not completed ingest (no `sealed_at`) or that failed validation. Re-activating the current
+   *  generation republishes it idempotently, so a partial failure or lost response is retryable. */
+  async activateIndexGeneration(
+    projectId: string,
+    generationId: string,
+  ): Promise<{
+    activated: string;
+    superseded: string[];
+    projection: { nodesWritten: number; edgesWritten: number; entitiesSkipped: number; edgesSkipped: number; retired: number; coChangeEdges: number };
+  }> {
     await this.assertProjectId(projectId);
     const gen = this.getIndexGenerationRow(generationId);
     if (!gen) throw new Error(`generation ${generationId} not found`);
-    if (gen.status !== 'staged') throw new Error(`generation ${generationId} is already ${gen.status}`);
-    if (!gen.sealed_at) throw new Error(`generation ${generationId} has not completed ingest — call completeIndexIngest first`);
-    if (gen.validation_problems) throw new Error(`generation ${generationId} failed validation: ${gen.validation_problems}`);
+    const retryingActive = gen.status === 'active';
+    if (!retryingActive && gen.status !== 'staged') throw new Error(`generation ${generationId} is already ${gen.status}`);
+    if (!retryingActive && !gen.sealed_at) throw new Error(`generation ${generationId} has not completed ingest — call completeIndexIngest first`);
+    if (!retryingActive && gen.validation_problems) throw new Error(`generation ${generationId} failed validation: ${gen.validation_problems}`);
 
     let superseded: string[] = [];
-    this.ctx.storage.transactionSync(() => {
+    if (!retryingActive) this.ctx.storage.transactionSync(() => {
       // The read of the currently-active generation happens INSIDE the transaction — moved here
       // from where the old activateCodeGeneration read it (before its own transactionSync), which
       // let two concurrent activations both observe the same prior active row and both promote.
@@ -917,6 +943,12 @@ export class ProjectMemory extends DurableObject<Env> {
       }
       this.ctx.storage.sql.exec(`UPDATE index_generations SET status = 'active', activated_at = ?2 WHERE id = ?1`, generationId, nowIso());
     });
+
+    // Activation is the production publish boundary. Project the staged entities/edges before
+    // acknowledging success. Retrying an already-active generation is deliberately allowed:
+    // projection and vector publication are idempotent, which closes the response-loss and
+    // partial-side-effect recovery path.
+    const projection = await this.projectActiveGeneration(projectId, generationId);
 
     // Best-effort vector publish, OUTSIDE the transaction (PLNR-256: a Vectorize upsert cannot
     // join a SQLite transaction; correctness comes from query-time generation filtering, never
@@ -951,7 +983,7 @@ export class ProjectMemory extends DurableObject<Env> {
       .setRepositoryActiveGeneration(projectId, gen.repository_key, generationId)
       .catch((err) => console.warn(`ProjectMemory active-generation projection for ${projectId}/${gen.repository_key} failed: ${String(err)}`));
 
-    return { activated: generationId, superseded };
+    return { activated: generationId, superseded, projection };
   }
 
   /**
@@ -984,6 +1016,28 @@ export class ProjectMemory extends DurableObject<Env> {
     const gen = this.getIndexGenerationRow(generationId);
     if (!gen) throw new Error(`generation ${generationId} not found`);
     if (gen.status !== 'active') throw new Error(`generation ${generationId} is ${gen.status} — only an active generation may be projected`);
+    const priorProjection = this.ctx.storage.sql
+      .exec<{ result: string }>(
+        `SELECT result FROM applied_operations
+         WHERE subject_type = 'generation-projection' AND subject_id = ?1
+         ORDER BY applied_at DESC LIMIT 1`,
+        generationId,
+      )
+      .toArray()[0];
+    if (priorProjection) {
+      const prior = JSON.parse(priorProjection.result) as Partial<{
+        nodesWritten: number; edgesWritten: number; entitiesSkipped: number;
+        edgesSkipped: number; retired: number; coChangeEdges: number;
+      }>;
+      return {
+        nodesWritten: prior.nodesWritten ?? 0,
+        edgesWritten: prior.edgesWritten ?? 0,
+        entitiesSkipped: prior.entitiesSkipped ?? 0,
+        edgesSkipped: prior.edgesSkipped ?? 0,
+        retired: prior.retired ?? 0,
+        coChangeEdges: prior.coChangeEdges ?? 0,
+      };
+    }
     const projectKey = await this.resolveProjectKey(projectId);
 
     const stagedEntities = this.ctx.storage.sql
@@ -1103,7 +1157,14 @@ export class ProjectMemory extends DurableObject<Env> {
         operationId,
         now,
         generationId,
-        JSON.stringify({ nodesWritten: plan.validEntities.length, edgesWritten: plan.validEdges.length }),
+        JSON.stringify({
+          nodesWritten: plan.validEntities.length,
+          edgesWritten: plan.validEdges.length,
+          entitiesSkipped: plan.invalidEntities.length,
+          edgesSkipped: plan.invalidEdges.length,
+          retired,
+          coChangeEdges,
+        }),
       );
     });
     this.ctx.storage.setAlarm(Date.now()).catch(() => {});
@@ -1540,14 +1601,12 @@ export class ProjectMemory extends DurableObject<Env> {
 
   /**
    * The full auditable erasure sequence (PLNR-250) — what a durable tombstone (migration 0072)
-   * is retried against until every step reports complete. Order: (1) this DO's own rows,
-   * including any generation debris a restore left behind (retained `prev_` tables, any
-   * `staging_` tables from an import that never finished); (2) this project's entire R2
-   * memory-backups prefix; (3)/(4) the vector and ingest-capability seams, shipped as explicit
-   * "nothing to do yet" steps — no memory Vectorize entity exists before Phase 4 and no ingest
-   * capability exists before Phase 5, so pretending to delete either would be theater. Each
-   * step is independently idempotent: re-running on an already-erased project reports ok on
-   * every step at effectively zero cost.
+   * is retried against until every step reports complete. Order: (1) operational-memory and
+   * code-intelligence vectors; (2) this DO's rows, including any retained `prev_`, import
+   * `staging_`, or export-copy tables; (3) this project's R2 memory-backups prefix; (4) ingest
+   * capability state. Vector deletion must succeed before canonical rows are erased, because
+   * those rows are the retry ledger for the otherwise filter-less Vectorize delete API. Each
+   * step is idempotent: a tombstone can safely drive the whole sequence again after any failure.
    */
   /** Test-only fault injection: force the next eraseAll's "store" step to fail — mirrors
    *  _setForceDeliveryFailure (PLNR-247), same reason: proves the tombstone survives a failed
@@ -1562,20 +1621,68 @@ export class ProjectMemory extends DurableObject<Env> {
     await this.assertProjectId(projectId);
     const steps: EraseStepResult[] = [];
 
+    // Capture every stable id before touching the canonical store. Vectorize has no
+    // delete-by-project operation; successful deletion of these ids is therefore a prerequisite
+    // for clearing the rows that let a later tombstone retry reconstruct the same target set.
+    const memoryVectorRefs = this.ctx.storage.sql
+      .exec<{ id: string; kind: 'memory' | 'episode' }>(
+        `SELECT id, 'memory' AS kind FROM memory_items
+         UNION ALL SELECT id, 'episode' AS kind FROM episodes`,
+      )
+      .toArray();
+    const codeVectorUris = this.ctx.storage.sql
+      .exec<{ uri: string }>(
+        `SELECT uri FROM index_staged_entities
+         UNION
+         SELECT uri FROM nodes WHERE type IN ('file','symbol','api','test','database_entity','procedure','artifact')`,
+      )
+      .toArray()
+      .map((r) => r.uri);
+
+    let vectorsCleared = true;
     try {
-      if (this._forceEraseFailure) throw new Error('injected erase failure (test)');
-      await this.erase(projectId);
-      this.ctx.storage.transactionSync(() => {
-        for (const table of BACKUP_TABLES) {
-          this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS prev_${table}`);
-          this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS staging_${table}`);
-        }
-        this.ctx.storage.sql.exec(`UPDATE _meta SET value = '0' WHERE key = 'has_prior_generation'`);
+      const operational = searchBackend(this.env);
+      if (operational) {
+        for (const ref of memoryVectorRefs) await removeEntity(operational, ref.kind, ref.id);
+      }
+      const code = codeSearchBackend(this.env);
+      if (code) {
+        for (const uri of codeVectorUris) await removeCodeEntity(code, uri);
+      }
+      const removed = memoryVectorRefs.length + codeVectorUris.length;
+      const configured = !!operational || !!code;
+      steps.push({
+        step: 'vectors',
+        ok: true,
+        detail: configured ? `${removed} canonical vector target(s) deleted` : 'vector indexes not configured — nothing to delete',
       });
-      this.ingestEpisodes.clear();
-      steps.push({ step: 'store', ok: true, detail: 'rows and any generation debris cleared' });
     } catch (err) {
-      steps.push({ step: 'store', ok: false, detail: String(err) });
+      vectorsCleared = false;
+      steps.push({ step: 'vectors', ok: false, detail: String(err) });
+    }
+
+    if (!vectorsCleared) {
+      steps.push({ step: 'store', ok: false, detail: 'deferred until vector deletion succeeds so its retry targets remain available' });
+    } else {
+      try {
+        if (this._forceEraseFailure) throw new Error('injected erase failure (test)');
+        await this.erase(projectId);
+        this.ctx.storage.transactionSync(() => {
+          for (const table of BACKUP_TABLES) {
+            this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS prev_${table}`);
+            this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS staging_${table}`);
+          }
+          const exportTables = this.ctx.storage.sql
+            .exec<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'export!_%' ESCAPE '!'`)
+            .toArray();
+          for (const { name } of exportTables) this.ctx.storage.sql.exec(`DROP TABLE ${name}`);
+          this.ctx.storage.sql.exec(`UPDATE _meta SET value = '0' WHERE key = 'has_prior_generation'`);
+        });
+        this.ingestEpisodes.clear();
+        steps.push({ step: 'store', ok: true, detail: 'rows and any generation debris cleared' });
+      } catch (err) {
+        steps.push({ step: 'store', ok: false, detail: String(err) });
+      }
     }
 
     try {
@@ -1585,19 +1692,13 @@ export class ProjectMemory extends DurableObject<Env> {
       steps.push({ step: 'r2-backups', ok: false, detail: String(err) });
     }
 
-    steps.push({ step: 'vectors', ok: true, detail: 'no memory vector index exists yet (Phase 4) — nothing to delete' });
-    // PLNR-260's capabilities are stateless HMAC tokens (§8) — there is no revocation list to
-    // clear; a token minted before erasure stays verifiable for the rest of its own short TTL
-    // (INGEST_TOKEN_TTL_SECONDS, ~15 min), scoped only to a project that no longer exists to
-    // accept its writes (assertProjectId above already refuses any RPC for it). In-flight upload
-    // STATE is real and is cleared in the 'store' step above — index-generation staging rows go
-    // with the rest of SCHEMA_TABLES via erase(), and this.ingestEpisodes is cleared explicitly
-    // (it is in-memory, not a SQL table) — this step is honest about the token itself, not
-    // silent about the state.
+    // Capability signatures themselves are stateless, but every consume route revalidates the
+    // live D1 project/repository scope. Project deletion removed that scope before eraseAll was
+    // called, so a pre-deletion token can no longer recreate rows in this DO.
     steps.push({
       step: 'ingest-capabilities',
       ok: true,
-      detail: 'stateless HMAC capabilities cannot be revoked — bounded by their own short TTL; in-flight upload state was cleared in the store step',
+      detail: 'stateless tokens are inert because every use revalidates the deleted D1 project/repository scope',
     });
 
     return { ok: steps.every((s) => s.ok), steps };
@@ -4091,7 +4192,20 @@ export class ProjectMemory extends DurableObject<Env> {
   override async alarm(): Promise<void> {
     const pid = this._pid ?? (await this.ctx.storage.get<string>('pid'));
     if (!pid) return;
-    await this.drainOutbox(pid).catch((err) => console.warn(`ProjectMemory alarm drain failed: ${String(err)}`));
+    try {
+      // This is the automatic bridge in both directions: memory outbox -> ProjectRoom and D1
+      // coordination events -> the memory graph. Calling only drainOutbox left runProjector with
+      // no production caller and made every coordination node depend on a manual admin rebuild.
+      const result = await this.reconcile(pid);
+      // drainOutbox reports per-row failures instead of throwing so one bad delivery does not
+      // block later rows. Rearm explicitly whenever any remain; otherwise a quiet project would
+      // leave the failed row pending forever because no later mutation would set another alarm.
+      if (result.failed > 0) await this.ctx.storage.setAlarm(Date.now() + 5_000);
+    } catch (err) {
+      await this.ctx.storage.setAlarm(Date.now() + 5_000).catch(() => {});
+      console.warn(`ProjectMemory alarm reconcile failed for ${pid}: ${String(err)}`);
+      throw err;
+    }
   }
 
   async _countNodes(projectId: string): Promise<number> {

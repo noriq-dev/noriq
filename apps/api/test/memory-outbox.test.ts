@@ -93,6 +93,31 @@ describe('outbox delivery — forward direction is idempotent', () => {
     expect(again).toEqual({ delivered: 0, failed: 0 });
     expect(await memoryEvents(projectId)).toHaveLength(1);
   });
+
+  it('does not retain the dedupe marker when the event append fails', async () => {
+    const { projectId } = await newOwnedProject('pm-outbox-atomic@example.com', 'PMOBXAT');
+    const seq = await appEnv.DB.prepare('SELECT next_event_seq AS n FROM projects WHERE id = ?')
+      .bind(projectId).first<{ n: number }>();
+    expect(seq).toBeTruthy();
+
+    // Force emit()'s event INSERT to collide while leaving its dedupe INSERT valid. The batch
+    // must roll both back, allowing the exact same operation id to be retried afterward.
+    await appEnv.DB.prepare(
+      `INSERT INTO events (id, project_id, seq, actor_kind, actor_id, verb, subject_type, subject_id)
+       VALUES (?, ?, ?, 'system', 'system', 'test.collision', 'test', 'test')`,
+    ).bind('ev_memory_atomic_collision', projectId, seq!.n).run();
+    const delivery = {
+      operationId: 'op_memory_atomic_retry', verb: 'memory.changed', subjectType: 'memory', subjectId: 'mem_atomic',
+    };
+    await expect(room(projectId).receiveMemoryEvent(projectId, delivery)).rejects.toThrow();
+    expect(await appEnv.DB.prepare('SELECT 1 FROM memory_event_dedup WHERE operation_id = ?')
+      .bind(delivery.operationId).first()).toBeNull();
+
+    await appEnv.DB.prepare('UPDATE projects SET next_event_seq = ? WHERE id = ?')
+      .bind(seq!.n + 1, projectId).run();
+    await expect(room(projectId).receiveMemoryEvent(projectId, delivery)).resolves.toEqual({ ok: true, deduped: false });
+    expect(await memoryEvents(projectId)).toHaveLength(1);
+  });
 });
 
 describe('injected delivery failure + reconciliation', () => {

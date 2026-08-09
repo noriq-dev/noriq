@@ -110,7 +110,7 @@ export function parseStagedRow(row: Record<string, unknown>): StagedRow {
 // index does; a dropped in-flight upload just gets re-POSTed. PLNR-263 is the real episode
 // RECORD writer: `rows` accumulated here are parsed as `EffortEpisode` records and handed to
 // `ProjectMemory.recordEpisode` by `completeEpisodeIngest`, which is also reachable from
-// `ProjectRoom`'s terminal-run fire-and-forget via `memory/episodes.ts`'s `recordEpisodeForRun`
+// `ProjectRoom`'s durable terminal-run job via `memory/episodes.ts`'s `recordEpisodeForRun`
 // — the two paths converge on the SAME upsert-by-run_id writer (see episodes.ts).
 // ---------------------------------------------------------------------------
 

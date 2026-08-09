@@ -35,8 +35,12 @@ interface MemRpc {
   beginIndexIngest(pid: string, manifest: IndexManifestInput): Promise<{ ok: true }>;
   ingestIndexBatch(pid: string, batch: { generationId: string; batchNumber: number; batchHash: string }, rows: StagedRow[]): Promise<{ ok: true; deduped: boolean }>;
   completeIndexIngest(pid: string, generationId: string): Promise<{ ok: true; batchesReceived: number; validation: { ok: boolean; problems: string[] } }>;
-  activateIndexGeneration(pid: string, generationId: string): Promise<{ activated: string; superseded: string[] }>;
+  activateIndexGeneration(pid: string, generationId: string): Promise<{
+    activated: string; superseded: string[];
+    projection: { nodesWritten: number; edgesWritten: number; entitiesSkipped: number; edgesSkipped: number; retired: number; coChangeEdges: number };
+  }>;
   projectActiveGeneration(pid: string, generationId: string): Promise<{ nodesWritten: number; edgesWritten: number; entitiesSkipped: number; edgesSkipped: number; retired: number; coChangeEdges: number }>;
+  runProjector(pid: string): Promise<{ applied: number; cursor: number }>;
   dependencyNeighborhood(pid: string, input: { entityUri: string; edgeTypes?: string[]; maxDepth?: number; maxResults?: number }): Promise<DependencyResult>;
   health(pid: string): Promise<{ tableCounts: Record<string, number> }>;
   _countNodes(pid: string): Promise<number>;
@@ -73,8 +77,7 @@ async function stageAndProject(projectId: string, opts: { generationId: string; 
   await m.ingestIndexBatch(projectId, { generationId: opts.generationId, batchNumber: 0, batchHash: 'h' }, opts.rows);
   const completed = await m.completeIndexIngest(projectId, opts.generationId);
   if (!completed.validation.ok) throw new Error(`validation failed: ${completed.validation.problems.join('; ')}`);
-  await m.activateIndexGeneration(projectId, opts.generationId);
-  return m.projectActiveGeneration(projectId, opts.generationId);
+  return (await m.activateIndexGeneration(projectId, opts.generationId)).projection;
 }
 
 describe('projecting an activated generation into the graph', () => {
@@ -114,13 +117,15 @@ describe('projecting an activated generation into the graph', () => {
   it('re-projecting the SAME entity content under a NEW generationId leaves the node id unchanged', async () => {
     const { projectId } = await newOwnedProject('pm-262-stable@example.com', 'PM62STB');
     const fileUri = buildEntityUri({ kind: 'file', projectKey: 'PM62STB', repositoryKey: 'repo-a', path: 'src/a.ts' });
+    await memory(projectId).runProjector(projectId);
+    const baseline = await memory(projectId)._countNodes(projectId);
     await stageAndProject(projectId, { generationId: 'gen_s1', repositoryKey: 'repo-a', rows: [{ kind: 'node', uri: fileUri, type: 'file', label: 'a.ts' }] });
     const nodesAfterFirst = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: fileUri });
     // No downstream expected — just confirming the seed resolves; capture the node id via a
     // second lookup path (a self-edge would be circular, so assert stability through re-query).
     await stageAndProject(projectId, { generationId: 'gen_s2', repositoryKey: 'repo-a', rows: [{ kind: 'node', uri: fileUri, type: 'file', label: 'a.ts (revised)' }] });
     const count = await memory(projectId)._countNodes(projectId);
-    expect(count).toBe(1); // an upsert at the same id, not a second node
+    expect(count).toBe(baseline + 1); // an upsert at the same id, not a second code node
     expect(nodesAfterFirst.coverage).toBeDefined();
   });
 
@@ -181,11 +186,13 @@ describe('projecting an activated generation into the graph', () => {
     const rows: StagedRow[] = Array.from({ length: 20 }, (_, i) => ({
       kind: 'node' as const, uri: buildEntityUri({ kind: 'file', projectKey: 'PM62BLK', repositoryKey: 'repo-a', path: `f${i}.ts` }), type: 'file', label: `f${i}.ts`,
     }));
+    await memory(projectId).runProjector(projectId);
+    const baseline = await memory(projectId)._countNodes(projectId);
     const before = await memory(projectId).health(projectId);
     await stageAndProject(projectId, { generationId: 'gen_bulk', repositoryKey: 'repo-a', rows });
     const after = await memory(projectId).health(projectId);
     expect((after.tableCounts.outbox ?? 0) - (before.tableCounts.outbox ?? 0)).toBe(1);
-    expect(await memory(projectId)._countNodes(projectId)).toBe(20);
+    expect(await memory(projectId)._countNodes(projectId)).toBe(baseline + 20);
   });
 
   it('a malformed staged entity (bad type) is skipped rather than aborting the whole projection', async () => {

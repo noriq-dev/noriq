@@ -1,8 +1,7 @@
 // PLNR-263: deterministic episode-skeleton assembly and the env-level recorder that wires it to
 // D1. Same split as backup.ts/restore.ts/lifecycle.ts/projection.ts: `buildEpisodeSkeleton` is
 // pure (no `env`, no storage) so it is trivially unit-testable; `recordEpisodeForRun` is the one
-// export that reads D1 and calls the `PROJECT_MEMORY` stub, mirroring `memory/lifecycle.ts`'s
-// shape for a module that takes `env` and does D1 reads.
+// D1-reading adapter used by the durable terminal-transition job processor.
 //
 // WHY THE SKELETON IS BUILT HERE, SERVER-SIDE, FROM D1 — NOT SUPPLIED BY THE DAEMON (§14, locked
 // decision): the server already holds every field the deterministic skeleton needs
@@ -202,11 +201,9 @@ export function buildEpisodeSkeleton(input: EpisodeSkeletonInput): EpisodeSkelet
 
 /**
  * The D1-reading half: load one run's state and everything the skeleton needs, then call
- * `ProjectMemory.recordEpisode` through the `PROJECT_MEMORY` stub. Called fire-and-forget from
- * `ProjectRoom.transitionRun`'s terminal branch (§19) — this function itself never throws in a
- * way that should reach an awaiting caller (there is none), but it does not swallow its own
- * errors either; the caller's `.catch(...)` is what makes a ProjectMemory outage harmless to the
- * run it describes.
+ * `ProjectMemory.recordEpisode` through the `PROJECT_MEMORY` stub. The terminal transition's
+ * durable job processor calls it outside the run's critical path; errors are retained on the D1
+ * job for the scheduled sweep rather than changing the already-committed run outcome.
  */
 export async function recordEpisodeForRun(env: Env, projectId: string, runId: string): Promise<void> {
   const run = await env.DB.prepare(
@@ -248,4 +245,65 @@ export async function recordEpisodeForRun(env: Env, projectId: string, runId: st
     ...skeleton,
     actor: { kind: 'system', id: null },
   });
+}
+
+/**
+ * Deliver one durable `memory_episode_jobs` row. The expected sitting check is the guard that
+ * prevents a retry for sitting N from accidentally describing sitting N+1 after `reopenRun`
+ * reused the same run id. `reopenRun` flushes the current sitting before incrementing it, while
+ * the scheduled sweep handles ordinary transient failures and isolate restarts.
+ */
+export async function processPendingEpisodeJob(
+  env: Env,
+  projectId: string,
+  runId: string,
+  sitting: number,
+): Promise<boolean> {
+  const job = await env.DB.prepare(
+    'SELECT 1 FROM memory_episode_jobs WHERE project_id = ? AND run_id = ? AND sitting = ?',
+  ).bind(projectId, runId, sitting).first();
+  if (!job) return false;
+
+  try {
+    const run = await env.DB.prepare(
+      'SELECT sitting, exit FROM runs WHERE id = ? AND project_id = ?',
+    ).bind(runId, projectId).first<{ sitting: number; exit: string | null }>();
+    if (!run) throw new Error(`run ${runId} no longer exists in project ${projectId}`);
+    if (run.sitting !== sitting) {
+      throw new Error(`episode job for ${runId} sitting ${sitting} cannot use current sitting ${run.sitting}`);
+    }
+    if (!run.exit) throw new Error(`run ${runId} sitting ${sitting} is no longer terminal`);
+
+    await recordEpisodeForRun(env, projectId, runId);
+    await env.DB.prepare(
+      'DELETE FROM memory_episode_jobs WHERE project_id = ? AND run_id = ? AND sitting = ?',
+    ).bind(projectId, runId, sitting).run();
+    return true;
+  } catch (err) {
+    await env.DB.prepare(
+      `UPDATE memory_episode_jobs
+       SET attempts = attempts + 1, last_error = ?, last_attempt_at = ?
+       WHERE project_id = ? AND run_id = ? AND sitting = ?`,
+    ).bind(String(err), new Date().toISOString(), projectId, runId, sitting).run();
+    throw err;
+  }
+}
+
+/** Retry a bounded oldest-first batch of terminal episode jobs. */
+export async function sweepPendingEpisodeJobs(env: Env, limit = 100): Promise<{ completed: number; failed: number }> {
+  const { results } = await env.DB.prepare(
+    `SELECT project_id, run_id, sitting FROM memory_episode_jobs
+     ORDER BY requested_at ASC LIMIT ?`,
+  ).bind(limit).all<{ project_id: string; run_id: string; sitting: number }>();
+  let completed = 0;
+  let failed = 0;
+  for (const row of results) {
+    try {
+      if (await processPendingEpisodeJob(env, row.project_id, row.run_id, row.sitting)) completed++;
+    } catch (err) {
+      failed++;
+      console.warn(`episode job retry for ${row.run_id}/${row.sitting} failed: ${String(err)}`);
+    }
+  }
+  return { completed, failed };
 }

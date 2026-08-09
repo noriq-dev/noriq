@@ -169,13 +169,15 @@ describe('restoreSnapshot — round trip reproduces canonical state', () => {
   it('rollback returns to the pre-restore state without touching R2, and is single-level', async () => {
     const { projectId } = await newOwnedProject('pm-restore-rollback@example.com', 'PMRSTRB');
     await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/keep', label: 'keep', actor: SYSTEM });
+    await memory(projectId).runProjector(projectId);
+    const exportedNodeCount = (await memory(projectId).health(projectId)).tableCounts.nodes;
     const exported = await memory(projectId).exportSnapshot(projectId);
     if (!exported.ok) throw new Error(`export failed: ${exported.reason}`);
 
     await memory(projectId).erase(projectId); // pre-restore state: empty
     const restored = await memory(projectId).restoreSnapshot(projectId, { exportedAt: exported.manifest.exportedAt });
     if (!restored.ok) throw new Error(`restore failed: ${restored.reason}`);
-    expect((await memory(projectId).health(projectId)).tableCounts.nodes).toBe(1);
+    expect((await memory(projectId).health(projectId)).tableCounts.nodes).toBe(exportedNodeCount);
 
     // Delete the backup's R2 objects entirely — rollback must not need them.
     for (const key of exported.manifest.r2EvidenceRefs) await appEnv.FILES!.delete(key);
@@ -219,6 +221,8 @@ describe('restoreSnapshot — round trip reproduces canonical state', () => {
     const { nodeId: a } = await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/ne-a', label: 'ne-a', actor: SYSTEM });
     const { nodeId: b } = await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/ne-b', label: 'ne-b', actor: SYSTEM });
     await memory(projectId).writeEdge(projectId, { type: 'related_to', fromNodeId: a, toNodeId: b, actor: SYSTEM });
+    await memory(projectId).runProjector(projectId);
+    const beforeExport = await memory(projectId).health(projectId);
 
     const exported = await memory(projectId).exportSnapshot(projectId);
     if (!exported.ok) throw new Error('export failed');
@@ -227,8 +231,8 @@ describe('restoreSnapshot — round trip reproduces canonical state', () => {
     const restored = await memory(projectId).restoreSnapshot(projectId, { exportedAt: exported.manifest.exportedAt });
     expect(restored.ok).toBe(true);
     const h = await memory(projectId).health(projectId);
-    expect(h.tableCounts.nodes).toBe(2);
-    expect(h.tableCounts.edges).toBe(1);
+    expect(h.tableCounts.nodes).toBe(beforeExport.tableCounts.nodes);
+    expect(h.tableCounts.edges).toBe(beforeExport.tableCounts.edges);
     expect(h.tableCounts.evidence).toBe(0);
     expect(await traverseOneHop(projectId, a, 'related_to')).toEqual([b]);
   });
@@ -250,6 +254,8 @@ describe('restoreSnapshot — round trip reproduces canonical state', () => {
       evidence: [{ repositoryKey: 'repo-x', branch: 'main', baseId: 'base1', path: 'README.md' }],
       actor: SYSTEM,
     });
+    await memory(projectId).runProjector(projectId);
+    const beforeExport = await memory(projectId).health(projectId);
 
     const first = await memory(projectId).exportSnapshot(projectId);
     if (!first.ok) throw new Error('export 1 failed');
@@ -261,12 +267,11 @@ describe('restoreSnapshot — round trip reproduces canonical state', () => {
     const r2 = await memory(projectId).restoreSnapshot(projectId, { exportedAt: second.manifest.exportedAt });
     expect(r2.ok).toBe(true);
 
-    // Data intact after two round trips, and the graph still traverses. 2 explicit nodes (a, b)
-    // + the memory's own node + its repository citation's file node (PLNR-283: recordMemory now
-    // writes both); 1 explicit edge (a->b) + the memory's own observed_in edge to that file node.
+    // Data intact after two round trips, and the graph still traverses. Compare with the settled
+    // pre-export snapshot so the automatically projected project node is part of both sides.
     const h = await memory(projectId).health(projectId);
-    expect(h.tableCounts.nodes).toBe(4);
-    expect(h.tableCounts.edges).toBe(2);
+    expect(h.tableCounts.nodes).toBe(beforeExport.tableCounts.nodes);
+    expect(h.tableCounts.edges).toBe(beforeExport.tableCounts.edges);
     expect(h.tableCounts.evidence).toBe(1);
     expect(await traverseOneHop(projectId, a, 'related_to')).toEqual([b]);
 
@@ -295,6 +300,7 @@ describe('restoreSnapshot — round trip reproduces canonical state', () => {
     );
 
     await memory(honestProjectId).writeNode(honestProjectId, { type: 'unknown', uri: 'noriq://unknown/untouched', label: 'untouched', actor: SYSTEM });
+    await memory(honestProjectId).runProjector(honestProjectId);
     const before = await memory(honestProjectId).health(honestProjectId);
 
     const result = await memory(honestProjectId).restoreSnapshot(honestProjectId, { exportedAt: fixedExportedAt });

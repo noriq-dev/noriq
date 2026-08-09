@@ -13,6 +13,7 @@ import type { Actor, CreateRunInput, RunPatch, RunView } from '../src/do/Project
 import type { Env } from '../src/env';
 import { buildEntityUri } from '@noriq-dev/shared';
 import { createAgent, mcpCall } from './helpers';
+import { sweepPendingEpisodeJobs } from '../src/memory/episodes';
 
 const appEnv = env as unknown as Env;
 const actor: Actor = { kind: 'human', id: 'usr_epi_test', name: 'Episode Tester' };
@@ -57,6 +58,7 @@ interface MemRpc {
     pid: string,
     opts: { episodeId?: string },
   ): Promise<{ results: Array<{ id: string; title: string; snippet: string; status?: string }> }>;
+  runProjector(pid: string): Promise<{ applied: number; cursor: number }>;
   _setForceWriteFailure(pid: string, fail: boolean): Promise<void>;
   beginEpisodeIngest(pid: string, manifest: { scopeId: string; projectId: string; batchCount: number }): Promise<{ ok: true }>;
   ingestEpisodeBatch(pid: string, scopeId: string, batchNumber: number, rows: EpisodeUploadRow[]): Promise<{ ok: true; deduped: boolean }>;
@@ -158,10 +160,13 @@ describe('ProjectMemory.recordEpisode — the deterministic writer (§14)', () =
     const runId = 'run_epi_dupe';
     const input = baseEpisodeInput(runId, { findings: [{ summary: 'duplicate delivery must not pile up' }] });
 
+    await memory(projectId).runProjector(projectId);
     const before = await memory(projectId).health(projectId);
     const first = await memory(projectId).recordEpisode(projectId, input);
+    await memory(projectId).runProjector(projectId);
     const afterFirst = await memory(projectId).health(projectId);
     const second = await memory(projectId).recordEpisode(projectId, input);
+    await memory(projectId).runProjector(projectId);
     const afterSecond = await memory(projectId).health(projectId);
 
     expect(first.episodeId).toBe(second.episodeId);
@@ -252,23 +257,43 @@ describe('a terminal Run produces its deterministic episode (ProjectRoom → rec
     expect(results[0]!.title).toContain(run.id);
   });
 
-  it('a ProjectMemory write failure never fails, delays, or alters the run\'s terminal transition', async () => {
+  it('a ProjectMemory write failure never alters the terminal transition and its durable job retries successfully', async () => {
     const projectId = await newProject('MEPIFAIL');
     const runnerId = 'rnr_epi_fail';
     const agentId = 'agt_epi_fail';
     await seedRunner(runnerId);
     await seedAgent(agentId, runnerId, projectId);
     await memory(projectId)._setForceWriteFailure(projectId, true);
+    const run = await room(projectId).createRun(projectId, actor, { kind: 'build', repoRef: 'r', agentTool: 'claude' });
     try {
-      const run = await room(projectId).createRun(projectId, actor, { kind: 'build', repoRef: 'r', agentTool: 'claude' });
       await room(projectId).dispatchRun(projectId, actor, run.id, runnerId);
       await room(projectId).transitionRun(projectId, actor, run.id, { status: 'running', agentId });
       const done = await room(projectId).transitionRun(projectId, actor, run.id, { status: 'done' });
       expect(done.status).toBe('done');
       expect(done.exit).toMatchObject({ outcome: 'done' });
+
+      // Wait until the background attempt has actually failed, proving this is the retry path
+      // rather than racing the initial delivery after fault injection is disabled.
+      let attempts = 0;
+      for (let i = 0; i < 20 && attempts === 0; i++) {
+        attempts = (await appEnv.DB.prepare(
+          'SELECT attempts FROM memory_episode_jobs WHERE run_id = ? AND sitting = 1',
+        ).bind(run.id).first<{ attempts: number }>())?.attempts ?? 0;
+        if (attempts === 0) await new Promise((r) => setTimeout(r, 25));
+      }
+      expect(attempts).toBeGreaterThan(0);
     } finally {
       await memory(projectId)._setForceWriteFailure(projectId, false);
     }
+
+    expect(await sweepPendingEpisodeJobs(appEnv)).toMatchObject({ completed: 1 });
+    expect(await appEnv.DB.prepare(
+      'SELECT 1 FROM memory_episode_jobs WHERE run_id = ? AND sitting = 1',
+    ).bind(run.id).first()).toBeNull();
+    const neighborhood = await memory(projectId).dependencyNeighborhood(projectId, {
+      entityUri: buildEntityUri({ kind: 'run', id: run.id }), edgeTypes: ['derived_from'],
+    });
+    expect(neighborhood.upstream.some((e) => e.type === 'episode')).toBe(true);
   });
 
   // PLNR-263 correction: `reopenRun` (RUN-182, "continue a failed run") reuses the SAME run id

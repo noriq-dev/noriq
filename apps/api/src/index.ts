@@ -36,6 +36,7 @@ import { renderEvidenceFrame, type EvidenceFrameItem } from './memory/evidence-f
 import { assembleContextPack } from './memory/context-pack';
 import { readBoundedBody, verifyBatchChecksum, decodeBatchRows, MAX_INGEST_BATCH_BYTES, INGEST_TOKEN_TTL_SECONDS } from './memory/ingest';
 import { normalizeVerificationReport } from './memory/verification';
+import { sweepPendingEpisodeJobs } from './memory/episodes';
 import { AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget, isTerminalRunStatus, normalizeProjectKey, IndexGenerationManifest, ContextPackRole, type RunnerIndexCursor } from '@noriq-dev/shared';
 
 export { ProjectRoom } from './do/ProjectRoom';
@@ -3175,6 +3176,16 @@ async function requireIngestCap(c: Context<AppContext>, token: string): Promise<
   if (!secret) return c.json({ error: 'ingest not enabled' }, 503);
   const claims = await verifyIngestToken(secret, token, Math.floor(Date.now() / 1000));
   if (!claims) return c.json({ error: 'invalid or expired ingest token' }, 401);
+  // Capabilities are stateless, so a signature minted before project deletion remains valid
+  // until `exp`. Re-check the live project/repository association on every use; otherwise an old
+  // index token can recreate rows in an already-erased ProjectMemory DO after its tombstone has
+  // been cleared. This also revokes a token immediately when its repository is unregistered.
+  const liveScope = await c.env.DB.prepare(
+    `SELECT 1 FROM projects p
+       JOIN project_repositories pr ON pr.project_id = p.id
+      WHERE p.id = ? AND pr.repository_key = ?`,
+  ).bind(claims.pid, claims.repositoryKey).first();
+  if (!liveScope) return c.json({ error: 'ingest capability scope no longer exists' }, 401);
   return claims;
 }
 
@@ -3448,6 +3459,7 @@ export default {
         Promise.all([
           sweepPendingErasures(env).then((r) => console.log(`[memory-lifecycle] erasure sweep: ${r.length} tombstone(s) processed`)),
           sweepProjectDebris(env).then((r) => console.log(`[memory-lifecycle] debris sweep: ${r.length} project(s) processed`)),
+          sweepPendingEpisodeJobs(env).then((r) => console.log(`[memory-lifecycle] episode jobs: ${r.completed} completed, ${r.failed} failed`)),
         ]).catch((err) => console.warn(`[memory-lifecycle] sweep failed: ${String(err)}`)),
       );
     }
@@ -3459,4 +3471,3 @@ export default {
     );
   },
 };
-

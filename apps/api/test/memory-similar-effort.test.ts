@@ -38,6 +38,7 @@ interface SimilarEffortRpcResult {
 }
 interface MemRpc {
   health(pid: string): Promise<{ schemaVersion: number; memoryRevision: number; tableCounts: Record<string, number> }>;
+  runProjector(pid: string): Promise<{ applied: number; cursor: number }>;
   recordEpisode(pid: string, input: RecordEpisodeInput): Promise<{ episodeId: string; runId: string; created: boolean }>;
   similarEffort(
     pid: string,
@@ -341,6 +342,7 @@ describe('ProjectMemory.similarEffort — end-to-end retrieval, gate, and non-mu
       failures: ['read-only probe task exploded unexpectedly'],
     }));
 
+    await memory(projectId).runProjector(projectId);
     const before = await memory(projectId).health(projectId);
     await memory(projectId).similarEffort(projectId, { taskId: made.body.id as string, title: 'Read-only probe task', anticipatedFiles: ['apps/api/src/x.ts'] });
     await memory(projectId).similarEffort(projectId, { taskId: made.body.id as string, title: 'Read-only probe task', anticipatedFiles: ['apps/api/src/x.ts'] });

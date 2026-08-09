@@ -1,7 +1,7 @@
 // PLNR-261: staged index generations and atomic activation. Drives ProjectMemory's real
 // stage -> validate -> promote RPCs directly (same technique as memory-registry.test.ts) —
 // killed uploads leaving the active graph untouched, batch replay convergence, validation
-// failure with actionable status and no partial-entity exposure, exactly-once activation,
+// failure with actionable status and no partial-entity exposure, idempotent activation,
 // declared deletions, and the abandoned-staged-generation sweep.
 import { env } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
@@ -20,7 +20,9 @@ interface MemRpc {
   beginIndexIngest(pid: string, manifest: IndexManifestInput): Promise<{ ok: true }>;
   ingestIndexBatch(pid: string, batch: { generationId: string; batchNumber: number; batchHash: string }, rows: StagedRow[]): Promise<{ ok: true; deduped: boolean }>;
   completeIndexIngest(pid: string, generationId: string): Promise<{ ok: true; batchesReceived: number; validation: { ok: boolean; problems: string[] } }>;
-  activateIndexGeneration(pid: string, generationId: string): Promise<{ activated: string; superseded: string[] }>;
+  activateIndexGeneration(pid: string, generationId: string): Promise<{
+    activated: string; superseded: string[]; projection: { nodesWritten: number };
+  }>;
   abortIndexIngest(pid: string, generationId: string): Promise<{ ok: true }>;
   indexIngestStatus(pid: string, generationId: string): Promise<{ status: string; sealed: boolean; batchesReceived: number; batchesExpected: number | null; validation: { ok: boolean; problems: string[] } | null }>;
   _getIndexGenerationStatusForTest(pid: string, generationId: string): Promise<string | null>;
@@ -122,7 +124,7 @@ describe('staged generation lifecycle — begin/batch/complete/activate', () => 
     ).rejects.toThrow(/completed/);
   });
 
-  it('a complete, valid generation activates EXACTLY once — calling activate twice leaves one active row', async () => {
+  it('a complete, valid generation activates idempotently — retrying republishes the same graph and leaves one active row', async () => {
     const { projectId } = await newOwnedProject('pm-261-once@example.com', 'PM61ONCE');
     const m = memory(projectId);
     await m.beginIndexIngest(projectId, baseManifest({ generationId: 'gen_once', projectId, repositoryKey: 'repo-once' }));
@@ -130,8 +132,10 @@ describe('staged generation lifecycle — begin/batch/complete/activate', () => 
       { kind: 'node', uri: 'noriq://file/PM61ONCE/repo-once/a.ts', type: 'file', label: 'a.ts' },
     ]);
     await m.completeIndexIngest(projectId, 'gen_once');
-    await m.activateIndexGeneration(projectId, 'gen_once');
-    await expect(m.activateIndexGeneration(projectId, 'gen_once')).rejects.toThrow(/already active/);
+    const first = await m.activateIndexGeneration(projectId, 'gen_once');
+    const retry = await m.activateIndexGeneration(projectId, 'gen_once');
+    expect(first.projection.nodesWritten).toBe(1);
+    expect(retry).toMatchObject({ activated: 'gen_once', superseded: [] });
     expect(await m._getIndexGenerationStatusForTest(projectId, 'gen_once')).toBe('active');
   });
 
@@ -165,7 +169,7 @@ describe('staged generation lifecycle — begin/batch/complete/activate', () => 
       { kind: 'node', uri: 'noriq://file/PM61DEL/repo-del/a.ts', type: 'file', label: 'a.ts' },
     ]);
     await m.completeIndexIngest(projectId, 'gen_del');
-    await expect(m.activateIndexGeneration(projectId, 'gen_del')).resolves.toEqual({ activated: 'gen_del', superseded: [] });
+    await expect(m.activateIndexGeneration(projectId, 'gen_del')).resolves.toMatchObject({ activated: 'gen_del', superseded: [] });
   });
 
   it('abort discards a still-staged generation and its staged rows; activate then reports it not found', async () => {

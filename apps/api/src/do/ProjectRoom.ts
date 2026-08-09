@@ -15,7 +15,7 @@ import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
 import { RunKind, AgentTool, RunStatus, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey } from '@noriq-dev/shared';
 import { writeExecutionSpec } from '../lib/execution-spec';
-import { recordEpisodeForRun } from '../memory/episodes';
+import { processPendingEpisodeJob } from '../memory/episodes';
 
 /**
  * ProjectRoom — one instance per project (idFromName(projectId)).
@@ -230,6 +230,7 @@ type RunRow = {
   plan_dispatch_id: string | null;
   created_by: string; created_at: string; updated_at: string;
   dispatched_at: string | null; started_at: string | null;
+  sitting: number;
 };
 
 // The wire shape of a Run (mirrors the shared Run entity). Named explicitly so the
@@ -418,6 +419,7 @@ export class ProjectRoom extends DurableObject<Env> {
     subjectType: string,
     subjectId: string,
     payload: Record<string, unknown> = {},
+    atomicPrefix: D1PreparedStatement[] = [],
   ) {
     const pid = this.projectId;
     // Sole-writer invariant makes read-increment-write on next_event_seq safe.
@@ -428,6 +430,7 @@ export class ProjectRoom extends DurableObject<Env> {
     const id = newId('ev');
     const createdAt = nowIso();
     const stmts = [
+      ...atomicPrefix,
       this.env.DB.prepare(
         `INSERT INTO events (id, project_id, seq, actor_kind, actor_id, verb, subject_type, subject_id, payload, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -3026,10 +3029,19 @@ export class ProjectRoom extends DurableObject<Env> {
         .bind(delivery.operationId)
         .first();
       if (seen) return { ok: true, deduped: true };
-      await this.env.DB.prepare('INSERT INTO memory_event_dedup (operation_id, project_id, applied_at) VALUES (?, ?, ?)')
-        .bind(delivery.operationId, projectId, nowIso())
-        .run();
-      await this.emit(SYSTEM_ACTOR, delivery.verb, delivery.subjectType, delivery.subjectId, delivery.payload ?? {});
+      // The marker and event append share emit()'s D1 batch. If event insertion or sequence
+      // advancement fails, the marker rolls back too, so the next outbox delivery really retries
+      // the event instead of mistaking a partial receive for a completed one.
+      await this.emit(
+        SYSTEM_ACTOR,
+        delivery.verb,
+        delivery.subjectType,
+        delivery.subjectId,
+        delivery.payload ?? {},
+        [this.env.DB.prepare(
+          'INSERT INTO memory_event_dedup (operation_id, project_id, applied_at) VALUES (?, ?, ?)',
+        ).bind(delivery.operationId, projectId, nowIso())],
+      );
       return { ok: true, deduped: false };
     });
   }
@@ -3090,6 +3102,7 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM run_log_segments WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare('DELETE FROM runtime_deliveries WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare('DELETE FROM steers WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
+        this.env.DB.prepare('DELETE FROM memory_episode_jobs WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM runs WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM plan_dispatches WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM plan_landings WHERE project_id = ?').bind(pid),
@@ -3359,6 +3372,15 @@ export class ProjectRoom extends DurableObject<Env> {
         advertises = (JSON.parse(runner.repos || '[]') as Array<{ id: string }>).some((r) => r.id === run.repo_ref);
       } catch { /* malformed repos JSON → treat as not advertised */ }
       if (!advertises) throw new Error("the run's runner no longer advertises this repo — its worktree is unreachable");
+
+      // A retry for the failed sitting must finish before this method clears `exit` and advances
+      // `sitting`; otherwise the server no longer has the terminal state needed to reconstruct
+      // that sitting's deterministic episode. This only waits on the exceptional backlog path —
+      // the normal terminal transition starts delivery in the background immediately.
+      const pendingEpisode = await this.env.DB.prepare(
+        'SELECT 1 FROM memory_episode_jobs WHERE project_id = ? AND run_id = ? AND sitting = ?',
+      ).bind(projectId, runId, run.sitting).first();
+      if (pendingEpisode) await processPendingEpisodeJob(this.env, projectId, runId, run.sitting);
 
       const now = nowIso();
       // Fold the round budget into the persisted budget JSON: RunnerHub redelivers a `dispatched`
@@ -3775,9 +3797,20 @@ export class ProjectRoom extends DurableObject<Env> {
     if (!RUN_TRANSITIONS[run.status]?.includes('cancelled')) return; // already terminal
     const now = nowIso();
     const exit = JSON.stringify({ outcome: 'cancelled', code: null, signal: null, reason, finishedAt: now });
-    await this.env.DB.prepare(
-      'UPDATE runs SET status = ?, exit = ?, phase = NULL, updated_at = ? WHERE id = ?',
-    ).bind('cancelled', exit, now, run.id).run();
+    await this.env.DB.batch([
+      this.env.DB.prepare(
+        'UPDATE runs SET status = ?, exit = ?, phase = NULL, updated_at = ? WHERE id = ?',
+      ).bind('cancelled', exit, now, run.id),
+      this.env.DB.prepare(
+        `INSERT INTO memory_episode_jobs (project_id, run_id, sitting, requested_at)
+         VALUES (?, ?, ?, ?) ON CONFLICT (run_id, sitting) DO NOTHING`,
+      ).bind(this.projectId, run.id, run.sitting, now),
+    ]);
+    this.ctx.waitUntil(
+      processPendingEpisodeJob(this.env, this.projectId, run.id, run.sitting).catch((err) =>
+        console.warn(`episode recording for run ${run.id}/${run.sitting} failed: ${String(err)}`),
+      ),
+    );
     if (run.agent_id) await this.retireRunAgent(run.agent_id);
     await this.emit(actor, 'run.status_changed', 'run', run.id, { from: run.status, to: 'cancelled', reason });
   }
@@ -3963,10 +3996,18 @@ export class ProjectRoom extends DurableObject<Env> {
       // it can be cleared: telemetry ticks COALESCE, so the daemon can set a phase but never
       // unset one, and the DO is what actually knows the Run is over.
       const phase = isTerminalRunStatus(to) ? null : (patch.phase ?? run.phase);
-      await this.env.DB.prepare(
+      const transitionStatements = [this.env.DB.prepare(
         `UPDATE runs SET status = ?, agent_id = ?, exit = ?, worktree_path = ?, phase = ?,
                 started_at = ?, updated_at = ? WHERE id = ?`,
-      ).bind(to, agentId, exitJson, worktreePath, phase, startedAt, now, runId).run();
+      ).bind(to, agentId, exitJson, worktreePath, phase, startedAt, now, runId)];
+      if (isTerminalRunStatus(to)) {
+        transitionStatements.push(this.env.DB.prepare(
+          `INSERT INTO memory_episode_jobs (project_id, run_id, sitting, requested_at)
+           VALUES (?, ?, ?, ?) ON CONFLICT (run_id, sitting) DO NOTHING`,
+        ).bind(projectId, runId, run.sitting, now));
+      }
+      // D1 batch is atomic: a terminal state can never commit without its retryable episode job.
+      await this.env.DB.batch(transitionStatements);
       if (isTerminalRunStatus(to) && agentId) await this.retireRunAgent(agentId);
       // The RUN's terminal outcome now moves its anchor task — not the agent (RUN-83). The build
       // agent used to release_task(review) when it finished, BEFORE the daemon's verify/reviewer
@@ -3975,13 +4016,14 @@ export class ProjectRoom extends DurableObject<Env> {
       if (isTerminalRunStatus(to) && run.kind === 'build' && run.anchor_type === 'task' && run.anchor_id) {
         await this.settleAnchorTask(run.anchor_id, to, now, agentId);
       }
-      // Every terminal run produces a deterministic episode (§14, PLNR-263) — fired AFTER the
-      // UPDATE above commits, and never awaited (§19: ProjectRoom never waits for episode
-      // enrichment). Same shape as the memory-erase fire-and-forget in deleteProject: a failed
-      // or slow ProjectMemory must never fail or delay the daemon's own status report.
+      // Every terminal run produces a deterministic episode (§14, PLNR-263). Delivery starts in
+      // the background, but unlike the old bare promise it is backed by `memory_episode_jobs`:
+      // transient failures and isolate restarts leave a row for the scheduled sweep to retry.
       if (isTerminalRunStatus(to)) {
-        void recordEpisodeForRun(this.env, projectId, runId).catch((err) =>
-          console.warn(`episode recording for run ${runId} failed: ${String(err)}`),
+        this.ctx.waitUntil(
+          processPendingEpisodeJob(this.env, projectId, runId, run.sitting).catch((err) =>
+            console.warn(`episode recording for run ${runId}/${run.sitting} failed: ${String(err)}`),
+          ),
         );
       }
       await this.emit(actor, 'run.status_changed', 'run', runId, { from: run.status, to, reason: patch.reason ?? null });
@@ -4170,14 +4212,25 @@ export class ProjectRoom extends DurableObject<Env> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const { results } = await this.env.DB.prepare(
-        `SELECT id, status, agent_id AS agentId FROM runs
+        `SELECT id, status, agent_id AS agentId, sitting FROM runs
          WHERE project_id = ? AND runner_id = ? AND status IN ('dispatched','running','blocked')`,
-      ).bind(projectId, runnerId).all<{ id: string; status: string; agentId: string | null }>();
+      ).bind(projectId, runnerId).all<{ id: string; status: string; agentId: string | null; sitting: number }>();
       const now = nowIso();
       for (const r of results) {
         const exit = JSON.stringify({ outcome: 'failed', code: null, signal: null, reason: 'daemon_restart', finishedAt: now });
-        await this.env.DB.prepare("UPDATE runs SET status = 'failed', exit = ?, updated_at = ? WHERE id = ?")
-          .bind(exit, now, r.id).run();
+        await this.env.DB.batch([
+          this.env.DB.prepare("UPDATE runs SET status = 'failed', exit = ?, updated_at = ? WHERE id = ?")
+            .bind(exit, now, r.id),
+          this.env.DB.prepare(
+            `INSERT INTO memory_episode_jobs (project_id, run_id, sitting, requested_at)
+             VALUES (?, ?, ?, ?) ON CONFLICT (run_id, sitting) DO NOTHING`,
+          ).bind(projectId, r.id, r.sitting, now),
+        ]);
+        this.ctx.waitUntil(
+          processPendingEpisodeJob(this.env, projectId, r.id, r.sitting).catch((err) =>
+            console.warn(`episode recording for reconciled run ${r.id}/${r.sitting} failed: ${String(err)}`),
+          ),
+        );
         // This path writes a TERMINAL status directly instead of going through transitionRun,
         // so it has to do transitionRun's retirement itself. Without it a daemon restart left
         // every orphaned run's credential valid for the rest of its 7-day TTL — a token with no
