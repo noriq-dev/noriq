@@ -377,14 +377,16 @@ export const IndexBatch = z.object({
 export type IndexBatch = z.infer<typeof IndexBatch>;
 
 /**
- * One decoded JSONL row in an index batch. This is a vendored Runner/server wire contract:
- * producers and consumers must agree on both the discriminator and the graph vocabularies.
- * `content` defaults to null so indexers may omit it for node kinds without searchable text.
+ * One decoded JSONL row in an index batch. This is a vendored Runner/server wire contract for
+ * the transport shape. Types remain non-empty strings here because staged generations retain
+ * malformed entities for validation/projection diagnostics; MemoryNodeType/MemoryEdgeType are
+ * enforced at that later boundary. `content` defaults to null so indexers may omit it for node
+ * kinds without searchable text.
  */
 export const StagedEntityRow = z.object({
   kind: z.literal('node'),
   uri: z.string().min(1),
-  type: MemoryNodeType,
+  type: z.string().min(1),
   label: z.string().min(1),
   content: z.string().nullable().default(null),
 });
@@ -392,7 +394,7 @@ export type StagedEntityRow = z.infer<typeof StagedEntityRow>;
 
 export const StagedEdgeRow = z.object({
   kind: z.literal('edge'),
-  type: MemoryEdgeType,
+  type: z.string().min(1),
   from: z.string().min(1),
   to: z.string().min(1),
 });

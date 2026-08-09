@@ -400,7 +400,7 @@ describe('MemoryNodeType <-> EntityRef drift guard (PLNR-278)', () => {
 });
 
 describe('staged index row shared contract (PLNR-313)', () => {
-  it('normalizes node content and accepts only the shared node and edge vocabularies', async () => {
+  it('normalizes node content and preserves non-empty staged types for downstream diagnostics', async () => {
     const { StagedRow } = await import('@noriq-dev/shared');
 
     expect(StagedRow.parse({ kind: 'node', uri: 'noriq://file/PLNR/repo/a.ts', type: 'file', label: 'a.ts' })).toEqual({
@@ -409,8 +409,9 @@ describe('staged index row shared contract (PLNR-313)', () => {
     expect(StagedRow.parse({
       kind: 'edge', type: 'imports', from: 'noriq://file/PLNR/repo/a.ts', to: 'noriq://file/PLNR/repo/b.ts',
     }).kind).toBe('edge');
-    expect(StagedRow.safeParse({ kind: 'node', uri: 'x', type: 'not-a-node-type', label: 'x' }).success).toBe(false);
-    expect(StagedRow.safeParse({ kind: 'edge', type: 'not-an-edge-type', from: 'x', to: 'y' }).success).toBe(false);
+    expect(StagedRow.parse({ kind: 'node', uri: 'x', type: 'not-a-node-type', label: 'x' }).type).toBe('not-a-node-type');
+    expect(StagedRow.parse({ kind: 'edge', type: 'not-an-edge-type', from: 'x', to: 'y' }).type).toBe('not-an-edge-type');
+    expect(StagedRow.safeParse({ kind: 'node', uri: 'x', type: '', label: 'x' }).success).toBe(false);
   });
 });
 
