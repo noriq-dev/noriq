@@ -138,6 +138,11 @@ export interface ProjectCleanupResult {
   /** PLNR-256: superseded index-generation registry rows discarded (no second scheduler — see
    *  SUPERSEDED_GENERATION_MAX_AGE_MS's doc comment for what this does and does not clean up). */
   prunedSupersededGenerations: number;
+  /** PLNR-320: whether this sweep was the one that ran the automatic one-time coordination-graph
+   *  backfill for this project (see `ProjectMemory.backfillProjectionOnce`'s own doc comment for
+   *  why the daily sweep, not `alarm()`/construction, is the deliberate trigger). `false` on
+   *  every sweep after the first — the durable marker, not this field, is the source of truth. */
+  backfilled: boolean;
 }
 
 /** The single-project body of `sweepProjectDebris` below, extracted (PLNR-273) so an operator
@@ -146,7 +151,7 @@ export interface ProjectCleanupResult {
  *  way — this is the only place the actual pruning happens now. */
 export async function sweepProjectDebrisForProject(env: Env, projectId: string): Promise<ProjectCleanupResult> {
   const stub = env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId));
-  const [prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations, decayedMemories, prunedSupersededGenerations] = await Promise.all([
+  const [prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations, decayedMemories, prunedSupersededGenerations, backfill] = await Promise.all([
     stub.pruneAbandonedStagedGenerations(projectId, STAGED_GENERATION_MAX_AGE_MS).catch(() => 0),
     stub.pruneRetainedGenerationIfExpired(projectId, RETAINED_GENERATION_MAX_AGE_MS).catch(() => false),
     pruneBackupRetention(env, projectId).catch(() => 0),
@@ -155,8 +160,16 @@ export async function sweepProjectDebrisForProject(env: Env, projectId: string):
       .then((r) => r.decayed.length)
       .catch(() => 0),
     stub.pruneSupersededGenerations(projectId, SUPERSEDED_GENERATION_MAX_AGE_MS).catch(() => 0),
+    // PLNR-320: the automatic one-time coordination-graph backfill — see
+    // ProjectMemory.backfillProjectionOnce's own doc comment for why THIS sweep, specifically,
+    // is the deliberate trigger (not alarm()/construction). A no-op on every sweep after the
+    // first for a given project — the durable `_meta` marker inside the DO is the real gate.
+    stub.backfillProjectionOnce(projectId).then((r) => r.ran).catch(() => false),
   ]);
-  const outcome: ProjectCleanupResult = { projectId, prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations, decayedMemories, prunedSupersededGenerations };
+  const outcome: ProjectCleanupResult = {
+    projectId, prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations, decayedMemories, prunedSupersededGenerations,
+    backfilled: backfill,
+  };
   await stub
     .health(projectId)
     .then((h) =>

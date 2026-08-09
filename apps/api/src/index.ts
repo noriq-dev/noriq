@@ -1217,10 +1217,19 @@ app.delete('/api/projects/:pid/memory/repositories/:key', userAuth, async (c) =>
 // field here is exactly what health()/the registry/env already report. A DO that cannot be
 // reached throws through to Hono's default error handling — the same "unreachable, not empty"
 // distinction ExploreTab's reachability probe already relies on (memoryHealth in api.ts).
+// PLNR-320: `drift` rides the same payload — the projection-drift report (missing edges per
+// coordination relationship kind, never derived from an edge's own `provenance` string; see
+// ProjectMemory.projectionDrift's doc comment for the wrinkles this sidesteps). Reported only,
+// never auto-repaired here or anywhere else — a human who sees non-zero drift re-runs the
+// existing manual rebuild route below.
 app.get('/api/projects/:pid/memory/ops-status', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
-  const [health, registry] = await Promise.all([memoryDO(c.env, pid).health(pid), getMemoryRegistry(c.env, pid)]);
-  return c.json({ health, registry, capabilities: memoryCapabilities(c.env) });
+  const [health, registry, drift] = await Promise.all([
+    memoryDO(c.env, pid).health(pid),
+    getMemoryRegistry(c.env, pid),
+    memoryDO(c.env, pid).projectionDrift(pid),
+  ]);
+  return c.json({ health, registry, drift, capabilities: memoryCapabilities(c.env) });
 });
 
 // PLNR-273: this project's backup generations (exportedAt slugs, newest first) — the picker for

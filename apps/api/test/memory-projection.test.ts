@@ -70,6 +70,15 @@ interface MemRpc {
   recordMemory(pid: string, input: RecordMemoryInput): Promise<{ memoryId: string; operationId: string; deduped: boolean }>;
   rebuildProjection(pid: string): Promise<{ nodesWritten: number; edgesWritten: number }>;
   searchProjectMemory(pid: string, opts: Record<string, unknown>): Promise<{ mode: string; results: Array<{ entityType: string; id: string; uri?: string }> }>;
+  // PLNR-320
+  backfillProjectionOnce(pid: string): Promise<{ ran: boolean; nodesWritten?: number; edgesWritten?: number }>;
+  projectionDrift(pid: string): Promise<{
+    phaseTasks: { expected: number; missing: number };
+    taskDocs: { expected: number; missing: number };
+    dependencies: { expected: number; missing: number };
+    totalMissing: number;
+  }>;
+  _allEdgesForTest(pid: string): Promise<Array<{ type: string; fromUri: string; toUri: string; provenance: string | null }>>;
 }
 
 const SYSTEM = { kind: 'system', id: null };
@@ -1218,5 +1227,204 @@ describe('deleting a coordination entity removes its node and every edge inciden
     expect(await memory(projectId)._nodeByUriForTest(projectId, taskUri)).toBeNull();
     expect(await memory(projectId)._countNodes(projectId)).toBe(nodesBefore);
     expect(await memory(projectId)._countEdges(projectId)).toBe(edgesBefore);
+  });
+});
+
+// PLNR-320: the centrepiece. Prior tasks proved convergence one relationship kind at a time
+// (dependency.added/removed, phase_tasks, task_docs each got their own "rebuild adds nothing
+// new" assertion). This proves it for the WHOLE graph at once, mutated through every kind
+// simultaneously — including a run edge, which `rebuildProjection` cannot itself draw (documented
+// gap on that method) — and asserts the edge set is BYTE-IDENTICAL, not just equal in count. A
+// count-only check could not catch "rebuild deleted edge X and added a different edge Y" or "the
+// same triples survived but a provenance string got overwritten" — `_allEdgesForTest` captures
+// (type, fromUri, toUri, provenance) for every edge so `toEqual` catches both.
+describe('PLNR-320: rebuildProjection converges — a rebuild after full incremental projection changes nothing', () => {
+  it('claim, dependency, phase-task, task-doc and run edges all survive a rebuild byte-identical', async () => {
+    const { token, projectId } = await newOwnedProject('pm-320-converge@example.com', 'PM320CV');
+
+    const doc = await mcpCall(token, 'create_doc', { projectId, name: 'converge doc', body: 'Settled: a fact.' });
+    if (doc.isError) throw new Error(`create_doc failed: ${doc.text}`);
+    const docId = doc.body.id as string;
+
+    const blocker = await mcpCall(token, 'create_task', { projectId, title: 'converge blocker', tags: ['pm-320'], allowNewTags: true });
+    if (blocker.isError) throw new Error(`create_task failed: ${blocker.text}`);
+    const blockerId = blocker.body.id as string;
+
+    const plan = await mcpCall(token, 'create_plan', {
+      projectId, title: 'converge plan', phases: [{ title: 'phase 1', newTasks: [{ title: 'converge anchor task', docIds: [docId] }] }],
+    });
+    if (plan.isError) throw new Error(`create_plan failed: ${plan.text}`);
+    const taskId = (plan.body.phases as Array<{ taskIds: string[] }>)[0]!.taskIds[0]!;
+
+    const add = await mcpCall(token, 'add_dependency', { projectId, taskId, dependsOnTaskId: blockerId });
+    if (add.isError) throw new Error(`add_dependency failed: ${add.text}`);
+
+    const claim = await mcpCall(token, 'claim_task', { projectId, taskId: blockerId });
+    if (claim.isError) throw new Error(`claim_task failed: ${claim.text}`);
+
+    // A run edge — deliberately included: rebuildProjection does NOT project run nodes/edges at
+    // all (its own documented gap), so this also proves a rebuild never DROPS an edge outside its
+    // own coverage, not merely that it reproduces the ones inside it.
+    await room(projectId).createRun(projectId, SYSTEM_ACTOR, {
+      kind: 'build', repoRef: 'repo_a', agentTool: 'claude', anchor: { type: 'task', id: taskId },
+    } as CreateRunInput);
+
+    const applied = await memory(projectId).runProjector(projectId);
+    expect(applied.applied).toBeGreaterThan(0);
+
+    const before = await memory(projectId)._allEdgesForTest(projectId);
+    // owned_by (claim) + depends_on + related_to(doc) + related_to(plan) + related_to(run->anchor)
+    expect(before.length).toBeGreaterThanOrEqual(5);
+
+    const rebuilt = await memory(projectId).rebuildProjection(projectId);
+    expect(rebuilt.edgesWritten).toBeGreaterThan(0); // it really did attempt to write the covered edges again
+
+    const after = await memory(projectId)._allEdgesForTest(projectId);
+    expect(after).toEqual(before); // THE assertion — byte-identical, not just same length
+  });
+});
+
+describe('PLNR-320: automatic one-time backfill', () => {
+  it('backfillProjectionOnce reconciles the incremental path first, then runs the rebuild exactly once — a second call is a true no-op', async () => {
+    const { token, projectId } = await newOwnedProject('pm-320-backfill@example.com', 'PM320BF');
+    const doc = await mcpCall(token, 'create_doc', { projectId, name: 'backfill doc', body: 'Settled: a fact.' });
+    if (doc.isError) throw new Error(`create_doc failed: ${doc.text}`);
+    const docId = doc.body.id as string;
+    const task = await mcpCall(token, 'create_task', { projectId, title: 'predates the projector', docIds: [docId], tags: ['pm-320'], allowNewTags: true });
+    if (task.isError) throw new Error(`create_task failed: ${task.text}`);
+    const taskId = task.body.id as string;
+
+    // Nothing has ever projected this project's graph yet — no runProjector, no manual rebuild.
+    expect(await memory(projectId)._countEdges(projectId)).toBe(0);
+
+    const first = await memory(projectId).backfillProjectionOnce(projectId);
+    expect(first.ran).toBe(true);
+    expect(first.edgesWritten).toBeGreaterThan(0);
+    const taskUri = buildEntityUri({ kind: 'task', id: taskId });
+    const docUri = buildEntityUri({ kind: 'artifact', id: docId });
+    // backfillProjectionOnce reconciles the incremental path FIRST (documented ordering) — the
+    // task.docs_linked event was real and pending, so it draws the edge before the rebuild ever
+    // runs, and the rebuild's own attempt at the SAME triple is a no-op (ON CONFLICT DO NOTHING).
+    expect(await memory(projectId)._edgeProvenance(projectId, 'related_to', taskUri, docUri)).toBe('event:task.docs_linked');
+
+    // The marker is durable — asserted by a real second call, not by inspecting internal state.
+    const edgesAfterFirst = await memory(projectId)._countEdges(projectId);
+    const second = await memory(projectId).backfillProjectionOnce(projectId);
+    expect(second).toEqual({ ran: false });
+    expect(await memory(projectId)._countEdges(projectId)).toBe(edgesAfterFirst); // nothing ran, nothing changed
+  });
+
+  it('a relationship with NO corresponding event at all (the real production shape — data that predates event-emission) is picked up with coordination:* provenance', async () => {
+    // CLAUDE.local.md: production's graph has no coordination edges at all today. That is not
+    // "the incremental path hasn't caught up yet" (every current relationship kind now emits a
+    // real event, PLNR-319/322) — it is D1 relational data with NO event ever recorded for it,
+    // because it predates event-emission entirely. Simulate that precisely: insert the task_docs
+    // row directly, bypassing update_task/create_task (and therefore emit()) altogether.
+    const { token, projectId } = await newOwnedProject('pm-320-legacy@example.com', 'PM320LG');
+    const doc = await mcpCall(token, 'create_doc', { projectId, name: 'legacy doc', body: 'Settled: a fact.' });
+    if (doc.isError) throw new Error(`create_doc failed: ${doc.text}`);
+    const docId = doc.body.id as string;
+    const task = await mcpCall(token, 'create_task', { projectId, title: 'legacy task', tags: ['pm-320'], allowNewTags: true });
+    if (task.isError) throw new Error(`create_task failed: ${task.text}`);
+    const taskId = task.body.id as string;
+    await appEnv.DB.prepare('INSERT INTO task_docs (task_id, doc_id) VALUES (?, ?)').bind(taskId, docId).run();
+
+    const { results: linkEvents } = await appEnv.DB.prepare(
+      `SELECT 1 FROM events WHERE project_id = ? AND verb = 'task.docs_linked'`,
+    ).bind(projectId).all();
+    expect(linkEvents).toHaveLength(0); // confirms the simulation: genuinely no event exists
+
+    const backfill = await memory(projectId).backfillProjectionOnce(projectId);
+    expect(backfill.ran).toBe(true);
+    const taskUri = buildEntityUri({ kind: 'task', id: taskId });
+    const docUri = buildEntityUri({ kind: 'artifact', id: docId });
+    expect(await memory(projectId)._edgeProvenance(projectId, 'related_to', taskUri, docUri)).toBe('coordination:task_docs');
+  });
+});
+
+describe('PLNR-320: projection drift is reported, never auto-repaired', () => {
+  it('reads all-zero on a project whose graph is caught up', async () => {
+    const { token, projectId } = await newOwnedProject('pm-320-drift-clean@example.com', 'PM320DC');
+    const doc = await mcpCall(token, 'create_doc', { projectId, name: 'clean doc', body: 'Settled: a fact.' });
+    if (doc.isError) throw new Error(`create_doc failed: ${doc.text}`);
+    const docId = doc.body.id as string;
+    const blocker = await mcpCall(token, 'create_task', { projectId, title: 'clean blocker', tags: ['pm-320'], allowNewTags: true });
+    if (blocker.isError) throw new Error(`create_task failed: ${blocker.text}`);
+    const blockerId = blocker.body.id as string;
+    const plan = await mcpCall(token, 'create_plan', {
+      projectId, title: 'clean plan', phases: [{ title: 'phase 1', newTasks: [{ title: 'clean task', docIds: [docId] }] }],
+    });
+    if (plan.isError) throw new Error(`create_plan failed: ${plan.text}`);
+    const taskId = (plan.body.phases as Array<{ taskIds: string[] }>)[0]!.taskIds[0]!;
+    const add = await mcpCall(token, 'add_dependency', { projectId, taskId, dependsOnTaskId: blockerId });
+    if (add.isError) throw new Error(`add_dependency failed: ${add.text}`);
+
+    await memory(projectId).runProjector(projectId);
+    const drift = await memory(projectId).projectionDrift(projectId);
+    expect(drift).toEqual({
+      phaseTasks: { expected: 1, missing: 0 },
+      taskDocs: { expected: 1, missing: 0 },
+      dependencies: { expected: 1, missing: 0 },
+      totalMissing: 0,
+    });
+  });
+
+  it('a real D1 relationship the projector has not yet drawn reads as non-zero drift, and asking again does not repair it', async () => {
+    const { token, projectId } = await newOwnedProject('pm-320-drift-lag@example.com', 'PM320DL');
+    const doc = await mcpCall(token, 'create_doc', { projectId, name: 'lag doc', body: 'Settled: a fact.' });
+    if (doc.isError) throw new Error(`create_doc failed: ${doc.text}`);
+    const docId = doc.body.id as string;
+    const task = await mcpCall(token, 'create_task', { projectId, title: 'lag task', docIds: [docId], tags: ['pm-320'], allowNewTags: true });
+    if (task.isError) throw new Error(`create_task failed: ${task.text}`);
+
+    // Deliberately never run the projector or the rebuild — this project's memory has never
+    // caught up on the task_docs relationship the board already knows about.
+    const drift = await memory(projectId).projectionDrift(projectId);
+    expect(drift.taskDocs).toEqual({ expected: 1, missing: 1 });
+    expect(drift.totalMissing).toBe(1);
+
+    // Reported, not repaired — asking again finds the SAME gap, not a smaller one.
+    const again = await memory(projectId).projectionDrift(projectId);
+    expect(again.taskDocs).toEqual({ expected: 1, missing: 1 });
+    expect(await memory(projectId)._countEdges(projectId)).toBe(0); // still nothing written
+  });
+
+  it('a healthy graph is not misread as drifted just because its edges carry event:* provenance rather than coordination:* (wrinkle 1)', async () => {
+    const { token, projectId } = await newOwnedProject('pm-320-drift-prov@example.com', 'PM320DP');
+    const doc = await mcpCall(token, 'create_doc', { projectId, name: 'prov doc', body: 'Settled: a fact.' });
+    if (doc.isError) throw new Error(`create_doc failed: ${doc.text}`);
+    const docId = doc.body.id as string;
+    const task = await mcpCall(token, 'create_task', { projectId, title: 'prov task', docIds: [docId], tags: ['pm-320'], allowNewTags: true });
+    if (task.isError) throw new Error(`create_task failed: ${task.text}`);
+    const taskId = task.body.id as string;
+
+    await memory(projectId).runProjector(projectId); // draws the edge with event:task.docs_linked provenance
+    const taskUri = buildEntityUri({ kind: 'task', id: taskId });
+    const docUri = buildEntityUri({ kind: 'artifact', id: docId });
+    expect(await memory(projectId)._edgeProvenance(projectId, 'related_to', taskUri, docUri)).toBe('event:task.docs_linked');
+
+    // If drift counted by a `coordination:*` provenance PREFIX (the trap CLAUDE.md/the task spec
+    // both warn against), this healthy, fully-converged project would misread as 100% drifted.
+    const drift = await memory(projectId).projectionDrift(projectId);
+    expect(drift.taskDocs).toEqual({ expected: 1, missing: 0 });
+  });
+
+  it('a cross-project dependency blocker is never counted as missing (wrinkle 3)', async () => {
+    const a = await newOwnedProject('pm-320-drift-cross@example.com', 'PM320DX');
+    const dependent = await mcpCall(a.token, 'create_task', { projectId: a.projectId, title: 'cross dependent', tags: ['pm-320'], allowNewTags: true });
+    if (dependent.isError) throw new Error(`create_task failed: ${dependent.text}`);
+    const dependentId = dependent.body.id as string;
+    const other = await mcpCall(a.token, 'create_project', { key: 'PM320DXB', name: 'PM320DXB project' });
+    if (other.isError) throw new Error(`create_project failed: ${other.text}`);
+    const blocker = await mcpCall(a.token, 'create_task', { projectId: other.body.id as string, title: 'cross blocker', tags: ['pm-320'], allowNewTags: true });
+    if (blocker.isError) throw new Error(`create_task failed: ${blocker.text}`);
+    const add = await mcpCall(a.token, 'add_dependency', { projectId: a.projectId, taskId: dependentId, dependsOnTaskId: blocker.body.id as string });
+    if (add.isError) throw new Error(`add_dependency failed: ${add.text}`);
+
+    // Never projected at all — if the cross-project skip were missing, this would read as
+    // `dependencies: { expected: 1, missing: 1 }` instead of correctly excluding it.
+    const drift = await memory(a.projectId).projectionDrift(a.projectId);
+    expect(drift.dependencies).toEqual({ expected: 0, missing: 0 });
+    expect(drift.totalMissing).toBe(0);
   });
 });

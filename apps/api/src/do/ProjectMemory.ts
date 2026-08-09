@@ -93,6 +93,25 @@ export interface ProjectMemoryHealth {
   hasPriorGeneration: boolean;
 }
 
+/** PLNR-320: one relationship kind's drift subtotal — see `ProjectMemory.projectionDrift`'s own
+ *  doc comment for the full contract (in particular why this is never derived from an edge's
+ *  `provenance` string). `expected` is how many edges `rebuildProjection` currently expects to
+ *  exist for this kind; `missing` is how many of those are absent from the graph today. */
+export interface ProjectionDriftCategory {
+  expected: number;
+  missing: number;
+}
+
+/** PLNR-320: `ProjectMemory.projectionDrift`'s full report — one category per relationship kind
+ *  `rebuildProjection` itself covers (deliberately NOT run edges — see that method's own
+ *  documented gap) plus a convenience total. Surfaced on `GET /memory/ops-status`. */
+export interface ProjectionDriftReport {
+  phaseTasks: ProjectionDriftCategory;
+  taskDocs: ProjectionDriftCategory;
+  dependencies: ProjectionDriftCategory;
+  totalMissing: number;
+}
+
 /** PLNR-273: one `index_generations` row as an operator-facing read — everything a human needs
  *  to judge whether a staged generation is safe to activate, without re-deriving validity
  *  client-side. `validationProblems` is always an array (never the raw JSON-or-null column). */
@@ -225,6 +244,17 @@ function summarizeEpisodeBody(bodyJson: string): string {
     return '(unreadable episode body)';
   }
 }
+
+/**
+ * PLNR-320: the automatic-backfill generation. `backfillProjectionOnce` compares this against
+ * the durable `_meta.backfill_version` marker and skips once the marker is at or past it — an
+ * INTEGER, not a boolean, precisely so a future fix to the projector (or to `rebuildProjection`
+ * itself) can bump this constant to force exactly one more automatic pass over every project,
+ * the same lever a schema-version bump gives migrations. Never decrement it by hand — that would
+ * make an already-backfilled project look unbackfilled and re-run for no reason (harmless, since
+ * the rebuild is idempotent, but pointless CPU).
+ */
+const BACKFILL_VERSION = 1;
 
 export class ProjectMemory extends DurableObject<Env> {
   // Bound on first call — from ctx.id.name when the runtime exposes it (every
@@ -4208,35 +4238,30 @@ export class ProjectMemory extends DurableObject<Env> {
   }
 
   /**
-   * PLNR-283's backfill: an idempotent full-state graph rebuild, sourced from this project's
-   * LIVE D1 coordination tables — never event replay — so a project whose event log predates
-   * this task (or that the incremental projector never fully caught up on) still gains a
-   * connected graph without hand-replaying its cursor from zero. Projects every task/plan/doc/
-   * milestone/agent this project currently has, plus the task<->plan (`phase_tasks`), task<->doc
-   * (`task_docs`) and task<->task (`dependencies`, PLNR-322) relationships the board already
-   * knows — `applyCoordinationEvent` cannot draw the first two from a single event's payload (a
-   * `plan.created` event carries phase task COUNTS, not ids; there is no event at all for "this
-   * task was added to a plan/doc"), and a `ctx.storage.transactionSync` block cannot await a
-   * second D1 read mid-transaction, so this reads everything up front, then writes it all in ONE
-   * transaction.
-   *
-   * `dependencies` has no `project_id` (an edge is owned by the DEPENDENT task's project,
-   * CLAUDE.md) — the query below joins through `tasks` on the dependent side to select this
-   * project's rows the same way `externalDependentsOf`/`addDependency` do. A CROSS-PROJECT
-   * blocker needs no special case here: `depNodeId` (built from `tasks.results`, THIS project
-   * only) simply never contains a foreign blocker's id, so the `if (fromId && toId)` guard below
-   * skips it — the identical choice `mapCoordinationEvent`'s `dependency.added`/`.removed` arms
-   * make explicitly (see that function's doc comment), reached here by construction instead of a
-   * second check, so the two writers cannot silently drift on it.
-   *
-   * Deliberately does NOT touch `projector_cursor` — that stays `runProjector`'s own concern.
-   * Every write here is idempotent (uri for nodes, the `(type, from, to)` triple for edges), so
-   * running this and the incremental projector in any order, any number of times, is always
-   * safe: re-running produces identical node/edge counts and no changed ids (stated acceptance).
+   * The live D1 coordination state `rebuildProjection` and `projectionDrift` (PLNR-320) both
+   * need — factored out so the two can never silently disagree on what "expected" means (the
+   * exact bug wrinkle-1/wrinkle-3 style drift would otherwise invite: a drift counter built from
+   * a SEPARATE, hand-copied query could diverge from the rebuild's own query without anyone
+   * noticing). `dependencies` has no `project_id` (an edge is owned by the DEPENDENT task's
+   * project, CLAUDE.md) — the query joins through `tasks` on the dependent side to select this
+   * project's rows, the same way `externalDependentsOf`/`addDependency` do. A CROSS-PROJECT
+   * blocker needs no special case in the SQL itself: `dependsOnId` for a foreign blocker simply
+   * never appears in `tasks.results` (this project only), so every caller's own node-id map
+   * lookup naturally skips it — the identical choice `mapCoordinationEvent`'s
+   * `dependency.added`/`.removed` arms make explicitly (see that function's doc comment), reached
+   * here by construction instead of a second check, so no writer or reader of this data can
+   * silently drift on which edges are cross-project.
    */
-  async rebuildProjection(projectId: string): Promise<{ nodesWritten: number; edgesWritten: number }> {
-    await this.assertProjectId(projectId);
-    const now = nowIso();
+  private async loadCoordinationRelationships(projectId: string): Promise<{
+    tasks: { results: Array<{ id: string; title: string }> };
+    plans: { results: Array<{ id: string; title: string }> };
+    docs: { results: Array<{ id: string; name: string }> };
+    milestones: { results: Array<{ id: string; title: string }> };
+    agents: { results: Array<{ id: string; name: string }> };
+    taskPlanLinks: { results: Array<{ taskId: string; planId: string }> };
+    taskDocLinks: { results: Array<{ taskId: string; docId: string }> };
+    taskDependencies: { results: Array<{ taskId: string; dependsOnId: string }> };
+  }> {
     const [tasks, plans, docs, milestones, agents, taskPlanLinks, taskDocLinks, taskDependencies] = await Promise.all([
       this.env.DB.prepare('SELECT id, title FROM tasks WHERE project_id = ?').bind(projectId).all<{ id: string; title: string }>(),
       this.env.DB.prepare('SELECT id, title FROM plans WHERE project_id = ?').bind(projectId).all<{ id: string; title: string }>(),
@@ -4256,6 +4281,45 @@ export class ProjectMemory extends DurableObject<Env> {
          JOIN tasks t ON t.id = d.task_id WHERE t.project_id = ?`,
       ).bind(projectId).all<{ taskId: string; dependsOnId: string }>(),
     ]);
+    return { tasks, plans, docs, milestones, agents, taskPlanLinks, taskDocLinks, taskDependencies };
+  }
+
+  /**
+   * PLNR-283's backfill, now also PLNR-320's REPAIR tool: an idempotent full-state graph
+   * rebuild, sourced from this project's LIVE D1 coordination tables — never event replay — so a
+   * project whose event log predates this task (or that the incremental projector never fully
+   * caught up on, or that diverged because of a projector bug) still gains a connected, correct
+   * graph without hand-replaying its cursor from zero. Projects every task/plan/doc/milestone/
+   * agent this project currently has, plus the task<->plan (`phase_tasks`), task<->doc
+   * (`task_docs`) and task<->task (`dependencies`, PLNR-322) relationships the board already
+   * knows — `applyCoordinationEvent` cannot draw the first two from a single event's payload (a
+   * `plan.created` event carries phase task COUNTS, not ids; there is no event at all for "this
+   * task was added to a plan/doc"), and a `ctx.storage.transactionSync` block cannot await a
+   * second D1 read mid-transaction, so this reads everything up front (`loadCoordinationRelationships`),
+   * then writes it all in ONE transaction.
+   *
+   * KNOWN GAP, left deliberately undiscussed no longer (PLNR-320): this method does not project
+   * RUN nodes or the `run.created` -> anchor edge at all — only `recordEpisode` creates run
+   * nodes, and only well after `run.created` fires. That asymmetry pre-dates this task. It does
+   * NOT break convergence in the direction PLNR-320 tests (a rebuild adds nothing new and never
+   * deletes, so a run edge the incremental path already drew simply survives a rebuild
+   * untouched — proven by this task's own convergence test, which deliberately includes a run
+   * among the mutated relationship kinds). It DOES mean "rebuild as repair tool" is incomplete
+   * for run edges specifically: if the incremental path ever failed to draw a `run.created` edge
+   * (a bug, not a documented skip like the cross-project case below), this rebuild cannot repair
+   * it, and `projectionDrift` below does not claim to measure it either — extending both to cover
+   * runs is future work, not silently assumed to already work.
+   *
+   * Deliberately does NOT touch `projector_cursor` — that stays `runProjector`'s own concern.
+   * Every write here is idempotent (uri for nodes, the `(type, from, to)` triple for edges), so
+   * running this and the incremental projector in any order, any number of times, is always
+   * safe: re-running produces identical node/edge counts and no changed ids (stated acceptance).
+   */
+  async rebuildProjection(projectId: string): Promise<{ nodesWritten: number; edgesWritten: number }> {
+    await this.assertProjectId(projectId);
+    const now = nowIso();
+    const { tasks, plans, docs, milestones, agents, taskPlanLinks, taskDocLinks, taskDependencies } =
+      await this.loadCoordinationRelationships(projectId);
 
     let nodesWritten = 0;
     let edgesWritten = 0;
@@ -4334,6 +4398,129 @@ export class ProjectMemory extends DurableObject<Env> {
     });
     this.ctx.storage.setAlarm(Date.now()).catch(() => {});
     return { nodesWritten, edgesWritten };
+  }
+
+  /**
+   * PLNR-320: how far the graph has drifted from what `rebuildProjection` currently expects,
+   * broken down by relationship kind (its "provenance" in the locked decision's sense — the
+   * coordination TABLE a category comes from, e.g. `phase_tasks`, never the edge row's own
+   * `provenance` STRING column). Read-only — never repairs anything; a human runs
+   * `rebuildProjection` (the manual route, or this same RPC) once drift is non-zero.
+   *
+   * Wrinkle 1 (why this does NOT filter by `edges.provenance`): `linkGraphEdge` writes
+   * provenance only on a triple's FIRST insert, and the incremental path's `event:<verb>` and
+   * this method's own `coordination:<table>` are two names for the SAME converged edge — a
+   * healthy graph's edges mostly carry `event:*` provenance because the incremental path
+   * usually gets there first. Counting "how many `coordination:*`-provenance edges exist" would
+   * read a perfectly healthy project as 100% drifted. The only correct check is existence of the
+   * `(type, from, to)` triple itself, regardless of which provenance string it happens to carry
+   * — exactly what `driftCategory` below does via `edgeExists`.
+   *
+   * Wrinkle 3 (cross-project dependencies): `loadCoordinationRelationships`'s `taskDependencies`
+   * query is NOT scoped to same-project blockers — same as `rebuildProjection` itself, expected
+   * edges are filtered by "is `dependsOnId` one of THIS project's own tasks" (the `taskIds` set
+   * below), so a cross-project blocker is excluded from `expected` entirely, never counted as
+   * missing. `mapCoordinationEvent`'s `dependency.added`/`.removed` arms make the identical
+   * choice (CLAUDE.md).
+   *
+   * Wrinkle 2 (run edges): deliberately absent from this report — `rebuildProjection` does not
+   * cover run nodes/edges (see its own doc comment), so there is no repair path this report
+   * could usefully point at for them. Reporting drift for something nothing can currently fix
+   * would be misleading, not merely incomplete.
+   */
+  async projectionDrift(projectId: string): Promise<ProjectionDriftReport> {
+    await this.assertProjectId(projectId);
+    const { tasks, taskPlanLinks, taskDocLinks, taskDependencies } = await this.loadCoordinationRelationships(projectId);
+    const taskIds = new Set(tasks.results.map((t) => t.id));
+
+    const phaseTasks = this.driftCategory(
+      taskPlanLinks.results.map((l) => ({
+        type: 'related_to', fromUri: buildEntityUri({ kind: 'task', id: l.taskId }), toUri: buildEntityUri({ kind: 'plan', id: l.planId }),
+      })),
+    );
+    const taskDocs = this.driftCategory(
+      taskDocLinks.results.map((l) => ({
+        type: 'related_to', fromUri: buildEntityUri({ kind: 'task', id: l.taskId }), toUri: buildEntityUri({ kind: 'artifact', id: l.docId }),
+      })),
+    );
+    const dependencies = this.driftCategory(
+      taskDependencies.results
+        .filter((d) => taskIds.has(d.dependsOnId)) // wrinkle 3: a cross-project blocker is never expected here
+        .map((d) => ({
+          type: 'depends_on', fromUri: buildEntityUri({ kind: 'task', id: d.taskId }), toUri: buildEntityUri({ kind: 'task', id: d.dependsOnId }),
+        })),
+    );
+    return { phaseTasks, taskDocs, dependencies, totalMissing: phaseTasks.missing + taskDocs.missing + dependencies.missing };
+  }
+
+  /** One category's drift subtotal: for each expected (type, fromUri, toUri) triple, missing
+   *  when either endpoint node does not exist yet OR the edge triple itself is absent — matched
+   *  by identity, never by provenance (wrinkle 1, see `projectionDrift`'s doc comment). */
+  private driftCategory(expected: Array<{ type: string; fromUri: string; toUri: string }>): ProjectionDriftCategory {
+    let missing = 0;
+    for (const e of expected) {
+      const from = this.resolveNodeByUri(e.fromUri);
+      const to = this.resolveNodeByUri(e.toUri);
+      if (!from || !to || !this.edgeExists(e.type, from.nodeId, to.nodeId)) missing++;
+    }
+    return { expected: expected.length, missing };
+  }
+
+  private edgeExists(type: string, fromNodeId: string, toNodeId: string): boolean {
+    return (
+      this.ctx.storage.sql
+        .exec<{ one: number }>(`SELECT 1 AS one FROM edges WHERE type = ?1 AND from_node_id = ?2 AND to_node_id = ?3 LIMIT 1`, type, fromNodeId, toNodeId)
+        .toArray().length > 0
+    );
+  }
+
+  /**
+   * PLNR-320: the automatic counterpart to the manual `/memory/graph/rebuild` route — runs
+   * `rebuildProjection` EXACTLY ONCE per project, gated by the durable `_meta.backfill_version`
+   * marker (see `BACKFILL_VERSION`'s own doc comment for why it is an integer, not a boolean).
+   * Called from `sweepProjectDebrisForProject` (memory/lifecycle.ts) — the SAME daily
+   * per-project cron sweep (and its on-demand `/memory/lifecycle-sweep` twin) that already
+   * prunes staged generations and decays low-authority memories, so "automatic, once per
+   * project" rides an existing, deliberate, once-a-day trigger rather than a new one. Two
+   * deployment triggers were considered and rejected: `alarm()` and DO construction. Both fire
+   * far more often and far less predictably than a daily sweep (any read OR write can wake a DO,
+   * and — verified against the real workerd test runtime, not just in theory — a `setAlarm`,
+   * even one scheduled seconds out, genuinely fires in the background whenever enough real
+   * wall-clock time elapses, independent of whether the caller that scheduled it is done). Since
+   * `rebuildProjection` is not a pure no-op the SECOND-plus time it runs in a given moment — it
+   * always appends one outbox row and bumps `memory_revision`, by design, so a human watching
+   * `health()` can see a rebuild actually happened — an unpredictable background trigger would
+   * make outbox/revision counts observably nondeterministic to anything else touching that
+   * project's memory around the same time. A daily sweep has no such surprise: it is already the
+   * place a human expects "occasional per-project bookkeeping" to happen.
+   *
+   * This method itself calls `reconcile()` FIRST, before deciding whether to rebuild — never the
+   * other way around, regardless of which caller reaches it. `reconcile()` catches the
+   * incremental projector up to the current event log, so any edge the incremental path can draw
+   * keeps its `event:<verb>` provenance. `linkGraphEdge`'s `ON CONFLICT … DO NOTHING` only writes
+   * provenance on a triple's FIRST insert — running the backfill BEFORE the incremental path
+   * catches up would let its `coordination:<table>` provenance win that race for a triple the
+   * incremental path was about to draw anyway. The actual EDGE would be identical either way
+   * (that is the whole point of convergence), but the audit trail would lie about which writer
+   * actually drew it — so the order is load-bearing, not cosmetic, and living INSIDE this method
+   * (not left to each caller to remember) is what makes that true regardless of caller.
+   *
+   * Idempotent beyond the marker too: `rebuildProjection`'s own graph writes are uri/triple
+   * idempotent, so a crash between the rebuild committing and the marker committing just means
+   * the NEXT sweep repeats a rebuild whose nodes/edges are unchanged, never a wrong one — only
+   * the bookkeeping (outbox row, revision) would double up, and only in that narrow crash window.
+   */
+  async backfillProjectionOnce(projectId: string): Promise<{ ran: boolean; nodesWritten?: number; edgesWritten?: number }> {
+    await this.assertProjectId(projectId);
+    const marker = this.ctx.storage.sql.exec<{ value: string }>(`SELECT value FROM _meta WHERE key = 'backfill_version'`).toArray()[0];
+    if (Number(marker?.value ?? '0') >= BACKFILL_VERSION) return { ran: false };
+    await this.reconcile(projectId);
+    const { nodesWritten, edgesWritten } = await this.rebuildProjection(projectId);
+    this.ctx.storage.sql.exec(
+      `INSERT INTO _meta (key, value) VALUES ('backfill_version', ?1) ON CONFLICT (key) DO UPDATE SET value = ?1`,
+      String(BACKFILL_VERSION),
+    );
+    return { ran: true, nodesWritten, edgesWritten };
   }
 
   override async alarm(): Promise<void> {
@@ -4507,6 +4694,23 @@ export class ProjectMemory extends DurableObject<Env> {
     const migration = MEMORY_MIGRATIONS.find((m) => m.name === '0011_memory_node_labels');
     if (!migration) throw new Error('memory-migration 0011_memory_node_labels not found in MEMORY_MIGRATIONS');
     this.ctx.storage.sql.exec(migration.sql);
+  }
+
+  /** Test-only: every edge in this project's graph as a (type, fromUri, toUri, provenance)
+   *  tuple, resolved through `nodes` and sorted for a stable diff — PLNR-320's centrepiece
+   *  convergence assertion snapshots this before and after `rebuildProjection` and expects it
+   *  BYTE-IDENTICAL, which a bare count could not catch (same length, different membership, or
+   *  the same triples with a changed provenance would both slip past a count-only check). */
+  async _allEdgesForTest(projectId: string): Promise<Array<{ type: string; fromUri: string; toUri: string; provenance: string | null }>> {
+    await this.assertProjectId(projectId);
+    const rows = this.ctx.storage.sql
+      .exec<{ type: string; from_uri: string; to_uri: string; provenance: string | null }>(
+        `SELECT e.type AS type, nf.uri AS from_uri, nt.uri AS to_uri, e.provenance AS provenance
+         FROM edges e JOIN nodes nf ON nf.id = e.from_node_id JOIN nodes nt ON nt.id = e.to_node_id
+         ORDER BY e.type, nf.uri, nt.uri`,
+      )
+      .toArray();
+    return rows.map((r) => ({ type: r.type, fromUri: r.from_uri, toUri: r.to_uri, provenance: r.provenance }));
   }
 
 }
