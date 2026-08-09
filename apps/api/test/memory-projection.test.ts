@@ -17,6 +17,12 @@ const appEnv = env as unknown as Env;
 // need, not the whole surface.
 interface RoomRpc {
   createRun(projectId: string, actor: Actor, input: CreateRunInput): Promise<RunView>;
+  // PLNR-319: exercised directly (not through MCP) the same way file-locks.test.ts already
+  // drives deleteTask — these are REST/human-only surfaces with no MCP tool.
+  deleteTask(projectId: string, actor: Actor, taskId: string): Promise<{ ok: true; key: string }>;
+  deletePlan(projectId: string, actor: Actor, planId: string): Promise<{ ok: true }>;
+  deleteDoc(projectId: string, actor: Actor, docId: string): Promise<{ ok: true }>;
+  moveTask(projectId: string, actor: Actor, taskId: string, toProjectId: string): Promise<{ ok: true }>;
 }
 const room = (projectId: string) => appEnv.PROJECT_ROOM.get(appEnv.PROJECT_ROOM.idFromName(projectId)) as unknown as RoomRpc;
 const SYSTEM_ACTOR: Actor = { kind: 'system', id: 'system', name: 'system' };
@@ -723,5 +729,317 @@ describe('run.created draws a run node and a related_to edge to its anchor end t
     const runUri = buildEntityUri({ kind: 'run', id: run.id });
     const runAsSeed = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: runUri });
     expect(runAsSeed.coverage.reasons).not.toContain('seed-not-found');
+  });
+});
+
+// PLNR-319: the root cause of the empty map — phase_tasks ("task joined a plan phase") and
+// task_docs ("doc attached to a task") were written in six-plus ProjectRoom.ts sites and NEVER
+// named by an event, so `rebuildProjection`'s live D1 read was the only source of these edges.
+// `plan.tasks_linked`/`plan.tasks_unlinked` and `task.docs_linked`/`task.docs_unlinked` close
+// that gap: same `related_to` edge type, same task -> plan / task -> doc direction
+// rebuildProjection already draws — only the provenance grammar differs (`event:<verb>` vs
+// `coordination:phase_tasks`/`coordination:task_docs`), the same precedent dependency.added and
+// run.created already set two tasks ago.
+const HUMAN_ACTOR: Actor = { kind: 'human', id: 'usr_pm319', name: 'PM319 Tester' };
+
+describe('mapCoordinationEvent — plan.tasks_linked/unlinked, task.docs_linked/unlinked (PLNR-319)', () => {
+  it('plan.tasks_linked projects one related_to edge PER LINK in the payload, task -> plan', () => {
+    const projected = mapCoordinationEvent({
+      verb: 'plan.tasks_linked',
+      subjectId: 'plan_abc',
+      payload: {
+        planTitle: 'Q3 plan',
+        links: [
+          { taskId: 'task_1', taskTitle: 'first', planId: 'plan_abc', planTitle: 'Q3 plan' },
+          { taskId: 'task_2', taskTitle: 'second', planId: 'plan_abc', planTitle: 'Q3 plan' },
+        ],
+      },
+    });
+    expect(projected).toEqual({
+      node: null,
+      edges: [
+        {
+          type: 'related_to',
+          from: { type: 'task', uri: buildEntityUri({ kind: 'task', id: 'task_1' }), label: 'first' },
+          to: { type: 'plan', uri: buildEntityUri({ kind: 'plan', id: 'plan_abc' }), label: 'Q3 plan' },
+          op: 'link',
+          provenance: 'event:plan.tasks_linked',
+        },
+        {
+          type: 'related_to',
+          from: { type: 'task', uri: buildEntityUri({ kind: 'task', id: 'task_2' }), label: 'second' },
+          to: { type: 'plan', uri: buildEntityUri({ kind: 'plan', id: 'plan_abc' }), label: 'Q3 plan' },
+          op: 'link',
+          provenance: 'event:plan.tasks_linked',
+        },
+      ],
+    });
+  });
+
+  it('plan.tasks_unlinked projects the same shape with op: unlink; a missing label falls back to the bare id', () => {
+    const projected = mapCoordinationEvent({
+      verb: 'plan.tasks_unlinked',
+      subjectId: 'plan_abc',
+      payload: { links: [{ taskId: 'task_1', planId: 'plan_abc' }] },
+    });
+    expect(projected?.edges).toHaveLength(1);
+    expect(projected?.edges[0]).toMatchObject({ op: 'unlink', provenance: 'event:plan.tasks_unlinked' });
+    expect(projected?.edges[0]?.from.label).toBe('task_1');
+    expect(projected?.edges[0]?.to.label).toBe('plan_abc');
+  });
+
+  it('task.docs_linked/unlinked mirror the same shape, task -> doc (the artifact node type)', () => {
+    const linked = mapCoordinationEvent({
+      verb: 'task.docs_linked',
+      subjectId: 'task_1',
+      payload: { taskTitle: 'a task', links: [{ taskId: 'task_1', taskTitle: 'a task', docId: 'doc_1', docLabel: 'design doc' }] },
+    });
+    expect(linked).toEqual({
+      node: null,
+      edges: [{
+        type: 'related_to',
+        from: { type: 'task', uri: buildEntityUri({ kind: 'task', id: 'task_1' }), label: 'a task' },
+        to: { type: 'artifact', uri: buildEntityUri({ kind: 'artifact', id: 'doc_1' }), label: 'design doc' },
+        op: 'link',
+        provenance: 'event:task.docs_linked',
+      }],
+    });
+
+    const unlinked = mapCoordinationEvent({
+      verb: 'task.docs_unlinked',
+      subjectId: 'task_1',
+      payload: { links: [{ taskId: 'task_1', docId: 'doc_1' }] },
+    });
+    expect(unlinked?.edges[0]).toMatchObject({ op: 'unlink', provenance: 'event:task.docs_unlinked' });
+  });
+
+  it('a non-array payload projects nothing; a malformed link item is skipped, not the whole event', () => {
+    expect(mapCoordinationEvent({ verb: 'plan.tasks_linked', subjectId: 'plan_abc', payload: {} })).toBeNull();
+    const projected = mapCoordinationEvent({
+      verb: 'task.docs_linked',
+      subjectId: 'task_1',
+      payload: { links: [{ taskId: 'task_1' /* no docId */ }, { taskId: 'task_2', docId: 'doc_2' }] },
+    });
+    expect(projected?.edges).toHaveLength(1);
+  });
+});
+
+describe('phase_tasks/task_docs draw real edges end to end, converging with rebuildProjection (PLNR-319)', () => {
+  it('create_task with docIds produces a task -> doc edge with no manual rebuild, and a rebuild afterwards adds nothing new', async () => {
+    const { token, projectId } = await newOwnedProject('pm-319-doc@example.com', 'PM319DC');
+    const doc = await mcpCall(token, 'create_doc', { projectId, name: 'design doc', body: 'The API returns JSON. This is settled.' });
+    if (doc.isError) throw new Error(`create_doc failed: ${doc.text}`);
+    const docId = doc.body.id as string;
+    const task = await mcpCall(token, 'create_task', { projectId, title: 'doc-linked task', docIds: [docId], tags: ['pm-319'], allowNewTags: true });
+    if (task.isError) throw new Error(`create_task failed: ${task.text}`);
+    const taskId = task.body.id as string;
+
+    const applied = await memory(projectId).runProjector(projectId);
+    expect(applied.applied).toBeGreaterThan(0);
+
+    const taskUri = buildEntityUri({ kind: 'task', id: taskId });
+    const docUri = buildEntityUri({ kind: 'artifact', id: docId });
+    const neighborhood = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: taskUri, edgeTypes: ['related_to'] });
+    expect(neighborhood.downstream.map((n) => n.uri)).toEqual([docUri]);
+    expect(await memory(projectId)._edgeProvenance(projectId, 'related_to', taskUri, docUri)).toBe('event:task.docs_linked');
+
+    // Convergence (stated acceptance): rebuildProjection still WRITES (attempts) the same
+    // triple, but nothing NEW lands, and provenance stays the incremental writer's.
+    const edgesBefore = await memory(projectId)._countEdges(projectId);
+    const rebuilt = await memory(projectId).rebuildProjection(projectId);
+    expect(rebuilt.edgesWritten).toBeGreaterThan(0);
+    expect(await memory(projectId)._countEdges(projectId)).toBe(edgesBefore);
+    expect(await memory(projectId)._edgeProvenance(projectId, 'related_to', taskUri, docUri)).toBe('event:task.docs_linked');
+  });
+
+  it('create_task with a phaseId produces a task -> plan edge', async () => {
+    const { token, projectId } = await newOwnedProject('pm-319-phase@example.com', 'PM319PH');
+    const plan = await mcpCall(token, 'create_plan', { projectId, title: 'phase plan', phases: [{ title: 'phase 1', newTasks: [{ title: 'seed task' }] }] });
+    if (plan.isError) throw new Error(`create_plan failed: ${plan.text}`);
+    const planId = plan.body.id as string;
+    const phaseId = (plan.body.phases as Array<{ id: string }>)[0]!.id;
+
+    const task = await mcpCall(token, 'create_task', { projectId, title: 'joins the phase', phaseId, tags: ['pm-319'], allowNewTags: true });
+    if (task.isError) throw new Error(`create_task failed: ${task.text}`);
+    const taskId = task.body.id as string;
+
+    const applied = await memory(projectId).runProjector(projectId);
+    expect(applied.applied).toBeGreaterThan(0);
+
+    const taskUri = buildEntityUri({ kind: 'task', id: taskId });
+    const planUri = buildEntityUri({ kind: 'plan', id: planId });
+    const neighborhood = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: taskUri, edgeTypes: ['related_to'] });
+    expect(neighborhood.downstream.map((n) => n.uri)).toEqual([planUri]);
+    expect(await memory(projectId)._edgeProvenance(projectId, 'related_to', taskUri, planUri)).toBe('event:plan.tasks_linked');
+  });
+
+  it('create_plan with many tasks in one phase emits ONE plan.tasks_linked event, not one per task (§19)', async () => {
+    const { token, projectId } = await newOwnedProject('pm-319-bulk@example.com', 'PM319BK');
+    const newTasks = Array.from({ length: 6 }, (_, i) => ({ title: `bulk task ${i}` }));
+    const plan = await mcpCall(token, 'create_plan', { projectId, title: 'bulk plan', phases: [{ title: 'phase 1', newTasks }] });
+    if (plan.isError) throw new Error(`create_plan failed: ${plan.text}`);
+    const planId = plan.body.id as string;
+    const taskIds = (plan.body.phases as Array<{ taskIds: string[] }>)[0]!.taskIds;
+    expect(taskIds).toHaveLength(6);
+
+    const { results: linkEvents } = await appEnv.DB.prepare(
+      `SELECT payload FROM events WHERE project_id = ? AND verb = 'plan.tasks_linked'`,
+    ).bind(projectId).all<{ payload: string }>();
+    expect(linkEvents).toHaveLength(1); // bounded: one event for the whole plan, not per task
+    const links = JSON.parse(linkEvents[0]!.payload).links as unknown[];
+    expect(links).toHaveLength(6);
+
+    const applied = await memory(projectId).runProjector(projectId);
+    expect(applied.applied).toBeGreaterThan(0);
+    const planUri = buildEntityUri({ kind: 'plan', id: planId });
+    const neighborhood = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: planUri, edgeTypes: ['related_to'] });
+    expect(neighborhood.upstream.map((n) => n.uri).sort()).toEqual(taskIds.map((id) => buildEntityUri({ kind: 'task', id })).sort());
+  });
+
+  it('update_task addDocIds then removeDocIds adds then removes the edge', async () => {
+    const { token, projectId } = await newOwnedProject('pm-319-attach@example.com', 'PM319AT');
+    const doc = await mcpCall(token, 'create_doc', { projectId, name: 'attach doc', body: 'Settled: this document exists.' });
+    if (doc.isError) throw new Error(`create_doc failed: ${doc.text}`);
+    const docId = doc.body.id as string;
+    const task = await mcpCall(token, 'create_task', { projectId, title: 'attach target', tags: ['pm-319'], allowNewTags: true });
+    if (task.isError) throw new Error(`create_task failed: ${task.text}`);
+    const taskId = task.body.id as string;
+
+    const attach = await mcpCall(token, 'update_task', { projectId, taskId, addDocIds: [docId] });
+    if (attach.isError) throw new Error(`update_task(addDocIds) failed: ${attach.text}`);
+
+    await memory(projectId).runProjector(projectId);
+    const taskUri = buildEntityUri({ kind: 'task', id: taskId });
+    const docUri = buildEntityUri({ kind: 'artifact', id: docId });
+    expect((await memory(projectId).dependencyNeighborhood(projectId, { entityUri: taskUri, edgeTypes: ['related_to'] })).downstream.map((n) => n.uri)).toEqual([docUri]);
+    expect(await memory(projectId)._edgeProvenance(projectId, 'related_to', taskUri, docUri)).toBe('event:task.docs_linked');
+
+    const detach = await mcpCall(token, 'update_task', { projectId, taskId, removeDocIds: [docId] });
+    if (detach.isError) throw new Error(`update_task(removeDocIds) failed: ${detach.text}`);
+    const edgesBeforeUnlink = await memory(projectId)._countEdges(projectId);
+    const applied = await memory(projectId).runProjector(projectId);
+    expect(applied.applied).toBeGreaterThan(0);
+    expect((await memory(projectId).dependencyNeighborhood(projectId, { entityUri: taskUri, edgeTypes: ['related_to'] })).downstream).toEqual([]);
+    expect(await memory(projectId)._countEdges(projectId)).toBe(edgesBeforeUnlink - 1);
+  });
+
+  it('update_plan structural restructure links a newly-added task and unlinks a removed one; a task kept in the SAME plan is untouched', async () => {
+    const { token, projectId } = await newOwnedProject('pm-319-restruct@example.com', 'PM319RS');
+    const t1 = await mcpCall(token, 'create_task', { projectId, title: 'stays', tags: ['pm-319'], allowNewTags: true });
+    const t2 = await mcpCall(token, 'create_task', { projectId, title: 'leaves', tags: ['pm-319'], allowNewTags: true });
+    const t3 = await mcpCall(token, 'create_task', { projectId, title: 'joins', tags: ['pm-319'], allowNewTags: true });
+    if (t1.isError || t2.isError || t3.isError) throw new Error('create_task failed');
+    const t1Id = t1.body.id as string;
+    const t2Id = t2.body.id as string;
+    const t3Id = t3.body.id as string;
+
+    const plan = await mcpCall(token, 'create_plan', { projectId, title: 'restructure plan', phases: [{ title: 'phase 1', taskIds: [t1Id, t2Id] }] });
+    if (plan.isError) throw new Error(`create_plan failed: ${plan.text}`);
+    const planId = plan.body.id as string;
+    const phaseId = (plan.body.phases as Array<{ id: string }>)[0]!.id;
+    await memory(projectId).runProjector(projectId); // project the initial link event
+
+    const restructure = await mcpCall(token, 'update_plan', {
+      projectId, planId, phases: [{ id: phaseId, title: 'phase 1', taskIds: [t1Id, t3Id] }],
+    });
+    if (restructure.isError) throw new Error(`update_plan failed: ${restructure.text}`);
+
+    const applied = await memory(projectId).runProjector(projectId);
+    expect(applied.applied).toBeGreaterThan(0);
+
+    const planUri = buildEntityUri({ kind: 'plan', id: planId });
+    const t1Uri = buildEntityUri({ kind: 'task', id: t1Id });
+    const t2Uri = buildEntityUri({ kind: 'task', id: t2Id });
+    const t3Uri = buildEntityUri({ kind: 'task', id: t3Id });
+    const upstreamUris = (await memory(projectId).dependencyNeighborhood(projectId, { entityUri: planUri, edgeTypes: ['related_to'] })).upstream.map((n) => n.uri).sort();
+    expect(upstreamUris).toEqual([t1Uri, t3Uri].sort());
+    expect(upstreamUris).not.toContain(t2Uri);
+  });
+
+  it('deleteTask unlinks its plan and doc edges (the task graph NODE itself is a pre-existing gap this task does not close)', async () => {
+    const { token, projectId } = await newOwnedProject('pm-319-deltask@example.com', 'PM319DT');
+    const doc = await mcpCall(token, 'create_doc', { projectId, name: 'del task doc', body: 'Settled: a fact.' });
+    if (doc.isError) throw new Error(`create_doc failed: ${doc.text}`);
+    const docId = doc.body.id as string;
+    const plan = await mcpCall(token, 'create_plan', {
+      projectId, title: 'del task plan', phases: [{ title: 'phase 1', newTasks: [{ title: 'to be deleted', docIds: [docId] }] }],
+    });
+    if (plan.isError) throw new Error(`create_plan failed: ${plan.text}`);
+    const planId = plan.body.id as string;
+    const taskId = (plan.body.phases as Array<{ taskIds: string[] }>)[0]!.taskIds[0]!;
+
+    await memory(projectId).runProjector(projectId);
+    const taskUri = buildEntityUri({ kind: 'task', id: taskId });
+    const planUri = buildEntityUri({ kind: 'plan', id: planId });
+    const docUri = buildEntityUri({ kind: 'artifact', id: docId });
+    expect((await memory(projectId).dependencyNeighborhood(projectId, { entityUri: taskUri, edgeTypes: ['related_to'] })).downstream.map((n) => n.uri).sort())
+      .toEqual([docUri, planUri].sort());
+
+    await room(projectId).deleteTask(projectId, HUMAN_ACTOR, taskId);
+    const applied = await memory(projectId).runProjector(projectId);
+    expect(applied.applied).toBeGreaterThan(0);
+    expect((await memory(projectId).dependencyNeighborhood(projectId, { entityUri: taskUri, edgeTypes: ['related_to'] })).downstream).toEqual([]);
+  });
+
+  it('deleteDoc unlinks every task it was attached to', async () => {
+    const { token, projectId } = await newOwnedProject('pm-319-deldoc@example.com', 'PM319DD');
+    const doc = await mcpCall(token, 'create_doc', { projectId, name: 'doomed doc', body: 'Settled: a fact.' });
+    if (doc.isError) throw new Error(`create_doc failed: ${doc.text}`);
+    const docId = doc.body.id as string;
+    const task = await mcpCall(token, 'create_task', { projectId, title: 'attached to doomed doc', docIds: [docId], tags: ['pm-319'], allowNewTags: true });
+    if (task.isError) throw new Error(`create_task failed: ${task.text}`);
+    const taskId = task.body.id as string;
+
+    await memory(projectId).runProjector(projectId);
+    const taskUri = buildEntityUri({ kind: 'task', id: taskId });
+    const docUri = buildEntityUri({ kind: 'artifact', id: docId });
+    expect((await memory(projectId).dependencyNeighborhood(projectId, { entityUri: taskUri, edgeTypes: ['related_to'] })).downstream.map((n) => n.uri)).toEqual([docUri]);
+
+    await room(projectId).deleteDoc(projectId, HUMAN_ACTOR, docId);
+    const applied = await memory(projectId).runProjector(projectId);
+    expect(applied.applied).toBeGreaterThan(0);
+    expect((await memory(projectId).dependencyNeighborhood(projectId, { entityUri: taskUri, edgeTypes: ['related_to'] })).downstream).toEqual([]);
+  });
+
+  it('deletePlan unlinks every task still in it', async () => {
+    const { token, projectId } = await newOwnedProject('pm-319-delplan@example.com', 'PM319DP2');
+    const plan = await mcpCall(token, 'create_plan', { projectId, title: 'doomed plan', phases: [{ title: 'phase 1', newTasks: [{ title: 'member task' }] }] });
+    if (plan.isError) throw new Error(`create_plan failed: ${plan.text}`);
+    const planId = plan.body.id as string;
+    const taskId = (plan.body.phases as Array<{ taskIds: string[] }>)[0]!.taskIds[0]!;
+
+    await memory(projectId).runProjector(projectId);
+    const taskUri = buildEntityUri({ kind: 'task', id: taskId });
+    const planUri = buildEntityUri({ kind: 'plan', id: planId });
+    expect((await memory(projectId).dependencyNeighborhood(projectId, { entityUri: taskUri, edgeTypes: ['related_to'] })).downstream.map((n) => n.uri)).toEqual([planUri]);
+
+    await room(projectId).deletePlan(projectId, HUMAN_ACTOR, planId);
+    const applied = await memory(projectId).runProjector(projectId);
+    expect(applied.applied).toBeGreaterThan(0);
+    expect((await memory(projectId).dependencyNeighborhood(projectId, { entityUri: taskUri, edgeTypes: ['related_to'] })).downstream).toEqual([]);
+  });
+
+  it('moveTask unlinks its plan and doc edges in the SOURCE project', async () => {
+    const { token, projectId } = await newOwnedProject('pm-319-move@example.com', 'PM319MV');
+    const other = await mcpCall(token, 'create_project', { key: 'PM319MVT', name: 'move target' });
+    if (other.isError) throw new Error(`create_project failed: ${other.text}`);
+    const toProjectId = other.body.id as string;
+
+    const doc = await mcpCall(token, 'create_doc', { projectId, name: 'move doc', body: 'Settled: a fact.' });
+    if (doc.isError) throw new Error(`create_doc failed: ${doc.text}`);
+    const docId = doc.body.id as string;
+    const task = await mcpCall(token, 'create_task', { projectId, title: 'to be moved', docIds: [docId], tags: ['pm-319'], allowNewTags: true });
+    if (task.isError) throw new Error(`create_task failed: ${task.text}`);
+    const taskId = task.body.id as string;
+
+    await memory(projectId).runProjector(projectId);
+    const taskUri = buildEntityUri({ kind: 'task', id: taskId });
+    const docUri = buildEntityUri({ kind: 'artifact', id: docId });
+    expect((await memory(projectId).dependencyNeighborhood(projectId, { entityUri: taskUri, edgeTypes: ['related_to'] })).downstream.map((n) => n.uri)).toEqual([docUri]);
+
+    await room(projectId).moveTask(projectId, HUMAN_ACTOR, taskId, toProjectId);
+    const applied = await memory(projectId).runProjector(projectId);
+    expect(applied.applied).toBeGreaterThan(0);
+    expect((await memory(projectId).dependencyNeighborhood(projectId, { entityUri: taskUri, edgeTypes: ['related_to'] })).downstream).toEqual([]);
   });
 });

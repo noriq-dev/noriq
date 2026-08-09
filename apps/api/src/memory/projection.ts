@@ -190,6 +190,25 @@ export interface CoordinationEventForProjection {
  * correctly refused rather than invent a field or silently skip with no trace, and pinned the old
  * payload shapes in regression tests.
  *
+ * PLNR-319 widens it again for the two relationships `rebuildProjection` could draw from D1 but
+ * no event ever named: plan phase membership (`phase_tasks`) and task<->doc attachment
+ * (`task_docs`). `plan.tasks_linked`/`plan.tasks_unlinked` and `task.docs_linked`/
+ * `task.docs_unlinked` all share one payload shape — `{ links: Array<{...}> }` — because
+ * ProjectRoom.ts's write sites vary in which side is "the one" and which is "the many" (a single
+ * task joining one plan via `create_task`'s `phaseId`; forty tasks joining one plan via
+ * `create_plan`; one task's whole doc set replacing via `update_task`'s `docIds`; one doc's every
+ * attachment severing via `deleteDoc`'s cascade). Rather than build edges from `ev.subjectId` and
+ * special-case which endpoint that names, EVERY link item carries BOTH endpoint ids (and, where
+ * the writer already had them, both labels) — `ev.subjectId` is bookkeeping for the event's own
+ * feed only, never read here. This is the SAME direction `rebuildProjection`'s `phase_tasks`/
+ * `task_docs` loops draw (`related_to`, from the task to the plan/doc) and the SAME `related_to`
+ * edge type (locked decision: no new `MemoryEdgeType`) — only the provenance grammar differs
+ * (`event:<verb>` here vs `coordination:phase_tasks`/`coordination:task_docs` there), exactly the
+ * precedent `dependency.added`/`.removed` already set (`event:dependency.added` vs
+ * `coordination:dependencies`) two paragraphs up: `linkGraphEdge`'s `ON CONFLICT ... DO NOTHING`
+ * never overwrites an existing edge's provenance, so the two writers converging on the same
+ * `(type, from, to)` triple is what matters, not matching strings.
+ *
  * PLNR-322 is that widening: `ProjectRoom.ts` now serializes `dependsOnId` (alongside the
  * unchanged `key`/`dependsOn`) and `anchorId` (alongside the unchanged `anchor`), so all three
  * verbs project edges below, built from ids exactly like every other arm here.
@@ -292,6 +311,46 @@ export function mapCoordinationEvent(ev: CoordinationEventForProjection): Coordi
       }
       const anchor: ProjectedNodeDescriptor = { type: anchorType, uri: buildEntityUri({ kind: anchorType, id: anchorId }), label: anchorId };
       return { node: run, edges: [{ type: 'related_to', from: run, to: anchor, op: 'link', provenance: 'event:run.created' }] };
+    }
+    case 'plan.tasks_linked':
+    case 'plan.tasks_unlinked': {
+      const raw = ev.payload.links;
+      if (!Array.isArray(raw)) return null;
+      const op = ev.verb === 'plan.tasks_linked' ? 'link' : 'unlink';
+      const edges: ProjectedEdgeDescriptor[] = [];
+      for (const item of raw) {
+        if (typeof item !== 'object' || item === null) continue;
+        const l = item as Record<string, unknown>;
+        const taskId = l.taskId;
+        const planId = l.planId;
+        if (typeof taskId !== 'string' || !taskId || typeof planId !== 'string' || !planId) continue;
+        const taskLabel = typeof l.taskTitle === 'string' && l.taskTitle.trim() ? l.taskTitle : taskId;
+        const planLabel = typeof l.planTitle === 'string' && l.planTitle.trim() ? l.planTitle : planId;
+        const task: ProjectedNodeDescriptor = { type: 'task', uri: buildEntityUri({ kind: 'task', id: taskId }), label: taskLabel };
+        const plan: ProjectedNodeDescriptor = { type: 'plan', uri: buildEntityUri({ kind: 'plan', id: planId }), label: planLabel };
+        edges.push({ type: 'related_to', from: task, to: plan, op, provenance: `event:${ev.verb}` });
+      }
+      return { node: null, edges };
+    }
+    case 'task.docs_linked':
+    case 'task.docs_unlinked': {
+      const raw = ev.payload.links;
+      if (!Array.isArray(raw)) return null;
+      const op = ev.verb === 'task.docs_linked' ? 'link' : 'unlink';
+      const edges: ProjectedEdgeDescriptor[] = [];
+      for (const item of raw) {
+        if (typeof item !== 'object' || item === null) continue;
+        const l = item as Record<string, unknown>;
+        const taskId = l.taskId;
+        const docId = l.docId;
+        if (typeof taskId !== 'string' || !taskId || typeof docId !== 'string' || !docId) continue;
+        const taskLabel = typeof l.taskTitle === 'string' && l.taskTitle.trim() ? l.taskTitle : taskId;
+        const docLabel = typeof l.docLabel === 'string' && l.docLabel.trim() ? l.docLabel : docId;
+        const task: ProjectedNodeDescriptor = { type: 'task', uri: buildEntityUri({ kind: 'task', id: taskId }), label: taskLabel };
+        const doc: ProjectedNodeDescriptor = { type: 'artifact', uri: buildEntityUri({ kind: 'artifact', id: docId }), label: docLabel };
+        edges.push({ type: 'related_to', from: task, to: doc, op, provenance: `event:${ev.verb}` });
+      }
+      return { node: null, edges };
     }
     default:
       return null;

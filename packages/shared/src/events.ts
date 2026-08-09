@@ -50,6 +50,17 @@ export const EventVerb = z.enum([
   // feed; a cross-project blocker settles in a different room, so the dependent's project
   // needs its own event or its board never hears.
   'dependency.unblocked',
+  // Coordination edges the projector could not previously draw at all (PLNR-319): a
+  // `plan.created`/`update_plan` event carries phase task COUNTS, not ids, and there was no
+  // event at all for "this task joined/left a plan phase" or "this doc was attached to/detached
+  // from a task" — `rebuildProjection`'s live D1 read was the only source of these `related_to`
+  // edges. Both pairs carry a `links` ARRAY in one payload (never one event per link — a plan
+  // created with forty tasks must not serialize forty of these) with both endpoint ids and,
+  // where the writer already has them in hand, both labels.
+  'plan.tasks_linked',
+  'plan.tasks_unlinked',
+  'task.docs_linked',
+  'task.docs_unlinked',
   'comment.posted',
   'comment.acknowledged',
   'comment.resolved',

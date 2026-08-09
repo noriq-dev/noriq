@@ -631,7 +631,7 @@ export class ProjectRoom extends DurableObject<Env> {
       if (input.milestoneId) await this.requireProjectMilestone(input.milestoneId);
       // Doc links (PLNR-182) validate BEFORE the insert batch so a bad doc id fails the
       // whole create cleanly instead of leaving a task without its intended links.
-      const docIds = await this.requireProjectDocs(input.docIds);
+      const docs = await this.requireProjectDocs(input.docIds);
       // Tags resolve BEFORE the insert too (PLNR-194 hardening): the mint guard can reject
       // (near-duplicate / curated policy), and a post-insert rejection used to leave a
       // half-created untagged task behind. Failing here fails the whole create; the
@@ -661,12 +661,14 @@ export class ProjectRoom extends DurableObject<Env> {
       // valid phase id from ANOTHER project would satisfy the FK silently. A bad/foreign ref
       // fails the whole create and writes nothing.
       let phaseId: string | null = null;
+      let phasePlan: { id: string; title: string } | null = null;
       if (input.phaseId != null) {
         const ph = await this.env.DB.prepare(
-          'SELECT ph.id FROM phases ph JOIN plans pl ON pl.id = ph.plan_id WHERE ph.id = ? AND pl.project_id = ?',
-        ).bind(input.phaseId, pid).first<{ id: string }>();
+          'SELECT ph.id, pl.id AS planId, pl.title AS planTitle FROM phases ph JOIN plans pl ON pl.id = ph.plan_id WHERE ph.id = ? AND pl.project_id = ?',
+        ).bind(input.phaseId, pid).first<{ id: string; planId: string; planTitle: string }>();
         if (!ph) throw new Error(`phase ${input.phaseId} not found in this project`);
         phaseId = ph.id;
+        phasePlan = { id: ph.planId, title: ph.planTitle };
       }
       const stmts = [
         // A spin-off (PLNR-230) is stored as a real `todo` with proposed_at set — the derived
@@ -685,8 +687,8 @@ export class ProjectRoom extends DurableObject<Env> {
           this.env.DB.prepare('INSERT OR IGNORE INTO dependencies (task_id, depends_on_task_id) VALUES (?, ?)').bind(id, dep),
         );
       }
-      for (const docId of docIds) {
-        stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO task_docs (task_id, doc_id) VALUES (?, ?)').bind(id, docId));
+      for (const doc of docs) {
+        stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO task_docs (task_id, doc_id) VALUES (?, ?)').bind(id, doc.id));
       }
       for (const tid of tagIds) {
         stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO task_tags (task_id, tag_id) VALUES (?, ?)').bind(id, tid));
@@ -713,6 +715,21 @@ export class ProjectRoom extends DurableObject<Env> {
       } else {
         await this.emit(actor, 'task.created', 'task', id, {
           key, title: input.title, parentTaskId: input.parentTaskId ?? null,
+        });
+      }
+      // PLNR-319: the phase_tasks/task_docs rows above are the whole attachment story — this
+      // is the event that lets the projector see them without a manual rebuild. One event per
+      // relationship kind, not per link (docs is already the whole set for this one task).
+      if (docs.length) {
+        await this.emit(actor, 'task.docs_linked', 'task', id, {
+          taskTitle: input.title,
+          links: docs.map((d) => ({ taskId: id, taskTitle: input.title, docId: d.id, docLabel: d.name })),
+        });
+      }
+      if (phasePlan) {
+        await this.emit(actor, 'plan.tasks_linked', 'plan', phasePlan.id, {
+          planTitle: phasePlan.title,
+          links: [{ taskId: id, taskTitle: input.title, planId: phasePlan.id, planTitle: phasePlan.title }],
         });
       }
       this.reindexSearch('task', id);
@@ -812,18 +829,46 @@ export class ProjectRoom extends DurableObject<Env> {
       // addDocIds/removeDocIds edit it without clobbering. All ids validated project-local.
       if (patch.docIds !== undefined || patch.addDocIds !== undefined || patch.removeDocIds !== undefined) {
         const stmts = [];
+        // PLNR-319: accumulate every doc joining/leaving this task's set across all three
+        // patch shapes into at most one `task.docs_linked` and one `task.docs_unlinked` event
+        // below — a caller that sets docIds AND addDocIds AND removeDocIds in one call still
+        // costs at most two events, not one per doc.
+        const linked = new Map<string, string>(); // docId -> name
+        const unlinked = new Set<string>();
         if (patch.docIds !== undefined) {
-          const ids = await this.requireProjectDocs(patch.docIds);
+          const docs = await this.requireProjectDocs(patch.docIds);
+          const { results: prior } = await this.env.DB.prepare('SELECT doc_id AS docId FROM task_docs WHERE task_id = ?')
+            .bind(taskId).all<{ docId: string }>();
+          const before = new Set(prior.map((r) => r.docId));
+          const after = new Set(docs.map((d) => d.id));
+          for (const d of docs) if (!before.has(d.id)) linked.set(d.id, d.name);
+          for (const docId of before) if (!after.has(docId)) unlinked.add(docId);
           stmts.push(this.env.DB.prepare('DELETE FROM task_docs WHERE task_id = ?').bind(taskId));
-          for (const d of ids) stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO task_docs (task_id, doc_id) VALUES (?, ?)').bind(taskId, d));
+          for (const d of docs) stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO task_docs (task_id, doc_id) VALUES (?, ?)').bind(taskId, d.id));
         }
         for (const d of await this.requireProjectDocs(patch.addDocIds)) {
-          stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO task_docs (task_id, doc_id) VALUES (?, ?)').bind(taskId, d));
+          linked.set(d.id, d.name);
+          unlinked.delete(d.id);
+          stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO task_docs (task_id, doc_id) VALUES (?, ?)').bind(taskId, d.id));
         }
         for (const d of patch.removeDocIds ?? []) {
+          linked.delete(d);
+          unlinked.add(d);
           stmts.push(this.env.DB.prepare('DELETE FROM task_docs WHERE task_id = ? AND doc_id = ?').bind(taskId, d));
         }
         if (stmts.length) await this.env.DB.batch(stmts);
+        if (linked.size) {
+          await this.emit(actor, 'task.docs_linked', 'task', taskId, {
+            taskTitle: task.title,
+            links: [...linked].map(([docId, docLabel]) => ({ taskId, taskTitle: task.title, docId, docLabel })),
+          });
+        }
+        if (unlinked.size) {
+          await this.emit(actor, 'task.docs_unlinked', 'task', taskId, {
+            taskTitle: task.title,
+            links: [...unlinked].map((docId) => ({ taskId, taskTitle: task.title, docId })),
+          });
+        }
         delete patch.docIds;
         delete patch.addDocIds;
         delete patch.removeDocIds;
@@ -2166,17 +2211,21 @@ export class ProjectRoom extends DurableObject<Env> {
 
   /** Validate doc ids against THIS project's docs (PLNR-182): a typo or a foreign
    *  project's doc id fails loudly with the full list of offenders. Returns the
-   *  deduplicated ids; [] for empty/undefined input. */
-  private async requireProjectDocs(docIds: string[] | undefined): Promise<string[]> {
+   *  deduplicated ids WITH their names — PLNR-319's `task.docs_linked` events want the
+   *  label already in hand rather than a second D1 round trip at emit time; `[]` for
+   *  empty/undefined input. */
+  private async requireProjectDocs(docIds: string[] | undefined): Promise<Array<{ id: string; name: string }>> {
     const ids = [...new Set((docIds ?? []).filter(Boolean))];
     if (!ids.length) return [];
     const { results } = await this.env.DB.prepare(
-      `SELECT id FROM docs WHERE project_id = ? AND id IN (${ids.map(() => '?').join(',')})`,
-    ).bind(this.projectId, ...ids).all<{ id: string }>();
-    const found = new Set(results.map((r) => r.id));
+      `SELECT id, name FROM docs WHERE project_id = ? AND id IN (${ids.map(() => '?').join(',')})`,
+    ).bind(this.projectId, ...ids).all<{ id: string; name: string }>();
+    const found = new Map(results.map((r) => [r.id, r.name]));
     const missing = ids.filter((d) => !found.has(d));
     if (missing.length) throw new Error(`doc(s) not found in this project: ${missing.join(', ')} (see list_docs)`);
-    return ids;
+    // Preserve the caller's original (deduplicated) order — results from an IN(...) query
+    // are not guaranteed to come back in list order.
+    return ids.map((id) => ({ id, name: found.get(id)! }));
   }
 
   /** The board a new subtask inherits (PLNR-181): its parent's, so a decomposed task's
@@ -2497,9 +2546,17 @@ export class ProjectRoom extends DurableObject<Env> {
         'SELECT COUNT(*) AS n FROM dependencies WHERE task_id = ? OR depends_on_task_id = ?',
       ).bind(task.id, task.id).first<{ n: number }>())!;
       // Doc links are project-local (docs live in the source project) — severed, unlike deps.
-      const { n: docLinkCount } = (await this.env.DB.prepare(
-        'SELECT COUNT(*) AS n FROM task_docs WHERE task_id = ?',
-      ).bind(task.id).first<{ n: number }>())!;
+      // PLNR-319: the actual ids (not just a count) so the severed relationships can be
+      // unlinked from THIS project's memory graph below — a moved task's phase/doc edges here
+      // would otherwise dangle forever (rebuildProjection only ever ADDS present links; it
+      // never removes ones D1 no longer has).
+      const { results: severedDocs } = await this.env.DB.prepare(
+        'SELECT doc_id AS docId FROM task_docs WHERE task_id = ?',
+      ).bind(task.id).all<{ docId: string }>();
+      const { results: severedPlans } = await this.env.DB.prepare(
+        `SELECT DISTINCT ph.plan_id AS planId FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE pt.task_id = ?`,
+      ).bind(task.id).all<{ planId: string }>();
+      const docLinkCount = severedDocs.length;
 
       const alloc = await this.env.DB.prepare(
         'UPDATE projects SET next_task_number = next_task_number + 1 WHERE id = ? RETURNING next_task_number AS next',
@@ -2540,6 +2597,19 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.emit(actor, 'task.moved', 'task', task.id, {
         key: task.key, toKey: newKey, toProjectId, title: task.title, keptDependencies: depCount,
       });
+      // PLNR-319: unlink what the move severed, in THIS (source) project's graph.
+      if (severedPlans.length) {
+        await this.emit(actor, 'plan.tasks_unlinked', 'task', task.id, {
+          taskTitle: task.title,
+          links: severedPlans.map((p) => ({ taskId: task.id, planId: p.planId })),
+        });
+      }
+      if (severedDocs.length) {
+        await this.emit(actor, 'task.docs_unlinked', 'task', task.id, {
+          taskTitle: task.title,
+          links: severedDocs.map((d) => ({ taskId: task.id, docId: d.docId })),
+        });
+      }
       this.reindexSearch('task', task.id); // metadata.projectId changed with the move
       return { ok: true, fromKey: task.key, key: newKey, projectId: toProjectId, keptDependencies: depCount, droppedDocLinks: docLinkCount, tags: retagged };
     });
@@ -2653,12 +2723,25 @@ export class ProjectRoom extends DurableObject<Env> {
       const doc = await this.env.DB.prepare('SELECT id, name FROM docs WHERE id = ? AND project_id = ?')
         .bind(docId, this.projectId).first<{ id: string; name: string }>();
       if (!doc) throw new Error('doc not found in this project');
+      // PLNR-319: every task this doc is attached to, before the cascade severs it — the graph
+      // has no listener for `doc.deleted` (the node itself survives as an orphan stub, same gap
+      // `task.deleted` has), but the `related_to` edges must still go so they don't outlive the
+      // relationship they described.
+      const { results: attachedTasks } = await this.env.DB.prepare(
+        'SELECT task_id AS taskId FROM task_docs WHERE doc_id = ?',
+      ).bind(docId).all<{ taskId: string }>();
       await this.env.DB.batch([
         this.env.DB.prepare('DELETE FROM task_docs WHERE doc_id = ?').bind(docId),
         this.env.DB.prepare('DELETE FROM doc_tags WHERE doc_id = ?').bind(docId),
         this.env.DB.prepare('DELETE FROM docs WHERE id = ?').bind(docId),
       ]);
       await this.emit(actor, 'doc.deleted', 'doc', docId, { name: doc.name });
+      if (attachedTasks.length) {
+        await this.emit(actor, 'task.docs_unlinked', 'doc', docId, {
+          docLabel: doc.name,
+          links: attachedTasks.map((t) => ({ taskId: t.taskId, docId })),
+        });
+      }
       this.dropSearch('doc', docId);
       return { ok: true };
     });
@@ -2752,6 +2835,12 @@ export class ProjectRoom extends DurableObject<Env> {
       const plan = await this.env.DB.prepare('SELECT id, title FROM plans WHERE id = ? AND project_id = ?')
         .bind(planId, this.projectId).first<{ id: string; title: string }>();
       if (!plan) throw new Error('plan not found');
+      // PLNR-319: every task still in this plan, before phase_tasks goes — same reasoning as
+      // deleteDoc's attachedTasks snapshot (the plan NODE has no deletion listener either, but
+      // the edges must not outlive the rows that backed them).
+      const { results: memberTasks } = await this.env.DB.prepare(
+        `SELECT DISTINCT pt.task_id AS taskId FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE ph.plan_id = ?`,
+      ).bind(planId).all<{ taskId: string }>();
       await this.env.DB.batch([
         // Gate rows before phases — the subselect needs the phases still present.
         this.env.DB.prepare('DELETE FROM phase_gates WHERE phase_id IN (SELECT id FROM phases WHERE plan_id = ?)').bind(planId),
@@ -2761,6 +2850,12 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM plans WHERE id = ?').bind(planId),
       ]);
       await this.emit(actor, 'plan.deleted', 'plan', planId, { title: plan.title });
+      if (memberTasks.length) {
+        await this.emit(actor, 'plan.tasks_unlinked', 'plan', planId, {
+          planTitle: plan.title,
+          links: memberTasks.map((t) => ({ taskId: t.taskId, planId })),
+        });
+      }
       return { ok: true };
     });
   }
@@ -2780,6 +2875,15 @@ export class ProjectRoom extends DurableObject<Env> {
       // Cross-project dependents snapshotted BEFORE the batch drops their edges (PLNR-241):
       // a deleted blocker unblocks them, and their rooms need telling after the commit.
       const externalDependents = await this.externalDependentsOf(id);
+      // PLNR-319: this task's plan/doc links, before the cascade drops them — the task NODE
+      // itself is not deleted from the graph (no listener does that today, same pre-existing
+      // gap `task.deleted` has always had), but its `related_to` edges must not survive it.
+      const { results: memberPlans } = await this.env.DB.prepare(
+        `SELECT DISTINCT ph.plan_id AS planId FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE pt.task_id = ?`,
+      ).bind(id).all<{ planId: string }>();
+      const { results: memberDocs } = await this.env.DB.prepare(
+        'SELECT doc_id AS docId FROM task_docs WHERE task_id = ?',
+      ).bind(id).all<{ docId: string }>();
       await this.env.DB.batch([
         this.env.DB.prepare('DELETE FROM phase_tasks WHERE task_id = ?').bind(id),
         this.env.DB.prepare('DELETE FROM dependencies WHERE task_id = ? OR depends_on_task_id = ?').bind(id, id),
@@ -2796,6 +2900,18 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM tasks WHERE id = ?').bind(id),
       ]);
       await this.emit(actor, 'task.deleted', 'task', id, { key: task.key, title: task.title });
+      if (memberPlans.length) {
+        await this.emit(actor, 'plan.tasks_unlinked', 'task', id, {
+          taskTitle: task.title,
+          links: memberPlans.map((p) => ({ taskId: id, planId: p.planId })),
+        });
+      }
+      if (memberDocs.length) {
+        await this.emit(actor, 'task.docs_unlinked', 'task', id, {
+          taskTitle: task.title,
+          links: memberDocs.map((d) => ({ taskId: id, docId: d.docId })),
+        });
+      }
       this.notifyExternalDependents(externalDependents, { id, key: task.key });
       this.dropSearch('task', id);
       return { ok: true, key: task.key };
@@ -3142,6 +3258,10 @@ export class ProjectRoom extends DurableObject<Env> {
          WHERE bt.project_id = ? AND t.project_id != ?`,
       ).bind(pid, pid).all<{ id: string; pid: string }>();
       const tasksSub = 'SELECT id FROM tasks WHERE project_id = ?';
+      // PLNR-319: no plan.tasks_unlinked/task.docs_unlinked here, deliberately — this project's
+      // OWN `events` table is deleted a few statements below, and its ProjectMemory graph is
+      // project-scoped and orphaned along with everything else once `projects` loses the row.
+      // Emitting into a feed that is being deleted in the same batch would be a write to nothing.
       await this.env.DB.batch([
         this.env.DB.prepare(`DELETE FROM phase_tasks WHERE task_id IN (${tasksSub}) OR phase_id IN (SELECT id FROM phases WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ?))`).bind(pid, pid),
         this.env.DB.prepare(`DELETE FROM dependencies WHERE task_id IN (${tasksSub}) OR depends_on_task_id IN (${tasksSub})`).bind(pid, pid),
@@ -4678,16 +4798,18 @@ export class ProjectRoom extends DurableObject<Env> {
       // mid-loop. A tag minted here and orphaned by a later pass-1 throw is the accepted harmless
       // leftover (PLNR-194); everything else below is read-only.
       const d = input.taskDefaults ?? {};
-      const resolvedExisting: string[][] = [];
+      // PLNR-319: titles ride alongside ids from pass 1 on so the eventual `plan.tasks_linked`
+      // event's links carry labels without a second D1 round trip at emit time.
+      const resolvedExisting: Array<Array<{ id: string; title: string }>> = [];
       const resolvedDeps: string[][][] = [];
       for (const ph of input.phases) {
-        const existing: string[] = [];
+        const existing: Array<{ id: string; title: string }> = [];
         for (const tid of ph.taskIds ?? []) {
           // Accept ids or keys; validate the task belongs to this project.
-          const t = await this.env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
-            .bind(tid, tid, projectId).first<{ id: string }>();
+          const t = await this.env.DB.prepare('SELECT id, title FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+            .bind(tid, tid, projectId).first<{ id: string; title: string }>();
           if (!t) throw new Error(`task ${tid} not found in this project`);
-          existing.push(t.id);
+          existing.push(t);
         }
         const newTasks = ph.newTasks ?? [];
         if (!existing.length && !newTasks.length) throw new Error(`phase "${ph.title}" has no tasks`);
@@ -4725,15 +4847,20 @@ export class ProjectRoom extends DurableObject<Env> {
       ).bind(planId, projectId, input.agentId ?? null, input.title, input.description ?? '', input.body ?? '', status, nowIso()).run();
   
       const phases: Array<{ id: string; title: string; taskIds: string[] }> = [];
+      // PLNR-319: every task that lands in ANY phase of this plan, across the whole call —
+      // ONE `plan.tasks_linked` event below carries all of them, not one event per phase or
+      // per task (a plan created with forty tasks must not serialize forty coordination writes).
+      const planLinks: Array<{ taskId: string; taskTitle: string }> = [];
       for (let i = 0; i < input.phases.length; i++) {
         const ph = input.phases[i]!;
         const phaseId = newId('phs');
         await this.env.DB.prepare('INSERT INTO phases (id, plan_id, title, body, "order") VALUES (?, ?, ?, ?, ?)')
           .bind(phaseId, planId, ph.title, ph.body ?? '', i).run();
-  
+
         // Ids were resolved and validated in pass 1; consuming those answers (rather than
         // re-querying) keeps the two passes provably the same check.
-        const taskIds: string[] = [...resolvedExisting[i]!];
+        const taskIds: string[] = resolvedExisting[i]!.map((t) => t.id);
+        for (const t of resolvedExisting[i]!) planLinks.push({ taskId: t.id, taskTitle: t.title });
         const phNewTasks = ph.newTasks ?? [];
         for (let j = 0; j < phNewTasks.length; j++) {
           const nt = phNewTasks[j]!;
@@ -4753,9 +4880,10 @@ export class ProjectRoom extends DurableObject<Env> {
             executionSpec: nt.executionSpec,
           });
           taskIds.push(created.id);
+          planLinks.push({ taskId: created.id, taskTitle: nt.title });
         }
         if (!taskIds.length) throw new Error(`phase "${ph.title}" has no tasks`);
-  
+
         await this.env.DB.batch(taskIds.map((tid) =>
           this.env.DB.prepare('INSERT OR IGNORE INTO phase_tasks (phase_id, task_id) VALUES (?, ?)').bind(phaseId, tid),
         ));
@@ -4766,6 +4894,12 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.emit(actor, 'plan.created', 'plan', planId, {
         title: input.title, status, phases: phases.map((p) => ({ title: p.title, tasks: p.taskIds.length })),
       });
+      if (planLinks.length) {
+        await this.emit(actor, 'plan.tasks_linked', 'plan', planId, {
+          planTitle: input.title,
+          links: planLinks.map((l) => ({ ...l, planId, planTitle: input.title })),
+        });
+      }
       this.reindexSearch('plan', planId);
       return { id: planId, title: input.title, status, phases };
 
@@ -4795,17 +4929,31 @@ export class ProjectRoom extends DurableObject<Env> {
       if (!plan) throw new Error('plan not found in this project');
 
       const resolved: Array<{ id: string | null; title: string; body?: string; taskIds: string[] }> = [];
+      // PLNR-319: titles alongside ids, for the `plan.tasks_linked` event's link labels below.
+      const taskTitleById = new Map<string, string>();
       for (const ph of phases) {
         const taskIds: string[] = [];
         for (const tid of ph.taskIds) {
-          const t = await this.env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
-            .bind(tid, tid, projectId).first<{ id: string }>();
+          const t = await this.env.DB.prepare('SELECT id, title FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+            .bind(tid, tid, projectId).first<{ id: string; title: string }>();
           if (!t) throw new Error(`task ${tid} not found in this project`);
           taskIds.push(t.id);
+          taskTitleById.set(t.id, t.title);
         }
         if (!taskIds.length) throw new Error(`phase "${ph.title}" has no tasks`);
         resolved.push({ id: ph.id ?? null, title: ph.title, body: ph.body, taskIds });
       }
+      // PLNR-319: the plan's CURRENT task membership, read before phase_tasks is wiped below —
+      // the diff against the new shape (by task id; a task moved between two phases of the SAME
+      // plan is neither a link nor an unlink) is what `plan.tasks_linked`/`plan.tasks_unlinked`
+      // carry. Edges are task -> plan, not task -> phase, so only plan-level membership matters.
+      const { results: priorLinks } = await this.env.DB.prepare(
+        `SELECT DISTINCT pt.task_id AS taskId FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE ph.plan_id = ?`,
+      ).bind(planId).all<{ taskId: string }>();
+      const oldTaskIds = new Set(priorLinks.map((r) => r.taskId));
+      const newTaskIds = new Set(resolved.flatMap((p) => p.taskIds));
+      const addedTaskIds = [...newTaskIds].filter((id) => !oldTaskIds.has(id));
+      const removedTaskIds = [...oldTaskIds].filter((id) => !newTaskIds.has(id));
 
       const { results: existing } = await this.env.DB.prepare('SELECT id FROM phases WHERE plan_id = ?')
         .bind(planId).all<{ id: string }>();
@@ -4846,6 +4994,18 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.emit(actor, 'plan.updated', 'plan', planId, {
         title: plan.title, structural: true, phases: out.map((p) => ({ title: p.title, tasks: p.taskIds.length })),
       });
+      if (addedTaskIds.length) {
+        await this.emit(actor, 'plan.tasks_linked', 'plan', planId, {
+          planTitle: plan.title,
+          links: addedTaskIds.map((taskId) => ({ taskId, taskTitle: taskTitleById.get(taskId) ?? taskId, planId, planTitle: plan.title })),
+        });
+      }
+      if (removedTaskIds.length) {
+        await this.emit(actor, 'plan.tasks_unlinked', 'plan', planId, {
+          planTitle: plan.title,
+          links: removedTaskIds.map((taskId) => ({ taskId, planId, planTitle: plan.title })),
+        });
+      }
       return { id: planId, title: plan.title, phases: out };
     });
   }
@@ -4903,6 +5063,14 @@ export class ProjectRoom extends DurableObject<Env> {
       ];
       await this.env.DB.batch(stmts);
       await this.emit(actor, 'plan.rejected', 'plan', planId, { title: plan.title, cancelledTasks: taskRows.length });
+      // PLNR-319: same phase_tasks cascade as deletePlan — the rejected plan's task links
+      // must not survive the rows that backed them.
+      if (taskRows.length) {
+        await this.emit(actor, 'plan.tasks_unlinked', 'plan', planId, {
+          planTitle: plan.title,
+          links: taskRows.map((t) => ({ taskId: t.id, planId })),
+        });
+      }
       return { ok: true, cancelledTasks: taskRows.length };
     });
   }
