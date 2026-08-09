@@ -179,6 +179,29 @@ export const GUIDANCE_RULES: readonly GuidanceRule[] = [
     detect: coOccurring(200, [/never[\s\S]{0,60}?instruction/i, /cannot raise (its|your) own authority/i]),
   },
   {
+    // PLNR-307: get_task_context ("The primary ASSEMBLED context interface for one task", per
+    // its own tool description in mcp.ts) is the highest-leverage memory tool a working agent
+    // has, and was absent from SKILL_MD and the playbook — an agent reading either would never
+    // learn to call it and would hand-chain the expensive path instead. "chain" (not the tool's
+    // own "instead of chaining" wording verbatim) is the detector token so a surface that
+    // reworks the sentence ("hand-chaining", "chain yourself") still matches.
+    id: 'assembled-context-entry-point',
+    description: 'get_task_context is the primary assembled-context interface for one task — prefer it over hand-chaining get_task + search_project_memory + explain_project_area before non-trivial work',
+    expectedSurfaces: BASE_SURFACES,
+    detect: coOccurring(200, [/get_task_context/i, /chain/i]),
+  },
+  {
+    // PLNR-307: explain_project_area's own tool description is emphatic that an unanswerable
+    // graph query ("coverage.complete === false") is NOT the same claim as "nothing is
+    // related" — a working agent that doesn't know this distinction will read an empty result
+    // as a negative finding instead of an unindexed graph. All three signals must co-occur:
+    // "coverage" alone is too generic a word to trust as evidence of THIS rule on its own.
+    id: 'graph-explain-coverage-caveat',
+    description: 'explain_project_area answers bounded graph facts about one entity URI, and coverage.complete === false means "the graph cannot answer that yet" — never the same claim as "nothing is related"',
+    expectedSurfaces: BASE_SURFACES,
+    detect: coOccurring(800, [/explain_project_area/i, /coverage/i, /nothing is related/i]),
+  },
+  {
     // The one rule DOC_SKILL_MD is EXPECTED to carry (CLAUDE.md: "the doc-authoring contract
     // belongs to DOC_SKILL_MD specifically") — and here it carries the SAME settled-only floor
     // the other three state for the base work loop, so unlike every other rule above, all four

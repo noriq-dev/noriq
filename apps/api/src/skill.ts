@@ -315,6 +315,22 @@ repository contents, and passing tests always outrank stored memory. Filters
 and compose together. Falls back to keyword + graph on an instance with no
 embeddings backend — it still answers (\`mode\` says which ran).
 
+For non-trivial work on a task, reach for \`get_task_context\` instead of
+hand-chaining \`get_task\` + \`search_project_memory\` + \`explain_project_area\`
+yourself: one call returns the task's own required facts in full (title, body,
+executionSpec, acceptance, open comments, claim state), plus as much of the active
+decisions, hazards, failed-approach records, other relevant memory, similar prior
+episodes (duplicate-work warnings), the task's dependency-graph neighborhood, and an
+uncertainty section as your \`budgetTokens\` allows — each section stamped with which
+retrieval stage produced it.
+
+\`explain_project_area\` is the graph counterpart to \`search_project_memory\`'s
+meaning search: not "what does the project know about X" but "what is connected to
+THIS entity" — dependencies, validating tests, implementers, decision lineage, or
+change impact — once you already hold its URI. Every response carries a \`coverage\`
+field; an empty result with \`coverage.complete === false\` means the graph cannot
+answer that yet, never the same claim as "nothing is related".
+
 Once you are localized to a project, \`get_briefing\` also carries a small, bounded
 \`memory\` block: recently changed decisions/hazards/unresolved unknowns, stale-memory
 warnings, and who else is actively claiming work nearby — a session-start pulse, not a
