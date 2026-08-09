@@ -1798,6 +1798,31 @@ export class ProjectMemory extends DurableObject<Env> {
     );
   }
 
+  /** PLNR-314: a canvas label is unreadable past ~80 chars, so this is the bound every memory
+   *  node's label is held to — both here (a freshly written or re-touched node) and in
+   *  memory-migration 0011's one-time backfill of nodes written before this fix, which mirrors
+   *  this normalization in SQL as closely as SQLite's string functions allow. */
+  private static readonly MEMORY_NODE_LABEL_MAX_CHARS = 80;
+
+  /**
+   * PLNR-314: a memory graph node's label is a bounded, single-line EXCERPT OF THE STATEMENT —
+   * never `kind`. Before this fix `upsertGraphNode('memory', …, input.kind, …)` named the node
+   * after its kind, so every `hazard`/`decision`/`unknown` memory rendered as an identically
+   * titled star; `kind` already travels as its own field on the constellation wire
+   * (graph-queries.ts resolves it from `memory_items`), so the label was the only place a memory
+   * node's actual content could appear at all, and this fixes that. Collapses whitespace/newlines
+   * to single spaces first — a multi-line statement makes an unreadable canvas label — then
+   * truncates with a trailing ellipsis past the bound. Display only (locked decision): never
+   * widen this excerpt, or reuse it, anywhere that renders in instruction position — a statement
+   * is untrusted model output, already quoted inside the evidence frame everywhere it is read as
+   * content (§13), and a graph label must not become a second, unframed path for the same text.
+   */
+  private static memoryNodeLabel(statement: string): string {
+    const normalized = statement.replace(/\s+/g, ' ').trim();
+    if (normalized.length <= ProjectMemory.MEMORY_NODE_LABEL_MAX_CHARS) return normalized;
+    return `${normalized.slice(0, ProjectMemory.MEMORY_NODE_LABEL_MAX_CHARS - 1)}…`;
+  }
+
   async recordMemory(
     projectId: string,
     input: {
@@ -1878,7 +1903,12 @@ export class ProjectMemory extends DurableObject<Env> {
       // `evidence` row id is on hand to become that citation's edge provenance — `evidence:
       // <evidenceId>` (locked decision's own example grammar); an entity citation gets no
       // `evidence` row to point at, so its provenance names the memory itself.
-      const memoryNodeId = this.upsertGraphNode('memory', buildEntityUri({ kind: 'memory', id: memoryId }), input.kind, now);
+      const memoryNodeId = this.upsertGraphNode(
+        'memory',
+        buildEntityUri({ kind: 'memory', id: memoryId }),
+        ProjectMemory.memoryNodeLabel(input.statement),
+        now,
+      );
       let repoCitationIndex = 0;
       for (const citation of citations) {
         let provenance: string;
@@ -4330,6 +4360,40 @@ export class ProjectMemory extends DurableObject<Env> {
   async _setMemoryRecordedAtForTest(projectId: string, memoryId: string, recordedAt: string): Promise<void> {
     await this.assertProjectId(projectId);
     this.ctx.storage.sql.exec(`UPDATE memory_items SET recorded_at = ?1 WHERE id = ?2`, recordedAt, memoryId);
+  }
+
+  /** Test-only: a node's stored type/label, resolved by uri — thin public wrapper over
+   *  `resolveNodeByUri` so PLNR-314's label-excerpt fix can be asserted without a wider query
+   *  surface. */
+  async _nodeByUriForTest(projectId: string, uri: string): Promise<{ nodeId: string; type: string; label: string } | null> {
+    await this.assertProjectId(projectId);
+    const node = this.resolveNodeByUri(uri);
+    return node ? { nodeId: node.nodeId, type: node.type, label: node.label } : null;
+  }
+
+  /** Test-only: force a node's label directly, bypassing every real writer — simulates a row
+   *  written by pre-PLNR-314 code (label == bare `kind`), which a fresh test DO can never
+   *  otherwise produce since `recordMemory` already writes the fixed label and migrations only
+   *  run once, at construction. Paired with `_reapplyMemoryNodeLabelBackfillForTest` below to
+   *  exercise the 0011 backfill's SQL against exactly that corrupted state. */
+  async _setNodeLabelForTest(projectId: string, uri: string, label: string): Promise<void> {
+    await this.assertProjectId(projectId);
+    this.ctx.storage.sql.exec(`UPDATE nodes SET label = ?1 WHERE uri = ?2`, label, uri);
+  }
+
+  /** Test-only: re-run memory-migration 0011's backfill SQL directly (PLNR-314). The real
+   *  migration only runs once, at construction, gated by `_meta.schema_version` — a fresh test
+   *  DO lands on the latest schema immediately and never observes 0011 transform a genuinely
+   *  pre-fix row. This runs the SAME SQL text (looked up from `MEMORY_MIGRATIONS`, never a
+   *  hand-copied duplicate that could drift from the shipped file) against whatever `nodes.label`
+   *  currently holds, proving the backfill itself — not just `recordMemory`'s write path — derives
+   *  a statement excerpt. Safe to call more than once: the backfill re-derives the same label
+   *  from the same `memory_items` row every time. */
+  async _reapplyMemoryNodeLabelBackfillForTest(projectId: string): Promise<void> {
+    await this.assertProjectId(projectId);
+    const migration = MEMORY_MIGRATIONS.find((m) => m.name === '0011_memory_node_labels');
+    if (!migration) throw new Error('memory-migration 0011_memory_node_labels not found in MEMORY_MIGRATIONS');
+    this.ctx.storage.sql.exec(migration.sql);
   }
 
 }
