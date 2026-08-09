@@ -14,6 +14,7 @@ export const GENERATION_MODEL = '@cf/openai/gpt-oss-120b';
 const CONTEXT_HITS = 8;
 const CONTEXT_CHARS = 1200;
 const MAX_ANSWER_TOKENS = 1200;
+const TOOL_DECISION_TOKENS = 256;
 const MAX_QUESTION_CHARS = 4000;
 const MAX_HISTORY_MESSAGES = 12;
 const MAX_HISTORY_CHARS = 4000;
@@ -148,13 +149,17 @@ export interface AskSource {
 export interface AskResult {
   answer: string;
   sources: AskSource[];
-  mode: 'semantic' | 'keyword';
+  mode: 'semantic' | 'keyword' | null;
   model: string;
   graphEnhanced: boolean;
 }
 
 export interface PreparedAsk extends Omit<AskResult, 'answer'> {
   messages: ChatMessage[];
+}
+
+export interface RetrievalDecisionClient {
+  select(question: string, history: AskHistoryMessage[]): Promise<string | null>;
 }
 
 interface AskSearchHit extends SearchHit {
@@ -182,6 +187,75 @@ export function extractFinishState(value: unknown): AskFinishState | null {
     ? incomplete.reason
     : root.type === 'response.completed' ? 'stop' : 'incomplete';
   return { finishReason: reason, truncated: root.type === 'response.incomplete' || response.status === 'incomplete' };
+}
+
+/** Read the traditional Chat Completions, legacy Workers AI, and Responses API tool-call shapes. */
+export function extractRetrievalToolQuery(value: unknown): string | null {
+  const root = asObject(value);
+  if (!root) return null;
+  const containers = [
+    root,
+    asObject(root.result),
+    asObject(root.response),
+    asObject(asObject(asArray(root.choices)[0])?.message),
+  ].filter((item): item is JsonObject => !!item);
+  const calls = containers.flatMap((container) => [
+    ...asArray(container.tool_calls),
+    ...asArray(container.output).filter((item) => asObject(item)?.type === 'function_call'),
+  ]);
+  for (const value of calls) {
+    const call = asObject(value);
+    const fn = asObject(call?.function);
+    const name = typeof call?.name === 'string' ? call.name : typeof fn?.name === 'string' ? fn.name : '';
+    if (name !== 'search_noriq') continue;
+    const raw = call?.arguments ?? fn?.arguments;
+    let args = asObject(raw);
+    if (!args && typeof raw === 'string') {
+      try { args = asObject(JSON.parse(raw)); } catch { /* malformed call falls back to question */ }
+    }
+    return typeof args?.query === 'string' && args.query.trim() ? args.query.trim().slice(0, MAX_QUESTION_CHARS) : '';
+  }
+  return null;
+}
+
+export function retrievalDecisionClient(env: Env): RetrievalDecisionClient | null {
+  if (!env.AI) return null;
+  const ai = env.AI;
+  return {
+    async select(question, history) {
+      const messages: ChatMessage[] = [
+        {
+          role: 'system',
+          content: [
+            'Decide whether the latest request needs current or private evidence from the user\'s Noriq workspace.',
+            'Call search_noriq exactly once when answering depends on their projects, tasks, plans, docs, runs, memories, decisions, or current state.',
+            'Do not call it for greetings, casual conversation, general knowledge, generic writing, or brainstorming unrelated to their workspace.',
+            'If no workspace evidence is needed, answer only NO_SEARCH.',
+          ].join(' '),
+        },
+        ...normalizeHistory(history),
+        { role: 'user', content: question },
+      ];
+      const result = await ai.run(GENERATION_MODEL, {
+        messages,
+        tools: [{
+          type: 'function',
+          function: {
+            name: 'search_noriq',
+            description: 'Search the user\'s accessible Noriq tasks, plans, docs, memories, episodes, and knowledge-graph connections for current project evidence.',
+            parameters: {
+              type: 'object',
+              properties: { query: { type: 'string', description: 'A focused semantic query for the needed workspace evidence.' } },
+              required: ['query'],
+            },
+          },
+        }],
+        max_tokens: TOOL_DECISION_TOKENS,
+      });
+      const query = extractRetrievalToolQuery(result);
+      return query === '' ? question : query;
+    },
+  };
 }
 
 /** Accept only user/assistant content from the client. System messages are never
@@ -436,6 +510,7 @@ export function buildMessages(
   projects: AskProject[],
   blocks: Array<{ hit: SearchHit; text: string }>,
   history: AskHistoryMessage[] = [],
+  retrievalAttempted = true,
 ): ChatMessage[] {
   const system = [
     'You are Ask, Noriq\'s concise and capable assistant.',
@@ -450,11 +525,14 @@ export function buildMessages(
   const byId = new Map(projects.map((p) => [p.id, p]));
   const context = blocks.length
     ? blocks.map((b) => `SOURCE_REF: ${sourceRef(b.hit, byId.get(b.hit.projectId))}\n${sourceLabel(b.hit, byId.get(b.hit.projectId))}\n${b.text}`).join('\n\n---\n\n')
-    : '(no matching project material was found)';
+    : '(search_noriq found no matching project material)';
+  const latest = retrievalAttempted
+    ? `PROJECT CONTEXT:\n\n${context}\n\n---\n\nCURRENT QUESTION: ${question}`
+    : `CURRENT QUESTION: ${question}`;
   return [
     { role: 'system', content: system },
     ...normalizeHistory(history),
-    { role: 'user', content: `PROJECT CONTEXT:\n\n${context}\n\n---\n\nCURRENT QUESTION: ${question}` },
+    { role: 'user', content: latest },
   ];
 }
 
@@ -462,12 +540,27 @@ export interface AskOptions {
   question: string;
   projects: AskProject[];
   history?: AskHistoryMessage[];
+  retrieval?: RetrievalDecisionClient | null;
+  onRetrieval?: () => void | Promise<void>;
 }
 
 export async function prepareQuestion(env: Env, opts: AskOptions): Promise<PreparedAsk> {
   const question = opts.question.trim().slice(0, MAX_QUESTION_CHARS);
+  const history = normalizeHistory(opts.history);
+  const retrieval = opts.retrieval === undefined ? retrievalDecisionClient(env) : opts.retrieval;
+  const retrievalQuery = await retrieval?.select(question, history) ?? null;
+  if (retrievalQuery === null) {
+    return {
+      messages: buildMessages(question, opts.projects, [], history, false),
+      sources: [],
+      mode: null,
+      model: GENERATION_MODEL,
+      graphEnhanced: false,
+    };
+  }
+  await opts.onRetrieval?.();
   const projectIds = opts.projects.map((p) => p.id);
-  const { mode, results, graphEnhanced } = await hybridAskSearch(env, question, projectIds);
+  const { mode, results, graphEnhanced } = await hybridAskSearch(env, retrievalQuery, projectIds);
   const blocks = await contextBlocks(env, results);
   const projects = new Map(opts.projects.map((p) => [p.id, p]));
   const sources: AskSource[] = results.flatMap((h) => {
@@ -493,7 +586,7 @@ export async function prepareQuestion(env: Env, opts: AskOptions): Promise<Prepa
     }] : [];
   });
   return {
-    messages: buildMessages(question, opts.projects, blocks, opts.history),
+    messages: buildMessages(question, opts.projects, blocks, history, true),
     sources,
     mode,
     model: GENERATION_MODEL,

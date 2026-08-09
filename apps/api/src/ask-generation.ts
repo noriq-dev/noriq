@@ -53,21 +53,31 @@ export async function runAskGeneration(env: Env, generationId: string): Promise<
   try {
     if (!await persist('searching', true)) return;
     const projects = await accessibleAskProjectsForUser(env, generation.userId);
+    let retrievalUsed = false;
     const prepared = await prepareQuestion(env, {
       question: generation.question,
       projects,
       history: generation.history,
+      onRetrieval: async () => {
+        retrievalUsed = true;
+        base.trace = ['Ask chose to search accessible Noriq evidence…'];
+        await persist('searching', true);
+      },
     });
     base.sources = prepared.sources;
     base.mode = prepared.mode;
     base.model = prepared.model;
     base.graphEnhanced = prepared.graphEnhanced;
-    const projectCount = new Set(prepared.sources.map((source) => source.projectId)).size;
-    const retrieval = `${prepared.mode}${prepared.graphEnhanced ? ' + graph' : ''}`;
-    base.trace = [
-      `Selected ${prepared.sources.length} ${retrieval} source${prepared.sources.length === 1 ? '' : 's'} across ${projectCount} project${projectCount === 1 ? '' : 's'}.`,
-      'Generating a grounded response…',
-    ];
+    if (retrievalUsed && prepared.mode) {
+      const projectCount = new Set(prepared.sources.map((source) => source.projectId)).size;
+      const retrieval = `${prepared.mode}${prepared.graphEnhanced ? ' + graph' : ''}`;
+      base.trace = [
+        `Ask used search_noriq and selected ${prepared.sources.length} ${retrieval} source${prepared.sources.length === 1 ? '' : 's'} across ${projectCount} project${projectCount === 1 ? '' : 's'}.`,
+        'Generating a grounded response…',
+      ];
+    } else {
+      base.trace = ['No Noriq evidence was needed for this response.', 'Generating a general response…'];
+    }
     if (!await persist('generating', true)) return;
 
     const result = await consumeAskGeneration(gen, prepared, {

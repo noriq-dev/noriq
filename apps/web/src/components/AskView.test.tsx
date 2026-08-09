@@ -86,7 +86,7 @@ describe('global Ask chat', () => {
     act(() => button('Send')!.click());
 
     expect(ask).toHaveBeenCalledWith('What is ready?', 'chat_active', expect.anything(), expect.any(AbortSignal));
-    expect(container.textContent).toContain('Searching sources, memories, and graph…');
+    expect(container.textContent).toContain('Thinking about what you asked…');
 
     act(() => {
       handlers!.onMeta({

@@ -347,7 +347,7 @@ export const api = {
   /** Global, multi-turn Ask chat. Project scope is derived server-side from the session; the
    *  browser sends conversation history but can never choose or broaden retrieval access. */
   ask: (question: string, history: ApiAskHistoryMessage[]) =>
-    req<{ answer: string; mode: 'semantic' | 'keyword'; model: string; graphEnhanced: boolean; sources: ApiAskSource[] }>(
+    req<{ answer: string; mode: 'semantic' | 'keyword' | null; model: string; graphEnhanced: boolean; sources: ApiAskSource[] }>(
       'POST', '/api/ask', { question, history }),
   askStream,
   resumeAskStream,

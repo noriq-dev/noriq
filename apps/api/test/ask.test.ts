@@ -5,8 +5,8 @@ import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import { createAgent, createUser, loginSession, mcpCall } from './helpers';
 import {
-  answerQuestion, askEventStream, buildMessages, extractFinishState, extractGeneratedText, extractReasoningSummaryDelta, extractStreamDelta,
-  generationClient, normalizeHistory, type ChatMessage, type GenerationClient, type PreparedAsk,
+  answerQuestion, askEventStream, buildMessages, extractFinishState, extractGeneratedText, extractReasoningSummaryDelta, extractRetrievalToolQuery, extractStreamDelta,
+  generationClient, normalizeHistory, retrievalDecisionClient, type ChatMessage, type GenerationClient, type PreparedAsk,
 } from '../src/ask';
 import type { SearchHit } from '../src/search';
 import type { Env } from '../src/env';
@@ -103,6 +103,32 @@ describe('Workers AI response adapters', () => {
     expect(extractFinishState({ type: 'response.completed', response: { status: 'completed' } })).toEqual({ finishReason: 'stop', truncated: false });
     expect(extractFinishState({ type: 'response.incomplete', response: { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } } }))
       .toEqual({ finishReason: 'max_output_tokens', truncated: true });
+  });
+
+  it('extracts search_noriq calls across Workers AI tool-call envelopes', () => {
+    expect(extractRetrievalToolQuery({ tool_calls: [{ name: 'search_noriq', arguments: { query: 'current release' } }] }))
+      .toBe('current release');
+    expect(extractRetrievalToolQuery({ choices: [{ message: { tool_calls: [{ function: {
+      name: 'search_noriq', arguments: '{"query":"memory decisions"}',
+    } }] } }] })).toBe('memory decisions');
+    expect(extractRetrievalToolQuery({ output: [{ type: 'function_call', name: 'search_noriq', arguments: '{"query":"runner state"}' }] }))
+      .toBe('runner state');
+    expect(extractRetrievalToolQuery({ choices: [{ message: { content: 'NO_SEARCH' } }] })).toBeNull();
+  });
+
+  it('offers search_noriq to the model and obeys its decision to use or skip it', async () => {
+    const inputs: unknown[] = [];
+    const toolClient = retrievalDecisionClient({ AI: { run: async (_model: string, input: unknown) => {
+      inputs.push(input);
+      return { choices: [{ message: { tool_calls: [{ function: { name: 'search_noriq', arguments: '{"query":"active runner"}' } }] } }] };
+    } } } as unknown as Env)!;
+    await expect(toolClient.select('How is RUN doing?', [])).resolves.toBe('active runner');
+    expect(inputs[0]).toEqual(expect.objectContaining({
+      tools: [expect.objectContaining({ type: 'function', function: expect.objectContaining({ name: 'search_noriq' }) })],
+    }));
+
+    const chatClient = retrievalDecisionClient({ AI: { run: async () => ({ choices: [{ message: { content: 'NO_SEARCH' } }] }) } } as unknown as Env)!;
+    await expect(chatClient.select('hello', [])).resolves.toBeNull();
   });
 
   it('turns upstream SSE into stable meta/status/delta/done events', async () => {
@@ -218,6 +244,7 @@ describe('answerQuestion (retrieval + fake generation)', () => {
     const { gen, calls } = fakeGen();
     const res = await answerQuestion(env as unknown as Env, gen, {
       question: 'payment retry backoff', projects: [{ id: projectId, key: 'ASK', name: 'askable' }],
+      retrieval: { async select() { return 'payment retry backoff'; } },
     });
     expect(res.mode).toBe('keyword'); // no embeddings backend in workerd tests
     expect(res.answer).toContain('Grounded');
@@ -240,17 +267,22 @@ describe('answerQuestion (retrieval + fake generation)', () => {
     const res = await answerQuestion(env as unknown as Env, gen, {
       question: 'quasar fallback provider brownouts',
       projects: [{ id: projectId, key: 'ASK', name: 'askable' }],
+      retrieval: { async select() { return 'quasar fallback provider brownouts'; } },
     });
     expect(res.sources.some((source) => source.kind === 'memory')).toBe(true);
     expect(calls[0]!.at(-1)!.content).toContain('Quasar fallback mode keeps payment retries below three attempts');
   });
 
-  it('still handles a general question when project retrieval has no matches', async () => {
-    const { gen } = fakeGen('A general answer.');
+  it('answers general chat without searching or attaching sources', async () => {
+    const { gen, calls } = fakeGen('A general answer.');
     const res = await answerQuestion(env as unknown as Env, gen, {
       question: 'zzznonexistenttermxyz', projects: [{ id: projectId, key: 'ASK', name: 'askable' }],
+      retrieval: { async select() { return null; } },
     });
     expect(res.sources).toHaveLength(0);
+    expect(res.mode).toBeNull();
+    expect(res.graphEnhanced).toBe(false);
+    expect(calls[0]!.at(-1)!.content).toBe('CURRENT QUESTION: zzznonexistenttermxyz');
     expect(res.answer).toContain('general answer');
   });
 });

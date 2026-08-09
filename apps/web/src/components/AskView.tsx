@@ -56,7 +56,7 @@ function GenerationActivity({ phase }: { phase: 'searching' | 'generating' }) {
   return (
     <div role="status" aria-live="polite" style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 10.5 }}>
       <WaveBars height={12} bars={3} />
-      <span>{phase === 'searching' ? 'Searching sources, memories, and graph…' : 'Generating with GPT-OSS 120B…'}</span>
+      <span>{phase === 'searching' ? 'Thinking about what you asked…' : 'Generating with GPT-OSS 120B…'}</span>
     </div>
   );
 }
@@ -398,8 +398,8 @@ export function AskView({ store }: { store: AppStore }) {
                   <div style={{ color: 'var(--accent)', fontSize: 28, lineHeight: 1, marginBottom: 16 }}>✦</div>
                   <h1 style={{ fontSize: 25, fontWeight: 700, letterSpacing: '-.025em', margin: '0 0 8px' }}>How can I help?</h1>
                   <div style={{ fontSize: 13, color: 'var(--text-mid)', lineHeight: 1.6 }}>
-                    Ask across tasks, docs, plans, durable memories, and their knowledge-graph connections.
-                    Answers keep their grounding sources.
+                    Chat normally, or ask about your tasks, docs, plans, durable memories, and graph connections.
+                    Ask searches Noriq only when the conversation needs current project evidence.
                   </div>
                   <div style={{ marginTop: 26, display: 'flex', flexDirection: 'column', gap: 8, textAlign: 'left' }}>
                     {EXAMPLES.map((example) => (
