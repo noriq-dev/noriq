@@ -135,8 +135,8 @@ for the components. (ARCHITECTURE.md calls it a "mock store" — that's stale; i
   `initialize` and in the modern `server/discover` result), the `playbook` array returned by
   `get_briefing` (same file), `SKILL_MD` ([skill.ts](apps/api/src/skill.ts), served at
   `/skill.md`), and `DOC_SKILL_MD` ([skill-docs.ts](apps/api/src/skill-docs.ts), the
-  doc-authoring contract — served at `/skill/docs.md`, as MCP resource
-  `noriq://skill/doc-authoring`, and via the `get_doc_guide` tool). The duplication is
+  doc-authoring contract — served at `/skill/docs.md` and as MCP resource
+  `noriq://skill/doc-authoring`). The duplication is
   intentional — the inline playbook spares a working agent a second fetch, and the skill is not
   registered as an MCP resource, so a bare "read the skill" pointer would dangle. **When you
   change the work-loop contract (claim/release, identity, planning, escalation), update
