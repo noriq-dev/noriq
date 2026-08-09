@@ -318,7 +318,7 @@ const WRITE: ToolHints = { readOnlyHint: false, destructiveHint: false, idempote
 const WRITE_IDEMPOTENT: ToolHints = { ...WRITE, idempotentHint: true };
 const TOOL_HINTS: Record<string, ToolHints> = {
   // reads
-  get_briefing: READ, my_updates: READ, list_projects: READ, get_project: READ, list_groups: READ, list_agents: READ,
+  get_briefing: READ, my_updates: READ, focus_project: READ, list_projects: READ, get_project: READ, list_groups: READ, list_agents: READ,
   get_task: READ, search_tasks: READ, semantic_search: READ, search_project_memory: READ, explain_project_area: READ, get_task_context: READ, tag_report: READ, next_claimable: READ, read_open_comments: READ, get_plans: READ, can_claim: READ,
   list_docs: READ, get_doc: READ, update_doc: WRITE_IDEMPOTENT, list_templates: READ, get_plan_doc: READ, update_plan_doc: WRITE_IDEMPOTENT,
   check_locks: READ, list_locks: READ,
@@ -553,6 +553,9 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         parentAgentId: z.string().optional().describe('If you are a sub-agent, the id of the agent that spawned you'),
       },
       tool(async ({ name, role, projectId, parentAgentId }) => {
+        if (projectId && agent.kind === 'agent') {
+          throw new Error('runner-owned agents are pinned to their run project and cannot change project focus');
+        }
         const token = await env.DB.prepare('SELECT user_id AS userId FROM oauth_tokens WHERE id = ?')
           .bind(opts.oauthTokenId).first<{ userId: string }>();
         if (!token) throw new Error('token not found');
@@ -591,6 +594,25 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           project: after?.projectId ?? null,
           parentAgentId: after?.parentAgentId ?? null,
           note: 'renamed — this identity now reads as that label; you were already this agent',
+        };
+      }),
+    );
+  }
+
+  if (opts.oauthTokenId && agent.kind === 'copilot') {
+    defineTool(
+      'focus_project',
+      'Set the active project for this roaming Copilot without claiming a task or renaming the identity. Use before read-only investigation, review, or planning in another project so get_briefing and my_updates carry that project\'s memory pulse, comments, broadcasts, and claimable work. A successful claim also moves Copilot focus automatically. Runner-owned agents never receive this tool because their run project is pinned.',
+      { projectId: z.string() },
+      tool(async ({ projectId }) => {
+        const before = await env.DB.prepare('SELECT project_id AS projectId FROM agents WHERE id = ?')
+          .bind(agent.id).first<{ projectId: string | null }>();
+        await env.DB.prepare("UPDATE agents SET project_id = ?, status = 'active', last_seen_at = ? WHERE id = ? AND kind = 'copilot'")
+          .bind(projectId, nowIso(), agent.id).run();
+        return {
+          previousProjectId: before?.projectId ?? null,
+          projectId,
+          nextAction: 'call get_briefing now to load this project\'s current state and memory pulse',
         };
       }),
     );
@@ -1702,9 +1724,16 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     tool(async ({ projectId, taskId }) => {
       const id = await resolveTaskId(env, projectId, taskId);
       const result = await room(env, projectId).claimTask(projectId, actor, id, agent.id);
-      // An agent that hasn't localized itself yet adopts the project it first works in.
-      await env.DB.prepare("UPDATE agents SET project_id = ?, status = 'active' WHERE id = ? AND project_id IS NULL")
-        .bind(projectId, agent.id).run();
+      // A Copilot roams: the task it successfully claimed is now its active project. A runner-
+      // owned agent is pinned by its run and may only adopt a project when an old pre-pin row is
+      // still null; it can never be moved across projects by this path.
+      if (agent.kind === 'copilot') {
+        await env.DB.prepare("UPDATE agents SET project_id = ?, status = 'active' WHERE id = ? AND kind = 'copilot'")
+          .bind(projectId, agent.id).run();
+      } else {
+        await env.DB.prepare("UPDATE agents SET project_id = ?, status = 'active' WHERE id = ? AND project_id IS NULL")
+          .bind(projectId, agent.id).run();
+      }
       // §19 (locked decision): the memory read happens HERE, after ProjectRoom already
       // committed the claim — never inside claimTask's own DO mutation — and a failure degrades
       // to no priorEffort block rather than touching the claim that already succeeded.
@@ -2531,7 +2560,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
  */
 export function mcpReferenceSpecs(): { tools: ToolSpec[]; resources: ResourceSpec[] } {
   const stubEnv = {} as Env;
-  const stubAgent: AgentIdentity = { id: 'stub', name: 'stub', role: 'worker' } as AgentIdentity;
+  const stubAgent: AgentIdentity = { id: 'stub', name: 'stub', role: 'worker', kind: 'copilot' } as AgentIdentity;
   const server = buildMcpServer(stubEnv, stubAgent, { oauthTokenId: 'stub' });
   return (server as unknown as { specs: { tools: ToolSpec[]; resources: ResourceSpec[] } }).specs;
 }
