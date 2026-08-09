@@ -30,13 +30,13 @@ import { onboarding } from './onboarding';
 import { z } from 'zod';
 import {
   listProjectRepositories, listRepositoryCheckouts, resolveRepositoryByKey, loadPriorEffort, searchHitToEvidenceItem,
-  getMemoryRegistry, memoryCapabilities, type ProjectMemoryStub,
+  getMemoryRegistry, memoryCapabilities, deriveRepositoryMemoryState, checkoutAssociationState, type ProjectMemoryStub,
 } from './lib/project-memory';
 import { renderEvidenceFrame, type EvidenceFrameItem } from './memory/evidence-frame';
 import { assembleContextPack } from './memory/context-pack';
 import { readBoundedBody, verifyBatchChecksum, decodeBatchRows, MAX_INGEST_BATCH_BYTES, INGEST_TOKEN_TTL_SECONDS } from './memory/ingest';
 import { normalizeVerificationReport } from './memory/verification';
-import { AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget, isTerminalRunStatus, normalizeProjectKey, IndexGenerationManifest } from '@noriq-dev/shared';
+import { AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget, isTerminalRunStatus, normalizeProjectKey, IndexGenerationManifest, ContextPackRole, type RunnerIndexCursor } from '@noriq-dev/shared';
 
 export { ProjectRoom } from './do/ProjectRoom';
 export { AgentSession } from './do/AgentSession';
@@ -1119,21 +1119,10 @@ app.get('/api/projects/:pid/memory/repositories', userAuth, async (c) => {
   const [repos, generations] = await Promise.all([listProjectRepositories(c.env, pid), memoryDO(c.env, pid).listIndexGenerations(pid)]);
   const withCheckouts = await Promise.all(repos.map(async (r) => {
     const checkouts = await listRepositoryCheckouts(c.env, r.id);
-    const repoGenerations = generations.filter((g) => g.repositoryKey === r.repositoryKey);
-    const activeGeneration = repoGenerations.find((g) => g.status === 'active') ?? null;
-    const stagedGenerations = repoGenerations
-      .filter((g) => g.status === 'staged')
-      .map((g) => ({ ...g, validated: !!g.sealedAt && g.validationProblems.length === 0 }));
-    // Stale: the repository has moved past the base the active generation was built from — a
-    // straight equality check over two already-stored values (PLNR-259's latestObservedBase,
-    // this generation's own baseId), never a derived age/threshold.
-    const stale = !!(activeGeneration && r.latestObservedBase && activeGeneration.baseId !== r.latestObservedBase);
-    // Failed ingest: either the D1 projection already says so, or a staged generation completed
-    // ingest (sealed) and failed its own validation — surfaced with the actual problems, not a
-    // bare boolean.
-    const failedStaged = stagedGenerations.find((g) => g.sealedAt && g.validationProblems.length > 0) ?? null;
-    const failedIngest = r.ingestStatus === 'failed' || !!failedStaged;
-    return { ...r, checkouts, activeGeneration, stagedGenerations, stale, failedIngest, failedIngestProblems: failedStaged?.validationProblems ?? [] };
+    // stale/failedIngest/activeGeneration/stagedGenerations: shared with the runner's agentAuth
+    // index-cursor read (PLNR-306, /api/runner-memory/index-cursor) so the two surfaces can never
+    // disagree on "is this index stale" — see deriveRepositoryMemoryState.
+    return { ...r, checkouts, ...deriveRepositoryMemoryState(r, generations) };
   }));
   return c.json({ repositories: withCheckouts });
 });
@@ -2097,24 +2086,32 @@ async function resolveRunnerRepos(
  * Associate each resolved repo's committed `repositoryKey` with its canonical project_repositories
  * row (PLNR-259, §4/§6) — the "one round trip" option: a checkout declares its key on the SAME
  * POST /api/runners (or heartbeat) call that already resolves projectKey -> projectId, rather than
- * a separate associate endpoint. Best-effort per repo: an unresolved project, a missing
- * repositoryKey, or an association ProjectRoom refuses (unknown key, conflicting checkout) is
- * skipped silently here — visible instead through GET /api/projects/:pid/memory/repositories —
- * because a checkout-association hiccup must never fail runner registration/heartbeat itself.
+ * a separate associate endpoint. Best-effort per repo: an unresolved project or a missing
+ * repositoryKey is skipped outright; a REFUSED association (unknown key, conflicting checkout —
+ * `associateCheckout` RETURNS `{associated:false, reason}` for both, it does not throw) is logged
+ * rather than discarded, so it is at least visible in the Worker's own logs even though this path
+ * has no actor to notify — the runner-facing surface is the agentAuth read in PLNR-306
+ * (/api/runner-memory/index-cursor), which reads the SAME live D1 state rather than this call's
+ * outcome. A THROW (malformed repositoryKey, e.g. a ckt_-prefixed value) is caught separately:
+ * registration/heartbeat must succeed regardless either way.
  */
 async function syncRepositoryCheckouts(env: Env, runnerId: string, repos: Array<z.infer<typeof RunnerRepo>>): Promise<void> {
   const sysActor: Actor = { kind: 'system', id: 'system', name: 'system' };
   for (const r of repos) {
     if (!r.projectId || !r.repositoryKey) continue;
     try {
-      await room(env, r.projectId).associateCheckout(r.projectId, sysActor, {
+      const result = await room(env, r.projectId).associateCheckout(r.projectId, sysActor, {
         repositoryKey: r.repositoryKey,
         runnerId,
         checkoutId: r.id,
       });
-    } catch {
-      // Malformed repositoryKey (e.g. a ckt_-prefixed value) — surfaced nowhere but ignored here;
-      // registration/heartbeat must succeed regardless.
+      if (!result.associated) {
+        console.warn(`checkout association refused for runner ${runnerId}, repositoryKey "${r.repositoryKey}": ${result.reason}`);
+      }
+    } catch (err) {
+      // Malformed repositoryKey (e.g. a ckt_-prefixed value) — registration/heartbeat must
+      // succeed regardless, but still worth a log line rather than a silent swallow.
+      console.warn(`checkout association threw for runner ${runnerId}, repositoryKey "${r.repositoryKey}": ${String(err)}`);
     }
   }
 }
@@ -3078,6 +3075,96 @@ app.post('/api/runner-ingest/capability', agentAuth, async (c) => {
     typ: 'ingest', pid: b.projectId, repositoryKey: b.repositoryKey, purpose: b.purpose, scopeId: b.scopeId, runnerId: b.runnerId, max, exp: expSec,
   });
   return c.json({ token, maxBytes: max, expiresAt: new Date(expSec * 1000).toISOString() });
+});
+
+// --- Runner-reachable (agentAuth) Project Memory READS (PLNR-306) -----------------------------
+// Every Project Memory read above (memory/repositories, memory/context, etc.) lives under
+// /api/projects/:pid/* (line 146), which runs userAuth before any route-level auth — a
+// Bearer-only daemon can never reach it (see the locked decision on index.ts:146 in this task's
+// executionSpec). These two routes give the runner daemon the read side RUN-213 (index cursor
+// reconciliation) and RUN-228 (context packs) need, OUTSIDE that subtree, with projectId in the
+// BODY — mirroring POST /api/runner-ingest/capability immediately above: the SAME two gates
+// (runner owned by this connection's user -> 404; tokenCanReachProject -> 403) in the SAME order,
+// then resolveRepositoryByKey's existing non-disclosing 404. Read-only: no capability minted, no
+// row written, no event emitted, ProjectRoom never touched.
+
+/** The two gates every runner-memory route below shares with POST /api/runner-ingest/capability.
+ *  Returns a Response to return as-is on failure, or null to proceed. */
+async function runnerMemoryGateDenied(c: Context<AppContext>, runnerId: string, projectId: string): Promise<Response | null> {
+  const conn = c.var.connection!;
+  const owned = await c.env.DB.prepare('SELECT id FROM runners WHERE id = ? AND owner_user_id = ?').bind(runnerId, conn.userId).first<{ id: string }>();
+  if (!owned) return c.json({ error: 'runner not found' }, 404);
+  if (!(await tokenCanReachProject(c.env, conn.tokenId, projectId))) {
+    return c.json({ error: 'runner is outside this connection’s authorized projects' }, 403);
+  }
+  return null;
+}
+
+const RunnerMemoryCursorBody = z.object({
+  projectId: z.string(),
+  repositoryKey: z.string(),
+  runnerId: z.string(),
+  // RunnerRepo.id — the runner-local checkout asking "is MY checkout associated?", not the
+  // canonical key (that's repositoryKey above).
+  checkoutId: z.string(),
+});
+
+// One round trip for RUN-213's whole reconciliation decision (unchanged / incremental / full /
+// incompatible-version / association-error): the active generation's baseId/branch/indexerVersion,
+// staged generations for a resume decision, and this checkout's own association state.
+// `stale`/`failedIngest`/the generation lists are computed by deriveRepositoryMemoryState — the
+// EXACT function GET /api/projects/:pid/memory/repositories uses — so the two surfaces can never
+// disagree on "is this index stale" (locked decision).
+app.post('/api/runner-memory/index-cursor', agentAuth, async (c) => {
+  const parsed = RunnerMemoryCursorBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid request', detail: parsed.error.issues }, 400);
+  const b = parsed.data;
+  const denied = await runnerMemoryGateDenied(c, b.runnerId, b.projectId);
+  if (denied) return denied;
+  const repo = await resolveRepositoryByKey(c.env, b.projectId, b.repositoryKey);
+  if (!repo) return c.json({ error: `no repository registered for key "${b.repositoryKey}" in this project` }, 404);
+  const generations = await memoryDO(c.env, b.projectId).listIndexGenerations(b.projectId);
+  const state = deriveRepositoryMemoryState(repo, generations);
+  const association = await checkoutAssociationState(c.env, repo.id, b.runnerId, b.checkoutId);
+  const cursor: RunnerIndexCursor = {
+    repositoryKey: repo.repositoryKey,
+    defaultBranch: repo.defaultBranch,
+    latestObservedBase: repo.latestObservedBase,
+    ...state,
+    association,
+  };
+  return c.json(cursor);
+});
+
+const RunnerMemoryContextBody = z.object({
+  projectId: z.string(),
+  runnerId: z.string(),
+  taskId: z.string(),
+  repositoryKey: z.string().optional(),
+  branch: z.string().optional(),
+  baseId: z.string().optional(),
+  role: ContextPackRole.optional(),
+  budgetTokens: z.number().int().positive().optional(),
+});
+
+// The agentAuth twin of POST /api/projects/:pid/memory/context (RUN-228) — same assembler, same
+// shape, reused unchanged. `role` defaults to 'build' (never the userAuth route's 'human' default
+// — a runner is never a browser, and 'human' would reweight section budgets toward the wrong
+// reader); pass an explicit `role` to override.
+app.post('/api/runner-memory/context', agentAuth, async (c) => {
+  const parsed = RunnerMemoryContextBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid request', detail: parsed.error.issues }, 400);
+  const b = parsed.data;
+  const denied = await runnerMemoryGateDenied(c, b.runnerId, b.projectId);
+  if (denied) return denied;
+  const task = await c.env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+    .bind(b.taskId, b.taskId, b.projectId).first<{ id: string }>();
+  if (!task) return c.json({ error: 'not found' }, 404);
+  const pack = await assembleContextPack(c.env, b.projectId, task.id, {
+    repositoryKey: b.repositoryKey, branch: b.branch, baseId: b.baseId,
+    role: b.role ?? 'build', tokenBudget: b.budgetTokens ?? null,
+  });
+  return c.json(pack);
 });
 
 /** Verify an ingest capability, or a Response to return as-is on failure. Every one of the five

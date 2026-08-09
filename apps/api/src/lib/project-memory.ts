@@ -3,7 +3,7 @@
 // Possessing or forging a project_repositories row grants nothing — the check below always
 // runs first, at the Worker boundary, before env.PROJECT_MEMORY.get() is ever called.
 import type { Env } from '../env';
-import type { ProjectMemoryHealth } from '../do/ProjectMemory';
+import type { ProjectMemoryHealth, IndexGenerationSummary } from '../do/ProjectMemory';
 import type { RankedHit } from '../memory/retrieval';
 import type { DuplicateWarning, EffortSummary } from '../memory/similar-effort';
 import type {
@@ -466,6 +466,66 @@ export async function listRepositoryCheckouts(env: Env, projectRepositoryId: str
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   }));
+}
+
+/** PLNR-259/273's per-repository derivation — `stale`/`failedIngest`/`activeGeneration`/
+ *  `stagedGenerations` computed from a repository row plus ITS OWN slice of
+ *  `listIndexGenerations()`. Shared by `GET /api/projects/:pid/memory/repositories` (userAuth,
+ *  human) and the runner's agentAuth index-cursor read (PLNR-306) so the two surfaces can never
+ *  answer "is this index stale" differently (locked decision — see PLNR-306's executionSpec).
+ *  `stale` stays the straight equality check over two already-stored values (activeGeneration's
+ *  own baseId vs the repository's latestObservedBase), never a derived age/threshold. */
+export interface RepositoryMemoryState {
+  activeGeneration: IndexGenerationSummary | null;
+  stagedGenerations: Array<IndexGenerationSummary & { validated: boolean }>;
+  stale: boolean;
+  failedIngest: boolean;
+  failedIngestProblems: string[];
+}
+
+export function deriveRepositoryMemoryState(repo: ProjectRepositoryRow, allGenerations: IndexGenerationSummary[]): RepositoryMemoryState {
+  const repoGenerations = allGenerations.filter((g) => g.repositoryKey === repo.repositoryKey);
+  const activeGeneration = repoGenerations.find((g) => g.status === 'active') ?? null;
+  const stagedGenerations = repoGenerations
+    .filter((g) => g.status === 'staged')
+    .map((g) => ({ ...g, validated: !!g.sealedAt && g.validationProblems.length === 0 }));
+  const stale = !!(activeGeneration && repo.latestObservedBase && activeGeneration.baseId !== repo.latestObservedBase);
+  const failedStaged = stagedGenerations.find((g) => g.sealedAt && g.validationProblems.length > 0) ?? null;
+  const failedIngest = repo.ingestStatus === 'failed' || !!failedStaged;
+  return { activeGeneration, stagedGenerations, stale, failedIngest, failedIngestProblems: failedStaged?.validationProblems ?? [] };
+}
+
+/**
+ * Whether ONE runner-local checkout (`RunnerRepo.id`) is associated with a canonical repository,
+ * derived LIVE from `repository_checkouts` (PLNR-306) — no new column, no migration (locked
+ * decision). A pure read, deliberately NOT `ProjectRoom.associateCheckout` (which writes/emits):
+ * this answers "what is true right now" without ever binding, rebinding, or touching ProjectRoom.
+ * Mirrors associateCheckout's own three-way read (unassociated / associated / conflict) so the
+ * two never disagree on what "conflict" means.
+ */
+export type CheckoutAssociationState =
+  | { state: 'not-associated' }
+  | { state: 'associated'; projectRepositoryId: string }
+  | { state: 'conflict'; projectRepositoryId: string; reason: string };
+
+export async function checkoutAssociationState(
+  env: Env,
+  projectRepositoryId: string,
+  runnerId: string,
+  checkoutId: string,
+): Promise<CheckoutAssociationState> {
+  const row = await env.DB.prepare(
+    'SELECT project_repository_id AS projectRepositoryId FROM repository_checkouts WHERE runner_id = ? AND checkout_id = ?',
+  ).bind(runnerId, checkoutId).first<{ projectRepositoryId: string }>();
+  if (!row) return { state: 'not-associated' };
+  if (row.projectRepositoryId !== projectRepositoryId) {
+    return {
+      state: 'conflict',
+      projectRepositoryId: row.projectRepositoryId,
+      reason: 'this checkout is already associated with a different repository — not rebinding',
+    };
+  }
+  return { state: 'associated', projectRepositoryId };
 }
 
 /** PLNR-273: the compact D1 registry row (migration 0069/0071/0073) projected for the operator
