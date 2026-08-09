@@ -34,6 +34,7 @@ export interface ApiAskStreamHandlers {
   onStatus?: (phase: 'searching' | 'generating') => void;
   onReasoning?: (text: string) => void;
   onDelta: (text: string) => void;
+  onCancelled?: () => void;
   onDone?: (result: { finishReason: string | null; truncated: boolean }) => void;
 }
 
@@ -101,6 +102,10 @@ async function consumeAskStream(res: Response, handlers: ApiAskStreamHandlers): 
     else if (event === 'reasoning' && typeof payload.text === 'string') handlers.onReasoning?.(payload.text);
     else if (event === 'delta' && typeof payload.text === 'string') handlers.onDelta(payload.text);
     else if (event === 'error') throw new Error(typeof payload.error === 'string' ? payload.error : 'Answer generation failed');
+    else if (event === 'cancelled') {
+      doneEvent = true;
+      handlers.onCancelled?.();
+    }
     else if (event === 'done') {
       doneEvent = true;
       handlers.onDone?.({
@@ -351,6 +356,8 @@ export const api = {
       'POST', '/api/ask', { question, history }),
   askStream,
   resumeAskStream,
+  cancelAskGeneration: (generationId: string) =>
+    req<{ ok: true; cancelled: true }>('POST', `/api/ask/generations/${generationId}/cancel`),
   askThreads: (archived = false) =>
     req<{ threads: ApiAskThread[] }>('GET', `/api/ask/threads${archived ? '?archived=1' : ''}`),
   askThread: (threadId: string) => req<ApiAskThreadDetail>('GET', `/api/ask/threads/${threadId}`),

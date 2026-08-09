@@ -169,6 +169,47 @@ describe('global Ask chat', () => {
     expect(container.textContent).toContain('Persisted continuation');
   });
 
+  it('keeps the composer editable, cancels the active generation, and copies full messages', async () => {
+    mockEmptyHistory();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+    const cancel = vi.spyOn(api, 'cancelAskGeneration').mockResolvedValue({ ok: true, cancelled: true });
+    vi.spyOn(api, 'askStream').mockImplementation(async (_question, _threadId, handlers, signal) => {
+      handlers.onGeneration?.({ id: 'askgen_cancel' });
+      handlers.onStatus?.('generating');
+      handlers.onDelta('Partial assistant response');
+      await new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+      });
+    });
+
+    mount();
+    await flush();
+    setTextarea('Original user prompt');
+    act(() => button('Send')!.click());
+    await flush();
+
+    const textarea = container.querySelector<HTMLTextAreaElement>('textarea')!;
+    expect(textarea.disabled).toBe(false);
+    setTextarea('Draft the next prompt');
+    expect(textarea.value).toBe('Draft the next prompt');
+    expect(button('Send')?.hasAttribute('disabled')).toBe(true);
+    expect(button('Cancel')).toBeTruthy();
+
+    await act(async () => button('Cancel')!.click());
+    await flush();
+    expect(cancel).toHaveBeenCalledWith('askgen_cancel');
+    expect(container.textContent).toContain('Response cancelled.');
+    expect(textarea.value).toBe('Draft the next prompt');
+
+    await act(async () => ariaButton('Copy user message')!.click());
+    await act(async () => ariaButton('Copy assistant message')!.click());
+    expect(writeText.mock.calls).toEqual([
+      ['Original user prompt'],
+      ['Partial assistant response'],
+    ]);
+  });
+
   it('archives, views, restores, and permanently deletes chats', async () => {
     vi.spyOn(api, 'askThreads').mockImplementation(async (archived = false) => ({ threads: archived ? [archivedThread] : [activeThread] }));
     vi.spyOn(api, 'askThread').mockImplementation(async (id) => detailFor(id === archivedThread.id ? archivedThread : activeThread));
@@ -259,5 +300,17 @@ describe('Ask SSE transport', () => {
     });
 
     expect(seen).toEqual(['thread:chat_1', 'meta:m:true', 'status:generating', 'reasoning:Summary', 'delta:Hello ', 'delta:world', 'done:stop:false']);
+  });
+
+  it('treats cancellation as a normal terminal stream event', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
+      'event: generation\ndata: {"id":"askgen_1"}\n\nevent: cancelled\ndata: {}\n\n',
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+    )));
+    const cancelled = vi.fn();
+    await api.resumeAskStream('askgen_1', { answer: 0, reasoning: 0 }, {
+      onMeta: () => {}, onDelta: () => {}, onCancelled: cancelled,
+    });
+    expect(cancelled).toHaveBeenCalledOnce();
   });
 });

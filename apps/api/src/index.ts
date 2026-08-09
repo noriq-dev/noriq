@@ -19,7 +19,8 @@ import {
   type AskProject,
 } from './ask';
 import {
-  askThreadHistory, createAskGeneration, createAskThread, deleteAskThread, getAskThread, listAskThreads, setAskThreadArchived,
+  ASK_GENERATION_CANCELLED, askThreadHistory, cancelAskGeneration, createAskGeneration, createAskThread,
+  deleteAskThread, getAskGeneration, getAskThread, listAskThreads, setAskThreadArchived,
 } from './ask-chats';
 import { accessibleAskProjectsForUser, askGenerationEventStream } from './ask-generation';
 import { verifyUploadToken, resolveUploadSecret, signIngestToken, verifyIngestToken, type IngestClaims } from './lib/upload-token';
@@ -1867,6 +1868,23 @@ app.post('/api/ask/stream', userAuth, async (c) => {
   } catch (e) {
     return c.json({ error: `answer generation failed: ${e instanceof Error ? e.message : 'unknown error'}` }, 502);
   }
+});
+
+app.post('/api/ask/generations/:generationId/cancel', userAuth, async (c) => {
+  const generationId = c.req.param('generationId')!;
+  const userId = c.var.user!.id;
+  const generation = await getAskGeneration(c.env.DB, generationId, userId);
+  if (!generation) return c.json({ error: 'generation not found' }, 404);
+  if (generation.status === 'failed' && generation.error === ASK_GENERATION_CANCELLED) {
+    return c.json({ ok: true, cancelled: true });
+  }
+  if (generation.status === 'completed' || generation.status === 'failed') {
+    return c.json({ error: 'generation is already finished' }, 409);
+  }
+  const cancelled = await cancelAskGeneration(c.env.DB, userId, generationId);
+  return cancelled
+    ? c.json({ ok: true, cancelled: true })
+    : c.json({ error: 'generation is already finished' }, 409);
 });
 
 app.get('/api/ask/generations/:generationId/stream', userAuth, async (c) => {

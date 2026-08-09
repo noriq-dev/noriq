@@ -11,7 +11,8 @@ import {
 import type { SearchHit } from '../src/search';
 import type { Env } from '../src/env';
 import {
-  completeAskGeneration, createAskGeneration, createAskThread, deleteAskThread, getAskGeneration, updateAskGeneration,
+  ASK_GENERATION_CANCELLED, cancelAskGeneration, completeAskGeneration, createAskGeneration, createAskThread,
+  deleteAskThread, getAskGeneration, getAskThread, updateAskGeneration,
 } from '../src/ask-chats';
 import { askGenerationEventStream } from '../src/ask-generation';
 
@@ -414,6 +415,58 @@ describe('REST /api/ask', () => {
     expect(detail.messages.filter((message) => message.role === 'assistant')).toEqual([
       expect.objectContaining({ generationId: generation.id, generationStatus: 'completed', content: 'durable answer' }),
     ]);
+    expect(detail.messages.map((message) => message.role)).toEqual(['user', 'assistant']);
+  });
+
+  it('orders legacy timestamp ties by insertion instead of randomized message id', async () => {
+    const owner = await createUser('ask-order@example.com', 'Ask Order', 'longenough1');
+    const thread = await createAskThread(env.DB, owner.id, 'Keep turns ordered');
+    const at = new Date().toISOString();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO ask_messages (id, thread_id, role, content, created_at)
+         VALUES ('msg_z_user', ?, 'user', 'Prompt first', ?)`,
+      ).bind(thread.id, at),
+      env.DB.prepare(
+        `INSERT INTO ask_messages (id, thread_id, role, content, created_at)
+         VALUES ('msg_a_assistant', ?, 'assistant', 'Answer second', ?)`,
+      ).bind(thread.id, at),
+    ]);
+
+    expect((await getAskThread(env.DB, owner.id, thread.id))?.messages.map(({ role, content }) => ({ role, content }))).toEqual([
+      { role: 'user', content: 'Prompt first' },
+      { role: 'assistant', content: 'Answer second' },
+    ]);
+  });
+
+  it('lets only the owner cancel an in-flight generation and preserves its partial message', async () => {
+    const owner = await createUser('ask-stop@example.com', 'Ask Stop', 'longenough1');
+    const ownerCookie = await loginSession('ask-stop@example.com', 'longenough1');
+    const thread = await createAskThread(env.DB, owner.id, 'Stop response');
+    const generation = await createAskGeneration(env.DB, owner.id, thread.id, 'Stop now', []);
+    await updateAskGeneration(env.DB, generation.id, {
+      status: 'generating', answer: 'Partial answer', reasoning: '', sources: [], trace: [],
+      mode: null, model: 'test-model', graphEnhanced: false,
+    });
+
+    const foreign = await SELF.fetch(`https://noriq.test/api/ask/generations/${generation.id}/cancel`, {
+      method: 'POST', headers: { Cookie: otherCookie },
+    });
+    expect(foreign.status).toBe(404);
+    const cancelled = await SELF.fetch(`https://noriq.test/api/ask/generations/${generation.id}/cancel`, {
+      method: 'POST', headers: { Cookie: ownerCookie },
+    });
+    expect(cancelled.status).toBe(200);
+    expect(await cancelled.json()).toEqual({ ok: true, cancelled: true });
+    expect(await cancelAskGeneration(env.DB, owner.id, generation.id)).toBe(false);
+    expect(await getAskGeneration(env.DB, generation.id, owner.id)).toMatchObject({
+      status: 'failed', error: ASK_GENERATION_CANCELLED, answer: 'Partial answer',
+    });
+
+    const replay = await new Response(askGenerationEventStream(env as unknown as Env, owner.id, generation.id)).text();
+    expect(replay).toContain('event: cancelled');
+    expect(replay).not.toContain('event: error');
+    expect((await getAskThread(env.DB, owner.id, thread.id))?.messages.at(-1)?.content).toBe('Partial answer');
   });
 
   it('deleting a chat removes the in-flight generation cancellation record', async () => {

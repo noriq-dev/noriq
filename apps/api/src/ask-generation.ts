@@ -1,7 +1,7 @@
 import type { Env } from './env';
 import { askOutputTokenLimit, consumeAskGeneration, prepareQuestion, streamingGenerationClient, type AskProject } from './ask';
 import {
-  completeAskGeneration, failAskGeneration, getAskGeneration, updateAskGeneration,
+  ASK_GENERATION_CANCELLED, completeAskGeneration, failAskGeneration, getAskGeneration, updateAskGeneration,
   type StoredAskGeneration,
 } from './ask-chats';
 import { USER_PROJECT_WHERE } from './lib/visibility';
@@ -161,6 +161,11 @@ export function askGenerationEventStream(
             return;
           }
           if (current.status === 'failed') {
+            if (current.error === ASK_GENERATION_CANCELLED) {
+              controller.enqueue(frame('cancelled', {}));
+              controller.close();
+              return;
+            }
             controller.enqueue(frame('error', { error: current.error ?? 'generation failed' }));
             controller.close();
             return;

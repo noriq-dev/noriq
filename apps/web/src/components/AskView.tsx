@@ -73,6 +73,7 @@ export function AskView({ store }: { store: AppStore }) {
   const [q, setQ] = useState('');
   const [phase, setPhase] = useState<'searching' | 'generating' | null>(null);
   const [error, setError] = useState('');
+  const [copiedMessage, setCopiedMessage] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -115,6 +116,11 @@ export function AskView({ store }: { store: AppStore }) {
     onDelta: (delta: string) => patchGeneration(generationRef.current, (message) => ({
       ...message,
       content: message.content + delta,
+    })),
+    onCancelled: () => patchGeneration(generationRef.current, (message) => ({
+      ...message,
+      generationStatus: 'failed',
+      generationError: 'Response cancelled.',
     })),
     onDone: () => patchGeneration(generationRef.current, (message) => ({
       ...message,
@@ -320,6 +326,35 @@ export function AskView({ store }: { store: AppStore }) {
     followScrollRef.current = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight <= 48;
   };
 
+  const cancelGeneration = async () => {
+    const active = [...messages].reverse().find((message) =>
+      message.generationId && ['pending', 'searching', 'generating'].includes(message.generationStatus ?? ''));
+    if (!active?.generationId) return;
+    setError('');
+    try {
+      await api.cancelAskGeneration(active.generationId);
+      abortRef.current?.abort();
+      abortRef.current = null;
+      patchGeneration(active.generationId, (message) => ({
+        ...message,
+        generationStatus: 'failed',
+        generationError: 'Response cancelled.',
+      }));
+      setPhase(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not cancel this response.');
+    }
+  };
+
+  const copyMessage = async (message: ThreadMessage, key: string) => {
+    try {
+      await navigator.clipboard.writeText(message.content);
+      setCopiedMessage(key);
+    } catch {
+      setError('Could not copy this message.');
+    }
+  };
+
   const openSource = (source: ApiAskSource) => {
     actions.selectProject(source.projectId);
     if (source.kind === 'task') actions.openTask(source.id);
@@ -334,6 +369,8 @@ export function AskView({ store }: { store: AppStore }) {
   };
 
   const visibleThreads = showArchived ? archivedThreads : threads;
+  const activeGeneration = [...messages].reverse().find((message) =>
+    message.generationId && ['pending', 'searching', 'generating'].includes(message.generationStatus ?? ''));
 
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg)' }}>
@@ -413,13 +450,22 @@ export function AskView({ store }: { store: AppStore }) {
 
               {messages.map((message, index) => {
                 const isStreaming = message.role === 'assistant' && index === messages.length - 1 && phase !== null;
+                const messageKey = message.id ?? message.generationId ?? `local-${index}`;
+                const copyLabel = `Copy ${message.role} message`;
                 return (
-                  <div key={message.id ?? index} style={{ marginBottom: 24 }}>
+                  <div key={messageKey} style={{ marginBottom: 24 }}>
                     {message.role === 'user' ? (
-                      <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
                         <div style={{ maxWidth: '82%', borderRadius: '14px 14px 4px 14px', background: 'var(--w-07)', border: '1px solid var(--w-08)', padding: '10px 13px', fontSize: 13.5, lineHeight: 1.55, whiteSpace: 'pre-wrap' }}>
                           {message.content}
                         </div>
+                        <button
+                          type="button"
+                          aria-label={copyLabel}
+                          title="Copy message"
+                          onClick={() => void copyMessage(message, messageKey)}
+                          style={{ marginTop: 5, cursor: 'pointer', color: 'var(--text-faint)', fontFamily: 'var(--mono)', fontSize: 8.5, padding: '2px 4px' }}
+                        >{copiedMessage === messageKey ? 'Copied' : 'Copy'}</button>
                       </div>
                     ) : (
                       <div style={{ display: 'flex', gap: 11, alignItems: 'flex-start' }}>
@@ -469,7 +515,23 @@ export function AskView({ store }: { store: AppStore }) {
                             {message.content ? <Markdown source={message.content} /> : phase && isStreaming ? <GenerationActivity phase={phase} /> : null}
                             {message.content && phase && isStreaming && <div style={{ marginTop: 9 }}><GenerationActivity phase={phase} /></div>}
                           </div>
-                          {(message.model || !isStreaming) && <div style={{ marginTop: 10, fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>{modelLabel(message.model)}</div>}
+                          {message.generationStatus === 'failed' && message.generationError && (
+                            <div style={{ marginTop: 9, color: message.generationError.toLowerCase().includes('cancelled') ? 'var(--text-dim)' : 'var(--red-soft)', fontSize: 11.5 }}>
+                              {message.generationError.toLowerCase().includes('cancelled') ? 'Response cancelled.' : message.generationError}
+                            </div>
+                          )}
+                          <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 10 }}>
+                            {(message.model || !isStreaming) && <div style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>{modelLabel(message.model)}</div>}
+                            <div style={{ flex: 1 }} />
+                            <button
+                              type="button"
+                              aria-label={copyLabel}
+                              title="Copy message"
+                              disabled={!message.content}
+                              onClick={() => void copyMessage(message, messageKey)}
+                              style={{ cursor: message.content ? 'pointer' : 'default', opacity: message.content ? 1 : 0.45, color: 'var(--text-faint)', fontFamily: 'var(--mono)', fontSize: 8.5, padding: '2px 4px' }}
+                            >{copiedMessage === messageKey ? 'Copied' : 'Copy'}</button>
+                          </div>
                         </div>
                       </div>
                     )}
@@ -483,12 +545,13 @@ export function AskView({ store }: { store: AppStore }) {
 
           <div style={{ flex: 'none', padding: '12px 24px 18px', background: 'linear-gradient(transparent, var(--bg) 22%)' }}>
             <div style={{ maxWidth: 800, margin: '0 auto', border: '1px solid var(--w-12)', borderRadius: 13, background: 'var(--card)', padding: '9px 10px 9px 13px', boxShadow: '0 10px 30px rgba(0,0,0,.12)' }}>
-              <textarea value={q} onChange={(event) => setQ(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void ask(); } }} placeholder={threadArchived ? 'Restore this chat to continue…' : 'Message Ask…'} rows={2} disabled={loading || historyLoading || threadArchived} style={{ boxSizing: 'border-box', width: '100%', background: 'transparent', border: 0, padding: '2px 0 6px', color: 'var(--text)', fontSize: 13.5, lineHeight: 1.5, resize: 'none', outline: 'none', fontFamily: 'inherit' }} />
+              <textarea value={q} onChange={(event) => setQ(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (!loading) void ask(); } }} placeholder={threadArchived ? 'Restore this chat to continue…' : 'Message Ask…'} rows={2} disabled={historyLoading || threadArchived} style={{ boxSizing: 'border-box', width: '100%', background: 'transparent', border: 0, padding: '2px 0 6px', color: 'var(--text)', fontSize: 13.5, lineHeight: 1.5, resize: 'none', outline: 'none', fontFamily: 'inherit' }} />
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                 <span style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>GPT-OSS 120B · CF</span>
                 <div style={{ flex: 1 }} />
                 <span style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>Shift+Enter for newline</span>
-                <Button onClick={() => void ask()} disabled={!q.trim() || loading || historyLoading || threadArchived}>{loading ? 'Thinking…' : 'Send'}</Button>
+                {loading && <Button variant="ghost" onClick={() => void cancelGeneration()} disabled={!activeGeneration?.generationId}>Cancel</Button>}
+                <Button onClick={() => void ask()} disabled={!q.trim() || loading || historyLoading || threadArchived}>Send</Button>
               </div>
             </div>
           </div>
