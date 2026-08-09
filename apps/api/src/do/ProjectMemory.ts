@@ -4167,12 +4167,22 @@ export class ProjectMemory extends DurableObject<Env> {
    * LIVE D1 coordination tables — never event replay — so a project whose event log predates
    * this task (or that the incremental projector never fully caught up on) still gains a
    * connected graph without hand-replaying its cursor from zero. Projects every task/plan/doc/
-   * milestone/agent this project currently has, plus the task<->plan (`phase_tasks`) and
-   * task<->doc (`task_docs`) relationships the board already knows — `applyCoordinationEvent`
-   * cannot draw these from a single event's payload (a `plan.created` event carries phase task
-   * COUNTS, not ids; there is no event at all for "this task was added to a plan/doc"), and a
-   * `ctx.storage.transactionSync` block cannot await a second D1 read mid-transaction, so this
-   * reads everything up front, then writes it all in ONE transaction.
+   * milestone/agent this project currently has, plus the task<->plan (`phase_tasks`), task<->doc
+   * (`task_docs`) and task<->task (`dependencies`, PLNR-322) relationships the board already
+   * knows — `applyCoordinationEvent` cannot draw the first two from a single event's payload (a
+   * `plan.created` event carries phase task COUNTS, not ids; there is no event at all for "this
+   * task was added to a plan/doc"), and a `ctx.storage.transactionSync` block cannot await a
+   * second D1 read mid-transaction, so this reads everything up front, then writes it all in ONE
+   * transaction.
+   *
+   * `dependencies` has no `project_id` (an edge is owned by the DEPENDENT task's project,
+   * CLAUDE.md) — the query below joins through `tasks` on the dependent side to select this
+   * project's rows the same way `externalDependentsOf`/`addDependency` do. A CROSS-PROJECT
+   * blocker needs no special case here: `depNodeId` (built from `tasks.results`, THIS project
+   * only) simply never contains a foreign blocker's id, so the `if (fromId && toId)` guard below
+   * skips it — the identical choice `mapCoordinationEvent`'s `dependency.added`/`.removed` arms
+   * make explicitly (see that function's doc comment), reached here by construction instead of a
+   * second check, so the two writers cannot silently drift on it.
    *
    * Deliberately does NOT touch `projector_cursor` — that stays `runProjector`'s own concern.
    * Every write here is idempotent (uri for nodes, the `(type, from, to)` triple for edges), so
@@ -4182,7 +4192,7 @@ export class ProjectMemory extends DurableObject<Env> {
   async rebuildProjection(projectId: string): Promise<{ nodesWritten: number; edgesWritten: number }> {
     await this.assertProjectId(projectId);
     const now = nowIso();
-    const [tasks, plans, docs, milestones, agents, taskPlanLinks, taskDocLinks] = await Promise.all([
+    const [tasks, plans, docs, milestones, agents, taskPlanLinks, taskDocLinks, taskDependencies] = await Promise.all([
       this.env.DB.prepare('SELECT id, title FROM tasks WHERE project_id = ?').bind(projectId).all<{ id: string; title: string }>(),
       this.env.DB.prepare('SELECT id, title FROM plans WHERE project_id = ?').bind(projectId).all<{ id: string; title: string }>(),
       this.env.DB.prepare('SELECT id, name FROM docs WHERE project_id = ?').bind(projectId).all<{ id: string; name: string }>(),
@@ -4196,6 +4206,10 @@ export class ProjectMemory extends DurableObject<Env> {
         `SELECT td.task_id AS taskId, td.doc_id AS docId FROM task_docs td
          JOIN tasks t ON t.id = td.task_id WHERE t.project_id = ?`,
       ).bind(projectId).all<{ taskId: string; docId: string }>(),
+      this.env.DB.prepare(
+        `SELECT d.task_id AS taskId, d.depends_on_task_id AS dependsOnId FROM dependencies d
+         JOIN tasks t ON t.id = d.task_id WHERE t.project_id = ?`,
+      ).bind(projectId).all<{ taskId: string; dependsOnId: string }>(),
     ]);
 
     let nodesWritten = 0;
@@ -4238,6 +4252,17 @@ export class ProjectMemory extends DurableObject<Env> {
         const toId = docNodeId.get(link.docId);
         if (fromId && toId) {
           this.linkGraphEdge('related_to', fromId, toId, now, 'coordination:task_docs');
+          edgesWritten++;
+        }
+      }
+      // PLNR-322: `depends_on`, dependent -> blocker (same direction `mapCoordinationEvent`'s
+      // `dependency.added` arm draws). `toId` is absent (guard skips) for a cross-project
+      // blocker, by construction — see this method's own doc comment.
+      for (const dep of taskDependencies.results) {
+        const fromId = taskNodeId.get(dep.taskId);
+        const toId = taskNodeId.get(dep.dependsOnId);
+        if (fromId && toId) {
+          this.linkGraphEdge('depends_on', fromId, toId, now, 'coordination:dependencies');
           edgesWritten++;
         }
       }

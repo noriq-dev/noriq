@@ -160,10 +160,11 @@ export interface CoordinationEventForProjection {
  * `applyCoordinationEvent`'s transaction (its projection write and cursor advance commit
  * together, and a `ctx.storage.transactionSync` block cannot await one). `task.created` is the
  * pre-existing arm (PLNR-247); `plan.created`/`doc.created`/`milestone.created` are PLNR-283;
- * `task.claimed`/`task.released` are PLNR-316. `agent.registered` is deliberately ABSENT — no
- * code anywhere in this repo ever emits it (see this task's execution spec: "project ...
- * milestones/agents WHERE AN EVENT EXISTS"), so there is nothing to hook. Agents still gain graph
- * nodes through `rebuildProjection`'s live D1 read, which needs no event at all; a `task.claimed`/
+ * `task.claimed`/`task.released` are PLNR-316; `dependency.added`/`dependency.removed`/
+ * `run.created` are PLNR-322. `agent.registered` is deliberately ABSENT — no code anywhere in
+ * this repo ever emits it (see this task's execution spec: "project ... milestones/agents WHERE
+ * AN EVENT EXISTS"), so there is nothing to hook. Agents still gain graph nodes through
+ * `rebuildProjection`'s live D1 read, which needs no event at all; a `task.claimed`/
  * `task.released` edge's agent endpoint is stubbed (labelled with its own id — no display name
  * rides either payload) until that reconciliation corrects it, same as any other stub. Every
  * other verb returns null — acknowledged (the cursor still advances past it), no projection —
@@ -176,27 +177,49 @@ export interface CoordinationEventForProjection {
  * `EXEMPT_NODE_TYPES`'s project/branch/revision/error — DOES have an addressable EntityRef arm
  * (`kind: 'unknown'`), so a milestone node stays independently retrievable by uri.
  *
- * PLNR-316 deliberately projects NO edge for `dependency.added`/`dependency.removed` or
- * `run.created`, despite this task's own body naming all three as verbs "already fully described
+ * PLNR-316 found it could NOT project an edge for `dependency.added`/`dependency.removed` or
+ * `run.created`, despite that task's own body naming all three as verbs "already fully described
  * by payloads the system emits TODAY" — verifying each payload at its ProjectRoom.ts emit site
- * (as the execution spec directs) shows that assumption is false for both:
- *   - `dependency.added`/`dependency.removed` (ProjectRoom.ts's `addDependency`/`removeDependency`)
- *     emit `{ key: task.key, dependsOn: dep.key, dependsOnProjectId? }` — the blocker is named
- *     ONLY by its display key. `getBlockerTask` has `dep.id` in scope at the emit call site; it is
- *     simply never serialized into the payload.
- *   - `run.created` (ProjectRoom.ts's `insertRun`) emits `{ kind, agentTool, repoRef, anchor:
- *     anchorType }` — `anchor` is the STRING 'task'|'plan', not the anchor's id. `anchorId` is
- *     likewise in scope at the emit call site and not serialized.
- * A `task`/`plan` node's uri is `noriq://{kind}/{id}` (see `buildEntityUri`) — built from the
- * entity's real D1 id, the same id every `*.created` event's `subjectId` already carries. Building
- * an edge endpoint from a KEY instead would mint a DIFFERENT uri (`noriq://task/{key}`) that can
- * never converge with the canonical id-keyed node `task.created`/`rebuildProjection` write for the
- * same task — a permanent orphan duplicate star, i.e. reintroducing this exact task's own bug
- * one level down, not fixing it. Rather than invent a field or silently skip with no trace, this
- * is a stated decision: both payloads need widening (an id alongside the existing key) before
- * their edges can be projected, and that widening is out of scope here (ProjectRoom.ts is owned
- * by a concurrent change in this tree, PLNR-318, widening `EventVerb`/`emit()` typing — payload
- * shape is a separate, deliberate follow-up).
+ * showed that assumption was false for both: the dependency verbs named the blocker only by its
+ * display key (`{ key, dependsOn, dependsOnProjectId? }`), and `run.created` named its anchor
+ * only by type (`{ kind, agentTool, repoRef, anchor: anchorType }`) — `dep.id`/`anchorId` were in
+ * scope at each emit call site but never serialized. Building an edge endpoint from a KEY or a
+ * bare TYPE STRING instead of an id would mint a uri (`noriq://task/{key}`, or no id-addressable
+ * uri at all) that can never converge with the canonical id-keyed node `task.created`/
+ * `rebuildProjection` write for the same entity — a permanent orphan duplicate star. PLNR-316
+ * correctly refused rather than invent a field or silently skip with no trace, and pinned the old
+ * payload shapes in regression tests.
+ *
+ * PLNR-322 is that widening: `ProjectRoom.ts` now serializes `dependsOnId` (alongside the
+ * unchanged `key`/`dependsOn`) and `anchorId` (alongside the unchanged `anchor`), so all three
+ * verbs project edges below, built from ids exactly like every other arm here.
+ *   - `dependency.added`/`dependency.removed` project a `depends_on` edge from the DEPENDENT task
+ *     (`ev.subjectId`) to its blocker (`payload.dependsOnId`) — link/unlink respectively — matching
+ *     the `dependencies` table's own `(task_id, depends_on_task_id)` direction (locked decision).
+ *     A CROSS-PROJECT blocker (`payload.dependsOnProjectId` present) projects NO edge (discretion,
+ *     chosen): this `ProjectMemory` DO is project-scoped, so a stub node for a foreign task would
+ *     be an unreachable star this project can never resolve, label, or repair. The widened id
+ *     still rides the payload either way — only the edge is skipped. `rebuildProjection` makes the
+ *     identical choice by construction (see its own doc comment) rather than by a second check
+ *     here, so the two writers cannot drift apart on this decision.
+ *   - `dependency.unblocked` is deliberately NOT projected (discretion, checked): its payload
+ *     (`ProjectRoom.ts`'s `onExternalBlockerSettled`) is `{ key, title, blockerKey }` — no id at
+ *     all, so it could not be widened the same way without a second follow-up. More fundamentally,
+ *     it names no relationship an edge should represent: the `depends_on` edge it would draw
+ *     already exists (written by the earlier `dependency.added`), and unblocking never removes a
+ *     `dependencies` row — a blocker finishing changes claim-gate READINESS, not graph structure.
+ *   - `run.created` projects its own `run` node (the `*.created` pattern every other arm here
+ *     follows) labelled `"<kind> run"` (payload carries no title), PLUS a `related_to` edge from
+ *     that run to its anchor (`payload.anchorId`/`payload.anchor`) when the run is anchored to a
+ *     task or plan — an unanchored run (`anchor`/`anchorId` both null) projects the node only.
+ *     `related_to` is the honest default edge type here (discretion) — no more specific verb
+ *     ("runs against", "targets") is in `MemoryEdgeType`, and adding one is out of scope (locked
+ *     decision: no new `MemoryEdgeType`). Deliberately NOT extended to `rebuildProjection`: that
+ *     rebuild does not project run nodes at all today (PLNR-263's `recordEpisode` is the only
+ *     other run-node writer, and only at episode ingest, well after `run.created`), so a
+ *     rebuild-vs-incremental convergence gap already exists for every run edge independent of
+ *     this change; closing it is a pre-existing gap, not one this task introduces, and is left
+ *     to whoever gives `rebuildProjection` run coverage.
  */
 export function mapCoordinationEvent(ev: CoordinationEventForProjection): CoordinationProjection | null {
   const label = (key: string): string => {
@@ -236,6 +259,39 @@ export function mapCoordinationEvent(ev: CoordinationEventForProjection): Coordi
       const task: ProjectedNodeDescriptor = { type: 'task', uri: buildEntityUri({ kind: 'task', id: ev.subjectId }), label: label('title') };
       const agent: ProjectedNodeDescriptor = { type: 'agent', uri: buildEntityUri({ kind: 'agent', id: agentId }), label: agentId };
       return { node: null, edges: [{ type: 'owned_by', from: task, to: agent, op: 'unlink', provenance: 'event:task.released' }] };
+    }
+    case 'dependency.added':
+    case 'dependency.removed': {
+      // PLNR-322: `dependsOnId` is the widened field (see this function's doc comment) —
+      // `dependsOn` stays the display key, used only as this stub's display label, same
+      // fallback-to-a-short-string idiom `task.claimed`'s agent endpoint already uses. A
+      // cross-project blocker (`dependsOnProjectId` present) projects no edge at all — chosen,
+      // not defaulted; `rebuildProjection`'s dependency loop makes the identical choice by only
+      // ever loading THIS project's tasks into its node map.
+      if (typeof ev.payload.dependsOnProjectId === 'string') return { node: null, edges: [] };
+      const dependsOnId = ev.payload.dependsOnId;
+      if (typeof dependsOnId !== 'string' || !dependsOnId) return null;
+      const task: ProjectedNodeDescriptor = { type: 'task', uri: buildEntityUri({ kind: 'task', id: ev.subjectId }), label: label('key') };
+      const blocker: ProjectedNodeDescriptor = { type: 'task', uri: buildEntityUri({ kind: 'task', id: dependsOnId }), label: label('dependsOn') };
+      const op = ev.verb === 'dependency.added' ? 'link' : 'unlink';
+      return { node: null, edges: [{ type: 'depends_on', from: task, to: blocker, op, provenance: `event:${ev.verb}` }] };
+    }
+    case 'run.created': {
+      // PLNR-322: a `run` node (this verb's own `*.created` arm), labelled `"<kind> run"` since
+      // the payload carries no title — the same naming `recordEpisode` already gives a run node
+      // elsewhere (ProjectMemory.ts). PLUS a `related_to` edge to the run's anchor, when it has
+      // one: `anchorId` is the widened field, `anchor` (the pre-existing type string) selects
+      // which node type the id resolves to.
+      const kind = ev.payload.kind;
+      const runLabel = typeof kind === 'string' && kind.trim() ? `${kind} run` : ev.subjectId;
+      const run: ProjectedNodeDescriptor = { type: 'run', uri: buildEntityUri({ kind: 'run', id: ev.subjectId }), label: runLabel };
+      const anchorType = ev.payload.anchor;
+      const anchorId = ev.payload.anchorId;
+      if ((anchorType !== 'task' && anchorType !== 'plan') || typeof anchorId !== 'string' || !anchorId) {
+        return { node: run, edges: [] };
+      }
+      const anchor: ProjectedNodeDescriptor = { type: anchorType, uri: buildEntityUri({ kind: anchorType, id: anchorId }), label: anchorId };
+      return { node: run, edges: [{ type: 'related_to', from: run, to: anchor, op: 'link', provenance: 'event:run.created' }] };
     }
     default:
       return null;

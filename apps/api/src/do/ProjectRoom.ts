@@ -1007,10 +1007,14 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.env.DB.prepare('INSERT OR IGNORE INTO dependencies (task_id, depends_on_task_id) VALUES (?, ?)')
         .bind(task.id, dep.id)
         .run();
-      // Same-project payload stays byte-identical to before; the cross-project fields ride
-      // only when the edge actually crosses, so existing feed renderers see nothing new.
+      // PLNR-322: `dependsOnId` (the blocker's real id) now rides alongside `dependsOn` (its
+      // display key) — the projector needs an id to build an edge endpoint that converges with
+      // the canonical `noriq://task/{id}` node `task.created` writes; a key-built uri never
+      // would. The existing `key`/`dependsOn` fields are untouched (locked decision: additive
+      // only), so existing feed renderers see nothing new. The cross-project field still rides
+      // only when the edge actually crosses.
       await this.emit(actor, 'dependency.added', 'task', task.id, {
-        key: task.key, dependsOn: dep.key,
+        key: task.key, dependsOn: dep.key, dependsOnId: dep.id,
         ...(dep.project_id !== projectId ? { dependsOnProjectId: dep.project_id } : {}),
       });
       return { ok: true };
@@ -1037,8 +1041,10 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.env.DB.prepare('DELETE FROM dependencies WHERE task_id = ? AND depends_on_task_id = ?')
         .bind(task.id, dep.id)
         .run();
+      // PLNR-322: same widening as addDependency's emit — `dependsOnId` alongside the
+      // unchanged `key`/`dependsOn` fields.
       await this.emit(actor, 'dependency.removed', 'task', task.id, {
-        key: task.key, dependsOn: dep.key,
+        key: task.key, dependsOn: dep.key, dependsOnId: dep.id,
         ...(dep.project_id !== projectId ? { dependsOnProjectId: dep.project_id } : {}),
       });
       return { ok: true };
@@ -3367,8 +3373,12 @@ export class ProjectRoom extends DurableObject<Env> {
       input.createdBy ?? actor.id, now, now,
       runnerId ? now : null,
     ).run();
+    // PLNR-322: `anchorId` rides alongside the existing `anchor` (type-only) field — the
+    // projector needs the anchor's real id to draw a run -> anchor edge; `anchor` itself is
+    // untouched (locked decision: additive only). `anchorId` mirrors `anchorType`'s nullability
+    // (an unanchored run carries neither).
     await this.emit(actor, 'run.created', 'run', id, {
-      kind: input.kind, agentTool: input.agentTool, repoRef: input.repoRef, anchor: anchorType,
+      kind: input.kind, agentTool: input.agentTool, repoRef: input.repoRef, anchor: anchorType, anchorId,
     });
     if (runnerId) await this.emit(actor, 'run.dispatched', 'run', id, { runnerId, to: 'dispatched' });
     return this.runToWire(await this.loadRun(id));

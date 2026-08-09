@@ -6,11 +6,20 @@
 import { env } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import type { Env } from '../src/env';
+import type { Actor, CreateRunInput, RunView } from '../src/do/ProjectRoom';
 import { createUser, mintTokenForUser, mcpCall } from './helpers';
 import { buildEntityUri } from '@noriq-dev/shared';
 import { mapCoordinationEvent } from '../src/memory/projection';
 
 const appEnv = env as unknown as Env;
+// The DurableObjectStub RPC type collapses CreateRun's RunView return to `never` (same reason
+// runs.test.ts hand-types it) — address ProjectRoom through a facade scoped to what these tests
+// need, not the whole surface.
+interface RoomRpc {
+  createRun(projectId: string, actor: Actor, input: CreateRunInput): Promise<RunView>;
+}
+const room = (projectId: string) => appEnv.PROJECT_ROOM.get(appEnv.PROJECT_ROOM.idFromName(projectId)) as unknown as RoomRpc;
+const SYSTEM_ACTOR: Actor = { kind: 'system', id: 'system', name: 'system' };
 
 interface IndexManifestInput {
   generationId: string; projectId: string; repositoryKey: string; branch: string; baseId: string;
@@ -403,21 +412,90 @@ describe('mapCoordinationEvent — pure mapping (PLNR-316)', () => {
     expect(mapCoordinationEvent({ verb: 'task.released', subjectId: 'task_abc', payload: { previousHolder: null } })).toBeNull();
   });
 
-  // Documented gap (see mapCoordinationEvent's own doc comment): both payloads name their
-  // second endpoint by KEY only, never by id, so no edge can be built that converges with the
-  // canonical id-keyed node `task.created`/`rebuildProjection` write for the same task. Locked
-  // in here so a future payload widening is a deliberate, visible change to this test, not a
-  // silent behavior change.
-  it('dependency.added projects nothing — payload names the blocker by key only, not by id', () => {
+  // PLNR-322: the payloads are widened with an id (`dependsOnId`/`anchorId`) alongside the
+  // pre-existing key/type fields — see mapCoordinationEvent's own doc comment for why PLNR-316
+  // could not build these edges from the OLD shape, and why the old shape is still accepted
+  // (the existing fields are untouched, additive only).
+  it('dependency.added projects a depends_on edge from the dependent task to its blocker, both keyed by id', () => {
+    const projected = mapCoordinationEvent({
+      verb: 'dependency.added', subjectId: 'task_abc', payload: { key: 'PM-1', dependsOn: 'PM-2', dependsOnId: 'task_def' },
+    });
+    expect(projected).toEqual({
+      node: null,
+      edges: [{
+        type: 'depends_on',
+        from: { type: 'task', uri: buildEntityUri({ kind: 'task', id: 'task_abc' }), label: 'PM-1' },
+        to: { type: 'task', uri: buildEntityUri({ kind: 'task', id: 'task_def' }), label: 'PM-2' },
+        op: 'link',
+        provenance: 'event:dependency.added',
+      }],
+    });
+  });
+
+  it('dependency.removed projects the SAME edge as an unlink', () => {
+    const projected = mapCoordinationEvent({
+      verb: 'dependency.removed', subjectId: 'task_abc', payload: { key: 'PM-1', dependsOn: 'PM-2', dependsOnId: 'task_def' },
+    });
+    expect(projected).toEqual({
+      node: null,
+      edges: [{
+        type: 'depends_on',
+        from: { type: 'task', uri: buildEntityUri({ kind: 'task', id: 'task_abc' }), label: 'PM-1' },
+        to: { type: 'task', uri: buildEntityUri({ kind: 'task', id: 'task_def' }), label: 'PM-2' },
+        op: 'unlink',
+        provenance: 'event:dependency.removed',
+      }],
+    });
+  });
+
+  it('dependency.added with no dependsOnId (pre-widening payload, defensive) projects nothing', () => {
     expect(mapCoordinationEvent({ verb: 'dependency.added', subjectId: 'task_abc', payload: { key: 'PM-1', dependsOn: 'PM-2' } })).toBeNull();
   });
 
-  it('dependency.removed projects nothing — same reason', () => {
-    expect(mapCoordinationEvent({ verb: 'dependency.removed', subjectId: 'task_abc', payload: { key: 'PM-1', dependsOn: 'PM-2' } })).toBeNull();
+  it('a CROSS-PROJECT dependency.added (dependsOnProjectId present) projects no edge — a foreign task would be an unreachable stub star', () => {
+    const projected = mapCoordinationEvent({
+      verb: 'dependency.added',
+      subjectId: 'task_abc',
+      payload: { key: 'PM-1', dependsOn: 'OTH-1', dependsOnId: 'task_foreign', dependsOnProjectId: 'prj_other' },
+    });
+    expect(projected).toEqual({ node: null, edges: [] });
   });
 
-  it('run.created projects nothing — payload names the anchor TYPE, not the anchor id', () => {
-    expect(mapCoordinationEvent({ verb: 'run.created', subjectId: 'run_abc', payload: { kind: 'build', agentTool: 'claude', repoRef: 'main', anchor: 'task' } })).toBeNull();
+  it('run.created projects its own run node, labelled by kind', () => {
+    const projected = mapCoordinationEvent({
+      verb: 'run.created', subjectId: 'run_abc', payload: { kind: 'build', agentTool: 'claude', repoRef: 'main', anchor: null, anchorId: null },
+    });
+    expect(projected).toEqual({
+      node: { type: 'run', uri: buildEntityUri({ kind: 'run', id: 'run_abc' }), label: 'build run' },
+      edges: [],
+    });
+  });
+
+  it('an anchored run.created ALSO projects a related_to edge from the run to its anchor task', () => {
+    const projected = mapCoordinationEvent({
+      verb: 'run.created', subjectId: 'run_abc', payload: { kind: 'build', agentTool: 'claude', repoRef: 'main', anchor: 'task', anchorId: 'task_anchor' },
+    });
+    expect(projected).toEqual({
+      node: { type: 'run', uri: buildEntityUri({ kind: 'run', id: 'run_abc' }), label: 'build run' },
+      edges: [{
+        type: 'related_to',
+        from: { type: 'run', uri: buildEntityUri({ kind: 'run', id: 'run_abc' }), label: 'build run' },
+        to: { type: 'task', uri: buildEntityUri({ kind: 'task', id: 'task_anchor' }), label: 'task_anchor' },
+        op: 'link',
+        provenance: 'event:run.created',
+      }],
+    });
+  });
+
+  it('a plan-anchored run.created edges to a plan node, not a task node', () => {
+    const projected = mapCoordinationEvent({
+      verb: 'run.created', subjectId: 'run_abc', payload: { kind: 'scope', agentTool: 'codex', repoRef: 'main', anchor: 'plan', anchorId: 'plan_anchor' },
+    });
+    expect(projected?.edges[0]?.to).toEqual({ type: 'plan', uri: buildEntityUri({ kind: 'plan', id: 'plan_anchor' }), label: 'plan_anchor' });
+  });
+
+  it('dependency.unblocked still projects nothing — no new relationship (the depends_on edge already exists; unblocking is a readiness change, not a graph change)', () => {
+    expect(mapCoordinationEvent({ verb: 'dependency.unblocked', subjectId: 'task_abc', payload: { key: 'PM-1', title: 'a task', blockerKey: 'PM-2' } })).toBeNull();
   });
 });
 
@@ -490,5 +568,160 @@ describe('applyCoordinationEvent draws edges end to end (PLNR-316)', () => {
     const second = await memory(projectId).runProjector(projectId);
     expect(second.applied).toBe(0);
     expect(await memory(projectId)._countEdges(projectId)).toBe(edgesAfterUnlink);
+  });
+});
+
+// PLNR-322: the widening PLNR-316 declined to guess at — ProjectRoom.ts now serializes
+// dependsOnId/anchorId, so dependency.added/removed and run.created draw real edges too, and
+// rebuildProjection is taught the same dependency edge so a repair rebuild does not drop it.
+describe('dependency.added/removed draw real depends_on edges end to end (PLNR-322)', () => {
+  it('add_dependency then the projector produces a depends_on edge from dependent to blocker; remove_dependency unlinks it', async () => {
+    const { token, projectId } = await newOwnedProject('pm-322-dep@example.com', 'PM322DP');
+    const dependent = await mcpCall(token, 'create_task', { projectId, title: 'dependent task', tags: ['pm-322'], allowNewTags: true });
+    if (dependent.isError) throw new Error(`create_task failed: ${dependent.text}`);
+    const blocker = await mcpCall(token, 'create_task', { projectId, title: 'blocker task', tags: ['pm-322'], allowNewTags: true });
+    if (blocker.isError) throw new Error(`create_task failed: ${blocker.text}`);
+    const dependentId = dependent.body.id as string;
+    const blockerId = blocker.body.id as string;
+
+    const add = await mcpCall(token, 'add_dependency', { projectId, taskId: dependentId, dependsOnTaskId: blockerId });
+    if (add.isError) throw new Error(`add_dependency failed: ${add.text}`);
+
+    const applied = await memory(projectId).runProjector(projectId);
+    expect(applied.applied).toBeGreaterThan(0);
+
+    const dependentUri = buildEntityUri({ kind: 'task', id: dependentId });
+    const blockerUri = buildEntityUri({ kind: 'task', id: blockerId });
+    const neighborhood = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: dependentUri, edgeTypes: ['depends_on'] });
+    expect(neighborhood.downstream.map((n) => n.uri)).toEqual([blockerUri]);
+    expect(await memory(projectId)._edgeProvenance(projectId, 'depends_on', dependentUri, blockerUri)).toBe('event:dependency.added');
+
+    const remove = await mcpCall(token, 'remove_dependency', { projectId, taskId: dependentId, dependsOnTaskId: blockerId });
+    if (remove.isError) throw new Error(`remove_dependency failed: ${remove.text}`);
+    const edgesBeforeUnlink = await memory(projectId)._countEdges(projectId);
+    const secondApplied = await memory(projectId).runProjector(projectId);
+    expect(secondApplied.applied).toBeGreaterThan(0);
+
+    const afterRemove = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: dependentUri, edgeTypes: ['depends_on'] });
+    expect(afterRemove.downstream).toEqual([]);
+    expect(await memory(projectId)._countEdges(projectId)).toBe(edgesBeforeUnlink - 1);
+  });
+
+  it('a CROSS-PROJECT dependency projects no edge in either project\'s graph — discretion: skip (a foreign task would be an unreachable stub star)', async () => {
+    // Same owning user for both projects (dependencies.test.ts's own cross-project pattern) —
+    // add_dependency's access check is per-USER project membership, not per-token/session.
+    const a = await newOwnedProject('pm-322-cross@example.com', 'PM322CA');
+    const dependent = await mcpCall(a.token, 'create_task', { projectId: a.projectId, title: 'cross-project dependent', tags: ['pm-322'], allowNewTags: true });
+    if (dependent.isError) throw new Error(`create_task failed: ${dependent.text}`);
+    const dependentId = dependent.body.id as string;
+
+    const other = await mcpCall(a.token, 'create_project', { key: 'PM322CB', name: 'PM322CB project' });
+    if (other.isError) throw new Error(`create_project failed: ${other.text}`);
+    const otherProjectId = other.body.id as string;
+    const blocker = await mcpCall(a.token, 'create_task', { projectId: otherProjectId, title: 'cross-project blocker', tags: ['pm-322'], allowNewTags: true });
+    if (blocker.isError) throw new Error(`create_task failed: ${blocker.text}`);
+    const blockerId = blocker.body.id as string;
+
+    const add = await mcpCall(a.token, 'add_dependency', { projectId: a.projectId, taskId: dependentId, dependsOnTaskId: blockerId });
+    if (add.isError) throw new Error(`add_dependency failed: ${add.text}`);
+
+    const edgesBefore = await memory(a.projectId)._countEdges(a.projectId);
+    const applied = await memory(a.projectId).runProjector(a.projectId);
+    expect(applied.applied).toBeGreaterThan(0); // the event WAS consumed — just projected no edge
+    expect(await memory(a.projectId)._countEdges(a.projectId)).toBe(edgesBefore);
+
+    const dependentUri = buildEntityUri({ kind: 'task', id: dependentId });
+    const neighborhood = await memory(a.projectId).dependencyNeighborhood(a.projectId, { entityUri: dependentUri, edgeTypes: ['depends_on'] });
+    expect(neighborhood.downstream).toEqual([]);
+
+    // rebuildProjection makes the identical choice — convergence, not just the incremental path.
+    const rebuilt = await memory(a.projectId).rebuildProjection(a.projectId);
+    expect(rebuilt.edgesWritten).toBe(0);
+  });
+
+  it('rebuildProjection produces the SAME depends_on edge the incremental path does, so a rebuild after incremental projection adds nothing new', async () => {
+    const { token, projectId } = await newOwnedProject('pm-322-converge@example.com', 'PM322CV');
+    const dependent = await mcpCall(token, 'create_task', { projectId, title: 'converge dependent', tags: ['pm-322'], allowNewTags: true });
+    if (dependent.isError) throw new Error(`create_task failed: ${dependent.text}`);
+    const blocker = await mcpCall(token, 'create_task', { projectId, title: 'converge blocker', tags: ['pm-322'], allowNewTags: true });
+    if (blocker.isError) throw new Error(`create_task failed: ${blocker.text}`);
+    const dependentId = dependent.body.id as string;
+    const blockerId = blocker.body.id as string;
+    const add = await mcpCall(token, 'add_dependency', { projectId, taskId: dependentId, dependsOnTaskId: blockerId });
+    if (add.isError) throw new Error(`add_dependency failed: ${add.text}`);
+
+    // Incremental first.
+    await memory(projectId).runProjector(projectId);
+    const dependentUri = buildEntityUri({ kind: 'task', id: dependentId });
+    const blockerUri = buildEntityUri({ kind: 'task', id: blockerId });
+    expect((await memory(projectId).dependencyNeighborhood(projectId, { entityUri: dependentUri, edgeTypes: ['depends_on'] })).downstream.map((n) => n.uri)).toEqual([blockerUri]);
+    const edgesAfterIncremental = await memory(projectId)._countEdges(projectId);
+
+    // A rebuild after incremental projection adds no NEW edge (stated acceptance) — the edge's
+    // provenance stays the incremental writer's, since linkGraphEdge writes provenance only once.
+    const rebuilt = await memory(projectId).rebuildProjection(projectId);
+    expect(rebuilt.edgesWritten).toBeGreaterThan(0); // the rebuild still WROTE (attempted) the edge...
+    expect(await memory(projectId)._countEdges(projectId)).toBe(edgesAfterIncremental); // ...but nothing NEW landed
+    expect(await memory(projectId)._edgeProvenance(projectId, 'depends_on', dependentUri, blockerUri)).toBe('event:dependency.added');
+  });
+
+  it('rebuildProjection alone (no incremental projector run) still produces the depends_on edge, tagged with its own provenance', async () => {
+    const { token, projectId } = await newOwnedProject('pm-322-rebuild-only@example.com', 'PM322RO');
+    const dependent = await mcpCall(token, 'create_task', { projectId, title: 'rebuild-only dependent', tags: ['pm-322'], allowNewTags: true });
+    if (dependent.isError) throw new Error(`create_task failed: ${dependent.text}`);
+    const blocker = await mcpCall(token, 'create_task', { projectId, title: 'rebuild-only blocker', tags: ['pm-322'], allowNewTags: true });
+    if (blocker.isError) throw new Error(`create_task failed: ${blocker.text}`);
+    const dependentId = dependent.body.id as string;
+    const blockerId = blocker.body.id as string;
+    const add = await mcpCall(token, 'add_dependency', { projectId, taskId: dependentId, dependsOnTaskId: blockerId });
+    if (add.isError) throw new Error(`add_dependency failed: ${add.text}`);
+
+    const rebuilt = await memory(projectId).rebuildProjection(projectId);
+    expect(rebuilt.edgesWritten).toBeGreaterThan(0);
+    const dependentUri = buildEntityUri({ kind: 'task', id: dependentId });
+    const blockerUri = buildEntityUri({ kind: 'task', id: blockerId });
+    expect((await memory(projectId).dependencyNeighborhood(projectId, { entityUri: dependentUri, edgeTypes: ['depends_on'] })).downstream.map((n) => n.uri)).toEqual([blockerUri]);
+    expect(await memory(projectId)._edgeProvenance(projectId, 'depends_on', dependentUri, blockerUri)).toBe('coordination:dependencies');
+  });
+});
+
+describe('run.created draws a run node and a related_to edge to its anchor end to end (PLNR-322)', () => {
+  it('a task-anchored run projects a run node and an edge to the task', async () => {
+    const { token, projectId } = await newOwnedProject('pm-322-run@example.com', 'PM322RN');
+    const task = await mcpCall(token, 'create_task', { projectId, title: 'anchor task', tags: ['pm-322'], allowNewTags: true });
+    if (task.isError) throw new Error(`create_task failed: ${task.text}`);
+    const taskId = task.body.id as string;
+
+    const run = await room(projectId).createRun(projectId, SYSTEM_ACTOR, {
+      kind: 'build', repoRef: 'repo_a', agentTool: 'claude', anchor: { type: 'task', id: taskId },
+    } as CreateRunInput);
+
+    const applied = await memory(projectId).runProjector(projectId);
+    expect(applied.applied).toBeGreaterThan(0);
+
+    const runUri = buildEntityUri({ kind: 'run', id: run.id });
+    const taskUri = buildEntityUri({ kind: 'task', id: taskId });
+    const neighborhood = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: runUri, edgeTypes: ['related_to'] });
+    expect(neighborhood.downstream.map((n) => n.uri)).toEqual([taskUri]);
+    expect(await memory(projectId)._edgeProvenance(projectId, 'related_to', runUri, taskUri)).toBe('event:run.created');
+
+    // The run node itself is independently addressable (not just a dangling edge endpoint).
+    const runAsSeed = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: runUri });
+    expect(runAsSeed.coverage.reasons).not.toContain('seed-not-found');
+  });
+
+  it('an UNANCHORED run projects just the run node, no edge', async () => {
+    const { projectId } = await newOwnedProject('pm-322-run-bare@example.com', 'PM322RB');
+    const run = await room(projectId).createRun(projectId, SYSTEM_ACTOR, {
+      kind: 'scope', repoRef: 'repo_a', agentTool: 'codex',
+    } as CreateRunInput);
+
+    const edgesBefore = await memory(projectId)._countEdges(projectId);
+    await memory(projectId).runProjector(projectId);
+    expect(await memory(projectId)._countEdges(projectId)).toBe(edgesBefore);
+
+    const runUri = buildEntityUri({ kind: 'run', id: run.id });
+    const runAsSeed = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: runUri });
+    expect(runAsSeed.coverage.reasons).not.toContain('seed-not-found');
   });
 });
