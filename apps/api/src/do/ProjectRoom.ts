@@ -974,7 +974,12 @@ export class ProjectRoom extends DurableObject<Env> {
         // Any transition out of active work releases the task's file locks (§5 auto-release) — this
         // is the supervisor-override settlement path, distinct from releaseTask.
         if (patch.status !== 'in_progress') await this.releaseLocksForTask(taskId, actor, `status → ${patch.status}`);
-        await this.emit(actor, 'task.status_changed', 'task', taskId, { key: task.key, from: task.status, to: patch.status, title: task.title });
+        await this.emit(actor, 'task.status_changed', 'task', taskId, {
+          key: task.key, from: task.status, to: patch.status, title: task.title,
+          ...((patch.status === 'done' || patch.status === 'cancelled' || patch.status === 'todo') && task.claimed_by
+            ? { previousHolder: task.claimed_by }
+            : {}),
+        });
         // The second way a task reaches done — a supervisor override rather than an agent
         // releasing it. Both paths need the hook or a plan finished by hand would never open its
         // merge request. `cancelled` counts too: a plan whose last open task was explicitly
@@ -1842,6 +1847,7 @@ export class ProjectRoom extends DurableObject<Env> {
       }
       await this.emit(actor, 'signal.raised', task ? 'task' : 'project', task?.id ?? this.projectId, {
         signalId: id, sigType: input.type, severity, title: input.title, taskKey: task?.key ?? null, parked,
+        ...(parked && task?.claimed_by ? { previousHolder: task.claimed_by } : {}),
         ...(blocking ? {} : { blocking: false }),
       });
       // Out-of-band delivery (PLNR-120): a blocking decision or a critical alert must
@@ -2547,9 +2553,9 @@ export class ProjectRoom extends DurableObject<Env> {
       ).bind(task.id, task.id).first<{ n: number }>())!;
       // Doc links are project-local (docs live in the source project) — severed, unlike deps.
       // PLNR-319: the actual ids (not just a count) so the severed relationships can be
-      // unlinked from THIS project's memory graph below — a moved task's phase/doc edges here
-      // would otherwise dangle forever (rebuildProjection only ever ADDS present links; it
-      // never removes ones D1 no longer has).
+      // unlinked from THIS project's memory graph immediately. Rebuild can also remove stale
+      // projector-owned links later, but the event path keeps the graph current without waiting
+      // for an operator repair.
       const { results: severedDocs } = await this.env.DB.prepare(
         'SELECT doc_id AS docId FROM task_docs WHERE task_id = ?',
       ).bind(task.id).all<{ docId: string }>();
@@ -4336,6 +4342,10 @@ export class ProjectRoom extends DurableObject<Env> {
     // requeued — the two states are byte-identical, so admitting one admits reversing the other.
     // The fix for the never-claimed case belongs where the gap is: the DAEMON takes the claim when
     // the run starts, instead of the run's authority resting on the agent remembering to.
+    const hadRunClaim = agentId
+      ? !!(await this.env.DB.prepare('SELECT 1 AS one FROM tasks WHERE id = ? AND claimed_by = ?')
+        .bind(taskId, agentId).first<{ one: number }>())
+      : false;
     const clear = 'claimed_by = NULL, claim_expires_at = NULL';
     // Built as ONE statement so there is exactly one place that can notice it changed nothing.
     let set: string;
@@ -4376,6 +4386,11 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.env.DB.prepare(
         'UPDATE claims SET released_at = ? WHERE task_id = ? AND agent_id = ? AND released_at IS NULL',
       ).bind(now, taskId, agentId).run();
+    }
+    if (agentId && hadRunClaim) {
+      await this.emit(SYSTEM_ACTOR, 'task.released', 'task', taskId, {
+        previousHolder: agentId, reason: `run settled: ${outcome}`,
+      });
     }
     // The run is settling this task — release its file locks too (§5 auto-release).
     await this.releaseLocksForTask(taskId, SYSTEM_ACTOR, `run settled: ${outcome}`);
@@ -4678,8 +4693,9 @@ export class ProjectRoom extends DurableObject<Env> {
       const action = phaseGateDecision(attempts, passed, opts.maxAttempts ?? DEFAULT_MAX_VERIFY_ATTEMPTS);
 
       const { results: tasks } = await this.env.DB.prepare(
-        'SELECT t.id, t.key, t.status FROM phase_tasks pt JOIN tasks t ON t.id = pt.task_id WHERE pt.phase_id = ?',
-      ).bind(phaseId).all<{ id: string; key: string; status: string }>();
+        `SELECT t.id, t.key, t.status, t.claimed_by AS claimedBy
+         FROM phase_tasks pt JOIN tasks t ON t.id = pt.task_id WHERE pt.phase_id = ?`,
+      ).bind(phaseId).all<{ id: string; key: string; status: string; claimedBy: string | null }>();
 
       let gateStatus: string;
       if (action === 'advance') {
@@ -4694,7 +4710,10 @@ export class ProjectRoom extends DurableObject<Env> {
         for (const t of tasks) {
           if (t.status !== 'review' && t.status !== 'blocked') continue;
           await this.env.DB.prepare("UPDATE tasks SET status = 'todo', claimed_by = NULL, claim_expires_at = NULL, updated_at = ? WHERE id = ?").bind(now, t.id).run();
-          await this.emit(actor, 'task.status_changed', 'task', t.id, { key: t.key, from: t.status, to: 'todo', reason: 'verify_failed_retry' });
+          await this.emit(actor, 'task.status_changed', 'task', t.id, {
+            key: t.key, from: t.status, to: 'todo', reason: 'verify_failed_retry',
+            ...(t.claimedBy ? { previousHolder: t.claimedBy } : {}),
+          });
         }
       } else {
         // escalate — stop auto-retrying, raise an alert for a human (inline insert

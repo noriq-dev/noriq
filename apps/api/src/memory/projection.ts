@@ -173,12 +173,12 @@ export interface CoordinationEventForProjection {
  * `applyCoordinationEvent`'s transaction (its projection write and cursor advance commit
  * together, and a `ctx.storage.transactionSync` block cannot await one). `task.created` is the
  * pre-existing arm (PLNR-247); `plan.created`/`doc.created`/`milestone.created` are PLNR-283;
- * `task.claimed`/`task.released` are PLNR-316; `dependency.added`/`dependency.removed`/
+ * `task.claimed` and the claim-ending/handoff verbs are PLNR-316; `dependency.added`/`dependency.removed`/
  * `run.created` are PLNR-322. `agent.registered` is deliberately ABSENT — no code anywhere in
  * this repo ever emits it (see this task's execution spec: "project ... milestones/agents WHERE
  * AN EVENT EXISTS"), so there is nothing to hook. Agents still gain graph nodes through
- * `rebuildProjection`'s live D1 read, which needs no event at all; a `task.claimed`/
- * `task.released` edge's agent endpoint is stubbed (labelled with its own id — no display name
+ * `rebuildProjection`'s live D1 read, which needs no event at all; a claim edge's agent endpoint
+ * is stubbed (labelled with its own id — no display name
  * rides either payload) until that reconciliation corrects it, same as any other stub. Every
  * other verb returns null — acknowledged (the cursor still advances past it), no projection —
  * exactly the original task.created-only projector's posture, widened rather than replaced
@@ -310,9 +310,12 @@ export function mapCoordinationEvent(ev: CoordinationEventForProjection): Coordi
       const agent: ProjectedNodeDescriptor = { type: 'agent', uri: buildEntityUri({ kind: 'agent', id: agentId }), label: agentId };
       return { node: null, edges: [{ type: 'owned_by', from: task, to: agent, op: 'link', provenance: 'event:task.claimed' }] };
     }
-    case 'task.released': {
-      // `previousHolder` is `task.claimed_by` READ BEFORE `releaseTask`'s own UPDATE clears it
-      // (ProjectRoom.ts), so it names the agent whose claim is ending — never `by` (the actor
+    case 'task.released':
+    case 'task.requeued':
+    case 'task.status_changed':
+    case 'signal.raised': {
+      // `previousHolder` is `task.claimed_by` read before the corresponding ProjectRoom update
+      // clears it, so it names the agent whose claim is ending — never `by` (the actor
       // performing the release, which may be a human overriding another agent's claim, PLNR-116).
       // Discretion: released UNLINKS rather than leaving a stale "still held" edge — `owned_by`
       // here means "currently holds", a live coordination fact, not a historical one (that record
@@ -322,7 +325,26 @@ export function mapCoordinationEvent(ev: CoordinationEventForProjection): Coordi
       if (typeof agentId !== 'string' || !agentId) return null;
       const task: ProjectedNodeDescriptor = { type: 'task', uri: buildEntityUri({ kind: 'task', id: ev.subjectId }), label: label('title') };
       const agent: ProjectedNodeDescriptor = { type: 'agent', uri: buildEntityUri({ kind: 'agent', id: agentId }), label: agentId };
-      return { node: null, edges: [{ type: 'owned_by', from: task, to: agent, op: 'unlink', provenance: 'event:task.released' }] };
+      return { node: null, edges: [{ type: 'owned_by', from: task, to: agent, op: 'unlink', provenance: `event:${ev.verb}` }] };
+    }
+    case 'task.handed_off': {
+      const task: ProjectedNodeDescriptor = { type: 'task', uri: buildEntityUri({ kind: 'task', id: ev.subjectId }), label: label('title') };
+      const edges: ProjectedEdgeDescriptor[] = [];
+      const previousHolder = ev.payload.previousHolder;
+      if (typeof previousHolder === 'string' && previousHolder) {
+        const previousAgent: ProjectedNodeDescriptor = {
+          type: 'agent', uri: buildEntityUri({ kind: 'agent', id: previousHolder }), label: previousHolder,
+        };
+        edges.push({ type: 'owned_by', from: task, to: previousAgent, op: 'unlink', provenance: 'event:task.handed_off' });
+      }
+      const toAgentId = ev.payload.toAgentId;
+      if (typeof toAgentId === 'string' && toAgentId) {
+        const nextAgent: ProjectedNodeDescriptor = {
+          type: 'agent', uri: buildEntityUri({ kind: 'agent', id: toAgentId }), label: label('toName'),
+        };
+        edges.push({ type: 'owned_by', from: task, to: nextAgent, op: 'link', provenance: 'event:task.handed_off' });
+      }
+      return edges.length ? { node: null, edges } : null;
     }
     case 'dependency.added':
     case 'dependency.removed': {

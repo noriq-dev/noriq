@@ -6,7 +6,7 @@
 import { env } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import type { Env } from '../src/env';
-import type { Actor, CreateRunInput, RunView } from '../src/do/ProjectRoom';
+import type { Actor, CreateRunInput, RunView, TaskPatch, UpdatedTask } from '../src/do/ProjectRoom';
 import { createUser, mintTokenForUser, mcpCall } from './helpers';
 import { buildEntityUri } from '@noriq-dev/shared';
 import { mapCoordinationEvent } from '../src/memory/projection';
@@ -26,6 +26,7 @@ interface RoomRpc {
   // PLNR-317: same "exercised directly" reasoning as the PLNR-319 RPCs above.
   deleteMilestone(projectId: string, actor: Actor, milestoneId: string): Promise<{ ok: true }>;
   rejectPlan(projectId: string, actor: Actor, planId: string): Promise<{ ok: true; cancelledTasks: number }>;
+  updateTask(projectId: string, actor: Actor, taskId: string, patch: TaskPatch): Promise<UpdatedTask>;
 }
 const room = (projectId: string) => appEnv.PROJECT_ROOM.get(appEnv.PROJECT_ROOM.idFromName(projectId)) as unknown as RoomRpc;
 const SYSTEM_ACTOR: Actor = { kind: 'system', id: 'system', name: 'system' };
@@ -73,11 +74,13 @@ interface MemRpc {
   // PLNR-320
   backfillProjectionOnce(pid: string): Promise<{ ran: boolean; nodesWritten?: number; edgesWritten?: number }>;
   projectionDrift(pid: string): Promise<{
-    phaseTasks: { expected: number; missing: number };
-    taskDocs: { expected: number; missing: number };
-    dependencies: { expected: number; missing: number };
-    runs: { expected: number; missing: number };
+    phaseTasks: { expected: number; missing: number; unexpected: number };
+    taskDocs: { expected: number; missing: number; unexpected: number };
+    dependencies: { expected: number; missing: number; unexpected: number };
+    runs: { expected: number; missing: number; unexpected: number };
+    ownership: { expected: number; missing: number; unexpected: number };
     totalMissing: number;
+    totalUnexpected: number;
   }>;
   _allEdgesForTest(pid: string): Promise<Array<{ type: string; fromUri: string; toUri: string; provenance: string | null }>>;
 }
@@ -491,6 +494,30 @@ describe('mapCoordinationEvent — pure mapping (PLNR-316)', () => {
     expect(mapCoordinationEvent({ verb: 'task.released', subjectId: 'task_abc', payload: { previousHolder: null } })).toBeNull();
   });
 
+  it.each(['task.requeued', 'task.status_changed', 'signal.raised'])(
+    '%s also unlinks the prior live holder when that mutation clears a claim',
+    (verb) => {
+      const projected = mapCoordinationEvent({
+        verb, subjectId: 'task_abc', payload: { title: 'a task', previousHolder: 'agt_old' },
+      });
+      expect(projected?.edges).toEqual([expect.objectContaining({
+        type: 'owned_by', op: 'unlink', provenance: `event:${verb}`,
+        to: expect.objectContaining({ uri: buildEntityUri({ kind: 'agent', id: 'agt_old' }) }),
+      })]);
+    },
+  );
+
+  it('task.handed_off replaces the old owner with the new owner in one projection', () => {
+    const projected = mapCoordinationEvent({
+      verb: 'task.handed_off', subjectId: 'task_abc',
+      payload: { title: 'a task', previousHolder: 'agt_old', toAgentId: 'agt_new', toName: 'New agent' },
+    });
+    expect(projected?.edges.map((e) => ({ op: e.op, to: e.to.uri, provenance: e.provenance }))).toEqual([
+      { op: 'unlink', to: buildEntityUri({ kind: 'agent', id: 'agt_old' }), provenance: 'event:task.handed_off' },
+      { op: 'link', to: buildEntityUri({ kind: 'agent', id: 'agt_new' }), provenance: 'event:task.handed_off' },
+    ]);
+  });
+
   // PLNR-322: the payloads are widened with an id (`dependsOnId`/`anchorId`) alongside the
   // pre-existing key/type fields — see mapCoordinationEvent's own doc comment for why PLNR-316
   // could not build these edges from the OLD shape, and why the old shape is still accepted
@@ -678,6 +705,25 @@ describe('applyCoordinationEvent draws edges end to end (PLNR-316)', () => {
     const second = await memory(projectId).runProjector(projectId);
     expect(second.applied).toBe(0);
     expect(await memory(projectId)._countEdges(projectId)).toBe(edgesAfterUnlink);
+  });
+
+  it('a human status override that clears the claim also unlinks the live ownership edge', async () => {
+    const { userId, token, projectId } = await newOwnedProject('pm-316-status-release@example.com', 'PM316SR');
+    const task = await mcpCall(token, 'create_task', { projectId, title: 'override claim task', tags: ['pm-316'], allowNewTags: true });
+    if (task.isError) throw new Error(`create_task failed: ${task.text}`);
+    const taskId = task.body.id as string;
+    const claim = await mcpCall(token, 'claim_task', { projectId, taskId });
+    if (claim.isError) throw new Error(`claim_task failed: ${claim.text}`);
+    const { agentId } = await appEnv.DB.prepare('SELECT claimed_by AS agentId FROM tasks WHERE id = ?')
+      .bind(taskId).first<{ agentId: string }>() ?? {};
+    await memory(projectId).runProjector(projectId);
+
+    await room(projectId).updateTask(projectId, { kind: 'human', id: userId, name: 'Owner' }, taskId, { status: 'todo' });
+    await memory(projectId).runProjector(projectId);
+
+    const taskUri = buildEntityUri({ kind: 'task', id: taskId });
+    const agentUri = buildEntityUri({ kind: 'agent', id: agentId! });
+    expect(await memory(projectId)._edgeProvenance(projectId, 'owned_by', taskUri, agentUri)).toBeNull();
   });
 });
 
@@ -1408,6 +1454,18 @@ describe('PLNR-320: automatic one-time backfill', () => {
     const docUri = buildEntityUri({ kind: 'artifact', id: docId });
     expect(await memory(projectId)._edgeProvenance(projectId, 'related_to', taskUri, docUri)).toBe('coordination:task_docs');
   });
+
+  it('serializes concurrent callers so only one rebuild claims the durable backfill version', async () => {
+    const { token, projectId } = await newOwnedProject('pm-320-backfill-race@example.com', 'PM320BR');
+    const task = await mcpCall(token, 'create_task', { projectId, title: 'race task', tags: ['pm-320'], allowNewTags: true });
+    if (task.isError) throw new Error(`create_task failed: ${task.text}`);
+
+    const results = await Promise.all([
+      memory(projectId).backfillProjectionOnce(projectId),
+      memory(projectId).backfillProjectionOnce(projectId),
+    ]);
+    expect(results.map((r) => r.ran).sort()).toEqual([false, true]);
+  });
 });
 
 describe('PLNR-320: projection drift is reported, never auto-repaired', () => {
@@ -1430,11 +1488,13 @@ describe('PLNR-320: projection drift is reported, never auto-repaired', () => {
     await memory(projectId).runProjector(projectId);
     const drift = await memory(projectId).projectionDrift(projectId);
     expect(drift).toEqual({
-      phaseTasks: { expected: 1, missing: 0 },
-      taskDocs: { expected: 1, missing: 0 },
-      dependencies: { expected: 1, missing: 0 },
-      runs: { expected: 0, missing: 0 },
+      phaseTasks: { expected: 1, missing: 0, unexpected: 0 },
+      taskDocs: { expected: 1, missing: 0, unexpected: 0 },
+      dependencies: { expected: 1, missing: 0, unexpected: 0 },
+      runs: { expected: 0, missing: 0, unexpected: 0 },
+      ownership: { expected: 0, missing: 0, unexpected: 0 },
       totalMissing: 0,
+      totalUnexpected: 0,
     });
   });
 
@@ -1449,12 +1509,12 @@ describe('PLNR-320: projection drift is reported, never auto-repaired', () => {
     // Deliberately never run the projector or the rebuild — this project's memory has never
     // caught up on the task_docs relationship the board already knows about.
     const drift = await memory(projectId).projectionDrift(projectId);
-    expect(drift.taskDocs).toEqual({ expected: 1, missing: 1 });
+    expect(drift.taskDocs).toEqual({ expected: 1, missing: 1, unexpected: 0 });
     expect(drift.totalMissing).toBe(1);
 
     // Reported, not repaired — asking again finds the SAME gap, not a smaller one.
     const again = await memory(projectId).projectionDrift(projectId);
-    expect(again.taskDocs).toEqual({ expected: 1, missing: 1 });
+    expect(again.taskDocs).toEqual({ expected: 1, missing: 1, unexpected: 0 });
     expect(await memory(projectId)._countEdges(projectId)).toBe(0); // still nothing written
   });
 
@@ -1475,7 +1535,57 @@ describe('PLNR-320: projection drift is reported, never auto-repaired', () => {
     // If drift counted by a `coordination:*` provenance PREFIX (the trap CLAUDE.md/the task spec
     // both warn against), this healthy, fully-converged project would misread as 100% drifted.
     const drift = await memory(projectId).projectionDrift(projectId);
-    expect(drift.taskDocs).toEqual({ expected: 1, missing: 0 });
+    expect(drift.taskDocs).toEqual({ expected: 1, missing: 0, unexpected: 0 });
+  });
+
+  it('reports and rebuilds away a projection-owned edge whose D1 relationship was removed without an event', async () => {
+    const { token, projectId } = await newOwnedProject('pm-320-drift-extra@example.com', 'PM320DE');
+    const doc = await mcpCall(token, 'create_doc', { projectId, name: 'extra doc', body: 'Settled: a fact.' });
+    if (doc.isError) throw new Error(`create_doc failed: ${doc.text}`);
+    const task = await mcpCall(token, 'create_task', {
+      projectId, title: 'extra task', docIds: [doc.body.id as string], tags: ['pm-320'], allowNewTags: true,
+    });
+    if (task.isError) throw new Error(`create_task failed: ${task.text}`);
+    const taskId = task.body.id as string;
+    const docId = doc.body.id as string;
+    await memory(projectId).runProjector(projectId);
+
+    // Simulate removal-side drift: authoritative D1 changed, but no unlink event reached the
+    // projector. Provenance still proves the surviving edge is projector-owned.
+    await appEnv.DB.prepare('DELETE FROM task_docs WHERE task_id = ? AND doc_id = ?').bind(taskId, docId).run();
+    const drifted = await memory(projectId).projectionDrift(projectId);
+    expect(drifted.taskDocs).toEqual({ expected: 0, missing: 0, unexpected: 1 });
+    expect(drifted.totalUnexpected).toBe(1);
+
+    await memory(projectId).rebuildProjection(projectId);
+    const taskUri = buildEntityUri({ kind: 'task', id: taskId });
+    const docUri = buildEntityUri({ kind: 'artifact', id: docId });
+    expect(await memory(projectId)._edgeProvenance(projectId, 'related_to', taskUri, docUri)).toBeNull();
+    expect((await memory(projectId).projectionDrift(projectId)).taskDocs).toEqual({ expected: 0, missing: 0, unexpected: 0 });
+  });
+
+  it('uses current D1 claims for ownership rebuild and detects a stale owner after the claim disappears', async () => {
+    const { token, projectId } = await newOwnedProject('pm-320-drift-owner@example.com', 'PM320DO');
+    const task = await mcpCall(token, 'create_task', { projectId, title: 'owned task', tags: ['pm-320'], allowNewTags: true });
+    if (task.isError) throw new Error(`create_task failed: ${task.text}`);
+    const taskId = task.body.id as string;
+    const claim = await mcpCall(token, 'claim_task', { projectId, taskId });
+    if (claim.isError) throw new Error(`claim_task failed: ${claim.text}`);
+    const { agentId } = await appEnv.DB.prepare('SELECT claimed_by AS agentId FROM tasks WHERE id = ?')
+      .bind(taskId).first<{ agentId: string }>() ?? {};
+
+    expect((await memory(projectId).projectionDrift(projectId)).ownership).toEqual({ expected: 1, missing: 1, unexpected: 0 });
+    await memory(projectId).rebuildProjection(projectId);
+    const taskUri = buildEntityUri({ kind: 'task', id: taskId });
+    const agentUri = buildEntityUri({ kind: 'agent', id: agentId! });
+    expect(await memory(projectId)._edgeProvenance(projectId, 'owned_by', taskUri, agentUri)).toBe('coordination:task_claims');
+
+    await appEnv.DB.prepare(
+      `UPDATE tasks SET claimed_by = NULL, claim_expires_at = NULL, status = 'todo' WHERE id = ?`,
+    ).bind(taskId).run();
+    expect((await memory(projectId).projectionDrift(projectId)).ownership).toEqual({ expected: 0, missing: 0, unexpected: 1 });
+    await memory(projectId).rebuildProjection(projectId);
+    expect(await memory(projectId)._edgeProvenance(projectId, 'owned_by', taskUri, agentUri)).toBeNull();
   });
 
   it('a cross-project dependency blocker is never counted as missing (wrinkle 3)', async () => {
@@ -1493,7 +1603,7 @@ describe('PLNR-320: projection drift is reported, never auto-repaired', () => {
     // Never projected at all — if the cross-project skip were missing, this would read as
     // `dependencies: { expected: 1, missing: 1 }` instead of correctly excluding it.
     const drift = await memory(a.projectId).projectionDrift(a.projectId);
-    expect(drift.dependencies).toEqual({ expected: 0, missing: 0 });
+    expect(drift.dependencies).toEqual({ expected: 0, missing: 0, unexpected: 0 });
     expect(drift.totalMissing).toBe(0);
   });
 
@@ -1522,11 +1632,11 @@ describe('PLNR-320: projection drift is reported, never auto-repaired', () => {
 
     // Never projected at all — only the anchored, still-resolving run counts.
     const drift = await memory(projectId).projectionDrift(projectId);
-    expect(drift.runs).toEqual({ expected: 1, missing: 1 });
+    expect(drift.runs).toEqual({ expected: 1, missing: 1, unexpected: 0 });
     expect(drift.totalMissing).toBe(1);
 
     await memory(projectId).runProjector(projectId);
     const caughtUp = await memory(projectId).projectionDrift(projectId);
-    expect(caughtUp.runs).toEqual({ expected: 1, missing: 0 });
+    expect(caughtUp.runs).toEqual({ expected: 1, missing: 0, unexpected: 0 });
   });
 });

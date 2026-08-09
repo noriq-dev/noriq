@@ -94,16 +94,20 @@ export interface ProjectMemoryHealth {
 }
 
 /** PLNR-320: one relationship kind's drift subtotal — see `ProjectMemory.projectionDrift`'s own
- *  doc comment for the full contract (in particular why this is never derived from an edge's
- *  `provenance` string). `expected` is how many edges `rebuildProjection` currently expects to
- *  exist for this kind; `missing` is how many of those are absent from the graph today. */
+ *  doc comment for the full contract. `expected` is how many edges `rebuildProjection` currently
+ *  expects to exist; `missing` counts absent expected triples, while `unexpected` counts stale
+ *  projector-owned triples whose backing D1 relationship no longer exists. */
 export interface ProjectionDriftCategory {
   expected: number;
   missing: number;
+  /** Projection-owned edges that still exist even though their backing D1 relationship does
+   *  not. User-authored edges (which carry no coordination provenance) are never counted here. */
+  unexpected: number;
 }
 
 /** PLNR-320/PLNR-325: `ProjectMemory.projectionDrift`'s full report — one category per
- *  relationship kind `rebuildProjection` itself covers, plus a convenience total. `runs` covers
+ *  relationship kind `rebuildProjection` itself covers, plus missing/unexpected totals. `runs`
+ *  covers
  *  the run -> anchor `related_to` edge (PLNR-325 gave `rebuildProjection` run coverage, so drift
  *  can now usefully point at it — an unanchored run, or one whose anchor no longer resolves,
  *  contributes no `expected` entry, same as a cross-project dependency blocker). Surfaced on
@@ -113,8 +117,63 @@ export interface ProjectionDriftReport {
   taskDocs: ProjectionDriftCategory;
   dependencies: ProjectionDriftCategory;
   runs: ProjectionDriftCategory;
+  ownership: ProjectionDriftCategory;
   totalMissing: number;
+  totalUnexpected: number;
 }
+
+type ProjectionRelationshipCategory = 'phaseTasks' | 'taskDocs' | 'dependencies' | 'runs' | 'ownership';
+
+interface ExpectedProjectionEdge {
+  category: ProjectionRelationshipCategory;
+  type: string;
+  fromUri: string;
+  toUri: string;
+  provenance: string;
+}
+
+interface StoredProjectedEdge extends ExpectedProjectionEdge {
+  id: string;
+}
+
+interface CoordinationRelationships {
+  tasks: { results: Array<{ id: string; title: string }> };
+  plans: { results: Array<{ id: string; title: string }> };
+  docs: { results: Array<{ id: string; name: string }> };
+  milestones: { results: Array<{ id: string; title: string }> };
+  agents: { results: Array<{ id: string; name: string }> };
+  taskPlanLinks: { results: Array<{ taskId: string; planId: string }> };
+  taskDocLinks: { results: Array<{ taskId: string; docId: string }> };
+  taskDependencies: { results: Array<{ taskId: string; dependsOnId: string }> };
+  taskClaims: { results: Array<{ taskId: string; agentId: string }> };
+  runs: { results: Array<{ id: string; kind: string; anchorType: string | null; anchorId: string | null }> };
+}
+
+const projectionEdgeKey = (edge: { type: string; fromUri: string; toUri: string }): string =>
+  `${edge.type}\0${edge.fromUri}\0${edge.toUri}`;
+
+const projectionCategoryForProvenance = (provenance: string | null): ProjectionRelationshipCategory | null => {
+  switch (provenance) {
+    case 'coordination:phase_tasks':
+    case 'event:plan.tasks_linked':
+      return 'phaseTasks';
+    case 'coordination:task_docs':
+    case 'event:task.docs_linked':
+      return 'taskDocs';
+    case 'coordination:dependencies':
+    case 'event:dependency.added':
+      return 'dependencies';
+    case 'coordination:runs':
+    case 'event:run.created':
+      return 'runs';
+    case 'coordination:task_claims':
+    case 'event:task.claimed':
+    case 'event:task.handed_off':
+      return 'ownership';
+    default:
+      return null;
+  }
+};
 
 /** PLNR-273: one `index_generations` row as an operator-facing read — everything a human needs
  *  to judge whether a staged generation is safe to activate, without re-deriving validity
@@ -4313,15 +4372,7 @@ export class ProjectMemory extends DurableObject<Env> {
    * here by construction instead of a second check, so no writer or reader of this data can
    * silently drift on which edges are cross-project.
    */
-  private async loadCoordinationRelationships(projectId: string): Promise<{
-    tasks: { results: Array<{ id: string; title: string }> };
-    plans: { results: Array<{ id: string; title: string }> };
-    docs: { results: Array<{ id: string; name: string }> };
-    milestones: { results: Array<{ id: string; title: string }> };
-    agents: { results: Array<{ id: string; name: string }> };
-    taskPlanLinks: { results: Array<{ taskId: string; planId: string }> };
-    taskDocLinks: { results: Array<{ taskId: string; docId: string }> };
-    taskDependencies: { results: Array<{ taskId: string; dependsOnId: string }> };
+  private async loadCoordinationRelationships(projectId: string): Promise<CoordinationRelationships> {
     // PLNR-325: every run this project has ever created, regardless of status — nothing prunes
     // individual `runs` rows short of `deleteProject` (checked: only that cascade touches this
     // table), and `run.created`/`recordEpisode` project a run node unconditionally too, so a
@@ -4329,16 +4380,14 @@ export class ProjectMemory extends DurableObject<Env> {
     // read straight off the soft ref (migration 0018's CHECK keeps them null-together); whether
     // the anchor still resolves is decided by the caller against the `tasks`/`plans` rows above,
     // never here.
-    runs: { results: Array<{ id: string; kind: string; anchorType: string | null; anchorId: string | null }> };
-  }> {
-    const [tasks, plans, docs, milestones, agents, taskPlanLinks, taskDocLinks, taskDependencies, runs] = await Promise.all([
+    const [tasks, plans, docs, milestones, agents, taskPlanLinks, taskDocLinks, taskDependencies, taskClaims, runs] = await Promise.all([
       this.env.DB.prepare('SELECT id, title FROM tasks WHERE project_id = ?').bind(projectId).all<{ id: string; title: string }>(),
       this.env.DB.prepare('SELECT id, title FROM plans WHERE project_id = ?').bind(projectId).all<{ id: string; title: string }>(),
       this.env.DB.prepare('SELECT id, name FROM docs WHERE project_id = ?').bind(projectId).all<{ id: string; name: string }>(),
       this.env.DB.prepare('SELECT id, title FROM milestones WHERE project_id = ?').bind(projectId).all<{ id: string; title: string }>(),
       this.env.DB.prepare('SELECT id, name FROM agents WHERE project_id = ?').bind(projectId).all<{ id: string; name: string }>(),
       this.env.DB.prepare(
-        `SELECT pt.task_id AS taskId, ph.plan_id AS planId FROM phase_tasks pt
+        `SELECT DISTINCT pt.task_id AS taskId, ph.plan_id AS planId FROM phase_tasks pt
          JOIN phases ph ON ph.id = pt.phase_id JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ?`,
       ).bind(projectId).all<{ taskId: string; planId: string }>(),
       this.env.DB.prepare(
@@ -4350,10 +4399,93 @@ export class ProjectMemory extends DurableObject<Env> {
          JOIN tasks t ON t.id = d.task_id WHERE t.project_id = ?`,
       ).bind(projectId).all<{ taskId: string; dependsOnId: string }>(),
       this.env.DB.prepare(
+        `SELECT id AS taskId, claimed_by AS agentId FROM tasks
+         WHERE project_id = ? AND claimed_by IS NOT NULL`,
+      ).bind(projectId).all<{ taskId: string; agentId: string }>(),
+      this.env.DB.prepare(
         `SELECT id, kind, anchor_type AS anchorType, anchor_id AS anchorId FROM runs WHERE project_id = ?`,
       ).bind(projectId).all<{ id: string; kind: string; anchorType: string | null; anchorId: string | null }>(),
     ]);
-    return { tasks, plans, docs, milestones, agents, taskPlanLinks, taskDocLinks, taskDependencies, runs };
+    return { tasks, plans, docs, milestones, agents, taskPlanLinks, taskDocLinks, taskDependencies, taskClaims, runs };
+  }
+
+  /** The exact relationship triples the live D1 state expects. Both rebuild and drift consume
+   *  this one derivation so their add/remove sides cannot disagree. */
+  private expectedProjectionEdges(state: CoordinationRelationships): ExpectedProjectionEdge[] {
+    const taskIds = new Set(state.tasks.results.map((t) => t.id));
+    const planIds = new Set(state.plans.results.map((p) => p.id));
+    const agentIds = new Set(state.agents.results.map((a) => a.id));
+    const edges: ExpectedProjectionEdge[] = [];
+    for (const link of state.taskPlanLinks.results) {
+      edges.push({
+        category: 'phaseTasks', type: 'related_to',
+        fromUri: buildEntityUri({ kind: 'task', id: link.taskId }),
+        toUri: buildEntityUri({ kind: 'plan', id: link.planId }),
+        provenance: 'coordination:phase_tasks',
+      });
+    }
+    for (const link of state.taskDocLinks.results) {
+      edges.push({
+        category: 'taskDocs', type: 'related_to',
+        fromUri: buildEntityUri({ kind: 'task', id: link.taskId }),
+        toUri: buildEntityUri({ kind: 'artifact', id: link.docId }),
+        provenance: 'coordination:task_docs',
+      });
+    }
+    for (const dep of state.taskDependencies.results) {
+      if (!taskIds.has(dep.dependsOnId)) continue;
+      edges.push({
+        category: 'dependencies', type: 'depends_on',
+        fromUri: buildEntityUri({ kind: 'task', id: dep.taskId }),
+        toUri: buildEntityUri({ kind: 'task', id: dep.dependsOnId }),
+        provenance: 'coordination:dependencies',
+      });
+    }
+    for (const run of state.runs.results) {
+      const anchorResolves =
+        (run.anchorType === 'task' && !!run.anchorId && taskIds.has(run.anchorId)) ||
+        (run.anchorType === 'plan' && !!run.anchorId && planIds.has(run.anchorId));
+      if (!anchorResolves) continue;
+      edges.push({
+        category: 'runs', type: 'related_to',
+        fromUri: buildEntityUri({ kind: 'run', id: run.id }),
+        toUri: buildEntityUri({ kind: run.anchorType as 'task' | 'plan', id: run.anchorId! }),
+        provenance: 'coordination:runs',
+      });
+    }
+    for (const claim of state.taskClaims.results) {
+      if (!taskIds.has(claim.taskId) || !agentIds.has(claim.agentId)) continue;
+      edges.push({
+        category: 'ownership', type: 'owned_by',
+        fromUri: buildEntityUri({ kind: 'task', id: claim.taskId }),
+        toUri: buildEntityUri({ kind: 'agent', id: claim.agentId }),
+        provenance: 'coordination:task_claims',
+      });
+    }
+    return edges;
+  }
+
+  /** Only edges whose provenance proves they came from the coordination projector/rebuilder.
+   *  A null/unknown provenance may be user-authored through `writeEdge` and is never repaired
+   *  away merely because D1 has no matching coordination row. */
+  private storedProjectedEdges(): StoredProjectedEdge[] {
+    const rows = this.ctx.storage.sql.exec<{
+      id: string; type: string; provenance: string | null; from_uri: string; to_uri: string;
+    }>(
+      `SELECT e.id, e.type, e.provenance, nf.uri AS from_uri, nt.uri AS to_uri
+       FROM edges e JOIN nodes nf ON nf.id = e.from_node_id JOIN nodes nt ON nt.id = e.to_node_id
+       WHERE e.provenance IS NOT NULL`,
+    ).toArray();
+    const projected: StoredProjectedEdge[] = [];
+    for (const row of rows) {
+      const category = projectionCategoryForProvenance(row.provenance);
+      if (!category || !row.provenance) continue;
+      projected.push({
+        id: row.id, category, type: row.type, fromUri: row.from_uri, toUri: row.to_uri,
+        provenance: row.provenance,
+      });
+    }
+    return projected;
   }
 
   /**
@@ -4363,8 +4495,9 @@ export class ProjectMemory extends DurableObject<Env> {
    * caught up on, or that diverged because of a projector bug) still gains a connected, correct
    * graph without hand-replaying its cursor from zero. Projects every task/plan/doc/milestone/
    * agent this project currently has, plus the task<->plan (`phase_tasks`), task<->doc
-   * (`task_docs`) and task<->task (`dependencies`, PLNR-322) relationships the board already
-   * knows — `applyCoordinationEvent` cannot draw the first two from a single event's payload (a
+   * (`task_docs`), task<->task (`dependencies`, PLNR-322), and live task->agent ownership
+   * relationships the board already knows. `applyCoordinationEvent` cannot draw the first two
+   * from a single event's payload (a
    * `plan.created` event carries phase task COUNTS, not ids; there is no event at all for "this
    * task was added to a plan/doc"), and a `ctx.storage.transactionSync` block cannot await a
    * second D1 read mid-transaction, so this reads everything up front (`loadCoordinationRelationships`),
@@ -4387,33 +4520,47 @@ export class ProjectMemory extends DurableObject<Env> {
    * uses (`coordination:runs`).
    *
    * Deliberately does NOT touch `projector_cursor` — that stays `runProjector`'s own concern.
-   * Every write here is idempotent (uri for nodes, the `(type, from, to)` triple for edges), so
-   * running this and the incremental projector in any order, any number of times, is always
-   * safe: re-running produces identical node/edge counts and no changed ids (stated acceptance).
+   * Rebuild also removes stale edges carrying a recognized coordination/event provenance; edges
+   * with null or unknown provenance may be user-authored and are preserved. Node upserts and edge
+   * triples remain idempotent, so re-running converges on the same projected graph.
    */
   async rebuildProjection(projectId: string): Promise<{ nodesWritten: number; edgesWritten: number }> {
     await this.assertProjectId(projectId);
     const now = nowIso();
-    const { tasks, plans, docs, milestones, agents, taskPlanLinks, taskDocLinks, taskDependencies, runs } =
-      await this.loadCoordinationRelationships(projectId);
+    const state = await this.loadCoordinationRelationships(projectId);
+    const { tasks, plans, docs, milestones, agents, runs } = state;
+    const expectedEdges = this.expectedProjectionEdges(state);
 
     let nodesWritten = 0;
     let edgesWritten = 0;
     this.ctx.storage.transactionSync(() => {
       if (this._forceWriteFailure) throw new Error('injected write failure (test)');
-      const taskNodeId = new Map<string, string>();
+
+      // Repair is bidirectional: remove only edges whose provenance proves this projector owns
+      // them and whose backing relationship no longer exists. Unknown/null provenance is a
+      // user-authored graph fact and remains untouched.
+      const expectedKeysByCategory = new Map<ProjectionRelationshipCategory, Set<string>>();
+      for (const edge of expectedEdges) {
+        const keys = expectedKeysByCategory.get(edge.category) ?? new Set<string>();
+        keys.add(projectionEdgeKey(edge));
+        expectedKeysByCategory.set(edge.category, keys);
+      }
+      for (const edge of this.storedProjectedEdges()) {
+        if (!(expectedKeysByCategory.get(edge.category)?.has(projectionEdgeKey(edge)) ?? false)) {
+          this.ctx.storage.sql.exec(`DELETE FROM edges WHERE id = ?1`, edge.id);
+        }
+      }
+
       for (const t of tasks.results) {
-        taskNodeId.set(t.id, this.upsertGraphNode('task', buildEntityUri({ kind: 'task', id: t.id }), t.title, now));
+        this.upsertGraphNode('task', buildEntityUri({ kind: 'task', id: t.id }), t.title, now);
         nodesWritten++;
       }
-      const planNodeId = new Map<string, string>();
       for (const p of plans.results) {
-        planNodeId.set(p.id, this.upsertGraphNode('plan', buildEntityUri({ kind: 'plan', id: p.id }), p.title, now));
+        this.upsertGraphNode('plan', buildEntityUri({ kind: 'plan', id: p.id }), p.title, now);
         nodesWritten++;
       }
-      const docNodeId = new Map<string, string>();
       for (const d of docs.results) {
-        docNodeId.set(d.id, this.upsertGraphNode('artifact', buildEntityUri({ kind: 'artifact', id: d.id }), d.name, now));
+        this.upsertGraphNode('artifact', buildEntityUri({ kind: 'artifact', id: d.id }), d.name, now);
         nodesWritten++;
       }
       for (const m of milestones.results) {
@@ -4424,46 +4571,15 @@ export class ProjectMemory extends DurableObject<Env> {
         this.upsertGraphNode('agent', buildEntityUri({ kind: 'agent', id: a.id }), a.name, now);
         nodesWritten++;
       }
-      for (const link of taskPlanLinks.results) {
-        const fromId = taskNodeId.get(link.taskId);
-        const toId = planNodeId.get(link.planId);
-        if (fromId && toId) {
-          this.linkGraphEdge('related_to', fromId, toId, now, 'coordination:phase_tasks');
-          edgesWritten++;
-        }
-      }
-      for (const link of taskDocLinks.results) {
-        const fromId = taskNodeId.get(link.taskId);
-        const toId = docNodeId.get(link.docId);
-        if (fromId && toId) {
-          this.linkGraphEdge('related_to', fromId, toId, now, 'coordination:task_docs');
-          edgesWritten++;
-        }
-      }
-      // PLNR-322: `depends_on`, dependent -> blocker (same direction `mapCoordinationEvent`'s
-      // `dependency.added` arm draws). `toId` is absent (guard skips) for a cross-project
-      // blocker, by construction — see this method's own doc comment.
-      for (const dep of taskDependencies.results) {
-        const fromId = taskNodeId.get(dep.taskId);
-        const toId = taskNodeId.get(dep.dependsOnId);
-        if (fromId && toId) {
-          this.linkGraphEdge('depends_on', fromId, toId, now, 'coordination:dependencies');
-          edgesWritten++;
-        }
-      }
-
-      // PLNR-325: a `run` node per row, always — an unanchored run (or one whose anchor no
-      // longer resolves against the live `tasks`/`plans` maps above) simply gets no edge, never
-      // a fabricated one. Label matches `recordEpisode`'s existing `"<kind> run"` convention.
       for (const r of runs.results) {
-        const runNodeId = this.upsertGraphNode('run', buildEntityUri({ kind: 'run', id: r.id }), `${r.kind} run`, now);
+        this.upsertGraphNode('run', buildEntityUri({ kind: 'run', id: r.id }), `${r.kind} run`, now);
         nodesWritten++;
-        const anchorNodeId =
-          r.anchorType === 'task' && r.anchorId ? taskNodeId.get(r.anchorId)
-          : r.anchorType === 'plan' && r.anchorId ? planNodeId.get(r.anchorId)
-          : undefined;
-        if (anchorNodeId) {
-          this.linkGraphEdge('related_to', runNodeId, anchorNodeId, now, 'coordination:runs');
+      }
+      for (const edge of expectedEdges) {
+        const fromId = this.findGraphNodeId(edge.fromUri);
+        const toId = this.findGraphNodeId(edge.toUri);
+        if (fromId && toId) {
+          this.linkGraphEdge(edge.type, fromId, toId, now, edge.provenance);
           edgesWritten++;
         }
       }
@@ -4494,12 +4610,12 @@ export class ProjectMemory extends DurableObject<Env> {
 
   /**
    * PLNR-320: how far the graph has drifted from what `rebuildProjection` currently expects,
-   * broken down by relationship kind (its "provenance" in the locked decision's sense — the
-   * coordination TABLE a category comes from, e.g. `phase_tasks`, never the edge row's own
-   * `provenance` STRING column). Read-only — never repairs anything; a human runs
-   * `rebuildProjection` (the manual route, or this same RPC) once drift is non-zero.
+   * broken down by relationship kind. Missing edges are matched by triple regardless of their
+   * stored provenance; unexpected edges are limited to recognized projector provenance so
+   * user-authored graph facts are not reported as stale. Read-only — never repairs anything; a
+   * human runs the manual `rebuildProjection` route once drift is non-zero.
    *
-   * Wrinkle 1 (why this does NOT filter by `edges.provenance`): `linkGraphEdge` writes
+   * Wrinkle 1 (why missing-edge detection does NOT filter by `edges.provenance`): `linkGraphEdge` writes
    * provenance only on a triple's FIRST insert, and the incremental path's `event:<verb>` and
    * this method's own `coordination:<table>` are two names for the SAME converged edge — a
    * healthy graph's edges mostly carry `event:*` provenance because the incremental path
@@ -4526,51 +4642,40 @@ export class ProjectMemory extends DurableObject<Env> {
    */
   async projectionDrift(projectId: string): Promise<ProjectionDriftReport> {
     await this.assertProjectId(projectId);
-    const { tasks, plans, taskPlanLinks, taskDocLinks, taskDependencies, runs } = await this.loadCoordinationRelationships(projectId);
-    const taskIds = new Set(tasks.results.map((t) => t.id));
-    const planIds = new Set(plans.results.map((p) => p.id));
-
-    const phaseTasks = this.driftCategory(
-      taskPlanLinks.results.map((l) => ({
-        type: 'related_to', fromUri: buildEntityUri({ kind: 'task', id: l.taskId }), toUri: buildEntityUri({ kind: 'plan', id: l.planId }),
-      })),
-    );
-    const taskDocs = this.driftCategory(
-      taskDocLinks.results.map((l) => ({
-        type: 'related_to', fromUri: buildEntityUri({ kind: 'task', id: l.taskId }), toUri: buildEntityUri({ kind: 'artifact', id: l.docId }),
-      })),
-    );
-    const dependencies = this.driftCategory(
-      taskDependencies.results
-        .filter((d) => taskIds.has(d.dependsOnId)) // wrinkle 3: a cross-project blocker is never expected here
-        .map((d) => ({
-          type: 'depends_on', fromUri: buildEntityUri({ kind: 'task', id: d.taskId }), toUri: buildEntityUri({ kind: 'task', id: d.dependsOnId }),
-        })),
-    );
-    const runEdges = this.driftCategory(
-      runs.results
-        .filter((r) => (r.anchorType === 'task' && r.anchorId) ? taskIds.has(r.anchorId) : (r.anchorType === 'plan' && r.anchorId) ? planIds.has(r.anchorId) : false)
-        .map((r) => ({
-          type: 'related_to', fromUri: buildEntityUri({ kind: 'run', id: r.id }), toUri: buildEntityUri({ kind: r.anchorType as 'task' | 'plan', id: r.anchorId! }),
-        })),
-    );
+    const expected = this.expectedProjectionEdges(await this.loadCoordinationRelationships(projectId));
+    const actual = this.storedProjectedEdges();
+    const forCategory = (category: ProjectionRelationshipCategory) => ({
+      expected: expected.filter((e) => e.category === category),
+      actual: actual.filter((e) => e.category === category),
+    });
+    const phaseTasks = this.driftCategory(forCategory('phaseTasks'));
+    const taskDocs = this.driftCategory(forCategory('taskDocs'));
+    const dependencies = this.driftCategory(forCategory('dependencies'));
+    const runEdges = this.driftCategory(forCategory('runs'));
+    const ownership = this.driftCategory(forCategory('ownership'));
     return {
-      phaseTasks, taskDocs, dependencies, runs: runEdges,
-      totalMissing: phaseTasks.missing + taskDocs.missing + dependencies.missing + runEdges.missing,
+      phaseTasks, taskDocs, dependencies, runs: runEdges, ownership,
+      totalMissing: phaseTasks.missing + taskDocs.missing + dependencies.missing + runEdges.missing + ownership.missing,
+      totalUnexpected: phaseTasks.unexpected + taskDocs.unexpected + dependencies.unexpected + runEdges.unexpected + ownership.unexpected,
     };
   }
 
   /** One category's drift subtotal: for each expected (type, fromUri, toUri) triple, missing
    *  when either endpoint node does not exist yet OR the edge triple itself is absent — matched
    *  by identity, never by provenance (wrinkle 1, see `projectionDrift`'s doc comment). */
-  private driftCategory(expected: Array<{ type: string; fromUri: string; toUri: string }>): ProjectionDriftCategory {
+  private driftCategory(input: {
+    expected: ExpectedProjectionEdge[];
+    actual: StoredProjectedEdge[];
+  }): ProjectionDriftCategory {
     let missing = 0;
-    for (const e of expected) {
+    for (const e of input.expected) {
       const from = this.resolveNodeByUri(e.fromUri);
       const to = this.resolveNodeByUri(e.toUri);
       if (!from || !to || !this.edgeExists(e.type, from.nodeId, to.nodeId)) missing++;
     }
-    return { expected: expected.length, missing };
+    const expectedKeys = new Set(input.expected.map(projectionEdgeKey));
+    const unexpected = input.actual.filter((edge) => !expectedKeys.has(projectionEdgeKey(edge))).length;
+    return { expected: input.expected.length, missing, unexpected };
   }
 
   private edgeExists(type: string, fromNodeId: string, toNodeId: string): boolean {
@@ -4612,22 +4717,28 @@ export class ProjectMemory extends DurableObject<Env> {
    * actually drew it — so the order is load-bearing, not cosmetic, and living INSIDE this method
    * (not left to each caller to remember) is what makes that true regardless of caller.
    *
+   * Concurrent callers are serialized with `blockConcurrencyWhile`, so the marker check,
+   * reconciliation, rebuild, and marker write act as one gate and only one caller can report
+   * `ran: true` for a generation.
+   *
    * Idempotent beyond the marker too: `rebuildProjection`'s own graph writes are uri/triple
    * idempotent, so a crash between the rebuild committing and the marker committing just means
    * the NEXT sweep repeats a rebuild whose nodes/edges are unchanged, never a wrong one — only
    * the bookkeeping (outbox row, revision) would double up, and only in that narrow crash window.
    */
   async backfillProjectionOnce(projectId: string): Promise<{ ran: boolean; nodesWritten?: number; edgesWritten?: number }> {
-    await this.assertProjectId(projectId);
-    const marker = this.ctx.storage.sql.exec<{ value: string }>(`SELECT value FROM _meta WHERE key = 'backfill_version'`).toArray()[0];
-    if (Number(marker?.value ?? '0') >= BACKFILL_VERSION) return { ran: false };
-    await this.reconcile(projectId);
-    const { nodesWritten, edgesWritten } = await this.rebuildProjection(projectId);
-    this.ctx.storage.sql.exec(
-      `INSERT INTO _meta (key, value) VALUES ('backfill_version', ?1) ON CONFLICT (key) DO UPDATE SET value = ?1`,
-      String(BACKFILL_VERSION),
-    );
-    return { ran: true, nodesWritten, edgesWritten };
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.assertProjectId(projectId);
+      const marker = this.ctx.storage.sql.exec<{ value: string }>(`SELECT value FROM _meta WHERE key = 'backfill_version'`).toArray()[0];
+      if (Number(marker?.value ?? '0') >= BACKFILL_VERSION) return { ran: false };
+      await this.reconcile(projectId);
+      const { nodesWritten, edgesWritten } = await this.rebuildProjection(projectId);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO _meta (key, value) VALUES ('backfill_version', ?1) ON CONFLICT (key) DO UPDATE SET value = ?1`,
+        String(BACKFILL_VERSION),
+      );
+      return { ran: true, nodesWritten, edgesWritten };
+    });
   }
 
   override async alarm(): Promise<void> {
