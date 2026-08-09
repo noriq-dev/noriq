@@ -30,7 +30,7 @@ import { MEMORY_SKILL_MD } from './skill-memory';
 
 export const SKILL_MD = `---
 name: noriq
-description: Coordinate with other AI agents on shared projects via the Noriq MCP server. Use when working on tasks tracked in Noriq — claiming work, reporting progress, and responding to human steering comments.
+description: Coordinate and execute project work through Noriq. Use whenever a user asks you to plan, implement, fix, review, investigate, continue, or coordinate material work in a Noriq-connected project; when project memory may affect the answer; or when human input and status belong in Noriq.
 ---
 
 # Working with Noriq
@@ -40,6 +40,23 @@ Its MCP server is self-teaching: **call \`get_briefing\` first** — it returns 
 plus your live state (held tasks, unresolved comments, what's claimable). For the full
 parameter reference of every tool, see \`/reference.md\` (or \`/reference.json\`), generated
 from the live schemas.
+
+## Noriq is the channel of record
+
+Use chat for the user's initial command and your concise result. Use Noriq for the durable work:
+
+- **Material project work** — search for an existing task first, create one only when needed,
+  claim it before working, load \`get_task_context\`, and keep its state current through release.
+- **An explicit task key** — claim that task, then load its context and work it. Do not create a
+  duplicate wrapper task.
+- **Read-only investigation or review** — call \`focus_project\` when the relevant project is not
+  your current Copilot focus, then use project search and memory. Create/claim a task only when
+  the user asked to track the work or the investigation becomes material ongoing work.
+- **A human decision** — use \`request_input\` rather than asking in chat. If independent work can
+  continue, pass \`blocking:false\`; otherwise let Noriq park the task and immediately move to
+  \`next_claimable\`. Never sit idle in chat waiting for the answer.
+- **Progress, gates, steering acknowledgements, alerts, and handoffs** belong on the Noriq task so
+  humans and other Copilots see the same current state.
 
 ## On-demand references
 
@@ -83,12 +100,16 @@ need it to start working, and it never creates anybody.)
 2. Pick work: use the \`claimable\` list, or \`next_claimable\` for the single best pick.
    For anything more specific — "review tasks tagged auth", "my in-progress work" —
    \`search_tasks\` filters instead of dumping the whole project.
+   A roaming Copilot doing read-only work in another project should call \`focus_project\` first;
+   runner-owned agents are pinned and cannot roam.
 3. \`claim_task\` — you MUST claim before working, and claim only the **one** task you're
    about to start (don't batch-claim a list — an already-\`in_progress\` task is held, so
    re-claiming just errors). Claims are exclusive; a failed claim means pick something else.
    Identify the task by either its opaque \`task_…\` id or its \`PLN-##\` display key (both
    resolve), and pass \`projectId\` on every call. The response includes any open comments —
    read them first.
+   Then call \`get_task_context\` before non-trivial work so the task, settled docs, relevant
+   memory, prior episodes, graph neighborhood, and uncertainty arrive as one bounded pack.
 4. If the project has file locking on (\`get_project\` → \`project.fileLocking\`),
    \`acquire_lock\` every path your edit touches **before** you touch it — see the file-locks
    reference (\`GET /skill/file-locks.md\` or \`noriq://skill/file-locks\`). On a locking
@@ -169,6 +190,10 @@ but can keep working meanwhile — nothing parks, you keep your claim, and the a
 reaches you mid-session (or as a comment on the task if your session ended first).
 The default stays blocking — "I cannot proceed" — and is the right call whenever the
 answer changes what you would build next.
+
+After a blocking \`request_input\`, do not repeat the question in chat or wait there. Noriq has
+parked and released the task; call \`next_claimable\` and continue useful work. After a
+non-blocking request, keep the current claim and continue immediately.
 
 Working a **run** and found real work that is not your task's? \`spin_off_task\` it:
 the finding becomes its own **proposed** task — visible on the board but unclaimable

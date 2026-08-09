@@ -32,6 +32,11 @@ describe('skill core (PLNR-310)', () => {
     expect(text).toContain('claim_task');
     expect(text).toContain('executionSpec');
     expect(text).toContain('anticipatedFiles');
+    expect(text).toContain('Noriq is the channel of record');
+    expect(text).toContain('focus_project');
+    expect(text).toContain('get_task_context');
+    expect(text).toMatch(/request_input[\s\S]+do not repeat the question in chat/i);
+    expect(text).toMatch(/description:.*plan, implement, fix, review, investigate, continue/i);
     expect(text).toContain('noriq://skill/doc-authoring');
     for (const ref of REFERENCES) {
       expect(text).toContain(`GET /skill/${ref.slug}.md`);

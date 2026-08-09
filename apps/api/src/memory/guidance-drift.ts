@@ -125,6 +125,24 @@ const BASE_SURFACES: readonly SurfaceId[] = ['instructions', 'playbook', 'skill_
 
 export const GUIDANCE_RULES: readonly GuidanceRule[] = [
   {
+    id: 'noriq-channel-of-record',
+    description: 'Noriq is the channel of record for material project work while chat carries only the initial command and concise outcome',
+    expectedSurfaces: BASE_SURFACES,
+    detect: single(/Noriq is the channel of record/i),
+  },
+  {
+    id: 'blocking-gate-move-on',
+    description: 'after blocking request_input, do not wait in chat; move to next_claimable while Noriq holds the parked gate',
+    expectedSurfaces: BASE_SURFACES,
+    detect: coOccurring(900, [/blocking[^.]{0,80}request_input|request_input[^.]{0,80}blocking/i, /next_claimable/i, /(?:do not|never)/i, /\bchat\b/i]),
+  },
+  {
+    id: 'roaming-copilot-focus',
+    description: 'a roaming Copilot uses focus_project before read-only work in another project while runner agents remain pinned',
+    expectedSurfaces: BASE_SURFACES,
+    detect: coOccurring(450, [/roaming copilot/i, /focus_project/i, /pinned/i]),
+  },
+  {
     id: 'claim-before-work',
     description: 'claim_task before starting work; release_task when finished',
     expectedSurfaces: BASE_SURFACES,

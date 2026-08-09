@@ -194,7 +194,7 @@ describe('dogfood: the four real agent-guidance surfaces', () => {
     expect(surfaces.skill_md).toContain(token);
     // Removing the token alone is enough — coOccurring requires EVERY pattern to match at least
     // once, so a rule with zero hits for one of its signals returns null regardless of the rest.
-    const drifted = { ...surfaces, skill_md: surfaces.skill_md.replace(token, '') };
+    const drifted = { ...surfaces, skill_md: surfaces.skill_md.replaceAll(token, '') };
     expect(drifted.skill_md).not.toContain(token);
 
     const findings = compareSurfaces(drifted);
