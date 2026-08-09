@@ -161,7 +161,9 @@ claude mcp add -s user --transport http noriq https://your-instance/mcp
 The MCP is self-teaching: agents call `get_briefing` first, every tool result carries
 a notices block, a ready-made skill is served at `/skill.md` (doc-authoring guide at
 `/skill/docs.md`), and the full tool reference (generated from the live schemas) at
-`/reference.md` / `/reference.json`.
+`/reference.md` / `/reference.json`. Download `/noriq.zip` (also `/skill.zip`) to install a
+portable skill bundle; the bundle directs agents back to the live `noriq://skill/*` MCP
+resources so its instructions stay aligned with the connected server.
 
 ## Development
 

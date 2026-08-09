@@ -33,6 +33,7 @@ import { advertisedWorkflowNames } from './lib/workflows';
 import type { Actor, RunView } from './do/ProjectRoom';
 import { SKILL_MD, SKILL_REFERENCES, SKILL_MD_SURFACE } from './skill';
 import { DOC_SKILL_MD } from './skill-docs';
+import { buildNoriqSkillArchive } from './skill-archive';
 import pkg from '../package.json';
 import { issueTokens, metadataRoutes, oauth } from './oauth';
 import { demoLocksDown } from './lib/demo';
@@ -338,6 +339,13 @@ app.get('/skill/docs.md', (c) => c.text(DOC_SKILL_MD, 200, { 'Content-Type': 'te
 for (const [slug, text] of Object.entries(SKILL_REFERENCES)) {
   app.get(`/skill/${slug}.md`, (c) => c.text(text, 200, { 'Content-Type': 'text/markdown; charset=utf-8' }));
 }
+const skillArchive = (c: Context<AppContext>) => c.body(buildNoriqSkillArchive(), 200, {
+  'Content-Type': 'application/zip',
+  'Content-Disposition': 'attachment; filename="noriq.zip"',
+  'Cache-Control': 'public, max-age=300',
+});
+app.get('/noriq.zip', skillArchive);
+app.get('/skill.zip', skillArchive);
 
 // --- MCP tool reference, generated from the zod schemas (PLNR-23) --------------
 app.get('/reference.md', (c) =>

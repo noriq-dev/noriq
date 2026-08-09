@@ -30,6 +30,7 @@ import { DOC_SKILL_MD } from './skill-docs';
 import { LOCKING_SKILL_MD } from './skill-locking';
 import { PLANNING_SKILL_MD } from './skill-planning';
 import { MEMORY_SKILL_MD } from './skill-memory';
+import { SKILL_MD } from './skill';
 import { signUploadToken, resolveUploadSecret } from './lib/upload-token';
 import { taskClaimability } from './lib/claimability';
 import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
@@ -2552,6 +2553,19 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         : { uri: uri.href, mimeType, blob: bytesToBase64(bytes) };
       return { contents: [content] };
     },
+  );
+
+  resourceSpecs.push({
+    name: 'noriq-core-skill',
+    uriTemplate: 'noriq://skill/core',
+    description: 'The current Noriq core skill and channel-of-record work loop (also GET /skill.md)',
+    minimumProjectAction: 'view',
+  });
+  server.registerResource(
+    'noriq-core-skill',
+    'noriq://skill/core',
+    { title: 'Noriq core skill', description: 'The current Noriq work loop and tool-selection guidance', mimeType: 'text/markdown' },
+    async (uri) => ({ contents: [{ uri: uri.href, mimeType: 'text/markdown', text: SKILL_MD }] }),
   );
 
   // The doc-authoring skill (PLNR-190) as a static resource, for clients that browse

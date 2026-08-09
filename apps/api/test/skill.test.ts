@@ -8,6 +8,7 @@
 import { SELF } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import { createAgent, mcpRpc } from './helpers';
+import { buildNoriqSkillArchive, noriqSkillFiles } from '../src/skill-archive';
 
 let agent: { id: string; apiKey: string };
 
@@ -22,6 +23,27 @@ const REFERENCES = [
   { slug: 'planning', uri: 'noriq://skill/planning', anchor: 'name: noriq-planning' },
   { slug: 'memory', uri: 'noriq://skill/memory', anchor: 'name: noriq-memory' },
 ];
+
+function readStoredZip(bytes: Uint8Array): Map<string, string> {
+  const entries = new Map<string, string>();
+  const decoder = new TextDecoder();
+  let offset = 0;
+  while (offset + 4 <= bytes.byteLength) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset + offset);
+    if (view.getUint32(0, true) !== 0x04034b50) break;
+    const compression = view.getUint16(8, true);
+    const size = view.getUint32(18, true);
+    const nameLength = view.getUint16(26, true);
+    const extraLength = view.getUint16(28, true);
+    expect(compression).toBe(0);
+    const nameStart = offset + 30;
+    const dataStart = nameStart + nameLength + extraLength;
+    const name = decoder.decode(bytes.subarray(nameStart, nameStart + nameLength));
+    entries.set(name, decoder.decode(bytes.subarray(dataStart, dataStart + size)));
+    offset = dataStart + size;
+  }
+  return entries;
+}
 
 describe('skill core (PLNR-310)', () => {
   it('stays useful standalone: states every topic and names each reference address', async () => {
@@ -64,4 +86,30 @@ describe('skill core (PLNR-310)', () => {
       expect(r.contents[0]!.text).toBe(routeText);
     });
   }
+
+  it('serves the current core skill as a live MCP resource', async () => {
+    const route = await (await SELF.fetch('https://noriq.test/skill.md')).text();
+    const r = (await mcpRpc(agent.apiKey, 'resources/read', { uri: 'noriq://skill/core' })) as {
+      contents: Array<{ text: string; mimeType: string }>;
+    };
+    expect(r.contents[0]!.mimeType).toBe('text/markdown');
+    expect(r.contents[0]!.text).toBe(route);
+  });
+
+  it('builds and serves a deterministic installable archive that prefers live MCP guidance', async () => {
+    expect(buildNoriqSkillArchive()).toEqual(buildNoriqSkillArchive());
+    const canonical = await SELF.fetch('https://noriq.test/noriq.zip');
+    const alias = await SELF.fetch('https://noriq.test/skill.zip');
+    expect(canonical.status).toBe(200);
+    expect(canonical.headers.get('Content-Type')).toBe('application/zip');
+    expect(canonical.headers.get('Content-Disposition')).toContain('noriq.zip');
+    expect(new Uint8Array(await alias.arrayBuffer())).toEqual(new Uint8Array(await canonical.clone().arrayBuffer()));
+
+    const entries = readStoredZip(new Uint8Array(await canonical.arrayBuffer()));
+    expect([...entries.keys()].sort()).toEqual(Object.keys(noriqSkillFiles()).sort());
+    expect(entries.get('noriq/SKILL.md')).toContain('noriq://skill/core');
+    expect(entries.get('noriq/SKILL.md')).toContain('live resource');
+    expect(entries.get('noriq/README.md')).toMatch(/call\s+`get_briefing` first/);
+    expect(entries.get('noriq/references/memory.md')).toContain('search_project_memory');
+  });
 });
