@@ -26,6 +26,7 @@ import {
   planProjection, changedFileUris, coChangePairs, CO_CHANGE_PAIR_CAP,
   mapCoordinationEvent, evidenceCitationNodes, EVIDENCE_EDGE_TYPE,
 } from '../memory/projection';
+import type { ProjectedEdgeDescriptor } from '../memory/projection';
 import {
   applyMemoryFilters, dedupeCandidates, rankCandidates, RETRIEVAL_DEFAULTS,
   type RetrievalHit, type RetrievalStage, type RankedHit,
@@ -1796,6 +1797,21 @@ export class ProjectMemory extends DurableObject<Env> {
       now,
       provenance,
     );
+  }
+
+  /** PLNR-316: a node's id by its uri, or `null` when no such node has been written yet —
+   *  `unlinkGraphEdge`'s own lookup (an edge-removal endpoint is looked up, never stubbed; see
+   *  `ProjectedEdgeDescriptor`'s doc comment for why). */
+  private findGraphNodeId(uri: string): string | null {
+    return this.ctx.storage.sql.exec<{ id: string }>(`SELECT id FROM nodes WHERE uri = ?1`, uri).toArray()[0]?.id ?? null;
+  }
+
+  /** PLNR-316: the inverse of `linkGraphEdge` — deletes the `(type, from, to)` triple if present,
+   *  a no-op otherwise. Idempotent by construction (same idiom as `upsertGraphNode`/
+   *  `linkGraphEdge`'s own `ON CONFLICT`s): replaying the same removal event twice deletes the
+   *  edge once, then finds nothing the second time. */
+  private unlinkGraphEdge(type: string, fromNodeId: string, toNodeId: string): void {
+    this.ctx.storage.sql.exec(`DELETE FROM edges WHERE type = ?1 AND from_node_id = ?2 AND to_node_id = ?3`, type, fromNodeId, toNodeId);
   }
 
   /** PLNR-314: a canvas label is unreadable past ~80 chars, so this is the bound every memory
@@ -4078,16 +4094,43 @@ export class ProjectMemory extends DurableObject<Env> {
 
   /**
    * PLNR-247's `task.created`-only projection, widened by PLNR-283 to `plan.created`/
-   * `doc.created`/`milestone.created` — see `mapCoordinationEvent` (memory/projection.ts, the
-   * pure decision of what to write) for which verbs project a node and why. `upsertGraphNode`'s
-   * `ON CONFLICT (uri) DO UPDATE` makes a re-applied event a no-op node-identity-wise rather than
-   * a duplicate, which matters because the cursor advance and this write commit in the SAME
-   * transaction — replaying a range this already consumed must stay side-effect-free.
+   * `doc.created`/`milestone.created`, then by PLNR-316 to draw EDGES too (`task.claimed`/
+   * `task.released`) — see `mapCoordinationEvent` (memory/projection.ts, the pure decision of
+   * what to write) for which verbs project what, and why `dependency.added`/`dependency.removed`/
+   * `run.created` still project nothing despite naming real relationships. `upsertGraphNode`'s
+   * `ON CONFLICT (uri) DO UPDATE` and `linkGraphEdge`'s `ON CONFLICT (type, from, to) DO NOTHING`
+   * make a re-applied event a no-op rather than a duplicate, which matters because the cursor
+   * advance and this write commit in the SAME transaction — replaying a range this already
+   * consumed must stay side-effect-free. Every edge endpoint is upserted (never just referenced)
+   * before the edge is linked — PLNR-316's locked decision that a missing endpoint is stubbed,
+   * never a reason to skip the edge; an `unlink` edge's endpoints are looked up instead (nothing
+   * to stub when the write is a removal).
    */
   private applyCoordinationEvent(ev: ProjectedEvent): void {
     const projected = mapCoordinationEvent({ verb: ev.verb, subjectId: ev.subjectId, payload: ev.payload });
     if (!projected) return;
-    this.upsertGraphNode(projected.type, projected.uri, projected.label, ev.createdAt);
+    if (projected.node) {
+      this.upsertGraphNode(projected.node.type, projected.node.uri, projected.node.label, ev.createdAt);
+    }
+    for (const edge of projected.edges) {
+      this.applyCoordinationEdge(edge, ev.createdAt);
+    }
+  }
+
+  /** PLNR-316: one edge from a coordination event's projection — see `ProjectedEdgeDescriptor`'s
+   *  own doc comment for the link/unlink split. Factored out of `applyCoordinationEvent` because
+   *  a single event may project more than one edge (none do yet, but the shape is per-edge, not
+   *  per-event, to keep it that way when one does). */
+  private applyCoordinationEdge(edge: ProjectedEdgeDescriptor, now: string): void {
+    if (edge.op === 'link') {
+      const fromId = this.upsertGraphNode(edge.from.type, edge.from.uri, edge.from.label, now);
+      const toId = this.upsertGraphNode(edge.to.type, edge.to.uri, edge.to.label, now);
+      this.linkGraphEdge(edge.type, fromId, toId, now, edge.provenance);
+    } else {
+      const fromId = this.findGraphNodeId(edge.from.uri);
+      const toId = this.findGraphNodeId(edge.to.uri);
+      if (fromId && toId) this.unlinkGraphEdge(edge.type, fromId, toId);
+    }
   }
 
   /**

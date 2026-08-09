@@ -110,6 +110,44 @@ export interface ProjectedNodeDescriptor {
   label: string;
 }
 
+/**
+ * One graph edge `applyCoordinationEvent` draws (or removes) from a single event's payload —
+ * PLNR-316. Both endpoints carry a FULL node descriptor, never a bare node id (locked decision):
+ * the projector cannot read D1 mid-transaction to discover a node it has not seen, so each
+ * endpoint is upserted-or-stubbed in the SAME `transactionSync` block the edge itself is written
+ * in — a missing endpoint is never a reason to skip the edge, and `upsertGraphNode`'s
+ * `ON CONFLICT (uri)` refines the stub's label the moment a better-labelled event for that same
+ * uri lands. `op: 'unlink'` is a removal: its endpoints are only LOOKED UP, never created —
+ * stubbing a node purely to immediately delete an edge that references it would be pointless
+ * churn, and finding neither endpoint just means there is nothing to unlink (already-idempotent
+ * no-op). `provenance` names the verb that produced the edge (locked decision: e.g.
+ * `event:task.claimed`) — the same mechanism `linkGraphEdge` already gives `recordMemory`'s
+ * evidence edges (`evidence:<id>`) and `rebuildProjection`'s backfill edges
+ * (`coordination:phase_tasks` etc.), so a later drift check can tell which source wrote which
+ * edge.
+ */
+export interface ProjectedEdgeDescriptor {
+  type: MemoryEdgeType;
+  from: ProjectedNodeDescriptor;
+  to: ProjectedNodeDescriptor;
+  op: 'link' | 'unlink';
+  provenance: string;
+}
+
+/**
+ * What one coordination event projects (PLNR-316 widens PLNR-283's node-only shape): its own
+ * node — non-null only for a `*.created` arm, since an edge-only verb like `task.claimed` names
+ * no NEW entity, only a relationship between entities that already have (or get stubbed) nodes —
+ * plus zero or more edges. `node` and `edges` are independent so a verb can project a node with
+ * no edges (unchanged from before this task), edges with no new top-level node (the edge's own
+ * endpoint descriptors already carry `upsertGraphNode` everything it needs), or, in principle,
+ * both.
+ */
+export interface CoordinationProjection {
+  node: ProjectedNodeDescriptor | null;
+  edges: ProjectedEdgeDescriptor[];
+}
+
 export interface CoordinationEventForProjection {
   verb: string;
   subjectId: string;
@@ -117,39 +155,88 @@ export interface CoordinationEventForProjection {
 }
 
 /**
- * Which coordination verbs create a graph node, and what node they create (§4/§5) — the D1
+ * Which coordination verbs project a node and/or edges, and what they project (§4/§5) — the D1
  * event log's payload alone must carry everything needed; there is no second D1 read from inside
  * `applyCoordinationEvent`'s transaction (its projection write and cursor advance commit
  * together, and a `ctx.storage.transactionSync` block cannot await one). `task.created` is the
- * pre-existing arm (PLNR-247); `plan.created`/`doc.created`/`milestone.created` are new here.
- * `agent.registered` is deliberately ABSENT — no code anywhere in this repo ever emits it (see
- * this task's execution spec: "project ... milestones/agents WHERE AN EVENT EXISTS"), so there is
- * nothing to hook. Agents still gain graph nodes through `rebuildProjection`'s live D1 read,
- * which needs no event at all. Every other verb returns null — acknowledged (the cursor still
- * advances past it), no projection — exactly the original task.created-only projector's posture,
- * widened rather than replaced (discretion: "cover what the constellation needs to be legible,
- * not the whole verb catalogue").
+ * pre-existing arm (PLNR-247); `plan.created`/`doc.created`/`milestone.created` are PLNR-283;
+ * `task.claimed`/`task.released` are PLNR-316. `agent.registered` is deliberately ABSENT — no
+ * code anywhere in this repo ever emits it (see this task's execution spec: "project ...
+ * milestones/agents WHERE AN EVENT EXISTS"), so there is nothing to hook. Agents still gain graph
+ * nodes through `rebuildProjection`'s live D1 read, which needs no event at all; a `task.claimed`/
+ * `task.released` edge's agent endpoint is stubbed (labelled with its own id — no display name
+ * rides either payload) until that reconciliation corrects it, same as any other stub. Every
+ * other verb returns null — acknowledged (the cursor still advances past it), no projection —
+ * exactly the original task.created-only projector's posture, widened rather than replaced
+ * (discretion: "cover what the constellation needs to be legible, not the whole verb catalogue").
  *
  * A project doc rides the `artifact` node type, not a new `doc` type (locked decision — the
  * `nodes.type` CHECK constraint permits no such value); a milestone has neither a dedicated node
  * type nor an `EntityRef` arm, so it rides the generic `unknown` catch-all, which — unlike
  * `EXEMPT_NODE_TYPES`'s project/branch/revision/error — DOES have an addressable EntityRef arm
  * (`kind: 'unknown'`), so a milestone node stays independently retrievable by uri.
+ *
+ * PLNR-316 deliberately projects NO edge for `dependency.added`/`dependency.removed` or
+ * `run.created`, despite this task's own body naming all three as verbs "already fully described
+ * by payloads the system emits TODAY" — verifying each payload at its ProjectRoom.ts emit site
+ * (as the execution spec directs) shows that assumption is false for both:
+ *   - `dependency.added`/`dependency.removed` (ProjectRoom.ts's `addDependency`/`removeDependency`)
+ *     emit `{ key: task.key, dependsOn: dep.key, dependsOnProjectId? }` — the blocker is named
+ *     ONLY by its display key. `getBlockerTask` has `dep.id` in scope at the emit call site; it is
+ *     simply never serialized into the payload.
+ *   - `run.created` (ProjectRoom.ts's `insertRun`) emits `{ kind, agentTool, repoRef, anchor:
+ *     anchorType }` — `anchor` is the STRING 'task'|'plan', not the anchor's id. `anchorId` is
+ *     likewise in scope at the emit call site and not serialized.
+ * A `task`/`plan` node's uri is `noriq://{kind}/{id}` (see `buildEntityUri`) — built from the
+ * entity's real D1 id, the same id every `*.created` event's `subjectId` already carries. Building
+ * an edge endpoint from a KEY instead would mint a DIFFERENT uri (`noriq://task/{key}`) that can
+ * never converge with the canonical id-keyed node `task.created`/`rebuildProjection` write for the
+ * same task — a permanent orphan duplicate star, i.e. reintroducing this exact task's own bug
+ * one level down, not fixing it. Rather than invent a field or silently skip with no trace, this
+ * is a stated decision: both payloads need widening (an id alongside the existing key) before
+ * their edges can be projected, and that widening is out of scope here (ProjectRoom.ts is owned
+ * by a concurrent change in this tree, PLNR-318, widening `EventVerb`/`emit()` typing — payload
+ * shape is a separate, deliberate follow-up).
  */
-export function mapCoordinationEvent(ev: CoordinationEventForProjection): ProjectedNodeDescriptor | null {
+export function mapCoordinationEvent(ev: CoordinationEventForProjection): CoordinationProjection | null {
   const label = (key: string): string => {
     const v = ev.payload[key];
     return typeof v === 'string' && v.trim() ? v : ev.subjectId;
   };
   switch (ev.verb) {
     case 'task.created':
-      return { type: 'task', uri: buildEntityUri({ kind: 'task', id: ev.subjectId }), label: label('title') };
+      return { node: { type: 'task', uri: buildEntityUri({ kind: 'task', id: ev.subjectId }), label: label('title') }, edges: [] };
     case 'plan.created':
-      return { type: 'plan', uri: buildEntityUri({ kind: 'plan', id: ev.subjectId }), label: label('title') };
+      return { node: { type: 'plan', uri: buildEntityUri({ kind: 'plan', id: ev.subjectId }), label: label('title') }, edges: [] };
     case 'doc.created':
-      return { type: 'artifact', uri: buildEntityUri({ kind: 'artifact', id: ev.subjectId }), label: label('name') };
+      return { node: { type: 'artifact', uri: buildEntityUri({ kind: 'artifact', id: ev.subjectId }), label: label('name') }, edges: [] };
     case 'milestone.created':
-      return { type: 'unknown', uri: buildEntityUri({ kind: 'unknown', id: ev.subjectId }), label: label('title') };
+      return { node: { type: 'unknown', uri: buildEntityUri({ kind: 'unknown', id: ev.subjectId }), label: label('title') }, edges: [] };
+    case 'task.claimed': {
+      // Both run-minted claims (ProjectRoom.ts's `claimAnchorTaskForRun`, payload `{ agentId,
+      // expiresAt, by: 'run' }`, no title) and human/agent `claim_task` claims (payload adds
+      // `key`/`title`) share this one verb — `label('title')` falls back to the task's own id
+      // when title is absent, same fallback every other arm here already uses.
+      const agentId = ev.payload.agentId;
+      if (typeof agentId !== 'string' || !agentId) return null;
+      const task: ProjectedNodeDescriptor = { type: 'task', uri: buildEntityUri({ kind: 'task', id: ev.subjectId }), label: label('title') };
+      const agent: ProjectedNodeDescriptor = { type: 'agent', uri: buildEntityUri({ kind: 'agent', id: agentId }), label: agentId };
+      return { node: null, edges: [{ type: 'owned_by', from: task, to: agent, op: 'link', provenance: 'event:task.claimed' }] };
+    }
+    case 'task.released': {
+      // `previousHolder` is `task.claimed_by` READ BEFORE `releaseTask`'s own UPDATE clears it
+      // (ProjectRoom.ts), so it names the agent whose claim is ending — never `by` (the actor
+      // performing the release, which may be a human overriding another agent's claim, PLNR-116).
+      // Discretion: released UNLINKS rather than leaving a stale "still held" edge — `owned_by`
+      // here means "currently holds", a live coordination fact, not a historical one (that record
+      // already exists, permanently, as the task's effort episode's own `owned_by` edge to the
+      // agent that worked it — PLNR-263).
+      const agentId = ev.payload.previousHolder;
+      if (typeof agentId !== 'string' || !agentId) return null;
+      const task: ProjectedNodeDescriptor = { type: 'task', uri: buildEntityUri({ kind: 'task', id: ev.subjectId }), label: label('title') };
+      const agent: ProjectedNodeDescriptor = { type: 'agent', uri: buildEntityUri({ kind: 'agent', id: agentId }), label: agentId };
+      return { node: null, edges: [{ type: 'owned_by', from: task, to: agent, op: 'unlink', provenance: 'event:task.released' }] };
+    }
     default:
       return null;
   }

@@ -8,6 +8,7 @@ import { describe, expect, it } from 'vitest';
 import type { Env } from '../src/env';
 import { createUser, mintTokenForUser, mcpCall } from './helpers';
 import { buildEntityUri } from '@noriq-dev/shared';
+import { mapCoordinationEvent } from '../src/memory/projection';
 
 const appEnv = env as unknown as Env;
 
@@ -351,5 +352,143 @@ describe('rebuildProjection — idempotent full-state backfill (PLNR-283)', () =
       entityUri: buildEntityUri({ kind: 'task', id: taskId }), edgeTypes: ['related_to'],
     });
     expect(taskToPlan.downstream.map((n) => n.uri)).toContain(buildEntityUri({ kind: 'plan', id: planId }));
+  });
+});
+
+// PLNR-316: applyCoordinationEvent draws edges, not just stars — the coordination projector's
+// mechanism (mapCoordinationEvent returning edges too, applyCoordinationEvent upserting both
+// endpoints and linking/unlinking) proven on the verbs whose payload is genuinely complete.
+describe('mapCoordinationEvent — pure mapping (PLNR-316)', () => {
+  it('task.claimed projects an owned_by edge from the task to the agent, no top-level node', () => {
+    const projected = mapCoordinationEvent({
+      verb: 'task.claimed', subjectId: 'task_abc', payload: { key: 'PM-1', title: 'a task', agentId: 'agt_xyz', expiresAt: '2026-01-01T00:00:00.000Z' },
+    });
+    expect(projected).toEqual({
+      node: null,
+      edges: [{
+        type: 'owned_by',
+        from: { type: 'task', uri: buildEntityUri({ kind: 'task', id: 'task_abc' }), label: 'a task' },
+        to: { type: 'agent', uri: buildEntityUri({ kind: 'agent', id: 'agt_xyz' }), label: 'agt_xyz' },
+        op: 'link',
+        provenance: 'event:task.claimed',
+      }],
+    });
+  });
+
+  it('task.claimed from a run-minted claim (no key/title in the payload) still projects, task labelled by its own id', () => {
+    // ProjectRoom.ts's claimAnchorTaskForRun emits exactly this shape — no key/title.
+    const projected = mapCoordinationEvent({ verb: 'task.claimed', subjectId: 'task_abc', payload: { agentId: 'agt_xyz', expiresAt: 'x', by: 'run' } });
+    expect(projected?.edges[0]?.from.label).toBe('task_abc');
+  });
+
+  it('task.released projects the SAME edge type as an unlink, keyed off previousHolder (not `by`)', () => {
+    const projected = mapCoordinationEvent({
+      verb: 'task.released',
+      subjectId: 'task_abc',
+      payload: { key: 'PM-1', title: 'a task', by: 'agt_human_override', previousHolder: 'agt_xyz', toStatus: 'review' },
+    });
+    expect(projected).toEqual({
+      node: null,
+      edges: [{
+        type: 'owned_by',
+        from: { type: 'task', uri: buildEntityUri({ kind: 'task', id: 'task_abc' }), label: 'a task' },
+        to: { type: 'agent', uri: buildEntityUri({ kind: 'agent', id: 'agt_xyz' }), label: 'agt_xyz' },
+        op: 'unlink',
+        provenance: 'event:task.released',
+      }],
+    });
+  });
+
+  it('task.released with no live holder (defensive — should not occur in practice) projects nothing', () => {
+    expect(mapCoordinationEvent({ verb: 'task.released', subjectId: 'task_abc', payload: { previousHolder: null } })).toBeNull();
+  });
+
+  // Documented gap (see mapCoordinationEvent's own doc comment): both payloads name their
+  // second endpoint by KEY only, never by id, so no edge can be built that converges with the
+  // canonical id-keyed node `task.created`/`rebuildProjection` write for the same task. Locked
+  // in here so a future payload widening is a deliberate, visible change to this test, not a
+  // silent behavior change.
+  it('dependency.added projects nothing — payload names the blocker by key only, not by id', () => {
+    expect(mapCoordinationEvent({ verb: 'dependency.added', subjectId: 'task_abc', payload: { key: 'PM-1', dependsOn: 'PM-2' } })).toBeNull();
+  });
+
+  it('dependency.removed projects nothing — same reason', () => {
+    expect(mapCoordinationEvent({ verb: 'dependency.removed', subjectId: 'task_abc', payload: { key: 'PM-1', dependsOn: 'PM-2' } })).toBeNull();
+  });
+
+  it('run.created projects nothing — payload names the anchor TYPE, not the anchor id', () => {
+    expect(mapCoordinationEvent({ verb: 'run.created', subjectId: 'run_abc', payload: { kind: 'build', agentTool: 'claude', repoRef: 'main', anchor: 'task' } })).toBeNull();
+  });
+});
+
+describe('applyCoordinationEvent draws edges end to end (PLNR-316)', () => {
+  it('claiming a task through ProjectRoom and running the projector produces an owned_by edge, no manual rebuild', async () => {
+    const { token, projectId } = await newOwnedProject('pm-316-claim@example.com', 'PM316CL');
+    const task = await mcpCall(token, 'create_task', { projectId, title: 'claim-edge task', tags: ['pm-316'], allowNewTags: true });
+    if (task.isError) throw new Error(`create_task failed: ${task.text}`);
+    const taskId = task.body.id as string;
+    const claim = await mcpCall(token, 'claim_task', { projectId, taskId });
+    if (claim.isError) throw new Error(`claim_task failed: ${claim.text}`);
+
+    const { agentId } = await appEnv.DB.prepare('SELECT claimed_by AS agentId FROM tasks WHERE id = ?')
+      .bind(taskId).first<{ agentId: string }>() ?? {};
+    expect(agentId).toBeTruthy();
+
+    const first = await memory(projectId).runProjector(projectId);
+    expect(first.applied).toBeGreaterThan(0);
+
+    const taskUri = buildEntityUri({ kind: 'task', id: taskId });
+    const agentUri = buildEntityUri({ kind: 'agent', id: agentId! });
+    const neighborhood = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: taskUri, edgeTypes: ['owned_by'] });
+    expect(neighborhood.downstream.map((n) => n.uri)).toEqual([agentUri]);
+    expect(await memory(projectId)._edgeProvenance(projectId, 'owned_by', taskUri, agentUri)).toBe('event:task.claimed');
+
+    // The agent's own node was never separately created by any event (agent.registered is
+    // never emitted) — it was STUBBED as this edge's endpoint, labelled with its own id.
+    const agentAsSeed = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: agentUri });
+    expect(agentAsSeed.coverage.reasons).not.toContain('seed-not-found');
+
+    // Idempotent: re-running the projector over the now-consumed range writes nothing new.
+    const edgesAfterFirst = await memory(projectId)._countEdges(projectId);
+    const second = await memory(projectId).runProjector(projectId);
+    expect(second.applied).toBe(0);
+    expect(await memory(projectId)._countEdges(projectId)).toBe(edgesAfterFirst);
+  });
+
+  it('releasing the task unlinks the owned_by edge; the agent stub node survives', async () => {
+    const { token, projectId } = await newOwnedProject('pm-316-release@example.com', 'PM316RL');
+    const task = await mcpCall(token, 'create_task', { projectId, title: 'release-edge task', tags: ['pm-316'], allowNewTags: true });
+    if (task.isError) throw new Error(`create_task failed: ${task.text}`);
+    const taskId = task.body.id as string;
+    const claim = await mcpCall(token, 'claim_task', { projectId, taskId });
+    if (claim.isError) throw new Error(`claim_task failed: ${claim.text}`);
+    const { agentId } = await appEnv.DB.prepare('SELECT claimed_by AS agentId FROM tasks WHERE id = ?')
+      .bind(taskId).first<{ agentId: string }>() ?? {};
+
+    // Project the claim first, so the edge genuinely exists before it is removed.
+    await memory(projectId).runProjector(projectId);
+    const taskUri = buildEntityUri({ kind: 'task', id: taskId });
+    const agentUri = buildEntityUri({ kind: 'agent', id: agentId! });
+    expect((await memory(projectId).dependencyNeighborhood(projectId, { entityUri: taskUri, edgeTypes: ['owned_by'] })).downstream.map((n) => n.uri)).toEqual([agentUri]);
+
+    const release = await mcpCall(token, 'release_task', { projectId, taskId, toStatus: 'review' });
+    if (release.isError) throw new Error(`release_task failed: ${release.text}`);
+    const edgesBeforeUnlink = await memory(projectId)._countEdges(projectId);
+    const applied = await memory(projectId).runProjector(projectId);
+    expect(applied.applied).toBeGreaterThan(0);
+
+    const afterRelease = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: taskUri, edgeTypes: ['owned_by'] });
+    expect(afterRelease.downstream).toEqual([]);
+    expect(await memory(projectId)._countEdges(projectId)).toBe(edgesBeforeUnlink - 1);
+
+    // The agent node itself is untouched by the unlink — only the edge is gone.
+    const agentAsSeed = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: agentUri });
+    expect(agentAsSeed.coverage.reasons).not.toContain('seed-not-found');
+
+    // Idempotent: re-running finds nothing left to unlink.
+    const edgesAfterUnlink = await memory(projectId)._countEdges(projectId);
+    const second = await memory(projectId).runProjector(projectId);
+    expect(second.applied).toBe(0);
+    expect(await memory(projectId)._countEdges(projectId)).toBe(edgesAfterUnlink);
   });
 });
