@@ -1053,6 +1053,9 @@ export interface ApiConstellationOmitted {
   nodes: number;
   edges: number;
   edgesDanglingPruned: number;
+  /** PLNR-315: `file`/`symbol` nodes excluded from this whole-project view before scoring —
+   *  reported so their absence reads as "this view doesn't show that", never "nothing is there". */
+  codeEntitiesExcluded: number;
 }
 
 export interface ApiConstellation {

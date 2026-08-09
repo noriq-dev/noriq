@@ -4,8 +4,8 @@
 // DO, shaping/sampling/coverage in memory/graph-queries.ts's pure `constellation`):
 //  - Bounding, tie-break determinism, dangling-edge pruning, and coverage classification are
 //    exercised directly against the PURE function with synthetic rows — no workerd/DO needed,
-//    and it is the only practical way to exceed CONSTELLATION_NODE_CEILING/EDGE_CEILING (300/600)
-//    in a fast test.
+//    and it is the only practical way to exceed CONSTELLATION_NODE_CEILING/EDGE_CEILING (1000/2000
+//    as of PLNR-315) in a fast test.
 //  - URI parity with `/memory/search`, provenance passthrough, revision-keyed determinism across
 //    real calls, the four distinct degraded states, and the REST route's auth gate are exercised
 //    against the real DO/REST stack (same technique as memory-graph-queries.test.ts).
@@ -37,7 +37,7 @@ describe('constellation (pure) — bounding', () => {
   it('returns exactly CONSTELLATION_NODE_CEILING nodes when the graph exceeds it, and counts the rest as omitted', () => {
     const total = CONSTELLATION_NODE_CEILING + 5;
     // Zero-padded ids sort lexicographically identically to numerically — with every OTHER
-    // scoring input tied, the uri ASC tie-break alone decides which 300 of 305 survive.
+    // scoring input tied, the uri ASC tie-break alone decides which 1000 of 1005 survive.
     const nodes = Array.from({ length: total }, (_, i) => node(`noriq://task/n${String(i).padStart(4, '0')}`, 'task'));
     const result = constellation(1, { nodes, edges: [], memoryItems: [], episodes: [] }, { codeGraphPopulated: true });
 
@@ -45,14 +45,16 @@ describe('constellation (pure) — bounding', () => {
     expect(result.omitted.nodes).toBe(5);
     expect(result.coverage.complete).toBe(false);
     expect(result.coverage.reasons).toContain('row-limit-reached');
-    // uri ASC tie-break: the first 300 lexicographically sorted uris survive.
+    // uri ASC tie-break: the first 1000 lexicographically sorted uris survive.
     expect(result.nodes[0]!.uri).toBe('noriq://task/n0000');
-    expect(result.nodes.at(-1)!.uri).toBe('noriq://task/n0299');
-    expect(result.nodes.some((n) => n.uri === 'noriq://task/n0300')).toBe(false);
+    expect(result.nodes.at(-1)!.uri).toBe('noriq://task/n0999');
+    expect(result.nodes.some((n) => n.uri === 'noriq://task/n1000')).toBe(false);
   });
 
   it('returns exactly CONSTELLATION_EDGE_CEILING edges when surviving edges exceed it, independent of node truncation', () => {
-    const nodeCount = 10;
+    // 20 nodes * 19 non-self pairs * 10 edge types = 3800 possible edges — comfortably past
+    // CONSTELLATION_EDGE_CEILING + 1 (2001) so the `break outer` below always has enough supply.
+    const nodeCount = 20;
     const nodes = Array.from({ length: nodeCount }, (_, i) => node(`noriq://task/n${i}`, 'task'));
     const types = ['depends_on', 'imports', 'calls', 'tests', 'implements', 'modifies', 'related_to', 'blocks', 'contradicts', 'supersedes'];
     const edges: ConstellationRawEdge[] = [];
@@ -226,11 +228,83 @@ describe('constellation (pure) — the four distinct coverage states', () => {
     expect(result.coverage.reasons).not.toContain('graph-empty');
   });
 
-  it('a fully populated, indexed project reports complete coverage', () => {
+  it('a fully populated, indexed project reports complete coverage, and its file node is excluded per PLNR-315', () => {
     const task = node('noriq://task/t1', 'task');
     const file = node('noriq://file/PROJ/repo-x/a.ts', 'file');
     const result = constellation(1, { nodes: [task, file], edges: [], memoryItems: [], episodes: [] }, { codeGraphPopulated: true });
     expect(result.coverage).toEqual({ complete: true, reasons: [] });
+    expect(result.nodes).toHaveLength(1);
+    expect(result.nodes[0]!.uri).toBe('noriq://task/t1');
+    expect(result.omitted.codeEntitiesExcluded).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// PLNR-315: file/symbol nodes are excluded from the whole-project constellation, server-side and
+// BEFORE scoring — so they can never eat the node ceiling — and their exclusion is reported
+// rather than silent. Ego-network expansion and explain_project_area (retrieval.ts) are untouched
+// by this task; nothing here exercises those primitives.
+// ---------------------------------------------------------------------------------------
+describe('constellation (pure) — PLNR-315 code entity exclusion', () => {
+  it('excludes every file and symbol node from the returned set, regardless of how well-connected or important they score', () => {
+    const task = node('noriq://task/t1', 'task');
+    const file = node('noriq://file/PROJ/repo-x/a.ts', 'file');
+    const symbol = node('noriq://symbol/PROJ/repo-x/a.ts#Foo', 'symbol');
+    const edges = [edge('depends_on', 'noriq://task/t1', file.uri), edge('imports', file.uri, symbol.uri)];
+    const result = constellation(1, { nodes: [task, file, symbol], edges, memoryItems: [], episodes: [] }, { codeGraphPopulated: true });
+
+    expect(result.nodes.map((n) => n.type)).toEqual(['task']);
+    expect(result.nodes.some((n) => n.type === 'file' || n.type === 'symbol')).toBe(false);
+  });
+
+  it('reports the excluded count via omitted.codeEntitiesExcluded rather than silently dropping them', () => {
+    const task = node('noriq://task/t1', 'task');
+    const files = Array.from({ length: 7 }, (_, i) => node(`noriq://file/PROJ/repo-x/f${i}.ts`, 'file'));
+    const symbols = Array.from({ length: 3 }, (_, i) => node(`noriq://symbol/PROJ/repo-x/s${i}`, 'symbol'));
+    const result = constellation(1, { nodes: [task, ...files, ...symbols], edges: [], memoryItems: [], episodes: [] }, { codeGraphPopulated: true });
+
+    expect(result.omitted.codeEntitiesExcluded).toBe(10);
+    expect(result.nodes).toHaveLength(1);
+  });
+
+  it('excluded code entities never consume the node ceiling — a task/memory population under the ceiling survives whole even when code entities vastly outnumber it', () => {
+    const coordinationNodes = Array.from({ length: 5 }, (_, i) => node(`noriq://task/t${i}`, 'task'));
+    // Far more file nodes than CONSTELLATION_NODE_CEILING — if exclusion happened AFTER sampling
+    // (or client-side), these would crowd out every coordination node instead.
+    const codeNodes = Array.from({ length: CONSTELLATION_NODE_CEILING * 3 }, (_, i) => node(`noriq://file/PROJ/repo-x/f${i}.ts`, 'file'));
+    const result = constellation(1, { nodes: [...coordinationNodes, ...codeNodes], edges: [], memoryItems: [], episodes: [] }, { codeGraphPopulated: true });
+
+    expect(result.nodes).toHaveLength(5);
+    expect(result.nodes.every((n) => n.type === 'task')).toBe(true);
+    expect(result.omitted.nodes).toBe(0); // no ceiling casualty among the eligible population
+    expect(result.omitted.codeEntitiesExcluded).toBe(CONSTELLATION_NODE_CEILING * 3);
+    expect(result.coverage.reasons).not.toContain('row-limit-reached');
+  });
+
+  it('prunes an edge to an excluded code entity as dangling, exactly like an edge to an unsampled node — no separate counter', () => {
+    const task = node('noriq://task/t1', 'task');
+    const file = node('noriq://file/PROJ/repo-x/a.ts', 'file');
+    const edges = [edge('modifies', task.uri, file.uri)];
+    const result = constellation(1, { nodes: [task, file], edges, memoryItems: [], episodes: [] }, { codeGraphPopulated: true });
+
+    expect(result.edges).toEqual([]);
+    expect(result.omitted.edgesDanglingPruned).toBe(1);
+    expect(result.omitted.edges).toBe(0); // not a ceiling casualty
+  });
+
+  it('a project with ONLY code entities is not graph-empty — that reason is reserved for a project with zero nodes at all', () => {
+    const file = node('noriq://file/PROJ/repo-x/a.ts', 'file');
+    const result = constellation(1, { nodes: [file], edges: [], memoryItems: [], episodes: [] }, { codeGraphPopulated: true });
+
+    expect(result.nodes).toEqual([]);
+    expect(result.omitted.codeEntitiesExcluded).toBe(1);
+    expect(result.coverage.reasons).not.toContain('graph-empty');
+  });
+
+  it('a genuinely empty project (zero rows) still reports graph-empty, and codeEntitiesExcluded is zero, not silently omitted', () => {
+    const result = constellation(0, { nodes: [], edges: [], memoryItems: [], episodes: [] }, { codeGraphPopulated: false });
+    expect(result.coverage.reasons).toContain('graph-empty');
+    expect(result.omitted.codeEntitiesExcluded).toBe(0);
   });
 });
 
@@ -251,7 +325,7 @@ interface MemRpc {
     edgeCeiling: number;
     nodes: Array<{ nodeId: string; uri: string; type: string; label: string; provenance?: unknown }>;
     edges: Array<{ type: string; fromNodeId: string; toNodeId: string; provenance: string | null }>;
-    omitted: { nodes: number; edges: number; edgesDanglingPruned: number };
+    omitted: { nodes: number; edges: number; edgesDanglingPruned: number; codeEntitiesExcluded: number };
     coverage: { complete: boolean; reasons: string[] };
   }>;
 }
@@ -351,7 +425,7 @@ describe('POST /api/projects/:pid/memory/constellation (REST)', () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
       memoryRevision: number; nodeCeiling: number; edgeCeiling: number;
-      nodes: unknown[]; edges: unknown[]; omitted: { nodes: number; edges: number; edgesDanglingPruned: number };
+      nodes: unknown[]; edges: unknown[]; omitted: { nodes: number; edges: number; edgesDanglingPruned: number; codeEntitiesExcluded: number };
       coverage: { complete: boolean; reasons: string[] };
     };
     expect(body.nodeCeiling).toBe(CONSTELLATION_NODE_CEILING);

@@ -253,14 +253,28 @@ export function changeImpact(
 // isolation.
 // ---------------------------------------------------------------------------------------
 
-/** A real project renders smoothly at a few hundred stars — well past that, a force-directed
- *  canvas degrades before a human can read it. Independent of RETRIEVAL_DEFAULTS' single-seed
- *  neighborhood ceilings (retrieval.ts): this samples the WHOLE project, not a bounded expansion
- *  from one seed, so it needs its own, larger numbers. Edge ceiling is 2x the node ceiling — a
- *  reasonably dense sampled subgraph has more edges than nodes, and a canvas reads a dense knot
- *  of edges before it reads a large count of stars. */
-export const CONSTELLATION_NODE_CEILING = 300;
-export const CONSTELLATION_EDGE_CEILING = 600;
+/** PLNR-315: raised from 300/600 — the real wall on this endpoint is response SIZE (§18's
+ *  "comfortably bounded" budget), not render time. `starmap-layout.ts`'s grid-bucketed relaxation
+ *  (`computeStarMap`) stays near-linear at 1000 nodes / 2000 edges; measured on this change (see
+ *  its release note) well under a frame budget for a one-time, call-once-per-fetch layout pass,
+ *  never a per-frame simulation. Independent of RETRIEVAL_DEFAULTS' single-seed neighborhood
+ *  ceilings (retrieval.ts): this samples the WHOLE project, not a bounded expansion from one seed,
+ *  so it needs its own, larger numbers. Edge ceiling is 2x the node ceiling — a reasonably dense
+ *  sampled subgraph has more edges than nodes, and a canvas reads a dense knot of edges before it
+ *  reads a large count of stars. */
+export const CONSTELLATION_NODE_CEILING = 1000;
+export const CONSTELLATION_EDGE_CEILING = 2000;
+
+/** PLNR-315: `file`/`symbol` nodes never enter the constellation at all — filtered out of the
+ *  candidate population BEFORE scoring/sampling (locked decision), not after. Once a repository
+ *  index lands, code entities outnumber memories/tasks/docs/plans by orders of magnitude and would
+ *  otherwise eat the entire node ceiling, leaving this bounded OVERVIEW technically full and
+ *  practically empty of the things a human opened it to see. This is a constraint on the whole-
+ *  project projection only — ego-network expansion and `explain_project_area` (retrieval.ts) are
+ *  untouched, since code entities are the point of those surfaces. A hardcoded set, not a
+ *  parameter: there is no filter UI for this (deliberately deferred), so nothing downstream needs
+ *  it to vary. */
+const CONSTELLATION_EXCLUDED_NODE_TYPES: ReadonlySet<string> = new Set(['file', 'symbol']);
 
 export interface ConstellationRawNode {
   nodeId: string;
@@ -345,7 +359,8 @@ export interface ConstellationEdge {
 }
 
 export interface ConstellationOmitted {
-  /** Nodes that existed but did not survive CONSTELLATION_NODE_CEILING sampling. */
+  /** Nodes that existed AMONG THE ELIGIBLE (non-excluded, see `codeEntitiesExcluded` below)
+   *  population but did not survive CONSTELLATION_NODE_CEILING sampling. */
   nodes: number;
   /** Edges whose both endpoints survived node sampling but did not survive
    *  CONSTELLATION_EDGE_CEILING sampling. */
@@ -355,8 +370,17 @@ export interface ConstellationOmitted {
    *  the pruned ones into coverage"). A human reads the two differently: "there was more graph
    *  than fit" versus "this edge's other end wasn't important enough to make the cut". An edge
    *  touching NEITHER selected node is not counted anywhere — it was never a candidate for this
-   *  response at all. */
+   *  response at all. Also where an edge to an EXCLUDED code entity lands (PLNR-315) — an excluded
+   *  node is simply never a candidate for node selection, so the existing dangling-prune semantics
+   *  already apply to it unchanged; no separate counter needed for that case. */
   edgesDanglingPruned: number;
+  /** PLNR-315: `file`/`symbol` nodes that existed in the project but were excluded from this
+   *  whole-project view BEFORE scoring/sampling — reported so their absence reads as "this view
+   *  deliberately does not show that" rather than "nothing is there" (§20 coverage discipline).
+   *  These never consumed the node ceiling and are NOT counted in `nodes` above (that field is
+   *  ceiling casualties among the ELIGIBLE population only — a different claim). Zero on a project
+   *  with no repository index, since there is nothing of these types to exclude. */
+  codeEntitiesExcluded: number;
 }
 
 export interface ConstellationResult {
@@ -433,13 +457,22 @@ export function constellation(memoryRevision: number, rows: ConstellationInputRo
   const memoryById = new Map(rows.memoryItems.map((m) => [m.id, m]));
   const episodeById = new Map(rows.episodes.map((e) => [e.id, e]));
 
+  // PLNR-315: code entities are filtered out of the candidate population here, before ANY scoring
+  // or sampling runs — so they can never displace a memory/task/doc/plan for a ceiling slot. Uses
+  // the RAW row count (`rows.nodes.length`, below) for `graph-empty`, not this filtered count: a
+  // project that has ONLY an indexed repository (zero coordination/memory nodes) is genuinely
+  // non-empty, just entirely excluded from this one view — conflating the two would misreport a
+  // populated-but-code-only project as "nothing has ever been recorded".
+  const eligibleNodes = rows.nodes.filter((n) => !CONSTELLATION_EXCLUDED_NODE_TYPES.has(n.type));
+  const codeEntitiesExcluded = rows.nodes.length - eligibleNodes.length;
+
   const degreeByNodeId = new Map<string, number>();
   for (const e of rows.edges) {
     degreeByNodeId.set(e.fromNodeId, (degreeByNodeId.get(e.fromNodeId) ?? 0) + 1);
     degreeByNodeId.set(e.toNodeId, (degreeByNodeId.get(e.toNodeId) ?? 0) + 1);
   }
 
-  const scored: ScoredNode[] = rows.nodes.map((n) => {
+  const scored: ScoredNode[] = eligibleNodes.map((n) => {
     let kind: string | null = null;
     let authority: number | null = null;
     let validity: string | null = null;
@@ -491,7 +524,7 @@ export function constellation(memoryRevision: number, rows: ConstellationInputRo
     codeGraphPopulated: coverageInputs.codeGraphPopulated,
     edgeTypesWithNoWriter: [], // no fixed edge-type dependency to check — the constellation shows whatever exists
     truncated: omittedNodes > 0 || omittedEdges > 0,
-    graphEmpty: totalNodes === 0,
+    graphEmpty: rows.nodes.length === 0, // raw count (see eligibleNodes comment above) — never the post-exclusion count
   });
 
   return {
@@ -516,7 +549,7 @@ export function constellation(memoryRevision: number, rows: ConstellationInputRo
       };
     }),
     edges: selectedEdges.map((e) => ({ type: e.type, fromNodeId: e.fromNodeId, toNodeId: e.toNodeId, provenance: e.provenance })),
-    omitted: { nodes: omittedNodes, edges: omittedEdges, edgesDanglingPruned },
+    omitted: { nodes: omittedNodes, edges: omittedEdges, edgesDanglingPruned, codeEntitiesExcluded },
     coverage,
   };
 }

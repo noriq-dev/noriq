@@ -74,8 +74,8 @@ const emptyFrame = { text: '', itemsIncluded: 0, itemsOmitted: 0, truncated: fal
 const baseCoverage = { complete: true, reasons: ['graph-empty'] as ApiGraphCoverageReason[] };
 function emptyConstellation(overrides: Partial<ApiConstellation> = {}): ApiConstellation {
   return {
-    memoryRevision: 1, nodeCeiling: 300, edgeCeiling: 600,
-    nodes: [], edges: [], omitted: { nodes: 0, edges: 0, edgesDanglingPruned: 0 },
+    memoryRevision: 1, nodeCeiling: 1000, edgeCeiling: 2000,
+    nodes: [], edges: [], omitted: { nodes: 0, edges: 0, edgesDanglingPruned: 0, codeEntitiesExcluded: 0 },
     coverage: baseCoverage, ...overrides,
   };
 }

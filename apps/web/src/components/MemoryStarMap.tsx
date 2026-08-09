@@ -688,6 +688,11 @@ export function MemoryStarMap({
   const isEmpty = reasons.includes('graph-empty');
   const isUnindexed = reasons.includes('code-graph-empty') && !isEmpty;
   const isTruncated = reasons.includes('row-limit-reached') && (data?.omitted.nodes ?? 0) + (data?.omitted.edges ?? 0) > 0;
+  // PLNR-315: file/symbol nodes are excluded server-side before scoring, so their absence needs
+  // its own note — distinct from `isTruncated` (a ceiling casualty), since this can be nonzero on
+  // a project that is otherwise nowhere near either ceiling.
+  const excludedCodeEntities = data?.omitted.codeEntitiesExcluded ?? 0;
+  const hasExcludedCodeEntities = excludedCodeEntities > 0;
 
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
@@ -753,7 +758,7 @@ export function MemoryStarMap({
             {selectedStar && (
               <DetailPanel star={selectedStar} onClose={() => setSelectedId(null)} onOpenEgoNetwork={onOpenEgoNetwork} onOpenInspector={onOpenInspector} />
             )}
-            {(isUnindexed || isTruncated) && (
+            {(isUnindexed || isTruncated || hasExcludedCodeEntities) && (
               <div style={{ position: 'absolute', left: 12, bottom: 12, maxWidth: 380, padding: '9px 12px', borderRadius: 10, background: 'rgba(245,166,35,.08)', border: '1px solid rgba(245,166,35,.3)' }}>
                 {isUnindexed && (
                   <div style={{ fontSize: 11, color: 'var(--text-soft)', lineHeight: 1.5 }}>
@@ -763,6 +768,11 @@ export function MemoryStarMap({
                 {isTruncated && (
                   <div style={{ fontSize: 11, color: 'var(--text-soft)', lineHeight: 1.5, marginTop: isUnindexed ? 6 : 0 }}>
                     Truncated sample — {data!.omitted.nodes} node{data!.omitted.nodes === 1 ? '' : 's'} and {data!.omitted.edges} edge{data!.omitted.edges === 1 ? '' : 's'} omitted by the server's ceiling ({data!.nodeCeiling} nodes / {data!.edgeCeiling} edges), plus {data!.omitted.edgesDanglingPruned} edge{data!.omitted.edgesDanglingPruned === 1 ? '' : 's'} dropped because their other endpoint wasn't sampled.
+                  </div>
+                )}
+                {hasExcludedCodeEntities && (
+                  <div style={{ fontSize: 11, color: 'var(--text-soft)', lineHeight: 1.5, marginTop: isUnindexed || isTruncated ? 6 : 0 }}>
+                    {excludedCodeEntities.toLocaleString()} code entit{excludedCodeEntities === 1 ? 'y' : 'ies'} (file/symbol) not shown — this whole-project map excludes code entities to keep the overview readable. Open ego-network exploration on a task or memory to see them.
                   </div>
                 )}
               </div>

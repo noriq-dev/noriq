@@ -40,11 +40,11 @@ const baseCoverage = { complete: true, reasons: [] as ApiGraphCoverageReason[] }
 function response(overrides: Partial<ApiConstellation>): ApiConstellation {
   return {
     memoryRevision: 1,
-    nodeCeiling: 300,
-    edgeCeiling: 600,
+    nodeCeiling: 1000,
+    edgeCeiling: 2000,
     nodes: [],
     edges: [],
-    omitted: { nodes: 0, edges: 0, edgesDanglingPruned: 0 },
+    omitted: { nodes: 0, edges: 0, edgesDanglingPruned: 0, codeEntitiesExcluded: 0 },
     coverage: baseCoverage,
     ...overrides,
   };
@@ -88,7 +88,7 @@ describe('the four honest states', () => {
     };
     vi.spyOn(api, 'memoryConstellation').mockResolvedValue(response({
       nodes: [node],
-      omitted: { nodes: 12, edges: 4, edgesDanglingPruned: 2 },
+      omitted: { nodes: 12, edges: 4, edgesDanglingPruned: 2, codeEntitiesExcluded: 0 },
       coverage: { complete: false, reasons: ['row-limit-reached'] },
     }));
     mount();
@@ -96,6 +96,22 @@ describe('the four honest states', () => {
     expect(text()).toMatch(/truncated sample/i);
     expect(text()).toMatch(/12 node/);
     expect(text()).toMatch(/4 edge/);
+  });
+
+  it('reports excluded code entities (PLNR-315) without the row-limit-reached banner when nothing was truncated by the ceiling', async () => {
+    const node = {
+      nodeId: 'n1', uri: 'noriq://task/t1', type: 'task', kind: null, label: 'A task',
+      authority: null, validity: null, isLead: null, leadReasons: null, degree: 0, groupKey: 'task',
+    };
+    vi.spyOn(api, 'memoryConstellation').mockResolvedValue(response({
+      nodes: [node],
+      omitted: { nodes: 0, edges: 0, edgesDanglingPruned: 0, codeEntitiesExcluded: 4200 },
+      coverage: { complete: true, reasons: [] },
+    }));
+    mount();
+    await tick();
+    expect(text()).toMatch(/4,?200 code entit(y|ies)/i);
+    expect(text()).not.toMatch(/truncated sample/i);
   });
 });
 
