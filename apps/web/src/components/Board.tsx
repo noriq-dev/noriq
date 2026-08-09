@@ -1,4 +1,4 @@
-// Board — kanban with a two-row filter bar (milestones / tags) and breathing room.
+// Board — kanban with composable milestone, task-attribute, plan, tag, and text filters.
 import { useState } from 'react';
 import { api } from '../api';
 import type { AppStore } from '../store';
@@ -47,6 +47,7 @@ export function Board({ store }: { store: AppStore }) {
   // priority <= this. 5 = any, since 0 is now P0, a real value (PLNR-231).
   const [typeFilter, setTypeFilter] = useState('');
   const [stateFilter, setStateFilter] = useState<'' | 'unblocked' | 'grabbable' | 'overdue'>('');
+  const [planFilter, setPlanFilter] = useState<'' | 'planned' | 'standalone'>('');
   // Multi-select for bulk triage (PLNR-125): shift/cmd-click gathers cards; a plain
   // click still opens the drawer, so the two gestures never fight.
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -61,6 +62,9 @@ export function Board({ store }: { store: AppStore }) {
   const msById = new Map(milestones.map((m) => [m.id, m]));
   const tagsExpanded = tagsOpen ?? tags.length <= 25;
   const activeTag = tagFilter ? tagById.get(tagFilter) ?? null : null;
+  // Plan membership is represented by phase_tasks, not a task column. Keep this derived from
+  // the snapshot so the filter follows the same canonical relationship as PlansView.
+  const planTaskIds = new Set((snapshot?.phaseTasks ?? []).map((pt) => pt.taskId));
 
   // A task shows on the selected board; tasks with no board (shouldn't happen post-
   // migration) fall onto the default board so nothing ever disappears.
@@ -84,6 +88,7 @@ export function Board({ store }: { store: AppStore }) {
       (tagFilter === null || t.tagIds.includes(tagFilter)) &&
       (prioFilter >= 5 || t.priority <= prioFilter) &&
       (typeFilter === '' || t.type === typeFilter) &&
+      (planFilter === '' || (planFilter === 'planned' ? planTaskIds.has(t.id) : !planTaskIds.has(t.id))) &&
       stateOk(t) &&
       (q === '' ||
         t.title.toLowerCase().includes(q) ||
@@ -197,6 +202,11 @@ export function Board({ store }: { store: AppStore }) {
           <option value="unblocked">unblocked</option>
           <option value="grabbable">up for grabs</option>
           <option value="overdue">overdue</option>
+        </FilterSelect>
+        <FilterSelect value={planFilter} onChange={(v) => setPlanFilter(v as typeof planFilter)} active={planFilter !== ''}>
+          <option value="">plan: any</option>
+          <option value="planned">in a plan</option>
+          <option value="standalone">not in a plan</option>
         </FilterSelect>
         <div style={{ flex: 1 }} />
         <button
