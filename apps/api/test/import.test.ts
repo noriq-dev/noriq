@@ -59,7 +59,7 @@ describe('D1 import / restore (PLNR-218)', () => {
     }
 
     const res = await importSnap(before);
-    expect(res.status).toBe(200);
+    expect(res.status, await res.clone().text()).toBe(200);
     const body = (await res.json()) as { ok: boolean; imported: Record<string, number> };
     expect(body.ok).toBe(true);
     expect(body.imported.tasks).toBe(before.counts.tasks);
@@ -69,6 +69,22 @@ describe('D1 import / restore (PLNR-218)', () => {
     for (const t of Object.keys(before.tables)) {
       expect(canon(after.tables[t]!)).toEqual(canon(before.tables[t]!));
     }
+  });
+
+  it('restores an empty trigger-populated presence projection exactly', async () => {
+    const before = await exportSnap();
+    expect(before.counts.agent_presences).toBeGreaterThan(0);
+    const withoutPresences = structuredClone(before);
+    withoutPresences.tables.agent_presences = [];
+    withoutPresences.counts.agent_presences = 0;
+
+    const res = await importSnap(withoutPresences);
+    expect(res.status, await res.clone().text()).toBe(200);
+    const after = await exportSnap();
+    expect(after.counts.agent_presences, JSON.stringify(after.tables.agent_presences)).toBe(0);
+
+    const restore = await importSnap(before);
+    expect(restore.status, await restore.clone().text()).toBe(200);
   });
 
   it('REPLACES data — importing an older snapshot drops rows created since', async () => {

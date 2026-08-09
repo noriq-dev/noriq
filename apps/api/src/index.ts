@@ -50,6 +50,7 @@ import { assembleContextPack } from './memory/context-pack';
 import { readBoundedBody, verifyBatchChecksum, decodeBatchRows, MAX_INGEST_BATCH_BYTES, INGEST_TOKEN_TTL_SECONDS } from './memory/ingest';
 import { normalizeVerificationReport } from './memory/verification';
 import { sweepPendingEpisodeJobs } from './memory/episodes';
+import { classifyAgentLifecycle } from './lib/agent-lifecycle';
 import { AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget, isTerminalRunStatus, normalizeProjectKey, IndexGenerationManifest, ContextPackRole, type RunnerIndexCursor } from '@noriq-dev/shared';
 import { auditAuthorizationParity, reconcileLegacyGroupGrants } from './lib/authorization-parity';
 import { evaluateMemoryAcceptance } from './memory/acceptance';
@@ -2652,6 +2653,14 @@ app.delete('/api/groups/:gid/members/:uid', userAuth, async (c) => {
 
 // --- agent management (admin humans) ------------------------------------------------
 
+// PLNR-362's non-mutating production gate. Applying the additive migration classifies existing
+// facts but hides/deletes nothing; operators inspect these grouped counts before PLNR-363 is ever
+// allowed to archive through its bounded sweep.
+app.get('/api/admin/agent-lifecycle/classification', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  return c.json(await classifyAgentLifecycle(c.env.DB));
+});
+
 app.get('/api/agents', userAuth, async (c) => {
   // Agents are project-local; scope the roster to a project when given (the Agents tab
   // passes the current project).
@@ -3501,11 +3510,14 @@ app.post('/api/runs/:runId/agent', agentAuth, async (c) => {
   // to the agent) → link back. 0026 made this cycle survivable by dropping NOT NULL from
   // oauth_tokens.agent_id; PLNR-143 is where the cycle stops existing at all.
   await c.env.DB.prepare(
-    `INSERT INTO agents (id, name, label, role, status, kind, user_id, project_id, runner_id, allowed_tools, last_seen_at, created_at)
-     VALUES (?, ?, ?, ?, 'active', 'agent', ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO agents (
+       id, name, label, role, status, kind, actor_class, user_id, project_id, runner_id,
+       allowed_tools, last_seen_at, lineage_status, lineage_reason, lifecycle_updated_at, created_at
+     ) VALUES (?, ?, ?, ?, 'active', 'agent', 'runner_agent', ?, ?, ?, ?, ?,
+               'partial', 'execution_contract_pending', ?, ?)`,
   ).bind(
     agentId, name, label, b.role, conn.userId, run.projectId, run.runnerId,
-    b.allowedTools ? JSON.stringify(b.allowedTools) : null, nowIso(), nowIso(),
+    b.allowedTools ? JSON.stringify(b.allowedTools) : null, nowIso(), nowIso(), nowIso(),
   ).run();
   const tokens = await issueTokens(c.env.DB, conn.clientId, conn.userId, agentId, 'mcp');
   await c.env.DB.batch([

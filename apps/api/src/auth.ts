@@ -189,6 +189,11 @@ export async function resolveSessionAgent(env: Env, conn: Connection, sessionId:
     // user's token to act AS that user's agent (PLNR-101).
     if (existing.userId !== conn.userId) throw new Error('session id does not belong to this connection');
     if (existing.status === 'revoked') throw new Error('this session’s agent was revoked');
+    // Session resolution happens once per MCP request, so it is the one reliable presence touch
+    // shared by every tool. Migration 0081 projects this update into agent_presences; keeping the
+    // compatibility columns fresh also makes old readers less dishonest during the rollout.
+    await env.DB.prepare("UPDATE agents SET status = 'active', last_seen_at = ? WHERE id = ?")
+      .bind(nowIso(), existing.id).run();
     return existing;
   }
   const id = newId('agt');
@@ -199,9 +204,16 @@ export async function resolveSessionAgent(env: Env, conn: Connection, sessionId:
   // parent_agent_id is the connection's copilot. Null only for a token minted before
   // PLNR-155 — those sessions stay parentless rather than being adopted by a guess.
   await env.DB.prepare(
-    `INSERT INTO agents (id, name, role, status, kind, user_id, oauth_token_id, session_id, parent_agent_id, created_at)
-     VALUES (?, ?, 'worker', 'idle', 'copilot', ?, ?, ?, ?, ?)`,
-  ).bind(id, name, conn.userId, conn.tokenId, sessionId, conn.copilotId, nowIso()).run();
+    `INSERT INTO agents (
+       id, name, role, status, kind, actor_class, user_id, oauth_token_id, session_id,
+       parent_agent_id, last_seen_at, lineage_status, lineage_reason, lifecycle_updated_at, created_at
+     ) VALUES (?, ?, 'worker', 'idle', 'copilot', 'session_copilot', ?, ?, ?, ?, ?,
+               'partial', ?, ?, ?)`,
+  ).bind(
+    id, name, conn.userId, conn.tokenId, sessionId, conn.copilotId, nowIso(),
+    conn.copilotId ? 'connection_owner_not_immediate_execution' : 'immediate_parent_unknown',
+    nowIso(), nowIso(),
+  ).run();
   return { id, name, role: 'worker', userId: conn.userId, kind: 'copilot' };
 }
 

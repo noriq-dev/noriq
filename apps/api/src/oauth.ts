@@ -264,9 +264,11 @@ async function createConnectionCopilot(db: D1Database, userId: string, clientId:
   const label = `${first}-${client}`;
   const id = newId('agt');
   await db.prepare(
-    `INSERT INTO agents (id, name, label, role, status, kind, user_id, created_at)
-     VALUES (?, ?, ?, 'worker', 'idle', 'copilot', ?, ?)`,
-  ).bind(id, `${label}-${id.slice(-6)}`, label, userId, nowIso()).run();
+    `INSERT INTO agents (
+       id, name, label, role, status, kind, actor_class, user_id,
+       lineage_status, lifecycle_updated_at, created_at
+     ) VALUES (?, ?, ?, 'worker', 'idle', 'copilot', 'connection_copilot', ?, 'complete', ?, ?)`,
+  ).bind(id, `${label}-${id.slice(-6)}`, label, userId, nowIso(), nowIso()).run();
   return id;
 }
 
