@@ -483,6 +483,9 @@ export const ContextPackMemoryExcerpt = z.object({
   id: z.string(),
   memoryKind: MemoryKind,
   statement: z.string(),
+  /** True only when a bounded presentation surface shortened the canonical statement. The
+   * canonical memory row is untouched; consumers must present this as an excerpt. */
+  statementTruncated: z.boolean().optional(),
   authority: AuthorityLevel,
   confidence: z.number().min(0).max(1).nullable(),
   validity: z.string(),
@@ -725,6 +728,7 @@ export const ProjectMemoryStaleWarning = z.object({
   memoryItemId: z.string(),
   kind: MemoryKind.nullable(),
   statement: z.string().nullable(),
+  statementTruncated: z.boolean().optional(),
   validity: z.string(),
   reason: z.string().nullable(),
   at: z.string().datetime(),

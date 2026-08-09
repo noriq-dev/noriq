@@ -3,7 +3,7 @@ import type { AgentIdentity } from './auth';
 import { TASK_NOT_IN_PROPOSED_PLAN, TASK_NOT_PHASE_BLOCKED, TASK_NOT_PROPOSED_SPINOFF, USER_PROJECT_WHERE, tokenProjectWhere } from './lib/visibility';
 import type { ProjectMemoryStub, MemoryItemRecord } from './lib/project-memory';
 import { nowIso } from './lib/util';
-import { allocateBudget, fillGreedy, type SectionSpec } from './memory/context-pack';
+import { allocateBudget, charSize, fillGreedy, type SectionSpec } from './memory/context-pack';
 import { classifyLead } from './memory/retrieval';
 import { verifiedForBase, type CallerBaseScope } from './memory/verification';
 import { renderEvidenceFrame, type EvidenceFrameItem, type EvidenceFrameResult } from './memory/evidence-frame';
@@ -356,6 +356,47 @@ const PULSE_MAX_CANDIDATES = 20;
 // assembly rather than trimmed after").
 const PULSE_MAX_ITEMS_PER_SECTION = 5;
 
+type PulseStatementItem = { statement: string | null; statementTruncated?: boolean };
+
+/** Fit prose-bearing pulse items without letting one production-sized statement erase a whole
+ * section. The canonical row remains untouched: only this bounded wire excerpt is shortened. */
+function fillPulseStatements<T extends PulseStatementItem>(
+  candidates: readonly T[], cap: number,
+): { taken: T[]; used: number; omitted: number; excerpted: number } {
+  const taken: T[] = [];
+  let used = 0;
+  let excerpted = 0;
+  for (const candidate of candidates) {
+    const fullSize = charSize(candidate);
+    if (used + fullSize <= cap) {
+      taken.push(candidate);
+      used += fullSize;
+      continue;
+    }
+    if (candidate.statement == null) break;
+    const points = Array.from(candidate.statement);
+    let low = 0;
+    let high = points.length;
+    let best: T | null = null;
+    while (low <= high) {
+      const count = Math.floor((low + high) / 2);
+      const statement = count >= points.length ? candidate.statement : `${points.slice(0, Math.max(0, count - 1)).join('')}…`;
+      const excerpt = { ...candidate, statement, statementTruncated: true } as T;
+      if (used + charSize(excerpt) <= cap) {
+        best = excerpt;
+        low = count + 1;
+      } else {
+        high = count - 1;
+      }
+    }
+    if (!best) break;
+    taken.push(best);
+    used += charSize(best);
+    excerpted++;
+  }
+  return { taken, used, omitted: candidates.length - taken.length, excerpted };
+}
+
 const PULSE_SECTION_ORDER: readonly SectionSpec<ProjectMemoryPulseSectionId>[] = [
   { id: 'active_decisions', weight: 3 },
   { id: 'known_hazards', weight: 2 },
@@ -563,9 +604,23 @@ export async function assembleProjectMemoryPulse(
 
     function fit<T>(id: ProjectMemoryPulseSectionId, candidates: T[]): T[] {
       const cap = (allotments[id] ?? 0) + pool;
-      const { taken, used, truncated } = fillGreedy(candidates.slice(0, PULSE_MAX_ITEMS_PER_SECTION), cap);
-      if (truncated) {
-        notices.push({ kind: 'truncated', reason: `${id}: ${candidates.length - taken.length} more item(s) did not fit in ${cap} characters` });
+      const capped = candidates.slice(0, PULSE_MAX_ITEMS_PER_SECTION);
+      const proseSection = id === 'active_decisions' || id === 'known_hazards' || id === 'unresolved_unknowns' || id === 'stale_warnings';
+      const result = proseSection
+        ? fillPulseStatements(capped as unknown as PulseStatementItem[], cap)
+        : (() => {
+            const basic = fillGreedy(capped, cap);
+            return { ...basic, omitted: candidates.length - basic.taken.length, excerpted: 0 };
+          })();
+      const taken = result.taken as T[];
+      const used = result.used;
+      const omitted = candidates.length - taken.length;
+      if (result.excerpted || omitted > 0) {
+        const details = [
+          result.excerpted ? `${result.excerpted} item(s) excerpted` : null,
+          omitted > 0 ? `${omitted} item(s) omitted` : null,
+        ].filter((v): v is string => v !== null).join(', ');
+        notices.push({ kind: 'truncated', reason: `${id}: ${details} to fit in ${cap} characters` });
       }
       pool = Math.max(0, cap - used);
       charsUsed += used;

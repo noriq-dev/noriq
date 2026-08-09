@@ -15,6 +15,7 @@ import type { Env } from '../src/env';
 import { createAgent, createRunAgent, createUser, mintTokenForUser, mcpCall } from './helpers';
 import { assembleProjectMemoryPulse, BRIEFING_PULSE_CHAR_BUDGET } from '../src/sync';
 import { GET_BRIEFING_PLAYBOOK } from '../src/mcp';
+import { ProjectMemoryPulse } from '@noriq-dev/shared';
 
 const appEnv = env as unknown as Env;
 
@@ -62,6 +63,29 @@ describe('assembleProjectMemoryPulse — bounded, and degrades to null rather th
     // Ten hazards recorded but the section capped at 5 — the overflow must be DECLARED, not
     // silently dropped (locked decision: a fixed cap enforced before assembly, honestly noticed).
     expect(pulse!.notices.some((n) => n.kind === 'truncated' && n.reason.includes('known_hazards'))).toBe(true);
+  });
+
+  it('excerpts production-sized statements instead of returning empty sections with unused budget', async () => {
+    const projectId = await newProject('MPBLONG');
+    const agent = await createRunAgent(projectId, 'scope');
+    await mcpCall(agent.apiKey, 'record_memory', { projectId, kind: 'decision', statement: `decision ${'D'.repeat(3500)}` });
+    await mcpCall(agent.apiKey, 'record_memory', { projectId, kind: 'hazard', statement: `hazard ${'H'.repeat(3500)}` });
+    await mcpCall(agent.apiKey, 'record_memory', { projectId, kind: 'unknown', statement: `unknown ${'U'.repeat(3500)}` });
+    await memory(projectId).drainOutbox(projectId);
+
+    const pulse = await assembleProjectMemoryPulse(appEnv, projectId, agent.agentId);
+    expect(pulse).toBeTruthy();
+    expect(() => ProjectMemoryPulse.parse(pulse)).not.toThrow();
+    const surfaced = [pulse!.activeDecisions[0], pulse!.knownHazards[0], pulse!.unresolvedUnknowns[0]];
+    for (const item of surfaced) {
+      expect(item).toBeTruthy();
+      expect(item!.statementTruncated).toBe(true);
+      expect(item!.statement.endsWith('…')).toBe(true);
+      expect(pulse!.evidenceFrame.text).toContain(item!.statement);
+    }
+    expect(pulse!.charsUsed).toBeGreaterThan(575);
+    expect(pulse!.charsUsed).toBeLessThanOrEqual(BRIEFING_PULSE_CHAR_BUDGET);
+    expect(pulse!.notices.filter((n) => n.reason.includes('item(s) excerpted')).length).toBe(3);
   });
 
   it('swallows a thrown error from the ProjectMemory stub and returns null — same degradation contract as loadPriorEffort (§19)', async () => {
