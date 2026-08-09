@@ -2809,23 +2809,49 @@ export class ProjectRoom extends DurableObject<Env> {
    *  may be registered again in a DIFFERENT project (a fork, a different server instance).
    *  `repositoryKey` is validated against @noriq-dev/shared's `RepositoryKey` (its `.refine`
    *  is what rejects a `ckt_`-prefixed runner-local checkout id being promoted to canonical
-   *  identity) — the schema's own message is thrown, not a hand-rolled one. */
+   *  identity) — the schema's own message is thrown, not a hand-rolled one.
+   *
+   *  IDEMPOTENT as of PLNR-321: re-registering the SAME key with the same (or unspecified)
+   *  `defaultBranch`/`vcsKind` returns the existing row (`created: false`) instead of throwing —
+   *  a caller (the HTTP route re-running setup, a zero-config default re-derived on every
+   *  registration attempt, a future MCP tool) never has to special-case "already registered" as
+   *  failure. Re-registering the same key with CONFLICTING details (an explicit value that
+   *  disagrees with what is already stored) still throws: silently repointing a repository
+   *  identity would orphan every entity URI already minted under it. `repositoryKey` itself is
+   *  NOT a secret — it is a public, stable identifier and a visible segment of every entity URI
+   *  (`noriq://file/<projectKey>/<repositoryKey>/<path>`); authorization runs independently at
+   *  the Worker boundary before a registry row is ever consulted (see lib/project-memory.ts). */
   async registerRepository(
     projectId: string,
     actor: Actor,
     repositoryKey: string,
     opts?: { defaultBranch?: string | null; vcsKind?: string | null },
-  ): Promise<{ id: string }> {
+  ): Promise<{ id: string; created: boolean }> {
     const parsed = RepositoryKey.safeParse(repositoryKey);
     if (!parsed.success) throw new Error(parsed.error.issues[0]?.message ?? 'invalid repository key');
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       // UNIQUE (project_id, repository_key) (0069) is the real guarantee this asserts against;
-      // this pre-check only turns the constraint violation into a message naming the key.
+      // this pre-check is also what makes re-registration idempotent (see doc comment above).
       const dup = await this.env.DB.prepare(
-        'SELECT id FROM project_repositories WHERE project_id = ? AND repository_key = ?',
-      ).bind(projectId, repositoryKey).first<{ id: string }>();
-      if (dup) throw new Error(`repository key "${repositoryKey}" is already registered in this project`);
+        'SELECT id, default_branch AS defaultBranch, vcs_kind AS vcsKind FROM project_repositories WHERE project_id = ? AND repository_key = ?',
+      ).bind(projectId, repositoryKey).first<{ id: string; defaultBranch: string | null; vcsKind: string | null }>();
+      if (dup) {
+        // "Conflicting" means the caller explicitly named a value that disagrees with an
+        // already-stored, explicitly-named value — an omitted opt or a stored NULL never
+        // conflicts with anything, so a bare re-register (no opts) is always idempotent.
+        const conflicts: string[] = [];
+        if (opts?.defaultBranch != null && dup.defaultBranch != null && opts.defaultBranch !== dup.defaultBranch) {
+          conflicts.push(`defaultBranch ("${dup.defaultBranch}" vs "${opts.defaultBranch}")`);
+        }
+        if (opts?.vcsKind != null && dup.vcsKind != null && opts.vcsKind !== dup.vcsKind) {
+          conflicts.push(`vcsKind ("${dup.vcsKind}" vs "${opts.vcsKind}")`);
+        }
+        if (conflicts.length) {
+          throw new Error(`repository key "${repositoryKey}" is already registered in this project with conflicting ${conflicts.join(', ')}`);
+        }
+        return { id: dup.id, created: false };
+      }
       const id = newId('repo');
       const now = nowIso();
       await this.env.DB.prepare(
@@ -2834,7 +2860,35 @@ export class ProjectRoom extends DurableObject<Env> {
          VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)`,
       ).bind(id, projectId, repositoryKey, 'none', opts?.defaultBranch ?? null, opts?.vcsKind ?? null, now, now).run();
       await this.emit(actor, 'project.updated', 'project', projectId, { repositoryRegistered: repositoryKey });
-      return { id };
+      return { id, created: true };
+    });
+  }
+
+  /** Deregister a repository — the inverse of `registerRepository` (PLNR-321, added on direct
+   *  human steering on this task). Removes only the D1 ROUTING/health row and its checkout
+   *  associations (repository_checkouts FK-references it — delete first, same order
+   *  `deleteProject`'s cascade already uses). The canonical memory graph, evidence, and
+   *  episodes already minted under this repositoryKey live in the ProjectMemory DO and are
+   *  untouched — the same "registry rows route, they never own the graph" split this whole
+   *  section's header comment documents, and the same reasoning that makes RENAMING a
+   *  repositoryKey a migration rather than a setting (every already-minted entity URI embeds
+   *  the key permanently, see RepositoryKey/EntityRef in @noriq-dev/shared). Deregistering
+   *  only stops FUTURE routing/association/ingest-capability minting through this key; it does
+   *  not erase history. Idempotent, matching `registerRepository`'s PLNR-321 posture:
+   *  deregistering an already-unregistered key is a no-op (`deleted: false`), never an error. */
+  async deregisterRepository(projectId: string, actor: Actor, repositoryKey: string): Promise<{ deleted: boolean }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const row = await this.env.DB.prepare(
+        'SELECT id FROM project_repositories WHERE project_id = ? AND repository_key = ?',
+      ).bind(projectId, repositoryKey).first<{ id: string }>();
+      if (!row) return { deleted: false };
+      await this.env.DB.batch([
+        this.env.DB.prepare('DELETE FROM repository_checkouts WHERE project_repository_id = ?').bind(row.id),
+        this.env.DB.prepare('DELETE FROM project_repositories WHERE id = ?').bind(row.id),
+      ]);
+      await this.emit(actor, 'project.updated', 'project', projectId, { repositoryDeregistered: repositoryKey });
+      return { deleted: true };
     });
   }
 

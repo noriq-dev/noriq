@@ -13,7 +13,10 @@ const appEnv = env as unknown as Env;
 const actor = SYSTEM_ACTOR as Actor;
 
 interface RegistryRpc {
-  registerRepository(pid: string, actor: Actor, repositoryKey: string): Promise<{ id: string }>;
+  registerRepository(
+    pid: string, actor: Actor, repositoryKey: string,
+    opts?: { defaultBranch?: string | null; vcsKind?: string | null },
+  ): Promise<{ id: string; created: boolean }>;
   upsertMemoryHealth(pid: string, health: { schemaVersion: number; memoryRevision: number }): Promise<{ ok: true }>;
   deleteProject(pid: string, actor: Actor): Promise<{ ok: true; key: string; name: string }>;
   health(pid: string): Promise<{ schemaVersion: number; memoryRevision: number; tableCounts: Record<string, number> }>;
@@ -38,10 +41,27 @@ describe('project_repositories registry', () => {
     expect(repos.map((r) => r.repositoryKey).sort()).toEqual(['repo-one', 'repo-two']);
   });
 
-  it('rejects a duplicate (project_id, repository_key)', async () => {
+  // PLNR-321: re-registering an IDENTICAL (project_id, repository_key) is now idempotent, not an
+  // error — this test USED TO pin "rejects a duplicate"; that expectation is what changes here,
+  // deliberately (see the task's locked decisions). A conflicting re-registration is still refused
+  // — covered separately below.
+  it('re-registering the SAME key with no (or matching) details is idempotent — returns the existing row', async () => {
     const { projectId } = await newOwnedProject('pm-reg-b@example.com', 'PMREGB');
-    await room(projectId).registerRepository(projectId, actor, 'dup-key');
-    await expect(room(projectId).registerRepository(projectId, actor, 'dup-key')).rejects.toThrow(/already registered/);
+    const first = await room(projectId).registerRepository(projectId, actor, 'dup-key');
+    expect(first.created).toBe(true);
+    const second = await room(projectId).registerRepository(projectId, actor, 'dup-key');
+    expect(second.created).toBe(false);
+    expect(second.id).toBe(first.id);
+    const repos = await listProjectRepositories(appEnv, projectId);
+    expect(repos.filter((r) => r.repositoryKey === 'dup-key')).toHaveLength(1);
+  });
+
+  it('rejects re-registering the same key with CONFLICTING details', async () => {
+    const { projectId } = await newOwnedProject('pm-reg-conflict@example.com', 'PMREGCFL');
+    await room(projectId).registerRepository(projectId, actor, 'conflict-key', { defaultBranch: 'main' });
+    await expect(
+      room(projectId).registerRepository(projectId, actor, 'conflict-key', { defaultBranch: 'develop' }),
+    ).rejects.toThrow(/already registered.*conflicting/i);
   });
 
   it('the SAME repository key succeeds in a DIFFERENT project', async () => {

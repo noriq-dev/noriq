@@ -1136,10 +1136,23 @@ app.get('/api/projects/:pid/memory/repositories', userAuth, async (c) => {
 });
 
 const RegisterRepositoryBody = z.object({
-  repositoryKey: z.string().min(1),
+  // Optional as of PLNR-321: repositoryKey is a public, stable identifier (a visible segment of
+  // every entity URI), never a secret, and one repository per project is the overwhelmingly
+  // common case — a caller that omits it gets a deterministic derived default rather than being
+  // forced to hand-author a slug for the zero-ceremony case. Multiple repositories per project
+  // are still fully supported: name each key explicitly to register more than one.
+  repositoryKey: z.string().min(1).optional(),
   defaultBranch: z.string().nullable().optional(),
   vcsKind: z.string().nullable().optional(),
 });
+
+// One repository per project is the zero-config default (PLNR-321): the project's own committed
+// KEY, lowercased. Deterministic and always a valid RepositoryKey slug — every project key is
+// already constrained to `[A-Z][A-Z0-9]{0,7}` at creation (POST /api/projects above, and
+// create_project in mcp.ts), so lowercasing it can never produce something RepositoryKey's own
+// regex rejects, and — having no `_` — can never collide with the `ckt_`-prefixed checkout-id
+// shape RepositoryKey refuses.
+const deriveDefaultRepositoryKey = (projectKey: string): string => projectKey.trim().toLowerCase();
 
 // PLNR-311: registration is a HUMAN action — this route lives under /api/projects/:pid/* (userAuth
 // + requireProjectAccess, line ~147), which a Bearer-authenticated runner/agent connection can
@@ -1148,29 +1161,54 @@ const RegisterRepositoryBody = z.object({
 // this task's executionSpec). The write goes through ProjectRoom.registerRepository — the sole D1
 // writer for this table (CLAUDE.md) — never a Worker-side INSERT. `RepositoryKey`'s own validation
 // (including the ckt_-prefixed-checkout-id rejection) already lives in the DO method; this route
-// does not re-validate the key shape, it only relays the DO's own message on failure. The DO
-// throws on an EXACT duplicate key (memory-registry.test.ts pins that as its own contract) — this
-// route absorbs that specific conflict into an idempotent 200 by re-resolving the existing row
-// (`created: false`), rather than surfacing an error a human re-running setup does not expect;
-// any other failure (invalid key shape) still surfaces as 400 with the DO's own message.
+// does not re-validate the key shape, it only relays the DO's own message on failure. As of
+// PLNR-321 the DO itself is idempotent on an exact duplicate (same key, non-conflicting details),
+// returning `created: false` — this route no longer needs to catch-and-re-resolve that case; a
+// thrown error here (invalid key shape, or a genuine conflicting-details duplicate) surfaces as
+// 400 with the DO's own message.
 app.post('/api/projects/:pid/memory/repositories', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
   const parsed = RegisterRepositoryBody.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) return c.json({ error: 'invalid repository registration request', detail: parsed.error.issues }, 400);
-  const { repositoryKey, defaultBranch, vcsKind } = parsed.data;
-  let created = true;
+  const { defaultBranch, vcsKind } = parsed.data;
+  let repositoryKey = parsed.data.repositoryKey;
+  if (!repositoryKey) {
+    const project = await c.env.DB.prepare('SELECT key FROM projects WHERE id = ?').bind(pid).first<{ key: string }>();
+    if (!project) return c.json({ error: 'not found' }, 404);
+    repositoryKey = deriveDefaultRepositoryKey(project.key);
+  }
   try {
-    await room(c.env, pid).registerRepository(pid, humanActor(c), repositoryKey, {
+    const { created } = await room(c.env, pid).registerRepository(pid, humanActor(c), repositoryKey, {
       defaultBranch: defaultBranch ?? null,
       vcsKind: vcsKind ?? null,
     });
+    const repo = await resolveRepositoryByKey(c.env, pid, repositoryKey);
+    return c.json({ repository: repo, created }, created ? 201 : 200);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    if (!/already registered/.test(message)) return c.json({ error: message }, 400);
-    created = false; // idempotent re-register: fall through to re-resolve the existing row
+    return c.json({ error: message }, 400);
   }
-  const repo = await resolveRepositoryByKey(c.env, pid, repositoryKey);
-  return c.json({ repository: repo, created }, created ? 201 : 200);
+});
+
+// PLNR-321: the inverse of registration, added on direct human steering on the same task ("Should
+// also support removal of repo keys" — comment on PLNR-321). Same posture as POST: a human-only
+// action (userAuth + requireProjectAccess), through ProjectRoom.deregisterRepository — the sole D1
+// writer for this table. Idempotent (deleting an already-absent key is a 200 with `deleted: false`,
+// never a 404) for the same reason registration itself became idempotent: a human re-running
+// cleanup should not have to special-case "already gone". This removes only the D1 routing/health
+// row and its checkout associations — the memory graph, evidence, and episodes already minted
+// under the key are untouched (see the DO method's own doc comment); it does not resurrect the key
+// as available for re-registration under different history.
+app.delete('/api/projects/:pid/memory/repositories/:key', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const key = c.req.param('key')!;
+  try {
+    const { deleted } = await room(c.env, pid).deregisterRepository(pid, humanActor(c), key);
+    return c.json({ deleted });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return c.json({ error: message }, 400);
+  }
 });
 
 // PLNR-273: assembled operator status — the DO's own health() plus the compact D1 registry

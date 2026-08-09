@@ -51,6 +51,14 @@ repository contents, and passing tests always outrank stored memory. Filters
 and compose together. Falls back to keyword + graph on an instance with no
 embeddings backend — it still answers (\`mode\` says which ran).
 
+\`repositoryKey\` is a public, stable identifier — a visible segment of every entity
+URI (\`noriq://file/<projectKey>/<repositoryKey>/<path>\`) — never a secret; access to
+what it names is enforced independently, before a registry row is ever consulted. One
+repository per project is the norm and needs no ceremony: a project registered
+without naming a key gets one derived automatically, and re-registering the same key
+is safe to repeat. Name a key explicitly only when a project genuinely spans more
+than one repository.
+
 For non-trivial work on a task, reach for \`get_task_context\` instead of
 hand-chaining \`get_task\` + \`search_project_memory\` + \`explain_project_area\`
 yourself: one call returns the task's own required facts in full (title, body,
