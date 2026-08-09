@@ -7,6 +7,8 @@
 
 import type { Env } from './env';
 import { search, type SearchHit } from './search';
+import type { ProjectMemoryStub } from './lib/project-memory';
+import { buildEntityUri, parseEntityUri } from '@noriq-dev/shared';
 
 export const GENERATION_MODEL = '@cf/openai/gpt-oss-120b';
 const CONTEXT_HITS = 8;
@@ -15,6 +17,8 @@ const MAX_ANSWER_TOKENS = 1200;
 const MAX_QUESTION_CHARS = 4000;
 const MAX_HISTORY_MESSAGES = 12;
 const MAX_HISTORY_CHARS = 4000;
+const GRAPH_SEED_PROJECTS = 4;
+const GRAPH_BOOST = 0.2;
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
@@ -131,6 +135,9 @@ export interface AskSource {
   projectId: string;
   projectKey: string;
   projectName: string;
+  authority?: number;
+  validity?: string;
+  retrieval: 'semantic' | 'keyword' | 'graph' | 'hybrid';
 }
 
 export interface AskResult {
@@ -138,10 +145,16 @@ export interface AskResult {
   sources: AskSource[];
   mode: 'semantic' | 'keyword';
   model: string;
+  graphEnhanced: boolean;
 }
 
 export interface PreparedAsk extends Omit<AskResult, 'answer'> {
   messages: ChatMessage[];
+}
+
+interface AskSearchHit extends SearchHit {
+  retrieval: AskSource['retrieval'];
+  graphPath?: string;
 }
 
 /** Accept only user/assistant content from the client. System messages are never
@@ -158,7 +171,162 @@ export function normalizeHistory(value: unknown): AskHistoryMessage[] {
     .filter((m) => m.content.length > 0);
 }
 
-async function contextBlocks(db: D1Database, hits: SearchHit[]): Promise<Array<{ hit: SearchHit; text: string }>> {
+const projectMemory = (env: Env, projectId: string): ProjectMemoryStub =>
+  env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)) as unknown as ProjectMemoryStub;
+
+const graphSeedUri = (hit: SearchHit): string | null => {
+  switch (hit.kind) {
+    case 'task': return buildEntityUri({ kind: 'task', id: hit.id });
+    case 'doc': return buildEntityUri({ kind: 'artifact', id: hit.id });
+    case 'plan': return buildEntityUri({ kind: 'plan', id: hit.id });
+    case 'memory': return buildEntityUri({ kind: 'memory', id: hit.id });
+    case 'episode': return buildEntityUri({ kind: 'episode', id: hit.id });
+  }
+};
+
+function graphNodeToHit(
+  projectId: string,
+  result: Awaited<ReturnType<ProjectMemoryStub['searchProjectMemory']>>['results'][number],
+): AskSearchHit | null {
+  if (result.stage !== 'graph' || !result.uri) return null;
+  let ref;
+  try { ref = parseEntityUri(result.uri); } catch { return null; }
+  let kind: SearchHit['kind'];
+  let id: string;
+  switch (ref.kind) {
+    case 'task': kind = 'task'; id = ref.id; break;
+    case 'artifact': kind = 'doc'; id = ref.id; break;
+    case 'plan': kind = 'plan'; id = ref.id; break;
+    case 'memory': kind = 'memory'; id = ref.id; break;
+    case 'episode': kind = 'episode'; id = ref.id; break;
+    default: return null; // code/internal nodes are useful traversal bridges, not answer sources
+  }
+  return {
+    kind,
+    id,
+    projectId,
+    title: result.title,
+    snippet: result.snippet,
+    score: result.finalScore * 0.75,
+    status: result.status,
+    authority: result.authority,
+    validity: result.validity,
+    retrieval: 'graph',
+    graphPath: result.edgePath,
+  };
+}
+
+/** Hydrate graph-only candidates from their canonical stores so the model gets actual project
+ * content rather than graph labels. Text-search hits are already hydrated by search.ts. */
+async function hydrateGraphHits(env: Env, hits: AskSearchHit[]): Promise<AskSearchHit[]> {
+  const graphHits = hits.filter((hit) => hit.retrieval === 'graph');
+  const canonical = new Map<string, Partial<SearchHit>>();
+  const ids = (kind: SearchHit['kind']) => graphHits.filter((hit) => hit.kind === kind).map((hit) => hit.id);
+  const inList = (values: string[]) => values.map(() => '?').join(',');
+
+  const taskIds = ids('task');
+  if (taskIds.length) {
+    const { results } = await env.DB.prepare(
+      `SELECT id, key, title, substr(body, 1, 200) AS snippet,
+              CASE WHEN failed_at IS NOT NULL THEN 'failed' ELSE status END AS status
+         FROM tasks WHERE id IN (${inList(taskIds)})`,
+    ).bind(...taskIds).all<{ id: string; key: string; title: string; snippet: string | null; status: string }>();
+    for (const row of results) canonical.set(`task:${row.id}`, { ...row, snippet: row.snippet ?? '' });
+  }
+  const docIds = ids('doc');
+  if (docIds.length) {
+    const { results } = await env.DB.prepare(
+      `SELECT id, name AS title, COALESCE(NULLIF(description, ''), substr(body, 1, 200), '') AS snippet
+         FROM docs WHERE id IN (${inList(docIds)})`,
+    ).bind(...docIds).all<{ id: string; title: string; snippet: string }>();
+    for (const row of results) canonical.set(`doc:${row.id}`, row);
+  }
+  const planIds = ids('plan');
+  if (planIds.length) {
+    const { results } = await env.DB.prepare(
+      `SELECT id, title, COALESCE(NULLIF(description, ''), substr(body, 1, 200), '') AS snippet, status
+         FROM plans WHERE id IN (${inList(planIds)})`,
+    ).bind(...planIds).all<{ id: string; title: string; snippet: string; status: string }>();
+    for (const row of results) canonical.set(`plan:${row.id}`, row);
+  }
+
+  const memoryByProject = new Map<string, Array<{ kind: 'memory' | 'episode'; id: string }>>();
+  for (const hit of graphHits) {
+    if (hit.kind !== 'memory' && hit.kind !== 'episode') continue;
+    const projectHits = memoryByProject.get(hit.projectId) ?? [];
+    projectHits.push({ kind: hit.kind, id: hit.id });
+    memoryByProject.set(hit.projectId, projectHits);
+  }
+  await Promise.all([...memoryByProject.entries()].map(async ([projectId, refs]) => {
+    const rows = await projectMemory(env, projectId).hydrateSearchHits(projectId, refs);
+    for (const row of rows) canonical.set(`${row.kind}:${row.id}`, row);
+  }));
+
+  return hits.flatMap((hit) => {
+    if (hit.retrieval !== 'graph') return [hit];
+    const row = canonical.get(`${hit.kind}:${hit.id}`);
+    return row ? [{ ...hit, ...row, score: hit.score, retrieval: hit.retrieval, graphPath: hit.graphPath }] : [];
+  });
+}
+
+/** Text relevance stays the recall layer; the best hit in each matched project seeds one bounded
+ * graph hop. A hit found both ways is boosted and labelled hybrid, while graph-only canonical
+ * project entities can enter the context at a discounted score. */
+async function hybridAskSearch(
+  env: Env,
+  question: string,
+  projectIds: string[],
+): Promise<{ mode: 'semantic' | 'keyword'; results: AskSearchHit[]; graphEnhanced: boolean }> {
+  const initial = await search(env, { q: question, projectIds, limit: CONTEXT_HITS * 2 });
+  const textHits: AskSearchHit[] = initial.results.map((hit) => ({ ...hit, retrieval: initial.mode }));
+  const seededProjects = new Set<string>();
+  const seeds: Array<{ projectId: string; uri: string }> = [];
+  for (const hit of textHits) {
+    if (seededProjects.has(hit.projectId)) continue;
+    const uri = graphSeedUri(hit);
+    if (!uri) continue;
+    seededProjects.add(hit.projectId);
+    seeds.push({ projectId: hit.projectId, uri });
+    if (seeds.length >= GRAPH_SEED_PROJECTS) break;
+  }
+  const graphGroups = await Promise.all(seeds.map(async ({ projectId, uri }) => {
+    try {
+      const result = await projectMemory(env, projectId).searchProjectMemory(projectId, {
+        seedEntityUri: uri,
+        maxDepth: 1,
+        limit: CONTEXT_HITS,
+      });
+      return result.results.flatMap((hit) => {
+        const mapped = graphNodeToHit(projectId, hit);
+        return mapped ? [mapped] : [];
+      });
+    } catch {
+      return []; // graph availability enriches Ask; it never takes ordinary search down
+    }
+  }));
+  const graphHits = await hydrateGraphHits(env, graphGroups.flat());
+  const merged = new Map<string, AskSearchHit>();
+  for (const hit of textHits) merged.set(`${hit.kind}:${hit.id}`, hit);
+  for (const hit of graphHits) {
+    const key = `${hit.kind}:${hit.id}`;
+    const previous = merged.get(key);
+    if (previous) {
+      merged.set(key, {
+        ...previous,
+        score: previous.score + GRAPH_BOOST,
+        retrieval: 'hybrid',
+        graphPath: hit.graphPath,
+      });
+    } else {
+      merged.set(key, hit);
+    }
+  }
+  const results = [...merged.values()].sort((a, b) => b.score - a.score).slice(0, CONTEXT_HITS);
+  return { mode: initial.mode, results, graphEnhanced: results.some((hit) => hit.retrieval === 'graph' || hit.retrieval === 'hybrid') };
+}
+
+async function contextBlocks(env: Env, hits: AskSearchHit[]): Promise<Array<{ hit: AskSearchHit; text: string }>> {
+  const db = env.DB;
   const ids: Partial<Record<SearchHit['kind'], string[]>> = {};
   for (const h of hits) (ids[h.kind] ??= []).push(h.id);
   const body = new Map<string, string>();
@@ -175,6 +343,12 @@ async function contextBlocks(db: D1Database, hits: SearchHit[]): Promise<Array<{
   await load('task', 'tasks');
   await load('doc', 'docs');
   await load('plan', 'plans');
+  await Promise.all(hits.filter((hit) => hit.kind === 'memory').map(async (hit) => {
+    try {
+      const memory = await projectMemory(env, hit.projectId).getMemoryItem(hit.projectId, hit.id);
+      if (memory) body.set(`memory:${hit.id}`, memory.statement.slice(0, CONTEXT_CHARS));
+    } catch { /* the search snippet remains a safe degraded context */ }
+  }));
   return hits.map((hit) => {
     const full = body.get(`${hit.kind}:${hit.id}`);
     return { hit, text: full && full.trim() ? full : hit.snippet };
@@ -184,8 +358,10 @@ async function contextBlocks(db: D1Database, hits: SearchHit[]): Promise<Array<{
 const sourceLabel = (h: SearchHit, project?: AskProject): string => {
   const ref = h.key ?? h.id;
   const status = h.status ? `, ${h.status}` : '';
+  const authority = h.authority != null ? `, authority ${h.authority}` : '';
+  const validity = h.validity ? `, ${h.validity}` : '';
   const projectRef = project ? `${project.key} / ` : '';
-  return `${projectRef}${h.kind.toUpperCase()} ${ref} (${h.title}${status})`;
+  return `${projectRef}${h.kind.toUpperCase()} ${ref} (${h.title}${status}${authority}${validity})`;
 };
 
 /** Build one general-assistant prompt with optional, untrusted project context. General questions
@@ -224,13 +400,8 @@ export interface AskOptions {
 export async function prepareQuestion(env: Env, opts: AskOptions): Promise<PreparedAsk> {
   const question = opts.question.trim().slice(0, MAX_QUESTION_CHARS);
   const projectIds = opts.projects.map((p) => p.id);
-  const { mode, results } = await search(env, {
-    q: question,
-    projectIds,
-    kinds: ['task', 'doc', 'plan'],
-    limit: CONTEXT_HITS,
-  });
-  const blocks = await contextBlocks(env.DB, results);
+  const { mode, results, graphEnhanced } = await hybridAskSearch(env, question, projectIds);
+  const blocks = await contextBlocks(env, results);
   const projects = new Map(opts.projects.map((p) => [p.id, p]));
   const sources: AskSource[] = results.flatMap((h) => {
     const project = projects.get(h.projectId);
@@ -244,6 +415,9 @@ export async function prepareQuestion(env: Env, opts: AskOptions): Promise<Prepa
       projectId: project.id,
       projectKey: project.key,
       projectName: project.name,
+      authority: h.authority,
+      validity: h.validity,
+      retrieval: h.retrieval,
     }] : [];
   });
   return {
@@ -251,6 +425,7 @@ export async function prepareQuestion(env: Env, opts: AskOptions): Promise<Prepa
     sources,
     mode,
     model: GENERATION_MODEL,
+    graphEnhanced,
   };
 }
 
@@ -258,20 +433,41 @@ export async function answerQuestion(env: Env, gen: GenerationClient, opts: AskO
   const prepared = await prepareQuestion(env, opts);
   const answer = (await gen.generate(prepared.messages, { maxTokens: MAX_ANSWER_TOKENS })).trim();
   if (!answer) throw new Error('Workers AI returned no answer text');
-  return { answer, sources: prepared.sources, mode: prepared.mode, model: prepared.model };
+  return {
+    answer,
+    sources: prepared.sources,
+    mode: prepared.mode,
+    model: prepared.model,
+    graphEnhanced: prepared.graphEnhanced,
+  };
 }
 
 const sse = (event: string, data: unknown): Uint8Array =>
   new TextEncoder().encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 
+export interface AskEventStreamOptions {
+  thread?: { id: string; title: string };
+  onComplete?: (result: { answer: string; reasoning: string }) => Promise<void>;
+}
+
 /** Translate Workers AI's own SSE dialect into the small, stable stream consumed by the web UI.
  * Sources arrive before inference begins; answer tokens follow as `delta` events. */
-export function askEventStream(gen: StreamingGenerationClient, prepared: PreparedAsk): ReadableStream<Uint8Array> {
+export function askEventStream(
+  gen: StreamingGenerationClient,
+  prepared: PreparedAsk,
+  options: AskEventStreamOptions = {},
+): ReadableStream<Uint8Array> {
   let upstreamReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   let cancelled = false;
   return new ReadableStream<Uint8Array>({
     async start(controller) {
-      controller.enqueue(sse('meta', { sources: prepared.sources, mode: prepared.mode, model: prepared.model }));
+      if (options.thread) controller.enqueue(sse('thread', options.thread));
+      controller.enqueue(sse('meta', {
+        sources: prepared.sources,
+        mode: prepared.mode,
+        model: prepared.model,
+        graphEnhanced: prepared.graphEnhanced,
+      }));
       controller.enqueue(sse('status', { phase: 'generating' }));
       try {
         const upstream = await gen.stream(prepared.messages, { maxTokens: MAX_ANSWER_TOKENS });
@@ -280,6 +476,8 @@ export function askEventStream(gen: StreamingGenerationClient, prepared: Prepare
         let buffer = '';
         let emitted = false;
         let finalCandidate = '';
+        const answerParts: string[] = [];
+        const reasoningParts: string[] = [];
 
         const consumeLine = (rawLine: string) => {
           const line = rawLine.trim();
@@ -291,10 +489,14 @@ export function askEventStream(gen: StreamingGenerationClient, prepared: Prepare
           const upstreamError = asObject(asObject(payload)?.error)?.message ?? asObject(payload)?.error;
           if (typeof upstreamError === 'string') throw new Error(`Workers AI: ${upstreamError}`);
           const reasoningSummary = extractReasoningSummaryDelta(payload);
-          if (reasoningSummary) controller.enqueue(sse('reasoning', { text: reasoningSummary }));
+          if (reasoningSummary) {
+            reasoningParts.push(reasoningSummary);
+            controller.enqueue(sse('reasoning', { text: reasoningSummary }));
+          }
           const delta = extractStreamDelta(payload);
           if (delta) {
             emitted = true;
+            answerParts.push(delta);
             controller.enqueue(sse('delta', { text: delta }));
           } else {
             const candidate = extractGeneratedText(payload);
@@ -315,9 +517,14 @@ export function askEventStream(gen: StreamingGenerationClient, prepared: Prepare
         if (cancelled) return;
         if (!emitted && finalCandidate) {
           emitted = true;
+          answerParts.push(finalCandidate);
           controller.enqueue(sse('delta', { text: finalCandidate }));
         }
         if (!emitted) throw new Error('Workers AI stream contained no answer text');
+        await options.onComplete?.({
+          answer: answerParts.join('').trim(),
+          reasoning: reasoningParts.join('').trim(),
+        });
         controller.enqueue(sse('done', {}));
         controller.close();
       } catch (error) {

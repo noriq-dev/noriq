@@ -23,9 +23,11 @@ export interface ApiAskStreamMeta {
   sources: ApiAskSource[];
   mode: 'semantic' | 'keyword';
   model: string;
+  graphEnhanced: boolean;
 }
 
 export interface ApiAskStreamHandlers {
+  onThread?: (thread: { id: string; title: string }) => void;
   onMeta: (meta: ApiAskStreamMeta) => void;
   onStatus?: (phase: 'generating') => void;
   onReasoning?: (text: string) => void;
@@ -34,14 +36,14 @@ export interface ApiAskStreamHandlers {
 
 async function askStream(
   question: string,
-  history: ApiAskHistoryMessage[],
+  threadId: string | null,
   handlers: ApiAskStreamHandlers,
   signal?: AbortSignal,
 ): Promise<void> {
   const res = await fetch('/api/ask/stream', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
-    body: JSON.stringify({ question, history }),
+    body: JSON.stringify({ question, threadId: threadId ?? undefined }),
     credentials: 'same-origin',
     signal,
   });
@@ -65,7 +67,9 @@ async function askStream(
     }
     if (!data.length) return;
     const payload = JSON.parse(data.join('\n')) as Record<string, unknown>;
-    if (event === 'meta') handlers.onMeta(payload as unknown as ApiAskStreamMeta);
+    if (event === 'thread' && typeof payload.id === 'string' && typeof payload.title === 'string') {
+      handlers.onThread?.({ id: payload.id, title: payload.title });
+    } else if (event === 'meta') handlers.onMeta(payload as unknown as ApiAskStreamMeta);
     else if (event === 'status' && payload.phase === 'generating') handlers.onStatus?.('generating');
     else if (event === 'reasoning' && typeof payload.text === 'string') handlers.onReasoning?.(payload.text);
     else if (event === 'delta' && typeof payload.text === 'string') handlers.onDelta(payload.text);
@@ -275,9 +279,15 @@ export const api = {
   /** Global, multi-turn Ask chat. Project scope is derived server-side from the session; the
    *  browser sends conversation history but can never choose or broaden retrieval access. */
   ask: (question: string, history: ApiAskHistoryMessage[]) =>
-    req<{ answer: string; mode: 'semantic' | 'keyword'; model: string; sources: ApiAskSource[] }>(
+    req<{ answer: string; mode: 'semantic' | 'keyword'; model: string; graphEnhanced: boolean; sources: ApiAskSource[] }>(
       'POST', '/api/ask', { question, history }),
   askStream,
+  askThreads: (archived = false) =>
+    req<{ threads: ApiAskThread[] }>('GET', `/api/ask/threads${archived ? '?archived=1' : ''}`),
+  askThread: (threadId: string) => req<ApiAskThreadDetail>('GET', `/api/ask/threads/${threadId}`),
+  archiveAskThread: (threadId: string) => req<{ ok: true; archived: true }>('POST', `/api/ask/threads/${threadId}/archive`),
+  restoreAskThread: (threadId: string) => req<{ ok: true; archived: false }>('POST', `/api/ask/threads/${threadId}/restore`),
+  deleteAskThread: (threadId: string) => req<{ ok: true }>('DELETE', `/api/ask/threads/${threadId}`),
   acknowledgeSignal: (pid: string, sid: string, dismiss = false) =>
     req('POST', `/api/projects/${pid}/signals/${sid}/acknowledge`, { dismiss }),
   addDependency: (pid: string, tid: string, dependsOnTaskId: string) =>
@@ -740,7 +750,7 @@ export interface ApiAskHistoryMessage {
 
 /** One cross-project grounding source behind a global /ask answer. */
 export interface ApiAskSource {
-  kind: 'task' | 'doc' | 'plan';
+  kind: 'task' | 'doc' | 'plan' | 'memory' | 'episode';
   id: string;
   key?: string;
   title: string;
@@ -749,6 +759,33 @@ export interface ApiAskSource {
   projectId: string;
   projectKey: string;
   projectName: string;
+  authority?: number;
+  validity?: string;
+  retrieval: 'semantic' | 'keyword' | 'graph' | 'hybrid';
+}
+
+export interface ApiAskThread {
+  id: string;
+  title: string;
+  archivedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  messageCount: number;
+  lastMessage: string | null;
+}
+
+export interface ApiAskStoredMessage extends ApiAskHistoryMessage {
+  id: string;
+  sources: ApiAskSource[];
+  reasoning: string;
+  trace: string[];
+  mode: 'semantic' | 'keyword' | null;
+  model: string | null;
+  createdAt: string;
+}
+
+export interface ApiAskThreadDetail extends ApiAskThread {
+  messages: ApiAskStoredMessage[];
 }
 
 /** One hit from /api/projects/:pid/search (PLNR-184; memory/episode kinds added PLNR-255). */

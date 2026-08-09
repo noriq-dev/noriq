@@ -72,6 +72,14 @@ export function MemoryView({ store }: { store: AppStore }) {
   const [graphSeedUri, setGraphSeedUri] = useState<string | null>(null);
   const [inspectorUri, setInspectorUri] = useState<string | null>(null);
 
+  useEffect(() => {
+    const memoryId = sessionStorage.getItem('noriq.openMemory');
+    if (!memoryId) return;
+    sessionStorage.removeItem('noriq.openMemory');
+    setInspectorUri(`noriq://memory/${memoryId}`);
+    setTab('explore');
+  }, [store.currentPid]);
+
   const openEgoNetwork = (uri: string) => { setGraphSeedUri(uri); setTab('graph'); };
   const openInspector = (uri: string) => { setInspectorUri(uri); setTab('explore'); };
 

@@ -3,7 +3,7 @@
 // available in the pool. Route tests cover validation + auth.
 import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
-import { createAgent, loginSession, mcpCall } from './helpers';
+import { createAgent, createUser, loginSession, mcpCall } from './helpers';
 import {
   answerQuestion, askEventStream, buildMessages, extractGeneratedText, extractReasoningSummaryDelta, extractStreamDelta,
   generationClient, normalizeHistory, type ChatMessage, type GenerationClient, type PreparedAsk,
@@ -103,9 +103,15 @@ describe('Workers AI response adapters', () => {
       },
     };
     const prepared: PreparedAsk = {
-      messages: [{ role: 'user', content: 'q' }], sources: [], mode: 'semantic', model: '@cf/openai/gpt-oss-120b',
+      messages: [{ role: 'user', content: 'q' }], sources: [], mode: 'semantic', model: '@cf/openai/gpt-oss-120b', graphEnhanced: false,
     };
-    const output = await new Response(askEventStream(gen, prepared)).text();
+    let completed: { answer: string; reasoning: string } | undefined;
+    const output = await new Response(askEventStream(gen, prepared, {
+      thread: { id: 'chat_1', title: 'Chat one' },
+      onComplete: async (result) => { completed = result; },
+    })).text();
+    expect(output).toContain('event: thread');
+    expect(output).toContain('chat_1');
     expect(output).toContain('event: meta');
     expect(output).toContain('event: status');
     expect(output).toContain('event: reasoning');
@@ -114,6 +120,7 @@ describe('Workers AI response adapters', () => {
     expect(output).toContain('"text":"world"');
     expect(output).not.toContain('private');
     expect(output).toContain('event: done');
+    expect(completed).toEqual({ answer: 'Hello world', reasoning: 'Checked the evidence.' });
   });
 
   it('reports an error rather than completing with a blank answer', async () => {
@@ -126,7 +133,7 @@ describe('Workers AI response adapters', () => {
       },
     };
     const prepared: PreparedAsk = {
-      messages: [{ role: 'user', content: 'q' }], sources: [], mode: 'semantic', model: '@cf/openai/gpt-oss-120b',
+      messages: [{ role: 'user', content: 'q' }], sources: [], mode: 'semantic', model: '@cf/openai/gpt-oss-120b', graphEnhanced: false,
     };
     const output = await new Response(askEventStream(gen, prepared)).text();
     expect(output).toContain('event: reasoning');
@@ -143,19 +150,32 @@ describe('Workers AI response adapters', () => {
 let agent: { id: string; apiKey: string };
 let projectId: string;
 let cookie: string;
+let otherCookie: string;
 
 beforeAll(async () => {
   agent = await createAgent('ask-agent');
   cookie = await loginSession('agent-mint@example.com', 'longenough1');
+  await createUser('ask-other@example.com', 'Ask Other', 'longenough1');
+  otherCookie = await loginSession('ask-other@example.com', 'longenough1');
   projectId = (await mcpCall(agent.apiKey, 'create_project', { key: 'ASK', name: 'askable' })).body.id;
-  await mcpCall(agent.apiKey, 'create_task', {
+  const task = await mcpCall(agent.apiKey, 'create_task', {
     projectId, title: 'implement payment retry backoff', tags: ['payments'], body: 'Exponential backoff on PSP timeouts.',
   });
   // description is what the search snippet shows; the retry detail lives only in the BODY —
   // so seeing it in the prompt proves we re-read the fuller body, not just the snippet.
-  await mcpCall(agent.apiKey, 'create_doc', {
+  const doc = await mcpCall(agent.apiKey, 'create_doc', {
     projectId, name: 'Payment gateway design', description: 'how payments flow',
     body: 'All payments go through the gateway service. The retry policy is exponential backoff, budget 3 attempts.',
+  });
+  await mcpCall(agent.apiKey, 'update_task', { projectId, taskId: task.body.id, docIds: [doc.body.id] });
+  const memory = env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)) as unknown as {
+    runProjector(projectId: string): Promise<unknown>;
+  };
+  await memory.runProjector(projectId);
+  await mcpCall(agent.apiKey, 'record_memory', {
+    projectId,
+    kind: 'decision',
+    statement: 'Quasar fallback mode keeps payment retries below three attempts during provider brownouts.',
   });
 }, 60000);
 
@@ -170,6 +190,8 @@ describe('answerQuestion (retrieval + fake generation)', () => {
     expect(res.sources.length).toBeGreaterThan(0);
     expect(res.sources.some((s) => s.kind === 'doc')).toBe(true);
     expect(res.sources.every((s) => s.projectId === projectId && s.projectKey === 'ASK')).toBe(true);
+    expect(res.graphEnhanced).toBe(true);
+    expect(res.sources.some((s) => s.retrieval === 'hybrid' || s.retrieval === 'graph')).toBe(true);
 
     const [system, user] = calls[0]!;
     expect(system!.role).toBe('system');
@@ -177,6 +199,16 @@ describe('answerQuestion (retrieval + fake generation)', () => {
     // "budget 3 attempts" lives only in the doc BODY (snippet = its description) — its
     // presence proves the fuller-body hydration beyond the 200-char search snippet.
     expect(user!.content).toContain('budget 3 attempts');
+  });
+
+  it('retrieves durable memories alongside tasks, docs, and plans', async () => {
+    const { gen, calls } = fakeGen('The recorded fallback caps retries.');
+    const res = await answerQuestion(env as unknown as Env, gen, {
+      question: 'quasar fallback provider brownouts',
+      projects: [{ id: projectId, key: 'ASK', name: 'askable' }],
+    });
+    expect(res.sources.some((source) => source.kind === 'memory')).toBe(true);
+    expect(calls[0]!.at(-1)!.content).toContain('Quasar fallback mode keeps payment retries below three attempts');
   });
 
   it('still handles a general question when project retrieval has no matches', async () => {
@@ -234,5 +266,66 @@ describe('REST /api/ask', () => {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: 'anything' }),
     });
     expect(anonymous.status).toBe(401);
+  });
+
+  it('keeps chat CRUD user-private and deletes its messages with the thread', async () => {
+    const created = await SELF.fetch('https://noriq.test/api/ask/threads', {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Persistent chat' }),
+    });
+    expect(created.status).toBe(201);
+    const thread = await created.json() as { id: string; title: string };
+    expect(thread.title).toBe('Persistent chat');
+    await env.DB.prepare(
+      `INSERT INTO ask_messages (id, thread_id, role, content, created_at) VALUES ('msg_test', ?, 'user', 'stored question', ?)`,
+    ).bind(thread.id, new Date().toISOString()).run();
+
+    const detail = await SELF.fetch(`https://noriq.test/api/ask/threads/${thread.id}`, { headers: { Cookie: cookie } });
+    expect(detail.status).toBe(200);
+    expect((await detail.json() as { messages: Array<{ content: string }> }).messages[0]!.content).toBe('stored question');
+    const foreign = await SELF.fetch(`https://noriq.test/api/ask/threads/${thread.id}`, { headers: { Cookie: otherCookie } });
+    expect(foreign.status).toBe(404);
+
+    expect((await SELF.fetch(`https://noriq.test/api/ask/threads/${thread.id}/archive`, {
+      method: 'POST', headers: { Cookie: cookie },
+    })).status).toBe(200);
+    const active = await SELF.fetch('https://noriq.test/api/ask/threads', { headers: { Cookie: cookie } });
+    expect((await active.json() as { threads: Array<{ id: string }> }).threads.some((item) => item.id === thread.id)).toBe(false);
+    const archived = await SELF.fetch('https://noriq.test/api/ask/threads?archived=1', { headers: { Cookie: cookie } });
+    expect((await archived.json() as { threads: Array<{ id: string }> }).threads.some((item) => item.id === thread.id)).toBe(true);
+    expect((await SELF.fetch(`https://noriq.test/api/ask/threads/${thread.id}/restore`, {
+      method: 'POST', headers: { Cookie: cookie },
+    })).status).toBe(200);
+
+    expect((await SELF.fetch(`https://noriq.test/api/ask/threads/${thread.id}`, {
+      method: 'DELETE', headers: { Cookie: cookie },
+    })).status).toBe(200);
+    expect(await env.DB.prepare('SELECT id FROM ask_messages WHERE thread_id = ?').bind(thread.id).first()).toBeNull();
+    expect((await SELF.fetch(`https://noriq.test/api/ask/threads/${thread.id}`, { headers: { Cookie: cookie } })).status).toBe(404);
+  });
+
+  it('removes owned chats before deleting a disabled user', async () => {
+    const doomed = await createUser('ask-delete@example.com', 'Ask Delete', 'longenough1');
+    const doomedCookie = await loginSession('ask-delete@example.com', 'longenough1');
+    const created = await SELF.fetch('https://noriq.test/api/ask/threads', {
+      method: 'POST', headers: { Cookie: doomedCookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Delete with owner' }),
+    });
+    const thread = await created.json() as { id: string };
+    await env.DB.prepare(
+      `INSERT INTO ask_messages (id, thread_id, role, content, created_at) VALUES ('msg_delete_owner', ?, 'user', 'remove me', ?)`,
+    ).bind(thread.id, new Date().toISOString()).run();
+
+    const disabled = await SELF.fetch(`https://noriq.test/api/users/${doomed.id}`, {
+      method: 'PATCH', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ disabled: true }),
+    });
+    expect(disabled.status).toBe(200);
+    const removed = await SELF.fetch(`https://noriq.test/api/users/${doomed.id}`, {
+      method: 'DELETE', headers: { Cookie: cookie },
+    });
+    expect(removed.status).toBe(200);
+    expect(await env.DB.prepare('SELECT id FROM ask_threads WHERE id = ?').bind(thread.id).first()).toBeNull();
+    expect(await env.DB.prepare("SELECT id FROM ask_messages WHERE id = 'msg_delete_owner'").first()).toBeNull();
   });
 });

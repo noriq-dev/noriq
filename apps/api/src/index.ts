@@ -18,6 +18,9 @@ import {
   answerQuestion, askEventStream, generationClient, normalizeHistory, prepareQuestion, streamingGenerationClient,
   type AskProject,
 } from './ask';
+import {
+  appendAskMessage, askThreadHistory, createAskThread, deleteAskThread, getAskThread, listAskThreads, setAskThreadArchived,
+} from './ask-chats';
 import { verifyUploadToken, resolveUploadSecret, signIngestToken, verifyIngestToken, type IngestClaims } from './lib/upload-token';
 import { USER_PROJECT_WHERE, taskWireStatus, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
 import { advertisedWorkflowNames } from './lib/workflows';
@@ -1611,8 +1614,9 @@ app.post('/api/projects/:pid/search/reindex', userAuth, async (c) => {
   return c.json(await reindexProject(c.env, backend, c.req.param('pid')!, offset));
 });
 
-// Global Ask — general multi-turn chat enriched with tasks/docs/plans from every active project
-// the signed-in user can reach. This route intentionally sits outside /api/projects/:pid/*:
+// Global Ask — durable, per-user chat enriched with source search, memories, and bounded graph
+// expansion across every active project the signed-in user can reach. This route intentionally
+// sits outside /api/projects/:pid/*:
 // it derives its complete retrieval scope from USER_PROJECT_WHERE on every request instead of
 // trusting project ids from the browser. Admins get their normal user-scoped set, not admin-all.
 const accessibleAskProjects = async (c: Context<AppContext>): Promise<AskProject[]> => {
@@ -1624,13 +1628,43 @@ const accessibleAskProjects = async (c: Context<AppContext>): Promise<AskProject
   return results;
 };
 
+app.get('/api/ask/threads', userAuth, async (c) => {
+  const archived = c.req.query('archived') === '1' || c.req.query('archived') === 'true';
+  return c.json({ threads: await listAskThreads(c.env.DB, c.var.user!.id, archived) });
+});
+
+app.post('/api/ask/threads', userAuth, async (c) => {
+  const body = await c.req.json<{ title?: string }>().catch(() => ({} as { title?: string }));
+  return c.json(await createAskThread(c.env.DB, c.var.user!.id, body.title ?? 'New chat'), 201);
+});
+
+app.get('/api/ask/threads/:threadId', userAuth, async (c) => {
+  const thread = await getAskThread(c.env.DB, c.var.user!.id, c.req.param('threadId')!);
+  return thread ? c.json(thread) : c.json({ error: 'not found' }, 404);
+});
+
+app.post('/api/ask/threads/:threadId/archive', userAuth, async (c) => {
+  const ok = await setAskThreadArchived(c.env.DB, c.var.user!.id, c.req.param('threadId')!, true);
+  return ok ? c.json({ ok: true, archived: true }) : c.json({ error: 'not found' }, 404);
+});
+
+app.post('/api/ask/threads/:threadId/restore', userAuth, async (c) => {
+  const ok = await setAskThreadArchived(c.env.DB, c.var.user!.id, c.req.param('threadId')!, false);
+  return ok ? c.json({ ok: true, archived: false }) : c.json({ error: 'not found' }, 404);
+});
+
+app.delete('/api/ask/threads/:threadId', userAuth, async (c) => {
+  const ok = await deleteAskThread(c.env.DB, c.var.user!.id, c.req.param('threadId')!);
+  return ok ? c.json({ ok: true }) : c.json({ error: 'not found' }, 404);
+});
+
 app.post('/api/ask', userAuth, async (c) => {
   const rl = await rateLimit(c.env, `ask:${c.var.user!.id}`, 20);
   if (!rl.ok) return c.json(tooMany, 429, { 'Retry-After': String(rl.retryAfter) });
   const gen = generationClient(c.env);
   if (!gen) return c.json({ error: 'no AI backend — asking questions requires the Workers AI (AI) binding' }, 503);
   const { question, history } = await c.req.json<{ question?: string; history?: unknown }>().catch(() => ({ question: undefined, history: undefined }));
-  const q = question?.trim();
+  const q = question?.trim().slice(0, 4000);
   if (!q) return c.json({ error: 'question required' }, 400);
   const projects = await accessibleAskProjects(c);
   try {
@@ -1652,17 +1686,44 @@ app.post('/api/ask/stream', userAuth, async (c) => {
   if (!rl.ok) return c.json(tooMany, 429, { 'Retry-After': String(rl.retryAfter) });
   const gen = streamingGenerationClient(c.env);
   if (!gen) return c.json({ error: 'no AI backend — asking questions requires the Workers AI (AI) binding' }, 503);
-  const { question, history } = await c.req.json<{ question?: string; history?: unknown }>().catch(() => ({ question: undefined, history: undefined }));
-  const q = question?.trim();
+  const { question, history, threadId } = await c.req.json<{ question?: string; history?: unknown; threadId?: string }>()
+    .catch(() => ({ question: undefined, history: undefined, threadId: undefined }));
+  const q = question?.trim().slice(0, 4000);
   if (!q) return c.json({ error: 'question required' }, 400);
+  const userId = c.var.user!.id;
+  const stored = threadId ? await askThreadHistory(c.env.DB, userId, threadId) : null;
+  if (threadId && !stored) return c.json({ error: 'chat not found' }, 404);
+  if (stored?.thread.archivedAt) return c.json({ error: 'restore this chat before continuing it' }, 409);
   const projects = await accessibleAskProjects(c);
   try {
     const prepared = await prepareQuestion(c.env, {
       question: q,
       projects,
-      history: normalizeHistory(history),
+      history: stored?.history ?? normalizeHistory(history),
     });
-    return new Response(askEventStream(gen, prepared), {
+    const thread = stored?.thread ?? await createAskThread(c.env.DB, userId, q);
+    await appendAskMessage(c.env.DB, userId, thread.id, { role: 'user', content: q });
+    const projectCount = new Set(prepared.sources.map((source) => source.projectId)).size;
+    const retrieval = `${prepared.mode}${prepared.graphEnhanced ? ' + graph' : ''}`;
+    const trace = [
+      `Selected ${prepared.sources.length} ${retrieval} source${prepared.sources.length === 1 ? '' : 's'} across ${projectCount} project${projectCount === 1 ? '' : 's'}.`,
+      'Generated a grounded response.',
+      'Response complete.',
+    ];
+    return new Response(askEventStream(gen, prepared, {
+      thread: { id: thread.id, title: thread.title },
+      onComplete: async ({ answer, reasoning }) => {
+        await appendAskMessage(c.env.DB, userId, thread.id, {
+          role: 'assistant',
+          content: answer,
+          sources: prepared.sources,
+          reasoning,
+          trace,
+          mode: prepared.mode,
+          model: prepared.model,
+        });
+      },
+    }), {
       headers: {
         'Content-Type': 'text/event-stream; charset=utf-8',
         'Cache-Control': 'no-cache, no-transform',
@@ -1920,6 +1981,8 @@ app.delete('/api/users/:uid', userAuth, async (c) => {
     c.env.DB.prepare('DELETE FROM user_groups WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('DELETE FROM oauth_codes WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('DELETE FROM templates WHERE user_id = ?').bind(uid),
+    c.env.DB.prepare('DELETE FROM ask_messages WHERE thread_id IN (SELECT id FROM ask_threads WHERE user_id = ?)').bind(uid),
+    c.env.DB.prepare('DELETE FROM ask_threads WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('DELETE FROM oauth_tokens WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('UPDATE agents SET user_id = NULL WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('UPDATE projects SET owner_user_id = NULL WHERE owner_user_id = ?').bind(uid),
