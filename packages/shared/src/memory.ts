@@ -352,6 +352,31 @@ export const IndexBatch = z.object({
 });
 export type IndexBatch = z.infer<typeof IndexBatch>;
 
+/**
+ * One decoded JSONL row in an index batch. This is a vendored Runner/server wire contract:
+ * producers and consumers must agree on both the discriminator and the graph vocabularies.
+ * `content` defaults to null so indexers may omit it for node kinds without searchable text.
+ */
+export const StagedEntityRow = z.object({
+  kind: z.literal('node'),
+  uri: z.string().min(1),
+  type: MemoryNodeType,
+  label: z.string().min(1),
+  content: z.string().nullable().default(null),
+});
+export type StagedEntityRow = z.infer<typeof StagedEntityRow>;
+
+export const StagedEdgeRow = z.object({
+  kind: z.literal('edge'),
+  type: MemoryEdgeType,
+  from: z.string().min(1),
+  to: z.string().min(1),
+});
+export type StagedEdgeRow = z.infer<typeof StagedEdgeRow>;
+
+export const StagedRow = z.discriminatedUnion('kind', [StagedEntityRow, StagedEdgeRow]);
+export type StagedRow = z.infer<typeof StagedRow>;
+
 // ---------------------------------------------------------------------------
 // Runner-reachable index cursor + checkout association (§4/§6/§7, PLNR-306)
 //

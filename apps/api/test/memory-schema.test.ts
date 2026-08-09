@@ -399,6 +399,21 @@ describe('MemoryNodeType <-> EntityRef drift guard (PLNR-278)', () => {
   });
 });
 
+describe('staged index row shared contract (PLNR-313)', () => {
+  it('normalizes node content and accepts only the shared node and edge vocabularies', async () => {
+    const { StagedRow } = await import('@noriq-dev/shared');
+
+    expect(StagedRow.parse({ kind: 'node', uri: 'noriq://file/PLNR/repo/a.ts', type: 'file', label: 'a.ts' })).toEqual({
+      kind: 'node', uri: 'noriq://file/PLNR/repo/a.ts', type: 'file', label: 'a.ts', content: null,
+    });
+    expect(StagedRow.parse({
+      kind: 'edge', type: 'imports', from: 'noriq://file/PLNR/repo/a.ts', to: 'noriq://file/PLNR/repo/b.ts',
+    }).kind).toBe('edge');
+    expect(StagedRow.safeParse({ kind: 'node', uri: 'x', type: 'not-a-node-type', label: 'x' }).success).toBe(false);
+    expect(StagedRow.safeParse({ kind: 'edge', type: 'not-an-edge-type', from: 'x', to: 'y' }).success).toBe(false);
+  });
+});
+
 describe('MemoryNode — rejects malformed and cross-project URIs (§5, §18)', () => {
   it('accepts a node whose uri belongs to its own project', () => {
     const node = MemoryNode.parse({

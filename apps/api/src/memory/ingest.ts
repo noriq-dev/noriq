@@ -8,6 +8,7 @@
 // Episode ingest (below) still uses the in-memory bridge PLNR-260 built — real episode RECORD
 // semantics remain PLNR-263's, so there is no SQL staging to move it onto yet.
 import { gunzip, sha256HexBytes } from './backup';
+import { StagedRow } from '@noriq-dev/shared';
 
 /** Per-batch byte ceiling — a bound, not a tune-for-performance number (mirrors backup.ts's
  *  DEFAULT_CHUNK_ROWS comment): the point is that a batch is never allowed to grow the Worker's
@@ -60,45 +61,14 @@ export async function decodeBatchRows(bytes: Uint8Array): Promise<Array<Record<s
 export type IngestStatus = 'pending' | 'complete' | 'aborted';
 
 // ---------------------------------------------------------------------------
-// Staged row parsing (PLNR-261) — a decoded batch row is one of two shapes, discriminated by
-// `kind`. This is a server-internal wire convention (no Runner produces real rows before
-// RUN-215+), kept deliberately out of packages/shared: it is not yet a contract anything
-// vendors, so there is nothing to keep server-first here.
+// Staged row parsing (PLNR-261/313) — the Runner/server wire shapes and graph vocabularies live
+// in packages/shared. The API retains this named boundary so every decoded row is validated
+// before it reaches durable staging.
 // ---------------------------------------------------------------------------
 
-export interface StagedEntityRow {
-  kind: 'node';
-  uri: string;
-  type: string;
-  label: string;
-  content: string | null;
-}
-
-export interface StagedEdgeRow {
-  kind: 'edge';
-  type: string;
-  from: string;
-  to: string;
-}
-
-export type StagedRow = StagedEntityRow | StagedEdgeRow;
-
-/** Shape-check one decoded batch row. Throws naming what's missing — never silently drops a
- *  malformed row into staging. */
+/** Shape-check one decoded batch row against the shared contract. */
 export function parseStagedRow(row: Record<string, unknown>): StagedRow {
-  if (row.kind === 'node') {
-    if (typeof row.uri !== 'string' || !row.uri) throw new Error('staged node row missing uri');
-    if (typeof row.type !== 'string' || !row.type) throw new Error('staged node row missing type');
-    if (typeof row.label !== 'string' || !row.label) throw new Error('staged node row missing label');
-    return { kind: 'node', uri: row.uri, type: row.type, label: row.label, content: typeof row.content === 'string' ? row.content : null };
-  }
-  if (row.kind === 'edge') {
-    if (typeof row.type !== 'string' || !row.type) throw new Error('staged edge row missing type');
-    if (typeof row.from !== 'string' || !row.from) throw new Error('staged edge row missing from');
-    if (typeof row.to !== 'string' || !row.to) throw new Error('staged edge row missing to');
-    return { kind: 'edge', type: row.type, from: row.from, to: row.to };
-  }
-  throw new Error(`staged row has unknown kind: ${JSON.stringify(row.kind)}`);
+  return StagedRow.parse(row);
 }
 
 // ---------------------------------------------------------------------------
