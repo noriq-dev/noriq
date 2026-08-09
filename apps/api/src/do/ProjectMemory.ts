@@ -2739,10 +2739,14 @@ export class ProjectMemory extends DurableObject<Env> {
         new_authority: number | null; actor_kind: string; actor_id: string | null; revision: string | null;
         note: string | null; created_at: string;
       }>(
+        // PLNR-312: `placeholders` is NUMBERED (`?1,…,?N`), so reusing the same string in both IN
+        // clauses makes them read the SAME N bindings — bind `idList` ONCE. Passing it twice
+        // supplies 2N bindings for N declared parameters and SQLite rejects the whole statement
+        // with "Wrong number of parameter bindings for SQL query", which 500'd this endpoint for
+        // every memory (even a single id with no chain: one `?1`, two bindings).
         `SELECT id, memory_item_id, resulting_memory_id, outcome, new_authority, actor_kind, actor_id, revision, note, created_at
          FROM memory_authority_transitions WHERE memory_item_id IN (${placeholders}) OR resulting_memory_id IN (${placeholders})
          ORDER BY created_at`,
-        ...idList,
         ...idList,
       )
       .toArray()
@@ -2761,8 +2765,8 @@ export class ProjectMemory extends DurableObject<Env> {
 
     const contradictionRows = this.ctx.storage.sql
       .exec<{ set_id: string }>(
+        // Same numbered-placeholder rule as the transitions query above (PLNR-312): bind ONCE.
         `SELECT DISTINCT set_id FROM contradictions WHERE memory_item_id IN (${placeholders}) OR contradicts_memory_item_id IN (${placeholders})`,
-        ...idList,
         ...idList,
       )
       .toArray();

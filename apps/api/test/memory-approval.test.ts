@@ -480,3 +480,67 @@ describe('GitHub webhook triggers merge promotion end to end', () => {
     expect(afterCount).toBe(beforeCount); // no registered repo to correlate against — left alone
   });
 });
+
+// PLNR-312: getMemoryHistory had NO coverage at all — not the DO method, not the route, not the
+// UI path — and shipped 500ing for every memory in production ("Wrong number of parameter
+// bindings for SQL query"): `placeholders` is numbered (`?1,…,?N`) and was reused in two IN
+// clauses while `idList` was spread TWICE, declaring N parameters and binding 2N. These drive the
+// real HTTP surface, so the route and the DO query are both covered.
+describe('memory history (PLNR-271 surface, PLNR-312 regression)', () => {
+  it('returns 200 for a lone memory with no supersession chain — the everyday case that 500d', async () => {
+    const { cookie, projectId } = await newOwnedProject('pm-hist-lone@example.com', 'PMHISTLN');
+    const { memoryId } = await memory(projectId).recordMemory(projectId, {
+      kind: 'learning', statement: 'a lone memory, superseding nothing', actor: AGENT,
+    });
+
+    const res = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/memory/items/${memoryId}/history`, {
+      headers: { Cookie: cookie },
+    });
+    expect(res.status).toBe(200); // pre-fix: 500, one `?1` declared against two bindings
+    const body = (await res.json()) as {
+      versions: Array<{ id: string; supersedesMemoryId: string | null; supersededByMemoryId: string | null }>;
+      transitions: unknown[]; contradictions: unknown[]; feedback: unknown[];
+    };
+    expect(body.versions.map((v) => v.id)).toEqual([memoryId]);
+    const [only] = body.versions;
+    expect(only?.supersedesMemoryId).toBeNull();
+    expect(only?.supersededByMemoryId).toBeNull();
+    expect(body.transitions).toEqual([]);
+    expect(body.contradictions).toEqual([]);
+    expect(body.feedback).toEqual([]);
+  });
+
+  it('returns the whole chain, oldest first, from either end of a supersession', async () => {
+    const { cookie, projectId } = await newOwnedProject('pm-hist-chain@example.com', 'PMHISTCH');
+    const { memoryId: original } = await memory(projectId).recordMemory(projectId, {
+      kind: 'learning', statement: 'the original claim', actor: AGENT,
+    });
+    const { memoryId: correction } = await memory(projectId).recordMemory(projectId, {
+      kind: 'learning', statement: 'the corrected claim', supersedesMemoryId: original, actor: AGENT,
+    });
+
+    // Reachable from the NEW id (walks back) and from the OLD id (walks forward) — the traversal
+    // seeds from whichever end the caller happens to hold.
+    for (const seed of [original, correction]) {
+      const res = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/memory/items/${seed}/history`, {
+        headers: { Cookie: cookie },
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        versions: Array<{ id: string; supersedesMemoryId: string | null; supersededByMemoryId: string | null }>;
+      };
+      expect(body.versions.map((v) => v.id)).toEqual([original, correction]); // ORDER BY recorded_at
+      const [older, newer] = body.versions;
+      expect(older?.supersededByMemoryId).toBe(correction);
+      expect(newer?.supersedesMemoryId).toBe(original);
+    }
+  });
+
+  it('404s an unknown memory id rather than 500ing', async () => {
+    const { cookie, projectId } = await newOwnedProject('pm-hist-404@example.com', 'PMHIST44');
+    const res = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/memory/items/mem_does_not_exist/history`, {
+      headers: { Cookie: cookie },
+    });
+    expect(res.status).toBe(404);
+  });
+});
