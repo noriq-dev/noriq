@@ -353,3 +353,68 @@ describe('destructive actions go through the real Dialog confirmation, naming th
     expect(rollback).toHaveBeenCalledWith('prj_1');
   });
 });
+
+describe('removing a repository (PLNR-324)', () => {
+  const REPO: ApiMemoryRepository = {
+    id: 'pr_1', projectId: 'prj_1', repositoryKey: 'web-app', indexingEnabled: true, ingestStatus: 'active',
+    defaultBranch: 'main', vcsKind: 'git', branchClasses: [], latestObservedBase: null, activeGenerationId: null,
+    createdAt: '2026-01-01T00:00:00.000Z', updatedAt: null, checkouts: [],
+    activeGeneration: null, stagedGenerations: [], stale: false, failedIngest: false, failedIngestProblems: [],
+  };
+
+  it('is offered to a NON-admin project member, same posture as registration', async () => {
+    vi.spyOn(api, 'memoryOpsStatus').mockResolvedValue(OK_STATUS);
+    vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [REPO] });
+    vi.spyOn(api, 'memoryBackupsList').mockResolvedValue({ backups: [], r2Available: true });
+
+    mount(fakeStore({ isAdmin: false }));
+    await tick();
+
+    expect(button('Remove')).toBeDefined();
+  });
+
+  it('does not remove on a bare click; names the repository key and notes the memory graph is untouched; removes only after confirming', async () => {
+    vi.spyOn(api, 'memoryOpsStatus').mockResolvedValue(OK_STATUS);
+    vi.spyOn(api, 'memoryRepositories')
+      .mockResolvedValueOnce({ repositories: [REPO] }) // initial load
+      .mockResolvedValueOnce({ repositories: [] }); // post-removal refresh
+    vi.spyOn(api, 'memoryBackupsList').mockResolvedValue({ backups: [], r2Available: true });
+    const deregister = vi.spyOn(api, 'deregisterRepository').mockResolvedValue({ deleted: true });
+
+    mount();
+    await tick();
+
+    await act(async () => { button('Remove')!.click(); });
+    expect(text()).toContain('web-app');
+    expect(text()).toContain('does NOT touch the memory graph');
+    expect(deregister).not.toHaveBeenCalled();
+
+    await act(async () => { button('Cancel')!.click(); });
+    expect(deregister).not.toHaveBeenCalled();
+    expect(text()).toContain('web-app'); // row still present, dismissing left it registered
+
+    await act(async () => { button('Remove')!.click(); });
+    await act(async () => { button('Remove repository')!.click(); });
+    expect(deregister).toHaveBeenCalledWith('prj_1', 'web-app');
+
+    await tick();
+    expect(text()).not.toContain('web-app'); // refreshed list no longer carries the removed repo
+  });
+
+  it('surfaces a rejected removal as an error and leaves the row in place, not silently', async () => {
+    vi.spyOn(api, 'memoryOpsStatus').mockResolvedValue(OK_STATUS);
+    vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [REPO] });
+    vi.spyOn(api, 'memoryBackupsList').mockResolvedValue({ backups: [], r2Available: true });
+    const deregister = vi.spyOn(api, 'deregisterRepository').mockRejectedValue(new Error('boom'));
+
+    mount();
+    await tick();
+
+    await act(async () => { button('Remove')!.click(); });
+    await act(async () => { button('Remove repository')!.click(); });
+
+    expect(deregister).toHaveBeenCalledWith('prj_1', 'web-app');
+    expect(text()).toContain('boom');
+    expect(text()).toContain('web-app'); // still registered — the rejection did not remove the row
+  });
+});

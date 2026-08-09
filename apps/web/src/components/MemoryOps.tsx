@@ -264,6 +264,13 @@ export function MemoryOps({ pid, store }: { pid: string; store: AppStore }) {
                   busy={actionBusy}
                   onActivate={(genId) => runAction(`activate:${genId}`, () => api.memoryActivateGeneration(pid, genId))}
                   onAbort={(genId) => runAction(`abort:${genId}`, () => api.memoryAbortGeneration(pid, genId))}
+                  onRemove={async () => {
+                    const ok = await confirm(
+                      `Remove repository "${r.repositoryKey}" from this project's memory?\n\nThis deregisters the repository — its routing entry and checkouts are removed, and it stops being indexable until re-registered. It does NOT touch the memory graph: decisions, hazards, and episodes already recorded under this key are untouched.`,
+                      { title: 'Remove repository', danger: true, confirmLabel: 'Remove repository' },
+                    );
+                    if (ok) runAction(`remove:${r.id}`, () => api.deregisterRepository(pid, r.repositoryKey));
+                  }}
                 />
               ))}
             </div>
@@ -357,14 +364,16 @@ export function MemoryOps({ pid, store }: { pid: string; store: AppStore }) {
 // ---------------------------------------------------------------------------------------------
 
 function RepositoryCard({
-  repo, isAdmin, busy, onActivate, onAbort,
+  repo, isAdmin, busy, onActivate, onAbort, onRemove,
 }: {
   repo: ApiMemoryRepository;
   isAdmin: boolean;
   busy: string | null;
   onActivate: (generationId: string) => void;
   onAbort: (generationId: string) => void;
+  onRemove: () => void;
 }) {
+  const removing = busy === `remove:${repo.id}`;
   return (
     <div style={{ border: '1px solid var(--w-07)', borderRadius: 10, padding: '12px 14px', background: 'var(--w-01)' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' }}>
@@ -376,6 +385,19 @@ function RepositoryCard({
         <div style={{ flex: 1 }} />
         <StateChip tone={repo.stale ? 'warn' : 'ok'} label="stale index" />
         <StateChip tone={repo.failedIngest ? 'bad' : 'ok'} label="failed ingest" />
+        {/* Removal is human-only but NOT admin-gated (same posture as registration below —
+         *  §4/§6 locked decision: humans declare identity, this mirrors that, not an operator
+         *  action against live index/backup state), matching the server route's own auth
+         *  (userAuth, no requireAdmin — unlike activate/abort's sibling operator routes). */}
+        <button
+          disabled={removing}
+          onClick={onRemove}
+          title={`Remove ${repo.repositoryKey} from this project's memory`}
+          className="hover-bright"
+          style={{ cursor: removing ? 'default' : 'pointer', fontSize: 10.5, padding: '3px 10px', borderRadius: 6, background: 'transparent', color: 'var(--red-soft)', border: '1px solid rgba(255,92,92,.35)' }}
+        >
+          {removing ? 'removing…' : 'Remove'}
+        </button>
       </div>
 
       {/* Visible guidance, not a hover-only tooltip — a state a human can only discover by

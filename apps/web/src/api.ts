@@ -261,6 +261,12 @@ export const api = {
    *  an already-registered key succeeds and returns `created: false`. */
   registerRepository: (pid: string, repositoryKey: string, opts?: { defaultBranch?: string | null; vcsKind?: string | null }) =>
     req<{ repository: ApiMemoryRepository; created: boolean }>('POST', `/api/projects/${pid}/memory/repositories`, { repositoryKey, ...opts }),
+  /** PLNR-321: the inverse of registerRepository — removes only the D1 routing/health row and its
+   *  checkout associations. Idempotent server-side (deleting an already-absent key is a 200 with
+   *  `deleted: false`, never a 404); the memory graph, evidence, and episodes already minted under
+   *  the key are untouched. Same human-only posture as registration, not gated to admin. */
+  deregisterRepository: (pid: string, repositoryKey: string) =>
+    req<{ deleted: boolean }>('DELETE', `/api/projects/${pid}/memory/repositories/${encodeURIComponent(repositoryKey)}`),
   memoryItem: (pid: string, id: string) => req<ApiMemoryItem>('GET', `/api/projects/${pid}/memory/items/${id}`),
   memoryHistory: (pid: string, id: string) => req<ApiMemoryHistory>('GET', `/api/projects/${pid}/memory/items/${id}/history`),
   memoryContradictionSet: (pid: string, setId: string) =>
