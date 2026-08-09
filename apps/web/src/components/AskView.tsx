@@ -30,6 +30,9 @@ interface ThreadMessage extends ApiAskHistoryMessage {
   model?: string;
   reasoning?: string;
   trace?: string[];
+  generationId?: string;
+  generationStatus?: ApiAskStoredMessage['generationStatus'];
+  generationError?: string;
 }
 
 const fromStoredMessage = (message: ApiAskStoredMessage): ThreadMessage => ({
@@ -41,6 +44,9 @@ const fromStoredMessage = (message: ApiAskStoredMessage): ThreadMessage => ({
   model: message.model ?? undefined,
   reasoning: message.reasoning,
   trace: message.trace,
+  generationId: message.generationId ?? undefined,
+  generationStatus: message.generationStatus,
+  generationError: message.generationError ?? undefined,
 });
 
 const modelLabel = (model?: string) => model?.includes('gpt-oss-120b') ? 'GPT-OSS 120B · Cloudflare' : 'Cloudflare Workers AI';
@@ -74,6 +80,69 @@ export function AskView({ store }: { store: AppStore }) {
   const openRequestRef = useRef(0);
   const loading = phase !== null;
 
+  const patchGeneration = (generationId: string, patch: (message: ThreadMessage) => ThreadMessage) => {
+    setMessages((current) => current.map((message, index) =>
+      message.role === 'assistant'
+      && (message.generationId === generationId || (!message.generationId && index === current.length - 1))
+        ? patch(message)
+        : message));
+  };
+
+  const generationHandlers = (
+    generationRef: { current: string },
+    onThread?: (thread: { id: string; title: string }) => void,
+  ) => ({
+    onThread,
+    onGeneration: ({ id }: { id: string }) => {
+      generationRef.current = id;
+      patchGeneration(id, (message) => ({ ...message, generationId: id }));
+    },
+    onMeta: (meta: import('../api').ApiAskStreamMeta) => patchGeneration(generationRef.current, (message) => ({
+      ...message,
+      sources: meta.sources,
+      mode: meta.mode ?? undefined,
+      model: meta.model ?? undefined,
+      trace: meta.trace ?? message.trace,
+    })),
+    onStatus: (next: 'searching' | 'generating') => {
+      setPhase(next);
+      patchGeneration(generationRef.current, (message) => ({ ...message, generationStatus: next }));
+    },
+    onReasoning: (delta: string) => patchGeneration(generationRef.current, (message) => ({
+      ...message,
+      reasoning: (message.reasoning ?? '') + delta,
+    })),
+    onDelta: (delta: string) => patchGeneration(generationRef.current, (message) => ({
+      ...message,
+      content: message.content + delta,
+    })),
+    onDone: () => patchGeneration(generationRef.current, (message) => ({
+      ...message,
+      generationStatus: 'completed',
+    })),
+  });
+
+  const resumeGeneration = async (message: ThreadMessage) => {
+    if (!message.generationId) return;
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const generationRef = { current: message.generationId };
+    try {
+      await api.resumeAskStream(message.generationId, {
+        answer: message.content.length,
+        reasoning: message.reasoning?.length ?? 0,
+      }, generationHandlers(generationRef), controller.signal);
+      await refreshThreadLists(false);
+    } catch (e) {
+      if (!controller.signal.aborted) setError(e instanceof Error ? e.message : 'Could not resume this response.');
+    } finally {
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+        setPhase(null);
+      }
+    }
+  };
+
   const loadThread = async (id: string) => {
     const request = ++openRequestRef.current;
     abortRef.current?.abort();
@@ -86,8 +155,15 @@ export function AskView({ store }: { store: AppStore }) {
       if (request !== openRequestRef.current) return;
       setThreadId(detail.id);
       setThreadArchived(detail.archivedAt !== null);
-      setMessages(detail.messages.map(fromStoredMessage));
+      const storedMessages = detail.messages.map(fromStoredMessage);
+      setMessages(storedMessages);
       followScrollRef.current = true;
+      const active = [...storedMessages].reverse().find((message) =>
+        message.generationId && ['pending', 'searching', 'generating'].includes(message.generationStatus ?? ''));
+      if (active) {
+        setPhase(active.generationStatus === 'generating' ? 'generating' : 'searching');
+        void resumeGeneration(active);
+      }
     } catch (e) {
       if (request !== openRequestRef.current) return;
       setError(e instanceof Error ? e.message : 'Could not load that chat.');
@@ -150,19 +226,18 @@ export function AskView({ store }: { store: AppStore }) {
     const activeThreadId = threadId;
     let streamedThreadId: string | null = null;
     const controller = new AbortController();
-    let completion = { finishReason: null as string | null, truncated: false };
+    const generationRef = { current: '' };
     abortRef.current = controller;
     setMessages((current) => [
       ...current,
       { role: 'user', content: question },
-      { role: 'assistant', content: '', sources: [], trace: ['Searching accessible projects…'] },
+      { role: 'assistant', content: '', sources: [], trace: ['Preparing response…'], generationStatus: 'pending' },
     ]);
     setQ('');
     setPhase('searching');
     setError('');
     try {
-      await api.askStream(question, activeThreadId, {
-        onThread: (thread) => {
+      await api.askStream(question, activeThreadId, generationHandlers(generationRef, (thread) => {
           streamedThreadId = thread.id;
           setThreadId(thread.id);
           setThreadArchived(false);
@@ -172,42 +247,7 @@ export function AskView({ store }: { store: AppStore }) {
             const now = new Date().toISOString();
             return [{ id: thread.id, title: thread.title, archivedAt: null, createdAt: now, updatedAt: now, messageCount: 1, lastMessage: question }, ...current];
           });
-        },
-        onMeta: (meta) => {
-          const projectCount = new Set(meta.sources.map((source) => source.projectId)).size;
-          const retrieval = `${meta.mode}${meta.graphEnhanced ? ' + graph' : ''}`;
-          setMessages((current) => current.map((message, index) =>
-            index === current.length - 1 && message.role === 'assistant'
-              ? {
-                  ...message,
-                  sources: meta.sources,
-                  mode: meta.mode,
-                  model: meta.model,
-                  trace: [`Selected ${meta.sources.length} ${retrieval} source${meta.sources.length === 1 ? '' : 's'} across ${projectCount} project${projectCount === 1 ? '' : 's'}.`],
-                }
-              : message));
-        },
-        onStatus: () => {
-          setPhase('generating');
-          setMessages((current) => current.map((message, index) =>
-            index === current.length - 1 && message.role === 'assistant'
-              ? { ...message, trace: [...(message.trace ?? []), 'Generating a grounded response…'] }
-              : message));
-        },
-        onReasoning: (delta) => setMessages((current) => current.map((message, index) =>
-          index === current.length - 1 && message.role === 'assistant'
-            ? { ...message, reasoning: (message.reasoning ?? '') + delta }
-            : message)),
-        onDelta: (delta) => setMessages((current) => current.map((message, index) =>
-          index === current.length - 1 && message.role === 'assistant'
-            ? { ...message, content: message.content + delta }
-            : message)),
-        onDone: (result) => { completion = result; },
-      }, controller.signal);
-      setMessages((current) => current.map((message, index) =>
-        index === current.length - 1 && message.role === 'assistant'
-          ? { ...message, trace: [...(message.trace ?? []), completion.truncated ? `Response truncated (${completion.finishReason ?? 'token limit'}).` : 'Response complete.'] }
-          : message));
+        }), controller.signal);
       await refreshThreadLists(false);
     } catch (e) {
       if (controller.signal.aborted) return;

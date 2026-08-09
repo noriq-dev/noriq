@@ -44,13 +44,15 @@
       { "name": "PROJECT_ROOM", "class_name": "ProjectRoom" },
       { "name": "AGENT_SESSION", "class_name": "AgentSession" },
       { "name": "RATE_LIMITER", "class_name": "RateLimiter" },
-      { "name": "RUNNER_HUB", "class_name": "RunnerHub" }
+      { "name": "RUNNER_HUB", "class_name": "RunnerHub" },
+      { "name": "ASK_GENERATION", "class_name": "AskGeneration" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["ProjectRoom", "AgentSession"] },
     { "tag": "v2", "new_sqlite_classes": ["RateLimiter"] },
-    { "tag": "v3", "new_sqlite_classes": ["RunnerHub"] }
+    { "tag": "v3", "new_sqlite_classes": ["RunnerHub"] },
+    { "tag": "v5", "new_sqlite_classes": ["AskGeneration"] }
   ],
 
   // A DEDICATED, FRESH database — create it once, then paste its id here. This must NOT be a

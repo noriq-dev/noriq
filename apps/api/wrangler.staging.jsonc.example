@@ -60,7 +60,8 @@
       { "name": "AGENT_SESSION", "class_name": "AgentSession" },
       { "name": "RATE_LIMITER", "class_name": "RateLimiter" },
       { "name": "RUNNER_HUB", "class_name": "RunnerHub" },
-      { "name": "PROJECT_MEMORY", "class_name": "ProjectMemory" }
+      { "name": "PROJECT_MEMORY", "class_name": "ProjectMemory" },
+      { "name": "ASK_GENERATION", "class_name": "AskGeneration" }
     ]
   },
   // Migration tags are per-worker and must stay append-only, in this order. A fresh worker still
@@ -69,7 +70,8 @@
     { "tag": "v1", "new_sqlite_classes": ["ProjectRoom", "AgentSession"] },
     { "tag": "v2", "new_sqlite_classes": ["RateLimiter"] },
     { "tag": "v3", "new_sqlite_classes": ["RunnerHub"] },
-    { "tag": "v4", "new_sqlite_classes": ["ProjectMemory"] }
+    { "tag": "v4", "new_sqlite_classes": ["ProjectMemory"] },
+    { "tag": "v5", "new_sqlite_classes": ["AskGeneration"] }
   ],
 
   //   npx wrangler d1 create noriq-staging

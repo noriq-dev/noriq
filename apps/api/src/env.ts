@@ -3,6 +3,7 @@ import type { AgentSession } from './do/AgentSession';
 import type { RateLimiter } from './do/RateLimiter';
 import type { RunnerHub } from './do/RunnerHub';
 import type { ProjectMemory } from './do/ProjectMemory';
+import type { AskGeneration } from './do/AskGeneration';
 
 export interface Env {
   DB: D1Database;
@@ -14,11 +15,16 @@ export interface Env {
   /** ProjectMemory (PLNR-245) — one per project (idFromName(projectId)), canonical writer/
    *  query authority for cognitive memory. Separate from PROJECT_ROOM by design (§2, §19). */
   PROJECT_MEMORY: DurableObjectNamespace<ProjectMemory>;
+  /** One alarm-backed Durable Object per Ask response. It owns inference independently of any
+   * browser stream, while D1 remains the reconnectable/cancellable generation record. */
+  ASK_GENERATION: DurableObjectNamespace<AskGeneration>;
   /** Set in tests to bypass rate limiting. */
   DISABLE_RATE_LIMIT?: boolean;
   /** Poll interval (ms) for the subscriptions/listen event stream (PLNR-234).
    *  Default 5000; tests set it low so change notifications arrive within a tick. */
   LISTEN_POLL_MS?: string;
+  /** Poll cadence for reconnectable Ask SSE followers. Primarily lowered by tests. */
+  ASK_STREAM_POLL_MS?: string;
   /** Bootstrap secret for issuing agent keys / creating users. Set via `wrangler secret put ADMIN_TOKEN`. */
   ADMIN_TOKEN?: string;
   /** Optional shared secret for GitHub webhook signature verification. */

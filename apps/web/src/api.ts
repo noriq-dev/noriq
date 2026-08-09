@@ -21,15 +21,17 @@ async function req<T>(method: string, path: string, body?: unknown, signal?: Abo
 
 export interface ApiAskStreamMeta {
   sources: ApiAskSource[];
-  mode: 'semantic' | 'keyword';
-  model: string;
+  mode: 'semantic' | 'keyword' | null;
+  model: string | null;
   graphEnhanced: boolean;
+  trace?: string[];
 }
 
 export interface ApiAskStreamHandlers {
   onThread?: (thread: { id: string; title: string }) => void;
+  onGeneration?: (generation: { id: string }) => void;
   onMeta: (meta: ApiAskStreamMeta) => void;
-  onStatus?: (phase: 'generating') => void;
+  onStatus?: (phase: 'searching' | 'generating') => void;
   onReasoning?: (text: string) => void;
   onDelta: (text: string) => void;
   onDone?: (result: { finishReason: string | null; truncated: boolean }) => void;
@@ -48,6 +50,28 @@ async function askStream(
     credentials: 'same-origin',
     signal,
   });
+  return consumeAskStream(res, handlers);
+}
+
+async function resumeAskStream(
+  generationId: string,
+  offsets: { answer: number; reasoning: number },
+  handlers: ApiAskStreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  const query = new URLSearchParams({
+    answerOffset: String(offsets.answer),
+    reasoningOffset: String(offsets.reasoning),
+  });
+  const res = await fetch(`/api/ask/generations/${generationId}/stream?${query}`, {
+    headers: { Accept: 'text/event-stream' },
+    credentials: 'same-origin',
+    signal,
+  });
+  return consumeAskStream(res, handlers);
+}
+
+async function consumeAskStream(res: Response, handlers: ApiAskStreamHandlers): Promise<void> {
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     throw new ApiError(res.status, (data as { error?: string }).error ?? res.statusText);
@@ -70,8 +94,10 @@ async function askStream(
     const payload = JSON.parse(data.join('\n')) as Record<string, unknown>;
     if (event === 'thread' && typeof payload.id === 'string' && typeof payload.title === 'string') {
       handlers.onThread?.({ id: payload.id, title: payload.title });
+    } else if (event === 'generation' && typeof payload.id === 'string') {
+      handlers.onGeneration?.({ id: payload.id });
     } else if (event === 'meta') handlers.onMeta(payload as unknown as ApiAskStreamMeta);
-    else if (event === 'status' && payload.phase === 'generating') handlers.onStatus?.('generating');
+    else if (event === 'status' && (payload.phase === 'searching' || payload.phase === 'generating')) handlers.onStatus?.(payload.phase);
     else if (event === 'reasoning' && typeof payload.text === 'string') handlers.onReasoning?.(payload.text);
     else if (event === 'delta' && typeof payload.text === 'string') handlers.onDelta(payload.text);
     else if (event === 'error') throw new Error(typeof payload.error === 'string' ? payload.error : 'Answer generation failed');
@@ -324,6 +350,7 @@ export const api = {
     req<{ answer: string; mode: 'semantic' | 'keyword'; model: string; graphEnhanced: boolean; sources: ApiAskSource[] }>(
       'POST', '/api/ask', { question, history }),
   askStream,
+  resumeAskStream,
   askThreads: (archived = false) =>
     req<{ threads: ApiAskThread[] }>('GET', `/api/ask/threads${archived ? '?archived=1' : ''}`),
   askThread: (threadId: string) => req<ApiAskThreadDetail>('GET', `/api/ask/threads/${threadId}`),
@@ -851,6 +878,9 @@ export interface ApiAskStoredMessage extends ApiAskHistoryMessage {
   trace: string[];
   mode: 'semantic' | 'keyword' | null;
   model: string | null;
+  generationId?: string | null;
+  generationStatus?: 'pending' | 'searching' | 'generating' | 'completed' | 'failed' | null;
+  generationError?: string | null;
   createdAt: string;
 }
 

@@ -10,6 +10,10 @@ import {
 } from '../src/ask';
 import type { SearchHit } from '../src/search';
 import type { Env } from '../src/env';
+import {
+  completeAskGeneration, createAskGeneration, createAskThread, deleteAskThread, getAskGeneration, updateAskGeneration,
+} from '../src/ask-chats';
+import { askGenerationEventStream } from '../src/ask-generation';
 
 /** Fake generation client: records the prompts it saw, returns a canned answer. */
 function fakeGen(canned = 'Grounded answer citing ASK-1.') {
@@ -332,6 +336,52 @@ describe('REST /api/ask', () => {
     })).status).toBe(200);
     expect(await env.DB.prepare('SELECT id FROM ask_messages WHERE thread_id = ?').bind(thread.id).first()).toBeNull();
     expect((await SELF.fetch(`https://noriq.test/api/ask/threads/${thread.id}`, { headers: { Cookie: cookie } })).status).toBe(404);
+  });
+
+  it('keeps a server-owned generation alive when a follower disconnects and replays from offsets', async () => {
+    const owner = await createUser('ask-reconnect@example.com', 'Ask Reconnect', 'longenough1');
+    const thread = await createAskThread(env.DB, owner.id, 'Reconnect me');
+    const generation = await createAskGeneration(env.DB, owner.id, thread.id, 'Keep going', []);
+
+    const follower = askGenerationEventStream(env as unknown as Env, owner.id, generation.id);
+    const reader = follower.getReader();
+    await reader.read();
+    await reader.cancel();
+    expect((await getAskGeneration(env.DB, generation.id, owner.id))?.status).toBe('pending');
+
+    await updateAskGeneration(env.DB, generation.id, {
+      status: 'generating',
+      answer: 'durable answer',
+      reasoning: 'public summary',
+      sources: [],
+      trace: ['Generating…'],
+      mode: 'keyword',
+      model: 'test-model',
+      graphEnhanced: false,
+    });
+    await completeAskGeneration(env.DB, generation.id, 'stop', false);
+    const replay = await new Response(askGenerationEventStream(env as unknown as Env, owner.id, generation.id, {
+      answerOffset: 'durable '.length,
+      reasoningOffset: 'public '.length,
+    })).text();
+    expect(replay).toContain('data: {"text":"answer"}');
+    expect(replay).toContain('data: {"text":"summary"}');
+    expect(replay).toContain('event: done');
+
+    const detail = await (await SELF.fetch(`https://noriq.test/api/ask/threads/${thread.id}`, {
+      headers: { Cookie: await loginSession('ask-reconnect@example.com', 'longenough1') },
+    })).json() as { messages: Array<{ role: string; generationId?: string; generationStatus?: string; content: string }> };
+    expect(detail.messages.filter((message) => message.role === 'assistant')).toEqual([
+      expect.objectContaining({ generationId: generation.id, generationStatus: 'completed', content: 'durable answer' }),
+    ]);
+  });
+
+  it('deleting a chat removes the in-flight generation cancellation record', async () => {
+    const owner = await createUser('ask-cancel@example.com', 'Ask Cancel', 'longenough1');
+    const thread = await createAskThread(env.DB, owner.id, 'Cancel me');
+    const generation = await createAskGeneration(env.DB, owner.id, thread.id, 'Stop now', []);
+    expect(await deleteAskThread(env.DB, owner.id, thread.id)).toBe(true);
+    expect(await getAskGeneration(env.DB, generation.id)).toBeNull();
   });
 
   it('removes owned chats before deleting a disabled user', async () => {

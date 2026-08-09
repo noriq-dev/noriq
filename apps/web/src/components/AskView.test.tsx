@@ -141,6 +141,33 @@ describe('global Ask chat', () => {
     await act(async () => { handlers!.onDelta('Stored answer'); finish!(); });
   });
 
+  it('reconnects to an in-flight stored response from its persisted offsets', async () => {
+    const detail = detailFor(activeThread);
+    detail.messages[1] = {
+      ...detail.messages[1]!,
+      content: 'Persisted ',
+      reasoning: 'Summary ',
+      generationId: 'askgen_live',
+      generationStatus: 'generating',
+    };
+    vi.spyOn(api, 'askThreads').mockResolvedValue({ threads: [activeThread] });
+    vi.spyOn(api, 'askThread').mockResolvedValue(detail);
+    const resume = vi.spyOn(api, 'resumeAskStream').mockImplementation(async (_id, _offsets, handlers) => {
+      handlers.onDelta('continuation');
+      handlers.onDone?.({ finishReason: 'stop', truncated: false });
+    });
+
+    mount();
+    await flush();
+    expect(resume).toHaveBeenCalledWith(
+      'askgen_live',
+      { answer: 'Persisted '.length, reasoning: 'Summary '.length },
+      expect.anything(),
+      expect.any(AbortSignal),
+    );
+    expect(container.textContent).toContain('Persisted continuation');
+  });
+
   it('archives, views, restores, and permanently deletes chats', async () => {
     vi.spyOn(api, 'askThreads').mockImplementation(async (archived = false) => ({ threads: archived ? [archivedThread] : [activeThread] }));
     vi.spyOn(api, 'askThread').mockImplementation(async (id) => detailFor(id === archivedThread.id ? archivedThread : activeThread));

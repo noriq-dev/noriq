@@ -21,7 +21,35 @@ export interface StoredAskMessage extends AskHistoryMessage {
   trace: string[];
   mode: 'semantic' | 'keyword' | null;
   model: string | null;
+  generationId: string | null;
+  generationStatus: AskGenerationStatus | null;
+  generationError: string | null;
   createdAt: string;
+}
+
+export type AskGenerationStatus = 'pending' | 'searching' | 'generating' | 'completed' | 'failed';
+
+export interface StoredAskGeneration {
+  id: string;
+  threadId: string;
+  messageId: string;
+  userId: string;
+  question: string;
+  history: AskHistoryMessage[];
+  status: AskGenerationStatus;
+  answer: string;
+  reasoning: string;
+  sources: AskSource[];
+  trace: string[];
+  mode: 'semantic' | 'keyword' | null;
+  model: string | null;
+  graphEnhanced: boolean;
+  finishReason: string | null;
+  truncated: boolean;
+  error: string | null;
+  revision: number;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface AskThreadDetail extends AskThreadSummary {
@@ -73,12 +101,16 @@ export async function getAskThread(db: D1Database, userId: string, threadId: str
   ).bind(threadId, userId).first<Omit<AskThreadSummary, 'messageCount' | 'lastMessage'>>();
   if (!thread) return null;
   const { results } = await db.prepare(
-    `SELECT id, role, content, sources_json AS sourcesJson, reasoning, trace_json AS traceJson,
-            retrieval_mode AS mode, model, created_at AS createdAt
-       FROM ask_messages WHERE thread_id = ? ORDER BY created_at, id`,
+    `SELECT m.id, m.role, m.content, m.sources_json AS sourcesJson, m.reasoning, m.trace_json AS traceJson,
+            m.retrieval_mode AS mode, m.model, m.created_at AS createdAt,
+            g.id AS generationId, g.status AS generationStatus, g.error AS generationError
+       FROM ask_messages m
+       LEFT JOIN ask_generations g ON g.message_id = m.id
+      WHERE m.thread_id = ? ORDER BY m.created_at, m.id`,
   ).bind(threadId).all<{
     id: string; role: 'user' | 'assistant'; content: string; sourcesJson: string; reasoning: string;
     traceJson: string; mode: 'semantic' | 'keyword' | null; model: string | null; createdAt: string;
+    generationId: string | null; generationStatus: AskGenerationStatus | null; generationError: string | null;
   }>();
   const messages = results.map((row): StoredAskMessage => ({
     id: row.id,
@@ -89,6 +121,9 @@ export async function getAskThread(db: D1Database, userId: string, threadId: str
     trace: jsonArray<string>(row.traceJson).filter((item): item is string => typeof item === 'string'),
     mode: row.mode,
     model: row.model,
+    generationId: row.generationId,
+    generationStatus: row.generationStatus,
+    generationError: row.generationError,
     createdAt: row.createdAt,
   }));
   return {
@@ -143,6 +178,140 @@ export async function appendAskMessage(
   return id;
 }
 
+/** Atomically append the user's prompt, reserve exactly one assistant message, and create the
+ * durable generation record that an alarm worker and reconnecting clients share. */
+export async function createAskGeneration(
+  db: D1Database,
+  userId: string,
+  threadId: string,
+  question: string,
+  history: AskHistoryMessage[],
+): Promise<StoredAskGeneration> {
+  const id = newId('askgen');
+  const userMessageId = newId('msg');
+  const messageId = newId('msg');
+  const now = nowIso();
+  const owned = await db.prepare('SELECT id FROM ask_threads WHERE id = ? AND user_id = ?').bind(threadId, userId).first();
+  if (!owned) throw new Error('chat not found');
+  await db.batch([
+    db.prepare(
+      `INSERT INTO ask_messages
+        (id, thread_id, role, content, sources_json, reasoning, trace_json, retrieval_mode, model, created_at)
+       VALUES (?, ?, 'user', ?, '[]', '', '[]', NULL, NULL, ?)`,
+    ).bind(userMessageId, threadId, question, now),
+    db.prepare(
+      `INSERT INTO ask_messages
+        (id, thread_id, role, content, sources_json, reasoning, trace_json, retrieval_mode, model, created_at)
+       VALUES (?, ?, 'assistant', '', '[]', '', '[]', NULL, NULL, ?)`,
+    ).bind(messageId, threadId, now),
+    db.prepare(
+      `INSERT INTO ask_generations
+        (id, thread_id, message_id, user_id, question, history_json, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+    ).bind(id, threadId, messageId, userId, question, JSON.stringify(history), now, now),
+    db.prepare('UPDATE ask_threads SET updated_at = ? WHERE id = ? AND user_id = ?').bind(now, threadId, userId),
+  ]);
+  return {
+    id, threadId, messageId, userId, question, history, status: 'pending', answer: '', reasoning: '',
+    sources: [], trace: [], mode: null, model: null, graphEnhanced: false, finishReason: null,
+    truncated: false, error: null, revision: 0, createdAt: now, updatedAt: now,
+  };
+}
+
+const generationFromRow = (row: {
+  id: string; threadId: string; messageId: string; userId: string; question: string; historyJson: string;
+  status: AskGenerationStatus; answer: string; reasoning: string; sourcesJson: string; traceJson: string;
+  mode: 'semantic' | 'keyword' | null; model: string | null; graphEnhanced: number; finishReason: string | null;
+  truncated: number; error: string | null; revision: number; createdAt: string; updatedAt: string;
+}): StoredAskGeneration => ({
+  id: row.id,
+  threadId: row.threadId,
+  messageId: row.messageId,
+  userId: row.userId,
+  question: row.question,
+  history: jsonArray<AskHistoryMessage>(row.historyJson),
+  status: row.status,
+  answer: row.answer,
+  reasoning: row.reasoning,
+  sources: jsonArray<AskSource>(row.sourcesJson),
+  trace: jsonArray<string>(row.traceJson),
+  mode: row.mode,
+  model: row.model,
+  graphEnhanced: row.graphEnhanced === 1,
+  finishReason: row.finishReason,
+  truncated: row.truncated === 1,
+  error: row.error,
+  revision: Number(row.revision),
+  createdAt: row.createdAt,
+  updatedAt: row.updatedAt,
+});
+
+export async function getAskGeneration(
+  db: D1Database,
+  generationId: string,
+  userId?: string,
+): Promise<StoredAskGeneration | null> {
+  const owner = userId ? ' AND user_id = ?' : '';
+  const row = await db.prepare(
+    `SELECT id, thread_id AS threadId, message_id AS messageId, user_id AS userId, question,
+            history_json AS historyJson, status, answer, reasoning, sources_json AS sourcesJson,
+            trace_json AS traceJson, retrieval_mode AS mode, model, graph_enhanced AS graphEnhanced,
+            finish_reason AS finishReason, truncated, error, revision,
+            created_at AS createdAt, updated_at AS updatedAt
+       FROM ask_generations WHERE id = ?${owner}`,
+  ).bind(...(userId ? [generationId, userId] : [generationId])).first<Parameters<typeof generationFromRow>[0]>();
+  return row ? generationFromRow(row) : null;
+}
+
+export async function updateAskGeneration(
+  db: D1Database,
+  generationId: string,
+  patch: Pick<StoredAskGeneration, 'status' | 'answer' | 'reasoning' | 'sources' | 'trace' | 'mode' | 'model' | 'graphEnhanced'>,
+): Promise<boolean> {
+  const now = nowIso();
+  const result = await db.prepare(
+    `UPDATE ask_generations
+        SET status = ?, answer = ?, reasoning = ?, sources_json = ?, trace_json = ?,
+            retrieval_mode = ?, model = ?, graph_enhanced = ?, revision = revision + 1, updated_at = ?
+      WHERE id = ? AND status NOT IN ('completed', 'failed')`,
+  ).bind(
+    patch.status, patch.answer, patch.reasoning, JSON.stringify(patch.sources), JSON.stringify(patch.trace),
+    patch.mode, patch.model, patch.graphEnhanced ? 1 : 0, now, generationId,
+  ).run();
+  if ((result.meta.changes ?? 0) < 1) return false;
+  await db.prepare(
+    `UPDATE ask_messages
+        SET content = ?, sources_json = ?, reasoning = ?, trace_json = ?, retrieval_mode = ?, model = ?
+      WHERE id = (SELECT message_id FROM ask_generations WHERE id = ?)`,
+  ).bind(
+    patch.answer, JSON.stringify(patch.sources), patch.reasoning, JSON.stringify(patch.trace), patch.mode, patch.model,
+    generationId,
+  ).run();
+  return true;
+}
+
+export async function completeAskGeneration(
+  db: D1Database,
+  generationId: string,
+  finishReason: string | null,
+  truncated: boolean,
+): Promise<boolean> {
+  const result = await db.prepare(
+    `UPDATE ask_generations
+        SET status = 'completed', finish_reason = ?, truncated = ?, revision = revision + 1, updated_at = ?
+      WHERE id = ? AND status NOT IN ('completed', 'failed')`,
+  ).bind(finishReason, truncated ? 1 : 0, nowIso(), generationId).run();
+  return (result.meta.changes ?? 0) > 0;
+}
+
+export async function failAskGeneration(db: D1Database, generationId: string, error: string): Promise<void> {
+  await db.prepare(
+    `UPDATE ask_generations
+        SET status = 'failed', error = ?, revision = revision + 1, updated_at = ?
+      WHERE id = ? AND status NOT IN ('completed', 'failed')`,
+  ).bind(error.slice(0, 1000), nowIso(), generationId).run();
+}
+
 export async function setAskThreadArchived(
   db: D1Database,
   userId: string,
@@ -159,6 +328,7 @@ export async function deleteAskThread(db: D1Database, userId: string, threadId: 
   const owned = await db.prepare('SELECT id FROM ask_threads WHERE id = ? AND user_id = ?').bind(threadId, userId).first();
   if (!owned) return false;
   await db.batch([
+    db.prepare('DELETE FROM ask_generations WHERE thread_id = ?').bind(threadId),
     db.prepare('DELETE FROM ask_messages WHERE thread_id = ?').bind(threadId),
     db.prepare('DELETE FROM ask_threads WHERE id = ? AND user_id = ?').bind(threadId, userId),
   ]);

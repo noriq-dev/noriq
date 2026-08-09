@@ -15,12 +15,13 @@ import type { ExecutionSpecInput, RunStatus } from '@noriq-dev/shared';
 import { readExecutionSpec } from './lib/execution-spec';
 import { search, searchBackend, reindexProject, ALL_KINDS, type SearchKind } from './search';
 import {
-  answerQuestion, askEventStream, generationClient, normalizeHistory, prepareQuestion, streamingGenerationClient,
+  answerQuestion, generationClient, normalizeHistory, streamingGenerationClient,
   type AskProject,
 } from './ask';
 import {
-  appendAskMessage, askThreadHistory, createAskThread, deleteAskThread, getAskThread, listAskThreads, setAskThreadArchived,
+  askThreadHistory, createAskGeneration, createAskThread, deleteAskThread, getAskThread, listAskThreads, setAskThreadArchived,
 } from './ask-chats';
+import { accessibleAskProjectsForUser, askGenerationEventStream } from './ask-generation';
 import { verifyUploadToken, resolveUploadSecret, signIngestToken, verifyIngestToken, type IngestClaims } from './lib/upload-token';
 import { USER_PROJECT_WHERE, taskWireStatus, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
 import {
@@ -56,6 +57,7 @@ export { AgentSession } from './do/AgentSession';
 export { RateLimiter } from './do/RateLimiter';
 export { RunnerHub } from './do/RunnerHub';
 export { ProjectMemory } from './do/ProjectMemory';
+export { AskGeneration } from './do/AskGeneration';
 
 const app = new Hono<AppContext>();
 
@@ -1780,12 +1782,7 @@ app.post('/api/projects/:pid/search/reindex', userAuth, async (c) => {
 // it derives its complete retrieval scope from USER_PROJECT_WHERE on every request instead of
 // trusting project ids from the browser. Admins get their normal user-scoped set, not admin-all.
 const accessibleAskProjects = async (c: Context<AppContext>): Promise<AskProject[]> => {
-  const { results } = await c.env.DB.prepare(
-    `SELECT p.id, p.key, p.name FROM projects p
-     WHERE p.status = 'active' AND ${USER_PROJECT_WHERE}
-     ORDER BY p.created_at`,
-  ).bind(c.var.user!.id).all<AskProject>();
-  return results;
+  return accessibleAskProjectsForUser(c.env, c.var.user!.id);
 };
 
 app.get('/api/ask/threads', userAuth, async (c) => {
@@ -1838,14 +1835,12 @@ app.post('/api/ask', userAuth, async (c) => {
   }
 });
 
-// Streaming twin of /api/ask. Retrieval completes first, then the response emits source metadata,
-// a generation status transition, visible answer deltas, and one terminal done/error event. The
-// upstream model's private reasoning events are deliberately never forwarded.
+// Start a server-owned response and follow its durable D1 snapshots. The alarm continues if this
+// browser stream disconnects; reconnect through the generation route below.
 app.post('/api/ask/stream', userAuth, async (c) => {
   const rl = await rateLimit(c.env, `ask:${c.var.user!.id}`, 20);
   if (!rl.ok) return c.json(tooMany, 429, { 'Retry-After': String(rl.retryAfter) });
-  const gen = streamingGenerationClient(c.env);
-  if (!gen) return c.json({ error: 'no AI backend — asking questions requires the Workers AI (AI) binding' }, 503);
+  if (!streamingGenerationClient(c.env)) return c.json({ error: 'no AI backend — asking questions requires the Workers AI (AI) binding' }, 503);
   const { question, history, threadId } = await c.req.json<{ question?: string; history?: unknown; threadId?: string }>()
     .catch(() => ({ question: undefined, history: undefined, threadId: undefined }));
   const q = question?.trim().slice(0, 4000);
@@ -1854,34 +1849,14 @@ app.post('/api/ask/stream', userAuth, async (c) => {
   const stored = threadId ? await askThreadHistory(c.env.DB, userId, threadId) : null;
   if (threadId && !stored) return c.json({ error: 'chat not found' }, 404);
   if (stored?.thread.archivedAt) return c.json({ error: 'restore this chat before continuing it' }, 409);
-  const projects = await accessibleAskProjects(c);
   try {
-    const prepared = await prepareQuestion(c.env, {
-      question: q,
-      projects,
-      history: stored?.history ?? normalizeHistory(history),
-    });
     const thread = stored?.thread ?? await createAskThread(c.env.DB, userId, q);
-    await appendAskMessage(c.env.DB, userId, thread.id, { role: 'user', content: q });
-    const projectCount = new Set(prepared.sources.map((source) => source.projectId)).size;
-    const retrieval = `${prepared.mode}${prepared.graphEnhanced ? ' + graph' : ''}`;
-    const trace = [
-      `Selected ${prepared.sources.length} ${retrieval} source${prepared.sources.length === 1 ? '' : 's'} across ${projectCount} project${projectCount === 1 ? '' : 's'}.`,
-      'Generated a grounded response.',
-    ];
-    return new Response(askEventStream(gen, prepared, {
+    const generation = await createAskGeneration(
+      c.env.DB, userId, thread.id, q, stored?.history ?? normalizeHistory(history),
+    );
+    await c.env.ASK_GENERATION.get(c.env.ASK_GENERATION.idFromName(generation.id)).start(generation.id);
+    return new Response(askGenerationEventStream(c.env, userId, generation.id, {
       thread: { id: thread.id, title: thread.title },
-      onComplete: async ({ answer, reasoning, finishReason, truncated }) => {
-        await appendAskMessage(c.env.DB, userId, thread.id, {
-          role: 'assistant',
-          content: answer,
-          sources: prepared.sources,
-          reasoning,
-          trace: [...trace, truncated ? `Response truncated (${finishReason ?? 'token limit'}).` : 'Response complete.'],
-          mode: prepared.mode,
-          model: prepared.model,
-        });
-      },
     }), {
       headers: {
         'Content-Type': 'text/event-stream; charset=utf-8',
@@ -1892,6 +1867,21 @@ app.post('/api/ask/stream', userAuth, async (c) => {
   } catch (e) {
     return c.json({ error: `answer generation failed: ${e instanceof Error ? e.message : 'unknown error'}` }, 502);
   }
+});
+
+app.get('/api/ask/generations/:generationId/stream', userAuth, async (c) => {
+  const answerOffset = Math.max(0, parseInt(c.req.query('answerOffset') ?? '0', 10) || 0);
+  const reasoningOffset = Math.max(0, parseInt(c.req.query('reasoningOffset') ?? '0', 10) || 0);
+  return new Response(askGenerationEventStream(c.env, c.var.user!.id, c.req.param('generationId')!, {
+    answerOffset,
+    reasoningOffset,
+  }), {
+    headers: {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      'X-Content-Type-Options': 'nosniff',
+    },
+  });
 });
 
 // Archive / restore a plan (PLNR-148) — display-only; see setPlanArchived.
@@ -2426,6 +2416,7 @@ app.delete('/api/users/:uid', userAuth, async (c) => {
     c.env.DB.prepare("DELETE FROM project_grants WHERE principal_type = 'user' AND principal_id = ?").bind(uid),
     c.env.DB.prepare('DELETE FROM oauth_codes WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('DELETE FROM templates WHERE user_id = ?').bind(uid),
+    c.env.DB.prepare('DELETE FROM ask_generations WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('DELETE FROM ask_messages WHERE thread_id IN (SELECT id FROM ask_threads WHERE user_id = ?)').bind(uid),
     c.env.DB.prepare('DELETE FROM ask_threads WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('DELETE FROM oauth_tokens WHERE user_id = ?').bind(uid),

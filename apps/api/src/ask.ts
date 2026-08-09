@@ -517,6 +517,92 @@ export async function answerQuestion(env: Env, gen: GenerationClient, opts: AskO
 const sse = (event: string, data: unknown): Uint8Array =>
   new TextEncoder().encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 
+export interface AskGenerationResult extends AskFinishState {
+  answer: string;
+  reasoning: string;
+}
+
+export interface AskGenerationCallbacks {
+  onReasoning?: (delta: string) => void | Promise<void>;
+  onDelta?: (delta: string) => void | Promise<void>;
+  shouldContinue?: () => boolean | Promise<boolean>;
+}
+
+/** Consume one Workers AI stream independently of any browser response. This is the generation
+ * primitive used by both the legacy direct SSE adapter and the alarm-owned durable job. */
+export async function consumeAskGeneration(
+  gen: StreamingGenerationClient,
+  prepared: PreparedAsk,
+  callbacks: AskGenerationCallbacks = {},
+): Promise<AskGenerationResult | null> {
+  const upstream = await gen.stream(prepared.messages, { maxTokens: MAX_ANSWER_TOKENS });
+  const reader = upstream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let emitted = false;
+  let finalCandidate = '';
+  const answerParts: string[] = [];
+  const reasoningParts: string[] = [];
+  let finish: AskFinishState = { finishReason: null, truncated: false };
+
+  const consumeLine = async (rawLine: string) => {
+    const line = rawLine.trim();
+    if (!line.startsWith('data:')) return;
+    const data = line.slice(5).trim();
+    if (!data || data === '[DONE]') return;
+    let payload: unknown;
+    try { payload = JSON.parse(data); } catch { return; }
+    const upstreamError = asObject(asObject(payload)?.error)?.message ?? asObject(payload)?.error;
+    if (typeof upstreamError === 'string') throw new Error(`Workers AI: ${upstreamError}`);
+    finish = extractFinishState(payload) ?? finish;
+    const reasoningSummary = extractReasoningSummaryDelta(payload);
+    if (reasoningSummary) {
+      reasoningParts.push(reasoningSummary);
+      await callbacks.onReasoning?.(reasoningSummary);
+    }
+    const delta = extractStreamDelta(payload);
+    if (delta) {
+      emitted = true;
+      answerParts.push(delta);
+      await callbacks.onDelta?.(delta);
+    } else {
+      const candidate = extractGeneratedText(payload);
+      if (candidate) finalCandidate = candidate;
+    }
+  };
+
+  try {
+    while (await callbacks.shouldContinue?.() ?? true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) await consumeLine(line);
+    }
+    if (callbacks.shouldContinue && !await callbacks.shouldContinue()) {
+      await reader.cancel();
+      return null;
+    }
+    buffer += decoder.decode();
+    if (buffer) await consumeLine(buffer);
+    if (!emitted && finalCandidate) {
+      emitted = true;
+      answerParts.push(finalCandidate);
+      await callbacks.onDelta?.(finalCandidate);
+    }
+    if (!emitted) throw new Error('Workers AI stream contained no answer text');
+    return {
+      answer: answerParts.join('').trim(),
+      reasoning: reasoningParts.join('').trim(),
+      ...finish,
+    };
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  }
+}
+
 export interface AskEventStreamOptions {
   thread?: { id: string; title: string };
   onComplete?: (result: { answer: string; reasoning: string } & AskFinishState) => Promise<void>;
@@ -529,7 +615,6 @@ export function askEventStream(
   prepared: PreparedAsk,
   options: AskEventStreamOptions = {},
 ): ReadableStream<Uint8Array> {
-  let upstreamReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   let cancelled = false;
   return new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -542,65 +627,14 @@ export function askEventStream(
       }));
       controller.enqueue(sse('status', { phase: 'generating' }));
       try {
-        const upstream = await gen.stream(prepared.messages, { maxTokens: MAX_ANSWER_TOKENS });
-        upstreamReader = upstream.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        let emitted = false;
-        let finalCandidate = '';
-        const answerParts: string[] = [];
-        const reasoningParts: string[] = [];
-        let finish: AskFinishState = { finishReason: null, truncated: false };
-
-        const consumeLine = (rawLine: string) => {
-          const line = rawLine.trim();
-          if (!line.startsWith('data:')) return;
-          const data = line.slice(5).trim();
-          if (!data || data === '[DONE]') return;
-          let payload: unknown;
-          try { payload = JSON.parse(data); } catch { return; }
-          const upstreamError = asObject(asObject(payload)?.error)?.message ?? asObject(payload)?.error;
-          if (typeof upstreamError === 'string') throw new Error(`Workers AI: ${upstreamError}`);
-          finish = extractFinishState(payload) ?? finish;
-          const reasoningSummary = extractReasoningSummaryDelta(payload);
-          if (reasoningSummary) {
-            reasoningParts.push(reasoningSummary);
-            controller.enqueue(sse('reasoning', { text: reasoningSummary }));
-          }
-          const delta = extractStreamDelta(payload);
-          if (delta) {
-            emitted = true;
-            answerParts.push(delta);
-            controller.enqueue(sse('delta', { text: delta }));
-          } else {
-            const candidate = extractGeneratedText(payload);
-            if (candidate) finalCandidate = candidate;
-          }
-        };
-
-        while (!cancelled) {
-          const { done, value } = await upstreamReader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-          const lines = buffer.split('\n');
-          buffer = lines.pop() ?? '';
-          for (const line of lines) consumeLine(line);
-        }
-        buffer += decoder.decode();
-        if (buffer) consumeLine(buffer);
-        if (cancelled) return;
-        if (!emitted && finalCandidate) {
-          emitted = true;
-          answerParts.push(finalCandidate);
-          controller.enqueue(sse('delta', { text: finalCandidate }));
-        }
-        if (!emitted) throw new Error('Workers AI stream contained no answer text');
-        await options.onComplete?.({
-          answer: answerParts.join('').trim(),
-          reasoning: reasoningParts.join('').trim(),
-          ...finish,
+        const result = await consumeAskGeneration(gen, prepared, {
+          shouldContinue: () => !cancelled,
+          onReasoning: (text) => controller.enqueue(sse('reasoning', { text })),
+          onDelta: (text) => controller.enqueue(sse('delta', { text })),
         });
-        controller.enqueue(sse('done', finish));
+        if (!result || cancelled) return;
+        await options.onComplete?.(result);
+        controller.enqueue(sse('done', { finishReason: result.finishReason, truncated: result.truncated }));
         controller.close();
       } catch (error) {
         if (cancelled) return;
@@ -610,7 +644,6 @@ export function askEventStream(
     },
     async cancel() {
       cancelled = true;
-      await upstreamReader?.cancel();
     },
   });
 }
