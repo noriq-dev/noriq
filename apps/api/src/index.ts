@@ -14,7 +14,10 @@ import { taskSearchFilters } from './lib/search';
 import type { ExecutionSpecInput, RunStatus } from '@noriq-dev/shared';
 import { readExecutionSpec } from './lib/execution-spec';
 import { search, searchBackend, reindexProject, ALL_KINDS, type SearchKind } from './search';
-import { answerQuestion, generationClient, normalizeHistory } from './ask';
+import {
+  answerQuestion, askEventStream, generationClient, normalizeHistory, prepareQuestion, streamingGenerationClient,
+  type AskProject,
+} from './ask';
 import { verifyUploadToken, resolveUploadSecret, signIngestToken, verifyIngestToken, type IngestClaims } from './lib/upload-token';
 import { USER_PROJECT_WHERE, taskWireStatus, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
 import { advertisedWorkflowNames } from './lib/workflows';
@@ -1612,6 +1615,15 @@ app.post('/api/projects/:pid/search/reindex', userAuth, async (c) => {
 // the signed-in user can reach. This route intentionally sits outside /api/projects/:pid/*:
 // it derives its complete retrieval scope from USER_PROJECT_WHERE on every request instead of
 // trusting project ids from the browser. Admins get their normal user-scoped set, not admin-all.
+const accessibleAskProjects = async (c: Context<AppContext>): Promise<AskProject[]> => {
+  const { results } = await c.env.DB.prepare(
+    `SELECT p.id, p.key, p.name FROM projects p
+     WHERE p.status = 'active' AND ${USER_PROJECT_WHERE}
+     ORDER BY p.created_at`,
+  ).bind(c.var.user!.id).all<AskProject>();
+  return results;
+};
+
 app.post('/api/ask', userAuth, async (c) => {
   const rl = await rateLimit(c.env, `ask:${c.var.user!.id}`, 20);
   if (!rl.ok) return c.json(tooMany, 429, { 'Retry-After': String(rl.retryAfter) });
@@ -1620,17 +1632,43 @@ app.post('/api/ask', userAuth, async (c) => {
   const { question, history } = await c.req.json<{ question?: string; history?: unknown }>().catch(() => ({ question: undefined, history: undefined }));
   const q = question?.trim();
   if (!q) return c.json({ error: 'question required' }, 400);
-  const { results: projects } = await c.env.DB.prepare(
-    `SELECT p.id, p.key, p.name FROM projects p
-     WHERE p.status = 'active' AND ${USER_PROJECT_WHERE}
-     ORDER BY p.created_at`,
-  ).bind(c.var.user!.id).all<{ id: string; key: string; name: string }>();
+  const projects = await accessibleAskProjects(c);
   try {
     return c.json(await answerQuestion(c.env, gen, {
       question: q,
       projects,
       history: normalizeHistory(history),
     }));
+  } catch (e) {
+    return c.json({ error: `answer generation failed: ${e instanceof Error ? e.message : 'unknown error'}` }, 502);
+  }
+});
+
+// Streaming twin of /api/ask. Retrieval completes first, then the response emits source metadata,
+// a generation status transition, visible answer deltas, and one terminal done/error event. The
+// upstream model's private reasoning events are deliberately never forwarded.
+app.post('/api/ask/stream', userAuth, async (c) => {
+  const rl = await rateLimit(c.env, `ask:${c.var.user!.id}`, 20);
+  if (!rl.ok) return c.json(tooMany, 429, { 'Retry-After': String(rl.retryAfter) });
+  const gen = streamingGenerationClient(c.env);
+  if (!gen) return c.json({ error: 'no AI backend — asking questions requires the Workers AI (AI) binding' }, 503);
+  const { question, history } = await c.req.json<{ question?: string; history?: unknown }>().catch(() => ({ question: undefined, history: undefined }));
+  const q = question?.trim();
+  if (!q) return c.json({ error: 'question required' }, 400);
+  const projects = await accessibleAskProjects(c);
+  try {
+    const prepared = await prepareQuestion(c.env, {
+      question: q,
+      projects,
+      history: normalizeHistory(history),
+    });
+    return new Response(askEventStream(gen, prepared), {
+      headers: {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'X-Content-Type-Options': 'nosniff',
+      },
+    });
   } catch (e) {
     return c.json({ error: `answer generation failed: ${e instanceof Error ? e.message : 'unknown error'}` }, 502);
   }

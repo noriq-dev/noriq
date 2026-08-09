@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, ApiError, type ApiAskHistoryMessage, type ApiAskSource } from '../api';
 import type { AppStore } from '../store';
-import { MonoTag, SectionLabel } from './bits';
+import { MonoTag, SectionLabel, WaveBars } from './bits';
 import { Button } from './ui';
 import { Markdown } from './Markdown';
 
@@ -22,6 +22,8 @@ interface ThreadMessage extends ApiAskHistoryMessage {
   sources?: ApiAskSource[];
   mode?: 'semantic' | 'keyword';
   model?: string;
+  reasoning?: string;
+  trace?: string[];
 }
 
 function loadThread(key: string): ThreadMessage[] {
@@ -31,7 +33,8 @@ function loadThread(key: string): ThreadMessage[] {
     return value.filter((m): m is ThreadMessage =>
       !!m && typeof m === 'object'
       && (m.role === 'user' || m.role === 'assistant')
-      && typeof m.content === 'string');
+      && typeof m.content === 'string'
+      && m.content.trim().length > 0);
   } catch {
     return [];
   }
@@ -39,14 +42,25 @@ function loadThread(key: string): ThreadMessage[] {
 
 const modelLabel = (model?: string) => model?.includes('gpt-oss-120b') ? 'GPT-OSS 120B · Cloudflare' : 'Cloudflare Workers AI';
 
+function GenerationActivity({ phase }: { phase: 'searching' | 'generating' }) {
+  return (
+    <div role="status" aria-live="polite" style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 10.5 }}>
+      <WaveBars height={12} bars={3} />
+      <span>{phase === 'searching' ? 'Searching your projects…' : 'Generating with GPT-OSS 120B…'}</span>
+    </div>
+  );
+}
+
 export function AskView({ store }: { store: AppStore }) {
   const { actions } = store;
   const storageKey = `noriq.ask.thread.${store.user?.id ?? 'current'}`;
   const [messages, setMessages] = useState<ThreadMessage[]>(() => loadThread(storageKey));
   const [q, setQ] = useState('');
-  const [loading, setLoading] = useState(false);
+  const [phase, setPhase] = useState<'searching' | 'generating' | null>(null);
   const [error, setError] = useState('');
   const endRef = useRef<HTMLDivElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const loading = phase !== null;
 
   useEffect(() => {
     try { sessionStorage.setItem(storageKey, JSON.stringify(messages.slice(-30))); } catch { /* storage may be disabled */ }
@@ -56,35 +70,78 @@ export function AskView({ store }: { store: AppStore }) {
     endRef.current?.scrollIntoView?.({ behavior: 'smooth', block: 'end' });
   }, [messages, loading]);
 
+  useEffect(() => () => abortRef.current?.abort(), []);
+
   const ask = async (text?: string) => {
     const question = (text ?? q).trim();
     if (!question || loading) return;
     const history = messages.map(({ role, content }) => ({ role, content }));
-    setMessages((current) => [...current, { role: 'user', content: question }]);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setMessages((current) => [
+      ...current,
+      { role: 'user', content: question },
+      { role: 'assistant', content: '', sources: [], trace: ['Searching accessible projects…'] },
+    ]);
     setQ('');
-    setLoading(true);
+    setPhase('searching');
     setError('');
     try {
-      const r = await api.ask(question, history);
-      setMessages((current) => [...current, {
-        role: 'assistant',
-        content: r.answer || '_No answer was produced._',
-        sources: r.sources,
-        mode: r.mode,
-        model: r.model,
-      }]);
+      await api.askStream(question, history, {
+        onMeta: (meta) => {
+          const projectCount = new Set(meta.sources.map((source) => source.projectId)).size;
+          setMessages((current) => current.map((message, index) =>
+            index === current.length - 1 && message.role === 'assistant'
+              ? {
+                  ...message,
+                  sources: meta.sources,
+                  mode: meta.mode,
+                  model: meta.model,
+                  trace: [`Selected ${meta.sources.length} ${meta.mode} source${meta.sources.length === 1 ? '' : 's'} across ${projectCount} project${projectCount === 1 ? '' : 's'}.`],
+                }
+              : message));
+        },
+        onStatus: () => {
+          setPhase('generating');
+          setMessages((current) => current.map((message, index) =>
+            index === current.length - 1 && message.role === 'assistant'
+              ? { ...message, trace: [...(message.trace ?? []), 'Generating a grounded response…'] }
+              : message));
+        },
+        onReasoning: (delta) => setMessages((current) => current.map((message, index) =>
+          index === current.length - 1 && message.role === 'assistant'
+            ? { ...message, reasoning: (message.reasoning ?? '') + delta }
+            : message)),
+        onDelta: (delta) => setMessages((current) => current.map((message, index) =>
+          index === current.length - 1 && message.role === 'assistant'
+            ? { ...message, content: message.content + delta }
+            : message)),
+      }, controller.signal);
+      setMessages((current) => current.map((message, index) =>
+        index === current.length - 1 && message.role === 'assistant'
+          ? { ...message, trace: [...(message.trace ?? []), 'Response complete.'] }
+          : message));
     } catch (e) {
+      if (controller.signal.aborted) return;
+      setMessages((current) => {
+        const last = current.at(-1);
+        return last?.role === 'assistant' && !last.content ? current.slice(0, -1) : current;
+      });
       setError(
         e instanceof ApiError && e.status === 503
           ? 'This instance has no AI backend configured — Ask needs the Workers AI binding.'
           : e instanceof Error ? e.message : 'Something went wrong.',
       );
     } finally {
-      setLoading(false);
+      if (abortRef.current === controller) abortRef.current = null;
+      if (!controller.signal.aborted) setPhase(null);
     }
   };
 
   const newChat = () => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setPhase(null);
     setMessages([]);
     setQ('');
     setError('');
@@ -134,7 +191,9 @@ export function AskView({ store }: { store: AppStore }) {
             </div>
           )}
 
-          {messages.map((message, index) => (
+          {messages.map((message, index) => {
+            const isStreaming = message.role === 'assistant' && index === messages.length - 1 && phase !== null;
+            return (
             <div key={index} style={{ marginBottom: 24 }}>
               {message.role === 'user' ? (
                 <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
@@ -146,8 +205,28 @@ export function AskView({ store }: { store: AppStore }) {
                 <div>
                   <div style={{ display: 'flex', gap: 11, alignItems: 'flex-start' }}>
                     <div style={{ color: 'var(--accent)', fontSize: 16, lineHeight: 1.5, flex: 'none' }}>✦</div>
-                    <div style={{ fontSize: 13.5, lineHeight: 1.65, minWidth: 0, flex: 1 }}><Markdown source={message.content} /></div>
+                    <div style={{ fontSize: 13.5, lineHeight: 1.65, minWidth: 0, flex: 1 }}>
+                      {message.content ? <Markdown source={message.content} /> : phase && isStreaming ? <GenerationActivity phase={phase} /> : null}
+                      {message.content && phase && isStreaming && (
+                        <div style={{ marginTop: 9 }}><GenerationActivity phase={phase} /></div>
+                      )}
+                    </div>
                   </div>
+                  {(message.trace?.length || message.reasoning) && (
+                    <details open={isStreaming || undefined} style={{ margin: '12px 0 0 27px', borderLeft: '1px solid var(--w-1)', paddingLeft: 11 }}>
+                      <summary style={{ cursor: 'pointer', color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 9.5, userSelect: 'none' }}>
+                        {isStreaming ? 'Thinking…' : 'Reasoning summary'}
+                      </summary>
+                      <div style={{ marginTop: 8, color: 'var(--text-mid)', fontSize: 11.5, lineHeight: 1.55 }}>
+                        {message.trace?.map((item, traceIndex) => (
+                          <div key={traceIndex} style={{ display: 'flex', gap: 7, marginBottom: 4 }}>
+                            <span style={{ color: 'var(--accent)' }}>·</span><span>{item}</span>
+                          </div>
+                        ))}
+                        {message.reasoning && <div style={{ marginTop: 8 }}><Markdown source={message.reasoning} /></div>}
+                      </div>
+                    </details>
+                  )}
                   {!!message.sources?.length && (
                     <div style={{ margin: '16px 0 0 27px' }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
@@ -166,18 +245,12 @@ export function AskView({ store }: { store: AppStore }) {
                       </div>
                     </div>
                   )}
-                  <div style={{ margin: '10px 0 0 27px', fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>{modelLabel(message.model)}</div>
+                  {(message.model || !isStreaming) && <div style={{ margin: '10px 0 0 27px', fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>{modelLabel(message.model)}</div>}
                 </div>
               )}
             </div>
-          ))}
-
-          {loading && (
-            <div style={{ display: 'flex', gap: 11, alignItems: 'center', marginBottom: 24, color: 'var(--text-dim)' }}>
-              <div style={{ color: 'var(--accent)', fontSize: 16 }}>✦</div>
-              <div style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>thinking and searching your projects…</div>
-            </div>
-          )}
+            );
+          })}
           {error && <div style={{ margin: '0 0 20px 27px', fontSize: 12.5, color: 'var(--red-soft)', border: '1px solid rgba(255,92,92,.3)', borderRadius: 10, background: 'rgba(255,92,92,.05)', padding: '10px 12px', lineHeight: 1.5 }}>{error}</div>}
           <div ref={endRef} />
         </div>

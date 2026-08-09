@@ -19,6 +19,78 @@ async function req<T>(method: string, path: string, body?: unknown, signal?: Abo
   return data as T;
 }
 
+export interface ApiAskStreamMeta {
+  sources: ApiAskSource[];
+  mode: 'semantic' | 'keyword';
+  model: string;
+}
+
+export interface ApiAskStreamHandlers {
+  onMeta: (meta: ApiAskStreamMeta) => void;
+  onStatus?: (phase: 'generating') => void;
+  onReasoning?: (text: string) => void;
+  onDelta: (text: string) => void;
+}
+
+async function askStream(
+  question: string,
+  history: ApiAskHistoryMessage[],
+  handlers: ApiAskStreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch('/api/ask/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    body: JSON.stringify({ question, history }),
+    credentials: 'same-origin',
+    signal,
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new ApiError(res.status, (data as { error?: string }).error ?? res.statusText);
+  }
+  if (!res.body) throw new Error('Ask returned no response stream');
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let doneEvent = false;
+
+  const dispatch = (block: string) => {
+    let event = 'message';
+    const data: string[] = [];
+    for (const line of block.split('\n')) {
+      if (line.startsWith('event:')) event = line.slice(6).trim();
+      else if (line.startsWith('data:')) data.push(line.slice(5).trimStart());
+    }
+    if (!data.length) return;
+    const payload = JSON.parse(data.join('\n')) as Record<string, unknown>;
+    if (event === 'meta') handlers.onMeta(payload as unknown as ApiAskStreamMeta);
+    else if (event === 'status' && payload.phase === 'generating') handlers.onStatus?.('generating');
+    else if (event === 'reasoning' && typeof payload.text === 'string') handlers.onReasoning?.(payload.text);
+    else if (event === 'delta' && typeof payload.text === 'string') handlers.onDelta(payload.text);
+    else if (event === 'error') throw new Error(typeof payload.error === 'string' ? payload.error : 'Answer generation failed');
+    else if (event === 'done') doneEvent = true;
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      const blocks = buffer.split('\n\n');
+      buffer = blocks.pop() ?? '';
+      for (const block of blocks) dispatch(block);
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) dispatch(buffer);
+    if (!doneEvent) throw new Error('Ask response ended before completion');
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  }
+}
+
 export const api = {
   setupStatus: () => req<{ needsSetup: boolean }>('GET', '/api/setup/status'),
   setup: (email: string, name: string, password: string) =>
@@ -205,6 +277,7 @@ export const api = {
   ask: (question: string, history: ApiAskHistoryMessage[]) =>
     req<{ answer: string; mode: 'semantic' | 'keyword'; model: string; sources: ApiAskSource[] }>(
       'POST', '/api/ask', { question, history }),
+  askStream,
   acknowledgeSignal: (pid: string, sid: string, dismiss = false) =>
     req('POST', `/api/projects/${pid}/signals/${sid}/acknowledge`, { dismiss }),
   addDependency: (pid: string, tid: string, dependsOnTaskId: string) =>
