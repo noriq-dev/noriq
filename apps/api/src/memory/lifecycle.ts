@@ -143,6 +143,11 @@ export interface ProjectCleanupResult {
    *  why the daily sweep, not `alarm()`/construction, is the deliberate trigger). `false` on
    *  every sweep after the first — the durable marker, not this field, is the source of truth. */
   backfilled: boolean;
+  backfillNodesWritten: number;
+  backfillEdgesWritten: number;
+  /** A cleanup step that failed is never reported as a successful zero. Other independent
+   *  steps still run, and the operator receives the exact failed step and message. */
+  errors: Array<{ step: string; message: string }>;
 }
 
 /** The single-project body of `sweepProjectDebris` below, extracted (PLNR-273) so an operator
@@ -151,37 +156,51 @@ export interface ProjectCleanupResult {
  *  way — this is the only place the actual pruning happens now. */
 export async function sweepProjectDebrisForProject(env: Env, projectId: string): Promise<ProjectCleanupResult> {
   const stub = env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId));
+  const errors: Array<{ step: string; message: string }> = [];
+  const capture = async <T>(step: string, fallback: T, promise: Promise<T>): Promise<T> => {
+    try {
+      return await promise;
+    } catch (err) {
+      errors.push({ step, message: err instanceof Error ? err.message : String(err) });
+      return fallback;
+    }
+  };
   const [prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations, decayedMemories, prunedSupersededGenerations, backfill] = await Promise.all([
-    stub.pruneAbandonedStagedGenerations(projectId, STAGED_GENERATION_MAX_AGE_MS).catch(() => 0),
-    stub.pruneRetainedGenerationIfExpired(projectId, RETAINED_GENERATION_MAX_AGE_MS).catch(() => false),
-    pruneBackupRetention(env, projectId).catch(() => 0),
-    stub
-      .decayLowAuthorityMemories(projectId, { maxAgeMs: MEMORY_HYPOTHESIS_DECAY_MAX_AGE_MS, authorityCeiling: MEMORY_HYPOTHESIS_DECAY_AUTHORITY_CEILING })
-      .then((r) => r.decayed.length)
-      .catch(() => 0),
-    stub.pruneSupersededGenerations(projectId, SUPERSEDED_GENERATION_MAX_AGE_MS).catch(() => 0),
+    capture('staged-generations', 0, stub.pruneAbandonedStagedGenerations(projectId, STAGED_GENERATION_MAX_AGE_MS)),
+    capture('retained-generation', false, stub.pruneRetainedGenerationIfExpired(projectId, RETAINED_GENERATION_MAX_AGE_MS)),
+    capture('backup-retention', 0, pruneBackupRetention(env, projectId)),
+    capture(
+      'memory-decay', 0,
+      stub
+        .decayLowAuthorityMemories(projectId, { maxAgeMs: MEMORY_HYPOTHESIS_DECAY_MAX_AGE_MS, authorityCeiling: MEMORY_HYPOTHESIS_DECAY_AUTHORITY_CEILING })
+        .then((r) => r.decayed.length),
+    ),
+    capture('superseded-generations', 0, stub.pruneSupersededGenerations(projectId, SUPERSEDED_GENERATION_MAX_AGE_MS)),
     // PLNR-320: the automatic one-time coordination-graph backfill — see
     // ProjectMemory.backfillProjectionOnce's own doc comment for why THIS sweep, specifically,
     // is the deliberate trigger (not alarm()/construction). A no-op on every sweep after the
     // first for a given project — the durable `_meta` marker inside the DO is the real gate.
-    stub.backfillProjectionOnce(projectId).then((r) => r.ran).catch(() => false),
+    capture('graph-backfill', { ran: false } as { ran: boolean; nodesWritten?: number; edgesWritten?: number }, stub.backfillProjectionOnce(projectId)),
   ]);
-  const outcome: ProjectCleanupResult = {
-    projectId, prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations, decayedMemories, prunedSupersededGenerations,
-    backfilled: backfill,
-  };
-  await stub
-    .health(projectId)
-    .then((h) =>
+  await capture(
+    'health-refresh',
+    undefined,
+    stub.health(projectId).then((h) =>
       env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName(projectId)).upsertMemoryHealth(projectId, {
         schemaVersion: h.schemaVersion,
         memoryRevision: h.memoryRevision,
         sizeBytes: h.databaseSize,
         sizeStatus: h.sizeStatus,
       }),
-    )
-    .catch((err) => console.warn(`ProjectMemory health refresh for ${projectId} failed: ${String(err)}`));
-  return outcome;
+    ),
+  );
+  return {
+    projectId, prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations, decayedMemories, prunedSupersededGenerations,
+    backfilled: backfill.ran,
+    backfillNodesWritten: backfill.nodesWritten ?? 0,
+    backfillEdgesWritten: backfill.edgesWritten ?? 0,
+    errors: errors.sort((a, b) => a.step.localeCompare(b.step)),
+  };
 }
 
 /** Per-project debris cleanup for every project with a memory registry row: abandoned staged

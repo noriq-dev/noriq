@@ -290,6 +290,32 @@ describe('a non-admin sees status without destructive action controls', () => {
   });
 });
 
+describe('lifecycle sweep graph backfill status', () => {
+  it('shows reconstructed write counts and any failed step instead of collapsing both into zero', async () => {
+    mockClean();
+    const sweep = vi.spyOn(api, 'memoryLifecycleSweep').mockResolvedValue({
+      projectId: 'prj_1',
+      prunedStagedGenerations: 0,
+      prunedRetainedGeneration: false,
+      prunedBackupGenerations: 0,
+      decayedMemories: 0,
+      prunedSupersededGenerations: 0,
+      backfilled: true,
+      backfillNodesWritten: 7,
+      backfillEdgesWritten: 5,
+      errors: [{ step: 'backup-retention', message: 'R2 unavailable' }],
+    });
+
+    mount();
+    await tick();
+    await act(async () => { button('Run lifecycle sweep')!.click(); });
+
+    expect(sweep).toHaveBeenCalledWith('prj_1');
+    expect(text()).toContain('graph backfill: ran (7 node write(s), 5 edge write(s))');
+    expect(text()).toContain('failed: backup-retention: R2 unavailable');
+  });
+});
+
 describe('a missing optional binding reads as reduced capability, never an error', () => {
   it('names R2 specifically and states what still works, with no failure styling', async () => {
     vi.spyOn(api, 'memoryOpsStatus').mockResolvedValue({

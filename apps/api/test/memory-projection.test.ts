@@ -51,6 +51,15 @@ interface RecordMemoryInput {
   actor: { kind: string; id: string | null };
 }
 
+interface RecordEpisodeInput {
+  runId: string; sitting: number; agentId: string | null; runKind: string; outcome: string; startedAt: string | null; finishedAt: string | null;
+  taskId: string | null; repositoryKey: string | null; baseId: string | null;
+  timeline: Array<{ at: string; label: string }>; filesTouched: string[]; commands: string[]; testsRun: string[]; failures: string[];
+  findings: Array<{ summary: string; severity?: string }>; reviewRounds: number; tokenUsage: Record<string, unknown>; costUSD: number;
+  acceptanceCoverage: number | null; steeringEvents: string[]; landingOutcome: string; remainingWork: string[];
+  actor: { kind: string; id: string | null };
+}
+
 interface MemRpc {
   beginIndexIngest(pid: string, manifest: IndexManifestInput): Promise<{ ok: true }>;
   ingestIndexBatch(pid: string, batch: { generationId: string; batchNumber: number; batchHash: string }, rows: StagedRow[]): Promise<{ ok: true; deduped: boolean }>;
@@ -69,6 +78,11 @@ interface MemRpc {
   _nodeByUriForTest(pid: string, uri: string): Promise<{ nodeId: string; type: string; label: string } | null>;
   _rewindProjectorCursorForTest(pid: string, globalSeq: number): Promise<void>;
   recordMemory(pid: string, input: RecordMemoryInput): Promise<{ memoryId: string; operationId: string; deduped: boolean }>;
+  addContradiction(
+    pid: string,
+    input: { memoryItemId: string; contradictsMemoryItemId: string; actor: { kind: string; id: string | null } },
+  ): Promise<{ setId: string; contradictionId: string }>;
+  recordEpisode(pid: string, input: RecordEpisodeInput): Promise<{ episodeId: string }>;
   rebuildProjection(pid: string): Promise<{ nodesWritten: number; edgesWritten: number }>;
   searchProjectMemory(pid: string, opts: Record<string, unknown>): Promise<{ mode: string; results: Array<{ entityType: string; id: string; uri?: string }> }>;
   // PLNR-320
@@ -83,6 +97,8 @@ interface MemRpc {
     totalUnexpected: number;
   }>;
   _allEdgesForTest(pid: string): Promise<Array<{ type: string; fromUri: string; toUri: string; provenance: string | null }>>;
+  _setMetaForTest(pid: string, key: string, value: string): Promise<void>;
+  _clearGraphForTest(pid: string): Promise<void>;
 }
 
 const SYSTEM = { kind: 'system', id: null };
@@ -1399,6 +1415,67 @@ describe('PLNR-320: rebuildProjection converges — a rebuild after full increme
 });
 
 describe('PLNR-320: automatic one-time backfill', () => {
+  it('version 2 reconstructs stored memory evidence, correction, contradiction, and episode links without guessing from text', async () => {
+    const { projectId } = await newOwnedProject('pm-memory-backfill@example.com', 'PMMEMBF');
+    const agentId = 'agt_memory_backfill';
+    const first = await memory(projectId).recordMemory(projectId, {
+      kind: 'learning',
+      statement: 'The first durable observation.',
+      evidence: [{ repositoryKey: 'repo-a', branch: 'main', baseId: 'sha_1', path: 'src/a.ts', symbol: 'loadA' }],
+      actor: { kind: 'agent', id: agentId },
+    });
+    const correction = await memory(projectId).recordMemory(projectId, {
+      kind: 'learning',
+      statement: 'The corrected durable observation.',
+      supersedesMemoryId: first.memoryId,
+      actor: { kind: 'agent', id: agentId },
+    });
+    const contradiction = await memory(projectId).addContradiction(projectId, {
+      memoryItemId: correction.memoryId,
+      contradictsMemoryItemId: first.memoryId,
+      actor: SYSTEM,
+    });
+    const episode = await memory(projectId).recordEpisode(projectId, {
+      runId: 'run_memory_backfill', sitting: 1, agentId, runKind: 'build', outcome: 'done', startedAt: null, finishedAt: null,
+      taskId: null, repositoryKey: null, baseId: null, timeline: [], filesTouched: [], commands: [], testsRun: [], failures: [],
+      findings: [], reviewRounds: 0, tokenUsage: {}, costUSD: 0, acceptanceCoverage: null, steeringEvents: [],
+      landingOutcome: 'landed', remainingWork: [], actor: SYSTEM,
+    });
+
+    const firstUri = buildEntityUri({ kind: 'memory', id: first.memoryId });
+    const correctionUri = buildEntityUri({ kind: 'memory', id: correction.memoryId });
+    const episodeUri = buildEntityUri({ kind: 'episode', id: episode.episodeId });
+    const fileUri = buildEntityUri({ kind: 'file', projectKey: 'PMMEMBF', repositoryKey: 'repo-a', path: 'src/a.ts' });
+    const symbolUri = buildEntityUri({ kind: 'symbol', projectKey: 'PMMEMBF', repositoryKey: 'repo-a', path: 'src/a.ts', name: 'loadA' });
+
+    // The live writers now project the durable lineage facts as they are recorded.
+    expect(await memory(projectId)._edgeProvenance(projectId, 'supersedes', correctionUri, firstUri)).toBe('memory_items:supersedes');
+    expect(await memory(projectId)._edgeProvenance(projectId, 'contradicts', correctionUri, firstUri)).toBe(`memory:contradiction:${contradiction.contradictionId}`);
+
+    // Preserve the source rows but erase the projection, matching an existing production
+    // project whose memories were recorded before these graph writers existed.
+    await memory(projectId)._clearGraphForTest(projectId);
+    await memory(projectId)._setMetaForTest(projectId, 'backfill_version', '1');
+    expect(await memory(projectId)._countNodes(projectId)).toBe(0);
+    expect(await memory(projectId)._countEdges(projectId)).toBe(0);
+
+    const rebuilt = await memory(projectId).backfillProjectionOnce(projectId);
+    expect(rebuilt.ran).toBe(true);
+    expect(rebuilt.nodesWritten).toBeGreaterThan(0);
+    expect(rebuilt.edgesWritten).toBeGreaterThanOrEqual(5);
+    expect(await memory(projectId)._nodeByUriForTest(projectId, firstUri)).toEqual(expect.objectContaining({ type: 'memory', label: 'The first durable observation.' }));
+    expect(await memory(projectId)._edgeProvenance(projectId, 'observed_in', firstUri, fileUri)).toMatch(/^evidence:/);
+    expect(await memory(projectId)._edgeProvenance(projectId, 'observed_in', firstUri, symbolUri)).toMatch(/^evidence:/);
+    expect(await memory(projectId)._edgeProvenance(projectId, 'supersedes', correctionUri, firstUri)).toBe('memory_items:supersedes');
+    expect(await memory(projectId)._edgeProvenance(projectId, 'contradicts', correctionUri, firstUri)).toBe(`memory:contradiction:${contradiction.contradictionId}`);
+    expect(await memory(projectId)._edgeProvenance(projectId, 'related_to', episodeUri, firstUri)).toBe(`memory:episode-agent:${episode.episodeId}`);
+    expect(await memory(projectId)._edgeProvenance(projectId, 'related_to', episodeUri, correctionUri)).toBe(`memory:episode-agent:${episode.episodeId}`);
+
+    const after = await memory(projectId)._allEdgesForTest(projectId);
+    expect(await memory(projectId).backfillProjectionOnce(projectId)).toEqual({ ran: false });
+    expect(await memory(projectId)._allEdgesForTest(projectId)).toEqual(after);
+  });
+
   it('backfillProjectionOnce reconciles the incremental path first, then runs the rebuild exactly once — a second call is a true no-op', async () => {
     const { token, projectId } = await newOwnedProject('pm-320-backfill@example.com', 'PM320BF');
     const doc = await mcpCall(token, 'create_doc', { projectId, name: 'backfill doc', body: 'Settled: a fact.' });

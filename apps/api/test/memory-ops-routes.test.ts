@@ -184,8 +184,15 @@ describe('PLNR-273 operator action routes require the admin role', () => {
 
     const sweepRes = await post(`/api/projects/${pid}/memory/lifecycle-sweep`, cookie);
     expect(sweepRes.status).toBe(200);
-    const sweepBody = await sweepRes.json() as { projectId: string };
+    const sweepBody = await sweepRes.json() as {
+      projectId: string; backfilled: boolean; backfillNodesWritten: number; backfillEdgesWritten: number;
+      errors: Array<{ step: string; message: string }>;
+    };
     expect(sweepBody.projectId).toBe(pid);
+    expect(sweepBody.backfilled).toBe(true);
+    expect(sweepBody.backfillNodesWritten).toBeGreaterThanOrEqual(0);
+    expect(sweepBody.backfillEdgesWritten).toBeGreaterThanOrEqual(0);
+    expect(sweepBody.errors).toEqual([]);
   });
 });
 

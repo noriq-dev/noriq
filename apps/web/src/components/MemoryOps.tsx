@@ -351,6 +351,15 @@ export function MemoryOps({ pid, store }: { pid: string; store: AppStore }) {
               swept: {lastSweep.prunedStagedGenerations} staged generation(s), {lastSweep.prunedSupersededGenerations} superseded generation(s),{' '}
               {lastSweep.prunedRetainedGeneration ? '1' : '0'} expired retained generation, {lastSweep.prunedBackupGenerations} backup(s) over retention,{' '}
               {lastSweep.decayedMemories} decayed hypothesis(es)
+              <br />
+              graph backfill: {lastSweep.backfilled
+                ? `ran (${lastSweep.backfillNodesWritten} node write(s), ${lastSweep.backfillEdgesWritten} edge write(s))`
+                : 'already current'}
+              {lastSweep.errors.length > 0 && (
+                <div style={{ color: 'var(--red-soft)', marginTop: 4 }}>
+                  failed: {lastSweep.errors.map((e) => `${e.step}: ${e.message}`).join('; ')}
+                </div>
+              )}
             </div>
           )}
         </Section>

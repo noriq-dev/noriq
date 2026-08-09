@@ -347,6 +347,8 @@ export const api = {
     req<{
       projectId: string; prunedStagedGenerations: number; prunedRetainedGeneration: boolean;
       prunedBackupGenerations: number; decayedMemories: number; prunedSupersededGenerations: number;
+      backfilled: boolean; backfillNodesWritten: number; backfillEdgesWritten: number;
+      errors: Array<{ step: string; message: string }>;
     }>('POST', `/api/projects/${pid}/memory/lifecycle-sweep`),
 };
 

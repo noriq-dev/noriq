@@ -317,7 +317,7 @@ function summarizeEpisodeBody(bodyJson: string): string {
  * make an already-backfilled project look unbackfilled and re-run for no reason (harmless, since
  * the rebuild is idempotent, but pointless CPU).
  */
-const BACKFILL_VERSION = 1;
+const BACKFILL_VERSION = 2;
 
 export class ProjectMemory extends DurableObject<Env> {
   // Bound on first call — from ctx.id.name when the runtime exposes it (every
@@ -1977,6 +1977,119 @@ export class ProjectMemory extends DurableObject<Env> {
     return `${normalized.slice(0, ProjectMemory.MEMORY_NODE_LABEL_MAX_CHARS - 1)}…`;
   }
 
+  /** Project one stored memory row and every exact repository citation it owns. This is the
+   *  shared reconstruction primitive for promotion writes and the versioned full backfill:
+   *  everything here is derived from durable columns, never inferred from statement text. */
+  private projectStoredMemoryItem(memoryId: string, projectKey: string | null, now: string): { nodesWritten: number; edgesWritten: number } {
+    const row = this.ctx.storage.sql
+      .exec<{ id: string; statement: string; supersedes_memory_id: string | null }>(
+        `SELECT id, statement, supersedes_memory_id FROM memory_items WHERE id = ?1`, memoryId,
+      )
+      .toArray()[0];
+    if (!row) return { nodesWritten: 0, edgesWritten: 0 };
+
+    let nodesWritten = 0;
+    let edgesWritten = 0;
+    const memoryNodeId = this.upsertGraphNode(
+      'memory', buildEntityUri({ kind: 'memory', id: row.id }), ProjectMemory.memoryNodeLabel(row.statement), now,
+    );
+    nodesWritten++;
+
+    if (row.supersedes_memory_id) {
+      const prior = this.ctx.storage.sql
+        .exec<{ statement: string }>(`SELECT statement FROM memory_items WHERE id = ?1`, row.supersedes_memory_id)
+        .toArray()[0];
+      if (prior) {
+        const priorNodeId = this.upsertGraphNode(
+          'memory', buildEntityUri({ kind: 'memory', id: row.supersedes_memory_id }),
+          ProjectMemory.memoryNodeLabel(prior.statement), now,
+        );
+        nodesWritten++;
+        this.linkGraphEdge('supersedes', memoryNodeId, priorNodeId, now, 'memory_items:supersedes');
+        edgesWritten++;
+      }
+    }
+
+    if (projectKey) {
+      const evidenceRows = this.ctx.storage.sql
+        .exec<{ id: string; repository_key: string; path: string; symbol: string | null }>(
+          `SELECT id, repository_key, path, symbol FROM evidence WHERE memory_item_id = ?1`, memoryId,
+        )
+        .toArray();
+      for (const evidence of evidenceRows) {
+        const fileNodeId = this.upsertGraphNode(
+          'file',
+          buildEntityUri({ kind: 'file', projectKey, repositoryKey: evidence.repository_key, path: evidence.path }),
+          evidence.path,
+          now,
+        );
+        nodesWritten++;
+        this.linkGraphEdge(EVIDENCE_EDGE_TYPE, memoryNodeId, fileNodeId, now, `evidence:${evidence.id}`);
+        edgesWritten++;
+        if (evidence.symbol) {
+          const symbolNodeId = this.upsertGraphNode(
+            'symbol',
+            buildEntityUri({ kind: 'symbol', projectKey, repositoryKey: evidence.repository_key, path: evidence.path, name: evidence.symbol }),
+            evidence.symbol,
+            now,
+          );
+          nodesWritten++;
+          this.linkGraphEdge(EVIDENCE_EDGE_TYPE, memoryNodeId, symbolNodeId, now, `evidence:${evidence.id}`);
+          edgesWritten++;
+        }
+      }
+    }
+    return { nodesWritten, edgesWritten };
+  }
+
+  /** Reconstruct the historical memory graph from facts ProjectMemory already stores: memory
+   *  rows/evidence, correction lineage, contradiction pairs, and episode agent identity. */
+  private projectStoredMemoryRelationships(projectKey: string | null, now: string): { nodesWritten: number; edgesWritten: number } {
+    let nodesWritten = 0;
+    let edgesWritten = 0;
+    const memories = this.ctx.storage.sql.exec<{ id: string }>(`SELECT id FROM memory_items`).toArray();
+    for (const memory of memories) {
+      const written = this.projectStoredMemoryItem(memory.id, projectKey, now);
+      nodesWritten += written.nodesWritten;
+      edgesWritten += written.edgesWritten;
+    }
+
+    const contradictions = this.ctx.storage.sql
+      .exec<{ id: string; memory_item_id: string; contradicts_memory_item_id: string }>(
+        `SELECT id, memory_item_id, contradicts_memory_item_id FROM contradictions`,
+      )
+      .toArray();
+    for (const contradiction of contradictions) {
+      const fromId = this.findGraphNodeId(buildEntityUri({ kind: 'memory', id: contradiction.memory_item_id }));
+      const toId = this.findGraphNodeId(buildEntityUri({ kind: 'memory', id: contradiction.contradicts_memory_item_id }));
+      if (fromId && toId) {
+        this.linkGraphEdge('contradicts', fromId, toId, now, `memory:contradiction:${contradiction.id}`);
+        edgesWritten++;
+      }
+    }
+
+    const episodeMemories = this.ctx.storage.sql
+      .exec<{ episode_id: string; run_kind: string | null; outcome: string | null; memory_item_id: string }>(
+        `SELECT e.id AS episode_id, e.run_kind, e.outcome, m.id AS memory_item_id
+         FROM episodes e JOIN memory_items m ON m.recorded_by_agent_id = e.agent_id
+         WHERE e.agent_id IS NOT NULL`,
+      )
+      .toArray();
+    for (const relation of episodeMemories) {
+      const episodeNodeId = this.upsertGraphNode(
+        'episode', buildEntityUri({ kind: 'episode', id: relation.episode_id }),
+        `${relation.run_kind ?? 'run'} episode (${relation.outcome ?? 'unknown'})`, now,
+      );
+      nodesWritten++;
+      const memoryNodeId = this.findGraphNodeId(buildEntityUri({ kind: 'memory', id: relation.memory_item_id }));
+      if (memoryNodeId) {
+        this.linkGraphEdge('related_to', episodeNodeId, memoryNodeId, now, `memory:episode-agent:${relation.episode_id}`);
+        edgesWritten++;
+      }
+    }
+    return { nodesWritten, edgesWritten };
+  }
+
   async recordMemory(
     projectId: string,
     input: {
@@ -2093,6 +2206,18 @@ export class ProjectMemory extends DurableObject<Env> {
         for (const node of evidenceCitationNodes(projectKey ?? '', citation)) {
           const targetNodeId = this.upsertGraphNode(node.type, node.uri, node.label, now);
           this.linkGraphEdge(EVIDENCE_EDGE_TYPE, memoryNodeId, targetNodeId, now, provenance);
+        }
+      }
+      if (input.supersedesMemoryId) {
+        const prior = this.ctx.storage.sql
+          .exec<{ statement: string }>(`SELECT statement FROM memory_items WHERE id = ?1`, input.supersedesMemoryId)
+          .toArray()[0];
+        if (prior) {
+          const priorNodeId = this.upsertGraphNode(
+            'memory', buildEntityUri({ kind: 'memory', id: input.supersedesMemoryId }),
+            ProjectMemory.memoryNodeLabel(prior.statement), now,
+          );
+          this.linkGraphEdge('supersedes', memoryNodeId, priorNodeId, now, 'memory_items:supersedes');
         }
       }
 
@@ -2260,6 +2385,23 @@ export class ProjectMemory extends DurableObject<Env> {
         setId,
         now,
       );
+      const fromMemory = this.ctx.storage.sql
+        .exec<{ statement: string }>(`SELECT statement FROM memory_items WHERE id = ?1`, input.memoryItemId)
+        .toArray()[0];
+      const toMemory = this.ctx.storage.sql
+        .exec<{ statement: string }>(`SELECT statement FROM memory_items WHERE id = ?1`, input.contradictsMemoryItemId)
+        .toArray()[0];
+      if (fromMemory && toMemory) {
+        const fromNodeId = this.upsertGraphNode(
+          'memory', buildEntityUri({ kind: 'memory', id: input.memoryItemId }),
+          ProjectMemory.memoryNodeLabel(fromMemory.statement), now,
+        );
+        const toNodeId = this.upsertGraphNode(
+          'memory', buildEntityUri({ kind: 'memory', id: input.contradictsMemoryItemId }),
+          ProjectMemory.memoryNodeLabel(toMemory.statement), now,
+        );
+        this.linkGraphEdge('contradicts', fromNodeId, toNodeId, now, `memory:contradiction:${contradictionId}`);
+      }
       this.ctx.storage.sql.exec(
         `INSERT INTO outbox (id, operation_id, verb, subject_type, subject_id, payload, created_at) VALUES (?1,?2,'memory.changed','memory',?3,?4,?5)`,
         newId('obx'),
@@ -3895,6 +4037,7 @@ export class ProjectMemory extends DurableObject<Env> {
 
     const original = await this.getMemoryItem(projectId, input.memoryItemId);
     if (!original) throw new Error(`memory item ${input.memoryItemId} not found`);
+    const graphProjectKey = original.evidence.length ? await this.resolveProjectKey(projectId) : null;
     const approvedMemoryId = newId('mem');
     const transitionId = newId('atr');
     const operationId = newId('op');
@@ -3917,6 +4060,7 @@ export class ProjectMemory extends DurableObject<Env> {
         now,
       );
       this.copyEvidence(input.memoryItemId, approvedMemoryId, now);
+      this.projectStoredMemoryItem(approvedMemoryId, graphProjectKey, now);
       this.ctx.storage.sql.exec(`UPDATE memory_items SET proposed_at = NULL WHERE id = ?1`, input.memoryItemId);
       this.ctx.storage.sql.exec(
         `INSERT INTO memory_authority_transitions (id, memory_item_id, resulting_memory_id, outcome, new_authority, actor_kind, actor_id, revision, note, created_at)
@@ -4031,6 +4175,7 @@ export class ProjectMemory extends DurableObject<Env> {
     input: { repositoryKey: string; branch: string; mergedBaseId: string },
   ): Promise<{ promoted: string[]; skipped: Array<{ memoryItemId: string; reason: string }> }> {
     await this.assertProjectId(projectId);
+    const graphProjectKey = await this.resolveProjectKey(projectId);
     const candidates = this.ctx.storage.sql
       .exec<{ id: string }>(`SELECT id FROM memory_items WHERE authority < ?1`, AUTHORITY_VERIFIED_MERGED)
       .toArray();
@@ -4098,6 +4243,7 @@ export class ProjectMemory extends DurableObject<Env> {
           now,
         );
         this.copyEvidence(id, promotedId, now);
+        this.projectStoredMemoryItem(promotedId, graphProjectKey, now);
         this.ctx.storage.sql.exec(
           `INSERT INTO memory_authority_transitions (id, memory_item_id, resulting_memory_id, outcome, new_authority, actor_kind, actor_id, revision, note, created_at)
            VALUES (?1,?2,?3,'merge_promoted',?4,'system',NULL,?5,NULL,?6)`,
@@ -4496,7 +4642,10 @@ export class ProjectMemory extends DurableObject<Env> {
    * graph without hand-replaying its cursor from zero. Projects every task/plan/doc/milestone/
    * agent this project currently has, plus the task<->plan (`phase_tasks`), task<->doc
    * (`task_docs`), task<->task (`dependencies`, PLNR-322), and live task->agent ownership
-   * relationships the board already knows. `applyCoordinationEvent` cannot draw the first two
+   * relationships the board already knows. It also reconstructs every historical memory node
+   * and exact relationship still supported by stored evidence, correction lineage,
+   * contradictions, or episode-agent identity; statement text is never used to guess an edge.
+   * `applyCoordinationEvent` cannot draw the first two
    * from a single event's payload (a
    * `plan.created` event carries phase task COUNTS, not ids; there is no event at all for "this
    * task was added to a plan/doc"), and a `ctx.storage.transactionSync` block cannot await a
@@ -4528,6 +4677,8 @@ export class ProjectMemory extends DurableObject<Env> {
     await this.assertProjectId(projectId);
     const now = nowIso();
     const state = await this.loadCoordinationRelationships(projectId);
+    const hasStoredEvidence = this.ctx.storage.sql.exec<{ one: number }>(`SELECT 1 AS one FROM evidence LIMIT 1`).toArray().length > 0;
+    const graphProjectKey = hasStoredEvidence ? await this.resolveProjectKey(projectId) : null;
     const { tasks, plans, docs, milestones, agents, runs } = state;
     const expectedEdges = this.expectedProjectionEdges(state);
 
@@ -4575,6 +4726,9 @@ export class ProjectMemory extends DurableObject<Env> {
         this.upsertGraphNode('run', buildEntityUri({ kind: 'run', id: r.id }), `${r.kind} run`, now);
         nodesWritten++;
       }
+      const memoryProjection = this.projectStoredMemoryRelationships(graphProjectKey, now);
+      nodesWritten += memoryProjection.nodesWritten;
+      edgesWritten += memoryProjection.edgesWritten;
       for (const edge of expectedEdges) {
         const fromId = this.findGraphNodeId(edge.fromUri);
         const toId = this.findGraphNodeId(edge.toUri);
@@ -4869,7 +5023,23 @@ export class ProjectMemory extends DurableObject<Env> {
    *  general query surface. */
   async _setMetaForTest(projectId: string, key: string, value: string): Promise<void> {
     await this.assertProjectId(projectId);
-    this.ctx.storage.sql.exec(`UPDATE _meta SET value = ?1 WHERE key = ?2`, value, key);
+    this.ctx.storage.sql.exec(
+      `INSERT INTO _meta (key, value) VALUES (?1, ?2)
+       ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
+      key,
+      value,
+    );
+  }
+
+  /** Test-only: remove the graph projection while preserving every durable source row. This
+   *  models a project whose memories/episodes predate graph projection so the versioned
+   *  backfill can be exercised against the real reconstruction inputs. */
+  async _clearGraphForTest(projectId: string): Promise<void> {
+    await this.assertProjectId(projectId);
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(`DELETE FROM edges`);
+      this.ctx.storage.sql.exec(`DELETE FROM nodes`);
+    });
   }
 
   /** Test-only: backdate a memory item's `recorded_at` — so decay-age eligibility (PLNR-254)
