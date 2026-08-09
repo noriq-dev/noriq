@@ -58,8 +58,10 @@ export function AskView({ store }: { store: AppStore }) {
   const [q, setQ] = useState('');
   const [phase, setPhase] = useState<'searching' | 'generating' | null>(null);
   const [error, setError] = useState('');
+  const scrollRef = useRef<HTMLDivElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const followScrollRef = useRef(true);
   const loading = phase !== null;
 
   useEffect(() => {
@@ -67,7 +69,7 @@ export function AskView({ store }: { store: AppStore }) {
   }, [messages, storageKey]);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView?.({ behavior: 'smooth', block: 'end' });
+    if (followScrollRef.current) endRef.current?.scrollIntoView?.({ block: 'end' });
   }, [messages, loading]);
 
   useEffect(() => () => abortRef.current?.abort(), []);
@@ -141,10 +143,17 @@ export function AskView({ store }: { store: AppStore }) {
   const newChat = () => {
     abortRef.current?.abort();
     abortRef.current = null;
+    followScrollRef.current = true;
     setPhase(null);
     setMessages([]);
     setQ('');
     setError('');
+  };
+
+  const updateScrollFollow = () => {
+    const scroll = scrollRef.current;
+    if (!scroll) return;
+    followScrollRef.current = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight <= 48;
   };
 
   const openSource = (s: ApiAskSource) => {
@@ -171,7 +180,7 @@ export function AskView({ store }: { store: AppStore }) {
         )}
       </div>
 
-      <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
+      <div ref={scrollRef} data-testid="ask-scroll" onScroll={updateScrollFollow} style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
         <div className="content-pad" style={{ maxWidth: 800, margin: '0 auto', padding: messages.length ? '28px 28px 36px' : '68px 28px 36px' }}>
           {messages.length === 0 && (
             <div style={{ textAlign: 'center', maxWidth: 620, margin: '0 auto' }}>
@@ -202,57 +211,57 @@ export function AskView({ store }: { store: AppStore }) {
                   </div>
                 </div>
               ) : (
-                <div>
-                  <div style={{ display: 'flex', gap: 11, alignItems: 'flex-start' }}>
-                    <div style={{ color: 'var(--accent)', fontSize: 16, lineHeight: 1.5, flex: 'none' }}>✦</div>
-                    <div style={{ fontSize: 13.5, lineHeight: 1.65, minWidth: 0, flex: 1 }}>
+                <div style={{ display: 'flex', gap: 11, alignItems: 'flex-start' }}>
+                  <div style={{ color: 'var(--accent)', fontSize: 16, lineHeight: 1.5, flex: 'none' }}>✦</div>
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    {(message.trace?.length || message.reasoning) && (
+                      <details data-testid="ask-reasoning" style={{ borderLeft: '1px solid var(--w-1)', paddingLeft: 11 }}>
+                        <summary style={{ cursor: 'pointer', color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 9.5, userSelect: 'none' }}>
+                          {isStreaming ? 'Thinking…' : 'Reasoning summary'}
+                        </summary>
+                        <div style={{ marginTop: 8, color: 'var(--text-mid)', fontSize: 11.5, lineHeight: 1.55 }}>
+                          {message.trace?.map((item, traceIndex) => (
+                            <div key={traceIndex} style={{ display: 'flex', gap: 7, marginBottom: 4 }}>
+                              <span style={{ color: 'var(--accent)' }}>·</span><span>{item}</span>
+                            </div>
+                          ))}
+                          {message.reasoning && <div style={{ marginTop: 8 }}><Markdown source={message.reasoning} /></div>}
+                        </div>
+                      </details>
+                    )}
+                    {!!message.sources?.length && (
+                      <div data-testid="ask-sources" style={{ marginTop: 12 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                          <SectionLabel>Sources</SectionLabel>
+                          {message.mode && <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>{message.mode} match</span>}
+                        </div>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                          {message.sources.map((s) => (
+                            <button key={`${s.kind}:${s.id}`} onClick={() => openSource(s)} className="hover-border" title={s.projectName} style={{ display: 'flex', alignItems: 'center', gap: 7, border: '1px solid var(--w-07)', borderRadius: 8, background: 'var(--w-02)', padding: '6px 9px', cursor: 'pointer', minWidth: 0 }}>
+                              <MonoTag color={KIND_COLOR[s.kind]} bg="var(--w-04)" size={8}>{s.kind.toUpperCase()}</MonoTag>
+                              <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>{s.projectKey}</span>
+                              {s.key && <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>{s.key}</span>}
+                              <span style={{ fontSize: 11.5, maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.title}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    <div data-testid="ask-answer" style={{ fontSize: 13.5, lineHeight: 1.65, marginTop: message.trace?.length || message.reasoning || message.sources?.length ? 14 : 0 }}>
                       {message.content ? <Markdown source={message.content} /> : phase && isStreaming ? <GenerationActivity phase={phase} /> : null}
                       {message.content && phase && isStreaming && (
                         <div style={{ marginTop: 9 }}><GenerationActivity phase={phase} /></div>
                       )}
                     </div>
+                    {(message.model || !isStreaming) && <div style={{ marginTop: 10, fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>{modelLabel(message.model)}</div>}
                   </div>
-                  {(message.trace?.length || message.reasoning) && (
-                    <details open={isStreaming || undefined} style={{ margin: '12px 0 0 27px', borderLeft: '1px solid var(--w-1)', paddingLeft: 11 }}>
-                      <summary style={{ cursor: 'pointer', color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 9.5, userSelect: 'none' }}>
-                        {isStreaming ? 'Thinking…' : 'Reasoning summary'}
-                      </summary>
-                      <div style={{ marginTop: 8, color: 'var(--text-mid)', fontSize: 11.5, lineHeight: 1.55 }}>
-                        {message.trace?.map((item, traceIndex) => (
-                          <div key={traceIndex} style={{ display: 'flex', gap: 7, marginBottom: 4 }}>
-                            <span style={{ color: 'var(--accent)' }}>·</span><span>{item}</span>
-                          </div>
-                        ))}
-                        {message.reasoning && <div style={{ marginTop: 8 }}><Markdown source={message.reasoning} /></div>}
-                      </div>
-                    </details>
-                  )}
-                  {!!message.sources?.length && (
-                    <div style={{ margin: '16px 0 0 27px' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-                        <SectionLabel>Sources</SectionLabel>
-                        {message.mode && <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>{message.mode} match</span>}
-                      </div>
-                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                        {message.sources.map((s) => (
-                          <button key={`${s.kind}:${s.id}`} onClick={() => openSource(s)} className="hover-border" title={s.projectName} style={{ display: 'flex', alignItems: 'center', gap: 7, border: '1px solid var(--w-07)', borderRadius: 8, background: 'var(--w-02)', padding: '6px 9px', cursor: 'pointer', minWidth: 0 }}>
-                            <MonoTag color={KIND_COLOR[s.kind]} bg="var(--w-04)" size={8}>{s.kind.toUpperCase()}</MonoTag>
-                            <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>{s.projectKey}</span>
-                            {s.key && <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>{s.key}</span>}
-                            <span style={{ fontSize: 11.5, maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.title}</span>
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                  {(message.model || !isStreaming) && <div style={{ margin: '10px 0 0 27px', fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>{modelLabel(message.model)}</div>}
                 </div>
               )}
             </div>
             );
           })}
           {error && <div style={{ margin: '0 0 20px 27px', fontSize: 12.5, color: 'var(--red-soft)', border: '1px solid rgba(255,92,92,.3)', borderRadius: 10, background: 'rgba(255,92,92,.05)', padding: '10px 12px', lineHeight: 1.5 }}>{error}</div>}
-          <div ref={endRef} />
+          <div ref={endRef} data-testid="ask-end" />
         </div>
       </div>
 

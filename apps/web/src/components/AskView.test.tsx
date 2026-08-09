@@ -81,7 +81,12 @@ describe('global Ask chat', () => {
     expect(container.textContent).toContain('Generating with GPT-OSS 120B…');
     expect(container.textContent).toContain('I compared the retrieved project state.');
     expect(container.textContent).toContain('PAY-2'); // sources arrive before completion
-    expect(container.querySelector('details')?.open).toBe(true);
+    const reasoning = container.querySelector<HTMLElement>('[data-testid="ask-reasoning"]')!;
+    const sources = container.querySelector<HTMLElement>('[data-testid="ask-sources"]')!;
+    const answer = [...container.querySelectorAll<HTMLElement>('[data-testid="ask-answer"]')].at(-1)!;
+    expect(container.querySelector('details')?.open).toBe(false);
+    expect(reasoning.compareDocumentPosition(sources) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(sources.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 
     await act(async () => {
       handlers!.onDelta('is ready.');
@@ -97,6 +102,41 @@ describe('global Ask chat', () => {
     act(() => source.click());
     expect(actions.selectProject).toHaveBeenCalledWith('project_pay');
     expect(actions.openTask).toHaveBeenCalledWith('task_2');
+  });
+
+  it('stops following streamed output after the user scrolls up and resumes at the bottom', async () => {
+    let handlers: ApiAskStreamHandlers | undefined;
+    let finish: (() => void) | undefined;
+    vi.spyOn(api, 'askStream').mockImplementation(async (_question, _history, callbacks) => {
+      handlers = callbacks;
+      await new Promise<void>((resolve) => { finish = resolve; });
+    });
+    mount();
+    const scroll = container.querySelector<HTMLElement>('[data-testid="ask-scroll"]')!;
+    const end = container.querySelector<HTMLElement>('[data-testid="ask-end"]')!;
+    const scrollIntoView = vi.fn();
+    end.scrollIntoView = scrollIntoView;
+    Object.defineProperties(scroll, {
+      scrollHeight: { configurable: true, value: 1000 },
+      clientHeight: { configurable: true, value: 400 },
+      scrollTop: { configurable: true, writable: true, value: 600 },
+    });
+
+    setTextarea('Stream a long answer');
+    act(() => button('Send')!.click());
+    scrollIntoView.mockClear();
+
+    scroll.scrollTop = 100;
+    act(() => scroll.dispatchEvent(new Event('scroll')));
+    act(() => handlers!.onDelta('First chunk'));
+    expect(scrollIntoView).not.toHaveBeenCalled();
+
+    scroll.scrollTop = 600;
+    act(() => scroll.dispatchEvent(new Event('scroll')));
+    act(() => handlers!.onDelta(' second chunk'));
+    expect(scrollIntoView).toHaveBeenCalled();
+
+    await act(async () => finish!());
   });
 
   it('starts a fresh session thread without deleting project data', () => {
