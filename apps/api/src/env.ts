@@ -27,6 +27,15 @@ export interface Env {
   ASK_STREAM_POLL_MS?: string;
   /** Maximum generated tokens for an Ask answer. Parsed and clamped by askOutputTokenLimit. */
   ASK_MAX_OUTPUT_TOKENS?: string;
+  /** Actor lifecycle policy overrides (PLNR-363). All numeric values are validated and capped;
+   * scheduled mutation remains off unless AGENT_LIFECYCLE_SWEEP_APPLY is explicitly truthy. */
+  AGENT_LIFECYCLE_ONLINE_SECONDS?: string;
+  AGENT_COPILOT_RETIRE_DAYS?: string;
+  AGENT_HISTORY_ARCHIVE_DAYS?: string;
+  AGENT_PRESENCE_PURGE_DAYS?: string;
+  RUNNER_OFFLINE_ARCHIVE_DAYS?: string;
+  AGENT_LIFECYCLE_SWEEP_BATCH?: string;
+  AGENT_LIFECYCLE_SWEEP_APPLY?: string;
   /** Bootstrap secret for issuing agent keys / creating users. Set via `wrangler secret put ADMIN_TOKEN`. */
   ADMIN_TOKEN?: string;
   /** Optional shared secret for GitHub webhook signature verification. */

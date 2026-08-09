@@ -49,7 +49,17 @@
   // OPTIONAL — email invites. Requires: wrangler email sending enable <your-domain>
   // Delete both if unused; invites fall back to copyable links.
   "send_email": [{ "name": "EMAIL" }],
-  "vars": { "EMAIL_FROM": "noriq@example.com", "ASK_MAX_OUTPUT_TOKENS": "8192" },
+  "vars": {
+    "EMAIL_FROM": "noriq@example.com",
+    "ASK_MAX_OUTPUT_TOKENS": "8192",
+    "AGENT_LIFECYCLE_ONLINE_SECONDS": "300",
+    "AGENT_COPILOT_RETIRE_DAYS": "7",
+    "AGENT_HISTORY_ARCHIVE_DAYS": "30",
+    "AGENT_PRESENCE_PURGE_DAYS": "90",
+    "RUNNER_OFFLINE_ARCHIVE_DAYS": "30",
+    "AGENT_LIFECYCLE_SWEEP_BATCH": "100",
+    "AGENT_LIFECYCLE_SWEEP_APPLY": "false"
+  },
 
   // OPTIONAL — task attachments. Requires R2 enabled on the account, then:
   //   wrangler r2 bucket create noriq-files

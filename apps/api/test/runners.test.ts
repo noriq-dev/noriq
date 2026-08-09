@@ -416,8 +416,15 @@ describe('run agent creation (RUN-43)', () => {
     });
     expect(after.status).toBe(401);
 
-    const row = await env.DB.prepare('SELECT status FROM agents WHERE id = ?').bind(body.agentId)
-      .first<{ status: string }>();
+    const row = await env.DB.prepare(
+      'SELECT status, retired_at AS retiredAt, retire_reason AS retireReason FROM agents WHERE id = ?',
+    ).bind(body.agentId).first<{ status: string; retiredAt: string | null; retireReason: string | null }>();
     expect(row!.status).toBe('offline');
+    expect(row!.retiredAt).not.toBeNull();
+    expect(row!.retireReason).toBe('run_terminal');
+    expect(await env.DB.prepare(
+      `SELECT to_state AS toState, reason FROM agent_lifecycle_events
+        WHERE subject_kind = 'actor' AND subject_id = ?`,
+    ).bind(body.agentId).first()).toMatchObject({ toState: 'retired', reason: 'run_terminal' });
   });
 });

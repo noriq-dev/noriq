@@ -42,6 +42,13 @@ describe('runner offboard (RUN-35)', () => {
     const res = await offboard(id);
     expect(res.status).toBe(200);
     expect((await res.json()) as { tokenRevoked: boolean }).toMatchObject({ tokenRevoked: true });
+    expect(await env.DB.prepare(
+      'SELECT retired_at AS retiredAt, retire_reason AS retireReason FROM runners WHERE id = ?',
+    ).bind(id).first()).toMatchObject({ retireReason: 'runner_offboarded' });
+    expect(await env.DB.prepare(
+      `SELECT to_state AS toState, reason FROM agent_lifecycle_events
+        WHERE subject_kind = 'runner' AND subject_id = ?`,
+    ).bind(id).first()).toMatchObject({ toState: 'retired', reason: 'runner_offboarded' });
 
     // The token is dead for EVERYTHING it could do, which is the point: no register, no
     // heartbeat, no MCP. A runner marked gone while its credential still works stops nothing.

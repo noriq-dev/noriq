@@ -192,8 +192,17 @@ export async function resolveSessionAgent(env: Env, conn: Connection, sessionId:
     // Session resolution happens once per MCP request, so it is the one reliable presence touch
     // shared by every tool. Migration 0081 projects this update into agent_presences; keeping the
     // compatibility columns fresh also makes old readers less dishonest during the rollout.
-    await env.DB.prepare("UPDATE agents SET status = 'active', last_seen_at = ? WHERE id = ?")
-      .bind(nowIso(), existing.id).run();
+    const resumedAt = nowIso();
+    await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE agents SET status = 'active', last_seen_at = ?, retired_at = NULL,
+                           retire_reason = NULL, archived_at = NULL, lifecycle_updated_at = ?
+          WHERE id = ?`,
+      ).bind(resumedAt, resumedAt, existing.id),
+      env.DB.prepare(
+        `UPDATE agent_presences SET archived_at = NULL, updated_at = ? WHERE actor_id = ?`,
+      ).bind(resumedAt, existing.id),
+    ]);
     return existing;
   }
   const id = newId('agt');

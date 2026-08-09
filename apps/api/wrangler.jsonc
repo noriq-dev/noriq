@@ -9,8 +9,19 @@
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat"],
 
-  // Ask answer budget. Override per deployment; validated to 256..32768 (default 4096).
-  "vars": { "ASK_MAX_OUTPUT_TOKENS": "4096" },
+  // Ask answer budget and actor-lifecycle retention policy. Lifecycle numeric values are parsed,
+  // clamped, and reported by the sweep. Scheduled mutation is deliberately opt-in; operators can
+  // review the dry-run endpoint before setting AGENT_LIFECYCLE_SWEEP_APPLY to "true".
+  "vars": {
+    "ASK_MAX_OUTPUT_TOKENS": "4096",
+    "AGENT_LIFECYCLE_ONLINE_SECONDS": "300",
+    "AGENT_COPILOT_RETIRE_DAYS": "7",
+    "AGENT_HISTORY_ARCHIVE_DAYS": "30",
+    "AGENT_PRESENCE_PURGE_DAYS": "90",
+    "RUNNER_OFFLINE_ARCHIVE_DAYS": "30",
+    "AGENT_LIFECYCLE_SWEEP_BATCH": "100",
+    "AGENT_LIFECYCLE_SWEEP_APPLY": "false"
+  },
 
   "assets": {
     "directory": "../web/dist",

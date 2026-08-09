@@ -51,6 +51,7 @@ import { readBoundedBody, verifyBatchChecksum, decodeBatchRows, MAX_INGEST_BATCH
 import { normalizeVerificationReport } from './memory/verification';
 import { sweepPendingEpisodeJobs } from './memory/episodes';
 import { classifyAgentLifecycle } from './lib/agent-lifecycle';
+import { agentLifecycleSweepConfig, sweepAgentLifecycle, type AgentLifecycleCursor } from './lib/agent-lifecycle-sweep';
 import { AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget, isTerminalRunStatus, normalizeProjectKey, IndexGenerationManifest, ContextPackRole, type RunnerIndexCursor } from '@noriq-dev/shared';
 import { auditAuthorizationParity, reconcileLegacyGroupGrants } from './lib/authorization-parity';
 import { evaluateMemoryAcceptance } from './memory/acceptance';
@@ -476,6 +477,25 @@ app.post('/api/admin/memory-restore/:projectId/rollback', adminAuth, async (c) =
 app.post('/api/admin/memory-lifecycle-sweep', adminAuth, async (c) => {
   const [erasures, debris] = await Promise.all([sweepPendingErasures(c.env), sweepProjectDebris(c.env)]);
   return c.json({ erasures, debris });
+});
+
+// PLNR-363: safe by default. A plain call is a bounded dry run; mutation requires the explicit
+// apply flag. The returned cursor can be supplied to continue an operator dry run, while scheduled
+// apply sweeps persist their own cursors in D1.
+app.post('/api/admin/agent-lifecycle-sweep', adminAuth, async (c) => {
+  let body: { cursor?: Partial<AgentLifecycleCursor> } = {};
+  if (c.req.header('content-type')?.includes('application/json')) {
+    try { body = await c.req.json(); }
+    catch { return c.json({ error: 'body must be JSON' }, 400); }
+  }
+  const cursor = body.cursor;
+  if (cursor && Object.values(cursor).some((value) => value !== null && typeof value !== 'string')) {
+    return c.json({ error: 'cursor values must be strings or null' }, 400);
+  }
+  return c.json(await sweepAgentLifecycle(c.env, {
+    dryRun: c.req.query('apply') !== 'true',
+    cursor,
+  }));
 });
 
 // Restore a snapshot (PLNR-218) — the inverse of /export. DESTRUCTIVE: REPLACES all data
@@ -2929,7 +2949,10 @@ app.post('/api/runners', agentAuth, async (c) => {
       return c.json({ error: 'this runner was offboarded — delete it to let this machine register again' }, 403);
     }
     await c.env.DB.prepare(
-      "UPDATE runners SET label = ?, status = 'online', capabilities = ?, repos = ?, free_slots = ?, last_heartbeat_at = ?, token_id = ?, version = ? WHERE id = ?",
+      `UPDATE runners SET label = ?, status = 'online', capabilities = ?, repos = ?,
+                          free_slots = ?, last_heartbeat_at = ?, token_id = ?, version = ?,
+                          retired_at = NULL, retire_reason = NULL, archived_at = NULL
+        WHERE id = ?`,
     ).bind(b.label, capabilities, JSON.stringify(repos), b.maxConcurrency, now, c.var.connection!.tokenId, b.version ?? null, id).run();
     // Reconnect reconciliation (RUN-6): the daemon's previous process died, so any
     // Runs still dispatched/running/blocked for it are orphaned → failed{daemon_restart}.
@@ -3017,15 +3040,40 @@ app.post('/api/runners/:id/offboard', userAuth, async (c) => {
   const tokenId = (runner.token_id as string | null) ?? null;
 
   const stmts = [
-    c.env.DB.prepare("UPDATE runners SET offboarded_at = ?, status = 'offline', free_slots = 0 WHERE id = ?").bind(now, id),
+    c.env.DB.prepare(
+      `INSERT INTO agent_lifecycle_events
+         (id, sweep_id, subject_kind, subject_id, from_state, to_state, reason, evidence_at, created_at)
+       SELECT ?, 'offboard', 'runner', id, 'active', 'retired', 'runner_offboarded', ?, ?
+         FROM runners WHERE id = ? AND retired_at IS NULL`,
+    ).bind(newId('ale'), now, now, id),
+    c.env.DB.prepare(
+      `UPDATE runners SET offboarded_at = ?, status = 'offline', free_slots = 0,
+                          retired_at = COALESCE(retired_at, ?),
+                          retire_reason = COALESCE(retire_reason, 'runner_offboarded')
+        WHERE id = ?`,
+    ).bind(now, now, id),
   ];
   if (tokenId) {
     stmts.push(
       c.env.DB.prepare('UPDATE oauth_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL').bind(now, tokenId),
+      c.env.DB.prepare(
+        `INSERT INTO agent_lifecycle_events
+           (id, sweep_id, subject_kind, subject_id, actor_class, from_state, to_state,
+            reason, evidence_at, created_at)
+         SELECT 'ale_' || lower(hex(randomblob(16))), 'offboard', 'actor', id, actor_class,
+                'active', 'retired', 'runner_offboarded', ?, ?
+           FROM agents
+          WHERE (oauth_token_id = ? OR runner_id = ?) AND retired_at IS NULL`,
+      ).bind(now, now, tokenId, id),
       // Same sweep the connections revoke does: retire the agents that ran on it so they stop
       // showing as live. A runner's agents are exactly the ones it spawned (0026).
-      c.env.DB.prepare("UPDATE agents SET status = 'offline' WHERE oauth_token_id = ? AND status = 'active'").bind(tokenId),
-      c.env.DB.prepare("UPDATE agents SET status = 'offline' WHERE runner_id = ? AND status = 'active'").bind(id),
+      c.env.DB.prepare(
+        `UPDATE agents SET status = CASE WHEN status = 'active' THEN 'offline' ELSE status END,
+                           retired_at = COALESCE(retired_at, ?),
+                           retire_reason = COALESCE(retire_reason, 'runner_offboarded'),
+                           lifecycle_updated_at = ?
+          WHERE oauth_token_id = ? OR runner_id = ?`,
+      ).bind(now, now, tokenId, id),
     );
   }
   await c.env.DB.batch(stmts);
@@ -4241,6 +4289,20 @@ export default {
           sweepProjectDebris(env).then((r) => console.log(`[memory-lifecycle] debris sweep: ${r.length} project(s) processed`)),
           sweepPendingEpisodeJobs(env).then((r) => console.log(`[memory-lifecycle] episode jobs: ${r.completed} completed, ${r.failed} failed`)),
         ]).catch((err) => console.warn(`[memory-lifecycle] sweep failed: ${String(err)}`)),
+      );
+      // Actor/session lifecycle shares the daily maintenance trigger but owns an independent,
+      // bounded cursor. Deployments remain dry-run-only until an operator reviews classification
+      // and explicitly enables scheduled apply in Worker vars.
+      const lifecycleConfig = agentLifecycleSweepConfig(env);
+      ctx.waitUntil(
+        sweepAgentLifecycle(env, {
+          dryRun: !lifecycleConfig.scheduledApply,
+          at: new Date(event.scheduledTime).toISOString(),
+          persistCursor: true,
+        }).then((r) => console.log(
+          `[agent-lifecycle] ${r.dryRun ? 'dry-run' : 'apply'} examined ${r.examined.actors} actor(s), `
+          + `${r.examined.presences} presence(s), ${r.examined.runners} runner(s); complete=${r.complete}`,
+        )).catch((err) => console.warn(`[agent-lifecycle] sweep failed: ${String(err)}`)),
       );
     }
     // Backstop auto-archive for projects nobody has viewed (the snapshot sweeps viewed ones).

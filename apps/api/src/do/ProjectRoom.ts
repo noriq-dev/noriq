@@ -4439,14 +4439,30 @@ export class ProjectRoom extends DurableObject<Env> {
   }
 
   private async retireRunAgent(agentId: string): Promise<void> {
-    const agent = await this.env.DB.prepare("SELECT id FROM agents WHERE id = ? AND kind = 'agent'")
-      .bind(agentId).first();
+    const agent = await this.env.DB.prepare(
+      "SELECT id, retired_at AS retiredAt FROM agents WHERE id = ? AND kind = 'agent'",
+    ).bind(agentId).first<{ id: string; retiredAt: string | null }>();
     if (!agent) return; // a copilot (legacy runs report one) — not ours to retire
-    await this.env.DB.batch([
+    const now = nowIso();
+    const statements = [
       this.env.DB.prepare('UPDATE oauth_tokens SET revoked_at = ? WHERE agent_id = ? AND revoked_at IS NULL')
-        .bind(nowIso(), agentId),
-      this.env.DB.prepare("UPDATE agents SET status = 'offline' WHERE id = ?").bind(agentId),
-    ]);
+        .bind(now, agentId),
+      this.env.DB.prepare(
+        `UPDATE agents SET status = 'offline', retired_at = COALESCE(retired_at, ?),
+                           retire_reason = COALESCE(retire_reason, 'run_terminal'),
+                           lifecycle_updated_at = ? WHERE id = ?`,
+      ).bind(now, now, agentId),
+    ];
+    if (!agent.retiredAt) {
+      statements.push(this.env.DB.prepare(
+        `INSERT INTO agent_lifecycle_events
+           (id, sweep_id, subject_kind, subject_id, actor_class, from_state, to_state,
+            reason, evidence_at, created_at)
+         VALUES (?, 'terminal', 'actor', ?, 'runner_agent', 'active', 'retired',
+                 'run_terminal', ?, ?)`,
+      ).bind(newId('ale'), agentId, now, now));
+    }
+    await this.env.DB.batch(statements);
     // NOTE: a claim the agent still holds is left to the TTL reaper (alarm()), as before —
     // it cannot release itself now that its token is dead. That is unchanged behaviour for a
     // process that died mid-claim, but it is the reason RUN-30 (pause/resume) and the claim
