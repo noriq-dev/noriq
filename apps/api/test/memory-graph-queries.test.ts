@@ -18,7 +18,7 @@ interface Coverage { complete: boolean; reasons: string[]; edgeTypesWithNoWriter
 interface MemRpc {
   recordMemory(
     pid: string,
-    input: { kind: string; statement: string; evidence?: Array<{ repositoryKey: string; branch: string; baseId: string; path: string }>; actor: { kind: string; id: string | null } },
+    input: { kind: string; statement: string; evidence?: Array<{ repositoryKey: string; branch: string; baseId: string; path: string }>; supersedesMemoryId?: string; actor: { kind: string; id: string | null } },
   ): Promise<{ memoryId: string }>;
   writeNode(pid: string, input: { type: string; uri: string; label: string; actor: { kind: string; id: string | null } }): Promise<{ nodeId: string }>;
   writeEdge(pid: string, input: { type: string; fromNodeId: string; toNodeId: string; actor: { kind: string; id: string | null } }): Promise<{ edgeId: string }>;
@@ -169,20 +169,24 @@ describe('decisionLineage — implements-then-modifies composition, superseding 
       actor: { kind: 'agent', id: 'agt_x' },
     });
     const decisionUri = `noriq://decision/${memoryId}`;
-    const decisionNode = await memory(projectId).writeNode(projectId, { type: 'decision', uri: decisionUri, label: 'adopt exponential backoff', actor: SYSTEM });
+    const recorded = await memory(projectId).decisionLineage(projectId, { decisionUri });
+    expect(recorded.seed).toEqual(expect.objectContaining({ type: 'decision', uri: decisionUri }));
+    expect(recorded.evidence).toEqual([expect.objectContaining({ path: 'RETRY.md' })]);
+    const decisionNode = recorded.seed!;
     const task = await memory(projectId).writeNode(projectId, { type: 'task', uri: 'noriq://task/task_dec1', label: 'implement backoff', actor: SYSTEM });
     await memory(projectId).writeEdge(projectId, { type: 'implements', fromNodeId: task.nodeId, toNodeId: decisionNode.nodeId, actor: SYSTEM });
     const file = await memory(projectId).writeNode(projectId, { type: 'file', uri: 'noriq://file/PMGQDEC/repo-x/retry.ts', label: 'retry.ts', actor: SYSTEM });
     await memory(projectId).writeEdge(projectId, { type: 'modifies', fromNodeId: task.nodeId, toNodeId: file.nodeId, actor: SYSTEM });
 
-    const { memoryId: newerMemId } = await memory(projectId).recordMemory(projectId, { kind: 'decision', statement: 'adopt jittered exponential backoff instead', actor: { kind: 'agent', id: 'agt_x' } });
-    const newerDecision = await memory(projectId).writeNode(projectId, { type: 'decision', uri: `noriq://decision/${newerMemId}`, label: 'adopt jittered backoff', actor: SYSTEM });
-    await memory(projectId).writeEdge(projectId, { type: 'supersedes', fromNodeId: newerDecision.nodeId, toNodeId: decisionNode.nodeId, actor: SYSTEM });
+    const { memoryId: newerMemId } = await memory(projectId).recordMemory(projectId, {
+      kind: 'decision', statement: 'adopt jittered exponential backoff instead', supersedesMemoryId: memoryId,
+      actor: { kind: 'agent', id: 'agt_x' },
+    });
 
     const r = await memory(projectId).decisionLineage(projectId, { decisionUri });
     expect(r.implementingTasks.map((t) => t.nodeId)).toEqual([task.nodeId]);
     expect(r.affectedEntities.map((t) => t.nodeId)).toEqual([file.nodeId]);
-    expect(r.supersedingDecisions.map((t) => t.nodeId)).toEqual([newerDecision.nodeId]);
+    expect(r.supersedingDecisions.map((t) => t.uri)).toEqual([`noriq://decision/${newerMemId}`]);
     expect(r.evidence).toHaveLength(1);
     expect(r.evidence[0]!.path).toBe('RETRY.md');
     expect(r.coverage.complete).toBe(true); // every edge type used here has a writer, and a file node exists

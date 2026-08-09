@@ -318,7 +318,7 @@ function summarizeEpisodeBody(bodyJson: string): string {
  * make an already-backfilled project look unbackfilled and re-run for no reason (harmless, since
  * the rebuild is idempotent, but pointless CPU).
  */
-const BACKFILL_VERSION = 2;
+const BACKFILL_VERSION = 3;
 
 export class ProjectMemory extends DurableObject<Env> {
   // Bound on first call — from ctx.id.name when the runtime exposes it (every
@@ -1983,8 +1983,8 @@ export class ProjectMemory extends DurableObject<Env> {
    *  everything here is derived from durable columns, never inferred from statement text. */
   private projectStoredMemoryItem(memoryId: string, projectKey: string | null, now: string): { nodesWritten: number; edgesWritten: number } {
     const row = this.ctx.storage.sql
-      .exec<{ id: string; statement: string; supersedes_memory_id: string | null }>(
-        `SELECT id, statement, supersedes_memory_id FROM memory_items WHERE id = ?1`, memoryId,
+      .exec<{ id: string; kind: string; statement: string; supersedes_memory_id: string | null }>(
+        `SELECT id, kind, statement, supersedes_memory_id FROM memory_items WHERE id = ?1`, memoryId,
       )
       .toArray()[0];
     if (!row) return { nodesWritten: 0, edgesWritten: 0 };
@@ -1995,10 +1995,20 @@ export class ProjectMemory extends DurableObject<Env> {
       'memory', buildEntityUri({ kind: 'memory', id: row.id }), ProjectMemory.memoryNodeLabel(row.statement), now,
     );
     nodesWritten++;
+    const decisionNodeId = row.kind === 'decision'
+      ? this.upsertGraphNode(
+          'decision', buildEntityUri({ kind: 'decision', id: row.id }), ProjectMemory.memoryNodeLabel(row.statement), now,
+        )
+      : null;
+    if (decisionNodeId) {
+      nodesWritten++;
+      this.linkGraphEdge('derived_from', decisionNodeId, memoryNodeId, now, 'memory_items:decision');
+      edgesWritten++;
+    }
 
     if (row.supersedes_memory_id) {
       const prior = this.ctx.storage.sql
-        .exec<{ statement: string }>(`SELECT statement FROM memory_items WHERE id = ?1`, row.supersedes_memory_id)
+        .exec<{ kind: string; statement: string }>(`SELECT kind, statement FROM memory_items WHERE id = ?1`, row.supersedes_memory_id)
         .toArray()[0];
       if (prior) {
         const priorNodeId = this.upsertGraphNode(
@@ -2008,6 +2018,15 @@ export class ProjectMemory extends DurableObject<Env> {
         nodesWritten++;
         this.linkGraphEdge('supersedes', memoryNodeId, priorNodeId, now, 'memory_items:supersedes');
         edgesWritten++;
+        if (decisionNodeId && prior.kind === 'decision') {
+          const priorDecisionNodeId = this.upsertGraphNode(
+            'decision', buildEntityUri({ kind: 'decision', id: row.supersedes_memory_id }),
+            ProjectMemory.memoryNodeLabel(prior.statement), now,
+          );
+          nodesWritten++;
+          this.linkGraphEdge('supersedes', decisionNodeId, priorDecisionNodeId, now, 'memory_items:supersedes');
+          edgesWritten++;
+        }
       }
     }
 
@@ -2177,6 +2196,17 @@ export class ProjectMemory extends DurableObject<Env> {
         ProjectMemory.memoryNodeLabel(input.statement),
         now,
       );
+      const decisionNodeId = input.kind === 'decision'
+        ? this.upsertGraphNode(
+            'decision',
+            buildEntityUri({ kind: 'decision', id: memoryId }),
+            ProjectMemory.memoryNodeLabel(input.statement),
+            now,
+          )
+        : null;
+      if (decisionNodeId) {
+        this.linkGraphEdge('derived_from', decisionNodeId, memoryNodeId, now, 'memory_items:decision');
+      }
       let repoCitationIndex = 0;
       for (const citation of citations) {
         let provenance: string;
@@ -2211,7 +2241,7 @@ export class ProjectMemory extends DurableObject<Env> {
       }
       if (input.supersedesMemoryId) {
         const prior = this.ctx.storage.sql
-          .exec<{ statement: string }>(`SELECT statement FROM memory_items WHERE id = ?1`, input.supersedesMemoryId)
+          .exec<{ kind: string; statement: string }>(`SELECT kind, statement FROM memory_items WHERE id = ?1`, input.supersedesMemoryId)
           .toArray()[0];
         if (prior) {
           const priorNodeId = this.upsertGraphNode(
@@ -2219,6 +2249,15 @@ export class ProjectMemory extends DurableObject<Env> {
             ProjectMemory.memoryNodeLabel(prior.statement), now,
           );
           this.linkGraphEdge('supersedes', memoryNodeId, priorNodeId, now, 'memory_items:supersedes');
+          if (decisionNodeId && prior.kind === 'decision') {
+            const priorDecisionNodeId = this.upsertGraphNode(
+              'decision',
+              buildEntityUri({ kind: 'decision', id: input.supersedesMemoryId }),
+              ProjectMemory.memoryNodeLabel(prior.statement),
+              now,
+            );
+            this.linkGraphEdge('supersedes', decisionNodeId, priorDecisionNodeId, now, 'memory_items:supersedes');
+          }
         }
       }
 
