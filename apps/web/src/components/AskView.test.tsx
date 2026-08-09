@@ -109,6 +109,7 @@ describe('global Ask chat', () => {
     const sources = [...container.querySelectorAll<HTMLElement>('[data-testid="ask-sources"]')].at(-1)!;
     const answer = [...container.querySelectorAll<HTMLElement>('[data-testid="ask-answer"]')].at(-1)!;
     expect((reasoning as HTMLDetailsElement).open).toBe(false);
+    expect((sources as HTMLDetailsElement).open).toBe(false);
     expect(reasoning.compareDocumentPosition(sources) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(sources.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 

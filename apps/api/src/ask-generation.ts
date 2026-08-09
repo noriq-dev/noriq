@@ -1,5 +1,5 @@
 import type { Env } from './env';
-import { consumeAskGeneration, prepareQuestion, streamingGenerationClient, type AskProject } from './ask';
+import { askOutputTokenLimit, consumeAskGeneration, prepareQuestion, streamingGenerationClient, type AskProject } from './ask';
 import {
   completeAskGeneration, failAskGeneration, getAskGeneration, updateAskGeneration,
   type StoredAskGeneration,
@@ -90,7 +90,7 @@ export async function runAskGeneration(env: Env, generationId: string): Promise<
         answer += delta;
         await persist('generating');
       },
-    });
+    }, askOutputTokenLimit(env));
     if (!result || !active) return;
     answer = result.answer;
     reasoning = result.reasoning;

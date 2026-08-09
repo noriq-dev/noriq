@@ -4,7 +4,7 @@ import {
   api, ApiError, type ApiAskHistoryMessage, type ApiAskSource, type ApiAskStoredMessage, type ApiAskThread,
 } from '../api';
 import type { AppStore } from '../store';
-import { MonoTag, SectionLabel, WaveBars } from './bits';
+import { MonoTag, WaveBars } from './bits';
 import { confirm } from './Dialog';
 import { Button } from './ui';
 import { Markdown } from './Markdown';
@@ -441,16 +441,16 @@ export function AskView({ store }: { store: AppStore }) {
                             </details>
                           )}
                           {!!message.sources?.length && (
-                            <div data-testid="ask-sources" style={{ marginTop: 12 }}>
-                              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-                                <SectionLabel>Sources</SectionLabel>
+                            <details data-testid="ask-sources" style={{ marginTop: 12, borderLeft: '1px solid var(--w-1)', paddingLeft: 11 }}>
+                              <summary style={{ cursor: 'pointer', color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 9.5, userSelect: 'none' }}>
+                                Sources · {message.sources.length}
                                 {message.mode && (
-                                  <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>
-                                    {message.mode}{message.sources?.some((source) => source.retrieval === 'graph' || source.retrieval === 'hybrid') ? ' + graph' : ''} match
+                                  <span style={{ marginLeft: 8, color: 'var(--text-faint)' }}>
+                                    {message.mode}{message.sources.some((source) => source.retrieval === 'graph' || source.retrieval === 'hybrid') ? ' + graph' : ''}
                                   </span>
                                 )}
-                              </div>
-                              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                              </summary>
+                              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
                                 {message.sources.map((source) => (
                                   <button key={`${source.kind}:${source.id}`} onClick={() => openSource(source)} className="hover-border" title={`${source.projectName} · ${source.retrieval}`} style={{ display: 'flex', alignItems: 'center', gap: 7, border: '1px solid var(--w-07)', borderRadius: 8, background: 'var(--w-02)', padding: '6px 9px', cursor: 'pointer', minWidth: 0 }}>
                                     <MonoTag color={KIND_COLOR[source.kind]} bg="var(--w-04)" size={8}>{source.kind.toUpperCase()}</MonoTag>
@@ -463,7 +463,7 @@ export function AskView({ store }: { store: AppStore }) {
                                   </button>
                                 ))}
                               </div>
-                            </div>
+                            </details>
                           )}
                           <div data-testid="ask-answer" style={{ fontSize: 13.5, lineHeight: 1.65, marginTop: message.trace?.length || message.reasoning || message.sources?.length ? 14 : 0 }}>
                             {message.content ? <Markdown source={message.content} /> : phase && isStreaming ? <GenerationActivity phase={phase} /> : null}

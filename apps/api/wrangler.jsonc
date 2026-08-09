@@ -9,6 +9,9 @@
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat"],
 
+  // Ask answer budget. Override per deployment; validated to 256..32768 (default 4096).
+  "vars": { "ASK_MAX_OUTPUT_TOKENS": "4096" },
+
   "assets": {
     "directory": "../web/dist",
     "binding": "ASSETS",

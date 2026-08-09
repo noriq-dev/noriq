@@ -5,7 +5,7 @@ import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import { createAgent, createUser, loginSession, mcpCall } from './helpers';
 import {
-  answerQuestion, askEventStream, buildMessages, extractFinishState, extractGeneratedText, extractReasoningSummaryDelta, extractRetrievalToolQuery, extractStreamDelta,
+  answerQuestion, askEventStream, askOutputTokenLimit, buildMessages, extractFinishState, extractGeneratedText, extractReasoningSummaryDelta, extractRetrievalToolQuery, extractStreamDelta,
   generationClient, normalizeHistory, retrievalDecisionClient, type ChatMessage, type GenerationClient, type PreparedAsk,
 } from '../src/ask';
 import type { SearchHit } from '../src/search';
@@ -75,6 +75,14 @@ describe('buildMessages (unit)', () => {
 });
 
 describe('Workers AI response adapters', () => {
+  it('uses a configurable and bounded Ask output-token budget', () => {
+    expect(askOutputTokenLimit({})).toBe(4096);
+    expect(askOutputTokenLimit({ ASK_MAX_OUTPUT_TOKENS: '8192' })).toBe(8192);
+    expect(askOutputTokenLimit({ ASK_MAX_OUTPUT_TOKENS: 'oops' })).toBe(4096);
+    expect(askOutputTokenLimit({ ASK_MAX_OUTPUT_TOKENS: '1' })).toBe(256);
+    expect(askOutputTokenLimit({ ASK_MAX_OUTPUT_TOKENS: '999999' })).toBe(32768);
+  });
+
   it('extracts legacy, Chat Completions, and Responses API answer text', () => {
     expect(extractGeneratedText({ response: 'legacy answer' })).toBe('legacy answer');
     expect(extractGeneratedText({ choices: [{ message: { content: 'chat answer' } }] })).toBe('chat answer');

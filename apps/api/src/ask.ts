@@ -13,7 +13,9 @@ import { buildEntityUri, parseEntityUri } from '@noriq-dev/shared';
 export const GENERATION_MODEL = '@cf/openai/gpt-oss-120b';
 const CONTEXT_HITS = 8;
 const CONTEXT_CHARS = 1200;
-const MAX_ANSWER_TOKENS = 1200;
+export const DEFAULT_ASK_MAX_OUTPUT_TOKENS = 4096;
+export const MIN_ASK_MAX_OUTPUT_TOKENS = 256;
+export const MAX_ASK_MAX_OUTPUT_TOKENS = 32768;
 const TOOL_DECISION_TOKENS = 256;
 const MAX_QUESTION_CHARS = 4000;
 const MAX_HISTORY_MESSAGES = 12;
@@ -34,6 +36,14 @@ export interface GenerationClient {
 
 export interface StreamingGenerationClient {
   stream(messages: ChatMessage[], opts: { maxTokens: number }): Promise<ReadableStream<Uint8Array>>;
+}
+
+/** Wrangler vars arrive as strings. Invalid values use the documented default; valid values are
+ * clamped below GPT-OSS's 128k total context window so one deployment typo cannot exhaust it. */
+export function askOutputTokenLimit(env: Pick<Env, 'ASK_MAX_OUTPUT_TOKENS'>): number {
+  const parsed = Number.parseInt(env.ASK_MAX_OUTPUT_TOKENS ?? '', 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_ASK_MAX_OUTPUT_TOKENS;
+  return Math.min(Math.max(parsed, MIN_ASK_MAX_OUTPUT_TOKENS), MAX_ASK_MAX_OUTPUT_TOKENS);
 }
 
 type JsonObject = Record<string, unknown>;
@@ -596,7 +606,7 @@ export async function prepareQuestion(env: Env, opts: AskOptions): Promise<Prepa
 
 export async function answerQuestion(env: Env, gen: GenerationClient, opts: AskOptions): Promise<AskResult> {
   const prepared = await prepareQuestion(env, opts);
-  const answer = (await gen.generate(prepared.messages, { maxTokens: MAX_ANSWER_TOKENS })).trim();
+  const answer = (await gen.generate(prepared.messages, { maxTokens: askOutputTokenLimit(env) })).trim();
   if (!answer) throw new Error('Workers AI returned no answer text');
   return {
     answer,
@@ -627,8 +637,9 @@ export async function consumeAskGeneration(
   gen: StreamingGenerationClient,
   prepared: PreparedAsk,
   callbacks: AskGenerationCallbacks = {},
+  maxTokens = DEFAULT_ASK_MAX_OUTPUT_TOKENS,
 ): Promise<AskGenerationResult | null> {
-  const upstream = await gen.stream(prepared.messages, { maxTokens: MAX_ANSWER_TOKENS });
+  const upstream = await gen.stream(prepared.messages, { maxTokens });
   const reader = upstream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';

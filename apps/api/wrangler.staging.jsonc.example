@@ -41,7 +41,8 @@
 
   "vars": {
     // Used for links in out-of-band notifications, where there is no request origin to read.
-    "PUBLIC_ORIGIN": "https://noriq-staging.<your-subdomain>.workers.dev"
+    "PUBLIC_ORIGIN": "https://noriq-staging.<your-subdomain>.workers.dev",
+    "ASK_MAX_OUTPUT_TOKENS": "8192"
   },
 
   "assets": {

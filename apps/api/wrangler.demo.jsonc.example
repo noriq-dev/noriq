@@ -29,7 +29,8 @@
     "DEMO_MODE": "1",
     // Absolute-URL base for the few links that need one; harmless to set even though the
     // demo doesn't send email.
-    "PUBLIC_ORIGIN": "https://demo.noriq.dev"
+    "PUBLIC_ORIGIN": "https://demo.noriq.dev",
+    "ASK_MAX_OUTPUT_TOKENS": "4096"
   },
 
   "assets": {

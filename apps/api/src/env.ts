@@ -25,6 +25,8 @@ export interface Env {
   LISTEN_POLL_MS?: string;
   /** Poll cadence for reconnectable Ask SSE followers. Primarily lowered by tests. */
   ASK_STREAM_POLL_MS?: string;
+  /** Maximum generated tokens for an Ask answer. Parsed and clamped by askOutputTokenLimit. */
+  ASK_MAX_OUTPUT_TOKENS?: string;
   /** Bootstrap secret for issuing agent keys / creating users. Set via `wrangler secret put ADMIN_TOKEN`. */
   ADMIN_TOKEN?: string;
   /** Optional shared secret for GitHub webhook signature verification. */
