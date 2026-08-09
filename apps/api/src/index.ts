@@ -19,7 +19,7 @@ import { verifyUploadToken, resolveUploadSecret, signIngestToken, verifyIngestTo
 import { USER_PROJECT_WHERE, taskWireStatus, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
 import { advertisedWorkflowNames } from './lib/workflows';
 import type { Actor, RunView } from './do/ProjectRoom';
-import { SKILL_MD } from './skill';
+import { SKILL_MD, SKILL_REFERENCES, SKILL_MD_SURFACE } from './skill';
 import { DOC_SKILL_MD } from './skill-docs';
 import pkg from '../package.json';
 import { issueTokens, metadataRoutes, oauth } from './oauth';
@@ -217,8 +217,15 @@ app.all('/mcp', agentAuth, async (c) => {
 });
 
 // --- agent skill (served by Noriq itself; ROADMAP Phase 5) -------------------
+// PLNR-310: SKILL_MD is the core entry point; SKILL_REFERENCES are the on-demand references
+// split out of it (file locks, planning, memory), each served the same way as the pre-existing
+// doc-authoring guide below. Route paths are named from SKILL_REFERENCES' own keys so a new
+// reference only needs adding to that map, never a second route list to keep in sync.
 app.get('/skill.md', (c) => c.text(SKILL_MD, 200, { 'Content-Type': 'text/markdown; charset=utf-8' }));
 app.get('/skill/docs.md', (c) => c.text(DOC_SKILL_MD, 200, { 'Content-Type': 'text/markdown; charset=utf-8' }));
+for (const [slug, text] of Object.entries(SKILL_REFERENCES)) {
+  app.get(`/skill/${slug}.md`, (c) => c.text(text, 200, { 'Content-Type': 'text/markdown; charset=utf-8' }));
+}
 
 // --- MCP tool reference, generated from the zod schemas (PLNR-23) --------------
 app.get('/reference.md', (c) =>
@@ -1452,12 +1459,16 @@ app.post('/api/projects/:pid/memory/items/:id/correct', userAuth, async (c) => {
 // mcp.ts/skill.ts/skill-docs.ts (see ProjectMemory.recordGuidanceDriftScan's own comment).
 // Recommendations are DATA: nothing here (or anywhere in this task) writes to a guidance file,
 // opens a PR, or edits a doc/task.
+// PLNR-310: skill_md uses SKILL_MD_SURFACE (core + every split-out reference), not bare
+// SKILL_MD — the scanner's rules must keep resolving prose that now lives in a reference file
+// (skill.ts's module comment explains why; test/memory-guidance-drift.test.ts's liveSurfaces()
+// builds this the identical way).
 app.post('/api/admin/memory-guidance-drift/:projectId/scan', adminAuth, async (c) => {
   const projectId = c.req.param('projectId')!;
   const surfaces = {
     instructions: INSTRUCTIONS,
     playbook: GET_BRIEFING_PLAYBOOK.join('\n\n'),
-    skill_md: SKILL_MD,
+    skill_md: SKILL_MD_SURFACE,
     doc_skill_md: DOC_SKILL_MD,
   };
   return c.json(await memoryStub(c.env, projectId).recordGuidanceDriftScan(projectId, surfaces));

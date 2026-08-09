@@ -27,6 +27,9 @@ import { refuseSpecWrite, specWriteRefusalMessage } from './lib/spec-authority';
 import { search, searchBackend, reindexProject } from './search';
 import { nearDupeGroups } from './lib/tags';
 import { DOC_SKILL_MD } from './skill-docs';
+import { LOCKING_SKILL_MD } from './skill-locking';
+import { PLANNING_SKILL_MD } from './skill-planning';
+import { MEMORY_SKILL_MD } from './skill-memory';
 import { signUploadToken, resolveUploadSecret } from './lib/upload-token';
 import { taskClaimability } from './lib/claimability';
 import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
@@ -2361,17 +2364,58 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
   );
 
   // The doc-authoring skill (PLNR-190) as a static resource, for clients that browse
-  // resources; get_doc_guide is the reliable path (every MCP client can call tools).
+  // resources; GET /skill/docs.md is the other reliable path (every MCP client can fetch a
+  // URL). PLNR-309: get_doc_guide is NOT a registered tool despite being named in older
+  // comments/docs elsewhere — do not point at it here.
   resourceSpecs.push({
     name: 'doc-authoring-skill',
     uriTemplate: 'noriq://skill/doc-authoring',
-    description: 'The doc-authoring guide — how to write project docs that last (also via get_doc_guide or GET /skill/docs.md)',
+    description: 'The doc-authoring guide — how to write project docs that last (also GET /skill/docs.md)',
   });
   server.registerResource(
     'doc-authoring-skill',
     'noriq://skill/doc-authoring',
     { title: 'Doc-authoring guide', description: 'How to write Noriq project docs that last', mimeType: 'text/markdown' },
     async (uri) => ({ contents: [{ uri: uri.href, mimeType: 'text/markdown', text: DOC_SKILL_MD }] }),
+  );
+
+  // PLNR-310: the three references split out of SKILL_MD, as static resources — the same
+  // precedent as doc-authoring-skill above (each is also served at GET /skill/<slug>.md,
+  // see index.ts).
+  resourceSpecs.push({
+    name: 'file-locks-skill',
+    uriTemplate: 'noriq://skill/file-locks',
+    description: 'The file-locking protocol — acquire/release, scope, conflict handling (also GET /skill/file-locks.md)',
+  });
+  server.registerResource(
+    'file-locks-skill',
+    'noriq://skill/file-locks',
+    { title: 'File-locking reference', description: 'The file-locking protocol for a project with fileLocking on', mimeType: 'text/markdown' },
+    async (uri) => ({ contents: [{ uri: uri.href, mimeType: 'text/markdown', text: LOCKING_SKILL_MD }] }),
+  );
+
+  resourceSpecs.push({
+    name: 'planning-skill',
+    uriTemplate: 'noriq://skill/planning',
+    description: 'Planning and execution-spec reference — create_plan, phase gating, writing/reading an executionSpec (also GET /skill/planning.md)',
+  });
+  server.registerResource(
+    'planning-skill',
+    'noriq://skill/planning',
+    { title: 'Planning reference', description: 'How to write a Noriq plan and a task executionSpec', mimeType: 'text/markdown' },
+    async (uri) => ({ contents: [{ uri: uri.href, mimeType: 'text/markdown', text: PLANNING_SKILL_MD }] }),
+  );
+
+  resourceSpecs.push({
+    name: 'memory-skill',
+    uriTemplate: 'noriq://skill/memory',
+    description: 'Project-memory reference — record_memory, search_project_memory, get_task_context, explain_project_area (also GET /skill/memory.md)',
+  });
+  server.registerResource(
+    'memory-skill',
+    'noriq://skill/memory',
+    { title: 'Project-memory reference', description: 'How to record and search Noriq project memory', mimeType: 'text/markdown' },
+    async (uri) => ({ contents: [{ uri: uri.href, mimeType: 'text/markdown', text: MEMORY_SKILL_MD }] }),
   );
 
   // Expose the captured specs so the reference doc can be generated from them.

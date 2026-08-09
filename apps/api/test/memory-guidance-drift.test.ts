@@ -15,7 +15,7 @@ import type { Env } from '../src/env';
 import { createUser, mintTokenForUser, mcpCall, ADMIN } from './helpers';
 import { GUIDANCE_RULES, detectRules, compareSurfaces, findingHash, SURFACE_IDS, type SurfaceId, type DriftFinding } from '../src/memory/guidance-drift';
 import { INSTRUCTIONS, GET_BRIEFING_PLAYBOOK } from '../src/mcp';
-import { SKILL_MD } from '../src/skill';
+import { SKILL_MD_SURFACE } from '../src/skill';
 import { DOC_SKILL_MD } from '../src/skill-docs';
 
 const appEnv = env as unknown as Env;
@@ -44,11 +44,15 @@ async function newOwnedProject(email: string, key: string) {
 
 // The four REAL, LIVE surfaces this task's own locked decisions name — exactly what the admin
 // REST route (index.ts) gathers. The playbook is joined the same way the route joins it.
+// PLNR-310: skill_md is SKILL_MD_SURFACE (core + every split-out reference: file locks,
+// planning, memory) — not bare SKILL_MD — so every rule below still resolves against prose
+// that now lives in a reference file instead of the core document. See skill.ts's module
+// comment and index.ts's guidance-drift scan route, which builds this identically.
 function liveSurfaces(): Record<SurfaceId, string> {
   return {
     instructions: INSTRUCTIONS,
     playbook: GET_BRIEFING_PLAYBOOK.join('\n\n'),
-    skill_md: SKILL_MD,
+    skill_md: SKILL_MD_SURFACE,
     doc_skill_md: DOC_SKILL_MD,
   };
 }
