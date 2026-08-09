@@ -33,7 +33,7 @@ interface MemoryItemRecord {
   supersedesMemoryId: string | null;
   recordedByAgentId: string | null;
   recordedAt: string;
-  evidence: Array<{ id: string; repositoryKey: string; branch: string; baseId: string; path: string; symbol: string | null; verificationState: string }>;
+  evidence: Array<{ id: string; repositoryKey: string; branch: string; baseId: string; path: string; symbol: string | null; verificationState: string; evidenceHash: string | null }>;
 }
 interface MemoryRpc {
   health(pid: string): Promise<{ schemaVersion: number; memoryRevision: number; tableCounts: Record<string, number> }>;
@@ -293,5 +293,6 @@ describe('content and evidence hashes are recorded', () => {
     const row = await memory(projectId).getMemoryItem(projectId, result.memoryId);
     expect(row!.contentHash).toBeTruthy();
     expect(row!.contentHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(row!.evidence[0]!.evidenceHash).toBe('ada7e92fefcfc509be8d0ba52d2144c85669be9d3034a4b1735b87cc8fb726f8');
   });
 });

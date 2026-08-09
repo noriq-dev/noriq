@@ -2,8 +2,7 @@
 // evidence hashing, scope-consistency validation, and the actor-authority clamp. Same split as
 // backup.ts/restore.ts/lifecycle.ts: this file never opens `ctx.storage` — only the DO can.
 import { z } from 'zod';
-import { RepositoryKey, BranchRef, BaseId, EvidenceRef, AUTHORITY_SINGLE_OBSERVATION, type EvidenceRef as EvidenceRefT } from '@noriq-dev/shared';
-import { sha256HexBytes } from './backup';
+import { RepositoryKey, BranchRef, BaseId, EvidenceRef, canonicalHash, AUTHORITY_SINGLE_OBSERVATION, type EvidenceRef as EvidenceRefT } from '@noriq-dev/shared';
 
 /** A memory's own repository/branch/baseId scope (§6, §16) — validated with the SAME shared
  *  primitives evidence citations use, never a re-derived rule. All optional: a project-wide
@@ -87,30 +86,12 @@ export function classifyEvidenceCitation(input: unknown): EvidenceCitation {
   return { source: 'repository', ref: validateEvidenceRef(input) };
 }
 
-async function canonicalHash(value: unknown): Promise<string> {
-  const bytes = new TextEncoder().encode(JSON.stringify(value));
-  return sha256HexBytes(bytes);
-}
-
 /** sha256 over a canonical serialization of what makes a memory's recorded content distinct —
  *  kind, statement, and scope. Two independently-recorded memories with identical content hash
  *  identically; nothing in this task's write path acts on that fact yet (retrieval, Phase 4, is
  *  what will), but the column exists from the first write onward. */
 export function memoryContentHash(kind: string, statement: string, scope: MemoryScope): Promise<string> {
   return canonicalHash({ kind, statement, scope });
-}
-
-/** sha256 over a canonical serialization of one evidence citation's identity (repository,
- *  branch, baseId, path, symbol) — deliberately excludes `contentHash`/`verificationState`,
- *  which describe the CITED artifact's freshness, not the citation's own identity. */
-export function evidenceHash(ref: EvidenceRefT): Promise<string> {
-  return canonicalHash({
-    repositoryKey: ref.repositoryKey,
-    branch: ref.branch,
-    baseId: ref.baseId,
-    path: ref.path,
-    symbol: ref.symbol,
-  });
 }
 
 /** Authority is clamped SERVER-SIDE by actor, never trusted from the caller (§12): an 'agent'

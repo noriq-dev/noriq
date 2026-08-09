@@ -95,6 +95,30 @@ export const EvidenceRef = z.object({
 });
 export type EvidenceRef = z.infer<typeof EvidenceRef>;
 
+/** SHA-256 over JSON.stringify's exact UTF-8 bytes. Property insertion order is therefore part
+ *  of this wire contract: callers that must reproduce an identity hash should use the shared
+ *  higher-level helper rather than reconstructing its object locally. */
+export async function canonicalHash(value: unknown): Promise<string> {
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  const digest = await crypto.subtle.digest('SHA-256', bytes as Uint8Array<ArrayBuffer>);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+export type EvidenceIdentity = Pick<EvidenceRef, 'repositoryKey' | 'branch' | 'baseId' | 'path' | 'symbol'>;
+
+/** Stable citation identity shared byte-for-byte by the server and Runner verification tier.
+ *  Freshness fields are deliberately excluded: they describe the cited artifact, not the
+ *  identity of the citation itself. */
+export function evidenceHash(ref: EvidenceIdentity): Promise<string> {
+  return canonicalHash({
+    repositoryKey: ref.repositoryKey,
+    branch: ref.branch,
+    baseId: ref.baseId,
+    path: ref.path,
+    symbol: ref.symbol,
+  });
+}
+
 /**
  * The five-level authority scale (§12). Higher is stronger; promotion between
  * levels is PLNR-253/266's job, not this schema's — this only fixes the wire

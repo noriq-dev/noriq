@@ -4,7 +4,7 @@ import { newId, nowIso } from '../lib/util';
 import {
   buildEntityUri, parseEntityUri, AUTHORITY_HYPOTHESIS, AUTHORITY_HUMAN_APPROVED, AUTHORITY_VERIFIED_MERGED,
   EffortEpisode, EpisodeSelfSummary, type EffortEpisode as EffortEpisodeData,
-  type EpisodeLandingOutcome, type MemoryBackupManifest,
+  evidenceHash, type EpisodeLandingOutcome, type MemoryBackupManifest,
 } from '@noriq-dev/shared';
 import { projectCoordinationEvents, type ProjectedEvent } from '../lib/memory-projector';
 import { exportMemorySnapshot, sha256HexBytes } from '../memory/backup';
@@ -12,7 +12,7 @@ import { fetchManifest, readSnapshotChunks, checkManifestHeader } from '../memor
 import { deleteAllProjectBackups, sizeStatus, type EraseReport, type EraseStepResult } from '../memory/lifecycle';
 import { MEMORY_MIGRATIONS } from '../memory/migrations';
 import {
-  validateMemoryScope, classifyEvidenceCitation, memoryContentHash, evidenceHash, clampAuthority,
+  validateMemoryScope, classifyEvidenceCitation, memoryContentHash, clampAuthority,
   type MemoryScope, type EvidenceCitation,
 } from '../memory/writes';
 import { searchBackend, indexEntity, removeEntity, clampMetadataTopK } from '../search';
@@ -2938,7 +2938,7 @@ export class ProjectMemory extends DurableObject<Env> {
     evidence: Array<{
       id: string; repositoryKey: string; branch: string; baseId: string; path: string; symbol: string | null;
       verificationState: string;
-      // The citation's stable identity (writes.ts's evidenceHash — repository/branch/baseId/
+      // The citation's stable identity (shared evidenceHash — repository/branch/baseId/
       // path/symbol) — PLNR-265's Runner verification report addresses a citation by
       // (memoryItemId, evidenceHash), never this row's internal `id`, so exposing it here is
       // what lets a human (or a future Runner integration) build a report without recomputing

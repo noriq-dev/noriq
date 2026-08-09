@@ -414,6 +414,15 @@ describe('staged index row shared contract (PLNR-313)', () => {
   });
 });
 
+describe('shared evidence identity hash (PLNR-348)', () => {
+  it('pins the exact Runner/server byte contract', async () => {
+    const { evidenceHash } = await import('@noriq-dev/shared');
+    await expect(evidenceHash({
+      repositoryKey: 'repo-x', branch: 'main', baseId: 'base1', path: 'README.md', symbol: null,
+    })).resolves.toBe('ada7e92fefcfc509be8d0ba52d2144c85669be9d3034a4b1735b87cc8fb726f8');
+  });
+});
+
 describe('MemoryNode — rejects malformed and cross-project URIs (§5, §18)', () => {
   it('accepts a node whose uri belongs to its own project', () => {
     const node = MemoryNode.parse({
