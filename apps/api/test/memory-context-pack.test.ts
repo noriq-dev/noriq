@@ -23,6 +23,7 @@ interface MemRpc {
     report: { citations: Array<{ memoryItemId: string; evidenceHash: string; state: string; baseId: string; branch: string }>; source: string },
     actor: { kind: string; id: string | null },
   ): Promise<{ applied: number; skipped: number; touchedMemoryIds: string[] }>;
+  reconcile(pid: string): Promise<{ delivered: number; failed: number; applied: number; cursor: number }>;
 }
 const memory = (pid: string) => appEnv.PROJECT_MEMORY.get(appEnv.PROJECT_MEMORY.idFromName(pid)) as unknown as MemRpc;
 
@@ -35,7 +36,12 @@ let agent: { id: string; apiKey: string };
 async function newProject(key: string): Promise<string> {
   const r = await mcpCall(agent.apiKey, 'create_project', { key, name: `${key} project` });
   if (r.isError) throw new Error(`create_project(${key}) failed: ${r.text}`);
-  return r.body.id as string;
+  const projectId = r.body.id as string;
+  // PLNR-419: settle create_project's own coordination events (the seeded "Backlog" milestone)
+  // deterministically now, rather than leaving them for some later, unpredictably-timed alarm to
+  // consume — see memory-lifecycle.test.ts's newOwnedProject for the full explanation.
+  await memory(projectId).reconcile(projectId);
+  return projectId;
 }
 
 beforeAll(async () => {
@@ -321,6 +327,11 @@ describe('assembleContextPack — no-Vectorize degradation and read-only', () =>
       evidence: [{ repositoryKey: 'repo-x', branch: 'main', baseId: 'sha-ro', path: 'a.ts' }],
     });
 
+    // PLNR-419: settle the task.created event (and anything else pending) deterministically
+    // before establishing the read-only boundary — otherwise a later alarm-driven runProjector
+    // pass could legitimately land between `before` and `after` and perturb tableCounts, which
+    // would misreport assembleContextPack itself as non-read-only.
+    await memory(projectId).reconcile(projectId);
     const before = await memory(projectId).health(projectId);
     await assembleContextPack(appEnv, projectId, made.body.id as string, { baseId: 'sha-ro', branch: 'main' });
     await assembleContextPack(appEnv, projectId, made.body.id as string, { tokenBudget: 1 });

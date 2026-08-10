@@ -72,6 +72,7 @@ interface MemRpc {
   }>;
   projectActiveGeneration(pid: string, generationId: string): Promise<{ nodesWritten: number; edgesWritten: number; entitiesSkipped: number; edgesSkipped: number; retired: number; coChangeEdges: number }>;
   runProjector(pid: string): Promise<{ applied: number; cursor: number }>;
+  reconcile(pid: string): Promise<{ delivered: number; failed: number; applied: number; cursor: number }>;
   dependencyNeighborhood(pid: string, input: { entityUri: string; edgeTypes?: string[]; maxDepth?: number; maxResults?: number }): Promise<DependencyResult>;
   health(pid: string): Promise<{ tableCounts: Record<string, number> }>;
   _countNodes(pid: string): Promise<number>;
@@ -113,7 +114,18 @@ async function newOwnedProject(email: string, key: string) {
   const token = await mintTokenForUser(email);
   const proj = await mcpCall(token, 'create_project', { key, name: `${key} project` });
   if (proj.isError) throw new Error(`create_project(${key}) failed: ${proj.text}`);
-  return { userId: user.id, token, projectId: proj.body.id as string };
+  const projectId = proj.body.id as string;
+  // PLNR-419: create_project's own createMilestone/createBoard calls append D1 coordination
+  // events (the seeded "Backlog" milestone) that nothing has consumed yet. Left alone, they sit
+  // there until SOME alarm-driven runProjector call eventually consumes them at a genuinely
+  // unpredictable point (verified against the real workerd runtime: an armed setAlarm fires
+  // whenever wall-clock time allows, independent of any caller) — on a loaded CI runner that can
+  // land squarely inside a test's own before/after graph-state assertions. Settling it here,
+  // deterministically, means every later runProjector pass for this project finds nothing left
+  // to consume and is a true no-op, so it can no longer perturb a test's assumptions about what
+  // mutated the graph and when. Matches memory-lifecycle.test.ts's own newOwnedProject.
+  await memory(projectId).reconcile(projectId);
+  return { userId: user.id, token, projectId };
 }
 
 const baseManifest = (over: Partial<IndexManifestInput> & Pick<IndexManifestInput, 'generationId' | 'projectId' | 'repositoryKey'>): IndexManifestInput => ({
@@ -1680,6 +1692,17 @@ describe('PLNR-320: projection drift is reported, never auto-repaired', () => {
 
     expect((await memory(projectId).projectionDrift(projectId)).ownership).toEqual({ expected: 1, missing: 1, unexpected: 0 });
     await memory(projectId).rebuildProjection(projectId);
+    // PLNR-419: rebuildProjection schedules its own alarm but deliberately never advances
+    // projector_cursor, leaving `task.created`/`task.claimed` unconsumed by the incremental
+    // path. Left alone, that pending alarm fires at a genuinely unpredictable point and can
+    // replay those events — via runProjector, independently of this test's own script — landing
+    // an `owned_by` edge with 'event:task.claimed' provenance at any point hereafter and
+    // clobbering this test's own before/after assertions. Reconciling immediately after each
+    // rebuild settles the cursor deterministically right here: `rebuildProjection` already wrote
+    // the edge, so the incremental replay is a same-triple no-op (ON CONFLICT DO NOTHING keeps
+    // the 'coordination:task_claims' provenance), and it makes the alarm rebuildProjection just
+    // scheduled a guaranteed no-op whenever it does eventually fire.
+    await memory(projectId).reconcile(projectId);
     const taskUri = buildEntityUri({ kind: 'task', id: taskId });
     const agentUri = buildEntityUri({ kind: 'agent', id: agentId! });
     expect(await memory(projectId)._edgeProvenance(projectId, 'owned_by', taskUri, agentUri)).toBe('coordination:task_claims');
@@ -1689,6 +1712,7 @@ describe('PLNR-320: projection drift is reported, never auto-repaired', () => {
     ).bind(taskId).run();
     expect((await memory(projectId).projectionDrift(projectId)).ownership).toEqual({ expected: 0, missing: 0, unexpected: 1 });
     await memory(projectId).rebuildProjection(projectId);
+    await memory(projectId).reconcile(projectId);
     expect(await memory(projectId)._edgeProvenance(projectId, 'owned_by', taskUri, agentUri)).toBeNull();
   });
 

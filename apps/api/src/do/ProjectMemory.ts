@@ -3049,6 +3049,22 @@ export class ProjectMemory extends DurableObject<Env> {
   }
 
   /**
+   * PLNR-419: bumped every time `erase()` runs, and checked by any background writer whose own
+   * work spans an `await` (currently `runProjector`/`rebuildProjection`) BEFORE that writer
+   * commits. The hazard: both read D1 asynchronously and only afterward write via
+   * `transactionSync` — if `erase()` interleaves inside that gap (reads the old cursor/state,
+   * awaits, `erase()` runs and resets everything to a clean zero state, THEN the write lands),
+   * the write resurrects rows into a store that just promised to be empty, and can even smuggle
+   * `projector_cursor` back off zero. In-memory only, deliberately not persisted: it only needs
+   * to fence overlapping async calls within ONE live instance — a call that was still in flight
+   * when the instance itself was evicted dies with it, so there is nothing to protect across a
+   * restart. A writer that starts (and captures this) AFTER `erase()` returns is not fenced —
+   * that is ordinary, intended eventual re-derivation from the still-present D1 coordination log,
+   * not the race this guards against.
+   */
+  private eraseGeneration = 0;
+
+  /**
    * Best-effort wipe of every row (PLNR-246), called fire-and-forget from
    * ProjectRoom.deleteProject once the D1 registry rows are already gone. Full
    * retention/quota/disaster-recovery policy is PLNR-250's — this is the
@@ -3060,6 +3076,12 @@ export class ProjectMemory extends DurableObject<Env> {
    */
   async erase(projectId: string): Promise<{ ok: true }> {
     await this.assertProjectId(projectId);
+    // Bump BEFORE the transaction (PLNR-419): any runProjector/rebuildProjection pass that read
+    // its pre-erase snapshot earlier and is still awaiting D1 must see a generation mismatch the
+    // moment it wakes up, even if it wakes up mid-transaction-equivalent (transactionSync itself
+    // can't be interrupted, but the bump has to be visible no later than the earliest instant the
+    // erase becomes observable).
+    this.eraseGeneration++;
     this.ctx.storage.transactionSync(() => {
       this.clearAnalyticsDerived();
       for (const table of [...SCHEMA_TABLES].reverse()) {
@@ -6184,15 +6206,70 @@ export class ProjectMemory extends DurableObject<Env> {
   }
 
   /**
+   * PLNR-419: a real, deterministic hand-off point for testing the erase/projector race — NOT a
+   * mocked epoch, the actual `await` gap `runProjector` spans in production. When armed, the
+   * NEXT `runProjector` call parks itself (resolving `parked`, so a test knows it has genuinely
+   * finished its D1 fetch and captured its pre-erase generation/cursor) immediately after that
+   * fetch and before it re-checks `eraseGeneration` or writes anything, until released. Mirrors
+   * the existing `_force*Failure` test-injection points (e.g. `_setForceEraseFailure` above) —
+   * the underlying race is exactly as "not reproducible on demand" as those failures are.
+   */
+  private _testProjectorGate: { parkedPromise: Promise<void>; markParked: () => void; release: Promise<void>; resolveRelease: () => void } | null = null;
+
+  /** Test-only: arm the gate described above for the NEXT `runProjector` call on this instance. */
+  async _armProjectorGateForTest(projectId: string): Promise<void> {
+    await this.assertProjectId(projectId);
+    let markParked!: () => void;
+    const parkedPromise = new Promise<void>((resolve) => { markParked = resolve; });
+    let resolveRelease!: () => void;
+    const release = new Promise<void>((resolve) => { resolveRelease = resolve; });
+    this._testProjectorGate = { parkedPromise, markParked, release, resolveRelease };
+  }
+
+  /** Test-only: resolves once the armed `runProjector` call has actually parked at the gate —
+   *  proof the race window is genuinely open, not merely assumed from call order. */
+  async _waitForProjectorParkForTest(projectId: string): Promise<void> {
+    await this.assertProjectId(projectId);
+    if (this._testProjectorGate) await this._testProjectorGate.parkedPromise;
+  }
+
+  /** Test-only: let the parked `runProjector` call proceed to its (post-erase-check) write. */
+  async _releaseProjectorGateForTest(projectId: string): Promise<void> {
+    await this.assertProjectId(projectId);
+    this._testProjectorGate?.resolveRelease();
+    this._testProjectorGate = null;
+  }
+
+  /**
    * Project this project's D1 coordination events past the durable `global_seq` cursor into
    * the graph, one event at a time — each projection write and its cursor advance commit in
    * ONE SQLite transaction, so a crash between them is impossible by construction, and
    * re-running over an already-consumed range applies nothing new (the cursor predicate and
    * the projection's own idempotent write both guarantee it).
+   *
+   * PLNR-419: the D1 fetch below is the vulnerable gap — everything it returns describes state
+   * as of BEFORE the fetch, but the write happens AFTER it, with no lock held in between. If
+   * `erase()` runs during that gap, it establishes a new clean-zero generation that this stale
+   * batch knows nothing about; writing it anyway would resurrect rows an erase just promised
+   * were gone (and could even smuggle `projector_cursor` back off the zero erase() just set).
+   * The fix is a fence, not a lock: capture the generation before the await, and if it no longer
+   * matches afterward, the whole batch is discarded rather than applied — the next call (whether
+   * from an alarm or an explicit `reconcile`) re-derives from the POST-erase cursor instead,
+   * which is ordinary, intended eventual consistency, not a resurrection.
    */
   async runProjector(projectId: string): Promise<{ applied: number; cursor: number }> {
     await this.assertProjectId(projectId);
+    const generationAtStart = this.eraseGeneration;
     const events = await projectCoordinationEvents(this.env, projectId, this.readProjectorCursor());
+    const gate = this._testProjectorGate;
+    if (gate) {
+      gate.markParked();
+      await gate.release;
+    }
+    if (this.eraseGeneration !== generationAtStart) {
+      // An erase() ran while this fetch was in flight — its zeroed cursor/store must win.
+      return { applied: 0, cursor: this.readProjectorCursor() };
+    }
     for (const ev of events) {
       this.ctx.storage.transactionSync(() => {
         this.applyCoordinationEvent(ev);
@@ -6392,10 +6469,19 @@ export class ProjectMemory extends DurableObject<Env> {
    */
   async rebuildProjection(projectId: string): Promise<{ nodesWritten: number; edgesWritten: number }> {
     await this.assertProjectId(projectId);
+    // PLNR-419: same fence as runProjector — this reads D1 (twice, across two awaits) before it
+    // ever writes. Reachable outside `backfillProjectionOnce`'s blockConcurrencyWhile (the
+    // `/memory/graph/rebuild` REST route calls it directly), so an erase() mid-flight here is a
+    // real, not merely theoretical, path to the same resurrection.
+    const generationAtStart = this.eraseGeneration;
     const now = nowIso();
     const state = await this.loadCoordinationRelationships(projectId);
     const hasStoredEvidence = this.ctx.storage.sql.exec<{ one: number }>(`SELECT 1 AS one FROM evidence LIMIT 1`).toArray().length > 0;
     const graphProjectKey = hasStoredEvidence ? await this.resolveProjectKey(projectId) : null;
+    if (this.eraseGeneration !== generationAtStart) {
+      // An erase() ran while this read was in flight — discard rather than resurrect.
+      return { nodesWritten: 0, edgesWritten: 0 };
+    }
     const { tasks, plans, docs, milestones, agents, runs } = state;
     const expectedEdges = this.expectedProjectionEdges(state);
 
