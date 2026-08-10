@@ -28,6 +28,7 @@ import {
 import type { AppStore } from '../store';
 import { MonoTag, SectionLabel } from './bits';
 import { Button, Select, TextInput } from './ui';
+import { TaskSearchSelect } from './TaskSearchSelect';
 
 // Mirrors apps/api/src/memory/retrieval.ts's RETRIEVAL_DEFAULTS. That file is server-only (not
 // re-exported through @noriq-dev/shared, which is the only cross-workspace import surface this
@@ -331,10 +332,19 @@ export function MemoryGraph({ pid, store, initialSeedUri }: { pid: string; store
     <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
       <div style={{ flex: 'none', padding: '12px 16px', borderBottom: '1px solid var(--line)', display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
         <SectionLabel>Seed</SectionLabel>
-        <Select aria-label="Task seed" value={taskPick} onChange={(e) => { setTaskPick(e.target.value); if (e.target.value) goToSeed(buildEntityUri({ kind: 'task', id: e.target.value })); }} style={{ maxWidth: 220 }}>
-          <option value="">pick a task…</option>
-          {tasks.map((t) => <option key={t.id} value={t.id}>{t.key} — {t.title.slice(0, 40)}</option>)}
-        </Select>
+        <div style={{ flex: '0 1 260px', minWidth: 200 }}>
+          <TaskSearchSelect
+            projectId={pid}
+            value={taskPick}
+            onChange={(taskId) => {
+              setTaskPick(taskId);
+              if (taskId) goToSeed(buildEntityUri({ kind: 'task', id: taskId }));
+            }}
+            initialTasks={tasks}
+            label="Task seed"
+            placeholder="Search for a task seed…"
+          />
+        </div>
         <TextInput
           placeholder="or paste an entity URI — e.g. noriq://task/…"
           value={seedInput}

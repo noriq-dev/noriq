@@ -26,6 +26,7 @@ import { MemoryReview } from './MemoryReview';
 import { MemoryStarMap } from './MemoryStarMap';
 import { MemoryConstellationV2 } from './MemoryConstellationV2';
 import { Button, Select, TextArea, TextInput } from './ui';
+import { TaskSearchSelect } from './TaskSearchSelect';
 
 type MemorySubTab = 'map' | 'review' | 'explore' | 'graph' | 'operations';
 
@@ -411,10 +412,14 @@ function ExploreTab({ pid, store, initialSelectionUri, onOpenEgoNetwork }: {
                 {repositories.map((r) => <option key={r.id} value={r.repositoryKey}>{r.repositoryKey}</option>)}
               </Select>
               <TextInput placeholder="branch (exact match)" value={branch} onChange={(e) => setBranch(e.target.value)} />
-              <Select value={taskId} onChange={(e) => setTaskId(e.target.value)} title="expand the graph from this task">
-                <option value="">no task focus</option>
-                {tasks.map((t) => <option key={t.id} value={t.id}>{t.key} — {t.title.slice(0, 40)}</option>)}
-              </Select>
+              <TaskSearchSelect
+                projectId={pid}
+                value={taskId}
+                onChange={setTaskId}
+                initialTasks={tasks}
+                label="Memory task focus"
+                placeholder="Search for a task focus…"
+              />
             </div>
           )}
         </div>

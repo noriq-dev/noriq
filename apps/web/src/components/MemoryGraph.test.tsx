@@ -40,8 +40,13 @@ const text = () => container.textContent ?? '';
 const tick = (ms = 0) => act(async () => { await new Promise((r) => setTimeout(r, ms)); });
 
 const setTaskSeed = (value: string) => {
-  act(() => container.querySelector<HTMLButtonElement>('button[aria-label="Task seed"]')!.click());
+  act(() => container.querySelector<HTMLInputElement>('input[aria-label="Task seed"]')!.focus());
   act(() => container.querySelector<HTMLElement>(`[role="option"][data-value="${value}"]`)!.click());
+};
+
+const setInputValue = (input: HTMLInputElement, value: string) => {
+  Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, value);
+  input.dispatchEvent(new Event('input', { bubbles: true }));
 };
 
 const findButton = (label: string) => [...container.querySelectorAll('button')].find((b) => b.textContent === label);
@@ -62,6 +67,31 @@ describe('the no-whole-project-load guarantee', () => {
     expect(dep).not.toHaveBeenCalled();
     expect(tests).not.toHaveBeenCalled();
     expect(impact).not.toHaveBeenCalled();
+  });
+
+  it('finds and loads a task seed even when the bounded memory UI state contains no tasks', async () => {
+    const task = {
+      ...TASK, status: 'todo', priority: 1, type: 'feature', projectId: 'prj_1', projectKey: 'PLNR',
+      boardId: null, updatedAt: '2026-08-10T00:00:00.000Z',
+    };
+    const search = vi.spyOn(api, 'searchTasks').mockResolvedValue({ tasks: [task], matched: 1, returned: 1 });
+    const dep = vi.spyOn(api, 'memoryDependencyNeighborhood').mockResolvedValue({
+      seed: { nodeId: 'node_1', uri: TASK_URI, type: 'task', label: TASK.title },
+      upstream: [], downstream: [], coverage: { complete: true, reasons: [] },
+    });
+    mount(fakeStore([]));
+
+    const input = container.querySelector<HTMLInputElement>('input[aria-label="Task seed"]')!;
+    act(() => input.focus());
+    act(() => setInputValue(input, 'PLNR-1'));
+    await tick(220);
+    expect(search).toHaveBeenCalledWith(
+      { projectId: 'prj_1', boardId: null, text: 'PLNR-1', limit: 25 },
+      expect.any(AbortSignal),
+    );
+    act(() => container.querySelector<HTMLElement>('[role="option"]')!.click());
+    await tick(250);
+    expect(dep).toHaveBeenCalledWith('prj_1', expect.objectContaining({ entityUri: TASK_URI }), expect.any(AbortSignal));
   });
 });
 

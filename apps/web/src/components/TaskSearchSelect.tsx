@@ -199,6 +199,7 @@ export function TaskSearchSelect({
               key={task.id}
               id={`${listId}-${index}`}
               role="option"
+              data-value={task.id}
               aria-selected={task.id === value}
               onPointerEnter={() => setActive(index)}
               onClick={() => choose(task)}
