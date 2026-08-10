@@ -21,6 +21,11 @@ import { ensureRunExecution, mirrorRunTransition } from '../lib/orchestration-st
 import {
   captureRunCommissioningSnapshot, recordRunSittingExecutedConfiguration, recordRunSittingExecutedSpec,
 } from '../lib/run-sitting-intelligence';
+import {
+  observeSimilarEffortCases as persistSimilarEffortOccurrences,
+  recordSimilarityFeedback as persistSimilarityFeedback,
+  type ObserveSimilarEffortInput, type OccurrenceCase, type RecordSimilarityFeedbackInput,
+} from '../memory/similarity-feedback';
 import type { ExecutionAssignment } from '@noriq-dev/shared';
 
 /**
@@ -597,6 +602,32 @@ export class ProjectRoom extends DurableObject<Env> {
         observedAt: input.observedAt ?? existing?.observedAt ?? nowIso(),
         provenance: input.provenance ?? {},
       });
+    });
+  }
+
+  /** Canonical D1 writer for retrieval occurrences. These high-volume calibration rows do not
+   * enter the coordination event feed, but they still pass through the project's sole writer so
+   * observation and feedback cannot race project deletion or one another. */
+  async observeSimilarEffortCases(
+    projectId: string,
+    input: ObserveSimilarEffortInput,
+  ): Promise<OccurrenceCase[]> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      return persistSimilarEffortOccurrences(this.env, this.projectId, input);
+    });
+  }
+
+  /** Append-only retrieval relevance judgment. This is intentionally a different RPC from
+   * ProjectMemory.recordFeedback: it cannot alter memory authority, validity, or ranking. */
+  async recordSimilarityFeedback(
+    projectId: string,
+    actor: Actor,
+    input: RecordSimilarityFeedbackInput,
+  ): Promise<{ feedbackId: string; operationKey: string; deduped: boolean; supersedesFeedbackId: string | null }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      return persistSimilarityFeedback(this.env, this.projectId, actor.id, input);
     });
   }
 
@@ -3462,6 +3493,8 @@ export class ProjectRoom extends DurableObject<Env> {
       // project-scoped and orphaned along with everything else once `projects` loses the row.
       // Emitting into a feed that is being deleted in the same batch would be a write to nothing.
       await this.env.DB.batch([
+        this.env.DB.prepare('DELETE FROM similar_effort_feedback WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare('DELETE FROM similar_effort_occurrences WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM project_quality_events WHERE project_id = ?').bind(pid),
         this.env.DB.prepare(`DELETE FROM phase_tasks WHERE task_id IN (${tasksSub}) OR phase_id IN (SELECT id FROM phases WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ?))`).bind(pid, pid),
         this.env.DB.prepare(`DELETE FROM dependencies WHERE task_id IN (${tasksSub}) OR depends_on_task_id IN (${tasksSub})`).bind(pid, pid),

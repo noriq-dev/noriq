@@ -50,6 +50,11 @@ import { renderEvidenceFrame, type EvidenceFrameItem } from './memory/evidence-f
 import { assembleContextPack } from './memory/context-pack';
 import { assessPreDispatchRisk } from './memory/scope-risk';
 import { assessProjectBottlenecks, BOTTLENECK_TASK_LIMIT } from './memory/bottlenecks';
+import {
+  getSimilarityCalibration,
+  SIMILARITY_JUDGMENTS, SIMILARITY_REASON_CODES, SimilarityFeedbackError,
+  type SimilarityJudgment, type SimilarityReasonCode,
+} from './memory/similarity-feedback';
 import { readBoundedBody, verifyBatchChecksum, decodeBatchRows, MAX_INGEST_BATCH_BYTES, INGEST_TOKEN_TTL_SECONDS } from './memory/ingest';
 import { normalizeVerificationReport } from './memory/verification';
 import { sweepPendingEpisodeJobs } from './memory/episodes';
@@ -1720,7 +1725,66 @@ app.post('/api/projects/:pid/memory/similar-effort', userAuth, async (c) => {
     return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
   }
   if (!result) return c.json({ error: 'project memory unavailable' }, 502);
-  return c.json(result);
+  const cases = await room(c.env, pid).observeSimilarEffortCases(pid, {
+    task,
+    policy: {
+      repositoryKey: body.repositoryKey, branch: body.branch, preferBranch: body.preferBranch,
+      baseId: body.baseId, includeCrossBranch: body.includeCrossBranch,
+      includeStaleEvidence: body.includeStaleEvidence,
+    },
+    pageOffset: result.page.offset,
+    cases: result.cases,
+  });
+  return c.json({ ...result, cases });
+});
+
+// Retrieval relevance is its own append-only ledger. It never calls recordFeedback on a memory,
+// updates an episode, or changes ranking; a later judgment must explicitly supersede the prior.
+app.post('/api/projects/:pid/memory/similar-effort/feedback', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const body: {
+    operationKey?: string; occurrenceId?: string; judgment?: string; reasonCode?: string;
+    reason?: string; supersedesFeedbackId?: string;
+  } = await c.req.json().catch(() => ({}));
+  if (!body.operationKey || !body.occurrenceId || !body.judgment) {
+    return c.json({ error: 'operationKey, occurrenceId, and judgment are required' }, 400);
+  }
+  if (!SIMILARITY_JUDGMENTS.includes(body.judgment as SimilarityJudgment)) {
+    return c.json({ error: 'invalid judgment' }, 400);
+  }
+  if (body.reasonCode && !SIMILARITY_REASON_CODES.includes(body.reasonCode as SimilarityReasonCode)) {
+    return c.json({ error: 'invalid reasonCode' }, 400);
+  }
+  try {
+    return c.json(await room(c.env, pid).recordSimilarityFeedback(pid, humanActor(c), {
+      operationKey: body.operationKey, occurrenceId: body.occurrenceId,
+      judgment: body.judgment as SimilarityJudgment,
+      reasonCode: body.reasonCode as SimilarityReasonCode | undefined,
+      reason: body.reason, supersedesFeedbackId: body.supersedesFeedbackId,
+    }));
+  } catch (error) {
+    if (error instanceof SimilarityFeedbackError) return c.json({ error: error.message }, error.status);
+    throw error;
+  }
+});
+
+app.get('/api/projects/:pid/memory/similar-effort/calibration', userAuth, async (c) => {
+  const numberParam = (name: string): number | undefined => {
+    const raw = c.req.query(name);
+    if (raw == null) return undefined;
+    const value = Number(raw);
+    if (!Number.isFinite(value)) throw new SimilarityFeedbackError(`${name} must be a number`);
+    return value;
+  };
+  try {
+    return c.json(await getSimilarityCalibration(c.env, c.req.param('pid')!, {
+      topK: numberParam('topK'), limit: numberParam('limit'),
+      from: c.req.query('from'), to: c.req.query('to'),
+    }));
+  } catch (error) {
+    if (error instanceof SimilarityFeedbackError) return c.json({ error: error.message }, error.status);
+    throw error;
+  }
 });
 
 // Named graph-query primitives (PLNR-258) — the human-facing twin of explain_project_area;

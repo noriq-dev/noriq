@@ -4227,7 +4227,7 @@ export class ProjectMemory extends DurableObject<Env> {
     },
   ): Promise<{
     warnings: DuplicateWarning[]; cases: PriorEffortCase[]; summary: EffortSummary; consideredCount: number;
-    page: { limit: number; total: number; nextCursor: string | null };
+    page: { limit: number; offset: number; total: number; nextCursor: string | null };
     coverage: { complete: boolean; candidatesConsidered: number; eligibleCases: number; reasons: string[] };
   }> {
     await this.assertProjectId(projectId);
@@ -4290,7 +4290,7 @@ export class ProjectMemory extends DurableObject<Env> {
     const episodeIds = [...provenance.keys()];
     if (!episodeIds.length) return {
       warnings: [], cases: [], summary: summarizeEffort([]), consideredCount: 0,
-      page: { limit: pageLimit, total: 0, nextCursor: null },
+      page: { limit: pageLimit, offset: 0, total: 0, nextCursor: null },
       coverage: { complete: true, candidatesConsidered: 0, eligibleCases: 0, reasons: [] },
     };
 
@@ -4469,7 +4469,7 @@ export class ProjectMemory extends DurableObject<Env> {
     return {
       warnings, cases, summary, consideredCount: eligibleCandidates.length,
       page: {
-        limit: pageLimit, total: allWarnings.length,
+        limit: pageLimit, offset: start, total: allWarnings.length,
         nextCursor: pageEnd < allWarnings.length ? warnings.at(-1)?.episodeId ?? null : null,
       },
       coverage: {

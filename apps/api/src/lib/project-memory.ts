@@ -376,7 +376,7 @@ export type SimilarEffortResult = {
   cases: PriorEffortCase[];
   summary: EffortSummary;
   consideredCount: number;
-  page: { limit: number; total: number; nextCursor: string | null };
+  page: { limit: number; offset: number; total: number; nextCursor: string | null };
   coverage: { complete: boolean; candidatesConsidered: number; eligibleCases: number; reasons: string[] };
 };
 
