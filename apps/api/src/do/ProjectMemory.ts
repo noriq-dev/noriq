@@ -4,6 +4,7 @@ import { newId, nowIso } from '../lib/util';
 import {
   buildEntityUri, parseEntityUri, AUTHORITY_HYPOTHESIS, AUTHORITY_HUMAN_APPROVED, AUTHORITY_VERIFIED_MERGED,
   EffortEpisode, EpisodeSelfSummary, type EffortEpisode as EffortEpisodeData,
+  ProjectIntelligenceEpisode,
   evidenceHash, type EpisodeLandingOutcome, type MemoryBackupManifest,
 } from '@noriq-dev/shared';
 import { projectCoordinationEvents, type ProjectedEvent } from '../lib/memory-projector';
@@ -40,6 +41,10 @@ import {
 } from '../memory/graph-queries';
 import { EpisodeSkeletonUnavailableError, loadEpisodeSkeleton } from '../memory/episodes';
 import type { EpisodeIntelligenceDraft } from '../lib/run-sitting-intelligence';
+import { normalizeAnalyticsEpisode } from '../memory/analytics-normalize';
+import type {
+  AnalyticsExecutionEventSnapshot, AnalyticsExecutionNodeSnapshot, AnalyticsSnapshotRow,
+} from '../memory/analytics';
 import {
   effortSignals, duplicateWarnings, summarizeEffort,
   type TaskEffortInput, type EffortCandidate, type DuplicateWarning, type EffortSummary,
@@ -604,6 +609,16 @@ export class ProjectMemory extends DurableObject<Env> {
     }
   }
 
+  /** Derived analytics never survive a canonical generation switch. They are rebuilt from the
+   * newly active episodes and D1 watermarks; retaining them would make a successful restore
+   * publish read rows from the pre-restore world. Caller owns transaction boundaries. */
+  private clearAnalyticsDerived(): void {
+    this.ctx.storage.sql.exec(`DELETE FROM analytics_rows`);
+    this.ctx.storage.sql.exec(`DELETE FROM analytics_snapshot_rows`);
+    this.ctx.storage.sql.exec(`UPDATE analytics_active_generation SET generation_id = NULL WHERE id = 0`);
+    this.ctx.storage.sql.exec(`DELETE FROM analytics_generations`);
+  }
+
   /**
    * Restore this project's canonical memory from a portable snapshot (PLNR-248's export).
    * Fetches and validates the manifest, imports every chunk into constraint-free staging tables
@@ -656,6 +671,7 @@ export class ProjectMemory extends DurableObject<Env> {
       this.ctx.storage.transactionSync(() => {
         this.snapshotLiveInto('prev_');
         this.replaceLiveContentsFrom('staging_');
+        this.clearAnalyticsDerived();
         this.ctx.storage.sql.exec(
           `INSERT INTO _meta (key, value) VALUES ('has_prior_generation', '1')
            ON CONFLICT (key) DO UPDATE SET value = '1'`,
@@ -693,6 +709,7 @@ export class ProjectMemory extends DurableObject<Env> {
     // generation — that is what makes this single-level rather than a stack).
     this.ctx.storage.transactionSync(() => {
       this.replaceLiveContentsFrom('prev_');
+      this.clearAnalyticsDerived();
       for (const table of ProjectMemory.PARENT_FIRST) this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS prev_${table}`);
       this.ctx.storage.sql.exec(`UPDATE _meta SET value = '0' WHERE key = 'has_prior_generation'`);
     });
@@ -1589,6 +1606,260 @@ export class ProjectMemory extends DurableObject<Env> {
     return { episodeId, runId: input.runId, created, nodesWritten, edgesWritten };
   }
 
+  // -------------------------------------------------------------------------
+  // Project Intelligence derived generations (PLNR-292)
+  // -------------------------------------------------------------------------
+
+  async beginAnalyticsGeneration(projectId: string, input: {
+    extractionVersion: string;
+    d1EventWatermark: number | null;
+    orchestrationWatermark: string | null;
+    force: boolean;
+  }): Promise<{ generationId: string; unchanged: boolean }> {
+    await this.assertProjectId(projectId);
+    const memoryRevision = this.ctx.storage.sql
+      .exec<{ value: number }>(`SELECT value FROM memory_revision WHERE id = 0`).toArray()[0]?.value ?? 0;
+    const active = this.ctx.storage.sql.exec<{
+      id: string; extraction_version: string; source_memory_revision: number;
+      d1_event_watermark: number | null; orchestration_watermark: string | null;
+    }>(
+      `SELECT g.id, g.extraction_version, g.source_memory_revision,
+              g.d1_event_watermark, g.orchestration_watermark
+         FROM analytics_active_generation a JOIN analytics_generations g ON g.id = a.generation_id
+        WHERE a.id = 0 AND g.status = 'complete'`,
+    ).toArray()[0];
+    if (!input.force && active
+      && active.extraction_version === input.extractionVersion
+      && active.source_memory_revision === memoryRevision
+      && active.d1_event_watermark === input.d1EventWatermark
+      && active.orchestration_watermark === input.orchestrationWatermark) {
+      return { generationId: active.id, unchanged: true };
+    }
+    const building = !input.force ? this.ctx.storage.sql.exec<{ id: string }>(
+      `SELECT id FROM analytics_generations
+        WHERE status = 'building' AND extraction_version = ?1 AND source_memory_revision = ?2
+          AND d1_event_watermark IS ?3 AND orchestration_watermark IS ?4
+        ORDER BY created_at DESC LIMIT 1`,
+      input.extractionVersion, memoryRevision, input.d1EventWatermark, input.orchestrationWatermark,
+    ).toArray()[0] : null;
+    if (building) return { generationId: building.id, unchanged: false };
+
+    const generationId = newId('ang');
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+      `INSERT INTO analytics_generations
+         (id, status, extraction_version, base_generation_id, source_memory_revision, d1_event_watermark,
+          orchestration_watermark, completeness, created_at)
+       VALUES (?1, 'building', ?2, ?3, ?4, ?5, ?6, ?7, ?8)`,
+        generationId, input.extractionVersion, input.force ? null : active?.id ?? null,
+        memoryRevision, input.d1EventWatermark, input.orchestrationWatermark,
+        JSON.stringify({ status: 'building', reasons: [] }), nowIso(),
+      );
+      if (!input.force && active) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO analytics_rows
+             (generation_id, episode_id, run_id, sitting, normalized, source_fingerprint, row_checksum)
+           SELECT ?1, episode_id, run_id, sitting, normalized, source_fingerprint, row_checksum
+             FROM analytics_rows WHERE generation_id = ?2`,
+          generationId, active.id,
+        );
+      }
+    });
+    return { generationId, unchanged: false };
+  }
+
+  async ingestAnalyticsSnapshot(
+    projectId: string,
+    generationId: string,
+    rows: AnalyticsSnapshotRow[],
+  ): Promise<{ accepted: number }> {
+    await this.assertProjectId(projectId);
+    if (rows.length > 500) throw new Error('analytics snapshot page exceeds 500 rows');
+    const generation = this.ctx.storage.sql.exec<{ status: string }>(
+      `SELECT status FROM analytics_generations WHERE id = ?1`, generationId,
+    ).toArray()[0];
+    if (!generation || generation.status !== 'building') throw new Error(`analytics generation ${generationId} is not building`);
+    this.ctx.storage.transactionSync(() => {
+      for (const row of rows) {
+        const body = JSON.stringify(row.body);
+        if (new TextEncoder().encode(body).byteLength > 65_536) throw new Error('analytics snapshot row exceeds 64 KiB');
+        const node = row.sourceKind === 'execution_node' ? row.body as AnalyticsExecutionNodeSnapshot : null;
+        const event = row.sourceKind === 'execution_event' ? row.body as AnalyticsExecutionEventSnapshot : null;
+        this.ctx.storage.sql.exec(
+          `INSERT INTO analytics_snapshot_rows
+             (generation_id, source_kind, source_key, run_id, sitting, execution_id, body)
+           VALUES (?1,?2,?3,?4,?5,?6,?7)
+           ON CONFLICT (generation_id, source_kind, source_key) DO UPDATE SET
+             run_id = excluded.run_id, sitting = excluded.sitting,
+             execution_id = excluded.execution_id, body = excluded.body`,
+          generationId, row.sourceKind, row.sourceKey, node?.runId ?? event?.runId ?? null,
+          node?.sitting ?? event?.sitting ?? null,
+          node?.id ?? event?.executionId ?? null, body,
+        );
+      }
+    });
+    return { accepted: rows.length };
+  }
+
+  async completeAnalyticsGeneration(projectId: string, generationId: string): Promise<{
+    generationId: string; rowCount: number; checksum: string; activated: boolean;
+  }> {
+    await this.assertProjectId(projectId);
+    const generation = this.ctx.storage.sql.exec<{
+      status: string; extraction_version: string; source_memory_revision: number;
+      d1_event_watermark: number | null; orchestration_watermark: string | null; base_generation_id: string | null;
+      checksum: string | null; row_count: number;
+    }>(
+      `SELECT status, extraction_version, source_memory_revision, d1_event_watermark, orchestration_watermark, base_generation_id,
+              checksum, row_count FROM analytics_generations WHERE id = ?1`, generationId,
+    ).toArray()[0];
+    if (!generation) throw new Error(`analytics generation ${generationId} not found`);
+    if (generation.status === 'complete') {
+      return {
+        generationId, rowCount: generation.row_count, checksum: generation.checksum!,
+        activated: this.ctx.storage.sql.exec<{ generation_id: string | null }>(
+          `SELECT generation_id FROM analytics_active_generation WHERE id = 0`,
+        ).toArray()[0]?.generation_id === generationId,
+      };
+    }
+    if (generation.status !== 'building') throw new Error(`analytics generation ${generationId} is ${generation.status}`);
+    const currentMemoryRevision = this.ctx.storage.sql
+      .exec<{ value: number }>(`SELECT value FROM memory_revision WHERE id = 0`).toArray()[0]?.value ?? 0;
+    if (currentMemoryRevision !== generation.source_memory_revision) {
+      throw new Error(
+        `analytics memory snapshot changed during build: expected revision ${generation.source_memory_revision}, current ${currentMemoryRevision}`,
+      );
+    }
+
+    // A retry restarts only this disposable generation. The previous complete generation and
+    // every canonical table remain untouched throughout the build.
+    if (!generation.base_generation_id) {
+      this.ctx.storage.sql.exec(`DELETE FROM analytics_rows WHERE generation_id = ?1`, generationId);
+    } else {
+      this.ctx.storage.sql.exec(
+        `DELETE FROM analytics_rows WHERE generation_id = ?1
+          AND episode_id NOT IN (SELECT id FROM episodes)`, generationId,
+      );
+    }
+    let offset = 0;
+    let rowCount = 0;
+    let rollingChecksum = await sha256HexBytes(new TextEncoder().encode(JSON.stringify({
+      extractionVersion: generation.extraction_version,
+      memoryRevision: generation.source_memory_revision,
+      d1EventWatermark: generation.d1_event_watermark,
+      orchestrationWatermark: generation.orchestration_watermark,
+    })));
+    const completenessReasons = new Set<string>();
+    for (;;) {
+      const episodes = this.ctx.storage.sql.exec<{
+        id: string; run_id: string; sitting: number; run_kind: string | null;
+        outcome: string | null; body: string;
+      }>(
+        `SELECT id, run_id, sitting, run_kind, outcome, body FROM episodes
+          ORDER BY run_id, sitting LIMIT 100 OFFSET ?1`, offset,
+      ).toArray();
+      if (!episodes.length) break;
+      for (const row of episodes) {
+        const episode = EffortEpisode.parse(JSON.parse(row.body));
+        const nodeEntries = this.ctx.storage.sql.exec<{ body: string }>(
+          `SELECT body FROM analytics_snapshot_rows
+            WHERE generation_id = ?1 AND source_kind = 'execution_node'
+              AND run_id = ?2 AND sitting = ?3 ORDER BY source_key`,
+          generationId, row.run_id, row.sitting,
+        ).toArray();
+        const nodes = nodeEntries.map((entry) => JSON.parse(entry.body) as AnalyticsExecutionNodeSnapshot);
+        const eventEntries = nodes.length ? this.ctx.storage.sql.exec<{ body: string }>(
+          `SELECT body FROM analytics_snapshot_rows
+            WHERE generation_id = ?1 AND source_kind = 'execution_event'
+              AND run_id = ?2 AND sitting = ?3
+            ORDER BY source_key`,
+          generationId, row.run_id, row.sitting,
+        ).toArray() : [];
+        const events = eventEntries.map((entry) => JSON.parse(entry.body) as AnalyticsExecutionEventSnapshot);
+        const sourceFingerprint = await sha256HexBytes(new TextEncoder().encode(JSON.stringify({
+          episode: row.body,
+          nodes: nodeEntries.map((entry) => entry.body),
+          events: eventEntries.map((entry) => entry.body),
+          extractionVersion: generation.extraction_version,
+        })));
+        const copied = generation.base_generation_id ? this.ctx.storage.sql.exec<{
+          normalized: string; source_fingerprint: string;
+        }>(
+          `SELECT normalized, source_fingerprint FROM analytics_rows
+            WHERE generation_id = ?1 AND episode_id = ?2`, generationId, row.id,
+        ).toArray()[0] : null;
+        const copiedNormalized = copied?.source_fingerprint === sourceFingerprint
+          ? ProjectIntelligenceEpisode.parse(JSON.parse(copied.normalized))
+          : null;
+        const normalized = copiedNormalized
+          ? ProjectIntelligenceEpisode.parse({
+              ...copiedNormalized,
+              sources: {
+                ...copiedNormalized.sources,
+                memoryRevision: generation.source_memory_revision,
+                coordinationEventSequence: generation.d1_event_watermark,
+              },
+              versions: { ...copiedNormalized.versions, extraction: generation.extraction_version },
+            })
+          : normalizeAnalyticsEpisode({
+              episode, sitting: row.sitting, runKind: row.run_kind ?? 'build',
+              outcome: row.outcome === 'failed' || row.outcome === 'cancelled' ? row.outcome : 'done',
+              sourceMemoryRevision: generation.source_memory_revision,
+              d1EventWatermark: generation.d1_event_watermark,
+              extractionVersion: generation.extraction_version,
+              nodes, events,
+            });
+        if (normalized.identity.lineage.status !== 'complete') completenessReasons.add('partial_lineage');
+        const encoded = JSON.stringify(normalized);
+        const rowChecksum = await sha256HexBytes(new TextEncoder().encode(encoded));
+        rollingChecksum = await sha256HexBytes(new TextEncoder().encode(`${rollingChecksum}:${rowChecksum}`));
+        this.ctx.storage.sql.exec(
+          `INSERT INTO analytics_rows
+             (generation_id, episode_id, run_id, sitting, normalized, source_fingerprint, row_checksum)
+           VALUES (?1,?2,?3,?4,?5,?6,?7)
+           ON CONFLICT (generation_id, episode_id) DO UPDATE SET
+             run_id = excluded.run_id, sitting = excluded.sitting, normalized = excluded.normalized,
+             source_fingerprint = excluded.source_fingerprint, row_checksum = excluded.row_checksum`,
+          generationId, row.id, row.run_id, row.sitting, encoded, sourceFingerprint, rowChecksum,
+        );
+        rowCount++;
+      }
+      offset += episodes.length;
+    }
+    const canonicalCount = this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM episodes`).toArray()[0]?.n ?? 0;
+    const derivedCount = this.ctx.storage.sql.exec<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM analytics_rows WHERE generation_id = ?1`, generationId,
+    ).toArray()[0]?.n ?? 0;
+    if (canonicalCount !== rowCount || derivedCount !== rowCount) {
+      throw new Error(`analytics validation count mismatch: canonical=${canonicalCount}, normalized=${rowCount}, stored=${derivedCount}`);
+    }
+    const completedAt = nowIso();
+    const completeness = JSON.stringify({
+      status: completenessReasons.size ? 'partial' : 'complete', reasons: [...completenessReasons].sort(),
+    });
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        `UPDATE analytics_generations SET status = 'complete', completeness = ?2,
+                row_count = ?3, checksum = ?4, completed_at = ?5, error = NULL
+          WHERE id = ?1 AND status = 'building'`,
+        generationId, completeness, rowCount, rollingChecksum, completedAt,
+      );
+      this.ctx.storage.sql.exec(
+        `UPDATE analytics_active_generation SET generation_id = ?1 WHERE id = 0`, generationId,
+      );
+    });
+    return { generationId, rowCount, checksum: rollingChecksum, activated: true };
+  }
+
+  async failAnalyticsGeneration(projectId: string, generationId: string, error: string): Promise<void> {
+    await this.assertProjectId(projectId);
+    this.ctx.storage.sql.exec(
+      `UPDATE analytics_generations SET status = 'failed', error = ?2, completed_at = ?3
+        WHERE id = ?1 AND status = 'building'`,
+      generationId, error.slice(0, 4_000), nowIso(),
+    );
+  }
+
   async beginEpisodeIngest(projectId: string, manifest: EpisodeUploadManifest): Promise<{ ok: true }> {
     await this.assertProjectId(projectId);
     this.ingestEpisodes.set(manifest.scopeId, beginIngestEpisode(this.ingestEpisodes.get(manifest.scopeId), manifest));
@@ -1659,6 +1930,13 @@ export class ProjectMemory extends DurableObject<Env> {
       });
       recorded++;
     }
+    if (recorded) {
+      await this.env.DB.prepare(
+        `INSERT INTO memory_analytics_jobs (project_id, requested_at) VALUES (?, ?)
+         ON CONFLICT (project_id) DO UPDATE SET requested_at = excluded.requested_at`,
+      ).bind(projectId, nowIso()).run().catch((error) =>
+        console.warn(`analytics enqueue after episode enrichment failed: ${String(error)}`));
+    }
     return { ok: true, batchesReceived: state.receivedBatches.size, rowCount: state.rows.length, recorded, skipped };
   }
 
@@ -1692,6 +1970,7 @@ export class ProjectMemory extends DurableObject<Env> {
   async erase(projectId: string): Promise<{ ok: true }> {
     await this.assertProjectId(projectId);
     this.ctx.storage.transactionSync(() => {
+      this.clearAnalyticsDerived();
       for (const table of [...SCHEMA_TABLES].reverse()) {
         this.ctx.storage.sql.exec(`DELETE FROM ${table}`);
       }
@@ -5194,6 +5473,43 @@ export class ProjectMemory extends DurableObject<Env> {
       .exec<{ body: string }>(`SELECT body FROM episodes WHERE run_id = ?1 AND sitting = ?2`, runId, sitting)
       .toArray()[0];
     return row ? EffortEpisode.parse(JSON.parse(row.body)) : null;
+  }
+
+  /** Test-only visibility for generation activation/rebuild invariants. */
+  async _getAnalyticsForTest(projectId: string): Promise<{
+    activeGenerationId: string | null;
+    generations: Array<{
+      id: string; status: string; baseGenerationId: string | null;
+      checksum: string | null; rowCount: number; error: string | null;
+    }>;
+    rows: Array<{ generationId: string; runId: string; sitting: number; normalized: Record<string, unknown> }>;
+  }> {
+    await this.assertProjectId(projectId);
+    const activeGenerationId = this.ctx.storage.sql.exec<{ generation_id: string | null }>(
+      `SELECT generation_id FROM analytics_active_generation WHERE id = 0`,
+    ).toArray()[0]?.generation_id ?? null;
+    const generations = this.ctx.storage.sql.exec<{
+      id: string; status: string; baseGenerationId: string | null;
+      checksum: string | null; rowCount: number; error: string | null;
+    }>(
+      `SELECT id, status, base_generation_id AS baseGenerationId, checksum, row_count AS rowCount, error
+         FROM analytics_generations ORDER BY created_at, id`,
+    ).toArray();
+    const rows = this.ctx.storage.sql.exec<{
+      generationId: string; runId: string; sitting: number; normalized: string;
+    }>(
+      `SELECT generation_id AS generationId, run_id AS runId, sitting, normalized
+         FROM analytics_rows ORDER BY generation_id, run_id, sitting`,
+    ).toArray().map((row) => ({ ...row, normalized: JSON.parse(row.normalized) as Record<string, unknown> }));
+    return { activeGenerationId, generations, rows };
+  }
+
+  /** Test-only simulation of disposable read-model loss. Canonical episodes are untouched. */
+  async _clearAnalyticsForTest(projectId: string): Promise<void> {
+    await this.assertProjectId(projectId);
+    this.ctx.storage.transactionSync(() => {
+      this.clearAnalyticsDerived();
+    });
   }
 
   /** Test-only: overwrite a `_meta` value directly — used to backdate

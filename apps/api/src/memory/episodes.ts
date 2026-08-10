@@ -385,6 +385,11 @@ export async function recordEpisodeForRun(env: Env, projectId: string, runId: st
     actor: { kind: 'system', id: null },
     writeMode: 'skeleton',
   });
+  const requestedAt = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO memory_analytics_jobs (project_id, requested_at) VALUES (?, ?)
+     ON CONFLICT (project_id) DO UPDATE SET requested_at = excluded.requested_at`,
+  ).bind(projectId, requestedAt).run();
 }
 
 /**

@@ -51,6 +51,7 @@ import { assembleContextPack } from './memory/context-pack';
 import { readBoundedBody, verifyBatchChecksum, decodeBatchRows, MAX_INGEST_BATCH_BYTES, INGEST_TOKEN_TTL_SECONDS } from './memory/ingest';
 import { normalizeVerificationReport } from './memory/verification';
 import { sweepPendingEpisodeJobs } from './memory/episodes';
+import { rebuildProjectAnalytics, sweepPendingAnalyticsJobs } from './memory/analytics';
 import { classifyAgentLifecycle } from './lib/agent-lifecycle';
 import { agentLifecycleSweepConfig, sweepAgentLifecycle, type AgentLifecycleCursor } from './lib/agent-lifecycle-sweep';
 import { AGENT_LIFECYCLES, listAgentRoster, type AgentRosterLifecycle } from './lib/agent-roster';
@@ -1552,6 +1553,18 @@ app.post('/api/projects/:pid/memory/vectors/rebuild', userAuth, async (c) => {
   if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
   const pid = c.req.param('pid')!;
   return c.json(await memoryDO(c.env, pid).rebuildVectorIndex(pid));
+});
+
+// PLNR-292: operator full rebuild of the disposable cross-source analytics generation. The old
+// complete generation remains active until the replacement validates and switches atomically.
+app.post('/api/projects/:pid/memory/analytics/rebuild', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  const pid = c.req.param('pid')!;
+  try {
+    return c.json(await rebuildProjectAnalytics(c.env, pid, { force: true }));
+  } catch (error) {
+    return c.json({ error: String(error) }, 409);
+  }
 });
 
 // The same idempotent per-project sweep the daily cron already runs (sweepProjectDebrisForProject,
@@ -4672,6 +4685,7 @@ export default {
           sweepPendingErasures(env).then((r) => console.log(`[memory-lifecycle] erasure sweep: ${r.length} tombstone(s) processed`)),
           sweepProjectDebris(env).then((r) => console.log(`[memory-lifecycle] debris sweep: ${r.length} project(s) processed`)),
           sweepPendingEpisodeJobs(env).then((r) => console.log(`[memory-lifecycle] episode jobs: ${r.completed} completed, ${r.failed} failed`)),
+          sweepPendingAnalyticsJobs(env).then((r) => console.log(`[memory-lifecycle] analytics jobs: ${r.completed} completed, ${r.failed} failed`)),
         ]).catch((err) => console.warn(`[memory-lifecycle] sweep failed: ${String(err)}`)),
       );
       // Actor/session lifecycle shares the daily maintenance trigger but owns an independent,
