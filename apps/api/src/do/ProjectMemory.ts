@@ -242,7 +242,7 @@ interface RecordEpisodeInput {
   writeMode?: 'replace' | 'skeleton' | 'enrichment';
 }
 
-export const SCHEMA_TABLES = [
+export const CANONICAL_TABLES = [
   'repositories',
   'index_generations',
   // PLNR-261's staged-generation tables: children of index_generations by convention (no real
@@ -263,6 +263,18 @@ export const SCHEMA_TABLES = [
   'outbox',
 ] as const;
 
+/** PLNR-373: derived Constellation v2 generations. Counted in health and erased with the project,
+ * but deliberately absent from portable backup/restore: canonical nodes/edges rebuild them. */
+export const CONSTELLATION_DERIVED_TABLES = [
+  'constellation_generations',
+  'constellation_node_stats',
+  'constellation_communities',
+  'constellation_memberships',
+  'constellation_community_links',
+] as const;
+
+export const SCHEMA_TABLES = [...CANONICAL_TABLES, ...CONSTELLATION_DERIVED_TABLES] as const;
+
 // Operational ledgers (PLNR-247) that are not part of SCHEMA_TABLES' health/erase accounting
 // (health counts them separately below; erase clears them explicitly) but that a faithful
 // backup/restore (PLNR-248/249) must carry — a restore missing these would re-project already
@@ -273,7 +285,47 @@ export const OPERATIONAL_TABLES = ['applied_operations', 'memory_revision', 'pro
  *  children — the same generic per-table chunking applies to both graph data and the
  *  operational singletons (memory_revision, projector_cursor are one row each, chunked the same
  *  way as everything else rather than carved into bespoke manifest fields). */
-export const BACKUP_TABLES = [...SCHEMA_TABLES, ...OPERATIONAL_TABLES] as const;
+export const BACKUP_TABLES = [...CANONICAL_TABLES, ...OPERATIONAL_TABLES] as const;
+
+export interface ConstellationGenerationData {
+  nodeStats: Array<{ nodeId: string; degree: number; weightedDegree: number; rank: number; boundaryDegree: number }>;
+  communities: Array<{
+    id: string; parentId: string | null; level: number; label: string; memberCount: number; childCount: number;
+    typeCounts: Record<string, number>; internalWeight: number; normalizedCohesion: number; boundaryWeight: number;
+    anchor: [number, number, number];
+  }>;
+  memberships: Array<{ nodeId: string; communityId: string; level: number }>;
+  links: Array<{
+    level: number; fromCommunityId: string; toCommunityId: string; direction: 'forward' | 'reverse' | 'both';
+    count: number; weight: number; byType: Record<string, number>;
+  }>;
+}
+
+export interface ConstellationGenerationStatus {
+  id: string;
+  sourceRevision: number;
+  currentRevision: number;
+  topologyVersion: string;
+  layoutVersion: string;
+  status: 'building' | 'complete' | 'active' | 'superseded' | 'failed';
+  createdAt: string;
+  completedAt: string | null;
+  activatedAt: string | null;
+  failureReason: string | null;
+}
+
+interface ConstellationGenerationRow {
+  [column: string]: string | number | null;
+  id: string;
+  source_revision: number;
+  topology_version: string;
+  layout_version: string;
+  status: ConstellationGenerationStatus['status'];
+  created_at: string;
+  completed_at: string | null;
+  activated_at: string | null;
+  failure_reason: string | null;
+}
 
 /**
  * A daemon upload is deliberately a PARTIAL enrichment, not an `EffortEpisode` replacement.
@@ -411,6 +463,159 @@ export class ProjectMemory extends DurableObject<Env> {
       sizeStatus: sizeStatus(databaseSize),
       hasPriorGeneration: priorGenFlag?.value === '1',
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Disposable Constellation v2 hierarchy generations (PLNR-373)
+  // ---------------------------------------------------------------------------
+
+  async beginConstellationGeneration(
+    projectId: string,
+    input: { topologyVersion: string; layoutVersion: string },
+  ): Promise<{ generationId: string; sourceRevision: number }> {
+    await this.assertProjectId(projectId);
+    const generationId = newId('cgen');
+    const sourceRevision = this.readMemoryRevision();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO constellation_generations
+         (id, source_revision, topology_version, layout_version, status, created_at)
+       VALUES (?1, ?2, ?3, ?4, 'building', ?5)`,
+      generationId, sourceRevision, input.topologyVersion, input.layoutVersion, nowIso(),
+    );
+    return { generationId, sourceRevision };
+  }
+
+  /** Replace a building generation's entire derived payload atomically. Canonical graph rows are
+   *  referenced but never mutated, and no reader can select this generation before activation. */
+  async stageConstellationGeneration(
+    projectId: string,
+    generationId: string,
+    data: ConstellationGenerationData,
+  ): Promise<{ ok: true }> {
+    await this.assertProjectId(projectId);
+    const generation = this.readConstellationGeneration(generationId);
+    if (!generation) throw new Error(`constellation generation ${generationId} not found`);
+    if (generation.status !== 'building') throw new Error(`constellation generation ${generationId} is ${generation.status}, not building`);
+    this.ctx.storage.transactionSync(() => {
+      this.deleteConstellationGenerationRows(generationId);
+      for (const row of data.nodeStats) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO constellation_node_stats
+             (generation_id, node_id, degree, weighted_degree, rank, boundary_degree)
+           VALUES (?1,?2,?3,?4,?5,?6)`,
+          generationId, row.nodeId, row.degree, row.weightedDegree, row.rank, row.boundaryDegree,
+        );
+      }
+      for (const row of [...data.communities].sort((a, b) => a.level - b.level || a.id.localeCompare(b.id))) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO constellation_communities
+             (generation_id,id,parent_id,level,label,member_count,child_count,type_counts,internal_weight,normalized_cohesion,boundary_weight,anchor_x,anchor_y,anchor_z)
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)`,
+          generationId, row.id, row.parentId, row.level, row.label, row.memberCount, row.childCount,
+          JSON.stringify(row.typeCounts), row.internalWeight, row.normalizedCohesion, row.boundaryWeight,
+          row.anchor[0], row.anchor[1], row.anchor[2],
+        );
+      }
+      for (const row of data.memberships) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO constellation_memberships (generation_id,node_id,community_id,level) VALUES (?1,?2,?3,?4)`,
+          generationId, row.nodeId, row.communityId, row.level,
+        );
+      }
+      for (const row of data.links) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO constellation_community_links
+             (generation_id,level,from_community_id,to_community_id,direction,edge_count,weight,by_type)
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8)`,
+          generationId, row.level, row.fromCommunityId, row.toCommunityId, row.direction,
+          row.count, row.weight, JSON.stringify(row.byType),
+        );
+      }
+    });
+    return { ok: true };
+  }
+
+  async completeConstellationGeneration(projectId: string, generationId: string): Promise<{ ok: true }> {
+    await this.assertProjectId(projectId);
+    const generation = this.readConstellationGeneration(generationId);
+    if (!generation) throw new Error(`constellation generation ${generationId} not found`);
+    if (generation.status !== 'building') throw new Error(`constellation generation ${generationId} is ${generation.status}, not building`);
+    this.ctx.storage.sql.exec(
+      `UPDATE constellation_generations SET status = 'complete', completed_at = ?2 WHERE id = ?1`,
+      generationId, nowIso(),
+    );
+    return { ok: true };
+  }
+
+  /** The only active-selector writer. The old active generation remains complete data under the
+   *  superseded status; generation failure or staging never displaces it. */
+  async activateConstellationGeneration(
+    projectId: string,
+    generationId: string,
+  ): Promise<{ activated: string; superseded: string | null }> {
+    await this.assertProjectId(projectId);
+    let superseded: string | null = null;
+    this.ctx.storage.transactionSync(() => {
+      const generation = this.readConstellationGeneration(generationId);
+      if (!generation) throw new Error(`constellation generation ${generationId} not found`);
+      if (generation.status === 'active') return;
+      if (generation.status !== 'complete') throw new Error(`constellation generation ${generationId} is ${generation.status}, not complete`);
+      const prior = this.ctx.storage.sql.exec<{ id: string }>(`SELECT id FROM constellation_generations WHERE status = 'active'`).toArray()[0];
+      superseded = prior?.id ?? null;
+      if (prior) this.ctx.storage.sql.exec(`UPDATE constellation_generations SET status = 'superseded' WHERE id = ?1`, prior.id);
+      this.ctx.storage.sql.exec(
+        `UPDATE constellation_generations SET status = 'active', activated_at = ?2 WHERE id = ?1`,
+        generationId, nowIso(),
+      );
+    });
+    return { activated: generationId, superseded };
+  }
+
+  async failConstellationGeneration(projectId: string, generationId: string, reason: string): Promise<{ ok: true }> {
+    await this.assertProjectId(projectId);
+    const generation = this.readConstellationGeneration(generationId);
+    if (!generation) throw new Error(`constellation generation ${generationId} not found`);
+    if (generation.status !== 'building') throw new Error(`constellation generation ${generationId} is ${generation.status}, not building`);
+    this.ctx.storage.sql.exec(
+      `UPDATE constellation_generations SET status = 'failed', failure_reason = ?2 WHERE id = ?1`,
+      generationId, reason.slice(0, 1000),
+    );
+    return { ok: true };
+  }
+
+  async constellationGenerationStatus(projectId: string, generationId?: string): Promise<ConstellationGenerationStatus | null> {
+    await this.assertProjectId(projectId);
+    const row = generationId
+      ? this.readConstellationGeneration(generationId)
+      : this.ctx.storage.sql.exec<ConstellationGenerationRow>(
+        `SELECT * FROM constellation_generations
+         ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'building' THEN 1 WHEN 'complete' THEN 2 ELSE 3 END, created_at DESC LIMIT 1`,
+      ).toArray()[0];
+    return row ? this.shapeConstellationGeneration(row) : null;
+  }
+
+  private readConstellationGeneration(generationId: string): ConstellationGenerationRow | undefined {
+    return this.ctx.storage.sql.exec<ConstellationGenerationRow>(`SELECT * FROM constellation_generations WHERE id = ?1`, generationId).toArray()[0];
+  }
+
+  private shapeConstellationGeneration(row: ConstellationGenerationRow): ConstellationGenerationStatus {
+    return {
+      id: row.id, sourceRevision: row.source_revision, currentRevision: this.readMemoryRevision(),
+      topologyVersion: row.topology_version, layoutVersion: row.layout_version, status: row.status,
+      createdAt: row.created_at, completedAt: row.completed_at, activatedAt: row.activated_at,
+      failureReason: row.failure_reason,
+    };
+  }
+
+  private deleteConstellationGenerationRows(generationId: string): void {
+    this.ctx.storage.sql.exec(`DELETE FROM constellation_community_links WHERE generation_id = ?1`, generationId);
+    this.ctx.storage.sql.exec(`DELETE FROM constellation_memberships WHERE generation_id = ?1`, generationId);
+    this.ctx.storage.sql.exec(`DELETE FROM constellation_communities WHERE generation_id = ?1`, generationId);
+    this.ctx.storage.sql.exec(`DELETE FROM constellation_node_stats WHERE generation_id = ?1`, generationId);
+  }
+
+  private clearConstellationDerived(): void {
+    for (const table of [...CONSTELLATION_DERIVED_TABLES].reverse()) this.ctx.storage.sql.exec(`DELETE FROM ${table}`);
   }
 
   // ---------------------------------------------------------------------------
@@ -653,6 +858,9 @@ export class ProjectMemory extends DurableObject<Env> {
       // live contents from staging. A constraint violation anywhere rolls all of it back.
       this.ctx.storage.transactionSync(() => {
         this.snapshotLiveInto('prev_');
+        // Derived constellation rows are not portable backup truth. A canonical restore
+        // invalidates them, so clear them in the same transaction as the switch.
+        this.clearConstellationDerived();
         this.replaceLiveContentsFrom('staging_');
         this.ctx.storage.sql.exec(
           `INSERT INTO _meta (key, value) VALUES ('has_prior_generation', '1')
@@ -690,6 +898,7 @@ export class ProjectMemory extends DurableObject<Env> {
     // live from the retained `prev_` copies, then discard them (rollback CONSUMES the retained
     // generation — that is what makes this single-level rather than a stack).
     this.ctx.storage.transactionSync(() => {
+      this.clearConstellationDerived();
       this.replaceLiveContentsFrom('prev_');
       for (const table of ProjectMemory.PARENT_FIRST) this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS prev_${table}`);
       this.ctx.storage.sql.exec(`UPDATE _meta SET value = '0' WHERE key = 'has_prior_generation'`);
