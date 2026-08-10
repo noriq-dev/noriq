@@ -37,7 +37,17 @@ export interface CurrentProjectFlowSummary {
     parkedNodes: number;
   };
   coordination: { activeClaims: number; activeLocks: number };
-  runners: { statuses: Record<string, number>; presenceStates: Record<string, number> };
+  runners: {
+    statuses: Record<string, number>;
+    presenceStates: Record<string, number>;
+    capacity: {
+      reportedRunners: number;
+      maxConcurrency: number | null;
+      freeSlots: number | null;
+      busySlots: number | null;
+      completeness: 'complete' | 'partial' | 'unavailable';
+    };
+  };
 }
 
 const countRows = <T extends { status: string; count: number }>(rows: T[]): Record<string, number> =>
@@ -169,7 +179,7 @@ export async function getCurrentProjectFlowSummary(
   type StatusCount = { status: string; count: number };
   const [
     watermarks, readiness, planStatuses, dispatchStatuses, gateStatuses, phaseCounts, landing,
-    runStatuses, orchestrationStatuses, nodeStatuses, claims, locks, runnerStatuses, presenceStates,
+    runStatuses, orchestrationStatuses, nodeStatuses, claims, locks, runnerStatuses, presenceStates, runnerCapacity,
   ] = await Promise.all([
     analyticsSourceWatermarks(env, projectId),
     env.DB.prepare(
@@ -239,6 +249,11 @@ export async function getCurrentProjectFlowSummary(
           AND (ap.project_id = ?1 OR EXISTS (SELECT 1 FROM runs run WHERE run.runner_id = ap.runner_id AND run.project_id = ?1))
         GROUP BY ap.state`,
     ).bind(projectId).all<StatusCount>(),
+    env.DB.prepare(
+      `SELECT capabilities, free_slots AS freeSlots FROM runners r
+        WHERE r.status IN ('online', 'draining')
+          AND (r.project_id = ?1 OR EXISTS (SELECT 1 FROM runs run WHERE run.runner_id = r.id AND run.project_id = ?1))`,
+    ).bind(projectId).all<{ capabilities: string; freeSlots: number | null }>(),
   ]);
   let orchestrationAcceptedAt: string | null = null;
   try {
@@ -276,7 +291,35 @@ export async function getCurrentProjectFlowSummary(
       parkedNodes: nodes.parked ?? 0,
     },
     coordination: { activeClaims: claims?.count ?? 0, activeLocks: locks?.count ?? 0 },
-    runners: { statuses: countRows(runnerStatuses.results), presenceStates: countRows(presenceStates.results) },
+    runners: {
+      statuses: countRows(runnerStatuses.results),
+      presenceStates: countRows(presenceStates.results),
+      capacity: (() => {
+        let maxConcurrency = 0;
+        let freeSlots = 0;
+        let complete = true;
+        for (const row of runnerCapacity.results) {
+          try {
+            const capabilities = JSON.parse(row.capabilities || '{}') as { maxConcurrency?: unknown };
+            if (typeof capabilities.maxConcurrency !== 'number' || !Number.isInteger(capabilities.maxConcurrency)
+              || capabilities.maxConcurrency < 0 || row.freeSlots == null) {
+              complete = false;
+              continue;
+            }
+            maxConcurrency += capabilities.maxConcurrency;
+            freeSlots += Math.max(0, Math.min(capabilities.maxConcurrency, row.freeSlots));
+          } catch { complete = false; }
+        }
+        const reportedRunners = runnerCapacity.results.length;
+        return {
+          reportedRunners,
+          maxConcurrency: reportedRunners && (complete || maxConcurrency > 0) ? maxConcurrency : null,
+          freeSlots: reportedRunners && (complete || maxConcurrency > 0) ? freeSlots : null,
+          busySlots: reportedRunners && (complete || maxConcurrency > 0) ? Math.max(0, maxConcurrency - freeSlots) : null,
+          completeness: !reportedRunners ? 'unavailable' : complete ? 'complete' : 'partial',
+        };
+      })(),
+    },
   };
 }
 

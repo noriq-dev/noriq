@@ -130,6 +130,13 @@ button { all: unset; box-sizing: border-box; max-width: 100%; }
    multi-column views collapse to a single scrollable column.
    ------------------------------------------------------------------------- */
 .mobile-topbar { display: none; }
+.intelligence-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.intelligence-groups { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.intelligence-metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; }
+.intelligence-metrics > div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.intelligence-metrics b { font-size: 13px; overflow-wrap: anywhere; }
+.intelligence-metrics small { font-family: var(--mono); font-size: 8px; color: var(--text-faint); }
+.intelligence-case { display: flex; gap: 8px; align-items: center; padding: 11px 13px; border-bottom: 1px solid var(--w-07); }
 
 @media (max-width: 860px) {
   .mobile-topbar {
@@ -151,6 +158,8 @@ button { all: unset; box-sizing: border-box; max-width: 100%; }
   .mc-grid > * { border-right: none !important; min-height: 62vh; }
   .mc-grid > *:not(:last-child) { border-bottom: 1px solid var(--line); }
   .agents-grid { grid-template-columns: 1fr !important; }
+  .intelligence-view { padding: 14px !important; }
+  .intelligence-grid, .intelligence-groups { grid-template-columns: 1fr !important; }
 
   /* Task drawer + centered modals go full-bleed. */
   .task-drawer { width: 100vw !important; }
@@ -196,4 +205,6 @@ button { all: unset; box-sizing: border-box; max-width: 100%; }
 @media (max-width: 480px) {
   /* Two-up form grids stack on small phones. */
   .stack-sm { grid-template-columns: 1fr !important; }
+  .intelligence-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .intelligence-case { align-items: stretch; flex-wrap: wrap; }
 }

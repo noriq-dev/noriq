@@ -64,6 +64,7 @@ import { sweepPendingEpisodeJobs } from './memory/episodes';
 import {
   getCurrentProjectFlowSummary, getProjectAnalyticsHealth, rebuildProjectAnalytics, sweepPendingAnalyticsJobs,
 } from './memory/analytics';
+import { getProjectIntelligenceDashboard } from './memory/intelligence-dashboard';
 import { classifyAgentLifecycle } from './lib/agent-lifecycle';
 import { agentLifecycleSweepConfig, sweepAgentLifecycle, type AgentLifecycleCursor } from './lib/agent-lifecycle-sweep';
 import { AGENT_LIFECYCLES, listAgentRoster, type AgentRosterLifecycle } from './lib/agent-roster';
@@ -1430,6 +1431,33 @@ app.post('/api/projects/:pid/memory/analytics/query', userAuth, async (c) => {
 app.get('/api/projects/:pid/memory/analytics/current', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
   return c.json(await getCurrentProjectFlowSummary(c.env, pid));
+});
+
+// PLNR-302: a single bounded dashboard packet keeps live and frozen facts visibly separate while
+// avoiding browser-authored joins or denominator arithmetic. Deterministic D1/SQLite reads remain
+// available without Vectorize, Workers AI, Queues, or Workflows.
+app.post('/api/projects/:pid/memory/intelligence', userAuth, async (c) => {
+  const parsed = z.object({
+    from: z.string().datetime(),
+    to: z.string().datetime(),
+    groupBy: HistoricalAnalyticsDimensionBody.optional(),
+    caseCursor: z.string().min(1).optional(),
+    caseLimit: z.number().int().min(1).max(100).default(24),
+    comparison: z.object({
+      dimension: z.enum(STRATEGY_DIMENSIONS), metric: z.enum(COMPARISON_METRICS),
+    }).strict().optional(),
+  }).strict().safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid project intelligence request', detail: parsed.error.issues }, 400);
+  const from = Date.parse(parsed.data.from);
+  const to = Date.parse(parsed.data.to);
+  if (from > to || to - from > 366 * 24 * 60 * 60 * 1_000) {
+    return c.json({ error: 'project intelligence range must be ordered and at most 366 days' }, 400);
+  }
+  try {
+    return c.json(await getProjectIntelligenceDashboard(c.env, c.req.param('pid')!, parsed.data));
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+  }
 });
 // Canonical repository identity + checkout associations (PLNR-259) — straight D1 reads (CLAUDE.md:
 // reads go straight to D1), not a ProjectMemory DO RPC; registration/association happen through
