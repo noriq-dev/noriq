@@ -4,7 +4,7 @@ import {
   type ApiConstellationV2Overview, type ApiMemoryHit,
 } from '../api';
 import { useTheme } from '../theme';
-import { Button, TextInput } from './ui';
+import { Button, Select, TextInput } from './ui';
 import { MonoTag, SectionLabel } from './bits';
 import {
   assembleConstellationV2Scene, CONSTELLATION_V2_RESIDENT_NODE_BUDGET, evictConstellationPages, type ResidentConstellationPage,
@@ -66,9 +66,18 @@ export function MemoryConstellationV2({
   const [query, setQuery] = useState('');
   const [hits, setHits] = useState<ApiMemoryHit[]>([]);
   const [searching, setSearching] = useState(false);
+  const [rendererFailure, setRendererFailure] = useState<string | null>(null);
+  const [typeFilter, setTypeFilter] = useState('');
+  const [reducedMotion, setReducedMotion] = useState(() => window.matchMedia('(prefers-reduced-motion: reduce)').matches);
 
   useEffect(() => { residentsRef.current = residents; }, [residents]);
   useEffect(() => { pathRef.current = path; }, [path]);
+  useEffect(() => {
+    const media = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const update = () => setReducedMotion(media.matches);
+    media.addEventListener('change', update);
+    return () => media.removeEventListener('change', update);
+  }, []);
 
   const loadOverview = useCallback(async (signal?: AbortSignal) => {
     const value = await api.memoryConstellationV2Overview(pid, signal);
@@ -128,6 +137,12 @@ export function MemoryConstellationV2({
 
   const currentPage = path.length ? residents.get(path.at(-1)!)?.page ?? null : null;
   const scene = useMemo(() => overview ? assembleConstellationV2Scene(overview, currentPage, incidentPages) : null, [overview, currentPage, incidentPages]);
+  const filteredScene = useMemo(() => {
+    if (!scene || !typeFilter) return scene;
+    const nodes = scene.nodes.filter((node) => node.community || node.type === typeFilter);
+    const ids = new Set(nodes.map((node) => node.id));
+    return { ...scene, nodes, edges: scene.edges.filter((edge) => ids.has(edge.fromId) && ids.has(edge.toId)) };
+  }, [scene, typeFilter]);
 
   const selectNode = useCallback((nodeId: string | null) => {
     incidentAbortRef.current?.abort();
@@ -183,20 +198,31 @@ export function MemoryConstellationV2({
     return () => { clearTimeout(timeout); controller.abort(); };
   }, [pid, query]);
 
+  const highlightedNodeIds = useMemo(() => hits.length && filteredScene
+    ? filteredScene.nodes.filter((node) => node.uri && hits.some((hit) => hit.uri === node.uri)).map((node) => node.id)
+    : [], [hits, filteredScene]);
   const selected = scene?.nodes.find((node) => node.id === selectedNodeId) ?? null;
   const selectedCommunity = selected?.community ? selected : null;
   const selectedEntity = selected?.uri ? selected : null;
+  const handleRendererFailure = useCallback((reason: string) => { setRendererFailure(reason); onFallback?.(reason); }, [onFallback]);
 
   if (loading) return <div style={{ padding: 24, color: 'var(--text-dim)' }}>Preparing navigable memory space…</div>;
-  if (!overview || !scene) return <div style={{ padding: 24, color: 'var(--red-soft)' }}>{error ?? 'Constellation v2 is unavailable'}</div>;
+  if (!overview || !scene || !filteredScene) return <div style={{ padding: 24, color: 'var(--red-soft)' }}>{error ?? 'Constellation v2 is unavailable'}</div>;
+
+  const typeOptions = [...new Set(scene.nodes.filter((node) => !node.community).map((node) => node.type))].sort();
+  const codeEntities = overview.communities.reduce((count, community) => count + (community.typeCounts.file ?? 0) + (community.typeCounts.symbol ?? 0) + (community.typeCounts.repository ?? 0), 0);
 
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
       <div style={{ padding: '8px 14px', borderBottom: '1px solid var(--line)', display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
         <SectionLabel>Constellation v2</SectionLabel>
-        <MonoTag color="var(--text-dim)" bg="var(--w-04)" size={9}>{scene.nodes.length} visible · {scene.edges.length} routes</MonoTag>
+        <MonoTag color="var(--text-dim)" bg="var(--w-04)" size={9}>{filteredScene.nodes.length} visible · {filteredScene.edges.length} routes</MonoTag>
         <MonoTag color={overview.revision.state === 'current' ? 'var(--green)' : 'var(--amber)'} bg="var(--w-04)" size={9}>{overview.revision.state}</MonoTag>
         <Button variant="ghost" disabled={path.length === 0} onClick={() => { const next = path.slice(0, -1); pathRef.current = next; setPath(next); selectNode(null); }}>← parent</Button>
+        <Select value={typeFilter} onChange={(event) => setTypeFilter(event.target.value)} aria-label="Filter visible entities by type">
+          <option value="">all types</option>
+          {typeOptions.map((type) => <option key={type} value={type}>{type}</option>)}
+        </Select>
         <div style={{ flex: 1 }} />
         <TextInput value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search memory, task, file, symbol…" style={{ width: 280 }} />
       </div>
@@ -205,15 +231,29 @@ export function MemoryConstellationV2({
         {path.map((id, index) => <button type="button" key={id} onClick={() => { const next = path.slice(0, index + 1); pathRef.current = next; setPath(next); selectNode(null); }}>› {residents.get(id)?.page.community.label ?? id}</button>)}
       </div>}
       <div style={{ position: 'relative', flex: 1, minHeight: 0 }}>
-        <Suspense fallback={<div style={{ padding: 24, color: 'var(--text-dim)' }}>Loading 3D renderer…</div>}>
-          <LazyConstellation3D
-            projectId={pid} generationId={overview.revision.generationId} layoutVersion={overview.revision.layoutVersion}
-            nodes={scene.nodes} edges={scene.edges} selectedNodeId={selectedNodeId} theme={theme}
-            reducedMotion={window.matchMedia('(prefers-reduced-motion: reduce)').matches}
-            onSelectNode={selectNode} onOpenEgoNetwork={onOpenEgoNetwork} onOpenInspector={onOpenInspector}
-            onRendererFailure={onFallback}
-          />
-        </Suspense>
+        {overview.communities.length === 0 ? <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: 'var(--text-dim)' }}>
+          <div style={{ maxWidth: 440, textAlign: 'center' }}><strong>No memory entities are present in this completed generation.</strong><div style={{ marginTop: 6, fontSize: 11 }}>This is a confirmed empty hierarchy, not a renderer or network failure.</div></div>
+        </div> : !rendererFailure ? <Suspense fallback={<div style={{ padding: 24, color: 'var(--text-dim)' }}>Loading 3D renderer…</div>}>
+            <LazyConstellation3D
+              projectId={pid} generationId={overview.revision.generationId} layoutVersion={overview.revision.layoutVersion}
+              nodes={filteredScene.nodes} edges={filteredScene.edges} selectedNodeId={selectedNodeId} highlightedNodeIds={highlightedNodeIds} theme={theme}
+              reducedMotion={reducedMotion}
+              onSelectNode={selectNode} onOpenEgoNetwork={onOpenEgoNetwork} onOpenInspector={onOpenInspector}
+              onRendererFailure={handleRendererFailure}
+            />
+          </Suspense> : <div role="region" aria-label="Textual memory constellation" style={{ position: 'absolute', inset: 0, overflow: 'auto', padding: 18 }}>
+            <div style={{ padding: 10, marginBottom: 10, border: '1px solid var(--line)', borderRadius: 8 }}>
+              <strong>3D view unavailable — textual navigation remains active.</strong>
+              <div style={{ color: 'var(--text-dim)', fontSize: 11, marginTop: 4 }}>{rendererFailure}</div>
+            </div>
+            {filteredScene.nodes.map((node) => <div key={node.id} style={{ display: 'flex', gap: 8, alignItems: 'center', padding: 7, borderBottom: '1px solid var(--line)' }}>
+              <button type="button" onClick={() => selectNode(node.id)} style={{ flex: 1, textAlign: 'left' }}>{node.label} <small>({node.type})</small></button>
+              {node.community && <Button onClick={() => void expand(node.id)}>open</Button>}
+              {node.uri && <Button variant="ghost" onClick={() => onOpenEgoNetwork?.(node.uri!)}>ego</Button>}
+              {node.uri && node.type === 'memory' && <Button variant="ghost" onClick={() => onOpenInspector?.(node.uri!)}>evidence</Button>}
+            </div>)}
+            {currentPage?.nextCursor && <Button onClick={() => void fetchCommunity(currentPage.community.id, currentPage.nextCursor!)}>load next catalogue page</Button>}
+          </div>}
         {(selectedCommunity || selectedEntity) && <aside style={{ position: 'absolute', right: 12, bottom: 12, width: 300, padding: 12, background: 'var(--panel)', border: '1px solid var(--line)', borderRadius: 10 }}>
           <strong>{selected?.label}</strong>
           <div style={{ marginTop: 5, color: 'var(--text-dim)', fontSize: 11 }}>{selectedCommunity ? 'Community aggregate' : `${selected?.type} · degree ${selected?.degree}`}</div>
@@ -227,15 +267,20 @@ export function MemoryConstellationV2({
         </aside>}
         {currentPage?.nextCursor && <Button onClick={() => void fetchCommunity(currentPage.community.id, currentPage.nextCursor!)} style={{ position: 'absolute', left: 12, bottom: 12 }}>load more in community</Button>}
         {scene.partial && <div style={{ position: 'absolute', left: 12, top: 12, padding: '5px 8px', borderRadius: 6, background: 'var(--panel)', color: 'var(--amber)', fontSize: 10 }}>Partial level · bounded continuation available</div>}
+        {overview.revision.state !== 'current' && <div style={{ position: 'absolute', left: 12, top: scene.partial ? 42 : 12, padding: '5px 8px', borderRadius: 6, background: 'var(--panel)', color: 'var(--amber)', fontSize: 10 }}>
+          {overview.revision.state === 'building' ? 'A newer hierarchy is building; this complete generation remains navigable.' : `This generation is stale (source ${overview.revision.sourceRevision}, current ${overview.revision.currentRevision}).`}
+        </div>}
+        {codeEntities === 0 && path.length === 0 && <div style={{ position: 'absolute', left: 12, top: 42, padding: '5px 8px', borderRadius: 6, background: 'var(--panel)', color: 'var(--text-dim)', fontSize: 10 }}>No repository entities are present in this generation; repository indexing may not have run.</div>}
         {error && <div role="status" style={{ position: 'absolute', left: 12, bottom: 54, maxWidth: 420, color: 'var(--red-soft)', background: 'var(--panel)', padding: 8 }}>{error}</div>}
         {hits.length > 0 && <div style={{ position: 'absolute', right: 14, top: 10, width: 360, maxHeight: 300, overflow: 'auto', background: 'var(--panel)', border: '1px solid var(--line)', borderRadius: 8 }}>
           {hits.map((hit) => <button key={`${hit.entityType}:${hit.id}`} type="button" onClick={() => void focusHit(hit)} style={{ display: 'block', width: '100%', padding: 9, textAlign: 'left', borderBottom: '1px solid var(--line)' }}>{hit.title}<small style={{ display: 'block', color: 'var(--text-dim)' }}>{hit.entityType} · {hit.uri}</small></button>)}
         </div>}
         {searching && <div style={{ position: 'absolute', right: 18, top: 16, color: 'var(--text-dim)', fontSize: 10 }}>searching…</div>}
-        <details style={{ position: 'absolute', left: 12, top: 42, maxHeight: '60%', width: 300, overflow: 'auto', background: 'var(--panel)', padding: 8, borderRadius: 8 }}>
-          <summary>Accessible visible list ({scene.nodes.length})</summary>
-          {scene.nodes.map((node) => <button key={node.id} type="button" onClick={() => selectNode(node.id)} onDoubleClick={() => { if (node.community) void expand(node.id); }} style={{ display: 'block', width: '100%', textAlign: 'left', padding: 5 }}>{node.label} <small>({node.type})</small></button>)}
-        </details>
+        {!rendererFailure && <details style={{ position: 'absolute', left: 12, top: codeEntities === 0 && path.length === 0 ? 70 : 42, maxHeight: '60%', width: 300, overflow: 'auto', background: 'var(--panel)', padding: 8, borderRadius: 8 }}>
+          <summary>Accessible visible list ({filteredScene.nodes.length})</summary>
+          {filteredScene.nodes.map((node) => <button key={node.id} type="button" onClick={() => selectNode(node.id)} onDoubleClick={() => { if (node.community) void expand(node.id); }} style={{ display: 'block', width: '100%', textAlign: 'left', padding: 5 }}>{node.label} <small>({node.type})</small></button>)}
+          {currentPage?.nextCursor && <Button onClick={() => void fetchCommunity(currentPage.community.id, currentPage.nextCursor!)}>load next page</Button>}
+        </details>}
       </div>
     </div>
   );

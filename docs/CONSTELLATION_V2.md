@@ -295,3 +295,22 @@ position changes. Missing WebGL2, context loss, three consecutive over-budget fr
 failure, or generation unavailability switches to the complete textual catalogue with an explicit
 reason and a retry action. Empty canonical graph, unindexed repository, stale generation, building
 generation, partial incident page, unreachable store, and rendering fallback are distinct states.
+
+### Product integration and initial cutover
+
+The Memory map keeps the established 2D constellation as its default while production GPU and
+dataset budgets are being validated. People can explicitly choose **Try 3D v2** and the choice is
+remembered per browser; **Use 2D map** is always available as an immediate escape hatch. This is a
+cutover gate, not a separate source of truth: both surfaces preserve the existing inspector and
+ego-network URI handoffs.
+
+Search remains hybrid and server-owned. A selected result is routed by its exact canonical URI into
+the required hierarchy path, then visually promoted with size as well as colour. Type filters,
+breadcrumbs, freshness and coverage labels, and the selected entity's details remain React-owned
+controls outside the canvas.
+
+If the GPU renderer cannot start or later loses its context, the v2 controller remains mounted and
+shows the same paginated hierarchy as a complete textual catalogue. Search routing, page
+continuations, selection, evidence, and ego-network actions continue to work without WebGL. The
+fallback therefore changes presentation only; it does not silently return to a bounded v1 sample
+or discard navigation state.

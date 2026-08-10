@@ -23,6 +23,7 @@ export interface MemoryConstellation3DProps {
   nodes: Constellation3DNode[];
   edges: Constellation3DEdge[];
   selectedNodeId: string | null;
+  highlightedNodeIds?: string[];
   theme?: 'dark' | 'light';
   reducedMotion?: boolean;
   onSelectNode?: (nodeId: string | null) => void;
@@ -99,7 +100,7 @@ function midpoint(edge: Constellation3DEdgeSegment): [number, number, number] {
  * React only owns the canvas, failure state, and a fixed label budget. It is intentionally not
  * wired into MemoryView until the cutover task establishes fallback and parity. */
 export function MemoryConstellation3D({
-  projectId, generationId, layoutVersion, nodes, edges, selectedNodeId, theme = 'dark', reducedMotion = false,
+  projectId, generationId, layoutVersion, nodes, edges, selectedNodeId, highlightedNodeIds = [], theme = 'dark', reducedMotion = false,
   onSelectNode, onOpenEgoNetwork, onOpenInspector, onRendererFailure,
 }: MemoryConstellation3DProps) {
   const hostRef = useRef<HTMLDivElement>(null);
@@ -152,7 +153,8 @@ export function MemoryConstellation3D({
         const initialCameraPosition = constellationCameraPosition(cameraState);
         camera.position.set(...initialCameraPosition);
         camera.lookAt(...cameraState.target);
-        const plan = buildConstellation3DRenderPlan(layoutNodes, edges, null, LABEL_BUDGET);
+        const highlighted = new Set(highlightedNodeIds);
+        const plan = buildConstellation3DRenderPlan(layoutNodes, edges, null, LABEL_BUDGET, highlighted);
         const nodeMeshes: Three.InstancedMesh[] = [];
         const matrix = new THREE.Matrix4();
         const color = new THREE.Color();
@@ -166,7 +168,8 @@ export function MemoryConstellation3D({
             const mesh = new THREE.InstancedMesh(geometry, material, group.length);
             mesh.userData.nodeIds = group.map((node) => node.id);
             group.forEach((node, index) => {
-              matrix.makeScale(node.scale, node.scale, node.scale);
+              const scale = node.scale * (node.highlighted ? 1.3 : 1);
+              matrix.makeScale(scale, scale, scale);
               matrix.setPosition(...node.position);
               mesh.setMatrixAt(index, matrix);
               color.setHSL(hueFor(node.type) / 360, theme === 'dark' ? 0.7 : 0.6, theme === 'dark' ? 0.62 : 0.42);
@@ -189,7 +192,8 @@ export function MemoryConstellation3D({
           );
           halo.userData.nodeIds = leadNodes.map((node) => node.id);
           leadNodes.forEach((node, index) => {
-            matrix.makeScale(node.scale, node.scale, node.scale);
+            const scale = node.scale * (highlighted.has(node.id) ? 1.3 : 1);
+            matrix.makeScale(scale, scale, scale);
             matrix.setPosition(...node.position);
             halo.setMatrixAt(index, matrix);
           });
@@ -231,7 +235,7 @@ export function MemoryConstellation3D({
         const render = () => renderer.render(scene, camera);
         const renderEdges = (selection: string | null) => {
           clearEdges();
-          const selectedPlan = buildConstellation3DRenderPlan(layoutNodes, edges, selection, LABEL_BUDGET);
+          const selectedPlan = buildConstellation3DRenderPlan(layoutNodes, edges, selection, LABEL_BUDGET, highlighted);
           const base = lineObject(THREE, selectedPlan.baseEdges, theme === 'dark' ? 0x7790aa : 0x506070, selection ? 0.1 : 0.38, 0);
           if (base) { scene.add(base); edgeObjects.push(base); }
           const promoted = lineObject(THREE, selectedPlan.promotedEdges, theme === 'dark' ? 0xffd166 : 0x8a5a00, 1, 10);
@@ -312,7 +316,7 @@ export function MemoryConstellation3D({
       rendererRef.current = null;
     };
     // Scene reconstruction is reserved for page integration/theme changes, not selection.
-  }, [layoutNodes, edges, theme, onRendererFailure]);
+  }, [layoutNodes, edges, highlightedNodeIds, theme, onRendererFailure]);
 
   useEffect(() => { rendererRef.current?.renderEdges(selectedNodeId); }, [selectedNodeId]);
   useEffect(() => { rendererRef.current?.applyCamera(cameraState); }, [cameraState]);

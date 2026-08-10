@@ -50,6 +50,7 @@ afterEach(() => {
   container?.remove();
   root = null;
   vi.restoreAllMocks();
+  localStorage.removeItem('noriq.memory.mapMode');
   history.replaceState(null, '', '/'); // the star map writes q/facet/selection params
 });
 
@@ -90,6 +91,20 @@ function emptyConstellation(overrides: Partial<ApiConstellation> = {}): ApiConst
 }
 
 describe('the memory view lands on the map (PLNR-287)', () => {
+  it('offers the integrated v2 surface without removing the established 2D escape hatch', async () => {
+    vi.spyOn(api, 'memoryConstellation').mockResolvedValue(emptyConstellation());
+    vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });
+    vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({
+      revision: { contract: 'constellation-v2', generationId: 'g1', sourceRevision: 1, currentRevision: 1, topologyVersion: 'connectivity-v1', layoutVersion: 'space-v1', state: 'current', generatedAt: 'now' },
+      communities: [], routes: [], coverage: { complete: true, reasons: [] },
+    });
+    mount(); await tick();
+    const toggle = [...container.querySelectorAll('button')].find((button) => button.textContent === 'try 3D v2')!;
+    act(() => toggle.click()); await tick();
+    expect(text()).toContain('No memory entities are present in this completed generation');
+    expect([...container.querySelectorAll('button')].some((button) => button.textContent === 'use 2D map')).toBe(true);
+  });
+
   it('shows the map, search-focused, with Explore/Graph/Operations each one tab away', async () => {
     vi.spyOn(api, 'memoryConstellation').mockResolvedValue(emptyConstellation());
     vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });

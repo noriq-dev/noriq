@@ -33,6 +33,7 @@ export interface Constellation3DNodeInstance extends Constellation3DNode {
   scale: number;
   opacity: number;
   halo: boolean;
+  highlighted: boolean;
 }
 
 export interface Constellation3DEdgeSegment extends Constellation3DEdge {
@@ -74,12 +75,14 @@ export function constellation3DNodeEncoding(node: Constellation3DNode): Constell
     scale: (node.community ? 8 : 2.4) + Math.log2(Math.max(1, node.degree + 1)) * (node.community ? 1.4 : 0.65) + authority * 0.25,
     opacity: node.validity === 'superseded' || node.validity === 'expired' || node.validity === 'stale' ? 0.42 : 1,
     halo: node.isLead === true,
+    highlighted: false,
   };
 }
 
 function compareLabelPriority(a: Constellation3DNodeInstance, b: Constellation3DNodeInstance, selectedNodeId: string | null) {
   const score = (node: Constellation3DNodeInstance) =>
-    (node.id === selectedNodeId ? 1_000_000 : 0) + (node.community ? 100_000 : 0) + (node.halo ? 10_000 : 0) + node.degree;
+    (node.id === selectedNodeId ? 1_000_000 : 0) + (node.highlighted ? 500_000 : 0)
+      + (node.community ? 100_000 : 0) + (node.halo ? 10_000 : 0) + node.degree;
   return score(b) - score(a) || a.id.localeCompare(b.id);
 }
 
@@ -90,11 +93,13 @@ export function buildConstellation3DRenderPlan(
   edges: Constellation3DEdge[],
   selectedNodeId: string | null,
   labelBudget = 24,
+  highlightedNodeIds: ReadonlySet<string> = new Set(),
 ): Constellation3DRenderPlan {
   const nodeGroups = new Map<Constellation3DShape, Constellation3DNodeInstance[]>();
   const byId = new Map<string, Constellation3DNodeInstance>();
   for (const input of nodes) {
     const node = constellation3DNodeEncoding(input);
+    node.highlighted = highlightedNodeIds.has(node.id);
     byId.set(node.id, node);
     const group = nodeGroups.get(node.shape);
     if (group) group.push(node);
