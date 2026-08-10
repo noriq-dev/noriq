@@ -12,7 +12,7 @@ import { StagedRow } from '@noriq-dev/shared';
 import { createHash, type Hash } from 'node:crypto';
 
 /** Per-batch byte ceiling — a bound, not a tune-for-performance number (mirrors backup.ts's
- *  DEFAULT_CHUNK_ROWS comment): the point is that a batch is never allowed to grow the Worker's
+ *  MEMORY_BACKUP_CHUNK_ROWS comment): the point is that a batch is never allowed to grow the Worker's
  *  memory past this, not that this number is tuned for throughput. */
 export const MAX_INGEST_BATCH_BYTES = 8 * 1024 * 1024;
 export const MAX_INGEST_BATCH_UNCOMPRESSED_BYTES = 16 * 1024 * 1024;
@@ -58,14 +58,17 @@ export async function verifyBatchChecksum(bytes: Uint8Array, expectedHash: strin
 
 /** Decode a checksum-verified, gzip'd JSONL batch into rows. Row SHAPE is not this task's concern
  *  (PLNR-261/262 map rows into real entities) — only that the bytes decode. */
-export async function decodeBatchRows(bytes: Uint8Array): Promise<Array<Record<string, unknown>>> {
-  const text = await gunzip(bytes);
-  if (text.length > MAX_INGEST_BATCH_UNCOMPRESSED_BYTES) {
-    throw new Error(`uncompressed batch exceeds ${MAX_INGEST_BATCH_UNCOMPRESSED_BYTES} bytes`);
+export async function decodeBatchRows(
+  bytes: Uint8Array,
+  maxUncompressedBytes = MAX_INGEST_BATCH_UNCOMPRESSED_BYTES,
+): Promise<Array<Record<string, unknown>>> {
+  const text = await gunzip(bytes, maxUncompressedBytes);
+  if (text.length > maxUncompressedBytes) {
+    throw new Error(`uncompressed batch exceeds ${maxUncompressedBytes} bytes`);
   }
   const decodedBytes = new TextEncoder().encode(text).byteLength;
-  if (decodedBytes > MAX_INGEST_BATCH_UNCOMPRESSED_BYTES) {
-    throw new Error(`uncompressed batch exceeds ${MAX_INGEST_BATCH_UNCOMPRESSED_BYTES} bytes`);
+  if (decodedBytes > maxUncompressedBytes) {
+    throw new Error(`uncompressed batch exceeds ${maxUncompressedBytes} bytes`);
   }
   if (!text.length) return [];
   return text.split('\n').filter((line) => line.length > 0).map((line) => JSON.parse(line) as Record<string, unknown>);

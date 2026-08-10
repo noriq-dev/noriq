@@ -21,7 +21,7 @@ export const MEMORY_BACKUP_FORMAT_VERSION = 1;
 
 /** Rows per chunk. A bound, not a tune-for-performance number — the point is that the exporter
  *  never holds more than one chunk's worth of one table's rows in memory at a time. */
-const DEFAULT_CHUNK_ROWS = 500;
+export const MEMORY_BACKUP_CHUNK_ROWS = 500;
 
 // Exported for restore.ts (PLNR-249) and lifecycle.ts (PLNR-250) — they read/enumerate exactly
 // what this file writes, so the prefix convention, the compression codec, and the checksum
@@ -30,15 +30,20 @@ export const projectBackupsPrefix = (projectId: string): string => `memory-backu
 export const backupPrefix = (projectId: string, exportedAt: string): string =>
   `${projectBackupsPrefix(projectId)}${exportedAt.replace(/[:.]/g, '-')}`;
 
-async function drainStream(readable: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+async function drainStream(readable: ReadableStream<Uint8Array>, maxBytes = Number.POSITIVE_INFINITY): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
   const reader = readable.getReader();
+  let total = 0;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
+    total += value.length;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {});
+      throw new Error(`decompressed payload exceeds ${maxBytes} bytes`);
+    }
     chunks.push(value);
   }
-  const total = chunks.reduce((n, c) => n + c.length, 0);
   const out = new Uint8Array(total);
   let offset = 0;
   for (const c of chunks) {
@@ -57,15 +62,21 @@ export async function gzip(text: string): Promise<Uint8Array> {
   return out;
 }
 
-export async function gunzip(bytes: Uint8Array): Promise<string> {
+export async function gunzip(bytes: Uint8Array, maxOutputBytes = Number.POSITIVE_INFINITY): Promise<string> {
   const ds = new DecompressionStream('gzip');
   const writer = ds.writable.getWriter();
   // Same ArrayBufferLike/ArrayBuffer generic mismatch as sha256HexBytes above — bytes here are
   // always a freshly allocated ArrayBuffer (R2's arrayBuffer() produces one).
   const writeDone = writer.write(bytes as unknown as Uint8Array<ArrayBuffer>).then(() => writer.close());
-  const out = await drainStream(ds.readable);
-  await writeDone;
-  return new TextDecoder().decode(out);
+  try {
+    const out = await drainStream(ds.readable, maxOutputBytes);
+    await writeDone;
+    return new TextDecoder().decode(out);
+  } catch (error) {
+    await writer.abort(error).catch(() => {});
+    await writeDone.catch(() => {});
+    throw error;
+  }
 }
 
 export async function sha256HexBytes(bytes: Uint8Array): Promise<string> {
@@ -109,7 +120,7 @@ export async function exportMemorySnapshot(opts: ExportMemorySnapshotOptions): P
   if (!opts.env.FILES) throw new Error('R2 (FILES) not configured');
   const files = opts.env.FILES;
   const prefix = backupPrefix(opts.projectId, opts.exportedAt);
-  const limit = opts.chunkRowLimit ?? DEFAULT_CHUNK_ROWS;
+  const limit = opts.chunkRowLimit ?? MEMORY_BACKUP_CHUNK_ROWS;
 
   const tableCounts: Record<string, number> = {};
   const checksums: Record<string, string> = {};

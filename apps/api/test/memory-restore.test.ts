@@ -5,7 +5,9 @@ import { env } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import type { Env } from '../src/env';
 import { createUser, mintTokenForUser, mcpCall } from './helpers';
-import { checkManifestHeader } from '../src/memory/restore';
+import { checkManifestHeader, readSnapshotChunks } from '../src/memory/restore';
+import { backupPrefix, gzip, sha256HexBytes } from '../src/memory/backup';
+import { BACKUP_TABLES } from '../src/do/ProjectMemory';
 import { MemoryBackupManifest } from '@noriq-dev/shared';
 
 const appEnv = env as unknown as Env;
@@ -99,6 +101,66 @@ describe('checkManifestHeader — pure, no R2 involved', () => {
   it('accepts a matching project at a compatible schema version', () => {
     const manifest = MemoryBackupManifest.parse({ ...base, projectId: 'prj_a' });
     expect(checkManifestHeader(manifest, 'prj_a', 1)).toEqual({ ok: true, problems: [] });
+  });
+
+  it('refuses an unsupported backup format version', () => {
+    const manifest = MemoryBackupManifest.parse({ ...base, projectId: 'prj_a', formatVersion: 2 });
+    const result = checkManifestHeader(manifest, 'prj_a', 1);
+    expect(result.ok).toBe(false);
+    expect(result.problems.join()).toContain('unsupported backup format version 2');
+  });
+
+  it('requires the complete canonical table inventory before restore staging', () => {
+    const tableCounts = Object.fromEntries(BACKUP_TABLES.map((table) => [table, 0]));
+    delete tableCounts.nodes;
+    const manifest = MemoryBackupManifest.parse({ ...base, projectId: 'prj_a', tableCounts });
+    const result = checkManifestHeader(manifest, 'prj_a', 1, BACKUP_TABLES);
+    expect(result.ok).toBe(false);
+    expect(result.problems).toContain('manifest is missing table count for nodes');
+  });
+
+  it('refuses non-contiguous chunk indices and mismatched evidence references', () => {
+    const tableCounts = Object.fromEntries(BACKUP_TABLES.map((table) => [table, table === 'nodes' ? 1 : 0]));
+    const manifest = MemoryBackupManifest.parse({
+      ...base,
+      projectId: 'prj_a',
+      tableCounts,
+      checksums: { 'nodes/chunk-1.jsonl.gz': '0'.repeat(64) },
+      r2EvidenceRefs: ['memory-backups/prj_a/wrong/chunk'],
+    });
+    const result = checkManifestHeader(manifest, 'prj_a', 1, BACKUP_TABLES);
+    expect(result.ok).toBe(false);
+    expect(result.problems).toContain('nodes: chunk indices must be contiguous from 0');
+    expect(result.problems).toContain('r2EvidenceRefs do not exactly match the manifest chunk inventory');
+  });
+});
+
+describe('readSnapshotChunks — hostile payload bounds', () => {
+  it('stops a checksum-valid gzip expansion before parsing or staging rows', async () => {
+    const projectId = 'prj_restore_expansion_bound';
+    const exportedAt = '2026-08-10T00:00:00.000Z';
+    const relKey = 'nodes/chunk-0.jsonl.gz';
+    const bytes = await gzip(JSON.stringify({ id: 'node_a', content: 'x'.repeat(4096) }));
+    const manifest = MemoryBackupManifest.parse({
+      formatVersion: 1,
+      projectMemorySchemaVersion: 1,
+      projectId,
+      memoryRevision: 0,
+      exportedAt,
+      tier: 'core',
+      tableCounts: { nodes: 1 },
+      checksums: { [relKey]: await sha256HexBytes(bytes) },
+      activeIndexGenerations: [],
+      r2EvidenceRefs: [`${backupPrefix(projectId, exportedAt)}/${relKey}`],
+    });
+    await appEnv.FILES!.put(`${backupPrefix(projectId, exportedAt)}/${relKey}`, bytes);
+
+    const consume = async () => {
+      for await (const _chunk of readSnapshotChunks(appEnv, manifest, { maxUncompressedBytes: 1024 })) {
+        // The bound must reject before yielding a parsed chunk.
+      }
+    };
+    await expect(consume()).rejects.toThrow('exceeds 1024 bytes');
   });
 });
 

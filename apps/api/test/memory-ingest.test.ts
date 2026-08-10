@@ -9,7 +9,7 @@ import type { Actor } from '../src/do/ProjectRoom';
 import type { Env } from '../src/env';
 import { gzip, sha256HexBytes } from '../src/memory/backup';
 import {
-  canonicalStagedRowJson, computeStagedContentHash, ingestCompletionErrorStatus,
+  canonicalStagedRowJson, computeStagedContentHash, decodeBatchRows, ingestCompletionErrorStatus,
   OrderedStagedContentHasher,
 } from '../src/memory/ingest';
 
@@ -89,6 +89,11 @@ beforeAll(async () => {
 }, 60000);
 
 describe('bounded generation completion helpers', () => {
+  it('stops gzip expansion at the uncompressed byte ceiling', async () => {
+    const compressed = await gzip(JSON.stringify({ content: 'x'.repeat(4096) }));
+    await expect(decodeBatchRows(compressed, 1024)).rejects.toThrow('exceeds 1024 bytes');
+  });
+
   it('incrementally hashes canonically ordered rows without changing the wire digest', async () => {
     const rows = [
       { kind: 'node' as const, uri: 'noriq://file/INGX/ingx-repo/a.ts', type: 'file', label: 'a.ts', content: 'const a = 1;' },

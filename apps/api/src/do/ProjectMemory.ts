@@ -1403,7 +1403,7 @@ export class ProjectMemory extends DurableObject<Env> {
     } catch (err) {
       return { ok: false, reason: `could not fetch manifest: ${String(err)}` };
     }
-    const header = checkManifestHeader(manifest, projectId, this.readSchemaVersion());
+    const header = checkManifestHeader(manifest, projectId, this.readSchemaVersion(), BACKUP_TABLES);
     if (!header.ok) return { ok: false, reason: header.problems.join('; ') };
 
     try {
