@@ -4479,6 +4479,34 @@ export class ProjectMemory extends DurableObject<Env> {
     };
   }
 
+  /** PLNR-301: bounded terminal episode facts for D1 shadow-snapshot comparison. The request is
+   * keyed only by run+sitting; execution stages are never returned as observations. */
+  async comparisonEpisodes(
+    projectId: string,
+    input: { cases: Array<{ runId: string; sitting: number }>; limit?: number },
+  ): Promise<{
+    episodes: Array<{ episodeId: string; runId: string; sitting: number; body: string }>;
+    coverage: { complete: boolean; reasons: string[] };
+  }> {
+    await this.assertProjectId(projectId);
+    const limit = Math.min(2_000, Math.max(1, Math.trunc(input.limit ?? 1_000)));
+    const requested = input.cases.slice(0, limit);
+    const episodes: Array<{ episodeId: string; runId: string; sitting: number; body: string }> = [];
+    for (let offset = 0; offset < requested.length; offset += 40) {
+      const chunk = requested.slice(offset, offset + 40);
+      const predicate = chunk.map((_, index) => `(run_id = ?${index * 2 + 1} AND sitting = ?${index * 2 + 2})`).join(' OR ');
+      const values = chunk.flatMap((item) => [item.runId, item.sitting]);
+      episodes.push(...this.ctx.storage.sql.exec<{
+        episodeId: string; runId: string; sitting: number; body: string;
+      }>(
+        `SELECT id AS episodeId, run_id AS runId, sitting, body FROM episodes WHERE ${predicate}`,
+        ...values,
+      ).toArray());
+    }
+    const reasons = input.cases.length > limit ? [`comparison episode request exceeded ${limit} cases`] : [];
+    return { episodes, coverage: { complete: reasons.length === 0, reasons } };
+  }
+
   // ---------------------------------------------------------------------------
   // Named graph-query primitives (PLNR-258) — dependency neighborhoods, validating tests,
   // implementing work, decision lineage, and change impact. Each executes bounded traversals

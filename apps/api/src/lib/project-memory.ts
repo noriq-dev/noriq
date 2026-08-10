@@ -275,6 +275,12 @@ export interface ProjectMemoryStub {
       cursor?: string; includeCrossBranch?: boolean; includeStaleEvidence?: boolean;
     },
   ): Promise<SimilarEffortResult>;
+  comparisonEpisodes(projectId: string, input: {
+    cases: Array<{ runId: string; sitting: number }>; limit?: number;
+  }): Promise<{
+    episodes: Array<{ episodeId: string; runId: string; sitting: number; body: string }>;
+    coverage: { complete: boolean; reasons: string[] };
+  }>;
   /** PLNR-258: named graph-query primitives — see memory/graph-queries.ts for the shared
    *  completeness-marker contract every one of these returns. */
   dependencyNeighborhood(

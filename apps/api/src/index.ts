@@ -49,6 +49,9 @@ import {
 import { renderEvidenceFrame, type EvidenceFrameItem } from './memory/evidence-frame';
 import { assembleContextPack } from './memory/context-pack';
 import { assessPreDispatchRisk } from './memory/scope-risk';
+import {
+  COMPARISON_METRICS, queryStrategyComparison, STRATEGY_DIMENSIONS,
+} from './memory/strategy-comparison';
 import { assessProjectBottlenecks, BOTTLENECK_TASK_LIMIT } from './memory/bottlenecks';
 import {
   getSimilarityCalibration,
@@ -1881,6 +1884,25 @@ app.post('/api/projects/:pid/memory/pre-dispatch-risk', userAuth, async (c) => {
     .bind(parsed.data.taskId, parsed.data.taskId, pid).first<{ id: string }>();
   if (!task) return c.json({ error: 'not found' }, 404);
   return c.json(await assessPreDispatchRisk(c.env, pid, task.id, parsed.data));
+});
+
+// PLNR-301: historical correlation-aware comparison. Dimension is a closed pre-execution enum;
+// metric is a separate outcome enum, so an outcome cannot become a cohort key by construction.
+app.post('/api/projects/:pid/memory/strategy-comparison', userAuth, async (c) => {
+  const parsed = z.object({
+    dimension: z.enum(STRATEGY_DIMENSIONS), metric: z.enum(COMPARISON_METRICS),
+    from: z.string().datetime().optional(), to: z.string().datetime().optional(),
+    limit: z.number().int().positive().max(2_000).optional(),
+    policy: z.object({
+      minimumCases: z.number().int().min(2).optional(),
+      minimumIndependentClusters: z.number().int().min(2).optional(),
+      minimumMetricCompleteness: z.number().min(0).max(1).optional(),
+      bootstrapIterations: z.number().int().min(200).max(5_000).optional(),
+      confidence: z.number().min(0.8).max(0.99).optional(),
+    }).strict().optional(),
+  }).strict().safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid strategy comparison request', detail: parsed.error.issues }, 400);
+  return c.json(await queryStrategyComparison(c.env, c.req.param('pid')!, parsed.data));
 });
 
 // PLNR-296: read-only current collision/readiness/capacity evidence. Like the pre-dispatch report,

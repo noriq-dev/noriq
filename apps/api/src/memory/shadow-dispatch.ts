@@ -82,6 +82,7 @@ export interface ShadowDispatchSnapshot {
       selectedBy: { kind: 'human' | 'agent' | 'system' | 'unknown'; id: string };
       requested: RunCommissioningSnapshot['requested'];
       commissioned: RunCommissioningSnapshot['commissioned'];
+      commissionedConfiguration: RunCommissioningSnapshot['configuration'];
     };
     gateMode: Feature<string>;
     runnerCapabilityClass: Feature<{
@@ -266,6 +267,7 @@ export async function captureShadowDispatchSnapshot(
           id: base.createdBy,
         },
         requested: commissioning.requested, commissioned: commissioning.commissioned,
+        commissionedConfiguration: commissioning.configuration,
       },
       gateMode: commissioning.gateMode
         ? { status: 'complete', value: commissioning.gateMode, source: 'plan_dispatch', version: null, reasons: [] }
