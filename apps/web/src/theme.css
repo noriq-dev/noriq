@@ -170,10 +170,8 @@ button { all: unset; box-sizing: border-box; max-width: 100%; }
   /* Roomier tap targets, tighter page padding. */
   .content-pad { padding-left: 14px !important; padding-right: 14px !important; }
 
-  /* TopBar: hide the redundant project block (shown in the mobile bar), let the
-     view tabs scroll horizontally instead of clipping. */
+  /* The compact project bar can still scroll its actions on narrow screens. */
   .topbar { padding: 0 12px !important; gap: 10px !important; overflow-x: auto; }
-  .topbar-project { display: none !important; }
 }
 
 /* PLNR-145: second mobile pass — the surfaces added since PLNR-68, plus the classic

@@ -5,6 +5,7 @@
 // the local list only knows task titles/keys.
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { api, type ApiSearchHit } from '../api';
+import { PROJECT_NAV_ITEMS } from '../project-navigation';
 import type { AppStore } from '../store';
 import type { ViewId } from '../types';
 import { MonoTag } from './bits';
@@ -18,9 +19,8 @@ interface Cmd {
 }
 
 const VIEW_LABELS: Array<[ViewId, string]> = [
-  ['control', 'Mission Control'], ['graph', 'Orchestration'], ['board', 'Board'],
-  ['plans', 'Plans'], ['roadmap', 'Roadmap'], ['review', 'Review queue'], ['docs', 'Docs'],
-  ['ask', 'Ask'], ['runs', 'Runs'], ['agents', 'Agents'], ['home', 'Home'],
+  ...PROJECT_NAV_ITEMS.map((item): [ViewId, string] => [item.id, item.label]),
+  ['ask', 'Ask'], ['home', 'Home'],
 ];
 
 export function CommandPalette({ store }: { store: AppStore }) {
