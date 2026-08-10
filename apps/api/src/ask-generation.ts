@@ -7,6 +7,7 @@ import {
 import { listWorkspaceProjects } from './lib/workspace-operations';
 import { resolveAskModel } from './ask-models';
 import { askToolDecisionClient, createAskReadTools, finalAskMessages, runAskToolLoop } from './ask-tools';
+import { listAskActions } from './ask-actions';
 
 const encoder = new TextEncoder();
 const frame = (event: string, data: unknown): Uint8Array =>
@@ -147,12 +148,14 @@ export function askGenerationEventStream(
           }
           if (current.revision !== revision) {
             revision = current.revision;
+            const actions = await listAskActions(env.DB, userId, { generationId });
             controller.enqueue(frame('meta', {
               sources: current.sources,
               mode: current.mode,
               model: current.model,
               graphEnhanced: current.graphEnhanced,
               trace: current.trace,
+              actions,
             }));
             controller.enqueue(frame('status', { phase: current.status }));
             if (current.reasoning.length > reasoningOffset) {

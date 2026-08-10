@@ -1,7 +1,7 @@
 // Global Ask — a durable, per-user multi-turn chat enriched with accessible project context.
 import { useEffect, useRef, useState } from 'react';
 import {
-  api, ApiError, type ApiAskHistoryMessage, type ApiAskSource, type ApiAskStoredMessage, type ApiAskThread,
+  api, ApiError, type ApiAskAction, type ApiAskHistoryMessage, type ApiAskSource, type ApiAskStoredMessage, type ApiAskThread,
 } from '../api';
 import type { AppStore } from '../store';
 import { MonoTag, WaveBars } from './bits';
@@ -37,6 +37,7 @@ interface ThreadMessage extends ApiAskHistoryMessage {
   generationId?: string;
   generationStatus?: ApiAskStoredMessage['generationStatus'];
   generationError?: string;
+  actions?: ApiAskAction[];
 }
 
 const fromStoredMessage = (message: ApiAskStoredMessage): ThreadMessage => ({
@@ -51,6 +52,7 @@ const fromStoredMessage = (message: ApiAskStoredMessage): ThreadMessage => ({
   generationId: message.generationId ?? undefined,
   generationStatus: message.generationStatus,
   generationError: message.generationError ?? undefined,
+  actions: message.actions,
 });
 
 const modelLabel = (model?: string) => model?.includes('gpt-oss-120b') ? 'GPT-OSS 120B · Cloudflare' : 'Cloudflare Workers AI';
@@ -108,6 +110,7 @@ export function AskView({ store }: { store: AppStore }) {
       mode: meta.mode ?? undefined,
       model: meta.model ?? undefined,
       trace: meta.trace ?? message.trace,
+      actions: meta.actions ?? message.actions,
     })),
     onStatus: (next: 'searching' | 'generating') => {
       setPhase(next);

@@ -16,6 +16,10 @@ import {
 } from '../src/ask-chats';
 import { askGenerationEventStream } from '../src/ask-generation';
 import {
+  AskActionDeniedError, AskActionMaintenanceError, AskActionNotFoundError,
+  approveAskAction, createAskAction, getAskAction,
+} from '../src/ask-actions';
+import {
   AskModelConfigurationError, AskModelSelectionError, askModelCatalog, resolveAskModel,
 } from '../src/ask-models';
 import {
@@ -501,6 +505,103 @@ describe('bounded Ask tool loop', () => {
 });
 
 describe('REST /api/ask', () => {
+  it('persists normalized actions and approves the stored payload exactly once', async () => {
+    const owner = await env.DB.prepare('SELECT owner_user_id AS id FROM projects WHERE id = ?')
+      .bind(projectId).first<{ id: string }>();
+    const thread = await createAskThread(env.DB, owner!.id, 'Action lifecycle');
+    const generation = await createAskGeneration(env.DB, owner!.id, thread.id, 'Propose it', []);
+    const action = await createAskAction(env.DB, {
+      userId: owner!.id, threadId: thread.id, messageId: generation.messageId, generationId: generation.id,
+      projectId, type: 'test_action', summary: 'Execute a test mutation', operationKey: 'ask-test-exact-once',
+      arguments: { z: 2, a: 1 }, expected: { revision: 3 },
+    });
+    expect(action).toMatchObject({ status: 'pending', arguments: { a: 1, z: 2 }, expected: { revision: 3 } });
+    expect((await createAskAction(env.DB, {
+      userId: owner!.id, threadId: thread.id, messageId: generation.messageId, generationId: generation.id,
+      projectId, type: 'test_action', summary: 'Duplicate', operationKey: 'ask-test-exact-once', arguments: { different: true },
+    })).id).toBe(action.id);
+
+    let executions = 0;
+    const executors = { test_action: { async execute(input: { arguments: Record<string, unknown>; expected: Record<string, unknown> }) {
+      executions += 1;
+      expect(input.arguments).toEqual({ a: 1, z: 2 });
+      expect(input.expected).toEqual({ revision: 3 });
+      return { changed: true };
+    } } };
+    const user = { id: owner!.id, name: 'Agent Mint' };
+    expect(await approveAskAction(env as unknown as Env, user, action.id, executors)).toMatchObject({ status: 'approved', result: { changed: true } });
+    expect(await approveAskAction(env as unknown as Env, user, action.id, executors)).toMatchObject({ status: 'approved' });
+    expect(executions).toBe(1);
+
+    const listed = await SELF.fetch(`https://noriq.test/api/ask/actions?threadId=${thread.id}`, { headers: { Cookie: cookie } });
+    expect(listed.status).toBe(200);
+    expect((await listed.json() as { actions: Array<{ id: string }> }).actions).toEqual([expect.objectContaining({ id: action.id })]);
+    expect((await SELF.fetch(`https://noriq.test/api/ask/actions/${action.id}/approve`, {
+      method: 'POST', headers: { Cookie: otherCookie },
+    })).status).toBe(404);
+  });
+
+  it('keeps maintenance/stale proposals safe and deletes actions before their chat', async () => {
+    const owner = await env.DB.prepare('SELECT owner_user_id AS id FROM projects WHERE id = ?')
+      .bind(projectId).first<{ id: string }>();
+    const thread = await createAskThread(env.DB, owner!.id, 'Action safety');
+    const generation = await createAskGeneration(env.DB, owner!.id, thread.id, 'Propose safely', []);
+    const pending = await createAskAction(env.DB, {
+      userId: owner!.id, threadId: thread.id, messageId: generation.messageId, generationId: generation.id,
+      projectId, type: 'stale_action', summary: 'Potentially stale action', operationKey: 'ask-test-stale',
+      arguments: { taskId }, expected: { updatedAt: 'old' },
+    });
+    await expect(approveAskAction(
+      { ...(env as unknown as Env), MAINTENANCE_MODE: '1' },
+      { id: owner!.id, name: 'Agent Mint' }, pending.id,
+      { stale_action: { async execute() { return {}; } } },
+    )).rejects.toBeInstanceOf(AskActionMaintenanceError);
+    expect((await getAskAction(env.DB, owner!.id, pending.id))?.status).toBe('pending');
+
+    const failed = await approveAskAction(env as unknown as Env, { id: owner!.id, name: 'Agent Mint' }, pending.id, {
+      stale_action: { async execute() { throw new Error('target state changed since proposal'); } },
+    });
+    expect(failed).toMatchObject({ status: 'failed', error: 'target state changed since proposal' });
+
+    expect(await deleteAskThread(env.DB, owner!.id, thread.id)).toBe(true);
+    expect(await getAskAction(env.DB, owner!.id, pending.id)).toBeNull();
+  });
+
+  it('rechecks project reach and account write mode before claiming an action', async () => {
+    const noAccess = await createUser('ask-action-no-access@example.com', 'No Access', 'longenough1');
+    const noAccessThread = await createAskThread(env.DB, noAccess.id, 'No access action');
+    const noAccessGeneration = await createAskGeneration(env.DB, noAccess.id, noAccessThread.id, 'Try it', []);
+    const unreachable = await createAskAction(env.DB, {
+      userId: noAccess.id, threadId: noAccessThread.id, messageId: noAccessGeneration.messageId,
+      generationId: noAccessGeneration.id, projectId, type: 'test_action', summary: 'Unreachable target',
+      operationKey: 'ask-action-unreachable', arguments: {},
+    });
+    let executions = 0;
+    const executor = { test_action: { async execute() { executions += 1; return {}; } } };
+    await expect(approveAskAction(env as unknown as Env, { ...noAccess, name: 'No Access' }, unreachable.id, executor))
+      .rejects.toBeInstanceOf(AskActionNotFoundError);
+    expect(executions).toBe(0);
+    expect((await getAskAction(env.DB, noAccess.id, unreachable.id))?.status).toBe('pending');
+
+    const readOnly = await createUser('ask-action-readonly@example.com', 'Read Only', 'longenough1');
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO project_grants (project_id, principal_type, principal_id, role) VALUES (?, 'user', ?, 'contributor')")
+        .bind(projectId, readOnly.id),
+      env.DB.prepare("UPDATE users SET access_mode = 'read_only' WHERE id = ?").bind(readOnly.id),
+    ]);
+    const readOnlyThread = await createAskThread(env.DB, readOnly.id, 'Read-only action');
+    const readOnlyGeneration = await createAskGeneration(env.DB, readOnly.id, readOnlyThread.id, 'Try it', []);
+    const denied = await createAskAction(env.DB, {
+      userId: readOnly.id, threadId: readOnlyThread.id, messageId: readOnlyGeneration.messageId,
+      generationId: readOnlyGeneration.id, projectId, type: 'test_action', summary: 'Read-only target',
+      operationKey: 'ask-action-readonly', arguments: {},
+    });
+    await expect(approveAskAction(env as unknown as Env, { ...readOnly, name: 'Read Only' }, denied.id, executor))
+      .rejects.toBeInstanceOf(AskActionDeniedError);
+    expect(executions).toBe(0);
+    expect((await getAskAction(env.DB, readOnly.id, denied.id))?.status).toBe('pending');
+  });
+
   it('serves the authenticated model catalog and rejects arbitrary model ids', async () => {
     const catalog = await SELF.fetch('https://noriq.test/api/ask/models', { headers: { Cookie: cookie } });
     expect(catalog.status).toBe(200);
@@ -588,6 +689,11 @@ describe('REST /api/ask', () => {
     const owner = await createUser('ask-reconnect@example.com', 'Ask Reconnect', 'longenough1');
     const thread = await createAskThread(env.DB, owner.id, 'Reconnect me');
     const generation = await createAskGeneration(env.DB, owner.id, thread.id, 'Keep going', [], '@cf/test/durable');
+    const proposed = await createAskAction(env.DB, {
+      userId: owner.id, threadId: thread.id, messageId: generation.messageId, generationId: generation.id,
+      projectId: 'prj_reconnect_target', type: 'test_action', summary: 'Reconnect action',
+      operationKey: 'ask-reconnect-action', arguments: { value: true },
+    });
     expect((await getAskGeneration(env.DB, generation.id, owner.id))?.model).toBe('@cf/test/durable');
 
     const follower = askGenerationEventStream(env as unknown as Env, owner.id, generation.id);
@@ -614,12 +720,16 @@ describe('REST /api/ask', () => {
     expect(replay).toContain('data: {"text":"answer"}');
     expect(replay).toContain('data: {"text":"summary"}');
     expect(replay).toContain('event: done');
+    expect(replay).toContain(proposed.id);
 
     const detail = await (await SELF.fetch(`https://noriq.test/api/ask/threads/${thread.id}`, {
       headers: { Cookie: await loginSession('ask-reconnect@example.com', 'longenough1') },
-    })).json() as { messages: Array<{ role: string; generationId?: string; generationStatus?: string; content: string; model?: string }> };
+    })).json() as { messages: Array<{ role: string; generationId?: string; generationStatus?: string; content: string; model?: string; actions?: Array<{ id: string }> }> };
     expect(detail.messages.filter((message) => message.role === 'assistant')).toEqual([
-      expect.objectContaining({ generationId: generation.id, generationStatus: 'completed', content: 'durable answer', model: 'test-model' }),
+      expect.objectContaining({
+        generationId: generation.id, generationStatus: 'completed', content: 'durable answer', model: 'test-model',
+        actions: [expect.objectContaining({ id: proposed.id })],
+      }),
     ]);
     expect(detail.messages.map((message) => message.role)).toEqual(['user', 'assistant']);
   });
@@ -694,6 +804,10 @@ describe('REST /api/ask', () => {
     await env.DB.prepare(
       `INSERT INTO ask_messages (id, thread_id, role, content, created_at) VALUES ('msg_delete_owner', ?, 'user', 'remove me', ?)`,
     ).bind(thread.id, new Date().toISOString()).run();
+    const doomedAction = await createAskAction(env.DB, {
+      userId: doomed.id, threadId: thread.id, messageId: 'msg_delete_owner', projectId: 'prj_deleted_target',
+      type: 'test_action', summary: 'Remove with owner', operationKey: 'ask-delete-owner-action', arguments: {},
+    });
 
     const disabled = await SELF.fetch(`https://noriq.test/api/users/${doomed.id}`, {
       method: 'PATCH', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
@@ -706,5 +820,6 @@ describe('REST /api/ask', () => {
     expect(removed.status).toBe(200);
     expect(await env.DB.prepare('SELECT id FROM ask_threads WHERE id = ?').bind(thread.id).first()).toBeNull();
     expect(await env.DB.prepare("SELECT id FROM ask_messages WHERE id = 'msg_delete_owner'").first()).toBeNull();
+    expect(await env.DB.prepare('SELECT id FROM ask_actions WHERE id = ?').bind(doomedAction.id).first()).toBeNull();
   });
 });

@@ -3,6 +3,7 @@
 
 import type { AskHistoryMessage, AskSource } from './ask';
 import { DEFAULT_ASK_MODEL_ID } from './ask-models';
+import { listAskActions, type StoredAskAction } from './ask-actions';
 import { newId, nowIso } from './lib/util';
 
 export interface AskThreadSummary {
@@ -26,6 +27,7 @@ export interface StoredAskMessage extends AskHistoryMessage {
   generationStatus: AskGenerationStatus | null;
   generationError: string | null;
   createdAt: string;
+  actions: StoredAskAction[];
 }
 
 export type AskGenerationStatus = 'pending' | 'searching' | 'generating' | 'completed' | 'failed';
@@ -114,6 +116,13 @@ export async function getAskThread(db: D1Database, userId: string, threadId: str
     traceJson: string; mode: 'semantic' | 'keyword' | null; model: string | null; createdAt: string;
     generationId: string | null; generationStatus: AskGenerationStatus | null; generationError: string | null;
   }>();
+  const actions = await listAskActions(db, userId, { threadId });
+  const actionsByMessage = new Map<string, StoredAskAction[]>();
+  for (const action of actions) {
+    const list = actionsByMessage.get(action.messageId) ?? [];
+    list.push(action);
+    actionsByMessage.set(action.messageId, list);
+  }
   const messages = results.map((row): StoredAskMessage => ({
     id: row.id,
     role: row.role,
@@ -127,6 +136,7 @@ export async function getAskThread(db: D1Database, userId: string, threadId: str
     generationStatus: row.generationStatus,
     generationError: row.generationError,
     createdAt: row.createdAt,
+    actions: actionsByMessage.get(row.id) ?? [],
   }));
   return {
     ...thread,
@@ -347,6 +357,7 @@ export async function deleteAskThread(db: D1Database, userId: string, threadId: 
   const owned = await db.prepare('SELECT id FROM ask_threads WHERE id = ? AND user_id = ?').bind(threadId, userId).first();
   if (!owned) return false;
   await db.batch([
+    db.prepare('DELETE FROM ask_actions WHERE thread_id = ? AND user_id = ?').bind(threadId, userId),
     db.prepare('DELETE FROM ask_generations WHERE thread_id = ?').bind(threadId),
     db.prepare('DELETE FROM ask_messages WHERE thread_id = ?').bind(threadId),
     db.prepare('DELETE FROM ask_threads WHERE id = ? AND user_id = ?').bind(threadId, userId),

@@ -24,6 +24,10 @@ import {
 } from './ask-chats';
 import { accessibleAskProjectsForUser, askGenerationEventStream } from './ask-generation';
 import { AskModelSelectionError, askModelCatalog, resolveAskModel } from './ask-models';
+import {
+  AskActionConflictError, AskActionDeniedError, AskActionMaintenanceError, AskActionNotFoundError,
+  approveAskAction, listAskActions, rejectAskAction, type AskActionExecutors,
+} from './ask-actions';
 import { verifyUploadToken, resolveUploadSecret, signIngestToken, verifyIngestToken, type IngestClaims } from './lib/upload-token';
 import { USER_PROJECT_WHERE, taskWireStatus, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
 import {
@@ -1893,12 +1897,45 @@ const accessibleAskProjects = async (c: Context<AppContext>): Promise<AskProject
   return accessibleAskProjectsForUser(c.env, c.var.user!.id);
 };
 
+// Concrete normalized mutations are registered by the task-action slice. Keeping the lifecycle
+// executor map explicit makes an unknown or retired type fail closed.
+const ASK_ACTION_EXECUTORS: AskActionExecutors = {};
+
+const askActionError = (c: Context<AppContext>, error: unknown) => {
+  const message = error instanceof Error ? error.message : 'Ask action failed';
+  if (error instanceof AskActionNotFoundError) return c.json({ error: message }, 404);
+  if (error instanceof AskActionDeniedError) return c.json({ error: message }, 403);
+  if (error instanceof AskActionConflictError) return c.json({ error: message }, 409);
+  if (error instanceof AskActionMaintenanceError) return c.json({ error: message }, 503, { 'Retry-After': '30' });
+  return c.json({ error: message }, 400);
+};
+
 app.get('/api/ask/models', userAuth, async (c) => {
   try {
     return c.json(askModelCatalog(c.env));
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Ask model configuration is invalid';
     return c.json({ error: message }, 503);
+  }
+});
+
+app.get('/api/ask/actions', userAuth, async (c) => c.json({
+  actions: await listAskActions(c.env.DB, c.var.user!.id, { threadId: c.req.query('threadId') }),
+}));
+
+app.post('/api/ask/actions/:actionId/approve', userAuth, async (c) => {
+  try {
+    return c.json(await approveAskAction(c.env, c.var.user!, c.req.param('actionId')!, ASK_ACTION_EXECUTORS));
+  } catch (error) {
+    return askActionError(c, error);
+  }
+});
+
+app.post('/api/ask/actions/:actionId/reject', userAuth, async (c) => {
+  try {
+    return c.json(await rejectAskAction(c.env.DB, c.var.user!.id, c.req.param('actionId')!));
+  } catch (error) {
+    return askActionError(c, error);
   }
 });
 
@@ -2567,6 +2604,7 @@ app.delete('/api/users/:uid', userAuth, async (c) => {
     c.env.DB.prepare("DELETE FROM project_grants WHERE principal_type = 'user' AND principal_id = ?").bind(uid),
     c.env.DB.prepare('DELETE FROM oauth_codes WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('DELETE FROM templates WHERE user_id = ?').bind(uid),
+    c.env.DB.prepare('DELETE FROM ask_actions WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('DELETE FROM ask_generations WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('DELETE FROM ask_messages WHERE thread_id IN (SELECT id FROM ask_threads WHERE user_id = ?)').bind(uid),
     c.env.DB.prepare('DELETE FROM ask_threads WHERE user_id = ?').bind(uid),

@@ -25,6 +25,7 @@ export interface ApiAskStreamMeta {
   model: string | null;
   graphEnhanced: boolean;
   trace?: string[];
+  actions?: ApiAskAction[];
 }
 
 export interface ApiAskStreamHandlers {
@@ -381,6 +382,11 @@ export const api = {
   resumeAskStream,
   cancelAskGeneration: (generationId: string) =>
     req<{ ok: true; cancelled: true }>('POST', `/api/ask/generations/${generationId}/cancel`),
+  askActions: (threadId?: string) => req<{ actions: ApiAskAction[] }>(
+    'GET', `/api/ask/actions${threadId ? `?threadId=${encodeURIComponent(threadId)}` : ''}`,
+  ),
+  approveAskAction: (actionId: string) => req<ApiAskAction>('POST', `/api/ask/actions/${actionId}/approve`),
+  rejectAskAction: (actionId: string) => req<ApiAskAction>('POST', `/api/ask/actions/${actionId}/reject`),
   askThreads: (archived = false) =>
     req<{ threads: ApiAskThread[] }>('GET', `/api/ask/threads${archived ? '?archived=1' : ''}`),
   askThread: (threadId: string) => req<ApiAskThreadDetail>('GET', `/api/ask/threads/${threadId}`),
@@ -1018,6 +1024,26 @@ export interface ApiAskHistoryMessage {
   content: string;
 }
 
+export interface ApiAskAction {
+  id: string;
+  threadId: string;
+  messageId: string;
+  generationId: string | null;
+  projectId: string;
+  type: string;
+  summary: string;
+  arguments: Record<string, unknown>;
+  expected: Record<string, unknown>;
+  requiredAction: string;
+  operationKey: string;
+  status: 'pending' | 'executing' | 'approved' | 'rejected' | 'failed';
+  result: unknown;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+  settledAt: string | null;
+}
+
 /** One cross-project grounding source behind a global /ask answer. */
 export interface ApiAskSource {
   kind: 'project' | 'task' | 'run' | 'signal' | 'comment' | 'doc' | 'plan' | 'memory' | 'episode';
@@ -1062,6 +1088,7 @@ export interface ApiAskStoredMessage extends ApiAskHistoryMessage {
   generationStatus?: 'pending' | 'searching' | 'generating' | 'completed' | 'failed' | null;
   generationError?: string | null;
   createdAt: string;
+  actions?: ApiAskAction[];
 }
 
 export interface ApiAskThreadDetail extends ApiAskThread {
