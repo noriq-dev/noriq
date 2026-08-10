@@ -1,7 +1,7 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { api, type ApiAskStreamHandlers, type ApiAskThread, type ApiAskThreadDetail } from '../api';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { api, type ApiAskAction, type ApiAskStreamHandlers, type ApiAskThread, type ApiAskThreadDetail } from '../api';
 import type { AppStore } from '../store';
 import { confirm } from './Dialog';
 import { AskView } from './AskView';
@@ -15,7 +15,10 @@ const actions = {
   selectProject: vi.fn(),
   openTask: vi.fn(),
   setView: vi.fn(),
+  refreshNow: vi.fn(),
 };
+
+const defaultModel = '@cf/openai/gpt-oss-120b';
 
 const now = '2026-08-09T12:00:00.000Z';
 const activeThread: ApiAskThread = {
@@ -57,6 +60,13 @@ const setTextarea = (value: string) => {
 const button = (label: string) => [...container.querySelectorAll('button')].find((item) => item.textContent === label);
 const ariaButton = (label: string) => container.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
 
+beforeEach(() => {
+  vi.spyOn(api, 'askModels').mockResolvedValue({
+    defaultModel,
+    models: [{ id: defaultModel, label: 'GPT-OSS 120B', capabilities: { tools: true, streaming: true, reasoningSummary: true } }],
+  });
+});
+
 afterEach(() => {
   act(() => root?.unmount());
   container?.remove();
@@ -85,14 +95,15 @@ describe('global Ask chat', () => {
     setTextarea('What is ready?');
     act(() => button('Send')!.click());
 
-    expect(ask).toHaveBeenCalledWith('What is ready?', 'chat_active', expect.anything(), expect.any(AbortSignal));
-    expect(container.textContent).toContain('Thinking about what you asked…');
+    expect(ask).toHaveBeenCalledWith('What is ready?', 'chat_active', expect.anything(), expect.any(AbortSignal), defaultModel);
+    expect(container.textContent).toContain('Searching workspace and selecting tools…');
 
     act(() => {
       handlers!.onMeta({
         mode: 'semantic',
         model: '@cf/openai/gpt-oss-120b',
         graphEnhanced: true,
+        trace: ['Ask read live workspace status.', 'Response truncated (token limit).'],
         sources: [{
           kind: 'task', id: 'task_2', key: 'PAY-2', title: 'Retry payments', score: 0.9,
           projectId: 'project_pay', projectKey: 'PAY', projectName: 'Payments', retrieval: 'hybrid',
@@ -105,6 +116,7 @@ describe('global Ask chat', () => {
     expect(container.textContent).toContain('The retry work');
     expect(container.textContent).toContain('I compared the retrieved project state.');
     expect(container.textContent).toContain('PAY-2');
+    expect(container.textContent).toContain('Coverage notice: Response truncated');
     const reasoning = [...container.querySelectorAll<HTMLElement>('[data-testid="ask-reasoning"]')].at(-1)!;
     const sources = [...container.querySelectorAll<HTMLElement>('[data-testid="ask-sources"]')].at(-1)!;
     const answer = [...container.querySelectorAll<HTMLElement>('[data-testid="ask-answer"]')].at(-1)!;
@@ -140,6 +152,102 @@ describe('global Ask chat', () => {
     expect(container.textContent).toContain('Start durable chat');
     expect(container.querySelector('[data-testid="ask-thread-chat_new"]')).toBeTruthy();
     await act(async () => { handlers!.onDelta('Stored answer'); finish!(); });
+  });
+
+  it('offers exactly the server catalog, sends the selected model, and keeps stored attribution', async () => {
+    const fastModel = '@cf/meta/fast-model';
+    vi.mocked(api.askModels).mockResolvedValue({
+      defaultModel,
+      models: [
+        { id: defaultModel, label: 'Large model', capabilities: { tools: true, streaming: true, reasoningSummary: true } },
+        { id: fastModel, label: 'Fast model', capabilities: { tools: true, streaming: true, reasoningSummary: false } },
+      ],
+    });
+    const detail = detailFor(activeThread);
+    detail.messages[1] = { ...detail.messages[1]!, model: fastModel };
+    vi.spyOn(api, 'askThreads').mockResolvedValue({ threads: [activeThread] });
+    vi.spyOn(api, 'askThread').mockResolvedValue(detail);
+    const ask = vi.spyOn(api, 'askStream').mockImplementation(async (_question, _threadId, handlers) => {
+      handlers.onDelta('Selected model answer');
+      handlers.onDone?.({ finishReason: 'stop', truncated: false });
+    });
+
+    mount();
+    await flush();
+    const selector = container.querySelector<HTMLSelectElement>('select[aria-label="Ask model"]')!;
+    expect([...selector.options].map((option) => [option.value, option.textContent])).toEqual([
+      [defaultModel, 'Large model'], [fastModel, 'Fast model'],
+    ]);
+    expect(container.textContent).toContain('Fast model');
+    expect(container.textContent).toContain(fastModel);
+    act(() => {
+      selector.value = fastModel;
+      selector.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    setTextarea('Use the fast model');
+    await act(async () => button('Send')!.click());
+    expect(ask).toHaveBeenCalledWith('Use the fast model', activeThread.id, expect.anything(), expect.any(AbortSignal), fastModel);
+  });
+
+  it('restores exact action cards, prevents double confirmation, and opens the affected task after success', async () => {
+    const pending: ApiAskAction = {
+      id: 'askact_update', threadId: activeThread.id, messageId: `${activeThread.id}_a`, generationId: 'askgen_action',
+      projectId: 'project_pay', type: 'update_task', summary: 'Update PAY-2: body, priority',
+      arguments: { projectId: 'project_pay', taskId: 'task_2', set: { body: 'New body', priority: 0 } },
+      expected: {
+        projectId: 'project_pay', taskId: 'task_2', updatedAt: now,
+        before: { body: 'Old body', priority: 2 }, after: { body: 'New body', priority: 0 },
+      },
+      requiredAction: 'contribute', operationKey: 'op_update', status: 'pending', result: null, error: null,
+      createdAt: now, updatedAt: now, settledAt: null,
+    };
+    const detail = detailFor(activeThread);
+    detail.messages[1] = { ...detail.messages[1]!, model: defaultModel, actions: [pending] };
+    vi.spyOn(api, 'askThreads').mockResolvedValue({ threads: [activeThread] });
+    vi.spyOn(api, 'askThread').mockResolvedValue(detail);
+    let settle!: (value: ApiAskAction) => void;
+    const approve = vi.spyOn(api, 'approveAskAction').mockImplementation(() => new Promise((resolve) => { settle = resolve; }));
+
+    mount();
+    await flush();
+    expect(container.textContent).toContain('Update PAY-2: body, priority');
+    expect(container.textContent).toContain('Old body');
+    expect(container.textContent).toContain('New body');
+    expect(container.textContent).toContain('Exact stored payload');
+    const confirmAction = ariaButton('Confirm Update PAY-2: body, priority')!;
+    act(() => { confirmAction.click(); confirmAction.click(); });
+    expect(approve).toHaveBeenCalledTimes(1);
+    expect(confirmAction.disabled).toBe(true);
+
+    await act(async () => settle({ ...pending, status: 'approved', result: { ok: true, key: 'PAY-2' }, settledAt: now }));
+    expect(container.textContent).toContain('Applied as your human action.');
+    expect(actions.selectProject).toHaveBeenCalledWith('project_pay');
+    expect(actions.refreshNow).toHaveBeenCalled();
+    expect(actions.openTask).toHaveBeenCalledWith('task_2');
+  });
+
+  it('rejects a restored pending action without opening a task and renders persisted failures', async () => {
+    const pending: ApiAskAction = {
+      id: 'askact_create', threadId: activeThread.id, messageId: `${activeThread.id}_a`, generationId: 'askgen_action_2',
+      projectId: 'project_pay', type: 'create_task', summary: 'Create task “Retry docs” in PAY',
+      arguments: { projectId: 'project_pay', title: 'Retry docs', tags: ['payments'] },
+      expected: { projectId: 'project_pay' }, requiredAction: 'contribute', operationKey: 'op_create',
+      status: 'pending', result: null, error: null, createdAt: now, updatedAt: now, settledAt: null,
+    };
+    const detail = detailFor(activeThread);
+    detail.messages[1] = { ...detail.messages[1]!, actions: [pending, {
+      ...pending, id: 'askact_failed', summary: 'Update PAY-9: body', status: 'failed', error: 'PAY-9 changed since this action was proposed',
+    }] };
+    vi.spyOn(api, 'askThreads').mockResolvedValue({ threads: [activeThread] });
+    vi.spyOn(api, 'askThread').mockResolvedValue(detail);
+    vi.spyOn(api, 'rejectAskAction').mockResolvedValue({ ...pending, status: 'rejected', settledAt: now });
+
+    mount();
+    await flush();
+    expect(container.textContent).toContain('PAY-9 changed since this action was proposed');
+    await act(async () => ariaButton('Reject Create task “Retry docs” in PAY')!.click());
+    expect(container.textContent).toContain('Rejected without changing Noriq.');
+    expect(actions.openTask).not.toHaveBeenCalled();
   });
 
   it('reconnects to an in-flight stored response from its persisted offsets', async () => {
@@ -282,12 +390,13 @@ describe('Ask SSE transport', () => {
       'ta: {"phase":"generating"}\n\nevent: reasoning\ndata: {"text":"Summary"}\n\nevent: delta\ndata: {"text":"Hello "}\n\nevent: del',
       'ta\ndata: {"text":"world"}\n\nevent: done\ndata: {"finishReason":"stop","truncated":false}\n\n',
     ];
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new ReadableStream<Uint8Array>({
+    const fetchMock = vi.fn().mockResolvedValue(new Response(new ReadableStream<Uint8Array>({
       start(controller) {
         for (const chunk of wire) controller.enqueue(new TextEncoder().encode(chunk));
         controller.close();
       },
-    }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })));
+    }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } }));
+    vi.stubGlobal('fetch', fetchMock);
     const seen: string[] = [];
 
     await api.askStream('question', null, {
@@ -297,9 +406,10 @@ describe('Ask SSE transport', () => {
       onReasoning: (text) => seen.push(`reasoning:${text}`),
       onDelta: (text) => seen.push(`delta:${text}`),
       onDone: (result) => seen.push(`done:${result.finishReason}:${result.truncated}`),
-    });
+    }, undefined, '@cf/test/selected');
 
     expect(seen).toEqual(['thread:chat_1', 'meta:m:true', 'status:generating', 'reasoning:Summary', 'delta:Hello ', 'delta:world', 'done:stop:false']);
+    expect(JSON.parse(String(fetchMock.mock.calls[0]![1]!.body))).toMatchObject({ question: 'question', model: '@cf/test/selected' });
   });
 
   it('treats cancellation as a normal terminal stream event', async () => {

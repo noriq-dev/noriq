@@ -10,10 +10,13 @@
 //  * DEMO_MODE=1 → the one-click "Try the demo" login + the nightly reseed cron, AND the
 //    resource lockdown (no OAuth connections/agents/runners, no new projects/groups, no
 //    passkeys, no project delete — see demoLocksDown in src/lib/demo.ts).
-//  * NO ai / vectorize / email / r2 bindings → semantic search degrades to keyword, invites
-//    fall back to copy-links, attachments report "not configured", and the nightly backup
-//    no-ops. Every one of those paths already guards on its binding, so omitting them is the
-//    resource guarantee; DEMO_MODE is the abuse/persistence guarantee. Keep them unset.
+//  * NO ai / vectorize / email / r2 bindings → Ask generation is explicitly unavailable,
+//    semantic search degrades to keyword, invites fall back to copy-links, attachments report
+//    "not configured", and the nightly backup no-ops. ASK_MODELS/ASK_DEFAULT_MODEL are omitted,
+//    leaving the built-in one-model catalog for configuration compatibility; generation still
+//    returns the explicit no-AI error. Every one of those paths already guards on its binding, so
+//    omitting them is the resource guarantee; DEMO_MODE is the abuse/persistence guarantee. Keep
+//    them unset.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "noriq-demo",
@@ -30,6 +33,8 @@
     // Absolute-URL base for the few links that need one; harmless to set even though the
     // demo doesn't send email.
     "PUBLIC_ORIGIN": "https://demo.noriq.dev",
+    // Harmless shared parser bound; it does not enable Ask without an `ai` binding and a model
+    // catalog. To enable Ask in another deployment, add all three together and verify live first.
     "ASK_MAX_OUTPUT_TOKENS": "4096",
     "AGENT_LIFECYCLE_ONLINE_SECONDS": "300",
     "AGENT_COPILOT_RETIRE_DAYS": "7",

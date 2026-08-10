@@ -127,6 +127,13 @@ export interface TaskPatch {
   workflow?: string | null;
 }
 
+/** Optimistic snapshot for a delayed, human-confirmed task update. Only Ask supplies this;
+ * ordinary REST/MCP edits retain their existing immediate-update behavior. */
+export interface TaskUpdateExpectation {
+  updatedAt: string;
+  before: Record<string, unknown>;
+}
+
 /** What a create returns. `executionSpec` present iff the call set one, normalised as stored.
  *  `status: 'proposed'` present iff the create was a spin-off (PLNR-230), so the filing agent
  *  is told in the same breath that its task awaits a human and no agent can act on it. */
@@ -168,6 +175,13 @@ type TaskRow = {
   failed_at: string | null;
   proposed_at: string | null;
   title: string;
+  body: string;
+  priority: number;
+  type: string;
+  estimate: number | null;
+  due_at: string | null;
+  board_id: string;
+  updated_at: string;
 };
 
 // A task is claimable when it's a fresh `todo`, or an `in_progress` whose claim has lapsed
@@ -778,10 +792,37 @@ export class ProjectRoom extends DurableObject<Env> {
       return created;
   }
 
-  async updateTask(projectId: string, actor: Actor, taskId: string, patch: TaskPatch): Promise<UpdatedTask> {
+  async updateTask(projectId: string, actor: Actor, taskId: string, patch: TaskPatch, expected?: TaskUpdateExpectation): Promise<UpdatedTask> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const task = await this.getTask(taskId);
+      // Ask approvals can sit pending while the task changes. Compare inside this project's
+      // serialized writer, before tags/docs or any other field can be touched, so confirmation
+      // applies exactly to the before/after state the human reviewed.
+      if (expected !== undefined) {
+        const current: Record<string, unknown> = {
+          title: task.title, body: task.body, priority: task.priority, type: task.type,
+          estimate: task.estimate, dueAt: task.due_at, boardId: task.board_id,
+        };
+        if (Object.hasOwn(expected.before, 'tags')) {
+          const tags = await this.env.DB.prepare(
+            'SELECT g.name FROM task_tags tt JOIN tags g ON g.id = tt.tag_id WHERE tt.task_id = ? ORDER BY g.name',
+          ).bind(taskId).all<{ name: string }>();
+          current.tags = tags.results.map((tag) => tag.name);
+        }
+        if (Object.hasOwn(expected.before, 'docIds')) {
+          const docs = await this.env.DB.prepare(
+            'SELECT d.id FROM task_docs td JOIN docs d ON d.id = td.doc_id WHERE td.task_id = ? ORDER BY d.name',
+          ).bind(taskId).all<{ id: string }>();
+          current.docIds = docs.results.map((doc) => doc.id);
+        }
+        const comparable = (field: string, value: unknown) =>
+          (field === 'tags' && Array.isArray(value) ? [...value].sort() : value);
+        const stale = task.updated_at !== expected.updatedAt
+          || Object.entries(expected.before).some(([field, value]) =>
+            JSON.stringify(comparable(field, current[field])) !== JSON.stringify(comparable(field, value)));
+        if (stale) throw new Error(`${task.key} changed since this action was proposed; review the current task and try again`);
+      }
       // A claimed task's status is not editable via MCP (PLNR-226): the claim protects
       // in-flight work, and an agent restatusing it — even to the "right" status — stomps the
       // holder's work loop. Agent actors only: `actor.kind === 'agent'` is exactly "via MCP"
@@ -5313,7 +5354,9 @@ export class ProjectRoom extends DurableObject<Env> {
 
   private async getTask(taskId: string): Promise<TaskRow> {
     const row = await this.env.DB.prepare(
-      'SELECT id, key, status, claimed_by, claim_expires_at, failed_at, proposed_at, title FROM tasks WHERE id = ? AND project_id = ?',
+      `SELECT id, key, status, claimed_by, claim_expires_at, failed_at, proposed_at, title, body,
+              priority, type, estimate, due_at, board_id, updated_at
+       FROM tasks WHERE id = ? AND project_id = ?`,
     ).bind(taskId, this.projectId).first<TaskRow>();
     if (!row) throw new Error(`task ${taskId} not found in this project`);
     return row;

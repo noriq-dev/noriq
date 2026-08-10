@@ -15,7 +15,7 @@ import {
   tokenProjectWhere,
   userCanAccessProject,
 } from './lib/visibility';
-import { taskSearchFilters } from './lib/search';
+import { searchWorkspaceEvidence, searchWorkspaceTasks } from './lib/workspace-operations';
 import {
   ExecutionEventType, ExecutionKind, ExecutionLineageStatus, ExecutionRelationType, ExecutionRole,
   ExecutionSpec, type ExecutionSpecInput, MemoryKind, MemoryEdgeType, EvidenceRef, ContextPackRole,
@@ -28,7 +28,7 @@ import type { ProjectMemoryStub } from './lib/project-memory';
 import { loadPriorEffort, searchHitToEvidenceItem } from './lib/project-memory';
 import { refuseSpecWrite, specWriteRefusalMessage } from './lib/spec-authority';
 import { search, searchBackend, reindexProject } from './search';
-import { nearDupeGroups } from './lib/tags';
+import { nearDupeGroups, requireDescriptiveTags, validateTagNames } from './lib/tags';
 import { DOC_SKILL_MD } from './skill-docs';
 import { LOCKING_SKILL_MD } from './skill-locking';
 import { PLANNING_SKILL_MD } from './skill-planning';
@@ -300,35 +300,6 @@ async function resolveBlockerRef(
 }
 
 const asActor = (a: AgentIdentity): Actor => ({ kind: 'agent', id: a.id, name: a.name });
-
-// PLNR-171: agent-created tasks must carry descriptive tags — tags[0] is the task's
-// PRIMARY tag (its main topical bucket). A tag restating status/type/priority/milestone
-// is rejected: those concepts have dedicated fields, and a tag copy of them is noise
-// that rots. The denylist is compared on a normalized form (lowercase, separators → '-').
-const NON_DESCRIPTIVE_TAGS = new Set([
-  'todo', 'in-progress', 'inprogress', 'blocked', 'review', 'in-review', 'done',
-  'cancelled', 'canceled', 'backlog', 'wip', 'in-flight',
-  'bug', 'feature', 'chore', 'research', 'task', 'epic', 'story', 'ticket',
-  'p0', 'p1', 'p2', 'p3', 'p4', 'priority', 'high', 'medium', 'low', 'high-priority',
-  'low-priority', 'urgent', 'critical', 'milestone',
-]);
-const TAG_GUIDANCE =
-  'tags must be descriptive topic/area/component words (e.g. "oauth", "board-filters", "ws-resume"); ' +
-  'the FIRST tag is the primary tag. Status, type, priority, and milestone have dedicated fields — never restate them as tags.';
-
-/** Validate tag NAMES when present (docs: tags optional but still descriptive, PLNR-194). */
-function validateTagNames(tags: string[] | undefined): void {
-  for (const raw of tags ?? []) {
-    const norm = raw.trim().toLowerCase().replace(/[\s_]+/g, '-');
-    if (!norm) throw new Error(`empty tag — ${TAG_GUIDANCE}`);
-    if (NON_DESCRIPTIVE_TAGS.has(norm)) throw new Error(`"${raw}" is not a descriptive tag — ${TAG_GUIDANCE}`);
-  }
-}
-
-function requireDescriptiveTags(tags: string[] | undefined): void {
-  if (!tags?.length) throw new Error(`tags are required — ${TAG_GUIDANCE}`);
-  validateTagNames(tags);
-}
 
 // MCP tool annotations (PLNR-88). Without these, clients assume the spec defaults —
 // write + destructive + open-world — for every tool. Ours are more benign: reads are
@@ -1622,26 +1593,15 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       limit: z.number().int().min(1).max(200).optional().describe('Default 50'),
     },
     tool(async ({ projectId, status, type, tag, milestoneId, holder, text, overdue, includeArchived, limit }) => {
-      const { sql, binds } = taskSearchFilters({
+      return searchWorkspaceTasks(env, {
+        userId: agent.userId,
+        oauthTokenId: opts.oauthTokenId,
+      }, {
+        projectId,
         status, type, tag, milestoneId, text, overdue, includeArchived,
         holder: holder === 'me' ? agent.id : holder,
+        limit,
       });
-      // Numbered params first (?1 user, ?2 project-or-null, ?3 token), THEN the filter
-      // fragment's bare `?`s — SQLite continues the positional counter from 3.
-      const base = `FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
-        WHERE ${USER_PROJECT_WHERE} AND ${tokenProjectWhere('?3')} AND (?2 IS NULL OR t.project_id = ?2)${sql}`;
-      const allBinds = [agent.userId, projectId ?? null, opts.oauthTokenId ?? null, ...binds];
-      const max = limit ?? 50;
-      const [rows, total] = await Promise.all([
-        env.DB.prepare(
-          `SELECT t.id, t.key, t.title, ${taskWireStatus('t')} AS status, t.failed_at AS failedAt, t.priority, t.estimate, t.due_at AS dueAt, t.type,
-                  t.project_id AS projectId, p.key AS projectKey, t.claimed_by AS claimedBy,
-                  t.milestone_id AS milestoneId, t.open_comments AS openComments, t.updated_at AS updatedAt
-           ${base} ORDER BY t.priority ASC, t.updated_at DESC LIMIT ${max}`,
-        ).bind(...allBinds).all(),
-        env.DB.prepare(`SELECT COUNT(*) AS n ${base}`).bind(...allBinds).first<{ n: number }>(),
-      ]);
-      return { tasks: rows.results, matched: total?.n ?? rows.results.length, returned: rows.results.length };
     }),
   );
 
@@ -1655,12 +1615,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       limit: z.number().int().min(1).max(50).optional().describe('Default 12'),
     },
     tool(async ({ query, projectId, kinds, limit }) => {
-      const { results } = await env.DB.prepare(
-        `SELECT p.id FROM projects p WHERE p.status = 'active' AND ${USER_PROJECT_WHERE} AND ${tokenProjectWhere('?2')}`,
-      ).bind(agent.userId, opts.oauthTokenId ?? null).all<{ id: string }>();
-      let projectIds = results.map((r) => r.id);
-      if (projectId) projectIds = projectIds.filter((id) => id === projectId);
-      const { mode, results: hits } = await search(env, { q: query, projectIds, kinds, limit });
+      const { mode, results: hits } = await searchWorkspaceEvidence(env, {
+        userId: agent.userId,
+        oauthTokenId: opts.oauthTokenId,
+      }, { query, projectId, kinds, limit });
       return { mode, results: hits, returned: hits.length };
     }),
   );

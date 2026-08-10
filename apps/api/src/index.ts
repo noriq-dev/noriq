@@ -10,7 +10,7 @@ import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot, importSnapshot } from './backup';
 import { sweepPendingErasures, sweepProjectDebris, sweepProjectDebrisForProject, listProjectBackupGenerations } from './memory/lifecycle';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, timingSafeEqual, verifyPassword, verifyPasswordConstantTime } from './lib/util';
-import { taskSearchFilters } from './lib/search';
+import { searchWorkspaceEvidence, searchWorkspaceTasks } from './lib/workspace-operations';
 import type { ExecutionSpecInput, RunStatus } from '@noriq-dev/shared';
 import { readExecutionSpec } from './lib/execution-spec';
 import { search, searchBackend, reindexProject, ALL_KINDS, type SearchKind } from './search';
@@ -23,6 +23,11 @@ import {
   deleteAskThread, getAskGeneration, getAskThread, listAskThreads, setAskThreadArchived,
 } from './ask-chats';
 import { accessibleAskProjectsForUser, askGenerationEventStream } from './ask-generation';
+import { AskModelSelectionError, askModelCatalog, resolveAskModel } from './ask-models';
+import {
+  AskActionConflictError, AskActionDeniedError, AskActionMaintenanceError, AskActionNotFoundError,
+  ASK_TASK_ACTION_EXECUTORS, approveAskAction, listAskActions, rejectAskAction,
+} from './ask-actions';
 import { verifyUploadToken, resolveUploadSecret, signIngestToken, verifyIngestToken, type IngestClaims } from './lib/upload-token';
 import { USER_PROJECT_WHERE, taskWireStatus, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
 import {
@@ -1057,26 +1062,16 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
 app.get('/api/tasks/search', userAuth, async (c) => {
   const u = c.var.user!;
   const q = c.req.query();
-  const { sql, binds } = taskSearchFilters({
+  const result = await searchWorkspaceTasks(c.env, {
+    userId: u.id,
+    allowAdminOverride: u.role === 'admin',
+  }, {
+    projectId: q.projectId,
     status: q.status, type: q.type, tag: q.tag, milestoneId: q.milestoneId,
     holder: q.holder, text: q.text, includeArchived: q.includeArchived === '1', overdue: q.overdue === '1',
+    limit: parseInt(q.limit ?? '50', 10) || 50,
   });
-  const limit = Math.min(Math.max(parseInt(q.limit ?? '50', 10) || 50, 1), 200);
-  const pid = q.projectId ?? null;
-  const visibleProjects = u.role === 'admin' ? '1 = 1' : USER_PROJECT_WHERE;
-  const base = `FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
-    WHERE ${visibleProjects} AND (? IS NULL OR t.project_id = ?)${sql}`;
-  const allBinds = [...(u.role === 'admin' ? [] : [u.id]), pid, pid, ...binds];
-  const [rows, total] = await Promise.all([
-    c.env.DB.prepare(
-      `SELECT t.id, t.key, t.title, ${taskWireStatus('t')} AS status, t.failed_at AS failedAt, t.priority, t.estimate, t.due_at AS dueAt, t.type,
-              t.project_id AS projectId, p.key AS projectKey, t.claimed_by AS claimedBy,
-              t.milestone_id AS milestoneId, t.open_comments AS openComments, t.updated_at AS updatedAt
-       ${base} ORDER BY t.priority ASC, t.updated_at DESC LIMIT ${limit}`,
-    ).bind(...allBinds).all(),
-    c.env.DB.prepare(`SELECT COUNT(*) AS n ${base}`).bind(...allBinds).first<{ n: number }>(),
-  ]);
-  return c.json({ tasks: rows.results, matched: total?.n ?? rows.results.length, returned: rows.results.length });
+  return c.json(result);
 });
 
 app.get('/api/tasks/:tid', userAuth, async (c) => {
@@ -1876,9 +1871,10 @@ app.get('/api/projects/:pid/search', userAuth, async (c) => {
   if (!q) return c.json({ error: 'q required' }, 400);
   const kindsParam = c.req.query('kinds')?.split(',').filter((k): k is SearchKind => (ALL_KINDS as readonly string[]).includes(k));
   const limit = Math.min(Math.max(parseInt(c.req.query('limit') ?? '12', 10) || 12, 1), 50);
-  const { mode, results } = await search(c.env, {
-    q, projectIds: [c.req.param('pid')!], kinds: kindsParam?.length ? kindsParam : undefined, limit,
-  });
+  const { mode, results } = await searchWorkspaceEvidence(c.env, {
+    userId: c.var.user!.id,
+    allowAdminOverride: c.var.user!.role === 'admin',
+  }, { query: q, projectId: c.req.param('pid')!, kinds: kindsParam?.length ? kindsParam : undefined, limit });
   return c.json({ mode, results });
 });
 
@@ -1900,6 +1896,44 @@ app.post('/api/projects/:pid/search/reindex', userAuth, async (c) => {
 const accessibleAskProjects = async (c: Context<AppContext>): Promise<AskProject[]> => {
   return accessibleAskProjectsForUser(c.env, c.var.user!.id);
 };
+
+const askActionError = (c: Context<AppContext>, error: unknown) => {
+  const message = error instanceof Error ? error.message : 'Ask action failed';
+  if (error instanceof AskActionNotFoundError) return c.json({ error: message }, 404);
+  if (error instanceof AskActionDeniedError) return c.json({ error: message }, 403);
+  if (error instanceof AskActionConflictError) return c.json({ error: message }, 409);
+  if (error instanceof AskActionMaintenanceError) return c.json({ error: message }, 503, { 'Retry-After': '30' });
+  return c.json({ error: message }, 400);
+};
+
+app.get('/api/ask/models', userAuth, async (c) => {
+  try {
+    return c.json(askModelCatalog(c.env));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Ask model configuration is invalid';
+    return c.json({ error: message }, 503);
+  }
+});
+
+app.get('/api/ask/actions', userAuth, async (c) => c.json({
+  actions: await listAskActions(c.env.DB, c.var.user!.id, { threadId: c.req.query('threadId') }),
+}));
+
+app.post('/api/ask/actions/:actionId/approve', userAuth, async (c) => {
+  try {
+    return c.json(await approveAskAction(c.env, c.var.user!, c.req.param('actionId')!, ASK_TASK_ACTION_EXECUTORS));
+  } catch (error) {
+    return askActionError(c, error);
+  }
+});
+
+app.post('/api/ask/actions/:actionId/reject', userAuth, async (c) => {
+  try {
+    return c.json(await rejectAskAction(c.env.DB, c.var.user!.id, c.req.param('actionId')!));
+  } catch (error) {
+    return askActionError(c, error);
+  }
+});
 
 app.get('/api/ask/threads', userAuth, async (c) => {
   const archived = c.req.query('archived') === '1' || c.req.query('archived') === 'true';
@@ -1934,17 +1968,26 @@ app.delete('/api/ask/threads/:threadId', userAuth, async (c) => {
 app.post('/api/ask', userAuth, async (c) => {
   const rl = await rateLimit(c.env, `ask:${c.var.user!.id}`, 20);
   if (!rl.ok) return c.json(tooMany, 429, { 'Retry-After': String(rl.retryAfter) });
-  const gen = generationClient(c.env);
-  if (!gen) return c.json({ error: 'no AI backend — asking questions requires the Workers AI (AI) binding' }, 503);
-  const { question, history } = await c.req.json<{ question?: string; history?: unknown }>().catch(() => ({ question: undefined, history: undefined }));
+  const { question, history, model: requestedModel } = await c.req.json<{ question?: string; history?: unknown; model?: string }>()
+    .catch(() => ({ question: undefined, history: undefined, model: undefined }));
   const q = question?.trim().slice(0, 4000);
   if (!q) return c.json({ error: 'question required' }, 400);
+  let model;
+  try {
+    model = resolveAskModel(c.env, requestedModel);
+  } catch (error) {
+    const status = error instanceof AskModelSelectionError ? 400 : 503;
+    return c.json({ error: error instanceof Error ? error.message : 'Ask model configuration is invalid' }, status);
+  }
+  const gen = generationClient(c.env, model.id);
+  if (!gen) return c.json({ error: 'no AI backend — asking questions requires the Workers AI (AI) binding' }, 503);
   const projects = await accessibleAskProjects(c);
   try {
     return c.json(await answerQuestion(c.env, gen, {
       question: q,
       projects,
       history: normalizeHistory(history),
+      model: model.id,
     }));
   } catch (e) {
     return c.json({ error: `answer generation failed: ${e instanceof Error ? e.message : 'unknown error'}` }, 502);
@@ -1956,11 +1999,18 @@ app.post('/api/ask', userAuth, async (c) => {
 app.post('/api/ask/stream', userAuth, async (c) => {
   const rl = await rateLimit(c.env, `ask:${c.var.user!.id}`, 20);
   if (!rl.ok) return c.json(tooMany, 429, { 'Retry-After': String(rl.retryAfter) });
-  if (!streamingGenerationClient(c.env)) return c.json({ error: 'no AI backend — asking questions requires the Workers AI (AI) binding' }, 503);
-  const { question, history, threadId } = await c.req.json<{ question?: string; history?: unknown; threadId?: string }>()
-    .catch(() => ({ question: undefined, history: undefined, threadId: undefined }));
+  const { question, history, threadId, model: requestedModel } = await c.req.json<{ question?: string; history?: unknown; threadId?: string; model?: string }>()
+    .catch(() => ({ question: undefined, history: undefined, threadId: undefined, model: undefined }));
   const q = question?.trim().slice(0, 4000);
   if (!q) return c.json({ error: 'question required' }, 400);
+  let model;
+  try {
+    model = resolveAskModel(c.env, requestedModel);
+  } catch (error) {
+    const status = error instanceof AskModelSelectionError ? 400 : 503;
+    return c.json({ error: error instanceof Error ? error.message : 'Ask model configuration is invalid' }, status);
+  }
+  if (!streamingGenerationClient(c.env, model.id)) return c.json({ error: 'no AI backend — asking questions requires the Workers AI (AI) binding' }, 503);
   const userId = c.var.user!.id;
   const stored = threadId ? await askThreadHistory(c.env.DB, userId, threadId) : null;
   if (threadId && !stored) return c.json({ error: 'chat not found' }, 404);
@@ -1969,6 +2019,7 @@ app.post('/api/ask/stream', userAuth, async (c) => {
     const thread = stored?.thread ?? await createAskThread(c.env.DB, userId, q);
     const generation = await createAskGeneration(
       c.env.DB, userId, thread.id, q, stored?.history ?? normalizeHistory(history),
+      model.id,
     );
     await c.env.ASK_GENERATION.get(c.env.ASK_GENERATION.idFromName(generation.id)).start(generation.id);
     return new Response(askGenerationEventStream(c.env, userId, generation.id, {
@@ -2549,6 +2600,7 @@ app.delete('/api/users/:uid', userAuth, async (c) => {
     c.env.DB.prepare("DELETE FROM project_grants WHERE principal_type = 'user' AND principal_id = ?").bind(uid),
     c.env.DB.prepare('DELETE FROM oauth_codes WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('DELETE FROM templates WHERE user_id = ?').bind(uid),
+    c.env.DB.prepare('DELETE FROM ask_actions WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('DELETE FROM ask_generations WHERE user_id = ?').bind(uid),
     c.env.DB.prepare('DELETE FROM ask_messages WHERE thread_id IN (SELECT id FROM ask_threads WHERE user_id = ?)').bind(uid),
     c.env.DB.prepare('DELETE FROM ask_threads WHERE user_id = ?').bind(uid),

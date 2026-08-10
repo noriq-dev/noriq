@@ -25,6 +25,7 @@ export interface ApiAskStreamMeta {
   model: string | null;
   graphEnhanced: boolean;
   trace?: string[];
+  actions?: ApiAskAction[];
 }
 
 export interface ApiAskStreamHandlers {
@@ -43,11 +44,12 @@ async function askStream(
   threadId: string | null,
   handlers: ApiAskStreamHandlers,
   signal?: AbortSignal,
+  model?: string,
 ): Promise<void> {
   const res = await fetch('/api/ask/stream', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
-    body: JSON.stringify({ question, threadId: threadId ?? undefined }),
+    body: JSON.stringify({ question, threadId: threadId ?? undefined, model }),
     credentials: 'same-origin',
     signal,
   });
@@ -374,13 +376,19 @@ export const api = {
     ),
   /** Global, multi-turn Ask chat. Project scope is derived server-side from the session; the
    *  browser sends conversation history but can never choose or broaden retrieval access. */
-  ask: (question: string, history: ApiAskHistoryMessage[]) =>
+  ask: (question: string, history: ApiAskHistoryMessage[], model?: string) =>
     req<{ answer: string; mode: 'semantic' | 'keyword' | null; model: string; graphEnhanced: boolean; sources: ApiAskSource[] }>(
-      'POST', '/api/ask', { question, history }),
+      'POST', '/api/ask', { question, history, model }),
+  askModels: () => req<ApiAskModelCatalog>('GET', '/api/ask/models'),
   askStream,
   resumeAskStream,
   cancelAskGeneration: (generationId: string) =>
     req<{ ok: true; cancelled: true }>('POST', `/api/ask/generations/${generationId}/cancel`),
+  askActions: (threadId?: string) => req<{ actions: ApiAskAction[] }>(
+    'GET', `/api/ask/actions${threadId ? `?threadId=${encodeURIComponent(threadId)}` : ''}`,
+  ),
+  approveAskAction: (actionId: string) => req<ApiAskAction>('POST', `/api/ask/actions/${actionId}/approve`),
+  rejectAskAction: (actionId: string) => req<ApiAskAction>('POST', `/api/ask/actions/${actionId}/reject`),
   askThreads: (archived = false) =>
     req<{ threads: ApiAskThread[] }>('GET', `/api/ask/threads${archived ? '?archived=1' : ''}`),
   askThread: (threadId: string) => req<ApiAskThreadDetail>('GET', `/api/ask/threads/${threadId}`),
@@ -1018,9 +1026,40 @@ export interface ApiAskHistoryMessage {
   content: string;
 }
 
+export interface ApiAskModelDefinition {
+  id: string;
+  label: string;
+  capabilities: { tools: true; streaming: true; reasoningSummary: boolean };
+}
+
+export interface ApiAskModelCatalog {
+  models: ApiAskModelDefinition[];
+  defaultModel: string;
+}
+
+export interface ApiAskAction {
+  id: string;
+  threadId: string;
+  messageId: string;
+  generationId: string | null;
+  projectId: string;
+  type: string;
+  summary: string;
+  arguments: Record<string, unknown>;
+  expected: Record<string, unknown>;
+  requiredAction: string;
+  operationKey: string;
+  status: 'pending' | 'executing' | 'approved' | 'rejected' | 'failed';
+  result: unknown;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+  settledAt: string | null;
+}
+
 /** One cross-project grounding source behind a global /ask answer. */
 export interface ApiAskSource {
-  kind: 'task' | 'doc' | 'plan' | 'memory' | 'episode';
+  kind: 'project' | 'task' | 'run' | 'signal' | 'comment' | 'doc' | 'plan' | 'memory' | 'episode';
   id: string;
   key?: string;
   title: string;
@@ -1036,7 +1075,9 @@ export interface ApiAskSource {
   historical?: boolean;
   graphPath?: string;
   evidenceVerifiedForCaller?: Array<boolean | null>;
-  retrieval: 'semantic' | 'keyword' | 'graph' | 'hybrid';
+  citation?: string;
+  updatedAt?: string;
+  retrieval: 'semantic' | 'keyword' | 'graph' | 'hybrid' | 'live';
 }
 
 export interface ApiAskThread {
@@ -1060,6 +1101,7 @@ export interface ApiAskStoredMessage extends ApiAskHistoryMessage {
   generationStatus?: 'pending' | 'searching' | 'generating' | 'completed' | 'failed' | null;
   generationError?: string | null;
   createdAt: string;
+  actions?: ApiAskAction[];
 }
 
 export interface ApiAskThreadDetail extends ApiAskThread {

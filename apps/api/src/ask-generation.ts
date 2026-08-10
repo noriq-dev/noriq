@@ -1,22 +1,20 @@
 import type { Env } from './env';
-import { askOutputTokenLimit, consumeAskGeneration, prepareQuestion, streamingGenerationClient, type AskProject } from './ask';
+import { askOutputTokenLimit, buildMessages, consumeAskGeneration, streamingGenerationClient, type AskProject, type PreparedAsk } from './ask';
 import {
   ASK_GENERATION_CANCELLED, completeAskGeneration, failAskGeneration, getAskGeneration, updateAskGeneration,
   type StoredAskGeneration,
 } from './ask-chats';
-import { USER_PROJECT_WHERE } from './lib/visibility';
+import { listWorkspaceProjects } from './lib/workspace-operations';
+import { resolveAskModel } from './ask-models';
+import { askToolDecisionClient, createAskTools, finalAskMessages, runAskToolLoop } from './ask-tools';
+import { listAskActions } from './ask-actions';
 
 const encoder = new TextEncoder();
 const frame = (event: string, data: unknown): Uint8Array =>
   encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 
 export async function accessibleAskProjectsForUser(env: Env, userId: string): Promise<AskProject[]> {
-  const { results } = await env.DB.prepare(
-    `SELECT p.id, p.key, p.name FROM projects p
-     WHERE p.status = 'active' AND ${USER_PROJECT_WHERE}
-     ORDER BY p.created_at`,
-  ).bind(userId).all<AskProject>();
-  return results;
+  return listWorkspaceProjects(env, { userId });
 }
 
 /** Alarm entrypoint: inference is owned by a Durable Object alarm (15 minute wall-time budget),
@@ -25,7 +23,14 @@ export async function accessibleAskProjectsForUser(env: Env, userId: string): Pr
 export async function runAskGeneration(env: Env, generationId: string): Promise<void> {
   const generation = await getAskGeneration(env.DB, generationId);
   if (!generation || generation.status === 'completed' || generation.status === 'failed') return;
-  const gen = streamingGenerationClient(env);
+  let model;
+  try {
+    model = resolveAskModel(env, generation.model);
+  } catch (error) {
+    await failAskGeneration(env.DB, generationId, error instanceof Error ? error.message : 'Ask model configuration is invalid');
+    return;
+  }
+  const gen = streamingGenerationClient(env, model.id);
   if (!gen) {
     await failAskGeneration(env.DB, generationId, 'no AI backend — asking questions requires the Workers AI (AI) binding');
     return;
@@ -53,31 +58,44 @@ export async function runAskGeneration(env: Env, generationId: string): Promise<
   try {
     if (!await persist('searching', true)) return;
     const projects = await accessibleAskProjectsForUser(env, generation.userId);
-    let retrievalUsed = false;
-    const prepared = await prepareQuestion(env, {
-      question: generation.question,
-      projects,
-      history: generation.history,
-      onRetrieval: async () => {
-        retrievalUsed = true;
-        base.trace = ['Ask chose to search accessible Noriq evidence…'];
-        await persist('searching', true);
-      },
+    const decision = askToolDecisionClient(env, model.id);
+    if (!decision) throw new Error('no AI backend — asking questions requires the Workers AI (AI) binding');
+    const tools = createAskTools(env, { userId: generation.userId }, projects, {
+      userId: generation.userId,
+      threadId: generation.threadId,
+      messageId: generation.messageId,
+      generationId: generation.id,
     });
-    base.sources = prepared.sources;
-    base.mode = prepared.mode;
-    base.model = prepared.model;
-    base.graphEnhanced = prepared.graphEnhanced;
-    if (retrievalUsed && prepared.mode) {
-      const projectCount = new Set(prepared.sources.map((source) => source.projectId)).size;
-      const retrieval = `${prepared.mode}${prepared.graphEnhanced ? ' + graph' : ''}`;
-      base.trace = [
-        `Ask used search_noriq and selected ${prepared.sources.length} ${retrieval} source${prepared.sources.length === 1 ? '' : 's'} across ${projectCount} project${projectCount === 1 ? '' : 's'}.`,
-        'Generating a grounded response…',
-      ];
-    } else {
-      base.trace = ['No Noriq evidence was needed for this response.', 'Generating a general response…'];
-    }
+    const loop = await runAskToolLoop(
+      decision,
+      buildMessages(generation.question, projects, [], generation.history, false),
+      tools,
+      {
+        shouldContinue: () => active,
+        onCheckpoint: async (state) => {
+          base.sources = state.sources;
+          base.trace = state.trace;
+          base.mode = state.mode;
+          base.graphEnhanced = state.graphEnhanced;
+          await persist('searching', true);
+        },
+      },
+    );
+    if (!loop || !active) return;
+    base.sources = loop.sources;
+    base.trace = [...loop.trace, loop.calls
+      ? 'Generating a response from the collected workspace evidence…'
+      : 'No Noriq workspace tool was needed; generating a general response…'];
+    base.mode = loop.mode;
+    base.model = model.id;
+    base.graphEnhanced = loop.graphEnhanced;
+    const prepared: PreparedAsk = {
+      messages: finalAskMessages(loop),
+      sources: loop.sources,
+      mode: loop.mode,
+      model: model.id,
+      graphEnhanced: loop.graphEnhanced,
+    };
     if (!await persist('generating', true)) return;
 
     const result = await consumeAskGeneration(gen, prepared, {
@@ -135,12 +153,14 @@ export function askGenerationEventStream(
           }
           if (current.revision !== revision) {
             revision = current.revision;
+            const actions = await listAskActions(env.DB, userId, { generationId });
             controller.enqueue(frame('meta', {
               sources: current.sources,
               mode: current.mode,
               model: current.model,
               graphEnhanced: current.graphEnhanced,
               trace: current.trace,
+              actions,
             }));
             controller.enqueue(frame('status', { phase: current.status }));
             if (current.reasoning.length > reasoningOffset) {

@@ -1,7 +1,8 @@
 // Global Ask — a durable, per-user multi-turn chat enriched with accessible project context.
 import { useEffect, useRef, useState } from 'react';
 import {
-  api, ApiError, type ApiAskHistoryMessage, type ApiAskSource, type ApiAskStoredMessage, type ApiAskThread,
+  api, ApiError, type ApiAskAction, type ApiAskHistoryMessage, type ApiAskModelDefinition, type ApiAskSource,
+  type ApiAskStoredMessage, type ApiAskThread,
 } from '../api';
 import type { AppStore } from '../store';
 import { MonoTag, WaveBars } from './bits';
@@ -10,7 +11,11 @@ import { Button } from './ui';
 import { Markdown } from './Markdown';
 
 const KIND_COLOR: Record<ApiAskSource['kind'], string> = {
+  project: 'var(--text-mid)',
   task: 'var(--blue)',
+  run: 'var(--cyan, #67e8f9)',
+  signal: 'var(--red, #f87171)',
+  comment: 'var(--text-mid)',
   doc: 'var(--green, var(--accent-ink))',
   plan: 'var(--amber)',
   memory: 'var(--purple, #a78bfa)',
@@ -33,6 +38,7 @@ interface ThreadMessage extends ApiAskHistoryMessage {
   generationId?: string;
   generationStatus?: ApiAskStoredMessage['generationStatus'];
   generationError?: string;
+  actions?: ApiAskAction[];
 }
 
 const fromStoredMessage = (message: ApiAskStoredMessage): ThreadMessage => ({
@@ -47,17 +53,85 @@ const fromStoredMessage = (message: ApiAskStoredMessage): ThreadMessage => ({
   generationId: message.generationId ?? undefined,
   generationStatus: message.generationStatus,
   generationError: message.generationError ?? undefined,
+  actions: message.actions,
 });
 
-const modelLabel = (model?: string) => model?.includes('gpt-oss-120b') ? 'GPT-OSS 120B · Cloudflare' : 'Cloudflare Workers AI';
+const modelLabel = (model: string | undefined, models: ApiAskModelDefinition[]) =>
+  models.find((candidate) => candidate.id === model)?.label ?? model ?? 'Model pending';
 const dayLabel = (iso: string) => new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 
-function GenerationActivity({ phase }: { phase: 'searching' | 'generating' }) {
+function GenerationActivity({ phase, model, trace }: {
+  phase: 'searching' | 'generating'; model: string; trace?: string[];
+}) {
+  const latest = trace?.at(-1);
   return (
-    <div role="status" aria-live="polite" style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 10.5 }}>
+    <div role="status" aria-live="polite" style={{ display: 'flex', alignItems: 'flex-start', gap: 8, color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 10.5 }}>
       <WaveBars height={12} bars={3} />
-      <span>{phase === 'searching' ? 'Thinking about what you asked…' : 'Generating with GPT-OSS 120B…'}</span>
+      <span>
+        {phase === 'searching' ? 'Searching workspace and selecting tools…' : `Generating with ${model}…`}
+        {latest && <span style={{ display: 'block', marginTop: 3, color: 'var(--text-faint)' }}>{latest}</span>}
+      </span>
     </div>
+  );
+}
+
+const record = (value: unknown): Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+const displayValue = (value: unknown) => value === undefined ? 'unchanged' : JSON.stringify(value);
+
+function ActionCard({ action, busy, onSettle }: {
+  action: ApiAskAction;
+  busy: boolean;
+  onSettle: (action: ApiAskAction, decision: 'approve' | 'reject') => void;
+}) {
+  const args = record(action.arguments);
+  const expected = record(action.expected);
+  const set = record(args.set);
+  const before = record(expected.before);
+  const after = record(expected.after);
+  const isUpdate = action.type === 'update_task';
+  const changes = isUpdate
+    ? Object.keys(set).map((field) => ({ field, before: before[field], after: after[field] }))
+    : Object.entries(args).filter(([field]) => field !== 'projectId').map(([field, value]) => ({ field, before: undefined, after: value }));
+  const statusColor = action.status === 'approved' ? 'var(--green, var(--accent-ink))'
+    : action.status === 'failed' ? 'var(--red-soft)'
+      : action.status === 'rejected' ? 'var(--text-faint)' : 'var(--amber)';
+  return (
+    <section aria-label={`Ask action: ${action.summary}`} data-testid={`ask-action-${action.id}`} style={{ marginTop: 12, border: '1px solid var(--w-12)', borderRadius: 10, background: 'var(--w-025, var(--w-02))', padding: '11px 12px' }}>
+      <div style={{ display: 'flex', gap: 9, alignItems: 'center' }}>
+        <MonoTag color={statusColor} bg="var(--w-05)" size={8.5}>{busy ? 'SETTLING' : action.status.toUpperCase()}</MonoTag>
+        <strong style={{ fontSize: 12.5 }}>{action.summary}</strong>
+      </div>
+      <div style={{ marginTop: 7, fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>
+        Project {action.projectId}{isUpdate && typeof args.taskId === 'string' ? ` · Task ${args.taskId}` : ''}
+      </div>
+      <div style={{ marginTop: 9, display: 'grid', gridTemplateColumns: 'minmax(90px, .5fr) minmax(0, 1fr)', gap: '5px 10px', fontSize: 11.5 }}>
+        {changes.map((change) => (
+          <div key={change.field} style={{ display: 'contents' }}>
+            <span style={{ fontFamily: 'var(--mono)', color: 'var(--text-dim)' }}>{change.field}</span>
+            <span style={{ minWidth: 0, overflowWrap: 'anywhere' }}>
+              {isUpdate && <span style={{ color: 'var(--text-faint)' }}>{displayValue(change.before)} → </span>}
+              {displayValue(change.after)}
+            </span>
+          </div>
+        ))}
+      </div>
+      <details style={{ marginTop: 9 }}>
+        <summary style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>Exact stored payload</summary>
+        <pre style={{ margin: '7px 0 0', maxHeight: 220, overflow: 'auto', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 9.5, color: 'var(--text-dim)' }}>
+          {JSON.stringify({ arguments: action.arguments, expected: action.expected }, null, 2)}
+        </pre>
+      </details>
+      {action.error && <div role="alert" style={{ marginTop: 8, color: 'var(--red-soft)', fontSize: 11.5 }}>{action.error}</div>}
+      {action.status === 'approved' && <div style={{ marginTop: 8, color: 'var(--text-dim)', fontSize: 11 }}>Applied as your human action.</div>}
+      {action.status === 'rejected' && <div style={{ marginTop: 8, color: 'var(--text-dim)', fontSize: 11 }}>Rejected without changing Noriq.</div>}
+      {action.status === 'pending' && (
+        <div style={{ display: 'flex', gap: 7, justifyContent: 'flex-end', marginTop: 11 }}>
+          <Button variant="ghost" disabled={busy} aria-label={`Reject ${action.summary}`} onClick={() => onSettle(action, 'reject')}>Reject</Button>
+          <Button disabled={busy} aria-label={`Confirm ${action.summary}`} onClick={() => onSettle(action, 'approve')}>Confirm</Button>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -71,12 +145,17 @@ export function AskView({ store }: { store: AppStore }) {
   const [threadArchived, setThreadArchived] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(true);
   const [q, setQ] = useState('');
+  const [models, setModels] = useState<ApiAskModelDefinition[]>([]);
+  const [selectedModel, setSelectedModel] = useState('');
+  const [modelsLoading, setModelsLoading] = useState(true);
   const [phase, setPhase] = useState<'searching' | 'generating' | null>(null);
   const [error, setError] = useState('');
+  const [settlingActions, setSettlingActions] = useState<Set<string>>(new Set());
   const [copiedMessage, setCopiedMessage] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const settlingActionsRef = useRef<Set<string>>(new Set());
   const followScrollRef = useRef(true);
   const openRequestRef = useRef(0);
   const loading = phase !== null;
@@ -104,6 +183,7 @@ export function AskView({ store }: { store: AppStore }) {
       mode: meta.mode ?? undefined,
       model: meta.model ?? undefined,
       trace: meta.trace ?? message.trace,
+      actions: meta.actions ?? message.actions,
     })),
     onStatus: (next: 'searching' | 'generating') => {
       setPhase(next);
@@ -209,6 +289,21 @@ export function AskView({ store }: { store: AppStore }) {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    api.askModels()
+      .then((catalog) => {
+        if (cancelled) return;
+        setModels(catalog.models);
+        setSelectedModel(catalog.defaultModel);
+      })
+      .catch((e) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : 'Could not load configured Ask models.');
+      })
+      .finally(() => { if (!cancelled) setModelsLoading(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
     if (followScrollRef.current) endRef.current?.scrollIntoView?.({ block: 'end' });
   }, [messages, loading, historyLoading]);
 
@@ -228,7 +323,7 @@ export function AskView({ store }: { store: AppStore }) {
 
   const ask = async (text?: string) => {
     const question = (text ?? q).trim();
-    if (!question || loading || historyLoading) return;
+    if (!question || !selectedModel || loading || historyLoading) return;
     const activeThreadId = threadId;
     let streamedThreadId: string | null = null;
     const controller = new AbortController();
@@ -237,7 +332,7 @@ export function AskView({ store }: { store: AppStore }) {
     setMessages((current) => [
       ...current,
       { role: 'user', content: question },
-      { role: 'assistant', content: '', sources: [], trace: ['Preparing response…'], generationStatus: 'pending' },
+      { role: 'assistant', content: '', sources: [], trace: ['Preparing response…'], model: selectedModel, generationStatus: 'pending' },
     ]);
     setQ('');
     setPhase('searching');
@@ -253,7 +348,7 @@ export function AskView({ store }: { store: AppStore }) {
             const now = new Date().toISOString();
             return [{ id: thread.id, title: thread.title, archivedAt: null, createdAt: now, updatedAt: now, messageCount: 1, lastMessage: question }, ...current];
           });
-        }), controller.signal);
+        }), controller.signal, selectedModel);
       await refreshThreadLists(false);
     } catch (e) {
       if (controller.signal.aborted) return;
@@ -362,9 +457,49 @@ export function AskView({ store }: { store: AppStore }) {
       sessionStorage.setItem('noriq.openDoc', source.id);
       actions.setView('docs');
     } else if (source.kind === 'plan') actions.setView('plans');
-    else {
+    else if (source.kind === 'memory' || source.kind === 'episode') {
       if (source.kind === 'memory') sessionStorage.setItem('noriq.openMemory', source.id);
       actions.setView('memory');
+    } else if (source.kind === 'run') actions.setView('runs');
+    else if (source.kind === 'signal') actions.setView('control');
+  };
+
+  const replaceAction = (updated: ApiAskAction) => {
+    setMessages((current) => current.map((message) => ({
+      ...message,
+      actions: message.actions?.map((candidate) => candidate.id === updated.id ? updated : candidate),
+    })));
+  };
+
+  const settleAction = async (action: ApiAskAction, decision: 'approve' | 'reject') => {
+    if (settlingActionsRef.current.has(action.id)) return;
+    settlingActionsRef.current.add(action.id);
+    setError('');
+    setSettlingActions((current) => new Set(current).add(action.id));
+    try {
+      const updated = decision === 'approve'
+        ? await api.approveAskAction(action.id)
+        : await api.rejectAskAction(action.id);
+      replaceAction(updated);
+      if (updated.status === 'approved') {
+        const args = record(updated.arguments);
+        const result = record(updated.result);
+        const taskId = updated.type === 'update_task' && typeof args.taskId === 'string'
+          ? args.taskId
+          : typeof result.id === 'string' ? result.id : null;
+        actions.selectProject(updated.projectId);
+        actions.refreshNow();
+        if (taskId) actions.openTask(taskId);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : `Could not ${decision} that action.`);
+    } finally {
+      settlingActionsRef.current.delete(action.id);
+      setSettlingActions((current) => {
+        const next = new Set(current);
+        next.delete(action.id);
+        return next;
+      });
     }
   };
 
@@ -452,6 +587,8 @@ export function AskView({ store }: { store: AppStore }) {
                 const isStreaming = message.role === 'assistant' && index === messages.length - 1 && phase !== null;
                 const messageKey = message.id ?? message.generationId ?? `local-${index}`;
                 const copyLabel = `Copy ${message.role} message`;
+                const displayedModel = modelLabel(message.model, models);
+                const coverageNotices = message.trace?.filter((item) => /truncat|server limit|capped|returned \d+ of/i.test(item)) ?? [];
                 return (
                   <div key={messageKey} style={{ marginBottom: 24 }}>
                     {message.role === 'user' ? (
@@ -474,7 +611,7 @@ export function AskView({ store }: { store: AppStore }) {
                           {(message.trace?.length || message.reasoning) && (
                             <details data-testid="ask-reasoning" style={{ borderLeft: '1px solid var(--w-1)', paddingLeft: 11 }}>
                               <summary style={{ cursor: 'pointer', color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 9.5, userSelect: 'none' }}>
-                                {isStreaming ? 'Thinking…' : 'Reasoning summary'}
+                                {isStreaming ? 'Live activity…' : 'Activity and reasoning'}
                               </summary>
                               <div style={{ marginTop: 8, color: 'var(--text-mid)', fontSize: 11.5, lineHeight: 1.55 }}>
                                 {message.trace?.map((item, traceIndex) => (
@@ -498,10 +635,9 @@ export function AskView({ store }: { store: AppStore }) {
                               </summary>
                               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
                                 {message.sources.map((source) => (
-                                  <button key={`${source.kind}:${source.id}`} onClick={() => openSource(source)} className="hover-border" title={`${source.projectName} · ${source.retrieval}`} style={{ display: 'flex', alignItems: 'center', gap: 7, border: '1px solid var(--w-07)', borderRadius: 8, background: 'var(--w-02)', padding: '6px 9px', cursor: 'pointer', minWidth: 0 }}>
+                                  <button key={`${source.kind}:${source.id}`} aria-label={`Open ${source.citation ?? source.key ?? source.title}`} onClick={() => openSource(source)} className="hover-border" title={`${source.projectName} · ${source.retrieval}${source.updatedAt ? ` · updated ${source.updatedAt}` : ''}`} style={{ display: 'flex', alignItems: 'center', gap: 7, border: '1px solid var(--w-07)', borderRadius: 8, background: 'var(--w-02)', padding: '6px 9px', cursor: 'pointer', minWidth: 0 }}>
                                     <MonoTag color={KIND_COLOR[source.kind]} bg="var(--w-04)" size={8}>{source.kind.toUpperCase()}</MonoTag>
-                                    <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>{source.projectKey}</span>
-                                    {source.key && <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>{source.key}</span>}
+                                    <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>{source.citation ?? [source.projectKey, source.key].filter(Boolean).join(' / ')}</span>
                                     {source.historical && <MonoTag color="var(--text-faint)" bg="var(--w-04)" size={8}>HISTORICAL</MonoTag>}
                                     {source.isLead && <MonoTag color="var(--amber)" bg="var(--w-04)" size={8}>LEAD</MonoTag>}
                                     <span style={{ fontSize: 11.5, maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{source.title}</span>
@@ -511,17 +647,29 @@ export function AskView({ store }: { store: AppStore }) {
                               </div>
                             </details>
                           )}
+                          {coverageNotices.map((notice) => (
+                            <div key={notice} role="note" style={{ marginTop: 10, borderLeft: '2px solid var(--amber)', paddingLeft: 9, color: 'var(--text-dim)', fontSize: 11.5 }}>
+                              Coverage notice: {notice}
+                            </div>
+                          ))}
                           <div data-testid="ask-answer" style={{ fontSize: 13.5, lineHeight: 1.65, marginTop: message.trace?.length || message.reasoning || message.sources?.length ? 14 : 0 }}>
-                            {message.content ? <Markdown source={message.content} /> : phase && isStreaming ? <GenerationActivity phase={phase} /> : null}
-                            {message.content && phase && isStreaming && <div style={{ marginTop: 9 }}><GenerationActivity phase={phase} /></div>}
+                            {message.content ? <Markdown source={message.content} /> : phase && isStreaming ? <GenerationActivity phase={phase} model={displayedModel} trace={message.trace} /> : null}
+                            {message.content && phase && isStreaming && <div style={{ marginTop: 9 }}><GenerationActivity phase={phase} model={displayedModel} trace={message.trace} /></div>}
                           </div>
                           {message.generationStatus === 'failed' && message.generationError && (
                             <div style={{ marginTop: 9, color: message.generationError.toLowerCase().includes('cancelled') ? 'var(--text-dim)' : 'var(--red-soft)', fontSize: 11.5 }}>
                               {message.generationError.toLowerCase().includes('cancelled') ? 'Response cancelled.' : message.generationError}
                             </div>
                           )}
+                          {message.actions?.map((action) => (
+                            <ActionCard key={action.id} action={action} busy={settlingActions.has(action.id)} onSettle={(candidate, decision) => void settleAction(candidate, decision)} />
+                          ))}
                           <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 10 }}>
-                            {(message.model || !isStreaming) && <div style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>{modelLabel(message.model)}</div>}
+                            {(message.model || !isStreaming) && (
+                              <div style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)', overflowWrap: 'anywhere' }}>
+                                {displayedModel}{message.model && displayedModel !== message.model ? ` · ${message.model}` : ''}
+                              </div>
+                            )}
                             <div style={{ flex: 1 }} />
                             <button
                               type="button"
@@ -547,11 +695,22 @@ export function AskView({ store }: { store: AppStore }) {
             <div style={{ maxWidth: 800, margin: '0 auto', border: '1px solid var(--w-12)', borderRadius: 13, background: 'var(--card)', padding: '9px 10px 9px 13px', boxShadow: '0 10px 30px rgba(0,0,0,.12)' }}>
               <textarea value={q} onChange={(event) => setQ(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (!loading) void ask(); } }} placeholder={threadArchived ? 'Restore this chat to continue…' : 'Message Ask…'} rows={2} disabled={historyLoading || threadArchived} style={{ boxSizing: 'border-box', width: '100%', background: 'transparent', border: 0, padding: '2px 0 6px', color: 'var(--text)', fontSize: 13.5, lineHeight: 1.5, resize: 'none', outline: 'none', fontFamily: 'inherit' }} />
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <span style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>GPT-OSS 120B · CF</span>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>
+                  Model
+                  <select
+                    aria-label="Ask model"
+                    value={selectedModel}
+                    onChange={(event) => setSelectedModel(event.target.value)}
+                    disabled={modelsLoading || models.length === 0 || loading || threadArchived}
+                    style={{ maxWidth: 220, background: 'var(--w-04)', border: '1px solid var(--w-1)', borderRadius: 6, color: 'var(--text-dim)', padding: '3px 22px 3px 6px', fontFamily: 'var(--mono)', fontSize: 9.5 }}
+                  >
+                    {models.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
+                  </select>
+                </label>
                 <div style={{ flex: 1 }} />
                 <span style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>Shift+Enter for newline</span>
                 {loading && <Button variant="ghost" onClick={() => void cancelGeneration()} disabled={!activeGeneration?.generationId}>Cancel</Button>}
-                <Button onClick={() => void ask()} disabled={!q.trim() || loading || historyLoading || threadArchived}>Send</Button>
+                <Button onClick={() => void ask()} disabled={!q.trim() || !selectedModel || loading || historyLoading || modelsLoading || threadArchived}>Send</Button>
               </div>
             </div>
           </div>
