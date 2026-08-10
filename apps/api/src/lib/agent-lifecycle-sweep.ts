@@ -12,6 +12,13 @@ const MAX_ONLINE_SECONDS = 86_400;
 const DEFAULT_BATCH = 100;
 const MAX_BATCH = 500;
 
+// These are deliberately soft attribution links: the durable execution row retains the presence
+// identifier after the short-lived presence record reaches its retention limit. Any new schema
+// reference remains fail-closed until it is reviewed and added here explicitly.
+const PURGE_SAFE_SOFT_PRESENCE_REFERENCES = new Set([
+  'execution_nodes.presence_id',
+]);
+
 export type AgentLifecycleSweepConfig = {
   onlineSeconds: number;
   copilotRetireDays: number;
@@ -173,7 +180,7 @@ async function presenceReferenceContract(db: D1Database): Promise<{ complete: bo
     const blockers = [
       ...inbound,
       ...soft.results.map((r) => `${r.name}.presence_id`),
-    ];
+    ].filter((reference) => !PURGE_SAFE_SOFT_PRESENCE_REFERENCES.has(reference));
     return { complete: blockers.length === 0, blockers };
   } catch (error) {
     return { complete: false, blockers: [`probe_failed:${String(error)}`] };
