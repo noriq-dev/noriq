@@ -1,7 +1,7 @@
 // Durable user-owned Ask threads. This module contains no routing or inference logic: routes
 // establish the signed-in user, then these helpers enforce ownership in every query.
 
-import type { AskHistoryMessage, AskSource } from './ask';
+import { normalizeAskReferences, type AskHistoryMessage, type AskInputReference, type AskSource } from './ask';
 import { DEFAULT_ASK_MODEL_ID } from './ask-models';
 import { listAskActions, type StoredAskAction } from './ask-actions';
 import { newId, nowIso } from './lib/util';
@@ -40,6 +40,7 @@ export interface StoredAskGeneration {
   userId: string;
   question: string;
   history: AskHistoryMessage[];
+  references: AskInputReference[];
   status: AskGenerationStatus;
   answer: string;
   reasoning: string;
@@ -105,14 +106,14 @@ export async function getAskThread(db: D1Database, userId: string, threadId: str
   ).bind(threadId, userId).first<Omit<AskThreadSummary, 'messageCount' | 'lastMessage'>>();
   if (!thread) return null;
   const { results } = await db.prepare(
-    `SELECT m.id, m.role, m.content, m.sources_json AS sourcesJson, m.reasoning, m.trace_json AS traceJson,
+    `SELECT m.id, m.role, m.content, m.references_json AS referencesJson, m.sources_json AS sourcesJson, m.reasoning, m.trace_json AS traceJson,
             m.retrieval_mode AS mode, m.model, m.created_at AS createdAt,
             g.id AS generationId, g.status AS generationStatus, g.error AS generationError
        FROM ask_messages m
        LEFT JOIN ask_generations g ON g.message_id = m.id
       WHERE m.thread_id = ? ORDER BY m.created_at, m.rowid`,
   ).bind(threadId).all<{
-    id: string; role: 'user' | 'assistant'; content: string; sourcesJson: string; reasoning: string;
+    id: string; role: 'user' | 'assistant'; content: string; referencesJson: string; sourcesJson: string; reasoning: string;
     traceJson: string; mode: 'semantic' | 'keyword' | null; model: string | null; createdAt: string;
     generationId: string | null; generationStatus: AskGenerationStatus | null; generationError: string | null;
   }>();
@@ -127,6 +128,7 @@ export async function getAskThread(db: D1Database, userId: string, threadId: str
     id: row.id,
     role: row.role,
     content: row.content,
+    references: normalizeAskReferences(jsonArray<unknown>(row.referencesJson)),
     sources: jsonArray<AskSource>(row.sourcesJson),
     reasoning: row.reasoning,
     trace: jsonArray<string>(row.traceJson).filter((item): item is string => typeof item === 'string'),
@@ -156,7 +158,7 @@ export async function askThreadHistory(
   if (!detail) return null;
   return {
     thread: detail,
-    history: detail.messages.slice(-limit).map(({ role, content }) => ({ role, content })),
+    history: detail.messages.slice(-limit).map(({ role, content, references }) => ({ role, content, references })),
   };
 }
 
@@ -170,6 +172,7 @@ export async function appendAskMessage(
     trace?: string[];
     mode?: 'semantic' | 'keyword' | null;
     model?: string | null;
+    references?: AskInputReference[];
   },
 ): Promise<string> {
   const id = newId('msg');
@@ -179,10 +182,10 @@ export async function appendAskMessage(
   await db.batch([
     db.prepare(
       `INSERT INTO ask_messages
-        (id, thread_id, role, content, sources_json, reasoning, trace_json, retrieval_mode, model, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (id, thread_id, role, content, references_json, sources_json, reasoning, trace_json, retrieval_mode, model, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
-      id, threadId, message.role, message.content, JSON.stringify(message.sources ?? []), message.reasoning ?? '',
+      id, threadId, message.role, message.content, JSON.stringify(normalizeAskReferences(message.references)), JSON.stringify(message.sources ?? []), message.reasoning ?? '',
       JSON.stringify(message.trace ?? []), message.mode ?? null, message.model ?? null, now,
     ),
     db.prepare('UPDATE ask_threads SET updated_at = ? WHERE id = ? AND user_id = ?').bind(now, threadId, userId),
@@ -199,6 +202,7 @@ export async function createAskGeneration(
   question: string,
   history: AskHistoryMessage[],
   model = DEFAULT_ASK_MODEL_ID,
+  references: AskInputReference[] = [],
 ): Promise<StoredAskGeneration> {
   const id = newId('askgen');
   const userMessageId = newId('msg');
@@ -210,33 +214,34 @@ export async function createAskGeneration(
   const assistantAt = new Date(Date.parse(now) + 1).toISOString();
   const owned = await db.prepare('SELECT id FROM ask_threads WHERE id = ? AND user_id = ?').bind(threadId, userId).first();
   if (!owned) throw new Error('chat not found');
+  const normalizedReferences = normalizeAskReferences(references);
   await db.batch([
     db.prepare(
       `INSERT INTO ask_messages
-        (id, thread_id, role, content, sources_json, reasoning, trace_json, retrieval_mode, model, created_at)
-       VALUES (?, ?, 'user', ?, '[]', '', '[]', NULL, NULL, ?)`,
-    ).bind(userMessageId, threadId, question, now),
+        (id, thread_id, role, content, references_json, sources_json, reasoning, trace_json, retrieval_mode, model, created_at)
+       VALUES (?, ?, 'user', ?, ?, '[]', '', '[]', NULL, NULL, ?)`,
+    ).bind(userMessageId, threadId, question, JSON.stringify(normalizedReferences), now),
     db.prepare(
       `INSERT INTO ask_messages
-        (id, thread_id, role, content, sources_json, reasoning, trace_json, retrieval_mode, model, created_at)
-       VALUES (?, ?, 'assistant', '', '[]', '', '[]', NULL, ?, ?)`,
+        (id, thread_id, role, content, references_json, sources_json, reasoning, trace_json, retrieval_mode, model, created_at)
+       VALUES (?, ?, 'assistant', '', '[]', '[]', '', '[]', NULL, ?, ?)`,
     ).bind(messageId, threadId, model, assistantAt),
     db.prepare(
       `INSERT INTO ask_generations
-        (id, thread_id, message_id, user_id, question, history_json, status, model, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
-    ).bind(id, threadId, messageId, userId, question, JSON.stringify(history), model, now, now),
+        (id, thread_id, message_id, user_id, question, history_json, references_json, status, model, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+    ).bind(id, threadId, messageId, userId, question, JSON.stringify(history), JSON.stringify(normalizedReferences), model, now, now),
     db.prepare('UPDATE ask_threads SET updated_at = ? WHERE id = ? AND user_id = ?').bind(now, threadId, userId),
   ]);
   return {
-    id, threadId, messageId, userId, question, history, status: 'pending', answer: '', reasoning: '',
+    id, threadId, messageId, userId, question, history, references: normalizedReferences, status: 'pending', answer: '', reasoning: '',
     sources: [], trace: [], mode: null, model, graphEnhanced: false, finishReason: null,
     truncated: false, error: null, revision: 0, createdAt: now, updatedAt: now,
   };
 }
 
 const generationFromRow = (row: {
-  id: string; threadId: string; messageId: string; userId: string; question: string; historyJson: string;
+  id: string; threadId: string; messageId: string; userId: string; question: string; historyJson: string; referencesJson: string;
   status: AskGenerationStatus; answer: string; reasoning: string; sourcesJson: string; traceJson: string;
   mode: 'semantic' | 'keyword' | null; model: string | null; graphEnhanced: number; finishReason: string | null;
   truncated: number; error: string | null; revision: number; createdAt: string; updatedAt: string;
@@ -247,6 +252,7 @@ const generationFromRow = (row: {
   userId: row.userId,
   question: row.question,
   history: jsonArray<AskHistoryMessage>(row.historyJson),
+  references: normalizeAskReferences(jsonArray<unknown>(row.referencesJson)),
   status: row.status,
   answer: row.answer,
   reasoning: row.reasoning,
@@ -271,7 +277,7 @@ export async function getAskGeneration(
   const owner = userId ? ' AND user_id = ?' : '';
   const row = await db.prepare(
     `SELECT id, thread_id AS threadId, message_id AS messageId, user_id AS userId, question,
-            history_json AS historyJson, status, answer, reasoning, sources_json AS sourcesJson,
+            history_json AS historyJson, references_json AS referencesJson, status, answer, reasoning, sources_json AS sourcesJson,
             trace_json AS traceJson, retrieval_mode AS mode, model, graph_enhanced AS graphEnhanced,
             finish_reason AS finishReason, truncated, error, revision,
             created_at AS createdAt, updated_at AS updatedAt

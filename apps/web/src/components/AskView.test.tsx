@@ -127,11 +127,30 @@ describe('global Ask chat', () => {
     const textarea = container.querySelector<HTMLTextAreaElement>('textarea')!;
     act(() => textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })));
     expect(textarea.value).toBe('What is active in @noriq-mission-control ');
+    expect(container.querySelector('[aria-label="Selected references"]')?.textContent).toContain('@noriq-mission-control');
     expect(ask).not.toHaveBeenCalled();
 
     await act(async () => button('Send')!.click());
     expect(ask).toHaveBeenCalledWith(
       'What is active in @noriq-mission-control', null, expect.anything(), expect.any(AbortSignal), defaultModel,
+      [{ kind: 'project', id: 'project_noriq', token: '@noriq-mission-control' }],
+    );
+  });
+
+  it('treats typed or pasted special characters as plain text unless a suggestion is selected', async () => {
+    mockEmptyHistory();
+    const ask = vi.spyOn(api, 'askStream').mockImplementation(async (_question, _threadId, handlers) => {
+      handlers.onDelta('Plain-text answer');
+      handlers.onDone?.({ finishReason: 'stop', truncated: false });
+    });
+    mount([{ id: 'project_noriq', key: 'PLNR', name: 'Noriq' }]);
+    await flush();
+
+    setTextarea('Email me@work.test about #PLNR-421 and @noriq');
+    expect(container.querySelector('[aria-label="Selected references"]')).toBeNull();
+    await act(async () => button('Send')!.click());
+    expect(ask).toHaveBeenCalledWith(
+      'Email me@work.test about #PLNR-421 and @noriq', null, expect.anything(), expect.any(AbortSignal), defaultModel,
     );
   });
 
@@ -213,6 +232,7 @@ describe('global Ask chat', () => {
     act(() => textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })));
     act(() => textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })));
     expect(textarea.value).toBe('Compare #PLNR-422 ');
+    expect(container.querySelector('[aria-label="Selected references"]')?.textContent).toContain('#PLNR-422');
   });
 
   it('loads a durable thread, streams into it, and opens a graph-aware source', async () => {

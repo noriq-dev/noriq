@@ -15,7 +15,7 @@ import type { ExecutionSpecInput, RunStatus } from '@noriq-dev/shared';
 import { readExecutionSpec } from './lib/execution-spec';
 import { search, searchBackend, reindexProject, ALL_KINDS, type SearchKind } from './search';
 import {
-  answerQuestion, generationClient, normalizeHistory, streamingGenerationClient,
+  answerQuestion, generationClient, normalizeAskReferences, normalizeHistory, streamingGenerationClient,
   type AskProject,
 } from './ask';
 import {
@@ -2596,8 +2596,8 @@ app.delete('/api/ask/threads/:threadId', userAuth, async (c) => {
 app.post('/api/ask', userAuth, async (c) => {
   const rl = await rateLimit(c.env, `ask:${c.var.user!.id}`, 20);
   if (!rl.ok) return c.json(tooMany, 429, { 'Retry-After': String(rl.retryAfter) });
-  const { question, history, model: requestedModel } = await c.req.json<{ question?: string; history?: unknown; model?: string }>()
-    .catch(() => ({ question: undefined, history: undefined, model: undefined }));
+  const { question, history, references, model: requestedModel } = await c.req.json<{ question?: string; history?: unknown; references?: unknown; model?: string }>()
+    .catch(() => ({ question: undefined, history: undefined, references: undefined, model: undefined }));
   const q = question?.trim().slice(0, 4000);
   if (!q) return c.json({ error: 'question required' }, 400);
   let model;
@@ -2615,6 +2615,7 @@ app.post('/api/ask', userAuth, async (c) => {
       question: q,
       projects,
       history: normalizeHistory(history),
+      references: normalizeAskReferences(references),
       model: model.id,
     }));
   } catch (e) {
@@ -2627,8 +2628,8 @@ app.post('/api/ask', userAuth, async (c) => {
 app.post('/api/ask/stream', userAuth, async (c) => {
   const rl = await rateLimit(c.env, `ask:${c.var.user!.id}`, 20);
   if (!rl.ok) return c.json(tooMany, 429, { 'Retry-After': String(rl.retryAfter) });
-  const { question, history, threadId, model: requestedModel } = await c.req.json<{ question?: string; history?: unknown; threadId?: string; model?: string }>()
-    .catch(() => ({ question: undefined, history: undefined, threadId: undefined, model: undefined }));
+  const { question, history, references, threadId, model: requestedModel } = await c.req.json<{ question?: string; history?: unknown; references?: unknown; threadId?: string; model?: string }>()
+    .catch(() => ({ question: undefined, history: undefined, references: undefined, threadId: undefined, model: undefined }));
   const q = question?.trim().slice(0, 4000);
   if (!q) return c.json({ error: 'question required' }, 400);
   let model;
@@ -2647,7 +2648,7 @@ app.post('/api/ask/stream', userAuth, async (c) => {
     const thread = stored?.thread ?? await createAskThread(c.env.DB, userId, q);
     const generation = await createAskGeneration(
       c.env.DB, userId, thread.id, q, stored?.history ?? normalizeHistory(history),
-      model.id,
+      model.id, normalizeAskReferences(references),
     );
     await c.env.ASK_GENERATION.get(c.env.ASK_GENERATION.idFromName(generation.id)).start(generation.id);
     return new Response(askGenerationEventStream(c.env, userId, generation.id, {

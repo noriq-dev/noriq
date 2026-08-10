@@ -30,7 +30,14 @@ export interface ChatMessage {
   content: string;
 }
 
-export type AskHistoryMessage = Pick<ChatMessage, 'role' | 'content'>;
+export type AskInputReference =
+  | { kind: 'project'; id: string; token: string }
+  | { kind: 'task'; id: string; key: string; token: string };
+
+export interface AskHistoryMessage extends Pick<ChatMessage, 'role' | 'content'> {
+  /** Server-stored composer selections. Client-supplied history never gets to populate this. */
+  references?: AskInputReference[];
+}
 
 export interface GenerationClient {
   generate(messages: ChatMessage[], opts: { maxTokens: number }): Promise<string>;
@@ -145,6 +152,54 @@ export interface AskProjectTag {
   projectName: string;
 }
 
+const MAX_ASK_INPUT_REFERENCES = 12;
+
+/** Keep only the narrow data emitted by a picker selection. This metadata still grants no access:
+ * project/task resolution applies the signed-in caller's workspace boundary again at use time. */
+export function normalizeAskReferences(value: unknown): AskInputReference[] {
+  if (!Array.isArray(value)) return [];
+  const references: AskInputReference[] = [];
+  const seen = new Set<string>();
+  for (const candidate of value) {
+    const item = asObject(candidate);
+    if (!item || (item.kind !== 'project' && item.kind !== 'task')
+      || typeof item.id !== 'string' || typeof item.token !== 'string') continue;
+    const id = item.id.trim().slice(0, 128);
+    const token = item.token.trim().slice(0, 80);
+    const key = `${item.kind}:${id}`;
+    if (!id || !token || seen.has(key)) continue;
+    if (item.kind === 'project' && /^@[a-z0-9][a-z0-9_-]{0,63}$/i.test(token)) {
+      references.push({ kind: 'project', id, token });
+      seen.add(key);
+    } else if (item.kind === 'task' && typeof item.key === 'string') {
+      const taskKey = item.key.trim().toUpperCase();
+      if (/^[A-Z][A-Z0-9]{0,7}-[1-9][0-9]*$/.test(taskKey) && token.toUpperCase() === `#${taskKey}`) {
+        references.push({ kind: 'task', id, key: taskKey, token: `#${taskKey}` });
+        seen.add(key);
+      }
+    }
+    if (references.length >= MAX_ASK_INPUT_REFERENCES) break;
+  }
+  return references;
+}
+
+export function resolveAskProjectSelections(
+  references: readonly AskInputReference[],
+  projects: AskProject[],
+): AskProjectTag[] {
+  const byId = new Map(projects.map((project) => [project.id, project]));
+  return normalizeAskReferences(references).flatMap((reference) => {
+    if (reference.kind !== 'project') return [];
+    const project = byId.get(reference.id);
+    return project ? [{
+      tag: reference.token,
+      projectId: project.id,
+      projectKey: project.key,
+      projectName: project.name,
+    }] : [];
+  });
+}
+
 const projectNameTag = (name: string): string => name
   .trim()
   .toLowerCase()
@@ -187,14 +242,14 @@ export function resolveAskProjectTagsForTurn(
   question: string,
   history: AskHistoryMessage[],
   projects: AskProject[],
+  references: readonly AskInputReference[] = [],
 ): AskProjectTag[] {
-  const current = resolveAskProjectTags(question, projects);
+  const current = resolveAskProjectSelections(references, projects);
   if (current.length || !isAskTaskActionFollowUp(question)) return current;
-  const normalized = normalizeHistory(history);
-  for (let index = normalized.length - 1; index >= 0; index -= 1) {
-    const message = normalized[index]!;
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const message = history[index]!;
     if (message.role !== 'user') continue;
-    const inherited = resolveAskProjectTags(message.content, projects);
+    const inherited = resolveAskProjectSelections(message.references ?? [], projects);
     if (inherited.length) return inherited;
   }
   return [];
@@ -653,6 +708,7 @@ export interface AskOptions {
   projects: AskProject[];
   model?: string;
   history?: AskHistoryMessage[];
+  references?: AskInputReference[];
   retrieval?: RetrievalDecisionClient | null;
   onRetrieval?: () => void | Promise<void>;
 }
@@ -709,7 +765,7 @@ export async function prepareQuestion(env: Env, opts: AskOptions): Promise<Prepa
   const question = opts.question.trim().slice(0, MAX_QUESTION_CHARS);
   const history = normalizeHistory(opts.history);
   const model = opts.model ?? GENERATION_MODEL;
-  const projectTags = resolveAskProjectTagsForTurn(question, history, opts.projects);
+  const projectTags = resolveAskProjectTagsForTurn(question, opts.history ?? [], opts.projects, opts.references);
   const projects = projectTags.length
     ? opts.projects.filter((project) => projectTags.some((tag) => tag.projectId === project.id))
     : opts.projects;

@@ -13,7 +13,7 @@ import { resolveAskModel } from './ask-models';
 import { askToolDecisionClient, createAskTools, finalAskMessages, runAskToolLoop } from './ask-tools';
 import { listAskActions } from './ask-actions';
 import {
-  askTaskReferenceSources, formatAskTaskReferenceContext, resolveAskTaskReferences,
+  askTaskReferenceSources, formatAskTaskReferenceContext, resolveAskTaskReferenceSelections,
 } from './ask-task-references';
 
 const encoder = new TextEncoder();
@@ -65,14 +65,16 @@ export async function runAskGeneration(env: Env, generationId: string): Promise<
   try {
     if (!await persist('searching', true)) return;
     const accessibleProjects = await accessibleAskProjectsForUser(env, generation.userId);
-    const projectTags = resolveAskProjectTagsForTurn(generation.question, generation.history, accessibleProjects);
+    const projectTags = resolveAskProjectTagsForTurn(
+      generation.question, generation.history, accessibleProjects, generation.references,
+    );
     const projects = projectTags.length
       ? accessibleProjects.filter((project) => projectTags.some((tag) => tag.projectId === project.id))
       : accessibleProjects;
-    const taskReferences = await resolveAskTaskReferences(env, {
+    const taskReferences = await resolveAskTaskReferenceSelections(env, {
       userId: generation.userId,
       ...(projectTags.length ? { projectIds: projectTags.map((tag) => tag.projectId) } : {}),
-    }, generation.question);
+    }, generation.references);
     const taskReferenceContext = formatAskTaskReferenceContext(taskReferences);
     const tagSources = askProjectTagSources(projectTags);
     const taskReferenceSources = askTaskReferenceSources(taskReferences);

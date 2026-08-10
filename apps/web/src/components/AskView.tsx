@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   api, ApiError, type ApiAskAction, type ApiAskHistoryMessage, type ApiAskModelDefinition, type ApiAskSource,
-  type ApiAskStoredMessage, type ApiAskThread, type ApiTaskSearchResult,
+  type ApiAskInputReference, type ApiAskStoredMessage, type ApiAskThread, type ApiTaskSearchResult,
 } from '../api';
 import type { AppStore } from '../store';
 import { MonoTag, WaveBars } from './bits';
@@ -53,6 +53,7 @@ const fromStoredMessage = (message: ApiAskStoredMessage): ThreadMessage => ({
   id: message.id,
   role: message.role,
   content: message.content,
+  references: message.references,
   sources: message.sources,
   mode: message.mode ?? undefined,
   model: message.model ?? undefined,
@@ -155,6 +156,7 @@ export function AskView({ store }: { store: AppStore }) {
   const [threadArchived, setThreadArchived] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(true);
   const [q, setQ] = useState('');
+  const [selectedReferences, setSelectedReferences] = useState<ApiAskInputReference[]>([]);
   const [activeProjectSuggestion, setActiveProjectSuggestion] = useState(0);
   const [taskSuggestions, setTaskSuggestions] = useState<ApiTaskSearchResult[]>([]);
   const [activeTaskSuggestion, setActiveTaskSuggestion] = useState(0);
@@ -220,16 +222,35 @@ export function AskView({ store }: { store: AppStore }) {
     };
   }, [taskMentionQuery]);
 
-  const insertProjectTag = (tag: string) => {
+  const addSelectedReference = (reference: ApiAskInputReference) => {
+    setSelectedReferences((current) => current.some((item) => item.kind === reference.kind && item.id === reference.id)
+      ? current
+      : [...current, reference]);
+  };
+
+  const insertProjectTag = (project: { id: string }, tag: string) => {
     if (!mention) return;
     const at = q.lastIndexOf('@');
     setQ(`${q.slice(0, at)}${tag} `);
+    addSelectedReference({ kind: 'project', id: project.id, token: tag });
   };
 
   const insertTaskReference = (task: ApiTaskSearchResult) => {
     if (!taskMention) return;
     const hash = q.lastIndexOf('#');
-    setQ(`${q.slice(0, hash)}#${task.key} `);
+    const token = `#${task.key}`;
+    setQ(`${q.slice(0, hash)}${token} `);
+    addSelectedReference({ kind: 'task', id: task.id, key: task.key, token });
+  };
+
+  const updateQuestion = (value: string) => {
+    setQ(value);
+    setSelectedReferences((current) => current.filter((reference) => value.includes(reference.token)));
+  };
+
+  const removeSelectedReference = (reference: ApiAskInputReference) => {
+    setSelectedReferences((current) => current.filter((item) => !(item.kind === reference.kind && item.id === reference.id)));
+    setQ((current) => current.replace(reference.token, '').replace(/ {2,}/g, ' '));
   };
 
   const patchGeneration = (generationId: string, patch: (message: ThreadMessage) => ThreadMessage) => {
@@ -390,6 +411,7 @@ export function AskView({ store }: { store: AppStore }) {
     setHistoryLoading(false);
     setMessages([]);
     setQ('');
+    setSelectedReferences([]);
     setError('');
   };
 
@@ -400,13 +422,15 @@ export function AskView({ store }: { store: AppStore }) {
     let streamedThreadId: string | null = null;
     const controller = new AbortController();
     const generationRef = { current: '' };
+    const references = text === undefined ? selectedReferences : [];
     abortRef.current = controller;
     setMessages((current) => [
       ...current,
-      { role: 'user', content: question },
+      { role: 'user', content: question, references },
       { role: 'assistant', content: '', sources: [], trace: ['Preparing response…'], model: selectedModel, generationStatus: 'pending' },
     ]);
     setQ('');
+    setSelectedReferences([]);
     setPhase('searching');
     setError('');
     try {
@@ -420,7 +444,7 @@ export function AskView({ store }: { store: AppStore }) {
             const now = new Date().toISOString();
             return [{ id: thread.id, title: thread.title, archivedAt: null, createdAt: now, updatedAt: now, messageCount: 1, lastMessage: question }, ...current];
           });
-        }), controller.signal, selectedModel);
+        }), controller.signal, selectedModel, ...(references.length ? [references] : []));
       await refreshThreadLists(false);
     } catch (e) {
       if (controller.signal.aborted) return;
@@ -785,7 +809,7 @@ export function AskView({ store }: { store: AppStore }) {
               {projectSuggestions.length > 0 && (
                 <div role="listbox" aria-label="Tag a project" aria-activedescendant={`ask-project-option-${projectSuggestions[selectedProjectSuggestion]!.project.id}`} style={{ position: 'absolute', left: 12, bottom: 'calc(100% + 7px)', width: 300, maxWidth: 'calc(100vw - 48px)', border: '1px solid var(--w-12)', borderRadius: 10, background: 'var(--bg-raised)', padding: 5, boxShadow: '0 14px 34px rgba(0,0,0,.3)', zIndex: 5 }}>
                   {projectSuggestions.map(({ project, tag }, index) => (
-                    <button id={`ask-project-option-${project.id}`} key={project.id} role="option" aria-selected={index === selectedProjectSuggestion} onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setActiveProjectSuggestion(index)} onClick={() => insertProjectTag(tag)} style={{ cursor: 'pointer', width: '100%', display: 'flex', alignItems: 'center', gap: 9, borderRadius: 7, padding: '7px 9px', color: 'var(--text)', textAlign: 'left', background: index === selectedProjectSuggestion ? 'var(--w-07)' : 'transparent' }} className="hover-border">
+                    <button id={`ask-project-option-${project.id}`} key={project.id} role="option" aria-selected={index === selectedProjectSuggestion} onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setActiveProjectSuggestion(index)} onClick={() => insertProjectTag(project, tag)} style={{ cursor: 'pointer', width: '100%', display: 'flex', alignItems: 'center', gap: 9, borderRadius: 7, padding: '7px 9px', color: 'var(--text)', textAlign: 'left', background: index === selectedProjectSuggestion ? 'var(--w-07)' : 'transparent' }} className="hover-border">
                       <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--accent-ink)' }}>{tag}</span>
                       <span style={{ fontSize: 11.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{project.name}</span>
                       <span style={{ marginLeft: 'auto', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>{project.key}</span>
@@ -805,7 +829,16 @@ export function AskView({ store }: { store: AppStore }) {
                   ))}
                 </div>
               )}
-              <textarea value={q} onChange={(event) => setQ(event.target.value)} onKeyDown={(event) => {
+              {selectedReferences.length > 0 && (
+                <div aria-label="Selected references" style={{ display: 'flex', flexWrap: 'wrap', gap: 6, padding: '0 0 7px' }}>
+                  {selectedReferences.map((reference) => (
+                    <button key={`${reference.kind}:${reference.id}`} type="button" aria-label={`Remove ${reference.token}`} title="Remove reference" onClick={() => removeSelectedReference(reference)} style={{ cursor: 'pointer', border: `1px solid ${reference.kind === 'project' ? 'rgba(198,242,78,.24)' : 'var(--w-12)'}`, borderRadius: 7, background: reference.kind === 'project' ? 'rgba(198,242,78,.07)' : 'var(--w-05)', padding: '3px 7px', color: reference.kind === 'project' ? 'var(--accent-ink)' : 'var(--blue)', fontFamily: 'var(--mono)', fontSize: 9.5 }}>
+                      {reference.token} <span aria-hidden="true" style={{ color: 'var(--text-faint)' }}>×</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+              <textarea value={q} onChange={(event) => updateQuestion(event.target.value)} onKeyDown={(event) => {
                 if (taskSuggestions.length > 0 && taskMentionQuery !== null && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
                   event.preventDefault();
                   setActiveTaskSuggestion((current) => event.key === 'ArrowDown'
@@ -828,7 +861,7 @@ export function AskView({ store }: { store: AppStore }) {
                     return;
                   }
                   const suggestion = projectSuggestions[selectedProjectSuggestion];
-                  if (suggestion) insertProjectTag(suggestion.tag);
+                  if (suggestion) insertProjectTag(suggestion.project, suggestion.tag);
                   else if (!loading) void ask();
                 }
               }} placeholder={threadArchived ? 'Restore this chat to continue…' : 'Message Ask… Use @project to focus.'} rows={2} disabled={historyLoading || threadArchived} style={{ boxSizing: 'border-box', width: '100%', background: 'transparent', border: 0, padding: '2px 0 6px', color: 'var(--text)', fontSize: phone ? MIN_INPUT_FONT_SIZE : 13.5, lineHeight: 1.5, resize: 'none', outline: 'none', fontFamily: 'inherit' }} />

@@ -1,5 +1,5 @@
 import type { Env } from './env';
-import type { AskSource } from './ask';
+import { normalizeAskReferences, type AskInputReference, type AskSource } from './ask';
 import {
   resolveWorkspaceTaskReferences,
   type WorkspaceScope,
@@ -40,6 +40,27 @@ export async function resolveAskTaskReferences(
   return {
     ...parsed,
     items: await resolveWorkspaceTaskReferences(env, scope, parsed.keys),
+  };
+}
+
+/** Resolve only task picker selections. Matching both the opaque id and display key prevents stale
+ * UI metadata from silently resolving a different task after a rename or forged request. */
+export async function resolveAskTaskReferenceSelections(
+  env: Pick<Env, 'DB'>,
+  scope: WorkspaceScope,
+  references: readonly AskInputReference[],
+): Promise<AskTaskReferenceContext> {
+  const selected = normalizeAskReferences(references)
+    .filter((reference): reference is Extract<AskInputReference, { kind: 'task' }> => reference.kind === 'task')
+    .slice(0, MAX_ASK_TASK_REFERENCES);
+  const resolved = await resolveWorkspaceTaskReferences(env, scope, selected.map((reference) => reference.key));
+  return {
+    keys: selected.map((reference) => reference.key),
+    truncated: references.filter((reference) => reference.kind === 'task').length > MAX_ASK_TASK_REFERENCES,
+    items: resolved.map((item, index) => ({
+      ...item,
+      task: item.task?.id === selected[index]?.id ? item.task : null,
+    })),
   };
 }
 

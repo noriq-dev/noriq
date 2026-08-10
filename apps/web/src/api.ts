@@ -91,11 +91,12 @@ async function askStream(
   handlers: ApiAskStreamHandlers,
   signal?: AbortSignal,
   model?: string,
+  references: ApiAskInputReference[] = [],
 ): Promise<void> {
   const res = await fetch('/api/ask/stream', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
-    body: JSON.stringify({ question, threadId: threadId ?? undefined, model }),
+    body: JSON.stringify({ question, threadId: threadId ?? undefined, model, references }),
     credentials: 'same-origin',
     signal,
   });
@@ -441,9 +442,9 @@ export const api = {
     ),
   /** Global, multi-turn Ask chat. Project scope is derived server-side from the session; the
    *  browser sends conversation history but can never choose or broaden retrieval access. */
-  ask: (question: string, history: ApiAskHistoryMessage[], model?: string) =>
+  ask: (question: string, history: ApiAskHistoryMessage[], model?: string, references: ApiAskInputReference[] = []) =>
     req<{ answer: string; mode: 'semantic' | 'keyword' | null; model: string; graphEnhanced: boolean; sources: ApiAskSource[]; projectTags: ApiAskProjectTag[] }>(
-      'POST', '/api/ask', { question, history, model }),
+      'POST', '/api/ask', { question, history, model, references }),
   askModels: () => req<ApiAskModelCatalog>('GET', '/api/ask/models'),
   askStream,
   resumeAskStream,
@@ -1118,7 +1119,12 @@ export interface ApiSignalAnswer {
 export interface ApiAskHistoryMessage {
   role: 'user' | 'assistant';
   content: string;
+  references?: ApiAskInputReference[];
 }
+
+export type ApiAskInputReference =
+  | { kind: 'project'; id: string; token: string }
+  | { kind: 'task'; id: string; key: string; token: string };
 
 export interface ApiAskModelDefinition {
   id: string;
