@@ -14,6 +14,7 @@ import { LiveDot, MonoTag, SectionLabel } from './bits';
 import { Button, ErrorNote, Field, Select, TextArea, TextInput } from './ui';
 import { alert, confirm, prompt } from './Dialog';
 import { DispatchIntelligencePanel } from './DispatchIntelligence';
+import { TaskSearchSelect } from './TaskSearchSelect';
 
 function ago(iso: string | null): string {
   if (!iso) return 'never';
@@ -577,6 +578,10 @@ function DispatchForm({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
+  // A repository board lock changes the legal anchor set, so an anchor selected for the
+  // previous repository must not silently survive the switch.
+  useEffect(() => { setAnchorTask(''); }, [lockedBoard]);
+
   // The selected tool's coordinate menu (RUN-115): model suggestions + the efforts it distinguishes
   // (codex collapses xhigh/max into its own 'high', so it advertises fewer). Empty menu → free-text
   // model and all five efforts, exactly as before the catalog existed.
@@ -729,10 +734,14 @@ function DispatchForm({
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 12 }}>
         <Field label="anchor task" hint="optional">
-          <Select value={anchorTask} onChange={(e) => setAnchorTask(e.target.value)}>
-            <option value="">— none —</option>
-            {tasks.map((t) => <option key={t.id} value={t.id}>{t.key} · {t.title.slice(0, 40)}</option>)}
-          </Select>
+          <TaskSearchSelect
+            projectId={pid}
+            boardId={lockedBoard}
+            value={anchorTask}
+            onChange={setAnchorTask}
+            initialTasks={tasks}
+            label="Anchor task"
+          />
         </Field>
         <Field label="max $" hint="optional">
           <TextInput value={maxUsd} onChange={(e) => setMaxUsd(e.target.value)} inputMode="decimal" placeholder="—" />

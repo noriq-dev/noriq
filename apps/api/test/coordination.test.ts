@@ -342,8 +342,10 @@ describe('update_tasks — batch mutation', () => {
 // ---- PLNR-117: search_tasks — precision instead of dumping the project ------------
 describe('search_tasks', () => {
   let pid: string;
+  let boardId: string;
   beforeAll(async () => {
     pid = (await mcpCall(orch.apiKey, 'create_project', { key: 'SRC', name: 'searchable' })).body.id;
+    boardId = (await mcpCall(orch.apiKey, 'get_project', { projectId: pid })).body.boards[0].id;
     await mcpCall(orch.apiKey, 'create_tasks', {
       projectId: pid,
       tasks: [
@@ -384,13 +386,14 @@ describe('search_tasks', () => {
   });
 
   it('REST mirror answers the same question for the UI', async () => {
-    const res = await SELF.fetch(`https://noriq.test/api/tasks/search?projectId=${pid}&tag=auth&type=bug`, {
+    const res = await SELF.fetch(`https://noriq.test/api/tasks/search?projectId=${pid}&boardId=${boardId}&tag=auth&type=bug`, {
       headers: { Cookie: cookie },
     });
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { matched: number; tasks: Array<{ key: string; projectKey: string }> };
+    const body = (await res.json()) as { matched: number; tasks: Array<{ key: string; projectKey: string; boardId: string }> };
     expect(body.matched).toBe(1);
     expect(body.tasks[0]!.projectKey).toBe('SRC');
+    expect(body.tasks[0]!.boardId).toBe(boardId);
   });
 });
 

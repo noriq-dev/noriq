@@ -196,6 +196,21 @@ export const api = {
       undefined,
       signal,
     ),
+  searchTasks: (input: { projectId?: string; boardId?: string | null; text?: string; limit?: number }, signal?: AbortSignal) => {
+    const query = new URLSearchParams();
+    if (input.projectId) query.set('projectId', input.projectId);
+    if (input.boardId) query.set('boardId', input.boardId);
+    if (input.text?.trim()) query.set('text', input.text.trim());
+    query.set('limit', String(input.limit ?? 25));
+    return req<{
+      tasks: Array<{
+        id: string; key: string; title: string; status: string; priority: number; type: string;
+        projectId: string; projectKey: string; boardId: string | null; updatedAt: string;
+      }>;
+      matched: number;
+      returned: number;
+    }>('GET', `/api/tasks/search?${query}`, undefined, signal);
+  },
   archiveTask: (pid: string, tid: string) => req('POST', `/api/projects/${pid}/tasks/${tid}/archive`),
   restoreTask: (pid: string, tid: string) => req('POST', `/api/projects/${pid}/tasks/${tid}/restore`),
   taskDetail: (tid: string) => req<ApiTaskDetail>('GET', `/api/tasks/${tid}`),

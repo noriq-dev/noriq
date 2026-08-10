@@ -8,6 +8,8 @@ export interface TaskSearchFilters {
   type?: string;
   tag?: string;
   milestoneId?: string;
+  /** Restrict results to one board. Used by runner repository locks in task pickers. */
+  boardId?: string;
   /** A resolved agent id, or 'none' for unclaimed. ('me' is resolved by the caller.) */
   holder?: string;
   /** Substring match over title/body/key (LIKE, escaped). */
@@ -27,6 +29,7 @@ export function taskSearchFilters(f: TaskSearchFilters): { sql: string; binds: u
   if (f.status) { conds.push(`${taskWireStatus('t')} = ?`); binds.push(f.status); }
   if (f.type) { conds.push('t.type = ?'); binds.push(f.type); }
   if (f.milestoneId) { conds.push('t.milestone_id = ?'); binds.push(f.milestoneId); }
+  if (f.boardId) { conds.push('t.board_id = ?'); binds.push(f.boardId); }
   if (f.holder === 'none') {
     conds.push('t.claimed_by IS NULL');
   } else if (f.holder) {

@@ -1267,6 +1267,7 @@ app.get('/api/tasks/search', userAuth, async (c) => {
   }, {
     projectId: q.projectId,
     status: q.status, type: q.type, tag: q.tag, milestoneId: q.milestoneId,
+    boardId: q.boardId,
     holder: q.holder, text: q.text, includeArchived: q.includeArchived === '1', overdue: q.overdue === '1',
     limit: parseInt(q.limit ?? '50', 10) || 50,
   });

@@ -97,7 +97,8 @@ export async function searchWorkspaceTasks(env: Pick<Env, 'DB'>, scope: Workspac
     env.DB.prepare(
       `SELECT t.id, t.key, t.title, ${taskWireStatus('t')} AS status, t.failed_at AS failedAt, t.priority, t.estimate, t.due_at AS dueAt, t.type,
               t.project_id AS projectId, p.key AS projectKey, t.claimed_by AS claimedBy,
-              t.milestone_id AS milestoneId, t.open_comments AS openComments, t.updated_at AS updatedAt
+              t.milestone_id AS milestoneId, t.board_id AS boardId,
+              t.open_comments AS openComments, t.updated_at AS updatedAt
        ${base} ORDER BY t.priority ASC, t.updated_at DESC LIMIT ${max}`,
     ).bind(...allBinds).all(),
     env.DB.prepare(`SELECT COUNT(*) AS n ${base}`).bind(...allBinds).first<{ n: number }>(),
