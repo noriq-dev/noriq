@@ -7,6 +7,7 @@ export const WIDE_DESKTOP_BREAKPOINT = 1280;
 export const MIN_TOUCH_TARGET = 44;
 export const MIN_INPUT_FONT_SIZE = 16;
 export const TAB_ITEM_HEIGHT = 50;
+export const MOBILE_TAB_BAR_HEIGHT = `calc(${TAB_ITEM_HEIGHT}px + env(safe-area-inset-bottom))`;
 export const LIST_ROW_HEIGHT = 54;
 
 export type ViewportKind = 'phone' | 'tablet' | 'desktop';

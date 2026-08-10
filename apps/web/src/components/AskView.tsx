@@ -737,7 +737,7 @@ export function AskView({ store }: { store: AppStore }) {
             </div>
           </div>
 
-          <div style={{ flex: 'none', padding: phone ? '8px 10px calc(8px + env(safe-area-inset-bottom))' : '12px 24px 18px', background: 'linear-gradient(transparent, var(--bg) 22%)' }}>
+          <div style={{ flex: 'none', padding: phone ? '8px 10px 10px' : '12px 24px 18px', background: 'linear-gradient(transparent, var(--bg) 22%)' }}>
             <div style={{ position: 'relative', maxWidth: 800, margin: '0 auto', border: '1px solid var(--w-12)', borderRadius: 13, background: 'var(--card)', padding: '9px 10px 9px 13px', boxShadow: '0 10px 30px rgba(0,0,0,.12)' }}>
               {projectSuggestions.length > 0 && (
                 <div role="listbox" aria-label="Tag a project" style={{ position: 'absolute', left: 12, bottom: 'calc(100% + 7px)', width: 300, maxWidth: 'calc(100vw - 48px)', border: '1px solid var(--w-12)', borderRadius: 10, background: 'var(--bg-raised)', padding: 5, boxShadow: '0 14px 34px rgba(0,0,0,.3)', zIndex: 5 }}>

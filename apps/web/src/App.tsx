@@ -34,7 +34,7 @@ import { PublicView } from './components/PublicView';
 import { MobileTabBar } from './components/MobileTabBar';
 import { ProjectSheet } from './components/ProjectSheet';
 import { AvatarChip, LiveDot } from './components/bits';
-import { useViewport } from './viewport';
+import { MOBILE_TAB_BAR_HEIGHT, useViewport } from './viewport';
 import { DesktopOnly, isDesktopOnlyView } from './components/DesktopOnly';
 import { MoreView } from './components/MoreView';
 
@@ -128,7 +128,10 @@ export function App() {
           </div>
         )}
         {!phone && projectView && <TopBar store={store} />}
-        <div style={{ flex: 1, minHeight: 0, position: 'relative', paddingBottom: phone ? 'calc(50px + env(safe-area-inset-bottom))' : 0 }}>
+        <div
+          data-mobile-content-frame={phone || undefined}
+          style={{ flex: 1, minHeight: 0, position: 'relative', marginBottom: phone ? MOBILE_TAB_BAR_HEIGHT : 0 }}
+        >
           {(store.view === 'home' || (!project && !['settings', 'admin', 'ask'].includes(store.view))) && <Home store={store} />}
           {store.view === 'settings' && <SettingsView store={store} />}
           {store.view === 'admin' && <AdminView store={store} />}

@@ -1,5 +1,5 @@
 import type { ViewId } from '../types';
-import { TAB_ITEM_HEIGHT } from '../viewport';
+import { MOBILE_TAB_BAR_HEIGHT, TAB_ITEM_HEIGHT } from '../viewport';
 
 export type MobileTab = 'feed' | 'board' | 'ask' | 'insight' | 'more';
 
@@ -31,7 +31,7 @@ export function MobileTabBar({ view, signalCount, onNavigate }: {
       style={{
         position: 'fixed', left: 0, right: 0, bottom: 0, zIndex: 45,
         display: 'grid', gridTemplateColumns: 'repeat(5, minmax(0, 1fr))',
-        minHeight: `calc(${TAB_ITEM_HEIGHT}px + env(safe-area-inset-bottom))`,
+        minHeight: MOBILE_TAB_BAR_HEIGHT,
         paddingBottom: 'env(safe-area-inset-bottom)', background: 'var(--bg-rail)',
         borderTop: '1px solid var(--w-09)', boxShadow: '0 -8px 24px rgba(0,0,0,.24)',
       }}

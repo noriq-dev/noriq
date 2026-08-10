@@ -534,7 +534,7 @@ function EventFeed({ store, phone = false, attentionSheet = false }: { store: Ap
         })}
       </div>
       {phone && (
-        <div style={{ flex: 'none', padding: '8px 10px calc(8px + env(safe-area-inset-bottom))', borderTop: '1px solid var(--w-07)', background: 'var(--bg)' }}>
+        <div style={{ flex: 'none', padding: '8px 10px 10px', borderTop: '1px solid var(--w-07)', background: 'var(--bg)' }}>
           <Composer store={store} placeholder="Message the project…" compact />
         </div>
       )}

@@ -7,6 +7,7 @@ import { LiveDot, MonoTag, SectionLabel } from './bits';
 import { Button } from './ui';
 import { QuestionForm } from './QuestionForm';
 import { Markdown } from './Markdown';
+import { useViewport } from '../viewport';
 
 type Attention = Awaited<ReturnType<typeof api.attention>>;
 
@@ -122,6 +123,7 @@ function AttentionSection({ store }: { store: AppStore }) {
 
 export function Home({ store }: { store: AppStore }) {
   const { data, groups, actions } = store;
+  const { phone } = useViewport();
   // A project whose group isn't in the list (e.g. not loaded) must still show —
   // treat it as ungrouped rather than dropping it (PLNR-81 regression guard).
   const knownGroupIds = new Set(groups.map((g) => g.id));
@@ -131,20 +133,22 @@ export function Home({ store }: { store: AppStore }) {
     .filter((g) => g.projects.length > 0);
   const hour = new Date().getHours();
   const greeting = hour < 5 ? 'Working late' : hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
+  const openTasks = data.projects.reduce((n, p) => n + p.openTasks, 0);
 
   return (
     <div style={{ position: 'absolute', inset: 0, overflowY: 'auto' }}>
-      <div className="content-pad" style={{ maxWidth: 880, margin: '0 auto', padding: '44px 28px 60px' }}>
+      <div className="content-pad" style={{ maxWidth: 880, margin: '0 auto', padding: phone ? '22px 15px 28px' : '44px 28px 60px' }}>
         {/* header */}
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 14, marginBottom: 6 }}>
-          <h1 style={{ fontSize: 26, fontWeight: 700, letterSpacing: '-.02em', margin: 0 }}>
+          <h1 style={{ fontSize: phone ? 22 : 26, fontWeight: 700, letterSpacing: '-.02em', margin: 0 }}>
             {greeting}, {store.user?.name?.split(' ')[0] ?? 'supervisor'}.
           </h1>
         </div>
-        <div style={{ fontSize: 13, color: 'var(--text-mid)', marginBottom: 34 }}>
-          {data.projects.length} project{data.projects.length === 1 ? '' : 's'} ·{' '}
-          {data.projects.reduce((n, p) => n + p.openTasks, 0)} open tasks ·{' '}
-          {data.projects.filter((p) => p.hasLive).length} with live agents
+        <div style={{ fontSize: 13, color: 'var(--text-mid)', marginBottom: phone ? 24 : 34, lineHeight: 1.55 }}>
+          {data.projects.length} project{data.projects.length === 1 ? '' : 's'} · {openTasks} open task{openTasks === 1 ? '' : 's'}
+          {phone
+            ? <span style={{ display: 'block', marginTop: 4, color: 'var(--text-dim)' }}>Choose a project to catch up, or use Ask for a workspace-wide answer.</span>
+            : <> · {data.projects.filter((p) => p.hasLive).length} with live agents</>}
         </div>
 
         <AttentionSection store={store} />
@@ -174,20 +178,20 @@ export function Home({ store }: { store: AppStore }) {
           </div>
         ) : (
           <>
-            {ungrouped.length > 0 && <ProjectGrid projects={ungrouped} onOpen={(id) => actions.selectProject(id)} />}
+            {ungrouped.length > 0 && <ProjectGrid projects={ungrouped} phone={phone} onOpen={(id) => actions.selectProject(id)} />}
             {grouped.map(({ group, projects }) => (
               <div key={group.id} style={{ marginTop: 18 }}>
                 <div style={{ fontFamily: 'var(--mono)', fontSize: 10, letterSpacing: '.08em', textTransform: 'uppercase', color: 'var(--text-faint)', margin: '0 0 10px 2px' }}>
                   {group.name}
                 </div>
-                <ProjectGrid projects={projects} onOpen={(id) => actions.selectProject(id)} />
+                <ProjectGrid projects={projects} phone={phone} onOpen={(id) => actions.selectProject(id)} />
               </div>
             ))}
           </>
         )}
 
-        {/* connect an agent */}
-        <div style={{ marginTop: 40, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+        {/* Desktop onboarding belongs beside the workstation where an agent can be configured. */}
+        {!phone && <div style={{ marginTop: 40, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
           <ConnectCard />
           <div
             style={{
@@ -215,15 +219,15 @@ export function Home({ store }: { store: AppStore }) {
               <a href="/.well-known/oauth-authorization-server" target="_blank" rel="noreferrer" style={{ color: 'var(--text-dim)' }}>oauth metadata →</a>
             </div>
           </div>
-        </div>
+        </div>}
       </div>
     </div>
   );
 }
 
-function ProjectGrid({ projects, onOpen }: { projects: ProjectVM[]; onOpen: (id: string) => void }) {
+function ProjectGrid({ projects, phone, onOpen }: { projects: ProjectVM[]; phone: boolean; onOpen: (id: string) => void }) {
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(250px, 1fr))', gap: 12 }}>
+    <div style={{ display: 'grid', gridTemplateColumns: phone ? '1fr' : 'repeat(auto-fill, minmax(250px, 1fr))', gap: phone ? 10 : 12 }}>
       {projects.map((p) => {
         const pct = p.totalTasks ? p.doneTasks / p.totalTasks : 0;
         return (
@@ -232,7 +236,8 @@ function ProjectGrid({ projects, onOpen }: { projects: ProjectVM[]; onOpen: (id:
             onClick={() => onOpen(p.id)}
             className="hover-border"
             style={{
-              border: '1px solid var(--w-07)', borderRadius: 13, padding: '15px 16px',
+              border: '1px solid var(--w-07)', borderRadius: 13, padding: phone ? '16px' : '15px 16px',
+              minHeight: phone ? 72 : undefined,
               background: 'var(--w-02)', cursor: 'pointer',
             }}
           >
