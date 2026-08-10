@@ -36,7 +36,7 @@ afterEach(() => {
 
 function Probe() {
   const viewport = useViewport();
-  return <output>{viewport.kind}</output>;
+  return <output>{viewport.kind}{viewport.wide ? ':wide' : ''}</output>;
 }
 
 describe('useViewport', () => {
@@ -53,5 +53,8 @@ describe('useViewport', () => {
 
     act(() => rotate(1024));
     expect(container.textContent).toBe('desktop');
+
+    act(() => rotate(1280));
+    expect(container.textContent).toBe('desktop:wide');
   });
 });

@@ -73,7 +73,7 @@ export function IntelligenceView({ store }: { store: AppStore }) {
   const groups = historical.state === 'available' ? historical.result.groups : [];
   const nextCursor = historical.state === 'available' ? historical.result.cases.nextCursor : null;
 
-  return <main className="intelligence-view" style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: 22 }}>
+  return <main className="intelligence-view" style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: phone ? 14 : 22 }}>
     <div style={{ maxWidth: 1320, margin: '0 auto' }}>
       <header style={{ display: 'flex', alignItems: 'flex-start', gap: 16, flexWrap: 'wrap', marginBottom: 16 }}>
         <div style={{ flex: 1, minWidth: phone ? '100%' : 260 }}>

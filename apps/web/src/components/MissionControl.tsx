@@ -10,7 +10,7 @@ import { DecisionsSheet } from './DecisionsSheet';
 import { useViewport } from '../viewport';
 
 export function MissionControl({ store }: { store: AppStore }) {
-  const { phone } = useViewport();
+  const { phone, tablet, wide } = useViewport();
   if (phone) {
     return (
       <div className="mc-mobile" style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
@@ -18,13 +18,24 @@ export function MissionControl({ store }: { store: AppStore }) {
       </div>
     );
   }
+  if (tablet) {
+    return (
+      <div data-testid="mc-tablet" style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        <EventFeed store={store} attentionSheet />
+      </div>
+    );
+  }
   return (
-    <div className="mc-grid" style={{ position: 'absolute', inset: 0, display: 'grid', gridTemplateColumns: '272px 1fr 328px', minHeight: 0 }}>
-      <Roster store={store} />
+    <div data-testid={wide ? 'mc-wide' : 'mc-desktop'} style={{ position: 'absolute', inset: 0, display: 'grid', gridTemplateColumns: wide ? '272px minmax(0, 1fr) 320px' : 'minmax(0, 1fr) 320px', minHeight: 0 }}>
+      {wide && <Roster store={store} />}
       <EventFeed store={store} />
-      {store.selectedAgentId ? <AgentPanel store={store} /> : <Holds store={store} />}
+      <AttentionColumn store={store} />
     </div>
   );
+}
+
+function AttentionColumn({ store }: { store: AppStore }) {
+  return <aside aria-label="Attention and holds" style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}><AttentionInbox store={store} />{store.selectedAgentId ? <AgentPanel store={store} /> : <Holds store={store} />}</aside>;
 }
 
 function ago(iso: string | null): string {
@@ -50,7 +61,7 @@ function AgentPanel({ store }: { store: AppStore }) {
   const children = agents.filter((a) => a.parentAgentId === agent.id);
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
       <div style={{ padding: '14px 16px 12px', display: 'flex', alignItems: 'center', gap: 10, flex: 'none', borderBottom: '1px solid var(--w-05)' }}>
         <AvatarChip name={agent.name} color={agent.color} size={34} radius={9} fontSize={12.5} />
         <div style={{ minWidth: 0, flex: 1 }}>
@@ -335,7 +346,7 @@ const dayKey = (iso: string): string => new Date(iso).toDateString();
 /** Short calendar date shown on a day-break separator, e.g. "Jul 28" (PLNR-227). */
 const dayLabel = (iso: string): string => new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 
-function EventFeed({ store, phone = false }: { store: AppStore; phone?: boolean }) {
+function EventFeed({ store, phone = false, attentionSheet = false }: { store: AppStore; phone?: boolean; attentionSheet?: boolean }) {
   const { data, currentPid, actions } = store;
   const [decisionsOpen, setDecisionsOpen] = useState(false);
   // Direction toggle (PLNR-149): 'bottom' = chat-style (oldest top, newest arriving at
@@ -416,7 +427,7 @@ function EventFeed({ store, phone = false }: { store: AppStore; phone?: boolean 
           append-only · {1200 + events.length}
         </span>
       </div>}
-      {phone && oldest && (
+      {(phone || attentionSheet) && oldest && (
         <button
           type="button"
           onClick={() => setDecisionsOpen(true)}
@@ -432,7 +443,6 @@ function EventFeed({ store, phone = false }: { store: AppStore; phone?: boolean 
           <span style={{ flex: 'none', padding: '7px 12px', borderRadius: 8, background: 'var(--amber)', color: 'var(--bg)', fontSize: 12, fontWeight: 700 }}>Review</span>
         </button>
       )}
-      {!phone && <AttentionInbox store={store} />}
       <div data-event-scroll ref={scrollRef} onScroll={onScroll} style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: '8px 0' }}>
         {events.map((ev, i) => {
           const ag = (data.agents[currentPid] ?? []).find((a) => a.name === ev.actor || a.id === ev.actor) ?? null;
@@ -528,7 +538,7 @@ function EventFeed({ store, phone = false }: { store: AppStore; phone?: boolean 
           <Composer store={store} placeholder="Message the project…" compact />
         </div>
       )}
-      {phone && decisionsOpen && <DecisionsSheet store={store} onClose={() => setDecisionsOpen(false)} />}
+      {(phone || attentionSheet) && decisionsOpen && <DecisionsSheet store={store} onClose={() => setDecisionsOpen(false)} />}
     </div>
   );
 }
@@ -545,7 +555,7 @@ function Holds({ store }: { store: AppStore }) {
     .slice(0, 6);
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
       <div style={{ padding: '14px 16px 10px', flex: 'none' }}>
         <SectionLabel>Who holds what</SectionLabel>
       </div>

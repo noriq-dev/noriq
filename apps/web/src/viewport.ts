@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 
 export const PHONE_BREAKPOINT = 768;
 export const DESKTOP_BREAKPOINT = 1024;
+export const WIDE_DESKTOP_BREAKPOINT = 1280;
 
 export const MIN_TOUCH_TARGET = 44;
 export const MIN_INPUT_FONT_SIZE = 16;
@@ -15,19 +16,20 @@ export interface Viewport {
   phone: boolean;
   tablet: boolean;
   desktop: boolean;
+  wide: boolean;
 }
 
-const desktopViewport: Viewport = { kind: 'desktop', phone: false, tablet: false, desktop: true };
+const desktopViewport: Viewport = { kind: 'desktop', phone: false, tablet: false, desktop: true, wide: true };
 
 function readViewport(): Viewport {
   if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return desktopViewport;
   if (window.matchMedia(`(max-width: ${PHONE_BREAKPOINT - 1}px)`).matches) {
-    return { kind: 'phone', phone: true, tablet: false, desktop: false };
+    return { kind: 'phone', phone: true, tablet: false, desktop: false, wide: false };
   }
   if (window.matchMedia(`(max-width: ${DESKTOP_BREAKPOINT - 1}px)`).matches) {
-    return { kind: 'tablet', phone: false, tablet: true, desktop: false };
+    return { kind: 'tablet', phone: false, tablet: true, desktop: false, wide: false };
   }
-  return desktopViewport;
+  return { ...desktopViewport, wide: !window.matchMedia(`(max-width: ${WIDE_DESKTOP_BREAKPOINT - 1}px)`).matches };
 }
 
 /** The sole JS viewport branch for mobile compositions. CSS may still handle decoration, but
@@ -39,13 +41,16 @@ export function useViewport(): Viewport {
     if (typeof window.matchMedia !== 'function') return;
     const phone = window.matchMedia(`(max-width: ${PHONE_BREAKPOINT - 1}px)`);
     const tablet = window.matchMedia(`(max-width: ${DESKTOP_BREAKPOINT - 1}px)`);
+    const wide = window.matchMedia(`(max-width: ${WIDE_DESKTOP_BREAKPOINT - 1}px)`);
     const update = () => setViewport(readViewport());
     phone.addEventListener('change', update);
     tablet.addEventListener('change', update);
+    wide.addEventListener('change', update);
     update();
     return () => {
       phone.removeEventListener('change', update);
       tablet.removeEventListener('change', update);
+      wide.removeEventListener('change', update);
     };
   }, []);
 

@@ -70,7 +70,7 @@ export function MoreView({ store }: { store: AppStore }) {
         </MoreSection>}
 
         <footer style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 10px 4px', color: 'var(--text-faint)', fontFamily: 'var(--mono)', fontSize: 9.5 }}>
-          <span>v{appVersion}</span><a href="https://noriq.dev" target="_blank" rel="noreferrer" style={{ color: 'inherit', textDecoration: 'none' }}>noriq.dev →</a>
+          <span style={{ alignSelf: 'center' }}>v{appVersion}</span><a href="https://noriq.dev" target="_blank" rel="noreferrer" style={{ minHeight: MIN_TOUCH_TARGET, display: 'flex', alignItems: 'center', color: 'inherit', textDecoration: 'none' }}>noriq.dev →</a>
         </footer>
       </div>
     </main>

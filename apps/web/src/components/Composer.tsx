@@ -4,8 +4,10 @@
 import { useEffect, useRef } from 'react';
 import type { AppStore } from '../store';
 import { KIND_META } from '../design';
+import { MIN_INPUT_FONT_SIZE, MIN_TOUCH_TARGET, useViewport } from '../viewport';
 
 export function Composer({ store, placeholder, compact }: { store: AppStore; placeholder: string; compact?: boolean }) {
+  const { phone } = useViewport();
   const { draftKind, draftText, actions } = store;
   const dk = KIND_META[draftKind];
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -35,6 +37,7 @@ export function Composer({ store, placeholder, compact }: { store: AppStore; pla
           onClick={actions.cycleKind}
           title="switch kind"
           style={{
+            minHeight: phone ? MIN_TOUCH_TARGET : undefined,
             cursor: 'pointer',
             fontFamily: 'var(--mono)',
             fontSize: 10,
@@ -67,7 +70,7 @@ export function Composer({ store, placeholder, compact }: { store: AppStore; pla
             border: 'none',
             outline: 'none',
             color: 'var(--text)',
-            fontSize: 12.5,
+            fontSize: phone ? MIN_INPUT_FONT_SIZE : 12.5,
             fontFamily: 'inherit',
             lineHeight: 1.5,
             resize: 'none',
@@ -75,19 +78,20 @@ export function Composer({ store, placeholder, compact }: { store: AppStore; pla
             overflowY: 'auto',
           }}
         />
-        {compact && <PostButton store={store} small />}
+        {compact && <PostButton store={store} small touch={phone} />}
       </div>
       {!compact && <PostButton store={store} />}
     </div>
   );
 }
 
-function PostButton({ store, small }: { store: AppStore; small?: boolean }) {
+function PostButton({ store, small, touch = false }: { store: AppStore; small?: boolean; touch?: boolean }) {
   return (
     <button
       onClick={store.actions.postComment}
       className="hover-bright"
       style={{
+        minHeight: touch ? MIN_TOUCH_TARGET : undefined,
         cursor: 'pointer',
         background: 'var(--accent)',
         color: 'var(--bg)',
