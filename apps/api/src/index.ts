@@ -48,6 +48,7 @@ import {
 } from './lib/project-memory';
 import { renderEvidenceFrame, type EvidenceFrameItem } from './memory/evidence-frame';
 import { assembleContextPack } from './memory/context-pack';
+import { assessPreDispatchRisk } from './memory/scope-risk';
 import { readBoundedBody, verifyBatchChecksum, decodeBatchRows, MAX_INGEST_BATCH_BYTES, INGEST_TOKEN_TTL_SECONDS } from './memory/ingest';
 import { normalizeVerificationReport } from './memory/verification';
 import { sweepPendingEpisodeJobs } from './memory/episodes';
@@ -1751,6 +1752,24 @@ app.post('/api/projects/:pid/memory/context', userAuth, async (c) => {
     role: body.role ?? 'human', tokenBudget: body.budgetTokens ?? null,
   });
   return c.json(pack);
+});
+
+// PLNR-295: read-only advisory evidence for humans preparing a dispatch. This route cannot write
+// a budget or affect claimability; it only compares the supplied proposal with cited prior cases.
+app.post('/api/projects/:pid/memory/pre-dispatch-risk', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const parsed = z.object({
+    taskId: z.string().min(1),
+    repositoryKey: z.string().min(1).nullable().optional(),
+    branch: z.string().min(1).nullable().optional(),
+    baseId: z.string().min(1).nullable().optional(),
+    budget: RunBudget.nullable().optional(),
+  }).strict().safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid pre-dispatch risk request', detail: parsed.error.issues }, 400);
+  const task = await c.env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+    .bind(parsed.data.taskId, parsed.data.taskId, pid).first<{ id: string }>();
+  if (!task) return c.json({ error: 'not found' }, 404);
+  return c.json(await assessPreDispatchRisk(c.env, pid, task.id, parsed.data));
 });
 
 // Production acceptance gate (PLNR-346). This is intentionally a viewer-safe read: it gathers

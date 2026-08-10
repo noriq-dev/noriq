@@ -53,8 +53,8 @@ import {
   type AnalyticsSnapshotRow,
 } from '../memory/analytics';
 import {
-  effortSignals, duplicateWarnings, summarizeEffort,
-  type TaskEffortInput, type EffortCandidate, type DuplicateWarning, type EffortSummary,
+  effortSignals, duplicateWarnings, priorEffortCase, summarizeEffort,
+  type TaskEffortInput, type EffortCandidate, type DuplicateWarning, type EffortSummary, type PriorEffortCase,
 } from '../memory/similar-effort';
 import {
   citationVerdict, verifiedForBase, rollUpValidity,
@@ -4163,8 +4163,11 @@ export class ProjectMemory extends DurableObject<Env> {
    */
   async similarEffort(
     projectId: string,
-    input: TaskEffortInput & { taskId: string; limit?: number },
-  ): Promise<{ warnings: DuplicateWarning[]; summary: EffortSummary; consideredCount: number }> {
+    input: TaskEffortInput & {
+      taskId: string; limit?: number; repositoryKey?: string;
+      branch?: string; preferBranch?: string; baseId?: string;
+    },
+  ): Promise<{ warnings: DuplicateWarning[]; cases: PriorEffortCase[]; summary: EffortSummary; consideredCount: number }> {
     await this.assertProjectId(projectId);
     const limit = Math.min(Math.max(input.limit ?? RETRIEVAL_DEFAULTS.maxResults, 1), RETRIEVAL_DEFAULTS.maxResultsCeiling);
     const signals = effortSignals(input);
@@ -4217,16 +4220,18 @@ export class ProjectMemory extends DurableObject<Env> {
     }
 
     const episodeIds = [...provenance.keys()];
-    if (!episodeIds.length) return { warnings: [], summary: summarizeEffort([]), consideredCount: 0 };
+    if (!episodeIds.length) return { warnings: [], cases: [], summary: summarizeEffort([]), consideredCount: 0 };
 
     const placeholders = episodeIds.map((_, i) => `?${i + 1}`).join(',');
     const rows = this.ctx.storage.sql
       .exec<{
-        id: string; run_id: string; task_id: string | null; landing_outcome: string; review_rounds: number;
+        id: string; run_id: string; sitting: number; task_id: string | null; repository_key: string | null;
+        base_id: string | null; landing_outcome: string; review_rounds: number; created_at: string;
         cost_usd: number; body: string; run_kind: string | null; outcome: string | null;
         started_at: string | null; finished_at: string | null;
       }>(
-        `SELECT id, run_id, task_id, landing_outcome, review_rounds, cost_usd, body, run_kind, outcome, started_at, finished_at
+        `SELECT id, run_id, sitting, task_id, repository_key, base_id, landing_outcome, review_rounds,
+                cost_usd, body, run_kind, outcome, started_at, finished_at, created_at
          FROM episodes WHERE id IN (${placeholders})`,
         ...episodeIds,
       )
@@ -4248,7 +4253,7 @@ export class ProjectMemory extends DurableObject<Env> {
       // empty fields rather than dropping the candidate (its deterministic columns are still
       // real evidence: run id, task, landing outcome, cost, review rounds).
       let body: Partial<EffortEpisode> = {};
-      try { body = JSON.parse(row.body) as EffortEpisode; } catch { /* degrade to empty fields below */ }
+      try { body = EffortEpisode.parse(JSON.parse(row.body)); } catch { /* degrade to empty fields below */ }
       const prov = provenance.get(row.id)!;
       return {
         episodeId: row.id,
@@ -4271,15 +4276,30 @@ export class ProjectMemory extends DurableObject<Env> {
         stage: prov.stage,
         score: prov.score,
         edgePath: prov.edgePath,
+        sitting: row.sitting,
+        repositoryKey: row.repository_key,
+        baseId: row.base_id,
+        createdAt: row.created_at,
+        intelligence: body.intelligence ?? null,
       };
     });
 
-    const warnings = duplicateWarnings(candidates, signals, { limit });
+    const eligibleCandidates = candidates.filter((candidate) => {
+      const repositoryKey = candidate.intelligence?.identity.repositoryKey ?? candidate.repositoryKey ?? null;
+      const branch = candidate.intelligence?.identity.branch ?? null;
+      const baseId = candidate.intelligence?.identity.baseId ?? candidate.baseId ?? null;
+      return (!input.repositoryKey || repositoryKey == null || repositoryKey === input.repositoryKey)
+        && (!input.branch || branch == null || branch === input.branch)
+        && (!input.baseId || baseId == null || baseId === input.baseId);
+    });
+    const warnings = duplicateWarnings(eligibleCandidates, signals, { limit, preferBranch: input.preferBranch });
     // The summary always covers EXACTLY the episodes the warnings above it cite — never a
     // silently broader "everything considered" set (memory/similar-effort.ts's own contract).
     const warnedIds = new Set(warnings.map((w) => w.episodeId));
-    const summary = summarizeEffort(candidates.filter((c) => warnedIds.has(c.episodeId)));
-    return { warnings, summary, consideredCount: candidates.length };
+    const summary = summarizeEffort(eligibleCandidates.filter((c) => warnedIds.has(c.episodeId)));
+    const candidateById = new Map(candidates.map((candidate) => [candidate.episodeId, candidate]));
+    const cases = warnings.map((warning) => priorEffortCase(candidateById.get(warning.episodeId)!, warning));
+    return { warnings, cases, summary, consideredCount: eligibleCandidates.length };
   }
 
   // ---------------------------------------------------------------------------

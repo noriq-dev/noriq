@@ -11,8 +11,10 @@
 // second one on its own. `duplicateWarnings`' gate is the one and only place that rule lives —
 // nothing upstream (ProjectMemory's candidate gathering) or downstream (mcp.ts's presentation)
 // re-implements it.
-import type { EpisodeLandingOutcome, RunModelUsage } from '@noriq-dev/shared';
+import type { EpisodeLandingOutcome, MetricCompleteness, ProjectIntelligenceEpisode, RunModelUsage } from '@noriq-dev/shared';
 import { rankCandidates, type RetrievalHit, type RetrievalStage } from './retrieval';
+
+export const SIMILAR_EFFORT_RETRIEVAL_VERSION = 'similar-effort-v1';
 
 // ---------------------------------------------------------------------------------------------
 // Signals extracted from the task about to be claimed
@@ -137,6 +139,51 @@ export interface EffortCandidate {
    *  what unlocks the graph-neighborhood/shared-decision channels below; it is independent of
    *  `stage` because a candidate can be found by text AND separately be graph-reachable. */
   edgePath?: string;
+  sitting?: number;
+  repositoryKey?: string | null;
+  baseId?: string | null;
+  createdAt?: string;
+  intelligence?: ProjectIntelligenceEpisode | null;
+}
+
+export interface PriorEffortObservation {
+  value: number | boolean | null;
+  completeness: MetricCompleteness;
+}
+
+/** One inspectable historical unit. This is deliberately case-shaped: no strategy grouping or
+ * ranking table exists here, and every measured outcome stays attached to its run+sitting. */
+export interface PriorEffortCase {
+  episodeId: string;
+  taskId: string | null;
+  taskKey: string | null;
+  runId: string;
+  sitting: number;
+  executionId: string | null;
+  orchestrationId: string | null;
+  repositoryKey: string | null;
+  branch: string | null;
+  baseId: string | null;
+  validity: 'historical_episode';
+  lineage: ProjectIntelligenceEpisode['identity']['lineage'];
+  retrieval: {
+    version: typeof SIMILAR_EFFORT_RETRIEVAL_VERSION;
+    stage: RetrievalStage;
+    score: number;
+    support: SupportEntry[];
+  };
+  outcome: { run: string; landing: EpisodeLandingOutcome };
+  observed: {
+    filesTouched: PriorEffortObservation;
+    tokens: PriorEffortObservation;
+    costUSD: PriorEffortObservation;
+    elapsedMs: PriorEffortObservation;
+    reviewRounds: PriorEffortObservation;
+    verificationOrRepair: PriorEffortObservation;
+  };
+  whatWasAttempted: string;
+  whatFailed: string[];
+  whatRemainsUncertain: string[];
 }
 
 // A single shared significant word is exactly the "unrelated lexical coincidence" the
@@ -253,7 +300,7 @@ const FAILED_EFFORT_RANK_BONUS = 0.15;
 export function duplicateWarnings(
   candidates: EffortCandidate[],
   signals: EffortSignals,
-  opts: { limit?: number } = {},
+  opts: { limit?: number; preferBranch?: string } = {},
 ): DuplicateWarning[] {
   const classified = candidates.map((candidate) => ({ candidate, support: classifySupport(candidate, signals) }));
   const gated = classified.filter(({ support }) => new Set(support.map((s) => s.kind)).size >= 2);
@@ -266,8 +313,9 @@ export function duplicateWarnings(
     snippet: candidate.approachSummary ?? candidate.findings[0]?.summary ?? '',
     stage: candidate.stage,
     score: candidate.score + (candidate.outcome === 'failed' ? FAILED_EFFORT_RANK_BONUS : 0),
+    branch: candidate.intelligence?.identity.branch ?? undefined,
   }));
-  const ranked = rankCandidates(hits, { limit: opts.limit });
+  const ranked = rankCandidates(hits, { limit: opts.limit, preferBranch: opts.preferBranch });
 
   const byId = new Map(gated.map((g) => [g.candidate.episodeId, g]));
   return ranked.map((r) => {
@@ -288,6 +336,79 @@ export function duplicateWarnings(
       score: r.finalScore,
     };
   });
+}
+
+function observation(value: number | boolean | null, completeness: MetricCompleteness): PriorEffortObservation {
+  return { value, completeness };
+}
+
+function completeMetric(metric: { status: string; value: number | null } | undefined): PriorEffortObservation {
+  if (!metric || metric.value == null) {
+    return observation(null, (metric?.status as MetricCompleteness | undefined) ?? 'unavailable');
+  }
+  return observation(metric.value, metric.status as MetricCompleteness);
+}
+
+/** Enrich a warning only after the two-support gate has passed. Outcome fields are read from the
+ * prior terminal episode; absent legacy telemetry remains unavailable/partial and never becomes
+ * a numeric zero merely because the old skeleton used one on disk. */
+export function priorEffortCase(candidate: EffortCandidate, warning: DuplicateWarning): PriorEffortCase {
+  const intelligence = candidate.intelligence ?? null;
+  const usage = intelligence?.execution.observedModelUsage;
+  let tokens: PriorEffortObservation = observation(null, usage?.status ?? 'unavailable');
+  let cost: PriorEffortObservation = observation(null, usage?.status ?? 'unavailable');
+  if (usage?.value && (usage.status === 'complete' || usage.status === 'partial')) {
+    const mixes = Object.values(usage.value);
+    tokens = observation(mixes.reduce((sum, mix) =>
+      sum + mix.inputTokens + mix.outputTokens + mix.cacheReadInputTokens + mix.cacheCreationInputTokens, 0), usage.status);
+    const observedCost = mixes.reduce((sum, mix) => sum + mix.costUSD, 0);
+    const tool = intelligence?.execution.executedStrategy?.tool ?? intelligence?.preExecution.commissionedStrategy?.tool;
+    cost = tool === 'codex' && observedCost === 0
+      ? observation(null, 'unavailable')
+      : observation(observedCost, usage.status);
+  }
+  const roles = intelligence?.execution.stages.map((stage) => stage.role) ?? [];
+  return {
+    episodeId: candidate.episodeId,
+    taskId: candidate.taskId,
+    taskKey: candidate.taskKey,
+    runId: candidate.runId,
+    sitting: candidate.sitting ?? 1,
+    executionId: intelligence?.identity.executionId ?? null,
+    orchestrationId: intelligence?.identity.orchestrationId ?? null,
+    repositoryKey: intelligence?.identity.repositoryKey ?? candidate.repositoryKey ?? null,
+    branch: intelligence?.identity.branch ?? null,
+    baseId: intelligence?.identity.baseId ?? candidate.baseId ?? null,
+    validity: 'historical_episode',
+    lineage: intelligence?.identity.lineage ?? {
+      status: 'partial', missing: ['legacy'], reason: 'episode predates analytics lineage capture',
+    },
+    retrieval: {
+      version: SIMILAR_EFFORT_RETRIEVAL_VERSION,
+      stage: candidate.stage,
+      score: warning.score,
+      support: warning.support,
+    },
+    outcome: { run: candidate.outcome, landing: candidate.landingOutcome },
+    observed: {
+      filesTouched: intelligence
+        ? completeMetric(intelligence.execution.changes.changedFiles)
+        : candidate.filesTouched.length ? observation(candidate.filesTouched.length, 'partial') : observation(null, 'unavailable'),
+      tokens,
+      costUSD: cost,
+      elapsedMs: completeMetric(intelligence?.execution.clocks.elapsedExecutionMs),
+      reviewRounds: intelligence
+        ? completeMetric(intelligence.outcome.reviewRounds)
+        : observation(candidate.reviewRounds, 'partial'),
+      verificationOrRepair: intelligence
+        ? observation(roles.some((role) => role === 'verifier' || role === 'repair'),
+            intelligence.execution.stages.length ? 'complete' : 'unavailable')
+        : observation(null, 'unavailable'),
+    },
+    whatWasAttempted: warning.whatWasAttempted,
+    whatFailed: warning.whatFailed,
+    whatRemainsUncertain: warning.whatRemainsUncertain,
+  };
 }
 
 // ---------------------------------------------------------------------------------------------

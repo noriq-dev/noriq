@@ -5,7 +5,7 @@
 import type { Env } from '../env';
 import type { ProjectMemoryHealth, IndexGenerationSummary } from '../do/ProjectMemory';
 import type { RankedHit } from '../memory/retrieval';
-import type { DuplicateWarning, EffortSummary } from '../memory/similar-effort';
+import type { DuplicateWarning, EffortSummary, PriorEffortCase } from '../memory/similar-effort';
 import type {
   DependencyNeighborhoodResult, ValidatingTestsResult, ImplementingWorkResult, DecisionLineageResult, ChangeImpactResult, ConstellationResult, ConstellationOptions,
   GraphEntityPage, GraphEntityPageInput,
@@ -269,8 +269,11 @@ export interface ProjectMemoryStub {
    *  see ProjectMemory.similarEffort's own doc comment for the full retrieval story. */
   similarEffort(
     projectId: string,
-    input: { taskId: string; title: string; body?: string | null; anticipatedFiles?: string[]; limit?: number },
-  ): Promise<{ warnings: DuplicateWarning[]; summary: EffortSummary; consideredCount: number }>;
+    input: {
+      taskId: string; title: string; body?: string | null; anticipatedFiles?: string[]; limit?: number;
+      repositoryKey?: string; branch?: string; preferBranch?: string; baseId?: string;
+    },
+  ): Promise<{ warnings: DuplicateWarning[]; cases: PriorEffortCase[]; summary: EffortSummary; consideredCount: number }>;
   /** PLNR-258: named graph-query primitives — see memory/graph-queries.ts for the shared
    *  completeness-marker contract every one of these returns. */
   dependencyNeighborhood(
