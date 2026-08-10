@@ -92,6 +92,20 @@ plan has a 14-draw-call ceiling and an 8.18 ms median selection-plan time across
 This passes the 100 ms interaction planning gate. It is not a GPU frame-time claim: the integrated
 and weak-GPU measurements remain required before PLNR-380 can enable v2 by default.
 
+### Layout and navigation evidence (PLNR-378)
+
+`space-v1` uses URI/community-stable seeds, sorted inputs, eight fixed convergence passes, and
+32-bit-rounded output. Compatible prior-generation positions are warm starts only; server anchors
+pull every pass, parent volumes clamp children, and no client coordinate is written back as
+canonical truth. The browser runs convergence in a dedicated module worker. If workers are
+unavailable it keeps server-authored anchors instead of moving O(N+E) work onto the UI thread.
+The 12,000-node/24,000-edge local fixture converges in an 86.38 ms median inside the worker.
+
+Camera and preference logic is WebGL-independent and unit tested: orbit, pan, bounded dolly,
+home, focus/fly-to, transition cancellation, direct reduced-motion focus, spatial-grid and keyboard
+selection, and version/layout-qualified local state. The 3D preference key and schema are distinct
+from v1, so legacy `{x,y}` pins can never be interpreted as 3D coordinates.
+
 ## Binding v2 contract (PLNR-372)
 
 ### Identity, versions, and hierarchy

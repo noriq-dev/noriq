@@ -1,13 +1,25 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type * as Three from 'three';
 import {
   buildConstellation3DRenderPlan, constellation3DNodeEncoding, type Constellation3DEdge, type Constellation3DEdgeSegment,
   type Constellation3DNode, type Constellation3DNodeInstance, type Constellation3DShape,
 } from './constellation-3d-buffers';
+import {
+  buildConstellation3DSpatialIndex, computeConstellation3DLayoutOffThread, nearestDirectionalConstellationNode,
+} from './constellation-3d-layout';
+import {
+  CONSTELLATION_3D_PREFS_VERSION, constellationCameraPosition, createCameraTransition, DEFAULT_CONSTELLATION_3D_CAMERA,
+  dollyConstellationCamera, focusConstellationCamera, loadConstellation3DPreferences, orbitConstellationCamera,
+  panConstellationCamera, sampleCameraTransition, saveConstellation3DPreferences, type CameraTransition,
+  type Constellation3DCamera,
+} from './constellation-3d-navigation';
 
 const LABEL_BUDGET = 24;
 
 export interface MemoryConstellation3DProps {
+  projectId: string;
+  generationId: string;
+  layoutVersion: string;
   nodes: Constellation3DNode[];
   edges: Constellation3DEdge[];
   selectedNodeId: string | null;
@@ -35,6 +47,7 @@ interface RendererState {
   nodeMeshes: Three.InstancedMesh[];
   edgeObjects: Three.Object3D[];
   renderEdges: (selectedNodeId: string | null) => void;
+  applyCamera: (camera: Constellation3DCamera) => void;
   render: () => void;
   dispose: () => void;
 }
@@ -86,14 +99,38 @@ function midpoint(edge: Constellation3DEdgeSegment): [number, number, number] {
  * React only owns the canvas, failure state, and a fixed label budget. It is intentionally not
  * wired into MemoryView until the cutover task establishes fallback and parity. */
 export function MemoryConstellation3D({
-  nodes, edges, selectedNodeId, theme = 'dark', reducedMotion = false,
-  onSelectNode, onRendererFailure,
+  projectId, generationId, layoutVersion, nodes, edges, selectedNodeId, theme = 'dark', reducedMotion = false,
+  onSelectNode, onOpenEgoNetwork, onOpenInspector, onRendererFailure,
 }: MemoryConstellation3DProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<RendererState | null>(null);
   const [labels, setLabels] = useState<LabelPosition[]>([]);
   const [failure, setFailure] = useState<string | null>(null);
+  const [layoutNodes, setLayoutNodes] = useState(nodes);
+  const priorLayoutRef = useRef<{ generationId: string; layoutVersion: string; positions: Record<string, [number, number, number]> } | undefined>();
+  const [cameraState, setCameraState] = useState<Constellation3DCamera>(() => loadConstellation3DPreferences(projectId, layoutVersion).camera);
+  const transitionRef = useRef<CameraTransition | null>(null);
+  const transitionFrameRef = useRef(0);
+  const dragRef = useRef<{ mode: 'orbit' | 'pan'; x: number; y: number; camera: Constellation3DCamera } | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    computeConstellation3DLayoutOffThread({ generationId, layoutVersion, nodes, edges, prior: priorLayoutRef.current }, controller.signal)
+      .then((result) => {
+        priorLayoutRef.current = result;
+        setLayoutNodes(nodes.map((node) => ({ ...node, position: result.positions[node.id] ?? node.position })));
+      })
+      .catch((error: unknown) => { if (!(error instanceof DOMException && error.name === 'AbortError')) setLayoutNodes(nodes); });
+    return () => controller.abort();
+  }, [generationId, layoutVersion, nodes, edges]);
+
+  useEffect(() => {
+    setCameraState(loadConstellation3DPreferences(projectId, layoutVersion).camera);
+  }, [projectId, layoutVersion]);
+
+  const positions = useMemo(() => new Map(layoutNodes.map((node) => [node.id, node.position] as const)), [layoutNodes]);
+  const spatialIndex = useMemo(() => buildConstellation3DSpatialIndex(positions), [positions]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -101,6 +138,7 @@ export function MemoryConstellation3D({
     if (!canvas || !host) return;
     let cancelled = false;
     let resizeObserver: ResizeObserver | null = null;
+    let removeResizeListener: (() => void) | null = null;
 
     void import('three').then((THREE) => {
       if (cancelled) return;
@@ -111,9 +149,10 @@ export function MemoryConstellation3D({
         renderer.setClearColor(theme === 'dark' ? 0x0c1017 : 0xf4f6fa, 1);
         const scene = new THREE.Scene();
         const camera = new THREE.PerspectiveCamera(48, 1, 0.1, 20_000);
-        camera.position.set(0, 0, 900);
-        camera.lookAt(0, 0, 0);
-        const plan = buildConstellation3DRenderPlan(nodes, edges, null, LABEL_BUDGET);
+        const initialCameraPosition = constellationCameraPosition(cameraState);
+        camera.position.set(...initialCameraPosition);
+        camera.lookAt(...cameraState.target);
+        const plan = buildConstellation3DRenderPlan(layoutNodes, edges, null, LABEL_BUDGET);
         const nodeMeshes: Three.InstancedMesh[] = [];
         const matrix = new THREE.Matrix4();
         const color = new THREE.Color();
@@ -141,7 +180,7 @@ export function MemoryConstellation3D({
           }
         }
 
-        const leadNodes = nodes.map(constellation3DNodeEncoding).filter((node) => node.halo);
+        const leadNodes = layoutNodes.map(constellation3DNodeEncoding).filter((node) => node.halo);
         if (leadNodes.length > 0) {
           const halo = new THREE.InstancedMesh(
             new THREE.TorusGeometry(1.35, 0.12, 5, 12),
@@ -187,10 +226,12 @@ export function MemoryConstellation3D({
           setLabels(visible.slice(0, LABEL_BUDGET));
         };
 
+        let currentLabels = plan.labels;
+        let currentPromoted: Constellation3DEdgeSegment[] = [];
         const render = () => renderer.render(scene, camera);
         const renderEdges = (selection: string | null) => {
           clearEdges();
-          const selectedPlan = buildConstellation3DRenderPlan(nodes, edges, selection, LABEL_BUDGET);
+          const selectedPlan = buildConstellation3DRenderPlan(layoutNodes, edges, selection, LABEL_BUDGET);
           const base = lineObject(THREE, selectedPlan.baseEdges, theme === 'dark' ? 0x7790aa : 0x506070, selection ? 0.1 : 0.38, 0);
           if (base) { scene.add(base); edgeObjects.push(base); }
           const promoted = lineObject(THREE, selectedPlan.promotedEdges, theme === 'dark' ? 0xffd166 : 0x8a5a00, 1, 10);
@@ -212,7 +253,15 @@ export function MemoryConstellation3D({
             scene.add(markers);
             edgeObjects.push(markers);
           }
-          projectLabels(selectedPlan.labels, selectedPlan.promotedEdges);
+          currentLabels = selectedPlan.labels;
+          currentPromoted = selectedPlan.promotedEdges;
+          projectLabels(currentLabels, currentPromoted);
+          render();
+        };
+        const applyCamera = (next: Constellation3DCamera) => {
+          camera.position.set(...constellationCameraPosition(next));
+          camera.lookAt(...next.target);
+          projectLabels(currentLabels, currentPromoted);
           render();
         };
 
@@ -223,11 +272,16 @@ export function MemoryConstellation3D({
           camera.updateProjectionMatrix();
           renderEdges(selectedNodeId);
         };
-        resizeObserver = new ResizeObserver(resize);
-        resizeObserver.observe(host);
+        if (typeof ResizeObserver !== 'undefined') {
+          resizeObserver = new ResizeObserver(resize);
+          resizeObserver.observe(host);
+        } else {
+          window.addEventListener('resize', resize);
+          removeResizeListener = () => window.removeEventListener('resize', resize);
+        }
 
         rendererRef.current = {
-          THREE, renderer, scene, camera, nodeMeshes, edgeObjects, renderEdges, render,
+          THREE, renderer, scene, camera, nodeMeshes, edgeObjects, renderEdges, applyCamera, render,
           dispose: () => {
             clearEdges();
             for (const mesh of nodeMeshes) {
@@ -253,13 +307,49 @@ export function MemoryConstellation3D({
     return () => {
       cancelled = true;
       resizeObserver?.disconnect();
+      removeResizeListener?.();
       rendererRef.current?.dispose();
       rendererRef.current = null;
     };
     // Scene reconstruction is reserved for page integration/theme changes, not selection.
-  }, [nodes, edges, theme, onRendererFailure]);
+  }, [layoutNodes, edges, theme, onRendererFailure]);
 
   useEffect(() => { rendererRef.current?.renderEdges(selectedNodeId); }, [selectedNodeId]);
+  useEffect(() => { rendererRef.current?.applyCamera(cameraState); }, [cameraState]);
+  useEffect(() => {
+    const timeout = setTimeout(() => saveConstellation3DPreferences(projectId, {
+      version: CONSTELLATION_3D_PREFS_VERSION, layoutVersion, camera: cameraState, expandedCommunityIds: [],
+    }), 150);
+    return () => clearTimeout(timeout);
+  }, [cameraState, projectId, layoutVersion]);
+
+  const cancelTransition = () => {
+    transitionRef.current = null;
+    cancelAnimationFrame(transitionFrameRef.current);
+  };
+  useEffect(() => () => cancelTransition(), []);
+
+  const transitionTo = (next: Constellation3DCamera) => {
+    cancelTransition();
+    const transition = createCameraTransition(cameraState, next, performance.now(), reducedMotion);
+    transitionRef.current = transition;
+    const step = (now: number) => {
+      if (transitionRef.current !== transition) return;
+      const sample = sampleCameraTransition(transition, now);
+      setCameraState(sample.camera);
+      if (sample.done) transitionRef.current = null;
+      else transitionFrameRef.current = requestAnimationFrame(step);
+    };
+    step(performance.now());
+  };
+
+  useEffect(() => {
+    if (!selectedNodeId) return;
+    const selected = layoutNodes.find((node) => node.id === selectedNodeId);
+    if (selected) transitionTo(focusConstellationCamera(cameraState, selected.position, selected.radius ?? (selected.community ? 70 : 18)));
+    // Selection is the trigger; camera changes during the flight must not restart it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedNodeId, layoutNodes]);
 
   const selectAt = (event: React.PointerEvent<HTMLCanvasElement>) => {
     const state = rendererRef.current;
@@ -278,17 +368,53 @@ export function MemoryConstellation3D({
 
   const dolly = (event: React.WheelEvent<HTMLCanvasElement>) => {
     event.preventDefault();
-    const state = rendererRef.current;
-    if (!state) return;
-    const factor = event.deltaY < 0 ? 0.88 : 1.14;
-    state.camera.position.multiplyScalar(factor);
-    state.camera.position.clampLength(80, 8_000);
-    state.renderEdges(selectedNodeId);
+    cancelTransition();
+    setCameraState((camera) => dollyConstellationCamera(camera, event.deltaY < 0 ? 0.88 : 1.14));
+  };
+
+  const pointerDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    cancelTransition();
+    dragRef.current = { mode: event.shiftKey || event.button === 1 || event.button === 2 ? 'pan' : 'orbit', x: event.clientX, y: event.clientY, camera: cameraState };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+  const pointerMove = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    const drag = dragRef.current;
+    if (!drag) return;
+    const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
+    setCameraState(drag.mode === 'orbit' ? orbitConstellationCamera(drag.camera, dx, dy) : panConstellationCamera(drag.camera, dx, dy));
+  };
+  const pointerUp = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    const drag = dragRef.current;
+    dragRef.current = null;
+    if (drag && Math.hypot(event.clientX - drag.x, event.clientY - drag.y) > 3) return;
+    selectAt(event);
+  };
+
+  const keyDown = (event: React.KeyboardEvent<HTMLCanvasElement>) => {
+    const directions: Record<string, [number, number, number]> = { ArrowLeft: [-1, 0, 0], ArrowRight: [1, 0, 0], ArrowUp: [0, 1, 0], ArrowDown: [0, -1, 0] };
+    const direction = directions[event.key];
+    if (direction && selectedNodeId) {
+      event.preventDefault();
+      const next = nearestDirectionalConstellationNode(spatialIndex, selectedNodeId, direction);
+      if (next) onSelectNode?.(next);
+      return;
+    }
+    const selected = selectedNodeId ? layoutNodes.find((node) => node.id === selectedNodeId) : null;
+    if (selected?.uri && event.key.toLowerCase() === 'e') onOpenEgoNetwork?.(selected.uri);
+    if (selected?.uri && event.key.toLowerCase() === 'i') onOpenInspector?.(selected.uri);
+    if (event.key === 'Escape') { cancelTransition(); onSelectNode?.(null); }
   };
 
   return (
     <div ref={hostRef} style={{ position: 'absolute', inset: 0, overflow: 'hidden' }} data-reduced-motion={reducedMotion ? 'true' : 'false'}>
-      <canvas ref={canvasRef} onPointerUp={selectAt} onWheel={dolly} style={{ width: '100%', height: '100%', display: 'block', touchAction: 'none' }} aria-label={`3D memory constellation with ${nodes.length} visible items`} />
+      <canvas ref={canvasRef} tabIndex={0} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onWheel={dolly} onKeyDown={keyDown} onContextMenu={(event) => event.preventDefault()} style={{ width: '100%', height: '100%', display: 'block', touchAction: 'none' }} aria-label={`3D memory constellation with ${layoutNodes.length} visible items. Arrow keys move selection; E opens ego network; I opens evidence inspector.`} />
+      <div style={{ position: 'absolute', right: 10, top: 10, display: 'flex', gap: 6 }}>
+        <button type="button" onClick={() => transitionTo(DEFAULT_CONSTELLATION_3D_CAMERA)}>home</button>
+        <button type="button" disabled={!selectedNodeId} onClick={() => {
+          const selected = layoutNodes.find((node) => node.id === selectedNodeId);
+          if (selected) transitionTo(focusConstellationCamera(cameraState, selected.position, selected.radius ?? 18));
+        }}>focus</button>
+      </div>
       {labels.map((label) => (
         <span key={label.key} style={{ position: 'absolute', left: label.x, top: label.y, transform: 'translate(-50%, -50%)', pointerEvents: 'none', fontFamily: 'var(--mono)', fontSize: label.promoted ? 11 : 10, fontWeight: label.promoted ? 700 : 500, color: label.promoted ? 'var(--amber)' : 'var(--text-soft)', textShadow: '0 1px 4px var(--bg)' }}>{label.text}</span>
       ))}

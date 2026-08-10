@@ -3,6 +3,7 @@ import { constellation, type ConstellationInputRows } from '../apps/api/src/memo
 import { compactConstellationCommunityPage, type ConstellationV2CommunityPage } from '../apps/api/src/memory/constellation-v2';
 import { computeStarMap, hitTest } from '../apps/web/src/components/starmap-layout';
 import { buildConstellation3DRenderPlan, type Constellation3DEdge, type Constellation3DNode } from '../apps/web/src/components/constellation-3d-buffers';
+import { computeConstellation3DLayout } from '../apps/web/src/components/constellation-3d-layout';
 
 type FixtureName = 'dense-hub' | 'disconnected-islands' | 'code-heavy' | 'memory-heavy';
 
@@ -135,7 +136,18 @@ const rendererBufferPlan = {
   drawCallCeiling: rendererPlan.drawCallCeiling, labels: rendererPlan.labels.length,
   selectionPlanMedianMs: median(rendererPlanRuns), interactionBudgetPassed: median(rendererPlanRuns) <= 100,
 };
+const workerLayoutRuns: number[] = [];
+for (let index = 0; index < 3; index++) {
+  const start = performance.now();
+  computeConstellation3DLayout({ generationId: 'benchmark', layoutVersion: 'space-v1', nodes: rendererNodes, edges: rendererEdges });
+  workerLayoutRuns.push(ms(start));
+}
+const workerLayout = {
+  passes: 8, medianMs: median(workerLayoutRuns), runsOffMainThread: true,
+  generationBudgetPassed: median(workerLayoutRuns) <= 10_000,
+};
 
-console.log(JSON.stringify({ runtime: process.version, results, rendererBufferPlan }, null, 2));
+console.log(JSON.stringify({ runtime: process.version, results, rendererBufferPlan, workerLayout }, null, 2));
 if (results.some((result) => !result.compactBudgetPassed)) process.exitCode = 1;
 if (!rendererBufferPlan.interactionBudgetPassed || rendererBufferPlan.drawCallCeiling > 14) process.exitCode = 1;
+if (!workerLayout.generationBudgetPassed) process.exitCode = 1;

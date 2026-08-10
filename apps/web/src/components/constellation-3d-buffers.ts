@@ -12,6 +12,8 @@ export interface Constellation3DNode {
   validity?: string | null;
   isLead?: boolean | null;
   community?: boolean;
+  parentId?: string | null;
+  radius?: number;
 }
 
 export interface Constellation3DEdge {
