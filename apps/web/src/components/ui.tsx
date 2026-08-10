@@ -172,6 +172,7 @@ function normalizedSelectValue(value: SelectHTMLAttributes<HTMLSelectElement>['v
 type SelectProps = Omit<SelectHTMLAttributes<HTMLSelectElement>, 'multiple' | 'size'> & {
   variant?: DropdownVariant;
   menuWidth?: CSSProperties['width'];
+  side?: 'bottom' | 'top';
   placeholder?: string;
   invalid?: string;
 };
@@ -179,7 +180,7 @@ type SelectProps = Omit<SelectHTMLAttributes<HTMLSelectElement>, 'multiple' | 's
 /** Native-select-compatible adapter. Dropdown owns every visible selection surface. */
 export function Select({
   children, value, defaultValue, onChange, disabled, style, title, autoFocus,
-  variant: requestedVariant, menuWidth, placeholder, invalid, ...props
+  variant: requestedVariant, menuWidth, side, placeholder, invalid, ...props
 }: SelectProps) {
   const fieldLabel = useContext(FieldLabelContext);
   const controlled = value !== undefined;
@@ -219,6 +220,7 @@ export function Select({
       disabled={disabled}
       invalid={invalid}
       menuWidth={menuWidth}
+      side={side}
       containerStyle={containerStyle}
       triggerStyle={{ ...triggerStyle, width: '100%' }}
       title={title}

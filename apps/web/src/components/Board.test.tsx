@@ -10,6 +10,20 @@ import { Board } from './Board';
 
 let container: HTMLDivElement;
 let root: Root | null = null;
+const originalMatchMedia = window.matchMedia;
+
+function mockPhoneViewport() {
+  window.matchMedia = vi.fn((query: string) => ({
+    matches: query.includes('767px') || query.includes('1023px'),
+    media: query,
+    onchange: null,
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+    dispatchEvent: vi.fn(),
+  }));
+}
 
 const task = (id: string, key: string, title: string): TaskVM => ({
   id,
@@ -39,8 +53,8 @@ const task = (id: string, key: string, title: string): TaskVM => ({
   comments: [],
 });
 
-function mount() {
-  const tasks = [
+function mount(taskList?: TaskVM[]) {
+  const tasks = taskList ?? [
     task('task_planned', 'BRD-1', 'Task from the release plan'),
     task('task_standalone', 'BRD-2', 'Standalone board task'),
   ];
@@ -90,10 +104,31 @@ afterEach(() => {
   act(() => root?.unmount());
   container?.remove();
   root = null;
+  window.matchMedia = originalMatchMedia;
   vi.restoreAllMocks();
 });
 
 describe('Board plan membership filter', () => {
+  it('renders one touch-selected lane without drag or bulk controls on phones', () => {
+    mockPhoneViewport();
+    const todo = task('task_todo', 'BRD-10', 'Phone todo task');
+    const review = { ...task('task_review', 'BRD-11', 'Phone review task'), status: 'review' as const };
+    mount([todo, review]);
+
+    expect(container.querySelector('[data-testid="mobile-board"]')).toBeTruthy();
+    expect(container.textContent).toContain('Phone todo task');
+    expect(container.textContent).not.toContain('Phone review task');
+    expect(container.querySelector('[draggable="true"]')).toBeNull();
+    expect(container.querySelector('.bulk-bar')).toBeNull();
+
+    const reviewLane = [...container.querySelectorAll<HTMLButtonElement>('nav[aria-label="Board lanes"] button')]
+      .find((item) => item.textContent?.includes('Review'))!;
+    act(() => reviewLane.click());
+    expect(container.textContent).not.toContain('Phone todo task');
+    expect(container.textContent).toContain('Phone review task');
+    expect(container.querySelector('[data-testid="mobile-board-lane-review"]')).toBeTruthy();
+  });
+
   it('can isolate tasks in plans or tasks outside plans', () => {
     mount();
     expect(container.textContent).toContain('Task from the release plan');

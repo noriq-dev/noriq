@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { api } from '../api';
 import type { AppStore } from '../store';
 import type { TaskStatus } from '../types';
+import { MIN_TOUCH_TARGET, useViewport } from '../viewport';
 import { statusMeta } from '../design';
 import { AvatarChip, MonoTag } from './bits';
 import { Button, Select } from './ui';
@@ -26,6 +27,7 @@ const COLUMNS: Array<[TaskStatus, string]> = [
 const TYPE_ICON: Record<string, string> = { bug: '✕', chore: '⟳', research: '?', feature: '' };
 
 export function Board({ store }: { store: AppStore }) {
+  const { phone } = useViewport();
   const { currentPid, helpers, actions, draggedId, snapshot, showArchived, boardId } = store;
   const tasks = helpers.tasksOf(currentPid);
   // Milestone progress counts the *whole* milestone, archived work included — otherwise
@@ -52,6 +54,7 @@ export function Board({ store }: { store: AppStore }) {
   // Multi-select for bulk triage (PLNR-125): shift/cmd-click gathers cards; a plain
   // click still opens the drawer, so the two gestures never fight.
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [activeLane, setActiveLane] = useState<TaskStatus>('todo');
   const toggleSelect = (id: string) =>
     setSelected((prev) => {
       const next = new Set(prev);
@@ -121,6 +124,114 @@ export function Board({ store }: { store: AppStore }) {
         bodyMatches.has(t.id) ||
         t.tagIds.some((id) => tagById.get(id)?.name.toLowerCase().includes(q))),
   );
+
+  const mobileColumns = COLUMNS.filter(([status]) =>
+    status !== 'proposed' || visible.some((task) => task.status === 'proposed'));
+  useEffect(() => {
+    if (!mobileColumns.some(([status]) => status === activeLane)) setActiveLane('todo');
+  }, [activeLane, mobileColumns]);
+
+  if (phone) {
+    const laneTasks = visible
+      .filter((task) => task.status === activeLane)
+      .sort((a, b) => a.priority - b.priority);
+    return (
+      <div data-testid="mobile-board" style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minHeight: 0, background: 'var(--bg)' }}>
+        <BoardTabs
+          boards={boards}
+          current={boardId}
+          editable={store.permissions.canContribute}
+          onSelect={(id) => actions.setBoard(id)}
+          onCreate={async () => {
+            const name = (await prompt('New board name:'))?.trim();
+            if (name) void actions.createBoard(name);
+          }}
+          onRename={async (id, cur) => {
+            const name = (await prompt('Rename board:', cur))?.trim();
+            if (name && name !== cur) void actions.renameBoard(id, name);
+          }}
+          onDelete={async (id, name) => {
+            if (await confirm(`Delete board "${name}"? Its tasks move to another board.`)) void actions.deleteBoard(id);
+          }}
+        />
+        <nav aria-label="Board lanes" style={{ flex: 'none', display: 'flex', gap: 7, overflowX: 'auto', padding: '10px 12px 9px', borderBottom: '1px solid var(--line)' }}>
+          {mobileColumns.map(([status, label]) => {
+            const meta = statusMeta(status);
+            const count = visible.filter((task) => task.status === status).length;
+            const active = status === activeLane;
+            return (
+              <button
+                key={status}
+                type="button"
+                aria-pressed={active}
+                onClick={() => setActiveLane(status)}
+                style={{ minHeight: MIN_TOUCH_TARGET, flex: 'none', display: 'flex', alignItems: 'center', gap: 7, padding: '0 12px', borderRadius: 999, cursor: 'pointer', background: active ? 'rgba(198,242,78,.1)' : 'var(--w-03)', color: active ? 'var(--accent)' : 'var(--text-mid)', border: `1px solid ${active ? 'rgba(198,242,78,.35)' : 'var(--w-08)'}`, fontSize: 12, fontWeight: 600 }}
+              >
+                <span style={{ width: 7, height: 7, borderRadius: '50%', background: meta.dot }} />
+                {label}
+                <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: active ? 'var(--accent)' : 'var(--text-faint)' }}>{count}</span>
+              </button>
+            );
+          })}
+        </nav>
+        <div data-testid={`mobile-board-lane-${activeLane}`} style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '12px 12px 20px' }}>
+          {laneTasks.length === 0 && <div style={{ padding: '36px 12px', textAlign: 'center', color: 'var(--text-faint)', fontSize: 12 }}>No tasks in this lane.</div>}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {laneTasks.map((task) => {
+              const effective = helpers.effStatus(currentPid, task);
+              const blocked = effective === 'blocked';
+              const agent = task.claimedBy ? helpers.agentById(currentPid, task.claimedBy) : null;
+              const taskTags = task.tagIds.map((id) => tagById.get(id)).filter(Boolean) as Array<{ id: string; name: string; color: string }>;
+              const milestone = task.milestoneId ? msById.get(task.milestoneId) : null;
+              const depKey = task.deps.map((id) => tasks.find((candidate) => candidate.id === id)?.key ?? '')[0] ?? '';
+              const typeIcon = TYPE_ICON[task.type] ?? '';
+              return (
+                <article
+                  key={task.id}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => actions.openTask(task.id)}
+                  onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') actions.openTask(task.id); }}
+                  className="hover-border"
+                  style={{ background: 'var(--card)', border: '1px solid var(--w-06)', borderLeft: `3px solid ${taskTags[0]?.color ?? 'var(--w-08)'}`, borderRadius: 11, padding: '13px 14px', cursor: 'pointer', opacity: task.archivedAt ? 0.5 : 1 }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 7, minHeight: 20, marginBottom: 7, flexWrap: 'wrap' }}>
+                    <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: statusMeta(effective).color }}>{task.key}</span>
+                    {task.archivedAt && <MonoTag color="var(--text-faint)" bg="var(--w-05)" size={8.5}>🗄</MonoTag>}
+                    {typeIcon && <span title={task.type} style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: task.type === 'bug' ? 'var(--red-soft)' : 'var(--text-dim)' }}>{typeIcon} {task.type}</span>}
+                    <div style={{ flex: 1 }} />
+                    {task.priority !== 2 && <MonoTag color={task.priority <= 0 ? 'var(--red-soft)' : task.priority === 1 ? 'var(--amber)' : 'var(--text-faint)'} bg="var(--w-04)" size={9}>P{task.priority}</MonoTag>}
+                    {task.estimate !== null && <MonoTag color="var(--text-faint)" bg="var(--w-04)" size={9}>{task.estimate}pt</MonoTag>}
+                    {task.dueAt && task.status !== 'done' && task.status !== 'cancelled' && (() => {
+                      const overdue = new Date(task.dueAt).getTime() < Date.now();
+                      return <MonoTag color={overdue ? 'var(--red-soft)' : 'var(--text-faint)'} bg="var(--w-04)" size={9}>{overdue ? '⚠ ' : ''}{new Date(task.dueAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</MonoTag>;
+                    })()}
+                    {task.openComments > 0 && <MonoTag color="var(--amber)" bg="rgba(245,166,35,.12)" size={9.5}>{task.openComments} ?</MonoTag>}
+                    {lockedTaskIds.has(task.id) && <MonoTag color="var(--blue)" bg="rgba(76,157,255,.12)" size={9.5}>🔒</MonoTag>}
+                  </div>
+                  <div style={{ fontSize: 14, lineHeight: 1.45, color: 'var(--text)' }}>{task.title}</div>
+                  {task.status === 'proposed' && store.permissions.canManage && (
+                    <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+                      <Button variant="primary" style={{ minHeight: MIN_TOUCH_TARGET, padding: '5px 13px' }} onClick={(event) => { event.stopPropagation(); void actions.acceptSpinoff(task.id); }}>✓ accept</Button>
+                      <Button variant="danger" style={{ minHeight: MIN_TOUCH_TARGET, padding: '5px 13px' }} onClick={async (event) => { event.stopPropagation(); if (await confirm(`Reject spin-off ${task.key}? The task is cancelled (its finding stays on record).`)) void actions.rejectSpinoff(task.id); }}>✕ reject</Button>
+                    </div>
+                  )}
+                  {(taskTags.length > 0 || agent || blocked || milestone) && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginTop: 10, flexWrap: 'wrap' }}>
+                      {taskTags.map((tag) => <span key={tag.id} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontFamily: 'var(--mono)', fontSize: 9.5, color: tag.color, border: `1px solid ${tag.color}44`, padding: '2px 7px', borderRadius: 5 }}><span style={{ width: 5, height: 5, borderRadius: '50%', background: tag.color }} />{tag.name}</span>)}
+                      {agent && <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}><AvatarChip name={agent.name} color={agent.color} size={18} radius={4} fontSize={7.5} /><span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-mid)' }}>{agent.name}</span></span>}
+                      <span style={{ flex: 1 }} />
+                      {blocked ? <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--red-soft)' }}>⟂ {depKey}</span> : milestone && <span style={{ maxWidth: 150, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>{milestone.title}</span>}
+                    </div>
+                  )}
+                </article>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>

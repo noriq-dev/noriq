@@ -9,6 +9,8 @@ import { MonoTag, WaveBars } from './bits';
 import { confirm } from './Dialog';
 import { Button, Select } from './ui';
 import { Markdown } from './Markdown';
+import { Sheet } from './Sheet';
+import { MIN_INPUT_FONT_SIZE, MIN_TOUCH_TARGET, useViewport } from '../viewport';
 
 const KIND_COLOR: Record<ApiAskSource['kind'], string> = {
   project: 'var(--text-mid)',
@@ -143,11 +145,13 @@ function ActionCard({ action, busy, onSettle }: {
 
 export function AskView({ store }: { store: AppStore }) {
   const { actions } = store;
+  const { phone } = useViewport();
   const [messages, setMessages] = useState<ThreadMessage[]>([]);
   const [threadId, setThreadId] = useState<string | null>(null);
   const [threads, setThreads] = useState<ApiAskThread[]>([]);
   const [archivedThreads, setArchivedThreads] = useState<ApiAskThread[]>([]);
   const [showArchived, setShowArchived] = useState(false);
+  const [threadsOpen, setThreadsOpen] = useState(false);
   const [threadArchived, setThreadArchived] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(true);
   const [q, setQ] = useState('');
@@ -532,64 +536,70 @@ export function AskView({ store }: { store: AppStore }) {
   const activeGeneration = [...messages].reverse().find((message) =>
     message.generationId && ['pending', 'searching', 'generating'].includes(message.generationStatus ?? ''));
 
+  const threadPanel = (
+    <>
+      <div style={{ display: 'flex', gap: 3, padding: 10, borderBottom: '1px solid var(--line)' }}>
+        {([false, true] as const).map((archived) => (
+          <button
+            key={String(archived)}
+            onClick={() => void toggleArchiveView(archived)}
+            style={{ minHeight: phone ? MIN_TOUCH_TARGET : undefined, flex: 1, cursor: 'pointer', borderRadius: 6, padding: '5px 7px', fontSize: 10.5, background: showArchived === archived ? 'var(--w-1)' : 'transparent', color: showArchived === archived ? 'var(--text)' : 'var(--text-dim)' }}
+          >
+            {archived ? 'Archived' : 'Chats'}
+          </button>
+        ))}
+      </div>
+      <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: 7 }}>
+        {!historyLoading && visibleThreads.length === 0 && (
+          <div style={{ padding: '18px 10px', color: 'var(--text-faint)', fontSize: 10.5, lineHeight: 1.5, textAlign: 'center' }}>
+            {showArchived ? 'No archived chats.' : 'Your chats will appear here.'}
+          </div>
+        )}
+        {visibleThreads.map((thread) => (
+          <div key={thread.id} data-testid={`ask-thread-${thread.id}`} style={{ display: 'flex', gap: 3, alignItems: 'center', borderRadius: 8, background: thread.id === threadId ? 'var(--w-07)' : 'transparent', marginBottom: 3 }}>
+            <button onClick={() => { setThreadsOpen(false); void loadThread(thread.id); }} style={{ minWidth: 0, minHeight: phone ? MIN_TOUCH_TARGET : undefined, flex: 1, cursor: 'pointer', textAlign: 'left', padding: '8px 7px' }}>
+              <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11.5, color: 'var(--text-soft)' }}>{thread.title}</div>
+              <div style={{ marginTop: 3, fontFamily: 'var(--mono)', fontSize: 8, color: 'var(--text-faint)' }}>{dayLabel(thread.updatedAt)} · {thread.messageCount}</div>
+            </button>
+            <button
+              title={showArchived ? 'Restore chat' : 'Archive chat'}
+              aria-label={showArchived ? `Restore ${thread.title}` : `Archive ${thread.title}`}
+              onClick={() => void (showArchived ? restoreThread(thread.id) : archiveThread(thread.id))}
+              style={{ cursor: 'pointer', minWidth: phone ? MIN_TOUCH_TARGET : undefined, minHeight: phone ? MIN_TOUCH_TARGET : undefined, padding: '5px', color: 'var(--text-faint)', fontSize: 11 }}
+            >{showArchived ? '↥' : '↧'}</button>
+            <button
+              title="Delete chat"
+              aria-label={`Delete ${thread.title}`}
+              onClick={() => void removeThread(thread)}
+              style={{ cursor: 'pointer', minWidth: phone ? MIN_TOUCH_TARGET : undefined, minHeight: phone ? MIN_TOUCH_TARGET : undefined, padding: '5px 7px 5px 3px', color: 'var(--text-faint)', fontSize: 12 }}
+            >×</button>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg)' }}>
-      <div style={{ height: 54, flex: 'none', borderBottom: '1px solid var(--line)', display: 'flex', alignItems: 'center', padding: '0 22px', background: 'var(--bg-raised)' }}>
-        <div>
+      <div style={{ height: 54, flex: 'none', borderBottom: '1px solid var(--line)', display: 'flex', alignItems: 'center', padding: phone ? '0 12px' : '0 22px', background: 'var(--bg-raised)' }}>
+        {phone ? (
+          <button type="button" onClick={() => setThreadsOpen(true)} style={{ minHeight: MIN_TOUCH_TARGET, padding: '0 10px', cursor: 'pointer', color: 'var(--text-mid)', fontSize: 12 }}>☰ Threads</button>
+        ) : <div>
           <div style={{ fontWeight: 700, fontSize: 14.5 }}>Ask</div>
           <div style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)', marginTop: 1 }}>GLOBAL ASSISTANT</div>
-        </div>
+        </div>}
         <div style={{ flex: 1 }} />
-        <button onClick={newChat} className="hover-bright" style={{ cursor: 'pointer', color: 'var(--text-mid)', fontSize: 11.5, padding: '6px 9px', borderRadius: 7 }}>
+        <button onClick={newChat} className="hover-bright" style={{ cursor: 'pointer', minHeight: phone ? MIN_TOUCH_TARGET : undefined, color: 'var(--text-mid)', fontSize: 11.5, padding: '6px 9px', borderRadius: 7 }}>
           + New chat
         </button>
       </div>
 
       <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
-        <aside style={{ width: 224, flex: 'none', minHeight: 0, display: 'flex', flexDirection: 'column', borderRight: '1px solid var(--line)', background: 'var(--bg-raised)' }}>
-          <div style={{ display: 'flex', gap: 3, padding: 10, borderBottom: '1px solid var(--line)' }}>
-            {([false, true] as const).map((archived) => (
-              <button
-                key={String(archived)}
-                onClick={() => void toggleArchiveView(archived)}
-                style={{ flex: 1, cursor: 'pointer', borderRadius: 6, padding: '5px 7px', fontSize: 10.5, background: showArchived === archived ? 'var(--w-1)' : 'transparent', color: showArchived === archived ? 'var(--text)' : 'var(--text-dim)' }}
-              >
-                {archived ? 'Archived' : 'Chats'}
-              </button>
-            ))}
-          </div>
-          <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: 7 }}>
-            {!historyLoading && visibleThreads.length === 0 && (
-              <div style={{ padding: '18px 10px', color: 'var(--text-faint)', fontSize: 10.5, lineHeight: 1.5, textAlign: 'center' }}>
-                {showArchived ? 'No archived chats.' : 'Your chats will appear here.'}
-              </div>
-            )}
-            {visibleThreads.map((thread) => (
-              <div key={thread.id} data-testid={`ask-thread-${thread.id}`} style={{ display: 'flex', gap: 3, alignItems: 'center', borderRadius: 8, background: thread.id === threadId ? 'var(--w-07)' : 'transparent', marginBottom: 3 }}>
-                <button onClick={() => void loadThread(thread.id)} style={{ minWidth: 0, flex: 1, cursor: 'pointer', textAlign: 'left', padding: '8px 7px' }}>
-                  <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11.5, color: 'var(--text-soft)' }}>{thread.title}</div>
-                  <div style={{ marginTop: 3, fontFamily: 'var(--mono)', fontSize: 8, color: 'var(--text-faint)' }}>{dayLabel(thread.updatedAt)} · {thread.messageCount}</div>
-                </button>
-                <button
-                  title={showArchived ? 'Restore chat' : 'Archive chat'}
-                  aria-label={showArchived ? `Restore ${thread.title}` : `Archive ${thread.title}`}
-                  onClick={() => void (showArchived ? restoreThread(thread.id) : archiveThread(thread.id))}
-                  style={{ cursor: 'pointer', padding: '5px', color: 'var(--text-faint)', fontSize: 11 }}
-                >{showArchived ? '↥' : '↧'}</button>
-                <button
-                  title="Delete chat"
-                  aria-label={`Delete ${thread.title}`}
-                  onClick={() => void removeThread(thread)}
-                  style={{ cursor: 'pointer', padding: '5px 7px 5px 3px', color: 'var(--text-faint)', fontSize: 12 }}
-                >×</button>
-              </div>
-            ))}
-          </div>
-        </aside>
+        {!phone && <aside style={{ width: 224, flex: 'none', minHeight: 0, display: 'flex', flexDirection: 'column', borderRight: '1px solid var(--line)', background: 'var(--bg-raised)' }}>{threadPanel}</aside>}
 
         <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
           <div ref={scrollRef} data-testid="ask-scroll" onScroll={updateScrollFollow} style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
-            <div className="content-pad" style={{ maxWidth: 800, margin: '0 auto', padding: messages.length ? '28px 28px 36px' : '68px 28px 36px' }}>
+            <div className="content-pad" style={{ maxWidth: 800, margin: '0 auto', padding: phone ? (messages.length ? '20px 15px 24px' : '36px 16px 24px') : (messages.length ? '28px 28px 36px' : '68px 28px 36px') }}>
               {!historyLoading && messages.length === 0 && (
                 <div style={{ textAlign: 'center', maxWidth: 620, margin: '0 auto' }}>
                   <div style={{ color: 'var(--accent)', fontSize: 28, lineHeight: 1, marginBottom: 16 }}>✦</div>
@@ -727,7 +737,7 @@ export function AskView({ store }: { store: AppStore }) {
             </div>
           </div>
 
-          <div style={{ flex: 'none', padding: '12px 24px 18px', background: 'linear-gradient(transparent, var(--bg) 22%)' }}>
+          <div style={{ flex: 'none', padding: phone ? '8px 10px calc(8px + env(safe-area-inset-bottom))' : '12px 24px 18px', background: 'linear-gradient(transparent, var(--bg) 22%)' }}>
             <div style={{ position: 'relative', maxWidth: 800, margin: '0 auto', border: '1px solid var(--w-12)', borderRadius: 13, background: 'var(--card)', padding: '9px 10px 9px 13px', boxShadow: '0 10px 30px rgba(0,0,0,.12)' }}>
               {projectSuggestions.length > 0 && (
                 <div role="listbox" aria-label="Tag a project" style={{ position: 'absolute', left: 12, bottom: 'calc(100% + 7px)', width: 300, maxWidth: 'calc(100vw - 48px)', border: '1px solid var(--w-12)', borderRadius: 10, background: 'var(--bg-raised)', padding: 5, boxShadow: '0 14px 34px rgba(0,0,0,.3)', zIndex: 5 }}>
@@ -740,12 +750,13 @@ export function AskView({ store }: { store: AppStore }) {
                   ))}
                 </div>
               )}
-              <textarea value={q} onChange={(event) => setQ(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (projectSuggestions[0]) insertProjectTag(projectSuggestions[0].tag); else if (!loading) void ask(); } }} placeholder={threadArchived ? 'Restore this chat to continue…' : 'Message Ask… Use @project to focus.'} rows={2} disabled={historyLoading || threadArchived} style={{ boxSizing: 'border-box', width: '100%', background: 'transparent', border: 0, padding: '2px 0 6px', color: 'var(--text)', fontSize: 13.5, lineHeight: 1.5, resize: 'none', outline: 'none', fontFamily: 'inherit' }} />
+              <textarea value={q} onChange={(event) => setQ(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (projectSuggestions[0]) insertProjectTag(projectSuggestions[0].tag); else if (!loading) void ask(); } }} placeholder={threadArchived ? 'Restore this chat to continue…' : 'Message Ask… Use @project to focus.'} rows={2} disabled={historyLoading || threadArchived} style={{ boxSizing: 'border-box', width: '100%', background: 'transparent', border: 0, padding: '2px 0 6px', color: 'var(--text)', fontSize: phone ? MIN_INPUT_FONT_SIZE : 13.5, lineHeight: 1.5, resize: 'none', outline: 'none', fontFamily: 'inherit' }} />
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                 <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>
                   Model
                   <Select
                     variant="micro"
+                    side={phone ? 'top' : 'bottom'}
                     aria-label="Ask model"
                     value={selectedModel}
                     onChange={(event) => setSelectedModel(event.target.value)}
@@ -756,7 +767,7 @@ export function AskView({ store }: { store: AppStore }) {
                   </Select>
                 </label>
                 <div style={{ flex: 1 }} />
-                <span style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>Shift+Enter for newline</span>
+                {!phone && <span style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>Shift+Enter for newline</span>}
                 {loading && <Button variant="ghost" onClick={() => void cancelGeneration()} disabled={!activeGeneration?.generationId}>Cancel</Button>}
                 <Button onClick={() => void ask()} disabled={!q.trim() || !selectedModel || loading || historyLoading || modelsLoading || threadArchived}>Send</Button>
               </div>
@@ -764,6 +775,7 @@ export function AskView({ store }: { store: AppStore }) {
           </div>
         </div>
       </div>
+      {phone && threadsOpen && <Sheet title="Threads" subtitle="Your Ask conversations" onClose={() => setThreadsOpen(false)}><div style={{ minHeight: 260, maxHeight: '65dvh', display: 'flex', flexDirection: 'column' }}>{threadPanel}</div></Sheet>}
     </div>
   );
 }
