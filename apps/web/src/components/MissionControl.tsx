@@ -6,8 +6,18 @@ import { QuestionForm, SignalThreadHistory } from './QuestionForm';
 import { Markdown } from './Markdown';
 import { AvatarChip, MonoTag, SectionLabel, WaveBars } from './bits';
 import { Composer } from './Composer';
+import { DecisionsSheet } from './DecisionsSheet';
+import { useViewport } from '../viewport';
 
 export function MissionControl({ store }: { store: AppStore }) {
+  const { phone } = useViewport();
+  if (phone) {
+    return (
+      <div className="mc-mobile" style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        <EventFeed store={store} phone />
+      </div>
+    );
+  }
   return (
     <div className="mc-grid" style={{ position: 'absolute', inset: 0, display: 'grid', gridTemplateColumns: '272px 1fr 328px', minHeight: 0 }}>
       <Roster store={store} />
@@ -325,8 +335,9 @@ const dayKey = (iso: string): string => new Date(iso).toDateString();
 /** Short calendar date shown on a day-break separator, e.g. "Jul 28" (PLNR-227). */
 const dayLabel = (iso: string): string => new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 
-function EventFeed({ store }: { store: AppStore }) {
+function EventFeed({ store, phone = false }: { store: AppStore; phone?: boolean }) {
   const { data, currentPid, actions } = store;
+  const [decisionsOpen, setDecisionsOpen] = useState(false);
   // Direction toggle (PLNR-149): 'bottom' = chat-style (oldest top, newest arriving at
   // the bottom — the default); 'top' = classic activity feed (newest first). Sticky per
   // browser via localStorage.
@@ -338,19 +349,20 @@ function EventFeed({ store }: { store: AppStore }) {
     setDir(next);
     localStorage.setItem('noriq.feedDir', next);
   };
+  const feedDir = phone ? 'bottom' : dir;
   // The store keeps events newest-first (Graph and the agent detail rely on that).
-  const events = dir === 'bottom' ? [...(data.events[currentPid] ?? [])].reverse() : data.events[currentPid] ?? [];
+  const events = feedDir === 'bottom' ? [...(data.events[currentPid] ?? [])].reverse() : data.events[currentPid] ?? [];
 
   const scrollRef = useRef<HTMLDivElement>(null);
   // Track whether the user is pinned to the bottom, so incoming events don't yank
   // the viewport while they're reading back through history. (Bottom mode only —
   // newest-first mode reads from the top and never needs to follow.)
   const stuckToBottom = useRef(true);
-  const newestId = dir === 'bottom' ? events[events.length - 1]?.id ?? null : null;
+  const newestId = feedDir === 'bottom' ? events[events.length - 1]?.id ?? null : null;
 
   const onScroll = () => {
     const el = scrollRef.current;
-    if (!el || dir !== 'bottom') return;
+    if (!el || feedDir !== 'bottom') return;
     stuckToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight <= STICK_THRESHOLD;
   };
 
@@ -359,20 +371,23 @@ function EventFeed({ store }: { store: AppStore }) {
     const el = scrollRef.current;
     if (!el) return;
     stuckToBottom.current = true;
-    el.scrollTop = dir === 'bottom' ? el.scrollHeight : 0;
-  }, [currentPid, dir]);
+    el.scrollTop = feedDir === 'bottom' ? el.scrollHeight : 0;
+  }, [currentPid, feedDir]);
 
   // Follow new events only while pinned to the bottom. Layout effect so the feed
   // lands at the newest row before paint instead of visibly jumping after it.
   useLayoutEffect(() => {
     const el = scrollRef.current;
-    if (!el || dir !== 'bottom' || !stuckToBottom.current) return;
+    if (!el || feedDir !== 'bottom' || !stuckToBottom.current) return;
     el.scrollTop = el.scrollHeight;
-  }, [newestId, dir]);
+  }, [newestId, feedDir]);
+
+  const signals = store.snapshot?.signals ?? [];
+  const oldest = [...signals].sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, minWidth: 0, borderRight: '1px solid var(--line)' }}>
-      <div
+      {!phone && <div
         style={{
           padding: '14px 20px 10px',
           display: 'flex',
@@ -400,9 +415,25 @@ function EventFeed({ store }: { store: AppStore }) {
         <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>
           append-only · {1200 + events.length}
         </span>
-      </div>
-      <AttentionInbox store={store} />
-      <div ref={scrollRef} onScroll={onScroll} style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: '8px 0' }}>
+      </div>}
+      {phone && oldest && (
+        <button
+          type="button"
+          onClick={() => setDecisionsOpen(true)}
+          style={{ width: '100%', flex: 'none', minHeight: 62, padding: '10px 12px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 10, textAlign: 'left', background: 'rgba(245,166,35,.07)', borderBottom: '1px solid rgba(245,166,35,.22)' }}
+        >
+          <span aria-hidden="true" style={{ width: 8, height: 8, flex: 'none', borderRadius: '50%', background: 'var(--amber)', animation: 'pl-blink 1.4s infinite' }} />
+          <span style={{ minWidth: 0, flex: 1 }}>
+            <strong style={{ display: 'block', fontSize: 13, color: 'var(--text)' }}>{signals.length} decision{signals.length === 1 ? '' : 's'} waiting on you</strong>
+            <span style={{ display: 'block', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+              {oldest.agentName}{oldest.taskKey ? ` · ${oldest.taskKey}` : ''} · {ago(oldest.createdAt)}
+            </span>
+          </span>
+          <span style={{ flex: 'none', padding: '7px 12px', borderRadius: 8, background: 'var(--amber)', color: 'var(--bg)', fontSize: 12, fontWeight: 700 }}>Review</span>
+        </button>
+      )}
+      {!phone && <AttentionInbox store={store} />}
+      <div data-event-scroll ref={scrollRef} onScroll={onScroll} style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: '8px 0' }}>
         {events.map((ev, i) => {
           const ag = (data.agents[currentPid] ?? []).find((a) => a.name === ev.actor || a.id === ev.actor) ?? null;
           const isYou = ev.actorKind === 'human';
@@ -421,7 +452,29 @@ function EventFeed({ store }: { store: AppStore }) {
                   <div style={{ flex: 1, borderBottom: '1px solid var(--line)' }} />
                 </div>
               )}
-            <div
+            {phone ? (
+              <div
+                onClick={ev.taskId != null ? () => actions.openTask(ev.taskId!) : undefined}
+                className="event-row"
+                style={{ padding: '11px 16px', display: 'flex', gap: 11, alignItems: 'flex-start', cursor: ev.taskId != null ? 'pointer' : 'default', animation: 'pl-stream-up .45s ease both', borderLeft: '2px solid transparent' }}
+              >
+                <div style={{ width: 30, height: 30, borderRadius: 8, background: isYou ? YOU_GRADIENT : isSystem ? '#3fd98b' : ag ? (isGhostColor(ag.color) ? 'var(--w-16)' : ag.color) : 'var(--w-16)', flex: 'none', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'var(--mono)', fontSize: 10, fontWeight: 700, color: isYou || isSystem ? '#0a0b0d' : ag ? agentFg(ag.color) : '#e6e8ec' }}>
+                  {isYou ? 'Y' : isSystem ? '✓' : initials(ev.actor)}
+                </div>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
+                    <b style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--text)', fontSize: 13.5 }}>{ev.actor}</b>
+                    <span style={{ flex: 'none', fontFamily: 'var(--mono)', fontSize: 10, color: vc.color, background: vc.bg, padding: '1px 6px', borderRadius: 4 }}>{ev.verb}</span>
+                    <span style={{ flex: 1 }} />
+                    <span style={{ flex: 'none', fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>{ev.t}</span>
+                  </div>
+                  <div data-event-subject style={{ marginTop: 3, color: 'var(--text-mid)', fontSize: 13, lineHeight: 1.45, whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
+                    {ev.dot && <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: ev.dot, marginRight: 5 }} />}
+                    {ev.subject}
+                  </div>
+                </div>
+              </div>
+            ) : <div
               onClick={ev.taskId != null ? () => actions.openTask(ev.taskId!) : undefined}
               className="event-row"
               style={{
@@ -465,11 +518,17 @@ function EventFeed({ store }: { store: AppStore }) {
                 )}
                 <span style={{ color: 'var(--text-mid)' }}>{ev.subject}</span>
               </div>
-            </div>
+            </div>}
             </Fragment>
           );
         })}
       </div>
+      {phone && (
+        <div style={{ flex: 'none', padding: '8px 10px calc(8px + env(safe-area-inset-bottom))', borderTop: '1px solid var(--w-07)', background: 'var(--bg)' }}>
+          <Composer store={store} placeholder="Message the project…" compact />
+        </div>
+      )}
+      {phone && decisionsOpen && <DecisionsSheet store={store} onClose={() => setDecisionsOpen(false)} />}
     </div>
   );
 }

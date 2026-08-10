@@ -15,9 +15,10 @@ interface Draft {
 const kindOf = (q: ApiSignalQuestion): NonNullable<ApiSignalQuestion['kind']> =>
   q.kind ?? (q.multi ? 'multi' : q.options?.length ? 'select' : 'text');
 
-export function QuestionForm({ questions, onSubmit }: {
+export function QuestionForm({ questions, onSubmit, touch = false }: {
   questions: ApiSignalQuestion[];
   onSubmit: (response: string, answers: ApiSignalAnswer[]) => void | Promise<void>;
+  touch?: boolean;
 }) {
   const [drafts, setDrafts] = useState<Draft[]>(() => questions.map(() => ({ picked: new Set(), other: '' })));
   const patch = (i: number, fn: (d: Draft) => Draft) =>
@@ -58,7 +59,8 @@ export function QuestionForm({ questions, onSubmit }: {
           return dd;
         })}
         style={{
-          cursor: 'pointer', fontSize: 11.5, fontWeight: 500, borderRadius: 7, padding: '4px 10px',
+          cursor: 'pointer', fontSize: touch ? 13 : 11.5, fontWeight: 500, borderRadius: 7, padding: touch ? '8px 11px' : '4px 10px',
+          width: touch ? '100%' : undefined, minHeight: touch ? 44 : undefined, textAlign: touch ? 'left' : undefined,
           color: on ? '#0a0b0d' : 'var(--accent-ink)',
           background: on ? 'var(--accent)' : 'rgba(198,242,78,.08)',
           border: `1px solid ${on ? 'var(--accent)' : 'rgba(198,242,78,.35)'}`,
@@ -91,12 +93,12 @@ export function QuestionForm({ questions, onSubmit }: {
               {KIND_HINT[kind] && <span style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>{KIND_HINT[kind]}</span>}
             </div>
             {hasOptions && (
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+              <div style={{ display: 'flex', flexDirection: touch ? 'column' : 'row', flexWrap: 'wrap', gap: 5 }}>
                 {q.options!.map((opt) => optionButton(i, q, opt, kind === 'select'))}
               </div>
             )}
             {kind === 'confirm' && (
-              <div style={{ display: 'flex', gap: 5 }}>
+              <div style={{ display: 'flex', flexDirection: touch ? 'column' : 'row', gap: 5 }}>
                 {['Yes', 'No'].map((opt) => optionButton(i, q, opt, true))}
               </div>
             )}
@@ -109,7 +111,7 @@ export function QuestionForm({ questions, onSubmit }: {
                 style={{
                   width: 140, boxSizing: 'border-box', marginTop: 6,
                   background: 'var(--w-03)', border: '1px solid var(--w-1)', borderRadius: 7,
-                  padding: '5px 9px', color: 'var(--text)', fontSize: 12, outline: 'none', fontFamily: 'var(--mono)',
+                  padding: '5px 9px', color: 'var(--text)', fontSize: touch ? 16 : 12, minHeight: touch ? 44 : undefined, outline: 'none', fontFamily: 'var(--mono)',
                 }}
               />
             ) : kind !== 'confirm' && (
@@ -121,7 +123,7 @@ export function QuestionForm({ questions, onSubmit }: {
                 style={{
                   width: '100%', boxSizing: 'border-box', marginTop: 6, resize: 'vertical',
                   background: 'var(--w-03)', border: '1px solid var(--w-1)', borderRadius: 7,
-                  padding: '5px 9px', color: 'var(--text)', fontSize: 12, outline: 'none', fontFamily: 'inherit',
+                  padding: '5px 9px', color: 'var(--text)', fontSize: touch ? 16 : 12, minHeight: touch ? 44 : undefined, outline: 'none', fontFamily: 'inherit',
                 }}
               />
             )}
@@ -135,6 +137,7 @@ export function QuestionForm({ questions, onSubmit }: {
           alignSelf: 'flex-end', cursor: complete ? 'pointer' : 'default', fontSize: 12, fontWeight: 600,
           color: '#0a0b0d', background: 'var(--accent)', border: 'none', borderRadius: 7,
           padding: '6px 14px', opacity: complete ? 1 : 0.4,
+          minHeight: touch ? 44 : undefined, width: touch ? '100%' : undefined,
         }}
       >
         Answer {questions.length > 1 ? `all ${questions.length}` : ''}
