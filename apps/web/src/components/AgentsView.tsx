@@ -7,7 +7,7 @@ import {
 import type { AppStore } from '../store';
 import { initials } from '../design';
 import { MonoTag, SectionLabel } from './bits';
-import { Button } from './ui';
+import { Button, Select } from './ui';
 import { alert, confirm } from './Dialog';
 
 const PALETTE = ['#4c9dff', '#b57bff', '#3fd98b', '#ff8a8a', '#c6f24e', '#f5a623'];
@@ -162,34 +162,34 @@ export function AgentsView({ store }: { store: AppStore }) {
 
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7, marginBottom: 14 }}>
             {subject !== 'copilot' && (
-              <select style={selectStyle} value={projectScope} onChange={(event) => setProjectScope(event.target.value as 'current' | 'all')}>
+              <Select variant="micro" aria-label="Project scope" style={selectStyle} value={projectScope} onChange={(event) => setProjectScope(event.target.value as 'current' | 'all')}>
                 <option value="current">current project</option>
                 {isAdmin && <option value="all">all projects</option>}
-              </select>
+              </Select>
             )}
             {isAdmin && (
-              <select style={selectStyle} value={ownerUserId} onChange={(event) => setOwnerUserId(event.target.value)}>
+              <Select variant="micro" aria-label="Owner" style={selectStyle} value={ownerUserId} onChange={(event) => setOwnerUserId(event.target.value)}>
                 <option value="">all owners</option>
                 {users.map((user) => <option key={user.id} value={user.id}>{user.name}</option>)}
-              </select>
+              </Select>
             )}
             {subject === 'agent' && (
-              <select style={selectStyle} value={runnerId} onChange={(event) => setRunnerId(event.target.value)}>
+              <Select variant="micro" aria-label="Runner" style={selectStyle} value={runnerId} onChange={(event) => setRunnerId(event.target.value)}>
                 <option value="">all Runners</option>
                 {runnerChoices.map((runner) => <option key={runner.id} value={runner.id}>{runner.label}</option>)}
-              </select>
+              </Select>
             )}
-            <select style={selectStyle} value={olderThanDays} onChange={(event) => setOlderThanDays(event.target.value)}>
+            <Select variant="micro" aria-label="Actor age" style={selectStyle} value={olderThanDays} onChange={(event) => setOlderThanDays(event.target.value)}>
               <option value="">any age</option><option value="1">older than 1 day</option><option value="7">older than 7 days</option>
               <option value="30">older than 30 days</option><option value="90">older than 90 days</option>
-            </select>
+            </Select>
             {view === 'history' && (
-              <select style={selectStyle} value={retireReason} onChange={(event) => setRetireReason(event.target.value)}>
+              <Select variant="micro" aria-label="Retirement reason" style={selectStyle} value={retireReason} onChange={(event) => setRetireReason(event.target.value)}>
                 <option value="">all retirement reasons</option><option value="runner_offboarded">offboarded</option>
                 <option value="runner_offline_retention">offline retention elapsed</option><option value="run_terminal">run terminal</option>
                 <option value="session_inactive">session inactive</option><option value="connection_authorization_ended">authorization ended</option>
                 <option value="administrator_revoked">administrator revoked</option>
-              </select>
+              </Select>
             )}
           </div>
 

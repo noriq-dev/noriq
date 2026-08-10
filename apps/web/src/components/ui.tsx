@@ -1,5 +1,9 @@
 // Shared UI kit: modal + form primitives, in the design language.
-import { forwardRef, useEffect, type CSSProperties, type ReactNode } from 'react';
+import {
+  Children, Fragment, createContext, forwardRef, isValidElement, useContext, useEffect, useMemo, useState,
+  type ChangeEvent, type CSSProperties, type ReactNode, type SelectHTMLAttributes,
+} from 'react';
+import { Dropdown, type DropdownOption, type DropdownVariant } from './Dropdown';
 
 export function Modal({ title, subtitle, onClose, children, width = 420 }: {
   title: string;
@@ -73,6 +77,8 @@ const inputStyle: CSSProperties = {
   fontFamily: 'inherit',
 };
 
+const FieldLabelContext = createContext<string | null>(null);
+
 export function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
   return (
     <label style={{ display: 'block', marginBottom: 14 }}>
@@ -80,7 +86,7 @@ export function Field({ label, hint, children }: { label: string; hint?: string;
         <span style={{ fontFamily: 'var(--mono)', fontSize: 10, textTransform: 'uppercase', letterSpacing: '.07em', color: 'var(--text-dim)' }}>{label}</span>
         {hint && <span style={{ fontSize: 10.5, color: 'var(--text-faint)' }}>{hint}</span>}
       </div>
-      {children}
+      <FieldLabelContext.Provider value={label}>{children}</FieldLabelContext.Provider>
     </label>
   );
 }
@@ -94,8 +100,107 @@ export function TextArea(props: React.TextareaHTMLAttributes<HTMLTextAreaElement
   return <textarea {...props} style={{ ...inputStyle, minHeight: 74, resize: 'vertical', ...props.style }} />;
 }
 
-export function Select(props: React.SelectHTMLAttributes<HTMLSelectElement>) {
-  return <select {...props} style={{ ...inputStyle, appearance: 'none', ...props.style }} />;
+interface SelectOptionElementProps {
+  value?: string | number;
+  disabled?: boolean;
+  title?: string;
+  label?: string;
+  children?: ReactNode;
+}
+
+function optionText(node: ReactNode): string {
+  return Children.toArray(node).map((child) => {
+    if (typeof child === 'string' || typeof child === 'number') return String(child);
+    return isValidElement<SelectOptionElementProps>(child) ? optionText(child.props.children) : '';
+  }).join('');
+}
+
+function dropdownOptions(children: ReactNode, section?: string): DropdownOption[] {
+  const options: DropdownOption[] = [];
+  Children.forEach(children, (child) => {
+    if (!isValidElement<SelectOptionElementProps>(child)) return;
+    if (child.type === Fragment) {
+      options.push(...dropdownOptions(child.props.children, section));
+      return;
+    }
+    if (child.type === 'optgroup') {
+      options.push(...dropdownOptions(child.props.children, child.props.label ?? section));
+      return;
+    }
+    if (child.type !== 'option') return;
+    const label = optionText(child.props.children) || child.props.label || String(child.props.value ?? '');
+    options.push({
+      value: String(child.props.value ?? label),
+      label,
+      description: child.props.title,
+      disabled: child.props.disabled,
+      section,
+    });
+  });
+  return options;
+}
+
+function normalizedSelectValue(value: SelectHTMLAttributes<HTMLSelectElement>['value']): string {
+  if (Array.isArray(value)) return String(value[0] ?? '');
+  return value == null ? '' : String(value);
+}
+
+type SelectProps = Omit<SelectHTMLAttributes<HTMLSelectElement>, 'multiple' | 'size'> & {
+  variant?: DropdownVariant;
+  menuWidth?: CSSProperties['width'];
+  placeholder?: string;
+  invalid?: string;
+};
+
+/** Native-select-compatible adapter. Dropdown owns every visible selection surface. */
+export function Select({
+  children, value, defaultValue, onChange, disabled, style, title, autoFocus,
+  variant: requestedVariant, menuWidth, placeholder, invalid, ...props
+}: SelectProps) {
+  const fieldLabel = useContext(FieldLabelContext);
+  const controlled = value !== undefined;
+  const [internalValue, setInternalValue] = useState(() => normalizedSelectValue(defaultValue));
+  const options = useMemo(() => dropdownOptions(children), [children]);
+  const selectedValue = controlled ? normalizedSelectValue(value) : internalValue;
+  const variant = requestedVariant ?? (fieldLabel ? 'field' : 'micro');
+  const label = props['aria-label'] ?? title ?? fieldLabel ?? 'Select an option';
+  const {
+    width, minWidth, maxWidth, flex, flexBasis, flexGrow, flexShrink, alignSelf,
+    margin, marginBlock, marginBlockEnd, marginBlockStart, marginBottom, marginInline,
+    marginInlineEnd, marginInlineStart, marginLeft, marginRight, marginTop,
+    ...triggerStyle
+  } = style ?? {};
+  const containerStyle: CSSProperties = {
+    width: width ?? (variant === 'field' ? '100%' : undefined),
+    minWidth, maxWidth, flex, flexBasis, flexGrow, flexShrink, alignSelf,
+    margin, marginBlock, marginBlockEnd, marginBlockStart, marginBottom, marginInline,
+    marginInlineEnd, marginInlineStart, marginLeft, marginRight, marginTop,
+  };
+
+  const emitChange = (nextValue: string) => {
+    if (!controlled) setInternalValue(nextValue);
+    if (!onChange) return;
+    const target = { value: nextValue } as HTMLSelectElement;
+    onChange({ target, currentTarget: target } as ChangeEvent<HTMLSelectElement>);
+  };
+
+  return (
+    <Dropdown
+      value={selectedValue}
+      options={options}
+      onChange={emitChange}
+      variant={variant}
+      label={label}
+      placeholder={placeholder}
+      disabled={disabled}
+      invalid={invalid}
+      menuWidth={menuWidth}
+      containerStyle={containerStyle}
+      triggerStyle={{ ...triggerStyle, width: '100%' }}
+      title={title}
+      autoFocus={autoFocus}
+    />
+  );
 }
 
 export function Button({ variant = 'primary', ...props }: React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: 'primary' | 'ghost' | 'danger' }) {

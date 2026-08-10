@@ -1,9 +1,10 @@
 // Compact project navigation, human attention, and server-authored live presence.
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api, type ApiAgent } from '../api';
 import type { AppStore } from '../store';
 import { PROJECT_NAV_GROUPS, PROJECT_NAV_ITEMS, type ProjectViewId } from '../project-navigation';
 import { AvatarChip, LiveDot } from './bits';
+import { Dropdown } from './Dropdown';
 
 const PINNED_VIEWS: ProjectViewId[] = ['control', 'board', 'plans', 'review'];
 
@@ -60,96 +61,22 @@ function GroupMenu({
   activeView: string;
   onSelect: (id: ProjectViewId) => void;
 }) {
-  const [open, setOpen] = useState(false);
-  const rootRef = useRef<HTMLDivElement>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
   const containsActive = items.some((item) => item.id === activeView);
-
-  useEffect(() => {
-    if (!open) return;
-    const closeOutside = (event: PointerEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
-    };
-    const closeEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setOpen(false);
-    };
-    document.addEventListener('pointerdown', closeOutside);
-    document.addEventListener('keydown', closeEscape);
-    menuRef.current?.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus();
-    return () => {
-      document.removeEventListener('pointerdown', closeOutside);
-      document.removeEventListener('keydown', closeEscape);
-    };
-  }, [open]);
-
   return (
-    <div ref={rootRef} style={{ position: 'relative' }}>
-      <button
-        type="button"
-        aria-haspopup="menu"
-        aria-expanded={open}
-        aria-label={`${label} views`}
-        className="topbar-tab"
-        onClick={() => setOpen((value) => !value)}
-        style={{
-          ...tabStyle(false),
-          ...(containsActive ? { color: 'var(--text)', fontWeight: 650 } : null),
-          ...(open ? { color: 'var(--text)', background: 'var(--w-06)', border: '1px solid var(--w-1)' } : null),
-          gap: 5,
-        }}
-      >
-        {label}
-        <span aria-hidden="true" style={{ fontFamily: 'var(--mono)', fontSize: 8, color: open ? 'var(--text-mid)' : 'var(--text-faint)' }}>
-          {open ? '▴' : '▾'}
-        </span>
-      </button>
-      {open && (
-        <div
-          ref={menuRef}
-          role="menu"
-          aria-label={`${label} views`}
-          onKeyDown={(event) => {
-            const menuItems = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
-            const index = menuItems.indexOf(document.activeElement as HTMLButtonElement);
-            const nextIndex = event.key === 'ArrowDown' ? Math.min(menuItems.length - 1, index + 1)
-              : event.key === 'ArrowUp' ? Math.max(0, index - 1)
-                : event.key === 'Home' ? 0
-                  : event.key === 'End' ? menuItems.length - 1
-                    : -1;
-            if (nextIndex >= 0) {
-              event.preventDefault();
-              menuItems[nextIndex]?.focus();
-            }
-          }}
-          style={{
-            position: 'absolute', zIndex: 70, top: 'calc(100% + 8px)', left: 0, width: 240,
-            padding: 6, border: '1px solid var(--w-12)', borderRadius: 12,
-            background: 'var(--bg-raised)', boxShadow: '0 18px 55px rgba(0,0,0,.5)',
-          }}
-        >
-          {items.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              role="menuitem"
-              aria-current={item.id === activeView ? 'page' : undefined}
-              className="topbar-menu-item"
-              onClick={() => { setOpen(false); onSelect(item.id); }}
-              style={{
-                width: '100%', cursor: 'pointer', display: 'flex', flexDirection: 'column',
-                gap: 1, padding: '7px 8px', borderRadius: 7, textAlign: 'left',
-                background: item.id === activeView ? 'var(--w-08)' : 'transparent',
-              }}
-            >
-              <span style={{ fontSize: 12.5, fontWeight: item.id === activeView ? 650 : 500, color: item.id === activeView ? 'var(--text)' : 'var(--text-soft)' }}>
-                {item.label}
-              </span>
-              <span style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>{item.description}</span>
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
+    <Dropdown
+      value={containsActive ? activeView as ProjectViewId : null}
+      options={items.map((item) => ({ value: item.id, label: item.label, description: item.description }))}
+      onChange={onSelect}
+      variant="inline"
+      label={`${label} views`}
+      displayValue={label}
+      menuWidth={240}
+      triggerStyle={{
+        ...tabStyle(false),
+        ...(containsActive ? { color: 'var(--text)', fontWeight: 650 } : null),
+        gap: 5,
+      }}
+    />
   );
 }
 

@@ -287,13 +287,13 @@ export function Drawer({ store }: { store: AppStore }) {
             <div style={{ marginBottom: 18 }}>
               <TextArea value={eBody} onChange={(e) => setEBody(e.target.value)} style={{ minHeight: 110 }} />
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 10 }}>
-                <Select value={eType} onChange={(e) => setEType(e.target.value)}>
+                <Select aria-label="Task type" value={eType} onChange={(e) => setEType(e.target.value)}>
                   <option value="feature">feature</option>
                   <option value="bug">bug</option>
                   <option value="chore">chore</option>
                   <option value="research">research</option>
                 </Select>
-                <Select value={ePriority} onChange={(e) => setEPriority(Number(e.target.value))}>
+                <Select aria-label="Task priority" value={ePriority} onChange={(e) => setEPriority(Number(e.target.value))}>
                   {/* The "keep" sentinel is -1, OFF the scale (PLNR-231): 0 is now P0, the most
                       urgent value there is, so a 0 sentinel made the top priority unsettable. */}
                   <option value={-1}>priority — keep</option>
@@ -305,7 +305,7 @@ export function Drawer({ store }: { store: AppStore }) {
                 </Select>
               </div>
               <div style={{ marginTop: 10, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-                <Select value={eMilestone} onChange={(e) => setEMilestone(e.target.value)}>
+                <Select aria-label="Task milestone" value={eMilestone} onChange={(e) => setEMilestone(e.target.value)}>
                   <option value="">— no milestone —</option>
                   {(snapshot?.milestones ?? []).map((mm) => (
                     <option key={mm.id} value={mm.id}>{mm.title}</option>
@@ -325,7 +325,7 @@ export function Drawer({ store }: { store: AppStore }) {
               </div>
               {(snapshot?.boards ?? []).length > 1 && (
                 <div style={{ marginTop: 10 }}>
-                  <Select value={eBoard} onChange={(e) => setEBoard(e.target.value)}>
+                  <Select aria-label="Task board" value={eBoard} onChange={(e) => setEBoard(e.target.value)}>
                     {(snapshot?.boards ?? []).map((b) => (
                       <option key={b.id} value={b.id}>board: {b.name}</option>
                     ))}
@@ -476,7 +476,9 @@ export function Drawer({ store }: { store: AppStore }) {
                 })}
                 {addingDep ? (
                   <>
-                    <select
+                    <Select
+                      variant="micro"
+                      aria-label="Add dependency"
                       autoFocus
                       defaultValue=""
                       onChange={async (e) => {
@@ -496,7 +498,7 @@ export function Drawer({ store }: { store: AppStore }) {
                       {eligibleDeps.map((t) => (
                         <option key={t.id} value={t.id}>{t.key} — {t.title.slice(0, 40)}</option>
                       ))}
-                    </select>
+                    </Select>
                     {/* Cross-project dependencies (PLNR-241): any project's task, by display key. */}
                     <input
                       placeholder="or key (any project)"
@@ -617,7 +619,9 @@ export function Drawer({ store }: { store: AppStore }) {
             <SectionLabel>Related docs · {taskDocs.length}</SectionLabel>
             <div style={{ flex: 1 }} />
             {allDocs.some((d) => !taskDocs.some((td) => td.id === d.id)) && (
-              <select
+              <Select
+                variant="micro"
+                aria-label="Link related document"
                 value=""
                 onChange={async (e) => {
                   if (!e.target.value) return;
@@ -630,7 +634,7 @@ export function Drawer({ store }: { store: AppStore }) {
                 {allDocs.filter((d) => !taskDocs.some((td) => td.id === d.id)).map((d) => (
                   <option key={d.id} value={d.id}>{d.name}</option>
                 ))}
-              </select>
+              </Select>
             )}
           </div>
           {taskDocs.length > 0 && (

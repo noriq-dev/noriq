@@ -7,7 +7,7 @@ import {
 import type { AppStore } from '../store';
 import { MonoTag, WaveBars } from './bits';
 import { confirm } from './Dialog';
-import { Button } from './ui';
+import { Button, Select } from './ui';
 import { Markdown } from './Markdown';
 
 const KIND_COLOR: Record<ApiAskSource['kind'], string> = {
@@ -697,7 +697,8 @@ export function AskView({ store }: { store: AppStore }) {
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                 <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>
                   Model
-                  <select
+                  <Select
+                    variant="micro"
                     aria-label="Ask model"
                     value={selectedModel}
                     onChange={(event) => setSelectedModel(event.target.value)}
@@ -705,7 +706,7 @@ export function AskView({ store }: { store: AppStore }) {
                     style={{ maxWidth: 220, background: 'var(--w-04)', border: '1px solid var(--w-1)', borderRadius: 6, color: 'var(--text-dim)', padding: '3px 22px 3px 6px', fontFamily: 'var(--mono)', fontSize: 9.5 }}
                   >
                     {models.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
-                  </select>
+                  </Select>
                 </label>
                 <div style={{ flex: 1 }} />
                 <span style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>Shift+Enter for newline</span>
