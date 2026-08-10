@@ -1,11 +1,10 @@
 import { z } from 'zod';
 import {
-  BackendChangeStats,
   ConfigurationFingerprint,
-  EpisodeStageFact,
-  IntelligenceDurationMs,
-  IntelligenceModelUsageMetric,
+  DAEMON_PROVENANCE,
+  DAEMON_SOURCES,
   ProjectIntelligenceEpisode,
+  UploadedEpisodeIntelligence,
 } from '@noriq-dev/shared';
 
 type ProjectIntelligence = z.infer<typeof ProjectIntelligenceEpisode>;
@@ -15,57 +14,19 @@ type IntelligenceMetric = {
   acceptedAt: string | null;
 };
 
-const DAEMON_PROVENANCE = new Set([
-  'runner_observed',
-  'driver_reported',
-  'backend_observed',
-  'derived',
-  'unavailable',
-]);
-const DAEMON_SOURCES = new Set(['runner', 'driver', 'vcs_backend']);
-
+/**
+ * PLNR-426: the daemon-assertable CONTRACT — the upload shape, and which provenance/source
+ * values a daemon may claim — moved to packages/shared/src/intelligence.ts (DAEMON_PROVENANCE /
+ * DAEMON_SOURCES / UploadedEpisodeIntelligence), so the Runner can validate its own payload
+ * before uploading. What stays here is server POLICY: how an already-validated assertion is
+ * merged into the server's record (mergeUploadedEpisodeIntelligence,
+ * preserveAcceptedEpisodeIntelligence) — and this same daemon-membership test, needed again on
+ * replay by `wasAcceptedDaemonMetric` to decide whether a previously accepted metric is still one
+ * a daemon is allowed to send.
+ */
 function isDaemonObservation(metric: Pick<IntelligenceMetric, 'provenance' | 'source'>): boolean {
   return DAEMON_PROVENANCE.has(metric.provenance) && DAEMON_SOURCES.has(metric.source);
 }
-
-const daemonMetric = <T extends IntelligenceMetric>(schema: z.ZodType<T>) => schema.refine(isDaemonObservation, {
-  message: 'daemon intelligence must carry runner, driver, or VCS-backend provenance',
-});
-
-const UploadedEpisodeStageFact = EpisodeStageFact.extend({
-  elapsedMs: daemonMetric(EpisodeStageFact.shape.elapsedMs),
-  tokens: daemonMetric(EpisodeStageFact.shape.tokens),
-  costUSD: daemonMetric(EpisodeStageFact.shape.costUSD),
-});
-
-const UploadedBackendChangeStats = z.object({
-  backend: BackendChangeStats.shape.backend.optional(),
-  changedFiles: daemonMetric(BackendChangeStats.shape.changedFiles).optional(),
-  additions: daemonMetric(BackendChangeStats.shape.additions).optional(),
-  deletions: daemonMetric(BackendChangeStats.shape.deletions).optional(),
-  churn: daemonMetric(BackendChangeStats.shape.churn).optional(),
-});
-
-/**
- * The only Project Intelligence facts an episode-uploading daemon may assert. Everything else
- * in ProjectIntelligenceEpisode is server-owned and is stripped at this boundary, including
- * identity, source watermarks, algorithm versions, commissioning task/spec/strategy/budget,
- * outcome, executed strategy, and executed spec.
- */
-export const UploadedEpisodeIntelligence = z.object({
-  preExecution: z.object({
-    configuration: z.array(ConfigurationFingerprint).optional(),
-  }).optional(),
-  execution: z.object({
-    observedModelUsage: daemonMetric(IntelligenceModelUsageMetric).optional(),
-    clocks: z.object({
-      verifyDurationMs: daemonMetric(IntelligenceDurationMs).optional(),
-    }).optional(),
-    stages: z.array(UploadedEpisodeStageFact).optional(),
-    changes: UploadedBackendChangeStats.optional(),
-  }).optional(),
-});
-export type UploadedEpisodeIntelligence = z.infer<typeof UploadedEpisodeIntelligence>;
 
 function acceptMetric<T extends IntelligenceMetric>(metric: T, acceptedAt: string | undefined): T {
   return acceptedAt === undefined ? metric : { ...metric, acceptedAt };

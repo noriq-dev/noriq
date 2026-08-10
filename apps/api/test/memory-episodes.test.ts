@@ -89,8 +89,8 @@ const DAEMON_OBSERVED_AT = '2026-08-10T18:00:00.000Z';
 const FORGED_ACCEPTED_AT = '2000-01-01T00:00:00.000Z';
 function daemonMetric<T>(
   value: T,
-  provenance: 'runner_observed' | 'backend_observed' | 'derived' = 'runner_observed',
-  source: 'runner' | 'vcs_backend' = 'runner',
+  provenance: 'runner_observed' | 'backend_observed' | 'derived' | 'driver_reported' = 'runner_observed',
+  source: 'runner' | 'vcs_backend' | 'driver' = 'runner',
 ) {
   return {
     status: 'complete' as const,
@@ -101,6 +101,21 @@ function daemonMetric<T>(
     observedAt: DAEMON_OBSERVED_AT,
     acceptedAt: FORGED_ACCEPTED_AT,
     reason: null,
+  };
+}
+/** RUN-243: a metric can be genuinely unavailable (e.g. a Codex reviewer reports tokens but
+ * never sets cost) while still carrying legitimate daemon provenance — `unavailable` is itself
+ * a MetricProvenance member and DAEMON_PROVENANCE must accept it. */
+function unavailableDaemonMetric(source: 'runner' | 'vcs_backend' | 'driver' = 'driver') {
+  return {
+    status: 'unavailable' as const,
+    value: null,
+    provenance: 'unavailable' as const,
+    source,
+    sourceId: 'daemon-source',
+    observedAt: DAEMON_OBSERVED_AT,
+    acceptedAt: FORGED_ACCEPTED_AT,
+    reason: 'not reported by the daemon',
   };
 }
 
@@ -741,5 +756,83 @@ describe('episode upload ingest — completeEpisodeIngest merges partial enrichm
     const completed = await memory(projectId).completeEpisodeIngest(projectId, scopeId);
     expect(completed.recorded).toBe(0);
     expect(completed.skipped).toBe(4);
+  });
+
+  it('a stage fact with provenance "unavailable" and source "driver" parses and is recorded (RUN-243 regression guard)', async () => {
+    const projectId = await newProject('MEPIING3');
+    const runnerId = 'rnr_epi_ing3';
+    const agentId = 'agt_epi_ing3';
+    await seedRunner(runnerId);
+    await seedAgent(agentId, runnerId, projectId);
+    const run = await room(projectId).createRun(projectId, actor, { kind: 'build', repoRef: 'r', agentTool: 'claude' });
+    await room(projectId).dispatchRun(projectId, actor, run.id, runnerId);
+    await room(projectId).transitionRun(projectId, actor, run.id, { status: 'running', agentId });
+    await room(projectId).transitionRun(projectId, actor, run.id, { status: 'done' });
+
+    const scopeId = `${run.id}_run243`;
+    await memory(projectId).beginEpisodeIngest(projectId, { scopeId, projectId, batchCount: 1 });
+    await memory(projectId).ingestEpisodeBatch(projectId, scopeId, 0, [{
+      runId: run.id,
+      intelligence: {
+        execution: {
+          stages: [{
+            executionId: 'exe_run243', kind: 'stage', role: 'reviewer', stage: 'review',
+            elapsedMs: daemonMetric(4_000, 'driver_reported', 'driver'),
+            tokens: daemonMetric(120, 'driver_reported', 'driver'),
+            // Exactly the RUN-243 shape: a Codex reviewer reports tokens/elapsed but never sets
+            // cost, so the cost metric is genuinely unavailable — this must still be accepted.
+            costUSD: unavailableDaemonMetric('driver'),
+          }],
+        },
+      },
+    }]);
+    const completed = await memory(projectId).completeEpisodeIngest(projectId, scopeId);
+    expect(completed).toMatchObject({ recorded: 1, skipped: 0 });
+
+    const episode = await memory(projectId)._getEpisodeForTest(projectId, run.id);
+    const stage = (episode!.intelligence as any).execution.stages[0];
+    expect(stage.costUSD).toMatchObject({ status: 'unavailable', value: null, provenance: 'unavailable', source: 'driver' });
+    expect(stage.elapsedMs).toMatchObject({ status: 'complete', value: 4_000, provenance: 'driver_reported' });
+  });
+
+  it('a single bad metric discards the whole row, including its otherwise-valid deterministic fields — the pinned PLNR-426 blast radius', async () => {
+    const projectId = await newProject('MEPIING4');
+    const runnerId = 'rnr_epi_ing4';
+    const agentId = 'agt_epi_ing4';
+    await seedRunner(runnerId);
+    await seedAgent(agentId, runnerId, projectId);
+    const run = await room(projectId).createRun(projectId, actor, { kind: 'build', repoRef: 'r', agentTool: 'claude' });
+    await room(projectId).dispatchRun(projectId, actor, run.id, runnerId);
+    await room(projectId).transitionRun(projectId, actor, run.id, { status: 'running', agentId });
+    await room(projectId).transitionRun(projectId, actor, run.id, { status: 'done' });
+
+    const scopeId = `${run.id}_blast`;
+    await memory(projectId).beginEpisodeIngest(projectId, { scopeId, projectId, batchCount: 1 });
+    await memory(projectId).ingestEpisodeBatch(projectId, scopeId, 0, [{
+      runId: run.id,
+      // Otherwise entirely valid daemon-owned deterministic fields...
+      filesTouched: ['src/would-have-recorded.ts'],
+      commands: ['npm test'],
+      findings: [{ summary: 'this finding is discarded along with the rest of the row' }],
+      intelligence: {
+        // ...sunk by ONE metric asserting provenance a daemon may not claim. See the decision
+        // comment in ProjectMemory.ts#completeEpisodeIngest: this is a deliberate PLNR-426
+        // choice, not an oversight — the whole row is discarded rather than salvaging the
+        // deterministic half.
+        execution: {
+          observedModelUsage: {
+            ...daemonMetric({ 'test-model': { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.1 } }),
+            provenance: 'server_observed',
+            source: 'd1_coordination',
+          },
+        },
+      },
+    }]);
+    const completed = await memory(projectId).completeEpisodeIngest(projectId, scopeId);
+    expect(completed).toMatchObject({ recorded: 0, skipped: 1 });
+
+    const episode = await memory(projectId)._getEpisodeForTest(projectId, run.id);
+    expect(episode?.filesTouched ?? []).not.toContain('src/would-have-recorded.ts');
+    expect(episode?.commands ?? []).not.toContain('npm test');
   });
 });

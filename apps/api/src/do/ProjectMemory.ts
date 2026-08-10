@@ -6,6 +6,7 @@ import {
   EffortEpisode, EpisodeSelfSummary, type EffortEpisode as EffortEpisodeData,
   ProjectIntelligenceEpisode,
   ProjectQualityEvent,
+  UploadedEpisodeIntelligence, type UploadedEpisodeIntelligence as UploadedEpisodeIntelligenceData,
   evidenceHash, type EpisodeLandingOutcome, type MemoryBackupManifest,
 } from '@noriq-dev/shared';
 import { projectCoordinationEvents, type ProjectedEvent } from '../lib/memory-projector';
@@ -59,10 +60,8 @@ import {
 import { EpisodeSkeletonUnavailableError, loadEpisodeSkeleton } from '../memory/episodes';
 import type { EpisodeIntelligenceDraft } from '../lib/run-sitting-intelligence';
 import {
-  UploadedEpisodeIntelligence,
   mergeUploadedEpisodeIntelligence,
   preserveAcceptedEpisodeIntelligence,
-  type UploadedEpisodeIntelligence as UploadedEpisodeIntelligenceData,
 } from '../memory/episode-intelligence';
 import { normalizeAnalyticsEpisode } from '../memory/analytics-normalize';
 import {
@@ -2977,6 +2976,20 @@ export class ProjectMemory extends DurableObject<Env> {
     let recorded = 0;
     let skipped = 0;
     for (const row of state.rows) {
+      // PLNR-426 decision: ONE bad metric anywhere in `intelligence` (e.g. a provenance/source
+      // value outside DAEMON_PROVENANCE/DAEMON_SOURCES) still fails `daemonMetric`'s refine and
+      // discards the WHOLE row here, including its otherwise-valid deterministic fields
+      // (filesTouched/commands/findings/etc). We keep that blast radius rather than splitting it
+      // to per-metric skip-and-diagnose, for two reasons: (1) the actual fix for the incident
+      // this task follows up on is upstream of here — the contract this row is checked against
+      // is now shared (packages/shared/src/intelligence.ts), so a Runner can safeParse its own
+      // payload and catch a bad enum value before it is ever uploaded, making a malformed row
+      // rare rather than routine; (2) softening this boundary would mean partially trusting a
+      // daemon payload we already know disagrees with the contract in some field, which is a
+      // POLICY question (how much to trust a partially-wrong daemon) deliberately left for
+      // whoever owns the ingest to revisit with real incident data, not a byproduct of a pure
+      // relocation task. See memory-episodes.test.ts's "one bad metric among otherwise-good
+      // fields still discards the whole row" case for the pinned behavior.
       const parsed = UPLOADED_EPISODE_SHAPE.safeParse(row);
       if (!parsed.success) {
         console.warn(`ProjectMemory episode-ingest(${scopeId}): skipping malformed uploaded row: ${parsed.error.issues[0]?.message ?? 'invalid'}`);
