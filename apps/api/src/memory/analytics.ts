@@ -6,11 +6,13 @@ import type { Env } from '../env';
 import {
   AnalyticsGenerationDescriptor,
   ProjectAnalyticsHealth,
+  ProjectQualityEvent,
   type AnalyticsGenerationDescriptor as AnalyticsGenerationDescriptorData,
   type ProjectAnalyticsHealth as ProjectAnalyticsHealthData,
+  type ProjectQualityEvent as ProjectQualityEventData,
 } from '@noriq-dev/shared';
 
-export const ANALYTICS_EXTRACTION_VERSION = 'project-intelligence-v2';
+export const ANALYTICS_EXTRACTION_VERSION = 'project-intelligence-v3';
 const SNAPSHOT_PAGE_SIZE = 200;
 const RETRY_BASE_MS = 60_000;
 const RETRY_MAX_MS = 24 * 60 * 60 * 1_000;
@@ -87,6 +89,8 @@ export type AnalyticsSnapshotRow =
   | { sourceKind: 'execution_node'; sourceKey: string; body: AnalyticsExecutionNodeSnapshot }
   | { sourceKind: 'execution_event'; sourceKey: string; body: AnalyticsExecutionEventSnapshot };
 
+export type AnalyticsQualityEventSnapshot = ProjectQualityEventData;
+
 type AnalyticsMemoryRpc = {
   beginAnalyticsGeneration(projectId: string, input: {
     extractionVersion: string;
@@ -95,6 +99,7 @@ type AnalyticsMemoryRpc = {
     force: boolean;
   }): Promise<{ generationId: string; unchanged: boolean }>;
   ingestAnalyticsSnapshot(projectId: string, generationId: string, rows: AnalyticsSnapshotRow[]): Promise<{ accepted: number }>;
+  ingestAnalyticsQualityEvents(projectId: string, generationId: string, rows: AnalyticsQualityEventSnapshot[]): Promise<{ accepted: number }>;
   completeAnalyticsGeneration(projectId: string, generationId: string): Promise<{
     generationId: string; rowCount: number; checksum: string; activated: boolean;
   }>;
@@ -122,7 +127,7 @@ type StoredAnalyticsHealth = {
   latestFailure: StoredGeneration | null;
   lastSuccessfulIncrementalAt: string | null;
   lastSuccessfulFullRebuildAt: string | null;
-  counts: { episodes: number; generations: number; rows: number; snapshotRows: number };
+  counts: { episodes: number; generations: number; rows: number; snapshotRows: number; qualityRows: number };
 };
 
 const memory = (env: Env, projectId: string): AnalyticsMemoryRpc =>
@@ -321,7 +326,7 @@ function descriptor(projectId: string, row: StoredGeneration | null): AnalyticsG
  * current D1/orchestration cursors and the durable retry job, then classifies staleness without
  * mutating either authority. */
 export async function getProjectAnalyticsHealth(env: Env, projectId: string): Promise<ProjectAnalyticsHealthData> {
-  const [stored, current, job, commissioning] = await Promise.all([
+  const [stored, current, job, commissioning, qualityEvents] = await Promise.all([
     memory(env, projectId).analyticsGenerationHealth(projectId),
     analyticsSourceWatermarks(env, projectId),
     env.DB.prepare(
@@ -333,6 +338,8 @@ export async function getProjectAnalyticsHealth(env: Env, projectId: string): Pr
       lastAttemptAt: string | null; nextRetryAt: string | null;
     }>(),
     env.DB.prepare('SELECT COUNT(*) AS n FROM run_sitting_intelligence WHERE project_id = ?')
+      .bind(projectId).first<{ n: number }>(),
+    env.DB.prepare('SELECT COUNT(*) AS n FROM project_quality_events WHERE project_id = ?')
       .bind(projectId).first<{ n: number }>(),
   ]);
   const capturedAt = new Date().toISOString();
@@ -390,14 +397,16 @@ export async function getProjectAnalyticsHealth(env: Env, projectId: string): Pr
       lastError: job?.lastError ?? null,
     },
     storage: {
-      canonicalRetainedRows: stored.counts.episodes + (commissioning?.n ?? 0),
-      disposableDerivedRows: stored.counts.generations + stored.counts.rows + stored.counts.snapshotRows,
+      canonicalRetainedRows: stored.counts.episodes + (commissioning?.n ?? 0) + (qualityEvents?.n ?? 0),
+      disposableDerivedRows: stored.counts.generations + stored.counts.rows + stored.counts.snapshotRows + stored.counts.qualityRows,
       byKind: {
         episodes: stored.counts.episodes,
         commissioningFacts: commissioning?.n ?? 0,
+        qualityEvents: qualityEvents?.n ?? 0,
         analyticsGenerations: stored.counts.generations,
         analyticsRows: stored.counts.rows,
         analyticsSnapshotRows: stored.counts.snapshotRows,
+        analyticsQualityEventRows: stored.counts.qualityRows,
       },
     },
   });
@@ -456,6 +465,41 @@ export async function rebuildProjectAnalytics(
       await stub.ingestAnalyticsSnapshot(projectId, begun.generationId, results.map((body) => ({
         sourceKind: 'execution_event' as const, sourceKey: body.eventId, body,
       })));
+      offset += results.length;
+      if (results.length < limit) break;
+    }
+
+    offset = 0;
+    for (;;) {
+      const { results } = await env.DB.prepare(
+        `SELECT id, operation_key AS operationKey, event_type AS type, task_id AS taskId,
+                related_task_id AS relatedTaskId, run_id AS runId, sitting,
+                orchestration_id AS orchestrationId, execution_id AS executionId,
+                artifact_ref AS artifactRef, source_kind AS sourceKind,
+                source_event_id AS sourceEventId, source_event_seq AS sourceEventSequence,
+                actor_kind AS actorKind, actor_id AS actorId, observed_at AS observedAt, provenance
+           FROM project_quality_events WHERE project_id = ? ORDER BY observed_at, id LIMIT ? OFFSET ?`,
+      ).bind(projectId, limit, offset).all<{
+        id: string; operationKey: string; type: ProjectQualityEventData['type']; taskId: string;
+        relatedTaskId: string | null; runId: string | null; sitting: number | null;
+        orchestrationId: string | null; executionId: string | null; artifactRef: string | null;
+        sourceKind: ProjectQualityEventData['source']['kind']; sourceEventId: string | null;
+        sourceEventSequence: number | null; actorKind: ProjectQualityEventData['actor']['kind'];
+        actorId: string; observedAt: string; provenance: string;
+      }>();
+      if (!results.length) break;
+      await stub.ingestAnalyticsQualityEvents(projectId, begun.generationId, results.map((row) =>
+        ProjectQualityEvent.parse({
+          schemaVersion: 1, id: row.id, operationKey: row.operationKey, projectId,
+          type: row.type, taskId: row.taskId, relatedTaskId: row.relatedTaskId,
+          runId: row.runId, sitting: row.sitting, episodeId: null,
+          orchestrationId: row.orchestrationId, executionId: row.executionId,
+          artifactRef: row.artifactRef,
+          source: { kind: row.sourceKind, eventId: row.sourceEventId, eventSequence: row.sourceEventSequence },
+          actor: { kind: row.actorKind, id: row.actorId }, observedAt: row.observedAt,
+          provenance: JSON.parse(row.provenance || '{}'),
+        }),
+      ));
       offset += results.length;
       if (results.length < limit) break;
     }

@@ -5,6 +5,7 @@ import {
   buildEntityUri, parseEntityUri, AUTHORITY_HYPOTHESIS, AUTHORITY_HUMAN_APPROVED, AUTHORITY_VERIFIED_MERGED,
   EffortEpisode, EpisodeSelfSummary, type EffortEpisode as EffortEpisodeData,
   ProjectIntelligenceEpisode,
+  ProjectQualityEvent,
   evidenceHash, type EpisodeLandingOutcome, type MemoryBackupManifest,
 } from '@noriq-dev/shared';
 import { projectCoordinationEvents, type ProjectedEvent } from '../lib/memory-projector';
@@ -50,6 +51,7 @@ import {
   requestProjectAnalyticsRebuild,
   type AnalyticsExecutionEventSnapshot,
   type AnalyticsExecutionNodeSnapshot,
+  type AnalyticsQualityEventSnapshot,
   type AnalyticsSnapshotRow,
 } from '../memory/analytics';
 import {
@@ -634,6 +636,7 @@ export class ProjectMemory extends DurableObject<Env> {
    * newly active episodes and D1 watermarks; retaining them would make a successful restore
    * publish read rows from the pre-restore world. Caller owns transaction boundaries. */
   private clearAnalyticsDerived(): void {
+    this.ctx.storage.sql.exec(`DELETE FROM analytics_quality_event_rows`);
     this.ctx.storage.sql.exec(`DELETE FROM analytics_rows`);
     this.ctx.storage.sql.exec(`DELETE FROM analytics_snapshot_rows`);
     this.ctx.storage.sql.exec(`UPDATE analytics_active_generation SET generation_id = NULL WHERE id = 0`);
@@ -1726,6 +1729,44 @@ export class ProjectMemory extends DurableObject<Env> {
     return { accepted: rows.length };
   }
 
+  async ingestAnalyticsQualityEvents(
+    projectId: string,
+    generationId: string,
+    rows: AnalyticsQualityEventSnapshot[],
+  ): Promise<{ accepted: number }> {
+    await this.assertProjectId(projectId);
+    if (rows.length > 500) throw new Error('analytics quality-event page exceeds 500 rows');
+    const generation = this.ctx.storage.sql.exec<{ status: string }>(
+      `SELECT status FROM analytics_generations WHERE id = ?1`, generationId,
+    ).toArray()[0];
+    if (!generation || generation.status !== 'building') throw new Error(`analytics generation ${generationId} is not building`);
+    const prepared = await Promise.all(rows.map(async (candidate) => {
+      const linkedEpisode = candidate.runId && candidate.sitting ? this.ctx.storage.sql.exec<{ id: string }>(
+        `SELECT id FROM episodes WHERE run_id = ?1 AND sitting = ?2`, candidate.runId, candidate.sitting,
+      ).toArray()[0] : null;
+      const row = ProjectQualityEvent.parse({ ...candidate, episodeId: linkedEpisode?.id ?? null });
+      if (row.projectId !== projectId) throw new Error('analytics quality event belongs to another project');
+      const body = JSON.stringify(row);
+      const bytes = new TextEncoder().encode(body);
+      if (bytes.byteLength > 65_536) throw new Error('analytics quality event exceeds 64 KiB');
+      return { row, body, checksum: await sha256HexBytes(bytes) };
+    }));
+    this.ctx.storage.transactionSync(() => {
+      for (const { row, body, checksum } of prepared) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO analytics_quality_event_rows
+             (generation_id, event_id, run_id, sitting, body, row_checksum)
+           VALUES (?1,?2,?3,?4,?5,?6)
+           ON CONFLICT (generation_id, event_id) DO UPDATE SET
+             run_id = excluded.run_id, sitting = excluded.sitting,
+             body = excluded.body, row_checksum = excluded.row_checksum`,
+          generationId, row.id, row.runId, row.sitting, body, checksum,
+        );
+      }
+    });
+    return { accepted: rows.length };
+  }
+
   async completeAnalyticsGeneration(projectId: string, generationId: string): Promise<{
     generationId: string; rowCount: number; checksum: string; activated: boolean;
   }> {
@@ -1858,6 +1899,13 @@ export class ProjectMemory extends DurableObject<Env> {
     if (canonicalCount !== rowCount || derivedCount !== rowCount) {
       throw new Error(`analytics validation count mismatch: canonical=${canonicalCount}, normalized=${rowCount}, stored=${derivedCount}`);
     }
+    const qualityRows = this.ctx.storage.sql.exec<{ row_checksum: string }>(
+      `SELECT row_checksum FROM analytics_quality_event_rows
+        WHERE generation_id = ?1 ORDER BY event_id`, generationId,
+    ).toArray();
+    for (const row of qualityRows) {
+      rollingChecksum = await sha256HexBytes(new TextEncoder().encode(`${rollingChecksum}:quality:${row.row_checksum}`));
+    }
     const completedAt = nowIso();
     const completeness = JSON.stringify({
       status: completenessReasons.size ? 'partial' : 'complete', reasons: [...completenessReasons].sort(),
@@ -1904,7 +1952,7 @@ export class ProjectMemory extends DurableObject<Env> {
     latestFailure: AnalyticsHealthGenerationRow | null;
     lastSuccessfulIncrementalAt: string | null;
     lastSuccessfulFullRebuildAt: string | null;
-    counts: { episodes: number; generations: number; rows: number; snapshotRows: number };
+    counts: { episodes: number; generations: number; rows: number; snapshotRows: number; qualityRows: number };
   }> {
     await this.assertProjectId(projectId);
     const select = `SELECT id, status, extraction_version AS extractionVersion,
@@ -1929,6 +1977,7 @@ export class ProjectMemory extends DurableObject<Env> {
       counts: {
         episodes: count('episodes'), generations: count('analytics_generations'),
         rows: count('analytics_rows'), snapshotRows: count('analytics_snapshot_rows'),
+        qualityRows: count('analytics_quality_event_rows'),
       },
     };
   }
@@ -1961,10 +2010,17 @@ export class ProjectMemory extends DurableObject<Env> {
     let completeness: unknown = { status: 'unknown', reasons: ['malformed_generation_completeness'] };
     try { completeness = JSON.parse(generation.completeness); } catch { /* explicit unknown above */ }
     const rows = stored.slice(0, HISTORICAL_ANALYTICS_MAX_ROWS);
+    const storedQuality = this.ctx.storage.sql.exec<{ body: string }>(
+      `SELECT body FROM analytics_quality_event_rows WHERE generation_id = ?1
+        ORDER BY event_id LIMIT ?2`, generation.id, HISTORICAL_ANALYTICS_MAX_ROWS + 1,
+    ).toArray();
+    const qualityRows = storedQuality.slice(0, HISTORICAL_ANALYTICS_MAX_ROWS);
     return aggregateHistoricalAnalytics({
       episodes: rows.map((row) => ProjectIntelligenceEpisode.parse(JSON.parse(row.normalized))),
+      qualityEvents: qualityRows.map((row) => ProjectQualityEvent.parse(JSON.parse(row.body))),
       scannedRows: rows.length,
       truncated: stored.length > HISTORICAL_ANALYTICS_MAX_ROWS,
+      qualityEventsTruncated: storedQuality.length > HISTORICAL_ANALYTICS_MAX_ROWS,
       query,
       generation: {
         id: generation.id,

@@ -1357,6 +1357,39 @@ app.get('/api/projects/:pid/memory/analytics/health', userAuth, async (c) => {
   return c.json(await getProjectAnalyticsHealth(c.env, pid));
 });
 
+const QualityEventBody = z.discriminatedUnion('type', [
+  z.object({
+    operationKey: z.string().min(1).max(200), type: z.literal('work_reverted'),
+    taskId: z.string().min(1), runId: z.string().min(1).nullable().optional(),
+    sitting: z.number().int().positive().nullable().optional(), artifactRef: z.string().min(1).max(1_000),
+    observedAt: z.string().datetime().optional(), provenance: z.record(z.string(), z.unknown()).optional(),
+  }).strict(),
+  z.object({
+    operationKey: z.string().min(1).max(200), type: z.literal('regression_task_linked'),
+    taskId: z.string().min(1), relatedTaskId: z.string().min(1),
+    runId: z.string().min(1).nullable().optional(), sitting: z.number().int().positive().nullable().optional(),
+    observedAt: z.string().datetime().optional(), provenance: z.record(z.string(), z.unknown()).optional(),
+  }).strict(),
+]).superRefine((value, ctx) => {
+  if ((value.runId == null) !== (value.sitting == null)) {
+    ctx.addIssue({ code: 'custom', message: 'runId and sitting must be supplied together' });
+  }
+});
+
+// PLNR-297: explicit evidence only. task_reopened is derived server-side from a deliberate
+// done -> active transition and is intentionally not accepted as caller-asserted input.
+app.post('/api/projects/:pid/memory/quality-events', userAuth, async (c) => {
+  const parsed = QualityEventBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid quality event', detail: parsed.error.issues }, 400);
+  try {
+    return c.json(await room(c.env, c.req.param('pid')!).recordQualityEvent(
+      c.req.param('pid')!, humanActor(c), parsed.data,
+    ));
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+  }
+});
+
 const HistoricalAnalyticsDimensionBody = z.enum([
   'project', 'plan', 'plan_dispatch', 'orchestration', 'task', 'run', 'sitting',
   'commissioned_workflow', 'executed_workflow', 'configuration', 'stage', 'role',
@@ -1368,6 +1401,7 @@ const HistoricalAnalyticsQueryBody = z.object({
   filters: z.array(z.object({ dimension: HistoricalAnalyticsDimensionBody, value: z.string().min(1) })).max(8).optional(),
   caseCursor: z.string().min(1).optional(),
   caseLimit: z.number().int().min(1).max(100).optional(),
+  qualityHorizonDays: z.number().int().min(1).max(3650).optional(),
 }).strict();
 
 // PLNR-294: frozen historical facts and live coordination state remain separate endpoints and

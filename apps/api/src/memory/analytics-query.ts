@@ -1,6 +1,7 @@
 import type {
   MetricCompleteness,
   ProjectIntelligenceEpisode,
+  ProjectQualityEvent,
   IntelligenceDurationMs,
   IntelligenceIntegerMetric,
   IntelligenceNumberMetric,
@@ -11,6 +12,7 @@ export const HISTORICAL_ANALYTICS_MAX_ROWS = 5_000;
 export const HISTORICAL_ANALYTICS_MAX_RANGE_MS = 366 * 24 * 60 * 60 * 1_000;
 export const HISTORICAL_ANALYTICS_DEFAULT_RANGE_MS = 30 * 24 * 60 * 60 * 1_000;
 export const HISTORICAL_ANALYTICS_MAX_CASES = 100;
+export const HISTORICAL_ANALYTICS_DEFAULT_QUALITY_HORIZON_DAYS = 30;
 
 export type HistoricalAnalyticsDimension =
   | 'project' | 'plan' | 'plan_dispatch' | 'orchestration' | 'task' | 'run' | 'sitting'
@@ -23,6 +25,7 @@ export interface HistoricalAnalyticsQuery {
   filters?: Array<{ dimension: HistoricalAnalyticsDimension; value: string }>;
   caseCursor?: string;
   caseLimit?: number;
+  qualityHorizonDays?: number;
 }
 
 export interface AnalyticsMetricSummary {
@@ -76,7 +79,17 @@ export interface AnalyticsAggregateGroup {
     failed: AnalyticsRate;
     cancelled: AnalyticsRate;
     landed: AnalyticsRate;
-    laterInstability: { status: 'unavailable'; count: null; denominator: number; reason: string };
+    laterInstability: {
+      status: 'unavailable' | 'partial' | 'complete';
+      count: number | null;
+      eventCount: number;
+      denominator: number;
+      rate: number | null;
+      horizonDays: number;
+      observedThrough: string;
+      eventTypeCounts: Record<ProjectQualityEvent['type'], number>;
+      reason: string | null;
+    };
   };
   composition: {
     stages: AnalyticsCompositionEntry[];
@@ -105,7 +118,10 @@ export interface HistoricalAnalyticsResult {
     completeness: unknown;
   };
   filter: { from: string; to: string; groupBy: HistoricalAnalyticsDimension | null; filters: Array<{ dimension: HistoricalAnalyticsDimension; value: string }> };
-  coverage: { complete: boolean; scannedRows: number; matchedSittings: number; reasons: string[] };
+  coverage: {
+    complete: boolean; scannedRows: number; matchedSittings: number; reasons: string[];
+    qualityEventsScanned: number; unassociatedQualityEvents: number;
+  };
   groups: AnalyticsAggregateGroup[];
   cases: { items: AnalyticsCaseRef[]; nextCursor: string | null; total: number };
 }
@@ -275,6 +291,9 @@ function aggregateGroup(
   value: string,
   episodes: ProjectIntelligenceEpisode[],
   generation: HistoricalAnalyticsResult['generation'],
+  qualityEvents: ProjectQualityEvent[],
+  qualityHorizonDays: number,
+  qualityEventsTruncated: boolean,
 ): AnalyticsAggregateGroup {
   const accumulators = Object.fromEntries([
     'queueDurationMs', 'dispatchToStartMs', 'elapsedExecutionMs', 'parkedMs', 'verifyDurationMs',
@@ -318,6 +337,31 @@ function aggregateGroup(
   const refs = episodes.map(caseRef);
   const first = episodes.map((episode) => episode.sources.capturedAt).sort()[0] ?? null;
   const last = episodes.map((episode) => episode.sources.capturedAt).sort().at(-1) ?? null;
+  const horizonMs = qualityHorizonDays * 24 * 60 * 60 * 1_000;
+  const observedThroughMs = Date.parse(generation.completedAt);
+  const mature = episodes.filter((episode) => Date.parse(episode.sources.capturedAt) + horizonMs <= observedThroughMs);
+  const matureKeys = new Map(mature.map((episode) => [
+    `${episode.identity.runId}/${episode.identity.sitting}`, episode,
+  ]));
+  const relevantQuality = qualityEvents.filter((event) => {
+    if (!event.runId || !event.sitting) return false;
+    const episode = matureKeys.get(`${event.runId}/${event.sitting}`);
+    if (!episode) return false;
+    const observed = Date.parse(event.observedAt);
+    const captured = Date.parse(episode.sources.capturedAt);
+    return observed >= captured && observed <= captured + horizonMs && observed <= observedThroughMs;
+  });
+  const affectedSittings = new Set(relevantQuality.map((event) => `${event.runId}/${event.sitting}`)).size;
+  const qualityReasons: string[] = [];
+  if (qualityEventsTruncated) qualityReasons.push('quality-event scan budget exceeded');
+  if (mature.length < episodes.length) qualityReasons.push(`${episodes.length - mature.length} sitting(s) have not completed the quality horizon`);
+  const qualityStatus = mature.length === 0
+    ? 'unavailable' as const
+    : qualityReasons.length ? 'partial' as const : 'complete' as const;
+  const eventTypeCounts: Record<ProjectQualityEvent['type'], number> = {
+    task_reopened: 0, work_reverted: 0, regression_task_linked: 0,
+  };
+  for (const event of relevantQuality) eventTypeCounts[event.type]++;
   return {
     dimension,
     value,
@@ -332,7 +376,18 @@ function aggregateGroup(
       failed: rate(episodes.filter((episode) => episode.outcome.runOutcome === 'failed').length, episodes.length),
       cancelled: rate(episodes.filter((episode) => episode.outcome.runOutcome === 'cancelled').length, episodes.length),
       landed: rate(episodes.filter((episode) => episode.outcome.landingOutcome === 'landed').length, episodes.length),
-      laterInstability: { status: 'unavailable', count: null, denominator: episodes.length, reason: 'quality-event extraction is not available yet' },
+      laterInstability: {
+        status: qualityStatus,
+        count: mature.length ? affectedSittings : null,
+        eventCount: relevantQuality.length,
+        denominator: mature.length,
+        rate: mature.length ? affectedSittings / mature.length : null,
+        horizonDays: qualityHorizonDays,
+        observedThrough: generation.completedAt,
+        eventTypeCounts,
+        reason: qualityStatus === 'complete' ? null
+          : qualityReasons.join('; ') || 'no sitting has completed the configured quality horizon',
+      },
     },
     composition: {
       stages,
@@ -363,13 +418,19 @@ export function validateHistoricalAnalyticsQuery(input: HistoricalAnalyticsQuery
   if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || fromMs > toMs) throw new Error('analytics time range is invalid');
   if (toMs - fromMs > HISTORICAL_ANALYTICS_MAX_RANGE_MS) throw new Error('analytics time range exceeds 366 days');
   if ((input.filters?.length ?? 0) > 8) throw new Error('analytics query supports at most 8 filters');
+  if (input.qualityHorizonDays != null
+    && (!Number.isInteger(input.qualityHorizonDays) || input.qualityHorizonDays < 1 || input.qualityHorizonDays > 3650)) {
+    throw new Error('analytics quality horizon must be an integer from 1 to 3650 days');
+  }
   return { ...input, from, to };
 }
 
 export function aggregateHistoricalAnalytics(input: {
   episodes: ProjectIntelligenceEpisode[];
+  qualityEvents?: ProjectQualityEvent[];
   scannedRows: number;
   truncated: boolean;
+  qualityEventsTruncated?: boolean;
   query: HistoricalAnalyticsQuery;
   generation: HistoricalAnalyticsResult['generation'];
   observedAt?: string;
@@ -378,6 +439,8 @@ export function aggregateHistoricalAnalytics(input: {
   const fromMs = Date.parse(query.from);
   const toMs = Date.parse(query.to);
   const filters = query.filters ?? [];
+  const qualityHorizonDays = query.qualityHorizonDays ?? HISTORICAL_ANALYTICS_DEFAULT_QUALITY_HORIZON_DAYS;
+  const qualityEvents = input.qualityEvents ?? [];
   const matched = input.episodes.filter((episode) => {
     const captured = Date.parse(episode.sources.capturedAt);
     return captured >= fromMs && captured <= toMs
@@ -399,14 +462,24 @@ export function aggregateHistoricalAnalytics(input: {
   const start = cursorIndex >= 0 ? cursorIndex + 1 : 0;
   const limit = Math.max(1, Math.min(query.caseLimit ?? 50, HISTORICAL_ANALYTICS_MAX_CASES));
   const items = refs.slice(start, start + limit);
+  const unassociatedQualityEvents = qualityEvents.filter((event) => !event.runId || !event.sitting).length;
   const reasons = input.truncated ? [`active generation exceeds the ${HISTORICAL_ANALYTICS_MAX_ROWS}-row query scan budget`] : [];
+  if (input.qualityEventsTruncated) reasons.push(`active generation quality events exceed the ${HISTORICAL_ANALYTICS_MAX_ROWS}-row query scan budget`);
+  if (unassociatedQualityEvents) reasons.push(`${unassociatedQualityEvents} quality event(s) lack run/sitting lineage and are excluded from episode rates`);
   return {
     observedAt: input.observedAt ?? new Date().toISOString(),
     generation: input.generation,
     filter: { from: query.from, to: query.to, groupBy: query.groupBy ?? null, filters },
-    coverage: { complete: !input.truncated, scannedRows: input.scannedRows, matchedSittings: matched.length, reasons },
+    coverage: {
+      complete: !input.truncated && !input.qualityEventsTruncated && unassociatedQualityEvents === 0,
+      scannedRows: input.scannedRows, matchedSittings: matched.length, reasons,
+      qualityEventsScanned: qualityEvents.length, unassociatedQualityEvents,
+    },
     groups: [...groups.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([value, episodes]) =>
-      aggregateGroup(query.groupBy ?? 'all', value, episodes, input.generation)),
+      aggregateGroup(
+        query.groupBy ?? 'all', value, episodes, input.generation, qualityEvents,
+        qualityHorizonDays, input.qualityEventsTruncated === true,
+      )),
     cases: { items, nextCursor: start + items.length < refs.length ? items.at(-1)?.episodeId ?? null : null, total: refs.length },
   };
 }

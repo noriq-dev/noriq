@@ -1,6 +1,6 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../env';
-import { newId, nowIso } from '../lib/util';
+import { newId, nowIso, sha256Hex } from '../lib/util';
 import { userCanAccessProject } from '../lib/visibility';
 import { projectRoleAllows, resolveProjectAccess } from '../lib/authorization';
 import { advertisedWorkflowNames } from '../lib/workflows';
@@ -137,6 +137,25 @@ export type CreatedTask = { id: string; key: string; status?: 'proposed'; execut
 /** What an update returns. `executionSpec` present iff the patch mentioned it; null = cleared. */
 export type UpdatedTask = { ok: true; key: string; executionSpec?: ExecutionSpec | null };
 
+export interface RecordQualityEventInput {
+  operationKey: string;
+  type: 'work_reverted' | 'regression_task_linked';
+  taskId: string;
+  relatedTaskId?: string | null;
+  runId?: string | null;
+  sitting?: number | null;
+  artifactRef?: string | null;
+  observedAt?: string;
+  provenance?: Record<string, unknown>;
+}
+
+export interface RecordedQualityEvent {
+  id: string;
+  operationKey: string;
+  type: 'task_reopened' | 'work_reverted' | 'regression_task_linked';
+  deduped: boolean;
+}
+
 /**
  * A one-line description of a stored spec, for the change event (RUN-162).
  *
@@ -171,6 +190,7 @@ type TaskRow = {
   failed_at: string | null;
   proposed_at: string | null;
   title: string;
+  updated_at: string;
 };
 
 // A task is claimable when it's a fresh `todo`, or an `in_progress` whose claim has lapsed
@@ -471,6 +491,113 @@ export class ProjectRoom extends DurableObject<Env> {
     };
     void this.broadcast(JSON.stringify({ type: 'event', event }));
     return event;
+  }
+
+  /** Canonical downstream-quality writer. Same operation key plus the same canonical payload is
+   * a no-op; reusing a key for different evidence is rejected. No application path updates rows. */
+  private async recordQualityEventLocked(
+    actor: Actor,
+    input: {
+      operationKey: string;
+      type: 'task_reopened' | 'work_reverted' | 'regression_task_linked';
+      taskId: string;
+      relatedTaskId: string | null;
+      runId: string | null;
+      sitting: number | null;
+      artifactRef: string | null;
+      observedAt: string;
+      provenance: Record<string, unknown>;
+    },
+  ): Promise<RecordedQualityEvent> {
+    if (!input.operationKey.trim()) throw new Error('quality event operationKey is required');
+    if (!Number.isFinite(Date.parse(input.observedAt))) throw new Error('quality event observedAt is invalid');
+    if ((input.runId == null) !== (input.sitting == null)) throw new Error('quality event runId and sitting must be supplied together');
+    if (input.sitting != null && (!Number.isInteger(input.sitting) || input.sitting < 1)) throw new Error('quality event sitting must be a positive integer');
+    if (input.type === 'work_reverted' && !input.artifactRef?.trim()) throw new Error('work_reverted requires an explicit artifactRef');
+    if (input.type !== 'work_reverted' && input.artifactRef != null) throw new Error(`${input.type} does not accept artifactRef`);
+    if (input.type === 'regression_task_linked' && !input.relatedTaskId) throw new Error('regression_task_linked requires an explicit relatedTaskId');
+    if (input.type !== 'regression_task_linked' && input.relatedTaskId != null) throw new Error(`${input.type} does not accept relatedTaskId`);
+
+    let orchestrationId: string | null = null;
+    let executionId: string | null = null;
+    if (input.runId) {
+      const run = await this.env.DB.prepare('SELECT id FROM runs WHERE id = ? AND project_id = ?')
+        .bind(input.runId, this.projectId).first<{ id: string }>();
+      if (!run) throw new Error(`run ${input.runId} not found in this project`);
+      const execution = await this.env.DB.prepare(
+        `SELECT orchestration_id AS orchestrationId, id AS executionId FROM execution_nodes
+          WHERE project_id = ? AND run_id = ? AND sitting = ?
+          ORDER BY CASE kind WHEN 'sitting' THEN 0 WHEN 'run' THEN 1 ELSE 2 END, created_at LIMIT 1`,
+      ).bind(this.projectId, input.runId, input.sitting).first<{ orchestrationId: string; executionId: string }>();
+      orchestrationId = execution?.orchestrationId ?? null;
+      executionId = execution?.executionId ?? null;
+    }
+    const canonical = {
+      type: input.type, taskId: input.taskId, relatedTaskId: input.relatedTaskId,
+      runId: input.runId, sitting: input.sitting, orchestrationId, executionId,
+      artifactRef: input.artifactRef, sourceKind: 'explicit_user_action',
+      actorKind: actor.kind, actorId: actor.id, observedAt: input.observedAt,
+      provenance: input.provenance,
+    };
+    const fingerprint = await sha256Hex(JSON.stringify(canonical));
+    const existing = await this.env.DB.prepare(
+      `SELECT id, event_type AS type, operation_fingerprint AS fingerprint
+         FROM project_quality_events WHERE project_id = ? AND operation_key = ?`,
+    ).bind(this.projectId, input.operationKey).first<{ id: string; type: RecordedQualityEvent['type']; fingerprint: string }>();
+    if (existing) {
+      if (existing.fingerprint !== fingerprint) {
+        await this.emit(actor, 'quality.event_rejected', 'task', input.taskId, {
+          operationKey: input.operationKey, reason: 'conflicting_operation_key', existingQualityEventId: existing.id,
+        });
+        throw new Error(`quality event operationKey ${input.operationKey} was already used for different evidence`);
+      }
+      return { id: existing.id, operationKey: input.operationKey, type: existing.type, deduped: true };
+    }
+    const id = newId('qev');
+    const insert = this.env.DB.prepare(
+      `INSERT INTO project_quality_events
+         (id, project_id, operation_key, operation_fingerprint, event_type, task_id,
+          related_task_id, run_id, sitting, orchestration_id, execution_id, artifact_ref,
+          source_kind, source_event_id, source_event_seq, actor_kind, actor_id, observed_at,
+          provenance, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'explicit_user_action', NULL, NULL, ?, ?, ?, ?, ?)`,
+    ).bind(
+      id, this.projectId, input.operationKey, fingerprint, input.type, input.taskId,
+      input.relatedTaskId, input.runId, input.sitting, orchestrationId, executionId,
+      input.artifactRef, actor.kind, actor.id, input.observedAt,
+      JSON.stringify(input.provenance), nowIso(),
+    );
+    await this.emit(actor, 'quality.event_recorded', 'task', input.taskId, {
+      qualityEventId: id, operationKey: input.operationKey, type: input.type,
+      runId: input.runId, sitting: input.sitting,
+    }, [insert]);
+    return { id, operationKey: input.operationKey, type: input.type, deduped: false };
+  }
+
+  async recordQualityEvent(
+    projectId: string,
+    actor: Actor,
+    input: RecordQualityEventInput,
+  ): Promise<RecordedQualityEvent> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const task = await this.resolveProjectTask(input.taskId);
+      const related = input.relatedTaskId ? await this.resolveProjectTask(input.relatedTaskId) : null;
+      const existing = input.observedAt ? null : await this.env.DB.prepare(
+        'SELECT observed_at AS observedAt FROM project_quality_events WHERE project_id = ? AND operation_key = ?',
+      ).bind(this.projectId, input.operationKey).first<{ observedAt: string }>();
+      return this.recordQualityEventLocked(actor, {
+        operationKey: input.operationKey,
+        type: input.type,
+        taskId: task.id,
+        relatedTaskId: related?.id ?? null,
+        runId: input.runId ?? null,
+        sitting: input.sitting ?? null,
+        artifactRef: input.artifactRef?.trim() || null,
+        observedAt: input.observedAt ?? existing?.observedAt ?? nowIso(),
+        provenance: input.provenance ?? {},
+      });
+    });
   }
 
   async broadcast(data: string) {
@@ -1017,6 +1144,23 @@ export class ProjectRoom extends DurableObject<Env> {
             ? { previousHolder: task.claimed_by }
             : {}),
         });
+        // PLNR-297: a reopen is only a deliberate move from settled work back to an active
+        // state. Continued failed sittings, reviewer repair, and verification retries never
+        // satisfy this predicate and therefore never manufacture downstream instability.
+        if (task.status === 'done' && (patch.status === 'todo' || patch.status === 'in_progress')) {
+          const run = await this.env.DB.prepare(
+            `SELECT id, sitting FROM runs
+              WHERE project_id = ? AND kind = 'build' AND anchor_type = 'task' AND anchor_id = ?
+              ORDER BY updated_at DESC, id DESC LIMIT 1`,
+          ).bind(this.projectId, taskId).first<{ id: string; sitting: number }>();
+          await this.recordQualityEventLocked(actor, {
+            operationKey: `task-reopened:${taskId}:${task.updated_at}`,
+            type: 'task_reopened', taskId,
+            runId: run?.id ?? null, sitting: run?.sitting ?? null,
+            artifactRef: null, relatedTaskId: null,
+            observedAt: nowIso(), provenance: { transition: { from: 'done', to: patch.status } },
+          });
+        }
         // The second way a task reaches done — a supervisor override rather than an agent
         // releasing it. Both paths need the hook or a plan finished by hand would never open its
         // merge request. `cancelled` counts too: a plan whose last open task was explicitly
@@ -3318,6 +3462,7 @@ export class ProjectRoom extends DurableObject<Env> {
       // project-scoped and orphaned along with everything else once `projects` loses the row.
       // Emitting into a feed that is being deleted in the same batch would be a write to nothing.
       await this.env.DB.batch([
+        this.env.DB.prepare('DELETE FROM project_quality_events WHERE project_id = ?').bind(pid),
         this.env.DB.prepare(`DELETE FROM phase_tasks WHERE task_id IN (${tasksSub}) OR phase_id IN (SELECT id FROM phases WHERE plan_id IN (SELECT id FROM plans WHERE project_id = ?))`).bind(pid, pid),
         this.env.DB.prepare(`DELETE FROM dependencies WHERE task_id IN (${tasksSub}) OR depends_on_task_id IN (${tasksSub})`).bind(pid, pid),
         this.env.DB.prepare(`DELETE FROM claims WHERE task_id IN (${tasksSub})`).bind(pid),
@@ -5325,9 +5470,17 @@ export class ProjectRoom extends DurableObject<Env> {
 
   private async getTask(taskId: string): Promise<TaskRow> {
     const row = await this.env.DB.prepare(
-      'SELECT id, key, status, claimed_by, claim_expires_at, failed_at, proposed_at, title FROM tasks WHERE id = ? AND project_id = ?',
+      'SELECT id, key, status, claimed_by, claim_expires_at, failed_at, proposed_at, title, updated_at FROM tasks WHERE id = ? AND project_id = ?',
     ).bind(taskId, this.projectId).first<TaskRow>();
     if (!row) throw new Error(`task ${taskId} not found in this project`);
+    return row;
+  }
+
+  private async resolveProjectTask(ref: string): Promise<{ id: string; key: string }> {
+    const row = await this.env.DB.prepare(
+      'SELECT id, key FROM tasks WHERE project_id = ? AND (id = ? OR key = ?)',
+    ).bind(this.projectId, ref, ref).first<{ id: string; key: string }>();
+    if (!row) throw new Error(`task ${ref} not found in this project`);
     return row;
   }
 

@@ -217,6 +217,56 @@ export const ProjectIntelligenceEpisode = z.object({
 });
 export type ProjectIntelligenceEpisode = z.infer<typeof ProjectIntelligenceEpisode>;
 
+/** Explicit downstream observations. These are append-only facts about what was observed later;
+ * they do not revise an episode's immediate outcome and do not assert blame or causality. */
+export const ProjectQualityEventType = z.enum([
+  'task_reopened',
+  'work_reverted',
+  'regression_task_linked',
+]);
+export type ProjectQualityEventType = z.infer<typeof ProjectQualityEventType>;
+
+export const ProjectQualityEvent = z.object({
+  schemaVersion: z.literal(PROJECT_INTELLIGENCE_CONTRACT_VERSION),
+  id: z.string().min(1),
+  operationKey: z.string().min(1),
+  projectId: z.string().min(1),
+  type: ProjectQualityEventType,
+  taskId: z.string().min(1),
+  relatedTaskId: z.string().min(1).nullable().default(null),
+  runId: z.string().min(1).nullable().default(null),
+  sitting: z.number().int().positive().nullable().default(null),
+  episodeId: z.string().min(1).nullable().default(null),
+  orchestrationId: z.string().min(1).nullable().default(null),
+  executionId: z.string().min(1).nullable().default(null),
+  artifactRef: z.string().min(1).nullable().default(null),
+  source: z.object({
+    kind: z.enum(['coordination_event', 'explicit_user_action']),
+    eventId: z.string().min(1).nullable().default(null),
+    eventSequence: z.number().int().nonnegative().nullable().default(null),
+  }),
+  actor: z.object({
+    kind: z.enum(['agent', 'human', 'system']),
+    id: z.string().min(1),
+  }),
+  observedAt: z.string().datetime(),
+  provenance: z.record(z.string(), z.unknown()).default({}),
+}).superRefine((event, ctx) => {
+  if ((event.runId == null) !== (event.sitting == null)) {
+    ctx.addIssue({ code: 'custom', message: 'runId and sitting must be supplied together' });
+  }
+  if ((event.type === 'regression_task_linked') !== (event.relatedTaskId != null)) {
+    ctx.addIssue({ code: 'custom', message: 'only regression_task_linked requires relatedTaskId' });
+  }
+  if ((event.type === 'work_reverted') !== (event.artifactRef != null)) {
+    ctx.addIssue({ code: 'custom', message: 'only work_reverted requires artifactRef' });
+  }
+  if ((event.source.kind === 'coordination_event') !== (event.source.eventId != null)) {
+    ctx.addIssue({ code: 'custom', message: 'coordination_event sources require eventId; explicit actions do not carry one' });
+  }
+});
+export type ProjectQualityEvent = z.infer<typeof ProjectQualityEvent>;
+
 export const AnalyticsGenerationState = z.enum(['not_started', 'stale', 'building', 'complete', 'failed']);
 export const AnalyticsGenerationDescriptor = z.object({
   id: z.string().min(1),
@@ -268,9 +318,11 @@ export const ProjectAnalyticsHealth = z.object({
     byKind: z.object({
       episodes: z.number().int().nonnegative(),
       commissioningFacts: z.number().int().nonnegative(),
+      qualityEvents: z.number().int().nonnegative(),
       analyticsGenerations: z.number().int().nonnegative(),
       analyticsRows: z.number().int().nonnegative(),
       analyticsSnapshotRows: z.number().int().nonnegative(),
+      analyticsQualityEventRows: z.number().int().nonnegative(),
     }),
   }),
 });

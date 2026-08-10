@@ -111,6 +111,10 @@ export const EventVerb = z.enum([
   'attachment.added',
   'attachment.removed',
   'ref.attached',
+  // An explicit append-only downstream quality observation was recorded. The payload is a
+  // compact identity summary, never an assertion of blame or a rewrite of an episode.
+  'quality.event_recorded',
+  'quality.event_rejected',
 ]);
 export type EventVerb = z.infer<typeof EventVerb>;
 
