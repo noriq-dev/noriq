@@ -74,16 +74,19 @@ const production = byPath['wrangler.production.jsonc.example'];
 const staging = byPath['wrangler.staging.jsonc.example'];
 const demo = byPath['wrangler.demo.jsonc.example'];
 
-for (const [name, config] of [['production', production], ['staging', staging]]) {
-  assert.ok(config.vars?.PUBLIC_ORIGIN, `${name}: PUBLIC_ORIGIN must match its deployed origin`);
-  assert.equal(config.ai?.binding, 'AI', `${name}: missing Workers AI binding`);
-  assert.deepEqual(
-    (config.vectorize ?? []).map((binding) => binding.binding).sort(),
-    ['CODE_VECTORIZE', 'VECTORIZE'],
-    `${name}: full-capability examples need both search indexes`,
-  );
-  assert.equal(config.r2_buckets?.[0]?.binding, 'FILES', `${name}: missing FILES binding`);
+assert.ok(production.vars?.PUBLIC_ORIGIN, 'production: PUBLIC_ORIGIN must match its deployed origin');
+for (const optionalBinding of ['ai', 'vectorize', 'r2_buckets', 'send_email']) {
+  assert.equal(production[optionalBinding], undefined, `production: ${optionalBinding} must be opt-in for clean-account deploys`);
 }
+
+assert.ok(staging.vars?.PUBLIC_ORIGIN, 'staging: PUBLIC_ORIGIN must match its deployed origin');
+assert.equal(staging.ai?.binding, 'AI', 'staging: missing Workers AI binding');
+assert.deepEqual(
+  (staging.vectorize ?? []).map((binding) => binding.binding).sort(),
+  ['CODE_VECTORIZE', 'VECTORIZE'],
+  'staging: full-capability example needs both search indexes',
+);
+assert.equal(staging.r2_buckets?.[0]?.binding, 'FILES', 'staging: missing FILES binding');
 
 assert.equal(demo.vars?.DEMO_MODE, '1', 'demo: DEMO_MODE must stay enabled');
 for (const costlyBinding of ['ai', 'vectorize', 'r2_buckets', 'send_email']) {

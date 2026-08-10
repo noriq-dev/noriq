@@ -35,7 +35,7 @@ coordination layer — projects, tasks, dependencies, claims, plans, and messagi
 - Self-hosted on **your own Cloudflare account** with one `wrangler deploy`. Noriq is
   open source.
 
-📍 **Docs:** [ARCHITECTURE.md](ARCHITECTURE.md) · [AUTHORIZATION.md](AUTHORIZATION.md) · [BACKUP.md](apps/api/BACKUP.md) · live tool reference at `/reference.md` (JSON at `/reference.json`) · agent skill at `/skill.md`
+📍 **Docs:** [ARCHITECTURE.md](ARCHITECTURE.md) · [AUTHORIZATION.md](AUTHORIZATION.md) · [Project Memory operations](docs/PROJECT_MEMORY_OPERATIONS.md) · [BACKUP.md](apps/api/BACKUP.md) · live tool reference at `/reference.md` (JSON at `/reference.json`) · agent skill at `/skill.md`
 
 ## Deploy your own instance
 
@@ -50,8 +50,9 @@ npm install
 npx wrangler login
 cd apps/api
 
-# 2. Create your instance config (gitignored) and fill in your values:
-#    your domain, optional email + R2. npm run deploy prefers this file.
+# 2. Create your instance config (gitignored) and fill in your domain.
+#    Optional services are commented out so this first deployment needs only D1.
+#    npm run deploy prefers this file.
 cp wrangler.production.jsonc.example wrangler.production.jsonc
 
 # 3. Create the database, then paste the printed database_id into
@@ -71,11 +72,10 @@ on first run. Then invite teammates from Settings and connect agents from the ho
 > in its `database_id`). Everything else — OAuth issuer, passkey rpID, invite links —
 > derives from the request origin, so no code changes are needed.
 
-> The example config ships with semantic and code-intelligence search enabled (Workers AI +
-> two Vectorize indexes), so `wrangler deploy` fails until both indexes exist. Run the provisioning
-> commands beside the bindings in `wrangler.production.jsonc`, or remove either binding you do not
-> want. Semantic search then degrades to keyword matching; code retrieval retains lexical + graph
-> search.
+> The example config is deliberately a reduced-capability deployment: D1 and the required Durable
+> Objects work without R2, email, Workers AI, or Vectorize. Add those services later using the
+> commands beside their commented bindings. See [Project Memory operations](docs/PROJECT_MEMORY_OPERATIONS.md)
+> for the staged enablement and verification sequence.
 
 ### Email (optional)
 
@@ -90,10 +90,10 @@ works** — inviting a user hands you a copyable invite link to deliver yourself
 
 ### Attachments & backups (optional)
 
-Task attachments and the automatic daily D1 backup both use R2. Enable R2 on your
-account, then `wrangler r2 bucket create noriq-files` (the `FILES` binding and the
-backup cron are already in the example config). Without R2, attachments report as not
-configured and the backup cron is a logged no-op. See [BACKUP.md](apps/api/BACKUP.md)
+Task attachments and the automatic daily D1 and ProjectMemory backups use R2. Enable R2 on your
+account, then `npx wrangler r2 bucket create noriq-files --config wrangler.production.jsonc`
+and uncomment the `FILES` binding in the example config (the backup cron is already present).
+Without R2, attachments report as not configured and the backup cron is a logged no-op. See [BACKUP.md](apps/api/BACKUP.md)
 for the on-demand export endpoint (`/api/admin/export`), its inverse
 (`/api/admin/import` — a full-instance restore), and the restore steps. The same daily
 cron also archives tasks that have been done for more than 24 hours.

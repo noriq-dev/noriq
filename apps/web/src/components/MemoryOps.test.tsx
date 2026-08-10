@@ -200,6 +200,35 @@ describe('the five failure modes render distinctly — no shared generic error t
   });
 });
 
+describe('memory vector rebuild recovery', () => {
+  it('offers the documented admin action and reports the canonical targets rebuilt', async () => {
+    mockClean();
+    const rebuild = vi.spyOn(api, 'memoryRebuildVectors').mockResolvedValue({ ok: true, rebuilt: true, reindexed: 17 });
+
+    mount();
+    await tick();
+    await act(async () => { button('Rebuild vectors')!.click(); });
+
+    expect(rebuild).toHaveBeenCalledWith('prj_1');
+    expect(text()).toContain('rebuilt 17 canonical vector target(s)');
+  });
+
+  it('disables the action when the optional embedding stack is absent', async () => {
+    vi.spyOn(api, 'memoryOpsStatus').mockResolvedValue({
+      ...OK_STATUS,
+      capabilities: { ...OK_STATUS.capabilities, workersAI: false, vectorize: false },
+    });
+    vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });
+    vi.spyOn(api, 'memoryBackupsList').mockResolvedValue({ backups: [], r2Available: false });
+
+    mount();
+    await tick();
+
+    expect(button('Rebuild vectors')?.disabled).toBe(true);
+    expect(text()).toContain('requires Workers AI and VECTORIZE');
+  });
+});
+
 describe('a staged generation the server has not validated offers no activation control', () => {
   const repoWithUnvalidated: ApiMemoryRepository = {
     id: 'pr_3', projectId: 'prj_1', repositoryKey: 'act-repo', indexingEnabled: true, ingestStatus: 'staged',
@@ -330,6 +359,7 @@ describe('a non-admin sees status without destructive action controls', () => {
     expect(button('Roll back')).toBeUndefined();
     expect(buttonContaining('Discard retained generation')).toBeUndefined();
     expect(button('Run lifecycle sweep')).toBeUndefined();
+    expect(button('Rebuild vectors')).toBeUndefined();
     // Status is still visible.
     expect(text()).toContain('Memory health');
     expect(text()).toContain('ok');

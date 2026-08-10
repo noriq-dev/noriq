@@ -47,13 +47,13 @@
   ],
 
   // OPTIONAL — email invites. Requires: wrangler email sending enable <your-domain>
-  // Delete both if unused; invites fall back to copyable links.
-  "send_email": [{ "name": "EMAIL" }],
+  // and then uncommenting this binding. Without it, invites fall back to copyable links.
+  // "send_email": [{ "name": "EMAIL" }],
   "vars": {
     // Keep this aligned with the route above. It supplies absolute links when no request
     // origin exists (scheduled work, signal webhooks, and agent upload capabilities).
     "PUBLIC_ORIGIN": "https://noriq.example.com",
-    "EMAIL_FROM": "noriq@example.com",
+    // "EMAIL_FROM": "noriq@example.com",
     "ASK_MAX_OUTPUT_TOKENS": "8192",
     // Server-side allowlist shown by GET /api/ask/models. Add only Workers AI models that you
     // verified in staging support both tool calls and streaming; this capability declaration is
@@ -81,13 +81,15 @@
   //   npx wrangler secret put GITHUB_WEBHOOK_SECRET --config wrangler.production.jsonc
   //   npx wrangler secret put SIGNAL_WEBHOOK_SECRET --config wrangler.production.jsonc
 
-  // OPTIONAL — task attachments. Requires R2 enabled on the account, then:
-  //   wrangler r2 bucket create noriq-files
-  // Delete if unused; the attachments UI reports it as not configured.
-  "r2_buckets": [{ "binding": "FILES", "bucket_name": "noriq-files" }],
+  // OPTIONAL — task attachments plus D1 and ProjectMemory portable backups. Requires R2 enabled
+  // on the account, then create the bucket and uncomment the binding:
+  //   npx wrangler r2 bucket create noriq-files --config wrangler.production.jsonc
+  // Without it, attachments and portable backups report unavailable; canonical memory still works.
+  // "r2_buckets": [{ "binding": "FILES", "bucket_name": "noriq-files" }],
 
 
-  // OPTIONAL — semantic + code-intelligence search. AI needs no provisioning. The two
+  // OPTIONAL — semantic + code-intelligence search. AI needs no provisioning. Uncomment `ai`
+  // after confirming Workers AI is available to the account. The two
   // Vectorize indexes are independent: authored memory/search belongs in noriq-search, while
   // repository generations belong in noriq-code and may churn without touching memory.
   //   wrangler vectorize create noriq-search --dimensions=1024 --metric=cosine
@@ -96,12 +98,13 @@
   //   wrangler vectorize create-metadata-index noriq-code --property-name=projectId --type=string
   //   wrangler vectorize create-metadata-index noriq-code --property-name=repositoryKey --type=string
   //   wrangler vectorize create-metadata-index noriq-code --property-name=generationId --type=string
-  // Delete either binding if unused. Retrieval transparently retains lexical + graph search.
-  "ai": { "binding": "AI" },
-  "vectorize": [
-    { "binding": "VECTORIZE", "index_name": "noriq-search" },
-    { "binding": "CODE_VECTORIZE", "index_name": "noriq-code" }
-  ],
+  // Add either Vectorize binding only after its index and metadata indexes exist. With no
+  // Vectorize bindings, retrieval transparently retains keyword/lexical + graph search.
+  // "ai": { "binding": "AI" },
+  // "vectorize": [
+  //   { "binding": "VECTORIZE", "index_name": "noriq-search" },
+  //   { "binding": "CODE_VECTORIZE", "index_name": "noriq-code" }
+  // ],
 
   // Daily D1 backup to R2 at 06:00 UTC (PLNR-21); snapshots land under backups/ (see BACKUP.md).
   "triggers": { "crons": ["0 6 * * *"] },

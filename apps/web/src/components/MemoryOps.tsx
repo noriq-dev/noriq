@@ -109,6 +109,7 @@ export function MemoryOps({ pid, store }: { pid: string; store: AppStore }) {
   const [loading, setLoading] = useState(true);
   const [lastSweep, setLastSweep] = useState<Awaited<ReturnType<typeof api.memoryLifecycleSweep>> | null>(null);
   const [lastBackup, setLastBackup] = useState<{ manifestKey: string } | null>(null);
+  const [lastVectorRebuild, setLastVectorRebuild] = useState<{ rebuilt: boolean; reindexed?: number; reason?: string } | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionBusy, setActionBusy] = useState<string | null>(null); // which control is in flight
   const [newRepoKey, setNewRepoKey] = useState('');
@@ -253,6 +254,31 @@ export function MemoryOps({ pid, store }: { pid: string; store: AppStore }) {
           <div style={{ marginTop: 8 }}>
             <CapabilitiesStrip capabilities={capabilities} />
           </div>
+          {isAdmin && (
+            <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+              <Button
+                variant="ghost"
+                disabled={actionBusy === 'vectors' || !capabilities.vectorize || !capabilities.workersAI}
+                onClick={() => void runAction('vectors', () => api.memoryRebuildVectors(pid).then((result) => {
+                  setLastVectorRebuild(result);
+                }))}
+              >
+                {actionBusy === 'vectors' ? 'rebuilding…' : 'Rebuild vectors'}
+              </Button>
+              {(!capabilities.vectorize || !capabilities.workersAI) && (
+                <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>
+                  requires Workers AI and VECTORIZE
+                </span>
+              )}
+              {lastVectorRebuild && (
+                <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: lastVectorRebuild.rebuilt ? 'var(--green)' : 'var(--text-dim)' }}>
+                  {lastVectorRebuild.rebuilt
+                    ? `rebuilt ${lastVectorRebuild.reindexed ?? 0} canonical vector target(s)`
+                    : lastVectorRebuild.reason ?? 'nothing to rebuild'}
+                </span>
+              )}
+            </div>
+          )}
         </Section>
 
         <Section title="Constellation hierarchy">

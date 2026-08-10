@@ -9,8 +9,9 @@ The Worker has a cron trigger (`0 6 * * *`, 06:00 UTC — see `wrangler.jsonc`) 
 writes a full logical snapshot of every table to the R2 bucket bound as `FILES`,
 under `backups/noriq-<timestamp>.json`.
 
-- Requires R2 to be enabled and `FILES` bound (it already is in
-  `wrangler.production.jsonc`). Without R2 the cron is a logged no-op — safe to leave on.
+- Requires R2 to be enabled and `FILES` bound (uncomment it in
+  `wrangler.production.jsonc` after creating the bucket). Without R2 the cron is a logged no-op —
+  safe to leave on.
 - Trigger it on demand: `POST /api/admin/backup` with the admin token.
 - Adjust the schedule by editing `triggers.crons`, or add lifecycle rules on the
   bucket to expire old snapshots.
@@ -50,9 +51,10 @@ memory-backups/<projectId>/<exportedAt>/<table>/chunk-<n>.jsonl.gz
   restorable. It carries the format/schema versions, the memory revision, per-table row counts,
   a sha256 checksum for every chunk, and the chunk keys (`r2EvidenceRefs`) — enough for a
   restore to detect a corrupted or missing chunk before trusting any of it.
-- `tier` in the manifest is `core` or `full`. Today they're identical — `full`'s additional
-  active code-index generation *content* doesn't exist until a later phase — the field just
-  keeps the manifest shape stable for when it does.
+- `tier` in the manifest is `core` or `full`. They currently export the same canonical and
+  operational table set, including repository generation manifests and staged entity/edge
+  content. The field preserves a compatible future policy seam; do not infer a retention
+  difference from it today.
 
 **Trigger it:**
 
@@ -103,10 +105,10 @@ retained generation is pruned automatically on a policy timer (PLNR-250) or can 
 manually.
 
 **Derived vectors after a restore:** a snapshot's rows never carry trusted vector embeddings —
-after activation the project is marked vector-dirty (visible in `project_memory_registry`) and
-must be re-embedded from the restored canonical rows. There is no memory Vectorize index to
-rebuild from yet (that lands in a later phase); the flag exists now so that pipeline has
-something to read once it does.
+after activation the project is marked vector-dirty (visible in `project_memory_registry`). If
+Workers AI and `VECTORIZE` are configured, rebuild them from the canonical restored rows with
+`POST /api/projects/<projectId>/memory/vectors/rebuild` as an instance admin. Without those
+bindings the rebuild is an honest no-op and lexical + graph retrieval remains available.
 
 **Schema compatibility:** a snapshot from a *newer* server than the one restoring it is refused
 outright — there's nothing to safely migrate it forward from. A snapshot from an older schema

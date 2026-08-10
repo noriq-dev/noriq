@@ -1801,9 +1801,10 @@ export class ProjectMemory extends DurableObject<Env> {
     return { ok: true, deduped: false };
   }
 
-  /** The VALIDATE step. Seals the generation (no further batches accepted) and records
-   *  `validation_problems` — actionable, naming what disagreed — without activating anything.
-   *  Idempotent: calling it again re-reports the same recorded result rather than re-validating. */
+  /** The VALIDATE + conditional PROMOTE step. Seals the generation (no further batches accepted)
+   *  and records actionable `validation_problems`. A clean generation auto-activates only if its
+   *  recorded predecessor is still current. Idempotent retries re-report validation and the same
+   *  activation rather than rebuilding a second generation. */
   async completeIndexIngest(
     projectId: string,
     generationId: string,
