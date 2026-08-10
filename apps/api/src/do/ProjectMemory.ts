@@ -929,24 +929,46 @@ export class ProjectMemory extends DurableObject<Env> {
     communityIds: string[],
   ): { routes: ConstellationV2AggregateRoute[]; externalCommunities: ConstellationV2Community[]; truncated: boolean } {
     if (communityIds.length === 0) return { routes: [], externalCommunities: [], truncated: false };
-    const placeholders = communityIds.map((_, i) => `?${i + 3}`).join(',');
-    const rows = this.ctx.storage.sql.exec<{
+    type AggregateRouteRow = {
       from_community_id: string; to_community_id: string; direction: 'forward' | 'reverse' | 'both'; edge_count: number; weight: number; by_type: string;
-    }>(
-      `SELECT from_community_id,to_community_id,direction,edge_count,weight,by_type
-       FROM constellation_community_links
-       WHERE generation_id = ?1 AND level = ?2
-         AND (from_community_id IN (${placeholders}) OR to_community_id IN (${placeholders}))
-       ORDER BY weight DESC, from_community_id, to_community_id LIMIT ${CONSTELLATION_V2_MAX_OVERVIEW_ROUTES + 1}`,
-      generationId, level, ...communityIds,
-    ).toArray();
-    const truncated = rows.length > CONSTELLATION_V2_MAX_OVERVIEW_ROUTES;
+    };
+    // Durable Object SQLite accepts at most 100 numbered variables. Two are reserved for the
+    // generation and level, so a community page wider than 98 children must query its route
+    // boundary in batches. Reusing each numbered placeholder in both IN clauses does not consume
+    // another variable; routes spanning two batches are deduplicated before the global ordering
+    // and cap are applied.
+    const ids = [...new Set(communityIds)];
+    const idsPerQuery = 98;
+    const rowByRoute = new Map<string, AggregateRouteRow>();
+    let batchTruncated = false;
+    for (let offset = 0; offset < ids.length; offset += idsPerQuery) {
+      const batch = ids.slice(offset, offset + idsPerQuery);
+      const placeholders = batch.map((_, index) => `?${index + 3}`).join(',');
+      const rows = this.ctx.storage.sql.exec<AggregateRouteRow>(
+        `SELECT from_community_id,to_community_id,direction,edge_count,weight,by_type
+         FROM constellation_community_links
+         WHERE generation_id = ?1 AND level = ?2
+           AND (from_community_id IN (${placeholders}) OR to_community_id IN (${placeholders}))
+         ORDER BY weight DESC, from_community_id, to_community_id LIMIT ${CONSTELLATION_V2_MAX_OVERVIEW_ROUTES + 1}`,
+        generationId, level, ...batch,
+      ).toArray();
+      batchTruncated ||= rows.length > CONSTELLATION_V2_MAX_OVERVIEW_ROUTES;
+      for (const row of rows) {
+        rowByRoute.set(`${row.from_community_id}\0${row.to_community_id}\0${row.direction}`, row);
+      }
+    }
+    const rows = [...rowByRoute.values()].sort((left, right) =>
+      right.weight - left.weight
+      || left.from_community_id.localeCompare(right.from_community_id)
+      || left.to_community_id.localeCompare(right.to_community_id)
+      || left.direction.localeCompare(right.direction));
+    const truncated = batchTruncated || rows.length > CONSTELLATION_V2_MAX_OVERVIEW_ROUTES;
     const page = rows.slice(0, CONSTELLATION_V2_MAX_OVERVIEW_ROUTES);
     const routes = page.map((row) => ({
       fromCommunityId: row.from_community_id, toCommunityId: row.to_community_id, direction: row.direction,
       count: row.edge_count, weight: row.weight, byType: JSON.parse(row.by_type) as Record<string, number>,
     }));
-    const visible = new Set(communityIds);
+    const visible = new Set(ids);
     const externalIds = [...new Set(routes.flatMap((route) => [route.fromCommunityId, route.toCommunityId]).filter((id) => !visible.has(id)))];
     const externalCommunities = externalIds.map((id) => this.readConstellationCommunity(generationId, id)).filter((row): row is ConstellationV2Community => row !== null);
     return { routes, externalCommunities, truncated };

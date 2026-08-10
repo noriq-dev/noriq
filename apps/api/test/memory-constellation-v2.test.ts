@@ -1,5 +1,6 @@
 import { env, SELF } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
+import type { ConstellationGenerationData } from '../src/do/ProjectMemory';
 import type { Env } from '../src/env';
 import { createUser, loginSession, mcpCall, mintTokenForUser } from './helpers';
 import {
@@ -16,6 +17,10 @@ interface MemoryRpc {
   writeNode(pid: string, input: { type: string; uri: string; label: string; actor: typeof SYSTEM }): Promise<{ nodeId: string }>;
   writeEdge(pid: string, input: { type: string; fromNodeId: string; toNodeId: string; actor: typeof SYSTEM }): Promise<{ edgeId: string }>;
   rebuildConstellationHierarchy(pid: string): Promise<{ ok: boolean }>;
+  beginConstellationGeneration(pid: string, input: { topologyVersion: string; layoutVersion: string }): Promise<{ generationId: string }>;
+  stageConstellationGeneration(pid: string, generationId: string, data: ConstellationGenerationData): Promise<{ ok: true }>;
+  completeConstellationGeneration(pid: string, generationId: string): Promise<{ ok: true }>;
+  activateConstellationGeneration(pid: string, generationId: string): Promise<{ activated: string }>;
   constellationV2Overview(pid: string): Promise<ConstellationV2Overview | ConstellationV2Unavailable>;
   constellationV2Community(pid: string, id: string, input?: { cursor?: string; limit?: number }): Promise<ConstellationV2CommunityPage | ConstellationV2Unavailable>;
   constellationV2Route(pid: string, uri: string): Promise<ConstellationV2Route | ConstellationV2Unavailable>;
@@ -63,6 +68,41 @@ describe('Constellation v2 compact encoding', () => {
 });
 
 describe('ProjectMemory Constellation v2 bounded reads', () => {
+  it('pages a 128-child community without exceeding the SQLite variable ceiling', async () => {
+    const pid = await newOwnedProject('pm-v2-wide@example.com', 'PMV2WIDE');
+    const root = {
+      id: 'wide-root', parentId: null, level: 0, label: 'wide root', memberCount: 128, childCount: 128,
+      typeCounts: { task: 128 }, internalEdgeCount: 0, internalWeight: 0, normalizedCohesion: 0,
+      boundaryWeight: 0, anchor: [0, 0, 0] as [number, number, number],
+    };
+    const children = Array.from({ length: 128 }, (_, index) => ({
+      id: `wide-child-${String(index).padStart(3, '0')}`, parentId: root.id, level: 1,
+      label: `child ${index}`, memberCount: 1, childCount: 0, typeCounts: { task: 1 },
+      internalEdgeCount: 0, internalWeight: 0, normalizedCohesion: 0, boundaryWeight: 0,
+      anchor: [index, 0, 0] as [number, number, number],
+    }));
+    const generation = await memory(pid).beginConstellationGeneration(pid, { topologyVersion: 'wide-test', layoutVersion: 'wide-test' });
+    await memory(pid).stageConstellationGeneration(pid, generation.generationId, {
+      nodeStats: [], communities: [root, ...children], memberships: [], links: [
+        { level: 1, fromCommunityId: children[0]!.id, toCommunityId: children[100]!.id, direction: 'forward', count: 1, weight: 10, byType: { related_to: 1 } },
+        { level: 1, fromCommunityId: children[99]!.id, toCommunityId: children[101]!.id, direction: 'forward', count: 1, weight: 20, byType: { calls: 1 } },
+      ],
+    });
+    await memory(pid).completeConstellationGeneration(pid, generation.generationId);
+    await memory(pid).activateConstellationGeneration(pid, generation.generationId);
+
+    const page = await memory(pid).constellationV2Community(pid, root.id, { limit: 256 }) as ConstellationV2CommunityPage;
+    expect(page.kind).toBe('communities');
+    expect(page.communities).toHaveLength(128);
+    expect(page.nextCursor).toBeNull();
+    // The cross-batch route (child 0 -> child 100) matches both SQL batches, but appears once;
+    // the merged page still follows the endpoint's global weight ordering.
+    expect(page.routes.map((route) => [route.fromCommunityId, route.toCommunityId])).toEqual([
+      [children[99]!.id, children[101]!.id],
+      [children[0]!.id, children[100]!.id],
+    ]);
+  });
+
   it('enumerates every entity, resolves exact symbols, and pages incoming/outgoing incidents', async () => {
     const pid = await newOwnedProject('pm-v2-pages@example.com', 'PMV2PAGE');
     const { nodeId: center } = await memory(pid).writeNode(pid, { type: 'file', uri: 'noriq://file/v2-center', label: 'center', actor: SYSTEM });
