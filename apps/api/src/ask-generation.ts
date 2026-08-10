@@ -1,11 +1,12 @@
 import type { Env } from './env';
-import { askOutputTokenLimit, consumeAskGeneration, prepareQuestion, streamingGenerationClient, type AskProject } from './ask';
+import { askOutputTokenLimit, buildMessages, consumeAskGeneration, searchAskWorkspace, streamingGenerationClient, type AskProject, type PreparedAsk } from './ask';
 import {
   ASK_GENERATION_CANCELLED, completeAskGeneration, failAskGeneration, getAskGeneration, updateAskGeneration,
   type StoredAskGeneration,
 } from './ask-chats';
 import { listWorkspaceProjects } from './lib/workspace-operations';
 import { resolveAskModel } from './ask-models';
+import { askToolDecisionClient, finalAskMessages, runAskToolLoop, type AskTool } from './ask-tools';
 
 const encoder = new TextEncoder();
 const frame = (event: string, data: unknown): Uint8Array =>
@@ -56,32 +57,58 @@ export async function runAskGeneration(env: Env, generationId: string): Promise<
   try {
     if (!await persist('searching', true)) return;
     const projects = await accessibleAskProjectsForUser(env, generation.userId);
-    let retrievalUsed = false;
-    const prepared = await prepareQuestion(env, {
-      question: generation.question,
-      projects,
-      history: generation.history,
-      model: model.id,
-      onRetrieval: async () => {
-        retrievalUsed = true;
-        base.trace = ['Ask chose to search accessible Noriq evidence…'];
-        await persist('searching', true);
+    const decision = askToolDecisionClient(env, model.id);
+    if (!decision) throw new Error('no AI backend — asking questions requires the Workers AI (AI) binding');
+    const tools: AskTool[] = [{
+      name: 'search_noriq',
+      description: 'Search the user\'s accessible Noriq tasks, plans, docs, memories, episodes, and knowledge-graph connections for current or private workspace evidence. Use focused queries; call again only when a distinct question remains.',
+      inputSchema: {
+        type: 'object',
+        properties: { query: { type: 'string', description: 'Focused semantic query for the needed workspace evidence.' } },
+        required: ['query'],
+        additionalProperties: false,
       },
-    });
-    base.sources = prepared.sources;
-    base.mode = prepared.mode;
-    base.model = prepared.model;
-    base.graphEnhanced = prepared.graphEnhanced;
-    if (retrievalUsed && prepared.mode) {
-      const projectCount = new Set(prepared.sources.map((source) => source.projectId)).size;
-      const retrieval = `${prepared.mode}${prepared.graphEnhanced ? ' + graph' : ''}`;
-      base.trace = [
-        `Ask used search_noriq and selected ${prepared.sources.length} ${retrieval} source${prepared.sources.length === 1 ? '' : 's'} across ${projectCount} project${projectCount === 1 ? '' : 's'}.`,
-        'Generating a grounded response…',
-      ];
-    } else {
-      base.trace = ['No Noriq evidence was needed for this response.', 'Generating a general response…'];
-    }
+      execute: async (arguments_) => {
+        const query = typeof arguments_.query === 'string' ? arguments_.query.trim().slice(0, 4000) : '';
+        if (!query) throw new Error('query is required');
+        const result = await searchAskWorkspace(env, query, projects);
+        const projectCount = new Set(result.sources.map((source) => source.projectId)).size;
+        return {
+          ...result,
+          summary: `Ask searched Noriq and selected ${result.sources.length} ${result.mode}${result.graphEnhanced ? ' + graph' : ''} source${result.sources.length === 1 ? '' : 's'} across ${projectCount} project${projectCount === 1 ? '' : 's'}.`,
+        };
+      },
+    }];
+    const loop = await runAskToolLoop(
+      decision,
+      buildMessages(generation.question, projects, [], generation.history, false),
+      tools,
+      {
+        shouldContinue: () => active,
+        onCheckpoint: async (state) => {
+          base.sources = state.sources;
+          base.trace = state.trace;
+          base.mode = state.mode;
+          base.graphEnhanced = state.graphEnhanced;
+          await persist('searching', true);
+        },
+      },
+    );
+    if (!loop || !active) return;
+    base.sources = loop.sources;
+    base.trace = [...loop.trace, loop.calls
+      ? 'Generating a response from the collected workspace evidence…'
+      : 'No Noriq workspace tool was needed; generating a general response…'];
+    base.mode = loop.mode;
+    base.model = model.id;
+    base.graphEnhanced = loop.graphEnhanced;
+    const prepared: PreparedAsk = {
+      messages: finalAskMessages(loop),
+      sources: loop.sources,
+      mode: loop.mode,
+      model: model.id,
+      graphEnhanced: loop.graphEnhanced,
+    };
     if (!await persist('generating', true)) return;
 
     const result = await consumeAskGeneration(gen, prepared, {
