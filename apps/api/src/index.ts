@@ -38,6 +38,7 @@ import pkg from '../package.json';
 import { issueTokens, metadataRoutes, oauth } from './oauth';
 import { demoLocksDown } from './lib/demo';
 import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
+import { copilotSessionContextFromMessages, endCopilotSession } from './lib/copilot-session';
 import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
 import { z } from 'zod';
@@ -293,6 +294,20 @@ app.all('/mcp', agentAuth, async (c) => {
   const rl = await rateLimit(c.env, `mcp:${conn.tokenId}`, 120);
   if (!rl.ok) return c.json({ error: 'rate limited — back off and retry' }, 429, { 'Retry-After': String(rl.retryAfter) });
 
+  // MCP session termination retires only the presented session. The OAuth connection remains
+  // authorized and may open another session; conflating these two lifecycles is what caused
+  // connection revocations to be used as a workaround for abandoned Copilots.
+  if (c.req.method === 'DELETE') {
+    const sessionId = c.req.header('mcp-session-id');
+    if (!sessionId) return c.json({ error: 'Mcp-Session-Id is required to terminate a session' }, 400);
+    const session = await c.env.DB.prepare(
+      `SELECT id FROM agents WHERE session_id = ? AND kind = 'copilot' AND user_id = ?`,
+    ).bind(sessionId, conn.userId).first<{ id: string }>();
+    if (!session) return c.json({ error: 'MCP session not found' }, 404);
+    await endCopilotSession(c.env, session.id, 'client_terminated');
+    return c.body(null, 204);
+  }
+
   // Two ways to be somebody here (0026):
   //  * a runner's per-run token is BOUND to one agent — it acts as that agent, full stop,
   //    and no session id can move it. The runner owns that identity's lifecycle.
@@ -323,9 +338,12 @@ app.all('/mcp', agentAuth, async (c) => {
     // replayed under another user's token (PLNR-101), and a session whose copilot was
     // revoked. They used to escape as 500s.
     try {
-      agent = await resolveSessionAgent(c.env, conn, sessionId);
+      const sessionContext = copilotSessionContextFromMessages(msgs);
+      agent = await resolveSessionAgent(c.env, conn, sessionId, sessionContext);
     } catch (e) {
-      return c.json({ error: (e as Error).message }, 401);
+      const message = (e as Error).message;
+      const authFailure = /does not belong|revoked|session has ended/i.test(message);
+      return c.json({ error: message }, authFailure ? 401 : 400);
     }
     if (isInit) c.header('Mcp-Session-Id', sessionId);
   }
@@ -336,7 +354,11 @@ app.all('/mcp', agentAuth, async (c) => {
     return c.json({ error: 'no MCP session — call initialize first (sessionless calls are not attributable)' }, 400);
   }
 
-  const server = buildMcpServer(c.env, agent, { oauthTokenId: conn.tokenId, sessionId, origin: new URL(c.req.url).origin });
+  const server = buildMcpServer(c.env, agent, {
+    oauthTokenId: conn.tokenId,
+    sessionId: conn.boundAgent ? undefined : sessionId,
+    origin: new URL(c.req.url).origin,
+  });
   const transport = new StreamableHTTPTransport();
   await server.connect(transport);
   return transport.handleRequest(c, raw ?? undefined);

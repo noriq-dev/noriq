@@ -5,8 +5,17 @@ import { z } from 'zod';
 // Runner that predates orchestration continues to parse the frames it already understands.
 
 export const ORCHESTRATION_CAPABILITY = 'orchestration.v1' as const;
+export const MCP_SESSION_LINEAGE_META = 'io.noriq/sessionLineage' as const;
 export const RunnerProtocolCapability = z.enum([ORCHESTRATION_CAPABILITY]);
 export type RunnerProtocolCapability = z.infer<typeof RunnerProtocolCapability>;
+
+export const McpSessionLineageHint = z.object({
+  parentPresenceId: z.string().min(1).optional(),
+  parentExecutionId: z.string().min(1).optional(),
+}).refine((value) => value.parentPresenceId || value.parentExecutionId, {
+  message: 'a session lineage hint must name a parent presence or execution',
+});
+export type McpSessionLineageHint = z.infer<typeof McpSessionLineageHint>;
 
 export const ExecutionKind = z.enum(['copilot_session', 'run', 'sitting', 'stage', 'step', 'gate']);
 export const ExecutionRole = z.enum(['orchestrator', 'planner', 'worker', 'reviewer', 'verifier', 'repair', 'system']);

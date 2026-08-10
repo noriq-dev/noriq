@@ -363,14 +363,14 @@ export async function mcpCallStream(apiKey: string, tool: string, args: Record<s
   return { result, notifications };
 }
 
-export async function mcpList(apiKey: string) {
+export async function mcpList(apiKey: string, sessionId?: string) {
   const res = await SELF.fetch('https://noriq.test/mcp', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
       Accept: 'application/json, text/event-stream',
-      'Mcp-Session-Id': sessionFor(apiKey),
+      'Mcp-Session-Id': sessionId ?? sessionFor(apiKey),
     },
     body: JSON.stringify({ jsonrpc: '2.0', id: rpcId++, method: 'tools/list', params: {} }),
   });

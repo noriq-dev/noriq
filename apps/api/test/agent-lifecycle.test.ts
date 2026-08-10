@@ -1,6 +1,6 @@
 import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { createAgent, createUser, loginSession, mcpCall } from './helpers';
+import { createAgent, createUser, loginSession, mcpCall, mcpList } from './helpers';
 
 let connection: { id: string; apiKey: string };
 let projectId: string;
@@ -33,7 +33,7 @@ describe('agent lifecycle and presence storage (PLNR-362)', () => {
     expect(session).toMatchObject({
       actorClass: 'session_copilot',
       lineageStatus: 'partial',
-      lineageReason: 'connection_owner_not_immediate_execution',
+      lineageReason: 'immediate_parent_unknown',
     });
     expect(session!.lastSeenAt).not.toBeNull();
 
@@ -57,7 +57,7 @@ describe('agent lifecycle and presence storage (PLNR-362)', () => {
     expect(connectionRoot).toEqual({ actorClass: 'connection_copilot', lineageStatus: 'complete' });
   });
 
-  it('refreshes MCP presence on every request through session resolution', async () => {
+  it('refreshes MCP presence on meaningful tool activity', async () => {
     const first = await mcpCall(connection.apiKey, 'get_briefing', {}, 'life-touch');
     const actorId = first.body.you.id as string;
     await env.DB.prepare(
@@ -66,6 +66,11 @@ describe('agent lifecycle and presence storage (PLNR-362)', () => {
     await env.DB.prepare(
       `UPDATE agent_presences SET state = 'dormant', last_seen_at = '2000-01-01T00:00:00.000Z' WHERE actor_id = ?`,
     ).bind(actorId).run();
+
+    await mcpList(connection.apiKey, 'life-touch');
+    expect(await env.DB.prepare(
+      `SELECT state, last_seen_at AS lastSeenAt FROM agent_presences WHERE actor_id = ?`,
+    ).bind(actorId).first()).toEqual({ state: 'dormant', lastSeenAt: '2000-01-01T00:00:00.000Z' });
 
     await mcpCall(connection.apiKey, 'get_briefing', {}, 'life-touch');
     const refreshed = await env.DB.prepare(

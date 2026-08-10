@@ -3,6 +3,9 @@ import type { Env } from './env';
 import { demoLocksDown } from './lib/demo';
 import { newId, nowIso, sha256Hex, timingSafeEqual } from './lib/util';
 import { resolveAccountCapabilities } from './lib/authorization';
+import {
+  syncCopilotSession, validateCopilotSessionContext, type CopilotSessionContext,
+} from './lib/copilot-session';
 
 /** What kind of thing is working (RUN-43). See migration 0026 for the full contrast. */
 export type AgentKind = 'copilot' | 'agent';
@@ -40,9 +43,10 @@ export interface Connection {
   boundAgent: AgentIdentity | null;
   /**
    * The connection's own copilot (PLNR-155) — minted when the grant was exchanged, and the
-   * PARENT that each session copilot hangs off. Independent of boundAgent, and never both:
-   * a human's connection has a copilot, a runner's per-run token has a bound agent.
-   * Null only for a token minted before PLNR-155 (its sessions simply have no parent).
+   * durable owner shown for that authorization. It is NOT an inferred delegation parent:
+   * immediate session/execution lineage is separately reported and validated (PLNR-367).
+   * Independent of boundAgent, and never both: a human connection has a Copilot owner, while a
+   * Runner's per-run token has a bound agent. Null only for a token minted before PLNR-155.
    */
   copilotId: string | null;
 }
@@ -160,9 +164,10 @@ const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(
 /**
  * Resolve the COPILOT for one MCP session (a chat, or a sub-agent) on a connection.
  * Each MCP client `initialize` gets its own session id, so this is one copilot per
- * session — parented to the connection's own copilot (PLNR-155), which is what keeps a
- * busy day legible: one named connection with its chats beneath it, rather than a flat
- * wall of anonymous rows. Created unscoped (project_id NULL) because a copilot roams.
+ * session. The connection Copilot owns the OAuth grant but is not assumed to be the
+ * immediate process that spawned this session. Immediate delegation is accepted only
+ * through a validated presence/execution hint (PLNR-367). Created unscoped because a
+ * Copilot's current project is mutable focus, not historical execution ownership.
  *
  * Nothing here needs announcing itself: the parent was registered when the grant was
  * exchanged and the child is named from the client, so an agent never has to invent an
@@ -173,57 +178,67 @@ const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(
  * here, and the kind filter below keeps it that way even if one somehow carried a
  * session id: a runner's agent must never be adopted by whoever presents a session.
  */
-export async function resolveSessionAgent(env: Env, conn: Connection, sessionId: string): Promise<AgentIdentity> {
+export async function resolveSessionAgent(
+  env: Env,
+  conn: Connection,
+  sessionId: string,
+  context: CopilotSessionContext = {},
+): Promise<AgentIdentity> {
   // Deliberately NOT filtered by status: a revoked copilot must be FOUND so it can be
   // refused. Filtering it out here would make the row invisible and send us straight to
   // the INSERT below — silently minting a replacement identity for the same session and
   // handing a revoked agent its access back. Revocation has to bite somewhere, and with a
   // connection no longer being an agent (0026) this is the only place left that it can.
   const existing = await env.DB.prepare(
-    `SELECT id, COALESCE(label, name) AS name, role, user_id AS userId, kind, status
+    `SELECT id, COALESCE(label, name) AS name, role, user_id AS userId, kind, status,
+            retired_at AS retiredAt, retire_reason AS retireReason
        FROM agents WHERE session_id = ? AND kind = 'copilot'`,
-  ).bind(sessionId).first<AgentIdentity & { status: string }>();
+  ).bind(sessionId).first<AgentIdentity & { status: string; retiredAt: string | null; retireReason: string | null }>();
   if (existing) {
     // The session id is client-supplied (echoed back from initialize). Bind it to
     // the authenticated user so a leaked session id can't be replayed with another
     // user's token to act AS that user's agent (PLNR-101).
     if (existing.userId !== conn.userId) throw new Error('session id does not belong to this connection');
     if (existing.status === 'revoked') throw new Error('this session’s agent was revoked');
+    if (existing.retiredAt) throw new Error(`this MCP session has ended (${existing.retireReason ?? 'retired'})`);
+    await validateCopilotSessionContext(env, conn.tokenId, conn.userId, context);
+    await syncCopilotSession(env, conn.tokenId, existing, context);
     // Session resolution happens once per MCP request, so it is the one reliable presence touch
     // shared by every tool. Migration 0081 projects this update into agent_presences; keeping the
     // compatibility columns fresh also makes old readers less dishonest during the rollout.
-    const resumedAt = nowIso();
-    await env.DB.batch([
-      env.DB.prepare(
-        `UPDATE agents SET status = 'active', last_seen_at = ?, retired_at = NULL,
-                           retire_reason = NULL, archived_at = NULL, lifecycle_updated_at = ?
-          WHERE id = ?`,
-      ).bind(resumedAt, resumedAt, existing.id),
-      env.DB.prepare(
-        `UPDATE agent_presences SET archived_at = NULL, updated_at = ? WHERE actor_id = ?`,
-      ).bind(resumedAt, existing.id),
-    ]);
+    if (context.meaningful) {
+      const resumedAt = nowIso();
+      await env.DB.batch([
+        env.DB.prepare(
+          `UPDATE agents SET status = 'active', last_seen_at = ?, archived_at = NULL,
+                             lifecycle_updated_at = ? WHERE id = ?`,
+        ).bind(resumedAt, resumedAt, existing.id),
+        env.DB.prepare(
+          `UPDATE agent_presences SET state = 'online', last_seen_at = ?, archived_at = NULL,
+                                      updated_at = ? WHERE actor_id = ? AND ended_at IS NULL`,
+        ).bind(resumedAt, resumedAt, existing.id),
+      ]);
+    }
     return existing;
   }
+  await validateCopilotSessionContext(env, conn.tokenId, conn.userId, context);
   const id = newId('agt');
   // `name` is a stable, globally-unique internal handle (label is the friendly display,
   // set via set_agent_identity). The id suffix guarantees uniqueness. PLNR-65 settled this
   // split deliberately — name is not dead weight, it is the handle label falls back to.
   const name = `${slug(conn.clientName)}-${id.slice(-6)}`;
-  // parent_agent_id is the connection's copilot. Null only for a token minted before
-  // PLNR-155 — those sessions stay parentless rather than being adopted by a guess.
   await env.DB.prepare(
     `INSERT INTO agents (
        id, name, role, status, kind, actor_class, user_id, oauth_token_id, session_id,
        parent_agent_id, last_seen_at, lineage_status, lineage_reason, lifecycle_updated_at, created_at
-     ) VALUES (?, ?, 'worker', 'idle', 'copilot', 'session_copilot', ?, ?, ?, ?, ?,
-               'partial', ?, ?, ?)`,
+     ) VALUES (?, ?, 'worker', 'idle', 'copilot', 'session_copilot', ?, ?, ?, NULL, ?,
+               'partial', 'immediate_parent_unknown', ?, ?)`,
   ).bind(
-    id, name, conn.userId, conn.tokenId, sessionId, conn.copilotId, nowIso(),
-    conn.copilotId ? 'connection_owner_not_immediate_execution' : 'immediate_parent_unknown',
-    nowIso(), nowIso(),
+    id, name, conn.userId, conn.tokenId, sessionId, nowIso(), nowIso(), nowIso(),
   ).run();
-  return { id, name, role: 'worker', userId: conn.userId, kind: 'copilot' };
+  const created: AgentIdentity = { id, name, role: 'worker', userId: conn.userId, kind: 'copilot' };
+  await syncCopilotSession(env, conn.tokenId, created, context);
+  return created;
 }
 
 /** Admin-token auth for bootstrap/ops endpoints (agent key issuance, user creation). */

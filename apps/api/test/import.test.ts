@@ -40,6 +40,16 @@ describe('D1 import / restore (PLNR-218)', () => {
     const projectId = proj.body.id as string;
     const parent = await mcpCall(apiKey, 'create_task', { projectId, title: 'parent task', tags: ['import-test'], allowNewTags: true });
     await mcpCall(apiKey, 'create_task', { projectId, title: 'child task', tags: ['import-test'], allowNewTags: true, parentTaskId: parent.body.id });
+    await mcpCall(apiKey, 'focus_project', { projectId }, 'import-parent-session');
+    const parentSession = (await mcpCall(apiKey, 'get_briefing', {}, 'import-parent-session')).body.you as {
+      presenceId: string; execution: { executionId: string };
+    };
+    await mcpCall(apiKey, 'get_briefing', {}, 'import-child-session', {
+      'io.noriq/sessionLineage': {
+        parentPresenceId: parentSession.presenceId,
+        parentExecutionId: parentSession.execution.executionId,
+      },
+    });
     s0 = await exportSnap();
   });
 
@@ -54,6 +64,7 @@ describe('D1 import / restore (PLNR-218)', () => {
     expect(before.counts.agents).toBeGreaterThan(0);
     expect(before.counts.oauth_tokens).toBeGreaterThan(0);
     expect(before.tables.tasks!.some((t) => t.parent_task_id != null)).toBe(true);
+    expect(before.tables.agent_presences!.some((p) => p.parent_presence_id != null)).toBe(true);
     for (const table of ['project_grants', 'authorization_settings', 'authorization_audit_events']) {
       expect(before.tables[table]).toBeDefined();
     }

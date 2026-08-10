@@ -338,7 +338,7 @@ describe('connection copilot (PLNR-155)', () => {
     expect(row!.runnerId).toBeNull(); // 0026's CHECK: only kind='agent' is runner-owned
   });
 
-  it('parents each session copilot to it, with nobody self-registering', async () => {
+  it('owns each session without pretending the connection is its immediate parent', async () => {
     const { access } = await grant('copilot-b@example.com');
     const parent = await copilotOf(access);
 
@@ -350,7 +350,12 @@ describe('connection copilot (PLNR-155)', () => {
 
     const child = await db().prepare('SELECT parent_agent_id AS parent FROM agents WHERE id = ?')
       .bind(me.id).first<{ parent: string | null }>();
-    expect(child!.parent).toBe(parent); // ← the tree
+    expect(child!.parent).toBeNull();
+    const ownership = await db().prepare(
+      `SELECT t.copilot_id AS owner FROM agents a JOIN oauth_tokens t ON t.id = a.oauth_token_id
+        WHERE a.id = ?`,
+    ).bind(me.id).first<{ owner: string | null }>();
+    expect(ownership!.owner).toBe(parent);
   });
 
   it('survives a refresh — rotation must not orphan the copilot', async () => {

@@ -88,9 +88,11 @@ const TRIGGER_POPULATED_TABLES = new Set(['agent_presences']);
 // use the generic NULL-then-patch cycle breaker for this self-reference. Parent-first row replay
 // satisfies the FK without mutating an accepted node after insertion.
 const ORDERED_SELF_REFERENCES = new Map<string, Set<string>>([
+  ['agent_presences', new Set(['parent_presence_id'])],
   ['execution_nodes', new Set(['parent_execution_id'])],
 ]);
 const IMMUTABLE_RESTORE_REFERENCES = new Map<string, Set<string>>([
+  ['agent_presences', new Set(['parent_presence_id'])],
   ['execution_nodes', new Set(['parent_execution_id', 'task_id', 'plan_id', 'run_id'])],
 ]);
 
@@ -332,6 +334,21 @@ export async function importSnapshot(env: Env, raw: unknown): Promise<ImportResu
       for (const row of rows) {
         if (row[c] == null) continue;
         patches.push(env.DB.prepare(`UPDATE "${t}" SET "${c}" = ? WHERE "${pk}" = ?`).bind(bindable(row[c]), bindable(row[pk])));
+      }
+    }
+    // Classification triggers intentionally normalize old Worker INSERTs, but a restore is not
+    // an old writer: it must preserve accepted lineage facts byte-for-byte. OAuth token replay
+    // can also reclassify connection roots after the agent row is inserted, so apply these exact
+    // snapshot values only after every authoritative row exists.
+    if (t === 'agents' && pk) {
+      for (const row of rows) {
+        patches.push(env.DB.prepare(
+          `UPDATE agents SET actor_class = ?, lineage_status = ?, lineage_reason = ?,
+                             lifecycle_updated_at = ? WHERE id = ?`,
+        ).bind(
+          bindable(row.actor_class), bindable(row.lineage_status), bindable(row.lineage_reason),
+          bindable(row.lifecycle_updated_at), bindable(row[pk]),
+        ));
       }
     }
   }

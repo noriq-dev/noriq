@@ -4,6 +4,7 @@ import type { Env } from './env';
 import { resolveSessionAgent, type AppContext, type Connection } from './auth';
 import { buildMcpServer, INSTRUCTIONS, SERVER_INFO } from './mcp';
 import { handleSubscriptionsListen } from './mcp-listen';
+import { copilotSessionContextFromMessages } from './lib/copilot-session';
 
 /**
  * MCP 2026-07-28 ("modern") compatibility layer — PLNR-233.
@@ -211,20 +212,25 @@ export async function handleModernMcp(c: Context<AppContext>, env: Env, conn: Co
 
   // --- identity (no protocol sessions in 2026-07-28 — see module docs) ---
   let agent = conn.boundAgent;
+  let sessionKey: string | undefined;
   if (!agent) {
     const openAiSession = meta['openai/session'];
-    const sessionKey = typeof openAiSession === 'string' && openAiSession.length > 0
+    sessionKey = typeof openAiSession === 'string' && openAiSession.length > 0
       ? `openai:${openAiSession}`
       : `stateless:${conn.tokenId}`;
     try {
-      agent = await resolveSessionAgent(env, conn, sessionKey);
+      agent = await resolveSessionAgent(env, conn, sessionKey, copilotSessionContextFromMessages([msg]));
     } catch (e) {
-      return c.json({ error: (e as Error).message }, 401);
+      const message = (e as Error).message;
+      const authFailure = /does not belong|revoked|session has ended/i.test(message);
+      return c.json({ error: message }, authFailure ? 401 : 400);
     }
   }
 
   // --- bridge into the SDK server over an in-memory pair ---
-  const server = buildMcpServer(env, agent, { oauthTokenId: conn.tokenId, origin: new URL(c.req.url).origin });
+  const server = buildMcpServer(env, agent, {
+    oauthTokenId: conn.tokenId, sessionId: sessionKey, origin: new URL(c.req.url).origin,
+  });
   const [clientT, serverT] = InMemoryTransport.createLinkedPair();
   const responseP = new Promise<RpcMessage>((resolve) => {
     // Notifications (no id) are dropped by design — see module docs.

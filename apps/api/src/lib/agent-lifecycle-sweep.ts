@@ -5,6 +5,7 @@
 
 import type { Env } from '../env';
 import { newId } from './util';
+import { endCopilotSession } from './copilot-session';
 
 const DAY_MS = 86_400_000;
 const MAX_DAYS = 3_650;
@@ -17,6 +18,9 @@ const MAX_BATCH = 500;
 // reference remains fail-closed until it is reviewed and added here explicitly.
 const PURGE_SAFE_SOFT_PRESENCE_REFERENCES = new Set([
   'execution_nodes.presence_id',
+  // A reviewed hard lineage reference. Individual parents remain protected below until every
+  // child presence that names them has itself passed retention and been purged.
+  'agent_presences.parent_presence_id',
 ]);
 
 export type AgentLifecycleSweepConfig = {
@@ -335,6 +339,9 @@ export async function sweepAgentLifecycle(env: Env, options: SweepOptions = {}) 
       ).bind(at, at, actor.id, archiveCutoff, at, at, onlineCutoff).run();
       changed = result.meta.changes ?? 0;
     }
+    if (changed && reason === 'session_inactive') {
+      await endCopilotSession(env, actor.id, 'session_expired', at, false);
+    }
     if (changed) await record('actor', actor.id, actor.actorClass, fromState, toState, reason, evidenceAt);
     else addCount(protections, 'compare_and_set_lost');
   }
@@ -360,6 +367,10 @@ export async function sweepAgentLifecycle(env: Env, options: SweepOptions = {}) 
         ? Boolean(await env.DB.prepare('SELECT 1 FROM runners WHERE id = ?').bind(presence.runnerId).first())
         : false;
     if (!durableOwnerExists) { addCount(protections, 'durable_owner_missing'); continue; }
+    const hasLiveLineageReference = Boolean(await env.DB.prepare(
+      'SELECT 1 FROM agent_presences WHERE parent_presence_id = ? LIMIT 1',
+    ).bind(presence.id).first());
+    if (hasLiveLineageReference) { addCount(protections, 'lineage_reference'); continue; }
     if (dryRun) {
       await record('presence', presence.id, presence.kind, 'ended', 'purged', 'presence_retention_elapsed', presence.endedAt);
       continue;
@@ -370,7 +381,9 @@ export async function sweepAgentLifecycle(env: Env, options: SweepOptions = {}) 
           AND ((actor_id IS NOT NULL AND EXISTS (
                  SELECT 1 FROM agents a WHERE a.id = agent_presences.actor_id))
             OR (actor_id IS NULL AND runner_id IS NOT NULL
-                AND EXISTS (SELECT 1 FROM runners r WHERE r.id = agent_presences.runner_id)))`,
+                AND EXISTS (SELECT 1 FROM runners r WHERE r.id = agent_presences.runner_id)))
+          AND NOT EXISTS (SELECT 1 FROM agent_presences child
+                           WHERE child.parent_presence_id = agent_presences.id)`,
     ).bind(presence.id, presenceCutoff).run();
     if (removed.meta.changes) {
       await record('presence', presence.id, presence.kind, 'ended', 'purged', 'presence_retention_elapsed', presence.endedAt);

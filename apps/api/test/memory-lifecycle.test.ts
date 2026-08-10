@@ -35,6 +35,7 @@ interface MemoryRpc {
   rollback(pid: string): Promise<{ ok: true } | { ok: false; reason: string }>;
   erase(pid: string): Promise<{ ok: true }>;
   eraseAll(pid: string): Promise<{ ok: boolean; steps: Array<{ step: string; ok: boolean; detail: string }> }>;
+  drainOutbox(pid: string): Promise<{ delivered: number; failed: number }>;
   _setForceEraseFailure(pid: string, fail: boolean): Promise<void>;
   writeNode(pid: string, input: { type: string; uri: string; label: string; actor: { kind: string; id: string | null } }): Promise<{ nodeId: string }>;
   _seedStagedIndexGeneration(pid: string, repositoryKey: string, createdAt: string): Promise<string>;
@@ -58,7 +59,12 @@ async function newOwnedProject(email: string, key: string) {
   const token = await mintTokenForUser(email);
   const proj = await mcpCall(token, 'create_project', { key, name: `${key} project` });
   if (proj.isError) throw new Error(`create_project(${key}) failed: ${proj.text}`);
-  return { userId: user.id, token, projectId: proj.body.id as string };
+  const projectId = proj.body.id as string;
+  // Project creation emits its graph projection asynchronously. Settle that outbox row before a
+  // test establishes an export/erase boundary, otherwise a late project.created delivery can
+  // legitimately repopulate the just-erased store and make disaster-recovery assertions race.
+  await memory(projectId).drainOutbox(projectId);
+  return { userId: user.id, token, projectId };
 }
 
 describe('sizeStatus — pure threshold logic', () => {

@@ -51,6 +51,7 @@ import {
   addExecutionRelation, applyExecutionEvent, createOrchestration, declareExecution,
   getOrchestrationTree,
 } from './lib/orchestration-store';
+import { describeCopilotSession } from './lib/copilot-session';
 
 const MAX_ATTACHMENT = 100 * 1024 * 1024;
 
@@ -581,7 +582,12 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         // `kind` is what an identity most needs to know about itself (0026): a copilot is a
         // human's session and may roam between projects; an agent is runner-owned, pinned to
         // one project for life, and expected to stay reachable.
-        you: { id: agent.id, name: agent.name, role: agent.role, kind: agent.kind },
+        you: {
+          id: agent.id, name: agent.name, role: agent.role, kind: agent.kind,
+          ...(agent.kind === 'copilot' && opts.sessionId
+            ? await describeCopilotSession(env, agent.id)
+            : {}),
+        },
         playbook: GET_BRIEFING_PLAYBOOK,
         projects,
         state: updates,
@@ -600,14 +606,17 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
   if (opts.oauthTokenId) {
     defineTool(
       'set_agent_identity',
-      'RENAME the identity you already have — it does NOT create one, and you never need it to start working. You are registered already (a copilot when your human authorized this connection; an agent when a runner spawned you), your parent is set automatically, and get_briefing tells you who you are. Use this only to swap the auto-generated label for one that reads better in a project — names are unique per project. projectId localizes a copilot to a project (a runner-spawned agent is already pinned and should not move).',
+      'RENAME the identity you already have — it does NOT create one, and you never need it to start working. Use this only to swap the auto-generated label for one that reads better in a project. projectId changes a roaming Copilot\'s current focus; it never rewrites historical ownership or execution lineage. Immediate parentage is supplied at the MCP request boundary with `_meta["io.noriq/sessionLineage"]`, using the presence/execution identifiers returned by get_briefing.',
       {
         name: z.string().min(2).max(40).regex(/^[a-z0-9][a-z0-9._-]*$/i, 'letters/digits/._-'),
         role: z.enum(['worker', 'orchestrator']).optional(),
         projectId: z.string().optional().describe('Localize this agent to a project (recommended)'),
-        parentAgentId: z.string().optional().describe('If you are a sub-agent, the id of the agent that spawned you'),
+        parentAgentId: z.string().optional().describe('Deprecated and rejected: use `_meta["io.noriq/sessionLineage"]`'),
       },
       tool(async ({ name, role, projectId, parentAgentId }) => {
+        if (parentAgentId) {
+          throw new Error('parentAgentId is no longer mutable identity data; pass the immediate parentPresenceId and/or parentExecutionId in `_meta["io.noriq/sessionLineage"]`');
+        }
         if (projectId && agent.kind === 'agent') {
           throw new Error('runner-owned agents are pinned to their run project and cannot change project focus');
         }
@@ -627,27 +636,17 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           if (clash.userId && clash.userId !== token.userId) throw new Error(`agent name "${name}" is owned by another user — pick a different name`);
           throw new Error(`agent name "${name}" is already taken in this project — pick another`);
         }
-        if (parentAgentId) {
-          const parent = await env.DB.prepare('SELECT id, user_id AS userId FROM agents WHERE id = ?')
-            .bind(parentAgentId).first<{ id: string; userId: string | null }>();
-          if (!parent) throw new Error(`parentAgentId ${parentAgentId} not found`);
-          if (parent.userId && parent.userId !== token.userId) throw new Error('parent agent belongs to another user');
-        }
         const newRole = role ?? agent.role;
         await env.DB.prepare(
           `UPDATE agents SET label = ?, role = ?, project_id = COALESCE(?, project_id),
-             parent_agent_id = COALESCE(?, parent_agent_id), status = 'active', last_seen_at = ?
+             status = 'active', last_seen_at = ?
            WHERE id = ?`,
-        ).bind(name, newRole, projectId ?? null, parentAgentId ?? null, nowIso(), agent.id).run();
-        // Read the parent back rather than echoing the argument: it is COALESCEd above, and
-        // since PLNR-155 a copilot already HAS a parent (its connection). Echoing `?? null`
-        // would report an orphan for every rename that didn't happen to pass one.
-        const after = await env.DB.prepare('SELECT parent_agent_id AS parentAgentId, project_id AS projectId FROM agents WHERE id = ?')
-          .bind(agent.id).first<{ parentAgentId: string | null; projectId: string | null }>();
+        ).bind(name, newRole, projectId ?? null, nowIso(), agent.id).run();
+        const after = await env.DB.prepare('SELECT project_id AS projectId FROM agents WHERE id = ?')
+          .bind(agent.id).first<{ projectId: string | null }>();
         return {
           actingAs: { id: agent.id, name, role: newRole },
           project: after?.projectId ?? null,
-          parentAgentId: after?.parentAgentId ?? null,
           note: 'renamed — this identity now reads as that label; you were already this agent',
         };
       }),

@@ -124,6 +124,10 @@ describe('agent lifecycle sweep policy and configuration (PLNR-363)', () => {
          FROM agents WHERE id = 'zzals_session'`,
     ).first()).toMatchObject({ retiredAt: OLD, reason: 'session_inactive', status: 'offline' });
     expect(await env.DB.prepare(
+      `SELECT state, end_reason AS endReason FROM agent_presences
+        WHERE id = 'prs_mcp_zzals_session'`,
+    ).first()).toEqual({ state: 'ended', endReason: 'session_expired' });
+    expect(await env.DB.prepare(
       "SELECT retired_at AS retiredAt FROM agents WHERE id = 'zzals_protected'",
     ).first()).toEqual({ retiredAt: null });
     expect(await env.DB.prepare(

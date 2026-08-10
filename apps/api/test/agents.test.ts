@@ -1,7 +1,7 @@
 // Agent re-model: one connection (token) → many agents (MCP sessions), each project-local.
 import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
-import { createAgent, loginSession, createUser, mcpCall } from './helpers';
+import { createAgent, loginSession, createUser, mcpCall, mintTokenForUser } from './helpers';
 
 let conn: { id: string; apiKey: string }; // one OAuth connection (token)
 let projectId: string;
@@ -107,8 +107,9 @@ describe('agents are per-session, project-local', () => {
     // Only copilots come back — a runner's agent is the other tab's business.
     expect(copilots.every((a) => a.kind === 'copilot')).toBe(true);
 
-    // And the tree is intact: some session hangs off a connection in the same list.
-    expect(copilots.some((a) => a.parentAgentId && copilots.some((p) => p.id === a.parentAgentId))).toBe(true);
+    // OAuth ownership is not execution lineage: sessions are not automatically claimed as
+    // children of their connection root.
+    expect(copilots.filter((a) => !a.clientName).every((a) => a.parentAgentId === null)).toBe(true);
   });
 
   it('?kind=agent narrows the project roster to runner-spawned agents (PLNR-156)', async () => {
@@ -119,17 +120,62 @@ describe('agents are per-session, project-local', () => {
     expect(agents.every((a) => a.kind === 'agent')).toBe(true);
   });
 
-  it('a sub-agent is attributed to its parent', async () => {
-    const parent = await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'lead', projectId }, 'sess-lead');
-    const sub = await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'helper', projectId, parentAgentId: parent.body.actingAs.id }, 'sess-sub');
-    expect(sub.body.parentAgentId).toBe(parent.body.actingAs.id);
+  it('attributes a sub-agent through immediate session and execution lineage', async () => {
+    await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'lead', projectId }, 'sess-lead');
+    const parentBriefing = await mcpCall(conn.apiKey, 'get_briefing', {}, 'sess-lead');
+    const parent = parentBriefing.body.you as {
+      presenceId: string; execution: { executionId: string };
+    };
+    const lineage = {
+      'io.noriq/sessionLineage': {
+        parentPresenceId: parent.presenceId,
+        parentExecutionId: parent.execution.executionId,
+      },
+    };
+    const sub = await mcpCall(
+      conn.apiKey, 'set_agent_identity', { name: 'helper', projectId }, 'sess-sub', lineage,
+    );
+    expect(sub.isError).toBe(false);
+    const subBriefing = await mcpCall(conn.apiKey, 'get_briefing', {}, 'sess-sub');
+    expect(subBriefing.body.you).toMatchObject({
+      parentPresenceId: parent.presenceId,
+      lineageStatus: 'complete',
+      execution: { parentExecutionId: parent.execution.executionId, lineageStatus: 'complete' },
+    });
 
     const cookie = await bootAdmin();
     const snap = await (await SELF.fetch(`https://noriq.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json() as {
       agents: Array<{ name: string; parentAgentId: string | null }>;
     };
     const helper = snap.agents.find((a) => a.name === 'helper');
-    expect(helper?.parentAgentId).toBe(parent.body.actingAs.id);
+    expect(helper?.parentAgentId).toBeNull();
+  });
+
+  it('rejects the legacy mutable parentAgentId route', async () => {
+    const attempted = await mcpCall(conn.apiKey, 'set_agent_identity', {
+      name: 'legacy-parent', projectId, parentAgentId: 'agt_guess',
+    }, 'sess-legacy-parent');
+    expect(attempted.isError).toBe(true);
+    expect(attempted.text).toContain('io.noriq/sessionLineage');
+  });
+
+  it('rejects self, cross-user, and cross-project lineage hints', async () => {
+    await mcpCall(conn.apiKey, 'focus_project', { projectId }, 'sess-lineage-guard');
+    const own = (await mcpCall(conn.apiKey, 'get_briefing', {}, 'sess-lineage-guard')).body.you as {
+      presenceId: string; execution: { executionId: string };
+    };
+    await expect(mcpCall(conn.apiKey, 'get_briefing', {}, 'sess-lineage-guard', {
+      'io.noriq/sessionLineage': { parentPresenceId: own.presenceId },
+    })).rejects.toThrow(/cannot parent itself/);
+
+    const outsiderToken = await mintTokenForUser('lineage-outsider@example.com');
+    await expect(mcpCall(outsiderToken, 'get_briefing', {}, 'sess-lineage-outsider', {
+      'io.noriq/sessionLineage': { parentPresenceId: own.presenceId },
+    })).rejects.toThrow(/another user/);
+
+    await expect(mcpCall(conn.apiKey, 'focus_project', { projectId: otherProjectId }, 'sess-lineage-project', {
+      'io.noriq/sessionLineage': { parentExecutionId: own.execution.executionId },
+    })).rejects.toThrow(/another project/);
   });
 });
 
@@ -214,6 +260,29 @@ describe('copilot / agent split', () => {
       .all<{ id: string; status: string }>();
     expect(results).toHaveLength(1);
     expect(results[0]!.status).toBe('revoked');
+
+    // Revoking one session is not revoking its OAuth connection. The same credential may open
+    // a different session with a fresh identity.
+    const replacementSession = await mcpCall(victim.apiKey, 'get_briefing', {}, 'sess-after-revoked');
+    expect(replacementSession.body.you.id).not.toBe(agentId);
+  });
+
+  it('terminates one MCP session without revoking its OAuth connection', async () => {
+    const before = await mcpCall(conn.apiKey, 'get_briefing', {}, 'sess-client-end');
+    const endedId = before.body.you.id as string;
+    const ended = await SELF.fetch('https://noriq.test/mcp', {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${conn.apiKey}`, 'Mcp-Session-Id': 'sess-client-end' },
+    });
+    expect(ended.status).toBe(204);
+
+    await expect(mcpCall(conn.apiKey, 'get_briefing', {}, 'sess-client-end'))
+      .rejects.toThrow(/session has ended/);
+    const another = await mcpCall(conn.apiKey, 'get_briefing', {}, 'sess-after-client-end');
+    expect(another.body.you.id).not.toBe(endedId);
+    expect(await env.DB.prepare(
+      `SELECT state, end_reason AS endReason FROM agent_presences WHERE actor_id = ?`,
+    ).bind(endedId).first()).toEqual({ state: 'ended', endReason: 'client_terminated' });
   });
 
   it('the schema itself refuses a malformed agent — this is not a convention', async () => {
@@ -239,4 +308,3 @@ async function bootAdmin(): Promise<string> {
   adminCookie = await loginSession('remodel-admin@example.com', 'longenough1');
   return adminCookie;
 }
-
