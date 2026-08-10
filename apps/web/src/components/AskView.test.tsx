@@ -154,6 +154,24 @@ describe('global Ask chat', () => {
     );
   });
 
+  it('grows the composer through six lines before enabling its own scrollbar', async () => {
+    mockEmptyHistory();
+    mount();
+    await flush();
+    const textarea = container.querySelector<HTMLTextAreaElement>('textarea')!;
+    Object.defineProperty(textarea, 'scrollHeight', { configurable: true, value: 90 });
+
+    setTextarea('one\ntwo\nthree\nfour');
+    expect(textarea.style.height).toBe('90px');
+    expect(textarea.style.overflowY).toBe('hidden');
+
+    Object.defineProperty(textarea, 'scrollHeight', { configurable: true, value: 400 });
+    setTextarea('one\ntwo\nthree\nfour\nfive\nsix\nseven\neight');
+    expect(Number.parseFloat(textarea.style.height)).toBeGreaterThan(120);
+    expect(Number.parseFloat(textarea.style.height)).toBeLessThan(140);
+    expect(textarea.style.overflowY).toBe('auto');
+  });
+
   it('renders tagged project scope separately from evidence and opens the project', async () => {
     vi.spyOn(api, 'askThreads').mockResolvedValue({ threads: [activeThread] });
     const detail = detailFor(activeThread);

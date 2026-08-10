@@ -1,5 +1,5 @@
 // Global Ask — a durable, per-user multi-turn chat enriched with accessible project context.
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   api, ApiError, type ApiAskAction, type ApiAskHistoryMessage, type ApiAskModelDefinition, type ApiAskSource,
   type ApiAskInputReference, type ApiAskStoredMessage, type ApiAskThread, type ApiTaskSearchResult,
@@ -170,6 +170,7 @@ export function AskView({ store }: { store: AppStore }) {
   const [copiedMessage, setCopiedMessage] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const settlingActionsRef = useRef<Set<string>>(new Set());
   const followScrollRef = useRef(true);
@@ -221,6 +222,23 @@ export function AskView({ store }: { store: AppStore }) {
       controller.abort();
     };
   }, [taskMentionQuery]);
+
+  useLayoutEffect(() => {
+    const textarea = composerRef.current;
+    if (!textarea) return;
+    const style = window.getComputedStyle(textarea);
+    const fontSize = Number.parseFloat(style.fontSize) || 13.5;
+    const parsedLineHeight = Number.parseFloat(style.lineHeight);
+    const lineHeight = style.lineHeight.endsWith('px') && Number.isFinite(parsedLineHeight)
+      ? parsedLineHeight
+      : fontSize * 1.5;
+    const verticalPadding = (Number.parseFloat(style.paddingTop) || 0) + (Number.parseFloat(style.paddingBottom) || 0);
+    const minHeight = lineHeight * 2 + verticalPadding;
+    const maxHeight = lineHeight * 6 + verticalPadding;
+    textarea.style.height = 'auto';
+    textarea.style.height = `${Math.min(Math.max(textarea.scrollHeight, minHeight), maxHeight)}px`;
+    textarea.style.overflowY = textarea.scrollHeight > maxHeight ? 'auto' : 'hidden';
+  }, [q]);
 
   const addSelectedReference = (reference: ApiAskInputReference) => {
     setSelectedReferences((current) => current.some((item) => item.kind === reference.kind && item.id === reference.id)
@@ -836,7 +854,7 @@ export function AskView({ store }: { store: AppStore }) {
                   ))}
                 </div>
               )}
-              <textarea value={q} onChange={(event) => updateQuestion(event.target.value)} onKeyDown={(event) => {
+              <textarea ref={composerRef} value={q} onChange={(event) => updateQuestion(event.target.value)} onKeyDown={(event) => {
                 if (taskSuggestions.length > 0 && taskMentionQuery !== null && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
                   event.preventDefault();
                   setActiveTaskSuggestion((current) => event.key === 'ArrowDown'
