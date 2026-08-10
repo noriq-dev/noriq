@@ -2,8 +2,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, type ApiAgent } from '../api';
 import type { AppStore } from '../store';
-import { PROJECT_NAV_GROUPS, projectNavigationContext, type ProjectViewId } from '../project-navigation';
+import { PROJECT_NAV_GROUPS, PROJECT_NAV_ITEMS, type ProjectViewId } from '../project-navigation';
 import { AvatarChip, LiveDot } from './bits';
+
+const PINNED_VIEWS: ProjectViewId[] = ['control', 'board', 'plans', 'review'];
 
 const AGENT_COLORS = ['#4c9dff', '#b57bff', '#3fd98b', '#ff8a8a', '#c6f24e', '#f5a623'];
 const MAX_VISIBLE_AGENTS = 4;
@@ -33,17 +35,138 @@ function agentTitle(agent: ApiAgent): string {
     : `${agent.name} — live, idle`;
 }
 
+const microLabel: React.CSSProperties = {
+  fontFamily: 'var(--mono)', fontSize: 7.5, letterSpacing: '.1em',
+  textTransform: 'uppercase', color: 'var(--text-faint)', paddingLeft: 10,
+};
+
+function tabStyle(active: boolean): React.CSSProperties {
+  return {
+    cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6,
+    padding: '3px 10px', borderRadius: 6, fontSize: 12.5, whiteSpace: 'nowrap',
+    fontWeight: active ? 650 : 500,
+    color: active ? 'var(--text)' : 'var(--text-mid)',
+    background: active ? 'rgba(198,242,78,.09)' : 'transparent',
+    border: `1px solid ${active ? 'rgba(198,242,78,.25)' : 'transparent'}`,
+  };
+}
+
+/** One GROUPS trigger + its menu. Menus list only the group's non-pinned views. */
+function GroupMenu({
+  label, items, activeView, onSelect,
+}: {
+  label: string;
+  items: { id: ProjectViewId; label: string; description: string }[];
+  activeView: string;
+  onSelect: (id: ProjectViewId) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const containsActive = items.some((item) => item.id === activeView);
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOutside = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('pointerdown', closeOutside);
+    document.addEventListener('keydown', closeEscape);
+    menuRef.current?.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus();
+    return () => {
+      document.removeEventListener('pointerdown', closeOutside);
+      document.removeEventListener('keydown', closeEscape);
+    };
+  }, [open]);
+
+  return (
+    <div ref={rootRef} style={{ position: 'relative' }}>
+      <button
+        type="button"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label={`${label} views`}
+        className="topbar-tab"
+        onClick={() => setOpen((value) => !value)}
+        style={{
+          ...tabStyle(false),
+          ...(containsActive ? { color: 'var(--text)', fontWeight: 650 } : null),
+          ...(open ? { color: 'var(--text)', background: 'var(--w-06)', border: '1px solid var(--w-1)' } : null),
+          gap: 5,
+        }}
+      >
+        {label}
+        <span aria-hidden="true" style={{ fontFamily: 'var(--mono)', fontSize: 8, color: open ? 'var(--text-mid)' : 'var(--text-faint)' }}>
+          {open ? '▴' : '▾'}
+        </span>
+      </button>
+      {open && (
+        <div
+          ref={menuRef}
+          role="menu"
+          aria-label={`${label} views`}
+          onKeyDown={(event) => {
+            const menuItems = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
+            const index = menuItems.indexOf(document.activeElement as HTMLButtonElement);
+            const nextIndex = event.key === 'ArrowDown' ? Math.min(menuItems.length - 1, index + 1)
+              : event.key === 'ArrowUp' ? Math.max(0, index - 1)
+                : event.key === 'Home' ? 0
+                  : event.key === 'End' ? menuItems.length - 1
+                    : -1;
+            if (nextIndex >= 0) {
+              event.preventDefault();
+              menuItems[nextIndex]?.focus();
+            }
+          }}
+          style={{
+            position: 'absolute', zIndex: 70, top: 'calc(100% + 8px)', left: 0, width: 240,
+            padding: 6, border: '1px solid var(--w-12)', borderRadius: 12,
+            background: 'var(--bg-raised)', boxShadow: '0 18px 55px rgba(0,0,0,.5)',
+          }}
+        >
+          {items.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              role="menuitem"
+              aria-current={item.id === activeView ? 'page' : undefined}
+              className="topbar-menu-item"
+              onClick={() => { setOpen(false); onSelect(item.id); }}
+              style={{
+                width: '100%', cursor: 'pointer', display: 'flex', flexDirection: 'column',
+                gap: 1, padding: '7px 8px', borderRadius: 7, textAlign: 'left',
+                background: item.id === activeView ? 'var(--w-08)' : 'transparent',
+              }}
+            >
+              <span style={{ fontSize: 12.5, fontWeight: item.id === activeView ? 650 : 500, color: item.id === activeView ? 'var(--text)' : 'var(--text-soft)' }}>
+                {item.label}
+              </span>
+              <span style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>{item.description}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function TopBar({ store }: { store: AppStore }) {
   const { currentPid, view, helpers, actions } = store;
   const tasks = helpers.tasksOf(currentPid);
   const reviewCount = tasks.filter((task) => task.status === 'review' && !task.archivedAt).length;
-  const current = projectNavigationContext(view);
-  const [navOpen, setNavOpen] = useState(false);
-  const navRef = useRef<HTMLDivElement>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
   const [attnCount, setAttnCount] = useState(0);
   const [presence, setPresence] = useState<{ agents: ApiAgent[]; total: number } | null>(null);
   const [presenceUnavailable, setPresenceUnavailable] = useState(false);
+
+  const pinned = PINNED_VIEWS
+    .map((id) => PROJECT_NAV_ITEMS.find((item) => item.id === id))
+    .filter((item): item is (typeof PROJECT_NAV_ITEMS)[number] => Boolean(item));
+  const menuGroups = PROJECT_NAV_GROUPS
+    .map((group) => ({ label: group.label, items: group.items.filter((item) => !PINNED_VIEWS.includes(item.id)) }))
+    .filter((group) => group.items.length > 0);
 
   useEffect(() => {
     const load = () => api.attention().then((attention) => setAttnCount(attention.signals.length + attention.overdue.length)).catch(() => {});
@@ -73,27 +196,6 @@ export function TopBar({ store }: { store: AppStore }) {
     };
   }, [currentPid]);
 
-  useEffect(() => {
-    if (!navOpen) return;
-    const closeOutside = (event: PointerEvent) => {
-      if (!navRef.current?.contains(event.target as Node)) setNavOpen(false);
-    };
-    const closeEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setNavOpen(false);
-    };
-    document.addEventListener('pointerdown', closeOutside);
-    document.addEventListener('keydown', closeEscape);
-    menuRef.current?.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus();
-    return () => {
-      document.removeEventListener('pointerdown', closeOutside);
-      document.removeEventListener('keydown', closeEscape);
-    };
-  }, [navOpen]);
-
-  const selectView = (next: ProjectViewId) => {
-    setNavOpen(false);
-    actions.setView(next);
-  };
   const visibleAgents = presence?.agents.slice(0, MAX_VISIBLE_AGENTS) ?? [];
   const overflow = Math.max(0, (presence?.total ?? 0) - visibleAgents.length);
   const presenceLabel = presence
@@ -112,132 +214,50 @@ export function TopBar({ store }: { store: AppStore }) {
         borderBottom: '1px solid var(--line)',
         display: 'flex',
         alignItems: 'center',
-        padding: '0 16px',
-        gap: 10,
+        padding: '0 14px',
+        gap: 12,
         background: 'var(--bg-raised)',
       }}
     >
-      <div ref={navRef} style={{ position: 'relative', flex: 'none' }}>
-        <button
-          type="button"
-          aria-haspopup="menu"
-          aria-expanded={navOpen}
-          aria-label={`Switch project view, current ${current.item.label}`}
-          onClick={() => setNavOpen((open) => !open)}
-          className="hover-border"
-          style={{
-            minWidth: 176,
-            cursor: 'pointer',
-            display: 'flex',
-            alignItems: 'center',
-            gap: 9,
-            padding: '5px 9px',
-            border: '1px solid var(--w-09)',
-            borderRadius: 8,
-            background: 'var(--w-03)',
-            textAlign: 'left',
-          }}
-        >
-          <span style={{ fontFamily: 'var(--mono)', fontSize: 8.5, letterSpacing: '.08em', textTransform: 'uppercase', color: 'var(--text-dim)' }}>
-            {current.group.label}
-          </span>
-          <span style={{ fontSize: 13, fontWeight: 650, color: 'var(--text)', whiteSpace: 'nowrap' }}>{current.item.label}</span>
-          <span aria-hidden="true" style={{ marginLeft: 'auto', color: 'var(--text-dim)', fontSize: 10 }}>▾</span>
-        </button>
+      {/* PINNED — the four core views, always flat */}
+      <nav aria-label="Pinned views" style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 2 }}>
+        <span style={microLabel}>Pinned</span>
+        <div style={{ display: 'flex', gap: 2 }}>
+          {pinned.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              aria-current={item.id === view ? 'page' : undefined}
+              className="topbar-tab"
+              onClick={() => actions.setView(item.id)}
+              style={tabStyle(item.id === view)}
+            >
+              {item.label}
+              {item.id === 'review' && reviewCount > 0 && (
+                <span style={{ fontFamily: 'var(--mono)', fontSize: 9, fontWeight: 700, color: 'var(--amber)', background: 'rgba(245,166,35,.14)', padding: '0 5px', borderRadius: 7, lineHeight: '14px' }}>
+                  {reviewCount}
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+      </nav>
 
-        {navOpen && (
-          <div
-            ref={menuRef}
-            role="menu"
-            aria-label="Project destinations"
-            onKeyDown={(event) => {
-              const items = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
-              const index = items.indexOf(document.activeElement as HTMLButtonElement);
-              const nextIndex = event.key === 'ArrowDown' ? Math.min(items.length - 1, index + 1)
-                : event.key === 'ArrowUp' ? Math.max(0, index - 1)
-                  : event.key === 'Home' ? 0
-                    : event.key === 'End' ? items.length - 1
-                      : -1;
-              if (nextIndex >= 0) {
-                event.preventDefault();
-                items[nextIndex]?.focus();
-              }
-            }}
-            style={{
-              position: 'absolute',
-              zIndex: 70,
-              top: 'calc(100% + 8px)',
-              left: 0,
-              width: 'min(540px, calc(100vw - 28px))',
-              display: 'grid',
-              gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
-              gap: 8,
-              padding: 10,
-              border: '1px solid var(--w-12)',
-              borderRadius: 12,
-              background: 'var(--bg-raised)',
-              boxShadow: '0 18px 55px rgba(0,0,0,.5)',
-            }}
-          >
-            {PROJECT_NAV_GROUPS.map((group) => (
-              <div key={group.label} style={{ minWidth: 0, padding: 4 }}>
-                <div style={{ padding: '2px 7px 6px', fontFamily: 'var(--mono)', fontSize: 9, letterSpacing: '.09em', textTransform: 'uppercase', color: 'var(--text-faint)' }}>
-                  {group.label}
-                </div>
-                {group.items.map((item) => {
-                  const selected = item.id === view;
-                  const itemReviewCount = item.id === 'review' ? reviewCount : 0;
-                  return (
-                    <button
-                      type="button"
-                      role="menuitem"
-                      aria-current={selected ? 'page' : undefined}
-                      key={item.id}
-                      onClick={() => selectView(item.id)}
-                      style={{
-                        width: '100%',
-                        cursor: 'pointer',
-                        display: 'grid',
-                        gridTemplateColumns: '1fr auto',
-                        gap: '2px 8px',
-                        padding: '7px 8px',
-                        borderRadius: 7,
-                        textAlign: 'left',
-                        background: selected ? 'var(--w-08)' : 'transparent',
-                        color: selected ? 'var(--text)' : 'var(--text-mid)',
-                      }}
-                    >
-                      <span style={{ fontSize: 12.5, fontWeight: selected ? 650 : 500 }}>{item.label}</span>
-                      {itemReviewCount > 0 && <span style={{ gridRow: '1 / span 2', gridColumn: 2, alignSelf: 'center', fontFamily: 'var(--mono)', fontSize: 9, fontWeight: 700, color: 'var(--amber)', background: 'rgba(245,166,35,.14)', padding: '1px 6px', borderRadius: 8 }}>{itemReviewCount}</span>}
-                      <span style={{ gridColumn: 1, fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>{item.description}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            ))}
-            {store.permissions.canManage && (
-              <div style={{ gridColumn: '1 / -1', borderTop: '1px solid var(--w-07)', padding: '7px 4px 0' }}>
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => {
-                    setNavOpen(false);
-                    actions.openModal('project-edit');
-                  }}
-                  style={{ width: '100%', cursor: 'pointer', padding: '7px 8px', borderRadius: 7, textAlign: 'left', color: 'var(--text-mid)', fontFamily: 'var(--mono)', fontSize: 10.5 }}
-                >
-                  Project settings
-                </button>
-              </div>
-            )}
-          </div>
-        )}
-      </div>
+      <span style={{ width: 1, height: 26, background: 'var(--w-06)', flex: 'none' }} />
 
-      <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)', whiteSpace: 'nowrap' }}>
-        ⌘K
-      </span>
+      {/* GROUPS — everything else, one click away */}
+      <nav aria-label="View groups" style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 2 }}>
+        <span style={microLabel}>Groups</span>
+        <div style={{ display: 'flex', gap: 2 }}>
+          {menuGroups.map((group) => (
+            <GroupMenu key={group.label} label={group.label} items={group.items} activeView={view} onSelect={(id) => actions.setView(id)} />
+          ))}
+        </div>
+      </nav>
+
       <div style={{ flex: 1 }} />
+
+      <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)', whiteSpace: 'nowrap' }}>⌘K</span>
 
       {!store.permissions.canContribute && (
         <span title={store.permissions.cappedByReadOnly ? 'Your account is read-only' : 'Your project role is view-only'} style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)', border: '1px solid var(--w-1)', borderRadius: 7, padding: '4px 8px', whiteSpace: 'nowrap' }}>
@@ -245,14 +265,8 @@ export function TopBar({ store }: { store: AppStore }) {
         </span>
       )}
 
-      {reviewCount > 0 && (
-        <button type="button" onClick={() => actions.setView('review')} title={`${reviewCount} task${reviewCount === 1 ? '' : 's'} awaiting review in this project`} style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 10.5, fontWeight: 700, color: 'var(--amber)', background: 'rgba(245,166,35,.1)', border: '1px solid rgba(245,166,35,.25)', borderRadius: 8, padding: '5px 9px', whiteSpace: 'nowrap' }}>
-          Review {reviewCount}
-        </button>
-      )}
-
       {attnCount > 0 && (
-        <button type="button" onClick={() => actions.setView('home')} title={`${attnCount} item(s) need you across all projects — open Home`} style={{ cursor: 'pointer', background: 'rgba(245,166,35,.1)', border: '1px solid rgba(245,166,35,.3)', borderRadius: 8, padding: '5px 9px', color: 'var(--amber)', fontFamily: 'var(--mono)', fontSize: 10.5, fontWeight: 700, whiteSpace: 'nowrap' }}>
+        <button type="button" onClick={() => actions.setView('home')} className="hover-bright" title={`${attnCount} item(s) need you across all projects — open Home`} style={{ cursor: 'pointer', background: 'rgba(245,166,35,.1)', border: '1px solid rgba(245,166,35,.3)', borderRadius: 8, padding: '5px 9px', color: 'var(--amber)', fontFamily: 'var(--mono)', fontSize: 10.5, fontWeight: 700, whiteSpace: 'nowrap' }}>
           Attention {attnCount}
         </button>
       )}
@@ -268,6 +282,7 @@ export function TopBar({ store }: { store: AppStore }) {
         onClick={() => actions.setView('agents')}
         aria-label={presenceAria}
         title={presenceUnavailable ? 'The live-agent roster could not be refreshed' : 'Open live agents'}
+        className="hover-border"
         style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8, minHeight: 32, padding: '3px 7px', borderRadius: 9, border: '1px solid var(--w-07)', background: 'var(--w-02)', color: presenceUnavailable ? 'var(--amber)' : presence?.total ? 'var(--green)' : 'var(--text-dim)' }}
       >
         {Boolean(presence?.total) && <LiveDot />}
