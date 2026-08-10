@@ -1,15 +1,11 @@
 // Modal host + the create dialogs (projects, tasks, groups, agents).
 import { useState } from 'react';
 import type { AppStore } from '../store';
-import { api, type ApiUser } from '../api';
-import { useEffect } from 'react';
 import { Button, ErrorNote, Field, Modal, Select, TextArea, TextInput } from './ui';
-import { confirm } from './Dialog';
 
 export function ModalHost({ store }: { store: AppStore }) {
   switch (store.modal) {
     case 'project': return <CreateProjectModal store={store} />;
-    case 'project-edit': return <EditProjectModal store={store} />;
     case 'task': return <CreateTaskModal store={store} />;
     case 'group': return <CreateGroupModal store={store} />;
     case 'milestone': return <CreateMilestoneModal store={store} />;
@@ -88,171 +84,6 @@ function CreateProjectModal({ store }: { store: AppStore }) {
         <Button disabled={busy || !key.trim() || !name.trim()} onClick={run}>Create project</Button>
       </div>
       {key && <div style={{ marginTop: 12, fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>tasks will be numbered {key}-1, {key}-2, …</div>}
-    </Modal>
-  );
-}
-
-function EditProjectModal({ store }: { store: AppStore }) {
-  const project = store.data.projects.find((p) => p.id === store.currentPid);
-  const [name, setName] = useState(project?.name ?? '');
-  const [description, setDescription] = useState(project?.phase ?? '');
-  const [groupId, setGroupId] = useState(project?.groupId ?? '');
-  const [ttlMin, setTtlMin] = useState(String(Math.round((store.snapshot?.project.claimTtlSeconds ?? 1800) / 60)));
-  const [users, setUsers] = useState<ApiUser[]>([]);
-  const [ownerId, setOwnerId] = useState<string>('');
-  const [access, setAccess] = useState<Awaited<ReturnType<typeof api.projectAccess>> | null>(null);
-  const [principalType, setPrincipalType] = useState<'user' | 'group'>('user');
-  const [principalId, setPrincipalId] = useState('');
-  const [grantRole, setGrantRole] = useState<'manager' | 'contributor' | 'viewer'>('viewer');
-  const [accessError, setAccessError] = useState<string | null>(null);
-  const [confirmName, setConfirmName] = useState('');
-  const [delError, setDelError] = useState<string | null>(null);
-  const [isPublic, setIsPublic] = useState(!!project?.isPublic);
-  useEffect(() => {
-    if (!store.permissions.canManage) return;
-    api.users().then((r) => setUsers(r.users)).catch(() => {});
-    api.projectAccess(store.currentPid).then(setAccess).catch(() => {});
-  }, [store.currentPid, store.permissions.canManage]);
-  const { busy, error, run } = useSubmit(async () => {
-    await store.actions.submitProjectMeta({
-      name: name.trim(),
-      description: description.trim(),
-      groupId: groupId || null,
-      claimTtlSeconds: Math.max(1, Number(ttlMin) || 30) * 60,
-      ...(isPublic !== !!project?.isPublic ? { public: isPublic } : {}),
-    });
-  });
-  if (!project) return null;
-
-  return (
-    <Modal title={`Edit ${project.key}`} subtitle="project settings" onClose={store.actions.closeModal}>
-      <Field label="Name">
-        <TextInput autoFocus value={name} onChange={(e) => setName(e.target.value)} />
-      </Field>
-      <Field label="Description" hint="shown in the top bar">
-        <TextInput value={description} onChange={(e) => setDescription(e.target.value)} />
-      </Field>
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-        <Field label="Group">
-          <Select value={groupId} onChange={(e) => setGroupId(e.target.value)}>
-            <option value="">— none —</option>
-            {store.groups.filter((g) => g.canEdit || g.id === groupId).map((g) => (
-              <option key={g.id} value={g.id}>{g.name}</option>
-            ))}
-          </Select>
-        </Field>
-        <Field label="Claim TTL (minutes)" hint="how long a held task survives with no agent activity before it's requeued">
-          <TextInput type="number" min={1} max={1440} value={ttlMin} onChange={(e) => setTtlMin(e.target.value)} />
-        </Field>
-      </div>
-      {!groupId && (
-        <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--amber)', background: 'rgba(245,166,35,.07)', border: '1px solid rgba(245,166,35,.25)', borderRadius: 8, padding: '7px 10px', marginBottom: 12 }}>
-          ⚠ no group — only the owner (and admins) can see this project
-        </div>
-      )}
-      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.5, color: 'var(--text-soft)', marginBottom: 12, cursor: 'pointer' }}>
-        <input type="checkbox" checked={isPublic} disabled={!store.permissions.canOwn} onChange={(e) => setIsPublic(e.target.checked)} style={{ width: 'auto' }} />
-        <span>
-          Public read-only page{' '}
-          <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: isPublic ? 'var(--amber)' : 'var(--text-faint)' }}>
-            {isPublic ? `anyone with the link can VIEW this project (owner-only setting)` : 'off — members only'}
-          </span>
-        </span>
-      </label>
-      {store.permissions.canManage && access && (
-        <div style={{ marginTop: 14, borderTop: '1px solid var(--w-08)', paddingTop: 14 }}>
-          <div style={{ fontFamily: 'var(--mono)', fontSize: 10, textTransform: 'uppercase', letterSpacing: '.06em', color: 'var(--text-dim)', marginBottom: 9 }}>Project access</div>
-          <div style={{ fontSize: 11.5, color: 'var(--text-mid)', marginBottom: 9 }}>
-            Owner · <b style={{ color: 'var(--text)' }}>{access.owner?.name ?? 'unknown'}</b>. Grants are independent of group membership.
-          </div>
-          {access.grants.map((grant) => (
-            <div key={`${grant.principalType}:${grant.principalId}`} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0', borderBottom: '1px solid var(--w-05)' }}>
-              <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)', width: 42 }}>{grant.principalType}</span>
-              <span style={{ fontSize: 12, flex: 1 }}>{grant.principalName}</span>
-              <Select aria-label={`Role for ${grant.principalName}`} value={grant.role} onChange={async (e) => {
-                await api.setProjectGrant(project.id, { principalType: grant.principalType, principalId: grant.principalId, role: e.target.value as typeof grant.role });
-                setAccess(await api.projectAccess(project.id));
-              }} style={{ width: 130 }}>
-                <option value="viewer">Viewer</option><option value="contributor">Contributor</option><option value="manager">Manager</option>
-              </Select>
-              <Button variant="ghost" onClick={async () => {
-                await api.revokeProjectGrant(project.id, grant.principalType, grant.principalId);
-                setAccess(await api.projectAccess(project.id));
-              }}>Remove</Button>
-            </div>
-          ))}
-          <div style={{ display: 'grid', gridTemplateColumns: '100px 1fr 130px auto', gap: 8, marginTop: 10 }}>
-            <Select aria-label="Grant principal type" value={principalType} onChange={(e) => { setPrincipalType(e.target.value as 'user' | 'group'); setPrincipalId(''); }}>
-              <option value="user">User</option><option value="group">Group</option>
-            </Select>
-            <Select aria-label={`Grant ${principalType}`} value={principalId} onChange={(e) => setPrincipalId(e.target.value)}>
-              <option value="">Choose…</option>
-              {(principalType === 'user' ? users : store.groups).map((entry) => <option key={entry.id} value={entry.id}>{entry.name}</option>)}
-            </Select>
-            <Select aria-label="Grant role" value={grantRole} onChange={(e) => setGrantRole(e.target.value as typeof grantRole)}>
-              <option value="viewer">Viewer</option><option value="contributor">Contributor</option><option value="manager">Manager</option>
-            </Select>
-            <Button disabled={!principalId} onClick={async () => {
-              setAccessError(null);
-              try {
-                await api.setProjectGrant(project.id, { principalType, principalId, role: grantRole });
-                setAccess(await api.projectAccess(project.id));
-                setPrincipalId('');
-              } catch (e) { setAccessError(e instanceof Error ? e.message : 'could not grant access'); }
-            }}>Grant</Button>
-          </div>
-          {access.canTransferOwnership && (
-            <Field label="Transfer ownership" hint="the previous owner keeps manager access">
-              <div style={{ display: 'flex', gap: 8 }}>
-                <Select value={ownerId} onChange={(e) => setOwnerId(e.target.value)}>
-                  <option value="">Choose active user…</option>
-                  {users.filter((u) => u.id !== access.owner?.id && !u.disabled).map((u) => <option key={u.id} value={u.id}>{u.name} ({u.email})</option>)}
-                </Select>
-                <Button disabled={!ownerId} onClick={async () => {
-                  if (!(await confirm('Transfer project ownership? You will retain manager access.'))) return;
-                  await api.transferProjectOwner(project.id, ownerId);
-                  setAccess(await api.projectAccess(project.id));
-                  setOwnerId('');
-                  await store.actions.refreshNow();
-                }}>Transfer</Button>
-              </div>
-            </Field>
-          )}
-          <ErrorNote>{accessError}</ErrorNote>
-        </div>
-      )}
-      <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
-        {store.permissions.canCreateGroups && <Button variant="ghost" onClick={() => store.actions.openModal('group')}>+ new group</Button>}
-        <div style={{ flex: 1 }} />
-        <ErrorNote>{error}</ErrorNote>
-        <Button disabled={busy || !name.trim()} onClick={run}>Save changes</Button>
-      </div>
-
-      {store.permissions.canOwn && <div style={{ marginTop: 18, borderTop: '1px solid var(--w-08)', paddingTop: 14 }}>
-        <div style={{ fontFamily: 'var(--mono)', fontSize: 10, textTransform: 'uppercase', letterSpacing: '.06em', color: 'var(--red-soft)', marginBottom: 7 }}>Danger zone</div>
-        <div style={{ fontSize: 11.5, color: 'var(--text-mid)', lineHeight: 1.55, marginBottom: 9 }}>
-          Deleting removes every task, plan, milestone, tag and its history — permanently. Type <b style={{ color: 'var(--text)' }}>{project.name}</b> to confirm.
-        </div>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <TextInput value={confirmName} onChange={(e) => setConfirmName(e.target.value)} placeholder={project.name} />
-          <Button
-            variant="danger"
-            disabled={confirmName !== project.name}
-            onClick={async () => {
-              setDelError(null);
-              try {
-                await store.actions.deleteProject(project.id);
-                store.actions.closeModal();
-              } catch (e) {
-                setDelError(e instanceof Error ? e.message : 'could not delete');
-              }
-            }}
-          >
-            Delete project
-          </Button>
-        </div>
-        <ErrorNote>{delError}</ErrorNote>
-      </div>}
     </Modal>
   );
 }

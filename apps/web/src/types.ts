@@ -114,7 +114,7 @@ export interface EventVM {
   dot?: string;
 }
 
-export type ViewId = 'home' | 'control' | 'graph' | 'executions' | 'intelligence' | 'board' | 'plans' | 'roadmap' | 'review' | 'docs' | 'ask' | 'agents' | 'runs' | 'settings' | 'admin' | 'memory';
+export type ViewId = 'home' | 'control' | 'graph' | 'executions' | 'intelligence' | 'board' | 'plans' | 'roadmap' | 'review' | 'docs' | 'ask' | 'agents' | 'runs' | 'settings' | 'project-settings' | 'admin' | 'memory';
 
 export interface BoardVM {
   id: string;

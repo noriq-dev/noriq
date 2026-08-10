@@ -138,6 +138,9 @@ button { all: unset; box-sizing: border-box; max-width: 100%; }
 .intelligence-metrics small { font-family: var(--mono); font-size: 8px; color: var(--text-faint); }
 .intelligence-case { display: flex; gap: 8px; align-items: center; padding: 11px 13px; border-bottom: 1px solid var(--w-07); }
 .dispatch-intelligence-cases { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+.project-settings-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.project-settings-grant-row { display: grid; grid-template-columns: 58px minmax(120px, 1fr) 145px auto; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--w-05); }
+.project-settings-grant-form { display: grid; grid-template-columns: 100px minmax(150px, 1fr) 145px auto; gap: 8px; margin-top: 12px; }
 
 @media (max-width: 860px) {
   .mobile-topbar {
@@ -162,6 +165,7 @@ button { all: unset; box-sizing: border-box; max-width: 100%; }
   .intelligence-view { padding: 14px !important; }
   .intelligence-grid, .intelligence-groups { grid-template-columns: 1fr !important; }
   .dispatch-intelligence-cases { grid-template-columns: 1fr !important; }
+  .project-settings-grant-row, .project-settings-grant-form { grid-template-columns: 1fr !important; }
 
   /* Task drawer + centered modals go full-bleed. */
   .task-drawer { width: 100vw !important; }
@@ -205,6 +209,7 @@ button { all: unset; box-sizing: border-box; max-width: 100%; }
 @media (max-width: 480px) {
   /* Two-up form grids stack on small phones. */
   .stack-sm { grid-template-columns: 1fr !important; }
+  .project-settings-fields { grid-template-columns: 1fr !important; }
   .intelligence-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .intelligence-case { align-items: stretch; flex-wrap: wrap; }
 }

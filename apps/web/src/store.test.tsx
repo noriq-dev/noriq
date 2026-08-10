@@ -2,7 +2,7 @@
 // Called during hook init and on popstate, an unhandled throw blanked the whole app.
 // safeDecode must never throw — it falls back to the raw value.
 import { describe, expect, it } from 'vitest';
-import { buildUrlSearch, parseUrl, safeDecode } from './store';
+import { buildUrlSearch, buildViewPath, parseUrl, safeDecode } from './store';
 
 describe('safeDecode (PLNR-113)', () => {
   it('decodes valid percent-encoding', () => {
@@ -22,6 +22,22 @@ describe('global Ask route', () => {
     history.replaceState(null, '', '/ask?task=stale_project_task');
     expect(parseUrl()).toEqual({ pid: null, view: 'ask', task: null });
     history.replaceState(null, '', '/');
+  });
+});
+
+describe('project Settings route (PLNR-401)', () => {
+  it('keeps project settings scoped to the URL project and separate from account settings', () => {
+    history.replaceState(null, '', '/p/prj_alpha/settings');
+    expect(parseUrl()).toEqual({ pid: 'prj_alpha', view: 'project-settings', task: null });
+
+    history.replaceState(null, '', '/settings');
+    expect(parseUrl()).toEqual({ pid: null, view: 'settings', task: null });
+    history.replaceState(null, '', '/');
+  });
+
+  it('writes the canonical project-scoped path without colliding with account settings', () => {
+    expect(buildViewPath('project-settings', 'prj alpha')).toBe('/p/prj%20alpha/settings');
+    expect(buildViewPath('settings', 'prj alpha')).toBe('/settings');
   });
 });
 

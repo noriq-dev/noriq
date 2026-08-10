@@ -99,6 +99,16 @@ describe('compact project TopBar (PLNR-396)', () => {
     expect(groups.querySelector('[role="listbox"]')).toBeNull();
   });
 
+  it('exposes the current project settings as a direct navigation action', async () => {
+    const { setView } = mount(roster([]));
+    await tick();
+
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="Project settings"]')!;
+    expect(settings).toBeTruthy();
+    await act(async () => { settings.click(); });
+    expect(setView).toHaveBeenCalledWith('project-settings');
+  });
+
   it('shows only server-authored live actors, working first, and opens the Agents view', async () => {
     const idle = agent({ id: 'agt_idle', name: 'Idle Agent', activityAt: '2026-08-10T13:10:00.000Z' });
     const stale = agent({ id: 'agt_stale', name: 'Stale Agent', lifecycle: 'recent', live: false, heldTasks: 3 });

@@ -70,6 +70,7 @@ export function CommandPalette({ store }: { store: AppStore }) {
     for (const [view, label] of VIEW_LABELS) {
       cmds.push({ id: `view:${view}`, kind: 'view', label: `Go to ${label}`, run: close(() => actions.setView(view)) });
     }
+    if (currentPid) cmds.push({ id: 'view:project-settings', kind: 'view', label: 'Go to Project Settings', run: close(() => actions.setView('project-settings')) });
     for (const p of data.projects) {
       cmds.push({ id: `proj:${p.id}`, kind: 'project', label: `Open ${p.name}`, hint: p.key, run: close(() => actions.selectProject(p.id)) });
     }

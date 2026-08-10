@@ -186,6 +186,19 @@ export function TopBar({ store }: { store: AppStore }) {
 
       <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)', whiteSpace: 'nowrap' }}>⌘K</span>
 
+      <button
+        type="button"
+        onClick={() => actions.setView('project-settings')}
+        aria-label="Project settings"
+        aria-current={view === 'project-settings' ? 'page' : undefined}
+        title="Project settings"
+        className="hover-border"
+        style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, minHeight: 30, padding: '4px 8px', borderRadius: 8, border: `1px solid ${view === 'project-settings' ? 'rgba(198,242,78,.25)' : 'var(--w-07)'}`, background: view === 'project-settings' ? 'rgba(198,242,78,.09)' : 'var(--w-02)', color: view === 'project-settings' ? 'var(--text)' : 'var(--text-mid)', whiteSpace: 'nowrap' }}
+      >
+        <span aria-hidden="true" style={{ fontSize: 12 }}>⚙</span>
+        <span style={{ fontSize: 11.5 }}>Settings</span>
+      </button>
+
       {!store.permissions.canContribute && (
         <span title={store.permissions.cappedByReadOnly ? 'Your account is read-only' : 'Your project role is view-only'} style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)', border: '1px solid var(--w-1)', borderRadius: 7, padding: '4px 8px', whiteSpace: 'nowrap' }}>
           {store.permissions.cappedByReadOnly ? 'READ ONLY' : `${(store.permissions.effectiveRole ?? 'viewer').toUpperCase()}`}

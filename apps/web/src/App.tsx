@@ -22,6 +22,7 @@ import { MemoryView } from './components/MemoryView';
 import { ModalHost } from './components/modals';
 import { DialogHost } from './components/Dialog';
 import { SettingsView } from './components/SettingsView';
+import { ProjectSettingsView } from './components/ProjectSettingsView';
 import { AdminView } from './components/AdminView';
 import { Logo } from './components/Logo';
 import { useState } from 'react';
@@ -130,6 +131,7 @@ export function App() {
               {store.view === 'runs' && <RunsView store={store} />}
               {store.view === 'agents' && <AgentsView store={store} />}
               {store.view === 'memory' && <MemoryView store={store} />}
+              {store.view === 'project-settings' && <ProjectSettingsView key={store.currentPid} store={store} />}
             </>
           )}
         </div>

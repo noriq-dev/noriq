@@ -71,7 +71,7 @@ function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
   return { id: e.id, t: timeOf(e.createdAt), createdAt: e.createdAt, actor, actorKind: e.actorKind, verb, subject, taskId, dot };
 }
 
-const VIEWS: ViewId[] = ['home', 'control', 'graph', 'executions', 'intelligence', 'board', 'plans', 'roadmap', 'review', 'docs', 'ask', 'agents', 'runs', 'settings', 'admin', 'memory'];
+const VIEWS: ViewId[] = ['home', 'control', 'graph', 'executions', 'intelligence', 'board', 'plans', 'roadmap', 'review', 'docs', 'ask', 'agents', 'runs', 'settings', 'project-settings', 'admin', 'memory'];
 
 /** decodeURIComponent throws URIError on malformed %-encoding (e.g. `/p/%`).
  *  Unhandled during render/popstate this blanks the app (PLNR-113); fall back to the raw value. */
@@ -85,12 +85,21 @@ export function parseUrl(): { pid: string | null; view: ViewId; task: string | n
     ? 'settings'
     : location.pathname === '/ask'
       ? 'ask'
-      : (m?.[2] as ViewId | undefined);
+      : m?.[2] === 'settings'
+        ? 'project-settings'
+        : (m?.[2] as ViewId | undefined);
   return {
     pid: m?.[1] ? safeDecode(m[1]) : null,
     view: view && VIEWS.includes(view) ? view : m ? 'control' : 'home',
     task: view === 'ask' ? null : new URLSearchParams(location.search).get('task'),
   };
+}
+
+export function buildViewPath(view: ViewId, currentPid: string | null): string {
+  if (view === 'settings') return '/settings';
+  if (view === 'ask') return '/ask';
+  if (view === 'home' || !currentPid) return '/';
+  return `/p/${encodeURIComponent(currentPid)}/${view === 'project-settings' ? 'settings' : view}`;
 }
 
 /** Builds the URL<->state sync effect's target search string (PLNR-36, fixed for PLNR-287): it
@@ -124,7 +133,7 @@ export function useAppStore() {
   const [user, setUser] = useState<UserVM | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
   const [needsSetup, setNeedsSetup] = useState(false);
-  const [modal, setModal] = useState<null | 'project' | 'project-edit' | 'task' | 'group' | 'milestone' | 'tag'>(null);
+  const [modal, setModal] = useState<null | 'project' | 'task' | 'group' | 'milestone' | 'tag'>(null);
   const [editMilestone, setEditMilestone] = useState<{ id: string; title: string; dueAt: string | null } | null>(null);
   const [groups, setGroups] = useState<Array<{ id: string; name: string; description: string; canEdit: number; myRole: 'owner' | 'manager' | 'member' | null }>>([]);
   const initialUrl = useRef(parseUrl());
@@ -391,13 +400,7 @@ export function useAppStore() {
   const popping = useRef(false);
   useEffect(() => {
     if (!user) return;
-    const path = view === 'settings'
-      ? '/settings'
-      : view === 'ask'
-        ? '/ask'
-        : view === 'home' || !currentPid
-          ? '/'
-          : `/p/${encodeURIComponent(currentPid)}/${view}`;
+    const path = buildViewPath(view, currentPid);
     const target = path + buildUrlSearch(location.search, selectedTaskId);
     if (location.pathname + location.search !== target) {
       if (popping.current) {
@@ -611,8 +614,7 @@ export function useAppStore() {
     openModal(next: typeof modal) {
       if (next === 'project' && !permissions.canCreateProjects) return;
       if (next === 'group' && !permissions.canCreateGroups) return;
-      if (next === 'project-edit' && !permissions.canManage) return;
-      if (next && !['project', 'group', 'project-edit'].includes(next) && !permissions.canContribute) return;
+      if (next && !['project', 'group'].includes(next) && !permissions.canContribute) return;
       setModal(next);
     },
     closeModal: () => { setModal(null); setEditMilestone(null); },
@@ -657,11 +659,10 @@ export function useAppStore() {
       refresh();
     },
 
-    async submitProjectMeta(meta: { name?: string; description?: string; groupId?: string | null; claimTtlSeconds?: number }) {
+    async submitProjectMeta(meta: { name?: string; description?: string; groupId?: string | null; claimTtlSeconds?: number; public?: boolean }) {
       if (!pidRef.current || !permissions.canManage) return;
       await api.setProjectMeta(pidRef.current, meta);
       await loadProjects();
-      setModal(null);
       refresh();
     },
 
