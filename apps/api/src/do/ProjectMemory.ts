@@ -34,7 +34,15 @@ import {
   type PriorConstellationCommunity,
 } from '../memory/constellation-hierarchy';
 import {
-  applyMemoryFilters, dedupeCandidates, rankCandidates, RETRIEVAL_DEFAULTS,
+  clampConstellationLimit, constellationEntityPosition, cursorMatches, decodeConstellationCursor, encodeConstellationCursor,
+  CONSTELLATION_V2_DEFAULT_ENTITY_LIMIT, CONSTELLATION_V2_DEFAULT_INCIDENT_LIMIT,
+  CONSTELLATION_V2_MAX_ENTITY_LIMIT, CONSTELLATION_V2_MAX_INCIDENT_LIMIT, CONSTELLATION_V2_MAX_OVERVIEW_ROUTES,
+  type ConstellationV2AggregateRoute, type ConstellationV2Community, type ConstellationV2CommunityPage,
+  type ConstellationV2Coverage, type ConstellationV2IncidentPage, type ConstellationV2Overview,
+  type ConstellationV2Revision, type ConstellationV2Route, type ConstellationV2Unavailable,
+} from '../memory/constellation-v2';
+import {
+  applyMemoryFilters, classifyLead, dedupeCandidates, rankCandidates, RETRIEVAL_DEFAULTS,
   type RetrievalHit, type RetrievalStage, type RankedHit,
 } from '../memory/retrieval';
 import {
@@ -758,6 +766,264 @@ export class ProjectMemory extends DurableObject<Env> {
       canonicalNodes, canonicalEdges, missingNodeStats, extraNodeStats, invalidMemberships,
       missingAggregatedEdges, unexpectedAggregatedEdges,
       converged: !stale && missingNodeStats === 0 && extraNodeStats === 0 && invalidMemberships === 0 && missingAggregatedEdges === 0 && unexpectedAggregatedEdges === 0,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Constellation v2 bounded read service (PLNR-375)
+  // ---------------------------------------------------------------------------
+
+  private activeConstellationRevision(): { generation: ConstellationGenerationRow; revision: ConstellationV2Revision } | null {
+    const generation = this.ctx.storage.sql.exec<ConstellationGenerationRow>(
+      `SELECT * FROM constellation_generations WHERE status = 'active'`,
+    ).toArray()[0];
+    if (!generation) return null;
+    const currentRevision = this.readMemoryRevision();
+    const building = this.ctx.storage.sql.exec<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM constellation_generations WHERE status = 'building'`,
+    ).toArray()[0]?.n ?? 0;
+    return {
+      generation,
+      revision: {
+        contract: 'constellation-v2', generationId: generation.id, sourceRevision: generation.source_revision,
+        currentRevision, topologyVersion: generation.topology_version, layoutVersion: generation.layout_version,
+        state: building > 0 ? 'building' : generation.source_revision === currentRevision ? 'current' : 'stale',
+        generatedAt: generation.completed_at ?? generation.created_at,
+      },
+    };
+  }
+
+  private unavailableConstellation(error: ConstellationV2Unavailable['error']): ConstellationV2Unavailable {
+    return { ok: false, error, currentRevision: this.readMemoryRevision(), retryAfter: error === 'generation-unavailable' ? 5 : undefined };
+  }
+
+  private shapeConstellationCommunity(row: Record<string, string | number | null>): ConstellationV2Community {
+    return {
+      id: String(row.id), parentId: row.parent_id === null ? null : String(row.parent_id), level: Number(row.level), label: String(row.label),
+      memberCount: Number(row.member_count), childCommunityCount: Number(row.child_count),
+      typeCounts: JSON.parse(String(row.type_counts)) as Record<string, number>, internalEdgeCount: Number(row.internal_edge_count),
+      internalWeight: Number(row.internal_weight), normalizedCohesion: Number(row.normalized_cohesion), boundaryWeight: Number(row.boundary_weight),
+      anchor: [Number(row.anchor_x), Number(row.anchor_y), Number(row.anchor_z)],
+    };
+  }
+
+  private readConstellationCommunity(generationId: string, communityId: string): ConstellationV2Community | null {
+    const row = this.ctx.storage.sql.exec<Record<string, string | number | null>>(
+      `SELECT * FROM constellation_communities WHERE generation_id = ?1 AND id = ?2`, generationId, communityId,
+    ).toArray()[0];
+    return row ? this.shapeConstellationCommunity(row) : null;
+  }
+
+  private readCommunityPath(generationId: string, nodeId: string): ConstellationV2Community[] {
+    const rows = this.ctx.storage.sql.exec<Record<string, string | number | null>>(
+      `WITH RECURSIVE path AS (
+         SELECT c.* FROM constellation_memberships m
+         JOIN constellation_communities c ON c.generation_id = m.generation_id AND c.id = m.community_id
+         WHERE m.generation_id = ?1 AND m.node_id = ?2
+         UNION ALL
+         SELECT parent.* FROM path child
+         JOIN constellation_communities parent ON parent.generation_id = ?1 AND parent.id = child.parent_id
+         WHERE child.parent_id IS NOT NULL
+       ) SELECT * FROM path ORDER BY level`,
+      generationId, nodeId,
+    ).toArray();
+    return rows.map((row) => this.shapeConstellationCommunity(row));
+  }
+
+  private readAggregateRoutes(
+    generationId: string,
+    level: number,
+    communityIds: string[],
+  ): { routes: ConstellationV2AggregateRoute[]; externalCommunities: ConstellationV2Community[]; truncated: boolean } {
+    if (communityIds.length === 0) return { routes: [], externalCommunities: [], truncated: false };
+    const placeholders = communityIds.map((_, i) => `?${i + 3}`).join(',');
+    const rows = this.ctx.storage.sql.exec<{
+      from_community_id: string; to_community_id: string; direction: 'forward' | 'reverse' | 'both'; edge_count: number; weight: number; by_type: string;
+    }>(
+      `SELECT from_community_id,to_community_id,direction,edge_count,weight,by_type
+       FROM constellation_community_links
+       WHERE generation_id = ?1 AND level = ?2
+         AND (from_community_id IN (${placeholders}) OR to_community_id IN (${placeholders}))
+       ORDER BY weight DESC, from_community_id, to_community_id LIMIT ${CONSTELLATION_V2_MAX_OVERVIEW_ROUTES + 1}`,
+      generationId, level, ...communityIds,
+    ).toArray();
+    const truncated = rows.length > CONSTELLATION_V2_MAX_OVERVIEW_ROUTES;
+    const page = rows.slice(0, CONSTELLATION_V2_MAX_OVERVIEW_ROUTES);
+    const routes = page.map((row) => ({
+      fromCommunityId: row.from_community_id, toCommunityId: row.to_community_id, direction: row.direction,
+      count: row.edge_count, weight: row.weight, byType: JSON.parse(row.by_type) as Record<string, number>,
+    }));
+    const visible = new Set(communityIds);
+    const externalIds = [...new Set(routes.flatMap((route) => [route.fromCommunityId, route.toCommunityId]).filter((id) => !visible.has(id)))];
+    const externalCommunities = externalIds.map((id) => this.readConstellationCommunity(generationId, id)).filter((row): row is ConstellationV2Community => row !== null);
+    return { routes, externalCommunities, truncated };
+  }
+
+  private constellationCoverage(revision: ConstellationV2Revision, pageLimited: boolean, excludedAtLevel = false): ConstellationV2Coverage {
+    const reasons: ConstellationV2Coverage['reasons'] = [];
+    if (pageLimited) reasons.push('page-limit-reached');
+    if (revision.state !== 'current') reasons.push('generation-stale');
+    if (excludedAtLevel) reasons.push('excluded-at-this-level');
+    return { complete: !pageLimited && revision.state === 'current', reasons };
+  }
+
+  async constellationV2Overview(projectId: string): Promise<ConstellationV2Overview | ConstellationV2Unavailable> {
+    await this.assertProjectId(projectId);
+    const active = this.activeConstellationRevision();
+    if (!active) return this.unavailableConstellation('generation-unavailable');
+    const rows = this.ctx.storage.sql.exec<Record<string, string | number | null>>(
+      `SELECT * FROM constellation_communities WHERE generation_id = ?1 AND parent_id IS NULL ORDER BY id`, active.generation.id,
+    ).toArray();
+    const communities = rows.map((row) => this.shapeConstellationCommunity(row));
+    const routePage = this.readAggregateRoutes(active.generation.id, 0, communities.map((community) => community.id));
+    return {
+      revision: active.revision, communities, routes: routePage.routes,
+      coverage: this.constellationCoverage(active.revision, routePage.truncated, true),
+    };
+  }
+
+  async constellationV2Community(
+    projectId: string,
+    communityId: string,
+    input: { cursor?: string; limit?: number } = {},
+  ): Promise<ConstellationV2CommunityPage | ConstellationV2Unavailable> {
+    await this.assertProjectId(projectId);
+    const active = this.activeConstellationRevision();
+    if (!active) return this.unavailableConstellation('generation-unavailable');
+    const community = this.readConstellationCommunity(active.generation.id, communityId);
+    if (!community) return this.unavailableConstellation('not-found');
+    const scope = `community:${communityId}`;
+    const cursor = decodeConstellationCursor(input.cursor);
+    if (input.cursor && (!cursor || !cursorMatches(cursor, active.generation.id, active.revision.currentRevision, scope))) {
+      return this.unavailableConstellation('cursor-stale');
+    }
+    if (community.childCommunityCount > 0) {
+      const limit = clampConstellationLimit(input.limit, 128, 128);
+      const rows = this.ctx.storage.sql.exec<Record<string, string | number | null>>(
+        `SELECT * FROM constellation_communities
+         WHERE generation_id = ?1 AND parent_id = ?2 AND id > ?3 ORDER BY id LIMIT ?4`,
+        active.generation.id, communityId, cursor?.after ?? '', limit + 1,
+      ).toArray();
+      const pageLimited = rows.length > limit;
+      const communities = rows.slice(0, limit).map((row) => this.shapeConstellationCommunity(row));
+      const routePage = this.readAggregateRoutes(active.generation.id, community.level + 1, communities.map((row) => row.id));
+      const after = communities.at(-1)?.id;
+      return {
+        revision: active.revision, community, kind: 'communities', communities, entities: [], routes: routePage.routes,
+        externalCommunities: routePage.externalCommunities,
+        nextCursor: pageLimited && after ? encodeConstellationCursor({ generationId: active.generation.id, currentRevision: active.revision.currentRevision, scope, after }) : null,
+        coverage: this.constellationCoverage(active.revision, pageLimited || routePage.truncated, true),
+      };
+    }
+    const limit = clampConstellationLimit(input.limit, CONSTELLATION_V2_DEFAULT_ENTITY_LIMIT, CONSTELLATION_V2_MAX_ENTITY_LIMIT);
+    let afterRank = Number.MAX_VALUE, afterNodeId = '';
+    if (cursor) {
+      try { [afterRank, afterNodeId] = JSON.parse(cursor.after) as [number, string]; }
+      catch { return this.unavailableConstellation('cursor-stale'); }
+    }
+    const rows = this.ctx.storage.sql.exec<{
+      node_id: string; uri: string; type: string; label: string; degree: number; boundary_degree: number; rank: number;
+      kind: string | null; authority: number | null; validity: string | null;
+    }>(
+      `SELECT n.id AS node_id,n.uri,n.type,n.label,s.degree,s.boundary_degree,s.rank,
+              COALESCE(mi.kind, ep.landing_outcome) AS kind,mi.authority,mi.validity
+       FROM constellation_memberships m
+       JOIN constellation_node_stats s ON s.generation_id = m.generation_id AND s.node_id = m.node_id
+       JOIN nodes n ON n.id = m.node_id
+       LEFT JOIN memory_items mi ON n.type = 'memory' AND n.uri = 'noriq://memory/' || mi.id
+       LEFT JOIN episodes ep ON n.type = 'episode' AND n.uri = 'noriq://episode/' || ep.id
+       WHERE m.generation_id = ?1 AND m.community_id = ?2
+         AND (s.rank < ?3 OR (s.rank = ?3 AND n.id > ?4))
+       ORDER BY s.rank DESC,n.id LIMIT ?5`,
+      active.generation.id, communityId, afterRank, afterNodeId, limit + 1,
+    ).toArray();
+    const pageLimited = rows.length > limit;
+    const entityRows = rows.slice(0, limit);
+    const entities = entityRows.map((row) => {
+      const lead = row.authority !== null || row.validity !== null ? classifyLead({ authority: row.authority ?? undefined, validity: row.validity ?? undefined }) : null;
+      return {
+        nodeId: row.node_id, uri: row.uri, type: row.type, kind: row.kind, label: row.label,
+        authority: row.authority, validity: row.validity, isLead: lead?.isLead ?? null, leadReasons: lead?.leadReasons ?? null,
+        degree: row.degree, boundaryDegree: row.boundary_degree, groupKey: row.type, communityId,
+        position: constellationEntityPosition(row.uri, community.anchor),
+      };
+    });
+    const routePage = this.readAggregateRoutes(active.generation.id, community.level, [community.id]);
+    const last = entityRows.at(-1);
+    return {
+      revision: active.revision, community, kind: 'entities', communities: [], entities, routes: routePage.routes,
+      externalCommunities: routePage.externalCommunities,
+      nextCursor: pageLimited && last ? encodeConstellationCursor({ generationId: active.generation.id, currentRevision: active.revision.currentRevision, scope, after: JSON.stringify([last.rank, last.node_id]) }) : null,
+      coverage: this.constellationCoverage(active.revision, pageLimited || routePage.truncated),
+    };
+  }
+
+  async constellationV2Route(projectId: string, uri: string): Promise<ConstellationV2Route | ConstellationV2Unavailable> {
+    await this.assertProjectId(projectId);
+    const active = this.activeConstellationRevision();
+    if (!active) return this.unavailableConstellation('generation-unavailable');
+    const node = this.ctx.storage.sql.exec<{ id: string; uri: string }>(`SELECT id,uri FROM nodes WHERE uri = ?1`, uri).toArray()[0];
+    if (!node) return this.unavailableConstellation('not-found');
+    const communityPath = this.readCommunityPath(active.generation.id, node.id);
+    if (communityPath.length === 0) return this.unavailableConstellation('generation-stale');
+    return { revision: active.revision, nodeId: node.id, uri: node.uri, communityPath };
+  }
+
+  async constellationV2Incidents(
+    projectId: string,
+    nodeId: string,
+    input: { cursor?: string; limit?: number } = {},
+  ): Promise<ConstellationV2IncidentPage | ConstellationV2Unavailable> {
+    await this.assertProjectId(projectId);
+    const active = this.activeConstellationRevision();
+    if (!active) return this.unavailableConstellation('generation-unavailable');
+    const node = this.ctx.storage.sql.exec<{ id: string; uri: string; type: string; label: string }>(
+      `SELECT id,uri,type,label FROM nodes WHERE id = ?1`, nodeId,
+    ).toArray()[0];
+    if (!node) return this.unavailableConstellation('not-found');
+    const communityPath = this.readCommunityPath(active.generation.id, node.id);
+    if (communityPath.length === 0) return this.unavailableConstellation('generation-stale');
+    const scope = `incidents:${nodeId}`;
+    const cursor = decodeConstellationCursor(input.cursor);
+    if (input.cursor && (!cursor || !cursorMatches(cursor, active.generation.id, active.revision.currentRevision, scope))) {
+      return this.unavailableConstellation('cursor-stale');
+    }
+    let after: [string, string, string, string] = ['', '', '', ''];
+    if (cursor) {
+      try { after = JSON.parse(cursor.after) as [string, string, string, string]; }
+      catch { return this.unavailableConstellation('cursor-stale'); }
+    }
+    const limit = clampConstellationLimit(input.limit, CONSTELLATION_V2_DEFAULT_INCIDENT_LIMIT, CONSTELLATION_V2_MAX_INCIDENT_LIMIT);
+    const rows = this.ctx.storage.sql.exec<{
+      edge_id: string; edge_type: string; direction: 'incoming' | 'outgoing'; provenance: string | null;
+      endpoint_id: string; endpoint_uri: string; endpoint_type: string; endpoint_label: string;
+    }>(
+      `SELECT e.id AS edge_id,e.type AS edge_type,e.provenance,
+              CASE WHEN e.from_node_id = ?1 THEN 'outgoing' ELSE 'incoming' END AS direction,
+              other.id AS endpoint_id,other.uri AS endpoint_uri,other.type AS endpoint_type,other.label AS endpoint_label
+       FROM edges e JOIN nodes other ON other.id = CASE WHEN e.from_node_id = ?1 THEN e.to_node_id ELSE e.from_node_id END
+       WHERE (e.from_node_id = ?1 OR e.to_node_id = ?1) AND (
+         e.type > ?2 OR (e.type = ?2 AND (CASE WHEN e.from_node_id = ?1 THEN 'outgoing' ELSE 'incoming' END) > ?3) OR
+         (e.type = ?2 AND (CASE WHEN e.from_node_id = ?1 THEN 'outgoing' ELSE 'incoming' END) = ?3 AND other.uri > ?4) OR
+         (e.type = ?2 AND (CASE WHEN e.from_node_id = ?1 THEN 'outgoing' ELSE 'incoming' END) = ?3 AND other.uri = ?4 AND e.id > ?5)
+       )
+       ORDER BY e.type,direction,other.uri,e.id LIMIT ?6`,
+      nodeId, after[0], after[1], after[2], after[3], limit + 1,
+    ).toArray();
+    const pageLimited = rows.length > limit;
+    const edgeRows = rows.slice(0, limit);
+    const edges = edgeRows.map((row) => ({
+      edgeId: row.edge_id, type: row.edge_type, direction: row.direction, provenance: row.provenance,
+      endpoint: { nodeId: row.endpoint_id, uri: row.endpoint_uri, type: row.endpoint_type, label: row.endpoint_label, communityPath: this.readCommunityPath(active.generation.id, row.endpoint_id) },
+    }));
+    const last = edgeRows.at(-1);
+    return {
+      revision: active.revision, node: { nodeId: node.id, uri: node.uri, type: node.type, label: node.label, communityPath }, edges,
+      nextCursor: pageLimited && last ? encodeConstellationCursor({
+        generationId: active.generation.id, currentRevision: active.revision.currentRevision, scope,
+        after: JSON.stringify([last.edge_type, last.direction, last.endpoint_uri, last.edge_id]),
+      }) : null,
+      coverage: this.constellationCoverage(active.revision, pageLimited),
     };
   }
 

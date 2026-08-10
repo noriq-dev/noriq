@@ -547,6 +547,24 @@ export const api = {
   // navigating-away human wants to cancel mid-flight.
   memoryConstellation: (pid: string, options?: { includeIsolated?: boolean }, signal?: AbortSignal) =>
     req<ApiConstellation>('POST', `/api/projects/${pid}/memory/constellation`, options ?? {}, signal),
+  memoryConstellationV2Overview: (pid: string, signal?: AbortSignal) =>
+    req<ApiConstellationV2Overview>('GET', `/api/projects/${pid}/memory/constellation/v2/overview`, undefined, signal),
+  memoryConstellationV2Community: (pid: string, communityId: string, input: { cursor?: string; limit?: number } = {}, signal?: AbortSignal) => {
+    const query = new URLSearchParams();
+    if (input.cursor) query.set('cursor', input.cursor);
+    if (input.limit) query.set('limit', String(input.limit));
+    const suffix = query.size ? `?${query}` : '';
+    return req<ApiConstellationV2CommunityPage>('GET', `/api/projects/${pid}/memory/constellation/v2/communities/${encodeURIComponent(communityId)}${suffix}`, undefined, signal);
+  },
+  memoryConstellationV2Route: (pid: string, uri: string, signal?: AbortSignal) =>
+    req<ApiConstellationV2EntityRoute>('GET', `/api/projects/${pid}/memory/constellation/v2/route?uri=${encodeURIComponent(uri)}`, undefined, signal),
+  memoryConstellationV2Incidents: (pid: string, nodeId: string, input: { cursor?: string; limit?: number } = {}, signal?: AbortSignal) => {
+    const query = new URLSearchParams();
+    if (input.cursor) query.set('cursor', input.cursor);
+    if (input.limit) query.set('limit', String(input.limit));
+    const suffix = query.size ? `?${query}` : '';
+    return req<ApiConstellationV2IncidentPage>('GET', `/api/projects/${pid}/memory/constellation/v2/entities/${encodeURIComponent(nodeId)}/incidents${suffix}`, undefined, signal);
+  },
   memoryEntities: (pid: string, input: ApiGraphEntityPageInput, signal?: AbortSignal) =>
     req<ApiGraphEntityPage>('POST', `/api/projects/${pid}/memory/entities`, input, signal),
 
@@ -1530,6 +1548,43 @@ export interface ApiConstellation {
   /** Optional during rolling deploys from pre-PLNR-339 API workers. */
   sampling?: ApiConstellationSampling;
   coverage: ApiGraphCoverage;
+}
+
+export interface ApiConstellationV2Revision {
+  contract: 'constellation-v2'; generationId: string; sourceRevision: number; currentRevision: number;
+  topologyVersion: string; layoutVersion: string; state: 'current' | 'stale' | 'building'; generatedAt: string;
+}
+export interface ApiConstellationV2Coverage {
+  complete: boolean;
+  reasons: Array<'page-limit-reached' | 'generation-stale' | 'excluded-at-this-level'>;
+}
+export interface ApiConstellationV2Community {
+  id: string; parentId: string | null; level: number; label: string; memberCount: number; childCommunityCount: number;
+  typeCounts: Record<string, number>; internalEdgeCount: number; internalWeight: number; normalizedCohesion: number;
+  boundaryWeight: number; anchor: [number, number, number];
+}
+export interface ApiConstellationV2RouteEdge {
+  fromCommunityId: string; toCommunityId: string; direction: 'forward' | 'reverse' | 'both'; count: number; weight: number; byType: Record<string, number>;
+}
+export interface ApiConstellationV2Entity extends Omit<ApiConstellationNode, 'createdAt'> {
+  boundaryDegree: number; communityId: string; position: [number, number, number];
+}
+export interface ApiConstellationV2Overview {
+  revision: ApiConstellationV2Revision; communities: ApiConstellationV2Community[]; routes: ApiConstellationV2RouteEdge[]; coverage: ApiConstellationV2Coverage;
+}
+export interface ApiConstellationV2CommunityPage {
+  revision: ApiConstellationV2Revision; community: ApiConstellationV2Community; kind: 'communities' | 'entities';
+  communities: ApiConstellationV2Community[]; entities: ApiConstellationV2Entity[]; routes: ApiConstellationV2RouteEdge[];
+  externalCommunities: ApiConstellationV2Community[]; nextCursor: string | null; coverage: ApiConstellationV2Coverage;
+}
+export interface ApiConstellationV2EntityRoute {
+  revision: ApiConstellationV2Revision; nodeId: string; uri: string; communityPath: ApiConstellationV2Community[];
+}
+export interface ApiConstellationV2IncidentPage {
+  revision: ApiConstellationV2Revision;
+  node: { nodeId: string; uri: string; type: string; label: string; communityPath: ApiConstellationV2Community[] };
+  edges: Array<{ edgeId: string; type: string; direction: 'incoming' | 'outgoing'; provenance: string | null; endpoint: { nodeId: string; uri: string; type: string; label: string; communityPath: ApiConstellationV2Community[] } }>;
+  nextCursor: string | null; coverage: ApiConstellationV2Coverage;
 }
 
 export type ApiGraphEntitySort = 'newest' | 'connected' | 'authority' | 'label';

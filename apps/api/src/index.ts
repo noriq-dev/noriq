@@ -1664,6 +1664,58 @@ app.post('/api/projects/:pid/memory/constellation', userAuth, async (c) => {
   return c.json(await memoryStub(c.env, pid).constellation(pid, { includeIsolated: body.includeIsolated === true }));
 });
 
+// Constellation v2 reads only completed derived hierarchy rows. These additive GET routes are
+// cache-addressable and never fall through to v1's whole-graph materialization.
+app.get('/api/projects/:pid/memory/constellation/v2/overview', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const result = await memoryStub(c.env, pid).constellationV2Overview(pid);
+  if ('ok' in result && result.ok === false) {
+    const status = result.error === 'generation-unavailable' ? 503 : result.error === 'not-found' ? 404 : 409;
+    if (result.retryAfter) c.header('Retry-After', String(result.retryAfter));
+    return c.json({ ...result, error: `constellation_${result.error.replaceAll('-', '_')}` }, status);
+  }
+  return c.json(result);
+});
+
+app.get('/api/projects/:pid/memory/constellation/v2/communities/:communityId', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const result = await memoryStub(c.env, pid).constellationV2Community(pid, c.req.param('communityId')!, {
+    cursor: c.req.query('cursor'), limit: c.req.query('limit') ? Number(c.req.query('limit')) : undefined,
+  });
+  if ('ok' in result && result.ok === false) {
+    const status = result.error === 'generation-unavailable' ? 503 : result.error === 'not-found' ? 404 : 409;
+    if (result.retryAfter) c.header('Retry-After', String(result.retryAfter));
+    return c.json({ ...result, error: `constellation_${result.error.replaceAll('-', '_')}` }, status);
+  }
+  return c.json(result);
+});
+
+app.get('/api/projects/:pid/memory/constellation/v2/route', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const uri = c.req.query('uri');
+  if (!uri) return c.json({ error: 'uri is required' }, 400);
+  const result = await memoryStub(c.env, pid).constellationV2Route(pid, uri);
+  if ('ok' in result && result.ok === false) {
+    const status = result.error === 'generation-unavailable' ? 503 : result.error === 'not-found' ? 404 : 409;
+    if (result.retryAfter) c.header('Retry-After', String(result.retryAfter));
+    return c.json({ ...result, error: `constellation_${result.error.replaceAll('-', '_')}` }, status);
+  }
+  return c.json(result);
+});
+
+app.get('/api/projects/:pid/memory/constellation/v2/entities/:nodeId/incidents', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const result = await memoryStub(c.env, pid).constellationV2Incidents(pid, c.req.param('nodeId')!, {
+    cursor: c.req.query('cursor'), limit: c.req.query('limit') ? Number(c.req.query('limit')) : undefined,
+  });
+  if ('ok' in result && result.ok === false) {
+    const status = result.error === 'generation-unavailable' ? 503 : result.error === 'not-found' ? 404 : 409;
+    if (result.retryAfter) c.header('Retry-After', String(result.retryAfter));
+    return c.json({ ...result, error: `constellation_${result.error.replaceAll('-', '_')}` }, status);
+  }
+  return c.json(result);
+});
+
 // PLNR-339: exhaustive ordered catalogue behind Explore and the accessible map list. Kept
 // separate from the bounded canvas response so pagination never fragments the visual graph.
 app.post('/api/projects/:pid/memory/entities', userAuth, async (c) => {
