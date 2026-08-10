@@ -57,7 +57,7 @@ interface MemRpc {
     pid: string,
     opts: {
       query?: string; memoryItemId?: string; episodeId?: string; taskId?: string; seedEntityUri?: string;
-      edgeTypes?: string[]; maxDepth?: number; repositoryKey?: string; branch?: string; kind?: string;
+      edgeTypes?: string[]; maxDepth?: number; repositoryKey?: string; branch?: string; preferBranch?: string; kind?: string;
       minAuthority?: number; validity?: string; limit?: number;
     },
   ): Promise<{ mode: 'semantic' | 'keyword'; results: RankedHit[] }>;
@@ -193,7 +193,9 @@ describe('search_project_memory — registration and MCP floor gating', () => {
     expect(tool!.description.toLowerCase()).toContain('lead');
     expect(tool!.description).toContain('taskId');
     expect(tool!.description).toContain('baseId');
+    expect(tool!.description).toContain('preferBranch');
     expect((tool as unknown as { inputSchema: { properties: Record<string, unknown> } }).inputSchema.properties).toHaveProperty('baseId');
+    expect((tool as unknown as { inputSchema: { properties: Record<string, unknown> } }).inputSchema.properties).toHaveProperty('preferBranch');
   });
 
   it('is absent from tools/list for a floor that omits it, present and callable for one that includes it', async () => {
@@ -372,6 +374,31 @@ describe('filters compose: repository, branch, kind, authority, validity', () =>
 
     const byMinAuthority = await memory(projectId).searchProjectMemory(projectId, { query: 'leaks connections', minAuthority: 3 });
     expect(byMinAuthority.results.map((r) => r.id)).not.toContain(a.memoryId); // both are authority 1
+  });
+
+  it('keeps cross-branch memories when branch is only preferred, while an explicit branch still filters', async () => {
+    const { projectId } = await newOwnedProject('pm-retr-branch-preference@example.com', 'PMRBRP');
+    const main = await memory(projectId).recordMemory(projectId, {
+      kind: 'learning', statement: 'branch preference probe common memory main',
+      scope: { repositoryKey: 'repo-x', branch: 'main' }, actor: { kind: 'agent', id: 'agt_x' },
+    });
+    const feature = await memory(projectId).recordMemory(projectId, {
+      kind: 'learning', statement: 'branch preference probe common memory feature',
+      scope: { repositoryKey: 'repo-x', branch: 'feature' }, actor: { kind: 'agent', id: 'agt_x' },
+    });
+
+    const preferred = await memory(projectId).searchProjectMemory(projectId, {
+      query: 'branch preference probe common memory', preferBranch: 'main', limit: 10,
+    });
+    expect(preferred.results.map((r) => r.id)).toEqual(expect.arrayContaining([main.memoryId, feature.memoryId]));
+    expect(preferred.results.find((r) => r.id === main.memoryId)!.finalScore)
+      .toBeGreaterThan(preferred.results.find((r) => r.id === feature.memoryId)!.finalScore);
+
+    const filtered = await memory(projectId).searchProjectMemory(projectId, {
+      query: 'branch preference probe common memory', branch: 'main', limit: 10,
+    });
+    expect(filtered.results.map((r) => r.id)).toContain(main.memoryId);
+    expect(filtered.results.map((r) => r.id)).not.toContain(feature.memoryId);
   });
 });
 

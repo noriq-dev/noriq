@@ -185,6 +185,34 @@ describe('assembleContextPack — required facts are never displaced, at any bud
 });
 
 describe('assembleContextPack — evidence, authority, validity, and base-scoped verification', () => {
+  it('retrieves the same relevant memories across caller branches instead of filtering cross-branch knowledge', async () => {
+    const projectId = await newProject('MCPBRNCH');
+    const made = await mcpCall(agent.apiKey, 'create_task', {
+      projectId, title: 'Cross branch memory retrieval probe', tags: ['context-pack-test'],
+    });
+    const recorded = await mcpCall(agent.apiKey, 'record_memory', {
+      projectId,
+      kind: 'learning',
+      statement: 'Cross branch memory retrieval probe keeps durable context visible',
+      scope: { repositoryKey: 'repo-x', branch: 'feature' },
+    });
+    const memoryId = recorded.body.memoryId as string;
+
+    const fromMain = await assembleContextPack(appEnv, projectId, made.body.id as string, {
+      repositoryKey: 'repo-x', branch: 'main', tokenBudget: 10_000,
+    });
+    const fromFeature = await assembleContextPack(appEnv, projectId, made.body.id as string, {
+      repositoryKey: 'repo-x', branch: 'feature', tokenBudget: 10_000,
+    });
+    const ids = (pack: typeof fromMain) => pack.sections
+      .flatMap((section) => section.excerpts)
+      .filter((excerpt) => excerpt.excerptKind === 'memory')
+      .map((excerpt) => excerpt.id);
+
+    expect(ids(fromMain)).toContain(memoryId);
+    expect(ids(fromFeature)).toContain(memoryId);
+  });
+
   it('every memory excerpt states authority/validity/evidence, and a citation verified at a DIFFERENT base is not presented as verified for this caller', async () => {
     const projectId = await newProject('MCP4');
     const made = await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'A task needing a settled decision', tags: ['context-pack-test'] });

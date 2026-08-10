@@ -235,7 +235,11 @@ export interface ProjectMemoryStub {
       edgeTypes?: string[];
       maxDepth?: number;
       repositoryKey?: string;
+      /** Hard filter: only return memories scoped to this branch (or unscoped memories). */
       branch?: string;
+      /** The caller's current branch: prefer matching memories without excluding memories from
+       *  other branches, and scope citation verification to this caller. */
+      preferBranch?: string;
       /** PLNR-265: the caller's own opaque VCS revision — string-compared only, scopes whether a
        *  'valid' citation reads as verified FOR THIS CALLER (`evidence-base-mismatch`). */
       baseId?: string;

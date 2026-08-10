@@ -3603,12 +3603,16 @@ export class ProjectMemory extends DurableObject<Env> {
       edgeTypes?: string[];
       maxDepth?: number;
       repositoryKey?: string;
+      /** Hard filter: only return memories scoped to this branch (or unscoped memories). */
       branch?: string;
+      /** The caller's current branch. Unlike `branch`, this only reranks cross-branch memories
+       *  lower and scopes citation verification; it never excludes them. */
+      preferBranch?: string;
       /** The caller's own opaque VCS revision (PLNR-265, §6) — string-compared only, never
-       *  parsed. Purely a verification-scoping input: unlike `branch` (which ALSO drives the
-       *  `preferBranch` rerank penalty below), a `baseId` mismatch never excludes or reranks a
-       *  candidate — it only stops a 'valid' citation checked against a DIFFERENT base from
-       *  reading as verified FOR this caller (`classifyLead`'s `evidence-base-mismatch`). */
+       *  parsed. Purely a verification-scoping input: unlike `branch`, a `baseId` mismatch never
+       *  excludes or reranks a candidate — it only stops a 'valid' citation checked against a
+       *  DIFFERENT base from reading as verified FOR this caller (`classifyLead`'s
+       *  `evidence-base-mismatch`). */
       baseId?: string;
       kind?: string;
       minAuthority?: number;
@@ -3618,7 +3622,11 @@ export class ProjectMemory extends DurableObject<Env> {
   ): Promise<{ mode: 'semantic' | 'keyword'; results: RankedHit[] }> {
     await this.assertProjectId(projectId);
     const limit = Math.min(Math.max(opts.limit ?? RETRIEVAL_DEFAULTS.maxResults, 1), RETRIEVAL_DEFAULTS.maxResultsCeiling);
-    const caller: CallerBaseScope = { baseId: opts.baseId ?? null, branch: opts.branch ?? null };
+    // `branch` remains backward-compatible as a caller scope when a direct filtered search does
+    // not also provide `preferBranch`. Context-pack assembly supplies only `preferBranch`, which
+    // is the important distinction: its caller branch affects verification/ranking but cannot
+    // hide knowledge recorded on another branch.
+    const caller: CallerBaseScope = { baseId: opts.baseId ?? null, branch: opts.preferBranch ?? opts.branch ?? null };
     const candidates: RetrievalHit[] = [];
     let mode: 'semantic' | 'keyword' = 'keyword';
 
@@ -3680,7 +3688,7 @@ export class ProjectMemory extends DurableObject<Env> {
       minAuthority: opts.minAuthority,
       validity: opts.validity,
     });
-    const results = rankCandidates(filtered, { limit, preferBranch: opts.branch });
+    const results = rankCandidates(filtered, { limit, preferBranch: opts.preferBranch });
     return { mode, results };
   }
 

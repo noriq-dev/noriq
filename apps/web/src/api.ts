@@ -1295,6 +1295,7 @@ export interface ApiMemorySearchFilters {
   maxDepth?: number;
   repositoryKey?: string;
   branch?: string;
+  preferBranch?: string;
   kind?: string;
   minAuthority?: number;
   validity?: string;

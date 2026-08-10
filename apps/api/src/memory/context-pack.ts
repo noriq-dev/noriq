@@ -377,7 +377,9 @@ export async function assembleContextPack(
       query: signals.queryText || undefined,
       taskId: row.id,
       repositoryKey: input.repositoryKey ?? undefined,
-      branch: input.branch ?? undefined,
+      // The task's caller branch is a ranking/verification preference, not a hard filter: a pack
+      // must retain relevant project knowledge recorded on another branch, only demoting it.
+      preferBranch: input.branch ?? undefined,
       baseId: input.baseId ?? undefined,
       limit: RETRIEVAL_DEFAULTS.maxResultsCeiling,
     }),

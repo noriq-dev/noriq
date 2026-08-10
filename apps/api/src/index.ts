@@ -1576,7 +1576,7 @@ app.post('/api/projects/:pid/memory/search', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
   const body = await c.req.json<{
     query?: string; memoryItemId?: string; episodeId?: string; taskId?: string; seedEntityUri?: string;
-    edgeTypes?: string[]; maxDepth?: number; repositoryKey?: string; branch?: string; baseId?: string; kind?: string;
+    edgeTypes?: string[]; maxDepth?: number; repositoryKey?: string; branch?: string; preferBranch?: string; baseId?: string; kind?: string;
     minAuthority?: number; validity?: string; limit?: number;
   }>().catch(() => ({}) as Record<string, never>);
   const result = await memoryStub(c.env, pid).searchProjectMemory(pid, body);
