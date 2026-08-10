@@ -22,7 +22,7 @@ const emptyRunners: ApiRunnerRoster = {
   policy: { heartbeatSeconds: 90 },
 };
 
-function mount() {
+function mount(canManage = true, role: 'admin' | 'member' = 'member') {
   vi.spyOn(api, 'agents').mockResolvedValue(emptyAgents);
   vi.spyOn(api, 'runners').mockResolvedValue(emptyRunners);
   vi.spyOn(api, 'users').mockResolvedValue({ users: [] });
@@ -30,7 +30,9 @@ function mount() {
   document.body.appendChild(container);
   root = createRoot(container);
   act(() => root!.render(<AgentsView store={{
-    currentPid: 'prj_1', user: { id: 'usr_1', email: 'admin@example.com', name: 'Admin', role: 'admin' },
+    currentPid: 'prj_1',
+    user: { id: 'usr_1', email: 'manager@example.com', name: 'Manager', role },
+    permissions: { canManage },
   } as unknown as AppStore} />));
 }
 
@@ -45,7 +47,7 @@ const button = (label: string) => [...container.querySelectorAll('button')].find
 
 describe('actor lifecycle inventory (PLNR-368)', () => {
   it('defaults to Active and exposes distinct Dormant and History views with server-side filters', async () => {
-    mount();
+    mount(true, 'admin');
     await tick();
     expect(container.textContent).toContain('Active 3');
     expect(container.textContent).toContain('Dormant 1');
@@ -62,19 +64,27 @@ describe('actor lifecycle inventory (PLNR-368)', () => {
     await tick();
     await act(async () => { button('runner')!.click(); });
     await tick();
-    expect(api.runners).toHaveBeenCalledWith(expect.objectContaining({ all: true, projectId: 'prj_1', view: 'active', limit: 50 }));
+    expect(api.runners).toHaveBeenCalledWith(expect.objectContaining({ all: false, projectId: 'prj_1', view: 'active', limit: 50 }));
     expect(container.textContent).toContain('Active 1');
     expect(container.textContent).toContain('Dormant 2');
     expect(container.textContent).toContain('History 3');
 
     vi.spyOn(api, 'agentLifecycleSweep').mockResolvedValue({
-      sweepId: 'als_1', dryRun: true, generatedAt: new Date().toISOString(),
-      examined: { actors: 4, presences: 3, runners: 2 }, transitions: { 'actor:active->retired': 1 }, protections: {},
+      sweepId: 'als_1', dryRun: true, projectId: 'prj_1', generatedAt: new Date().toISOString(),
+      examined: { actors: 4, presences: 3, runners: 0 }, transitions: { 'actor:active->retired': 1 }, protections: {},
       referenceCheck: { complete: true, blockers: [] }, errorCounts: {}, errors: [],
       cursor: { actorId: null, presenceId: null, runnerId: null }, complete: true,
     });
     await act(async () => { button('dry run')!.click(); });
-    expect(container.textContent).toContain('DRY RUN · examined 4 actors / 3 presences / 2 Runners');
+    expect(api.agentLifecycleSweep).toHaveBeenCalledWith('prj_1', false);
+    expect(container.textContent).toContain('DRY RUN · examined 4 actors / 3 presences / 0 Runners');
     expect(container.textContent).toContain('reference probe passed');
+  });
+
+  it('hides project cleanup from users below manager', async () => {
+    mount(false);
+    await tick();
+    expect(button('dry run')).toBeUndefined();
+    expect(button('apply one batch')).toBeUndefined();
   });
 });

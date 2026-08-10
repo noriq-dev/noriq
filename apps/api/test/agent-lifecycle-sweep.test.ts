@@ -2,7 +2,7 @@ import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import type { Env } from '../src/env';
 import { agentLifecycleSweepConfig, sweepAgentLifecycle } from '../src/lib/agent-lifecycle-sweep';
-import { ADMIN, createAgent, mcpCall } from './helpers';
+import { ADMIN, createAgent, createUser, loginSession, mcpCall } from './helpers';
 
 const OLD = '2000-01-01T00:00:00.000Z';
 const NOW = '2026-08-09T12:00:00.000Z';
@@ -11,6 +11,9 @@ const appEnv = env as unknown as Env;
 
 let ownerId: string;
 let projectId: string;
+let foreignProjectId: string;
+let managerCookie: string;
+let viewerCookie: string;
 
 beforeAll(async () => {
   const connection = await createAgent('lifecycle-sweep');
@@ -19,6 +22,20 @@ beforeAll(async () => {
   projectId = (await mcpCall(connection.apiKey, 'create_project', {
     key: 'ALSWEEP', name: 'Actor lifecycle sweep fixtures',
   })).body.id as string;
+  foreignProjectId = (await mcpCall(connection.apiKey, 'create_project', {
+    key: 'ALSWEEP2', name: 'Foreign actor lifecycle sweep fixtures',
+  })).body.id as string;
+
+  const manager = await createUser('lifecycle-sweep-manager@example.com', 'Lifecycle Manager', 'longenough1');
+  const viewer = await createUser('lifecycle-sweep-viewer@example.com', 'Lifecycle Viewer', 'longenough1');
+  managerCookie = await loginSession('lifecycle-sweep-manager@example.com', 'longenough1');
+  viewerCookie = await loginSession('lifecycle-sweep-viewer@example.com', 'longenough1');
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO project_grants (project_id, principal_type, principal_id, role) VALUES (?, 'user', ?, 'manager')")
+      .bind(projectId, manager.id),
+    env.DB.prepare("INSERT INTO project_grants (project_id, principal_type, principal_id, role) VALUES (?, 'user', ?, 'viewer')")
+      .bind(projectId, viewer.id),
+  ]);
 
   await env.DB.prepare(
     `INSERT INTO agents (
@@ -157,5 +174,60 @@ describe('agent lifecycle sweep policy and configuration (PLNR-363)', () => {
     });
     expect(allowed.status).toBe(200);
     expect(await allowed.json()).toMatchObject({ dryRun: true });
+  });
+
+  it('lets project managers sweep only that project while keeping shared Runners global', async () => {
+    await env.DB.prepare(
+      `INSERT INTO agents (
+         id, name, status, kind, actor_class, user_id, project_id, session_id,
+         last_seen_at, lineage_status, lineage_reason, lifecycle_updated_at, created_at
+       ) VALUES
+         ('zzals_scoped_actor', 'zzals-scoped-actor', 'active', 'copilot', 'session_copilot', ?, ?,
+          'zzals-scoped-actor', ?, 'partial', 'immediate_parent_unknown', ?, ?),
+         ('zzals_foreign_actor', 'zzals-foreign-actor', 'active', 'copilot', 'session_copilot', ?, ?,
+          'zzals-foreign-actor', ?, 'partial', 'immediate_parent_unknown', ?, ?)`,
+    ).bind(ownerId, projectId, OLD, OLD, OLD, ownerId, foreignProjectId, OLD, OLD, OLD).run();
+    await env.DB.prepare(
+      `INSERT INTO agent_presences (
+         id, kind, source_key, actor_id, project_id, state, started_at, last_seen_at,
+         ended_at, end_reason, created_at, updated_at
+       ) VALUES
+         ('zzals_scoped_presence', 'mcp_session', 'scoped-purge-fixture', 'zzals_scoped_actor', ?, 'ended', ?, ?, ?, 'fixture_ended', ?, ?),
+         ('zzals_foreign_presence', 'mcp_session', 'foreign-purge-fixture', 'zzals_foreign_actor', ?, 'ended', ?, ?, ?, 'fixture_ended', ?, ?)`,
+    ).bind(projectId, OLD, OLD, OLD, OLD, OLD, foreignProjectId, OLD, OLD, OLD, OLD, OLD).run();
+
+    const viewerDenied = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/agent-lifecycle-sweep`, {
+      method: 'POST', headers: { Cookie: viewerCookie, 'Content-Type': 'application/json' }, body: '{}',
+    });
+    expect(viewerDenied.status).toBe(403);
+
+    const preview = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/agent-lifecycle-sweep`, {
+      method: 'POST', headers: { Cookie: managerCookie, 'Content-Type': 'application/json' }, body: '{}',
+    });
+    expect(preview.status).toBe(200);
+    expect(await preview.json()).toMatchObject({
+      dryRun: true,
+      projectId,
+      examined: { runners: 0 },
+      transitions: {
+        'actor:active->retired:session_inactive': expect.any(Number),
+        'presence:ended->purged:presence_retention_elapsed': expect.any(Number),
+      },
+    });
+
+    const cursorBefore = await env.DB.prepare('SELECT * FROM agent_lifecycle_sweep_state WHERE id = 1').first();
+    const applied = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/agent-lifecycle-sweep?apply=true`, {
+      method: 'POST', headers: { Cookie: managerCookie, 'Content-Type': 'application/json' }, body: '{}',
+    });
+    expect(applied.status).toBe(200);
+    expect(await applied.json()).toMatchObject({ dryRun: false, projectId, examined: { runners: 0 } });
+    expect(await env.DB.prepare("SELECT retired_at AS retiredAt FROM agents WHERE id = 'zzals_scoped_actor'").first())
+      .toMatchObject({ retiredAt: OLD });
+    expect(await env.DB.prepare("SELECT retired_at AS retiredAt FROM agents WHERE id = 'zzals_foreign_actor'").first())
+      .toEqual({ retiredAt: null });
+    expect(await env.DB.prepare("SELECT 1 AS present FROM agent_presences WHERE id = 'zzals_scoped_presence'").first()).toBeNull();
+    expect(await env.DB.prepare("SELECT 1 AS present FROM agent_presences WHERE id = 'zzals_foreign_presence'").first())
+      .toEqual({ present: 1 });
+    expect(await env.DB.prepare('SELECT * FROM agent_lifecycle_sweep_state WHERE id = 1').first()).toEqual(cursorBefore);
   });
 });

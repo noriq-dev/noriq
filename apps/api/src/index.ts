@@ -218,6 +218,7 @@ const MANAGER_ROUTES = [
   /\/memory\/generations(?:\/[^/]+\/(?:activate|abort)|\/prune-retained)$/,
   /\/memory\/vectors\/rebuild$/,
   /\/memory\/items\/[^/]+\/(approve|reject)$/,
+  /\/agent-lifecycle-sweep$/,
 ];
 
 const projectActionForRequest = (method: string, pathname: string): ProjectAction => {
@@ -529,6 +530,27 @@ app.post('/api/admin/agent-lifecycle-sweep', adminAuth, async (c) => {
   return c.json(await sweepAgentLifecycle(c.env, {
     dryRun: c.req.query('apply') !== 'true',
     cursor,
+  }));
+});
+
+// PLNR-386: project managers may clean up their project's actors and disposable presence rows
+// without possessing the instance-wide ADMIN_TOKEN. The project authorization middleware maps
+// this route to `manage`; sweepAgentLifecycle hard-scopes every selected row and leaves shared
+// Runner identities to the global operator sweep above.
+app.post('/api/projects/:pid/agent-lifecycle-sweep', async (c) => {
+  let body: { cursor?: Partial<AgentLifecycleCursor> } = {};
+  if (c.req.header('content-type')?.includes('application/json')) {
+    try { body = await c.req.json(); }
+    catch { return c.json({ error: 'body must be JSON' }, 400); }
+  }
+  const cursor = body.cursor;
+  if (cursor && Object.values(cursor).some((value) => value !== null && typeof value !== 'string')) {
+    return c.json({ error: 'cursor values must be strings or null' }, 400);
+  }
+  return c.json(await sweepAgentLifecycle(c.env, {
+    dryRun: c.req.query('apply') !== 'true',
+    cursor,
+    projectId: c.req.param('pid'),
   }));
 });
 

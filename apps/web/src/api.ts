@@ -431,8 +431,8 @@ export const api = {
   restoreRunnerVisibility: (id: string) => req<{ ok: true; archived: false; note: string }>('POST', `/api/runners/${id}/restore-visibility`),
   deleteRunner: (id: string) => req('DELETE', `/api/runners/${id}`),
   agentLifecycleClassification: () => req<ApiAgentLifecycleClassification>('GET', '/api/admin/agent-lifecycle/classification'),
-  agentLifecycleSweep: (apply = false, cursor?: Record<string, string | null>) =>
-    req<ApiAgentLifecycleSweep>('POST', `/api/admin/agent-lifecycle-sweep${apply ? '?apply=true' : ''}`, cursor ? { cursor } : {}),
+  agentLifecycleSweep: (pid: string, apply = false, cursor?: Record<string, string | null>) =>
+    req<ApiAgentLifecycleSweep>('POST', `/api/projects/${pid}/agent-lifecycle-sweep${apply ? '?apply=true' : ''}`, cursor ? { cursor } : {}),
   runs: (pid: string) => req<{ runs: ApiRun[] }>('GET', `/api/projects/${pid}/runs`),
   orchestrations: (pid: string, options: { view?: 'active' | 'history'; cursor?: string; limit?: number } = {}) => {
     const q = new URLSearchParams();
@@ -952,6 +952,7 @@ export interface ApiAgentLifecycleClassification {
 export interface ApiAgentLifecycleSweep {
   sweepId: string;
   dryRun: boolean;
+  projectId: string | null;
   generatedAt: string;
   examined: { actors: number; presences: number; runners: number };
   transitions: Record<string, number>;

@@ -43,6 +43,10 @@ type SweepOptions = {
   dryRun?: boolean;
   at?: string;
   cursor?: Partial<AgentLifecycleCursor>;
+  /** Restrict human-initiated cleanup to one project. Runner identities are deliberately
+   * excluded from project sweeps because a Runner may serve more than one project; only the
+   * system-wide operator sweep may change Runner lifecycle state. */
+  projectId?: string;
   /** Scheduled dry runs persist only their scan cursor/telemetry so every bounded batch is
    * eventually inspected. Actor/presence/Runner rows and transition events remain untouched. */
   persistCursor?: boolean;
@@ -202,7 +206,9 @@ export async function sweepAgentLifecycle(env: Env, options: SweepOptions = {}) 
   const runnerCutoff = before(at, config.runnerOfflineArchiveDays);
   const sweepId = newId('als');
 
-  const persistCursor = !dryRun || options.persistCursor === true;
+  // The stored cursor belongs to the system-wide scheduled sweep. A project manager walking one
+  // project's batches must never advance or inherit that global cursor.
+  const persistCursor = !options.projectId && (!dryRun || options.persistCursor === true);
   const stored = persistCursor ? await env.DB.prepare(
     `SELECT actor_cursor AS actorId, presence_cursor AS presenceId, runner_cursor AS runnerId
        FROM agent_lifecycle_sweep_state WHERE id = 1`,
@@ -217,6 +223,7 @@ export async function sweepAgentLifecycle(env: Env, options: SweepOptions = {}) 
     presenceId: selectedCursor('presenceId'),
     runnerId: selectedCursor('runnerId'),
   };
+  const actorProjectPredicate = options.projectId ? ' AND project_id = ?' : '';
 
   const transitions: Record<string, number> = {};
   const protections: Record<string, number> = {};
@@ -255,10 +262,14 @@ export async function sweepAgentLifecycle(env: Env, options: SweepOptions = {}) 
                                   AND cr.status IN ('queued','dispatched','running','blocked'))
                      )) AS liveChild
        FROM agents a
-      WHERE a.id > ?
+      WHERE ${options.projectId ? 'a.project_id = ? AND ' : ''}a.id > ?
       ORDER BY a.id
       LIMIT ?`,
-  ).bind(at, at, at, onlineCutoff, cursor.actorId ?? '', config.batchSize).all<ActorRow>();
+  ).bind(
+    at, at, at, onlineCutoff,
+    ...(options.projectId ? [options.projectId] : []),
+    cursor.actorId ?? '', config.batchSize,
+  ).all<ActorRow>();
 
   const record = async (
     subjectKind: 'actor' | 'presence' | 'runner', subjectId: string, actorClass: string | null,
@@ -306,37 +317,52 @@ export async function sweepAgentLifecycle(env: Env, options: SweepOptions = {}) 
       const result = await env.DB.prepare(
         `UPDATE agents SET status = CASE WHEN status = 'revoked' THEN status ELSE 'offline' END,
                            retired_at = ?, retire_reason = ?, lifecycle_updated_at = ?
-          WHERE id = ? AND retired_at IS NULL AND EXISTS (
+          WHERE id = ?${actorProjectPredicate} AND retired_at IS NULL AND EXISTS (
             SELECT 1 FROM runs r WHERE (r.agent_id = agents.id OR r.id IN (
               SELECT p.run_id FROM agent_presences p WHERE p.actor_id = agents.id AND p.run_id IS NOT NULL
             )) AND r.status IN ('done','failed','cancelled'))`,
-      ).bind(evidenceAt, reason, at, actor.id).run();
+      ).bind(
+        evidenceAt, reason, at, actor.id,
+        ...(options.projectId ? [options.projectId] : []),
+      ).run();
       changed = result.meta.changes ?? 0;
     } else if (toState === 'retired' && reason === 'session_inactive') {
       const result = await env.DB.prepare(
         `UPDATE agents SET status = 'offline', retired_at = ?, retire_reason = ?, lifecycle_updated_at = ?
-          WHERE id = ? AND actor_class = 'session_copilot' AND retired_at IS NULL AND status != 'revoked'
+          WHERE id = ?${actorProjectPredicate} AND actor_class = 'session_copilot' AND retired_at IS NULL AND status != 'revoked'
             AND MAX(COALESCE(last_seen_at, created_at), COALESCE(
               (SELECT MAX(p.last_seen_at) FROM agent_presences p WHERE p.actor_id = agents.id),
               last_seen_at, created_at)) <= ?
             ${ACTOR_PROTECTION_PREDICATE}`,
-      ).bind(evidenceAt, reason, at, actor.id, retireCutoff, at, at, onlineCutoff).run();
+      ).bind(
+        evidenceAt, reason, at, actor.id,
+        ...(options.projectId ? [options.projectId] : []),
+        retireCutoff, at, at, onlineCutoff,
+      ).run();
       changed = result.meta.changes ?? 0;
     } else if (toState === 'retired' && reason === 'connection_authorization_ended') {
       const result = await env.DB.prepare(
         `UPDATE agents SET status = 'offline', retired_at = ?, retire_reason = ?, lifecycle_updated_at = ?
-          WHERE id = ? AND actor_class = 'connection_copilot' AND retired_at IS NULL AND status != 'revoked'
+          WHERE id = ?${actorProjectPredicate} AND actor_class = 'connection_copilot' AND retired_at IS NULL AND status != 'revoked'
             AND NOT EXISTS (SELECT 1 FROM oauth_tokens ot WHERE ot.copilot_id = agents.id
                             AND ot.revoked_at IS NULL AND ot.expires_at > ?)
             ${ACTOR_PROTECTION_PREDICATE}`,
-      ).bind(evidenceAt, reason, at, actor.id, at, at, at, onlineCutoff).run();
+      ).bind(
+        evidenceAt, reason, at, actor.id,
+        ...(options.projectId ? [options.projectId] : []),
+        at, at, at, onlineCutoff,
+      ).run();
       changed = result.meta.changes ?? 0;
     } else if (toState === 'archived') {
       const result = await env.DB.prepare(
         `UPDATE agents SET archived_at = ?, lifecycle_updated_at = ?
-          WHERE id = ? AND retired_at IS NOT NULL AND retired_at <= ? AND archived_at IS NULL
+          WHERE id = ?${actorProjectPredicate} AND retired_at IS NOT NULL AND retired_at <= ? AND archived_at IS NULL
             ${ACTOR_PROTECTION_PREDICATE}`,
-      ).bind(at, at, actor.id, archiveCutoff, at, at, onlineCutoff).run();
+      ).bind(
+        at, at, actor.id,
+        ...(options.projectId ? [options.projectId] : []),
+        archiveCutoff, at, at, onlineCutoff,
+      ).run();
       changed = result.meta.changes ?? 0;
     }
     if (changed && reason === 'session_inactive') {
@@ -354,9 +380,12 @@ export async function sweepAgentLifecycle(env: Env, options: SweepOptions = {}) 
   const presences = await env.DB.prepare(
     `SELECT id, kind, actor_id AS actorId, runner_id AS runnerId, ended_at AS endedAt
        FROM agent_presences
-      WHERE id > ? AND ended_at IS NOT NULL AND ended_at <= ?
+      WHERE ${options.projectId ? 'project_id = ? AND ' : ''}id > ? AND ended_at IS NOT NULL AND ended_at <= ?
       ORDER BY id LIMIT ?`,
-  ).bind(cursor.presenceId ?? '', presenceCutoff, config.batchSize).all<PresenceRow>();
+  ).bind(
+    ...(options.projectId ? [options.projectId] : []),
+    cursor.presenceId ?? '', presenceCutoff, config.batchSize,
+  ).all<PresenceRow>();
 
   for (const presence of presences.results) {
     examined.presences++;
@@ -377,26 +406,32 @@ export async function sweepAgentLifecycle(env: Env, options: SweepOptions = {}) 
     }
     const removed = await env.DB.prepare(
       `DELETE FROM agent_presences
-        WHERE id = ? AND ended_at IS NOT NULL AND ended_at <= ?
+        WHERE id = ?${options.projectId ? ' AND project_id = ?' : ''} AND ended_at IS NOT NULL AND ended_at <= ?
           AND ((actor_id IS NOT NULL AND EXISTS (
                  SELECT 1 FROM agents a WHERE a.id = agent_presences.actor_id))
             OR (actor_id IS NULL AND runner_id IS NOT NULL
                 AND EXISTS (SELECT 1 FROM runners r WHERE r.id = agent_presences.runner_id)))
           AND NOT EXISTS (SELECT 1 FROM agent_presences child
                            WHERE child.parent_presence_id = agent_presences.id)`,
-    ).bind(presence.id, presenceCutoff).run();
+    ).bind(
+      presence.id,
+      ...(options.projectId ? [options.projectId] : []),
+      presenceCutoff,
+    ).run();
     if (removed.meta.changes) {
       await record('presence', presence.id, presence.kind, 'ended', 'purged', 'presence_retention_elapsed', presence.endedAt);
     } else addCount(protections, 'compare_and_set_lost');
   }
 
-  const runners = await env.DB.prepare(
-    `SELECT r.id, r.status, r.last_heartbeat_at AS heartbeatAt, r.offboarded_at AS offboardedAt,
-            r.retired_at AS retiredAt, r.archived_at AS archivedAt,
-            EXISTS (SELECT 1 FROM runs run WHERE run.runner_id = r.id
-                     AND run.status IN ('queued','dispatched','running','blocked')) AS liveRun
-       FROM runners r WHERE r.id > ? ORDER BY r.id LIMIT ?`,
-  ).bind(cursor.runnerId ?? '', config.batchSize).all<RunnerRow>();
+  const runners: { results: RunnerRow[] } = options.projectId
+    ? { results: [] }
+    : await env.DB.prepare(
+      `SELECT r.id, r.status, r.last_heartbeat_at AS heartbeatAt, r.offboarded_at AS offboardedAt,
+              r.retired_at AS retiredAt, r.archived_at AS archivedAt,
+              EXISTS (SELECT 1 FROM runs run WHERE run.runner_id = r.id
+                       AND run.status IN ('queued','dispatched','running','blocked')) AS liveRun
+         FROM runners r WHERE r.id > ? ORDER BY r.id LIMIT ?`,
+    ).bind(cursor.runnerId ?? '', config.batchSize).all<RunnerRow>();
 
   for (const runner of runners.results) {
     examined.runners++;
@@ -441,7 +476,7 @@ export async function sweepAgentLifecycle(env: Env, options: SweepOptions = {}) 
   };
   const complete = !nextCursor.actorId && !nextCursor.presenceId && !nextCursor.runnerId;
   const result = {
-    sweepId, dryRun, generatedAt: at, config, examined, transitions, protections,
+    sweepId, dryRun, projectId: options.projectId ?? null, generatedAt: at, config, examined, transitions, protections,
     referenceCheck: referenceContract, errorCounts, errors, cursor: nextCursor, complete,
   };
 

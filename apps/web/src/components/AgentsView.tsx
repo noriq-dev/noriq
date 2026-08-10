@@ -56,6 +56,7 @@ export function AgentsView({ store }: { store: AppStore }) {
   const [sweep, setSweep] = useState<ApiAgentLifecycleSweep | null>(null);
   const [operation, setOperation] = useState<string | null>(null);
   const isAdmin = store.user?.role === 'admin';
+  const canCleanCurrentProject = Boolean(store.currentPid && store.permissions.canManage && projectScope === 'current');
 
   const activeBefore = olderThanDays
     ? new Date(Date.now() - Number(olderThanDays) * 86_400_000).toISOString()
@@ -127,11 +128,12 @@ export function AgentsView({ store }: { store: AppStore }) {
   };
 
   const runSweep = async (apply: boolean) => {
+    if (!store.currentPid || !canCleanCurrentProject) return;
     if (apply && !(await confirm(
       'Apply one bounded lifecycle sweep batch?\n\nThis can retire inactive actors, archive retained history, and purge only verified-safe expired presence rows. Durable actor history is never deleted.',
     ))) return;
     setOperation('sweep');
-    try { setSweep(await api.agentLifecycleSweep(apply)); await load(); }
+    try { setSweep(await api.agentLifecycleSweep(store.currentPid, apply)); await load(); }
     catch (error) { await alert(error instanceof Error ? error.message : String(error)); }
     finally { setOperation(null); }
   };
@@ -191,10 +193,10 @@ export function AgentsView({ store }: { store: AppStore }) {
             )}
           </div>
 
-          {isAdmin && (
+          {canCleanCurrentProject && (
             <div style={{ padding: '10px 12px', marginBottom: 12, borderRadius: 9, border: '1px solid var(--w-07)', background: 'var(--w-02)', fontSize: 11 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <b>Cleanup preview</b><span style={{ color: 'var(--text-dim)' }}>bounded and dry-run by default</span><div style={{ flex: 1 }} />
+                <b>Project cleanup preview</b><span style={{ color: 'var(--text-dim)' }}>actors and presence rows · bounded and dry-run by default</span><div style={{ flex: 1 }} />
                 <Button variant="ghost" disabled={operation === 'sweep'} onClick={() => void runSweep(false)}>dry run</Button>
                 <Button variant="danger" disabled={operation === 'sweep'} onClick={() => void runSweep(true)}>apply one batch</Button>
               </div>
