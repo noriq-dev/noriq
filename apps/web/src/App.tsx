@@ -35,6 +35,8 @@ import { MobileTabBar } from './components/MobileTabBar';
 import { ProjectSheet } from './components/ProjectSheet';
 import { AvatarChip, LiveDot } from './components/bits';
 import { useViewport } from './viewport';
+import { DesktopOnly, isDesktopOnlyView } from './components/DesktopOnly';
+import { MoreView } from './components/MoreView';
 
 // Floating toggle for the unauthenticated screens (login / setup / invite) — no rail there.
 function FloatingTheme() {
@@ -93,6 +95,7 @@ export function App() {
 
   const project = store.data.projects.find((p) => p.id === store.currentPid);
   const projectView = project && !['home', 'settings', 'admin', 'ask', 'more'].includes(store.view);
+  const desktopOnlyView = phone && projectView && isDesktopOnlyView(store.view) ? store.view : null;
   const signalCount = store.snapshot?.signals?.length ?? 0;
   const liveCount = project?.liveAgentCount ?? store.data.agents[store.currentPid]?.length ?? 0;
   const navigateMobile = (view: Parameters<typeof store.actions.setView>[0]) => {
@@ -130,22 +133,24 @@ export function App() {
           {store.view === 'settings' && <SettingsView store={store} />}
           {store.view === 'admin' && <AdminView store={store} />}
           {store.view === 'ask' && <AskView store={store} />}
-          {store.view === 'more' && <div style={{ padding: 24, color: 'var(--text-dim)' }}>Mobile workspace shortcuts are coming in this plan.</div>}
+          {store.view === 'more' && <MoreView store={store} />}
           {projectView && (
             <>
-              {store.view === 'control' && <MissionControl store={store} />}
-              {store.view === 'graph' && <Graph store={store} />}
-              {store.view === 'executions' && <ExecutionView store={store} />}
-              {store.view === 'intelligence' && <IntelligenceView store={store} />}
-              {store.view === 'board' && <Board store={store} />}
-              {store.view === 'plans' && <PlansView store={store} />}
-              {store.view === 'review' && <ReviewView store={store} />}
-              {store.view === 'docs' && <DocsView store={store} />}
-              {store.view === 'roadmap' && <RoadmapView store={store} />}
-              {store.view === 'runs' && <RunsView store={store} />}
-              {store.view === 'agents' && <AgentsView store={store} />}
-              {store.view === 'memory' && <MemoryView store={store} />}
-              {store.view === 'project-settings' && <ProjectSettingsView key={store.currentPid} store={store} />}
+              {desktopOnlyView ? <DesktopOnly projectId={store.currentPid} view={desktopOnlyView} /> : <>
+                {store.view === 'control' && <MissionControl store={store} />}
+                {store.view === 'graph' && <Graph store={store} />}
+                {store.view === 'executions' && <ExecutionView store={store} />}
+                {store.view === 'intelligence' && <IntelligenceView store={store} />}
+                {store.view === 'board' && <Board store={store} />}
+                {store.view === 'plans' && <PlansView store={store} />}
+                {store.view === 'review' && <ReviewView store={store} />}
+                {store.view === 'docs' && <DocsView store={store} />}
+                {store.view === 'roadmap' && <RoadmapView store={store} />}
+                {store.view === 'runs' && <RunsView store={store} />}
+                {store.view === 'agents' && <AgentsView store={store} />}
+                {store.view === 'memory' && <MemoryView store={store} />}
+                {store.view === 'project-settings' && <ProjectSettingsView key={store.currentPid} store={store} />}
+              </>}
             </>
           )}
         </div>

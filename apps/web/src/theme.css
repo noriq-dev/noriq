@@ -155,7 +155,9 @@ button { all: unset; box-sizing: border-box; max-width: 100%; }
   .mc-grid > *:not(:last-child) { border-bottom: 1px solid var(--line); }
   .agents-grid { grid-template-columns: 1fr !important; }
   .intelligence-view { padding: 14px !important; }
-  .intelligence-grid, .intelligence-groups { grid-template-columns: 1fr !important; }
+  .intelligence-grid { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  .intelligence-groups { grid-template-columns: 1fr !important; }
+  .intelligence-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .dispatch-intelligence-cases { grid-template-columns: 1fr !important; }
   .project-settings-grant-row, .project-settings-grant-form { grid-template-columns: 1fr !important; }
 
@@ -202,6 +204,5 @@ button { all: unset; box-sizing: border-box; max-width: 100%; }
   /* Two-up form grids stack on small phones. */
   .stack-sm { grid-template-columns: 1fr !important; }
   .project-settings-fields { grid-template-columns: 1fr !important; }
-  .intelligence-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .intelligence-case { align-items: stretch; flex-wrap: wrap; }
 }
