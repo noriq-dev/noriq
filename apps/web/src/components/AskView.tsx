@@ -155,6 +155,7 @@ export function AskView({ store }: { store: AppStore }) {
   const [threadArchived, setThreadArchived] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(true);
   const [q, setQ] = useState('');
+  const [activeProjectSuggestion, setActiveProjectSuggestion] = useState(0);
   const [models, setModels] = useState<ApiAskModelDefinition[]>([]);
   const [selectedModel, setSelectedModel] = useState('');
   const [modelsLoading, setModelsLoading] = useState(true);
@@ -182,6 +183,11 @@ export function AskView({ store }: { store: AppStore }) {
     }))
     .filter(({ project, tag }) => tag.slice(1).startsWith(mentionQuery) || project.key.toLowerCase().startsWith(mentionQuery))
     .slice(0, 6);
+  const selectedProjectSuggestion = Math.min(activeProjectSuggestion, Math.max(0, projectSuggestions.length - 1));
+
+  useEffect(() => {
+    setActiveProjectSuggestion(0);
+  }, [mentionQuery]);
 
   const insertProjectTag = (tag: string) => {
     if (!mention) return;
@@ -740,9 +746,9 @@ export function AskView({ store }: { store: AppStore }) {
           <div style={{ flex: 'none', padding: phone ? '8px 10px 10px' : '12px 24px 18px', background: 'linear-gradient(transparent, var(--bg) 22%)' }}>
             <div style={{ position: 'relative', maxWidth: 800, margin: '0 auto', border: '1px solid var(--w-12)', borderRadius: 13, background: 'var(--card)', padding: '9px 10px 9px 13px', boxShadow: '0 10px 30px rgba(0,0,0,.12)' }}>
               {projectSuggestions.length > 0 && (
-                <div role="listbox" aria-label="Tag a project" style={{ position: 'absolute', left: 12, bottom: 'calc(100% + 7px)', width: 300, maxWidth: 'calc(100vw - 48px)', border: '1px solid var(--w-12)', borderRadius: 10, background: 'var(--bg-raised)', padding: 5, boxShadow: '0 14px 34px rgba(0,0,0,.3)', zIndex: 5 }}>
-                  {projectSuggestions.map(({ project, tag }) => (
-                    <button key={project.id} role="option" aria-selected="false" onMouseDown={(event) => event.preventDefault()} onClick={() => insertProjectTag(tag)} style={{ cursor: 'pointer', width: '100%', display: 'flex', alignItems: 'center', gap: 9, borderRadius: 7, padding: '7px 9px', color: 'var(--text)', textAlign: 'left' }} className="hover-border">
+                <div role="listbox" aria-label="Tag a project" aria-activedescendant={`ask-project-option-${projectSuggestions[selectedProjectSuggestion]!.project.id}`} style={{ position: 'absolute', left: 12, bottom: 'calc(100% + 7px)', width: 300, maxWidth: 'calc(100vw - 48px)', border: '1px solid var(--w-12)', borderRadius: 10, background: 'var(--bg-raised)', padding: 5, boxShadow: '0 14px 34px rgba(0,0,0,.3)', zIndex: 5 }}>
+                  {projectSuggestions.map(({ project, tag }, index) => (
+                    <button id={`ask-project-option-${project.id}`} key={project.id} role="option" aria-selected={index === selectedProjectSuggestion} onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setActiveProjectSuggestion(index)} onClick={() => insertProjectTag(tag)} style={{ cursor: 'pointer', width: '100%', display: 'flex', alignItems: 'center', gap: 9, borderRadius: 7, padding: '7px 9px', color: 'var(--text)', textAlign: 'left', background: index === selectedProjectSuggestion ? 'var(--w-07)' : 'transparent' }} className="hover-border">
                       <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--accent-ink)' }}>{tag}</span>
                       <span style={{ fontSize: 11.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{project.name}</span>
                       <span style={{ marginLeft: 'auto', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>{project.key}</span>
@@ -750,7 +756,21 @@ export function AskView({ store }: { store: AppStore }) {
                   ))}
                 </div>
               )}
-              <textarea value={q} onChange={(event) => setQ(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (projectSuggestions[0]) insertProjectTag(projectSuggestions[0].tag); else if (!loading) void ask(); } }} placeholder={threadArchived ? 'Restore this chat to continue…' : 'Message Ask… Use @project to focus.'} rows={2} disabled={historyLoading || threadArchived} style={{ boxSizing: 'border-box', width: '100%', background: 'transparent', border: 0, padding: '2px 0 6px', color: 'var(--text)', fontSize: phone ? MIN_INPUT_FONT_SIZE : 13.5, lineHeight: 1.5, resize: 'none', outline: 'none', fontFamily: 'inherit' }} />
+              <textarea value={q} onChange={(event) => setQ(event.target.value)} onKeyDown={(event) => {
+                if (projectSuggestions.length > 0 && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
+                  event.preventDefault();
+                  setActiveProjectSuggestion((current) => event.key === 'ArrowDown'
+                    ? (current + 1) % projectSuggestions.length
+                    : (current - 1 + projectSuggestions.length) % projectSuggestions.length);
+                  return;
+                }
+                if (event.key === 'Enter' && !event.shiftKey) {
+                  event.preventDefault();
+                  const suggestion = projectSuggestions[selectedProjectSuggestion];
+                  if (suggestion) insertProjectTag(suggestion.tag);
+                  else if (!loading) void ask();
+                }
+              }} placeholder={threadArchived ? 'Restore this chat to continue…' : 'Message Ask… Use @project to focus.'} rows={2} disabled={historyLoading || threadArchived} style={{ boxSizing: 'border-box', width: '100%', background: 'transparent', border: 0, padding: '2px 0 6px', color: 'var(--text)', fontSize: phone ? MIN_INPUT_FONT_SIZE : 13.5, lineHeight: 1.5, resize: 'none', outline: 'none', fontFamily: 'inherit' }} />
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                 <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>
                   Model

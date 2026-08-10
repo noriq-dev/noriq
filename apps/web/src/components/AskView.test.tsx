@@ -170,6 +170,27 @@ describe('global Ask chat', () => {
     ]);
   });
 
+  it('navigates project tag suggestions with arrow keys and selects the active option', async () => {
+    mockEmptyHistory();
+    mount([
+      { id: 'project_noriq', key: 'PLNR', name: 'Noriq Mission Control' },
+      { id: 'project_nod', key: 'NOD', name: 'Project Nod' },
+    ]);
+    await flush();
+    setTextarea('@');
+
+    const textarea = container.querySelector<HTMLTextAreaElement>('textarea')!;
+    const options = [...container.querySelectorAll('[role="option"]')];
+    expect(options.map((option) => option.getAttribute('aria-selected'))).toEqual(['true', 'false']);
+
+    act(() => textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })));
+    expect(options.map((option) => option.getAttribute('aria-selected'))).toEqual(['false', 'true']);
+    expect(container.querySelector('[role="listbox"]')?.getAttribute('aria-activedescendant')).toBe('ask-project-option-project_nod');
+
+    act(() => textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })));
+    expect(textarea.value).toBe('@project-nod ');
+  });
+
   it('loads a durable thread, streams into it, and opens a graph-aware source', async () => {
     vi.spyOn(api, 'askThreads').mockResolvedValue({ threads: [activeThread] });
     vi.spyOn(api, 'askThread').mockResolvedValue(detailFor(activeThread));
