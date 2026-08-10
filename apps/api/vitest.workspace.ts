@@ -15,7 +15,7 @@ import fs from 'node:fs';
 // (`test.projects` inline in a vitest.config.ts does NOT work — the pool plugin only wires
 // `cloudflare:test` when each project is a workspace entry, so this must be a workspace file.)
 //
-// load.test.ts is a ~28s stress test (a 12-agent claim stampede). It's kept out of the shards
+// Load suites are intentionally kept out of the shards
 // and given its own `load` project, selected by name — `npm test` runs `--project 'shard*'`
 // (no load), `npm run test:load` runs `--project load`. (Selection is by project name, NOT an
 // env flag: shell env does not reach vitest's config evaluation.)
@@ -119,5 +119,5 @@ export default [
   // Write-freeze suite runs with MAINTENANCE_MODE ON (its own project so the flag stays off
   // everywhere else). `npm test` selects it explicitly alongside the shards.
   project('maintenance', MAINTENANCE_FILES.map((f) => `test/${f}`), { MAINTENANCE_MODE: '1' }),
-  project('load', ['test/load.test.ts']),
+  project('load', ['test/load.test.ts', 'test/memory-load.test.ts']),
 ];

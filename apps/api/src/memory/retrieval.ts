@@ -85,6 +85,9 @@ export const RETRIEVAL_DEFAULTS = {
   maxDepthCeiling: 4,
   maxGraphResults: 25,
   maxGraphResultsCeiling: 100,
+  /** Total recursive rows explored, including duplicate paths. This bounds adversarial fanout
+   *  before the final result limit and JS dedupe run. */
+  maxGraphExpansionRows: 1_000,
   maxResults: 20,
   maxResultsCeiling: 100,
 } as const;

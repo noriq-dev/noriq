@@ -4850,11 +4850,13 @@ export class ProjectMemory extends DurableObject<Env> {
     }
     const depthPh = binds.length + 1;
     binds.push(maxDepth);
+    const expansionLimitPh = binds.length + 1;
+    binds.push(RETRIEVAL_DEFAULTS.maxGraphExpansionRows);
     const limitPh = binds.length + 1;
     binds.push(maxResults + 1); // +1 so truncation is detected, not guessed
 
     const rows = this.ctx.storage.sql
-      .exec<{ nodeId: string; uri: string; type: string; label: string; depth: number; edgePath: string }>(
+      .exec<{ nodeId: string; uri: string; type: string; label: string; depth: number; edgePath: string; reachCount: number }>(
         `WITH RECURSIVE reach(node_id, depth, path) AS (
            SELECT id, 0, '' FROM nodes WHERE id IN (${seedPlaceholders})
            UNION
@@ -4863,8 +4865,10 @@ export class ProjectMemory extends DurableObject<Env> {
                        ELSE (r.path || ';' || e.from_node_id || '>' || e.type || '>' || e.to_node_id) END
            FROM reach r JOIN edges e ON e.${startCol} = r.node_id
            WHERE r.depth < ?${depthPh} ${edgeFilterSql}
+           LIMIT ?${expansionLimitPh}
          )
-         SELECT n.id AS nodeId, n.uri AS uri, n.type AS type, n.label AS label, reach.depth AS depth, reach.path AS edgePath
+         SELECT n.id AS nodeId, n.uri AS uri, n.type AS type, n.label AS label, reach.depth AS depth,
+                reach.path AS edgePath, COUNT(*) OVER () AS reachCount
          FROM reach JOIN nodes n ON n.id = reach.node_id
          WHERE reach.depth > 0
          ORDER BY reach.depth ASC
@@ -4873,7 +4877,13 @@ export class ProjectMemory extends DurableObject<Env> {
       )
       .toArray();
 
-    const truncated = rows.length > maxResults;
+    // `LIMIT` on the recursive SELECT bounds work done while populating the CTE. The window
+    // count is evaluated before the final result limit, so reaching that ceiling remains
+    // visible to callers as incomplete coverage even when duplicate paths dedupe below the
+    // requested result count.
+    const recursiveRows = rows[0]?.reachCount ?? 0;
+    const recursiveBudgetReached = recursiveRows >= RETRIEVAL_DEFAULTS.maxGraphExpansionRows - seedNodeIds.length;
+    const truncated = rows.length > maxResults || recursiveBudgetReached;
     const seen = new Set<string>();
     const deduped: typeof rows = [];
     for (const r of rows.slice(0, maxResults)) {
