@@ -14,7 +14,7 @@ import { ExecutionSpecPanel, type SpecLoad } from './ExecutionSpec';
 import { DispatchIntelligencePanel } from './DispatchIntelligence';
 import { confirm } from './Dialog';
 import { AttachmentPreview, attachmentPreviewDecision, type AttachmentPreviewItem } from './AttachmentPreview';
-import { useViewport } from '../viewport';
+import { MOBILE_TAB_BAR_HEIGHT, useViewport } from '../viewport';
 
 export function drawerShellStyle(phone: boolean): CSSProperties {
   const shared: CSSProperties = {
@@ -24,11 +24,10 @@ export function drawerShellStyle(phone: boolean): CSSProperties {
   };
   return phone ? {
     ...shared,
-    top: 'max(12px, env(safe-area-inset-top))', left: 0, width: '100%',
+    top: 'max(12px, env(safe-area-inset-top))', left: 0, bottom: MOBILE_TAB_BAR_HEIGHT, width: '100%',
     border: '1px solid var(--w-12)', borderBottom: 0, borderRadius: '22px 22px 0 0',
     animation: 'pl-stream-up .22s cubic-bezier(.22,1,.36,1) both',
     boxShadow: '0 -20px 60px rgba(0,0,0,.6)',
-    paddingBottom: 'env(safe-area-inset-bottom)',
   } : {
     ...shared,
     top: 0, width: 480, borderLeft: '1px solid var(--w-1)',
