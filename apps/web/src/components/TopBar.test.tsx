@@ -2,6 +2,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { api, type ApiAgent, type ApiAgentRoster } from '../api';
+import type { ProjectViewId } from '../project-navigation';
 import type { AppStore } from '../store';
 import { TopBar } from './TopBar';
 
@@ -26,7 +27,7 @@ function roster(agents: ApiAgent[], live = agents.filter((item) => item.live && 
   };
 }
 
-function mount(agentRoster: ApiAgentRoster) {
+function mount(agentRoster: ApiAgentRoster, view: ProjectViewId = 'memory') {
   vi.spyOn(api, 'attention').mockResolvedValue({ signals: [], overdue: [] });
   vi.spyOn(api, 'agents').mockResolvedValue(agentRoster);
   const setView = vi.fn();
@@ -35,7 +36,7 @@ function mount(agentRoster: ApiAgentRoster) {
   root = createRoot(container);
   act(() => root!.render(<TopBar store={{
     currentPid: 'prj_1',
-    view: 'memory',
+    view,
     permissions: { canContribute: true, canManage: true, cappedByReadOnly: false, effectiveRole: 'owner' },
     helpers: { tasksOf: () => [{ id: 'task_1', status: 'review', archivedAt: null }] },
     actions: { setView, createTask: vi.fn() },
@@ -51,28 +52,51 @@ afterEach(() => {
 });
 
 describe('compact project TopBar (PLNR-396)', () => {
-  it('groups every project destination behind the current view and routes selection', async () => {
+  it('keeps core destinations pinned and routes them directly', async () => {
     const { setView } = mount(roster([]));
     await tick();
 
-    const switcher = container.querySelector<HTMLButtonElement>('[aria-haspopup="menu"]')!;
-    expect(switcher.textContent).toContain('Knowledge');
-    expect(switcher.textContent).toContain('Memory');
-    expect(container.textContent).not.toContain('AI-native project management');
+    const pinned = container.querySelector<HTMLElement>('nav[aria-label="Pinned views"]')!;
+    const pinnedButtons = [...pinned.querySelectorAll<HTMLButtonElement>('button')];
+    expect(pinnedButtons).toHaveLength(4);
+    expect(pinnedButtons.map((button) => button.textContent?.trim())).toEqual([
+      'Mission Control',
+      'Board',
+      'Plans',
+      'Review1',
+    ]);
+    expect(pinned.querySelector('[aria-current="page"]')).toBeNull();
 
-    await act(async () => { switcher.click(); });
-    expect(container.textContent).toContain('Overview');
-    expect(container.textContent).toContain('Work');
-    expect(container.textContent).toContain('Operate');
-    expect(container.textContent).toContain('Mission Control');
-    expect(container.textContent).toContain('Intelligence');
-    expect(container.textContent).toContain('Review 1');
-    expect(container.textContent).toContain('Project settings');
-
-    const board = [...container.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+    const board = pinnedButtons
       .find((button) => button.textContent?.includes('Board'))!;
     await act(async () => { board.click(); });
     expect(setView).toHaveBeenCalledWith('board');
+  });
+
+  it('groups non-pinned destinations and marks the current menu item', async () => {
+    const { setView } = mount(roster([]), 'memory');
+    await tick();
+
+    const groups = container.querySelector<HTMLElement>('nav[aria-label="View groups"]')!;
+    const triggers = [...groups.querySelectorAll<HTMLButtonElement>('button[aria-haspopup="menu"]')];
+    expect(triggers.map((button) => button.getAttribute('aria-label'))).toEqual([
+      'Work views',
+      'Operate views',
+      'Knowledge views',
+    ]);
+
+    const knowledge = triggers.find((button) => button.getAttribute('aria-label') === 'Knowledge views')!;
+    await act(async () => { knowledge.click(); });
+
+    const menu = groups.querySelector<HTMLElement>('[role="menu"][aria-label="Knowledge views"]')!;
+    const items = [...menu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
+    expect(items.map((button) => button.querySelector('span')?.textContent)).toEqual(['Docs', 'Memory']);
+    expect(menu.querySelector('[aria-current="page"]')?.textContent).toContain('Memory');
+
+    const docs = items.find((button) => button.textContent?.includes('Docs'))!;
+    await act(async () => { docs.click(); });
+    expect(setView).toHaveBeenCalledWith('docs');
+    expect(groups.querySelector('[role="menu"]')).toBeNull();
   });
 
   it('shows only server-authored live actors, working first, and opens the Agents view', async () => {
