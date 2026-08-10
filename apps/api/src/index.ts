@@ -949,6 +949,182 @@ app.get('/api/public/projects/:pid/snapshot', async (c) => {
   });
 });
 
+// Purpose-built SPA read model (PLNR-400). The legacy /snapshot route below remains the
+// complete project export used by integrations and tests, but it is far too expensive to be
+// the browser's invalidation primitive: most project views own their own paginated APIs and
+// need only project metadata. Task-centric views receive the relationships they actually
+// render, while large markdown bodies are limited to Plans (task bodies already have a detail
+// endpoint). Keep this allowlist closed so a new view cannot silently fall back to "everything".
+const UI_STATE_SURFACES = new Set([
+  'control', 'graph', 'board', 'plans', 'roadmap', 'review', 'docs',
+  'executions', 'intelligence', 'agents', 'runs', 'memory', 'project-settings',
+]);
+
+app.get('/api/projects/:pid/ui-state', userAuth, async (c) => {
+  const startedAt = performance.now();
+  const pid = c.req.param('pid')!;
+  const surface = c.req.query('surface') ?? '';
+  if (!UI_STATE_SURFACES.has(surface)) return c.json({ error: 'unknown UI surface' }, 400);
+
+  const effectiveAccess = await resolveProjectAccess(c.env.DB, c.var.user!.id, pid, { allowAdminOverride: true });
+  await room(c.env, pid).sweepArchive(pid).catch(() => {});
+  await room(c.env, pid).sweepPlanArchive(pid).catch(() => {});
+
+  let queryCount = 0;
+  const rows = async (enabled: boolean, sql: string, ...binds: unknown[]): Promise<Record<string, unknown>[]> => {
+    if (!enabled) return [];
+    queryCount += 1;
+    return (await c.env.DB.prepare(sql).bind(...binds).all<Record<string, unknown>>()).results;
+  };
+  queryCount += 1;
+  const project = await c.env.DB.prepare(
+    `SELECT p.id, p.key, p.name, p.description, p.claim_ttl_seconds AS claimTtlSeconds,
+            p.lock_ttl_seconds AS lockTtlSeconds, p.file_locking_enabled AS fileLockingEnabled,
+            p.repo_url AS repoUrl,
+            (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'review' AND t.archived_at IS NULL) AS reviewTasks,
+            (SELECT COALESCE(MAX(e.seq), 0) FROM events e WHERE e.project_id = p.id) AS eventSeq
+       FROM projects p WHERE p.id = ?`,
+  ).bind(pid).first<Record<string, unknown>>();
+  if (!project) return c.json({ error: 'not found' }, 404);
+
+  const taskSurface = ['control', 'graph', 'board', 'plans', 'roadmap', 'review'].includes(surface);
+  const docsSurface = surface === 'docs';
+  const operationalSurface = ['control', 'graph', 'board', 'plans', 'roadmap', 'review'].includes(surface);
+  const planSurface = surface === 'plans';
+  const eventSurface = surface === 'control' || surface === 'graph';
+  const lockSurface = surface === 'control' || surface === 'board';
+  const agentSurface = operationalSurface;
+  const taskWhere = docsSurface
+    ? 't.project_id = ? AND EXISTS (SELECT 1 FROM task_docs td WHERE td.task_id = t.id)'
+    : 't.project_id = ?';
+
+  const [tasks, dependencies, extDeps, agents, events, milestones, boards, plans, phases,
+    phaseTasks, tags, taskTags, signals, taskDocs, planDocs, locks] = await Promise.all([
+    rows(taskSurface || docsSurface,
+      `SELECT t.id, t.key, t.title, '' AS body, ${taskWireStatus('t')} AS status,
+              t.type, t.priority, t.estimate, t.due_at AS dueAt, t.claimed_by AS claimedBy,
+              t.claim_expires_at AS claimExpiresAt, t.parent_task_id AS parentTaskId,
+              t.milestone_id AS milestoneId, t.board_id AS boardId, t.archived_at AS archivedAt,
+              t.failed_at AS failedAt, t.open_comments AS openComments, t."order",
+              t.proposed_at AS proposedAt, t.spinoff_run_id AS spinoffRunId,
+              t.spinoff_source_task_id AS spinoffSourceTaskId, t.spinoff_finding AS spinoffFinding,
+              (t.execution_spec IS NOT NULL) AS specPlanned, t.workflow
+         FROM tasks t WHERE ${taskWhere} ORDER BY t."order"`, pid),
+    rows(taskSurface,
+      'SELECT d.task_id AS taskId, d.depends_on_task_id AS dependsOnTaskId FROM dependencies d JOIN tasks t ON t.id = d.task_id WHERE t.project_id = ?', pid),
+    rows(taskSurface,
+      `SELECT DISTINCT dt.id, dt.key, dt.title, ${taskWireStatus('dt')} AS status,
+              dt.project_id AS projectId, dp.key AS projectKey
+         FROM dependencies d JOIN tasks t ON t.id = d.task_id
+         JOIN tasks dt ON dt.id = d.depends_on_task_id JOIN projects dp ON dp.id = dt.project_id
+        WHERE t.project_id = ?1 AND dt.project_id != ?1`, pid),
+    rows(agentSurface,
+      `SELECT a.id, COALESCE(a.label, a.name) AS name, a.role, a.status,
+              a.last_seen_at AS lastSeenAt, a.parent_agent_id AS parentAgentId, u.name AS ownerName
+         FROM agents a LEFT JOIN users u ON u.id = a.user_id
+        WHERE a.project_id = ? AND a.status != 'revoked' ORDER BY a.created_at`, pid),
+    rows(eventSurface,
+      `SELECT id, seq, actor_kind AS actorKind, actor_id AS actorId, verb,
+              subject_type AS subjectType, subject_id AS subjectId, payload, created_at AS createdAt
+         FROM events WHERE project_id = ? ORDER BY seq DESC LIMIT 60`, pid),
+    rows(operationalSurface,
+      'SELECT id, title, due_at AS dueAt, description, "order" FROM milestones WHERE project_id = ? ORDER BY "order"', pid),
+    rows(operationalSurface,
+      'SELECT id, name, "order" FROM boards WHERE project_id = ? ORDER BY "order", created_at', pid),
+    rows(taskSurface,
+      `SELECT id, agent_id AS agentId, title, description,
+              ${planSurface ? 'body' : "'' AS body"}, status, archived_at AS archivedAt, created_at AS createdAt
+         FROM plans WHERE project_id = ? ORDER BY created_at DESC`, pid),
+    rows(taskSurface,
+      `SELECT ph.id, ph.plan_id AS planId, ph.title, ${planSurface ? 'ph.body' : "'' AS body"}, ph."order"
+         FROM phases ph JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ? ORDER BY ph."order"`, pid),
+    rows(taskSurface,
+      'SELECT pt.phase_id AS phaseId, pt.task_id AS taskId FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ?', pid),
+    rows(operationalSurface || docsSurface,
+      'SELECT id, name, color, "order" FROM tags WHERE project_id = ? ORDER BY "order"', pid),
+    rows(taskSurface || docsSurface,
+      'SELECT tt.task_id AS taskId, tt.tag_id AS tagId FROM task_tags tt JOIN tasks t ON t.id = tt.task_id WHERE t.project_id = ?', pid),
+    rows(operationalSurface,
+      `SELECT s.id, s.task_id AS taskId, t.key AS taskKey, s.agent_id AS agentId, s.agent_name AS agentName,
+              s.type, s.severity, s.title, s.body, s.options, s.questions, s.follow_up_to AS followUpTo,
+              s.blocking, s.created_at AS createdAt
+         FROM signals s LEFT JOIN tasks t ON t.id = s.task_id
+        WHERE s.project_id = ? AND s.status = 'open' ORDER BY
+          CASE s.type WHEN 'input_request' THEN 0 ELSE 1 END,
+          CASE s.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, s.created_at DESC`, pid),
+    rows(docsSurface,
+      'SELECT td.task_id AS taskId, td.doc_id AS docId FROM task_docs td JOIN tasks t ON t.id = td.task_id WHERE t.project_id = ?', pid),
+    rows(planSurface,
+      'SELECT id, plan_id AS planId, name, description, body, author_kind AS authorKind, author_name AS authorName, created_at AS createdAt, updated_at AS updatedAt FROM plan_docs WHERE project_id = ? ORDER BY updated_at DESC', pid),
+    rows(lockSurface,
+      `SELECT fl.id, fl.agent_id AS agentId, fl.task_id AS taskId, fl.kind, fl.canon_pattern AS path,
+              fl.branch, fl.all_branches AS allBranches, fl.acquired_at AS acquiredAt, fl.expires_at AS expiresAt,
+              a.name AS holderName, t.key AS taskKey, t.title AS taskTitle
+         FROM file_locks fl LEFT JOIN agents a ON a.id = fl.agent_id LEFT JOIN tasks t ON t.id = fl.task_id
+        WHERE fl.project_id = ? AND fl.released_at IS NULL
+          AND fl.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') ORDER BY fl.acquired_at DESC`, pid),
+  ]);
+
+  const extPids = [...new Set(extDeps.map((row) => String(row.projectId)))];
+  const reachablePids = new Set(
+    (await Promise.all(extPids.map(async (externalPid) => ((await reachesProject(c, externalPid)) ? externalPid : null)))).filter(Boolean),
+  );
+  const externalTasks = extDeps.map((row) =>
+    reachablePids.has(String(row.projectId)) ? row : { id: row.id, status: row.status },
+  );
+  const duration = performance.now() - startedAt;
+  c.header('Cache-Control', 'private, no-store');
+  c.header('Server-Timing', `ui-state;dur=${duration.toFixed(2)};desc="${surface}"`);
+  c.header('X-Noriq-UI-Surface', surface);
+  c.header('X-Noriq-Query-Count', String(queryCount));
+  return c.json({
+    version: pkg.version,
+    surface,
+    project: { ...project, ...projectAccessFields(effectiveAccess) },
+    tasks,
+    dependencies,
+    externalTasks,
+    agents,
+    events: events.map((event) => ({ ...event, payload: JSON.parse(String(event.payload)) })),
+    milestones,
+    boards,
+    plans,
+    phases,
+    phaseTasks,
+    tags,
+    taskTags,
+    signals: signals.map((signal) => ({
+      ...signal,
+      options: signal.options ? JSON.parse(String(signal.options)) : null,
+      questions: signal.questions ? JSON.parse(String(signal.questions)) : null,
+    })),
+    taskDocs,
+    planDocs,
+    locks,
+  });
+});
+
+// On-demand body matching for the board's text filter (PLNR-400). Task bodies are deliberately
+// absent from UI-state list rows; this bounded page preserves body search without putting every
+// markdown document back into every board refresh. The browser follows nextCursor incrementally
+// and aborts the chain as soon as the query changes.
+app.get('/api/projects/:pid/task-body-matches', userAuth, async (c) => {
+  const query = c.req.query('q')?.trim();
+  if (!query) return c.json({ error: 'q required' }, 400);
+  const limit = Math.min(Math.max(parseInt(c.req.query('limit') ?? '256', 10) || 256, 1), 256);
+  const offset = Math.max(parseInt(c.req.query('cursor') ?? '0', 10) || 0, 0);
+  const { results } = await c.env.DB.prepare(
+    `SELECT id FROM tasks
+      WHERE project_id = ? AND instr(lower(COALESCE(body, '')), lower(?)) > 0
+      ORDER BY "order", id LIMIT ? OFFSET ?`,
+  ).bind(c.req.param('pid')!, query, limit + 1, offset).all<{ id: string }>();
+  const hasMore = results.length > limit;
+  return c.json({
+    taskIds: results.slice(0, limit).map((row) => row.id),
+    nextCursor: hasMore ? String(offset + limit) : null,
+  });
+});
+
 app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
   const effectiveAccess = await resolveProjectAccess(c.env.DB, c.var.user!.id, pid, { allowAdminOverride: true });

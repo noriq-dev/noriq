@@ -2,7 +2,7 @@
 // Called during hook init and on popstate, an unhandled throw blanked the whole app.
 // safeDecode must never throw — it falls back to the raw value.
 import { describe, expect, it } from 'vitest';
-import { buildUrlSearch, buildViewPath, parseUrl, safeDecode } from './store';
+import { buildUrlSearch, buildViewPath, parseUrl, projectUiSurface, safeDecode } from './store';
 
 describe('safeDecode (PLNR-113)', () => {
   it('decodes valid percent-encoding', () => {
@@ -38,6 +38,21 @@ describe('project Settings route (PLNR-401)', () => {
   it('writes the canonical project-scoped path without colliding with account settings', () => {
     expect(buildViewPath('project-settings', 'prj alpha')).toBe('/p/prj%20alpha/settings');
     expect(buildViewPath('settings', 'prj alpha')).toBe('/settings');
+  });
+});
+
+describe('surface-scoped project loading (PLNR-400)', () => {
+  it('maps every project route to an explicit bounded surface', () => {
+    expect(projectUiSurface('control')).toBe('control');
+    expect(projectUiSurface('plans')).toBe('plans');
+    expect(projectUiSurface('memory')).toBe('memory');
+    expect(projectUiSurface('project-settings')).toBe('project-settings');
+  });
+
+  it('does not issue project reads for global routes', () => {
+    for (const view of ['home', 'ask', 'settings', 'admin'] as const) {
+      expect(projectUiSurface(view)).toBeNull();
+    }
   });
 });
 

@@ -1,6 +1,6 @@
 // Live store — REST snapshots + WebSocket invalidation. Replaces the Phase-0 mock.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, type ApiProject, type ApiSnapshot } from './api';
+import { api, type ApiProject, type ApiSnapshot, type ApiUiSurface } from './api';
 import type { AppData, CommentKind, EventVM, ProjectVM, TaskStatus, TaskVM, UserVM, ViewId } from './types';
 
 const PALETTE = ['#4c9dff', '#b57bff', '#3fd98b', '#ff8a8a', '#c6f24e', '#f5a623'];
@@ -72,6 +72,16 @@ function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
 }
 
 const VIEWS: ViewId[] = ['home', 'control', 'graph', 'executions', 'intelligence', 'board', 'plans', 'roadmap', 'review', 'docs', 'ask', 'agents', 'runs', 'settings', 'project-settings', 'admin', 'memory'];
+const UI_SURFACES = new Set<ApiUiSurface>([
+  'control', 'graph', 'executions', 'intelligence', 'board', 'plans', 'roadmap',
+  'review', 'docs', 'agents', 'runs', 'project-settings', 'memory',
+]);
+
+/** Global views have no project read model. Project views map one-to-one to the API's
+ * closed surface allowlist, so adding navigation cannot accidentally restore /snapshot. */
+export function projectUiSurface(view: ViewId): ApiUiSurface | null {
+  return UI_SURFACES.has(view as ApiUiSurface) ? view as ApiUiSurface : null;
+}
 
 /** decodeURIComponent throws URIError on malformed %-encoding (e.g. `/p/%`).
  *  Unhandled during render/popstate this blanks the app (PLNR-113); fall back to the raw value. */
@@ -155,6 +165,8 @@ export function useAppStore() {
 
   const pidRef = useRef(currentPid);
   pidRef.current = currentPid;
+  const viewRef = useRef(view);
+  viewRef.current = view;
   const boardRef = useRef(boardId);
   boardRef.current = boardId;
   const selRef = useRef(selectedTaskId);
@@ -162,6 +174,12 @@ export function useAppStore() {
   const lastSeq = useRef(0);
   const wsRef = useRef<WebSocket | null>(null);
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const uiRequest = useRef<{
+    key: string;
+    controller: AbortController;
+    promise: Promise<void>;
+    queued: boolean;
+  } | null>(null);
 
   // --- auth + first-run setup ---------------------------------------------------
   useEffect(() => {
@@ -240,21 +258,39 @@ export function useAppStore() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const loadSnapshot = useCallback(async (pid: string) => {
-    const snap = await api.snapshot(pid);
-    maybeReloadForNewVersion(snap.version);
-    if (pidRef.current !== pid) return;
-    // PLNR-112: overlapping /snapshot fetches (a WS-triggered refresh racing an
-    // action refresh(), or two rapid WS events) can resolve out of order. Drop any
-    // response whose newest event seq is older than what we've already applied —
-    // otherwise a stale snapshot overwrites newer state AND regresses lastSeq, which
-    // is then sent as sinceSeq on the next WS resubscribe. seq is monotonic per
-    // project, so max-seq is a reliable freshness cursor. (A project switch resets
-    // lastSeq to 0 in selectProject, so a new project's first snapshot always applies.)
-    const maxSeq = Math.max(0, ...snap.events.map((e) => e.seq));
-    if (maxSeq < lastSeq.current) return;
-    setSnapshot(snap);
-    lastSeq.current = maxSeq;
+  const loadUiState = useCallback((pid: string, surface: ApiUiSurface): Promise<void> => {
+    const key = `${pid}:${surface}`;
+    if (uiRequest.current?.key === key) {
+      // Do not fan duplicate invalidations out into concurrent reads. Remember one trailing
+      // refresh so an event arriving after the in-flight query began cannot be lost either.
+      uiRequest.current.queued = true;
+      return uiRequest.current.promise;
+    }
+    uiRequest.current?.controller.abort();
+    const controller = new AbortController();
+    const promise = api.uiState(pid, surface, controller.signal)
+      .then((snap) => {
+        maybeReloadForNewVersion(snap.version);
+        if (pidRef.current !== pid || projectUiSurface(viewRef.current) !== surface) return;
+        setSnapshot(snap);
+        // Every surface carries a cheap MAX(seq) cursor in project metadata. Event-heavy
+        // surfaces also carry the bounded feed itself; either way reconnects do not replay
+        // the entire backlog just because the current page owns its own data API.
+        lastSeq.current = Math.max(lastSeq.current, snap.project.eventSeq ?? 0, ...snap.events.map((event) => event.seq));
+      })
+      .catch((error: unknown) => {
+        if (!(error instanceof DOMException && error.name === 'AbortError')) throw error;
+      })
+      .finally(() => {
+        if (uiRequest.current?.promise !== promise) return;
+        const queued = uiRequest.current.queued;
+        uiRequest.current = null;
+        if (queued && pidRef.current === pid && projectUiSurface(viewRef.current) === surface) {
+          setTimeout(() => void loadUiState(pid, surface), 0);
+        }
+      });
+    uiRequest.current = { key, controller, promise, queued: false };
+    return promise;
   }, []);
 
   // A new deploy bumps the server's package version (see /api/health): reload the tab
@@ -291,8 +327,10 @@ export function useAppStore() {
   }, [user, loadProjects]);
 
   useEffect(() => {
-    if (user && currentPid) void loadSnapshot(currentPid);
-  }, [user, currentPid, loadSnapshot]);
+    const surface = projectUiSurface(view);
+    if (user && currentPid && surface) void loadUiState(currentPid, surface);
+    else uiRequest.current?.controller.abort();
+  }, [user, currentPid, view, loadUiState]);
 
   // Keep the selected board valid: default to the first board, and re-home if the
   // current one vanished (project switch or board deletion).
@@ -338,10 +376,12 @@ export function useAppStore() {
         try {
           if ((JSON.parse(ev.data as string) as { type?: string }).type === 'pong') return; // liveness only
         } catch { /* non-JSON frame — treat as an event */ }
-        // Any event (or backlog) → debounced snapshot refresh; comments too if drawer open.
+        // Any event (or backlog) → one debounced refresh of the CURRENT surface; comments too
+        // if the drawer is open. The in-flight key above coalesces duplicate invalidations.
         if (refreshTimer.current) clearTimeout(refreshTimer.current);
         refreshTimer.current = setTimeout(() => {
-          if (pidRef.current) void loadSnapshot(pidRef.current);
+          const surface = projectUiSurface(viewRef.current);
+          if (pidRef.current && surface) void loadUiState(pidRef.current, surface);
           if (selRef.current) void loadComments(selRef.current);
         }, 250);
       };
@@ -377,7 +417,8 @@ export function useAppStore() {
     const onWake = () => {
       if (document.visibilityState !== 'visible') return;
       ensureLive();
-      if (pidRef.current) void loadSnapshot(pidRef.current);
+      const surface = projectUiSurface(viewRef.current);
+      if (pidRef.current && surface) void loadUiState(pidRef.current, surface);
       if (selRef.current) void loadComments(selRef.current);
     };
     document.addEventListener('visibilitychange', onWake);
@@ -394,7 +435,7 @@ export function useAppStore() {
       if (reconnectTimer) clearTimeout(reconnectTimer);
       socket?.close();
     };
-  }, [user, currentPid, loadSnapshot, loadComments]);
+  }, [user, currentPid, loadUiState, loadComments]);
 
   // --- URL <-> state sync (PLNR-36) ---------------------------------------------
   const popping = useRef(false);
@@ -542,9 +583,10 @@ export function useAppStore() {
   }, [data, snapshot, showArchived]);
 
   const refresh = useCallback(() => {
-    if (pidRef.current) void loadSnapshot(pidRef.current);
+    const surface = projectUiSurface(viewRef.current);
+    if (pidRef.current && surface) void loadUiState(pidRef.current, surface);
     if (selRef.current) void loadComments(selRef.current);
-  }, [loadSnapshot, loadComments]);
+  }, [loadUiState, loadComments]);
 
   const directoryProject = projects.find((p) => p.id === currentPid);
   const permissions = {

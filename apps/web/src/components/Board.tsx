@@ -1,5 +1,5 @@
 // Board — kanban with composable milestone, task-attribute, plan, tag, and text filters.
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api } from '../api';
 import type { AppStore } from '../store';
 import type { TaskStatus } from '../types';
@@ -42,6 +42,7 @@ export function Board({ store }: { store: AppStore }) {
   // Tag row collapse (PLNR-196): null = default (open unless the vocabulary is large).
   const [tagsOpen, setTagsOpen] = useState<boolean | null>(null);
   const [query, setQuery] = useState('');
+  const [bodyMatches, setBodyMatches] = useState<Set<string>>(new Set());
   // Attribute filters (PLNR-161): the triage axes the milestone/tag/text bar didn't cover.
   const [prioFilter, setPrioFilter] = useState(5); // most-urgent-first scale: keep tasks with
   // priority <= this. 5 = any, since 0 is now P0, a real value (PLNR-231).
@@ -72,6 +73,30 @@ export function Board({ store }: { store: AppStore }) {
     boardId === null || tBoardId === boardId || (tBoardId == null && boardId === firstBoardId);
 
   const q = query.trim().toLowerCase();
+  useEffect(() => {
+    const controller = new AbortController();
+    setBodyMatches(new Set());
+    if (!q) return () => controller.abort();
+    const timer = setTimeout(() => {
+      void (async () => {
+        const ids = new Set<string>();
+        let cursor: string | undefined;
+        do {
+          const page = await api.taskBodyMatches(currentPid, q, cursor, controller.signal);
+          for (const id of page.taskIds) ids.add(id);
+          if (!controller.signal.aborted) setBodyMatches(new Set(ids));
+          cursor = page.nextCursor ?? undefined;
+        } while (cursor && !controller.signal.aborted);
+      })().catch((error: unknown) => {
+        if (!(error instanceof DOMException && error.name === 'AbortError')) setBodyMatches(new Set());
+      });
+    }, 150);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [currentPid, q]);
+
   const stateOk = (t: (typeof tasks)[number]): boolean => {
     if (!stateFilter) return true;
     const openish = t.status !== 'done' && t.status !== 'cancelled';
@@ -93,7 +118,7 @@ export function Board({ store }: { store: AppStore }) {
       (q === '' ||
         t.title.toLowerCase().includes(q) ||
         t.key.toLowerCase().includes(q) ||
-        (t.body ?? '').toLowerCase().includes(q) ||
+        bodyMatches.has(t.id) ||
         t.tagIds.some((id) => tagById.get(id)?.name.toLowerCase().includes(q))),
   );
 

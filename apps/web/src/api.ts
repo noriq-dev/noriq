@@ -186,6 +186,15 @@ export const api = {
   // The snapshot always includes archived tasks (flagged by archivedAt); the store
   // filters them for display (PLNR-150).
   snapshot: (pid: string) => req<ApiSnapshot>('GET', `/api/projects/${pid}/snapshot`),
+  uiState: (pid: string, surface: ApiUiSurface, signal?: AbortSignal) =>
+    req<ApiSnapshot>('GET', `/api/projects/${pid}/ui-state?surface=${encodeURIComponent(surface)}`, undefined, signal),
+  taskBodyMatches: (pid: string, q: string, cursor?: string, signal?: AbortSignal) =>
+    req<{ taskIds: string[]; nextCursor: string | null }>(
+      'GET',
+      `/api/projects/${pid}/task-body-matches?q=${encodeURIComponent(q)}&limit=256${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`,
+      undefined,
+      signal,
+    ),
   archiveTask: (pid: string, tid: string) => req('POST', `/api/projects/${pid}/tasks/${tid}/archive`),
   restoreTask: (pid: string, tid: string) => req('POST', `/api/projects/${pid}/tasks/${tid}/restore`),
   taskDetail: (tid: string) => req<ApiTaskDetail>('GET', `/api/tasks/${tid}`),
@@ -1185,12 +1194,19 @@ export interface ApiSearchHit {
   validity?: string;
 }
 
+export type ApiUiSurface =
+  | 'control' | 'graph' | 'board' | 'plans' | 'roadmap' | 'review' | 'docs'
+  | 'executions' | 'intelligence' | 'agents' | 'runs' | 'memory' | 'project-settings';
+
 export interface ApiSnapshot {
   /** Server package version — deploy marker for the SPA's self-refresh (PLNR-193). */
   version?: string;
+  /** Present on the purpose-built SPA read model; absent on the legacy full snapshot. */
+  surface?: ApiUiSurface;
   project: {
     id: string; key: string; name: string; description: string; claimTtlSeconds: number;
     lockTtlSeconds?: number | null; fileLockingEnabled?: number;
+    reviewTasks?: number; eventSeq?: number;
     effectiveRole: 'owner' | 'manager' | 'contributor' | 'viewer' | null;
     accessSource: string; canView: boolean; canContribute: boolean; canManage: boolean; canOwn: boolean;
     cappedByReadOnly: boolean;

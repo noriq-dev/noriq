@@ -36,6 +36,10 @@ export function Drawer({ store }: { store: AppStore }) {
   const [depError, setDepError] = useState('');
   const [attachments, setAttachments] = useState<Array<{ id: string; filename: string; size: number; contentType?: string; createdAt: string }>>([]);
   const [taskDocs, setTaskDocs] = useState<Array<{ id: string; name: string; description: string }>>([]);
+  // PLNR-400: list rows intentionally omit markdown bodies. The drawer already owns the
+  // canonical task-detail request, so keep the body with that response instead of making every
+  // project-surface refresh carry every task body.
+  const [detailBody, setDetailBody] = useState<string | null>(null);
   // The spec rides only on the DETAIL read (RUN-135) — the board snapshot deliberately omits it,
   // so it cannot come from the store's task view-model. `load` is carried alongside because
   // "still fetching" and "the fetch failed" must not render as "this task has no spec": that
@@ -59,6 +63,7 @@ export function Drawer({ store }: { store: AppStore }) {
       api.taskEvents(selectedTaskId).then((r) => setTimeline(r.events)).catch(() => setTimeline([]));
       const forTask = selectedTaskId;
       detailFor.current = forTask;
+      setDetailBody(null);
       setSpec(null);
       setSpecUnreadable(false);
       setSpecLoad('loading');
@@ -67,6 +72,7 @@ export function Drawer({ store }: { store: AppStore }) {
           if (detailFor.current !== forTask) return; // a later task won the race
           setAttachments(r.attachments);
           setTaskDocs(r.docs ?? []);
+          setDetailBody(typeof r.task.body === 'string' ? r.task.body : '');
           setSpec((r.task.executionSpec as ExecutionSpec | null) ?? null);
           setSpecUnreadable(r.task.executionSpecUnreadable === true);
           setSpecLoad('loaded');
@@ -75,6 +81,7 @@ export function Drawer({ store }: { store: AppStore }) {
           if (detailFor.current !== forTask) return;
           setAttachments([]);
           setTaskDocs([]);
+          setDetailBody(null);
           setSpec(null);
           setSpecUnreadable(false);
           setSpecLoad('error');
@@ -120,8 +127,9 @@ export function Drawer({ store }: { store: AppStore }) {
   const taskSignals = (snapshot?.signals ?? []).filter((s) => s.taskId === task.id);
 
   const startEdit = () => {
+    if (detailBody === null) return;
     setETitle(task.title);
-    setEBody(task.body);
+    setEBody(detailBody);
     setEType(task.type);
     setEPriority(-1); // -1 = keep: priority isn't in the VM snapshot list, and 0 is now a real
     // value (P0, the most urgent), so 'unchanged' has to live off the scale (PLNR-231).
@@ -148,6 +156,7 @@ export function Drawer({ store }: { store: AppStore }) {
       // repo's advertised set is runner-scoped state the drawer doesn't know.
       workflow: eWorkflow.trim() || null,
     });
+    setDetailBody(eBody);
     setEditing(false);
     actions.refreshNow();
   };
@@ -233,7 +242,7 @@ export function Drawer({ store }: { store: AppStore }) {
               ))}
             </datalist>
             <div style={{ flex: 1 }} />
-            {!editing && store.permissions.canContribute && (
+            {!editing && store.permissions.canContribute && detailBody !== null && (
               <button
                 onClick={startEdit}
                 title="Edit task"
@@ -358,7 +367,11 @@ export function Drawer({ store }: { store: AppStore }) {
               </div>
             </div>
           ) : (
-            <div style={{ marginBottom: 18 }}><Markdown source={task.body} /></div>
+            <div style={{ marginBottom: 18 }}>
+              {detailBody === null
+                ? <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>loading task details…</span>
+                : <Markdown source={detailBody} />}
+            </div>
           )}
 
           {/* Spin-off provenance + decision (PLNR-230). The panel persists after the decision —

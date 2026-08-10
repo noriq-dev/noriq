@@ -83,7 +83,9 @@ function GroupMenu({
 export function TopBar({ store }: { store: AppStore }) {
   const { currentPid, view, helpers, actions } = store;
   const tasks = helpers.tasksOf(currentPid);
-  const reviewCount = tasks.filter((task) => task.status === 'review' && !task.archivedAt).length;
+  // Metadata carries the count even on surfaces that intentionally load no task rows.
+  const reviewCount = store.snapshot?.project.reviewTasks
+    ?? tasks.filter((task) => task.status === 'review' && !task.archivedAt).length;
   const [attnCount, setAttnCount] = useState(0);
   const [presence, setPresence] = useState<{ agents: ApiAgent[]; total: number } | null>(null);
   const [presenceUnavailable, setPresenceUnavailable] = useState(false);

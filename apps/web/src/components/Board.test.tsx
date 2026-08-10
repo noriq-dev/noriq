@@ -1,6 +1,7 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { api } from '../api';
 import type { AppStore } from '../store';
 import type { TaskVM } from '../types';
 import { Board } from './Board';
@@ -89,6 +90,7 @@ afterEach(() => {
   act(() => root?.unmount());
   container?.remove();
   root = null;
+  vi.restoreAllMocks();
 });
 
 describe('Board plan membership filter', () => {
@@ -102,6 +104,25 @@ describe('Board plan membership filter', () => {
     expect(container.textContent).not.toContain('Standalone board task');
 
     selectPlanFilter('standalone');
+    expect(container.textContent).not.toContain('Task from the release plan');
+    expect(container.textContent).toContain('Standalone board task');
+  });
+
+  it('keeps body search lazy and renders incremental server matches', async () => {
+    const match = vi.spyOn(api, 'taskBodyMatches').mockResolvedValue({
+      taskIds: ['task_standalone'],
+      nextCursor: null,
+    });
+    mount();
+    const input = container.querySelector<HTMLInputElement>('input[placeholder="Search tasks…"]')!;
+
+    act(() => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, 'only in markdown');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 180)); });
+
+    expect(match).toHaveBeenCalledWith('project_board', 'only in markdown', undefined, expect.any(AbortSignal));
     expect(container.textContent).not.toContain('Task from the release plan');
     expect(container.textContent).toContain('Standalone board task');
   });
