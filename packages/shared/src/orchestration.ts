@@ -23,6 +23,19 @@ export const ExecutionStatus = z.enum(['pending', 'running', 'parked', 'succeede
 export const ExecutionRelationType = z.enum(['continues', 'verifies', 'repairs', 'hands_off_to', 'depends_on']);
 export const ExecutionEventType = z.enum(['started', 'parked', 'resumed', 'succeeded', 'failed', 'cancelled', 'interrupted']);
 export const ExecutionLineageStatus = z.enum(['complete', 'partial', 'unknown']);
+export const ExecutionLineageMissing = z.enum(['root', 'parent', 'actor', 'presence', 'subject', 'events', 'legacy']);
+
+/**
+ * The complete lineage-quality value settled by PLNR-361. The original wire assignment carries
+ * the compact status only; Project Intelligence and read models need the reasons as well, and
+ * must reuse this authority rather than inventing a second completeness vocabulary.
+ */
+export const LineageCompleteness = z.object({
+  status: ExecutionLineageStatus,
+  missing: z.array(ExecutionLineageMissing).default([]),
+  reason: z.string().nullable().default(null),
+});
+export type LineageCompleteness = z.infer<typeof LineageCompleteness>;
 
 export const ExecutionAssignment = z.object({
   schemaVersion: z.literal(1),

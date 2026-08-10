@@ -24,6 +24,9 @@ export const SUPERSEDED_GENERATION_MAX_AGE_MS = 24 * 3600 * 1000;
 /** How long a restore's retained prior generation stays available for rollback before the
  *  sweep discards it. */
 export const RETAINED_GENERATION_MAX_AGE_MS = 7 * 24 * 3600 * 1000;
+/** A cross-source analytics build older than this is an abandoned resumable job, not a live
+ * generation. The sweep fails it, discards its inbox, and leaves canonical sources untouched. */
+export const ANALYTICS_BUILD_MAX_AGE_MS = 24 * 3600 * 1000;
 /** Visibility thresholds only (§18) — nothing here refuses a write at either line. */
 export const DB_SIZE_WARN_BYTES = 500 * 1024 * 1024;
 export const DB_SIZE_CRITICAL_BYTES = 1024 * 1024 * 1024;
@@ -138,6 +141,8 @@ export interface ProjectCleanupResult {
   /** PLNR-256: superseded index-generation registry rows discarded (no second scheduler — see
    *  SUPERSEDED_GENERATION_MAX_AGE_MS's doc comment for what this does and does not clean up). */
   prunedSupersededGenerations: number;
+  prunedAnalyticsGenerations: number;
+  abandonedAnalyticsGenerations: number;
   /** PLNR-320: whether this sweep was the one that ran the automatic one-time coordination-graph
    *  backfill for this project (see `ProjectMemory.backfillProjectionOnce`'s own doc comment for
    *  why the daily sweep, not `alarm()`/construction, is the deliberate trigger). `false` on
@@ -165,7 +170,7 @@ export async function sweepProjectDebrisForProject(env: Env, projectId: string):
       return fallback;
     }
   };
-  const [prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations, decayedMemories, prunedSupersededGenerations, backfill] = await Promise.all([
+  const [prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations, decayedMemories, prunedSupersededGenerations, analytics, backfill] = await Promise.all([
     capture('staged-generations', 0, stub.pruneAbandonedStagedGenerations(projectId, STAGED_GENERATION_MAX_AGE_MS)),
     capture('retained-generation', false, stub.pruneRetainedGenerationIfExpired(projectId, RETAINED_GENERATION_MAX_AGE_MS)),
     capture('backup-retention', 0, pruneBackupRetention(env, projectId)),
@@ -176,6 +181,11 @@ export async function sweepProjectDebrisForProject(env: Env, projectId: string):
         .then((r) => r.decayed.length),
     ),
     capture('superseded-generations', 0, stub.pruneSupersededGenerations(projectId, SUPERSEDED_GENERATION_MAX_AGE_MS)),
+    capture(
+      'analytics-generations', { pruned: 0, abandoned: 0 },
+      stub.pruneAnalyticsGenerations(projectId, ANALYTICS_BUILD_MAX_AGE_MS)
+        .then((result) => ({ pruned: result.pruned, abandoned: result.abandoned })),
+    ),
     // PLNR-320: the automatic one-time coordination-graph backfill — see
     // ProjectMemory.backfillProjectionOnce's own doc comment for why THIS sweep, specifically,
     // is the deliberate trigger (not alarm()/construction). A no-op on every sweep after the
@@ -196,6 +206,8 @@ export async function sweepProjectDebrisForProject(env: Env, projectId: string):
   );
   return {
     projectId, prunedStagedGenerations, prunedRetainedGeneration, prunedBackupGenerations, decayedMemories, prunedSupersededGenerations,
+    prunedAnalyticsGenerations: analytics.pruned,
+    abandonedAnalyticsGenerations: analytics.abandoned,
     backfilled: backfill.ran,
     backfillNodesWritten: backfill.nodesWritten ?? 0,
     backfillEdgesWritten: backfill.edgesWritten ?? 0,

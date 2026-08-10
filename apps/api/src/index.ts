@@ -53,9 +53,24 @@ import {
 } from './lib/project-memory';
 import { renderEvidenceFrame, type EvidenceFrameItem } from './memory/evidence-frame';
 import { assembleContextPack } from './memory/context-pack';
+import { assessPreDispatchRisk } from './memory/scope-risk';
+import { getDispatchIntelligence, resolveDispatchRepository } from './memory/dispatch-intelligence';
+import {
+  COMPARISON_METRICS, queryStrategyComparison, STRATEGY_DIMENSIONS,
+} from './memory/strategy-comparison';
+import { assessProjectBottlenecks, BOTTLENECK_TASK_LIMIT } from './memory/bottlenecks';
+import {
+  getSimilarityCalibration,
+  SIMILARITY_JUDGMENTS, SIMILARITY_REASON_CODES, SimilarityFeedbackError,
+  type SimilarityJudgment, type SimilarityReasonCode,
+} from './memory/similarity-feedback';
 import { readBoundedBody, verifyBatchChecksum, decodeBatchRows, MAX_INGEST_BATCH_BYTES, INGEST_TOKEN_TTL_SECONDS } from './memory/ingest';
 import { normalizeVerificationReport } from './memory/verification';
 import { sweepPendingEpisodeJobs } from './memory/episodes';
+import {
+  getCurrentProjectFlowSummary, getProjectAnalyticsHealth, rebuildProjectAnalytics, sweepPendingAnalyticsJobs,
+} from './memory/analytics';
+import { getProjectIntelligenceDashboard } from './memory/intelligence-dashboard';
 import { classifyAgentLifecycle } from './lib/agent-lifecycle';
 import { agentLifecycleSweepConfig, sweepAgentLifecycle, type AgentLifecycleCursor } from './lib/agent-lifecycle-sweep';
 import { AGENT_LIFECYCLES, listAgentRoster, type AgentRosterLifecycle } from './lib/agent-roster';
@@ -1341,6 +1356,105 @@ app.get('/api/projects/:pid/memory/health', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
   return c.json(await memoryStub(c.env, pid).health(pid));
 });
+
+app.get('/api/projects/:pid/memory/analytics/health', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  return c.json(await getProjectAnalyticsHealth(c.env, pid));
+});
+
+const QualityEventBody = z.discriminatedUnion('type', [
+  z.object({
+    operationKey: z.string().min(1).max(200), type: z.literal('work_reverted'),
+    taskId: z.string().min(1), runId: z.string().min(1).nullable().optional(),
+    sitting: z.number().int().positive().nullable().optional(), artifactRef: z.string().min(1).max(1_000),
+    observedAt: z.string().datetime().optional(), provenance: z.record(z.string(), z.unknown()).optional(),
+  }).strict(),
+  z.object({
+    operationKey: z.string().min(1).max(200), type: z.literal('regression_task_linked'),
+    taskId: z.string().min(1), relatedTaskId: z.string().min(1),
+    runId: z.string().min(1).nullable().optional(), sitting: z.number().int().positive().nullable().optional(),
+    observedAt: z.string().datetime().optional(), provenance: z.record(z.string(), z.unknown()).optional(),
+  }).strict(),
+]).superRefine((value, ctx) => {
+  if ((value.runId == null) !== (value.sitting == null)) {
+    ctx.addIssue({ code: 'custom', message: 'runId and sitting must be supplied together' });
+  }
+});
+
+// PLNR-297: explicit evidence only. task_reopened is derived server-side from a deliberate
+// done -> active transition and is intentionally not accepted as caller-asserted input.
+app.post('/api/projects/:pid/memory/quality-events', userAuth, async (c) => {
+  const parsed = QualityEventBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid quality event', detail: parsed.error.issues }, 400);
+  try {
+    return c.json(await room(c.env, c.req.param('pid')!).recordQualityEvent(
+      c.req.param('pid')!, humanActor(c), parsed.data,
+    ));
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+  }
+});
+
+const HistoricalAnalyticsDimensionBody = z.enum([
+  'project', 'plan', 'plan_dispatch', 'orchestration', 'task', 'run', 'sitting',
+  'commissioned_workflow', 'executed_workflow', 'configuration', 'stage', 'role',
+]);
+const HistoricalAnalyticsQueryBody = z.object({
+  from: z.string().datetime().optional(),
+  to: z.string().datetime().optional(),
+  groupBy: HistoricalAnalyticsDimensionBody.optional(),
+  filters: z.array(z.object({ dimension: HistoricalAnalyticsDimensionBody, value: z.string().min(1) })).max(8).optional(),
+  caseCursor: z.string().min(1).optional(),
+  caseLimit: z.number().int().min(1).max(100).optional(),
+  qualityHorizonDays: z.number().int().min(1).max(3650).optional(),
+}).strict();
+
+// PLNR-294: frozen historical facts and live coordination state remain separate endpoints and
+// carry separate observation/generation timestamps. Consumers cannot accidentally blend a
+// current queue count into a completed generation's historical denominator.
+app.post('/api/projects/:pid/memory/analytics/query', userAuth, async (c) => {
+  const parsed = HistoricalAnalyticsQueryBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid historical analytics query', detail: parsed.error.issues }, 400);
+  const pid = c.req.param('pid')!;
+  try {
+    return c.json(await memoryDO(c.env, pid).queryHistoricalAnalytics(pid, parsed.data));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return c.json({ error: message }, message.includes('no complete analytics generation') ? 409 : 400);
+  }
+});
+
+app.get('/api/projects/:pid/memory/analytics/current', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  return c.json(await getCurrentProjectFlowSummary(c.env, pid));
+});
+
+// PLNR-302: a single bounded dashboard packet keeps live and frozen facts visibly separate while
+// avoiding browser-authored joins or denominator arithmetic. Deterministic D1/SQLite reads remain
+// available without Vectorize, Workers AI, Queues, or Workflows.
+app.post('/api/projects/:pid/memory/intelligence', userAuth, async (c) => {
+  const parsed = z.object({
+    from: z.string().datetime(),
+    to: z.string().datetime(),
+    groupBy: HistoricalAnalyticsDimensionBody.optional(),
+    caseCursor: z.string().min(1).optional(),
+    caseLimit: z.number().int().min(1).max(100).default(24),
+    comparison: z.object({
+      dimension: z.enum(STRATEGY_DIMENSIONS), metric: z.enum(COMPARISON_METRICS),
+    }).strict().optional(),
+  }).strict().safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid project intelligence request', detail: parsed.error.issues }, 400);
+  const from = Date.parse(parsed.data.from);
+  const to = Date.parse(parsed.data.to);
+  if (from > to || to - from > 366 * 24 * 60 * 60 * 1_000) {
+    return c.json({ error: 'project intelligence range must be ordered and at most 366 days' }, 400);
+  }
+  try {
+    return c.json(await getProjectIntelligenceDashboard(c.env, c.req.param('pid')!, parsed.data));
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+  }
+});
 // Canonical repository identity + checkout associations (PLNR-259) — straight D1 reads (CLAUDE.md:
 // reads go straight to D1), not a ProjectMemory DO RPC; registration/association happen through
 // ProjectRoom (runner registration/heartbeat sync them automatically — see syncRepositoryCheckouts).
@@ -1449,12 +1563,13 @@ app.delete('/api/projects/:pid/memory/repositories/:key', userAuth, async (c) =>
 // manual rebuild route below.
 app.get('/api/projects/:pid/memory/ops-status', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
-  const [health, registry, drift] = await Promise.all([
+  const [health, registry, drift, analytics] = await Promise.all([
     memoryDO(c.env, pid).health(pid),
     getMemoryRegistry(c.env, pid),
     memoryDO(c.env, pid).projectionDrift(pid),
+    getProjectAnalyticsHealth(c.env, pid),
   ]);
-  return c.json({ health, registry, drift, capabilities: memoryCapabilities(c.env) });
+  return c.json({ health, registry, drift, analytics, capabilities: memoryCapabilities(c.env) });
 });
 
 // PLNR-273: this project's backup generations (exportedAt slugs, newest first) — the picker for
@@ -1549,6 +1664,18 @@ app.post('/api/projects/:pid/memory/vectors/rebuild', userAuth, async (c) => {
   return c.json(await memoryDO(c.env, pid).rebuildVectorIndex(pid));
 });
 
+// PLNR-292: operator full rebuild of the disposable cross-source analytics generation. The old
+// complete generation remains active until the replacement validates and switches atomically.
+app.post('/api/projects/:pid/memory/analytics/rebuild', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  const pid = c.req.param('pid')!;
+  try {
+    return c.json(await rebuildProjectAnalytics(c.env, pid, { force: true }));
+  } catch (error) {
+    return c.json({ error: String(error) }, 409);
+  }
+});
+
 // The same idempotent per-project sweep the daily cron already runs (sweepProjectDebrisForProject,
 // extracted from sweepProjectDebris for exactly this on-demand use) — an operator-triggered
 // "clean up now" rather than a parallel cleanup mechanism.
@@ -1606,14 +1733,85 @@ app.post('/api/projects/:pid/memory/search', userAuth, async (c) => {
 // how a task's title/body/anticipatedFiles become ProjectMemory.similarEffort's input.
 app.post('/api/projects/:pid/memory/similar-effort', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
-  const body = await c.req.json<{ taskId?: string }>().catch(() => ({}) as { taskId?: string });
+  const body: {
+    taskId?: string; limit?: number; cursor?: string; repositoryKey?: string; branch?: string;
+    preferBranch?: string; baseId?: string; includeCrossBranch?: boolean; includeStaleEvidence?: boolean;
+  } = await c.req.json().catch(() => ({}));
   if (!body.taskId) return c.json({ error: 'taskId required' }, 400);
   const task = await c.env.DB.prepare('SELECT id, title, body, execution_spec AS executionSpec FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
     .bind(body.taskId, body.taskId, pid).first<{ id: string; title: string; body: string | null; executionSpec: string | null }>();
   if (!task) return c.json({ error: 'not found' }, 404);
-  const result = await loadPriorEffort(c.env, pid, task);
+  let result;
+  try {
+    result = await loadPriorEffort(c.env, pid, task, {
+      limit: body.limit, cursor: body.cursor, repositoryKey: body.repositoryKey,
+      branch: body.branch, preferBranch: body.preferBranch, baseId: body.baseId,
+      includeCrossBranch: body.includeCrossBranch, includeStaleEvidence: body.includeStaleEvidence,
+    });
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+  }
   if (!result) return c.json({ error: 'project memory unavailable' }, 502);
-  return c.json(result);
+  const cases = await room(c.env, pid).observeSimilarEffortCases(pid, {
+    task,
+    policy: {
+      repositoryKey: body.repositoryKey, branch: body.branch, preferBranch: body.preferBranch,
+      baseId: body.baseId, includeCrossBranch: body.includeCrossBranch,
+      includeStaleEvidence: body.includeStaleEvidence,
+    },
+    pageOffset: result.page.offset,
+    cases: result.cases,
+  });
+  return c.json({ ...result, cases });
+});
+
+// Retrieval relevance is its own append-only ledger. It never calls recordFeedback on a memory,
+// updates an episode, or changes ranking; a later judgment must explicitly supersede the prior.
+app.post('/api/projects/:pid/memory/similar-effort/feedback', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const body: {
+    operationKey?: string; occurrenceId?: string; judgment?: string; reasonCode?: string;
+    reason?: string; supersedesFeedbackId?: string;
+  } = await c.req.json().catch(() => ({}));
+  if (!body.operationKey || !body.occurrenceId || !body.judgment) {
+    return c.json({ error: 'operationKey, occurrenceId, and judgment are required' }, 400);
+  }
+  if (!SIMILARITY_JUDGMENTS.includes(body.judgment as SimilarityJudgment)) {
+    return c.json({ error: 'invalid judgment' }, 400);
+  }
+  if (body.reasonCode && !SIMILARITY_REASON_CODES.includes(body.reasonCode as SimilarityReasonCode)) {
+    return c.json({ error: 'invalid reasonCode' }, 400);
+  }
+  try {
+    return c.json(await room(c.env, pid).recordSimilarityFeedback(pid, humanActor(c), {
+      operationKey: body.operationKey, occurrenceId: body.occurrenceId,
+      judgment: body.judgment as SimilarityJudgment,
+      reasonCode: body.reasonCode as SimilarityReasonCode | undefined,
+      reason: body.reason, supersedesFeedbackId: body.supersedesFeedbackId,
+    }));
+  } catch (error) {
+    if (error instanceof SimilarityFeedbackError) return c.json({ error: error.message }, error.status);
+    throw error;
+  }
+});
+
+app.get('/api/projects/:pid/memory/similar-effort/calibration', userAuth, async (c) => {
+  const numberParam = (name: string): number | undefined => {
+    const raw = c.req.query(name);
+    if (raw == null) return undefined;
+    const value = Number(raw);
+    if (!Number.isFinite(value)) throw new SimilarityFeedbackError(`${name} must be a number`);
+    return value;
+  };
+  try {
+    return c.json(await getSimilarityCalibration(c.env, c.req.param('pid')!, {
+      topK: numberParam('topK'), limit: numberParam('limit'),
+      from: c.req.query('from'), to: c.req.query('to'),
+    }));
+  } catch (error) {
+    if (error instanceof SimilarityFeedbackError) return c.json({ error: error.message }, error.status);
+    throw error;
+  }
 });
 
 // Named graph-query primitives (PLNR-258) — the human-facing twin of explain_project_area;
@@ -1692,6 +1890,139 @@ app.post('/api/projects/:pid/memory/context', userAuth, async (c) => {
     role: body.role ?? 'human', tokenBudget: body.budgetTokens ?? null,
   });
   return c.json(pack);
+});
+
+// PLNR-295: read-only advisory evidence for humans preparing a dispatch. This route cannot write
+// a budget or affect claimability; it only compares the supplied proposal with cited prior cases.
+app.post('/api/projects/:pid/memory/pre-dispatch-risk', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const parsed = z.object({
+    taskId: z.string().min(1),
+    repositoryKey: z.string().min(1).nullable().optional(),
+    branch: z.string().min(1).nullable().optional(),
+    baseId: z.string().min(1).nullable().optional(),
+    budget: RunBudget.nullable().optional(),
+  }).strict().safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid pre-dispatch risk request', detail: parsed.error.issues }, 400);
+  const task = await c.env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+    .bind(parsed.data.taskId, parsed.data.taskId, pid).first<{ id: string }>();
+  if (!task) return c.json({ error: 'not found' }, 404);
+  return c.json(await assessPreDispatchRisk(c.env, pid, task.id, parsed.data));
+});
+
+const DispatchIntelligenceBody = z.object({
+  taskId: z.string().min(1),
+  runnerId: z.string().min(1).nullable().optional(),
+  repositoryCheckoutId: z.string().min(1).nullable().optional(),
+  branch: z.string().min(1).nullable().optional(),
+  baseId: z.string().min(1).nullable().optional(),
+  budget: RunBudget.nullable().optional(),
+  comparison: z.object({ dimension: z.enum(STRATEGY_DIMENSIONS), metric: z.enum(COMPARISON_METRICS) }).strict().optional(),
+}).strict();
+
+// PLNR-303: the task drawer and dispatch form consume this ONE advisory packet. It composes the
+// same context/risk/bottleneck/comparison authorities used by MCP and REST; preview is read-only
+// and cannot create a shadow snapshot or similarity-calibration occurrence.
+app.post('/api/projects/:pid/memory/dispatch-intelligence', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const parsed = DispatchIntelligenceBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid dispatch intelligence request', detail: parsed.error.issues }, 400);
+  const task = await c.env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+    .bind(parsed.data.taskId, parsed.data.taskId, pid).first<{ id: string }>();
+  if (!task) return c.json({ error: 'not found' }, 404);
+  try {
+    return c.json(await getDispatchIntelligence(c.env, pid, { ...parsed.data, taskId: task.id }));
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+  }
+});
+
+// Feedback is the only write on the preview surface. The server reruns the shared retrieval and
+// persists an occurrence only if the exact episode/run/sitting is still in that result; merely
+// opening or changing a preview therefore never creates a calibration/training row.
+app.post('/api/projects/:pid/memory/dispatch-intelligence/feedback', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const parsed = DispatchIntelligenceBody.extend({
+    episodeId: z.string().min(1), runId: z.string().min(1), sitting: z.number().int().positive(),
+    operationKey: z.string().min(1).max(200), judgment: z.enum(SIMILARITY_JUDGMENTS),
+    reasonCode: z.enum(SIMILARITY_REASON_CODES).nullable().optional(), reason: z.string().max(2_000).nullable().optional(),
+  }).omit({ budget: true, comparison: true }).safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid dispatch intelligence feedback', detail: parsed.error.issues }, 400);
+  const task = await c.env.DB.prepare(
+    'SELECT id, title, body, execution_spec AS executionSpec FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?',
+  ).bind(parsed.data.taskId, parsed.data.taskId, pid).first<{ id: string; title: string; body: string | null; executionSpec: string | null }>();
+  if (!task) return c.json({ error: 'not found' }, 404);
+  const repository = await resolveDispatchRepository(c.env, pid, parsed.data.runnerId, parsed.data.repositoryCheckoutId);
+  const prior = await loadPriorEffort(c.env, pid, task, {
+    limit: 20, repositoryKey: repository.repositoryKey ?? undefined,
+    preferBranch: parsed.data.branch ?? undefined, baseId: parsed.data.baseId ?? undefined,
+  });
+  if (!prior) return c.json({ error: 'project memory unavailable' }, 502);
+  const index = prior.cases.findIndex((item) => item.episodeId === parsed.data.episodeId
+    && item.runId === parsed.data.runId && item.sitting === parsed.data.sitting);
+  if (index < 0) return c.json({ error: 'the case is no longer present in the server-authored preview' }, 409);
+  const [surfaced] = await room(c.env, pid).observeSimilarEffortCases(pid, {
+    task,
+    policy: {
+      repositoryKey: repository.repositoryKey ?? undefined,
+      preferBranch: parsed.data.branch ?? undefined,
+      baseId: parsed.data.baseId ?? undefined,
+    },
+    pageOffset: index,
+    cases: [prior.cases[index]!],
+  });
+  try {
+    const result = await room(c.env, pid).recordSimilarityFeedback(pid, humanActor(c), {
+      operationKey: parsed.data.operationKey, occurrenceId: surfaced!.occurrence.id,
+      judgment: parsed.data.judgment, reasonCode: parsed.data.reasonCode,
+      reason: parsed.data.reason,
+    });
+    return c.json({ ...result, occurrenceId: surfaced!.occurrence.id });
+  } catch (error) {
+    if (error instanceof SimilarityFeedbackError) return c.json({ error: error.message }, error.status);
+    throw error;
+  }
+});
+
+// PLNR-301: historical correlation-aware comparison. Dimension is a closed pre-execution enum;
+// metric is a separate outcome enum, so an outcome cannot become a cohort key by construction.
+app.post('/api/projects/:pid/memory/strategy-comparison', userAuth, async (c) => {
+  const parsed = z.object({
+    dimension: z.enum(STRATEGY_DIMENSIONS), metric: z.enum(COMPARISON_METRICS),
+    from: z.string().datetime().optional(), to: z.string().datetime().optional(),
+    limit: z.number().int().positive().max(2_000).optional(),
+    policy: z.object({
+      minimumCases: z.number().int().min(2).optional(),
+      minimumIndependentClusters: z.number().int().min(2).optional(),
+      minimumMetricCompleteness: z.number().min(0).max(1).optional(),
+      bootstrapIterations: z.number().int().min(200).max(5_000).optional(),
+      confidence: z.number().min(0.8).max(0.99).optional(),
+    }).strict().optional(),
+  }).strict().safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid strategy comparison request', detail: parsed.error.issues }, 400);
+  return c.json(await queryStrategyComparison(c.env, c.req.param('pid')!, parsed.data));
+});
+
+// PLNR-296: read-only current collision/readiness/capacity evidence. Like the pre-dispatch report,
+// this route cannot claim, dispatch, lock, alter a gate, or change a Runner's capacity.
+app.post('/api/projects/:pid/memory/bottlenecks', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const parsed = z.object({
+    taskId: z.string().min(1).nullable().optional(),
+    repositoryKey: z.string().min(1).nullable().optional(),
+    branch: z.string().min(1).nullable().optional(),
+    baseId: z.string().min(1).nullable().optional(),
+    taskLimit: z.number().int().min(1).max(BOTTLENECK_TASK_LIMIT).optional(),
+  }).strict().safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid bottleneck request', detail: parsed.error.issues }, 400);
+  let taskId: string | null = null;
+  if (parsed.data.taskId) {
+    const task = await c.env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+      .bind(parsed.data.taskId, parsed.data.taskId, pid).first<{ id: string }>();
+    if (!task) return c.json({ error: 'not found' }, 404);
+    taskId = task.id;
+  }
+  return c.json(await assessProjectBottlenecks(c.env, pid, { ...parsed.data, taskId }));
 });
 
 // Production acceptance gate (PLNR-346). This is intentionally a viewer-safe read: it gathers
@@ -4724,6 +5055,7 @@ export default {
           sweepPendingErasures(env).then((r) => console.log(`[memory-lifecycle] erasure sweep: ${r.length} tombstone(s) processed`)),
           sweepProjectDebris(env).then((r) => console.log(`[memory-lifecycle] debris sweep: ${r.length} project(s) processed`)),
           sweepPendingEpisodeJobs(env).then((r) => console.log(`[memory-lifecycle] episode jobs: ${r.completed} completed, ${r.failed} failed`)),
+          sweepPendingAnalyticsJobs(env).then((r) => console.log(`[memory-lifecycle] analytics jobs: ${r.completed} completed, ${r.failed} failed`)),
         ]).catch((err) => console.warn(`[memory-lifecycle] sweep failed: ${String(err)}`)),
       );
       // Actor/session lifecycle shares the daily maintenance trigger but owns an independent,

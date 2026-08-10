@@ -18,10 +18,10 @@ const memory = (pid: string) => appEnv.PROJECT_MEMORY.get(appEnv.PROJECT_MEMORY.
 const SYSTEM = { kind: 'system', id: null };
 
 describe('ProjectMemory — schema migrator', () => {
-  it('initializes to schema version 1 with every table empty', async () => {
+  it('initializes to the current schema version with every canonical table empty', async () => {
     const pid = 'prj_pm_fresh';
     const h = await memory(pid).health(pid);
-    expect(h.schemaVersion).toBe(11);
+    expect(h.schemaVersion).toBe(14);
     expect(h.memoryRevision).toBe(0);
     expect(Object.values(h.tableCounts).every((n) => n === 0)).toBe(true);
     expect(h.tableCounts.nodes).toBe(0);
@@ -35,7 +35,7 @@ describe('ProjectMemory — schema migrator', () => {
     // A second stub handle for the SAME idFromName — whether the runtime reuses the live
     // instance or reconstructs it from storage, the migrator must not re-run destructively.
     const again = await memory(pid).health(pid);
-    expect(again.schemaVersion).toBe(11);
+    expect(again.schemaVersion).toBe(14);
     expect(again.tableCounts.nodes).toBe(1);
 
     const count = await memory(pid)._countNodes(pid);
@@ -46,7 +46,7 @@ describe('ProjectMemory — schema migrator', () => {
     const pid = 'prj_pm_no_optional_bindings';
     expect(appEnv.VECTORIZE).toBeUndefined();
     const h = await memory(pid).health(pid);
-    expect(h.schemaVersion).toBe(11);
+    expect(h.schemaVersion).toBe(14);
   });
 });
 

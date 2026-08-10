@@ -23,6 +23,7 @@ interface RoomRpc {
   dispatchRun(projectId: string, actor: Actor, runId: string, runnerId: string): Promise<RunView>;
   transitionRun(projectId: string, actor: Actor, runId: string, patch: RunPatch): Promise<RunView>;
   reopenRun(projectId: string, actor: Actor, runId: string, rounds: number | null): Promise<RunView>;
+  recordRunTelemetry(projectId: string, runId: string, telemetry: Record<string, unknown>): Promise<void>;
 }
 const room = (projectId: string) => appEnv.PROJECT_ROOM.get(appEnv.PROJECT_ROOM.idFromName(projectId)) as unknown as RoomRpc;
 
@@ -215,6 +216,72 @@ describe('ProjectMemory.recordEpisode — the deterministic writer (§14)', () =
 });
 
 describe('a terminal Run produces its deterministic episode (ProjectRoom → recordEpisodeForRun)', () => {
+  it('keeps immutable commissioning facts distinct from the executed spec and later task drift', async () => {
+    const projectId = await newProject('MEPIINT');
+    const commissionedSpec = {
+      requirementIds: ['BEFORE-DISPATCH'],
+      anticipatedFiles: [{ path: 'src/commissioned.ts', action: 'modify' }],
+    };
+    const executedSpec = {
+      requirementIds: ['EXECUTED'],
+      acceptance: { observableTruths: ['the Runner used this contract'] },
+    };
+    const made = await mcpCall(agent.apiKey, 'create_task', {
+      projectId, title: 'title at commissioning', type: 'research', tags: ['commissioned-tag'],
+      allowNewTags: true, executionSpec: commissionedSpec,
+    });
+    const taskId = made.body.id as string;
+    const runnerId = 'rnr_epi_int';
+    const agentId = 'agt_epi_int';
+    await seedRunner(runnerId);
+    await seedAgent(agentId, runnerId, projectId);
+
+    const run = await room(projectId).createRun(projectId, actor, {
+      kind: 'build', repoRef: 'r', agentTool: 'codex', model: 'gpt-5', effort: 'high', workflow: 'careful',
+      anchor: { type: 'task', id: taskId },
+    });
+    await room(projectId).dispatchRun(projectId, actor, run.id, runnerId);
+    await room(projectId).recordRunTelemetry(projectId, run.id, {
+      executedSpec,
+      executedConfiguration: {
+        strategy: {
+          tool: 'codex', vendor: 'openai', model: 'gpt-5-resolved', effort: 'high', workflow: 'careful',
+          reviewer: null, verifier: null, contextStrategy: null, concurrencyStrategy: null,
+        },
+        configuration: [{ kind: 'runner', name: runnerId, version: 'test', fingerprint: 'runner-test' }],
+      },
+    });
+
+    // These are intentionally mutable live facts. The terminal episode must not use them to
+    // reconstruct what was commissioned earlier.
+    await env.DB.prepare(
+      `UPDATE tasks SET title = 'title after drift', type = 'bug', execution_spec = NULL WHERE id = ?`,
+    ).bind(taskId).run();
+    await env.DB.prepare('DELETE FROM task_tags WHERE task_id = ?').bind(taskId).run();
+
+    await room(projectId).transitionRun(projectId, actor, run.id, { status: 'running', agentId });
+    await room(projectId).transitionRun(projectId, actor, run.id, { status: 'done' });
+    let episode: Record<string, unknown> | null = null;
+    for (let i = 0; i < 20 && !episode; i++) {
+      episode = await memory(projectId)._getEpisodeForTest(projectId, run.id);
+      if (!episode) await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const intelligence = episode?.intelligence as Record<string, any>;
+    expect(intelligence.identity).toMatchObject({
+      episodeId: episode?.id, projectId, runId: run.id, sitting: 1, taskId,
+      orchestrationId: expect.stringMatching(/^orc_/), executionId: expect.stringMatching(/^exe_/),
+    });
+    expect(intelligence.preExecution.task).toMatchObject({ taskType: 'research', tags: ['commissioned-tag'] });
+    expect(intelligence.preExecution.commissionedSpec.requirementIds).toEqual(['BEFORE-DISPATCH']);
+    expect(intelligence.execution.executedSpec.requirementIds).toEqual(['EXECUTED']);
+    expect(intelligence.execution.executedStrategy).toMatchObject({ vendor: 'openai', model: 'gpt-5-resolved' });
+    expect(intelligence.preExecution.commissionedStrategy).toMatchObject({
+      tool: 'codex', model: 'gpt-5', effort: 'high', workflow: 'careful',
+    });
+    expect(intelligence.execution.observedModelUsage).toMatchObject({ status: 'unavailable', value: null });
+    expect(intelligence.execution.changes.changedFiles).toMatchObject({ status: 'unavailable', value: null });
+  });
+
   it.each(['done', 'failed', 'cancelled'] as const)('a build run reaching %s produces exactly one episode, reachable from its task/run/agent nodes', async (outcome) => {
     const projectId = await newProject(`MEPIR${outcome[0]!.toUpperCase()}`);
     const made = await mcpCall(agent.apiKey, 'create_task', { projectId, title: `task settled by a ${outcome} run`, tags: ['episode-test'] });
@@ -322,6 +389,9 @@ describe('a terminal Run produces its deterministic episode (ProjectRoom → rec
       kind: 'build', repoRef: 'r', agentTool: 'claude', anchor: { type: 'task', id: taskId },
     });
     await room(projectId).dispatchRun(projectId, actor, run.id, runnerId);
+    await room(projectId).recordRunTelemetry(projectId, run.id, {
+      executedSpec: { requirementIds: ['SITTING-1'] },
+    });
     await room(projectId).transitionRun(projectId, actor, run.id, { status: 'running', agentId: agentSitting1 });
     const failed = await room(projectId).transitionRun(projectId, actor, run.id, { status: 'failed' });
     expect(failed.status).toBe('failed');
@@ -346,6 +416,9 @@ describe('a terminal Run produces its deterministic episode (ProjectRoom → rec
 
     // Continue the failed run — RUN-182's reopenRun, same run id, new sitting.
     await room(projectId).reopenRun(projectId, actor, run.id, null);
+    await room(projectId).recordRunTelemetry(projectId, run.id, {
+      executedSpec: { requirementIds: ['SITTING-2'] },
+    });
     await room(projectId).transitionRun(projectId, actor, run.id, { status: 'running', agentId: agentSitting2 });
     const done = await room(projectId).transitionRun(projectId, actor, run.id, { status: 'done' });
     expect(done.status).toBe('done');
@@ -363,6 +436,18 @@ describe('a terminal Run produces its deterministic episode (ProjectRoom → rec
     // 'pending' (not 'failed'): a done sitting with no merged PR is "awaiting review", the
     // ordinary state — see landingOutcomeFor's doc comment in memory/episodes.ts.
     expect(newHit.results[0]).toMatchObject({ id: episodeId2, status: 'pending' });
+
+    const sittingFacts = (await env.DB.prepare(
+      `SELECT sitting, executed_specs AS executedSpecs FROM run_sitting_intelligence
+        WHERE run_id = ? ORDER BY sitting`,
+    ).bind(run.id).all<{ sitting: number; executedSpecs: string }>()).results;
+    expect(sittingFacts.map((row) => ({
+      sitting: row.sitting,
+      requirementId: (JSON.parse(row.executedSpecs) as Array<{ requirementIds: string[] }>)[0]!.requirementIds[0],
+    }))).toEqual([
+      { sitting: 1, requirementId: 'SITTING-1' },
+      { sitting: 2, requirementId: 'SITTING-2' },
+    ]);
 
     // Both episodes are reachable from the ONE task they share — the acceptance line's "linked
     // to the earlier one" is this shared task neighborhood, not a direct episode-to-episode edge.
@@ -468,6 +553,10 @@ describe('episode upload ingest — completeEpisodeIngest merges partial enrichm
     expect((episode!.timeline as Array<{ label: string }>).map((entry) => entry.label)).toEqual([
       'queued', 'dispatched to runner', 'agent started', 'run done',
     ]);
+    expect(episode!.intelligence).toMatchObject({
+      identity: { episodeId: episode!.id, projectId, runId: run.id, sitting: 1, taskId },
+      preExecution: { task: { tags: ['episode-test'] } },
+    });
 
     // A later partial enrichment changes only what it names; schema defaults must not turn
     // omitted arrays into destructive explicit clears.
@@ -488,6 +577,7 @@ describe('episode upload ingest — completeEpisodeIngest merges partial enrichm
     await recordEpisodeForRun(appEnv, projectId, run.id);
     expect(await memory(projectId)._getEpisodeForTest(projectId, run.id)).toMatchObject({
       filesTouched: ['src/slow.ts'], commands: ['npm test'], findings: [{ summary: 'the follow-up review confirmed the query fix' }],
+      intelligence: { identity: { episodeId: episode!.id, runId: run.id, sitting: 1 } },
     });
   });
 

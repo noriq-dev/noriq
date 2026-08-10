@@ -481,6 +481,14 @@ export const api = {
    *  callers use a failed promise here to distinguish "the memory store is down" from "it answered
    *  with zero results." */
   memoryHealth: (pid: string) => req<ApiMemoryHealth>('GET', `/api/projects/${pid}/memory/health`),
+  projectIntelligence: (pid: string, input: ApiProjectIntelligenceInput) =>
+    req<ApiProjectIntelligence>('POST', `/api/projects/${pid}/memory/intelligence`, input),
+  dispatchIntelligence: (pid: string, input: ApiDispatchIntelligenceInput, signal?: AbortSignal) =>
+    req<ApiDispatchIntelligence>('POST', `/api/projects/${pid}/memory/dispatch-intelligence`, input, signal),
+  dispatchIntelligenceFeedback: (pid: string, input: ApiDispatchIntelligenceFeedbackInput) =>
+    req<{ feedbackId: string; operationKey: string; occurrenceId: string; deduped: boolean }>(
+      'POST', `/api/projects/${pid}/memory/dispatch-intelligence/feedback`, input,
+    ),
   memoryRepositories: (pid: string) => req<{ repositories: ApiMemoryRepository[] }>('GET', `/api/projects/${pid}/memory/repositories`),
   /** PLNR-311: registers a canonical repository — the ONE write in this file open to any project
    *  member, not gated to admin (unlike every action below): registration is a human declaring
@@ -1430,6 +1438,133 @@ export interface ApiMemoryHistory {
   }>;
   contradictions: Array<{ setId: string; memoryItemIds: string[]; resolvedAt: string | null }>;
   feedback: Array<{ id: string; actorId: string; vote: string; kind: ApiMemoryFeedbackKind | null; reason: string | null; createdAt: string }>;
+}
+
+// --- Project Intelligence (PLNR-302). These are server-authored evidence packets: live state
+// and frozen history have separate clocks, and comparisons can expose rows only after the server
+// has cleared its evidence gates. The client intentionally has no raw episode outcome payload
+// from which it could manufacture a comparison.
+export type ApiIntelligenceDimension =
+  | 'project' | 'plan' | 'plan_dispatch' | 'orchestration' | 'task' | 'run' | 'sitting'
+  | 'commissioned_workflow' | 'executed_workflow' | 'configuration' | 'stage' | 'role';
+export type ApiStrategyDimension = 'model_vendor_effort' | 'workflow' | 'reviewer_verifier' | 'context' | 'concurrency' | 'configuration';
+export type ApiComparisonMetric = 'run_success' | 'landing' | 'elapsed_ms' | 'files_changed' | 'churn' | 'review_rounds' | 'later_quality_event';
+export interface ApiProjectIntelligenceInput {
+  from: string;
+  to: string;
+  groupBy?: ApiIntelligenceDimension;
+  caseCursor?: string;
+  caseLimit?: number;
+  comparison?: { dimension: ApiStrategyDimension; metric: ApiComparisonMetric };
+}
+export interface ApiDispatchIntelligenceInput {
+  taskId: string; runnerId?: string | null; repositoryCheckoutId?: string | null;
+  branch?: string | null; baseId?: string | null; budget?: Partial<ApiRunBudget> | null;
+  comparison?: { dimension: ApiStrategyDimension; metric: ApiComparisonMetric };
+}
+export interface ApiDispatchIntelligenceFeedbackInput extends Omit<ApiDispatchIntelligenceInput, 'budget' | 'comparison'> {
+  episodeId: string; runId: string; sitting: number; operationKey: string;
+  judgment: 'relevant' | 'partially_relevant' | 'not_similar';
+  reasonCode?: 'wrong_subsystem' | 'superficial_wording' | 'different_task_shape' | 'outdated_implementation' | 'branch_revision_mismatch' | 'duplicate_case' | 'other' | null;
+  reason?: string | null;
+}
+export interface ApiDispatchMemoryExcerpt {
+  id: string; memoryKind: string; statement: string; statementTruncated?: boolean; authority: number;
+  confidence: number | null; validity: string; isLead: boolean; leadReasons: string[];
+  evidence: Array<{ repositoryKey: string; branch: string; baseId: string; path: string; symbol: string | null; verificationState: string; verifiedForCaller: boolean }>;
+}
+export interface ApiDispatchPriorCase {
+  episodeId: string; taskId: string | null; taskKey: string | null; runId: string; sitting: number;
+  executionId: string | null; orchestrationId: string | null; repositoryKey: string | null; branch: string | null; baseId: string | null;
+  capturedAt: string | null; validity: 'historical_episode';
+  applicability: { validity: 'historical_episode'; branch: string; baseId: string };
+  lineage: { status: 'complete' | 'partial' | 'unknown'; missing: string[]; reason: string | null };
+  retrieval: { version: string; stage: string; score: number; support: Array<{ kind: string; detail: string }> };
+  outcome: { run: string; landing: string };
+  observed: Record<'filesTouched' | 'tokens' | 'costUSD' | 'elapsedMs' | 'reviewRounds' | 'verificationOrRepair', { value: number | boolean | null; completeness: string }>;
+  whatWasAttempted: string; whatFailed: string[]; whatRemainsUncertain: string[];
+}
+export interface ApiDispatchIntelligence {
+  advisory: true; version: string; observedAt: string;
+  targetContext: { taskId: string; runnerId: string | null; repositoryCheckoutId: string | null; repositoryKey: string | null; repositoryResolutionReason: string | null; branch: string | null; baseId: string | null };
+  current: {
+    kind: 'current_project_state'; readiness: null | { taskId: string; taskKey: string; primary: string; reason: string; claimability: { claimable: boolean; reason?: string }; anticipatedFiles: string[]; currentRunIds: string[]; currentExecutionIds: string[]; lockCollisionIds: string[] };
+    capacity: { status: string; availableSlots: number | null; activeCapableRunners: number; liveRunsCounted: number; note: string };
+    collisions: { locking: { status: 'unanswerable' | 'observed'; enabled: boolean; current: Array<{ lockId: string; requestedPath: string; lockedPath: string; holderName: string | null; taskKey: string | null }> }; anticipatedPaths: { status: string; overlaps: Array<{ taskKey: string; focusPath: string; otherPath: string; branchOverlap: boolean | null; currentClaimOrExecution: boolean }> }; graphImpact: { status: string; coverageReasons: string[]; overlaps: Array<{ taskKey: string; sharedEntities: Array<{ uri: string; label: string }> }> } };
+    planGates: { dispatches: unknown[]; phaseGates: unknown[]; owedLandings: unknown[] };
+    humanBlocks: Array<{ signalId: string; title: string }>;
+    coverage: { status: string; reasons: string[] };
+  };
+  constraints: { kind: string; decisions: ApiDispatchMemoryExcerpt[]; hazards: ApiDispatchMemoryExcerpt[]; unknowns: ApiDispatchMemoryExcerpt[] };
+  quotedEvidence: { kind: string; failedApproaches: ApiDispatchMemoryExcerpt[]; relevant: ApiDispatchMemoryExcerpt[]; evidenceFrame: { text: string; itemsIncluded: number; itemsOmitted: number; truncated: boolean } };
+  historical: { kind: 'historical_case_observation'; retrievalMode: string; branchPolicy: string; supportRule: string; caseLimit: number; consideredCount: number; coverage: { complete: boolean; candidatesConsidered: number; eligibleCases: number; reasons: string[] }; cases: ApiDispatchPriorCase[] };
+  observations: { kind: 'statistical_observation'; scope: { status: string; anticipatedFiles: string[]; observation: string }; budget: Record<'maxTokens' | 'maxUsd' | 'maxDurationSeconds' | 'maxRounds', { proposed: number | null; observedCount: number; unavailableCount: number; min: number | null; median: number | null; max: number | null; belowObservedCases: number; completeness: string; observation: string }>; coverage: { status: string; reasons: string[] }; versions: { risk: string; retrieval: string } };
+  comparison: ApiProjectIntelligence['comparison'];
+  feedback: { endpoint: string; requiresExplicitHumanAction: true; previewCreatesOccurrence: false };
+}
+export interface ApiMetricSummary {
+  observedCount: number; partialCount: number; unavailableCount: number; denominator: number;
+  min: number | null; p25: number | null; median: number | null; p75: number | null;
+  iqr: number | null; p90: number | null; max: number | null; total: number | null;
+}
+export interface ApiIntelligenceCase {
+  episodeId: string; runId: string; sitting: number; taskId: string | null; planId: string | null;
+  planDispatchId: string | null; orchestrationId: string | null; executionId: string | null;
+}
+export interface ApiAnalyticsGroup {
+  dimension: ApiIntelligenceDimension | 'all'; value: string;
+  provenance: { source: 'derived_generation'; generationId: string; generationCompletedAt: string };
+  sample: { sittings: number; runs: number };
+  throughput: { sittings: number; runs: number; firstObservedAt: string | null; lastObservedAt: string | null };
+  metrics: Record<string, ApiMetricSummary>;
+  outcomes: {
+    done: { numerator: number; denominator: number; rate: number | null };
+    failed: { numerator: number; denominator: number; rate: number | null };
+    cancelled: { numerator: number; denominator: number; rate: number | null };
+    landed: { numerator: number; denominator: number; rate: number | null };
+    laterInstability: { status: 'unavailable' | 'partial' | 'complete'; count: number | null; eventCount: number; denominator: number; rate: number | null; horizonDays: number; observedThrough: string; eventTypeCounts: Record<string, number>; reason: string | null };
+  };
+  composition: {
+    stages: ApiCompositionEntry[]; roles: ApiCompositionEntry[];
+    reviewRepairTokenShare: { value: number | null; denominator: number; share: number | null; completeness: string };
+  };
+  completeness: { lineageComplete: number; lineagePartial: number; lineageUnknown: number; metricDenominators: Record<string, number> };
+  supportingCaseCount: number; supportingCases: ApiIntelligenceCase[];
+}
+export interface ApiCompositionEntry {
+  value: string; sittingCount: number;
+  tokens: { value: number | null; denominator: number; share: number | null; completeness: string };
+  costUSD: { value: number | null; denominator: number; share: number | null; completeness: string };
+}
+export interface ApiProjectIntelligence {
+  live: {
+    observedAt: string; source: 'd1_current_state';
+    readiness: { totalTasks: number; readyTasks: number; blockedTasks: number; inProgressTasks: number; reviewTasks: number };
+    plans: { statuses: Record<string, number>; dispatchStatuses: Record<string, number>; phaseGateStatuses: Record<string, number>; phasesWithoutGate: number; landings: { recorded: number; owed: number; succeeded: number; failed: number } };
+    execution: { runStatuses: Record<string, number>; orchestrationStatuses: Record<string, number>; nodeStatuses: Record<string, number>; activeNodes: number; parkedNodes: number };
+    coordination: { activeClaims: number; activeLocks: number };
+    runners: { statuses: Record<string, number>; presenceStates: Record<string, number>; capacity: { reportedRunners: number; maxConcurrency: number | null; freeSlots: number | null; busySlots: number | null; completeness: 'complete' | 'partial' | 'unavailable' } };
+  };
+  analytics: {
+    health: { state: 'not_started' | 'stale' | 'building' | 'complete' | 'failed'; staleSources: string[]; active: { id: string; completedAt: string | null } | null; latestFailure: { error: string | null } | null };
+    freshness: { state: 'current' | 'lagging' | 'unavailable'; liveObservedAt: string; generationCompletedAt: string | null; gapMs: number | null; label: string };
+    historical: { state: 'unavailable'; reason: string; result: null } | { state: 'available'; result: {
+      observedAt: string; generation: { id: string; completedAt: string; completeness: unknown };
+      filter: { from: string; to: string; groupBy: ApiIntelligenceDimension | null; filters: Array<{ dimension: ApiIntelligenceDimension; value: string }> };
+      coverage: { complete: boolean; scannedRows: number; matchedSittings: number; reasons: string[]; qualityEventsScanned: number; unassociatedQualityEvents: number };
+      groups: ApiAnalyticsGroup[];
+      cases: { items: ApiIntelligenceCase[]; nextCursor: string | null; total: number };
+    } };
+  };
+  comparison: null | {
+    dimension: ApiStrategyDimension; metric: ApiComparisonMetric;
+    state: 'insufficient_evidence' | 'cannot_yet_distinguish' | 'directional_signal' | 'distinguishable';
+    interpretation: string;
+    rows: Array<{ strategy: string; observations: number; independentClusters: number; metricCompleteness: { eligible: number; total: number; rate: number }; distribution: { median: number; q1: number; q3: number; iqr: number; min: number; max: number }; interval: { low: number; high: number; confidence: number; method: string }; supportingCaseIds: string[] }>;
+    eligibility: { totalCases: number; eligibleCases: number; independentClusters: number; reasons: string[]; policy: Record<string, number> };
+    caseAudit: { eligible: Array<{ caseId: string; episodeId: string; strategy: string; clusterId: string }>; excluded: Array<{ caseId: string; episodeId: string; reasons: string[] }> };
+  };
+  bounds: { from: string; to: string; caseLimit: number; groupBy: ApiIntelligenceDimension | null };
 }
 
 // --- Ego-network graph + change-impact views (PLNR-272) — mirrors

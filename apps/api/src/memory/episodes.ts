@@ -21,7 +21,15 @@
 // the failed sitting's episode, destroying evidence §14 says must remain retrievable. `sitting`
 // is read straight off the `runs` row below, exactly like every other identity field here.
 import type { Env } from '../env';
-import { EpisodeLandingOutcome, RunModelUsage } from '@noriq-dev/shared';
+import {
+  EpisodeLandingOutcome, ExecutionSpec, LineageCompleteness, RunModelUsage, StrategyCoordinate,
+  type IntelligenceDurationMs, type IntelligenceIntegerMetric, type IntelligenceRatioMetric,
+} from '@noriq-dev/shared';
+import {
+  INTELLIGENCE_EXTRACTION_VERSION, loadRunSittingEvidence, type EpisodeIntelligenceDraft,
+} from '../lib/run-sitting-intelligence';
+import { requestProjectAnalyticsRebuild } from './analytics';
+import { attachShadowOutcomeRef } from './shadow-dispatch';
 
 /** The subset of a `runs` row the skeleton needs — D1 column names, matching the shape
  *  `env.DB.prepare(...).first()` hands back. */
@@ -100,6 +108,36 @@ export interface EpisodeSkeleton {
   steeringEvents: string[];
   landingOutcome: EpisodeLandingOutcome;
   remainingWork: string[];
+  /** Present only for runs captured at the PLNR-291 dispatch boundary. Legacy episodes remain
+   * valid without it; ProjectMemory supplies the stable episode id at its write seam. */
+  intelligence?: EpisodeIntelligenceDraft;
+}
+
+const unavailable = (reason: string) => ({
+  status: 'unavailable' as const, value: null, provenance: 'unavailable' as const,
+  source: 'project_memory_episode' as const, sourceId: null, observedAt: null, acceptedAt: null, reason,
+});
+const notApplicable = (reason: string) => ({
+  status: 'not_applicable' as const, value: null, provenance: 'server_observed' as const,
+  source: 'd1_coordination' as const, sourceId: null, observedAt: null, acceptedAt: null, reason,
+});
+const serverMetric = <T>(value: T, sourceId: string, observedAt: string | null) => ({
+  status: 'complete' as const, value, provenance: 'server_observed' as const,
+  source: 'd1_coordination' as const, sourceId, observedAt, acceptedAt: observedAt, reason: null,
+});
+const runnerMetric = <T>(value: T, sourceId: string, observedAt: string | null) => ({
+  status: 'complete' as const, value, provenance: 'runner_observed' as const,
+  source: 'runner' as const, sourceId, observedAt, acceptedAt: null, reason: null,
+});
+
+function durationBetween(
+  from: string | null,
+  to: string | null,
+  runId: string,
+  reason: string,
+): IntelligenceDurationMs {
+  if (!from || !to) return unavailable(reason) as IntelligenceDurationMs;
+  return serverMetric(Math.max(0, Date.parse(to) - Date.parse(from)), runId, to) as IntelligenceDurationMs;
 }
 
 /** Parse `runs.exit`'s JSON — thrown by nothing: a run reaching this function is past a terminal
@@ -216,7 +254,7 @@ export async function loadEpisodeSkeleton(env: Env, projectId: string, runId: st
   if (!run.exit) throw new EpisodeSkeletonUnavailableError(`run ${runId} has no terminal exit yet`);
 
   const taskId = run.anchor_type === 'task' ? run.anchor_id : null;
-  const [taskRow, taskRefsResult, steersResult, reviewRoundsRow, repoRow] = await Promise.all([
+  const [taskRow, taskRefsResult, steersResult, reviewRoundsRow, repoRow, sittingEvidence, executionRow, eventRow] = await Promise.all([
     taskId ? env.DB.prepare('SELECT title FROM tasks WHERE id = ?').bind(taskId).first<{ title: string }>() : Promise.resolve(null),
     taskId
       ? env.DB.prepare('SELECT kind, ref, state FROM task_refs WHERE task_id = ? ORDER BY created_at ASC').bind(taskId).all<TaskRefRowForEpisode>()
@@ -231,16 +269,109 @@ export async function loadEpisodeSkeleton(env: Env, projectId: string, runId: st
             WHERE rc.runner_id = ? AND rc.checkout_id = ?`,
         ).bind(run.runner_id, run.repo_ref).first<{ repositoryKey: string }>()
       : Promise.resolve(null),
+    loadRunSittingEvidence(env.DB, runId, run.sitting),
+    env.DB.prepare(
+      `SELECT id AS executionId, orchestration_id AS orchestrationId,
+              completeness_status AS status, completeness_missing AS missing,
+              completeness_reason AS reason, updated_at AS updatedAt
+         FROM execution_nodes WHERE run_id = ? AND sitting = ? AND kind = 'sitting' LIMIT 1`,
+    ).bind(runId, run.sitting).first<{
+      executionId: string; orchestrationId: string; status: string; missing: string; reason: string | null; updatedAt: string;
+    }>(),
+    env.DB.prepare('SELECT MAX(seq) AS seq FROM events WHERE project_id = ?').bind(projectId).first<{ seq: number | null }>(),
   ]);
-
-  return buildEpisodeSkeleton({
+  const skeleton = buildEpisodeSkeleton({
     run,
-    taskTitle: taskRow?.title ?? null,
-    repositoryKey: repoRow?.repositoryKey ?? null,
+    // PLNR-291: a captured title wins. The live task row is a legacy-only label fallback and is
+    // never used as the analytics commissioning fact.
+    taskTitle: sittingEvidence?.commissioning.taskTitle ?? taskRow?.title ?? null,
+    repositoryKey: sittingEvidence?.commissioning.repositoryKey ?? repoRow?.repositoryKey ?? null,
     taskRefs: taskRefsResult.results,
     steers: steersResult.results,
     reviewRounds: reviewRoundsRow?.maxRound ?? 0,
   });
+  if (!sittingEvidence) return skeleton;
+
+  const snapshot = sittingEvidence.commissioning;
+  const { outcome, finishedAt } = parseExit(run.exit);
+  const lineageParsed = LineageCompleteness.safeParse(executionRow ? {
+    status: executionRow.status,
+    missing: (() => { try { return JSON.parse(executionRow.missing || '[]'); } catch { return ['legacy']; } })(),
+    reason: executionRow.reason,
+  } : { status: 'unknown', missing: ['root', 'parent', 'events', 'legacy'], reason: 'no sitting execution node' });
+  const lineage = lineageParsed.success
+    ? lineageParsed.data
+    : LineageCompleteness.parse({ status: 'unknown', missing: ['legacy'], reason: 'invalid stored lineage' });
+  const executedSpecCandidate = sittingEvidence.executedSpecs.at(-1);
+  const executedSpec = executedSpecCandidate == null ? null : ExecutionSpec.safeParse(executedSpecCandidate);
+  const executedStrategy = sittingEvidence.executedConfig?.strategy
+    ? StrategyCoordinate.safeParse(sittingEvidence.executedConfig.strategy)
+    : null;
+  const observedAt = sittingEvidence.runnerObservedAt;
+  const strategy = {
+    tool: snapshot.commissioned.tool, vendor: null, model: snapshot.commissioned.model,
+    effort: snapshot.commissioned.effort, workflow: snapshot.commissioned.workflow,
+    reviewer: null, verifier: null, contextStrategy: null, concurrencyStrategy: null,
+  };
+  let modelUsage: ReturnType<typeof RunModelUsage.safeParse> | null = null;
+  if (run.model_usage) {
+    try { modelUsage = RunModelUsage.safeParse(JSON.parse(run.model_usage)); } catch { /* unavailable below */ }
+  }
+  skeleton.intelligence = {
+    schemaVersion: 1,
+    identity: {
+      projectId, runId, sitting: run.sitting, taskId: snapshot.taskId, planId: snapshot.planId,
+      planDispatchId: snapshot.planDispatchId, orchestrationId: executionRow?.orchestrationId ?? null,
+      executionId: executionRow?.executionId ?? null, repositoryKey: snapshot.repositoryKey,
+      branch: snapshot.branch, baseId: snapshot.baseId, lineage,
+    },
+    sources: {
+      memoryRevision: null, coordinationEventSequence: eventRow?.seq ?? null,
+      orchestrationAcceptedAt: executionRow?.updatedAt ?? null, capturedAt: snapshot.capturedAt,
+    },
+    versions: { extraction: INTELLIGENCE_EXTRACTION_VERSION, retrieval: null, risk: null, comparison: null },
+    preExecution: {
+      task: {
+        taskType: snapshot.taskType, tags: snapshot.tags,
+        executionSpecFingerprint: snapshot.executionSpecFingerprint, capturedAt: snapshot.capturedAt,
+      },
+      requestedStrategy: strategy, commissionedStrategy: strategy,
+      commissionedSpec: snapshot.executionSpec, budget: snapshot.budget, configuration: snapshot.configuration,
+    },
+    execution: {
+      executedStrategy: executedStrategy?.success ? executedStrategy.data : null,
+      executedSpec: executedSpec?.success ? executedSpec.data : null,
+      observedModelUsage: modelUsage?.success
+        ? runnerMetric(modelUsage.data, runId, observedAt)
+        : unavailable('Runner did not report valid per-model usage'),
+      clocks: {
+        queueDurationMs: durationBetween(run.created_at, run.dispatched_at, runId, 'dispatch time unavailable'),
+        dispatchToStartMs: durationBetween(run.dispatched_at, run.started_at, runId, 'start time unavailable'),
+        elapsedExecutionMs: durationBetween(run.started_at, finishedAt, runId, 'execution boundary unavailable'),
+        humanBlockedMs: unavailable('blocked intervals are not yet instrumented'),
+        verifyDurationMs: run.kind === 'verify'
+          ? durationBetween(run.started_at, finishedAt, runId, 'verify boundary unavailable')
+          : notApplicable('not a verify run'),
+      },
+      stages: [],
+      changes: {
+        backend: null,
+        changedFiles: unavailable('VCS backend evidence not reported'),
+        additions: unavailable('VCS backend evidence not reported'),
+        deletions: unavailable('VCS backend evidence not reported'),
+        churn: unavailable('VCS backend evidence not reported'),
+      },
+    },
+    outcome: {
+      runOutcome: outcome,
+      landingOutcome: skeleton.landingOutcome,
+      reviewRounds: serverMetric(skeleton.reviewRounds, runId, finishedAt) as IntelligenceIntegerMetric,
+      acceptanceCoverage: skeleton.acceptanceCoverage == null
+        ? unavailable('acceptance evidence not reported') as IntelligenceRatioMetric
+        : serverMetric(skeleton.acceptanceCoverage, runId, finishedAt) as IntelligenceRatioMetric,
+    },
+  };
+  return skeleton;
 }
 
 /**
@@ -251,11 +382,16 @@ export async function loadEpisodeSkeleton(env: Env, projectId: string, runId: st
 export async function recordEpisodeForRun(env: Env, projectId: string, runId: string): Promise<void> {
   const skeleton = await loadEpisodeSkeleton(env, projectId, runId);
 
-  await env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)).recordEpisode(projectId, {
+  const recorded = await env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)).recordEpisode(projectId, {
     ...skeleton,
     actor: { kind: 'system', id: null },
     writeMode: 'skeleton',
   });
+  await attachShadowOutcomeRef(
+    env.DB, projectId, runId, skeleton.sitting, 'episode', recorded.episodeId,
+    skeleton.finishedAt ?? new Date().toISOString(),
+  );
+  await requestProjectAnalyticsRebuild(env, projectId);
 }
 
 /**

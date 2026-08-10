@@ -383,7 +383,12 @@ export async function assembleContextPack(
       baseId: input.baseId ?? undefined,
       limit: RETRIEVAL_DEFAULTS.maxResultsCeiling,
     }),
-    stub.similarEffort(projectId, { taskId: row.id, title: row.title, body: row.body, anticipatedFiles, limit: RETRIEVAL_DEFAULTS.maxResults }),
+    stub.similarEffort(projectId, {
+      taskId: row.id, title: row.title, body: row.body, anticipatedFiles,
+      repositoryKey: input.repositoryKey ?? undefined,
+      preferBranch: input.branch ?? undefined,
+      limit: RETRIEVAL_DEFAULTS.maxResults,
+    }),
     stub.dependencyNeighborhood(projectId, { entityUri: taskUri, maxDepth: RETRIEVAL_DEFAULTS.maxDepth, maxResults: RETRIEVAL_DEFAULTS.maxGraphResults }),
     fileUris.length
       ? stub.changeImpact(projectId, { entityUris: fileUris, maxDepth: RETRIEVAL_DEFAULTS.maxDepth, maxResults: RETRIEVAL_DEFAULTS.maxGraphResults })
