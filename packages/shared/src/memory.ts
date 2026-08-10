@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { RepoPath, ExecutionSpec } from './execution-spec';
+import { ProjectIntelligenceEpisode } from './intelligence';
 import { RunModelUsage } from './runner';
 
 // ---------------------------------------------------------------------------
@@ -332,6 +333,10 @@ export const EffortEpisode = z.object({
   steeringEvents: z.array(z.string()).default([]),
   landingOutcome: EpisodeLandingOutcome.default('pending'),
   remainingWork: z.array(z.string()).default([]),
+  // PLNR-290: additive analytics-grade facts. Absence is permanent backwards compatibility,
+  // not a legacy error — old Runners/episodes remain valid and later extraction reports the
+  // corresponding metrics as unavailable.
+  intelligence: ProjectIntelligenceEpisode.nullable().optional(),
   // Absent OR malformed both leave the episode valid (§14) — `.catch(null)` swallows a bad
   // self-summary rather than failing the whole record's parse.
   selfSummary: EpisodeSelfSummary.nullable().default(null).catch(null),
