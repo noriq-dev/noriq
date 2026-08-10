@@ -610,6 +610,14 @@ function NeighborhoodCanvas({
 
   const posOf = (uri: string) => (dragPos?.uri === uri ? { x: dragPos.x, y: dragPos.y } : layout.positions.get(uri));
 
+  const selectedNodeId = graph.nodes.find((node) => node.uri === selectedUri)?.nodeId ?? null;
+  const orderedEdges = selectedNodeId === null
+    ? graph.edges
+    : [
+        ...graph.edges.filter((edge) => edge.fromNodeId !== selectedNodeId && edge.toNodeId !== selectedNodeId),
+        ...graph.edges.filter((edge) => edge.fromNodeId === selectedNodeId || edge.toNodeId === selectedNodeId),
+      ];
+
   // Ring headers (one per side/depth) double as the collapse toggle — a real, persisted
   // "collapsed branches" affordance (locked decision), not a stub.
   const ringKeys = useMemo(() => {
@@ -654,8 +662,17 @@ function NeighborhoodCanvas({
             <marker id="mg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
               <path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)" />
             </marker>
+            <marker id="mg-arrow-subdued" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="var(--text-dim)" opacity={0.28} />
+            </marker>
+            <marker id="mg-arrow-selected" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="var(--text)" />
+            </marker>
+            <marker id="mg-arrow-historical-selected" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="var(--amber)" />
+            </marker>
           </defs>
-          {graph.edges.map((e) => {
+          {orderedEdges.map((e) => {
             const fromNode = graph.nodes.find((n) => n.nodeId === e.fromNodeId);
             const toNode = graph.nodes.find((n) => n.nodeId === e.toNodeId);
             if (!fromNode || !toNode) return null;
@@ -663,20 +680,36 @@ function NeighborhoodCanvas({
             const b = posOf(toNode.uri);
             if (!a || !b) return null;
             const historical = HISTORICAL_EDGE_TYPES.has(e.edgeType);
+            const incident = selectedNodeId !== null && (e.fromNodeId === selectedNodeId || e.toNodeId === selectedNodeId);
+            const edgeState = selectedNodeId === null ? 'default' : incident ? 'incident' : 'subdued';
             const mx = (a.x + b.x) / 2;
             const my = (a.y + b.y) / 2;
             return (
-              <g key={e.key}>
+              <g key={e.key} data-edge-key={e.key} data-edge-state={edgeState} data-edge-historical={historical}>
                 <line
+                  data-edge-part="line"
                   x1={a.x} y1={a.y} x2={b.x} y2={b.y}
                   stroke={historical ? 'var(--amber)' : 'var(--text-dim)'}
-                  strokeWidth={1.4}
+                  strokeWidth={edgeState === 'incident' ? 2.8 : edgeState === 'subdued' ? 1.1 : 1.4}
                   strokeDasharray={historical ? '3 3' : undefined}
-                  opacity={0.65}
-                  markerEnd="url(#mg-arrow)"
+                  opacity={edgeState === 'incident' ? 1 : edgeState === 'subdued' ? 0.28 : 0.65}
+                  markerEnd={edgeState === 'incident'
+                    ? `url(#${historical ? 'mg-arrow-historical-selected' : 'mg-arrow-selected'})`
+                    : `url(#${edgeState === 'subdued' ? 'mg-arrow-subdued' : 'mg-arrow'})`}
                 />
-                <rect x={mx - e.edgeType.length * 3 - 3} y={my - 7} width={e.edgeType.length * 6 + 6} height={12} rx={4} fill="var(--bg-raised)" opacity={0.9} />
-                <text x={mx} y={my + 3} textAnchor="middle" fontFamily="var(--mono)" fontSize={8.5} fill={historical ? 'var(--amber)' : 'var(--text-dim)'}>
+                <rect
+                  data-edge-part="label-background"
+                  x={mx - e.edgeType.length * 3 - 3} y={my - 7} width={e.edgeType.length * 6 + 6} height={12} rx={4}
+                  fill="var(--bg-raised)" opacity={edgeState === 'incident' ? 0.96 : edgeState === 'subdued' ? 0.32 : 0.9}
+                />
+                <text
+                  data-edge-part="label"
+                  x={mx} y={my + 3} textAnchor="middle" fontFamily="var(--mono)"
+                  fontSize={edgeState === 'incident' ? 9.5 : 8.5}
+                  fontWeight={edgeState === 'incident' ? 700 : undefined}
+                  opacity={edgeState === 'subdued' ? 0.38 : 1}
+                  fill={historical ? 'var(--amber)' : 'var(--text-dim)'}
+                >
                   {e.edgeType}
                 </text>
               </g>
@@ -691,6 +724,7 @@ function NeighborhoodCanvas({
             return (
               <g
                 key={n.uri}
+                data-node-uri={n.uri}
                 transform={`translate(${p.x},${p.y})`}
                 onMouseDown={(e) => startDrag(e, n.uri, p)}
                 onClick={(e) => { e.stopPropagation(); onSelect(n.uri); }}

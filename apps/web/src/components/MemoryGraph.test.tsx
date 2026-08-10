@@ -142,6 +142,91 @@ describe('relationship filtering (PLNR-384)', () => {
   });
 });
 
+describe('selected-node incident edge emphasis (PLNR-387)', () => {
+  const uri = (id: string) => `noriq://task/${id}`;
+  const graphResult: ApiDependencyNeighborhood = {
+    seed: { nodeId: 'n1', uri: uri('n1'), type: 'task', label: 'Seed' },
+    downstream: [
+      {
+        nodeId: 'n2', uri: uri('n2'), type: 'task', label: 'Selected first', depth: 1,
+        edgePath: [{ fromNodeId: 'n1', edgeType: 'depends_on', toNodeId: 'n2' }],
+      },
+      {
+        nodeId: 'n3', uri: uri('n3'), type: 'task', label: 'Selected second', depth: 1,
+        edgePath: [{ fromNodeId: 'n3', edgeType: 'implements', toNodeId: 'n1' }],
+      },
+      {
+        nodeId: 'n4', uri: uri('n4'), type: 'task', label: 'Historical target', depth: 2,
+        edgePath: [
+          { fromNodeId: 'n1', edgeType: 'depends_on', toNodeId: 'n2' },
+          { fromNodeId: 'n2', edgeType: 'supersedes', toNodeId: 'n4' },
+        ],
+      },
+    ],
+    upstream: [],
+    coverage: { complete: true, reasons: [] },
+  };
+
+  const edgeGroups = () => [...container.querySelectorAll<SVGGElement>('g[data-edge-key]')];
+  const edge = (key: string) => edgeGroups().find((group) => group.dataset.edgeKey === key)!;
+  const node = (nodeUri: string) => [...container.querySelectorAll<SVGGElement>('g[data-node-uri]')]
+    .find((group) => group.dataset.nodeUri === nodeUri)!;
+
+  it('promotes inbound and outbound edges, draws them last, and clears or recomputes without refetching', async () => {
+    const dep = vi.spyOn(api, 'memoryDependencyNeighborhood').mockResolvedValue(graphResult);
+    mount(fakeStore(), uri('n1'));
+    await tick(250);
+
+    // With no selection, the original presentation remains exact.
+    expect(edgeGroups().map((group) => group.dataset.edgeState)).toEqual(['default', 'default', 'default']);
+    for (const group of edgeGroups()) {
+      const line = group.querySelector('[data-edge-part="line"]')!;
+      expect(line.getAttribute('stroke-width')).toBe('1.4');
+      expect(line.getAttribute('opacity')).toBe('0.65');
+      expect(line.getAttribute('marker-end')).toBe('url(#mg-arrow)');
+    }
+
+    act(() => node(uri('n2')).dispatchEvent(new MouseEvent('click', { bubbles: true })));
+
+    const inbound = edge('depends_on:n1:n2');
+    const outboundHistorical = edge('supersedes:n2:n4');
+    const unrelated = edge('implements:n3:n1');
+    expect(edgeGroups().map((group) => group.dataset.edgeState)).toEqual(['subdued', 'incident', 'incident']);
+    expect(inbound.dataset.edgeState).toBe('incident');
+    expect(outboundHistorical.dataset.edgeState).toBe('incident');
+    expect(unrelated.dataset.edgeState).toBe('subdued');
+
+    const inboundLine = inbound.querySelector('[data-edge-part="line"]')!;
+    const inboundLabel = inbound.querySelector('[data-edge-part="label"]')!;
+    expect(inboundLine.getAttribute('stroke-width')).toBe('2.8');
+    expect(inboundLine.getAttribute('opacity')).toBe('1');
+    expect(inboundLine.getAttribute('marker-end')).toBe('url(#mg-arrow-selected)');
+    expect(inboundLabel.getAttribute('font-weight')).toBe('700');
+    expect(inboundLabel.textContent).toBe('depends_on');
+
+    const historicalLine = outboundHistorical.querySelector('[data-edge-part="line"]')!;
+    expect(outboundHistorical.dataset.edgeHistorical).toBe('true');
+    expect(historicalLine.getAttribute('stroke-dasharray')).toBe('3 3');
+    expect(historicalLine.getAttribute('marker-end')).toBe('url(#mg-arrow-historical-selected)');
+    expect(outboundHistorical.querySelector('[data-edge-part="label"]')!.textContent).toBe('supersedes');
+
+    const unrelatedLine = unrelated.querySelector('[data-edge-part="line"]')!;
+    expect(unrelatedLine.getAttribute('stroke-width')).toBe('1.1');
+    expect(unrelatedLine.getAttribute('opacity')).toBe('0.28');
+    expect(unrelatedLine.getAttribute('marker-end')).toBe('url(#mg-arrow-subdued)');
+
+    act(() => container.querySelector('svg')!.dispatchEvent(new MouseEvent('click', { bubbles: true })));
+    expect(edgeGroups().every((group) => group.dataset.edgeState === 'default')).toBe(true);
+    expect(edgeGroups().every((group) => group.querySelector('[data-edge-part="line"]')!.getAttribute('stroke-width') === '1.4')).toBe(true);
+
+    act(() => node(uri('n3')).dispatchEvent(new MouseEvent('click', { bubbles: true })));
+    expect(edge('implements:n3:n1').dataset.edgeState).toBe('incident');
+    expect(edge('depends_on:n1:n2').dataset.edgeState).toBe('subdued');
+    expect(edge('supersedes:n2:n4').dataset.edgeState).toBe('subdued');
+    expect(dep).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('coverage.complete === false', () => {
   it('renders as its own explained state, never as "nothing is related"', async () => {
     const result: ApiDependencyNeighborhood = {
