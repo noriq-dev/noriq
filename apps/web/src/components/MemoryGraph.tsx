@@ -404,7 +404,11 @@ function NeighborhoodPanel({
     const t = setTimeout(() => {
       api.memoryDependencyNeighborhood(
         pid,
-        { entityUri: seedUri, edgeTypes: prefs.edgeTypes.length ? prefs.edgeTypes : undefined, maxDepth: prefs.maxDepth },
+        {
+          entityUri: seedUri,
+          edgeTypes: prefs.edgeTypes.length ? prefs.edgeTypes : [...MemoryEdgeType.options],
+          maxDepth: prefs.maxDepth,
+        },
         controller.signal,
       )
         .then((r) => { setData(r); setLoading(false); })

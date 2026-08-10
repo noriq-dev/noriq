@@ -8,7 +8,7 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { buildEntityUri } from '@noriq-dev/shared';
+import { buildEntityUri, MemoryEdgeType } from '@noriq-dev/shared';
 import { api, type ApiDependencyNeighborhood } from '../api';
 import { MemoryGraph } from './MemoryGraph';
 import type { AppStore } from '../store';
@@ -20,11 +20,11 @@ function fakeStore(tasks: Array<{ id: string; key: string; title: string }> = []
   return { helpers: { tasksOf: () => tasks } } as unknown as AppStore;
 }
 
-function mount(store: AppStore = fakeStore()) {
+function mount(store: AppStore = fakeStore(), initialSeedUri?: string) {
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
-  act(() => root!.render(<MemoryGraph pid="prj_1" store={store} />));
+  act(() => root!.render(<MemoryGraph pid="prj_1" store={store} initialSeedUri={initialSeedUri} />));
 }
 
 afterEach(() => {
@@ -96,6 +96,51 @@ describe('bounded, cancellable expansion', () => {
     act(() => rejectFn?.(new DOMException('aborted', 'AbortError')));
     await tick();
     expect(text()).not.toContain('did not answer');
+  });
+});
+
+describe('relationship filtering (PLNR-384)', () => {
+  const emptyResult: ApiDependencyNeighborhood = {
+    seed: { nodeId: 'n1', uri: TASK_URI, type: 'task', label: TASK.title },
+    downstream: [], upstream: [], coverage: { complete: true, reasons: [] },
+  };
+
+  it('sends every shared edge type by default, an exact selected subset, and every type again after clear', async () => {
+    const dep = vi.spyOn(api, 'memoryDependencyNeighborhood').mockResolvedValue(emptyResult);
+    mount(fakeStore([TASK]));
+    act(() => setSelectValue(container.querySelector('select') as HTMLSelectElement, TASK.id));
+    await tick(250);
+    expect(dep.mock.calls[0]![1].edgeTypes).toEqual([...MemoryEdgeType.options]);
+
+    act(() => findButton('edge types (all)')!.dispatchEvent(new MouseEvent('click', { bubbles: true })));
+    const derivedFrom = [...container.querySelectorAll('label')].find((label) => label.textContent?.includes('derived_from'))!;
+    act(() => derivedFrom.querySelector('input')!.dispatchEvent(new MouseEvent('click', { bubbles: true })));
+    await tick(250);
+    expect(dep.mock.calls.at(-1)![1].edgeTypes).toEqual(['derived_from']);
+
+    act(() => findButton('clear')!.dispatchEvent(new MouseEvent('click', { bubbles: true })));
+    await tick(250);
+    expect(dep.mock.calls.at(-1)![1].edgeTypes).toEqual([...MemoryEdgeType.options]);
+  });
+
+  it('renders a decision connected to its underlying memory by derived_from under the all default', async () => {
+    const decisionUri = 'noriq://decision/mem_live';
+    const memoryUri = 'noriq://memory/mem_live';
+    vi.spyOn(api, 'memoryDependencyNeighborhood').mockResolvedValue({
+      seed: { nodeId: 'decision_1', uri: decisionUri, type: 'decision', label: 'Use the canonical graph' },
+      downstream: [{
+        nodeId: 'memory_1', uri: memoryUri, type: 'memory', label: 'Canonical graph decision memory', depth: 1,
+        edgePath: [{ fromNodeId: 'decision_1', edgeType: 'derived_from', toNodeId: 'memory_1' }],
+      }],
+      upstream: [], coverage: { complete: true, reasons: [] },
+    });
+
+    mount(fakeStore(), decisionUri);
+    await tick(250);
+    act(() => findButton('List')!.dispatchEvent(new MouseEvent('click', { bubbles: true })));
+    expect(text()).toContain('Canonical graph decision memory');
+    expect(text()).toContain('derived_from');
+    expect(text()).not.toContain('has no recorded relationships');
   });
 });
 
