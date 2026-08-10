@@ -13,6 +13,7 @@ import { Button, Select, TextArea, TextInput } from './ui';
 import { ExecutionSpecPanel, type SpecLoad } from './ExecutionSpec';
 import { DispatchIntelligencePanel } from './DispatchIntelligence';
 import { confirm } from './Dialog';
+import { AttachmentPreview, attachmentPreviewDecision, type AttachmentPreviewItem } from './AttachmentPreview';
 
 export function Drawer({ store }: { store: AppStore }) {
   const { currentPid, selectedTaskId, helpers, actions, snapshot } = store;
@@ -35,6 +36,7 @@ export function Drawer({ store }: { store: AppStore }) {
   const [addingDep, setAddingDep] = useState(false);
   const [depError, setDepError] = useState('');
   const [attachments, setAttachments] = useState<Array<{ id: string; filename: string; size: number; contentType?: string; createdAt: string }>>([]);
+  const [previewAttachment, setPreviewAttachment] = useState<AttachmentPreviewItem | null>(null);
   const [taskDocs, setTaskDocs] = useState<Array<{ id: string; name: string; description: string }>>([]);
   // PLNR-400: list rows intentionally omit markdown bodies. The drawer already owns the
   // canonical task-detail request, so keep the body with that response instead of making every
@@ -53,12 +55,14 @@ export function Drawer({ store }: { store: AppStore }) {
   const detailFor = useRef<string | null>(null);
   const [allDocs, setAllDocs] = useState<Array<{ id: string; name: string }>>([]);
   const fileRef = useRef<HTMLInputElement>(null);
+  const previewReturnFocus = useRef<HTMLElement | null>(null);
 
   const allTags = snapshot?.tags ?? [];
   const tagById = new Map(allTags.map((t) => [t.id, t]));
 
   useEffect(() => {
     setEditing(false);
+    setPreviewAttachment(null);
     if (selectedTaskId) {
       api.taskEvents(selectedTaskId).then((r) => setTimeline(r.events)).catch(() => setTimeline([]));
       const forTask = selectedTaskId;
@@ -166,6 +170,11 @@ export function Drawer({ store }: { store: AppStore }) {
     const detail = await api.taskDetail(task.id);
     setAttachments(detail.attachments);
     actions.refreshNow();
+  };
+
+  const openAttachmentPreview = (attachment: AttachmentPreviewItem, trigger: HTMLElement) => {
+    previewReturnFocus.current = trigger;
+    setPreviewAttachment(attachment);
   };
 
   return (
@@ -703,31 +712,40 @@ export function Drawer({ store }: { store: AppStore }) {
             <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginBottom: 18 }}>
               {attachments.map((att) => {
                 const url = `/api/attachments/${att.id}`;
-                const isImage = (att.contentType ?? '').startsWith('image/');
+                const isImage = attachmentPreviewDecision(att).kind === 'image';
                 return (
                   <div key={att.id} style={{ borderRadius: 8, background: 'var(--w-02)', border: '1px solid var(--w-06)', overflow: 'hidden' }}>
                     {isImage && (
-                      // Inline preview — click to open full size in a new tab.
-                      <a href={url} target="_blank" rel="noreferrer" style={{ display: 'block' }}>
+                      <button
+                        type="button"
+                        aria-label={`Preview ${att.filename}`}
+                        onClick={(event) => openAttachmentPreview(att, event.currentTarget)}
+                        style={{ display: 'block', width: '100%', padding: 0, border: 0, cursor: 'zoom-in', background: 'transparent' }}
+                      >
                         <img
                           src={url}
                           alt={att.filename}
                           loading="lazy"
                           style={{ display: 'block', width: '100%', maxHeight: 220, objectFit: 'contain', background: 'rgba(0,0,0,.25)' }}
                         />
-                      </a>
+                      </button>
                     )}
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 10px' }}>
                       <span style={{ fontSize: 12 }}>{isImage ? '🖼️' : '📎'}</span>
-                      <a href={url} target="_blank" rel="noreferrer" style={{ fontSize: 12, textDecoration: 'none', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      <button
+                        type="button"
+                        onClick={(event) => openAttachmentPreview(att, event.currentTarget)}
+                        style={{ cursor: 'pointer', padding: 0, border: 0, background: 'transparent', color: 'var(--text)', fontSize: 12, textAlign: 'left', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                      >
                         {att.filename}
-                      </a>
+                      </button>
                       <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>{(att.size / 1024).toFixed(0)} KB</span>
                       <div style={{ flex: 1 }} />
                       <button
                         onClick={async () => {
                           await api.deleteAttachment(att.id);
                           setAttachments((l) => l.filter((x) => x.id !== att.id));
+                          if (previewAttachment?.id === att.id) setPreviewAttachment(null);
                         }}
                         style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--red-soft)', background: 'transparent' }}
                       >
@@ -817,6 +835,14 @@ export function Drawer({ store }: { store: AppStore }) {
           <Composer store={store} placeholder={`Steer ${holder}…`} compact />
         </div>
       </div>
+      {previewAttachment && (
+        <AttachmentPreview
+          key={previewAttachment.id}
+          attachment={previewAttachment}
+          returnFocus={previewReturnFocus.current}
+          onClose={() => setPreviewAttachment(null)}
+        />
+      )}
     </>
   );
 }
