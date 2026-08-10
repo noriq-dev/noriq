@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api, type ApiAskAction, type ApiAskStreamHandlers, type ApiAskThread, type ApiAskThreadDetail } from '../api';
 import type { AppStore } from '../store';
 import { confirm } from './Dialog';
-import { AskView } from './AskView';
+import { AskView, askProjectTag } from './AskView';
 
 vi.mock('./Dialog', () => ({ confirm: vi.fn() }));
 
@@ -38,11 +38,11 @@ const detailFor = (thread: ApiAskThread): ApiAskThreadDetail => ({
   ],
 });
 
-function mount() {
+function mount(projects: Array<{ id: string; key: string; name: string }> = []) {
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
-  const store = { user: { id: 'usr_ask' }, actions } as unknown as AppStore;
+  const store = { user: { id: 'usr_ask' }, actions, data: { projects } } as unknown as AppStore;
   act(() => root!.render(<AskView store={store} />));
 }
 
@@ -78,6 +78,64 @@ afterEach(() => {
 });
 
 describe('global Ask chat', () => {
+  it('suggests accessible projects, inserts a normalized tag, and sends it intact', async () => {
+    mockEmptyHistory();
+    const ask = vi.spyOn(api, 'askStream').mockImplementation(async (_question, _threadId, handlers) => {
+      handlers.onDelta('Scoped answer');
+      handlers.onDone?.({ finishReason: 'stop', truncated: false });
+    });
+    mount([{ id: 'project_noriq', key: 'PLNR', name: 'Noriq Mission Control' }]);
+    await flush();
+
+    setTextarea('What is active in @nori');
+    expect(container.querySelector('[role="listbox"][aria-label="Tag a project"]')).toBeTruthy();
+    expect(container.textContent).toContain('@noriq-mission-control');
+    const textarea = container.querySelector<HTMLTextAreaElement>('textarea')!;
+    act(() => textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })));
+    expect(textarea.value).toBe('What is active in @noriq-mission-control ');
+    expect(ask).not.toHaveBeenCalled();
+
+    await act(async () => button('Send')!.click());
+    expect(ask).toHaveBeenCalledWith(
+      'What is active in @noriq-mission-control', null, expect.anything(), expect.any(AbortSignal), defaultModel,
+    );
+  });
+
+  it('renders tagged project scope separately from evidence and opens the project', async () => {
+    vi.spyOn(api, 'askThreads').mockResolvedValue({ threads: [activeThread] });
+    const detail = detailFor(activeThread);
+    detail.messages[1] = {
+      ...detail.messages[1]!,
+      sources: [{
+        kind: 'project', id: 'project_noriq', title: 'Noriq', score: 1,
+        projectId: 'project_noriq', projectKey: 'PLNR', projectName: 'Noriq',
+        citation: 'PLNR / project:project_noriq', tag: '@noriq', retrieval: 'live',
+      }],
+    };
+    vi.spyOn(api, 'askThread').mockResolvedValue(detail);
+
+    mount();
+    await flush();
+    expect(container.querySelector('[aria-label="Tagged project scope"]')?.textContent).toContain('@noriq · PLNR');
+    expect(container.querySelector('[data-testid="ask-sources"]')).toBeNull();
+    act(() => button('@noriq · PLNR')!.click());
+    expect(actions.selectProject).toHaveBeenCalledWith('project_noriq');
+    expect(actions.openTask).not.toHaveBeenCalled();
+  });
+
+  it('uses project keys when normalized project names would be ambiguous', async () => {
+    mockEmptyHistory();
+    mount([
+      { id: 'project_one', key: 'ONE', name: 'Shared Name' },
+      { id: 'project_two', key: 'TWO', name: 'Shared Name' },
+    ]);
+    await flush();
+    setTextarea('@');
+    expect([...container.querySelectorAll('[role="option"]')].map((option) => option.textContent)).toEqual([
+      '@oneShared NameONE', '@twoShared NameTWO',
+    ]);
+  });
+
   it('loads a durable thread, streams into it, and opens a graph-aware source', async () => {
     vi.spyOn(api, 'askThreads').mockResolvedValue({ threads: [activeThread] });
     vi.spyOn(api, 'askThread').mockResolvedValue(detailFor(activeThread));
@@ -421,5 +479,11 @@ describe('Ask SSE transport', () => {
       onMeta: () => {}, onDelta: () => {}, onCancelled: cancelled,
     });
     expect(cancelled).toHaveBeenCalledOnce();
+  });
+});
+
+describe('askProjectTag', () => {
+  it('normalizes project names into stable @ tokens', () => {
+    expect(askProjectTag('  Project NOD: Prototype  ')).toBe('@project-nod-prototype');
   });
 });

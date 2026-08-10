@@ -28,6 +28,12 @@ const EXAMPLES = [
   'What do our memories say about recent architectural decisions?',
 ];
 
+export const askProjectTag = (name: string): string => `@${name
+  .trim()
+  .toLowerCase()
+  .replace(/[^a-z0-9]+/g, '-')
+  .replace(/^-+|-+$/g, '')}`;
+
 interface ThreadMessage extends ApiAskHistoryMessage {
   id?: string;
   sources?: ApiAskSource[];
@@ -159,6 +165,25 @@ export function AskView({ store }: { store: AppStore }) {
   const followScrollRef = useRef(true);
   const openRequestRef = useRef(0);
   const loading = phase !== null;
+  const mention = q.match(/(?:^|\s)@([a-z0-9_-]*)$/i);
+  const mentionQuery = mention?.[1]?.toLowerCase() ?? null;
+  const projectDirectory = store.data?.projects ?? [];
+  const nameTags = projectDirectory.map((project) => askProjectTag(project.name));
+  const nameTagCounts = new Map<string, number>();
+  for (const tag of nameTags) nameTagCounts.set(tag, (nameTagCounts.get(tag) ?? 0) + 1);
+  const projectSuggestions = mentionQuery === null ? [] : projectDirectory
+    .map((project, index) => ({
+      project,
+      tag: nameTagCounts.get(nameTags[index]!)! > 1 ? `@${project.key.toLowerCase()}` : nameTags[index]!,
+    }))
+    .filter(({ project, tag }) => tag.slice(1).startsWith(mentionQuery) || project.key.toLowerCase().startsWith(mentionQuery))
+    .slice(0, 6);
+
+  const insertProjectTag = (tag: string) => {
+    if (!mention) return;
+    const at = q.lastIndexOf('@');
+    setQ(`${q.slice(0, at)}${tag} `);
+  };
 
   const patchGeneration = (generationId: string, patch: (message: ThreadMessage) => ThreadMessage) => {
     setMessages((current) => current.map((message, index) =>
@@ -589,6 +614,8 @@ export function AskView({ store }: { store: AppStore }) {
                 const copyLabel = `Copy ${message.role} message`;
                 const displayedModel = modelLabel(message.model, models);
                 const coverageNotices = message.trace?.filter((item) => /truncat|server limit|capped|returned \d+ of/i.test(item)) ?? [];
+                const taggedProjects = message.sources?.filter((source) => source.kind === 'project' && source.tag) ?? [];
+                const evidenceSources = message.sources?.filter((source) => !(source.kind === 'project' && source.tag)) ?? [];
                 return (
                   <div key={messageKey} style={{ marginBottom: 24 }}>
                     {message.role === 'user' ? (
@@ -608,6 +635,15 @@ export function AskView({ store }: { store: AppStore }) {
                       <div style={{ display: 'flex', gap: 11, alignItems: 'flex-start' }}>
                         <div style={{ color: 'var(--accent)', fontSize: 16, lineHeight: 1.5, flex: 'none' }}>✦</div>
                         <div style={{ minWidth: 0, flex: 1 }}>
+                          {taggedProjects.length > 0 && (
+                            <div aria-label="Tagged project scope" style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
+                              {taggedProjects.map((source) => (
+                                <button key={source.id} onClick={() => openSource(source)} title={`Open ${source.projectName}`} style={{ cursor: 'pointer', border: '1px solid rgba(198,242,78,.24)', borderRadius: 7, background: 'rgba(198,242,78,.07)', padding: '4px 8px', color: 'var(--accent-ink)', fontFamily: 'var(--mono)', fontSize: 9.5 }}>
+                                  {source.tag} · {source.projectKey}
+                                </button>
+                              ))}
+                            </div>
+                          )}
                           {(message.trace?.length || message.reasoning) && (
                             <details data-testid="ask-reasoning" style={{ borderLeft: '1px solid var(--w-1)', paddingLeft: 11 }}>
                               <summary style={{ cursor: 'pointer', color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 9.5, userSelect: 'none' }}>
@@ -623,18 +659,18 @@ export function AskView({ store }: { store: AppStore }) {
                               </div>
                             </details>
                           )}
-                          {!!message.sources?.length && (
+                          {evidenceSources.length > 0 && (
                             <details data-testid="ask-sources" style={{ marginTop: 12, borderLeft: '1px solid var(--w-1)', paddingLeft: 11 }}>
                               <summary style={{ cursor: 'pointer', color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 9.5, userSelect: 'none' }}>
-                                Sources · {message.sources.length}
+                                Sources · {evidenceSources.length}
                                 {message.mode && (
                                   <span style={{ marginLeft: 8, color: 'var(--text-faint)' }}>
-                                    {message.mode}{message.sources.some((source) => source.retrieval === 'graph' || source.retrieval === 'hybrid') ? ' + graph' : ''}
+                                    {message.mode}{evidenceSources.some((source) => source.retrieval === 'graph' || source.retrieval === 'hybrid') ? ' + graph' : ''}
                                   </span>
                                 )}
                               </summary>
                               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
-                                {message.sources.map((source) => (
+                                {evidenceSources.map((source) => (
                                   <button key={`${source.kind}:${source.id}`} aria-label={`Open ${source.citation ?? source.key ?? source.title}`} onClick={() => openSource(source)} className="hover-border" title={`${source.projectName} · ${source.retrieval}${source.updatedAt ? ` · updated ${source.updatedAt}` : ''}`} style={{ display: 'flex', alignItems: 'center', gap: 7, border: '1px solid var(--w-07)', borderRadius: 8, background: 'var(--w-02)', padding: '6px 9px', cursor: 'pointer', minWidth: 0 }}>
                                     <MonoTag color={KIND_COLOR[source.kind]} bg="var(--w-04)" size={8}>{source.kind.toUpperCase()}</MonoTag>
                                     <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>{source.citation ?? [source.projectKey, source.key].filter(Boolean).join(' / ')}</span>
@@ -692,8 +728,19 @@ export function AskView({ store }: { store: AppStore }) {
           </div>
 
           <div style={{ flex: 'none', padding: '12px 24px 18px', background: 'linear-gradient(transparent, var(--bg) 22%)' }}>
-            <div style={{ maxWidth: 800, margin: '0 auto', border: '1px solid var(--w-12)', borderRadius: 13, background: 'var(--card)', padding: '9px 10px 9px 13px', boxShadow: '0 10px 30px rgba(0,0,0,.12)' }}>
-              <textarea value={q} onChange={(event) => setQ(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (!loading) void ask(); } }} placeholder={threadArchived ? 'Restore this chat to continue…' : 'Message Ask…'} rows={2} disabled={historyLoading || threadArchived} style={{ boxSizing: 'border-box', width: '100%', background: 'transparent', border: 0, padding: '2px 0 6px', color: 'var(--text)', fontSize: 13.5, lineHeight: 1.5, resize: 'none', outline: 'none', fontFamily: 'inherit' }} />
+            <div style={{ position: 'relative', maxWidth: 800, margin: '0 auto', border: '1px solid var(--w-12)', borderRadius: 13, background: 'var(--card)', padding: '9px 10px 9px 13px', boxShadow: '0 10px 30px rgba(0,0,0,.12)' }}>
+              {projectSuggestions.length > 0 && (
+                <div role="listbox" aria-label="Tag a project" style={{ position: 'absolute', left: 12, bottom: 'calc(100% + 7px)', width: 300, maxWidth: 'calc(100vw - 48px)', border: '1px solid var(--w-12)', borderRadius: 10, background: 'var(--bg-raised)', padding: 5, boxShadow: '0 14px 34px rgba(0,0,0,.3)', zIndex: 5 }}>
+                  {projectSuggestions.map(({ project, tag }) => (
+                    <button key={project.id} role="option" aria-selected="false" onMouseDown={(event) => event.preventDefault()} onClick={() => insertProjectTag(tag)} style={{ cursor: 'pointer', width: '100%', display: 'flex', alignItems: 'center', gap: 9, borderRadius: 7, padding: '7px 9px', color: 'var(--text)', textAlign: 'left' }} className="hover-border">
+                      <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--accent-ink)' }}>{tag}</span>
+                      <span style={{ fontSize: 11.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{project.name}</span>
+                      <span style={{ marginLeft: 'auto', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>{project.key}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+              <textarea value={q} onChange={(event) => setQ(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (projectSuggestions[0]) insertProjectTag(projectSuggestions[0].tag); else if (!loading) void ask(); } }} placeholder={threadArchived ? 'Restore this chat to continue…' : 'Message Ask… Use @project to focus.'} rows={2} disabled={historyLoading || threadArchived} style={{ boxSizing: 'border-box', width: '100%', background: 'transparent', border: 0, padding: '2px 0 6px', color: 'var(--text)', fontSize: 13.5, lineHeight: 1.5, resize: 'none', outline: 'none', fontFamily: 'inherit' }} />
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                 <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>
                   Model

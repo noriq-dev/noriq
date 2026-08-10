@@ -16,6 +16,9 @@ export interface WorkspaceScope {
   userId: string;
   allowAdminOverride?: boolean;
   oauthTokenId?: string | null;
+  /** Optional narrowing inside the authenticated boundary. Ask uses this for an explicit
+   * @project tag; it can reduce reach but can never add a project the caller cannot access. */
+  projectIds?: readonly string[];
 }
 
 export interface WorkspaceProject {
@@ -57,7 +60,16 @@ const visibility = (scope: WorkspaceScope, nextParam: number) => {
   if (!scope.allowAdminOverride) binds.push(scope.userId);
   const tokenParam = `?${nextParam + binds.length}`;
   binds.push(scope.oauthTokenId ?? null);
-  return { sql: `${userWhere} AND ${tokenProjectWhere(tokenParam)}`, binds };
+  let projectWhere = '1 = 1';
+  if (scope.projectIds) {
+    if (scope.projectIds.length === 0) projectWhere = '0 = 1';
+    else {
+      const first = nextParam + binds.length;
+      projectWhere = `p.id IN (${scope.projectIds.map((_, index) => `?${first + index}`).join(',')})`;
+      binds.push(...scope.projectIds);
+    }
+  }
+  return { sql: `${userWhere} AND ${tokenProjectWhere(tokenParam)} AND ${projectWhere}`, binds };
 };
 
 /** List active projects reachable inside an explicit human/agent/token scope. */

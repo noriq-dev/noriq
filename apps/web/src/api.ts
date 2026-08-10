@@ -53,6 +53,7 @@ export function clearConstellationV2PageCache(): void {
 
 export interface ApiAskStreamMeta {
   sources: ApiAskSource[];
+  projectTags?: ApiAskProjectTag[];
   mode: 'semantic' | 'keyword' | null;
   model: string | null;
   graphEnhanced: boolean;
@@ -418,7 +419,7 @@ export const api = {
   /** Global, multi-turn Ask chat. Project scope is derived server-side from the session; the
    *  browser sends conversation history but can never choose or broaden retrieval access. */
   ask: (question: string, history: ApiAskHistoryMessage[], model?: string) =>
-    req<{ answer: string; mode: 'semantic' | 'keyword' | null; model: string; graphEnhanced: boolean; sources: ApiAskSource[] }>(
+    req<{ answer: string; mode: 'semantic' | 'keyword' | null; model: string; graphEnhanced: boolean; sources: ApiAskSource[]; projectTags: ApiAskProjectTag[] }>(
       'POST', '/api/ask', { question, history, model }),
   askModels: () => req<ApiAskModelCatalog>('GET', '/api/ask/models'),
   askStream,
@@ -1128,6 +1129,13 @@ export interface ApiAskAction {
 }
 
 /** One cross-project grounding source behind a global /ask answer. */
+export interface ApiAskProjectTag {
+  tag: string;
+  projectId: string;
+  projectKey: string;
+  projectName: string;
+}
+
 export interface ApiAskSource {
   kind: 'project' | 'task' | 'run' | 'signal' | 'comment' | 'doc' | 'plan' | 'memory' | 'episode';
   id: string;
@@ -1147,6 +1155,7 @@ export interface ApiAskSource {
   evidenceVerifiedForCaller?: Array<boolean | null>;
   citation?: string;
   updatedAt?: string;
+  tag?: string;
   retrieval: 'semantic' | 'keyword' | 'graph' | 'hybrid' | 'live';
 }
 

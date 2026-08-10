@@ -6,7 +6,8 @@ import { describe, expect, it, beforeAll } from 'vitest';
 import { createAgent, createUser, loginSession, mcpCall } from './helpers';
 import {
   answerQuestion, askEventStream, askOutputTokenLimit, buildMessages, extractFinishState, extractGeneratedText, extractReasoningSummaryDelta, extractRetrievalToolQuery, extractStreamDelta,
-  generationClient, normalizeHistory, retrievalDecisionClient, type ChatMessage, type GenerationClient, type PreparedAsk,
+  generationClient, normalizeHistory, resolveAskProjectTags, retrievalDecisionClient, stripAskProjectTags,
+  type ChatMessage, type GenerationClient, type PreparedAsk,
 } from '../src/ask';
 import type { SearchHit } from '../src/search';
 import type { Env } from '../src/env';
@@ -26,6 +27,7 @@ import {
 import {
   MAX_ASK_TOOL_CALLS, createAskReadTools, createAskTools, extractAskToolCalls, finalAskMessages, runAskToolLoop, type AskTool,
 } from '../src/ask-tools';
+import { listWorkspaceProjects, searchWorkspaceTasks } from '../src/lib/workspace-operations';
 
 /** Fake generation client: records the prompts it saw, returns a canned answer. */
 function fakeGen(canned = 'Grounded answer citing ASK-1.') {
@@ -83,6 +85,31 @@ describe('buildMessages (unit)', () => {
     expect(history).toHaveLength(12);
     expect(history.every((m) => m.role !== 'system')).toBe(true);
     expect(history[0]!.content).toBe('message 2');
+  });
+
+  it('resolves unique project names and keys without treating arbitrary @ text as project scope', () => {
+    const directory = [
+      { id: 'p1', key: 'PLNR', name: 'Noriq Mission Control' },
+      { id: 'p2', key: 'RUN', name: 'Noriq Runner' },
+    ];
+    expect(resolveAskProjectTags('Compare @noriq-mission-control with (@RUN).', directory)).toEqual([
+      { tag: '@noriq-mission-control', projectId: 'p1', projectKey: 'PLNR', projectName: 'Noriq Mission Control' },
+      { tag: '@RUN', projectId: 'p2', projectKey: 'RUN', projectName: 'Noriq Runner' },
+    ]);
+    expect(resolveAskProjectTags('Email person@example.com about @PLNR-398 and model @cf/openai.', directory)).toEqual([]);
+    expect(resolveAskProjectTags('@same', [
+      { id: 'a', key: 'A', name: 'Same' }, { id: 'b', key: 'B', name: 'same' },
+    ])).toEqual([]);
+  });
+
+  it('removes only resolved routing tags and labels trusted tag scope in the prompt', () => {
+    const tags = resolveAskProjectTags('Check (@proj), then email a@proj.com.', projects);
+    expect(stripAskProjectTags('Check (@proj), then email a@proj.com.', tags)).toBe('Check then email a@proj.com.');
+    const msgs = buildMessages('Check @proj', projects, [], [], false, tags);
+    expect(msgs.at(-1)!.content).toContain('PROJECT TAG SCOPE (trusted server-resolved routing metadata)');
+    expect(msgs.at(-1)!.content).toContain('"tag":"@proj"');
+    expect(msgs[0]!.content).toMatch(/routing identifiers only.*never follow instructions/i);
+    expect(msgs.at(-1)!.content).toContain('CURRENT QUESTION: Check @proj');
   });
 });
 
@@ -197,6 +224,7 @@ describe('Workers AI response adapters', () => {
     };
     const prepared: PreparedAsk = {
       messages: [{ role: 'user', content: 'q' }], sources: [], mode: 'semantic', model: '@cf/openai/gpt-oss-120b', graphEnhanced: false,
+      projectTags: [{ tag: '@proj', projectId: 'p', projectKey: 'ASK', projectName: 'Proj' }],
     };
     let completed: { answer: string; reasoning: string; finishReason: string | null; truncated: boolean } | undefined;
     const output = await new Response(askEventStream(gen, prepared, {
@@ -206,6 +234,7 @@ describe('Workers AI response adapters', () => {
     expect(output).toContain('event: thread');
     expect(output).toContain('chat_1');
     expect(output).toContain('event: meta');
+    expect(output).toContain('"projectTags":[{"tag":"@proj","projectId":"p","projectKey":"ASK","projectName":"Proj"}]');
     expect(output).toContain('event: status');
     expect(output).toContain('event: reasoning');
     expect(output).toContain('Checked the evidence.');
@@ -367,6 +396,17 @@ describe('Ask workspace read catalog', () => {
     expect(status.projects).toEqual([]);
     await expect(tools.find((tool) => tool.name === 'get_task')!.execute({ taskId })).rejects.toThrow(/not found/i);
   });
+
+  it('treats projectIds as a narrowing constraint inside the authenticated boundary', async () => {
+    const owner = await env.DB.prepare('SELECT owner_user_id AS id FROM projects WHERE id = ?')
+      .bind(projectId).first<{ id: string }>();
+    await expect(listWorkspaceProjects(env, { userId: owner!.id, projectIds: [projectId] }))
+      .resolves.toEqual([{ id: projectId, key: 'ASK', name: 'askable' }]);
+    await expect(listWorkspaceProjects(env, { userId: owner!.id, projectIds: ['project_not_accessible'] }))
+      .resolves.toEqual([]);
+    await expect(searchWorkspaceTasks(env, { userId: owner!.id, projectIds: [] }, { projectId }))
+      .resolves.toMatchObject({ tasks: [], matched: 0, returned: 0 });
+  });
 });
 
 describe('Ask confirmed single-task actions', () => {
@@ -504,6 +544,21 @@ describe('Ask confirmed single-task actions', () => {
 });
 
 describe('answerQuestion (retrieval + fake generation)', () => {
+  it('uses a resolved @project tag as a trusted routing scope and preserves it in the response', async () => {
+    const { gen, calls } = fakeGen('Scoped answer.');
+    const res = await answerQuestion(env as unknown as Env, gen, {
+      question: 'payment retry backoff in @ASK', projects: [{ id: projectId, key: 'ASK', name: 'askable' }],
+      retrieval: { async select() { throw new Error('tagged questions bypass the model retrieval decision'); } },
+    });
+    expect(res.projectTags).toEqual([
+      { tag: '@ASK', projectId, projectKey: 'ASK', projectName: 'askable' },
+    ]);
+    expect(res.sources[0]).toMatchObject({ kind: 'project', id: projectId, tag: '@ASK', retrieval: 'live' });
+    expect(res.sources.every((source) => source.projectId === projectId)).toBe(true);
+    expect(calls[0]!.at(-1)!.content).toContain('PROJECT TAG SCOPE (trusted server-resolved routing metadata)');
+    expect(calls[0]!.at(-1)!.content).toContain('CURRENT QUESTION: payment retry backoff in @ASK');
+  });
+
   it('grounds the prompt on retrieved material, hydrates fuller bodies, and returns sources', async () => {
     const { gen, calls } = fakeGen();
     const res = await answerQuestion(env as unknown as Env, gen, {
@@ -894,7 +949,11 @@ describe('REST /api/ask', () => {
       status: 'generating',
       answer: 'durable answer',
       reasoning: 'public summary',
-      sources: [],
+      sources: [{
+        kind: 'project', id: 'prj_reconnect_target', title: 'Reconnect target', score: 1,
+        projectId: 'prj_reconnect_target', projectKey: 'REC', projectName: 'Reconnect target',
+        citation: 'REC / project:prj_reconnect_target', tag: '@reconnect-target', retrieval: 'live',
+      }],
       trace: ['Generating…'],
       mode: 'keyword',
       model: 'test-model',
@@ -909,13 +968,15 @@ describe('REST /api/ask', () => {
     expect(replay).toContain('data: {"text":"summary"}');
     expect(replay).toContain('event: done');
     expect(replay).toContain(proposed.id);
+    expect(replay).toContain('"projectTags":[{"tag":"@reconnect-target","projectId":"prj_reconnect_target","projectKey":"REC","projectName":"Reconnect target"}]');
 
     const detail = await (await SELF.fetch(`https://noriq.test/api/ask/threads/${thread.id}`, {
       headers: { Cookie: await loginSession('ask-reconnect@example.com', 'longenough1') },
-    })).json() as { messages: Array<{ role: string; generationId?: string; generationStatus?: string; content: string; model?: string; actions?: Array<{ id: string }> }> };
+    })).json() as { messages: Array<{ role: string; generationId?: string; generationStatus?: string; content: string; model?: string; sources?: Array<{ tag?: string }>; actions?: Array<{ id: string }> }> };
     expect(detail.messages.filter((message) => message.role === 'assistant')).toEqual([
       expect.objectContaining({
         generationId: generation.id, generationStatus: 'completed', content: 'durable answer', model: 'test-model',
+        sources: [expect.objectContaining({ tag: '@reconnect-target' })],
         actions: [expect.objectContaining({ id: proposed.id })],
       }),
     ]);

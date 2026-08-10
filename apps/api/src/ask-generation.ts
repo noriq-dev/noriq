@@ -1,5 +1,8 @@
 import type { Env } from './env';
-import { askOutputTokenLimit, buildMessages, consumeAskGeneration, streamingGenerationClient, type AskProject, type PreparedAsk } from './ask';
+import {
+  askOutputTokenLimit, askProjectTagSources, buildMessages, consumeAskGeneration,
+  resolveAskProjectTags, streamingGenerationClient, type AskProject, type AskSource, type PreparedAsk,
+} from './ask';
 import {
   ASK_GENERATION_CANCELLED, completeAskGeneration, failAskGeneration, getAskGeneration, updateAskGeneration,
   type StoredAskGeneration,
@@ -57,10 +60,25 @@ export async function runAskGeneration(env: Env, generationId: string): Promise<
 
   try {
     if (!await persist('searching', true)) return;
-    const projects = await accessibleAskProjectsForUser(env, generation.userId);
+    const accessibleProjects = await accessibleAskProjectsForUser(env, generation.userId);
+    const projectTags = resolveAskProjectTags(generation.question, accessibleProjects);
+    const projects = projectTags.length
+      ? accessibleProjects.filter((project) => projectTags.some((tag) => tag.projectId === project.id))
+      : accessibleProjects;
+    const tagSources = askProjectTagSources(projectTags);
+    const withTagSources = (sources: AskSource[]) => [
+      ...tagSources,
+      ...sources.filter((source) => !tagSources.some((tag) => tag.projectId === source.projectId && tag.kind === source.kind && tag.id === source.id)),
+    ];
+    base.sources = withTagSources(base.sources);
+    if (projectTags.length) base.trace = [`Scoped this response to ${projectTags.map((tag) => tag.tag).join(', ')}.`, ...base.trace];
+    if (!await persist('searching', true)) return;
     const decision = askToolDecisionClient(env, model.id);
     if (!decision) throw new Error('no AI backend — asking questions requires the Workers AI (AI) binding');
-    const tools = createAskTools(env, { userId: generation.userId }, projects, {
+    const tools = createAskTools(env, {
+      userId: generation.userId,
+      ...(projectTags.length ? { projectIds: projectTags.map((tag) => tag.projectId) } : {}),
+    }, projects, {
       userId: generation.userId,
       threadId: generation.threadId,
       messageId: generation.messageId,
@@ -68,13 +86,13 @@ export async function runAskGeneration(env: Env, generationId: string): Promise<
     });
     const loop = await runAskToolLoop(
       decision,
-      buildMessages(generation.question, projects, [], generation.history, false),
+      buildMessages(generation.question, projects, [], generation.history, false, projectTags),
       tools,
       {
         shouldContinue: () => active,
         onCheckpoint: async (state) => {
-          base.sources = state.sources;
-          base.trace = state.trace;
+          base.sources = withTagSources(state.sources);
+          base.trace = [...(projectTags.length ? [`Scoped this response to ${projectTags.map((tag) => tag.tag).join(', ')}.`] : []), ...state.trace];
           base.mode = state.mode;
           base.graphEnhanced = state.graphEnhanced;
           await persist('searching', true);
@@ -82,8 +100,8 @@ export async function runAskGeneration(env: Env, generationId: string): Promise<
       },
     );
     if (!loop || !active) return;
-    base.sources = loop.sources;
-    base.trace = [...loop.trace, loop.calls
+    base.sources = withTagSources(loop.sources);
+    base.trace = [...(projectTags.length ? [`Scoped this response to ${projectTags.map((tag) => tag.tag).join(', ')}.`] : []), ...loop.trace, loop.calls
       ? 'Generating a response from the collected workspace evidence…'
       : 'No Noriq workspace tool was needed; generating a general response…'];
     base.mode = loop.mode;
@@ -91,7 +109,8 @@ export async function runAskGeneration(env: Env, generationId: string): Promise<
     base.graphEnhanced = loop.graphEnhanced;
     const prepared: PreparedAsk = {
       messages: finalAskMessages(loop),
-      sources: loop.sources,
+      sources: withTagSources(loop.sources),
+      projectTags,
       mode: loop.mode,
       model: model.id,
       graphEnhanced: loop.graphEnhanced,
@@ -156,6 +175,11 @@ export function askGenerationEventStream(
             const actions = await listAskActions(env.DB, userId, { generationId });
             controller.enqueue(frame('meta', {
               sources: current.sources,
+              projectTags: current.sources
+                .filter((source) => source.kind === 'project' && source.tag)
+                .map((source) => ({
+                  tag: source.tag!, projectId: source.projectId, projectKey: source.projectKey, projectName: source.projectName,
+                })),
               mode: current.mode,
               model: current.model,
               graphEnhanced: current.graphEnhanced,
