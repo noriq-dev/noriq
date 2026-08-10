@@ -174,16 +174,15 @@ describe('global Ask chat', () => {
 
     mount();
     await flush();
-    const selector = container.querySelector<HTMLSelectElement>('select[aria-label="Ask model"]')!;
-    expect([...selector.options].map((option) => [option.value, option.textContent])).toEqual([
+    const selector = container.querySelector<HTMLButtonElement>('button[aria-label="Ask model"]')!;
+    act(() => selector.click());
+    expect([...container.querySelectorAll<HTMLElement>('[role="option"]')].map((option) => [option.dataset.value, option.querySelector('span span')?.textContent])).toEqual([
       [defaultModel, 'Large model'], [fastModel, 'Fast model'],
     ]);
     expect(container.textContent).toContain('Fast model');
     expect(container.textContent).toContain(fastModel);
-    act(() => {
-      selector.value = fastModel;
-      selector.dispatchEvent(new Event('change', { bubbles: true }));
-    });
+    const fastOption = container.querySelector<HTMLElement>(`[role="option"][data-value="${fastModel}"]`)!;
+    act(() => fastOption.click());
     setTextarea('Use the fast model');
     await act(async () => button('Send')!.click());
     expect(ask).toHaveBeenCalledWith('Use the fast model', activeThread.id, expect.anything(), expect.any(AbortSignal), fastModel);

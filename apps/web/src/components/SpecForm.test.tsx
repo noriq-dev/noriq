@@ -130,8 +130,9 @@ describe('editing', () => {
 
   it('offers the three change kinds as a choice rather than free text', () => {
     mount({ draft: draft({ anticipatedFiles: [{ path: 'src/a.ts', change: 'modify', why: '' }] }) });
-    const select = container.querySelector('select')!;
-    expect([...select.options].map((o) => o.value)).toEqual(['create', 'modify', 'delete']);
+    const select = container.querySelector<HTMLButtonElement>('button[aria-label="Change type for src/a.ts"]')!;
+    act(() => select.click());
+    expect([...container.querySelectorAll<HTMLElement>('[role="option"]')].map((option) => option.dataset.value)).toEqual(['create', 'modify', 'delete']);
   });
 
   it('shows Clear only when there is something to clear', () => {

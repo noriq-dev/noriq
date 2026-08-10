@@ -7,6 +7,7 @@ import type { AppStore } from '../store';
 import { LiveDot, MonoTag } from './bits';
 import { GroupsSection, Section, UsersSection } from './SettingsView';
 import { confirm } from './Dialog';
+import { Select } from './ui';
 
 export function AdminView({ store }: { store: AppStore }) {
   useEffect(() => {
@@ -119,9 +120,9 @@ function AuthorizationSection() {
           <thead><tr><Th>Account</Th><Th>Access</Th><Th>Project creation</Th><Th>Group creation</Th></tr></thead>
           <tbody>{state.accounts.map((u) => <tr key={u.id} style={{ borderTop: '1px solid var(--w-05)' }}>
             <Td><b>{u.name}</b> <span style={{ color: 'var(--text-faint)', fontFamily: 'var(--mono)', fontSize: 9.5 }}>{u.email}</span></Td>
-            <Td><select value={u.accessMode ?? 'read_write'} onChange={(e) => void updateAccount(u.id, { accessMode: e.target.value as 'read_write' | 'read_only' })}><option value="read_write">Read/write</option><option value="read_only">Read-only</option></select></Td>
-            <Td><PolicySelect value={u.canCreateProjectsOverride} onChange={(v) => updateAccount(u.id, { canCreateProjects: v })} /></Td>
-            <Td><PolicySelect value={u.canCreateGroupsOverride} onChange={(v) => updateAccount(u.id, { canCreateGroups: v })} /></Td>
+            <Td><Select variant="micro" aria-label={`Access mode for ${u.name}`} value={u.accessMode ?? 'read_write'} onChange={(e) => void updateAccount(u.id, { accessMode: e.target.value as 'read_write' | 'read_only' })}><option value="read_write">Read/write</option><option value="read_only">Read-only</option></Select></Td>
+            <Td><PolicySelect label={`Project creation policy for ${u.name}`} value={u.canCreateProjectsOverride} onChange={(v) => updateAccount(u.id, { canCreateProjects: v })} /></Td>
+            <Td><PolicySelect label={`Group creation policy for ${u.name}`} value={u.canCreateGroupsOverride} onChange={(v) => updateAccount(u.id, { canCreateGroups: v })} /></Td>
           </tr>)}</tbody>
         </table></div>
       </Section>
@@ -142,10 +143,10 @@ function AuthorizationSection() {
   );
 }
 
-function PolicySelect({ value, onChange }: { value?: number | null; onChange: (value: boolean | null) => Promise<void> }) {
-  return <select value={value == null ? 'inherit' : value ? 'allow' : 'deny'} onChange={(e) => void onChange(e.target.value === 'inherit' ? null : e.target.value === 'allow')}>
+function PolicySelect({ label, value, onChange }: { label: string; value?: number | null; onChange: (value: boolean | null) => Promise<void> }) {
+  return <Select variant="micro" aria-label={label} value={value == null ? 'inherit' : value ? 'allow' : 'deny'} onChange={(e) => void onChange(e.target.value === 'inherit' ? null : e.target.value === 'allow')}>
     <option value="inherit">Inherit default</option><option value="allow">Allow</option><option value="deny">Deny</option>
-  </select>;
+  </Select>;
 }
 
 /** Admin OAuth management (PLNR-160): every live connection instance-wide, revocable,

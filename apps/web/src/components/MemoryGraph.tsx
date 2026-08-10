@@ -331,7 +331,7 @@ export function MemoryGraph({ pid, store, initialSeedUri }: { pid: string; store
     <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
       <div style={{ flex: 'none', padding: '12px 16px', borderBottom: '1px solid var(--line)', display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
         <SectionLabel>Seed</SectionLabel>
-        <Select value={taskPick} onChange={(e) => { setTaskPick(e.target.value); if (e.target.value) goToSeed(buildEntityUri({ kind: 'task', id: e.target.value })); }} style={{ maxWidth: 220 }}>
+        <Select aria-label="Task seed" value={taskPick} onChange={(e) => { setTaskPick(e.target.value); if (e.target.value) goToSeed(buildEntityUri({ kind: 'task', id: e.target.value })); }} style={{ maxWidth: 220 }}>
           <option value="">pick a task…</option>
           {tasks.map((t) => <option key={t.id} value={t.id}>{t.key} — {t.title.slice(0, 40)}</option>)}
         </Select>

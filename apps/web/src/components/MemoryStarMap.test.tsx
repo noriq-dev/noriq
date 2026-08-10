@@ -196,7 +196,7 @@ describe('the accessible sampled catalogue', () => {
     act(() => listButton!.dispatchEvent(new MouseEvent('click', { bubbles: true })));
 
     expect(text()).toContain('Sampled entities · 2');
-    expect((container.querySelector('select[aria-label="entity ordering"]') as HTMLSelectElement).value).toBe('connected');
+    expect(container.querySelector('button[aria-label="entity ordering"]')?.textContent).toContain('most connected');
     const rows = [...container.querySelectorAll('ul[aria-label="Star map entities"] li')].map((row) => row.textContent);
     expect(rows).toEqual([expect.stringContaining('Connected first'), expect.stringContaining('Alphabetical first')]);
   });

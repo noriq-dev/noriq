@@ -169,7 +169,7 @@ function EditProjectModal({ store }: { store: AppStore }) {
             <div key={`${grant.principalType}:${grant.principalId}`} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0', borderBottom: '1px solid var(--w-05)' }}>
               <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)', width: 42 }}>{grant.principalType}</span>
               <span style={{ fontSize: 12, flex: 1 }}>{grant.principalName}</span>
-              <Select value={grant.role} onChange={async (e) => {
+              <Select aria-label={`Role for ${grant.principalName}`} value={grant.role} onChange={async (e) => {
                 await api.setProjectGrant(project.id, { principalType: grant.principalType, principalId: grant.principalId, role: e.target.value as typeof grant.role });
                 setAccess(await api.projectAccess(project.id));
               }} style={{ width: 130 }}>
@@ -182,14 +182,14 @@ function EditProjectModal({ store }: { store: AppStore }) {
             </div>
           ))}
           <div style={{ display: 'grid', gridTemplateColumns: '100px 1fr 130px auto', gap: 8, marginTop: 10 }}>
-            <Select value={principalType} onChange={(e) => { setPrincipalType(e.target.value as 'user' | 'group'); setPrincipalId(''); }}>
+            <Select aria-label="Grant principal type" value={principalType} onChange={(e) => { setPrincipalType(e.target.value as 'user' | 'group'); setPrincipalId(''); }}>
               <option value="user">User</option><option value="group">Group</option>
             </Select>
-            <Select value={principalId} onChange={(e) => setPrincipalId(e.target.value)}>
+            <Select aria-label={`Grant ${principalType}`} value={principalId} onChange={(e) => setPrincipalId(e.target.value)}>
               <option value="">Choose…</option>
               {(principalType === 'user' ? users : store.groups).map((entry) => <option key={entry.id} value={entry.id}>{entry.name}</option>)}
             </Select>
-            <Select value={grantRole} onChange={(e) => setGrantRole(e.target.value as typeof grantRole)}>
+            <Select aria-label="Grant role" value={grantRole} onChange={(e) => setGrantRole(e.target.value as typeof grantRole)}>
               <option value="viewer">Viewer</option><option value="contributor">Contributor</option><option value="manager">Manager</option>
             </Select>
             <Button disabled={!principalId} onClick={async () => {

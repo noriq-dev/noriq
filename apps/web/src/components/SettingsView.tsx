@@ -352,6 +352,7 @@ function GroupMembers({ store, groupId, callerRole }: { store: AppStore; groupId
           </span>
           {m.status === 'accepted' && (
             <Select
+              aria-label={`Role for ${m.name}`}
               value={m.role}
               disabled={callerRole !== 'owner' && m.role === 'owner'}
               onChange={async (e) => {
@@ -378,13 +379,13 @@ function GroupMembers({ store, groupId, callerRole }: { store: AppStore; groupId
         </div>
       ))}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-        <Select value={adding} onChange={(e) => setAdding(e.target.value)} style={{ flex: 1 }}>
+        <Select aria-label="Member to invite" value={adding} onChange={(e) => setAdding(e.target.value)} style={{ flex: 1 }}>
           <option value="">+ invite member…</option>
           {candidates.map((u) => (
             <option key={u.id} value={u.id}>{u.name} · {u.email}</option>
           ))}
         </Select>
-        <Select value={inviteRole} onChange={(e) => setInviteRole(e.target.value as typeof inviteRole)} style={{ width: 110 }}>
+        <Select aria-label="Invited member role" value={inviteRole} onChange={(e) => setInviteRole(e.target.value as typeof inviteRole)} style={{ width: 110 }}>
           <option value="member">Member</option><option value="manager">Manager</option>
           {callerRole === 'owner' && <option value="owner">Owner</option>}
         </Select>

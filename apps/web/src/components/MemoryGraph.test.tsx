@@ -39,10 +39,9 @@ const text = () => container.textContent ?? '';
 /** Advance past the panel's 200ms debounce before it fires the bounded fetch. */
 const tick = (ms = 0) => act(async () => { await new Promise((r) => setTimeout(r, ms)); });
 
-const setSelectValue = (select: HTMLSelectElement, value: string) => {
-  const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')!.set!;
-  setter.call(select, value);
-  select.dispatchEvent(new Event('change', { bubbles: true }));
+const setTaskSeed = (value: string) => {
+  act(() => container.querySelector<HTMLButtonElement>('button[aria-label="Task seed"]')!.click());
+  act(() => container.querySelector<HTMLElement>(`[role="option"][data-value="${value}"]`)!.click());
 };
 
 const findButton = (label: string) => [...container.querySelectorAll('button')].find((b) => b.textContent === label);
@@ -74,8 +73,7 @@ describe('bounded, cancellable expansion', () => {
     );
 
     mount(fakeStore([TASK]));
-    const select = container.querySelector('select') as HTMLSelectElement;
-    act(() => setSelectValue(select, TASK.id));
+    setTaskSeed(TASK.id);
     await tick(250);
 
     expect(dep).toHaveBeenCalledTimes(1);
@@ -108,7 +106,7 @@ describe('relationship filtering (PLNR-384)', () => {
   it('sends every shared edge type by default, an exact selected subset, and every type again after clear', async () => {
     const dep = vi.spyOn(api, 'memoryDependencyNeighborhood').mockResolvedValue(emptyResult);
     mount(fakeStore([TASK]));
-    act(() => setSelectValue(container.querySelector('select') as HTMLSelectElement, TASK.id));
+    setTaskSeed(TASK.id);
     await tick(250);
     expect(dep.mock.calls[0]![1].edgeTypes).toEqual([...MemoryEdgeType.options]);
 
@@ -155,8 +153,7 @@ describe('coverage.complete === false', () => {
     vi.spyOn(api, 'memoryDependencyNeighborhood').mockResolvedValue(result);
 
     mount(fakeStore([TASK]));
-    const select = container.querySelector('select') as HTMLSelectElement;
-    act(() => setSelectValue(select, TASK.id));
+    setTaskSeed(TASK.id);
     await tick(250);
 
     expect(text()).toContain('This graph cannot answer that yet');
@@ -179,8 +176,7 @@ describe('the textual fallback mode', () => {
     vi.spyOn(api, 'memoryDependencyNeighborhood').mockResolvedValue(result);
 
     mount(fakeStore([TASK]));
-    const select = container.querySelector('select') as HTMLSelectElement;
-    act(() => setSelectValue(select, TASK.id));
+    setTaskSeed(TASK.id);
     await tick(250);
 
     // Visual is the default landing mode.

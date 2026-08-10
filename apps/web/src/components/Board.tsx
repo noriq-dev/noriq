@@ -5,7 +5,7 @@ import type { AppStore } from '../store';
 import type { TaskStatus } from '../types';
 import { statusMeta } from '../design';
 import { AvatarChip, MonoTag } from './bits';
-import { Button } from './ui';
+import { Button, Select } from './ui';
 import { confirm, prompt } from './Dialog';
 
 const COLUMNS: Array<[TaskStatus, string]> = [
@@ -184,26 +184,26 @@ export function Board({ store }: { store: AppStore }) {
             multi-select: filter down, then shift-click + bulk act. */}
         {/* "at least this urgent" is now priority <= N (PLNR-231), and the any-sentinel is 5:
             0 is a real value (P0), so it can no longer stand for "no filter". */}
-        <FilterSelect value={String(prioFilter)} onChange={(v) => setPrioFilter(Number(v))} active={prioFilter < 5}>
+        <FilterSelect label="Priority filter" value={String(prioFilter)} onChange={(v) => setPrioFilter(Number(v))} active={prioFilter < 5}>
           <option value="5">priority: any</option>
           <option value="0">P0 only</option>
           <option value="1">P1 +</option>
           <option value="2">P2 +</option>
         </FilterSelect>
-        <FilterSelect value={typeFilter} onChange={setTypeFilter} active={typeFilter !== ''}>
+        <FilterSelect label="Task type filter" value={typeFilter} onChange={setTypeFilter} active={typeFilter !== ''}>
           <option value="">type: any</option>
           <option value="feature">feature</option>
           <option value="bug">bug</option>
           <option value="chore">chore</option>
           <option value="research">research</option>
         </FilterSelect>
-        <FilterSelect value={stateFilter} onChange={(v) => setStateFilter(v as typeof stateFilter)} active={stateFilter !== ''}>
+        <FilterSelect label="Task state filter" value={stateFilter} onChange={(v) => setStateFilter(v as typeof stateFilter)} active={stateFilter !== ''}>
           <option value="">state: any</option>
           <option value="unblocked">unblocked</option>
           <option value="grabbable">up for grabs</option>
           <option value="overdue">overdue</option>
         </FilterSelect>
-        <FilterSelect value={planFilter} onChange={(v) => setPlanFilter(v as typeof planFilter)} active={planFilter !== ''}>
+        <FilterSelect label="Plan filter" value={planFilter} onChange={(v) => setPlanFilter(v as typeof planFilter)} active={planFilter !== ''}>
           <option value="">plan: any</option>
           <option value="planned">in a plan</option>
           <option value="standalone">not in a plan</option>
@@ -555,18 +555,18 @@ function BulkBar({ count, milestones, boards, onStatus, onMilestone, onBoard, on
       <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--accent)', fontWeight: 700, whiteSpace: 'nowrap' }}>
         {count} selected
       </span>
-      <select style={sel} defaultValue="" onChange={(e) => e.target.value && onStatus(e.target.value as TaskStatus)}>
+      <Select variant="micro" aria-label="Set selected task status" style={sel} defaultValue="" onChange={(e) => e.target.value && onStatus(e.target.value as TaskStatus)}>
         <option value="" disabled>status…</option>
         {(['todo', 'review', 'done', 'cancelled'] as TaskStatus[]).map((s) => <option key={s} value={s}>{s}</option>)}
-      </select>
-      <select style={sel} defaultValue="" onChange={(e) => e.target.value && onMilestone(e.target.value)}>
+      </Select>
+      <Select variant="micro" aria-label="Set selected task milestone" style={sel} defaultValue="" onChange={(e) => e.target.value && onMilestone(e.target.value)}>
         <option value="" disabled>milestone…</option>
         {milestones.map((m) => <option key={m.id} value={m.id}>{m.title}</option>)}
-      </select>
-      <select style={sel} defaultValue="" onChange={(e) => e.target.value && onBoard(e.target.value)}>
+      </Select>
+      <Select variant="micro" aria-label="Set selected task board" style={sel} defaultValue="" onChange={(e) => e.target.value && onBoard(e.target.value)}>
         <option value="" disabled>board…</option>
         {boards.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
-      </select>
+      </Select>
       <button style={{ ...sel }} onClick={onAddTag}>+ tag</button>
       <button style={{ ...sel, color: 'var(--red-soft)' }} onClick={onArchive}>archive</button>
       <button style={{ ...sel, color: 'var(--text-dim)', border: 'none', background: 'transparent' }} onClick={onClear}>✕</button>
@@ -574,11 +574,13 @@ function BulkBar({ count, milestones, boards, onStatus, onMilestone, onBoard, on
   );
 }
 
-function FilterSelect({ value, onChange, active, children }: {
-  value: string; onChange: (v: string) => void; active: boolean; children: React.ReactNode;
+function FilterSelect({ label, value, onChange, active, children }: {
+  label: string; value: string; onChange: (v: string) => void; active: boolean; children: React.ReactNode;
 }) {
   return (
-    <select
+    <Select
+      variant="micro"
+      aria-label={label}
       value={value}
       onChange={(e) => onChange(e.target.value)}
       style={{
@@ -591,7 +593,7 @@ function FilterSelect({ value, onChange, active, children }: {
       }}
     >
       {children}
-    </select>
+    </Select>
   );
 }
 

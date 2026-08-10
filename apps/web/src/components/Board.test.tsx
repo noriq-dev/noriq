@@ -76,17 +76,12 @@ function mount() {
   act(() => root!.render(<Board store={store} />));
 }
 
-function planSelect(): HTMLSelectElement {
-  return [...container.querySelectorAll('select')].find((select) =>
-    [...select.options].some((option) => option.textContent === 'plan: any'),
-  )!;
-}
-
 function selectPlanFilter(value: 'planned' | 'standalone') {
-  const select = planSelect();
   act(() => {
-    select.value = value;
-    select.dispatchEvent(new Event('change', { bubbles: true }));
+    container.querySelector<HTMLButtonElement>('button[aria-label="Plan filter"]')!.click();
+  });
+  act(() => {
+    container.querySelector<HTMLElement>(`[role="option"][data-value="${value}"]`)!.click();
   });
 }
 

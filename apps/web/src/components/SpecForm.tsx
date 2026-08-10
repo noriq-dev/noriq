@@ -223,7 +223,7 @@ export function SpecForm({
           <>
             <div style={{ display: 'flex', gap: 5 }}>
               <TextInput value={f.path} placeholder="src/thing.ts" onChange={(e) => set({ path: e.target.value })} style={{ ...field, flex: 1 }} />
-              <Select value={f.change} onChange={(e) => set({ change: e.target.value as typeof f.change })} style={{ ...field, width: 92 }}>
+              <Select aria-label={`Change type for ${f.path || 'anticipated file'}`} value={f.change} onChange={(e) => set({ change: e.target.value as typeof f.change })} style={{ ...field, width: 92 }}>
                 <option value="create">create</option>
                 <option value="modify">modify</option>
                 <option value="delete">delete</option>

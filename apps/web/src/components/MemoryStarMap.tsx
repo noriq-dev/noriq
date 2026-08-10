@@ -936,7 +936,7 @@ function SearchBar({
         <option value="">any authority</option>
         {[5, 4, 3, 2, 1].map((n) => <option key={n} value={n}>min {n}/5</option>)}
       </Select>
-      <Select value={search.validity} onChange={(e) => onPatch({ validity: e.target.value })} style={{ width: 108 }}>
+      <Select aria-label="Memory validity" value={search.validity} onChange={(e) => onPatch({ validity: e.target.value })} style={{ width: 108 }}>
         <option value="">any validity</option>
         <option value="active">active</option>
         <option value="stale">stale</option>
@@ -950,7 +950,7 @@ function SearchBar({
       </button>
       {showMore && (
         <>
-          <Select value={search.repositoryKey} onChange={(e) => onPatch({ repositoryKey: e.target.value })} style={{ width: 150 }}>
+          <Select aria-label="Memory repository" value={search.repositoryKey} onChange={(e) => onPatch({ repositoryKey: e.target.value })} style={{ width: 150 }}>
             <option value="">any repository</option>
             {repositories.map((r) => <option key={r.id} value={r.repositoryKey}>{r.repositoryKey}</option>)}
           </Select>

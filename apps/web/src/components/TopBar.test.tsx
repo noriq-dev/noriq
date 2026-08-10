@@ -78,7 +78,7 @@ describe('compact project TopBar (PLNR-396)', () => {
     await tick();
 
     const groups = container.querySelector<HTMLElement>('nav[aria-label="View groups"]')!;
-    const triggers = [...groups.querySelectorAll<HTMLButtonElement>('button[aria-haspopup="menu"]')];
+    const triggers = [...groups.querySelectorAll<HTMLButtonElement>('button[aria-haspopup="listbox"]')];
     expect(triggers.map((button) => button.getAttribute('aria-label'))).toEqual([
       'Work views',
       'Operate views',
@@ -88,15 +88,15 @@ describe('compact project TopBar (PLNR-396)', () => {
     const knowledge = triggers.find((button) => button.getAttribute('aria-label') === 'Knowledge views')!;
     await act(async () => { knowledge.click(); });
 
-    const menu = groups.querySelector<HTMLElement>('[role="menu"][aria-label="Knowledge views"]')!;
-    const items = [...menu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
-    expect(items.map((button) => button.querySelector('span')?.textContent)).toEqual(['Docs', 'Memory']);
-    expect(menu.querySelector('[aria-current="page"]')?.textContent).toContain('Memory');
+    const menu = groups.querySelector<HTMLElement>('[role="listbox"][aria-label="Knowledge views"]')!;
+    const items = [...menu.querySelectorAll<HTMLElement>('[role="option"]')];
+    expect(items.map((item) => item.querySelector('span span')?.textContent)).toEqual(['Docs', 'Memory']);
+    expect(menu.querySelector('[aria-selected="true"]')?.textContent).toContain('Memory');
 
     const docs = items.find((button) => button.textContent?.includes('Docs'))!;
     await act(async () => { docs.click(); });
     expect(setView).toHaveBeenCalledWith('docs');
-    expect(groups.querySelector('[role="menu"]')).toBeNull();
+    expect(groups.querySelector('[role="listbox"]')).toBeNull();
   });
 
   it('shows only server-authored live actors, working first, and opens the Agents view', async () => {
