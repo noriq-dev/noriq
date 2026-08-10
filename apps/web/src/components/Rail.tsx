@@ -15,17 +15,9 @@ function loadCollapsed(): Record<string, boolean> {
   }
 }
 
-export function Rail({ store, open, onNavigate }: { store: AppStore; open?: boolean; onNavigate?: () => void }) {
+export function Rail({ store }: { store: AppStore }) {
   const { data, currentPid, actions: rawActions, groups } = store;
-  // Wrap navigation so tapping an item also closes the mobile slide-over.
-  const actions = {
-    ...rawActions,
-    goHome: () => { rawActions.goHome(); onNavigate?.(); },
-    selectProject: (id: string) => { rawActions.selectProject(id); onNavigate?.(); },
-    createProject: () => { rawActions.createProject(); onNavigate?.(); },
-    setView: (v: Parameters<typeof rawActions.setView>[0]) => { rawActions.setView(v); onNavigate?.(); },
-    openAdmin: () => { rawActions.openAdmin(); onNavigate?.(); },
-  };
+  const actions = rawActions;
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>(loadCollapsed);
   const ungrouped = data.projects.filter((p) => !p.groupId);
   const grouped = groups
@@ -42,7 +34,7 @@ export function Rail({ store, open, onNavigate }: { store: AppStore; open?: bool
 
   return (
     <div
-      className={`rail${open ? ' rail-open' : ''}`}
+      className="rail"
       style={{
         width: 216,
         flex: 'none',

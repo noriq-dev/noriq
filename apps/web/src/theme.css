@@ -142,20 +142,12 @@ button { all: unset; box-sizing: border-box; max-width: 100%; }
 .project-settings-grant-row { display: grid; grid-template-columns: 58px minmax(120px, 1fr) 145px auto; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--w-05); }
 .project-settings-grant-form { display: grid; grid-template-columns: 100px minmax(150px, 1fr) 145px auto; gap: 8px; margin-top: 12px; }
 
-@media (max-width: 860px) {
+@media (max-width: 767px) {
   .mobile-topbar {
     display: flex; align-items: center; gap: 10px; flex: none;
     height: 50px; padding: 0 12px 0 10px;
     border-bottom: 1px solid var(--line); background: var(--bg-rail);
   }
-
-  .rail {
-    position: fixed !important; top: 0; left: 0; bottom: 0; z-index: 80;
-    transform: translateX(-100%); transition: transform .22s ease;
-    box-shadow: 2px 0 30px rgba(0,0,0,.45);
-  }
-  .rail.rail-open { transform: none; }
-  .rail-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 75; }
 
   /* Mission Control 3-col + Agents 2-col → one scrollable column. */
   .mc-grid { display: block !important; overflow-y: auto !important; }
