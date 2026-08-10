@@ -288,12 +288,19 @@ export const api = {
 
   /** kind='copilot' is a different read, not a filter: copilots aren't project-local, so they
    *  scope to their owner and ignore projectId entirely (PLNR-156). */
-  agents: (projectId?: string, kind?: 'agent' | 'copilot') => {
+  agents: (projectId?: string, kind?: 'agent' | 'copilot', options: {
+    includeHistory?: boolean;
+    cursor?: string;
+    limit?: number;
+  } = {}) => {
     const q = new URLSearchParams();
     if (projectId && kind !== 'copilot') q.set('projectId', projectId);
     if (kind) q.set('kind', kind);
+    if (options.includeHistory) q.set('includeHistory', 'true');
+    if (options.cursor) q.set('cursor', options.cursor);
+    if (options.limit) q.set('limit', String(options.limit));
     const qs = q.toString();
-    return req<{ agents: ApiAgent[] }>('GET', qs ? `/api/agents?${qs}` : '/api/agents');
+    return req<ApiAgentRoster>('GET', qs ? `/api/agents?${qs}` : '/api/agents');
   },
   agentEvents: (aid: string) => req<{ events: ApiAgentEvent[] }>('GET', `/api/agents/${aid}/events`),
   revokeAgent: (aid: string) => req('POST', `/api/agents/${aid}/revoke`),
@@ -737,6 +744,8 @@ export interface ApiProject {
   ownerUserId: string | null;
   ownerName: string | null;
   agentCount: number;
+  liveAgentCount: number;
+  historicalAgentCount: number;
   /** Opt-in public read-only visibility (PLNR-78). */
   public: number;
   effectiveRole: 'owner' | 'manager' | 'contributor' | 'viewer' | null;
@@ -777,6 +786,15 @@ export interface ApiAgent {
   runnerId: string | null;
   role: string;
   status: string;
+  lifecycle: 'live' | 'recent' | 'dormant' | 'retired' | 'archived' | 'revoked';
+  live: boolean;
+  activityAt: string;
+  actorClass: string;
+  retiredAt: string | null;
+  retireReason: string | null;
+  archivedAt: string | null;
+  lineageStatus: 'complete' | 'partial' | 'unknown';
+  lineageReason: string | null;
   lastSeenAt: string | null;
   createdAt: string;
   heldTasks: number;
@@ -791,6 +809,20 @@ export interface ApiAgent {
    *  a token pointing at it. */
   projectId?: string | null;
   clientName?: string | null;
+}
+
+export interface ApiAgentRoster {
+  /** Compatibility array retained for older clients. */
+  agents: ApiAgent[];
+  counts: {
+    live: number;
+    recent: number;
+    historical: number;
+    total: number;
+    byLifecycle: Record<ApiAgent['lifecycle'], number>;
+  };
+  page: { limit: number; hasMore: boolean; nextCursor: string | null };
+  policy: { onlineSeconds: number; recentDays: number };
 }
 
 export interface ApiAgentEvent {

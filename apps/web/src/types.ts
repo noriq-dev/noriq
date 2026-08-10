@@ -30,6 +30,8 @@ export interface ProjectVM {
   doneTasks: number;
   ownerName?: string | null;
   agentCount?: number;
+  liveAgentCount?: number;
+  historicalAgentCount?: number;
   isPublic?: boolean;
   effectiveRole: 'owner' | 'manager' | 'contributor' | 'viewer' | null;
   accessSource: string;

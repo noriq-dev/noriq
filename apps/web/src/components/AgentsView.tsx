@@ -1,6 +1,6 @@
 // Agents — roster: agents self-register via OAuth; revoke and inspect activity here.
 import { useEffect, useState } from 'react';
-import { api, type ApiAgent, type ApiAgentEvent } from '../api';
+import { api, type ApiAgent, type ApiAgentEvent, type ApiAgentRoster } from '../api';
 import type { AppStore } from '../store';
 import { initials } from '../design';
 import { MonoTag, SectionLabel } from './bits';
@@ -28,20 +28,40 @@ export function AgentsView({ store }: { store: AppStore }) {
   const [agents, setAgents] = useState<ApiAgent[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [events, setEvents] = useState<ApiAgentEvent[]>([]);
+  const [counts, setCounts] = useState<ApiAgentRoster['counts'] | null>(null);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [showHistory, setShowHistory] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   // The two kinds have opposite lifecycles (RUN-43), so they get separate views rather than
   // one list that means two things. Agents are the project's runner-spawned processes;
   // copilots are YOUR sessions and aren't project-local at all (PLNR-156).
   const [kind, setKind] = useState<'agent' | 'copilot'>('agent');
   const isAdmin = store.user?.role === 'admin';
 
-  const load = () => api.agents(store.currentPid, kind).then((r) => setAgents(r.agents)).catch(() => {});
+  const load = () => api.agents(store.currentPid, kind, { includeHistory: showHistory }).then((r) => {
+    setAgents(r.agents);
+    setCounts(r.counts);
+    setNextCursor(r.page.nextCursor);
+  }).catch(() => {});
+  const loadMore = async () => {
+    if (!nextCursor || loadingMore) return;
+    setLoadingMore(true);
+    try {
+      const r = await api.agents(store.currentPid, kind, { includeHistory: showHistory, cursor: nextCursor });
+      setAgents((current) => [...current, ...r.agents]);
+      setCounts(r.counts);
+      setNextCursor(r.page.nextCursor);
+    } finally {
+      setLoadingMore(false);
+    }
+  };
   useEffect(() => {
     setSelected(null); // a selection from the other tab isn't in this list
     load();
     const iv = setInterval(load, 15000);
     return () => clearInterval(iv);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [store.modal, store.currentPid, kind]); // reload on project switch, tab switch, modal close
+  }, [store.modal, store.currentPid, kind, showHistory]); // reload on scope/filter changes
 
   useEffect(() => {
     if (selected) api.agentEvents(selected).then((r) => setEvents(r.events)).catch(() => setEvents([]));
@@ -56,7 +76,7 @@ export function AgentsView({ store }: { store: AppStore }) {
         <div style={{ maxWidth: 860, margin: '0 auto' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 14 }}>
             <SectionLabel>
-              {kind === 'agent' ? 'Agents' : 'Copilots'} · {agents.filter((a) => a.status !== 'revoked').length}
+              {kind === 'agent' ? 'Agents' : 'Copilots'} · {counts?.live ?? 0} live
             </SectionLabel>
             <div style={{ display: 'flex', gap: 2, padding: 2, borderRadius: 9, background: 'var(--w-02)', border: '1px solid var(--w-07)' }}>
               {(['agent', 'copilot'] as const).map((k) => (
@@ -75,6 +95,13 @@ export function AgentsView({ store }: { store: AppStore }) {
               ))}
             </div>
             <div style={{ flex: 1 }} />
+            <Button
+              variant={showHistory ? 'primary' : 'ghost'}
+              style={{ padding: '5px 10px', fontSize: 10 }}
+              onClick={() => setShowHistory((value) => !value)}
+            >
+              {showHistory ? 'hide history' : `history ${counts?.historical ?? 0}`}
+            </Button>
             <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>
               {kind === 'agent'
                 ? 'runner-spawned — one run each, pinned to this project'
@@ -84,8 +111,9 @@ export function AgentsView({ store }: { store: AppStore }) {
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             {agents.map((a) => {
-              const revoked = a.status === 'revoked';
-              const online = a.lastSeenAt !== null && Date.now() - new Date(a.lastSeenAt).getTime() < 5 * 60 * 1000;
+              const revoked = a.lifecycle === 'revoked';
+              const historical = ['dormant', 'retired', 'archived', 'revoked'].includes(a.lifecycle);
+              const online = a.live;
               // Copilots read as a tree: one named connection with its chats beneath it —
               // otherwise a busy day is a wall of anonymous rows, which is the thing PLNR-155
               // set out to fix. A session whose parent isn't in view (a token minted before
@@ -103,7 +131,7 @@ export function AgentsView({ store }: { store: AppStore }) {
                     borderLeft: isChild ? '2px solid var(--w-18)' : undefined,
                     background: selected === a.id ? 'var(--w-045)' : 'var(--w-02)',
                     border: `1px solid ${selected === a.id ? 'var(--w-18)' : 'var(--w-07)'}`,
-                    opacity: revoked ? 0.45 : 1,
+                    opacity: historical ? 0.5 : 1,
                   }}
                 >
                   <div style={{ position: 'relative', width: 34, height: 34, borderRadius: 9, background: colorOf(a), display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'var(--mono)', fontSize: 12, fontWeight: 700, color: '#0a0b0d' }}>
@@ -122,6 +150,8 @@ export function AgentsView({ store }: { store: AppStore }) {
                       )}
                       {a.role === 'orchestrator' && <MonoTag color="var(--accent)" bg="rgba(198,242,78,.12)" size={9}>ORCH</MonoTag>}
                       {revoked && <MonoTag color="var(--red-soft)" bg="rgba(255,92,92,.12)" size={9}>REVOKED</MonoTag>}
+                      {!revoked && a.lifecycle !== 'live' && <MonoTag color="var(--text-dim)" bg="rgba(255,255,255,.06)" size={9}>{a.lifecycle.toUpperCase()}</MonoTag>}
+                      {a.lineageStatus !== 'complete' && <MonoTag color="var(--amber)" bg="rgba(245,166,35,.10)" size={9}>LINEAGE {a.lineageStatus.toUpperCase()}</MonoTag>}
                     </div>
                     <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', marginTop: 2 }}>
                       {/* "last seen" means opposite things for the two kinds, so only one of
@@ -166,6 +196,11 @@ export function AgentsView({ store }: { store: AppStore }) {
               <div style={{ padding: 40, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-dim)' }}>
                 no agents yet — connect an MCP client via OAuth from the homepage
               </div>
+            )}
+            {nextCursor && (
+              <Button variant="ghost" disabled={loadingMore} onClick={loadMore} style={{ alignSelf: 'center', marginTop: 6 }}>
+                {loadingMore ? 'loading…' : 'load more'}
+              </Button>
             )}
           </div>
         </div>

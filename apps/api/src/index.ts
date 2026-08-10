@@ -52,6 +52,7 @@ import { normalizeVerificationReport } from './memory/verification';
 import { sweepPendingEpisodeJobs } from './memory/episodes';
 import { classifyAgentLifecycle } from './lib/agent-lifecycle';
 import { agentLifecycleSweepConfig, sweepAgentLifecycle, type AgentLifecycleCursor } from './lib/agent-lifecycle-sweep';
+import { AGENT_LIFECYCLES, listAgentRoster, type AgentRosterLifecycle } from './lib/agent-roster';
 import { AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget, isTerminalRunStatus, normalizeProjectKey, IndexGenerationManifest, ContextPackRole, type RunnerIndexCursor } from '@noriq-dev/shared';
 import { auditAuthorizationParity, reconcileLegacyGroupGrants } from './lib/authorization-parity';
 import { evaluateMemoryAcceptance } from './memory/acceptance';
@@ -728,15 +729,38 @@ app.get('/api/projects', userAuth, async (c) => {
             (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'in_progress') AS liveTasks,
             (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status NOT IN ('done','cancelled')) AS openTasks,
             (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) AS totalTasks,
-            (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'done') AS doneTasks,
-            (SELECT COUNT(*) FROM agents a WHERE a.project_id = p.id AND a.status != 'revoked') AS agentCount
+            (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'done') AS doneTasks
      FROM projects p LEFT JOIN users ou ON ou.id = p.owner_user_id`;
   const stmt = adminAll
     ? c.env.DB.prepare(`${select} WHERE p.status = 'active' ORDER BY p.created_at`)
     : c.env.DB.prepare(`${select} WHERE p.status = 'active' AND ${USER_PROJECT_WHERE} ORDER BY p.created_at`).bind(u.id);
-  const { results } = await stmt.all<Record<string, unknown> & { id: string }>();
+  const liveCutoff = new Date(Date.now() - agentLifecycleSweepConfig(c.env).onlineSeconds * 1_000).toISOString();
+  const countsStmt = c.env.DB.prepare(
+    `SELECT p.id,
+            SUM(CASE WHEN a.status != 'revoked' AND a.retired_at IS NULL AND a.archived_at IS NULL
+                      AND EXISTS (SELECT 1 FROM agent_presences ap
+                                   WHERE ap.actor_id = a.id AND ap.archived_at IS NULL
+                                     AND ap.state IN ('online','working') AND ap.last_seen_at >= ?2)
+                     THEN 1 ELSE 0 END) AS liveAgentCount,
+            COUNT(a.id) AS totalAgentCount
+       FROM projects p LEFT JOIN agents a ON a.project_id = p.id
+      WHERE p.status = 'active' AND ${adminAll ? '1 = 1' : USER_PROJECT_WHERE}
+      GROUP BY p.id`,
+  ).bind(adminAll ? '' : u.id, liveCutoff);
+  const [{ results }, { results: countRows }] = await Promise.all([
+    stmt.all<Record<string, unknown> & { id: string }>(),
+    countsStmt.all<{ id: string; liveAgentCount: number; totalAgentCount: number }>(),
+  ]);
+  const actorCounts = new Map(countRows.map((row) => [row.id, {
+    live: Number(row.liveAgentCount), total: Number(row.totalAgentCount),
+  }]));
   const projects = await Promise.all(results.map(async (project) => ({
     ...project,
+    // Compatibility: agentCount remains the dashboard's operational number, but now means
+    // genuinely live presence. History is explicit instead of silently inflating it.
+    agentCount: actorCounts.get(project.id)?.live ?? 0,
+    liveAgentCount: actorCounts.get(project.id)?.live ?? 0,
+    historicalAgentCount: (actorCounts.get(project.id)?.total ?? 0) - (actorCounts.get(project.id)?.live ?? 0),
     ...projectAccessFields(await resolveProjectAccess(c.env.DB, u.id, project.id, {
       allowAdminOverride: adminAll,
     })),
@@ -791,6 +815,7 @@ app.get('/api/public/projects/:pid/snapshot', async (c) => {
     'SELECT id, key, name, description, public FROM projects WHERE id = ? AND status = ?',
   ).bind(pid, 'active').first<{ id: string; key: string; name: string; description: string; public: number }>();
   if (!proj || !proj.public) return c.json({ error: 'not found' }, 404);
+  const agentLiveCutoff = new Date(Date.now() - agentLifecycleSweepConfig(c.env).onlineSeconds * 1_000).toISOString();
   const [tasks, deps, extDeps, agents, events, milestones, boards, plans, phases, phaseTasks, tags, taskTags] = await Promise.all([
     c.env.DB.prepare(
       `SELECT id, key, title, body,
@@ -812,8 +837,14 @@ app.get('/api/public/projects/:pid/snapshot', async (c) => {
        WHERE t.project_id = ?1 AND dt.project_id != ?1`,
     ).bind(pid).all(),
     c.env.DB.prepare(
-      "SELECT a.id, COALESCE(a.label, a.name) AS name, a.role, a.status FROM agents a WHERE a.project_id = ? AND a.status != 'revoked'",
-    ).bind(pid).all(),
+      `SELECT a.id, COALESCE(a.label, a.name) AS name, a.role, a.status, 'live' AS lifecycle
+         FROM agents a
+        WHERE a.project_id = ? AND a.status != 'revoked'
+          AND a.retired_at IS NULL AND a.archived_at IS NULL
+          AND EXISTS (SELECT 1 FROM agent_presences ap
+                       WHERE ap.actor_id = a.id AND ap.archived_at IS NULL
+                         AND ap.state IN ('online','working') AND ap.last_seen_at >= ?)`,
+    ).bind(pid, agentLiveCutoff).all(),
     c.env.DB.prepare(
       'SELECT id, seq, actor_kind AS actorKind, actor_id AS actorId, verb, subject_type AS subjectType, subject_id AS subjectId, payload, created_at AS createdAt FROM events WHERE project_id = ? ORDER BY seq DESC LIMIT 60',
     ).bind(pid).all(),
@@ -2689,26 +2720,36 @@ app.get('/api/agents', userAuth, async (c) => {
   // project-local — it roams, and a connection's copilot has project_id NULL by design
   // (PLNR-155) — so the project-scoped query below would return an empty list and read as
   // broken. Copilots scope to their OWNER instead: yours are yours to see, no admin needed.
-  if (c.req.query('kind') === 'copilot') {
+  const kind = c.req.query('kind');
+  if (kind !== undefined && kind !== 'agent' && kind !== 'copilot') return c.json({ error: 'kind must be agent or copilot' }, 400);
+  const lifecycleRaw = c.req.query('lifecycle');
+  if (lifecycleRaw !== undefined && !AGENT_LIFECYCLES.includes(lifecycleRaw as AgentRosterLifecycle)) {
+    return c.json({ error: `lifecycle must be one of: ${AGENT_LIFECYCLES.join(', ')}` }, 400);
+  }
+  const limitRaw = c.req.query('limit');
+  const limit = limitRaw === undefined ? undefined : Number(limitRaw);
+  if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) return c.json({ error: 'limit must be a positive integer' }, 400);
+  const rosterOptions = {
+    kind: kind as 'agent' | 'copilot' | undefined,
+    runnerId: c.req.query('runnerId'),
+    lifecycle: lifecycleRaw as AgentRosterLifecycle | undefined,
+    includeHistory: c.req.query('includeHistory') === 'true',
+    activeAfter: c.req.query('activeAfter'),
+    activeBefore: c.req.query('activeBefore'),
+    cursor: c.req.query('cursor'),
+    limit,
+  };
+  if (kind === 'copilot') {
     const isAdmin = c.var.user!.role === 'admin';
-    const stmt = c.env.DB.prepare(
-      `SELECT a.id, COALESCE(a.label, a.name) AS name, a.role, a.status, a.last_seen_at AS lastSeenAt,
-              a.created_at AS createdAt, a.kind, a.runner_id AS runnerId, a.project_id AS projectId,
-              a.parent_agent_id AS parentAgentId, u.name AS ownerName, u.id AS ownerUserId,
-              (SELECT COUNT(*) FROM tasks t WHERE t.claimed_by = a.id) AS heldTasks,
-              (SELECT COUNT(*) FROM claims cl WHERE cl.agent_id = a.id) AS totalClaims,
-              -- Which client authorized it; only a connection copilot has a token pointing at it.
-              (SELECT COALESCE(oc.name, 'MCP client') FROM oauth_tokens ot
-                 LEFT JOIN oauth_clients oc ON oc.id = ot.client_id
-                WHERE ot.copilot_id = a.id ORDER BY ot.expires_at DESC LIMIT 1) AS clientName
-         FROM agents a LEFT JOIN users u ON u.id = a.user_id
-        WHERE a.kind = 'copilot' AND a.status != 'revoked'${isAdmin ? '' : ' AND a.user_id = ?1'}
-        -- Group each connection copilot with its session children: same COALESCE key, parent
-        -- first (its own parent_agent_id is NULL), then children oldest-first.
-        ORDER BY COALESCE(a.parent_agent_id, a.id), a.parent_agent_id IS NOT NULL, a.created_at`,
-    );
-    const { results } = await (isAdmin ? stmt : stmt.bind(c.var.user!.id)).all();
-    return c.json({ agents: results });
+    try {
+      return c.json(await listAgentRoster(c.env, {
+        ...rosterOptions,
+        ownerUserId: isAdmin ? undefined : c.var.user!.id,
+        scopeAll: isAdmin,
+      }));
+    } catch (error) {
+      return c.json({ error: String(error instanceof Error ? error.message : error) }, 400);
+    }
   }
   // PLNR-97: the roster is per-project — a non-admin must be able to reach it; the
   // cross-project view (no projectId) stays admin-only.
@@ -2717,20 +2758,15 @@ app.get('/api/agents', userAuth, async (c) => {
   } else if (c.var.user!.role !== 'admin') {
     return c.json({ agents: [] });
   }
-  // ?kind=agent narrows the project roster to runner-spawned agents. Absent, the roster stays
-  // exactly as it was (both kinds), so nothing that already calls this changes shape.
-  const agentsOnly = c.req.query('kind') === 'agent' ? " AND a.kind = 'agent'" : '';
-  const where = (projectId ? 'WHERE a.project_id = ?' : 'WHERE a.project_id IS NOT NULL') + agentsOnly;
-  const stmt = c.env.DB.prepare(
-    `SELECT a.id, COALESCE(a.label, a.name) AS name, a.role, a.status, a.last_seen_at AS lastSeenAt, a.created_at AS createdAt,
-            a.kind, a.runner_id AS runnerId,
-            a.parent_agent_id AS parentAgentId, u.name AS ownerName, u.id AS ownerUserId,
-            (SELECT COUNT(*) FROM tasks t WHERE t.claimed_by = a.id) AS heldTasks,
-            (SELECT COUNT(*) FROM claims cl WHERE cl.agent_id = a.id) AS totalClaims
-     FROM agents a LEFT JOIN users u ON u.id = a.user_id ${where} ORDER BY a.created_at`,
-  );
-  const { results } = await (projectId ? stmt.bind(projectId) : stmt).all();
-  return c.json({ agents: results });
+  try {
+    return c.json(await listAgentRoster(c.env, {
+      ...rosterOptions,
+      projectId: projectId ?? undefined,
+      projectScopedOnly: !projectId,
+    }));
+  } catch (error) {
+    return c.json({ error: String(error instanceof Error ? error.message : error) }, 400);
+  }
 });
 
 app.get('/api/agents/:aid/events', userAuth, async (c) => {

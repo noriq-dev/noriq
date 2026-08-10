@@ -203,6 +203,8 @@ export function useAppStore() {
     doneTasks: p.doneTasks,
     ownerName: p.ownerName,
     agentCount: p.agentCount,
+    liveAgentCount: p.liveAgentCount,
+    historicalAgentCount: p.historicalAgentCount,
     isPublic: !!p.public,
     effectiveRole: p.effectiveRole,
     accessSource: p.accessSource,

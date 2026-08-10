@@ -43,6 +43,7 @@ import {
   userCanCreateProject,
   type ProjectAction,
 } from './lib/authorization';
+import { AGENT_LIFECYCLES, listAgentRoster } from './lib/agent-roster';
 
 const MAX_ATTACHMENT = 100 * 1024 * 1024;
 
@@ -736,24 +737,34 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'list_agents',
-    'Who else is on this project: active agents with role/kind, parent attribution (sub-agents), liveness, and the tasks each one holds right now. Use it to coordinate — find the orchestrator, see who owns what, resolve a name to the agent id that send_message needs. `you` marks your own entry.',
-    { projectId: z.string(), includeRevoked: z.boolean().optional().describe('Also list revoked agents (default false)') },
-    tool(async ({ projectId, includeRevoked }) => {
-      const [{ results: agents }, { results: heldRows }] = await Promise.all([
-        env.DB.prepare(
-          `SELECT a.id, COALESCE(a.label, a.name) AS name, a.role, a.kind, a.status,
-                  a.parent_agent_id AS parentAgentId, a.last_seen_at AS lastSeenAt
-           FROM agents a WHERE a.project_id = ?${includeRevoked ? '' : " AND a.status != 'revoked'"}
-           ORDER BY a.created_at`,
-        ).bind(projectId).all<{ id: string; name: string; role: string; kind: string; status: string; parentAgentId: string | null; lastSeenAt: string | null }>(),
-        env.DB.prepare(
-          'SELECT t.claimed_by AS agentId, t.key, t.title, t.status FROM tasks t WHERE t.project_id = ? AND t.claimed_by IS NOT NULL',
-        ).bind(projectId).all<{ agentId: string; key: string; title: string; status: string }>(),
-      ]);
+    'Who else is live or recently active on this project: agents with role/kind, explicit presence-derived lifecycle, lineage completeness, parent attribution, and held work. Defaults to a bounded live/recent page; use lifecycle/includeHistory and the returned cursor to inspect history. `you` marks your own entry.',
+    {
+      projectId: z.string(),
+      includeRevoked: z.boolean().optional().describe('Legacy alias: include all history (prefer includeHistory/lifecycle)'),
+      includeHistory: z.boolean().optional().describe('Include dormant, retired, archived and revoked actors'),
+      lifecycle: z.enum(AGENT_LIFECYCLES).optional(),
+      kind: z.enum(['agent', 'copilot']).optional(),
+      runnerId: z.string().optional(),
+      activeAfter: z.string().datetime().optional(),
+      activeBefore: z.string().datetime().optional(),
+      cursor: z.string().optional(),
+      limit: z.number().int().min(1).max(100).optional(),
+    },
+    tool(async ({ projectId, includeRevoked, includeHistory, lifecycle, kind, runnerId, activeAfter, activeBefore, cursor, limit }) => {
+      const roster = await listAgentRoster(env, {
+        projectId, includeHistory: includeHistory || includeRevoked, lifecycle, kind, runnerId,
+        activeAfter, activeBefore, cursor, limit,
+      });
+      const ids = roster.agents.map((a) => a.id);
+      const heldRows = ids.length ? (await env.DB.prepare(
+        `SELECT t.claimed_by AS agentId, t.key, t.title, t.status FROM tasks t
+          WHERE t.project_id = ? AND t.claimed_by IN (${ids.map(() => '?').join(',')})`,
+      ).bind(projectId, ...ids).all<{ agentId: string; key: string; title: string; status: string }>()).results : [];
       const held = new Map<string, Array<{ key: string; title: string; status: string }>>();
       for (const h of heldRows) held.set(h.agentId, [...(held.get(h.agentId) ?? []), { key: h.key, title: h.title, status: h.status }]);
       return {
-        agents: agents.map((a) => ({ ...a, you: a.id === agent.id, heldTasks: held.get(a.id) ?? [] })),
+        ...roster,
+        agents: roster.agents.map((a) => ({ ...a, you: a.id === agent.id, heldTaskCount: a.heldTasks, heldTasks: held.get(a.id) ?? [] })),
       };
     }),
   );
