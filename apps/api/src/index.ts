@@ -49,6 +49,7 @@ import {
 import { renderEvidenceFrame, type EvidenceFrameItem } from './memory/evidence-frame';
 import { assembleContextPack } from './memory/context-pack';
 import { assessPreDispatchRisk } from './memory/scope-risk';
+import { assessProjectBottlenecks, BOTTLENECK_TASK_LIMIT } from './memory/bottlenecks';
 import { readBoundedBody, verifyBatchChecksum, decodeBatchRows, MAX_INGEST_BATCH_BYTES, INGEST_TOKEN_TTL_SECONDS } from './memory/ingest';
 import { normalizeVerificationReport } from './memory/verification';
 import { sweepPendingEpisodeJobs } from './memory/episodes';
@@ -1770,6 +1771,28 @@ app.post('/api/projects/:pid/memory/pre-dispatch-risk', userAuth, async (c) => {
     .bind(parsed.data.taskId, parsed.data.taskId, pid).first<{ id: string }>();
   if (!task) return c.json({ error: 'not found' }, 404);
   return c.json(await assessPreDispatchRisk(c.env, pid, task.id, parsed.data));
+});
+
+// PLNR-296: read-only current collision/readiness/capacity evidence. Like the pre-dispatch report,
+// this route cannot claim, dispatch, lock, alter a gate, or change a Runner's capacity.
+app.post('/api/projects/:pid/memory/bottlenecks', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const parsed = z.object({
+    taskId: z.string().min(1).nullable().optional(),
+    repositoryKey: z.string().min(1).nullable().optional(),
+    branch: z.string().min(1).nullable().optional(),
+    baseId: z.string().min(1).nullable().optional(),
+    taskLimit: z.number().int().min(1).max(BOTTLENECK_TASK_LIMIT).optional(),
+  }).strict().safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid bottleneck request', detail: parsed.error.issues }, 400);
+  let taskId: string | null = null;
+  if (parsed.data.taskId) {
+    const task = await c.env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+      .bind(parsed.data.taskId, parsed.data.taskId, pid).first<{ id: string }>();
+    if (!task) return c.json({ error: 'not found' }, 404);
+    taskId = task.id;
+  }
+  return c.json(await assessProjectBottlenecks(c.env, pid, { ...parsed.data, taskId }));
 });
 
 // Production acceptance gate (PLNR-346). This is intentionally a viewer-safe read: it gathers
