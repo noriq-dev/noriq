@@ -10,7 +10,11 @@ import { Button } from './ui';
 import { Markdown } from './Markdown';
 
 const KIND_COLOR: Record<ApiAskSource['kind'], string> = {
+  project: 'var(--text-mid)',
   task: 'var(--blue)',
+  run: 'var(--cyan, #67e8f9)',
+  signal: 'var(--red, #f87171)',
+  comment: 'var(--text-mid)',
   doc: 'var(--green, var(--accent-ink))',
   plan: 'var(--amber)',
   memory: 'var(--purple, #a78bfa)',
@@ -362,10 +366,11 @@ export function AskView({ store }: { store: AppStore }) {
       sessionStorage.setItem('noriq.openDoc', source.id);
       actions.setView('docs');
     } else if (source.kind === 'plan') actions.setView('plans');
-    else {
+    else if (source.kind === 'memory' || source.kind === 'episode') {
       if (source.kind === 'memory') sessionStorage.setItem('noriq.openMemory', source.id);
       actions.setView('memory');
-    }
+    } else if (source.kind === 'run') actions.setView('runs');
+    else if (source.kind === 'signal') actions.setView('control');
   };
 
   const visibleThreads = showArchived ? archivedThreads : threads;

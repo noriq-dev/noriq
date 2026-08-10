@@ -19,7 +19,7 @@ import {
   AskModelConfigurationError, AskModelSelectionError, askModelCatalog, resolveAskModel,
 } from '../src/ask-models';
 import {
-  MAX_ASK_TOOL_CALLS, extractAskToolCalls, finalAskMessages, runAskToolLoop, type AskTool,
+  MAX_ASK_TOOL_CALLS, createAskReadTools, extractAskToolCalls, finalAskMessages, runAskToolLoop, type AskTool,
 } from '../src/ask-tools';
 
 /** Fake generation client: records the prompts it saw, returns a canned answer. */
@@ -250,6 +250,9 @@ describe('Workers AI response adapters', () => {
 
 let agent: { id: string; apiKey: string };
 let projectId: string;
+let taskId: string;
+let reviewTaskId: string;
+let blockedTaskId: string;
 let cookie: string;
 let otherCookie: string;
 
@@ -262,6 +265,20 @@ beforeAll(async () => {
   const task = await mcpCall(agent.apiKey, 'create_task', {
     projectId, title: 'implement payment retry backoff', tags: ['payments'], body: 'Exponential backoff on PSP timeouts.',
   });
+  taskId = task.body.id;
+  reviewTaskId = (await mcpCall(agent.apiKey, 'create_task', {
+    projectId, title: 'review the Ask evidence contract', tags: ['ask'], body: 'Confirm stored requirements and references.',
+    executionSpec: { acceptance: { observableTruths: ['References are exact and scoped.'] } },
+  })).body.id;
+  blockedTaskId = (await mcpCall(agent.apiKey, 'create_task', {
+    projectId, title: 'waiting without an input signal', tags: ['ask'], body: 'Blocked on an external prerequisite.',
+  })).body.id;
+  await env.DB.prepare("UPDATE tasks SET status = 'in_progress', claimed_by = ?, updated_at = ? WHERE id = ?")
+    .bind(agent.id, new Date().toISOString(), taskId).run();
+  await env.DB.prepare("UPDATE tasks SET status = 'review', updated_at = ? WHERE id = ?")
+    .bind(new Date().toISOString(), reviewTaskId).run();
+  await env.DB.prepare("UPDATE tasks SET status = 'blocked', updated_at = ? WHERE id = ?")
+    .bind(new Date().toISOString(), blockedTaskId).run();
   // description is what the search snippet shows; the retry detail lives only in the BODY —
   // so seeing it in the prompt proves we re-read the fuller body, not just the snippet.
   const doc = await mcpCall(agent.apiKey, 'create_doc', {
@@ -278,7 +295,64 @@ beforeAll(async () => {
     kind: 'decision',
     statement: 'Quasar fallback mode keeps payment retries below three attempts during provider brownouts.',
   });
+  await mcpCall(agent.apiKey, 'create_plan', {
+    projectId, title: 'Ask evidence rollout', description: 'Exercise plan reads',
+    phases: [{ title: 'Read surfaces', newTasks: [{ title: 'Document Ask status tools', tags: ['ask'] }] }],
+  });
 }, 60000);
+
+describe('Ask workspace read catalog', () => {
+  it('reports live ongoing/review work and drills into task, docs, plans, and review evidence', async () => {
+    const owner = await env.DB.prepare('SELECT owner_user_id AS id FROM projects WHERE id = ?')
+      .bind(projectId).first<{ id: string }>();
+    const tools = createAskReadTools(env as unknown as Env, { userId: owner!.id }, [{ id: projectId, key: 'ASK', name: 'askable' }]);
+    expect(tools.map((tool) => tool.name)).toEqual(expect.arrayContaining([
+      'workspace_status', 'search_tasks', 'get_task', 'get_task_context', 'search_noriq',
+      'workspace_memory', 'workspace_docs', 'workspace_plans', 'workspace_review',
+    ]));
+
+    const status = JSON.parse((await tools.find((tool) => tool.name === 'workspace_status')!.execute({ projectId })).content);
+    expect(status.executing.items).toEqual(expect.arrayContaining([expect.objectContaining({ id: taskId, status: 'in_progress' })]));
+    expect(status.review.items).toEqual(expect.arrayContaining([expect.objectContaining({ id: reviewTaskId, status: 'review' })]));
+    expect(status.waiting.items).toEqual(expect.arrayContaining([expect.objectContaining({ id: blockedTaskId, kind: 'task', status: 'blocked' })]));
+    expect(status.references).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: taskId, citation: expect.stringMatching(/^ASK \/ ASK-/) }),
+    ]));
+    expect(status.asOf).toMatch(/^\d{4}-/);
+
+    const detail = JSON.parse((await tools.find((tool) => tool.name === 'get_task')!.execute({ taskId: reviewTaskId })).content);
+    expect(detail.task.executionSpec.acceptance.observableTruths).toContain('References are exact and scoped.');
+    expect(detail.commentsReturned).toBeLessThanOrEqual(40);
+    const context = JSON.parse((await tools.find((tool) => tool.name === 'get_task_context')!.execute({ taskId: reviewTaskId, budgetTokens: 300 })).content);
+    expect(context.taskFacts).toEqual(expect.objectContaining({ taskId: reviewTaskId, status: 'review' }));
+    expect(context.sections).toBeInstanceOf(Array);
+
+    const memory = JSON.parse((await tools.find((tool) => tool.name === 'workspace_memory')!.execute({
+      projectId, query: 'quasar provider brownouts',
+    })).content);
+    expect(memory.results).toEqual(expect.arrayContaining([expect.objectContaining({ entityType: 'memory' })]));
+    expect(memory.references).toEqual(expect.arrayContaining([expect.objectContaining({ kind: 'memory', projectId })]));
+
+    const docs = JSON.parse((await tools.find((tool) => tool.name === 'workspace_docs')!.execute({ projectId, limit: 1 })).content);
+    expect(docs.matched).toBeGreaterThanOrEqual(docs.returned);
+    expect(docs.references[0]).toEqual(expect.objectContaining({ kind: 'doc', projectId }));
+    const plans = JSON.parse((await tools.find((tool) => tool.name === 'workspace_plans')!.execute({ projectId, limit: 1 })).content);
+    expect(plans.plans[0].phases).toBeInstanceOf(Array);
+    expect(plans.references[0]).toEqual(expect.objectContaining({ kind: 'plan', projectId }));
+
+    const review = JSON.parse((await tools.find((tool) => tool.name === 'workspace_review')!.execute({ projectId })).content);
+    expect(review.tasks.items).toEqual(expect.arrayContaining([expect.objectContaining({ id: reviewTaskId })]));
+    expect(review.scopeNote).toMatch(/no repository checkout or diff/i);
+  });
+
+  it('does not expose another user\'s project through live read tools', async () => {
+    const other = await createUser('ask-reader-scope@example.com', 'Ask Scoped Reader', 'longenough1');
+    const tools = createAskReadTools(env as unknown as Env, { userId: other.id }, [{ id: projectId, key: 'ASK', name: 'askable' }]);
+    const status = JSON.parse((await tools.find((tool) => tool.name === 'workspace_status')!.execute({})).content);
+    expect(status.projects).toEqual([]);
+    await expect(tools.find((tool) => tool.name === 'get_task')!.execute({ taskId })).rejects.toThrow(/not found/i);
+  });
+});
 
 describe('answerQuestion (retrieval + fake generation)', () => {
   it('grounds the prompt on retrieved material, hydrates fuller bodies, and returns sources', async () => {

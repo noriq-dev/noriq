@@ -1020,7 +1020,7 @@ export interface ApiAskHistoryMessage {
 
 /** One cross-project grounding source behind a global /ask answer. */
 export interface ApiAskSource {
-  kind: 'task' | 'doc' | 'plan' | 'memory' | 'episode';
+  kind: 'project' | 'task' | 'run' | 'signal' | 'comment' | 'doc' | 'plan' | 'memory' | 'episode';
   id: string;
   key?: string;
   title: string;
@@ -1036,7 +1036,9 @@ export interface ApiAskSource {
   historical?: boolean;
   graphPath?: string;
   evidenceVerifiedForCaller?: Array<boolean | null>;
-  retrieval: 'semantic' | 'keyword' | 'graph' | 'hybrid';
+  citation?: string;
+  updatedAt?: string;
+  retrieval: 'semantic' | 'keyword' | 'graph' | 'hybrid' | 'live';
 }
 
 export interface ApiAskThread {

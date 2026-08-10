@@ -1,12 +1,12 @@
 import type { Env } from './env';
-import { askOutputTokenLimit, buildMessages, consumeAskGeneration, searchAskWorkspace, streamingGenerationClient, type AskProject, type PreparedAsk } from './ask';
+import { askOutputTokenLimit, buildMessages, consumeAskGeneration, streamingGenerationClient, type AskProject, type PreparedAsk } from './ask';
 import {
   ASK_GENERATION_CANCELLED, completeAskGeneration, failAskGeneration, getAskGeneration, updateAskGeneration,
   type StoredAskGeneration,
 } from './ask-chats';
 import { listWorkspaceProjects } from './lib/workspace-operations';
 import { resolveAskModel } from './ask-models';
-import { askToolDecisionClient, finalAskMessages, runAskToolLoop, type AskTool } from './ask-tools';
+import { askToolDecisionClient, createAskReadTools, finalAskMessages, runAskToolLoop } from './ask-tools';
 
 const encoder = new TextEncoder();
 const frame = (event: string, data: unknown): Uint8Array =>
@@ -59,26 +59,7 @@ export async function runAskGeneration(env: Env, generationId: string): Promise<
     const projects = await accessibleAskProjectsForUser(env, generation.userId);
     const decision = askToolDecisionClient(env, model.id);
     if (!decision) throw new Error('no AI backend — asking questions requires the Workers AI (AI) binding');
-    const tools: AskTool[] = [{
-      name: 'search_noriq',
-      description: 'Search the user\'s accessible Noriq tasks, plans, docs, memories, episodes, and knowledge-graph connections for current or private workspace evidence. Use focused queries; call again only when a distinct question remains.',
-      inputSchema: {
-        type: 'object',
-        properties: { query: { type: 'string', description: 'Focused semantic query for the needed workspace evidence.' } },
-        required: ['query'],
-        additionalProperties: false,
-      },
-      execute: async (arguments_) => {
-        const query = typeof arguments_.query === 'string' ? arguments_.query.trim().slice(0, 4000) : '';
-        if (!query) throw new Error('query is required');
-        const result = await searchAskWorkspace(env, query, projects);
-        const projectCount = new Set(result.sources.map((source) => source.projectId)).size;
-        return {
-          ...result,
-          summary: `Ask searched Noriq and selected ${result.sources.length} ${result.mode}${result.graphEnhanced ? ' + graph' : ''} source${result.sources.length === 1 ? '' : 's'} across ${projectCount} project${projectCount === 1 ? '' : 's'}.`,
-        };
-      },
-    }];
+    const tools = createAskReadTools(env, { userId: generation.userId }, projects);
     const loop = await runAskToolLoop(
       decision,
       buildMessages(generation.question, projects, [], generation.history, false),

@@ -1,5 +1,10 @@
 import type { Env } from './env';
-import type { AskSource, ChatMessage } from './ask';
+import { searchAskWorkspace, type AskProject, type AskSource, type ChatMessage } from './ask';
+import {
+  listWorkspaceProjects, searchWorkspaceTasks, workspaceDocs, workspaceMemory, workspacePlans, workspaceReview,
+  workspaceStatus, workspaceTaskContext, workspaceTaskDetail,
+  type WorkspaceReference, type WorkspaceScope,
+} from './lib/workspace-operations';
 
 export const MAX_ASK_TOOL_ROUNDS = 4;
 export const MAX_ASK_TOOL_CALLS = 6;
@@ -118,6 +123,200 @@ export function askToolDefinitions(tools: AskTool[]): JsonObject[] {
       parameters: tool.inputSchema,
     },
   }));
+}
+
+const jsonResult = (value: unknown): string => JSON.stringify(value, null, 2);
+
+const referenceSources = (references: WorkspaceReference[]): AskSource[] => references.map((item) => ({
+  kind: item.kind,
+  id: item.id,
+  key: item.key,
+  title: item.title,
+  status: item.status,
+  score: 1,
+  projectId: item.projectId,
+  projectKey: item.projectKey,
+  projectName: item.projectName,
+  historical: item.kind === 'task' && (item.status === 'done' || item.status === 'cancelled'),
+  citation: item.citation,
+  updatedAt: item.updatedAt,
+  retrieval: 'live',
+}));
+
+const optionalString = (value: unknown): string | undefined => typeof value === 'string' && value.trim() ? value.trim() : undefined;
+const optionalNumber = (value: unknown): number | undefined => typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+
+/** The explicit human Ask read catalog. It is intentionally independent from MCP registration. */
+export function createAskReadTools(env: Env, scope: WorkspaceScope, projects: AskProject[]): AskTool[] {
+  const projectsById = new Map(projects.map((project) => [project.id, project]));
+  return [
+    {
+      name: 'workspace_status',
+      description: 'Get live ongoing work across accessible projects: executing or claimed tasks, active runs, blocking input/alerts, and task/plan items awaiting human review. Use this for “current work”, “what is ongoing”, “what needs attention”, or workspace-wide status; do not substitute semantic search.',
+      inputSchema: {
+        type: 'object', properties: {
+          projectId: { type: 'string', description: 'Optional accessible project id to restrict the aggregate.' },
+          limit: { type: 'integer', minimum: 1, maximum: 80, description: 'Per-section result cap; default 40.' },
+        }, additionalProperties: false,
+      },
+      execute: async (args) => {
+        const result = await workspaceStatus(env, scope, { projectId: optionalString(args.projectId), limit: optionalNumber(args.limit) });
+        return {
+          content: jsonResult(result), sources: referenceSources(result.references),
+          summary: `Ask read live workspace status: ${result.executing.returned} executing, ${result.runs.returned} runs, ${result.waiting.returned} waiting, ${result.review.returned} awaiting review.`,
+        };
+      },
+    },
+    {
+      name: 'search_tasks',
+      description: 'Filter live tasks by structured attributes. Use after workspace_status or semantic discovery to drill into status, project, type, tag, holder, due state, or exact text. Matched/returned fields reveal truncation.',
+      inputSchema: {
+        type: 'object', properties: {
+          projectId: { type: 'string' }, status: { type: 'string' }, type: { type: 'string' }, tag: { type: 'string' },
+          milestoneId: { type: 'string' }, holder: { type: 'string', description: 'Agent id or none.' }, text: { type: 'string' },
+          overdue: { type: 'boolean' }, includeArchived: { type: 'boolean' }, limit: { type: 'integer', minimum: 1, maximum: 100 },
+        }, additionalProperties: false,
+      },
+      execute: async (args) => {
+        const result = await searchWorkspaceTasks(env, scope, {
+          projectId: optionalString(args.projectId), status: optionalString(args.status), type: optionalString(args.type),
+          tag: optionalString(args.tag), milestoneId: optionalString(args.milestoneId), holder: optionalString(args.holder),
+          text: optionalString(args.text), overdue: args.overdue === true, includeArchived: args.includeArchived === true,
+          limit: optionalNumber(args.limit),
+        });
+        const references: WorkspaceReference[] = result.tasks.flatMap((task) => {
+          const record = task as Record<string, unknown>;
+          const project = projectsById.get(String(record.projectId));
+          return project ? [{
+            kind: 'task', id: String(record.id), key: String(record.key), title: String(record.title),
+            projectId: project.id, projectKey: project.key, projectName: project.name,
+            status: String(record.status), updatedAt: String(record.updatedAt), citation: `${project.key} / ${record.key}`,
+          }] : [];
+        });
+        return {
+          content: jsonResult({ ...result, capped: result.matched > result.returned, references }),
+          sources: referenceSources(references),
+          summary: `Ask filtered tasks and returned ${result.returned} of ${result.matched} matches.`,
+        };
+      },
+    },
+    {
+      name: 'get_task',
+      description: 'Read one accessible task by id or display key with current status, body, acceptance/execution spec, comments, refs, signals, related docs, dependencies, and runs. Use identifiers returned by another tool.',
+      inputSchema: { type: 'object', properties: { taskId: { type: 'string' } }, required: ['taskId'], additionalProperties: false },
+      execute: async (args) => {
+        const taskId = optionalString(args.taskId);
+        if (!taskId) throw new Error('taskId is required');
+        const result = await workspaceTaskDetail(env, scope, taskId);
+        return { content: jsonResult(result), sources: referenceSources(result.references), summary: `Ask read task ${String(result.task.key)} and its stored review/context evidence.` };
+      },
+    },
+    {
+      name: 'get_task_context',
+      description: 'Assemble one bounded task-aware context pack: required task facts, decisions, hazards, failed approaches, related memory, prior effort, graph coverage, tests, neighboring work, uncertainty, and evidence provenance. Empty sections with an unanswerable notice are not negative evidence.',
+      inputSchema: {
+        type: 'object', properties: {
+          taskId: { type: 'string' }, repositoryKey: { type: 'string' }, branch: { type: 'string' }, baseId: { type: 'string' },
+          budgetTokens: { type: 'integer', minimum: 1, maximum: 6000 },
+        }, required: ['taskId'], additionalProperties: false,
+      },
+      execute: async (args) => {
+        const taskId = optionalString(args.taskId);
+        if (!taskId) throw new Error('taskId is required');
+        const result = await workspaceTaskContext(env, scope, {
+          taskId, repositoryKey: optionalString(args.repositoryKey), branch: optionalString(args.branch),
+          baseId: optionalString(args.baseId), budgetTokens: optionalNumber(args.budgetTokens),
+        });
+        return { content: jsonResult(result), sources: referenceSources(result.references), summary: `Ask assembled bounded context for task ${result.taskFacts.key}.` };
+      },
+    },
+    {
+      name: 'search_noriq',
+      description: 'Search accessible Noriq tasks, plans, docs, memories, episodes, and graph connections by meaning. Use for discovery or project knowledge, not for live “ongoing work” status (use workspace_status).',
+      inputSchema: {
+        type: 'object', properties: { query: { type: 'string', description: 'Focused semantic query.' } },
+        required: ['query'], additionalProperties: false,
+      },
+      execute: async (args) => {
+        const query = optionalString(args.query)?.slice(0, 4000);
+        if (!query) throw new Error('query is required');
+        const scopedProjects = await listWorkspaceProjects(env, scope);
+        const result = await searchAskWorkspace(env, query, scopedProjects);
+        const projectCount = new Set(result.sources.map((source) => source.projectId)).size;
+        return {
+          content: result.content, sources: result.sources, mode: result.mode, graphEnhanced: result.graphEnhanced,
+          summary: `Ask searched Noriq and selected ${result.sources.length} ${result.mode}${result.graphEnhanced ? ' + graph' : ''} source${result.sources.length === 1 ? '' : 's'} across ${projectCount} project${projectCount === 1 ? '' : 's'}.`,
+        };
+      },
+    },
+    {
+      name: 'workspace_memory',
+      description: 'Search canonical project memory in one accessible project with authority, validity, lead reasons, and evidence. Use after a project or task reference is known. Low-authority, stale, invalid, or unverified items are leads rather than settled truth.',
+      inputSchema: {
+        type: 'object', properties: {
+          projectId: { type: 'string' }, query: { type: 'string' }, kind: { type: 'string' },
+          minAuthority: { type: 'integer', minimum: 1, maximum: 5 }, validity: { type: 'string' },
+          limit: { type: 'integer', minimum: 1, maximum: 20 },
+        }, required: ['projectId', 'query'], additionalProperties: false,
+      },
+      execute: async (args) => {
+        const projectId = optionalString(args.projectId); const query = optionalString(args.query);
+        if (!projectId || !query) throw new Error('projectId and query are required');
+        const result = await workspaceMemory(env, scope, {
+          projectId, query, kind: optionalString(args.kind), minAuthority: optionalNumber(args.minAuthority),
+          validity: optionalString(args.validity), limit: optionalNumber(args.limit),
+        });
+        return { content: jsonResult(result), sources: referenceSources(result.references), mode: result.mode, summary: `Ask read ${result.returned} project-memory result${result.returned === 1 ? '' : 's'} from ${result.project.key}.` };
+      },
+    },
+    {
+      name: 'workspace_docs',
+      description: 'List or read accessible settled project documents. Pass docId for one exact body; otherwise filter by projectId and/or text. Results report matched/returned coverage.',
+      inputSchema: {
+        type: 'object', properties: {
+          projectId: { type: 'string' }, docId: { type: 'string' }, text: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 40 },
+        }, additionalProperties: false,
+      },
+      execute: async (args) => {
+        const result = await workspaceDocs(env, scope, {
+          projectId: optionalString(args.projectId), docId: optionalString(args.docId), text: optionalString(args.text), limit: optionalNumber(args.limit),
+        });
+        return { content: jsonResult(result), sources: referenceSources(result.references), summary: `Ask read ${result.returned} of ${result.matched} matching project documents.` };
+      },
+    },
+    {
+      name: 'workspace_plans',
+      description: 'List or read accessible active/proposed plans with phase task keys and live done/settled progress. Pass planId for one exact plan; archived plans are excluded.',
+      inputSchema: {
+        type: 'object', properties: {
+          projectId: { type: 'string' }, planId: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 30 },
+        }, additionalProperties: false,
+      },
+      execute: async (args) => {
+        const result = await workspacePlans(env, scope, {
+          projectId: optionalString(args.projectId), planId: optionalString(args.planId), limit: optionalNumber(args.limit),
+        });
+        return { content: jsonResult(result), sources: referenceSources(result.references), summary: `Ask read ${result.returned} of ${result.matched} active plans.` };
+      },
+    },
+    {
+      name: 'workspace_review',
+      description: 'Read the human review queue for one accessible project using only evidence stored in Noriq: task requirements/acceptance, comments, refs, runs, and canonical memory review items. This does not inspect repository files, commits, pull requests, or diffs; say so.',
+      inputSchema: {
+        type: 'object', properties: { projectId: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 30 } },
+        required: ['projectId'], additionalProperties: false,
+      },
+      execute: async (args) => {
+        const projectId = optionalString(args.projectId);
+        if (!projectId) throw new Error('projectId is required');
+        const result = await workspaceReview(env, scope, { projectId, limit: optionalNumber(args.limit) });
+        return {
+          content: jsonResult(result), sources: referenceSources(result.references),
+          summary: `Ask read ${result.tasks.returned} task review item${result.tasks.returned === 1 ? '' : 's'} and ${result.memory.items.length} memory review item${result.memory.items.length === 1 ? '' : 's'} from ${result.project.key}.`,
+        };
+      },
+    },
+  ];
 }
 
 const frameResult = (name: string, content: string, truncated: boolean): string => [
