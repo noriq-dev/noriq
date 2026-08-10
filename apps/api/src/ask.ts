@@ -9,8 +9,9 @@ import type { Env } from './env';
 import { search, type SearchHit } from './search';
 import type { ProjectMemoryStub } from './lib/project-memory';
 import { buildEntityUri, parseEntityUri } from '@noriq-dev/shared';
+import { DEFAULT_ASK_MODEL_ID } from './ask-models';
 
-export const GENERATION_MODEL = '@cf/openai/gpt-oss-120b';
+export const GENERATION_MODEL = DEFAULT_ASK_MODEL_ID;
 const CONTEXT_HITS = 8;
 const CONTEXT_CHARS = 1200;
 export const DEFAULT_ASK_MAX_OUTPUT_TOKENS = 4096;
@@ -105,12 +106,12 @@ export function extractReasoningSummaryDelta(value: unknown): string {
     : '';
 }
 
-export function generationClient(env: Env): GenerationClient | null {
+export function generationClient(env: Env, model = GENERATION_MODEL): GenerationClient | null {
   if (!env.AI) return null;
   const ai = env.AI;
   return {
     async generate(messages, opts) {
-      const res = await ai.run(GENERATION_MODEL, { messages, max_tokens: opts.maxTokens });
+      const res = await ai.run(model, { messages, max_tokens: opts.maxTokens });
       const text = extractGeneratedText(res);
       if (!text) throw new Error('Workers AI returned no answer text');
       return text;
@@ -118,12 +119,12 @@ export function generationClient(env: Env): GenerationClient | null {
   };
 }
 
-export function streamingGenerationClient(env: Env): StreamingGenerationClient | null {
+export function streamingGenerationClient(env: Env, model = GENERATION_MODEL): StreamingGenerationClient | null {
   if (!env.AI) return null;
   const ai = env.AI;
   return {
     async stream(messages, opts) {
-      const result = await ai.run(GENERATION_MODEL, { messages, max_tokens: opts.maxTokens, stream: true });
+      const result = await ai.run(model, { messages, max_tokens: opts.maxTokens, stream: true });
       if (!(result instanceof ReadableStream)) throw new Error('Workers AI returned a non-streaming response');
       return result as ReadableStream<Uint8Array>;
     },
@@ -228,7 +229,7 @@ export function extractRetrievalToolQuery(value: unknown): string | null {
   return null;
 }
 
-export function retrievalDecisionClient(env: Env): RetrievalDecisionClient | null {
+export function retrievalDecisionClient(env: Env, model = GENERATION_MODEL): RetrievalDecisionClient | null {
   if (!env.AI) return null;
   const ai = env.AI;
   return {
@@ -246,7 +247,7 @@ export function retrievalDecisionClient(env: Env): RetrievalDecisionClient | nul
         ...normalizeHistory(history),
         { role: 'user', content: question },
       ];
-      const result = await ai.run(GENERATION_MODEL, {
+      const result = await ai.run(model, {
         messages,
         tools: [{
           type: 'function',
@@ -549,6 +550,7 @@ export function buildMessages(
 export interface AskOptions {
   question: string;
   projects: AskProject[];
+  model?: string;
   history?: AskHistoryMessage[];
   retrieval?: RetrievalDecisionClient | null;
   onRetrieval?: () => void | Promise<void>;
@@ -557,14 +559,15 @@ export interface AskOptions {
 export async function prepareQuestion(env: Env, opts: AskOptions): Promise<PreparedAsk> {
   const question = opts.question.trim().slice(0, MAX_QUESTION_CHARS);
   const history = normalizeHistory(opts.history);
-  const retrieval = opts.retrieval === undefined ? retrievalDecisionClient(env) : opts.retrieval;
+  const model = opts.model ?? GENERATION_MODEL;
+  const retrieval = opts.retrieval === undefined ? retrievalDecisionClient(env, model) : opts.retrieval;
   const retrievalQuery = await retrieval?.select(question, history) ?? null;
   if (retrievalQuery === null) {
     return {
       messages: buildMessages(question, opts.projects, [], history, false),
       sources: [],
       mode: null,
-      model: GENERATION_MODEL,
+      model,
       graphEnhanced: false,
     };
   }
@@ -599,7 +602,7 @@ export async function prepareQuestion(env: Env, opts: AskOptions): Promise<Prepa
     messages: buildMessages(question, opts.projects, blocks, history, true),
     sources,
     mode,
-    model: GENERATION_MODEL,
+    model,
     graphEnhanced,
   };
 }

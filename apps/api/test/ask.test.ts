@@ -15,6 +15,9 @@ import {
   deleteAskThread, getAskGeneration, getAskThread, updateAskGeneration,
 } from '../src/ask-chats';
 import { askGenerationEventStream } from '../src/ask-generation';
+import {
+  AskModelConfigurationError, AskModelSelectionError, askModelCatalog, resolveAskModel,
+} from '../src/ask-models';
 
 /** Fake generation client: records the prompts it saw, returns a canned answer. */
 function fakeGen(canned = 'Grounded answer citing ASK-1.') {
@@ -76,6 +79,29 @@ describe('buildMessages (unit)', () => {
 });
 
 describe('Workers AI response adapters', () => {
+  it('parses a bounded operator model allowlist and fails closed on invalid configuration', () => {
+    const configured = {
+      ASK_MODELS: JSON.stringify([
+        { id: '@cf/openai/gpt-oss-120b', label: 'Large', capabilities: { tools: true, streaming: true, reasoningSummary: true } },
+        { id: '@cf/meta/llama-test', label: 'Fast', capabilities: { tools: true, streaming: true } },
+      ]),
+      ASK_DEFAULT_MODEL: '@cf/meta/llama-test',
+    };
+    expect(askModelCatalog(configured)).toMatchObject({
+      defaultModel: '@cf/meta/llama-test',
+      models: [
+        { id: '@cf/openai/gpt-oss-120b', label: 'Large' },
+        { id: '@cf/meta/llama-test', label: 'Fast' },
+      ],
+    });
+    expect(resolveAskModel(configured).id).toBe('@cf/meta/llama-test');
+    expect(() => resolveAskModel(configured, '@cf/unknown/model')).toThrow(AskModelSelectionError);
+    expect(() => askModelCatalog({ ASK_MODELS: 'not json' })).toThrow(AskModelConfigurationError);
+    expect(() => askModelCatalog({ ASK_MODELS: JSON.stringify([
+      { id: '@cf/no-tools', label: 'No tools', capabilities: { streaming: true } },
+    ]) })).toThrow(/tools and streaming/i);
+  });
+
   it('uses a configurable and bounded Ask output-token budget', () => {
     expect(askOutputTokenLimit({})).toBe(4096);
     expect(askOutputTokenLimit({ ASK_MAX_OUTPUT_TOKENS: '8192' })).toBe(8192);
@@ -127,11 +153,14 @@ describe('Workers AI response adapters', () => {
 
   it('offers search_noriq to the model and obeys its decision to use or skip it', async () => {
     const inputs: unknown[] = [];
-    const toolClient = retrievalDecisionClient({ AI: { run: async (_model: string, input: unknown) => {
+    const models: string[] = [];
+    const toolClient = retrievalDecisionClient({ AI: { run: async (model: string, input: unknown) => {
+      models.push(model);
       inputs.push(input);
       return { choices: [{ message: { tool_calls: [{ function: { name: 'search_noriq', arguments: '{"query":"active runner"}' } }] } }] };
-    } } } as unknown as Env)!;
+    } } } as unknown as Env, '@cf/test/selected')!;
     await expect(toolClient.select('How is RUN doing?', [])).resolves.toBe('active runner');
+    expect(models).toEqual(['@cf/test/selected']);
     expect(inputs[0]).toEqual(expect.objectContaining({
       tools: [expect.objectContaining({ type: 'function', function: expect.objectContaining({ name: 'search_noriq' }) })],
     }));
@@ -303,16 +332,38 @@ describe('generationClient gate (unit) — the 503 trigger', () => {
   });
 
   it('reads a Responses API envelope and rejects an unknown empty envelope', async () => {
+    const invoked: string[] = [];
     const responses = generationClient({
-      AI: { run: async () => ({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'actual answer' }] }] }) },
-    } as unknown as Env)!;
+      AI: { run: async (model: string) => {
+        invoked.push(model);
+        return { output: [{ type: 'message', content: [{ type: 'output_text', text: 'actual answer' }] }] };
+      } },
+    } as unknown as Env, '@cf/test/selected')!;
     await expect(responses.generate([], { maxTokens: 10 })).resolves.toBe('actual answer');
+    expect(invoked).toEqual(['@cf/test/selected']);
     const empty = generationClient({ AI: { run: async () => ({ output: [] }) } } as unknown as Env)!;
     await expect(empty.generate([], { maxTokens: 10 })).rejects.toThrow(/no answer text/i);
   });
 });
 
 describe('REST /api/ask', () => {
+  it('serves the authenticated model catalog and rejects arbitrary model ids', async () => {
+    const catalog = await SELF.fetch('https://noriq.test/api/ask/models', { headers: { Cookie: cookie } });
+    expect(catalog.status).toBe(200);
+    expect(await catalog.json()).toMatchObject({
+      defaultModel: '@cf/openai/gpt-oss-120b',
+      models: [expect.objectContaining({ id: '@cf/openai/gpt-oss-120b', label: 'GPT-OSS 120B' })],
+    });
+    expect((await SELF.fetch('https://noriq.test/api/ask/models')).status).toBe(401);
+
+    const unknown = await SELF.fetch('https://noriq.test/api/ask/stream', {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: 'anything', model: '@cf/unadvertised/model' }),
+    });
+    expect(unknown.status).toBe(400);
+    expect((await unknown.json() as { error: string }).error).toMatch(/not available/i);
+  });
+
   it('rejects a missing question with 400', async () => {
     const res = await SELF.fetch('https://noriq.test/api/ask', {
       method: 'POST',
@@ -382,7 +433,8 @@ describe('REST /api/ask', () => {
   it('keeps a server-owned generation alive when a follower disconnects and replays from offsets', async () => {
     const owner = await createUser('ask-reconnect@example.com', 'Ask Reconnect', 'longenough1');
     const thread = await createAskThread(env.DB, owner.id, 'Reconnect me');
-    const generation = await createAskGeneration(env.DB, owner.id, thread.id, 'Keep going', []);
+    const generation = await createAskGeneration(env.DB, owner.id, thread.id, 'Keep going', [], '@cf/test/durable');
+    expect((await getAskGeneration(env.DB, generation.id, owner.id))?.model).toBe('@cf/test/durable');
 
     const follower = askGenerationEventStream(env as unknown as Env, owner.id, generation.id);
     const reader = follower.getReader();
@@ -411,9 +463,9 @@ describe('REST /api/ask', () => {
 
     const detail = await (await SELF.fetch(`https://noriq.test/api/ask/threads/${thread.id}`, {
       headers: { Cookie: await loginSession('ask-reconnect@example.com', 'longenough1') },
-    })).json() as { messages: Array<{ role: string; generationId?: string; generationStatus?: string; content: string }> };
+    })).json() as { messages: Array<{ role: string; generationId?: string; generationStatus?: string; content: string; model?: string }> };
     expect(detail.messages.filter((message) => message.role === 'assistant')).toEqual([
-      expect.objectContaining({ generationId: generation.id, generationStatus: 'completed', content: 'durable answer' }),
+      expect.objectContaining({ generationId: generation.id, generationStatus: 'completed', content: 'durable answer', model: 'test-model' }),
     ]);
     expect(detail.messages.map((message) => message.role)).toEqual(['user', 'assistant']);
   });

@@ -27,6 +27,10 @@ export interface Env {
   ASK_STREAM_POLL_MS?: string;
   /** Maximum generated tokens for an Ask answer. Parsed and clamped by askOutputTokenLimit. */
   ASK_MAX_OUTPUT_TOKENS?: string;
+  /** JSON array of server-allowlisted Ask models. Invalid explicit configuration fails closed. */
+  ASK_MODELS?: string;
+  /** Model id from ASK_MODELS used when the client does not select one. */
+  ASK_DEFAULT_MODEL?: string;
   /** Actor lifecycle policy overrides (PLNR-363). All numeric values are validated and capped;
    * scheduled mutation remains off unless AGENT_LIFECYCLE_SWEEP_APPLY is explicitly truthy. */
   AGENT_LIFECYCLE_ONLINE_SECONDS?: string;

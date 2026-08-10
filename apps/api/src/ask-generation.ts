@@ -5,6 +5,7 @@ import {
   type StoredAskGeneration,
 } from './ask-chats';
 import { listWorkspaceProjects } from './lib/workspace-operations';
+import { resolveAskModel } from './ask-models';
 
 const encoder = new TextEncoder();
 const frame = (event: string, data: unknown): Uint8Array =>
@@ -20,7 +21,14 @@ export async function accessibleAskProjectsForUser(env: Env, userId: string): Pr
 export async function runAskGeneration(env: Env, generationId: string): Promise<void> {
   const generation = await getAskGeneration(env.DB, generationId);
   if (!generation || generation.status === 'completed' || generation.status === 'failed') return;
-  const gen = streamingGenerationClient(env);
+  let model;
+  try {
+    model = resolveAskModel(env, generation.model);
+  } catch (error) {
+    await failAskGeneration(env.DB, generationId, error instanceof Error ? error.message : 'Ask model configuration is invalid');
+    return;
+  }
+  const gen = streamingGenerationClient(env, model.id);
   if (!gen) {
     await failAskGeneration(env.DB, generationId, 'no AI backend — asking questions requires the Workers AI (AI) binding');
     return;
@@ -53,6 +61,7 @@ export async function runAskGeneration(env: Env, generationId: string): Promise<
       question: generation.question,
       projects,
       history: generation.history,
+      model: model.id,
       onRetrieval: async () => {
         retrievalUsed = true;
         base.trace = ['Ask chose to search accessible Noriq evidence…'];

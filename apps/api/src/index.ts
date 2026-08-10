@@ -23,6 +23,7 @@ import {
   deleteAskThread, getAskGeneration, getAskThread, listAskThreads, setAskThreadArchived,
 } from './ask-chats';
 import { accessibleAskProjectsForUser, askGenerationEventStream } from './ask-generation';
+import { AskModelSelectionError, askModelCatalog, resolveAskModel } from './ask-models';
 import { verifyUploadToken, resolveUploadSecret, signIngestToken, verifyIngestToken, type IngestClaims } from './lib/upload-token';
 import { USER_PROJECT_WHERE, taskWireStatus, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
 import {
@@ -1892,6 +1893,15 @@ const accessibleAskProjects = async (c: Context<AppContext>): Promise<AskProject
   return accessibleAskProjectsForUser(c.env, c.var.user!.id);
 };
 
+app.get('/api/ask/models', userAuth, async (c) => {
+  try {
+    return c.json(askModelCatalog(c.env));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Ask model configuration is invalid';
+    return c.json({ error: message }, 503);
+  }
+});
+
 app.get('/api/ask/threads', userAuth, async (c) => {
   const archived = c.req.query('archived') === '1' || c.req.query('archived') === 'true';
   return c.json({ threads: await listAskThreads(c.env.DB, c.var.user!.id, archived) });
@@ -1925,17 +1935,26 @@ app.delete('/api/ask/threads/:threadId', userAuth, async (c) => {
 app.post('/api/ask', userAuth, async (c) => {
   const rl = await rateLimit(c.env, `ask:${c.var.user!.id}`, 20);
   if (!rl.ok) return c.json(tooMany, 429, { 'Retry-After': String(rl.retryAfter) });
-  const gen = generationClient(c.env);
-  if (!gen) return c.json({ error: 'no AI backend — asking questions requires the Workers AI (AI) binding' }, 503);
-  const { question, history } = await c.req.json<{ question?: string; history?: unknown }>().catch(() => ({ question: undefined, history: undefined }));
+  const { question, history, model: requestedModel } = await c.req.json<{ question?: string; history?: unknown; model?: string }>()
+    .catch(() => ({ question: undefined, history: undefined, model: undefined }));
   const q = question?.trim().slice(0, 4000);
   if (!q) return c.json({ error: 'question required' }, 400);
+  let model;
+  try {
+    model = resolveAskModel(c.env, requestedModel);
+  } catch (error) {
+    const status = error instanceof AskModelSelectionError ? 400 : 503;
+    return c.json({ error: error instanceof Error ? error.message : 'Ask model configuration is invalid' }, status);
+  }
+  const gen = generationClient(c.env, model.id);
+  if (!gen) return c.json({ error: 'no AI backend — asking questions requires the Workers AI (AI) binding' }, 503);
   const projects = await accessibleAskProjects(c);
   try {
     return c.json(await answerQuestion(c.env, gen, {
       question: q,
       projects,
       history: normalizeHistory(history),
+      model: model.id,
     }));
   } catch (e) {
     return c.json({ error: `answer generation failed: ${e instanceof Error ? e.message : 'unknown error'}` }, 502);
@@ -1947,11 +1966,18 @@ app.post('/api/ask', userAuth, async (c) => {
 app.post('/api/ask/stream', userAuth, async (c) => {
   const rl = await rateLimit(c.env, `ask:${c.var.user!.id}`, 20);
   if (!rl.ok) return c.json(tooMany, 429, { 'Retry-After': String(rl.retryAfter) });
-  if (!streamingGenerationClient(c.env)) return c.json({ error: 'no AI backend — asking questions requires the Workers AI (AI) binding' }, 503);
-  const { question, history, threadId } = await c.req.json<{ question?: string; history?: unknown; threadId?: string }>()
-    .catch(() => ({ question: undefined, history: undefined, threadId: undefined }));
+  const { question, history, threadId, model: requestedModel } = await c.req.json<{ question?: string; history?: unknown; threadId?: string; model?: string }>()
+    .catch(() => ({ question: undefined, history: undefined, threadId: undefined, model: undefined }));
   const q = question?.trim().slice(0, 4000);
   if (!q) return c.json({ error: 'question required' }, 400);
+  let model;
+  try {
+    model = resolveAskModel(c.env, requestedModel);
+  } catch (error) {
+    const status = error instanceof AskModelSelectionError ? 400 : 503;
+    return c.json({ error: error instanceof Error ? error.message : 'Ask model configuration is invalid' }, status);
+  }
+  if (!streamingGenerationClient(c.env, model.id)) return c.json({ error: 'no AI backend — asking questions requires the Workers AI (AI) binding' }, 503);
   const userId = c.var.user!.id;
   const stored = threadId ? await askThreadHistory(c.env.DB, userId, threadId) : null;
   if (threadId && !stored) return c.json({ error: 'chat not found' }, 404);
@@ -1960,6 +1986,7 @@ app.post('/api/ask/stream', userAuth, async (c) => {
     const thread = stored?.thread ?? await createAskThread(c.env.DB, userId, q);
     const generation = await createAskGeneration(
       c.env.DB, userId, thread.id, q, stored?.history ?? normalizeHistory(history),
+      model.id,
     );
     await c.env.ASK_GENERATION.get(c.env.ASK_GENERATION.idFromName(generation.id)).start(generation.id);
     return new Response(askGenerationEventStream(c.env, userId, generation.id, {

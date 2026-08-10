@@ -14,6 +14,8 @@
   // review the dry-run endpoint before setting AGENT_LIFECYCLE_SWEEP_APPLY to "true".
   "vars": {
     "ASK_MAX_OUTPUT_TOKENS": "4096",
+    "ASK_MODELS": "[{\"id\":\"@cf/openai/gpt-oss-120b\",\"label\":\"GPT-OSS 120B\",\"capabilities\":{\"tools\":true,\"streaming\":true,\"reasoningSummary\":true}}]",
+    "ASK_DEFAULT_MODEL": "@cf/openai/gpt-oss-120b",
     "AGENT_LIFECYCLE_ONLINE_SECONDS": "300",
     "AGENT_COPILOT_RETIRE_DAYS": "7",
     "AGENT_HISTORY_ARCHIVE_DAYS": "30",
