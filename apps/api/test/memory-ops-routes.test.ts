@@ -9,6 +9,7 @@ import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import type { Env } from '../src/env';
 import { createUser, loginSession, SYSTEM_ACTOR } from './helpers';
+import { computeStagedContentHash } from '../src/memory/ingest';
 
 const appEnv = env as unknown as Env;
 
@@ -114,14 +115,15 @@ describe('GET /api/projects/:pid/memory/repositories enrichment (PLNR-273)', () 
     // project_repositories table are separate registries (§3); GET /repositories reads the D1
     // one, so it must exist before anything below matters to it.
     await room.registerRepository(pid, SYSTEM_ACTOR, 'stale-repo');
+    const staleRows = [
+      { kind: 'node', uri: `noriq://file/MOSTALE/stale-repo/a.ts`, type: 'file', label: 'a.ts' },
+    ];
 
     await rpc.beginIndexIngest(pid, {
       generationId: 'gen_stale_1', projectId: pid, repositoryKey: 'stale-repo', branch: 'main', baseId: 'sha_old',
-      indexerVersion: 'v1', batchCount: 1, fileCount: 1, contentHash: 'sha256:x', deletions: [], createdAt: new Date().toISOString(),
+      indexerVersion: 'v1', batchCount: 1, fileCount: 1, contentHash: await computeStagedContentHash(staleRows as never), deletions: [], createdAt: new Date().toISOString(),
     });
-    await rpc.ingestIndexBatch(pid, { generationId: 'gen_stale_1', batchNumber: 0, batchHash: 'h' }, [
-      { kind: 'node', uri: `noriq://file/MOSTALE/stale-repo/a.ts`, type: 'file', label: 'a.ts' },
-    ]);
+    await rpc.ingestIndexBatch(pid, { generationId: 'gen_stale_1', batchNumber: 0, batchHash: 'h' }, staleRows);
     await rpc.completeIndexIngest(pid, 'gen_stale_1');
     // Activate directly through the DO (not REST — this test's subject is the read-side
     // enrichment, not the activate route) — activateIndexGeneration itself projects
@@ -142,14 +144,15 @@ describe('GET /api/projects/:pid/memory/repositories enrichment (PLNR-273)', () 
     const cookie = await loginSession('mo-failed@example.com', 'longenough1');
     const pid = await ownedProject(cookie, 'MOFAIL1');
     const rpc = await memoryRpc(pid);
+    const badRows = [
+      { kind: 'node', uri: `noriq://file/MOFAIL1/bad-repo/a.ts`, type: 'file', label: 'a.ts' },
+    ];
 
     await rpc.beginIndexIngest(pid, {
       generationId: 'gen_bad_1', projectId: pid, repositoryKey: 'bad-repo', branch: 'main', baseId: 'sha_1',
-      indexerVersion: 'v1', batchCount: 1, fileCount: 9, contentHash: 'sha256:x', deletions: [], createdAt: new Date().toISOString(),
+      indexerVersion: 'v1', batchCount: 1, fileCount: 9, contentHash: await computeStagedContentHash(badRows as never), deletions: [], createdAt: new Date().toISOString(),
     });
-    await rpc.ingestIndexBatch(pid, { generationId: 'gen_bad_1', batchNumber: 0, batchHash: 'h' }, [
-      { kind: 'node', uri: `noriq://file/MOFAIL1/bad-repo/a.ts`, type: 'file', label: 'a.ts' }, // 1, manifest says 9
-    ]);
+    await rpc.ingestIndexBatch(pid, { generationId: 'gen_bad_1', batchNumber: 0, batchHash: 'h' }, badRows); // 1, manifest says 9
     await rpc.completeIndexIngest(pid, 'gen_bad_1');
     await roomFor(pid).registerRepository(pid, SYSTEM_ACTOR, 'bad-repo');
 
@@ -239,7 +242,7 @@ describe('PLNR-273 restore keeps the ?confirm=replace guard and cannot activate 
 
     await rpc.beginIndexIngest(pid, {
       generationId: 'gen_unsealed', projectId: pid, repositoryKey: 'act-repo', branch: 'main', baseId: 'sha_1',
-      indexerVersion: 'v1', batchCount: 1, fileCount: 1, contentHash: 'sha256:x', deletions: [], createdAt: new Date().toISOString(),
+      indexerVersion: 'v1', batchCount: 1, fileCount: 1, contentHash: '0'.repeat(64), deletions: [], createdAt: new Date().toISOString(),
     });
     // Never sealed (no completeIndexIngest) — activation must be refused.
     const res = await post(`/api/projects/${pid}/memory/generations/gen_unsealed/activate`, cookie);
@@ -254,14 +257,15 @@ describe('PLNR-273 restore keeps the ?confirm=replace guard and cannot activate 
     const pid = await ownedProject(cookie, 'MOACT02');
     const rpc = await memoryRpc(pid);
     await roomFor(pid).registerRepository(pid, SYSTEM_ACTOR, 'ok-repo'); // so the best-effort D1 projection has a row to update
+    const okRows = [
+      { kind: 'node', uri: `noriq://file/MOACT02/ok-repo/a.ts`, type: 'file', label: 'a.ts' },
+    ];
 
     await rpc.beginIndexIngest(pid, {
       generationId: 'gen_ok', projectId: pid, repositoryKey: 'ok-repo', branch: 'main', baseId: 'sha_1',
-      indexerVersion: 'v1', batchCount: 1, fileCount: 1, contentHash: 'sha256:x', deletions: [], createdAt: new Date().toISOString(),
+      indexerVersion: 'v1', batchCount: 1, fileCount: 1, contentHash: await computeStagedContentHash(okRows as never), deletions: [], createdAt: new Date().toISOString(),
     });
-    await rpc.ingestIndexBatch(pid, { generationId: 'gen_ok', batchNumber: 0, batchHash: 'h' }, [
-      { kind: 'node', uri: `noriq://file/MOACT02/ok-repo/a.ts`, type: 'file', label: 'a.ts' },
-    ]);
+    await rpc.ingestIndexBatch(pid, { generationId: 'gen_ok', batchNumber: 0, batchHash: 'h' }, okRows);
     await rpc.completeIndexIngest(pid, 'gen_ok');
 
     const res = await post(`/api/projects/${pid}/memory/generations/gen_ok/activate`, cookie);

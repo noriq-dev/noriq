@@ -15,6 +15,7 @@ import {
 } from '../src/memory/code-index';
 import { indexEntity as indexOperationalEntity, type SearchBackend, type EmbeddingClient, type VectorStore } from '../src/search';
 import { buildEntityUri, parseEntityUri } from '@noriq-dev/shared';
+import { computeStagedContentHash } from '../src/memory/ingest';
 
 const appEnv = env as unknown as Env;
 
@@ -52,7 +53,12 @@ interface MemRpc {
     indexerVersion: string; batchCount: number; fileCount: number; contentHash: string; deletions: string[]; createdAt: string;
   }): Promise<{ ok: true }>;
   ingestIndexBatch(pid: string, batch: { generationId: string; batchNumber: number; batchHash: string }, rows: StagedNodeRow[]): Promise<{ ok: true; deduped: boolean }>;
-  completeIndexIngest(pid: string, generationId: string): Promise<{ ok: true; batchesReceived: number; validation: { ok: boolean; problems: string[] } }>;
+  completeIndexIngest(pid: string, generationId: string): Promise<{
+    ok: true;
+    batchesReceived: number;
+    validation: { ok: boolean; problems: string[] };
+    activation?: { activated: string; superseded: string[] };
+  }>;
   activateIndexGeneration(pid: string, generationId: string): Promise<{ activated: string; superseded: string[] }>;
   pruneSupersededGenerations(pid: string, maxAgeMs: number): Promise<number>;
   _seedSupersededIndexGenerationForTest(pid: string, repositoryKey: string, activatedAt: string): Promise<string>;
@@ -70,12 +76,12 @@ async function stageAndActivate(
   await m.beginIndexIngest(projectId, {
     generationId: opts.generationId, projectId, repositoryKey: opts.repositoryKey, branch: opts.branch, baseId: opts.baseId,
     indexerVersion: 'test', batchCount: 1, fileCount: opts.entities.filter((e) => e.type === 'file').length,
-    contentHash: 'sha256:test', deletions: opts.deletions ?? [], createdAt: new Date().toISOString(),
+    contentHash: await computeStagedContentHash(opts.entities as never), deletions: opts.deletions ?? [], createdAt: new Date().toISOString(),
   });
   await m.ingestIndexBatch(projectId, { generationId: opts.generationId, batchNumber: 0, batchHash: 'unused-in-fake-test-path' }, opts.entities);
   const completed = await m.completeIndexIngest(projectId, opts.generationId);
   if (!completed.validation.ok) throw new Error(`validation failed: ${completed.validation.problems.join('; ')}`);
-  return m.activateIndexGeneration(projectId, opts.generationId);
+  return completed.activation ?? m.activateIndexGeneration(projectId, opts.generationId);
 }
 
 async function newOwnedProject(email: string, key: string) {

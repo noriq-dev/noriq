@@ -17,7 +17,8 @@ const attachmentClaims = (over: Partial<AttachmentUploadClaims> = {}): Attachmen
 
 const ingestClaims = (over: Partial<IngestClaims> = {}): IngestClaims => ({
   typ: 'ingest', pid: 'prj_1', repositoryKey: 'repo-one', purpose: 'index', scopeId: 'gen_1',
-  runnerId: 'rnr_1', max: 1000, exp: 1_700_000_000, ...over,
+  runnerId: 'rnr_1', tokenId: 'tok_1', ownerUserId: 'usr_1', checkoutId: 'ckt_1',
+  max: 1000, exp: 1_700_000_000, ...over,
 });
 
 describe('attachment upload token', () => {

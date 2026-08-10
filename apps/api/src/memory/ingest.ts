@@ -14,6 +14,11 @@ import { StagedRow } from '@noriq-dev/shared';
  *  DEFAULT_CHUNK_ROWS comment): the point is that a batch is never allowed to grow the Worker's
  *  memory past this, not that this number is tuned for throughput. */
 export const MAX_INGEST_BATCH_BYTES = 8 * 1024 * 1024;
+export const MAX_INGEST_BATCH_UNCOMPRESSED_BYTES = 16 * 1024 * 1024;
+export const MAX_INDEX_GENERATION_BYTES = 64 * 1024 * 1024;
+export const MAX_INDEX_GENERATION_ROWS = 1_000_000;
+export const MAX_INDEX_GENERATION_BATCHES = 256;
+export const MAX_INDEX_GENERATION_FILES = 100_000;
 export const INGEST_TOKEN_TTL_SECONDS = 15 * 60;
 
 /** Read a stream up to `maxBytes`, throwing the moment it is exceeded — never buffers more than
@@ -54,6 +59,13 @@ export async function verifyBatchChecksum(bytes: Uint8Array, expectedHash: strin
  *  (PLNR-261/262 map rows into real entities) — only that the bytes decode. */
 export async function decodeBatchRows(bytes: Uint8Array): Promise<Array<Record<string, unknown>>> {
   const text = await gunzip(bytes);
+  if (text.length > MAX_INGEST_BATCH_UNCOMPRESSED_BYTES) {
+    throw new Error(`uncompressed batch exceeds ${MAX_INGEST_BATCH_UNCOMPRESSED_BYTES} bytes`);
+  }
+  const decodedBytes = new TextEncoder().encode(text).byteLength;
+  if (decodedBytes > MAX_INGEST_BATCH_UNCOMPRESSED_BYTES) {
+    throw new Error(`uncompressed batch exceeds ${MAX_INGEST_BATCH_UNCOMPRESSED_BYTES} bytes`);
+  }
   if (!text.length) return [];
   return text.split('\n').filter((line) => line.length > 0).map((line) => JSON.parse(line) as Record<string, unknown>);
 }
@@ -69,6 +81,35 @@ export type IngestStatus = 'pending' | 'complete' | 'aborted';
 /** Shape-check one decoded batch row against the shared contract. */
 export function parseStagedRow(row: Record<string, unknown>): StagedRow {
   return StagedRow.parse(row);
+}
+
+/** Runner-compatible canonical row encoding and generation digest. Object keys and rows use
+ * plain code-unit ordering, with one newline between rows and no trailing newline. */
+export function canonicalStagedRowJson(row: StagedRow): string {
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(row).sort()) sorted[key] = (row as unknown as Record<string, unknown>)[key];
+  return JSON.stringify(sorted);
+}
+
+export function compareStagedRows(a: StagedRow, b: StagedRow): number {
+  if (a.kind !== b.kind) return a.kind === 'node' ? -1 : 1;
+  if (a.kind === 'node' && b.kind === 'node') return a.uri < b.uri ? -1 : a.uri > b.uri ? 1 : 0;
+  if (a.kind === 'edge' && b.kind === 'edge') {
+    return a.from < b.from ? -1 : a.from > b.from ? 1
+      : a.type < b.type ? -1 : a.type > b.type ? 1
+        : a.to < b.to ? -1 : a.to > b.to ? 1 : 0;
+  }
+  return 0;
+}
+
+export function stagedRowsCanonicalBytes(rows: StagedRow[]): number {
+  if (!rows.length) return 0;
+  return new TextEncoder().encode(rows.map(canonicalStagedRowJson).join('\n')).byteLength;
+}
+
+export async function computeStagedContentHash(rows: StagedRow[]): Promise<string> {
+  const canonical = rows.map((row) => StagedRow.parse(row)).sort(compareStagedRows).map(canonicalStagedRowJson).join('\n');
+  return sha256HexBytes(new TextEncoder().encode(canonical));
 }
 
 // ---------------------------------------------------------------------------

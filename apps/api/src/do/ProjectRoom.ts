@@ -3386,8 +3386,12 @@ export class ProjectRoom extends DurableObject<Env> {
       ).bind(projectId, repositoryKey).first<{ id: string }>();
       if (!row) throw new Error(`no repository registered for key "${repositoryKey}" in this project`);
       await this.env.DB.prepare(
-        'UPDATE project_repositories SET active_generation_id = ?, updated_at = ? WHERE id = ?',
-      ).bind(generationId, nowIso(), row.id).run();
+        `UPDATE project_repositories
+            SET active_generation_id = ?, indexing_enabled = 1,
+                ingest_status = CASE WHEN ? IS NULL THEN 'none' ELSE 'active' END,
+                updated_at = ?
+          WHERE id = ?`,
+      ).bind(generationId, generationId, nowIso(), row.id).run();
       return { ok: true };
     });
   }

@@ -12,6 +12,7 @@ import { describe, expect, it, beforeAll } from 'vitest';
 import type { Env } from '../src/env';
 import type { Actor } from '../src/do/ProjectRoom';
 import { createUser, loginSession, mintTokenForUser, authorizeForAllProjects, projectRoom, SYSTEM_ACTOR } from './helpers';
+import { computeStagedContentHash } from '../src/memory/ingest';
 
 const appEnv = env as unknown as Env;
 
@@ -164,13 +165,14 @@ describe('index cursor — parity with GET /api/projects/:pid/memory/repositorie
   it('reports the SAME activeGeneration/stale/failedIngest the human-facing route computes — one shared derivation', async () => {
     await room(projectId).registerRepository(projectId, SYSTEM_ACTOR as Actor, 'cursor-repo');
     const m = memory(projectId);
+    const rows = [
+      { kind: 'node', uri: 'noriq://file/RMREAD/cursor-repo/a.ts', type: 'file', label: 'a.ts' },
+    ];
     await m.beginIndexIngest(projectId, {
       generationId: 'gen_cursor_1', projectId, repositoryKey: 'cursor-repo', branch: 'main', baseId: 'sha_old',
-      indexerVersion: 'v1', batchCount: 1, fileCount: 1, contentHash: 'sha256:x', deletions: [], createdAt: new Date().toISOString(),
+      indexerVersion: 'v1', batchCount: 1, fileCount: 1, contentHash: await computeStagedContentHash(rows as never), deletions: [], createdAt: new Date().toISOString(),
     });
-    await m.ingestIndexBatch(projectId, { generationId: 'gen_cursor_1', batchNumber: 0, batchHash: 'h' }, [
-      { kind: 'node', uri: 'noriq://file/RMREAD/cursor-repo/a.ts', type: 'file', label: 'a.ts' },
-    ]);
+    await m.ingestIndexBatch(projectId, { generationId: 'gen_cursor_1', batchNumber: 0, batchHash: 'h' }, rows);
     await m.completeIndexIngest(projectId, 'gen_cursor_1');
     await m.activateIndexGeneration(projectId, 'gen_cursor_1');
     // Move the repository on past the generation's base — this is what "stale" means.

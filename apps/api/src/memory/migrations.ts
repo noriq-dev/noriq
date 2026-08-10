@@ -62,6 +62,7 @@ import sql0014 from '../../memory-migrations/0014_analytics_quality_events.sql';
 import sql0015 from '../../memory-migrations/0015_constellation_generations.sql';
 import sql0016 from '../../memory-migrations/0016_constellation_internal_counts.sql';
 import sql0017 from '../../memory-migrations/0017_constellation_node_delete_invalidation.sql';
+import sql0018 from '../../memory-migrations/0018_index_ingest_acceptance.sql';
 
 export interface MemoryMigration {
   /** 1-based, contiguous, and equal to this entry's array index + 1. */
@@ -103,6 +104,7 @@ export const MEMORY_MIGRATIONS: readonly MemoryMigration[] = [
   { version: 15, name: '0015_constellation_generations', sql: sql0015 },
   { version: 16, name: '0016_constellation_internal_counts', sql: sql0016 },
   { version: 17, name: '0017_constellation_node_delete_invalidation', sql: sql0017 },
+  { version: 18, name: '0018_index_ingest_acceptance', sql: sql0018 },
 ];
 
 /** The schema version a freshly-migrated store lands on. */

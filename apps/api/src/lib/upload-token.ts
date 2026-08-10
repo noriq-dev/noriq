@@ -42,6 +42,9 @@ export interface IngestClaims {
   purpose: 'index' | 'episode';
   scopeId: string; // generationId (index) or an episode upload id
   runnerId: string;
+  tokenId: string; // exact OAuth connection the runner registered with
+  ownerUserId: string;
+  checkoutId: string; // exact already-associated Runner checkout
   max: number; // per-batch byte ceiling
   exp: number; // expiry, epoch seconds
 }

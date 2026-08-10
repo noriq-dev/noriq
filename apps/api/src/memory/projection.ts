@@ -8,7 +8,7 @@
 // node it projects (`mapCoordinationEvent`), and a classified evidence citation -> the node(s) it
 // names plus the edge type linking a memory to them (`evidenceCitationNodes`). ProjectMemory
 // still owns every actual `nodes`/`edges` write — these functions only decide WHAT to write.
-import { MemoryNode, MemoryEdgeType, buildEntityUri, type EntityRef } from '@noriq-dev/shared';
+import { MemoryNode, MemoryEdgeType, buildEntityUri, parseEntityUri, type EntityRef } from '@noriq-dev/shared';
 import type { EvidenceCitation } from './writes';
 
 export interface StagedEntityForProjection {
@@ -43,13 +43,33 @@ export function planProjection(
   projectKey: string,
   entities: StagedEntityForProjection[],
   edges: StagedEdgeForProjection[],
+  repositoryKey?: string,
 ): ProjectionPlan {
   const validEntities: StagedEntityForProjection[] = [];
   const invalidEntities: Array<{ uri: string; reason: string }> = [];
   for (const e of entities) {
     const parsed = MemoryNode.safeParse({ id: 'validate', projectKey, type: e.type, uri: e.uri, label: e.label });
-    if (parsed.success) validEntities.push(e);
-    else invalidEntities.push({ uri: e.uri, reason: parsed.error.issues[0]?.message ?? 'invalid staged entity' });
+    if (!parsed.success) {
+      invalidEntities.push({ uri: e.uri, reason: parsed.error.issues[0]?.message ?? 'invalid staged entity' });
+      continue;
+    }
+    if (repositoryKey) {
+      try {
+        const ref = parseEntityUri(e.uri);
+        if (!('repositoryKey' in ref) || ref.repositoryKey !== repositoryKey) {
+          invalidEntities.push({ uri: e.uri, reason: `uri does not belong to repository "${repositoryKey}"` });
+          continue;
+        }
+        if (ref.kind !== e.type) {
+          invalidEntities.push({ uri: e.uri, reason: `node type "${e.type}" does not match uri kind "${ref.kind}"` });
+          continue;
+        }
+      } catch {
+        invalidEntities.push({ uri: e.uri, reason: 'uri is not a valid repository entity uri' });
+        continue;
+      }
+    }
+    validEntities.push(e);
   }
   const validEntityUris = new Set(validEntities.map((e) => e.uri));
   const validEdgeTypes = new Set<string>(MemoryEdgeType.options);

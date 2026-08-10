@@ -9,6 +9,7 @@ import type { Env } from '../src/env';
 import type { Actor, CreateRunInput, RunView, TaskPatch, UpdatedTask } from '../src/do/ProjectRoom';
 import { createUser, mintTokenForUser, mcpCall } from './helpers';
 import { buildEntityUri } from '@noriq-dev/shared';
+import { computeStagedContentHash } from '../src/memory/ingest';
 import { mapCoordinationEvent } from '../src/memory/projection';
 import type { ConstellationV2Overview } from '../src/memory/constellation-v2';
 
@@ -116,7 +117,7 @@ async function newOwnedProject(email: string, key: string) {
 }
 
 const baseManifest = (over: Partial<IndexManifestInput> & Pick<IndexManifestInput, 'generationId' | 'projectId' | 'repositoryKey'>): IndexManifestInput => ({
-  branch: 'main', baseId: 'sha_1', indexerVersion: 'v1', batchCount: 1, fileCount: 1, contentHash: 'sha256:x', deletions: [], createdAt: new Date().toISOString(),
+  branch: 'main', baseId: 'sha_1', indexerVersion: 'v1', batchCount: 1, fileCount: 1, contentHash: '0'.repeat(64), deletions: [], createdAt: new Date().toISOString(),
   ...over,
 });
 
@@ -126,6 +127,7 @@ async function stageAndProject(projectId: string, opts: { generationId: string; 
   await m.beginIndexIngest(projectId, baseManifest({
     generationId: opts.generationId, projectId, repositoryKey: opts.repositoryKey,
     fileCount: opts.fileCount ?? opts.rows.filter((r) => r.kind === 'node' && r.type === 'file').length,
+    contentHash: await computeStagedContentHash(opts.rows as never),
   }));
   await m.ingestIndexBatch(projectId, { generationId: opts.generationId, batchNumber: 0, batchHash: 'h' }, opts.rows);
   const completed = await m.completeIndexIngest(projectId, opts.generationId);
@@ -248,18 +250,16 @@ describe('projecting an activated generation into the graph', () => {
     expect(await memory(projectId)._countNodes(projectId)).toBe(baseline + 20);
   });
 
-  it('a malformed staged entity (bad type) is skipped rather than aborting the whole projection', async () => {
+  it('a malformed staged entity (bad type) fails validation and never partially projects', async () => {
     const { projectId } = await newOwnedProject('pm-262-badtype@example.com', 'PM62BADT');
     const goodUri = buildEntityUri({ kind: 'file', projectKey: 'PM62BADT', repositoryKey: 'repo-a', path: 'good.ts' });
-    const result = await stageAndProject(projectId, {
+    await expect(stageAndProject(projectId, {
       generationId: 'gen_bad', repositoryKey: 'repo-a', fileCount: 1,
       rows: [
         { kind: 'node', uri: goodUri, type: 'file', label: 'good.ts' },
         { kind: 'node', uri: 'noriq://file/PM62BADT/repo-a/bad.ts', type: 'not-a-real-type', label: 'bad.ts' },
       ],
-    });
-    expect(result.nodesWritten).toBe(1);
-    expect(result.entitiesSkipped).toBe(1);
+    })).rejects.toThrow(/validation failed.*invalid entity/);
   });
 
   it('projecting a non-active generation is refused', async () => {

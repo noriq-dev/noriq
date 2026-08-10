@@ -325,7 +325,16 @@ export interface ProjectMemoryStub {
    *  the durable staged-generation tables this will drive instead). */
   beginIndexIngest(projectId: string, manifest: { generationId: string; projectId: string; repositoryKey: string; branch: string; baseId: string; indexerVersion: string; batchCount: number; fileCount: number; contentHash: string; deletions: string[]; createdAt: string }): Promise<{ ok: true }>;
   ingestIndexBatch(projectId: string, batch: { generationId: string; batchNumber: number; batchHash: string }, rows: Array<Record<string, unknown>>): Promise<{ ok: true; deduped: boolean }>;
-  completeIndexIngest(projectId: string, generationId: string): Promise<{ ok: true; batchesReceived: number; rowCount: number }>;
+  completeIndexIngest(projectId: string, generationId: string): Promise<{
+    ok: true;
+    batchesReceived: number;
+    validation: { ok: boolean; problems: string[] };
+    activation?: {
+      activated: string;
+      superseded: string[];
+      projection: { nodesWritten: number; edgesWritten: number; entitiesSkipped: number; edgesSkipped: number; retired: number; coChangeEdges: number };
+    };
+  }>;
   abortIndexIngest(projectId: string, generationId: string): Promise<{ ok: true }>;
   indexIngestStatus(projectId: string, generationId: string): Promise<{ status: 'unknown' | 'pending' | 'complete' | 'aborted'; batchesReceived: number; batchesExpected: number | null }>;
   /** PLNR-260: episode ingest — endpoint only; real episode RECORD semantics are PLNR-263's. */

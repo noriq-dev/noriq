@@ -4774,8 +4774,20 @@ app.post('/api/runner-ingest/capability', agentAuth, async (c) => {
   // Same two gates as POST /api/runs/:runId/agent and GET /api/runs/:runId/park: the runner must
   // be owned by this connection's user, and the connection's TOKEN must be authorized for the
   // project — an unscoped run-agent token would otherwise treat this as reaching every project.
-  const owned = await c.env.DB.prepare('SELECT id FROM runners WHERE id = ? AND owner_user_id = ?').bind(b.runnerId, conn.userId).first<{ id: string }>();
-  if (!owned) return c.json({ error: 'runner not found' }, 404);
+  const liveCutoff = new Date(Date.now() - RUNNER_HEARTBEAT_TTL_MS).toISOString();
+  const runnerScope = await c.env.DB.prepare(
+    `SELECT rc.checkout_id AS checkoutId
+       FROM runners r
+       JOIN oauth_tokens ot ON ot.id = r.token_id
+       JOIN project_repositories pr ON pr.project_id = ?3 AND pr.repository_key = ?4
+       JOIN repository_checkouts rc ON rc.project_repository_id = pr.id AND rc.runner_id = r.id
+      WHERE r.id = ?1 AND r.owner_user_id = ?2 AND r.token_id = ?5
+        AND r.status = 'online' AND r.offboarded_at IS NULL AND r.retired_at IS NULL
+        AND r.last_heartbeat_at >= ?6
+        AND ot.revoked_at IS NULL AND ot.expires_at > ?7
+      ORDER BY rc.checkout_id LIMIT 1`,
+  ).bind(b.runnerId, conn.userId, b.projectId, b.repositoryKey, conn.tokenId, liveCutoff, nowIso()).first<{ checkoutId: string }>();
+  if (!runnerScope) return c.json({ error: 'runner is not active and associated with this repository' }, 404);
   const actionDenied = await runnerProjectActionDenied(c, b.projectId, 'contribute');
   if (actionDenied) return actionDenied;
   // The repository key must resolve to a canonical repository IN THIS project (PLNR-259) —
@@ -4788,8 +4800,18 @@ app.post('/api/runner-ingest/capability', agentAuth, async (c) => {
   const max = Math.min(b.maxBytes ?? MAX_INGEST_BATCH_BYTES, MAX_INGEST_BATCH_BYTES);
   const expSec = Math.floor(Date.now() / 1000) + INGEST_TOKEN_TTL_SECONDS;
   const token = await signIngestToken(secret, {
-    typ: 'ingest', pid: b.projectId, repositoryKey: b.repositoryKey, purpose: b.purpose, scopeId: b.scopeId, runnerId: b.runnerId, max, exp: expSec,
+    typ: 'ingest', pid: b.projectId, repositoryKey: b.repositoryKey, purpose: b.purpose,
+    scopeId: b.scopeId, runnerId: b.runnerId, tokenId: conn.tokenId, ownerUserId: conn.userId,
+    checkoutId: runnerScope.checkoutId, max, exp: expSec,
   });
+  if (b.purpose === 'index') {
+    await room(c.env, b.projectId).updateRepository(
+      b.projectId,
+      { kind: 'system', id: 'runner-index-opt-in', name: 'runner index opt-in' },
+      b.repositoryKey,
+      { indexingEnabled: true },
+    );
+  }
   return c.json({ token, maxBytes: max, expiresAt: new Date(expSec * 1000).toISOString() });
 });
 
@@ -4892,12 +4914,30 @@ async function requireIngestCap(c: Context<AppContext>, token: string): Promise<
   // until `exp`. Re-check the live project/repository association on every use; otherwise an old
   // index token can recreate rows in an already-erased ProjectMemory DO after its tombstone has
   // been cleared. This also revokes a token immediately when its repository is unregistered.
+  const liveCutoff = new Date(Date.now() - RUNNER_HEARTBEAT_TTL_MS).toISOString();
   const liveScope = await c.env.DB.prepare(
     `SELECT 1 FROM projects p
-       JOIN project_repositories pr ON pr.project_id = p.id
-      WHERE p.id = ? AND pr.repository_key = ?`,
-  ).bind(claims.pid, claims.repositoryKey).first();
+       JOIN project_repositories pr ON pr.project_id = p.id AND pr.repository_key = ?2
+       JOIN repository_checkouts rc ON rc.project_repository_id = pr.id
+         AND rc.runner_id = ?3 AND rc.checkout_id = ?4
+       JOIN runners r ON r.id = rc.runner_id
+       JOIN oauth_tokens ot ON ot.id = r.token_id
+      WHERE p.id = ?1 AND r.owner_user_id = ?5 AND r.token_id = ?6
+        AND r.status = 'online' AND r.offboarded_at IS NULL AND r.retired_at IS NULL
+        AND r.last_heartbeat_at >= ?7
+        AND ot.revoked_at IS NULL AND ot.expires_at > ?8`,
+  ).bind(
+    claims.pid, claims.repositoryKey, claims.runnerId, claims.checkoutId,
+    claims.ownerUserId, claims.tokenId, liveCutoff, nowIso(),
+  ).first();
   if (!liveScope) return c.json({ error: 'ingest capability scope no longer exists' }, 401);
+  const [access, tokenAllowed] = await Promise.all([
+    resolveProjectAccess(c.env.DB, claims.ownerUserId, claims.pid),
+    tokenCanReachProject(c.env, claims.tokenId, claims.pid),
+  ]);
+  if (!tokenAllowed || !projectRoleAllows(access.role, 'contribute')) {
+    return c.json({ error: 'ingest capability is no longer authorized for this project' }, 401);
+  }
   return claims;
 }
 
@@ -4912,6 +4952,12 @@ app.post('/api/memory-ingest/:token/begin', async (c) => {
         ...body, generationId: claims.scopeId, projectId: claims.pid, repositoryKey: claims.repositoryKey,
       });
       await stub.beginIndexIngest(claims.pid, manifest);
+      await room(c.env, claims.pid).updateRepository(
+        claims.pid,
+        { kind: 'system', id: 'runner-index-ingest', name: 'runner index ingest' },
+        claims.repositoryKey,
+        { indexingEnabled: true, ingestStatus: 'staged' },
+      );
     } else {
       const batchCount = typeof body.batchCount === 'number' ? body.batchCount : 1;
       await stub.beginEpisodeIngest(claims.pid, { scopeId: claims.scopeId, projectId: claims.pid, batchCount });
@@ -4967,6 +5013,14 @@ app.post('/api/memory-ingest/:token/complete', async (c) => {
     const result = claims.purpose === 'index'
       ? await stub.completeIndexIngest(claims.pid, claims.scopeId)
       : await stub.completeEpisodeIngest(claims.pid, claims.scopeId);
+    if (claims.purpose === 'index' && 'validation' in result && !result.validation.ok) {
+      await room(c.env, claims.pid).updateRepository(
+        claims.pid,
+        { kind: 'system', id: 'runner-index-validation', name: 'runner index validation' },
+        claims.repositoryKey,
+        { ingestStatus: 'failed' },
+      );
+    }
     return c.json(result);
   } catch (err) {
     return c.json({ error: String(err) }, 409);

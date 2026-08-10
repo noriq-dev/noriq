@@ -60,7 +60,7 @@ describe('EvidenceRef round-trips (§1)', () => {
       baseId: 'a1b2c3',
       path: 'apps/api/src/mcp.ts',
       symbol: 'buildMcpServer',
-      contentHash: 'sha256:deadbeef',
+      contentHash: 'd'.repeat(64),
       verificationState: 'valid',
     });
     expect(ev).toEqual({
@@ -69,7 +69,7 @@ describe('EvidenceRef round-trips (§1)', () => {
       baseId: 'a1b2c3',
       path: 'apps/api/src/mcp.ts',
       symbol: 'buildMcpServer',
-      contentHash: 'sha256:deadbeef',
+      contentHash: 'd'.repeat(64),
       verificationState: 'valid',
     });
   });
@@ -208,7 +208,7 @@ describe('IndexGenerationManifest and MemoryBackupManifest (§8, §17)', () => {
       indexerVersion: '1.0.0',
       batchCount: 3,
       fileCount: 120,
-      contentHash: 'sha256:deadbeef',
+      contentHash: 'd'.repeat(64),
       createdAt: '2026-08-06T00:00:00.000Z',
     });
     expect(gen.deletions).toEqual([]);

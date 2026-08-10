@@ -16,6 +16,7 @@ import type { Env } from '../src/env';
 import { createUser, mintTokenForUser, mcpCall, createRunAgent, loginSession } from './helpers';
 import { buildEntityUri } from '@noriq-dev/shared';
 import { citationVerdict, verifiedForBase, rollUpValidity, normalizeVerificationReport } from '../src/memory/verification';
+import { computeStagedContentHash } from '../src/memory/ingest';
 
 const appEnv = env as unknown as Env;
 
@@ -211,7 +212,7 @@ async function newOwnedProject(email: string, key: string) {
 }
 
 function manifestFor(over: Partial<IndexManifestInput> & Pick<IndexManifestInput, 'generationId' | 'projectId' | 'repositoryKey' | 'branch' | 'baseId'>): IndexManifestInput {
-  return { indexerVersion: 'v1', batchCount: 1, fileCount: 1, contentHash: 'sha256:x', deletions: [], createdAt: new Date().toISOString(), ...over };
+  return { indexerVersion: 'v1', batchCount: 1, fileCount: 1, contentHash: '0'.repeat(64), deletions: [], createdAt: new Date().toISOString(), ...over };
 }
 
 /** Stage one batch and drive it all the way to a projected, active generation — same technique
@@ -223,6 +224,7 @@ async function stageAndProject(projectId: string, opts: { generationId: string; 
   await m.beginIndexIngest(projectId, manifestFor({
     generationId: opts.generationId, projectId, repositoryKey: opts.repositoryKey, branch: opts.branch, baseId: opts.baseId,
     fileCount: opts.rows.filter((r) => r.kind === 'node' && r.type === 'file').length,
+    contentHash: await computeStagedContentHash(opts.rows as never),
   }));
   await m.ingestIndexBatch(projectId, { generationId: opts.generationId, batchNumber: 0, batchHash: 'h' }, opts.rows);
   const completed = await m.completeIndexIngest(projectId, opts.generationId);

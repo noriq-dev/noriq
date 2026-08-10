@@ -363,7 +363,7 @@ export const IndexGenerationManifest = z.object({
   indexerVersion: z.string().min(1),
   batchCount: z.number().int().positive(),
   fileCount: z.number().int().nonnegative(),
-  contentHash: z.string().min(1),
+  contentHash: z.string().regex(/^[a-f0-9]{64}$/, 'must be a lowercase SHA-256 hex digest'),
   deletions: z.array(RepoPath).default([]),
   createdAt: z.string().datetime(),
 });

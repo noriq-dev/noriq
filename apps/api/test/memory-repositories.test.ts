@@ -323,6 +323,17 @@ describe('POST /api/projects/:pid/memory/repositories — HTTP registration (PLN
     const registered = await post(pid, cookie, { repositoryKey: 'ingest-http-repo' });
     expect(registered.status).toBe(201);
 
+    const reconnect = await SELF.fetch('https://noriq.test/api/runners', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${ownerToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        runnerId,
+        label: 'pm311-runner',
+        repos: [{ id: 'ckt_pm311', projectKey: 'PM311ING', repositoryKey: 'ingest-http-repo', name: 'repo' }],
+      }),
+    });
+    expect(reconnect.status).toBe(200);
+
     const after = await mintCap(ownerToken, { projectId: pid, repositoryKey: 'ingest-http-repo', purpose: 'index', scopeId: 'gen_pm311', runnerId });
     expect(after.status).toBe(200);
     const capBody = (await after.json()) as { token: string };
