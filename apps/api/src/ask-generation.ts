@@ -12,6 +12,9 @@ import { listWorkspaceProjects } from './lib/workspace-operations';
 import { resolveAskModel } from './ask-models';
 import { askToolDecisionClient, createAskTools, finalAskMessages, runAskToolLoop } from './ask-tools';
 import { listAskActions } from './ask-actions';
+import {
+  askTaskReferenceSources, formatAskTaskReferenceContext, resolveAskTaskReferences,
+} from './ask-task-references';
 
 const encoder = new TextEncoder();
 const frame = (event: string, data: unknown): Uint8Array =>
@@ -66,13 +69,27 @@ export async function runAskGeneration(env: Env, generationId: string): Promise<
     const projects = projectTags.length
       ? accessibleProjects.filter((project) => projectTags.some((tag) => tag.projectId === project.id))
       : accessibleProjects;
+    const taskReferences = await resolveAskTaskReferences(env, {
+      userId: generation.userId,
+      ...(projectTags.length ? { projectIds: projectTags.map((tag) => tag.projectId) } : {}),
+    }, generation.question);
+    const taskReferenceContext = formatAskTaskReferenceContext(taskReferences);
     const tagSources = askProjectTagSources(projectTags);
+    const taskReferenceSources = askTaskReferenceSources(taskReferences);
     const withTagSources = (sources: AskSource[]) => [
       ...tagSources,
-      ...sources.filter((source) => !tagSources.some((tag) => tag.projectId === source.projectId && tag.kind === source.kind && tag.id === source.id)),
+      ...taskReferenceSources.filter((source) => !tagSources.some((tag) => tag.projectId === source.projectId && tag.kind === source.kind && tag.id === source.id)),
+      ...sources.filter((source) => ![...tagSources, ...taskReferenceSources]
+        .some((known) => known.projectId === source.projectId && known.kind === source.kind && known.id === source.id)),
+    ];
+    const contextTrace = [
+      ...(projectTags.length ? [`Scoped this response to ${projectTags.map((tag) => tag.tag).join(', ')}.`] : []),
+      ...(taskReferences.keys.length
+        ? [`Resolved ${taskReferenceSources.length}/${taskReferences.keys.length} explicit task reference(s) inside the accessible scope.`]
+        : []),
     ];
     base.sources = withTagSources(base.sources);
-    if (projectTags.length) base.trace = [`Scoped this response to ${projectTags.map((tag) => tag.tag).join(', ')}.`, ...base.trace];
+    base.trace = [...contextTrace, ...base.trace];
     if (!await persist('searching', true)) return;
     const decision = askToolDecisionClient(env, model.id);
     if (!decision) throw new Error('no AI backend — asking questions requires the Workers AI (AI) binding');
@@ -99,7 +116,8 @@ export async function runAskGeneration(env: Env, generationId: string): Promise<
         : 'There is no pending task action in this chat.'}`
       : null;
     const initialMessages = buildMessages(generation.question, projects, [], generation.history, false, projectTags);
-    if (actionState) initialMessages.at(-1)!.content = `${actionState}\n\n${initialMessages.at(-1)!.content}`;
+    const initialContext = [actionState, taskReferenceContext].filter(Boolean).join('\n\n');
+    if (initialContext) initialMessages.at(-1)!.content = `${initialContext}\n\n${initialMessages.at(-1)!.content}`;
     const loop = await runAskToolLoop(
       decision,
       initialMessages,
@@ -111,7 +129,7 @@ export async function runAskGeneration(env: Env, generationId: string): Promise<
         shouldContinue: () => active,
         onCheckpoint: async (state) => {
           base.sources = withTagSources(state.sources);
-          base.trace = [...(projectTags.length ? [`Scoped this response to ${projectTags.map((tag) => tag.tag).join(', ')}.`] : []), ...state.trace];
+          base.trace = [...contextTrace, ...state.trace];
           base.mode = state.mode;
           base.graphEnhanced = state.graphEnhanced;
           await persist('searching', true);
@@ -120,7 +138,7 @@ export async function runAskGeneration(env: Env, generationId: string): Promise<
     );
     if (!loop || !active) return;
     base.sources = withTagSources(loop.sources);
-    base.trace = [...(projectTags.length ? [`Scoped this response to ${projectTags.map((tag) => tag.tag).join(', ')}.`] : []), ...loop.trace, loop.calls
+    base.trace = [...contextTrace, ...loop.trace, loop.calls
       ? 'Generating a response from the collected workspace evidence…'
       : 'No Noriq workspace tool was needed; generating a general response…'];
     base.mode = loop.mode;

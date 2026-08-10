@@ -54,6 +54,23 @@ export interface WorkspaceSemanticSearchInput {
   limit?: number;
 }
 
+export interface WorkspaceTaskReference {
+  requestedKey: string;
+  task: null | {
+    id: string;
+    key: string;
+    title: string;
+    body: string;
+    status: string;
+    type: string;
+    priority: number;
+    updatedAt: string;
+    projectId: string;
+    projectKey: string;
+    projectName: string;
+  };
+}
+
 const visibility = (scope: WorkspaceScope, nextParam: number) => {
   const binds: unknown[] = [];
   const userWhere = scope.allowAdminOverride ? '1 = 1' : USER_PROJECT_WHERE;
@@ -104,6 +121,28 @@ export async function searchWorkspaceTasks(env: Pick<Env, 'DB'>, scope: Workspac
     env.DB.prepare(`SELECT COUNT(*) AS n ${base}`).bind(...allBinds).first<{ n: number }>(),
   ]);
   return { tasks: rows.results, matched: total?.n ?? rows.results.length, returned: rows.results.length };
+}
+
+/** Resolve exact display keys without revealing whether an unavailable key exists elsewhere. */
+export async function resolveWorkspaceTaskReferences(
+  env: Pick<Env, 'DB'>,
+  scope: WorkspaceScope,
+  requestedKeys: readonly string[],
+): Promise<WorkspaceTaskReference[]> {
+  const keys = [...new Set(requestedKeys.map((key) => key.trim().toUpperCase()).filter(Boolean))].slice(0, 8);
+  if (!keys.length) return [];
+  const visible = visibility(scope, 1);
+  const firstKeyParam = visible.binds.length + 1;
+  const placeholders = keys.map((_, index) => `?${firstKeyParam + index}`).join(',');
+  const rows = await env.DB.prepare(
+    `SELECT t.id, t.key, t.title, substr(t.body, 1, 1600) AS body,
+            ${taskWireStatus('t')} AS status, t.type, t.priority, t.updated_at AS updatedAt,
+            t.project_id AS projectId, p.key AS projectKey, p.name AS projectName
+       FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
+      WHERE ${visible.sql} AND t.archived_at IS NULL AND UPPER(t.key) IN (${placeholders})`,
+  ).bind(...visible.binds, ...keys).all<NonNullable<WorkspaceTaskReference['task']>>();
+  const byKey = new Map(rows.results.map((task) => [task.key.toUpperCase(), task]));
+  return keys.map((requestedKey) => ({ requestedKey, task: byKey.get(requestedKey) ?? null }));
 }
 
 /** Meaning search whose project set is always derived from the caller scope. */
