@@ -71,7 +71,7 @@ function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
   return { id: e.id, t: timeOf(e.createdAt), createdAt: e.createdAt, actor, actorKind: e.actorKind, verb, subject, taskId, dot };
 }
 
-const VIEWS: ViewId[] = ['home', 'control', 'graph', 'executions', 'intelligence', 'board', 'plans', 'roadmap', 'review', 'docs', 'ask', 'agents', 'runs', 'settings', 'project-settings', 'admin', 'memory'];
+const VIEWS: ViewId[] = ['home', 'control', 'graph', 'executions', 'intelligence', 'board', 'plans', 'roadmap', 'review', 'docs', 'ask', 'agents', 'runs', 'settings', 'project-settings', 'admin', 'memory', 'more'];
 const UI_SURFACES = new Set<ApiUiSurface>([
   'control', 'graph', 'executions', 'intelligence', 'board', 'plans', 'roadmap',
   'review', 'docs', 'agents', 'runs', 'project-settings', 'memory',

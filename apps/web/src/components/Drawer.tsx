@@ -1,5 +1,5 @@
 // Task detail drawer — view/edit, tags, comments, attachments, event timeline.
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import type { AppStore } from '../store';
 import type { TaskStatus } from '../types';
 import { api, type ApiAgentEvent } from '../api';
@@ -14,8 +14,31 @@ import { ExecutionSpecPanel, type SpecLoad } from './ExecutionSpec';
 import { DispatchIntelligencePanel } from './DispatchIntelligence';
 import { confirm } from './Dialog';
 import { AttachmentPreview, attachmentPreviewDecision, type AttachmentPreviewItem } from './AttachmentPreview';
+import { useViewport } from '../viewport';
+
+export function drawerShellStyle(phone: boolean): CSSProperties {
+  const shared: CSSProperties = {
+    position: 'fixed', right: 0, bottom: 0, maxWidth: '100vw',
+    background: 'var(--bg-raised)', zIndex: 41,
+    display: 'flex', flexDirection: 'column',
+  };
+  return phone ? {
+    ...shared,
+    top: 'max(12px, env(safe-area-inset-top))', left: 0, width: '100%',
+    border: '1px solid var(--w-12)', borderBottom: 0, borderRadius: '22px 22px 0 0',
+    animation: 'pl-stream-up .22s cubic-bezier(.22,1,.36,1) both',
+    boxShadow: '0 -20px 60px rgba(0,0,0,.6)',
+    paddingBottom: 'env(safe-area-inset-bottom)',
+  } : {
+    ...shared,
+    top: 0, width: 480, borderLeft: '1px solid var(--w-1)',
+    animation: 'pl-drawer .28s cubic-bezier(.22,1,.36,1) both',
+    boxShadow: '-20px 0 60px rgba(0,0,0,.5)',
+  };
+}
 
 export function Drawer({ store }: { store: AppStore }) {
+  const { phone } = useViewport();
   const { currentPid, selectedTaskId, helpers, actions, snapshot } = store;
   const tasks = helpers.tasksOf(currentPid);
   const task = selectedTaskId != null ? tasks.find((t) => t.id === selectedTaskId) : null;
@@ -182,15 +205,11 @@ export function Drawer({ store }: { store: AppStore }) {
       <div onClick={actions.closeTask} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', zIndex: 40 }} />
       <div
         className="task-drawer"
-        style={{
-          position: 'fixed', top: 0, right: 0, bottom: 0, width: 480, maxWidth: '100vw',
-          background: 'var(--bg-raised)', borderLeft: '1px solid var(--w-1)', zIndex: 41,
-          display: 'flex', flexDirection: 'column',
-          animation: 'pl-drawer .28s cubic-bezier(.22,1,.36,1) both',
-          boxShadow: '-20px 0 60px rgba(0,0,0,.5)',
-        }}
+        data-mobile-sheet={phone || undefined}
+        style={drawerShellStyle(phone)}
       >
-        <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--line)', flex: 'none' }}>
+        {phone && <div aria-hidden="true" style={{ flex: 'none', width: 38, height: 4, borderRadius: 999, background: 'var(--w-2)', margin: '8px auto 0' }} />}
+        <div style={{ padding: phone ? '12px 14px' : '16px 20px', borderBottom: '1px solid var(--line)', flex: 'none' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, flexWrap: 'wrap' }}>
             <MonoTag color={m.color} bg={m.bg} size={11}>{task.key}</MonoTag>
             <MonoTag color={m.color} bg={m.bg} size={10.5}>{m.label}</MonoTag>
@@ -300,7 +319,7 @@ export function Drawer({ store }: { store: AppStore }) {
           )}
         </div>
 
-        <div style={{ flex: 1, overflowY: 'auto', padding: '18px 20px' }}>
+        <div style={{ flex: 1, overflowY: 'auto', padding: phone ? '16px 14px' : '18px 20px' }}>
           {editing ? (
             <div style={{ marginBottom: 18 }}>
               <TextArea value={eBody} onChange={(e) => setEBody(e.target.value)} style={{ minHeight: 110 }} />

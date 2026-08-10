@@ -27,11 +27,16 @@ import { AdminView } from './components/AdminView';
 import { Logo } from './components/Logo';
 import { useState } from 'react';
 import { useTheme } from './theme';
-import { ThemeButton } from './components/ThemeButton';
 import { Home } from './components/Home';
 import { Invite } from './components/Invite';
 import { ResetPassword } from './components/ResetPassword';
 import { PublicView } from './components/PublicView';
+import { MobileTabBar } from './components/MobileTabBar';
+import { ProjectSheet } from './components/ProjectSheet';
+import { AvatarChip, LiveDot } from './components/bits';
+import { useViewport } from './viewport';
+import { DesktopOnly, isDesktopOnlyView } from './components/DesktopOnly';
+import { MoreView } from './components/MoreView';
 
 // Floating toggle for the unauthenticated screens (login / setup / invite) — no rail there.
 function FloatingTheme() {
@@ -55,7 +60,8 @@ function FloatingTheme() {
 
 export function App() {
   const store = useAppStore();
-  const [railOpen, setRailOpen] = useState(false);
+  const { phone } = useViewport();
+  const [projectSheetOpen, setProjectSheetOpen] = useState(false);
   // Anonymous visitor on a project URL (PLNR-78): try the public read-only page before
   // falling back to Login. `publicFailed` flips when the project isn't public.
   const [publicFailed, setPublicFailed] = useState(false);
@@ -88,54 +94,69 @@ export function App() {
   }
 
   const project = store.data.projects.find((p) => p.id === store.currentPid);
-  const projectView = project && !['home', 'settings', 'admin', 'ask'].includes(store.view);
+  const projectView = project && !['home', 'settings', 'admin', 'ask', 'more'].includes(store.view);
+  const desktopOnlyView = phone && projectView && isDesktopOnlyView(store.view) ? store.view : null;
+  const signalCount = store.snapshot?.signals?.length ?? 0;
+  const liveCount = project?.liveAgentCount ?? store.data.agents[store.currentPid]?.length ?? 0;
+  const navigateMobile = (view: Parameters<typeof store.actions.setView>[0]) => {
+    if (!store.currentPid && !['ask', 'more'].includes(view)) {
+      const firstProject = store.data.projects[0];
+      if (firstProject) store.actions.selectProject(firstProject.id);
+    }
+    store.actions.setView(view);
+  };
 
   return (
     <div style={{ height: '100vh', display: 'flex', background: 'var(--bg)' }}>
       <MaintenanceBanner />
-      {railOpen && <div className="rail-backdrop" onClick={() => setRailOpen(false)} />}
-      <Rail store={store} open={railOpen} onNavigate={() => setRailOpen(false)} />
+      {!phone && <Rail store={store} />}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-        <div className="mobile-topbar">
-          <button
-            onClick={() => setRailOpen(true)}
-            aria-label="Menu"
-            style={{ cursor: 'pointer', width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 19, color: 'var(--text-soft)', borderRadius: 8 }}
-          >
-            ☰
-          </button>
-          <Logo size={22} radius={6} />
-          <span style={{ fontWeight: 700, fontSize: 14.5, letterSpacing: '-.01em', color: 'var(--text)' }}>
-            {store.view === 'ask' ? 'Ask' : project && projectView ? project.name : 'Noriq'}
-          </span>
-          <div style={{ flex: 1 }} />
-          <ThemeButton size={34} />
-        </div>
-        {projectView && <TopBar store={store} />}
-        <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
+        {phone && (
+          <div className="mobile-topbar">
+            {store.view === 'ask' || store.view === 'more' ? (
+              <span style={{ fontWeight: 700, fontSize: 16, letterSpacing: '-.01em' }}>{store.view === 'ask' ? 'Ask' : 'More'}</span>
+            ) : project ? (
+              <button type="button" onClick={() => setProjectSheetOpen(true)} style={{ minWidth: 0, maxWidth: 240, height: 38, padding: '0 9px', borderRadius: 10, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8, background: 'var(--w-025)', border: '1px solid var(--w-08)', textAlign: 'left' }}>
+                <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, fontWeight: 700, color: 'var(--accent)', background: 'var(--w-05)', borderRadius: 5, padding: '3px 5px' }}>{project.key}</span>
+                <span style={{ minWidth: 0, maxWidth: 150, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 13.5, fontWeight: 600 }}>{project.name}</span>
+                <span aria-hidden="true" style={{ color: 'var(--text-faint)', fontSize: 10 }}>▾</span>
+              </button>
+            ) : <Logo size={24} radius={7} />}
+            <div style={{ flex: 1 }} />
+            {project && store.view !== 'ask' && store.view !== 'more' && <><LiveDot size={6} /><span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-mid)' }}>{liveCount} live</span></>}
+            <AvatarChip name={store.user.name} color="you" size={34} radius={17} />
+          </div>
+        )}
+        {!phone && projectView && <TopBar store={store} />}
+        <div style={{ flex: 1, minHeight: 0, position: 'relative', paddingBottom: phone ? 'calc(50px + env(safe-area-inset-bottom))' : 0 }}>
           {(store.view === 'home' || (!project && !['settings', 'admin', 'ask'].includes(store.view))) && <Home store={store} />}
           {store.view === 'settings' && <SettingsView store={store} />}
           {store.view === 'admin' && <AdminView store={store} />}
           {store.view === 'ask' && <AskView store={store} />}
+          {store.view === 'more' && <MoreView store={store} />}
           {projectView && (
             <>
-              {store.view === 'control' && <MissionControl store={store} />}
-              {store.view === 'graph' && <Graph store={store} />}
-              {store.view === 'executions' && <ExecutionView store={store} />}
-              {store.view === 'intelligence' && <IntelligenceView store={store} />}
-              {store.view === 'board' && <Board store={store} />}
-              {store.view === 'plans' && <PlansView store={store} />}
-              {store.view === 'review' && <ReviewView store={store} />}
-              {store.view === 'docs' && <DocsView store={store} />}
-              {store.view === 'roadmap' && <RoadmapView store={store} />}
-              {store.view === 'runs' && <RunsView store={store} />}
-              {store.view === 'agents' && <AgentsView store={store} />}
-              {store.view === 'memory' && <MemoryView store={store} />}
-              {store.view === 'project-settings' && <ProjectSettingsView key={store.currentPid} store={store} />}
+              {desktopOnlyView ? <DesktopOnly projectId={store.currentPid} view={desktopOnlyView} /> : <>
+                {store.view === 'control' && <MissionControl store={store} />}
+                {store.view === 'graph' && <Graph store={store} />}
+                {store.view === 'executions' && <ExecutionView store={store} />}
+                {store.view === 'intelligence' && <IntelligenceView store={store} />}
+                {store.view === 'board' && <Board store={store} />}
+                {store.view === 'plans' && <PlansView store={store} />}
+                {store.view === 'review' && <ReviewView store={store} />}
+                {store.view === 'docs' && <DocsView store={store} />}
+                {store.view === 'roadmap' && <RoadmapView store={store} />}
+                {store.view === 'runs' && <RunsView store={store} />}
+                {store.view === 'agents' && <AgentsView store={store} />}
+                {store.view === 'memory' && <MemoryView store={store} />}
+                {store.view === 'project-settings' && <ProjectSettingsView key={store.currentPid} store={store} />}
+              </>}
             </>
           )}
         </div>
       </div>
+      {phone && <MobileTabBar view={store.view} signalCount={signalCount} onNavigate={navigateMobile} />}
+      {phone && projectSheetOpen && <ProjectSheet store={store} preserveView={store.view} onClose={() => setProjectSheetOpen(false)} />}
       <Drawer store={store} />
       <ModalHost store={store} />
       <DialogHost />

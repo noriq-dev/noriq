@@ -6,6 +6,7 @@ import {
 import type { AppStore } from '../store';
 import { MonoTag, SectionLabel } from './bits';
 import { Button, Select } from './ui';
+import { MIN_TOUCH_TARGET, useViewport } from '../viewport';
 
 const card: React.CSSProperties = {
   background: 'var(--w-025)', border: '1px solid var(--w-08)', borderRadius: 12, padding: 15, minWidth: 0,
@@ -22,6 +23,7 @@ const metricLabel: Record<string, string> = {
 };
 
 export function IntelligenceView({ store }: { store: AppStore }) {
+  const { phone } = useViewport();
   const pid = store.currentPid;
   const [days, setDays] = useState(30);
   const [groupBy, setGroupBy] = useState<ApiIntelligenceDimension>('executed_workflow');
@@ -32,6 +34,8 @@ export function IntelligenceView({ store }: { store: AppStore }) {
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [comparisonOpen, setComparisonOpen] = useState(false);
+  const [casesOpen, setCasesOpen] = useState(false);
 
   const load = async (cursor?: string) => {
     if (!pid) return;
@@ -69,21 +73,21 @@ export function IntelligenceView({ store }: { store: AppStore }) {
   const groups = historical.state === 'available' ? historical.result.groups : [];
   const nextCursor = historical.state === 'available' ? historical.result.cases.nextCursor : null;
 
-  return <main className="intelligence-view" style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: 22 }}>
+  return <main className="intelligence-view" style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: phone ? 14 : 22 }}>
     <div style={{ maxWidth: 1320, margin: '0 auto' }}>
       <header style={{ display: 'flex', alignItems: 'flex-start', gap: 16, flexWrap: 'wrap', marginBottom: 16 }}>
-        <div style={{ flex: 1, minWidth: 260 }}>
+        <div style={{ flex: 1, minWidth: phone ? '100%' : 260 }}>
           <SectionLabel>Project Intelligence</SectionLabel>
           <h1 style={{ fontSize: 22, margin: '5px 0 4px' }}>Execution evidence, live flow, and capacity</h1>
           <div style={{ ...mono, lineHeight: 1.5 }}>Live coordination and historical evidence are shown on separate clocks. Values marked unavailable are never inferred as zero.</div>
         </div>
-        <label style={mono}>Range
-          <Select aria-label="Analytics range" value={days} onChange={(e) => setDays(Number(e.target.value))} style={{ marginTop: 5, minWidth: 110 }}>
+        <label style={{ ...mono, flex: phone ? 1 : undefined }}>Range
+          <Select variant={phone ? 'micro' : undefined} aria-label="Analytics range" value={days} onChange={(e) => setDays(Number(e.target.value))} style={{ marginTop: 5, minWidth: phone ? 0 : 110, width: phone ? '100%' : undefined }}>
             <option value={7}>7 days</option><option value={30}>30 days</option><option value={90}>90 days</option><option value={366}>366 days</option>
           </Select>
         </label>
-        <label style={mono}>Composition
-          <Select aria-label="Analytics grouping" value={groupBy} onChange={(e) => setGroupBy(e.target.value as ApiIntelligenceDimension)} style={{ marginTop: 5, minWidth: 170 }}>
+        <label style={{ ...mono, flex: phone ? 1.5 : undefined }}>Composition
+          <Select variant={phone ? 'micro' : undefined} aria-label="Analytics grouping" value={groupBy} onChange={(e) => setGroupBy(e.target.value as ApiIntelligenceDimension)} style={{ marginTop: 5, minWidth: phone ? 0 : 170, width: phone ? '100%' : undefined }}>
             <option value="executed_workflow">Executed workflow</option><option value="commissioned_workflow">Commissioned workflow</option>
             <option value="configuration">Configuration</option><option value="stage">Stage</option><option value="role">Role</option>
           </Select>
@@ -122,7 +126,7 @@ export function IntelligenceView({ store }: { store: AppStore }) {
           </>}
       </section>
 
-      <section aria-labelledby="comparison-intelligence" style={{ marginBottom: 22 }}>
+      {(!phone || comparisonOpen) && <section aria-labelledby="comparison-intelligence" style={{ marginBottom: 22 }}>
         <div style={{ display: 'flex', alignItems: 'end', gap: 10, flexWrap: 'wrap', marginBottom: 8 }}>
           <div style={{ flex: 1, minWidth: 220 }}><h2 id="comparison-intelligence" style={{ fontSize: 14, margin: 0 }}>Evidence-gated comparison</h2><div style={mono}>Server-authored cohorts and intervals only; no winner or recommendation.</div></div>
           <Select aria-label="Comparison dimension" value={dimension} onChange={(e) => setDimension(e.target.value as ApiStrategyDimension)} style={{ width: 170 }}>
@@ -136,9 +140,9 @@ export function IntelligenceView({ store }: { store: AppStore }) {
           : packet.comparison.rows.length === 0
             ? <State inline title={packet.comparison.interpretation} detail={packet.comparison.eligibility.reasons.join(' · ') || 'The evidence gates did not expose comparable rows.'} />
             : <div className="intelligence-grid">{packet.comparison.rows.map((row) => <EvidenceCard key={row.strategy} title={row.strategy} primary={`median ${fmtNumber(row.distribution.median, 2)}`} details={`${row.observations} cases · ${row.independentClusters} independent clusters · ${(row.interval.confidence * 100).toFixed(0)}% interval ${fmtNumber(row.interval.low, 2)}–${fmtNumber(row.interval.high, 2)}`} />)}</div>}
-      </section>
+      </section>}
 
-      <section aria-labelledby="case-intelligence">
+      {(!phone || casesOpen) && <section aria-labelledby="case-intelligence">
         <h2 id="case-intelligence" style={{ fontSize: 14, margin: '0 0 8px' }}>Canonical case drill-down</h2>
         <div style={{ ...card, padding: 0, overflow: 'hidden' }}>
           {!cases.length ? <div style={{ padding: 18, color: 'var(--text-dim)' }}>No cases in this bounded page.</div> : cases.map((item) => <div key={item.episodeId} className="intelligence-case">
@@ -148,7 +152,11 @@ export function IntelligenceView({ store }: { store: AppStore }) {
           </div>)}
           {nextCursor && <div style={{ padding: 12, borderTop: '1px solid var(--w-07)', textAlign: 'center' }}><Button variant="ghost" disabled={loadingMore} onClick={() => void load(nextCursor)}>{loadingMore ? 'Loading…' : 'Load more cases'}</Button></div>}
         </div>
-      </section>
+      </section>}
+      {phone && <nav aria-label="Additional intelligence" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 16 }}>
+        <button type="button" aria-expanded={comparisonOpen} onClick={() => setComparisonOpen((open) => !open)} style={{ minHeight: MIN_TOUCH_TARGET, borderRadius: 10, cursor: 'pointer', background: comparisonOpen ? 'rgba(198,242,78,.1)' : 'var(--w-03)', border: `1px solid ${comparisonOpen ? 'rgba(198,242,78,.35)' : 'var(--w-09)'}`, color: comparisonOpen ? 'var(--accent)' : 'var(--text-mid)', fontSize: 12.5 }}>{comparisonOpen ? 'Hide compare' : 'Compare'}</button>
+        <button type="button" aria-expanded={casesOpen} onClick={() => setCasesOpen((open) => !open)} style={{ minHeight: MIN_TOUCH_TARGET, borderRadius: 10, cursor: 'pointer', background: casesOpen ? 'rgba(198,242,78,.1)' : 'var(--w-03)', border: `1px solid ${casesOpen ? 'rgba(198,242,78,.35)' : 'var(--w-09)'}`, color: casesOpen ? 'var(--accent)' : 'var(--text-mid)', fontSize: 12.5 }}>{casesOpen ? 'Hide cases' : 'Cases'}</button>
+      </nav>}
     </div>
   </main>;
 }

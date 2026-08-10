@@ -1,6 +1,6 @@
 import type { ViewId } from './types';
 
-export type ProjectViewId = Exclude<ViewId, 'home' | 'ask' | 'settings' | 'project-settings' | 'admin'>;
+export type ProjectViewId = Exclude<ViewId, 'home' | 'ask' | 'settings' | 'project-settings' | 'admin' | 'more'>;
 
 export interface ProjectNavigationItem {
   id: ProjectViewId;

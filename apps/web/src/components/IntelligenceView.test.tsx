@@ -7,6 +7,13 @@ import { IntelligenceView } from './IntelligenceView';
 
 let root: Root | null = null;
 let container: HTMLDivElement;
+const originalMatchMedia = window.matchMedia;
+const mockPhoneViewport = () => {
+  window.matchMedia = vi.fn((query: string) => ({
+    matches: query.includes('767px') || query.includes('1023px'), media: query, onchange: null,
+    addListener: vi.fn(), removeListener: vi.fn(), addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn(),
+  }));
+};
 const tick = () => act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
 const metric = (median: number | null, denominator = median == null ? 0 : 1) => ({
   observedCount: denominator, partialCount: 0, unavailableCount: denominator ? 0 : 1, denominator,
@@ -44,9 +51,29 @@ const packet: ApiProjectIntelligence = {
   bounds: { from: '2026-07-10T00:00:00.000Z', to: '2026-08-10T00:00:00.000Z', caseLimit: 24, groupBy: 'executed_workflow' },
 };
 
-afterEach(() => { act(() => root?.unmount()); container?.remove(); root = null; vi.restoreAllMocks(); history.replaceState(null, '', '/'); });
+afterEach(() => { act(() => root?.unmount()); container?.remove(); root = null; window.matchMedia = originalMatchMedia; vi.restoreAllMocks(); history.replaceState(null, '', '/'); });
 
 describe('Project Intelligence surface (PLNR-302)', () => {
+  it('keeps the phone first paint compact and defers comparisons and cases', async () => {
+    mockPhoneViewport();
+    vi.spyOn(api, 'projectIntelligence').mockResolvedValue(packet);
+    container = document.createElement('div'); document.body.appendChild(container); root = createRoot(container);
+    act(() => root!.render(<IntelligenceView store={{ currentPid: 'prj_1' } as AppStore} />));
+    await tick();
+
+    expect(container.querySelectorAll('.intelligence-grid > article')).toHaveLength(6);
+    expect(container.textContent).not.toContain('insufficient evidence');
+    expect(container.textContent).not.toContain('Canonical case drill-down');
+    expect(container.querySelector<HTMLButtonElement>('button[aria-label="Analytics range"]')?.style.fontSize).toBe('9.5px');
+
+    const compare = [...container.querySelectorAll('button')].find((button) => button.textContent === 'Compare')!;
+    act(() => compare.click());
+    expect(container.textContent).toContain('insufficient evidence');
+    const cases = [...container.querySelectorAll('button')].find((button) => button.textContent === 'Cases')!;
+    act(() => cases.click());
+    expect(container.textContent).toContain('Canonical case drill-down');
+  });
+
   it('renders server-authored completeness and refuses to turn missing spend into zero', async () => {
     vi.spyOn(api, 'projectIntelligence').mockResolvedValue(packet);
     history.replaceState(null, '', '/p/prj_1/intelligence');

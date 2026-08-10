@@ -10,6 +10,20 @@ vi.mock('./Dialog', () => ({ confirm: vi.fn() }));
 
 let container: HTMLDivElement;
 let root: Root | null = null;
+const originalMatchMedia = window.matchMedia;
+
+function mockPhoneViewport() {
+  window.matchMedia = vi.fn((query: string) => ({
+    matches: query.includes('767px') || query.includes('1023px'),
+    media: query,
+    onchange: null,
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+    dispatchEvent: vi.fn(),
+  }));
+}
 
 const actions = {
   selectProject: vi.fn(),
@@ -71,6 +85,7 @@ afterEach(() => {
   act(() => root?.unmount());
   container?.remove();
   root = null;
+  window.matchMedia = originalMatchMedia;
   sessionStorage.clear();
   vi.restoreAllMocks();
   vi.mocked(confirm).mockReset();
@@ -78,6 +93,25 @@ afterEach(() => {
 });
 
 describe('global Ask chat', () => {
+  it('moves threads into a phone sheet and opens the model menu above the composer', async () => {
+    mockPhoneViewport();
+    vi.spyOn(api, 'askThreads').mockResolvedValue({ threads: [activeThread] });
+    vi.spyOn(api, 'askThread').mockResolvedValue(detailFor(activeThread));
+
+    mount();
+    await flush();
+
+    expect(container.querySelector('aside')).toBeNull();
+    const threads = [...container.querySelectorAll('button')].find((item) => item.textContent?.includes('Threads'))!;
+    act(() => threads.click());
+    expect(container.querySelector('[data-sheet-backdrop]')).toBeTruthy();
+    expect(container.querySelector('[data-testid="ask-thread-chat_active"]')).toBeTruthy();
+
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="Ask model"]')!.click());
+    expect(container.querySelector('.dd-menu')?.getAttribute('data-side')).toBe('top');
+    expect(container.querySelector('textarea')?.style.fontSize).toBe('16px');
+  });
+
   it('suggests accessible projects, inserts a normalized tag, and sends it intact', async () => {
     mockEmptyHistory();
     const ask = vi.spyOn(api, 'askStream').mockImplementation(async (_question, _threadId, handlers) => {

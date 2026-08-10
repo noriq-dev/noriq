@@ -4,6 +4,8 @@ import {
   type ChangeEvent, type CSSProperties, type ReactNode, type SelectHTMLAttributes,
 } from 'react';
 import { Dropdown, type DropdownOption, type DropdownVariant } from './Dropdown';
+import { Sheet } from './Sheet';
+import { useViewport } from '../viewport';
 
 export function Modal({ title, subtitle, onClose, children, width = 420 }: {
   title: string;
@@ -11,6 +13,22 @@ export function Modal({ title, subtitle, onClose, children, width = 420 }: {
   onClose: () => void;
   children: ReactNode;
   width?: number;
+}) {
+  const { phone } = useViewport();
+
+  if (phone) {
+    return <Sheet title={title} subtitle={subtitle} onClose={onClose}>{children}</Sheet>;
+  }
+
+  return <DesktopModal title={title} subtitle={subtitle} onClose={onClose} width={width}>{children}</DesktopModal>;
+}
+
+function DesktopModal({ title, subtitle, onClose, children, width }: {
+  title: string;
+  subtitle?: string;
+  onClose: () => void;
+  children: ReactNode;
+  width: number;
 }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
@@ -22,6 +40,7 @@ export function Modal({ title, subtitle, onClose, children, width = 420 }: {
     <>
       <div onClick={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.55)', zIndex: 50, backdropFilter: 'blur(2px)' }} />
       <div
+        role="presentation"
         style={{
           position: 'fixed', inset: 0, zIndex: 51,
           display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -29,6 +48,9 @@ export function Modal({ title, subtitle, onClose, children, width = 420 }: {
         }}
       >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
         style={{
           width,
           maxWidth: 'calc(100vw - 40px)',
@@ -50,7 +72,9 @@ export function Modal({ title, subtitle, onClose, children, width = 420 }: {
           </div>
           <div style={{ flex: 1 }} />
           <button
+            type="button"
             onClick={onClose}
+            aria-label={`Close ${title}`}
             className="drawer-x"
             style={{ cursor: 'pointer', color: 'var(--text-dim)', fontSize: 17, width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6 }}
           >
@@ -148,6 +172,7 @@ function normalizedSelectValue(value: SelectHTMLAttributes<HTMLSelectElement>['v
 type SelectProps = Omit<SelectHTMLAttributes<HTMLSelectElement>, 'multiple' | 'size'> & {
   variant?: DropdownVariant;
   menuWidth?: CSSProperties['width'];
+  side?: 'bottom' | 'top';
   placeholder?: string;
   invalid?: string;
 };
@@ -155,7 +180,7 @@ type SelectProps = Omit<SelectHTMLAttributes<HTMLSelectElement>, 'multiple' | 's
 /** Native-select-compatible adapter. Dropdown owns every visible selection surface. */
 export function Select({
   children, value, defaultValue, onChange, disabled, style, title, autoFocus,
-  variant: requestedVariant, menuWidth, placeholder, invalid, ...props
+  variant: requestedVariant, menuWidth, side, placeholder, invalid, ...props
 }: SelectProps) {
   const fieldLabel = useContext(FieldLabelContext);
   const controlled = value !== undefined;
@@ -195,6 +220,7 @@ export function Select({
       disabled={disabled}
       invalid={invalid}
       menuWidth={menuWidth}
+      side={side}
       containerStyle={containerStyle}
       triggerStyle={{ ...triggerStyle, width: '100%' }}
       title={title}
