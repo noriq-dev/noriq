@@ -79,6 +79,7 @@ export interface PreDispatchRiskResult {
     supportRule: 'two_independent_kinds';
     caseLimit: number;
     consideredCount: number;
+    coverage: { complete: boolean; candidatesConsidered: number; eligibleCases: number; reasons: string[] };
     cases: Array<PriorEffortCase & { contextMatch: {
       repository: boolean | null; branch: boolean | null; baseId: boolean | null;
     } }>;
@@ -282,6 +283,7 @@ export async function assessPreDispatchRisk(
       supportRule: 'two_independent_kinds',
       caseLimit: PRE_DISPATCH_CASE_LIMIT,
       consideredCount: prior.consideredCount,
+      coverage: prior.coverage,
       cases,
     },
   };

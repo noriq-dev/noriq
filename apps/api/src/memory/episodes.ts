@@ -29,6 +29,7 @@ import {
   INTELLIGENCE_EXTRACTION_VERSION, loadRunSittingEvidence, type EpisodeIntelligenceDraft,
 } from '../lib/run-sitting-intelligence';
 import { requestProjectAnalyticsRebuild } from './analytics';
+import { attachShadowOutcomeRef } from './shadow-dispatch';
 
 /** The subset of a `runs` row the skeleton needs — D1 column names, matching the shape
  *  `env.DB.prepare(...).first()` hands back. */
@@ -381,11 +382,15 @@ export async function loadEpisodeSkeleton(env: Env, projectId: string, runId: st
 export async function recordEpisodeForRun(env: Env, projectId: string, runId: string): Promise<void> {
   const skeleton = await loadEpisodeSkeleton(env, projectId, runId);
 
-  await env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)).recordEpisode(projectId, {
+  const recorded = await env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)).recordEpisode(projectId, {
     ...skeleton,
     actor: { kind: 'system', id: null },
     writeMode: 'skeleton',
   });
+  await attachShadowOutcomeRef(
+    env.DB, projectId, runId, skeleton.sitting, 'episode', recorded.episodeId,
+    skeleton.finishedAt ?? new Date().toISOString(),
+  );
   await requestProjectAnalyticsRebuild(env, projectId);
 }
 

@@ -26,6 +26,12 @@ import {
   recordSimilarityFeedback as persistSimilarityFeedback,
   type ObserveSimilarEffortInput, type OccurrenceCase, type RecordSimilarityFeedbackInput,
 } from '../memory/similarity-feedback';
+import {
+  attachShadowOutcomeRef as appendShadowOutcomeRef,
+  captureShadowDispatchSnapshot as buildShadowDispatchSnapshot,
+  recordShadowCaptureFailure,
+  type StoredShadowDispatchSnapshot,
+} from '../memory/shadow-dispatch';
 import type { ExecutionAssignment } from '@noriq-dev/shared';
 
 /**
@@ -576,6 +582,11 @@ export class ProjectRoom extends DurableObject<Env> {
       qualityEventId: id, operationKey: input.operationKey, type: input.type,
       runId: input.runId, sitting: input.sitting,
     }, [insert]);
+    if (input.runId && input.sitting) {
+      await appendShadowOutcomeRef(
+        this.env.DB, this.projectId, input.runId, input.sitting, 'quality_event', id, input.observedAt,
+      );
+    }
     return { id, operationKey: input.operationKey, type: input.type, deduped: false };
   }
 
@@ -629,6 +640,44 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.setPid(projectId);
       return persistSimilarityFeedback(this.env, this.projectId, actor.id, input);
     });
+  }
+
+  private scheduleShadowDispatchSnapshot(runId: string, sitting: number, capturedAt: string): void {
+    const projectId = this.projectId;
+    this.ctx.waitUntil(
+      buildShadowDispatchSnapshot(this.env, projectId, runId, sitting, capturedAt)
+        .then((stored) => {
+          if (!stored) throw new Error(`commissioning evidence for ${runId}/${sitting} was unavailable`);
+        })
+        .catch(async (error) => {
+          await recordShadowCaptureFailure(this.env.DB, projectId, runId, sitting, String(error), capturedAt);
+          console.warn(`shadow dispatch capture for ${runId}/${sitting} failed: ${String(error)}`);
+        }),
+    );
+  }
+
+  /** Explicit retry/test seam. Production dispatch calls scheduleShadowDispatchSnapshot and does
+   * not await this evidence work; INSERT OR IGNORE makes a replay return the original snapshot. */
+  async captureShadowDispatchSnapshot(
+    projectId: string,
+    runId: string,
+    sitting: number,
+    capturedAt?: string,
+  ): Promise<StoredShadowDispatchSnapshot | null> {
+    await this.setPid(projectId);
+    return buildShadowDispatchSnapshot(this.env, projectId, runId, sitting, capturedAt);
+  }
+
+  async attachShadowOutcomeRef(
+    projectId: string,
+    runId: string,
+    sitting: number,
+    refType: 'episode' | 'quality_event',
+    refId: string,
+    observedAt?: string,
+  ): Promise<{ attached: boolean }> {
+    await this.setPid(projectId);
+    return appendShadowOutcomeRef(this.env.DB, projectId, runId, sitting, refType, refId, observedAt);
   }
 
   async broadcast(data: string) {
@@ -3744,6 +3793,7 @@ export class ProjectRoom extends DurableObject<Env> {
     if (runnerId) await this.emit(actor, 'run.dispatched', 'run', id, { runnerId, to: 'dispatched' });
     const view = this.runToWire(await this.loadRun(id));
     view.execution = await ensureRunExecution(this.env, id);
+    if (runnerId) this.scheduleShadowDispatchSnapshot(id, 1, now);
     return view;
   }
 
@@ -3763,6 +3813,7 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.emit(actor, 'run.dispatched', 'run', runId, { runnerId, from: run.status, to: 'dispatched' });
       const view = this.runToWire(await this.loadRun(runId));
       view.execution = await ensureRunExecution(this.env, runId);
+      this.scheduleShadowDispatchSnapshot(runId, run.sitting, now);
       return view;
     });
   }
@@ -3864,6 +3915,7 @@ export class ProjectRoom extends DurableObject<Env> {
       }
       const view = this.runToWire(await this.loadRun(runId));
       view.execution = await ensureRunExecution(this.env, runId);
+      this.scheduleShadowDispatchSnapshot(runId, run.sitting + 1, now);
       return view;
     });
   }
