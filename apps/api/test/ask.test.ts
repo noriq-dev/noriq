@@ -16,14 +16,15 @@ import {
 } from '../src/ask-chats';
 import { askGenerationEventStream } from '../src/ask-generation';
 import {
+  ASK_TASK_ACTION_EXECUTORS,
   AskActionDeniedError, AskActionMaintenanceError, AskActionNotFoundError,
-  approveAskAction, createAskAction, getAskAction,
+  approveAskAction, createAskAction, getAskAction, normalizeAskCreateTaskArguments, normalizeAskUpdateTaskArguments,
 } from '../src/ask-actions';
 import {
   AskModelConfigurationError, AskModelSelectionError, askModelCatalog, resolveAskModel,
 } from '../src/ask-models';
 import {
-  MAX_ASK_TOOL_CALLS, createAskReadTools, extractAskToolCalls, finalAskMessages, runAskToolLoop, type AskTool,
+  MAX_ASK_TOOL_CALLS, createAskReadTools, createAskTools, extractAskToolCalls, finalAskMessages, runAskToolLoop, type AskTool,
 } from '../src/ask-tools';
 
 /** Fake generation client: records the prompts it saw, returns a canned answer. */
@@ -355,6 +356,140 @@ describe('Ask workspace read catalog', () => {
     const status = JSON.parse((await tools.find((tool) => tool.name === 'workspace_status')!.execute({})).content);
     expect(status.projects).toEqual([]);
     await expect(tools.find((tool) => tool.name === 'get_task')!.execute({ taskId })).rejects.toThrow(/not found/i);
+  });
+});
+
+describe('Ask confirmed single-task actions', () => {
+  const proposalTools = async (label: string) => {
+    const owner = await env.DB.prepare('SELECT owner_user_id AS id FROM projects WHERE id = ?')
+      .bind(projectId).first<{ id: string }>();
+    const thread = await createAskThread(env.DB, owner!.id, label);
+    const generation = await createAskGeneration(env.DB, owner!.id, thread.id, label, []);
+    return {
+      owner: owner!, thread, generation,
+      tools: createAskTools(env as unknown as Env, { userId: owner!.id }, [{ id: projectId, key: 'ASK', name: 'askable' }], {
+        userId: owner!.id, threadId: thread.id, messageId: generation.messageId, generationId: generation.id,
+      }),
+    };
+  };
+
+  it('proposes one tagged task without mutating, then creates it once as the approving human', async () => {
+    const title = `Ask confirmed task ${crypto.randomUUID()}`;
+    const { owner, tools } = await proposalTools('Confirm task create');
+    const create = tools.find((tool) => tool.name === 'propose_task_create')!;
+    const result = JSON.parse((await create.execute({
+      projectId, title, tags: ['ask'], body: 'Created only after confirmation.', priority: 1, type: 'chore',
+    })).content) as { action: { id: string; status: string }; mutationApplied: boolean };
+    expect(result).toMatchObject({ mutationApplied: false, action: { status: 'pending' } });
+    expect(await env.DB.prepare('SELECT id FROM tasks WHERE project_id = ? AND title = ?').bind(projectId, title).first()).toBeNull();
+
+    const approved = await SELF.fetch(`https://noriq.test/api/ask/actions/${result.action.id}/approve`, {
+      method: 'POST', headers: { Cookie: cookie },
+    });
+    expect(approved.status).toBe(200);
+    expect(await approved.json()).toMatchObject({ status: 'approved' });
+    const task = await env.DB.prepare('SELECT id FROM tasks WHERE project_id = ? AND title = ?').bind(projectId, title).first<{ id: string }>();
+    expect(task?.id).toBeTruthy();
+    expect(await env.DB.prepare(
+      "SELECT id FROM events WHERE subject_id = ? AND verb = 'task.created' AND actor_kind = 'human' AND actor_id = ?",
+    ).bind(task!.id, owner.id).first()).toBeTruthy();
+    expect((await SELF.fetch(`https://noriq.test/api/ask/actions/${result.action.id}/approve`, {
+      method: 'POST', headers: { Cookie: cookie },
+    })).status).toBe(200);
+    expect((await env.DB.prepare('SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND title = ?')
+      .bind(projectId, title).first<{ n: number }>())?.n).toBe(1);
+  });
+
+  it('records exact replacement before/after values and refuses a stale update atomically', async () => {
+    const target = await mcpCall(agent.apiKey, 'create_task', {
+      projectId, title: `Ask stale target ${crypto.randomUUID()}`, tags: ['ask'], body: 'Before proposal.',
+    });
+    const { owner, tools } = await proposalTools('Confirm stale task update');
+    const update = tools.find((tool) => tool.name === 'propose_task_update')!;
+    const result = JSON.parse((await update.execute({
+      projectId, taskId: target.body.key, set: { tags: ['payments'] },
+    })).content) as { action: { id: string; expected: { before: Record<string, unknown>; after: Record<string, unknown> } } };
+    expect(result.action.expected).toMatchObject({
+      before: { tags: ['ask'] },
+      after: { tags: ['payments'] },
+    });
+    expect(await env.DB.prepare('SELECT body FROM tasks WHERE id = ?').bind(target.body.id).first()).toMatchObject({ body: 'Before proposal.' });
+
+    // Simulate a tag-only concurrent edit. ProjectRoom intentionally does not bump the task row's
+    // updated_at for this relationship-only write, so the exact before snapshot must catch it.
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM task_tags WHERE task_id = ?').bind(target.body.id),
+      env.DB.prepare("INSERT INTO task_tags (task_id, tag_id) SELECT ?, id FROM tags WHERE project_id = ? AND name = 'payments'")
+        .bind(target.body.id, projectId),
+    ]);
+    const stale = await approveAskAction(
+      env as unknown as Env,
+      { id: owner.id, name: 'Agent Mint' },
+      result.action.id,
+      ASK_TASK_ACTION_EXECUTORS,
+    );
+    expect(stale).toMatchObject({ status: 'failed', error: expect.stringMatching(/changed since.*proposed/i) });
+    expect(await env.DB.prepare('SELECT body FROM tasks WHERE id = ?').bind(target.body.id).first()).toMatchObject({ body: 'Before proposal.' });
+    const tags = await env.DB.prepare('SELECT g.name FROM task_tags tt JOIN tags g ON g.id = tt.tag_id WHERE tt.task_id = ?')
+      .bind(target.body.id).all<{ name: string }>();
+    expect(tags.results.map((tag) => tag.name)).toEqual(['payments']);
+  });
+
+  it('updates one task after confirmation and refuses bulk, lifecycle, and planning-shaped inputs', async () => {
+    const target = await mcpCall(agent.apiKey, 'create_task', {
+      projectId, title: `Ask update target ${crypto.randomUUID()}`, tags: ['ask'], body: 'Original.',
+    });
+    const { owner, tools } = await proposalTools('Confirm current task update');
+    const update = tools.find((tool) => tool.name === 'propose_task_update')!;
+    const proposed = JSON.parse((await update.execute({
+      projectId, taskId: target.body.id, set: { body: 'Confirmed edit.', priority: 0, docIds: [] },
+    })).content) as { action: { id: string } };
+    expect(await env.DB.prepare('SELECT body FROM tasks WHERE id = ?').bind(target.body.id).first()).toMatchObject({ body: 'Original.' });
+    expect(await approveAskAction(env as unknown as Env, { id: owner.id, name: 'Agent Mint' }, proposed.action.id, ASK_TASK_ACTION_EXECUTORS))
+      .toMatchObject({ status: 'approved' });
+    expect(await env.DB.prepare('SELECT body, priority FROM tasks WHERE id = ?').bind(target.body.id).first())
+      .toMatchObject({ body: 'Confirmed edit.', priority: 0 });
+    expect(await env.DB.prepare(
+      "SELECT id FROM events WHERE subject_id = ? AND verb = 'task.updated' AND actor_kind = 'human' AND actor_id = ?",
+    ).bind(target.body.id, owner.id).first()).toBeTruthy();
+
+    expect(() => normalizeAskCreateTaskArguments({ projectId, title: 'Several', tags: ['ask'], tasks: [{ title: 'two' }] })).toThrow();
+    expect(() => normalizeAskUpdateTaskArguments({ projectId, taskId: target.body.id, set: { status: 'done' } })).toThrow();
+    expect(() => normalizeAskUpdateTaskArguments({ projectId, taskId: target.body.id, set: { executionSpec: null } })).toThrow();
+    const create = tools.find((tool) => tool.name === 'propose_task_create')!;
+    await expect(create.execute({ projectId, title: 'A second action', tags: ['ask'] })).rejects.toThrow(/only one task action/i);
+  });
+
+  it('preserves ProjectRoom human tag authority under a curated vocabulary', async () => {
+    const title = `Ask curated human create ${crypto.randomUUID()}`;
+    const { owner, tools } = await proposalTools('Confirm curated task create');
+    await env.DB.prepare("UPDATE projects SET tag_policy = 'curated' WHERE id = ?").bind(projectId).run();
+    try {
+      const result = JSON.parse((await tools.find((tool) => tool.name === 'propose_task_create')!.execute({
+        projectId, title, tags: [`unknown-${crypto.randomUUID()}`],
+      })).content) as { action: { id: string } };
+      const approved = await approveAskAction(env as unknown as Env, { id: owner.id, name: 'Agent Mint' }, result.action.id, ASK_TASK_ACTION_EXECUTORS);
+      expect(approved).toMatchObject({ status: 'approved', error: null });
+      expect(await env.DB.prepare('SELECT id FROM tasks WHERE project_id = ? AND title = ?').bind(projectId, title).first()).toBeTruthy();
+    } finally {
+      await env.DB.prepare("UPDATE projects SET tag_policy = 'open' WHERE id = ?").bind(projectId).run();
+    }
+  });
+
+  it('leaves no task when ProjectRoom rejects an invalid create target field', async () => {
+    const title = `Ask invalid board ${crypto.randomUUID()}`;
+    const { owner, tools } = await proposalTools('Confirm invalid task create');
+    const result = JSON.parse((await tools.find((tool) => tool.name === 'propose_task_create')!.execute({
+      projectId, title, tags: ['ask'], boardId: 'board_not_in_project',
+    })).content) as { action: { id: string } };
+    const failed = await approveAskAction(
+      env as unknown as Env,
+      { id: owner.id, name: 'Agent Mint' },
+      result.action.id,
+      ASK_TASK_ACTION_EXECUTORS,
+    );
+    expect(failed).toMatchObject({ status: 'failed', error: expect.stringMatching(/board.*not found/i) });
+    expect(await env.DB.prepare('SELECT id FROM tasks WHERE project_id = ? AND title = ?').bind(projectId, title).first()).toBeNull();
   });
 });
 

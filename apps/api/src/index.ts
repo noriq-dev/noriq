@@ -26,7 +26,7 @@ import { accessibleAskProjectsForUser, askGenerationEventStream } from './ask-ge
 import { AskModelSelectionError, askModelCatalog, resolveAskModel } from './ask-models';
 import {
   AskActionConflictError, AskActionDeniedError, AskActionMaintenanceError, AskActionNotFoundError,
-  approveAskAction, listAskActions, rejectAskAction, type AskActionExecutors,
+  ASK_TASK_ACTION_EXECUTORS, approveAskAction, listAskActions, rejectAskAction,
 } from './ask-actions';
 import { verifyUploadToken, resolveUploadSecret, signIngestToken, verifyIngestToken, type IngestClaims } from './lib/upload-token';
 import { USER_PROJECT_WHERE, taskWireStatus, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
@@ -1897,10 +1897,6 @@ const accessibleAskProjects = async (c: Context<AppContext>): Promise<AskProject
   return accessibleAskProjectsForUser(c.env, c.var.user!.id);
 };
 
-// Concrete normalized mutations are registered by the task-action slice. Keeping the lifecycle
-// executor map explicit makes an unknown or retired type fail closed.
-const ASK_ACTION_EXECUTORS: AskActionExecutors = {};
-
 const askActionError = (c: Context<AppContext>, error: unknown) => {
   const message = error instanceof Error ? error.message : 'Ask action failed';
   if (error instanceof AskActionNotFoundError) return c.json({ error: message }, 404);
@@ -1925,7 +1921,7 @@ app.get('/api/ask/actions', userAuth, async (c) => c.json({
 
 app.post('/api/ask/actions/:actionId/approve', userAuth, async (c) => {
   try {
-    return c.json(await approveAskAction(c.env, c.var.user!, c.req.param('actionId')!, ASK_ACTION_EXECUTORS));
+    return c.json(await approveAskAction(c.env, c.var.user!, c.req.param('actionId')!, ASK_TASK_ACTION_EXECUTORS));
   } catch (error) {
     return askActionError(c, error);
   }

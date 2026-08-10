@@ -6,7 +6,7 @@ import {
 } from './ask-chats';
 import { listWorkspaceProjects } from './lib/workspace-operations';
 import { resolveAskModel } from './ask-models';
-import { askToolDecisionClient, createAskReadTools, finalAskMessages, runAskToolLoop } from './ask-tools';
+import { askToolDecisionClient, createAskTools, finalAskMessages, runAskToolLoop } from './ask-tools';
 import { listAskActions } from './ask-actions';
 
 const encoder = new TextEncoder();
@@ -60,7 +60,12 @@ export async function runAskGeneration(env: Env, generationId: string): Promise<
     const projects = await accessibleAskProjectsForUser(env, generation.userId);
     const decision = askToolDecisionClient(env, model.id);
     if (!decision) throw new Error('no AI backend — asking questions requires the Workers AI (AI) binding');
-    const tools = createAskReadTools(env, { userId: generation.userId }, projects);
+    const tools = createAskTools(env, { userId: generation.userId }, projects, {
+      userId: generation.userId,
+      threadId: generation.threadId,
+      messageId: generation.messageId,
+      generationId: generation.id,
+    });
     const loop = await runAskToolLoop(
       decision,
       buildMessages(generation.question, projects, [], generation.history, false),

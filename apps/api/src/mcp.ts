@@ -28,7 +28,7 @@ import type { ProjectMemoryStub } from './lib/project-memory';
 import { loadPriorEffort, searchHitToEvidenceItem } from './lib/project-memory';
 import { refuseSpecWrite, specWriteRefusalMessage } from './lib/spec-authority';
 import { search, searchBackend, reindexProject } from './search';
-import { nearDupeGroups } from './lib/tags';
+import { nearDupeGroups, requireDescriptiveTags, validateTagNames } from './lib/tags';
 import { DOC_SKILL_MD } from './skill-docs';
 import { LOCKING_SKILL_MD } from './skill-locking';
 import { PLANNING_SKILL_MD } from './skill-planning';
@@ -300,35 +300,6 @@ async function resolveBlockerRef(
 }
 
 const asActor = (a: AgentIdentity): Actor => ({ kind: 'agent', id: a.id, name: a.name });
-
-// PLNR-171: agent-created tasks must carry descriptive tags — tags[0] is the task's
-// PRIMARY tag (its main topical bucket). A tag restating status/type/priority/milestone
-// is rejected: those concepts have dedicated fields, and a tag copy of them is noise
-// that rots. The denylist is compared on a normalized form (lowercase, separators → '-').
-const NON_DESCRIPTIVE_TAGS = new Set([
-  'todo', 'in-progress', 'inprogress', 'blocked', 'review', 'in-review', 'done',
-  'cancelled', 'canceled', 'backlog', 'wip', 'in-flight',
-  'bug', 'feature', 'chore', 'research', 'task', 'epic', 'story', 'ticket',
-  'p0', 'p1', 'p2', 'p3', 'p4', 'priority', 'high', 'medium', 'low', 'high-priority',
-  'low-priority', 'urgent', 'critical', 'milestone',
-]);
-const TAG_GUIDANCE =
-  'tags must be descriptive topic/area/component words (e.g. "oauth", "board-filters", "ws-resume"); ' +
-  'the FIRST tag is the primary tag. Status, type, priority, and milestone have dedicated fields — never restate them as tags.';
-
-/** Validate tag NAMES when present (docs: tags optional but still descriptive, PLNR-194). */
-function validateTagNames(tags: string[] | undefined): void {
-  for (const raw of tags ?? []) {
-    const norm = raw.trim().toLowerCase().replace(/[\s_]+/g, '-');
-    if (!norm) throw new Error(`empty tag — ${TAG_GUIDANCE}`);
-    if (NON_DESCRIPTIVE_TAGS.has(norm)) throw new Error(`"${raw}" is not a descriptive tag — ${TAG_GUIDANCE}`);
-  }
-}
-
-function requireDescriptiveTags(tags: string[] | undefined): void {
-  if (!tags?.length) throw new Error(`tags are required — ${TAG_GUIDANCE}`);
-  validateTagNames(tags);
-}
 
 // MCP tool annotations (PLNR-88). Without these, clients assume the spec defaults —
 // write + destructive + open-world — for every tool. Ours are more benign: reads are

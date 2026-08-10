@@ -1,6 +1,11 @@
 import type { Env } from './env';
 import { searchAskWorkspace, type AskProject, type AskSource, type ChatMessage } from './ask';
 import {
+  ASK_CREATE_TASK_ACTION, ASK_UPDATE_TASK_ACTION, createAskAction,
+  normalizeAskCreateTaskArguments, normalizeAskUpdateTaskArguments,
+} from './ask-actions';
+import { sha256Hex } from './lib/util';
+import {
   listWorkspaceProjects, searchWorkspaceTasks, workspaceDocs, workspaceMemory, workspacePlans, workspaceReview,
   workspaceStatus, workspaceTaskContext, workspaceTaskDetail,
   type WorkspaceReference, type WorkspaceScope,
@@ -38,6 +43,13 @@ export interface AskTool {
   description: string;
   inputSchema: JsonObject;
   execute(arguments_: JsonObject): Promise<AskToolResult>;
+}
+
+export interface AskActionProposalContext {
+  userId: string;
+  threadId: string;
+  messageId: string;
+  generationId: string;
 }
 
 export interface AskToolDecisionClient {
@@ -314,6 +326,142 @@ export function createAskReadTools(env: Env, scope: WorkspaceScope, projects: As
           content: jsonResult(result), sources: referenceSources(result.references),
           summary: `Ask read ${result.tasks.returned} task review item${result.tasks.returned === 1 ? '' : 's'} and ${result.memory.items.length} memory review item${result.memory.items.length === 1 ? '' : 's'} from ${result.project.key}.`,
         };
+      },
+    },
+  ];
+}
+
+const CREATE_TASK_INPUT_SCHEMA: JsonObject = {
+  type: 'object',
+  properties: {
+    projectId: { type: 'string', description: 'Explicit id of one accessible target project.' },
+    title: { type: 'string', description: 'Title for exactly one task.' },
+    tags: { type: 'array', minItems: 1, maxItems: 50, items: { type: 'string' }, description: 'Required descriptive project tags, primary first. Reuse the project vocabulary.' },
+    body: { type: 'string' },
+    priority: { type: 'integer', minimum: 0, maximum: 4 },
+    type: { type: 'string', enum: ['feature', 'bug', 'chore', 'research'] },
+    estimate: { type: 'integer', minimum: 0 },
+    dueAt: { type: 'string', format: 'date-time' },
+    boardId: { type: 'string' },
+    docIds: { type: 'array', maxItems: 50, items: { type: 'string' } },
+  },
+  required: ['projectId', 'title', 'tags'],
+  additionalProperties: false,
+};
+
+const UPDATE_TASK_SET_SCHEMA: JsonObject = {
+  type: 'object',
+  minProperties: 1,
+  properties: {
+    title: { type: 'string' }, body: { type: 'string' },
+    priority: { type: 'integer', minimum: 0, maximum: 4 },
+    type: { type: 'string', enum: ['feature', 'bug', 'chore', 'research'] },
+    estimate: { anyOf: [{ type: 'integer', minimum: 0 }, { type: 'null' }] },
+    dueAt: { anyOf: [{ type: 'string', format: 'date-time' }, { type: 'null' }] },
+    boardId: { type: 'string' },
+    tags: { type: 'array', maxItems: 50, items: { type: 'string' }, description: 'Whole replacement of the tag set; [] clears it.' },
+    docIds: { type: 'array', maxItems: 50, items: { type: 'string' }, description: 'Whole replacement of related docs; [] clears them.' },
+  },
+  additionalProperties: false,
+};
+
+const taskValue = (detail: Awaited<ReturnType<typeof workspaceTaskDetail>>, field: string): unknown => {
+  const task = detail.task as Record<string, unknown>;
+  if (field === 'dueAt') return task.due_at ?? null;
+  if (field === 'boardId') return task.board_id ?? null;
+  if (field === 'docIds') return (detail.docs as Array<Record<string, unknown>>).map((doc) => String(doc.id));
+  return task[field] ?? null;
+};
+
+const actionResult = (action: Awaited<ReturnType<typeof createAskAction>>): AskToolResult => ({
+  content: jsonResult({
+    action,
+    mutationApplied: false,
+    nextStep: 'The user must review and approve this single action before Noriq changes the task.',
+  }),
+  summary: `Ask proposed ${action.summary}; no mutation was applied.`,
+});
+
+/** Full Ask catalog. Proposal tools persist one confirmable action but never mutate a task. */
+export function createAskTools(
+  env: Env,
+  scope: WorkspaceScope,
+  projects: AskProject[],
+  proposal: AskActionProposalContext,
+): AskTool[] {
+  if (proposal.userId !== scope.userId) throw new Error('Ask proposal owner does not match workspace scope');
+  const byId = new Map(projects.map((project) => [project.id, project]));
+  let proposedAction = false;
+  const reserve = () => {
+    if (proposedAction) {
+      throw new Error('Only one task action can be proposed in a response. For multiple tasks, decomposition, or a plan, use Plans instead.');
+    }
+  };
+  const operationKey = async (type: string, args: Record<string, unknown>) =>
+    `${proposal.generationId}:${type}:${(await sha256Hex(JSON.stringify(args))).slice(0, 32)}`;
+  return [
+    ...createAskReadTools(env, scope, projects),
+    {
+      name: 'propose_task_create',
+      description: 'Propose creating exactly ONE user-defined task in one explicit accessible project. This only creates a pending confirmation action; it does not create the task. Use descriptive tags and existing board/doc ids. Never use for several tasks, task decomposition, a plan, or a suite of work—tell the user to continue in Plans instead.',
+      inputSchema: CREATE_TASK_INPUT_SCHEMA,
+      execute: async (raw) => {
+        reserve();
+        const args = normalizeAskCreateTaskArguments(raw);
+        const visible = (await listWorkspaceProjects(env, scope)).some((project) => project.id === args.projectId);
+        if (!visible || !byId.has(args.projectId)) throw new Error(`project ${args.projectId} not found`);
+        const action = await createAskAction(env.DB, {
+          ...proposal,
+          projectId: args.projectId,
+          type: ASK_CREATE_TASK_ACTION,
+          summary: `Create task “${args.title}” in ${byId.get(args.projectId)!.key}`,
+          arguments: args,
+          expected: { projectId: args.projectId },
+          operationKey: await operationKey(ASK_CREATE_TASK_ACTION, args),
+        });
+        proposedAction = true;
+        return actionResult(action);
+      },
+    },
+    {
+      name: 'propose_task_update',
+      description: 'Propose updating supported descriptive fields on exactly ONE accessible task. Reads the current task first and records exact before/after values. This only creates a pending confirmation action; it does not update the task. tags and docIds replace their whole sets. Status, claims, execution specs, dependencies, project moves, deletion, review acceptance, and plan changes are unavailable. For multi-task changes or planning, direct the user to Plans.',
+      inputSchema: {
+        type: 'object', properties: {
+          projectId: { type: 'string', description: 'Explicit target project id.' },
+          taskId: { type: 'string', description: 'One task id or display key.' },
+          set: UPDATE_TASK_SET_SCHEMA,
+        }, required: ['projectId', 'taskId', 'set'], additionalProperties: false,
+      },
+      execute: async (raw) => {
+        reserve();
+        const requested = normalizeAskUpdateTaskArguments(raw);
+        const detail = await workspaceTaskDetail(env, scope, requested.taskId);
+        const task = detail.task as Record<string, unknown>;
+        const canonical = normalizeAskUpdateTaskArguments({
+          projectId: String(task.project_id), taskId: String(task.id), set: requested.set,
+        });
+        if (canonical.projectId !== requested.projectId) throw new Error(`task ${requested.taskId} not found in project ${requested.projectId}`);
+        const before = Object.fromEntries(Object.keys(canonical.set).map((field) => [field, taskValue(detail, field)]));
+        const after = { ...before, ...canonical.set };
+        const expected = {
+          projectId: canonical.projectId,
+          taskId: canonical.taskId,
+          updatedAt: String(task.updated_at),
+          before,
+          after,
+        };
+        const action = await createAskAction(env.DB, {
+          ...proposal,
+          projectId: canonical.projectId,
+          type: ASK_UPDATE_TASK_ACTION,
+          summary: `Update ${String(task.key)}: ${Object.keys(canonical.set).join(', ')}`,
+          arguments: canonical,
+          expected,
+          operationKey: await operationKey(ASK_UPDATE_TASK_ACTION, canonical),
+        });
+        proposedAction = true;
+        return actionResult(action);
       },
     },
   ];

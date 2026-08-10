@@ -2,7 +2,76 @@ import type { Env } from './env';
 import { newId, nowIso } from './lib/util';
 import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
 import { projectRoleAllows, resolveAccountCapabilities, resolveProjectAccess, type ProjectAction } from './lib/authorization';
-import type { Actor } from './do/ProjectRoom';
+import type { Actor, CreateTaskInput, TaskPatch } from './do/ProjectRoom';
+import { requireDescriptiveTags, validateTagNames } from './lib/tags';
+import { z } from 'zod';
+
+export const ASK_CREATE_TASK_ACTION = 'create_task';
+export const ASK_UPDATE_TASK_ACTION = 'update_task';
+
+const taskType = z.enum(['feature', 'bug', 'chore', 'research']);
+const stringList = z.array(z.string().min(1).max(200)).max(50);
+const createTaskArgumentsSchema = z.object({
+  projectId: z.string().min(1),
+  title: z.string().trim().min(1).max(500),
+  tags: stringList.min(1),
+  body: z.string().max(40_000).optional(),
+  priority: z.number().int().min(0).max(4).optional(),
+  type: taskType.optional(),
+  estimate: z.number().int().min(0).optional(),
+  dueAt: z.string().datetime().optional(),
+  boardId: z.string().min(1).optional(),
+  docIds: stringList.optional(),
+}).strict();
+
+const updateTaskSetSchema = z.object({
+  title: z.string().trim().min(1).max(500).optional(),
+  body: z.string().max(40_000).optional(),
+  priority: z.number().int().min(0).max(4).optional(),
+  type: taskType.optional(),
+  estimate: z.number().int().min(0).nullable().optional(),
+  dueAt: z.string().datetime().nullable().optional(),
+  boardId: z.string().min(1).optional(),
+  tags: stringList.optional(),
+  docIds: stringList.optional(),
+}).strict().refine((set) => Object.keys(set).length > 0, 'at least one supported task field is required');
+
+const updateTaskArgumentsSchema = z.object({
+  projectId: z.string().min(1),
+  taskId: z.string().min(1),
+  set: updateTaskSetSchema,
+}).strict();
+
+const updateTaskExpectedSchema = z.object({
+  projectId: z.string().min(1),
+  taskId: z.string().min(1),
+  updatedAt: z.string().min(1),
+  before: z.record(z.string(), z.unknown()),
+  after: z.record(z.string(), z.unknown()),
+}).strict();
+
+export type AskCreateTaskArguments = z.infer<typeof createTaskArgumentsSchema>;
+export type AskUpdateTaskArguments = z.infer<typeof updateTaskArgumentsSchema>;
+
+const cleanList = (values: string[]): string[] => values.map((value) => value.trim());
+
+export function normalizeAskCreateTaskArguments(value: unknown): AskCreateTaskArguments {
+  const parsed = createTaskArgumentsSchema.parse(value);
+  parsed.tags = cleanList(parsed.tags);
+  if (parsed.docIds) parsed.docIds = cleanList(parsed.docIds);
+  requireDescriptiveTags(parsed.tags);
+  return parsed;
+}
+
+export function normalizeAskUpdateTaskArguments(value: unknown): AskUpdateTaskArguments {
+  const parsed = updateTaskArgumentsSchema.parse(value);
+  if (parsed.set.tags) {
+    parsed.set.tags = cleanList(parsed.set.tags);
+    validateTagNames(parsed.set.tags);
+  }
+  if (parsed.set.docIds) parsed.set.docIds = cleanList(parsed.set.docIds);
+  return parsed;
+}
 
 export type AskActionStatus = 'pending' | 'executing' | 'approved' | 'rejected' | 'failed';
 
@@ -282,3 +351,51 @@ export async function approveAskAction(
   }
   return (await getAskAction(env.DB, user.id, action.id))!;
 }
+
+const projectRoom = (env: Env, projectId: string) =>
+  env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName(projectId));
+
+const requireActionProject = (action: StoredAskAction, projectId: string): void => {
+  if (action.projectId !== projectId) throw new Error('Ask action project does not match its stored authorization target');
+};
+
+/** The only Ask task mutations. Both execute as the approving human through ProjectRoom. */
+export const ASK_TASK_ACTION_EXECUTORS: AskActionExecutors = {
+  [ASK_CREATE_TASK_ACTION]: {
+    async execute({ env, action, actor, arguments: raw }) {
+      const args = normalizeAskCreateTaskArguments(raw);
+      requireActionProject(action, args.projectId);
+      const input: CreateTaskInput = {
+        title: args.title,
+        tags: args.tags,
+        ...(args.body !== undefined ? { body: args.body } : {}),
+        ...(args.priority !== undefined ? { priority: args.priority } : {}),
+        ...(args.type !== undefined ? { type: args.type } : {}),
+        ...(args.estimate !== undefined ? { estimate: args.estimate } : {}),
+        ...(args.dueAt !== undefined ? { dueAt: args.dueAt } : {}),
+        ...(args.boardId !== undefined ? { boardId: args.boardId } : {}),
+        ...(args.docIds !== undefined ? { docIds: args.docIds } : {}),
+      };
+      return projectRoom(env, args.projectId).createTask(args.projectId, actor, input);
+    },
+  },
+  [ASK_UPDATE_TASK_ACTION]: {
+    async execute({ env, action, actor, arguments: raw, expected: rawExpected }) {
+      const args = normalizeAskUpdateTaskArguments(raw);
+      const expected = updateTaskExpectedSchema.parse(rawExpected);
+      requireActionProject(action, args.projectId);
+      if (expected.projectId !== args.projectId || expected.taskId !== args.taskId) {
+        throw new Error('Ask action expected state does not match its task target');
+      }
+      // The timestamp and exact reviewed fields are checked inside ProjectRoom before any
+      // partial tag, doc, or scalar update. `set` is a strict supported-field allowlist.
+      return projectRoom(env, args.projectId).updateTask(
+        args.projectId,
+        actor,
+        args.taskId,
+        { ...args.set } as TaskPatch,
+        { updatedAt: expected.updatedAt, before: expected.before },
+      );
+    },
+  },
+};

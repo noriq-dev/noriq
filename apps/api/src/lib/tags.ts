@@ -5,6 +5,34 @@
 
 const norm = (s: string) => s.trim().toLowerCase().replace(/[\s_]+/g, '-');
 
+// Shared task/doc vocabulary contract. Keep transports out of this rule: MCP, Ask, and any
+// future human-assistant surface should reject the same status/type/priority pseudo-tags.
+const NON_DESCRIPTIVE_TAGS = new Set([
+  'todo', 'in-progress', 'inprogress', 'blocked', 'review', 'in-review', 'done',
+  'cancelled', 'canceled', 'backlog', 'wip', 'in-flight',
+  'bug', 'feature', 'chore', 'research', 'task', 'epic', 'story', 'ticket',
+  'p0', 'p1', 'p2', 'p3', 'p4', 'priority', 'high', 'medium', 'low', 'high-priority',
+  'low-priority', 'urgent', 'critical', 'milestone',
+]);
+const TAG_GUIDANCE =
+  'tags must be descriptive topic/area/component words (e.g. "oauth", "board-filters", "ws-resume"); ' +
+  'the FIRST tag is the primary tag. Status, type, priority, and milestone have dedicated fields — never restate them as tags.';
+
+/** Validate tag names when present. Empty arrays are valid for replacement-style updates. */
+export function validateTagNames(tags: string[] | undefined): void {
+  for (const raw of tags ?? []) {
+    const normalized = norm(raw);
+    if (!normalized) throw new Error(`empty tag — ${TAG_GUIDANCE}`);
+    if (NON_DESCRIPTIVE_TAGS.has(normalized)) throw new Error(`"${raw}" is not a descriptive tag — ${TAG_GUIDANCE}`);
+  }
+}
+
+/** Task creation requires at least one descriptive tag, with the first as the primary tag. */
+export function requireDescriptiveTags(tags: string[] | undefined): void {
+  if (!tags?.length) throw new Error(`tags are required — ${TAG_GUIDANCE}`);
+  validateTagNames(tags);
+}
+
 /** Strip decorations that near-always mark a duplicate of an existing concept. */
 const stem = (s: string) => norm(s).replace(/-(system|systems|core)$/, '').replace(/ies$/, 'y').replace(/s$/, '');
 
