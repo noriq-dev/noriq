@@ -35,6 +35,7 @@ const actions = {
 const defaultModel = '@cf/openai/gpt-oss-120b';
 
 const now = '2026-08-09T12:00:00.000Z';
+const emptyContext = { usedChars: 0, limitChars: 32_000, percent: 0, compacted: false, omittedMessages: 0 };
 const activeThread: ApiAskThread = {
   id: 'chat_active', title: 'Release readiness', archivedAt: null, createdAt: now, updatedAt: now,
   messageCount: 2, lastMessage: 'Earlier answer',
@@ -46,6 +47,7 @@ const archivedThread: ApiAskThread = {
 
 const detailFor = (thread: ApiAskThread): ApiAskThreadDetail => ({
   ...thread,
+  context: emptyContext,
   messages: [
     { id: `${thread.id}_u`, role: 'user', content: thread.id === activeThread.id ? 'Earlier question' : 'Archived question', sources: [], reasoning: '', trace: [], mode: null, model: null, createdAt: now },
     { id: `${thread.id}_a`, role: 'assistant', content: thread.lastMessage!, sources: [], reasoning: '', trace: [], mode: null, model: null, createdAt: now },
@@ -79,6 +81,7 @@ beforeEach(() => {
     defaultModel,
     models: [{ id: defaultModel, label: 'GPT-OSS 120B', capabilities: { tools: true, streaming: true, reasoningSummary: true } }],
   });
+  vi.spyOn(api, 'askThreadContext').mockResolvedValue(emptyContext);
 });
 
 afterEach(() => {
@@ -170,6 +173,23 @@ describe('global Ask chat', () => {
     expect(Number.parseFloat(textarea.style.height)).toBeGreaterThan(120);
     expect(Number.parseFloat(textarea.style.height)).toBeLessThan(140);
     expect(textarea.style.overflowY).toBe('auto');
+  });
+
+  it('shows server-defined context usage beside Send and includes the current draft', async () => {
+    vi.spyOn(api, 'askThreads').mockResolvedValue({ threads: [activeThread] });
+    const detail = detailFor(activeThread);
+    detail.context = { usedChars: 23_000, limitChars: 32_000, percent: 72, compacted: true, omittedMessages: 18 };
+    vi.spyOn(api, 'askThread').mockResolvedValue(detail);
+    mount();
+    await flush();
+
+    const meter = container.querySelector<HTMLElement>('[role="meter"]')!;
+    expect(meter.getAttribute('aria-label')).toBe('Context 72%');
+    expect(meter.title).toContain('18 earlier messages compacted');
+    expect(container.querySelector<HTMLTextAreaElement>('textarea')!.maxLength).toBe(4000);
+
+    setTextarea('x'.repeat(1000));
+    expect(meter.getAttribute('aria-label')).toBe('Context 75%');
   });
 
   it('renders tagged project scope separately from evidence and opens the project', async () => {

@@ -15,11 +15,11 @@ import type { ExecutionSpecInput, RunStatus } from '@noriq-dev/shared';
 import { readExecutionSpec } from './lib/execution-spec';
 import { search, searchBackend, reindexProject, ALL_KINDS, type SearchKind } from './search';
 import {
-  answerQuestion, generationClient, normalizeAskReferences, normalizeHistory, streamingGenerationClient,
+  answerQuestion, generationClient, MAX_ASK_QUESTION_CHARS, normalizeAskReferences, normalizeHistory, streamingGenerationClient,
   type AskProject,
 } from './ask';
 import {
-  ASK_GENERATION_CANCELLED, askThreadHistory, cancelAskGeneration, createAskGeneration, createAskThread,
+  ASK_GENERATION_CANCELLED, askThreadContext, askThreadHistory, cancelAskGeneration, createAskGeneration, createAskThread,
   deleteAskThread, getAskGeneration, getAskThread, listAskThreads, setAskThreadArchived,
 } from './ask-chats';
 import { accessibleAskProjectsForUser, askGenerationEventStream } from './ask-generation';
@@ -2578,6 +2578,11 @@ app.get('/api/ask/threads/:threadId', userAuth, async (c) => {
   return thread ? c.json(thread) : c.json({ error: 'not found' }, 404);
 });
 
+app.get('/api/ask/threads/:threadId/context', userAuth, async (c) => {
+  const context = await askThreadContext(c.env.DB, c.var.user!.id, c.req.param('threadId')!);
+  return context ? c.json(context) : c.json({ error: 'not found' }, 404);
+});
+
 app.post('/api/ask/threads/:threadId/archive', userAuth, async (c) => {
   const ok = await setAskThreadArchived(c.env.DB, c.var.user!.id, c.req.param('threadId')!, true);
   return ok ? c.json({ ok: true, archived: true }) : c.json({ error: 'not found' }, 404);
@@ -2598,8 +2603,11 @@ app.post('/api/ask', userAuth, async (c) => {
   if (!rl.ok) return c.json(tooMany, 429, { 'Retry-After': String(rl.retryAfter) });
   const { question, history, references, model: requestedModel } = await c.req.json<{ question?: string; history?: unknown; references?: unknown; model?: string }>()
     .catch(() => ({ question: undefined, history: undefined, references: undefined, model: undefined }));
-  const q = question?.trim().slice(0, 4000);
+  const q = question?.trim();
   if (!q) return c.json({ error: 'question required' }, 400);
+  if (q.length > MAX_ASK_QUESTION_CHARS) {
+    return c.json({ error: `question exceeds ${MAX_ASK_QUESTION_CHARS} character limit` }, 413);
+  }
   let model;
   try {
     model = resolveAskModel(c.env, requestedModel);
@@ -2630,8 +2638,11 @@ app.post('/api/ask/stream', userAuth, async (c) => {
   if (!rl.ok) return c.json(tooMany, 429, { 'Retry-After': String(rl.retryAfter) });
   const { question, history, references, threadId, model: requestedModel } = await c.req.json<{ question?: string; history?: unknown; references?: unknown; threadId?: string; model?: string }>()
     .catch(() => ({ question: undefined, history: undefined, references: undefined, threadId: undefined, model: undefined }));
-  const q = question?.trim().slice(0, 4000);
+  const q = question?.trim();
   if (!q) return c.json({ error: 'question required' }, 400);
+  if (q.length > MAX_ASK_QUESTION_CHARS) {
+    return c.json({ error: `question exceeds ${MAX_ASK_QUESTION_CHARS} character limit` }, 413);
+  }
   let model;
   try {
     model = resolveAskModel(c.env, requestedModel);

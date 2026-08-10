@@ -2,7 +2,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   api, ApiError, type ApiAskAction, type ApiAskHistoryMessage, type ApiAskModelDefinition, type ApiAskSource,
-  type ApiAskInputReference, type ApiAskStoredMessage, type ApiAskThread, type ApiTaskSearchResult,
+  type ApiAskContextUsage, type ApiAskInputReference, type ApiAskStoredMessage, type ApiAskThread, type ApiTaskSearchResult,
 } from '../api';
 import type { AppStore } from '../store';
 import { MonoTag, WaveBars } from './bits';
@@ -29,6 +29,10 @@ const EXAMPLES = [
   'Compare the release plans across my projects.',
   'What do our memories say about recent architectural decisions?',
 ];
+
+const EMPTY_CONTEXT: ApiAskContextUsage = {
+  usedChars: 0, limitChars: 32_000, percent: 0, compacted: false, omittedMessages: 0,
+};
 
 export const askProjectTag = (name: string): string => `@${name
   .trim()
@@ -156,6 +160,7 @@ export function AskView({ store }: { store: AppStore }) {
   const [threadArchived, setThreadArchived] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(true);
   const [q, setQ] = useState('');
+  const [contextUsage, setContextUsage] = useState<ApiAskContextUsage>(EMPTY_CONTEXT);
   const [selectedReferences, setSelectedReferences] = useState<ApiAskInputReference[]>([]);
   const [activeProjectSuggestion, setActiveProjectSuggestion] = useState(0);
   const [taskSuggestions, setTaskSuggestions] = useState<ApiTaskSearchResult[]>([]);
@@ -352,6 +357,7 @@ export function AskView({ store }: { store: AppStore }) {
       if (request !== openRequestRef.current) return;
       setThreadId(detail.id);
       setThreadArchived(detail.archivedAt !== null);
+      setContextUsage(detail.context);
       const storedMessages = detail.messages.map(fromStoredMessage);
       setMessages(storedMessages);
       followScrollRef.current = true;
@@ -429,6 +435,7 @@ export function AskView({ store }: { store: AppStore }) {
     setHistoryLoading(false);
     setMessages([]);
     setQ('');
+    setContextUsage(EMPTY_CONTEXT);
     setSelectedReferences([]);
     setError('');
   };
@@ -464,6 +471,11 @@ export function AskView({ store }: { store: AppStore }) {
           });
         }), controller.signal, selectedModel, ...(references.length ? [references] : []));
       await refreshThreadLists(false);
+      const completedThreadId = activeThreadId ?? streamedThreadId;
+      if (completedThreadId) {
+        try { setContextUsage(await api.askThreadContext(completedThreadId)); }
+        catch { /* A completed answer remains valid if this secondary meter refresh fails. */ }
+      }
     } catch (e) {
       if (controller.signal.aborted) return;
       setMessages((current) => {
@@ -618,6 +630,9 @@ export function AskView({ store }: { store: AppStore }) {
   const visibleThreads = showArchived ? archivedThreads : threads;
   const activeGeneration = [...messages].reverse().find((message) =>
     message.generationId && ['pending', 'searching', 'generating'].includes(message.generationStatus ?? ''));
+  const contextPercent = Math.min(100, Math.round(
+    ((contextUsage.usedChars + q.length) / Math.max(1, contextUsage.limitChars)) * 100,
+  ));
 
   const threadPanel = (
     <>
@@ -854,7 +869,7 @@ export function AskView({ store }: { store: AppStore }) {
                   ))}
                 </div>
               )}
-              <textarea ref={composerRef} value={q} onChange={(event) => updateQuestion(event.target.value)} onKeyDown={(event) => {
+              <textarea ref={composerRef} value={q} maxLength={4000} onChange={(event) => updateQuestion(event.target.value)} onKeyDown={(event) => {
                 if (taskSuggestions.length > 0 && taskMentionQuery !== null && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
                   event.preventDefault();
                   setActiveTaskSuggestion((current) => event.key === 'ArrowDown'
@@ -898,6 +913,17 @@ export function AskView({ store }: { store: AppStore }) {
                 </label>
                 <div style={{ flex: 1 }} />
                 {!phone && <span style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>Shift+Enter for newline</span>}
+                <div
+                  role="meter"
+                  aria-label={`Context ${contextPercent}%`}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={contextPercent}
+                  title={`Context ${contextPercent}% of the automatic compaction budget${contextUsage.compacted ? ` · ${contextUsage.omittedMessages} earlier messages compacted` : ''}`}
+                  style={{ width: 27, height: 27, flex: 'none', display: 'grid', placeItems: 'center', borderRadius: '50%', background: `conic-gradient(${contextPercent >= 80 ? 'var(--amber)' : 'var(--accent)'} ${contextPercent}%, var(--w-08) 0)`, fontFamily: 'var(--mono)', fontSize: 7.5, color: 'var(--text-dim)' }}
+                >
+                  <span style={{ width: 21, height: 21, display: 'grid', placeItems: 'center', borderRadius: '50%', background: 'var(--card)' }}>{contextPercent}%</span>
+                </div>
                 {loading && <Button variant="ghost" onClick={() => void cancelGeneration()} disabled={!activeGeneration?.generationId}>Cancel</Button>}
                 <Button onClick={() => void ask()} disabled={!q.trim() || !selectedModel || loading || historyLoading || modelsLoading || threadArchived}>Send</Button>
               </div>

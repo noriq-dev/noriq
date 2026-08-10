@@ -1,7 +1,10 @@
 // Durable user-owned Ask threads. This module contains no routing or inference logic: routes
 // establish the signed-in user, then these helpers enforce ownership in every query.
 
-import { normalizeAskReferences, type AskHistoryMessage, type AskInputReference, type AskSource } from './ask';
+import {
+  compactAskHistory, normalizeAskReferences,
+  type AskContextUsage, type AskHistoryMessage, type AskInputReference, type AskSource,
+} from './ask';
 import { DEFAULT_ASK_MODEL_ID } from './ask-models';
 import { listAskActions, type StoredAskAction } from './ask-actions';
 import { newId, nowIso } from './lib/util';
@@ -59,6 +62,7 @@ export interface StoredAskGeneration {
 
 export interface AskThreadDetail extends AskThreadSummary {
   messages: StoredAskMessage[];
+  context: AskContextUsage;
 }
 
 const titleFrom = (value: string): string => value.trim().replace(/\s+/g, ' ').slice(0, 100) || 'New chat';
@@ -145,6 +149,7 @@ export async function getAskThread(db: D1Database, userId: string, threadId: str
     messageCount: messages.length,
     lastMessage: messages.at(-1)?.content ?? null,
     messages,
+    context: compactAskHistory(messages, true).usage,
   };
 }
 
@@ -152,14 +157,25 @@ export async function askThreadHistory(
   db: D1Database,
   userId: string,
   threadId: string,
-  limit = 12,
+  _limit?: number,
 ): Promise<{ thread: AskThreadSummary; history: AskHistoryMessage[] } | null> {
   const detail = await getAskThread(db, userId, threadId);
   if (!detail) return null;
   return {
     thread: detail,
-    history: detail.messages.slice(-limit).map(({ role, content, references }) => ({ role, content, references })),
+    history: compactAskHistory(
+      detail.messages.map(({ role, content, references }) => ({ role, content, references })), true,
+    ).history,
   };
+}
+
+export async function askThreadContext(
+  db: D1Database,
+  userId: string,
+  threadId: string,
+): Promise<AskContextUsage | null> {
+  const detail = await getAskThread(db, userId, threadId);
+  return detail?.context ?? null;
 }
 
 export async function appendAskMessage(

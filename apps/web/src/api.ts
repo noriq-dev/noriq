@@ -458,6 +458,7 @@ export const api = {
   askThreads: (archived = false) =>
     req<{ threads: ApiAskThread[] }>('GET', `/api/ask/threads${archived ? '?archived=1' : ''}`),
   askThread: (threadId: string) => req<ApiAskThreadDetail>('GET', `/api/ask/threads/${threadId}`),
+  askThreadContext: (threadId: string) => req<ApiAskContextUsage>('GET', `/api/ask/threads/${threadId}/context`),
   archiveAskThread: (threadId: string) => req<{ ok: true; archived: true }>('POST', `/api/ask/threads/${threadId}/archive`),
   restoreAskThread: (threadId: string) => req<{ ok: true; archived: false }>('POST', `/api/ask/threads/${threadId}/restore`),
   deleteAskThread: (threadId: string) => req<{ ok: true }>('DELETE', `/api/ask/threads/${threadId}`),
@@ -1214,6 +1215,15 @@ export interface ApiAskStoredMessage extends ApiAskHistoryMessage {
 
 export interface ApiAskThreadDetail extends ApiAskThread {
   messages: ApiAskStoredMessage[];
+  context: ApiAskContextUsage;
+}
+
+export interface ApiAskContextUsage {
+  usedChars: number;
+  limitChars: number;
+  percent: number;
+  compacted: boolean;
+  omittedMessages: number;
 }
 
 /** One hit from /api/projects/:pid/search (PLNR-184; memory/episode kinds added PLNR-255). */

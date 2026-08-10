@@ -19,8 +19,11 @@ export const DEFAULT_ASK_MAX_OUTPUT_TOKENS = 4096;
 export const MIN_ASK_MAX_OUTPUT_TOKENS = 256;
 export const MAX_ASK_MAX_OUTPUT_TOKENS = 32768;
 const TOOL_DECISION_TOKENS = 256;
-const MAX_QUESTION_CHARS = 4000;
-const MAX_HISTORY_MESSAGES = 12;
+export const MAX_ASK_QUESTION_CHARS = 4000;
+export const MAX_ASK_CONTEXT_CHARS = 32_000;
+const ASK_COMPACT_AT_CHARS = 27_200;
+const ASK_COMPACT_TARGET_CHARS = 18_000;
+const MAX_HISTORY_MESSAGES = 24;
 const MAX_HISTORY_CHARS = 4000;
 const GRAPH_SEED_PROJECTS = 4;
 const GRAPH_BOOST = 0.2;
@@ -37,6 +40,94 @@ export type AskInputReference =
 export interface AskHistoryMessage extends Pick<ChatMessage, 'role' | 'content'> {
   /** Server-stored composer selections. Client-supplied history never gets to populate this. */
   references?: AskInputReference[];
+}
+
+export interface AskContextUsage {
+  usedChars: number;
+  limitChars: number;
+  percent: number;
+  compacted: boolean;
+  omittedMessages: number;
+}
+
+const historySize = (history: readonly AskHistoryMessage[]) =>
+  history.reduce((total, message) => total + message.content.length + 16, 0);
+
+const compactedExcerpt = (content: string): string => {
+  const normalized = content.replace(/\s+/g, ' ').trim();
+  return normalized.length <= 240 ? normalized : `${normalized.slice(0, 157)} … ${normalized.slice(-78)}`;
+};
+
+/** Deterministic context compaction keeps recent turns verbatim (within per-message bounds) and
+ * represents omitted turns as clearly labeled, non-authoritative excerpts. Canonical chat rows are
+ * never rewritten or deleted, so a later UI reload still shows the complete conversation. */
+export function compactAskHistory(value: unknown, preserveReferences = false): {
+  history: AskHistoryMessage[];
+  usage: AskContextUsage;
+} {
+  if (!Array.isArray(value)) return {
+    history: [],
+    usage: { usedChars: 0, limitChars: MAX_ASK_CONTEXT_CHARS, percent: 0, compacted: false, omittedMessages: 0 },
+  };
+  const normalized = value
+    .filter((message): message is { role: 'user' | 'assistant'; content: string; references?: unknown } =>
+      !!message && typeof message === 'object'
+      && ((message as { role?: unknown }).role === 'user' || (message as { role?: unknown }).role === 'assistant')
+      && typeof (message as { content?: unknown }).content === 'string')
+    .map((message): AskHistoryMessage => ({
+      role: message.role,
+      content: message.content.trim().length > MAX_HISTORY_CHARS
+        ? `${message.content.trim().slice(0, 2600)}\n\n[message compacted]\n\n${message.content.trim().slice(-1300)}`
+        : message.content.trim(),
+      ...(preserveReferences ? { references: normalizeAskReferences(message.references) } : {}),
+    }))
+    .filter((message) => message.content.length > 0);
+  const mustCompact = normalized.length > MAX_HISTORY_MESSAGES || historySize(normalized) > ASK_COMPACT_AT_CHARS;
+  if (!mustCompact) {
+    const usedChars = historySize(normalized);
+    return {
+      history: normalized,
+      usage: {
+        usedChars,
+        limitChars: MAX_ASK_CONTEXT_CHARS,
+        percent: Math.min(100, Math.round((usedChars / MAX_ASK_CONTEXT_CHARS) * 100)),
+        compacted: false,
+        omittedMessages: 0,
+      },
+    };
+  }
+
+  const recent: AskHistoryMessage[] = [];
+  let recentChars = 0;
+  for (let index = normalized.length - 1; index >= 0 && recent.length < MAX_HISTORY_MESSAGES - 1; index -= 1) {
+    const message = normalized[index]!;
+    const size = historySize([message]);
+    if (recent.length >= 2 && recentChars + size > ASK_COMPACT_TARGET_CHARS) break;
+    recent.unshift(message);
+    recentChars += size;
+  }
+  const omitted = normalized.slice(0, normalized.length - recent.length);
+  const excerpts = omitted.slice(-14).map((message) =>
+    `- ${message.role === 'user' ? 'USER' : 'ASSISTANT'}: ${compactedExcerpt(message.content)}`);
+  const summary: AskHistoryMessage = {
+    role: 'user',
+    content: [
+      `[Earlier conversation compacted: ${omitted.length} message${omitted.length === 1 ? '' : 's'} omitted. These excerpts are conversation continuity only, not current workspace evidence.]`,
+      ...excerpts,
+    ].join('\n'),
+  };
+  const history = [summary, ...recent];
+  const usedChars = historySize(history);
+  return {
+    history,
+    usage: {
+      usedChars,
+      limitChars: MAX_ASK_CONTEXT_CHARS,
+      percent: Math.min(100, Math.round((usedChars / MAX_ASK_CONTEXT_CHARS) * 100)),
+      compacted: true,
+      omittedMessages: omitted.length,
+    },
+  };
 }
 
 export interface GenerationClient {
@@ -386,7 +477,7 @@ export function extractRetrievalToolQuery(value: unknown): string | null {
     if (!args && typeof raw === 'string') {
       try { args = asObject(JSON.parse(raw)); } catch { /* malformed call falls back to question */ }
     }
-    return typeof args?.query === 'string' && args.query.trim() ? args.query.trim().slice(0, MAX_QUESTION_CHARS) : '';
+    return typeof args?.query === 'string' && args.query.trim() ? args.query.trim().slice(0, MAX_ASK_QUESTION_CHARS) : '';
   }
   return null;
 }
@@ -434,15 +525,7 @@ export function retrievalDecisionClient(env: Env, model = GENERATION_MODEL): Ret
 /** Accept only user/assistant content from the client. System messages are never
  * trusted, and both message count and individual content are bounded before reaching the model. */
 export function normalizeHistory(value: unknown): AskHistoryMessage[] {
-  if (!Array.isArray(value)) return [];
-  return value
-    .filter((m): m is { role: 'user' | 'assistant'; content: string } =>
-      !!m && typeof m === 'object'
-      && ((m as { role?: unknown }).role === 'user' || (m as { role?: unknown }).role === 'assistant')
-      && typeof (m as { content?: unknown }).content === 'string')
-    .slice(-MAX_HISTORY_MESSAGES)
-    .map((m) => ({ role: m.role, content: m.content.trim().slice(0, MAX_HISTORY_CHARS) }))
-    .filter((m) => m.content.length > 0);
+  return compactAskHistory(value).history;
 }
 
 const projectMemory = (env: Env, projectId: string): ProjectMemoryStub =>
@@ -762,7 +845,7 @@ export async function searchAskWorkspace(env: Env, query: string, projects: AskP
 }
 
 export async function prepareQuestion(env: Env, opts: AskOptions): Promise<PreparedAsk> {
-  const question = opts.question.trim().slice(0, MAX_QUESTION_CHARS);
+  const question = opts.question.trim().slice(0, MAX_ASK_QUESTION_CHARS);
   const history = normalizeHistory(opts.history);
   const model = opts.model ?? GENERATION_MODEL;
   const projectTags = resolveAskProjectTagsForTurn(question, opts.history ?? [], opts.projects, opts.references);
