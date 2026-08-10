@@ -31,6 +31,32 @@ export interface ProjectionPlan {
   invalidEdges: Array<{ edge: StagedEdgeForProjection; reason: string }>;
 }
 
+export function projectionEntityProblem(
+  projectKey: string,
+  entity: StagedEntityForProjection,
+  repositoryKey?: string,
+): string | null {
+  const parsed = MemoryNode.safeParse({ id: 'validate', projectKey, type: entity.type, uri: entity.uri, label: entity.label });
+  if (!parsed.success) return parsed.error.issues[0]?.message ?? 'invalid staged entity';
+  if (!repositoryKey) return null;
+  try {
+    const ref = parseEntityUri(entity.uri);
+    if (!('repositoryKey' in ref) || ref.repositoryKey !== repositoryKey) {
+      return `uri does not belong to repository "${repositoryKey}"`;
+    }
+    if (ref.kind !== entity.type) return `node type "${entity.type}" does not match uri kind "${ref.kind}"`;
+  } catch {
+    return 'uri is not a valid repository entity uri';
+  }
+  return null;
+}
+
+export function projectionEdgeTypeProblem(edge: StagedEdgeForProjection): string | null {
+  return (MemoryEdgeType.options as readonly string[]).includes(edge.type)
+    ? null
+    : `edge type "${edge.type}" is not in MemoryEdgeType`;
+}
+
 /**
  * Validate staged rows BEFORE any SQL write. `MemoryNode`'s cross-project URI refinement is
  * otherwise dead code — `writeNode` performs no zod validation on its loose string inputs — so
@@ -48,36 +74,20 @@ export function planProjection(
   const validEntities: StagedEntityForProjection[] = [];
   const invalidEntities: Array<{ uri: string; reason: string }> = [];
   for (const e of entities) {
-    const parsed = MemoryNode.safeParse({ id: 'validate', projectKey, type: e.type, uri: e.uri, label: e.label });
-    if (!parsed.success) {
-      invalidEntities.push({ uri: e.uri, reason: parsed.error.issues[0]?.message ?? 'invalid staged entity' });
+    const problem = projectionEntityProblem(projectKey, e, repositoryKey);
+    if (problem) {
+      invalidEntities.push({ uri: e.uri, reason: problem });
       continue;
-    }
-    if (repositoryKey) {
-      try {
-        const ref = parseEntityUri(e.uri);
-        if (!('repositoryKey' in ref) || ref.repositoryKey !== repositoryKey) {
-          invalidEntities.push({ uri: e.uri, reason: `uri does not belong to repository "${repositoryKey}"` });
-          continue;
-        }
-        if (ref.kind !== e.type) {
-          invalidEntities.push({ uri: e.uri, reason: `node type "${e.type}" does not match uri kind "${ref.kind}"` });
-          continue;
-        }
-      } catch {
-        invalidEntities.push({ uri: e.uri, reason: 'uri is not a valid repository entity uri' });
-        continue;
-      }
     }
     validEntities.push(e);
   }
   const validEntityUris = new Set(validEntities.map((e) => e.uri));
-  const validEdgeTypes = new Set<string>(MemoryEdgeType.options);
   const validEdges: StagedEdgeForProjection[] = [];
   const invalidEdges: Array<{ edge: StagedEdgeForProjection; reason: string }> = [];
   for (const e of edges) {
-    if (!validEdgeTypes.has(e.type)) {
-      invalidEdges.push({ edge: e, reason: `edge type "${e.type}" is not in MemoryEdgeType` });
+    const typeProblem = projectionEdgeTypeProblem(e);
+    if (typeProblem) {
+      invalidEdges.push({ edge: e, reason: typeProblem });
     } else if (!validEntityUris.has(e.fromUri) || !validEntityUris.has(e.toUri)) {
       // Referential integrity was already checked at stage time (PLNR-261's
       // indexStagingIntegrityProblems) against ALL staged entities — this narrower check is

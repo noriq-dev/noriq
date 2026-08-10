@@ -64,7 +64,10 @@ import {
   SIMILARITY_JUDGMENTS, SIMILARITY_REASON_CODES, SimilarityFeedbackError,
   type SimilarityJudgment, type SimilarityReasonCode,
 } from './memory/similarity-feedback';
-import { readBoundedBody, verifyBatchChecksum, decodeBatchRows, MAX_INGEST_BATCH_BYTES, INGEST_TOKEN_TTL_SECONDS } from './memory/ingest';
+import {
+  readBoundedBody, verifyBatchChecksum, decodeBatchRows, ingestCompletionErrorStatus,
+  MAX_INGEST_BATCH_BYTES, INGEST_TOKEN_TTL_SECONDS,
+} from './memory/ingest';
 import { normalizeVerificationReport } from './memory/verification';
 import { sweepPendingEpisodeJobs } from './memory/episodes';
 import {
@@ -5023,7 +5026,7 @@ app.post('/api/memory-ingest/:token/complete', async (c) => {
     }
     return c.json(result);
   } catch (err) {
-    return c.json({ error: String(err) }, 409);
+    return c.json({ error: String(err) }, ingestCompletionErrorStatus(err));
   }
 });
 

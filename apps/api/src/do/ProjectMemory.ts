@@ -21,14 +21,14 @@ import { searchBackend, indexEntity, removeEntity, clampMetadataTopK } from '../
 import { codeSearchBackend, indexCodeEntity, removeCodeEntity, type CodeEntityType } from '../memory/code-index';
 import {
   parseStagedRow,
-  computeStagedContentHash, stagedRowsCanonicalBytes,
+  OrderedStagedContentHasher, stagedRowsCanonicalBytes,
   MAX_INDEX_GENERATION_BATCHES, MAX_INDEX_GENERATION_BYTES, MAX_INDEX_GENERATION_FILES, MAX_INDEX_GENERATION_ROWS,
   beginIngestEpisode, applyIngestEpisodeBatch, completeIngestEpisode, abortIngestEpisode, type IngestEpisodeState,
   type EpisodeUploadManifest,
 } from '../memory/ingest';
-import { IndexGenerationManifest, type IndexBatch, type StagedRow } from '@noriq-dev/shared';
+import { IndexGenerationManifest, type IndexBatch } from '@noriq-dev/shared';
 import {
-  planProjection, changedFileUris, coChangePairs, CO_CHANGE_PAIR_CAP,
+  projectionEntityProblem, projectionEdgeTypeProblem, coChangePairs, CO_CHANGE_PAIR_CAP,
   mapCoordinationEvent, evidenceCitationNodes, EVIDENCE_EDGE_TYPE,
 } from '../memory/projection';
 import type { ProjectedEdgeDescriptor } from '../memory/projection';
@@ -1835,33 +1835,53 @@ export class ProjectMemory extends DurableObject<Env> {
       .toArray()[0]!.n;
     if (fileEntities !== gen.file_count) problems.push(`manifest declares fileCount ${gen.file_count}, staged ${fileEntities} file entities`);
     problems.push(...this.indexStagingIntegrityProblems(generationId));
-    const stagedEntities = this.ctx.storage.sql
-      .exec<{ uri: string; type: string; label: string; content: string | null }>(
-        `SELECT uri, type, label, content FROM index_staged_entities WHERE generation_id = ?1`, generationId,
-      ).toArray();
-    const stagedEdges = this.ctx.storage.sql
-      .exec<{ type: string; from_uri: string; to_uri: string }>(
-        `SELECT type, from_uri, to_uri FROM index_staged_edges WHERE generation_id = ?1`, generationId,
-      ).toArray();
-    const uniqueRows: StagedRow[] = [
-      ...stagedEntities.map((e) => ({ kind: 'node' as const, ...e })),
-      ...stagedEdges.map((e) => ({ kind: 'edge' as const, type: e.type, from: e.from_uri, to: e.to_uri })),
-    ];
+    const stagedRows = this.ctx.storage.sql
+      .exec<{ n: number }>(
+        `SELECT
+           (SELECT COUNT(*) FROM index_staged_entities WHERE generation_id = ?1) +
+           (SELECT COUNT(*) FROM index_staged_edges WHERE generation_id = ?1) AS n`,
+        generationId,
+      ).toArray()[0]!.n;
     const receivedRows = this.ctx.storage.sql
       .exec<{ n: number }>(`SELECT COALESCE(SUM(row_count), 0) AS n FROM index_batches WHERE generation_id = ?1`, generationId)
       .toArray()[0]!.n;
-    if (receivedRows !== uniqueRows.length) problems.push(`received ${receivedRows} rows but staged ${uniqueRows.length} unique rows`);
-    const actualHash = await computeStagedContentHash(uniqueRows);
+    if (receivedRows !== stagedRows) problems.push(`received ${receivedRows} rows but staged ${stagedRows} unique rows`);
+    const hasher = new OrderedStagedContentHasher();
+    for (const entity of this.ctx.storage.sql.exec<{ uri: string; type: string; label: string; content: string | null }>(
+      `SELECT uri, type, label, content FROM index_staged_entities WHERE generation_id = ?1 ORDER BY uri`,
+      generationId,
+    )) {
+      hasher.update({ kind: 'node', ...entity });
+    }
+    for (const edge of this.ctx.storage.sql.exec<{ type: string; from_uri: string; to_uri: string }>(
+      `SELECT type, from_uri, to_uri FROM index_staged_edges
+       WHERE generation_id = ?1 ORDER BY from_uri, type, to_uri`,
+      generationId,
+    )) {
+      hasher.update({ kind: 'edge', type: edge.type, from: edge.from_uri, to: edge.to_uri });
+    }
+    const actualHash = hasher.digestHex();
     if (actualHash !== gen.content_hash) problems.push(`contentHash mismatch: expected ${gen.content_hash}, computed ${actualHash}`);
     const projectKey = await this.resolveProjectKey(projectId);
-    const plan = planProjection(
-      projectKey,
-      stagedEntities,
-      stagedEdges.map((e) => ({ type: e.type, fromUri: e.from_uri, toUri: e.to_uri })),
-      gen.repository_key,
-    );
-    for (const bad of plan.invalidEntities) problems.push(`invalid entity ${bad.uri}: ${bad.reason}`);
-    for (const bad of plan.invalidEdges) problems.push(`invalid edge ${bad.edge.fromUri} -[${bad.edge.type}]-> ${bad.edge.toUri}: ${bad.reason}`);
+    let omittedValidationProblems = 0;
+    const addValidationProblem = (problem: string) => {
+      if (problems.length < 100) problems.push(problem);
+      else omittedValidationProblems++;
+    };
+    for (const entity of this.ctx.storage.sql.exec<{ uri: string; type: string; label: string }>(
+      `SELECT uri, type, label FROM index_staged_entities WHERE generation_id = ?1`, generationId,
+    )) {
+      const reason = projectionEntityProblem(projectKey, { ...entity, content: null }, gen.repository_key);
+      if (reason) addValidationProblem(`invalid entity ${entity.uri}: ${reason}`);
+    }
+    for (const edge of this.ctx.storage.sql.exec<{ type: string; from_uri: string; to_uri: string }>(
+      `SELECT type, from_uri, to_uri FROM index_staged_edges WHERE generation_id = ?1`, generationId,
+    )) {
+      const projected = { type: edge.type, fromUri: edge.from_uri, toUri: edge.to_uri };
+      const reason = projectionEdgeTypeProblem(projected);
+      if (reason) addValidationProblem(`invalid edge ${projected.fromUri} -[${projected.type}]-> ${projected.toUri}: ${reason}`);
+    }
+    if (omittedValidationProblems) problems.push(`${omittedValidationProblems} additional validation problem(s) omitted`);
     this.ctx.storage.sql.exec(
       `UPDATE index_generations SET sealed_at = ?2, validation_problems = ?3 WHERE id = ?1`,
       generationId,
@@ -1895,68 +1915,81 @@ export class ProjectMemory extends DurableObject<Env> {
     };
   }
 
-  private stagedProjectionPlan(projectKey: string, generationId: string, repositoryKey: string) {
-    const entities = this.ctx.storage.sql
-      .exec<{ uri: string; type: string; label: string; content: string | null }>(
-        `SELECT uri, type, label, content FROM index_staged_entities WHERE generation_id = ?1`, generationId,
-      ).toArray();
-    const edges = this.ctx.storage.sql
-      .exec<{ type: string; from_uri: string; to_uri: string }>(
-        `SELECT type, from_uri, to_uri FROM index_staged_edges WHERE generation_id = ?1`, generationId,
-      ).toArray();
-    return planProjection(
-      projectKey,
-      entities,
-      edges.map((e) => ({ type: e.type, fromUri: e.from_uri, toUri: e.to_uri })),
-      repositoryKey,
-    );
-  }
-
   /** Apply graph rows, retirement, revision and idempotency bookkeeping inside the caller's
-   * transaction. Generation status changes are deliberately performed in that same transaction. */
+   * transaction. The staged cursors are consumed one row at a time; source `content` is neither
+   * selected nor copied because graph projection only needs uri/type/label. Generation status
+   * changes are deliberately performed in that same transaction. */
   private applyGenerationProjection(
     generationId: string,
     previousGenerationId: string | null,
-    plan: ReturnType<typeof planProjection>,
   ): { nodesWritten: number; edgesWritten: number; entitiesSkipped: number; edgesSkipped: number; retired: number; coChangeEdges: number } {
+    let nodesWritten = 0;
+    let edgesWritten = 0;
     let retired = 0;
     let coChangeEdges = 0;
     const now = nowIso();
-    for (const e of plan.validEntities) {
+    for (const e of this.ctx.storage.sql.exec<{ uri: string; type: string; label: string }>(
+      `SELECT uri, type, label FROM index_staged_entities WHERE generation_id = ?1`, generationId,
+    )) {
       this.ctx.storage.sql.exec(
         `INSERT INTO nodes (id, type, uri, label, created_at) VALUES (?1,?2,?3,?4,?5)
          ON CONFLICT (uri) DO UPDATE SET label = excluded.label, type = excluded.type`,
         newId('node'), e.type, e.uri, e.label, now,
       );
+      nodesWritten++;
     }
     const nodeIdByUri = (uri: string): string | undefined =>
       this.ctx.storage.sql.exec<{ id: string }>(`SELECT id FROM nodes WHERE uri = ?1`, uri).toArray()[0]?.id;
-    for (const e of plan.validEdges) {
-      const fromId = nodeIdByUri(e.fromUri);
-      const toId = nodeIdByUri(e.toUri);
+    for (const e of this.ctx.storage.sql.exec<{ type: string; from_uri: string; to_uri: string }>(
+      `SELECT type, from_uri, to_uri FROM index_staged_edges WHERE generation_id = ?1`, generationId,
+    )) {
+      const fromId = nodeIdByUri(e.from_uri);
+      const toId = nodeIdByUri(e.to_uri);
       if (!fromId || !toId) throw new Error(`validated edge endpoint disappeared during projection`);
       this.ctx.storage.sql.exec(
         `INSERT INTO edges (id, type, from_node_id, to_node_id, created_at) VALUES (?1,?2,?3,?4,?5)
          ON CONFLICT (type, from_node_id, to_node_id) DO NOTHING`,
         newId('edge'), e.type, fromId, toId, now,
       );
+      edgesWritten++;
     }
     if (previousGenerationId) {
-      const prevEntities = this.ctx.storage.sql
-        .exec<{ uri: string; type: string }>(
-          `SELECT uri, type FROM index_staged_entities WHERE generation_id = ?1`, previousGenerationId,
-        ).toArray();
-      const prevFileUris = new Set(prevEntities.filter((e) => e.type === 'file').map((e) => e.uri));
-      const newFileUris = new Set(plan.validEntities.filter((e) => e.type === 'file').map((e) => e.uri));
-      for (const uri of [...prevFileUris].filter((u) => !newFileUris.has(u))) {
-        const node = nodeIdByUri(uri);
+      for (const prior of this.ctx.storage.sql.exec<{ uri: string }>(
+        `SELECT previous.uri FROM index_staged_entities previous
+         WHERE previous.generation_id = ?1 AND previous.type = 'file'
+           AND NOT EXISTS (
+             SELECT 1 FROM index_staged_entities current
+             WHERE current.generation_id = ?2 AND current.type = 'file' AND current.uri = previous.uri
+           )`,
+        previousGenerationId,
+        generationId,
+      )) {
+        const node = nodeIdByUri(prior.uri);
         if (!node) continue;
         this.ctx.storage.sql.exec(`DELETE FROM edges WHERE from_node_id = ?1 OR to_node_id = ?1`, node);
         retired++;
       }
-      const changed = changedFileUris(prevFileUris, newFileUris);
+      const changed = this.ctx.storage.sql.exec<{ uri: string }>(
+        `SELECT previous.uri FROM index_staged_entities previous
+         WHERE previous.generation_id = ?1 AND previous.type = 'file'
+           AND NOT EXISTS (
+             SELECT 1 FROM index_staged_entities current
+             WHERE current.generation_id = ?2 AND current.type = 'file' AND current.uri = previous.uri
+           )
+         UNION ALL
+         SELECT current.uri FROM index_staged_entities current
+         WHERE current.generation_id = ?2 AND current.type = 'file'
+           AND NOT EXISTS (
+             SELECT 1 FROM index_staged_entities previous
+             WHERE previous.generation_id = ?1 AND previous.type = 'file' AND previous.uri = current.uri
+           )
+         LIMIT ?3`,
+        previousGenerationId,
+        generationId,
+        CO_CHANGE_PAIR_CAP + 1,
+      ).toArray().map((row) => row.uri);
       if (changed.length > CO_CHANGE_PAIR_CAP) {
-        console.warn(`ProjectMemory projection(${generationId}): ${changed.length} files exceed co-change cap ${CO_CHANGE_PAIR_CAP}`);
+        console.warn(`ProjectMemory projection(${generationId}): more than ${CO_CHANGE_PAIR_CAP} files exceed the co-change cap`);
       }
       for (const [a, b] of coChangePairs(changed)) {
         const aId = nodeIdByUri(a);
@@ -1971,10 +2004,10 @@ export class ProjectMemory extends DurableObject<Env> {
       }
     }
     const result = {
-      nodesWritten: plan.validEntities.length,
-      edgesWritten: plan.validEdges.length,
-      entitiesSkipped: plan.invalidEntities.length,
-      edgesSkipped: plan.invalidEdges.length,
+      nodesWritten,
+      edgesWritten,
+      entitiesSkipped: 0,
+      edgesSkipped: 0,
       retired,
       coChangeEdges,
     };
@@ -1991,6 +2024,40 @@ export class ProjectMemory extends DurableObject<Env> {
       operationId, now, generationId, JSON.stringify(result),
     );
     return result;
+  }
+
+  /** Best-effort vector publishing stays off the activation response path and consumes one
+   * staged content row at a time. `waitUntil` preserves the prior non-blocking contract while
+   * the awaited loop prevents thousands of content-holding embedding promises from piling up. */
+  private async publishGenerationVectors(
+    backend: NonNullable<ReturnType<typeof codeSearchBackend>>,
+    projectId: string,
+    generationId: string,
+    repositoryKey: string,
+    encodedDeletions: string,
+  ): Promise<void> {
+    for (const entity of this.ctx.storage.sql.exec<{ uri: string; type: string; label: string; content: string | null }>(
+      `SELECT uri, type, label, content FROM index_staged_entities WHERE generation_id = ?1 ORDER BY uri`,
+      generationId,
+    )) {
+      await indexCodeEntity(backend, {
+        uri: entity.uri,
+        projectId,
+        repositoryKey,
+        generationId,
+        type: entity.type as CodeEntityType,
+        label: entity.label,
+        content: entity.content,
+      }).catch((err) => console.warn(`ProjectMemory code-index for ${entity.uri} failed: ${String(err)}`));
+    }
+    const deletions: string[] = JSON.parse(encodedDeletions || '[]');
+    if (!deletions.length) return;
+    const projectKey = await this.resolveProjectKey(projectId);
+    for (const path of deletions) {
+      const uri = buildEntityUri({ kind: 'file', projectKey, repositoryKey, path });
+      await removeCodeEntity(backend, uri)
+        .catch((err) => console.warn(`ProjectMemory code-deindex for ${uri} failed: ${String(err)}`));
+    }
   }
 
   /** The PROMOTE step — the ONLY writer of `status = 'active'`. Refuses a generation that has
@@ -2016,11 +2083,6 @@ export class ProjectMemory extends DurableObject<Env> {
     let superseded: string[] = [];
     let projection = this.appliedGenerationProjection(generationId);
     if (!projection) {
-      const projectKey = await this.resolveProjectKey(projectId);
-      const plan = this.stagedProjectionPlan(projectKey, generationId, gen.repository_key);
-      if (plan.invalidEntities.length || plan.invalidEdges.length) {
-        throw new Error(`generation ${generationId} failed projection validation`);
-      }
       this.ctx.storage.transactionSync(() => {
         const active = this.ctx.storage.sql
           .exec<{ id: string }>(`SELECT id FROM index_generations WHERE repository_key = ?1 AND status = 'active'`, gen.repository_key)
@@ -2032,7 +2094,7 @@ export class ProjectMemory extends DurableObject<Env> {
           );
         }
         superseded = retryingActive ? [] : active.map((r) => r.id);
-        projection = this.applyGenerationProjection(generationId, retryingActive ? null : currentActive, plan);
+        projection = this.applyGenerationProjection(generationId, retryingActive ? null : currentActive);
         for (const id of superseded) this.ctx.storage.sql.exec(`UPDATE index_generations SET status = 'superseded' WHERE id = ?1`, id);
         if (!retryingActive) {
           this.ctx.storage.sql.exec(`UPDATE index_generations SET status = 'active', activated_at = ?2 WHERE id = ?1`, generationId, nowIso());
@@ -2046,25 +2108,10 @@ export class ProjectMemory extends DurableObject<Env> {
     // from "we deleted the old vectors").
     const backend = codeSearchBackend(this.env);
     if (backend) {
-      const staged = this.ctx.storage.sql
-        .exec<{ uri: string; type: string; label: string; content: string | null }>(
-          `SELECT uri, type, label, content FROM index_staged_entities WHERE generation_id = ?1`,
-          generationId,
-        )
-        .toArray();
-      for (const e of staged) {
-        void indexCodeEntity(backend, {
-          uri: e.uri, projectId, repositoryKey: gen.repository_key, generationId, type: e.type as CodeEntityType, label: e.label, content: e.content,
-        }).catch((err) => console.warn(`ProjectMemory code-index for ${e.uri} failed: ${String(err)}`));
-      }
-      const deletions: string[] = JSON.parse(gen.deletions || '[]');
-      if (deletions.length) {
-        const projectKey = await this.resolveProjectKey(projectId);
-        for (const path of deletions) {
-          const uri = buildEntityUri({ kind: 'file', projectKey, repositoryKey: gen.repository_key, path });
-          void removeCodeEntity(backend, uri).catch((err) => console.warn(`ProjectMemory code-deindex for ${uri} failed: ${String(err)}`));
-        }
-      }
+      this.ctx.waitUntil(
+        this.publishGenerationVectors(backend, projectId, generationId, gen.repository_key, gen.deletions)
+          .catch((err) => console.warn(`ProjectMemory code-index generation ${generationId} failed: ${String(err)}`)),
+      );
     }
 
     // D1-side active-generation PROJECTION (PLNR-259) — DO -> ProjectRoom -> D1, mirroring
@@ -2109,11 +2156,6 @@ export class ProjectMemory extends DurableObject<Env> {
     if (gen.status !== 'active') throw new Error(`generation ${generationId} is ${gen.status} — only an active generation may be projected`);
     const priorProjection = this.appliedGenerationProjection(generationId);
     if (priorProjection) return priorProjection;
-    const projectKey = await this.resolveProjectKey(projectId);
-    const plan = this.stagedProjectionPlan(projectKey, generationId, gen.repository_key);
-    if (plan.invalidEntities.length || plan.invalidEdges.length) {
-      throw new Error(`generation ${generationId} failed projection validation`);
-    }
     const prevGen = this.ctx.storage.sql
       .exec<{ id: string }>(
         `SELECT id FROM index_generations WHERE repository_key = ?1 AND status = 'superseded' AND id != ?2 ORDER BY activated_at DESC, id DESC LIMIT 1`,
@@ -2123,7 +2165,7 @@ export class ProjectMemory extends DurableObject<Env> {
       .toArray()[0];
     let result!: ReturnType<ProjectMemory['applyGenerationProjection']>;
     this.ctx.storage.transactionSync(() => {
-      result = this.applyGenerationProjection(generationId, prevGen?.id ?? null, plan);
+      result = this.applyGenerationProjection(generationId, prevGen?.id ?? null);
     });
     this.ctx.storage.setAlarm(Date.now()).catch(() => {});
     return result;

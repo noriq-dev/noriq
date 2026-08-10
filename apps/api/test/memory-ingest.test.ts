@@ -8,7 +8,10 @@ import { createUser, loginSession, mintTokenForUser, authorizeForAllProjects, pr
 import type { Actor } from '../src/do/ProjectRoom';
 import type { Env } from '../src/env';
 import { gzip, sha256HexBytes } from '../src/memory/backup';
-import { computeStagedContentHash } from '../src/memory/ingest';
+import {
+  canonicalStagedRowJson, computeStagedContentHash, ingestCompletionErrorStatus,
+  OrderedStagedContentHasher,
+} from '../src/memory/ingest';
 
 const appEnv = env as unknown as Env;
 
@@ -84,6 +87,28 @@ beforeAll(async () => {
   });
   runnerId = ((await reg.json()) as { runner: { id: string } }).runner.id;
 }, 60000);
+
+describe('bounded generation completion helpers', () => {
+  it('incrementally hashes canonically ordered rows without changing the wire digest', async () => {
+    const rows = [
+      { kind: 'node' as const, uri: 'noriq://file/INGX/ingx-repo/a.ts', type: 'file', label: 'a.ts', content: 'const a = 1;' },
+      { kind: 'node' as const, uri: 'noriq://symbol/INGX/ingx-repo/a.ts#a', type: 'symbol', label: 'a', content: null },
+      { kind: 'edge' as const, type: 'declares', from: 'noriq://file/INGX/ingx-repo/a.ts', to: 'noriq://symbol/INGX/ingx-repo/a.ts#a' },
+    ];
+    const hasher = new OrderedStagedContentHasher();
+    for (const row of rows) hasher.update(row);
+    const canonical = rows.map(canonicalStagedRowJson).join('\n');
+    expect(hasher.digestHex()).toBe(await sha256HexBytes(new TextEncoder().encode(canonical)));
+    expect(await computeStagedContentHash([...rows].reverse())).toBe(await sha256HexBytes(new TextEncoder().encode(canonical)));
+  });
+
+  it('marks only Durable Object storage resets as retryable', () => {
+    expect(ingestCompletionErrorStatus(new Error(
+      'Internal error in Durable Object storage caused object to be reset; reference = reset-1',
+    ))).toBe(503);
+    expect(ingestCompletionErrorStatus(new Error('generation is already active'))).toBe(409);
+  });
+});
 
 describe('capability minting scope', () => {
   it('refuses a repositoryKey not registered in the project', async () => {

@@ -9,6 +9,7 @@
 // semantics remain PLNR-263's, so there is no SQL staging to move it onto yet.
 import { gunzip, sha256HexBytes } from './backup';
 import { StagedRow } from '@noriq-dev/shared';
+import { createHash, type Hash } from 'node:crypto';
 
 /** Per-batch byte ceiling — a bound, not a tune-for-performance number (mirrors backup.ts's
  *  DEFAULT_CHUNK_ROWS comment): the point is that a batch is never allowed to grow the Worker's
@@ -107,9 +108,34 @@ export function stagedRowsCanonicalBytes(rows: StagedRow[]): number {
   return new TextEncoder().encode(rows.map(canonicalStagedRowJson).join('\n')).byteLength;
 }
 
+/** Incremental form of the runner-compatible generation digest. Callers must provide rows in
+ * canonical order (nodes by uri, then edges by from/type/to). Keeping only the SHA-256 state
+ * lets a Durable Object verify a repository index without materializing its source content. */
+export class OrderedStagedContentHasher {
+  private readonly hash: Hash = createHash('sha256');
+  private first = true;
+
+  update(row: StagedRow): void {
+    if (!this.first) this.hash.update('\n');
+    this.hash.update(canonicalStagedRowJson(row), 'utf8');
+    this.first = false;
+  }
+
+  digestHex(): string {
+    return this.hash.digest('hex');
+  }
+}
+
 export async function computeStagedContentHash(rows: StagedRow[]): Promise<string> {
-  const canonical = rows.map((row) => StagedRow.parse(row)).sort(compareStagedRows).map(canonicalStagedRowJson).join('\n');
-  return sha256HexBytes(new TextEncoder().encode(canonical));
+  const hasher = new OrderedStagedContentHasher();
+  for (const row of rows.map((candidate) => StagedRow.parse(candidate)).sort(compareStagedRows)) hasher.update(row);
+  return hasher.digestHex();
+}
+
+/** Only a reset of the backing Durable Object is retryable here. Validation and lifecycle
+ * errors remain conflicts so callers do not retry an input that cannot succeed unchanged. */
+export function ingestCompletionErrorStatus(error: unknown): 409 | 503 {
+  return /internal error in durable object storage caused object to be reset/i.test(String(error)) ? 503 : 409;
 }
 
 // ---------------------------------------------------------------------------

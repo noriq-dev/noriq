@@ -86,6 +86,36 @@ describe('staged generation lifecycle — begin/batch/complete/activate', () => 
     expect(status.batchesReceived).toBe(1);
   });
 
+  it('auto-accepts unsorted content-bearing rows through cursor hashing and projection', async () => {
+    const { projectId } = await newOwnedProject('pm-402-cursor@example.com', 'PM402CUR');
+    const m = memory(projectId);
+    const fileUri = 'noriq://file/PM402CUR/repo-cursor/a.ts';
+    const symbolUri = 'noriq://symbol/PM402CUR/repo-cursor/a.ts#a';
+    const rows: StagedRow[] = [
+      { kind: 'edge', type: 'declares', from: fileUri, to: symbolUri },
+      { kind: 'node', uri: symbolUri, type: 'symbol', label: 'a', content: null },
+      { kind: 'node', uri: fileUri, type: 'file', label: 'a.ts', content: 'export const a = 1;'.repeat(1_000) },
+    ];
+    await m.beginIndexIngest(projectId, baseManifest({
+      generationId: 'gen_cursor_hash', projectId, repositoryKey: 'repo-cursor',
+      contentHash: await computeStagedContentHash(rows as never),
+    }));
+    await m.ingestIndexBatch(
+      projectId,
+      { generationId: 'gen_cursor_hash', batchNumber: 0, batchHash: 'h' },
+      rows,
+    );
+
+    const completed = await m.completeIndexIngest(projectId, 'gen_cursor_hash');
+
+    expect(completed.validation).toEqual({ ok: true, problems: [] });
+    expect(await m._getIndexGenerationStatusForTest(projectId, 'gen_cursor_hash')).toBe('active');
+    await expect(m.activateIndexGeneration(projectId, 'gen_cursor_hash')).resolves.toMatchObject({
+      activated: 'gen_cursor_hash',
+      projection: { nodesWritten: 2, edgesWritten: 1 },
+    });
+  });
+
   it('a generation whose staged counts disagree with its manifest fails validation and activates nothing', async () => {
     const { projectId } = await newOwnedProject('pm-261-badcount@example.com', 'PM61BAD');
     const m = memory(projectId);
