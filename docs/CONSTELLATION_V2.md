@@ -296,13 +296,14 @@ failure, or generation unavailability switches to the complete textual catalogue
 reason and a retry action. Empty canonical graph, unindexed repository, stale generation, building
 generation, partial incident page, unreachable store, and rendering fallback are distinct states.
 
-### Product integration and initial cutover
+### Product integration and rolling cutover
 
-The Memory map keeps the established 2D constellation as its default while production GPU and
-dataset budgets are being validated. People can explicitly choose **Try 3D v2** and the choice is
-remembered per browser; **Use 2D map** is always available as an immediate escape hatch. This is a
-cutover gate, not a separate source of truth: both surfaces preserve the existing inspector and
-ego-network URI handoffs.
+The Memory map defaults to Constellation v2. An explicit **Use 2D map** choice is remembered per
+browser, and **Try 3D v2** returns to the primary surface. During a mixed-version deployment, a
+new client that receives no v2 API/generation automatically uses the compatible 2D endpoint for
+that session without persisting the downgrade; an old client continues to use the additive v1
+endpoint on a new server. Both surfaces preserve the existing inspector and ego-network URI
+handoffs.
 
 Search remains hybrid and server-owned. A selected result is routed by its exact canonical URI into
 the required hierarchy path, then visually promoted with size as well as colour. Type filters,
@@ -314,6 +315,17 @@ shows the same paginated hierarchy as a complete textual catalogue. Search routi
 continuations, selection, evidence, and ego-network actions continue to work without WebGL. The
 fallback therefore changes presentation only; it does not silently return to a bounded v1 sample
 or discard navigation state.
+
+Memory Operations reports the active hierarchy's generation/source/current revisions, build and
+failure state, age, derived row counts, database size, and compact-page cache budgets. Project
+owners/managers may request a rebuild of disposable hierarchy data there; the action cannot mutate
+canonical nodes, edges, or memories.
+
+The legacy 2D endpoint and renderer remain a controlled rollout compatibility path, not a second
+feature roadmap. Their removal requires an explicit follow-up decision after two consecutive
+production releases with v2 as the default, every supported deployment serving the v2 contract,
+the representative and weak-GPU p95 gates passing, automatic compatibility fallback below 0.1%
+of Memory-map sessions, and no unresolved severity-1/2 accessibility or navigation regression.
 
 ## Integrated hardening evidence (PLNR-381)
 
@@ -346,8 +358,8 @@ task title with an opaque dependency/run identifier: dependency and run events n
 authoritative labels needed by incremental projection.
 
 The web integration test exercises exact-URI off-page routing, cursor continuation, evidence and
-ego handoffs, and the complete no-WebGL textual path. An integrated representative/weak-GPU p95
-frame measurement is still intentionally unsupported in repository automation. Consequently v2
-remains explicit opt-in and the 2D/textual paths remain the supported defaults until production
-GPU telemetry proves the 16.7/33 ms frame gates; no renderer-only measurement is used to claim
-that cutover.
+ego handoffs, and the complete no-WebGL textual path. Repository automation still cannot claim an
+integrated representative/weak-GPU p95. The default renderer therefore has a runtime guard that
+switches to the complete textual peer after three consecutive render submissions exceed 33 ms,
+while production GPU telemetry remains a required criterion for retiring the 2D compatibility
+path; no renderer-only measurement is used to claim that final removal gate.

@@ -92,10 +92,11 @@ export function MemoryConstellationV2({
     setLoading(true); setError(null);
     loadOverview(controller.signal).then(() => setLoading(false)).catch((reason: unknown) => {
       if (controller.signal.aborted) return;
-      setError(reason instanceof ApiError ? reason.message : 'Constellation v2 is unavailable'); setLoading(false);
+      const message = reason instanceof ApiError ? reason.message : 'Constellation v2 is unavailable';
+      setError(message); setLoading(false); onFallback?.(message);
     });
     return () => controller.abort();
-  }, [loadOverview]);
+  }, [loadOverview, onFallback]);
 
   const storeResident = useCallback((communityId: string, page: ApiConstellationV2CommunityPage, nextPath: string[]) => {
     const updated = new Map(residentsRef.current);
@@ -204,7 +205,9 @@ export function MemoryConstellationV2({
   const selected = scene?.nodes.find((node) => node.id === selectedNodeId) ?? null;
   const selectedCommunity = selected?.community ? selected : null;
   const selectedEntity = selected?.uri ? selected : null;
-  const handleRendererFailure = useCallback((reason: string) => { setRendererFailure(reason); onFallback?.(reason); }, [onFallback]);
+  // Renderer failures retain the v2 controller and switch presentation to its full textual peer.
+  // `onFallback` is reserved for API/generation incompatibility that requires the rolling 2D path.
+  const handleRendererFailure = useCallback((reason: string) => { setRendererFailure(reason); }, []);
 
   if (loading) return <div style={{ padding: 24, color: 'var(--text-dim)' }}>Preparing navigable memory space…</div>;
   if (!overview || !scene || !filteredScene) return <div style={{ padding: 24, color: 'var(--red-soft)' }}>{error ?? 'Constellation v2 is unavailable'}</div>;

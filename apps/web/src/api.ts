@@ -597,6 +597,9 @@ export const api = {
     const suffix = query.size ? `?${query}` : '';
     return constellationReq(`/api/projects/${pid}/memory/constellation/v2/entities/${encodeURIComponent(nodeId)}/incidents${suffix}`, decodeConstellationV2IncidentPage, signal);
   },
+  memoryConstellationV2Rebuild: (pid: string) => req<{ ok: true; generationId: string; sourceRevision: number; nodes: number; edges: number } | { ok: false; generationId: string; reason: string; detail: string }>(
+    'POST', `/api/projects/${pid}/memory/constellation/v2/rebuild`,
+  ),
   memoryEntities: (pid: string, input: ApiGraphEntityPageInput, signal?: AbortSignal) =>
     req<ApiGraphEntityPage>('POST', `/api/projects/${pid}/memory/entities`, input, signal),
 
@@ -1294,7 +1297,23 @@ export interface ApiMemoryCapabilities {
 export interface ApiMemoryOpsStatus {
   health: ApiMemoryHealth;
   registry: ApiMemoryRegistry | null;
+  hierarchy: ApiConstellationHierarchyOperations;
   capabilities: ApiMemoryCapabilities;
+}
+
+export interface ApiConstellationGenerationStatus {
+  id: string; sourceRevision: number; currentRevision: number; topologyVersion: string; layoutVersion: string;
+  status: 'building' | 'complete' | 'active' | 'superseded' | 'failed'; createdAt: string;
+  completedAt: string | null; activatedAt: string | null; failureReason: string | null;
+}
+
+export interface ApiConstellationHierarchyOperations {
+  state: 'current' | 'stale' | 'building' | 'failed' | 'unavailable';
+  active: ApiConstellationGenerationStatus | null;
+  building: ApiConstellationGenerationStatus | null;
+  lastFailed: ApiConstellationGenerationStatus | null;
+  rows: { nodeStats: number; communities: number; memberships: number; links: number };
+  cache: { policy: 'private-revalidate'; compactPageTargetBytes: number; compactPageHardLimitBytes: number };
 }
 
 /** Mirrors memory/retrieval.ts's RankedHit — the shape every /memory/search result carries.

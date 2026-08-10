@@ -97,8 +97,8 @@ function midpoint(edge: Constellation3DEdgeSegment): [number, number, number] {
 }
 
 /** Lazy Three/WebGL renderer. The scene contains bounded instanced meshes and buffer geometries;
- * React only owns the canvas, failure state, and a fixed label budget. It is intentionally not
- * wired into MemoryView until the cutover task establishes fallback and parity. */
+ * React only owns the canvas, failure state, and a fixed label budget. The v2 controller hands
+ * renderer failures to its full textual peer. */
 export function MemoryConstellation3D({
   projectId, generationId, layoutVersion, nodes, edges, selectedNodeId, highlightedNodeIds = [], theme = 'dark', reducedMotion = false,
   onSelectNode, onOpenEgoNetwork, onOpenInspector, onRendererFailure,
@@ -140,6 +140,13 @@ export function MemoryConstellation3D({
     let cancelled = false;
     let resizeObserver: ResizeObserver | null = null;
     let removeResizeListener: (() => void) | null = null;
+    const handleContextLost = (event: Event) => {
+      event.preventDefault();
+      const reason = 'WebGL context was lost';
+      setFailure(reason);
+      onRendererFailure?.(reason);
+    };
+    canvas.addEventListener('webglcontextlost', handleContextLost);
 
     void import('three').then((THREE) => {
       if (cancelled) return;
@@ -232,7 +239,20 @@ export function MemoryConstellation3D({
 
         let currentLabels = plan.labels;
         let currentPromoted: Constellation3DEdgeSegment[] = [];
-        const render = () => renderer.render(scene, camera);
+        let consecutiveOverBudgetFrames = 0;
+        let performanceFailureReported = false;
+        const render = () => {
+          const started = performance.now();
+          renderer.render(scene, camera);
+          const elapsed = performance.now() - started;
+          consecutiveOverBudgetFrames = elapsed > 33 ? consecutiveOverBudgetFrames + 1 : 0;
+          if (consecutiveOverBudgetFrames >= 3 && !performanceFailureReported) {
+            performanceFailureReported = true;
+            const reason = `3D rendering exceeded the 33 ms weak-client budget for ${consecutiveOverBudgetFrames} consecutive frames`;
+            setFailure(reason);
+            onRendererFailure?.(reason);
+          }
+        };
         const renderEdges = (selection: string | null) => {
           clearEdges();
           const selectedPlan = buildConstellation3DRenderPlan(layoutNodes, edges, selection, LABEL_BUDGET, highlighted);
@@ -312,6 +332,7 @@ export function MemoryConstellation3D({
       cancelled = true;
       resizeObserver?.disconnect();
       removeResizeListener?.();
+      canvas.removeEventListener('webglcontextlost', handleContextLost);
       rendererRef.current?.dispose();
       rendererRef.current = null;
     };

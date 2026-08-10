@@ -219,6 +219,7 @@ const MANAGER_ROUTES = [
   /\/search\/reindex$/,
   /\/memory\/repositories(?:\/[^/]+)?$/,
   /\/memory\/(backup|restore(?:\/rollback)?|lifecycle-sweep|graph\/rebuild)$/,
+  /\/memory\/constellation\/v2\/rebuild$/,
   /\/memory\/generations(?:\/[^/]+\/(?:activate|abort)|\/prune-retained)$/,
   /\/memory\/vectors\/rebuild$/,
   /\/memory\/items\/[^/]+\/(approve|reject)$/,
@@ -1458,12 +1459,13 @@ app.delete('/api/projects/:pid/memory/repositories/:key', userAuth, async (c) =>
 // manual rebuild route below.
 app.get('/api/projects/:pid/memory/ops-status', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
-  const [health, registry, drift] = await Promise.all([
+  const [health, registry, drift, hierarchy] = await Promise.all([
     memoryDO(c.env, pid).health(pid),
     getMemoryRegistry(c.env, pid),
     memoryDO(c.env, pid).projectionDrift(pid),
+    memoryDO(c.env, pid).constellationHierarchyOperations(pid),
   ]);
-  return c.json({ health, registry, drift, capabilities: memoryCapabilities(c.env) });
+  return c.json({ health, registry, drift, hierarchy, capabilities: memoryCapabilities(c.env) });
 });
 
 // PLNR-273: this project's backup generations (exportedAt slugs, newest first) — the picker for
@@ -1768,6 +1770,15 @@ app.get('/api/projects/:pid/memory/constellation/v2/entities/:nodeId/incidents',
     rows: (result) => 1 + result.node.communityPath.length + result.edges.length
       + result.edges.reduce((count, edge) => count + edge.endpoint.communityPath.length, 0),
   });
+});
+
+// A project owner/manager can rebuild this project's disposable visualization hierarchy. The
+// project authorization boundary above classifies this route as `manage`; no instance-admin
+// token is involved, and the canonical graph remains unchanged.
+app.post('/api/projects/:pid/memory/constellation/v2/rebuild', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const result = await memoryDO(c.env, pid).rebuildConstellationHierarchy(pid);
+  return c.json(result, result.ok ? 200 : 409);
 });
 
 // PLNR-339: exhaustive ordered catalogue behind Explore and the accessible map list. Kept

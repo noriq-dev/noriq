@@ -53,10 +53,12 @@ describe('GET /api/projects/:pid/memory/ops-status (PLNR-273)', () => {
     const body = await res.json() as {
       health: { hasPriorGeneration: boolean; sizeStatus: string };
       registry: unknown;
+      hierarchy: { state: string; active: unknown };
       capabilities: { r2: boolean; vectorize: boolean; workersAI: boolean; codeVectorize: boolean };
     };
     expect(body.health.hasPriorGeneration).toBe(false);
     expect(body.registry).toBeNull(); // never touched its memory store yet
+    expect(body.hierarchy).toMatchObject({ state: 'unavailable', active: null });
     expect(typeof body.capabilities.r2).toBe('boolean');
     expect(typeof body.capabilities.vectorize).toBe('boolean');
   });
@@ -76,6 +78,27 @@ describe('GET /api/projects/:pid/memory/ops-status (PLNR-273)', () => {
     expect(backupsRes.status).toBe(200);
     expect((await reposRes.json() as { repositories: unknown[] }).repositories).toEqual([]);
     expect((await backupsRes.json() as { backups: unknown[] }).backups).toEqual([]);
+  });
+});
+
+describe('Constellation hierarchy operations (PLNR-382)', () => {
+  it('allows a project owner/manager to rebuild without instance-admin authority and reports the active generation', async () => {
+    await createUser('mo-hierarchy@example.com', 'Hierarchy owner', 'longenough1').catch(() => {});
+    const cookie = await loginSession('mo-hierarchy@example.com', 'longenough1');
+    const pid = await ownedProject(cookie, 'MOHIER1');
+
+    const rebuilt = await post(`/api/projects/${pid}/memory/constellation/v2/rebuild`, cookie);
+    expect(rebuilt.status).toBe(200);
+    expect(await rebuilt.json()).toMatchObject({ ok: true, nodes: 0, edges: 0 });
+
+    const status = await get(`/api/projects/${pid}/memory/ops-status`, cookie);
+    expect(await status.json()).toMatchObject({
+      hierarchy: {
+        state: 'current', active: { status: 'active', sourceRevision: 0, currentRevision: 0 },
+        rows: { nodeStats: 0, communities: 0, memberships: 0, links: 0 },
+        cache: { policy: 'private-revalidate', compactPageHardLimitBytes: 524288 },
+      },
+    });
   });
 });
 

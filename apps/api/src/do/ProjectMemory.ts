@@ -343,6 +343,15 @@ export interface ConstellationHierarchyDrift {
   converged: boolean;
 }
 
+export interface ConstellationHierarchyOperations {
+  state: 'current' | 'stale' | 'building' | 'failed' | 'unavailable';
+  active: ConstellationGenerationStatus | null;
+  building: ConstellationGenerationStatus | null;
+  lastFailed: ConstellationGenerationStatus | null;
+  rows: { nodeStats: number; communities: number; memberships: number; links: number };
+  cache: { policy: 'private-revalidate'; compactPageTargetBytes: number; compactPageHardLimitBytes: number };
+}
+
 interface ConstellationGenerationRow {
   [column: string]: string | number | null;
   id: string;
@@ -640,6 +649,37 @@ export class ProjectMemory extends DurableObject<Env> {
          ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'building' THEN 1 WHEN 'complete' THEN 2 ELSE 3 END, created_at DESC LIMIT 1`,
       ).toArray()[0];
     return row ? this.shapeConstellationGeneration(row) : null;
+  }
+
+  /** Operational read model for the hierarchy, separate from visualization data. It reports
+   *  failed/retried work even while a prior active generation remains safe to serve. */
+  async constellationHierarchyOperations(projectId: string): Promise<ConstellationHierarchyOperations> {
+    await this.assertProjectId(projectId);
+    const generation = (status: ConstellationGenerationStatus['status']): ConstellationGenerationRow | undefined =>
+      this.ctx.storage.sql.exec<ConstellationGenerationRow>(
+        `SELECT * FROM constellation_generations WHERE status = ?1 ORDER BY created_at DESC LIMIT 1`, status,
+      ).toArray()[0];
+    const activeRow = generation('active');
+    const buildingRow = generation('building');
+    const failedRow = generation('failed');
+    const currentRevision = this.readMemoryRevision();
+    const rows = activeRow
+      ? this.ctx.storage.sql.exec<{ node_stats: number; communities: number; memberships: number; links: number }>(
+        `SELECT
+          (SELECT COUNT(*) FROM constellation_node_stats WHERE generation_id = ?1) AS node_stats,
+          (SELECT COUNT(*) FROM constellation_communities WHERE generation_id = ?1) AS communities,
+          (SELECT COUNT(*) FROM constellation_memberships WHERE generation_id = ?1) AS memberships,
+          (SELECT COUNT(*) FROM constellation_community_links WHERE generation_id = ?1) AS links`, activeRow.id,
+      ).toArray()[0]!
+      : { node_stats: 0, communities: 0, memberships: 0, links: 0 };
+    return {
+      state: buildingRow ? 'building' : activeRow ? (activeRow.source_revision === currentRevision ? 'current' : 'stale') : failedRow ? 'failed' : 'unavailable',
+      active: activeRow ? this.shapeConstellationGeneration(activeRow) : null,
+      building: buildingRow ? this.shapeConstellationGeneration(buildingRow) : null,
+      lastFailed: failedRow ? this.shapeConstellationGeneration(failedRow) : null,
+      rows: { nodeStats: rows.node_stats, communities: rows.communities, memberships: rows.memberships, links: rows.links },
+      cache: { policy: 'private-revalidate', compactPageTargetBytes: 256 * 1024, compactPageHardLimitBytes: 512 * 1024 },
+    };
   }
 
   private readConstellationGeneration(generationId: string): ConstellationGenerationRow | undefined {
