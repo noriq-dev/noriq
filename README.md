@@ -13,7 +13,7 @@ coordination layer — projects, tasks, dependencies, claims, plans, and messagi
   criteria, handed to whichever agent claims the task — with a structured editor so
   humans can read and correct them.
 - Humans watch it all live (Mission Control, Orchestration graph, Board, Plans, Runs,
-  Review, Docs, Roadmap, and an **Ask-the-project** RAG Q&A panel) and steer by
+  Review, Docs, Roadmap, and an **Ask workspace operator**) and steer by
   commenting — the working agent picks comments up mid-flight and must resolve them.
 - **Dispatch work from the dashboard**: pair the server with a `noriq-runner` daemon
   on your own machine and launch scope/build/verify runs of Claude Code or Codex
@@ -166,6 +166,39 @@ a notices block, a ready-made skill is served at `/skill.md` (doc-authoring guid
 portable skill bundle; the bundle directs agents back to the live `noriq://skill/*` MCP
 resources so its instructions stay aligned with the connected server.
 
+## Ask workspace operator
+
+Ask can answer from both retrieved project knowledge and current structured state. It can inspect
+the signed-in user's accessible projects, active or blocked work, review queues, runs, tasks and
+their context, settled docs, plans, and project memory. Tool output is bounded, reports how many
+matches were returned, is treated as untrusted evidence, and carries clickable project/task/doc/
+plan references when available. Completed-task bodies are historical evidence, not current state.
+
+Operators configure the server-owned model catalog with `ASK_MODELS` and select its default with
+`ASK_DEFAULT_MODEL`; the browser may choose only an advertised model. Every entry must declare
+working tool-call and streaming support. An invalid catalog, unknown selection, unsupported
+capability, or missing Workers AI binding fails explicitly instead of silently falling back to a
+different model. Vectorize improves semantic retrieval but is not required for structured live
+reads; without it, search falls back to keyword matching. Without Workers AI, generation is
+unavailable.
+
+Ask may propose exactly one task creation or one supported-field task update. A proposal does not
+mutate anything: the signed-in human must review its exact payload and confirm it. Confirmation
+rechecks the account and project role, maintenance mode, and the target snapshot; the mutation runs
+once through the same ProjectRoom service as REST/MCP and is attributed to that human. Stale,
+repeated, rejected, inaccessible, or deleted-chat proposals remain safe.
+
+Ask intentionally does not create plans, decompose work into task suites, batch mutations, claim or
+dispatch work, change task lifecycle/dependencies/specifications, delete data, accept reviews, reach
+external SaaS, inspect a repository checkout, or review diffs. Those operations need the existing
+purpose-built UI, MCP workflow, or better repository context.
+
+Before changing the production catalog, verify each model in staging with real Workers AI: basic
+answer text, multi-round tool calls, streaming deltas, reasoning summaries if advertised, output
+truncation, cancellation, and reconnect. Local tests inject representative Workers AI envelopes;
+they prove parsing and safety boundaries, not that a particular hosted model currently emits those
+envelopes.
+
 ## Development
 
 ```sh
@@ -182,7 +215,7 @@ CI runs `typecheck` + `test` on every PR (`.github/workflows/ci.yml`).
 Live today: the coordination core (claims, plans with computed phase gating, execution
 specs, dependencies), OAuth 2.1 + passkeys + device grant, run dispatch to local
 `noriq-runner` daemons, proposed tasks & plan approval gates, file locking, project
-docs with a settled-only contract, semantic search + Ask-the-project, tag governance,
+docs with a settled-only contract, semantic search + the Ask workspace operator, tag governance,
 plan templates, groups with consent-based membership, GitHub PR→task webhooks, email
 invites, task attachments, dark/light themes, rate limiting, daily D1 backups with
 JSON export/import, and a generated tool reference. The in-app Roadmap view tracks
