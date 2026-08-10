@@ -174,6 +174,50 @@ export function resolveAskProjectTags(question: string, projects: AskProject[]):
   return tags;
 }
 
+const actionFollowUpPattern = /^(?:(?:yes|ok(?:ay)?|sure)[,.!]?\s+)?(?:(?:please|go\s+ahead\s+and)\s+)?(?:create|submit|propose|update|edit|change)\s+(?:it|that|this|the\s+task)(?:\s+(?:now|please))?[.!]?$/i;
+
+export function isAskTaskActionFollowUp(question: string): boolean {
+  return actionFollowUpPattern.test(question.trim());
+}
+
+/** A short action continuation may omit the @project tag because the user already supplied it in
+ * the preceding request. Inherit only server-resolvable tags from prior USER messages, and only
+ * for an explicit deictic task-action follow-up, so an unrelated next question never stays scoped. */
+export function resolveAskProjectTagsForTurn(
+  question: string,
+  history: AskHistoryMessage[],
+  projects: AskProject[],
+): AskProjectTag[] {
+  const current = resolveAskProjectTags(question, projects);
+  if (current.length || !isAskTaskActionFollowUp(question)) return current;
+  const normalized = normalizeHistory(history);
+  for (let index = normalized.length - 1; index >= 0; index -= 1) {
+    const message = normalized[index]!;
+    if (message.role !== 'user') continue;
+    const inherited = resolveAskProjectTags(message.content, projects);
+    if (inherited.length) return inherited;
+  }
+  return [];
+}
+
+export type AskTaskActionIntent = 'create' | 'update';
+
+/** Detect only narrow, singular task-action language. The model still validates whether the target
+ * and fields are clear; this signal merely prevents a prose-only answer from skipping the durable
+ * proposal route altogether. */
+export function askTaskActionIntent(question: string): AskTaskActionIntent | null {
+  const text = question.trim();
+  if (!text || /\b(?:tasks|suites?|decompos(?:e|ition))\b/i.test(text)
+    || /\b(?:create|add|draft|make)\s+(?:a\s+)?plan\b/i.test(text)) return null;
+  if (isAskTaskActionFollowUp(text)) {
+    return /\b(?:update|edit|change)\b/i.test(text) ? 'update' : 'create';
+  }
+  if (/\b(?:create|add|file|open)\b[\s\S]{0,80}\b(?:task|bug|feature|chore|research)\b/i.test(text)
+    || /\b(?:task|bug|feature|chore|research)\b[\s\S]{0,80}\b(?:create|add|file|open)\b/i.test(text)) return 'create';
+  if (/\b(?:update|edit|change)\b[\s\S]{0,80}\btask\b/i.test(text)) return 'update';
+  return null;
+}
+
 export function stripAskProjectTags(question: string, tags: AskProjectTag[]): string {
   const values = new Set(tags.map((tag) => tag.tag.toLowerCase()));
   return question
@@ -665,7 +709,7 @@ export async function prepareQuestion(env: Env, opts: AskOptions): Promise<Prepa
   const question = opts.question.trim().slice(0, MAX_QUESTION_CHARS);
   const history = normalizeHistory(opts.history);
   const model = opts.model ?? GENERATION_MODEL;
-  const projectTags = resolveAskProjectTags(question, opts.projects);
+  const projectTags = resolveAskProjectTagsForTurn(question, history, opts.projects);
   const projects = projectTags.length
     ? opts.projects.filter((project) => projectTags.some((tag) => tag.projectId === project.id))
     : opts.projects;

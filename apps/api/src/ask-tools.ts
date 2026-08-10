@@ -36,6 +36,7 @@ export interface AskToolResult {
   mode?: 'semantic' | 'keyword' | null;
   graphEnhanced?: boolean;
   summary?: string;
+  actionProposed?: boolean;
 }
 
 export interface AskTool {
@@ -59,6 +60,9 @@ export interface AskToolDecisionClient {
 export interface AskToolLoopOptions {
   shouldContinue?: () => boolean | Promise<boolean>;
   onCheckpoint?: (state: AskToolLoopState) => void | Promise<void>;
+  /** When the latest request is an explicit singular task action, retry one prose-only decision
+   * with a server-authored routing correction before allowing the final answer. */
+  requiredActionTool?: 'propose_task_create' | 'propose_task_update';
 }
 
 export interface AskToolLoopState {
@@ -70,6 +74,7 @@ export interface AskToolLoopState {
   calls: number;
   rounds: number;
   limitReached: boolean;
+  actionProposed: boolean;
 }
 
 const parseArguments = (value: unknown): { parsed: JsonObject | null; raw: string } => {
@@ -380,6 +385,7 @@ const actionResult = (action: Awaited<ReturnType<typeof createAskAction>>): AskT
     nextStep: 'The user must review and approve this single action before Noriq changes the task.',
   }),
   summary: `Ask proposed ${action.summary}; no mutation was applied.`,
+  actionProposed: true,
 });
 
 /** Full Ask catalog. Proposal tools persist one confirmable action but never mutate a task. */
@@ -487,16 +493,28 @@ export async function runAskToolLoop(
   const definitions = askToolDefinitions(tools);
   const state: AskToolLoopState = {
     messages: [...initialMessages], sources: [], trace: [], mode: null, graphEnhanced: false,
-    calls: 0, rounds: 0, limitReached: false,
+    calls: 0, rounds: 0, limitReached: false, actionProposed: false,
   };
   let contextChars = 0;
+  let actionRetrySent = false;
   for (let round = 1; round <= MAX_ASK_TOOL_ROUNDS; round += 1) {
     if (options.shouldContinue && !await options.shouldContinue()) return null;
     const response = await client.decide(state.messages, definitions);
     if (options.shouldContinue && !await options.shouldContinue()) return null;
     const requested = extractAskToolCalls(response);
     state.rounds = round;
-    if (requested.length === 0) return state;
+    if (requested.length === 0) {
+      if (options.requiredActionTool && !state.actionProposed && !actionRetrySent) {
+        actionRetrySent = true;
+        state.trace.push('Ask retried the required single-task proposal route.');
+        state.messages.push({
+          role: 'user',
+          content: `SERVER ACTION ROUTING: The latest user explicitly requested one task action, but no durable proposal exists in this turn. Call ${options.requiredActionTool} now if the target and fields are clear from the latest request, trusted scope, and user-authored history. Otherwise explain the one exact detail that is missing. A prose-only proposal is not a stored action.`,
+        });
+        continue;
+      }
+      return state;
+    }
     const remainingCalls = MAX_ASK_TOOL_CALLS - state.calls;
     if (remainingCalls <= 0) {
       state.limitReached = true;
@@ -543,6 +561,7 @@ export async function runAskToolLoop(
       }
       if (result.mode === 'semantic' || (result.mode === 'keyword' && state.mode === null)) state.mode = result.mode;
       state.graphEnhanced ||= result.graphEnhanced === true;
+      state.actionProposed ||= result.actionProposed === true;
       if (truncated || contextChars >= MAX_ASK_TOOL_CONTEXT_CHARS) state.limitReached = true;
       if (contextChars >= MAX_ASK_TOOL_CONTEXT_CHARS) break;
     }

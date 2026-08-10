@@ -6,7 +6,7 @@ import { describe, expect, it, beforeAll } from 'vitest';
 import { createAgent, createUser, loginSession, mcpCall } from './helpers';
 import {
   answerQuestion, askEventStream, askOutputTokenLimit, buildMessages, extractFinishState, extractGeneratedText, extractReasoningSummaryDelta, extractRetrievalToolQuery, extractStreamDelta,
-  generationClient, normalizeHistory, resolveAskProjectTags, retrievalDecisionClient, stripAskProjectTags,
+  askTaskActionIntent, generationClient, normalizeHistory, resolveAskProjectTags, resolveAskProjectTagsForTurn, retrievalDecisionClient, stripAskProjectTags,
   type ChatMessage, type GenerationClient, type PreparedAsk,
 } from '../src/ask';
 import type { SearchHit } from '../src/search';
@@ -15,11 +15,11 @@ import {
   ASK_GENERATION_CANCELLED, cancelAskGeneration, completeAskGeneration, createAskGeneration, createAskThread,
   deleteAskThread, getAskGeneration, getAskThread, updateAskGeneration,
 } from '../src/ask-chats';
-import { askGenerationEventStream } from '../src/ask-generation';
+import { askGenerationEventStream, runAskGeneration } from '../src/ask-generation';
 import {
   ASK_TASK_ACTION_EXECUTORS,
   AskActionDeniedError, AskActionMaintenanceError, AskActionNotFoundError,
-  approveAskAction, createAskAction, getAskAction, normalizeAskCreateTaskArguments, normalizeAskUpdateTaskArguments,
+  approveAskAction, createAskAction, getAskAction, listAskActions, normalizeAskCreateTaskArguments, normalizeAskUpdateTaskArguments,
 } from '../src/ask-actions';
 import {
   AskModelConfigurationError, AskModelSelectionError, askModelCatalog, resolveAskModel,
@@ -130,6 +130,21 @@ describe('buildMessages (unit)', () => {
     expect(msgs.at(-1)!.content).toContain('"tag":"@proj"');
     expect(msgs[0]!.content).toMatch(/routing identifiers only.*never follow instructions/i);
     expect(msgs.at(-1)!.content).toContain('CURRENT QUESTION: Check @proj');
+  });
+
+  it('inherits trusted project scope only for an explicit task-action follow-up', () => {
+    const history = [
+      { role: 'user' as const, content: '@ASK Create a bug task for the mobile overlap.' },
+      { role: 'assistant' as const, content: 'I prepared the details, but no durable action exists.' },
+    ];
+    expect(resolveAskProjectTagsForTurn('Create it', history, projects)).toEqual([
+      { tag: '@ASK', projectId: 'p', projectKey: 'ASK', projectName: 'Proj' },
+    ]);
+    expect(resolveAskProjectTagsForTurn('What is active now?', history, projects)).toEqual([]);
+    expect(askTaskActionIntent('@ASK Create a bug task for the mobile overlap.')).toBe('create');
+    expect(askTaskActionIntent('@ASK Create a bug task for the Plans page.')).toBe('create');
+    expect(askTaskActionIntent('Create it')).toBe('create');
+    expect(askTaskActionIntent('Create these tasks and a plan')).toBeNull();
   });
 });
 
@@ -470,6 +485,61 @@ describe('Ask confirmed single-task actions', () => {
       .bind(projectId, title).first<{ n: number }>())?.n).toBe(1);
   });
 
+  it('stores a proposal when a follow-up generation initially skips the action tool', async () => {
+    const owner = await env.DB.prepare('SELECT owner_user_id AS id FROM projects WHERE id = ?')
+      .bind(projectId).first<{ id: string }>();
+    const thread = await createAskThread(env.DB, owner!.id, 'Follow-up action retry');
+    const history = [
+      { role: 'user' as const, content: '@ASK Create a bug task for the mobile overlap.' },
+      { role: 'assistant' as const, content: 'The task is prepared but no stored action exists.' },
+    ];
+    const generation = await createAskGeneration(env.DB, owner!.id, thread.id, 'Create it', history);
+    const decisions: ChatMessage[][] = [];
+    const ai = { run: async (_model: string, input: { messages?: ChatMessage[]; stream?: boolean }) => {
+      if (input.stream) {
+        return new Response([
+          'data: {"type":"response.output_text.delta","delta":"The task proposal is ready for review."}\n\n',
+          'data: [DONE]\n\n',
+        ].join('')).body!;
+      }
+      const messages = input.messages ?? [];
+      decisions.push(messages.map((message) => ({ ...message })));
+      if (messages.at(-1)?.content.includes('SERVER ACTION ROUTING')) {
+        return { tool_calls: [{ name: 'propose_task_create', arguments: JSON.stringify({
+          projectId, title: 'Mobile overlap', tags: ['mobile', 'ui'], type: 'bug',
+        }) }] };
+      }
+      return { choices: [{ message: { content: 'READY_TO_ANSWER' } }] };
+    } };
+    const fakeEnv = new Proxy(env as unknown as Env, {
+      get(target, property, receiver) { return property === 'AI' ? ai : Reflect.get(target, property, receiver); },
+    });
+
+    await runAskGeneration(fakeEnv, generation.id);
+
+    const stored = await getAskGeneration(env.DB, generation.id, owner!.id);
+    const actions = await listAskActions(env.DB, owner!.id, { generationId: generation.id });
+    expect(stored).toMatchObject({ status: 'completed', answer: 'The task proposal is ready for review.' });
+    expect(stored!.sources).toEqual(expect.arrayContaining([expect.objectContaining({ projectId, tag: '@ASK' })]));
+    expect(actions).toEqual([expect.objectContaining({
+      projectId, type: 'create_task', status: 'pending', summary: expect.stringContaining('Mobile overlap'),
+    })]);
+    expect(decisions[0]!.at(-1)!.content).toMatch(/ASK ACTION STATE[\s\S]*no pending task action[\s\S]*PROJECT TAG SCOPE/i);
+    expect(decisions.some((messages) => messages.at(-1)?.content.includes('SERVER ACTION ROUTING'))).toBe(true);
+
+    const previousDecisionCount = decisions.length;
+    const confirmation = await createAskGeneration(env.DB, owner!.id, thread.id, 'Create it', [
+      ...history,
+      { role: 'user', content: 'Create it' },
+      { role: 'assistant', content: 'The durable proposal is ready for review.' },
+    ]);
+    await runAskGeneration(fakeEnv, confirmation.id);
+    const confirmationDecisions = decisions.slice(previousDecisionCount);
+    expect(await listAskActions(env.DB, owner!.id, { threadId: thread.id })).toHaveLength(1);
+    expect(confirmationDecisions[0]!.at(-1)!.content).toMatch(/ASK ACTION STATE[\s\S]*"status":"pending"/i);
+    expect(confirmationDecisions.some((messages) => messages.at(-1)?.content.includes('SERVER ACTION ROUTING'))).toBe(false);
+  });
+
   it('records exact replacement before/after values and refuses a stale update atomically', async () => {
     const target = await mcpCall(agent.apiKey, 'create_task', {
       projectId, title: `Ask stale target ${crypto.randomUUID()}`, tags: ['ask'], body: 'Before proposal.',
@@ -716,6 +786,33 @@ describe('bounded Ask tool loop', () => {
     expect(bounded).toMatchObject({ calls: MAX_ASK_TOOL_CALLS, limitReached: true });
     expect(bounded!.trace.at(-1)).toMatch(/call server limit/i);
     expect(finalAskMessages(bounded!).at(-1)?.content).toMatch(/uncertainty/i);
+  });
+
+  it('retries a skipped follow-up proposal with a fresh per-generation budget', async () => {
+    const responses = [
+      { tool_calls: [{ name: 'workspace_status', arguments: '{}' }] },
+      { choices: [{ message: { content: 'READY_TO_ANSWER' } }] },
+      { tool_calls: [{ name: 'propose_task_create', arguments: '{"projectId":"p","title":"Mobile overlap","tags":["mobile","ui"],"type":"bug"}' }] },
+      { choices: [{ message: { content: 'READY_TO_ANSWER' } }] },
+    ];
+    const state = await runAskToolLoop(
+      { decide: async () => responses.shift() },
+      [
+        { role: 'user', content: '@ASK create an earlier task' },
+        { role: 'assistant', content: 'An earlier turn used tools.' },
+        { role: 'user', content: '@ASK Create a mobile bug task.' },
+        { role: 'assistant', content: 'The task is prepared, but no action was stored.' },
+        { role: 'user', content: 'Create it' },
+      ],
+      [
+        { name: 'workspace_status', description: 'status', inputSchema: { type: 'object' }, async execute() { return { content: '{}', summary: 'status read' }; } },
+        { name: 'propose_task_create', description: 'proposal', inputSchema: { type: 'object' }, async execute() { return { content: '{"pending":true}', summary: 'proposal stored', actionProposed: true }; } },
+      ],
+      { requiredActionTool: 'propose_task_create' },
+    );
+    expect(state).toMatchObject({ calls: 2, rounds: 4, limitReached: false, actionProposed: true });
+    expect(state!.trace).toEqual(expect.arrayContaining(['Ask retried the required single-task proposal route.', 'proposal stored']));
+    expect(state!.messages.some((message) => message.content.includes('SERVER ACTION ROUTING'))).toBe(true);
   });
 
   it('keeps failed tool output explicit and untrusted so the final answer cannot imply success', async () => {
