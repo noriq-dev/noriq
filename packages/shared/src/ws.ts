@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { Run, RunStatus, RunPhase, RunExit, AgentTool, RunKind, RunnerRepo, RunModelUsage } from './runner';
 import { ExecutionSpec } from './execution-spec';
+import { ExecutedConfigurationEvidence } from './intelligence';
 import {
   ExecutionReportAck,
   ORCHESTRATION_CAPABILITY,
@@ -234,6 +235,9 @@ export const RunnerClientMessage = z.discriminatedUnion('type', [
      * mint a status change, and `run.status` has no running → running edge to carry it on.
      */
     executedSpec: ExecutionSpec.nullable().default(null),
+    // PLNR-291: resolved Runner/driver configuration is late evidence, not permission to rewrite
+    // the immutable server commissioning record. Older Runners omit it.
+    executedConfiguration: ExecutedConfigurationEvidence.nullable().default(null),
     at: z.string().datetime(),
   }),
 

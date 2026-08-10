@@ -18,6 +18,9 @@ import { RunKind, AgentTool, RunStatus, type RunPhase, type ExecutionSpec, type 
 import { writeExecutionSpec } from '../lib/execution-spec';
 import { processPendingEpisodeJob } from '../memory/episodes';
 import { ensureRunExecution, mirrorRunTransition } from '../lib/orchestration-store';
+import {
+  captureRunCommissioningSnapshot, recordRunSittingExecutedConfiguration, recordRunSittingExecutedSpec,
+} from '../lib/run-sitting-intelligence';
 import type { ExecutionAssignment } from '@noriq-dev/shared';
 
 /**
@@ -3551,6 +3554,7 @@ export class ProjectRoom extends DurableObject<Env> {
       input.createdBy ?? actor.id, now, now,
       runnerId ? now : null,
     ).run();
+    if (runnerId) await captureRunCommissioningSnapshot(this.env.DB, this.projectId, id, now);
     // PLNR-322: `anchorId` rides alongside the existing `anchor` (type-only) field — the
     // projector needs the anchor's real id to draw a run -> anchor edge; `anchor` itself is
     // untouched (locked decision: additive only). `anchorId` mirrors `anchorType`'s nullability
@@ -3576,6 +3580,7 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.env.DB.prepare(
         "UPDATE runs SET runner_id = ?, status = 'dispatched', dispatched_at = ?, updated_at = ? WHERE id = ?",
       ).bind(runnerId, now, now, runId).run();
+      await captureRunCommissioningSnapshot(this.env.DB, this.projectId, runId, now);
       await this.emit(actor, 'run.dispatched', 'run', runId, { runnerId, from: run.status, to: 'dispatched' });
       const view = this.runToWire(await this.loadRun(runId));
       view.execution = await ensureRunExecution(this.env, runId);
@@ -3659,6 +3664,7 @@ export class ProjectRoom extends DurableObject<Env> {
         `UPDATE runs SET status = 'dispatched', exit = NULL, phase = NULL, agent_id = NULL,
                 sitting = sitting + 1, budget = ?, dispatched_at = ?, updated_at = ? WHERE id = ?`,
       ).bind(JSON.stringify(budget), now, now, runId).run();
+      await captureRunCommissioningSnapshot(this.env.DB, this.projectId, runId, now);
       await this.emit(actor, 'run.status_changed', 'run', runId, { from: 'failed', to: 'dispatched', reason: 'continue', maxRounds: rounds });
 
       // Re-arm the anchor task — the inverse of the failed settle. Clear `failed_at` and hand it
@@ -4577,6 +4583,7 @@ export class ProjectRoom extends DurableObject<Env> {
       modelUsage?: Record<string, unknown> | null;
       /** The spec this run was actually briefed with (RUN-166) — reported once, then null. */
       executedSpec?: unknown | null;
+      executedConfiguration?: import('@noriq-dev/shared').ExecutedConfigurationEvidence | null;
     },
   ): Promise<void> {
     await this.setPid(projectId);
@@ -4672,6 +4679,7 @@ export class ProjectRoom extends DurableObject<Env> {
     // against the last entry keeps redelivery a no-op — which is also what lets the daemon re-send
     // freely until the frame lands, since the record rides fire-and-forget telemetry.
     if (t.executedSpec != null) {
+      await recordRunSittingExecutedSpec(this.env.DB, projectId, runId, t.executedSpec);
       const row = await this.env.DB.prepare('SELECT executed_spec AS s FROM runs WHERE id = ? AND project_id = ?')
         .bind(runId, projectId).first<{ s: string | null }>();
       const history = ProjectRoom.parseSpecList(row?.s ?? null);
@@ -4681,6 +4689,9 @@ export class ProjectRoom extends DurableObject<Env> {
         await this.env.DB.prepare('UPDATE runs SET executed_spec = ? WHERE id = ? AND project_id = ?')
           .bind(JSON.stringify(history), runId, projectId).run();
       }
+    }
+    if (t.executedConfiguration != null) {
+      await recordRunSittingExecutedConfiguration(this.env.DB, projectId, runId, t.executedConfiguration);
     }
   }
 

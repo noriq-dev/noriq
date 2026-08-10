@@ -39,6 +39,7 @@ import {
   type GraphEntityPage, type GraphEntityPageInput, type ConstellationInputRows,
 } from '../memory/graph-queries';
 import { EpisodeSkeletonUnavailableError, loadEpisodeSkeleton } from '../memory/episodes';
+import type { EpisodeIntelligenceDraft } from '../lib/run-sitting-intelligence';
 import {
   effortSignals, duplicateWarnings, summarizeEffort,
   type TaskEffortInput, type EffortCandidate, type DuplicateWarning, type EffortSummary,
@@ -235,6 +236,7 @@ interface RecordEpisodeInput {
   steeringEvents: string[];
   landingOutcome: string;
   remainingWork: string[];
+  intelligence?: EpisodeIntelligenceDraft;
   selfSummary?: unknown;
   actor: { kind: string; id: string | null };
   /** Direct callers replace enrichment by default. Skeleton replays preserve it; daemon
@@ -1441,6 +1443,19 @@ export class ProjectMemory extends DurableObject<Env> {
     // column can never disagree.
     const episodeId = existingRow?.id ?? newId('epi');
     const created = !existingRow;
+    const acceptedMemoryRevision = (this.ctx.storage.sql
+      .exec<{ value: number }>(`SELECT value FROM memory_revision WHERE id = 0`)
+      .toArray()[0]?.value ?? 0) + 1;
+    // The caller cannot know the Durable Object's stable episode id. It supplies every other
+    // server-derived fact; this storage seam completes the identity. Daemon enrichment cannot
+    // replace it because its accepted upload schema never carries `intelligence`.
+    const intelligence = input.intelligence
+      ? {
+          ...input.intelligence,
+          identity: { episodeId, ...input.intelligence.identity },
+          sources: { ...input.intelligence.sources, memoryRevision: acceptedMemoryRevision },
+        }
+      : existingBody.intelligence;
 
     // Validated (and default-filled) through the SAME shared schema the wire contract uses —
     // the full EffortEpisode rides `body` as JSON (locked decision; the table's own header
@@ -1466,6 +1481,7 @@ export class ProjectMemory extends DurableObject<Env> {
       steeringEvents: input.steeringEvents,
       landingOutcome: input.landingOutcome,
       remainingWork: input.remainingWork,
+      intelligence,
       selfSummary: mergedSelfSummary,
       createdAt,
     });

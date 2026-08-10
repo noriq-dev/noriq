@@ -102,6 +102,14 @@ export const ConfigurationFingerprint = z.object({
 });
 export type ConfigurationFingerprint = z.infer<typeof ConfigurationFingerprint>;
 
+/** Late Runner evidence about the configuration that actually executed. It is deliberately
+ * distinct from the server's commissioning snapshot and optional on telemetry for old Runners. */
+export const ExecutedConfigurationEvidence = z.object({
+  strategy: StrategyCoordinate.nullable().default(null),
+  configuration: z.array(ConfigurationFingerprint).default([]),
+});
+export type ExecutedConfigurationEvidence = z.infer<typeof ExecutedConfigurationEvidence>;
+
 export const ProjectIntelligenceIdentity = z.object({
   episodeId: z.string().min(1),
   projectId: z.string().min(1),
