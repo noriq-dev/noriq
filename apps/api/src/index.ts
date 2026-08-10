@@ -49,6 +49,7 @@ import {
 import { renderEvidenceFrame, type EvidenceFrameItem } from './memory/evidence-frame';
 import { assembleContextPack } from './memory/context-pack';
 import { assessPreDispatchRisk } from './memory/scope-risk';
+import { getDispatchIntelligence, resolveDispatchRepository } from './memory/dispatch-intelligence';
 import {
   COMPARISON_METRICS, queryStrategyComparison, STRATEGY_DIMENSIONS,
 } from './memory/strategy-comparison';
@@ -1912,6 +1913,80 @@ app.post('/api/projects/:pid/memory/pre-dispatch-risk', userAuth, async (c) => {
     .bind(parsed.data.taskId, parsed.data.taskId, pid).first<{ id: string }>();
   if (!task) return c.json({ error: 'not found' }, 404);
   return c.json(await assessPreDispatchRisk(c.env, pid, task.id, parsed.data));
+});
+
+const DispatchIntelligenceBody = z.object({
+  taskId: z.string().min(1),
+  runnerId: z.string().min(1).nullable().optional(),
+  repositoryCheckoutId: z.string().min(1).nullable().optional(),
+  branch: z.string().min(1).nullable().optional(),
+  baseId: z.string().min(1).nullable().optional(),
+  budget: RunBudget.nullable().optional(),
+  comparison: z.object({ dimension: z.enum(STRATEGY_DIMENSIONS), metric: z.enum(COMPARISON_METRICS) }).strict().optional(),
+}).strict();
+
+// PLNR-303: the task drawer and dispatch form consume this ONE advisory packet. It composes the
+// same context/risk/bottleneck/comparison authorities used by MCP and REST; preview is read-only
+// and cannot create a shadow snapshot or similarity-calibration occurrence.
+app.post('/api/projects/:pid/memory/dispatch-intelligence', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const parsed = DispatchIntelligenceBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid dispatch intelligence request', detail: parsed.error.issues }, 400);
+  const task = await c.env.DB.prepare('SELECT id FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
+    .bind(parsed.data.taskId, parsed.data.taskId, pid).first<{ id: string }>();
+  if (!task) return c.json({ error: 'not found' }, 404);
+  try {
+    return c.json(await getDispatchIntelligence(c.env, pid, { ...parsed.data, taskId: task.id }));
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+  }
+});
+
+// Feedback is the only write on the preview surface. The server reruns the shared retrieval and
+// persists an occurrence only if the exact episode/run/sitting is still in that result; merely
+// opening or changing a preview therefore never creates a calibration/training row.
+app.post('/api/projects/:pid/memory/dispatch-intelligence/feedback', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const parsed = DispatchIntelligenceBody.extend({
+    episodeId: z.string().min(1), runId: z.string().min(1), sitting: z.number().int().positive(),
+    operationKey: z.string().min(1).max(200), judgment: z.enum(SIMILARITY_JUDGMENTS),
+    reasonCode: z.enum(SIMILARITY_REASON_CODES).nullable().optional(), reason: z.string().max(2_000).nullable().optional(),
+  }).omit({ budget: true, comparison: true }).safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid dispatch intelligence feedback', detail: parsed.error.issues }, 400);
+  const task = await c.env.DB.prepare(
+    'SELECT id, title, body, execution_spec AS executionSpec FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?',
+  ).bind(parsed.data.taskId, parsed.data.taskId, pid).first<{ id: string; title: string; body: string | null; executionSpec: string | null }>();
+  if (!task) return c.json({ error: 'not found' }, 404);
+  const repository = await resolveDispatchRepository(c.env, pid, parsed.data.runnerId, parsed.data.repositoryCheckoutId);
+  const prior = await loadPriorEffort(c.env, pid, task, {
+    limit: 20, repositoryKey: repository.repositoryKey ?? undefined,
+    preferBranch: parsed.data.branch ?? undefined, baseId: parsed.data.baseId ?? undefined,
+  });
+  if (!prior) return c.json({ error: 'project memory unavailable' }, 502);
+  const index = prior.cases.findIndex((item) => item.episodeId === parsed.data.episodeId
+    && item.runId === parsed.data.runId && item.sitting === parsed.data.sitting);
+  if (index < 0) return c.json({ error: 'the case is no longer present in the server-authored preview' }, 409);
+  const [surfaced] = await room(c.env, pid).observeSimilarEffortCases(pid, {
+    task,
+    policy: {
+      repositoryKey: repository.repositoryKey ?? undefined,
+      preferBranch: parsed.data.branch ?? undefined,
+      baseId: parsed.data.baseId ?? undefined,
+    },
+    pageOffset: index,
+    cases: [prior.cases[index]!],
+  });
+  try {
+    const result = await room(c.env, pid).recordSimilarityFeedback(pid, humanActor(c), {
+      operationKey: parsed.data.operationKey, occurrenceId: surfaced!.occurrence.id,
+      judgment: parsed.data.judgment, reasonCode: parsed.data.reasonCode,
+      reason: parsed.data.reason,
+    });
+    return c.json({ ...result, occurrenceId: surfaced!.occurrence.id });
+  } catch (error) {
+    if (error instanceof SimilarityFeedbackError) return c.json({ error: error.message }, error.status);
+    throw error;
+  }
 });
 
 // PLNR-301: historical correlation-aware comparison. Dimension is a closed pre-execution enum;

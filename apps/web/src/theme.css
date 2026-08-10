@@ -137,6 +137,7 @@ button { all: unset; box-sizing: border-box; max-width: 100%; }
 .intelligence-metrics b { font-size: 13px; overflow-wrap: anywhere; }
 .intelligence-metrics small { font-family: var(--mono); font-size: 8px; color: var(--text-faint); }
 .intelligence-case { display: flex; gap: 8px; align-items: center; padding: 11px 13px; border-bottom: 1px solid var(--w-07); }
+.dispatch-intelligence-cases { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
 
 @media (max-width: 860px) {
   .mobile-topbar {
@@ -160,6 +161,7 @@ button { all: unset; box-sizing: border-box; max-width: 100%; }
   .agents-grid { grid-template-columns: 1fr !important; }
   .intelligence-view { padding: 14px !important; }
   .intelligence-grid, .intelligence-groups { grid-template-columns: 1fr !important; }
+  .dispatch-intelligence-cases { grid-template-columns: 1fr !important; }
 
   /* Task drawer + centered modals go full-bleed. */
   .task-drawer { width: 100vw !important; }

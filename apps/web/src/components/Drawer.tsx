@@ -11,6 +11,7 @@ import { Markdown } from './Markdown';
 import { Composer } from './Composer';
 import { Button, Select, TextArea, TextInput } from './ui';
 import { ExecutionSpecPanel, type SpecLoad } from './ExecutionSpec';
+import { DispatchIntelligencePanel } from './DispatchIntelligence';
 import { confirm } from './Dialog';
 
 export function Drawer({ store }: { store: AppStore }) {
@@ -608,6 +609,8 @@ export function Drawer({ store }: { store: AppStore }) {
             inFlight={eff !== 'todo'}
             onSaved={() => reloadSpec(task.id)}
           />
+
+          <DispatchIntelligencePanel pid={currentPid} taskId={task.id} />
 
           {/* related docs (PLNR-182) — the design/decision docs this task implements */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 8 }}>

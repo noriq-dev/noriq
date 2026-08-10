@@ -13,6 +13,7 @@ import { Markdown } from './Markdown';
 import { LiveDot, MonoTag, SectionLabel } from './bits';
 import { Button, ErrorNote, Field, Select, TextArea, TextInput } from './ui';
 import { alert, confirm, prompt } from './Dialog';
+import { DispatchIntelligencePanel } from './DispatchIntelligence';
 
 function ago(iso: string | null): string {
   if (!iso) return 'never';
@@ -743,6 +744,21 @@ function DispatchForm({
           <TextInput value={maxMinutes} onChange={(e) => setMaxMinutes(e.target.value)} inputMode="numeric" placeholder="—" />
         </Field>
       </div>
+
+      {anchorTask && <DispatchIntelligencePanel
+        expanded
+        includeComparison
+        pid={pid}
+        taskId={anchorTask}
+        runnerId={runner.id}
+        repositoryCheckoutId={repoRef || null}
+        branch={targetBranch.trim() || null}
+        budget={{
+          maxUsd: num(maxUsd), maxTokens: num(maxTokens),
+          maxDurationSeconds: maxMinutes.trim() ? (num(maxMinutes) ?? 0) * 60 : null,
+          maxRounds: null,
+        }}
+      />}
 
       {err && <ErrorNote>{err}</ErrorNote>}
 

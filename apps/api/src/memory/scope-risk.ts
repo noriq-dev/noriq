@@ -72,6 +72,12 @@ export interface PreDispatchRiskResult {
     hazards: ContextPackMemoryExcerpt[];
     unknowns: ContextPackMemoryExcerpt[];
   };
+  quotedMemoryEvidence: {
+    kind: 'quoted_memory_evidence';
+    failedApproaches: ContextPackMemoryExcerpt[];
+    relevant: ContextPackMemoryExcerpt[];
+    evidenceFrame: Awaited<ReturnType<typeof assembleContextPack>>['evidenceFrame'];
+  };
   priorEvidence: {
     kind: 'historical_case_observation';
     retrievalMode: 'semantic' | 'keyword';
@@ -275,6 +281,12 @@ export async function assessPreDispatchRisk(
         .filter((item) => item.authority === AUTHORITY_HUMAN_APPROVED),
       hazards: currentHighAuthority(pack, 'known_hazards'),
       unknowns: currentHighAuthority(pack, 'uncertainty'),
+    },
+    quotedMemoryEvidence: {
+      kind: 'quoted_memory_evidence',
+      failedApproaches: memoryExcerpts(pack, 'failed_approaches'),
+      relevant: memoryExcerpts(pack, 'relevant_memories'),
+      evidenceFrame: pack.evidenceFrame,
     },
     priorEvidence: {
       kind: 'historical_case_observation',
