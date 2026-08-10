@@ -7,6 +7,7 @@ import {
   resolveGroupRole,
   resolveProjectAccess,
 } from '../src/lib/authorization';
+import { listWorkspaceProjects } from '../src/lib/workspace-operations';
 
 const ids = {
   owner: 'usr_authz_owner',
@@ -136,6 +137,17 @@ describe('layered authorization foundation (PLNR-326)', () => {
     const elevated = await resolveProjectAccess(env.DB, ids.admin, ids.project, { allowAdminOverride: true });
     expect(elevated.role).toBe('owner');
     expect(elevated.source).toBe('admin_override');
+  });
+
+  it('requires the same explicit override in shared workspace operations', async () => {
+    const ordinary = await listWorkspaceProjects(env, { userId: ids.admin });
+    expect(ordinary.some((project) => project.id === ids.project)).toBe(false);
+
+    const elevated = await listWorkspaceProjects(env, { userId: ids.admin, allowAdminOverride: true });
+    expect(elevated.some((project) => project.id === ids.project)).toBe(true);
+
+    const pending = await listWorkspaceProjects(env, { userId: ids.pending });
+    expect(pending.some((project) => project.id === ids.project)).toBe(false);
   });
 
   it('maps project roles to stable action thresholds', () => {

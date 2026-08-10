@@ -15,7 +15,7 @@ import {
   tokenProjectWhere,
   userCanAccessProject,
 } from './lib/visibility';
-import { taskSearchFilters } from './lib/search';
+import { searchWorkspaceEvidence, searchWorkspaceTasks } from './lib/workspace-operations';
 import {
   ExecutionEventType, ExecutionKind, ExecutionLineageStatus, ExecutionRelationType, ExecutionRole,
   ExecutionSpec, type ExecutionSpecInput, MemoryKind, MemoryEdgeType, EvidenceRef, ContextPackRole,
@@ -1622,26 +1622,15 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       limit: z.number().int().min(1).max(200).optional().describe('Default 50'),
     },
     tool(async ({ projectId, status, type, tag, milestoneId, holder, text, overdue, includeArchived, limit }) => {
-      const { sql, binds } = taskSearchFilters({
+      return searchWorkspaceTasks(env, {
+        userId: agent.userId,
+        oauthTokenId: opts.oauthTokenId,
+      }, {
+        projectId,
         status, type, tag, milestoneId, text, overdue, includeArchived,
         holder: holder === 'me' ? agent.id : holder,
+        limit,
       });
-      // Numbered params first (?1 user, ?2 project-or-null, ?3 token), THEN the filter
-      // fragment's bare `?`s — SQLite continues the positional counter from 3.
-      const base = `FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
-        WHERE ${USER_PROJECT_WHERE} AND ${tokenProjectWhere('?3')} AND (?2 IS NULL OR t.project_id = ?2)${sql}`;
-      const allBinds = [agent.userId, projectId ?? null, opts.oauthTokenId ?? null, ...binds];
-      const max = limit ?? 50;
-      const [rows, total] = await Promise.all([
-        env.DB.prepare(
-          `SELECT t.id, t.key, t.title, ${taskWireStatus('t')} AS status, t.failed_at AS failedAt, t.priority, t.estimate, t.due_at AS dueAt, t.type,
-                  t.project_id AS projectId, p.key AS projectKey, t.claimed_by AS claimedBy,
-                  t.milestone_id AS milestoneId, t.open_comments AS openComments, t.updated_at AS updatedAt
-           ${base} ORDER BY t.priority ASC, t.updated_at DESC LIMIT ${max}`,
-        ).bind(...allBinds).all(),
-        env.DB.prepare(`SELECT COUNT(*) AS n ${base}`).bind(...allBinds).first<{ n: number }>(),
-      ]);
-      return { tasks: rows.results, matched: total?.n ?? rows.results.length, returned: rows.results.length };
     }),
   );
 
@@ -1655,12 +1644,10 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       limit: z.number().int().min(1).max(50).optional().describe('Default 12'),
     },
     tool(async ({ query, projectId, kinds, limit }) => {
-      const { results } = await env.DB.prepare(
-        `SELECT p.id FROM projects p WHERE p.status = 'active' AND ${USER_PROJECT_WHERE} AND ${tokenProjectWhere('?2')}`,
-      ).bind(agent.userId, opts.oauthTokenId ?? null).all<{ id: string }>();
-      let projectIds = results.map((r) => r.id);
-      if (projectId) projectIds = projectIds.filter((id) => id === projectId);
-      const { mode, results: hits } = await search(env, { q: query, projectIds, kinds, limit });
+      const { mode, results: hits } = await searchWorkspaceEvidence(env, {
+        userId: agent.userId,
+        oauthTokenId: opts.oauthTokenId,
+      }, { query, projectId, kinds, limit });
       return { mode, results: hits, returned: hits.length };
     }),
   );

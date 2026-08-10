@@ -10,7 +10,7 @@ import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot, importSnapshot } from './backup';
 import { sweepPendingErasures, sweepProjectDebris, sweepProjectDebrisForProject, listProjectBackupGenerations } from './memory/lifecycle';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, timingSafeEqual, verifyPassword, verifyPasswordConstantTime } from './lib/util';
-import { taskSearchFilters } from './lib/search';
+import { searchWorkspaceEvidence, searchWorkspaceTasks } from './lib/workspace-operations';
 import type { ExecutionSpecInput, RunStatus } from '@noriq-dev/shared';
 import { readExecutionSpec } from './lib/execution-spec';
 import { search, searchBackend, reindexProject, ALL_KINDS, type SearchKind } from './search';
@@ -1057,26 +1057,16 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
 app.get('/api/tasks/search', userAuth, async (c) => {
   const u = c.var.user!;
   const q = c.req.query();
-  const { sql, binds } = taskSearchFilters({
+  const result = await searchWorkspaceTasks(c.env, {
+    userId: u.id,
+    allowAdminOverride: u.role === 'admin',
+  }, {
+    projectId: q.projectId,
     status: q.status, type: q.type, tag: q.tag, milestoneId: q.milestoneId,
     holder: q.holder, text: q.text, includeArchived: q.includeArchived === '1', overdue: q.overdue === '1',
+    limit: parseInt(q.limit ?? '50', 10) || 50,
   });
-  const limit = Math.min(Math.max(parseInt(q.limit ?? '50', 10) || 50, 1), 200);
-  const pid = q.projectId ?? null;
-  const visibleProjects = u.role === 'admin' ? '1 = 1' : USER_PROJECT_WHERE;
-  const base = `FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
-    WHERE ${visibleProjects} AND (? IS NULL OR t.project_id = ?)${sql}`;
-  const allBinds = [...(u.role === 'admin' ? [] : [u.id]), pid, pid, ...binds];
-  const [rows, total] = await Promise.all([
-    c.env.DB.prepare(
-      `SELECT t.id, t.key, t.title, ${taskWireStatus('t')} AS status, t.failed_at AS failedAt, t.priority, t.estimate, t.due_at AS dueAt, t.type,
-              t.project_id AS projectId, p.key AS projectKey, t.claimed_by AS claimedBy,
-              t.milestone_id AS milestoneId, t.open_comments AS openComments, t.updated_at AS updatedAt
-       ${base} ORDER BY t.priority ASC, t.updated_at DESC LIMIT ${limit}`,
-    ).bind(...allBinds).all(),
-    c.env.DB.prepare(`SELECT COUNT(*) AS n ${base}`).bind(...allBinds).first<{ n: number }>(),
-  ]);
-  return c.json({ tasks: rows.results, matched: total?.n ?? rows.results.length, returned: rows.results.length });
+  return c.json(result);
 });
 
 app.get('/api/tasks/:tid', userAuth, async (c) => {
@@ -1876,9 +1866,10 @@ app.get('/api/projects/:pid/search', userAuth, async (c) => {
   if (!q) return c.json({ error: 'q required' }, 400);
   const kindsParam = c.req.query('kinds')?.split(',').filter((k): k is SearchKind => (ALL_KINDS as readonly string[]).includes(k));
   const limit = Math.min(Math.max(parseInt(c.req.query('limit') ?? '12', 10) || 12, 1), 50);
-  const { mode, results } = await search(c.env, {
-    q, projectIds: [c.req.param('pid')!], kinds: kindsParam?.length ? kindsParam : undefined, limit,
-  });
+  const { mode, results } = await searchWorkspaceEvidence(c.env, {
+    userId: c.var.user!.id,
+    allowAdminOverride: c.var.user!.role === 'admin',
+  }, { query: q, projectId: c.req.param('pid')!, kinds: kindsParam?.length ? kindsParam : undefined, limit });
   return c.json({ mode, results });
 });
 

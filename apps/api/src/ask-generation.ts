@@ -4,19 +4,14 @@ import {
   ASK_GENERATION_CANCELLED, completeAskGeneration, failAskGeneration, getAskGeneration, updateAskGeneration,
   type StoredAskGeneration,
 } from './ask-chats';
-import { USER_PROJECT_WHERE } from './lib/visibility';
+import { listWorkspaceProjects } from './lib/workspace-operations';
 
 const encoder = new TextEncoder();
 const frame = (event: string, data: unknown): Uint8Array =>
   encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 
 export async function accessibleAskProjectsForUser(env: Env, userId: string): Promise<AskProject[]> {
-  const { results } = await env.DB.prepare(
-    `SELECT p.id, p.key, p.name FROM projects p
-     WHERE p.status = 'active' AND ${USER_PROJECT_WHERE}
-     ORDER BY p.created_at`,
-  ).bind(userId).all<AskProject>();
-  return results;
+  return listWorkspaceProjects(env, { userId });
 }
 
 /** Alarm entrypoint: inference is owned by a Durable Object alarm (15 minute wall-time budget),
