@@ -382,6 +382,33 @@ describe('global Ask chat', () => {
     expect(actions.openTask).toHaveBeenCalledWith('task_2');
   });
 
+  it('keeps Ask open after approving a task creation', async () => {
+    const pending: ApiAskAction = {
+      id: 'askact_create', threadId: activeThread.id, messageId: `${activeThread.id}_a`, generationId: 'askgen_create',
+      projectId: 'project_pay', type: 'create_task', summary: 'Create task “Retry docs” in PAY',
+      arguments: { projectId: 'project_pay', title: 'Retry docs', tags: ['payments'] },
+      expected: { projectId: 'project_pay' }, requiredAction: 'contribute', operationKey: 'op_create',
+      status: 'pending', result: null, error: null, createdAt: now, updatedAt: now, settledAt: null,
+    };
+    const detail = detailFor(activeThread);
+    detail.messages[1] = { ...detail.messages[1]!, actions: [pending] };
+    vi.spyOn(api, 'askThreads').mockResolvedValue({ threads: [activeThread] });
+    vi.spyOn(api, 'askThread').mockResolvedValue(detail);
+    vi.spyOn(api, 'approveAskAction').mockResolvedValue({
+      ...pending, status: 'approved', result: { id: 'task_created', key: 'PAY-10' }, settledAt: now,
+    });
+
+    mount();
+    await flush();
+    await act(async () => ariaButton('Confirm Create task “Retry docs” in PAY')!.click());
+
+    expect(container.textContent).toContain('Applied as your human action.');
+    expect(container.textContent).toContain('Release readiness');
+    expect(actions.refreshNow).toHaveBeenCalled();
+    expect(actions.selectProject).not.toHaveBeenCalled();
+    expect(actions.openTask).not.toHaveBeenCalled();
+  });
+
   it('rejects a restored pending action without opening a task and renders persisted failures', async () => {
     const pending: ApiAskAction = {
       id: 'askact_create', threadId: activeThread.id, messageId: `${activeThread.id}_a`, generationId: 'askgen_action_2',

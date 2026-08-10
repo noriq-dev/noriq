@@ -578,14 +578,12 @@ export function AskView({ store }: { store: AppStore }) {
         : await api.rejectAskAction(action.id);
       replaceAction(updated);
       if (updated.status === 'approved') {
-        const args = record(updated.arguments);
-        const result = record(updated.result);
-        const taskId = updated.type === 'update_task' && typeof args.taskId === 'string'
-          ? args.taskId
-          : typeof result.id === 'string' ? result.id : null;
-        actions.selectProject(updated.projectId);
         actions.refreshNow();
-        if (taskId) actions.openTask(taskId);
+        if (updated.type === 'update_task') {
+          const args = record(updated.arguments);
+          actions.selectProject(updated.projectId);
+          if (typeof args.taskId === 'string') actions.openTask(args.taskId);
+        }
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : `Could not ${decision} that action.`);
