@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   api, ApiError, type ApiAskAction, type ApiAskHistoryMessage, type ApiAskModelDefinition, type ApiAskSource,
-  type ApiAskStoredMessage, type ApiAskThread,
+  type ApiAskStoredMessage, type ApiAskThread, type ApiTaskSearchResult,
 } from '../api';
 import type { AppStore } from '../store';
 import { MonoTag, WaveBars } from './bits';
@@ -156,6 +156,9 @@ export function AskView({ store }: { store: AppStore }) {
   const [historyLoading, setHistoryLoading] = useState(true);
   const [q, setQ] = useState('');
   const [activeProjectSuggestion, setActiveProjectSuggestion] = useState(0);
+  const [taskSuggestions, setTaskSuggestions] = useState<ApiTaskSearchResult[]>([]);
+  const [activeTaskSuggestion, setActiveTaskSuggestion] = useState(0);
+  const [taskSuggestionsLoading, setTaskSuggestionsLoading] = useState(false);
   const [models, setModels] = useState<ApiAskModelDefinition[]>([]);
   const [selectedModel, setSelectedModel] = useState('');
   const [modelsLoading, setModelsLoading] = useState(true);
@@ -172,6 +175,8 @@ export function AskView({ store }: { store: AppStore }) {
   const loading = phase !== null;
   const mention = q.match(/(?:^|\s)@([a-z0-9_-]*)$/i);
   const mentionQuery = mention?.[1]?.toLowerCase() ?? null;
+  const taskMention = q.match(/(?:^|\s)#([a-z0-9_-]*)$/i);
+  const taskMentionQuery = taskMention?.[1] ?? null;
   const projectDirectory = store.data?.projects ?? [];
   const nameTags = projectDirectory.map((project) => askProjectTag(project.name));
   const nameTagCounts = new Map<string, number>();
@@ -189,10 +194,42 @@ export function AskView({ store }: { store: AppStore }) {
     setActiveProjectSuggestion(0);
   }, [mentionQuery]);
 
+  useEffect(() => {
+    setActiveTaskSuggestion(0);
+    if (taskMentionQuery === null) {
+      setTaskSuggestions([]);
+      setTaskSuggestionsLoading(false);
+      return;
+    }
+    setTaskSuggestions([]);
+    setTaskSuggestionsLoading(true);
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      void api.searchTasks({ text: taskMentionQuery, limit: 6 }, controller.signal)
+        .then(({ tasks }) => setTaskSuggestions(tasks))
+        .catch((cause: unknown) => {
+          if (!(cause instanceof DOMException && cause.name === 'AbortError')) setTaskSuggestions([]);
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setTaskSuggestionsLoading(false);
+        });
+    }, 200);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [taskMentionQuery]);
+
   const insertProjectTag = (tag: string) => {
     if (!mention) return;
     const at = q.lastIndexOf('@');
     setQ(`${q.slice(0, at)}${tag} `);
+  };
+
+  const insertTaskReference = (task: ApiTaskSearchResult) => {
+    if (!taskMention) return;
+    const hash = q.lastIndexOf('#');
+    setQ(`${q.slice(0, hash)}#${task.key} `);
   };
 
   const patchGeneration = (generationId: string, patch: (message: ThreadMessage) => ThreadMessage) => {
@@ -756,7 +793,26 @@ export function AskView({ store }: { store: AppStore }) {
                   ))}
                 </div>
               )}
+              {taskMentionQuery !== null && (taskSuggestionsLoading || taskSuggestions.length > 0) && (
+                <div role="listbox" aria-label="Reference a task" aria-activedescendant={taskSuggestions[activeTaskSuggestion] ? `ask-task-option-${taskSuggestions[activeTaskSuggestion]!.id}` : undefined} style={{ position: 'absolute', left: 12, bottom: 'calc(100% + 7px)', width: 420, maxWidth: 'calc(100vw - 48px)', maxHeight: 280, overflowY: 'auto', border: '1px solid var(--w-12)', borderRadius: 10, background: 'var(--bg-raised)', padding: 5, boxShadow: '0 14px 34px rgba(0,0,0,.3)', zIndex: 5 }}>
+                  {taskSuggestionsLoading && <div style={{ padding: '7px 9px', color: 'var(--text-faint)', fontFamily: 'var(--mono)', fontSize: 9 }}>searching…</div>}
+                  {taskSuggestions.map((task, index) => (
+                    <button id={`ask-task-option-${task.id}`} key={task.id} role="option" aria-selected={index === activeTaskSuggestion} onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setActiveTaskSuggestion(index)} onClick={() => insertTaskReference(task)} style={{ cursor: 'pointer', width: '100%', display: 'flex', alignItems: 'center', gap: 9, borderRadius: 7, padding: '7px 9px', color: 'var(--text)', textAlign: 'left', background: index === activeTaskSuggestion ? 'var(--w-07)' : 'transparent' }} className="hover-border">
+                      <span style={{ flex: 'none', fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--blue)' }}>#{task.key}</span>
+                      <span style={{ minWidth: 0, fontSize: 11.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{task.title}</span>
+                      <span style={{ marginLeft: 'auto', flex: 'none', fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>{task.projectKey} · {task.status}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
               <textarea value={q} onChange={(event) => setQ(event.target.value)} onKeyDown={(event) => {
+                if (taskSuggestions.length > 0 && taskMentionQuery !== null && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
+                  event.preventDefault();
+                  setActiveTaskSuggestion((current) => event.key === 'ArrowDown'
+                    ? (current + 1) % taskSuggestions.length
+                    : (current - 1 + taskSuggestions.length) % taskSuggestions.length);
+                  return;
+                }
                 if (projectSuggestions.length > 0 && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
                   event.preventDefault();
                   setActiveProjectSuggestion((current) => event.key === 'ArrowDown'
@@ -766,6 +822,11 @@ export function AskView({ store }: { store: AppStore }) {
                 }
                 if (event.key === 'Enter' && !event.shiftKey) {
                   event.preventDefault();
+                  const taskSuggestion = taskMentionQuery !== null ? taskSuggestions[activeTaskSuggestion] : undefined;
+                  if (taskSuggestion) {
+                    insertTaskReference(taskSuggestion);
+                    return;
+                  }
                   const suggestion = projectSuggestions[selectedProjectSuggestion];
                   if (suggestion) insertProjectTag(suggestion.tag);
                   else if (!loading) void ask();

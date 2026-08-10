@@ -191,6 +191,30 @@ describe('global Ask chat', () => {
     expect(textarea.value).toBe('@project-nod ');
   });
 
+  it('searches the authorized workspace for task references and supports keyboard selection', async () => {
+    mockEmptyHistory();
+    const fields = { status: 'todo', priority: 2, type: 'feature', projectId: 'project_noriq', projectKey: 'PLNR', boardId: 'board_1', updatedAt: now };
+    const search = vi.spyOn(api, 'searchTasks').mockResolvedValue({
+      tasks: [
+        { ...fields, id: 'task_421', key: 'PLNR-421', title: 'Project keyboard navigation' },
+        { ...fields, id: 'task_422', key: 'PLNR-422', title: 'Task reference search' },
+      ],
+      matched: 2,
+      returned: 2,
+    });
+    mount();
+    await flush();
+    setTextarea('Compare #PLNR-42');
+    await act(async () => { await new Promise((resolve) => window.setTimeout(resolve, 210)); });
+
+    expect(search).toHaveBeenCalledWith({ text: 'PLNR-42', limit: 6 }, expect.any(AbortSignal));
+    const textarea = container.querySelector<HTMLTextAreaElement>('textarea')!;
+    expect(container.querySelector('[role="listbox"][aria-label="Reference a task"]')).toBeTruthy();
+    act(() => textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })));
+    act(() => textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })));
+    expect(textarea.value).toBe('Compare #PLNR-422 ');
+  });
+
   it('loads a durable thread, streams into it, and opens a graph-aware source', async () => {
     vi.spyOn(api, 'askThreads').mockResolvedValue({ threads: [activeThread] });
     vi.spyOn(api, 'askThread').mockResolvedValue(detailFor(activeThread));
