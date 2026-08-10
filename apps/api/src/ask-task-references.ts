@@ -56,7 +56,7 @@ export function askTaskReferenceSources(context: AskTaskReferenceContext): AskSo
     projectName: task.projectName,
     citation: `${task.projectKey} / ${task.key}`,
     updatedAt: task.updatedAt,
-    historical: task.status === 'done' || task.status === 'cancelled',
+    historical: task.archivedAt !== null || task.status === 'done' || task.status === 'cancelled',
     retrieval: 'live' as const,
   }] : []);
 }
@@ -65,8 +65,10 @@ export function formatAskTaskReferenceContext(context: AskTaskReferenceContext):
   if (!context.keys.length) return null;
   const entries = context.items.map(({ requestedKey, task }) => {
     if (!task) return `TASK_REFERENCE #${requestedKey}: unavailable (not found or not accessible in the current workspace scope).`;
-    const historical = task.status === 'done' || task.status === 'cancelled'
-      ? `\nHISTORICAL TASK BODY — status is ${task.status}; this describes the work at the time, not current system state.`
+    const historical = task.archivedAt !== null
+      ? `\nHISTORICAL TASK BODY — this task was archived at ${task.archivedAt}; it describes the work at the time, not current system state.`
+      : task.status === 'done' || task.status === 'cancelled'
+        ? `\nHISTORICAL TASK BODY — status is ${task.status}; this describes the work at the time, not current system state.`
       : '';
     return [
       `SOURCE_REF: ${task.projectKey} / ${task.key}`,

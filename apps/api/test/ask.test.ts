@@ -30,7 +30,7 @@ import {
 import { listWorkspaceProjects, searchWorkspaceTasks } from '../src/lib/workspace-operations';
 import { NORIQ_ASK_SYSTEM_PROMPT, NORIQ_ASK_SYSTEM_PROMPT_VERSION } from '../src/ask-system-prompt';
 import {
-  formatAskTaskReferenceContext, parseAskTaskReferences, resolveAskTaskReferences,
+  askTaskReferenceSources, formatAskTaskReferenceContext, parseAskTaskReferences, resolveAskTaskReferences,
 } from '../src/ask-task-references';
 
 /** Fake generation client: records the prompts it saw, returns a canned answer. */
@@ -391,6 +391,8 @@ describe('Ask workspace read catalog', () => {
     const accessible = await mcpCall(agent.apiKey, 'create_task', {
       projectId: crossProjectId, title: 'Cross-project reference target', tags: ['ask'], body: 'Reference evidence.',
     });
+    const archivedAt = new Date().toISOString();
+    await env.DB.prepare('UPDATE tasks SET archived_at = ? WHERE id = ?').bind(archivedAt, accessible.body.id).run();
     const privateProjectId = (await mcpCall(agent.apiKey, 'create_project', { key: 'HRF', name: 'Hidden references' })).body.id;
     const hidden = await mcpCall(agent.apiKey, 'create_task', {
       projectId: privateProjectId, title: 'Private task title must not leak', tags: ['private'], body: 'Private task body must not leak.',
@@ -401,12 +403,18 @@ describe('Ask workspace read catalog', () => {
     const context = await resolveAskTaskReferences(env, { userId: owner!.id },
       `Review #${accessible.body.key.toLowerCase()}, #MIS-999, and #${hidden.body.key}.`);
     expect(context.items).toEqual([
-      expect.objectContaining({ requestedKey: accessible.body.key, task: expect.objectContaining({ id: accessible.body.id, projectId: crossProjectId }) }),
+      expect.objectContaining({ requestedKey: accessible.body.key, task: expect.objectContaining({
+        id: accessible.body.id, projectId: crossProjectId, archivedAt,
+      }) }),
       { requestedKey: 'MIS-999', task: null },
       { requestedKey: hidden.body.key, task: null },
     ]);
     const framed = formatAskTaskReferenceContext(context)!;
     expect(framed).toContain(`SOURCE_REF: ARF / ${accessible.body.key}`);
+    expect(framed).toContain(`this task was archived at ${archivedAt}`);
+    expect(askTaskReferenceSources(context)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: accessible.body.id, historical: true }),
+    ]));
     expect(framed.match(/unavailable \(not found or not accessible in the current workspace scope\)/g)).toHaveLength(2);
     expect(framed).not.toContain('Private task title must not leak');
     expect(framed).not.toContain('Private task body must not leak');

@@ -65,6 +65,7 @@ export interface WorkspaceTaskReference {
     type: string;
     priority: number;
     updatedAt: string;
+    archivedAt: string | null;
     projectId: string;
     projectKey: string;
     projectName: string;
@@ -123,7 +124,9 @@ export async function searchWorkspaceTasks(env: Pick<Env, 'DB'>, scope: Workspac
   return { tasks: rows.results, matched: total?.n ?? rows.results.length, returned: rows.results.length };
 }
 
-/** Resolve exact display keys without revealing whether an unavailable key exists elsewhere. */
+/** Resolve exact display keys without revealing whether an unavailable key exists elsewhere.
+ * Unlike current-work search, an explicit reference includes an archived task: the caller named
+ * the exact historical record and still receives it inside the same authorization boundary. */
 export async function resolveWorkspaceTaskReferences(
   env: Pick<Env, 'DB'>,
   scope: WorkspaceScope,
@@ -137,9 +140,10 @@ export async function resolveWorkspaceTaskReferences(
   const rows = await env.DB.prepare(
     `SELECT t.id, t.key, t.title, substr(t.body, 1, 1600) AS body,
             ${taskWireStatus('t')} AS status, t.type, t.priority, t.updated_at AS updatedAt,
+            t.archived_at AS archivedAt,
             t.project_id AS projectId, p.key AS projectKey, p.name AS projectName
        FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
-      WHERE ${visible.sql} AND t.archived_at IS NULL AND UPPER(t.key) IN (${placeholders})`,
+      WHERE ${visible.sql} AND UPPER(t.key) IN (${placeholders})`,
   ).bind(...visible.binds, ...keys).all<NonNullable<WorkspaceTaskReference['task']>>();
   const byKey = new Map(rows.results.map((task) => [task.key.toUpperCase(), task]));
   return keys.map((requestedKey) => ({ requestedKey, task: byKey.get(requestedKey) ?? null }));
