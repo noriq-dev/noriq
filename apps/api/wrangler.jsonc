@@ -72,10 +72,11 @@
   // Code-intelligence search (PLNR-256, §9) is a SEPARATE, independently optional index — files,
   // symbols, APIs, tests, config/schema entities, repository docs. Missing it (or AI) degrades
   // code retrieval to lexical + graph; missing it never affects the noriq-search index above.
-  // See env.ts's CODE_VECTORIZE doc comment for its two required metadata-index commands
-  // (projectId AND generationId).
+  // See env.ts's CODE_VECTORIZE doc comment for its three required metadata-index commands
+  // (projectId, repositoryKey, AND generationId).
   //   wrangler vectorize create noriq-code --dimensions=1024 --metric=cosine
   //   wrangler vectorize create-metadata-index noriq-code --property-name=projectId --type=string
+  //   wrangler vectorize create-metadata-index noriq-code --property-name=repositoryKey --type=string
   //   wrangler vectorize create-metadata-index noriq-code --property-name=generationId --type=string
   "ai": { "binding": "AI" },
   // "vectorize": [

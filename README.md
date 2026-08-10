@@ -71,11 +71,11 @@ on first run. Then invite teammates from Settings and connect agents from the ho
 > in its `database_id`). Everything else — OAuth issuer, passkey rpID, invite links —
 > derives from the request origin, so no code changes are needed.
 
-> The example config ships with semantic search enabled (Workers AI + Vectorize), so
-> `wrangler deploy` fails until the index exists. Either create it first —
-> `npx wrangler vectorize create noriq-search --dimensions=1024 --metric=cosine` then
-> `npx wrangler vectorize create-metadata-index noriq-search --property-name=projectId --type=string`
-> — or delete the `vectorize` block (search degrades to keyword matching).
+> The example config ships with semantic and code-intelligence search enabled (Workers AI +
+> two Vectorize indexes), so `wrangler deploy` fails until both indexes exist. Run the provisioning
+> commands beside the bindings in `wrangler.production.jsonc`, or remove either binding you do not
+> want. Semantic search then degrades to keyword matching; code retrieval retains lexical + graph
+> search.
 
 ### Email (optional)
 

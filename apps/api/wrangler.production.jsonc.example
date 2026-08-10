@@ -50,6 +50,9 @@
   // Delete both if unused; invites fall back to copyable links.
   "send_email": [{ "name": "EMAIL" }],
   "vars": {
+    // Keep this aligned with the route above. It supplies absolute links when no request
+    // origin exists (scheduled work, signal webhooks, and agent upload capabilities).
+    "PUBLIC_ORIGIN": "https://noriq.example.com",
     "EMAIL_FROM": "noriq@example.com",
     "ASK_MAX_OUTPUT_TOKENS": "8192",
     "AGENT_LIFECYCLE_ONLINE_SECONDS": "300",
@@ -58,8 +61,20 @@
     "AGENT_PRESENCE_PURGE_DAYS": "90",
     "RUNNER_OFFLINE_ARCHIVE_DAYS": "30",
     "AGENT_LIFECYCLE_SWEEP_BATCH": "100",
-    "AGENT_LIFECYCLE_SWEEP_APPLY": "false"
+    // Leave mutation off until POST /api/admin/agent-lifecycle-sweep (a dry run by default)
+    // has been reviewed.
+    "AGENT_LIFECYCLE_SWEEP_APPLY": "false",
+    // Optional hardening/integration vars (see README.md > Productionizing):
+    // "CIMD_ALLOWED_HOSTS": "chatgpt.com,claude.ai",
+    // "SIGNAL_WEBHOOK_URL": "https://hooks.example.com/noriq",
+    // "MAINTENANCE_MODE": "false"
   },
+
+  // Secrets never belong in this file. Add only the ones you use:
+  //   npx wrangler secret put ADMIN_TOKEN --config wrangler.production.jsonc
+  //   npx wrangler secret put ATTACHMENT_UPLOAD_SECRET --config wrangler.production.jsonc
+  //   npx wrangler secret put GITHUB_WEBHOOK_SECRET --config wrangler.production.jsonc
+  //   npx wrangler secret put SIGNAL_WEBHOOK_SECRET --config wrangler.production.jsonc
 
   // OPTIONAL — task attachments. Requires R2 enabled on the account, then:
   //   wrangler r2 bucket create noriq-files
@@ -67,13 +82,21 @@
   "r2_buckets": [{ "binding": "FILES", "bucket_name": "noriq-files" }],
 
 
-  // OPTIONAL — semantic search (PLNR-184). AI = Workers AI embeddings (no provisioning
-  // needed). VECTORIZE is opt-in: create the index first, then keep the binding below —
+  // OPTIONAL — semantic + code-intelligence search. AI needs no provisioning. The two
+  // Vectorize indexes are independent: authored memory/search belongs in noriq-search, while
+  // repository generations belong in noriq-code and may churn without touching memory.
   //   wrangler vectorize create noriq-search --dimensions=1024 --metric=cosine
   //   wrangler vectorize create-metadata-index noriq-search --property-name=projectId --type=string
-  // Delete the vectorize line if unused; search transparently degrades to keyword matching.
+  //   wrangler vectorize create noriq-code --dimensions=1024 --metric=cosine
+  //   wrangler vectorize create-metadata-index noriq-code --property-name=projectId --type=string
+  //   wrangler vectorize create-metadata-index noriq-code --property-name=repositoryKey --type=string
+  //   wrangler vectorize create-metadata-index noriq-code --property-name=generationId --type=string
+  // Delete either binding if unused. Retrieval transparently retains lexical + graph search.
   "ai": { "binding": "AI" },
-  "vectorize": [{ "binding": "VECTORIZE", "index_name": "noriq-search" }],
+  "vectorize": [
+    { "binding": "VECTORIZE", "index_name": "noriq-search" },
+    { "binding": "CODE_VECTORIZE", "index_name": "noriq-code" }
+  ],
 
   // Daily D1 backup to R2 at 06:00 UTC (PLNR-21); snapshots land under backups/ (see BACKUP.md).
   "triggers": { "crons": ["0 6 * * *"] },

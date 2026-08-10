@@ -14,6 +14,7 @@
     "build": "npm run build --workspace @noriq-dev/shared && npm run build --workspace @noriq-dev/web",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "check:authz": "node scripts/check-authorization-boundaries.mjs",
+    "check:wrangler": "npm run check:wrangler --workspace @noriq-dev/api",
     "memory:acceptance": "node scripts/memory-acceptance.mjs",
     "test": "npm run test --workspaces --if-present",
     "test:hooks": "node --test hooks/*.test.mjs",

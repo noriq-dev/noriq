@@ -42,7 +42,15 @@
   "vars": {
     // Used for links in out-of-band notifications, where there is no request origin to read.
     "PUBLIC_ORIGIN": "https://noriq-staging.<your-subdomain>.workers.dev",
-    "ASK_MAX_OUTPUT_TOKENS": "8192"
+    "ASK_MAX_OUTPUT_TOKENS": "8192",
+    "AGENT_LIFECYCLE_ONLINE_SECONDS": "300",
+    "AGENT_COPILOT_RETIRE_DAYS": "7",
+    "AGENT_HISTORY_ARCHIVE_DAYS": "30",
+    "AGENT_PRESENCE_PURGE_DAYS": "90",
+    "RUNNER_OFFLINE_ARCHIVE_DAYS": "30",
+    "AGENT_LIFECYCLE_SWEEP_BATCH": "100",
+    // Keep this false until staging dry-run results have been reviewed.
+    "AGENT_LIFECYCLE_SWEEP_APPLY": "false"
   },
 
   "assets": {
@@ -52,7 +60,7 @@
     "run_worker_first": ["/api/*", "/mcp", "/mcp/*", "/ws", "/ws/*", "/oauth/*", "/.well-known/*", "/skill.md", "/skill/*", "/skill.zip", "/noriq.zip", "/reference.md", "/reference.json"]
   },
 
-  // All FIVE Durable Objects. PROJECT_MEMORY is REQUIRED (env.ts declares it non-optional, unlike
+  // All SIX Durable Objects. PROJECT_MEMORY is REQUIRED (env.ts declares it non-optional, unlike
   // the genuinely optional AI/VECTORIZE/FILES bindings): without it every memory path throws
   // rather than degrading, so a config missing it is broken, not merely reduced.
   "durable_objects": {
@@ -66,7 +74,7 @@
     ]
   },
   // Migration tags are per-worker and must stay append-only, in this order. A fresh worker still
-  // replays v1..v4 — that is how each class gets created — so never renumber or collapse them.
+  // replays v1..v5 — that is how each class gets created — so never renumber or collapse them.
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["ProjectRoom", "AgentSession"] },
     { "tag": "v2", "new_sqlite_classes": ["RateLimiter"] },
