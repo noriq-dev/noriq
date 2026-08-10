@@ -16,6 +16,30 @@ let owner: { apiKey: string };
 beforeAll(async () => { owner = await createAgent('dispatch-intelligence'); }, 60_000);
 
 describe('dispatch-time Project Intelligence (PLNR-303)', () => {
+  it('loads an explicitly opened completed task outside the bounded open-task inventory', async () => {
+    const projectId = (await mcpCall(owner.apiKey, 'create_project', {
+      key: 'PIDONE', name: 'Completed dispatch intelligence',
+    })).body.id as string;
+    const created = await mcpCall(owner.apiKey, 'create_task', {
+      projectId, title: 'Inspect completed mobile fix', tags: ['analytics-test'],
+      executionSpec: {
+        anticipatedFiles: [{ path: 'apps/web/src/components/Drawer.tsx', change: 'modify', why: 'mobile fix' }],
+      },
+    });
+    const taskId = created.body.id as string;
+    const taskKey = created.body.key as string;
+    await appEnv.DB.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").bind(taskId).run();
+
+    const result = await getDispatchIntelligence(appEnv, projectId, { taskId });
+
+    expect(result.current.readiness).toMatchObject({
+      taskId, taskKey, status: 'done', primary: 'unknown',
+      claimability: { claimable: false, reasonCode: 'status' },
+    });
+    expect(result.current.coverage.reasons).not.toContain('focus_task_not_supplied');
+    expect(result.targetContext.taskId).toBe(taskId);
+  });
+
   it('returns case cards and honest lock uncertainty without writing preview calibration rows', async () => {
     const projectId = (await mcpCall(owner.apiKey, 'create_project', { key: 'PIDISP', name: 'Dispatch intelligence' })).body.id as string;
     const taskId = (await mcpCall(owner.apiKey, 'create_task', {

@@ -47,6 +47,16 @@ async function runner(projectId: string, id: string, heartbeat = observedAt, max
 }
 
 describe('collision and bottleneck evidence (PLNR-296)', () => {
+  it('does not load an explicit focus task from another project', async () => {
+    const projectId = await project('BTISO', 'Bottleneck focus isolation');
+    const otherProjectId = await project('BTOTHER', 'Other bottleneck project');
+    const foreign = await task(otherProjectId, 'foreign focus task');
+
+    await expect(assessProjectBottlenecks(appEnv, projectId, {
+      taskId: foreign.id, taskLimit: 1, observedAt,
+    })).rejects.toThrow(`task ${foreign.id} not found in project ${projectId}`);
+  });
+
   it('uses the shared landed-gate rule and never blames idle Runner capacity for gated work', async () => {
     const projectId = await project('BTLAND', 'Bottleneck landed gate');
     const blocker = await task(projectId, 'prior phase', ['apps/api/src/prior.ts']);

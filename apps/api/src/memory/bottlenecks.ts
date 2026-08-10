@@ -2,7 +2,9 @@
 // come from coordination facts; historical episodes are a separately labelled support channel.
 import type { Env } from '../env';
 import { analyticsSourceWatermarks } from './analytics';
-import { projectTaskClaimability, type Claimability, type ClaimabilityReason } from '../lib/claimability';
+import {
+  projectTaskClaimability, taskClaimability, type Claimability, type ClaimabilityReason,
+} from '../lib/claimability';
 import { readExecutionSpec } from '../lib/execution-spec';
 import {
   branchScopesOverlap, normalizePattern, patternsOverlap, type NormalizedPattern,
@@ -365,22 +367,39 @@ export async function assessProjectBottlenecks(
   const focusTaskId = input.taskId ?? null;
   const taskLimit = Math.min(BOTTLENECK_TASK_LIMIT, Math.max(1, Math.trunc(input.taskLimit ?? BOTTLENECK_TASK_LIMIT)));
   const claimability = await projectTaskClaimability(env.DB, projectId, taskLimit);
-  const taskIds = claimability.items.map((item) => item.id);
-  if (focusTaskId && !taskIds.includes(focusTaskId)) {
-    const focus = await env.DB.prepare('SELECT id FROM tasks WHERE id = ? AND project_id = ?')
-      .bind(focusTaskId, projectId).first();
+  const boundedTaskIds = claimability.items.map((item) => item.id);
+  let claimabilityItems = claimability.items;
+  let focusTaskRow: TaskRow | null = null;
+  if (focusTaskId && !claimabilityItems.some((item) => item.id === focusTaskId)) {
+    const focus = await env.DB.prepare(
+      `SELECT id, key, title, body, status, claimed_by AS claimedBy,
+              execution_spec AS executionSpec, updated_at AS updatedAt, proposed_at AS proposedAt
+         FROM tasks WHERE id = ? AND project_id = ?`,
+    ).bind(focusTaskId, projectId).first<{
+      id: string; key: string; title: string; body: string | null; status: string;
+      claimedBy: string | null; executionSpec: string | null; updatedAt: string; proposedAt: string | null;
+    }>();
     if (!focus) throw new Error(`task ${focusTaskId} not found in project ${projectId}`);
-    throw new Error(`focus task ${focusTaskId} is outside the bounded open-task result`);
+    // The project-wide inventory intentionally stays bounded to open tasks. An explicitly
+    // requested focus is a separate, authoritative point lookup: combine it in memory so task
+    // drawers can inspect completed/review work without widening the project scan or pushing a
+    // full 100-task IN query beyond D1's bind-variable ceiling.
+    focusTaskRow = focus;
+    claimabilityItems = [
+      ...claimabilityItems,
+      { ...focus, claimability: await taskClaimability(env.DB, focus.id) },
+    ];
   }
-  const ids = taskIds.length ? placeholders(taskIds) : "''";
+  const taskIds = claimabilityItems.map((item) => item.id);
+  const ids = boundedTaskIds.length ? placeholders(boundedTaskIds) : "''";
   const [project, taskRows, runs, signals, locks, runnerRows, runnerPresence, busyRuns, nodeCounts,
     dispatches, phaseGates, landings, watermarks] = await Promise.all([
     env.DB.prepare('SELECT key, file_locking_enabled AS fileLockingEnabled FROM projects WHERE id = ?')
       .bind(projectId).first<{ key: string; fileLockingEnabled: number }>(),
-    taskIds.length ? env.DB.prepare(
+    boundedTaskIds.length ? env.DB.prepare(
       `SELECT id, key, title, body, status, claimed_by AS claimedBy, execution_spec AS executionSpec, updated_at AS updatedAt
          FROM tasks WHERE id IN (${ids})`,
-    ).bind(...taskIds).all<TaskRow>() : Promise.resolve({ results: [] as TaskRow[] }),
+    ).bind(...boundedTaskIds).all<TaskRow>() : Promise.resolve({ results: [] as TaskRow[] }),
     env.DB.prepare(
       `SELECT r.id, CASE WHEN r.anchor_type = 'task' THEN r.anchor_id END AS taskId,
               r.runner_id AS runnerId, r.agent_id AS agentId, r.sitting, r.status, r.phase,
@@ -459,10 +478,11 @@ export async function assessProjectBottlenecks(
   ]);
   if (!project) throw new Error(`project ${projectId} not found`);
 
-  const claimById = new Map(claimability.items.map((item) => [item.id, item.claimability]));
+  const claimById = new Map(claimabilityItems.map((item) => [item.id, item.claimability]));
   const runsByTask = new Map<string, LiveRun[]>();
   for (const run of runs.results) if (run.taskId) runsByTask.set(run.taskId, [...(runsByTask.get(run.taskId) ?? []), run]);
-  const prepared: PreparedTask[] = taskRows.results.map((row) => {
+  const selectedTaskRows = focusTaskRow ? [...taskRows.results, focusTaskRow] : taskRows.results;
+  const prepared: PreparedTask[] = selectedTaskRows.map((row) => {
     const read = readExecutionSpec(row.executionSpec, row.id);
     return {
       ...row,
