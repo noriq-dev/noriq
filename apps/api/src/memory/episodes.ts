@@ -335,7 +335,7 @@ export async function loadEpisodeSkeleton(env: Env, projectId: string, runId: st
         executionSpecFingerprint: snapshot.executionSpecFingerprint, capturedAt: snapshot.capturedAt,
       },
       requestedStrategy: strategy, commissionedStrategy: strategy,
-      commissionedSpec: snapshot.executionSpec, configuration: snapshot.configuration,
+      commissionedSpec: snapshot.executionSpec, budget: snapshot.budget, configuration: snapshot.configuration,
     },
     execution: {
       executedStrategy: executedStrategy?.success ? executedStrategy.data : null,

@@ -43,6 +43,10 @@ import { EpisodeSkeletonUnavailableError, loadEpisodeSkeleton } from '../memory/
 import type { EpisodeIntelligenceDraft } from '../lib/run-sitting-intelligence';
 import { normalizeAnalyticsEpisode } from '../memory/analytics-normalize';
 import {
+  aggregateHistoricalAnalytics, HISTORICAL_ANALYTICS_MAX_ROWS, validateHistoricalAnalyticsQuery,
+  type HistoricalAnalyticsQuery, type HistoricalAnalyticsResult,
+} from '../memory/analytics-query';
+import {
   requestProjectAnalyticsRebuild,
   type AnalyticsExecutionEventSnapshot,
   type AnalyticsExecutionNodeSnapshot,
@@ -1927,6 +1931,51 @@ export class ProjectMemory extends DurableObject<Env> {
         rows: count('analytics_rows'), snapshotRows: count('analytics_snapshot_rows'),
       },
     };
+  }
+
+  /** Read only from the atomically activated generation. The hard row budget bounds CPU and
+   * response latency; a larger generation is reported as partial coverage rather than silently
+   * masquerading as a complete population. */
+  async queryHistoricalAnalytics(
+    projectId: string,
+    query: HistoricalAnalyticsQuery,
+  ): Promise<HistoricalAnalyticsResult> {
+    await this.assertProjectId(projectId);
+    validateHistoricalAnalyticsQuery(query);
+    const generation = this.ctx.storage.sql.exec<{
+      id: string; extraction_version: string; completed_at: string;
+      source_memory_revision: number; d1_event_watermark: number | null;
+      orchestration_watermark: string | null; completeness: string;
+    }>(
+      `SELECT g.id, g.extraction_version, g.completed_at, g.source_memory_revision,
+              g.d1_event_watermark, g.orchestration_watermark, g.completeness
+         FROM analytics_active_generation a JOIN analytics_generations g ON g.id = a.generation_id
+        WHERE a.id = 0 AND g.status = 'complete'`,
+    ).toArray()[0];
+    if (!generation) throw new Error('no complete analytics generation is available');
+    const stored = this.ctx.storage.sql.exec<{ normalized: string }>(
+      `SELECT normalized FROM analytics_rows WHERE generation_id = ?1
+        ORDER BY run_id, sitting LIMIT ?2`,
+      generation.id, HISTORICAL_ANALYTICS_MAX_ROWS + 1,
+    ).toArray();
+    let completeness: unknown = { status: 'unknown', reasons: ['malformed_generation_completeness'] };
+    try { completeness = JSON.parse(generation.completeness); } catch { /* explicit unknown above */ }
+    const rows = stored.slice(0, HISTORICAL_ANALYTICS_MAX_ROWS);
+    return aggregateHistoricalAnalytics({
+      episodes: rows.map((row) => ProjectIntelligenceEpisode.parse(JSON.parse(row.normalized))),
+      scannedRows: rows.length,
+      truncated: stored.length > HISTORICAL_ANALYTICS_MAX_ROWS,
+      query,
+      generation: {
+        id: generation.id,
+        extractionVersion: generation.extraction_version,
+        completedAt: generation.completed_at,
+        memoryRevision: generation.source_memory_revision,
+        coordinationEventSequence: generation.d1_event_watermark,
+        orchestrationWatermark: generation.orchestration_watermark,
+        completeness,
+      },
+    });
   }
 
   /** Keep only the active complete generation, one prior complete cutover target, the newest

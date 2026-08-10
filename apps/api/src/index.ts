@@ -51,7 +51,9 @@ import { assembleContextPack } from './memory/context-pack';
 import { readBoundedBody, verifyBatchChecksum, decodeBatchRows, MAX_INGEST_BATCH_BYTES, INGEST_TOKEN_TTL_SECONDS } from './memory/ingest';
 import { normalizeVerificationReport } from './memory/verification';
 import { sweepPendingEpisodeJobs } from './memory/episodes';
-import { getProjectAnalyticsHealth, rebuildProjectAnalytics, sweepPendingAnalyticsJobs } from './memory/analytics';
+import {
+  getCurrentProjectFlowSummary, getProjectAnalyticsHealth, rebuildProjectAnalytics, sweepPendingAnalyticsJobs,
+} from './memory/analytics';
 import { classifyAgentLifecycle } from './lib/agent-lifecycle';
 import { agentLifecycleSweepConfig, sweepAgentLifecycle, type AgentLifecycleCursor } from './lib/agent-lifecycle-sweep';
 import { AGENT_LIFECYCLES, listAgentRoster, type AgentRosterLifecycle } from './lib/agent-roster';
@@ -1351,6 +1353,39 @@ app.get('/api/projects/:pid/memory/health', userAuth, async (c) => {
 app.get('/api/projects/:pid/memory/analytics/health', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
   return c.json(await getProjectAnalyticsHealth(c.env, pid));
+});
+
+const HistoricalAnalyticsDimensionBody = z.enum([
+  'project', 'plan', 'plan_dispatch', 'orchestration', 'task', 'run', 'sitting',
+  'commissioned_workflow', 'executed_workflow', 'configuration', 'stage', 'role',
+]);
+const HistoricalAnalyticsQueryBody = z.object({
+  from: z.string().datetime().optional(),
+  to: z.string().datetime().optional(),
+  groupBy: HistoricalAnalyticsDimensionBody.optional(),
+  filters: z.array(z.object({ dimension: HistoricalAnalyticsDimensionBody, value: z.string().min(1) })).max(8).optional(),
+  caseCursor: z.string().min(1).optional(),
+  caseLimit: z.number().int().min(1).max(100).optional(),
+}).strict();
+
+// PLNR-294: frozen historical facts and live coordination state remain separate endpoints and
+// carry separate observation/generation timestamps. Consumers cannot accidentally blend a
+// current queue count into a completed generation's historical denominator.
+app.post('/api/projects/:pid/memory/analytics/query', userAuth, async (c) => {
+  const parsed = HistoricalAnalyticsQueryBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid historical analytics query', detail: parsed.error.issues }, 400);
+  const pid = c.req.param('pid')!;
+  try {
+    return c.json(await memoryDO(c.env, pid).queryHistoricalAnalytics(pid, parsed.data));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return c.json({ error: message }, message.includes('no complete analytics generation') ? 409 : 400);
+  }
+});
+
+app.get('/api/projects/:pid/memory/analytics/current', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  return c.json(await getCurrentProjectFlowSummary(c.env, pid));
 });
 // Canonical repository identity + checkout associations (PLNR-259) — straight D1 reads (CLAUDE.md:
 // reads go straight to D1), not a ProjectMemory DO RPC; registration/association happen through

@@ -145,7 +145,7 @@ export function normalizeAnalyticsEpisode(input: NormalizeAnalyticsInput): Proje
     versions: { extraction: input.extractionVersion, retrieval: null, risk: null, comparison: null },
     preExecution: {
       task: { taskType: null, tags: [], executionSpecFingerprint: null, capturedAt: input.episode.createdAt },
-      requestedStrategy: null, commissionedStrategy: null, commissionedSpec: null, configuration: [],
+      requestedStrategy: null, commissionedStrategy: null, commissionedSpec: null, budget: null, configuration: [],
     },
     execution: {
       executedStrategy: null, executedSpec: null,

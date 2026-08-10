@@ -10,10 +10,36 @@ import {
   type ProjectAnalyticsHealth as ProjectAnalyticsHealthData,
 } from '@noriq-dev/shared';
 
-export const ANALYTICS_EXTRACTION_VERSION = 'project-intelligence-v1';
+export const ANALYTICS_EXTRACTION_VERSION = 'project-intelligence-v2';
 const SNAPSHOT_PAGE_SIZE = 200;
 const RETRY_BASE_MS = 60_000;
 const RETRY_MAX_MS = 24 * 60 * 60 * 1_000;
+
+export interface CurrentProjectFlowSummary {
+  observedAt: string;
+  source: 'd1_current_state';
+  watermarks: { coordinationEventSequence: number | null; orchestrationAcceptedAt: string | null };
+  readiness: { totalTasks: number; readyTasks: number; blockedTasks: number; inProgressTasks: number; reviewTasks: number };
+  plans: {
+    statuses: Record<string, number>;
+    dispatchStatuses: Record<string, number>;
+    phaseGateStatuses: Record<string, number>;
+    phasesWithoutGate: number;
+    landings: { recorded: number; owed: number; succeeded: number; failed: number };
+  };
+  execution: {
+    runStatuses: Record<string, number>;
+    orchestrationStatuses: Record<string, number>;
+    nodeStatuses: Record<string, number>;
+    activeNodes: number;
+    parkedNodes: number;
+  };
+  coordination: { activeClaims: number; activeLocks: number };
+  runners: { statuses: Record<string, number>; presenceStates: Record<string, number> };
+}
+
+const countRows = <T extends { status: string; count: number }>(rows: T[]): Record<string, number> =>
+  Object.fromEntries(rows.map((row) => [row.status, row.count]));
 
 /** Canonical analytics adjuncts live for the project lifetime and ride the authoritative
  * store's existing backup. Derived generations are deliberately excluded and rebuilt. The
@@ -124,6 +150,128 @@ export async function analyticsSourceWatermarks(env: Env, projectId: string): Pr
     orchestrationWatermark: JSON.stringify(orchestration ?? {
       nodeCount: 0, nodeUpdatedAt: null, eventCount: 0, eventAcceptedAt: null,
     }),
+  };
+}
+
+/** Canonical operational flow, observed directly from D1 at request time. This intentionally
+ * does not join or inherit the completed analytics generation's timestamps: it answers "now",
+ * while queryHistoricalAnalytics answers only for a frozen historical population. */
+export async function getCurrentProjectFlowSummary(
+  env: Env,
+  projectId: string,
+  observedAt = new Date().toISOString(),
+): Promise<CurrentProjectFlowSummary> {
+  type StatusCount = { status: string; count: number };
+  const [
+    watermarks, readiness, planStatuses, dispatchStatuses, gateStatuses, phaseCounts, landing,
+    runStatuses, orchestrationStatuses, nodeStatuses, claims, locks, runnerStatuses, presenceStates,
+  ] = await Promise.all([
+    analyticsSourceWatermarks(env, projectId),
+    env.DB.prepare(
+      `SELECT COUNT(*) AS totalTasks,
+              SUM(CASE WHEN t.status = 'todo'
+                         AND NOT EXISTS (
+                           SELECT 1 FROM dependencies d JOIN tasks dependency ON dependency.id = d.depends_on_task_id
+                            WHERE d.task_id = t.id AND dependency.status != 'done'
+                         )
+                         AND NOT EXISTS (
+                           SELECT 1 FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id
+                             JOIN plans p ON p.id = ph.plan_id
+                            WHERE pt.task_id = t.id AND p.status = 'proposed'
+                         ) THEN 1 ELSE 0 END) AS readyTasks,
+              SUM(CASE WHEN t.status = 'blocked' THEN 1 ELSE 0 END) AS blockedTasks,
+              SUM(CASE WHEN t.status IN ('claimed','in_progress') THEN 1 ELSE 0 END) AS inProgressTasks,
+              SUM(CASE WHEN t.status = 'review' THEN 1 ELSE 0 END) AS reviewTasks
+         FROM tasks t WHERE t.project_id = ?`,
+    ).bind(projectId).first<{
+      totalTasks: number; readyTasks: number | null; blockedTasks: number | null;
+      inProgressTasks: number | null; reviewTasks: number | null;
+    }>(),
+    env.DB.prepare('SELECT status, COUNT(*) AS count FROM plans WHERE project_id = ? GROUP BY status')
+      .bind(projectId).all<StatusCount>(),
+    env.DB.prepare('SELECT status, COUNT(*) AS count FROM plan_dispatches WHERE project_id = ? GROUP BY status')
+      .bind(projectId).all<StatusCount>(),
+    env.DB.prepare(
+      `SELECT pg.status, COUNT(*) AS count FROM phase_gates pg
+         JOIN phases ph ON ph.id = pg.phase_id JOIN plans p ON p.id = ph.plan_id
+        WHERE p.project_id = ? GROUP BY pg.status`,
+    ).bind(projectId).all<StatusCount>(),
+    env.DB.prepare(
+      `SELECT COUNT(*) AS phases,
+              SUM(CASE WHEN pg.phase_id IS NULL THEN 1 ELSE 0 END) AS withoutGate
+         FROM phases ph JOIN plans p ON p.id = ph.plan_id LEFT JOIN phase_gates pg ON pg.phase_id = ph.id
+        WHERE p.project_id = ?`,
+    ).bind(projectId).first<{ phases: number; withoutGate: number | null }>(),
+    env.DB.prepare(
+      `SELECT COUNT(*) AS recorded,
+              SUM(CASE WHEN merge_requested_at IS NULL THEN 1 ELSE 0 END) AS owed,
+              SUM(CASE WHEN merge_requested_at IS NOT NULL AND failed_detail IS NULL THEN 1 ELSE 0 END) AS succeeded,
+              SUM(CASE WHEN failed_detail IS NOT NULL THEN 1 ELSE 0 END) AS failed
+         FROM plan_landings WHERE project_id = ?`,
+    ).bind(projectId).first<{ recorded: number; owed: number | null; succeeded: number | null; failed: number | null }>(),
+    env.DB.prepare('SELECT status, COUNT(*) AS count FROM runs WHERE project_id = ? GROUP BY status')
+      .bind(projectId).all<StatusCount>(),
+    env.DB.prepare('SELECT status, COUNT(*) AS count FROM orchestrations WHERE project_id = ? GROUP BY status')
+      .bind(projectId).all<StatusCount>(),
+    env.DB.prepare('SELECT status, COUNT(*) AS count FROM execution_nodes WHERE project_id = ? GROUP BY status')
+      .bind(projectId).all<StatusCount>(),
+    env.DB.prepare(
+      `SELECT COUNT(*) AS count FROM claims c JOIN tasks t ON t.id = c.task_id
+        WHERE t.project_id = ? AND c.released_at IS NULL AND c.expires_at > ?`,
+    ).bind(projectId, observedAt).first<{ count: number }>(),
+    env.DB.prepare(
+      `SELECT COUNT(*) AS count FROM file_locks
+        WHERE project_id = ? AND released_at IS NULL AND expires_at > ?`,
+    ).bind(projectId, observedAt).first<{ count: number }>(),
+    env.DB.prepare(
+      `SELECT r.status, COUNT(DISTINCT r.id) AS count FROM runners r
+        WHERE r.project_id = ?1 OR EXISTS (SELECT 1 FROM runs run WHERE run.runner_id = r.id AND run.project_id = ?1)
+        GROUP BY r.status`,
+    ).bind(projectId).all<StatusCount>(),
+    env.DB.prepare(
+      `SELECT ap.state AS status, COUNT(*) AS count FROM agent_presences ap
+        WHERE ap.kind = 'runner_daemon' AND ap.archived_at IS NULL
+          AND (ap.project_id = ?1 OR EXISTS (SELECT 1 FROM runs run WHERE run.runner_id = ap.runner_id AND run.project_id = ?1))
+        GROUP BY ap.state`,
+    ).bind(projectId).all<StatusCount>(),
+  ]);
+  let orchestrationAcceptedAt: string | null = null;
+  try {
+    orchestrationAcceptedAt = (JSON.parse(watermarks.orchestrationWatermark) as { eventAcceptedAt?: string | null }).eventAcceptedAt ?? null;
+  } catch { /* current-state data remains usable if a legacy watermark is malformed */ }
+  const nodes = countRows(nodeStatuses.results);
+  return {
+    observedAt,
+    source: 'd1_current_state',
+    watermarks: { coordinationEventSequence: watermarks.eventWatermark, orchestrationAcceptedAt },
+    readiness: {
+      totalTasks: readiness?.totalTasks ?? 0,
+      readyTasks: readiness?.readyTasks ?? 0,
+      blockedTasks: readiness?.blockedTasks ?? 0,
+      inProgressTasks: readiness?.inProgressTasks ?? 0,
+      reviewTasks: readiness?.reviewTasks ?? 0,
+    },
+    plans: {
+      statuses: countRows(planStatuses.results),
+      dispatchStatuses: countRows(dispatchStatuses.results),
+      phaseGateStatuses: countRows(gateStatuses.results),
+      phasesWithoutGate: phaseCounts?.withoutGate ?? 0,
+      landings: {
+        recorded: landing?.recorded ?? 0,
+        owed: landing?.owed ?? 0,
+        succeeded: landing?.succeeded ?? 0,
+        failed: landing?.failed ?? 0,
+      },
+    },
+    execution: {
+      runStatuses: countRows(runStatuses.results),
+      orchestrationStatuses: countRows(orchestrationStatuses.results),
+      nodeStatuses: nodes,
+      activeNodes: (nodes.pending ?? 0) + (nodes.running ?? 0),
+      parkedNodes: nodes.parked ?? 0,
+    },
+    coordination: { activeClaims: claims?.count ?? 0, activeLocks: locks?.count ?? 0 },
+    runners: { statuses: countRows(runnerStatuses.results), presenceStates: countRows(presenceStates.results) },
   };
 }
 

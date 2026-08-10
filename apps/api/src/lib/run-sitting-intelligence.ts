@@ -1,8 +1,8 @@
-import type { ExecutedConfigurationEvidence, ExecutionSpec, ProjectIntelligenceEpisode } from '@noriq-dev/shared';
+import { RunBudget, type ExecutedConfigurationEvidence, type ExecutionSpec, type ProjectIntelligenceEpisode } from '@noriq-dev/shared';
 import { readExecutionSpec } from './execution-spec';
 import { nowIso, sha256Hex } from './util';
 
-export const INTELLIGENCE_EXTRACTION_VERSION = 'commissioning-v1';
+export const INTELLIGENCE_EXTRACTION_VERSION = 'commissioning-v2';
 
 export interface RunCommissioningSnapshot {
   runId: string;
@@ -38,6 +38,7 @@ export interface RunCommissioningSnapshot {
   executionSpec: ExecutionSpec | null;
   executionSpecUnreadable: boolean;
   executionSpecFingerprint: string | null;
+  budget: { maxTokens: number | null; maxUsd: number | null; maxDurationSeconds: number | null; maxRounds: number | null };
   configuration: Array<{ kind: 'runner' | 'workflow' | 'reviewer' | 'verifier' | 'manifest' | 'context'; name: string | null; version: string | null; fingerprint: string }>;
   capturedAt: string;
 }
@@ -77,7 +78,7 @@ export async function captureRunCommissioningSnapshot(
     `SELECT r.id, r.project_id AS projectId, r.sitting, r.anchor_type AS anchorType,
             r.anchor_id AS anchorId, r.plan_id AS planId, r.plan_dispatch_id AS planDispatchId,
             r.repo_ref AS repoRef, r.runner_id AS runnerId, r.target_branch AS targetBranch,
-            r.agent_tool AS agentTool, r.agent, r.model, r.effort, r.workflow,
+            r.agent_tool AS agentTool, r.agent, r.model, r.effort, r.workflow, r.budget,
             t.title AS taskTitle, t.type AS taskType, t.execution_spec AS executionSpec,
             ph.id AS phaseId, ph."order" AS phaseOrder, pd.gate AS gateMode,
             pr.repository_key AS repositoryKey, rn.version AS runnerVersion
@@ -140,6 +141,10 @@ export async function captureRunCommissioningSnapshot(
     executionSpec: storedSpec.spec,
     executionSpecUnreadable: storedSpec.unreadable === true,
     executionSpecFingerprint,
+    budget: (() => {
+      try { return RunBudget.parse(JSON.parse(String(run.budget ?? '{}'))); }
+      catch { return RunBudget.parse({}); }
+    })(),
     configuration,
     capturedAt,
   };
