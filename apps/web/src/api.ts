@@ -434,6 +434,21 @@ export const api = {
   agentLifecycleSweep: (apply = false, cursor?: Record<string, string | null>) =>
     req<ApiAgentLifecycleSweep>('POST', `/api/admin/agent-lifecycle-sweep${apply ? '?apply=true' : ''}`, cursor ? { cursor } : {}),
   runs: (pid: string) => req<{ runs: ApiRun[] }>('GET', `/api/projects/${pid}/runs`),
+  orchestrations: (pid: string, options: { view?: 'active' | 'history'; cursor?: string; limit?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (options.view) q.set('view', options.view);
+    if (options.cursor) q.set('cursor', options.cursor);
+    if (options.limit) q.set('limit', String(options.limit));
+    const query = q.toString();
+    return req<ApiOrchestrationPage>('GET', `/api/projects/${pid}/orchestrations${query ? `?${query}` : ''}`);
+  },
+  orchestration: (pid: string, id: string, options: { timelineCursor?: string; timelineLimit?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (options.timelineCursor) q.set('timelineCursor', options.timelineCursor);
+    if (options.timelineLimit) q.set('timelineLimit', String(options.timelineLimit));
+    const query = q.toString();
+    return req<ApiOrchestrationTree>('GET', `/api/projects/${pid}/orchestrations/${id}${query ? `?${query}` : ''}`);
+  },
   dispatchRun: (pid: string, body: DispatchInput) => req<{ run: ApiRun; delivered: boolean }>('POST', `/api/projects/${pid}/runs`, body),
   cancelRun: (runId: string, reason?: string) => req<{ run: ApiRun }>('POST', `/api/runs/${runId}/cancel`, { reason }),
   /** Continue a FAILED run (PLNR-180): re-open the same run id with N more reviewer rounds, back on
@@ -639,6 +654,43 @@ export interface ApiRunnerRoster {
   };
   page: { limit: number; hasMore: boolean; nextCursor: string | null };
   policy: { heartbeatSeconds: number };
+}
+
+export type ApiExecutionStatus = 'pending' | 'running' | 'parked' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
+export interface ApiOrchestrationSummary {
+  id: string; anchorType: 'task' | 'plan' | 'run' | 'chat' | 'none'; anchorId: string | null;
+  anchorLabel: string | null; rootExecutionId: string | null; status: ApiExecutionStatus;
+  completenessStatus: 'complete' | 'partial' | 'unknown'; completenessMissing: string[]; completenessReason: string | null;
+  createdByKind: string; createdById: string; createdByName: string | null;
+  nodeCount: number; liveNodeCount: number; incompleteNodeCount: number;
+  createdAt: string; updatedAt: string; finishedAt: string | null;
+}
+export interface ApiOrchestrationPage {
+  orchestrations: ApiOrchestrationSummary[];
+  counts: { active: number; history: number; total: number };
+  page: { limit: number; hasMore: boolean; nextCursor: string | null };
+}
+export interface ApiExecutionNode {
+  id: string; parentExecutionId: string | null; kind: 'copilot_session' | 'run' | 'sitting' | 'stage' | 'step' | 'gate';
+  role: string; actorKind: string | null; actorId: string | null; actorName: string | null; presenceId: string | null;
+  taskId: string | null; taskKey: string | null; taskTitle: string | null; planId: string | null; planTitle: string | null;
+  runId: string | null; sitting: number | null; stage: string | null; step: string | null; gateId: string | null;
+  status: ApiExecutionStatus; completenessStatus: 'complete' | 'partial' | 'unknown'; completenessMissing: string[];
+  completenessReason: string | null; lastRevision: number; startedAt: string | null; parkedAt: string | null;
+  finishedAt: string | null; outcomeReason: string | null; createdAt: string; updatedAt: string;
+}
+export interface ApiExecutionRelation {
+  id: string; fromExecutionId: string; toExecutionId: string;
+  type: 'continues' | 'verifies' | 'repairs' | 'hands_off_to' | 'depends_on'; metadata: Record<string, unknown>; createdAt: string;
+}
+export interface ApiExecutionTimelineEvent {
+  eventId: string; executionId: string; revision: number; eventType: string; observedAt: string;
+  targetExecutionId: string | null; reason: string | null; metadata: Record<string, unknown>; acceptedAt: string;
+}
+export interface ApiOrchestrationTree {
+  orchestration: ApiOrchestrationSummary;
+  nodes: ApiExecutionNode[]; rootExecutionIds: string[]; relations: ApiExecutionRelation[]; timeline: ApiExecutionTimelineEvent[];
+  timelinePage: { limit: number; hasMore: boolean; nextCursor: string | null };
 }
 export interface ApiRunBudget {
   maxTokens: number | null;

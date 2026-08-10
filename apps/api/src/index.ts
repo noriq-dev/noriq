@@ -65,7 +65,7 @@ import {
 import { auditAuthorizationParity, reconcileLegacyGroupGrants } from './lib/authorization-parity';
 import { evaluateMemoryAcceptance } from './memory/acceptance';
 import {
-  declareRunnerExecution, ensureRunExecution, getOrchestrationTree, reconcileRunnerExecution,
+  declareRunnerExecution, ensureRunExecution, getOrchestrationTree, listOrchestrations, reconcileRunnerExecution,
   reportRunnerExecutionEvent, reportRunnerExecutionRelation,
 } from './lib/orchestration-store';
 
@@ -3514,11 +3514,30 @@ app.get('/api/projects/:pid/runs', userAuth, async (c) => {
 
 // Human/read-side orchestration tree. The project middleware above applies the same visibility
 // rule as every other /api/projects/:pid surface; the store also re-checks project ownership.
+app.get('/api/projects/:pid/orchestrations', userAuth, async (c) => {
+  const view = c.req.query('view');
+  if (view !== undefined && view !== 'active' && view !== 'history') return c.json({ error: 'view must be active or history' }, 400);
+  const limitRaw = c.req.query('limit');
+  const limit = limitRaw === undefined ? undefined : Number(limitRaw);
+  if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) return c.json({ error: 'limit must be a positive integer' }, 400);
+  try {
+    return c.json(await listOrchestrations(c.env.DB, c.req.param('pid')!, {
+      view: view as 'active' | 'history' | undefined, cursor: c.req.query('cursor'), limit,
+    }));
+  } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 400); }
+});
+
 app.get('/api/projects/:pid/orchestrations/:orchestrationId', userAuth, async (c) => {
   try {
-    return c.json(await getOrchestrationTree(c.env.DB, c.req.param('pid')!, c.req.param('orchestrationId')!));
+    const timelineLimitRaw = c.req.query('timelineLimit');
+    const timelineLimit = timelineLimitRaw === undefined ? undefined : Number(timelineLimitRaw);
+    if (timelineLimit !== undefined && (!Number.isInteger(timelineLimit) || timelineLimit < 1)) return c.json({ error: 'timelineLimit must be a positive integer' }, 400);
+    return c.json(await getOrchestrationTree(c.env.DB, c.req.param('pid')!, c.req.param('orchestrationId')!, {
+      timelineCursor: c.req.query('timelineCursor'), timelineLimit,
+    }));
   } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : String(error) }, 404);
+    const message = error instanceof Error ? error.message : String(error);
+    return c.json({ error: message }, message === 'orchestration not found' ? 404 : 400);
   }
 });
 

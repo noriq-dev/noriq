@@ -5,6 +5,8 @@ import {
   applyExecutionEvent,
   createOrchestration,
   declareExecution,
+  getOrchestrationTree,
+  listOrchestrations,
 } from '../src/lib/orchestration-store';
 import { createAgent, mcpCall } from './helpers';
 
@@ -201,5 +203,63 @@ describe('canonical orchestration and execution storage (PLNR-365)', () => {
       eventId: 'evt_metadata_large', revision: 1, type: 'started', observedAt: at(41),
       metadata: { value: 'x'.repeat(9_000) },
     })).rejects.toThrow(/metadata exceeds/);
+  });
+
+  it('serves a bounded human inventory and paginated canonical audit timeline', async () => {
+    const orchestration = await createOrchestration(appEnv, {
+      projectId, anchor: { type: 'task', id: taskId }, createdBy: { kind: 'copilot', id: actor.id },
+      completeness: { status: 'partial', missing: ['legacy_parent'], reason: 'legacy session' },
+      createdAt: at(50),
+    });
+    const root = await declareExecution(appEnv, {
+      projectId, orchestrationId: orchestration.id, producerScope: 'human-read', localNodeKey: 'root',
+      kind: 'copilot_session', role: 'orchestrator', actor: { kind: 'copilot', id: actor.id },
+      subject: { taskId }, observedAt: at(51),
+    });
+    const handoff = await declareExecution(appEnv, {
+      projectId, orchestrationId: orchestration.id, parentExecutionId: root.id,
+      producerScope: 'human-read', localNodeKey: 'handoff', kind: 'step', role: 'worker',
+      subject: { taskId, step: 'handoff target' }, observedAt: at(51),
+    });
+    const relation = await addExecutionRelation(appEnv, {
+      projectId, orchestrationId: orchestration.id, fromExecutionId: root.id, toExecutionId: handoff.id,
+      type: 'hands_off_to', createdAt: at(51),
+    });
+    await applyExecutionEvent(appEnv, {
+      projectId, orchestrationId: orchestration.id, executionId: root.id,
+      eventId: 'evt_human_started', revision: 1, type: 'started', observedAt: at(52),
+    });
+    await applyExecutionEvent(appEnv, {
+      projectId, orchestrationId: orchestration.id, executionId: root.id,
+      eventId: 'evt_human_parked', revision: 2, type: 'parked', observedAt: at(53), reason: 'human gate',
+    });
+
+    const inventory = await listOrchestrations(env.DB, projectId, { view: 'active', limit: 1 });
+    expect(inventory.orchestrations).toHaveLength(1);
+    expect(inventory.page).toMatchObject({ limit: 1, hasMore: true, nextCursor: expect.any(String) });
+    expect(inventory.orchestrations[0]).toMatchObject({
+      id: orchestration.id, anchorLabel: 'ORCSTORE-1 · Orchestration anchor',
+      createdByName: 'orchestration-store', completenessMissing: ['legacy_parent'], nodeCount: 2, liveNodeCount: 2,
+    });
+
+    const first = await getOrchestrationTree(env.DB, projectId, orchestration.id, { timelineLimit: 1 });
+    expect(first.orchestration).toMatchObject({
+      anchorLabel: 'ORCSTORE-1 · Orchestration anchor', createdByName: 'orchestration-store',
+      nodeCount: 2, liveNodeCount: 2, incompleteNodeCount: 0,
+    });
+    expect(first.rootExecutionIds).toEqual([root.id]);
+    expect(first.nodes.find((node) => node.id === root.id)).toMatchObject({
+      actorName: 'orchestration-store', taskKey: 'ORCSTORE-1', taskTitle: 'Orchestration anchor', parentExecutionId: null,
+    });
+    expect(first.timeline.map((event) => event.eventId)).toEqual(['evt_human_parked']);
+    expect(first.timelinePage).toMatchObject({ hasMore: true, nextCursor: expect.any(String) });
+    const second = await getOrchestrationTree(env.DB, projectId, orchestration.id, {
+      timelineLimit: 1, timelineCursor: first.timelinePage.nextCursor!,
+    });
+    expect(second.timeline.map((event) => event.eventId)).toEqual(['evt_human_started']);
+    const completeTimeline = await getOrchestrationTree(env.DB, projectId, orchestration.id);
+    expect(completeTimeline.timeline).toContainEqual(expect.objectContaining({
+      eventId: relation.id, eventType: 'hands_off_to', executionId: root.id, targetExecutionId: handoff.id,
+    }));
   });
 });

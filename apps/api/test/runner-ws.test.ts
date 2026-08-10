@@ -223,6 +223,14 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
       parentExecutionId: assigned.run.execution.executionId,
       status: 'running',
     }));
+    const inventoryRes = await SELF.fetch(
+      `https://noriq.test/api/projects/${pid}/orchestrations?view=active&limit=100`,
+      { headers: { Cookie: cookie } },
+    );
+    expect(inventoryRes.status).toBe(200);
+    const inventory = await inventoryRes.json() as { orchestrations: Array<{ id: string }>; page: { limit: number } };
+    expect(inventory.orchestrations.map((item) => item.id)).toContain(assigned.run.execution.orchestrationId);
+    expect(inventory.page.limit).toBe(100);
 
     const minted = await SELF.fetch(`https://noriq.test/api/runs/${disp.run.id}/agent`, {
       method: 'POST',

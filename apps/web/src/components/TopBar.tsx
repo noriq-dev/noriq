@@ -7,7 +7,8 @@ import { AvatarChip, LiveDot } from './bits';
 
 const TABS: Array<{ id: ViewId; label: string }> = [
   { id: 'control', label: 'Mission Control' },
-  { id: 'graph', label: 'Orchestration' },
+  { id: 'graph', label: 'Task Graph' },
+  { id: 'executions', label: 'Execution' },
   { id: 'board', label: 'Board' },
   { id: 'plans', label: 'Plans' },
   { id: 'roadmap', label: 'Roadmap' },

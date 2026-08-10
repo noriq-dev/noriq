@@ -689,40 +689,174 @@ export async function mirrorRunTransition(env: Env, input: {
   });
 }
 
-export async function getOrchestrationTree(db: D1Database, projectId: string, orchestrationId: string) {
+type OrchestrationCursor = { updatedAt: string; id: string };
+type TimelineCursor = { observedAt: string; eventId: string };
+
+const encodeReadCursor = (value: object) => btoa(JSON.stringify(value)).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+function decodeReadCursor<T>(raw: string | undefined, fields: string[]): T | null {
+  if (!raw) return null;
+  try {
+    const padded = raw.replaceAll('-', '+').replaceAll('_', '/') + '='.repeat((4 - raw.length % 4) % 4);
+    const value = JSON.parse(atob(padded)) as Record<string, unknown>;
+    if (fields.some((field) => typeof value[field] !== 'string' || !value[field])) throw new Error('invalid cursor');
+    return value as T;
+  } catch { throw new Error('cursor is invalid or expired'); }
+}
+
+export async function listOrchestrations(db: D1Database, projectId: string, options: {
+  view?: 'active' | 'history'; cursor?: string; limit?: number;
+} = {}) {
+  const limit = Math.min(100, Math.max(1, Math.trunc(options.limit ?? 40)));
+  const cursor = decodeReadCursor<OrchestrationCursor>(options.cursor, ['updatedAt', 'id']);
+  const statuses = options.view === 'history'
+    ? "o.status IN ('succeeded','failed','cancelled','interrupted')"
+    : "o.status IN ('pending','running','parked')";
+  const cursorSql = cursor ? ' AND (o.updated_at < ? OR (o.updated_at = ? AND o.id < ?))' : '';
+  const binds: unknown[] = [projectId];
+  if (cursor) binds.push(cursor.updatedAt, cursor.updatedAt, cursor.id);
+  binds.push(limit + 1);
+  const rows = await db.prepare(
+    `SELECT o.id, o.anchor_type AS anchorType, o.anchor_id AS anchorId, o.root_execution_id AS rootExecutionId,
+            o.status, o.completeness_status AS completenessStatus,
+            o.completeness_missing AS completenessMissing, o.completeness_reason AS completenessReason,
+            o.created_by_kind AS createdByKind, o.created_by_id AS createdById,
+            CASE o.created_by_kind
+              WHEN 'human' THEN (SELECT name FROM users WHERE id = o.created_by_id)
+              WHEN 'runner' THEN (SELECT label FROM runners WHERE id = o.created_by_id)
+              WHEN 'agent' THEN (SELECT COALESCE(label, name) FROM agents WHERE id = o.created_by_id)
+              WHEN 'copilot' THEN (SELECT COALESCE(label, name) FROM agents WHERE id = o.created_by_id)
+              ELSE 'system' END AS createdByName,
+            CASE o.anchor_type
+              WHEN 'task' THEN (SELECT key || ' · ' || title FROM tasks WHERE id = o.anchor_id)
+              WHEN 'plan' THEN (SELECT title FROM plans WHERE id = o.anchor_id)
+              WHEN 'run' THEN (SELECT kind || ' run · ' || id FROM runs WHERE id = o.anchor_id)
+              WHEN 'chat' THEN (SELECT title FROM ask_threads WHERE id = o.anchor_id)
+              ELSE 'Unanchored orchestration' END AS anchorLabel,
+            (SELECT COUNT(*) FROM execution_nodes n WHERE n.orchestration_id = o.id) AS nodeCount,
+            (SELECT COUNT(*) FROM execution_nodes n WHERE n.orchestration_id = o.id
+              AND n.status IN ('pending','running','parked')) AS liveNodeCount,
+            (SELECT COUNT(*) FROM execution_nodes n WHERE n.orchestration_id = o.id
+              AND n.completeness_status != 'complete') AS incompleteNodeCount,
+            o.created_at AS createdAt, o.updated_at AS updatedAt, o.finished_at AS finishedAt
+       FROM orchestrations o
+      WHERE o.project_id = ? AND ${statuses}${cursorSql}
+      ORDER BY o.updated_at DESC, o.id DESC LIMIT ?`,
+  ).bind(...binds).all<Record<string, unknown> & { id: string; updatedAt: string }>();
+  const hasMore = rows.results.length > limit;
+  const orchestrations = rows.results.slice(0, limit).map((row) => ({
+    ...row,
+    completenessMissing: (() => { try { return JSON.parse(String(row.completenessMissing)); } catch { return []; } })(),
+  }));
+  const last = orchestrations.at(-1);
+  const counts = await db.prepare(
+    `SELECT SUM(status IN ('pending','running','parked')) AS active,
+            SUM(status IN ('succeeded','failed','cancelled','interrupted')) AS history,
+            COUNT(*) AS total FROM orchestrations WHERE project_id = ?`,
+  ).bind(projectId).first<{ active: number; history: number; total: number }>();
+  return {
+    orchestrations,
+    counts: { active: Number(counts?.active ?? 0), history: Number(counts?.history ?? 0), total: Number(counts?.total ?? 0) },
+    page: { limit, hasMore, nextCursor: hasMore && last ? encodeReadCursor({ updatedAt: String(last.updatedAt), id: last.id }) : null },
+  };
+}
+
+export async function getOrchestrationTree(db: D1Database, projectId: string, orchestrationId: string, options: {
+  timelineCursor?: string; timelineLimit?: number;
+} = {}) {
   const orchestration = await db.prepare(
     `SELECT id, project_id AS projectId, anchor_type AS anchorType, anchor_id AS anchorId,
             root_execution_id AS rootExecutionId, status, completeness_status AS completenessStatus,
             completeness_missing AS completenessMissing, completeness_reason AS completenessReason,
             created_by_kind AS createdByKind, created_by_id AS createdById,
+            CASE created_by_kind
+              WHEN 'human' THEN (SELECT name FROM users WHERE id = orchestrations.created_by_id)
+              WHEN 'runner' THEN (SELECT label FROM runners WHERE id = orchestrations.created_by_id)
+              WHEN 'agent' THEN (SELECT COALESCE(label, name) FROM agents WHERE id = orchestrations.created_by_id)
+              WHEN 'copilot' THEN (SELECT COALESCE(label, name) FROM agents WHERE id = orchestrations.created_by_id)
+              ELSE 'system' END AS createdByName,
+            CASE anchor_type
+              WHEN 'task' THEN (SELECT key || ' · ' || title FROM tasks WHERE id = orchestrations.anchor_id)
+              WHEN 'plan' THEN (SELECT title FROM plans WHERE id = orchestrations.anchor_id)
+              WHEN 'run' THEN (SELECT kind || ' run · ' || id FROM runs WHERE id = orchestrations.anchor_id)
+              WHEN 'chat' THEN (SELECT title FROM ask_threads WHERE id = orchestrations.anchor_id)
+              ELSE 'Unanchored orchestration' END AS anchorLabel,
+            (SELECT COUNT(*) FROM execution_nodes n WHERE n.orchestration_id = orchestrations.id) AS nodeCount,
+            (SELECT COUNT(*) FROM execution_nodes n WHERE n.orchestration_id = orchestrations.id
+              AND n.status IN ('pending','running','parked')) AS liveNodeCount,
+            (SELECT COUNT(*) FROM execution_nodes n WHERE n.orchestration_id = orchestrations.id
+              AND n.completeness_status != 'complete') AS incompleteNodeCount,
             created_at AS createdAt, updated_at AS updatedAt, finished_at AS finishedAt
        FROM orchestrations WHERE id = ? AND project_id = ?`,
   ).bind(orchestrationId, projectId).first<Record<string, unknown>>();
   if (!orchestration) throw new Error('orchestration not found');
-  const [nodes, relations] = await Promise.all([
+  const timelineLimit = Math.min(200, Math.max(1, Math.trunc(options.timelineLimit ?? 100)));
+  const timelineCursor = decodeReadCursor<TimelineCursor>(options.timelineCursor, ['observedAt', 'eventId']);
+  const [nodes, relations, events] = await Promise.all([
     db.prepare(
       `SELECT id, parent_execution_id AS parentExecutionId, kind, role, actor_kind AS actorKind,
               actor_id AS actorId, presence_id AS presenceId, task_id AS taskId, plan_id AS planId,
               run_id AS runId, sitting, stage, step, gate_id AS gateId, status,
+              CASE actor_kind
+                WHEN 'human' THEN (SELECT name FROM users WHERE id = execution_nodes.actor_id)
+                WHEN 'runner' THEN (SELECT label FROM runners WHERE id = execution_nodes.actor_id)
+                WHEN 'agent' THEN (SELECT COALESCE(label, name) FROM agents WHERE id = execution_nodes.actor_id)
+                WHEN 'copilot' THEN (SELECT COALESCE(label, name) FROM agents WHERE id = execution_nodes.actor_id)
+                ELSE CASE WHEN actor_kind = 'system' THEN 'system' END END AS actorName,
+              (SELECT key FROM tasks WHERE id = execution_nodes.task_id) AS taskKey,
+              (SELECT title FROM tasks WHERE id = execution_nodes.task_id) AS taskTitle,
+              (SELECT title FROM plans WHERE id = execution_nodes.plan_id) AS planTitle,
               completeness_status AS completenessStatus, completeness_missing AS completenessMissing,
               completeness_reason AS completenessReason, last_revision AS lastRevision,
               started_at AS startedAt, parked_at AS parkedAt, finished_at AS finishedAt,
               outcome_reason AS outcomeReason, created_at AS createdAt, updated_at AS updatedAt
          FROM execution_nodes WHERE orchestration_id = ? ORDER BY created_at, id`,
-    ).bind(orchestrationId).all<Record<string, unknown>>(),
+    ).bind(orchestrationId).all<Record<string, unknown> & { id: string; parentExecutionId: string | null }>(),
     db.prepare(
       `SELECT id, from_execution_id AS fromExecutionId, to_execution_id AS toExecutionId,
               type, metadata, created_at AS createdAt
          FROM execution_relations WHERE orchestration_id = ? ORDER BY created_at, id`,
     ).bind(orchestrationId).all<Record<string, unknown>>(),
+    db.prepare(
+      `WITH audit AS (
+         SELECT event_id AS eventId, execution_id AS executionId, revision, event_type AS eventType,
+                NULL AS targetExecutionId, observed_at AS observedAt, reason, metadata, accepted_at AS acceptedAt
+           FROM execution_lifecycle_events WHERE orchestration_id = ?
+         UNION ALL
+         SELECT id AS eventId, from_execution_id AS executionId, 0 AS revision,
+                type AS eventType, to_execution_id AS targetExecutionId, created_at AS observedAt, NULL AS reason, metadata,
+                created_at AS acceptedAt
+           FROM execution_relations WHERE orchestration_id = ?
+       ) SELECT * FROM audit
+        WHERE 1 = 1 ${timelineCursor ? 'AND (observedAt < ? OR (observedAt = ? AND eventId < ?))' : ''}
+        ORDER BY observedAt DESC, eventId DESC LIMIT ?`,
+    ).bind(
+      orchestrationId, orchestrationId,
+      ...(timelineCursor ? [timelineCursor.observedAt, timelineCursor.observedAt, timelineCursor.eventId] : []),
+      timelineLimit + 1,
+    ).all<Record<string, unknown> & { eventId: string; observedAt: string }>(),
   ]);
   const parse = (value: unknown) => { try { return JSON.parse(String(value)); } catch { return value; } };
+  const hasMoreTimeline = events.results.length > timelineLimit;
+  const timeline = events.results.slice(0, timelineLimit).map((event) => ({ ...event, metadata: parse(event.metadata) }));
+  const lastEvent = timeline.at(-1);
+  const nodeIds = new Set(nodes.results.map((node) => String(node.id)));
+  const rootExecutionIds = nodes.results
+    .filter((node) => node.parentExecutionId == null || !nodeIds.has(String(node.parentExecutionId)))
+    .map((node) => String(node.id));
   return {
     orchestration: {
       ...orchestration,
       completenessMissing: parse(orchestration.completenessMissing),
     },
     nodes: nodes.results.map((node) => ({ ...node, completenessMissing: parse(node.completenessMissing) })),
+    rootExecutionIds,
     relations: relations.results.map((relation) => ({ ...relation, metadata: parse(relation.metadata) })),
+    timeline,
+    timelinePage: {
+      limit: timelineLimit,
+      hasMore: hasMoreTimeline,
+      nextCursor: hasMoreTimeline && lastEvent
+        ? encodeReadCursor({ observedAt: String(lastEvent.observedAt), eventId: String(lastEvent.eventId) }) : null,
+    },
   };
 }
