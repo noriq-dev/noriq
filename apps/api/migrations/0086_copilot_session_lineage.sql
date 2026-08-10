@@ -20,48 +20,51 @@ CREATE TRIGGER agent_presences_parent_validate_insert
 BEFORE INSERT ON agent_presences
 WHEN NEW.parent_presence_id IS NOT NULL
 BEGIN
-  SELECT CASE WHEN NEW.parent_presence_id = NEW.id
-    THEN RAISE(ABORT, 'session presence cannot parent itself') END;
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT RAISE(ABORT, 'session presence cannot parent itself')
+   WHERE NEW.parent_presence_id = NEW.id;
+  SELECT RAISE(ABORT, 'session presence parent must be an MCP session for the same user')
+   WHERE NOT EXISTS (
     SELECT 1 FROM agent_presences parent
     JOIN agents parent_actor ON parent_actor.id = parent.actor_id
     JOIN agents child_actor ON child_actor.id = NEW.actor_id
     WHERE parent.id = NEW.parent_presence_id
       AND parent.kind = 'mcp_session' AND NEW.kind = 'mcp_session'
       AND parent_actor.user_id = child_actor.user_id
-  ) THEN RAISE(ABORT, 'session presence parent must be an MCP session for the same user') END;
-  SELECT CASE WHEN EXISTS (
+  );
+  SELECT RAISE(ABORT, 'session presence parent would create a cycle') WHERE EXISTS (
     WITH RECURSIVE ancestors(id) AS (
       SELECT parent_presence_id FROM agent_presences WHERE id = NEW.parent_presence_id
       UNION ALL
       SELECT p.parent_presence_id FROM agent_presences p JOIN ancestors a ON p.id = a.id
       WHERE p.parent_presence_id IS NOT NULL
     ) SELECT 1 FROM ancestors WHERE id = NEW.id
-  ) THEN RAISE(ABORT, 'session presence parent would create a cycle') END;
+  );
 END;
 
 CREATE TRIGGER agent_presences_parent_validate_update
 BEFORE UPDATE OF parent_presence_id ON agent_presences
 BEGIN
-  SELECT CASE WHEN OLD.parent_presence_id IS NOT NULL
-                   AND OLD.parent_presence_id IS NOT NEW.parent_presence_id
-    THEN RAISE(ABORT, 'session presence parent is immutable') END;
-  SELECT CASE WHEN NEW.parent_presence_id = NEW.id
-    THEN RAISE(ABORT, 'session presence cannot parent itself') END;
-  SELECT CASE WHEN NEW.parent_presence_id IS NOT NULL AND NOT EXISTS (
+  SELECT RAISE(ABORT, 'session presence parent is immutable')
+   WHERE OLD.parent_presence_id IS NOT NULL
+     AND OLD.parent_presence_id IS NOT NEW.parent_presence_id;
+  SELECT RAISE(ABORT, 'session presence cannot parent itself')
+   WHERE NEW.parent_presence_id = NEW.id;
+  SELECT RAISE(ABORT, 'session presence parent must be an MCP session for the same user')
+   WHERE NEW.parent_presence_id IS NOT NULL AND NOT EXISTS (
     SELECT 1 FROM agent_presences parent
     JOIN agents parent_actor ON parent_actor.id = parent.actor_id
     JOIN agents child_actor ON child_actor.id = NEW.actor_id
     WHERE parent.id = NEW.parent_presence_id
       AND parent.kind = 'mcp_session' AND NEW.kind = 'mcp_session'
       AND parent_actor.user_id = child_actor.user_id
-  ) THEN RAISE(ABORT, 'session presence parent must be an MCP session for the same user') END;
-  SELECT CASE WHEN NEW.parent_presence_id IS NOT NULL AND EXISTS (
+  );
+  SELECT RAISE(ABORT, 'session presence parent would create a cycle')
+   WHERE NEW.parent_presence_id IS NOT NULL AND EXISTS (
     WITH RECURSIVE ancestors(id) AS (
       SELECT parent_presence_id FROM agent_presences WHERE id = NEW.parent_presence_id
       UNION ALL
       SELECT p.parent_presence_id FROM agent_presences p JOIN ancestors a ON p.id = a.id
       WHERE p.parent_presence_id IS NOT NULL
     ) SELECT 1 FROM ancestors WHERE id = NEW.id
-  ) THEN RAISE(ABORT, 'session presence parent would create a cycle') END;
+  );
 END;

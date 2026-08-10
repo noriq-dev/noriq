@@ -138,46 +138,46 @@ CREATE TRIGGER execution_nodes_parent_scope_insert
 BEFORE INSERT ON execution_nodes
 WHEN NEW.parent_execution_id IS NOT NULL
 BEGIN
-  SELECT CASE WHEN NEW.parent_execution_id = NEW.id
-    THEN RAISE(ABORT, 'execution cannot parent itself') END;
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT RAISE(ABORT, 'execution cannot parent itself')
+   WHERE NEW.parent_execution_id = NEW.id;
+  SELECT RAISE(ABORT, 'execution parent scope mismatch') WHERE NOT EXISTS (
     SELECT 1 FROM execution_nodes p
      WHERE p.id = NEW.parent_execution_id
        AND p.orchestration_id = NEW.orchestration_id
        AND p.project_id = NEW.project_id
-  ) THEN RAISE(ABORT, 'execution parent scope mismatch') END;
+  );
 END;
 
 CREATE TRIGGER execution_relations_scope_insert
 BEFORE INSERT ON execution_relations
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT RAISE(ABORT, 'execution relation scope mismatch') WHERE NOT EXISTS (
     SELECT 1 FROM execution_nodes f JOIN execution_nodes t
       ON t.id = NEW.to_execution_id
      WHERE f.id = NEW.from_execution_id
        AND f.orchestration_id = NEW.orchestration_id
        AND t.orchestration_id = NEW.orchestration_id
        AND f.project_id = NEW.project_id AND t.project_id = NEW.project_id
-  ) THEN RAISE(ABORT, 'execution relation scope mismatch') END;
+  );
 END;
 
 CREATE TRIGGER execution_events_validate_insert
 BEFORE INSERT ON execution_lifecycle_events
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT RAISE(ABORT, 'execution event scope mismatch') WHERE NOT EXISTS (
     SELECT 1 FROM execution_nodes n
      WHERE n.id = NEW.execution_id AND n.orchestration_id = NEW.orchestration_id
-  ) THEN RAISE(ABORT, 'execution event scope mismatch') END;
-  SELECT CASE WHEN NEW.revision != (
+  );
+  SELECT RAISE(ABORT, 'execution event revision mismatch') WHERE NEW.revision != (
     SELECT last_revision + 1 FROM execution_nodes WHERE id = NEW.execution_id
-  ) THEN RAISE(ABORT, 'execution event revision mismatch') END;
-  SELECT CASE WHEN NOT EXISTS (
+  );
+  SELECT RAISE(ABORT, 'illegal execution lifecycle transition') WHERE NOT EXISTS (
     SELECT 1 FROM execution_nodes n WHERE n.id = NEW.execution_id AND (
       (n.status = 'pending' AND NEW.event_type IN ('started','cancelled','interrupted')) OR
       (n.status = 'running' AND NEW.event_type IN ('parked','succeeded','failed','cancelled','interrupted')) OR
       (n.status = 'parked' AND NEW.event_type IN ('resumed','failed','cancelled','interrupted'))
     )
-  ) THEN RAISE(ABORT, 'illegal execution lifecycle transition') END;
+  );
 END;
 
 CREATE TRIGGER execution_events_apply_insert

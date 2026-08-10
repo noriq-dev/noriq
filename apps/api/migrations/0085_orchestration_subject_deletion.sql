@@ -27,20 +27,20 @@ WHEN OLD.orchestration_id != NEW.orchestration_id
   OR OLD.step IS NOT NEW.step
   OR OLD.gate_id IS NOT NEW.gate_id
 BEGIN
-  SELECT CASE WHEN OLD.orchestration_id != NEW.orchestration_id THEN RAISE(ABORT, 'execution orchestration is immutable') END;
-  SELECT CASE WHEN OLD.project_id != NEW.project_id THEN RAISE(ABORT, 'execution project is immutable') END;
-  SELECT CASE WHEN OLD.parent_execution_id IS NOT NEW.parent_execution_id THEN RAISE(ABORT, 'execution structure is immutable: parent') END;
-  SELECT CASE WHEN OLD.local_node_key IS NOT NEW.local_node_key THEN RAISE(ABORT, 'execution local key is immutable') END;
-  SELECT CASE WHEN OLD.producer_scope IS NOT NEW.producer_scope THEN RAISE(ABORT, 'execution producer scope is immutable') END;
-  SELECT CASE WHEN OLD.kind != NEW.kind THEN RAISE(ABORT, 'execution kind is immutable') END;
-  SELECT CASE WHEN OLD.actor_kind IS NOT NEW.actor_kind THEN RAISE(ABORT, 'execution actor kind is immutable') END;
-  SELECT CASE WHEN OLD.actor_id IS NOT NEW.actor_id THEN RAISE(ABORT, 'execution actor is immutable') END;
-  SELECT CASE WHEN OLD.presence_id IS NOT NEW.presence_id THEN RAISE(ABORT, 'execution presence is immutable') END;
-  SELECT CASE WHEN OLD.task_id IS NOT NEW.task_id AND NEW.task_id IS NOT NULL THEN RAISE(ABORT, 'execution task is immutable') END;
-  SELECT CASE WHEN OLD.plan_id IS NOT NEW.plan_id AND NEW.plan_id IS NOT NULL THEN RAISE(ABORT, 'execution plan is immutable') END;
-  SELECT CASE WHEN OLD.run_id IS NOT NEW.run_id AND NEW.run_id IS NOT NULL THEN RAISE(ABORT, 'execution run is immutable') END;
-  SELECT CASE WHEN OLD.sitting IS NOT NEW.sitting THEN RAISE(ABORT, 'execution sitting is immutable') END;
-  SELECT CASE WHEN OLD.stage IS NOT NEW.stage THEN RAISE(ABORT, 'execution stage is immutable') END;
-  SELECT CASE WHEN OLD.step IS NOT NEW.step THEN RAISE(ABORT, 'execution step is immutable') END;
-  SELECT CASE WHEN OLD.gate_id IS NOT NEW.gate_id THEN RAISE(ABORT, 'execution gate is immutable') END;
+  SELECT RAISE(ABORT, 'execution orchestration is immutable') WHERE OLD.orchestration_id != NEW.orchestration_id;
+  SELECT RAISE(ABORT, 'execution project is immutable') WHERE OLD.project_id != NEW.project_id;
+  SELECT RAISE(ABORT, 'execution structure is immutable: parent') WHERE OLD.parent_execution_id IS NOT NEW.parent_execution_id;
+  SELECT RAISE(ABORT, 'execution local key is immutable') WHERE OLD.local_node_key IS NOT NEW.local_node_key;
+  SELECT RAISE(ABORT, 'execution producer scope is immutable') WHERE OLD.producer_scope IS NOT NEW.producer_scope;
+  SELECT RAISE(ABORT, 'execution kind is immutable') WHERE OLD.kind != NEW.kind;
+  SELECT RAISE(ABORT, 'execution actor kind is immutable') WHERE OLD.actor_kind IS NOT NEW.actor_kind;
+  SELECT RAISE(ABORT, 'execution actor is immutable') WHERE OLD.actor_id IS NOT NEW.actor_id;
+  SELECT RAISE(ABORT, 'execution presence is immutable') WHERE OLD.presence_id IS NOT NEW.presence_id;
+  SELECT RAISE(ABORT, 'execution task is immutable') WHERE OLD.task_id IS NOT NEW.task_id AND NEW.task_id IS NOT NULL;
+  SELECT RAISE(ABORT, 'execution plan is immutable') WHERE OLD.plan_id IS NOT NEW.plan_id AND NEW.plan_id IS NOT NULL;
+  SELECT RAISE(ABORT, 'execution run is immutable') WHERE OLD.run_id IS NOT NEW.run_id AND NEW.run_id IS NOT NULL;
+  SELECT RAISE(ABORT, 'execution sitting is immutable') WHERE OLD.sitting IS NOT NEW.sitting;
+  SELECT RAISE(ABORT, 'execution stage is immutable') WHERE OLD.stage IS NOT NEW.stage;
+  SELECT RAISE(ABORT, 'execution step is immutable') WHERE OLD.step IS NOT NEW.step;
+  SELECT RAISE(ABORT, 'execution gate is immutable') WHERE OLD.gate_id IS NOT NEW.gate_id;
 END;
