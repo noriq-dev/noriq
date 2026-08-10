@@ -56,7 +56,8 @@ import {
 } from '../memory/analytics';
 import {
   effortSignals, duplicateWarnings, priorEffortCase, summarizeEffort,
-  type TaskEffortInput, type EffortCandidate, type DuplicateWarning, type EffortSummary, type PriorEffortCase,
+  type TaskEffortInput, type EffortCandidate, type DuplicateWarning, type EffortSummary,
+  type PriorEffortCase, type PriorEffortMemorySupport,
 } from '../memory/similar-effort';
 import {
   citationVerdict, verifiedForBase, rollUpValidity,
@@ -4222,10 +4223,16 @@ export class ProjectMemory extends DurableObject<Env> {
     input: TaskEffortInput & {
       taskId: string; limit?: number; repositoryKey?: string;
       branch?: string; preferBranch?: string; baseId?: string;
+      cursor?: string; includeCrossBranch?: boolean; includeStaleEvidence?: boolean;
     },
-  ): Promise<{ warnings: DuplicateWarning[]; cases: PriorEffortCase[]; summary: EffortSummary; consideredCount: number }> {
+  ): Promise<{
+    warnings: DuplicateWarning[]; cases: PriorEffortCase[]; summary: EffortSummary; consideredCount: number;
+    page: { limit: number; total: number; nextCursor: string | null };
+    coverage: { complete: boolean; candidatesConsidered: number; eligibleCases: number; reasons: string[] };
+  }> {
     await this.assertProjectId(projectId);
-    const limit = Math.min(Math.max(input.limit ?? RETRIEVAL_DEFAULTS.maxResults, 1), RETRIEVAL_DEFAULTS.maxResultsCeiling);
+    const pageLimit = Math.min(Math.max(input.limit ?? RETRIEVAL_DEFAULTS.maxResults, 1), RETRIEVAL_DEFAULTS.maxResultsCeiling);
+    const candidateLimit = RETRIEVAL_DEFAULTS.maxResultsCeiling;
     const signals = effortSignals(input);
 
     // episodeId -> best-known provenance across every stage that found it. A graph hit's
@@ -4241,6 +4248,7 @@ export class ProjectMemory extends DurableObject<Env> {
     // in `entityType: 'node'`) doesn't accept without first re-deriving that resolution here
     // anyway. Two call sites implementing one documented rule beats forcing a shape mismatch.
     const provenance = new Map<string, { stage: RetrievalStage; score: number; edgePath?: string }>();
+    const retrievalCoverageReasons: string[] = [];
     const consider = (id: string, stage: RetrievalStage, score: number, edgePath?: string) => {
       const prev = provenance.get(id);
       if (!prev) { provenance.set(id, { stage, score, edgePath }); return; }
@@ -4249,10 +4257,14 @@ export class ProjectMemory extends DurableObject<Env> {
     };
 
     if (signals.queryText.trim()) {
-      for (const hit of this.lexicalRetrievalRows(signals.queryText, { limit })) {
+      const lexicalHits = this.lexicalRetrievalRows(signals.queryText, { limit: candidateLimit });
+      if (lexicalHits.length >= candidateLimit) retrievalCoverageReasons.push('lexical candidate scan reached its bounded ceiling');
+      for (const hit of lexicalHits) {
         if (hit.entityType === 'episode') consider(hit.id, hit.stage, hit.score);
       }
-      for (const hit of await this.semanticRetrievalRows(projectId, signals.queryText, limit)) {
+      const semanticHits = await this.semanticRetrievalRows(projectId, signals.queryText, candidateLimit);
+      if (semanticHits.length >= candidateLimit) retrievalCoverageReasons.push('semantic candidate scan reached its bounded ceiling');
+      for (const hit of semanticHits) {
         if (hit.entityType === 'episode') consider(hit.id, hit.stage, hit.score);
       }
     }
@@ -4264,10 +4276,10 @@ export class ProjectMemory extends DurableObject<Env> {
     if (taskNode) {
       const seedIds = [taskNode.nodeId];
       const graphOpts = { maxResults: RETRIEVAL_DEFAULTS.maxGraphResults };
-      const rows = [
-        ...this.rawTraverseGraph(seedIds, { ...graphOpts, direction: 'downstream' }).rows,
-        ...this.rawTraverseGraph(seedIds, { ...graphOpts, direction: 'upstream' }).rows,
-      ];
+      const down = this.rawTraverseGraph(seedIds, { ...graphOpts, direction: 'downstream' });
+      const up = this.rawTraverseGraph(seedIds, { ...graphOpts, direction: 'upstream' });
+      if (down.truncated || up.truncated) retrievalCoverageReasons.push('graph candidate traversal reached its bounded ceiling');
+      const rows = [...down.rows, ...up.rows];
       for (const row of rows) {
         if (row.type !== 'episode') continue;
         const ref = parseEntityUri(row.uri);
@@ -4276,7 +4288,11 @@ export class ProjectMemory extends DurableObject<Env> {
     }
 
     const episodeIds = [...provenance.keys()];
-    if (!episodeIds.length) return { warnings: [], cases: [], summary: summarizeEffort([]), consideredCount: 0 };
+    if (!episodeIds.length) return {
+      warnings: [], cases: [], summary: summarizeEffort([]), consideredCount: 0,
+      page: { limit: pageLimit, total: 0, nextCursor: null },
+      coverage: { complete: true, candidatesConsidered: 0, eligibleCases: 0, reasons: [] },
+    };
 
     const placeholders = episodeIds.map((_, i) => `?${i + 1}`).join(',');
     const rows = this.ctx.storage.sql
@@ -4340,22 +4356,127 @@ export class ProjectMemory extends DurableObject<Env> {
       };
     });
 
+    // Current memory validity/authority stays distinct from the quoted historical episode.
+    // Resolve the bounded episode -> memory graph links in bulk, then read each memory's live
+    // authority/validity and citation scope. This never rewrites the episode or treats current
+    // task text as historical evidence.
+    const candidateById = new Map(candidates.map((candidate) => [candidate.episodeId, candidate]));
+    const episodeUris = candidates.map((candidate) => buildEntityUri({ kind: 'episode', id: candidate.episodeId }));
+    const episodeNodeByUri = new Map<string, string>();
+    if (episodeUris.length) {
+      const ephs = episodeUris.map((_, i) => `?${i + 1}`).join(',');
+      for (const node of this.ctx.storage.sql.exec<{ id: string; uri: string }>(
+        `SELECT id, uri FROM nodes WHERE uri IN (${ephs})`, ...episodeUris,
+      ).toArray()) episodeNodeByUri.set(node.uri, node.id);
+    }
+    const nodeToEpisode = new Map([...episodeNodeByUri.entries()].map(([uri, id]) => {
+      const ref = parseEntityUri(uri);
+      return [id, ref.kind === 'episode' ? ref.id : ''] as const;
+    }));
+    const episodeNodeIds = [...nodeToEpisode.keys()];
+    const supportEdgeLimit = 2_000;
+    const supportEdges = episodeNodeIds.length ? this.ctx.storage.sql.exec<{
+      episode_node_id: string; memory_uri: string;
+    }>(
+      `SELECT e.from_node_id AS episode_node_id, m.uri AS memory_uri
+         FROM edges e JOIN nodes m ON m.id = e.to_node_id
+        WHERE e.type = 'related_to' AND m.type = 'memory'
+          AND e.from_node_id IN (${episodeNodeIds.map((_, i) => `?${i + 1}`).join(',')})
+        ORDER BY e.from_node_id, m.uri LIMIT ${supportEdgeLimit + 1}`,
+      ...episodeNodeIds,
+    ).toArray() : [];
+    const supportTruncated = supportEdges.length > supportEdgeLimit;
+    const usableSupportEdges = supportEdges.slice(0, supportEdgeLimit);
+    const supportMemoryIds = [...new Set(usableSupportEdges.map((edge) => {
+      const ref = parseEntityUri(edge.memory_uri);
+      return ref.kind === 'memory' ? ref.id : null;
+    }).filter((id): id is string => !!id))];
+    const supportById = new Map<string, PriorEffortMemorySupport>();
+    if (supportMemoryIds.length) {
+      const mphs = supportMemoryIds.map((_, i) => `?${i + 1}`).join(',');
+      const memoryRows = this.ctx.storage.sql.exec<{
+        id: string; kind: string; authority: number; validity: 'active' | 'stale' | 'invalid';
+        repository_key: string | null; branch: string | null; base_id: string | null;
+      }>(
+        `SELECT m.id, m.kind, m.authority, m.validity,
+                e.repository_key, e.branch, e.base_id
+           FROM memory_items m LEFT JOIN evidence e ON e.memory_item_id = m.id
+          WHERE m.id IN (${mphs})
+          ORDER BY m.id,
+            CASE WHEN e.branch IS ?${supportMemoryIds.length + 1} THEN 0 ELSE 1 END,
+            CASE WHEN e.base_id IS ?${supportMemoryIds.length + 2} THEN 0 ELSE 1 END,
+            e.id`,
+        ...supportMemoryIds, input.branch ?? null, input.baseId ?? null,
+      ).toArray();
+      for (const row of memoryRows) if (!supportById.has(row.id)) supportById.set(row.id, {
+        memoryId: row.id, kind: row.kind, authority: row.authority, validity: row.validity,
+        repositoryKey: row.repository_key, branch: row.branch, baseId: row.base_id,
+      });
+    }
+    for (const edge of usableSupportEdges) {
+      const episodeId = nodeToEpisode.get(edge.episode_node_id);
+      const ref = parseEntityUri(edge.memory_uri);
+      const support = ref.kind === 'memory' ? supportById.get(ref.id) : null;
+      const candidate = episodeId ? candidateById.get(episodeId) : null;
+      if (candidate && support && !(candidate.supportingMemories ?? []).some((item) => item.memoryId === support.memoryId)) {
+        candidate.supportingMemories = [...(candidate.supportingMemories ?? []), support];
+      }
+    }
+
     const eligibleCandidates = candidates.filter((candidate) => {
       const repositoryKey = candidate.intelligence?.identity.repositoryKey ?? candidate.repositoryKey ?? null;
       const branch = candidate.intelligence?.identity.branch ?? null;
       const baseId = candidate.intelligence?.identity.baseId ?? candidate.baseId ?? null;
+      const currentSupport = candidate.supportingMemories ?? [];
+      const onlyStaleSupport = currentSupport.length > 0 && currentSupport.every((memory) => memory.validity !== 'active');
       return (!input.repositoryKey || repositoryKey == null || repositoryKey === input.repositoryKey)
-        && (!input.branch || branch == null || branch === input.branch)
-        && (!input.baseId || baseId == null || baseId === input.baseId);
+        && (!input.branch || branch == null || branch === input.branch || input.includeCrossBranch === true)
+        && (!input.baseId || baseId == null || baseId === input.baseId)
+        && (!onlyStaleSupport || input.includeStaleEvidence === true);
     });
-    const warnings = duplicateWarnings(eligibleCandidates, signals, { limit, preferBranch: input.preferBranch });
+    const allWarnings = duplicateWarnings(eligibleCandidates, signals, {
+      limit: RETRIEVAL_DEFAULTS.maxResultsCeiling, preferBranch: input.preferBranch,
+    });
+    const cursorIndex = input.cursor ? allWarnings.findIndex((warning) => warning.episodeId === input.cursor) : -1;
+    if (input.cursor && cursorIndex < 0) throw new Error('similar-effort cursor is not present in the eligible result');
+    const start = cursorIndex < 0 ? 0 : cursorIndex + 1;
+    const warnings = allWarnings.slice(start, start + pageLimit);
     // The summary always covers EXACTLY the episodes the warnings above it cite — never a
     // silently broader "everything considered" set (memory/similar-effort.ts's own contract).
     const warnedIds = new Set(warnings.map((w) => w.episodeId));
     const summary = summarizeEffort(eligibleCandidates.filter((c) => warnedIds.has(c.episodeId)));
-    const candidateById = new Map(candidates.map((candidate) => [candidate.episodeId, candidate]));
-    const cases = warnings.map((warning) => priorEffortCase(candidateById.get(warning.episodeId)!, warning));
-    return { warnings, cases, summary, consideredCount: eligibleCandidates.length };
+    const cases = warnings.map((warning) => priorEffortCase(candidateById.get(warning.episodeId)!, warning, input));
+    const eligibleOrderByRun = new Map<string, EffortCandidate[]>();
+    for (const warning of allWarnings) {
+      const candidate = candidateById.get(warning.episodeId)!;
+      const list = eligibleOrderByRun.get(candidate.runId) ?? [];
+      list.push(candidate);
+      eligibleOrderByRun.set(candidate.runId, list);
+    }
+    for (const list of eligibleOrderByRun.values()) list.sort((a, b) => (a.sitting ?? 1) - (b.sitting ?? 1));
+    for (const item of cases) {
+      const linked = eligibleOrderByRun.get(item.runId) ?? [];
+      const index = linked.findIndex((candidate) => candidate.episodeId === item.episodeId);
+      item.continuation = {
+        previousEpisodeId: index > 0 ? linked[index - 1]!.episodeId : null,
+        nextEpisodeId: index >= 0 && index + 1 < linked.length ? linked[index + 1]!.episodeId : null,
+      };
+    }
+    const pageEnd = start + warnings.length;
+    const reasons: string[] = [...retrievalCoverageReasons];
+    if (supportTruncated) reasons.push(`supporting-memory edge scan exceeded ${supportEdgeLimit} rows`);
+    if (allWarnings.length >= RETRIEVAL_DEFAULTS.maxResultsCeiling) reasons.push('eligible cases reached the bounded retrieval ceiling');
+    return {
+      warnings, cases, summary, consideredCount: eligibleCandidates.length,
+      page: {
+        limit: pageLimit, total: allWarnings.length,
+        nextCursor: pageEnd < allWarnings.length ? warnings.at(-1)?.episodeId ?? null : null,
+      },
+      coverage: {
+        complete: reasons.length === 0, candidatesConsidered: candidates.length,
+        eligibleCases: allWarnings.length, reasons,
+      },
+    };
   }
 
   // ---------------------------------------------------------------------------

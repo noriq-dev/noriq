@@ -9,6 +9,7 @@
 //   - can_claim / claim_task's `priorEffort` block via the real MCP surface.
 import { env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
+import { ProjectIntelligenceEpisode } from '@noriq-dev/shared';
 import type { Env } from '../src/env';
 import { createAgent, mcpCall } from './helpers';
 import {
@@ -16,6 +17,7 @@ import {
   type EffortCandidate, type EffortSignals,
 } from '../src/memory/similar-effort';
 import { loadPriorEffort } from '../src/lib/project-memory';
+import type { SimilarEffortResult } from '../src/lib/project-memory';
 
 const appEnv = env as unknown as Env;
 
@@ -25,24 +27,27 @@ interface RecordEpisodeInput {
   timeline: Array<{ at: string; label: string }>; filesTouched: string[]; commands: string[]; testsRun: string[]; failures: string[];
   findings: Array<{ summary: string; severity?: string }>; reviewRounds: number; tokenUsage: Record<string, unknown>; costUSD: number;
   acceptanceCoverage: number | null; steeringEvents: string[]; landingOutcome: string; remainingWork: string[]; selfSummary?: unknown;
+  intelligence?: unknown;
   actor: { kind: string; id: string | null };
 }
-interface SimilarEffortRpcResult {
-  warnings: Array<{
-    episodeId: string; runId: string; taskId: string | null; taskKey: string | null; runKind: string; outcome: string;
-    landingOutcome: string; whatWasAttempted: string; whatFailed: string[]; whatRemainsUncertain: string[];
-    support: Array<{ kind: string; detail: string }>; score: number;
-  }>;
-  summary: { episodesConsidered: number; totalCostUSD: number; totalTokens: number; averageReviewRounds: number; averageDurationMs: number | null; landingOutcomes: Record<string, number> };
-  consideredCount: number;
-}
+type SimilarEffortRpcResult = SimilarEffortResult;
 interface MemRpc {
   health(pid: string): Promise<{ schemaVersion: number; memoryRevision: number; tableCounts: Record<string, number> }>;
   runProjector(pid: string): Promise<{ applied: number; cursor: number }>;
   recordEpisode(pid: string, input: RecordEpisodeInput): Promise<{ episodeId: string; runId: string; created: boolean }>;
+  recordMemory(pid: string, input: {
+    kind: string; statement: string; actor: { kind: string; id: string | null };
+  }): Promise<{ memoryId: string }>;
+  transitionMemoryValidity(pid: string, input: {
+    memoryItemId: string; validity: 'active' | 'stale' | 'invalid'; actor: { kind: string; id: string | null };
+  }): Promise<{ ok: true }>;
   similarEffort(
     pid: string,
-    input: { taskId: string; title: string; body?: string | null; anticipatedFiles?: string[]; limit?: number },
+    input: {
+      taskId: string; title: string; body?: string | null; anticipatedFiles?: string[]; limit?: number;
+      cursor?: string; branch?: string; preferBranch?: string; baseId?: string;
+      includeCrossBranch?: boolean; includeStaleEvidence?: boolean;
+    },
   ): Promise<SimilarEffortRpcResult>;
 }
 const memory = (pid: string) => appEnv.PROJECT_MEMORY.get(appEnv.PROJECT_MEMORY.idFromName(pid)) as unknown as MemRpc;
@@ -56,6 +61,40 @@ function baseEpisodeInput(runId: string, overrides: Partial<RecordEpisodeInput> 
     actor: { kind: 'system', id: null },
     ...overrides,
   };
+}
+
+function scopedIntelligence(projectId: string, runId: string, branch: string, workflow: string) {
+  const capturedAt = '2026-08-09T12:00:00.000Z';
+  const unavailable = {
+    status: 'unavailable' as const, value: null, provenance: 'unavailable' as const,
+    source: 'runner' as const, sourceId: null, observedAt: null, acceptedAt: null, reason: 'not reported',
+  };
+  return ProjectIntelligenceEpisode.parse({
+    schemaVersion: 1,
+    identity: {
+      episodeId: 'filled-by-writer', projectId, runId, sitting: 1, taskId: null, planId: null,
+      planDispatchId: null, orchestrationId: null, executionId: null, repositoryKey: 'repo-scope',
+      branch, baseId: 'base-scope', lineage: { status: 'complete', missing: [], reason: null },
+    },
+    sources: { memoryRevision: 1, coordinationEventSequence: 1, orchestrationAcceptedAt: null, capturedAt },
+    versions: { extraction: 'scope-test', retrieval: null, risk: null, comparison: null },
+    preExecution: {
+      task: { taskType: 'feature', tags: ['scope'], executionSpecFingerprint: `spec-${workflow}`, capturedAt },
+      requestedStrategy: { workflow }, commissionedStrategy: { workflow }, commissionedSpec: null,
+      budget: null, configuration: [{ kind: 'workflow', name: workflow, version: 'v1', fingerprint: `fp-${workflow}` }],
+    },
+    execution: {
+      executedStrategy: { workflow }, executedSpec: null, observedModelUsage: unavailable,
+      clocks: {
+        queueDurationMs: unavailable, dispatchToStartMs: unavailable, elapsedExecutionMs: unavailable,
+        humanBlockedMs: unavailable, verifyDurationMs: unavailable,
+      },
+      stages: [], changes: {
+        backend: null, changedFiles: unavailable, additions: unavailable, deletions: unavailable, churn: unavailable,
+      },
+    },
+    outcome: { runOutcome: 'done', landingOutcome: 'landed', reviewRounds: unavailable, acceptanceCoverage: unavailable },
+  });
 }
 
 let agent: { id: string; apiKey: string };
@@ -349,6 +388,116 @@ describe('ProjectMemory.similarEffort — end-to-end retrieval, gate, and non-mu
     const after = await memory(projectId).health(projectId);
 
     expect(after).toEqual(before);
+  });
+
+  it('returns case-first cursor pages, keeps continued sittings distinct, and exposes no strategy ranking', async () => {
+    const projectId = await newProject('MSE7');
+    const made = await mcpCall(agent.apiKey, 'create_task', {
+      projectId, title: 'Refactor frobnicator protocol cache', tags: ['similar-effort-test'],
+    });
+    const taskId = made.body.id as string;
+    const common = {
+      filesTouched: ['apps/api/src/frobnicator/cache.ts'],
+      findings: [{ summary: 'Refactor frobnicator protocol cache with bounded invalidation' }],
+    };
+    // Four workflow-A cases and three workflow-B cases. They remain seven sitting cases; this
+    // task deliberately does not expose a 4-vs-3 strategy aggregate before PLNR-301's gate.
+    for (let i = 0; i < 7; i++) {
+      await memory(projectId).recordEpisode(projectId, baseEpisodeInput(
+        i < 2 ? 'run_frobnicator_continued' : `run_frobnicator_${i}`,
+        { ...common, sitting: i === 1 ? 2 : 1, outcome: i === 0 ? 'failed' : 'done' },
+      ));
+    }
+    const query = {
+      taskId, title: 'Refactor frobnicator protocol cache',
+      anticipatedFiles: ['apps/api/src/frobnicator/cache.ts'], limit: 4,
+    };
+    const first = await memory(projectId).similarEffort(projectId, query);
+    expect(first.cases).toHaveLength(4);
+    expect(first.page).toMatchObject({ limit: 4, total: 7, nextCursor: expect.any(String) });
+    expect(new Set(first.cases.map((item) => item.episodeId)).size).toBe(4);
+    expect('strategyAggregates' in first).toBe(false);
+    expect(first.cases.every((item) => item.retrieval.version === 'similar-effort-v1')).toBe(true);
+    expect(first.cases.every((item) => item.lineage.status === 'partial')).toBe(true);
+    expect(first.cases.every((item) => item.observed.elapsedMs.completeness === 'unavailable')).toBe(true);
+
+    const second = await memory(projectId).similarEffort(projectId, { ...query, cursor: first.page.nextCursor! });
+    expect(second.cases).toHaveLength(3);
+    expect(second.page.nextCursor).toBeNull();
+    const all = [...first.cases, ...second.cases];
+    const continued = all.filter((item) => item.runId === 'run_frobnicator_continued')
+      .sort((a, b) => a.sitting - b.sitting);
+    expect(continued.map((item) => item.sitting)).toEqual([1, 2]);
+    expect(continued[0]!.continuation.nextEpisodeId).toBe(continued[1]!.episodeId);
+    expect(continued[1]!.continuation.previousEpisodeId).toBe(continued[0]!.episodeId);
+  });
+
+  it('requires the explicit stale-evidence policy and labels retained current memory support', async () => {
+    const projectId = await newProject('MSE8');
+    const made = await mcpCall(agent.apiKey, 'create_task', {
+      projectId, title: 'Repair telemetry batch compaction', tags: ['similar-effort-test'],
+    });
+    const taskId = made.body.id as string;
+    const historicalActor = 'agt_historical_support';
+    const recorded = await memory(projectId).recordMemory(projectId, {
+      kind: 'failed_approach', statement: 'Telemetry batch compaction lost boundary markers',
+      actor: { kind: 'agent', id: historicalActor },
+    });
+    await memory(projectId).recordEpisode(projectId, baseEpisodeInput('run_telemetry_compaction', {
+      agentId: historicalActor, filesTouched: ['apps/api/src/telemetry/batch.ts'],
+      findings: [{ summary: 'Repair telemetry batch compaction with boundary markers' }],
+    }));
+    const query = {
+      taskId, title: 'Repair telemetry batch compaction',
+      anticipatedFiles: ['apps/api/src/telemetry/batch.ts'],
+    };
+    const active = await memory(projectId).similarEffort(projectId, query);
+    expect(active.cases[0]!.supportingMemories).toContainEqual(expect.objectContaining({
+      memoryId: recorded.memoryId, authority: 1, validity: 'active',
+    }));
+    await memory(projectId).transitionMemoryValidity(projectId, {
+      memoryItemId: recorded.memoryId, validity: 'stale', actor: { kind: 'system', id: null },
+    });
+    expect((await memory(projectId).similarEffort(projectId, query)).cases).toEqual([]);
+    const explicit = await memory(projectId).similarEffort(projectId, { ...query, includeStaleEvidence: true });
+    expect(explicit.cases[0]!.supportingMemories).toContainEqual(expect.objectContaining({
+      memoryId: recorded.memoryId, validity: 'stale',
+    }));
+  });
+
+  it('keeps exact branch filtering separate from preferred ranking and requires cross-branch opt-in', async () => {
+    const projectId = await newProject('MSE9');
+    const made = await mcpCall(agent.apiKey, 'create_task', {
+      projectId, title: 'Reconcile scoped cache manifests', tags: ['similar-effort-test'],
+    });
+    const taskId = made.body.id as string;
+    for (const [suffix, branch] of [['main', 'main'], ['feature', 'feature/cache']] as const) {
+      const runId = `run_scoped_${suffix}`;
+      await memory(projectId).recordEpisode(projectId, baseEpisodeInput(runId, {
+        repositoryKey: 'repo-scope', baseId: 'base-scope',
+        filesTouched: ['apps/api/src/cache/manifest.ts'],
+        findings: [{ summary: 'Reconcile scoped cache manifests deterministically' }],
+        intelligence: scopedIntelligence(projectId, runId, branch, `workflow-${suffix}`),
+      }));
+    }
+    const query = {
+      taskId, title: 'Reconcile scoped cache manifests', anticipatedFiles: ['apps/api/src/cache/manifest.ts'],
+      branch: 'main', preferBranch: 'main', baseId: 'base-scope',
+    };
+    const exact = await memory(projectId).similarEffort(projectId, query);
+    expect(exact.cases).toHaveLength(1);
+    expect(exact.cases[0]).toMatchObject({
+      branch: 'main', baseId: 'base-scope',
+      applicability: { branch: 'exact', baseId: 'exact' },
+      taskSnapshot: { taskType: 'feature', executionSpecFingerprint: 'spec-workflow-main' },
+      strategy: {
+        commissioned: { workflow: 'workflow-main' }, executed: { workflow: 'workflow-main' },
+        executedConfiguration: null, executedConfigurationCompleteness: 'unavailable',
+      },
+    });
+    const cross = await memory(projectId).similarEffort(projectId, { ...query, includeCrossBranch: true });
+    expect(cross.cases).toHaveLength(2);
+    expect(cross.cases.find((item) => item.branch === 'feature/cache')?.applicability.branch).toBe('cross_branch');
   });
 });
 

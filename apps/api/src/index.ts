@@ -1701,12 +1701,24 @@ app.post('/api/projects/:pid/memory/search', userAuth, async (c) => {
 // how a task's title/body/anticipatedFiles become ProjectMemory.similarEffort's input.
 app.post('/api/projects/:pid/memory/similar-effort', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
-  const body = await c.req.json<{ taskId?: string }>().catch(() => ({}) as { taskId?: string });
+  const body: {
+    taskId?: string; limit?: number; cursor?: string; repositoryKey?: string; branch?: string;
+    preferBranch?: string; baseId?: string; includeCrossBranch?: boolean; includeStaleEvidence?: boolean;
+  } = await c.req.json().catch(() => ({}));
   if (!body.taskId) return c.json({ error: 'taskId required' }, 400);
   const task = await c.env.DB.prepare('SELECT id, title, body, execution_spec AS executionSpec FROM tasks WHERE (id = ? OR key = ?) AND project_id = ?')
     .bind(body.taskId, body.taskId, pid).first<{ id: string; title: string; body: string | null; executionSpec: string | null }>();
   if (!task) return c.json({ error: 'not found' }, 404);
-  const result = await loadPriorEffort(c.env, pid, task);
+  let result;
+  try {
+    result = await loadPriorEffort(c.env, pid, task, {
+      limit: body.limit, cursor: body.cursor, repositoryKey: body.repositoryKey,
+      branch: body.branch, preferBranch: body.preferBranch, baseId: body.baseId,
+      includeCrossBranch: body.includeCrossBranch, includeStaleEvidence: body.includeStaleEvidence,
+    });
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+  }
   if (!result) return c.json({ error: 'project memory unavailable' }, 502);
   return c.json(result);
 });

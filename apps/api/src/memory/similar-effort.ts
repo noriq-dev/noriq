@@ -11,7 +11,10 @@
 // second one on its own. `duplicateWarnings`' gate is the one and only place that rule lives —
 // nothing upstream (ProjectMemory's candidate gathering) or downstream (mcp.ts's presentation)
 // re-implements it.
-import type { EpisodeLandingOutcome, MetricCompleteness, ProjectIntelligenceEpisode, RunModelUsage } from '@noriq-dev/shared';
+import type {
+  ConfigurationFingerprint, EpisodeLandingOutcome, ExecutionSpec, MetricCompleteness,
+  ProjectIntelligenceEpisode, RunModelUsage, StrategyCoordinate,
+} from '@noriq-dev/shared';
 import { rankCandidates, type RetrievalHit, type RetrievalStage } from './retrieval';
 
 export const SIMILAR_EFFORT_RETRIEVAL_VERSION = 'similar-effort-v1';
@@ -144,6 +147,17 @@ export interface EffortCandidate {
   baseId?: string | null;
   createdAt?: string;
   intelligence?: ProjectIntelligenceEpisode | null;
+  supportingMemories?: PriorEffortMemorySupport[];
+}
+
+export interface PriorEffortMemorySupport {
+  memoryId: string;
+  kind: string;
+  authority: number;
+  validity: 'active' | 'stale' | 'invalid';
+  repositoryKey: string | null;
+  branch: string | null;
+  baseId: string | null;
 }
 
 export interface PriorEffortObservation {
@@ -164,7 +178,13 @@ export interface PriorEffortCase {
   repositoryKey: string | null;
   branch: string | null;
   baseId: string | null;
+  capturedAt: string | null;
   validity: 'historical_episode';
+  applicability: {
+    validity: 'historical_episode';
+    branch: 'exact' | 'preferred' | 'cross_branch' | 'unknown' | 'unspecified';
+    baseId: 'exact' | 'different' | 'unknown' | 'unspecified';
+  };
   lineage: ProjectIntelligenceEpisode['identity']['lineage'];
   retrieval: {
     version: typeof SIMILAR_EFFORT_RETRIEVAL_VERSION;
@@ -173,6 +193,26 @@ export interface PriorEffortCase {
     support: SupportEntry[];
   };
   outcome: { run: string; landing: EpisodeLandingOutcome };
+  taskSnapshot: ProjectIntelligenceEpisode['preExecution']['task'] | null;
+  strategy: {
+    requested: StrategyCoordinate | null;
+    commissioned: StrategyCoordinate | null;
+    executed: StrategyCoordinate | null;
+    commissionedSpec: ExecutionSpec | null;
+    executedSpec: ExecutionSpec | null;
+    commissionedConfiguration: ConfigurationFingerprint[];
+    executedConfiguration: null;
+    executedConfigurationCompleteness: 'unavailable';
+  };
+  executionPath: Array<{
+    executionId: string | null;
+    kind: string;
+    role: string;
+    stage: string | null;
+    elapsedMs: PriorEffortObservation;
+  }>;
+  continuation: { previousEpisodeId: string | null; nextEpisodeId: string | null };
+  supportingMemories: PriorEffortMemorySupport[];
   observed: {
     filesTouched: PriorEffortObservation;
     tokens: PriorEffortObservation;
@@ -352,7 +392,11 @@ function completeMetric(metric: { status: string; value: number | null } | undef
 /** Enrich a warning only after the two-support gate has passed. Outcome fields are read from the
  * prior terminal episode; absent legacy telemetry remains unavailable/partial and never becomes
  * a numeric zero merely because the old skeleton used one on disk. */
-export function priorEffortCase(candidate: EffortCandidate, warning: DuplicateWarning): PriorEffortCase {
+export function priorEffortCase(
+  candidate: EffortCandidate,
+  warning: DuplicateWarning,
+  caller: { branch?: string; preferBranch?: string; baseId?: string } = {},
+): PriorEffortCase {
   const intelligence = candidate.intelligence ?? null;
   const usage = intelligence?.execution.observedModelUsage;
   let tokens: PriorEffortObservation = observation(null, usage?.status ?? 'unavailable');
@@ -368,6 +412,14 @@ export function priorEffortCase(candidate: EffortCandidate, warning: DuplicateWa
       : observation(observedCost, usage.status);
   }
   const roles = intelligence?.execution.stages.map((stage) => stage.role) ?? [];
+  const branch = intelligence?.identity.branch ?? null;
+  const baseId = intelligence?.identity.baseId ?? candidate.baseId ?? null;
+  const branchApplicability = !caller.branch && !caller.preferBranch ? 'unspecified' as const
+    : branch == null ? 'unknown' as const
+      : caller.branch ? branch === caller.branch ? 'exact' as const : 'cross_branch' as const
+        : branch === caller.preferBranch ? 'preferred' as const : 'cross_branch' as const;
+  const baseApplicability = !caller.baseId ? 'unspecified' as const
+    : baseId == null ? 'unknown' as const : baseId === caller.baseId ? 'exact' as const : 'different' as const;
   return {
     episodeId: candidate.episodeId,
     taskId: candidate.taskId,
@@ -377,9 +429,11 @@ export function priorEffortCase(candidate: EffortCandidate, warning: DuplicateWa
     executionId: intelligence?.identity.executionId ?? null,
     orchestrationId: intelligence?.identity.orchestrationId ?? null,
     repositoryKey: intelligence?.identity.repositoryKey ?? candidate.repositoryKey ?? null,
-    branch: intelligence?.identity.branch ?? null,
-    baseId: intelligence?.identity.baseId ?? candidate.baseId ?? null,
+    branch,
+    baseId,
+    capturedAt: intelligence?.sources.capturedAt ?? candidate.createdAt ?? null,
     validity: 'historical_episode',
+    applicability: { validity: 'historical_episode', branch: branchApplicability, baseId: baseApplicability },
     lineage: intelligence?.identity.lineage ?? {
       status: 'partial', missing: ['legacy'], reason: 'episode predates analytics lineage capture',
     },
@@ -390,6 +444,25 @@ export function priorEffortCase(candidate: EffortCandidate, warning: DuplicateWa
       support: warning.support,
     },
     outcome: { run: candidate.outcome, landing: candidate.landingOutcome },
+    taskSnapshot: intelligence?.preExecution.task ?? null,
+    strategy: {
+      requested: intelligence?.preExecution.requestedStrategy ?? null,
+      commissioned: intelligence?.preExecution.commissionedStrategy ?? null,
+      executed: intelligence?.execution.executedStrategy ?? null,
+      commissionedSpec: intelligence?.preExecution.commissionedSpec ?? null,
+      executedSpec: intelligence?.execution.executedSpec ?? null,
+      commissionedConfiguration: intelligence?.preExecution.configuration ?? [],
+      // PLNR-291 captures late executed configuration, but the v1 episode contract retained
+      // only its executed strategy/spec. Keep that loss explicit instead of copying commission.
+      executedConfiguration: null,
+      executedConfigurationCompleteness: 'unavailable',
+    },
+    executionPath: (intelligence?.execution.stages ?? []).map((stage) => ({
+      executionId: stage.executionId, kind: stage.kind, role: stage.role, stage: stage.stage,
+      elapsedMs: completeMetric(stage.elapsedMs),
+    })),
+    continuation: { previousEpisodeId: null, nextEpisodeId: null },
+    supportingMemories: candidate.supportingMemories ?? [],
     observed: {
       filesTouched: intelligence
         ? completeMetric(intelligence.execution.changes.changedFiles)

@@ -272,8 +272,9 @@ export interface ProjectMemoryStub {
     input: {
       taskId: string; title: string; body?: string | null; anticipatedFiles?: string[]; limit?: number;
       repositoryKey?: string; branch?: string; preferBranch?: string; baseId?: string;
+      cursor?: string; includeCrossBranch?: boolean; includeStaleEvidence?: boolean;
     },
-  ): Promise<{ warnings: DuplicateWarning[]; cases: PriorEffortCase[]; summary: EffortSummary; consideredCount: number }>;
+  ): Promise<SimilarEffortResult>;
   /** PLNR-258: named graph-query primitives — see memory/graph-queries.ts for the shared
    *  completeness-marker contract every one of these returns. */
   dependencyNeighborhood(
@@ -370,7 +371,14 @@ export function searchHitToEvidenceItem(hit: RankedHit): EvidenceFrameItem | nul
   };
 }
 
-export type SimilarEffortResult = { warnings: DuplicateWarning[]; summary: EffortSummary; consideredCount: number };
+export type SimilarEffortResult = {
+  warnings: DuplicateWarning[];
+  cases: PriorEffortCase[];
+  summary: EffortSummary;
+  consideredCount: number;
+  page: { limit: number; total: number; nextCursor: string | null };
+  coverage: { complete: boolean; candidatesConsidered: number; eligibleCases: number; reasons: string[] };
+};
 
 // PLNR-270 (§13): `whatWasAttempted`/`whatFailed`/`whatRemainsUncertain` are past-agent prose —
 // untrusted the same way a memory statement is — and `priorEffort` hands them to an agent at the
@@ -409,15 +417,22 @@ export async function loadPriorEffort(
   env: Env,
   projectId: string,
   task: { id: string; title: string; body: string | null; executionSpec: string | null },
+  options: {
+    limit?: number; cursor?: string; repositoryKey?: string; branch?: string; preferBranch?: string;
+    baseId?: string; includeCrossBranch?: boolean; includeStaleEvidence?: boolean;
+  } = {},
 ): Promise<(SimilarEffortResult & { evidenceFrame: EvidenceFrameResult }) | null> {
   try {
     const stored = readExecutionSpec(task.executionSpec, task.id);
     const anticipatedFiles = stored.spec?.anticipatedFiles?.map((f) => f.path) ?? [];
     const stub = env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)) as unknown as ProjectMemoryStub;
-    const result = await stub.similarEffort(projectId, { taskId: task.id, title: task.title, body: task.body, anticipatedFiles });
+    const result = await stub.similarEffort(projectId, {
+      taskId: task.id, title: task.title, body: task.body, anticipatedFiles, ...options,
+    });
     const evidenceFrame = renderEvidenceFrame(result.warnings.map(duplicateWarningToEvidenceItem));
     return { ...result, evidenceFrame };
   } catch (err) {
+    if (options.cursor && String(err).includes('similar-effort cursor')) throw err;
     console.warn(`similarEffort lookup failed for task ${task.id} in project ${projectId}: ${String(err)}`);
     return null;
   }
