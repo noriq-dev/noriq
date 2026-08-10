@@ -22,6 +22,7 @@ afterEach(() => {
   act(() => root?.unmount());
   container?.remove();
   root = null;
+  vi.restoreAllMocks();
 });
 
 describe('Dropdown', () => {
@@ -114,6 +115,64 @@ describe('Dropdown', () => {
     expect(document.getElementById(trigger.getAttribute('aria-describedby')!)?.textContent).toBe('Pick a runner');
     act(() => trigger.click());
     expect(container.textContent).toContain('No runners online.');
+  });
+
+  it('opens above the trigger when the preferred bottom side would leave the viewport', () => {
+    vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(768);
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.classList.contains('dd-root')) {
+        return { top: 700, right: 300, bottom: 730, left: 100, width: 200, height: 30, x: 100, y: 700, toJSON: () => ({}) };
+      }
+      if (this.classList.contains('dd-menu')) {
+        return { top: 738, right: 400, bottom: 938, left: 100, width: 300, height: 200, x: 100, y: 738, toJSON: () => ({}) };
+      }
+      return { top: 0, right: 0, bottom: 0, left: 0, width: 0, height: 0, x: 0, y: 0, toJSON: () => ({}) };
+    });
+
+    render(<Dropdown
+      label="Model"
+      value="gpt-oss"
+      options={[
+        { value: 'gpt-oss', label: 'GPT-OSS 120B' },
+        { value: 'codex', label: 'Codex' },
+      ]}
+      onChange={() => {}}
+    />);
+
+    const trigger = container.querySelector<HTMLButtonElement>('[aria-label="Model"]')!;
+    act(() => trigger.click());
+    const menu = container.querySelector<HTMLElement>('.dd-menu')!;
+
+    expect(menu.dataset.side).toBe('top');
+    expect(menu.style.bottom).toBe('calc(100% + 8px)');
+    expect(menu.style.top).toBe('');
+  });
+
+  it('keeps the preferred bottom side when the menu fits in the viewport', () => {
+    vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(768);
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.classList.contains('dd-root')) {
+        return { top: 100, right: 300, bottom: 130, left: 100, width: 200, height: 30, x: 100, y: 100, toJSON: () => ({}) };
+      }
+      if (this.classList.contains('dd-menu')) {
+        return { top: 138, right: 400, bottom: 338, left: 100, width: 300, height: 200, x: 100, y: 138, toJSON: () => ({}) };
+      }
+      return { top: 0, right: 0, bottom: 0, left: 0, width: 0, height: 0, x: 0, y: 0, toJSON: () => ({}) };
+    });
+
+    render(<Dropdown
+      label="Model"
+      value="gpt-oss"
+      options={[{ value: 'gpt-oss', label: 'GPT-OSS 120B' }]}
+      onChange={() => {}}
+    />);
+
+    act(() => container.querySelector<HTMLButtonElement>('[aria-label="Model"]')!.click());
+    const menu = container.querySelector<HTMLElement>('.dd-menu')!;
+
+    expect(menu.dataset.side).toBe('bottom');
+    expect(menu.style.top).toBe('calc(100% + 8px)');
+    expect(menu.style.bottom).toBe('');
   });
 
   it('backs the existing Select API with the same Dropdown behavior', () => {

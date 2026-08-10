@@ -1,6 +1,6 @@
 // Dropdown.tsx — the one dropdown for Noriq.
 import {
-  useEffect, useId, useMemo, useRef, useState,
+  useEffect, useId, useLayoutEffect, useMemo, useRef, useState,
   type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type ReactNode,
 } from 'react';
 
@@ -47,6 +47,8 @@ export interface DropdownProps<T extends string = string> {
 
 /** Options count at which the filter box appears (spec §3). */
 const FILTER_THRESHOLD = 8;
+const MENU_GAP = 8;
+const VIEWPORT_PADDING = 8;
 
 const MENU: CSSProperties = {
   position: 'absolute', zIndex: 70, padding: 6,
@@ -115,8 +117,10 @@ export function Dropdown<T extends string = string>({
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(-1);
+  const [resolvedSide, setResolvedSide] = useState(side);
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const filterRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const listId = useId();
@@ -174,6 +178,40 @@ export function Dropdown<T extends string = string>({
     }
   }, [disabled, loading]);
 
+  useLayoutEffect(() => {
+    if (!open) return;
+
+    const updatePlacement = () => {
+      const root = rootRef.current;
+      const menu = menuRef.current;
+      if (!root || !menu) return;
+
+      const rootRect = root.getBoundingClientRect();
+      const menuHeight = menu.getBoundingClientRect().height;
+      const belowSpace = Math.max(0, window.innerHeight - rootRect.bottom - MENU_GAP - VIEWPORT_PADDING);
+      const aboveSpace = Math.max(0, rootRect.top - MENU_GAP - VIEWPORT_PADDING);
+      const preferredSpace = side === 'bottom' ? belowSpace : aboveSpace;
+      const oppositeSpace = side === 'bottom' ? aboveSpace : belowSpace;
+      const nextSide = menuHeight > preferredSpace && oppositeSpace > preferredSpace
+        ? side === 'bottom' ? 'top' : 'bottom'
+        : side;
+
+      setResolvedSide((current) => current === nextSide ? current : nextSide);
+    };
+
+    updatePlacement();
+    window.addEventListener('resize', updatePlacement);
+    window.addEventListener('scroll', updatePlacement, true);
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(updatePlacement);
+    if (observer) observer.observe(menuRef.current!);
+
+    return () => {
+      window.removeEventListener('resize', updatePlacement);
+      window.removeEventListener('scroll', updatePlacement, true);
+      observer?.disconnect();
+    };
+  }, [open, side, visible.length]);
+
   const commit = (option: DropdownOption<T>) => {
     if (option.disabled) return;
     onChange(option.value);
@@ -226,7 +264,7 @@ export function Dropdown<T extends string = string>({
   }, []);
 
   return (
-    <div ref={rootRef} style={{ position: 'relative', flex: 'none', width: variant === 'field' ? '100%' : undefined, ...containerStyle }}>
+    <div ref={rootRef} className="dd-root" style={{ position: 'relative', flex: 'none', width: variant === 'field' ? '100%' : undefined, ...containerStyle }}>
       <button
         ref={triggerRef}
         type="button"
@@ -272,11 +310,14 @@ export function Dropdown<T extends string = string>({
 
       {open && (
         <div
+          ref={menuRef}
           className="dd-menu"
+          data-side={resolvedSide}
           style={{
             ...MENU,
+            animation: `${resolvedSide === 'top' ? 'pl-stream-up' : 'pl-stream'} .25s ease both`,
             width: menuWidth ?? (variant === 'field' ? '100%' : spec.menuWidth),
-            [side === 'top' ? 'bottom' : 'top']: 'calc(100% + 8px)',
+            [resolvedSide === 'top' ? 'bottom' : 'top']: `calc(100% + ${MENU_GAP}px)`,
             [align === 'end' ? 'right' : 'left']: 0,
           }}
           onKeyDown={onKeyDown}
