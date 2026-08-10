@@ -15,7 +15,9 @@ export type AgentRosterOptions = {
   scopeAll?: boolean;
   kind?: 'agent' | 'copilot';
   runnerId?: string;
+  retireReason?: string;
   lifecycle?: AgentRosterLifecycle;
+  view?: 'active' | 'dormant' | 'history';
   includeHistory?: boolean;
   activeAfter?: string;
   activeBefore?: string;
@@ -125,6 +127,7 @@ export async function listAgentRoster(env: Env, options: AgentRosterOptions) {
   const filterBinds: unknown[] = [];
   if (activeAfter) { filters.push('activityAt >= ?'); filterBinds.push(activeAfter); }
   if (activeBefore) { filters.push('activityAt < ?'); filterBinds.push(activeBefore); }
+  if (options.retireReason) { filters.push('retireReason = ?'); filterBinds.push(options.retireReason); }
   const filterSql = filters.length ? ` WHERE ${filters.join(' AND ')}` : '';
 
   const countRows = await env.DB.prepare(
@@ -138,6 +141,10 @@ export async function listAgentRoster(env: Env, options: AgentRosterOptions) {
   if (options.lifecycle) {
     pageFilters.push('lifecycle = ?');
     pageBinds.push(options.lifecycle);
+  } else if (options.view === 'dormant') {
+    pageFilters.push("lifecycle = 'dormant'");
+  } else if (options.view === 'history') {
+    pageFilters.push("lifecycle IN ('retired','archived','revoked')");
   } else if (!options.includeHistory) {
     pageFilters.push("lifecycle IN ('live','recent')");
   }

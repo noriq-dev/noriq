@@ -46,7 +46,7 @@ export function PlansView({ store }: { store: AppStore }) {
   const loadDispatchState = async () => {
     if (!currentPid) return;
     try {
-      const [d, r] = await Promise.all([api.planDispatches(currentPid), api.runners()]);
+      const [d, r] = await Promise.all([api.planDispatches(currentPid), api.runners({ view: 'active', limit: 100 })]);
       setDispatches(d.dispatches);
       setRunners(r.runners);
     } catch {

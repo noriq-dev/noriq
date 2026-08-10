@@ -54,6 +54,7 @@ import { sweepPendingEpisodeJobs } from './memory/episodes';
 import { classifyAgentLifecycle } from './lib/agent-lifecycle';
 import { agentLifecycleSweepConfig, sweepAgentLifecycle, type AgentLifecycleCursor } from './lib/agent-lifecycle-sweep';
 import { AGENT_LIFECYCLES, listAgentRoster, type AgentRosterLifecycle } from './lib/agent-roster';
+import { listRunnerRoster, RUNNER_HEARTBEAT_TTL_MS, RUNNER_LIFECYCLES, type RunnerRosterLifecycle } from './lib/runner-roster';
 import {
   AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget,
   ORCHESTRATION_CAPABILITY, RunnerProtocolCapability,
@@ -2761,10 +2762,17 @@ app.get('/api/agents', userAuth, async (c) => {
   const limitRaw = c.req.query('limit');
   const limit = limitRaw === undefined ? undefined : Number(limitRaw);
   if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) return c.json({ error: 'limit must be a positive integer' }, 400);
+  const view = c.req.query('view');
+  if (view !== undefined && view !== 'active' && view !== 'dormant' && view !== 'history') {
+    return c.json({ error: 'view must be active, dormant, or history' }, 400);
+  }
   const rosterOptions = {
     kind: kind as 'agent' | 'copilot' | undefined,
+    ownerUserId: c.req.query('ownerUserId'),
     runnerId: c.req.query('runnerId'),
+    retireReason: c.req.query('retireReason'),
     lifecycle: lifecycleRaw as AgentRosterLifecycle | undefined,
+    view: view as 'active' | 'dormant' | 'history' | undefined,
     includeHistory: c.req.query('includeHistory') === 'true',
     activeAfter: c.req.query('activeAfter'),
     activeBefore: c.req.query('activeBefore'),
@@ -2773,10 +2781,11 @@ app.get('/api/agents', userAuth, async (c) => {
   };
   if (kind === 'copilot') {
     const isAdmin = c.var.user!.role === 'admin';
+    if (rosterOptions.ownerUserId && !isAdmin) return c.json({ error: 'owner filter requires administrator scope' }, 403);
     try {
       return c.json(await listAgentRoster(c.env, {
         ...rosterOptions,
-        ownerUserId: isAdmin ? undefined : c.var.user!.id,
+        ownerUserId: isAdmin ? rosterOptions.ownerUserId : c.var.user!.id,
         scopeAll: isAdmin,
       }));
     } catch (error) {
@@ -2790,6 +2799,7 @@ app.get('/api/agents', userAuth, async (c) => {
   } else if (c.var.user!.role !== 'admin') {
     return c.json({ agents: [] });
   }
+  if (rosterOptions.ownerUserId && c.var.user!.role !== 'admin') return c.json({ error: 'owner filter requires administrator scope' }, 403);
   try {
     return c.json(await listAgentRoster(c.env, {
       ...rosterOptions,
@@ -2820,8 +2830,93 @@ app.get('/api/agents/:aid/events', userAuth, async (c) => {
 
 app.post('/api/agents/:aid/revoke', userAuth, async (c) => {
   if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
-  await c.env.DB.prepare("UPDATE agents SET status = 'revoked' WHERE id = ?").bind(c.req.param('aid')!).run();
+  const aid = c.req.param('aid')!;
+  const actor = await c.env.DB.prepare(
+    'SELECT id, status, actor_class AS actorClass, oauth_token_id AS tokenId FROM agents WHERE id = ?',
+  ).bind(aid).first<{ id: string; status: string; actorClass: string; tokenId: string | null }>();
+  if (!actor) return c.json({ error: 'agent not found' }, 404);
+  const now = nowIso();
+  const statements = [
+    c.env.DB.prepare(
+      `UPDATE agents SET status = 'revoked', retired_at = COALESCE(retired_at, ?),
+                         retire_reason = COALESCE(retire_reason, 'administrator_revoked'),
+                         lifecycle_updated_at = ? WHERE id = ?`,
+    ).bind(now, now, aid),
+    c.env.DB.prepare(
+      `UPDATE agent_presences SET state = 'ended', ended_at = COALESCE(ended_at, ?),
+                                  end_reason = COALESCE(end_reason, 'administrator_revoked'), last_seen_at = ?
+        WHERE actor_id = ? AND ended_at IS NULL`,
+    ).bind(now, now, aid),
+  ];
+  // A session Copilot is one conversation beneath a connection. Revoking it must not revoke the
+  // user's whole OAuth authorization; a Runner agent or connection Copilot is credential-level.
+  if (actor.actorClass !== 'session_copilot') statements.push(c.env.DB.prepare(
+    `UPDATE oauth_tokens SET revoked_at = COALESCE(revoked_at, ?)
+      WHERE id = ? OR agent_id = ? OR copilot_id = ?`,
+  ).bind(now, actor.tokenId, aid, aid));
+  if (actor.status !== 'revoked') statements.push(c.env.DB.prepare(
+    `INSERT INTO agent_lifecycle_events
+       (id, sweep_id, subject_kind, subject_id, actor_class, from_state, to_state, reason, evidence_at, created_at)
+     VALUES (?, 'manual', 'actor', ?, ?, 'active', 'revoked', 'administrator_revoked', ?, ?)`,
+  ).bind(newId('ale'), aid, actor.actorClass, now, now));
+  await c.env.DB.batch(statements);
   return c.json({ ok: true });
+});
+
+app.post('/api/agents/:aid/archive', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  const aid = c.req.param('aid')!;
+  const actor = await c.env.DB.prepare(
+    `SELECT id, status, actor_class AS actorClass, retired_at AS retiredAt, archived_at AS archivedAt,
+            EXISTS (SELECT 1 FROM claims cl WHERE cl.agent_id = agents.id AND cl.released_at IS NULL AND cl.expires_at > ?) AS liveClaim,
+            EXISTS (SELECT 1 FROM file_locks l WHERE l.agent_id = agents.id AND l.released_at IS NULL AND l.expires_at > ?) AS liveLock,
+            EXISTS (SELECT 1 FROM runs r WHERE r.agent_id = agents.id AND r.status IN ('queued','dispatched','running','blocked')) AS liveRun,
+            EXISTS (SELECT 1 FROM signals s WHERE s.agent_id = agents.id AND s.status = 'open' AND s.blocking = 1) AS openGate,
+            EXISTS (SELECT 1 FROM steers st WHERE st.agent_id = agents.id AND st.acked_at IS NULL
+                     AND COALESCE(st.delivered_via, '') != 'dropped') AS pendingSteer,
+            EXISTS (SELECT 1 FROM agents child WHERE child.parent_agent_id = agents.id
+                     AND child.retired_at IS NULL AND child.status != 'revoked') AS liveChild
+       FROM agents WHERE id = ?`,
+  ).bind(nowIso(), nowIso(), aid).first<{
+    id: string; status: string; actorClass: string; retiredAt: string | null; archivedAt: string | null;
+    liveClaim: number; liveLock: number; liveRun: number; openGate: number; pendingSteer: number; liveChild: number;
+  }>();
+  if (!actor) return c.json({ error: 'agent not found' }, 404);
+  if (actor.archivedAt) return c.json({ ok: true, archived: true });
+  if (!actor.retiredAt && actor.status !== 'revoked') return c.json({ error: 'agent must be retired or revoked before it can be archived' }, 409);
+  if (actor.liveClaim || actor.liveLock || actor.liveRun || actor.openGate || actor.pendingSteer || actor.liveChild) {
+    return c.json({ error: 'agent still has protected live work and cannot be archived' }, 409);
+  }
+  const now = nowIso();
+  await c.env.DB.batch([
+    c.env.DB.prepare('UPDATE agents SET archived_at = ?, lifecycle_updated_at = ? WHERE id = ? AND archived_at IS NULL').bind(now, now, aid),
+    c.env.DB.prepare(
+      `INSERT INTO agent_lifecycle_events
+         (id, sweep_id, subject_kind, subject_id, actor_class, from_state, to_state, reason, evidence_at, created_at)
+       VALUES (?, 'manual', 'actor', ?, ?, ?, 'archived', 'administrator_archived', ?, ?)`,
+    ).bind(newId('ale'), aid, actor.actorClass, actor.status === 'revoked' ? 'revoked' : 'retired', actor.retiredAt ?? now, now),
+  ]);
+  return c.json({ ok: true, archived: true });
+});
+
+app.post('/api/agents/:aid/restore-visibility', userAuth, async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
+  const aid = c.req.param('aid')!;
+  const actor = await c.env.DB.prepare(
+    'SELECT status, actor_class AS actorClass, archived_at AS archivedAt FROM agents WHERE id = ?',
+  ).bind(aid).first<{ status: string; actorClass: string; archivedAt: string | null }>();
+  if (!actor) return c.json({ error: 'agent not found' }, 404);
+  if (!actor.archivedAt) return c.json({ ok: true, archived: false, note: 'visibility was already restored; retirement and revocation remain unchanged' });
+  const now = nowIso();
+  await c.env.DB.batch([
+    c.env.DB.prepare('UPDATE agents SET archived_at = NULL, lifecycle_updated_at = ? WHERE id = ? AND archived_at IS NOT NULL').bind(now, aid),
+    c.env.DB.prepare(
+      `INSERT INTO agent_lifecycle_events
+         (id, sweep_id, subject_kind, subject_id, actor_class, from_state, to_state, reason, evidence_at, created_at)
+       VALUES (?, 'manual', 'actor', ?, ?, 'archived', ?, 'visibility_restored', ?, ?)`,
+    ).bind(newId('ale'), aid, actor.actorClass, actor.status === 'revoked' ? 'revoked' : 'retired', actor.archivedAt, now),
+  ]);
+  return c.json({ ok: true, archived: false, note: 'visibility restored; retirement and revocation remain unchanged' });
 });
 
 // --- runners: the execution plane (RUN-5) -----------------------------------
@@ -2832,8 +2927,6 @@ app.post('/api/agents/:aid/revoke', userAuth, async (c) => {
 
 // A runner is treated offline once its heartbeat is older than this (≈3 missed
 // 30s beats), derived on read so the panel is correct even without a sweeper.
-const RUNNER_HEARTBEAT_TTL_MS = 90_000;
-
 const RegisterRunnerBody = z.object({
   runnerId: z.string().optional(), // present on re-register (reconnect)
   label: z.string().min(1),
@@ -3071,19 +3164,67 @@ app.post('/api/runners/:id/heartbeat', agentAuth, async (c) => {
 });
 
 app.get('/api/runners', userAuth, async (c) => {
-  // A user sees their own runners; an admin may see all with ?all=1.
+  // A user sees their own runners; an admin may open the instance-wide lifecycle inventory.
   const all = c.req.query('all') === '1' && c.var.user!.role === 'admin';
-  const stmt = all
-    ? c.env.DB.prepare('SELECT * FROM runners ORDER BY created_at DESC')
-    : c.env.DB.prepare('SELECT * FROM runners WHERE owner_user_id = ? ORDER BY created_at DESC').bind(c.var.user!.id);
-  const { results } = await stmt.all<Record<string, unknown>>();
-  return c.json({ runners: results.map(runnerView) });
+  const lifecycleRaw = c.req.query('lifecycle');
+  if (lifecycleRaw !== undefined && !RUNNER_LIFECYCLES.includes(lifecycleRaw as RunnerRosterLifecycle)) {
+    return c.json({ error: `lifecycle must be one of: ${RUNNER_LIFECYCLES.join(', ')}` }, 400);
+  }
+  const limitRaw = c.req.query('limit');
+  const limit = limitRaw === undefined ? undefined : Number(limitRaw);
+  if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) return c.json({ error: 'limit must be a positive integer' }, 400);
+  const view = c.req.query('view');
+  if (view !== undefined && view !== 'active' && view !== 'dormant' && view !== 'history') {
+    return c.json({ error: 'view must be active, dormant, or history' }, 400);
+  }
+  const projectId = c.req.query('projectId');
+  if (projectId && !all && !(await userCanAccessProject(c.env, c.var.user!.id, projectId))) {
+    return c.json({ error: 'project not found' }, 404);
+  }
+  if (c.req.query('ownerUserId') && !all) return c.json({ error: 'owner filter requires administrator scope' }, 403);
+  try {
+    const roster = await listRunnerRoster(c.env, {
+      ownerUserId: all ? c.req.query('ownerUserId') : c.var.user!.id,
+      scopeAll: all,
+      projectId,
+      lifecycle: lifecycleRaw as RunnerRosterLifecycle | undefined,
+      view: view as 'active' | 'dormant' | 'history' | undefined,
+      retireReason: c.req.query('retireReason'),
+      activeAfter: c.req.query('activeAfter'),
+      activeBefore: c.req.query('activeBefore'),
+      cursor: c.req.query('cursor'),
+      limit,
+    });
+    return c.json({
+      ...roster,
+      runners: roster.runners.map((row) => {
+        const raw = row as Record<string, unknown> & typeof row;
+        return {
+          ...runnerView(raw),
+          lifecycle: row.lifecycle,
+          activityAt: row.activityAt,
+          retiredAt: (raw.retired_at as string | null) ?? null,
+          retireReason: (raw.retire_reason as string | null) ?? null,
+          archivedAt: (raw.archived_at as string | null) ?? null,
+          ownerName: (raw.ownerName as string | null) ?? null,
+          ownerUserId: (raw.ownerUserId as string | null) ?? null,
+          agentCount: Number(row.agentCount),
+          liveRuns: Number(row.liveRuns),
+          eligiblePurge: row.eligiblePurge,
+        };
+      }),
+    });
+  } catch (error) {
+    return c.json({ error: String(error instanceof Error ? error.message : error) }, 400);
+  }
 });
 
-/** The owner's runner, or null. Every lifecycle route below is owner-scoped through this. */
+/** The owner's runner, or any Runner for an administrator. Every lifecycle route below uses this. */
 async function ownedRunner(c: Context<AppContext>, id: string) {
-  return c.env.DB.prepare('SELECT * FROM runners WHERE id = ? AND owner_user_id = ?')
-    .bind(id, c.var.user!.id).first<Record<string, unknown>>();
+  return c.var.user!.role === 'admin'
+    ? c.env.DB.prepare('SELECT * FROM runners WHERE id = ?').bind(id).first<Record<string, unknown>>()
+    : c.env.DB.prepare('SELECT * FROM runners WHERE id = ? AND owner_user_id = ?')
+      .bind(id, c.var.user!.id).first<Record<string, unknown>>();
 }
 
 /**
@@ -3168,6 +3309,48 @@ app.post('/api/runners/:id/offboard', userAuth, async (c) => {
       : { warning: 'this runner predates token tracking — it is marked offboarded, but no token was revoked. Revoke its connection in Settings.' }),
     note: 'Noriq access is severed. This does not remove the daemon’s local repo access — stop the process on that machine too.',
   });
+});
+
+app.post('/api/runners/:id/archive', userAuth, async (c) => {
+  const id = c.req.param('id')!;
+  const runner = await ownedRunner(c, id);
+  if (!runner) return c.json({ error: 'runner not found' }, 404);
+  if (runner.archived_at) return c.json({ ok: true, archived: true });
+  if (!runner.retired_at && !runner.offboarded_at) {
+    return c.json({ error: 'Runner must be retired or offboarded before it can be archived' }, 409);
+  }
+  const liveRuns = await c.env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM runs WHERE runner_id = ? AND status IN ('queued','dispatched','running','blocked')",
+  ).bind(id).first<{ n: number }>();
+  if (liveRuns?.n) return c.json({ error: 'Runner still has live runs and cannot be archived' }, 409);
+  const now = nowIso();
+  await c.env.DB.batch([
+    c.env.DB.prepare('UPDATE runners SET archived_at = ? WHERE id = ? AND archived_at IS NULL').bind(now, id),
+    c.env.DB.prepare(
+      `INSERT INTO agent_lifecycle_events
+         (id, sweep_id, subject_kind, subject_id, from_state, to_state, reason, evidence_at, created_at)
+       VALUES (?, 'manual', 'runner', ?, 'retired', 'archived', 'operator_archived', ?, ?)`,
+    ).bind(newId('ale'), id, (runner.retired_at as string | null) ?? now, now),
+  ]);
+  return c.json({ ok: true, archived: true });
+});
+
+app.post('/api/runners/:id/restore-visibility', userAuth, async (c) => {
+  const id = c.req.param('id')!;
+  const runner = await ownedRunner(c, id);
+  if (!runner) return c.json({ error: 'runner not found' }, 404);
+  const archivedAt = (runner.archived_at as string | null) ?? null;
+  if (!archivedAt) return c.json({ ok: true, archived: false, note: 'visibility was already restored; retirement and offboarding remain unchanged' });
+  const now = nowIso();
+  await c.env.DB.batch([
+    c.env.DB.prepare('UPDATE runners SET archived_at = NULL WHERE id = ? AND archived_at IS NOT NULL').bind(id),
+    c.env.DB.prepare(
+      `INSERT INTO agent_lifecycle_events
+         (id, sweep_id, subject_kind, subject_id, from_state, to_state, reason, evidence_at, created_at)
+       VALUES (?, 'manual', 'runner', ?, 'archived', 'retired', 'visibility_restored', ?, ?)`,
+    ).bind(newId('ale'), id, archivedAt, now),
+  ]);
+  return c.json({ ok: true, archived: false, note: 'visibility restored; retirement and offboarding remain unchanged' });
 });
 
 /** Re-label. Cosmetic, but it is how a human tells two boxes apart. */

@@ -125,6 +125,13 @@ describe('live-first paginated agent rosters (PLNR-364)', () => {
 
     const after = await roster(`&kind=agent&includeHistory=true&activeAfter=${encodeURIComponent(yesterday)}`);
     expect(after.agents.map((actor) => actor.id)).toEqual(['agt_roster_live', 'agt_roster_recent']);
+
+    const dormant = await roster('&kind=agent&view=dormant');
+    expect(dormant.agents.map((actor) => actor.id)).toEqual(['agt_roster_dormant']);
+    const history = await roster('&kind=agent&view=history&limit=25');
+    expect(history.agents).toHaveLength(25);
+    expect(history.agents.every((actor) => ['retired', 'archived', 'revoked'].includes(actor.lifecycle))).toBe(true);
+    expect(history.page.hasMore).toBe(true);
   });
 
   it('keeps MCP agents compatibility while exposing lifecycle counts and pagination', async () => {
@@ -158,5 +165,32 @@ describe('live-first paginated agent rosters (PLNR-364)', () => {
       headers: { Cookie: cookie },
     });
     expect(badLifecycle.status).toBe(400);
+    const badView = await SELF.fetch(`https://noriq.test/api/agents?projectId=${projectId}&view=everything`, {
+      headers: { Cookie: cookie },
+    });
+    expect(badView.status).toBe(400);
+  });
+
+  it('archives and restores visibility without reviving a retired actor', async () => {
+    await env.DB.prepare(
+      `INSERT INTO agents (id, name, status, kind, actor_class, user_id, project_id, runner_id,
+                           last_seen_at, retired_at, retire_reason, created_at)
+       VALUES ('agt_manual_archive', 'manual archive', 'offline', 'agent', 'runner_agent', ?, ?,
+               'rnr_roster', ?, ?, 'run_terminal', ?)`,
+    ).bind(ownerId, projectId, old, old, old).run();
+    const archived = await SELF.fetch('https://noriq.test/api/agents/agt_manual_archive/archive', {
+      method: 'POST', headers: { Cookie: cookie },
+    });
+    expect(archived.status).toBe(200);
+    expect(await env.DB.prepare('SELECT archived_at AS archivedAt FROM agents WHERE id = ?')
+      .bind('agt_manual_archive').first<{ archivedAt: string | null }>()).toMatchObject({ archivedAt: expect.any(String) });
+
+    const restored = await SELF.fetch('https://noriq.test/api/agents/agt_manual_archive/restore-visibility', {
+      method: 'POST', headers: { Cookie: cookie },
+    });
+    expect(restored.status).toBe(200);
+    expect(await env.DB.prepare(
+      'SELECT status, retired_at AS retiredAt, archived_at AS archivedAt FROM agents WHERE id = ?',
+    ).bind('agt_manual_archive').first()).toMatchObject({ status: 'offline', retiredAt: old, archivedAt: null });
   });
 });

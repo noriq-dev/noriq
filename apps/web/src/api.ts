@@ -290,6 +290,13 @@ export const api = {
    *  scope to their owner and ignore projectId entirely (PLNR-156). */
   agents: (projectId?: string, kind?: 'agent' | 'copilot', options: {
     includeHistory?: boolean;
+    view?: 'active' | 'dormant' | 'history';
+    lifecycle?: ApiAgent['lifecycle'];
+    runnerId?: string;
+    ownerUserId?: string;
+    retireReason?: string;
+    activeAfter?: string;
+    activeBefore?: string;
     cursor?: string;
     limit?: number;
   } = {}) => {
@@ -297,6 +304,13 @@ export const api = {
     if (projectId && kind !== 'copilot') q.set('projectId', projectId);
     if (kind) q.set('kind', kind);
     if (options.includeHistory) q.set('includeHistory', 'true');
+    if (options.view) q.set('view', options.view);
+    if (options.lifecycle) q.set('lifecycle', options.lifecycle);
+    if (options.runnerId) q.set('runnerId', options.runnerId);
+    if (options.ownerUserId) q.set('ownerUserId', options.ownerUserId);
+    if (options.retireReason) q.set('retireReason', options.retireReason);
+    if (options.activeAfter) q.set('activeAfter', options.activeAfter);
+    if (options.activeBefore) q.set('activeBefore', options.activeBefore);
     if (options.cursor) q.set('cursor', options.cursor);
     if (options.limit) q.set('limit', String(options.limit));
     const qs = q.toString();
@@ -304,6 +318,8 @@ export const api = {
   },
   agentEvents: (aid: string) => req<{ events: ApiAgentEvent[] }>('GET', `/api/agents/${aid}/events`),
   revokeAgent: (aid: string) => req('POST', `/api/agents/${aid}/revoke`),
+  archiveAgent: (aid: string) => req<{ ok: true; archived: true }>('POST', `/api/agents/${aid}/archive`),
+  restoreAgentVisibility: (aid: string) => req<{ ok: true; archived: false; note: string }>('POST', `/api/agents/${aid}/restore-visibility`),
 
   createBoard: (pid: string, name: string) => req<{ id: string; name: string }>('POST', `/api/projects/${pid}/boards`, { name }),
   renameBoard: (pid: string, bid: string, name: string) => req('PATCH', `/api/projects/${pid}/boards/${bid}`, { name }),
@@ -387,14 +403,36 @@ export const api = {
     req('POST', `/api/projects/${pid}/tasks/${tid}/release`, { toStatus }),
 
   // --- runners / runs (RUN-22) ---
-  runners: () => req<{ runners: ApiRunner[] }>('GET', '/api/runners'),
+  runners: (options: {
+    all?: boolean; projectId?: string; ownerUserId?: string; lifecycle?: ApiRunner['lifecycle']; view?: 'active' | 'dormant' | 'history';
+    retireReason?: string; activeAfter?: string; activeBefore?: string; cursor?: string; limit?: number;
+  } = {}) => {
+    const q = new URLSearchParams();
+    if (options.all) q.set('all', '1');
+    if (options.projectId) q.set('projectId', options.projectId);
+    if (options.ownerUserId) q.set('ownerUserId', options.ownerUserId);
+    if (options.lifecycle) q.set('lifecycle', options.lifecycle);
+    if (options.view) q.set('view', options.view);
+    if (options.retireReason) q.set('retireReason', options.retireReason);
+    if (options.activeAfter) q.set('activeAfter', options.activeAfter);
+    if (options.activeBefore) q.set('activeBefore', options.activeBefore);
+    if (options.cursor) q.set('cursor', options.cursor);
+    if (options.limit) q.set('limit', String(options.limit));
+    const qs = q.toString();
+    return req<ApiRunnerRoster>('GET', qs ? `/api/runners?${qs}` : '/api/runners');
+  },
   /** Cut a runner off (RUN-35): revokes its token, fails its live runs. Severs Noriq — it does
    *  NOT remove the daemon's local repo access, so the process must be stopped too. */
   offboardRunner: (id: string) =>
     req<{ ok: boolean; tokenRevoked: boolean; failedRuns: number; warning?: string; note: string }>(
       'POST', `/api/runners/${id}/offboard`),
   renameRunner: (id: string, label: string) => req('PATCH', `/api/runners/${id}`, { label }),
+  archiveRunner: (id: string) => req<{ ok: true; archived: true }>('POST', `/api/runners/${id}/archive`),
+  restoreRunnerVisibility: (id: string) => req<{ ok: true; archived: false; note: string }>('POST', `/api/runners/${id}/restore-visibility`),
   deleteRunner: (id: string) => req('DELETE', `/api/runners/${id}`),
+  agentLifecycleClassification: () => req<ApiAgentLifecycleClassification>('GET', '/api/admin/agent-lifecycle/classification'),
+  agentLifecycleSweep: (apply = false, cursor?: Record<string, string | null>) =>
+    req<ApiAgentLifecycleSweep>('POST', `/api/admin/agent-lifecycle-sweep${apply ? '?apply=true' : ''}`, cursor ? { cursor } : {}),
   runs: (pid: string) => req<{ runs: ApiRun[] }>('GET', `/api/projects/${pid}/runs`),
   dispatchRun: (pid: string, body: DispatchInput) => req<{ run: ApiRun; delivered: boolean }>('POST', `/api/projects/${pid}/runs`, body),
   cancelRun: (runId: string, reason?: string) => req<{ run: ApiRun }>('POST', `/api/runs/${runId}/cancel`, { reason }),
@@ -581,6 +619,26 @@ export interface ApiRunner {
    *  reads its own repo (RUN-37), and the server does not distribute releases. */
   version: string | null;
   createdAt: string;
+  lifecycle?: 'active' | 'dormant' | 'retired' | 'archived';
+  activityAt?: string;
+  retiredAt?: string | null;
+  retireReason?: string | null;
+  archivedAt?: string | null;
+  ownerName?: string | null;
+  ownerUserId?: string | null;
+  agentCount?: number;
+  liveRuns?: number;
+  eligiblePurge?: boolean;
+}
+
+export interface ApiRunnerRoster {
+  runners: ApiRunner[];
+  counts: {
+    active: number; dormant: number; historical: number; total: number;
+    byLifecycle: Record<'active' | 'dormant' | 'retired' | 'archived', number>;
+  };
+  page: { limit: number; hasMore: boolean; nextCursor: string | null };
+  policy: { heartbeatSeconds: number };
 }
 export interface ApiRunBudget {
   maxTokens: number | null;
@@ -823,6 +881,34 @@ export interface ApiAgentRoster {
   };
   page: { limit: number; hasMore: boolean; nextCursor: string | null };
   policy: { onlineSeconds: number; recentDays: number };
+}
+
+export interface ApiAgentLifecycleClassification {
+  generatedAt: string;
+  dryRun: true;
+  mutationPerformed: false;
+  summary: {
+    actors: number; presences: number; legacyUnknownActors: number; activeButStaleSevenDays: number;
+    actorArchiveAgeCandidates: number; presencePurgeAgeCandidates: number;
+    durableActorDeleteCandidates: number; verifiedPresencePurgeCandidates: number;
+  };
+  actors: Array<Record<string, string | number | null>>;
+  presences: Array<Record<string, string | number | null>>;
+  runners: Array<Record<string, string | number | null>>;
+}
+
+export interface ApiAgentLifecycleSweep {
+  sweepId: string;
+  dryRun: boolean;
+  generatedAt: string;
+  examined: { actors: number; presences: number; runners: number };
+  transitions: Record<string, number>;
+  protections: Record<string, number>;
+  referenceCheck: { complete: boolean; blockers: string[] };
+  errorCounts: Record<string, number>;
+  errors: string[];
+  cursor: { actorId: string | null; presenceId: string | null; runnerId: string | null };
+  complete: boolean;
 }
 
 export interface ApiAgentEvent {

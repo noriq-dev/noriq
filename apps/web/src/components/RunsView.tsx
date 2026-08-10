@@ -132,7 +132,7 @@ export function RunsView({ store }: { store: AppStore }) {
 
   const load = async () => {
     try {
-      const [rr, ru] = await Promise.all([api.runners(), api.runs(pid)]);
+      const [rr, ru] = await Promise.all([api.runners({ view: 'active', projectId: pid, limit: 100 }), api.runs(pid)]);
       setRunners(rr.runners);
       setRuns(ru.runs);
     } catch {
