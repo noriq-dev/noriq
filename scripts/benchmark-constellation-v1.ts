@@ -2,6 +2,7 @@ import { gzipSync } from 'node:zlib';
 import { constellation, type ConstellationInputRows } from '../apps/api/src/memory/graph-queries';
 import { compactConstellationCommunityPage, type ConstellationV2CommunityPage } from '../apps/api/src/memory/constellation-v2';
 import { computeStarMap, hitTest } from '../apps/web/src/components/starmap-layout';
+import { buildConstellation3DRenderPlan, type Constellation3DEdge, type Constellation3DNode } from '../apps/web/src/components/constellation-3d-buffers';
 
 type FixtureName = 'dense-hub' | 'disconnected-islands' | 'code-heavy' | 'memory-heavy';
 
@@ -112,5 +113,29 @@ for (const spec of SPECS) {
   results.push({ fixture: spec.name, inputNodes: rows.nodes.length, inputEdges: rows.edges.length, rowsRead: rows.nodes.length + rows.edges.length + rows.memoryItems.length + rows.episodes.length, inputMiB: Math.round(rawBytes / 1024 / 1024 * 100) / 100, outputNodes: result.nodes.length, outputEdges: result.edges.length, responseKiB: Math.round(responseBytes / 1024 * 100) / 100, gzipKiB: Math.round(gzipBytes / 1024 * 100) / 100, shapeMedianMs: median(shapeRuns), layoutMedianMs: median(layoutRuns), hitTest1kMs, v2CompactPageKiB: Math.round(compactBytes / 1024 * 100) / 100, v2CompactGzipKiB: Math.round(compactGzipBytes / 1024 * 100) / 100, compactBudgetPassed });
 }
 
-console.log(JSON.stringify({ runtime: process.version, results }, null, 2));
+const rendererNodes: Constellation3DNode[] = Array.from({ length: 12_000 }, (_, index) => ({
+  id: `render-node-${index}`, uri: `noriq://memory/render-node-${index}`, label: `node ${index}`,
+  type: index % 5 === 0 ? 'memory' : index % 5 === 1 ? 'task' : index % 5 === 2 ? 'file' : index % 5 === 3 ? 'error' : 'unknown',
+  position: [index % 100, Math.floor(index / 100), index % 31], degree: 4, validity: index % 17 === 0 ? 'stale' : 'active', isLead: index % 101 === 0,
+}));
+const rendererEdges: Constellation3DEdge[] = Array.from({ length: 24_000 }, (_, index) => ({
+  id: `render-edge-${index}`, fromId: `render-node-${index % rendererNodes.length}`,
+  toId: `render-node-${(index * 7919 + 1) % rendererNodes.length}`, type: index % 7 === 0 ? 'depends_on' : 'related_to',
+  direction: 'forward', weight: 1, aggregate: index % 3 === 0,
+}));
+const rendererPlanRuns: number[] = [];
+let rendererPlan = buildConstellation3DRenderPlan(rendererNodes, rendererEdges, 'render-node-42');
+for (let index = 0; index < 5; index++) {
+  const start = performance.now();
+  rendererPlan = buildConstellation3DRenderPlan(rendererNodes, rendererEdges, 'render-node-42');
+  rendererPlanRuns.push(ms(start));
+}
+const rendererBufferPlan = {
+  nodes: rendererPlan.nodeCount, edges: rendererPlan.baseEdges.length + rendererPlan.promotedEdges.length,
+  drawCallCeiling: rendererPlan.drawCallCeiling, labels: rendererPlan.labels.length,
+  selectionPlanMedianMs: median(rendererPlanRuns), interactionBudgetPassed: median(rendererPlanRuns) <= 100,
+};
+
+console.log(JSON.stringify({ runtime: process.version, results, rendererBufferPlan }, null, 2));
 if (results.some((result) => !result.compactBudgetPassed)) process.exitCode = 1;
+if (!rendererBufferPlan.interactionBudgetPassed || rendererBufferPlan.drawCallCeiling > 14) process.exitCode = 1;

@@ -79,6 +79,19 @@ timing headers. The web client asks for compact pages, decodes them back into th
 shape, revalidates cached pages, evicts only the changed project's incompatible generation, and
 uses request sequence ordering so a late response cannot replace newer state.
 
+### Renderer evidence (PLNR-377)
+
+The 3D renderer is an isolated, lazy-loaded Three.js surface until the cutover gate. It groups
+nodes into five shape families, splits current and faded validity instances, and uses one halo
+instance buffer for lead memories. Relationships use base and final promoted line passes plus one
+direction-marker pass; selection rebuilds those bounded buffers, not one object per relationship.
+React renders at most 24 depth-culled node/relationship labels and never one component per node.
+
+On the local benchmark's resident-scene ceiling of 12,000 nodes and 24,000 edges, the pure buffer
+plan has a 14-draw-call ceiling and an 8.18 ms median selection-plan time across five warm runs.
+This passes the 100 ms interaction planning gate. It is not a GPU frame-time claim: the integrated
+and weak-GPU measurements remain required before PLNR-380 can enable v2 by default.
+
 ## Binding v2 contract (PLNR-372)
 
 ### Identity, versions, and hierarchy
