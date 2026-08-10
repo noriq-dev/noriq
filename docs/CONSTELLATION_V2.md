@@ -62,3 +62,175 @@ frame budget is exceeded for three sampling windows, or a valid generation canno
 No v1 production ceiling is raised by this benchmark. The v2 common path must avoid a global raw
 graph load entirely; the database, response, Worker, and renderer bounds above are independently
 enforced.
+
+## Binding v2 contract (PLNR-372)
+
+### Identity, versions, and hierarchy
+
+Canonical entity identity remains the stable `uri` from ProjectMemory. Derived community IDs are
+opaque display identities and must never be accepted where an entity URI is required.
+
+Every response carries:
+
+```ts
+interface ConstellationRevision {
+  contract: 'constellation-v2';
+  generationId: string;
+  sourceRevision: number;       // canonical memory revision used to build this generation
+  currentRevision: number;      // canonical revision observed while serving
+  topologyVersion: 'connectivity-v1';
+  layoutVersion: 'space-v1';
+  state: 'current' | 'stale' | 'building';
+  generatedAt: string;
+}
+```
+
+`state: stale` means the complete generation is safe but `sourceRevision < currentRevision`.
+`building` means that same complete generation is being served while a successor builds. A failed
+or partial build is never addressable. Generation identity changes if source, topology, or layout
+version changes.
+
+The hierarchy has three semantic levels, even if large communities require several repeated
+community pages:
+
+1. `overview`: project-root children are connectivity communities only.
+2. `community`: nested connectivity communities or an entity page; a page never mixes child
+   communities and raw entities.
+3. `entity`: canonical nodes. Repository and file communities are ordinary topology communities,
+   but file expansion is the required route to high-volume symbol entities.
+
+The server recursively partitions until a leaf fits the 500-entity hard page bound or cannot be
+split without inventing relationships. An unsplittable leaf remains cursor-paginated. Every
+eligible canonical entity belongs to exactly one leaf in a completed generation and has one
+recorded ancestor path to the project root.
+
+Clustering consumes an undirected normalized view but never changes canonical edge direction.
+Weights for `connectivity-v1` are: `calls`, `imports`, `depends_on`, `tests`, `validated_by`, and
+`implements` = 4; `modifies`, `declares`, `derived_from`, `decided_by`, `observed_in`, and
+`commonly_changes_with` = 3; `blocks`, `owned_by`, and `failed_because` = 2; `related_to`,
+`supersedes`, and `contradicts` = 1. Parallel typed edges add, then each contribution is divided by
+`sqrt(max(1, degree(a)) * max(1, degree(b)))` so hubs cannot collapse the map into one community.
+Unknown future edge types use weight 1 and are reported in generation diagnostics.
+
+Partitioning, tie-breaking, and aggregate ordering are deterministic. A community's provisional
+fingerprint is the hash of topology version, parent fingerprint, level, and sorted member URIs.
+Across adjacent generations, the builder reuses a prior community ID only for the deterministic
+best overlap above the settled 0.60 Jaccard threshold; one prior ID can be reused once. Ties resolve
+by larger intersection, then prior ID and new fingerprint lexicographically. Layout anchors seed
+from the reused/final community ID or entity URI. Rebuilds from identical canonical inputs must be
+byte-identical.
+
+### HTTP resources and bounded response shapes
+
+V1 remains available as `POST /api/projects/:pid/memory/constellation` with its existing body and
+response. V2 is additive:
+
+- `GET /api/projects/:pid/memory/constellation/v2/overview`
+- `GET /api/projects/:pid/memory/constellation/v2/communities/:communityId?cursor=&limit=`
+- `GET /api/projects/:pid/memory/constellation/v2/route?uri=`
+- `GET /api/projects/:pid/memory/constellation/v2/entities/:nodeId/incidents?cursor=&limit=`
+
+All routes use existing project authorization. Responses are private and project-scoped. Overview
+returns only root community summaries and aggregate routes:
+
+```ts
+interface CommunitySummary {
+  id: string;
+  parentId: string | null;
+  level: number;
+  label: string;
+  memberCount: number;
+  childCommunityCount: number;
+  typeCounts: Record<string, number>;
+  internalWeight: number;
+  normalizedCohesion: number;
+  boundaryWeight: number;
+  anchor: [number, number, number];
+}
+
+interface AggregateRoute {
+  fromCommunityId: string;
+  toCommunityId: string;
+  direction: 'forward' | 'reverse' | 'both';
+  count: number;
+  weight: number;
+  byType: Record<string, number>;
+}
+```
+
+Community expansion returns either `kind: communities` with `CommunitySummary[]` and aggregate
+routes, or `kind: entities` with compact entity records and a backbone/boundary edge page. Entity
+records retain v1's `nodeId`, `uri`, `type`, `kind`, `label`, `authority`, `validity`, `isLead`,
+`leadReasons`, `degree`, and `groupKey`; `createdAt` remains available in details but is omitted from
+compact pages. V2 adds `communityId`, `position: [x,y,z]`, and `boundaryDegree`. Type, authority,
+validity, and lead semantics are unchanged and server-authored.
+
+Every page contains `revision`, `coverage`, `nextCursor`, and exact page counts. Cursors are opaque,
+URL-safe, and bind generation ID, route kind, parent/entity ID, and the last total-order key. A
+cursor from another generation or scope returns `409` with code `constellation_cursor_stale` and
+the current overview URL; it is never silently replayed against different data. `limit` defaults
+to the measured budget and clamps to the hard bound. Ordering is weight/rank descending followed
+by stable ID/URI ascending, so retries return the same page.
+
+Incident pages carry canonical edge direction/type/provenance, the visible endpoint's node ID and
+URI, the other endpoint's node ID/URI/label/type, its community path, and `endpointOnCurrentPage`.
+High-degree entities expose `nextCursor` and incomplete coverage rather than silently truncating.
+An off-page endpoint is truthful context, not an instruction to load its whole community.
+
+The route endpoint maps an exact canonical URI to `{ nodeId, communityPath, generationId }`. A
+missing canonical entity is `404`; an entity newer than the served generation returns `409
+constellation_generation_stale` and schedules/reports generation work. Search continues through
+the shared hybrid memory search and calls this exact-URI route only for chosen hits. Search does
+not download pages speculatively.
+
+### Caching and generation availability
+
+Every successful GET emits a strong ETag derived from contract, generation ID, resource identity,
+cursor, and limit, plus `Cache-Control: private, max-age=0, must-revalidate`. `If-None-Match` is
+checked against derived metadata before page rows are decoded or serialized; an unchanged request
+returns `304` with no body. Immutable generation-addressed internals may use long-lived private
+caching, but the public head is always revalidated.
+
+If no complete generation exists, v2 returns `503 constellation_generation_unavailable` with
+`Retry-After`, current build state, and the textual catalogue URL. It never falls through to a
+global v1 scan. A stale complete generation is served with visible revision/state fields while a
+replacement builds. Generation failure preserves the previous complete generation and reports
+failure only through operations state.
+
+### Edge level of detail and selection
+
+Overview draws only aggregate inter-community routes. Community pages draw a deterministic
+maximum-spanning backbone plus highest-weight boundary routes under the page edge budget. Entity
+pages draw the same backbone/boundary set. They do not draw every internal edge.
+
+Selecting a community promotes all currently loaded incident aggregate routes in a final render
+pass. Selecting an entity pins it, requests incident pages only as needed, promotes loaded incoming
+and outgoing canonical edges with direction and type, and dims unrelated visible routes without
+removing them. Hover previews this at lower intensity and never overrides pinned selection.
+Clearing selection restores the exact prior LOD set. Pagination and coverage remain visible for a
+high-degree selection.
+
+### Client navigation, persistence, and accessibility
+
+The v2 renderer is lazy and must use batched GPU buffers/instancing; React owns controls and status,
+not one component per graph object. Layout calculation and page integration occur in a dedicated
+worker. Camera operations are orbit, pan, dolly, fit-level, focus-selected, and return-to-parent.
+Approach alone may offer expansion, but only explicit focus/expand mutates the loaded hierarchy;
+reduced-motion mode never auto-flies or auto-expands.
+
+Preferences use `noriq.constellation.v2.<projectId>` and include a schema version, topology/layout
+versions, camera, expanded community IDs, filters, and selected URI. Incompatible versions discard
+only display preferences. Canonical or derived graph facts are never written to local storage.
+
+The searchable textual catalogue is a peer control, not an error-only escape hatch. It exposes the
+same hierarchy path, counts, paging, search focus, selection, inspector, and ego-network actions.
+Keyboard operation can traverse parent/child/sibling items, expand/collapse, select, focus, open
+details, and return to the parent without using the canvas. Focus is visible and announced through
+a concise live region; community size/connectivity and entity type/authority/validity are available
+as text, not colour alone.
+
+`prefers-reduced-motion` disables ambient motion and animated camera travel while preserving direct
+position changes. Missing WebGL2, context loss, three consecutive over-budget frame windows, worker
+failure, or generation unavailability switches to the complete textual catalogue with an explicit
+reason and a retry action. Empty canonical graph, unindexed repository, stale generation, building
+generation, partial incident page, unreachable store, and rendering fallback are distinct states.
