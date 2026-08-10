@@ -1,5 +1,6 @@
 import { gzipSync } from 'node:zlib';
 import { constellation, type ConstellationInputRows } from '../apps/api/src/memory/graph-queries';
+import { compactConstellationCommunityPage, type ConstellationV2CommunityPage } from '../apps/api/src/memory/constellation-v2';
 import { computeStarMap, hitTest } from '../apps/web/src/components/starmap-layout';
 
 type FixtureName = 'dense-hub' | 'disconnected-islands' | 'code-heavy' | 'memory-heavy';
@@ -87,7 +88,29 @@ for (const spec of SPECS) {
   const interactionStart = performance.now();
   for (let i = 0; i < 1000; i++) hitTest(layout.stars, { x: 0, y: 0, zoom: 1 }, { width: 1440, height: 900 }, { x: i % 1440, y: (i * 17) % 900 });
   const hitTest1kMs = ms(interactionStart);
-  results.push({ fixture: spec.name, inputNodes: rows.nodes.length, inputEdges: rows.edges.length, rowsRead: rows.nodes.length + rows.edges.length + rows.memoryItems.length + rows.episodes.length, inputMiB: Math.round(rawBytes / 1024 / 1024 * 100) / 100, outputNodes: result.nodes.length, outputEdges: result.edges.length, responseKiB: Math.round(responseBytes / 1024 * 100) / 100, gzipKiB: Math.round(gzipBytes / 1024 * 100) / 100, shapeMedianMs: median(shapeRuns), layoutMedianMs: median(layoutRuns), hitTest1kMs });
+  const pageCommunity = { id: 'community-benchmark-leaf', parentId: 'community-benchmark-root', level: 1, label: `${spec.name} leaf`, memberCount: Math.min(500, rows.nodes.length), childCommunityCount: 0, typeCounts: {}, internalEdgeCount: 499, internalWeight: 499, normalizedCohesion: 1, boundaryWeight: 32, anchor: [0, 0, 0] as [number, number, number] };
+  const v2Page: ConstellationV2CommunityPage = {
+    revision: { contract: 'constellation-v2', generationId: 'benchmark-generation', sourceRevision: 42, currentRevision: 42, topologyVersion: 'connectivity-v1', layoutVersion: 'space-v1', state: 'current', generatedAt: '2026-08-10T00:00:00.000Z' },
+    community: pageCommunity, kind: 'entities', communities: [], externalCommunities: [], nextCursor: 'opaque-benchmark-cursor', coverage: { complete: false, reasons: ['page-limit-reached'] },
+    entities: rows.nodes.slice(0, 500).map((node, index) => ({
+      nodeId: node.nodeId, uri: node.uri, type: node.type, kind: node.type === 'memory' ? 'learning' : null,
+      label: node.label, authority: node.type === 'memory' ? 3 : null, validity: node.type === 'memory' ? 'active' : null,
+      isLead: node.type === 'memory', leadReasons: node.type === 'memory' ? ['authority'] : null,
+      degree: 8, boundaryDegree: index % 7 === 0 ? 1 : 0, groupKey: node.type, communityId: pageCommunity.id,
+      position: [index % 20, Math.floor(index / 20), (index * 17) % 31],
+    })),
+    routes: Array.from({ length: 512 }, (_, index) => ({
+      fromCommunityId: pageCommunity.id, toCommunityId: `community-boundary-${index % 64}`,
+      direction: index % 2 ? 'forward' as const : 'reverse' as const, count: index + 1, weight: 512 - index,
+      byType: { related_to: index + 1 },
+    })),
+  };
+  const compactResponse = JSON.stringify(compactConstellationCommunityPage(v2Page));
+  const compactBytes = Buffer.byteLength(compactResponse);
+  const compactGzipBytes = gzipSync(compactResponse).byteLength;
+  const compactBudgetPassed = compactBytes <= 512 * 1024 && compactGzipBytes <= 128 * 1024;
+  results.push({ fixture: spec.name, inputNodes: rows.nodes.length, inputEdges: rows.edges.length, rowsRead: rows.nodes.length + rows.edges.length + rows.memoryItems.length + rows.episodes.length, inputMiB: Math.round(rawBytes / 1024 / 1024 * 100) / 100, outputNodes: result.nodes.length, outputEdges: result.edges.length, responseKiB: Math.round(responseBytes / 1024 * 100) / 100, gzipKiB: Math.round(gzipBytes / 1024 * 100) / 100, shapeMedianMs: median(shapeRuns), layoutMedianMs: median(layoutRuns), hitTest1kMs, v2CompactPageKiB: Math.round(compactBytes / 1024 * 100) / 100, v2CompactGzipKiB: Math.round(compactGzipBytes / 1024 * 100) / 100, compactBudgetPassed });
 }
 
 console.log(JSON.stringify({ runtime: process.version, results }, null, 2));
+if (results.some((result) => !result.compactBudgetPassed)) process.exitCode = 1;

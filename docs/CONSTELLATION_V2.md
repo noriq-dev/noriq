@@ -63,6 +63,22 @@ No v1 production ceiling is raised by this benchmark. The v2 common path must av
 graph load entirely; the database, response, Worker, and renderer bounds above are independently
 enforced.
 
+### Transport evidence (PLNR-376)
+
+The same benchmark now constructs a maximum-size 500-entity expansion with 512 aggregate routes
+for every fixture. The compact dictionary/tuple representation is 75.54 KiB or less before
+compression and 15.35 KiB or less under gzip, passing both the 512 KiB hard uncompressed bound and
+128 KiB compressed gate. This synthetic result tests representation size; Cloudflare production
+compression and latency remain deployment observations rather than claims made by the local run.
+
+Every public v2 GET first performs a metadata-only generation-head read. Its strong ETag includes
+the representation, resource identity, active generation, current canonical revision, topology,
+and layout versions. A matching `If-None-Match` returns an empty `304` before hierarchy page rows
+are read. Responses expose cache hit/miss, rows shaped, serialized bytes, stale state, and server
+timing headers. The web client asks for compact pages, decodes them back into the stable application
+shape, revalidates cached pages, evicts only the changed project's incompatible generation, and
+uses request sequence ordering so a late response cannot replace newer state.
+
 ## Binding v2 contract (PLNR-372)
 
 ### Identity, versions, and hierarchy

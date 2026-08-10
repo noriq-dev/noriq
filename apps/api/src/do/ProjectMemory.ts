@@ -38,7 +38,7 @@ import {
   CONSTELLATION_V2_DEFAULT_ENTITY_LIMIT, CONSTELLATION_V2_DEFAULT_INCIDENT_LIMIT,
   CONSTELLATION_V2_MAX_ENTITY_LIMIT, CONSTELLATION_V2_MAX_INCIDENT_LIMIT, CONSTELLATION_V2_MAX_OVERVIEW_ROUTES,
   type ConstellationV2AggregateRoute, type ConstellationV2Community, type ConstellationV2CommunityPage,
-  type ConstellationV2Coverage, type ConstellationV2IncidentPage, type ConstellationV2Overview,
+  type ConstellationV2Coverage, type ConstellationV2Head, type ConstellationV2IncidentPage, type ConstellationV2Overview,
   type ConstellationV2Revision, type ConstellationV2Route, type ConstellationV2Unavailable,
 } from '../memory/constellation-v2';
 import {
@@ -795,6 +795,13 @@ export class ProjectMemory extends DurableObject<Env> {
 
   private unavailableConstellation(error: ConstellationV2Unavailable['error']): ConstellationV2Unavailable {
     return { ok: false, error, currentRevision: this.readMemoryRevision(), retryAfter: error === 'generation-unavailable' ? 5 : undefined };
+  }
+
+  /** Metadata-only cache validator: no hierarchy page or canonical graph rows are read. */
+  async constellationV2Head(projectId: string): Promise<ConstellationV2Head | ConstellationV2Unavailable> {
+    await this.assertProjectId(projectId);
+    const active = this.activeConstellationRevision();
+    return active ? { revision: active.revision } : this.unavailableConstellation('generation-unavailable');
   }
 
   private shapeConstellationCommunity(row: Record<string, string | number | null>): ConstellationV2Community {

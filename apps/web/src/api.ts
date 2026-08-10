@@ -19,6 +19,38 @@ async function req<T>(method: string, path: string, body?: unknown, signal?: Abo
   return data as T;
 }
 
+const CONSTELLATION_V2_COMPACT_MEDIA_TYPE = 'application/vnd.noriq.constellation-v2.compact+json';
+const constellationPageCache = new Map<string, { etag: string | null; generationId: string; value: unknown }>();
+const constellationRequestSerial = new Map<string, number>();
+
+async function constellationReq<T>(path: string, decode: (wire: unknown) => T, signal?: AbortSignal): Promise<T> {
+  const cached = constellationPageCache.get(path);
+  const serial = (constellationRequestSerial.get(path) ?? 0) + 1;
+  constellationRequestSerial.set(path, serial);
+  const headers: Record<string, string> = { Accept: CONSTELLATION_V2_COMPACT_MEDIA_TYPE };
+  if (cached?.etag) headers['If-None-Match'] = cached.etag;
+  const res = await fetch(path, { headers, credentials: 'same-origin', signal });
+  if (res.status === 304 && cached) return cached.value as T;
+  const wire = await res.json().catch(() => ({}));
+  if (!res.ok) throw new ApiError(res.status, (wire as { error?: string }).error ?? res.statusText);
+  const value = decode(wire);
+  if (constellationRequestSerial.get(path) !== serial) return (constellationPageCache.get(path)?.value as T | undefined) ?? value;
+  const generationId = (value as { revision?: { generationId?: string } }).revision?.generationId ?? '';
+  const projectPrefix = path.match(/^\/api\/projects\/[^/]+\/memory\/constellation\/v2\//)?.[0];
+  if (projectPrefix && generationId) {
+    for (const [key, entry] of constellationPageCache) {
+      if (key.startsWith(projectPrefix) && entry.generationId !== generationId) constellationPageCache.delete(key);
+    }
+  }
+  constellationPageCache.set(path, { etag: res.headers.get('ETag'), generationId, value });
+  return value;
+}
+
+export function clearConstellationV2PageCache(): void {
+  constellationPageCache.clear();
+  constellationRequestSerial.clear();
+}
+
 export interface ApiAskStreamMeta {
   sources: ApiAskSource[];
   mode: 'semantic' | 'keyword' | null;
@@ -548,22 +580,22 @@ export const api = {
   memoryConstellation: (pid: string, options?: { includeIsolated?: boolean }, signal?: AbortSignal) =>
     req<ApiConstellation>('POST', `/api/projects/${pid}/memory/constellation`, options ?? {}, signal),
   memoryConstellationV2Overview: (pid: string, signal?: AbortSignal) =>
-    req<ApiConstellationV2Overview>('GET', `/api/projects/${pid}/memory/constellation/v2/overview`, undefined, signal),
+    constellationReq(`/api/projects/${pid}/memory/constellation/v2/overview`, decodeConstellationV2Overview, signal),
   memoryConstellationV2Community: (pid: string, communityId: string, input: { cursor?: string; limit?: number } = {}, signal?: AbortSignal) => {
     const query = new URLSearchParams();
     if (input.cursor) query.set('cursor', input.cursor);
     if (input.limit) query.set('limit', String(input.limit));
     const suffix = query.size ? `?${query}` : '';
-    return req<ApiConstellationV2CommunityPage>('GET', `/api/projects/${pid}/memory/constellation/v2/communities/${encodeURIComponent(communityId)}${suffix}`, undefined, signal);
+    return constellationReq(`/api/projects/${pid}/memory/constellation/v2/communities/${encodeURIComponent(communityId)}${suffix}`, decodeConstellationV2CommunityPage, signal);
   },
   memoryConstellationV2Route: (pid: string, uri: string, signal?: AbortSignal) =>
-    req<ApiConstellationV2EntityRoute>('GET', `/api/projects/${pid}/memory/constellation/v2/route?uri=${encodeURIComponent(uri)}`, undefined, signal),
+    constellationReq(`/api/projects/${pid}/memory/constellation/v2/route?uri=${encodeURIComponent(uri)}`, decodeConstellationV2EntityRoute, signal),
   memoryConstellationV2Incidents: (pid: string, nodeId: string, input: { cursor?: string; limit?: number } = {}, signal?: AbortSignal) => {
     const query = new URLSearchParams();
     if (input.cursor) query.set('cursor', input.cursor);
     if (input.limit) query.set('limit', String(input.limit));
     const suffix = query.size ? `?${query}` : '';
-    return req<ApiConstellationV2IncidentPage>('GET', `/api/projects/${pid}/memory/constellation/v2/entities/${encodeURIComponent(nodeId)}/incidents${suffix}`, undefined, signal);
+    return constellationReq(`/api/projects/${pid}/memory/constellation/v2/entities/${encodeURIComponent(nodeId)}/incidents${suffix}`, decodeConstellationV2IncidentPage, signal);
   },
   memoryEntities: (pid: string, input: ApiGraphEntityPageInput, signal?: AbortSignal) =>
     req<ApiGraphEntityPage>('POST', `/api/projects/${pid}/memory/entities`, input, signal),
@@ -1585,6 +1617,63 @@ export interface ApiConstellationV2IncidentPage {
   node: { nodeId: string; uri: string; type: string; label: string; communityPath: ApiConstellationV2Community[] };
   edges: Array<{ edgeId: string; type: string; direction: 'incoming' | 'outgoing'; provenance: string | null; endpoint: { nodeId: string; uri: string; type: string; label: string; communityPath: ApiConstellationV2Community[] } }>;
   nextCursor: string | null; coverage: ApiConstellationV2Coverage;
+}
+
+interface ApiConstellationV2CompactDictionary {
+  ids: string[]; uris: string[]; labels: string[]; types: string[]; kinds: Array<string | null>;
+}
+interface ApiConstellationV2CompactCommunityPage extends Omit<ApiConstellationV2CommunityPage, 'entities' | 'routes'> {
+  encoding: 'constellation-v2-community-v1'; dictionary: ApiConstellationV2CompactDictionary;
+  entities: Array<[number, number, number, number, number, number | null, string | null, boolean | null, string[] | null, number, number, number, number, number, number, number]>;
+  routes: Array<[number, number, ApiConstellationV2RouteEdge['direction'], number, number, Record<string, number>]>;
+}
+interface ApiConstellationV2CompactIncidentPage extends Omit<ApiConstellationV2IncidentPage, 'node' | 'edges'> {
+  encoding: 'constellation-v2-incidents-v1'; dictionary: ApiConstellationV2CompactDictionary;
+  node: [number, number, number, number, ApiConstellationV2Community[]];
+  edges: Array<[number, number, 'incoming' | 'outgoing', string | null, number, number, number, number, ApiConstellationV2Community[]]>;
+}
+
+function decodeConstellationV2Overview(wire: unknown): ApiConstellationV2Overview {
+  return wire as ApiConstellationV2Overview;
+}
+
+function decodeConstellationV2CommunityPage(wire: unknown): ApiConstellationV2CommunityPage {
+  const page = wire as ApiConstellationV2CommunityPage | ApiConstellationV2CompactCommunityPage;
+  if (!('encoding' in page) || page.encoding !== 'constellation-v2-community-v1') return page as ApiConstellationV2CommunityPage;
+  const d = page.dictionary;
+  return {
+    revision: page.revision, community: page.community, kind: page.kind, communities: page.communities,
+    externalCommunities: page.externalCommunities, nextCursor: page.nextCursor, coverage: page.coverage,
+    entities: page.entities.map((entity) => ({
+      nodeId: d.ids[entity[0]]!, uri: d.uris[entity[1]]!, type: d.types[entity[2]]!, kind: d.kinds[entity[3]]!,
+      label: d.labels[entity[4]]!, authority: entity[5], validity: entity[6], isLead: entity[7], leadReasons: entity[8],
+      degree: entity[9], boundaryDegree: entity[10], groupKey: d.types[entity[11]]!, communityId: d.ids[entity[12]]!,
+      position: [entity[13], entity[14], entity[15]],
+    })),
+    routes: page.routes.map((route) => ({
+      fromCommunityId: d.ids[route[0]]!, toCommunityId: d.ids[route[1]]!, direction: route[2],
+      count: route[3], weight: route[4], byType: route[5],
+    })),
+  };
+}
+
+function decodeConstellationV2EntityRoute(wire: unknown): ApiConstellationV2EntityRoute {
+  return wire as ApiConstellationV2EntityRoute;
+}
+
+function decodeConstellationV2IncidentPage(wire: unknown): ApiConstellationV2IncidentPage {
+  const page = wire as ApiConstellationV2IncidentPage | ApiConstellationV2CompactIncidentPage;
+  if (!('encoding' in page) || page.encoding !== 'constellation-v2-incidents-v1') return page as ApiConstellationV2IncidentPage;
+  const d = page.dictionary;
+  return {
+    revision: page.revision,
+    node: { nodeId: d.ids[page.node[0]]!, uri: d.uris[page.node[1]]!, type: d.types[page.node[2]]!, label: d.labels[page.node[3]]!, communityPath: page.node[4] },
+    edges: page.edges.map((edge) => ({
+      edgeId: d.ids[edge[0]]!, type: d.types[edge[1]]!, direction: edge[2], provenance: edge[3],
+      endpoint: { nodeId: d.ids[edge[4]]!, uri: d.uris[edge[5]]!, type: d.types[edge[6]]!, label: d.labels[edge[7]]!, communityPath: edge[8] },
+    })),
+    nextCursor: page.nextCursor, coverage: page.coverage,
+  };
 }
 
 export type ApiGraphEntitySort = 'newest' | 'connected' | 'authority' | 'label';

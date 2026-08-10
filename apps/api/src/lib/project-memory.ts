@@ -12,7 +12,7 @@ import type {
 } from '../memory/graph-queries';
 import type { SurfaceId } from '../memory/guidance-drift';
 import type {
-  ConstellationV2CommunityPage, ConstellationV2IncidentPage, ConstellationV2Overview,
+  ConstellationV2CommunityPage, ConstellationV2Head, ConstellationV2IncidentPage, ConstellationV2Overview,
   ConstellationV2Route, ConstellationV2Unavailable,
 } from '../memory/constellation-v2';
 import { renderEvidenceFrame, type EvidenceFrameItem, type EvidenceFrameResult } from '../memory/evidence-frame';
@@ -290,6 +290,7 @@ export interface ProjectMemoryStub {
    *  contract. Read-only, no input beyond the project id (no seed — this is the whole map). */
   constellation(projectId: string, options?: ConstellationOptions): Promise<ConstellationResult>;
   listGraphEntities(projectId: string, input?: GraphEntityPageInput): Promise<GraphEntityPage>;
+  constellationV2Head(projectId: string): Promise<ConstellationV2Head | ConstellationV2Unavailable>;
   constellationV2Overview(projectId: string): Promise<ConstellationV2Overview | ConstellationV2Unavailable>;
   constellationV2Community(projectId: string, communityId: string, input?: { cursor?: string; limit?: number }): Promise<ConstellationV2CommunityPage | ConstellationV2Unavailable>;
   constellationV2Route(projectId: string, uri: string): Promise<ConstellationV2Route | ConstellationV2Unavailable>;

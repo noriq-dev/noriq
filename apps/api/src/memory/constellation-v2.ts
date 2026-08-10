@@ -3,6 +3,7 @@ export const CONSTELLATION_V2_MAX_ENTITY_LIMIT = 500;
 export const CONSTELLATION_V2_DEFAULT_INCIDENT_LIMIT = 256;
 export const CONSTELLATION_V2_MAX_INCIDENT_LIMIT = 500;
 export const CONSTELLATION_V2_MAX_OVERVIEW_ROUTES = 512;
+export const CONSTELLATION_V2_COMPACT_MEDIA_TYPE = 'application/vnd.noriq.constellation-v2.compact+json';
 
 export interface ConstellationV2Revision {
   contract: 'constellation-v2';
@@ -13,6 +14,10 @@ export interface ConstellationV2Revision {
   layoutVersion: string;
   state: 'current' | 'stale' | 'building';
   generatedAt: string;
+}
+
+export interface ConstellationV2Head {
+  revision: ConstellationV2Revision;
 }
 
 export interface ConstellationV2Coverage {
@@ -110,6 +115,42 @@ export type ConstellationV2Unavailable = {
   retryAfter?: number;
 };
 
+export interface ConstellationV2CompactDictionary {
+  ids: string[];
+  uris: string[];
+  labels: string[];
+  types: string[];
+  kinds: Array<string | null>;
+}
+
+export interface ConstellationV2CompactCommunityPage {
+  encoding: 'constellation-v2-community-v1';
+  dictionary: ConstellationV2CompactDictionary;
+  revision: ConstellationV2Revision;
+  community: ConstellationV2Community;
+  kind: 'communities' | 'entities';
+  communities: ConstellationV2Community[];
+  /** node id, uri, type, kind, label, authority, validity, lead, reasons, degree, boundary degree, group, community id, x, y, z */
+  entities: Array<[number, number, number, number, number, number | null, string | null, boolean | null, string[] | null, number, number, number, number, number, number, number]>;
+  /** from community id, to community id, direction, count, weight, by-type */
+  routes: Array<[number, number, ConstellationV2AggregateRoute['direction'], number, number, Record<string, number>]>;
+  externalCommunities: ConstellationV2Community[];
+  nextCursor: string | null;
+  coverage: ConstellationV2Coverage;
+}
+
+export interface ConstellationV2CompactIncidentPage {
+  encoding: 'constellation-v2-incidents-v1';
+  dictionary: ConstellationV2CompactDictionary;
+  revision: ConstellationV2Revision;
+  /** node id, uri, type, label */
+  node: [number, number, number, number, ConstellationV2Community[]];
+  /** edge id, type, direction, provenance, endpoint id, uri, type, label, community path */
+  edges: Array<[number, number, ConstellationV2IncidentEdge['direction'], string | null, number, number, number, number, ConstellationV2Community[]]>;
+  nextCursor: string | null;
+  coverage: ConstellationV2Coverage;
+}
+
 interface CursorPayload {
   v: 1;
   generationId: string;
@@ -156,4 +197,54 @@ export function constellationEntityPosition(uri: string, anchor: [number, number
     return (value >>> 0) / 0xffffffff * 2 - 1;
   };
   return [anchor[0] + hash('x') * 80, anchor[1] + hash('y') * 80, anchor[2] + hash('z') * 80];
+}
+
+function compactDictionary() {
+  const dictionary: ConstellationV2CompactDictionary = { ids: [], uris: [], labels: [], types: [], kinds: [] };
+  const indices = {
+    ids: new Map<string, number>(), uris: new Map<string, number>(), labels: new Map<string, number>(),
+    types: new Map<string, number>(), kinds: new Map<string | null, number>(),
+  };
+  const add = <T extends string | null>(values: T[], index: Map<T, number>, value: T) => {
+    const existing = index.get(value);
+    if (existing !== undefined) return existing;
+    const next = values.length;
+    values.push(value);
+    index.set(value, next);
+    return next;
+  };
+  return {
+    dictionary,
+    id: (value: string) => add(dictionary.ids, indices.ids, value),
+    uri: (value: string) => add(dictionary.uris, indices.uris, value),
+    label: (value: string) => add(dictionary.labels, indices.labels, value),
+    type: (value: string) => add(dictionary.types, indices.types, value),
+    kind: (value: string | null) => add(dictionary.kinds, indices.kinds, value),
+  };
+}
+
+export function compactConstellationCommunityPage(page: ConstellationV2CommunityPage): ConstellationV2CompactCommunityPage {
+  const dict = compactDictionary();
+  const entities: ConstellationV2CompactCommunityPage['entities'] = page.entities.map((entity) => [
+    dict.id(entity.nodeId), dict.uri(entity.uri), dict.type(entity.type), dict.kind(entity.kind), dict.label(entity.label),
+    entity.authority, entity.validity, entity.isLead, entity.leadReasons, entity.degree, entity.boundaryDegree,
+    dict.type(entity.groupKey), dict.id(entity.communityId), ...entity.position,
+  ]);
+  const routes: ConstellationV2CompactCommunityPage['routes'] = page.routes.map((route) => [
+    dict.id(route.fromCommunityId), dict.id(route.toCommunityId), route.direction, route.count, route.weight, route.byType,
+  ]);
+  return { ...page, encoding: 'constellation-v2-community-v1', dictionary: dict.dictionary, entities, routes };
+}
+
+export function compactConstellationIncidentPage(page: ConstellationV2IncidentPage): ConstellationV2CompactIncidentPage {
+  const dict = compactDictionary();
+  return {
+    encoding: 'constellation-v2-incidents-v1', dictionary: dict.dictionary, revision: page.revision,
+    node: [dict.id(page.node.nodeId), dict.uri(page.node.uri), dict.type(page.node.type), dict.label(page.node.label), page.node.communityPath],
+    edges: page.edges.map((edge) => [
+      dict.id(edge.edgeId), dict.type(edge.type), edge.direction, edge.provenance, dict.id(edge.endpoint.nodeId),
+      dict.uri(edge.endpoint.uri), dict.type(edge.endpoint.type), dict.label(edge.endpoint.label), edge.endpoint.communityPath,
+    ]),
+    nextCursor: page.nextCursor, coverage: page.coverage,
+  };
 }

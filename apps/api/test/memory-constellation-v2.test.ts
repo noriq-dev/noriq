@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { Env } from '../src/env';
 import { createUser, loginSession, mcpCall, mintTokenForUser } from './helpers';
 import {
+  compactConstellationCommunityPage,
   cursorMatches, decodeConstellationCursor, encodeConstellationCursor,
   type ConstellationV2CommunityPage, type ConstellationV2IncidentPage, type ConstellationV2Overview,
   type ConstellationV2Route, type ConstellationV2Unavailable,
@@ -40,6 +41,24 @@ describe('Constellation v2 cursors', () => {
     expect(cursorMatches(decoded, 'g1', 7, 'community:c1')).toBe(true);
     expect(cursorMatches(decoded, 'g2', 7, 'community:c1')).toBe(false);
     expect(decodeConstellationCursor('not-a-cursor')).toBeNull();
+  });
+});
+
+describe('Constellation v2 compact encoding', () => {
+  it('dictionary-encodes repeated entity identity fields below the verbose page size', () => {
+    const revision = { contract: 'constellation-v2' as const, generationId: 'generation-with-a-long-stable-id', sourceRevision: 1, currentRevision: 1, topologyVersion: 'connectivity-v1', layoutVersion: 'space-v1', state: 'current' as const, generatedAt: '2026-08-10T00:00:00.000Z' };
+    const community = { id: 'community-with-a-long-stable-id', parentId: null, level: 0, label: 'community', memberCount: 100, childCommunityCount: 0, typeCounts: { memory: 100 }, internalEdgeCount: 99, internalWeight: 99, normalizedCohesion: 1, boundaryWeight: 0, anchor: [0, 0, 0] as [number, number, number] };
+    const page: ConstellationV2CommunityPage = {
+      revision, community, kind: 'entities', communities: [], routes: [], externalCommunities: [], nextCursor: null,
+      coverage: { complete: true, reasons: [] },
+      entities: Array.from({ length: 100 }, (_, index) => ({
+        nodeId: `node-with-a-long-stable-id-${index}`, uri: `noriq://memory/memory-with-a-long-stable-id-${index}`,
+        type: 'memory', kind: 'observation', label: `Memory item ${index}`, authority: 0.8, validity: 'current',
+        isLead: true, leadReasons: ['authority'], degree: 3, boundaryDegree: 1, groupKey: 'memory',
+        communityId: community.id, position: [index, index / 2, -index],
+      })),
+    };
+    expect(JSON.stringify(compactConstellationCommunityPage(page)).length).toBeLessThan(JSON.stringify(page).length * 0.7);
   });
 });
 
@@ -125,7 +144,28 @@ describe('Constellation v2 REST authorization and availability', () => {
 
     const response = await SELF.fetch(`https://noriq.test/api/projects/${pid}/memory/constellation/v2/overview`, { headers: { Cookie: cookie } });
     expect(response.status).toBe(200);
-    expect((await response.json() as ConstellationV2Overview).communities).toHaveLength(1);
+    const etag = response.headers.get('ETag');
+    expect(etag).toMatch(/^"[a-f0-9]{32}"$/);
+    expect(response.headers.get('Cache-Control')).toBe('private, max-age=0, must-revalidate');
+    expect(response.headers.get('X-Noriq-Constellation-Cache')).toBe('miss');
+    expect(Number(response.headers.get('X-Noriq-Constellation-Rows'))).toBeGreaterThan(0);
+    const overviewBody = await response.json() as ConstellationV2Overview;
+    expect(overviewBody.communities).toHaveLength(1);
+
+    const unchanged = await SELF.fetch(`https://noriq.test/api/projects/${pid}/memory/constellation/v2/overview`, {
+      headers: { Cookie: cookie, 'If-None-Match': etag! },
+    });
+    expect(unchanged.status).toBe(304);
+    expect(await unchanged.text()).toBe('');
+    expect(unchanged.headers.get('X-Noriq-Constellation-Cache')).toBe('hit');
+    expect(unchanged.headers.get('X-Noriq-Constellation-Rows')).toBe('0');
+
+    const compact = await SELF.fetch(`https://noriq.test/api/projects/${pid}/memory/constellation/v2/communities/${overviewBody.communities[0]!.id}`, {
+      headers: { Cookie: cookie, Accept: 'application/vnd.noriq.constellation-v2.compact+json' },
+    });
+    expect(compact.status).toBe(200);
+    expect(compact.headers.get('Content-Type')).toContain('application/vnd.noriq.constellation-v2.compact+json');
+    expect(await compact.json()).toMatchObject({ encoding: 'constellation-v2-community-v1', dictionary: { ids: expect.any(Array) }, entities: expect.any(Array) });
 
     await createUser('pm-v2-outsider@example.com', 'Outsider', 'longenough1').catch(() => {});
     const outsider = await loginSession('pm-v2-outsider@example.com', 'longenough1');
