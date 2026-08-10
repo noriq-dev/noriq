@@ -93,7 +93,9 @@ for (const spec of SPECS) {
   const pageCommunity = { id: 'community-benchmark-leaf', parentId: 'community-benchmark-root', level: 1, label: `${spec.name} leaf`, memberCount: Math.min(500, rows.nodes.length), childCommunityCount: 0, typeCounts: {}, internalEdgeCount: 499, internalWeight: 499, normalizedCohesion: 1, boundaryWeight: 32, anchor: [0, 0, 0] as [number, number, number] };
   const v2Page: ConstellationV2CommunityPage = {
     revision: { contract: 'constellation-v2', generationId: 'benchmark-generation', sourceRevision: 42, currentRevision: 42, topologyVersion: 'connectivity-v1', layoutVersion: 'space-v1', state: 'current', generatedAt: '2026-08-10T00:00:00.000Z' },
-    community: pageCommunity, kind: 'entities', communities: [], externalCommunities: [], nextCursor: 'opaque-benchmark-cursor', coverage: { complete: false, reasons: ['page-limit-reached'] },
+    community: pageCommunity, kind: 'entities', communities: [],
+    backboneEdges: Array.from({ length: 499 }, (_, index) => ({ edgeId: `backbone-${index}`, type: 'related_to', fromNodeId: `n${index}`, toNodeId: `n${index + 1}`, direction: 'forward' as const, provenance: 'benchmark', weight: 1, historical: false })),
+    externalCommunities: [], nextCursor: 'opaque-benchmark-cursor', coverage: { complete: false, reasons: ['page-limit-reached'] },
     entities: rows.nodes.slice(0, 500).map((node, index) => ({
       nodeId: node.nodeId, uri: node.uri, type: node.type, kind: node.type === 'memory' ? 'learning' : null,
       label: node.label, authority: node.type === 'memory' ? 3 : null, validity: node.type === 'memory' ? 'active' : null,

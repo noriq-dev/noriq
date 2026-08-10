@@ -25,6 +25,7 @@ export interface Constellation3DEdge {
   weight: number;
   aggregate: boolean;
   provenance?: string | null;
+  historical?: boolean;
 }
 
 export interface Constellation3DNodeInstance extends Constellation3DNode {

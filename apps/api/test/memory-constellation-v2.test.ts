@@ -49,7 +49,7 @@ describe('Constellation v2 compact encoding', () => {
     const revision = { contract: 'constellation-v2' as const, generationId: 'generation-with-a-long-stable-id', sourceRevision: 1, currentRevision: 1, topologyVersion: 'connectivity-v1', layoutVersion: 'space-v1', state: 'current' as const, generatedAt: '2026-08-10T00:00:00.000Z' };
     const community = { id: 'community-with-a-long-stable-id', parentId: null, level: 0, label: 'community', memberCount: 100, childCommunityCount: 0, typeCounts: { memory: 100 }, internalEdgeCount: 99, internalWeight: 99, normalizedCohesion: 1, boundaryWeight: 0, anchor: [0, 0, 0] as [number, number, number] };
     const page: ConstellationV2CommunityPage = {
-      revision, community, kind: 'entities', communities: [], routes: [], externalCommunities: [], nextCursor: null,
+      revision, community, kind: 'entities', communities: [], backboneEdges: [], routes: [], externalCommunities: [], nextCursor: null,
       coverage: { complete: true, reasons: [] },
       entities: Array.from({ length: 100 }, (_, index) => ({
         nodeId: `node-with-a-long-stable-id-${index}`, uri: `noriq://memory/memory-with-a-long-stable-id-${index}`,

@@ -1746,7 +1746,7 @@ app.get('/api/projects/:pid/memory/constellation/v2/communities/:communityId', u
     cursor: c.req.query('cursor'), limit: c.req.query('limit') ? Number(c.req.query('limit')) : undefined,
   }), {
     compact: compactConstellationCommunityPage,
-    rows: (result) => 1 + result.communities.length + result.entities.length + result.routes.length + result.externalCommunities.length,
+    rows: (result) => 1 + result.communities.length + result.entities.length + result.backboneEdges.length + result.routes.length + result.externalCommunities.length,
   });
 });
 

@@ -30,6 +30,7 @@ import {
 import type { ProjectedEdgeDescriptor } from '../memory/projection';
 import {
   buildConstellationHierarchy, constellationSourceIsCurrent,
+  constellationEdgeBaseWeight,
   CONSTELLATION_LAYOUT_VERSION, CONSTELLATION_TOPOLOGY_VERSION,
   type PriorConstellationCommunity,
 } from '../memory/constellation-hierarchy';
@@ -39,7 +40,7 @@ import {
   CONSTELLATION_V2_MAX_ENTITY_LIMIT, CONSTELLATION_V2_MAX_INCIDENT_LIMIT, CONSTELLATION_V2_MAX_OVERVIEW_ROUTES,
   type ConstellationV2AggregateRoute, type ConstellationV2Community, type ConstellationV2CommunityPage,
   type ConstellationV2Coverage, type ConstellationV2Head, type ConstellationV2IncidentPage, type ConstellationV2Overview,
-  type ConstellationV2Revision, type ConstellationV2Route, type ConstellationV2Unavailable,
+  type ConstellationV2RawEdge, type ConstellationV2Revision, type ConstellationV2Route, type ConstellationV2Unavailable,
 } from '../memory/constellation-v2';
 import {
   applyMemoryFilters, classifyLead, dedupeCandidates, rankCandidates, RETRIEVAL_DEFAULTS,
@@ -874,6 +875,44 @@ export class ProjectMemory extends DurableObject<Env> {
     return { complete: !pageLimited && revision.state === 'current', reasons };
   }
 
+  private readConstellationBackbone(generationId: string, communityId: string): { edges: ConstellationV2RawEdge[]; truncated: boolean } {
+    const candidateLimit = 2_000;
+    const rows = this.ctx.storage.sql.exec<{
+      edge_id: string; type: string; from_node_id: string; to_node_id: string; provenance: string | null;
+    }>(
+      `SELECT e.id AS edge_id,e.type,e.from_node_id,e.to_node_id,e.provenance
+       FROM edges e
+       JOIN constellation_memberships source ON source.generation_id = ?1 AND source.community_id = ?2 AND source.node_id = e.from_node_id
+       JOIN constellation_memberships target ON target.generation_id = ?1 AND target.community_id = ?2 AND target.node_id = e.to_node_id
+       ORDER BY CASE e.type
+         WHEN 'calls' THEN 4 WHEN 'imports' THEN 4 WHEN 'depends_on' THEN 4 WHEN 'tests' THEN 4 WHEN 'validated_by' THEN 4 WHEN 'implements' THEN 4
+         WHEN 'modifies' THEN 3 WHEN 'declares' THEN 3 WHEN 'derived_from' THEN 3 WHEN 'decided_by' THEN 3 WHEN 'observed_in' THEN 3 WHEN 'commonly_changes_with' THEN 3
+         WHEN 'blocks' THEN 2 WHEN 'owned_by' THEN 2 WHEN 'failed_because' THEN 2 ELSE 1 END DESC,
+         e.type,e.from_node_id,e.to_node_id,e.id LIMIT ?3`,
+      generationId, communityId, candidateLimit + 1,
+    ).toArray();
+    const parent = new Map<string, string>();
+    const root = (id: string): string => {
+      const current = parent.get(id);
+      if (!current) { parent.set(id, id); return id; }
+      if (current === id) return id;
+      const resolved = root(current); parent.set(id, resolved); return resolved;
+    };
+    const edges: ConstellationV2RawEdge[] = [];
+    for (const row of rows.slice(0, candidateLimit)) {
+      const fromRoot = root(row.from_node_id), toRoot = root(row.to_node_id);
+      if (fromRoot === toRoot) continue;
+      parent.set(toRoot, fromRoot);
+      edges.push({
+        edgeId: row.edge_id, type: row.type, fromNodeId: row.from_node_id, toNodeId: row.to_node_id,
+        direction: 'forward', provenance: row.provenance, weight: constellationEdgeBaseWeight(row.type),
+        historical: row.type === 'supersedes' || row.type === 'contradicts',
+      });
+      if (edges.length >= 499) break;
+    }
+    return { edges, truncated: rows.length > candidateLimit };
+  }
+
   async constellationV2Overview(projectId: string): Promise<ConstellationV2Overview | ConstellationV2Unavailable> {
     await this.assertProjectId(projectId);
     const active = this.activeConstellationRevision();
@@ -916,7 +955,7 @@ export class ProjectMemory extends DurableObject<Env> {
       const routePage = this.readAggregateRoutes(active.generation.id, community.level + 1, communities.map((row) => row.id));
       const after = communities.at(-1)?.id;
       return {
-        revision: active.revision, community, kind: 'communities', communities, entities: [], routes: routePage.routes,
+        revision: active.revision, community, kind: 'communities', communities, entities: [], backboneEdges: [], routes: routePage.routes,
         externalCommunities: routePage.externalCommunities,
         nextCursor: pageLimited && after ? encodeConstellationCursor({ generationId: active.generation.id, currentRevision: active.revision.currentRevision, scope, after }) : null,
         coverage: this.constellationCoverage(active.revision, pageLimited || routePage.truncated, true),
@@ -956,12 +995,13 @@ export class ProjectMemory extends DurableObject<Env> {
       };
     });
     const routePage = this.readAggregateRoutes(active.generation.id, community.level, [community.id]);
+    const backbone = this.readConstellationBackbone(active.generation.id, community.id);
     const last = entityRows.at(-1);
     return {
-      revision: active.revision, community, kind: 'entities', communities: [], entities, routes: routePage.routes,
+      revision: active.revision, community, kind: 'entities', communities: [], entities, backboneEdges: backbone.edges, routes: routePage.routes,
       externalCommunities: routePage.externalCommunities,
       nextCursor: pageLimited && last ? encodeConstellationCursor({ generationId: active.generation.id, currentRevision: active.revision.currentRevision, scope, after: JSON.stringify([last.rank, last.node_id]) }) : null,
-      coverage: this.constellationCoverage(active.revision, pageLimited || routePage.truncated),
+      coverage: this.constellationCoverage(active.revision, pageLimited || routePage.truncated || backbone.truncated),
     };
   }
 

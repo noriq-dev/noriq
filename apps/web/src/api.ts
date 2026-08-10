@@ -1601,12 +1601,15 @@ export interface ApiConstellationV2RouteEdge {
 export interface ApiConstellationV2Entity extends Omit<ApiConstellationNode, 'createdAt'> {
   boundaryDegree: number; communityId: string; position: [number, number, number];
 }
+export interface ApiConstellationV2RawEdge {
+  edgeId: string; type: string; fromNodeId: string; toNodeId: string; direction: 'forward'; provenance: string | null; weight: number; historical: boolean;
+}
 export interface ApiConstellationV2Overview {
   revision: ApiConstellationV2Revision; communities: ApiConstellationV2Community[]; routes: ApiConstellationV2RouteEdge[]; coverage: ApiConstellationV2Coverage;
 }
 export interface ApiConstellationV2CommunityPage {
   revision: ApiConstellationV2Revision; community: ApiConstellationV2Community; kind: 'communities' | 'entities';
-  communities: ApiConstellationV2Community[]; entities: ApiConstellationV2Entity[]; routes: ApiConstellationV2RouteEdge[];
+  communities: ApiConstellationV2Community[]; entities: ApiConstellationV2Entity[]; backboneEdges: ApiConstellationV2RawEdge[]; routes: ApiConstellationV2RouteEdge[];
   externalCommunities: ApiConstellationV2Community[]; nextCursor: string | null; coverage: ApiConstellationV2Coverage;
 }
 export interface ApiConstellationV2EntityRoute {
@@ -1622,9 +1625,10 @@ export interface ApiConstellationV2IncidentPage {
 interface ApiConstellationV2CompactDictionary {
   ids: string[]; uris: string[]; labels: string[]; types: string[]; kinds: Array<string | null>;
 }
-interface ApiConstellationV2CompactCommunityPage extends Omit<ApiConstellationV2CommunityPage, 'entities' | 'routes'> {
+interface ApiConstellationV2CompactCommunityPage extends Omit<ApiConstellationV2CommunityPage, 'entities' | 'backboneEdges' | 'routes'> {
   encoding: 'constellation-v2-community-v1'; dictionary: ApiConstellationV2CompactDictionary;
   entities: Array<[number, number, number, number, number, number | null, string | null, boolean | null, string[] | null, number, number, number, number, number, number, number]>;
+  backboneEdges: Array<[number, number, number, number, string | null, number, boolean]>;
   routes: Array<[number, number, ApiConstellationV2RouteEdge['direction'], number, number, Record<string, number>]>;
 }
 interface ApiConstellationV2CompactIncidentPage extends Omit<ApiConstellationV2IncidentPage, 'node' | 'edges'> {
@@ -1649,6 +1653,10 @@ function decodeConstellationV2CommunityPage(wire: unknown): ApiConstellationV2Co
       label: d.labels[entity[4]]!, authority: entity[5], validity: entity[6], isLead: entity[7], leadReasons: entity[8],
       degree: entity[9], boundaryDegree: entity[10], groupKey: d.types[entity[11]]!, communityId: d.ids[entity[12]]!,
       position: [entity[13], entity[14], entity[15]],
+    })),
+    backboneEdges: page.backboneEdges.map((edge) => ({
+      edgeId: d.ids[edge[0]]!, type: d.types[edge[1]]!, fromNodeId: d.ids[edge[2]]!, toNodeId: d.ids[edge[3]]!,
+      direction: 'forward', provenance: edge[4], weight: edge[5], historical: edge[6],
     })),
     routes: page.routes.map((route) => ({
       fromCommunityId: d.ids[route[0]]!, toCommunityId: d.ids[route[1]]!, direction: route[2],

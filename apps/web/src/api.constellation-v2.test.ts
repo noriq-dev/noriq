@@ -16,7 +16,7 @@ const overview = (generationId: string): ApiConstellationV2Overview => ({
 const community = (generationId: string): ApiConstellationV2CommunityPage => ({
   revision: revision(generationId),
   community: { id: 'c1', parentId: null, level: 0, label: 'root', memberCount: 0, childCommunityCount: 0, typeCounts: {}, internalEdgeCount: 0, internalWeight: 0, normalizedCohesion: 0, boundaryWeight: 0, anchor: [0, 0, 0] },
-  kind: 'entities', communities: [], entities: [], routes: [], externalCommunities: [], nextCursor: null,
+  kind: 'entities', communities: [], entities: [], backboneEdges: [], routes: [], externalCommunities: [], nextCursor: null,
   coverage: { complete: true, reasons: [] },
 });
 

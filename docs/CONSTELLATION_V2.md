@@ -65,9 +65,9 @@ enforced.
 
 ### Transport evidence (PLNR-376)
 
-The same benchmark now constructs a maximum-size 500-entity expansion with 512 aggregate routes
-for every fixture. The compact dictionary/tuple representation is 75.54 KiB or less before
-compression and 15.35 KiB or less under gzip, passing both the 512 KiB hard uncompressed bound and
+The same benchmark now constructs a maximum-size 500-entity expansion with 499 backbone edges and
+512 aggregate routes for every fixture. The compact dictionary/tuple representation is 100.17 KiB
+or less before compression and 20.39 KiB or less under gzip, passing both the 512 KiB hard uncompressed bound and
 128 KiB compressed gate. This synthetic result tests representation size; Cloudflare production
 compression and latency remain deployment observations rather than claims made by the local run.
 
@@ -105,6 +105,23 @@ Camera and preference logic is WebGL-independent and unit tested: orbit, pan, bo
 home, focus/fly-to, transition cancellation, direct reduced-motion focus, spatial-grid and keyboard
 selection, and version/layout-qualified local state. The 3D preference key and schema are distinct
 from v1, so legacy `{x,y}` pins can never be interpreted as 3D coordinates.
+
+### Hierarchy and relationship detail (PLNR-379)
+
+Leaf expansion pages now carry a deterministic maximum-weight spanning forest selected from at
+most 2,000 ordered internal candidates, capped at 499 raw edges. Candidate truncation is explicit
+in page coverage; the renderer never substitutes a global raw-edge load. Aggregate routes remain
+the boundary context. The client merges cursor pages without duplicates, retains breadcrumbs,
+evicts oldest collapsed/off-route pages before the 12,000-node resident ceiling, and stops rather
+than silently exceeding that ceiling when pinned path pages alone fill it.
+
+All selection entry points share one pinned node ID. Community selection promotes aggregate
+routes. Entity selection cancels the previous incident request, loads only bounded incident pages,
+and maps off-page endpoints to their truthful containing community. Incoming/outgoing direction,
+type, provenance, and historical semantics survive scene assembly; clearing incident pages
+reconstructs the exact backbone/boundary scene. Hybrid search only invokes exact URI routing for a
+chosen hit, follows the returned hierarchy path, and pages the destination leaf until that entity
+is present. Generation mismatches are discarded rather than combined.
 
 ## Binding v2 contract (PLNR-372)
 

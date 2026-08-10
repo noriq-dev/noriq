@@ -12,6 +12,8 @@ const EDGE_WEIGHTS: Readonly<Record<string, number>> = {
   related_to: 1, supersedes: 1, contradicts: 1,
 };
 
+export const constellationEdgeBaseWeight = (type: string): number => EDGE_WEIGHTS[type] ?? 1;
+
 export interface PriorConstellationCommunity {
   id: string;
   level: number;

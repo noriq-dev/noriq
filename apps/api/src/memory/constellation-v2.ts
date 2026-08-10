@@ -66,6 +66,17 @@ export interface ConstellationV2Entity {
   position: [number, number, number];
 }
 
+export interface ConstellationV2RawEdge {
+  edgeId: string;
+  type: string;
+  fromNodeId: string;
+  toNodeId: string;
+  direction: 'forward';
+  provenance: string | null;
+  weight: number;
+  historical: boolean;
+}
+
 export interface ConstellationV2Overview {
   revision: ConstellationV2Revision;
   communities: ConstellationV2Community[];
@@ -79,6 +90,7 @@ export interface ConstellationV2CommunityPage {
   kind: 'communities' | 'entities';
   communities: ConstellationV2Community[];
   entities: ConstellationV2Entity[];
+  backboneEdges: ConstellationV2RawEdge[];
   routes: ConstellationV2AggregateRoute[];
   externalCommunities: ConstellationV2Community[];
   nextCursor: string | null;
@@ -132,6 +144,8 @@ export interface ConstellationV2CompactCommunityPage {
   communities: ConstellationV2Community[];
   /** node id, uri, type, kind, label, authority, validity, lead, reasons, degree, boundary degree, group, community id, x, y, z */
   entities: Array<[number, number, number, number, number, number | null, string | null, boolean | null, string[] | null, number, number, number, number, number, number, number]>;
+  /** edge id, type, from node id, to node id, provenance, weight, historical */
+  backboneEdges: Array<[number, number, number, number, string | null, number, boolean]>;
   /** from community id, to community id, direction, count, weight, by-type */
   routes: Array<[number, number, ConstellationV2AggregateRoute['direction'], number, number, Record<string, number>]>;
   externalCommunities: ConstellationV2Community[];
@@ -233,7 +247,10 @@ export function compactConstellationCommunityPage(page: ConstellationV2Community
   const routes: ConstellationV2CompactCommunityPage['routes'] = page.routes.map((route) => [
     dict.id(route.fromCommunityId), dict.id(route.toCommunityId), route.direction, route.count, route.weight, route.byType,
   ]);
-  return { ...page, encoding: 'constellation-v2-community-v1', dictionary: dict.dictionary, entities, routes };
+  const backboneEdges: ConstellationV2CompactCommunityPage['backboneEdges'] = page.backboneEdges.map((edge) => [
+    dict.id(edge.edgeId), dict.type(edge.type), dict.id(edge.fromNodeId), dict.id(edge.toNodeId), edge.provenance, edge.weight, edge.historical,
+  ]);
+  return { ...page, encoding: 'constellation-v2-community-v1', dictionary: dict.dictionary, entities, backboneEdges, routes };
 }
 
 export function compactConstellationIncidentPage(page: ConstellationV2IncidentPage): ConstellationV2CompactIncidentPage {
