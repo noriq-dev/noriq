@@ -16,6 +16,7 @@
     "check:authz": "node scripts/check-authorization-boundaries.mjs",
     "check:wrangler": "npm run check:wrangler --workspace @noriq-dev/api",
     "memory:acceptance": "node scripts/memory-acceptance.mjs",
+    "benchmark:constellation": "vite-node scripts/benchmark-constellation-v1.ts",
     "test": "npm run test --workspaces --if-present",
     "test:hooks": "node --test hooks/*.test.mjs",
     "deploy": "npm run build && npm run deploy --workspace @noriq-dev/api",
