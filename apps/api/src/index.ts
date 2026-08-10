@@ -51,7 +51,7 @@ import { assembleContextPack } from './memory/context-pack';
 import { readBoundedBody, verifyBatchChecksum, decodeBatchRows, MAX_INGEST_BATCH_BYTES, INGEST_TOKEN_TTL_SECONDS } from './memory/ingest';
 import { normalizeVerificationReport } from './memory/verification';
 import { sweepPendingEpisodeJobs } from './memory/episodes';
-import { rebuildProjectAnalytics, sweepPendingAnalyticsJobs } from './memory/analytics';
+import { getProjectAnalyticsHealth, rebuildProjectAnalytics, sweepPendingAnalyticsJobs } from './memory/analytics';
 import { classifyAgentLifecycle } from './lib/agent-lifecycle';
 import { agentLifecycleSweepConfig, sweepAgentLifecycle, type AgentLifecycleCursor } from './lib/agent-lifecycle-sweep';
 import { AGENT_LIFECYCLES, listAgentRoster, type AgentRosterLifecycle } from './lib/agent-roster';
@@ -1347,6 +1347,11 @@ app.get('/api/projects/:pid/memory/health', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
   return c.json(await memoryStub(c.env, pid).health(pid));
 });
+
+app.get('/api/projects/:pid/memory/analytics/health', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  return c.json(await getProjectAnalyticsHealth(c.env, pid));
+});
 // Canonical repository identity + checkout associations (PLNR-259) — straight D1 reads (CLAUDE.md:
 // reads go straight to D1), not a ProjectMemory DO RPC; registration/association happen through
 // ProjectRoom (runner registration/heartbeat sync them automatically — see syncRepositoryCheckouts).
@@ -1455,12 +1460,13 @@ app.delete('/api/projects/:pid/memory/repositories/:key', userAuth, async (c) =>
 // manual rebuild route below.
 app.get('/api/projects/:pid/memory/ops-status', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
-  const [health, registry, drift] = await Promise.all([
+  const [health, registry, drift, analytics] = await Promise.all([
     memoryDO(c.env, pid).health(pid),
     getMemoryRegistry(c.env, pid),
     memoryDO(c.env, pid).projectionDrift(pid),
+    getProjectAnalyticsHealth(c.env, pid),
   ]);
-  return c.json({ health, registry, drift, capabilities: memoryCapabilities(c.env) });
+  return c.json({ health, registry, drift, analytics, capabilities: memoryCapabilities(c.env) });
 });
 
 // PLNR-273: this project's backup generations (exportedAt slugs, newest first) — the picker for

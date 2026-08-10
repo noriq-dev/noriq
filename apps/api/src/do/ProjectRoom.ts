@@ -3343,6 +3343,7 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM runtime_deliveries WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare('DELETE FROM steers WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare('DELETE FROM memory_episode_jobs WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare('DELETE FROM memory_analytics_jobs WHERE project_id = ?').bind(pid),
         // Canonical execution history owns FKs to Runs/plans/tasks. Remove the orchestration
         // scope first; its CASCADE clears nodes, relations, and lifecycle events.
         this.env.DB.prepare('DELETE FROM orchestrations WHERE project_id = ?').bind(pid),

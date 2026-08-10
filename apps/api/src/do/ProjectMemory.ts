@@ -42,8 +42,11 @@ import {
 import { EpisodeSkeletonUnavailableError, loadEpisodeSkeleton } from '../memory/episodes';
 import type { EpisodeIntelligenceDraft } from '../lib/run-sitting-intelligence';
 import { normalizeAnalyticsEpisode } from '../memory/analytics-normalize';
-import type {
-  AnalyticsExecutionEventSnapshot, AnalyticsExecutionNodeSnapshot, AnalyticsSnapshotRow,
+import {
+  requestProjectAnalyticsRebuild,
+  type AnalyticsExecutionEventSnapshot,
+  type AnalyticsExecutionNodeSnapshot,
+  type AnalyticsSnapshotRow,
 } from '../memory/analytics';
 import {
   effortSignals, duplicateWarnings, summarizeEffort,
@@ -200,6 +203,20 @@ export interface IndexGenerationSummary {
   validationProblems: string[];
   createdAt: string;
   activatedAt: string | null;
+}
+
+interface AnalyticsHealthGenerationRow {
+  [key: string]: string | number | null;
+  id: string;
+  status: 'building' | 'complete' | 'failed';
+  extractionVersion: string;
+  buildMode: 'incremental' | 'full';
+  sourceMemoryRevision: number;
+  d1EventWatermark: number | null;
+  orchestrationWatermark: string | null;
+  createdAt: string;
+  completedAt: string | null;
+  error: string | null;
 }
 
 /**
@@ -685,6 +702,8 @@ export class ProjectMemory extends DurableObject<Env> {
       this.dropStagingTables();
 
       await this.reportVectorDirty(projectId, true);
+      await requestProjectAnalyticsRebuild(this.env, projectId).catch((error) =>
+        console.warn(`analytics rebuild enqueue after restore failed for ${projectId}: ${String(error)}`));
       const tableCounts: Record<string, number> = {};
       for (const table of ProjectMemory.PARENT_FIRST) tableCounts[table] = this.countRows('', table);
       return { ok: true, tableCounts };
@@ -714,6 +733,8 @@ export class ProjectMemory extends DurableObject<Env> {
       this.ctx.storage.sql.exec(`UPDATE _meta SET value = '0' WHERE key = 'has_prior_generation'`);
     });
     await this.reportVectorDirty(projectId, true);
+    await requestProjectAnalyticsRebuild(this.env, projectId).catch((error) =>
+      console.warn(`analytics rebuild enqueue after rollback failed for ${projectId}: ${String(error)}`));
     return { ok: true };
   }
 
@@ -1649,11 +1670,11 @@ export class ProjectMemory extends DurableObject<Env> {
       this.ctx.storage.sql.exec(
       `INSERT INTO analytics_generations
          (id, status, extraction_version, base_generation_id, source_memory_revision, d1_event_watermark,
-          orchestration_watermark, completeness, created_at)
-       VALUES (?1, 'building', ?2, ?3, ?4, ?5, ?6, ?7, ?8)`,
+          orchestration_watermark, completeness, created_at, build_mode)
+       VALUES (?1, 'building', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
         generationId, input.extractionVersion, input.force ? null : active?.id ?? null,
         memoryRevision, input.d1EventWatermark, input.orchestrationWatermark,
-        JSON.stringify({ status: 'building', reasons: [] }), nowIso(),
+        JSON.stringify({ status: 'building', reasons: [] }), nowIso(), input.force || !active ? 'full' : 'incremental',
       );
       if (!input.force && active) {
         this.ctx.storage.sql.exec(
@@ -1838,6 +1859,12 @@ export class ProjectMemory extends DurableObject<Env> {
       status: completenessReasons.size ? 'partial' : 'complete', reasons: [...completenessReasons].sort(),
     });
     this.ctx.storage.transactionSync(() => {
+      const activationRevision = this.readMemoryRevision();
+      if (activationRevision !== generation.source_memory_revision) {
+        throw new Error(
+          `analytics memory snapshot changed before activation: expected revision ${generation.source_memory_revision}, current ${activationRevision}`,
+        );
+      }
       this.ctx.storage.sql.exec(
         `UPDATE analytics_generations SET status = 'complete', completeness = ?2,
                 row_count = ?3, checksum = ?4, completed_at = ?5, error = NULL
@@ -1847,17 +1874,107 @@ export class ProjectMemory extends DurableObject<Env> {
       this.ctx.storage.sql.exec(
         `UPDATE analytics_active_generation SET generation_id = ?1 WHERE id = 0`, generationId,
       );
+      this.ctx.storage.sql.exec(`DELETE FROM analytics_snapshot_rows WHERE generation_id = ?1`, generationId);
     });
     return { generationId, rowCount, checksum: rollingChecksum, activated: true };
   }
 
   async failAnalyticsGeneration(projectId: string, generationId: string, error: string): Promise<void> {
     await this.assertProjectId(projectId);
-    this.ctx.storage.sql.exec(
-      `UPDATE analytics_generations SET status = 'failed', error = ?2, completed_at = ?3
-        WHERE id = ?1 AND status = 'building'`,
-      generationId, error.slice(0, 4_000), nowIso(),
-    );
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        `UPDATE analytics_generations SET status = 'failed', error = ?2, completed_at = ?3
+          WHERE id = ?1 AND status = 'building'`,
+        generationId, error.slice(0, 4_000), nowIso(),
+      );
+      this.ctx.storage.sql.exec(`DELETE FROM analytics_snapshot_rows WHERE generation_id = ?1`, generationId);
+    });
+  }
+
+  /** Stored half of analytics health. Current D1/orchestration watermarks and retry metadata are
+   * deliberately joined outside the DO by memory/analytics.ts, preserving source authority. */
+  async analyticsGenerationHealth(projectId: string): Promise<{
+    memoryRevision: number;
+    active: AnalyticsHealthGenerationRow | null;
+    building: AnalyticsHealthGenerationRow | null;
+    latestFailure: AnalyticsHealthGenerationRow | null;
+    lastSuccessfulIncrementalAt: string | null;
+    lastSuccessfulFullRebuildAt: string | null;
+    counts: { episodes: number; generations: number; rows: number; snapshotRows: number };
+  }> {
+    await this.assertProjectId(projectId);
+    const select = `SELECT id, status, extraction_version AS extractionVersion,
+      build_mode AS buildMode, source_memory_revision AS sourceMemoryRevision,
+      d1_event_watermark AS d1EventWatermark, orchestration_watermark AS orchestrationWatermark,
+      created_at AS createdAt, completed_at AS completedAt, error FROM analytics_generations`;
+    const activeId = this.ctx.storage.sql.exec<{ generation_id: string | null }>(
+      `SELECT generation_id FROM analytics_active_generation WHERE id = 0`,
+    ).toArray()[0]?.generation_id ?? null;
+    const one = (where: string, ...args: Array<string | number | null>) =>
+      this.ctx.storage.sql.exec<AnalyticsHealthGenerationRow>(`${select} ${where}`, ...args).toArray()[0] ?? null;
+    const count = (table: string) => this.ctx.storage.sql.exec<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM ${table}`,
+    ).toArray()[0]?.n ?? 0;
+    return {
+      memoryRevision: this.readMemoryRevision(),
+      active: activeId ? one('WHERE id = ?1', activeId) : null,
+      building: one("WHERE status = 'building' ORDER BY created_at DESC, id DESC LIMIT 1"),
+      latestFailure: one("WHERE status = 'failed' ORDER BY completed_at DESC, id DESC LIMIT 1"),
+      lastSuccessfulIncrementalAt: one("WHERE status = 'complete' AND build_mode = 'incremental' ORDER BY completed_at DESC LIMIT 1")?.completedAt ?? null,
+      lastSuccessfulFullRebuildAt: one("WHERE status = 'complete' AND build_mode = 'full' ORDER BY completed_at DESC LIMIT 1")?.completedAt ?? null,
+      counts: {
+        episodes: count('episodes'), generations: count('analytics_generations'),
+        rows: count('analytics_rows'), snapshotRows: count('analytics_snapshot_rows'),
+      },
+    };
+  }
+
+  /** Keep only the active complete generation, one prior complete cutover target, the newest
+   * failure diagnostic, and non-abandoned builds. Snapshot inbox rows exist only for live builds.
+   * This is bounded and idempotent; canonical episodes are never touched. */
+  async pruneAnalyticsGenerations(projectId: string, maxBuildingAgeMs: number): Promise<{
+    pruned: number; abandoned: number;
+  }> {
+    await this.assertProjectId(projectId);
+    const cutoff = new Date(Date.now() - maxBuildingAgeMs).toISOString();
+    const activeId = this.ctx.storage.sql.exec<{ generation_id: string | null }>(
+      `SELECT generation_id FROM analytics_active_generation WHERE id = 0`,
+    ).toArray()[0]?.generation_id ?? null;
+    const priorId = this.ctx.storage.sql.exec<{ id: string }>(
+      `SELECT id FROM analytics_generations WHERE status = 'complete' AND id IS NOT ?1
+        ORDER BY completed_at DESC, id DESC LIMIT 1`, activeId,
+    ).toArray()[0]?.id ?? null;
+    const failureId = this.ctx.storage.sql.exec<{ id: string }>(
+      `SELECT id FROM analytics_generations WHERE status = 'failed'
+        ORDER BY completed_at DESC, id DESC LIMIT 1`,
+    ).toArray()[0]?.id ?? null;
+    const abandoned = this.ctx.storage.sql.exec<{ id: string }>(
+      `SELECT id FROM analytics_generations WHERE status = 'building' AND created_at < ?1
+        ORDER BY created_at DESC, id DESC`, cutoff,
+    ).toArray();
+    const keep = new Set([activeId, priorId, failureId].filter((id): id is string => !!id));
+    if (abandoned[0]) keep.add(abandoned[0].id);
+    const all = this.ctx.storage.sql.exec<{ id: string; status: string; created_at: string }>(
+      `SELECT id, status, created_at FROM analytics_generations`,
+    ).toArray();
+    const remove = all.filter((row) => !keep.has(row.id)
+      && (row.status !== 'building' || row.created_at < cutoff));
+    this.ctx.storage.transactionSync(() => {
+      for (const row of abandoned) {
+        this.ctx.storage.sql.exec(
+          `UPDATE analytics_generations SET status = 'failed', completed_at = ?2,
+                  error = 'abandoned analytics build expired during lifecycle sweep'
+            WHERE id = ?1 AND status = 'building'`, row.id, nowIso(),
+        );
+        this.ctx.storage.sql.exec(`DELETE FROM analytics_snapshot_rows WHERE generation_id = ?1`, row.id);
+      }
+      for (const row of remove) {
+        this.ctx.storage.sql.exec(`DELETE FROM analytics_snapshot_rows WHERE generation_id = ?1`, row.id);
+        this.ctx.storage.sql.exec(`DELETE FROM analytics_rows WHERE generation_id = ?1`, row.id);
+        this.ctx.storage.sql.exec(`DELETE FROM analytics_generations WHERE id = ?1`, row.id);
+      }
+    });
+    return { pruned: remove.length, abandoned: abandoned.length };
   }
 
   async beginEpisodeIngest(projectId: string, manifest: EpisodeUploadManifest): Promise<{ ok: true }> {
@@ -1931,10 +2048,7 @@ export class ProjectMemory extends DurableObject<Env> {
       recorded++;
     }
     if (recorded) {
-      await this.env.DB.prepare(
-        `INSERT INTO memory_analytics_jobs (project_id, requested_at) VALUES (?, ?)
-         ON CONFLICT (project_id) DO UPDATE SET requested_at = excluded.requested_at`,
-      ).bind(projectId, nowIso()).run().catch((error) =>
+      await requestProjectAnalyticsRebuild(this.env, projectId).catch((error) =>
         console.warn(`analytics enqueue after episode enrichment failed: ${String(error)}`));
     }
     return { ok: true, batchesReceived: state.receivedBatches.size, rowCount: state.rows.length, recorded, skipped };

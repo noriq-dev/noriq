@@ -108,7 +108,7 @@ describe('auditable deletion sequence', () => {
     expect(h.tableCounts.nodes).toBe(0);
     const remainingBackups = await listProjectBackupGenerations(appEnv, projectId);
     expect(remainingBackups).toEqual([]);
-    for (const table of ['project_memory_registry', 'project_repositories', 'memory_event_dedup']) {
+    for (const table of ['project_memory_registry', 'project_repositories', 'memory_event_dedup', 'memory_analytics_jobs']) {
       const row = await appEnv.DB.prepare(`SELECT 1 FROM ${table} WHERE project_id = ?`).bind(projectId).first();
       expect(row).toBeNull();
     }

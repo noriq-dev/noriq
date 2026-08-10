@@ -57,6 +57,7 @@ import sql0009 from '../../memory-migrations/0009_guidance_drift.sql';
 import sql0010 from '../../memory-migrations/0010_edge_provenance.sql';
 import sql0011 from '../../memory-migrations/0011_memory_node_labels.sql';
 import sql0012 from '../../memory-migrations/0012_analytics_generations.sql';
+import sql0013 from '../../memory-migrations/0013_analytics_lifecycle.sql';
 
 export interface MemoryMigration {
   /** 1-based, contiguous, and equal to this entry's array index + 1. */
@@ -93,6 +94,7 @@ export const MEMORY_MIGRATIONS: readonly MemoryMigration[] = [
   // change; see the .sql file's own header comment.
   { version: 11, name: '0011_memory_node_labels', sql: sql0011 },
   { version: 12, name: '0012_analytics_generations', sql: sql0012 },
+  { version: 13, name: '0013_analytics_lifecycle', sql: sql0013 },
 ];
 
 /** The schema version a freshly-migrated store lands on. */

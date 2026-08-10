@@ -227,3 +227,49 @@ export const AnalyticsGenerationDescriptor = z.object({
   error: z.string().nullable().default(null),
 });
 export type AnalyticsGenerationDescriptor = z.infer<typeof AnalyticsGenerationDescriptor>;
+
+export const AnalyticsStaleSource = z.enum([
+  'extraction_version',
+  'project_memory',
+  'coordination',
+  'orchestration',
+]);
+export type AnalyticsStaleSource = z.infer<typeof AnalyticsStaleSource>;
+
+export const ProjectAnalyticsHealth = z.object({
+  projectId: z.string().min(1),
+  state: AnalyticsGenerationState,
+  extractionVersion: z.string().min(1),
+  active: AnalyticsGenerationDescriptor.nullable(),
+  building: AnalyticsGenerationDescriptor.nullable(),
+  latestFailure: AnalyticsGenerationDescriptor.nullable(),
+  staleSources: z.array(AnalyticsStaleSource),
+  lag: z.object({
+    memoryRevisions: z.number().int().nonnegative().nullable(),
+    coordinationEvents: z.number().int().nonnegative().nullable(),
+    orchestrationChanged: z.boolean(),
+  }),
+  currentSources: IntelligenceSourceWatermarks,
+  lastSuccessfulIncrementalAt: z.string().datetime().nullable(),
+  lastSuccessfulFullRebuildAt: z.string().datetime().nullable(),
+  retry: z.object({
+    pending: z.boolean(),
+    attempts: z.number().int().nonnegative(),
+    requestedAt: z.string().datetime().nullable(),
+    lastAttemptAt: z.string().datetime().nullable(),
+    nextRetryAt: z.string().datetime().nullable(),
+    lastError: z.string().nullable(),
+  }),
+  storage: z.object({
+    canonicalRetainedRows: z.number().int().nonnegative(),
+    disposableDerivedRows: z.number().int().nonnegative(),
+    byKind: z.object({
+      episodes: z.number().int().nonnegative(),
+      commissioningFacts: z.number().int().nonnegative(),
+      analyticsGenerations: z.number().int().nonnegative(),
+      analyticsRows: z.number().int().nonnegative(),
+      analyticsSnapshotRows: z.number().int().nonnegative(),
+    }),
+  }),
+});
+export type ProjectAnalyticsHealth = z.infer<typeof ProjectAnalyticsHealth>;
