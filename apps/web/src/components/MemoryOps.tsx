@@ -98,6 +98,7 @@ function CapabilitiesStrip({ capabilities }: { capabilities: ApiMemoryOpsStatus[
 
 export function MemoryOps({ pid, store }: { pid: string; store: AppStore }) {
   const isAdmin = store.isAdmin;
+  const canManage = store.permissions?.canManage ?? isAdmin;
   const projectName = store.data.projects.find((p) => p.id === pid)?.name ?? 'this project';
 
   const [reachable, setReachable] = useState<boolean | null>(null);
@@ -185,6 +186,11 @@ export function MemoryOps({ pid, store }: { pid: string; store: AppStore }) {
   if (!status) return null;
 
   const { health, registry, capabilities } = status;
+  const hierarchy = status.hierarchy ?? {
+    state: 'unavailable' as const, active: null, building: null, lastFailed: null,
+    rows: { nodeStats: 0, communities: 0, memberships: 0, links: 0 },
+    cache: { policy: 'private-revalidate' as const, compactPageTargetBytes: 256 * 1024, compactPageHardLimitBytes: 512 * 1024 },
+  };
   const vectorDirty = registry?.vectorDirty ?? false;
   const backupStatus = registry?.backupStatus ?? 'none';
 
@@ -246,6 +252,36 @@ export function MemoryOps({ pid, store }: { pid: string; store: AppStore }) {
           <SectionLabel>Optional bindings</SectionLabel>
           <div style={{ marginTop: 8 }}>
             <CapabilitiesStrip capabilities={capabilities} />
+          </div>
+        </Section>
+
+        <Section title="Constellation hierarchy">
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginBottom: 10 }}>
+            <StateChip
+              tone={hierarchy.state === 'current' ? 'ok' : hierarchy.state === 'failed' ? 'bad' : hierarchy.state === 'unavailable' ? 'muted' : 'warn'}
+              label={hierarchy.state}
+            />
+            <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>
+              source revision {hierarchy.active?.sourceRevision ?? '—'} / canonical {health.memoryRevision}
+              {' '}· generated {fmtWhen(hierarchy.active?.completedAt ?? null)}
+            </span>
+          </div>
+          <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', lineHeight: 1.8, marginBottom: 10 }}>
+            active rows: {hierarchy.rows.nodeStats} node stats · {hierarchy.rows.memberships} memberships · {hierarchy.rows.communities} communities · {hierarchy.rows.links} aggregate routes
+            <br />cache: private revalidation · compact page target {fmtBytes(hierarchy.cache.compactPageTargetBytes)} / hard limit {fmtBytes(hierarchy.cache.compactPageHardLimitBytes)}
+            {hierarchy.building && <><br /><span style={{ color: 'var(--amber)' }}>building {shortId(hierarchy.building.id)} from revision {hierarchy.building.sourceRevision} since {fmtWhen(hierarchy.building.createdAt)}</span></>}
+            {hierarchy.lastFailed && <><br /><span style={{ color: 'var(--red-soft)' }}>last failed {shortId(hierarchy.lastFailed.id)} · {hierarchy.lastFailed.failureReason ?? 'no reason recorded'}</span></>}
+          </div>
+          {canManage ? <Button
+            variant="ghost"
+            disabled={actionBusy === 'hierarchy-rebuild' || hierarchy.state === 'building'}
+            onClick={() => void runAction('hierarchy-rebuild', () => api.memoryConstellationV2Rebuild(pid).then((result) => {
+              if (!result.ok) throw new Error(result.detail);
+            }))}
+          >{actionBusy === 'hierarchy-rebuild' ? 'rebuilding…' : hierarchy.state === 'building' ? 'build in progress' : 'Rebuild hierarchy'}</Button>
+            : <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>project manager role required to rebuild</div>}
+          <div style={{ marginTop: 8, fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>
+            Rebuilds disposable navigation data from the canonical graph; it does not mutate memories or graph relationships.
           </div>
         </Section>
 

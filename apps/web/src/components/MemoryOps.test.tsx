@@ -15,10 +15,11 @@ import type { AppStore } from '../store';
 let container: HTMLDivElement;
 let root: Root | null = null;
 
-function fakeStore(opts: { isAdmin?: boolean } = {}): AppStore {
+function fakeStore(opts: { isAdmin?: boolean; canManage?: boolean } = {}): AppStore {
   return {
     currentPid: 'prj_1',
     isAdmin: opts.isAdmin ?? true,
+    permissions: { canManage: opts.canManage ?? opts.isAdmin ?? true },
     data: { projects: [{ id: 'prj_1', name: 'Acme Project' }] },
   } as unknown as AppStore;
 }
@@ -52,6 +53,13 @@ const buttonContaining = (label: string) => [...container.querySelectorAll('butt
 const OK_STATUS: ApiMemoryOpsStatus = {
   health: { projectId: 'prj_1', schemaVersion: 1, memoryRevision: 3, tableCounts: {}, databaseSize: 1024, sizeStatus: 'ok', hasPriorGeneration: false },
   registry: { backupStatus: 'ok', lastBackupAt: '2026-01-01T00:00:00.000Z', vectorDirty: false, sizeBytes: 1024, sizeStatus: 'ok' },
+  hierarchy: {
+    state: 'current',
+    active: { id: 'cgen_current', sourceRevision: 3, currentRevision: 3, topologyVersion: 'connectivity-v1', layoutVersion: 'space-v1', status: 'active', createdAt: '2026-01-01T00:00:00.000Z', completedAt: '2026-01-01T00:00:01.000Z', activatedAt: '2026-01-01T00:00:01.000Z', failureReason: null },
+    building: null, lastFailed: null,
+    rows: { nodeStats: 12, communities: 2, memberships: 12, links: 1 },
+    cache: { policy: 'private-revalidate', compactPageTargetBytes: 262144, compactPageHardLimitBytes: 524288 },
+  },
   capabilities: { r2: true, vectorize: true, workersAI: true, codeVectorize: true },
 };
 
@@ -92,6 +100,43 @@ describe('renders without crashing on a project with no repositories, generation
   });
 });
 
+describe('Constellation hierarchy operations (PLNR-382)', () => {
+  it('shows source/current revision, row and cache health, and lets a project manager rebuild without instance-admin role', async () => {
+    mockClean();
+    const rebuild = vi.spyOn(api, 'memoryConstellationV2Rebuild').mockResolvedValue({
+      ok: true, generationId: 'cgen_next', sourceRevision: 3, nodes: 12, edges: 1,
+    });
+    mount(fakeStore({ isAdmin: false, canManage: true }));
+    await tick();
+    expect(text()).toContain('Constellation hierarchy');
+    expect(text()).toContain('source revision 3 / canonical 3');
+    expect(text()).toContain('12 node stats');
+    expect(text()).toContain('hard limit 512.0 KB');
+    act(() => button('Rebuild hierarchy')!.click());
+    await tick();
+    expect(rebuild).toHaveBeenCalledWith('prj_1');
+  });
+
+  it('distinguishes an in-progress successor and the last failed attempt while retaining active rows', async () => {
+    vi.spyOn(api, 'memoryOpsStatus').mockResolvedValue({
+      ...OK_STATUS,
+      hierarchy: {
+        ...OK_STATUS.hierarchy,
+        state: 'building',
+        building: { ...OK_STATUS.hierarchy.active!, id: 'cgen_building', status: 'building', sourceRevision: 4, completedAt: null, activatedAt: null },
+        lastFailed: { ...OK_STATUS.hierarchy.active!, id: 'cgen_failed', status: 'failed', failureReason: 'worker interrupted', completedAt: null, activatedAt: null },
+      },
+    });
+    vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });
+    vi.spyOn(api, 'memoryBackupsList').mockResolvedValue({ backups: [], r2Available: true });
+    mount(); await tick();
+    expect(text()).toContain('building');
+    expect(text()).toContain('last failed');
+    expect(text()).toContain('worker interrupted');
+    expect(button('build in progress')).toBeDefined();
+  });
+});
+
 describe('the five failure modes render distinctly — no shared generic error text', () => {
   const STALE_REPO: ApiMemoryRepository = {
     id: 'pr_1', projectId: 'prj_1', repositoryKey: 'stale-repo', indexingEnabled: true, ingestStatus: 'active',
@@ -129,6 +174,7 @@ describe('the five failure modes render distinctly — no shared generic error t
     vi.spyOn(api, 'memoryOpsStatus').mockResolvedValue({
       health: { ...OK_STATUS.health },
       registry: { backupStatus: 'failed', lastBackupAt: '2026-01-01T00:00:00.000Z', vectorDirty: true, sizeBytes: 1024, sizeStatus: 'ok' },
+      hierarchy: OK_STATUS.hierarchy,
       capabilities: OK_STATUS.capabilities,
     });
     vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [STALE_REPO, FAILED_REPO] });
@@ -321,6 +367,7 @@ describe('a missing optional binding reads as reduced capability, never an error
     vi.spyOn(api, 'memoryOpsStatus').mockResolvedValue({
       health: OK_STATUS.health,
       registry: null, // never touched its memory store — R2 unbound instances still start here
+      hierarchy: OK_STATUS.hierarchy,
       capabilities: { r2: false, vectorize: true, workersAI: true, codeVectorize: true },
     });
     vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });

@@ -12,7 +12,7 @@
 // number/label displayed here (authority, validity, isLead, verificationState) is read straight
 // from the API — this file never re-derives `classifyLead` or `verifiedForBase` itself.
 import { parseEntityUri } from '@noriq-dev/shared';
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   api,
   type ApiConstellationNode, type ApiGraphEntityPage, type ApiGraphEntitySort,
@@ -24,6 +24,7 @@ import { MemoryGraph } from './MemoryGraph';
 import { MemoryOps } from './MemoryOps';
 import { MemoryReview } from './MemoryReview';
 import { MemoryStarMap } from './MemoryStarMap';
+import { MemoryConstellationV2 } from './MemoryConstellationV2';
 import { Button, Select, TextArea, TextInput } from './ui';
 
 type MemorySubTab = 'map' | 'review' | 'explore' | 'graph' | 'operations';
@@ -67,6 +68,21 @@ export function MemoryView({ store }: { store: AppStore }) {
   // secondary-but-primary-entry-point view. Explore/Graph/Operations are each one tab-click away —
   // nothing Phase 8 shipped lost a hop.
   const [tab, setTab] = useState<MemorySubTab>('map');
+  const [mapMode, setMapMode] = useState<'legacy' | 'v2'>(() => {
+    try { return localStorage.getItem('noriq.memory.mapMode') === 'legacy' ? 'legacy' : 'v2'; }
+    catch { return 'v2'; }
+  });
+  const [compatibilityNotice, setCompatibilityNotice] = useState<string | null>(null);
+  const changeMapMode = (mode: 'legacy' | 'v2') => {
+    setMapMode(mode); setCompatibilityNotice(null);
+    try { localStorage.setItem('noriq.memory.mapMode', mode); } catch { /* optional preference */ }
+  };
+  const useCompatibilityMap = useCallback((reason: string) => {
+    // Session-only: do not persist this downgrade, so a newly deployed v2 server/generation is
+    // tried again on the next visit during a rolling rollout.
+    setCompatibilityNotice(reason);
+    setMapMode('legacy');
+  }, []);
 
   // Pivot targets: a star's URI, carried across the tab switch as a fresh-mount initializer
   // (mirroring how `?task=` seeds MemoryGraph's own picker) rather than a controlled prop, so
@@ -113,10 +129,21 @@ export function MemoryView({ store }: { store: AppStore }) {
               {t.label}{t.id === 'review' && reviewCount != null && reviewCount > 0 ? ` · ${reviewCount}` : ''}
             </button>
           ))}
+          {tab === 'map' && <button
+            type="button"
+            onClick={() => changeMapMode(mapMode === 'v2' ? 'legacy' : 'v2')}
+            style={{ cursor: 'pointer', padding: '5px 10px', borderRadius: 6, fontSize: 11, color: 'var(--text-mid)' }}
+            title={mapMode === 'v2' ? 'Use the established 2D map' : 'Try the hierarchical 3D constellation'}
+          >{mapMode === 'v2' ? 'use 2D map' : 'try 3D v2'}</button>}
         </div>
       </div>
       <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
-        {tab === 'map' && <MemoryStarMap pid={store.currentPid} onOpenEgoNetwork={openEgoNetwork} onOpenInspector={openInspector} />}
+        {tab === 'map' && compatibilityNotice && <div role="status" style={{ position: 'absolute', zIndex: 4, top: 8, left: '50%', transform: 'translateX(-50%)', maxWidth: 620, padding: '7px 10px', borderRadius: 8, background: 'var(--panel)', border: '1px solid var(--amber)', color: 'var(--text-mid)', fontSize: 10.5 }}>
+          Using the compatible 2D map because Constellation v2 is not available from this server/generation: {compatibilityNotice}
+        </div>}
+        {tab === 'map' && (mapMode === 'v2'
+          ? <MemoryConstellationV2 pid={store.currentPid} onOpenEgoNetwork={openEgoNetwork} onOpenInspector={openInspector} onFallback={useCompatibilityMap} />
+          : <MemoryStarMap pid={store.currentPid} onOpenEgoNetwork={openEgoNetwork} onOpenInspector={openInspector} />)}
         {tab === 'review' && <MemoryReview pid={store.currentPid} store={store} onOpenInspector={openInspector} onQueueChange={setReviewCount} />}
         {tab === 'explore' && <ExploreTab pid={store.currentPid} store={store} initialSelectionUri={inspectorUri} onOpenEgoNetwork={openEgoNetwork} />}
         {tab === 'graph' && <MemoryGraph pid={store.currentPid} store={store} initialSeedUri={graphSeedUri} />}

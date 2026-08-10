@@ -11,6 +11,10 @@ import type {
   GraphEntityPage, GraphEntityPageInput,
 } from '../memory/graph-queries';
 import type { SurfaceId } from '../memory/guidance-drift';
+import type {
+  ConstellationV2CommunityPage, ConstellationV2Head, ConstellationV2IncidentPage, ConstellationV2Overview,
+  ConstellationV2Route, ConstellationV2Unavailable,
+} from '../memory/constellation-v2';
 import { renderEvidenceFrame, type EvidenceFrameItem, type EvidenceFrameResult } from '../memory/evidence-frame';
 import { userCanAccessProject } from './visibility';
 import { readExecutionSpec } from './execution-spec';
@@ -296,6 +300,11 @@ export interface ProjectMemoryStub {
    *  contract. Read-only, no input beyond the project id (no seed — this is the whole map). */
   constellation(projectId: string, options?: ConstellationOptions): Promise<ConstellationResult>;
   listGraphEntities(projectId: string, input?: GraphEntityPageInput): Promise<GraphEntityPage>;
+  constellationV2Head(projectId: string): Promise<ConstellationV2Head | ConstellationV2Unavailable>;
+  constellationV2Overview(projectId: string): Promise<ConstellationV2Overview | ConstellationV2Unavailable>;
+  constellationV2Community(projectId: string, communityId: string, input?: { cursor?: string; limit?: number }): Promise<ConstellationV2CommunityPage | ConstellationV2Unavailable>;
+  constellationV2Route(projectId: string, uri: string): Promise<ConstellationV2Route | ConstellationV2Unavailable>;
+  constellationV2Incidents(projectId: string, nodeId: string, input?: { cursor?: string; limit?: number }): Promise<ConstellationV2IncidentPage | ConstellationV2Unavailable>;
   /** PLNR-255: re-embed this project's memories/episodes into the operational search index and
    *  clear `project_memory_registry.vector_dirty` on success (Phase 4's fill-in of the Phase
    *  2/3 no-op hook). No-ops honestly when no embeddings backend is bound. */

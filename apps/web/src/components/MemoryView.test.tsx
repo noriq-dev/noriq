@@ -38,6 +38,9 @@ function mount(store = fakeStore()) {
 }
 
 beforeEach(() => {
+  // Most legacy star-map assertions below are not cutover tests. Pin their surface explicitly;
+  // the first describe removes this preference when it verifies the new default.
+  localStorage.setItem('noriq.memory.mapMode', 'legacy');
   vi.spyOn(api, 'memoryReviewQueue').mockResolvedValue({
     items: [],
     counts: { proposed_decision: 0, contradiction: 0, stale_invalid: 0, recent_negative_feedback: 0, low_authority: 0 },
@@ -50,6 +53,7 @@ afterEach(() => {
   container?.remove();
   root = null;
   vi.restoreAllMocks();
+  localStorage.removeItem('noriq.memory.mapMode');
   history.replaceState(null, '', '/'); // the star map writes q/facet/selection params
 });
 
@@ -90,6 +94,30 @@ function emptyConstellation(overrides: Partial<ApiConstellation> = {}): ApiConst
 }
 
 describe('the memory view lands on the map (PLNR-287)', () => {
+  it('offers the integrated v2 surface without removing the established 2D escape hatch', async () => {
+    localStorage.removeItem('noriq.memory.mapMode');
+    vi.spyOn(api, 'memoryConstellation').mockResolvedValue(emptyConstellation());
+    vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });
+    vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({
+      revision: { contract: 'constellation-v2', generationId: 'g1', sourceRevision: 1, currentRevision: 1, topologyVersion: 'connectivity-v1', layoutVersion: 'space-v1', state: 'current', generatedAt: 'now' },
+      communities: [], routes: [], coverage: { complete: true, reasons: [] },
+    });
+    mount(); await tick();
+    expect(text()).toContain('No memory entities are present in this completed generation');
+    expect([...container.querySelectorAll('button')].some((button) => button.textContent === 'use 2D map')).toBe(true);
+  });
+
+  it('falls back session-only to the 2D contract when a mixed-version server has no v2 route', async () => {
+    localStorage.removeItem('noriq.memory.mapMode');
+    vi.spyOn(api, 'memoryConstellation').mockResolvedValue(emptyConstellation());
+    vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });
+    vi.spyOn(api, 'memoryConstellationV2Overview').mockRejectedValue(new Error('HTTP 404'));
+    mount(); await tick(); await tick();
+    expect(text()).toContain('Using the compatible 2D map');
+    expect(text()).toContain('Nothing has been recorded yet');
+    expect(localStorage.getItem('noriq.memory.mapMode')).toBeNull();
+  });
+
   it('shows the map, search-focused, with Explore/Graph/Operations each one tab away', async () => {
     vi.spyOn(api, 'memoryConstellation').mockResolvedValue(emptyConstellation());
     vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });

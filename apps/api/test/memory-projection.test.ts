@@ -10,6 +10,7 @@ import type { Actor, CreateRunInput, RunView, TaskPatch, UpdatedTask } from '../
 import { createUser, mintTokenForUser, mcpCall } from './helpers';
 import { buildEntityUri } from '@noriq-dev/shared';
 import { mapCoordinationEvent } from '../src/memory/projection';
+import type { ConstellationV2Overview } from '../src/memory/constellation-v2';
 
 const appEnv = env as unknown as Env;
 // The DurableObjectStub RPC type collapses CreateRun's RunView return to `never` (same reason
@@ -84,6 +85,8 @@ interface MemRpc {
   ): Promise<{ setId: string; contradictionId: string }>;
   recordEpisode(pid: string, input: RecordEpisodeInput): Promise<{ episodeId: string }>;
   rebuildProjection(pid: string): Promise<{ nodesWritten: number; edgesWritten: number }>;
+  rebuildConstellationHierarchy(pid: string): Promise<{ ok: boolean }>;
+  constellationV2Overview(pid: string): Promise<ConstellationV2Overview>;
   searchProjectMemory(pid: string, opts: Record<string, unknown>): Promise<{ mode: string; results: Array<{ entityType: string; id: string; uri?: string }> }>;
   // PLNR-320
   backfillProjectionOnce(pid: string): Promise<{ ran: boolean; nodesWritten?: number; edgesWritten?: number }>;
@@ -570,6 +573,14 @@ describe('mapCoordinationEvent — pure mapping (PLNR-316)', () => {
     });
   });
 
+  it('prefers authoritative dependency titles over keys so incremental projection converges with rebuild labels', () => {
+    const projected = mapCoordinationEvent({
+      verb: 'dependency.added', subjectId: 'task_abc',
+      payload: { key: 'PM-1', title: 'Dependent title', dependsOn: 'PM-2', dependsOnId: 'task_def', dependsOnTitle: 'Blocker title' },
+    });
+    expect(projected?.edges[0]).toMatchObject({ from: { label: 'Dependent title' }, to: { label: 'Blocker title' } });
+  });
+
   it('dependency.added with no dependsOnId (pre-widening payload, defensive) projects nothing', () => {
     expect(mapCoordinationEvent({ verb: 'dependency.added', subjectId: 'task_abc', payload: { key: 'PM-1', dependsOn: 'PM-2' } })).toBeNull();
   });
@@ -614,6 +625,14 @@ describe('mapCoordinationEvent — pure mapping (PLNR-316)', () => {
       verb: 'run.created', subjectId: 'run_abc', payload: { kind: 'scope', agentTool: 'codex', repoRef: 'main', anchor: 'plan', anchorId: 'plan_anchor' },
     });
     expect(projected?.edges[0]?.to).toEqual({ type: 'plan', uri: buildEntityUri({ kind: 'plan', id: 'plan_anchor' }), label: 'plan_anchor' });
+  });
+
+  it('keeps the authoritative anchor label on a run edge instead of regressing it to an opaque id', () => {
+    const projected = mapCoordinationEvent({
+      verb: 'run.created', subjectId: 'run_abc',
+      payload: { kind: 'build', anchor: 'task', anchorId: 'task_anchor', anchorLabel: 'Human-readable task' },
+    });
+    expect(projected?.edges[0]?.to.label).toBe('Human-readable task');
   });
 
   it('dependency.unblocked still projects nothing — no new relationship (the depends_on edge already exists; unblocking is a readiness change, not a graph change)', () => {
@@ -1396,6 +1415,9 @@ describe('PLNR-320: rebuildProjection converges — a rebuild after full increme
     const applied = await memory(projectId).runProjector(projectId);
     expect(applied.applied).toBeGreaterThan(0);
 
+    expect((await memory(projectId).rebuildConstellationHierarchy(projectId)).ok).toBe(true);
+    const hierarchyBefore = await memory(projectId).constellationV2Overview(projectId);
+
     const before = await memory(projectId)._allEdgesForTest(projectId);
     // owned_by (claim) + depends_on + related_to(doc) + related_to(plan) + related_to(run->anchor)
     expect(before.length).toBeGreaterThanOrEqual(5);
@@ -1405,6 +1427,11 @@ describe('PLNR-320: rebuildProjection converges — a rebuild after full increme
 
     const after = await memory(projectId)._allEdgesForTest(projectId);
     expect(after).toEqual(before); // THE assertion — byte-identical, not just same length
+    expect((await memory(projectId).rebuildConstellationHierarchy(projectId)).ok).toBe(true);
+    const hierarchyAfter = await memory(projectId).constellationV2Overview(projectId);
+    expect({ communities: hierarchyAfter.communities, routes: hierarchyAfter.routes }).toEqual({
+      communities: hierarchyBefore.communities, routes: hierarchyBefore.routes,
+    });
 
     // The run edge's provenance in particular stays event:run.created — the incremental path got
     // there first, so rebuildProjection's own 'coordination:runs' attempt never wins the race.

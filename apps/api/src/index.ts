@@ -85,6 +85,10 @@ import {
 import { auditAuthorizationParity, reconcileLegacyGroupGrants } from './lib/authorization-parity';
 import { evaluateMemoryAcceptance } from './memory/acceptance';
 import {
+  compactConstellationCommunityPage, compactConstellationIncidentPage, CONSTELLATION_V2_COMPACT_MEDIA_TYPE,
+  type ConstellationV2Revision, type ConstellationV2Unavailable,
+} from './memory/constellation-v2';
+import {
   declareRunnerExecution, ensureRunExecution, getOrchestrationTree, listOrchestrations, reconcileRunnerExecution,
   reportRunnerExecutionEvent, reportRunnerExecutionRelation,
 } from './lib/orchestration-store';
@@ -235,6 +239,7 @@ const MANAGER_ROUTES = [
   /\/search\/reindex$/,
   /\/memory\/repositories(?:\/[^/]+)?$/,
   /\/memory\/(backup|restore(?:\/rollback)?|lifecycle-sweep|graph\/rebuild)$/,
+  /\/memory\/constellation\/v2\/rebuild$/,
   /\/memory\/generations(?:\/[^/]+\/(?:activate|abort)|\/prune-retained)$/,
   /\/memory\/vectors\/rebuild$/,
   /\/memory\/items\/[^/]+\/(approve|reject)$/,
@@ -1563,13 +1568,14 @@ app.delete('/api/projects/:pid/memory/repositories/:key', userAuth, async (c) =>
 // manual rebuild route below.
 app.get('/api/projects/:pid/memory/ops-status', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
-  const [health, registry, drift, analytics] = await Promise.all([
+  const [health, registry, drift, analytics, hierarchy] = await Promise.all([
     memoryDO(c.env, pid).health(pid),
     getMemoryRegistry(c.env, pid),
     memoryDO(c.env, pid).projectionDrift(pid),
     getProjectAnalyticsHealth(c.env, pid),
+    memoryDO(c.env, pid).constellationHierarchyOperations(pid),
   ]);
-  return c.json({ health, registry, drift, analytics, capabilities: memoryCapabilities(c.env) });
+  return c.json({ health, registry, drift, analytics, hierarchy, capabilities: memoryCapabilities(c.env) });
 });
 
 // PLNR-273: this project's backup generations (exportedAt slugs, newest first) — the picker for
@@ -1855,6 +1861,117 @@ app.post('/api/projects/:pid/memory/constellation', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
   const body: { includeIsolated?: boolean } = await c.req.json<{ includeIsolated?: boolean }>().catch(() => ({}));
   return c.json(await memoryStub(c.env, pid).constellation(pid, { includeIsolated: body.includeIsolated === true }));
+});
+
+// Constellation v2 reads only completed derived hierarchy rows. These additive GET routes are
+// cache-addressable and never fall through to v1's whole-graph materialization.
+const constellationUnavailableResponse = (c: Context<AppContext>, result: ConstellationV2Unavailable) => {
+  const status = result.error === 'generation-unavailable' ? 503 : result.error === 'not-found' ? 404 : 409;
+  if (result.retryAfter) c.header('Retry-After', String(result.retryAfter));
+  c.header('Cache-Control', 'private, no-store');
+  return c.json({ ...result, error: `constellation_${result.error.replaceAll('-', '_')}` }, status);
+};
+
+const constellationEtag = async (revision: ConstellationV2Revision, identity: string, representation: string) =>
+  `"${(await sha256Hex([
+    revision.contract, revision.generationId, revision.currentRevision, revision.topologyVersion,
+    revision.layoutVersion, identity, representation,
+  ].join('\n'))).slice(0, 32)}"`;
+
+const ifNoneMatchIncludes = (raw: string | undefined, etag: string) =>
+  raw?.split(',').some((candidate) => candidate.trim() === etag || candidate.trim() === '*') === true;
+
+type ConstellationReadResult = { revision: ConstellationV2Revision } | ConstellationV2Unavailable;
+const constellationIsUnavailable = (value: ConstellationReadResult): value is ConstellationV2Unavailable =>
+  'ok' in value && value.ok === false;
+
+async function constellationCachedRead<T extends ConstellationReadResult>(
+  c: Context<AppContext>,
+  pid: string,
+  read: () => Promise<T>,
+  options: {
+    compact?: (value: Exclude<T, ConstellationV2Unavailable>) => unknown;
+    rows: (value: Exclude<T, ConstellationV2Unavailable>) => number;
+  },
+) {
+  const stub = memoryStub(c.env, pid);
+  const head = await stub.constellationV2Head(pid);
+  if (constellationIsUnavailable(head)) return constellationUnavailableResponse(c, head);
+  const compact = Boolean(options.compact && c.req.header('Accept')?.includes(CONSTELLATION_V2_COMPACT_MEDIA_TYPE));
+  const representation = compact ? 'compact-v1' : 'verbose-v1';
+  const identity = new URL(c.req.url).pathname + new URL(c.req.url).search;
+  const headEtag = await constellationEtag(head.revision, identity, representation);
+  c.header('Cache-Control', 'private, max-age=0, must-revalidate');
+  c.header('Vary', 'Accept');
+  c.header('ETag', headEtag);
+  if (ifNoneMatchIncludes(c.req.header('If-None-Match'), headEtag)) {
+    c.header('X-Noriq-Constellation-Cache', 'hit');
+    c.header('X-Noriq-Constellation-Rows', '0');
+    c.header('Server-Timing', 'constellation;dur=0;desc="metadata validation"');
+    return c.body(null, 304);
+  }
+
+  const started = performance.now();
+  const result = await read();
+  if (constellationIsUnavailable(result)) return constellationUnavailableResponse(c, result);
+  const payload = compact && options.compact ? options.compact(result as Exclude<T, ConstellationV2Unavailable>) : result;
+  const body = JSON.stringify(payload);
+  const duration = performance.now() - started;
+  const responseEtag = await constellationEtag(result.revision, identity, representation);
+  c.header('ETag', responseEtag);
+  c.header('Content-Type', compact ? `${CONSTELLATION_V2_COMPACT_MEDIA_TYPE}; charset=UTF-8` : 'application/json; charset=UTF-8');
+  c.header('X-Noriq-Constellation-Cache', 'miss');
+  c.header('X-Noriq-Constellation-Rows', String(options.rows(result as Exclude<T, ConstellationV2Unavailable>)));
+  c.header('X-Noriq-Constellation-Bytes', String(new TextEncoder().encode(body).byteLength));
+  c.header('X-Noriq-Constellation-Stale', result.revision.state === 'current' ? '0' : '1');
+  c.header('Server-Timing', `constellation;dur=${duration.toFixed(2)};desc="page read and serialization"`);
+  return c.body(body, 200);
+}
+
+app.get('/api/projects/:pid/memory/constellation/v2/overview', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  return constellationCachedRead(c, pid, () => memoryStub(c.env, pid).constellationV2Overview(pid), {
+    rows: (result) => result.communities.length + result.routes.length,
+  });
+});
+
+app.get('/api/projects/:pid/memory/constellation/v2/communities/:communityId', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  return constellationCachedRead(c, pid, () => memoryStub(c.env, pid).constellationV2Community(pid, c.req.param('communityId')!, {
+    cursor: c.req.query('cursor'), limit: c.req.query('limit') ? Number(c.req.query('limit')) : undefined,
+  }), {
+    compact: compactConstellationCommunityPage,
+    rows: (result) => 1 + result.communities.length + result.entities.length + result.backboneEdges.length + result.routes.length + result.externalCommunities.length,
+  });
+});
+
+app.get('/api/projects/:pid/memory/constellation/v2/route', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const uri = c.req.query('uri');
+  if (!uri) return c.json({ error: 'uri is required' }, 400);
+  return constellationCachedRead(c, pid, () => memoryStub(c.env, pid).constellationV2Route(pid, uri), {
+    rows: (result) => result.communityPath.length + 1,
+  });
+});
+
+app.get('/api/projects/:pid/memory/constellation/v2/entities/:nodeId/incidents', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  return constellationCachedRead(c, pid, () => memoryStub(c.env, pid).constellationV2Incidents(pid, c.req.param('nodeId')!, {
+    cursor: c.req.query('cursor'), limit: c.req.query('limit') ? Number(c.req.query('limit')) : undefined,
+  }), {
+    compact: compactConstellationIncidentPage,
+    rows: (result) => 1 + result.node.communityPath.length + result.edges.length
+      + result.edges.reduce((count, edge) => count + edge.endpoint.communityPath.length, 0),
+  });
+});
+
+// A project owner/manager can rebuild this project's disposable visualization hierarchy. The
+// project authorization boundary above classifies this route as `manage`; no instance-admin
+// token is involved, and the canonical graph remains unchanged.
+app.post('/api/projects/:pid/memory/constellation/v2/rebuild', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const result = await memoryDO(c.env, pid).rebuildConstellationHierarchy(pid);
+  return c.json(result, result.ok ? 200 : 409);
 });
 
 // PLNR-339: exhaustive ordered catalogue behind Explore and the accessible map list. Kept
