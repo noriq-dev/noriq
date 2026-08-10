@@ -93,6 +93,8 @@ describe('agent lifecycle sweep policy and configuration (PLNR-363)', () => {
   });
 
   it('dry-runs without mutation and reports both transitions and protected work', async () => {
+    const eventCountBefore = (await env.DB.prepare('SELECT COUNT(*) AS count FROM agent_lifecycle_events')
+      .first<{ count: number }>())!.count;
     const result = await sweepAgentLifecycle(appEnv, { dryRun: true, at: NOW, cursor: CURSOR });
     expect(result.referenceCheck).toEqual({ complete: true, blockers: [] });
     expect(result.transitions['actor:active->retired:session_inactive']).toBe(1);
@@ -108,7 +110,7 @@ describe('agent lifecycle sweep policy and configuration (PLNR-363)', () => {
       "SELECT 1 AS present FROM agent_presences WHERE id = 'zzals_presence'",
     ).first()).toEqual({ present: 1 });
     expect((await env.DB.prepare('SELECT COUNT(*) AS count FROM agent_lifecycle_events')
-      .first<{ count: number }>())!.count).toBe(0);
+      .first<{ count: number }>())!.count).toBe(eventCountBefore);
   });
 
   it('applies once, converges through archival, and never retires protected sessions', async () => {

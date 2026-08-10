@@ -17,6 +17,8 @@ import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } 
 import { RunKind, AgentTool, RunStatus, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType } from '@noriq-dev/shared';
 import { writeExecutionSpec } from '../lib/execution-spec';
 import { processPendingEpisodeJob } from '../memory/episodes';
+import { ensureRunExecution, mirrorRunTransition } from '../lib/orchestration-store';
+import type { ExecutionAssignment } from '@noriq-dev/shared';
 
 /**
  * ProjectRoom — one instance per project (idFromName(projectId)).
@@ -214,6 +216,7 @@ export interface RunPatch {
   worktreePath?: string | null; // daemon-side checkout path, for server-side visibility
   phase?: RunPhase | null; // sub-state of running (RUN-31); forced to null on terminal
   reason?: string | null;
+  observedAt?: string;
 }
 
 type RunRow = {
@@ -251,6 +254,8 @@ export interface RunView {
   projectId: string;
   runnerId: string | null;
   agentId: string | null;
+  /** Server-authored execution assignment. Additive; absent only on a degraded legacy read. */
+  execution?: ExecutionAssignment | null;
   kind: string;
   anchor: { type: 'task'; taskId: string } | { type: 'plan'; planId: string } | null;
   /** VERIFY only: the build run whose diff this one judges. */
@@ -2887,6 +2892,7 @@ export class ProjectRoom extends DurableObject<Env> {
         `SELECT DISTINCT pt.task_id AS taskId FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE ph.plan_id = ?`,
       ).bind(planId).all<{ taskId: string }>();
       await this.env.DB.batch([
+        this.env.DB.prepare('UPDATE execution_nodes SET plan_id = NULL WHERE plan_id = ?').bind(planId),
         // Gate rows before phases — the subselect needs the phases still present.
         this.env.DB.prepare('DELETE FROM phase_gates WHERE phase_id IN (SELECT id FROM phases WHERE plan_id = ?)').bind(planId),
         this.env.DB.prepare('DELETE FROM phase_tasks WHERE phase_id IN (SELECT id FROM phases WHERE plan_id = ?)').bind(planId),
@@ -2930,6 +2936,7 @@ export class ProjectRoom extends DurableObject<Env> {
         'SELECT doc_id AS docId FROM task_docs WHERE task_id = ?',
       ).bind(id).all<{ docId: string }>();
       await this.env.DB.batch([
+        this.env.DB.prepare('UPDATE execution_nodes SET task_id = NULL WHERE task_id = ?').bind(id),
         this.env.DB.prepare('DELETE FROM phase_tasks WHERE task_id = ?').bind(id),
         this.env.DB.prepare('DELETE FROM dependencies WHERE task_id = ? OR depends_on_task_id = ?').bind(id, id),
         this.env.DB.prepare('DELETE FROM claims WHERE task_id = ?').bind(id),
@@ -3333,6 +3340,9 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM runtime_deliveries WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare('DELETE FROM steers WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare('DELETE FROM memory_episode_jobs WHERE project_id = ?').bind(pid),
+        // Canonical execution history owns FKs to Runs/plans/tasks. Remove the orchestration
+        // scope first; its CASCADE clears nodes, relations, and lifecycle events.
+        this.env.DB.prepare('DELETE FROM orchestrations WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM runs WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM plan_dispatches WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM plan_landings WHERE project_id = ?').bind(pid),
@@ -3549,7 +3559,9 @@ export class ProjectRoom extends DurableObject<Env> {
       kind: input.kind, agentTool: input.agentTool, repoRef: input.repoRef, anchor: anchorType, anchorId,
     });
     if (runnerId) await this.emit(actor, 'run.dispatched', 'run', id, { runnerId, to: 'dispatched' });
-    return this.runToWire(await this.loadRun(id));
+    const view = this.runToWire(await this.loadRun(id));
+    view.execution = await ensureRunExecution(this.env, id);
+    return view;
   }
 
   /** Assign a queued Run to a runner and mark it dispatched. */
@@ -3565,7 +3577,9 @@ export class ProjectRoom extends DurableObject<Env> {
         "UPDATE runs SET runner_id = ?, status = 'dispatched', dispatched_at = ?, updated_at = ? WHERE id = ?",
       ).bind(runnerId, now, now, runId).run();
       await this.emit(actor, 'run.dispatched', 'run', runId, { runnerId, from: run.status, to: 'dispatched' });
-      return this.runToWire(await this.loadRun(runId));
+      const view = this.runToWire(await this.loadRun(runId));
+      view.execution = await ensureRunExecution(this.env, runId);
+      return view;
     });
   }
 
@@ -3663,7 +3677,9 @@ export class ProjectRoom extends DurableObject<Env> {
           });
         }
       }
-      return this.runToWire(await this.loadRun(runId));
+      const view = this.runToWire(await this.loadRun(runId));
+      view.execution = await ensureRunExecution(this.env, runId);
+      return view;
     });
   }
 
@@ -4245,6 +4261,12 @@ export class ProjectRoom extends DurableObject<Env> {
       }
       // D1 batch is atomic: a terminal state can never commit without its retryable episode job.
       await this.env.DB.batch(transitionStatements);
+      // The run row remains the transition authority. Its canonical sitting projection is
+      // repaired synchronously here for old and new Runners alike; daemon-reported child work
+      // uses the additive execution protocol separately.
+      await mirrorRunTransition(this.env, {
+        runId, from: run.status, to, observedAt: patch.observedAt ?? now, reason: patch.reason,
+      });
       if (isTerminalRunStatus(to) && agentId) await this.retireRunAgent(agentId);
       // The RUN's terminal outcome now moves its anchor task — not the agent (RUN-83). The build
       // agent used to release_task(review) when it finished, BEFORE the daemon's verify/reviewer
@@ -5130,6 +5152,7 @@ export class ProjectRoom extends DurableObject<Env> {
             "UPDATE tasks SET status = 'cancelled', updated_at = ? WHERE id = ? AND status = 'todo' AND claimed_by IS NULL",
           ).bind(now, r.id),
         ),
+        this.env.DB.prepare('UPDATE execution_nodes SET plan_id = NULL WHERE plan_id = ?').bind(planId),
         // Gate rows before phases (subselect needs them). Phase-order gating dies with the
         // phase_tasks rows themselves (PLNR-163) — nothing else to reap.
         this.env.DB.prepare('DELETE FROM phase_gates WHERE phase_id IN (SELECT id FROM phases WHERE plan_id = ?)').bind(planId),

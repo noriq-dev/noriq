@@ -53,9 +53,19 @@ import { sweepPendingEpisodeJobs } from './memory/episodes';
 import { classifyAgentLifecycle } from './lib/agent-lifecycle';
 import { agentLifecycleSweepConfig, sweepAgentLifecycle, type AgentLifecycleCursor } from './lib/agent-lifecycle-sweep';
 import { AGENT_LIFECYCLES, listAgentRoster, type AgentRosterLifecycle } from './lib/agent-roster';
-import { AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget, isTerminalRunStatus, normalizeProjectKey, IndexGenerationManifest, ContextPackRole, type RunnerIndexCursor } from '@noriq-dev/shared';
+import {
+  AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget,
+  ORCHESTRATION_CAPABILITY, RunnerProtocolCapability,
+  RunnerExecutionDeclaration, RunnerExecutionEventReport, RunnerExecutionReconciliation,
+  RunnerExecutionRelationReport, isTerminalRunStatus, normalizeProjectKey,
+  IndexGenerationManifest, ContextPackRole, type RunnerIndexCursor,
+} from '@noriq-dev/shared';
 import { auditAuthorizationParity, reconcileLegacyGroupGrants } from './lib/authorization-parity';
 import { evaluateMemoryAcceptance } from './memory/acceptance';
+import {
+  declareRunnerExecution, ensureRunExecution, getOrchestrationTree, reconcileRunnerExecution,
+  reportRunnerExecutionEvent, reportRunnerExecutionRelation,
+} from './lib/orchestration-store';
 
 export { ProjectRoom } from './do/ProjectRoom';
 export { AgentSession } from './do/AgentSession';
@@ -3297,6 +3307,16 @@ app.get('/api/projects/:pid/runs', userAuth, async (c) => {
   return c.json({ runs });
 });
 
+// Human/read-side orchestration tree. The project middleware above applies the same visibility
+// rule as every other /api/projects/:pid surface; the store also re-checks project ownership.
+app.get('/api/projects/:pid/orchestrations/:orchestrationId', userAuth, async (c) => {
+  try {
+    return c.json(await getOrchestrationTree(c.env.DB, c.req.param('pid')!, c.req.param('orchestrationId')!));
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 404);
+  }
+});
+
 // --- Plan dispatch (PLNR-170): dispatch a whole PLAN; the server fans out per-task runs ---
 // The dispatch primitive above stays the unit of execution — this creates a durable
 // orchestration record and a pump in the project's room turns ready tasks (dependency edges
@@ -3523,6 +3543,9 @@ const RunAgentBody = z.object({
   // shared constant to drift. Optional: an older daemon that omits it gets the full
   // catalogue, which is the pre-RUN-47 behavior it enforces against anyway.
   allowedTools: z.array(z.string().min(1).max(64)).max(64).optional(),
+  // PLNR-366: this one-shot request has no WebSocket handshake. A capable daemon advertises
+  // the same shared capability here; absent means the legacy response does not grow a field.
+  protocolCapabilities: z.array(RunnerProtocolCapability).max(16).default([]),
 });
 app.post('/api/runs/:runId/agent', agentAuth, async (c) => {
   const runId = c.req.param('runId')!;
@@ -3631,7 +3654,86 @@ app.post('/api/runs/:runId/agent', agentAuth, async (c) => {
     projectId: run.projectId,
     token: tokens.access_token,
     expiresIn: tokens.expires_in,
+    ...(b.protocolCapabilities.includes(ORCHESTRATION_CAPABILITY)
+      ? { execution: await ensureRunExecution(c.env, runId) }
+      : {}),
   });
+});
+
+type RunnerOwnedRun = { id: string; projectId: string; runnerId: string | null; owner: string | null };
+async function runnerOwnedRun(c: Context<AppContext>, runId: string): Promise<RunnerOwnedRun | null> {
+  return c.env.DB.prepare(
+    `SELECT r.id, r.project_id AS projectId, r.runner_id AS runnerId, rn.owner_user_id AS owner
+       FROM runs r LEFT JOIN runners rn ON rn.id = r.runner_id WHERE r.id = ?`,
+  ).bind(runId).first<RunnerOwnedRun>();
+}
+
+// HTTP parity for daemons that cannot keep the WebSocket alive. Every write is parsed from the
+// exact shared schema used by RunnerHub, but project/orchestration/run/sitting/actor facts are
+// derived from the owned Run rather than trusted from the body.
+app.get('/api/runs/:runId/orchestration', agentAuth, async (c) => {
+  const runId = c.req.param('runId')!;
+  const run = await runnerOwnedRun(c, runId);
+  if (!run || run.owner !== c.var.connection!.userId) return c.json({ error: 'run not found' }, 404);
+  const denied = await runnerProjectActionDenied(c, run.projectId, 'view');
+  if (denied) return denied;
+  return c.json({ assignment: await ensureRunExecution(c.env, runId) });
+});
+
+app.post('/api/runs/:runId/executions', agentAuth, async (c) => {
+  const runId = c.req.param('runId')!;
+  const run = await runnerOwnedRun(c, runId);
+  if (!run || run.owner !== c.var.connection!.userId) return c.json({ error: 'run not found' }, 404);
+  const denied = await runnerProjectActionDenied(c, run.projectId, 'contribute');
+  if (denied) return denied;
+  const parsed = RunnerExecutionDeclaration.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid execution declaration', detail: parsed.error.issues }, 400);
+  try {
+    return c.json(await declareRunnerExecution(c.env, runId, parsed.data));
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 409);
+  }
+});
+
+app.post('/api/runs/:runId/execution-relations', agentAuth, async (c) => {
+  const runId = c.req.param('runId')!;
+  const run = await runnerOwnedRun(c, runId);
+  if (!run || run.owner !== c.var.connection!.userId) return c.json({ error: 'run not found' }, 404);
+  const denied = await runnerProjectActionDenied(c, run.projectId, 'contribute');
+  if (denied) return denied;
+  const parsed = RunnerExecutionRelationReport.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid execution relation', detail: parsed.error.issues }, 400);
+  try {
+    return c.json(await reportRunnerExecutionRelation(c.env, runId, parsed.data));
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 409);
+  }
+});
+
+app.post('/api/runs/:runId/execution-events', agentAuth, async (c) => {
+  const runId = c.req.param('runId')!;
+  const run = await runnerOwnedRun(c, runId);
+  if (!run || run.owner !== c.var.connection!.userId) return c.json({ error: 'run not found' }, 404);
+  const denied = await runnerProjectActionDenied(c, run.projectId, 'contribute');
+  if (denied) return denied;
+  const parsed = RunnerExecutionEventReport.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid execution event', detail: parsed.error.issues }, 400);
+  try {
+    return c.json(await reportRunnerExecutionEvent(c.env, runId, parsed.data));
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 409);
+  }
+});
+
+app.post('/api/runs/:runId/execution-reconcile', agentAuth, async (c) => {
+  const runId = c.req.param('runId')!;
+  const run = await runnerOwnedRun(c, runId);
+  if (!run || run.owner !== c.var.connection!.userId) return c.json({ error: 'run not found' }, 404);
+  const denied = await runnerProjectActionDenied(c, run.projectId, 'contribute');
+  if (denied) return denied;
+  const parsed = RunnerExecutionReconciliation.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid execution reconciliation', detail: parsed.error.issues }, 400);
+  return c.json(await reconcileRunnerExecution(c.env, runId, parsed.data));
 });
 
 /**

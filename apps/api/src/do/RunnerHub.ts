@@ -1,9 +1,23 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../env';
 import type { Actor } from './ProjectRoom';
-import { RunnerClientMessage, RUNNER_PROTOCOL_VERSION } from '@noriq-dev/shared';
+import {
+  ORCHESTRATION_CAPABILITY,
+  RunnerClientMessage,
+  RUNNER_PROTOCOL_CAPABILITIES,
+  RUNNER_PROTOCOL_VERSION,
+  type ExecutionReportAck,
+  type RunnerProtocolCapability,
+} from '@noriq-dev/shared';
 import { projectRoleAllows, resolveAccountCapabilities, resolveProjectAccess } from '../lib/authorization';
 import { tokenCanReachProject } from '../lib/visibility';
+import {
+  declareRunnerExecution,
+  ensureRunExecution,
+  reconcileRunnerExecution,
+  reportRunnerExecutionEvent,
+  reportRunnerExecutionRelation,
+} from '../lib/orchestration-store';
 
 /**
  * RunnerHub — one instance per runner (idFromName(runnerId)).
@@ -16,7 +30,7 @@ import { tokenCanReachProject } from '../lib/visibility';
  * forwarded here (token → runner owner), mirroring /ws/projects.
  */
 const SYS: Actor = { kind: 'system', id: 'system', name: 'system' };
-type RunnerSocketAuth = { userId: string; tokenId: string };
+type RunnerSocketAuth = { userId: string; tokenId: string; capabilities?: RunnerProtocolCapability[] };
 
 export class RunnerHub extends DurableObject<Env> {
   private _runnerId?: string;
@@ -54,7 +68,7 @@ export class RunnerHub extends DurableObject<Env> {
       try {
         const auth = await this.authorizeSocket(ws);
         if (!auth) continue;
-        ws.send(json);
+        ws.send(await this.messageForSocket(ws, json));
         delivered = true;
       } catch { /* socket gone */ }
     }
@@ -80,7 +94,13 @@ export class RunnerHub extends DurableObject<Env> {
         return;
 
       case 'hello': {
-        if (!this.sendIfOpen(ws, JSON.stringify({ type: 'registered', runnerId, protocol: RUNNER_PROTOCOL_VERSION, serverTime: new Date().toISOString() }))) return;
+        const acceptedCapabilities = RUNNER_PROTOCOL_CAPABILITIES.filter((capability) =>
+          msg.protocolCapabilities.includes(capability));
+        ws.serializeAttachment({ ...auth, capabilities: acceptedCapabilities } satisfies RunnerSocketAuth);
+        if (!this.sendIfOpen(ws, JSON.stringify({
+          type: 'registered', runnerId, protocol: RUNNER_PROTOCOL_VERSION,
+          serverTime: new Date().toISOString(), acceptedCapabilities,
+        }))) return;
         // Redeliver Runs already dispatched to this runner but not yet started — they
         // may have been assigned while the socket was down (dispatch-before-connect).
         const { results } = await this.env.DB.prepare(
@@ -89,7 +109,7 @@ export class RunnerHub extends DurableObject<Env> {
         for (const r of results) {
           if (!(await this.authorizeProject(ws, auth, r.pid))) return;
           const run = await this.runView(r.id);
-          if (run && !this.sendIfOpen(ws, JSON.stringify({ type: 'run.assigned', run }))) return;
+          if (run && !this.sendIfOpen(ws, await this.messageForSocket(ws, JSON.stringify({ type: 'run.assigned', run })))) return;
         }
         return;
       }
@@ -129,12 +149,70 @@ export class RunnerHub extends DurableObject<Env> {
             agentId: msg.agentId ?? undefined,
             exit: msg.exit ?? undefined,
             worktreePath: msg.worktreePath ?? undefined,
+            observedAt: msg.at,
           });
         } catch (err) {
           // The DO is authoritative, so a rejected frame is dropped — but LOUDLY (RUN-45): this
           // exact catch silently ate every same-status report for the whole life of RUN-43,
           // which is how a dead frame kept looking load-bearing.
           console.warn(`run.status rejected for ${msg.runId}: ${String(err)}`);
+        }
+        return;
+      }
+
+      case 'execution.declare': {
+        const pid = await this.authorizeRun(ws, auth, runnerId, msg.runId);
+        if (!pid) return;
+        try {
+          const result = await declareRunnerExecution(this.env, msg.runId, msg.declaration);
+          this.sendExecutionAck(ws, {
+            reportId: msg.declaration.reportId, accepted: true, executionId: result.id,
+            status: null, expectedRevision: null, error: null,
+          });
+        } catch (error) {
+          this.sendExecutionAck(ws, this.rejectedAck(msg.declaration.reportId, error));
+        }
+        return;
+      }
+
+      case 'execution.relation': {
+        const pid = await this.authorizeRun(ws, auth, runnerId, msg.runId);
+        if (!pid) return;
+        try {
+          await reportRunnerExecutionRelation(this.env, msg.runId, msg.relation);
+          this.sendExecutionAck(ws, {
+            reportId: msg.relation.reportId, accepted: true, executionId: msg.relation.fromExecutionId,
+            status: null, expectedRevision: null, error: null,
+          });
+        } catch (error) {
+          this.sendExecutionAck(ws, this.rejectedAck(msg.relation.reportId, error));
+        }
+        return;
+      }
+
+      case 'execution.event': {
+        const pid = await this.authorizeRun(ws, auth, runnerId, msg.runId);
+        if (!pid) return;
+        try {
+          const result = await reportRunnerExecutionEvent(this.env, msg.runId, msg.event);
+          this.sendExecutionAck(ws, {
+            reportId: msg.event.reportId, accepted: true, executionId: msg.event.executionId,
+            status: result.status, expectedRevision: result.expectedRevision, error: null,
+          });
+        } catch (error) {
+          this.sendExecutionAck(ws, this.rejectedAck(msg.event.reportId, error, msg.event.executionId));
+        }
+        return;
+      }
+
+      case 'execution.reconcile': {
+        const pid = await this.authorizeRun(ws, auth, runnerId, msg.runId);
+        if (!pid) return;
+        try {
+          const result = await reconcileRunnerExecution(this.env, msg.runId, msg.reconciliation);
+          for (const ack of result.acknowledgements) this.sendExecutionAck(ws, ack);
+        } catch (error) {
+          this.sendExecutionAck(ws, this.rejectedAck(msg.reconciliation.reportId, error));
         }
         return;
       }
@@ -213,6 +291,42 @@ export class RunnerHub extends DurableObject<Env> {
     } catch {
       return false;
     }
+  }
+
+  private sendExecutionAck(ws: WebSocket, ack: ExecutionReportAck): void {
+    this.sendIfOpen(ws, JSON.stringify({ type: 'execution.ack', ack }));
+  }
+
+  private rejectedAck(reportId: string, error: unknown, executionId: string | null = null): ExecutionReportAck {
+    return {
+      reportId, accepted: false, executionId, status: null, expectedRevision: null,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  private async authorizeRun(
+    ws: WebSocket, auth: RunnerSocketAuth, runnerId: string, runId: string,
+  ): Promise<string | null> {
+    if (!auth.capabilities?.includes(ORCHESTRATION_CAPABILITY)) return null;
+    const row = await this.env.DB.prepare('SELECT project_id AS pid, runner_id AS rid FROM runs WHERE id = ?')
+      .bind(runId).first<{ pid: string; rid: string | null }>();
+    if (!row || row.rid !== runnerId) return null;
+    return await this.authorizeProject(ws, auth, row.pid) ? row.pid : null;
+  }
+
+  /** Strip orchestration from legacy sockets and derive it server-side for negotiated peers. */
+  private async messageForSocket(ws: WebSocket, json: string): Promise<string> {
+    let parsed: { type?: string; run?: Record<string, unknown> };
+    try { parsed = JSON.parse(json) as typeof parsed; } catch { return json; }
+    if (parsed.type !== 'run.assigned' || !parsed.run || typeof parsed.run.id !== 'string') return json;
+    const auth = ws.deserializeAttachment() as RunnerSocketAuth | null;
+    const run = { ...parsed.run };
+    if (auth?.capabilities?.includes(ORCHESTRATION_CAPABILITY)) {
+      run.execution = await ensureRunExecution(this.env, parsed.run.id);
+    } else {
+      delete run.execution;
+    }
+    return JSON.stringify({ ...parsed, run });
   }
 
   /** A runner credential never inherits a human administrator override. Re-check the OAuth

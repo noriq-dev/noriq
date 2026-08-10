@@ -1,5 +1,13 @@
 import type { Env } from '../env';
 import { newId, nowIso, sha256Hex } from './util';
+import type {
+  ExecutionAssignment,
+  ExecutionReportAck,
+  RunnerExecutionDeclaration,
+  RunnerExecutionEventReport,
+  RunnerExecutionReconciliation,
+  RunnerExecutionRelationReport,
+} from '@noriq-dev/shared';
 
 export const EXECUTION_KINDS = ['copilot_session', 'run', 'sitting', 'stage', 'step', 'gate'] as const;
 export const EXECUTION_ROLES = ['orchestrator', 'planner', 'worker', 'reviewer', 'verifier', 'repair', 'system'] as const;
@@ -40,6 +48,9 @@ export type DeclareExecutionInput = {
   /** Explicit terminal continuation. The new node points to the terminal predecessor with a
    * `continues` relation; structural parentage is still declared independently and immutable. */
   continuesExecutionId?: string;
+  /** Internal accepting-server exception: a plan pump or verifier may append a new immutable
+   * child to its durable work envelope. Public clients cannot set this through REST/MCP schemas. */
+  allowTerminalExtension?: boolean;
   observedAt: string;
 };
 
@@ -98,6 +109,19 @@ async function actorExists(db: D1Database, actor: ActorRef | null | undefined): 
     .bind(actor.id, actor.kind === 'agent' ? 'agent' : 'copilot').first());
 }
 
+async function actorUserId(db: D1Database, actor: ActorRef): Promise<string | null> {
+  if (actor.kind === 'human') return actor.id;
+  if (actor.kind === 'agent' || actor.kind === 'copilot') {
+    return (await db.prepare('SELECT user_id AS userId FROM agents WHERE id = ? AND kind = ?')
+      .bind(actor.id, actor.kind).first<{ userId: string }>())?.userId ?? null;
+  }
+  if (actor.kind === 'runner') {
+    return (await db.prepare('SELECT owner_user_id AS userId FROM runners WHERE id = ?')
+      .bind(actor.id).first<{ userId: string }>())?.userId ?? null;
+  }
+  return null;
+}
+
 export async function createOrchestration(env: Env, input: {
   projectId: string;
   anchor: { type: 'task' | 'plan' | 'run' | 'chat'; id: string } | { type: 'none' };
@@ -109,9 +133,12 @@ export async function createOrchestration(env: Env, input: {
   const anchorId = input.anchor.type === 'none' ? null : input.anchor.id;
   if (input.anchor.type !== 'none') {
     const table = input.anchor.type === 'task' ? 'tasks' : input.anchor.type === 'plan' ? 'plans' : input.anchor.type === 'run' ? 'runs' : null;
+    const ownerUserId = input.anchor.type === 'chat' ? await actorUserId(env.DB, input.createdBy) : null;
     const found = table
       ? await env.DB.prepare(`SELECT 1 FROM ${table} WHERE id = ? AND project_id = ?`).bind(anchorId, input.projectId).first()
-      : await env.DB.prepare('SELECT 1 FROM ask_threads WHERE id = ?').bind(anchorId).first();
+      : ownerUserId
+        ? await env.DB.prepare('SELECT 1 FROM ask_threads WHERE id = ? AND user_id = ?').bind(anchorId, ownerUserId).first()
+        : null;
     if (!found) throw new Error('orchestration anchor is outside the project');
   }
   const id = newId('orc');
@@ -136,9 +163,6 @@ export async function declareExecution(env: Env, input: DeclareExecutionInput): 
     'SELECT project_id AS projectId, status FROM orchestrations WHERE id = ?',
   ).bind(input.orchestrationId).first<{ projectId: string; status: ExecutionStatus }>();
   if (!orchestration || orchestration.projectId !== input.projectId) throw new Error('orchestration is outside the authorized project');
-  if (terminal.has(orchestration.status) && !input.continuesExecutionId) {
-    throw new Error('orchestration is terminal; declare an authorized continuation instead');
-  }
   if (!input.localNodeKey || !input.producerScope) throw new Error('producerScope and localNodeKey are required');
   if (!await actorExists(env.DB, input.actor)) throw new Error('execution actor does not exist or has the wrong kind');
   const subject = input.subject ?? {};
@@ -166,6 +190,9 @@ export async function declareExecution(env: Env, input: DeclareExecutionInput): 
   if (existing) {
     if (existing.declarationHash !== declarationHash) throw new Error('local execution key conflicts with its canonical declaration');
     return { id: existing.id, created: false };
+  }
+  if (terminal.has(orchestration.status) && !input.continuesExecutionId && !input.allowTerminalExtension) {
+    throw new Error('orchestration is terminal; declare an authorized continuation instead');
   }
 
   let parent: ExecutionRow | null = null;
@@ -351,6 +378,9 @@ export async function refreshOrchestrationStatus(db: D1Database, orchestrationId
     `SELECT n.status, COUNT(*) AS count FROM execution_nodes n
       WHERE n.orchestration_id = ?
         AND NOT EXISTS (
+          SELECT 1 FROM execution_nodes child WHERE child.parent_execution_id = n.id
+        )
+        AND NOT EXISTS (
           SELECT 1 FROM execution_relations r
            WHERE r.orchestration_id = n.orchestration_id
              AND r.type = 'continues' AND r.to_execution_id = n.id
@@ -371,4 +401,328 @@ export async function refreshOrchestrationStatus(db: D1Database, orchestrationId
     'UPDATE orchestrations SET status = ?, updated_at = ?, finished_at = ? WHERE id = ?',
   ).bind(status, at, finishedAt, orchestrationId).run();
   return status;
+}
+
+type RunExecutionFacts = {
+  id: string;
+  projectId: string;
+  runnerId: string | null;
+  agentId: string | null;
+  kind: 'scope' | 'build' | 'verify';
+  taskId: string | null;
+  planId: string | null;
+  verifiesRunId: string | null;
+  planDispatchId: string | null;
+  sitting: number;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+async function loadRunExecutionFacts(db: D1Database, runId: string): Promise<RunExecutionFacts> {
+  const run = await db.prepare(
+    `SELECT r.id, r.project_id AS projectId, r.runner_id AS runnerId, r.agent_id AS agentId,
+            r.kind,
+            CASE WHEN r.anchor_type = 'task' AND EXISTS (
+              SELECT 1 FROM tasks t WHERE t.id = r.anchor_id AND t.project_id = r.project_id
+            ) THEN r.anchor_id END AS taskId,
+            CASE
+              WHEN r.plan_id IS NOT NULL AND EXISTS (
+                SELECT 1 FROM plans p WHERE p.id = r.plan_id AND p.project_id = r.project_id
+              ) THEN r.plan_id
+              WHEN r.anchor_type = 'plan' AND EXISTS (
+                SELECT 1 FROM plans p WHERE p.id = r.anchor_id AND p.project_id = r.project_id
+              ) THEN r.anchor_id
+            END AS planId,
+            r.verifies_run_id AS verifiesRunId, r.plan_dispatch_id AS planDispatchId,
+            r.sitting, r.created_by AS createdBy, r.created_at AS createdAt, r.updated_at AS updatedAt
+       FROM runs r WHERE r.id = ?`,
+  ).bind(runId).first<RunExecutionFacts>();
+  if (!run) throw new Error('run not found');
+  return run;
+}
+
+const runRole = (kind: RunExecutionFacts['kind']): ExecutionRole => (
+  kind === 'scope' ? 'planner' : kind === 'verify' ? 'verifier' : 'worker'
+);
+
+async function runCreator(db: D1Database, id: string): Promise<ActorRef> {
+  const agent = await db.prepare('SELECT kind FROM agents WHERE id = ?').bind(id).first<{ kind: 'copilot' | 'agent' }>();
+  if (agent) return { id, kind: agent.kind };
+  if (await db.prepare('SELECT 1 FROM runners WHERE id = ?').bind(id).first()) return { id, kind: 'runner' };
+  return { id, kind: 'human' };
+}
+
+async function assignmentForRun(db: D1Database, runId: string, sitting?: number): Promise<ExecutionAssignment | null> {
+  const row = await db.prepare(
+    `SELECT n.id AS executionId, n.orchestration_id AS orchestrationId,
+            n.parent_execution_id AS parentExecutionId, n.role,
+            n.completeness_status AS lineageStatus
+       FROM execution_nodes n
+      WHERE n.run_id = ? AND n.kind = 'sitting' AND (? IS NULL OR n.sitting = ?)
+      ORDER BY n.sitting DESC LIMIT 1`,
+  ).bind(runId, sitting ?? null, sitting ?? null).first<Omit<ExecutionAssignment, 'schemaVersion'>>();
+  return row ? { schemaVersion: 1, ...row } : null;
+}
+
+/** Ensure the server-authored Run and current-sitting nodes exist, then return the assignment a
+ * capable Runner receives. Server-side Run facts win; the caller supplies no project, role,
+ * actor, plan, task, or sitting claims. */
+export async function ensureRunExecution(env: Env, runId: string): Promise<ExecutionAssignment> {
+  const run = await loadRunExecutionFacts(env.DB, runId);
+  const existing = await assignmentForRun(env.DB, run.id, run.sitting);
+  if (existing) return existing;
+
+  const storedRunNode = await env.DB.prepare(
+    `SELECT id, orchestration_id AS orchestrationId, parent_execution_id AS parentExecutionId
+       FROM execution_nodes WHERE producer_scope = ? AND local_node_key = 'run'`,
+  ).bind(`run/${run.id}`).first<{ id: string; orchestrationId: string; parentExecutionId: string | null }>();
+  let orchestrationId = storedRunNode?.orchestrationId ?? '';
+  let parentExecutionId: string | null = storedRunNode?.parentExecutionId ?? null;
+  let verifiedRunNodeId: string | null = null;
+  if (storedRunNode) {
+    const scoped = await env.DB.prepare(
+      'SELECT 1 FROM execution_nodes WHERE id = ? AND project_id = ? AND run_id = ?',
+    ).bind(storedRunNode.id, run.projectId, run.id).first();
+    if (!scoped) throw new Error('stored run execution has invalid scope');
+  } else if (run.planDispatchId) {
+    const scope = `plan-dispatch/${run.planDispatchId}`;
+    let root = await env.DB.prepare(
+      `SELECT id, orchestration_id AS orchestrationId FROM execution_nodes
+        WHERE producer_scope = ? AND local_node_key = 'root'`,
+    ).bind(scope).first<{ id: string; orchestrationId: string }>();
+    if (!root) {
+      const orchestration = await createOrchestration(env, {
+        projectId: run.projectId,
+        anchor: run.planId ? { type: 'plan', id: run.planId } : { type: 'none' },
+        createdBy: { kind: 'system', id: 'system' },
+        completeness: { status: 'complete' },
+        createdAt: run.createdAt,
+      });
+      const declared = await declareExecution(env, {
+        projectId: run.projectId, orchestrationId: orchestration.id,
+        producerScope: scope, localNodeKey: 'root', kind: 'stage', role: 'orchestrator',
+        actor: { kind: 'system', id: 'system' }, subject: { planId: run.planId, stage: 'plan_dispatch' },
+        observedAt: run.createdAt,
+      });
+      root = { id: declared.id, orchestrationId: orchestration.id };
+    }
+    orchestrationId = root.orchestrationId;
+    parentExecutionId = root.id;
+  } else if (run.verifiesRunId) {
+    const target = await ensureRunExecution(env, run.verifiesRunId);
+    orchestrationId = target.orchestrationId;
+    verifiedRunNodeId = target.parentExecutionId;
+  } else {
+    const orchestration = await createOrchestration(env, {
+      projectId: run.projectId,
+      anchor: { type: 'run', id: run.id },
+      createdBy: await runCreator(env.DB, run.createdBy),
+      completeness: { status: 'complete' },
+      createdAt: run.createdAt,
+    });
+    orchestrationId = orchestration.id;
+  }
+
+  const role = runRole(run.kind);
+  const runNode = storedRunNode ?? await declareExecution(env, {
+      projectId: run.projectId, orchestrationId, parentExecutionId,
+      producerScope: `run/${run.id}`, localNodeKey: 'run', kind: 'run', role,
+      actor: run.runnerId ? { kind: 'runner', id: run.runnerId } : null,
+      subject: { taskId: run.taskId, planId: run.planId, runId: run.id },
+      allowTerminalExtension: run.planDispatchId !== null || (run.kind === 'verify' && verifiedRunNodeId !== null),
+      observedAt: run.createdAt,
+    });
+  if (!storedRunNode && verifiedRunNodeId) {
+    await addExecutionRelation(env, {
+      projectId: run.projectId, orchestrationId,
+      fromExecutionId: runNode.id, toExecutionId: verifiedRunNodeId,
+      type: 'verifies', metadata: { source: 'runs.verifies_run_id' }, createdAt: run.createdAt,
+    });
+  }
+  const previous = await assignmentForRun(env.DB, run.id);
+  const previousStatus = previous ? await env.DB.prepare('SELECT status FROM execution_nodes WHERE id = ?')
+    .bind(previous.executionId).first<{ status: ExecutionStatus }>() : null;
+  const canContinue = previous && previousStatus && terminal.has(previousStatus.status);
+  const sitting = await declareExecution(env, {
+    projectId: run.projectId, orchestrationId, parentExecutionId: runNode.id,
+    producerScope: `run/${run.id}`, localNodeKey: `sitting/${run.sitting}`,
+    kind: 'sitting', role,
+    actor: run.agentId ? { kind: 'agent', id: run.agentId }
+      : run.runnerId ? { kind: 'runner', id: run.runnerId } : null,
+    subject: { taskId: run.taskId, planId: run.planId, runId: run.id, sitting: run.sitting },
+    continuesExecutionId: canContinue ? previous.executionId : undefined,
+    allowTerminalExtension: run.planDispatchId !== null || (run.kind === 'verify' && verifiedRunNodeId !== null),
+    observedAt: run.updatedAt,
+  });
+  return (await assignmentForRun(env.DB, run.id, run.sitting)) ?? {
+    schemaVersion: 1, orchestrationId, executionId: sitting.id,
+    parentExecutionId: runNode.id, role, lineageStatus: 'complete',
+  };
+}
+
+async function assertRunnerExecutionScope(db: D1Database, run: RunExecutionFacts, executionId: string, orchestrationId: string) {
+  const found = await db.prepare(
+    'SELECT 1 FROM execution_nodes WHERE id = ? AND orchestration_id = ? AND project_id = ? AND run_id = ?',
+  ).bind(executionId, orchestrationId, run.projectId, run.id).first();
+  if (!found) throw new Error('execution is outside the server-derived run scope');
+}
+
+export async function declareRunnerExecution(
+  env: Env, runId: string, input: RunnerExecutionDeclaration,
+): Promise<{ id: string; created: boolean }> {
+  const run = await loadRunExecutionFacts(env.DB, runId);
+  const assignment = await ensureRunExecution(env, runId);
+  await assertRunnerExecutionScope(env.DB, run, input.parentExecutionId, assignment.orchestrationId);
+  return declareExecution(env, {
+    projectId: run.projectId, orchestrationId: assignment.orchestrationId,
+    parentExecutionId: input.parentExecutionId,
+    producerScope: `runner/${run.runnerId ?? 'unassigned'}/run/${run.id}/sitting/${run.sitting}`,
+    localNodeKey: input.localNodeKey, kind: input.kind, role: input.role,
+    actor: run.agentId ? { kind: 'agent', id: run.agentId }
+      : run.runnerId ? { kind: 'runner', id: run.runnerId } : null,
+    subject: {
+      taskId: run.taskId, planId: run.planId, runId: run.id, sitting: run.sitting,
+      stage: input.stage, step: input.step, gateId: input.gateId,
+    },
+    continuesExecutionId: input.continuesExecutionId ?? undefined,
+    observedAt: input.observedAt,
+  });
+}
+
+export async function reportRunnerExecutionRelation(
+  env: Env, runId: string, input: RunnerExecutionRelationReport,
+): Promise<{ id: string; created: boolean }> {
+  const run = await loadRunExecutionFacts(env.DB, runId);
+  const assignment = await ensureRunExecution(env, runId);
+  await assertRunnerExecutionScope(env.DB, run, input.fromExecutionId, assignment.orchestrationId);
+  await assertRunnerExecutionScope(env.DB, run, input.toExecutionId, assignment.orchestrationId);
+  return addExecutionRelation(env, {
+    projectId: run.projectId, orchestrationId: assignment.orchestrationId,
+    fromExecutionId: input.fromExecutionId, toExecutionId: input.toExecutionId,
+    type: input.relation, metadata: input.metadata, createdAt: input.observedAt,
+  });
+}
+
+export async function reportRunnerExecutionEvent(
+  env: Env, runId: string, input: RunnerExecutionEventReport,
+): Promise<ReturnType<typeof applyExecutionEvent> extends Promise<infer T> ? T : never> {
+  const run = await loadRunExecutionFacts(env.DB, runId);
+  const assignment = await ensureRunExecution(env, runId);
+  await assertRunnerExecutionScope(env.DB, run, input.executionId, assignment.orchestrationId);
+  return applyExecutionEvent(env, {
+    projectId: run.projectId, orchestrationId: assignment.orchestrationId,
+    executionId: input.executionId, eventId: input.reportId, revision: input.revision,
+    type: input.event, observedAt: input.observedAt, reason: input.reason, metadata: input.metadata,
+  });
+}
+
+export async function reconcileRunnerExecution(
+  env: Env, runId: string, input: RunnerExecutionReconciliation,
+): Promise<{ assignment: ExecutionAssignment; acknowledgements: ExecutionReportAck[] }> {
+  const assignment = await ensureRunExecution(env, runId);
+  const acknowledgements: ExecutionReportAck[] = [];
+  for (const declaration of input.declarations) {
+    try {
+      const result = await declareRunnerExecution(env, runId, declaration);
+      acknowledgements.push({ reportId: declaration.reportId, accepted: true, executionId: result.id, status: null, expectedRevision: null, error: null });
+    } catch (error) {
+      acknowledgements.push({ reportId: declaration.reportId, accepted: false, executionId: null, status: null, expectedRevision: null, error: String(error) });
+    }
+  }
+  for (const relation of input.relations) {
+    try {
+      await reportRunnerExecutionRelation(env, runId, relation);
+      acknowledgements.push({ reportId: relation.reportId, accepted: true, executionId: relation.fromExecutionId, status: null, expectedRevision: null, error: null });
+    } catch (error) {
+      acknowledgements.push({ reportId: relation.reportId, accepted: false, executionId: null, status: null, expectedRevision: null, error: String(error) });
+    }
+  }
+  for (const event of input.events) {
+    try {
+      const result = await reportRunnerExecutionEvent(env, runId, event);
+      acknowledgements.push({ reportId: event.reportId, accepted: true, executionId: event.executionId, status: result.status, expectedRevision: result.expectedRevision, error: null });
+    } catch (error) {
+      acknowledgements.push({ reportId: event.reportId, accepted: false, executionId: event.executionId, status: null, expectedRevision: null, error: String(error) });
+    }
+  }
+  const rejected = acknowledgements.filter((ack) => !ack.accepted).length;
+  acknowledgements.push({
+    reportId: input.reportId, accepted: rejected === 0, executionId: assignment.executionId,
+    status: null, expectedRevision: null,
+    error: rejected ? `${rejected} reconciliation report(s) were rejected` : null,
+  });
+  return { assignment, acknowledgements };
+}
+
+/** Mirror the server-authoritative Run transition into its current sitting. Older Runners gain
+ * truthful execution history without knowing the new protocol; capable Runners use explicit
+ * execution reports only for child stages/steps/gates. */
+export async function mirrorRunTransition(env: Env, input: {
+  runId: string;
+  from: string;
+  to: string;
+  observedAt: string;
+  reason?: string | null;
+}): Promise<void> {
+  const event = input.to === 'running'
+    ? (input.from === 'blocked' ? 'resumed' : 'started')
+    : input.to === 'blocked' ? 'parked'
+      : input.to === 'done' ? 'succeeded'
+        : input.to === 'failed' ? 'failed'
+          : input.to === 'cancelled' ? 'cancelled' : null;
+  if (!event) return;
+  const assignment = await ensureRunExecution(env, input.runId);
+  const node = await env.DB.prepare('SELECT last_revision AS revision FROM execution_nodes WHERE id = ?')
+    .bind(assignment.executionId).first<{ revision: number }>();
+  if (!node) throw new Error('run execution assignment disappeared');
+  await applyExecutionEvent(env, {
+    projectId: (await loadRunExecutionFacts(env.DB, input.runId)).projectId,
+    orchestrationId: assignment.orchestrationId,
+    executionId: assignment.executionId,
+    eventId: `evt_run_${input.runId}_${assignment.executionId}_${node.revision + 1}`,
+    revision: node.revision + 1,
+    type: event,
+    observedAt: input.observedAt,
+    reason: input.reason,
+    metadata: { source: 'server_run_transition', runStatus: input.to },
+  });
+}
+
+export async function getOrchestrationTree(db: D1Database, projectId: string, orchestrationId: string) {
+  const orchestration = await db.prepare(
+    `SELECT id, project_id AS projectId, anchor_type AS anchorType, anchor_id AS anchorId,
+            root_execution_id AS rootExecutionId, status, completeness_status AS completenessStatus,
+            completeness_missing AS completenessMissing, completeness_reason AS completenessReason,
+            created_by_kind AS createdByKind, created_by_id AS createdById,
+            created_at AS createdAt, updated_at AS updatedAt, finished_at AS finishedAt
+       FROM orchestrations WHERE id = ? AND project_id = ?`,
+  ).bind(orchestrationId, projectId).first<Record<string, unknown>>();
+  if (!orchestration) throw new Error('orchestration not found');
+  const [nodes, relations] = await Promise.all([
+    db.prepare(
+      `SELECT id, parent_execution_id AS parentExecutionId, kind, role, actor_kind AS actorKind,
+              actor_id AS actorId, presence_id AS presenceId, task_id AS taskId, plan_id AS planId,
+              run_id AS runId, sitting, stage, step, gate_id AS gateId, status,
+              completeness_status AS completenessStatus, completeness_missing AS completenessMissing,
+              completeness_reason AS completenessReason, last_revision AS lastRevision,
+              started_at AS startedAt, parked_at AS parkedAt, finished_at AS finishedAt,
+              outcome_reason AS outcomeReason, created_at AS createdAt, updated_at AS updatedAt
+         FROM execution_nodes WHERE orchestration_id = ? ORDER BY created_at, id`,
+    ).bind(orchestrationId).all<Record<string, unknown>>(),
+    db.prepare(
+      `SELECT id, from_execution_id AS fromExecutionId, to_execution_id AS toExecutionId,
+              type, metadata, created_at AS createdAt
+         FROM execution_relations WHERE orchestration_id = ? ORDER BY created_at, id`,
+    ).bind(orchestrationId).all<Record<string, unknown>>(),
+  ]);
+  const parse = (value: unknown) => { try { return JSON.parse(String(value)); } catch { return value; } };
+  return {
+    orchestration: {
+      ...orchestration,
+      completenessMissing: parse(orchestration.completenessMissing),
+    },
+    nodes: nodes.results.map((node) => ({ ...node, completenessMissing: parse(node.completenessMissing) })),
+    relations: relations.results.map((relation) => ({ ...relation, metadata: parse(relation.metadata) })),
+  };
 }

@@ -3,6 +3,7 @@
 // the MCP notices fallback.
 import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
+import { RunnerHello, RunnerServerMessage } from '@noriq-dev/shared';
 import { createAgent, createUser, loginSession, mcpCall, mintTokenForUser, authorizeForAllProjects } from './helpers';
 
 // Resolve the next WS frame matching a predicate (with a timeout).
@@ -44,6 +45,15 @@ async function pollRun(runId: string, want: (r: RunRowPeek) => boolean, tries = 
   }
   throw new Error(`run ${runId} never matched — last: ${JSON.stringify(last)}`);
 }
+
+describe('runner protocol compatibility (PLNR-366)', () => {
+  it('defaults capability fields for legacy v1 peers', () => {
+    expect(RunnerHello.parse({ type: 'hello', protocol: 1, label: 'legacy' }).protocolCapabilities).toEqual([]);
+    expect(RunnerServerMessage.parse({
+      type: 'registered', runnerId: 'run_legacy', protocol: 1, serverTime: new Date().toISOString(),
+    })).toMatchObject({ acceptedCapabilities: [] });
+  });
+});
 
 describe('runner WS channel + dispatch (RUN-7)', () => {
   let token: string;
@@ -103,10 +113,125 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
     const assigned = await assignedP;
     expect(assigned.run.id).toBe(disp.run.id);
     expect(assigned.run.brief).toBe('do the thing');
+    // Capability negotiation is additive: old daemons receive the byte-compatible v1 frame,
+    // without the new assignment field that their strict decoders do not know about.
+    expect(assigned.run).not.toHaveProperty('execution');
 
     // Daemon reports the process came up → the Run transitions in its ProjectRoom.
     ws.send(JSON.stringify({ type: 'run.status', runId: disp.run.id, status: 'running', at: new Date(0).toISOString() }));
     await waitRunStatus(disp.run.id, 'running');
+  });
+
+  it('negotiates orchestration assignments and accepts idempotent execution reports', async () => {
+    const res = await wsConnect(runnerId, { Authorization: `Bearer ${token}` });
+    expect(res.status).toBe(101);
+    const ws = res.webSocket!;
+    ws.accept();
+
+    const registeredP = nextFrame(ws, (m) => m.type === 'registered');
+    ws.send(JSON.stringify({
+      type: 'hello', protocol: 1, label: 'ws-daemon',
+      protocolCapabilities: ['orchestration.v1'],
+    }));
+    const registered = await registeredP;
+    expect(registered.acceptedCapabilities).toEqual(['orchestration.v1']);
+
+    const brief = `orchestration protocol ${crypto.randomUUID()}`;
+    const assignedP = nextFrame(ws, (m) => m.type === 'run.assigned' && m.run?.brief === brief);
+    const disp = await (await SELF.fetch(`https://noriq.test/api/projects/${pid}/runs`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runnerId, kind: 'build', agentTool: 'claude', repoRef: 'repo_x', brief }),
+    })).json() as { run: { id: string; execution: null | { orchestrationId: string; executionId: string } } };
+    const assigned = await assignedP;
+    expect(assigned.run.execution).toMatchObject({
+      schemaVersion: 1,
+      orchestrationId: expect.any(String),
+      executionId: expect.any(String),
+      role: 'worker',
+    });
+    expect(disp.run.execution).toEqual(assigned.run.execution);
+
+    // The polling transport exposes the exact same server-derived assignment. It accepts no
+    // client project/task/plan fields, so a daemon cannot widen the scope it was dispatched into.
+    const polled = await SELF.fetch(`https://noriq.test/api/runs/${disp.run.id}/orchestration`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(polled.status).toBe(200);
+    expect((await polled.json() as { assignment: unknown }).assignment).toEqual(assigned.run.execution);
+
+    const observedAt = new Date().toISOString();
+    const declaration = {
+      reportId: `report-${crypto.randomUUID()}`,
+      parentExecutionId: assigned.run.execution.executionId,
+      localNodeKey: 'build-stage',
+      kind: 'stage', role: 'worker', stage: 'build', step: null, gateId: null,
+      continuesExecutionId: null, observedAt,
+    };
+    const declaredP = nextFrame(ws, (m) => m.type === 'execution.ack' && m.ack?.reportId === declaration.reportId);
+    ws.send(JSON.stringify({ type: 'execution.declare', runId: disp.run.id, declaration }));
+    const declared = await declaredP;
+    expect(declared.ack).toMatchObject({ accepted: true, executionId: expect.any(String) });
+
+    const restDeclaration = {
+      ...declaration,
+      reportId: `rest-${crypto.randomUUID()}`,
+      localNodeKey: 'test-stage',
+      stage: 'test',
+    };
+    const restDeclared = await SELF.fetch(`https://noriq.test/api/runs/${disp.run.id}/executions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(restDeclaration),
+    });
+    expect(restDeclared.status).toBe(200);
+    expect(await restDeclared.json()).toMatchObject({ created: true, id: expect.any(String) });
+
+    const event = {
+      reportId: `event-${crypto.randomUUID()}`,
+      executionId: declared.ack.executionId,
+      revision: 1, event: 'started', observedAt, reason: null,
+    };
+    const startedP = nextFrame(ws, (m) => m.type === 'execution.ack' && m.ack?.reportId === event.reportId);
+    ws.send(JSON.stringify({ type: 'execution.event', runId: disp.run.id, event }));
+    expect((await startedP).ack).toMatchObject({
+      accepted: true, executionId: declared.ack.executionId, status: 'running', expectedRevision: 2,
+    });
+
+    // Replaying the exact report is accepted without incrementing the node a second time.
+    const replayP = nextFrame(ws, (m) => m.type === 'execution.ack' && m.ack?.reportId === event.reportId);
+    ws.send(JSON.stringify({ type: 'execution.event', runId: disp.run.id, event }));
+    expect((await replayP).ack).toMatchObject({ accepted: true, status: 'running', expectedRevision: 2 });
+
+    const reconciliation = {
+      reportId: `reconcile-${crypto.randomUUID()}`,
+      declarations: [], relations: [], events: [], observedAt: new Date().toISOString(),
+    };
+    const reconciledP = nextFrame(ws, (m) => m.type === 'execution.ack' && m.ack?.reportId === reconciliation.reportId);
+    ws.send(JSON.stringify({ type: 'execution.reconcile', runId: disp.run.id, reconciliation }));
+    expect((await reconciledP).ack).toMatchObject({
+      accepted: true, executionId: assigned.run.execution.executionId,
+    });
+
+    const treeRes = await SELF.fetch(
+      `https://noriq.test/api/projects/${pid}/orchestrations/${assigned.run.execution.orchestrationId}`,
+      { headers: { Cookie: cookie } },
+    );
+    expect(treeRes.status).toBe(200);
+    const tree = await treeRes.json() as { nodes: Array<{ id: string; parentExecutionId: string | null; status: string }> };
+    expect(tree.nodes).toContainEqual(expect.objectContaining({
+      id: declared.ack.executionId,
+      parentExecutionId: assigned.run.execution.executionId,
+      status: 'running',
+    }));
+
+    const minted = await SELF.fetch(`https://noriq.test/api/runs/${disp.run.id}/agent`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ protocolCapabilities: ['orchestration.v1'] }),
+    });
+    expect(minted.status).toBe(200);
+    expect(await minted.json()).toMatchObject({ execution: assigned.run.execution });
+    ws.close();
   });
 
   it('dispatch rejects a repoRef that does not resolve to the project', async () => {

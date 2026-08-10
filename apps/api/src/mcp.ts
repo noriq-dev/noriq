@@ -16,7 +16,10 @@ import {
   userCanAccessProject,
 } from './lib/visibility';
 import { taskSearchFilters } from './lib/search';
-import { ExecutionSpec, type ExecutionSpecInput, MemoryKind, MemoryEdgeType, EvidenceRef, ContextPackRole } from '@noriq-dev/shared';
+import {
+  ExecutionEventType, ExecutionKind, ExecutionLineageStatus, ExecutionRelationType, ExecutionRole,
+  ExecutionSpec, type ExecutionSpecInput, MemoryKind, MemoryEdgeType, EvidenceRef, ContextPackRole,
+} from '@noriq-dev/shared';
 import { RETRIEVAL_DEFAULTS } from './memory/retrieval';
 import { assembleContextPack } from './memory/context-pack';
 import { renderEvidenceFrame, type EvidenceFrameItem } from './memory/evidence-frame';
@@ -44,6 +47,10 @@ import {
   type ProjectAction,
 } from './lib/authorization';
 import { AGENT_LIFECYCLES, listAgentRoster } from './lib/agent-roster';
+import {
+  addExecutionRelation, applyExecutionEvent, createOrchestration, declareExecution,
+  getOrchestrationTree,
+} from './lib/orchestration-store';
 
 const MAX_ATTACHMENT = 100 * 1024 * 1024;
 
@@ -348,7 +355,7 @@ export const MCP_TOOL_POLICIES: Record<string, ToolHints> = {
   search_tasks: READ, semantic_search: READ, tag_report: READ, can_claim: READ,
   next_claimable: READ, check_locks: READ, list_locks: READ, read_open_comments: READ,
   get_plans: READ, get_plan_doc: READ, search_project_memory: READ, explain_project_area: READ,
-  get_task_context: READ,
+  get_task_context: READ, get_orchestration: READ,
 
   focus_project: WRITE_IDEMPOTENT, set_agent_identity: WRITE_IDEMPOTENT,
   set_project_group: WRITE_IDEMPOTENT, update_doc: WRITE_IDEMPOTENT,
@@ -359,6 +366,8 @@ export const MCP_TOOL_POLICIES: Record<string, ToolHints> = {
   acknowledge_comment: WRITE_IDEMPOTENT, resolve_comment: WRITE_IDEMPOTENT,
   update_plan: WRITE_IDEMPOTENT, update_plan_doc: WRITE_IDEMPOTENT,
   attach_ref: WRITE_IDEMPOTENT,
+  declare_execution: WRITE_IDEMPOTENT, relate_execution: WRITE_IDEMPOTENT,
+  report_execution: WRITE_IDEMPOTENT,
 
   create_project: WRITE, save_template: WRITE, create_plan_from_template: WRITE,
   create_doc: WRITE, create_task: WRITE, create_tasks: WRITE, decompose_task: WRITE,
@@ -366,6 +375,7 @@ export const MCP_TOOL_POLICIES: Record<string, ToolHints> = {
   claim_task: WRITE, release_task: WRITE, add_comment: WRITE, post_comment: WRITE,
   send_message: WRITE, request_input: WRITE, raise_alert: WRITE, spin_off_task: WRITE,
   create_plan: WRITE, create_plan_doc: WRITE, create_milestone: WRITE, record_memory: WRITE,
+  create_orchestration: WRITE,
 
   // Both operations discard relationships or vocabulary that cannot be reconstructed from the
   // result alone. Their descriptions explain the exact loss, so clients can confirm appropriately.
@@ -767,6 +777,91 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         agents: roster.agents.map((a) => ({ ...a, you: a.id === agent.id, heldTaskCount: a.heldTasks, heldTasks: held.get(a.id) ?? [] })),
       };
     }),
+  );
+
+  defineTool(
+    'get_orchestration',
+    'Read one project-scoped orchestration as its immutable execution tree plus typed continuation, verification, repair, handoff, and dependency relations.',
+    { projectId: z.string(), orchestrationId: z.string() },
+    tool(async ({ projectId, orchestrationId }) => getOrchestrationTree(env.DB, projectId, orchestrationId)),
+  );
+
+  defineTool(
+    'create_orchestration',
+    'Create the durable project-scoped authority for a task, plan, run, chat, or unanchored body of work. The server mints the orchestration id; declare_execution adds its immutable nodes.',
+    {
+      projectId: z.string(),
+      anchor: z.discriminatedUnion('type', [
+        z.object({ type: z.literal('task'), id: z.string() }),
+        z.object({ type: z.literal('plan'), id: z.string() }),
+        z.object({ type: z.literal('run'), id: z.string() }),
+        z.object({ type: z.literal('chat'), id: z.string() }),
+        z.object({ type: z.literal('none') }),
+      ]),
+      completeness: z.object({
+        status: ExecutionLineageStatus,
+        missing: z.array(z.string().max(100)).max(32).optional(),
+        reason: z.string().max(2_000).nullable().optional(),
+      }).optional(),
+      createdAt: z.string().datetime().optional(),
+    },
+    tool(async ({ projectId, anchor, completeness, createdAt }) => createOrchestration(env, {
+      projectId, anchor,
+      createdBy: { kind: agent.kind, id: agent.id },
+      completeness, createdAt,
+    })),
+  );
+
+  defineTool(
+    'declare_execution',
+    'Idempotently declare one immutable execution node. producerScope plus localNodeKey is its stable producer identity; changed content under the same identity is rejected. Use continuesExecutionId to continue terminal work as a new node.',
+    {
+      projectId: z.string(), orchestrationId: z.string(),
+      parentExecutionId: z.string().nullable().optional(),
+      localNodeKey: z.string().min(1).max(160),
+      producerScope: z.string().min(1).max(240),
+      kind: ExecutionKind, role: ExecutionRole,
+      presenceId: z.string().nullable().optional(),
+      subject: z.object({
+        taskId: z.string().nullable().optional(), planId: z.string().nullable().optional(),
+        runId: z.string().nullable().optional(), sitting: z.number().int().positive().nullable().optional(),
+        stage: z.string().max(160).nullable().optional(), step: z.string().max(160).nullable().optional(),
+        gateId: z.string().max(160).nullable().optional(),
+      }).optional(),
+      completeness: z.object({
+        status: ExecutionLineageStatus,
+        missing: z.array(z.string().max(100)).max(32).optional(),
+        reason: z.string().max(2_000).nullable().optional(),
+      }).optional(),
+      continuesExecutionId: z.string().optional(), observedAt: z.string().datetime(),
+    },
+    tool(async (input) => declareExecution(env, {
+      ...input, actor: { kind: agent.kind, id: agent.id },
+    })),
+  );
+
+  defineTool(
+    'relate_execution',
+    'Idempotently add a typed non-tree relationship between two nodes in one authorized orchestration. Cyclic continues and depends_on relationships are rejected.',
+    {
+      projectId: z.string(), orchestrationId: z.string(),
+      fromExecutionId: z.string(), toExecutionId: z.string(), type: ExecutionRelationType,
+      metadata: z.record(z.string(), z.unknown()).optional(), createdAt: z.string().datetime().optional(),
+    },
+    tool(async (input) => addExecutionRelation(env, input)),
+  );
+
+  defineTool(
+    'report_execution',
+    'Apply one revisioned lifecycle event to an execution. Replaying the same event or identical node revision is a no-op; gaps, conflicts, impossible transitions, and terminal resurrection are rejected.',
+    {
+      projectId: z.string(), orchestrationId: z.string(), executionId: z.string(),
+      eventId: z.string().min(1).max(160), revision: z.number().int().positive(),
+      type: ExecutionEventType, observedAt: z.string().datetime(),
+      reason: z.string().max(2_000).nullable().optional(),
+      metadata: z.record(z.string(), z.unknown()).optional(),
+    },
+    tool(async (input) => applyExecutionEvent(env, input)),
   );
 
   defineTool(

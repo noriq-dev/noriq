@@ -1055,7 +1055,8 @@ describe('a continued run mints a fresh agent (RUN-182)', () => {
 
   it('mints a NEW identity once the run is continued and its old agent retired', async () => {
     const runId = await seedRun();
-    const first = (await (await mintAgent(runId)).json()) as { agentId: string };
+    const first = (await (await mintAgent(runId)).json()) as { agentId: string; execution?: unknown };
+    expect(first).not.toHaveProperty('execution');
 
     await room(pid).transitionRun(pid, actor, runId, { status: 'running', agentId: first.agentId });
     await room(pid).transitionRun(pid, actor, runId, { status: 'failed', reason: 'review' });
