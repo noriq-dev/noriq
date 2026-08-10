@@ -160,6 +160,18 @@ describe('Constellation v2 REST authorization and availability', () => {
     expect(unchanged.headers.get('X-Noriq-Constellation-Cache')).toBe('hit');
     expect(unchanged.headers.get('X-Noriq-Constellation-Rows')).toBe('0');
 
+    await memory(pid).writeNode(pid, { type: 'memory', uri: 'noriq://memory/v2-rest-newer', label: 'newer', actor: SYSTEM });
+    const stale = await SELF.fetch(`https://noriq.test/api/projects/${pid}/memory/constellation/v2/overview`, {
+      headers: { Cookie: cookie, 'If-None-Match': etag! },
+    });
+    expect(stale.status).toBe(200);
+    expect(stale.headers.get('ETag')).not.toBe(etag);
+    expect(stale.headers.get('X-Noriq-Constellation-Cache')).toBe('miss');
+    expect(await stale.json()).toMatchObject({
+      revision: { generationId: overviewBody.revision.generationId, state: 'stale', sourceRevision: overviewBody.revision.sourceRevision },
+      communities: overviewBody.communities,
+    });
+
     const compact = await SELF.fetch(`https://noriq.test/api/projects/${pid}/memory/constellation/v2/communities/${overviewBody.communities[0]!.id}`, {
       headers: { Cookie: cookie, Accept: 'application/vnd.noriq.constellation-v2.compact+json' },
     });

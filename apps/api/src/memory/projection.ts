@@ -357,8 +357,8 @@ export function mapCoordinationEvent(ev: CoordinationEventForProjection): Coordi
       if (typeof ev.payload.dependsOnProjectId === 'string') return { node: null, edges: [] };
       const dependsOnId = ev.payload.dependsOnId;
       if (typeof dependsOnId !== 'string' || !dependsOnId) return null;
-      const task: ProjectedNodeDescriptor = { type: 'task', uri: buildEntityUri({ kind: 'task', id: ev.subjectId }), label: label('key') };
-      const blocker: ProjectedNodeDescriptor = { type: 'task', uri: buildEntityUri({ kind: 'task', id: dependsOnId }), label: label('dependsOn') };
+      const task: ProjectedNodeDescriptor = { type: 'task', uri: buildEntityUri({ kind: 'task', id: ev.subjectId }), label: label(typeof ev.payload.title === 'string' ? 'title' : 'key') };
+      const blocker: ProjectedNodeDescriptor = { type: 'task', uri: buildEntityUri({ kind: 'task', id: dependsOnId }), label: label(typeof ev.payload.dependsOnTitle === 'string' ? 'dependsOnTitle' : 'dependsOn') };
       const op = ev.verb === 'dependency.added' ? 'link' : 'unlink';
       return { node: null, edges: [{ type: 'depends_on', from: task, to: blocker, op, provenance: `event:${ev.verb}` }] };
     }
@@ -376,7 +376,8 @@ export function mapCoordinationEvent(ev: CoordinationEventForProjection): Coordi
       if ((anchorType !== 'task' && anchorType !== 'plan') || typeof anchorId !== 'string' || !anchorId) {
         return { node: run, edges: [] };
       }
-      const anchor: ProjectedNodeDescriptor = { type: anchorType, uri: buildEntityUri({ kind: anchorType, id: anchorId }), label: anchorId };
+      const anchorLabel = typeof ev.payload.anchorLabel === 'string' && ev.payload.anchorLabel.trim() ? ev.payload.anchorLabel : anchorId;
+      const anchor: ProjectedNodeDescriptor = { type: anchorType, uri: buildEntityUri({ kind: anchorType, id: anchorId }), label: anchorLabel };
       return { node: run, edges: [{ type: 'related_to', from: run, to: anchor, op: 'link', provenance: 'event:run.created' }] };
     }
     case 'plan.tasks_linked':

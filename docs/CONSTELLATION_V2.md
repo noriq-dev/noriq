@@ -314,3 +314,40 @@ shows the same paginated hierarchy as a complete textual catalogue. Search routi
 continuations, selection, evidence, and ego-network actions continue to work without WebGL. The
 fallback therefore changes presentation only; it does not silently return to a bounded v1 sample
 or discard navigation state.
+
+## Integrated hardening evidence (PLNR-381)
+
+The 2026-08-09 benchmark was extended to run the real hierarchy builder, reconcile every
+hierarchy level against its eligible canonical edge count, and assert one leaf membership per
+canonical node. The measurements below are one deterministic local run on Node v26.7.0; active
+CPU is process user plus system time, so it can exceed elapsed wall time. The 30-second generation
+bound passed with substantial margin, including the settled 100k-node/250k-edge envelope.
+
+| fixture | nodes / edges | rows read | elapsed ms | active CPU ms | communities / depth |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| universal dense hub | 12,000 / 48,000 | 60,000 | 188.05 | 307.12 | 24 / 0 |
+| disconnected islands and isolates | 18,000 / 17,920 | 35,920 | 104.27 | 173.79 | 1,705 / 1 |
+| code heavy | 60,000 / 120,000 | 180,000 | 526.83 | 727.97 | 412 / 1 |
+| memory heavy | 24,000 / 72,000 | 96,000 | 250.96 | 331.40 | 315 / 1 |
+| target envelope | 100,000 / 250,000 | 350,000 | 2,061.18 | 2,352.20 | 330 / 2 |
+
+Every row passed membership completeness and aggregate reconciliation. The maximum compact page
+remained at 100.17 KiB uncompressed and 20.39 KiB under gzip. The 12k-node/24k-route render-plan
+selection measured 4.48 ms with a 14-draw-call ceiling, and the worker layout measured 79.29 ms;
+both are CPU-side local evidence rather than browser frame-time claims.
+
+Production-like workerd tests cover cursor completeness/no-duplication, mixed-revision rejection,
+stale generation serving, strong ETag revalidation (`304`, zero hierarchy rows shaped), cache
+invalidation after a canonical revision, interrupted-build retry cleanup, failed-build retention of
+the prior active generation, backup/restore invalidation, and hierarchy drift. The convergence
+test now rebuilds the hierarchy both before and after full coordination projection repair and
+requires identical communities and routes. That test exposed and fixed live events replacing a
+task title with an opaque dependency/run identifier: dependency and run events now carry the
+authoritative labels needed by incremental projection.
+
+The web integration test exercises exact-URI off-page routing, cursor continuation, evidence and
+ego handoffs, and the complete no-WebGL textual path. An integrated representative/weak-GPU p95
+frame measurement is still intentionally unsupported in repository automation. Consequently v2
+remains explicit opt-in and the 2D/textual paths remain the supported defaults until production
+GPU telemetry proves the 16.7/33 ms frame gates; no renderer-only measurement is used to claim
+that cutover.

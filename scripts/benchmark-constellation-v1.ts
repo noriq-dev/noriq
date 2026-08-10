@@ -1,11 +1,12 @@
 import { gzipSync } from 'node:zlib';
 import { constellation, type ConstellationInputRows } from '../apps/api/src/memory/graph-queries';
+import { buildConstellationHierarchy } from '../apps/api/src/memory/constellation-hierarchy';
 import { compactConstellationCommunityPage, type ConstellationV2CommunityPage } from '../apps/api/src/memory/constellation-v2';
 import { computeStarMap, hitTest } from '../apps/web/src/components/starmap-layout';
 import { buildConstellation3DRenderPlan, type Constellation3DEdge, type Constellation3DNode } from '../apps/web/src/components/constellation-3d-buffers';
 import { computeConstellation3DLayout } from '../apps/web/src/components/constellation-3d-layout';
 
-type FixtureName = 'dense-hub' | 'disconnected-islands' | 'code-heavy' | 'memory-heavy';
+type FixtureName = 'dense-hub' | 'disconnected-islands' | 'code-heavy' | 'memory-heavy' | 'target-envelope';
 
 interface FixtureSpec {
   name: FixtureName;
@@ -21,6 +22,7 @@ const SPECS: FixtureSpec[] = [
   { name: 'code-heavy', nodes: 60_000, edges: 120_000, memories: 500, symbols: 48_000 },
   { name: 'memory-heavy', nodes: 24_000, edges: 72_000, memories: 12_000, symbols: 0 },
 ];
+const TARGET_SPEC: FixtureSpec = { name: 'target-envelope', nodes: 100_000, edges: 250_000, memories: 5_000, symbols: 75_000 };
 
 function fixture(spec: FixtureSpec): ConstellationInputRows {
   const nodes: ConstellationInputRows['nodes'] = [];
@@ -66,9 +68,36 @@ function median(values: number[]): number {
   return Math.round(sorted[Math.floor(sorted.length / 2)]! * 100) / 100;
 }
 
+function measureHierarchy(rows: ConstellationInputRows) {
+  const cpuStart = process.cpuUsage();
+  const started = performance.now();
+  const hierarchy = buildConstellationHierarchy(rows.nodes, rows.edges);
+  const generationMs = ms(started);
+  const cpu = process.cpuUsage(cpuStart);
+  const uniqueMemberships = new Set(hierarchy.data.memberships.map((membership) => membership.nodeId));
+  let aggregatesReconcile = true;
+  for (let level = 0; level <= hierarchy.diagnostics.maxDepth; level++) {
+    const visible = hierarchy.data.communities.filter((community) => community.level === level || (community.childCount === 0 && community.level < level));
+    const internal = visible.reduce((sum, community) => sum + community.internalEdgeCount, 0);
+    const crossing = hierarchy.data.links.filter((link) => link.level === level).reduce((sum, link) => sum + link.count, 0);
+    if (internal + crossing !== hierarchy.diagnostics.edgeCount) aggregatesReconcile = false;
+  }
+  return {
+    rowsRead: rows.nodes.length + rows.edges.length,
+    generationMs,
+    activeCpuMs: Math.round((cpu.user + cpu.system) / 10) / 100,
+    communities: hierarchy.data.communities.length,
+    maxDepth: hierarchy.diagnostics.maxDepth,
+    membershipsComplete: hierarchy.data.memberships.length === rows.nodes.length && uniqueMemberships.size === rows.nodes.length,
+    aggregatesReconcile,
+    generationBudgetPassed: generationMs <= 30_000,
+  };
+}
+
 const results = [];
 for (const spec of SPECS) {
   const rows = fixture(spec);
+  const hierarchy = measureHierarchy(rows);
   const rawBytes = Buffer.byteLength(JSON.stringify(rows));
   const shapeRuns: number[] = [];
   let result = constellation(42, rows, { codeGraphPopulated: true }); // warm module/JIT paths
@@ -113,8 +142,11 @@ for (const spec of SPECS) {
   const compactBytes = Buffer.byteLength(compactResponse);
   const compactGzipBytes = gzipSync(compactResponse).byteLength;
   const compactBudgetPassed = compactBytes <= 512 * 1024 && compactGzipBytes <= 128 * 1024;
-  results.push({ fixture: spec.name, inputNodes: rows.nodes.length, inputEdges: rows.edges.length, rowsRead: rows.nodes.length + rows.edges.length + rows.memoryItems.length + rows.episodes.length, inputMiB: Math.round(rawBytes / 1024 / 1024 * 100) / 100, outputNodes: result.nodes.length, outputEdges: result.edges.length, responseKiB: Math.round(responseBytes / 1024 * 100) / 100, gzipKiB: Math.round(gzipBytes / 1024 * 100) / 100, shapeMedianMs: median(shapeRuns), layoutMedianMs: median(layoutRuns), hitTest1kMs, v2CompactPageKiB: Math.round(compactBytes / 1024 * 100) / 100, v2CompactGzipKiB: Math.round(compactGzipBytes / 1024 * 100) / 100, compactBudgetPassed });
+  results.push({ fixture: spec.name, inputNodes: rows.nodes.length, inputEdges: rows.edges.length, rowsRead: rows.nodes.length + rows.edges.length + rows.memoryItems.length + rows.episodes.length, inputMiB: Math.round(rawBytes / 1024 / 1024 * 100) / 100, outputNodes: result.nodes.length, outputEdges: result.edges.length, responseKiB: Math.round(responseBytes / 1024 * 100) / 100, gzipKiB: Math.round(gzipBytes / 1024 * 100) / 100, shapeMedianMs: median(shapeRuns), layoutMedianMs: median(layoutRuns), hitTest1kMs, v2CompactPageKiB: Math.round(compactBytes / 1024 * 100) / 100, v2CompactGzipKiB: Math.round(compactGzipBytes / 1024 * 100) / 100, compactBudgetPassed, hierarchy });
 }
+
+const targetRows = fixture(TARGET_SPEC);
+const targetEnvelope = { fixture: TARGET_SPEC.name, inputNodes: targetRows.nodes.length, inputEdges: targetRows.edges.length, ...measureHierarchy(targetRows) };
 
 const rendererNodes: Constellation3DNode[] = Array.from({ length: 12_000 }, (_, index) => ({
   id: `render-node-${index}`, uri: `noriq://memory/render-node-${index}`, label: `node ${index}`,
@@ -149,7 +181,8 @@ const workerLayout = {
   generationBudgetPassed: median(workerLayoutRuns) <= 10_000,
 };
 
-console.log(JSON.stringify({ runtime: process.version, results, rendererBufferPlan, workerLayout }, null, 2));
-if (results.some((result) => !result.compactBudgetPassed)) process.exitCode = 1;
+console.log(JSON.stringify({ runtime: process.version, results, targetEnvelope, rendererBufferPlan, workerLayout }, null, 2));
+if (results.some((result) => !result.compactBudgetPassed || !result.hierarchy.generationBudgetPassed || !result.hierarchy.membershipsComplete || !result.hierarchy.aggregatesReconcile)) process.exitCode = 1;
+if (!targetEnvelope.generationBudgetPassed || !targetEnvelope.membershipsComplete || !targetEnvelope.aggregatesReconcile) process.exitCode = 1;
 if (!rendererBufferPlan.interactionBudgetPassed || rendererBufferPlan.drawCallCeiling > 14) process.exitCode = 1;
 if (!workerLayout.generationBudgetPassed) process.exitCode = 1;

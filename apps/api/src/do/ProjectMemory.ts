@@ -505,12 +505,26 @@ export class ProjectMemory extends DurableObject<Env> {
     await this.assertProjectId(projectId);
     const generationId = newId('cgen');
     const sourceRevision = this.readMemoryRevision();
-    this.ctx.storage.sql.exec(
-      `INSERT INTO constellation_generations
-         (id, source_revision, topology_version, layout_version, status, created_at)
-       VALUES (?1, ?2, ?3, ?4, 'building', ?5)`,
-      generationId, sourceRevision, input.topologyVersion, input.layoutVersion, nowIso(),
-    );
+    this.ctx.storage.transactionSync(() => {
+      // An explicit retry owns the one build slot. A request interrupted after begin/stage/complete
+      // must not leave the active generation reporting `building` forever, and its disposable
+      // payload must not accumulate. The active generation is never touched.
+      const abandoned = this.ctx.storage.sql.exec<{ id: string }>(
+        `SELECT id FROM constellation_generations WHERE status IN ('building', 'complete')`,
+      ).toArray();
+      for (const row of abandoned) this.deleteConstellationGenerationRows(row.id);
+      this.ctx.storage.sql.exec(
+        `UPDATE constellation_generations
+         SET status = 'failed', failure_reason = 'superseded by constellation generation retry'
+         WHERE status IN ('building', 'complete')`,
+      );
+      this.ctx.storage.sql.exec(
+        `INSERT INTO constellation_generations
+           (id, source_revision, topology_version, layout_version, status, created_at)
+         VALUES (?1, ?2, ?3, ?4, 'building', ?5)`,
+        generationId, sourceRevision, input.topologyVersion, input.layoutVersion, nowIso(),
+      );
+    });
     return { generationId, sourceRevision };
   }
 

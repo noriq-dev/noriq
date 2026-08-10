@@ -4,6 +4,7 @@ import type { Env } from '../src/env';
 import type {
   ConstellationGenerationData, ConstellationGenerationStatus, ConstellationHierarchyDrift, ProjectMemoryHealth,
 } from '../src/do/ProjectMemory';
+import type { ConstellationV2Overview } from '../src/memory/constellation-v2';
 
 const appEnv = env as unknown as Env;
 const SYSTEM = { kind: 'system', id: null };
@@ -20,6 +21,7 @@ interface MemoryRpc {
   constellationGenerationStatus(pid: string, generationId?: string): Promise<ConstellationGenerationStatus | null>;
   rebuildConstellationHierarchy(pid: string): Promise<{ ok: boolean; generationId: string; nodes?: number; edges?: number }>;
   constellationHierarchyDrift(pid: string): Promise<ConstellationHierarchyDrift>;
+  constellationV2Overview(pid: string): Promise<ConstellationV2Overview>;
   exportSnapshot(pid: string): Promise<{ ok: true; manifest: { exportedAt: string } } | { ok: false; reason: string }>;
   erase(pid: string): Promise<{ ok: true }>;
   restoreSnapshot(pid: string, opts: { exportedAt: string }): Promise<{ ok: true } | { ok: false; reason: string }>;
@@ -113,6 +115,40 @@ describe('Constellation hierarchy generation storage', () => {
 
     await expect(memory(pid).activateConstellationGeneration(pid, generation.generationId)).rejects.toThrow(/source revision .* stale/);
     expect((await memory(pid).constellationGenerationStatus(pid, generation.generationId))?.status).toBe('complete');
+  });
+
+  it('reaps interrupted build payloads on retry while continuously serving the prior active generation', async () => {
+    const pid = 'prj_constellation_retry';
+    const { nodeId: a } = await memory(pid).writeNode(pid, { type: 'task', uri: 'noriq://task/retry-a', label: 'a', actor: SYSTEM });
+    const { nodeId: b } = await memory(pid).writeNode(pid, { type: 'memory', uri: 'noriq://memory/retry-b', label: 'b', actor: SYSTEM });
+    expect((await memory(pid).rebuildConstellationHierarchy(pid)).ok).toBe(true);
+    const active = await memory(pid).constellationGenerationStatus(pid);
+
+    await memory(pid).writeNode(pid, { type: 'task', uri: 'noriq://task/retry-newer', label: 'newer', actor: SYSTEM });
+    expect((await memory(pid).constellationV2Overview(pid)).revision).toMatchObject({
+      generationId: active!.id, state: 'stale',
+    });
+
+    const interrupted = await memory(pid).beginConstellationGeneration(pid, { topologyVersion: 'connectivity-v1', layoutVersion: 'space-v1' });
+    await memory(pid).stageConstellationGeneration(pid, interrupted.generationId, generationData(a, b));
+    expect((await memory(pid).constellationV2Overview(pid)).revision).toMatchObject({
+      generationId: active!.id, state: 'building',
+    });
+    expect((await memory(pid).health(pid)).tableCounts.constellation_memberships).toBe(4);
+
+    const retry = await memory(pid).beginConstellationGeneration(pid, { topologyVersion: 'connectivity-v1', layoutVersion: 'space-v1' });
+    expect(await memory(pid).constellationGenerationStatus(pid, interrupted.generationId)).toMatchObject({
+      status: 'failed', failureReason: 'superseded by constellation generation retry',
+    });
+    expect((await memory(pid).health(pid)).tableCounts.constellation_memberships).toBe(2);
+    expect((await memory(pid).constellationV2Overview(pid)).revision).toMatchObject({
+      generationId: active!.id, state: 'building',
+    });
+
+    await memory(pid).failConstellationGeneration(pid, retry.generationId, 'fixture stops retry');
+    expect((await memory(pid).constellationV2Overview(pid)).revision).toMatchObject({
+      generationId: active!.id, state: 'stale',
+    });
   });
 
   it('builds and activates the pure hierarchy through the ProjectMemory orchestration wrapper', async () => {

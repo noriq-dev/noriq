@@ -1062,10 +1062,10 @@ export class ProjectRoom extends DurableObject<Env> {
    *  sole-writer-per-project invariant holds. ACCESS to the blocker's project is the caller's
    *  problem (the MCP/REST edges check it before crossing into the DO); this lookup is the
    *  existence check, not the fence. */
-  private async getBlockerTask(ref: string): Promise<{ id: string; key: string; project_id: string; status: string }> {
+  private async getBlockerTask(ref: string): Promise<{ id: string; key: string; title: string; project_id: string; status: string }> {
     const row = await this.env.DB.prepare(
-      'SELECT id, key, project_id, status FROM tasks WHERE id = ? OR key = ?',
-    ).bind(ref, ref).first<{ id: string; key: string; project_id: string; status: string }>();
+      'SELECT id, key, title, project_id, status FROM tasks WHERE id = ? OR key = ?',
+    ).bind(ref, ref).first<{ id: string; key: string; title: string; project_id: string; status: string }>();
     if (!row) throw new Error(`task ${ref} not found`);
     return row;
   }
@@ -1098,8 +1098,8 @@ export class ProjectRoom extends DurableObject<Env> {
       // only), so existing feed renderers see nothing new. The cross-project field still rides
       // only when the edge actually crosses.
       await this.emit(actor, 'dependency.added', 'task', task.id, {
-        key: task.key, dependsOn: dep.key, dependsOnId: dep.id,
-        ...(dep.project_id !== projectId ? { dependsOnProjectId: dep.project_id } : {}),
+        key: task.key, title: task.title, dependsOn: dep.key, dependsOnId: dep.id,
+        ...(dep.project_id !== projectId ? { dependsOnProjectId: dep.project_id } : { dependsOnTitle: dep.title }),
       });
       return { ok: true };
 
@@ -1128,8 +1128,8 @@ export class ProjectRoom extends DurableObject<Env> {
       // PLNR-322: same widening as addDependency's emit — `dependsOnId` alongside the
       // unchanged `key`/`dependsOn` fields.
       await this.emit(actor, 'dependency.removed', 'task', task.id, {
-        key: task.key, dependsOn: dep.key, dependsOnId: dep.id,
-        ...(dep.project_id !== projectId ? { dependsOnProjectId: dep.project_id } : {}),
+        key: task.key, title: task.title, dependsOn: dep.key, dependsOnId: dep.id,
+        ...(dep.project_id !== projectId ? { dependsOnProjectId: dep.project_id } : { dependsOnTitle: dep.title }),
       });
       return { ok: true };
 
@@ -3551,12 +3551,17 @@ export class ProjectRoom extends DurableObject<Env> {
       input.createdBy ?? actor.id, now, now,
       runnerId ? now : null,
     ).run();
+    const anchorLabel = anchorType === 'task' && anchorId
+      ? (await this.env.DB.prepare('SELECT title FROM tasks WHERE id = ? AND project_id = ?').bind(anchorId, this.projectId).first<{ title: string }>())?.title ?? anchorId
+      : anchorType === 'plan' && anchorId
+        ? (await this.env.DB.prepare('SELECT title FROM plans WHERE id = ? AND project_id = ?').bind(anchorId, this.projectId).first<{ title: string }>())?.title ?? anchorId
+        : null;
     // PLNR-322: `anchorId` rides alongside the existing `anchor` (type-only) field — the
     // projector needs the anchor's real id to draw a run -> anchor edge; `anchor` itself is
     // untouched (locked decision: additive only). `anchorId` mirrors `anchorType`'s nullability
     // (an unanchored run carries neither).
     await this.emit(actor, 'run.created', 'run', id, {
-      kind: input.kind, agentTool: input.agentTool, repoRef: input.repoRef, anchor: anchorType, anchorId,
+      kind: input.kind, agentTool: input.agentTool, repoRef: input.repoRef, anchor: anchorType, anchorId, anchorLabel,
     });
     if (runnerId) await this.emit(actor, 'run.dispatched', 'run', id, { runnerId, to: 'dispatched' });
     const view = this.runToWire(await this.loadRun(id));
