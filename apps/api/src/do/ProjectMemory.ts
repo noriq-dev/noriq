@@ -29,6 +29,11 @@ import {
 } from '../memory/projection';
 import type { ProjectedEdgeDescriptor } from '../memory/projection';
 import {
+  buildConstellationHierarchy, constellationSourceIsCurrent,
+  CONSTELLATION_LAYOUT_VERSION, CONSTELLATION_TOPOLOGY_VERSION,
+  type PriorConstellationCommunity,
+} from '../memory/constellation-hierarchy';
+import {
   applyMemoryFilters, dedupeCandidates, rankCandidates, RETRIEVAL_DEFAULTS,
   type RetrievalHit, type RetrievalStage, type RankedHit,
 } from '../memory/retrieval';
@@ -291,7 +296,7 @@ export interface ConstellationGenerationData {
   nodeStats: Array<{ nodeId: string; degree: number; weightedDegree: number; rank: number; boundaryDegree: number }>;
   communities: Array<{
     id: string; parentId: string | null; level: number; label: string; memberCount: number; childCount: number;
-    typeCounts: Record<string, number>; internalWeight: number; normalizedCohesion: number; boundaryWeight: number;
+    typeCounts: Record<string, number>; internalEdgeCount: number; internalWeight: number; normalizedCohesion: number; boundaryWeight: number;
     anchor: [number, number, number];
   }>;
   memberships: Array<{ nodeId: string; communityId: string; level: number }>;
@@ -312,6 +317,21 @@ export interface ConstellationGenerationStatus {
   completedAt: string | null;
   activatedAt: string | null;
   failureReason: string | null;
+}
+
+export interface ConstellationHierarchyDrift {
+  activeGenerationId: string | null;
+  sourceRevision: number | null;
+  currentRevision: number;
+  stale: boolean;
+  canonicalNodes: number;
+  canonicalEdges: number;
+  missingNodeStats: number;
+  extraNodeStats: number;
+  invalidMemberships: number;
+  missingAggregatedEdges: number;
+  unexpectedAggregatedEdges: number;
+  converged: boolean;
 }
 
 interface ConstellationGenerationRow {
@@ -509,11 +529,11 @@ export class ProjectMemory extends DurableObject<Env> {
       for (const row of [...data.communities].sort((a, b) => a.level - b.level || a.id.localeCompare(b.id))) {
         this.ctx.storage.sql.exec(
           `INSERT INTO constellation_communities
-             (generation_id,id,parent_id,level,label,member_count,child_count,type_counts,internal_weight,normalized_cohesion,boundary_weight,anchor_x,anchor_y,anchor_z)
-           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)`,
+             (generation_id,id,parent_id,level,label,member_count,child_count,type_counts,internal_weight,normalized_cohesion,boundary_weight,anchor_x,anchor_y,anchor_z,internal_edge_count)
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)`,
           generationId, row.id, row.parentId, row.level, row.label, row.memberCount, row.childCount,
           JSON.stringify(row.typeCounts), row.internalWeight, row.normalizedCohesion, row.boundaryWeight,
-          row.anchor[0], row.anchor[1], row.anchor[2],
+          row.anchor[0], row.anchor[1], row.anchor[2], row.internalEdgeCount,
         );
       }
       for (const row of data.memberships) {
@@ -560,6 +580,9 @@ export class ProjectMemory extends DurableObject<Env> {
       if (!generation) throw new Error(`constellation generation ${generationId} not found`);
       if (generation.status === 'active') return;
       if (generation.status !== 'complete') throw new Error(`constellation generation ${generationId} is ${generation.status}, not complete`);
+      if (!constellationSourceIsCurrent(generation.source_revision, this.readMemoryRevision())) {
+        throw new Error(`constellation generation ${generationId} source revision ${generation.source_revision} is stale`);
+      }
       const prior = this.ctx.storage.sql.exec<{ id: string }>(`SELECT id FROM constellation_generations WHERE status = 'active'`).toArray()[0];
       superseded = prior?.id ?? null;
       if (prior) this.ctx.storage.sql.exec(`UPDATE constellation_generations SET status = 'superseded' WHERE id = ?1`, prior.id);
@@ -575,7 +598,9 @@ export class ProjectMemory extends DurableObject<Env> {
     await this.assertProjectId(projectId);
     const generation = this.readConstellationGeneration(generationId);
     if (!generation) throw new Error(`constellation generation ${generationId} not found`);
-    if (generation.status !== 'building') throw new Error(`constellation generation ${generationId} is ${generation.status}, not building`);
+    if (generation.status !== 'building' && generation.status !== 'complete') {
+      throw new Error(`constellation generation ${generationId} is ${generation.status}, not fail-able`);
+    }
     this.ctx.storage.sql.exec(
       `UPDATE constellation_generations SET status = 'failed', failure_reason = ?2 WHERE id = ?1`,
       generationId, reason.slice(0, 1000),
@@ -616,6 +641,124 @@ export class ProjectMemory extends DurableObject<Env> {
 
   private clearConstellationDerived(): void {
     for (const table of [...CONSTELLATION_DERIVED_TABLES].reverse()) this.ctx.storage.sql.exec(`DELETE FROM ${table}`);
+  }
+
+  private readPriorConstellationCommunities(): PriorConstellationCommunity[] {
+    const active = this.ctx.storage.sql.exec<{ id: string }>(`SELECT id FROM constellation_generations WHERE status = 'active'`).toArray()[0];
+    if (!active) return [];
+    const rows = this.ctx.storage.sql.exec<{ community_id: string; level: number; uri: string }>(
+      `WITH RECURSIVE ancestors(node_id, community_id, level) AS (
+         SELECT m.node_id, m.community_id, m.level
+         FROM constellation_memberships m WHERE m.generation_id = ?1
+         UNION ALL
+         SELECT a.node_id, c.parent_id, c.level - 1
+         FROM ancestors a
+         JOIN constellation_communities c ON c.generation_id = ?1 AND c.id = a.community_id
+         WHERE c.parent_id IS NOT NULL
+       )
+       SELECT a.community_id, a.level, n.uri
+       FROM ancestors a JOIN nodes n ON n.id = a.node_id
+       ORDER BY a.level, a.community_id, n.uri`,
+      active.id,
+    ).toArray();
+    const grouped = new Map<string, PriorConstellationCommunity>();
+    for (const row of rows) {
+      const key = `${row.level}\0${row.community_id}`;
+      const community = grouped.get(key) ?? { id: row.community_id, level: row.level, memberUris: [] };
+      community.memberUris.push(row.uri);
+      grouped.set(key, community);
+    }
+    return [...grouped.values()];
+  }
+
+  /** Build off ProjectRoom's coordination path, then publish only if canonical graph revision is
+   *  still exactly the revision captured at generation start. Retrying is safe: a stale/failed
+   *  attempt is inert, and the next call creates a fresh generation. */
+  async rebuildConstellationHierarchy(projectId: string): Promise<
+    | { ok: true; generationId: string; sourceRevision: number; nodes: number; edges: number }
+    | { ok: false; generationId: string; reason: 'source-revision-advanced' | 'generation-failed'; detail: string }
+  > {
+    await this.assertProjectId(projectId);
+    const started = await this.beginConstellationGeneration(projectId, {
+      topologyVersion: CONSTELLATION_TOPOLOGY_VERSION,
+      layoutVersion: CONSTELLATION_LAYOUT_VERSION,
+    });
+    try {
+      const rows = this.readConstellationRows();
+      const hierarchy = buildConstellationHierarchy(rows.nodes, rows.edges, this.readPriorConstellationCommunities());
+      if (!constellationSourceIsCurrent(started.sourceRevision, this.readMemoryRevision())) {
+        await this.failConstellationGeneration(projectId, started.generationId, 'canonical source revision advanced during build');
+        return { ok: false, generationId: started.generationId, reason: 'source-revision-advanced', detail: 'canonical source revision advanced during build' };
+      }
+      await this.stageConstellationGeneration(projectId, started.generationId, hierarchy.data);
+      if (!constellationSourceIsCurrent(started.sourceRevision, this.readMemoryRevision())) {
+        await this.failConstellationGeneration(projectId, started.generationId, 'canonical source revision advanced before completion');
+        return { ok: false, generationId: started.generationId, reason: 'source-revision-advanced', detail: 'canonical source revision advanced before completion' };
+      }
+      await this.completeConstellationGeneration(projectId, started.generationId);
+      await this.activateConstellationGeneration(projectId, started.generationId);
+      return { ok: true, generationId: started.generationId, sourceRevision: started.sourceRevision, nodes: hierarchy.diagnostics.nodeCount, edges: hierarchy.diagnostics.edgeCount };
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      const generation = this.readConstellationGeneration(started.generationId);
+      if (generation && (generation.status === 'building' || generation.status === 'complete')) {
+        await this.failConstellationGeneration(projectId, started.generationId, detail);
+      }
+      return { ok: false, generationId: started.generationId, reason: detail.includes('source revision') ? 'source-revision-advanced' : 'generation-failed', detail };
+    }
+  }
+
+  /** Compare the selected disposable projection to canonical graph truth. Counts both missing
+   *  rows and stale extra aggregates; a source-revision mismatch can never report converged. */
+  async constellationHierarchyDrift(projectId: string): Promise<ConstellationHierarchyDrift> {
+    await this.assertProjectId(projectId);
+    const currentRevision = this.readMemoryRevision();
+    const active = this.ctx.storage.sql.exec<{ id: string; source_revision: number }>(
+      `SELECT id, source_revision FROM constellation_generations WHERE status = 'active'`,
+    ).toArray()[0];
+    const canonicalNodes = this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM nodes`).toArray()[0]?.n ?? 0;
+    const canonicalEdges = this.ctx.storage.sql.exec<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM edges e JOIN nodes f ON f.id = e.from_node_id JOIN nodes t ON t.id = e.to_node_id`,
+    ).toArray()[0]?.n ?? 0;
+    if (!active) {
+      return {
+        activeGenerationId: null, sourceRevision: null, currentRevision, stale: canonicalNodes > 0,
+        canonicalNodes, canonicalEdges, missingNodeStats: canonicalNodes, extraNodeStats: 0,
+        invalidMemberships: canonicalNodes, missingAggregatedEdges: canonicalEdges, unexpectedAggregatedEdges: 0,
+        converged: canonicalNodes === 0 && canonicalEdges === 0,
+      };
+    }
+    const missingNodeStats = this.ctx.storage.sql.exec<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM nodes n WHERE NOT EXISTS (
+         SELECT 1 FROM constellation_node_stats s WHERE s.generation_id = ?1 AND s.node_id = n.id
+       )`, active.id,
+    ).toArray()[0]?.n ?? 0;
+    const extraNodeStats = this.ctx.storage.sql.exec<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM constellation_node_stats s
+       WHERE s.generation_id = ?1 AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = s.node_id)`, active.id,
+    ).toArray()[0]?.n ?? 0;
+    const invalidMemberships = this.ctx.storage.sql.exec<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM (
+         SELECT n.id, COUNT(m.community_id) AS memberships
+         FROM nodes n LEFT JOIN constellation_memberships m ON m.generation_id = ?1 AND m.node_id = n.id
+         GROUP BY n.id HAVING memberships != 1
+       )`, active.id,
+    ).toArray()[0]?.n ?? 0;
+    const aggregatedEdges = this.ctx.storage.sql.exec<{ n: number }>(
+      `SELECT
+         COALESCE((SELECT SUM(internal_edge_count) FROM constellation_communities WHERE generation_id = ?1 AND parent_id IS NULL), 0) +
+         COALESCE((SELECT SUM(edge_count) FROM constellation_community_links WHERE generation_id = ?1 AND level = 0), 0) AS n`,
+      active.id,
+    ).toArray()[0]?.n ?? 0;
+    const stale = active.source_revision !== currentRevision;
+    const missingAggregatedEdges = Math.max(0, canonicalEdges - aggregatedEdges);
+    const unexpectedAggregatedEdges = Math.max(0, aggregatedEdges - canonicalEdges);
+    return {
+      activeGenerationId: active.id, sourceRevision: active.source_revision, currentRevision, stale,
+      canonicalNodes, canonicalEdges, missingNodeStats, extraNodeStats, invalidMemberships,
+      missingAggregatedEdges, unexpectedAggregatedEdges,
+      converged: !stale && missingNodeStats === 0 && extraNodeStats === 0 && invalidMemberships === 0 && missingAggregatedEdges === 0 && unexpectedAggregatedEdges === 0,
+    };
   }
 
   // ---------------------------------------------------------------------------

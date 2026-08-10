@@ -142,6 +142,7 @@ interface CommunitySummary {
   memberCount: number;
   childCommunityCount: number;
   typeCounts: Record<string, number>;
+  internalEdgeCount: number;
   internalWeight: number;
   normalizedCohesion: number;
   boundaryWeight: number;
