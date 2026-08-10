@@ -58,6 +58,12 @@ import {
 } from '../memory/graph-queries';
 import { EpisodeSkeletonUnavailableError, loadEpisodeSkeleton } from '../memory/episodes';
 import type { EpisodeIntelligenceDraft } from '../lib/run-sitting-intelligence';
+import {
+  UploadedEpisodeIntelligence,
+  mergeUploadedEpisodeIntelligence,
+  preserveAcceptedEpisodeIntelligence,
+  type UploadedEpisodeIntelligence as UploadedEpisodeIntelligenceData,
+} from '../memory/episode-intelligence';
 import { normalizeAnalyticsEpisode } from '../memory/analytics-normalize';
 import {
   aggregateHistoricalAnalytics, HISTORICAL_ANALYTICS_MAX_ROWS, validateHistoricalAnalyticsQuery,
@@ -282,6 +288,7 @@ interface RecordEpisodeInput {
   landingOutcome: string;
   remainingWork: string[];
   intelligence?: EpisodeIntelligenceDraft;
+  intelligenceEnrichment?: UploadedEpisodeIntelligenceData;
   selfSummary?: unknown;
   actor: { kind: string; id: string | null };
   /** Direct callers replace enrichment by default. Skeleton replays preserve it; daemon
@@ -411,7 +418,10 @@ const UPLOADED_EPISODE_SHAPE = EffortEpisode.pick({
   failures: true,
   findings: true,
   selfSummary: true,
-}).partial().extend({ runId: EffortEpisode.shape.runId });
+}).partial().extend({
+  runId: EffortEpisode.shape.runId,
+  intelligence: UploadedEpisodeIntelligence.optional(),
+});
 
 /**
  * PLNR-255: the embedding/display text derived from an episode's `body` JSON blob — `body` is
@@ -2332,16 +2342,23 @@ export class ProjectMemory extends DurableObject<Env> {
     const acceptedMemoryRevision = (this.ctx.storage.sql
       .exec<{ value: number }>(`SELECT value FROM memory_revision WHERE id = 0`)
       .toArray()[0]?.value ?? 0) + 1;
-    // The caller cannot know the Durable Object's stable episode id. It supplies every other
-    // server-derived fact; this storage seam completes the identity. Daemon enrichment cannot
-    // replace it because its accepted upload schema never carries `intelligence`.
-    const intelligence = input.intelligence
-      ? {
+    // The caller cannot know the Durable Object's stable episode id. The server skeleton supplies
+    // every other authoritative fact; this storage seam completes identity and source revision.
+    // A terminal-job replay carries forward only previously accepted daemon observations, while
+    // a new daemon upload is overlaid through the narrow schema above one metric at a time.
+    let intelligence = input.intelligence
+      ? ProjectIntelligenceEpisode.parse({
           ...input.intelligence,
           identity: { episodeId, ...input.intelligence.identity },
           sources: { ...input.intelligence.sources, memoryRevision: acceptedMemoryRevision },
-        }
+        })
       : existingBody.intelligence;
+    if (mode !== 'replace' && intelligence && existingBody.intelligence) {
+      intelligence = preserveAcceptedEpisodeIntelligence(intelligence, existingBody.intelligence);
+    }
+    if (intelligence && input.intelligenceEnrichment) {
+      intelligence = mergeUploadedEpisodeIntelligence(intelligence, input.intelligenceEnrichment, now);
+    }
 
     // Validated (and default-filled) through the SAME shared schema the wire contract uses —
     // the full EffortEpisode rides `body` as JSON (locked decision; the table's own header
@@ -2988,6 +3005,7 @@ export class ProjectMemory extends DurableObject<Env> {
         failures: supplied('failures'),
         findings: supplied('findings'),
         selfSummary: supplied('selfSummary'),
+        intelligenceEnrichment: parsed.data.intelligence,
         actor: { kind: 'agent', id: skeleton.agentId },
         writeMode: 'enrichment',
       });

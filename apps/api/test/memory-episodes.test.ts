@@ -40,6 +40,7 @@ interface EpisodeUploadRow {
   timeline?: Array<{ at: string; label: string }>; filesTouched?: string[]; commands?: string[]; testsRun?: string[]; failures?: string[];
   findings?: Array<{ summary: string; severity?: string }>; reviewRounds?: number; tokenUsage?: Record<string, unknown>; costUSD?: number;
   acceptanceCoverage?: number | null; steeringEvents?: string[]; landingOutcome?: string; remainingWork?: string[]; selfSummary?: unknown;
+  intelligence?: Record<string, unknown>;
 }
 interface MemRpc {
   health(pid: string): Promise<{ schemaVersion: number; memoryRevision: number; tableCounts: Record<string, number> }>;
@@ -81,6 +82,25 @@ function baseEpisodeInput(runId: string, overrides: Partial<RecordEpisodeInput> 
     acceptanceCoverage: null, steeringEvents: [], landingOutcome: 'pending', remainingWork: [],
     actor: { kind: 'system', id: null },
     ...overrides,
+  };
+}
+
+const DAEMON_OBSERVED_AT = '2026-08-10T18:00:00.000Z';
+const FORGED_ACCEPTED_AT = '2000-01-01T00:00:00.000Z';
+function daemonMetric<T>(
+  value: T,
+  provenance: 'runner_observed' | 'backend_observed' | 'derived' = 'runner_observed',
+  source: 'runner' | 'vcs_backend' = 'runner',
+) {
+  return {
+    status: 'complete' as const,
+    value,
+    provenance,
+    source,
+    sourceId: 'daemon-source',
+    observedAt: DAEMON_OBSERVED_AT,
+    acceptedAt: FORGED_ACCEPTED_AT,
+    reason: null,
   };
 }
 
@@ -468,6 +488,7 @@ describe('episode upload ingest — completeEpisodeIngest merges partial enrichm
     const taskId = made.body.id as string;
     await mcpCall(agent.apiKey, 'attach_ref', { taskId, kind: 'commit', ref: 'server-base-sha' });
     await seedRunner(runnerId);
+    await appEnv.DB.prepare('UPDATE runners SET version = ? WHERE id = ?').bind('server-runner-v1', runnerId).run();
     await seedAgent(agentId, runnerId, projectId);
     const now = new Date().toISOString();
     await appEnv.DB.prepare(
@@ -524,6 +545,45 @@ describe('episode upload ingest — completeEpisodeIngest merges partial enrichm
         steeringEvents: [],
         landingOutcome: 'not-a-real-outcome',
         remainingWork: ['forged remaining work'],
+        intelligence: {
+          schemaVersion: 1,
+          identity: { episodeId: 'forged-episode', projectId: 'forged-project', runId: 'forged-run', sitting: 99 },
+          sources: { memoryRevision: 999, capturedAt: '2000-01-01T00:00:00.000Z' },
+          versions: { extraction: 'forged-extractor' },
+          preExecution: {
+            task: { taskType: 'forged', tags: ['forged'], capturedAt: '2000-01-01T00:00:00.000Z' },
+            requestedStrategy: { model: 'forged-model' },
+            configuration: [
+              { kind: 'runner', name: runnerId, version: 'server-runner-v1', fingerprint: 'forged-runner-fingerprint' },
+              { kind: 'workflow', name: 'daemon-workflow', version: '1.0.0', fingerprint: 'workflow-sha256' },
+            ],
+          },
+          execution: {
+            executedStrategy: { model: 'forged-model' },
+            observedModelUsage: daemonMetric({
+              'daemon-model': {
+                inputTokens: 34, outputTokens: 13, cacheReadInputTokens: 8,
+                cacheCreationInputTokens: 5, costUSD: 2.75,
+              },
+            }),
+            clocks: {
+              queueDurationMs: daemonMetric(99_999),
+              verifyDurationMs: daemonMetric(1_250),
+            },
+            stages: [{
+              executionId: 'exe_daemon_verify', kind: 'stage', role: 'verifier', stage: 'tests',
+              elapsedMs: daemonMetric(1_250), tokens: daemonMetric(55), costUSD: daemonMetric(0.75),
+            }],
+            changes: {
+              backend: 'git',
+              changedFiles: daemonMetric(3, 'backend_observed', 'vcs_backend'),
+              additions: daemonMetric(21, 'backend_observed', 'vcs_backend'),
+              deletions: daemonMetric(8, 'backend_observed', 'vcs_backend'),
+              churn: daemonMetric(29, 'derived', 'vcs_backend'),
+            },
+          },
+          outcome: { runOutcome: 'failed', landingOutcome: 'failed' },
+        },
       },
     ]);
     const completed = await memory(projectId).completeEpisodeIngest(projectId, scopeId);
@@ -555,15 +615,59 @@ describe('episode upload ingest — completeEpisodeIngest merges partial enrichm
     ]);
     expect(episode!.intelligence).toMatchObject({
       identity: { episodeId: episode!.id, projectId, runId: run.id, sitting: 1, taskId },
-      preExecution: { task: { tags: ['episode-test'] } },
+      sources: { capturedAt: expect.not.stringContaining('2000-01-01') },
+      versions: { extraction: 'commissioning-v2' },
+      preExecution: {
+        task: { tags: ['episode-test'] },
+        configuration: expect.arrayContaining([
+          expect.objectContaining({ kind: 'runner', name: runnerId, version: 'server-runner-v1' }),
+          { kind: 'workflow', name: 'daemon-workflow', version: '1.0.0', fingerprint: 'workflow-sha256' },
+        ]),
+      },
+      execution: {
+        observedModelUsage: expect.objectContaining({
+          value: expect.objectContaining({ 'daemon-model': expect.objectContaining({ costUSD: 2.75 }) }),
+          provenance: 'runner_observed', source: 'runner',
+        }),
+        clocks: {
+          verifyDurationMs: expect.objectContaining({ value: 1_250, provenance: 'runner_observed' }),
+        },
+        stages: [expect.objectContaining({ stage: 'tests', elapsedMs: expect.objectContaining({ value: 1_250 }) })],
+        changes: {
+          backend: 'git',
+          changedFiles: expect.objectContaining({ value: 3 }), additions: expect.objectContaining({ value: 21 }),
+          deletions: expect.objectContaining({ value: 8 }), churn: expect.objectContaining({ value: 29 }),
+        },
+      },
+      outcome: { runOutcome: 'done', landingOutcome: 'pending' },
     });
+    const acceptedUsage = (episode!.intelligence as any).execution.observedModelUsage;
+    expect(acceptedUsage.acceptedAt).not.toBe(FORGED_ACCEPTED_AT);
+    expect(acceptedUsage.acceptedAt).toEqual(expect.any(String));
+    const acceptedConfiguration = (episode!.intelligence as any).preExecution.configuration as Array<Record<string, unknown>>;
+    expect(acceptedConfiguration.find((item) => item.kind === 'runner')?.fingerprint).not.toBe('forged-runner-fingerprint');
+    // The upload's forged queue clock was stripped; this remains the server's D1-derived value.
+    expect((episode!.intelligence as any).execution.clocks.queueDurationMs.value).not.toBe(99_999);
+    // Nor may the daemon replace a server-derived executed strategy.
+    expect((episode!.intelligence as any).execution.executedStrategy?.model).not.toBe('forged-model');
 
-    // A later partial enrichment changes only what it names; schema defaults must not turn
-    // omitted arrays into destructive explicit clears.
+    // A later partial intelligence enrichment changes only the individual metric it names.
+    // Explicit [] still clears the daemon-owned stages array, while [] cannot erase the
+    // server-owned commissioning fingerprints.
     const partialScopeId = `${run.id}_partial`;
     await memory(projectId).beginEpisodeIngest(projectId, { scopeId: partialScopeId, projectId, batchCount: 1 });
     await memory(projectId).ingestEpisodeBatch(projectId, partialScopeId, 0, [
-      { runId: run.id, findings: [{ summary: 'the follow-up review confirmed the query fix' }] },
+      {
+        runId: run.id,
+        findings: [{ summary: 'the follow-up review confirmed the query fix' }],
+        intelligence: {
+          preExecution: { configuration: [] },
+          execution: {
+            stages: [],
+            changes: { additions: daemonMetric(34, 'backend_observed', 'vcs_backend') },
+          },
+        },
+      },
     ]);
     expect(await memory(projectId).completeEpisodeIngest(projectId, partialScopeId)).toMatchObject({ recorded: 1, skipped: 0 });
     expect(await memory(projectId)._getEpisodeForTest(projectId, run.id)).toMatchObject({
@@ -571,13 +675,37 @@ describe('episode upload ingest — completeEpisodeIngest merges partial enrichm
       commands: ['npm test'],
       testsRun: ['memory-episodes.test.ts'],
       findings: [{ summary: 'the follow-up review confirmed the query fix' }],
+      intelligence: {
+        preExecution: { configuration: expect.arrayContaining([
+          expect.objectContaining({ kind: 'runner', name: runnerId }),
+          expect.objectContaining({ kind: 'workflow', name: 'daemon-workflow' }),
+        ]) },
+        execution: {
+          observedModelUsage: expect.objectContaining({ value: expect.objectContaining({ 'daemon-model': expect.anything() }) }),
+          clocks: { verifyDurationMs: expect.objectContaining({ value: 1_250 }) },
+          stages: [],
+          changes: {
+            changedFiles: expect.objectContaining({ value: 3 }), additions: expect.objectContaining({ value: 34 }),
+            deletions: expect.objectContaining({ value: 8 }), churn: expect.objectContaining({ value: 29 }),
+          },
+        },
+      },
     });
 
     // A terminal-job retry after enrichment must not clear the daemon-owned half either.
     await recordEpisodeForRun(appEnv, projectId, run.id);
     expect(await memory(projectId)._getEpisodeForTest(projectId, run.id)).toMatchObject({
       filesTouched: ['src/slow.ts'], commands: ['npm test'], findings: [{ summary: 'the follow-up review confirmed the query fix' }],
-      intelligence: { identity: { episodeId: episode!.id, runId: run.id, sitting: 1 } },
+      intelligence: {
+        identity: { episodeId: episode!.id, runId: run.id, sitting: 1 },
+        execution: {
+          observedModelUsage: expect.objectContaining({ value: expect.objectContaining({ 'daemon-model': expect.anything() }) }),
+          clocks: { verifyDurationMs: expect.objectContaining({ value: 1_250 }) },
+          changes: {
+            changedFiles: expect.objectContaining({ value: 3 }), additions: expect.objectContaining({ value: 34 }),
+          },
+        },
+      },
     });
   });
 
@@ -597,11 +725,21 @@ describe('episode upload ingest — completeEpisodeIngest merges partial enrichm
     await memory(projectId).beginEpisodeIngest(projectId, { scopeId, projectId, batchCount: 1 });
     await memory(projectId).ingestEpisodeBatch(projectId, scopeId, 0, [
       { runId: run.id, findings: [{ summary: '' }] }, // malformed daemon-owned enrichment
+      {
+        runId: run.id,
+        intelligence: {
+          execution: {
+            observedModelUsage: {
+              ...daemonMetric({}), provenance: 'server_observed', source: 'd1_coordination',
+            },
+          },
+        },
+      }, // daemon may not forge server-observed provenance
       { runId: 'run_does_not_exist' }, // parses fine, but no such run in this project
       { runId: nonterminal.id, commands: ['must not record yet'] },
     ]);
     const completed = await memory(projectId).completeEpisodeIngest(projectId, scopeId);
     expect(completed.recorded).toBe(0);
-    expect(completed.skipped).toBe(3);
+    expect(completed.skipped).toBe(4);
   });
 });
