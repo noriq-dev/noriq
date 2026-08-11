@@ -133,3 +133,71 @@ describe('MemoryConstellationV2 header band, breadcrumb row, and resident meter 
     expect(host.textContent).toContain('resident 1 / 12,000 nodes');
   });
 });
+
+describe('MemoryConstellationV2 status region (PLNR-436)', () => {
+  it('stacks error, stale, and partial notices as ordered siblings in one flow container with no positional coupling, and the partial notice carries its own continue action', async () => {
+    const staleRevision: ApiConstellationV2Revision = { ...revision, state: 'stale', sourceRevision: 3, currentRevision: 7 };
+    vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision: staleRevision, communities: [rootCommunity], routes: [], coverage: { complete: true, reasons: [] } });
+    vi.spyOn(api, 'memoryConstellationV2Community').mockImplementation(async () => ({ ...page('a', 'more'), revision: staleRevision }));
+    vi.spyOn(api, 'memoryConstellationV2Incidents').mockRejectedValue(new Error('Incident boom'));
+    host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
+    act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
+    await tick(); await tick();
+
+    // Expand the root community: entities page has a nextCursor, so scene.partial becomes true.
+    const openRoot = [...host.querySelectorAll('button')].find((button) => button.textContent === 'open')!;
+    act(() => openRoot.click());
+    await tick(); await tick();
+
+    // Select the resident entity: the mocked incident fetch rejects, driving the error notice.
+    const entityRow = [...host.querySelectorAll('button')].find((button) => button.textContent?.startsWith('Memory a'))!;
+    act(() => entityRow.click());
+    await tick(); await tick();
+
+    const notices = [...host.querySelectorAll('[role="status"]')];
+    expect(notices).toHaveLength(3);
+    // Fixed severity order: error -> stale -> building -> partial -> informational (Navigator
+    // conventions doc §3). Only error/stale/partial are reachable simultaneously here.
+    expect(notices[0]!.textContent).toContain('Incident boom');
+    expect(notices[1]!.textContent).toContain('This generation is stale (source 3, current 7).');
+    expect(notices[2]!.textContent).toContain('Partial level · bounded continuation available');
+
+    // All three are siblings under the same flow container — not independently offset elements.
+    const parent = notices[0]!.parentElement!;
+    expect(notices.every((notice) => notice.parentElement === parent)).toBe(true);
+    expect(parent.style.display).toBe('flex');
+    expect(parent.style.flexDirection).toBe('column');
+    // No notice computes its own position — only the shared container is positioned.
+    for (const notice of notices) {
+      expect((notice as HTMLElement).style.position).toBe('');
+      expect((notice as HTMLElement).style.top).toBe('');
+      expect((notice as HTMLElement).style.left).toBe('');
+    }
+
+    // The former standalone "load more in community" button is now this notice's inline action.
+    const continueAction = notices[2]!.querySelector('button')!;
+    expect(continueAction.textContent).toBe('continue');
+    act(() => continueAction.click());
+    await tick();
+    expect(api.memoryConstellationV2Community).toHaveBeenCalledWith('p1', 'root', expect.objectContaining({ cursor: 'more' }), undefined);
+  });
+
+  it('stacks building and informational (unindexed) notices together at root, in severity order, without reading each other\'s presence', async () => {
+    const buildingRevision: ApiConstellationV2Revision = { ...revision, state: 'building' };
+    // No file/symbol/repository counts anywhere, so codeEntities === 0 at root.
+    vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision: buildingRevision, communities: [rootCommunity], routes: [], coverage: { complete: true, reasons: [] } });
+    host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
+    act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
+    await tick(); await tick();
+
+    const notices = [...host.querySelectorAll('[role="status"]')];
+    expect(notices).toHaveLength(2);
+    expect(notices[0]!.textContent).toContain('A newer hierarchy is building; this complete generation remains navigable.');
+    expect(notices[1]!.textContent).toContain('No repository entities are present in this generation; repository indexing may not have run.');
+    expect(notices[0]!.parentElement).toBe(notices[1]!.parentElement);
+    // Note: the accessible-list <details> panel (Space view only) is unreachable in this file's
+    // suite — the top-of-file MemoryConstellation3D mock always fires onRendererFailure, which
+    // forces Catalogue. Its no-longer-conditional `top: 42` offset is verified by reading the
+    // component source, not by a DOM assertion here.
+  });
+});

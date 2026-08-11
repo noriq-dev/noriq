@@ -264,6 +264,45 @@ export function MemoryConstellationV2({
   const searchActive = query.trim().length > 0;
   const residentMeterPercent = Math.min(100, (residentTotal / CONSTELLATION_V2_RESIDENT_NODE_BUDGET) * 100);
 
+  // One stacked status region, fixed severity order (error -> stale -> building -> partial ->
+  // informational, per the Navigator conventions doc), each entry a sibling in a single flow
+  // container. No entry computes its position from another entry's presence — that arithmetic
+  // (`top: scene.partial ? 42 : 12` etc.) is exactly what this replaces. Message text is preserved
+  // verbatim in meaning from the pre-existing strips (PLNR-372/380 truthful-degradation copy).
+  const statusNotices: Array<{ key: string; token: 'error' | 'stale' | 'building' | 'partial' | 'informational'; message: string; action?: { label: string; onClick: () => void } }> = [];
+  if (error) statusNotices.push({ key: 'error', token: 'error', message: error });
+  if (overview.revision.state === 'stale') {
+    statusNotices.push({
+      key: 'stale', token: 'stale',
+      message: `This generation is stale (source ${overview.revision.sourceRevision}, current ${overview.revision.currentRevision}).`,
+    });
+  }
+  if (overview.revision.state === 'building') {
+    statusNotices.push({
+      key: 'building', token: 'building',
+      message: 'A newer hierarchy is building; this complete generation remains navigable.',
+    });
+  }
+  if (scene.partial) {
+    // The former standalone "load more in community" button (bottom:12) becomes this notice's
+    // inline continue action: currentPage.nextCursor is a strict subset of what makes scene.partial
+    // true (incomplete incident pages can also set it), so the action only appears when there is
+    // actually a community page to continue.
+    const continuation = currentPage?.nextCursor
+      ? { label: 'continue', onClick: () => void fetchCommunity(currentPage.community.id, currentPage.nextCursor!) }
+      : undefined;
+    statusNotices.push({ key: 'partial', token: 'partial', message: 'Partial level · bounded continuation available', action: continuation });
+  }
+  if (codeEntities === 0 && path.length === 0) {
+    statusNotices.push({
+      key: 'unindexed', token: 'informational',
+      message: 'No repository entities are present in this generation; repository indexing may not have run.',
+    });
+  }
+  const STATUS_TOKEN_COLOR: Record<(typeof statusNotices)[number]['token'], string> = {
+    error: 'var(--red-soft)', stale: 'var(--amber)', building: 'var(--amber)', partial: 'var(--amber)', informational: 'var(--text-dim)',
+  };
+
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
       <div style={{
@@ -399,18 +438,31 @@ export function MemoryConstellationV2({
           </div>
           {incidentPages.at(-1)?.nextCursor && <Button variant="ghost" onClick={() => void loadMoreIncidents()} style={{ marginTop: 8 }}>load more relationships</Button>}
         </aside>}
-        {currentPage?.nextCursor && <Button onClick={() => void fetchCommunity(currentPage.community.id, currentPage.nextCursor!)} style={{ position: 'absolute', left: 12, bottom: 12 }}>load more in community</Button>}
-        {scene.partial && <div style={{ position: 'absolute', left: 12, top: 12, padding: '5px 8px', borderRadius: 6, background: 'var(--panel)', color: 'var(--amber)', fontSize: 10 }}>Partial level · bounded continuation available</div>}
-        {overview.revision.state !== 'current' && <div style={{ position: 'absolute', left: 12, top: scene.partial ? 42 : 12, padding: '5px 8px', borderRadius: 6, background: 'var(--panel)', color: 'var(--amber)', fontSize: 10 }}>
-          {overview.revision.state === 'building' ? 'A newer hierarchy is building; this complete generation remains navigable.' : `This generation is stale (source ${overview.revision.sourceRevision}, current ${overview.revision.currentRevision}).`}
+        {statusNotices.length > 0 && <div style={{ position: 'absolute', left: 14, top: 12, display: 'flex', flexDirection: 'column', gap: 6, maxWidth: 420, zIndex: 1 }}>
+          {statusNotices.map((notice) => <div key={notice.key} role="status" style={{
+            display: 'flex', alignItems: 'center', gap: 8, padding: '4px 9px', borderRadius: 6,
+            background: 'var(--panel)', border: `1px solid ${STATUS_TOKEN_COLOR[notice.token]}`,
+            color: STATUS_TOKEN_COLOR[notice.token], fontFamily: 'var(--mono)', fontSize: 10,
+          }}>
+            <span>{notice.message}</span>
+            {notice.action && <button
+              type="button" onClick={notice.action.onClick}
+              style={{ background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', fontFamily: 'inherit', fontSize: 'inherit', color: 'inherit', textDecoration: 'underline' }}
+            >
+              {notice.action.label}
+            </button>}
+          </div>)}
         </div>}
-        {codeEntities === 0 && path.length === 0 && <div style={{ position: 'absolute', left: 12, top: 42, padding: '5px 8px', borderRadius: 6, background: 'var(--panel)', color: 'var(--text-dim)', fontSize: 10 }}>No repository entities are present in this generation; repository indexing may not have run.</div>}
-        {error && <div role="status" style={{ position: 'absolute', left: 12, bottom: 54, maxWidth: 420, color: 'var(--red-soft)', background: 'var(--panel)', padding: 8 }}>{error}</div>}
         {hits.length > 0 && <div style={{ position: 'absolute', right: 14, top: 10, width: 360, maxHeight: 300, overflow: 'auto', background: 'var(--panel)', border: '1px solid var(--line)', borderRadius: 8 }}>
           {hits.map((hit) => <button key={`${hit.entityType}:${hit.id}`} type="button" onClick={() => void focusHit(hit)} style={{ display: 'block', width: '100%', padding: 9, textAlign: 'left', borderBottom: '1px solid var(--line)' }}>{hit.title}<small style={{ display: 'block', color: 'var(--text-dim)' }}>{hit.entityType} · {hit.uri}</small></button>)}
         </div>}
         {searching && <div style={{ position: 'absolute', right: 18, top: 16, color: 'var(--text-dim)', fontSize: 10 }}>searching…</div>}
-        {!showCatalogue && <details style={{ position: 'absolute', left: 12, top: codeEntities === 0 && path.length === 0 ? 70 : 42, maxHeight: '60%', width: 300, overflow: 'auto', background: 'var(--panel)', padding: 8, borderRadius: 8 }}>
+        {/* Fixed offset, not conditional on the status region's height: this widget is superseded by
+            the Catalogue promotion in Phase 4 (PLNR-441/442, per the audit doc's "Fallbacks"
+            disposition), so it is left in place rather than redesigned here — but per this task's
+            acceptance truth ("no component computes a pixel offset from another element's presence")
+            it must stop reading codeEntities/path.length the way it used to. */}
+        {!showCatalogue && <details style={{ position: 'absolute', left: 12, top: 42, maxHeight: '60%', width: 300, overflow: 'auto', background: 'var(--panel)', padding: 8, borderRadius: 8 }}>
           <summary>Accessible visible list ({filteredScene.nodes.length})</summary>
           {filteredScene.nodes.map((node) => <button key={node.id} type="button" onClick={() => selectNode(node.id)} onDoubleClick={() => { if (node.community) void expand(node.id); }} style={{ display: 'block', width: '100%', textAlign: 'left', padding: 5 }}>{node.label} <small>({node.type})</small></button>)}
           {currentPage?.nextCursor && <Button onClick={() => void fetchCommunity(currentPage.community.id, currentPage.nextCursor!)}>load next page</Button>}
