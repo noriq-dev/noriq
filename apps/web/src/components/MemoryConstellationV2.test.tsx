@@ -244,3 +244,78 @@ describe('MemoryConstellationV2 encoding legend (PLNR-438)', () => {
     expect(legend.textContent).toContain('size = connectivity · brightness = authority');
   });
 });
+
+describe('MemoryConstellationV2 docked selection inspector (PLNR-440)', () => {
+  it('docks the inspector as a real flex sibling of the canvas area (not a floating overlay) and keeps its relationship coverage honest through a continuation', async () => {
+    vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision, communities: [rootCommunity], routes: [], coverage: { complete: true, reasons: [] } });
+    vi.spyOn(api, 'memoryConstellationV2Community').mockResolvedValue(page('a', null));
+    vi.spyOn(api, 'memoryConstellationV2Incidents').mockImplementation(async (_pid, _nodeId, input) => (input?.cursor ? {
+      revision, node: { nodeId: 'a', uri: 'noriq://memory/a', type: 'memory', label: 'Memory a', communityPath: [] },
+      edges: [{ edgeId: 'e2', type: 'related_to', direction: 'outgoing', provenance: null, endpoint: { nodeId: 'x2', uri: 'noriq://task/x2', type: 'task', label: 'Task X2', communityPath: [] } }],
+      nextCursor: null, coverage: { complete: true, reasons: [] },
+    } : {
+      revision, node: { nodeId: 'a', uri: 'noriq://memory/a', type: 'memory', label: 'Memory a', communityPath: [] },
+      edges: [{ edgeId: 'e1', type: 'references', direction: 'outgoing', provenance: null, endpoint: { nodeId: 'x1', uri: 'noriq://task/x1', type: 'task', label: 'Task X1', communityPath: [] } }],
+      nextCursor: 'more', coverage: { complete: false, reasons: ['page-limit-reached'] },
+    }));
+    host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
+    act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
+    await tick(); await tick();
+
+    const openRoot = [...host.querySelectorAll('button')].find((button) => button.textContent === 'open')!;
+    act(() => openRoot.click());
+    await tick(); await tick();
+
+    const entityRow = [...host.querySelectorAll('button')].find((button) => button.textContent?.startsWith('Memory a'))!;
+    act(() => entityRow.click());
+    await tick(); await tick();
+
+    const inspector = host.querySelector('[aria-label="Selection inspector"]') as HTMLElement;
+    expect(inspector).toBeTruthy();
+    // A real flex-layout sibling of the canvas area, never an absolutely-positioned overlay reading
+    // a computed offset off it — the same "no sibling-dependent offset arithmetic" rule the status
+    // region already follows (PLNR-436), now applied to the panel that changes the canvas's own
+    // available width.
+    expect(inspector.style.position).toBe('');
+    // jsdom's CSSOM normalizes the `flex: 'none'` shorthand into its longhand equivalent.
+    expect(inspector.style.flex).toBe('0 0 auto');
+    expect(inspector.style.width).toBe('320px');
+
+    // The `entity()` fixture carries degree: 1, which the live cursor (still open) immediately
+    // proves too low — the honest denominator corrects UP to match what is actually loaded rather
+    // than parroting a stale snapshot number.
+    expect(inspector.textContent).toContain('Relationships · 1 of 1');
+    const loadMore = [...inspector.querySelectorAll('button')].find((button) => button.textContent?.startsWith('load next page'))!;
+    act(() => loadMore.click());
+    await tick(); await tick();
+    expect(api.memoryConstellationV2Incidents).toHaveBeenCalledWith('p1', 'a', expect.objectContaining({ cursor: 'more' }), expect.any(AbortSignal));
+    // The continuation completed (nextCursor null) — coverage is now exact, and the action is gone.
+    expect(inspector.textContent).toContain('Relationships · 2 of 2');
+    expect([...inspector.querySelectorAll('button')].some((button) => button.textContent?.startsWith('load next page'))).toBe(false);
+  });
+
+  it('shows the community aggregate view (never a relationship list) and wires "open community" through the same expand path the catalogue row uses', async () => {
+    vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision, communities: [rootCommunity], routes: [], coverage: { complete: true, reasons: [] } });
+    vi.spyOn(api, 'memoryConstellationV2Community').mockResolvedValue(page('a', null));
+    host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
+    act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
+    await tick(); await tick();
+
+    const communityRow = [...host.querySelectorAll('button')].find((button) => button.textContent?.startsWith('Root community'))!;
+    act(() => communityRow.click());
+    await tick();
+
+    const inspector = host.querySelector('[aria-label="Selection inspector"]') as HTMLElement;
+    expect(inspector.textContent).toContain('Root community');
+    expect(inspector.textContent).toContain('2 entities');
+    expect(inspector.textContent).not.toContain('Relationships');
+
+    const openCommunity = [...inspector.querySelectorAll('button')].find((button) => button.textContent === 'open community')!;
+    act(() => openCommunity.click());
+    await tick(); await tick();
+    // Same `expand()`/`api.memoryConstellationV2Community` path the catalogue row's own "open"
+    // button already drives — the dock is a lens onto the existing expansion, not a second one.
+    expect(api.memoryConstellationV2Community).toHaveBeenCalledWith('p1', 'root', expect.objectContaining({ limit: 256 }), undefined);
+    expect(host.textContent).toContain('level 1');
+  });
+});

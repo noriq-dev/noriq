@@ -6,6 +6,17 @@ import type { Constellation3DEdge, Constellation3DNode } from './constellation-3
 
 export const CONSTELLATION_V2_RESIDENT_NODE_BUDGET = 12_000;
 
+/** An incident edge TYPE that reads as superseded/replaced rather than a live relationship — the
+ * one predicate this scene assembler treats as historical for a raw incident edge (backbone edges
+ * instead carry a server-computed `historical` flag verbatim, no client-side guess needed). Exported
+ * so ConstellationInspector.tsx's relationship-list rows apply the EXACT same test the canvas
+ * promoted-edge pass already uses below — a row must never disagree with the 3D scene about which
+ * relationships are historical (PLNR-440, mirroring the "one colour source" rule constellation-encoding.ts
+ * already established for types). */
+export function isHistoricalIncidentEdgeType(type: string): boolean {
+  return type === 'supersedes' || type === 'contradicts';
+}
+
 export interface ConstellationV2Scene {
   nodes: Constellation3DNode[];
   edges: Constellation3DEdge[];
@@ -70,7 +81,7 @@ export function assembleConstellationV2Scene(
         id: `incident:${incident.edgeId}`, fromId: outgoing ? incidentPage.node.nodeId : endpointId,
         toId: outgoing ? endpointId : incidentPage.node.nodeId, type: incident.type, direction: 'forward',
         weight: 5, aggregate: endpointId !== incident.endpoint.nodeId, provenance: incident.provenance,
-        historical: incident.type === 'supersedes' || incident.type === 'contradicts',
+        historical: isHistoricalIncidentEdgeType(incident.type),
       });
     }
   }

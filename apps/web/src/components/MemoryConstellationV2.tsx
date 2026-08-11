@@ -7,6 +7,7 @@ import { useTheme } from '../theme';
 import { Button, Select, TextInput } from './ui';
 import { MonoTag } from './bits';
 import { CONSTELLATION_SHAPE_GLYPH, encodingForType } from './constellation-encoding';
+import { ConstellationInspector } from './ConstellationInspector';
 import {
   assembleConstellationV2Scene, CONSTELLATION_V2_RESIDENT_NODE_BUDGET, evictConstellationPages, type ResidentConstellationPage,
 } from './constellation-v2-scene';
@@ -65,6 +66,10 @@ export function MemoryConstellationV2({
   const pathRef = useRef(path);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [incidentPages, setIncidentPages] = useState<ApiConstellationV2IncidentPage[]>([]);
+  // True while an incident page (initial selection or a "load next page" continuation) is in
+  // flight — surfaced to the docked inspector so its relationship coverage line can say "loading…"
+  // instead of a premature "0 of N" between the click and the fetch resolving.
+  const [relationshipsLoading, setRelationshipsLoading] = useState(false);
   const incidentAbortRef = useRef<AbortController | null>(null);
   const selectionSerialRef = useRef(0);
   const [loading, setLoading] = useState(true);
@@ -177,13 +182,19 @@ export function MemoryConstellationV2({
     const serial = ++selectionSerialRef.current;
     setSelectedNodeId(nodeId); setIncidentPages([]);
     const activePage = pathRef.current.length ? residentsRef.current.get(pathRef.current.at(-1)!)?.page : null;
-    if (!nodeId || !activePage?.entities.some((entity) => entity.nodeId === nodeId)) return;
+    const isEntitySelection = Boolean(nodeId) && Boolean(activePage?.entities.some((entity) => entity.nodeId === nodeId));
+    setRelationshipsLoading(isEntitySelection);
+    if (!isEntitySelection) return;
     const controller = new AbortController();
     incidentAbortRef.current = controller;
-    api.memoryConstellationV2Incidents(pid, nodeId, { limit: 256 }, controller.signal).then((page) => {
+    api.memoryConstellationV2Incidents(pid, nodeId!, { limit: 256 }, controller.signal).then((page) => {
       if (selectionSerialRef.current !== serial || page.revision.generationId !== overviewRef.current?.revision.generationId) return;
-      setIncidentPages([page]);
-    }).catch((reason: unknown) => { if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : 'Incident edges failed'); });
+      setIncidentPages([page]); setRelationshipsLoading(false);
+    }).catch((reason: unknown) => {
+      if (controller.signal.aborted) return;
+      setError(reason instanceof Error ? reason.message : 'Incident edges failed');
+      if (selectionSerialRef.current === serial) setRelationshipsLoading(false);
+    });
   }, [pid]);
 
   const loadMoreIncidents = async () => {
@@ -191,10 +202,12 @@ export function MemoryConstellationV2({
     if (!last?.nextCursor || !selectedNodeId) return;
     const serial = selectionSerialRef.current;
     const controller = new AbortController(); incidentAbortRef.current = controller;
+    setRelationshipsLoading(true);
     try {
       const page = await api.memoryConstellationV2Incidents(pid, selectedNodeId, { cursor: last.nextCursor, limit: 256 }, controller.signal);
       if (selectionSerialRef.current === serial && page.revision.generationId === overviewRef.current?.revision.generationId) setIncidentPages((current) => [...current, page]);
     } catch (reason) { if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : 'Incident continuation failed'); }
+    finally { if (selectionSerialRef.current === serial) setRelationshipsLoading(false); }
   };
 
   const focusHit = async (hit: ApiMemoryHit) => {
@@ -413,105 +426,117 @@ export function MemoryConstellationV2({
           <div style={{ width: `${residentMeterPercent}%`, height: '100%', background: 'var(--accent)' }} />
         </div>
       </div>
-      <div style={{ position: 'relative', flex: 1, minHeight: 0 }}>
-        {overview.communities.length === 0 ? <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: 'var(--text-dim)' }}>
-          <div style={{ maxWidth: 440, textAlign: 'center' }}><strong>No memory entities are present in this completed generation.</strong><div style={{ marginTop: 6, fontSize: 11 }}>This is a confirmed empty hierarchy, not a renderer or network failure.</div></div>
-        </div> : !showCatalogue ? <Suspense fallback={<div style={{ padding: 24, color: 'var(--text-dim)' }}>Loading 3D renderer…</div>}>
-            <LazyConstellation3D
-              projectId={pid} generationId={overview.revision.generationId} layoutVersion={overview.revision.layoutVersion}
-              nodes={filteredScene.nodes} edges={filteredScene.edges} selectedNodeId={selectedNodeId} highlightedNodeIds={highlightedNodeIds} theme={theme}
-              reducedMotion={reducedMotion}
-              onSelectNode={selectNode} onOpenEgoNetwork={onOpenEgoNetwork} onOpenInspector={onOpenInspector}
-              onRendererFailure={handleRendererFailure}
-            />
-          </Suspense> : <div role="region" aria-label="Textual memory constellation" style={{ position: 'absolute', inset: 0, overflow: 'auto', padding: 18 }}>
-            {rendererFailure && <div style={{ padding: 10, marginBottom: 10, border: '1px solid var(--line)', borderRadius: 8 }}>
-              <strong>3D view unavailable — textual navigation remains active.</strong>
-              <div style={{ color: 'var(--text-dim)', fontSize: 11, marginTop: 4 }}>{rendererFailure}</div>
+      {/* The docked inspector (PLNR-440) is a normal flex sibling of the canvas area below, not an
+          absolutely-positioned overlay — so opening/closing it changes the canvas area's available
+          width through ordinary flexbox reflow, and MemoryConstellation3D's own ResizeObserver on
+          its host element (already built for window resizes) picks that up and re-projects the
+          scene with no manual width arithmetic here. This is deliberately the "handle it without
+          reintroducing sibling-dependent offset arithmetic" instruction: nothing in this file reads
+          the inspector's width to compute the canvas area's size. */}
+      <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex' }}>
+        <div style={{ position: 'relative', flex: 1, minHeight: 0 }}>
+          {overview.communities.length === 0 ? <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: 'var(--text-dim)' }}>
+            <div style={{ maxWidth: 440, textAlign: 'center' }}><strong>No memory entities are present in this completed generation.</strong><div style={{ marginTop: 6, fontSize: 11 }}>This is a confirmed empty hierarchy, not a renderer or network failure.</div></div>
+          </div> : !showCatalogue ? <Suspense fallback={<div style={{ padding: 24, color: 'var(--text-dim)' }}>Loading 3D renderer…</div>}>
+              <LazyConstellation3D
+                projectId={pid} generationId={overview.revision.generationId} layoutVersion={overview.revision.layoutVersion}
+                nodes={filteredScene.nodes} edges={filteredScene.edges} selectedNodeId={selectedNodeId} highlightedNodeIds={highlightedNodeIds} theme={theme}
+                reducedMotion={reducedMotion}
+                onSelectNode={selectNode} onOpenEgoNetwork={onOpenEgoNetwork} onOpenInspector={onOpenInspector}
+                onRendererFailure={handleRendererFailure}
+              />
+            </Suspense> : <div role="region" aria-label="Textual memory constellation" style={{ position: 'absolute', inset: 0, overflow: 'auto', padding: 18 }}>
+              {rendererFailure && <div style={{ padding: 10, marginBottom: 10, border: '1px solid var(--line)', borderRadius: 8 }}>
+                <strong>3D view unavailable — textual navigation remains active.</strong>
+                <div style={{ color: 'var(--text-dim)', fontSize: 11, marginTop: 4 }}>{rendererFailure}</div>
+              </div>}
+              {filteredScene.nodes.map((node) => <div key={node.id} style={{ display: 'flex', gap: 8, alignItems: 'center', padding: 7, borderBottom: '1px solid var(--line)' }}>
+                <button type="button" onClick={() => selectNode(node.id)} style={{ flex: 1, textAlign: 'left' }}>{node.label} <small>({node.type})</small></button>
+                {node.community && <Button onClick={() => void expand(node.id)}>open</Button>}
+                {node.uri && <Button variant="ghost" onClick={() => onOpenEgoNetwork?.(node.uri!)}>ego</Button>}
+                {node.uri && node.type === 'memory' && <Button variant="ghost" onClick={() => onOpenInspector?.(node.uri!)}>evidence</Button>}
+              </div>)}
+              {currentPage?.nextCursor && <Button onClick={() => void fetchCommunity(currentPage.community.id, currentPage.nextCursor!)}>load next catalogue page</Button>}
             </div>}
-            {filteredScene.nodes.map((node) => <div key={node.id} style={{ display: 'flex', gap: 8, alignItems: 'center', padding: 7, borderBottom: '1px solid var(--line)' }}>
-              <button type="button" onClick={() => selectNode(node.id)} style={{ flex: 1, textAlign: 'left' }}>{node.label} <small>({node.type})</small></button>
-              {node.community && <Button onClick={() => void expand(node.id)}>open</Button>}
-              {node.uri && <Button variant="ghost" onClick={() => onOpenEgoNetwork?.(node.uri!)}>ego</Button>}
-              {node.uri && node.type === 'memory' && <Button variant="ghost" onClick={() => onOpenInspector?.(node.uri!)}>evidence</Button>}
+          {statusNotices.length > 0 && <div style={{ position: 'absolute', left: 14, top: 12, display: 'flex', flexDirection: 'column', gap: 6, maxWidth: 420, zIndex: 1 }}>
+            {statusNotices.map((notice) => <div key={notice.key} role="status" style={{
+              display: 'flex', alignItems: 'center', gap: 8, padding: '4px 9px', borderRadius: 6,
+              background: 'var(--panel)', border: `1px solid ${STATUS_TOKEN_COLOR[notice.token]}`,
+              color: STATUS_TOKEN_COLOR[notice.token], fontFamily: 'var(--mono)', fontSize: 10,
+            }}>
+              <span>{notice.message}</span>
+              {notice.action && <button
+                type="button" onClick={notice.action.onClick}
+                style={{ background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', fontFamily: 'inherit', fontSize: 'inherit', color: 'inherit', textDecoration: 'underline' }}
+              >
+                {notice.action.label}
+              </button>}
             </div>)}
-            {currentPage?.nextCursor && <Button onClick={() => void fetchCommunity(currentPage.community.id, currentPage.nextCursor!)}>load next catalogue page</Button>}
           </div>}
-        {(selectedCommunity || selectedEntity) && <aside style={{ position: 'absolute', right: 12, bottom: 12, width: 300, padding: 12, background: 'var(--panel)', border: '1px solid var(--line)', borderRadius: 10 }}>
-          <strong>{selected?.label}</strong>
-          <div style={{ marginTop: 5, color: 'var(--text-dim)', fontSize: 11 }}>{selectedCommunity ? 'Community aggregate' : `${selected?.type} · degree ${selected?.degree}`}</div>
-          <div style={{ display: 'flex', gap: 6, marginTop: 10, flexWrap: 'wrap' }}>
-            {selectedCommunity && <Button onClick={() => void expand(selectedCommunity.id)} disabled={expanding}>{expanding ? 'opening…' : 'open community'}</Button>}
-            {selectedEntity?.uri && <Button variant="ghost" onClick={() => onOpenEgoNetwork?.(selectedEntity.uri!)}>ego network</Button>}
-            {selectedEntity?.uri && selectedEntity.type === 'memory' && <Button variant="ghost" onClick={() => onOpenInspector?.(selectedEntity.uri!)}>evidence</Button>}
-            <Button variant="ghost" onClick={() => selectNode(null)}>clear</Button>
-          </div>
-          {incidentPages.at(-1)?.nextCursor && <Button variant="ghost" onClick={() => void loadMoreIncidents()} style={{ marginTop: 8 }}>load more relationships</Button>}
-        </aside>}
-        {statusNotices.length > 0 && <div style={{ position: 'absolute', left: 14, top: 12, display: 'flex', flexDirection: 'column', gap: 6, maxWidth: 420, zIndex: 1 }}>
-          {statusNotices.map((notice) => <div key={notice.key} role="status" style={{
-            display: 'flex', alignItems: 'center', gap: 8, padding: '4px 9px', borderRadius: 6,
-            background: 'var(--panel)', border: `1px solid ${STATUS_TOKEN_COLOR[notice.token]}`,
-            color: STATUS_TOKEN_COLOR[notice.token], fontFamily: 'var(--mono)', fontSize: 10,
+          {hits.length > 0 && <div style={{ position: 'absolute', right: 14, top: 10, width: 360, maxHeight: 300, overflow: 'auto', background: 'var(--panel)', border: '1px solid var(--line)', borderRadius: 8 }}>
+            {hits.map((hit) => <button key={`${hit.entityType}:${hit.id}`} type="button" onClick={() => void focusHit(hit)} style={{ display: 'block', width: '100%', padding: 9, textAlign: 'left', borderBottom: '1px solid var(--line)' }}>{hit.title}<small style={{ display: 'block', color: 'var(--text-dim)' }}>{hit.entityType} · {hit.uri}</small></button>)}
+          </div>}
+          {searching && <div style={{ position: 'absolute', right: 18, top: 16, color: 'var(--text-dim)', fontSize: 10 }}>searching…</div>}
+          {/* Fixed offset, not conditional on the status region's height: this widget is superseded by
+              the Catalogue promotion in Phase 4 (PLNR-441/442, per the audit doc's "Fallbacks"
+              disposition), so it is left in place rather than redesigned here — but per this task's
+              acceptance truth ("no component computes a pixel offset from another element's presence")
+              it must stop reading codeEntities/path.length the way it used to. */}
+          {!showCatalogue && <details style={{ position: 'absolute', left: 12, top: 42, maxHeight: '60%', width: 300, overflow: 'auto', background: 'var(--panel)', padding: 8, borderRadius: 8 }}>
+            <summary>Accessible visible list ({filteredScene.nodes.length})</summary>
+            {filteredScene.nodes.map((node) => <button key={node.id} type="button" onClick={() => selectNode(node.id)} onDoubleClick={() => { if (node.community) void expand(node.id); }} style={{ display: 'block', width: '100%', textAlign: 'left', padding: 5 }}>{node.label} <small>({node.type})</small></button>)}
+            {currentPage?.nextCursor && <Button onClick={() => void fetchCommunity(currentPage.community.id, currentPage.nextCursor!)}>load next page</Button>}
+          </details>}
+          {/* Fixed bottom-left, independent of the top-left status region / accessible-list panel's
+              presence or height — same "no sibling-dependent offset" rule those already follow
+              (PLNR-436/438). Space view only, matching the accessible-list panel's scope. */}
+          {!showCatalogue && <div aria-label="Constellation encoding legend" style={{
+            position: 'absolute', left: 14, bottom: 14, width: 238, background: 'var(--panel)',
+            border: '1px solid var(--line)', borderRadius: 8, padding: 10, fontFamily: 'var(--mono)',
           }}>
-            <span>{notice.message}</span>
-            {notice.action && <button
-              type="button" onClick={notice.action.onClick}
-              style={{ background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', fontFamily: 'inherit', fontSize: 'inherit', color: 'inherit', textDecoration: 'underline' }}
+            <button
+              type="button" onClick={() => setLegendOpen((open) => !open)} aria-expanded={legendOpen}
+              style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%',
+                background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', fontFamily: 'inherit',
+              }}
             >
-              {notice.action.label}
-            </button>}
-          </div>)}
-        </div>}
-        {hits.length > 0 && <div style={{ position: 'absolute', right: 14, top: 10, width: 360, maxHeight: 300, overflow: 'auto', background: 'var(--panel)', border: '1px solid var(--line)', borderRadius: 8 }}>
-          {hits.map((hit) => <button key={`${hit.entityType}:${hit.id}`} type="button" onClick={() => void focusHit(hit)} style={{ display: 'block', width: '100%', padding: 9, textAlign: 'left', borderBottom: '1px solid var(--line)' }}>{hit.title}<small style={{ display: 'block', color: 'var(--text-dim)' }}>{hit.entityType} · {hit.uri}</small></button>)}
-        </div>}
-        {searching && <div style={{ position: 'absolute', right: 18, top: 16, color: 'var(--text-dim)', fontSize: 10 }}>searching…</div>}
-        {/* Fixed offset, not conditional on the status region's height: this widget is superseded by
-            the Catalogue promotion in Phase 4 (PLNR-441/442, per the audit doc's "Fallbacks"
-            disposition), so it is left in place rather than redesigned here — but per this task's
-            acceptance truth ("no component computes a pixel offset from another element's presence")
-            it must stop reading codeEntities/path.length the way it used to. */}
-        {!showCatalogue && <details style={{ position: 'absolute', left: 12, top: 42, maxHeight: '60%', width: 300, overflow: 'auto', background: 'var(--panel)', padding: 8, borderRadius: 8 }}>
-          <summary>Accessible visible list ({filteredScene.nodes.length})</summary>
-          {filteredScene.nodes.map((node) => <button key={node.id} type="button" onClick={() => selectNode(node.id)} onDoubleClick={() => { if (node.community) void expand(node.id); }} style={{ display: 'block', width: '100%', textAlign: 'left', padding: 5 }}>{node.label} <small>({node.type})</small></button>)}
-          {currentPage?.nextCursor && <Button onClick={() => void fetchCommunity(currentPage.community.id, currentPage.nextCursor!)}>load next page</Button>}
-        </details>}
-        {/* Fixed bottom-left, independent of the top-left status region / accessible-list panel's
-            presence or height — same "no sibling-dependent offset" rule those already follow
-            (PLNR-436/438). Space view only, matching the accessible-list panel's scope. */}
-        {!showCatalogue && <div aria-label="Constellation encoding legend" style={{
-          position: 'absolute', left: 14, bottom: 14, width: 238, background: 'var(--panel)',
-          border: '1px solid var(--line)', borderRadius: 8, padding: 10, fontFamily: 'var(--mono)',
-        }}>
-          <button
-            type="button" onClick={() => setLegendOpen((open) => !open)} aria-expanded={legendOpen}
-            style={{
-              display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%',
-              background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', fontFamily: 'inherit',
-            }}
-          >
-            <span style={{ fontSize: 10, letterSpacing: '.12em', textTransform: 'uppercase', color: 'var(--text-dim)' }}>Encoding</span>
-            <span aria-hidden="true" style={{ color: 'var(--text-faint)', fontSize: 10 }}>{legendOpen ? '−' : '+'}</span>
-          </button>
-          {legendOpen && <>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginTop: 8 }}>
-              {LEGEND_TYPES.map((type) => {
-                const encoding = encodingForType(type);
-                return (
-                  <div key={type} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 }}>
-                    <span aria-hidden="true" style={{ color: `var(${encoding.token})`, fontSize: 16, lineHeight: 1 }}>{CONSTELLATION_SHAPE_GLYPH[encoding.shape]}</span>
-                    <span style={{ color: 'var(--text-soft)' }}>{encoding.label.toLowerCase()}</span>
-                  </div>
-                );
-              })}
-            </div>
-            <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--w-07)', display: 'flex', flexDirection: 'column', gap: 3, fontSize: 9.5, color: 'var(--text-dim)' }}>
-              <span>size = connectivity · brightness = authority</span>
-              <span>amber halo = lead · amber route = selection</span>
-            </div>
-          </>}
-        </div>}
+              <span style={{ fontSize: 10, letterSpacing: '.12em', textTransform: 'uppercase', color: 'var(--text-dim)' }}>Encoding</span>
+              <span aria-hidden="true" style={{ color: 'var(--text-faint)', fontSize: 10 }}>{legendOpen ? '−' : '+'}</span>
+            </button>
+            {legendOpen && <>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginTop: 8 }}>
+                {LEGEND_TYPES.map((type) => {
+                  const encoding = encodingForType(type);
+                  return (
+                    <div key={type} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 }}>
+                      <span aria-hidden="true" style={{ color: `var(${encoding.token})`, fontSize: 16, lineHeight: 1 }}>{CONSTELLATION_SHAPE_GLYPH[encoding.shape]}</span>
+                      <span style={{ color: 'var(--text-soft)' }}>{encoding.label.toLowerCase()}</span>
+                    </div>
+                  );
+                })}
+              </div>
+              <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--w-07)', display: 'flex', flexDirection: 'column', gap: 3, fontSize: 9.5, color: 'var(--text-dim)' }}>
+                <span>size = connectivity · brightness = authority</span>
+                <span>amber halo = lead · amber route = selection</span>
+              </div>
+            </>}
+          </div>}
+        </div>
+        {selected && (selectedCommunity || selectedEntity) && (
+          <ConstellationInspector
+            pid={pid}
+            selected={selected}
+            incidentPages={incidentPages}
+            relationshipsLoading={relationshipsLoading}
+            expanding={expanding}
+            onLoadMoreRelationships={() => void loadMoreIncidents()}
+            onOpenCommunity={(communityId) => void expand(communityId)}
+            onOpenEgoNetwork={onOpenEgoNetwork}
+            onOpenInspector={onOpenInspector}
+            onClear={() => selectNode(null)}
+          />
+        )}
       </div>
     </div>
   );
