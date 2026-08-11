@@ -17,6 +17,23 @@ import { MonoTag } from './bits';
 
 export const CONSTELLATION_INSPECTOR_WIDTH = 320;
 
+// PLNR-443 audit fix: the docked inspector's own background (`rgba(14,16,20,.96)` below) is fixed
+// dark in BOTH themes — a deliberate HUD-style panel over the canvas, per the screen spec's literal
+// colour. Every text/border colour drawn on it must therefore be fixed too, not theme-following:
+// `var(--text)` and friends flip to near-black in light theme (theme.css's light block), which
+// against this panel's own always-dark fill renders as dark text on a dark background — effectively
+// invisible. These are the dark theme's own `--text*`/`--w-06`/`--line`/`--amber-select` values,
+// inlined as constants so the panel reads correctly regardless of the app's theme toggle (same
+// reasoning MemoryConstellation3D.tsx's THREE.Color literals already apply to the canvas itself).
+const INSPECTOR_TEXT = '#e6e8ec';
+const INSPECTOR_TEXT_MID = '#8a8f98';
+const INSPECTOR_TEXT_DIM = '#6b7280';
+const INSPECTOR_TEXT_FAINT = '#4b5563';
+const INSPECTOR_AMBER_SELECT = '#ffd166';
+const INSPECTOR_W_06 = 'rgba(255,255,255,.06)';
+const INSPECTOR_LINE = 'rgba(255,255,255,.07)';
+const INSPECTOR_GHOST_BUTTON_STYLE = { background: 'rgba(255,255,255,.05)', color: INSPECTOR_TEXT, border: '1px solid rgba(255,255,255,.12)' } as const;
+
 // --- Authority/validity tone — mirrors MemoryView.tsx's AuthorityBadge/ValidityBadge numeric
 // thresholds and colour choices exactly (same "existing authority/validity semantics" the
 // executionSpec calls for), kept as an independent small table here rather than a cross-import:
@@ -160,22 +177,22 @@ export function ConstellationInspector({
     <>
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10 }}>
         {isCommunity
-          ? <MonoTag color="var(--text-dim)" bg="var(--w-06)" size={9}>community</MonoTag>
+          ? <MonoTag color={INSPECTOR_TEXT_DIM} bg={INSPECTOR_W_06} size={9}>community</MonoTag>
           : <TypeChip type={selected.type} />}
-        <MonoTag color="var(--amber-select)" bg="rgba(255,209,102,.12)" size={9}>pinned</MonoTag>
+        <MonoTag color={INSPECTOR_AMBER_SELECT} bg="rgba(255,209,102,.12)" size={9}>pinned</MonoTag>
         <div style={{ flex: 1 }} />
         <button
           type="button" aria-label="Close inspector" onClick={onClear} className="drawer-x"
-          style={{ cursor: 'pointer', color: 'var(--text-dim)', fontSize: 14, width: 22, height: 22, borderRadius: 6 }}
+          style={{ cursor: 'pointer', color: INSPECTOR_TEXT_DIM, fontSize: 14, width: 22, height: 22, borderRadius: 6 }}
         >
           ✕
         </button>
       </div>
-      <div style={{ fontSize: 13.5, fontWeight: 600, color: 'var(--text)', marginBottom: 4, wordBreak: 'break-word' }}>{selected.label}</div>
+      <div style={{ fontSize: 13.5, fontWeight: 600, color: INSPECTOR_TEXT, marginBottom: 4, wordBreak: 'break-word' }}>{selected.label}</div>
       {selected.uri && (
         <div
           title={selected.uri}
-          style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', marginBottom: 8 }}
+          style={{ fontFamily: 'var(--mono)', fontSize: 9, color: INSPECTOR_TEXT_FAINT, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', marginBottom: 8 }}
         >
           {selected.uri}
         </div>
@@ -190,12 +207,12 @@ export function ConstellationInspector({
         aria-label="Selection inspector"
         style={{
           width: CONSTELLATION_INSPECTOR_WIDTH, flex: 'none', display: 'flex', flexDirection: 'column', minHeight: 0,
-          background: 'rgba(14,16,20,.96)', borderLeft: '1px solid var(--line)', backdropFilter: 'blur(10px)',
+          background: 'rgba(14,16,20,.96)', borderLeft: `1px solid ${INSPECTOR_LINE}`, backdropFilter: 'blur(10px)',
         }}
       >
         <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: 14 }}>
           {identity}
-          <div style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-mid)', marginBottom: 14 }}>
+          <div style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: INSPECTOR_TEXT_MID, marginBottom: 14 }}>
             {(tooltip?.entityCount ?? selected.memberCount ?? 0).toLocaleString()} entities · {(tooltip?.boundaryRouteCount ?? selected.boundaryRouteCount ?? 0).toLocaleString()} boundary routes
           </div>
           {tooltip && tooltip.topTypeCounts.length > 0 && (
@@ -203,15 +220,15 @@ export function ConstellationInspector({
               {tooltip.topTypeCounts.map(({ type, count }) => (
                 <div key={type} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   <TypeChip type={type} />
-                  <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>{count.toLocaleString()}</span>
+                  <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: INSPECTOR_TEXT_DIM }}>{count.toLocaleString()}</span>
                 </div>
               ))}
             </div>
           )}
         </div>
-        <div style={{ flex: 'none', borderTop: '1px solid var(--line)', padding: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
+        <div style={{ flex: 'none', borderTop: `1px solid ${INSPECTOR_LINE}`, padding: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
           <Button onClick={() => onOpenCommunity(selected.id)} disabled={expanding}>{expanding ? 'opening…' : 'open community'}</Button>
-          <button type="button" onClick={onClear} style={{ cursor: 'pointer', color: 'var(--text-dim)', fontSize: 11.5, background: 'transparent', border: 'none', padding: 0, font: 'inherit' }}>clear</button>
+          <button type="button" onClick={onClear} style={{ cursor: 'pointer', color: INSPECTOR_TEXT_DIM, fontSize: 11.5, background: 'transparent', border: 'none', padding: 0, font: 'inherit' }}>clear</button>
         </div>
       </aside>
     );
@@ -222,12 +239,12 @@ export function ConstellationInspector({
       aria-label="Selection inspector"
       style={{
         width: CONSTELLATION_INSPECTOR_WIDTH, flex: 'none', display: 'flex', flexDirection: 'column', minHeight: 0,
-        background: 'rgba(14,16,20,.96)', borderLeft: '1px solid var(--line)', backdropFilter: 'blur(10px)',
+        background: 'rgba(14,16,20,.96)', borderLeft: `1px solid ${INSPECTOR_LINE}`, backdropFilter: 'blur(10px)',
       }}
     >
       <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: 14 }}>
         {identity}
-        <div style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-mid)', display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 14 }}>
+        <div style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: INSPECTOR_TEXT_MID, display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 14 }}>
           <span>degree {selected.degree}</span>
           {selected.authority != null && <span style={{ color: authorityTone(selected.authority).color }}>{authorityTone(selected.authority).label}</span>}
           {selected.validity && <span style={{ color: validityTone(selected.validity).color }}>{validityTone(selected.validity).icon} validity {selected.validity}</span>}
@@ -235,10 +252,10 @@ export function ConstellationInspector({
 
         {isMemory && (
           <div style={{ marginBottom: 16 }}>
-            <div style={{ fontFamily: 'var(--mono)', fontSize: 10, letterSpacing: '.08em', textTransform: 'uppercase', color: 'var(--text-dim)', marginBottom: 6 }}>Evidence</div>
+            <div style={{ fontFamily: 'var(--mono)', fontSize: 10, letterSpacing: '.08em', textTransform: 'uppercase', color: INSPECTOR_TEXT_DIM, marginBottom: 6 }}>Evidence</div>
             <div style={{ borderLeft: '3px solid rgba(198,242,78,.4)', paddingLeft: 10 }}>
               {evidenceLoading && !evidence ? (
-                <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-faint)' }}>loading…</div>
+                <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: INSPECTOR_TEXT_FAINT }}>loading…</div>
               ) : evidence?.text ? (
                 <div style={{ maxHeight: 150, overflowY: 'auto' }}>
                   {evidence.suspicious && (
@@ -246,54 +263,54 @@ export function ConstellationInspector({
                       <MonoTag color="var(--red-soft)" bg="rgba(255,92,92,.14)" size={8.5}>⚠ SUSPICIOUS</MonoTag>
                     </div>
                   )}
-                  <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: 'var(--mono)', fontSize: 9.5, lineHeight: 1.55, color: 'var(--text-mid)' }}>
+                  <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: 'var(--mono)', fontSize: 9.5, lineHeight: 1.55, color: INSPECTOR_TEXT_MID }}>
                     {evidence.text}
                   </pre>
                 </div>
               ) : (
-                <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>no evidence text returned</div>
+                <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: INSPECTOR_TEXT_FAINT }}>no evidence text returned</div>
               )}
             </div>
           </div>
         )}
 
         <div>
-          <div style={{ fontFamily: 'var(--mono)', fontSize: 10, letterSpacing: '.08em', textTransform: 'uppercase', color: 'var(--text-dim)', marginBottom: 6 }}>
+          <div style={{ fontFamily: 'var(--mono)', fontSize: 10, letterSpacing: '.08em', textTransform: 'uppercase', color: INSPECTOR_TEXT_DIM, marginBottom: 6 }}>
             {total === 0 && !relationshipsLoading ? 'Relationships · none' : `Relationships · ${rows.length} of ${total}`}
           </div>
-          {relationshipsLoading && rows.length === 0 && <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>loading…</div>}
+          {relationshipsLoading && rows.length === 0 && <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: INSPECTOR_TEXT_FAINT }}>loading…</div>}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
             {rows.map((row) => (
               <div key={row.key} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '5px 0', opacity: row.historical ? 0.65 : 1 }}>
-                <span aria-hidden="true" style={{ fontSize: 14, color: 'var(--amber-select)', width: 14, flex: 'none', textAlign: 'center' }}>
+                <span aria-hidden="true" style={{ fontSize: 14, color: INSPECTOR_AMBER_SELECT, width: 14, flex: 'none', textAlign: 'center' }}>
                   {row.direction === 'outgoing' ? '→' : '←'}
                 </span>
-                <span style={{ width: 104, flex: 'none', fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-mid)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={row.type}>
+                <span style={{ width: 104, flex: 'none', fontFamily: 'var(--mono)', fontSize: 10, color: INSPECTOR_TEXT_MID, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={row.type}>
                   {row.type}
                 </span>
-                <span style={{ flex: 1, minWidth: 0, fontSize: 11, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={row.targetLabel}>
+                <span style={{ flex: 1, minWidth: 0, fontSize: 11, color: INSPECTOR_TEXT, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={row.targetLabel}>
                   {row.targetLabel}
                 </span>
                 <TypeChip type={row.targetType} />
-                {row.historical && <MonoTag color="var(--amber-select)" bg="rgba(255,209,102,.12)" size={8}>historical</MonoTag>}
+                {row.historical && <MonoTag color={INSPECTOR_AMBER_SELECT} bg="rgba(255,209,102,.12)" size={8}>historical</MonoTag>}
               </div>
             ))}
           </div>
           {hasMore && (
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
-              <Button variant="ghost" onClick={onLoadMoreRelationships} disabled={relationshipsLoading}>
+              <Button variant="ghost" onClick={onLoadMoreRelationships} disabled={relationshipsLoading} style={INSPECTOR_GHOST_BUTTON_STYLE}>
                 load next page{remaining ? ` · ${remaining} more` : ''}
               </Button>
-              <span style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)' }}>cursor-bounded · 256/req</span>
+              <span style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: INSPECTOR_TEXT_FAINT }}>cursor-bounded · 256/req</span>
             </div>
           )}
         </div>
       </div>
 
-      <div style={{ flex: 'none', borderTop: '1px solid var(--line)', padding: 12, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+      <div style={{ flex: 'none', borderTop: `1px solid ${INSPECTOR_LINE}`, padding: 12, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
         {selected.uri && <Button onClick={() => onOpenEgoNetwork?.(selected.uri!)}>Ego network</Button>}
-        {isMemory && selected.uri && <Button variant="ghost" onClick={() => onOpenInspector?.(selected.uri!)}>Evidence</Button>}
-        <button type="button" onClick={onClear} style={{ cursor: 'pointer', color: 'var(--text-dim)', fontSize: 11.5, background: 'transparent', border: 'none', padding: 0, font: 'inherit' }}>clear</button>
+        {isMemory && selected.uri && <Button variant="ghost" onClick={() => onOpenInspector?.(selected.uri!)} style={INSPECTOR_GHOST_BUTTON_STYLE}>Evidence</Button>}
+        <button type="button" onClick={onClear} style={{ cursor: 'pointer', color: INSPECTOR_TEXT_DIM, fontSize: 11.5, background: 'transparent', border: 'none', padding: 0, font: 'inherit' }}>clear</button>
       </div>
     </aside>
   );

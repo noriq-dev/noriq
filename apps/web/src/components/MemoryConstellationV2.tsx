@@ -21,6 +21,17 @@ const LazyConstellation3D = lazy(() => import('./MemoryConstellation3D'));
 // actually draws — this is the "same colour source" the task explicitly warns against duplicating.
 const LEGEND_TYPES = ['memory', 'task', 'artifact', 'file', 'plan'] as const;
 
+// PLNR-443 audit fix: the search "Matches" panel below (screen spec 1c) has a fixed dark background
+// (`rgba(14,16,20,.96)`) in BOTH themes, same as the docked inspector (ConstellationInspector.tsx,
+// which documents the same reasoning) — its `var(--text*)`/`var(--line)` children must therefore use
+// the dark theme's own fixed values rather than the theme-following tokens, which flip to near-black
+// in light theme and become illegible against this panel's own always-dark fill.
+const MATCHES_TEXT = '#e6e8ec';
+const MATCHES_TEXT_SOFT = '#c9ccd1';
+const MATCHES_TEXT_MID = '#8a8f98';
+const MATCHES_TEXT_DIM = '#6b7280';
+const MATCHES_LINE = 'rgba(255,255,255,.07)';
+
 interface LoadedCommunity {
   page: ApiConstellationV2CommunityPage;
   touchedAt: number;
@@ -549,13 +560,13 @@ export function MemoryConstellationV2({
           </div>}
           {hits.length > 0 && <div role="region" aria-label="Search matches" style={{
             position: 'absolute', right: 14, top: 10, width: 392, maxHeight: 340, overflow: 'auto',
-            background: 'rgba(14,16,20,.96)', border: '1px solid var(--line)', borderRadius: 10, backdropFilter: 'blur(10px)',
+            background: 'rgba(14,16,20,.96)', border: `1px solid ${MATCHES_LINE}`, borderRadius: 10, backdropFilter: 'blur(10px)',
           }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px', borderBottom: '1px solid var(--line)' }}>
-              <span style={{ fontFamily: 'var(--mono)', fontSize: 9, letterSpacing: '.1em', textTransform: 'uppercase', color: 'var(--text-dim)' }}>Matches</span>
-              <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-mid)' }}>{hits.length} · hybrid + exact URI</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px', borderBottom: `1px solid ${MATCHES_LINE}` }}>
+              <span style={{ fontFamily: 'var(--mono)', fontSize: 9, letterSpacing: '.1em', textTransform: 'uppercase', color: MATCHES_TEXT_DIM }}>Matches</span>
+              <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: MATCHES_TEXT_MID }}>{hits.length} · hybrid + exact URI</span>
               <div style={{ flex: 1 }} />
-              <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>↵ focuses top</span>
+              <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: MATCHES_TEXT_DIM }}>↵ focuses top</span>
             </div>
             {hits.map((hit, index) => {
               // Off-page: this hit's uri is not among the currently resident nodes on canvas — the
@@ -570,13 +581,13 @@ export function MemoryConstellationV2({
                 <button
                   key={`${hit.entityType}:${hit.id}`} type="button" onClick={() => void focusHit(hit)}
                   style={{
-                    display: 'block', width: '100%', padding: '8px 10px', textAlign: 'left', borderBottom: '1px solid var(--line)',
+                    display: 'block', width: '100%', padding: '8px 10px', textAlign: 'left', borderBottom: `1px solid ${MATCHES_LINE}`,
                     borderLeft: top ? '2px solid var(--accent)' : '2px solid transparent',
                     background: top ? 'rgba(198,242,78,.05)' : 'transparent',
                   }}
                 >
-                  <span style={{ fontSize: 12, fontWeight: top ? 600 : 400, color: top ? 'var(--text)' : 'var(--text-soft)' }}>{hit.title}</span>
-                  <small style={{ display: 'block', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-dim)', marginTop: 2 }}>{hit.entityType} · {hit.uri}</small>
+                  <span style={{ fontSize: 12, fontWeight: top ? 600 : 400, color: top ? MATCHES_TEXT : MATCHES_TEXT_SOFT }}>{hit.title}</span>
+                  <small style={{ display: 'block', fontFamily: 'var(--mono)', fontSize: 9, color: MATCHES_TEXT_DIM, marginTop: 2 }}>{hit.entityType} · {hit.uri}</small>
                   {!resident && routeCommunity && (
                     <small style={{ display: 'block', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--amber)', marginTop: 2 }}>
                       off-page · picking it routes via {routeCommunity.label}
