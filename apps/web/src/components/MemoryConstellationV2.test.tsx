@@ -250,8 +250,8 @@ describe('MemoryConstellationV2 encoding legend (PLNR-438)', () => {
   });
 });
 
-describe('MemoryConstellationV2 docked selection inspector (PLNR-440)', () => {
-  it('docks the inspector as a real flex sibling of the canvas area (not a floating overlay) and keeps its relationship coverage honest through a continuation', async () => {
+describe('MemoryConstellationV2 selection inspector overlay (PLNR-462)', () => {
+  it('overlays the full-width canvas without a pointer-catching backdrop and keeps relationship coverage honest through a continuation', async () => {
     vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision, communities: [rootCommunity], routes: [], coverage: { complete: true, reasons: [] } });
     vi.spyOn(api, 'memoryConstellationV2Community').mockResolvedValue(page('a', null));
     vi.spyOn(api, 'memoryConstellationV2Incidents').mockImplementation(async (_pid, _nodeId, input) => (input?.cursor ? {
@@ -277,14 +277,18 @@ describe('MemoryConstellationV2 docked selection inspector (PLNR-440)', () => {
 
     const inspector = host.querySelector('[aria-label="Selection inspector"]') as HTMLElement;
     expect(inspector).toBeTruthy();
-    // A real flex-layout sibling of the canvas area, never an absolutely-positioned overlay reading
-    // a computed offset off it — the same "no sibling-dependent offset arithmetic" rule the status
-    // region already follows (PLNR-436), now applied to the panel that changes the canvas's own
-    // available width.
-    expect(inspector.style.position).toBe('');
-    // jsdom's CSSOM normalizes the `flex: 'none'` shorthand into its longhand equivalent.
-    expect(inspector.style.flex).toBe('0 0 auto');
+    expect(inspector.style.position).toBe('absolute');
+    expect(inspector.style.top).toBe('0px');
+    expect(inspector.style.right).toBe('0px');
+    expect(inspector.style.bottom).toBe('0px');
     expect(inspector.style.width).toBe('320px');
+    expect(inspector.style.pointerEvents).toBe('auto');
+    const canvasLayer = inspector.previousElementSibling as HTMLElement;
+    expect(canvasLayer.style.position).toBe('absolute');
+    expect(canvasLayer.style.inset).toBe('0');
+    expect(inspector.parentElement!.style.position).toBe('relative');
+    // No sibling around the aside covers the canvas to capture events outside the panel's box.
+    expect(inspector.parentElement!.style.pointerEvents).toBe('');
 
     // The `entity()` fixture carries degree: 1, which the live cursor (still open) immediately
     // proves too low — the honest denominator corrects UP to match what is actually loaded rather

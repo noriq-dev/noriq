@@ -551,15 +551,12 @@ export function MemoryConstellationV2({
           <div style={{ width: `${residentMeterPercent}%`, height: '100%', background: 'var(--accent)' }} />
         </div>
       </div>
-      {/* The docked inspector (PLNR-440) is a normal flex sibling of the canvas area below, not an
-          absolutely-positioned overlay — so opening/closing it changes the canvas area's available
-          width through ordinary flexbox reflow, and MemoryConstellation3D's own ResizeObserver on
-          its host element (already built for window resizes) picks that up and re-projects the
-          scene with no manual width arithmetic here. This is deliberately the "handle it without
-          reintroducing sibling-dependent offset arithmetic" instruction: nothing in this file reads
-          the inspector's width to compute the canvas area's size. */}
-      <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex' }}>
-        <div style={{ position: 'relative', flex: 1, minHeight: 0 }}>
+      {/* Montana 2026-08-11 (PLNR-462) supersedes PLNR-440's flex-sibling reflow: the canvas layer
+          always fills this relative wrapper, while the inspector is an absolute right-edge overlay.
+          Only the aside's own 320px box accepts its pointer events — there is no viewport-sized
+          backdrop to intercept orbit/select gestures elsewhere on the canvas. */}
+      <div style={{ position: 'relative', flex: 1, minHeight: 0 }}>
+        <div style={{ position: 'absolute', inset: 0 }}>
           {overview.communities.length === 0 ? <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: 'var(--text-dim)' }}>
             <div style={{ maxWidth: 440, textAlign: 'center' }}><strong>No memory entities are present in this completed generation.</strong><div style={{ marginTop: 6, fontSize: 11 }}>This is a confirmed empty hierarchy, not a renderer or network failure.</div></div>
           </div> : !showCatalogue ? <Suspense fallback={<div style={{ padding: 24, color: 'var(--text-dim)' }}>Loading 3D renderer…</div>}>

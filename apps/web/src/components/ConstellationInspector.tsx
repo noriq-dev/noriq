@@ -1,5 +1,5 @@
-// Docked selection inspector (PLNR-440, screen spec 1b) — replaces the floating 300px selection
-// card with the designed 320px docked panel: identity, authority/validity metrics, a cited memory
+// Selection inspector (PLNR-440/462, screen spec 1b) — the designed 320px overlay panel: identity,
+// authority/validity metrics, a cited memory
 // excerpt, and a cursor-honest relationship list. Deliberately a LENS onto the two canonical
 // handoffs (ego network, evidence inspector) rather than a second detail view: it never fetches a
 // memory's full history/feedback/correction state (that stays exclusive to MemoryView.tsx's
@@ -33,6 +33,12 @@ const INSPECTOR_AMBER_SELECT = '#ffd166';
 const INSPECTOR_W_06 = 'rgba(255,255,255,.06)';
 const INSPECTOR_LINE = 'rgba(255,255,255,.07)';
 const INSPECTOR_GHOST_BUTTON_STYLE = { background: 'rgba(255,255,255,.05)', color: INSPECTOR_TEXT, border: '1px solid rgba(255,255,255,.12)' } as const;
+const INSPECTOR_PANEL_STYLE = {
+  position: 'absolute', top: 0, right: 0, bottom: 0, zIndex: 3,
+  width: CONSTELLATION_INSPECTOR_WIDTH, display: 'flex', flexDirection: 'column', minHeight: 0,
+  overflow: 'hidden', pointerEvents: 'auto',
+  background: 'rgba(14,16,20,.96)', borderLeft: `1px solid ${INSPECTOR_LINE}`, backdropFilter: 'blur(10px)',
+} as const;
 
 // --- Authority/validity tone — mirrors MemoryView.tsx's AuthorityBadge/ValidityBadge numeric
 // thresholds and colour choices exactly (same "existing authority/validity semantics" the
@@ -119,7 +125,7 @@ export interface ConstellationInspectorProps {
 }
 
 /**
- * Docked 320px selection inspector. DOM chrome over the WebGL canvas: renders once per selection
+ * 320px selection inspector over the WebGL canvas: renders once per selection
  * change (a React state update from a click/keypress, never a per-frame tick — hover state lives
  * entirely inside MemoryConstellation3D's own local state and is never lifted into a prop this
  * component receives), and never touches the Three.js scene, so it adds zero draw calls to the
@@ -205,10 +211,7 @@ export function ConstellationInspector({
     return (
       <aside
         aria-label="Selection inspector"
-        style={{
-          width: CONSTELLATION_INSPECTOR_WIDTH, flex: 'none', display: 'flex', flexDirection: 'column', minHeight: 0,
-          background: 'rgba(14,16,20,.96)', borderLeft: `1px solid ${INSPECTOR_LINE}`, backdropFilter: 'blur(10px)',
-        }}
+        style={INSPECTOR_PANEL_STYLE}
       >
         <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: 14 }}>
           {identity}
@@ -237,10 +240,7 @@ export function ConstellationInspector({
   return (
     <aside
       aria-label="Selection inspector"
-      style={{
-        width: CONSTELLATION_INSPECTOR_WIDTH, flex: 'none', display: 'flex', flexDirection: 'column', minHeight: 0,
-        background: 'rgba(14,16,20,.96)', borderLeft: `1px solid ${INSPECTOR_LINE}`, backdropFilter: 'blur(10px)',
-      }}
+      style={INSPECTOR_PANEL_STYLE}
     >
       <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: 14 }}>
         {identity}
