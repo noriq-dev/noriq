@@ -52,7 +52,9 @@ interface MemoryRpc {
     pid: string,
     input: { repositoryKey: string; branch: string; mergedBaseId: string },
   ): Promise<{ promoted: string[]; skipped: Array<{ memoryItemId: string; reason: string }> }>;
-  drainOutbox(pid: string): Promise<{ delivered: number; failed: number }>;
+  // PLNR-430: reconcile() (not drainOutbox() alone) settles both the outbox and the projector
+  // cursor — see memory-lifecycle.test.ts's newOwnedProject (PLNR-419).
+  reconcile(pid: string): Promise<{ delivered: number; failed: number; applied: number; cursor: number }>;
   _setForceWriteFailure(pid: string, fail: boolean): Promise<void>;
   _setForceRecordedAt(pid: string, iso: string | null): Promise<void>;
   beginIndexIngest(pid: string, manifest: IndexManifestInput): Promise<{ ok: true }>;
@@ -227,7 +229,8 @@ describe('human approval — the only path to authority 5', () => {
     const { projectId } = await newOwnedProject('pm-appr-events@example.com', 'PMAPREVT');
     const { memoryId } = await memory(projectId).recordMemory(projectId, { kind: 'decision', statement: 'to be approved', actor: AGENT });
     await memory(projectId).approveDecision(projectId, { memoryItemId: memoryId, actorUserId: 'usr_x' });
-    await memory(projectId).drainOutbox(projectId);
+    // PLNR-430: settle via reconcile(), not drainOutbox() alone — see the interface comment above.
+    await memory(projectId).reconcile(projectId);
     const { results } = await appEnv.DB.prepare(
       "SELECT payload FROM events WHERE project_id = ? AND verb = 'memory.changed'",
     ).bind(projectId).all<{ payload: string }>();

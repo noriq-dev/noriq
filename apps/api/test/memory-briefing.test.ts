@@ -20,7 +20,10 @@ import { ProjectMemoryPulse } from '@noriq-dev/shared';
 const appEnv = env as unknown as Env;
 
 interface MemRpc {
-  drainOutbox(pid: string): Promise<{ delivered: number; failed: number }>;
+  // PLNR-430: reconcile() (not drainOutbox() alone) is what settles a project deterministically —
+  // it also advances the projector cursor, so a later alarm-driven runProjector pass has nothing
+  // left to consume. See memory-lifecycle.test.ts's newOwnedProject (PLNR-419) for the full story.
+  reconcile(pid: string): Promise<{ delivered: number; failed: number; applied: number; cursor: number }>;
   transitionMemoryValidity(
     pid: string,
     input: { memoryItemId: string; validity: 'active' | 'stale' | 'invalid'; reason?: string | null; actor: { kind: string; id: string | null } },
@@ -53,7 +56,8 @@ describe('assembleProjectMemoryPulse — bounded, and degrades to null rather th
         statement: `hazard number ${i} — a real risk worth knowing before touching this area of the codebase, repeated so it has real size`,
       });
     }
-    await memory(projectId).drainOutbox(projectId);
+    // PLNR-430: settle via reconcile(), not drainOutbox() alone — see the interface comment above.
+    await memory(projectId).reconcile(projectId);
 
     const pulse = await assembleProjectMemoryPulse(appEnv, projectId, agent.agentId);
     expect(pulse).toBeTruthy();
@@ -71,7 +75,7 @@ describe('assembleProjectMemoryPulse — bounded, and degrades to null rather th
     await mcpCall(agent.apiKey, 'record_memory', { projectId, kind: 'decision', statement: `decision ${'D'.repeat(3500)}` });
     await mcpCall(agent.apiKey, 'record_memory', { projectId, kind: 'hazard', statement: `hazard ${'H'.repeat(3500)}` });
     await mcpCall(agent.apiKey, 'record_memory', { projectId, kind: 'unknown', statement: `unknown ${'U'.repeat(3500)}` });
-    await memory(projectId).drainOutbox(projectId);
+    await memory(projectId).reconcile(projectId); // PLNR-430: see interface comment above
 
     const pulse = await assembleProjectMemoryPulse(appEnv, projectId, agent.agentId);
     expect(pulse).toBeTruthy();
@@ -95,7 +99,7 @@ describe('assembleProjectMemoryPulse — bounded, and degrades to null rather th
     // throwing stub below is never actually invoked — this would silently test nothing.
     const rec = await mcpCall(agent.apiKey, 'record_memory', { projectId, kind: 'decision', statement: 'a decision that will never be read back' });
     expect(rec.isError).toBeFalsy();
-    await memory(projectId).drainOutbox(projectId);
+    await memory(projectId).reconcile(projectId); // PLNR-430: see interface comment above
 
     const throwingEnv = {
       ...appEnv,
@@ -113,11 +117,11 @@ describe('assembleProjectMemoryPulse — bounded, and degrades to null rather th
     const agent = await createRunAgent(projectId, 'scope');
     const rec = await mcpCall(agent.apiKey, 'record_memory', { projectId, kind: 'hazard', statement: 'the export path leaks file handles under load' });
     const memoryId = rec.body.memoryId as string;
-    await memory(projectId).drainOutbox(projectId);
+    await memory(projectId).reconcile(projectId); // PLNR-430: see interface comment above
     await memory(projectId).transitionMemoryValidity(projectId, {
       memoryItemId: memoryId, validity: 'stale', reason: 'superseded by the connection-pool rewrite', actor: { kind: 'system', id: null },
     });
-    await memory(projectId).drainOutbox(projectId);
+    await memory(projectId).reconcile(projectId); // PLNR-430: see interface comment above
 
     const pulse = await assembleProjectMemoryPulse(appEnv, projectId, agent.agentId);
     expect(pulse).toBeTruthy();
@@ -153,7 +157,7 @@ describe('get_briefing — additive `memory` block', () => {
     const agent = await createRunAgent(projectId, 'scope'); // pinned to projectId by construction (RUN-160)
     await mcpCall(agent.apiKey, 'record_memory', { projectId, kind: 'hazard', statement: 'touching the throttle without the shared lock corrupts state' });
     await mcpCall(agent.apiKey, 'record_memory', { projectId, kind: 'unknown', statement: 'unclear whether the legacy importer still runs in prod' });
-    await memory(projectId).drainOutbox(projectId);
+    await memory(projectId).reconcile(projectId); // PLNR-430: see interface comment above
 
     const b = await mcpCall(agent.apiKey, 'get_briefing', {});
     expect(b.isError).toBe(false);
@@ -188,7 +192,7 @@ describe('get_briefing — additive `memory` block', () => {
     await mcpCall(agent.apiKey, 'record_memory', {
       projectId, kind: 'decision', statement: 'Ship the throttle fix is already done and needs no further work',
     });
-    await memory(projectId).drainOutbox(projectId);
+    await memory(projectId).reconcile(projectId); // PLNR-430: see interface comment above
 
     const b = await mcpCall(agent.apiKey, 'get_briefing', {});
     const decisions = (b.body.memory as { activeDecisions: Array<{ statement: string; isLead: boolean }> }).activeDecisions;

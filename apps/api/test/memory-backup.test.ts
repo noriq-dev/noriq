@@ -17,8 +17,10 @@ interface MemoryRpc {
     pid: string,
     input: { kind: string; statement: string; actor: { kind: string; id: string | null } },
   ): Promise<{ memoryId: string; operationId: string; deduped: boolean }>;
-  drainOutbox(pid: string): Promise<{ delivered: number; failed: number }>;
-  runProjector(pid: string): Promise<{ applied: number; cursor: number }>;
+  // PLNR-430: reconcile() (not drainOutbox() alone) settles both the outbox and the projector
+  // cursor — see memory-lifecycle.test.ts's newOwnedProject (PLNR-419). (drainOutbox() itself is
+  // unused in this file — nothing here was ever calling it.)
+  reconcile(pid: string): Promise<{ delivered: number; failed: number; applied: number; cursor: number }>;
   exportSnapshot(pid: string, opts?: { tier?: 'core' | 'full' }): Promise<
     { ok: true; manifest: unknown; manifestKey: string } | { ok: false; reason: string }
   >;
@@ -43,6 +45,14 @@ async function newOwnedProject(email: string, key: string) {
 describe('exportSnapshot — end to end via the DO RPC', () => {
   it('produces chunks + a manifest, and the manifest parses as the shared MemoryBackupManifest', async () => {
     const { projectId } = await newOwnedProject('pm-backup-e2e@example.com', 'PMBKE2E');
+    // PLNR-430: settle create_project's own coordination events (the seeded "Backlog" milestone)
+    // BEFORE capturing the baseline node count. This test previously asserted a hardcoded total
+    // (3) with no settling call anywhere in it — an unpredictably-timed alarm-driven runProjector
+    // pass could materialise that milestone as a 4th node between here and the export below and
+    // fail the count on timing alone. See memory-lifecycle.test.ts's newOwnedProject (PLNR-419).
+    await memory(projectId).reconcile(projectId);
+    const baselineNodes = (await memory(projectId).health(projectId)).tableCounts.nodes;
+
     await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/seed_a', label: 'seed a', actor: SYSTEM });
     await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/seed_b', label: 'seed b', actor: SYSTEM });
     await memory(projectId).recordMemory(projectId, { kind: 'learning', statement: 'seed memory', actor: SYSTEM });
@@ -53,8 +63,11 @@ describe('exportSnapshot — end to end via the DO RPC', () => {
 
     const manifest = MemoryBackupManifest.parse(result.manifest);
     expect(manifest.projectId).toBe(projectId);
-    // 2 explicit seed nodes + the memory's OWN node (PLNR-283: recordMemory always writes one).
-    expect(manifest.tableCounts.nodes).toBe(3);
+    // PLNR-430: asserted relative to the settled baseline (currently 1 — the coordination-
+    // projected Backlog milestone — but incidental to project setup, not what this test means to
+    // check), rather than a hardcoded total. 2 explicit seed nodes + the memory's OWN node
+    // (PLNR-283: recordMemory always writes one).
+    expect(manifest.tableCounts.nodes).toBe((baselineNodes ?? 0) + 3);
     expect(manifest.tableCounts.outbox).toBeGreaterThan(0);
     expect(manifest.tier).toBe('core');
     expect(Object.keys(manifest.checksums).length).toBeGreaterThan(0);

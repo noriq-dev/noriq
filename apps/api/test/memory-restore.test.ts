@@ -25,6 +25,11 @@ interface MemoryRpc {
   ): Promise<{ memoryId: string; operationId: string; deduped: boolean }>;
   drainOutbox(pid: string): Promise<{ delivered: number; failed: number }>;
   runProjector(pid: string): Promise<{ applied: number; cursor: number }>;
+  // PLNR-430: reconcile() drains the outbox AND advances the projector cursor in one call — see
+  // memory-lifecycle.test.ts's newOwnedProject (PLNR-419) for why settling only the outbox is not
+  // enough. drainOutbox/runProjector stay above because :218 below asserts drainOutbox's own
+  // return value directly (do not fold that one into reconcile()).
+  reconcile(pid: string): Promise<{ delivered: number; failed: number; applied: number; cursor: number }>;
   exportSnapshot(pid: string, opts?: { tier?: 'core' | 'full' }): Promise<
     { ok: true; manifest: { exportedAt: string; r2EvidenceRefs: string[] }; manifestKey: string } | { ok: false; reason: string }
   >;
@@ -172,13 +177,13 @@ describe('restoreSnapshot — round trip reproduces canonical state', () => {
 
     // Catch every ledger up BEFORE exporting, so a restore's idempotency claim is testable:
     // nothing should be newly applicable afterward. drainOutbox itself emits a fresh D1 event
-    // (the delivered memory.changed), so the projector must run AGAIN after it to consume that
-    // too — otherwise the snapshot exports with a cursor already behind the live event log.
+    // (the delivered memory.changed), which the projector must also consume — reconcile() does
+    // both, in the right order, in one call (PLNR-430) — otherwise the snapshot exports with a
+    // cursor already behind the live event log.
     await memory(projectId).runProjector(projectId);
     const { operationId } = await memory(projectId).recordMemory(projectId, { kind: 'learning', statement: 'pre-export marker', actor: SYSTEM });
     void operationId;
-    await memory(projectId).drainOutbox(projectId);
-    await memory(projectId).runProjector(projectId);
+    await memory(projectId).reconcile(projectId);
 
     const { nodeId: nodeA } = await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/a', label: 'a', actor: SYSTEM });
     const { nodeId: nodeB } = await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/b', label: 'b', actor: SYSTEM });
@@ -189,10 +194,9 @@ describe('restoreSnapshot — round trip reproduces canonical state', () => {
       evidence: [{ repositoryKey: 'repo-x', branch: 'main', baseId: 'a1b2c3', path: 'README.md' }],
       actor: SYSTEM,
     });
-    // Every write above (node/edge/memory) queued its own outbox row — drain and project again
-    // so the ledgers are caught up before export, matching the comment above.
-    await memory(projectId).drainOutbox(projectId);
-    await memory(projectId).runProjector(projectId);
+    // Every write above (node/edge/memory) queued its own outbox row — reconcile() again so the
+    // ledgers are caught up before export, matching the comment above.
+    await memory(projectId).reconcile(projectId);
 
     const beforeHealth = await memory(projectId).health(projectId);
     const beforeTraversal = await traverseOneHop(projectId, nodeA, 'related_to');
@@ -265,6 +269,14 @@ describe('restoreSnapshot — round trip reproduces canonical state', () => {
 
     // Live state diverges from the (now-corrupted) snapshot after export.
     await memory(projectId).writeNode(projectId, { type: 'unknown', uri: 'noriq://unknown/live-only', label: 'live-only', actor: SYSTEM });
+    // PLNR-430: this test never settled at all (no runProjector/reconcile call existed here
+    // before this fix) — create_project's own unconsumed Backlog-milestone coordination event,
+    // plus this test's own writeNode calls (each schedules its own fire-and-forget alarm), could
+    // otherwise materialise a node between liveCountBefore and liveCountAfter below on timing
+    // alone and break the "untouched" assertion. See memory-lifecycle.test.ts's newOwnedProject
+    // (PLNR-419). The comparison itself stays relative (before vs. after) — no hardcoded total
+    // here to rebaseline, unlike memory-backup.test.ts's manifest.tableCounts.nodes assertion.
+    await memory(projectId).reconcile(projectId);
     const liveCountBefore = (await memory(projectId).health(projectId)).tableCounts.nodes;
 
     const restored = await memory(projectId).restoreSnapshot(projectId, { exportedAt: exported.manifest.exportedAt });

@@ -50,7 +50,9 @@ interface MemoryRpc {
   promoteMemoriesOnMerge(pid: string, input: { repositoryKey: string; branch: string; mergedBaseId: string }): Promise<{ promoted: string[] }>;
   exportSnapshot(pid: string): Promise<{ ok: true; manifest: { exportedAt: string } } | { ok: false; reason: string }>;
   restoreSnapshot(pid: string, opts: { exportedAt: string }): Promise<{ ok: true } | { ok: false; reason: string }>;
-  drainOutbox(pid: string): Promise<{ delivered: number; failed: number }>;
+  // PLNR-430: reconcile() (not drainOutbox() alone) settles both the outbox and the projector
+  // cursor — see memory-lifecycle.test.ts's newOwnedProject (PLNR-419).
+  reconcile(pid: string): Promise<{ delivered: number; failed: number; applied: number; cursor: number }>;
   _setMemoryRecordedAtForTest(pid: string, memoryId: string, recordedAt: string): Promise<void>;
   beginIndexIngest(pid: string, manifest: IndexManifestInput): Promise<{ ok: true }>;
   ingestIndexBatch(pid: string, batch: { generationId: string; batchNumber: number; batchHash: string }, rows: StagedRow[]): Promise<{ ok: true; deduped: boolean }>;
@@ -281,7 +283,8 @@ describe('decayLowAuthorityMemories — bounded, policy-driven, reversible from 
       maxAgeMs: MEMORY_HYPOTHESIS_DECAY_MAX_AGE_MS,
       authorityCeiling: MEMORY_HYPOTHESIS_DECAY_AUTHORITY_CEILING,
     });
-    await memory(projectId).drainOutbox(projectId);
+    // PLNR-430: settle via reconcile(), not drainOutbox() alone — see the interface comment above.
+    await memory(projectId).reconcile(projectId);
     const { results } = await appEnv.DB.prepare("SELECT payload FROM events WHERE project_id = ? AND verb = 'memory.changed'").bind(projectId).all<{ payload: string }>();
     const decayEvents = results.map((r) => JSON.parse(r.payload)).filter((p) => p.entityType === 'decay');
     expect(decayEvents).toHaveLength(1);
