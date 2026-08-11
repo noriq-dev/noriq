@@ -555,18 +555,19 @@ export function MemoryConstellation3D({
     const pointer = new state.THREE.Vector2((event.clientX - rect.left) / rect.width * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
     const raycaster = new state.THREE.Raycaster();
     raycaster.setFromCamera(pointer, state.camera);
-    for (const hit of raycaster.intersectObjects(state.nodeMeshes, false)) {
-      if (hit.instanceId === undefined) continue;
-      const nodeId = (hit.object.userData.nodeIds as string[] | undefined)?.[hit.instanceId];
-      const node = nodeId ? state.nodeById.get(nodeId) : undefined;
-      const content = node ? communityTooltipContent(node) : null;
-      if (node && content) {
-        const point = new state.THREE.Vector3(...node.position).project(state.camera);
-        const width = rect.width || 1, height = rect.height || 1;
-        state.setHover(node);
-        setHoveredTooltip({ nodeId: node.id, content, x: (point.x + 1) * width / 2, y: (1 - point.y) * height / 2 });
-        return;
-      }
+    // Only the frontmost real hit decides — mirroring `selectAt`'s own semantics. Scanning past it
+    // to find a community further along the ray would let a foreground entity become see-through,
+    // surfacing a tooltip for something the cursor isn't actually over.
+    const hit = raycaster.intersectObjects(state.nodeMeshes, false).find((candidate) => candidate.instanceId !== undefined);
+    const nodeId = hit ? (hit.object.userData.nodeIds as string[] | undefined)?.[hit.instanceId!] : undefined;
+    const node = nodeId ? state.nodeById.get(nodeId) : undefined;
+    const content = node ? communityTooltipContent(node) : null;
+    if (node && content) {
+      const point = new state.THREE.Vector3(...node.position).project(state.camera);
+      const width = rect.width || 1, height = rect.height || 1;
+      state.setHover(node);
+      setHoveredTooltip({ nodeId: node.id, content, x: (point.x + 1) * width / 2, y: (1 - point.y) * height / 2 });
+      return;
     }
     state.setHover(null);
     setHoveredTooltip(null);
