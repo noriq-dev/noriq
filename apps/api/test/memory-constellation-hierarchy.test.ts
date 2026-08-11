@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  buildConstellationHierarchy, constellationSourceIsCurrent, CONSTELLATION_COMMUNITY_LABEL_MAX_LENGTH, CONSTELLATION_LEAF_SIZE,
+  anchorFor, buildConstellationHierarchy, constellationSourceIsCurrent, CONSTELLATION_COMMUNITY_LABEL_MAX_LENGTH, CONSTELLATION_LEAF_SIZE,
   type PriorConstellationCommunity,
 } from '../src/memory/constellation-hierarchy';
 import type { ConstellationRawEdge, ConstellationRawNode } from '../src/memory/graph-queries';
@@ -17,6 +17,15 @@ function leafCounts(result: ReturnType<typeof buildConstellationHierarchy>): Map
   for (const membership of result.data.memberships) counts.set(membership.communityId, (counts.get(membership.communityId) ?? 0) + 1);
   return counts;
 }
+
+describe('anchorFor', () => {
+  it('decorrelates every axis for representative persisted community ids', () => {
+    for (const id of ['com_02aa3b285e20ccf1', 'com_1f8b0d7a9c3e6254', 'com_fedcba9876543210']) {
+      const anchor = anchorFor(id);
+      expect(Math.max(...anchor) - Math.min(...anchor)).toBeGreaterThan(0.01);
+    }
+  });
+});
 
 describe('buildConstellationHierarchy', () => {
   it('normalizes a dense universal hub, recursively bounds leaves, and represents every node once', () => {

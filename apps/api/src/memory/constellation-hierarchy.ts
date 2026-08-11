@@ -1,6 +1,6 @@
 import type { ConstellationRawEdge, ConstellationRawNode } from './graph-queries';
 
-export const CONSTELLATION_TOPOLOGY_VERSION = 'semantic-roots-v2';
+export const CONSTELLATION_TOPOLOGY_VERSION = 'semantic-roots-v3';
 export const CONSTELLATION_LAYOUT_VERSION = 'space-v1';
 export const CONSTELLATION_MAX_CHILDREN = 128;
 export const CONSTELLATION_LEAF_SIZE = 500;
@@ -52,8 +52,8 @@ function fnv64(input: string): string {
   return h.toString(16).padStart(16, '0');
 }
 
-function anchorFor(id: string): [number, number, number] {
-  const unit = (salt: string) => (Number.parseInt(fnv64(`${id}:${salt}`).slice(0, 8), 16) / 0xffffffff) * 2 - 1;
+export function anchorFor(id: string): [number, number, number] {
+  const unit = (salt: string) => (Number.parseInt(fnv64(`${salt}:${id}`).slice(0, 8), 16) / 0xffffffff) * 2 - 1;
   return [unit('x') * 1000, unit('y') * 1000, unit('z') * 1000];
 }
 
