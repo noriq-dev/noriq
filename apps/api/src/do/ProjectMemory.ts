@@ -30,7 +30,7 @@ import {
 import { IndexGenerationManifest, type IndexBatch } from '@noriq-dev/shared';
 import {
   projectionEntityProblem, projectionEdgeTypeProblem, coChangePairs, CO_CHANGE_PAIR_CAP,
-  mapCoordinationEvent, evidenceCitationNodes, EVIDENCE_EDGE_TYPE,
+  mapCoordinationEvent, evidenceCitationNodes, EVIDENCE_EDGE_TYPE, memoryItemNode, phaseTaskProvenance,
 } from '../memory/projection';
 import type { ProjectedEdgeDescriptor } from '../memory/projection';
 import {
@@ -182,7 +182,7 @@ interface CoordinationRelationships {
   docs: { results: Array<{ id: string; name: string }> };
   milestones: { results: Array<{ id: string; title: string }> };
   agents: { results: Array<{ id: string; name: string }> };
-  taskPlanLinks: { results: Array<{ taskId: string; planId: string }> };
+  taskPlanLinks: { results: Array<{ taskId: string; planId: string; phaseId: string }> };
   taskDocLinks: { results: Array<{ taskId: string; docId: string }> };
   taskDependencies: { results: Array<{ taskId: string; dependsOnId: string }> };
   taskClaims: { results: Array<{ taskId: string; agentId: string }> };
@@ -193,6 +193,9 @@ const projectionEdgeKey = (edge: { type: string; fromUri: string; toUri: string 
   `${edge.type}\0${edge.fromUri}\0${edge.toUri}`;
 
 const projectionCategoryForProvenance = (provenance: string | null): ProjectionRelationshipCategory | null => {
+  if (provenance?.startsWith('coordination:phase_tasks:') || provenance?.startsWith('event:plan.tasks_linked:')) {
+    return 'phaseTasks';
+  }
   switch (provenance) {
     case 'coordination:phase_tasks':
     case 'event:plan.tasks_linked':
@@ -456,7 +459,7 @@ function summarizeEpisodeBody(bodyJson: string): string {
  * make an already-backfilled project look unbackfilled and re-run for no reason (harmless, since
  * the rebuild is idempotent, but pointless CPU).
  */
-const BACKFILL_VERSION = 3;
+const BACKFILL_VERSION = 4;
 
 export class ProjectMemory extends DurableObject<Env> {
   // Bound on first call — from ctx.id.name when the runtime exposes it (every
@@ -3363,31 +3366,6 @@ export class ProjectMemory extends DurableObject<Env> {
     this.ctx.storage.sql.exec(`DELETE FROM nodes WHERE id = ?1`, node.id);
   }
 
-  /** PLNR-314: a canvas label is unreadable past ~80 chars, so this is the bound every memory
-   *  node's label is held to — both here (a freshly written or re-touched node) and in
-   *  memory-migration 0011's one-time backfill of nodes written before this fix, which mirrors
-   *  this normalization in SQL as closely as SQLite's string functions allow. */
-  private static readonly MEMORY_NODE_LABEL_MAX_CHARS = 80;
-
-  /**
-   * PLNR-314: a memory graph node's label is a bounded, single-line EXCERPT OF THE STATEMENT —
-   * never `kind`. Before this fix `upsertGraphNode('memory', …, input.kind, …)` named the node
-   * after its kind, so every `hazard`/`decision`/`unknown` memory rendered as an identically
-   * titled star; `kind` already travels as its own field on the constellation wire
-   * (graph-queries.ts resolves it from `memory_items`), so the label was the only place a memory
-   * node's actual content could appear at all, and this fixes that. Collapses whitespace/newlines
-   * to single spaces first — a multi-line statement makes an unreadable canvas label — then
-   * truncates with a trailing ellipsis past the bound. Display only (locked decision): never
-   * widen this excerpt, or reuse it, anywhere that renders in instruction position — a statement
-   * is untrusted model output, already quoted inside the evidence frame everywhere it is read as
-   * content (§13), and a graph label must not become a second, unframed path for the same text.
-   */
-  private static memoryNodeLabel(statement: string): string {
-    const normalized = statement.replace(/\s+/g, ' ').trim();
-    if (normalized.length <= ProjectMemory.MEMORY_NODE_LABEL_MAX_CHARS) return normalized;
-    return `${normalized.slice(0, ProjectMemory.MEMORY_NODE_LABEL_MAX_CHARS - 1)}…`;
-  }
-
   /** Project one stored memory row and every exact repository citation it owns. This is the
    *  shared reconstruction primitive for promotion writes and the versioned full backfill:
    *  everything here is derived from durable columns, never inferred from statement text. */
@@ -3401,13 +3379,12 @@ export class ProjectMemory extends DurableObject<Env> {
 
     let nodesWritten = 0;
     let edgesWritten = 0;
-    const memoryNodeId = this.upsertGraphNode(
-      'memory', buildEntityUri({ kind: 'memory', id: row.id }), ProjectMemory.memoryNodeLabel(row.statement), now,
-    );
+    const memoryDescriptor = memoryItemNode(row.id, row.statement);
+    const memoryNodeId = this.upsertGraphNode(memoryDescriptor.type, memoryDescriptor.uri, memoryDescriptor.label, now);
     nodesWritten++;
     const decisionNodeId = row.kind === 'decision'
       ? this.upsertGraphNode(
-          'decision', buildEntityUri({ kind: 'decision', id: row.id }), ProjectMemory.memoryNodeLabel(row.statement), now,
+          'decision', buildEntityUri({ kind: 'decision', id: row.id }), memoryDescriptor.label, now,
         )
       : null;
     if (decisionNodeId) {
@@ -3421,17 +3398,15 @@ export class ProjectMemory extends DurableObject<Env> {
         .exec<{ kind: string; statement: string }>(`SELECT kind, statement FROM memory_items WHERE id = ?1`, row.supersedes_memory_id)
         .toArray()[0];
       if (prior) {
-        const priorNodeId = this.upsertGraphNode(
-          'memory', buildEntityUri({ kind: 'memory', id: row.supersedes_memory_id }),
-          ProjectMemory.memoryNodeLabel(prior.statement), now,
-        );
+        const priorDescriptor = memoryItemNode(row.supersedes_memory_id, prior.statement);
+        const priorNodeId = this.upsertGraphNode(priorDescriptor.type, priorDescriptor.uri, priorDescriptor.label, now);
         nodesWritten++;
         this.linkGraphEdge('supersedes', memoryNodeId, priorNodeId, now, 'memory_items:supersedes');
         edgesWritten++;
         if (decisionNodeId && prior.kind === 'decision') {
           const priorDecisionNodeId = this.upsertGraphNode(
             'decision', buildEntityUri({ kind: 'decision', id: row.supersedes_memory_id }),
-            ProjectMemory.memoryNodeLabel(prior.statement), now,
+            priorDescriptor.label, now,
           );
           nodesWritten++;
           this.linkGraphEdge('supersedes', decisionNodeId, priorDecisionNodeId, now, 'memory_items:supersedes');
@@ -3600,17 +3575,13 @@ export class ProjectMemory extends DurableObject<Env> {
       // `evidence` row id is on hand to become that citation's edge provenance — `evidence:
       // <evidenceId>` (locked decision's own example grammar); an entity citation gets no
       // `evidence` row to point at, so its provenance names the memory itself.
-      const memoryNodeId = this.upsertGraphNode(
-        'memory',
-        buildEntityUri({ kind: 'memory', id: memoryId }),
-        ProjectMemory.memoryNodeLabel(input.statement),
-        now,
-      );
+      const memoryDescriptor = memoryItemNode(memoryId, input.statement);
+      const memoryNodeId = this.upsertGraphNode(memoryDescriptor.type, memoryDescriptor.uri, memoryDescriptor.label, now);
       const decisionNodeId = input.kind === 'decision'
         ? this.upsertGraphNode(
             'decision',
             buildEntityUri({ kind: 'decision', id: memoryId }),
-            ProjectMemory.memoryNodeLabel(input.statement),
+            memoryDescriptor.label,
             now,
           )
         : null;
@@ -3654,16 +3625,14 @@ export class ProjectMemory extends DurableObject<Env> {
           .exec<{ kind: string; statement: string }>(`SELECT kind, statement FROM memory_items WHERE id = ?1`, input.supersedesMemoryId)
           .toArray()[0];
         if (prior) {
-          const priorNodeId = this.upsertGraphNode(
-            'memory', buildEntityUri({ kind: 'memory', id: input.supersedesMemoryId }),
-            ProjectMemory.memoryNodeLabel(prior.statement), now,
-          );
+          const priorDescriptor = memoryItemNode(input.supersedesMemoryId, prior.statement);
+          const priorNodeId = this.upsertGraphNode(priorDescriptor.type, priorDescriptor.uri, priorDescriptor.label, now);
           this.linkGraphEdge('supersedes', memoryNodeId, priorNodeId, now, 'memory_items:supersedes');
           if (decisionNodeId && prior.kind === 'decision') {
             const priorDecisionNodeId = this.upsertGraphNode(
               'decision',
               buildEntityUri({ kind: 'decision', id: input.supersedesMemoryId }),
-              ProjectMemory.memoryNodeLabel(prior.statement),
+              priorDescriptor.label,
               now,
             );
             this.linkGraphEdge('supersedes', decisionNodeId, priorDecisionNodeId, now, 'memory_items:supersedes');
@@ -3842,14 +3811,10 @@ export class ProjectMemory extends DurableObject<Env> {
         .exec<{ statement: string }>(`SELECT statement FROM memory_items WHERE id = ?1`, input.contradictsMemoryItemId)
         .toArray()[0];
       if (fromMemory && toMemory) {
-        const fromNodeId = this.upsertGraphNode(
-          'memory', buildEntityUri({ kind: 'memory', id: input.memoryItemId }),
-          ProjectMemory.memoryNodeLabel(fromMemory.statement), now,
-        );
-        const toNodeId = this.upsertGraphNode(
-          'memory', buildEntityUri({ kind: 'memory', id: input.contradictsMemoryItemId }),
-          ProjectMemory.memoryNodeLabel(toMemory.statement), now,
-        );
+        const fromDescriptor = memoryItemNode(input.memoryItemId, fromMemory.statement);
+        const toDescriptor = memoryItemNode(input.contradictsMemoryItemId, toMemory.statement);
+        const fromNodeId = this.upsertGraphNode(fromDescriptor.type, fromDescriptor.uri, fromDescriptor.label, now);
+        const toNodeId = this.upsertGraphNode(toDescriptor.type, toDescriptor.uri, toDescriptor.label, now);
         this.linkGraphEdge('contradicts', fromNodeId, toNodeId, now, `memory:contradiction:${contradictionId}`);
       }
       this.ctx.storage.sql.exec(
@@ -6447,9 +6412,10 @@ export class ProjectMemory extends DurableObject<Env> {
       this.env.DB.prepare('SELECT id, title FROM milestones WHERE project_id = ?').bind(projectId).all<{ id: string; title: string }>(),
       this.env.DB.prepare('SELECT id, name FROM agents WHERE project_id = ?').bind(projectId).all<{ id: string; name: string }>(),
       this.env.DB.prepare(
-        `SELECT DISTINCT pt.task_id AS taskId, ph.plan_id AS planId FROM phase_tasks pt
-         JOIN phases ph ON ph.id = pt.phase_id JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ?`,
-      ).bind(projectId).all<{ taskId: string; planId: string }>(),
+        `SELECT pt.task_id AS taskId, ph.plan_id AS planId, MIN(pt.phase_id) AS phaseId FROM phase_tasks pt
+         JOIN phases ph ON ph.id = pt.phase_id JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ?
+         GROUP BY pt.task_id, ph.plan_id ORDER BY pt.task_id, ph.plan_id`,
+      ).bind(projectId).all<{ taskId: string; planId: string; phaseId: string }>(),
       this.env.DB.prepare(
         `SELECT td.task_id AS taskId, td.doc_id AS docId FROM task_docs td
          JOIN tasks t ON t.id = td.task_id WHERE t.project_id = ?`,
@@ -6481,7 +6447,7 @@ export class ProjectMemory extends DurableObject<Env> {
         category: 'phaseTasks', type: 'related_to',
         fromUri: buildEntityUri({ kind: 'task', id: link.taskId }),
         toUri: buildEntityUri({ kind: 'plan', id: link.planId }),
-        provenance: 'coordination:phase_tasks',
+        provenance: phaseTaskProvenance(link.phaseId),
       });
     }
     for (const link of state.taskDocLinks.results) {
@@ -6656,6 +6622,19 @@ export class ProjectMemory extends DurableObject<Env> {
         const fromId = this.findGraphNodeId(edge.fromUri);
         const toId = this.findGraphNodeId(edge.toUri);
         if (fromId && toId) {
+          if (edge.category === 'phaseTasks') {
+            // Phase identity is part of the serialized graph fact, not the triple. Rewrite only
+            // projector-owned legacy provenance; a null/user-authored edge remains untouched.
+            this.ctx.storage.sql.exec(
+              `UPDATE edges SET provenance = ?1
+               WHERE type = ?2 AND from_node_id = ?3 AND to_node_id = ?4
+                 AND (provenance = 'coordination:phase_tasks'
+                   OR provenance GLOB 'coordination:phase_tasks:*'
+                   OR provenance = 'event:plan.tasks_linked'
+                   OR provenance GLOB 'event:plan.tasks_linked:*')`,
+              edge.provenance, edge.type, fromId, toId,
+            );
+          }
           this.linkGraphEdge(edge.type, fromId, toId, now, edge.provenance);
           edgesWritten++;
         }
@@ -6789,10 +6768,11 @@ export class ProjectMemory extends DurableObject<Env> {
    * keeps its `event:<verb>` provenance. `linkGraphEdge`'s `ON CONFLICT … DO NOTHING` only writes
    * provenance on a triple's FIRST insert — running the backfill BEFORE the incremental path
    * catches up would let its `coordination:<table>` provenance win that race for a triple the
-   * incremental path was about to draw anyway. The actual EDGE would be identical either way
-   * (that is the whole point of convergence), but the audit trail would lie about which writer
-   * actually drew it — so the order is load-bearing, not cosmetic, and living INSIDE this method
-   * (not left to each caller to remember) is what makes that true regardless of caller.
+   * incremental path was about to draw anyway. The deliberate PLNR-470 exception is a phase-task
+   * edge: rebuild upgrades projector-owned provenance to the canonical phase-qualified grammar,
+   * because the phase id is new data rather than merely an audit-source label. For every other
+   * edge the actual triple would be identical either way (the point of convergence), but changing
+   * provenance would lie about which writer drew it — so the ordering remains load-bearing.
    *
    * Concurrent callers are serialized with `blockConcurrencyWhile`, so the marker check,
    * reconciliation, rebuild, and marker write act as one gate and only one caller can report
@@ -6865,6 +6845,28 @@ export class ProjectMemory extends DurableObject<Env> {
           to.nodeId,
         )
         .toArray()[0]?.provenance ?? null
+    );
+  }
+
+  /** Test-only: overwrite provenance on one known edge so rebuild tests can model a graph row
+   * written before phase-qualified provenance existed without exposing general graph mutation. */
+  async _setEdgeProvenanceForTest(
+    projectId: string,
+    type: string,
+    fromUri: string,
+    toUri: string,
+    provenance: string | null,
+  ): Promise<void> {
+    await this.assertProjectId(projectId);
+    const from = this.resolveNodeByUri(fromUri);
+    const to = this.resolveNodeByUri(toUri);
+    if (!from || !to) throw new Error('edge endpoint not found');
+    this.ctx.storage.sql.exec(
+      `UPDATE edges SET provenance = ?1 WHERE type = ?2 AND from_node_id = ?3 AND to_node_id = ?4`,
+      provenance,
+      type,
+      from.nodeId,
+      to.nodeId,
     );
   }
 

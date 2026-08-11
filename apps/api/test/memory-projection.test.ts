@@ -10,7 +10,12 @@ import type { Actor, CreateRunInput, RunView, TaskPatch, UpdatedTask } from '../
 import { createUser, mintTokenForUser, mcpCall } from './helpers';
 import { buildEntityUri } from '@noriq-dev/shared';
 import { computeStagedContentHash } from '../src/memory/ingest';
-import { mapCoordinationEvent } from '../src/memory/projection';
+import {
+  mapCoordinationEvent,
+  memoryItemNode,
+  MEMORY_PROJECTION_LABEL_MAX_CHARS,
+  phaseTaskProvenance,
+} from '../src/memory/projection';
 import type { ConstellationV2Overview } from '../src/memory/constellation-v2';
 
 const appEnv = env as unknown as Env;
@@ -78,6 +83,7 @@ interface MemRpc {
   _countNodes(pid: string): Promise<number>;
   _countEdges(pid: string): Promise<number>;
   _edgeProvenance(pid: string, type: string, fromUri: string, toUri: string): Promise<string | null>;
+  _setEdgeProvenanceForTest(pid: string, type: string, fromUri: string, toUri: string, provenance: string | null): Promise<void>;
   _nodeByUriForTest(pid: string, uri: string): Promise<{ nodeId: string; type: string; label: string } | null>;
   _rewindProjectorCursorForTest(pid: string, globalSeq: number): Promise<void>;
   recordMemory(pid: string, input: RecordMemoryInput): Promise<{ memoryId: string; operationId: string; deduped: boolean }>;
@@ -286,6 +292,15 @@ describe('projecting an activated generation into the graph', () => {
 // PLNR-283: recordMemory's own graph node + evidence-cited edges, the widened coordination
 // projector's rebuild backfill, and the URI-parity retrieval needs (PLNR-284/286).
 describe('recordMemory writes its own node and typed edges to cited entities (PLNR-283)', () => {
+  it('maps a stored memory to the canonical URI and a bounded single-line statement label', () => {
+    const projected = memoryItemNode('mem_projection', `  ${'stellar observation '.repeat(8)}\nwith evidence  `);
+    expect(projected.type).toBe('memory');
+    expect(projected.uri).toBe(buildEntityUri({ kind: 'memory', id: 'mem_projection' }));
+    expect(projected.label).not.toMatch(/\s{2,}|\n/);
+    expect(projected.label).toHaveLength(MEMORY_PROJECTION_LABEL_MAX_CHARS);
+    expect(projected.label.endsWith('…')).toBe(true);
+  });
+
   it('evidence citing a task and a doc creates the memory node and both edges in ONE transaction with ONE outbox row, reachable from the task in one hop', async () => {
     const { token, projectId } = await newOwnedProject('pm-283-evidence@example.com', 'PM283EV');
     const task = await mcpCall(token, 'create_task', { projectId, title: 'cited task', tags: ['pm-283'], allowNewTags: true });
@@ -934,9 +949,8 @@ describe('run.created draws a run node and a related_to edge to its anchor end t
 // named by an event, so `rebuildProjection`'s live D1 read was the only source of these edges.
 // `plan.tasks_linked`/`plan.tasks_unlinked` and `task.docs_linked`/`task.docs_unlinked` close
 // that gap: same `related_to` edge type, same task -> plan / task -> doc direction
-// rebuildProjection already draws — only the provenance grammar differs (`event:<verb>` vs
-// `coordination:phase_tasks`/`coordination:task_docs`), the same precedent dependency.added and
-// run.created already set two tasks ago.
+// rebuildProjection already draws. Phase links now share one phase-qualified provenance grammar
+// across event and rebuild writers; legacy events without phaseId retain their old event grammar.
 const HUMAN_ACTOR: Actor = { kind: 'human', id: 'usr_pm319', name: 'PM319 Tester' };
 
 describe('mapCoordinationEvent — plan.tasks_linked/unlinked, task.docs_linked/unlinked (PLNR-319)', () => {
@@ -947,8 +961,8 @@ describe('mapCoordinationEvent — plan.tasks_linked/unlinked, task.docs_linked/
       payload: {
         planTitle: 'Q3 plan',
         links: [
-          { taskId: 'task_1', taskTitle: 'first', planId: 'plan_abc', planTitle: 'Q3 plan' },
-          { taskId: 'task_2', taskTitle: 'second', planId: 'plan_abc', planTitle: 'Q3 plan' },
+          { taskId: 'task_1', taskTitle: 'first', planId: 'plan_abc', planTitle: 'Q3 plan', phaseId: 'phs_one' },
+          { taskId: 'task_2', taskTitle: 'second', planId: 'plan_abc', planTitle: 'Q3 plan', phaseId: 'phs_two' },
         ],
       },
     });
@@ -960,20 +974,20 @@ describe('mapCoordinationEvent — plan.tasks_linked/unlinked, task.docs_linked/
           from: { type: 'task', uri: buildEntityUri({ kind: 'task', id: 'task_1' }), label: 'first' },
           to: { type: 'plan', uri: buildEntityUri({ kind: 'plan', id: 'plan_abc' }), label: 'Q3 plan' },
           op: 'link',
-          provenance: 'event:plan.tasks_linked',
+          provenance: phaseTaskProvenance('phs_one'),
         },
         {
           type: 'related_to',
           from: { type: 'task', uri: buildEntityUri({ kind: 'task', id: 'task_2' }), label: 'second' },
           to: { type: 'plan', uri: buildEntityUri({ kind: 'plan', id: 'plan_abc' }), label: 'Q3 plan' },
           op: 'link',
-          provenance: 'event:plan.tasks_linked',
+          provenance: phaseTaskProvenance('phs_two'),
         },
       ],
     });
   });
 
-  it('plan.tasks_unlinked projects the same shape with op: unlink; a missing label falls back to the bare id', () => {
+  it('a legacy plan.tasks_unlinked without phaseId remains replayable and falls back to bare-id labels', () => {
     const projected = mapCoordinationEvent({
       verb: 'plan.tasks_unlinked',
       subjectId: 'plan_abc',
@@ -1049,7 +1063,7 @@ describe('phase_tasks/task_docs draw real edges end to end, converging with rebu
     expect(await memory(projectId)._edgeProvenance(projectId, 'related_to', taskUri, docUri)).toBe('event:task.docs_linked');
   });
 
-  it('create_task with a phaseId produces a task -> plan edge', async () => {
+  it('create_task with a phaseId produces a phase-qualified task -> plan edge and rebuild upgrades legacy provenance', async () => {
     const { token, projectId } = await newOwnedProject('pm-319-phase@example.com', 'PM319PH');
     const plan = await mcpCall(token, 'create_plan', { projectId, title: 'phase plan', phases: [{ title: 'phase 1', newTasks: [{ title: 'seed task' }] }] });
     if (plan.isError) throw new Error(`create_plan failed: ${plan.text}`);
@@ -1067,7 +1081,14 @@ describe('phase_tasks/task_docs draw real edges end to end, converging with rebu
     const planUri = buildEntityUri({ kind: 'plan', id: planId });
     const neighborhood = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: taskUri, edgeTypes: ['related_to'] });
     expect(neighborhood.downstream.map((n) => n.uri)).toEqual([planUri]);
-    expect(await memory(projectId)._edgeProvenance(projectId, 'related_to', taskUri, planUri)).toBe('event:plan.tasks_linked');
+    const qualified = phaseTaskProvenance(phaseId);
+    expect(await memory(projectId)._edgeProvenance(projectId, 'related_to', taskUri, planUri)).toBe(qualified);
+
+    // Model the poisoned pre-PLNR-470 row. Rebuild derives the phase from D1 phase_tasks and
+    // replaces only projector-owned legacy provenance, leaving the graph triple intact.
+    await memory(projectId)._setEdgeProvenanceForTest(projectId, 'related_to', taskUri, planUri, 'coordination:phase_tasks');
+    await memory(projectId).rebuildProjection(projectId);
+    expect(await memory(projectId)._edgeProvenance(projectId, 'related_to', taskUri, planUri)).toBe(qualified);
   });
 
   it('create_plan with many tasks in one phase emits ONE plan.tasks_linked event, not one per task (§19)', async () => {
@@ -1076,15 +1097,17 @@ describe('phase_tasks/task_docs draw real edges end to end, converging with rebu
     const plan = await mcpCall(token, 'create_plan', { projectId, title: 'bulk plan', phases: [{ title: 'phase 1', newTasks }] });
     if (plan.isError) throw new Error(`create_plan failed: ${plan.text}`);
     const planId = plan.body.id as string;
-    const taskIds = (plan.body.phases as Array<{ taskIds: string[] }>)[0]!.taskIds;
+    const createdPhase = (plan.body.phases as Array<{ id: string; taskIds: string[] }>)[0]!;
+    const taskIds = createdPhase.taskIds;
     expect(taskIds).toHaveLength(6);
 
     const { results: linkEvents } = await appEnv.DB.prepare(
       `SELECT payload FROM events WHERE project_id = ? AND verb = 'plan.tasks_linked'`,
     ).bind(projectId).all<{ payload: string }>();
     expect(linkEvents).toHaveLength(1); // bounded: one event for the whole plan, not per task
-    const links = JSON.parse(linkEvents[0]!.payload).links as unknown[];
+    const links = JSON.parse(linkEvents[0]!.payload).links as Array<{ phaseId?: string }>;
     expect(links).toHaveLength(6);
+    expect(links.every((link) => link.phaseId === createdPhase.id)).toBe(true);
 
     const applied = await memory(projectId).runProjector(projectId);
     expect(applied.applied).toBeGreaterThan(0);
@@ -1454,7 +1477,7 @@ describe('PLNR-320: rebuildProjection converges — a rebuild after full increme
 });
 
 describe('PLNR-320: automatic one-time backfill', () => {
-  it('version 2 reconstructs stored memory evidence, correction, contradiction, and episode links without guessing from text', async () => {
+  it('version 4 reprojects stored memory nodes and evidence even when version 3 was already marked complete', async () => {
     const { projectId } = await newOwnedProject('pm-memory-backfill@example.com', 'PMMEMBF');
     const agentId = 'agt_memory_backfill';
     const first = await memory(projectId).recordMemory(projectId, {
@@ -1494,7 +1517,7 @@ describe('PLNR-320: automatic one-time backfill', () => {
     // Preserve the source rows but erase the projection, matching an existing production
     // project whose memories were recorded before these graph writers existed.
     await memory(projectId)._clearGraphForTest(projectId);
-    await memory(projectId)._setMetaForTest(projectId, 'backfill_version', '1');
+    await memory(projectId)._setMetaForTest(projectId, 'backfill_version', '3');
     expect(await memory(projectId)._countNodes(projectId)).toBe(0);
     expect(await memory(projectId)._countEdges(projectId)).toBe(0);
 

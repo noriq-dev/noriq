@@ -983,10 +983,10 @@ export class ProjectRoom extends DurableObject<Env> {
           links: docs.map((d) => ({ taskId: id, taskTitle: input.title, docId: d.id, docLabel: d.name })),
         });
       }
-      if (phasePlan) {
+      if (phasePlan && phaseId) {
         await this.emit(actor, 'plan.tasks_linked', 'plan', phasePlan.id, {
           planTitle: phasePlan.title,
-          links: [{ taskId: id, taskTitle: input.title, planId: phasePlan.id, planTitle: phasePlan.title }],
+          links: [{ taskId: id, taskTitle: input.title, planId: phasePlan.id, planTitle: phasePlan.title, phaseId }],
         });
       }
       this.reindexSearch('task', id);
@@ -2889,8 +2889,9 @@ export class ProjectRoom extends DurableObject<Env> {
         'SELECT doc_id AS docId FROM task_docs WHERE task_id = ?',
       ).bind(task.id).all<{ docId: string }>();
       const { results: severedPlans } = await this.env.DB.prepare(
-        `SELECT DISTINCT ph.plan_id AS planId FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE pt.task_id = ?`,
-      ).bind(task.id).all<{ planId: string }>();
+        `SELECT ph.plan_id AS planId, pt.phase_id AS phaseId
+         FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE pt.task_id = ?`,
+      ).bind(task.id).all<{ planId: string; phaseId: string }>();
       const docLinkCount = severedDocs.length;
 
       const alloc = await this.env.DB.prepare(
@@ -2936,7 +2937,7 @@ export class ProjectRoom extends DurableObject<Env> {
       if (severedPlans.length) {
         await this.emit(actor, 'plan.tasks_unlinked', 'task', task.id, {
           taskTitle: task.title,
-          links: severedPlans.map((p) => ({ taskId: task.id, planId: p.planId })),
+          links: severedPlans.map((p) => ({ taskId: task.id, planId: p.planId, phaseId: p.phaseId })),
         });
       }
       if (severedDocs.length) {
@@ -3174,8 +3175,9 @@ export class ProjectRoom extends DurableObject<Env> {
       // deleteDoc's attachedTasks snapshot (the plan NODE has no deletion listener either, but
       // the edges must not outlive the rows that backed them).
       const { results: memberTasks } = await this.env.DB.prepare(
-        `SELECT DISTINCT pt.task_id AS taskId FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE ph.plan_id = ?`,
-      ).bind(planId).all<{ taskId: string }>();
+        `SELECT pt.task_id AS taskId, pt.phase_id AS phaseId
+         FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE ph.plan_id = ?`,
+      ).bind(planId).all<{ taskId: string; phaseId: string }>();
       await this.env.DB.batch([
         this.env.DB.prepare('UPDATE execution_nodes SET plan_id = NULL WHERE plan_id = ?').bind(planId),
         // Gate rows before phases — the subselect needs the phases still present.
@@ -3189,7 +3191,7 @@ export class ProjectRoom extends DurableObject<Env> {
       if (memberTasks.length) {
         await this.emit(actor, 'plan.tasks_unlinked', 'plan', planId, {
           planTitle: plan.title,
-          links: memberTasks.map((t) => ({ taskId: t.taskId, planId })),
+          links: memberTasks.map((t) => ({ taskId: t.taskId, planId, phaseId: t.phaseId })),
         });
       }
       return { ok: true };
@@ -3215,8 +3217,9 @@ export class ProjectRoom extends DurableObject<Env> {
       // itself is not deleted from the graph (no listener does that today, same pre-existing
       // gap `task.deleted` has always had), but its `related_to` edges must not survive it.
       const { results: memberPlans } = await this.env.DB.prepare(
-        `SELECT DISTINCT ph.plan_id AS planId FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE pt.task_id = ?`,
-      ).bind(id).all<{ planId: string }>();
+        `SELECT ph.plan_id AS planId, pt.phase_id AS phaseId
+         FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE pt.task_id = ?`,
+      ).bind(id).all<{ planId: string; phaseId: string }>();
       const { results: memberDocs } = await this.env.DB.prepare(
         'SELECT doc_id AS docId FROM task_docs WHERE task_id = ?',
       ).bind(id).all<{ docId: string }>();
@@ -3240,7 +3243,7 @@ export class ProjectRoom extends DurableObject<Env> {
       if (memberPlans.length) {
         await this.emit(actor, 'plan.tasks_unlinked', 'task', id, {
           taskTitle: task.title,
-          links: memberPlans.map((p) => ({ taskId: id, planId: p.planId })),
+          links: memberPlans.map((p) => ({ taskId: id, planId: p.planId, phaseId: p.phaseId })),
         });
       }
       if (memberDocs.length) {
@@ -5258,7 +5261,7 @@ export class ProjectRoom extends DurableObject<Env> {
       // PLNR-319: every task that lands in ANY phase of this plan, across the whole call —
       // ONE `plan.tasks_linked` event below carries all of them, not one event per phase or
       // per task (a plan created with forty tasks must not serialize forty coordination writes).
-      const planLinks: Array<{ taskId: string; taskTitle: string }> = [];
+      const planLinks: Array<{ taskId: string; taskTitle: string; phaseId: string }> = [];
       for (let i = 0; i < input.phases.length; i++) {
         const ph = input.phases[i]!;
         const phaseId = newId('phs');
@@ -5268,7 +5271,7 @@ export class ProjectRoom extends DurableObject<Env> {
         // Ids were resolved and validated in pass 1; consuming those answers (rather than
         // re-querying) keeps the two passes provably the same check.
         const taskIds: string[] = resolvedExisting[i]!.map((t) => t.id);
-        for (const t of resolvedExisting[i]!) planLinks.push({ taskId: t.id, taskTitle: t.title });
+        for (const t of resolvedExisting[i]!) planLinks.push({ taskId: t.id, taskTitle: t.title, phaseId });
         const phNewTasks = ph.newTasks ?? [];
         for (let j = 0; j < phNewTasks.length; j++) {
           const nt = phNewTasks[j]!;
@@ -5288,7 +5291,7 @@ export class ProjectRoom extends DurableObject<Env> {
             executionSpec: nt.executionSpec,
           });
           taskIds.push(created.id);
-          planLinks.push({ taskId: created.id, taskTitle: nt.title });
+          planLinks.push({ taskId: created.id, taskTitle: nt.title, phaseId });
         }
         if (!taskIds.length) throw new Error(`phase "${ph.title}" has no tasks`);
 
@@ -5351,17 +5354,14 @@ export class ProjectRoom extends DurableObject<Env> {
         if (!taskIds.length) throw new Error(`phase "${ph.title}" has no tasks`);
         resolved.push({ id: ph.id ?? null, title: ph.title, body: ph.body, taskIds });
       }
-      // PLNR-319: the plan's CURRENT task membership, read before phase_tasks is wiped below —
-      // the diff against the new shape (by task id; a task moved between two phases of the SAME
-      // plan is neither a link nor an unlink) is what `plan.tasks_linked`/`plan.tasks_unlinked`
-      // carry. Edges are task -> plan, not task -> phase, so only plan-level membership matters.
+      // The plan's CURRENT phase membership, read before phase_tasks is replaced below. PLNR-470
+      // makes phase identity part of edge provenance, so moving a task between phases is now an
+      // unlink(old phase) + link(new phase), even though the graph triple remains task -> plan.
       const { results: priorLinks } = await this.env.DB.prepare(
-        `SELECT DISTINCT pt.task_id AS taskId FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE ph.plan_id = ?`,
-      ).bind(planId).all<{ taskId: string }>();
-      const oldTaskIds = new Set(priorLinks.map((r) => r.taskId));
-      const newTaskIds = new Set(resolved.flatMap((p) => p.taskIds));
-      const addedTaskIds = [...newTaskIds].filter((id) => !oldTaskIds.has(id));
-      const removedTaskIds = [...oldTaskIds].filter((id) => !newTaskIds.has(id));
+        `SELECT pt.task_id AS taskId, pt.phase_id AS phaseId
+         FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id
+         WHERE ph.plan_id = ? ORDER BY pt.task_id, pt.phase_id`,
+      ).bind(planId).all<{ taskId: string; phaseId: string }>();
 
       const { results: existing } = await this.env.DB.prepare('SELECT id FROM phases WHERE plan_id = ?')
         .bind(planId).all<{ id: string }>();
@@ -5369,6 +5369,12 @@ export class ProjectRoom extends DurableObject<Env> {
       for (const p of resolved) {
         if (p.id && !existingIds.has(p.id)) throw new Error(`phase ${p.id} is not part of this plan`);
       }
+      const resolvedPhaseIds = resolved.map((p) => p.id ?? newId('phs'));
+      const oldPhaseByTask = new Map(priorLinks.map((link) => [link.taskId, link.phaseId]));
+      const newPhaseByTask = new Map<string, string>();
+      resolved.forEach((phase, index) => phase.taskIds.forEach((taskId) => newPhaseByTask.set(taskId, resolvedPhaseIds[index]!)));
+      const removedLinks = [...oldPhaseByTask].filter(([taskId, phaseId]) => newPhaseByTask.get(taskId) !== phaseId);
+      const addedLinks = [...newPhaseByTask].filter(([taskId, phaseId]) => oldPhaseByTask.get(taskId) !== phaseId);
       const keptIds = new Set(resolved.map((p) => p.id).filter((id): id is string => !!id));
 
       const stmts = [
@@ -5381,7 +5387,7 @@ export class ProjectRoom extends DurableObject<Env> {
       ];
       const out: Array<{ id: string; title: string; taskIds: string[] }> = [];
       resolved.forEach((p, i) => {
-        const phaseId = p.id ?? newId('phs');
+        const phaseId = resolvedPhaseIds[i]!;
         if (p.id) {
           stmts.push(
             p.body === undefined
@@ -5402,16 +5408,17 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.emit(actor, 'plan.updated', 'plan', planId, {
         title: plan.title, structural: true, phases: out.map((p) => ({ title: p.title, tasks: p.taskIds.length })),
       });
-      if (addedTaskIds.length) {
-        await this.emit(actor, 'plan.tasks_linked', 'plan', planId, {
-          planTitle: plan.title,
-          links: addedTaskIds.map((taskId) => ({ taskId, taskTitle: taskTitleById.get(taskId) ?? taskId, planId, planTitle: plan.title })),
-        });
-      }
-      if (removedTaskIds.length) {
+      // Unlink first so a same-triple phase move removes the old provenance before the new link.
+      if (removedLinks.length) {
         await this.emit(actor, 'plan.tasks_unlinked', 'plan', planId, {
           planTitle: plan.title,
-          links: removedTaskIds.map((taskId) => ({ taskId, planId, planTitle: plan.title })),
+          links: removedLinks.map(([taskId, phaseId]) => ({ taskId, planId, planTitle: plan.title, phaseId })),
+        });
+      }
+      if (addedLinks.length) {
+        await this.emit(actor, 'plan.tasks_linked', 'plan', planId, {
+          planTitle: plan.title,
+          links: addedLinks.map(([taskId, phaseId]) => ({ taskId, taskTitle: taskTitleById.get(taskId) ?? taskId, planId, planTitle: plan.title, phaseId })),
         });
       }
       return { id: planId, title: plan.title, phases: out };
@@ -5451,8 +5458,8 @@ export class ProjectRoom extends DurableObject<Env> {
       if (!plan) throw new Error('plan not found');
       if (plan.status !== 'proposed') throw new Error(`plan is ${plan.status}, not proposed — only a proposal can be rejected`);
       const { results: taskRows } = await this.env.DB.prepare(
-        'SELECT DISTINCT pt.task_id AS id FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE ph.plan_id = ?',
-      ).bind(planId).all<{ id: string }>();
+        'SELECT pt.task_id AS id, pt.phase_id AS phaseId FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE ph.plan_id = ?',
+      ).bind(planId).all<{ id: string; phaseId: string }>();
       const now = nowIso();
       const stmts = [
         // Cancel only the plan's own un-started tasks (never touch in-flight/finished work).
@@ -5477,7 +5484,7 @@ export class ProjectRoom extends DurableObject<Env> {
       if (taskRows.length) {
         await this.emit(actor, 'plan.tasks_unlinked', 'plan', planId, {
           planTitle: plan.title,
-          links: taskRows.map((t) => ({ taskId: t.id, planId })),
+          links: taskRows.map((t) => ({ taskId: t.id, planId, phaseId: t.phaseId })),
         });
       }
       return { ok: true, cancelledTasks: taskRows.length };

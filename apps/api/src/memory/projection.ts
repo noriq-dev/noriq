@@ -140,6 +140,25 @@ export interface ProjectedNodeDescriptor {
   label: string;
 }
 
+export const MEMORY_PROJECTION_LABEL_MAX_CHARS = 80;
+
+/** The one memory-item -> graph-node mapping shared by live record writes and rebuilds. Memory
+ * statements are untrusted prose, so graph labels are single-line bounded excerpts, never a
+ * second unbounded rendering surface. */
+export function memoryItemNode(memoryId: string, statement: string): ProjectedNodeDescriptor {
+  const normalized = statement.replace(/\s+/g, ' ').trim();
+  const label = normalized.length <= MEMORY_PROJECTION_LABEL_MAX_CHARS
+    ? normalized
+    : `${normalized.slice(0, MEMORY_PROJECTION_LABEL_MAX_CHARS - 1)}…`;
+  return { type: 'memory', uri: buildEntityUri({ kind: 'memory', id: memoryId }), label };
+}
+
+/** Phase identity rides the existing edge provenance rather than inventing a graph node or edge
+ * type. Rebuild and new coordination events converge on this exact grammar (PLNR-470). */
+export function phaseTaskProvenance(phaseId: string): string {
+  return `coordination:phase_tasks:${phaseId}`;
+}
+
 /**
  * One graph edge `applyCoordinationEvent` draws (or removes) from a single event's payload —
  * PLNR-316. Both endpoints carry a FULL node descriptor, never a bare node id (locked decision):
@@ -426,7 +445,13 @@ export function mapCoordinationEvent(ev: CoordinationEventForProjection): Coordi
         const planLabel = typeof l.planTitle === 'string' && l.planTitle.trim() ? l.planTitle : planId;
         const task: ProjectedNodeDescriptor = { type: 'task', uri: buildEntityUri({ kind: 'task', id: taskId }), label: taskLabel };
         const plan: ProjectedNodeDescriptor = { type: 'plan', uri: buildEntityUri({ kind: 'plan', id: planId }), label: planLabel };
-        edges.push({ type: 'related_to', from: task, to: plan, op, provenance: `event:${ev.verb}` });
+        const phaseId = typeof l.phaseId === 'string' && l.phaseId ? l.phaseId : null;
+        edges.push({
+          type: 'related_to', from: task, to: plan, op,
+          // Old events remain replayable; all newly-emitted links carry phaseId and converge with
+          // rebuildProjection's canonical phase-qualified provenance.
+          provenance: phaseId ? phaseTaskProvenance(phaseId) : `event:${ev.verb}`,
+        });
       }
       return { node: null, edges };
     }
