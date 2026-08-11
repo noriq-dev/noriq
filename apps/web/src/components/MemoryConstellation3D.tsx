@@ -916,6 +916,20 @@ export function MemoryConstellation3D({
 }
 
 const TOOLTIP_WIDTH = 230;
+// PLNR-451: this tooltip's own background (`rgba(16,18,22,.94)` below) is fixed dark in BOTH
+// themes, same "HUD panel over the canvas" as the camera controls (CAMERA_CTRL_* above) and the
+// docked inspector / search matches panel (2c80d5d, PLNR-443). Its border and text were still
+// following var(--w-1)/var(--text*) — which flip to near-black in light theme (theme.css's light
+// block) — rendering dark-on-dark against this panel's own always-dark fill. Reusing CAMERA_CTRL_TEXT
+// (--text) and CAMERA_CTRL_TEXT_FAINT (--text-faint) for the two colours they already cover, and
+// pinning the remaining --text-dim/--w-1/--w-06/--w-07 uses to the dark theme's own literal values
+// as local constants — the same fix pattern 2c80d5d established. `encoding.token` (the type-chip
+// text colour) is left following the theme: --accent/--blue/--purple/--steel/--green have no
+// light-theme override in theme.css, so they read identically in both themes already.
+const TOOLTIP_TEXT_DIM = '#6b7280';
+const TOOLTIP_BORDER = 'rgba(255,255,255,.1)';
+const TOOLTIP_CHIP_BG = 'rgba(255,255,255,.06)';
+const TOOLTIP_DIVIDER = 'rgba(255,255,255,.07)';
 
 /** The overview hover tooltip (PLNR-438) — DOM over canvas, positioned from the already-projected
  * screen coordinates `hoverAt` computed (the same technique labels already use), clamped so it
@@ -932,11 +946,11 @@ function ConstellationHoverTooltip({ tooltip, hostRef }: { tooltip: HoverTooltip
       role="tooltip"
       style={{
         position: 'absolute', left, top, width: TOOLTIP_WIDTH, padding: 10, pointerEvents: 'none', zIndex: 2,
-        background: 'rgba(16,18,22,.94)', border: '1px solid var(--w-1)', borderRadius: 9, backdropFilter: 'blur(8px)',
+        background: 'rgba(16,18,22,.94)', border: `1px solid ${TOOLTIP_BORDER}`, borderRadius: 9, backdropFilter: 'blur(8px)',
       }}
     >
-      <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text)' }}>{tooltip.content.name}</div>
-      <div style={{ marginTop: 3, fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>
+      <div style={{ fontSize: 12.5, fontWeight: 600, color: CAMERA_CTRL_TEXT }}>{tooltip.content.name}</div>
+      <div style={{ marginTop: 3, fontFamily: 'var(--mono)', fontSize: 9.5, color: TOOLTIP_TEXT_DIM }}>
         {tooltip.content.entityCount.toLocaleString()} entities · {tooltip.content.boundaryRouteCount.toLocaleString()} boundary routes
       </div>
       {tooltip.content.topTypeCounts.length > 0 && (
@@ -944,14 +958,14 @@ function ConstellationHoverTooltip({ tooltip, hostRef }: { tooltip: HoverTooltip
           {tooltip.content.topTypeCounts.map(({ type, count }) => {
             const encoding = encodingForType(type);
             return (
-              <span key={type} style={{ fontFamily: 'var(--mono)', fontSize: 9, padding: '1px 6px', borderRadius: 4, background: 'var(--w-06)', color: `var(${encoding.token})` }}>
+              <span key={type} style={{ fontFamily: 'var(--mono)', fontSize: 9, padding: '1px 6px', borderRadius: 4, background: TOOLTIP_CHIP_BG, color: `var(${encoding.token})` }}>
                 {encoding.label.toLowerCase()} {count}
               </span>
             );
           })}
         </div>
       )}
-      <div style={{ marginTop: 8, paddingTop: 6, borderTop: '1px solid var(--w-07)', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>
+      <div style={{ marginTop: 8, paddingTop: 6, borderTop: `1px solid ${TOOLTIP_DIVIDER}`, fontFamily: 'var(--mono)', fontSize: 9, color: CAMERA_CTRL_TEXT_FAINT }}>
         {tooltip.content.affordance}
       </div>
     </div>
