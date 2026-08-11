@@ -6,11 +6,18 @@ import {
 import { useTheme } from '../theme';
 import { Button, Select, TextInput } from './ui';
 import { MonoTag } from './bits';
+import { CONSTELLATION_SHAPE_GLYPH, encodingForType } from './constellation-encoding';
 import {
   assembleConstellationV2Scene, CONSTELLATION_V2_RESIDENT_NODE_BUDGET, evictConstellationPages, type ResidentConstellationPage,
 } from './constellation-v2-scene';
 
 const LazyConstellation3D = lazy(() => import('./MemoryConstellation3D'));
+
+// The overview encoding legend's rows (PLNR-438) — the Navigator conventions doc §1's "locked,
+// not re-litigated" primary types, in the design's own order. Reads shape/token/label straight
+// off constellation-encoding.ts (PLNR-437) so the legend can never disagree with what the renderer
+// actually draws — this is the "same colour source" the task explicitly warns against duplicating.
+const LEGEND_TYPES = ['memory', 'task', 'artifact', 'file', 'plan'] as const;
 
 interface LoadedCommunity {
   page: ApiConstellationV2CommunityPage;
@@ -68,6 +75,9 @@ export function MemoryConstellationV2({
   const [searching, setSearching] = useState(false);
   const [rendererFailure, setRendererFailure] = useState<string | null>(null);
   const [typeFilter, setTypeFilter] = useState('');
+  // Default open, matching the design reference; toggleable per the screen spec ("which the design
+  // exposes as a toggle") — this task's discretion on the default.
+  const [legendOpen, setLegendOpen] = useState(true);
   const [reducedMotion, setReducedMotion] = useState(() => window.matchMedia('(prefers-reduced-motion: reduce)').matches);
   // Space is the 3D scene, Catalogue is the textual peer (PLNR-380). A renderer failure forces
   // Catalogue regardless of this — see `showCatalogue` below — but the human can also choose it deliberately.
@@ -467,6 +477,41 @@ export function MemoryConstellationV2({
           {filteredScene.nodes.map((node) => <button key={node.id} type="button" onClick={() => selectNode(node.id)} onDoubleClick={() => { if (node.community) void expand(node.id); }} style={{ display: 'block', width: '100%', textAlign: 'left', padding: 5 }}>{node.label} <small>({node.type})</small></button>)}
           {currentPage?.nextCursor && <Button onClick={() => void fetchCommunity(currentPage.community.id, currentPage.nextCursor!)}>load next page</Button>}
         </details>}
+        {/* Fixed bottom-left, independent of the top-left status region / accessible-list panel's
+            presence or height — same "no sibling-dependent offset" rule those already follow
+            (PLNR-436/438). Space view only, matching the accessible-list panel's scope. */}
+        {!showCatalogue && <div aria-label="Constellation encoding legend" style={{
+          position: 'absolute', left: 14, bottom: 14, width: 238, background: 'var(--panel)',
+          border: '1px solid var(--line)', borderRadius: 8, padding: 10, fontFamily: 'var(--mono)',
+        }}>
+          <button
+            type="button" onClick={() => setLegendOpen((open) => !open)} aria-expanded={legendOpen}
+            style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%',
+              background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', fontFamily: 'inherit',
+            }}
+          >
+            <span style={{ fontSize: 10, letterSpacing: '.12em', textTransform: 'uppercase', color: 'var(--text-dim)' }}>Encoding</span>
+            <span aria-hidden="true" style={{ color: 'var(--text-faint)', fontSize: 10 }}>{legendOpen ? '−' : '+'}</span>
+          </button>
+          {legendOpen && <>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginTop: 8 }}>
+              {LEGEND_TYPES.map((type) => {
+                const encoding = encodingForType(type);
+                return (
+                  <div key={type} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 }}>
+                    <span aria-hidden="true" style={{ color: `var(${encoding.token})`, fontSize: 16, lineHeight: 1 }}>{CONSTELLATION_SHAPE_GLYPH[encoding.shape]}</span>
+                    <span style={{ color: 'var(--text-soft)' }}>{encoding.label.toLowerCase()}</span>
+                  </div>
+                );
+              })}
+            </div>
+            <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--w-07)', display: 'flex', flexDirection: 'column', gap: 3, fontSize: 9.5, color: 'var(--text-dim)' }}>
+              <span>size = connectivity · brightness = authority</span>
+              <span>amber halo = lead · amber route = selection</span>
+            </div>
+          </>}
+        </div>}
       </div>
     </div>
   );

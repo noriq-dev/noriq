@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type * as Three from 'three';
 import {
-  buildConstellation3DRenderPlan, constellation3DNodeEncoding, type Constellation3DEdge, type Constellation3DEdgeSegment,
+  aggregateRouteWidth, buildConstellation3DRenderPlan, communityTooltipContent, constellation3DColorType,
+  constellation3DNodeEncoding, type Constellation3DEdge, type Constellation3DEdgeSegment, type ConstellationCommunityTooltip,
   type Constellation3DNode, type Constellation3DNodeInstance, type Constellation3DShape,
 } from './constellation-3d-buffers';
 import { encodingForType, resolveConstellationToken } from './constellation-encoding';
@@ -16,6 +17,13 @@ import {
 } from './constellation-3d-navigation';
 
 const LABEL_BUDGET = 24;
+// Layered radial falloff (PLNR-438): outer well at 10% opacity, mid at 22%, both tinted by the
+// community's dominant type — sized as a fixed ratio of the solid core sphere the standard node
+// pass already renders, so "outer radius from aggregate connectivity" (the core's own scale,
+// computed by constellation3DNodeEncoding from degree+authority) drives every layer together
+// rather than needing a second connectivity computation.
+const COMMUNITY_WELL_MID_RATIO = 1.6;
+const COMMUNITY_WELL_OUTER_RATIO = 2.4;
 
 export interface MemoryConstellation3DProps {
   projectId: string;
@@ -36,9 +44,19 @@ export interface MemoryConstellation3DProps {
 interface LabelPosition {
   key: string;
   text: string;
+  /** Second line, community labels only — "N entities" beneath the name (PLNR-438). Undefined
+   *  keeps every other label exactly as single-line as before. */
+  subtext?: string;
   x: number;
   y: number;
   promoted: boolean;
+}
+
+interface HoverTooltip {
+  nodeId: string;
+  content: ConstellationCommunityTooltip;
+  x: number;
+  y: number;
 }
 
 interface RendererState {
@@ -47,9 +65,15 @@ interface RendererState {
   scene: Three.Scene;
   camera: Three.PerspectiveCamera;
   nodeMeshes: Three.InstancedMesh[];
+  // Non-interactive: community gravity-well falloff layers + the hover ring. Disposed alongside
+  // nodeMeshes but never raycast against — intersecting a giant 10%-opacity outer well would steal
+  // clicks from whatever it visually surrounds.
+  decorativeMeshes: Three.Object3D[];
   edgeObjects: Three.Object3D[];
+  nodeById: Map<string, Constellation3DNodeInstance>;
   renderEdges: (selectedNodeId: string | null) => void;
   applyCamera: (camera: Constellation3DCamera) => void;
+  setHover: (node: Constellation3DNodeInstance | null) => void;
   render: () => void;
   dispose: () => void;
 }
@@ -102,6 +126,11 @@ export function MemoryConstellation3D({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<RendererState | null>(null);
   const [labels, setLabels] = useState<LabelPosition[]>([]);
+  // Hover is entirely separate state from `selectedNodeId` (the pin) — nothing in this file ever
+  // writes `hoveredTooltip` into `selectedNodeId`, or calls `onSelectNode` from a hover path. That
+  // separation IS the "hover never overrides a pinned selection" guarantee (PLNR-379/PLNR-438):
+  // there is no shared variable left for a hover to steal.
+  const [hoveredTooltip, setHoveredTooltip] = useState<HoverTooltip | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
   const [layoutNodes, setLayoutNodes] = useState(nodes);
   const priorLayoutRef = useRef<{ generationId: string; layoutVersion: string; positions: Record<string, [number, number, number]> } | undefined>();
@@ -158,6 +187,12 @@ export function MemoryConstellation3D({
         const highlighted = new Set(highlightedNodeIds);
         const plan = buildConstellation3DRenderPlan(layoutNodes, edges, null, LABEL_BUDGET, highlighted);
         const nodeMeshes: Three.InstancedMesh[] = [];
+        const decorativeMeshes: Three.Object3D[] = [];
+        const nodeById = new Map<string, Constellation3DNodeInstance>(layoutNodes.map((node) => {
+          const encoded = constellation3DNodeEncoding(node);
+          encoded.highlighted = highlighted.has(node.id);
+          return [node.id, encoded];
+        }));
         const matrix = new THREE.Matrix4();
         // Type colour is a theme.css token, resolved live off the cascade and cached per token
         // (not per node) — a handful of getComputedStyle calls per scene rebuild, not one per
@@ -183,7 +218,9 @@ export function MemoryConstellation3D({
               matrix.makeScale(scale, scale, scale);
               matrix.setPosition(...node.position);
               mesh.setMatrixAt(index, matrix);
-              mesh.setColorAt(index, colorForType(node.type));
+              // Community aggregates tint by dominant type (PLNR-438 locked decision); every other
+              // node keeps tinting by its own type exactly as PLNR-437 shipped.
+              mesh.setColorAt(index, colorForType(constellation3DColorType(node)));
             });
             mesh.instanceMatrix.needsUpdate = true;
             if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
@@ -213,6 +250,73 @@ export function MemoryConstellation3D({
           nodeMeshes.push(halo);
         }
 
+        // Community gravity wells (PLNR-438): two extra low-opacity layers per community, sized as
+        // a fixed ratio of the solid core sphere the standard node pass above already drew for
+        // every community node — that core IS the third, innermost falloff layer, so this adds
+        // exactly two draw calls total (not two per community) regardless of how many communities
+        // are in the reference frame. depthWrite is off so the layers blend into the well rather
+        // than occluding whatever sits behind them.
+        const communityNodes = [...nodeById.values()].filter((node) => node.community);
+        if (communityNodes.length > 0) {
+          const outer = new THREE.InstancedMesh(
+            new THREE.SphereGeometry(1, 12, 8),
+            new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.1, vertexColors: true, depthWrite: false }),
+            communityNodes.length,
+          );
+          const mid = new THREE.InstancedMesh(
+            new THREE.SphereGeometry(1, 12, 8),
+            new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.22, vertexColors: true, depthWrite: false }),
+            communityNodes.length,
+          );
+          outer.renderOrder = -2;
+          mid.renderOrder = -1;
+          communityNodes.forEach((node, index) => {
+            const color = colorForType(constellation3DColorType(node));
+            const outerScale = node.scale * COMMUNITY_WELL_OUTER_RATIO;
+            matrix.makeScale(outerScale, outerScale, outerScale);
+            matrix.setPosition(...node.position);
+            outer.setMatrixAt(index, matrix);
+            outer.setColorAt(index, color);
+            const midScale = node.scale * COMMUNITY_WELL_MID_RATIO;
+            matrix.makeScale(midScale, midScale, midScale);
+            matrix.setPosition(...node.position);
+            mid.setMatrixAt(index, matrix);
+            mid.setColorAt(index, color);
+          });
+          outer.instanceMatrix.needsUpdate = true;
+          mid.instanceMatrix.needsUpdate = true;
+          if (outer.instanceColor) outer.instanceColor.needsUpdate = true;
+          if (mid.instanceColor) mid.instanceColor.needsUpdate = true;
+          outer.computeBoundingSphere();
+          mid.computeBoundingSphere();
+          scene.add(outer);
+          scene.add(mid);
+          decorativeMeshes.push(outer, mid);
+        }
+
+        // Hover pre-selection ring (PLNR-438): one reusable dashed LineLoop, built once at a unit
+        // radius and repositioned/rescaled per hover via `setHover` below — never rebuilt, so hover
+        // never adds a draw call beyond this single, always-present object. Deliberately NOT
+        // billboarded, matching the existing lead-halo Torus's convention of sitting in its default
+        // plane rather than always facing the camera.
+        const ringSegments = 64;
+        const ringPositions = new Float32Array(ringSegments * 3);
+        for (let index = 0; index < ringSegments; index += 1) {
+          const angle = (index / ringSegments) * Math.PI * 2;
+          ringPositions.set([Math.cos(angle), Math.sin(angle), 0], index * 3);
+        }
+        const ringGeometry = new THREE.BufferGeometry();
+        ringGeometry.setAttribute('position', new THREE.BufferAttribute(ringPositions, 3));
+        const hoverRing = new THREE.LineLoop(
+          ringGeometry,
+          new THREE.LineDashedMaterial({ color: 0xffd166, transparent: true, opacity: 0.8, dashSize: 0.35, gapSize: 0.28, depthTest: false }),
+        );
+        hoverRing.computeLineDistances();
+        hoverRing.visible = false;
+        hoverRing.renderOrder = 20;
+        scene.add(hoverRing);
+        decorativeMeshes.push(hoverRing);
+
         const edgeObjects: Three.Object3D[] = [];
         const clearEdges = () => {
           for (const object of edgeObjects.splice(0)) {
@@ -230,7 +334,10 @@ export function MemoryConstellation3D({
           for (const node of labelNodes) {
             const point = new THREE.Vector3(...node.position).project(camera);
             if (point.z < -1 || point.z > 1 || Math.abs(point.x) > 1 || Math.abs(point.y) > 1) continue;
-            visible.push({ key: `node:${node.id}`, text: node.label, x: (point.x + 1) * width / 2, y: (1 - point.y) * height / 2, promoted: false });
+            // Two-line label for a community: name + entity count (PLNR-438) — one budget entry,
+            // same as before, just carrying a second rendered line.
+            const subtext = node.community ? `${(node.memberCount ?? 0).toLocaleString()} entities` : undefined;
+            visible.push({ key: `node:${node.id}`, text: node.label, subtext, x: (point.x + 1) * width / 2, y: (1 - point.y) * height / 2, promoted: false });
           }
           for (const edge of promoted.slice(0, Math.max(0, LABEL_BUDGET - visible.length))) {
             const point = new THREE.Vector3(...midpoint(edge)).project(camera);
@@ -256,11 +363,52 @@ export function MemoryConstellation3D({
             onRendererFailure?.(reason);
           }
         };
+        const setHover = (node: Constellation3DNodeInstance | null) => {
+          if (!node) { if (hoverRing.visible) { hoverRing.visible = false; render(); } return; }
+          const ringScale = node.scale * COMMUNITY_WELL_OUTER_RATIO * 1.08;
+          hoverRing.position.set(...node.position);
+          hoverRing.scale.setScalar(ringScale);
+          hoverRing.visible = true;
+          render();
+        };
         const renderEdges = (selection: string | null) => {
           clearEdges();
           const selectedPlan = buildConstellation3DRenderPlan(layoutNodes, edges, selection, LABEL_BUDGET, highlighted);
-          const base = lineObject(THREE, selectedPlan.baseEdges, theme === 'dark' ? 0x7790aa : 0x506070, selection ? 0.1 : 0.38, 0);
+          // Aggregate community-to-community routes render as instanced tubes, not thin lines — a
+          // `LineBasicMaterial.linewidth` is silently clamped to 1px on most WebGL backends, so it
+          // cannot honestly carry "route thickness maps to boundary weight" (PLNR-438 locked
+          // decision). A tube radius can. This is also what keeps aggregate routes visually
+          // distinct from raw entity edges (PLNR-379): different geometry, not just a numeric
+          // width difference on the same thin-line pass.
+          const rawBaseEdges = selectedPlan.baseEdges.filter((edge) => !edge.aggregate);
+          const aggregateBaseEdges = selectedPlan.baseEdges.filter((edge) => edge.aggregate);
+          const base = lineObject(THREE, rawBaseEdges, theme === 'dark' ? 0x7790aa : 0x506070, selection ? 0.1 : 0.38, 0);
           if (base) { scene.add(base); edgeObjects.push(base); }
+          if (aggregateBaseEdges.length > 0) {
+            const weights = aggregateBaseEdges.map((edge) => edge.weight);
+            const minWeight = Math.min(...weights), maxWeight = Math.max(...weights);
+            const routes = new THREE.InstancedMesh(
+              new THREE.CylinderGeometry(1, 1, 1, 5, 1, true),
+              new THREE.MeshBasicMaterial({ color: theme === 'dark' ? 0x7790aa : 0x506070, transparent: true, opacity: selection ? 0.12 : 0.32, depthWrite: false }),
+              aggregateBaseEdges.length,
+            );
+            routes.renderOrder = 1;
+            const up = new THREE.Vector3(0, 1, 0);
+            aggregateBaseEdges.forEach((edge, index) => {
+              const from = new THREE.Vector3(...edge.from), to = new THREE.Vector3(...edge.to);
+              const mid = from.clone().add(to).multiplyScalar(0.5);
+              const length = Math.max(0.01, from.distanceTo(to));
+              const direction = to.clone().sub(from).normalize();
+              const quaternion = new THREE.Quaternion().setFromUnitVectors(up, direction);
+              const radius = aggregateRouteWidth(edge.weight, minWeight, maxWeight) * 0.5;
+              matrix.compose(mid, quaternion, new THREE.Vector3(radius, length, radius));
+              routes.setMatrixAt(index, matrix);
+            });
+            routes.instanceMatrix.needsUpdate = true;
+            routes.computeBoundingSphere();
+            scene.add(routes);
+            edgeObjects.push(routes);
+          }
           const promoted = lineObject(THREE, selectedPlan.promotedEdges, theme === 'dark' ? 0xffd166 : 0x8a5a00, 1, 10);
           if (promoted) { scene.add(promoted); edgeObjects.push(promoted); }
           const directed = selectedPlan.promotedEdges.filter((edge) => edge.directionMarker);
@@ -308,13 +456,15 @@ export function MemoryConstellation3D({
         }
 
         rendererRef.current = {
-          THREE, renderer, scene, camera, nodeMeshes, edgeObjects, renderEdges, applyCamera, render,
+          THREE, renderer, scene, camera, nodeMeshes, decorativeMeshes, edgeObjects, nodeById, renderEdges, applyCamera, setHover, render,
           dispose: () => {
             clearEdges();
-            for (const mesh of nodeMeshes) {
-              scene.remove(mesh); mesh.geometry.dispose();
-              const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-              materials.forEach((material) => material.dispose());
+            for (const mesh of [...nodeMeshes, ...decorativeMeshes]) {
+              scene.remove(mesh);
+              const renderable = mesh as Three.LineLoop | Three.InstancedMesh;
+              renderable.geometry?.dispose();
+              const materials = Array.isArray(renderable.material) ? renderable.material : [renderable.material];
+              materials.filter(Boolean).forEach((material) => material.dispose());
             }
             renderer.dispose();
           },
@@ -394,6 +544,35 @@ export function MemoryConstellation3D({
     onSelectNode?.(null);
   };
 
+  // Hover is scoped to community supernodes only — entity-level hover belongs to the deferred
+  // Phase 3 selection/promoted-edge treatment. Every path here writes local `hoveredTooltip` state
+  // (or the renderer's own hover-ring visibility) and NEVER `selectedNodeId`/`onSelectNode` — that
+  // is the entire mechanism behind "hover never overrides a pinned selection" (PLNR-379/PLNR-438).
+  const hoverAt = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    const state = rendererRef.current;
+    if (!state) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const pointer = new state.THREE.Vector2((event.clientX - rect.left) / rect.width * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
+    const raycaster = new state.THREE.Raycaster();
+    raycaster.setFromCamera(pointer, state.camera);
+    for (const hit of raycaster.intersectObjects(state.nodeMeshes, false)) {
+      if (hit.instanceId === undefined) continue;
+      const nodeId = (hit.object.userData.nodeIds as string[] | undefined)?.[hit.instanceId];
+      const node = nodeId ? state.nodeById.get(nodeId) : undefined;
+      const content = node ? communityTooltipContent(node) : null;
+      if (node && content) {
+        const point = new state.THREE.Vector3(...node.position).project(state.camera);
+        const width = rect.width || 1, height = rect.height || 1;
+        state.setHover(node);
+        setHoveredTooltip({ nodeId: node.id, content, x: (point.x + 1) * width / 2, y: (1 - point.y) * height / 2 });
+        return;
+      }
+    }
+    state.setHover(null);
+    setHoveredTooltip(null);
+  };
+  const clearHover = () => { rendererRef.current?.setHover(null); setHoveredTooltip(null); };
+
   const dolly = (event: React.WheelEvent<HTMLCanvasElement>) => {
     event.preventDefault();
     cancelTransition();
@@ -407,7 +586,7 @@ export function MemoryConstellation3D({
   };
   const pointerMove = (event: React.PointerEvent<HTMLCanvasElement>) => {
     const drag = dragRef.current;
-    if (!drag) return;
+    if (!drag) { hoverAt(event); return; }
     const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
     setCameraState(drag.mode === 'orbit' ? orbitConstellationCamera(drag.camera, dx, dy) : panConstellationCamera(drag.camera, dx, dy));
   };
@@ -435,7 +614,7 @@ export function MemoryConstellation3D({
 
   return (
     <div ref={hostRef} style={{ position: 'absolute', inset: 0, overflow: 'hidden' }} data-reduced-motion={reducedMotion ? 'true' : 'false'}>
-      <canvas ref={canvasRef} tabIndex={0} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onWheel={dolly} onKeyDown={keyDown} onContextMenu={(event) => event.preventDefault()} style={{ width: '100%', height: '100%', display: 'block', touchAction: 'none' }} aria-label={`3D memory constellation with ${layoutNodes.length} visible items. Arrow keys move selection; E opens ego network; I opens evidence inspector.`} />
+      <canvas ref={canvasRef} tabIndex={0} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerLeave={clearHover} onWheel={dolly} onKeyDown={keyDown} onContextMenu={(event) => event.preventDefault()} style={{ width: '100%', height: '100%', display: 'block', touchAction: 'none' }} aria-label={`3D memory constellation with ${layoutNodes.length} visible items. Arrow keys move selection; E opens ego network; I opens evidence inspector.`} />
       <div style={{ position: 'absolute', right: 10, top: 10, display: 'flex', gap: 6 }}>
         <button type="button" onClick={() => transitionTo(DEFAULT_CONSTELLATION_3D_CAMERA)}>home</button>
         <button type="button" disabled={!selectedNodeId} onClick={() => {
@@ -444,9 +623,56 @@ export function MemoryConstellation3D({
         }}>focus</button>
       </div>
       {labels.map((label) => (
-        <span key={label.key} style={{ position: 'absolute', left: label.x, top: label.y, transform: 'translate(-50%, -50%)', pointerEvents: 'none', fontFamily: 'var(--mono)', fontSize: label.promoted ? 11 : 10, fontWeight: label.promoted ? 700 : 500, color: label.promoted ? 'var(--amber)' : 'var(--text-soft)', textShadow: '0 1px 4px var(--bg)' }}>{label.text}</span>
+        <div key={label.key} style={{ position: 'absolute', left: label.x, top: label.y, transform: 'translate(-50%, -50%)', pointerEvents: 'none', textAlign: 'center', textShadow: '0 1px 4px var(--bg)' }}>
+          <div style={{ fontFamily: 'var(--mono)', fontSize: label.promoted ? 11 : 10.5, fontWeight: label.promoted ? 700 : 500, color: label.promoted ? 'var(--amber)' : 'var(--text-soft)' }}>{label.text}</div>
+          {label.subtext && <div style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-dim)' }}>{label.subtext}</div>}
+        </div>
       ))}
+      {hoveredTooltip && <ConstellationHoverTooltip tooltip={hoveredTooltip} hostRef={hostRef} />}
       {failure && <div role="status" style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: 'var(--text-dim)', fontSize: 12 }}>3D view unavailable: {failure}</div>}
+    </div>
+  );
+}
+
+const TOOLTIP_WIDTH = 230;
+
+/** The overview hover tooltip (PLNR-438) — DOM over canvas, positioned from the already-projected
+ * screen coordinates `hoverAt` computed (the same technique labels already use), clamped so it
+ * never runs off the viewport edge (this task's placement-strategy discretion). Content comes
+ * entirely from `communityTooltipContent`, a pure function unit-tested in
+ * constellation-3d-buffers.test.ts without WebGL. */
+function ConstellationHoverTooltip({ tooltip, hostRef }: { tooltip: HoverTooltip; hostRef: React.RefObject<HTMLDivElement> }) {
+  const hostWidth = hostRef.current?.clientWidth ?? TOOLTIP_WIDTH + 40;
+  const hostHeight = hostRef.current?.clientHeight ?? 300;
+  const left = Math.min(Math.max(tooltip.x + 16, 8), Math.max(8, hostWidth - TOOLTIP_WIDTH - 8));
+  const top = Math.min(Math.max(tooltip.y - 24, 8), Math.max(8, hostHeight - 140));
+  return (
+    <div
+      role="tooltip"
+      style={{
+        position: 'absolute', left, top, width: TOOLTIP_WIDTH, padding: 10, pointerEvents: 'none', zIndex: 2,
+        background: 'rgba(16,18,22,.94)', border: '1px solid var(--w-1)', borderRadius: 9, backdropFilter: 'blur(8px)',
+      }}
+    >
+      <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text)' }}>{tooltip.content.name}</div>
+      <div style={{ marginTop: 3, fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>
+        {tooltip.content.entityCount.toLocaleString()} entities · {tooltip.content.boundaryRouteCount.toLocaleString()} boundary routes
+      </div>
+      {tooltip.content.topTypeCounts.length > 0 && (
+        <div style={{ display: 'flex', gap: 5, marginTop: 7, flexWrap: 'wrap' }}>
+          {tooltip.content.topTypeCounts.map(({ type, count }) => {
+            const encoding = encodingForType(type);
+            return (
+              <span key={type} style={{ fontFamily: 'var(--mono)', fontSize: 9, padding: '1px 6px', borderRadius: 4, background: 'var(--w-06)', color: `var(${encoding.token})` }}>
+                {encoding.label.toLowerCase()} {count}
+              </span>
+            );
+          })}
+        </div>
+      )}
+      <div style={{ marginTop: 8, paddingTop: 6, borderTop: '1px solid var(--w-07)', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>
+        {tooltip.content.affordance}
+      </div>
     </div>
   );
 }

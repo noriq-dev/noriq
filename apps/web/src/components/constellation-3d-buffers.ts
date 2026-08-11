@@ -16,6 +16,17 @@ export interface Constellation3DNode {
   community?: boolean;
   parentId?: string | null;
   radius?: number;
+  /** Community aggregates only (PLNR-438) — entity count backing the community, straight off
+   *  `ApiConstellationV2Community.memberCount`. `degree` on a community node is `internalEdgeCount`,
+   *  not an entity count, so the two-line label and hover tooltip need this separately. */
+  memberCount?: number;
+  /** Community aggregates only — `ApiConstellationV2Community.typeCounts` verbatim, the source
+   *  the dominant-type tint and the tooltip's top-type-count rows both read from. */
+  typeCounts?: Record<string, number>;
+  /** Community aggregates only — sum of `ApiConstellationV2RouteEdge.count` across every boundary
+   *  route touching this community (computed in constellation-v2-scene.ts, where the routes are
+   *  in scope). Distinct from `degree`/internalEdgeCount, which counts INTERNAL edges only. */
+  boundaryRouteCount?: number;
 }
 
 export interface Constellation3DEdge {
@@ -58,11 +69,69 @@ export interface Constellation3DRenderPlan {
 
 // Shape/scale-multiplier both come from the shared type encoding table (PLNR-437) — this module
 // no longer owns type→shape grouping itself, it just applies the table's per-node consequences
-// (community aggregates are the one case the table doesn't cover: they render as `sphere`
-// regardless of dominant member type until PLNR-438's community-well treatment lands).
+// (community aggregates are the one case the table doesn't cover: shape stays `sphere` regardless
+// of dominant member type — the community "gravity well" is a distinct visual family from any
+// single entity shape — but colour DOES follow the dominant type; see `constellation3DColorType`).
 export function constellation3DShape(node: Constellation3DNode): Constellation3DShape {
   if (node.community) return 'sphere';
   return encodingForType(node.type).shape;
+}
+
+/** `typeCounts` sorted by count desc, count ties broken alphabetically for determinism — the one
+ * ranking both the dominant-type tint and the tooltip's top-type rows read from, so the two can
+ * never disagree about which type is "dominant". */
+function sortedTypeCounts(typeCounts: Record<string, number> | undefined): Array<[string, number]> {
+  return Object.entries(typeCounts ?? {}).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+}
+
+/** A community's dominant entity type, straight off `typeCounts` (PLNR-438 locked decision: the
+ * overview response already carries this — no extra request). Null when a node has no counts to
+ * rank (not a community, or a community with an empty membership). */
+export function dominantCommunityType(node: Pick<Constellation3DNode, 'typeCounts'>): string | null {
+  return sortedTypeCounts(node.typeCounts)[0]?.[0] ?? null;
+}
+
+/** The type key `colorForType` (MemoryConstellation3D.tsx) should resolve a node's tint against —
+ * a community's dominant type, or the node's own type for anything else. One function so the
+ * renderer and any DOM consumer read colour off the identical decision. Falls through to
+ * `encodingForType`'s own 'unknown' handling when a community has no typeCounts to rank. */
+export function constellation3DColorType(node: Constellation3DNode): string {
+  return node.community ? dominantCommunityType(node) ?? 'unknown' : node.type;
+}
+
+export interface ConstellationCommunityTooltip {
+  name: string;
+  entityCount: number;
+  boundaryRouteCount: number;
+  topTypeCounts: Array<{ type: string; count: number }>;
+  affordance: string;
+}
+
+/** The overview hover tooltip's content (PLNR-438) — a pure data transform, kept separate from
+ * the DOM/positioning concern so it is unit-testable without WebGL. Null for a non-community node:
+ * this task's hover treatment is scoped to community supernodes only (entity-level hover is
+ * Phase 3 selection/promoted-edge work, deliberately deferred). */
+export function communityTooltipContent(node: Constellation3DNode, maxTypeRows = 3): ConstellationCommunityTooltip | null {
+  if (!node.community) return null;
+  return {
+    name: node.label,
+    entityCount: node.memberCount ?? 0,
+    boundaryRouteCount: node.boundaryRouteCount ?? 0,
+    topTypeCounts: sortedTypeCounts(node.typeCounts).slice(0, maxTypeRows).map(([type, count]) => ({ type, count })),
+    affordance: 'click to select · double-click to open',
+  };
+}
+
+/** Aggregate route thickness maps to boundary weight (PLNR-438 locked decision, PLNR-379). Mirrors
+ * the screen spec's 0.8–2.4 stroke-width range, min/max-normalized against whatever aggregate
+ * weights are actually present in the current plan — a scene with one boundary weight gets the
+ * range's midpoint rather than a divide-by-zero. The renderer applies this as an instanced tube
+ * RADIUS (not a `LineBasicMaterial.linewidth`, which most browsers silently clamp to 1px) — see
+ * MemoryConstellation3D.tsx's `renderEdges`. */
+export function aggregateRouteWidth(weight: number, minWeight: number, maxWeight: number): number {
+  if (!Number.isFinite(weight) || maxWeight <= minWeight) return 1.6;
+  const t = Math.max(0, Math.min(1, (weight - minWeight) / (maxWeight - minWeight)));
+  return 0.8 + t * 1.6;
 }
 
 export function constellation3DNodeEncoding(node: Constellation3DNode): Constellation3DNodeInstance {
@@ -105,6 +174,12 @@ export function buildConstellation3DRenderPlan(
     else nodeGroups.set(node.shape, [node]);
   }
 
+  // Normalized once per plan, over every aggregate edge regardless of selection state, so the
+  // width band stays stable as a node gets selected/deselected rather than rescaling under it.
+  const aggregateWeights = edges.filter((edge) => edge.aggregate).map((edge) => edge.weight);
+  const minAggregateWeight = aggregateWeights.length ? Math.min(...aggregateWeights) : 0;
+  const maxAggregateWeight = aggregateWeights.length ? Math.max(...aggregateWeights) : 0;
+
   const baseEdges: Constellation3DEdgeSegment[] = [];
   const promotedEdges: Constellation3DEdgeSegment[] = [];
   for (const edge of edges) {
@@ -115,7 +190,7 @@ export function buildConstellation3DRenderPlan(
     const state: Constellation3DEdgeState = selectedIncident ? 'selected-incident' : selectedNodeId ? 'unrelated-dimmed' : 'base';
     const segment: Constellation3DEdgeSegment = {
       ...edge, from: from.position, to: to.position, state,
-      width: selectedIncident ? 3 : edge.aggregate ? 1.4 : 1,
+      width: selectedIncident ? 3 : edge.aggregate ? aggregateRouteWidth(edge.weight, minAggregateWeight, maxAggregateWeight) : 1,
       opacity: selectedIncident ? 1 : state === 'unrelated-dimmed' ? 0.1 : edge.aggregate ? 0.42 : 0.3,
       directionMarker: edge.direction !== 'both',
     };
@@ -123,7 +198,16 @@ export function buildConstellation3DRenderPlan(
   }
 
   const labels = [...byId.values()].sort((a, b) => compareLabelPriority(a, b, selectedNodeId)).slice(0, Math.max(0, labelBudget));
-  // Five shape meshes + lead halo mesh + base/promoted line passes + promoted direction markers.
-  const drawCallCeiling = nodeGroups.size * 2 + (nodes.some((node) => node.isLead) ? 1 : 0) + 3;
+  // Five shape meshes (faded/unfaded) + lead halo mesh + community gravity-well falloff (outer +
+  // mid, only when a community node is present — never for the pure-entity 12k fixture) +
+  // aggregate-route instanced tubes (only when an aggregate edge is present) + base/promoted line
+  // passes + promoted direction markers. The hover pre-selection ring is deliberately NOT counted
+  // here: it is one reusable Object3D that never scales with node/edge count (see
+  // MemoryConstellation3D.tsx), the same reason the camera-control DOM buttons aren't counted.
+  const drawCallCeiling = nodeGroups.size * 2
+    + (nodes.some((node) => node.isLead) ? 1 : 0)
+    + (nodes.some((node) => node.community) ? 2 : 0)
+    + (aggregateWeights.length > 0 ? 1 : 0)
+    + 3;
   return { nodeGroups, baseEdges, promotedEdges, labels, nodeCount: byId.size, drawCallCeiling };
 }

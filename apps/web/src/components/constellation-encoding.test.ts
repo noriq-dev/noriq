@@ -2,7 +2,9 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { MemoryNodeType } from '@noriq-dev/shared';
 import { describe, expect, it } from 'vitest';
-import { CONSTELLATION_TYPE_ENCODING, encodingForType, resolveConstellationToken } from './constellation-encoding';
+import {
+  CONSTELLATION_SHAPE_GLYPH, CONSTELLATION_TYPE_ENCODING, type Constellation3DShape, encodingForType, resolveConstellationToken,
+} from './constellation-encoding';
 
 // theme.css itself, read as text — same pattern theme.mobile.test.ts already uses to assert on
 // the stylesheet without a jsdom CSS engine standing in for a real browser cascade.
@@ -63,5 +65,11 @@ describe('constellation type encoding (PLNR-437)', () => {
     // This test's jsdom document has no theme.css loaded, so the custom property resolves empty —
     // the same branch a non-browser context (`typeof document === 'undefined'`) takes.
     expect(resolveConstellationToken('--accent', '#fallback')).toBe('#fallback');
+  });
+
+  it('has a distinct DOM glyph for every Constellation3DShape (PLNR-438 legend)', () => {
+    const shapes: Constellation3DShape[] = ['sphere', 'box', 'octahedron', 'cone', 'dodecahedron'];
+    for (const shape of shapes) expect(CONSTELLATION_SHAPE_GLYPH[shape], `no glyph for shape "${shape}"`).toBeTruthy();
+    expect(new Set(Object.values(CONSTELLATION_SHAPE_GLYPH)).size).toBe(shapes.length);
   });
 });

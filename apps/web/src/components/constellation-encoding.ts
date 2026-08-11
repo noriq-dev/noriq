@@ -17,6 +17,13 @@ import { MemoryNodeType } from '@noriq-dev/shared';
 
 export type Constellation3DShape = 'sphere' | 'box' | 'octahedron' | 'cone' | 'dodecahedron';
 
+/** A DOM-safe glyph per shape — the legend panel (PLNR-438) and any other flat-text consumer draw
+ * this instead of reaching for a `geometryFor()`-shaped mesh. One table so canvas geometry and DOM
+ * glyph never drift apart the way the old hash palette did (see this file's own history, PLNR-437). */
+export const CONSTELLATION_SHAPE_GLYPH: Readonly<Record<Constellation3DShape, string>> = Object.freeze({
+  sphere: '●', box: '■', octahedron: '◆', cone: '▲', dodecahedron: '⬟',
+});
+
 export interface ConstellationTypeEncoding {
   /** A `nodes.type` / `MemoryNodeType` value (packages/shared/src/memory.ts) — the graph's own
    *  entity-kind vocabulary, not a UI invention. */

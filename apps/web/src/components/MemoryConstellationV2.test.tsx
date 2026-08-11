@@ -3,9 +3,14 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { api, type ApiConstellationV2CommunityPage, type ApiConstellationV2Revision } from '../api';
 
+// Mutable via `vi.hoisted` so individual tests can reach Space view (the mock stays a WebGL-free
+// stand-in either way — real MemoryConstellation3D needs a WebGL context jsdom cannot provide —
+// but most of this file wants the always-reachable Catalogue peer, and only the legend test
+// (PLNR-438, Space-view-only chrome) needs to opt out of the forced failure).
+const mockRenderer3D = vi.hoisted(() => ({ failOnMount: true }));
 vi.mock('./MemoryConstellation3D', () => ({
   default: (props: { onRendererFailure?: (reason: string) => void }) => {
-    useEffect(() => props.onRendererFailure?.('WebGL2 unavailable in test'), [props.onRendererFailure]);
+    useEffect(() => { if (mockRenderer3D.failOnMount) props.onRendererFailure?.('WebGL2 unavailable in test'); }, [props.onRendererFailure]);
     return null;
   },
 }));
@@ -26,6 +31,7 @@ const tick = (ms = 0) => act(async () => { await new Promise((resolve) => setTim
 
 afterEach(() => {
   act(() => root?.unmount()); root = null; host?.remove(); vi.restoreAllMocks();
+  mockRenderer3D.failOnMount = true;
 });
 
 describe('MemoryConstellationV2 graceful textual parity', () => {
@@ -199,5 +205,42 @@ describe('MemoryConstellationV2 status region (PLNR-436)', () => {
     // suite — the top-of-file MemoryConstellation3D mock always fires onRendererFailure, which
     // forces Catalogue. Its no-longer-conditional `top: 42` offset is verified by reading the
     // component source, not by a DOM assertion here.
+  });
+});
+
+describe('MemoryConstellationV2 encoding legend (PLNR-438)', () => {
+  it('states the five primary type rows plus the size/brightness/halo/route sentence, and can be toggled', async () => {
+    // Opts out of the file's default forced-failure mock so Space view (where the legend lives)
+    // is actually reachable — this is the one thing in this suite that needs it.
+    mockRenderer3D.failOnMount = false;
+    vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision, communities: [rootCommunity], routes: [], coverage: { complete: true, reasons: [] } });
+    host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
+    act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
+    await tick(); await tick();
+
+    // Space view actually rendered (no forced Catalogue fallback this time).
+    expect(host.textContent).not.toContain('3D view unavailable');
+    const legend = host.querySelector('[aria-label="Constellation encoding legend"]') as HTMLElement;
+    expect(legend).toBeTruthy();
+
+    // Default open (this task's discretion) — every primary row from the Navigator conventions
+    // doc §1 table, reading the exact same encoding table the renderer draws from.
+    expect(legend.textContent).toContain('memory');
+    expect(legend.textContent).toContain('task');
+    expect(legend.textContent).toContain('doc');
+    expect(legend.textContent).toContain('file');
+    expect(legend.textContent).toContain('plan');
+    expect(legend.textContent).toContain('size = connectivity · brightness = authority');
+    expect(legend.textContent).toContain('amber halo = lead · amber route = selection');
+
+    // Toggleable, per the screen spec ("which the design exposes as a toggle").
+    const toggle = legend.querySelector('button[aria-expanded]') as HTMLButtonElement;
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    act(() => toggle.click());
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(legend.textContent).not.toContain('size = connectivity');
+    act(() => toggle.click());
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(legend.textContent).toContain('size = connectivity · brightness = authority');
   });
 });

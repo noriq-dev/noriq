@@ -12,10 +12,11 @@ export interface ConstellationV2Scene {
   currentCommunity: ApiConstellationV2Community | null;
   partial: boolean;
 }
-const communityNode = (community: ApiConstellationV2Community): Constellation3DNode => ({
+const communityNode = (community: ApiConstellationV2Community, boundaryRouteCount = 0): Constellation3DNode => ({
   id: community.id, uri: null, label: community.label, type: 'community', position: community.anchor,
   degree: community.internalEdgeCount, community: true, parentId: community.parentId,
   radius: Math.max(45, Math.min(180, Math.sqrt(community.memberCount) * 9)),
+  memberCount: community.memberCount, typeCounts: community.typeCounts, boundaryRouteCount,
 });
 
 export function assembleConstellationV2Scene(
@@ -28,7 +29,18 @@ export function assembleConstellationV2Scene(
   const visibleCommunities = page
     ? page.kind === 'communities' ? page.communities : []
     : overview.communities;
-  for (const community of [...visibleCommunities, ...(page?.externalCommunities ?? [])]) nodes.set(community.id, communityNode(community));
+  // Sum of underlying-edge counts (route.count, not route.weight) across every boundary route
+  // touching a community — the "N boundary routes" figure the hover tooltip states (PLNR-438).
+  // Computed from the same route list `assembleConstellationV2Scene` already uses for edges below,
+  // so it can never disagree with what the scene actually renders.
+  const boundaryRouteCounts = new Map<string, number>();
+  for (const route of page?.routes ?? overview.routes) {
+    boundaryRouteCounts.set(route.fromCommunityId, (boundaryRouteCounts.get(route.fromCommunityId) ?? 0) + route.count);
+    boundaryRouteCounts.set(route.toCommunityId, (boundaryRouteCounts.get(route.toCommunityId) ?? 0) + route.count);
+  }
+  for (const community of [...visibleCommunities, ...(page?.externalCommunities ?? [])]) {
+    nodes.set(community.id, communityNode(community, boundaryRouteCounts.get(community.id) ?? 0));
+  }
   for (const entity of page?.entities ?? []) nodes.set(entity.nodeId, {
     id: entity.nodeId, uri: entity.uri, label: entity.label, type: entity.type, position: entity.position,
     degree: entity.degree, authority: entity.authority, validity: entity.validity, isLead: entity.isLead,

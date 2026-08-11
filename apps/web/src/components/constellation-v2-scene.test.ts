@@ -53,6 +53,31 @@ describe('Constellation v2 scene assembly', () => {
     expect(assembleConstellationV2Scene(overview, merged, []).edges).toEqual(base.edges);
   });
 
+  it('carries memberCount/typeCounts onto every community node and sums boundary route counts from the routes actually rendered (PLNR-438)', () => {
+    const scene = assembleConstellationV2Scene(overview, null, []);
+    const root = scene.nodes.find((n) => n.id === 'root')!;
+    const other = scene.nodes.find((n) => n.id === 'other')!;
+    expect(root.memberCount).toBe(2);
+    expect(root.typeCounts).toEqual({ memory: 1, task: 1 });
+    // overview.routes has a single root<->other route with count: 1 — both endpoints see it.
+    expect(root.boundaryRouteCount).toBe(1);
+    expect(other.boundaryRouteCount).toBe(1);
+  });
+
+  it('sums multiple boundary routes touching the same community, using route.count not route.weight', () => {
+    const busyOverview: ApiConstellationV2Overview = {
+      revision, communities: [community('hub'), community('a'), community('b')],
+      routes: [
+        { fromCommunityId: 'hub', toCommunityId: 'a', direction: 'forward', count: 12, weight: 2, byType: {} },
+        { fromCommunityId: 'b', toCommunityId: 'hub', direction: 'forward', count: 30, weight: 99, byType: {} },
+      ],
+      coverage: { complete: true, reasons: [] },
+    };
+    const scene = assembleConstellationV2Scene(busyOverview, null, []);
+    const hub = scene.nodes.find((n) => n.id === 'hub')!;
+    expect(hub.boundaryRouteCount).toBe(42); // 12 + 30, not 101 (which would be summing weight instead)
+  });
+
   it('evicts oldest collapsed pages before pinned route pages', () => {
     const result = evictConstellationPages([
       { communityId: 'old', value: 1, nodeCount: 6, touchedAt: 1, pinned: false },
