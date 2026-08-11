@@ -88,7 +88,8 @@ import {
 import { auditAuthorizationParity, reconcileLegacyGroupGrants } from './lib/authorization-parity';
 import { evaluateMemoryAcceptance } from './memory/acceptance';
 import {
-  compactConstellationCommunityPage, compactConstellationIncidentPage, CONSTELLATION_V2_COMPACT_MEDIA_TYPE,
+  compactConstellationCommunityPage, compactConstellationIncidentPage, constellationEtagInput,
+  CONSTELLATION_V2_COMPACT_MEDIA_TYPE,
   type ConstellationV2Revision, type ConstellationV2Unavailable,
 } from './memory/constellation-v2';
 import {
@@ -2053,10 +2054,7 @@ const constellationUnavailableResponse = (c: Context<AppContext>, result: Conste
 };
 
 const constellationEtag = async (revision: ConstellationV2Revision, identity: string, representation: string) =>
-  `"${(await sha256Hex([
-    revision.contract, revision.generationId, revision.currentRevision, revision.topologyVersion,
-    revision.layoutVersion, identity, representation,
-  ].join('\n'))).slice(0, 32)}"`;
+  `"${(await sha256Hex(constellationEtagInput(revision, identity, representation))).slice(0, 32)}"`;
 
 const ifNoneMatchIncludes = (raw: string | undefined, etag: string) =>
   raw?.split(',').some((candidate) => candidate.trim() === etag || candidate.trim() === '*') === true;

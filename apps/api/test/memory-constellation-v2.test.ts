@@ -9,6 +9,7 @@ import {
   type ConstellationV2CommunityPage, type ConstellationV2IncidentPage, type ConstellationV2Overview,
   type ConstellationV2Route, type ConstellationV2Unavailable,
 } from '../src/memory/constellation-v2';
+import { sha256Hex } from '../src/lib/util';
 
 const appEnv = env as unknown as Env;
 const SYSTEM = { kind: 'system', id: null };
@@ -182,7 +183,8 @@ describe('Constellation v2 REST authorization and availability', () => {
     await memory(pid).writeNode(pid, { type: 'memory', uri: 'noriq://memory/v2-rest', label: 'rest', actor: SYSTEM });
     await memory(pid).rebuildConstellationHierarchy(pid);
 
-    const response = await SELF.fetch(`https://noriq.test/api/projects/${pid}/memory/constellation/v2/overview`, { headers: { Cookie: cookie } });
+    const overviewUrl = `https://noriq.test/api/projects/${pid}/memory/constellation/v2/overview`;
+    const response = await SELF.fetch(overviewUrl, { headers: { Cookie: cookie } });
     expect(response.status).toBe(200);
     const etag = response.headers.get('ETag');
     expect(etag).toMatch(/^"[a-f0-9]{32}"$/);
@@ -192,7 +194,12 @@ describe('Constellation v2 REST authorization and availability', () => {
     const overviewBody = await response.json() as ConstellationV2Overview;
     expect(overviewBody.communities).toHaveLength(1);
 
-    const unchanged = await SELF.fetch(`https://noriq.test/api/projects/${pid}/memory/constellation/v2/overview`, {
+    const stable = await SELF.fetch(overviewUrl, { headers: { Cookie: cookie } });
+    expect(stable.status).toBe(200);
+    expect(stable.headers.get('ETag')).toBe(etag);
+    expect(await stable.json()).toEqual(overviewBody);
+
+    const unchanged = await SELF.fetch(overviewUrl, {
       headers: { Cookie: cookie, 'If-None-Match': etag! },
     });
     expect(unchanged.status).toBe(304);
@@ -200,8 +207,23 @@ describe('Constellation v2 REST authorization and availability', () => {
     expect(unchanged.headers.get('X-Noriq-Constellation-Cache')).toBe('hit');
     expect(unchanged.headers.get('X-Noriq-Constellation-Rows')).toBe('0');
 
+    const oldEtagInput = [
+      overviewBody.revision.contract, overviewBody.revision.generationId, overviewBody.revision.currentRevision,
+      overviewBody.revision.topologyVersion, overviewBody.revision.layoutVersion,
+      new URL(overviewUrl).pathname, 'verbose-v1',
+    ].join('\n');
+    const oldEtag = `"${(await sha256Hex(oldEtagInput)).slice(0, 32)}"`;
+    expect(oldEtag).not.toBe(etag);
+    const staleReadVersion = await SELF.fetch(overviewUrl, {
+      headers: { Cookie: cookie, 'If-None-Match': oldEtag },
+    });
+    expect(staleReadVersion.status).toBe(200);
+    expect(staleReadVersion.headers.get('ETag')).toBe(etag);
+    expect(staleReadVersion.headers.get('X-Noriq-Constellation-Cache')).toBe('miss');
+    expect(await staleReadVersion.json()).toEqual(overviewBody);
+
     await memory(pid).writeNode(pid, { type: 'memory', uri: 'noriq://memory/v2-rest-newer', label: 'newer', actor: SYSTEM });
-    const stale = await SELF.fetch(`https://noriq.test/api/projects/${pid}/memory/constellation/v2/overview`, {
+    const stale = await SELF.fetch(overviewUrl, {
       headers: { Cookie: cookie, 'If-None-Match': etag! },
     });
     expect(stale.status).toBe(200);

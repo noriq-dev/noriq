@@ -4,6 +4,9 @@ export const CONSTELLATION_V2_DEFAULT_INCIDENT_LIMIT = 256;
 export const CONSTELLATION_V2_MAX_INCIDENT_LIMIT = 500;
 export const CONSTELLATION_V2_MAX_OVERVIEW_ROUTES = 512;
 export const CONSTELLATION_V2_COMPACT_MEDIA_TYPE = 'application/vnd.noriq.constellation-v2.compact+json';
+// Bump for every read-time response derivation change (position math, compact shapes, or fields):
+// PLNR-465 changed positions without a revision bump and stranded returning browsers on stale 304 bodies.
+export const CONSTELLATION_READ_VERSION = 'read-v2';
 
 export interface ConstellationV2Revision {
   contract: 'constellation-v2';
@@ -126,6 +129,17 @@ export type ConstellationV2Unavailable = {
   currentRevision: number;
   retryAfter?: number;
 };
+
+export function constellationEtagInput(
+  revision: ConstellationV2Revision,
+  identity: string,
+  representation: string,
+): string {
+  return [
+    revision.contract, revision.generationId, revision.currentRevision, revision.topologyVersion,
+    revision.layoutVersion, CONSTELLATION_READ_VERSION, identity, representation,
+  ].join('\n');
+}
 
 export interface ConstellationV2CompactDictionary {
   ids: string[];
