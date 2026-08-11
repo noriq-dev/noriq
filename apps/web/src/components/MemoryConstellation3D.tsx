@@ -2,8 +2,9 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type * as Three from 'three';
 import {
   buildConstellation3DRenderPlan, communityEntitySubtext, communityIgniteSubtext, communityTooltipContent,
-  constellation3DColorType, constellation3DCommunityWellScale, constellation3DIsDimmed, constellation3DIsRootScene,
-  constellation3DNodeEncoding, constellation3DStarPositions, CONSTELLATION_IGNITE_DIM_OPACITY,
+  constellation3DColorType, constellation3DCommunityCoreColor, constellation3DCommunityWellScale,
+  constellation3DIsDimmed, constellation3DIsRootScene, constellation3DNodeEncoding,
+  constellation3DNodeLightnessVariance, constellation3DStarPositions, CONSTELLATION_IGNITE_DIM_OPACITY,
   isOffPageIncidentEdge, placeConstellation3DLabels, promotedEdgeLabelText, truncateConstellationLabel, type Constellation3DEdge,
   type Constellation3DEdgeSegment, type ConstellationCommunityTooltip, type Constellation3DNode,
   type Constellation3DNodeInstance, type Constellation3DShape, type Constellation3DLabelPriority,
@@ -444,7 +445,8 @@ export function MemoryConstellation3D({
         const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false, powerPreference: 'high-performance' });
         if (!renderer.capabilities.isWebGL2) throw new Error('WebGL2 is unavailable');
         renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
-        renderer.setClearColor(theme === 'dark' ? 0x0c1017 : 0xf4f6fa, 1);
+        const backgroundColor = theme === 'dark' ? 0x0c1017 : 0xf4f6fa;
+        renderer.setClearColor(backgroundColor, 1);
         const scene = new THREE.Scene();
         const camera = new THREE.PerspectiveCamera(48, 1, 0.1, 20_000);
         const initialCameraPosition = constellationCameraPosition(cameraState);
@@ -476,6 +478,23 @@ export function MemoryConstellation3D({
         // node raycast list, and resolve their neutral tint from the live theme token cascade.
         const residentNodes = [...nodeById.values()].filter((node) => !node.offPageStandIn);
         const ambience = ambienceFrame(residentNodes);
+        // PLNR-467 depth rig: fog uses the exact canvas clear colour, so distant systems recede
+        // into the theme rather than a foreign haze. Light mode starts slightly sooner on white;
+        // the close flown-in cluster remains well inside either clear range.
+        scene.fog = new THREE.Fog(
+          backgroundColor,
+          ambience.radius * (theme === 'dark' ? 1.15 : 0.95),
+          ambience.radius * (theme === 'dark' ? 4.2 : 3.4),
+        );
+        const ambientLight = new THREE.AmbientLight(0xffffff, theme === 'dark' ? 0.48 : 1.15);
+        const keyLight = new THREE.DirectionalLight(0xffffff, theme === 'dark' ? 1.15 : 0.72);
+        keyLight.position.set(
+          ambience.center[0] + ambience.radius * 0.7,
+          ambience.center[1] + ambience.radius * 1.1,
+          ambience.center[2] + ambience.radius * 0.85,
+        );
+        keyLight.target.position.set(...ambience.center);
+        scene.add(ambientLight, keyLight, keyLight.target);
         const ambienceTint = new THREE.Color(resolveConstellationToken('--text-faint'));
         const starGeometry = new THREE.BufferGeometry();
         starGeometry.setAttribute('position', new THREE.BufferAttribute(
@@ -491,6 +510,7 @@ export function MemoryConstellation3D({
             size: theme === 'dark' ? 1.7 : 1.25,
             sizeAttenuation: false,
             depthWrite: false,
+            fog: false,
           }),
         );
         stars.position.set(...ambience.center);
@@ -523,7 +543,11 @@ export function MemoryConstellation3D({
           });
         }
 
-        for (const [shape, instances] of plan.nodeGroups) {
+        const addSolidNodeBucket = (
+          shape: Constellation3DShape,
+          instances: Constellation3DNodeInstance[],
+          communityCore: boolean,
+        ) => {
           for (const faded of [false, true]) {
             // Same two buckets as before PLNR-441 — search only changes which predicate decides
             // membership (constellation3DIsDimmed), never the bucket count, so this costs zero new
@@ -532,7 +556,12 @@ export function MemoryConstellation3D({
             if (group.length === 0) continue;
             const geometry = geometryFor(THREE, shape);
             // Geometry vertex colors have no attribute here and would multiply instance tints into black.
-            const material = new THREE.MeshBasicMaterial({ transparent: faded, opacity: faded ? (searchActive ? CONSTELLATION_IGNITE_DIM_OPACITY : 0.42) : 1 });
+            const material = new THREE.MeshLambertMaterial({
+              transparent: faded,
+              opacity: faded ? (searchActive ? CONSTELLATION_IGNITE_DIM_OPACITY : 0.42) : 1,
+              emissive: communityCore ? 0xffffff : 0x000000,
+              emissiveIntensity: communityCore ? (theme === 'dark' ? 0.34 : 0.16) : 0,
+            });
             const mesh = new THREE.InstancedMesh(geometry, material, group.length);
             mesh.userData.nodeIds = group.map((node) => node.id);
             group.forEach((node, index) => {
@@ -540,9 +569,13 @@ export function MemoryConstellation3D({
               matrix.makeScale(scale, scale, scale);
               matrix.setPosition(...node.position);
               mesh.setMatrixAt(index, matrix);
-              // Community aggregates tint by dominant type (PLNR-438 locked decision); every other
-              // node keeps tinting by its own type exactly as PLNR-437 shipped.
-              mesh.setColorAt(index, colorForType(constellation3DColorType(node)));
+              const color = colorForType(constellation3DColorType(node)).clone();
+              if (communityCore) {
+                color.setRGB(...constellation3DCommunityCoreColor([color.r, color.g, color.b], theme));
+              } else {
+                color.offsetHSL(0, 0, constellation3DNodeLightnessVariance(node.id));
+              }
+              mesh.setColorAt(index, color);
             });
             mesh.instanceMatrix.needsUpdate = true;
             if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
@@ -550,7 +583,16 @@ export function MemoryConstellation3D({
             scene.add(mesh);
             nodeMeshes.push(mesh);
           }
+        };
+        const communityNodes: Constellation3DNodeInstance[] = [];
+        for (const [shape, instances] of plan.nodeGroups) {
+          addSolidNodeBucket(shape, instances.filter((node) => !node.community), false);
+          communityNodes.push(...instances.filter((node) => node.community));
         }
+        // Memory entities and communities both use spheres, but only the latter are suns. Keeping
+        // cores in one dedicated instanced Lambert bucket permits white-mixed tint + emissive
+        // without bleaching memory planets; at most two faded/unfaded calls cover every core.
+        addSolidNodeBucket('sphere', communityNodes, true);
 
         const leadNodes = layoutNodes.map(constellation3DNodeEncoding).filter((node) => node.halo);
         if (leadNodes.length > 0) {
@@ -580,7 +622,6 @@ export function MemoryConstellation3D({
         // PLNR-448: excludes off-page stand-ins — a stand-in gets its own dedicated terminus glyph
         // (the offPagePromotedEdges pass below), never the full gravity-well/core-sphere treatment
         // the PLNR-379 honesty rule reserves for a genuinely resident community.
-        const communityNodes = [...nodeById.values()].filter((node) => node.community && !node.offPageStandIn);
         if (communityNodes.length > 0) {
           // Geometry vertex colors have no attribute here and would multiply instance tints into black.
           const outer = new THREE.InstancedMesh(

@@ -225,10 +225,12 @@ export function promotedEdgeLabelText(edge: Constellation3DEdge, targetLabel: st
 
 // ---------------------------------------------------------------------------------------------
 // Search ignite (PLNR-441, screen spec 1c). PLNR-461 deliberately spends one call on the shared
-// starfield and three more on root-only orbit guides: the root overview rises from 6 to 10 calls,
-// while the realistic non-root pinned-selection ceiling rises from 14 to 15 (18 at root).
-// Ignite itself still has zero headroom —
-// means ignite cannot afford a single new draw call: it has to ride the instanced buckets that
+// starfield and three more on root-only orbit guides. PLNR-467 then splits luminous community
+// cores from same-shape memory entities: the mixed root reference rises from 10 to 12 calls, while
+// the realistic non-root pinned-selection ceiling rises from 15 to 17 (20 at root). Lights and fog
+// are scene state and add zero calls.
+// Ignite itself still has zero headroom. That means it cannot afford a single new draw call: it
+// has to ride the instanced buckets that
 // already exist rather than add its own. Two consequences, both load-bearing:
 //   (1) The unmatched field's dim is the SAME "faded"/"unfaded" material bucket every node mesh
 //       already splits into (see `constellation3DIsDimmed` below) — search just changes which
@@ -238,7 +240,7 @@ export function promotedEdgeLabelText(edge: Constellation3DEdge, targetLabel: st
 //       that same boost after their visibility floor, so a flared well still grows with its core
 //       for free, with no separate well-opacity bucket to split.
 // This is why the combined pinned-selection + ignite measurement in
-// constellation-3d-buffers.test.ts stays at its ambience-inclusive 15: ignite adds zero calls.
+// constellation-3d-buffers.test.ts stays at its ambience/core-inclusive 17: ignite adds zero calls.
 export const CONSTELLATION_IGNITE_DIM_OPACITY = 0.32;
 // Wells are the population-presence channel, distinct from the core's honest connectivity scale:
 // cube-root growth keeps the 216-member bucket dominant without erasing an 8-member plan system.
@@ -273,6 +275,28 @@ function deterministicUnit(seed: string): number {
     hash = Math.imul(hash, 0x01000193);
   }
   return (hash >>> 0) / 0x1_0000_0000;
+}
+
+export const CONSTELLATION_NODE_LIGHTNESS_VARIANCE = 0.12;
+
+/** Stable per-entity lightness offset. It is deliberately keyed only by node id so changing
+ * camera, theme, layout, or render order cannot make a same-type field shimmer (PLNR-467). */
+export function constellation3DNodeLightnessVariance(nodeId: string): number {
+  return (deterministicUnit(`brightness:${nodeId}`) * 2 - 1) * CONSTELLATION_NODE_LIGHTNESS_VARIANCE;
+}
+
+/** Community cores are suns: retain their dominant-type hue at the rim while pulling the solid
+ * core strongly toward white. The light-theme mix is lower because its white background already
+ * supplies perceived luminance; both branches remain strictly lighter than the source tint. */
+export function constellation3DCommunityCoreColor(
+  color: readonly [number, number, number],
+  theme: 'dark' | 'light',
+): [number, number, number] {
+  const whiteMix = theme === 'dark' ? 0.68 : 0.52;
+  return color.map((channel) => {
+    const bounded = Math.max(0, Math.min(1, channel));
+    return bounded + (1 - bounded) * whiteMix;
+  }) as [number, number, number];
 }
 
 /** Normalized deterministic shell positions for the single-draw-call starfield. The caller
@@ -407,7 +431,8 @@ export function buildConstellation3DRenderPlan(
   const hasHistoricalPromoted = promotedEdges.some((edge) => edge.historical && !isOffPageIncidentEdge(edge));
   const hasCurrentPromoted = promotedEdges.some((edge) => !edge.historical && !isOffPageIncidentEdge(edge));
   const hasDirectionMarkers = promotedEdges.some((edge) => edge.directionMarker && !isOffPageIncidentEdge(edge));
-  // Five shape meshes (faded/unfaded) + lead halo mesh + community gravity-well falloff (outer +
+  // Five entity-shape meshes (faded/unfaded) + a dedicated luminous community-core bucket
+  // (faded/unfaded) + lead halo mesh + community gravity-well falloff (outer +
   // mid, only when a community node is present — never for the pure-entity 12k fixture) +
   // aggregate-route instanced tubes (only when an aggregate edge is present) + the always-allotted
   // backbone base-edge pass + the promoted-edge passes above. The selection reticle and the hover
@@ -422,7 +447,11 @@ export function buildConstellation3DRenderPlan(
   // an aggregate edge that got promoted away from the base pass and so never actually fires one.
   const hasAggregateRouteTube = baseEdges.some((edge) => edge.aggregate);
   const ambienceDrawCalls = 1 + (constellation3DIsRootScene(nodes) ? 3 : 0);
-  const drawCallCeiling = nodeGroups.size * 2
+  const entityShapeCount = new Set([...byId.values()]
+    .filter((node) => !node.offPageStandIn && !node.community)
+    .map((node) => node.shape)).size;
+  const hasCommunityCore = [...byId.values()].some((node) => node.community && !node.offPageStandIn);
+  const drawCallCeiling = (entityShapeCount + (hasCommunityCore ? 1 : 0)) * 2
     + (nodes.some((node) => node.isLead) ? 1 : 0)
     // PLNR-448: a plan whose only community node is an off-page stand-in no longer builds the
     // gravity-well pass (it was excluded from nodeGroups above, same reasoning), so the ceiling

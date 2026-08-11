@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   aggregateRouteWidth, buildConstellation3DRenderPlan, communityEntitySubtext, communityIgniteSubtext, communityTooltipContent,
-  constellation3DColorType, constellation3DCommunityWellScale, constellation3DIsDimmed, constellation3DIsRootScene,
-  constellation3DNodeEncoding, constellation3DStarPositions,
-  CONSTELLATION_COMMUNITY_WELL_SCALE_CAP, CONSTELLATION_COMMUNITY_WELL_SCALE_FLOOR, CONSTELLATION_IGNITE_DIM_OPACITY,
+  constellation3DColorType, constellation3DCommunityCoreColor, constellation3DCommunityWellScale,
+  constellation3DIsDimmed, constellation3DIsRootScene, constellation3DNodeEncoding,
+  constellation3DNodeLightnessVariance, constellation3DStarPositions,
+  CONSTELLATION_COMMUNITY_WELL_SCALE_CAP, CONSTELLATION_COMMUNITY_WELL_SCALE_FLOOR,
+  CONSTELLATION_IGNITE_DIM_OPACITY, CONSTELLATION_NODE_LIGHTNESS_VARIANCE,
   dominantCommunityType, isOffPageIncidentEdge, placeConstellation3DLabels, promotedEdgeLabelText, truncateConstellationLabel,
   type Constellation3DEdge, type Constellation3DLabelCandidate, type Constellation3DNode,
 } from './constellation-3d-buffers';
@@ -32,6 +34,27 @@ describe('constellation 3D buffer planning', () => {
     expect(constellation3DCommunityWellScale(capped)).toBe(CONSTELLATION_COMMUNITY_WELL_SCALE_CAP);
     expect(constellation3DCommunityWellScale(small)).toBeGreaterThanOrEqual(CONSTELLATION_COMMUNITY_WELL_SCALE_FLOOR);
     expect(constellation3DCommunityWellScale(constellation3DNodeEncoding(node('e')))).toBe(constellation3DNodeEncoding(node('e')).scale);
+  });
+
+  it('derives bounded deterministic per-node lightness variation with both signs', () => {
+    const first = constellation3DNodeLightnessVariance('task-42');
+    expect(constellation3DNodeLightnessVariance('task-42')).toBe(first);
+    const sample = Array.from({ length: 128 }, (_, index) => constellation3DNodeLightnessVariance(`node-${index}`));
+    expect(sample.every((value) => Math.abs(value) <= CONSTELLATION_NODE_LIGHTNESS_VARIANCE)).toBe(true);
+    expect(sample.some((value) => value < 0)).toBe(true);
+    expect(sample.some((value) => value > 0)).toBe(true);
+    expect(new Set(sample).size).toBeGreaterThan(120);
+  });
+
+  it('mixes community cores strongly toward white in both themes', () => {
+    const tint: [number, number, number] = [0.1, 0.4, 0.8];
+    const dark = constellation3DCommunityCoreColor(tint, 'dark');
+    const light = constellation3DCommunityCoreColor(tint, 'light');
+    expect(dark[0]).toBeCloseTo(0.712); expect(dark[1]).toBeCloseTo(0.808); expect(dark[2]).toBeCloseTo(0.936);
+    expect(light[0]).toBeCloseTo(0.568); expect(light[1]).toBeCloseTo(0.712); expect(light[2]).toBeCloseTo(0.904);
+    expect(dark.every((channel, index) => channel > tint[index]!)).toBe(true);
+    expect(light.every((channel, index) => channel > tint[index]!)).toBe(true);
+    expect(dark.every((channel, index) => channel > light[index]!)).toBe(true);
   });
 
   it('submits selected incidents in the final promoted pass while retaining direction and type', () => {
@@ -77,7 +100,7 @@ describe('constellation 3D buffer planning', () => {
     expect(plan.labels.map((label) => label.id)).toEqual(['large', 'small', 'large-member']);
   });
 
-  it('accounts for the root starfield and three orbit guides at an exact 10 draw calls', () => {
+  it('accounts for the luminous core split and root ambience at an exact 12 draw calls', () => {
     // Nine communities, matching the actual root overview reference frame — the scene this task
     // adds the most rendering work to (gravity-well falloff, aggregate-route tubes).
     const communities = Array.from({ length: 9 }, (_, index) => node(`c${index}`, 'community', {
@@ -88,9 +111,12 @@ describe('constellation 3D buffer planning', () => {
       id: `r${index}`, fromId: `c${index}`, toId: `c${index + 1}`, type: 'related_to',
       direction: 'forward', weight: 1 + index * 2, aggregate: true,
     }));
-    const plan = buildConstellation3DRenderPlan(communities, routes, null, 24);
-    expect(plan.nodeGroups.size).toBe(1); // every community renders as the single 'sphere' shape
-    expect(plan.drawCallCeiling).toBe(10);
+    // A resident memory entity shares the sphere geometry family with cores, forcing PLNR-467's
+    // dedicated luminous core bucket while preserving the public shape grouping.
+    const nodes = [...communities, node('memory-planet', 'memory', { parentId: 'c0' })];
+    const plan = buildConstellation3DRenderPlan(nodes, routes, null, 24);
+    expect(plan.nodeGroups.size).toBe(1); // memory + communities still resolve to sphere geometry
+    expect(plan.drawCallCeiling).toBe(12);
     // Route width maps continuously to boundary weight (locked decision), min/max-normalized
     // against a visibly legible 2–6 world-unit tube-radius range.
     expect(plan.baseEdges[0]!.width).toBeCloseTo(2);
@@ -381,17 +407,20 @@ describe('draw-call ceiling accounts for promoted-edge passes (PLNR-439)', () =>
       { id: 'incident:offpage', fromId: 'pin', toId: 'offpage-community', type: 'related_to', direction: 'forward', weight: 1, aggregate: true },
     ];
     const plan = buildConstellation3DRenderPlan(pinNodes, edges, 'pin');
-    // Both nodes share one shape group (memory and community both render as spheres): 1 group ×2
-    // + community wells (+2) + base backbone (+1) + off-page pass (+2, dashed line + terminus
+    // Both nodes share a public shape group, but entity spheres and luminous cores now render in
+    // separate faded/unfaded buckets: 2 buckets ×2 + community wells (+2) + base backbone (+1) +
+    // off-page pass (+2, dashed line + terminus
     // glyph) — no lead, no current/historical promoted, no direction markers (off-page never gets
     // one), and critically no aggregate-route-tube term since the edge never reaches baseEdges.
-    expect(plan.drawCallCeiling).toBe(1 * 2 + 2 + 1 + 2 + 1); // shared starfield
+    expect(plan.drawCallCeiling).toBe(2 * 2 + 2 + 1 + 2 + 1); // shared starfield
   });
 });
 
 describe('search ignite draw-call budget (PLNR-441/461)', () => {
   // PLNR-439 measured a realistic pinned-selection scene at exactly 14; PLNR-461 intentionally
-  // adds one shared starfield call. Ignite layers on top of selection (screen spec 1c), so this is the
+  // added one shared starfield call, and PLNR-467's luminous core split adds two conservative
+  // faded/unfaded calls when memory entities share the sphere family. Ignite layers on top of
+  // selection, so this is the
   // combination most likely to blow the budget; per this task's brief, that combination must be
   // measured explicitly rather than assumed safe. It is verified here to add ZERO draw calls: the
   // unmatched-field dim reuses the existing faded/unfaded material bucket (constellation3DIsDimmed
@@ -404,7 +433,7 @@ describe('search ignite draw-call budget (PLNR-441/461)', () => {
     // Mirrors PLNR-439's realistic fixture: two shape groups (memory + task, community also renders
     // as sphere so it does not add a third), a lead pin, current+historical+off-page promoted edges,
     // and an aggregate route-tube edge on a base (unselected-incident) pair — the exact combination
-    // the PLNR-439 commit reports at 14 before PLNR-461's single shared ambience call.
+    // the PLNR-439 commit reports at 14 before the shared ambience and luminous-core split.
     const nodes: Constellation3DNode[] = [
       pinNode('pin', 'memory', { isLead: true }),
       pinNode('b', 'memory'),
@@ -419,14 +448,14 @@ describe('search ignite draw-call budget (PLNR-441/461)', () => {
       { id: 'aggregate:d:neighbor', fromId: 'd', toId: 'neighbor', type: 'related_to', direction: 'forward', weight: 2, aggregate: true },
     ];
     const withoutSearch = buildConstellation3DRenderPlan(nodes, edges, 'pin');
-    expect(withoutSearch.drawCallCeiling).toBeLessThanOrEqual(15);
+    expect(withoutSearch.drawCallCeiling).toBeLessThanOrEqual(17);
 
     // The pin itself and the neighbour community are BOTH search matches — the exact "mixed
     // matched/unmatched community" case a naive well-opacity split would have to pay for with two
     // extra draw calls. The measured number is identical to the unselected-for-search baseline.
     const withSearch = buildConstellation3DRenderPlan(nodes, edges, 'pin', 24, new Set(['pin', 'neighbor']));
     expect(withSearch.drawCallCeiling).toBe(withoutSearch.drawCallCeiling);
-    expect(withSearch.drawCallCeiling).toBeLessThanOrEqual(15);
+    expect(withSearch.drawCallCeiling).toBeLessThanOrEqual(17);
 
     // And the case where only the pin matches (the neighbour community stays unmatched/dimmed) —
     // same result, confirming the ceiling does not depend on which nodes happen to be highlighted.
