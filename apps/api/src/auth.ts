@@ -126,7 +126,30 @@ export async function agentAuth(c: Context<AppContext>, next: Next) {
     agentId: string | null; agentName: string | null; agentRole: 'orchestrator' | 'worker' | null;
     agentKind: AgentKind | null; agentAllowedTools: string | null;
   }>();
-  if (!t) return unauthorized('invalid, expired, or revoked token — connect via OAuth');
+  if (!t) {
+    // The primary lookup collapses "no such token", "revoked", "expired" and "user disabled"
+    // into one NULL row (they're all WHERE-clause exclusions), which makes a real bug and a
+    // routine credential lifecycle event look identical from the outside (PLNR-432). A second,
+    // unfiltered lookup on the same hash tells them apart — off the hot path (this only runs
+    // once the primary query has already failed) and safe to skip straight to the generic
+    // message if even the hash itself doesn't resolve to a row.
+    const diag = await c.env.DB.prepare(
+      `SELECT t.revoked_at AS revokedAt,
+              (t.expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')) AS isExpired,
+              u.disabled AS userDisabled
+       FROM oauth_tokens t JOIN users u ON u.id = t.user_id
+       WHERE t.token_hash = ?`,
+    ).bind(hash).first<{ revokedAt: string | null; isExpired: number; userDisabled: number }>();
+    if (!diag) return unauthorized('invalid token — no such credential, connect via OAuth');
+    if (diag.revokedAt) return unauthorized('revoked token — connect via OAuth');
+    if (diag.isExpired) return unauthorized('expired token — connect via OAuth');
+    if (diag.userDisabled) return unauthorized('invalid token — account disabled');
+    // The row exists, isn't revoked/expired, and its user isn't disabled, yet still failed the
+    // primary query's WHERE — a genuine unexplained race (the primary read raced ahead of, or
+    // behind, a write this diagnostic query no longer sees). Keep the original message so this
+    // stays visibly the "we don't know why" case rather than masquerading as one of the above.
+    return unauthorized('invalid, expired, or revoked token — connect via OAuth');
+  }
 
   // Use-time kill switch for the demo (PLNR-199). The demo never mints agent tokens — the
   // consent flow refuses the demo account — but any token minted before DEMO_MODE was set,
