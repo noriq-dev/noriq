@@ -2345,6 +2345,14 @@ export class ProjectMemory extends DurableObject<Env> {
     // every other authoritative fact; this storage seam completes identity and source revision.
     // A terminal-job replay carries forward only previously accepted daemon observations, while
     // a new daemon upload is overlaid through the narrow schema above one metric at a time.
+    //
+    // PLNR-433: `input.intelligence.contextConsumption` (built server-side, by
+    // `memory/episodes.ts#loadEpisodeSkeleton`) is never set — the server has no view of the
+    // Runner's own ContextPack, so there is no default worth manufacturing here. The field is
+    // `.optional()` on `ProjectIntelligenceEpisode` for exactly this reason: `ProjectIntelligenceEpisode.parse`
+    // below leaves it absent rather than a fabricated `not_applicable`, and it is filled in only
+    // when a daemon later uploads one through `intelligenceEnrichment` (below) or a replay
+    // preserves an already-accepted one via `preserveAcceptedEpisodeIntelligence`.
     let intelligence = input.intelligence
       ? ProjectIntelligenceEpisode.parse({
           ...input.intelligence,

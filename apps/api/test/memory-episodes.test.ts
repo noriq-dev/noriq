@@ -11,7 +11,7 @@ import { env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import type { Actor, CreateRunInput, RunPatch, RunView } from '../src/do/ProjectRoom';
 import type { Env } from '../src/env';
-import { buildEntityUri } from '@noriq-dev/shared';
+import { buildEntityUri, IntelligenceContextConsumptionMetric, ProjectIntelligenceEpisode, UploadedEpisodeIntelligence } from '@noriq-dev/shared';
 import { createAgent, mcpCall } from './helpers';
 import { recordEpisodeForRun, sweepPendingEpisodeJobs } from '../src/memory/episodes';
 
@@ -834,5 +834,167 @@ describe('episode upload ingest — completeEpisodeIngest merges partial enrichm
     const episode = await memory(projectId)._getEpisodeForTest(projectId, run.id);
     expect(episode?.filesTouched ?? []).not.toContain('src/would-have-recorded.ts');
     expect(episode?.commands ?? []).not.toContain('npm test');
+  });
+});
+
+// PLNR-433: what a run actually READ (`contextConsumption`), as distinct from what it was told to
+// do or what it did. Two layers, same reasoning as this file's own opening comment: the first
+// group is pure schema tests against `packages/shared/src/intelligence.ts` directly — no DO, no D1
+// — because the facts under test (backward compatibility, the no-text rule, and the
+// three-states-none-a-zero rule) are properties of the CONTRACT itself, provable without any
+// wiring; the second group drives the real `completeEpisodeIngest` → `mergeUploadedEpisodeIntelligence`
+// / `preserveAcceptedEpisodeIntelligence` path, matching the style of the daemon-provenance cases
+// directly above.
+describe('PLNR-433: context-consumption facts', () => {
+  const FIXTURE_ISO = '2026-08-10T12:00:00.000Z';
+
+  /** A complete, minimal `ProjectIntelligenceEpisode` with no `contextConsumption` key at all —
+   *  standing in for a body stored before this task, since that field did not exist for it to have
+   *  omitted on purpose. */
+  function fullIntelligenceFixture(overrides: Record<string, unknown> = {}) {
+    return {
+      schemaVersion: 1,
+      identity: {
+        episodeId: 'epi_ctx_fixture', projectId: 'prj_ctx_fixture', runId: 'run_ctx_fixture', sitting: 1,
+        lineage: { status: 'unknown', missing: [], reason: null },
+      },
+      sources: { capturedAt: FIXTURE_ISO },
+      versions: { extraction: 'test-v1' },
+      preExecution: { task: { capturedAt: FIXTURE_ISO } },
+      execution: {
+        observedModelUsage: daemonMetric({}),
+        clocks: {
+          queueDurationMs: daemonMetric(0), dispatchToStartMs: daemonMetric(0),
+          elapsedExecutionMs: daemonMetric(0), humanBlockedMs: daemonMetric(0), verifyDurationMs: daemonMetric(0),
+        },
+        changes: {
+          changedFiles: daemonMetric(0), additions: daemonMetric(0), deletions: daemonMetric(0), churn: daemonMetric(0),
+        },
+      },
+      outcome: {
+        runOutcome: 'done', landingOutcome: 'pending',
+        reviewRounds: daemonMetric(0), acceptanceCoverage: daemonMetric(0),
+      },
+      ...overrides,
+    };
+  }
+
+  /** A fully populated `ContextConsumptionSnapshot` — counts, enums, and booleans only. */
+  function fullContextConsumptionSnapshot(mode: 'semantic' | 'keyword' = 'semantic') {
+    return {
+      mode, role: 'build', charBudget: 8000, charsUsed: 4200,
+      sections: [{ id: 'active_decisions', excerptCount: 3, graphEntityCount: 0, truncated: false, unanswerable: false }],
+      similarEpisodesConsidered: 2, staleCitationsCount: 0, noticesCount: 0, retrievalTookMs: 120,
+    };
+  }
+
+  it('an episode payload captured before this change still parses — proven by parsing a pre-change fixture, not by inspection', () => {
+    const parsed = ProjectIntelligenceEpisode.parse(fullIntelligenceFixture());
+    expect(parsed.contextConsumption).toBeUndefined();
+  });
+
+  it('the daemon-assertable subset is expressible in UploadedEpisodeIntelligence and refined by daemonMetric, so a Runner can safeParse before uploading', () => {
+    const legal = { contextConsumption: daemonMetric(fullContextConsumptionSnapshot('semantic')) };
+    expect(UploadedEpisodeIntelligence.safeParse(legal).success).toBe(true);
+
+    // The RUN-243/PLNR-426 hazard, mirrored onto this new field: a provenance/source combination a
+    // daemon may not claim must fail HERE, at parse time — not silently, three calls later,
+    // server-side.
+    const forged = {
+      contextConsumption: { ...daemonMetric(fullContextConsumptionSnapshot('semantic')), provenance: 'server_observed', source: 'd1_coordination' },
+    };
+    expect(UploadedEpisodeIntelligence.safeParse(forged).success).toBe(false);
+  });
+
+  it('no field in the new section can carry memory statement text, a source excerpt, or transcript content — demonstrated by schema rejection, not asserted', () => {
+    const suspiciousText = 'The user prefers dark mode because bright screens trigger their migraines — recorded from run_9182 transcript.';
+
+    const textInMode = daemonMetric({ ...fullContextConsumptionSnapshot(), mode: suspiciousText });
+    expect(UploadedEpisodeIntelligence.safeParse({ contextConsumption: textInMode }).success).toBe(false);
+
+    const textInSectionId = daemonMetric({
+      ...fullContextConsumptionSnapshot(),
+      sections: [{ id: suspiciousText, excerptCount: 1, graphEntityCount: 0, truncated: false, unanswerable: false }],
+    });
+    expect(UploadedEpisodeIntelligence.safeParse({ contextConsumption: textInSectionId }).success).toBe(false);
+
+    // An unrecognized field name carrying text is stripped, not stored: zod drops unknown keys
+    // rather than accepting them, so there is no back door via an extra property either.
+    const smuggledExtraField = {
+      contextConsumption: daemonMetric(fullContextConsumptionSnapshot()),
+      memoryStatement: suspiciousText,
+    };
+    const parsedSmuggled = UploadedEpisodeIntelligence.safeParse(smuggledExtraField);
+    expect(parsedSmuggled.success).toBe(true);
+    expect(parsedSmuggled.success && 'memoryStatement' in parsedSmuggled.data).toBe(false);
+  });
+
+  it('never requested / requested but never rendered / rendered in degraded mode are three distinguishable states, none spelled as a zero', () => {
+    const obs = { provenance: 'runner_observed' as const, source: 'runner' as const, sourceId: 's', observedAt: null, acceptedAt: null, reason: null };
+    const neverRequested = { status: 'not_applicable' as const, value: null, ...obs };
+    const requestedNeverRendered = { status: 'unavailable' as const, value: null, ...obs };
+    const renderedDegraded = { status: 'partial' as const, value: fullContextConsumptionSnapshot('keyword'), ...obs };
+
+    for (const candidate of [neverRequested, requestedNeverRendered, renderedDegraded]) {
+      expect(IntelligenceContextConsumptionMetric.safeParse(candidate).success).toBe(true);
+    }
+    // The two null-value states are distinguished ONLY by `status` — nothing numeric tells them apart.
+    expect(neverRequested.value).toBeNull();
+    expect(requestedNeverRendered.value).toBeNull();
+    expect(neverRequested.status).not.toBe(requestedNeverRendered.status);
+    expect(renderedDegraded.value).not.toBeNull();
+  });
+
+  it('reporting context facts leaves execution.stages/clocks/changes untouched, and a terminal-job replay preserves the accepted fact', async () => {
+    const projectId = await newProject('MEPICTX1');
+    const runnerId = 'rnr_epi_ctx1';
+    const agentId = 'agt_epi_ctx1';
+    await seedRunner(runnerId);
+    await seedAgent(agentId, runnerId, projectId);
+    const run = await room(projectId).createRun(projectId, actor, { kind: 'build', repoRef: 'r', agentTool: 'claude' });
+    await room(projectId).dispatchRun(projectId, actor, run.id, runnerId);
+    await room(projectId).transitionRun(projectId, actor, run.id, { status: 'running', agentId });
+    await room(projectId).transitionRun(projectId, actor, run.id, { status: 'done' });
+
+    const scopeId = `${run.id}_ctx1`;
+    await memory(projectId).beginEpisodeIngest(projectId, { scopeId, projectId, batchCount: 1 });
+    await memory(projectId).ingestEpisodeBatch(projectId, scopeId, 0, [{
+      runId: run.id,
+      intelligence: {
+        execution: {
+          stages: [{
+            executionId: 'exe_ctx1', kind: 'stage', role: 'verifier', stage: 'tests',
+            elapsedMs: daemonMetric(500), tokens: daemonMetric(10), costUSD: daemonMetric(0.01),
+          }],
+        },
+        contextConsumption: daemonMetric(fullContextConsumptionSnapshot('semantic')),
+      },
+    }]);
+    const completed = await memory(projectId).completeEpisodeIngest(projectId, scopeId);
+    expect(completed).toMatchObject({ recorded: 1, skipped: 0 });
+
+    const episode = await memory(projectId)._getEpisodeForTest(projectId, run.id);
+    const intelligence = episode!.intelligence as any;
+    expect(intelligence.contextConsumption).toMatchObject({
+      status: 'complete',
+      value: expect.objectContaining({ mode: 'semantic', role: 'build', charsUsed: 4200 }),
+    });
+    // The sibling execution facts this upload never mentioned (changes) or set through a
+    // DIFFERENT field (stages) are untouched by reporting a context fact in the same upload.
+    expect(intelligence.execution.stages).toEqual([
+      expect.objectContaining({ stage: 'tests', elapsedMs: expect.objectContaining({ value: 500 }) }),
+    ]);
+    expect(intelligence.execution.clocks.verifyDurationMs.status).toBe('not_applicable'); // untouched server skeleton default (not a verify run)
+    expect(intelligence.execution.changes.changedFiles.status).toBe('unavailable'); // untouched server skeleton default
+
+    // A terminal-job replay rebuilds the skeleton fresh from D1 (which knows nothing about the
+    // Runner's ContextPack) and must still carry the previously accepted context fact forward.
+    await recordEpisodeForRun(appEnv, projectId, run.id);
+    const replayed = (await memory(projectId)._getEpisodeForTest(projectId, run.id))!.intelligence as any;
+    expect(replayed.contextConsumption).toMatchObject({
+      status: 'complete',
+      value: expect.objectContaining({ mode: 'semantic', charsUsed: 4200 }),
+    });
+    expect(replayed.execution.stages).toEqual([expect.objectContaining({ stage: 'tests' })]);
   });
 });

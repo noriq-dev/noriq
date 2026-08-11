@@ -107,6 +107,13 @@ export function mergeUploadedEpisodeIntelligence(
           : acceptMetric(changes.churn, acceptedAt),
       },
     },
+    // PLNR-433: a disjoint top-level key from `execution` by construction (see the placement
+    // rationale on `ProjectIntelligenceEpisode` in packages/shared/src/intelligence.ts) — so
+    // overlaying it here can never touch `execution.stages`/`clocks`/`changes` above, without this
+    // function having to work at it.
+    contextConsumption: uploaded.contextConsumption === undefined
+      ? base.contextConsumption
+      : acceptMetric(uploaded.contextConsumption, acceptedAt),
   };
 }
 
@@ -147,6 +154,13 @@ export function preserveAcceptedEpisodeIntelligence(
   }
   if (Object.keys(retainedChanges).length > 0) {
     uploaded.execution!.changes = retainedChanges;
+  }
+  // PLNR-433: `contextConsumption` is `.optional()` on ProjectIntelligenceEpisode (older episodes,
+  // and any episode the Runner never reported context facts for, simply lack the key) — the
+  // undefined check must come first, same reason `wasAcceptedDaemonMetric` itself already exists:
+  // an unset fact was never a daemon assertion to begin with.
+  if (existing.contextConsumption !== undefined && wasAcceptedDaemonMetric(existing.contextConsumption)) {
+    uploaded.contextConsumption = existing.contextConsumption;
   }
   return mergeUploadedEpisodeIntelligence(server, uploaded, undefined);
 }
