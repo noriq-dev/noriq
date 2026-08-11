@@ -1109,7 +1109,7 @@ export class ProjectMemory extends DurableObject<Env> {
         nodeId: row.node_id, uri: row.uri, type: row.type, kind: row.kind, label: row.label,
         authority: row.authority, validity: row.validity, isLead: lead?.isLead ?? null, leadReasons: lead?.leadReasons ?? null,
         degree: row.degree, boundaryDegree: row.boundary_degree, groupKey: row.type, communityId,
-        position: constellationEntityPosition(row.uri, community.anchor),
+        position: constellationEntityPosition(row.uri, community.anchor, community.memberCount),
       };
     });
     const routePage = this.readAggregateRoutes(active.generation.id, community.level, [community.id]);

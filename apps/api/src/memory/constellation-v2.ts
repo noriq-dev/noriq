@@ -203,14 +203,34 @@ export function cursorMatches(cursor: CursorPayload | null, generationId: string
   return cursor === null || (cursor.generationId === generationId && cursor.currentRevision === currentRevision && cursor.scope === scope);
 }
 
-export function constellationEntityPosition(uri: string, anchor: [number, number, number]): [number, number, number] {
-  const hash = (salt: string) => {
+export function constellationEntityCloudRadius(memberCount: number): number {
+  const population = Number.isFinite(memberCount) ? Math.max(0, memberCount) : 0;
+  const wellRadius = Math.min(140, Math.max(44, 24 + 17 * Math.cbrt(population)));
+  return wellRadius * 0.75;
+}
+
+export function constellationEntityPosition(
+  uri: string,
+  anchor: [number, number, number],
+  memberCount: number,
+): [number, number, number] {
+  const hashUnit = (salt: string) => {
     let value = 0x811c9dc5;
-    const input = `${uri}:${salt}`;
+    // Prefixing the one-byte axis salt gives FNV-1a the full URI to diffuse the axis difference;
+    // a trailing salt only changes the final multiply and collapses x/y/z onto one diagonal.
+    const input = `${salt}:${uri}`;
     for (let i = 0; i < input.length; i++) { value ^= input.charCodeAt(i); value = Math.imul(value, 0x01000193); }
-    return (value >>> 0) / 0xffffffff * 2 - 1;
+    return (value >>> 0) / 0x1_0000_0000;
   };
-  return [anchor[0] + hash('x') * 80, anchor[1] + hash('y') * 80, anchor[2] + hash('z') * 80];
+  const theta = hashUnit('x') * Math.PI * 2;
+  const z = hashUnit('y') * 2 - 1;
+  const planar = Math.sqrt(Math.max(0, 1 - z * z));
+  const radius = constellationEntityCloudRadius(memberCount) * Math.cbrt(hashUnit('z'));
+  return [
+    anchor[0] + Math.cos(theta) * planar * radius,
+    anchor[1] + Math.sin(theta) * planar * radius,
+    anchor[2] + z * radius,
+  ];
 }
 
 function compactDictionary() {

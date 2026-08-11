@@ -98,6 +98,7 @@ describe('Constellation v2 scene assembly', () => {
     const other = scene.nodes.find((n) => n.id === 'other')!;
     expect(root.memberCount).toBe(2);
     expect(root.typeCounts).toEqual({ memory: 1, task: 1 });
+    expect(root.radius).toBeCloseTo(24 + 17 * Math.cbrt(root.memberCount!));
     // overview.routes has a single root<->other route with count: 1 — both endpoints see it.
     expect(root.boundaryRouteCount).toBe(1);
     expect(other.boundaryRouteCount).toBe(1);

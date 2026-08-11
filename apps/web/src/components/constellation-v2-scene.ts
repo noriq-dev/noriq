@@ -2,7 +2,9 @@ import type {
   ApiConstellationV2Community, ApiConstellationV2CommunityPage, ApiConstellationV2IncidentPage,
   ApiConstellationV2Overview,
 } from '../api';
-import type { Constellation3DEdge, Constellation3DNode } from './constellation-3d-buffers';
+import {
+  constellation3DCommunityWellScale, type Constellation3DEdge, type Constellation3DNode,
+} from './constellation-3d-buffers';
 
 export const CONSTELLATION_V2_RESIDENT_NODE_BUDGET = 12_000;
 
@@ -24,7 +26,9 @@ export interface ConstellationV2Scene {
 const communityNode = (community: ApiConstellationV2Community, boundaryRouteCount = 0): Constellation3DNode => ({
   id: community.id, uri: null, label: community.label, type: 'community', position: community.anchor,
   degree: community.internalEdgeCount, community: true, parentId: community.parentId,
-  radius: Math.max(45, Math.min(180, Math.sqrt(community.memberCount) * 9)),
+  // The layout parent clamp must contain the server's 0.75× well-radius member cloud; using the
+  // well itself here keeps every scattered member inside without shrinking mid-sized systems.
+  radius: constellation3DCommunityWellScale({ community: true, memberCount: community.memberCount, scale: 0 }),
   memberCount: community.memberCount, typeCounts: community.typeCounts, boundaryRouteCount,
 });
 
