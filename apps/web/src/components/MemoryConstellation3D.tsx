@@ -14,7 +14,7 @@ import {
 } from './constellation-3d-layout';
 import {
   CONSTELLATION_3D_PREFS_VERSION, constellationCameraPosition, createCameraTransition, dollyConstellationCamera,
-  fitConstellationCamera, focusConstellationCamera, loadConstellation3DPreferences, orbitConstellationCamera,
+  fitConstellationCamera, fitConstellationClusterCamera, focusConstellationCamera, loadConstellation3DPreferences, orbitConstellationCamera,
   panConstellationCamera, sampleCameraTransition, saveConstellation3DPreferences, type CameraTransition,
   type Constellation3DCamera,
 } from './constellation-3d-navigation';
@@ -75,6 +75,34 @@ export function constellation3DClickIntent(
   const zoom = previous?.nodeId === nodeId && elapsed >= 0 && elapsed <= CONSTELLATION_DOUBLE_CLICK_MS;
   return { next: zoom ? null : { nodeId, at }, zoom };
 }
+
+/** Direct member nodes are the visible body of a community in continuous space. The anchor itself
+ * is deliberately excluded: fitting it again would make a large well dominate its own fly-in. */
+export function constellation3DCommunityCluster(
+  nodes: readonly Constellation3DNode[],
+  communityId: string,
+): Constellation3DNode[] {
+  return nodes.filter((node) => node.id !== communityId && node.parentId === communityId && !node.offPageStandIn);
+}
+
+export function constellation3DCommunityClusterCamera(
+  nodes: readonly Constellation3DNode[],
+  communityId: string,
+  aspect: number,
+  camera: Constellation3DCamera,
+): Constellation3DCamera | null {
+  const members = constellation3DCommunityCluster(nodes, communityId);
+  if (members.length === 0) return null;
+  return fitConstellationClusterCamera(members.map((member) => {
+    const encoded = constellation3DNodeEncoding(member);
+    return {
+      position: member.position,
+      radius: member.community
+        ? constellation3DCommunityWellScale(encoded) * COMMUNITY_WELL_OUTER_RATIO
+        : encoded.scale * FIT_ENTITY_FOOTPRINT_RATIO,
+    };
+  }), { aspect, camera });
+}
 // Selection reticle (PLNR-439, screen spec 1b "the pin") — every radius is a ratio of the
 // selected node's own connectivity-derived scale, the same pattern PLNR-438 established for the
 // community wells and hover ring, so the reticle grows/shrinks with whatever it is pinned to
@@ -113,7 +141,10 @@ export interface MemoryConstellation3DProps {
   igniteMatchCounts?: ReadonlyMap<string, number>;
   theme?: 'dark' | 'light';
   reducedMotion?: boolean;
+  residentCommunityIds?: string[];
+  focusRequest?: { nodeId: string; serial: number } | null;
   onSelectNode?: (nodeId: string | null) => void;
+  onEnsureCommunityResident?: (communityId: string) => Promise<boolean>;
   onOpenEgoNetwork?: (uri: string) => void;
   onOpenInspector?: (uri: string) => void;
   onRendererFailure?: (reason: string) => void;
@@ -317,7 +348,8 @@ function fitCameraToScene(nodes: readonly Constellation3DNode[], aspect = 1): Co
 export function MemoryConstellation3D({
   projectId, generationId, layoutVersion, nodes, edges, selectedNodeId, highlightedNodeIds = [],
   searchActive = false, igniteMatchCounts, theme = 'dark', reducedMotion = false,
-  onSelectNode, onOpenEgoNetwork, onOpenInspector, onRendererFailure,
+  residentCommunityIds = [], focusRequest, onSelectNode, onEnsureCommunityResident,
+  onOpenEgoNetwork, onOpenInspector, onRendererFailure,
 }: MemoryConstellation3DProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -345,6 +377,9 @@ export function MemoryConstellation3D({
     mode: 'orbit' | 'pan'; x: number; y: number; camera: Constellation3DCamera; dragged: boolean;
   } | null>(null);
   const lastClickRef = useRef<Constellation3DClickState | null>(null);
+  const pendingCommunityZoomRef = useRef<string | null>(null);
+  const handledFocusRequestRef = useRef(0);
+  const residentCommunityIdSet = useMemo(() => new Set(residentCommunityIds), [residentCommunityIds]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -966,11 +1001,54 @@ export function MemoryConstellation3D({
     step(performance.now());
   };
 
-  // PLNR-464 can replace this one community branch with fly-to-cluster while leaving gesture,
-  // entity focus, keyboard Enter, and the camera-control button wired through the same seam.
   const zoomToNode = (node: Constellation3DNode) => {
-    transitionTo(focusConstellationCamera(cameraState, node.position, node.radius ?? (node.community ? 70 : 18)));
+    if (!node.community) {
+      transitionTo(focusConstellationCamera(cameraState, node.position, node.radius ?? 18));
+      return;
+    }
+    const host = hostRef.current;
+    const aspect = host ? Math.max(1, host.clientWidth) / Math.max(1, host.clientHeight) : 1;
+    const clusterCamera = constellation3DCommunityClusterCamera(layoutNodes, node.id, aspect, cameraState);
+    if (clusterCamera) {
+      transitionTo(clusterCamera);
+      return;
+    }
+    if (residentCommunityIdSet.has(node.id)) {
+      // Empty or type-filtered resident systems still have a truthful anchor to focus.
+      transitionTo(focusConstellationCamera(cameraState, node.position, node.radius ?? 70));
+      return;
+    }
+    pendingCommunityZoomRef.current = node.id;
+    void onEnsureCommunityResident?.(node.id).then((loaded) => {
+      if (!loaded && pendingCommunityZoomRef.current === node.id) pendingCommunityZoomRef.current = null;
+    });
   };
+
+  // A non-resident double-click cannot fit until React has integrated the fetched page and the
+  // worker has laid out its members. Wait for both facts; never fly to a fake placeholder cluster.
+  useEffect(() => {
+    const communityId = pendingCommunityZoomRef.current;
+    if (!communityId || !residentCommunityIdSet.has(communityId)) return;
+    const sourceHasMembers = constellation3DCommunityCluster(nodes, communityId).length > 0;
+    const layoutHasMembers = constellation3DCommunityCluster(layoutNodes, communityId).length > 0;
+    if (sourceHasMembers && !layoutHasMembers) return;
+    const community = layoutNodes.find((node) => node.id === communityId);
+    if (!community) return;
+    pendingCommunityZoomRef.current = null;
+    zoomToNode(community);
+  // `zoomToNode` intentionally uses the camera from the render that observes the completed layout.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [layoutNodes, nodes, residentCommunityIdSet]);
+
+  // Search and textual Catalogue focus use the same in-place camera seam as pointer/Enter zoom.
+  useEffect(() => {
+    if (!focusRequest || handledFocusRequestRef.current === focusRequest.serial) return;
+    const node = layoutNodes.find((candidate) => candidate.id === focusRequest.nodeId);
+    if (!node) return;
+    handledFocusRequestRef.current = focusRequest.serial;
+    zoomToNode(node);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusRequest, layoutNodes]);
 
   const nodeAt = (event: React.PointerEvent<HTMLCanvasElement>): string | null | undefined => {
     const state = rendererRef.current;
@@ -1074,7 +1152,7 @@ export function MemoryConstellation3D({
     }
     if (selected?.uri && event.key.toLowerCase() === 'e') onOpenEgoNetwork?.(selected.uri);
     if (selected?.uri && event.key.toLowerCase() === 'i') onOpenInspector?.(selected.uri);
-    if (event.key === 'Escape') { cancelTransition(); onSelectNode?.(null); }
+    if (event.key === 'Escape') onSelectNode?.(null);
   };
 
   return (
@@ -1084,7 +1162,7 @@ export function MemoryConstellation3D({
         <button
           type="button"
           className="camera-ctrl-btn"
-          aria-label="Fit camera to resident scene"
+          aria-label="Fit camera to whole scene"
           onClick={() => {
             const host = hostRef.current;
             const aspect = host ? Math.max(1, host.clientWidth) / Math.max(1, host.clientHeight) : 1;

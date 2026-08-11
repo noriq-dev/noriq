@@ -115,6 +115,20 @@ export function fitConstellationCamera(
   return { target, yaw: base.yaw, pitch: base.pitch, distance };
 }
 
+/** Community fly-in uses the same camera-basis fit as Home, but with a little more breathing room
+ * and the normal focus distance ceiling so a system reads as a place rather than another overview. */
+export function fitConstellationClusterCamera(
+  items: readonly Constellation3DFitItem[],
+  options: Constellation3DFitOptions = {},
+): Constellation3DCamera {
+  return fitConstellationCamera(items, {
+    ...options,
+    padding: options.padding ?? 1.16,
+    minDistance: options.minDistance ?? 60,
+    maxDistance: options.maxDistance ?? 2_000,
+  });
+}
+
 export function orbitConstellationCamera(camera: Constellation3DCamera, dx: number, dy: number): Constellation3DCamera {
   return { ...camera, yaw: camera.yaw - dx * 0.006, pitch: clamp(camera.pitch - dy * 0.006, -Math.PI * 0.48, Math.PI * 0.48) };
 }

@@ -115,10 +115,10 @@ export interface ConstellationInspectorProps {
   incidentPages: ApiConstellationV2IncidentPage[];
   /** True while a relationship page (initial or continuation) is in flight. */
   relationshipsLoading: boolean;
-  /** True while `onOpenCommunity` is resolving (mirrors the old floating card's `expanding` gate). */
+  /** True while `onFocusCommunity` is making a non-resident system available. */
   expanding: boolean;
   onLoadMoreRelationships: () => void;
-  onOpenCommunity: (communityId: string) => void;
+  onFocusCommunity: (communityId: string) => void;
   onOpenEgoNetwork?: (uri: string) => void;
   onOpenInspector?: (uri: string) => void;
   onClear: () => void;
@@ -133,7 +133,7 @@ export interface ConstellationInspectorProps {
  */
 export function ConstellationInspector({
   pid, selected, incidentPages, relationshipsLoading, expanding,
-  onLoadMoreRelationships, onOpenCommunity, onOpenEgoNetwork, onOpenInspector, onClear,
+  onLoadMoreRelationships, onFocusCommunity, onOpenEgoNetwork, onOpenInspector, onClear,
 }: ConstellationInspectorProps) {
   const isCommunity = Boolean(selected.community);
   const isMemory = !isCommunity && selected.type === 'memory';
@@ -230,7 +230,7 @@ export function ConstellationInspector({
           )}
         </div>
         <div style={{ flex: 'none', borderTop: `1px solid ${INSPECTOR_LINE}`, padding: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
-          <Button onClick={() => onOpenCommunity(selected.id)} disabled={expanding}>{expanding ? 'opening…' : 'open community'}</Button>
+          <Button onClick={() => onFocusCommunity(selected.id)} disabled={expanding}>{expanding ? 'loading…' : 'focus system'}</Button>
           <button type="button" onClick={onClear} style={{ cursor: 'pointer', color: INSPECTOR_TEXT_DIM, fontSize: 11.5, background: 'transparent', border: 'none', padding: 0, font: 'inherit' }}>clear</button>
         </div>
       </aside>

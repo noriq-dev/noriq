@@ -20,8 +20,6 @@ export function isHistoricalIncidentEdgeType(type: string): boolean {
 export interface ConstellationV2Scene {
   nodes: Constellation3DNode[];
   edges: Constellation3DEdge[];
-  currentCommunity: ApiConstellationV2Community | null;
-  partial: boolean;
 }
 const communityNode = (community: ApiConstellationV2Community, boundaryRouteCount = 0): Constellation3DNode => ({
   id: community.id, uri: null, label: community.label, type: 'community', position: community.anchor,
@@ -32,40 +30,50 @@ const communityNode = (community: ApiConstellationV2Community, boundaryRouteCoun
 
 export function assembleConstellationV2Scene(
   overview: ApiConstellationV2Overview,
-  page: ApiConstellationV2CommunityPage | null,
+  residentPages: ApiConstellationV2CommunityPage | readonly ApiConstellationV2CommunityPage[] | null,
   incidentPages: ApiConstellationV2IncidentPage[],
 ): ConstellationV2Scene {
+  const pages = residentPages === null ? [] : Array.isArray(residentPages) ? residentPages : [residentPages];
   const nodes = new Map<string, Constellation3DNode>();
   const edges = new Map<string, Constellation3DEdge>();
-  const visibleCommunities = page
-    ? page.kind === 'communities' ? page.communities : []
-    : overview.communities;
+  const routes = new Map<string, (typeof overview.routes)[number]>();
+  for (const route of overview.routes) routes.set(`${route.fromCommunityId}:${route.toCommunityId}`, route);
+  for (const page of pages) {
+    for (const route of page.routes) routes.set(`${route.fromCommunityId}:${route.toCommunityId}`, route);
+  }
   // Sum of underlying-edge counts (route.count, not route.weight) across every boundary route
   // touching a community — the "N boundary routes" figure the hover tooltip states (PLNR-438).
   // Computed from the same route list `assembleConstellationV2Scene` already uses for edges below,
   // so it can never disagree with what the scene actually renders.
   const boundaryRouteCounts = new Map<string, number>();
-  for (const route of page?.routes ?? overview.routes) {
+  for (const route of routes.values()) {
     boundaryRouteCounts.set(route.fromCommunityId, (boundaryRouteCounts.get(route.fromCommunityId) ?? 0) + route.count);
     boundaryRouteCounts.set(route.toCommunityId, (boundaryRouteCounts.get(route.toCommunityId) ?? 0) + route.count);
   }
-  for (const community of [...visibleCommunities, ...(page?.externalCommunities ?? [])]) {
+  for (const community of overview.communities) {
     nodes.set(community.id, communityNode(community, boundaryRouteCounts.get(community.id) ?? 0));
   }
-  for (const entity of page?.entities ?? []) nodes.set(entity.nodeId, {
-    id: entity.nodeId, uri: entity.uri, label: entity.label, type: entity.type, position: entity.position,
-    degree: entity.degree, authority: entity.authority, validity: entity.validity, isLead: entity.isLead,
-    parentId: entity.communityId,
-  });
-  for (const route of page?.routes ?? overview.routes) edges.set(`aggregate:${route.fromCommunityId}:${route.toCommunityId}`, {
+  for (const page of pages) {
+    for (const community of [page.community, ...page.communities, ...page.externalCommunities]) {
+      if (!nodes.has(community.id)) nodes.set(community.id, communityNode(community, boundaryRouteCounts.get(community.id) ?? 0));
+    }
+    for (const entity of page.entities) nodes.set(entity.nodeId, {
+      id: entity.nodeId, uri: entity.uri, label: entity.label, type: entity.type, position: entity.position,
+      degree: entity.degree, authority: entity.authority, validity: entity.validity, isLead: entity.isLead,
+      parentId: entity.communityId,
+    });
+  }
+  for (const route of routes.values()) edges.set(`aggregate:${route.fromCommunityId}:${route.toCommunityId}`, {
     id: `aggregate:${route.fromCommunityId}:${route.toCommunityId}`, fromId: route.fromCommunityId, toId: route.toCommunityId,
     type: Object.entries(route.byType).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]?.[0] ?? 'related_to',
     direction: route.direction, weight: route.weight, aggregate: true,
   });
-  for (const edge of page?.backboneEdges ?? []) edges.set(`raw:${edge.edgeId}`, {
-    id: `raw:${edge.edgeId}`, fromId: edge.fromNodeId, toId: edge.toNodeId, type: edge.type,
-    direction: 'forward', weight: edge.weight, aggregate: false, provenance: edge.provenance, historical: edge.historical,
-  });
+  for (const page of pages) {
+    for (const edge of page.backboneEdges) edges.set(`raw:${edge.edgeId}`, {
+      id: `raw:${edge.edgeId}`, fromId: edge.fromNodeId, toId: edge.toNodeId, type: edge.type,
+      direction: 'forward', weight: edge.weight, aggregate: false, provenance: edge.provenance, historical: edge.historical,
+    });
+  }
 
   for (const incidentPage of incidentPages) {
     for (const incident of incidentPage.edges) {
@@ -98,16 +106,13 @@ export function assembleConstellationV2Scene(
       });
     }
   }
-  return {
-    nodes: [...nodes.values()], edges: [...edges.values()], currentCommunity: page?.community ?? null,
-    partial: Boolean(page && (!page.coverage.complete || page.nextCursor)) || incidentPages.some((incident) => !incident.coverage.complete || incident.nextCursor),
-  };
+  return { nodes: [...nodes.values()], edges: [...edges.values()] };
 }
 
 export interface ResidentConstellationPage<T> { communityId: string; value: T; nodeCount: number; touchedAt: number; pinned: boolean }
 
-/** LRU eviction for collapsed/off-route pages. Pinned path pages are never evicted; if those alone
- * exceed the budget the caller must stop expanding instead of silently dropping visible data. */
+/** LRU eviction for resident systems. A caller may pin the system being interacted with so loading
+ * it evicts an older resident rather than immediately evicting the requested page itself. */
 export function evictConstellationPages<T>(pages: ResidentConstellationPage<T>[], budget = CONSTELLATION_V2_RESIDENT_NODE_BUDGET): ResidentConstellationPage<T>[] {
   const result = [...pages];
   let resident = result.reduce((sum, page) => sum + page.nodeCount, 0);

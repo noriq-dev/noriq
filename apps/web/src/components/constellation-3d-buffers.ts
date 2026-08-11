@@ -182,7 +182,7 @@ export function communityTooltipContent(node: Constellation3DNode, maxTypeRows =
     entityCount: node.memberCount ?? 0,
     boundaryRouteCount: node.boundaryRouteCount ?? 0,
     topTypeCounts: sortedTypeCounts(node.typeCounts).slice(0, maxTypeRows).map(([type, count]) => ({ type, count })),
-    affordance: 'click to select · double-click to open',
+    affordance: 'click to select · double-click to fly in',
   };
 }
 
@@ -256,11 +256,14 @@ export function constellation3DCommunityWellScale(
   );
 }
 
-/** Root pages contain only real top-level communities. Exact `null` avoids mistaking older test
- * fixtures or an entered page's children for the overview that earns the four ambience calls. */
+/** The continuous root space contains top-level community wells plus any resident entities whose
+ * direct parent is one of those systems. Nested community pages still suppress the root guides. */
 export function constellation3DIsRootScene(nodes: readonly Constellation3DNode[]): boolean {
   const resident = nodes.filter((node) => !node.offPageStandIn);
-  return resident.length > 0 && resident.every((node) => node.community === true && node.parentId === null);
+  const rootIds = new Set(resident.filter((node) => node.community === true && node.parentId === null).map((node) => node.id));
+  return rootIds.size > 0 && resident.every((node) => node.community === true
+    ? node.parentId === null
+    : node.parentId !== null && node.parentId !== undefined && rootIds.has(node.parentId));
 }
 
 function deterministicUnit(seed: string): number {
@@ -324,10 +327,20 @@ export function constellation3DNodeEncoding(node: Constellation3DNode): Constell
   };
 }
 
-function compareLabelPriority(a: Constellation3DNodeInstance, b: Constellation3DNodeInstance, selectedNodeId: string | null) {
-  const score = (node: Constellation3DNodeInstance) =>
+function compareLabelPriority(
+  a: Constellation3DNodeInstance,
+  b: Constellation3DNodeInstance,
+  selectedNodeId: string | null,
+  byId: ReadonlyMap<string, Constellation3DNodeInstance>,
+) {
+  const score = (node: Constellation3DNodeInstance) => {
+    const parentPopulation = node.parentId ? byId.get(node.parentId)?.memberCount ?? 0 : 0;
+    return (
     (node.id === selectedNodeId ? 1_000_000 : 0) + (node.highlighted ? 500_000 : 0)
-      + (node.community ? 100_000 : 0) + (node.halo ? 10_000 : 0) + node.degree;
+      + (node.community ? 100_000 + (node.memberCount ?? 0) * 100 : parentPopulation * 100)
+      + (node.halo ? 10_000 : 0) + node.degree
+    );
+  };
   return score(b) - score(a) || a.id.localeCompare(b.id);
 }
 
@@ -382,7 +395,7 @@ export function buildConstellation3DRenderPlan(
   // PLNR-448: an off-page stand-in never earns a text label either — same honesty rule as the
   // shape-group exclusion above, applied to the label budget instead of the instancing pass.
   const labels = [...byId.values()].filter((node) => !node.offPageStandIn)
-    .sort((a, b) => compareLabelPriority(a, b, selectedNodeId)).slice(0, Math.max(0, labelBudget));
+    .sort((a, b) => compareLabelPriority(a, b, selectedNodeId, byId)).slice(0, Math.max(0, labelBudget));
   // PLNR-439: promoted edges (selection) split into up to three separate passes so historical and
   // off-page relationships can carry their own dash pattern/opacity instead of sharing the solid
   // amber line every other promoted edge gets — each pass is only allotted when the plan actually

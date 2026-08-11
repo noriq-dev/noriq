@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   CONSTELLATION_DOUBLE_CLICK_MS, CONSTELLATION_DRAG_THRESHOLD_PX, constellation3DClickIntent,
-  constellation3DHasDragged, constellation3DKeyboardZoomIntent,
+  constellation3DCommunityCluster, constellation3DCommunityClusterCamera, constellation3DHasDragged, constellation3DKeyboardZoomIntent,
 } from './MemoryConstellation3D';
+import { DEFAULT_CONSTELLATION_3D_CAMERA } from './constellation-3d-navigation';
 
 describe('MemoryConstellation3D click intent (PLNR-463)', () => {
   it('keeps a single node click selection-only and recognizes the same node inside the double-click window', () => {
@@ -37,5 +38,20 @@ describe('MemoryConstellation3D click intent (PLNR-463)', () => {
     expect(constellation3DKeyboardZoomIntent('Enter', 'node-a')).toBe(true);
     expect(constellation3DKeyboardZoomIntent('ArrowRight', 'node-a')).toBe(false);
     expect(constellation3DKeyboardZoomIntent('Enter', null)).toBe(false);
+  });
+
+  it('turns a community double-click into its member cluster, not the anchor supernode', () => {
+    const intent = constellation3DClickIntent({ nodeId: 'system', at: 1_000 }, 'system', 1_100, 0);
+    const nodes = [
+      { id: 'system', uri: null, label: 'System', type: 'community', position: [0, 0, 0] as [number, number, number], degree: 2, community: true, parentId: null },
+      { id: 'member-a', uri: 'noriq://task/a', label: 'A', type: 'task', position: [-20, 0, 0] as [number, number, number], degree: 1, parentId: 'system' },
+      { id: 'member-b', uri: 'noriq://task/b', label: 'B', type: 'task', position: [20, 0, 0] as [number, number, number], degree: 1, parentId: 'system' },
+      { id: 'other', uri: 'noriq://task/c', label: 'C', type: 'task', position: [500, 0, 0] as [number, number, number], degree: 1, parentId: 'other-system' },
+    ];
+    expect(intent.zoom).toBe(true);
+    expect(constellation3DCommunityCluster(nodes, 'system').map((node) => node.id)).toEqual(['member-a', 'member-b']);
+    expect(constellation3DCommunityClusterCamera(nodes, 'system', 1.5, DEFAULT_CONSTELLATION_3D_CAMERA)).toMatchObject({
+      target: [0, 0, 0],
+    });
   });
 });

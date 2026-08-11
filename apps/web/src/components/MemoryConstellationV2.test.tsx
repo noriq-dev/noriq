@@ -7,9 +7,10 @@ import { api, type ApiConstellationV2CommunityPage, type ApiConstellationV2Revis
 // stand-in either way — real MemoryConstellation3D needs a WebGL context jsdom cannot provide —
 // but most of this file wants the always-reachable Catalogue peer, and only the legend test
 // (PLNR-438, Space-view-only chrome) needs to opt out of the forced failure).
-const mockRenderer3D = vi.hoisted(() => ({ failOnMount: true }));
+const mockRenderer3D = vi.hoisted(() => ({ failOnMount: true, props: null as Record<string, unknown> | null }));
 vi.mock('./MemoryConstellation3D', () => ({
-  default: (props: { onRendererFailure?: (reason: string) => void }) => {
+  default: (props: { onRendererFailure?: (reason: string) => void } & Record<string, unknown>) => {
+    mockRenderer3D.props = props;
     useEffect(() => { if (mockRenderer3D.failOnMount) props.onRendererFailure?.('WebGL2 unavailable in test'); }, [props.onRendererFailure]);
     return null;
   },
@@ -31,7 +32,7 @@ const tick = (ms = 0) => act(async () => { await new Promise((resolve) => setTim
 
 afterEach(() => {
   act(() => root?.unmount()); root = null; host?.remove(); vi.restoreAllMocks();
-  mockRenderer3D.failOnMount = true;
+  mockRenderer3D.failOnMount = true; mockRenderer3D.props = null;
 });
 
 describe('MemoryConstellationV2 graceful textual parity', () => {
@@ -58,7 +59,7 @@ describe('MemoryConstellationV2 graceful textual parity', () => {
     act(() => hit.click());
     await tick(); await tick();
 
-    expect(api.memoryConstellationV2Community).toHaveBeenCalledWith('p1', 'root', expect.objectContaining({ cursor: 'more' }), undefined);
+    expect(api.memoryConstellationV2Community).toHaveBeenCalledWith('p1', 'root', expect.objectContaining({ cursor: 'more' }), expect.any(AbortSignal));
     expect(host.textContent).toContain('Memory b');
     const memoryB = [...host.querySelectorAll('button')].find((button) => button.textContent?.startsWith('Memory b'))!;
     const fallbackRow = memoryB.parentElement!;
@@ -70,8 +71,8 @@ describe('MemoryConstellationV2 graceful textual parity', () => {
   });
 });
 
-describe('MemoryConstellationV2 header band, breadcrumb row, and resident meter (PLNR-435)', () => {
-  it('shows generation/counts chrome, keeps every breadcrumb crumb a real focusable button with the trailing one current, and tracks the resident meter through expand and collapse', async () => {
+describe('MemoryConstellationV2 continuous-space chrome and resident meter (PLNR-464)', () => {
+  it('retires breadcrumbs, keeps overview counts, and streams the root system into the resident scene automatically', async () => {
     vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision, communities: [rootCommunity], routes: [], coverage: { complete: true, reasons: [] } });
     vi.spyOn(api, 'memoryConstellationV2Community').mockResolvedValue(page('a', null));
     host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
@@ -95,82 +96,114 @@ describe('MemoryConstellationV2 header band, breadcrumb row, and resident meter 
     expect(spaceToggle.style.padding).not.toBe('');
     expect(catalogueToggle.style.background).not.toBe('');
 
-    // Breadcrumb row: a single "Project" crumb at root, styled as the current (trailing) crumb.
-    const crumbs = () => [...host.querySelectorAll('button')].filter((button) => button.textContent === 'Project' || button.textContent === 'Root community');
-    expect(crumbs()).toHaveLength(1);
-    const rootCrumb = crumbs()[0]!;
-    expect(rootCrumb.tagName).toBe('BUTTON');
-    expect(rootCrumb.getAttribute('aria-current')).toBe('location');
-    expect(rootCrumb.tabIndex).not.toBe(-1);
-    expect(rootCrumb.style.color).not.toBe('');
-    expect(host.textContent).toContain('root level · double-click a community to open it');
+    expect(host.textContent).toContain('Project space');
+    expect(host.textContent).toContain('continuous space · double-click a system to fly in');
+    expect(host.querySelector('[aria-current="location"]')).toBeNull();
+    expect(host.textContent).not.toContain('level 1');
 
-    // Resident meter starts at zero — nothing has been fetched into residency yet.
+    // Auto-expansion fetched the complete member page without an open/collapse journey.
     const meter = () => host.querySelector('[role="img"][aria-label^="Resident nodes"]')!;
-    expect(host.textContent).toContain('resident 0 / 12,000 nodes');
-    expect(meter().getAttribute('aria-label')).toBe('Resident nodes: 0 of 12,000 budget');
-
-    // Expand the root community — the fallback catalogue's "open" button next to it.
-    const openRoot = [...host.querySelectorAll('button')].find((button) => button.textContent === 'open')!;
-    act(() => openRoot.click());
-    await tick(); await tick();
-
-    // Meter tracks the expansion: the fetched page (1 entity) is now resident.
     expect(host.textContent).toContain('resident 1 / 12,000 nodes');
     expect(meter().getAttribute('aria-label')).toBe('Resident nodes: 1 of 12,000 budget');
-    // Breadcrumb grew a second, now-trailing crumb for the opened community; "Project" demoted to ancestor styling.
-    expect(crumbs()).toHaveLength(2);
-    const [projectCrumb, communityCrumb] = crumbs() as [HTMLButtonElement, HTMLButtonElement];
-    expect(projectCrumb.textContent).toBe('Project');
-    expect(projectCrumb.getAttribute('aria-current')).toBeNull();
-    expect(communityCrumb.textContent).toBe('Root community');
-    expect(communityCrumb.getAttribute('aria-current')).toBe('location');
-    expect(host.textContent).toContain('level 1');
+    expect(host.textContent).toContain('Root community');
+    expect(host.textContent).toContain('Memory a');
+    expect([...host.querySelectorAll('button')].some((button) => button.textContent === 'open')).toBe(false);
+  });
+});
 
-    // Collapse back to root via the "Project" crumb.
-    act(() => projectCrumb.click());
-    await tick();
+describe('MemoryConstellationV2 continuous resident model (PLNR-464)', () => {
+  const secondCommunity = {
+    ...rootCommunity, id: 'other', label: 'Other system', memberCount: 1,
+    anchor: [300, 0, 0] as [number, number, number],
+  };
+  const pageFor = (community: typeof rootCommunity, id: string): ApiConstellationV2CommunityPage => ({
+    ...page(id, null), community, entities: [{ ...entity(id), communityId: community.id, position: community.anchor }],
+  });
 
-    expect(crumbs()).toHaveLength(1);
-    expect(crumbs()[0]!.getAttribute('aria-current')).toBe('location');
-    // The fetched page stays resident after collapsing (eviction is lazy, keyed off the next store, not
-    // off leaving a level) — the meter keeps reporting the true resident count rather than resetting to
-    // zero as if nothing were loaded.
-    expect(host.textContent).toContain('resident 1 / 12,000 nodes');
+  it('assembles entities from multiple auto-expanded systems into the overview scene at once', async () => {
+    mockRenderer3D.failOnMount = false;
+    vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({
+      revision, communities: [rootCommunity, secondCommunity],
+      routes: [{ fromCommunityId: 'root', toCommunityId: 'other', direction: 'forward', count: 1, weight: 2, byType: { depends_on: 1 } }],
+      coverage: { complete: true, reasons: [] },
+    });
+    vi.spyOn(api, 'memoryConstellationV2Community').mockImplementation(async (_pid, communityId) =>
+      communityId === 'root' ? pageFor(rootCommunity, 'a') : pageFor(secondCommunity, 'b'));
+    host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
+    act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
+    await tick(); await tick(); await tick();
+
+    const nodes = mockRenderer3D.props?.nodes as Array<{ id: string; parentId?: string }>;
+    expect(nodes.map((node) => node.id)).toEqual(expect.arrayContaining(['root', 'other', 'a', 'b']));
+    expect(nodes.find((node) => node.id === 'a')?.parentId).toBe('root');
+    expect(nodes.find((node) => node.id === 'b')?.parentId).toBe('other');
+    expect(mockRenderer3D.props?.residentCommunityIds).toEqual(expect.arrayContaining(['root', 'other']));
+  });
+
+  it('leaves over-budget systems as wells only and names the honest load-on-demand state', async () => {
+    const oversized = { ...rootCommunity, memberCount: 12_001 };
+    mockRenderer3D.failOnMount = false;
+    vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision, communities: [oversized], routes: [], coverage: { complete: true, reasons: [] } });
+    const communityRequest = vi.spyOn(api, 'memoryConstellationV2Community').mockResolvedValue(page('never', null));
+    host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
+    act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
+    await tick(); await tick();
+
+    expect(communityRequest).not.toHaveBeenCalled();
+    expect((mockRenderer3D.props?.nodes as Array<{ id: string }>).map((node) => node.id)).toEqual(['root']);
+    expect(host.textContent).toContain('1 system not loaded — double-click one to load it.');
+  });
+
+  it('focuses an exact search hit in place after ensuring its system is resident', async () => {
+    mockRenderer3D.failOnMount = false;
+    vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision, communities: [rootCommunity], routes: [], coverage: { complete: true, reasons: [] } });
+    vi.spyOn(api, 'memoryConstellationV2Community').mockResolvedValue(page('a', null));
+    vi.spyOn(api, 'memoryConstellationV2Route').mockResolvedValue({ revision, nodeId: 'a', uri: 'noriq://memory/a', communityPath: [rootCommunity] });
+    vi.spyOn(api, 'memoryConstellationV2Incidents').mockResolvedValue({ revision, node: { nodeId: 'a', uri: 'noriq://memory/a', type: 'memory', label: 'Memory a', communityPath: [rootCommunity] }, edges: [], nextCursor: null, coverage: { complete: true, reasons: [] } });
+    vi.spyOn(api, 'memorySearch').mockResolvedValue({ mode: 'keyword', results: [{ entityType: 'memory', id: 'a', uri: 'noriq://memory/a', title: 'Memory a', snippet: '', stage: 'lexical', score: 1, isLead: true, leadReasons: [], finalScore: 1 }], evidenceFrame: { text: '', itemsIncluded: 0, itemsOmitted: 0, truncated: false, charsUsed: 0, suspiciousCount: 0 } });
+    host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
+    act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
+    await tick(); await tick();
+    const search = host.querySelector('input[placeholder^="Search memory"]') as HTMLInputElement;
+    act(() => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(search, 'memory a');
+      search.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await tick(350); await tick();
+    const hit = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Memory a') && button.closest('[aria-label="Search matches"]'))!;
+    act(() => hit.click());
+    await tick(); await tick();
+
+    expect((mockRenderer3D.props?.focusRequest as { nodeId: string }).nodeId).toBe('a');
+    expect(mockRenderer3D.props?.selectedNodeId).toBe('a');
+    expect(host.textContent).not.toContain('level 1');
   });
 });
 
 describe('MemoryConstellationV2 status region (PLNR-436)', () => {
-  it('stacks error, stale, and partial notices as ordered siblings in one flow container with no positional coupling, and the partial notice carries its own continue action', async () => {
+  it('stacks selection errors and stale state without reviving the retired partial-level notice', async () => {
     const staleRevision: ApiConstellationV2Revision = { ...revision, state: 'stale', sourceRevision: 3, currentRevision: 7 };
     vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision: staleRevision, communities: [rootCommunity], routes: [], coverage: { complete: true, reasons: [] } });
-    vi.spyOn(api, 'memoryConstellationV2Community').mockImplementation(async () => ({ ...page('a', 'more'), revision: staleRevision }));
+    vi.spyOn(api, 'memoryConstellationV2Community').mockResolvedValue({ ...page('a', null), revision: staleRevision });
     vi.spyOn(api, 'memoryConstellationV2Incidents').mockRejectedValue(new Error('Incident boom'));
     host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
     act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
     await tick(); await tick();
 
-    // Expand the root community: entities page has a nextCursor, so scene.partial becomes true.
-    const openRoot = [...host.querySelectorAll('button')].find((button) => button.textContent === 'open')!;
-    act(() => openRoot.click());
-    await tick(); await tick();
-
-    // Select the resident entity: the mocked incident fetch rejects, driving the error notice.
+    // Select the auto-resident entity: the mocked incident fetch rejects, driving the error notice.
     const entityRow = [...host.querySelectorAll('button')].find((button) => button.textContent?.startsWith('Memory a'))!;
     act(() => entityRow.click());
     await tick(); await tick();
 
     const notices = [...host.querySelectorAll('[role="status"]')];
-    // Fixed severity order: error -> stale -> building -> partial -> informational (Navigator
-    // conventions doc §3). error/stale/partial are reachable simultaneously here, plus the renderer
-    // failure this suite's default MemoryConstellation3D mock always triggers (PLNR-442: the
-    // failure reason now rides this SAME status region, informational severity, rather than a
-    // separate ad hoc box).
+    // Fixed severity order: error -> stale -> informational. The unindexed and renderer-failure
+    // notices remain, while the old partial-level continuation is gone with level navigation.
     expect(notices).toHaveLength(4);
     expect(notices[0]!.textContent).toContain('Incident boom');
     expect(notices[1]!.textContent).toContain('This generation is stale (source 3, current 7).');
-    expect(notices[2]!.textContent).toContain('Partial level · bounded continuation available');
+    expect(notices[2]!.textContent).toContain('No repository entities are present');
     expect(notices[3]!.textContent).toContain('3D view unavailable — textual navigation remains active');
+    expect(host.textContent).not.toContain('Partial level');
 
     // All three are siblings under the same flow container — not independently offset elements.
     const parent = notices[0]!.parentElement!;
@@ -183,19 +216,13 @@ describe('MemoryConstellationV2 status region (PLNR-436)', () => {
       expect((notice as HTMLElement).style.top).toBe('');
       expect((notice as HTMLElement).style.left).toBe('');
     }
-
-    // The former standalone "load more in community" button is now this notice's inline action.
-    const continueAction = notices[2]!.querySelector('button')!;
-    expect(continueAction.textContent).toBe('continue');
-    act(() => continueAction.click());
-    await tick();
-    expect(api.memoryConstellationV2Community).toHaveBeenCalledWith('p1', 'root', expect.objectContaining({ cursor: 'more' }), undefined);
   });
 
   it('stacks building and informational (unindexed) notices together at root, in severity order, without reading each other\'s presence', async () => {
     const buildingRevision: ApiConstellationV2Revision = { ...revision, state: 'building' };
     // No file/symbol/repository counts anywhere, so codeEntities === 0 at root.
     vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision: buildingRevision, communities: [rootCommunity], routes: [], coverage: { complete: true, reasons: [] } });
+    vi.spyOn(api, 'memoryConstellationV2Community').mockResolvedValue({ ...page('a', null), revision: buildingRevision });
     host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
     act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
     await tick(); await tick();
@@ -267,10 +294,6 @@ describe('MemoryConstellationV2 selection inspector overlay (PLNR-462)', () => {
     act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
     await tick(); await tick();
 
-    const openRoot = [...host.querySelectorAll('button')].find((button) => button.textContent === 'open')!;
-    act(() => openRoot.click());
-    await tick(); await tick();
-
     const entityRow = [...host.querySelectorAll('button')].find((button) => button.textContent?.startsWith('Memory a'))!;
     act(() => entityRow.click());
     await tick(); await tick();
@@ -303,7 +326,7 @@ describe('MemoryConstellationV2 selection inspector overlay (PLNR-462)', () => {
     expect([...inspector.querySelectorAll('button')].some((button) => button.textContent?.startsWith('load next page'))).toBe(false);
   });
 
-  it('shows the community aggregate view (never a relationship list) and wires "open community" through the same expand path the catalogue row uses', async () => {
+  it('shows the community aggregate view and focuses its already-resident cluster without changing levels', async () => {
     vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision, communities: [rootCommunity], routes: [], coverage: { complete: true, reasons: [] } });
     vi.spyOn(api, 'memoryConstellationV2Community').mockResolvedValue(page('a', null));
     host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
@@ -319,13 +342,11 @@ describe('MemoryConstellationV2 selection inspector overlay (PLNR-462)', () => {
     expect(inspector.textContent).toContain('2 entities');
     expect(inspector.textContent).not.toContain('Relationships');
 
-    const openCommunity = [...inspector.querySelectorAll('button')].find((button) => button.textContent === 'open community')!;
-    act(() => openCommunity.click());
+    const focusSystem = [...inspector.querySelectorAll('button')].find((button) => button.textContent === 'focus system')!;
+    act(() => focusSystem.click());
     await tick(); await tick();
-    // Same `expand()`/`api.memoryConstellationV2Community` path the catalogue row's own "open"
-    // button already drives — the dock is a lens onto the existing expansion, not a second one.
-    expect(api.memoryConstellationV2Community).toHaveBeenCalledWith('p1', 'root', expect.objectContaining({ limit: 256 }), undefined);
-    expect(host.textContent).toContain('level 1');
+    expect(api.memoryConstellationV2Community).toHaveBeenCalledWith('p1', 'root', expect.objectContaining({ limit: 256 }), expect.any(AbortSignal));
+    expect(host.textContent).not.toContain('level 1');
   });
 });
 
@@ -333,6 +354,7 @@ describe('MemoryConstellationV2 Catalogue as a designed peer view (PLNR-442)', (
   it('is selectable from the header while the renderer is healthy (not only entered by failure), switches back to Space, and the old <details> disclosure is gone entirely', async () => {
     mockRenderer3D.failOnMount = false; // renderer succeeds — no forced Catalogue
     vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision, communities: [rootCommunity], routes: [], coverage: { complete: true, reasons: [] } });
+    vi.spyOn(api, 'memoryConstellationV2Community').mockResolvedValue(page('a', null));
     host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
     act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
     await tick(); await tick();
@@ -367,6 +389,7 @@ describe('MemoryConstellationV2 Catalogue as a designed peer view (PLNR-442)', (
 
   it('names the renderer failure as a status notice sharing the SAME severity-ordered region as every other truthful-degradation message, not a separate ad hoc box', async () => {
     vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision, communities: [rootCommunity], routes: [], coverage: { complete: true, reasons: [] } });
+    vi.spyOn(api, 'memoryConstellationV2Community').mockResolvedValue(page('a', null));
     host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
     act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
     await tick(); await tick();
@@ -499,7 +522,7 @@ describe('MemoryConstellationV2 search ignite (PLNR-441)', () => {
     expect(row.style.borderLeft).toContain('var(--accent)');
     // Off-page: not yet loaded anywhere on canvas, so picking it will fly the camera and load pages —
     // the routing community is named before that flight is committed to.
-    expect(row.textContent).toContain('off-page · picking it routes via Root community');
+    expect(row.textContent).toContain('not resident · picking loads Root community');
   });
 
   it('does not call an already-resident match off-page, and Enter routes the top hit exactly like a click', async () => {
@@ -510,10 +533,6 @@ describe('MemoryConstellationV2 search ignite (PLNR-441)', () => {
     vi.spyOn(api, 'memorySearch').mockResolvedValue(searchResult([hit({ id: 'a', uri: 'noriq://memory/a', title: 'Memory a' })]));
     host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
     act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
-    await tick(); await tick();
-
-    const openRoot = [...host.querySelectorAll('button')].find((button) => button.textContent === 'open')!;
-    act(() => openRoot.click());
     await tick(); await tick();
 
     const search = host.querySelector('input[placeholder^="Search memory"]') as HTMLInputElement;

@@ -66,6 +66,17 @@ describe('constellation 3D buffer planning', () => {
     expect(plan.labels[0]!.id).toBe('n9999');
   });
 
+  it('spends the bounded entity-label remainder on the biggest resident systems first', () => {
+    const nodes = [
+      node('large', 'community', { community: true, parentId: null, memberCount: 200 }),
+      node('small', 'community', { community: true, parentId: null, memberCount: 8 }),
+      node('large-member', 'task', { parentId: 'large', degree: 1 }),
+      node('small-member', 'task', { parentId: 'small', degree: 99, isLead: true }),
+    ];
+    const plan = buildConstellation3DRenderPlan(nodes, [], null, 3);
+    expect(plan.labels.map((label) => label.id)).toEqual(['large', 'small', 'large-member']);
+  });
+
   it('accounts for the root starfield and three orbit guides at an exact 10 draw calls', () => {
     // Nine communities, matching the actual root overview reference frame — the scene this task
     // adds the most rendering work to (gravity-well falloff, aggregate-route tubes).
@@ -179,7 +190,7 @@ describe('community hover tooltip content (PLNR-438)', () => {
     const tooltip = communityTooltipContent(community);
     expect(tooltip).toMatchObject({ name: 'Coordination core', entityCount: 733, boundaryRouteCount: 84 });
     expect(tooltip!.topTypeCounts).toEqual([{ type: 'task', count: 291 }, { type: 'file', count: 274 }, { type: 'memory', count: 168 }]);
-    expect(tooltip!.affordance).toBe('click to select · double-click to open');
+    expect(tooltip!.affordance).toBe('click to select · double-click to fly in');
   });
 
   it('defaults entity/boundary counts to zero and an empty top-types list rather than throwing when the fields are absent', () => {
@@ -215,10 +226,14 @@ describe('deterministic galaxy ambience (PLNR-461)', () => {
     }
   });
 
-  it('recognizes only a page made entirely of real, explicitly top-level communities as root', () => {
+  it('recognizes top-level systems plus their resident entities as the continuous root space', () => {
     expect(constellation3DIsRootScene([
       node('a', 'community', { community: true, parentId: null }),
       node('b', 'community', { community: true, parentId: null }),
+    ])).toBe(true);
+    expect(constellation3DIsRootScene([
+      node('root', 'community', { community: true, parentId: null }),
+      node('entity', 'task', { parentId: 'root' }),
     ])).toBe(true);
     expect(constellation3DIsRootScene([node('child', 'community', { community: true, parentId: 'root' })])).toBe(false);
     expect(constellation3DIsRootScene([node('entity')])).toBe(false);

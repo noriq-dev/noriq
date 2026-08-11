@@ -31,6 +31,21 @@ describe('Constellation v2 scene assembly', () => {
     expect(merged.coverage).toEqual({ complete: true, reasons: [] });
   });
 
+  it('assembles multiple resident community pages without replacing the root field', () => {
+    const firstPage = page([{ nodeId: 'a', uri: 'noriq://memory/a' }], null);
+    const first = { ...firstPage, community: community('root'), entities: firstPage.entities.map((entity) => ({ ...entity, communityId: 'root' })) };
+    const second = {
+      ...page([{ nodeId: 'b', uri: 'noriq://memory/b' }], null),
+      community: community('other'),
+      entities: page([{ nodeId: 'b', uri: 'noriq://memory/b' }], null).entities.map((entity) => ({ ...entity, communityId: 'other' })),
+    };
+    const scene = assembleConstellationV2Scene(overview, [first, second], []);
+    expect(scene.nodes.map((node) => node.id)).toEqual(expect.arrayContaining(['root', 'other', 'a', 'b']));
+    expect(scene.nodes.find((node) => node.id === 'a')?.parentId).toBe('root');
+    expect(scene.nodes.find((node) => node.id === 'b')?.parentId).toBe('other');
+    expect(scene.edges.map((edge) => edge.id)).toContain('aggregate:root:other');
+  });
+
   it('adds bounded inbound/outbound incident detail and truthful off-page community context', () => {
     const merged = page([{ nodeId: 'a', uri: 'noriq://memory/a' }, { nodeId: 'b', uri: 'noriq://task/b' }], null);
     const incidents: ApiConstellationV2IncidentPage = {
@@ -43,7 +58,7 @@ describe('Constellation v2 scene assembly', () => {
     };
     const base = assembleConstellationV2Scene(overview, merged, []);
     const selected = assembleConstellationV2Scene(overview, merged, [incidents]);
-    expect(base.edges.map((edge) => edge.id)).toEqual(['aggregate:leaf:other', 'raw:backbone']);
+    expect(base.edges.map((edge) => edge.id)).toEqual(['aggregate:root:other', 'aggregate:leaf:other', 'raw:backbone']);
     expect(selected.nodes.map((node) => node.id)).toContain('outside-root');
     expect(selected.edges).toEqual(expect.arrayContaining([
       // PLNR-445: an incoming incident edge must render as 'reverse' (← in the typed label), not
@@ -51,7 +66,6 @@ describe('Constellation v2 scene assembly', () => {
       expect.objectContaining({ id: 'incident:incoming', fromId: 'outside-root', toId: 'a', direction: 'reverse', historical: true, aggregate: true }),
       expect.objectContaining({ id: 'incident:outgoing', fromId: 'a', toId: 'b', direction: 'forward', aggregate: false }),
     ]));
-    expect(selected.partial).toBe(true);
     expect(assembleConstellationV2Scene(overview, merged, []).edges).toEqual(base.edges);
     // PLNR-448: the substituted stand-in must be marked so the renderer can exclude it from the
     // normal community passes (gravity well, core sphere, label) — it exists only for the edge

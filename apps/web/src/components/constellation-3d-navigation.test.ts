@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_CONSTELLATION_3D_CAMERA, createCameraTransition, dollyConstellationCamera, focusConstellationCamera,
-  fitConstellationCamera, loadConstellation3DPreferences, orbitConstellationCamera, sampleCameraTransition,
+  fitConstellationCamera, fitConstellationClusterCamera, loadConstellation3DPreferences, orbitConstellationCamera, sampleCameraTransition,
 } from './constellation-3d-navigation';
 
 describe('constellation 3D navigation and preferences', () => {
@@ -50,6 +50,16 @@ describe('constellation 3D navigation and preferences', () => {
     expect(single).toMatchObject({ target: [4, 5, 6], distance: 60 });
     expect(Number.isFinite(single.distance)).toBe(true);
     expect(fitConstellationCamera([])).toEqual(DEFAULT_CONSTELLATION_3D_CAMERA);
+  });
+
+  it('fits a community member cluster around its own centroid with fly-in padding', () => {
+    const fitted = fitConstellationClusterCamera([
+      { position: [80, -10, 0], radius: 5 },
+      { position: [120, 10, 0], radius: 5 },
+    ], { aspect: 1.5 });
+    expect(fitted.target).toEqual([100, 0, 0]);
+    expect(fitted.distance).toBeGreaterThanOrEqual(60);
+    expect(fitted.distance).toBeLessThan(2_000);
   });
 
   it('keeps only a stored camera from the same generation and layout', () => {

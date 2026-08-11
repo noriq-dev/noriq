@@ -29,6 +29,24 @@ describe('deterministic constellation 3D layout', () => {
     expect(incompatible).toEqual(computeConstellation3DLayout(input));
   });
 
+  it('keeps simultaneous resident systems clustered around their own parent anchors', () => {
+    const multi: Constellation3DLayoutInput = {
+      ...input,
+      nodes: [
+        { id: 'left', uri: null, label: 'left', type: 'community', position: [-400, 0, 0], degree: 1, community: true, radius: 90 },
+        { id: 'left-a', uri: 'noriq://task/left-a', label: 'left-a', type: 'task', position: [-360, 0, 0], degree: 1, parentId: 'left' },
+        { id: 'right', uri: null, label: 'right', type: 'community', position: [400, 0, 0], degree: 1, community: true, radius: 90 },
+        { id: 'right-a', uri: 'noriq://task/right-a', label: 'right-a', type: 'task', position: [360, 0, 0], degree: 1, parentId: 'right' },
+      ],
+      edges: [],
+    };
+    const result = computeConstellation3DLayout(multi);
+    expect(Math.abs(result.positions['left-a']![0] - result.positions.left![0])).toBeLessThanOrEqual(90.001);
+    expect(Math.abs(result.positions['right-a']![0] - result.positions.right![0])).toBeLessThanOrEqual(90.001);
+    expect(result.positions['left-a']![0]).toBeLessThan(0);
+    expect(result.positions['right-a']![0]).toBeGreaterThan(0);
+  });
+
   it('uses a bounded spatial grid with stable nearest tie-breaking', () => {
     const positions = new Map<string, [number, number, number]>([['b', [1, 0, 0]], ['a', [-1, 0, 0]], ['far', [500, 0, 0]]]);
     const index = buildConstellation3DSpatialIndex(positions, 20);

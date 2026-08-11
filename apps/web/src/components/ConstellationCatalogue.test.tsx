@@ -1,14 +1,8 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { ApiConstellationV2CommunityPage, ApiConstellationV2Revision } from '../api';
 import type { Constellation3DNode } from './constellation-3d-buffers';
 import { ConstellationCatalogue } from './ConstellationCatalogue';
-
-const revision: ApiConstellationV2Revision = {
-  contract: 'constellation-v2', generationId: 'g1', sourceRevision: 1, currentRevision: 1,
-  topologyVersion: 'connectivity-v1', layoutVersion: 'space-v1', state: 'current', generatedAt: 'now',
-};
 
 const memoryEntity: Constellation3DNode = {
   id: 'a', uri: 'noriq://memory/a', label: 'API keys are OAuth-only', type: 'memory',
@@ -31,14 +25,6 @@ const offPageCommunity: Constellation3DNode = {
   community: true, memberCount: 512, typeCounts: { task: 400 }, boundaryRouteCount: 0, offPageStandIn: true,
 };
 
-const communityPage = (overrides: Partial<ApiConstellationV2CommunityPage> = {}): ApiConstellationV2CommunityPage => ({
-  revision,
-  community: { id: 'c1', parentId: null, level: 0, label: 'Coordination core', memberCount: 120, childCommunityCount: 0, typeCounts: { task: 80, memory: 40 }, internalEdgeCount: 9, internalWeight: 1, normalizedCohesion: 1, boundaryWeight: 0, anchor: [0, 0, 0] },
-  kind: 'entities', communities: [], entities: [], backboneEdges: [], routes: [], externalCommunities: [],
-  nextCursor: null, coverage: { complete: true, reasons: [] },
-  ...overrides,
-});
-
 let host: HTMLDivElement;
 let root: Root | null = null;
 
@@ -53,11 +39,10 @@ function render(props: Partial<React.ComponentProps<typeof ConstellationCatalogu
       matchCounts={new Map()}
       searchActive={false}
       selectedNodeId={null}
-      currentPage={null}
+      residentCommunityIds={new Set(['c1'])}
       expanding={false}
       onSelectNode={() => {}}
-      onExpandCommunity={() => {}}
-      onLoadNextPage={() => {}}
+      onFocusCommunity={() => {}}
       {...props}
     />,
   ));
@@ -92,7 +77,7 @@ describe('ConstellationCatalogue rows (PLNR-442)', () => {
   });
 
   it('every interactive control is a real <button> (keyboard reachability falls out of ordinary DOM structure)', () => {
-    render({ currentPage: communityPage({ nextCursor: 'more' }) });
+    render();
     const interactiveLikelyElements = [...host.querySelectorAll('[onclick], [role="button"]')];
     expect(interactiveLikelyElements).toHaveLength(0); // nothing faking a button
     const buttons = [...host.querySelectorAll('button')];
@@ -108,9 +93,9 @@ describe('ConstellationCatalogue rows (PLNR-442)', () => {
 });
 
 describe('ConstellationCatalogue community rows expandable inline (PLNR-442)', () => {
-  it('toggles an inline preview (entity count, boundary routes, top type chips) without navigating or firing onExpandCommunity', () => {
-    const onExpandCommunity = vi.fn();
-    render({ nodes: [community], onExpandCommunity });
+  it('toggles an inline preview (entity count, boundary routes, top type chips) without navigating or firing onFocusCommunity', () => {
+    const onFocusCommunity = vi.fn();
+    render({ nodes: [community], onFocusCommunity });
     expect(host.textContent).not.toContain('boundary routes');
 
     const toggle = host.querySelector('button[aria-expanded]') as HTMLButtonElement;
@@ -119,19 +104,19 @@ describe('ConstellationCatalogue community rows expandable inline (PLNR-442)', (
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
     expect(host.textContent).toContain('120 entities · 14 boundary routes');
     expect(host.textContent).toContain('task'); // top type count row
-    expect(onExpandCommunity).not.toHaveBeenCalled();
+    expect(onFocusCommunity).not.toHaveBeenCalled();
 
     act(() => toggle.click());
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
     expect(host.textContent).not.toContain('boundary routes');
   });
 
-  it('still lets "open" descend into the community via the same onExpandCommunity/expand path as before, independent of the preview toggle', () => {
-    const onExpandCommunity = vi.fn();
-    render({ nodes: [community], onExpandCommunity });
-    const open = [...host.querySelectorAll('button')].find((button) => button.textContent === 'open')!;
-    act(() => open.click());
-    expect(onExpandCommunity).toHaveBeenCalledWith('c1');
+  it('focuses a resident system without introducing a level-navigation action', () => {
+    const onFocusCommunity = vi.fn();
+    render({ nodes: [community], onFocusCommunity });
+    const focus = [...host.querySelectorAll('button')].find((button) => button.textContent === 'focus system')!;
+    act(() => focus.click());
+    expect(onFocusCommunity).toHaveBeenCalledWith('c1');
   });
 });
 
@@ -147,38 +132,18 @@ describe('ConstellationCatalogue off-page stand-in rows (PLNR-452)', () => {
     expect(host.querySelector('button[aria-expanded]')).toBeNull();
   });
 
-  it('keeps the off-page row\'s "open" action wired — the stand-in id is a real, navigable community', () => {
-    const onExpandCommunity = vi.fn();
-    render({ nodes: [offPageCommunity], onExpandCommunity });
-    const open = [...host.querySelectorAll('button')].find((button) => button.textContent === 'open')!;
-    act(() => open.click());
-    expect(onExpandCommunity).toHaveBeenCalledWith('c2');
+  it('keeps the off-page row\'s load action wired — the stand-in id is a real, navigable community', () => {
+    const onFocusCommunity = vi.fn();
+    render({ nodes: [offPageCommunity], onFocusCommunity });
+    const load = [...host.querySelectorAll('button')].find((button) => button.textContent === 'load system')!;
+    act(() => load.click());
+    expect(onFocusCommunity).toHaveBeenCalledWith('c2');
   });
 
   it('does not affect an ordinary resident community row in the same list', () => {
     render({ nodes: [community, offPageCommunity] });
     expect(host.textContent).toContain('120 entities');
     expect(host.querySelectorAll('button[aria-expanded]')).toHaveLength(1); // only the resident row gets a preview toggle
-  });
-});
-
-describe('ConstellationCatalogue coverage honesty (PLNR-442)', () => {
-  it('states remaining count on the load-next-page action rather than a bare "load more"', () => {
-    const onLoadNextPage = vi.fn();
-    render({
-      nodes: [memoryEntity],
-      currentPage: communityPage({ entities: [{ nodeId: 'a', uri: 'noriq://memory/a', type: 'memory', kind: 'learning', label: memoryEntity.label, authority: 5, validity: 'active', isLead: false, leadReasons: [], degree: 23, boundaryDegree: 0, groupKey: 'memory', communityId: 'c1', position: [0, 0, 0] }], nextCursor: 'cursor-2' }),
-      onLoadNextPage,
-    });
-    const button = [...host.querySelectorAll('button')].find((b) => b.textContent?.startsWith('load next catalogue page'))!;
-    expect(button.textContent).toBe('load next catalogue page · 119 more');
-    act(() => button.click());
-    expect(onLoadNextPage).toHaveBeenCalled();
-  });
-
-  it('omits the load-next-page action once the cursor is exhausted (never a dangling control)', () => {
-    render({ nodes: [memoryEntity], currentPage: communityPage({ nextCursor: null }) });
-    expect([...host.querySelectorAll('button')].some((b) => b.textContent?.startsWith('load next catalogue page'))).toBe(false);
   });
 });
 

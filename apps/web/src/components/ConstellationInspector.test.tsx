@@ -56,7 +56,7 @@ function render(props: Partial<React.ComponentProps<typeof ConstellationInspecto
       relationshipsLoading={false}
       expanding={false}
       onLoadMoreRelationships={noop}
-      onOpenCommunity={noop}
+      onFocusCommunity={noop}
       onClear={noop}
       {...props}
     />,
@@ -233,9 +233,9 @@ describe('ConstellationInspector handoffs stay a lens onto the canonical surface
 });
 
 describe('ConstellationInspector community aggregate view', () => {
-  it('shows entity count, boundary routes, and top type counts instead of a relationship list, with open-community as the primary action', async () => {
-    const onOpenCommunity = vi.fn();
-    render({ selected: community, onOpenCommunity });
+  it('shows entity count, boundary routes, and top type counts instead of a relationship list, with focus-system as the primary action', async () => {
+    const onFocusCommunity = vi.fn();
+    render({ selected: community, onFocusCommunity });
     await tick();
     expect(host.textContent).toContain('Coordination core');
     expect(host.textContent).toContain('120 entities');
@@ -243,15 +243,15 @@ describe('ConstellationInspector community aggregate view', () => {
     expect(host.textContent).toContain('task');
     expect(host.textContent).toContain('memory');
     expect(host.textContent).not.toContain('Relationships');
-    const open = [...host.querySelectorAll('button')].find((button) => button.textContent === 'open community')!;
-    act(() => open.click());
-    expect(onOpenCommunity).toHaveBeenCalledWith('c1');
+    const focus = [...host.querySelectorAll('button')].find((button) => button.textContent === 'focus system')!;
+    act(() => focus.click());
+    expect(onFocusCommunity).toHaveBeenCalledWith('c1');
   });
 
-  it('disables and relabels the primary action while the community is still opening', async () => {
+  it('disables and relabels the primary action while the community is still loading', async () => {
     render({ selected: community, expanding: true });
     await tick();
-    const open = [...host.querySelectorAll('button')].find((button) => button.textContent === 'opening…') as HTMLButtonElement;
+    const open = [...host.querySelectorAll('button')].find((button) => button.textContent === 'loading…') as HTMLButtonElement;
     expect(open.disabled).toBe(true);
   });
 });

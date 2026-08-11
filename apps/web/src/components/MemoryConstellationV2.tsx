@@ -31,11 +31,14 @@ const MATCHES_TEXT_SOFT = '#c9ccd1';
 const MATCHES_TEXT_MID = '#8a8f98';
 const MATCHES_TEXT_DIM = '#6b7280';
 const MATCHES_LINE = 'rgba(255,255,255,.07)';
+const CONSTELLATION_AUTO_EXPANSION_CONCURRENCY = 4;
 
 interface LoadedCommunity {
   page: ApiConstellationV2CommunityPage;
   touchedAt: number;
 }
+
+const residentPageNodeCount = (page: ApiConstellationV2CommunityPage) => page.communities.length + page.entities.length;
 
 const mergeUnique = <T,>(left: T[], right: T[], key: (value: T) => string): T[] => {
   const values = new Map(left.map((value) => [key(value), value]));
@@ -74,9 +77,10 @@ export function MemoryConstellationV2({
   const overviewRef = useRef<ApiConstellationV2Overview | null>(null);
   const [residents, setResidents] = useState<Map<string, LoadedCommunity>>(new Map());
   const residentsRef = useRef(residents);
-  const [path, setPath] = useState<string[]>([]);
-  const pathRef = useRef(path);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [cameraFocusRequest, setCameraFocusRequest] = useState<{ nodeId: string; serial: number } | null>(null);
+  const cameraFocusSerialRef = useRef(0);
+  const [autoExpansionComplete, setAutoExpansionComplete] = useState(false);
   const [incidentPages, setIncidentPages] = useState<ApiConstellationV2IncidentPage[]>([]);
   // True while an incident page (initial selection or a "load next page" continuation) is in
   // flight — surfaced to the docked inspector so its relationship coverage line can say "loading…"
@@ -109,7 +113,6 @@ export function MemoryConstellationV2({
   const searchInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => { residentsRef.current = residents; }, [residents]);
-  useEffect(() => { pathRef.current = path; }, [path]);
   useEffect(() => {
     const media = window.matchMedia('(prefers-reduced-motion: reduce)');
     const update = () => setReducedMotion(media.matches);
@@ -132,9 +135,12 @@ export function MemoryConstellationV2({
 
   const loadOverview = useCallback(async (signal?: AbortSignal) => {
     const value = await api.memoryConstellationV2Overview(pid, signal);
+    incidentAbortRef.current?.abort();
     overviewRef.current = value;
     setOverview(value);
-    setResidents(new Map()); setPath([]); setSelectedNodeId(null); setIncidentPages([]);
+    residentsRef.current = new Map();
+    setResidents(new Map()); setSelectedNodeId(null); setCameraFocusRequest(null); setIncidentPages([]);
+    setRelationshipsLoading(false); setAutoExpansionComplete(false);
     return value;
   }, [pid]);
 
@@ -149,59 +155,115 @@ export function MemoryConstellationV2({
     return () => controller.abort();
   }, [loadOverview, onFallback]);
 
-  const storeResident = useCallback((communityId: string, page: ApiConstellationV2CommunityPage, nextPath: string[]) => {
+  const storeResident = useCallback((communityId: string, page: ApiConstellationV2CommunityPage, mode: 'auto' | 'interactive'): boolean => {
     const updated = new Map(residentsRef.current);
     updated.set(communityId, { page, touchedAt: performance.now() });
+    const requestedTotal = [...updated.values()].reduce((sum, value) => sum + residentPageNodeCount(value.page), 0);
+    if (mode === 'auto' && requestedTotal > CONSTELLATION_V2_RESIDENT_NODE_BUDGET) return false;
     const bounded = evictConstellationPages([...updated].map(([id, value]): ResidentConstellationPage<LoadedCommunity> => ({
-      communityId: id, value, nodeCount: value.page.communities.length + value.page.entities.length,
-      touchedAt: value.touchedAt, pinned: nextPath.includes(id),
+      communityId: id, value, nodeCount: residentPageNodeCount(value.page),
+      touchedAt: value.touchedAt, pinned: mode === 'interactive' && id === communityId,
     })));
     if (bounded.reduce((sum, entry) => sum + entry.nodeCount, 0) > CONSTELLATION_V2_RESIDENT_NODE_BUDGET) {
-      throw new Error('Visible hierarchy reached the 12,000-node resident budget; collapse a level before expanding further');
+      throw new Error('This system exceeds the 12,000-node resident budget and cannot be loaded in full');
     }
     const next = new Map(bounded.map((entry) => [entry.communityId, entry.value]));
     residentsRef.current = next;
     setResidents(next);
+    return true;
   }, []);
 
-  const fetchCommunity = useCallback(async (communityId: string, cursor?: string, signal?: AbortSignal) => {
-    const next = await api.memoryConstellationV2Community(pid, communityId, { cursor, limit: 256 }, signal);
-    if (next.revision.generationId !== overviewRef.current?.revision.generationId) throw new Error('Constellation generation changed');
-    const merged = mergeConstellationCommunityPages(residentsRef.current.get(communityId)?.page ?? null, next);
-    const nextPath = pathRef.current.includes(communityId) ? pathRef.current : [...pathRef.current, communityId];
-    storeResident(communityId, merged, nextPath);
-    return merged;
-  }, [pid, storeResident]);
+  const fetchCompleteCommunity = useCallback(async (
+    communityId: string,
+    signal?: AbortSignal,
+    initial: ApiConstellationV2CommunityPage | null = null,
+  ) => {
+    let merged = initial;
+    let cursor = initial?.nextCursor ?? undefined;
+    if (merged && !cursor) return merged;
+    do {
+      const next = await api.memoryConstellationV2Community(pid, communityId, { cursor, limit: 256 }, signal);
+      if (next.revision.generationId !== overviewRef.current?.revision.generationId) throw new Error('Constellation generation changed');
+      merged = mergeConstellationCommunityPages(merged, next);
+      cursor = next.nextCursor ?? undefined;
+    } while (cursor);
+    return merged!;
+  }, [pid]);
 
-  const expand = useCallback(async (communityId: string) => {
+  const ensureCommunityResident = useCallback(async (communityId: string): Promise<boolean> => {
     setExpanding(true); setError(null);
     try {
-      let loaded = residentsRef.current.get(communityId)?.page;
-      if (!loaded) loaded = await fetchCommunity(communityId);
-      const nextPath = pathRef.current.includes(communityId) ? pathRef.current.slice(0, pathRef.current.indexOf(communityId) + 1) : [...pathRef.current, communityId];
-      pathRef.current = nextPath; setPath(nextPath); storeResident(communityId, loaded, nextPath);
-      setSelectedNodeId(null); setIncidentPages([]);
+      const existing = residentsRef.current.get(communityId)?.page ?? null;
+      const loaded = await fetchCompleteCommunity(communityId, undefined, existing);
+      storeResident(communityId, loaded, 'interactive');
+      return true;
     } catch (reason) {
       if (reason instanceof Error && reason.message === 'Constellation generation changed') await loadOverview();
-      else setError(reason instanceof Error ? reason.message : 'Community expansion failed');
+      else setError(reason instanceof Error ? reason.message : 'System loading failed');
+      return false;
     } finally { setExpanding(false); }
-  }, [fetchCommunity, loadOverview, storeResident]);
+  }, [fetchCompleteCommunity, loadOverview, storeResident]);
 
-  const currentPage = path.length ? residents.get(path.at(-1)!)?.page ?? null : null;
-  const scene = useMemo(() => overview ? assembleConstellationV2Scene(overview, currentPage, incidentPages) : null, [overview, currentPage, incidentPages]);
+  // Wells arrive with the overview first. Member pages then stream in four at a time, largest
+  // systems first; results are committed in that same order so budget admission is deterministic
+  // even when network completion order is not. Generation cleanup aborts every in-flight page.
+  useEffect(() => {
+    if (!overview) return;
+    const controller = new AbortController();
+    const generationId = overview.revision.generationId;
+    setAutoExpansionComplete(false);
+    const ordered = [...overview.communities].sort((a, b) => b.memberCount - a.memberCount || a.id.localeCompare(b.id));
+    const candidates: ApiConstellationV2Community[] = [];
+    let plannedNodes = 0;
+    for (const community of ordered) {
+      if (plannedNodes + community.memberCount > CONSTELLATION_V2_RESIDENT_NODE_BUDGET) continue;
+      plannedNodes += community.memberCount;
+      candidates.push(community);
+    }
+    void (async () => {
+      for (let index = 0; index < candidates.length; index += CONSTELLATION_AUTO_EXPANSION_CONCURRENCY) {
+        const batch = candidates.slice(index, index + CONSTELLATION_AUTO_EXPANSION_CONCURRENCY);
+        const settled = await Promise.allSettled(batch.map((community) => fetchCompleteCommunity(community.id, controller.signal)));
+        if (controller.signal.aborted || overviewRef.current?.revision.generationId !== generationId) return;
+        if (settled.some((result) => result.status === 'rejected'
+          && result.reason instanceof Error && result.reason.message === 'Constellation generation changed')) {
+          await loadOverview(controller.signal);
+          return;
+        }
+        settled.forEach((result, offset) => {
+          if (result.status === 'fulfilled' && !residentsRef.current.has(batch[offset]!.id)) {
+            storeResident(batch[offset]!.id, result.value, 'auto');
+          }
+        });
+      }
+      if (!controller.signal.aborted && overviewRef.current?.revision.generationId === generationId) setAutoExpansionComplete(true);
+    })();
+    return () => controller.abort();
+  }, [overview, fetchCompleteCommunity, loadOverview, storeResident]);
+
+  const residentPages = useMemo(() => [...residents.values()].map((resident) => resident.page), [residents]);
+  const scene = useMemo(() => overview ? assembleConstellationV2Scene(overview, residentPages, incidentPages) : null, [overview, residentPages, incidentPages]);
   const filteredScene = useMemo(() => {
     if (!scene || !typeFilter) return scene;
-    const nodes = scene.nodes.filter((node) => node.community || node.type === typeFilter);
+    // A pinned/search-focused entity remains visible even when it falls outside the standing type
+    // filter; hiding the exact focus target would make the camera request impossible to honor.
+    const nodes = scene.nodes.filter((node) => node.community || node.type === typeFilter || node.id === selectedNodeId);
     const ids = new Set(nodes.map((node) => node.id));
     return { ...scene, nodes, edges: scene.edges.filter((edge) => ids.has(edge.fromId) && ids.has(edge.toId)) };
-  }, [scene, typeFilter]);
+  }, [scene, selectedNodeId, typeFilter]);
 
   const selectNode = useCallback((nodeId: string | null) => {
     incidentAbortRef.current?.abort();
     const serial = ++selectionSerialRef.current;
     setSelectedNodeId(nodeId); setIncidentPages([]);
-    const activePage = pathRef.current.length ? residentsRef.current.get(pathRef.current.at(-1)!)?.page : null;
-    const isEntitySelection = Boolean(nodeId) && Boolean(activePage?.entities.some((entity) => entity.nodeId === nodeId));
+    const owner = nodeId ? [...residentsRef.current.entries()].find(([, resident]) =>
+      resident.page.community.id === nodeId || resident.page.entities.some((entity) => entity.nodeId === nodeId)) : undefined;
+    const isEntitySelection = Boolean(nodeId) && Boolean(owner?.[1].page.entities.some((entity) => entity.nodeId === nodeId));
+    if (owner) {
+      const next = new Map(residentsRef.current);
+      next.set(owner[0], { ...owner[1], touchedAt: performance.now() });
+      residentsRef.current = next; setResidents(next);
+    }
     setRelationshipsLoading(isEntitySelection);
     if (!isEntitySelection) return;
     const controller = new AbortController();
@@ -235,16 +297,22 @@ export function MemoryConstellationV2({
       if (!hit.uri) throw new Error('Search result has no canonical URI');
       const route = await api.memoryConstellationV2Route(pid, hit.uri);
       if (route.revision.generationId !== overviewRef.current?.revision.generationId) { await loadOverview(); return; }
-      const routeIds = route.communityPath.map((community) => community.id);
-      pathRef.current = [];
-      for (const communityId of routeIds) {
-        let page = residentsRef.current.get(communityId)?.page ?? await fetchCommunity(communityId);
-        while (page.kind === 'entities' && !page.entities.some((entity) => entity.nodeId === route.nodeId) && page.nextCursor) page = await fetchCommunity(communityId, page.nextCursor);
-        pathRef.current = [...pathRef.current, communityId];
-      }
-      setPath(routeIds); setHits([]); selectNode(route.nodeId);
+      const containingCommunityId = route.communityPath.at(-1)?.id;
+      if (!containingCommunityId) throw new Error('Search result has no constellation community');
+      if (!await ensureCommunityResident(containingCommunityId)) return;
+      const resident = residentsRef.current.get(containingCommunityId)?.page;
+      if (!resident?.entities.some((entity) => entity.nodeId === route.nodeId)) throw new Error('Search result is absent from its routed system');
+      setHits([]); selectNode(route.nodeId);
+      setCameraFocusRequest({ nodeId: route.nodeId, serial: ++cameraFocusSerialRef.current });
     } catch (reason) { setError(reason instanceof Error ? reason.message : 'Exact constellation route failed'); }
     finally { setSearching(false); }
+  };
+
+  const focusCommunity = async (communityId: string) => {
+    selectNode(communityId);
+    if (!await ensureCommunityResident(communityId)) return;
+    setViewMode('space');
+    setCameraFocusRequest({ nodeId: communityId, serial: ++cameraFocusSerialRef.current });
   };
 
   useEffect(() => {
@@ -308,17 +376,12 @@ export function MemoryConstellationV2({
   // CONSTELLATION_V2_RESIDENT_NODE_BUDGET before throwing. Surfaced as a gauge so the ceiling is watched,
   // not hit; the throw in storeResident stays the enforcement backstop.
   const residentTotal = useMemo(
-    () => [...residents.values()].reduce((sum, entry) => sum + entry.page.communities.length + entry.page.entities.length, 0),
+    () => [...residents.values()].reduce((sum, entry) => sum + residentPageNodeCount(entry.page), 0),
     [residents],
   );
-  const crumbs = useMemo(() => [
-    { id: 'root', label: 'Project', onSelect: () => { pathRef.current = []; setPath([]); selectNode(null); } },
-    ...path.map((id, index) => ({
-      id,
-      label: residents.get(id)?.page.community.label ?? id,
-      onSelect: () => { const next = path.slice(0, index + 1); pathRef.current = next; setPath(next); selectNode(null); },
-    })),
-  ], [path, residents, selectNode]);
+  const nonResidentSystemCount = overview
+    ? overview.communities.reduce((count, community) => count + Number(!residents.has(community.id)), 0)
+    : 0;
   const selected = scene?.nodes.find((node) => node.id === selectedNodeId) ?? null;
   const selectedCommunity = selected?.community ? selected : null;
   const selectedEntity = selected?.uri ? selected : null;
@@ -337,11 +400,9 @@ export function MemoryConstellationV2({
   const showCatalogue = viewMode === 'catalogue' || Boolean(rendererFailure);
   const generationColor = overview.revision.state === 'current' ? 'var(--green)' : 'var(--amber)';
   const totalEntities = overview.communities.reduce((sum, community) => sum + community.memberCount, 0);
-  const countsLabel = path.length === 0
-    ? `${overview.communities.length} communit${overview.communities.length === 1 ? 'y' : 'ies'} · ${totalEntities.toLocaleString()} entities`
-    : `${filteredScene.nodes.length} visible · ${filteredScene.edges.length} routes`;
+  const countsLabel = `${overview.communities.length} communit${overview.communities.length === 1 ? 'y' : 'ies'} · ${totalEntities.toLocaleString()} entities`;
   const searchActive = query.trim().length > 0;
-  // Search-active breadcrumb copy (screen spec 1c): states the total and the community spread up
+  // Search-active context copy (screen spec 1c): states the total and the community spread up
   // front, so what follows can never be misread as a filter having removed anything — the count IS
   // the honesty mechanism, not a nicety (Navigator conventions doc §4 "dimming is not filtering").
   // Space dims non-matches to ~32% opacity on a continuous field; Catalogue is a flat list with no
@@ -349,20 +410,18 @@ export function MemoryConstellationV2({
   // rule forbids. The textual equivalent (PLNR-442): every row stays listed and unmatched rows are
   // simply left unmarked, mirroring "dimmed, not removed" with "unmarked, not removed" — dimming's
   // job (visually de-emphasize without hiding) is done by omission of the ignite mark, not by any
-  // row disappearing. Falls back to the root/expanded hints (PLNR-436) when no query is active.
+  // row disappearing. The idle copy now describes the one continuous field; there is no level path.
   const levelHint = searchActive
     ? `— ${hits.length} match${hits.length === 1 ? '' : 'es'} ignited across ${matchedRootCommunityIds.size} communit${matchedRootCommunityIds.size === 1 ? 'y' : 'ies'} · non-matches ${showCatalogue ? 'unmarked' : 'dimmed'}, not removed`
-    : path.length === 0
-      ? '— root level · double-click a community to open it'
-      : `· level ${path.length}`;
+    : '— continuous space · double-click a system to fly in';
   const residentMeterPercent = Math.min(100, (residentTotal / CONSTELLATION_V2_RESIDENT_NODE_BUDGET) * 100);
 
-  // One stacked status region, fixed severity order (error -> stale -> building -> partial ->
-  // informational, per the Navigator conventions doc), each entry a sibling in a single flow
+  // One stacked status region, fixed severity order (error -> stale -> building -> informational,
+  // per the Navigator conventions doc), each entry a sibling in a single flow
   // container. No entry computes its position from another entry's presence — that arithmetic
   // (`top: scene.partial ? 42 : 12` etc.) is exactly what this replaces. Message text is preserved
   // verbatim in meaning from the pre-existing strips (PLNR-372/380 truthful-degradation copy).
-  const statusNotices: Array<{ key: string; token: 'error' | 'stale' | 'building' | 'partial' | 'informational'; message: string; action?: { label: string; onClick: () => void } }> = [];
+  const statusNotices: Array<{ key: string; token: 'error' | 'stale' | 'building' | 'partial' | 'informational'; message: string }> = [];
   if (error) statusNotices.push({ key: 'error', token: 'error', message: error });
   if (overview.revision.state === 'stale') {
     statusNotices.push({
@@ -376,17 +435,13 @@ export function MemoryConstellationV2({
       message: 'A newer hierarchy is building; this complete generation remains navigable.',
     });
   }
-  if (scene.partial) {
-    // The former standalone "load more in community" button (bottom:12) becomes this notice's
-    // inline continue action: currentPage.nextCursor is a strict subset of what makes scene.partial
-    // true (incomplete incident pages can also set it), so the action only appears when there is
-    // actually a community page to continue.
-    const continuation = currentPage?.nextCursor
-      ? { label: 'continue', onClick: () => void fetchCommunity(currentPage.community.id, currentPage.nextCursor!) }
-      : undefined;
-    statusNotices.push({ key: 'partial', token: 'partial', message: 'Partial level · bounded continuation available', action: continuation });
+  if (autoExpansionComplete && nonResidentSystemCount > 0) {
+    statusNotices.push({
+      key: 'resident-budget', token: 'partial',
+      message: `${nonResidentSystemCount.toLocaleString()} system${nonResidentSystemCount === 1 ? '' : 's'} not loaded — double-click one to load it.`,
+    });
   }
-  if (codeEntities === 0 && path.length === 0) {
+  if (codeEntities === 0) {
     statusNotices.push({
       key: 'unindexed', token: 'informational',
       message: 'No repository entities are present in this generation; repository indexing may not have run.',
@@ -417,12 +472,6 @@ export function MemoryConstellationV2({
       color: STATUS_TOKEN_COLOR[notice.token], fontFamily: 'var(--mono)', fontSize: 10,
     }}>
       <span>{notice.message}</span>
-      {notice.action && <button
-        type="button" onClick={notice.action.onClick}
-        style={{ background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', fontFamily: 'inherit', fontSize: 'inherit', color: 'inherit', textDecoration: 'underline' }}
-      >
-        {notice.action.label}
-      </button>}
     </div>
   ));
   // PLNR-449: Catalogue is pure DOM with real rows starting at its own top edge, so a notice
@@ -441,11 +490,10 @@ export function MemoryConstellationV2({
     matchCounts={matchCountsByRootCommunity}
     searchActive={searchActive}
     selectedNodeId={selectedNodeId}
-    currentPage={currentPage}
+    residentCommunityIds={new Set(residents.keys())}
     expanding={expanding}
     onSelectNode={selectNode}
-    onExpandCommunity={(communityId) => void expand(communityId)}
-    onLoadNextPage={() => currentPage && void fetchCommunity(currentPage.community.id, currentPage.nextCursor!)}
+    onFocusCommunity={(communityId) => void focusCommunity(communityId)}
     onOpenEgoNetwork={onOpenEgoNetwork}
     onOpenInspector={onOpenInspector}
   />;
@@ -520,27 +568,8 @@ export function MemoryConstellationV2({
         height: 30, boxSizing: 'border-box', padding: '0 14px', display: 'flex', alignItems: 'center', gap: 6,
         borderBottom: '1px solid var(--line)', fontFamily: 'var(--mono)', fontSize: 10, flexWrap: 'nowrap',
       }}>
-        {crumbs.map((crumb, index) => (
-          // Keyed by position + id, not id alone: a real community id can collide with the synthetic
-          // 'root' id of the leading Project crumb (community ids are not guaranteed disjoint from it).
-          <span key={`${index}:${crumb.id}`} style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 'none' }}>
-            {index > 0 && <span aria-hidden="true" style={{ color: 'var(--text-faint)' }}>▸</span>}
-            <button
-              type="button"
-              onClick={crumb.onSelect}
-              aria-current={index === crumbs.length - 1 ? 'location' : undefined}
-              style={{
-                background: 'transparent', border: 'none', padding: 0, cursor: 'pointer',
-                fontFamily: 'inherit', fontSize: 'inherit',
-                color: index === crumbs.length - 1 ? 'var(--accent)' : 'var(--text-mid)',
-                fontWeight: index === crumbs.length - 1 ? 600 : 400,
-              }}
-            >
-              {crumb.label}
-            </button>
-          </span>
-        ))}
-        <span style={{ color: 'var(--text-faint)', marginLeft: 2, flex: 'none' }}>{levelHint}</span>
+        <span style={{ color: 'var(--accent)', fontWeight: 600, flex: 'none' }}>Project space</span>
+        <span style={{ color: 'var(--text-faint)', flex: 'none' }}>{levelHint}</span>
         <div style={{ flex: 1 }} />
         <span style={{ color: 'var(--text-dim)', flex: 'none' }}>resident {residentTotal.toLocaleString()} / {CONSTELLATION_V2_RESIDENT_NODE_BUDGET.toLocaleString()} nodes</span>
         <div
@@ -564,7 +593,10 @@ export function MemoryConstellationV2({
                 projectId={pid} generationId={overview.revision.generationId} layoutVersion={overview.revision.layoutVersion}
                 nodes={filteredScene.nodes} edges={filteredScene.edges} selectedNodeId={selectedNodeId} highlightedNodeIds={highlightedNodeIds} theme={theme}
                 searchActive={searchActive} igniteMatchCounts={matchCountsByRootCommunity}
+                residentCommunityIds={[...residents.keys()]}
+                focusRequest={cameraFocusRequest}
                 reducedMotion={reducedMotion}
+                onEnsureCommunityResident={ensureCommunityResident}
                 onSelectNode={selectNode} onOpenEgoNetwork={onOpenEgoNetwork} onOpenInspector={onOpenInspector}
                 onRendererFailure={handleRendererFailure}
               />
@@ -623,7 +655,7 @@ export function MemoryConstellationV2({
                   <small style={{ display: 'block', fontFamily: 'var(--mono)', fontSize: 9, color: MATCHES_TEXT_DIM, marginTop: 2 }}>{hit.entityType} · {hit.uri}</small>
                   {!resident && routeCommunity && (
                     <small style={{ display: 'block', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--amber)', marginTop: 2 }}>
-                      off-page · picking it routes via {routeCommunity.label}
+                      not resident · picking loads {routeCommunity.label}
                     </small>
                   )}
                 </button>
@@ -632,8 +664,7 @@ export function MemoryConstellationV2({
           </div>}
           {searching && <div style={{ position: 'absolute', right: 18, top: 16, color: 'var(--text-dim)', fontSize: 10 }}>searching…</div>}
           {/* The old <details> "Accessible visible list" disclosure lived here (Space view only).
-              PLNR-436 decoupled its offset from codeEntities/path.length but deliberately left its
-              content alone, scoping the promotion to this task (PLNR-442) — the audit doc's
+              PLNR-442 removed it after the earlier offset coupling was retired — the audit doc's
               "Fallbacks" disposition is explicit: Delete, its function is absorbed by Catalogue.
               A disclosure widget was never a navigation surface; the Catalogue view (reachable from
               the header toggle at all times, not only on renderer failure) is. */}
@@ -692,7 +723,7 @@ export function MemoryConstellationV2({
             relationshipsLoading={relationshipsLoading}
             expanding={expanding}
             onLoadMoreRelationships={() => void loadMoreIncidents()}
-            onOpenCommunity={(communityId) => void expand(communityId)}
+            onFocusCommunity={(communityId) => void focusCommunity(communityId)}
             onOpenEgoNetwork={onOpenEgoNetwork}
             onOpenInspector={onOpenInspector}
             onClear={() => selectNode(null)}
