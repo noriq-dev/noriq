@@ -17,7 +17,7 @@
 import { useEffect, useState } from 'react';
 import { hasExecutionSpec, type ExecutionSpec } from '@noriq-dev/shared';
 import { api } from '../api';
-import { MonoTag, SectionLabel } from './bits';
+import { MonoTag } from './bits';
 import { Button } from './ui';
 import { type SpecDraft, SpecForm, pruneDraft } from './SpecForm';
 import { confirm } from './Dialog';
@@ -55,6 +55,10 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
       {children}
     </div>
   );
+}
+
+function quantity(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? '' : 's'}`;
 }
 
 // Index keys throughout: the schema enforces no uniqueness anywhere — two anticipated files may
@@ -249,24 +253,43 @@ export function ExecutionSpecPanel({
   // would quietly call a populated spec empty the day one is added.
   const empty = !hasExecutionSpec(spec);
   const editable = load === 'loaded';
+  const summary = load === 'loading'
+    ? 'loading'
+    : load === 'error'
+      ? 'unavailable'
+      : unreadable
+        ? 'stored value unreadable'
+        : empty
+          ? 'no execution plan'
+          : `${quantity(spec?.requirementIds.length ?? 0, 'requirement')} · ${quantity(spec?.anticipatedFiles.length ?? 0, 'file')} · ${quantity(spec?.acceptance.observableTruths.length ?? 0, 'check')}`;
 
   return (
-    <div style={{ marginBottom: 18 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 8 }}>
-        <SectionLabel>Execution spec</SectionLabel>
-        <div style={{ flex: 1 }} />
-        {!editing && editable && (
-          <button
-            onClick={startEdit}
-            className="rail-add"
-            style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)', border: '1px dashed var(--w-15)', padding: '3px 9px', borderRadius: 6, background: 'transparent' }}
-          >
-            {/* "+ add spec" would be a lie on a corrupt row: there IS something stored, it just
-                cannot be read, and the human's job is to replace it rather than author a first. */}
-            {unreadable ? 'rewrite' : empty ? '+ add spec' : 'edit'}
-          </button>
-        )}
-      </div>
+    <details
+      data-execution-spec
+      style={{ border: '1px solid var(--w-1)', borderRadius: 10, background: 'var(--w-025)', margin: '12px 0' }}
+    >
+      <summary style={{ cursor: 'pointer', padding: '11px 13px', fontWeight: 650, fontSize: 12 }}>
+        Execution spec{' '}
+        <span style={{ fontFamily: 'var(--mono)', fontSize: 9, fontWeight: 400, color: unreadable || load === 'error' ? 'var(--red-soft)' : 'var(--text-dim)' }}>
+          {summary}
+        </span>
+      </summary>
+      <div style={{ padding: '0 13px 13px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 8 }}>
+          <div style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>builder contract · expand only when needed</div>
+          <div style={{ flex: 1 }} />
+          {!editing && editable && (
+            <button
+              onClick={startEdit}
+              className="rail-add"
+              style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)', border: '1px dashed var(--w-15)', padding: '3px 9px', borderRadius: 6, background: 'transparent' }}
+            >
+              {/* "+ add spec" would be a lie on a corrupt row: there IS something stored, it just
+                  cannot be read, and the human's job is to replace it rather than author a first. */}
+              {unreadable ? 'rewrite' : empty ? '+ add spec' : 'edit'}
+            </button>
+          )}
+        </div>
 
       {/* "we do not know yet" and "we could not ask" must not render as "there is no spec" — that
           reading invites someone to write over a plan that already exists. */}
@@ -324,6 +347,7 @@ export function ExecutionSpecPanel({
           ) : null}
         </>
       )}
-    </div>
+      </div>
+    </details>
   );
 }

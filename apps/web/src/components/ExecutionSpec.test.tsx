@@ -52,6 +52,22 @@ beforeEach(() => vi.restoreAllMocks());
 afterEach(() => container?.remove());
 
 describe('reading a spec', () => {
+  it('starts as the same collapsed disclosure pattern used by dispatch intelligence', () => {
+    mount({
+      spec: spec({
+        requirementIds: ['PLNR-429'],
+        anticipatedFiles: [{ path: 'src/task.ts', change: 'modify', why: 'the task detail surface' }],
+        acceptance: { observableTruths: ['the spec expands on demand'], artifacts: [], links: [] },
+      }),
+    });
+    const disclosure = container.querySelector<HTMLDetailsElement>('details[data-execution-spec]')!;
+    expect(disclosure.open).toBe(false);
+    expect(disclosure.querySelector('summary')?.textContent).toContain('1 requirement · 1 file · 1 check');
+
+    act(() => { disclosure.querySelector<HTMLElement>('summary')!.click(); });
+    expect(disclosure.open).toBe(true);
+  });
+
   it('renders every populated section, and none of the empty ones', () => {
     mount({
       spec: spec({

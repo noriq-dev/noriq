@@ -9,7 +9,7 @@ import { AvatarChip, MonoTag, SectionLabel } from './bits';
 import { QuestionForm, SignalThreadHistory } from './QuestionForm';
 import { Markdown } from './Markdown';
 import { Composer } from './Composer';
-import { Button, Select, TextArea, TextInput } from './ui';
+import { Button, Modal, Select, TextArea, TextInput } from './ui';
 import { ExecutionSpecPanel, type SpecLoad } from './ExecutionSpec';
 import { DispatchIntelligencePanel } from './DispatchIntelligence';
 import { confirm } from './Dialog';
@@ -52,6 +52,8 @@ export function Drawer({ store }: { store: AppStore }) {
   const [eBoard, setEBoard] = useState('');
   const [eDue, setEDue] = useState(''); // yyyy-mm-dd; '' = no deadline (PLNR-126)
   const [eWorkflow, setEWorkflow] = useState(''); // dispatch-workflow override (PLNR-240); '' = none
+  const [editSaving, setEditSaving] = useState(false);
+  const [editError, setEditError] = useState('');
   const [timeline, setTimeline] = useState<ApiAgentEvent[]>([]);
   const [addingTag, setAddingTag] = useState(false);
   const [newTag, setNewTag] = useState('');
@@ -164,27 +166,36 @@ export function Drawer({ store }: { store: AppStore }) {
     setEBoard(task.boardId ?? '');
     setEDue(task.dueAt ? task.dueAt.slice(0, 10) : '');
     setEWorkflow(task.workflow ?? '');
+    setEditError('');
     setEditing(true);
   };
 
   const saveEdit = async () => {
-    await api.updateTask(currentPid, task.id, {
-      title: eTitle.trim() || task.title,
-      body: eBody,
-      type: eType,
-      tags: eTags.split(',').map((t) => t.trim()).filter(Boolean),
-      milestoneId: eMilestone || null,
-      // End-of-day UTC so "due today" doesn't read overdue at 9am.
-      dueAt: eDue ? `${eDue}T23:59:59.000Z` : null,
-      ...(eBoard ? { boardId: eBoard } : {}),
-      ...(ePriority >= 0 ? { priority: ePriority } : {}),
-      // The dispatch-workflow override (PLNR-240): validated at dispatch time, not here — a
-      // repo's advertised set is runner-scoped state the drawer doesn't know.
-      workflow: eWorkflow.trim() || null,
-    });
-    setDetailBody(eBody);
-    setEditing(false);
-    actions.refreshNow();
+    setEditSaving(true);
+    setEditError('');
+    try {
+      await api.updateTask(currentPid, task.id, {
+        title: eTitle.trim() || task.title,
+        body: eBody,
+        type: eType,
+        tags: eTags.split(',').map((t) => t.trim()).filter(Boolean),
+        milestoneId: eMilestone || null,
+        // End-of-day UTC so "due today" doesn't read overdue at 9am.
+        dueAt: eDue ? `${eDue}T23:59:59.000Z` : null,
+        ...(eBoard ? { boardId: eBoard } : {}),
+        ...(ePriority >= 0 ? { priority: ePriority } : {}),
+        // The dispatch-workflow override (PLNR-240): validated at dispatch time, not here — a
+        // repo's advertised set is runner-scoped state the drawer doesn't know.
+        workflow: eWorkflow.trim() || null,
+      });
+      setDetailBody(eBody);
+      setEditing(false);
+      actions.refreshNow();
+    } catch (error) {
+      setEditError(error instanceof Error ? error.message : 'Could not save the task');
+    } finally {
+      setEditSaving(false);
+    }
   };
 
   const upload = async (file: File) => {
@@ -269,7 +280,7 @@ export function Drawer({ store }: { store: AppStore }) {
               ))}
             </datalist>
             <div style={{ flex: 1 }} />
-            {!editing && store.permissions.canContribute && detailBody !== null && (
+            {store.permissions.canContribute && detailBody !== null && (
               <button
                 onClick={startEdit}
                 title="Edit task"
@@ -279,7 +290,7 @@ export function Drawer({ store }: { store: AppStore }) {
                 ✎
               </button>
             )}
-            {!editing && store.permissions.canContribute && (
+            {store.permissions.canContribute && (
               <button
                 onClick={() => void (task.archivedAt ? actions.restoreTask(task.id) : actions.archiveTask(task.id))}
                 title={task.archivedAt ? 'Restore from archive' : 'Archive task'}
@@ -289,7 +300,7 @@ export function Drawer({ store }: { store: AppStore }) {
                 {task.archivedAt ? '⤴' : '🗄'}
               </button>
             )}
-            {!editing && store.permissions.canContribute && (
+            {store.permissions.canContribute && (
               <button
                 onClick={async () => {
                   if (await confirm(`Delete ${task.key} "${task.title}"? This removes its comments, attachments and dependency links. Child tasks are kept.`)) {
@@ -311,95 +322,15 @@ export function Drawer({ store }: { store: AppStore }) {
               ✕
             </button>
           </div>
-          {editing ? (
-            <TextInput value={eTitle} onChange={(e) => setETitle(e.target.value)} style={{ fontSize: 15, fontWeight: 600 }} />
-          ) : (
-            <div style={{ fontSize: 16, fontWeight: 600, lineHeight: 1.35, letterSpacing: '-.01em' }}>{task.title}</div>
-          )}
+          <div style={{ fontSize: 16, fontWeight: 600, lineHeight: 1.35, letterSpacing: '-.01em' }}>{task.title}</div>
         </div>
 
         <div style={{ flex: 1, overflowY: 'auto', padding: phone ? '16px 14px' : '18px 20px' }}>
-          {editing ? (
-            <div style={{ marginBottom: 18 }}>
-              <TextArea value={eBody} onChange={(e) => setEBody(e.target.value)} style={{ minHeight: 110 }} />
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 10 }}>
-                <Select aria-label="Task type" value={eType} onChange={(e) => setEType(e.target.value)}>
-                  <option value="feature">feature</option>
-                  <option value="bug">bug</option>
-                  <option value="chore">chore</option>
-                  <option value="research">research</option>
-                </Select>
-                <Select aria-label="Task priority" value={ePriority} onChange={(e) => setEPriority(Number(e.target.value))}>
-                  {/* The "keep" sentinel is -1, OFF the scale (PLNR-231): 0 is now P0, the most
-                      urgent value there is, so a 0 sentinel made the top priority unsettable. */}
-                  <option value={-1}>priority — keep</option>
-                  <option value={0}>P0 · urgent</option>
-                  <option value={1}>P1 · high</option>
-                  <option value={2}>P2 · normal</option>
-                  <option value={3}>P3 · low</option>
-                  <option value={4}>P4 · someday</option>
-                </Select>
-              </div>
-              <div style={{ marginTop: 10, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-                <Select aria-label="Task milestone" value={eMilestone} onChange={(e) => setEMilestone(e.target.value)}>
-                  <option value="">— no milestone —</option>
-                  {(snapshot?.milestones ?? []).map((mm) => (
-                    <option key={mm.id} value={mm.id}>{mm.title}</option>
-                  ))}
-                </Select>
-                <input
-                  type="date"
-                  value={eDue}
-                  onChange={(e) => setEDue(e.target.value)}
-                  title="due date — empty for none"
-                  style={{
-                    background: 'var(--w-04)', border: '1px solid var(--w-1)', borderRadius: 8,
-                    padding: '7px 10px', color: eDue ? 'var(--text)' : 'var(--text-dim)', fontSize: 12.5,
-                    outline: 'none', fontFamily: 'inherit', colorScheme: 'dark',
-                  }}
-                />
-              </div>
-              {(snapshot?.boards ?? []).length > 1 && (
-                <div style={{ marginTop: 10 }}>
-                  <Select aria-label="Task board" value={eBoard} onChange={(e) => setEBoard(e.target.value)}>
-                    {(snapshot?.boards ?? []).map((b) => (
-                      <option key={b.id} value={b.id}>board: {b.name}</option>
-                    ))}
-                  </Select>
-                </div>
-              )}
-              <div style={{ marginTop: 10 }}>
-                <TextInput value={eTags} onChange={(e) => setETags(e.target.value)} placeholder="tags, comma, separated" list="noriq-tags-drawer" />
-                <datalist id="noriq-tags-drawer">
-                  {allTags.map((t) => (
-                    <option key={t.id} value={t.name} />
-                  ))}
-                </datalist>
-              </div>
-              <div style={{ marginTop: 10 }}>
-                {/* PLNR-240: the workflow the plan pump dispatches THIS task under, overriding the
-                    dispatch default. Free text — the valid names are per-repo (see the dispatch
-                    form); an unadvertised name stalls the dispatch legibly rather than running. */}
-                <TextInput
-                  value={eWorkflow}
-                  onChange={(e) => setEWorkflow(e.target.value)}
-                  placeholder="dispatch workflow (optional, e.g. build-codex)"
-                  title="Workflow the plan dispatch pump runs this task under — blank for the dispatch's default"
-                />
-              </div>
-              <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
-                <Button variant="ghost" onClick={() => setEditing(false)}>cancel</Button>
-                <div style={{ flex: 1 }} />
-                <Button onClick={saveEdit}>Save changes</Button>
-              </div>
-            </div>
-          ) : (
-            <div style={{ marginBottom: 18 }}>
-              {detailBody === null
-                ? <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>loading task details…</span>
-                : <Markdown source={detailBody} />}
-            </div>
-          )}
+          <div style={{ marginBottom: 18 }}>
+            {detailBody === null
+              ? <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>loading task details…</span>
+              : <Markdown source={detailBody} />}
+          </div>
 
           {/* Spin-off provenance + decision (PLNR-230). The panel persists after the decision —
               which run filed it, from which task, on what finding is the durable record the
@@ -853,6 +784,104 @@ export function Drawer({ store }: { store: AppStore }) {
           <Composer store={store} placeholder={`Steer ${holder}…`} compact />
         </div>
       </div>
+      {editing && (
+        <Modal
+          title={`Edit ${task.key}`}
+          subtitle="Task details and dispatch settings"
+          width={560}
+          onClose={() => setEditing(false)}
+        >
+          <form
+            aria-label={`Edit ${task.key}`}
+            onSubmit={(event) => {
+              event.preventDefault();
+              void saveEdit();
+            }}
+          >
+            <label style={{ display: 'block', marginBottom: 12 }}>
+              <span style={{ display: 'block', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '.07em', marginBottom: 5 }}>Title</span>
+              <TextInput autoFocus aria-label="Task title" value={eTitle} onChange={(e) => setETitle(e.target.value)} />
+            </label>
+            <label style={{ display: 'block', marginBottom: 12 }}>
+              <span style={{ display: 'block', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '.07em', marginBottom: 5 }}>Description</span>
+              <TextArea aria-label="Task description" value={eBody} onChange={(e) => setEBody(e.target.value)} style={{ minHeight: 140 }} />
+            </label>
+            <div style={{ display: 'grid', gridTemplateColumns: phone ? '1fr' : '1fr 1fr', gap: 10 }}>
+              <Select aria-label="Task type" value={eType} onChange={(e) => setEType(e.target.value)}>
+                <option value="feature">feature</option>
+                <option value="bug">bug</option>
+                <option value="chore">chore</option>
+                <option value="research">research</option>
+              </Select>
+              <Select aria-label="Task priority" value={ePriority} onChange={(e) => setEPriority(Number(e.target.value))}>
+                {/* The "keep" sentinel is -1, OFF the scale (PLNR-231): 0 is now P0, the most
+                    urgent value there is, so a 0 sentinel made the top priority unsettable. */}
+                <option value={-1}>priority — keep</option>
+                <option value={0}>P0 · urgent</option>
+                <option value={1}>P1 · high</option>
+                <option value={2}>P2 · normal</option>
+                <option value={3}>P3 · low</option>
+                <option value={4}>P4 · someday</option>
+              </Select>
+            </div>
+            <div style={{ marginTop: 10, display: 'grid', gridTemplateColumns: phone ? '1fr' : '1fr 1fr', gap: 10 }}>
+              <Select aria-label="Task milestone" value={eMilestone} onChange={(e) => setEMilestone(e.target.value)}>
+                <option value="">— no milestone —</option>
+                {(snapshot?.milestones ?? []).map((mm) => (
+                  <option key={mm.id} value={mm.id}>{mm.title}</option>
+                ))}
+              </Select>
+              <input
+                aria-label="Task due date"
+                type="date"
+                value={eDue}
+                onChange={(e) => setEDue(e.target.value)}
+                title="due date — empty for none"
+                style={{
+                  background: 'var(--w-04)', border: '1px solid var(--w-1)', borderRadius: 8,
+                  padding: '7px 10px', color: eDue ? 'var(--text)' : 'var(--text-dim)', fontSize: 12.5,
+                  outline: 'none', fontFamily: 'inherit', colorScheme: 'dark',
+                }}
+              />
+            </div>
+            {(snapshot?.boards ?? []).length > 1 && (
+              <div style={{ marginTop: 10 }}>
+                <Select aria-label="Task board" value={eBoard} onChange={(e) => setEBoard(e.target.value)}>
+                  {(snapshot?.boards ?? []).map((b) => (
+                    <option key={b.id} value={b.id}>board: {b.name}</option>
+                  ))}
+                </Select>
+              </div>
+            )}
+            <div style={{ marginTop: 10 }}>
+              <TextInput aria-label="Task tags" value={eTags} onChange={(e) => setETags(e.target.value)} placeholder="tags, comma, separated" list="noriq-tags-drawer" />
+              <datalist id="noriq-tags-drawer">
+                {allTags.map((t) => (
+                  <option key={t.id} value={t.name} />
+                ))}
+              </datalist>
+            </div>
+            <div style={{ marginTop: 10 }}>
+              {/* PLNR-240: the workflow the plan pump dispatches THIS task under, overriding the
+                  dispatch default. Free text — the valid names are per-repo (see the dispatch
+                  form); an unadvertised name stalls the dispatch legibly rather than running. */}
+              <TextInput
+                aria-label="Dispatch workflow"
+                value={eWorkflow}
+                onChange={(e) => setEWorkflow(e.target.value)}
+                placeholder="dispatch workflow (optional, e.g. build-codex)"
+                title="Workflow the plan dispatch pump runs this task under — blank for the dispatch's default"
+              />
+            </div>
+            {editError && <div role="alert" style={{ marginTop: 12, fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--red-soft)' }}>{editError}</div>}
+            <div style={{ display: 'flex', gap: 8, marginTop: 18 }}>
+              <Button type="button" variant="ghost" disabled={editSaving} onClick={() => setEditing(false)}>Cancel</Button>
+              <div style={{ flex: 1 }} />
+              <Button type="submit" disabled={editSaving}>{editSaving ? 'Saving…' : 'Save changes'}</Button>
+            </div>
+          </form>
+        </Modal>
+      )}
       {previewAttachment && (
         <AttachmentPreview
           key={previewAttachment.id}
