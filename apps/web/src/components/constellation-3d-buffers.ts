@@ -97,7 +97,15 @@ export interface Constellation3DLabelCandidate {
   /** Communities claim same-tier label space before entities; their population then supplies the
    * total-order-independent importance signal for the collision sweep (PLNR-457). */
   community?: boolean;
+  communityLevel?: number;
   memberCount?: number;
+}
+
+export interface Constellation3DLabelPresentation {
+  width: number;
+  height: number;
+  maxCharacters: number;
+  subtext?: string;
 }
 
 /** Decode the five entities admitted by the projection boundary. Ampersand stays last so a
@@ -120,19 +128,35 @@ export function communityEntitySubtext(entityCount: number): string {
   return `${entityCount.toLocaleString()} ${entityCount === 1 ? 'entity' : 'entities'}`;
 }
 
-/** Greedy screen-space rectangle rejection. Priority tiers are swept first; inside a tier,
- * populous communities claim space before smaller communities and entities so insertion order
- * cannot hide the root systems that carry most of the graph (PLNR-457). */
+/** Shared DOM footprint for projected node labels. Phase wells stay visibly subordinate to their
+ * system sun while retaining the same truthful population subtext as every other community. */
+export function constellation3DLabelPresentation(
+  node: Pick<Constellation3DNodeInstance, 'community' | 'communityLevel' | 'memberCount'>,
+  igniteCount?: number,
+): Constellation3DLabelPresentation {
+  if (!node.community) return { width: 260, height: 18, maxCharacters: 42 };
+  const subtext = igniteCount ? communityIgniteSubtext(igniteCount) : communityEntitySubtext(node.memberCount ?? 0);
+  return (node.communityLevel ?? 0) > 0
+    ? { width: 150, height: 26, maxCharacters: 28, subtext }
+    : { width: 180, height: 30, maxCharacters: 28, subtext };
+}
+
+/** Greedy screen-space rectangle rejection. Priority tiers are swept first; inside the ambient
+ * tier root systems outrank phase wells, phase wells outrank entities, and member count orders
+ * peers. Off-camera roots are filtered before this pass, so they cannot starve a flown-in phase. */
 export function placeConstellation3DLabels<T extends Constellation3DLabelCandidate>(
   candidates: readonly T[],
   budget = 24,
   gap = 6,
 ): T[] {
   const rank: Record<Constellation3DLabelPriority, number> = { ambient: 0, promoted: 1, selected: 2 };
+  const communityRank = (candidate: Constellation3DLabelCandidate) => candidate.community
+    ? ((candidate.communityLevel ?? 0) > 0 ? 1 : 2)
+    : 0;
   const ordered = candidates.map((candidate, index) => ({ candidate, index }))
     .sort((a, b) => rank[b.candidate.priority] - rank[a.candidate.priority]
-      || Number(Boolean(b.candidate.community)) - Number(Boolean(a.candidate.community))
-      || (b.candidate.community && a.candidate.community
+      || communityRank(b.candidate) - communityRank(a.candidate)
+      || (communityRank(b.candidate) === communityRank(a.candidate) && b.candidate.community && a.candidate.community
         ? (b.candidate.memberCount ?? 0) - (a.candidate.memberCount ?? 0)
         : 0)
       || a.index - b.index);
@@ -385,11 +409,14 @@ function compareLabelPriority(
   selectedNodeId: string | null,
   byId: ReadonlyMap<string, Constellation3DNodeInstance>,
 ) {
+  const communityRank = (node: Constellation3DNodeInstance) => node.community
+    ? ((node.communityLevel ?? 0) > 0 ? 1 : 2)
+    : 0;
   const score = (node: Constellation3DNodeInstance) => {
     const parentPopulation = node.parentId ? byId.get(node.parentId)?.memberCount ?? 0 : 0;
     return (
     (node.id === selectedNodeId ? 1_000_000 : 0) + (node.highlighted ? 500_000 : 0)
-      + (node.community ? 100_000 + (node.memberCount ?? 0) * 100 : parentPopulation * 100)
+      + communityRank(node) * 100_000 + (node.community ? (node.memberCount ?? 0) * 100 : parentPopulation * 100)
       + (node.halo ? 10_000 : 0) + node.degree
     );
   };
@@ -445,10 +472,18 @@ export function buildConstellation3DRenderPlan(
   }
 
   // PLNR-448: an off-page stand-in never earns a text label either — same honesty rule as the
-  // shape-group exclusion above, applied to the label budget instead of the instancing pass.
-  const labels = [...byId.values()].filter((node) => !node.offPageStandIn
+  // shape-group exclusion above, applied to the label candidate pool instead of the instancing pass.
+  const orderedLabels = [...byId.values()].filter((node) => !node.offPageStandIn
       && (!node.ambient || node.id === selectedNodeId || node.highlighted))
-    .sort((a, b) => compareLabelPriority(a, b, selectedNodeId, byId)).slice(0, Math.max(0, labelBudget));
+    .sort((a, b) => compareLabelPriority(a, b, selectedNodeId, byId));
+  // Keep every honest community until camera projection: the global field can contain 22+ root
+  // systems, and slicing here let off-camera roots consume the entire pool before flown-in phase
+  // wells were even tested against the frustum. Entity candidates remain bounded and ordered
+  // biggest-system-first; the later screen-space collision pass still emits at most labelBudget.
+  const labels = [
+    ...orderedLabels.filter((node) => node.community),
+    ...orderedLabels.filter((node) => !node.community).slice(0, Math.max(0, labelBudget)),
+  ];
   // PLNR-439: promoted edges (selection) split into up to three separate passes so historical and
   // off-page relationships can carry their own dash pattern/opacity instead of sharing the solid
   // amber line every other promoted edge gets — each pass is only allotted when the plan actually

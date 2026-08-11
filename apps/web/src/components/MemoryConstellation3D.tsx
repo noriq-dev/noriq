@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type * as Three from 'three';
 import {
-  buildConstellation3DRenderPlan, communityEntitySubtext, communityIgniteSubtext, communityTooltipContent,
+  buildConstellation3DRenderPlan, communityTooltipContent,
   constellation3DColorType, constellation3DCommunityCoreColor, constellation3DCommunityWellScale,
-  constellation3DIsDimmed, constellation3DIsRootScene, constellation3DNodeEncoding,
+  constellation3DIsDimmed, constellation3DIsRootScene, constellation3DLabelPresentation, constellation3DNodeEncoding,
   constellation3DNodeLightnessVariance, constellation3DStarPositions, CONSTELLATION_IGNITE_DIM_OPACITY,
   isOffPageIncidentEdge, placeConstellation3DLabels, promotedEdgeLabelText, truncateConstellationLabel, type Constellation3DEdge,
   type Constellation3DEdgeSegment, type ConstellationCommunityTooltip, type Constellation3DNode,
@@ -21,10 +21,7 @@ import {
 } from './constellation-3d-navigation';
 
 const LABEL_BUDGET = 24;
-const COMMUNITY_LABEL_WIDTH_PX = 180;
-const ENTITY_LABEL_WIDTH_PX = 260;
 const PROMOTED_LABEL_WIDTH_PX = 220;
-const COMMUNITY_LABEL_MAX_CHARACTERS = 28;
 const ENTITY_LABEL_MAX_CHARACTERS = 42;
 const PROMOTED_LABEL_MAX_CHARACTERS = 34;
 // Camera controls (PLNR-447, screen spec "Camera controls") — the 30×30 chip is a fixed-dark panel
@@ -774,17 +771,14 @@ export function MemoryConstellation3D({
             // count instead (screen spec 1c "+N matches") — entities are not resident at this
             // level, so the count is the only truthful thing to say about what matched here.
             const igniteCount = searchActive ? igniteMatchCounts?.get(node.systemId ?? node.id) : undefined;
-            const subtext = node.community
-              ? (igniteCount ? communityIgniteSubtext(igniteCount) : communityEntitySubtext(node.memberCount ?? 0))
-              : undefined;
+            const presentation = constellation3DLabelPresentation(node, igniteCount);
             const pinned = node.id === selection;
             const y = (1 - point.y) * height / 2;
             candidates.push({
               key: `node:${node.id}`,
-              text: truncateConstellationLabel(node.label, node.community ? COMMUNITY_LABEL_MAX_CHARACTERS : ENTITY_LABEL_MAX_CHARACTERS),
-              subtext, x: (point.x + 1) * width / 2, y: pinned ? y - PINNED_TITLE_OFFSET_PX : y,
-              width: node.community ? COMMUNITY_LABEL_WIDTH_PX : ENTITY_LABEL_WIDTH_PX,
-              height: node.community ? 30 : 18, priority: pinned ? 'selected' : 'ambient',
+              text: truncateConstellationLabel(node.label, presentation.maxCharacters),
+              subtext: presentation.subtext, x: (point.x + 1) * width / 2, y: pinned ? y - PINNED_TITLE_OFFSET_PX : y,
+              width: presentation.width, height: presentation.height, priority: pinned ? 'selected' : 'ambient',
               community: node.community, communityLevel: node.communityLevel, memberCount: node.memberCount, promoted: false, pinned,
             });
           }

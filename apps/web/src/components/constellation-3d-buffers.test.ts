@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   aggregateRouteWidth, buildConstellation3DRenderPlan, communityEntitySubtext, communityIgniteSubtext, communityTooltipContent,
   constellation3DColorType, constellation3DCommunityCoreColor, constellation3DCommunityWellScale,
-  constellation3DIsDimmed, constellation3DIsRootScene, constellation3DNodeEncoding,
+  constellation3DIsDimmed, constellation3DIsRootScene, constellation3DLabelPresentation, constellation3DNodeEncoding,
   constellation3DNodeLightnessVariance, constellation3DStarPositions,
   CONSTELLATION_COMMUNITY_WELL_SCALE_CAP, CONSTELLATION_COMMUNITY_WELL_SCALE_FLOOR,
   CONSTELLATION_IGNITE_DIM_OPACITY, CONSTELLATION_NODE_LIGHTNESS_VARIANCE,
@@ -112,7 +112,7 @@ describe('constellation 3D buffer planning', () => {
     expect(plan.labels[0]!.id).toBe('n9999');
   });
 
-  it('spends the bounded entity-label remainder on the biggest resident systems first', () => {
+  it('keeps every community until projection while bounding entity candidates biggest-system-first', () => {
     const nodes = [
       node('large', 'community', { community: true, parentId: null, memberCount: 200 }),
       node('small', 'community', { community: true, parentId: null, memberCount: 8 }),
@@ -120,7 +120,32 @@ describe('constellation 3D buffer planning', () => {
       node('small-member', 'task', { parentId: 'small', degree: 99, isLead: true }),
     ];
     const plan = buildConstellation3DRenderPlan(nodes, [], null, 3);
-    expect(plan.labels.map((label) => label.id)).toEqual(['large', 'small', 'large-member']);
+    expect(plan.labels.map((label) => label.id)).toEqual(['large', 'small', 'large-member', 'small-member']);
+  });
+
+  it('keeps root and phase labels in the candidate set with subordinate phase dimensions and ordering', () => {
+    const nodes = [
+      node('root', 'plan', { community: true, anchorEntity: true, parentId: null, communityLevel: 0, memberCount: 40 }),
+      node('phase-large', 'community', { community: true, parentId: 'root', communityLevel: 1, memberCount: 12 }),
+      node('phase-small', 'community', { community: true, parentId: 'root', communityLevel: 1, memberCount: 3 }),
+      ...Array.from({ length: 30 }, (_, index) => node(`entity-${index}`, 'task', { parentId: 'root', degree: 100 - index })),
+    ];
+    const plan = buildConstellation3DRenderPlan(nodes, [], null, 2);
+    expect(plan.labels.slice(0, 3).map((label) => label.id)).toEqual(['root', 'phase-large', 'phase-small']);
+    expect(plan.labels.filter((label) => !label.community)).toHaveLength(2);
+
+    const rootPresentation = constellation3DLabelPresentation(plan.labels[0]!);
+    const phasePresentation = constellation3DLabelPresentation(plan.labels[1]!);
+    expect(phasePresentation).toMatchObject({ subtext: '12 entities' });
+    expect(phasePresentation.width).toBeLessThan(rootPresentation.width);
+    expect(phasePresentation.height).toBeLessThan(rootPresentation.height);
+
+    const overlapping = [
+      { key: 'entity', x: 0, y: 0, width: 20, height: 10, priority: 'ambient' as const },
+      { key: 'phase', x: 0, y: 0, width: 20, height: 10, priority: 'ambient' as const, community: true, communityLevel: 1, memberCount: 99 },
+      { key: 'root', x: 0, y: 0, width: 20, height: 10, priority: 'ambient' as const, community: true, communityLevel: 0, memberCount: 1 },
+    ];
+    expect(placeConstellation3DLabels(overlapping).map(({ key }) => key)).toEqual(['root']);
   });
 
   it('accounts for the luminous core split and root ambience at an exact 12 draw calls', () => {
