@@ -36,13 +36,13 @@ import type { ProjectedEdgeDescriptor } from '../memory/projection';
 import {
   buildConstellationHierarchy, constellationSourceIsCurrent,
   constellationEdgeBaseWeight,
-  CONSTELLATION_LAYOUT_VERSION, CONSTELLATION_TOPOLOGY_VERSION,
-  type PriorConstellationCommunity,
+  CONSTELLATION_LAYOUT_VERSION, CONSTELLATION_LENSES, CONSTELLATION_TOPOLOGY_VERSION,
+  type ConstellationLens, type HierarchyGenerationData, type PriorConstellationCommunity,
 } from '../memory/constellation-hierarchy';
 import {
-  clampConstellationLimit, constellationEntityPosition, cursorMatches, decodeConstellationCursor, encodeConstellationCursor,
+  clampConstellationLimit, constellationAmbientPosition, constellationEntityPosition, cursorMatches, decodeConstellationCursor, encodeConstellationCursor,
   CONSTELLATION_V2_DEFAULT_ENTITY_LIMIT, CONSTELLATION_V2_DEFAULT_INCIDENT_LIMIT,
-  CONSTELLATION_V2_MAX_ENTITY_LIMIT, CONSTELLATION_V2_MAX_INCIDENT_LIMIT, CONSTELLATION_V2_MAX_OVERVIEW_ROUTES,
+  CONSTELLATION_V2_MAX_AMBIENT_ENTITIES, CONSTELLATION_V2_MAX_ENTITY_LIMIT, CONSTELLATION_V2_MAX_INCIDENT_LIMIT, CONSTELLATION_V2_MAX_OVERVIEW_ROUTES,
   type ConstellationV2AggregateRoute, type ConstellationV2Community, type ConstellationV2CommunityPage,
   type ConstellationV2Coverage, type ConstellationV2Head, type ConstellationV2IncidentPage, type ConstellationV2Overview,
   type ConstellationV2RawEdge, type ConstellationV2Revision, type ConstellationV2Route, type ConstellationV2Unavailable,
@@ -327,6 +327,11 @@ export const CONSTELLATION_DERIVED_TABLES = [
   'constellation_communities',
   'constellation_memberships',
   'constellation_community_links',
+  'constellation_lens_builds',
+  'constellation_lens_node_stats',
+  'constellation_lens_communities',
+  'constellation_lens_memberships',
+  'constellation_lens_community_links',
 ] as const;
 
 export const SCHEMA_TABLES = [...CANONICAL_TABLES, ...CONSTELLATION_DERIVED_TABLES] as const;
@@ -344,17 +349,7 @@ export const OPERATIONAL_TABLES = ['applied_operations', 'memory_revision', 'pro
 export const BACKUP_TABLES = [...CANONICAL_TABLES, ...OPERATIONAL_TABLES] as const;
 
 export interface ConstellationGenerationData {
-  nodeStats: Array<{ nodeId: string; degree: number; weightedDegree: number; rank: number; boundaryDegree: number }>;
-  communities: Array<{
-    id: string; parentId: string | null; level: number; label: string; memberCount: number; childCount: number;
-    typeCounts: Record<string, number>; internalEdgeCount: number; internalWeight: number; normalizedCohesion: number; boundaryWeight: number;
-    anchor: [number, number, number];
-  }>;
-  memberships: Array<{ nodeId: string; communityId: string; level: number }>;
-  links: Array<{
-    level: number; fromCommunityId: string; toCommunityId: string; direction: 'forward' | 'reverse' | 'both';
-    count: number; weight: number; byType: Record<string, number>;
-  }>;
+  lenses: HierarchyGenerationData[];
 }
 
 export interface ConstellationGenerationStatus {
@@ -593,40 +588,51 @@ export class ProjectMemory extends DurableObject<Env> {
     const generation = this.readConstellationGeneration(generationId);
     if (!generation) throw new Error(`constellation generation ${generationId} not found`);
     if (generation.status !== 'building') throw new Error(`constellation generation ${generationId} is ${generation.status}, not building`);
+    const byLens = new Map(data.lenses.map((lens) => [lens.lens, lens]));
+    if (byLens.size !== CONSTELLATION_LENSES.length || CONSTELLATION_LENSES.some((lens) => !byLens.has(lens))) {
+      throw new Error('constellation generation must stage exactly plans and memories lens data');
+    }
     this.ctx.storage.transactionSync(() => {
       this.deleteConstellationGenerationRows(generationId);
-      for (const row of data.nodeStats) {
+      for (const lens of CONSTELLATION_LENSES) {
+        const lensData = byLens.get(lens)!;
         this.ctx.storage.sql.exec(
-          `INSERT INTO constellation_node_stats
-             (generation_id, node_id, degree, weighted_degree, rank, boundary_degree)
-           VALUES (?1,?2,?3,?4,?5,?6)`,
-          generationId, row.nodeId, row.degree, row.weightedDegree, row.rank, row.boundaryDegree,
+          `INSERT INTO constellation_lens_builds (generation_id,lens,anchor_count,ambient_count) VALUES (?1,?2,?3,?4)`,
+          generationId, lens, lensData.communities.filter((row) => row.parentId === null).length, lensData.ambientNodeIds.length,
         );
-      }
-      for (const row of [...data.communities].sort((a, b) => a.level - b.level || a.id.localeCompare(b.id))) {
-        this.ctx.storage.sql.exec(
-          `INSERT INTO constellation_communities
-             (generation_id,id,parent_id,level,label,member_count,child_count,type_counts,internal_weight,normalized_cohesion,boundary_weight,anchor_x,anchor_y,anchor_z,internal_edge_count)
-           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)`,
-          generationId, row.id, row.parentId, row.level, row.label, row.memberCount, row.childCount,
-          JSON.stringify(row.typeCounts), row.internalWeight, row.normalizedCohesion, row.boundaryWeight,
-          row.anchor[0], row.anchor[1], row.anchor[2], row.internalEdgeCount,
-        );
-      }
-      for (const row of data.memberships) {
-        this.ctx.storage.sql.exec(
-          `INSERT INTO constellation_memberships (generation_id,node_id,community_id,level) VALUES (?1,?2,?3,?4)`,
-          generationId, row.nodeId, row.communityId, row.level,
-        );
-      }
-      for (const row of data.links) {
-        this.ctx.storage.sql.exec(
-          `INSERT INTO constellation_community_links
-             (generation_id,level,from_community_id,to_community_id,direction,edge_count,weight,by_type)
-           VALUES (?1,?2,?3,?4,?5,?6,?7,?8)`,
-          generationId, row.level, row.fromCommunityId, row.toCommunityId, row.direction,
-          row.count, row.weight, JSON.stringify(row.byType),
-        );
+        for (const row of lensData.nodeStats) {
+          this.ctx.storage.sql.exec(
+            `INSERT INTO constellation_lens_node_stats
+               (generation_id,lens,node_id,degree,weighted_degree,rank,boundary_degree)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)`,
+            generationId, lens, row.nodeId, row.degree, row.weightedDegree, row.rank, row.boundaryDegree,
+          );
+        }
+        for (const row of [...lensData.communities].sort((a, b) => a.level - b.level || a.id.localeCompare(b.id))) {
+          this.ctx.storage.sql.exec(
+            `INSERT INTO constellation_lens_communities
+               (generation_id,lens,id,parent_id,level,label,core_node_id,member_count,child_count,type_counts,internal_weight,normalized_cohesion,boundary_weight,anchor_x,anchor_y,anchor_z,internal_edge_count)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)`,
+            generationId, lens, row.id, row.parentId, row.level, row.label, row.coreNodeId, row.memberCount, row.childCount,
+            JSON.stringify(row.typeCounts), row.internalWeight, row.normalizedCohesion, row.boundaryWeight,
+            row.anchor[0], row.anchor[1], row.anchor[2], row.internalEdgeCount,
+          );
+        }
+        for (const row of lensData.memberships) {
+          this.ctx.storage.sql.exec(
+            `INSERT INTO constellation_lens_memberships (generation_id,lens,node_id,community_id,level) VALUES (?1,?2,?3,?4,?5)`,
+            generationId, lens, row.nodeId, row.communityId, row.level,
+          );
+        }
+        for (const row of lensData.links) {
+          this.ctx.storage.sql.exec(
+            `INSERT INTO constellation_lens_community_links
+               (generation_id,lens,level,from_community_id,to_community_id,direction,edge_count,weight,by_type)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)`,
+            generationId, lens, row.level, row.fromCommunityId, row.toCommunityId, row.direction,
+            row.count, row.weight, JSON.stringify(row.byType),
+          );
+        }
       }
     });
     return { ok: true };
@@ -711,14 +717,16 @@ export class ProjectMemory extends DurableObject<Env> {
     const rows = activeRow
       ? this.ctx.storage.sql.exec<{ node_stats: number; communities: number; memberships: number; links: number }>(
         `SELECT
-          (SELECT COUNT(*) FROM constellation_node_stats WHERE generation_id = ?1) AS node_stats,
-          (SELECT COUNT(*) FROM constellation_communities WHERE generation_id = ?1) AS communities,
-          (SELECT COUNT(*) FROM constellation_memberships WHERE generation_id = ?1) AS memberships,
-          (SELECT COUNT(*) FROM constellation_community_links WHERE generation_id = ?1) AS links`, activeRow.id,
+          (SELECT COUNT(*) FROM constellation_lens_node_stats WHERE generation_id = ?1) AS node_stats,
+          (SELECT COUNT(*) FROM constellation_lens_communities WHERE generation_id = ?1) AS communities,
+          (SELECT COUNT(*) FROM constellation_lens_memberships WHERE generation_id = ?1) AS memberships,
+          (SELECT COUNT(*) FROM constellation_lens_community_links WHERE generation_id = ?1) AS links`, activeRow.id,
       ).toArray()[0]!
       : { node_stats: 0, communities: 0, memberships: 0, links: 0 };
     return {
-      state: buildingRow ? 'building' : activeRow ? (activeRow.source_revision === currentRevision ? 'current' : 'stale') : failedRow ? 'failed' : 'unavailable',
+      state: buildingRow ? 'building' : activeRow
+        ? (activeRow.source_revision === currentRevision && activeRow.topology_version === CONSTELLATION_TOPOLOGY_VERSION ? 'current' : 'stale')
+        : failedRow ? 'failed' : 'unavailable',
       active: activeRow ? this.shapeConstellationGeneration(activeRow) : null,
       building: buildingRow ? this.shapeConstellationGeneration(buildingRow) : null,
       lastFailed: failedRow ? this.shapeConstellationGeneration(failedRow) : null,
@@ -741,6 +749,11 @@ export class ProjectMemory extends DurableObject<Env> {
   }
 
   private deleteConstellationGenerationRows(generationId: string): void {
+    this.ctx.storage.sql.exec(`DELETE FROM constellation_lens_community_links WHERE generation_id = ?1`, generationId);
+    this.ctx.storage.sql.exec(`DELETE FROM constellation_lens_memberships WHERE generation_id = ?1`, generationId);
+    this.ctx.storage.sql.exec(`DELETE FROM constellation_lens_communities WHERE generation_id = ?1`, generationId);
+    this.ctx.storage.sql.exec(`DELETE FROM constellation_lens_node_stats WHERE generation_id = ?1`, generationId);
+    this.ctx.storage.sql.exec(`DELETE FROM constellation_lens_builds WHERE generation_id = ?1`, generationId);
     this.ctx.storage.sql.exec(`DELETE FROM constellation_community_links WHERE generation_id = ?1`, generationId);
     this.ctx.storage.sql.exec(`DELETE FROM constellation_memberships WHERE generation_id = ?1`, generationId);
     this.ctx.storage.sql.exec(`DELETE FROM constellation_communities WHERE generation_id = ?1`, generationId);
@@ -751,23 +764,23 @@ export class ProjectMemory extends DurableObject<Env> {
     for (const table of [...CONSTELLATION_DERIVED_TABLES].reverse()) this.ctx.storage.sql.exec(`DELETE FROM ${table}`);
   }
 
-  private readPriorConstellationCommunities(): PriorConstellationCommunity[] {
+  private readPriorConstellationCommunities(lens: ConstellationLens): PriorConstellationCommunity[] {
     const active = this.ctx.storage.sql.exec<{ id: string }>(`SELECT id FROM constellation_generations WHERE status = 'active'`).toArray()[0];
     if (!active) return [];
     const rows = this.ctx.storage.sql.exec<{ community_id: string; level: number; uri: string }>(
       `WITH RECURSIVE ancestors(node_id, community_id, level) AS (
          SELECT m.node_id, m.community_id, m.level
-         FROM constellation_memberships m WHERE m.generation_id = ?1
+         FROM constellation_lens_memberships m WHERE m.generation_id = ?1 AND m.lens = ?2
          UNION ALL
          SELECT a.node_id, c.parent_id, c.level - 1
          FROM ancestors a
-         JOIN constellation_communities c ON c.generation_id = ?1 AND c.id = a.community_id
+         JOIN constellation_lens_communities c ON c.generation_id = ?1 AND c.lens = ?2 AND c.id = a.community_id
          WHERE c.parent_id IS NOT NULL
        )
        SELECT a.community_id, a.level, n.uri
        FROM ancestors a JOIN nodes n ON n.id = a.node_id
        ORDER BY a.level, a.community_id, n.uri`,
-      active.id,
+      active.id, lens,
     ).toArray();
     const grouped = new Map<string, PriorConstellationCommunity>();
     for (const row of rows) {
@@ -793,19 +806,23 @@ export class ProjectMemory extends DurableObject<Env> {
     });
     try {
       const rows = this.readConstellationRows();
-      const hierarchy = buildConstellationHierarchy(rows.nodes, rows.edges, this.readPriorConstellationCommunities());
+      const lenses = CONSTELLATION_LENSES.map((lens) =>
+        buildConstellationHierarchy(rows.nodes, rows.edges, lens, this.readPriorConstellationCommunities(lens)));
       if (!constellationSourceIsCurrent(started.sourceRevision, this.readMemoryRevision())) {
         await this.failConstellationGeneration(projectId, started.generationId, 'canonical source revision advanced during build');
         return { ok: false, generationId: started.generationId, reason: 'source-revision-advanced', detail: 'canonical source revision advanced during build' };
       }
-      await this.stageConstellationGeneration(projectId, started.generationId, hierarchy.data);
+      await this.stageConstellationGeneration(projectId, started.generationId, { lenses: lenses.map((result) => result.data) });
       if (!constellationSourceIsCurrent(started.sourceRevision, this.readMemoryRevision())) {
         await this.failConstellationGeneration(projectId, started.generationId, 'canonical source revision advanced before completion');
         return { ok: false, generationId: started.generationId, reason: 'source-revision-advanced', detail: 'canonical source revision advanced before completion' };
       }
       await this.completeConstellationGeneration(projectId, started.generationId);
       await this.activateConstellationGeneration(projectId, started.generationId);
-      return { ok: true, generationId: started.generationId, sourceRevision: started.sourceRevision, nodes: hierarchy.diagnostics.nodeCount, edges: hierarchy.diagnostics.edgeCount };
+      return {
+        ok: true, generationId: started.generationId, sourceRevision: started.sourceRevision,
+        nodes: lenses[0]!.diagnostics.nodeCount, edges: lenses[0]!.diagnostics.edgeCount,
+      };
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       const generation = this.readConstellationGeneration(started.generationId);
@@ -821,8 +838,8 @@ export class ProjectMemory extends DurableObject<Env> {
   async constellationHierarchyDrift(projectId: string): Promise<ConstellationHierarchyDrift> {
     await this.assertProjectId(projectId);
     const currentRevision = this.readMemoryRevision();
-    const active = this.ctx.storage.sql.exec<{ id: string; source_revision: number }>(
-      `SELECT id, source_revision FROM constellation_generations WHERE status = 'active'`,
+    const active = this.ctx.storage.sql.exec<{ id: string; source_revision: number; topology_version: string }>(
+      `SELECT id, source_revision, topology_version FROM constellation_generations WHERE status = 'active'`,
     ).toArray()[0];
     const canonicalNodes = this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM nodes`).toArray()[0]?.n ?? 0;
     const canonicalEdges = this.ctx.storage.sql.exec<{ n: number }>(
@@ -831,36 +848,56 @@ export class ProjectMemory extends DurableObject<Env> {
     if (!active) {
       return {
         activeGenerationId: null, sourceRevision: null, currentRevision, stale: canonicalNodes > 0,
-        canonicalNodes, canonicalEdges, missingNodeStats: canonicalNodes, extraNodeStats: 0,
-        invalidMemberships: canonicalNodes, missingAggregatedEdges: canonicalEdges, unexpectedAggregatedEdges: 0,
+        canonicalNodes, canonicalEdges, missingNodeStats: canonicalNodes * CONSTELLATION_LENSES.length, extraNodeStats: 0,
+        invalidMemberships: canonicalNodes * CONSTELLATION_LENSES.length, missingAggregatedEdges: canonicalEdges, unexpectedAggregatedEdges: 0,
         converged: canonicalNodes === 0 && canonicalEdges === 0,
       };
     }
     const missingNodeStats = this.ctx.storage.sql.exec<{ n: number }>(
-      `SELECT COUNT(*) AS n FROM nodes n WHERE NOT EXISTS (
-         SELECT 1 FROM constellation_node_stats s WHERE s.generation_id = ?1 AND s.node_id = n.id
+      `WITH lenses(lens) AS (VALUES ('plans'), ('memories'))
+       SELECT COUNT(*) AS n FROM nodes n CROSS JOIN lenses l WHERE NOT EXISTS (
+         SELECT 1 FROM constellation_lens_node_stats s
+         WHERE s.generation_id = ?1 AND s.lens = l.lens AND s.node_id = n.id
        )`, active.id,
     ).toArray()[0]?.n ?? 0;
     const extraNodeStats = this.ctx.storage.sql.exec<{ n: number }>(
-      `SELECT COUNT(*) AS n FROM constellation_node_stats s
+      `SELECT COUNT(*) AS n FROM constellation_lens_node_stats s
        WHERE s.generation_id = ?1 AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = s.node_id)`, active.id,
     ).toArray()[0]?.n ?? 0;
-    const invalidMemberships = this.ctx.storage.sql.exec<{ n: number }>(
-      `SELECT COUNT(*) AS n FROM (
-         SELECT n.id, COUNT(m.community_id) AS memberships
-         FROM nodes n LEFT JOIN constellation_memberships m ON m.generation_id = ?1 AND m.node_id = n.id
-         GROUP BY n.id HAVING memberships != 1
-       )`, active.id,
-    ).toArray()[0]?.n ?? 0;
-    const aggregatedEdges = this.ctx.storage.sql.exec<{ n: number }>(
-      `SELECT
-         COALESCE((SELECT SUM(internal_edge_count) FROM constellation_communities WHERE generation_id = ?1 AND parent_id IS NULL), 0) +
-         COALESCE((SELECT SUM(edge_count) FROM constellation_community_links WHERE generation_id = ?1 AND level = 0), 0) AS n`,
-      active.id,
-    ).toArray()[0]?.n ?? 0;
-    const stale = active.source_revision !== currentRevision;
-    const missingAggregatedEdges = Math.max(0, canonicalEdges - aggregatedEdges);
-    const unexpectedAggregatedEdges = Math.max(0, aggregatedEdges - canonicalEdges);
+    let invalidMemberships = 0;
+    let missingAggregatedEdges = 0;
+    let unexpectedAggregatedEdges = 0;
+    for (const lens of CONSTELLATION_LENSES) {
+      const build = this.ctx.storage.sql.exec<{ ambient_count: number }>(
+        `SELECT ambient_count FROM constellation_lens_builds WHERE generation_id = ?1 AND lens = ?2`, active.id, lens,
+      ).toArray()[0];
+      const membershipCount = this.ctx.storage.sql.exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM constellation_lens_memberships WHERE generation_id = ?1 AND lens = ?2`, active.id, lens,
+      ).toArray()[0]?.n ?? 0;
+      invalidMemberships += build ? Math.abs(canonicalNodes - build.ambient_count - membershipCount) : canonicalNodes;
+      invalidMemberships += this.ctx.storage.sql.exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM (
+           SELECT node_id FROM constellation_lens_memberships
+           WHERE generation_id = ?1 AND lens = ?2 GROUP BY node_id HAVING COUNT(*) != 1
+         )`, active.id, lens,
+      ).toArray()[0]?.n ?? 0;
+      const coveredEdges = this.ctx.storage.sql.exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM edges e
+         JOIN constellation_lens_memberships f ON f.generation_id = ?1 AND f.lens = ?2 AND f.node_id = e.from_node_id
+         JOIN constellation_lens_memberships t ON t.generation_id = ?1 AND t.lens = ?2 AND t.node_id = e.to_node_id`,
+        active.id, lens,
+      ).toArray()[0]?.n ?? 0;
+      const aggregatedEdges = this.ctx.storage.sql.exec<{ n: number }>(
+        `SELECT
+           COALESCE((SELECT SUM(internal_edge_count) FROM constellation_lens_communities
+             WHERE generation_id = ?1 AND lens = ?2 AND parent_id IS NULL), 0) +
+           COALESCE((SELECT SUM(edge_count) FROM constellation_lens_community_links
+             WHERE generation_id = ?1 AND lens = ?2 AND level = 0), 0) AS n`, active.id, lens,
+      ).toArray()[0]?.n ?? 0;
+      missingAggregatedEdges += Math.max(0, coveredEdges - aggregatedEdges);
+      unexpectedAggregatedEdges += Math.max(0, aggregatedEdges - coveredEdges);
+    }
+    const stale = active.source_revision !== currentRevision || active.topology_version !== CONSTELLATION_TOPOLOGY_VERSION;
     return {
       activeGenerationId: active.id, sourceRevision: active.source_revision, currentRevision, stale,
       canonicalNodes, canonicalEdges, missingNodeStats, extraNodeStats, invalidMemberships,
@@ -887,7 +924,8 @@ export class ProjectMemory extends DurableObject<Env> {
       revision: {
         contract: 'constellation-v2', generationId: generation.id, sourceRevision: generation.source_revision,
         currentRevision, topologyVersion: generation.topology_version, layoutVersion: generation.layout_version,
-        state: building > 0 ? 'building' : generation.source_revision === currentRevision ? 'current' : 'stale',
+        state: building > 0 ? 'building'
+          : generation.source_revision === currentRevision && generation.topology_version === CONSTELLATION_TOPOLOGY_VERSION ? 'current' : 'stale',
         generatedAt: generation.completed_at ?? generation.created_at,
       },
     };
@@ -898,15 +936,21 @@ export class ProjectMemory extends DurableObject<Env> {
   }
 
   /** Metadata-only cache validator: no hierarchy page or canonical graph rows are read. */
-  async constellationV2Head(projectId: string): Promise<ConstellationV2Head | ConstellationV2Unavailable> {
+  async constellationV2Head(
+    projectId: string,
+    lens: ConstellationLens = 'plans',
+  ): Promise<ConstellationV2Head | ConstellationV2Unavailable> {
     await this.assertProjectId(projectId);
     const active = this.activeConstellationRevision();
-    return active ? { revision: active.revision } : this.unavailableConstellation('generation-unavailable');
+    if (!active) return this.unavailableConstellation('generation-unavailable');
+    if (!this.constellationLensWasBuilt(active.generation.id, lens)) return this.unavailableConstellation('generation-stale');
+    return { revision: active.revision };
   }
 
   private shapeConstellationCommunity(row: Record<string, string | number | null>): ConstellationV2Community {
     return {
       id: String(row.id), parentId: row.parent_id === null ? null : String(row.parent_id), level: Number(row.level), label: String(row.label),
+      coreNodeId: row.core_node_id === null ? null : String(row.core_node_id),
       memberCount: Number(row.member_count), childCommunityCount: Number(row.child_count),
       typeCounts: JSON.parse(String(row.type_counts)) as Record<string, number>, internalEdgeCount: Number(row.internal_edge_count),
       internalWeight: Number(row.internal_weight), normalizedCohesion: Number(row.normalized_cohesion), boundaryWeight: Number(row.boundary_weight),
@@ -914,31 +958,32 @@ export class ProjectMemory extends DurableObject<Env> {
     };
   }
 
-  private readConstellationCommunity(generationId: string, communityId: string): ConstellationV2Community | null {
+  private readConstellationCommunity(generationId: string, lens: ConstellationLens, communityId: string): ConstellationV2Community | null {
     const row = this.ctx.storage.sql.exec<Record<string, string | number | null>>(
-      `SELECT * FROM constellation_communities WHERE generation_id = ?1 AND id = ?2`, generationId, communityId,
+      `SELECT * FROM constellation_lens_communities WHERE generation_id = ?1 AND lens = ?2 AND id = ?3`, generationId, lens, communityId,
     ).toArray()[0];
     return row ? this.shapeConstellationCommunity(row) : null;
   }
 
-  private readCommunityPath(generationId: string, nodeId: string): ConstellationV2Community[] {
+  private readCommunityPath(generationId: string, lens: ConstellationLens, nodeId: string): ConstellationV2Community[] {
     const rows = this.ctx.storage.sql.exec<Record<string, string | number | null>>(
       `WITH RECURSIVE path AS (
-         SELECT c.* FROM constellation_memberships m
-         JOIN constellation_communities c ON c.generation_id = m.generation_id AND c.id = m.community_id
-         WHERE m.generation_id = ?1 AND m.node_id = ?2
+         SELECT c.* FROM constellation_lens_memberships m
+         JOIN constellation_lens_communities c ON c.generation_id = m.generation_id AND c.lens = m.lens AND c.id = m.community_id
+         WHERE m.generation_id = ?1 AND m.lens = ?2 AND m.node_id = ?3
          UNION ALL
          SELECT parent.* FROM path child
-         JOIN constellation_communities parent ON parent.generation_id = ?1 AND parent.id = child.parent_id
+         JOIN constellation_lens_communities parent ON parent.generation_id = ?1 AND parent.lens = ?2 AND parent.id = child.parent_id
          WHERE child.parent_id IS NOT NULL
        ) SELECT * FROM path ORDER BY level`,
-      generationId, nodeId,
+      generationId, lens, nodeId,
     ).toArray();
     return rows.map((row) => this.shapeConstellationCommunity(row));
   }
 
   private readAggregateRoutes(
     generationId: string,
+    lens: ConstellationLens,
     level: number,
     communityIds: string[],
   ): { routes: ConstellationV2AggregateRoute[]; externalCommunities: ConstellationV2Community[]; truncated: boolean } {
@@ -946,25 +991,25 @@ export class ProjectMemory extends DurableObject<Env> {
     type AggregateRouteRow = {
       from_community_id: string; to_community_id: string; direction: 'forward' | 'reverse' | 'both'; edge_count: number; weight: number; by_type: string;
     };
-    // Durable Object SQLite accepts at most 100 numbered variables. Two are reserved for the
-    // generation and level, so a community page wider than 98 children must query its route
+    // Durable Object SQLite accepts at most 100 numbered variables. Three are reserved for the
+    // generation, lens, and level, so a community page wider than 97 children must query its route
     // boundary in batches. Reusing each numbered placeholder in both IN clauses does not consume
     // another variable; routes spanning two batches are deduplicated before the global ordering
     // and cap are applied.
     const ids = [...new Set(communityIds)];
-    const idsPerQuery = 98;
+    const idsPerQuery = 97;
     const rowByRoute = new Map<string, AggregateRouteRow>();
     let batchTruncated = false;
     for (let offset = 0; offset < ids.length; offset += idsPerQuery) {
       const batch = ids.slice(offset, offset + idsPerQuery);
-      const placeholders = batch.map((_, index) => `?${index + 3}`).join(',');
+      const placeholders = batch.map((_, index) => `?${index + 4}`).join(',');
       const rows = this.ctx.storage.sql.exec<AggregateRouteRow>(
         `SELECT from_community_id,to_community_id,direction,edge_count,weight,by_type
-         FROM constellation_community_links
-         WHERE generation_id = ?1 AND level = ?2
+         FROM constellation_lens_community_links
+         WHERE generation_id = ?1 AND lens = ?2 AND level = ?3
            AND (from_community_id IN (${placeholders}) OR to_community_id IN (${placeholders}))
          ORDER BY weight DESC, from_community_id, to_community_id LIMIT ${CONSTELLATION_V2_MAX_OVERVIEW_ROUTES + 1}`,
-        generationId, level, ...batch,
+        generationId, lens, level, ...batch,
       ).toArray();
       batchTruncated ||= rows.length > CONSTELLATION_V2_MAX_OVERVIEW_ROUTES;
       for (const row of rows) {
@@ -984,7 +1029,7 @@ export class ProjectMemory extends DurableObject<Env> {
     }));
     const visible = new Set(ids);
     const externalIds = [...new Set(routes.flatMap((route) => [route.fromCommunityId, route.toCommunityId]).filter((id) => !visible.has(id)))];
-    const externalCommunities = externalIds.map((id) => this.readConstellationCommunity(generationId, id)).filter((row): row is ConstellationV2Community => row !== null);
+    const externalCommunities = externalIds.map((id) => this.readConstellationCommunity(generationId, lens, id)).filter((row): row is ConstellationV2Community => row !== null);
     return { routes, externalCommunities, truncated };
   }
 
@@ -996,21 +1041,21 @@ export class ProjectMemory extends DurableObject<Env> {
     return { complete: !pageLimited && revision.state === 'current', reasons };
   }
 
-  private readConstellationBackbone(generationId: string, communityId: string): { edges: ConstellationV2RawEdge[]; truncated: boolean } {
+  private readConstellationBackbone(generationId: string, lens: ConstellationLens, communityId: string): { edges: ConstellationV2RawEdge[]; truncated: boolean } {
     const candidateLimit = 2_000;
     const rows = this.ctx.storage.sql.exec<{
       edge_id: string; type: string; from_node_id: string; to_node_id: string; provenance: string | null;
     }>(
       `SELECT e.id AS edge_id,e.type,e.from_node_id,e.to_node_id,e.provenance
        FROM edges e
-       JOIN constellation_memberships source ON source.generation_id = ?1 AND source.community_id = ?2 AND source.node_id = e.from_node_id
-       JOIN constellation_memberships target ON target.generation_id = ?1 AND target.community_id = ?2 AND target.node_id = e.to_node_id
+       JOIN constellation_lens_memberships source ON source.generation_id = ?1 AND source.lens = ?2 AND source.community_id = ?3 AND source.node_id = e.from_node_id
+       JOIN constellation_lens_memberships target ON target.generation_id = ?1 AND target.lens = ?2 AND target.community_id = ?3 AND target.node_id = e.to_node_id
        ORDER BY CASE e.type
          WHEN 'calls' THEN 4 WHEN 'imports' THEN 4 WHEN 'depends_on' THEN 4 WHEN 'tests' THEN 4 WHEN 'validated_by' THEN 4 WHEN 'implements' THEN 4
          WHEN 'modifies' THEN 3 WHEN 'declares' THEN 3 WHEN 'derived_from' THEN 3 WHEN 'decided_by' THEN 3 WHEN 'observed_in' THEN 3 WHEN 'commonly_changes_with' THEN 3
          WHEN 'blocks' THEN 2 WHEN 'owned_by' THEN 2 WHEN 'failed_because' THEN 2 ELSE 1 END DESC,
-         e.type,e.from_node_id,e.to_node_id,e.id LIMIT ?3`,
-      generationId, communityId, candidateLimit + 1,
+         e.type,e.from_node_id,e.to_node_id,e.id LIMIT ?4`,
+      generationId, lens, communityId, candidateLimit + 1,
     ).toArray();
     const parent = new Map<string, string>();
     const root = (id: string): string => {
@@ -1034,32 +1079,75 @@ export class ProjectMemory extends DurableObject<Env> {
     return { edges, truncated: rows.length > candidateLimit };
   }
 
-  async constellationV2Overview(projectId: string): Promise<ConstellationV2Overview | ConstellationV2Unavailable> {
+  private constellationLensWasBuilt(generationId: string, lens: ConstellationLens): boolean {
+    return this.ctx.storage.sql.exec<{ one: number }>(
+      `SELECT 1 AS one FROM constellation_lens_builds WHERE generation_id = ?1 AND lens = ?2`, generationId, lens,
+    ).toArray().length > 0;
+  }
+
+  async constellationV2Overview(
+    projectId: string,
+    lens: ConstellationLens = 'plans',
+  ): Promise<ConstellationV2Overview | ConstellationV2Unavailable> {
     await this.assertProjectId(projectId);
     const active = this.activeConstellationRevision();
     if (!active) return this.unavailableConstellation('generation-unavailable');
+    if (!this.constellationLensWasBuilt(active.generation.id, lens)) return this.unavailableConstellation('generation-stale');
     const rows = this.ctx.storage.sql.exec<Record<string, string | number | null>>(
-      `SELECT * FROM constellation_communities WHERE generation_id = ?1 AND parent_id IS NULL ORDER BY id`, active.generation.id,
+      `SELECT * FROM constellation_lens_communities
+       WHERE generation_id = ?1 AND lens = ?2 AND parent_id IS NULL ORDER BY id`, active.generation.id, lens,
     ).toArray();
     const communities = rows.map((row) => this.shapeConstellationCommunity(row));
-    const routePage = this.readAggregateRoutes(active.generation.id, 0, communities.map((community) => community.id));
+    const routePage = this.readAggregateRoutes(active.generation.id, lens, 0, communities.map((community) => community.id));
+    const ambientCount = this.ctx.storage.sql.exec<{ ambient_count: number }>(
+      `SELECT ambient_count FROM constellation_lens_builds WHERE generation_id = ?1 AND lens = ?2`, active.generation.id, lens,
+    ).toArray()[0]!.ambient_count;
+    const ambientRows = this.ctx.storage.sql.exec<{
+      node_id: string; uri: string; type: string; label: string; degree: number; boundary_degree: number; rank: number;
+      kind: string | null; authority: number | null; validity: string | null;
+    }>(
+      `SELECT n.id AS node_id,n.uri,n.type,n.label,s.degree,s.boundary_degree,s.rank,
+              COALESCE(mi.kind, ep.landing_outcome) AS kind,mi.authority,mi.validity
+       FROM constellation_lens_node_stats s
+       JOIN nodes n ON n.id = s.node_id
+       LEFT JOIN constellation_lens_memberships m
+         ON m.generation_id = s.generation_id AND m.lens = s.lens AND m.node_id = s.node_id
+       LEFT JOIN memory_items mi ON n.type = 'memory' AND n.uri = 'noriq://memory/' || mi.id
+       LEFT JOIN episodes ep ON n.type = 'episode' AND n.uri = 'noriq://episode/' || ep.id
+       WHERE s.generation_id = ?1 AND s.lens = ?2 AND m.node_id IS NULL
+       ORDER BY s.rank DESC,n.id LIMIT ?3`,
+      active.generation.id, lens, CONSTELLATION_V2_MAX_AMBIENT_ENTITIES,
+    ).toArray();
+    const ambientEntities = ambientRows.map((row) => {
+      const lead = row.authority !== null || row.validity !== null
+        ? classifyLead({ authority: row.authority ?? undefined, validity: row.validity ?? undefined }) : null;
+      return {
+        nodeId: row.node_id, uri: row.uri, type: row.type, kind: row.kind, label: row.label,
+        authority: row.authority, validity: row.validity, isLead: lead?.isLead ?? null, leadReasons: lead?.leadReasons ?? null,
+        degree: row.degree, boundaryDegree: row.boundary_degree, groupKey: row.type, communityId: null,
+        position: constellationAmbientPosition(row.uri, ambientCount),
+      };
+    });
     return {
-      revision: active.revision, communities, routes: routePage.routes,
-      coverage: this.constellationCoverage(active.revision, routePage.truncated, true),
+      revision: active.revision, lens, communities, routes: routePage.routes,
+      ambient: { count: ambientCount, entities: ambientEntities },
+      coverage: this.constellationCoverage(active.revision, routePage.truncated || ambientCount > ambientEntities.length, true),
     };
   }
 
   async constellationV2Community(
     projectId: string,
     communityId: string,
-    input: { cursor?: string; limit?: number } = {},
+    input: { cursor?: string; limit?: number; lens?: ConstellationLens } = {},
   ): Promise<ConstellationV2CommunityPage | ConstellationV2Unavailable> {
     await this.assertProjectId(projectId);
     const active = this.activeConstellationRevision();
     if (!active) return this.unavailableConstellation('generation-unavailable');
-    const community = this.readConstellationCommunity(active.generation.id, communityId);
+    const lens = input.lens ?? 'plans';
+    if (!this.constellationLensWasBuilt(active.generation.id, lens)) return this.unavailableConstellation('generation-stale');
+    const community = this.readConstellationCommunity(active.generation.id, lens, communityId);
     if (!community) return this.unavailableConstellation('not-found');
-    const scope = `community:${communityId}`;
+    const scope = `${lens}:community:${communityId}`;
     const cursor = decodeConstellationCursor(input.cursor);
     if (input.cursor && (!cursor || !cursorMatches(cursor, active.generation.id, active.revision.currentRevision, scope))) {
       return this.unavailableConstellation('cursor-stale');
@@ -1067,16 +1155,16 @@ export class ProjectMemory extends DurableObject<Env> {
     if (community.childCommunityCount > 0) {
       const limit = clampConstellationLimit(input.limit, 128, 128);
       const rows = this.ctx.storage.sql.exec<Record<string, string | number | null>>(
-        `SELECT * FROM constellation_communities
-         WHERE generation_id = ?1 AND parent_id = ?2 AND id > ?3 ORDER BY id LIMIT ?4`,
-        active.generation.id, communityId, cursor?.after ?? '', limit + 1,
+        `SELECT * FROM constellation_lens_communities
+         WHERE generation_id = ?1 AND lens = ?2 AND parent_id = ?3 AND id > ?4 ORDER BY id LIMIT ?5`,
+        active.generation.id, lens, communityId, cursor?.after ?? '', limit + 1,
       ).toArray();
       const pageLimited = rows.length > limit;
       const communities = rows.slice(0, limit).map((row) => this.shapeConstellationCommunity(row));
-      const routePage = this.readAggregateRoutes(active.generation.id, community.level + 1, communities.map((row) => row.id));
+      const routePage = this.readAggregateRoutes(active.generation.id, lens, community.level + 1, communities.map((row) => row.id));
       const after = communities.at(-1)?.id;
       return {
-        revision: active.revision, community, kind: 'communities', communities, entities: [], backboneEdges: [], routes: routePage.routes,
+        revision: active.revision, lens, community, kind: 'communities', communities, entities: [], backboneEdges: [], routes: routePage.routes,
         externalCommunities: routePage.externalCommunities,
         nextCursor: pageLimited && after ? encodeConstellationCursor({ generationId: active.generation.id, currentRevision: active.revision.currentRevision, scope, after }) : null,
         coverage: this.constellationCoverage(active.revision, pageLimited || routePage.truncated, true),
@@ -1094,15 +1182,15 @@ export class ProjectMemory extends DurableObject<Env> {
     }>(
       `SELECT n.id AS node_id,n.uri,n.type,n.label,s.degree,s.boundary_degree,s.rank,
               COALESCE(mi.kind, ep.landing_outcome) AS kind,mi.authority,mi.validity
-       FROM constellation_memberships m
-       JOIN constellation_node_stats s ON s.generation_id = m.generation_id AND s.node_id = m.node_id
+       FROM constellation_lens_memberships m
+       JOIN constellation_lens_node_stats s ON s.generation_id = m.generation_id AND s.lens = m.lens AND s.node_id = m.node_id
        JOIN nodes n ON n.id = m.node_id
        LEFT JOIN memory_items mi ON n.type = 'memory' AND n.uri = 'noriq://memory/' || mi.id
        LEFT JOIN episodes ep ON n.type = 'episode' AND n.uri = 'noriq://episode/' || ep.id
-       WHERE m.generation_id = ?1 AND m.community_id = ?2
-         AND (s.rank < ?3 OR (s.rank = ?3 AND n.id > ?4))
-       ORDER BY s.rank DESC,n.id LIMIT ?5`,
-      active.generation.id, communityId, afterRank, afterNodeId, limit + 1,
+       WHERE m.generation_id = ?1 AND m.lens = ?2 AND m.community_id = ?3
+         AND (s.rank < ?4 OR (s.rank = ?4 AND n.id > ?5))
+       ORDER BY s.rank DESC,n.id LIMIT ?6`,
+      active.generation.id, lens, communityId, afterRank, afterNodeId, limit + 1,
     ).toArray();
     const pageLimited = rows.length > limit;
     const entityRows = rows.slice(0, limit);
@@ -1115,43 +1203,48 @@ export class ProjectMemory extends DurableObject<Env> {
         position: constellationEntityPosition(row.uri, community.anchor, community.memberCount),
       };
     });
-    const routePage = this.readAggregateRoutes(active.generation.id, community.level, [community.id]);
-    const backbone = this.readConstellationBackbone(active.generation.id, community.id);
+    const routePage = this.readAggregateRoutes(active.generation.id, lens, community.level, [community.id]);
+    const backbone = this.readConstellationBackbone(active.generation.id, lens, community.id);
     const last = entityRows.at(-1);
     return {
-      revision: active.revision, community, kind: 'entities', communities: [], entities, backboneEdges: backbone.edges, routes: routePage.routes,
+      revision: active.revision, lens, community, kind: 'entities', communities: [], entities, backboneEdges: backbone.edges, routes: routePage.routes,
       externalCommunities: routePage.externalCommunities,
       nextCursor: pageLimited && last ? encodeConstellationCursor({ generationId: active.generation.id, currentRevision: active.revision.currentRevision, scope, after: JSON.stringify([last.rank, last.node_id]) }) : null,
       coverage: this.constellationCoverage(active.revision, pageLimited || routePage.truncated || backbone.truncated),
     };
   }
 
-  async constellationV2Route(projectId: string, uri: string): Promise<ConstellationV2Route | ConstellationV2Unavailable> {
+  async constellationV2Route(
+    projectId: string,
+    uri: string,
+    lens: ConstellationLens = 'plans',
+  ): Promise<ConstellationV2Route | ConstellationV2Unavailable> {
     await this.assertProjectId(projectId);
     const active = this.activeConstellationRevision();
     if (!active) return this.unavailableConstellation('generation-unavailable');
+    if (!this.constellationLensWasBuilt(active.generation.id, lens)) return this.unavailableConstellation('generation-stale');
     const node = this.ctx.storage.sql.exec<{ id: string; uri: string }>(`SELECT id,uri FROM nodes WHERE uri = ?1`, uri).toArray()[0];
     if (!node) return this.unavailableConstellation('not-found');
-    const communityPath = this.readCommunityPath(active.generation.id, node.id);
-    if (communityPath.length === 0) return this.unavailableConstellation('generation-stale');
-    return { revision: active.revision, nodeId: node.id, uri: node.uri, communityPath };
+    const communityPath = this.readCommunityPath(active.generation.id, lens, node.id);
+    return { revision: active.revision, lens, nodeId: node.id, uri: node.uri, communityPath, ambient: communityPath.length === 0 };
   }
 
   async constellationV2Incidents(
     projectId: string,
     nodeId: string,
-    input: { cursor?: string; limit?: number } = {},
+    input: { cursor?: string; limit?: number; lens?: ConstellationLens } = {},
   ): Promise<ConstellationV2IncidentPage | ConstellationV2Unavailable> {
     await this.assertProjectId(projectId);
     const active = this.activeConstellationRevision();
     if (!active) return this.unavailableConstellation('generation-unavailable');
+    const lens = input.lens ?? 'plans';
+    if (!this.constellationLensWasBuilt(active.generation.id, lens)) return this.unavailableConstellation('generation-stale');
     const node = this.ctx.storage.sql.exec<{ id: string; uri: string; type: string; label: string }>(
       `SELECT id,uri,type,label FROM nodes WHERE id = ?1`, nodeId,
     ).toArray()[0];
     if (!node) return this.unavailableConstellation('not-found');
-    const communityPath = this.readCommunityPath(active.generation.id, node.id);
-    if (communityPath.length === 0) return this.unavailableConstellation('generation-stale');
-    const scope = `incidents:${nodeId}`;
+    const communityPath = this.readCommunityPath(active.generation.id, lens, node.id);
+    const scope = `${lens}:incidents:${nodeId}`;
     const cursor = decodeConstellationCursor(input.cursor);
     if (input.cursor && (!cursor || !cursorMatches(cursor, active.generation.id, active.revision.currentRevision, scope))) {
       return this.unavailableConstellation('cursor-stale');
@@ -1182,11 +1275,11 @@ export class ProjectMemory extends DurableObject<Env> {
     const edgeRows = rows.slice(0, limit);
     const edges = edgeRows.map((row) => ({
       edgeId: row.edge_id, type: row.edge_type, direction: row.direction, provenance: row.provenance,
-      endpoint: { nodeId: row.endpoint_id, uri: row.endpoint_uri, type: row.endpoint_type, label: row.endpoint_label, communityPath: this.readCommunityPath(active.generation.id, row.endpoint_id) },
+      endpoint: { nodeId: row.endpoint_id, uri: row.endpoint_uri, type: row.endpoint_type, label: row.endpoint_label, communityPath: this.readCommunityPath(active.generation.id, lens, row.endpoint_id) },
     }));
     const last = edgeRows.at(-1);
     return {
-      revision: active.revision, node: { nodeId: node.id, uri: node.uri, type: node.type, label: node.label, communityPath }, edges,
+      revision: active.revision, lens, node: { nodeId: node.id, uri: node.uri, type: node.type, label: node.label, communityPath }, edges,
       nextCursor: pageLimited && last ? encodeConstellationCursor({
         generationId: active.generation.id, currentRevision: active.revision.currentRevision, scope,
         after: JSON.stringify([last.edge_type, last.direction, last.endpoint_uri, last.edge_id]),

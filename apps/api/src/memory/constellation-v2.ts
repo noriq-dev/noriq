@@ -3,10 +3,13 @@ export const CONSTELLATION_V2_MAX_ENTITY_LIMIT = 500;
 export const CONSTELLATION_V2_DEFAULT_INCIDENT_LIMIT = 256;
 export const CONSTELLATION_V2_MAX_INCIDENT_LIMIT = 500;
 export const CONSTELLATION_V2_MAX_OVERVIEW_ROUTES = 512;
+export const CONSTELLATION_V2_MAX_AMBIENT_ENTITIES = 500;
 export const CONSTELLATION_V2_COMPACT_MEDIA_TYPE = 'application/vnd.noriq.constellation-v2.compact+json';
 // Bump for every read-time response derivation change (position math, compact shapes, or fields):
 // PLNR-465 changed positions without a revision bump and stranded returning browsers on stale 304 bodies.
-export const CONSTELLATION_READ_VERSION = 'read-v2';
+export const CONSTELLATION_READ_VERSION = 'read-v3';
+
+export type ConstellationV2Lens = 'plans' | 'memories';
 
 export interface ConstellationV2Revision {
   contract: 'constellation-v2';
@@ -33,6 +36,7 @@ export interface ConstellationV2Community {
   parentId: string | null;
   level: number;
   label: string;
+  coreNodeId: string | null;
   memberCount: number;
   childCommunityCount: number;
   typeCounts: Record<string, number>;
@@ -65,7 +69,7 @@ export interface ConstellationV2Entity {
   degree: number;
   boundaryDegree: number;
   groupKey: string;
-  communityId: string;
+  communityId: string | null;
   position: [number, number, number];
 }
 
@@ -82,13 +86,16 @@ export interface ConstellationV2RawEdge {
 
 export interface ConstellationV2Overview {
   revision: ConstellationV2Revision;
+  lens: ConstellationV2Lens;
   communities: ConstellationV2Community[];
   routes: ConstellationV2AggregateRoute[];
+  ambient: { count: number; entities: ConstellationV2Entity[] };
   coverage: ConstellationV2Coverage;
 }
 
 export interface ConstellationV2CommunityPage {
   revision: ConstellationV2Revision;
+  lens: ConstellationV2Lens;
   community: ConstellationV2Community;
   kind: 'communities' | 'entities';
   communities: ConstellationV2Community[];
@@ -102,9 +109,11 @@ export interface ConstellationV2CommunityPage {
 
 export interface ConstellationV2Route {
   revision: ConstellationV2Revision;
+  lens: ConstellationV2Lens;
   nodeId: string;
   uri: string;
   communityPath: ConstellationV2Community[];
+  ambient: boolean;
 }
 
 export interface ConstellationV2IncidentEdge {
@@ -117,6 +126,7 @@ export interface ConstellationV2IncidentEdge {
 
 export interface ConstellationV2IncidentPage {
   revision: ConstellationV2Revision;
+  lens: ConstellationV2Lens;
   node: { nodeId: string; uri: string; type: string; label: string; communityPath: ConstellationV2Community[] };
   edges: ConstellationV2IncidentEdge[];
   nextCursor: string | null;
@@ -247,6 +257,17 @@ export function constellationEntityPosition(
   ];
 }
 
+/** Unanchored entities are a neutral galaxy field, not a fake system at the origin. Reuse the
+ * deterministic uniform-ball direction/radius sample, then widen it to scene scale so hundreds
+ * of ambient base entities do not masquerade as one tight community cloud. */
+export function constellationAmbientPosition(uri: string, ambientCount: number): [number, number, number] {
+  const localRadius = constellationEntityCloudRadius(ambientCount);
+  const fieldRadius = Math.min(850, Math.max(300, 180 + 55 * Math.cbrt(Math.max(0, ambientCount))));
+  const local = constellationEntityPosition(uri, [0, 0, 0], ambientCount);
+  const scale = fieldRadius / localRadius;
+  return [local[0] * scale, local[1] * scale, local[2] * scale];
+}
+
 function compactDictionary() {
   const dictionary: ConstellationV2CompactDictionary = { ids: [], uris: [], labels: [], types: [], kinds: [] };
   const indices = {
@@ -276,7 +297,7 @@ export function compactConstellationCommunityPage(page: ConstellationV2Community
   const entities: ConstellationV2CompactCommunityPage['entities'] = page.entities.map((entity) => [
     dict.id(entity.nodeId), dict.uri(entity.uri), dict.type(entity.type), dict.kind(entity.kind), dict.label(entity.label),
     entity.authority, entity.validity, entity.isLead, entity.leadReasons, entity.degree, entity.boundaryDegree,
-    dict.type(entity.groupKey), dict.id(entity.communityId), ...entity.position,
+    dict.type(entity.groupKey), dict.id(entity.communityId!), ...entity.position,
   ]);
   const routes: ConstellationV2CompactCommunityPage['routes'] = page.routes.map((route) => [
     dict.id(route.fromCommunityId), dict.id(route.toCommunityId), route.direction, route.count, route.weight, route.byType,

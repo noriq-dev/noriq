@@ -5,6 +5,7 @@ import type {
   ConstellationGenerationData, ConstellationGenerationStatus, ConstellationHierarchyDrift, ProjectMemoryHealth,
 } from '../src/do/ProjectMemory';
 import type { ConstellationV2Overview } from '../src/memory/constellation-v2';
+import type { HierarchyGenerationData } from '../src/memory/constellation-hierarchy';
 
 const appEnv = env as unknown as Env;
 const SYSTEM = { kind: 'system', id: null };
@@ -30,23 +31,26 @@ interface MemoryRpc {
 const memory = (pid: string) => appEnv.PROJECT_MEMORY.get(appEnv.PROJECT_MEMORY.idFromName(pid)) as unknown as MemoryRpc;
 
 function generationData(a: string, b: string): ConstellationGenerationData {
-  return {
+  const lens = (name: 'plans' | 'memories', suffix: string): HierarchyGenerationData => ({
+    lens: name,
     nodeStats: [
       { nodeId: a, degree: 1, weightedDegree: 1, rank: 1, boundaryDegree: 1 },
       { nodeId: b, degree: 1, weightedDegree: 1, rank: 0.5, boundaryDegree: 1 },
     ],
     communities: [
-      { id: 'com_a', parentId: null, level: 0, label: 'A', memberCount: 1, childCount: 0, typeCounts: { task: 1 }, internalEdgeCount: 0, internalWeight: 0, normalizedCohesion: 0, boundaryWeight: 1, anchor: [1, 2, 3] },
-      { id: 'com_b', parentId: null, level: 0, label: 'B', memberCount: 1, childCount: 0, typeCounts: { memory: 1 }, internalEdgeCount: 0, internalWeight: 0, normalizedCohesion: 0, boundaryWeight: 1, anchor: [4, 5, 6] },
+      { id: `com_a_${suffix}`, parentId: null, level: 0, label: 'A', coreNodeId: a, memberCount: 1, childCount: 0, typeCounts: { task: 1 }, internalEdgeCount: 0, internalWeight: 0, normalizedCohesion: 0, boundaryWeight: 1, anchor: [1, 2, 3] as [number, number, number] },
+      { id: `com_b_${suffix}`, parentId: null, level: 0, label: 'B', coreNodeId: b, memberCount: 1, childCount: 0, typeCounts: { memory: 1 }, internalEdgeCount: 0, internalWeight: 0, normalizedCohesion: 0, boundaryWeight: 1, anchor: [4, 5, 6] as [number, number, number] },
     ],
     memberships: [
-      { nodeId: a, communityId: 'com_a', level: 0 },
-      { nodeId: b, communityId: 'com_b', level: 0 },
+      { nodeId: a, communityId: `com_a_${suffix}`, level: 0 },
+      { nodeId: b, communityId: `com_b_${suffix}`, level: 0 },
     ],
+    ambientNodeIds: [],
     links: [
-      { level: 0, fromCommunityId: 'com_a', toCommunityId: 'com_b', direction: 'forward', count: 1, weight: 1, byType: { related_to: 1 } },
+      { level: 0, fromCommunityId: `com_a_${suffix}`, toCommunityId: `com_b_${suffix}`, direction: 'forward' as const, count: 1, weight: 1, byType: { related_to: 1 } },
     ],
-  };
+  });
+  return { lenses: [lens('plans', 'plans'), lens('memories', 'memories')] };
 }
 
 describe('Constellation hierarchy generation storage', () => {
@@ -79,7 +83,7 @@ describe('Constellation hierarchy generation storage', () => {
     expect(after.tableCounts.edges).toBe(canonicalBefore.tableCounts.edges);
     expect(after.memoryRevision).toBe(canonicalBefore.memoryRevision);
     expect(after.tableCounts.constellation_generations).toBe(3);
-    expect(after.tableCounts.constellation_memberships).toBe(4);
+    expect(after.tableCounts.constellation_lens_memberships).toBe(8);
   });
 
   it('excludes disposable generations from backup and invalidates them on canonical restore', async () => {
@@ -101,6 +105,7 @@ describe('Constellation hierarchy generation storage', () => {
     expect(health.tableCounts.nodes).toBe(2);
     expect(health.tableCounts.constellation_generations).toBe(0);
     expect(health.tableCounts.constellation_communities).toBe(0);
+    expect(health.tableCounts.constellation_lens_communities).toBe(0);
     expect(await memory(pid).constellationGenerationStatus(pid)).toBeNull();
   });
 
@@ -134,13 +139,13 @@ describe('Constellation hierarchy generation storage', () => {
     expect((await memory(pid).constellationV2Overview(pid)).revision).toMatchObject({
       generationId: active!.id, state: 'building',
     });
-    expect((await memory(pid).health(pid)).tableCounts.constellation_memberships).toBe(4);
+    expect((await memory(pid).health(pid)).tableCounts.constellation_lens_memberships).toBe(5);
 
     const retry = await memory(pid).beginConstellationGeneration(pid, { topologyVersion: 'connectivity-v1', layoutVersion: 'space-v1' });
     expect(await memory(pid).constellationGenerationStatus(pid, interrupted.generationId)).toMatchObject({
       status: 'failed', failureReason: 'superseded by constellation generation retry',
     });
-    expect((await memory(pid).health(pid)).tableCounts.constellation_memberships).toBe(2);
+    expect((await memory(pid).health(pid)).tableCounts.constellation_lens_memberships).toBe(1);
     expect((await memory(pid).constellationV2Overview(pid)).revision).toMatchObject({
       generationId: active!.id, state: 'building',
     });
@@ -161,11 +166,11 @@ describe('Constellation hierarchy generation storage', () => {
     expect(rebuilt).toMatchObject({ ok: true, nodes: 2, edges: 1 });
     expect((await memory(pid).constellationGenerationStatus(pid))?.status).toBe('active');
     const health = await memory(pid).health(pid);
-    expect(health.tableCounts.constellation_node_stats).toBe(2);
-    expect(health.tableCounts.constellation_memberships).toBe(2);
+    expect(health.tableCounts.constellation_lens_node_stats).toBe(4);
+    expect(health.tableCounts.constellation_lens_memberships).toBe(0);
     expect(await memory(pid).constellationHierarchyDrift(pid)).toMatchObject({ converged: true, stale: false, missingNodeStats: 0, unexpectedAggregatedEdges: 0 });
 
     await memory(pid).writeNode(pid, { type: 'task', uri: 'noriq://task/rebuild-newer', label: 'newer', actor: SYSTEM });
-    expect(await memory(pid).constellationHierarchyDrift(pid)).toMatchObject({ converged: false, stale: true, missingNodeStats: 1 });
+    expect(await memory(pid).constellationHierarchyDrift(pid)).toMatchObject({ converged: false, stale: true, missingNodeStats: 2 });
   });
 });

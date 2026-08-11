@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { sha256Hex } from '../src/lib/util';
 import {
-  constellationEtagInput, CONSTELLATION_READ_VERSION, type ConstellationV2Revision,
+  constellationAmbientPosition, constellationEtagInput, CONSTELLATION_READ_VERSION, type ConstellationV2Revision,
 } from '../src/memory/constellation-v2';
 
 const revision: ConstellationV2Revision = {
@@ -12,6 +12,7 @@ const revision: ConstellationV2Revision = {
 
 describe('Constellation v2 ETag identity (PLNR-466)', () => {
   it('is stable and includes the declared read-time serialization version', async () => {
+    expect(CONSTELLATION_READ_VERSION).toBe('read-v3');
     const identity = '/api/projects/p1/memory/constellation/v2/overview';
     const current = constellationEtagInput(revision, identity, 'verbose-v1');
     const repeated = constellationEtagInput(revision, identity, 'verbose-v1');
@@ -23,5 +24,16 @@ describe('Constellation v2 ETag identity (PLNR-466)', () => {
     expect(repeated).toBe(current);
     expect(current.split('\n')).toContain(CONSTELLATION_READ_VERSION);
     expect(await sha256Hex(current)).not.toBe(await sha256Hex(old));
+  });
+});
+
+describe('constellation ambient positions', () => {
+  it('deterministically spreads unanchored entities across a wide bounded field', () => {
+    const first = constellationAmbientPosition('noriq://task/ambient-a', 245);
+    expect(constellationAmbientPosition('noriq://task/ambient-a', 245)).toEqual(first);
+    expect(constellationAmbientPosition('noriq://task/ambient-b', 245)).not.toEqual(first);
+    const radius = Math.hypot(...first);
+    expect(radius).toBeGreaterThan(100);
+    expect(radius).toBeLessThanOrEqual(850);
   });
 });

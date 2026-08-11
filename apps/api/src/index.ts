@@ -90,7 +90,7 @@ import { evaluateMemoryAcceptance } from './memory/acceptance';
 import {
   compactConstellationCommunityPage, compactConstellationIncidentPage, constellationEtagInput,
   CONSTELLATION_V2_COMPACT_MEDIA_TYPE,
-  type ConstellationV2Revision, type ConstellationV2Unavailable,
+  type ConstellationV2Lens, type ConstellationV2Revision, type ConstellationV2Unavailable,
 } from './memory/constellation-v2';
 import {
   declareRunnerExecution, ensureRunExecution, getOrchestrationTree, listOrchestrations, reconcileRunnerExecution,
@@ -2053,6 +2053,11 @@ const constellationUnavailableResponse = (c: Context<AppContext>, result: Conste
   return c.json({ ...result, error: `constellation_${result.error.replaceAll('-', '_')}` }, status);
 };
 
+// Phase 1 defaults the wire API to plans so projects without memory anchors retain a useful
+// constellation until Phase 2's selector explicitly sends its memories-default product choice.
+const constellationLens = (raw: string | undefined): ConstellationV2Lens | null =>
+  raw === undefined ? 'plans' : raw === 'plans' || raw === 'memories' ? raw : null;
+
 const constellationEtag = async (revision: ConstellationV2Revision, identity: string, representation: string) =>
   `"${(await sha256Hex(constellationEtagInput(revision, identity, representation))).slice(0, 32)}"`;
 
@@ -2068,12 +2073,13 @@ async function constellationCachedRead<T extends ConstellationReadResult>(
   pid: string,
   read: () => Promise<T>,
   options: {
+    lens: ConstellationV2Lens;
     compact?: (value: Exclude<T, ConstellationV2Unavailable>) => unknown;
     rows: (value: Exclude<T, ConstellationV2Unavailable>) => number;
   },
 ) {
   const stub = memoryStub(c.env, pid);
-  const head = await stub.constellationV2Head(pid);
+  const head = await stub.constellationV2Head(pid, options.lens);
   if (constellationIsUnavailable(head)) return constellationUnavailableResponse(c, head);
   const compact = Boolean(options.compact && c.req.header('Accept')?.includes(CONSTELLATION_V2_COMPACT_MEDIA_TYPE));
   const representation = compact ? 'compact-v1' : 'verbose-v1';
@@ -2108,16 +2114,22 @@ async function constellationCachedRead<T extends ConstellationReadResult>(
 
 app.get('/api/projects/:pid/memory/constellation/v2/overview', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
-  return constellationCachedRead(c, pid, () => memoryStub(c.env, pid).constellationV2Overview(pid), {
-    rows: (result) => result.communities.length + result.routes.length,
+  const lens = constellationLens(c.req.query('lens'));
+  if (!lens) return c.json({ error: 'lens must be plans or memories' }, 400);
+  return constellationCachedRead(c, pid, () => memoryStub(c.env, pid).constellationV2Overview(pid, lens), {
+    lens,
+    rows: (result) => result.communities.length + result.routes.length + result.ambient.entities.length,
   });
 });
 
 app.get('/api/projects/:pid/memory/constellation/v2/communities/:communityId', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
+  const lens = constellationLens(c.req.query('lens'));
+  if (!lens) return c.json({ error: 'lens must be plans or memories' }, 400);
   return constellationCachedRead(c, pid, () => memoryStub(c.env, pid).constellationV2Community(pid, c.req.param('communityId')!, {
-    cursor: c.req.query('cursor'), limit: c.req.query('limit') ? Number(c.req.query('limit')) : undefined,
+    cursor: c.req.query('cursor'), limit: c.req.query('limit') ? Number(c.req.query('limit')) : undefined, lens,
   }), {
+    lens,
     compact: compactConstellationCommunityPage,
     rows: (result) => 1 + result.communities.length + result.entities.length + result.backboneEdges.length + result.routes.length + result.externalCommunities.length,
   });
@@ -2127,16 +2139,22 @@ app.get('/api/projects/:pid/memory/constellation/v2/route', userAuth, async (c) 
   const pid = c.req.param('pid')!;
   const uri = c.req.query('uri');
   if (!uri) return c.json({ error: 'uri is required' }, 400);
-  return constellationCachedRead(c, pid, () => memoryStub(c.env, pid).constellationV2Route(pid, uri), {
+  const lens = constellationLens(c.req.query('lens'));
+  if (!lens) return c.json({ error: 'lens must be plans or memories' }, 400);
+  return constellationCachedRead(c, pid, () => memoryStub(c.env, pid).constellationV2Route(pid, uri, lens), {
+    lens,
     rows: (result) => result.communityPath.length + 1,
   });
 });
 
 app.get('/api/projects/:pid/memory/constellation/v2/entities/:nodeId/incidents', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
+  const lens = constellationLens(c.req.query('lens'));
+  if (!lens) return c.json({ error: 'lens must be plans or memories' }, 400);
   return constellationCachedRead(c, pid, () => memoryStub(c.env, pid).constellationV2Incidents(pid, c.req.param('nodeId')!, {
-    cursor: c.req.query('cursor'), limit: c.req.query('limit') ? Number(c.req.query('limit')) : undefined,
+    cursor: c.req.query('cursor'), limit: c.req.query('limit') ? Number(c.req.query('limit')) : undefined, lens,
   }), {
+    lens,
     compact: compactConstellationIncidentPage,
     rows: (result) => 1 + result.node.communityPath.length + result.edges.length
       + result.edges.reduce((count, edge) => count + edge.endpoint.communityPath.length, 0),
