@@ -1872,14 +1872,15 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'release_task',
-    'Release your claim when done or handing off. toStatus: "review" (default for finished work needing eyes), "done", "todo" (give it back), or "blocked". Optional comment: your closing thoughts / handoff notes, recorded on the task in one call (no separate post_comment needed).',
+    'Release your claim when done or handing off. toStatus: "review" (default for finished work needing eyes), "done", "todo" (give it back), or "blocked". Optional comment records closing thoughts in the same call. Optional commitId attaches the exact opaque VCS revision this release produced, so later review, intelligence, and memory can trace the work without a separate attach_ref call.',
     {
       projectId: z.string(),
       taskId: z.string(),
       toStatus: z.enum(['todo', 'review', 'done', 'blocked']).optional(),
       comment: z.string().optional().describe('Closing thoughts / handoff notes to record on the task'),
+      commitId: z.string().min(1).optional().describe('Exact opaque VCS commit/base identifier produced by this work; stored as the task commit ref without parsing or normalization'),
     },
-    tool(async ({ projectId, taskId, toStatus, comment }) => {
+    tool(async ({ projectId, taskId, toStatus, comment, commitId }) => {
       refuseLifecycleCall('release_task');
       const id = await resolveTaskId(env, projectId, taskId);
       if (toStatus === 'done') {
@@ -1896,7 +1897,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           throw new Error(`task has ${gate.n} open input request(s) awaiting a human decision — can't finish until they're answered`);
         }
       }
-      return room(env, projectId).releaseTask(projectId, actor, id, { toStatus, comment });
+      return room(env, projectId).releaseTask(projectId, actor, id, { toStatus, comment, commitId });
     }),
   );
 

@@ -167,6 +167,21 @@ describe('coordination core', () => {
     expect(note.status).toBe('addressed');
   });
 
+  it('release_task can attach the exact opaque commit produced by copilot work', async () => {
+    const t = (await mcpCall(orch.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'release at an exact revision' })).body;
+    await mcpCall(nova.apiKey, 'claim_task', { projectId, taskId: t.id });
+    const rel = await mcpCall(nova.apiKey, 'release_task', {
+      projectId, taskId: t.id, toStatus: 'review', commitId: 'p4-change-0192',
+    });
+    expect(rel.isError).toBe(false);
+    expect(rel.body).toMatchObject({ status: 'review', commitId: 'p4-change-0192' });
+
+    const detail = await mcpCall(orch.apiKey, 'get_task', { taskId: t.id });
+    expect(detail.body.refs).toContainEqual(expect.objectContaining({
+      kind: 'commit', ref: 'p4-change-0192',
+    }));
+  });
+
   it('decompose_task builds an ordered subtree', async () => {
     const parent = (await mcpCall(orch.apiKey, 'create_task', { tags: ['test-fixture'], projectId, title: 'Epic' })).body;
     const dec = await mcpCall(orch.apiKey, 'decompose_task', {

@@ -1578,7 +1578,7 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
-  async releaseTask(projectId: string, actor: Actor, taskId: string, opts: { toStatus?: string; comment?: string } = {})  {
+  async releaseTask(projectId: string, actor: Actor, taskId: string, opts: { toStatus?: string; comment?: string; commitId?: string } = {})  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const task = await this.getTask(taskId);
@@ -1591,16 +1591,34 @@ export class ProjectRoom extends DurableObject<Env> {
       }
       const toStatus = opts.toStatus ?? 'todo';
       if (!['todo', 'review', 'done', 'blocked'].includes(toStatus)) throw new Error(`invalid release status: ${toStatus}`);
-      await this.env.DB.batch([
+      // A copilot release can identify the exact revision it produced (PLNR-427), matching the
+      // commit ref Runner-backed work already exposes to episodes and Project Intelligence. Keep
+      // it opaque and commit it atomically with the release: a task must never say "released"
+      // while silently losing the revision the caller supplied with that same operation.
+      const commitId = opts.commitId?.trim() || null;
+      const releaseStatements = [
         this.env.DB.prepare('UPDATE claims SET released_at = ? WHERE task_id = ? AND released_at IS NULL').bind(nowIso(), taskId),
         this.env.DB.prepare('UPDATE tasks SET status = ?, claimed_by = NULL, claim_expires_at = NULL, updated_at = ? WHERE id = ?')
           .bind(toStatus, nowIso(), taskId),
-      ]);
+      ];
+      if (commitId) {
+        releaseStatements.push(this.env.DB.prepare(
+          `INSERT INTO task_refs (id, task_id, kind, ref, url, state, created_at)
+           VALUES (?, ?, 'commit', ?, NULL, NULL, ?)
+           ON CONFLICT (task_id, kind, ref) DO NOTHING`,
+        ).bind(newId('ref'), taskId, commitId, nowIso()));
+      }
+      await this.env.DB.batch(releaseStatements);
       // Releasing the task hands its file locks back too (§5 auto-release).
       await this.releaseLocksForTask(taskId, actor, `task released to ${toStatus}`);
       await this.emit(actor, 'task.released', 'task', taskId, {
-        key: task.key, title: task.title, by: actor.id, previousHolder: task.claimed_by, toStatus,
+        key: task.key, title: task.title, by: actor.id, previousHolder: task.claimed_by, toStatus, commitId,
       });
+      if (commitId) {
+        await this.emit(actor, 'ref.attached', 'task', taskId, {
+          key: task.key, kind: 'commit', ref: commitId, url: null, state: null,
+        });
+      }
       // Optional closing note from the agent. Recorded as already-resolved so it reads as
       // a handoff remark, not an unresolved question (and never blocks a later `done`).
       let commentId: string | null = null;
@@ -1625,7 +1643,7 @@ export class ProjectRoom extends DurableObject<Env> {
         // …and any dependents in OTHER projects (PLNR-241).
         this.notifyExternalDependents(await this.externalDependentsOf(taskId), { id: taskId, key: task.key });
       }
-      return { ok: true, key: task.key, status: toStatus, commentId };
+      return { ok: true, key: task.key, status: toStatus, commentId, commitId };
 
     });
   }
