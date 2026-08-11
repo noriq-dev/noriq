@@ -35,6 +35,7 @@
   --w-09: rgba(255,255,255,.09); --w-1: rgba(255,255,255,.1); --w-12: rgba(255,255,255,.12);
   --w-14: rgba(255,255,255,.14); --w-15: rgba(255,255,255,.15); --w-16: rgba(255,255,255,.16);
   --w-18: rgba(255,255,255,.18); --w-25: rgba(255,255,255,.25);
+  --panel: rgba(12,13,16,.88);
 }
 
 * { box-sizing: border-box; }
@@ -64,6 +65,7 @@
   --w-09: rgba(0,0,0,.12); --w-1: rgba(0,0,0,.14); --w-12: rgba(0,0,0,.16);
   --w-14: rgba(0,0,0,.18); --w-15: rgba(0,0,0,.2); --w-16: rgba(0,0,0,.22);
   --w-18: rgba(0,0,0,.24); --w-25: rgba(0,0,0,.3);
+  --panel: rgba(0,0,0,.08);
 }
 :root[data-theme='light'] body { background: var(--bg); color: var(--text); }
 :root[data-theme='light'] ::-webkit-scrollbar-thumb { background: rgba(0,0,0,.18); background-clip: content-box; }
