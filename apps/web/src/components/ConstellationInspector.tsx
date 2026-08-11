@@ -9,7 +9,7 @@
 import { useEffect, useState } from 'react';
 import { parseEntityUri } from '@noriq-dev/shared';
 import { api, type ApiConstellationV2IncidentPage } from '../api';
-import { type Constellation3DNode, communityTooltipContent } from './constellation-3d-buffers';
+import { type Constellation3DNode, communityTooltipContent, decodeConstellationLabel } from './constellation-3d-buffers';
 import { CONSTELLATION_SHAPE_GLYPH, encodingForType } from './constellation-encoding';
 import { isHistoricalIncidentEdgeType } from './constellation-v2-scene';
 import { Button } from './ui';
@@ -195,7 +195,7 @@ export function ConstellationInspector({
           ✕
         </button>
       </div>
-      <div style={{ fontSize: 13.5, fontWeight: 600, color: INSPECTOR_TEXT, marginBottom: 4, wordBreak: 'break-word' }}>{selected.label}</div>
+      <div style={{ fontSize: 13.5, fontWeight: 600, color: INSPECTOR_TEXT, marginBottom: 4, wordBreak: 'break-word' }}>{decodeConstellationLabel(selected.label)}</div>
       {selected.uri && (
         <div
           title={selected.uri}

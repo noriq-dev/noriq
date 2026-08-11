@@ -100,10 +100,17 @@ export interface Constellation3DLabelCandidate {
   memberCount?: number;
 }
 
-/** Presentation-only shortening for the DOM labels; callers retain the original graph label. */
+/** Decode the five entities admitted by the projection boundary. Ampersand stays last so a
+ * double-escaped value is decoded exactly once rather than silently changing its meaning. */
+export function decodeConstellationLabel(label: string): string {
+  return label.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+}
+
+/** Presentation-only decoding/shortening for DOM labels; callers retain the original graph label. */
 export function truncateConstellationLabel(label: string, maxCharacters: number): string {
-  const characters = Array.from(label);
-  if (characters.length <= maxCharacters) return label;
+  const decoded = decodeConstellationLabel(label);
+  const characters = Array.from(decoded);
+  if (characters.length <= maxCharacters) return decoded;
   if (maxCharacters <= 0) return '';
   if (maxCharacters === 1) return '…';
   return `${characters.slice(0, maxCharacters - 1).join('').trimEnd()}…`;
@@ -187,7 +194,7 @@ export interface ConstellationCommunityTooltip {
 export function communityTooltipContent(node: Constellation3DNode, maxTypeRows = 3): ConstellationCommunityTooltip | null {
   if (!node.community) return null;
   return {
-    name: node.label,
+    name: decodeConstellationLabel(node.label),
     entityCount: node.memberCount ?? 0,
     boundaryRouteCount: node.boundaryRouteCount ?? 0,
     topTypeCounts: sortedTypeCounts(node.typeCounts).slice(0, maxTypeRows).map(([type, count]) => ({ type, count })),

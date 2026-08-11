@@ -76,6 +76,13 @@ describe('ConstellationCatalogue rows (PLNR-442)', () => {
     expect(communityButton.textContent).not.toContain('degree');
   });
 
+  it('decodes projected entity labels in visible text and accessible names', () => {
+    render({ nodes: [{ ...community, label: 'Security &amp; correctness' }] });
+    expect(host.textContent).toContain('Security & correctness');
+    expect(host.textContent).not.toContain('&amp;');
+    expect(host.querySelector('[aria-label="Expand Security & correctness preview"]')).not.toBeNull();
+  });
+
   it('every interactive control is a real <button> (keyboard reachability falls out of ordinary DOM structure)', () => {
     render();
     const interactiveLikelyElements = [...host.querySelectorAll('[onclick], [role="button"]')];

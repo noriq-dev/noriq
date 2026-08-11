@@ -19,7 +19,7 @@
 // matching rows with the same amber/accent ignite treatment the search-results panel and the 3D
 // scene already use, plus a per-community match count mirroring the overview's "+N matches" flare.
 import { useState } from 'react';
-import { type Constellation3DNode, communityTooltipContent } from './constellation-3d-buffers';
+import { type Constellation3DNode, communityTooltipContent, decodeConstellationLabel } from './constellation-3d-buffers';
 import { authorityTone, TypeChip, validityTone } from './ConstellationInspector';
 import { Button } from './ui';
 import { MonoTag } from './bits';
@@ -95,6 +95,7 @@ export function ConstellationCatalogue({
           const previewed = previewedIds.has(node.id);
           const tooltip = isSystem && !offPage ? communityTooltipContent(node) : null;
           const matchCount = isSystem ? matchCounts.get(node.systemId ?? node.id) : undefined;
+          const displayLabel = decodeConstellationLabel(node.label);
           return (
             <div key={node.id}>
               <div
@@ -108,7 +109,7 @@ export function ConstellationCatalogue({
                 {isSystem && !offPage ? (
                   <button
                     type="button" aria-expanded={previewed}
-                    aria-label={`${previewed ? 'Collapse' : 'Expand'} ${node.label} preview`}
+                    aria-label={`${previewed ? 'Collapse' : 'Expand'} ${displayLabel} preview`}
                     onClick={() => togglePreview(node.id)}
                     style={{ flex: 'none', width: 16, background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--text-faint)', fontSize: 10, padding: 0 }}
                   >
@@ -125,7 +126,7 @@ export function ConstellationCatalogue({
                     cursor: 'pointer', padding: 0, color: 'var(--text)', font: 'inherit',
                   }}
                 >
-                  <span style={{ fontSize: 12.5, fontWeight: 500 }}>{node.label}</span>
+                  <span style={{ fontSize: 12.5, fontWeight: 500 }}>{displayLabel}</span>
                   {!isCommunity && node.uri && (
                     <span
                       title={node.uri}

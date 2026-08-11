@@ -6,7 +6,7 @@ import {
   constellation3DNodeLightnessVariance, constellation3DStarPositions,
   CONSTELLATION_COMMUNITY_WELL_SCALE_CAP, CONSTELLATION_COMMUNITY_WELL_SCALE_FLOOR,
   CONSTELLATION_IGNITE_DIM_OPACITY, CONSTELLATION_NODE_LIGHTNESS_VARIANCE,
-  dominantCommunityType, isOffPageIncidentEdge, placeConstellation3DLabels, promotedEdgeLabelText, truncateConstellationLabel,
+  decodeConstellationLabel, dominantCommunityType, isOffPageIncidentEdge, placeConstellation3DLabels, promotedEdgeLabelText, truncateConstellationLabel,
   type Constellation3DEdge, type Constellation3DLabelCandidate, type Constellation3DNode,
 } from './constellation-3d-buffers';
 
@@ -208,6 +208,14 @@ describe('constellation 3D DOM label placement (PLNR-454)', () => {
     expect(truncateConstellationLabel(full, 24)).toBe('This raw memory stateme…');
     expect(full).toBe('This raw memory statement is intentionally sentence-length');
     expect(truncateConstellationLabel('Coordination core', 24)).toBe('Coordination core');
+  });
+
+  it('decodes projected HTML entities before applying the character budget', () => {
+    const rendered = truncateConstellationLabel('Security &amp; correctness remediation', 24);
+    expect(rendered).toBe('Security & correctness…');
+    expect(Array.from(rendered)).toHaveLength(23);
+    expect(decodeConstellationLabel('Security & correctness')).toBe('Security & correctness');
+    expect(decodeConstellationLabel('&lt;task&gt; &quot;safe&quot; &#39;now&#39; &amp;amp;')).toBe('<task> "safe" \'now\' &amp;');
   });
 
   it('pluralizes the community entity count', () => {

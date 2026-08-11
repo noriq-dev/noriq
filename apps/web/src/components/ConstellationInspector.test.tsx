@@ -78,6 +78,15 @@ describe('ConstellationInspector identity and metrics', () => {
     expect(host.textContent).toContain('memory');
   });
 
+  it('decodes a projected entity label without altering its entity behavior', async () => {
+    vi.spyOn(api, 'memorySearch').mockResolvedValue({ mode: 'keyword', results: [], evidenceFrame: { text: '', itemsIncluded: 0, itemsOmitted: 0, truncated: false, charsUsed: 0, suspiciousCount: 0 } });
+    render({ selected: { ...memoryEntity, label: 'Security &amp; correctness' } });
+    await tick();
+    expect(host.textContent).toContain('Security & correctness');
+    expect(host.textContent).not.toContain('&amp;');
+    expect(host.textContent).toContain('noriq://memory/a');
+  });
+
   it('closes on both the header × and the footer "clear" text action', async () => {
     vi.spyOn(api, 'memorySearch').mockResolvedValue({ mode: 'keyword', results: [], evidenceFrame: { text: '', itemsIncluded: 0, itemsOmitted: 0, truncated: false, charsUsed: 0, suspiciousCount: 0 } });
     const onClear = vi.fn();

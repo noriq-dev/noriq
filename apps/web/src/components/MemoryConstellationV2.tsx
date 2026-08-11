@@ -12,6 +12,7 @@ import { ConstellationInspector } from './ConstellationInspector';
 import {
   assembleConstellationV2Scene, CONSTELLATION_V2_RESIDENT_NODE_BUDGET, evictConstellationPages, type ResidentConstellationPage,
 } from './constellation-v2-scene';
+import { decodeConstellationLabel } from './constellation-3d-buffers';
 
 const LazyConstellation3D = lazy(() => import('./MemoryConstellation3D'));
 
@@ -738,11 +739,11 @@ export function MemoryConstellationV2({
                     background: top ? 'rgba(198,242,78,.05)' : 'transparent',
                   }}
                 >
-                  <span style={{ fontSize: 12, fontWeight: top ? 600 : 400, color: top ? MATCHES_TEXT : MATCHES_TEXT_SOFT }}>{hit.title}</span>
+                  <span style={{ fontSize: 12, fontWeight: top ? 600 : 400, color: top ? MATCHES_TEXT : MATCHES_TEXT_SOFT }}>{decodeConstellationLabel(hit.title)}</span>
                   <small style={{ display: 'block', fontFamily: 'var(--mono)', fontSize: 9, color: MATCHES_TEXT_DIM, marginTop: 2 }}>{hit.entityType} · {hit.uri}</small>
                   {!resident && routeCommunity && (
                     <small style={{ display: 'block', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--amber)', marginTop: 2 }}>
-                      not resident · picking loads {routeCommunity.label}
+                      not resident · picking loads {decodeConstellationLabel(routeCommunity.label)}
                     </small>
                   )}
                 </button>
