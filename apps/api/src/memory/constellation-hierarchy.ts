@@ -1,10 +1,13 @@
 import type { ConstellationRawEdge, ConstellationRawNode } from './graph-queries';
 
-export const CONSTELLATION_TOPOLOGY_VERSION = 'semantic-roots-v3';
+export const CONSTELLATION_TOPOLOGY_VERSION = 'semantic-roots-v4';
 export const CONSTELLATION_LAYOUT_VERSION = 'space-v1';
 export const CONSTELLATION_MAX_CHILDREN = 128;
 export const CONSTELLATION_LEAF_SIZE = 500;
 export const CONSTELLATION_COMMUNITY_LABEL_MAX_LENGTH = 40;
+
+const CONSTELLATION_ROOT_COMMUNITY_MIN_SIZE = 8;
+const COMMUNITY_SCORE_EPSILON = 1e-12;
 
 const EDGE_WEIGHTS: Readonly<Record<string, number>> = {
   calls: 4, imports: 4, depends_on: 4, tests: 4, validated_by: 4, implements: 4,
@@ -119,6 +122,99 @@ function buildCommunity(members: string[], adjacency: ReadonlyMap<string, Map<st
   return { members, children: groups.map((group) => buildCommunity(group, adjacency, rank, byId)) };
 }
 
+function mergeDetectedCommunities(
+  detected: string[][],
+  adjacency: ReadonlyMap<string, Map<string, number>>,
+  byId: ReadonlyMap<string, ConstellationRawNode>,
+): string[][] {
+  const groups = detected.map((members) => [...members].sort((a, b) => compareNodeIds(a, b, byId)));
+  const compareGroups = (a: string[], b: string[]) => a.length - b.length || compareNodeIds(a[0]!, b[0]!, byId);
+  const mergeSmallest = (onlyBelowFloor: boolean) => {
+    const source = groups
+      .map((members, index) => ({ members, index }))
+      .filter(({ members }) => !onlyBelowFloor || members.length < CONSTELLATION_ROOT_COMMUNITY_MIN_SIZE)
+      .sort((a, b) => compareGroups(a.members, b.members))[0];
+    if (!source || groups.length <= 1) return false;
+    const groupByNode = new Map(groups.flatMap((members, index) => members.map((id) => [id, index] as const)));
+    const weights = new Map<number, number>();
+    for (const id of source.members) {
+      const neighbors = [...(adjacency.get(id) ?? [])].sort((a, b) => compareNodeIds(a[0], b[0], byId));
+      for (const [neighbor, weight] of neighbors) {
+        const target = groupByNode.get(neighbor)!;
+        if (target !== source.index) weights.set(target, (weights.get(target) ?? 0) + weight);
+      }
+    }
+    const target = [...weights]
+      .sort((a, b) => b[1] - a[1] || compareNodeIds(groups[a[0]]![0]!, groups[b[0]]![0]!, byId))[0]?.[0];
+    if (target === undefined) throw new Error('connected constellation community has no merge neighbor');
+    const merged = [...source.members, ...groups[target]!].sort((a, b) => compareNodeIds(a, b, byId));
+    for (const index of [source.index, target].sort((a, b) => b - a)) groups.splice(index, 1);
+    groups.push(merged);
+    return true;
+  };
+  while (groups.length > 1 && groups.some((members) => members.length < CONSTELLATION_ROOT_COMMUNITY_MIN_SIZE)) mergeSmallest(true);
+  while (groups.length > CONSTELLATION_MAX_CHILDREN) mergeSmallest(false);
+  return groups.sort((a, b) => compareNodeIds(a[0]!, b[0]!, byId));
+}
+
+/** Deterministic weighted Louvain local moving for promoted connected components. Each move
+ * strictly improves modularity (with canonical-label ties), while sorted nodes, neighbors, and
+ * candidates make the result byte-stable; tiny/capped communities merge across their strongest
+ * shared boundary so structural promotion cannot recreate the old singleton soup. */
+function detectConnectivityCommunities(
+  members: string[],
+  adjacency: ReadonlyMap<string, Map<string, number>>,
+  byId: ReadonlyMap<string, ConstellationRawNode>,
+): string[][] {
+  const ordered = [...members].sort((a, b) => compareNodeIds(a, b, byId));
+  const degree = new Map(ordered.map((id) => [id, [...(adjacency.get(id)?.values() ?? [])].reduce((sum, weight) => sum + weight, 0)]));
+  const totalDegree = [...degree.values()].reduce((sum, value) => sum + value, 0);
+  const communityByNode = new Map(ordered.map((id) => [id, id]));
+  const communityDegree = new Map(degree);
+  for (let iteration = 0; iteration < Math.min(100, ordered.length); iteration++) {
+    let changed = false;
+    for (const id of ordered) {
+      const current = communityByNode.get(id)!;
+      const nodeDegree = degree.get(id)!;
+      const weightsByCommunity = new Map<string, number>();
+      const neighbors = [...(adjacency.get(id) ?? [])].sort((a, b) => compareNodeIds(a[0], b[0], byId));
+      for (const [neighbor, weight] of neighbors) {
+        const community = communityByNode.get(neighbor)!;
+        weightsByCommunity.set(community, (weightsByCommunity.get(community) ?? 0) + weight);
+      }
+      communityDegree.set(current, communityDegree.get(current)! - nodeDegree);
+      const score = (community: string) => (weightsByCommunity.get(community) ?? 0)
+        - (nodeDegree * (communityDegree.get(community) ?? 0)) / totalDegree;
+      let best = current;
+      const currentScore = score(current);
+      let bestScore = currentScore;
+      const candidates = [...weightsByCommunity.keys()].sort((a, b) => compareNodeIds(a, b, byId));
+      for (const candidate of candidates) {
+        const candidateScore = score(candidate);
+        if (candidateScore > bestScore + COMMUNITY_SCORE_EPSILON
+          || (candidateScore > currentScore + COMMUNITY_SCORE_EPSILON
+            && Math.abs(candidateScore - bestScore) <= COMMUNITY_SCORE_EPSILON
+            && compareNodeIds(candidate, best, byId) < 0)) {
+          best = candidate;
+          bestScore = candidateScore;
+        }
+      }
+      communityByNode.set(id, best);
+      communityDegree.set(best, (communityDegree.get(best) ?? 0) + nodeDegree);
+      changed ||= best !== current;
+    }
+    if (!changed) break;
+  }
+  const detected = new Map<string, string[]>();
+  for (const id of ordered) {
+    const community = communityByNode.get(id)!;
+    const group = detected.get(community) ?? [];
+    group.push(id);
+    detected.set(community, group);
+  }
+  return mergeDetectedCommunities([...detected.values()], adjacency, byId);
+}
+
 function dominantType(members: readonly string[], byId: ReadonlyMap<string, ConstellationRawNode>): string {
   const counts = new Map<string, number>();
   for (const id of members) counts.set(byId.get(id)!.type, (counts.get(byId.get(id)!.type) ?? 0) + 1);
@@ -126,7 +222,9 @@ function dominantType(members: readonly string[], byId: ReadonlyMap<string, Cons
 }
 
 function boundedLabel(value: string): string {
-  const normalized = value.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+  // Decode ampersands last so an upstream double-escape stays single-escaped, not over-decoded.
+  const decoded = value.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+  const normalized = decoded.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
   if (normalized.length <= CONSTELLATION_COMMUNITY_LABEL_MAX_LENGTH) return normalized || 'Community';
   return `${normalized.slice(0, CONSTELLATION_COMMUNITY_LABEL_MAX_LENGTH - 1).trimEnd()}…`;
 }
@@ -146,24 +244,42 @@ function structuralLabel(community: DraftCommunity, byId: ReadonlyMap<string, Co
   return boundedLabel(`${visible}${types.length > 2 ? ` +${types.length - 2}` : ''}`);
 }
 
+function promotedPlanLabel(
+  members: readonly string[],
+  degree: ReadonlyMap<string, number>,
+  byId: ReadonlyMap<string, ConstellationRawNode>,
+): string | undefined {
+  const plan = members
+    .filter((id) => byId.get(id)!.type === 'plan')
+    .sort((a, b) => degree.get(b)! - degree.get(a)! || compareNodeIds(a, b, byId))[0];
+  return plan ? boundedLabel(byId.get(plan)!.label) : undefined;
+}
+
 function consolidateComponents(
   components: readonly string[][],
   adjacency: ReadonlyMap<string, Map<string, number>>,
   rank: ReadonlyMap<string, number>,
+  degree: ReadonlyMap<string, number>,
   byId: ReadonlyMap<string, ConstellationRawNode>,
 ): DraftCommunity[] {
   const roots: DraftCommunity[] = [];
   const smallByType = new Map<string, string[][]>();
   for (const members of components) {
-    if (members.length > CONSTELLATION_LEAF_SIZE) { roots.push(buildCommunity(members, adjacency, rank, byId)); continue; }
+    if (members.length >= CONSTELLATION_ROOT_COMMUNITY_MIN_SIZE) {
+      for (const detected of detectConnectivityCommunities(members, adjacency, byId)) {
+        const community = buildCommunity(detected, adjacency, rank, byId);
+        roots.push({ ...community, labelHint: promotedPlanLabel(detected, degree, byId) });
+      }
+      continue;
+    }
     const type = dominantType(members, byId);
     const grouped = smallByType.get(type) ?? [];
     grouped.push(members);
     smallByType.set(type, grouped);
   }
-  // Type is universal, stable, and already drives constellation tinting. Assigning each whole
-  // component by its dominant type consolidates isolates without severing real edges; grouping by
-  // URI namespace instead would often turn per-entity IDs and file paths into singleton buckets.
+  // Type is universal, stable, and already drives constellation tinting. Assigning each small
+  // whole component by its dominant type consolidates isolates without severing real edges;
+  // grouping by URI namespace would turn per-entity IDs and file paths into singleton buckets.
   for (const [type, grouped] of [...smallByType].sort((a, b) => a[0].localeCompare(b[0]))) {
     const members = grouped.flat().sort((a, b) => compareNodeIds(a, b, byId));
     roots.push({ ...buildCommunity(members, adjacency, rank, byId), labelHint: typeLabel(type) });
@@ -263,7 +379,7 @@ export function buildConstellationHierarchy(
   }
   const rank = new Map(nodes.map((n) => [n.nodeId, Math.log2(rawDegree.get(n.nodeId)! + 1) + weightedDegree.get(n.nodeId)!]));
   const components = connectedComponents(nodes.map((n) => n.nodeId), adjacency, byId);
-  const forest = wrapForest(consolidateComponents(components, adjacency, rank, byId), byId);
+  const forest = wrapForest(consolidateComponents(components, adjacency, rank, rawDegree, byId), byId);
   const communities = assignCommunityIds(forest, byId, previous);
 
   const pathByNode = new Map<string, DraftCommunity[]>();
