@@ -63,3 +63,73 @@ describe('MemoryConstellationV2 graceful textual parity', () => {
     expect(openInspector).toHaveBeenCalledWith('noriq://memory/b');
   });
 });
+
+describe('MemoryConstellationV2 header band, breadcrumb row, and resident meter (PLNR-435)', () => {
+  it('shows generation/counts chrome, keeps every breadcrumb crumb a real focusable button with the trailing one current, and tracks the resident meter through expand and collapse', async () => {
+    vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision, communities: [rootCommunity], routes: [], coverage: { complete: true, reasons: [] } });
+    vi.spyOn(api, 'memoryConstellationV2Community').mockResolvedValue(page('a', null));
+    host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
+    act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
+    await tick(); await tick();
+
+    // Header band: eyebrow, title, v2 chip, generation chip (id · state), root-level counts chip.
+    expect(host.textContent).toContain('MEMORY');
+    expect(host.textContent).toContain('Constellation');
+    expect(host.textContent).toContain('v2');
+    expect(host.textContent).toContain('g1 · current');
+    expect(host.textContent).toContain('1 community · 2 entities');
+
+    // Renderer failure (forced by the MemoryConstellation3D mock above) puts the view toggle into
+    // Catalogue and disables the now-meaningless Space segment — it stays visible, not hidden.
+    const spaceToggle = [...host.querySelectorAll('button')].find((button) => button.textContent === 'Space')!;
+    const catalogueToggle = [...host.querySelectorAll('button')].find((button) => button.textContent === 'Catalogue')!;
+    expect(spaceToggle.disabled).toBe(true);
+    expect(catalogueToggle.getAttribute('aria-pressed')).toBe('true');
+    // Styled, not bare native buttons.
+    expect(spaceToggle.style.padding).not.toBe('');
+    expect(catalogueToggle.style.background).not.toBe('');
+
+    // Breadcrumb row: a single "Project" crumb at root, styled as the current (trailing) crumb.
+    const crumbs = () => [...host.querySelectorAll('button')].filter((button) => button.textContent === 'Project' || button.textContent === 'Root community');
+    expect(crumbs()).toHaveLength(1);
+    const rootCrumb = crumbs()[0]!;
+    expect(rootCrumb.tagName).toBe('BUTTON');
+    expect(rootCrumb.getAttribute('aria-current')).toBe('location');
+    expect(rootCrumb.tabIndex).not.toBe(-1);
+    expect(rootCrumb.style.color).not.toBe('');
+    expect(host.textContent).toContain('root level · double-click a community to open it');
+
+    // Resident meter starts at zero — nothing has been fetched into residency yet.
+    const meter = () => host.querySelector('[role="img"][aria-label^="Resident nodes"]')!;
+    expect(host.textContent).toContain('resident 0 / 12,000 nodes');
+    expect(meter().getAttribute('aria-label')).toBe('Resident nodes: 0 of 12,000 budget');
+
+    // Expand the root community — the fallback catalogue's "open" button next to it.
+    const openRoot = [...host.querySelectorAll('button')].find((button) => button.textContent === 'open')!;
+    act(() => openRoot.click());
+    await tick(); await tick();
+
+    // Meter tracks the expansion: the fetched page (1 entity) is now resident.
+    expect(host.textContent).toContain('resident 1 / 12,000 nodes');
+    expect(meter().getAttribute('aria-label')).toBe('Resident nodes: 1 of 12,000 budget');
+    // Breadcrumb grew a second, now-trailing crumb for the opened community; "Project" demoted to ancestor styling.
+    expect(crumbs()).toHaveLength(2);
+    const [projectCrumb, communityCrumb] = crumbs() as [HTMLButtonElement, HTMLButtonElement];
+    expect(projectCrumb.textContent).toBe('Project');
+    expect(projectCrumb.getAttribute('aria-current')).toBeNull();
+    expect(communityCrumb.textContent).toBe('Root community');
+    expect(communityCrumb.getAttribute('aria-current')).toBe('location');
+    expect(host.textContent).toContain('level 1');
+
+    // Collapse back to root via the "Project" crumb.
+    act(() => projectCrumb.click());
+    await tick();
+
+    expect(crumbs()).toHaveLength(1);
+    expect(crumbs()[0]!.getAttribute('aria-current')).toBe('location');
+    // The fetched page stays resident after collapsing (eviction is lazy, keyed off the next store, not
+    // off leaving a level) — the meter keeps reporting the true resident count rather than resetting to
+    // zero as if nothing were loaded.
+    expect(host.textContent).toContain('resident 1 / 12,000 nodes');
+  });
+});

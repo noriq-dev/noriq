@@ -5,7 +5,7 @@ import {
 } from '../api';
 import { useTheme } from '../theme';
 import { Button, Select, TextInput } from './ui';
-import { MonoTag, SectionLabel } from './bits';
+import { MonoTag } from './bits';
 import {
   assembleConstellationV2Scene, CONSTELLATION_V2_RESIDENT_NODE_BUDGET, evictConstellationPages, type ResidentConstellationPage,
 } from './constellation-v2-scene';
@@ -69,6 +69,10 @@ export function MemoryConstellationV2({
   const [rendererFailure, setRendererFailure] = useState<string | null>(null);
   const [typeFilter, setTypeFilter] = useState('');
   const [reducedMotion, setReducedMotion] = useState(() => window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  // Space is the 3D scene, Catalogue is the textual peer (PLNR-380). A renderer failure forces
+  // Catalogue regardless of this — see `showCatalogue` below — but the human can also choose it deliberately.
+  const [viewMode, setViewMode] = useState<'space' | 'catalogue'>('space');
+  const searchInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => { residentsRef.current = residents; }, [residents]);
   useEffect(() => { pathRef.current = path; }, [path]);
@@ -77,6 +81,19 @@ export function MemoryConstellationV2({
     const update = () => setReducedMotion(media.matches);
     media.addEventListener('change', update);
     return () => media.removeEventListener('change', update);
+  }, []);
+  // The header search field's `/` affordance: focuses search unless the user is already typing somewhere.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== '/' || event.metaKey || event.ctrlKey || event.altKey) return;
+      const target = event.target as HTMLElement | null;
+      const tag = target?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || target?.isContentEditable) return;
+      event.preventDefault();
+      searchInputRef.current?.focus();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
   }, []);
 
   const loadOverview = useCallback(async (signal?: AbortSignal) => {
@@ -202,6 +219,21 @@ export function MemoryConstellationV2({
   const highlightedNodeIds = useMemo(() => hits.length && filteredScene
     ? filteredScene.nodes.filter((node) => node.uri && hits.some((hit) => hit.uri === node.uri)).map((node) => node.id)
     : [], [hits, filteredScene]);
+  // Sum of every currently-resident page's node count — the same figure `storeResident` compares against
+  // CONSTELLATION_V2_RESIDENT_NODE_BUDGET before throwing. Surfaced as a gauge so the ceiling is watched,
+  // not hit; the throw in storeResident stays the enforcement backstop.
+  const residentTotal = useMemo(
+    () => [...residents.values()].reduce((sum, entry) => sum + entry.page.communities.length + entry.page.entities.length, 0),
+    [residents],
+  );
+  const crumbs = useMemo(() => [
+    { id: 'root', label: 'Project', onSelect: () => { pathRef.current = []; setPath([]); selectNode(null); } },
+    ...path.map((id, index) => ({
+      id,
+      label: residents.get(id)?.page.community.label ?? id,
+      onSelect: () => { const next = path.slice(0, index + 1); pathRef.current = next; setPath(next); selectNode(null); },
+    })),
+  ], [path, residents, selectNode]);
   const selected = scene?.nodes.find((node) => node.id === selectedNodeId) ?? null;
   const selectedCommunity = selected?.community ? selected : null;
   const selectedEntity = selected?.uri ? selected : null;
@@ -215,28 +247,127 @@ export function MemoryConstellationV2({
   const typeOptions = [...new Set(scene.nodes.filter((node) => !node.community).map((node) => node.type))].sort();
   const codeEntities = overview.communities.reduce((count, community) => count + (community.typeCounts.file ?? 0) + (community.typeCounts.symbol ?? 0) + (community.typeCounts.repository ?? 0), 0);
 
+  // Renderer failure forces Catalogue (it is the only reachable path when WebGL is down) but a human
+  // can also choose Catalogue deliberately — it is a peer view, not only a failure fallback (PLNR-380).
+  const showCatalogue = viewMode === 'catalogue' || Boolean(rendererFailure);
+  const generationColor = overview.revision.state === 'current' ? 'var(--green)' : 'var(--amber)';
+  const totalEntities = overview.communities.reduce((sum, community) => sum + community.memberCount, 0);
+  const countsLabel = path.length === 0
+    ? `${overview.communities.length} communit${overview.communities.length === 1 ? 'y' : 'ies'} · ${totalEntities.toLocaleString()} entities`
+    : `${filteredScene.nodes.length} visible · ${filteredScene.edges.length} routes`;
+  // Search-active breadcrumb copy ("N matches ignited ... non-matches dimmed") describes the ignite/dim
+  // treatment that lands with the later search-ignite task; showing that copy before dimming exists would
+  // claim a visual behaviour the app doesn't have yet, so this task only carries the root/expanded hints.
+  const levelHint = path.length === 0
+    ? '— root level · double-click a community to open it'
+    : `· level ${path.length}`;
+  const searchActive = query.trim().length > 0;
+  const residentMeterPercent = Math.min(100, (residentTotal / CONSTELLATION_V2_RESIDENT_NODE_BUDGET) * 100);
+
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-      <div style={{ padding: '8px 14px', borderBottom: '1px solid var(--line)', display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-        <SectionLabel>Constellation v2</SectionLabel>
-        <MonoTag color="var(--text-dim)" bg="var(--w-04)" size={9}>{filteredScene.nodes.length} visible · {filteredScene.edges.length} routes</MonoTag>
-        <MonoTag color={overview.revision.state === 'current' ? 'var(--green)' : 'var(--amber)'} bg="var(--w-04)" size={9}>{overview.revision.state}</MonoTag>
-        <Button variant="ghost" disabled={path.length === 0} onClick={() => { const next = path.slice(0, -1); pathRef.current = next; setPath(next); selectNode(null); }}>← parent</Button>
-        <Select value={typeFilter} onChange={(event) => setTypeFilter(event.target.value)} aria-label="Filter visible entities by type">
+      <div style={{
+        height: 46, boxSizing: 'border-box', padding: '0 14px', display: 'flex', alignItems: 'center', gap: 10,
+        background: 'var(--bg-raised)', borderBottom: '1px solid var(--line)', flexWrap: 'nowrap',
+      }}>
+        <span style={{ fontFamily: 'var(--mono)', fontSize: 10, letterSpacing: '.12em', textTransform: 'uppercase', color: 'var(--text-dim)', flex: 'none' }}>MEMORY</span>
+        <span style={{ fontSize: 13, fontWeight: 600, letterSpacing: '-.01em', color: 'var(--text)', flex: 'none' }}>Constellation</span>
+        <MonoTag color="var(--accent)" bg="rgba(198,242,78,.1)" size={9}>v2</MonoTag>
+        <span style={{
+          fontFamily: 'var(--mono)', fontSize: 9, fontWeight: 600, padding: '1px 6px', borderRadius: 4,
+          background: 'var(--w-04)', border: `1px solid ${generationColor}`, color: generationColor, whiteSpace: 'nowrap', flex: 'none',
+        }}>
+          {overview.revision.generationId} · {overview.revision.state}
+        </span>
+        <MonoTag color="var(--text-dim)" bg="var(--w-04)" size={9}>{countsLabel}</MonoTag>
+        <div style={{ flex: 1 }} />
+        <div role="group" aria-label="View" style={{ display: 'flex', flex: 'none', border: '1px solid var(--w-1)', borderRadius: 7, overflow: 'hidden' }}>
+          <button
+            type="button" aria-pressed={!showCatalogue} disabled={Boolean(rendererFailure)}
+            onClick={() => setViewMode('space')}
+            style={{
+              padding: '5px 10px', fontFamily: 'inherit', fontSize: 11, fontWeight: 600, border: 'none',
+              cursor: rendererFailure ? 'default' : 'pointer',
+              background: !showCatalogue ? 'var(--w-08)' : 'transparent',
+              color: rendererFailure ? 'var(--text-faint)' : !showCatalogue ? 'var(--text)' : 'var(--text-dim)',
+            }}
+          >
+            Space
+          </button>
+          <button
+            type="button" aria-pressed={showCatalogue}
+            onClick={() => setViewMode('catalogue')}
+            style={{
+              padding: '5px 10px', fontFamily: 'inherit', fontSize: 11, fontWeight: 600, border: 'none', cursor: 'pointer',
+              background: showCatalogue ? 'var(--w-08)' : 'transparent', color: showCatalogue ? 'var(--text)' : 'var(--text-dim)',
+            }}
+          >
+            Catalogue
+          </button>
+        </div>
+        <Select value={typeFilter} onChange={(event) => setTypeFilter(event.target.value)} aria-label="Filter visible entities by type" style={{ flex: 'none', minWidth: 108 }}>
           <option value="">all types</option>
           {typeOptions.map((type) => <option key={type} value={type}>{type}</option>)}
         </Select>
-        <div style={{ flex: 1 }} />
-        <TextInput value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search memory, task, file, symbol…" style={{ width: 280 }} />
+        <div style={{ position: 'relative', flex: 'none' }}>
+          <span aria-hidden="true" style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', fontSize: 12, color: searchActive ? 'var(--accent)' : 'var(--text-faint)', pointerEvents: 'none' }}>⌕</span>
+          <TextInput
+            ref={searchInputRef}
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Search memory, task, file, symbol…"
+            aria-label="Search memory, task, file, symbol"
+            style={{
+              width: 280, paddingLeft: 28, paddingRight: searchActive ? 66 : 34,
+              borderColor: searchActive ? 'rgba(198,242,78,.5)' : 'var(--w-1)',
+              background: searchActive ? 'rgba(198,242,78,.04)' : 'var(--w-05)',
+              boxShadow: searchActive ? '0 0 0 3px rgba(198,242,78,.07)' : 'none',
+            }}
+          />
+          {searchActive
+            ? <span style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)', pointerEvents: 'none', whiteSpace: 'nowrap' }}>{searching ? '…' : `${hits.length} result${hits.length === 1 ? '' : 's'}`}</span>
+            : <span aria-hidden="true" style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)', border: '1px solid var(--w-12)', borderRadius: 4, padding: '0 4px', pointerEvents: 'none' }}>/</span>}
+        </div>
       </div>
-      {path.length > 0 && <div style={{ padding: '6px 14px', display: 'flex', gap: 5, borderBottom: '1px solid var(--line)', fontSize: 11 }}>
-        <button type="button" onClick={() => { pathRef.current = []; setPath([]); selectNode(null); }}>Project</button>
-        {path.map((id, index) => <button type="button" key={id} onClick={() => { const next = path.slice(0, index + 1); pathRef.current = next; setPath(next); selectNode(null); }}>› {residents.get(id)?.page.community.label ?? id}</button>)}
-      </div>}
+      <div style={{
+        height: 30, boxSizing: 'border-box', padding: '0 14px', display: 'flex', alignItems: 'center', gap: 6,
+        borderBottom: '1px solid var(--line)', fontFamily: 'var(--mono)', fontSize: 10, flexWrap: 'nowrap',
+      }}>
+        {crumbs.map((crumb, index) => (
+          // Keyed by position + id, not id alone: a real community id can collide with the synthetic
+          // 'root' id of the leading Project crumb (community ids are not guaranteed disjoint from it).
+          <span key={`${index}:${crumb.id}`} style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 'none' }}>
+            {index > 0 && <span aria-hidden="true" style={{ color: 'var(--text-faint)' }}>▸</span>}
+            <button
+              type="button"
+              onClick={crumb.onSelect}
+              aria-current={index === crumbs.length - 1 ? 'location' : undefined}
+              style={{
+                background: 'transparent', border: 'none', padding: 0, cursor: 'pointer',
+                fontFamily: 'inherit', fontSize: 'inherit',
+                color: index === crumbs.length - 1 ? 'var(--accent)' : 'var(--text-mid)',
+                fontWeight: index === crumbs.length - 1 ? 600 : 400,
+              }}
+            >
+              {crumb.label}
+            </button>
+          </span>
+        ))}
+        <span style={{ color: 'var(--text-faint)', marginLeft: 2, flex: 'none' }}>{levelHint}</span>
+        <div style={{ flex: 1 }} />
+        <span style={{ color: 'var(--text-dim)', flex: 'none' }}>resident {residentTotal.toLocaleString()} / {CONSTELLATION_V2_RESIDENT_NODE_BUDGET.toLocaleString()} nodes</span>
+        <div
+          role="img"
+          aria-label={`Resident nodes: ${residentTotal.toLocaleString()} of ${CONSTELLATION_V2_RESIDENT_NODE_BUDGET.toLocaleString()} budget`}
+          style={{ width: 90, height: 3, borderRadius: 2, background: 'var(--w-08)', overflow: 'hidden', flex: 'none' }}
+        >
+          <div style={{ width: `${residentMeterPercent}%`, height: '100%', background: 'var(--accent)' }} />
+        </div>
+      </div>
       <div style={{ position: 'relative', flex: 1, minHeight: 0 }}>
         {overview.communities.length === 0 ? <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: 'var(--text-dim)' }}>
           <div style={{ maxWidth: 440, textAlign: 'center' }}><strong>No memory entities are present in this completed generation.</strong><div style={{ marginTop: 6, fontSize: 11 }}>This is a confirmed empty hierarchy, not a renderer or network failure.</div></div>
-        </div> : !rendererFailure ? <Suspense fallback={<div style={{ padding: 24, color: 'var(--text-dim)' }}>Loading 3D renderer…</div>}>
+        </div> : !showCatalogue ? <Suspense fallback={<div style={{ padding: 24, color: 'var(--text-dim)' }}>Loading 3D renderer…</div>}>
             <LazyConstellation3D
               projectId={pid} generationId={overview.revision.generationId} layoutVersion={overview.revision.layoutVersion}
               nodes={filteredScene.nodes} edges={filteredScene.edges} selectedNodeId={selectedNodeId} highlightedNodeIds={highlightedNodeIds} theme={theme}
@@ -245,10 +376,10 @@ export function MemoryConstellationV2({
               onRendererFailure={handleRendererFailure}
             />
           </Suspense> : <div role="region" aria-label="Textual memory constellation" style={{ position: 'absolute', inset: 0, overflow: 'auto', padding: 18 }}>
-            <div style={{ padding: 10, marginBottom: 10, border: '1px solid var(--line)', borderRadius: 8 }}>
+            {rendererFailure && <div style={{ padding: 10, marginBottom: 10, border: '1px solid var(--line)', borderRadius: 8 }}>
               <strong>3D view unavailable — textual navigation remains active.</strong>
               <div style={{ color: 'var(--text-dim)', fontSize: 11, marginTop: 4 }}>{rendererFailure}</div>
-            </div>
+            </div>}
             {filteredScene.nodes.map((node) => <div key={node.id} style={{ display: 'flex', gap: 8, alignItems: 'center', padding: 7, borderBottom: '1px solid var(--line)' }}>
               <button type="button" onClick={() => selectNode(node.id)} style={{ flex: 1, textAlign: 'left' }}>{node.label} <small>({node.type})</small></button>
               {node.community && <Button onClick={() => void expand(node.id)}>open</Button>}
@@ -279,7 +410,7 @@ export function MemoryConstellationV2({
           {hits.map((hit) => <button key={`${hit.entityType}:${hit.id}`} type="button" onClick={() => void focusHit(hit)} style={{ display: 'block', width: '100%', padding: 9, textAlign: 'left', borderBottom: '1px solid var(--line)' }}>{hit.title}<small style={{ display: 'block', color: 'var(--text-dim)' }}>{hit.entityType} · {hit.uri}</small></button>)}
         </div>}
         {searching && <div style={{ position: 'absolute', right: 18, top: 16, color: 'var(--text-dim)', fontSize: 10 }}>searching…</div>}
-        {!rendererFailure && <details style={{ position: 'absolute', left: 12, top: codeEntities === 0 && path.length === 0 ? 70 : 42, maxHeight: '60%', width: 300, overflow: 'auto', background: 'var(--panel)', padding: 8, borderRadius: 8 }}>
+        {!showCatalogue && <details style={{ position: 'absolute', left: 12, top: codeEntities === 0 && path.length === 0 ? 70 : 42, maxHeight: '60%', width: 300, overflow: 'auto', background: 'var(--panel)', padding: 8, borderRadius: 8 }}>
           <summary>Accessible visible list ({filteredScene.nodes.length})</summary>
           {filteredScene.nodes.map((node) => <button key={node.id} type="button" onClick={() => selectNode(node.id)} onDoubleClick={() => { if (node.community) void expand(node.id); }} style={{ display: 'block', width: '100%', textAlign: 'left', padding: 5 }}>{node.label} <small>({node.type})</small></button>)}
           {currentPage?.nextCursor && <Button onClick={() => void fetchCommunity(currentPage.community.id, currentPage.nextCursor!)}>load next page</Button>}
