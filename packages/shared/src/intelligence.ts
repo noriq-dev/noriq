@@ -254,11 +254,16 @@ export const IntelligenceAlgorithmVersions = z.object({
 // second, wrong watermark that would need its own reconciliation with the first.
 //
 // Duplicated enum values below (`ContextConsumptionSectionId`/`Mode`/`Role`) mirror `memory.ts`'s
-// `ContextPackSectionId`/`ContextPackMode`/`ContextPackRole` BY CONVENTION, not by import — the
-// same device `memory.ts`'s own `ContextPackProvenance` doc comment already uses for its four
-// retrieval-stage values. `memory.ts` imports `ProjectIntelligenceEpisode` from THIS file (for
-// `EffortEpisode.intelligence`), so this file importing back from `memory.ts` would be a cycle.
-// Keep the enums' values in sync by hand.
+// `ContextPackSectionId`/`ContextPackMode`/`ContextPackRole`. `memory.ts` imports
+// `ProjectIntelligenceEpisode` from THIS file (for `EffortEpisode.intelligence`), so this file
+// importing back from `memory.ts` would be a cycle — the duplication itself is forced. UNLIKE
+// `memory.ts`'s own `ContextPackProvenance`, which mirrors the Worker-internal `RetrievalStage` "by
+// convention, not by import" because a compile-time check is genuinely unavailable across that
+// package boundary, both halves of these three pairs live in this SAME package — so nothing is
+// kept in sync "by hand": `memory.ts` (which already imports from this file, so the dependency
+// direction is untouched) carries a type-level bidirectional equality assertion for all three
+// pairs, right after its own `ContextPackSectionId`/`Mode`/`Role` declarations, that fails
+// `npx tsc --noEmit` the moment either side adds, removes, or renames a value.
 export const ContextConsumptionSectionId = z.enum([
   'active_decisions',
   'known_hazards',
