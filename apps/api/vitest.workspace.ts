@@ -18,7 +18,9 @@ import fs from 'node:fs';
 // Load suites are intentionally kept out of the shards
 // and given its own `load` project, selected by name — `npm test` runs `--project 'shard*'`
 // (no load), `npm run test:load` runs `--project load`. (Selection is by project name, NOT an
-// env flag: shell env does not reach vitest's config evaluation.)
+// env flag: shell env does not reach vitest's config evaluation.) The shard exclusion is
+// derived from LOAD_FILES below (PLNR-431) — a file only has to be added there, not ALSO
+// hand-excluded from the shard filter, to stay out of the default sweep.
 //
 // Targeting one file: `cd apps/api && npx vitest run test/oauth.test.ts` — a positional file
 // runs in whichever shard owns it. (Once a workspace file exists it governs every run, so the
@@ -37,11 +39,16 @@ const DEMO_FILES = ['demo.test.ts', 'demo-gates.test.ts'];
 // MAINTENANCE_MODE freezes writes globally (PLNR-166) — like DEMO_MODE it can't ride the
 // shared default, so this file gets its own project with the flag ON.
 const MAINTENANCE_FILES = ['maintenance.test.ts'];
+// Load suites are heavy/timing-sensitive by design and belong only in the opt-in `load`
+// project (PLNR-431) — this is the single source of truth for that list; the shard filter
+// below excludes exactly these files, so a new load suite added here is automatically kept
+// out of the default sweep with no second edit required.
+const LOAD_FILES = ['load.test.ts', 'memory-load.test.ts'];
 
 const testDir = path.join(__dirname, 'test');
 const testFiles = fs
   .readdirSync(testDir)
-  .filter((f) => f.endsWith('.test.ts') && f !== 'load.test.ts' && !DEMO_FILES.includes(f) && !MAINTENANCE_FILES.includes(f))
+  .filter((f) => f.endsWith('.test.ts') && !LOAD_FILES.includes(f) && !DEMO_FILES.includes(f) && !MAINTENANCE_FILES.includes(f))
   .sort();
 const shards: string[][] = Array.from({ length: SHARDS }, () => []);
 testFiles.forEach((f, i) => shards[i % SHARDS]!.push(`test/${f}`));
@@ -119,5 +126,5 @@ export default [
   // Write-freeze suite runs with MAINTENANCE_MODE ON (its own project so the flag stays off
   // everywhere else). `npm test` selects it explicitly alongside the shards.
   project('maintenance', MAINTENANCE_FILES.map((f) => `test/${f}`), { MAINTENANCE_MODE: '1' }),
-  project('load', ['test/load.test.ts', 'test/memory-load.test.ts']),
+  project('load', LOAD_FILES.map((f) => `test/${f}`)),
 ];
