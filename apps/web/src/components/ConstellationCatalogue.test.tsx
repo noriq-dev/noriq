@@ -22,6 +22,14 @@ const community: Constellation3DNode = {
   id: 'c1', uri: null, label: 'Coordination core', type: 'community', position: [0, 0, 0], degree: 9,
   community: true, memberCount: 120, typeCounts: { task: 80, memory: 40 }, boundaryRouteCount: 14,
 };
+// PLNR-452: the same stand-in shape constellation-v2-scene.ts's `assembleConstellationV2Scene`
+// creates for an off-page incident edge's non-resident endpoint — a REAL community's id/label/
+// counts (never fabricated), just not resident at the current level, with `offPageStandIn: true`
+// so the canvas (PLNR-448) and now Catalogue both know not to treat it as an ordinary loaded row.
+const offPageCommunity: Constellation3DNode = {
+  id: 'c2', uri: null, label: 'Ask subsystem', type: 'community', position: [0, 0, 0], degree: 3,
+  community: true, memberCount: 512, typeCounts: { task: 400 }, boundaryRouteCount: 0, offPageStandIn: true,
+};
 
 const communityPage = (overrides: Partial<ApiConstellationV2CommunityPage> = {}): ApiConstellationV2CommunityPage => ({
   revision,
@@ -124,6 +132,33 @@ describe('ConstellationCatalogue community rows expandable inline (PLNR-442)', (
     const open = [...host.querySelectorAll('button')].find((button) => button.textContent === 'open')!;
     act(() => open.click());
     expect(onExpandCommunity).toHaveBeenCalledWith('c1');
+  });
+});
+
+describe('ConstellationCatalogue off-page stand-in rows (PLNR-452)', () => {
+  it('labels an off-page stand-in row instead of showing its member count, and hides the preview toggle', () => {
+    render({ nodes: [offPageCommunity] });
+    expect(host.textContent).toContain('Ask subsystem');
+    expect(host.textContent).toContain('off-page ▸');
+    expect(host.textContent).not.toContain('512 entities');
+    // No preview disclosure control — the stand-in's boundaryRouteCount is never computed
+    // (constellation-v2-scene.ts), so a preview would show a fabricated "0 boundary routes"
+    // rather than the truthful "not known here".
+    expect(host.querySelector('button[aria-expanded]')).toBeNull();
+  });
+
+  it('keeps the off-page row\'s "open" action wired — the stand-in id is a real, navigable community', () => {
+    const onExpandCommunity = vi.fn();
+    render({ nodes: [offPageCommunity], onExpandCommunity });
+    const open = [...host.querySelectorAll('button')].find((button) => button.textContent === 'open')!;
+    act(() => open.click());
+    expect(onExpandCommunity).toHaveBeenCalledWith('c2');
+  });
+
+  it('does not affect an ordinary resident community row in the same list', () => {
+    render({ nodes: [community, offPageCommunity] });
+    expect(host.textContent).toContain('120 entities');
+    expect(host.querySelectorAll('button[aria-expanded]')).toHaveLength(1); // only the resident row gets a preview toggle
   });
 });
 

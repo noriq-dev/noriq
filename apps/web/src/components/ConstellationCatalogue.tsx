@@ -84,9 +84,27 @@ export function ConstellationCatalogue({
       <div style={{ display: 'flex', flexDirection: 'column' }}>
         {nodes.map((node) => {
           const isCommunity = Boolean(node.community);
+          // PLNR-452 (following PLNR-448's off-page-stand-in exclusion from the 3D community
+          // passes): `node.offPageStandIn` is the SAME real containing-community id/label/counts
+          // `assembleConstellationV2Scene` uses whenever it substitutes an incident edge's
+          // non-resident endpoint (constellation-v2-scene.ts) — not a fabricated identity, so
+          // removing the row outright would delete a genuine, navigable path (Navigator
+          // conventions §7: Catalogue keeps every action reachable). But presenting it as an
+          // ordinary loaded-at-this-level row would violate §4 ("no synthesized node, ever" /
+          // "off-page is named, never faked") the same way the pre-PLNR-448 3D gravity well did,
+          // and its `boundaryRouteCount` is never computed for a stand-in (always 0 — see
+          // constellation-v2-scene.ts's `communityNode(containing)` call with no route-count arg),
+          // so the preview disclosure below would show a fabricated "0 boundary routes" rather
+          // than the truthful "not known here". Resolution: keep the row and its `open` action
+          // (a real path to a real place), but replace the entity-count line with the same
+          // "· off-page ▸" caption idiom the pinned-selection off-page route (screen spec 1b) and
+          // the search-results off-page hit (MemoryConstellationV2.tsx, `var(--amber)`) already
+          // use, and suppress the preview toggle so its unreliable boundary-route figure is never
+          // shown as if it were known.
+          const offPage = Boolean(node.offPageStandIn);
           const highlighted = highlightedNodeIds.has(node.id);
           const previewed = previewedIds.has(node.id);
-          const tooltip = isCommunity ? communityTooltipContent(node) : null;
+          const tooltip = isCommunity && !offPage ? communityTooltipContent(node) : null;
           const matchCount = isCommunity ? matchCounts.get(node.id) : undefined;
           return (
             <div key={node.id}>
@@ -98,7 +116,7 @@ export function ConstellationCatalogue({
                   background: node.id === selectedNodeId ? 'var(--w-04)' : highlighted ? 'rgba(198,242,78,.04)' : 'transparent',
                 }}
               >
-                {isCommunity ? (
+                {isCommunity && !offPage ? (
                   <button
                     type="button" aria-expanded={previewed}
                     aria-label={`${previewed ? 'Collapse' : 'Expand'} ${node.label} preview`}
@@ -130,7 +148,12 @@ export function ConstellationCatalogue({
                       {node.uri}
                     </span>
                   )}
-                  {isCommunity && (
+                  {isCommunity && offPage && (
+                    <span style={{ display: 'block', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--amber)' }}>
+                      off-page ▸
+                    </span>
+                  )}
+                  {isCommunity && !offPage && (
                     <span style={{ display: 'block', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>
                       {(node.memberCount ?? 0).toLocaleString()} entities
                     </span>
