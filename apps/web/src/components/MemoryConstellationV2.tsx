@@ -4,9 +4,10 @@ import {
   type ApiConstellationV2Overview, type ApiMemoryHit,
 } from '../api';
 import { useTheme } from '../theme';
-import { Button, Select, TextInput } from './ui';
+import { Select, TextInput } from './ui';
 import { MonoTag } from './bits';
 import { CONSTELLATION_SHAPE_GLYPH, encodingForType } from './constellation-encoding';
+import { ConstellationCatalogue } from './ConstellationCatalogue';
 import { ConstellationInspector } from './ConstellationInspector';
 import {
   assembleConstellationV2Scene, CONSTELLATION_V2_RESIDENT_NODE_BUDGET, evictConstellationPages, type ResidentConstellationPage,
@@ -330,11 +331,16 @@ export function MemoryConstellationV2({
     : `${filteredScene.nodes.length} visible · ${filteredScene.edges.length} routes`;
   const searchActive = query.trim().length > 0;
   // Search-active breadcrumb copy (screen spec 1c): states the total and the community spread up
-  // front, so the dim that follows can never be misread as a filter having removed anything — the
-  // count IS the honesty mechanism, not a nicety (Navigator conventions doc §4 "dimming is not
-  // filtering"). Falls back to the root/expanded hints (PLNR-436) when no query is active.
+  // front, so what follows can never be misread as a filter having removed anything — the count IS
+  // the honesty mechanism, not a nicety (Navigator conventions doc §4 "dimming is not filtering").
+  // Space dims non-matches to ~32% opacity on a continuous field; Catalogue is a flat list with no
+  // field to dim, so silently shortening it to only-matches would be the exact thing the honesty
+  // rule forbids. The textual equivalent (PLNR-442): every row stays listed and unmatched rows are
+  // simply left unmarked, mirroring "dimmed, not removed" with "unmarked, not removed" — dimming's
+  // job (visually de-emphasize without hiding) is done by omission of the ignite mark, not by any
+  // row disappearing. Falls back to the root/expanded hints (PLNR-436) when no query is active.
   const levelHint = searchActive
-    ? `— ${hits.length} match${hits.length === 1 ? '' : 'es'} ignited across ${matchedRootCommunityIds.size} communit${matchedRootCommunityIds.size === 1 ? 'y' : 'ies'} · non-matches dimmed, not removed`
+    ? `— ${hits.length} match${hits.length === 1 ? '' : 'es'} ignited across ${matchedRootCommunityIds.size} communit${matchedRootCommunityIds.size === 1 ? 'y' : 'ies'} · non-matches ${showCatalogue ? 'unmarked' : 'dimmed'}, not removed`
     : path.length === 0
       ? '— root level · double-click a community to open it'
       : `· level ${path.length}`;
@@ -373,6 +379,18 @@ export function MemoryConstellationV2({
     statusNotices.push({
       key: 'unindexed', token: 'informational',
       message: 'No repository entities are present in this generation; repository indexing may not have run.',
+    });
+  }
+  // Catalogue-by-failure (PLNR-442, lockedDecisions): the failure reason rides the SAME status
+  // region every other truthful-degradation message uses, rather than a separate ad hoc box — one
+  // flow container stays the single source of "what's wrong right now". Informational severity:
+  // per the Navigator conventions doc §4 "Unavailable ≠ empty", a renderer failure is grouped with
+  // "confirmed empty hierarchy" and "indexing may not have run" as a truthful capability statement,
+  // not a data-quality error — Catalogue itself remains fully functional, which is the whole point.
+  if (rendererFailure) {
+    statusNotices.push({
+      key: 'renderer-failure', token: 'informational',
+      message: `3D view unavailable — textual navigation remains active. ${rendererFailure}`,
     });
   }
   const STATUS_TOKEN_COLOR: Record<(typeof statusNotices)[number]['token'], string> = {
@@ -500,19 +518,20 @@ export function MemoryConstellationV2({
                 onSelectNode={selectNode} onOpenEgoNetwork={onOpenEgoNetwork} onOpenInspector={onOpenInspector}
                 onRendererFailure={handleRendererFailure}
               />
-            </Suspense> : <div role="region" aria-label="Textual memory constellation" style={{ position: 'absolute', inset: 0, overflow: 'auto', padding: 18 }}>
-              {rendererFailure && <div style={{ padding: 10, marginBottom: 10, border: '1px solid var(--line)', borderRadius: 8 }}>
-                <strong>3D view unavailable — textual navigation remains active.</strong>
-                <div style={{ color: 'var(--text-dim)', fontSize: 11, marginTop: 4 }}>{rendererFailure}</div>
-              </div>}
-              {filteredScene.nodes.map((node) => <div key={node.id} style={{ display: 'flex', gap: 8, alignItems: 'center', padding: 7, borderBottom: '1px solid var(--line)' }}>
-                <button type="button" onClick={() => selectNode(node.id)} style={{ flex: 1, textAlign: 'left' }}>{node.label} <small>({node.type})</small></button>
-                {node.community && <Button onClick={() => void expand(node.id)}>open</Button>}
-                {node.uri && <Button variant="ghost" onClick={() => onOpenEgoNetwork?.(node.uri!)}>ego</Button>}
-                {node.uri && node.type === 'memory' && <Button variant="ghost" onClick={() => onOpenInspector?.(node.uri!)}>evidence</Button>}
-              </div>)}
-              {currentPage?.nextCursor && <Button onClick={() => void fetchCommunity(currentPage.community.id, currentPage.nextCursor!)}>load next catalogue page</Button>}
-            </div>}
+            </Suspense> : <ConstellationCatalogue
+              nodes={filteredScene.nodes}
+              highlightedNodeIds={new Set(highlightedNodeIds)}
+              matchCounts={matchCountsByRootCommunity}
+              searchActive={searchActive}
+              selectedNodeId={selectedNodeId}
+              currentPage={currentPage}
+              expanding={expanding}
+              onSelectNode={selectNode}
+              onExpandCommunity={(communityId) => void expand(communityId)}
+              onLoadNextPage={() => currentPage && void fetchCommunity(currentPage.community.id, currentPage.nextCursor!)}
+              onOpenEgoNetwork={onOpenEgoNetwork}
+              onOpenInspector={onOpenInspector}
+            />}
           {statusNotices.length > 0 && <div style={{ position: 'absolute', left: 14, top: 12, display: 'flex', flexDirection: 'column', gap: 6, maxWidth: 420, zIndex: 1 }}>
             {statusNotices.map((notice) => <div key={notice.key} role="status" style={{
               display: 'flex', alignItems: 'center', gap: 8, padding: '4px 9px', borderRadius: 6,
@@ -568,19 +587,17 @@ export function MemoryConstellationV2({
             })}
           </div>}
           {searching && <div style={{ position: 'absolute', right: 18, top: 16, color: 'var(--text-dim)', fontSize: 10 }}>searching…</div>}
-          {/* Fixed offset, not conditional on the status region's height: this widget is superseded by
-              the Catalogue promotion in Phase 4 (PLNR-441/442, per the audit doc's "Fallbacks"
-              disposition), so it is left in place rather than redesigned here — but per this task's
-              acceptance truth ("no component computes a pixel offset from another element's presence")
-              it must stop reading codeEntities/path.length the way it used to. */}
-          {!showCatalogue && <details style={{ position: 'absolute', left: 12, top: 42, maxHeight: '60%', width: 300, overflow: 'auto', background: 'var(--panel)', padding: 8, borderRadius: 8 }}>
-            <summary>Accessible visible list ({filteredScene.nodes.length})</summary>
-            {filteredScene.nodes.map((node) => <button key={node.id} type="button" onClick={() => selectNode(node.id)} onDoubleClick={() => { if (node.community) void expand(node.id); }} style={{ display: 'block', width: '100%', textAlign: 'left', padding: 5 }}>{node.label} <small>({node.type})</small></button>)}
-            {currentPage?.nextCursor && <Button onClick={() => void fetchCommunity(currentPage.community.id, currentPage.nextCursor!)}>load next page</Button>}
-          </details>}
-          {/* Fixed bottom-left, independent of the top-left status region / accessible-list panel's
-              presence or height — same "no sibling-dependent offset" rule those already follow
-              (PLNR-436/438). Space view only, matching the accessible-list panel's scope. */}
+          {/* The old <details> "Accessible visible list" disclosure lived here (Space view only).
+              PLNR-436 decoupled its offset from codeEntities/path.length but deliberately left its
+              content alone, scoping the promotion to this task (PLNR-442) — the audit doc's
+              "Fallbacks" disposition is explicit: Delete, its function is absorbed by Catalogue.
+              A disclosure widget was never a navigation surface; the Catalogue view (reachable from
+              the header toggle at all times, not only on renderer failure) is. */}
+          {/* Fixed bottom-left, independent of the top-left status region's presence or height —
+              same "no sibling-dependent offset" rule it already follows (PLNR-436/438). Space view
+              only: the legend explains the 3D encoding; every Catalogue row already carries its own
+              type chip and shape glyph inline, so a second, freestanding legend would be redundant
+              there. */}
           {!showCatalogue && <div aria-label={searchActive ? 'Constellation ignite legend' : 'Constellation encoding legend'} style={{
             position: 'absolute', left: 14, bottom: 14, width: 238, background: 'var(--panel)',
             border: '1px solid var(--line)', borderRadius: 8, padding: 10, fontFamily: 'var(--mono)',

@@ -161,12 +161,16 @@ describe('MemoryConstellationV2 status region (PLNR-436)', () => {
     await tick(); await tick();
 
     const notices = [...host.querySelectorAll('[role="status"]')];
-    expect(notices).toHaveLength(3);
     // Fixed severity order: error -> stale -> building -> partial -> informational (Navigator
-    // conventions doc §3). Only error/stale/partial are reachable simultaneously here.
+    // conventions doc §3). error/stale/partial are reachable simultaneously here, plus the renderer
+    // failure this suite's default MemoryConstellation3D mock always triggers (PLNR-442: the
+    // failure reason now rides this SAME status region, informational severity, rather than a
+    // separate ad hoc box).
+    expect(notices).toHaveLength(4);
     expect(notices[0]!.textContent).toContain('Incident boom');
     expect(notices[1]!.textContent).toContain('This generation is stale (source 3, current 7).');
     expect(notices[2]!.textContent).toContain('Partial level · bounded continuation available');
+    expect(notices[3]!.textContent).toContain('3D view unavailable — textual navigation remains active');
 
     // All three are siblings under the same flow container — not independently offset elements.
     const parent = notices[0]!.parentElement!;
@@ -197,14 +201,15 @@ describe('MemoryConstellationV2 status region (PLNR-436)', () => {
     await tick(); await tick();
 
     const notices = [...host.querySelectorAll('[role="status"]')];
-    expect(notices).toHaveLength(2);
+    // Two informational-severity notices land together here: the pre-existing "no repository
+    // entities" note, and (PLNR-442) the renderer-failure notice this suite's default mock always
+    // triggers — both truthful capability statements, same tier, same container.
+    expect(notices).toHaveLength(3);
     expect(notices[0]!.textContent).toContain('A newer hierarchy is building; this complete generation remains navigable.');
     expect(notices[1]!.textContent).toContain('No repository entities are present in this generation; repository indexing may not have run.');
+    expect(notices[2]!.textContent).toContain('3D view unavailable — textual navigation remains active');
     expect(notices[0]!.parentElement).toBe(notices[1]!.parentElement);
-    // Note: the accessible-list <details> panel (Space view only) is unreachable in this file's
-    // suite — the top-of-file MemoryConstellation3D mock always fires onRendererFailure, which
-    // forces Catalogue. Its no-longer-conditional `top: 42` offset is verified by reading the
-    // component source, not by a DOM assertion here.
+    expect(notices[1]!.parentElement).toBe(notices[2]!.parentElement);
   });
 });
 
@@ -320,6 +325,64 @@ describe('MemoryConstellationV2 docked selection inspector (PLNR-440)', () => {
   });
 });
 
+describe('MemoryConstellationV2 Catalogue as a designed peer view (PLNR-442)', () => {
+  it('is selectable from the header while the renderer is healthy (not only entered by failure), switches back to Space, and the old <details> disclosure is gone entirely', async () => {
+    mockRenderer3D.failOnMount = false; // renderer succeeds — no forced Catalogue
+    vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision, communities: [rootCommunity], routes: [], coverage: { complete: true, reasons: [] } });
+    host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
+    act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
+    await tick(); await tick();
+
+    expect(host.textContent).not.toContain('3D view unavailable');
+    // No disclosure widget anywhere — its function is fully absorbed by the Catalogue view
+    // (audit doc pdoc_msopdg2u602z4b0q3i2n, "Fallbacks" disposition: Delete).
+    expect(host.querySelector('details')).toBeNull();
+
+    const spaceToggle = [...host.querySelectorAll('button')].find((button) => button.textContent === 'Space')!;
+    const catalogueToggle = [...host.querySelectorAll('button')].find((button) => button.textContent === 'Catalogue')!;
+    // Deliberately choosable — the Space segment is enabled (not the disabled-by-failure state).
+    expect(spaceToggle.disabled).toBe(false);
+    expect(catalogueToggle.getAttribute('aria-pressed')).toBe('false');
+
+    act(() => catalogueToggle.click());
+    await tick();
+    expect(catalogueToggle.getAttribute('aria-pressed')).toBe('true');
+    expect(host.querySelector('[role="region"][aria-label="Textual memory constellation"]')).toBeTruthy();
+    expect(host.textContent).toContain('Root community');
+    // No renderer-failure notice: this is a deliberate choice, not a degradation. (The fixture's
+    // root community has no file/symbol/repository counts, so the unrelated "unindexed" notice is
+    // still legitimately present — this assertion is specifically about the renderer.)
+    expect(host.textContent).not.toContain('3D view unavailable');
+    expect(host.querySelector('details')).toBeNull();
+
+    act(() => spaceToggle.click());
+    await tick();
+    expect(spaceToggle.getAttribute('aria-pressed')).toBe('true');
+    expect(host.querySelector('[role="region"][aria-label="Textual memory constellation"]')).toBeNull();
+  });
+
+  it('names the renderer failure as a status notice sharing the SAME severity-ordered region as every other truthful-degradation message, not a separate ad hoc box', async () => {
+    vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision, communities: [rootCommunity], routes: [], coverage: { complete: true, reasons: [] } });
+    host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
+    act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
+    await tick(); await tick();
+
+    // Two informational-severity notices legitimately coexist with this fixture: the pre-existing
+    // "no repository entities" note (the root community fixture has no file/symbol/repository
+    // counts) and the renderer-failure notice this test is actually about — same tier, same
+    // container, neither reads a pixel offset from the other's presence.
+    const notices = [...host.querySelectorAll('[role="status"]')];
+    expect(notices).toHaveLength(2);
+    const failureNotice = notices.find((notice) => notice.textContent?.includes('3D view unavailable'))!;
+    expect(failureNotice).toBeTruthy();
+    expect(failureNotice.textContent).toContain('3D view unavailable — textual navigation remains active');
+    expect(failureNotice.textContent).toContain('WebGL2 unavailable in test');
+    // Same styled chip element every other notice uses — no bespoke bordered box.
+    expect(failureNotice.getAttribute('role')).toBe('status');
+    expect(failureNotice.parentElement).toBe(notices[0]!.parentElement);
+  });
+});
+
 describe('MemoryConstellationV2 search ignite (PLNR-441)', () => {
   const hit = (overrides: Partial<{ id: string; uri: string; title: string }> = {}) => ({
     entityType: 'memory' as const, id: overrides.id ?? 'x', uri: overrides.uri ?? 'noriq://memory/x', kind: 'learning',
@@ -350,7 +413,10 @@ describe('MemoryConstellationV2 search ignite (PLNR-441)', () => {
 
     // The count and the community spread are stated BEFORE any dimming could be mistaken for a
     // filter having removed anything (Navigator conventions doc §4 "dimming is not filtering").
-    expect(host.textContent).toContain('1 match ignited across 1 community · non-matches dimmed, not removed');
+    // This suite's default mock forces Catalogue (renderer failure on mount), so this exercises
+    // the TEXTUAL equivalent (PLNR-442): a flat list has no field to dim, so unmatched rows are
+    // simply left unmarked rather than dimmed — never silently shortened to matches-only.
+    expect(host.textContent).toContain('1 match ignited across 1 community · non-matches unmarked, not removed');
 
     const panel = host.querySelector('[aria-label="Search matches"]') as HTMLElement;
     expect(panel).toBeTruthy();

@@ -24,7 +24,10 @@ export const CONSTELLATION_INSPECTOR_WIDTH = 320;
 // MemoryConstellationV2.tsx, so importing back from MemoryView.tsx would be a circular import.
 // This is the same "kept independent, same reasoning documented" convention constellation-encoding.ts's
 // resolveConstellationToken already uses for MemoryStarMap's separate readPalette().
-function authorityTone(authority: number): { color: string; label: string } {
+// Exported (PLNR-442) — ConstellationCatalogue.tsx is now a second DOM consumer of these tones and
+// of TypeChip below, for the exact same "one colour/label source" reason this file's own header
+// comment already gives for keeping them independent of MemoryView.tsx's badges.
+export function authorityTone(authority: number): { color: string; label: string } {
   const labels: Record<number, string> = {
     5: 'human-approved', 4: 'verified against code/tests', 3: 'repeated observation',
     2: 'single-agent observation', 1: 'hypothesis',
@@ -32,17 +35,18 @@ function authorityTone(authority: number): { color: string; label: string } {
   const color = authority >= 5 ? 'var(--green)' : authority >= 3 ? 'var(--blue)' : 'var(--amber)';
   return { color, label: labels[authority] ?? `authority ${authority}` };
 }
-function validityTone(validity: string): { color: string; icon: string } {
+export function validityTone(validity: string): { color: string; icon: string } {
   if (validity === 'active') return { color: 'var(--green)', icon: '●' };
   if (validity === 'stale') return { color: 'var(--amber)', icon: '◐' };
   if (validity === 'invalid' || validity === 'superseded' || validity === 'expired') return { color: 'var(--red-soft)', icon: '✕' };
   return { color: 'var(--text-mid)', icon: '?' };
 }
 
-/** Shared by the entity type chip, every relationship row's target chip, and a community's top-type
- * chips — the one DOM rendering of `constellation-encoding.ts`'s table, so a type never looks
- * different in the dock than it does on canvas (locked decision, restated by this task's brief). */
-function TypeChip({ type }: { type: string }) {
+/** Shared by the entity type chip, every relationship row's target chip, a community's top-type
+ * chips, and (PLNR-442) every Catalogue row — the one DOM rendering of `constellation-encoding.ts`'s
+ * table, so a type never looks different in the dock, the catalogue, or on canvas (locked decision,
+ * restated by this task's brief). */
+export function TypeChip({ type }: { type: string }) {
   const encoding = encodingForType(type);
   return (
     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, fontFamily: 'var(--mono)', fontSize: 8.5, color: `var(${encoding.token})`, whiteSpace: 'nowrap' }}>
