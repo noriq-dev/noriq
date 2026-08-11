@@ -36,8 +36,8 @@ function seededPosition(node: Constellation3DNode): [number, number, number] {
 const add = (a: [number, number, number], b: [number, number, number]): [number, number, number] =>
   [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
 
-/** Deterministic fixed-pass layout. Prior anchors only initialize a compatible client transition;
- * they are never written back to the server or treated as canonical hierarchy coordinates. */
+/** Deterministic fixed-pass layout. Prior entity positions only initialize a compatible client
+ * transition; community anchors remain canonical and stationary, and nothing is written back. */
 export function computeConstellation3DLayout(input: Constellation3DLayoutInput): Constellation3DLayoutResult {
   const nodes = [...input.nodes].sort((a, b) => a.id.localeCompare(b.id));
   const edges = [...input.edges].sort((a, b) => a.id.localeCompare(b.id));
@@ -47,6 +47,12 @@ export function computeConstellation3DLayout(input: Constellation3DLayoutInput):
   for (const node of nodes) {
     const prior = compatiblePrior?.[node.id];
     const source = node.position.every(Number.isFinite) ? node.position : seededPosition(node);
+    if (node.community) {
+      // Community anchors are the stationary centers of their member systems (PLNR-468): neither
+      // a stale warm start nor client forces may detach the core/well/label from its orbiters.
+      positions.set(node.id, [...source]);
+      continue;
+    }
     // Prior coordinates are only a warm start and are pulled toward the generation's own anchor
     // in every pass, preventing a stale local preference from becoming canonical placement.
     positions.set(node.id, prior ? [prior[0] * 0.7 + source[0] * 0.3, prior[1] * 0.7 + source[1] * 0.3, prior[2] * 0.7 + source[2] * 0.3] : [...source]);
@@ -56,6 +62,11 @@ export function computeConstellation3DLayout(input: Constellation3DLayoutInput):
     const deltas = new Map<string, [number, number, number]>();
     const nudge = (id: string, delta: [number, number, number]) => deltas.set(id, add(deltas.get(id) ?? [0, 0, 0], delta));
     for (const edge of edges) {
+      const fromNode = byId.get(edge.fromId), toNode = byId.get(edge.toId);
+      // Aggregate routes normally join two pinned communities; calculating a force that neither
+      // endpoint may consume is wasted work. A future mixed community/entity edge still moves its
+      // entity endpoint below while leaving the community fixed.
+      if (fromNode?.community && toNode?.community) continue;
       const from = positions.get(edge.fromId), to = positions.get(edge.toId);
       if (!from || !to) continue;
       const dx = to[0] - from[0], dy = to[1] - from[1], dz = to[2] - from[2];
@@ -63,17 +74,21 @@ export function computeConstellation3DLayout(input: Constellation3DLayoutInput):
       const desired = edge.aggregate ? 210 : 75;
       const force = Math.max(-18, Math.min(18, (distance - desired) * 0.035 * Math.min(4, Math.max(0.25, edge.weight))));
       const delta: [number, number, number] = [dx / distance * force, dy / distance * force, dz / distance * force];
-      nudge(edge.fromId, delta); nudge(edge.toId, [-delta[0], -delta[1], -delta[2]]);
+      if (!fromNode?.community) nudge(edge.fromId, delta);
+      if (!toNode?.community) nudge(edge.toId, [-delta[0], -delta[1], -delta[2]]);
     }
     for (const node of nodes) {
-      const current = positions.get(node.id)!;
       const anchor = node.position.every(Number.isFinite) ? node.position : seededPosition(node);
-      const pull = node.community ? 0.025 : 0.08;
+      if (node.community) {
+        positions.set(node.id, [...anchor]);
+        continue;
+      }
+      const current = positions.get(node.id)!;
       const delta = deltas.get(node.id) ?? [0, 0, 0];
       let next: [number, number, number] = [
-        current[0] + delta[0] + (anchor[0] - current[0]) * pull,
-        current[1] + delta[1] + (anchor[1] - current[1]) * pull,
-        current[2] + delta[2] + (anchor[2] - current[2]) * pull,
+        current[0] + delta[0] + (anchor[0] - current[0]) * 0.08,
+        current[1] + delta[1] + (anchor[1] - current[1]) * 0.08,
+        current[2] + delta[2] + (anchor[2] - current[2]) * 0.08,
       ];
       if (node.parentId) {
         const parent = byId.get(node.parentId), parentPosition = positions.get(node.parentId);

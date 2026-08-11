@@ -29,6 +29,54 @@ describe('deterministic constellation 3D layout', () => {
     expect(incompatible).toEqual(computeConstellation3DLayout(input));
   });
 
+  it('pins aggregate-linked community cores exactly to their authored anchors', () => {
+    const communities: Constellation3DLayoutInput = {
+      generationId: 'g-route', layoutVersion: 'space-v1',
+      nodes: [
+        { id: 'left', uri: null, label: 'left', type: 'community', position: [-600, 40, 15], degree: 1, community: true, radius: 90 },
+        { id: 'right', uri: null, label: 'right', type: 'community', position: [900, -80, -25], degree: 1, community: true, radius: 90 },
+      ],
+      edges: [{ id: 'aggregate', fromId: 'left', toId: 'right', type: 'related_to', direction: 'forward', weight: 4, aggregate: true }],
+    };
+    const result = computeConstellation3DLayout(communities);
+    expect(result.positions.left).toEqual([-600, 40, 15]);
+    expect(result.positions.right).toEqual([900, -80, -25]);
+  });
+
+  it('keeps a spring-connected member cloud centered on its pinned core', () => {
+    const anchor: [number, number, number] = [120, -70, 30];
+    const cloud: Constellation3DLayoutInput = {
+      generationId: 'g-cloud', layoutVersion: 'space-v1',
+      nodes: [
+        { id: 'core', uri: null, label: 'core', type: 'community', position: anchor, degree: 4, community: true, radius: 100 },
+        { id: 'a', uri: 'noriq://task/a', label: 'a', type: 'task', position: [anchor[0] - 30, anchor[1], anchor[2]], degree: 2, parentId: 'core' },
+        { id: 'b', uri: 'noriq://task/b', label: 'b', type: 'task', position: [anchor[0] + 30, anchor[1], anchor[2]], degree: 2, parentId: 'core' },
+        { id: 'c', uri: 'noriq://task/c', label: 'c', type: 'task', position: [anchor[0], anchor[1] - 30, anchor[2]], degree: 2, parentId: 'core' },
+        { id: 'd', uri: 'noriq://task/d', label: 'd', type: 'task', position: [anchor[0], anchor[1] + 30, anchor[2]], degree: 2, parentId: 'core' },
+      ],
+      edges: [
+        { id: 'ab', fromId: 'a', toId: 'b', type: 'related_to', direction: 'both', weight: 1, aggregate: false },
+        { id: 'cd', fromId: 'c', toId: 'd', type: 'related_to', direction: 'both', weight: 1, aggregate: false },
+      ],
+    };
+    const result = computeConstellation3DLayout(cloud);
+    const members = ['a', 'b', 'c', 'd'].map((id) => result.positions[id]!);
+    const centroid = [0, 1, 2].map((axis) => members.reduce((sum, position) => sum + position[axis]!, 0) / members.length);
+    expect(result.positions.core).toEqual(anchor);
+    expect(Math.hypot(centroid[0]! - anchor[0], centroid[1]! - anchor[1], centroid[2]! - anchor[2])).toBeLessThan(0.001);
+  });
+
+  it('ignores a compatible but stale prior position for a community core', () => {
+    const result = computeConstellation3DLayout({
+      ...input,
+      prior: {
+        generationId: 'older', layoutVersion: 'space-v1',
+        positions: { root: [8_000, -4_000, 2_000] },
+      },
+    });
+    expect(result.positions.root).toEqual([0, 0, 0]);
+  });
+
   it('keeps simultaneous resident systems clustered around their own parent anchors', () => {
     const multi: Constellation3DLayoutInput = {
       ...input,
