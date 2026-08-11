@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type * as Three from 'three';
 import {
-  aggregateRouteWidth, buildConstellation3DRenderPlan, communityIgniteSubtext, communityTooltipContent,
+  aggregateRouteWidth, buildConstellation3DRenderPlan, communityEntitySubtext, communityIgniteSubtext, communityTooltipContent,
   constellation3DColorType, constellation3DIsDimmed, constellation3DNodeEncoding, CONSTELLATION_IGNITE_DIM_OPACITY,
-  isOffPageIncidentEdge, promotedEdgeLabelText, type Constellation3DEdge,
+  isOffPageIncidentEdge, placeConstellation3DLabels, promotedEdgeLabelText, truncateConstellationLabel, type Constellation3DEdge,
   type Constellation3DEdgeSegment, type ConstellationCommunityTooltip, type Constellation3DNode,
-  type Constellation3DNodeInstance, type Constellation3DShape,
+  type Constellation3DNodeInstance, type Constellation3DShape, type Constellation3DLabelPriority,
 } from './constellation-3d-buffers';
 import { encodingForType, resolveConstellationToken } from './constellation-encoding';
 import {
@@ -19,6 +19,12 @@ import {
 } from './constellation-3d-navigation';
 
 const LABEL_BUDGET = 24;
+const COMMUNITY_LABEL_WIDTH_PX = 180;
+const ENTITY_LABEL_WIDTH_PX = 260;
+const PROMOTED_LABEL_WIDTH_PX = 220;
+const COMMUNITY_LABEL_MAX_CHARACTERS = 28;
+const ENTITY_LABEL_MAX_CHARACTERS = 42;
+const PROMOTED_LABEL_MAX_CHARACTERS = 34;
 // Camera controls (PLNR-447, screen spec "Camera controls") — the 30×30 chip is a fixed-dark panel
 // in BOTH themes, same reasoning as ConstellationInspector.tsx / MemoryConstellationV2.tsx's
 // PLNR-443 audit fix (see 2c80d5d): `var(--text*)`/`var(--w-12)` flip to near-black-on-light-text
@@ -92,6 +98,9 @@ interface LabelPosition {
   subtext?: string;
   x: number;
   y: number;
+  width: number;
+  height: number;
+  priority: Constellation3DLabelPriority;
   promoted: boolean;
   /** The pinned node's own title (PLNR-439) — distinct from `promoted` (which styles a promoted
    *  EDGE label amber): the title stays `--text` coloured but grows to the promoted type scale and
@@ -484,7 +493,7 @@ export function MemoryConstellation3D({
 
         const projectLabels = (labelNodes: Constellation3DNodeInstance[], promoted: Constellation3DEdgeSegment[], selection: string | null) => {
           const width = host.clientWidth || 1, height = host.clientHeight || 1;
-          const visible: LabelPosition[] = [];
+          const candidates: LabelPosition[] = [];
           for (const node of labelNodes) {
             const point = new THREE.Vector3(...node.position).project(camera);
             if (point.z < -1 || point.z > 1 || Math.abs(point.x) > 1 || Math.abs(point.y) > 1) continue;
@@ -495,30 +504,33 @@ export function MemoryConstellation3D({
             // level, so the count is the only truthful thing to say about what matched here.
             const igniteCount = searchActive ? igniteMatchCounts?.get(node.id) : undefined;
             const subtext = node.community
-              ? (igniteCount ? communityIgniteSubtext(igniteCount) : `${(node.memberCount ?? 0).toLocaleString()} entities`)
+              ? (igniteCount ? communityIgniteSubtext(igniteCount) : communityEntitySubtext(node.memberCount ?? 0))
               : undefined;
             const pinned = node.id === selection;
             const y = (1 - point.y) * height / 2;
-            // The pin's title renders 40px above the node instead of centred on it (screen spec
-            // 1b) — that offset, together with promoted edge labels sitting at 72% along the edge
-            // rather than the midpoint, is the whole collision-avoidance mechanism: nothing here
-            // computes an overlap check, the two placements are just designed apart.
-            visible.push({
-              key: `node:${node.id}`, text: node.label, subtext, x: (point.x + 1) * width / 2,
-              y: pinned ? y - PINNED_TITLE_OFFSET_PX : y, promoted: false, pinned,
+            candidates.push({
+              key: `node:${node.id}`,
+              text: truncateConstellationLabel(node.label, node.community ? COMMUNITY_LABEL_MAX_CHARACTERS : ENTITY_LABEL_MAX_CHARACTERS),
+              subtext, x: (point.x + 1) * width / 2, y: pinned ? y - PINNED_TITLE_OFFSET_PX : y,
+              width: node.community ? COMMUNITY_LABEL_WIDTH_PX : ENTITY_LABEL_WIDTH_PX,
+              height: node.community ? 30 : 18, priority: pinned ? 'selected' : 'ambient', promoted: false, pinned,
             });
           }
-          for (const edge of promoted.slice(0, Math.max(0, LABEL_BUDGET - visible.length))) {
+          for (const edge of promoted.slice(0, LABEL_BUDGET)) {
             const point = new THREE.Vector3(...midpoint(edge)).project(camera);
             if (point.z < -1 || point.z > 1) continue;
             const otherId = edge.fromId === selection ? edge.toId : edge.fromId;
             const targetLabel = nodeById.get(otherId)?.label ?? '';
-            visible.push({
-              key: `edge:${edge.id}`, text: promotedEdgeLabelText(edge, targetLabel),
-              x: (point.x + 1) * width / 2, y: (1 - point.y) * height / 2, promoted: true,
+            candidates.push({
+              key: `edge:${edge.id}`,
+              text: truncateConstellationLabel(promotedEdgeLabelText(edge, targetLabel), PROMOTED_LABEL_MAX_CHARACTERS),
+              x: (point.x + 1) * width / 2, y: (1 - point.y) * height / 2,
+              width: PROMOTED_LABEL_WIDTH_PX, height: 18, priority: 'promoted', promoted: true,
             });
           }
-          setLabels(visible.slice(0, LABEL_BUDGET));
+          // Projection only runs for scene/selection/resize changes and active camera movement;
+          // this DOM collision pass therefore does no canvas work and never spins while idle.
+          setLabels(placeConstellation3DLabels(candidates, LABEL_BUDGET));
         };
 
         let currentLabels = plan.labels;
@@ -890,7 +902,7 @@ export function MemoryConstellation3D({
         </button>
       </div>
       {labels.map((label) => (
-        <div key={label.key} style={{ position: 'absolute', left: label.x, top: label.y, transform: 'translate(-50%, -50%)', pointerEvents: 'none', textAlign: 'center', textShadow: '0 1px 4px var(--bg)' }}>
+        <div key={label.key} style={{ position: 'absolute', left: label.x, top: label.y, width: label.width, transform: 'translate(-50%, -50%)', pointerEvents: 'none', textAlign: 'center', textShadow: '0 1px 4px var(--bg)' }}>
           <div
             style={{
               fontFamily: 'var(--mono)',
@@ -902,6 +914,7 @@ export function MemoryConstellation3D({
               // The pin's own title stays `--text` (screen spec 1b) — the reticle already carries
               // the amber "this is picked" signal, so the title itself does not need to repeat it.
               color: label.promoted ? 'var(--amber-select)' : label.pinned ? 'var(--text)' : 'var(--text-soft)',
+              whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
             }}
           >
             {label.text}

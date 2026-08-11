@@ -76,6 +76,52 @@ export interface Constellation3DRenderPlan {
   drawCallCeiling: number;
 }
 
+export type Constellation3DLabelPriority = 'ambient' | 'promoted' | 'selected';
+
+export interface Constellation3DLabelCandidate {
+  key: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  priority: Constellation3DLabelPriority;
+}
+
+/** Presentation-only shortening for the DOM labels; callers retain the original graph label. */
+export function truncateConstellationLabel(label: string, maxCharacters: number): string {
+  const characters = Array.from(label);
+  if (characters.length <= maxCharacters) return label;
+  if (maxCharacters <= 0) return '';
+  if (maxCharacters === 1) return '…';
+  return `${characters.slice(0, maxCharacters - 1).join('').trimEnd()}…`;
+}
+
+export function communityEntitySubtext(entityCount: number): string {
+  return `${entityCount.toLocaleString()} ${entityCount === 1 ? 'entity' : 'entities'}`;
+}
+
+/** Greedy screen-space rectangle rejection. Priority tiers are swept first while the caller's
+ * existing order is retained within each tier, so selected/promoted chrome always claims space
+ * before ambient labels without changing the renderer's established degree/community ordering. */
+export function placeConstellation3DLabels<T extends Constellation3DLabelCandidate>(
+  candidates: readonly T[],
+  budget = 24,
+  gap = 6,
+): T[] {
+  const rank: Record<Constellation3DLabelPriority, number> = { ambient: 0, promoted: 1, selected: 2 };
+  const ordered = candidates.map((candidate, index) => ({ candidate, index }))
+    .sort((a, b) => rank[b.candidate.priority] - rank[a.candidate.priority] || a.index - b.index);
+  const placed: T[] = [];
+  for (const { candidate } of ordered) {
+    if (placed.length >= Math.max(0, budget)) break;
+    const overlaps = placed.some((other) =>
+      Math.abs(candidate.x - other.x) < (candidate.width + other.width) / 2 + gap
+      && Math.abs(candidate.y - other.y) < (candidate.height + other.height) / 2 + gap);
+    if (!overlaps) placed.push(candidate);
+  }
+  return placed;
+}
+
 // Shape/scale-multiplier both come from the shared type encoding table (PLNR-437) — this module
 // no longer owns type→shape grouping itself, it just applies the table's per-node consequences
 // (community aggregates are the one case the table doesn't cover: shape stays `sphere` regardless

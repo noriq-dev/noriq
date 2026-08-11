@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
-  aggregateRouteWidth, buildConstellation3DRenderPlan, communityIgniteSubtext, communityTooltipContent,
+  aggregateRouteWidth, buildConstellation3DRenderPlan, communityEntitySubtext, communityIgniteSubtext, communityTooltipContent,
   constellation3DColorType, constellation3DIsDimmed, constellation3DNodeEncoding, CONSTELLATION_IGNITE_DIM_OPACITY,
-  dominantCommunityType, isOffPageIncidentEdge, promotedEdgeLabelText,
-  type Constellation3DEdge, type Constellation3DNode,
+  dominantCommunityType, isOffPageIncidentEdge, placeConstellation3DLabels, promotedEdgeLabelText, truncateConstellationLabel,
+  type Constellation3DEdge, type Constellation3DLabelCandidate, type Constellation3DNode,
 } from './constellation-3d-buffers';
 
 const node = (id: string, type = 'task', overrides: Partial<Constellation3DNode> = {}): Constellation3DNode => ({
@@ -78,6 +78,49 @@ describe('constellation 3D buffer planning', () => {
     const edges: Constellation3DEdge[] = [{ id: 'r', fromId: 'a', toId: 'b', type: 'related_to', direction: 'forward', weight: 5, aggregate: true }];
     const plan = buildConstellation3DRenderPlan(nodes, edges, null);
     expect(plan.baseEdges[0]!.width).toBe(1.6);
+  });
+});
+
+describe('constellation 3D DOM label placement (PLNR-454)', () => {
+  const overlaps = (a: Constellation3DLabelCandidate, b: Constellation3DLabelCandidate, gap: number) =>
+    Math.abs(a.x - b.x) < (a.width + b.width) / 2 + gap
+    && Math.abs(a.y - b.y) < (a.height + b.height) / 2 + gap;
+
+  it('greedily culls a 30-label cluster without overlap, deterministically preserving selected/promoted priority', () => {
+    const ambient: Constellation3DLabelCandidate[] = Array.from({ length: 30 }, (_, index) => ({
+      key: `ambient-${index}`, x: 100 + (index % 6) * 20, y: 100 + Math.floor(index / 6) * 14,
+      width: 50, height: 18, priority: 'ambient',
+    }));
+    // Deliberately appended after the ambient candidates and placed directly on ambient-0/-29:
+    // priority, not input position, must decide which label owns each rectangle.
+    const candidates: Constellation3DLabelCandidate[] = [
+      ...ambient,
+      { key: 'selected', x: ambient[0]!.x, y: ambient[0]!.y, width: 50, height: 18, priority: 'selected' },
+      { key: 'promoted', x: ambient[29]!.x, y: ambient[29]!.y, width: 50, height: 18, priority: 'promoted' },
+    ];
+    const placed = placeConstellation3DLabels(candidates, 24, 4);
+    const keys = placed.map(({ key }) => key);
+    expect(keys).toEqual(placeConstellation3DLabels(candidates, 24, 4).map(({ key }) => key));
+    expect(keys.slice(0, 2)).toEqual(['selected', 'promoted']);
+    expect(keys).not.toContain('ambient-0');
+    expect(keys).not.toContain('ambient-29');
+    for (let i = 0; i < placed.length; i += 1) {
+      for (let j = i + 1; j < placed.length; j += 1) expect(overlaps(placed[i]!, placed[j]!, 4)).toBe(false);
+    }
+  });
+
+  it('truncates presentation text with an ellipsis without changing labels already within the designed width', () => {
+    const full = 'This raw memory statement is intentionally sentence-length';
+    expect(truncateConstellationLabel(full, 24)).toBe('This raw memory stateme…');
+    expect(full).toBe('This raw memory statement is intentionally sentence-length');
+    expect(truncateConstellationLabel('Coordination core', 24)).toBe('Coordination core');
+  });
+
+  it('pluralizes the community entity count', () => {
+    expect(communityEntitySubtext(0)).toBe('0 entities');
+    expect(communityEntitySubtext(1)).toBe('1 entity');
+    expect(communityEntitySubtext(2)).toBe('2 entities');
+    expect(communityEntitySubtext(1234)).toBe('1,234 entities');
   });
 });
 
