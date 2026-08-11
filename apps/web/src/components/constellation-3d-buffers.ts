@@ -85,6 +85,10 @@ export interface Constellation3DLabelCandidate {
   width: number;
   height: number;
   priority: Constellation3DLabelPriority;
+  /** Communities claim same-tier label space before entities; their population then supplies the
+   * total-order-independent importance signal for the collision sweep (PLNR-457). */
+  community?: boolean;
+  memberCount?: number;
 }
 
 /** Presentation-only shortening for the DOM labels; callers retain the original graph label. */
@@ -100,9 +104,9 @@ export function communityEntitySubtext(entityCount: number): string {
   return `${entityCount.toLocaleString()} ${entityCount === 1 ? 'entity' : 'entities'}`;
 }
 
-/** Greedy screen-space rectangle rejection. Priority tiers are swept first while the caller's
- * existing order is retained within each tier, so selected/promoted chrome always claims space
- * before ambient labels without changing the renderer's established degree/community ordering. */
+/** Greedy screen-space rectangle rejection. Priority tiers are swept first; inside a tier,
+ * populous communities claim space before smaller communities and entities so insertion order
+ * cannot hide the root systems that carry most of the graph (PLNR-457). */
 export function placeConstellation3DLabels<T extends Constellation3DLabelCandidate>(
   candidates: readonly T[],
   budget = 24,
@@ -110,7 +114,12 @@ export function placeConstellation3DLabels<T extends Constellation3DLabelCandida
 ): T[] {
   const rank: Record<Constellation3DLabelPriority, number> = { ambient: 0, promoted: 1, selected: 2 };
   const ordered = candidates.map((candidate, index) => ({ candidate, index }))
-    .sort((a, b) => rank[b.candidate.priority] - rank[a.candidate.priority] || a.index - b.index);
+    .sort((a, b) => rank[b.candidate.priority] - rank[a.candidate.priority]
+      || Number(Boolean(b.candidate.community)) - Number(Boolean(a.candidate.community))
+      || (b.candidate.community && a.candidate.community
+        ? (b.candidate.memberCount ?? 0) - (a.candidate.memberCount ?? 0)
+        : 0)
+      || a.index - b.index);
   const placed: T[] = [];
   for (const { candidate } of ordered) {
     if (placed.length >= Math.max(0, budget)) break;
@@ -177,16 +186,16 @@ export function communityTooltipContent(node: Constellation3DNode, maxTypeRows =
   };
 }
 
-/** Aggregate route thickness maps to boundary weight (PLNR-438 locked decision, PLNR-379). Mirrors
- * the screen spec's 0.8–2.4 stroke-width range, min/max-normalized against whatever aggregate
+/** Aggregate route thickness maps to boundary weight (PLNR-438 locked decision, PLNR-457). Uses a
+ * 2–6 world-unit tube-radius range, min/max-normalized against whatever aggregate
  * weights are actually present in the current plan — a scene with one boundary weight gets the
  * range's midpoint rather than a divide-by-zero. The renderer applies this as an instanced tube
  * RADIUS (not a `LineBasicMaterial.linewidth`, which most browsers silently clamp to 1px) — see
  * MemoryConstellation3D.tsx's `renderEdges`. */
 export function aggregateRouteWidth(weight: number, minWeight: number, maxWeight: number): number {
-  if (!Number.isFinite(weight) || maxWeight <= minWeight) return 1.6;
+  if (!Number.isFinite(weight) || maxWeight <= minWeight) return 4;
   const t = Math.max(0, Math.min(1, (weight - minWeight) / (maxWeight - minWeight)));
-  return 0.8 + t * 1.6;
+  return 2 + t * 4;
 }
 
 /** True when a promoted (selected-incident) edge's "other" endpoint is a community standing in
@@ -215,8 +224,10 @@ export function promotedEdgeLabelText(edge: Constellation3DEdge, targetLabel: st
 }
 
 // ---------------------------------------------------------------------------------------------
-// Search ignite (PLNR-441, screen spec 1c). The PLNR-439 draw-call-ceiling finding — a realistic
-// pinned-selection scene already sits at exactly 14, the PLNR-371 ceiling, with zero headroom —
+// Search ignite (PLNR-441, screen spec 1c). PLNR-461 deliberately spends one call on the shared
+// starfield and three more on root-only orbit guides: the root overview rises from 6 to 10 calls,
+// while the realistic non-root pinned-selection ceiling rises from 14 to 15 (18 at root).
+// Ignite itself still has zero headroom —
 // means ignite cannot afford a single new draw call: it has to ride the instanced buckets that
 // already exist rather than add its own. Two consequences, both load-bearing:
 //   (1) The unmatched field's dim is the SAME "faded"/"unfaded" material bucket every node mesh
@@ -227,15 +238,58 @@ export function promotedEdgeLabelText(edge: Constellation3DEdge, targetLabel: st
 //       that same boost after their visibility floor, so a flared well still grows with its core
 //       for free, with no separate well-opacity bucket to split.
 // This is why the combined pinned-selection + ignite measurement in
-// constellation-3d-buffers.test.ts stays at 14, not higher: ignite spends zero new draw calls.
+// constellation-3d-buffers.test.ts stays at its ambience-inclusive 15: ignite adds zero calls.
 export const CONSTELLATION_IGNITE_DIM_OPACITY = 0.32;
-// A fixed world-space floor keeps sparse root communities legible after a wide fit-to-content
-// frame without making well size camera-dependent. Connectivity remains encoded by `scale`; only
-// the well footprint clamps, and communities above this threshold pass through unchanged.
-export const CONSTELLATION_COMMUNITY_WELL_SCALE_FLOOR = 16;
+// Wells are the population-presence channel, distinct from the core's honest connectivity scale:
+// cube-root growth keeps the 216-member bucket dominant without erasing an 8-member plan system.
+export const CONSTELLATION_COMMUNITY_WELL_SCALE_FLOOR = 44;
+export const CONSTELLATION_COMMUNITY_WELL_SCALE_CAP = 140;
 
-export function constellation3DCommunityWellScale(node: Pick<Constellation3DNodeInstance, 'community' | 'scale'>): number {
-  return node.community ? Math.max(CONSTELLATION_COMMUNITY_WELL_SCALE_FLOOR, node.scale) : node.scale;
+export function constellation3DCommunityWellScale(
+  node: Pick<Constellation3DNodeInstance, 'community' | 'memberCount' | 'scale'>,
+): number {
+  if (!node.community) return node.scale;
+  const population = Number.isFinite(node.memberCount) ? Math.max(0, node.memberCount ?? 0) : 0;
+  return Math.min(
+    CONSTELLATION_COMMUNITY_WELL_SCALE_CAP,
+    Math.max(CONSTELLATION_COMMUNITY_WELL_SCALE_FLOOR, 24 + 17 * Math.cbrt(population)),
+  );
+}
+
+/** Root pages contain only real top-level communities. Exact `null` avoids mistaking older test
+ * fixtures or an entered page's children for the overview that earns the four ambience calls. */
+export function constellation3DIsRootScene(nodes: readonly Constellation3DNode[]): boolean {
+  const resident = nodes.filter((node) => !node.offPageStandIn);
+  return resident.length > 0 && resident.every((node) => node.community === true && node.parentId === null);
+}
+
+function deterministicUnit(seed: string): number {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < seed.length; index += 1) {
+    hash ^= seed.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0) / 0x1_0000_0000;
+}
+
+/** Normalized deterministic shell positions for the single-draw-call starfield. The caller
+ * applies scene radius and centroid; no render-time randomness can make screenshots or rerenders
+ * drift (PLNR-461). */
+export function constellation3DStarPositions(seed: string, count = 360): Float32Array {
+  const total = Math.max(0, Math.floor(count));
+  const positions = new Float32Array(total * 3);
+  for (let index = 0; index < total; index += 1) {
+    const azimuth = deterministicUnit(`a:${seed}:${index}`) * Math.PI * 2;
+    const z = deterministicUnit(`z:${seed}:${index}`) * 2 - 1;
+    const planar = Math.sqrt(Math.max(0, 1 - z * z));
+    const radius = 0.72 + deterministicUnit(`r:${seed}:${index}`) * 0.28;
+    positions.set([
+      Math.cos(azimuth) * planar * radius,
+      z * radius,
+      Math.sin(azimuth) * planar * radius,
+    ], index * 3);
+  }
+  return positions;
 }
 
 /** Whether a node instance renders in the dimmed material bucket. Outside search, this is the
@@ -354,6 +408,7 @@ export function buildConstellation3DRenderPlan(
   // selection-independent) is the wrong signal for THIS term: it would allot a tube draw call for
   // an aggregate edge that got promoted away from the base pass and so never actually fires one.
   const hasAggregateRouteTube = baseEdges.some((edge) => edge.aggregate);
+  const ambienceDrawCalls = 1 + (constellation3DIsRootScene(nodes) ? 3 : 0);
   const drawCallCeiling = nodeGroups.size * 2
     + (nodes.some((node) => node.isLead) ? 1 : 0)
     // PLNR-448: a plan whose only community node is an off-page stand-in no longer builds the
@@ -366,6 +421,7 @@ export function buildConstellation3DRenderPlan(
     + (hasCurrentPromoted ? 1 : 0)
     + (hasHistoricalPromoted ? 1 : 0)
     + (hasOffPagePromoted ? 2 : 0) // dashed route line + instanced terminus-glyph mesh
-    + (hasDirectionMarkers ? 1 : 0);
+    + (hasDirectionMarkers ? 1 : 0)
+    + ambienceDrawCalls; // one Points cloud everywhere + three root-only LineLoops (PLNR-461)
   return { nodeGroups, baseEdges, promotedEdges, labels, nodeCount: byId.size, drawCallCeiling };
 }

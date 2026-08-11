@@ -21,15 +21,28 @@ describe('constellation 3D navigation and preferences', () => {
     expect(loadConstellation3DPreferences('p1', 'space-v1', wrongLayout).expandedCommunityIds).toEqual([]);
   });
 
-  it('centres resident bounds and places the padded bounding radius inside the limiting FOV', () => {
+  it('centres resident bounds and fits their rendered footprints in the actual camera axes', () => {
     const camera = fitConstellationCamera([
       { position: [-100, -20, 30], radius: 10 },
       { position: [100, 20, -30], radius: 10 },
     ], { aspect: 1, padding: 1.2 });
     expect(camera.target).toEqual([0, 0, 0]);
-    const boundingRadius = Math.hypot(100, 20, 30) + 10;
-    expect(camera.distance).toBeGreaterThanOrEqual(boundingRadius * 1.2 / Math.sin(24 * Math.PI / 180));
+    expect(camera.distance).toBeGreaterThan(250);
     expect(camera).toMatchObject({ yaw: DEFAULT_CONSTELLATION_3D_CAMERA.yaw, pitch: DEFAULT_CONSTELLATION_3D_CAMERA.pitch });
+  });
+
+  it('uses the landscape horizontal FOV for a wide flat root instead of shrinking it with a bounding sphere', () => {
+    const camera = fitConstellationCamera([
+      { position: [-1_000, 0, 0], radius: 100 },
+      { position: [1_000, 0, 0], radius: 100 },
+    ], { aspect: 1440 / 790 });
+    const verticalHalfFov = 24 * Math.PI / 180;
+    const horizontalHalfFov = Math.atan(Math.tan(verticalHalfFov) * 1440 / 790);
+    const anchorWidthOccupancy = 1_000 / (camera.distance * Math.tan(horizontalHalfFov));
+    expect(anchorWidthOccupancy).toBeGreaterThan(0.79);
+    expect(anchorWidthOccupancy).toBeLessThan(0.82);
+    // The ±100-unit footprints, not just their centres, remain inside the padded frame.
+    expect(1_100 / (camera.distance * Math.tan(horizontalHalfFov))).toBeLessThan(1);
   });
 
   it('returns safe cameras for single-node and empty scenes', () => {

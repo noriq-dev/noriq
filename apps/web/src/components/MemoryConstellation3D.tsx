@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type * as Three from 'three';
 import {
-  aggregateRouteWidth, buildConstellation3DRenderPlan, communityEntitySubtext, communityIgniteSubtext, communityTooltipContent,
-  constellation3DColorType, constellation3DCommunityWellScale, constellation3DIsDimmed, constellation3DNodeEncoding, CONSTELLATION_IGNITE_DIM_OPACITY,
+  buildConstellation3DRenderPlan, communityEntitySubtext, communityIgniteSubtext, communityTooltipContent,
+  constellation3DColorType, constellation3DCommunityWellScale, constellation3DIsDimmed, constellation3DIsRootScene,
+  constellation3DNodeEncoding, constellation3DStarPositions, CONSTELLATION_IGNITE_DIM_OPACITY,
   isOffPageIncidentEdge, placeConstellation3DLabels, promotedEdgeLabelText, truncateConstellationLabel, type Constellation3DEdge,
   type Constellation3DEdgeSegment, type ConstellationCommunityTooltip, type Constellation3DNode,
   type Constellation3DNodeInstance, type Constellation3DShape, type Constellation3DLabelPriority,
@@ -39,12 +40,13 @@ const CAMERA_CTRL_STYLE: React.CSSProperties = {
   width: 30, height: 30, borderRadius: 7, background: CAMERA_CTRL_BG, border: `1px solid ${CAMERA_CTRL_BORDER}`,
   display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, lineHeight: 1,
 };
-// Layered radial falloff (PLNR-438): outer well at 10% opacity, mid at 22%, both tinted by the
-// community's dominant type. Above the sparse-community visibility floor they remain fixed ratios
-// of the connectivity-derived core scale; below it only the translucent well footprint clamps.
-const COMMUNITY_WELL_MID_RATIO = 1.6;
-const COMMUNITY_WELL_OUTER_RATIO = 2.4;
+// Population-sized layered falloff (PLNR-457/461): the core keeps connectivity honest while these
+// broad, low-alpha shells supply community presence. Dark mode can add light; light mode must only
+// tint, hence the per-theme blending choice at material construction below.
+const COMMUNITY_WELL_MID_RATIO = 1.75;
+const COMMUNITY_WELL_OUTER_RATIO = 3;
 const FIT_ENTITY_FOOTPRINT_RATIO = 1.9;
+const CONSTELLATION_STAR_COUNT = 360;
 // Selection reticle (PLNR-439, screen spec 1b "the pin") — every radius is a ratio of the
 // selected node's own connectivity-derived scale, the same pattern PLNR-438 established for the
 // community wells and hover ring, so the reticle grows/shrinks with whatever it is pinned to
@@ -100,6 +102,8 @@ interface LabelPosition {
   width: number;
   height: number;
   priority: Constellation3DLabelPriority;
+  community?: boolean;
+  memberCount?: number;
   promoted: boolean;
   /** The pinned node's own title (PLNR-439) — distinct from `promoted` (which styles a promoted
    *  EDGE label amber): the title stays `--text` coloured but grows to the promoted type scale and
@@ -120,9 +124,9 @@ interface RendererState {
   scene: Three.Scene;
   camera: Three.PerspectiveCamera;
   nodeMeshes: Three.InstancedMesh[];
-  // Non-interactive: community gravity-well falloff layers + the hover ring. Disposed alongside
-  // nodeMeshes but never raycast against — intersecting a giant 10%-opacity outer well would steal
-  // clicks from whatever it visually surrounds.
+  // Non-interactive: gravity wells, starfield, root orbit guides, and hover/selection chrome.
+  // Disposed alongside nodeMeshes but never raycast against — a giant translucent well must not
+  // steal clicks from whatever it visually surrounds.
   decorativeMeshes: Three.Object3D[];
   edgeObjects: Three.Object3D[];
   nodeById: Map<string, Constellation3DNodeInstance>;
@@ -227,6 +231,38 @@ function reticleTickGeometry(THREE: typeof Three, innerRadius: number, outerRadi
   axes.forEach(([dx, dy], index) => {
     positions.set([dx * innerRadius, dy * innerRadius, 0, dx * outerRadius, dy * outerRadius, 0], index * 6);
   });
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  return geometry;
+}
+
+function ambienceFrame(nodes: readonly Constellation3DNodeInstance[]): {
+  center: [number, number, number];
+  radius: number;
+} {
+  if (nodes.length === 0) return { center: [0, 0, 0], radius: 900 };
+  const minimum: [number, number, number] = [Infinity, Infinity, Infinity];
+  const maximum: [number, number, number] = [-Infinity, -Infinity, -Infinity];
+  for (const node of nodes) {
+    for (let axis = 0; axis < 3; axis += 1) {
+      minimum[axis] = Math.min(minimum[axis]!, node.position[axis]!);
+      maximum[axis] = Math.max(maximum[axis]!, node.position[axis]!);
+    }
+  }
+  const center = minimum.map((value, axis) => (value + maximum[axis]!) / 2) as [number, number, number];
+  const radius = nodes.reduce((largest, node) => Math.max(largest, Math.hypot(
+    node.position[0] - center[0], node.position[1] - center[1], node.position[2] - center[2],
+  )), 0);
+  return { center, radius: Math.max(500, radius) };
+}
+
+function orbitGuideGeometry(THREE: typeof Three, radius: number, flattening: number): Three.BufferGeometry {
+  const segments = 128;
+  const positions = new Float32Array(segments * 3);
+  for (let index = 0; index < segments; index += 1) {
+    const angle = index / segments * Math.PI * 2;
+    positions.set([Math.cos(angle) * radius, 0, Math.sin(angle) * radius * flattening], index * 3);
+  }
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   return geometry;
@@ -369,6 +405,58 @@ export function MemoryConstellation3D({
           return cached;
         };
 
+        // Galaxy ambience (PLNR-461): one deterministic Points draw everywhere, plus exactly three
+        // root-only LineLoops. All four are scene geometry (never DOM/sprites), never enter the
+        // node raycast list, and resolve their neutral tint from the live theme token cascade.
+        const residentNodes = [...nodeById.values()].filter((node) => !node.offPageStandIn);
+        const ambience = ambienceFrame(residentNodes);
+        const ambienceTint = new THREE.Color(resolveConstellationToken('--text-faint'));
+        const starGeometry = new THREE.BufferGeometry();
+        starGeometry.setAttribute('position', new THREE.BufferAttribute(
+          constellation3DStarPositions(`${generationId}:${layoutVersion}`, CONSTELLATION_STAR_COUNT), 3,
+        ));
+        starGeometry.computeBoundingSphere();
+        const stars = new THREE.Points(
+          starGeometry,
+          new THREE.PointsMaterial({
+            color: ambienceTint,
+            transparent: true,
+            opacity: theme === 'dark' ? 0.3 : 0.1,
+            size: theme === 'dark' ? 1.7 : 1.25,
+            sizeAttenuation: false,
+            depthWrite: false,
+          }),
+        );
+        stars.position.set(...ambience.center);
+        stars.scale.setScalar(ambience.radius * 2.6);
+        stars.renderOrder = -6;
+        stars.raycast = () => undefined;
+        scene.add(stars);
+        decorativeMeshes.push(stars);
+
+        if (constellation3DIsRootScene(layoutNodes)) {
+          const guideRatios = [0.46, 0.72, 1.02] as const;
+          guideRatios.forEach((ratio, index) => {
+            const guide = new THREE.LineLoop(
+              orbitGuideGeometry(THREE, ambience.radius * ratio, 0.72 + index * 0.08),
+              new THREE.LineDashedMaterial({
+                color: ambienceTint,
+                transparent: true,
+                opacity: theme === 'dark' ? 0.1 : 0.055,
+                dashSize: 22 + index * 4,
+                gapSize: 18 + index * 5,
+                depthWrite: false,
+              }),
+            );
+            guide.computeLineDistances();
+            guide.position.set(...ambience.center);
+            guide.renderOrder = -5;
+            guide.raycast = () => undefined;
+            scene.add(guide);
+            decorativeMeshes.push(guide);
+          });
+        }
+
         for (const [shape, instances] of plan.nodeGroups) {
           for (const faded of [false, true]) {
             // Same two buckets as before PLNR-441 — search only changes which predicate decides
@@ -418,11 +506,11 @@ export function MemoryConstellation3D({
           nodeMeshes.push(halo);
         }
 
-        // Community gravity wells (PLNR-438): two extra low-opacity layers per community, sized as
-        // a fixed ratio of connectivity scale above the visibility floor. The standard node pass
-        // remains the third, innermost layer and retains its unmodified connectivity encoding, so
-        // this still adds exactly two draw calls total (not two per community). depthWrite is off
-        // so the layers blend into the well rather than occluding whatever sits behind them.
+        // Community gravity wells (PLNR-457/461): two population-sized low-opacity layers per
+        // community. The standard core pass remains the third, innermost layer and retains its
+        // unmodified connectivity encoding, so this still adds exactly two calls total (not two
+        // per community). Dark mode adds the tint as light; normal blending avoids bleaching the
+        // light canvas. depthWrite stays off so the falloff never occludes its own surroundings.
         // PLNR-448: excludes off-page stand-ins — a stand-in gets its own dedicated terminus glyph
         // (the offPagePromotedEdges pass below), never the full gravity-well/core-sphere treatment
         // the PLNR-379 honesty rule reserves for a genuinely resident community.
@@ -431,12 +519,22 @@ export function MemoryConstellation3D({
           // Geometry vertex colors have no attribute here and would multiply instance tints into black.
           const outer = new THREE.InstancedMesh(
             new THREE.SphereGeometry(1, 12, 8),
-            new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.1, depthWrite: false }),
+            new THREE.MeshBasicMaterial({
+              transparent: true,
+              opacity: theme === 'dark' ? 0.055 : 0.022,
+              depthWrite: false,
+              blending: theme === 'dark' ? THREE.AdditiveBlending : THREE.NormalBlending,
+            }),
             communityNodes.length,
           );
           const mid = new THREE.InstancedMesh(
             new THREE.SphereGeometry(1, 12, 8),
-            new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.22, depthWrite: false }),
+            new THREE.MeshBasicMaterial({
+              transparent: true,
+              opacity: theme === 'dark' ? 0.14 : 0.065,
+              depthWrite: false,
+              blending: theme === 'dark' ? THREE.AdditiveBlending : THREE.NormalBlending,
+            }),
             communityNodes.length,
           );
           outer.renderOrder = -2;
@@ -446,8 +544,8 @@ export function MemoryConstellation3D({
             // Ignite flare rides the SAME highlighted-scale boost the core sphere pass below already
             // applies (PLNR-441) rather than a second, well-specific opacity bucket — a matched
             // community's well grows with its core for zero extra draw calls (see the ignite-budget
-            // comment in constellation-3d-buffers.ts: a realistic pinned-selection scene is already
-            // at the 14-call ceiling with no headroom for a new pass).
+            // comment in constellation-3d-buffers.ts: ambience raises the measured ceiling, but
+            // ignite itself still has no call available for a new well-specific pass).
             const boost = node.highlighted ? 1.3 : 1;
             const wellScale = constellation3DCommunityWellScale(node);
             const outerScale = wellScale * boost * COMMUNITY_WELL_OUTER_RATIO;
@@ -560,7 +658,8 @@ export function MemoryConstellation3D({
               text: truncateConstellationLabel(node.label, node.community ? COMMUNITY_LABEL_MAX_CHARACTERS : ENTITY_LABEL_MAX_CHARACTERS),
               subtext, x: (point.x + 1) * width / 2, y: pinned ? y - PINNED_TITLE_OFFSET_PX : y,
               width: node.community ? COMMUNITY_LABEL_WIDTH_PX : ENTITY_LABEL_WIDTH_PX,
-              height: node.community ? 30 : 18, priority: pinned ? 'selected' : 'ambient', promoted: false, pinned,
+              height: node.community ? 30 : 18, priority: pinned ? 'selected' : 'ambient',
+              community: node.community, memberCount: node.memberCount, promoted: false, pinned,
             });
           }
           for (const edge of promoted.slice(0, LABEL_BUDGET)) {
@@ -599,7 +698,8 @@ export function MemoryConstellation3D({
         };
         const setHover = (node: Constellation3DNodeInstance | null) => {
           if (!node) { if (hoverRing.visible) { hoverRing.visible = false; render(); } return; }
-          const ringScale = node.scale * COMMUNITY_WELL_OUTER_RATIO * 1.08;
+          const ringScale = (node.community ? constellation3DCommunityWellScale(node) : node.scale)
+            * COMMUNITY_WELL_OUTER_RATIO * 1.08;
           hoverRing.position.set(...node.position);
           hoverRing.scale.setScalar(ringScale);
           hoverRing.visible = true;
@@ -636,11 +736,14 @@ export function MemoryConstellation3D({
           const base = lineObject(THREE, rawBaseEdges, theme === 'dark' ? 0x7790aa : 0x506070, selection ? 0.1 : searchActive ? CONSTELLATION_IGNITE_DIM_OPACITY : 0.38, 0);
           if (base) { scene.add(base); edgeObjects.push(base); }
           if (aggregateBaseEdges.length > 0) {
-            const weights = aggregateBaseEdges.map((edge) => edge.weight);
-            const minWeight = Math.min(...weights), maxWeight = Math.max(...weights);
             const routes = new THREE.InstancedMesh(
               new THREE.CylinderGeometry(1, 1, 1, 5, 1, true),
-              new THREE.MeshBasicMaterial({ color: theme === 'dark' ? 0x7790aa : 0x506070, transparent: true, opacity: selection ? 0.12 : searchActive ? CONSTELLATION_IGNITE_DIM_OPACITY : 0.32, depthWrite: false }),
+              new THREE.MeshBasicMaterial({
+                color: theme === 'dark' ? 0x7790aa : 0x506070,
+                transparent: true,
+                opacity: selection ? 0.12 : searchActive ? CONSTELLATION_IGNITE_DIM_OPACITY : theme === 'dark' ? 0.58 : 0.48,
+                depthWrite: false,
+              }),
               aggregateBaseEdges.length,
             );
             routes.renderOrder = 1;
@@ -651,7 +754,9 @@ export function MemoryConstellation3D({
               const length = Math.max(0.01, from.distanceTo(to));
               const direction = to.clone().sub(from).normalize();
               const quaternion = new THREE.Quaternion().setFromUnitVectors(up, direction);
-              const radius = aggregateRouteWidth(edge.weight, minWeight, maxWeight) * 0.5;
+              // The plan normalized this against every aggregate edge before selection split, so
+              // using its width keeps surviving root routes from rescaling when one is promoted.
+              const radius = edge.width;
               matrix.compose(mid, quaternion, new THREE.Vector3(radius, length, radius));
               routes.setMatrixAt(index, matrix);
             });
@@ -799,7 +904,7 @@ export function MemoryConstellation3D({
     // searchActive/igniteMatchCounts join highlightedNodeIds here for the same reason that field
     // already triggers a rebuild: ignite changes which material bucket nodes/wells/routes land in
     // and what a community's label subtext says, all baked in at scene-build time, not per-frame.
-  }, [layoutNodes, edges, highlightedNodeIds, searchActive, igniteMatchCounts, theme, onRendererFailure]);
+  }, [layoutNodes, edges, highlightedNodeIds, searchActive, igniteMatchCounts, theme, generationId, layoutVersion, onRendererFailure]);
 
   useEffect(() => { rendererRef.current?.renderEdges(selectedNodeId); }, [selectedNodeId]);
   useEffect(() => { rendererRef.current?.applyCamera(cameraState); }, [cameraState]);

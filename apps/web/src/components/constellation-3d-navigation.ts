@@ -30,7 +30,7 @@ export interface CameraTransition {
 
 export const DEFAULT_CONSTELLATION_3D_CAMERA: Constellation3DCamera = { target: [0, 0, 0], yaw: 0, pitch: 0.2, distance: 900 };
 export const CONSTELLATION_3D_VERTICAL_FOV_DEGREES = 48;
-export const CONSTELLATION_3D_FIT_PADDING = 1.18;
+export const CONSTELLATION_3D_FIT_PADDING = 1.06;
 
 export interface Constellation3DFitItem {
   position: [number, number, number];
@@ -50,9 +50,10 @@ export interface Constellation3DFitOptions {
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 
-/** Frames a bounding sphere around the resident rendered footprints. The sphere makes the result
- * independent of the default orbit angle; the smaller of the vertical and horizontal perspective
- * half-FOVs determines the tangent distance, with explicit padding outside the content radius. */
+/** Frames every resident footprint in the actual camera basis. A bounding-sphere fit makes a wide,
+ * flat anchor cloud pay its horizontal radius against the much narrower vertical FOV, wasting the
+ * sides of a landscape viewport; per-axis perspective constraints keep the padded wells in frame
+ * while allowing the anchor spread itself to occupy roughly 80% of a 1440×790 view (PLNR-457). */
 export function fitConstellationCamera(
   items: readonly Constellation3DFitItem[],
   options: Constellation3DFitOptions = {},
@@ -77,12 +78,6 @@ export function fitConstellationCamera(
     }
   }
   const target = minimum.map((value, axis) => (value + maximum[axis]!) / 2) as [number, number, number];
-  const radius = valid.reduce((largest, item) => Math.max(
-    largest,
-    Math.hypot(
-      item.position[0] - target[0], item.position[1] - target[1], item.position[2] - target[2],
-    ) + item.extent,
-  ), 0);
   const verticalHalfFov = clamp(
     (Number.isFinite(options.verticalFovDegrees) ? options.verticalFovDegrees! : CONSTELLATION_3D_VERTICAL_FOV_DEGREES) * Math.PI / 360,
     Math.PI / 180,
@@ -90,11 +85,33 @@ export function fitConstellationCamera(
   );
   const aspect = Number.isFinite(options.aspect) && options.aspect! > 0 ? options.aspect! : 1;
   const horizontalHalfFov = Math.atan(Math.tan(verticalHalfFov) * aspect);
-  const limitingHalfFov = Math.min(verticalHalfFov, horizontalHalfFov);
   const padding = Number.isFinite(options.padding) ? Math.max(1, options.padding!) : CONSTELLATION_3D_FIT_PADDING;
   const minDistance = Number.isFinite(options.minDistance) ? Math.max(0, options.minDistance!) : 60;
   const maxDistance = Number.isFinite(options.maxDistance) ? Math.max(minDistance, options.maxDistance!) : 12_000;
-  const distance = clamp(radius * padding / Math.sin(limitingHalfFov), minDistance, maxDistance);
+  const backward: [number, number, number] = [
+    Math.sin(base.yaw) * Math.cos(base.pitch),
+    Math.sin(base.pitch),
+    Math.cos(base.yaw) * Math.cos(base.pitch),
+  ];
+  const right: [number, number, number] = [Math.cos(base.yaw), 0, -Math.sin(base.yaw)];
+  const up: [number, number, number] = [
+    -Math.sin(base.yaw) * Math.sin(base.pitch),
+    Math.cos(base.pitch),
+    -Math.cos(base.yaw) * Math.sin(base.pitch),
+  ];
+  const dot = (vector: readonly number[], basis: readonly number[]) =>
+    vector[0]! * basis[0]! + vector[1]! * basis[1]! + vector[2]! * basis[2]!;
+  const distance = clamp(valid.reduce((required, item) => {
+    const relative = item.position.map((value, axis) => value - target[axis]!) as [number, number, number];
+    const towardCamera = dot(relative, backward) + item.extent;
+    const horizontal = Math.abs(dot(relative, right)) + item.extent;
+    const vertical = Math.abs(dot(relative, up)) + item.extent;
+    return Math.max(
+      required,
+      towardCamera + horizontal * padding / Math.tan(horizontalHalfFov),
+      towardCamera + vertical * padding / Math.tan(verticalHalfFov),
+    );
+  }, 0), minDistance, maxDistance);
   return { target, yaw: base.yaw, pitch: base.pitch, distance };
 }
 
