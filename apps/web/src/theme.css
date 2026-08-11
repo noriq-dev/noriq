@@ -112,6 +112,11 @@ button { all: unset; box-sizing: border-box; max-width: 100%; }
 .event-row:hover { background: var(--w-03); border-left-color: rgba(198, 242, 78, 0.5) !important; }
 .rail-add:hover { color: var(--text); border-color: var(--w-18) !important; }
 .drawer-x:hover { background: var(--w-08); color: var(--text); }
+/* `button { all: unset }` above strips the native focus ring app-wide, so icon-only buttons that
+   need their own visible keyboard-focus indicator (PLNR-447 camera controls; Navigator conventions
+   doc §8) opt into this class. `--accent` is theme-invariant (never overridden in the light block),
+   so the ring stays legible regardless of the app theme or an underlying fixed-dark panel. */
+.camera-ctrl-btn:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
 
 /* markdown (plan documents) */
 .md { font-size: 12.5px; line-height: 1.65; color: var(--text-soft); }

@@ -19,6 +19,20 @@ import {
 } from './constellation-3d-navigation';
 
 const LABEL_BUDGET = 24;
+// Camera controls (PLNR-447, screen spec "Camera controls") — the 30×30 chip is a fixed-dark panel
+// in BOTH themes, same reasoning as ConstellationInspector.tsx / MemoryConstellationV2.tsx's
+// PLNR-443 audit fix (see 2c80d5d): `var(--text*)`/`var(--w-12)` flip to near-black-on-light-text
+// values in light theme, which against this panel's own always-dark `rgba(16,18,22,.9)` fill would
+// render illegibly. These are the dark theme's own `--text`/`--text-faint`/`--w-12` values, inlined
+// as constants so the chip reads correctly regardless of the app's theme toggle.
+const CAMERA_CTRL_BG = 'rgba(16,18,22,.9)';
+const CAMERA_CTRL_BORDER = 'rgba(255,255,255,.12)';
+const CAMERA_CTRL_TEXT = '#e6e8ec';
+const CAMERA_CTRL_TEXT_FAINT = '#4b5563';
+const CAMERA_CTRL_STYLE: React.CSSProperties = {
+  width: 30, height: 30, borderRadius: 7, background: CAMERA_CTRL_BG, border: `1px solid ${CAMERA_CTRL_BORDER}`,
+  display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, lineHeight: 1,
+};
 // Layered radial falloff (PLNR-438): outer well at 10% opacity, mid at 22%, both tinted by the
 // community's dominant type — sized as a fixed ratio of the solid core sphere the standard node
 // pass already renders, so "outer radius from aggregate connectivity" (the core's own scale,
@@ -840,12 +854,37 @@ export function MemoryConstellation3D({
   return (
     <div ref={hostRef} style={{ position: 'absolute', inset: 0, overflow: 'hidden' }} data-reduced-motion={reducedMotion ? 'true' : 'false'}>
       <canvas ref={canvasRef} tabIndex={0} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerLeave={clearHover} onWheel={dolly} onKeyDown={keyDown} onContextMenu={(event) => event.preventDefault()} style={{ width: '100%', height: '100%', display: 'block', touchAction: 'none' }} aria-label={`3D memory constellation with ${layoutNodes.length} visible items. Arrow keys move selection; E opens ego network; I opens evidence inspector.`} />
-      <div style={{ position: 'absolute', right: 10, top: 10, display: 'flex', gap: 6 }}>
-        <button type="button" onClick={() => transitionTo(DEFAULT_CONSTELLATION_3D_CAMERA)}>home</button>
-        <button type="button" disabled={!selectedNodeId} onClick={() => {
-          const selected = layoutNodes.find((node) => node.id === selectedNodeId);
-          if (selected) transitionTo(focusConstellationCamera(cameraState, selected.position, selected.radius ?? 18));
-        }}>focus</button>
+      <div style={{ position: 'absolute', right: 10, bottom: 10, display: 'flex', gap: 6 }}>
+        <button
+          type="button"
+          className="camera-ctrl-btn"
+          aria-label="Reset camera to default view"
+          onClick={() => transitionTo(DEFAULT_CONSTELLATION_3D_CAMERA)}
+          style={{ ...CAMERA_CTRL_STYLE, color: CAMERA_CTRL_TEXT, cursor: 'pointer' }}
+        >
+          ◎
+        </button>
+        {/* Kept keyboard-reachable even with nothing selected (Navigator conventions doc §8) — a
+            native `disabled` button drops out of the tab order, so the no-selection state is
+            conveyed via `aria-disabled` + a guarded click/keyboard handler instead. The dimming is
+            applied to the GLYPH only (not a button-level `opacity`, which would fade the chip's own
+            background too and break the "fixed-dark panel in both themes" rule this task is about —
+            confirmed against a light-theme screenshot during verification); `aria-disabled` plus the
+            default cursor add non-colour signal on top of the faint-text colour itself. */}
+        <button
+          type="button"
+          className="camera-ctrl-btn"
+          aria-label="Focus camera on selection"
+          aria-disabled={!selectedNodeId}
+          onClick={() => {
+            if (!selectedNodeId) return;
+            const selected = layoutNodes.find((node) => node.id === selectedNodeId);
+            if (selected) transitionTo(focusConstellationCamera(cameraState, selected.position, selected.radius ?? 18));
+          }}
+          style={{ ...CAMERA_CTRL_STYLE, cursor: selectedNodeId ? 'pointer' : 'default' }}
+        >
+          <span style={{ color: selectedNodeId ? CAMERA_CTRL_TEXT : CAMERA_CTRL_TEXT_FAINT, opacity: selectedNodeId ? 1 : 0.75 }}>⌖</span>
+        </button>
       </div>
       {labels.map((label) => (
         <div key={label.key} style={{ position: 'absolute', left: label.x, top: label.y, transform: 'translate(-50%, -50%)', pointerEvents: 'none', textAlign: 'center', textShadow: '0 1px 4px var(--bg)' }}>
