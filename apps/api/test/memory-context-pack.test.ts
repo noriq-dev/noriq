@@ -12,6 +12,7 @@ import { describe, expect, it, beforeAll } from 'vitest';
 import type { Env } from '../src/env';
 import { createAgent, createRunAgent, createUser, mintTokenForUser, loginSession, mcpCall, mcpList } from './helpers';
 import { allocateBudget, SECTION_ORDER, CHARS_PER_TOKEN, assembleContextPack } from '../src/memory/context-pack';
+import { buildEntityUri } from '@noriq-dev/shared';
 
 const appEnv = env as unknown as Env;
 
@@ -24,6 +25,9 @@ interface MemRpc {
     actor: { kind: string; id: string | null },
   ): Promise<{ applied: number; skipped: number; touchedMemoryIds: string[] }>;
   reconcile(pid: string): Promise<{ delivered: number; failed: number; applied: number; cursor: number }>;
+  recordEpisode(pid: string, input: Record<string, unknown>): Promise<{ episodeId: string }>;
+  writeNode(pid: string, input: { type: string; uri: string; label: string; actor: { kind: string; id: string | null } }): Promise<{ nodeId: string }>;
+  writeEdge(pid: string, input: { type: string; fromNodeId: string; toNodeId: string; actor: { kind: string; id: string | null } }): Promise<{ edgeId: string }>;
 }
 const memory = (pid: string) => appEnv.PROJECT_MEMORY.get(appEnv.PROJECT_MEMORY.idFromName(pid)) as unknown as MemRpc;
 
@@ -304,6 +308,59 @@ describe('assembleContextPack — an unanswerable section is distinguishable fro
     const graph = pack.sections.find((s) => s.id === 'graph_neighborhood')!;
     expect(graph.notice?.kind).toBe('unanswerable');
     expect(graph.graphEntities).toEqual([]);
+  });
+
+  it('graph_neighborhood: an existing task node with no episode seed is incomplete, not an affirmative empty answer', async () => {
+    const projectId = await newProject('MCP6A');
+    const made = await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'Projected but never run', tags: ['context-pack-test'] });
+    await memory(projectId).reconcile(projectId);
+
+    const pack = await assembleContextPack(appEnv, projectId, made.body.id as string, {});
+    const graph = pack.sections.find((s) => s.id === 'graph_neighborhood')!;
+    expect(graph.graphEntities).toEqual([]);
+    expect(graph.coverage).toMatchObject({ complete: false, reasons: expect.arrayContaining(['task-episode-seed-missing']) });
+    expect(graph.notice).toMatchObject({ kind: 'unanswerable' });
+  });
+
+  it('graph_neighborhood: a real task episode reaches observed files and derived co-change files with the full edge path', async () => {
+    const projectKey = 'MCP6B';
+    const projectId = await newProject(projectKey);
+    const made = await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'Change two connected files', tags: ['context-pack-test'] });
+    const taskId = made.body.id as string;
+    const directUri = buildEntityUri({ kind: 'file', projectKey, repositoryKey: 'repo-x', path: 'src/direct.ts' });
+    const cochangeUri = buildEntityUri({ kind: 'file', projectKey, repositoryKey: 'repo-x', path: 'src/cochange.ts' });
+
+    await memory(projectId).recordEpisode(projectId, {
+      runId: 'run_context_pack_episode', sitting: 1, agentId: null, runKind: 'build', outcome: 'done',
+      startedAt: null, finishedAt: null, taskId, taskTitle: 'Change two connected files',
+      repositoryKey: 'repo-x', baseId: 'sha-context-pack', timeline: [], filesTouched: ['src/direct.ts'],
+      commands: [], testsRun: [], failures: [], findings: [], reviewRounds: 0, tokenUsage: {}, costUSD: 0,
+      acceptanceCoverage: 1, steeringEvents: [], landingOutcome: 'landed', remainingWork: [],
+      actor: { kind: 'system', id: null },
+    });
+    const direct = await memory(projectId).writeNode(projectId, {
+      type: 'file', uri: directUri, label: 'src/direct.ts', actor: { kind: 'system', id: null },
+    });
+    const cochange = await memory(projectId).writeNode(projectId, {
+      type: 'file', uri: cochangeUri, label: 'src/cochange.ts', actor: { kind: 'system', id: null },
+    });
+    await memory(projectId).writeEdge(projectId, {
+      type: 'commonly_changes_with', fromNodeId: cochange.nodeId, toNodeId: direct.nodeId,
+      actor: { kind: 'system', id: null },
+    });
+
+    const pack = await assembleContextPack(appEnv, projectId, taskId, { tokenBudget: 30_000 });
+    const graph = pack.sections.find((s) => s.id === 'graph_neighborhood')!;
+    const directEntity = graph.graphEntities.find((entity) => entity.uri === directUri)!;
+    const cochangeEntity = graph.graphEntities.find((entity) => entity.uri === cochangeUri)!;
+
+    expect(graph.coverage).toMatchObject({ complete: true, reasons: [] });
+    expect(graph.notice).toBeNull();
+    expect(directEntity.depth).toBe(2);
+    expect(directEntity.edgePath).toMatch(/>related_to>.*;.*>modifies>/);
+    expect(directEntity.edgePath).not.toContain('commonly_changes_with');
+    expect(cochangeEntity.depth).toBe(3);
+    expect(cochangeEntity.edgePath).toMatch(/>related_to>.*;.*>modifies>.*;.*>commonly_changes_with>/);
   });
 });
 

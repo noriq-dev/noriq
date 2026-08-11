@@ -389,7 +389,7 @@ export async function assembleContextPack(
       preferBranch: input.branch ?? undefined,
       limit: RETRIEVAL_DEFAULTS.maxResults,
     }),
-    stub.dependencyNeighborhood(projectId, { entityUri: taskUri, maxDepth: RETRIEVAL_DEFAULTS.maxDepth, maxResults: RETRIEVAL_DEFAULTS.maxGraphResults }),
+    stub.taskCodeNeighborhood(projectId, { taskUri, maxResults: RETRIEVAL_DEFAULTS.maxGraphResults }),
     fileUris.length
       ? stub.changeImpact(projectId, { entityUris: fileUris, maxDepth: RETRIEVAL_DEFAULTS.maxDepth, maxResults: RETRIEVAL_DEFAULTS.maxGraphResults })
       : stub.validatingTests(projectId, { entityUri: taskUri, maxDepth: RETRIEVAL_DEFAULTS.maxDepth, maxResults: RETRIEVAL_DEFAULTS.maxGraphResults }),
@@ -452,7 +452,7 @@ export async function assembleContextPack(
   function toGraphEntity(e: { uri: string; type: string; label: string; depth: number; edgePath: Array<{ fromNodeId: string; edgeType: string; toNodeId: string }> }): ContextPackGraphEntity {
     return { uri: e.uri, type: e.type, label: e.label, depth: e.depth, edgePath: e.edgePath.map((h) => `${h.fromNodeId}>${h.edgeType}>${h.toNodeId}`).join(';') };
   }
-  const graphCandidates = [...depResult.downstream, ...depResult.upstream].map(toGraphEntity);
+  const graphCandidates = depResult.entities.map(toGraphEntity);
   const graphCoverage: ContextPackCoverage = depResult.coverage;
 
   const usedChangeImpact = 'impactedTests' in testsResult;

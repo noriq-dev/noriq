@@ -7,7 +7,7 @@ import type { ProjectMemoryHealth, IndexGenerationSummary } from '../do/ProjectM
 import type { RankedHit } from '../memory/retrieval';
 import type { DuplicateWarning, EffortSummary, PriorEffortCase } from '../memory/similar-effort';
 import type {
-  DependencyNeighborhoodResult, ValidatingTestsResult, ImplementingWorkResult, DecisionLineageResult, ChangeImpactResult, ConstellationResult, ConstellationOptions,
+  DependencyNeighborhoodResult, TaskCodeNeighborhoodResult, ValidatingTestsResult, ImplementingWorkResult, DecisionLineageResult, ChangeImpactResult, ConstellationResult, ConstellationOptions,
   GraphEntityPage, GraphEntityPageInput,
 } from '../memory/graph-queries';
 import type { SurfaceId } from '../memory/guidance-drift';
@@ -291,6 +291,7 @@ export interface ProjectMemoryStub {
     projectId: string,
     input: { entityUri: string; edgeTypes?: string[]; maxDepth?: number; maxResults?: number },
   ): Promise<DependencyNeighborhoodResult>;
+  taskCodeNeighborhood(projectId: string, input: { taskUri: string; maxResults?: number }): Promise<TaskCodeNeighborhoodResult>;
   validatingTests(projectId: string, input: { entityUri: string; maxDepth?: number; maxResults?: number }): Promise<ValidatingTestsResult>;
   implementingWork(projectId: string, input: { entityUri: string; maxDepth?: number; maxResults?: number }): Promise<ImplementingWorkResult>;
   decisionLineage(projectId: string, input: { decisionUri: string; maxDepth?: number; maxResults?: number }): Promise<DecisionLineageResult>;

@@ -23,7 +23,14 @@
 
 import { classifyLead } from './retrieval';
 
-export type CoverageReason = 'seed-not-found' | 'code-graph-empty' | 'no-writer-yet' | 'row-limit-reached' | 'graph-empty';
+export type CoverageReason =
+  | 'seed-not-found'
+  | 'task-episode-seed-missing'
+  | 'episode-code-link-missing'
+  | 'code-graph-empty'
+  | 'no-writer-yet'
+  | 'row-limit-reached'
+  | 'graph-empty';
 
 /**
  * The required, non-optional completeness marker every primitive returns (§2): what the
@@ -48,6 +55,10 @@ export interface CoverageInputs {
   truncated: boolean;
   /** The seed URI itself didn't resolve to an existing node. */
   seedMissing?: boolean;
+  /** A task seed resolved, but no canonical episode points to it. */
+  taskEpisodeSeedMissing?: boolean;
+  /** Task episodes resolved, but none has an observed `modifies` edge into code. */
+  episodeCodeLinkMissing?: boolean;
   /** PLNR-284: this project's `nodes` table has ZERO rows — nothing has ever been recorded or
    *  projected into memory at all. Distinct from `codeGraphPopulated` (which is about repository
    *  code intelligence specifically, and reads false even on a lively project that simply has
@@ -60,6 +71,8 @@ export interface CoverageInputs {
 export function buildCoverage(inputs: CoverageInputs): Coverage {
   const reasons: CoverageReason[] = [];
   if (inputs.seedMissing) reasons.push('seed-not-found');
+  if (inputs.taskEpisodeSeedMissing) reasons.push('task-episode-seed-missing');
+  if (inputs.episodeCodeLinkMissing) reasons.push('episode-code-link-missing');
   if (inputs.graphEmpty) reasons.push('graph-empty');
   if (!inputs.codeGraphPopulated) reasons.push('code-graph-empty');
   if (inputs.edgeTypesWithNoWriter.length) reasons.push('no-writer-yet');
@@ -149,6 +162,27 @@ export function dependencyNeighborhood(
   coverage: CoverageInputs,
 ): DependencyNeighborhoodResult {
   return { seed, downstream: toRelatedEntities(downstreamRows), upstream: toRelatedEntities(upstreamRows), coverage: buildCoverage(coverage) };
+}
+
+/**
+ * The code neighborhood reached from a task through its canonical landed evidence:
+ * task <-related_to- episode -modifies-> file <-/->commonly_changes_with file.
+ * `edgePath` retains every edge's actual stored direction, so callers can distinguish the
+ * observed `modifies` hop from the derived co-change hop instead of receiving an unexplained
+ * bag of files.
+ */
+export interface TaskCodeNeighborhoodResult {
+  seed: GraphEntityRef | null;
+  entities: RelatedEntity[];
+  coverage: Coverage;
+}
+
+export function taskCodeNeighborhood(
+  seed: GraphEntityRef | null,
+  rows: TraversalRow[],
+  coverage: CoverageInputs,
+): TaskCodeNeighborhoodResult {
+  return { seed, entities: toRelatedEntities(rows), coverage: buildCoverage(coverage) };
 }
 
 export interface ValidatingTestsResult {

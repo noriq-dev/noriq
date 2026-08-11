@@ -52,10 +52,10 @@ import {
   type RetrievalHit, type RetrievalStage, type RankedHit,
 } from '../memory/retrieval';
 import {
-  dependencyNeighborhood, validatingTests, implementingWork, decisionLineage, changeImpact, constellation, listGraphEntities,
+  dependencyNeighborhood, taskCodeNeighborhood, validatingTests, implementingWork, decisionLineage, changeImpact, constellation, listGraphEntities,
   type GraphEntityRef, type DependencyNeighborhoodResult, type ValidatingTestsResult,
   type ImplementingWorkResult, type DecisionLineageResult, type ChangeImpactResult, type ConstellationResult, type ConstellationOptions,
-  type GraphEntityPage, type GraphEntityPageInput, type ConstellationInputRows,
+  type GraphEntityPage, type GraphEntityPageInput, type ConstellationInputRows, type TaskCodeNeighborhoodResult,
 } from '../memory/graph-queries';
 import { EpisodeSkeletonUnavailableError, loadEpisodeSkeleton } from '../memory/episodes';
 import type { EpisodeIntelligenceDraft } from '../lib/run-sitting-intelligence';
@@ -5450,6 +5450,118 @@ export class ProjectMemory extends DurableObject<Env> {
     const down = this.rawTraverseGraph(seedIds, { edgeTypes, maxDepth: input.maxDepth, maxResults: input.maxResults, direction: 'downstream' });
     const up = this.rawTraverseGraph(seedIds, { edgeTypes, maxDepth: input.maxDepth, maxResults: input.maxResults, direction: 'upstream' });
     return dependencyNeighborhood(seed, down.rows, up.rows, this.edgeCoverageInputs(seed, edgeTypes, down.truncated || up.truncated));
+  }
+
+  /** PLNR-444: task-anchored code context follows the evidence path the episode writer already
+   * owns, never anticipatedFiles. One bounded query composes the direction-changing path that a
+   * generic one-direction traversal cannot express: task <- episode -> file, then either
+   * direction of the derived file co-change edge. */
+  async taskCodeNeighborhood(
+    projectId: string,
+    input: { taskUri: string; maxResults?: number },
+  ): Promise<TaskCodeNeighborhoodResult> {
+    await this.assertProjectId(projectId);
+    const edgeTypes = ['related_to', 'modifies', 'commonly_changes_with'];
+    const seed = this.resolveNodeByUri(input.taskUri);
+    const maxResults = Math.min(
+      Math.max(input.maxResults ?? RETRIEVAL_DEFAULTS.maxGraphResults, 1),
+      RETRIEVAL_DEFAULTS.maxGraphResultsCeiling,
+    );
+    const episodeSeedLimit = RETRIEVAL_DEFAULTS.maxResults;
+    const episodeCount = seed
+      ? this.ctx.storage.sql.exec<{ n: number }>(
+          `SELECT COUNT(DISTINCT episode.id) AS n
+           FROM edges relation JOIN nodes episode ON episode.id = relation.from_node_id
+           WHERE relation.type = 'related_to' AND relation.to_node_id = ?1 AND episode.type = 'episode'`,
+          seed.nodeId,
+        ).toArray()[0]?.n ?? 0
+      : 0;
+    const modifiedFileCount = seed && episodeCount
+      ? this.ctx.storage.sql.exec<{ n: number }>(
+          `WITH task_episodes AS (
+             SELECT episode.id
+             FROM edges relation
+             JOIN nodes episode ON episode.id = relation.from_node_id AND episode.type = 'episode'
+             WHERE relation.type = 'related_to' AND relation.to_node_id = ?1
+             ORDER BY episode.created_at DESC, episode.id ASC
+             LIMIT ?2
+           )
+           SELECT COUNT(DISTINCT file.id) AS n
+           FROM task_episodes
+           JOIN edges modification ON modification.from_node_id = task_episodes.id AND modification.type = 'modifies'
+           JOIN nodes file ON file.id = modification.to_node_id AND file.type IN ('file','symbol','api','database_entity')
+          `,
+          seed.nodeId,
+          episodeSeedLimit,
+        ).toArray()[0]?.n ?? 0
+      : 0;
+
+    const rows = seed && modifiedFileCount
+      ? this.ctx.storage.sql.exec<{
+          nodeId: string; uri: string; type: string; label: string; depth: number; edgePath: string; rank: number;
+        }>(
+          `WITH task_episodes AS (
+             SELECT episode.id AS episode_node_id,
+                    relation.from_node_id || '>related_to>' || relation.to_node_id AS task_path
+           FROM edges relation JOIN nodes episode ON episode.id = relation.from_node_id
+             WHERE relation.type = 'related_to' AND relation.to_node_id = ?1 AND episode.type = 'episode'
+             ORDER BY episode.created_at DESC, episode.id ASC
+             LIMIT ?2
+           ),
+           direct_candidates AS (
+             SELECT file.id AS nodeId, file.uri, file.type, file.label, 2 AS depth,
+                    task_episodes.task_path || ';' || modification.from_node_id || '>modifies>' || modification.to_node_id AS edgePath,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY file.id ORDER BY task_episodes.task_path ASC, modification.id ASC
+                    ) AS directRank
+             FROM task_episodes
+             JOIN edges modification ON modification.from_node_id = task_episodes.episode_node_id AND modification.type = 'modifies'
+             JOIN nodes file ON file.id = modification.to_node_id AND file.type IN ('file','symbol','api','database_entity')
+           ),
+           direct_files AS (
+             SELECT nodeId, uri, type, label, depth, edgePath
+             FROM direct_candidates WHERE directRank = 1
+             ORDER BY uri ASC
+             LIMIT ?3
+           ),
+           cochanged_files AS (
+             SELECT other.id AS nodeId, other.uri, other.type, other.label, 3 AS depth,
+                    direct_files.edgePath || ';' || cochange.from_node_id || '>commonly_changes_with>' || cochange.to_node_id AS edgePath
+             FROM direct_files
+             JOIN edges cochange ON cochange.type = 'commonly_changes_with'
+               AND (cochange.from_node_id = direct_files.nodeId OR cochange.to_node_id = direct_files.nodeId)
+             JOIN nodes other ON other.id = CASE
+               WHEN cochange.from_node_id = direct_files.nodeId THEN cochange.to_node_id ELSE cochange.from_node_id END
+             WHERE other.type IN ('file','symbol','api','database_entity')
+           ),
+           paths AS (
+             SELECT * FROM direct_files
+             UNION ALL
+             SELECT * FROM cochanged_files
+           ),
+           ranked AS (
+             SELECT paths.*, ROW_NUMBER() OVER (PARTITION BY nodeId ORDER BY depth ASC, edgePath ASC) AS rank
+             FROM paths
+           )
+           SELECT nodeId, uri, type, label, depth, edgePath, rank
+           FROM ranked WHERE rank = 1
+           ORDER BY depth ASC, uri ASC
+           LIMIT ?4`,
+          seed.nodeId,
+          episodeSeedLimit,
+          maxResults + 1,
+          maxResults + 1,
+        ).toArray()
+      : [];
+    const truncated = episodeCount > episodeSeedLimit || rows.length > maxResults;
+    return taskCodeNeighborhood(seed, rows.slice(0, maxResults), {
+      codeGraphPopulated: this.isCodeGraphPopulated(),
+      edgeTypesWithNoWriter: this.edgeTypesWithNoWriter(edgeTypes),
+      truncated,
+      seedMissing: !seed,
+      taskEpisodeSeedMissing: !!seed && episodeCount === 0,
+      episodeCodeLinkMissing: episodeCount > 0 && modifiedFileCount === 0,
+    });
   }
 
   /** Tests connected to an entity via tests/validated_by (either direction — no writer has
