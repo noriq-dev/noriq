@@ -407,6 +407,48 @@ export function MemoryConstellationV2({
   const STATUS_TOKEN_COLOR: Record<(typeof statusNotices)[number]['token'], string> = {
     error: 'var(--red-soft)', stale: 'var(--amber)', building: 'var(--amber)', partial: 'var(--amber)', informational: 'var(--text-dim)',
   };
+  // The chip markup itself never changes between views — same source array, same order, same
+  // styling (Navigator conventions §7: Catalogue shares "the same ... status region"). Only the
+  // CONTAINER differs (see below), by a fixed branch on showCatalogue, never by measuring anything.
+  const noticeChips = statusNotices.map((notice) => (
+    <div key={notice.key} role="status" style={{
+      display: 'flex', alignItems: 'center', gap: 8, padding: '4px 9px', borderRadius: 6,
+      background: 'var(--panel)', border: `1px solid ${STATUS_TOKEN_COLOR[notice.token]}`,
+      color: STATUS_TOKEN_COLOR[notice.token], fontFamily: 'var(--mono)', fontSize: 10,
+    }}>
+      <span>{notice.message}</span>
+      {notice.action && <button
+        type="button" onClick={notice.action.onClick}
+        style={{ background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', fontFamily: 'inherit', fontSize: 'inherit', color: 'inherit', textDecoration: 'underline' }}
+      >
+        {notice.action.label}
+      </button>}
+    </div>
+  ));
+  // PLNR-449: Catalogue is pure DOM with real rows starting at its own top edge, so a notice
+  // floating at a fixed left:14/top:12 sits on top of its first row. Space has no such collision —
+  // investigated below — so only Catalogue (and only once it actually has rows to collide with)
+  // gets the status region promoted out of the overlay into a normal-flow sibling above it, whose
+  // own rendered height reserves its own space. Nothing here measures another element's height or
+  // reads its presence to compute an offset — that arithmetic is exactly what PLNR-436 (13137ff)
+  // deleted, and reintroducing it as "pad Catalogue by the notice stack's measured height" would be
+  // the same defect back under a different name. This is a discrete branch on a boolean, not a
+  // runtime measurement.
+  const noticesReserveFlowSpace = showCatalogue && overview.communities.length > 0;
+  const catalogueElement = <ConstellationCatalogue
+    nodes={filteredScene.nodes}
+    highlightedNodeIds={new Set(highlightedNodeIds)}
+    matchCounts={matchCountsByRootCommunity}
+    searchActive={searchActive}
+    selectedNodeId={selectedNodeId}
+    currentPage={currentPage}
+    expanding={expanding}
+    onSelectNode={selectNode}
+    onExpandCommunity={(communityId) => void expand(communityId)}
+    onLoadNextPage={() => currentPage && void fetchCommunity(currentPage.community.id, currentPage.nextCursor!)}
+    onOpenEgoNetwork={onOpenEgoNetwork}
+    onOpenInspector={onOpenInspector}
+  />;
 
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
@@ -529,34 +571,28 @@ export function MemoryConstellationV2({
                 onSelectNode={selectNode} onOpenEgoNetwork={onOpenEgoNetwork} onOpenInspector={onOpenInspector}
                 onRendererFailure={handleRendererFailure}
               />
-            </Suspense> : <ConstellationCatalogue
-              nodes={filteredScene.nodes}
-              highlightedNodeIds={new Set(highlightedNodeIds)}
-              matchCounts={matchCountsByRootCommunity}
-              searchActive={searchActive}
-              selectedNodeId={selectedNodeId}
-              currentPage={currentPage}
-              expanding={expanding}
-              onSelectNode={selectNode}
-              onExpandCommunity={(communityId) => void expand(communityId)}
-              onLoadNextPage={() => currentPage && void fetchCommunity(currentPage.community.id, currentPage.nextCursor!)}
-              onOpenEgoNetwork={onOpenEgoNetwork}
-              onOpenInspector={onOpenInspector}
-            />}
-          {statusNotices.length > 0 && <div style={{ position: 'absolute', left: 14, top: 12, display: 'flex', flexDirection: 'column', gap: 6, maxWidth: 420, zIndex: 1 }}>
-            {statusNotices.map((notice) => <div key={notice.key} role="status" style={{
-              display: 'flex', alignItems: 'center', gap: 8, padding: '4px 9px', borderRadius: 6,
-              background: 'var(--panel)', border: `1px solid ${STATUS_TOKEN_COLOR[notice.token]}`,
-              color: STATUS_TOKEN_COLOR[notice.token], fontFamily: 'var(--mono)', fontSize: 10,
-            }}>
-              <span>{notice.message}</span>
-              {notice.action && <button
-                type="button" onClick={notice.action.onClick}
-                style={{ background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', fontFamily: 'inherit', fontSize: 'inherit', color: 'inherit', textDecoration: 'underline' }}
-              >
-                {notice.action.label}
-              </button>}
-            </div>)}
+            </Suspense> : noticesReserveFlowSpace ? (
+              // Flow slot, scoped to Catalogue-with-rows (see noticesReserveFlowSpace above): the
+              // notice stack is a normal block sibling ABOVE the Catalogue container, which fills
+              // exactly the remaining flex space below it — Catalogue's own top row can never sit
+              // under a notice because the browser's ordinary box layout, not a computed pixel
+              // value, is what reserves the height.
+              <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column' }}>
+                <div style={{ flex: 'none', padding: '12px 14px 0', display: 'flex', flexDirection: 'column', gap: 6, maxWidth: 420 }}>
+                  {noticeChips}
+                </div>
+                <div style={{ position: 'relative', flex: 1, minHeight: 0 }}>
+                  {catalogueElement}
+                </div>
+              </div>
+            ) : catalogueElement}
+          {/* Space (and the empty-communities message, either view) keep the status region as the
+              translucent overlay the screen spec specifies ("anchored top-left of the canvas") —
+              nothing else occupies that corner in Space (camera controls bottom-right, legend
+              bottom-left, search matches on the right), so there is nothing for it to collide with,
+              and there are no Catalogue rows to cover when the hierarchy is empty. */}
+          {!noticesReserveFlowSpace && statusNotices.length > 0 && <div style={{ position: 'absolute', left: 14, top: 12, display: 'flex', flexDirection: 'column', gap: 6, maxWidth: 420, zIndex: 1 }}>
+            {noticeChips}
           </div>}
           {hits.length > 0 && <div role="region" aria-label="Search matches" style={{
             position: 'absolute', right: 14, top: 10, width: 392, maxHeight: 340, overflow: 'auto',

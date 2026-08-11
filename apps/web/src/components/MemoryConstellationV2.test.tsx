@@ -383,6 +383,73 @@ describe('MemoryConstellationV2 Catalogue as a designed peer view (PLNR-442)', (
   });
 });
 
+describe('MemoryConstellationV2 status notice does not overlap Catalogue rows (PLNR-449)', () => {
+  it('promotes the status region into a flow slot above Catalogue instead of an overlay pinned on top of its rows', async () => {
+    vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision, communities: [rootCommunity], routes: [], coverage: { complete: true, reasons: [] } });
+    host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
+    act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
+    await tick(); await tick();
+
+    // This suite's default mock forces Catalogue (renderer failure on mount) and the fixture root
+    // community has members, so Catalogue actually renders a row the old overlay would sit on top of.
+    const catalogueRegion = host.querySelector('[role="region"][aria-label="Textual memory constellation"]') as HTMLElement;
+    expect(catalogueRegion).toBeTruthy();
+
+    const notices = [...host.querySelectorAll('[role="status"]')];
+    expect(notices.length).toBeGreaterThan(0);
+    const noticeContainer = notices[0]!.parentElement!;
+
+    // The notice stack is a normal-flow sibling ABOVE Catalogue, not an absolute overlay pinned at
+    // left:14/top:12 on top of it — it carries no position/top/left of its own, and its height is
+    // reserved by ordinary box layout, not by measuring anything.
+    expect(noticeContainer.style.position).not.toBe('absolute');
+    expect(noticeContainer.style.top).toBe('');
+    expect(noticeContainer.style.left).toBe('');
+    expect(noticeContainer.style.flex).toBe('0 0 auto'); // React's `flex: 'none'` shorthand, as jsdom expands it
+
+    // Document order: the notice block precedes the Catalogue region — genuinely above it in flow,
+    // not stacked on top of it via z-index.
+    const position = noticeContainer.compareDocumentPosition(catalogueRegion);
+    expect(Boolean(position & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true);
+
+    // Catalogue's own wrapper fills the REMAINING space below the notices (flex:1) — a fixed
+    // structural sibling relationship, not a measured offset (the PLNR-436 pattern this must not
+    // reintroduce).
+    const catalogueFlexWrapper = catalogueRegion.parentElement!;
+    expect(catalogueFlexWrapper.style.flex).toBe('1 1 0%'); // React's `flex: 1` shorthand, as jsdom expands it
+  });
+
+  it('leaves Space\'s status region as the unchanged translucent overlay, since nothing else occupies that corner there', async () => {
+    mockRenderer3D.failOnMount = false; // renderer healthy — real Space view reachable
+    const buildingRevision: ApiConstellationV2Revision = { ...revision, state: 'building' };
+    vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision: buildingRevision, communities: [rootCommunity], routes: [], coverage: { complete: true, reasons: [] } });
+    host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
+    act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
+    await tick(); await tick();
+
+    expect(host.textContent).not.toContain('3D view unavailable');
+    const notices = [...host.querySelectorAll('[role="status"]')];
+    expect(notices.length).toBeGreaterThan(0);
+    const noticeContainer = notices[0]!.parentElement!;
+    expect(noticeContainer.style.position).toBe('absolute');
+    expect(noticeContainer.style.left).toBe('14px');
+    expect(noticeContainer.style.top).toBe('12px');
+  });
+
+  it('keeps the overlay (not the flow slot) when the hierarchy is empty, since there are no Catalogue rows to collide with', async () => {
+    vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision, communities: [], routes: [], coverage: { complete: true, reasons: [] } });
+    host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
+    act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
+    await tick(); await tick();
+
+    expect(host.textContent).toContain('No memory entities are present in this completed generation.');
+    const notices = [...host.querySelectorAll('[role="status"]')];
+    expect(notices.length).toBeGreaterThan(0);
+    const noticeContainer = notices[0]!.parentElement!;
+    expect(noticeContainer.style.position).toBe('absolute');
+  });
+});
+
 describe('MemoryConstellationV2 search ignite (PLNR-441)', () => {
   const hit = (overrides: Partial<{ id: string; uri: string; title: string }> = {}) => ({
     entityType: 'memory' as const, id: overrides.id ?? 'x', uri: overrides.uri ?? 'noriq://memory/x', kind: 'learning',
