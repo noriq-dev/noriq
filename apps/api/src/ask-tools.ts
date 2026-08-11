@@ -6,9 +6,9 @@ import {
 } from './ask-actions';
 import { sha256Hex } from './lib/util';
 import {
-  listWorkspaceProjects, searchWorkspaceTasks, workspaceDocs, workspaceMemory, workspacePlans, workspaceReview,
-  workspaceStatus, workspaceTaskContext, workspaceTaskDetail,
-  type WorkspaceReference, type WorkspaceScope,
+  listWorkspaceProjects, searchWorkspaceTasks, workspaceDocs, workspaceMemory, workspacePlans, workspaceProjectTagVocabulary,
+  workspaceReview, workspaceStatus, workspaceTaskContext, workspaceTaskDetail,
+  type WorkspaceProjectTagVocabulary, type WorkspaceReference, type WorkspaceScope,
 } from './lib/workspace-operations';
 
 export const MAX_ASK_TOOL_ROUNDS = 4;
@@ -336,12 +336,60 @@ export function createAskReadTools(env: Env, scope: WorkspaceScope, projects: As
   ];
 }
 
-const CREATE_TASK_INPUT_SCHEMA: JsonObject = {
+/** Per-project tag count included in the `propose_task_create` schema description before an
+ * "(+N more)" note takes over — keeps the guidance readable and bounds it independently of
+ * MAX_ASK_TASK_TAG_GUIDANCE_CHARS below (which bounds the whole multi-project string). */
+const MAX_ASK_TASK_TAG_GUIDANCE_PER_PROJECT = 25;
+/** Hard cap on the combined tag-vocabulary guidance text across every accessible project, so a
+ * workspace with many projects cannot balloon a schema description resent every tool-decision
+ * round (MAX_ASK_TOOL_ROUNDS). Once exceeded, remaining projects are named but their tag lists
+ * omitted — the model can still ask about them via search_tasks{tag}. */
+const MAX_ASK_TASK_TAG_GUIDANCE_CHARS = 3_000;
+
+/** Render "reuse the project vocabulary" as an instruction the model can act on: the actual
+ * vocabulary, one entry per accessible project (bounded, most-used tag first — see
+ * workspaceProjectTagVocabulary), so `propose_task_create` carries it unconditionally with no
+ * extra tool round and no dependency on the model remembering to look it up. A project with no
+ * tags yet gets an explicit "(no tags yet)" — never silently omitted, since silence there would
+ * read as "unknown" rather than "empty". */
+export function formatAskTaskTagVocabularyGuidance(
+  projects: AskProject[],
+  vocabulary: Map<string, WorkspaceProjectTagVocabulary>,
+): string {
+  if (!projects.length) return 'No accessible projects.';
+  const parts: string[] = [];
+  let used = 0;
+  let omitted = 0;
+  for (const project of projects) {
+    const entry = vocabulary.get(project.id);
+    const shown = (entry?.tags ?? []).slice(0, MAX_ASK_TASK_TAG_GUIDANCE_PER_PROJECT);
+    const more = (entry?.totalTags ?? 0) - shown.length;
+    const part = shown.length
+      ? `${project.key}: ${shown.join(', ')}${more > 0 ? ` (+${more} more)` : ''}`
+      : `${project.key}: (no tags yet)`;
+    if (parts.length && used + part.length > MAX_ASK_TASK_TAG_GUIDANCE_CHARS) {
+      omitted += 1;
+      continue;
+    }
+    parts.push(part);
+    used += part.length + 3;
+  }
+  const suffix = omitted > 0
+    ? ` (+${omitted} more accessible project${omitted === 1 ? '' : 's'} omitted for length — use search_tasks with a tag filter to check them)`
+    : '';
+  return `${parts.join(' | ')}${suffix}`;
+}
+
+const createTaskInputSchema = (tagVocabularyGuidance: string): JsonObject => ({
   type: 'object',
   properties: {
     projectId: { type: 'string', description: 'Explicit id of one accessible target project.' },
     title: { type: 'string', description: 'Title for exactly one task.' },
-    tags: { type: 'array', minItems: 1, maxItems: 50, items: { type: 'string' }, description: 'Required descriptive project tags, primary first. Reuse the project vocabulary.' },
+    tags: {
+      type: 'array', minItems: 1, maxItems: 50, items: { type: 'string' },
+      description: 'Required descriptive project tags, primary first. Reuse the project vocabulary below '
+        + `instead of minting a synonym — mint a new tag only when none of these fit. ${tagVocabularyGuidance}`,
+    },
     body: { type: 'string' },
     priority: { type: 'integer', minimum: 0, maximum: 4 },
     type: { type: 'string', enum: ['feature', 'bug', 'chore', 'research'] },
@@ -352,7 +400,7 @@ const CREATE_TASK_INPUT_SCHEMA: JsonObject = {
   },
   required: ['projectId', 'title', 'tags'],
   additionalProperties: false,
-};
+});
 
 const UPDATE_TASK_SET_SCHEMA: JsonObject = {
   type: 'object',
@@ -389,14 +437,20 @@ const actionResult = (action: Awaited<ReturnType<typeof createAskAction>>): AskT
 });
 
 /** Full Ask catalog. Proposal tools persist one confirmable action but never mutate a task. */
-export function createAskTools(
+export async function createAskTools(
   env: Env,
   scope: WorkspaceScope,
   projects: AskProject[],
   proposal: AskActionProposalContext,
-): AskTool[] {
+): Promise<AskTool[]> {
   if (proposal.userId !== scope.userId) throw new Error('Ask proposal owner does not match workspace scope');
   const byId = new Map(projects.map((project) => [project.id, project]));
+  // PLNR-428: `propose_task_create`'s schema tells the model to "reuse the project vocabulary",
+  // so the vocabulary must actually be reachable. `projects` is already the caller's scoped set
+  // (see workspaceProjectTagVocabulary's own re-check against WorkspaceScope for the paranoid
+  // belt-and-suspenders layer), so this fetch cannot leak a project outside it.
+  const tagVocabulary = await workspaceProjectTagVocabulary(env, scope, projects.map((project) => project.id));
+  const createTaskSchema = createTaskInputSchema(formatAskTaskTagVocabularyGuidance(projects, tagVocabulary));
   let proposedAction = false;
   const reserve = () => {
     if (proposedAction) {
@@ -409,8 +463,8 @@ export function createAskTools(
     ...createAskReadTools(env, scope, projects),
     {
       name: 'propose_task_create',
-      description: 'Propose creating exactly ONE user-defined task in one explicit accessible project. This only creates a pending confirmation action; it does not create the task. Use descriptive tags and existing board/doc ids. Never use for several tasks, task decomposition, a plan, or a suite of work—tell the user to continue in Plans instead.',
-      inputSchema: CREATE_TASK_INPUT_SCHEMA,
+      description: 'Propose creating exactly ONE user-defined task in one explicit accessible project. This only creates a pending confirmation action; it does not create the task. Use descriptive tags — reuse the project\'s existing vocabulary (see the tags parameter) — and existing board/doc ids. Never use for several tasks, task decomposition, a plan, or a suite of work—tell the user to continue in Plans instead.',
+      inputSchema: createTaskSchema,
       execute: async (raw) => {
         reserve();
         const args = normalizeAskCreateTaskArguments(raw);

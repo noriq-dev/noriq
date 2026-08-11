@@ -101,6 +101,56 @@ export async function listWorkspaceProjects(env: Pick<Env, 'DB'>, scope: Workspa
   return results;
 }
 
+export interface WorkspaceProjectTagVocabulary {
+  projectId: string;
+  /** Most-used-first, capped at MAX_WORKSPACE_TAG_VOCABULARY_PER_PROJECT. */
+  tags: string[];
+  /** Total distinct tags on the project, so a caller can tell whether `tags` was truncated. */
+  totalTags: number;
+}
+
+export const MAX_WORKSPACE_TAG_VOCABULARY_PER_PROJECT = 40;
+
+/**
+ * Each accessible project's existing tag vocabulary, most-used tag first (task+doc usage
+ * combined) so a caller surfacing "reuse the project vocabulary" guidance leads with the tags
+ * most worth reusing rather than an arbitrary or alphabetical slice. Bounded per project
+ * (MAX_WORKSPACE_TAG_VOCABULARY_PER_PROJECT) so a large, established project cannot blow a
+ * caller's context budget; `totalTags` on the result tells the caller whether it was truncated.
+ * A project with no tags yet simply has no entry in the returned map (or a `tags: []` one, once
+ * looked up) — never an error.
+ *
+ * `projectIds` is treated as a request, not a grant: it is re-intersected against
+ * `listWorkspaceProjects(scope)` here, the same paranoia `ask-tools.ts` applies when re-checking
+ * `byId` against `listWorkspaceProjects` — a caller cannot pull another user's project's tags by
+ * naming a foreign project id even if it otherwise trusts its own input.
+ */
+export async function workspaceProjectTagVocabulary(
+  env: Pick<Env, 'DB'>,
+  scope: WorkspaceScope,
+  projectIds: readonly string[],
+): Promise<Map<string, WorkspaceProjectTagVocabulary>> {
+  const result = new Map<string, WorkspaceProjectTagVocabulary>();
+  if (!projectIds.length) return result;
+  const reachable = new Set((await listWorkspaceProjects(env, scope)).map((project) => project.id));
+  const ids = [...new Set(projectIds)].filter((id) => reachable.has(id));
+  await Promise.all(ids.map(async (projectId) => {
+    const { results } = await env.DB.prepare(
+      `SELECT g.name AS name,
+              (SELECT COUNT(*) FROM task_tags tt WHERE tt.tag_id = g.id)
+              + (SELECT COUNT(*) FROM doc_tags dt WHERE dt.tag_id = g.id) AS uses
+         FROM tags g WHERE g.project_id = ?
+        ORDER BY uses DESC, g.name ASC`,
+    ).bind(projectId).all<{ name: string; uses: number }>();
+    result.set(projectId, {
+      projectId,
+      tags: results.slice(0, MAX_WORKSPACE_TAG_VOCABULARY_PER_PROJECT).map((row) => row.name),
+      totalTags: results.length,
+    });
+  }));
+  return result;
+}
+
 /** Attribute search shared by REST, MCP, and Ask without transport-specific response shaping. */
 export async function searchWorkspaceTasks(env: Pick<Env, 'DB'>, scope: WorkspaceScope, input: WorkspaceTaskSearchInput) {
   const { projectId, limit, ...filters } = input;

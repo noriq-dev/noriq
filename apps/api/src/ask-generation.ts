@@ -95,7 +95,7 @@ export async function runAskGeneration(env: Env, generationId: string): Promise<
     if (!await persist('searching', true)) return;
     const decision = askToolDecisionClient(env, model.id);
     if (!decision) throw new Error('no AI backend — asking questions requires the Workers AI (AI) binding');
-    const tools = createAskTools(env, {
+    const tools = await createAskTools(env, {
       userId: generation.userId,
       ...(projectTags.length ? { projectIds: projectTags.map((tag) => tag.projectId) } : {}),
     }, projects, {

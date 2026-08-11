@@ -25,9 +25,9 @@ import {
   AskModelConfigurationError, AskModelSelectionError, askModelCatalog, resolveAskModel,
 } from '../src/ask-models';
 import {
-  MAX_ASK_TOOL_CALLS, createAskReadTools, createAskTools, extractAskToolCalls, finalAskMessages, runAskToolLoop, type AskTool,
+  MAX_ASK_TOOL_CALLS, askToolDefinitions, createAskReadTools, createAskTools, extractAskToolCalls, finalAskMessages, runAskToolLoop, type AskTool,
 } from '../src/ask-tools';
-import { listWorkspaceProjects, searchWorkspaceTasks } from '../src/lib/workspace-operations';
+import { listWorkspaceProjects, searchWorkspaceTasks, workspaceProjectTagVocabulary } from '../src/lib/workspace-operations';
 import { NORIQ_ASK_SYSTEM_PROMPT, NORIQ_ASK_SYSTEM_PROMPT_VERSION } from '../src/ask-system-prompt';
 import {
   askTaskReferenceSources, formatAskTaskReferenceContext, parseAskTaskReferences, resolveAskTaskReferenceSelections, resolveAskTaskReferences,
@@ -585,6 +585,16 @@ describe('Ask workspace read catalog', () => {
   });
 });
 
+/** Extract the `tags` param description from the exact JSON schema `askToolDefinitions` sends
+ * the model as `tools[].function.parameters` — the model surface, not a helper's return value.
+ * This is what proves PLNR-428's fix: the schema, not some intermediate lookup. */
+function createTaskTagsGuidance(tools: AskTool[]): string {
+  const definitions = askToolDefinitions(tools);
+  const createDef = definitions.find((def) => (def.function as { name: string }).name === 'propose_task_create')!;
+  const parameters = (createDef.function as { parameters: { properties: { tags: { description: string } } } }).parameters;
+  return parameters.properties.tags.description;
+}
+
 describe('Ask confirmed single-task actions', () => {
   const proposalTools = async (label: string) => {
     const owner = await env.DB.prepare('SELECT owner_user_id AS id FROM projects WHERE id = ?')
@@ -593,7 +603,7 @@ describe('Ask confirmed single-task actions', () => {
     const generation = await createAskGeneration(env.DB, owner!.id, thread.id, label, []);
     return {
       owner: owner!, thread, generation,
-      tools: createAskTools(env as unknown as Env, { userId: owner!.id }, [{ id: projectId, key: 'ASK', name: 'askable' }], {
+      tools: await createAskTools(env as unknown as Env, { userId: owner!.id }, [{ id: projectId, key: 'ASK', name: 'askable' }], {
         userId: owner!.id, threadId: thread.id, messageId: generation.messageId, generationId: generation.id,
       }),
     };
@@ -771,6 +781,80 @@ describe('Ask confirmed single-task actions', () => {
     );
     expect(failed).toMatchObject({ status: 'failed', error: expect.stringMatching(/board.*not found/i) });
     expect(await env.DB.prepare('SELECT id FROM tasks WHERE project_id = ? AND title = ?').bind(projectId, title).first()).toBeNull();
+  });
+});
+
+// PLNR-428: `propose_task_create` told the model to "reuse the project vocabulary" while nothing
+// in Ask's context ever carried that vocabulary, so the model minted novel tags instead of
+// existing ones. These assert the fix at the actual model surface — the JSON schema
+// `askToolDefinitions` sends as `tools[].function.parameters` — not merely that some lookup
+// helper can return tags.
+describe('Ask task tag vocabulary reaches the propose_task_create model surface (PLNR-428)', () => {
+  it('carries the target project\'s existing tags, most-used first, in the tags parameter schema', async () => {
+    // Isolated fixture project (not the shared `projectId` other tests in this file also tag)
+    // so the usage-count ordering assertion below cannot be perturbed by test execution order.
+    const created = await mcpCall(agent.apiKey, 'create_project', { key: 'ATV', name: 'Ask tag vocabulary' });
+    const vocabProjectId = created.body.id as string;
+    await mcpCall(agent.apiKey, 'create_task', { projectId: vocabProjectId, title: 'a', tags: ['board-filters'] });
+    await mcpCall(agent.apiKey, 'create_task', { projectId: vocabProjectId, title: 'b', tags: ['board-filters'] });
+    await mcpCall(agent.apiKey, 'create_task', { projectId: vocabProjectId, title: 'c', tags: ['ws-resume'] });
+    const owner = await env.DB.prepare('SELECT owner_user_id AS id FROM projects WHERE id = ?')
+      .bind(vocabProjectId).first<{ id: string }>();
+    const thread = await createAskThread(env.DB, owner!.id, 'Tag vocabulary probe');
+    const generation = await createAskGeneration(env.DB, owner!.id, thread.id, 'probe', []);
+    const tools = await createAskTools(
+      env as unknown as Env, { userId: owner!.id }, [{ id: vocabProjectId, key: 'ATV', name: 'Ask tag vocabulary' }],
+      { userId: owner!.id, threadId: thread.id, messageId: generation.messageId, generationId: generation.id },
+    );
+    const guidance = createTaskTagsGuidance(tools);
+    expect(guidance).toContain('ATV: ');
+    expect(guidance).toContain('board-filters');
+    expect(guidance).toContain('ws-resume');
+    expect(guidance.indexOf('board-filters')).toBeLessThan(guidance.indexOf('ws-resume'));
+    expect(guidance).toMatch(/reuse the project vocabulary/i);
+  });
+
+  it('still offers a working propose_task_create in a project with no tags yet', async () => {
+    const created = await mcpCall(agent.apiKey, 'create_project', { key: 'ETV', name: 'Empty tag vocabulary' });
+    const emptyProjectId = created.body.id as string;
+    const owner = await env.DB.prepare('SELECT owner_user_id AS id FROM projects WHERE id = ?')
+      .bind(emptyProjectId).first<{ id: string }>();
+    const thread = await createAskThread(env.DB, owner!.id, 'Empty vocabulary probe');
+    const generation = await createAskGeneration(env.DB, owner!.id, thread.id, 'probe', []);
+    const tools = await createAskTools(
+      env as unknown as Env, { userId: owner!.id }, [{ id: emptyProjectId, key: 'ETV', name: 'Empty tag vocabulary' }],
+      { userId: owner!.id, threadId: thread.id, messageId: generation.messageId, generationId: generation.id },
+    );
+    expect(createTaskTagsGuidance(tools)).toContain('ETV: (no tags yet)');
+
+    const title = `Ask empty vocabulary create ${crypto.randomUUID()}`;
+    const result = JSON.parse((await tools.find((tool) => tool.name === 'propose_task_create')!.execute({
+      projectId: emptyProjectId, title, tags: ['fresh-topic'],
+    })).content) as { action: { id: string } };
+    const approved = await approveAskAction(env as unknown as Env, { id: owner!.id, name: 'Agent Mint' }, result.action.id, ASK_TASK_ACTION_EXECUTORS);
+    expect(approved).toMatchObject({ status: 'approved', error: null });
+    expect(await env.DB.prepare('SELECT id FROM tasks WHERE project_id = ? AND title = ?').bind(emptyProjectId, title).first()).toBeTruthy();
+  });
+
+  it('never surfaces a project\'s tags through a scope that cannot reach it', async () => {
+    const other = await createUser(`ask-tag-scope-${crypto.randomUUID()}@example.com`, 'Ask Tag Scope', 'longenough1');
+    const thread = await createAskThread(env.DB, other.id, 'Tag scope probe');
+    const generation = await createAskGeneration(env.DB, other.id, thread.id, 'probe', []);
+    // `other` cannot reach `projectId` (owned by the ASK-agent's minting user), but the caller
+    // still hands its AskProject object through `projects` — mirroring the same defense-in-depth
+    // ask-tools.ts:415 applies when it re-checks `byId` against listWorkspaceProjects.
+    const tools = await createAskTools(
+      env as unknown as Env, { userId: other.id }, [{ id: projectId, key: 'ASK', name: 'askable' }],
+      { userId: other.id, threadId: thread.id, messageId: generation.messageId, generationId: generation.id },
+    );
+    const guidance = createTaskTagsGuidance(tools);
+    expect(guidance).not.toContain('payments');
+    expect(guidance).toContain('ASK: (no tags yet)');
+
+    // Same re-check directly against the new workspace-operations helper: an out-of-scope
+    // project id in the request list is silently dropped, never answered with its real tags.
+    const direct = await workspaceProjectTagVocabulary(env, { userId: other.id }, [projectId]);
+    expect(direct.has(projectId)).toBe(false);
   });
 });
 
