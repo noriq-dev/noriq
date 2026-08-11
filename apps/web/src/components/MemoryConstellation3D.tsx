@@ -377,7 +377,8 @@ export function MemoryConstellation3D({
             const group = instances.filter((node) => constellation3DIsDimmed(node, searchActive) === faded);
             if (group.length === 0) continue;
             const geometry = geometryFor(THREE, shape);
-            const material = new THREE.MeshBasicMaterial({ transparent: faded, opacity: faded ? (searchActive ? CONSTELLATION_IGNITE_DIM_OPACITY : 0.42) : 1, vertexColors: true });
+            // Geometry vertex colors have no attribute here and would multiply instance tints into black.
+            const material = new THREE.MeshBasicMaterial({ transparent: faded, opacity: faded ? (searchActive ? CONSTELLATION_IGNITE_DIM_OPACITY : 0.42) : 1 });
             const mesh = new THREE.InstancedMesh(geometry, material, group.length);
             mesh.userData.nodeIds = group.map((node) => node.id);
             group.forEach((node, index) => {
@@ -427,14 +428,15 @@ export function MemoryConstellation3D({
         // the PLNR-379 honesty rule reserves for a genuinely resident community.
         const communityNodes = [...nodeById.values()].filter((node) => node.community && !node.offPageStandIn);
         if (communityNodes.length > 0) {
+          // Geometry vertex colors have no attribute here and would multiply instance tints into black.
           const outer = new THREE.InstancedMesh(
             new THREE.SphereGeometry(1, 12, 8),
-            new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.1, vertexColors: true, depthWrite: false }),
+            new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.1, depthWrite: false }),
             communityNodes.length,
           );
           const mid = new THREE.InstancedMesh(
             new THREE.SphereGeometry(1, 12, 8),
-            new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.22, vertexColors: true, depthWrite: false }),
+            new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.22, depthWrite: false }),
             communityNodes.length,
           );
           outer.renderOrder = -2;
