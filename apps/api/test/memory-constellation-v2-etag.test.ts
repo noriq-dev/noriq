@@ -12,7 +12,7 @@ const revision: ConstellationV2Revision = {
 
 describe('Constellation v2 ETag identity (PLNR-466)', () => {
   it('is stable and includes the declared read-time serialization version', async () => {
-    expect(CONSTELLATION_READ_VERSION).toBe('read-v3');
+    expect(CONSTELLATION_READ_VERSION).toBe('read-v4');
     const identity = '/api/projects/p1/memory/constellation/v2/overview';
     const current = constellationEtagInput(revision, identity, 'verbose-v1');
     const repeated = constellationEtagInput(revision, identity, 'verbose-v1');

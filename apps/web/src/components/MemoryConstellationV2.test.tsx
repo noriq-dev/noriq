@@ -16,7 +16,7 @@ vi.mock('./MemoryConstellation3D', () => ({
   },
 }));
 
-import { MemoryConstellationV2 } from './MemoryConstellationV2';
+import { constellationLensStorageKey, MemoryConstellationV2 } from './MemoryConstellationV2';
 
 const revision: ApiConstellationV2Revision = { contract: 'constellation-v2', generationId: 'g1', sourceRevision: 1, currentRevision: 1, topologyVersion: 'connectivity-v1', layoutVersion: 'space-v1', state: 'current', generatedAt: 'now' };
 const rootCommunity = { id: 'root', parentId: null, level: 0, label: 'Root community', memberCount: 2, childCommunityCount: 0, typeCounts: { memory: 2 }, internalEdgeCount: 1, internalWeight: 1, normalizedCohesion: 1, boundaryWeight: 0, anchor: [0, 0, 0] as [number, number, number] };
@@ -32,7 +32,56 @@ const tick = (ms = 0) => act(async () => { await new Promise((resolve) => setTim
 
 afterEach(() => {
   act(() => root?.unmount()); root = null; host?.remove(); vi.restoreAllMocks();
+  localStorage.removeItem(constellationLensStorageKey('p1'));
   mockRenderer3D.failOnMount = true; mockRenderer3D.props = null;
+});
+
+describe('MemoryConstellationV2 anchor lenses and ambient field (PLNR-471)', () => {
+  const ambientEntity = {
+    ...entity('ambient-task'), uri: 'noriq://task/ambient-task', type: 'task', label: 'Ambient task',
+    kind: null, authority: null, isLead: null, communityId: null, position: [240, -80, 20] as [number, number, number],
+  };
+
+  it('defaults to memories, renders its ambient field under the empty-state notice, and persists a plans switch', async () => {
+    mockRenderer3D.failOnMount = false;
+    const overviewRequest = vi.spyOn(api, 'memoryConstellationV2Overview').mockImplementation(async (_pid, activeLens) => activeLens === 'plans'
+      ? { revision, lens: 'plans', communities: [rootCommunity], routes: [], ambient: { count: 0, entities: [] }, coverage: { complete: true, reasons: [] } }
+      : { revision, lens: 'memories', communities: [], routes: [], ambient: { count: 692, entities: [ambientEntity] }, coverage: { complete: false, reasons: ['excluded-at-this-level'] } });
+    vi.spyOn(api, 'memoryConstellationV2Community').mockResolvedValue(page('a', null));
+    host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
+    act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
+    await tick(); await tick();
+
+    expect(overviewRequest).toHaveBeenCalledWith('p1', 'memories', expect.any(AbortSignal));
+    expect(host.textContent).toContain('No memory systems yet.');
+    expect(host.textContent).toContain('1 of 692 ambient shown');
+    expect((mockRenderer3D.props?.nodes as Array<{ id: string; ambient?: boolean }>)).toEqual([
+      expect.objectContaining({ id: 'ambient-task', ambient: true }),
+    ]);
+    const lensGroup = host.querySelector('[role="group"][aria-label="Constellation lens"]')!;
+    expect(lensGroup.textContent).toBe('MemoriesPlans');
+    const plansButton = [...lensGroup.querySelectorAll('button')].find((button) => button.textContent === 'Plans')!;
+    act(() => plansButton.click()); await tick(); await tick();
+
+    expect(localStorage.getItem(constellationLensStorageKey('p1'))).toBe('plans');
+    expect(overviewRequest).toHaveBeenCalledWith('p1', 'plans', expect.any(AbortSignal));
+    expect(host.textContent).not.toContain('No memory systems yet.');
+    expect(host.textContent).toContain('1 system · 2 entities · 0 ambient');
+    const catalogue = [...host.querySelectorAll('button')].find((button) => button.textContent === 'Catalogue')!;
+    act(() => catalogue.click());
+    expect(host.querySelector('[role="group"][aria-label="Constellation lens"]')).not.toBeNull();
+  });
+
+  it('restores the project-specific persisted lens before the first overview request', async () => {
+    localStorage.setItem(constellationLensStorageKey('p1'), 'plans');
+    const overviewRequest = vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({
+      revision, lens: 'plans', communities: [], routes: [], ambient: { count: 0, entities: [] }, coverage: { complete: true, reasons: [] },
+    });
+    host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
+    act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
+    await tick();
+    expect(overviewRequest).toHaveBeenCalledWith('p1', 'plans', expect.any(AbortSignal));
+  });
 });
 
 describe('MemoryConstellationV2 graceful textual parity', () => {
@@ -84,7 +133,7 @@ describe('MemoryConstellationV2 continuous-space chrome and resident meter (PLNR
     expect(host.textContent).toContain('Constellation');
     expect(host.textContent).toContain('v2');
     expect(host.textContent).toContain('g1 · current');
-    expect(host.textContent).toContain('1 community · 2 entities');
+    expect(host.textContent).toContain('1 system · 2 entities · 0 ambient');
 
     // Renderer failure (forced by the MemoryConstellation3D mock above) puts the view toggle into
     // Catalogue and disables the now-meaningless Space segment — it stays visible, not hidden.
@@ -469,7 +518,7 @@ describe('MemoryConstellationV2 status notice does not overlap Catalogue rows (P
     act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
     await tick(); await tick();
 
-    expect(host.textContent).toContain('No memory entities are present in this completed generation.');
+    expect(host.textContent).toContain('No memory systems yet.');
     const notices = [...host.querySelectorAll('[role="status"]')];
     expect(notices.length).toBeGreaterThan(0);
     const noticeContainer = notices[0]!.parentElement!;
@@ -510,7 +559,7 @@ describe('MemoryConstellationV2 search ignite (PLNR-441)', () => {
     // This suite's default mock forces Catalogue (renderer failure on mount), so this exercises
     // the TEXTUAL equivalent (PLNR-442): a flat list has no field to dim, so unmatched rows are
     // simply left unmarked rather than dimmed — never silently shortened to matches-only.
-    expect(host.textContent).toContain('1 match ignited across 1 community · non-matches unmarked, not removed');
+    expect(host.textContent).toContain('1 match ignited across 1 system · non-matches unmarked, not removed');
 
     const panel = host.querySelector('[aria-label="Search matches"]') as HTMLElement;
     expect(panel).toBeTruthy();
@@ -549,7 +598,7 @@ describe('MemoryConstellationV2 search ignite (PLNR-441)', () => {
     await tick(); await tick();
     // Same exact-URI route focusHit's click path already uses — preserved exactly, just reachable
     // from the keyboard too, matching the results header's own "↵ focuses top" hint.
-    expect(api.memoryConstellationV2Route).toHaveBeenCalledWith('p1', 'noriq://memory/a');
+    expect(api.memoryConstellationV2Route).toHaveBeenCalledWith('p1', 'noriq://memory/a', 'memories');
   });
 
   it('replaces the encoding legend with the ignite legend while a search is active, and restores it when the query clears', async () => {

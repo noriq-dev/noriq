@@ -36,6 +36,29 @@ describe('constellation 3D buffer planning', () => {
     expect(constellation3DCommunityWellScale(constellation3DNodeEncoding(node('e')))).toBe(constellation3DNodeEncoding(node('e')).scale);
   });
 
+  it('renders anchor entities as larger luminous entity-shaped suns and phase wells at a reduced scale', () => {
+    const anchor = constellation3DNodeEncoding(node('plan', 'plan', {
+      community: true, anchorEntity: true, systemId: 'system', memberCount: 80, communityLevel: 0,
+    }));
+    const ordinary = constellation3DNodeEncoding(node('ordinary', 'plan'));
+    const phase = constellation3DNodeEncoding(node('phase', 'community', {
+      community: true, memberCount: 12, communityLevel: 1,
+    }));
+    expect(anchor.shape).toBe('dodecahedron');
+    expect(anchor.scale).toBeGreaterThan(ordinary.scale);
+    expect(constellation3DColorType(anchor)).toBe('plan');
+    expect(constellation3DCommunityWellScale(phase)).toBeLessThan(CONSTELLATION_COMMUNITY_WELL_SCALE_FLOOR);
+  });
+
+  it('keeps ambient entities small and dim and outside the standing label budget until selected', () => {
+    const ambient = node('dust', 'task', { ambient: true });
+    const encoded = constellation3DNodeEncoding(ambient);
+    expect(encoded.scale).toBeLessThan(constellation3DNodeEncoding(node('task', 'task')).scale);
+    expect(encoded.opacity).toBeLessThan(0.5);
+    expect(buildConstellation3DRenderPlan([ambient], [], null).labels).toEqual([]);
+    expect(buildConstellation3DRenderPlan([ambient], [], 'dust').labels.map((label) => label.id)).toEqual(['dust']);
+  });
+
   it('derives bounded deterministic per-node lightness variation with both signs', () => {
     const first = constellation3DNodeLightnessVariance('task-42');
     expect(constellation3DNodeLightnessVariance('task-42')).toBe(first);
@@ -122,6 +145,16 @@ describe('constellation 3D buffer planning', () => {
     expect(plan.baseEdges[0]!.width).toBeCloseTo(2);
     expect(plan.baseEdges.at(-1)!.width).toBeCloseTo(6);
     expect(plan.baseEdges.every((edge) => edge.width >= 2 - 1e-9 && edge.width <= 6 + 1e-9)).toBe(true);
+  });
+
+  it('reuses the well layers for phase children and budgets only their second occupied core shape', () => {
+    const nodes = [
+      node('plan', 'plan', { community: true, anchorEntity: true, systemId: 'root', parentId: null, memberCount: 12 }),
+      node('phase', 'community', { community: true, parentId: 'plan', communityLevel: 1, memberCount: 6 }),
+      node('task', 'task', { parentId: 'phase' }),
+    ];
+    const edges: Constellation3DEdge[] = [{ id: 'phase-route', fromId: 'plan', toId: 'phase', type: 'related_to', direction: 'forward', weight: 1, aggregate: true }];
+    expect(buildConstellation3DRenderPlan(nodes, edges, null).drawCallCeiling).toBe(14);
   });
 
   it('gives a plan with one uniform aggregate weight the midpoint width rather than dividing by zero', () => {
@@ -260,6 +293,12 @@ describe('deterministic galaxy ambience (PLNR-461)', () => {
     expect(constellation3DIsRootScene([
       node('root', 'community', { community: true, parentId: null }),
       node('entity', 'task', { parentId: 'root' }),
+    ])).toBe(true);
+    expect(constellation3DIsRootScene([
+      node('root', 'plan', { community: true, anchorEntity: true, parentId: null }),
+      node('phase', 'community', { community: true, parentId: 'root', communityLevel: 1 }),
+      node('entity', 'task', { parentId: 'phase' }),
+      node('ambient', 'task', { ambient: true, parentId: null }),
     ])).toBe(true);
     expect(constellation3DIsRootScene([node('child', 'community', { community: true, parentId: 'root' })])).toBe(false);
     expect(constellation3DIsRootScene([node('entity')])).toBe(false);

@@ -630,21 +630,23 @@ export const api = {
   // navigating-away human wants to cancel mid-flight.
   memoryConstellation: (pid: string, options?: { includeIsolated?: boolean }, signal?: AbortSignal) =>
     req<ApiConstellation>('POST', `/api/projects/${pid}/memory/constellation`, options ?? {}, signal),
-  memoryConstellationV2Overview: (pid: string, signal?: AbortSignal) =>
-    constellationReq(`/api/projects/${pid}/memory/constellation/v2/overview`, decodeConstellationV2Overview, signal),
-  memoryConstellationV2Community: (pid: string, communityId: string, input: { cursor?: string; limit?: number } = {}, signal?: AbortSignal) => {
+  memoryConstellationV2Overview: (pid: string, lens: ApiConstellationLens = 'plans', signal?: AbortSignal) =>
+    constellationReq(`/api/projects/${pid}/memory/constellation/v2/overview?lens=${lens}`, decodeConstellationV2Overview, signal),
+  memoryConstellationV2Community: (pid: string, communityId: string, input: { cursor?: string; limit?: number; lens?: ApiConstellationLens } = {}, signal?: AbortSignal) => {
     const query = new URLSearchParams();
     if (input.cursor) query.set('cursor', input.cursor);
     if (input.limit) query.set('limit', String(input.limit));
+    if (input.lens) query.set('lens', input.lens);
     const suffix = query.size ? `?${query}` : '';
     return constellationReq(`/api/projects/${pid}/memory/constellation/v2/communities/${encodeURIComponent(communityId)}${suffix}`, decodeConstellationV2CommunityPage, signal);
   },
-  memoryConstellationV2Route: (pid: string, uri: string, signal?: AbortSignal) =>
-    constellationReq(`/api/projects/${pid}/memory/constellation/v2/route?uri=${encodeURIComponent(uri)}`, decodeConstellationV2EntityRoute, signal),
-  memoryConstellationV2Incidents: (pid: string, nodeId: string, input: { cursor?: string; limit?: number } = {}, signal?: AbortSignal) => {
+  memoryConstellationV2Route: (pid: string, uri: string, lens: ApiConstellationLens = 'plans', signal?: AbortSignal) =>
+    constellationReq(`/api/projects/${pid}/memory/constellation/v2/route?uri=${encodeURIComponent(uri)}&lens=${lens}`, decodeConstellationV2EntityRoute, signal),
+  memoryConstellationV2Incidents: (pid: string, nodeId: string, input: { cursor?: string; limit?: number; lens?: ApiConstellationLens } = {}, signal?: AbortSignal) => {
     const query = new URLSearchParams();
     if (input.cursor) query.set('cursor', input.cursor);
     if (input.limit) query.set('limit', String(input.limit));
+    if (input.lens) query.set('lens', input.lens);
     const suffix = query.size ? `?${query}` : '';
     return constellationReq(`/api/projects/${pid}/memory/constellation/v2/entities/${encodeURIComponent(nodeId)}/incidents${suffix}`, decodeConstellationV2IncidentPage, signal);
   },
@@ -1846,12 +1848,14 @@ export interface ApiConstellationV2Revision {
   contract: 'constellation-v2'; generationId: string; sourceRevision: number; currentRevision: number;
   topologyVersion: string; layoutVersion: string; state: 'current' | 'stale' | 'building'; generatedAt: string;
 }
+export type ApiConstellationLens = 'memories' | 'plans';
 export interface ApiConstellationV2Coverage {
   complete: boolean;
   reasons: Array<'page-limit-reached' | 'generation-stale' | 'excluded-at-this-level'>;
 }
 export interface ApiConstellationV2Community {
   id: string; parentId: string | null; level: number; label: string; memberCount: number; childCommunityCount: number;
+  coreNodeId?: string | null;
   typeCounts: Record<string, number>; internalEdgeCount: number; internalWeight: number; normalizedCohesion: number;
   boundaryWeight: number; anchor: [number, number, number];
 }
@@ -1859,24 +1863,25 @@ export interface ApiConstellationV2RouteEdge {
   fromCommunityId: string; toCommunityId: string; direction: 'forward' | 'reverse' | 'both'; count: number; weight: number; byType: Record<string, number>;
 }
 export interface ApiConstellationV2Entity extends Omit<ApiConstellationNode, 'createdAt'> {
-  boundaryDegree: number; communityId: string; position: [number, number, number];
+  boundaryDegree: number; communityId: string | null; position: [number, number, number];
 }
 export interface ApiConstellationV2RawEdge {
   edgeId: string; type: string; fromNodeId: string; toNodeId: string; direction: 'forward'; provenance: string | null; weight: number; historical: boolean;
 }
 export interface ApiConstellationV2Overview {
-  revision: ApiConstellationV2Revision; communities: ApiConstellationV2Community[]; routes: ApiConstellationV2RouteEdge[]; coverage: ApiConstellationV2Coverage;
+  revision: ApiConstellationV2Revision; lens?: ApiConstellationLens; communities: ApiConstellationV2Community[]; routes: ApiConstellationV2RouteEdge[];
+  ambient?: { count: number; entities: ApiConstellationV2Entity[] }; coverage: ApiConstellationV2Coverage;
 }
 export interface ApiConstellationV2CommunityPage {
-  revision: ApiConstellationV2Revision; community: ApiConstellationV2Community; kind: 'communities' | 'entities';
+  revision: ApiConstellationV2Revision; lens?: ApiConstellationLens; community: ApiConstellationV2Community; kind: 'communities' | 'entities';
   communities: ApiConstellationV2Community[]; entities: ApiConstellationV2Entity[]; backboneEdges: ApiConstellationV2RawEdge[]; routes: ApiConstellationV2RouteEdge[];
   externalCommunities: ApiConstellationV2Community[]; nextCursor: string | null; coverage: ApiConstellationV2Coverage;
 }
 export interface ApiConstellationV2EntityRoute {
-  revision: ApiConstellationV2Revision; nodeId: string; uri: string; communityPath: ApiConstellationV2Community[];
+  revision: ApiConstellationV2Revision; lens?: ApiConstellationLens; nodeId: string; uri: string; communityPath: ApiConstellationV2Community[]; ambient?: boolean;
 }
 export interface ApiConstellationV2IncidentPage {
-  revision: ApiConstellationV2Revision;
+  revision: ApiConstellationV2Revision; lens?: ApiConstellationLens;
   node: { nodeId: string; uri: string; type: string; label: string; communityPath: ApiConstellationV2Community[] };
   edges: Array<{ edgeId: string; type: string; direction: 'incoming' | 'outgoing'; provenance: string | null; endpoint: { nodeId: string; uri: string; type: string; label: string; communityPath: ApiConstellationV2Community[] } }>;
   nextCursor: string | null; coverage: ApiConstellationV2Coverage;
@@ -1906,7 +1911,7 @@ function decodeConstellationV2CommunityPage(wire: unknown): ApiConstellationV2Co
   if (!('encoding' in page) || page.encoding !== 'constellation-v2-community-v1') return page as ApiConstellationV2CommunityPage;
   const d = page.dictionary;
   return {
-    revision: page.revision, community: page.community, kind: page.kind, communities: page.communities,
+    revision: page.revision, lens: page.lens, community: page.community, kind: page.kind, communities: page.communities,
     externalCommunities: page.externalCommunities, nextCursor: page.nextCursor, coverage: page.coverage,
     entities: page.entities.map((entity) => ({
       nodeId: d.ids[entity[0]]!, uri: d.uris[entity[1]]!, type: d.types[entity[2]]!, kind: d.kinds[entity[3]]!,
@@ -1934,7 +1939,7 @@ function decodeConstellationV2IncidentPage(wire: unknown): ApiConstellationV2Inc
   if (!('encoding' in page) || page.encoding !== 'constellation-v2-incidents-v1') return page as ApiConstellationV2IncidentPage;
   const d = page.dictionary;
   return {
-    revision: page.revision,
+    revision: page.revision, lens: page.lens,
     node: { nodeId: d.ids[page.node[0]]!, uri: d.uris[page.node[1]]!, type: d.types[page.node[2]]!, label: d.labels[page.node[3]]!, communityPath: page.node[4] },
     edges: page.edges.map((edge) => ({
       edgeId: d.ids[edge[0]]!, type: d.types[edge[1]]!, direction: edge[2], provenance: edge[3],

@@ -22,6 +22,34 @@ const page = (entities: Array<{ nodeId: string; uri: string }>, nextCursor: stri
 });
 
 describe('Constellation v2 scene assembly', () => {
+  it('maps a resident coreNodeId to the real anchor-entity sun, nests phase sub-wells, and keeps ambient entities unclustered', () => {
+    const root = { ...community('root'), coreNodeId: 'plan-core', childCommunityCount: 1, memberCount: 4, typeCounts: { plan: 1, task: 3 } };
+    const phase = { ...community('phase', 'root'), label: 'Foundation', memberCount: 3, typeCounts: { task: 3 }, anchor: [120, 15, -4] as [number, number, number] };
+    const planPage: ApiConstellationV2CommunityPage = {
+      revision, lens: 'plans', community: root, kind: 'entities', communities: [phase],
+      entities: [
+        { nodeId: 'plan-core', uri: 'noriq://plan/core', type: 'plan', kind: null, label: 'Core plan', authority: null, validity: null, isLead: null, leadReasons: null, degree: 3, boundaryDegree: 0, groupKey: 'plan', communityId: 'root', position: [9, 9, 9] },
+        { nodeId: 'phase-task', uri: 'noriq://task/phase', type: 'task', kind: null, label: 'Phase task', authority: null, validity: null, isLead: null, leadReasons: null, degree: 1, boundaryDegree: 0, groupKey: 'task', communityId: 'phase', position: [121, 15, -4] },
+      ],
+      backboneEdges: [], routes: [], externalCommunities: [], nextCursor: null, coverage: { complete: true, reasons: [] },
+    };
+    const lensOverview: ApiConstellationV2Overview = {
+      revision, lens: 'plans', communities: [root], routes: [],
+      ambient: { count: 1, entities: [{ nodeId: 'ambient', uri: 'noriq://task/ambient', type: 'task', kind: null, label: 'Ambient', authority: null, validity: null, isLead: null, leadReasons: null, degree: 0, boundaryDegree: 0, groupKey: 'task', communityId: null, position: [-300, 20, 80] }] },
+      coverage: { complete: true, reasons: [] },
+    };
+    const scene = assembleConstellationV2Scene(lensOverview, planPage, []);
+
+    expect(scene.nodes.some((node) => node.id === 'root')).toBe(false);
+    expect(scene.nodes.find((node) => node.id === 'plan-core')).toMatchObject({
+      uri: 'noriq://plan/core', type: 'plan', community: true, anchorEntity: true,
+      systemId: 'root', parentId: null, position: root.anchor, memberCount: 4,
+    });
+    expect(scene.nodes.find((node) => node.id === 'phase')).toMatchObject({ community: true, communityLevel: 1, parentId: 'plan-core' });
+    expect(scene.nodes.find((node) => node.id === 'phase-task')).toMatchObject({ parentId: 'phase' });
+    expect(scene.nodes.find((node) => node.id === 'ambient')).toMatchObject({ ambient: true, parentId: null });
+  });
+
   it('merges pages without duplicating entities and preserves complete reachability', () => {
     const first = page([{ nodeId: 'a', uri: 'noriq://memory/a' }], 'cursor');
     const second = page([{ nodeId: 'b', uri: 'noriq://task/b' }], null);

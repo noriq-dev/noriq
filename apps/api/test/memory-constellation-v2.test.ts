@@ -170,6 +170,47 @@ describe('ProjectMemory Constellation v2 bounded reads', () => {
     ]);
   });
 
+  it('returns direct plan-system members alongside phase child communities', async () => {
+    const pid = await newOwnedProject('pm-v2-phase-direct@example.com', 'PMV2PHAS');
+    const { nodeId: plan } = await memory(pid).writeNode(pid, { type: 'plan', uri: 'noriq://plan/phase-root', label: 'Plan sun', actor: SYSTEM });
+    const { nodeId: agent } = await memory(pid).writeNode(pid, { type: 'agent', uri: 'noriq://agent/direct', label: 'Direct agent', actor: SYSTEM });
+    const { nodeId: task } = await memory(pid).writeNode(pid, { type: 'task', uri: 'noriq://task/phase-member', label: 'Phase task', actor: SYSTEM });
+    const root = {
+      id: 'phase-root', parentId: null, level: 0, label: 'Plan sun', coreNodeId: plan, memberCount: 3, childCount: 1,
+      typeCounts: { plan: 1, agent: 1, task: 1 }, internalEdgeCount: 0, internalWeight: 0, normalizedCohesion: 1,
+      boundaryWeight: 0, anchor: [100, 50, -20] as [number, number, number],
+    };
+    const child = {
+      id: 'phase-child', parentId: root.id, level: 1, label: 'Foundation', coreNodeId: null, memberCount: 1, childCount: 0,
+      typeCounts: { task: 1 }, internalEdgeCount: 0, internalWeight: 0, normalizedCohesion: 1,
+      boundaryWeight: 0, anchor: [130, 50, -20] as [number, number, number],
+    };
+    const generation = await memory(pid).beginConstellationGeneration(pid, { topologyVersion: 'anchor-lens-v2', layoutVersion: 'space-v1' });
+    await memory(pid).stageConstellationGeneration(pid, generation.generationId, {
+      lenses: [
+        {
+          lens: 'plans', communities: [root, child], links: [], ambientNodeIds: [],
+          nodeStats: [plan, agent, task].map((nodeId) => ({ nodeId, degree: 0, weightedDegree: 0, rank: 0, boundaryDegree: 0 })),
+          memberships: [
+            { nodeId: plan, communityId: root.id, level: 0 },
+            { nodeId: agent, communityId: root.id, level: 0 },
+            { nodeId: task, communityId: child.id, level: 1 },
+          ],
+        },
+        { lens: 'memories', nodeStats: [], communities: [], memberships: [], ambientNodeIds: [], links: [] },
+      ],
+    });
+    await memory(pid).completeConstellationGeneration(pid, generation.generationId);
+    await memory(pid).activateConstellationGeneration(pid, generation.generationId);
+
+    const rootPage = await memory(pid).constellationV2Community(pid, root.id, { lens: 'plans', limit: 256 }) as ConstellationV2CommunityPage;
+    expect(rootPage.kind).toBe('communities');
+    expect(rootPage.communities).toEqual([expect.objectContaining({ id: child.id, label: 'Foundation' })]);
+    expect(rootPage.entities.map((entity) => entity.nodeId).sort()).toEqual([agent, plan].sort());
+    const childPage = await memory(pid).constellationV2Community(pid, child.id, { lens: 'plans', limit: 256 }) as ConstellationV2CommunityPage;
+    expect(childPage.entities.map((entity) => entity.nodeId)).toEqual([task]);
+  });
+
   it('enumerates every entity, resolves exact symbols, and pages incoming/outgoing incidents', async () => {
     const pid = await newOwnedProject('pm-v2-pages@example.com', 'PMV2PAGE');
     const { nodeId: center } = await memory(pid).writeNode(pid, { type: 'file', uri: 'noriq://file/v2-center', label: 'center', actor: SYSTEM });

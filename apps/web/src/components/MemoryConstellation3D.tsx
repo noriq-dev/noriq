@@ -83,7 +83,20 @@ export function constellation3DCommunityCluster(
   nodes: readonly Constellation3DNode[],
   communityId: string,
 ): Constellation3DNode[] {
-  return nodes.filter((node) => node.id !== communityId && node.parentId === communityId && !node.offPageStandIn);
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const community = nodes.find((node) => node.systemId === communityId || node.id === communityId);
+  if (!community) return [];
+  return nodes.filter((node) => {
+    if (node.id === community.id || node.offPageStandIn || node.ambient) return false;
+    let parentId = node.parentId;
+    const seen = new Set<string>();
+    while (parentId && !seen.has(parentId)) {
+      if (parentId === community.id) return true;
+      seen.add(parentId);
+      parentId = byId.get(parentId)?.parentId;
+    }
+    return false;
+  });
 }
 
 export function constellation3DCommunityClusterCamera(
@@ -164,6 +177,7 @@ interface LabelPosition {
   priority: Constellation3DLabelPriority;
   community?: boolean;
   memberCount?: number;
+  communityLevel?: number;
   promoted: boolean;
   /** The pinned node's own title (PLNR-439) — distinct from `promoted` (which styles a promoted
    *  EDGE label amber): the title stays `--text` coloured but grows to the promoted type scale and
@@ -177,6 +191,8 @@ interface HoverTooltip {
   x: number;
   y: number;
 }
+
+interface HoveredEntityLabel { nodeId: string; text: string; x: number; y: number }
 
 interface RendererState {
   THREE: typeof Three;
@@ -361,6 +377,7 @@ export function MemoryConstellation3D({
   // separation IS the "hover never overrides a pinned selection" guarantee (PLNR-379/PLNR-438):
   // there is no shared variable left for a hover to steal.
   const [hoveredTooltip, setHoveredTooltip] = useState<HoverTooltip | null>(null);
+  const [hoveredEntityLabel, setHoveredEntityLabel] = useState<HoveredEntityLabel | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
   const [layoutNodes, setLayoutNodes] = useState(nodes);
   const priorLayoutRef = useRef<{ generationId: string; layoutVersion: string; positions: Record<string, [number, number, number]> } | undefined>();
@@ -589,10 +606,12 @@ export function MemoryConstellation3D({
           addSolidNodeBucket(shape, instances.filter((node) => !node.community), false);
           communityNodes.push(...instances.filter((node) => node.community));
         }
-        // Memory entities and communities both use spheres, but only the latter are suns. Keeping
-        // cores in one dedicated instanced Lambert bucket permits white-mixed tint + emissive
-        // without bleaching memory planets; at most two faded/unfaded calls cover every core.
-        addSolidNodeBucket('sphere', communityNodes, true);
+        // Real plan/memory anchors retain their entity geometry while receiving the luminous sun
+        // material; synthetic non-resident/phase wells remain spheres. One instanced bucket per
+        // occupied core shape preserves the material split without creating one mesh per system.
+        for (const shape of new Set(communityNodes.map((node) => node.shape))) {
+          addSolidNodeBucket(shape, communityNodes.filter((node) => node.shape === shape), true);
+        }
 
         const leadNodes = layoutNodes.map(constellation3DNodeEncoding).filter((node) => node.halo);
         if (leadNodes.length > 0) {
@@ -754,7 +773,7 @@ export function MemoryConstellation3D({
             // this community has at least one ignited match, the second line reports the match
             // count instead (screen spec 1c "+N matches") — entities are not resident at this
             // level, so the count is the only truthful thing to say about what matched here.
-            const igniteCount = searchActive ? igniteMatchCounts?.get(node.id) : undefined;
+            const igniteCount = searchActive ? igniteMatchCounts?.get(node.systemId ?? node.id) : undefined;
             const subtext = node.community
               ? (igniteCount ? communityIgniteSubtext(igniteCount) : communityEntitySubtext(node.memberCount ?? 0))
               : undefined;
@@ -766,7 +785,7 @@ export function MemoryConstellation3D({
               subtext, x: (point.x + 1) * width / 2, y: pinned ? y - PINNED_TITLE_OFFSET_PX : y,
               width: node.community ? COMMUNITY_LABEL_WIDTH_PX : ENTITY_LABEL_WIDTH_PX,
               height: node.community ? 30 : 18, priority: pinned ? 'selected' : 'ambient',
-              community: node.community, memberCount: node.memberCount, promoted: false, pinned,
+              community: node.community, communityLevel: node.communityLevel, memberCount: node.memberCount, promoted: false, pinned,
             });
           }
           for (const edge of promoted.slice(0, LABEL_BUDGET)) {
@@ -1049,18 +1068,20 @@ export function MemoryConstellation3D({
     }
     const host = hostRef.current;
     const aspect = host ? Math.max(1, host.clientWidth) / Math.max(1, host.clientHeight) : 1;
-    const clusterCamera = constellation3DCommunityClusterCamera(layoutNodes, node.id, aspect, cameraState);
+    const systemId = node.systemId ?? node.id;
+    const residentRootId = node.residentRootId ?? systemId;
+    const clusterCamera = constellation3DCommunityClusterCamera(layoutNodes, systemId, aspect, cameraState);
     if (clusterCamera) {
       transitionTo(clusterCamera);
       return;
     }
-    if (residentCommunityIdSet.has(node.id)) {
+    if (residentCommunityIdSet.has(residentRootId)) {
       // Empty or type-filtered resident systems still have a truthful anchor to focus.
       transitionTo(focusConstellationCamera(cameraState, node.position, node.radius ?? 70));
       return;
     }
     pendingCommunityZoomRef.current = node.id;
-    void onEnsureCommunityResident?.(node.id).then((loaded) => {
+    void onEnsureCommunityResident?.(residentRootId).then((loaded) => {
       if (!loaded && pendingCommunityZoomRef.current === node.id) pendingCommunityZoomRef.current = null;
     });
   };
@@ -1068,13 +1089,14 @@ export function MemoryConstellation3D({
   // A non-resident double-click cannot fit until React has integrated the fetched page and the
   // worker has laid out its members. Wait for both facts; never fly to a fake placeholder cluster.
   useEffect(() => {
-    const communityId = pendingCommunityZoomRef.current;
-    if (!communityId || !residentCommunityIdSet.has(communityId)) return;
+    const communityNodeId = pendingCommunityZoomRef.current;
+    const community = communityNodeId ? layoutNodes.find((node) => node.id === communityNodeId
+      || node.anchorEntity && node.residentRootId === communityNodeId) : undefined;
+    if (!community || !residentCommunityIdSet.has(community.residentRootId ?? community.systemId ?? community.id)) return;
+    const communityId = community.systemId ?? community.id;
     const sourceHasMembers = constellation3DCommunityCluster(nodes, communityId).length > 0;
     const layoutHasMembers = constellation3DCommunityCluster(layoutNodes, communityId).length > 0;
     if (sourceHasMembers && !layoutHasMembers) return;
-    const community = layoutNodes.find((node) => node.id === communityId);
-    if (!community) return;
     pendingCommunityZoomRef.current = null;
     zoomToNode(community);
   // `zoomToNode` intentionally uses the camera from the render that observes the completed layout.
@@ -1128,13 +1150,21 @@ export function MemoryConstellation3D({
       const point = new state.THREE.Vector3(...node.position).project(state.camera);
       const width = rect.width || 1, height = rect.height || 1;
       state.setHover(node);
+      setHoveredEntityLabel(null);
       setHoveredTooltip({ nodeId: node.id, content, x: (point.x + 1) * width / 2, y: (1 - point.y) * height / 2 });
+      return;
+    }
+    if (node?.ambient) {
+      const point = new state.THREE.Vector3(...node.position).project(state.camera);
+      state.setHover(null); setHoveredTooltip(null);
+      setHoveredEntityLabel({ nodeId: node.id, text: truncateConstellationLabel(node.label, ENTITY_LABEL_MAX_CHARACTERS), x: (point.x + 1) * rect.width / 2, y: (1 - point.y) * rect.height / 2 });
       return;
     }
     state.setHover(null);
     setHoveredTooltip(null);
+    setHoveredEntityLabel(null);
   };
-  const clearHover = () => { rendererRef.current?.setHover(null); setHoveredTooltip(null); };
+  const clearHover = () => { rendererRef.current?.setHover(null); setHoveredTooltip(null); setHoveredEntityLabel(null); };
 
   const dolly = (event: React.WheelEvent<HTMLCanvasElement>) => {
     event.preventDefault();
@@ -1240,7 +1270,7 @@ export function MemoryConstellation3D({
           <div
             style={{
               fontFamily: 'var(--mono)',
-              fontSize: label.promoted ? 11 : label.pinned ? 11.5 : 10.5,
+              fontSize: label.promoted ? 11 : label.pinned ? 11.5 : (label.communityLevel ?? 0) > 0 ? 9.5 : 10.5,
               fontWeight: label.promoted || label.pinned ? 700 : 500,
               // `--amber-select` (#ffd166) is the SELECTION amber, deliberately distinct from
               // `--amber` (#f5a623, status/degraded-data amber) — see theme.css and the Navigator
@@ -1256,6 +1286,11 @@ export function MemoryConstellation3D({
           {label.subtext && <div style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-dim)' }}>{label.subtext}</div>}
         </div>
       ))}
+      {hoveredEntityLabel && !labels.some((label) => label.key === `node:${hoveredEntityLabel.nodeId}`) && (
+        <div style={{ position: 'absolute', left: hoveredEntityLabel.x, top: hoveredEntityLabel.y - 18, transform: 'translate(-50%, -50%)', pointerEvents: 'none', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-soft)', textShadow: '0 1px 4px var(--bg)', whiteSpace: 'nowrap' }}>
+          {hoveredEntityLabel.text}
+        </div>
+      )}
       {hoveredTooltip && <ConstellationHoverTooltip tooltip={hoveredTooltip} hostRef={hostRef} />}
       {failure && <div role="status" style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: 'var(--text-dim)', fontSize: 12 }}>3D view unavailable: {failure}</div>}
     </div>

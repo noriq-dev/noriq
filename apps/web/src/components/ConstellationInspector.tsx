@@ -135,7 +135,8 @@ export function ConstellationInspector({
   pid, selected, incidentPages, relationshipsLoading, expanding,
   onLoadMoreRelationships, onFocusCommunity, onOpenEgoNetwork, onOpenInspector, onClear,
 }: ConstellationInspectorProps) {
-  const isCommunity = Boolean(selected.community);
+  const isSystemAnchor = Boolean(selected.anchorEntity);
+  const isCommunity = Boolean(selected.community && !isSystemAnchor);
   const isMemory = !isCommunity && selected.type === 'memory';
 
   // Cited evidence excerpt (memory selections only) — reuses the EXACT server-rendered, quoted/cited/
@@ -246,6 +247,7 @@ export function ConstellationInspector({
         {identity}
         <div style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: INSPECTOR_TEXT_MID, display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 14 }}>
           <span>degree {selected.degree}</span>
+          {isSystemAnchor && <span>{(selected.memberCount ?? 0).toLocaleString()} system entities · {(selected.boundaryRouteCount ?? 0).toLocaleString()} boundary routes</span>}
           {selected.authority != null && <span style={{ color: authorityTone(selected.authority).color }}>{authorityTone(selected.authority).label}</span>}
           {selected.validity && <span style={{ color: validityTone(selected.validity).color }}>{validityTone(selected.validity).icon} validity {selected.validity}</span>}
         </div>

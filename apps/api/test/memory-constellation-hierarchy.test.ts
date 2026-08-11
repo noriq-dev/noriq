@@ -16,8 +16,8 @@ const node = (id: string, type = 'task', label = id): ConstellationRawNode => ({
   label,
   createdAt: '2026-01-01T00:00:00.000Z',
 });
-const edge = (id: string, fromNodeId: string, toNodeId: string, type = 'related_to'): ConstellationRawEdge => ({
-  edgeId: id, type, fromNodeId, toNodeId, provenance: null,
+const edge = (id: string, fromNodeId: string, toNodeId: string, type = 'related_to', provenance: string | null = null): ConstellationRawEdge => ({
+  edgeId: id, type, fromNodeId, toNodeId, provenance,
 });
 
 const rootForNode = (result: ReturnType<typeof buildConstellationHierarchy>, nodeId: string) => {
@@ -38,7 +38,7 @@ describe('anchorFor', () => {
 
 describe('anchor-lens hierarchy', () => {
   it('uses the anchor-lens topology generation', () => {
-    expect(CONSTELLATION_TOPOLOGY_VERSION).toBe('anchor-lens-v1');
+    expect(CONSTELLATION_TOPOLOGY_VERSION).toBe('anchor-lens-v2');
   });
 
   it('seeds exactly one root per plan, labels it from the anchor, and leaves disconnected base entities ambient', () => {
@@ -135,6 +135,67 @@ describe('anchor-lens hierarchy', () => {
     expect(rootForNode(memories, 'task_a').coreNodeId).toBe('memory_linked');
     expect(rootForNode(memories, 'memory_unlinked').coreNodeId).toBe('memory_unlinked');
     expect(memories.data.ambientNodeIds).toEqual([]);
+  });
+
+  it('creates titled phase children for qualified plan-task provenance while direct members keep orbiting the sun', () => {
+    const nodes = [
+      node('plan_a', 'plan', 'Release plan'),
+      ...Array.from({ length: 7 }, (_, index) => node(`task_${index + 1}`)),
+      node('agent_a', 'agent'),
+    ];
+    const edges = [
+      ...Array.from({ length: 4 }, (_, index) => edge(
+        `alpha_${index}`, 'plan_a', `task_${index + 1}`, 'related_to', 'coordination:phase_tasks:ph_alpha',
+      )),
+      ...Array.from({ length: 3 }, (_, index) => edge(
+        `beta_${index}`, 'plan_a', `task_${index + 5}`, 'related_to', 'coordination:phase_tasks:ph_beta',
+      )),
+      edge('owner', 'plan_a', 'agent_a', 'owned_by'),
+    ];
+    const result = buildConstellationHierarchy(nodes, edges, 'plans', [], {
+      phaseLabels: new Map([['ph_alpha', 'Foundation'], ['ph_beta', 'Verification']]),
+    });
+    const root = result.data.communities.find((community) => community.parentId === null)!;
+    const children = result.data.communities.filter((community) => community.parentId === root.id);
+
+    expect(root).toMatchObject({ coreNodeId: 'plan_a', label: 'Release plan', childCount: 2 });
+    expect(children.map((community) => community.label).sort()).toEqual(['Foundation', 'Verification']);
+    expect(children.map((community) => community.memberCount).sort((a, b) => a - b)).toEqual([3, 4]);
+    expect(result.data.memberships.find((membership) => membership.nodeId === 'plan_a')).toMatchObject({ communityId: root.id, level: 0 });
+    expect(result.data.memberships.find((membership) => membership.nodeId === 'agent_a')).toMatchObject({ communityId: root.id, level: 0 });
+    expect(children.every((child) => Math.hypot(
+      child.anchor[0] - root.anchor[0], child.anchor[1] - root.anchor[1], child.anchor[2] - root.anchor[2],
+    ) > 30)).toBe(true);
+  });
+
+  it('keeps sub-threshold and phase-less plan members direct, and never phases a memories lens', () => {
+    const nodes = [node('plan_a', 'plan'), node('memory_a', 'memory'), node('task_1'), node('task_2')];
+    const edges = [
+      edge('phase_1', 'plan_a', 'task_1', 'related_to', 'coordination:phase_tasks:ph_small'),
+      edge('phase_2', 'plan_a', 'task_2', 'related_to', 'coordination:phase_tasks:ph_small'),
+      edge('evidence', 'memory_a', 'task_1', 'observed_in'),
+    ];
+    const plans = buildConstellationHierarchy(nodes, edges, 'plans');
+    expect(plans.data.communities).toHaveLength(1);
+    expect(plans.data.communities[0]).toMatchObject({ childCount: 0, memberCount: 4 });
+    expect(plans.data.memberships.every((membership) => membership.level === 0)).toBe(true);
+
+    const memories = buildConstellationHierarchy(nodes, edges, 'memories');
+    expect(memories.data.communities).toHaveLength(1);
+    expect(memories.data.communities[0]).toMatchObject({ coreNodeId: 'memory_a', childCount: 0 });
+  });
+
+  it('assigns deterministic Phase N fallbacks by canonical phase id regardless of input order', () => {
+    const nodes = [node('plan_a', 'plan'), ...Array.from({ length: 6 }, (_, index) => node(`task_${index}`))];
+    const edges = [
+      ...Array.from({ length: 3 }, (_, index) => edge(`z_${index}`, 'plan_a', `task_${index}`, 'related_to', 'coordination:phase_tasks:ph_z')),
+      ...Array.from({ length: 3 }, (_, index) => edge(`a_${index}`, 'plan_a', `task_${index + 3}`, 'related_to', 'coordination:phase_tasks:ph_a')),
+    ];
+    const first = buildConstellationHierarchy(nodes, edges, 'plans');
+    const second = buildConstellationHierarchy([...nodes].reverse(), [...edges].reverse(), 'plans');
+    const labels = first.data.communities.filter((community) => community.level === 1).map((community) => community.label).sort();
+    expect(labels).toEqual(['Phase 1', 'Phase 2']);
+    expect(second).toEqual(first);
   });
 
   it('recurses inside an oversized anchored system while preserving the anchor as the root core', () => {

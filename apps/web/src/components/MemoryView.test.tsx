@@ -103,7 +103,7 @@ describe('the memory view lands on the map (PLNR-287)', () => {
       communities: [], routes: [], coverage: { complete: true, reasons: [] },
     });
     mount(); await tick();
-    expect(text()).toContain('No memory entities are present in this completed generation');
+    expect(text()).toContain('No memory systems yet');
     expect([...container.querySelectorAll('button')].some((button) => button.textContent === 'use 2D map')).toBe(true);
   });
 

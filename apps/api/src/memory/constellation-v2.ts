@@ -7,7 +7,7 @@ export const CONSTELLATION_V2_MAX_AMBIENT_ENTITIES = 500;
 export const CONSTELLATION_V2_COMPACT_MEDIA_TYPE = 'application/vnd.noriq.constellation-v2.compact+json';
 // Bump for every read-time response derivation change (position math, compact shapes, or fields):
 // PLNR-465 changed positions without a revision bump and stranded returning browsers on stale 304 bodies.
-export const CONSTELLATION_READ_VERSION = 'read-v3';
+export const CONSTELLATION_READ_VERSION = 'read-v4';
 
 export type ConstellationV2Lens = 'plans' | 'memories';
 

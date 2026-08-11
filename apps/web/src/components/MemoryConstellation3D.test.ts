@@ -54,4 +54,17 @@ describe('MemoryConstellation3D click intent (PLNR-463)', () => {
       target: [0, 0, 0],
     });
   });
+
+  it('fits a real anchor-entity sun and a phase sub-well through their canonical system ids', () => {
+    const nodes = [
+      { id: 'plan-node', systemId: 'root-community', uri: 'noriq://plan/a', label: 'Plan', type: 'plan', position: [0, 0, 0] as [number, number, number], degree: 4, community: true, anchorEntity: true, parentId: null },
+      { id: 'phase-community', systemId: 'phase-community', uri: null, label: 'Phase 1', type: 'community', position: [40, 0, 0] as [number, number, number], degree: 2, community: true, communityLevel: 1, parentId: 'plan-node' },
+      { id: 'phase-a', uri: 'noriq://task/a', label: 'A', type: 'task', position: [34, 0, 0] as [number, number, number], degree: 1, parentId: 'phase-community' },
+      { id: 'phase-b', uri: 'noriq://task/b', label: 'B', type: 'task', position: [46, 0, 0] as [number, number, number], degree: 1, parentId: 'phase-community' },
+      { id: 'direct', uri: 'noriq://agent/a', label: 'Agent', type: 'agent', position: [-20, 0, 0] as [number, number, number], degree: 1, parentId: 'plan-node' },
+    ];
+    expect(constellation3DCommunityCluster(nodes, 'root-community').map((node) => node.id)).toEqual(['phase-community', 'phase-a', 'phase-b', 'direct']);
+    expect(constellation3DCommunityCluster(nodes, 'phase-community').map((node) => node.id)).toEqual(['phase-a', 'phase-b']);
+    expect(constellation3DCommunityClusterCamera(nodes, 'phase-community', 1.5, DEFAULT_CONSTELLATION_3D_CAMERA)?.target[0]).toBeCloseTo(40);
+  });
 });

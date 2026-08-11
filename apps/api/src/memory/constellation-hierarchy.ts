@@ -1,6 +1,6 @@
 import type { ConstellationRawEdge, ConstellationRawNode } from './graph-queries';
 
-export const CONSTELLATION_TOPOLOGY_VERSION = 'anchor-lens-v1';
+export const CONSTELLATION_TOPOLOGY_VERSION = 'anchor-lens-v2';
 export const CONSTELLATION_LAYOUT_VERSION = 'space-v1';
 export const CONSTELLATION_MAX_CHILDREN = 128;
 export const CONSTELLATION_LEAF_SIZE = 500;
@@ -52,9 +52,16 @@ interface DraftCommunity {
   children: DraftCommunity[];
   labelHint?: string;
   coreNodeId?: string;
+  stableKey?: string;
   id?: string;
   level?: number;
   parentId?: string | null;
+}
+
+export interface ConstellationHierarchyOptions {
+  /** Phase titles are coordination metadata, not graph nodes. ProjectMemory supplies the D1
+   * snapshot when available; pure/replayed graph builds fall back to deterministic Phase N names. */
+  phaseLabels?: ReadonlyMap<string, string>;
 }
 
 function fnv64(input: string): string {
@@ -197,6 +204,8 @@ function anchorLensForest(
   rank: ReadonlyMap<string, number>,
   byId: ReadonlyMap<string, ConstellationRawNode>,
   lens: ConstellationLens,
+  edges: readonly ConstellationRawEdge[],
+  options: ConstellationHierarchyOptions,
 ): { forest: DraftCommunity[]; ambientNodeIds: string[] } {
   const { assignments, ambientNodeIds } = assignConstellationAnchors(nodes, adjacency, lens);
   const byAnchor = new Map<string, string[]>();
@@ -211,7 +220,39 @@ function anchorLensForest(
     .sort((a, b) => compareNodeIds(a[0], b[0], byId))
     .map(([anchorId, unsorted]) => {
       const members = unsorted.sort((a, b) => compareNodeIds(a, b, byId));
-      const community = buildCommunity(members, adjacency, rank, byId);
+      let community = buildCommunity(members, adjacency, rank, byId);
+      if (lens === 'plans') {
+        const memberIds = new Set(members);
+        const phaseMembers = new Map<string, Set<string>>();
+        for (const edge of edges) {
+          if (!edge.provenance?.startsWith('coordination:phase_tasks:')) continue;
+          const phaseId = edge.provenance.slice('coordination:phase_tasks:'.length);
+          if (!phaseId) continue;
+          const taskId = edge.fromNodeId === anchorId ? edge.toNodeId : edge.toNodeId === anchorId ? edge.fromNodeId : null;
+          if (!taskId || !memberIds.has(taskId) || byId.get(taskId)?.type !== 'task') continue;
+          const group = phaseMembers.get(phaseId) ?? new Set<string>();
+          group.add(taskId);
+          phaseMembers.set(phaseId, group);
+        }
+        const qualifying = [...phaseMembers]
+          .filter(([, ids]) => ids.size >= 3)
+          .sort((a, b) => a[0].localeCompare(b[0]));
+        if (qualifying.length > 0) {
+          const assigned = new Set(qualifying.flatMap(([, ids]) => [...ids]));
+          const phaseChildren = qualifying.map(([phaseId, ids], index) => ({
+            ...buildCommunity([...ids].sort((a, b) => compareNodeIds(a, b, byId)), adjacency, rank, byId),
+            stableKey: `phase:${phaseId}`,
+            labelHint: boundedLabel(options.phaseLabels?.get(phaseId) ?? `Phase ${index + 1}`),
+          }));
+          // A >500-member residual still receives the established bounded connectivity partition;
+          // ordinary unphased members otherwise remain direct children of the plan sun.
+          const residual = members.filter((id) => !assigned.has(id));
+          const residualChildren = residual.length > CONSTELLATION_LEAF_SIZE
+            ? buildCommunity(residual, adjacency, rank, byId).children
+            : [];
+          community = { members, children: [...phaseChildren, ...residualChildren] };
+        }
+      }
       return { ...community, coreNodeId: anchorId, labelHint: boundedLabel(byId.get(anchorId)!.label) };
     });
   return { forest, ambientNodeIds };
@@ -256,6 +297,8 @@ function assignCommunityIds(
     const anchorUri = community.coreNodeId ? byId.get(community.coreNodeId)!.uri : null;
     community.id = anchorUri
       ? `com_${fnv64(`${CONSTELLATION_TOPOLOGY_VERSION}\0${lens}\0anchor\0${anchorUri}`)}`
+      : community.stableKey
+        ? `com_${fnv64(`${CONSTELLATION_TOPOLOGY_VERSION}\0${lens}\0${parentId ?? 'root'}\0${community.stableKey}`)}`
       : candidates[0]?.prior.id ?? `com_${fnv64(`${CONSTELLATION_TOPOLOGY_VERSION}\0${lens}\0${parentId ?? 'root'}\0${uris.join('\0')}`)}`;
     if (!anchorUri && candidates[0]) used.add(candidates[0].prior.id);
     community.level = level;
@@ -271,6 +314,7 @@ export function buildConstellationHierarchy(
   inputEdges: readonly ConstellationRawEdge[],
   lens: ConstellationLens = 'plans',
   previous: readonly PriorConstellationCommunity[] = [],
+  options: ConstellationHierarchyOptions = {},
 ): HierarchyGenerationResult {
   const nodes = [...inputNodes].sort((a, b) => a.uri.localeCompare(b.uri));
   const byId = new Map(nodes.map((n) => [n.nodeId, n]));
@@ -305,7 +349,7 @@ export function buildConstellationHierarchy(
     weightedDegree.set(edge.toNodeId, weightedDegree.get(edge.toNodeId)! + edge.weight);
   }
   const rank = new Map(nodes.map((n) => [n.nodeId, Math.log2(rawDegree.get(n.nodeId)! + 1) + weightedDegree.get(n.nodeId)!]));
-  const { forest, ambientNodeIds } = anchorLensForest(nodes, adjacency, rank, byId, lens);
+  const { forest, ambientNodeIds } = anchorLensForest(nodes, adjacency, rank, byId, lens, validEdges, options);
   const communities = assignCommunityIds(forest, byId, previous, lens);
 
   const pathByNode = new Map<string, DraftCommunity[]>();
@@ -338,6 +382,24 @@ export function buildConstellationHierarchy(
     }
     for (const id of bIds) if (!aIds.has(id)) connectivity.get(id)!.boundaryWeight += edge.weight;
   }
+  const anchorByCommunity = new Map<string, [number, number, number]>();
+  for (const community of communities) {
+    if (!community.parentId) {
+      anchorByCommunity.set(community.id!, anchorFor(community.id!));
+      continue;
+    }
+    const parent = communities.find((candidate) => candidate.id === community.parentId)!;
+    const parentAnchor = anchorByCommunity.get(parent.id!)!;
+    const direction = anchorFor(community.id!);
+    const length = Math.hypot(...direction) || 1;
+    const parentWell = Math.min(140, Math.max(44, 24 + 17 * Math.cbrt(parent.members.length)));
+    const offset = Math.min(90, Math.max(36, parentWell * 0.48));
+    anchorByCommunity.set(community.id!, [
+      parentAnchor[0] + direction[0] / length * offset,
+      parentAnchor[1] + direction[1] / length * offset,
+      parentAnchor[2] + direction[2] / length * offset,
+    ]);
+  }
   const summaries = communities.map((community) => {
     const { internalEdgeCount, internalWeight, boundaryWeight } = connectivity.get(community.id!)!;
     const typeCounts: Record<string, number> = {};
@@ -346,7 +408,7 @@ export function buildConstellationHierarchy(
       id: community.id!, parentId: community.parentId!, level: community.level!, label: structuralLabel(community, byId),
       memberCount: community.members.length, childCount: community.children.length, typeCounts, internalEdgeCount,
       internalWeight, normalizedCohesion: internalWeight / (internalWeight + boundaryWeight || 1), boundaryWeight,
-      anchor: anchorFor(community.id!), coreNodeId: community.coreNodeId ?? null,
+      anchor: anchorByCommunity.get(community.id!)!, coreNodeId: community.coreNodeId ?? null,
     };
   });
 

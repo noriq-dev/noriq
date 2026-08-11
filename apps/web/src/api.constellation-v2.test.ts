@@ -30,6 +30,27 @@ afterEach(() => {
 });
 
 describe('Constellation v2 client cache', () => {
+  it('threads the selected lens through overview, community, route, and incident requests', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ ...overview('g1'), lens: 'memories', ambient: { count: 0, entities: [] } }, '"o"'))
+      .mockResolvedValueOnce(jsonResponse({ ...community('g1'), lens: 'memories' }, '"c"'))
+      .mockResolvedValueOnce(jsonResponse({ revision: revision('g1'), lens: 'memories', nodeId: 'n1', uri: 'noriq://memory/n1', communityPath: [], ambient: true }, '"r"'))
+      .mockResolvedValueOnce(jsonResponse({ revision: revision('g1'), lens: 'memories', node: { nodeId: 'n1', uri: 'noriq://memory/n1', type: 'memory', label: 'n1', communityPath: [] }, edges: [], nextCursor: null, coverage: { complete: true, reasons: [] } }, '"i"'));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.memoryConstellationV2Overview('p1', 'memories');
+    await api.memoryConstellationV2Community('p1', 'c1', { lens: 'memories' });
+    await api.memoryConstellationV2Route('p1', 'noriq://memory/n1', 'memories');
+    await api.memoryConstellationV2Incidents('p1', 'n1', { lens: 'memories' });
+
+    expect(fetchMock.mock.calls.map((call) => String(call[0]))).toEqual([
+      expect.stringContaining('/overview?lens=memories'),
+      expect.stringContaining('/communities/c1?lens=memories'),
+      expect.stringContaining('/route?uri=noriq%3A%2F%2Fmemory%2Fn1&lens=memories'),
+      expect.stringContaining('/entities/n1/incidents?lens=memories'),
+    ]);
+  });
+
   it('revalidates with ETag and reuses the cached object on 304', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(jsonResponse(overview('g1'), '"etag-g1"'))

@@ -43,7 +43,7 @@ import {
   clampConstellationLimit, constellationAmbientPosition, constellationEntityPosition, cursorMatches, decodeConstellationCursor, encodeConstellationCursor,
   CONSTELLATION_V2_DEFAULT_ENTITY_LIMIT, CONSTELLATION_V2_DEFAULT_INCIDENT_LIMIT,
   CONSTELLATION_V2_MAX_AMBIENT_ENTITIES, CONSTELLATION_V2_MAX_ENTITY_LIMIT, CONSTELLATION_V2_MAX_INCIDENT_LIMIT, CONSTELLATION_V2_MAX_OVERVIEW_ROUTES,
-  type ConstellationV2AggregateRoute, type ConstellationV2Community, type ConstellationV2CommunityPage,
+  type ConstellationV2AggregateRoute, type ConstellationV2Community, type ConstellationV2CommunityPage, type ConstellationV2Entity,
   type ConstellationV2Coverage, type ConstellationV2Head, type ConstellationV2IncidentPage, type ConstellationV2Overview,
   type ConstellationV2RawEdge, type ConstellationV2Revision, type ConstellationV2Route, type ConstellationV2Unavailable,
 } from '../memory/constellation-v2';
@@ -806,8 +806,12 @@ export class ProjectMemory extends DurableObject<Env> {
     });
     try {
       const rows = this.readConstellationRows();
+      const phaseRows = await this.env.DB.prepare(
+        `SELECT ph.id, ph.title FROM phases ph JOIN plans pl ON pl.id = ph.plan_id WHERE pl.project_id = ? ORDER BY ph.id`,
+      ).bind(projectId).all<{ id: string; title: string }>();
+      const phaseLabels = new Map(phaseRows.results.map((phase) => [phase.id, phase.title]));
       const lenses = CONSTELLATION_LENSES.map((lens) =>
-        buildConstellationHierarchy(rows.nodes, rows.edges, lens, this.readPriorConstellationCommunities(lens)));
+        buildConstellationHierarchy(rows.nodes, rows.edges, lens, this.readPriorConstellationCommunities(lens), { phaseLabels }));
       if (!constellationSourceIsCurrent(started.sourceRevision, this.readMemoryRevision())) {
         await this.failConstellationGeneration(projectId, started.generationId, 'canonical source revision advanced during build');
         return { ok: false, generationId: started.generationId, reason: 'source-revision-advanced', detail: 'canonical source revision advanced during build' };
@@ -1085,6 +1089,47 @@ export class ProjectMemory extends DurableObject<Env> {
     ).toArray().length > 0;
   }
 
+  private readConstellationEntities(
+    generationId: string,
+    lens: ConstellationLens,
+    community: ConstellationV2Community,
+    limit: number,
+    afterRank = Number.MAX_VALUE,
+    afterNodeId = '',
+  ): { entities: ConstellationV2Entity[]; last: { node_id: string; rank: number } | undefined; truncated: boolean } {
+    const rows = this.ctx.storage.sql.exec<{
+      node_id: string; uri: string; type: string; label: string; degree: number; boundary_degree: number; rank: number;
+      kind: string | null; authority: number | null; validity: string | null;
+    }>(
+      `SELECT n.id AS node_id,n.uri,n.type,n.label,s.degree,s.boundary_degree,s.rank,
+              COALESCE(mi.kind, ep.landing_outcome) AS kind,mi.authority,mi.validity
+       FROM constellation_lens_memberships m
+       JOIN constellation_lens_node_stats s ON s.generation_id = m.generation_id AND s.lens = m.lens AND s.node_id = m.node_id
+       JOIN nodes n ON n.id = m.node_id
+       LEFT JOIN memory_items mi ON n.type = 'memory' AND n.uri = 'noriq://memory/' || mi.id
+       LEFT JOIN episodes ep ON n.type = 'episode' AND n.uri = 'noriq://episode/' || ep.id
+       WHERE m.generation_id = ?1 AND m.lens = ?2 AND m.community_id = ?3
+         AND (s.rank < ?4 OR (s.rank = ?4 AND n.id > ?5))
+       ORDER BY s.rank DESC,n.id LIMIT ?6`,
+      generationId, lens, community.id, afterRank, afterNodeId, limit + 1,
+    ).toArray();
+    const entityRows = rows.slice(0, limit);
+    return {
+      entities: entityRows.map((row) => {
+        const lead = row.authority !== null || row.validity !== null
+          ? classifyLead({ authority: row.authority ?? undefined, validity: row.validity ?? undefined }) : null;
+        return {
+          nodeId: row.node_id, uri: row.uri, type: row.type, kind: row.kind, label: row.label,
+          authority: row.authority, validity: row.validity, isLead: lead?.isLead ?? null, leadReasons: lead?.leadReasons ?? null,
+          degree: row.degree, boundaryDegree: row.boundary_degree, groupKey: row.type, communityId: community.id,
+          position: constellationEntityPosition(row.uri, community.anchor, community.memberCount),
+        };
+      }),
+      last: entityRows.at(-1),
+      truncated: rows.length > limit,
+    };
+  }
+
   async constellationV2Overview(
     projectId: string,
     lens: ConstellationLens = 'plans',
@@ -1162,12 +1207,18 @@ export class ProjectMemory extends DurableObject<Env> {
       const pageLimited = rows.length > limit;
       const communities = rows.slice(0, limit).map((row) => this.shapeConstellationCommunity(row));
       const routePage = this.readAggregateRoutes(active.generation.id, lens, community.level + 1, communities.map((row) => row.id));
+      // Phase children cover only qualified tasks. The plan sun and phase-less agents/runs/tasks
+      // remain direct root members and must travel in this same bounded page rather than vanish.
+      const direct = this.readConstellationEntities(
+        active.generation.id, lens, community, CONSTELLATION_V2_MAX_ENTITY_LIMIT,
+      );
+      const backbone = this.readConstellationBackbone(active.generation.id, lens, community.id);
       const after = communities.at(-1)?.id;
       return {
-        revision: active.revision, lens, community, kind: 'communities', communities, entities: [], backboneEdges: [], routes: routePage.routes,
+        revision: active.revision, lens, community, kind: 'communities', communities, entities: direct.entities, backboneEdges: backbone.edges, routes: routePage.routes,
         externalCommunities: routePage.externalCommunities,
         nextCursor: pageLimited && after ? encodeConstellationCursor({ generationId: active.generation.id, currentRevision: active.revision.currentRevision, scope, after }) : null,
-        coverage: this.constellationCoverage(active.revision, pageLimited || routePage.truncated, true),
+        coverage: this.constellationCoverage(active.revision, pageLimited || direct.truncated || routePage.truncated || backbone.truncated, true),
       };
     }
     const limit = clampConstellationLimit(input.limit, CONSTELLATION_V2_DEFAULT_ENTITY_LIMIT, CONSTELLATION_V2_MAX_ENTITY_LIMIT);
@@ -1176,41 +1227,15 @@ export class ProjectMemory extends DurableObject<Env> {
       try { [afterRank, afterNodeId] = JSON.parse(cursor.after) as [number, string]; }
       catch { return this.unavailableConstellation('cursor-stale'); }
     }
-    const rows = this.ctx.storage.sql.exec<{
-      node_id: string; uri: string; type: string; label: string; degree: number; boundary_degree: number; rank: number;
-      kind: string | null; authority: number | null; validity: string | null;
-    }>(
-      `SELECT n.id AS node_id,n.uri,n.type,n.label,s.degree,s.boundary_degree,s.rank,
-              COALESCE(mi.kind, ep.landing_outcome) AS kind,mi.authority,mi.validity
-       FROM constellation_lens_memberships m
-       JOIN constellation_lens_node_stats s ON s.generation_id = m.generation_id AND s.lens = m.lens AND s.node_id = m.node_id
-       JOIN nodes n ON n.id = m.node_id
-       LEFT JOIN memory_items mi ON n.type = 'memory' AND n.uri = 'noriq://memory/' || mi.id
-       LEFT JOIN episodes ep ON n.type = 'episode' AND n.uri = 'noriq://episode/' || ep.id
-       WHERE m.generation_id = ?1 AND m.lens = ?2 AND m.community_id = ?3
-         AND (s.rank < ?4 OR (s.rank = ?4 AND n.id > ?5))
-       ORDER BY s.rank DESC,n.id LIMIT ?6`,
-      active.generation.id, lens, communityId, afterRank, afterNodeId, limit + 1,
-    ).toArray();
-    const pageLimited = rows.length > limit;
-    const entityRows = rows.slice(0, limit);
-    const entities = entityRows.map((row) => {
-      const lead = row.authority !== null || row.validity !== null ? classifyLead({ authority: row.authority ?? undefined, validity: row.validity ?? undefined }) : null;
-      return {
-        nodeId: row.node_id, uri: row.uri, type: row.type, kind: row.kind, label: row.label,
-        authority: row.authority, validity: row.validity, isLead: lead?.isLead ?? null, leadReasons: lead?.leadReasons ?? null,
-        degree: row.degree, boundaryDegree: row.boundary_degree, groupKey: row.type, communityId,
-        position: constellationEntityPosition(row.uri, community.anchor, community.memberCount),
-      };
-    });
+    const entityPage = this.readConstellationEntities(active.generation.id, lens, community, limit, afterRank, afterNodeId);
     const routePage = this.readAggregateRoutes(active.generation.id, lens, community.level, [community.id]);
     const backbone = this.readConstellationBackbone(active.generation.id, lens, community.id);
-    const last = entityRows.at(-1);
+    const last = entityPage.last;
     return {
-      revision: active.revision, lens, community, kind: 'entities', communities: [], entities, backboneEdges: backbone.edges, routes: routePage.routes,
+      revision: active.revision, lens, community, kind: 'entities', communities: [], entities: entityPage.entities, backboneEdges: backbone.edges, routes: routePage.routes,
       externalCommunities: routePage.externalCommunities,
-      nextCursor: pageLimited && last ? encodeConstellationCursor({ generationId: active.generation.id, currentRevision: active.revision.currentRevision, scope, after: JSON.stringify([last.rank, last.node_id]) }) : null,
-      coverage: this.constellationCoverage(active.revision, pageLimited || routePage.truncated || backbone.truncated),
+      nextCursor: entityPage.truncated && last ? encodeConstellationCursor({ generationId: active.generation.id, currentRevision: active.revision.currentRevision, scope, after: JSON.stringify([last.rank, last.node_id]) }) : null,
+      coverage: this.constellationCoverage(active.revision, entityPage.truncated || routePage.truncated || backbone.truncated),
     };
   }
 

@@ -14,6 +14,15 @@ export interface Constellation3DNode {
   validity?: string | null;
   isLead?: boolean | null;
   community?: boolean;
+  /** A real plan/memory entity promoted to its system's luminous sun. It keeps its URI and entity
+   * inspector semantics even though renderer/layout treatment follows a pinned community core. */
+  anchorEntity?: boolean;
+  /** Canonical persisted community id represented by this visual node. Anchor entities use their
+   * real node id for selection, so this keeps routing/loading keyed to the server community id. */
+  systemId?: string;
+  residentRootId?: string;
+  communityLevel?: number;
+  ambient?: boolean;
   parentId?: string | null;
   radius?: number;
   /** Community aggregates only (PLNR-438) — entity count backing the community, straight off
@@ -137,7 +146,7 @@ export function placeConstellation3DLabels<T extends Constellation3DLabelCandida
 // of dominant member type — the community "gravity well" is a distinct visual family from any
 // single entity shape — but colour DOES follow the dominant type; see `constellation3DColorType`).
 export function constellation3DShape(node: Constellation3DNode): Constellation3DShape {
-  if (node.community) return 'sphere';
+  if (node.community && !node.anchorEntity) return 'sphere';
   return encodingForType(node.type).shape;
 }
 
@@ -160,7 +169,7 @@ export function dominantCommunityType(node: Pick<Constellation3DNode, 'typeCount
  * renderer and any DOM consumer read colour off the identical decision. Falls through to
  * `encodingForType`'s own 'unknown' handling when a community has no typeCounts to rank. */
 export function constellation3DColorType(node: Constellation3DNode): string {
-  return node.community ? dominantCommunityType(node) ?? 'unknown' : node.type;
+  return node.anchorEntity ? node.type : node.community ? dominantCommunityType(node) ?? 'unknown' : node.type;
 }
 
 export interface ConstellationCommunityTooltip {
@@ -226,9 +235,10 @@ export function promotedEdgeLabelText(edge: Constellation3DEdge, targetLabel: st
 // ---------------------------------------------------------------------------------------------
 // Search ignite (PLNR-441, screen spec 1c). PLNR-461 deliberately spends one call on the shared
 // starfield and three more on root-only orbit guides. PLNR-467 then splits luminous community
-// cores from same-shape memory entities: the mixed root reference rises from 10 to 12 calls, while
-// the realistic non-root pinned-selection ceiling rises from 15 to 17 (20 at root). Lights and fog
-// are scene state and add zero calls.
+// cores from same-shape memory entities: the mixed root reference rises from 10 to 12 calls. PLNR-472
+// adds phase sub-wells to the SAME two well instances; a plans lens can occupy one additional core
+// shape bucket (plan-anchor dodecahedra + synthetic phase spheres), making the representative root
+// 14 calls with routes. Lights and fog remain scene state and add zero calls.
 // Ignite itself still has zero headroom. That means it cannot afford a single new draw call: it
 // has to ride the instanced buckets that
 // already exist rather than add its own. Two consequences, both load-bearing:
@@ -248,24 +258,34 @@ export const CONSTELLATION_COMMUNITY_WELL_SCALE_FLOOR = 44;
 export const CONSTELLATION_COMMUNITY_WELL_SCALE_CAP = 140;
 
 export function constellation3DCommunityWellScale(
-  node: Pick<Constellation3DNodeInstance, 'community' | 'memberCount' | 'scale'>,
+  node: Pick<Constellation3DNodeInstance, 'community' | 'memberCount' | 'scale' | 'communityLevel'>,
 ): number {
   if (!node.community) return node.scale;
   const population = Number.isFinite(node.memberCount) ? Math.max(0, node.memberCount ?? 0) : 0;
-  return Math.min(
+  const rootScale = Math.min(
     CONSTELLATION_COMMUNITY_WELL_SCALE_CAP,
     Math.max(CONSTELLATION_COMMUNITY_WELL_SCALE_FLOOR, 24 + 17 * Math.cbrt(population)),
   );
+  return (node.communityLevel ?? 0) > 0 ? Math.min(62, Math.max(22, rootScale * 0.48)) : rootScale;
 }
 
 /** The continuous root space contains top-level community wells plus any resident entities whose
  * direct parent is one of those systems. Nested community pages still suppress the root guides. */
 export function constellation3DIsRootScene(nodes: readonly Constellation3DNode[]): boolean {
   const resident = nodes.filter((node) => !node.offPageStandIn);
+  const byId = new Map(resident.map((node) => [node.id, node]));
   const rootIds = new Set(resident.filter((node) => node.community === true && node.parentId === null).map((node) => node.id));
-  return rootIds.size > 0 && resident.every((node) => node.community === true
-    ? node.parentId === null
-    : node.parentId !== null && node.parentId !== undefined && rootIds.has(node.parentId));
+  if (rootIds.size === 0 && !resident.some((node) => node.ambient)) return false;
+  return resident.every((node) => {
+    if (node.ambient) return true;
+    let current: Constellation3DNode | undefined = node;
+    const seen = new Set<string>();
+    while (current?.parentId && !seen.has(current.id)) {
+      seen.add(current.id);
+      current = byId.get(current.parentId);
+    }
+    return Boolean(current && rootIds.has(current.id));
+  });
 }
 
 function deterministicUnit(seed: string): number {
@@ -340,12 +360,13 @@ export function communityIgniteSubtext(matchCount: number): string {
 
 export function constellation3DNodeEncoding(node: Constellation3DNode): Constellation3DNodeInstance {
   const authority = node.authority === null || node.authority === undefined ? 0 : Math.max(0, Math.min(5, node.authority));
-  const scaleMultiplier = node.community ? 1 : encodingForType(node.type).scaleMultiplier;
+  const scaleMultiplier = node.community && !node.anchorEntity ? 1 : encodingForType(node.type).scaleMultiplier;
+  const baseScale = ((node.community ? 8 : 2.4) + Math.log2(Math.max(1, node.degree + 1)) * (node.community ? 1.4 : 0.65) + authority * 0.25) * scaleMultiplier;
   return {
     ...node,
     shape: constellation3DShape(node),
-    scale: ((node.community ? 8 : 2.4) + Math.log2(Math.max(1, node.degree + 1)) * (node.community ? 1.4 : 0.65) + authority * 0.25) * scaleMultiplier,
-    opacity: node.validity === 'superseded' || node.validity === 'expired' || node.validity === 'stale' ? 0.42 : 1,
+    scale: baseScale * (node.anchorEntity ? 1.28 : node.ambient ? 0.64 : 1),
+    opacity: node.ambient ? 0.38 : node.validity === 'superseded' || node.validity === 'expired' || node.validity === 'stale' ? 0.42 : 1,
     halo: node.isLead === true,
     highlighted: false,
   };
@@ -418,7 +439,8 @@ export function buildConstellation3DRenderPlan(
 
   // PLNR-448: an off-page stand-in never earns a text label either — same honesty rule as the
   // shape-group exclusion above, applied to the label budget instead of the instancing pass.
-  const labels = [...byId.values()].filter((node) => !node.offPageStandIn)
+  const labels = [...byId.values()].filter((node) => !node.offPageStandIn
+      && (!node.ambient || node.id === selectedNodeId || node.highlighted))
     .sort((a, b) => compareLabelPriority(a, b, selectedNodeId, byId)).slice(0, Math.max(0, labelBudget));
   // PLNR-439: promoted edges (selection) split into up to three separate passes so historical and
   // off-page relationships can carry their own dash pattern/opacity instead of sharing the solid
@@ -431,8 +453,8 @@ export function buildConstellation3DRenderPlan(
   const hasHistoricalPromoted = promotedEdges.some((edge) => edge.historical && !isOffPageIncidentEdge(edge));
   const hasCurrentPromoted = promotedEdges.some((edge) => !edge.historical && !isOffPageIncidentEdge(edge));
   const hasDirectionMarkers = promotedEdges.some((edge) => edge.directionMarker && !isOffPageIncidentEdge(edge));
-  // Five entity-shape meshes (faded/unfaded) + a dedicated luminous community-core bucket
-  // (faded/unfaded) + lead halo mesh + community gravity-well falloff (outer +
+  // Five entity-shape meshes (faded/unfaded) + dedicated luminous community-core buckets per
+  // occupied shape (faded/unfaded) + lead halo mesh + community gravity-well falloff (outer +
   // mid, only when a community node is present — never for the pure-entity 12k fixture) +
   // aggregate-route instanced tubes (only when an aggregate edge is present) + the always-allotted
   // backbone base-edge pass + the promoted-edge passes above. The selection reticle and the hover
@@ -450,8 +472,10 @@ export function buildConstellation3DRenderPlan(
   const entityShapeCount = new Set([...byId.values()]
     .filter((node) => !node.offPageStandIn && !node.community)
     .map((node) => node.shape)).size;
-  const hasCommunityCore = [...byId.values()].some((node) => node.community && !node.offPageStandIn);
-  const drawCallCeiling = (entityShapeCount + (hasCommunityCore ? 1 : 0)) * 2
+  const communityCoreShapeCount = new Set([...byId.values()]
+    .filter((node) => node.community && !node.offPageStandIn)
+    .map((node) => node.shape)).size;
+  const drawCallCeiling = (entityShapeCount + communityCoreShapeCount) * 2
     + (nodes.some((node) => node.isLead) ? 1 : 0)
     // PLNR-448: a plan whose only community node is an off-page stand-in no longer builds the
     // gravity-well pass (it was excluded from nodeGroups above, same reasoning), so the ceiling

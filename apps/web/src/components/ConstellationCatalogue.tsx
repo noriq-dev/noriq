@@ -71,7 +71,8 @@ export function ConstellationCatalogue({
     <div role="region" aria-label="Textual memory constellation" style={{ position: 'absolute', inset: 0, overflow: 'auto', padding: 18 }}>
       <div style={{ display: 'flex', flexDirection: 'column' }}>
         {nodes.map((node) => {
-          const isCommunity = Boolean(node.community);
+          const isSystem = Boolean(node.community);
+          const isCommunity = Boolean(node.community && !node.anchorEntity);
           // PLNR-452 (following PLNR-448's off-page-stand-in exclusion from the 3D community
           // passes): `node.offPageStandIn` is the SAME real containing-community id/label/counts
           // `assembleConstellationV2Scene` uses whenever it substitutes an incident edge's
@@ -92,8 +93,8 @@ export function ConstellationCatalogue({
           const offPage = Boolean(node.offPageStandIn);
           const highlighted = highlightedNodeIds.has(node.id);
           const previewed = previewedIds.has(node.id);
-          const tooltip = isCommunity && !offPage ? communityTooltipContent(node) : null;
-          const matchCount = isCommunity ? matchCounts.get(node.id) : undefined;
+          const tooltip = isSystem && !offPage ? communityTooltipContent(node) : null;
+          const matchCount = isSystem ? matchCounts.get(node.systemId ?? node.id) : undefined;
           return (
             <div key={node.id}>
               <div
@@ -104,7 +105,7 @@ export function ConstellationCatalogue({
                   background: node.id === selectedNodeId ? 'var(--w-04)' : highlighted ? 'rgba(198,242,78,.04)' : 'transparent',
                 }}
               >
-                {isCommunity && !offPage ? (
+                {isSystem && !offPage ? (
                   <button
                     type="button" aria-expanded={previewed}
                     aria-label={`${previewed ? 'Collapse' : 'Expand'} ${node.label} preview`}
@@ -136,12 +137,12 @@ export function ConstellationCatalogue({
                       {node.uri}
                     </span>
                   )}
-                  {isCommunity && offPage && (
+                  {isSystem && offPage && (
                     <span style={{ display: 'block', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--amber)' }}>
                       off-page ▸
                     </span>
                   )}
-                  {isCommunity && !offPage && (
+                  {isSystem && !offPage && (
                     <span style={{ display: 'block', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>
                       {(node.memberCount ?? 0).toLocaleString()} entities
                     </span>
@@ -164,18 +165,18 @@ export function ConstellationCatalogue({
                 )}
                 {searchActive && highlighted && (
                   <MonoTag color="var(--accent)" bg="rgba(198,242,78,.1)" size={8}>
-                    {isCommunity && matchCount ? `+${matchCount} match${matchCount === 1 ? '' : 'es'}` : 'match'}
+                    {isSystem && matchCount ? `+${matchCount} match${matchCount === 1 ? '' : 'es'}` : 'match'}
                   </MonoTag>
                 )}
-                {isCommunity && (
+                {isSystem && (
                   <Button onClick={() => onFocusCommunity(node.id)} disabled={expanding}>
-                    {expanding ? 'loading…' : residentCommunityIds.has(node.id) ? 'focus system' : 'load system'}
+                    {expanding ? 'loading…' : residentCommunityIds.has(node.residentRootId ?? node.systemId ?? node.id) ? 'focus system' : 'load system'}
                   </Button>
                 )}
                 {node.uri && <Button variant="ghost" onClick={() => onOpenEgoNetwork?.(node.uri!)}>ego</Button>}
                 {node.uri && node.type === 'memory' && <Button variant="ghost" onClick={() => onOpenInspector?.(node.uri!)}>evidence</Button>}
               </div>
-              {isCommunity && previewed && tooltip && (
+              {isSystem && previewed && tooltip && (
                 <div style={{ padding: '2px 6px 10px 32px', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>
                   <div>{tooltip.entityCount.toLocaleString()} entities · {tooltip.boundaryRouteCount.toLocaleString()} boundary routes</div>
                   {tooltip.topTypeCounts.length > 0 && (
