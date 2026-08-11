@@ -223,12 +223,20 @@ export function promotedEdgeLabelText(edge: Constellation3DEdge, targetLabel: st
 //       already splits into (see `constellation3DIsDimmed` below) — search just changes which
 //       predicate decides bucket membership, not how many buckets or draw calls there are.
 //   (2) A matched node's "flare" is the scale boost `highlighted` nodes already get in the
-//       renderer's per-instance matrix (never a new mesh) — a community's gravity-well layers key
-//       their own radius off that same `node.scale`, so a flared community's WELL grows with its
-//       core for free, with no separate well-opacity bucket to split.
+//       renderer's per-instance matrix (never a new mesh) — community gravity-well layers apply
+//       that same boost after their visibility floor, so a flared well still grows with its core
+//       for free, with no separate well-opacity bucket to split.
 // This is why the combined pinned-selection + ignite measurement in
 // constellation-3d-buffers.test.ts stays at 14, not higher: ignite spends zero new draw calls.
 export const CONSTELLATION_IGNITE_DIM_OPACITY = 0.32;
+// A fixed world-space floor keeps sparse root communities legible after a wide fit-to-content
+// frame without making well size camera-dependent. Connectivity remains encoded by `scale`; only
+// the well footprint clamps, and communities above this threshold pass through unchanged.
+export const CONSTELLATION_COMMUNITY_WELL_SCALE_FLOOR = 16;
+
+export function constellation3DCommunityWellScale(node: Pick<Constellation3DNodeInstance, 'community' | 'scale'>): number {
+  return node.community ? Math.max(CONSTELLATION_COMMUNITY_WELL_SCALE_FLOOR, node.scale) : node.scale;
+}
 
 /** Whether a node instance renders in the dimmed material bucket. Outside search, this is the
  * pre-existing validity-based dim (superseded/expired/stale, PLNR-437). During search it is

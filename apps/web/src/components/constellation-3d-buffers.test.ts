@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   aggregateRouteWidth, buildConstellation3DRenderPlan, communityEntitySubtext, communityIgniteSubtext, communityTooltipContent,
-  constellation3DColorType, constellation3DIsDimmed, constellation3DNodeEncoding, CONSTELLATION_IGNITE_DIM_OPACITY,
+  constellation3DColorType, constellation3DCommunityWellScale, constellation3DIsDimmed, constellation3DNodeEncoding,
+  CONSTELLATION_COMMUNITY_WELL_SCALE_FLOOR, CONSTELLATION_IGNITE_DIM_OPACITY,
   dominantCommunityType, isOffPageIncidentEdge, placeConstellation3DLabels, promotedEdgeLabelText, truncateConstellationLabel,
   type Constellation3DEdge, type Constellation3DLabelCandidate, type Constellation3DNode,
 } from './constellation-3d-buffers';
@@ -18,6 +19,15 @@ describe('constellation 3D buffer planning', () => {
     expect(memory.scale).toBeGreaterThan(task.scale);
     expect(memory.halo).toBe(true);
     expect(memory.opacity).toBeLessThan(task.opacity);
+  });
+
+  it('floors only sparse community-well footprints while preserving connectivity ordering above it', () => {
+    const sparse = constellation3DNodeEncoding(node('s', 'community', { community: true, degree: 0, authority: 0 }));
+    const high = constellation3DNodeEncoding(node('h', 'community', { community: true, degree: 4095, authority: 0 }));
+    expect(sparse.scale).toBeLessThan(CONSTELLATION_COMMUNITY_WELL_SCALE_FLOOR);
+    expect(constellation3DCommunityWellScale(sparse)).toBe(CONSTELLATION_COMMUNITY_WELL_SCALE_FLOOR);
+    expect(constellation3DCommunityWellScale(high)).toBe(high.scale);
+    expect(constellation3DCommunityWellScale(sparse)).toBeLessThan(constellation3DCommunityWellScale(high));
   });
 
   it('submits selected incidents in the final promoted pass while retaining direction and type', () => {

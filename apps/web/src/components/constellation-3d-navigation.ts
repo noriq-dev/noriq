@@ -10,8 +10,15 @@ export interface Constellation3DCamera {
 export interface Constellation3DPreferences {
   version: typeof CONSTELLATION_3D_PREFS_VERSION;
   layoutVersion: string;
+  /** A camera is reusable only for the generation whose resident layout it describes. Older
+   * preferences did not carry this field and safely fall back to fit-to-content on first load. */
+  generationId?: string;
   camera: Constellation3DCamera;
   expandedCommunityIds: string[];
+}
+
+export interface LoadedConstellation3DPreferences extends Constellation3DPreferences {
+  cameraSource: 'stored' | 'fallback';
 }
 
 export interface CameraTransition {
@@ -22,8 +29,74 @@ export interface CameraTransition {
 }
 
 export const DEFAULT_CONSTELLATION_3D_CAMERA: Constellation3DCamera = { target: [0, 0, 0], yaw: 0, pitch: 0.2, distance: 900 };
+export const CONSTELLATION_3D_VERTICAL_FOV_DEGREES = 48;
+export const CONSTELLATION_3D_FIT_PADDING = 1.18;
+
+export interface Constellation3DFitItem {
+  position: [number, number, number];
+  /** World-space rendered radius. `scale` is also accepted so callers can pass either form. */
+  radius?: number;
+  scale?: number;
+}
+
+export interface Constellation3DFitOptions {
+  aspect?: number;
+  verticalFovDegrees?: number;
+  padding?: number;
+  minDistance?: number;
+  maxDistance?: number;
+  camera?: Constellation3DCamera;
+}
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+
+/** Frames a bounding sphere around the resident rendered footprints. The sphere makes the result
+ * independent of the default orbit angle; the smaller of the vertical and horizontal perspective
+ * half-FOVs determines the tangent distance, with explicit padding outside the content radius. */
+export function fitConstellationCamera(
+  items: readonly Constellation3DFitItem[],
+  options: Constellation3DFitOptions = {},
+): Constellation3DCamera {
+  const base = options.camera ?? DEFAULT_CONSTELLATION_3D_CAMERA;
+  const valid = items.flatMap((item) => {
+    if (!item.position.every(Number.isFinite)) return [];
+    const extent = Math.max(
+      Number.isFinite(item.radius) ? Math.max(0, item.radius!) : 0,
+      Number.isFinite(item.scale) ? Math.max(0, item.scale!) : 0,
+    );
+    return [{ position: item.position, extent }];
+  });
+  if (valid.length === 0) return { ...base, target: [...base.target] };
+
+  const minimum: [number, number, number] = [Infinity, Infinity, Infinity];
+  const maximum: [number, number, number] = [-Infinity, -Infinity, -Infinity];
+  for (const { position, extent } of valid) {
+    for (let axis = 0; axis < 3; axis += 1) {
+      minimum[axis] = Math.min(minimum[axis]!, position[axis]! - extent);
+      maximum[axis] = Math.max(maximum[axis]!, position[axis]! + extent);
+    }
+  }
+  const target = minimum.map((value, axis) => (value + maximum[axis]!) / 2) as [number, number, number];
+  const radius = valid.reduce((largest, item) => Math.max(
+    largest,
+    Math.hypot(
+      item.position[0] - target[0], item.position[1] - target[1], item.position[2] - target[2],
+    ) + item.extent,
+  ), 0);
+  const verticalHalfFov = clamp(
+    (Number.isFinite(options.verticalFovDegrees) ? options.verticalFovDegrees! : CONSTELLATION_3D_VERTICAL_FOV_DEGREES) * Math.PI / 360,
+    Math.PI / 180,
+    Math.PI * 0.49,
+  );
+  const aspect = Number.isFinite(options.aspect) && options.aspect! > 0 ? options.aspect! : 1;
+  const horizontalHalfFov = Math.atan(Math.tan(verticalHalfFov) * aspect);
+  const limitingHalfFov = Math.min(verticalHalfFov, horizontalHalfFov);
+  const padding = Number.isFinite(options.padding) ? Math.max(1, options.padding!) : CONSTELLATION_3D_FIT_PADDING;
+  const minDistance = Number.isFinite(options.minDistance) ? Math.max(0, options.minDistance!) : 60;
+  const maxDistance = Number.isFinite(options.maxDistance) ? Math.max(minDistance, options.maxDistance!) : 12_000;
+  const distance = clamp(radius * padding / Math.sin(limitingHalfFov), minDistance, maxDistance);
+  return { target, yaw: base.yaw, pitch: base.pitch, distance };
+}
 
 export function orbitConstellationCamera(camera: Constellation3DCamera, dx: number, dy: number): Constellation3DCamera {
   return { ...camera, yaw: camera.yaw - dx * 0.006, pitch: clamp(camera.pitch - dy * 0.006, -Math.PI * 0.48, Math.PI * 0.48) };
@@ -86,12 +159,25 @@ function validCamera(value: unknown): value is Constellation3DCamera {
     && Number.isFinite(camera.yaw) && Number.isFinite(camera.pitch) && Number.isFinite(camera.distance);
 }
 
-export function loadConstellation3DPreferences(projectId: string, layoutVersion: string, storage: Pick<Storage, 'getItem'> = localStorage): Constellation3DPreferences {
-  const fallback: Constellation3DPreferences = { version: CONSTELLATION_3D_PREFS_VERSION, layoutVersion, camera: { ...DEFAULT_CONSTELLATION_3D_CAMERA, target: [...DEFAULT_CONSTELLATION_3D_CAMERA.target] }, expandedCommunityIds: [] };
+export function loadConstellation3DPreferences(
+  projectId: string,
+  layoutVersion: string,
+  storage: Pick<Storage, 'getItem'> = localStorage,
+  fallbackCamera: Constellation3DCamera = DEFAULT_CONSTELLATION_3D_CAMERA,
+  generationId?: string,
+): LoadedConstellation3DPreferences {
+  const fallback: LoadedConstellation3DPreferences = {
+    version: CONSTELLATION_3D_PREFS_VERSION, layoutVersion, generationId,
+    camera: { ...fallbackCamera, target: [...fallbackCamera.target] }, expandedCommunityIds: [], cameraSource: 'fallback',
+  };
   try {
     const parsed = JSON.parse(storage.getItem(constellation3DPrefsKey(projectId)) ?? 'null') as Partial<Constellation3DPreferences> | null;
-    if (!parsed || parsed.version !== CONSTELLATION_3D_PREFS_VERSION || parsed.layoutVersion !== layoutVersion || !validCamera(parsed.camera)) return fallback;
-    return { ...fallback, camera: parsed.camera, expandedCommunityIds: Array.isArray(parsed.expandedCommunityIds) ? parsed.expandedCommunityIds.filter((id): id is string => typeof id === 'string') : [] };
+    if (!parsed || parsed.version !== CONSTELLATION_3D_PREFS_VERSION || parsed.layoutVersion !== layoutVersion
+      || (generationId !== undefined && parsed.generationId !== generationId) || !validCamera(parsed.camera)) return fallback;
+    return {
+      ...fallback, camera: parsed.camera, cameraSource: 'stored',
+      expandedCommunityIds: Array.isArray(parsed.expandedCommunityIds) ? parsed.expandedCommunityIds.filter((id): id is string => typeof id === 'string') : [],
+    };
   } catch { return fallback; }
 }
 

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type * as Three from 'three';
 import {
   aggregateRouteWidth, buildConstellation3DRenderPlan, communityEntitySubtext, communityIgniteSubtext, communityTooltipContent,
-  constellation3DColorType, constellation3DIsDimmed, constellation3DNodeEncoding, CONSTELLATION_IGNITE_DIM_OPACITY,
+  constellation3DColorType, constellation3DCommunityWellScale, constellation3DIsDimmed, constellation3DNodeEncoding, CONSTELLATION_IGNITE_DIM_OPACITY,
   isOffPageIncidentEdge, placeConstellation3DLabels, promotedEdgeLabelText, truncateConstellationLabel, type Constellation3DEdge,
   type Constellation3DEdgeSegment, type ConstellationCommunityTooltip, type Constellation3DNode,
   type Constellation3DNodeInstance, type Constellation3DShape, type Constellation3DLabelPriority,
@@ -12,8 +12,8 @@ import {
   buildConstellation3DSpatialIndex, computeConstellation3DLayoutOffThread, nearestDirectionalConstellationNode,
 } from './constellation-3d-layout';
 import {
-  CONSTELLATION_3D_PREFS_VERSION, constellationCameraPosition, createCameraTransition, DEFAULT_CONSTELLATION_3D_CAMERA,
-  dollyConstellationCamera, focusConstellationCamera, loadConstellation3DPreferences, orbitConstellationCamera,
+  CONSTELLATION_3D_PREFS_VERSION, constellationCameraPosition, createCameraTransition, dollyConstellationCamera,
+  fitConstellationCamera, focusConstellationCamera, loadConstellation3DPreferences, orbitConstellationCamera,
   panConstellationCamera, sampleCameraTransition, saveConstellation3DPreferences, type CameraTransition,
   type Constellation3DCamera,
 } from './constellation-3d-navigation';
@@ -40,12 +40,11 @@ const CAMERA_CTRL_STYLE: React.CSSProperties = {
   display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, lineHeight: 1,
 };
 // Layered radial falloff (PLNR-438): outer well at 10% opacity, mid at 22%, both tinted by the
-// community's dominant type — sized as a fixed ratio of the solid core sphere the standard node
-// pass already renders, so "outer radius from aggregate connectivity" (the core's own scale,
-// computed by constellation3DNodeEncoding from degree+authority) drives every layer together
-// rather than needing a second connectivity computation.
+// community's dominant type. Above the sparse-community visibility floor they remain fixed ratios
+// of the connectivity-derived core scale; below it only the translucent well footprint clamps.
 const COMMUNITY_WELL_MID_RATIO = 1.6;
 const COMMUNITY_WELL_OUTER_RATIO = 2.4;
+const FIT_ENTITY_FOOTPRINT_RATIO = 1.9;
 // Selection reticle (PLNR-439, screen spec 1b "the pin") — every radius is a ratio of the
 // selected node's own connectivity-derived scale, the same pattern PLNR-438 established for the
 // community wells and hover ring, so the reticle grows/shrinks with whatever it is pinned to
@@ -233,6 +232,21 @@ function reticleTickGeometry(THREE: typeof Three, innerRadius: number, outerRadi
   return geometry;
 }
 
+/** Rendered world-space footprints used by the pure navigation fit. Off-page stand-ins contribute
+ * their truthful terminus position but not a fake community well; ordinary nodes reserve enough
+ * room for their largest reusable selection chrome. */
+function fitCameraToScene(nodes: readonly Constellation3DNode[], aspect = 1): Constellation3DCamera {
+  return fitConstellationCamera(nodes.map((node) => {
+    const encoded = constellation3DNodeEncoding(node);
+    const radius = node.offPageStandIn
+      ? 1
+      : node.community
+        ? constellation3DCommunityWellScale(encoded) * COMMUNITY_WELL_OUTER_RATIO
+        : encoded.scale * FIT_ENTITY_FOOTPRINT_RATIO;
+    return { position: node.position, radius };
+  }), { aspect });
+}
+
 /** Lazy Three/WebGL renderer. The scene contains bounded instanced meshes and buffer geometries;
  * React only owns the canvas, failure state, and a fixed label budget. The v2 controller hands
  * renderer failures to its full textual peer. */
@@ -253,7 +267,14 @@ export function MemoryConstellation3D({
   const [failure, setFailure] = useState<string | null>(null);
   const [layoutNodes, setLayoutNodes] = useState(nodes);
   const priorLayoutRef = useRef<{ generationId: string; layoutVersion: string; positions: Record<string, [number, number, number]> } | undefined>();
-  const [cameraState, setCameraState] = useState<Constellation3DCamera>(() => loadConstellation3DPreferences(projectId, layoutVersion).camera);
+  const generationLayoutKey = `${generationId}:${layoutVersion}`;
+  const initialFitKeyRef = useRef<string | null>(null);
+  const [cameraState, setCameraState] = useState<Constellation3DCamera>(() => {
+    const fitted = fitCameraToScene(nodes);
+    const preferences = loadConstellation3DPreferences(projectId, layoutVersion, localStorage, fitted, generationId);
+    initialFitKeyRef.current = preferences.cameraSource === 'fallback' ? generationLayoutKey : null;
+    return preferences.camera;
+  });
   const transitionRef = useRef<CameraTransition | null>(null);
   const transitionFrameRef = useRef(0);
   const dragRef = useRef<{ mode: 'orbit' | 'pan'; x: number; y: number; camera: Constellation3DCamera } | null>(null);
@@ -263,15 +284,39 @@ export function MemoryConstellation3D({
     computeConstellation3DLayoutOffThread({ generationId, layoutVersion, nodes, edges, prior: priorLayoutRef.current }, controller.signal)
       .then((result) => {
         priorLayoutRef.current = result;
-        setLayoutNodes(nodes.map((node) => ({ ...node, position: result.positions[node.id] ?? node.position })));
+        const nextNodes = nodes.map((node) => ({ ...node, position: result.positions[node.id] ?? node.position }));
+        setLayoutNodes(nextNodes);
+        if (initialFitKeyRef.current === generationLayoutKey) {
+          initialFitKeyRef.current = null;
+          const host = hostRef.current;
+          const aspect = host ? Math.max(1, host.clientWidth) / Math.max(1, host.clientHeight) : 1;
+          setCameraState(fitCameraToScene(nextNodes, aspect));
+        }
       })
-      .catch((error: unknown) => { if (!(error instanceof DOMException && error.name === 'AbortError')) setLayoutNodes(nodes); });
+      .catch((error: unknown) => {
+        if (error instanceof DOMException && error.name === 'AbortError') return;
+        setLayoutNodes(nodes);
+        if (initialFitKeyRef.current === generationLayoutKey) {
+          initialFitKeyRef.current = null;
+          const host = hostRef.current;
+          const aspect = host ? Math.max(1, host.clientWidth) / Math.max(1, host.clientHeight) : 1;
+          setCameraState(fitCameraToScene(nodes, aspect));
+        }
+      });
     return () => controller.abort();
-  }, [generationId, layoutVersion, nodes, edges]);
+  }, [generationId, generationLayoutKey, layoutVersion, nodes, edges]);
 
   useEffect(() => {
-    setCameraState(loadConstellation3DPreferences(projectId, layoutVersion).camera);
-  }, [projectId, layoutVersion]);
+    const host = hostRef.current;
+    const aspect = host ? Math.max(1, host.clientWidth) / Math.max(1, host.clientHeight) : 1;
+    const fitted = fitCameraToScene(nodes, aspect);
+    const preferences = loadConstellation3DPreferences(projectId, layoutVersion, localStorage, fitted, generationId);
+    initialFitKeyRef.current = preferences.cameraSource === 'fallback' ? generationLayoutKey : null;
+    setCameraState(preferences.camera);
+  // A resident-page expansion within one generation deliberately does not force camera motion;
+  // Home computes a fresh fit for the current resident scene when the user asks for one.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, generationId, generationLayoutKey, layoutVersion]);
 
   const positions = useMemo(() => new Map(layoutNodes.map((node) => [node.id, node.position] as const)), [layoutNodes]);
   const spatialIndex = useMemo(() => buildConstellation3DSpatialIndex(positions), [positions]);
@@ -373,11 +418,10 @@ export function MemoryConstellation3D({
         }
 
         // Community gravity wells (PLNR-438): two extra low-opacity layers per community, sized as
-        // a fixed ratio of the solid core sphere the standard node pass above already drew for
-        // every community node — that core IS the third, innermost falloff layer, so this adds
-        // exactly two draw calls total (not two per community) regardless of how many communities
-        // are in the reference frame. depthWrite is off so the layers blend into the well rather
-        // than occluding whatever sits behind them.
+        // a fixed ratio of connectivity scale above the visibility floor. The standard node pass
+        // remains the third, innermost layer and retains its unmodified connectivity encoding, so
+        // this still adds exactly two draw calls total (not two per community). depthWrite is off
+        // so the layers blend into the well rather than occluding whatever sits behind them.
         // PLNR-448: excludes off-page stand-ins — a stand-in gets its own dedicated terminus glyph
         // (the offPagePromotedEdges pass below), never the full gravity-well/core-sphere treatment
         // the PLNR-379 honesty rule reserves for a genuinely resident community.
@@ -403,12 +447,13 @@ export function MemoryConstellation3D({
             // comment in constellation-3d-buffers.ts: a realistic pinned-selection scene is already
             // at the 14-call ceiling with no headroom for a new pass).
             const boost = node.highlighted ? 1.3 : 1;
-            const outerScale = node.scale * boost * COMMUNITY_WELL_OUTER_RATIO;
+            const wellScale = constellation3DCommunityWellScale(node);
+            const outerScale = wellScale * boost * COMMUNITY_WELL_OUTER_RATIO;
             matrix.makeScale(outerScale, outerScale, outerScale);
             matrix.setPosition(...node.position);
             outer.setMatrixAt(index, matrix);
             outer.setColorAt(index, color);
-            const midScale = node.scale * boost * COMMUNITY_WELL_MID_RATIO;
+            const midScale = wellScale * boost * COMMUNITY_WELL_MID_RATIO;
             matrix.makeScale(midScale, midScale, midScale);
             matrix.setPosition(...node.position);
             mid.setMatrixAt(index, matrix);
@@ -635,6 +680,15 @@ export function MemoryConstellation3D({
           // Off-page routes get a visibly weaker, differently-dashed line (short dash, long gap,
           // 60% opacity — distinct from historical's even dash/gap) so the truncation itself reads
           // on canvas before the DOM caption below even loads.
+          // PLNR-455 artifact audit: when a selection has an off-page edge, this pass draws a long
+          // low-opacity dotted span from the entity's ±80-local position to a substituted ±1000
+          // community anchor — under the old fixed camera, mostly off-frame, leaving an orphaned
+          // middle segment. That is intentional truthful selection chrome (and Home now fits the
+          // stand-in terminus into frame). Whether it is ALSO the vertical dotted artifact in the
+          // live-project screenshot is NOT settled: every dashed canvas path (this one, historical
+          // above, hover ring, reticle) is selection-dependent, no DOM dotted border spans the
+          // canvas, and that screenshot shows no docked inspector — i.e. no live selection. The
+          // artifact still needs one live reproduction (devtools: DOM or canvas?) to be named.
           const offPage = dashedLineObject(THREE, offPagePromotedEdges, promotedAmber, 0.6, 1.1, 2.8, 10);
           if (offPage) { scene.add(offPage); edgeObjects.push(offPage); }
           // Off-page edges never get a direction cone — a cone implies "this points at the real
@@ -749,10 +803,10 @@ export function MemoryConstellation3D({
   useEffect(() => { rendererRef.current?.applyCamera(cameraState); }, [cameraState]);
   useEffect(() => {
     const timeout = setTimeout(() => saveConstellation3DPreferences(projectId, {
-      version: CONSTELLATION_3D_PREFS_VERSION, layoutVersion, camera: cameraState, expandedCommunityIds: [],
+      version: CONSTELLATION_3D_PREFS_VERSION, layoutVersion, generationId, camera: cameraState, expandedCommunityIds: [],
     }), 150);
     return () => clearTimeout(timeout);
-  }, [cameraState, projectId, layoutVersion]);
+  }, [cameraState, projectId, generationId, layoutVersion]);
 
   const cancelTransition = () => {
     transitionRef.current = null;
@@ -873,8 +927,12 @@ export function MemoryConstellation3D({
         <button
           type="button"
           className="camera-ctrl-btn"
-          aria-label="Reset camera to default view"
-          onClick={() => transitionTo(DEFAULT_CONSTELLATION_3D_CAMERA)}
+          aria-label="Fit camera to resident scene"
+          onClick={() => {
+            const host = hostRef.current;
+            const aspect = host ? Math.max(1, host.clientWidth) / Math.max(1, host.clientHeight) : 1;
+            transitionTo(fitCameraToScene(layoutNodes, aspect));
+          }}
           style={{ ...CAMERA_CTRL_STYLE, color: CAMERA_CTRL_TEXT, cursor: 'pointer' }}
         >
           ◎
