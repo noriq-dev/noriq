@@ -1,4 +1,6 @@
-export type Constellation3DShape = 'sphere' | 'box' | 'octahedron' | 'cone' | 'dodecahedron';
+import { encodingForType, type Constellation3DShape } from './constellation-encoding';
+
+export type { Constellation3DShape };
 export type Constellation3DEdgeState = 'base' | 'unrelated-dimmed' | 'selected-incident';
 
 export interface Constellation3DNode {
@@ -54,25 +56,22 @@ export interface Constellation3DRenderPlan {
   drawCallCeiling: number;
 }
 
-const KNOWLEDGE_TYPES = new Set(['memory', 'decision', 'requirement', 'procedure', 'episode', 'hazard']);
-const CODE_TYPES = new Set(['file', 'symbol', 'api', 'test', 'database_entity', 'repository', 'branch', 'revision']);
-const COORDINATION_TYPES = new Set(['task', 'plan', 'run', 'agent', 'project']);
-
+// Shape/scale-multiplier both come from the shared type encoding table (PLNR-437) — this module
+// no longer owns type→shape grouping itself, it just applies the table's per-node consequences
+// (community aggregates are the one case the table doesn't cover: they render as `sphere`
+// regardless of dominant member type until PLNR-438's community-well treatment lands).
 export function constellation3DShape(node: Constellation3DNode): Constellation3DShape {
   if (node.community) return 'sphere';
-  if (KNOWLEDGE_TYPES.has(node.type)) return 'octahedron';
-  if (CODE_TYPES.has(node.type)) return 'cone';
-  if (COORDINATION_TYPES.has(node.type)) return 'box';
-  if (node.type === 'error' || node.type === 'artifact') return 'dodecahedron';
-  return 'sphere';
+  return encodingForType(node.type).shape;
 }
 
 export function constellation3DNodeEncoding(node: Constellation3DNode): Constellation3DNodeInstance {
   const authority = node.authority === null || node.authority === undefined ? 0 : Math.max(0, Math.min(5, node.authority));
+  const scaleMultiplier = node.community ? 1 : encodingForType(node.type).scaleMultiplier;
   return {
     ...node,
     shape: constellation3DShape(node),
-    scale: (node.community ? 8 : 2.4) + Math.log2(Math.max(1, node.degree + 1)) * (node.community ? 1.4 : 0.65) + authority * 0.25,
+    scale: ((node.community ? 8 : 2.4) + Math.log2(Math.max(1, node.degree + 1)) * (node.community ? 1.4 : 0.65) + authority * 0.25) * scaleMultiplier,
     opacity: node.validity === 'superseded' || node.validity === 'expired' || node.validity === 'stale' ? 0.42 : 1,
     halo: node.isLead === true,
     highlighted: false,

@@ -4,6 +4,7 @@ import {
   buildConstellation3DRenderPlan, constellation3DNodeEncoding, type Constellation3DEdge, type Constellation3DEdgeSegment,
   type Constellation3DNode, type Constellation3DNodeInstance, type Constellation3DShape,
 } from './constellation-3d-buffers';
+import { encodingForType, resolveConstellationToken } from './constellation-encoding';
 import {
   buildConstellation3DSpatialIndex, computeConstellation3DLayoutOffThread, nearestDirectionalConstellationNode,
 } from './constellation-3d-layout';
@@ -51,12 +52,6 @@ interface RendererState {
   applyCamera: (camera: Constellation3DCamera) => void;
   render: () => void;
   dispose: () => void;
-}
-
-function hueFor(value: string): number {
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < value.length; index++) { hash ^= value.charCodeAt(index); hash = Math.imul(hash, 0x01000193); }
-  return (hash >>> 0) % 360;
 }
 
 function geometryFor(THREE: typeof Three, shape: Constellation3DShape): Three.BufferGeometry {
@@ -164,7 +159,16 @@ export function MemoryConstellation3D({
         const plan = buildConstellation3DRenderPlan(layoutNodes, edges, null, LABEL_BUDGET, highlighted);
         const nodeMeshes: Three.InstancedMesh[] = [];
         const matrix = new THREE.Matrix4();
-        const color = new THREE.Color();
+        // Type colour is a theme.css token, resolved live off the cascade and cached per token
+        // (not per node) — a handful of getComputedStyle calls per scene rebuild, not one per
+        // instance. Replaces hueFor()'s hash-derived HSL (PLNR-437).
+        const tokenColors = new Map<string, Three.Color>();
+        const colorForType = (type: string) => {
+          const token = encodingForType(type).token;
+          let cached = tokenColors.get(token);
+          if (!cached) { cached = new THREE.Color(resolveConstellationToken(token)); tokenColors.set(token, cached); }
+          return cached;
+        };
 
         for (const [shape, instances] of plan.nodeGroups) {
           for (const faded of [false, true]) {
@@ -179,8 +183,7 @@ export function MemoryConstellation3D({
               matrix.makeScale(scale, scale, scale);
               matrix.setPosition(...node.position);
               mesh.setMatrixAt(index, matrix);
-              color.setHSL(hueFor(node.type) / 360, theme === 'dark' ? 0.7 : 0.6, theme === 'dark' ? 0.62 : 0.42);
-              mesh.setColorAt(index, color);
+              mesh.setColorAt(index, colorForType(node.type));
             });
             mesh.instanceMatrix.needsUpdate = true;
             if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;

@@ -11,7 +11,7 @@ describe('constellation 3D buffer planning', () => {
   it('keeps type, authority, lead, and validity legible without relying on colour', () => {
     const memory = constellation3DNodeEncoding(node('m', 'memory', { authority: 5, isLead: true, validity: 'stale', degree: 12 }));
     const task = constellation3DNodeEncoding(node('t', 'task', { authority: null, isLead: false, validity: 'active', degree: 1 }));
-    expect(memory.shape).toBe('octahedron');
+    expect(memory.shape).toBe('sphere');
     expect(task.shape).toBe('box');
     expect(memory.scale).toBeGreaterThan(task.scale);
     expect(memory.halo).toBe(true);
