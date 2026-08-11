@@ -671,9 +671,9 @@ export type ContextPackSectionId = z.infer<typeof ContextPackSectionId>;
 // accept the check unconditionally instead of enforcing it.
 type AssertEqualEnum<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 type AssertTrue<T extends true> = T;
-type _ContextPackSectionIdMatchesConsumption = AssertTrue<AssertEqualEnum<ContextPackSectionId, ContextConsumptionSectionId>>;
-type _ContextPackModeMatchesConsumption = AssertTrue<AssertEqualEnum<ContextPackMode, ContextConsumptionMode>>;
-type _ContextPackRoleMatchesConsumption = AssertTrue<AssertEqualEnum<ContextPackRole, ContextConsumptionRole>>;
+export type _ContextPackSectionIdMatchesConsumption = AssertTrue<AssertEqualEnum<ContextPackSectionId, ContextConsumptionSectionId>>;
+export type _ContextPackModeMatchesConsumption = AssertTrue<AssertEqualEnum<ContextPackMode, ContextConsumptionMode>>;
+export type _ContextPackRoleMatchesConsumption = AssertTrue<AssertEqualEnum<ContextPackRole, ContextConsumptionRole>>;
 
 export const ContextPackSection = z.object({
   id: ContextPackSectionId,
