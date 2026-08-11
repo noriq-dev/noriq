@@ -74,7 +74,13 @@ export function assembleConstellationV2Scene(
         const containing = incident.endpoint.communityPath.at(-1);
         if (!containing) continue;
         endpointId = containing.id;
-        if (!nodes.has(endpointId)) nodes.set(endpointId, communityNode(containing));
+        // PLNR-448: `offPageStandIn` marks this node as purely a substitute so the renderer can
+        // exclude it from the normal community passes (gravity well, core sphere, label) the
+        // PLNR-379 honesty rule forbids for it — it exists here only so the edge below has
+        // somewhere to point. Only set on the fresh-node branch: if `containing` is ALREADY in
+        // `nodes` (a genuinely resident/neighbour community added above), that node is untouched
+        // and keeps its normal treatment.
+        if (!nodes.has(endpointId)) nodes.set(endpointId, { ...communityNode(containing), offPageStandIn: true });
       }
       const outgoing = incident.direction === 'outgoing';
       // PLNR-445: `direction` here is the typed-label arrow (promotedEdgeLabelText reads it, not

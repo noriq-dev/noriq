@@ -369,7 +369,10 @@ export function MemoryConstellation3D({
         // exactly two draw calls total (not two per community) regardless of how many communities
         // are in the reference frame. depthWrite is off so the layers blend into the well rather
         // than occluding whatever sits behind them.
-        const communityNodes = [...nodeById.values()].filter((node) => node.community);
+        // PLNR-448: excludes off-page stand-ins — a stand-in gets its own dedicated terminus glyph
+        // (the offPagePromotedEdges pass below), never the full gravity-well/core-sphere treatment
+        // the PLNR-379 honesty rule reserves for a genuinely resident community.
+        const communityNodes = [...nodeById.values()].filter((node) => node.community && !node.offPageStandIn);
         if (communityNodes.length > 0) {
           const outer = new THREE.InstancedMesh(
             new THREE.SphereGeometry(1, 12, 8),

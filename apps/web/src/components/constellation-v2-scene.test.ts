@@ -53,6 +53,29 @@ describe('Constellation v2 scene assembly', () => {
     ]));
     expect(selected.partial).toBe(true);
     expect(assembleConstellationV2Scene(overview, merged, []).edges).toEqual(base.edges);
+    // PLNR-448: the substituted stand-in must be marked so the renderer can exclude it from the
+    // normal community passes (gravity well, core sphere, label) — it exists only for the edge
+    // above to resolve a position through.
+    expect(selected.nodes.find((node) => node.id === 'outside-root')).toMatchObject({ community: true, offPageStandIn: true });
+  });
+
+  it('does not mark a stand-in when the containing community is already resident on the page (PLNR-448)', () => {
+    // 'other' is already resident via overview.communities/externalCommunities — an incident edge
+    // whose off-page endpoint's containing community happens to be one already on the page must
+    // find the EXISTING node, not overwrite it with a fresh offPageStandIn-flagged one: it is a
+    // genuinely resident/neighbour community and must keep its normal rendering treatment.
+    const merged = page([{ nodeId: 'a', uri: 'noriq://memory/a' }], null);
+    const incidents: ApiConstellationV2IncidentPage = {
+      revision, node: { nodeId: 'a', uri: 'noriq://memory/a', type: 'memory', label: 'a', communityPath: [community('root'), community('leaf', 'root')] },
+      edges: [
+        { edgeId: 'toOther', type: 'related_to', direction: 'outgoing', provenance: 'test', endpoint: { nodeId: 'not-resident', uri: 'noriq://memory/not-resident', type: 'memory', label: 'not-resident', communityPath: [community('other')] } },
+      ],
+      nextCursor: null, coverage: { complete: true, reasons: [] },
+    };
+    const scene = assembleConstellationV2Scene(overview, merged, [incidents]);
+    const other = scene.nodes.find((node) => node.id === 'other');
+    expect(other).toMatchObject({ community: true });
+    expect(other!.offPageStandIn).toBeFalsy();
   });
 
   it('carries memberCount/typeCounts onto every community node and sums boundary route counts from the routes actually rendered (PLNR-438)', () => {

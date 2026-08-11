@@ -27,6 +27,15 @@ export interface Constellation3DNode {
    *  route touching this community (computed in constellation-v2-scene.ts, where the routes are
    *  in scope). Distinct from `degree`/internalEdgeCount, which counts INTERNAL edges only. */
   boundaryRouteCount?: number;
+  /** True only for a community node constellation-v2-scene.ts synthesized as a stand-in for an
+   *  off-page incident edge's real, non-resident endpoint — never for a community that is
+   *  genuinely resident/visible on this page (PLNR-448). It stays in the node map ONLY so
+   *  `buildConstellation3DRenderPlan` can resolve `Constellation3DEdgeSegment.from/to` through it;
+   *  the PLNR-379 honesty rule ("no synthesized node, ever") means it must be excluded from every
+   *  NORMAL node pass (shape/instancing group, community gravity well, text label) below — the
+   *  dedicated off-page terminus glyph (MemoryConstellation3D.tsx's `offPagePromotedEdges` pass)
+   *  is the only thing that may render it. */
+  offPageStandIn?: boolean;
 }
 
 export interface Constellation3DEdge {
@@ -229,6 +238,11 @@ export function buildConstellation3DRenderPlan(
     const node = constellation3DNodeEncoding(input);
     node.highlighted = highlightedNodeIds.has(node.id);
     byId.set(node.id, node);
+    // PLNR-448: an off-page stand-in must resolve edge positions through `byId` (above) but never
+    // join a shape/instancing group — that group is exactly what draws the core sphere the PLNR-379
+    // honesty rule forbids for a synthesized node. It still gets its dedicated terminus glyph,
+    // built independently from the promoted off-page edges in MemoryConstellation3D.tsx.
+    if (node.offPageStandIn) continue;
     const group = nodeGroups.get(node.shape);
     if (group) group.push(node);
     else nodeGroups.set(node.shape, [node]);
@@ -257,7 +271,10 @@ export function buildConstellation3DRenderPlan(
     (selectedIncident ? promotedEdges : baseEdges).push(segment);
   }
 
-  const labels = [...byId.values()].sort((a, b) => compareLabelPriority(a, b, selectedNodeId)).slice(0, Math.max(0, labelBudget));
+  // PLNR-448: an off-page stand-in never earns a text label either — same honesty rule as the
+  // shape-group exclusion above, applied to the label budget instead of the instancing pass.
+  const labels = [...byId.values()].filter((node) => !node.offPageStandIn)
+    .sort((a, b) => compareLabelPriority(a, b, selectedNodeId)).slice(0, Math.max(0, labelBudget));
   // PLNR-439: promoted edges (selection) split into up to three separate passes so historical and
   // off-page relationships can carry their own dash pattern/opacity instead of sharing the solid
   // amber line every other promoted edge gets — each pass is only allotted when the plan actually
@@ -285,7 +302,11 @@ export function buildConstellation3DRenderPlan(
   const hasAggregateRouteTube = baseEdges.some((edge) => edge.aggregate);
   const drawCallCeiling = nodeGroups.size * 2
     + (nodes.some((node) => node.isLead) ? 1 : 0)
-    + (nodes.some((node) => node.community) ? 2 : 0)
+    // PLNR-448: a plan whose only community node is an off-page stand-in no longer builds the
+    // gravity-well pass (it was excluded from nodeGroups above, same reasoning), so the ceiling
+    // must not allot draw calls for a pass that never fires. A genuinely resident community still
+    // counts normally, standing in or not alongside it.
+    + (nodes.some((node) => node.community && !node.offPageStandIn) ? 2 : 0)
     + (hasAggregateRouteTube ? 1 : 0)
     + 1 // base backbone line pass
     + (hasCurrentPromoted ? 1 : 0)

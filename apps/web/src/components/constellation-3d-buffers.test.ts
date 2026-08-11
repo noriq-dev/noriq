@@ -215,6 +215,54 @@ describe('draw-call ceiling accounts for promoted-edge passes (PLNR-439)', () =>
     expect(plan.drawCallCeiling).toBeLessThanOrEqual(14);
   });
 
+  it('excludes an off-page stand-in from the shape/instancing group and the label budget, but keeps it resolvable for edge geometry (PLNR-448)', () => {
+    const standIn = node('outside-root', 'community', { community: true, offPageStandIn: true, memberCount: 40, typeCounts: { task: 5 } });
+    const pin = node('pin', 'memory');
+    const edges: Constellation3DEdge[] = [
+      { id: 'incident:offpage', fromId: 'pin', toId: 'outside-root', type: 'related_to', direction: 'forward', weight: 1, aggregate: true },
+    ];
+    const plan = buildConstellation3DRenderPlan([pin, standIn], edges, 'pin', 24);
+    // The stand-in never joins a shape group — only 'pin' (a sphere-shaped memory node) does.
+    expect(plan.nodeGroups.get('sphere')?.map((n) => n.id)).toEqual(['pin']);
+    // Nor does it ever earn a text label.
+    expect(plan.labels.some((n) => n.id === 'outside-root')).toBe(false);
+    // But the promoted edge still resolves both endpoints — the stand-in's position is intact.
+    expect(plan.promotedEdges).toHaveLength(1);
+    expect(plan.promotedEdges[0]).toMatchObject({ fromId: 'pin', toId: 'outside-root' });
+  });
+
+  it('does not allot the community gravity-well pass for a scene whose only community node is an off-page stand-in (PLNR-448)', () => {
+    const standIn = node('outside-root', 'community', { community: true, offPageStandIn: true });
+    const pin = node('pin', 'memory');
+    const edges: Constellation3DEdge[] = [
+      { id: 'incident:offpage', fromId: 'pin', toId: 'outside-root', type: 'related_to', direction: 'forward', weight: 1, aggregate: true },
+    ];
+    const withStandIn = buildConstellation3DRenderPlan([pin, standIn], edges, 'pin');
+    const withoutStandIn = buildConstellation3DRenderPlan([pin], [], 'pin');
+    // No +2 gravity-well term over the plain-pin baseline, and no separate sphere shape-group cost
+    // either (the stand-in's own shape-group entry is excluded, same as the label above) — the
+    // only extra draw calls come from the off-page promoted-edge pass itself (dashed line +
+    // terminus glyph, +2) plus the base backbone pass gaining nothing since there was already one.
+    expect(withStandIn.drawCallCeiling).toBe(withoutStandIn.drawCallCeiling + 2);
+  });
+
+  it('still allots the gravity-well pass when a genuinely resident community sits alongside an off-page stand-in — the exclusion must not leak onto real communities (PLNR-448)', () => {
+    const standIn = node('outside-root', 'community', { community: true, offPageStandIn: true });
+    const resident = node('neighbor', 'community', { community: true, memberCount: 40, typeCounts: { task: 2 } });
+    const pin = node('pin', 'memory');
+    const edges: Constellation3DEdge[] = [
+      { id: 'incident:offpage', fromId: 'pin', toId: 'outside-root', type: 'related_to', direction: 'forward', weight: 1, aggregate: true },
+      { id: 'aggregate:neighbor:other', fromId: 'neighbor', toId: 'pin', type: 'related_to', direction: 'forward', weight: 2, aggregate: true },
+    ];
+    const plan = buildConstellation3DRenderPlan([pin, standIn, resident], edges, null, 24);
+    // The resident community still joins the sphere shape group and still gets its well pass —
+    // only the stand-in is excluded.
+    expect(plan.nodeGroups.get('sphere')?.map((n) => n.id).sort()).toEqual(['neighbor', 'pin']);
+    expect(plan.drawCallCeiling).toBeGreaterThanOrEqual(2); // gravity-well pass is present
+    expect(plan.labels.some((n) => n.id === 'neighbor')).toBe(true);
+    expect(plan.labels.some((n) => n.id === 'outside-root')).toBe(false);
+  });
+
   it('does not allot an aggregate-route-tube draw call for an aggregate edge that got promoted (off-page) rather than landing in baseEdges', () => {
     // A community-typed off-page target with a neighbour community also in frame — the aggregate
     // edge that substitutes it is INCIDENT to the selection, so it lands in promotedEdges (and
