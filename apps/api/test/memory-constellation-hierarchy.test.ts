@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  buildConstellationHierarchy, constellationSourceIsCurrent, CONSTELLATION_LEAF_SIZE,
+  buildConstellationHierarchy, constellationSourceIsCurrent, CONSTELLATION_COMMUNITY_LABEL_MAX_LENGTH, CONSTELLATION_LEAF_SIZE,
   type PriorConstellationCommunity,
 } from '../src/memory/constellation-hierarchy';
 import type { ConstellationRawEdge, ConstellationRawNode } from '../src/memory/graph-queries';
@@ -38,7 +38,26 @@ describe('buildConstellationHierarchy', () => {
     const result = buildConstellationHierarchy(nodes, edges);
     expect(result.data.memberships).toHaveLength(12);
     expect(result.data.links).toHaveLength(0);
-    expect(result.data.communities.filter((c) => c.parentId === null)).toHaveLength(9);
+    expect(result.data.communities.filter((c) => c.parentId === null)).toHaveLength(1);
+  });
+
+  it('consolidates sparse components into readable, deterministic semantic roots with short names', () => {
+    const types = ['task', 'memory', 'doc', 'file'];
+    const nodes = Array.from({ length: 42 }, (_, i) => ({
+      ...node(i, types[i % types.length]!),
+      label: `Implement the complete long-form project requirement number ${i} with all supporting details and acceptance criteria.`,
+    }));
+    const edges = [edge(0, 36, 37), edge(1, 38, 39), edge(2, 40, 41)];
+    const a = buildConstellationHierarchy(nodes, edges);
+    const b = buildConstellationHierarchy([...nodes].reverse(), [...edges].reverse());
+    const roots = a.data.communities.filter((community) => community.parentId === null);
+
+    expect(roots.length).toBeGreaterThanOrEqual(3);
+    expect(roots.length).toBeLessThanOrEqual(10);
+    expect(roots.length).toBeLessThan(39);
+    expect(a).toEqual(b);
+    expect(a.data.communities.every((community) => community.label.length <= CONSTELLATION_COMMUNITY_LABEL_MAX_LENGTH)).toBe(true);
+    expect(a.data.communities.every((community) => !nodes.some((n) => n.label === community.label))).toBe(true);
   });
 
   it('preserves a bridge as a typed, directed aggregate route when an oversized component splits', () => {

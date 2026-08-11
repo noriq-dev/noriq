@@ -1,9 +1,10 @@
 import type { ConstellationRawEdge, ConstellationRawNode } from './graph-queries';
 
-export const CONSTELLATION_TOPOLOGY_VERSION = 'connectivity-v1';
+export const CONSTELLATION_TOPOLOGY_VERSION = 'semantic-roots-v2';
 export const CONSTELLATION_LAYOUT_VERSION = 'space-v1';
 export const CONSTELLATION_MAX_CHILDREN = 128;
 export const CONSTELLATION_LEAF_SIZE = 500;
+export const CONSTELLATION_COMMUNITY_LABEL_MAX_LENGTH = 40;
 
 const EDGE_WEIGHTS: Readonly<Record<string, number>> = {
   calls: 4, imports: 4, depends_on: 4, tests: 4, validated_by: 4, implements: 4,
@@ -40,7 +41,7 @@ export interface HierarchyGenerationResult {
 }
 
 interface WeightedEdge extends ConstellationRawEdge { weight: number }
-interface DraftCommunity { members: string[]; children: DraftCommunity[]; id?: string; level?: number; parentId?: string | null }
+interface DraftCommunity { members: string[]; children: DraftCommunity[]; labelHint?: string; id?: string; level?: number; parentId?: string | null }
 
 function fnv64(input: string): string {
   let h = 0xcbf29ce484222325n;
@@ -116,6 +117,58 @@ function buildCommunity(members: string[], adjacency: ReadonlyMap<string, Map<st
   if (members.length <= CONSTELLATION_LEAF_SIZE) return { members, children: [] };
   const groups = partition(members, adjacency, rank, byId);
   return { members, children: groups.map((group) => buildCommunity(group, adjacency, rank, byId)) };
+}
+
+function dominantType(members: readonly string[], byId: ReadonlyMap<string, ConstellationRawNode>): string {
+  const counts = new Map<string, number>();
+  for (const id of members) counts.set(byId.get(id)!.type, (counts.get(byId.get(id)!.type) ?? 0) + 1);
+  return [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]![0];
+}
+
+function boundedLabel(value: string): string {
+  const normalized = value.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (normalized.length <= CONSTELLATION_COMMUNITY_LABEL_MAX_LENGTH) return normalized || 'Community';
+  return `${normalized.slice(0, CONSTELLATION_COMMUNITY_LABEL_MAX_LENGTH - 1).trimEnd()}…`;
+}
+
+function typeLabel(type: string): string {
+  const singular = type.replace(/[_-]+/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase());
+  const irregular: Readonly<Record<string, string>> = { memory: 'Memories', repository: 'Repositories' };
+  return boundedLabel(irregular[type] ?? `${singular}${singular.endsWith('s') ? '' : 's'}`);
+}
+
+function structuralLabel(community: DraftCommunity, byId: ReadonlyMap<string, ConstellationRawNode>): string {
+  if (community.labelHint) return boundedLabel(community.labelHint);
+  const counts = new Map<string, number>();
+  for (const id of community.members) counts.set(byId.get(id)!.type, (counts.get(byId.get(id)!.type) ?? 0) + 1);
+  const types = [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  const visible = types.slice(0, 2).map(([type]) => typeLabel(type)).join(' / ');
+  return boundedLabel(`${visible}${types.length > 2 ? ` +${types.length - 2}` : ''}`);
+}
+
+function consolidateComponents(
+  components: readonly string[][],
+  adjacency: ReadonlyMap<string, Map<string, number>>,
+  rank: ReadonlyMap<string, number>,
+  byId: ReadonlyMap<string, ConstellationRawNode>,
+): DraftCommunity[] {
+  const roots: DraftCommunity[] = [];
+  const smallByType = new Map<string, string[][]>();
+  for (const members of components) {
+    if (members.length > CONSTELLATION_LEAF_SIZE) { roots.push(buildCommunity(members, adjacency, rank, byId)); continue; }
+    const type = dominantType(members, byId);
+    const grouped = smallByType.get(type) ?? [];
+    grouped.push(members);
+    smallByType.set(type, grouped);
+  }
+  // Type is universal, stable, and already drives constellation tinting. Assigning each whole
+  // component by its dominant type consolidates isolates without severing real edges; grouping by
+  // URI namespace instead would often turn per-entity IDs and file paths into singleton buckets.
+  for (const [type, grouped] of [...smallByType].sort((a, b) => a[0].localeCompare(b[0]))) {
+    const members = grouped.flat().sort((a, b) => compareNodeIds(a, b, byId));
+    roots.push({ ...buildCommunity(members, adjacency, rank, byId), labelHint: typeLabel(type) });
+  }
+  return roots.sort((a, b) => compareNodeIds(a.members[0]!, b.members[0]!, byId));
 }
 
 function wrapForest(children: DraftCommunity[], byId: ReadonlyMap<string, ConstellationRawNode>): DraftCommunity[] {
@@ -210,7 +263,7 @@ export function buildConstellationHierarchy(
   }
   const rank = new Map(nodes.map((n) => [n.nodeId, Math.log2(rawDegree.get(n.nodeId)! + 1) + weightedDegree.get(n.nodeId)!]));
   const components = connectedComponents(nodes.map((n) => n.nodeId), adjacency, byId);
-  const forest = wrapForest(components.map((members) => buildCommunity(members, adjacency, rank, byId)), byId);
+  const forest = wrapForest(consolidateComponents(components, adjacency, rank, byId), byId);
   const communities = assignCommunityIds(forest, byId, previous);
 
   const pathByNode = new Map<string, DraftCommunity[]>();
@@ -245,9 +298,8 @@ export function buildConstellationHierarchy(
     const { internalEdgeCount, internalWeight, boundaryWeight } = connectivity.get(community.id!)!;
     const typeCounts: Record<string, number> = {};
     for (const id of community.members) typeCounts[byId.get(id)!.type] = (typeCounts[byId.get(id)!.type] ?? 0) + 1;
-    const representative = [...community.members].sort((a, b) => (rank.get(b)! - rank.get(a)!) || compareNodeIds(a, b, byId))[0]!;
     return {
-      id: community.id!, parentId: community.parentId!, level: community.level!, label: byId.get(representative)!.label,
+      id: community.id!, parentId: community.parentId!, level: community.level!, label: structuralLabel(community, byId),
       memberCount: community.members.length, childCount: community.children.length, typeCounts, internalEdgeCount,
       internalWeight, normalizedCohesion: internalWeight / (internalWeight + boundaryWeight || 1), boundaryWeight,
       anchor: anchorFor(community.id!),
