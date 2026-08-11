@@ -159,6 +159,41 @@ export function promotedEdgeLabelText(edge: Constellation3DEdge, targetLabel: st
   return `${arrow} ${edge.type}${suffix}`;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Search ignite (PLNR-441, screen spec 1c). The PLNR-439 draw-call-ceiling finding — a realistic
+// pinned-selection scene already sits at exactly 14, the PLNR-371 ceiling, with zero headroom —
+// means ignite cannot afford a single new draw call: it has to ride the instanced buckets that
+// already exist rather than add its own. Two consequences, both load-bearing:
+//   (1) The unmatched field's dim is the SAME "faded"/"unfaded" material bucket every node mesh
+//       already splits into (see `constellation3DIsDimmed` below) — search just changes which
+//       predicate decides bucket membership, not how many buckets or draw calls there are.
+//   (2) A matched node's "flare" is the scale boost `highlighted` nodes already get in the
+//       renderer's per-instance matrix (never a new mesh) — a community's gravity-well layers key
+//       their own radius off that same `node.scale`, so a flared community's WELL grows with its
+//       core for free, with no separate well-opacity bucket to split.
+// This is why the combined pinned-selection + ignite measurement in
+// constellation-3d-buffers.test.ts stays at 14, not higher: ignite spends zero new draw calls.
+export const CONSTELLATION_IGNITE_DIM_OPACITY = 0.32;
+
+/** Whether a node instance renders in the dimmed material bucket. Outside search, this is the
+ * pre-existing validity-based dim (superseded/expired/stale, PLNR-437). During search it is
+ * replaced — not layered — by match state: a matched node (entity or community, `highlighted`
+ * already carries both per MemoryConstellationV2.tsx's ignite wiring) never dims, and everything
+ * else drops into the same bucket regardless of its own validity. This is a straight swap of the
+ * predicate the existing 2-bucket split (`for (const faded of [false, true])` in
+ * MemoryConstellation3D.tsx) already uses — it does not add a bucket. */
+export function constellation3DIsDimmed(node: Pick<Constellation3DNodeInstance, 'opacity' | 'highlighted'>, searchActive: boolean): boolean {
+  return searchActive ? !node.highlighted : node.opacity < 1;
+}
+
+/** The overview flare's "+N matches" community subtext (screen spec 1c) — replaces the normal
+ * "N entities" line while a search is active and this community has at least one ignited match.
+ * Plural handling is this task's discretion; kept trivial and testable independent of the label's
+ * DOM/projection concerns, same split as `communityTooltipContent`. */
+export function communityIgniteSubtext(matchCount: number): string {
+  return `+${matchCount.toLocaleString()} match${matchCount === 1 ? '' : 'es'}`;
+}
+
 export function constellation3DNodeEncoding(node: Constellation3DNode): Constellation3DNodeInstance {
   const authority = node.authority === null || node.authority === undefined ? 0 : Math.max(0, Math.min(5, node.authority));
   const scaleMultiplier = node.community ? 1 : encodingForType(node.type).scaleMultiplier;

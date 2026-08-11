@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type * as Three from 'three';
 import {
-  aggregateRouteWidth, buildConstellation3DRenderPlan, communityTooltipContent, constellation3DColorType,
-  constellation3DNodeEncoding, isOffPageIncidentEdge, promotedEdgeLabelText, type Constellation3DEdge,
+  aggregateRouteWidth, buildConstellation3DRenderPlan, communityIgniteSubtext, communityTooltipContent,
+  constellation3DColorType, constellation3DIsDimmed, constellation3DNodeEncoding, CONSTELLATION_IGNITE_DIM_OPACITY,
+  isOffPageIncidentEdge, promotedEdgeLabelText, type Constellation3DEdge,
   type Constellation3DEdgeSegment, type ConstellationCommunityTooltip, type Constellation3DNode,
   type Constellation3DNodeInstance, type Constellation3DShape,
 } from './constellation-3d-buffers';
@@ -48,7 +49,19 @@ export interface MemoryConstellation3DProps {
   nodes: Constellation3DNode[];
   edges: Constellation3DEdge[];
   selectedNodeId: string | null;
+  /** Entity AND community node ids an active search has matched — the SAME field drives entity
+   *  ignite (unchanged from the pre-PLNR-441 highlight mechanism) and community-flare eligibility;
+   *  see constellation-3d-buffers.ts's ignite-budget comment for why one field, not two. */
   highlightedNodeIds?: string[];
+  /** True whenever the search box carries a non-empty query (MemoryConstellationV2.tsx's
+   *  `searchActive`) — distinct from `highlightedNodeIds.length > 0`: a zero-hit or not-yet-routed
+   *  search must still dim the field (screen spec 1c honesty rule), so dimming cannot wait on a
+   *  match being known. */
+  searchActive?: boolean;
+  /** Community node id -> ignited match count (root-level communities only, computed in
+   *  MemoryConstellationV2.tsx from the search hits' resolved routes). Subtext-only: it never
+   *  changes which draw-call bucket a community lands in (see constellation-3d-buffers.ts). */
+  igniteMatchCounts?: ReadonlyMap<string, number>;
   theme?: 'dark' | 'light';
   reducedMotion?: boolean;
   onSelectNode?: (nodeId: string | null) => void;
@@ -201,7 +214,8 @@ function reticleTickGeometry(THREE: typeof Three, innerRadius: number, outerRadi
  * React only owns the canvas, failure state, and a fixed label budget. The v2 controller hands
  * renderer failures to its full textual peer. */
 export function MemoryConstellation3D({
-  projectId, generationId, layoutVersion, nodes, edges, selectedNodeId, highlightedNodeIds = [], theme = 'dark', reducedMotion = false,
+  projectId, generationId, layoutVersion, nodes, edges, selectedNodeId, highlightedNodeIds = [],
+  searchActive = false, igniteMatchCounts, theme = 'dark', reducedMotion = false,
   onSelectNode, onOpenEgoNetwork, onOpenInspector, onRendererFailure,
 }: MemoryConstellation3DProps) {
   const hostRef = useRef<HTMLDivElement>(null);
@@ -289,10 +303,13 @@ export function MemoryConstellation3D({
 
         for (const [shape, instances] of plan.nodeGroups) {
           for (const faded of [false, true]) {
-            const group = instances.filter((node) => (node.opacity < 1) === faded);
+            // Same two buckets as before PLNR-441 — search only changes which predicate decides
+            // membership (constellation3DIsDimmed), never the bucket count, so this costs zero new
+            // draw calls: the ignite budget note in constellation-3d-buffers.ts is what this reuses.
+            const group = instances.filter((node) => constellation3DIsDimmed(node, searchActive) === faded);
             if (group.length === 0) continue;
             const geometry = geometryFor(THREE, shape);
-            const material = new THREE.MeshBasicMaterial({ transparent: faded, opacity: faded ? 0.42 : 1, vertexColors: true });
+            const material = new THREE.MeshBasicMaterial({ transparent: faded, opacity: faded ? (searchActive ? CONSTELLATION_IGNITE_DIM_OPACITY : 0.42) : 1, vertexColors: true });
             const mesh = new THREE.InstancedMesh(geometry, material, group.length);
             mesh.userData.nodeIds = group.map((node) => node.id);
             group.forEach((node, index) => {
@@ -354,12 +371,18 @@ export function MemoryConstellation3D({
           mid.renderOrder = -1;
           communityNodes.forEach((node, index) => {
             const color = colorForType(constellation3DColorType(node));
-            const outerScale = node.scale * COMMUNITY_WELL_OUTER_RATIO;
+            // Ignite flare rides the SAME highlighted-scale boost the core sphere pass below already
+            // applies (PLNR-441) rather than a second, well-specific opacity bucket — a matched
+            // community's well grows with its core for zero extra draw calls (see the ignite-budget
+            // comment in constellation-3d-buffers.ts: a realistic pinned-selection scene is already
+            // at the 14-call ceiling with no headroom for a new pass).
+            const boost = node.highlighted ? 1.3 : 1;
+            const outerScale = node.scale * boost * COMMUNITY_WELL_OUTER_RATIO;
             matrix.makeScale(outerScale, outerScale, outerScale);
             matrix.setPosition(...node.position);
             outer.setMatrixAt(index, matrix);
             outer.setColorAt(index, color);
-            const midScale = node.scale * COMMUNITY_WELL_MID_RATIO;
+            const midScale = node.scale * boost * COMMUNITY_WELL_MID_RATIO;
             matrix.makeScale(midScale, midScale, midScale);
             matrix.setPosition(...node.position);
             mid.setMatrixAt(index, matrix);
@@ -449,8 +472,14 @@ export function MemoryConstellation3D({
             const point = new THREE.Vector3(...node.position).project(camera);
             if (point.z < -1 || point.z > 1 || Math.abs(point.x) > 1 || Math.abs(point.y) > 1) continue;
             // Two-line label for a community: name + entity count (PLNR-438) — one budget entry,
-            // same as before, just carrying a second rendered line.
-            const subtext = node.community ? `${(node.memberCount ?? 0).toLocaleString()} entities` : undefined;
+            // same as before, just carrying a second rendered line. While a search is active and
+            // this community has at least one ignited match, the second line reports the match
+            // count instead (screen spec 1c "+N matches") — entities are not resident at this
+            // level, so the count is the only truthful thing to say about what matched here.
+            const igniteCount = searchActive ? igniteMatchCounts?.get(node.id) : undefined;
+            const subtext = node.community
+              ? (igniteCount ? communityIgniteSubtext(igniteCount) : `${(node.memberCount ?? 0).toLocaleString()} entities`)
+              : undefined;
             const pinned = node.id === selection;
             const y = (1 - point.y) * height / 2;
             // The pin's title renders 40px above the node instead of centred on it (screen spec
@@ -522,14 +551,20 @@ export function MemoryConstellation3D({
           // width difference on the same thin-line pass.
           const rawBaseEdges = selectedPlan.baseEdges.filter((edge) => !edge.aggregate);
           const aggregateBaseEdges = selectedPlan.baseEdges.filter((edge) => edge.aggregate);
-          const base = lineObject(THREE, rawBaseEdges, theme === 'dark' ? 0x7790aa : 0x506070, selection ? 0.1 : 0.38, 0);
+          // Field dim during search (screen spec 1c: "drops to ~32% opacity as a whole — stars,
+          // routes, and unmatched communities together") reuses the SAME base/aggregate line
+          // objects, just at a lower opacity — no edge is individually classified as
+          // matched/unmatched (only nodes are search results), so this is a uniform dim of the
+          // whole unselected route field rather than a second bucketed pass. A pinned selection
+          // still wins (0.1/0.12): the promoted incident edges are the thing to look at then.
+          const base = lineObject(THREE, rawBaseEdges, theme === 'dark' ? 0x7790aa : 0x506070, selection ? 0.1 : searchActive ? CONSTELLATION_IGNITE_DIM_OPACITY : 0.38, 0);
           if (base) { scene.add(base); edgeObjects.push(base); }
           if (aggregateBaseEdges.length > 0) {
             const weights = aggregateBaseEdges.map((edge) => edge.weight);
             const minWeight = Math.min(...weights), maxWeight = Math.max(...weights);
             const routes = new THREE.InstancedMesh(
               new THREE.CylinderGeometry(1, 1, 1, 5, 1, true),
-              new THREE.MeshBasicMaterial({ color: theme === 'dark' ? 0x7790aa : 0x506070, transparent: true, opacity: selection ? 0.12 : 0.32, depthWrite: false }),
+              new THREE.MeshBasicMaterial({ color: theme === 'dark' ? 0x7790aa : 0x506070, transparent: true, opacity: selection ? 0.12 : searchActive ? CONSTELLATION_IGNITE_DIM_OPACITY : 0.32, depthWrite: false }),
               aggregateBaseEdges.length,
             );
             routes.renderOrder = 1;
@@ -676,7 +711,10 @@ export function MemoryConstellation3D({
       rendererRef.current = null;
     };
     // Scene reconstruction is reserved for page integration/theme changes, not selection.
-  }, [layoutNodes, edges, highlightedNodeIds, theme, onRendererFailure]);
+    // searchActive/igniteMatchCounts join highlightedNodeIds here for the same reason that field
+    // already triggers a rebuild: ignite changes which material bucket nodes/wells/routes land in
+    // and what a community's label subtext says, all baked in at scene-build time, not per-frame.
+  }, [layoutNodes, edges, highlightedNodeIds, searchActive, igniteMatchCounts, theme, onRendererFailure]);
 
   useEffect(() => { rendererRef.current?.renderEdges(selectedNodeId); }, [selectedNodeId]);
   useEffect(() => { rendererRef.current?.applyCamera(cameraState); }, [cameraState]);

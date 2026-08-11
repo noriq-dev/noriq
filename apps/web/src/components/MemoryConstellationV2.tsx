@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  api, ApiError, type ApiConstellationV2CommunityPage, type ApiConstellationV2IncidentPage,
+  api, ApiError, type ApiConstellationV2Community, type ApiConstellationV2CommunityPage, type ApiConstellationV2IncidentPage,
   type ApiConstellationV2Overview, type ApiMemoryHit,
 } from '../api';
 import { useTheme } from '../theme';
@@ -78,6 +78,13 @@ export function MemoryConstellationV2({
   const [query, setQuery] = useState('');
   const [hits, setHits] = useState<ApiMemoryHit[]>([]);
   const [searching, setSearching] = useState(false);
+  // Search ignite (PLNR-441): a hit's containing-community ancestry, resolved through the SAME
+  // `memoryConstellationV2Route` endpoint focusHit already uses to route on pick — no new endpoint.
+  // At overview level no entity is resident, so this is the only way to know which community to
+  // flare or which community an off-page result line names; keyed by uri and never cleared on a
+  // narrowing requery so a hit seen again (e.g. backspaced back to) doesn't refetch.
+  const [hitRoutes, setHitRoutes] = useState<Map<string, ApiConstellationV2Community[]>>(new Map());
+  const hitRoutesRef = useRef(hitRoutes);
   const [rendererFailure, setRendererFailure] = useState<string | null>(null);
   const [typeFilter, setTypeFilter] = useState('');
   // Default open, matching the design reference; toggleable per the screen spec ("which the design
@@ -239,9 +246,52 @@ export function MemoryConstellationV2({
     return () => { clearTimeout(timeout); controller.abort(); };
   }, [pid, query]);
 
-  const highlightedNodeIds = useMemo(() => hits.length && filteredScene
-    ? filteredScene.nodes.filter((node) => node.uri && hits.some((hit) => hit.uri === node.uri)).map((node) => node.id)
-    : [], [hits, filteredScene]);
+  // Resolves each new hit's community ancestry in parallel (bounded by memorySearch's own limit:
+  // 12), skipping anything already cached. A hit with no uri can never be routed at all (focusHit
+  // throws on that), so it is left out of ignite/off-page reasoning entirely rather than guessed at.
+  useEffect(() => {
+    const toFetch = hits.filter((hit): hit is ApiMemoryHit & { uri: string } => Boolean(hit.uri) && !hitRoutesRef.current.has(hit.uri!));
+    if (toFetch.length === 0) return;
+    const controller = new AbortController();
+    Promise.allSettled(toFetch.map((hit) => api.memoryConstellationV2Route(pid, hit.uri, controller.signal).then((route) => [hit.uri, route.communityPath] as const)))
+      .then((settled) => {
+        if (controller.signal.aborted) return;
+        const next = new Map(hitRoutesRef.current);
+        for (const result of settled) if (result.status === 'fulfilled') next.set(result.value[0], result.value[1]);
+        hitRoutesRef.current = next; setHitRoutes(next);
+      });
+    return () => controller.abort();
+  }, [pid, hits]);
+
+  // Root-level community each hit lands in (communityPath[0]) — the header's "N matches ignited
+  // across M communities" figure and the overview flare/count both read off this, matching the
+  // "communities" the rest of the chrome already means by that word (overview.communities, always
+  // root level). Deepest ancestor (`.at(-1)`) is used separately, per-hit, for the results panel's
+  // off-page routing note — a more specific name is more useful there than the root.
+  const matchedRootCommunityIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const hit of hits) { const rootId = hit.uri ? hitRoutes.get(hit.uri)?.[0]?.id : undefined; if (rootId) ids.add(rootId); }
+    return ids;
+  }, [hits, hitRoutes]);
+  const matchCountsByRootCommunity = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const hit of hits) {
+      const rootId = hit.uri ? hitRoutes.get(hit.uri)?.[0]?.id : undefined;
+      if (rootId) counts.set(rootId, (counts.get(rootId) ?? 0) + 1);
+    }
+    return counts;
+  }, [hits, hitRoutes]);
+
+  const highlightedNodeIds = useMemo(() => {
+    if (!filteredScene) return [];
+    const ids = new Set<string>();
+    if (hits.length) for (const node of filteredScene.nodes) if (node.uri && hits.some((hit) => hit.uri === node.uri)) ids.add(node.id);
+    // Community ignite rides the SAME field entity ignite already used (constellation-3d-buffers.ts's
+    // ignite-budget comment explains why this is one field, not two): whichever matched-root-community
+    // ids happen to correspond to a node actually in frame get flared, harmlessly no-op otherwise.
+    for (const id of matchedRootCommunityIds) ids.add(id);
+    return [...ids];
+  }, [hits, filteredScene, matchedRootCommunityIds]);
   // Sum of every currently-resident page's node count — the same figure `storeResident` compares against
   // CONSTELLATION_V2_RESIDENT_NODE_BUDGET before throwing. Surfaced as a gauge so the ceiling is watched,
   // not hit; the throw in storeResident stays the enforcement backstop.
@@ -278,13 +328,16 @@ export function MemoryConstellationV2({
   const countsLabel = path.length === 0
     ? `${overview.communities.length} communit${overview.communities.length === 1 ? 'y' : 'ies'} · ${totalEntities.toLocaleString()} entities`
     : `${filteredScene.nodes.length} visible · ${filteredScene.edges.length} routes`;
-  // Search-active breadcrumb copy ("N matches ignited ... non-matches dimmed") describes the ignite/dim
-  // treatment that lands with the later search-ignite task; showing that copy before dimming exists would
-  // claim a visual behaviour the app doesn't have yet, so this task only carries the root/expanded hints.
-  const levelHint = path.length === 0
-    ? '— root level · double-click a community to open it'
-    : `· level ${path.length}`;
   const searchActive = query.trim().length > 0;
+  // Search-active breadcrumb copy (screen spec 1c): states the total and the community spread up
+  // front, so the dim that follows can never be misread as a filter having removed anything — the
+  // count IS the honesty mechanism, not a nicety (Navigator conventions doc §4 "dimming is not
+  // filtering"). Falls back to the root/expanded hints (PLNR-436) when no query is active.
+  const levelHint = searchActive
+    ? `— ${hits.length} match${hits.length === 1 ? '' : 'es'} ignited across ${matchedRootCommunityIds.size} communit${matchedRootCommunityIds.size === 1 ? 'y' : 'ies'} · non-matches dimmed, not removed`
+    : path.length === 0
+      ? '— root level · double-click a community to open it'
+      : `· level ${path.length}`;
   const residentMeterPercent = Math.min(100, (residentTotal / CONSTELLATION_V2_RESIDENT_NODE_BUDGET) * 100);
 
   // One stacked status region, fixed severity order (error -> stale -> building -> partial ->
@@ -377,6 +430,7 @@ export function MemoryConstellationV2({
             ref={searchInputRef}
             value={query}
             onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => { if (event.key === 'Enter' && hits.length > 0) { event.preventDefault(); void focusHit(hits[0]!); } }}
             placeholder="Search memory, task, file, symbol…"
             aria-label="Search memory, task, file, symbol"
             style={{
@@ -441,6 +495,7 @@ export function MemoryConstellationV2({
               <LazyConstellation3D
                 projectId={pid} generationId={overview.revision.generationId} layoutVersion={overview.revision.layoutVersion}
                 nodes={filteredScene.nodes} edges={filteredScene.edges} selectedNodeId={selectedNodeId} highlightedNodeIds={highlightedNodeIds} theme={theme}
+                searchActive={searchActive} igniteMatchCounts={matchCountsByRootCommunity}
                 reducedMotion={reducedMotion}
                 onSelectNode={selectNode} onOpenEgoNetwork={onOpenEgoNetwork} onOpenInspector={onOpenInspector}
                 onRendererFailure={handleRendererFailure}
@@ -473,8 +528,44 @@ export function MemoryConstellationV2({
               </button>}
             </div>)}
           </div>}
-          {hits.length > 0 && <div style={{ position: 'absolute', right: 14, top: 10, width: 360, maxHeight: 300, overflow: 'auto', background: 'var(--panel)', border: '1px solid var(--line)', borderRadius: 8 }}>
-            {hits.map((hit) => <button key={`${hit.entityType}:${hit.id}`} type="button" onClick={() => void focusHit(hit)} style={{ display: 'block', width: '100%', padding: 9, textAlign: 'left', borderBottom: '1px solid var(--line)' }}>{hit.title}<small style={{ display: 'block', color: 'var(--text-dim)' }}>{hit.entityType} · {hit.uri}</small></button>)}
+          {hits.length > 0 && <div role="region" aria-label="Search matches" style={{
+            position: 'absolute', right: 14, top: 10, width: 392, maxHeight: 340, overflow: 'auto',
+            background: 'rgba(14,16,20,.96)', border: '1px solid var(--line)', borderRadius: 10, backdropFilter: 'blur(10px)',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px', borderBottom: '1px solid var(--line)' }}>
+              <span style={{ fontFamily: 'var(--mono)', fontSize: 9, letterSpacing: '.1em', textTransform: 'uppercase', color: 'var(--text-dim)' }}>Matches</span>
+              <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-mid)' }}>{hits.length} · hybrid + exact URI</span>
+              <div style={{ flex: 1 }} />
+              <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>↵ focuses top</span>
+            </div>
+            {hits.map((hit, index) => {
+              // Off-page: this hit's uri is not among the currently resident nodes on canvas — the
+              // ONLY thing that makes focusHit's flight (route, load pages, focus, pin) a surprise
+              // rather than an expectation (Navigator conventions doc §4 "off-page is named, never
+              // faked"). The deepest known ancestor (`.at(-1)`) is the most specific truthful name
+              // available for where picking this hit will actually land.
+              const resident = Boolean(hit.uri) && filteredScene.nodes.some((node) => node.uri === hit.uri);
+              const routeCommunity = hit.uri ? hitRoutes.get(hit.uri)?.at(-1) : undefined;
+              const top = index === 0;
+              return (
+                <button
+                  key={`${hit.entityType}:${hit.id}`} type="button" onClick={() => void focusHit(hit)}
+                  style={{
+                    display: 'block', width: '100%', padding: '8px 10px', textAlign: 'left', borderBottom: '1px solid var(--line)',
+                    borderLeft: top ? '2px solid var(--accent)' : '2px solid transparent',
+                    background: top ? 'rgba(198,242,78,.05)' : 'transparent',
+                  }}
+                >
+                  <span style={{ fontSize: 12, fontWeight: top ? 600 : 400, color: top ? 'var(--text)' : 'var(--text-soft)' }}>{hit.title}</span>
+                  <small style={{ display: 'block', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-dim)', marginTop: 2 }}>{hit.entityType} · {hit.uri}</small>
+                  {!resident && routeCommunity && (
+                    <small style={{ display: 'block', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--amber)', marginTop: 2 }}>
+                      off-page · picking it routes via {routeCommunity.label}
+                    </small>
+                  )}
+                </button>
+              );
+            })}
           </div>}
           {searching && <div style={{ position: 'absolute', right: 18, top: 16, color: 'var(--text-dim)', fontSize: 10 }}>searching…</div>}
           {/* Fixed offset, not conditional on the status region's height: this widget is superseded by
@@ -490,7 +581,7 @@ export function MemoryConstellationV2({
           {/* Fixed bottom-left, independent of the top-left status region / accessible-list panel's
               presence or height — same "no sibling-dependent offset" rule those already follow
               (PLNR-436/438). Space view only, matching the accessible-list panel's scope. */}
-          {!showCatalogue && <div aria-label="Constellation encoding legend" style={{
+          {!showCatalogue && <div aria-label={searchActive ? 'Constellation ignite legend' : 'Constellation encoding legend'} style={{
             position: 'absolute', left: 14, bottom: 14, width: 238, background: 'var(--panel)',
             border: '1px solid var(--line)', borderRadius: 8, padding: 10, fontFamily: 'var(--mono)',
           }}>
@@ -501,10 +592,19 @@ export function MemoryConstellationV2({
                 background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', fontFamily: 'inherit',
               }}
             >
-              <span style={{ fontSize: 10, letterSpacing: '.12em', textTransform: 'uppercase', color: 'var(--text-dim)' }}>Encoding</span>
+              <span style={{ fontSize: 10, letterSpacing: '.12em', textTransform: 'uppercase', color: 'var(--text-dim)' }}>{searchActive ? 'Ignite' : 'Encoding'}</span>
               <span aria-hidden="true" style={{ color: 'var(--text-faint)', fontSize: 10 }}>{legendOpen ? '−' : '+'}</span>
             </button>
-            {legendOpen && <>
+            {/* While a search is active, the ignite legend REPLACES the encoding legend (screen spec
+                1c) rather than appending to it — the type/shape table stays true throughout, so
+                restating it while every unmatched entry is dimmed to ~32% would bury the two lines
+                that actually explain what's on screen right now. */}
+            {legendOpen && (searchActive ? (
+              <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 3, fontSize: 9.5, color: 'var(--text-dim)' }}>
+                <span>flare + count = matches inside community</span>
+                <span>field dims to 32% — off-page truth preserved</span>
+              </div>
+            ) : <>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginTop: 8 }}>
                 {LEGEND_TYPES.map((type) => {
                   const encoding = encodingForType(type);
@@ -520,7 +620,7 @@ export function MemoryConstellationV2({
                 <span>size = connectivity · brightness = authority</span>
                 <span>amber halo = lead · amber route = selection</span>
               </div>
-            </>}
+            </>)}
           </div>}
         </div>
         {selected && (selectedCommunity || selectedEntity) && (

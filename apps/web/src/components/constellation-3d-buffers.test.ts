@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
-  aggregateRouteWidth, buildConstellation3DRenderPlan, communityTooltipContent, constellation3DColorType,
-  constellation3DNodeEncoding, dominantCommunityType, isOffPageIncidentEdge, promotedEdgeLabelText,
+  aggregateRouteWidth, buildConstellation3DRenderPlan, communityIgniteSubtext, communityTooltipContent,
+  constellation3DColorType, constellation3DIsDimmed, constellation3DNodeEncoding, CONSTELLATION_IGNITE_DIM_OPACITY,
+  dominantCommunityType, isOffPageIncidentEdge, promotedEdgeLabelText,
   type Constellation3DEdge, type Constellation3DNode,
 } from './constellation-3d-buffers';
 
@@ -231,5 +232,78 @@ describe('draw-call ceiling accounts for promoted-edge passes (PLNR-439)', () =>
     // glyph) — no lead, no current/historical promoted, no direction markers (off-page never gets
     // one), and critically no aggregate-route-tube term since the edge never reaches baseEdges.
     expect(plan.drawCallCeiling).toBe(1 * 2 + 2 + 1 + 2);
+  });
+});
+
+describe('search ignite draw-call budget (PLNR-441)', () => {
+  // PLNR-439 measured a realistic pinned-selection scene at exactly 14 — the PLNR-371 ceiling —
+  // with zero headroom. Ignite layers on top of selection (screen spec 1c), so this is the
+  // combination most likely to blow the budget; per this task's brief, that combination must be
+  // measured explicitly rather than assumed safe. It is verified here to add ZERO draw calls: the
+  // unmatched-field dim reuses the existing faded/unfaded material bucket (constellation3DIsDimmed
+  // just swaps which predicate decides membership) and a matched community's flare rides the same
+  // highlighted-scale boost the core sphere pass already applies — no new mesh, no new pass.
+  const pinNode = (id: string, type: string, overrides: Partial<Constellation3DNode> = {}) =>
+    node(id, type, overrides);
+
+  it('stays at the same ceiling with search ignite active on a realistic pinned-selection + neighbour-community scene', () => {
+    // Mirrors PLNR-439's realistic fixture: two shape groups (memory + task, community also renders
+    // as sphere so it does not add a third), a lead pin, current+historical+off-page promoted edges,
+    // and an aggregate route-tube edge on a base (unselected-incident) pair — the exact combination
+    // the PLNR-439 commit reports hit 15 before its own fix and exactly 14 after.
+    const nodes: Constellation3DNode[] = [
+      pinNode('pin', 'memory', { isLead: true }),
+      pinNode('b', 'memory'),
+      pinNode('c', 'memory', { validity: 'stale' }),
+      pinNode('d', 'task'),
+      pinNode('neighbor', 'community', { community: true, memberCount: 40, typeCounts: { task: 2 } }),
+    ];
+    const edges: Constellation3DEdge[] = [
+      { id: 'incident:current', fromId: 'pin', toId: 'b', type: 'references', direction: 'forward', weight: 1, aggregate: false },
+      { id: 'incident:historical', fromId: 'pin', toId: 'c', type: 'supersedes', direction: 'forward', weight: 1, aggregate: false, historical: true },
+      { id: 'incident:offpage', fromId: 'pin', toId: 'neighbor', type: 'related_to', direction: 'forward', weight: 1, aggregate: true },
+      { id: 'aggregate:d:neighbor', fromId: 'd', toId: 'neighbor', type: 'related_to', direction: 'forward', weight: 2, aggregate: true },
+    ];
+    const withoutSearch = buildConstellation3DRenderPlan(nodes, edges, 'pin');
+    expect(withoutSearch.drawCallCeiling).toBeLessThanOrEqual(14);
+
+    // The pin itself and the neighbour community are BOTH search matches — the exact "mixed
+    // matched/unmatched community" case a naive well-opacity split would have to pay for with two
+    // extra draw calls. The measured number is identical to the unselected-for-search baseline.
+    const withSearch = buildConstellation3DRenderPlan(nodes, edges, 'pin', 24, new Set(['pin', 'neighbor']));
+    expect(withSearch.drawCallCeiling).toBe(withoutSearch.drawCallCeiling);
+    expect(withSearch.drawCallCeiling).toBeLessThanOrEqual(14);
+
+    // And the case where only the pin matches (the neighbour community stays unmatched/dimmed) —
+    // same result, confirming the ceiling does not depend on which nodes happen to be highlighted.
+    const withSearchPinOnly = buildConstellation3DRenderPlan(nodes, edges, 'pin', 24, new Set(['pin']));
+    expect(withSearchPinOnly.drawCallCeiling).toBe(withoutSearch.drawCallCeiling);
+  });
+});
+
+describe('search ignite (PLNR-441)', () => {
+  it('constellation3DIsDimmed: outside search, dims exactly the pre-existing validity-based faded set', () => {
+    const active = { opacity: 1, highlighted: false };
+    const stale = { opacity: 0.42, highlighted: false };
+    expect(constellation3DIsDimmed(active, false)).toBe(false);
+    expect(constellation3DIsDimmed(stale, false)).toBe(true);
+  });
+
+  it('constellation3DIsDimmed: during search, dims everything that is not a match — validity plays no part', () => {
+    const matchedButStale = { opacity: 0.42, highlighted: true };
+    const unmatchedButActive = { opacity: 1, highlighted: false };
+    expect(constellation3DIsDimmed(matchedButStale, true)).toBe(false);
+    expect(constellation3DIsDimmed(unmatchedButActive, true)).toBe(true);
+  });
+
+  it('CONSTELLATION_IGNITE_DIM_OPACITY sits within the screen spec\'s ~32% dim target', () => {
+    expect(CONSTELLATION_IGNITE_DIM_OPACITY).toBeCloseTo(0.32);
+  });
+
+  it('communityIgniteSubtext pluralizes "match"/"matches" and formats the count with locale separators', () => {
+    expect(communityIgniteSubtext(1)).toBe('+1 match');
+    expect(communityIgniteSubtext(7)).toBe('+7 matches');
+    expect(communityIgniteSubtext(0)).toBe('+0 matches');
+    expect(communityIgniteSubtext(1234)).toBe('+1,234 matches');
   });
 });

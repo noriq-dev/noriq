@@ -319,3 +319,107 @@ describe('MemoryConstellationV2 docked selection inspector (PLNR-440)', () => {
     expect(host.textContent).toContain('level 1');
   });
 });
+
+describe('MemoryConstellationV2 search ignite (PLNR-441)', () => {
+  const hit = (overrides: Partial<{ id: string; uri: string; title: string }> = {}) => ({
+    entityType: 'memory' as const, id: overrides.id ?? 'x', uri: overrides.uri ?? 'noriq://memory/x', kind: 'learning',
+    title: overrides.title ?? 'Root memory X', snippet: '', stage: 'lexical' as const, score: 1, isLead: false, leadReasons: [], finalScore: 1,
+  });
+  const searchResult = (results: ReturnType<typeof hit>[]) => ({
+    mode: 'keyword' as const, results, evidenceFrame: { text: '', itemsIncluded: 0, itemsOmitted: 0, truncated: false, charsUsed: 0, suspiciousCount: 0 },
+  });
+  const typeInto = (input: HTMLInputElement, value: string) => act(() => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, value);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+
+  it('states the total matches and community spread up front, marks the top hit, and names an off-page hit\'s routing community before it is picked', async () => {
+    vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision, communities: [rootCommunity], routes: [], coverage: { complete: true, reasons: [] } });
+    // At root level nothing is resident, so `noriq://memory/x`'s only community exists via this
+    // route lookup — the same endpoint focusHit already calls on pick, reused here purely to know
+    // where the match lives before it is picked.
+    vi.spyOn(api, 'memoryConstellationV2Route').mockResolvedValue({ revision, nodeId: 'x', uri: 'noriq://memory/x', communityPath: [rootCommunity] });
+    vi.spyOn(api, 'memorySearch').mockResolvedValue(searchResult([hit()]));
+    host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
+    act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
+    await tick(); await tick();
+
+    const search = host.querySelector('input[placeholder^="Search memory"]') as HTMLInputElement;
+    typeInto(search, 'root');
+    await tick(350); await tick(); await tick(); await tick();
+
+    // The count and the community spread are stated BEFORE any dimming could be mistaken for a
+    // filter having removed anything (Navigator conventions doc §4 "dimming is not filtering").
+    expect(host.textContent).toContain('1 match ignited across 1 community · non-matches dimmed, not removed');
+
+    const panel = host.querySelector('[aria-label="Search matches"]') as HTMLElement;
+    expect(panel).toBeTruthy();
+    expect(panel.textContent).toContain('1 · hybrid + exact URI');
+    expect(panel.textContent).toContain('↵ focuses top');
+
+    const row = [...panel.querySelectorAll('button')].find((button) => button.textContent?.includes('Root memory X'))!;
+    // The Enter target is visually distinguished by more than colour alone (a border, not just a tint).
+    expect(row.style.borderLeft).toContain('var(--accent)');
+    // Off-page: not yet loaded anywhere on canvas, so picking it will fly the camera and load pages —
+    // the routing community is named before that flight is committed to.
+    expect(row.textContent).toContain('off-page · picking it routes via Root community');
+  });
+
+  it('does not call an already-resident match off-page, and Enter routes the top hit exactly like a click', async () => {
+    vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision, communities: [rootCommunity], routes: [], coverage: { complete: true, reasons: [] } });
+    vi.spyOn(api, 'memoryConstellationV2Community').mockResolvedValue(page('a', null));
+    vi.spyOn(api, 'memoryConstellationV2Route').mockResolvedValue({ revision, nodeId: 'a', uri: 'noriq://memory/a', communityPath: [rootCommunity] });
+    vi.spyOn(api, 'memoryConstellationV2Incidents').mockResolvedValue({ revision, node: { nodeId: 'a', uri: 'noriq://memory/a', type: 'memory', label: 'Memory a', communityPath: [rootCommunity] }, edges: [], nextCursor: null, coverage: { complete: true, reasons: [] } });
+    vi.spyOn(api, 'memorySearch').mockResolvedValue(searchResult([hit({ id: 'a', uri: 'noriq://memory/a', title: 'Memory a' })]));
+    host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
+    act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
+    await tick(); await tick();
+
+    const openRoot = [...host.querySelectorAll('button')].find((button) => button.textContent === 'open')!;
+    act(() => openRoot.click());
+    await tick(); await tick();
+
+    const search = host.querySelector('input[placeholder^="Search memory"]') as HTMLInputElement;
+    typeInto(search, 'memory a');
+    await tick(350); await tick(); await tick();
+
+    const panel = host.querySelector('[aria-label="Search matches"]') as HTMLElement;
+    const row = [...panel.querySelectorAll('button')].find((button) => button.textContent?.includes('Memory a'))!;
+    // Resident (entity 'a' is on the currently loaded page) — the flight would be a no-op, so it
+    // must never be labelled off-page.
+    expect(row.textContent).not.toContain('off-page');
+
+    act(() => search.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })));
+    await tick(); await tick();
+    // Same exact-URI route focusHit's click path already uses — preserved exactly, just reachable
+    // from the keyboard too, matching the results header's own "↵ focuses top" hint.
+    expect(api.memoryConstellationV2Route).toHaveBeenCalledWith('p1', 'noriq://memory/a');
+  });
+
+  it('replaces the encoding legend with the ignite legend while a search is active, and restores it when the query clears', async () => {
+    mockRenderer3D.failOnMount = false; // reach Space view, where the legend lives (PLNR-438 precedent)
+    vi.spyOn(api, 'memoryConstellationV2Overview').mockResolvedValue({ revision, communities: [rootCommunity], routes: [], coverage: { complete: true, reasons: [] } });
+    vi.spyOn(api, 'memoryConstellationV2Route').mockResolvedValue({ revision, nodeId: 'x', uri: 'noriq://memory/x', communityPath: [rootCommunity] });
+    vi.spyOn(api, 'memorySearch').mockResolvedValue(searchResult([hit()]));
+    host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host);
+    act(() => root!.render(<MemoryConstellationV2 pid="p1" />));
+    await tick(); await tick();
+
+    expect(host.querySelector('[aria-label="Constellation encoding legend"]')).toBeTruthy();
+
+    const search = host.querySelector('input[placeholder^="Search memory"]') as HTMLInputElement;
+    typeInto(search, 'root');
+    await tick(350); await tick(); await tick();
+
+    const igniteLegend = host.querySelector('[aria-label="Constellation ignite legend"]') as HTMLElement;
+    expect(igniteLegend).toBeTruthy();
+    expect(host.querySelector('[aria-label="Constellation encoding legend"]')).toBeFalsy();
+    expect(igniteLegend.textContent).toContain('flare + count = matches inside community');
+    expect(igniteLegend.textContent).toContain('field dims to 32% — off-page truth preserved');
+
+    typeInto(search, '');
+    await tick(350); await tick();
+    expect(host.querySelector('[aria-label="Constellation encoding legend"]')).toBeTruthy();
+    expect(host.querySelector('[aria-label="Constellation ignite legend"]')).toBeFalsy();
+  });
+});
