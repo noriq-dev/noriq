@@ -15,6 +15,10 @@
   --blue: #4c9dff;          /* in progress / instruction */
   --purple: #b57bff;        /* review */
   --amber: #f5a623;         /* claimed / question / orch */
+  --amber-select: #ffd166;  /* constellation SELECTION only — pin reticle, promoted edges, off-page
+                                routes (Navigator conventions doc §2). Distinct from --amber above,
+                                which is a truthfulness/status warning: a human should never read
+                                "you picked this" as "this data is degraded". */
   --red: #ff5c5c;           /* blocked */
   --red-soft: #ff8a8a;
   --steel: #8fb3d9;          /* constellation: repository-scoped entities (file/symbol/repository) */
@@ -40,6 +44,9 @@
 :root[data-theme='light'] {
   color-scheme: light;
   --accent-ink: #4f7a06;
+  /* Matches the darker literal (0x8a5a00) the constellation renderer already uses for selection
+     amber in light mode — same colour, DOM token vs. THREE.Color literal. */
+  --amber-select: #8a5a00;
   --bg: #e8eaef;            /* a touch darker so white cards separate clearly */
   --bg-raised: #ffffff;
   --bg-rail: #dcdee4;

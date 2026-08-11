@@ -134,6 +134,31 @@ export function aggregateRouteWidth(weight: number, minWeight: number, maxWeight
   return 0.8 + t * 1.6;
 }
 
+/** True when a promoted (selected-incident) edge's "other" endpoint is a community standing in
+ * for a node that isn't resident on this page — constellation-v2-scene.ts's `assembleConstellationV2Scene`
+ * sets `aggregate: true` on an `incident:`-prefixed edge exactly when it substituted the endpoint id
+ * (`endpointId !== incident.endpoint.nodeId`). The id-prefix check is what excludes a GENUINE
+ * community-to-community `aggregate:`-prefixed route from being misread as off-page: selecting a
+ * community node can itself promote one of its own boundary routes to `promotedEdges`, and that
+ * route is not a truncated substitution — the community at the other end is already rendered, on
+ * this page, exactly where the route points. Only an `incident:` edge's `aggregate` flag means "the
+ * literal target is not resident; this is a stand-in" (PLNR-379 honesty rule). */
+export function isOffPageIncidentEdge(edge: Pick<Constellation3DEdge, 'aggregate' | 'id'>): boolean {
+  return edge.aggregate && edge.id.startsWith('incident:');
+}
+
+/** Typed mono label text for a promoted incident edge (screen spec 1b). An off-page edge never gets
+ * the relationship-typed text — it gets the truthful "route to a community" caption instead, so a
+ * dashed line pointing at a community node never gets mislabeled as if it pointed at the real,
+ * resident endpoint. `targetLabel` is the OTHER endpoint's own label (the community's name for an
+ * off-page edge), resolved by the caller from the same node map the scene already has in hand. */
+export function promotedEdgeLabelText(edge: Constellation3DEdge, targetLabel: string): string {
+  if (isOffPageIncidentEdge(edge)) return `${targetLabel} · off-page ▸`;
+  const arrow = edge.direction === 'reverse' ? '←' : edge.direction === 'both' ? '↔' : '→';
+  const suffix = edge.historical ? ' · historical' : '';
+  return `${arrow} ${edge.type}${suffix}`;
+}
+
 export function constellation3DNodeEncoding(node: Constellation3DNode): Constellation3DNodeInstance {
   const authority = node.authority === null || node.authority === undefined ? 0 : Math.max(0, Math.min(5, node.authority));
   const scaleMultiplier = node.community ? 1 : encodingForType(node.type).scaleMultiplier;
@@ -198,16 +223,39 @@ export function buildConstellation3DRenderPlan(
   }
 
   const labels = [...byId.values()].sort((a, b) => compareLabelPriority(a, b, selectedNodeId)).slice(0, Math.max(0, labelBudget));
+  // PLNR-439: promoted edges (selection) split into up to three separate passes so historical and
+  // off-page relationships can carry their own dash pattern/opacity instead of sharing the solid
+  // amber line every other promoted edge gets — each pass is only allotted when the plan actually
+  // has an edge of that kind, same convention the lead/community/aggregate-route terms below use.
+  // Mutually exclusive over promotedEdges, matching the renderer's own partition in
+  // MemoryConstellation3D.tsx: an edge that is both historical AND off-page renders (once) as
+  // off-page — "where this points" outranks "when this was true" for which dashed pass it joins.
+  const hasOffPagePromoted = promotedEdges.some((edge) => isOffPageIncidentEdge(edge));
+  const hasHistoricalPromoted = promotedEdges.some((edge) => edge.historical && !isOffPageIncidentEdge(edge));
+  const hasCurrentPromoted = promotedEdges.some((edge) => !edge.historical && !isOffPageIncidentEdge(edge));
+  const hasDirectionMarkers = promotedEdges.some((edge) => edge.directionMarker && !isOffPageIncidentEdge(edge));
   // Five shape meshes (faded/unfaded) + lead halo mesh + community gravity-well falloff (outer +
   // mid, only when a community node is present — never for the pure-entity 12k fixture) +
-  // aggregate-route instanced tubes (only when an aggregate edge is present) + base/promoted line
-  // passes + promoted direction markers. The hover pre-selection ring is deliberately NOT counted
-  // here: it is one reusable Object3D that never scales with node/edge count (see
-  // MemoryConstellation3D.tsx), the same reason the camera-control DOM buttons aren't counted.
+  // aggregate-route instanced tubes (only when an aggregate edge is present) + the always-allotted
+  // backbone base-edge pass + the promoted-edge passes above. The selection reticle and the hover
+  // pre-selection ring are deliberately NOT counted here: both are reusable Object3Ds repositioned
+  // in place, never rebuilt or multiplied per node/edge (see MemoryConstellation3D.tsx), the same
+  // reason the camera-control DOM buttons aren't counted.
+  // The aggregate-route TUBE mesh only ever gets built from `baseEdges` (see `renderEdges`'s
+  // `aggregateBaseEdges`) — an aggregate edge incident to the current selection lands in
+  // `promotedEdges` instead (rendered as the off-page pass above) and never reaches that base-pass
+  // tube at all. `aggregateWeights.length` (used above for width normalization, deliberately
+  // selection-independent) is the wrong signal for THIS term: it would allot a tube draw call for
+  // an aggregate edge that got promoted away from the base pass and so never actually fires one.
+  const hasAggregateRouteTube = baseEdges.some((edge) => edge.aggregate);
   const drawCallCeiling = nodeGroups.size * 2
     + (nodes.some((node) => node.isLead) ? 1 : 0)
     + (nodes.some((node) => node.community) ? 2 : 0)
-    + (aggregateWeights.length > 0 ? 1 : 0)
-    + 3;
+    + (hasAggregateRouteTube ? 1 : 0)
+    + 1 // base backbone line pass
+    + (hasCurrentPromoted ? 1 : 0)
+    + (hasHistoricalPromoted ? 1 : 0)
+    + (hasOffPagePromoted ? 2 : 0) // dashed route line + instanced terminus-glyph mesh
+    + (hasDirectionMarkers ? 1 : 0);
   return { nodeGroups, baseEdges, promotedEdges, labels, nodeCount: byId.size, drawCallCeiling };
 }

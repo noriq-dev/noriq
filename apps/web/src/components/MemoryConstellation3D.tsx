@@ -2,8 +2,9 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type * as Three from 'three';
 import {
   aggregateRouteWidth, buildConstellation3DRenderPlan, communityTooltipContent, constellation3DColorType,
-  constellation3DNodeEncoding, type Constellation3DEdge, type Constellation3DEdgeSegment, type ConstellationCommunityTooltip,
-  type Constellation3DNode, type Constellation3DNodeInstance, type Constellation3DShape,
+  constellation3DNodeEncoding, isOffPageIncidentEdge, promotedEdgeLabelText, type Constellation3DEdge,
+  type Constellation3DEdgeSegment, type ConstellationCommunityTooltip, type Constellation3DNode,
+  type Constellation3DNodeInstance, type Constellation3DShape,
 } from './constellation-3d-buffers';
 import { encodingForType, resolveConstellationToken } from './constellation-encoding';
 import {
@@ -24,6 +25,21 @@ const LABEL_BUDGET = 24;
 // rather than needing a second connectivity computation.
 const COMMUNITY_WELL_MID_RATIO = 1.6;
 const COMMUNITY_WELL_OUTER_RATIO = 2.4;
+// Selection reticle (PLNR-439, screen spec 1b "the pin") — every radius is a ratio of the
+// selected node's own connectivity-derived scale, the same pattern PLNR-438 established for the
+// community wells and hover ring, so the reticle grows/shrinks with whatever it is pinned to
+// instead of carrying an independent, undesigned size. Reticle tick geometry and ring radii are
+// this task's discretion (executionSpec).
+const RETICLE_RING_RATIO = 1.55;
+const RETICLE_DASH_RING_RATIO = 1.05;
+const RETICLE_GLOW_RATIO = 0.62;
+const RETICLE_TICK_INNER_RATIO = 1.5;
+const RETICLE_TICK_OUTER_RATIO = 1.9;
+// The pin's title is promoted above the standard label treatment and drawn 40px above the node
+// (screen spec 1b) rather than centred on it — the deliberate offset is what keeps it clear of a
+// promoted edge label pinned at 72% along the edge (see `midpoint` below): a true midpoint would
+// land squarely on this same title.
+const PINNED_TITLE_OFFSET_PX = 40;
 
 export interface MemoryConstellation3DProps {
   projectId: string;
@@ -50,6 +66,10 @@ interface LabelPosition {
   x: number;
   y: number;
   promoted: boolean;
+  /** The pinned node's own title (PLNR-439) — distinct from `promoted` (which styles a promoted
+   *  EDGE label amber): the title stays `--text` coloured but grows to the promoted type scale and
+   *  renders offset above the node instead of centred on it. */
+  pinned?: boolean;
 }
 
 interface HoverTooltip {
@@ -74,6 +94,7 @@ interface RendererState {
   renderEdges: (selectedNodeId: string | null) => void;
   applyCamera: (camera: Constellation3DCamera) => void;
   setHover: (node: Constellation3DNodeInstance | null) => void;
+  setSelection: (node: Constellation3DNodeInstance | null) => void;
   render: () => void;
   dispose: () => void;
 }
@@ -113,6 +134,67 @@ function midpoint(edge: Constellation3DEdgeSegment): [number, number, number] {
   const from = forward ? edge.from : edge.to;
   const to = forward ? edge.to : edge.from;
   return [from[0] + (to[0] - from[0]) * 0.72, from[1] + (to[1] - from[1]) * 0.72, from[2] + (to[2] - from[2]) * 0.72];
+}
+
+/** Dashed variant of `lineObject` (PLNR-439: historical and off-page promoted edges, screen spec
+ * 1b). Deliberately does NOT use `Line.computeLineDistances()` — that method accumulates distance
+ * across the WHOLE buffer, so every segment after the first would inherit the prior segments'
+ * cumulative length and its dash phase would drift instead of starting fresh. Each independent
+ * relationship gets its own dash pattern reset to 0 at its own start. */
+function dashedLineObject(
+  THREE: typeof Three,
+  segments: Constellation3DEdgeSegment[],
+  color: number,
+  opacity: number,
+  dashSize: number,
+  gapSize: number,
+  renderOrder: number,
+): Three.LineSegments | null {
+  if (segments.length === 0) return null;
+  const positions = new Float32Array(segments.length * 6);
+  const lineDistances = new Float32Array(segments.length * 2);
+  segments.forEach((edge, index) => {
+    positions.set([...edge.from, ...edge.to], index * 6);
+    const dx = edge.to[0] - edge.from[0], dy = edge.to[1] - edge.from[1], dz = edge.to[2] - edge.from[2];
+    lineDistances[index * 2] = 0;
+    lineDistances[index * 2 + 1] = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  });
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('lineDistance', new THREE.BufferAttribute(lineDistances, 1));
+  geometry.computeBoundingSphere();
+  const material = new THREE.LineDashedMaterial({ color, transparent: true, opacity, dashSize, gapSize, depthWrite: false });
+  const lines = new THREE.LineSegments(geometry, material);
+  lines.renderOrder = renderOrder;
+  lines.frustumCulled = true;
+  return lines;
+}
+
+/** Unit-radius ring geometry for the selection reticle's concentric rings, scaled by `radius`
+ * directly (not via object.scale) so a single reticle Object3D group can be repositioned/rescaled
+ * uniformly by the pinned node's own scale in `setSelection` while each ring keeps its own ratio. */
+function reticleCircleGeometry(THREE: typeof Three, radius: number, segments = 48): Three.BufferGeometry {
+  const positions = new Float32Array(segments * 3);
+  for (let index = 0; index < segments; index += 1) {
+    const angle = (index / segments) * Math.PI * 2;
+    positions.set([Math.cos(angle) * radius, Math.sin(angle) * radius, 0], index * 3);
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  return geometry;
+}
+
+/** Four cardinal tick marks, r `innerRadius` → `outerRadius`, same unit-radius convention as
+ * `reticleCircleGeometry`. */
+function reticleTickGeometry(THREE: typeof Three, innerRadius: number, outerRadius: number): Three.BufferGeometry {
+  const axes: Array<[number, number]> = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+  const positions = new Float32Array(axes.length * 2 * 3);
+  axes.forEach(([dx, dy], index) => {
+    positions.set([dx * innerRadius, dy * innerRadius, 0, dx * outerRadius, dy * outerRadius, 0], index * 6);
+  });
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  return geometry;
 }
 
 /** Lazy Three/WebGL renderer. The scene contains bounded instanced meshes and buffer geometries;
@@ -317,6 +399,38 @@ export function MemoryConstellation3D({
         scene.add(hoverRing);
         decorativeMeshes.push(hoverRing);
 
+        // Selection reticle (PLNR-439, screen spec 1b "the pin"): concentric solid ring, a dashed
+        // inner ring, four cardinal tick marks, and an inner glow ring — four small, reusable
+        // objects built once here and only repositioned/rescaled by `setSelection` below, the exact
+        // same "never rebuild, never touch node buffers" convention `hoverRing` already established.
+        // Deliberately a richer composition than the single-ring hover treatment so the two read as
+        // different states even before colour: a hover is provisional, a pin is a lock.
+        const reticleAmber = theme === 'dark' ? 0xffd166 : 0x8a5a00;
+        const reticleRing = new THREE.LineLoop(
+          reticleCircleGeometry(THREE, RETICLE_RING_RATIO),
+          new THREE.LineBasicMaterial({ color: reticleAmber, transparent: true, opacity: 0.35, depthTest: false }),
+        );
+        const reticleDashedRing = new THREE.LineLoop(
+          reticleCircleGeometry(THREE, RETICLE_DASH_RING_RATIO),
+          new THREE.LineDashedMaterial({ color: reticleAmber, transparent: true, opacity: 1, dashSize: 0.18, gapSize: 0.12, depthTest: false }),
+        );
+        reticleDashedRing.computeLineDistances();
+        const reticleGlow = new THREE.LineLoop(
+          reticleCircleGeometry(THREE, RETICLE_GLOW_RATIO, 32),
+          new THREE.LineBasicMaterial({ color: reticleAmber, transparent: true, opacity: 0.2, depthTest: false }),
+        );
+        const reticleTicks = new THREE.LineSegments(
+          reticleTickGeometry(THREE, RETICLE_TICK_INNER_RATIO, RETICLE_TICK_OUTER_RATIO),
+          new THREE.LineBasicMaterial({ color: reticleAmber, transparent: true, opacity: 0.9, depthTest: false }),
+        );
+        const reticleParts: Three.Object3D[] = [reticleRing, reticleDashedRing, reticleGlow, reticleTicks];
+        for (const part of reticleParts) {
+          part.visible = false;
+          part.renderOrder = 15;
+          scene.add(part);
+          decorativeMeshes.push(part);
+        }
+
         const edgeObjects: Three.Object3D[] = [];
         const clearEdges = () => {
           for (const object of edgeObjects.splice(0)) {
@@ -328,7 +442,7 @@ export function MemoryConstellation3D({
           }
         };
 
-        const projectLabels = (labelNodes: Constellation3DNodeInstance[], promoted: Constellation3DEdgeSegment[]) => {
+        const projectLabels = (labelNodes: Constellation3DNodeInstance[], promoted: Constellation3DEdgeSegment[], selection: string | null) => {
           const width = host.clientWidth || 1, height = host.clientHeight || 1;
           const visible: LabelPosition[] = [];
           for (const node of labelNodes) {
@@ -337,18 +451,33 @@ export function MemoryConstellation3D({
             // Two-line label for a community: name + entity count (PLNR-438) — one budget entry,
             // same as before, just carrying a second rendered line.
             const subtext = node.community ? `${(node.memberCount ?? 0).toLocaleString()} entities` : undefined;
-            visible.push({ key: `node:${node.id}`, text: node.label, subtext, x: (point.x + 1) * width / 2, y: (1 - point.y) * height / 2, promoted: false });
+            const pinned = node.id === selection;
+            const y = (1 - point.y) * height / 2;
+            // The pin's title renders 40px above the node instead of centred on it (screen spec
+            // 1b) — that offset, together with promoted edge labels sitting at 72% along the edge
+            // rather than the midpoint, is the whole collision-avoidance mechanism: nothing here
+            // computes an overlap check, the two placements are just designed apart.
+            visible.push({
+              key: `node:${node.id}`, text: node.label, subtext, x: (point.x + 1) * width / 2,
+              y: pinned ? y - PINNED_TITLE_OFFSET_PX : y, promoted: false, pinned,
+            });
           }
           for (const edge of promoted.slice(0, Math.max(0, LABEL_BUDGET - visible.length))) {
             const point = new THREE.Vector3(...midpoint(edge)).project(camera);
             if (point.z < -1 || point.z > 1) continue;
-            visible.push({ key: `edge:${edge.id}`, text: `${edge.direction === 'reverse' ? '←' : edge.direction === 'both' ? '↔' : '→'} ${edge.type}`, x: (point.x + 1) * width / 2, y: (1 - point.y) * height / 2, promoted: true });
+            const otherId = edge.fromId === selection ? edge.toId : edge.fromId;
+            const targetLabel = nodeById.get(otherId)?.label ?? '';
+            visible.push({
+              key: `edge:${edge.id}`, text: promotedEdgeLabelText(edge, targetLabel),
+              x: (point.x + 1) * width / 2, y: (1 - point.y) * height / 2, promoted: true,
+            });
           }
           setLabels(visible.slice(0, LABEL_BUDGET));
         };
 
         let currentLabels = plan.labels;
         let currentPromoted: Constellation3DEdgeSegment[] = [];
+        let currentSelection: string | null = null;
         let consecutiveOverBudgetFrames = 0;
         let performanceFailureReported = false;
         const render = () => {
@@ -369,6 +498,17 @@ export function MemoryConstellation3D({
           hoverRing.position.set(...node.position);
           hoverRing.scale.setScalar(ringScale);
           hoverRing.visible = true;
+          render();
+        };
+        // Reticle update: only repositions/rescales the four fixed parts built above — never
+        // rebuilds geometry, never touches the (potentially 12k-instance) node buffers. This is
+        // the "selection updates touch only the bounded relevant buffers" budget (PLNR-371/377)
+        // applied to the pin itself.
+        const setSelection = (node: Constellation3DNodeInstance | null) => {
+          for (const part of reticleParts) {
+            if (node) { part.position.set(...node.position); part.scale.setScalar(node.scale); }
+            part.visible = node !== null;
+          }
           render();
         };
         const renderEdges = (selection: string | null) => {
@@ -409,11 +549,36 @@ export function MemoryConstellation3D({
             scene.add(routes);
             edgeObjects.push(routes);
           }
-          const promoted = lineObject(THREE, selectedPlan.promotedEdges, theme === 'dark' ? 0xffd166 : 0x8a5a00, 1, 10);
-          if (promoted) { scene.add(promoted); edgeObjects.push(promoted); }
-          const directed = selectedPlan.promotedEdges.filter((edge) => edge.directionMarker);
+          const promotedAmber = theme === 'dark' ? 0xffd166 : 0x8a5a00;
+          // Promoted incident edges split into three passes so historical and off-page
+          // relationships carry their OWN dash pattern/opacity instead of sharing the one solid
+          // line every other promoted edge gets (PLNR-379: historical stays visible but reads as
+          // superseded; off-page is named, never faked). All three still render above the dimmed
+          // backbone (renderOrder 10, vs. the backbone's 0).
+          // Mutually exclusive and exhaustive over promotedEdges: an edge that happens to be BOTH
+          // historical AND off-page (e.g. a superseded relationship whose endpoint isn't resident)
+          // gets the off-page treatment, never both dashed passes layered on the same segment —
+          // "where does this actually point" outranks "when was this true" for what the line itself
+          // has to say; the typed label still appends "· historical" regardless (see
+          // promotedEdgeLabelText, though the off-page caption currently wins the label text too).
+          const offPagePromotedEdges = selectedPlan.promotedEdges.filter((edge) => isOffPageIncidentEdge(edge));
+          const historicalPromotedEdges = selectedPlan.promotedEdges.filter((edge) => edge.historical && !isOffPageIncidentEdge(edge));
+          const currentPromotedEdges = selectedPlan.promotedEdges.filter((edge) => !edge.historical && !isOffPageIncidentEdge(edge));
+          const current = lineObject(THREE, currentPromotedEdges, promotedAmber, 1, 10);
+          if (current) { scene.add(current); edgeObjects.push(current); }
+          const historical = dashedLineObject(THREE, historicalPromotedEdges, promotedAmber, 0.75, 2.2, 1.6, 10);
+          if (historical) { scene.add(historical); edgeObjects.push(historical); }
+          // Off-page routes get a visibly weaker, differently-dashed line (short dash, long gap,
+          // 60% opacity — distinct from historical's even dash/gap) so the truncation itself reads
+          // on canvas before the DOM caption below even loads.
+          const offPage = dashedLineObject(THREE, offPagePromotedEdges, promotedAmber, 0.6, 1.1, 2.8, 10);
+          if (offPage) { scene.add(offPage); edgeObjects.push(offPage); }
+          // Off-page edges never get a direction cone — a cone implies "this points at the real
+          // target"; an off-page route points at a community stand-in instead, and gets its own
+          // terminus glyph below rather than borrowing the incident-edge affordance.
+          const directed = [...currentPromotedEdges, ...historicalPromotedEdges].filter((edge) => edge.directionMarker);
           if (directed.length > 0) {
-            const markers = new THREE.InstancedMesh(new THREE.ConeGeometry(1.6, 4.8, 5), new THREE.MeshBasicMaterial({ color: theme === 'dark' ? 0xffd166 : 0x8a5a00, depthTest: false }), directed.length);
+            const markers = new THREE.InstancedMesh(new THREE.ConeGeometry(1.6, 4.8, 5), new THREE.MeshBasicMaterial({ color: promotedAmber, transparent: true, depthTest: false }), directed.length);
             markers.renderOrder = 11;
             directed.forEach((edge, index) => {
               const at = midpoint(edge);
@@ -428,15 +593,36 @@ export function MemoryConstellation3D({
             scene.add(markers);
             edgeObjects.push(markers);
           }
+          if (offPagePromotedEdges.length > 0) {
+            // Truthful terminus (PLNR-379: no synthesized node) — a small dashed-reading ring at
+            // the community stand-in's own real position, one instanced draw call regardless of
+            // how many off-page edges the selection has.
+            const glyphs = new THREE.InstancedMesh(
+              new THREE.TorusGeometry(0.85, 0.09, 5, 16),
+              new THREE.MeshBasicMaterial({ color: promotedAmber, transparent: true, opacity: 0.6, depthTest: false }),
+              offPagePromotedEdges.length,
+            );
+            glyphs.renderOrder = 11;
+            offPagePromotedEdges.forEach((edge, index) => {
+              const far = edge.fromId === selection ? edge.to : edge.from;
+              matrix.makeTranslation(...far);
+              glyphs.setMatrixAt(index, matrix);
+            });
+            glyphs.instanceMatrix.needsUpdate = true;
+            glyphs.computeBoundingSphere();
+            scene.add(glyphs);
+            edgeObjects.push(glyphs);
+          }
           currentLabels = selectedPlan.labels;
           currentPromoted = selectedPlan.promotedEdges;
-          projectLabels(currentLabels, currentPromoted);
-          render();
+          currentSelection = selection;
+          projectLabels(currentLabels, currentPromoted, currentSelection);
+          setSelection(selection ? nodeById.get(selection) ?? null : null);
         };
         const applyCamera = (next: Constellation3DCamera) => {
           camera.position.set(...constellationCameraPosition(next));
           camera.lookAt(...next.target);
-          projectLabels(currentLabels, currentPromoted);
+          projectLabels(currentLabels, currentPromoted, currentSelection);
           render();
         };
 
@@ -456,7 +642,7 @@ export function MemoryConstellation3D({
         }
 
         rendererRef.current = {
-          THREE, renderer, scene, camera, nodeMeshes, decorativeMeshes, edgeObjects, nodeById, renderEdges, applyCamera, setHover, render,
+          THREE, renderer, scene, camera, nodeMeshes, decorativeMeshes, edgeObjects, nodeById, renderEdges, applyCamera, setHover, setSelection, render,
           dispose: () => {
             clearEdges();
             for (const mesh of [...nodeMeshes, ...decorativeMeshes]) {
@@ -625,7 +811,21 @@ export function MemoryConstellation3D({
       </div>
       {labels.map((label) => (
         <div key={label.key} style={{ position: 'absolute', left: label.x, top: label.y, transform: 'translate(-50%, -50%)', pointerEvents: 'none', textAlign: 'center', textShadow: '0 1px 4px var(--bg)' }}>
-          <div style={{ fontFamily: 'var(--mono)', fontSize: label.promoted ? 11 : 10.5, fontWeight: label.promoted ? 700 : 500, color: label.promoted ? 'var(--amber)' : 'var(--text-soft)' }}>{label.text}</div>
+          <div
+            style={{
+              fontFamily: 'var(--mono)',
+              fontSize: label.promoted ? 11 : label.pinned ? 11.5 : 10.5,
+              fontWeight: label.promoted || label.pinned ? 700 : 500,
+              // `--amber-select` (#ffd166) is the SELECTION amber, deliberately distinct from
+              // `--amber` (#f5a623, status/degraded-data amber) — see theme.css and the Navigator
+              // conventions doc §2. A promoted edge label is a selection response, never a status.
+              // The pin's own title stays `--text` (screen spec 1b) — the reticle already carries
+              // the amber "this is picked" signal, so the title itself does not need to repeat it.
+              color: label.promoted ? 'var(--amber-select)' : label.pinned ? 'var(--text)' : 'var(--text-soft)',
+            }}
+          >
+            {label.text}
+          </div>
           {label.subtext && <div style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-dim)' }}>{label.subtext}</div>}
         </div>
       ))}

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   aggregateRouteWidth, buildConstellation3DRenderPlan, communityTooltipContent, constellation3DColorType,
-  constellation3DNodeEncoding, dominantCommunityType,
+  constellation3DNodeEncoding, dominantCommunityType, isOffPageIncidentEdge, promotedEdgeLabelText,
   type Constellation3DEdge, type Constellation3DNode,
 } from './constellation-3d-buffers';
 
@@ -130,5 +130,106 @@ describe('aggregate route width mapping (PLNR-438)', () => {
   it('returns the range midpoint when there is no weight variation to map, never NaN or Infinity', () => {
     expect(aggregateRouteWidth(5, 5, 5)).toBe(1.6);
     expect(aggregateRouteWidth(Number.NaN, 0, 10)).toBe(1.6);
+  });
+});
+
+describe('off-page incident detection (PLNR-439)', () => {
+  it('is true only for an incident: edge whose endpoint was substituted by a community', () => {
+    expect(isOffPageIncidentEdge({ id: 'incident:x', aggregate: true })).toBe(true);
+    expect(isOffPageIncidentEdge({ id: 'incident:x', aggregate: false })).toBe(false);
+  });
+
+  it('is false for a genuine community-to-community aggregate route, even though it also carries aggregate: true', () => {
+    // Selecting a community node can promote one of its own boundary routes into promotedEdges —
+    // that route's target is already resident on this page, not a truncated stand-in, so it must
+    // never be mistaken for an off-page substitution just because both set `aggregate`.
+    expect(isOffPageIncidentEdge({ id: 'aggregate:leaf:other', aggregate: true })).toBe(false);
+  });
+});
+
+describe('promoted edge label text (PLNR-439)', () => {
+  const base: Constellation3DEdge = { id: 'incident:e', fromId: 'a', toId: 'b', type: 'references', direction: 'forward', weight: 1, aggregate: false };
+
+  it('renders a typed mono label with the direction arrow for a resident relationship', () => {
+    expect(promotedEdgeLabelText(base, 'ignored')).toBe('→ references');
+    expect(promotedEdgeLabelText({ ...base, direction: 'reverse' }, 'ignored')).toBe('← references');
+    expect(promotedEdgeLabelText({ ...base, direction: 'both' }, 'ignored')).toBe('↔ references');
+  });
+
+  it('appends a "· historical" suffix without dropping the direction arrow or type', () => {
+    expect(promotedEdgeLabelText({ ...base, historical: true }, 'ignored')).toBe('→ references · historical');
+  });
+
+  it('replaces the typed relationship text with a truthful off-page caption naming the containing community, never the raw type', () => {
+    const offPage: Constellation3DEdge = { ...base, id: 'incident:e', aggregate: true };
+    expect(promotedEdgeLabelText(offPage, 'Coordination core')).toBe('Coordination core · off-page ▸');
+  });
+
+  it('never gives a genuine aggregate community-to-community route the off-page caption', () => {
+    const route: Constellation3DEdge = { ...base, id: 'aggregate:leaf:other', aggregate: true };
+    expect(promotedEdgeLabelText(route, 'other')).toBe('→ references');
+  });
+
+  it('resolves to the off-page caption for an edge that is BOTH historical and off-page, never a hybrid or double-labelled text', () => {
+    const both: Constellation3DEdge = { ...base, id: 'incident:e', aggregate: true, historical: true };
+    expect(promotedEdgeLabelText(both, 'Coordination core')).toBe('Coordination core · off-page ▸');
+  });
+});
+
+describe('draw-call ceiling accounts for promoted-edge passes (PLNR-439)', () => {
+  const nodes: Constellation3DNode[] = [node('a'), node('b', 'memory'), node('c', 'file'), node('d', 'task')];
+
+  it('adds nothing for promoted edges when nothing is selected', () => {
+    const edges: Constellation3DEdge[] = [{ id: 'incident:x', fromId: 'a', toId: 'b', type: 'references', direction: 'forward', weight: 1, aggregate: false }];
+    const withSelection = buildConstellation3DRenderPlan(nodes, edges, 'a');
+    const withoutSelection = buildConstellation3DRenderPlan(nodes, edges, null);
+    expect(withoutSelection.drawCallCeiling).toBeLessThan(withSelection.drawCallCeiling);
+  });
+
+  it('allots separate passes for current, historical, and off-page promoted edges plus direction markers', () => {
+    const edges: Constellation3DEdge[] = [
+      { id: 'incident:current', fromId: 'a', toId: 'b', type: 'references', direction: 'forward', weight: 1, aggregate: false },
+      { id: 'incident:historical', fromId: 'a', toId: 'c', type: 'supersedes', direction: 'forward', weight: 1, aggregate: false, historical: true },
+      { id: 'incident:offpage', fromId: 'a', toId: 'd', type: 'related_to', direction: 'forward', weight: 1, aggregate: true },
+    ];
+    // Same edges, unselected vs. selected. Unlike the other terms, the aggregate-route-tube term
+    // does NOT cancel out of this diff: unselected, the off-page edge sits in baseEdges and trips
+    // it (+1); selected, that same edge is incident to 'a' and moves into promotedEdges instead,
+    // so the tube mesh never gets built and the term drops to 0 (-1) — see `hasAggregateRouteTube`.
+    const unselected = buildConstellation3DRenderPlan(nodes, edges, null);
+    const selected = buildConstellation3DRenderPlan(nodes, edges, 'a');
+    // current(+1) + historical(+1) + off-page(+2: dashed line + terminus glyph) + direction
+    // markers(+1, current+historical only — off-page never gets a cone) - aggregate-route-tube
+    // lost to the promotion above (-1) = +4.
+    expect(selected.drawCallCeiling).toBe(unselected.drawCallCeiling + 4);
+  });
+
+  it('stays within the PLNR-371 ceiling of 14 for a realistic single-selection incident fixture', () => {
+    const edges: Constellation3DEdge[] = [
+      { id: 'incident:current', fromId: 'a', toId: 'b', type: 'references', direction: 'forward', weight: 1, aggregate: false },
+      { id: 'incident:historical', fromId: 'a', toId: 'c', type: 'supersedes', direction: 'forward', weight: 1, aggregate: false, historical: true },
+      { id: 'incident:offpage', fromId: 'a', toId: 'd', type: 'related_to', direction: 'forward', weight: 1, aggregate: true },
+    ];
+    const plan = buildConstellation3DRenderPlan(nodes, edges, 'a');
+    expect(plan.drawCallCeiling).toBeLessThanOrEqual(14);
+  });
+
+  it('does not allot an aggregate-route-tube draw call for an aggregate edge that got promoted (off-page) rather than landing in baseEdges', () => {
+    // A community-typed off-page target with a neighbour community also in frame — the aggregate
+    // edge that substitutes it is INCIDENT to the selection, so it lands in promotedEdges (and
+    // renders via the off-page pass), never in baseEdges. The base-pass aggregate-route TUBE mesh
+    // (renderEdges's `aggregateBaseEdges`) is therefore never built for this plan, and the ceiling
+    // must not allot a draw call for a mesh that never fires.
+    const community = node('offpage-community', 'community', { community: true, memberCount: 40 });
+    const pinNodes: Constellation3DNode[] = [node('pin', 'memory'), community];
+    const edges: Constellation3DEdge[] = [
+      { id: 'incident:offpage', fromId: 'pin', toId: 'offpage-community', type: 'related_to', direction: 'forward', weight: 1, aggregate: true },
+    ];
+    const plan = buildConstellation3DRenderPlan(pinNodes, edges, 'pin');
+    // Both nodes share one shape group (memory and community both render as spheres): 1 group ×2
+    // + community wells (+2) + base backbone (+1) + off-page pass (+2, dashed line + terminus
+    // glyph) — no lead, no current/historical promoted, no direction markers (off-page never gets
+    // one), and critically no aggregate-route-tube term since the edge never reaches baseEdges.
+    expect(plan.drawCallCeiling).toBe(1 * 2 + 2 + 1 + 2);
   });
 });
