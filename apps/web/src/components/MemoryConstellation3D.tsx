@@ -47,6 +47,34 @@ const COMMUNITY_WELL_MID_RATIO = 1.75;
 const COMMUNITY_WELL_OUTER_RATIO = 3;
 const FIT_ENTITY_FOOTPRINT_RATIO = 1.9;
 const CONSTELLATION_STAR_COUNT = 360;
+export const CONSTELLATION_DOUBLE_CLICK_MS = 350;
+export const CONSTELLATION_DRAG_THRESHOLD_PX = 3;
+
+export interface Constellation3DClickState { nodeId: string; at: number }
+
+/** Drag classification is hysteretic: once the pointer crosses the threshold, returning near the
+ * origin cannot turn that camera gesture back into a click on pointer-up. */
+export function constellation3DHasDragged(alreadyDragged: boolean, distance: number): boolean {
+  return alreadyDragged || distance > CONSTELLATION_DRAG_THRESHOLD_PX;
+}
+
+export function constellation3DKeyboardZoomIntent(key: string, selectedNodeId: string | null): boolean {
+  return key === 'Enter' && selectedNodeId !== null;
+}
+
+/** Resolves click sequencing independently of raycasting: a drag or background hit breaks the
+ * sequence, and only a second click on the same node inside Montana's window requests zoom. */
+export function constellation3DClickIntent(
+  previous: Constellation3DClickState | null,
+  nodeId: string | null,
+  at: number,
+  dragDistance: number,
+): { next: Constellation3DClickState | null; zoom: boolean } {
+  if (dragDistance > CONSTELLATION_DRAG_THRESHOLD_PX || nodeId === null) return { next: null, zoom: false };
+  const elapsed = previous ? at - previous.at : Infinity;
+  const zoom = previous?.nodeId === nodeId && elapsed >= 0 && elapsed <= CONSTELLATION_DOUBLE_CLICK_MS;
+  return { next: zoom ? null : { nodeId, at }, zoom };
+}
 // Selection reticle (PLNR-439, screen spec 1b "the pin") — every radius is a ratio of the
 // selected node's own connectivity-derived scale, the same pattern PLNR-438 established for the
 // community wells and hover ring, so the reticle grows/shrinks with whatever it is pinned to
@@ -313,7 +341,10 @@ export function MemoryConstellation3D({
   });
   const transitionRef = useRef<CameraTransition | null>(null);
   const transitionFrameRef = useRef(0);
-  const dragRef = useRef<{ mode: 'orbit' | 'pan'; x: number; y: number; camera: Constellation3DCamera } | null>(null);
+  const dragRef = useRef<{
+    mode: 'orbit' | 'pan'; x: number; y: number; camera: Constellation3DCamera; dragged: boolean;
+  } | null>(null);
+  const lastClickRef = useRef<Constellation3DClickState | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -935,17 +966,15 @@ export function MemoryConstellation3D({
     step(performance.now());
   };
 
-  useEffect(() => {
-    if (!selectedNodeId) return;
-    const selected = layoutNodes.find((node) => node.id === selectedNodeId);
-    if (selected) transitionTo(focusConstellationCamera(cameraState, selected.position, selected.radius ?? (selected.community ? 70 : 18)));
-    // Selection is the trigger; camera changes during the flight must not restart it.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedNodeId, layoutNodes]);
+  // PLNR-464 can replace this one community branch with fly-to-cluster while leaving gesture,
+  // entity focus, keyboard Enter, and the camera-control button wired through the same seam.
+  const zoomToNode = (node: Constellation3DNode) => {
+    transitionTo(focusConstellationCamera(cameraState, node.position, node.radius ?? (node.community ? 70 : 18)));
+  };
 
-  const selectAt = (event: React.PointerEvent<HTMLCanvasElement>) => {
+  const nodeAt = (event: React.PointerEvent<HTMLCanvasElement>): string | null | undefined => {
     const state = rendererRef.current;
-    if (!state) return;
+    if (!state) return undefined;
     const rect = event.currentTarget.getBoundingClientRect();
     const pointer = new state.THREE.Vector2((event.clientX - rect.left) / rect.width * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
     const raycaster = new state.THREE.Raycaster();
@@ -953,9 +982,9 @@ export function MemoryConstellation3D({
     for (const hit of raycaster.intersectObjects(state.nodeMeshes, false)) {
       if (hit.instanceId === undefined) continue;
       const nodeId = (hit.object.userData.nodeIds as string[] | undefined)?.[hit.instanceId];
-      if (nodeId) { onSelectNode?.(nodeId); return; }
+      if (nodeId) return nodeId;
     }
-    onSelectNode?.(null);
+    return null;
   };
 
   // Hover is scoped to community supernodes only — entity-level hover belongs to the deferred
@@ -996,23 +1025,41 @@ export function MemoryConstellation3D({
 
   const pointerDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
     cancelTransition();
-    dragRef.current = { mode: event.shiftKey || event.button === 1 || event.button === 2 ? 'pan' : 'orbit', x: event.clientX, y: event.clientY, camera: cameraState };
+    dragRef.current = {
+      mode: event.shiftKey || event.button === 1 || event.button === 2 ? 'pan' : 'orbit',
+      x: event.clientX, y: event.clientY, camera: cameraState, dragged: false,
+    };
     event.currentTarget.setPointerCapture(event.pointerId);
   };
   const pointerMove = (event: React.PointerEvent<HTMLCanvasElement>) => {
     const drag = dragRef.current;
     if (!drag) { hoverAt(event); return; }
     const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
+    if (!constellation3DHasDragged(drag.dragged, Math.hypot(dx, dy))) return;
+    drag.dragged = true;
     setCameraState(drag.mode === 'orbit' ? orbitConstellationCamera(drag.camera, dx, dy) : panConstellationCamera(drag.camera, dx, dy));
   };
   const pointerUp = (event: React.PointerEvent<HTMLCanvasElement>) => {
     const drag = dragRef.current;
     dragRef.current = null;
-    if (drag && Math.hypot(event.clientX - drag.x, event.clientY - drag.y) > 3) return;
-    selectAt(event);
+    const dragDistance = drag ? Math.hypot(event.clientX - drag.x, event.clientY - drag.y) : 0;
+    if (constellation3DHasDragged(drag?.dragged ?? false, dragDistance)) {
+      lastClickRef.current = null;
+      return;
+    }
+    const nodeId = nodeAt(event);
+    if (nodeId === undefined) return;
+    const intent = constellation3DClickIntent(lastClickRef.current, nodeId, event.timeStamp, dragDistance);
+    lastClickRef.current = intent.next;
+    onSelectNode?.(nodeId);
+    if (intent.zoom && nodeId) {
+      const node = layoutNodes.find((candidate) => candidate.id === nodeId);
+      if (node) zoomToNode(node);
+    }
   };
 
   const keyDown = (event: React.KeyboardEvent<HTMLCanvasElement>) => {
+    lastClickRef.current = null;
     const directions: Record<string, [number, number, number]> = { ArrowLeft: [-1, 0, 0], ArrowRight: [1, 0, 0], ArrowUp: [0, 1, 0], ArrowDown: [0, -1, 0] };
     const direction = directions[event.key];
     if (direction && selectedNodeId) {
@@ -1022,6 +1069,9 @@ export function MemoryConstellation3D({
       return;
     }
     const selected = selectedNodeId ? layoutNodes.find((node) => node.id === selectedNodeId) : null;
+    if (selected && constellation3DKeyboardZoomIntent(event.key, selectedNodeId)) {
+      event.preventDefault(); zoomToNode(selected); return;
+    }
     if (selected?.uri && event.key.toLowerCase() === 'e') onOpenEgoNetwork?.(selected.uri);
     if (selected?.uri && event.key.toLowerCase() === 'i') onOpenInspector?.(selected.uri);
     if (event.key === 'Escape') { cancelTransition(); onSelectNode?.(null); }
@@ -1029,7 +1079,7 @@ export function MemoryConstellation3D({
 
   return (
     <div ref={hostRef} style={{ position: 'absolute', inset: 0, overflow: 'hidden' }} data-reduced-motion={reducedMotion ? 'true' : 'false'}>
-      <canvas ref={canvasRef} tabIndex={0} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerLeave={clearHover} onWheel={dolly} onKeyDown={keyDown} onContextMenu={(event) => event.preventDefault()} style={{ width: '100%', height: '100%', display: 'block', touchAction: 'none' }} aria-label={`3D memory constellation with ${layoutNodes.length} visible items. Arrow keys move selection; E opens ego network; I opens evidence inspector.`} />
+      <canvas ref={canvasRef} tabIndex={0} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerLeave={clearHover} onWheel={dolly} onKeyDown={keyDown} onContextMenu={(event) => event.preventDefault()} style={{ width: '100%', height: '100%', display: 'block', touchAction: 'none' }} aria-label={`3D memory constellation with ${layoutNodes.length} visible items. Single-click pins; double-click or Enter zooms; arrow keys move selection; E opens ego network; I opens evidence inspector.`} />
       <div style={{ position: 'absolute', right: 10, bottom: 10, display: 'flex', gap: 6 }}>
         <button
           type="button"
@@ -1059,7 +1109,7 @@ export function MemoryConstellation3D({
           onClick={() => {
             if (!selectedNodeId) return;
             const selected = layoutNodes.find((node) => node.id === selectedNodeId);
-            if (selected) transitionTo(focusConstellationCamera(cameraState, selected.position, selected.radius ?? 18));
+            if (selected) zoomToNode(selected);
           }}
           style={{ ...CAMERA_CTRL_STYLE, cursor: selectedNodeId ? 'pointer' : 'default' }}
         >
