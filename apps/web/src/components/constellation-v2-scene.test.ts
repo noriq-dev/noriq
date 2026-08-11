@@ -46,8 +46,10 @@ describe('Constellation v2 scene assembly', () => {
     expect(base.edges.map((edge) => edge.id)).toEqual(['aggregate:leaf:other', 'raw:backbone']);
     expect(selected.nodes.map((node) => node.id)).toContain('outside-root');
     expect(selected.edges).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: 'incident:incoming', fromId: 'outside-root', toId: 'a', historical: true, aggregate: true }),
-      expect.objectContaining({ id: 'incident:outgoing', fromId: 'a', toId: 'b', aggregate: false }),
+      // PLNR-445: an incoming incident edge must render as 'reverse' (← in the typed label), not
+      // collapse to the same 'forward' every outgoing edge gets.
+      expect.objectContaining({ id: 'incident:incoming', fromId: 'outside-root', toId: 'a', direction: 'reverse', historical: true, aggregate: true }),
+      expect.objectContaining({ id: 'incident:outgoing', fromId: 'a', toId: 'b', direction: 'forward', aggregate: false }),
     ]));
     expect(selected.partial).toBe(true);
     expect(assembleConstellationV2Scene(overview, merged, []).edges).toEqual(base.edges);

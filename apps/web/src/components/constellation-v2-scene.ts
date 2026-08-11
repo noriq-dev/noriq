@@ -77,9 +77,16 @@ export function assembleConstellationV2Scene(
         if (!nodes.has(endpointId)) nodes.set(endpointId, communityNode(containing));
       }
       const outgoing = incident.direction === 'outgoing';
+      // PLNR-445: `direction` here is the typed-label arrow (promotedEdgeLabelText reads it, not
+      // fromId/toId), and it must agree with the fromId/toId swap two lines up rather than being
+      // hardcoded — an incoming incident edge (fromId=endpoint, toId=the pin) is a 'reverse' edge
+      // by the same 'forward'|'reverse'|'both' vocabulary every other edge kind here already uses;
+      // an incident edge's direction is never 'both' (ApiConstellationV2IncidentPage.edges[].direction
+      // is 'incoming' | 'outgoing' only), so there is no third case to thread through.
       edges.set(`incident:${incident.edgeId}`, {
         id: `incident:${incident.edgeId}`, fromId: outgoing ? incidentPage.node.nodeId : endpointId,
-        toId: outgoing ? endpointId : incidentPage.node.nodeId, type: incident.type, direction: 'forward',
+        toId: outgoing ? endpointId : incidentPage.node.nodeId, type: incident.type,
+        direction: outgoing ? 'forward' : 'reverse',
         weight: 5, aggregate: endpointId !== incident.endpoint.nodeId, provenance: incident.provenance,
         historical: isHistoricalIncidentEdgeType(incident.type),
       });
