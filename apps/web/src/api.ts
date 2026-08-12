@@ -837,6 +837,8 @@ export interface ApiRun {
   /** The selected repo-defined workflow (RUN-121); null = the built-in for `kind`. Overrides only
    *  the prompt — `kind` still carries the posture. */
   workflow: string | null;
+  /** per_task is the legacy fan-out; single_root delegates child scheduling to a mission.v2 workflow. */
+  strategy: 'per_task' | 'single_root';
   budget: Partial<ApiRunBudget>;
   status: RunStatus;
   /** What a `running` run is doing right now (RUN-31). Null when queued or terminal. */
@@ -912,6 +914,7 @@ export interface PlanDispatchInput {
   /** Workflow every pump-created run selects unless the task names its own (PLNR-240).
    *  Must be advertised by the chosen repo; the server refuses an unknown name. */
   workflow?: string | null;
+  strategy?: 'per_task' | 'single_root';
 }
 /** One transcript segment (RUN-74). Consecutive same-voice segments merge in the UI. */
 export interface ApiRunLogSegment {

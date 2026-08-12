@@ -38,7 +38,7 @@ let pid: string;
 /** A runner the pump can schedule onto. Fresh per test — capacity math reads the runs
  *  table, so sharing a runner across tests would leak slots between them. */
 let runnerSeq = 0;
-async function seedRunner(maxConcurrency: number): Promise<string> {
+async function seedRunner(maxConcurrency: number, mission = false): Promise<string> {
   const id = `rnr_pd_${++runnerSeq}`;
   await env.DB.prepare(
     `INSERT INTO runners (id, label, owner_user_id, status, capabilities, repos, free_slots)
@@ -46,7 +46,12 @@ async function seedRunner(maxConcurrency: number): Promise<string> {
   ).bind(
     id, id, userId,
     JSON.stringify({ tools: ['claude'], kinds: ['scope', 'build', 'verify'], maxConcurrency }),
-    JSON.stringify([{ id: 'repo_pd', projectKey: 'PDSP', projectId: pid, name: 'pd', defaultBranch: 'main' }]),
+    JSON.stringify([{
+      id: 'repo_pd', projectKey: 'PDSP', projectId: pid, name: 'pd', defaultBranch: 'main',
+      workflows: mission ? [{
+        name: 'mission-plan', base: 'build', description: 'Runner mission harness', capabilities: ['mission.v2'],
+      }] : [],
+    }]),
     maxConcurrency,
   ).run();
   return id;
@@ -518,5 +523,68 @@ describe('the door checks', () => {
     const list = await SELF.fetch(`https://noriq.test/api/projects/${pid}/runs`, { headers: { Cookie: cookie } });
     const { runs } = (await list.json()) as { runs: Array<{ planDispatchId: string | null }> };
     expect(runs.filter((r) => r.planDispatchId === dispatch.id).length).toBe(2);
+  });
+});
+
+describe('single_root Runner mission commissioning (PLNR-484)', () => {
+  it('commissions one plan-anchored root and excludes the legacy task pump', async () => {
+    const runner = await seedRunner(4, true);
+    const { planId } = await makePlan('mission-one-root');
+    const dispatch = await createDispatch(runner, planId, {
+      strategy: 'single_root', workflow: 'mission-plan',
+    });
+    expect(dispatch.strategy).toBe('single_root');
+    expect(dispatch.tasks.every((task) => task.runId === null)).toBe(true);
+    const roots = await env.DB.prepare(
+      `SELECT id, anchor_type AS anchorType, anchor_id AS anchorId, workflow
+         FROM runs WHERE plan_dispatch_id = ?`,
+    ).bind(dispatch.id).all<{ id: string; anchorType: string; anchorId: string; workflow: string }>();
+    expect(roots.results).toHaveLength(1);
+    expect(roots.results[0]).toMatchObject({ anchorType: 'plan', anchorId: planId, workflow: 'mission-plan' });
+
+    await room(pid).pumpProjectDispatches(pid);
+    await room(pid).retryPlanDispatch(pid, actor, dispatch.id);
+    expect((await env.DB.prepare('SELECT id FROM runs WHERE plan_dispatch_id = ?').bind(dispatch.id).all()).results).toHaveLength(1);
+  });
+
+  it('requires an explicit rich build mission.v2 offer while legacy dispatch remains unchanged', async () => {
+    const legacyRunner = await seedRunner(2);
+    const legacyPlan = await makePlan('mission-legacy');
+    const legacy = await createDispatch(legacyRunner, legacyPlan.planId);
+    expect(legacy.strategy).toBe('per_task');
+    expect((await dispatchRuns(legacy.id)).length).toBe(2);
+
+    const plan = await makePlan('mission-refuse');
+    await expect(createDispatch(legacyRunner, plan.planId, {
+      strategy: 'single_root', workflow: 'mission-plan',
+    })).rejects.toThrow(/mission\.v2/);
+  });
+
+  it('cancels the root and stalls rather than claiming completion when it exits with open tasks', async () => {
+    const runner = await seedRunner(2, true);
+    const agent = await seedAgent(runner);
+    const openPlan = await makePlan('mission-open');
+    const openDispatch = await createDispatch(runner, openPlan.planId, {
+      strategy: 'single_root', workflow: 'mission-plan',
+    });
+    const openRoot = await env.DB.prepare('SELECT id FROM runs WHERE plan_dispatch_id = ?')
+      .bind(openDispatch.id).first<{ id: string }>();
+    await finishRun(openRoot!.id, agent);
+    const stalled = (await room(pid).listPlanDispatches(pid, openPlan.planId)).dispatches[0]!;
+    expect(stalled.status).toBe('stalled');
+    expect(stalled.stallReason).toMatch(/completed.*3 plan task/);
+    for (const taskId of [openPlan.a, openPlan.b, openPlan.c]) {
+      await room(pid).updateTask(pid, actor, taskId, { status: 'done' });
+    }
+    expect((await room(pid).listPlanDispatches(pid, openPlan.planId)).dispatches[0]!.status).toBe('completed');
+
+    const cancelPlan = await makePlan('mission-cancel');
+    const cancelDispatch = await createDispatch(runner, cancelPlan.planId, {
+      strategy: 'single_root', workflow: 'mission-plan',
+    });
+    expect((await room(pid).cancelPlanDispatch(pid, actor, cancelDispatch.id)).cancelledRuns).toBe(1);
+    const cancelled = await env.DB.prepare('SELECT status FROM runs WHERE plan_dispatch_id = ?')
+      .bind(cancelDispatch.id).first<{ status: string }>();
+    expect(cancelled?.status).toBe('cancelled');
   });
 });

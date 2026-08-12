@@ -34,7 +34,7 @@ import {
   groupRoleAllows, projectRoleAllows, resolveAccountCapabilities, resolveGroupRole, resolveProjectAccess,
   recordAuthorizationAudit, userCanCreateGroup, userCanCreateProject, type ProjectAction,
 } from './lib/authorization';
-import { advertisedWorkflowNames } from './lib/workflows';
+import { advertisedWorkflowNames, workflowSupports } from './lib/workflows';
 import type { Actor, CreateTaskInput, RunView } from './do/ProjectRoom';
 import { SKILL_MD, SKILL_REFERENCES, SKILL_MD_SURFACE } from './skill';
 import { DOC_SKILL_MD } from './skill-docs';
@@ -4325,6 +4325,7 @@ const PlanDispatchApiBody = z.object({
   // unless the task names its own. Validated against the repo's advertised set at the door,
   // same as the single-run dispatch; a task-level name is validated by the pump per task.
   workflow: z.string().min(1).max(80).nullish(),
+  strategy: z.enum(['per_task', 'single_root']).default('per_task'),
 });
 app.post('/api/projects/:pid/plans/:planId/dispatch', userAuth, async (c) => {
   const denied = demoDenied(c);
@@ -4344,11 +4345,15 @@ app.post('/api/projects/:pid/plans/:planId/dispatch', userAuth, async (c) => {
   if (b.workflow && !advertisedWorkflowNames(repo).has(b.workflow)) {
     return c.json({ error: `workflow "${b.workflow}" is not advertised by this repo — refresh the runner or pick another` }, 400);
   }
+  if (b.strategy === 'single_root' && (!b.workflow || !workflowSupports(repo, b.workflow, 'build', 'mission.v2'))) {
+    return c.json({ error: 'single_root requires an advertised build-posture workflow with mission.v2' }, 400);
+  }
   try {
     const dispatch = await room(c.env, pid).createPlanDispatch(pid, humanActor(c), {
       planId, runnerId: b.runnerId, repoRef: b.repoRef, agentTool: b.agentTool,
       model: b.model ?? null, effort: b.effort ?? null, budget: b.budget, gate: b.gate,
       workflow: b.workflow ?? null,
+      strategy: b.strategy,
     });
     return c.json({ dispatch });
   } catch (e) {

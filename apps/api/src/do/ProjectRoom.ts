@@ -3,7 +3,7 @@ import type { Env } from '../env';
 import { newId, nowIso, sha256Hex } from '../lib/util';
 import { userCanAccessProject } from '../lib/visibility';
 import { projectRoleAllows, resolveProjectAccess } from '../lib/authorization';
-import { advertisedWorkflowNames } from '../lib/workflows';
+import { advertisedWorkflowNames, workflowSupports } from '../lib/workflows';
 import { unfinishedDeps as unfinishedDepsLib } from '../lib/claimability';
 import { needsOutOfBand, sendSignalEmail, sendSignalWebhook } from '../lib/notify-out';
 import { requireDecisionOnlyDoc } from '../lib/doclint';
@@ -373,6 +373,9 @@ export interface CreatePlanDispatchInput {
    *  unless the task names its own. Validated against the repo's advertised set at the REST
    *  door; the pump re-validates per task against the runner's CURRENT advertisement. */
   workflow?: string | null;
+  /** Omitted/per_task preserves the legacy fan-out pump. single_root commissions one
+   * plan-anchored build Run under a mission.v2 workflow. */
+  strategy?: 'per_task' | 'single_root';
   createdBy?: string;
 }
 
@@ -380,6 +383,7 @@ type PlanDispatchRow = {
   id: string; project_id: string; plan_id: string; runner_id: string; repo_ref: string;
   agent_tool: string; model: string | null; effort: string | null; budget: string;
   gate: string; status: string; stall_reason: string | null; workflow: string | null;
+  strategy: 'per_task' | 'single_root';
   created_by: string; created_at: string; updated_at: string; finished_at: string | null;
 };
 
@@ -405,6 +409,7 @@ export interface PlanDispatchView {
   stallReason: string | null;
   /** The dispatch-level workflow default (PLNR-240); null = the built-in build. */
   workflow: string | null;
+  strategy: 'per_task' | 'single_root';
   tasks: PlanDispatchTaskView[];
   createdBy: string;
   createdAt: string;
@@ -4164,6 +4169,20 @@ export class ProjectRoom extends DurableObject<Env> {
       if (!plan) throw new Error('plan not found');
       // The RUN-23 gate holds here too: a proposed plan's tasks are not real work yet.
       if (plan.status === 'proposed') throw new Error('plan is proposed — approve it before dispatching');
+      const strategy = input.strategy ?? 'per_task';
+      if (strategy === 'single_root') {
+        if (!input.workflow) throw new Error('single_root requires an explicit mission.v2 workflow');
+        const runner = await this.env.DB.prepare('SELECT repos FROM runners WHERE id = ?')
+          .bind(input.runnerId).first<{ repos: string }>();
+        let repo: { id: string; projectId?: string | null; workflows?: Array<string | { name: string; base?: string; capabilities?: string[] }> } | undefined;
+        try {
+          repo = (JSON.parse(runner?.repos || '[]') as Array<typeof repo>).find((entry) => entry?.id === input.repoRef);
+        } catch { /* malformed advertisement is an unavailable capability */ }
+        if (!repo || repo.projectId !== projectId) throw new Error('single_root repo does not resolve to this project');
+        if (!workflowSupports(repo, input.workflow, 'build', 'mission.v2')) {
+          throw new Error(`workflow "${input.workflow}" is not a build-posture mission.v2 offer`);
+        }
+      }
       // One live dispatch per plan: two pumps would race each other to the same ready tasks,
       // and "which runner is working my plan" should have one answer.
       const existing = await this.env.DB.prepare(
@@ -4182,12 +4201,12 @@ export class ProjectRoom extends DurableObject<Env> {
       const now = nowIso();
       await this.env.DB.prepare(
         `INSERT INTO plan_dispatches (id, project_id, plan_id, runner_id, repo_ref, agent_tool,
-                                      model, effort, budget, gate, workflow, status, created_by, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+                                      model, effort, budget, gate, workflow, strategy, status, created_by, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
       ).bind(
         id, projectId, input.planId, input.runnerId, input.repoRef, input.agentTool,
         input.model ?? null, input.effort ?? null, JSON.stringify(input.budget ?? {}),
-        input.gate ?? 'approved', input.workflow ?? null, input.createdBy ?? actor.id, now, now,
+        input.gate ?? 'approved', input.workflow ?? null, strategy, input.createdBy ?? actor.id, now, now,
       ).run();
       await this.emit(actor, 'plan_dispatch.created', 'plan_dispatch', id, {
         planId: plan.id, planTitle: plan.title, runnerId: input.runnerId, gate: input.gate ?? 'approved',
@@ -4318,6 +4337,8 @@ export class ProjectRoom extends DurableObject<Env> {
     opts: { retry?: boolean } = {},
   ): Promise<{ created: number }> {
     if (d.status !== 'active' && d.status !== 'stalled') return { created: 0 };
+
+    if (d.strategy === 'single_root') return this.pumpSingleRootDispatch(d, actor);
 
     const open = await this.env.DB.prepare(
       `SELECT COUNT(*) AS n FROM phase_tasks pt
@@ -4464,6 +4485,76 @@ export class ProjectRoom extends DurableObject<Env> {
     return { created };
   }
 
+  /** Commission/reconcile the one Runner-owned mission root. Task lifecycle remains server-owned:
+   * a successful root with open tasks is visibly stalled, never treated as plan completion. */
+  private async pumpSingleRootDispatch(d: PlanDispatchRow, actor: Actor): Promise<{ created: number }> {
+    const open = await this.env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM phase_tasks pt
+         JOIN phases ph ON ph.id = pt.phase_id JOIN tasks t ON t.id = pt.task_id
+       WHERE ph.plan_id = ? AND t.status NOT IN ('done','cancelled')`,
+    ).bind(d.plan_id).first<{ n: number }>();
+    const root = await this.env.DB.prepare(
+      `SELECT * FROM runs WHERE plan_dispatch_id = ? AND anchor_type = 'plan' AND anchor_id = ?
+       ORDER BY created_at LIMIT 1`,
+    ).bind(d.id, d.plan_id).first<RunRow>();
+
+    if (root) {
+      const rootStatus = logicalRunStatus(root);
+      if (['queued', 'dispatched', 'running', 'blocked'].includes(rootStatus)) {
+        if (d.status === 'stalled') {
+          await this.env.DB.prepare(
+            "UPDATE plan_dispatches SET status = 'active', stall_reason = NULL, updated_at = ? WHERE id = ?",
+          ).bind(nowIso(), d.id).run();
+        }
+        return { created: 0 };
+      }
+      if (rootStatus === 'done' && !open?.n) {
+        const now = nowIso();
+        await this.env.DB.prepare(
+          "UPDATE plan_dispatches SET status = 'completed', stall_reason = NULL, finished_at = ?, updated_at = ? WHERE id = ?",
+        ).bind(now, now, d.id).run();
+        await this.emit(actor, 'plan_dispatch.completed', 'plan_dispatch', d.id, { planId: d.plan_id, rootRunId: root.id });
+        return { created: 0 };
+      }
+      const reason = rootStatus === 'done'
+        ? `mission root completed but ${open?.n ?? 0} plan task(s) remain open`
+        : `mission root is ${rootStatus}; ${open?.n ?? 0} plan task(s) remain open`;
+      await this.env.DB.prepare(
+        "UPDATE plan_dispatches SET status = 'stalled', stall_reason = ?, updated_at = ? WHERE id = ?",
+      ).bind(reason, nowIso(), d.id).run();
+      if (d.status !== 'stalled' || d.stall_reason !== reason) {
+        await this.emit(actor, 'plan_dispatch.stalled', 'plan_dispatch', d.id, { planId: d.plan_id, rootRunId: root.id, reason });
+      }
+      return { created: 0 };
+    }
+
+    const runner = await this.env.DB.prepare('SELECT status, capabilities FROM runners WHERE id = ?')
+      .bind(d.runner_id).first<{ status: string; capabilities: string }>();
+    let slots = 0;
+    if (runner && runner.status !== 'offboarded') {
+      let max = 1;
+      try { max = Number((JSON.parse(runner.capabilities || '{}') as { maxConcurrency?: number }).maxConcurrency ?? 1); } catch { /* default */ }
+      const busy = await this.env.DB.prepare(
+        "SELECT COUNT(*) AS n FROM runs WHERE runner_id = ? AND status IN ('dispatched','running')",
+      ).bind(d.runner_id).first<{ n: number }>();
+      slots = Math.max(0, max - (busy?.n ?? 0));
+    }
+    if (slots < 1) return { created: 0 };
+
+    const run = await this.insertRun(actor, {
+      kind: 'build', anchor: { type: 'plan', id: d.plan_id }, repoRef: d.repo_ref,
+      agentTool: d.agent_tool, model: d.model, effort: d.effort, workflow: d.workflow,
+      budget: JSON.parse(d.budget || '{}'), runnerId: d.runner_id,
+      createdBy: d.created_by, planDispatchId: d.id,
+      brief: 'Execute this approved plan through the advertised Runner mission harness.',
+    });
+    try {
+      await this.env.RUNNER_HUB.get(this.env.RUNNER_HUB.idFromName(d.runner_id))
+        .deliver(JSON.stringify({ type: 'run.assigned', run }));
+    } catch { /* hello reconciliation redelivers */ }
+    return { created: 1 };
+  }
+
   /** Why the pump is stuck, composed for a human. Best-effort taxonomy — the counts answer
    *  "what do I click": retry failed runs, approve reviews, answer a parked question. */
   private async planDispatchStallReason(d: PlanDispatchRow, extra: string[] = []): Promise<string> {
@@ -4560,6 +4651,7 @@ export class ProjectRoom extends DurableObject<Env> {
       status: row.status as PlanDispatchView['status'],
       stallReason: row.stall_reason,
       workflow: row.workflow,
+      strategy: row.strategy,
       tasks: tasks.map((t) => ({
         taskId: t.taskId,
         runId: t.runId,

@@ -288,6 +288,10 @@ export const AdvertisedWorkflow = z.object({
   name: z.string().min(1),
   base: RunKind,
   description: z.string().nullable().default(null),
+  // Additive, opaque workflow protocol capabilities. `mission.v2` means a build-posture
+  // workflow can own child scheduling for a single-root plan dispatch. Older advertisements
+  // omit this and remain valid ordinary workflows.
+  capabilities: z.array(z.string().min(1).max(80)).max(16).default([]),
 });
 export type AdvertisedWorkflow = z.infer<typeof AdvertisedWorkflow>;
 
