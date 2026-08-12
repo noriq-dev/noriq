@@ -2,11 +2,14 @@ import type {
   ApiConstellationV2Community, ApiConstellationV2CommunityPage, ApiConstellationV2IncidentPage,
   ApiConstellationV2Overview,
 } from '../api';
+import { CONSTELLATION_RESIDENT_NODE_BUDGET } from '@noriq-dev/shared';
 import {
   constellation3DCommunityWellScale, type Constellation3DEdge, type Constellation3DNode,
 } from './constellation-3d-buffers';
 
-export const CONSTELLATION_V2_RESIDENT_NODE_BUDGET = 12_000;
+/** Compatibility name retained for existing scene/loader consumers; the value is shared with
+ * the 2D fallback endpoint rather than independently tuned here. */
+export const CONSTELLATION_V2_RESIDENT_NODE_BUDGET = CONSTELLATION_RESIDENT_NODE_BUDGET;
 
 /** An incident edge TYPE that reads as superseded/replaced rather than a live relationship — the
  * one predicate this scene assembler treats as historical for a raw incident edge (backbone edges

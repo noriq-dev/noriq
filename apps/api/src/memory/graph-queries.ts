@@ -21,6 +21,7 @@
 // `Coverage` shape rather than inventing a second one (locked decision), which is why
 // `CoverageReason` gains one new arm below (`graph-empty`) instead of a parallel field.
 
+import { CONSTELLATION_RESIDENT_NODE_BUDGET } from '@noriq-dev/shared';
 import { classifyLead } from './retrieval';
 
 export type CoverageReason =
@@ -287,17 +288,15 @@ export function changeImpact(
 // isolation.
 // ---------------------------------------------------------------------------------------
 
-/** PLNR-315: raised from 300/600 — the real wall on this endpoint is response SIZE (§18's
- *  "comfortably bounded" budget), not render time. `starmap-layout.ts`'s grid-bucketed relaxation
- *  (`computeStarMap`) stays near-linear at 1000 nodes / 2000 edges; measured on this change (see
- *  its release note) well under a frame budget for a one-time, call-once-per-fetch layout pass,
- *  never a per-frame simulation. Independent of RETRIEVAL_DEFAULTS' single-seed neighborhood
- *  ceilings (retrieval.ts): this samples the WHOLE project, not a bounded expansion from one seed,
- *  so it needs its own, larger numbers. Edge ceiling is 2x the node ceiling — a reasonably dense
- *  sampled subgraph has more edges than nodes, and a canvas reads a dense knot of edges before it
- *  reads a large count of stars. */
-export const CONSTELLATION_NODE_CEILING = 1000;
-export const CONSTELLATION_EDGE_CEILING = 2000;
+/** PLNR-315 introduced this whole-project response bound; PLNR-474 gives 2D and 3D the SAME
+ * shared resident-node budget so changing renderer never shrinks the graph. At full density the
+ * JSON response can be several MiB before HTTP gzip, mitigated by edge repetition compressing
+ * well on the wire; it remains one bounded, call-once-per-fetch layout rather than a per-frame
+ * simulation. This stays independent of RETRIEVAL_DEFAULTS' single-seed neighborhood ceilings.
+ * Edge capacity remains exactly 2x nodes: enough relationship context without letting lines
+ * dominate either payload size or the canvas. */
+export const CONSTELLATION_NODE_CEILING = CONSTELLATION_RESIDENT_NODE_BUDGET;
+export const CONSTELLATION_EDGE_CEILING = CONSTELLATION_RESIDENT_NODE_BUDGET * 2;
 
 /** PLNR-339: files are useful constellation landmarks and are therefore eligible again. Symbols
  *  remain excluded: an indexed repository can contain orders of magnitude more symbols than every
@@ -307,7 +306,7 @@ const CONSTELLATION_EXCLUDED_NODE_TYPES: ReadonlySet<string> = new Set(['symbol'
 
 /** A bounded but meaningful share of the overview is reserved for project memory. Without this
  *  tier, even an authority-5 memory loses to two-degree coordination/code nodes and a busy project
- *  can produce a 1000-node "memory" map containing no memories at all. */
+ *  can produce a budget-sized "memory" map containing no memories at all. */
 export const CONSTELLATION_MEMORY_RESERVE = 300;
 
 export interface ConstellationRawNode {

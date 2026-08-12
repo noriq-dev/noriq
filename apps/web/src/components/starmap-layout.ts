@@ -19,7 +19,7 @@
 // later unrelated cluster therefore cannot perturb an earlier cluster. Member relaxation is
 // scoped to one cluster, so adding a member to cluster B never changes cluster A's positions.
 // There is no Math.random, Date, response-index seed, or live per-frame simulation. The server's
-// current 1,000-node ceiling bounds all work; its sampling precedes this module and is intentionally
+// shared 12,000-node ceiling bounds all work; its sampling precedes this module and is intentionally
 // left unchanged, so this layout tells the truth about the returned sample rather than inventing
 // omitted cluster membership.
 // ---------------------------------------------------------------------------------------------
@@ -178,7 +178,7 @@ const REPULSION_STRENGTH = 0.6;
 const MAX_STEP_PER_PASS = 24;
 
 /** Buckets one cluster into `INTERACTION_RADIUS`-sized cells, keeping member relaxation near-linear
- * at the current 1,000-node response ceiling. */
+ * at the shared 12,000-node response ceiling. */
 function buildGrid(positions: Map<string, WorldPoint>): Map<string, string[]> {
   const grid = new Map<string, string[]>();
   for (const [nodeId, p] of positions) {

@@ -4,7 +4,8 @@ import type {
   ApiConstellationV2Overview, ApiConstellationV2Revision,
 } from '../api';
 import { mergeConstellationCommunityPages } from './MemoryConstellationV2';
-import { assembleConstellationV2Scene, evictConstellationPages } from './constellation-v2-scene';
+import { CONSTELLATION_RESIDENT_NODE_BUDGET } from '@noriq-dev/shared';
+import { assembleConstellationV2Scene, CONSTELLATION_V2_RESIDENT_NODE_BUDGET, evictConstellationPages } from './constellation-v2-scene';
 
 const revision: ApiConstellationV2Revision = { contract: 'constellation-v2', generationId: 'g1', sourceRevision: 1, currentRevision: 1, topologyVersion: 'connectivity-v1', layoutVersion: 'space-v1', state: 'current', generatedAt: 'now' };
 const community = (id: string, parentId: string | null = null): ApiConstellationV2Community => ({ id, parentId, level: parentId ? 1 : 0, label: id, memberCount: 2, childCommunityCount: 0, typeCounts: { memory: 1, task: 1 }, internalEdgeCount: 1, internalWeight: 2, normalizedCohesion: 1, boundaryWeight: 2, anchor: [id.charCodeAt(0), 0, 0] });
@@ -22,6 +23,10 @@ const page = (entities: Array<{ nodeId: string; uri: string }>, nextCursor: stri
 });
 
 describe('Constellation v2 scene assembly', () => {
+  it('re-exports the shared resident-node budget under the established v2 name', () => {
+    expect(CONSTELLATION_V2_RESIDENT_NODE_BUDGET).toBe(CONSTELLATION_RESIDENT_NODE_BUDGET);
+  });
+
   it('maps a resident coreNodeId to the real anchor-entity sun, nests phase sub-wells, and keeps ambient entities unclustered', () => {
     const root = { ...community('root'), coreNodeId: 'plan-core', childCommunityCount: 1, memberCount: 4, typeCounts: { plan: 1, task: 3 } };
     const phase = { ...community('phase', 'root'), label: 'Foundation', memberCount: 3, typeCounts: { task: 3 }, anchor: [120, 15, -4] as [number, number, number] };

@@ -4,6 +4,11 @@ import { ProjectIntelligenceEpisode } from './intelligence';
 import type { ContextConsumptionMode, ContextConsumptionRole, ContextConsumptionSectionId } from './intelligence';
 import { RunModelUsage } from './runner';
 
+/** PLNR-474: one resident-graph ceiling shared by the 2D fallback response and the 3D continuous
+ * space. Consumers may impose representation-specific edge/page bounds around this node budget,
+ * but neither visualization gets a smaller universe merely because it uses a different renderer. */
+export const CONSTELLATION_RESIDENT_NODE_BUDGET = 12_000;
+
 // ---------------------------------------------------------------------------
 // Project Memory — shared entities, stable URIs, and wire contracts (PLNR-244,
 // Phase 1 of the Project Memory plan; see the "Project Memory — settled

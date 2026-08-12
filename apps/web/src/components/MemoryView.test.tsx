@@ -18,6 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api, type ApiConstellation, type ApiGraphCoverageReason, type ApiMemoryHistory, type ApiMemoryItem, type ApiMemoryReviewQueue } from '../api';
 import { MemoryView } from './MemoryView';
 import type { AppStore } from '../store';
+import { CONSTELLATION_RESIDENT_NODE_BUDGET } from '@noriq-dev/shared';
 
 let container: HTMLDivElement;
 let root: Root | null = null;
@@ -87,7 +88,7 @@ const emptyFrame = { text: '', itemsIncluded: 0, itemsOmitted: 0, truncated: fal
 const baseCoverage = { complete: true, reasons: ['graph-empty'] as ApiGraphCoverageReason[] };
 function emptyConstellation(overrides: Partial<ApiConstellation> = {}): ApiConstellation {
   return {
-    memoryRevision: 1, nodeCeiling: 1000, edgeCeiling: 2000,
+    memoryRevision: 1, nodeCeiling: CONSTELLATION_RESIDENT_NODE_BUDGET, edgeCeiling: CONSTELLATION_RESIDENT_NODE_BUDGET * 2,
     nodes: [], edges: [], omitted: { nodes: 0, edges: 0, edgesDanglingPruned: 0, codeEntitiesExcluded: 0 },
     coverage: baseCoverage, ...overrides,
   };

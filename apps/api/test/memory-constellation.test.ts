@@ -4,15 +4,14 @@
 // DO, shaping/sampling/coverage in memory/graph-queries.ts's pure `constellation`):
 //  - Bounding, tie-break determinism, dangling-edge pruning, and coverage classification are
 //    exercised directly against the PURE function with synthetic rows — no workerd/DO needed,
-//    and it is the only practical way to exceed CONSTELLATION_NODE_CEILING/EDGE_CEILING (1000/2000
-//    as of PLNR-315) in a fast test.
+//    and it is the only practical way to exceed the shared 12k resident-node budget in a test.
 //  - URI parity with `/memory/search`, provenance passthrough, revision-keyed determinism across
 //    real calls, the four distinct degraded states, and the REST route's auth gate are exercised
 //    against the real DO/REST stack (same technique as memory-graph-queries.test.ts).
 import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import type { Env } from '../src/env';
-import { buildEntityUri, parseEntityUri } from '@noriq-dev/shared';
+import { buildEntityUri, CONSTELLATION_RESIDENT_NODE_BUDGET, parseEntityUri } from '@noriq-dev/shared';
 import {
   constellation, listGraphEntities, CONSTELLATION_NODE_CEILING, CONSTELLATION_EDGE_CEILING, CONSTELLATION_MEMORY_RESERVE,
   type ConstellationRawNode, type ConstellationRawEdge,
@@ -34,29 +33,34 @@ function edge(type: string, fromUri: string, toUri: string, provenance: string |
 }
 
 describe('constellation (pure) — bounding', () => {
+  it('uses the shared 2D/3D resident-node budget and keeps edges at exactly twice it', () => {
+    expect(CONSTELLATION_NODE_CEILING).toBe(CONSTELLATION_RESIDENT_NODE_BUDGET);
+    expect(CONSTELLATION_EDGE_CEILING).toBe(CONSTELLATION_RESIDENT_NODE_BUDGET * 2);
+  });
+
   it('returns exactly CONSTELLATION_NODE_CEILING nodes when the graph exceeds it, and counts the rest as omitted', () => {
     const total = CONSTELLATION_NODE_CEILING + 5;
     // Zero-padded ids sort lexicographically identically to numerically — with every OTHER
-    // scoring input tied, the uri ASC tie-break alone decides which 1000 of 1005 survive.
-    const nodes = Array.from({ length: total }, (_, i) => node(`noriq://task/n${String(i).padStart(4, '0')}`, 'task'));
+    // scoring input tied, the uri ASC tie-break alone decides which budget-sized prefix survives.
+    const width = String(total - 1).length;
+    const nodes = Array.from({ length: total }, (_, i) => node(`noriq://task/n${String(i).padStart(width, '0')}`, 'task'));
     const result = constellation(1, { nodes, edges: [], memoryItems: [], episodes: [] }, { codeGraphPopulated: true }, { includeIsolated: true });
 
     expect(result.nodes).toHaveLength(CONSTELLATION_NODE_CEILING);
     expect(result.omitted.nodes).toBe(5);
     expect(result.coverage.complete).toBe(false);
     expect(result.coverage.reasons).toContain('row-limit-reached');
-    // uri ASC tie-break: the first 1000 lexicographically sorted uris survive.
-    expect(result.nodes[0]!.uri).toBe('noriq://task/n0000');
-    expect(result.nodes.at(-1)!.uri).toBe('noriq://task/n0999');
-    expect(result.nodes.some((n) => n.uri === 'noriq://task/n1000')).toBe(false);
+    // uri ASC tie-break: the first budget-sized lexicographic prefix survives.
+    expect(result.nodes[0]!.uri).toBe(`noriq://task/n${String(0).padStart(width, '0')}`);
+    expect(result.nodes.at(-1)!.uri).toBe(`noriq://task/n${String(CONSTELLATION_NODE_CEILING - 1).padStart(width, '0')}`);
+    expect(result.nodes.some((n) => n.uri === `noriq://task/n${String(CONSTELLATION_NODE_CEILING).padStart(width, '0')}`)).toBe(false);
   });
 
   it('returns exactly CONSTELLATION_EDGE_CEILING edges when surviving edges exceed it, independent of node truncation', () => {
-    // 20 nodes * 19 non-self pairs * 10 edge types = 3800 possible edges — comfortably past
-    // CONSTELLATION_EDGE_CEILING + 1 (2001) so the `break outer` below always has enough supply.
-    const nodeCount = 20;
+    // A complete directed graph sized from the exported ceiling always supplies one excess edge.
+    const nodeCount = Math.ceil(Math.sqrt(CONSTELLATION_EDGE_CEILING + 1)) + 2;
     const nodes = Array.from({ length: nodeCount }, (_, i) => node(`noriq://task/n${i}`, 'task'));
-    const types = ['depends_on', 'imports', 'calls', 'tests', 'implements', 'modifies', 'related_to', 'blocks', 'contradicts', 'supersedes'];
+    const types = ['depends_on'];
     const edges: ConstellationRawEdge[] = [];
     outer: for (const type of types) {
       for (let i = 0; i < nodeCount; i++) {
@@ -135,8 +139,8 @@ describe('constellation (pure) — determinism and the explicit tie-break', () =
 describe('constellation (pure) — PLNR-339 relationship and memory preservation', () => {
   it('reserves memory representation even when connected coordination nodes would otherwise fill the ceiling', () => {
     const memories = Array.from({ length: 400 }, (_, i) => node(`noriq://memory/m${String(i).padStart(4, '0')}`, 'memory'));
-    const tasks = Array.from({ length: 1000 }, (_, i) => node(`noriq://task/t${String(i).padStart(4, '0')}`, 'task'));
-    const edges = Array.from({ length: 500 }, (_, i) => edge('related_to', tasks[i * 2]!.uri, tasks[i * 2 + 1]!.uri));
+    const tasks = Array.from({ length: CONSTELLATION_NODE_CEILING }, (_, i) => node(`noriq://task/t${String(i).padStart(5, '0')}`, 'task'));
+    const edges = Array.from({ length: CONSTELLATION_NODE_CEILING / 2 }, (_, i) => edge('related_to', tasks[i * 2]!.uri, tasks[i * 2 + 1]!.uri));
     const memoryItems = memories.map((_, i) => ({ id: `m${String(i).padStart(4, '0')}`, kind: 'learning', authority: 1, validity: 'active' }));
 
     const result = constellation(1, { nodes: [...tasks, ...memories], edges, memoryItems, episodes: [] }, { codeGraphPopulated: true });
@@ -154,8 +158,8 @@ describe('constellation (pure) — PLNR-339 relationship and memory preservation
   });
 
   it('selects connected nodes with an endpoint so every returned connected star retains a visible relationship', () => {
-    const nodes = Array.from({ length: 1200 }, (_, i) => node(`noriq://task/t${String(i).padStart(4, '0')}`, 'task'));
-    const edges = Array.from({ length: 600 }, (_, i) => edge('related_to', nodes[i * 2]!.uri, nodes[i * 2 + 1]!.uri));
+    const nodes = Array.from({ length: CONSTELLATION_NODE_CEILING + 200 }, (_, i) => node(`noriq://task/t${String(i).padStart(5, '0')}`, 'task'));
+    const edges = Array.from({ length: nodes.length / 2 }, (_, i) => edge('related_to', nodes[i * 2]!.uri, nodes[i * 2 + 1]!.uri));
     const result = constellation(1, { nodes, edges, memoryItems: [], episodes: [] }, { codeGraphPopulated: true });
     const endpoints = new Set(result.edges.flatMap((e) => [e.fromNodeId, e.toNodeId]));
 

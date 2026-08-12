@@ -19,6 +19,7 @@ import {
   type ApiMemorySearchResult,
 } from '../api';
 import { MemoryStarMap } from './MemoryStarMap';
+import { CONSTELLATION_RESIDENT_NODE_BUDGET } from '@noriq-dev/shared';
 import {
   computeHighlight, computeStarMap, decodeStarMapSearchState, encodeStarMapSearchState, highlightStateFor,
   type StarMapInputEdge, type StarMapInputNode, type StarMapSearchState,
@@ -206,7 +207,7 @@ const queryInput = () => container.querySelector('input[placeholder^="search mem
 const baseCoverage = { complete: true, reasons: [] as ApiGraphCoverageReason[] };
 function constellationResponse(overrides: Partial<ApiConstellation>): ApiConstellation {
   return {
-    memoryRevision: 1, nodeCeiling: 1000, edgeCeiling: 2000,
+    memoryRevision: 1, nodeCeiling: CONSTELLATION_RESIDENT_NODE_BUDGET, edgeCeiling: CONSTELLATION_RESIDENT_NODE_BUDGET * 2,
     nodes: [], edges: [], omitted: { nodes: 0, edges: 0, edgesDanglingPruned: 0, codeEntitiesExcluded: 0 },
     coverage: baseCoverage, ...overrides,
   };

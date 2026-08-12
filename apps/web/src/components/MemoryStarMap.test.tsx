@@ -9,6 +9,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { api, type ApiConstellation, type ApiGraphCoverageReason } from '../api';
+import { CONSTELLATION_RESIDENT_NODE_BUDGET } from '@noriq-dev/shared';
 import { MemoryStarMap } from './MemoryStarMap';
 
 let container: HTMLDivElement;
@@ -40,8 +41,8 @@ const baseCoverage = { complete: true, reasons: [] as ApiGraphCoverageReason[] }
 function response(overrides: Partial<ApiConstellation>): ApiConstellation {
   return {
     memoryRevision: 1,
-    nodeCeiling: 1000,
-    edgeCeiling: 2000,
+    nodeCeiling: CONSTELLATION_RESIDENT_NODE_BUDGET,
+    edgeCeiling: CONSTELLATION_RESIDENT_NODE_BUDGET * 2,
     nodes: [],
     edges: [],
     omitted: { nodes: 0, edges: 0, edgesDanglingPruned: 0, codeEntitiesExcluded: 0 },

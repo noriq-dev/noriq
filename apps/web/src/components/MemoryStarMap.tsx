@@ -4,7 +4,7 @@
 // memory look like", never replaces the seeded neighborhood view.
 //
 // Rendering split (locked decision): the star FIELD — every star and every constellation line, up
-// to the endpoint's 1000-node/2000-edge ceiling — draws to a single <canvas> 2D context in one pass
+// to the shared resident-node budget and its 2x edge ceiling — draws to a single <canvas> 2D context in one pass
 // per frame. A DOM/SVG overlay carries ONLY labels (a bounded, budgeted subset — see
 // starmap-layout.ts's `selectLabels`), the selection focus ring, the hover tooltip, and the
 // accessible node list. Nothing here computes layout, encoding, or hit-testing itself — all of
