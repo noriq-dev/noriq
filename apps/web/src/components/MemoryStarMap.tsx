@@ -18,19 +18,22 @@
 // map reads correctly with colour vision removed entirely (locked decision, PLNR-271's rule).
 // Colour is layered on top only as a redundant, familiar cue: the same per-type colour family
 // MemoryGraph.tsx's NODE_TYPE_META already uses, so a human reading both views sees one
-// consistent vocabulary. Layout is a fixed, seeded-from-uri radial-by-type arrangement with a
-// bounded relaxation pass (starmap-layout.ts) — never a live force simulation — so a "twinkle"
+// consistent vocabulary. Layout is a fixed, graph-derived cluster arrangement with bounded
+// deterministic relaxation (starmap-layout.ts) — never a live force simulation — so a "twinkle"
 // ambient animation here is purely a time-based brightness modulation, never a position change,
 // and is fully disabled under `prefers-reduced-motion: reduce`.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError, type ApiConstellation, type ApiMemoryHit, type ApiMemoryRepository } from '../api';
 import {
   applyPins, computeHighlight, DEFAULT_CAMERA, DEFAULT_STAR_MAP_PREFS,
+  clusterLabelBudget,
   decodeStarMapPrefs, decodeStarMapSearchState, encodeStarMapPrefs, encodeStarMapSearchState, fitCamera,
   highlightAlphaMultiplier, highlightStateFor, hitTest, screenToWorld, selectLabels, starShapeFor, worldToScreen,
-  clampZoom, type Camera, type ComputedStarMap, type LayoutStar, type StarMapHighlight, type StarMapPrefs,
+  selectClusterLabels,
+  clampZoom, type Camera, type ComputedStarMap, type LayoutCluster, type LayoutStar, type StarMapHighlight, type StarMapPrefs,
   type StarMapSearchState, type Viewport, computeStarMap,
 } from './starmap-layout';
+import { truncateConstellationLabel } from './constellation-3d-buffers';
 import { Button, Select, TextInput } from './ui';
 import { SectionLabel, MonoTag } from './bits';
 import { useTheme } from '../theme';
@@ -43,14 +46,24 @@ import { useTheme } from '../theme';
 const MEMORY_KINDS = ['learning', 'decision', 'failed_approach', 'procedure', 'requirement', 'hazard', 'unknown'] as const;
 
 const SEARCH_DEBOUNCE_MS = 250;
+const STAR_MAP_LAYOUT_PREF_VERSION = 2;
 
 const prefsKey = (pid: string) => `noriq.starmap.${pid}`;
 
 function loadPrefs(pid: string): StarMapPrefs {
-  try { return decodeStarMapPrefs(localStorage.getItem(prefsKey(pid))); } catch { return DEFAULT_STAR_MAP_PREFS; }
+  try {
+    const raw = localStorage.getItem(prefsKey(pid));
+    const prefs = decodeStarMapPrefs(raw);
+    const storedVersion = raw ? (JSON.parse(raw) as { layoutVersion?: number }).layoutVersion : undefined;
+    // PLNR-473 replaced type-ring coordinates with system discs. Old camera/pin coordinates are
+    // meaningless, but filters remain valid preferences and survive the one-time reframing.
+    return storedVersion === STAR_MAP_LAYOUT_PREF_VERSION ? prefs : { ...prefs, camera: null, pins: {} };
+  } catch { return DEFAULT_STAR_MAP_PREFS; }
 }
 function savePrefs(pid: string, prefs: StarMapPrefs) {
-  try { localStorage.setItem(prefsKey(pid), encodeStarMapPrefs(prefs)); } catch { /* private mode / quota — a nicety, never load-bearing */ }
+  try {
+    localStorage.setItem(prefsKey(pid), JSON.stringify({ ...JSON.parse(encodeStarMapPrefs(prefs)), layoutVersion: STAR_MAP_LAYOUT_PREF_VERSION }));
+  } catch { /* private mode / quota — a nicety, never load-bearing */ }
 }
 
 // Same per-type colour family MemoryGraph.tsx's NODE_TYPE_META already uses (a CSS var NAME, not
@@ -175,6 +188,20 @@ function draw(canvas: HTMLCanvasElement, s: DrawState, now: number) {
   const posOf = (star: LayoutStar): { x: number; y: number } =>
     s.dragOverride && s.dragOverride.nodeId === star.nodeId ? { x: s.dragOverride.x, y: s.dragOverride.y } : star;
 
+  // Systems are compositional regions, not extra interactive objects. Mini-clusters receive the
+  // same quiet disc but no fabricated sun/label; seeded plan/memory systems carry those below.
+  for (const cluster of s.layout.clusters) {
+    const anchor = cluster.anchorNodeId ? s.layout.byNodeId.get(cluster.anchorNodeId) : null;
+    const color = anchor ? s.palette.typeColor[anchor.type] ?? s.palette.textDim : s.palette.textDim;
+    ctx.fillStyle = hexToRgba(color, anchor ? 0.045 : 0.025);
+    ctx.strokeStyle = hexToRgba(color, anchor ? 0.2 : 0.1);
+    ctx.lineWidth = 1 / s.camera.zoom;
+    ctx.beginPath();
+    ctx.arc(cluster.x, cluster.y, cluster.radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  }
+
   if (s.showEdges) {
     ctx.lineWidth = 1 / s.camera.zoom;
     for (const e of s.layout.edges) {
@@ -222,6 +249,18 @@ function draw(canvas: HTMLCanvasElement, s: DrawState, now: number) {
     ctx.save();
     ctx.translate(p.x, p.y);
     ctx.globalAlpha = brightness;
+
+    if (star.clusterRole === 'sun') {
+      const glow = ctx.createRadialGradient(0, 0, star.visual.radius * 0.2, 0, 0, star.visual.radius * 2.8);
+      glow.addColorStop(0, hexToRgba(color, 0.55));
+      glow.addColorStop(1, hexToRgba(color, 0));
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = glow;
+      ctx.beginPath();
+      ctx.arc(0, 0, star.visual.radius * 2.8, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = brightness;
+    }
 
     if (star.visual.halo !== 'none') {
       ctx.save();
@@ -286,7 +325,26 @@ function StarLabel({ star, camera, viewport, dim }: { star: LayoutStar; camera: 
         opacity: dim ? 0.35 : 0.9, textShadow: '0 1px 3px var(--bg)',
       }}
     >
-      {star.label.length > 26 ? `${star.label.slice(0, 25)}…` : star.label}
+      {truncateConstellationLabel(star.label, 26)}
+    </div>
+  );
+}
+
+function ClusterLabel({ cluster, camera, viewport }: { cluster: LayoutCluster; camera: Camera; viewport: Viewport }) {
+  if (!cluster.label) return null;
+  const p = worldToScreen(cluster, camera, viewport);
+  return (
+    <div style={{
+      position: 'absolute', left: p.x, top: p.y - cluster.radius * camera.zoom - 8,
+      transform: 'translate(-50%, -100%)', pointerEvents: 'none', whiteSpace: 'nowrap',
+      maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', fontFamily: 'var(--mono)',
+      fontSize: 10.5, fontWeight: 650, color: 'var(--text-soft)', opacity: 0.95,
+      textShadow: '0 1px 4px var(--bg)',
+    }}>
+      {cluster.label}
+      <span style={{ marginLeft: 7, fontSize: 8.5, color: 'var(--text-faint)', fontWeight: 500 }}>
+        {cluster.memberNodeIds.length.toLocaleString()}
+      </span>
     </div>
   );
 }
@@ -513,13 +571,17 @@ export function MemoryStarMap({
   }, []);
 
   const [camera, setCamera] = useState<Camera>(() => prefs.camera ?? DEFAULT_CAMERA);
+  const fittedClusterCamera = useMemo(
+    () => layout ? fitCamera(layout.clusterBounds, viewport, 36) : DEFAULT_CAMERA,
+    [layout, viewport],
+  );
   const autoFitDone = useRef(false);
   useEffect(() => {
     if (autoFitDone.current || prefs.camera || !layout || layout.stars.length === 0) return;
     autoFitDone.current = true;
-    setCamera(fitCamera(layout.bounds, viewport));
+    setCamera(fittedClusterCamera);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [layout, viewport]);
+  }, [layout, viewport, fittedClusterCamera]);
   useEffect(() => { autoFitDone.current = false; }, [pid]);
 
   const persistCamera = useCallback((c: Camera) => patchPrefs({ camera: c }), [patchPrefs]);
@@ -653,7 +715,7 @@ export function MemoryStarMap({
   };
   const resetView = () => {
     if (!layout) return;
-    const next = fitCamera(layout.bounds, viewport);
+    const next = fittedClusterCamera;
     setCamera(next);
     persistCamera(next);
     patchPrefs({ pins: {} });
@@ -671,9 +733,12 @@ export function MemoryStarMap({
     patchSearch({ selectedUri: selectedStar?.uri ?? null });
   }, [selectedStar?.uri, patchSearch, search.selectedUri]);
   const labelIds = useMemo(
-    () => (layout ? selectLabels(layout.stars, camera, viewport, LABEL_BUDGET, highlight?.matched) : new Set<string>()),
+    () => (layout ? selectLabels(layout.stars.filter((star) => star.clusterRole !== 'sun'), camera, viewport, LABEL_BUDGET, highlight?.matched) : new Set<string>()),
     [layout, camera, viewport, highlight],
   );
+  const clusterLabelIds = useMemo(() => layout ? selectClusterLabels(
+    layout.clusters, camera, viewport, clusterLabelBudget(camera.zoom, fittedClusterCamera.zoom),
+  ) : new Set<string>(), [layout, camera, viewport, fittedClusterCamera.zoom]);
 
   const groupKeys = useMemo(() => {
     if (!layout) return [];
@@ -761,6 +826,9 @@ export function MemoryStarMap({
             {layout && layout.stars.length === 0 && hiddenIsolated > 0 && (
               <CenteredNote icon="✦" title="No connected entities yet" body={`${hiddenIsolated.toLocaleString()} unconnected entities are hidden by this overview. Use “show isolated” to include them.`} />
             )}
+            {layout && layout.clusters.filter((cluster) => clusterLabelIds.has(cluster.id)).map((cluster) => (
+              <ClusterLabel key={cluster.id} cluster={cluster} camera={camera} viewport={viewport} />
+            ))}
             {layout && [...labelIds].map((id) => {
               const star = layout.byNodeId.get(id);
               if (!star) return null;

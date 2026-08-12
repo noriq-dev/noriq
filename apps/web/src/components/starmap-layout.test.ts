@@ -3,10 +3,10 @@
 // are provable ONLY against this DOM-free module (jsdom has no canvas 2D context).
 import { describe, expect, it } from 'vitest';
 import {
-  applyPins, clampZoom, computeStarMap, decodeStarMapPrefs, DEFAULT_STAR_MAP_PREFS, encodeStarMapPrefs,
+  applyPins, clampZoom, clusterLabelBudget, computeStarMap, decodeStarMapPrefs, DEFAULT_STAR_MAP_PREFS, deriveStarMapClusters, encodeStarMapPrefs,
   fitCamera, hashString, hitTest, MAX_ZOOM, MIN_ZOOM, RELAXATION_PASSES, screenToWorld, selectLabels,
-  starShapeFor, starVisual, worldToScreen,
-  type StarMapInputEdge, type StarMapInputNode,
+  selectClusterLabels, starMapClusterRadius, starShapeFor, starVisual, worldToScreen, STAR_MAP_CLUSTER_GAP, STAR_MAP_CLUSTER_LABEL_MAX_LENGTH,
+  STAR_MAP_DEFAULT_CLUSTER_LABEL_BUDGET, type LayoutCluster, type StarMapInputEdge, type StarMapInputNode,
 } from './starmap-layout';
 
 function node(overrides: Partial<StarMapInputNode> & { nodeId: string; uri: string }): StarMapInputNode {
@@ -94,44 +94,85 @@ describe('computeStarMap determinism', () => {
   });
 });
 
-describe('stability under an unrelated node change (locked decision)', () => {
-  // Two nodes of DIFFERENT types (different rings) with no edge between them. RING_GAP is sized
-  // so cross-ring local repulsion is provably impossible (see the module's doc comment) — this is
-  // the one case the module can GUARANTEE invariance for without needing to hand-verify hash
-  // outputs, and it is the general case a client observes when the server's importance sampling
-  // admits or drops one different, unrelated entity.
-  const task = node({ nodeId: 'task-a', uri: 'noriq://task/stable-task', groupKey: 'task', type: 'task' });
-  const memory = node({ nodeId: 'mem-a', uri: 'noriq://memory/stable-memory', groupKey: 'memory', type: 'memory' });
+describe('graph-derived systems (PLNR-473)', () => {
+  const planA = node({ nodeId: 'plan-a', uri: 'noriq://plan/a', type: 'plan', groupKey: 'plan', label: 'Security &amp; correctness remediation with a deliberately long title' });
+  const planB = node({ nodeId: 'plan-b', uri: 'noriq://plan/b', type: 'plan', groupKey: 'plan', label: 'Delivery' });
+  const a1 = node({ nodeId: 'a1', uri: 'noriq://task/a1' });
+  const a2 = node({ nodeId: 'a2', uri: 'noriq://task/a2' });
+  const tie = node({ nodeId: 'tie', uri: 'noriq://task/tie' });
+  const b1 = node({ nodeId: 'b1', uri: 'noriq://task/b1' });
+  const edges: StarMapInputEdge[] = [
+    { type: 'related_to', fromNodeId: 'plan-a', toNodeId: 'a1', provenance: null },
+    { type: 'related_to', fromNodeId: 'a1', toNodeId: 'a2', provenance: null },
+    { type: 'related_to', fromNodeId: 'plan-a', toNodeId: 'tie', provenance: null },
+    { type: 'related_to', fromNodeId: 'plan-b', toNodeId: 'tie', provenance: null },
+    { type: 'related_to', fromNodeId: 'plan-b', toNodeId: 'b1', provenance: null },
+  ];
 
-  it('leaves an unrelated, differently-typed star\'s position untouched when another node is added', () => {
-    const before = computeStarMap([task, memory], []);
-    const beforePos = before.byNodeId.get('task-a')!;
-
-    const extra = node({ nodeId: 'file-x', uri: 'noriq://file/unrelated-new-file', groupKey: 'file', type: 'file', degree: 9 });
-    const after = computeStarMap([task, memory, extra], []);
-    const afterPos = after.byNodeId.get('task-a')!;
-
-    expect([afterPos.x, afterPos.y]).toEqual([beforePos.x, beforePos.y]);
-    // The memory star, also unrelated to the added file, is untouched too.
-    const memBefore = before.byNodeId.get('mem-a')!;
-    const memAfter = after.byNodeId.get('mem-a')!;
-    expect([memAfter.x, memAfter.y]).toEqual([memBefore.x, memBefore.y]);
+  it('assigns nearest-anchor membership and breaks equal-hop ties by canonical seed uri', () => {
+    const derived = deriveStarMapClusters([planB, tie, a2, planA, b1, a1], [...edges].reverse());
+    const aCluster = derived.clusters.find((cluster) => cluster.anchorNodeId === 'plan-a')!;
+    const bCluster = derived.clusters.find((cluster) => cluster.anchorNodeId === 'plan-b')!;
+    expect(aCluster.memberNodeIds).toEqual(['plan-a', 'a1', 'a2', 'tie']);
+    expect(bCluster.memberNodeIds).toEqual(['plan-b', 'b1']);
   });
 
-  it('leaves an unrelated star\'s position untouched when another node is removed', () => {
-    const extra = node({ nodeId: 'file-x', uri: 'noriq://file/unrelated-new-file', groupKey: 'file', type: 'file', degree: 9 });
-    const withExtra = computeStarMap([task, memory, extra], []);
-    const withoutExtra = computeStarMap([task, memory], []);
-    const a = withExtra.byNodeId.get('task-a')!;
-    const b = withoutExtra.byNodeId.get('task-a')!;
-    expect([a.x, a.y]).toEqual([b.x, b.y]);
+  it('turns seedless components of three into mini-clusters and leaves smaller fragments ambient', () => {
+    const loose = ['c1', 'c2', 'c3', 'dust-1', 'dust-2'].map((id) => node({ nodeId: id, uri: `noriq://task/${id}` }));
+    const looseEdges: StarMapInputEdge[] = [
+      { type: 'related_to', fromNodeId: 'c1', toNodeId: 'c2', provenance: null },
+      { type: 'related_to', fromNodeId: 'c2', toNodeId: 'c3', provenance: null },
+      { type: 'related_to', fromNodeId: 'dust-1', toNodeId: 'dust-2', provenance: null },
+    ];
+    const map = computeStarMap(loose, looseEdges);
+    expect(map.clusters).toHaveLength(1);
+    expect(map.clusters[0]).toMatchObject({ anchorNodeId: null, label: null });
+    expect(map.clusters[0]!.memberNodeIds).toHaveLength(3);
+    expect(map.ambientCount).toBe(2);
+    expect(map.byNodeId.get('dust-1')?.clusterRole).toBe('ambient');
   });
 
-  it('assigns a stable ring to a groupKey outside the current MemoryNodeType vocabulary, from its own hash alone', () => {
-    const odd = node({ nodeId: 'odd-1', uri: 'noriq://unknown/odd-1', groupKey: 'not-a-real-type', type: 'unknown' });
-    const a = computeStarMap([odd], []);
-    const b = computeStarMap([odd, node({ nodeId: 'odd-2', uri: 'noriq://unknown/odd-2', groupKey: 'not-a-real-type', type: 'unknown' })], []);
-    expect(a.byNodeId.get('odd-1')!.ring).toBe(b.byNodeId.get('odd-1')!.ring);
+  it('keeps every cluster disc separated by a real gap', () => {
+    const many = Array.from({ length: 9 }, (_, index) => node({
+      nodeId: `plan-${index}`, uri: `noriq://plan/${index}`, type: 'plan', groupKey: 'plan',
+    }));
+    const map = computeStarMap(many, []);
+    for (let i = 0; i < map.clusters.length; i++) for (let j = i + 1; j < map.clusters.length; j++) {
+      const a = map.clusters[i]!, b = map.clusters[j]!;
+      expect(Math.hypot(a.x - b.x, a.y - b.y) + 1e-6).toBeGreaterThanOrEqual(a.radius + b.radius + STAR_MAP_CLUSTER_GAP);
+    }
+  });
+
+  it('decodes and bounds anchor labels and makes the real anchor the centered sun', () => {
+    const map = computeStarMap([planA, a1], [edges[0]!]);
+    const cluster = map.clusters[0]!;
+    expect(cluster.label).toContain('&');
+    expect(cluster.label).not.toContain('&amp;');
+    expect(Array.from(cluster.label!).length).toBeLessThanOrEqual(STAR_MAP_CLUSTER_LABEL_MAX_LENGTH);
+    const sun = map.byNodeId.get('plan-a')!;
+    expect(sun.clusterRole).toBe('sun');
+    expect(sun.label).toContain('Security & correctness');
+    expect(sun.label).not.toContain('&amp;');
+    expect([sun.x, sun.y]).toEqual([cluster.x, cluster.y]);
+    expect(sun.visual.radius).toBeGreaterThan(map.byNodeId.get('a1')!.visual.radius);
+  });
+
+  it('leaves cluster A byte-identical when a member is added only to cluster B', () => {
+    const before = computeStarMap([planA, a1, a2, planB, b1], edges.filter((edge) => edge.toNodeId !== 'tie' && edge.fromNodeId !== 'tie'));
+    const b2 = node({ nodeId: 'b2', uri: 'noriq://task/b2' });
+    const after = computeStarMap(
+      [planA, a1, a2, planB, b1, b2],
+      [...edges.filter((edge) => edge.toNodeId !== 'tie' && edge.fromNodeId !== 'tie'), { type: 'related_to', fromNodeId: 'plan-b', toNodeId: 'b2', provenance: null }],
+    );
+    for (const id of ['plan-a', 'a1', 'a2']) {
+      const a = before.byNodeId.get(id)!, b = after.byNodeId.get(id)!;
+      expect([b.x, b.y]).toEqual([a.x, a.y]);
+    }
+  });
+
+  it('scales system discs with sqrt membership while keeping a finite cap', () => {
+    expect(starMapClusterRadius(216)).toBeGreaterThan(starMapClusterRadius(8));
+    expect(starMapClusterRadius(100_000)).toBe(220);
   });
 });
 
@@ -251,8 +292,7 @@ describe('selectLabels', () => {
     node({ nodeId: `n${i}`, uri: `noriq://task/t${i}`, groupKey: 'task', degree: i }));
   const map = computeStarMap(nodes, []);
   const camera = { x: 0, y: 0, zoom: 1 };
-  // Same groupKey ('task') rings all 10 stars at radius up to RING_BASE + ring*RING_GAP +
-  // RING_JITTER; large enough on every side that every star lands on-screen regardless of angle.
+  // Wide enough to include the deterministic ambient outer field regardless of seeded angle.
   const viewport = { width: 6000, height: 6000 };
 
   it('never exceeds the given budget', () => {
@@ -266,6 +306,49 @@ describe('selectLabels', () => {
     // The single highest-degree node is n9 (degree 9) — unless a screen collision knocked it out,
     // which can't happen when it's the only pick.
     expect(id).toBe('n9');
+  });
+});
+
+describe('cluster label budget and framing', () => {
+  const cluster = (id: string, x: number, memberCount: number, label = `System ${id}`): LayoutCluster => ({
+    id, x, y: 100, radius: 40, anchorNodeId: `anchor-${id}`, label,
+    memberNodeIds: Array.from({ length: memberCount }, (_, index) => `${id}-${index}`),
+  });
+  const viewport = { width: 800, height: 500 };
+  const camera = { x: 100, y: 100, zoom: 1 };
+
+  it('ranks by member count before greedily rejecting projected label collisions', () => {
+    const selected = selectClusterLabels([
+      cluster('small', 100, 3, 'Small overlapping system'),
+      cluster('largest', 100, 80, 'Largest overlapping system'),
+      cluster('separate', 350, 12),
+    ], camera, viewport, 16);
+    expect(selected.has('largest')).toBe(true);
+    expect(selected.has('small')).toBe(false);
+    expect(selected.has('separate')).toBe(true);
+  });
+
+  it('honors the default cap and raises it as zoom increases', () => {
+    expect(clusterLabelBudget(0.4, 0.4)).toBe(STAR_MAP_DEFAULT_CLUSTER_LABEL_BUDGET);
+    expect(clusterLabelBudget(1.6, 0.4)).toBeGreaterThan(STAR_MAP_DEFAULT_CLUSTER_LABEL_BUDGET);
+  });
+
+  it('reveals more non-colliding system labels when projected spacing grows', () => {
+    const systems = [0, 70, 140, 210].map((x, index) => cluster(`c${index}`, x, 20 - index, 'A system label'));
+    const overview = selectClusterLabels(systems, camera, viewport, 16);
+    const zoomed = selectClusterLabels(systems, { ...camera, zoom: 2 }, viewport, 16);
+    expect(zoomed.size).toBeGreaterThan(overview.size);
+  });
+
+  it('fits the meaningful cluster field more tightly than the ambient outer field', () => {
+    const plan = node({ nodeId: 'frame-plan', uri: 'noriq://plan/frame', type: 'plan', groupKey: 'plan' });
+    const ambient = Array.from({ length: 80 }, (_, index) => node({ nodeId: `ambient-${index}`, uri: `noriq://task/ambient-${index}` }));
+    const map = computeStarMap([plan, ...ambient], []);
+    const clusterFit = fitCamera(map.clusterBounds, viewport, 36);
+    const wholeFieldFit = fitCamera(map.bounds, viewport, 36);
+    expect(clusterFit.zoom).toBeGreaterThan(wholeFieldFit.zoom);
+    expect(clusterFit.x).toBeCloseTo(map.clusters[0]!.x);
+    expect(clusterFit.y).toBeCloseTo(map.clusters[0]!.y);
   });
 });
 

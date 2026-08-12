@@ -156,6 +156,7 @@ describe('localStorage persistence (locked decision: noriq.* convention, never w
     expect(raw).toBeTruthy();
     const parsed = JSON.parse(raw!);
     expect(parsed.showEdges).toBe(false);
+    expect(parsed.layoutVersion).toBe(2);
   });
 
   it('restores persisted preferences on the next mount for the same project', async () => {

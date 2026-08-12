@@ -5,35 +5,26 @@
 // every engine, forever. MemoryStarMap.tsx (the canvas + DOM-overlay component) is the only
 // consumer of this module's canvas-facing values, and it never recomputes layout itself.
 //
-// --- Determinism (locked decision) ---------------------------------------------------------
-// A star's position is seeded from its `uri` — never `nodeId`, never its index in the response
-// array. `hashString`/`hashToUnit` below are ordinary integer arithmetic (Math.imul, no
-// Math.random, no Date, no iteration-order dependence), so they return the identical value on
-// every call, every engine, every process. `computeStarMap` runs the same fixed
-// `RELAXATION_PASSES` every time it is called — never a live per-frame simulation — so calling it
-// twice on byte-identical input rows produces byte-identical output positions.
+// --- PLNR-473 supersedes type rings (Montana, 2026-08-12) ----------------------------------
+// The radial-by-MemoryNodeType model made a sampled production graph look like one arbitrary
+// hairball: types are visual encodings, not systems. The fallback now derives systems solely from
+// its own bounded ApiConstellation payload. Plan/memory nodes seed a deterministic multi-source
+// BFS; seedless connected components of three or more become unsunned mini-clusters; the remaining
+// isolated fragments are ambient dust. This remains self-contained when constellation v2 is
+// unavailable and never borrows a hierarchy the response did not contain.
 //
-// --- Stability under an unrelated node change (locked decision) ---------------------------
-// A node's *ring* (its radial band) comes from `RING_ORDER`, a FIXED, static ordering over the
-// complete `MemoryNodeType` vocabulary — never from which types happen to appear in this
-// particular response. That is what stops an unrelated node of a *new* type from silently
-// reshuffling every other type's ring. Within relaxation, repulsion is LOCAL: two stars only push
-// on each other when they are within `INTERACTION_RADIUS` of one another, decided fresh from
-// current positions each pass (grid-bucketed, so the cost stays near-linear at the 300-node
-// ceiling). `RING_GAP` is chosen so that `RING_GAP - ringJitterMax(RING_GAP) > INTERACTION_RADIUS`
-// — by the reverse triangle inequality, two points at different ring radii are *always* farther
-// apart than that gap, so two stars in different rings can never land inside each other's
-// interaction radius, regardless of how many other stars exist. A star's position is therefore
-// fully determined by (a) its own uri's seed, (b) its ring (a static lookup, not data-dependent),
-// (c) spring pulls from its OWN edges, and (d) repulsion from same-ring neighbors within
-// `INTERACTION_RADIUS`. An unrelated star of a *different* type, added or removed anywhere in the
-// map, changes none of those four inputs for an unconnected star — its position is untouched.
-// Same-ring crowding can still shift a star's exact resting spot when a same-typed neighbor
-// appears very close to it — that is the necessary, honest cost of collision avoidance, not an
-// oversight.
+// Determinism/stability remain locked. Every total order is uri then nodeId, every scatter is
+// prefix-salted FNV-1a, and both member and disc relaxation run a fixed pass count. Clusters are
+// placed in canonical-anchor order and overlap resolution moves only the later disc; changing a
+// later unrelated cluster therefore cannot perturb an earlier cluster. Member relaxation is
+// scoped to one cluster, so adding a member to cluster B never changes cluster A's positions.
+// There is no Math.random, Date, response-index seed, or live per-frame simulation. The server's
+// current 1,000-node ceiling bounds all work; its sampling precedes this module and is intentionally
+// left unchanged, so this layout tells the truth about the returned sample rather than inventing
+// omitted cluster membership.
 // ---------------------------------------------------------------------------------------------
 
-import { MemoryNodeType } from '@noriq-dev/shared';
+import { decodeConstellationLabel, truncateConstellationLabel } from './constellation-3d-buffers';
 
 // --- Input shapes (mirror ApiConstellationNode/Edge in api.ts; kept structurally compatible
 // rather than imported, so this module can be unit-tested with zero dependency on api.ts). -----
@@ -77,42 +68,104 @@ export function hashString(input: string): number {
  *  give independent-looking values without needing a stateful PRNG (which would reintroduce an
  *  iteration-order dependency between calls). */
 function hashToUnit(seed: string, salt: string): number {
-  return hashString(`${seed}#${salt}`) / 0x100000000;
+  return hashString(`${salt}:${seed}`) / 0x100000000;
 }
 
-// --- Ring assignment (groupKey -> radial band) ---------------------------------------------
+// --- Graph-derived clusters ----------------------------------------------------------------
 
-/** The fixed, complete node-type vocabulary, in its declared order — NOT the set of groupKeys
- *  present in any one response. This is what makes ring assignment stable across reloads that add
- *  or drop node types from the sample (see module doc comment). */
-const RING_ORDER: readonly string[] = MemoryNodeType.options;
-
-export const RING_BASE = 90;
-/** Must exceed `INTERACTION_RADIUS` by more than the max radial jitter within a ring (see module
- *  doc comment's reverse-triangle-inequality argument) so cross-ring local repulsion is
- *  impossible by construction. */
-export const RING_GAP = 130;
-export const RING_JITTER = RING_GAP * 0.6;
+export const STAR_MAP_CLUSTER_LABEL_MAX_LENGTH = 40;
+export const STAR_MAP_CLUSTER_GAP = 52;
+export const STAR_MAP_AMBIENT_GAP = 180;
+export const STAR_MAP_CLUSTER_RELAXATION_PASSES = 18;
 export const INTERACTION_RADIUS = 46;
-
-function ringIndexFor(groupKey: string): number {
-  const idx = RING_ORDER.indexOf(groupKey);
-  if (idx >= 0) return idx;
-  // Forward-compat: a groupKey outside the current MemoryNodeType vocabulary still gets a STABLE
-  // ring, derived only from its own string — never from what else is present in this response.
-  return RING_ORDER.length + (hashString(groupKey) % 8);
-}
-
-// --- Seeded initial placement ----------------------------------------------------------------
-
 interface WorldPoint { x: number; y: number; }
 
-function seedPosition(node: StarMapInputNode): WorldPoint {
-  const ring = ringIndexFor(node.groupKey);
-  const angle = hashToUnit(node.uri, 'angle') * Math.PI * 2;
-  const radialJitter = hashToUnit(node.uri, 'radius') * RING_JITTER;
-  const radius = RING_BASE + ring * RING_GAP + radialJitter;
-  return { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius };
+function compareNodes(a: StarMapInputNode, b: StarMapInputNode): number {
+  return a.uri < b.uri ? -1 : a.uri > b.uri ? 1 : a.nodeId < b.nodeId ? -1 : a.nodeId > b.nodeId ? 1 : 0;
+}
+
+export function starMapClusterRadius(memberCount: number): number {
+  return clamp(48 + 9 * Math.sqrt(Math.max(1, memberCount)), 58, 220);
+}
+
+interface DerivedCluster {
+  id: string;
+  anchorNodeId: string | null;
+  memberNodeIds: string[];
+}
+
+interface ClusterDerivation {
+  clusters: DerivedCluster[];
+  clusterIdByNodeId: Map<string, string>;
+  ambientNodeIds: Set<string>;
+}
+
+/** Deterministic nearest-anchor assignment. Because every edge costs one hop, a layer-synchronous
+ * queue ordered by seed uri implements the specified (hop, canonical seed uri) ordering. */
+export function deriveStarMapClusters(nodes: StarMapInputNode[], edges: StarMapInputEdge[]): ClusterDerivation {
+  const sortedNodes = [...nodes].sort(compareNodes);
+  const byId = new Map(sortedNodes.map((node) => [node.nodeId, node]));
+  const adjacency = new Map<string, string[]>();
+  for (const node of sortedNodes) adjacency.set(node.nodeId, []);
+  for (const edge of edges) {
+    if (!byId.has(edge.fromNodeId) || !byId.has(edge.toNodeId) || edge.fromNodeId === edge.toNodeId) continue;
+    adjacency.get(edge.fromNodeId)!.push(edge.toNodeId);
+    adjacency.get(edge.toNodeId)!.push(edge.fromNodeId);
+  }
+  for (const neighbors of adjacency.values()) {
+    neighbors.sort((a, b) => compareNodes(byId.get(a)!, byId.get(b)!));
+  }
+
+  const seeds = sortedNodes.filter((node) => node.type === 'memory' || node.type === 'plan');
+  const owner = new Map<string, string>();
+  let frontier = seeds.map((seed) => ({ nodeId: seed.nodeId, seedId: seed.nodeId }));
+  for (const seed of seeds) owner.set(seed.nodeId, seed.nodeId);
+  while (frontier.length > 0) {
+    const candidates = new Map<string, string>();
+    for (const item of frontier) {
+      for (const neighborId of adjacency.get(item.nodeId) ?? []) {
+        if (owner.has(neighborId)) continue;
+        const previous = candidates.get(neighborId);
+        if (!previous || compareNodes(byId.get(item.seedId)!, byId.get(previous)!) < 0) candidates.set(neighborId, item.seedId);
+      }
+    }
+    frontier = [...candidates].map(([nodeId, seedId]) => ({ nodeId, seedId }))
+      .sort((a, b) => compareNodes(byId.get(a.seedId)!, byId.get(b.seedId)!) || compareNodes(byId.get(a.nodeId)!, byId.get(b.nodeId)!));
+    for (const item of frontier) owner.set(item.nodeId, item.seedId);
+  }
+
+  const clusters: DerivedCluster[] = seeds.map((seed) => ({ id: `seed:${seed.uri}`, anchorNodeId: seed.nodeId, memberNodeIds: [] }));
+  const clusterBySeed = new Map(clusters.map((cluster) => [cluster.anchorNodeId!, cluster]));
+  for (const node of sortedNodes) {
+    const seedId = owner.get(node.nodeId);
+    if (seedId) clusterBySeed.get(seedId)!.memberNodeIds.push(node.nodeId);
+  }
+
+  const ambientNodeIds = new Set<string>();
+  const seen = new Set(owner.keys());
+  for (const start of sortedNodes) {
+    if (seen.has(start.nodeId)) continue;
+    const members: string[] = [];
+    const queue = [start.nodeId];
+    seen.add(start.nodeId);
+    while (queue.length > 0) {
+      const id = queue.shift()!;
+      members.push(id);
+      for (const neighbor of adjacency.get(id) ?? []) {
+        if (seen.has(neighbor)) continue;
+        seen.add(neighbor);
+        queue.push(neighbor);
+      }
+    }
+    members.sort((a, b) => compareNodes(byId.get(a)!, byId.get(b)!));
+    if (members.length >= 3) clusters.push({ id: `component:${byId.get(members[0]!)!.uri}`, anchorNodeId: null, memberNodeIds: members });
+    else for (const id of members) ambientNodeIds.add(id);
+  }
+
+  clusters.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  const clusterIdByNodeId = new Map<string, string>();
+  for (const cluster of clusters) for (const id of cluster.memberNodeIds) clusterIdByNodeId.set(id, cluster.id);
+  return { clusters, clusterIdByNodeId, ambientNodeIds };
 }
 
 // --- Bounded relaxation ------------------------------------------------------------------------
@@ -124,8 +177,8 @@ const SPRING_STRENGTH = 0.05;
 const REPULSION_STRENGTH = 0.6;
 const MAX_STEP_PER_PASS = 24;
 
-/** Buckets current positions into `INTERACTION_RADIUS`-sized grid cells so neighbor lookups stay
- *  near-linear instead of the O(n^2) an all-pairs scan would cost at the 300-node ceiling. */
+/** Buckets one cluster into `INTERACTION_RADIUS`-sized cells, keeping member relaxation near-linear
+ * at the current 1,000-node response ceiling. */
 function buildGrid(positions: Map<string, WorldPoint>): Map<string, string[]> {
   const grid = new Map<string, string[]>();
   for (const [nodeId, p] of positions) {
@@ -154,7 +207,9 @@ function neighborsOf(nodeId: string, p: WorldPoint, grid: Map<string, string[]>)
 /** Relax seeded positions in place (a fresh Map, never mutating the caller's). Each pass computes
  *  every delta from the CURRENT (pre-pass) positions and applies them all together afterward —
  *  order-independent, so iterating nodes/edges in any order gives the same result. */
-function relax(positions: Map<string, WorldPoint>, edgesByNodeId: StarMapInputEdge[]): Map<string, WorldPoint> {
+function relaxMembers(
+  positions: Map<string, WorldPoint>, edgesByNodeId: StarMapInputEdge[], radius: number, pinnedNodeId: string | null,
+): Map<string, WorldPoint> {
   const current = new Map(positions);
   for (let pass = 0; pass < RELAXATION_PASSES; pass++) {
     const delta = new Map<string, WorldPoint>();
@@ -163,8 +218,7 @@ function relax(positions: Map<string, WorldPoint>, edgesByNodeId: StarMapInputEd
       delta.set(id, { x: d.x + dx, y: d.y + dy });
     };
 
-    // Springs: pull edge endpoints toward SPRING_LENGTH apart. Only touches nodes that share a
-    // real edge — never an "unrelated" pair.
+    // Cross-system edges remain drawable but never distort either system's local composition.
     for (const e of edgesByNodeId) {
       const a = current.get(e.fromNodeId);
       const b = current.get(e.toNodeId);
@@ -175,12 +229,12 @@ function relax(positions: Map<string, WorldPoint>, edgesByNodeId: StarMapInputEd
       const force = (dist - SPRING_LENGTH) * SPRING_STRENGTH;
       const ux = dx / dist;
       const uy = dy / dist;
-      addDelta(e.fromNodeId, ux * force, uy * force);
-      addDelta(e.toNodeId, -ux * force, -uy * force);
+      if (e.fromNodeId !== pinnedNodeId) addDelta(e.fromNodeId, ux * force, uy * force);
+      if (e.toNodeId !== pinnedNodeId) addDelta(e.toNodeId, -ux * force, -uy * force);
     }
 
-    // Local repulsion: only among nodes within INTERACTION_RADIUS right now, via a spatial grid.
-    // RING_GAP is sized so this can never fire across two different rings (module doc comment).
+    // Local repulsion is deliberately scoped to this one system; another system can never enter
+    // this grid or perturb these resting positions.
     const grid = buildGrid(current);
     for (const [nodeId, p] of current) {
       for (const otherId of neighborsOf(nodeId, p, grid)) {
@@ -195,14 +249,79 @@ function relax(positions: Map<string, WorldPoint>, edgesByNodeId: StarMapInputEd
     }
 
     for (const [id, d] of delta) {
+      if (id === pinnedNodeId) continue;
       const p = current.get(id);
       if (!p) continue;
       const clampedDx = Math.max(-MAX_STEP_PER_PASS, Math.min(MAX_STEP_PER_PASS, d.x));
       const clampedDy = Math.max(-MAX_STEP_PER_PASS, Math.min(MAX_STEP_PER_PASS, d.y));
-      current.set(id, { x: p.x + clampedDx, y: p.y + clampedDy });
+      let x = p.x + clampedDx, y = p.y + clampedDy;
+      const distance = Math.hypot(x, y);
+      const maxDistance = Math.max(1, radius - 18);
+      if (distance > maxDistance) { x = x / distance * maxDistance; y = y / distance * maxDistance; }
+      current.set(id, { x, y });
     }
   }
   return current;
+}
+
+function initialClusterCenter(index: number): WorldPoint {
+  if (index === 0) return { x: 0, y: 0 };
+  const angle = index * Math.PI * (3 - Math.sqrt(5));
+  const radius = 170 * Math.sqrt(index);
+  return { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius };
+}
+
+/** Fixed-pass, one-way disc relaxation. Canonically earlier systems are landmarks; a later disc
+ * yields under overlap, which preserves the earlier system under an unrelated later change. */
+function placeClusterDiscs(clusters: DerivedCluster[]): Map<string, WorldPoint> {
+  const centers = new Map<string, WorldPoint>();
+  const radii = new Map(clusters.map((cluster) => [cluster.id, starMapClusterRadius(cluster.memberNodeIds.length)]));
+  clusters.forEach((cluster, index) => centers.set(cluster.id, initialClusterCenter(index)));
+  for (let pass = 0; pass < STAR_MAP_CLUSTER_RELAXATION_PASSES; pass++) {
+    for (let later = 1; later < clusters.length; later++) {
+      const cluster = clusters[later]!;
+      const point = centers.get(cluster.id)!;
+      for (let earlier = 0; earlier < later; earlier++) {
+        const fixed = clusters[earlier]!;
+        const fixedPoint = centers.get(fixed.id)!;
+        let dx = point.x - fixedPoint.x, dy = point.y - fixedPoint.y;
+        let distance = Math.hypot(dx, dy);
+        const required = radii.get(cluster.id)! + radii.get(fixed.id)! + STAR_MAP_CLUSTER_GAP;
+        if (distance >= required) continue;
+        if (distance < 0.001) {
+          const angle = hashToUnit(cluster.id, `separate:${fixed.id}`) * Math.PI * 2;
+          dx = Math.cos(angle); dy = Math.sin(angle); distance = 1;
+        }
+        point.x += dx / distance * (required - distance);
+        point.y += dy / distance * (required - distance);
+      }
+    }
+  }
+  // The fixed relaxation normally settles every disc. Make the invariant unconditional: any
+  // residual overlap tries later phyllotaxis sites, then a guaranteed clear right-hand site.
+  for (let later = 1; later < clusters.length; later++) {
+    const cluster = clusters[later]!;
+    const clusterRadius = radii.get(cluster.id)!;
+    const clearsEarlier = (candidate: WorldPoint) => clusters.slice(0, later).every((fixed) => {
+      const fixedPoint = centers.get(fixed.id)!;
+      return Math.hypot(candidate.x - fixedPoint.x, candidate.y - fixedPoint.y)
+        >= clusterRadius + radii.get(fixed.id)! + STAR_MAP_CLUSTER_GAP;
+    });
+    if (clearsEarlier(centers.get(cluster.id)!)) continue;
+    let placed = false;
+    for (let attempt = 1; attempt <= Math.max(256, clusters.length * 16); attempt++) {
+      const candidate = initialClusterCenter(later + attempt);
+      if (!clearsEarlier(candidate)) continue;
+      centers.set(cluster.id, candidate);
+      placed = true;
+      break;
+    }
+    if (!placed) {
+      const rightEdge = Math.max(...clusters.slice(0, later).map((fixed) => centers.get(fixed.id)!.x + radii.get(fixed.id)!));
+      centers.set(cluster.id, { x: rightEdge + STAR_MAP_CLUSTER_GAP + clusterRadius, y: 0 });
+    }
+  }
+  return centers;
 }
 
 // --- Visual encoding (locked decision: every load-bearing distinction carries a non-colour
@@ -261,8 +380,21 @@ export function starVisual(node: StarMapInputNode): StarVisual {
 export interface LayoutStar extends StarMapInputNode {
   x: number;
   y: number;
+  /** Retained as a rolling-client shape seam; type rings are superseded, so every value is -1. */
   ring: number;
+  clusterId: string | null;
+  clusterRole: 'sun' | 'member' | 'ambient';
   visual: StarVisual;
+}
+
+export interface LayoutCluster {
+  id: string;
+  anchorNodeId: string | null;
+  label: string | null;
+  x: number;
+  y: number;
+  radius: number;
+  memberNodeIds: string[];
 }
 
 export interface LayoutEdge {
@@ -276,11 +408,15 @@ export interface Bounds { minX: number; minY: number; maxX: number; maxY: number
 
 export interface ComputedStarMap {
   stars: LayoutStar[];
+  clusters: LayoutCluster[];
+  ambientCount: number;
   /** Edges whose BOTH endpoints resolved to a star in `stars` — mirrors the server's own
    *  dangling-edge pruning discipline, applied defensively here too (never trust a payload to be
    *  internally consistent). */
   edges: LayoutEdge[];
   bounds: Bounds;
+  /** Meaningful system discs only; the ambient outer field must not shrink default framing. */
+  clusterBounds: Bounds;
   /** nodeId -> LayoutStar. Built once, reused for edge endpoint lookup and hit-testing. */
   byNodeId: Map<string, LayoutStar>;
   /** uri -> LayoutStar. A SEPARATE index (locked decision: index by both, never derive one key
@@ -288,23 +424,70 @@ export interface ComputedStarMap {
   byUri: Map<string, LayoutStar>;
 }
 
-/** The one entry point: seed every node from its uri, relax a fixed number of passes, encode the
- *  visual channels, and index the result both ways. Call this ONCE per fetched constellation
- *  response (keyed by `memoryRevision` upstream) — never per frame, never per pan/zoom tick. */
+/** Derive systems, place non-overlapping discs, relax each system independently, then scatter
+ * ambient dust outside the clustered field. Call once per fetched memoryRevision, never/frame. */
 export function computeStarMap(nodes: StarMapInputNode[], edges: StarMapInputEdge[]): ComputedStarMap {
-  const seeded = new Map<string, WorldPoint>();
-  for (const n of nodes) seeded.set(n.nodeId, seedPosition(n));
+  const sortedNodes = [...nodes].sort(compareNodes);
+  const inputById = new Map(sortedNodes.map((node) => [node.nodeId, node]));
+  const validEdges = edges.filter((edge) => inputById.has(edge.fromNodeId) && inputById.has(edge.toNodeId));
+  const derivation = deriveStarMapClusters(sortedNodes, validEdges);
+  const clusterCenters = placeClusterDiscs(derivation.clusters);
+  const positions = new Map<string, WorldPoint>();
+  const clusters: LayoutCluster[] = [];
 
-  const validEdges = edges.filter((e) => seeded.has(e.fromNodeId) && seeded.has(e.toNodeId));
-  const relaxed = relax(seeded, validEdges);
+  for (const cluster of derivation.clusters) {
+    const center = clusterCenters.get(cluster.id)!;
+    const radius = starMapClusterRadius(cluster.memberNodeIds.length);
+    const local = new Map<string, WorldPoint>();
+    for (const nodeId of cluster.memberNodeIds) {
+      const node = inputById.get(nodeId)!;
+      if (nodeId === cluster.anchorNodeId) { local.set(nodeId, { x: 0, y: 0 }); continue; }
+      const angle = hashToUnit(node.uri, 'member-angle') * Math.PI * 2;
+      const distance = Math.sqrt(hashToUnit(node.uri, 'member-radius')) * Math.max(8, radius - 24);
+      local.set(nodeId, { x: Math.cos(angle) * distance, y: Math.sin(angle) * distance });
+    }
+    const members = new Set(cluster.memberNodeIds);
+    const localEdges = validEdges.filter((edge) => members.has(edge.fromNodeId) && members.has(edge.toNodeId));
+    const relaxed = relaxMembers(local, localEdges, radius, cluster.anchorNodeId);
+    for (const [nodeId, point] of relaxed) positions.set(nodeId, { x: center.x + point.x, y: center.y + point.y });
+    const anchor = cluster.anchorNodeId ? inputById.get(cluster.anchorNodeId) : null;
+    clusters.push({
+      id: cluster.id,
+      anchorNodeId: cluster.anchorNodeId,
+      label: anchor ? truncateConstellationLabel(anchor.label, STAR_MAP_CLUSTER_LABEL_MAX_LENGTH) : null,
+      x: center.x, y: center.y, radius, memberNodeIds: [...cluster.memberNodeIds],
+    });
+  }
+
+  let clusterExtent = 0;
+  for (const cluster of clusters) clusterExtent = Math.max(clusterExtent, Math.hypot(cluster.x, cluster.y) + cluster.radius);
+  const ambientBase = clusterExtent + STAR_MAP_AMBIENT_GAP;
+  const ambient = sortedNodes.filter((node) => derivation.ambientNodeIds.has(node.nodeId));
+  ambient.forEach((node, index) => {
+    const angle = hashToUnit(node.uri, 'ambient-angle') * Math.PI * 2;
+    const layer = Math.floor(index / 40);
+    const radius = ambientBase + 60 + layer * 72 + hashToUnit(node.uri, 'ambient-radius') * 55;
+    positions.set(node.nodeId, { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius });
+  });
 
   const byNodeId = new Map<string, LayoutStar>();
   const byUri = new Map<string, LayoutStar>();
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
 
   const stars: LayoutStar[] = nodes.map((n) => {
-    const p = relaxed.get(n.nodeId) ?? seedPosition(n);
-    const star: LayoutStar = { ...n, x: p.x, y: p.y, ring: ringIndexFor(n.groupKey), visual: starVisual(n) };
+    const p = positions.get(n.nodeId) ?? { x: 0, y: 0 };
+    const clusterId = derivation.clusterIdByNodeId.get(n.nodeId) ?? null;
+    const cluster = clusterId ? clusters.find((item) => item.id === clusterId) : null;
+    const clusterRole: LayoutStar['clusterRole'] = cluster?.anchorNodeId === n.nodeId ? 'sun' : clusterId ? 'member' : 'ambient';
+    const baseVisual = starVisual(n);
+    const visual = clusterRole === 'sun'
+      ? { ...baseVisual, radius: Math.max(18, Math.min(26, baseVisual.radius * 1.9)), brightness: 1 }
+      : clusterRole === 'ambient'
+        ? { ...baseVisual, radius: Math.max(2.5, baseVisual.radius * 0.72), brightness: Math.min(0.34, baseVisual.brightness * 0.42) }
+        : baseVisual;
+    const star: LayoutStar = {
+      ...n, label: decodeConstellationLabel(n.label), x: p.x, y: p.y, ring: -1, clusterId, clusterRole, visual,
+    };
     byNodeId.set(n.nodeId, star);
     byUri.set(n.uri, star);
     minX = Math.min(minX, p.x - star.visual.radius);
@@ -314,12 +497,28 @@ export function computeStarMap(nodes: StarMapInputNode[], edges: StarMapInputEdg
     return star;
   });
 
+  for (const cluster of clusters) {
+    minX = Math.min(minX, cluster.x - cluster.radius);
+    minY = Math.min(minY, cluster.y - cluster.radius);
+    maxX = Math.max(maxX, cluster.x + cluster.radius);
+    maxY = Math.max(maxY, cluster.y + cluster.radius);
+  }
+
   if (!stars.length) { minX = -1; minY = -1; maxX = 1; maxY = 1; }
+  const clusterBounds = clusters.length > 0 ? clusters.reduce<Bounds>((bounds, cluster) => ({
+    minX: Math.min(bounds.minX, cluster.x - cluster.radius),
+    minY: Math.min(bounds.minY, cluster.y - cluster.radius),
+    maxX: Math.max(bounds.maxX, cluster.x + cluster.radius),
+    maxY: Math.max(bounds.maxY, cluster.y + cluster.radius),
+  }), { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity }) : { minX, minY, maxX, maxY };
 
   return {
     stars,
+    clusters,
+    ambientCount: ambient.length,
     edges: validEdges.map((e) => ({ type: e.type, fromNodeId: e.fromNodeId, toNodeId: e.toNodeId, provenance: e.provenance })),
     bounds: { minX, minY, maxX, maxY },
+    clusterBounds,
     byNodeId,
     byUri,
   };
@@ -429,6 +628,47 @@ export function selectLabels(
     picked.add(s.nodeId);
   }
   return picked;
+}
+
+export const STAR_MAP_DEFAULT_CLUSTER_LABEL_BUDGET = 16;
+export const STAR_MAP_MAX_CLUSTER_LABEL_BUDGET = 48;
+
+/** Keep the fitted overview intentionally sparse, then reveal more names as the human zooms in. */
+export function clusterLabelBudget(currentZoom: number, fittedZoom: number): number {
+  const ratio = Math.max(1, currentZoom / Math.max(MIN_ZOOM, fittedZoom));
+  return Math.min(STAR_MAP_MAX_CLUSTER_LABEL_BUDGET, Math.floor(STAR_MAP_DEFAULT_CLUSTER_LABEL_BUDGET * Math.sqrt(ratio)));
+}
+
+/** Largest systems win scarce label space. Rectangles mirror ClusterLabel's fixed screen-space
+ * typography and projected position; rerunning this on camera changes naturally reveals labels. */
+export function selectClusterLabels(
+  clusters: LayoutCluster[], camera: Camera, viewport: Viewport, budget: number,
+): Set<string> {
+  const candidates = clusters.filter((cluster) => cluster.label).map((cluster) => {
+    const point = worldToScreen(cluster, camera, viewport);
+    const countCharacters = String(cluster.memberNodeIds.length).length;
+    const width = Math.min(270, Math.max(62, Array.from(cluster.label!).length * 6.4 + countCharacters * 5 + 16));
+    const height = 18;
+    const bottom = point.y - cluster.radius * camera.zoom - 8;
+    return { cluster, rect: { left: point.x - width / 2, right: point.x + width / 2, top: bottom - height, bottom } };
+  }).filter(({ rect }) => rect.right >= 0 && rect.left <= viewport.width && rect.bottom >= 0 && rect.top <= viewport.height)
+    .sort((a, b) => b.cluster.memberNodeIds.length - a.cluster.memberNodeIds.length
+      || (a.cluster.id < b.cluster.id ? -1 : a.cluster.id > b.cluster.id ? 1 : 0));
+
+  const selected = new Set<string>();
+  const occupied: Array<{ left: number; right: number; top: number; bottom: number }> = [];
+  const gap = 5;
+  for (const candidate of candidates) {
+    if (selected.size >= budget) break;
+    const collision = occupied.some((rect) => !(
+      candidate.rect.right + gap <= rect.left || candidate.rect.left >= rect.right + gap
+      || candidate.rect.bottom + gap <= rect.top || candidate.rect.top >= rect.bottom + gap
+    ));
+    if (collision) continue;
+    occupied.push(candidate.rect);
+    selected.add(candidate.cluster.id);
+  }
+  return selected;
 }
 
 // --- Preference (de)serialization — pure encode/decode only; the component owns the actual
