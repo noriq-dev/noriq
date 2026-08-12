@@ -111,6 +111,75 @@ export interface ExportMemorySnapshotResult {
   prefix: string;
 }
 
+export interface MemorySnapshotChunkWriteResult {
+  relKey: string;
+  key: string;
+  checksum: string;
+  serializedBytes: number;
+  compressedBytes: number;
+}
+
+/** Write one already-bounded JSONL chunk using the original PLNR-248 key/metadata/checksum
+ * contract. The session exporter and the legacy one-shot helper share this exact sink. */
+export async function writeMemorySnapshotChunk(opts: {
+  env: Env;
+  prefix: string;
+  table: string;
+  chunkIndex: number;
+  rowOffset: number;
+  rowCount: number;
+  jsonl: string;
+  serializedBytes?: number;
+}): Promise<MemorySnapshotChunkWriteResult> {
+  if (!opts.env.FILES) throw new Error('R2 (FILES) not configured');
+  const compressed = await gzip(opts.jsonl);
+  const relKey = `${opts.table}/chunk-${opts.chunkIndex}.jsonl.gz`;
+  const key = `${opts.prefix}/${relKey}`;
+  await opts.env.FILES.put(key, compressed, {
+    httpMetadata: { contentType: 'application/gzip' },
+    customMetadata: { table: opts.table, offset: String(opts.rowOffset), rows: String(opts.rowCount) },
+  });
+  return {
+    relKey,
+    key,
+    checksum: await sha256HexBytes(compressed),
+    serializedBytes: opts.serializedBytes ?? new TextEncoder().encode(opts.jsonl).byteLength,
+    compressedBytes: compressed.byteLength,
+  };
+}
+
+/** Assemble and publish the unchanged format-v1 manifest. This remains the final R2 write: until
+ * it succeeds, any chunks from an interrupted session are debris rather than a backup. */
+export async function writeMemorySnapshotManifest(opts: {
+  env: Env;
+  projectId: string;
+  schemaVersion: number;
+  memoryRevision: number;
+  tier: 'core' | 'full';
+  exportedAt: string;
+  tableCounts: Record<string, number>;
+  checksums: Record<string, string>;
+  r2EvidenceRefs: string[];
+}): Promise<ExportMemorySnapshotResult> {
+  if (!opts.env.FILES) throw new Error('R2 (FILES) not configured');
+  const prefix = backupPrefix(opts.projectId, opts.exportedAt);
+  const manifest = MemoryBackupManifest.parse({
+    formatVersion: MEMORY_BACKUP_FORMAT_VERSION,
+    projectMemorySchemaVersion: opts.schemaVersion,
+    projectId: opts.projectId,
+    memoryRevision: opts.memoryRevision,
+    exportedAt: opts.exportedAt,
+    tier: opts.tier,
+    tableCounts: opts.tableCounts,
+    checksums: opts.checksums,
+    activeIndexGenerations: [],
+    r2EvidenceRefs: opts.r2EvidenceRefs,
+  });
+  const manifestKey = `${prefix}/manifest.json`;
+  await opts.env.FILES.put(manifestKey, JSON.stringify(manifest), { httpMetadata: { contentType: 'application/json' } });
+  return { manifest, manifestKey, prefix };
+}
+
 /**
  * Export every BACKUP_TABLES table in bounded row batches, gzip each batch as its own R2
  * object, and write the manifest last. Throws if `env.FILES` is unbound — callers (the DO RPC,
@@ -118,7 +187,6 @@ export interface ExportMemorySnapshotResult {
  */
 export async function exportMemorySnapshot(opts: ExportMemorySnapshotOptions): Promise<ExportMemorySnapshotResult> {
   if (!opts.env.FILES) throw new Error('R2 (FILES) not configured');
-  const files = opts.env.FILES;
   const prefix = backupPrefix(opts.projectId, opts.exportedAt);
   const limit = opts.chunkRowLimit ?? MEMORY_BACKUP_CHUNK_ROWS;
 
@@ -134,39 +202,22 @@ export async function exportMemorySnapshot(opts: ExportMemorySnapshotOptions): P
     while (offset < total) {
       const rows = opts.readBatch(table, offset, limit);
       if (rows.length === 0) break; // defensive — a shrinking table mid-export stops cleanly
-      const jsonl = rows.map((r) => JSON.stringify(r)).join('\n');
-      const compressed = await gzip(jsonl);
-      const relKey = `${table}/chunk-${chunkIndex}.jsonl.gz`;
-      const key = `${prefix}/${relKey}`;
-      await files.put(key, compressed, {
-        httpMetadata: { contentType: 'application/gzip' },
-        customMetadata: { table, offset: String(offset), rows: String(rows.length) },
+      const written = await writeMemorySnapshotChunk({
+        env: opts.env, prefix, table, chunkIndex, rowOffset: offset, rowCount: rows.length,
+        jsonl: rows.map((r) => JSON.stringify(r)).join('\n'),
       });
-      checksums[relKey] = await sha256HexBytes(compressed);
-      r2EvidenceRefs.push(key);
+      checksums[written.relKey] = written.checksum;
+      r2EvidenceRefs.push(written.key);
       offset += rows.length;
       chunkIndex++;
     }
   }
 
-  const manifest = MemoryBackupManifest.parse({
-    formatVersion: MEMORY_BACKUP_FORMAT_VERSION,
-    projectMemorySchemaVersion: opts.schemaVersion,
-    projectId: opts.projectId,
-    memoryRevision: opts.memoryRevision,
-    exportedAt: opts.exportedAt,
-    tier: opts.tier,
-    tableCounts,
-    checksums,
-    // Phase 5 (PLNR-261/262) is what makes an index generation meaningfully "active" content —
-    // nothing here fabricates an entry before that exists.
-    activeIndexGenerations: [],
-    r2EvidenceRefs,
+  return writeMemorySnapshotManifest({
+    env: opts.env, projectId: opts.projectId, schemaVersion: opts.schemaVersion,
+    memoryRevision: opts.memoryRevision, tier: opts.tier, exportedAt: opts.exportedAt,
+    tableCounts, checksums, r2EvidenceRefs,
   });
-  const manifestKey = `${prefix}/manifest.json`;
-  await files.put(manifestKey, JSON.stringify(manifest), { httpMetadata: { contentType: 'application/json' } });
-
-  return { manifest, manifestKey, prefix };
 }
 
 /**

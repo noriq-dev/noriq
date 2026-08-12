@@ -49,7 +49,8 @@ import { onboarding } from './onboarding';
 import { z } from 'zod';
 import {
   listProjectRepositories, listRepositoryCheckouts, resolveRepositoryByKey, loadPriorEffort, searchHitToEvidenceItem,
-  getMemoryRegistry, memoryCapabilities, deriveRepositoryMemoryState, checkoutAssociationState, type ProjectMemoryStub, type MemoryReviewReason,
+  getMemoryRegistry, memoryCapabilities, deriveRepositoryMemoryState, checkoutAssociationState, runMemoryBackup,
+  type ProjectMemoryStub, type MemoryReviewReason,
 } from './lib/project-memory';
 import { renderEvidenceFrame, type EvidenceFrameItem } from './memory/evidence-frame';
 import { assembleContextPack } from './memory/context-pack';
@@ -507,7 +508,7 @@ app.post('/api/admin/backup', adminAuth, async (c) => {
 app.post('/api/admin/memory-backup/:projectId', adminAuth, async (c) => {
   const projectId = c.req.param('projectId')!;
   const tier = c.req.query('tier') === 'full' ? 'full' : 'core';
-  const res = await c.env.PROJECT_MEMORY.get(c.env.PROJECT_MEMORY.idFromName(projectId)).exportSnapshot(projectId, { tier });
+  const res = await runMemoryBackup(c.env, projectId, tier);
   return c.json(res, res.ok ? 200 : 503);
 });
 
@@ -1531,7 +1532,7 @@ const memoryStub = (env: Env, pid: string): ProjectMemoryStub =>
 
 // The FULLY-typed DO stub (env.PROJECT_MEMORY is DurableObjectNamespace<ProjectMemory> — see
 // env.ts) rather than the narrow ProjectMemoryStub interface above, for the PLNR-273 operator
-// routes below: they reach RPCs (listIndexGenerations, exportSnapshot, restoreSnapshot, rollback,
+// routes below: they reach RPCs (listIndexGenerations, restoreSnapshot, rollback,
 // activateIndexGeneration, abortIndexIngest, rebuildVectorIndex, pruneRetainedGeneration) that
 // ProjectMemoryStub was never widened to include, and adding ten more single-use method
 // signatures to that manually-maintained interface would cost more than it buys here — this
@@ -1781,7 +1782,7 @@ app.post('/api/projects/:pid/memory/backup', userAuth, async (c) => {
   if (!requireAdmin(c)) return c.json({ error: 'admin role required' }, 403);
   const pid = c.req.param('pid')!;
   const tier = c.req.query('tier') === 'full' ? 'full' : 'core';
-  const res = await memoryDO(c.env, pid).exportSnapshot(pid, { tier });
+  const res = await runMemoryBackup(c.env, pid, tier);
   return c.json(res, res.ok ? 200 : 503);
 });
 
@@ -5411,15 +5412,15 @@ export default {
           .all<{ project_id: string }>()
           .then(({ results }) =>
             Promise.all(
-              results.map((r) =>
-                env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(r.project_id))
-                  .exportSnapshot(r.project_id)
-                  .then((res) => {
-                    // eslint-disable-next-line no-console
-                    console.log(res.ok ? `[memory-backup] ${r.project_id} wrote ${res.manifestKey}` : `[memory-backup] ${r.project_id} skipped: ${res.reason}`);
-                  })
-                  .catch((err) => console.warn(`[memory-backup] ${r.project_id} failed: ${String(err)}`)),
-              ),
+              results.map((r) => runMemoryBackup(env, r.project_id, 'core', { alertOnFailure: true }).then((res) => {
+                if (res.ok) {
+                  console.log(`[memory-backup] ${r.project_id} wrote ${res.manifestKey} ${JSON.stringify(res.summary)}`);
+                } else if (res.reason === 'R2 (FILES) not configured') {
+                  console.log(`[memory-backup] ${r.project_id} skipped: ${res.reason}`);
+                } else {
+                  console.warn(JSON.stringify({ event: 'memory_backup_failed', projectId: r.project_id, reason: res.reason, summary: res.summary }));
+                }
+              })),
             ),
           )
           .catch((err) => console.warn(`[memory-backup] sweep failed: ${String(err)}`)),

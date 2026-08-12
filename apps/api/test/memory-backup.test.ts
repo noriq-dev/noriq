@@ -8,6 +8,10 @@ import type { Env } from '../src/env';
 import { createUser, mintTokenForUser, mcpCall, projectRoom } from './helpers';
 import { exportMemorySnapshot, verifyMemorySnapshot } from '../src/memory/backup';
 import { MemoryBackupManifest } from '@noriq-dev/shared';
+import { runMemoryBackup } from '../src/lib/project-memory';
+import {
+  BACKUP_TABLES, MEMORY_BACKUP_EXPORT_CHUNKS_PER_INVOCATION, MEMORY_BACKUP_EXPORT_SESSION_TTL_MS,
+} from '../src/do/ProjectMemory';
 
 const appEnv = env as unknown as Env;
 
@@ -24,6 +28,17 @@ interface MemoryRpc {
   exportSnapshot(pid: string, opts?: { tier?: 'core' | 'full' }): Promise<
     { ok: true; manifest: unknown; manifestKey: string } | { ok: false; reason: string }
   >;
+  exportBegin(pid: string, opts?: { tier?: 'core' | 'full' }): Promise<
+    { ok: true; exportId: string; sweptSessions: number } | { ok: false; reason: string }
+  >;
+  exportContinue(pid: string, exportId: string): Promise<{ ok: boolean; done?: boolean; reason?: string }>;
+  exportAbort(pid: string, exportId: string, reason?: string): Promise<{ ok: true }>;
+  restoreSnapshot(pid: string, input: { exportedAt: string }): Promise<{ ok: boolean; reason?: string }>;
+  _backdateExportSessionForTest(pid: string, exportId: string, updatedAt: string): Promise<{ ok: true }>;
+  _exportCopyTableCountForTest(pid: string, exportId: string): Promise<number>;
+  _seedBackupScaleForTest(pid: string, input: {
+    start: number; count: number; nodeCount: number; payloadBytes: number; evidencePerMemory?: number;
+  }): Promise<{ ok: true }>;
   writeNode(pid: string, input: { type: string; uri: string; label: string; actor: { kind: string; id: string | null } }): Promise<{ nodeId: string }>;
 }
 interface RoomRpc {
@@ -120,6 +135,72 @@ describe('exportSnapshot — end to end via the DO RPC', () => {
     expect(verifiedAfterDelete.ok).toBe(false);
     if (verifiedAfterDelete.ok) throw new Error('unreachable');
     expect(verifiedAfterDelete.problems.some((p) => p.includes('missing chunk'))).toBe(true);
+  });
+});
+
+describe('worker-driven multi-invocation export sessions (PLNR-456)', () => {
+  it('exports and restores a representative multi-chunk store without keyset skips or duplicates', async () => {
+    const { projectId } = await newOwnedProject('pm-backup-session-scale@example.com', 'PMBKSESS');
+    await memory(projectId).reconcile(projectId);
+    const baseline = await memory(projectId).health(projectId);
+    const rows = 1_000;
+    for (let start = 0; start < rows; start += 100) {
+      await memory(projectId)._seedBackupScaleForTest(projectId, {
+        start, count: 100, nodeCount: 300, payloadBytes: 5 * 1024, evidencePerMemory: 2,
+      });
+    }
+    const populated = await memory(projectId).health(projectId);
+    expect(populated.tableCounts.nodes).toBe((baseline.tableCounts.nodes ?? 0) + 300);
+    expect(populated.tableCounts.edges).toBe((baseline.tableCounts.edges ?? 0) + 299);
+    expect(populated.tableCounts.memory_items).toBe((baseline.tableCounts.memory_items ?? 0) + rows);
+    expect(populated.tableCounts.evidence).toBe((baseline.tableCounts.evidence ?? 0) + rows * 2);
+    expect(populated.tableCounts.episodes).toBe((baseline.tableCounts.episodes ?? 0) + rows);
+
+    const result = await runMemoryBackup(appEnv, projectId, 'full');
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.reason);
+    expect(result.summary.invocations).toBeGreaterThan(2); // begin + multiple fresh continue events
+    expect(result.summary.chunks).toBeGreaterThan(4);
+    expect(result.summary.invocations).toBeGreaterThanOrEqual(
+      Math.ceil(result.summary.chunks / MEMORY_BACKUP_EXPORT_CHUNKS_PER_INVOCATION) + 1,
+    );
+    expect(result.summary.rows).toBe(Object.values(result.manifest.tableCounts).reduce((sum, count) => sum + count, 0));
+    expect(result.summary.bytes).toBeGreaterThan(2 * 1024 * 1024);
+    expect(result.manifest.tableCounts.nodes).toBe(populated.tableCounts.nodes);
+    expect(result.manifest.tableCounts.edges).toBe(populated.tableCounts.edges);
+    expect(result.manifest.tableCounts.memory_items).toBe(populated.tableCounts.memory_items);
+    expect(result.manifest.tableCounts.evidence).toBe(populated.tableCounts.evidence);
+    expect(result.manifest.tableCounts.episodes).toBe(populated.tableCounts.episodes);
+    expect(Object.keys(result.manifest.tableCounts)).toEqual([...BACKUP_TABLES]);
+    expect(result.manifest.r2EvidenceRefs.filter((key) => key.includes('/memory_items/')).length).toBeGreaterThan(2);
+    expect(result.manifest.r2EvidenceRefs.filter((key) => key.includes('/episodes/')).length).toBeGreaterThan(2);
+    expect(await verifyMemorySnapshot(appEnv, result.manifest)).toEqual({ ok: true });
+
+    const restored = await memory(projectId).restoreSnapshot(projectId, { exportedAt: result.manifest.exportedAt });
+    expect(restored.ok).toBe(true);
+    const after = await memory(projectId).health(projectId);
+    for (const table of BACKUP_TABLES) {
+      expect(after.tableCounts[table]).toBe(populated.tableCounts[table]);
+    }
+  }, 60_000);
+
+  it('sweeps an abandoned session and drops all of its immutable copy tables at the next begin', async () => {
+    const { projectId } = await newOwnedProject('pm-backup-session-sweep@example.com', 'PMBKSWP');
+    const abandoned = await memory(projectId).exportBegin(projectId);
+    if (!abandoned.ok) throw new Error(abandoned.reason);
+    expect(await memory(projectId)._exportCopyTableCountForTest(projectId, abandoned.exportId)).toBe(BACKUP_TABLES.length);
+    await memory(projectId)._backdateExportSessionForTest(
+      projectId,
+      abandoned.exportId,
+      new Date(Date.now() - MEMORY_BACKUP_EXPORT_SESSION_TTL_MS - 1_000).toISOString(),
+    );
+
+    const replacement = await memory(projectId).exportBegin(projectId);
+    if (!replacement.ok) throw new Error(replacement.reason);
+    expect(replacement.sweptSessions).toBe(1);
+    expect(await memory(projectId)._exportCopyTableCountForTest(projectId, abandoned.exportId)).toBe(0);
+    expect(await memory(projectId).exportContinue(projectId, abandoned.exportId)).toMatchObject({ ok: false });
+    await memory(projectId).exportAbort(projectId, replacement.exportId, 'test cleanup');
   });
 });
 

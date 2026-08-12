@@ -200,9 +200,11 @@ describe('PLNR-273 operator action routes require the admin role', () => {
 
     const backupRes = await post(`/api/projects/${pid}/memory/backup`, cookie);
     expect(backupRes.status).toBe(200);
-    const backupBody = await backupRes.json() as { ok: boolean; manifestKey?: string };
+    const backupBody = await backupRes.json() as { ok: boolean; manifestKey?: string; summary?: { chunks: number; invocations: number; rows: number; durationMs: number } };
     expect(backupBody.ok).toBe(true);
     expect(typeof backupBody.manifestKey).toBe('string');
+    expect(backupBody.summary).toMatchObject({ invocations: expect.any(Number), chunks: expect.any(Number), rows: expect.any(Number), durationMs: expect.any(Number) });
+    expect(backupBody.summary!.invocations).toBeGreaterThanOrEqual(2);
 
     const rebuildRes = await post(`/api/projects/${pid}/memory/vectors/rebuild`, cookie);
     expect(rebuildRes.status).toBe(200);

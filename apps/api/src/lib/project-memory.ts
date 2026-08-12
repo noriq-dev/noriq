@@ -3,7 +3,9 @@
 // Possessing or forging a project_repositories row grants nothing — the check below always
 // runs first, at the Worker boundary, before env.PROJECT_MEMORY.get() is ever called.
 import type { Env } from '../env';
-import type { ProjectMemoryHealth, IndexGenerationSummary } from '../do/ProjectMemory';
+import type {
+  ProjectMemoryHealth, IndexGenerationSummary, MemoryBackupExportBeginResult, MemoryBackupExportContinueResult,
+} from '../do/ProjectMemory';
 import type { RankedHit } from '../memory/retrieval';
 import type { DuplicateWarning, EffortSummary, PriorEffortCase } from '../memory/similar-effort';
 import type {
@@ -626,6 +628,99 @@ export interface MemoryRegistrySummary {
   vectorDirty: boolean;
   sizeBytes: number | null;
   sizeStatus: 'ok' | 'warn' | 'critical';
+}
+
+export interface MemoryBackupRunSummary {
+  chunks: number;
+  invocations: number;
+  rows: number;
+  bytes: number;
+  compressedBytes: number;
+  durationMs: number;
+}
+
+export type MemoryBackupRunResult =
+  | { ok: true; manifest: import('@noriq-dev/shared').MemoryBackupManifest; manifestKey: string; summary: MemoryBackupRunSummary }
+  | { ok: false; reason: string; summary: MemoryBackupRunSummary };
+
+interface MemoryBackupSessionStub {
+  exportBegin(projectId: string, opts: { tier?: 'core' | 'full' }): Promise<MemoryBackupExportBeginResult>;
+  exportContinue(projectId: string, exportId: string): Promise<MemoryBackupExportContinueResult>;
+  exportAbort(projectId: string, exportId: string, reason?: string): Promise<{ ok: true }>;
+}
+
+const BACKUP_FAILURE_SIGNAL_TITLE = 'Project memory backup failed';
+
+async function surfaceMemoryBackupFailure(env: Env, projectId: string, reason: string, alert: boolean): Promise<void> {
+  if (reason === 'R2 (FILES) not configured') return;
+  const projectRoom = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName(projectId));
+  await projectRoom.updateMemoryBackupStatus(projectId, { ok: false }).catch((error) => {
+    console.warn(`[memory-backup] failed to update backup status for ${projectId}: ${String(error)}`);
+  });
+  if (!alert) return;
+  try {
+    const existing = await env.DB.prepare(
+      `SELECT id FROM signals
+       WHERE project_id = ?1 AND type = 'alert' AND status = 'open' AND title = ?2 LIMIT 1`,
+    ).bind(projectId, BACKUP_FAILURE_SIGNAL_TITLE).first<{ id: string }>();
+    if (existing) return;
+    await projectRoom.raiseSignal(
+      projectId,
+      { kind: 'system', id: 'system', name: 'system' },
+      {
+        type: 'alert', severity: 'critical', title: BACKUP_FAILURE_SIGNAL_TITLE,
+        body: `The scheduled ProjectMemory export did not produce a manifest. ${reason}`,
+      },
+    );
+  } catch (error) {
+    console.warn(`[memory-backup] failed to raise alert for ${projectId}: ${String(error)}`);
+  }
+}
+
+/** Drive one portable backup from the Worker, not from inside a Durable Object event. Every
+ * exportContinue stub call therefore receives a fresh DO CPU budget while the durable _meta
+ * session carries the keyset cursor and manifest inventory across invocations. */
+export async function runMemoryBackup(
+  env: Env,
+  projectId: string,
+  tier: 'core' | 'full' = 'core',
+  options: { alertOnFailure?: boolean } = {},
+): Promise<MemoryBackupRunResult> {
+  const summary: MemoryBackupRunSummary = { chunks: 0, invocations: 0, rows: 0, bytes: 0, compressedBytes: 0, durationMs: 0 };
+  const stub = env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)) as unknown as MemoryBackupSessionStub;
+  let exportId: string | null = null;
+  try {
+    summary.invocations++;
+    const begun = await stub.exportBegin(projectId, { tier });
+    summary.durationMs += begun.ok ? begun.metrics.durationMs : 0;
+    if (!begun.ok) {
+      await surfaceMemoryBackupFailure(env, projectId, begun.reason, options.alertOnFailure === true);
+      return { ok: false, reason: begun.reason, summary };
+    }
+    exportId = begun.exportId;
+    for (;;) {
+      summary.invocations++;
+      const continued = await stub.exportContinue(projectId, exportId);
+      if (!continued.ok) {
+        await stub.exportAbort(projectId, exportId, continued.reason).catch(() => {});
+        await surfaceMemoryBackupFailure(env, projectId, continued.reason, options.alertOnFailure === true);
+        return { ok: false, reason: continued.reason, summary };
+      }
+      summary.chunks += continued.metrics.chunks;
+      summary.rows += continued.metrics.rows;
+      summary.bytes += continued.metrics.bytes;
+      summary.compressedBytes += continued.metrics.compressedBytes;
+      summary.durationMs += continued.metrics.durationMs;
+      if (continued.done) {
+        return { ok: true, manifest: continued.manifest, manifestKey: continued.manifestKey, summary };
+      }
+    }
+  } catch (error) {
+    const reason = String(error);
+    if (exportId) await stub.exportAbort(projectId, exportId, reason).catch(() => {});
+    await surfaceMemoryBackupFailure(env, projectId, reason, options.alertOnFailure === true);
+    return { ok: false, reason, summary };
+  }
 }
 
 export async function getMemoryRegistry(env: Env, projectId: string): Promise<MemoryRegistrySummary | null> {

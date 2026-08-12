@@ -10,7 +10,10 @@ import {
   evidenceHash, type EpisodeLandingOutcome, type MemoryBackupManifest,
 } from '@noriq-dev/shared';
 import { projectCoordinationEvents, type ProjectedEvent } from '../lib/memory-projector';
-import { exportMemorySnapshot, sha256HexBytes } from '../memory/backup';
+import {
+  backupPrefix, MEMORY_BACKUP_CHUNK_ROWS, sha256HexBytes,
+  writeMemorySnapshotChunk, writeMemorySnapshotManifest,
+} from '../memory/backup';
 import { fetchManifest, readSnapshotChunks, checkManifestHeader } from '../memory/restore';
 import { deleteAllProjectBackups, sizeStatus, type EraseReport, type EraseStepResult } from '../memory/lifecycle';
 import { MEMORY_MIGRATIONS } from '../memory/migrations';
@@ -347,6 +350,70 @@ export const OPERATIONAL_TABLES = ['applied_operations', 'memory_revision', 'pro
  *  operational singletons (memory_revision, projector_cursor are one row each, chunked the same
  *  way as everything else rather than carved into bespoke manifest fields). */
 export const BACKUP_TABLES = [...CANONICAL_TABLES, ...OPERATIONAL_TABLES] as const;
+
+export const MEMORY_BACKUP_EXPORT_CHUNKS_PER_INVOCATION = 4;
+export const MEMORY_BACKUP_EXPORT_CHUNK_TARGET_BYTES = 2 * 1024 * 1024;
+export const MEMORY_BACKUP_EXPORT_READ_PAGE_ROWS = 32;
+export const MEMORY_BACKUP_EXPORT_SESSION_TTL_MS = 60 * 60 * 1000;
+const MEMORY_BACKUP_EXPORT_SESSION_KEY_PREFIX = 'backup_export_session:';
+
+export interface MemoryBackupExportInvocationMetrics {
+  chunks: number;
+  rows: number;
+  bytes: number;
+  compressedBytes: number;
+  durationMs: number;
+}
+
+export type MemoryBackupExportTotals = MemoryBackupExportInvocationMetrics;
+
+export type MemoryBackupExportBeginResult =
+  | { ok: false; reason: string }
+  | {
+    ok: true;
+    exportId: string;
+    sweptSessions: number;
+    metrics: MemoryBackupExportInvocationMetrics;
+  };
+
+export type MemoryBackupExportContinueResult =
+  | { ok: false; reason: string }
+  | {
+    ok: true;
+    done: false;
+    progress: { table: string | null; tableIndex: number; tableCount: number; cursor: number; chunkIndex: number };
+    metrics: MemoryBackupExportInvocationMetrics;
+    totals: MemoryBackupExportTotals;
+  }
+  | {
+    ok: true;
+    done: true;
+    manifest: MemoryBackupManifest;
+    manifestKey: string;
+    metrics: MemoryBackupExportInvocationMetrics;
+    totals: MemoryBackupExportTotals;
+  };
+
+interface MemoryBackupExportSession {
+  version: 1;
+  exportId: string;
+  projectId: string;
+  copyPrefix: string;
+  tier: 'core' | 'full';
+  exportedAt: string;
+  schemaVersion: number;
+  memoryRevision: number;
+  tableIndex: number;
+  cursor: number;
+  chunkIndex: number;
+  tableRowCount: number;
+  tableCounts: Record<string, number>;
+  checksums: Record<string, string>;
+  r2EvidenceRefs: string[];
+  totals: MemoryBackupExportTotals;
+  createdAt: string;
+  updatedAt: string;
+}
 
 export interface ConstellationGenerationData {
   lenses: HierarchyGenerationData[];
@@ -1317,57 +1384,334 @@ export class ProjectMemory extends DurableObject<Env> {
   // Portable snapshot export (PLNR-248)
   // ---------------------------------------------------------------------------
 
-  /**
-   * Export this project's canonical memory to R2 in bounded, checksummed chunks (see
-   * lib/memory/backup.ts for the pipeline itself — this method only supplies the two
-   * synchronous SQLite callbacks and the current schema/revision header fields; only this DO
-   * can read its own SQLite, so the pipeline can never open storage itself). Degrades
-   * gracefully with `{ ok: false, reason }` rather than throwing when R2 (FILES) is unbound —
-   * every other RPC on this DO keeps working with zero optional bindings (§20).
-   */
+  private exportSessionKey(exportId: string): string {
+    return `${MEMORY_BACKUP_EXPORT_SESSION_KEY_PREFIX}${exportId}`;
+  }
+
+  private assertExportCopyPrefix(prefix: string): void {
+    if (!/^export_[a-z0-9]+[a-z0-9_]*_$/.test(prefix)) throw new Error('invalid backup export copy prefix');
+  }
+
+  private readExportSession(exportId: string): MemoryBackupExportSession | null {
+    const row = this.ctx.storage.sql.exec<{ value: string }>(
+      `SELECT value FROM _meta WHERE key = ?1`, this.exportSessionKey(exportId),
+    ).toArray()[0];
+    if (!row) return null;
+    const session = JSON.parse(row.value) as MemoryBackupExportSession;
+    if (session.version !== 1 || session.exportId !== exportId) {
+      throw new Error(`invalid backup export session ${exportId}`);
+    }
+    this.assertExportCopyPrefix(session.copyPrefix);
+    return session;
+  }
+
+  private writeExportSession(session: MemoryBackupExportSession): void {
+    session.updatedAt = nowIso();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO _meta (key,value) VALUES (?1,?2)
+       ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
+      this.exportSessionKey(session.exportId), JSON.stringify(session),
+    );
+  }
+
+  private dropExportCopyTables(copyPrefix: string): void {
+    this.assertExportCopyPrefix(copyPrefix);
+    for (const table of BACKUP_TABLES) this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS ${copyPrefix}${table}`);
+  }
+
+  private sweepAbandonedExportSessions(now = Date.now()): number {
+    const rows = this.ctx.storage.sql.exec<{ key: string; value: string }>(
+      `SELECT key,value FROM _meta WHERE substr(key,1,length(?1)) = ?1`, MEMORY_BACKUP_EXPORT_SESSION_KEY_PREFIX,
+    ).toArray();
+    let swept = 0;
+    for (const row of rows) {
+      let session: MemoryBackupExportSession | null = null;
+      try { session = JSON.parse(row.value) as MemoryBackupExportSession; } catch { /* malformed sessions are deleted below */ }
+      const updated = session ? Date.parse(session.updatedAt) : Number.NaN;
+      if (Number.isFinite(updated) && now - updated <= MEMORY_BACKUP_EXPORT_SESSION_TTL_MS) continue;
+      if (session) this.dropExportCopyTables(session.copyPrefix);
+      this.ctx.storage.sql.exec(`DELETE FROM _meta WHERE key = ?1`, row.key);
+      swept++;
+    }
+    return swept;
+  }
+
+  /** Capture one immutable SQLite generation and durably register its producer cursor. R2 work
+   * starts only in exportContinue, so this invocation is bounded to the point-in-time copy. */
+  async exportBegin(
+    projectId: string,
+    opts: { tier?: 'core' | 'full' } = {},
+  ): Promise<MemoryBackupExportBeginResult> {
+    const started = performance.now();
+    await this.assertProjectId(projectId);
+    if (!this.env.FILES) return { ok: false, reason: 'R2 (FILES) not configured' };
+    const exportId = newId('export');
+    const copyPrefix = `${exportId}_`;
+    try {
+      let sweptSessions = 0;
+      this.ctx.storage.transactionSync(() => {
+        sweptSessions = this.sweepAbandonedExportSessions();
+        const exportedAt = nowIso();
+        const session: MemoryBackupExportSession = {
+          version: 1, exportId, projectId, copyPrefix, tier: opts.tier ?? 'core', exportedAt,
+          schemaVersion: this.readSchemaVersion(), memoryRevision: this.readMemoryRevision(),
+          tableIndex: 0, cursor: 0, chunkIndex: 0, tableRowCount: 0,
+          tableCounts: {}, checksums: {}, r2EvidenceRefs: [],
+          totals: { chunks: 0, rows: 0, bytes: 0, compressedBytes: 0, durationMs: 0 },
+          createdAt: exportedAt, updatedAt: exportedAt,
+        };
+        this.snapshotLiveInto(copyPrefix);
+        this.writeExportSession(session);
+      });
+      return {
+        ok: true, exportId, sweptSessions,
+        metrics: { chunks: 0, rows: 0, bytes: 0, compressedBytes: 0, durationMs: performance.now() - started },
+      };
+    } catch (error) {
+      await this.reportBackupStatus(projectId, false);
+      return { ok: false, reason: String(error) };
+    }
+  }
+
+  private readExportChunk(session: MemoryBackupExportSession, table: string): {
+    jsonl: string; rowCount: number; lastRowid: number; serializedBytes: number; tableDone: boolean;
+  } {
+    this.assertExportCopyPrefix(session.copyPrefix);
+    const lines: string[] = [];
+    const encoder = new TextEncoder();
+    let serializedBytes = 0;
+    let lastRowid = session.cursor;
+    let tableDone = false;
+    let byteBoundReached = false;
+    while (lines.length < MEMORY_BACKUP_CHUNK_ROWS && !byteBoundReached) {
+      const limit = Math.min(MEMORY_BACKUP_EXPORT_READ_PAGE_ROWS, MEMORY_BACKUP_CHUNK_ROWS - lines.length);
+      const rows = this.ctx.storage.sql.exec<Record<string, string | number | ArrayBuffer | null>>(
+        `SELECT rowid AS __noriq_backup_rowid,* FROM ${session.copyPrefix}${table}
+         WHERE rowid > ?1 ORDER BY rowid LIMIT ?2`,
+        lastRowid, limit,
+      ).toArray();
+      if (rows.length === 0) { tableDone = true; break; }
+      let consumed = 0;
+      for (const row of rows) {
+        const rowid = Number(row.__noriq_backup_rowid);
+        if (!Number.isSafeInteger(rowid) || rowid <= lastRowid) throw new Error(`${table}: invalid keyset rowid ${rowid}`);
+        const data = { ...row };
+        delete data.__noriq_backup_rowid;
+        const line = JSON.stringify(data);
+        const lineBytes = encoder.encode(line).byteLength + (lines.length > 0 ? 1 : 0);
+        if (lines.length > 0 && serializedBytes + lineBytes > MEMORY_BACKUP_EXPORT_CHUNK_TARGET_BYTES) {
+          byteBoundReached = true;
+          break;
+        }
+        lines.push(line);
+        serializedBytes += lineBytes;
+        lastRowid = rowid;
+        consumed++;
+        // A single row may exceed the approximate target; it is still one bounded restore row
+        // and must travel alone rather than making a live memory silently unbackuppable.
+        if (serializedBytes >= MEMORY_BACKUP_EXPORT_CHUNK_TARGET_BYTES) {
+          byteBoundReached = true;
+          break;
+        }
+      }
+      if (consumed === rows.length && rows.length < limit) tableDone = true;
+      if (consumed < rows.length) byteBoundReached = true;
+    }
+    return { jsonl: lines.join('\n'), rowCount: lines.length, lastRowid, serializedBytes, tableDone };
+  }
+
+  private completeExportTable(session: MemoryBackupExportSession, table: string): void {
+    session.tableCounts[table] = session.tableRowCount;
+    session.tableIndex++;
+    session.cursor = 0;
+    session.chunkIndex = 0;
+    session.tableRowCount = 0;
+  }
+
+  /** Produce at most four R2 chunks from an immutable copy. Every chunk commits its keyset
+   * cursor/checksum to _meta before the next begins, so a killed invocation repeats at most one
+   * deterministic object write and can never skip a row. */
+  async exportContinue(projectId: string, exportId: string): Promise<MemoryBackupExportContinueResult> {
+    const started = performance.now();
+    await this.assertProjectId(projectId);
+    const session = this.readExportSession(exportId);
+    if (!session) return { ok: false, reason: `backup export session ${exportId} not found` };
+    if (!this.env.FILES) return { ok: false, reason: 'R2 (FILES) not configured' };
+    const metrics: MemoryBackupExportInvocationMetrics = { chunks: 0, rows: 0, bytes: 0, compressedBytes: 0, durationMs: 0 };
+
+    while (metrics.chunks < MEMORY_BACKUP_EXPORT_CHUNKS_PER_INVOCATION && session.tableIndex < BACKUP_TABLES.length) {
+      const table = BACKUP_TABLES[session.tableIndex]!;
+      const chunk = this.readExportChunk(session, table);
+      if (chunk.rowCount === 0) {
+        this.completeExportTable(session, table);
+        this.writeExportSession(session);
+        continue;
+      }
+      const written = await writeMemorySnapshotChunk({
+        env: this.env,
+        prefix: backupPrefix(projectId, session.exportedAt),
+        table,
+        chunkIndex: session.chunkIndex,
+        rowOffset: session.tableRowCount,
+        rowCount: chunk.rowCount,
+        jsonl: chunk.jsonl,
+        serializedBytes: chunk.serializedBytes,
+      });
+      session.checksums[written.relKey] = written.checksum;
+      session.r2EvidenceRefs.push(written.key);
+      session.cursor = chunk.lastRowid;
+      session.chunkIndex++;
+      session.tableRowCount += chunk.rowCount;
+      metrics.chunks++;
+      metrics.rows += chunk.rowCount;
+      metrics.bytes += chunk.serializedBytes;
+      metrics.compressedBytes += written.compressedBytes;
+      session.totals.chunks++;
+      session.totals.rows += chunk.rowCount;
+      session.totals.bytes += chunk.serializedBytes;
+      session.totals.compressedBytes += written.compressedBytes;
+      if (chunk.tableDone) this.completeExportTable(session, table);
+      this.writeExportSession(session);
+    }
+
+    if (session.tableIndex >= BACKUP_TABLES.length) {
+      const result = await writeMemorySnapshotManifest({
+        env: this.env, projectId, schemaVersion: session.schemaVersion, memoryRevision: session.memoryRevision,
+        tier: session.tier, exportedAt: session.exportedAt, tableCounts: session.tableCounts,
+        checksums: session.checksums, r2EvidenceRefs: session.r2EvidenceRefs,
+      });
+      this.ctx.storage.transactionSync(() => {
+        this.dropExportCopyTables(session.copyPrefix);
+        this.ctx.storage.sql.exec(`DELETE FROM _meta WHERE key = ?1`, this.exportSessionKey(exportId));
+      });
+      await this.reportBackupStatus(projectId, true);
+      metrics.durationMs = performance.now() - started;
+      session.totals.durationMs += metrics.durationMs;
+      return { ok: true, done: true, manifest: result.manifest, manifestKey: result.manifestKey, metrics, totals: session.totals };
+    }
+
+    metrics.durationMs = performance.now() - started;
+    session.totals.durationMs += metrics.durationMs;
+    this.writeExportSession(session);
+    return {
+      ok: true,
+      done: false,
+      progress: {
+        table: BACKUP_TABLES[session.tableIndex] ?? null,
+        tableIndex: session.tableIndex,
+        tableCount: BACKUP_TABLES.length,
+        cursor: session.cursor,
+        chunkIndex: session.chunkIndex,
+      },
+      metrics,
+      totals: session.totals,
+    };
+  }
+
+  async exportAbort(projectId: string, exportId: string, reason = 'backup export aborted'): Promise<{ ok: true }> {
+    await this.assertProjectId(projectId);
+    const session = this.readExportSession(exportId);
+    if (session) {
+      this.ctx.storage.transactionSync(() => {
+        this.dropExportCopyTables(session.copyPrefix);
+        this.ctx.storage.sql.exec(`DELETE FROM _meta WHERE key = ?1`, this.exportSessionKey(exportId));
+      });
+    }
+    await this.reportBackupStatus(projectId, false);
+    console.warn(`[memory-backup] aborted ${projectId}/${exportId}: ${reason}`);
+    return { ok: true };
+  }
+
+  /** Compatibility seam for existing tests and small direct RPC consumers. Production route and
+   * cron callers use runMemoryBackup outside the DO; awaiting this loop here remains one event. */
   async exportSnapshot(
     projectId: string,
     opts: { tier?: 'core' | 'full' } = {},
   ): Promise<{ ok: true; manifest: MemoryBackupManifest; manifestKey: string } | { ok: false; reason: string }> {
-    await this.assertProjectId(projectId);
-    if (!this.env.FILES) return { ok: false, reason: 'R2 (FILES) not configured' };
-    // R2 writes yield between chunks, so paging directly over the live tables can otherwise
-    // mix revisions (and OFFSET can skip/duplicate rows as concurrent writes land). Materialize
-    // one constraint-free, point-in-time copy first; both header fields are captured in the same
-    // SQLite transaction as the rows they describe. A unique prefix also makes concurrent export
-    // calls independent.
-    const copyPrefix = `${newId('export')}_`;
-    let schemaVersion = 0;
-    let memoryRevision = 0;
+    const begun = await this.exportBegin(projectId, opts);
+    if (!begun.ok) return begun;
     try {
-      this.ctx.storage.transactionSync(() => {
-        schemaVersion = this.readSchemaVersion();
-        memoryRevision = this.readMemoryRevision();
-        this.snapshotLiveInto(copyPrefix);
-      });
-      const result = await exportMemorySnapshot({
-        env: this.env,
-        projectId,
-        schemaVersion,
-        memoryRevision,
-        tier: opts.tier ?? 'core',
-        exportedAt: nowIso(),
-        tables: BACKUP_TABLES,
-        readBatch: (table, offset, limit) =>
-          this.ctx.storage.sql.exec(`SELECT * FROM ${copyPrefix}${table} ORDER BY rowid LIMIT ?1 OFFSET ?2`, limit, offset).toArray(),
-        tableCount: (table) =>
-          this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${copyPrefix}${table}`).toArray()[0]?.n ?? 0,
-      });
-      await this.reportBackupStatus(projectId, true);
-      return { ok: true, manifest: result.manifest, manifestKey: result.manifestKey };
-    } catch (err) {
-      await this.reportBackupStatus(projectId, false);
-      return { ok: false, reason: String(err) };
-    } finally {
-      this.ctx.storage.transactionSync(() => {
-        for (const table of BACKUP_TABLES) this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS ${copyPrefix}${table}`);
-      });
+      for (;;) {
+        const continued = await this.exportContinue(projectId, begun.exportId);
+        if (!continued.ok) return continued;
+        if (continued.done) return { ok: true, manifest: continued.manifest, manifestKey: continued.manifestKey };
+      }
+    } catch (error) {
+      await this.exportAbort(projectId, begun.exportId, String(error));
+      return { ok: false, reason: String(error) };
     }
+  }
+
+  /** Test-only controls for abandoned-session cleanup without exposing arbitrary SQLite. */
+  async _backdateExportSessionForTest(projectId: string, exportId: string, updatedAt: string): Promise<{ ok: true }> {
+    await this.assertProjectId(projectId);
+    const session = this.readExportSession(exportId);
+    if (!session) throw new Error(`backup export session ${exportId} not found`);
+    session.updatedAt = updatedAt;
+    this.ctx.storage.sql.exec(`UPDATE _meta SET value = ?2 WHERE key = ?1`, this.exportSessionKey(exportId), JSON.stringify(session));
+    return { ok: true };
+  }
+
+  async _exportCopyTableCountForTest(projectId: string, exportId: string): Promise<number> {
+    await this.assertProjectId(projectId);
+    const prefix = `${exportId}_`;
+    this.assertExportCopyPrefix(prefix);
+    return this.ctx.storage.sql.exec<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND substr(name,1,length(?1)) = ?1`, prefix,
+    ).toArray()[0]?.n ?? 0;
+  }
+
+  /** Test-only representative backup population. Batches keep fixture creation itself below the
+   * same DO limits the producer test is meant to exercise; every row satisfies the live schema. */
+  async _seedBackupScaleForTest(
+    projectId: string,
+    input: { start: number; count: number; nodeCount: number; payloadBytes: number; evidencePerMemory?: number },
+  ): Promise<{ ok: true }> {
+    await this.assertProjectId(projectId);
+    const evidencePerMemory = input.evidencePerMemory ?? 2;
+    const payload = 'x'.repeat(Math.max(0, input.payloadBytes));
+    const createdAt = nowIso();
+    this.ctx.storage.transactionSync(() => {
+      for (let index = input.start; index < input.start + input.count; index++) {
+        if (index < input.nodeCount) {
+          this.ctx.storage.sql.exec(
+            `INSERT OR IGNORE INTO nodes (id,type,uri,label,created_at) VALUES (?1,'unknown',?2,?3,?4)`,
+            `backup_scale_node_${index}`, `noriq://unknown/backup-scale-${index}`, `Backup scale node ${index}`, createdAt,
+          );
+          if (index > 0) {
+            this.ctx.storage.sql.exec(
+              `INSERT OR IGNORE INTO edges (id,type,from_node_id,to_node_id,created_at,provenance)
+               VALUES (?1,'related_to',?2,?3,?4,'test:backup-scale')`,
+              `backup_scale_edge_${index}`, `backup_scale_node_${index - 1}`, `backup_scale_node_${index}`, createdAt,
+            );
+          }
+        }
+        const memoryId = `backup_scale_memory_${index}`;
+        this.ctx.storage.sql.exec(
+          `INSERT OR IGNORE INTO memory_items (id,kind,statement,authority,recorded_at)
+           VALUES (?1,'learning',?2,1,?3)`,
+          memoryId, `${index}:${payload}`, createdAt,
+        );
+        for (let evidenceIndex = 0; evidenceIndex < evidencePerMemory; evidenceIndex++) {
+          this.ctx.storage.sql.exec(
+            `INSERT OR IGNORE INTO evidence
+               (id,memory_item_id,repository_key,branch,base_id,path,verification_state,created_at)
+             VALUES (?1,?2,'backup-scale','main','base',?3,'valid',?4)`,
+            `backup_scale_evidence_${index}_${evidenceIndex}`, memoryId,
+            `src/backup-scale-${index}-${evidenceIndex}.ts`, createdAt,
+          );
+        }
+        this.ctx.storage.sql.exec(
+          `INSERT OR IGNORE INTO episodes
+             (id,run_id,task_id,repository_key,base_id,landing_outcome,review_rounds,cost_usd,acceptance_coverage,body,created_at,sitting)
+           VALUES (?1,?2,NULL,NULL,NULL,'landed',0,0,1,?3,?4,1)`,
+          `backup_scale_episode_${index}`, `backup_scale_run_${index}`,
+          JSON.stringify({ index, payload }), createdAt,
+        );
+      }
+      this.ctx.storage.sql.exec(`UPDATE memory_revision SET value = value + 1 WHERE id = 0`);
+    });
+    return { ok: true };
   }
 
   /** Project the backup outcome into the D1 registry via ProjectRoom (sole D1 writer per
@@ -3306,6 +3650,9 @@ export class ProjectMemory extends DurableObject<Env> {
             .exec<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'export!_%' ESCAPE '!'`)
             .toArray();
           for (const { name } of exportTables) this.ctx.storage.sql.exec(`DROP TABLE ${name}`);
+          this.ctx.storage.sql.exec(
+            `DELETE FROM _meta WHERE substr(key,1,length(?1)) = ?1`, MEMORY_BACKUP_EXPORT_SESSION_KEY_PREFIX,
+          );
           this.ctx.storage.sql.exec(`UPDATE _meta SET value = '0' WHERE key = 'has_prior_generation'`);
         });
         this.ingestEpisodes.clear();
