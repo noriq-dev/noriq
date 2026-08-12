@@ -1502,8 +1502,16 @@ app.post('/api/projects/:pid/tags/:tid/merge', userAuth, async (c) => {
 app.delete('/api/projects/:pid/tags/:tid', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).deleteTag(c.req.param('pid')!, humanActor(c), c.req.param('tid')!)));
 
-app.delete('/api/projects/:pid/plans/:plid', userAuth, async (c) =>
-  c.json(await room(c.env, c.req.param('pid')!).deletePlan(c.req.param('pid')!, humanActor(c), c.req.param('plid')!)));
+app.delete('/api/projects/:pid/plans/:plid', userAuth, async (c) => {
+  const body = await c.req.json<{ taskDisposition?: 'orphan' | 'delete' }>()
+    .catch((): { taskDisposition?: 'orphan' | 'delete' } => ({}));
+  if (body.taskDisposition !== undefined && body.taskDisposition !== 'orphan' && body.taskDisposition !== 'delete') {
+    return c.json({ error: 'taskDisposition must be orphan or delete' }, 400);
+  }
+  return c.json(await room(c.env, c.req.param('pid')!).deletePlan(
+    c.req.param('pid')!, humanActor(c), c.req.param('plid')!, body.taskDisposition ?? 'orphan',
+  ));
+});
 
 // Project docs (PLNR-158) — reads direct, writes through the DO.
 app.get('/api/projects/:pid/docs', userAuth, async (c) => {
@@ -2726,8 +2734,16 @@ app.get('/api/ask/generations/:generationId/stream', userAuth, async (c) => {
 });
 
 // Archive / restore a plan (PLNR-148) — display-only; see setPlanArchived.
-app.post('/api/projects/:pid/plans/:plid/archive', userAuth, async (c) =>
-  c.json(await room(c.env, c.req.param('pid')!).setPlanArchived(c.req.param('pid')!, humanActor(c), c.req.param('plid')!, true)));
+app.post('/api/projects/:pid/plans/:plid/archive', userAuth, async (c) => {
+  const body = await c.req.json<{ cancelOpenTasks?: boolean }>()
+    .catch((): { cancelOpenTasks?: boolean } => ({}));
+  if (body.cancelOpenTasks !== undefined && typeof body.cancelOpenTasks !== 'boolean') {
+    return c.json({ error: 'cancelOpenTasks must be a boolean' }, 400);
+  }
+  return c.json(await room(c.env, c.req.param('pid')!).setPlanArchived(
+    c.req.param('pid')!, humanActor(c), c.req.param('plid')!, true, { cancelOpenTasks: body.cancelOpenTasks },
+  ));
+});
 app.post('/api/projects/:pid/plans/:plid/restore', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).setPlanArchived(c.req.param('pid')!, humanActor(c), c.req.param('plid')!, false)));
 

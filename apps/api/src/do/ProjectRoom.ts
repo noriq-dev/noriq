@@ -3140,15 +3140,24 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
-  /** Archive / restore a plan (PLNR-148) — display-only, mirroring task archive:
-   *  everything (phases, membership, minted edges, gating) stays in force; the default
-   *  Plans listing just hides it. Restore brings it back. */
-  async setPlanArchived(projectId: string, actor: Actor, planId: string, archived: boolean) {
+  /** Archive / restore a plan (PLNR-148/446). Archiving normally remains display-only, but a
+   *  human may explicitly settle every open member task as cancelled in the same serialized
+   *  operation. Restore never changes task state. */
+  async setPlanArchived(
+    projectId: string,
+    actor: Actor,
+    planId: string,
+    archived: boolean,
+    opts: { cancelOpenTasks?: boolean } = {},
+  ) {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const plan = await this.env.DB.prepare('SELECT id, title FROM plans WHERE id = ? AND project_id = ?')
         .bind(planId, projectId).first<{ id: string; title: string }>();
       if (!plan) throw new Error('plan not found');
+      const cancelledTasks = archived && opts.cancelOpenTasks
+        ? await this.cancelOpenPlanTasksLocked(actor, planId)
+        : 0;
       // A RESTORE stamps archive_restored_at so it survives the auto-sweep (PLNR-225). The sweep
       // reads MAX(tasks.updated_at) as its completion proxy, and a restore moves none of that —
       // so without this marker the next snapshot re-derived "completed, settled long ago" and
@@ -3157,15 +3166,51 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.env.DB.prepare('UPDATE plans SET archived_at = ?, archive_restored_at = ? WHERE id = ?')
         .bind(archived ? nowIso() : null, archived ? null : nowIso(), planId).run();
       await this.emit(actor, archived ? 'plan.archived' : 'plan.restored', 'plan', planId, { title: plan.title });
-      return { ok: true, archived };
+      return { ok: true, archived, cancelledTasks };
     });
+  }
+
+  private async cancelOpenPlanTasksLocked(actor: Actor, planId: string): Promise<number> {
+    const { results: tasks } = await this.env.DB.prepare(
+      `SELECT DISTINCT t.id, t.key, t.title, t.status, t.claimed_by AS claimedBy
+       FROM phase_tasks pt
+       JOIN phases ph ON ph.id = pt.phase_id
+       JOIN tasks t ON t.id = pt.task_id
+       WHERE ph.plan_id = ? AND t.status NOT IN ('done', 'cancelled')`,
+    ).bind(planId).all<{ id: string; key: string; title: string; status: string; claimedBy: string | null }>();
+    if (!tasks.length) return 0;
+    const now = nowIso();
+    await this.env.DB.batch(tasks.flatMap((task) => [
+      this.env.DB.prepare(
+        `UPDATE tasks SET status = 'cancelled', failed_at = NULL, claimed_by = NULL,
+          claim_expires_at = NULL, updated_at = ? WHERE id = ?`,
+      ).bind(now, task.id),
+      this.env.DB.prepare('UPDATE claims SET released_at = ? WHERE task_id = ? AND released_at IS NULL')
+        .bind(now, task.id),
+    ]));
+    for (const task of tasks) {
+      await this.releaseLocksForTask(task.id, actor, 'plan archived with open tasks cancelled');
+      await this.emit(actor, 'task.status_changed', 'task', task.id, {
+        key: task.key, from: task.status, to: 'cancelled', title: task.title,
+        ...(task.claimedBy ? { previousHolder: task.claimedBy } : {}),
+        reason: 'plan archived',
+      });
+      this.notifyExternalDependents(await this.externalDependentsOf(task.id), { id: task.id, key: task.key });
+    }
+    await this.pumpLiveDispatches(actor);
+    return tasks.length;
   }
 
   /** Delete a plan + its phases/phase-links, including the dependency edges it minted
    *  to enforce phase order (PLNR-153) — a deleted plan must not leave tasks blocked by
-   *  debris nothing explains. Manual (NULL-provenance) edges survive; the underlying
-   *  tasks survive. */
-  async deletePlan(projectId: string, actor: Actor, planId: string)  {
+   *  debris nothing explains. Manual (NULL-provenance) edges survive. PLNR-446 makes task
+   *  disposition explicit: orphan keeps member tasks; delete permanently removes them. */
+  async deletePlan(
+    projectId: string,
+    actor: Actor,
+    planId: string,
+    taskDisposition: 'orphan' | 'delete' = 'orphan',
+  )  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const plan = await this.env.DB.prepare('SELECT id, title FROM plans WHERE id = ? AND project_id = ?')
@@ -3178,6 +3223,10 @@ export class ProjectRoom extends DurableObject<Env> {
         `SELECT pt.task_id AS taskId, pt.phase_id AS phaseId
          FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE ph.plan_id = ?`,
       ).bind(planId).all<{ taskId: string; phaseId: string }>();
+      const memberTaskIds = [...new Set(memberTasks.map((task) => task.taskId))];
+      if (taskDisposition === 'delete') {
+        for (const taskId of memberTaskIds) await this.deleteTaskLocked(actor, taskId);
+      }
       await this.env.DB.batch([
         this.env.DB.prepare('UPDATE execution_nodes SET plan_id = NULL WHERE plan_id = ?').bind(planId),
         // Gate rows before phases — the subselect needs the phases still present.
@@ -3188,13 +3237,17 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM plans WHERE id = ?').bind(planId),
       ]);
       await this.emit(actor, 'plan.deleted', 'plan', planId, { title: plan.title });
-      if (memberTasks.length) {
+      if (taskDisposition === 'orphan' && memberTasks.length) {
         await this.emit(actor, 'plan.tasks_unlinked', 'plan', planId, {
           planTitle: plan.title,
           links: memberTasks.map((t) => ({ taskId: t.taskId, planId, phaseId: t.phaseId })),
         });
       }
-      return { ok: true };
+      return {
+        ok: true,
+        deletedTasks: taskDisposition === 'delete' ? memberTaskIds.length : 0,
+        orphanedTasks: taskDisposition === 'orphan' ? memberTaskIds.length : 0,
+      };
     });
   }
 
@@ -3203,59 +3256,63 @@ export class ProjectRoom extends DurableObject<Env> {
   async deleteTask(projectId: string, actor: Actor, taskId: string)  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
-      const task = await this.getTask(taskId);
-      // R2 first (best-effort; not transactional with D1).
-      if (this.env.FILES) {
-        const { results } = await this.env.DB.prepare('SELECT r2_key AS key FROM attachments WHERE task_id = ?').bind(task.id).all<{ key: string }>();
-        for (const a of results) await this.env.FILES.delete(a.key).catch(() => {});
-      }
-      const id = task.id;
-      // Cross-project dependents snapshotted BEFORE the batch drops their edges (PLNR-241):
-      // a deleted blocker unblocks them, and their rooms need telling after the commit.
-      const externalDependents = await this.externalDependentsOf(id);
-      // PLNR-319: this task's plan/doc links, before the cascade drops them — the task NODE
-      // itself is not deleted from the graph (no listener does that today, same pre-existing
-      // gap `task.deleted` has always had), but its `related_to` edges must not survive it.
-      const { results: memberPlans } = await this.env.DB.prepare(
-        `SELECT ph.plan_id AS planId, pt.phase_id AS phaseId
-         FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE pt.task_id = ?`,
-      ).bind(id).all<{ planId: string; phaseId: string }>();
-      const { results: memberDocs } = await this.env.DB.prepare(
-        'SELECT doc_id AS docId FROM task_docs WHERE task_id = ?',
-      ).bind(id).all<{ docId: string }>();
-      await this.env.DB.batch([
-        this.env.DB.prepare('UPDATE execution_nodes SET task_id = NULL WHERE task_id = ?').bind(id),
-        this.env.DB.prepare('DELETE FROM phase_tasks WHERE task_id = ?').bind(id),
-        this.env.DB.prepare('DELETE FROM dependencies WHERE task_id = ? OR depends_on_task_id = ?').bind(id, id),
-        this.env.DB.prepare('DELETE FROM claims WHERE task_id = ?').bind(id),
-        this.env.DB.prepare('DELETE FROM file_locks WHERE task_id = ?').bind(id), // PLNR-203: task's locks die with it
-        this.env.DB.prepare('DELETE FROM comments WHERE task_id = ?').bind(id),
-        this.env.DB.prepare('DELETE FROM task_refs WHERE task_id = ?').bind(id),
-        this.env.DB.prepare('DELETE FROM task_tags WHERE task_id = ?').bind(id),
-        this.env.DB.prepare('DELETE FROM task_docs WHERE task_id = ?').bind(id),
-        this.env.DB.prepare('DELETE FROM attachments WHERE task_id = ?').bind(id),
-        this.env.DB.prepare('DELETE FROM signals WHERE task_id = ?').bind(id),
-        this.env.DB.prepare('UPDATE tasks SET parent_task_id = NULL WHERE parent_task_id = ?').bind(id),
-        this.env.DB.prepare('UPDATE messages SET ref_task_id = NULL WHERE ref_task_id = ?').bind(id),
-        this.env.DB.prepare('DELETE FROM tasks WHERE id = ?').bind(id),
-      ]);
-      await this.emit(actor, 'task.deleted', 'task', id, { key: task.key, title: task.title });
-      if (memberPlans.length) {
-        await this.emit(actor, 'plan.tasks_unlinked', 'task', id, {
-          taskTitle: task.title,
-          links: memberPlans.map((p) => ({ taskId: id, planId: p.planId, phaseId: p.phaseId })),
-        });
-      }
-      if (memberDocs.length) {
-        await this.emit(actor, 'task.docs_unlinked', 'task', id, {
-          taskTitle: task.title,
-          links: memberDocs.map((d) => ({ taskId: id, docId: d.docId })),
-        });
-      }
-      this.notifyExternalDependents(externalDependents, { id, key: task.key });
-      this.dropSearch('task', id);
-      return { ok: true, key: task.key };
+      return this.deleteTaskLocked(actor, taskId);
     });
+  }
+
+  private async deleteTaskLocked(actor: Actor, taskId: string) {
+    const task = await this.getTask(taskId);
+    // R2 first (best-effort; not transactional with D1).
+    if (this.env.FILES) {
+      const { results } = await this.env.DB.prepare('SELECT r2_key AS key FROM attachments WHERE task_id = ?').bind(task.id).all<{ key: string }>();
+      for (const a of results) await this.env.FILES.delete(a.key).catch(() => {});
+    }
+    const id = task.id;
+    // Cross-project dependents snapshotted BEFORE the batch drops their edges (PLNR-241):
+    // a deleted blocker unblocks them, and their rooms need telling after the commit.
+    const externalDependents = await this.externalDependentsOf(id);
+    // PLNR-319: this task's plan/doc links, before the cascade drops them — the task NODE
+    // itself is not deleted from the graph (no listener does that today, same pre-existing
+    // gap `task.deleted` has always had), but its `related_to` edges must not survive it.
+    const { results: memberPlans } = await this.env.DB.prepare(
+      `SELECT ph.plan_id AS planId, pt.phase_id AS phaseId
+       FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE pt.task_id = ?`,
+    ).bind(id).all<{ planId: string; phaseId: string }>();
+    const { results: memberDocs } = await this.env.DB.prepare(
+      'SELECT doc_id AS docId FROM task_docs WHERE task_id = ?',
+    ).bind(id).all<{ docId: string }>();
+    await this.env.DB.batch([
+      this.env.DB.prepare('UPDATE execution_nodes SET task_id = NULL WHERE task_id = ?').bind(id),
+      this.env.DB.prepare('DELETE FROM phase_tasks WHERE task_id = ?').bind(id),
+      this.env.DB.prepare('DELETE FROM dependencies WHERE task_id = ? OR depends_on_task_id = ?').bind(id, id),
+      this.env.DB.prepare('DELETE FROM claims WHERE task_id = ?').bind(id),
+      this.env.DB.prepare('DELETE FROM file_locks WHERE task_id = ?').bind(id), // PLNR-203: task's locks die with it
+      this.env.DB.prepare('DELETE FROM comments WHERE task_id = ?').bind(id),
+      this.env.DB.prepare('DELETE FROM task_refs WHERE task_id = ?').bind(id),
+      this.env.DB.prepare('DELETE FROM task_tags WHERE task_id = ?').bind(id),
+      this.env.DB.prepare('DELETE FROM task_docs WHERE task_id = ?').bind(id),
+      this.env.DB.prepare('DELETE FROM attachments WHERE task_id = ?').bind(id),
+      this.env.DB.prepare('DELETE FROM signals WHERE task_id = ?').bind(id),
+      this.env.DB.prepare('UPDATE tasks SET parent_task_id = NULL WHERE parent_task_id = ?').bind(id),
+      this.env.DB.prepare('UPDATE messages SET ref_task_id = NULL WHERE ref_task_id = ?').bind(id),
+      this.env.DB.prepare('DELETE FROM tasks WHERE id = ?').bind(id),
+    ]);
+    await this.emit(actor, 'task.deleted', 'task', id, { key: task.key, title: task.title });
+    if (memberPlans.length) {
+      await this.emit(actor, 'plan.tasks_unlinked', 'task', id, {
+        taskTitle: task.title,
+        links: memberPlans.map((p) => ({ taskId: id, planId: p.planId, phaseId: p.phaseId })),
+      });
+    }
+    if (memberDocs.length) {
+      await this.emit(actor, 'task.docs_unlinked', 'task', id, {
+        taskTitle: task.title,
+        links: memberDocs.map((d) => ({ taskId: id, docId: d.docId })),
+      });
+    }
+    this.notifyExternalDependents(externalDependents, { id, key: task.key });
+    this.dropSearch('task', id);
+    return { ok: true, key: task.key };
   }
 
   // ---------------------------------------------------------------------------
