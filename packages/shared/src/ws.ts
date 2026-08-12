@@ -4,6 +4,10 @@ import { ExecutionSpec } from './execution-spec';
 import { ExecutedConfigurationEvidence } from './intelligence';
 import {
   ExecutionReportAck,
+  MissionTaskAck,
+  MissionTaskBeginReport,
+  MissionTaskSettleReport,
+  MISSION_CAPABILITY,
   ORCHESTRATION_CAPABILITY,
   RunnerExecutionDeclaration,
   RunnerExecutionEventReport,
@@ -29,7 +33,7 @@ import {
 // Bump when the envelope shape changes incompatibly; sent in `hello` so the
 // server can reject or adapt to an out-of-date daemon.
 export const RUNNER_PROTOCOL_VERSION = 1;
-export const RUNNER_PROTOCOL_CAPABILITIES = [ORCHESTRATION_CAPABILITY] as const;
+export const RUNNER_PROTOCOL_CAPABILITIES = [ORCHESTRATION_CAPABILITY, MISSION_CAPABILITY] as const;
 
 // How a steer is injected into the live CLI session:
 //   soft — queue as the next user turn (the agent finishes its current thought)
@@ -119,6 +123,7 @@ export const RunnerServerMessage = z.discriminatedUnion('type', [
   z.object({ type: z.literal('pong') }),
 
   z.object({ type: z.literal('execution.ack'), ack: ExecutionReportAck }),
+  z.object({ type: z.literal('mission.task.ack'), ack: MissionTaskAck }),
 ]);
 export type RunnerServerMessage = z.infer<typeof RunnerServerMessage>;
 
@@ -191,6 +196,9 @@ export const RunnerClientMessage = z.discriminatedUnion('type', [
     runId: z.string(),
     reconciliation: RunnerExecutionReconciliation,
   }),
+
+  z.object({ type: z.literal('mission.task.begin'), runId: z.string(), begin: MissionTaskBeginReport }),
+  z.object({ type: z.literal('mission.task.settle'), runId: z.string(), settle: MissionTaskSettleReport }),
 
   // Live run telemetry (RUN-22): a high-frequency, non-transitional heartbeat of
   // spend + a rolling log tail, so the dashboard can show token/USD burn and the

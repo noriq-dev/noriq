@@ -8,6 +8,7 @@ import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import type { Actor, CreatePlanDispatchInput, CreateRunInput, PlanDispatchView, RunPatch, RunView } from '../src/do/ProjectRoom';
 import type { Env } from '../src/env';
+import type { MissionTaskAck, MissionTaskBeginReport, MissionTaskSettleReport } from '@noriq-dev/shared';
 import { taskClaimability } from '../src/lib/claimability';
 import { createUser, loginSession } from './helpers';
 
@@ -27,6 +28,8 @@ interface RoomRpc {
   claimTask(projectId: string, actor: Actor, taskId: string, agentId: string): Promise<{ key: string }>;
   releaseTask(projectId: string, actor: Actor, taskId: string, opts?: { toStatus?: string }): Promise<unknown>;
   updateTask(projectId: string, actor: Actor, taskId: string, patch: Record<string, unknown>): Promise<unknown>;
+  beginMissionTask(projectId: string, rootRunId: string, input: MissionTaskBeginReport): Promise<MissionTaskAck>;
+  settleMissionTask(projectId: string, rootRunId: string, input: MissionTaskSettleReport): Promise<MissionTaskAck>;
 }
 const room = (pid: string) =>
   appEnv.PROJECT_ROOM.get(appEnv.PROJECT_ROOM.idFromName(pid)) as unknown as RoomRpc;
@@ -586,5 +589,94 @@ describe('single_root Runner mission commissioning (PLNR-484)', () => {
     const cancelled = await env.DB.prepare('SELECT status FROM runs WHERE plan_dispatch_id = ?')
       .bind(cancelDispatch.id).first<{ status: string }>();
     expect(cancelled?.status).toBe('cancelled');
+  });
+});
+
+describe('server-authorized mission task attempts (PLNR-485)', () => {
+  async function liveMission(title: string) {
+    const runner = await seedRunner(4, true);
+    const agent = await seedAgent(runner);
+    const plan = await makePlan(title);
+    const dispatch = await createDispatch(runner, plan.planId, {
+      strategy: 'single_root', workflow: 'mission-plan',
+    });
+    const root = await env.DB.prepare('SELECT id FROM runs WHERE plan_dispatch_id = ?')
+      .bind(dispatch.id).first<{ id: string }>();
+    await room(pid).transitionRun(pid, actor, root!.id, { status: 'running', agentId: agent });
+    return { runner, agent, ...plan, dispatch, rootRunId: root!.id };
+  }
+
+  const begin = (rootRunId: string, taskId: string, attemptId: string, childKey = attemptId) =>
+    room(pid).beginMissionTask(pid, rootRunId, {
+      reportId: `begin-${attemptId}`, attemptId, taskId, childKey, observedAt: new Date().toISOString(),
+    });
+
+  it('atomically claims an eligible task, records its child execution, and replays the original ack', async () => {
+    const mission = await liveMission('mission-attempt');
+    const input: MissionTaskBeginReport = {
+      reportId: 'begin-a', attemptId: 'attempt-a', taskId: mission.a,
+      childKey: 'child-a', observedAt: new Date().toISOString(),
+    };
+    const accepted = await room(pid).beginMissionTask(pid, mission.rootRunId, input);
+    expect(accepted).toMatchObject({ accepted: true, phase: 'begin', taskId: mission.a, taskStatus: 'in_progress' });
+    expect(accepted.claimId).toMatch(/^clm_/);
+    const task = await env.DB.prepare('SELECT status, claimed_by AS holder FROM tasks WHERE id = ?')
+      .bind(mission.a).first<{ status: string; holder: string }>();
+    expect(task).toEqual({ status: 'in_progress', holder: mission.agent });
+    const child = await env.DB.prepare(
+      'SELECT task_id AS taskId, run_id AS runId, parent_execution_id AS parentId FROM execution_nodes WHERE id = ?',
+    ).bind(accepted.executionId).first<{ taskId: string; runId: string; parentId: string }>();
+    expect(child).toMatchObject({ taskId: mission.a, runId: mission.rootRunId });
+    expect(child?.parentId).toMatch(/^exe_/);
+
+    expect(await room(pid).beginMissionTask(pid, mission.rootRunId, input)).toEqual(accepted);
+    await expect(room(pid).beginMissionTask(pid, mission.rootRunId, { ...input, taskId: mission.b }))
+      .rejects.toThrow(/conflicts/);
+    await expect(begin(mission.rootRunId, mission.c, 'attempt-c')).rejects.toThrow(/dependency gate/);
+  });
+
+  it('settles through the admitted claim CAS and refuses to overwrite a human move', async () => {
+    const mission = await liveMission('mission-settle');
+    const admitted = await begin(mission.rootRunId, mission.a, 'attempt-settle-a');
+    const settle: MissionTaskSettleReport = {
+      reportId: 'settle-a', attemptId: 'attempt-settle-a', claimId: admitted.claimId!,
+      outcome: 'done', reason: null, observedAt: new Date().toISOString(),
+    };
+    const ack = await room(pid).settleMissionTask(pid, mission.rootRunId, settle);
+    expect(ack).toMatchObject({ accepted: true, taskStatus: 'review', executionId: admitted.executionId });
+    expect(await room(pid).settleMissionTask(pid, mission.rootRunId, settle)).toEqual(ack);
+    await expect(room(pid).settleMissionTask(pid, mission.rootRunId, { ...settle, outcome: 'failed' }))
+      .rejects.toThrow(/conflicts/);
+
+    const b = await begin(mission.rootRunId, mission.b, 'attempt-human-move');
+    await room(pid).updateTask(pid, actor, mission.b, { status: 'done' });
+    await expect(room(pid).settleMissionTask(pid, mission.rootRunId, {
+      reportId: 'settle-human-move', attemptId: 'attempt-human-move', claimId: b.claimId!,
+      outcome: 'done', reason: null, observedAt: new Date().toISOString(),
+    })).rejects.toThrow(/ownership changed/);
+    expect((await env.DB.prepare('SELECT status FROM tasks WHERE id = ?').bind(mission.b).first<{ status: string }>())?.status)
+      .toBe('done');
+  });
+
+  it('root terminalization interrupts live attempts without rewriting settled outcomes', async () => {
+    const mission = await liveMission('mission-root-stop');
+    const settled = await begin(mission.rootRunId, mission.a, 'attempt-already-settled');
+    await room(pid).settleMissionTask(pid, mission.rootRunId, {
+      reportId: 'settled-before-root', attemptId: 'attempt-already-settled', claimId: settled.claimId!,
+      outcome: 'done', reason: null, observedAt: new Date().toISOString(),
+    });
+    await begin(mission.rootRunId, mission.b, 'attempt-live-at-root-stop');
+    await room(pid).transitionRun(pid, actor, mission.rootRunId, { status: 'done' });
+    const attempts = await env.DB.prepare(
+      'SELECT id, status FROM mission_task_attempts WHERE root_run_id = ? ORDER BY id',
+    ).bind(mission.rootRunId).all<{ id: string; status: string }>();
+    expect(attempts.results).toEqual([
+      { id: 'attempt-already-settled', status: 'review' },
+      { id: 'attempt-live-at-root-stop', status: 'interrupted' },
+    ]);
+    const states = await env.DB.prepare('SELECT id, status, claimed_by AS holder FROM tasks WHERE id IN (?, ?) ORDER BY id')
+      .bind(mission.a, mission.b).all<{ id: string; status: string; holder: string | null }>();
+    expect(states.results.find((task) => task.id === mission.a)).toMatchObject({ status: 'review', holder: null });
+    expect(states.results.find((task) => task.id === mission.b)).toMatchObject({ status: 'todo', holder: null });
   });
 });

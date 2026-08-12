@@ -14,10 +14,10 @@ import {
 import { searchBackend, indexEntity, removeEntity, type SearchKind } from '../search';
 import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
-import { RunKind, AgentTool, RunStatus, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType } from '@noriq-dev/shared';
+import { RunKind, AgentTool, RunStatus, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
 import { writeExecutionSpec } from '../lib/execution-spec';
 import { processPendingCopilotEpisodeJob, processPendingEpisodeJob } from '../memory/episodes';
-import { ensureRunExecution, mirrorRunTransition } from '../lib/orchestration-store';
+import { applyMissionTaskExecutionEvent, ensureMissionTaskExecution, ensureRunExecution, mirrorRunTransition } from '../lib/orchestration-store';
 import {
   captureRunCommissioningSnapshot, recordRunSittingExecutedConfiguration, recordRunSittingExecutedSpec,
 } from '../lib/run-sitting-intelligence';
@@ -4217,6 +4217,198 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
+  /** Admit one task child for a live single-root mission. The acknowledgement is the spawn
+   * permission: attempt + claim commit together before it is returned. */
+  async beginMissionTask(
+    projectId: string,
+    rootRunId: string,
+    input: MissionTaskBeginReport,
+  ): Promise<MissionTaskAck> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const beginHash = await sha256Hex(JSON.stringify({
+        attemptId: input.attemptId, taskId: input.taskId, childKey: input.childKey, observedAt: input.observedAt,
+      }));
+      const repeated = await this.env.DB.prepare(
+        `SELECT begin_hash AS beginHash, begin_ack AS beginAck, child_execution_id AS executionId,
+                claim_id AS claimId, task_id AS taskId
+           FROM mission_task_attempts WHERE id = ?`,
+      ).bind(input.attemptId).first<{
+        beginHash: string; beginAck: string | null; executionId: string; claimId: string; taskId: string;
+      }>();
+      if (repeated) {
+        if (repeated.beginHash !== beginHash) throw new Error('attemptId conflicts with its accepted begin payload');
+        if (repeated.beginAck) return JSON.parse(repeated.beginAck) as MissionTaskAck;
+        await applyMissionTaskExecutionEvent(this.env, {
+          rootRunId, attemptId: input.attemptId, executionId: repeated.executionId,
+          type: 'started', observedAt: input.observedAt,
+        });
+        const ack: MissionTaskAck = {
+          reportId: input.reportId, attemptId: input.attemptId, phase: 'begin', accepted: true,
+          taskId: repeated.taskId, claimId: repeated.claimId, executionId: repeated.executionId,
+          taskStatus: 'in_progress', error: null,
+        };
+        await this.env.DB.prepare('UPDATE mission_task_attempts SET begin_ack = ?, updated_at = ? WHERE id = ?')
+          .bind(JSON.stringify(ack), nowIso(), input.attemptId).run();
+        return ack;
+      }
+
+      const root = await this.env.DB.prepare(
+        `SELECT r.id, r.status, r.exit, r.agent_id AS agentId, r.plan_id AS planId,
+                r.plan_dispatch_id AS dispatchId, pd.gate, pd.strategy
+           FROM runs r JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
+          WHERE r.id = ? AND r.project_id = ? AND r.anchor_type = 'plan'
+            AND r.anchor_id = pd.plan_id`,
+      ).bind(rootRunId, projectId).first<{
+        id: string; status: string; exit: string | null; agentId: string | null; planId: string;
+        dispatchId: string; gate: 'approved' | 'landed'; strategy: string;
+      }>();
+      if (!root || root.strategy !== 'single_root') throw new Error('run is not a commissioned single_root mission');
+      if (!['running', 'blocked'].includes(logicalRunStatus(root))) throw new Error('mission root is not live');
+      if (!root.agentId) throw new Error('mission root has no registered Run agent');
+      const task = await this.env.DB.prepare(
+        `SELECT t.id, t.key, t.title, t.status, t.claimed_by AS claimedBy, t.proposed_at AS proposedAt,
+                ph."order" AS phaseOrder
+           FROM tasks t JOIN phase_tasks pt ON pt.task_id = t.id
+           JOIN phases ph ON ph.id = pt.phase_id
+          WHERE t.id = ? AND t.project_id = ? AND ph.plan_id = ?`,
+      ).bind(input.taskId, projectId, root.planId).first<{
+        id: string; key: string; title: string; status: string; claimedBy: string | null;
+        proposedAt: string | null; phaseOrder: number;
+      }>();
+      if (!task) throw new Error('task is not part of the commissioned plan');
+      if (task.status !== 'todo' || task.claimedBy || task.proposedAt) {
+        throw new Error(`${task.key} is not eligible for mission begin`);
+      }
+      const landedException = root.gate === 'landed'
+        ? `AND NOT (dt.status = 'review' AND EXISTS (
+             SELECT 1 FROM runs dr WHERE dr.anchor_type = 'task' AND dr.anchor_id = dt.id AND dr.status = 'done'))`
+        : '';
+      const blocked = await this.env.DB.prepare(
+        `SELECT 1 AS blocked
+           WHERE EXISTS (
+             SELECT 1 FROM dependencies dp JOIN tasks dt ON dt.id = dp.depends_on_task_id
+              WHERE dp.task_id = ?1 AND dt.status NOT IN ('done','cancelled') ${landedException})
+              OR EXISTS (
+             SELECT 1 FROM phases prev JOIN phase_tasks ppt ON ppt.phase_id = prev.id
+               JOIN tasks dt ON dt.id = ppt.task_id
+              WHERE prev.plan_id = ?2 AND prev."order" < ?3
+                AND dt.status NOT IN ('done','cancelled') ${landedException})`,
+      ).bind(task.id, root.planId, task.phaseOrder).first();
+      if (blocked) throw new Error(`${task.key} is blocked by the commissioned plan dependency gate`);
+
+      const execution = await ensureMissionTaskExecution(this.env, rootRunId, input);
+      const ttl = await this.claimTtlSeconds();
+      const now = nowIso();
+      const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
+      const claimId = newId('clm');
+      await this.env.DB.batch([
+        this.env.DB.prepare(
+          `INSERT INTO claims (id, task_id, agent_id, acquired_at, expires_at, work_role, execution_id)
+           VALUES (?, ?, ?, ?, ?, 'build', ?)`,
+        ).bind(claimId, task.id, root.agentId, now, expiresAt, execution.id),
+        this.env.DB.prepare(
+          `UPDATE tasks SET status = 'in_progress', claimed_by = ?, claim_expires_at = ?, failed_at = NULL, updated_at = ?
+            WHERE id = ? AND status = 'todo' AND claimed_by IS NULL`,
+        ).bind(root.agentId, expiresAt, now, task.id),
+        this.env.DB.prepare(
+          `INSERT INTO mission_task_attempts
+             (id, project_id, plan_dispatch_id, root_run_id, task_id, child_execution_id,
+              claim_id, agent_id, begin_hash, status, begun_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)`,
+        ).bind(
+          input.attemptId, projectId, root.dispatchId, rootRunId, task.id, execution.id,
+          claimId, root.agentId, beginHash, now, now,
+        ),
+      ]);
+      await this.scheduleExpiryAlarm();
+      await applyMissionTaskExecutionEvent(this.env, {
+        rootRunId, attemptId: input.attemptId, executionId: execution.id,
+        type: 'started', observedAt: input.observedAt,
+      });
+      const ack: MissionTaskAck = {
+        reportId: input.reportId, attemptId: input.attemptId, phase: 'begin', accepted: true,
+        taskId: task.id, claimId, executionId: execution.id, taskStatus: 'in_progress', error: null,
+      };
+      await this.env.DB.prepare('UPDATE mission_task_attempts SET begin_ack = ?, updated_at = ? WHERE id = ?')
+        .bind(JSON.stringify(ack), nowIso(), input.attemptId).run();
+      await this.emit(SYSTEM_ACTOR, 'task.claimed', 'task', task.id, {
+        key: task.key, title: task.title, agentId: root.agentId, expiresAt, by: 'mission',
+        rootRunId, attemptId: input.attemptId, executionId: execution.id,
+      });
+      return ack;
+    });
+  }
+
+  /** Settle an admitted attempt using the claim returned by begin as the CAS token. */
+  async settleMissionTask(
+    projectId: string,
+    rootRunId: string,
+    input: MissionTaskSettleReport,
+  ): Promise<MissionTaskAck> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const settleHash = await sha256Hex(JSON.stringify({
+        attemptId: input.attemptId, claimId: input.claimId, outcome: input.outcome,
+        reason: input.reason, observedAt: input.observedAt,
+      }));
+      const attempt = await this.env.DB.prepare(
+        `SELECT a.*, t.key, t.title, t.status AS task_status, t.claimed_by AS task_holder,
+                c.released_at AS claim_released
+           FROM mission_task_attempts a JOIN tasks t ON t.id = a.task_id
+           JOIN claims c ON c.id = a.claim_id
+          WHERE a.id = ? AND a.project_id = ? AND a.root_run_id = ?`,
+      ).bind(input.attemptId, projectId, rootRunId).first<Record<string, unknown>>();
+      if (!attempt) throw new Error('mission task attempt not found');
+      if (attempt.settle_hash) {
+        if (attempt.settle_hash !== settleHash) throw new Error('attemptId conflicts with its accepted settle payload');
+        return JSON.parse(String(attempt.settle_ack)) as MissionTaskAck;
+      }
+      if (attempt.claim_id !== input.claimId) throw new Error('mission task claim token does not match the admitted attempt');
+      if (attempt.status !== 'running') throw new Error(`mission task attempt is already ${String(attempt.status)}`);
+      if (attempt.claim_released || attempt.task_holder !== attempt.agent_id
+          || !['in_progress', 'claimed'].includes(String(attempt.task_status))) {
+        throw new Error('mission task ownership changed; settlement refused');
+      }
+      const now = nowIso();
+      const taskStatus = input.outcome === 'done' || input.outcome === 'gated' ? 'review' : 'todo';
+      const attemptStatus = input.outcome === 'done' || input.outcome === 'gated'
+        ? 'review' : input.outcome === 'failed' ? 'failed' : 'cancelled';
+      const failedAt = input.outcome === 'failed' ? now : null;
+      const executionEvent = input.outcome === 'done' || input.outcome === 'gated'
+        ? 'succeeded' : input.outcome === 'failed' ? 'failed' : 'cancelled';
+      const ack: MissionTaskAck = {
+        reportId: input.reportId, attemptId: input.attemptId, phase: 'settle', accepted: true,
+        taskId: String(attempt.task_id), claimId: input.claimId,
+        executionId: String(attempt.child_execution_id), taskStatus, error: null,
+      };
+      await this.env.DB.batch([
+        this.env.DB.prepare(
+          `UPDATE tasks SET status = ?, failed_at = ?, claimed_by = NULL, claim_expires_at = NULL, updated_at = ?
+            WHERE id = ? AND claimed_by = ? AND status IN ('in_progress','claimed')`,
+        ).bind(taskStatus, failedAt, now, attempt.task_id, attempt.agent_id),
+        this.env.DB.prepare(
+          `UPDATE claims SET released_at = ?, release_status = ? WHERE id = ? AND released_at IS NULL`,
+        ).bind(now, taskStatus, input.claimId),
+        this.env.DB.prepare(
+          `UPDATE mission_task_attempts SET settle_hash = ?, settle_ack = ?, status = ?, settled_at = ?, updated_at = ?
+            WHERE id = ? AND status = 'running'`,
+        ).bind(settleHash, JSON.stringify(ack), attemptStatus, now, now, input.attemptId),
+      ]);
+      await applyMissionTaskExecutionEvent(this.env, {
+        rootRunId, attemptId: input.attemptId, executionId: String(attempt.child_execution_id),
+        type: executionEvent, observedAt: input.observedAt, reason: input.reason,
+      });
+      await this.releaseLocksForTask(String(attempt.task_id), SYSTEM_ACTOR, `mission attempt settled: ${input.outcome}`);
+      await this.emit(SYSTEM_ACTOR, 'task.released', 'task', String(attempt.task_id), {
+        key: attempt.key, title: attempt.title, previousHolder: attempt.agent_id,
+        toStatus: taskStatus, reason: `mission attempt settled: ${input.outcome}`,
+        rootRunId, attemptId: input.attemptId,
+      });
+      return ack;
+    });
+  }
+
   /** Halt the pump and kill this dispatch's live runs. Idempotent on a finished dispatch. */
   async cancelPlanDispatch(
     projectId: string,
@@ -4837,6 +5029,9 @@ export class ProjectRoom extends DurableObject<Env> {
       if (isTerminalRunStatus(to) && run.kind === 'build' && run.anchor_type === 'task' && run.anchor_id) {
         await this.settleAnchorTask(run.anchor_id, to, now, agentId);
       }
+      if (isTerminalRunStatus(to) && run.kind === 'build' && run.anchor_type === 'plan') {
+        await this.interruptMissionTaskAttempts(run.id, agentId, now, to);
+      }
       // Every terminal run produces a deterministic episode (§14, PLNR-263). Delivery starts in
       // the background, but unlike the old bare promise it is backed by `memory_episode_jobs`:
       // transient failures and isolate restarts leave a row for the scheduled sweep to retry.
@@ -5020,6 +5215,50 @@ export class ProjectRoom extends DurableObject<Env> {
     }
     // The run is settling this task — release its file locks too (§5 auto-release).
     await this.releaseLocksForTask(taskId, SYSTEM_ACTOR, `run settled: ${outcome}`);
+  }
+
+  /** A root process ending revokes only its still-live task attempts. Settled rows are immutable
+   * history and are excluded by status; human moves/foreign claims survive the ownership guard. */
+  private async interruptMissionTaskAttempts(
+    rootRunId: string,
+    agentId: string | null,
+    now: string,
+    rootOutcome: string,
+  ): Promise<void> {
+    const { results } = await this.env.DB.prepare(
+      `SELECT id, task_id AS taskId, claim_id AS claimId, child_execution_id AS executionId,
+              agent_id AS agentId
+         FROM mission_task_attempts WHERE root_run_id = ? AND status = 'running'`,
+    ).bind(rootRunId).all<{
+      id: string; taskId: string; claimId: string; executionId: string; agentId: string;
+    }>();
+    for (const attempt of results) {
+      const holder = agentId ?? attempt.agentId;
+      await this.env.DB.batch([
+        this.env.DB.prepare(
+          `UPDATE tasks SET status = 'todo', failed_at = NULL, claimed_by = NULL,
+                  claim_expires_at = NULL, updated_at = ?
+            WHERE id = ? AND claimed_by = ? AND status IN ('in_progress','claimed')`,
+        ).bind(now, attempt.taskId, holder),
+        this.env.DB.prepare(
+          `UPDATE claims SET released_at = ?, release_status = 'todo'
+            WHERE id = ? AND agent_id = ? AND released_at IS NULL`,
+        ).bind(now, attempt.claimId, holder),
+        this.env.DB.prepare(
+          `UPDATE mission_task_attempts SET status = 'interrupted', settled_at = ?, updated_at = ?
+            WHERE id = ? AND status = 'running'`,
+        ).bind(now, now, attempt.id),
+      ]);
+      await applyMissionTaskExecutionEvent(this.env, {
+        rootRunId, attemptId: attempt.id, executionId: attempt.executionId,
+        type: 'interrupted', observedAt: now, reason: `mission root settled: ${rootOutcome}`,
+      });
+      await this.releaseLocksForTask(attempt.taskId, SYSTEM_ACTOR, `mission root settled: ${rootOutcome}`);
+      await this.emit(SYSTEM_ACTOR, 'task.released', 'task', attempt.taskId, {
+        previousHolder: holder, toStatus: 'todo', reason: `mission root settled: ${rootOutcome}`,
+        rootRunId, attemptId: attempt.id,
+      });
+    }
   }
 
   private async retireRunAgent(agentId: string): Promise<void> {

@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import { createAgent, mcpCall } from './helpers';
+import { RunnerClientMessage, RunnerServerMessage } from '@noriq-dev/shared';
 
 describe('orchestration MCP protocol (PLNR-366)', () => {
   let apiKey: string;
@@ -45,5 +46,26 @@ describe('orchestration MCP protocol (PLNR-366)', () => {
     expect(tree.isError).toBe(false);
     expect(tree.body.orchestration).toMatchObject({ id: orchestrationId, projectId, status: 'running' });
     expect(tree.body.nodes).toContainEqual(expect.objectContaining({ id: root.body.id, status: 'running' }));
+  });
+});
+
+describe('mission task wire contract (PLNR-485)', () => {
+  it('parses begin, settle, and acknowledgement frames without changing execution telemetry', () => {
+    const now = new Date().toISOString();
+    expect(RunnerClientMessage.parse({
+      type: 'mission.task.begin', runId: 'run_root',
+      begin: { reportId: 'report-begin', attemptId: 'attempt-1', taskId: 'task-1', childKey: 'child-1', observedAt: now },
+    }).type).toBe('mission.task.begin');
+    expect(RunnerClientMessage.parse({
+      type: 'mission.task.settle', runId: 'run_root',
+      settle: { reportId: 'report-settle', attemptId: 'attempt-1', claimId: 'clm_1', outcome: 'done', observedAt: now },
+    }).type).toBe('mission.task.settle');
+    expect(RunnerServerMessage.parse({
+      type: 'mission.task.ack',
+      ack: {
+        reportId: 'report-begin', attemptId: 'attempt-1', phase: 'begin', accepted: true,
+        taskId: 'task-1', claimId: 'clm_1', executionId: 'exe_1', taskStatus: 'in_progress', error: null,
+      },
+    }).type).toBe('mission.task.ack');
   });
 });

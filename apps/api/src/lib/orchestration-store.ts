@@ -7,6 +7,7 @@ import type {
   RunnerExecutionEventReport,
   RunnerExecutionReconciliation,
   RunnerExecutionRelationReport,
+  MissionTaskBeginReport,
 } from '@noriq-dev/shared';
 
 export const EXECUTION_KINDS = ['copilot_session', 'run', 'sitting', 'stage', 'step', 'gate'] as const;
@@ -587,6 +588,57 @@ export async function declareRunnerExecution(
     },
     continuesExecutionId: input.continuesExecutionId ?? undefined,
     observedAt: input.observedAt,
+  });
+}
+
+/** Declare the real task-scoped child attempt beneath the root Run's current sitting. The
+ * ProjectRoom remains responsible for admitting the task claim before Runner may spawn. */
+export async function ensureMissionTaskExecution(
+  env: Env, rootRunId: string, input: MissionTaskBeginReport,
+): Promise<{ id: string; created: boolean }> {
+  const run = await loadRunExecutionFacts(env.DB, rootRunId);
+  if (!run.planDispatchId || !run.planId) throw new Error('mission root is not plan-dispatched');
+  const assignment = await ensureRunExecution(env, rootRunId);
+  return declareExecution(env, {
+    projectId: run.projectId,
+    orchestrationId: assignment.orchestrationId,
+    parentExecutionId: assignment.executionId,
+    producerScope: `mission/${rootRunId}/sitting/${run.sitting}`,
+    localNodeKey: `task/${input.childKey}`,
+    kind: 'step', role: 'worker',
+    actor: run.agentId ? { kind: 'agent', id: run.agentId } : null,
+    subject: { taskId: input.taskId, planId: run.planId, runId: rootRunId, sitting: run.sitting, step: input.childKey },
+    allowTerminalExtension: true,
+    observedAt: input.observedAt,
+  });
+}
+
+export async function applyMissionTaskExecutionEvent(env: Env, input: {
+  rootRunId: string;
+  attemptId: string;
+  executionId: string;
+  type: 'started' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
+  observedAt: string;
+  reason?: string | null;
+}): Promise<void> {
+  const run = await loadRunExecutionFacts(env.DB, input.rootRunId);
+  const assignment = await ensureRunExecution(env, input.rootRunId);
+  await assertRunnerExecutionScope(env.DB, run, input.executionId, assignment.orchestrationId);
+  const node = await env.DB.prepare('SELECT status, last_revision AS revision FROM execution_nodes WHERE id = ?')
+    .bind(input.executionId).first<{ status: ExecutionStatus; revision: number }>();
+  if (!node) throw new Error('mission task execution not found');
+  const target = input.type === 'started' ? 'running'
+    : input.type === 'succeeded' ? 'succeeded'
+      : input.type === 'failed' ? 'failed'
+        : input.type === 'cancelled' ? 'cancelled' : 'interrupted';
+  if (node.status === target) return;
+  if (terminal.has(node.status)) throw new Error(`mission task execution is already ${node.status}`);
+  await applyExecutionEvent(env, {
+    projectId: run.projectId, orchestrationId: assignment.orchestrationId,
+    executionId: input.executionId,
+    eventId: `mission_${input.attemptId}_${input.type}`,
+    revision: node.revision + 1, type: input.type, observedAt: input.observedAt,
+    reason: input.reason, metadata: { source: 'mission_task_attempt', attemptId: input.attemptId },
   });
 }
 

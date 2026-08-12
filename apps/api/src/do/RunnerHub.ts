@@ -3,10 +3,12 @@ import type { Env } from '../env';
 import type { Actor } from './ProjectRoom';
 import {
   ORCHESTRATION_CAPABILITY,
+  MISSION_CAPABILITY,
   RunnerClientMessage,
   RUNNER_PROTOCOL_CAPABILITIES,
   RUNNER_PROTOCOL_VERSION,
   type ExecutionReportAck,
+  type MissionTaskAck,
   type RunnerProtocolCapability,
 } from '@noriq-dev/shared';
 import { projectRoleAllows, resolveAccountCapabilities, resolveProjectAccess } from '../lib/authorization';
@@ -217,6 +219,34 @@ export class RunnerHub extends DurableObject<Env> {
         return;
       }
 
+      case 'mission.task.begin': {
+        const pid = await this.authorizeMissionRun(ws, auth, runnerId, msg.runId);
+        if (!pid) return;
+        try {
+          const ack = await this.room(pid).beginMissionTask(pid, msg.runId, msg.begin);
+          this.sendMissionAck(ws, ack);
+        } catch (error) {
+          this.sendMissionAck(ws, this.rejectedMissionAck(
+            msg.begin.reportId, msg.begin.attemptId, 'begin', error,
+          ));
+        }
+        return;
+      }
+
+      case 'mission.task.settle': {
+        const pid = await this.authorizeMissionRun(ws, auth, runnerId, msg.runId);
+        if (!pid) return;
+        try {
+          const ack = await this.room(pid).settleMissionTask(pid, msg.runId, msg.settle);
+          this.sendMissionAck(ws, ack);
+        } catch (error) {
+          this.sendMissionAck(ws, this.rejectedMissionAck(
+            msg.settle.reportId, msg.settle.attemptId, 'settle', error,
+          ));
+        }
+        return;
+      }
+
       case 'run.telemetry': {
         // Non-transitional spend/log-tail/phase tick (RUN-22, RUN-31). Persist on the run row
         // via the owning project's authority; the runner may only report its OWN runs.
@@ -305,12 +335,42 @@ export class RunnerHub extends DurableObject<Env> {
     };
   }
 
+  private sendMissionAck(ws: WebSocket, ack: MissionTaskAck): void {
+    this.sendIfOpen(ws, JSON.stringify({ type: 'mission.task.ack', ack }));
+  }
+
+  private rejectedMissionAck(
+    reportId: string,
+    attemptId: string,
+    phase: 'begin' | 'settle',
+    error: unknown,
+  ): MissionTaskAck {
+    return {
+      reportId, attemptId, phase, accepted: false, taskId: null, claimId: null,
+      executionId: null, taskStatus: null,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+
   private async authorizeRun(
     ws: WebSocket, auth: RunnerSocketAuth, runnerId: string, runId: string,
   ): Promise<string | null> {
     if (!auth.capabilities?.includes(ORCHESTRATION_CAPABILITY)) return null;
     const row = await this.env.DB.prepare('SELECT project_id AS pid, runner_id AS rid FROM runs WHERE id = ?')
       .bind(runId).first<{ pid: string; rid: string | null }>();
+    if (!row || row.rid !== runnerId) return null;
+    return await this.authorizeProject(ws, auth, row.pid) ? row.pid : null;
+  }
+
+  private async authorizeMissionRun(
+    ws: WebSocket, auth: RunnerSocketAuth, runnerId: string, runId: string,
+  ): Promise<string | null> {
+    if (!auth.capabilities?.includes(MISSION_CAPABILITY)) return null;
+    const row = await this.env.DB.prepare(
+      `SELECT r.project_id AS pid, r.runner_id AS rid
+         FROM runs r JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
+        WHERE r.id = ? AND r.anchor_type = 'plan' AND pd.strategy = 'single_root'`,
+    ).bind(runId).first<{ pid: string; rid: string | null }>();
     if (!row || row.rid !== runnerId) return null;
     return await this.authorizeProject(ws, auth, row.pid) ? row.pid : null;
   }
