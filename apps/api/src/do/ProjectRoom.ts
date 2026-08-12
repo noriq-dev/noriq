@@ -1477,9 +1477,24 @@ export class ProjectRoom extends DurableObject<Env> {
   // Claim arbiter — the reason this DO exists
   // ---------------------------------------------------------------------------
 
-  async claimTask(projectId: string, actor: Actor, taskId: string, agentId: string)  {
+  async claimTask(
+    projectId: string,
+    actor: Actor,
+    taskId: string,
+    agentId: string,
+    metadata: { workRole?: 'scope' | 'build' | 'verify'; executionId?: string | null } = {},
+  )  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
+      if (metadata.executionId) {
+        const execution = await this.env.DB.prepare(
+          `SELECT n.id FROM execution_nodes n
+             JOIN agent_presences p ON p.id = n.presence_id
+            WHERE n.id = ? AND n.project_id = ? AND n.kind = 'copilot_session'
+              AND p.actor_id = ? AND p.kind = 'mcp_session'`,
+        ).bind(metadata.executionId, projectId, agentId).first<{ id: string }>();
+        if (!execution) throw new Error('claim execution does not belong to this Copilot session and project');
+      }
       const task = await this.getTask(taskId);
       // Re-claiming your OWN task is a RENEWAL, not a conflict (RUN-181). This became reachable
       // when the run started taking its anchor's claim at `running`: the builder is still told to
@@ -1550,16 +1565,20 @@ export class ProjectRoom extends DurableObject<Env> {
       // a first claim.
       if (renewing) {
         const held = await this.env.DB.prepare(
-          `SELECT id FROM claims WHERE task_id = ? AND agent_id = ? AND released_at IS NULL
+          `SELECT id, work_role AS workRole, execution_id AS executionId
+             FROM claims WHERE task_id = ? AND agent_id = ? AND released_at IS NULL
             ORDER BY acquired_at DESC LIMIT 1`,
-        ).bind(taskId, agentId).first<{ id: string }>();
+        ).bind(taskId, agentId).first<{ id: string; workRole: string | null; executionId: string | null }>();
         const heldId = held?.id ?? newId('clm');
         await this.env.DB.batch([
           held
-            ? this.env.DB.prepare('UPDATE claims SET expires_at = ? WHERE id = ?').bind(expiresAt, heldId)
+            ? this.env.DB.prepare(
+                'UPDATE claims SET expires_at = ?, work_role = COALESCE(?, work_role), execution_id = COALESCE(?, execution_id) WHERE id = ?',
+              ).bind(expiresAt, metadata.workRole ?? null, metadata.executionId ?? null, heldId)
             : this.env.DB.prepare(
-                'INSERT INTO claims (id, task_id, agent_id, acquired_at, expires_at) VALUES (?, ?, ?, ?, ?)',
-              ).bind(heldId, taskId, agentId, nowIso(), expiresAt),
+                `INSERT INTO claims (id, task_id, agent_id, acquired_at, expires_at, work_role, execution_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+              ).bind(heldId, taskId, agentId, nowIso(), expiresAt, metadata.workRole ?? null, metadata.executionId ?? null),
           this.env.DB.prepare(
             "UPDATE tasks SET status = 'in_progress', claim_expires_at = ?, failed_at = NULL, updated_at = ? WHERE id = ?",
           ).bind(expiresAt, nowIso(), taskId),
@@ -1567,6 +1586,8 @@ export class ProjectRoom extends DurableObject<Env> {
         await this.scheduleExpiryAlarm();
         return {
           claimId: heldId, key: task.key, expiresAt, ttlSeconds: ttl,
+          workRole: metadata.workRole ?? held?.workRole ?? null,
+          executionId: metadata.executionId ?? held?.executionId ?? null,
           openComments: await this.openCommentsFor(taskId),
         };
       }
@@ -1574,8 +1595,10 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.env.DB.batch([
         // Defensive release of any stale claim row before granting.
         this.env.DB.prepare('UPDATE claims SET released_at = ? WHERE task_id = ? AND released_at IS NULL').bind(nowIso(), taskId),
-        this.env.DB.prepare('INSERT INTO claims (id, task_id, agent_id, acquired_at, expires_at) VALUES (?, ?, ?, ?, ?)')
-          .bind(claimId, taskId, agentId, nowIso(), expiresAt),
+        this.env.DB.prepare(
+          `INSERT INTO claims (id, task_id, agent_id, acquired_at, expires_at, work_role, execution_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        ).bind(claimId, taskId, agentId, nowIso(), expiresAt, metadata.workRole ?? null, metadata.executionId ?? null),
         // Clearing failed_at (RUN-83): claiming a task for a retry drops its prior gate failure,
         // so the derived wire status returns to in_progress instead of lingering as `failed`.
         this.env.DB.prepare("UPDATE tasks SET status = 'in_progress', claimed_by = ?, claim_expires_at = ?, failed_at = NULL, updated_at = ? WHERE id = ?")
@@ -1588,7 +1611,12 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.scheduleExpiryAlarm();
       await this.emit(actor, 'task.claimed', 'task', taskId, { key: task.key, title: task.title, agentId, expiresAt });
       const openComments = await this.openCommentsFor(taskId);
-      return { claimId, key: task.key, expiresAt, ttlSeconds: ttl, openComments };
+      return {
+        claimId, key: task.key, expiresAt, ttlSeconds: ttl,
+        workRole: metadata.workRole ?? null,
+        executionId: metadata.executionId ?? null,
+        openComments,
+      };
     
     });
   }

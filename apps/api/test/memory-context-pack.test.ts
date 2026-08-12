@@ -411,6 +411,43 @@ describe('assembleContextPack — project scoping', () => {
 // -------------------------------------------------------------------------------------------
 
 describe('get_task_context — the real MCP tool', () => {
+  it('uses a live Copilot claim role and exposes its session execution without creating a Run', async () => {
+    const projectId = await newProject('MCPCLAIM');
+    const made = await mcpCall(agent.apiKey, 'create_task', {
+      projectId, title: 'Verify an IDE Copilot change', tags: ['context-pack-test'],
+    });
+    const taskId = made.body.id as string;
+
+    const claimed = await mcpCall(agent.apiKey, 'claim_task', {
+      projectId, taskId, workRole: 'verify',
+    });
+    expect(claimed.isError).toBe(false);
+    expect(claimed.body).toMatchObject({ workRole: 'verify' });
+    expect(claimed.body.executionId).toMatch(/^exe_/);
+
+    const claimRow = await appEnv.DB.prepare(
+      'SELECT work_role AS workRole, execution_id AS executionId FROM claims WHERE task_id = ? AND released_at IS NULL',
+    ).bind(taskId).first<{ workRole: string; executionId: string }>();
+    expect(claimRow).toEqual({ workRole: 'verify', executionId: claimed.body.executionId });
+
+    const context = await mcpCall(agent.apiKey, 'get_task_context', { projectId, taskId });
+    expect(context.isError).toBe(false);
+    expect(context.body.role).toBe('verify');
+    expect(context.body.intelligenceSummary.readiness).toMatchObject({
+      taskId, primary: 'execution', currentExecutionIds: [claimed.body.executionId],
+    });
+
+    const intelligence = await mcpCall(agent.apiKey, 'get_task_intelligence', {
+      projectId, taskId, executorMode: 'copilot',
+    });
+    expect(intelligence.body.current.capacity).toBeDefined();
+    expect(intelligence.body.current.readiness.currentRunIds).toEqual([]);
+    expect(intelligence.body.current.readiness.currentExecutionIds).toEqual([claimed.body.executionId]);
+    expect(intelligence.body.current).not.toHaveProperty('runCreatedForCopilot');
+    expect(intelligence.body.current).toBeDefined();
+    expect(intelligence.body.current.readiness.reason).toMatch(/active Copilot claim/);
+  });
+
   it('is registered with READ hints, and role defaults from the calling agent\'s own run kind', async () => {
     const tools = await mcpList(agent.apiKey);
     const tool = tools.find((t) => t.name === 'get_task_context');

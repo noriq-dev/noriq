@@ -63,6 +63,18 @@ type LiveRun = {
   updatedAt: string;
 };
 
+type LiveCopilotClaim = {
+  claimId: string;
+  taskId: string;
+  taskKey: string;
+  agentId: string;
+  agentName: string | null;
+  workRole: 'scope' | 'build' | 'verify' | null;
+  executionId: string | null;
+  acquiredAt: string;
+  expiresAt: string;
+};
+
 type LiveLock = {
   id: string;
   taskId: string | null;
@@ -96,6 +108,7 @@ type PreparedTask = TaskRow & {
   executionSpecUnreadable: boolean;
   branch: string | null;
   liveRuns: LiveRun[];
+  liveCopilotClaims: LiveCopilotClaim[];
 };
 
 export interface CurrentLockCollision {
@@ -172,7 +185,9 @@ export interface BottleneckAssessmentResult {
   };
   execution: {
     liveRuns: LiveRun[];
+    liveCopilotClaims: LiveCopilotClaim[];
     liveWorkerCount: number;
+    liveCopilotWorkerCount: number;
     nodeCounts: Array<{ status: string; kind: string; role: string; count: number }>;
     note: string;
   };
@@ -234,6 +249,9 @@ function primaryClassification(input: {
   if (task.liveRuns.length) {
     if (task.liveRuns.some((run) => run.phase === 'landing')) return { primary: 'landing', reason: 'a live run is in its landing phase' };
     return { primary: 'execution', reason: 'a canonical live run already owns or queues this work' };
+  }
+  if (task.liveCopilotClaims.length) {
+    return { primary: 'execution', reason: 'an active Copilot claim owns this work without a Runner run' };
   }
   const reasonCode: ClaimabilityReason = task.claimability.reasonCode;
   if (reasonCode === 'spin_off_approval' || reasonCode === 'plan_approval') {
@@ -407,7 +425,7 @@ export async function assessProjectBottlenecks(
   }
   const taskIds = claimabilityItems.map((item) => item.id);
   const ids = boundedTaskIds.length ? placeholders(boundedTaskIds) : "''";
-  const [project, taskRows, runs, signals, locks, runnerRows, runnerPresence, busyRuns, nodeCounts,
+  const [project, taskRows, runs, copilotClaims, signals, locks, runnerRows, runnerPresence, busyRuns, nodeCounts,
     dispatches, phaseGates, landings, watermarks] = await Promise.all([
     env.DB.prepare('SELECT key, file_locking_enabled AS fileLockingEnabled FROM projects WHERE id = ?')
       .bind(projectId).first<{ key: string; fileLockingEnabled: number }>(),
@@ -424,6 +442,16 @@ export async function assessProjectBottlenecks(
         WHERE r.project_id = ? AND r.status IN ('queued','dispatched','running','blocked')
         ORDER BY r.created_at, r.id`,
     ).bind(projectId).all<LiveRun>(),
+    env.DB.prepare(
+      `SELECT c.id AS claimId, c.task_id AS taskId, t.key AS taskKey,
+              c.agent_id AS agentId, COALESCE(a.label, a.name) AS agentName,
+              c.work_role AS workRole, c.execution_id AS executionId,
+              c.acquired_at AS acquiredAt, c.expires_at AS expiresAt
+         FROM claims c JOIN tasks t ON t.id = c.task_id JOIN agents a ON a.id = c.agent_id
+        WHERE t.project_id = ? AND a.kind = 'copilot'
+          AND c.released_at IS NULL AND c.expires_at > ?
+        ORDER BY c.acquired_at, c.id`,
+    ).bind(projectId, observedAt).all<LiveCopilotClaim>(),
     env.DB.prepare(
       `SELECT s.id AS signalId, s.task_id AS taskId, t.key AS taskKey, s.title, s.created_at AS createdAt
          FROM signals s JOIN tasks t ON t.id = s.task_id
@@ -496,6 +524,10 @@ export async function assessProjectBottlenecks(
   const claimById = new Map(claimabilityItems.map((item) => [item.id, item.claimability]));
   const runsByTask = new Map<string, LiveRun[]>();
   for (const run of runs.results) if (run.taskId) runsByTask.set(run.taskId, [...(runsByTask.get(run.taskId) ?? []), run]);
+  const copilotClaimsByTask = new Map<string, LiveCopilotClaim[]>();
+  for (const claim of copilotClaims.results) {
+    copilotClaimsByTask.set(claim.taskId, [...(copilotClaimsByTask.get(claim.taskId) ?? []), claim]);
+  }
   const selectedTaskRows = focusTaskRow ? [...taskRows.results, focusTaskRow] : taskRows.results;
   const prepared: PreparedTask[] = selectedTaskRows.map((row) => {
     const read = readExecutionSpec(row.executionSpec, row.id);
@@ -506,6 +538,7 @@ export async function assessProjectBottlenecks(
       executionSpecUnreadable: !!read.unreadable,
       branch: taskBranch(row.id, focusTaskId, input.branch ?? null, runs.results),
       liveRuns: runsByTask.get(row.id) ?? [],
+      liveCopilotClaims: copilotClaimsByTask.get(row.id) ?? [],
     };
   }).sort((a, b) => taskIds.indexOf(a.id) - taskIds.indexOf(b.id));
   const focus = focusTaskId ? prepared.find((task) => task.id === focusTaskId) ?? null : null;
@@ -601,7 +634,10 @@ export async function assessProjectBottlenecks(
       taskId: task.id, taskKey: task.key, title: task.title, status: task.status,
       ...primary, claimability: task.claimability, anticipatedFiles: task.anticipatedFiles,
       branch: task.branch, currentRunIds: task.liveRuns.map((run) => run.id),
-      currentExecutionIds: task.liveRuns.flatMap((run) => run.executionId ? [run.executionId] : []),
+      currentExecutionIds: [
+        ...task.liveRuns.flatMap((run) => run.executionId ? [run.executionId] : []),
+        ...task.liveCopilotClaims.flatMap((claim) => claim.executionId ? [claim.executionId] : []),
+      ],
       blockingInputRequestIds, lockCollisionIds,
     };
   });
@@ -662,9 +698,11 @@ export async function assessProjectBottlenecks(
     },
     execution: {
       liveRuns: runs.results,
+      liveCopilotClaims: copilotClaims.results,
       liveWorkerCount: runs.results.filter((run) => run.status === 'dispatched' || run.status === 'running').length,
+      liveCopilotWorkerCount: new Set(copilotClaims.results.map((claim) => claim.executionId ?? claim.agentId)).size,
       nodeCounts: nodeCounts.results.map((row) => ({ ...row, count: Number(row.count) })),
-      note: 'execution nodes describe lineage and stages; concurrent workers are counted from distinct live run rows only',
+      note: 'Runner workers are counted from distinct live run rows; IDE Copilots are counted separately from live claim execution identities',
     },
     humanBlocks: signals.results.map((signal) => ({
       ...signal, runIds: runsByTask.get(signal.taskId)?.map((run) => run.id) ?? [], kind: 'blocking_input_request' as const,
