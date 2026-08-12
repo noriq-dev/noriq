@@ -2236,6 +2236,8 @@ const DispatchIntelligenceBody = z.object({
   taskId: z.string().min(1),
   runnerId: z.string().min(1).nullable().optional(),
   repositoryCheckoutId: z.string().min(1).nullable().optional(),
+  repositoryKey: z.string().min(1).nullable().optional(),
+  executorMode: z.enum(['runner', 'copilot', 'human']).optional(),
   branch: z.string().min(1).nullable().optional(),
   baseId: z.string().min(1).nullable().optional(),
   budget: RunBudget.nullable().optional(),

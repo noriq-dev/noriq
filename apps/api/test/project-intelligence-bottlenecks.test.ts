@@ -148,7 +148,7 @@ describe('collision and bottleneck evidence (PLNR-296)', () => {
       taskId: focus.id, repositoryKey: 'noriq', branch: 'main', baseId: 'base-lock', observedAt,
     });
     expect(result.targetContext).toEqual({
-      taskId: focus.id, repositoryKey: 'noriq', branch: 'main', baseId: 'base-lock',
+      taskId: focus.id, repositoryKey: 'noriq', branch: 'main', baseId: 'base-lock', executorMode: 'runner',
     });
     expect(result.collisions.locking.status).toBe('observed');
     expect(result.collisions.locking.current).toContainEqual(expect.objectContaining({
@@ -166,6 +166,23 @@ describe('collision and bottleneck evidence (PLNR-296)', () => {
     });
     expect(result.historicalSupport).toHaveProperty('cases');
     expect(result.collisions.locking).not.toHaveProperty('historical');
+  });
+
+  it('does not gate an IDE Copilot on missing Runner capacity', async () => {
+    const projectId = await project('BTCOP', 'Copilot executor readiness');
+    const focus = await task(projectId, 'implement from an IDE', ['apps/api/src/copilot.ts']);
+
+    const result = await assessProjectBottlenecks(appEnv, projectId, {
+      taskId: focus.id, executorMode: 'copilot', observedAt,
+    });
+
+    expect(result.capacity).toMatchObject({ status: 'unanswerable', availableSlots: null });
+    expect(result.targetContext.executorMode).toBe('copilot');
+    expect(result.readiness.tasks.find((item) => item.taskId === focus.id)).toMatchObject({
+      primary: 'ready',
+      reason: expect.stringMatching(/Copilot executor.*Runner capacity is not applicable/),
+    });
+    expect(result.coverage.reasons).not.toContain('runner_capacity_unknown');
   });
 
   it('counts a continued run once while identifying only blocking input requests as human blocks', async () => {

@@ -3,7 +3,10 @@
 // a selected strategy, a budget, or the dispatch payload.
 import type { RunBudget } from '@noriq-dev/shared';
 import type { Env } from '../env';
-import { assessProjectBottlenecks } from './bottlenecks';
+import { resolveRepositoryByKey } from '../lib/project-memory';
+import {
+  assessProjectBottlenecks, type IntelligenceExecutorMode,
+} from './bottlenecks';
 import { assessPreDispatchRisk } from './scope-risk';
 import {
   queryStrategyComparison, type ComparisonMetric, type StrategyDimension,
@@ -15,15 +18,24 @@ export interface DispatchIntelligenceInput {
   taskId: string;
   runnerId?: string | null;
   repositoryCheckoutId?: string | null;
+  repositoryKey?: string | null;
   branch?: string | null;
   baseId?: string | null;
   budget?: RunBudget | null;
   comparison?: { dimension: StrategyDimension; metric: ComparisonMetric };
+  executorMode?: IntelligenceExecutorMode;
 }
 
 export async function resolveDispatchRepository(
   env: Env, projectId: string, runnerId?: string | null, checkoutId?: string | null,
+  requestedRepositoryKey?: string | null,
 ): Promise<{ repositoryKey: string | null; reason: string | null }> {
+  if (requestedRepositoryKey) {
+    const repository = await resolveRepositoryByKey(env, projectId, requestedRepositoryKey);
+    return repository
+      ? { repositoryKey: repository.repositoryKey, reason: null }
+      : { repositoryKey: null, reason: 'repository key is not registered to this project' };
+  }
   if (!runnerId || !checkoutId) return { repositoryKey: null, reason: 'runner checkout context was not supplied' };
   const row = await env.DB.prepare(
     `SELECT pr.repository_key AS repositoryKey
@@ -39,8 +51,9 @@ export async function getDispatchIntelligence(
   env: Env, projectId: string, input: DispatchIntelligenceInput,
 ) {
   const repository = await resolveDispatchRepository(
-    env, projectId, input.runnerId, input.repositoryCheckoutId,
+    env, projectId, input.runnerId, input.repositoryCheckoutId, input.repositoryKey,
   );
+  const executorMode = input.executorMode ?? 'runner';
   const observedAt = new Date().toISOString();
   const context = {
     repositoryKey: repository.repositoryKey,
@@ -52,7 +65,7 @@ export async function getDispatchIntelligence(
       ...context, budget: input.budget ?? null, observedAt,
     }),
     assessProjectBottlenecks(env, projectId, {
-      taskId: input.taskId, ...context, observedAt,
+      taskId: input.taskId, ...context, observedAt, executorMode,
     }),
     input.comparison
       ? queryStrategyComparison(env, projectId, input.comparison)
@@ -66,6 +79,7 @@ export async function getDispatchIntelligence(
       taskId: input.taskId,
       runnerId: input.runnerId ?? null,
       repositoryCheckoutId: input.repositoryCheckoutId ?? null,
+      executorMode,
       repositoryKey: repository.repositoryKey,
       repositoryResolutionReason: repository.reason,
       branch: input.branch ?? null,
@@ -97,5 +111,41 @@ export async function getDispatchIntelligence(
       requiresExplicitHumanAction: true as const,
       previewCreatesOccurrence: false as const,
     },
+  };
+}
+
+/** A deliberately small subset for automatic inclusion in get_task_context. The full packet is
+ * available through get_task_intelligence; quoted evidence and case bodies are never duplicated
+ * into the context pack. */
+export function summarizeDispatchIntelligence(
+  packet: Awaited<ReturnType<typeof getDispatchIntelligence>>,
+) {
+  return {
+    advisory: true as const,
+    available: true as const,
+    version: packet.version,
+    observedAt: packet.observedAt,
+    executorMode: packet.targetContext.executorMode,
+    repository: {
+      key: packet.targetContext.repositoryKey,
+      reason: packet.targetContext.repositoryResolutionReason,
+      branch: packet.targetContext.branch,
+      baseId: packet.targetContext.baseId,
+    },
+    readiness: packet.current.readiness,
+    collisions: {
+      lockingStatus: packet.current.collisions.locking.status,
+      liveLockCount: packet.current.collisions.locking.current.length,
+      anticipatedPathOverlapCount: packet.current.collisions.anticipatedPaths.overlaps.length,
+      graphImpactOverlapCount: packet.current.collisions.graphImpact.overlaps.length,
+    },
+    blockingHumanInputCount: packet.current.humanBlocks.length,
+    coverage: packet.current.coverage,
+    scope: {
+      status: packet.observations.scope.status,
+      observation: packet.observations.scope.observation,
+    },
+    historicalCaseCount: packet.historical.cases.length,
+    fullPacketTool: 'get_task_intelligence' as const,
   };
 }

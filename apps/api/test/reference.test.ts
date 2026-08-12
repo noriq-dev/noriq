@@ -29,7 +29,7 @@ describe('MCP tool reference', () => {
       resources: Array<{ minimumProjectAction: string }>;
     };
     expect(doc.serverInfo.name).toBe('noriq');
-    expect(doc.catalog).toMatchObject({ valid: true, toolCount: 69, findings: [] });
+    expect(doc.catalog).toMatchObject({ valid: true, toolCount: 70, findings: [] });
     const claim = doc.tools.find((t) => t.name === 'claim_task');
     expect(claim).toBeTruthy();
     expect(claim!.minimumProjectAction).toBe('contribute');

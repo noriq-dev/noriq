@@ -16,6 +16,52 @@ let owner: { apiKey: string };
 beforeAll(async () => { owner = await createAgent('dispatch-intelligence'); }, 60_000);
 
 describe('dispatch-time Project Intelligence (PLNR-303)', () => {
+  it('serves a validated executor-aware packet and bounded summary to MCP Copilots', async () => {
+    const projectId = (await mcpCall(owner.apiKey, 'create_project', {
+      key: 'PICOP', name: 'Copilot intelligence',
+    })).body.id as string;
+    const taskId = (await mcpCall(owner.apiKey, 'create_task', {
+      projectId, title: 'Build through an IDE Copilot', tags: ['analytics-test'],
+      executionSpec: {
+        anticipatedFiles: [{ path: 'apps/api/src/mcp.ts', change: 'modify', why: 'expose intelligence' }],
+      },
+    })).body.id as string;
+    await appEnv.DB.prepare(
+      `INSERT INTO project_repositories (id, project_id, repository_key, created_at)
+       VALUES ('prp_picop', ?, 'noriq', datetime('now'))`,
+    ).bind(projectId).run();
+
+    const full = await mcpCall(owner.apiKey, 'get_task_intelligence', {
+      projectId, taskId, executorMode: 'copilot', repositoryKey: 'noriq', branch: 'main', baseId: 'copilot-base',
+    });
+    expect(full.isError).toBe(false);
+    expect(full.body).toMatchObject({
+      advisory: true,
+      targetContext: { taskId, executorMode: 'copilot', repositoryKey: 'noriq', repositoryResolutionReason: null },
+      current: { readiness: { primary: 'ready' } },
+    });
+
+    const context = await mcpCall(owner.apiKey, 'get_task_context', {
+      projectId, taskId, repositoryKey: 'noriq', branch: 'main', baseId: 'copilot-base', budgetTokens: 500,
+    });
+    expect(context.isError).toBe(false);
+    expect(context.body.intelligenceSummary).toMatchObject({
+      advisory: true, available: true, executorMode: 'copilot',
+      repository: { key: 'noriq', reason: null },
+      readiness: { taskId, primary: 'ready' },
+      fullPacketTool: 'get_task_intelligence',
+    });
+    expect(context.body.intelligenceSummary).not.toHaveProperty('quotedEvidence');
+
+    const unregistered = await mcpCall(owner.apiKey, 'get_task_intelligence', {
+      projectId, taskId, executorMode: 'copilot', repositoryKey: 'not-this-project',
+    });
+    expect(unregistered.isError).toBe(false);
+    expect(unregistered.body.targetContext).toMatchObject({
+      repositoryKey: null, repositoryResolutionReason: 'repository key is not registered to this project',
+    });
+  });
+
   it('loads an explicitly opened completed task outside the bounded open-task inventory', async () => {
     const projectId = (await mcpCall(owner.apiKey, 'create_project', {
       key: 'PIDONE', name: 'Completed dispatch intelligence',

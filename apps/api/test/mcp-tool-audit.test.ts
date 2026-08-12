@@ -13,7 +13,7 @@ describe('complete MCP tool contract audit', () => {
     const audit = auditMcpCatalog(specs);
     expect(audit.findings).toEqual([]);
     expect(audit.valid).toBe(true);
-    expect(audit.toolCount).toBe(69);
+    expect(audit.toolCount).toBe(70);
     expect(Object.keys(MCP_TOOL_POLICIES).sort()).toEqual(specs.tools.map((tool) => tool.name).sort());
   });
 

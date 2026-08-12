@@ -24,6 +24,8 @@ export type BottleneckKind =
   | 'ready' | 'dependency' | 'approval' | 'landing' | 'lock'
   | 'human' | 'execution' | 'runner_capacity' | 'unknown';
 
+export type IntelligenceExecutorMode = 'runner' | 'copilot' | 'human';
+
 export interface BottleneckAssessmentInput {
   taskId?: string | null;
   repositoryKey?: string | null;
@@ -31,6 +33,8 @@ export interface BottleneckAssessmentInput {
   baseId?: string | null;
   observedAt?: string;
   taskLimit?: number;
+  /** Only Runner execution is gated on Runner inventory. */
+  executorMode?: IntelligenceExecutorMode;
 }
 
 type TaskRow = {
@@ -119,6 +123,7 @@ export interface BottleneckAssessmentResult {
     repositoryKey: string | null;
     branch: string | null;
     baseId: string | null;
+    executorMode: IntelligenceExecutorMode;
   };
   sources: {
     current: { kind: 'point_in_time'; coordinationEventSequence: number | null; orchestrationWatermark: string; runnerHeartbeatCutoff: string };
@@ -222,8 +227,9 @@ function primaryClassification(input: {
   lockCollisionIds: string[];
   capacityKnown: boolean;
   availableSlots: number;
+  executorMode: IntelligenceExecutorMode;
 }): { primary: BottleneckKind; reason: string } {
-  const { task, humanSignalIds, lockCollisionIds, capacityKnown, availableSlots } = input;
+  const { task, humanSignalIds, lockCollisionIds, capacityKnown, availableSlots, executorMode } = input;
   if (humanSignalIds.length) return { primary: 'human', reason: 'an open blocking input request parks this task' };
   if (task.liveRuns.length) {
     if (task.liveRuns.some((run) => run.phase === 'landing')) return { primary: 'landing', reason: 'a live run is in its landing phase' };
@@ -246,6 +252,14 @@ function primaryClassification(input: {
     return { primary: 'unknown', reason: task.claimability.reason ?? `task status ${task.status} is not claimable` };
   }
   if (lockCollisionIds.length) return { primary: 'lock', reason: 'a live overlapping lock blocks an anticipated path on this branch' };
+  if (executorMode !== 'runner') {
+    return {
+      primary: 'ready',
+      reason: executorMode === 'copilot'
+        ? 'shared claimability passes for the active Copilot executor; Runner capacity is not applicable'
+        : 'shared claimability passes for the human executor; Runner capacity is not applicable',
+    };
+  }
   if (!capacityKnown) return { primary: 'unknown', reason: 'Runner capacity is unavailable; zero capacity was not inferred' };
   if (availableSlots === 0) return { primary: 'runner_capacity', reason: 'the task is claimable and live capable Runners have no derived free slot' };
   return { primary: 'ready', reason: 'shared claimability passes and a live capable Runner slot is available' };
@@ -363,6 +377,7 @@ export async function assessProjectBottlenecks(
   input: BottleneckAssessmentInput = {},
 ): Promise<BottleneckAssessmentResult> {
   const observedAt = input.observedAt ?? new Date().toISOString();
+  const executorMode = input.executorMode ?? 'runner';
   if (!Number.isFinite(Date.parse(observedAt))) throw new Error('observedAt must be an ISO date-time');
   const focusTaskId = input.taskId ?? null;
   const taskLimit = Math.min(BOTTLENECK_TASK_LIMIT, Math.max(1, Math.trunc(input.taskLimit ?? BOTTLENECK_TASK_LIMIT)));
@@ -580,6 +595,7 @@ export async function assessProjectBottlenecks(
     const primary = primaryClassification({
       task, humanSignalIds: blockingInputRequestIds, lockCollisionIds,
       capacityKnown, availableSlots: capacity.result.availableSlots ?? 0,
+      executorMode,
     });
     return {
       taskId: task.id, taskKey: task.key, title: task.title, status: task.status,
@@ -600,7 +616,7 @@ export async function assessProjectBottlenecks(
   if (!project.fileLockingEnabled) coverageReasons.push('locking_disabled');
   if (prepared.some((task) => !task.anticipatedFiles.length)) coverageReasons.push('anticipated_files_absent');
   if (prepared.some((task) => task.executionSpecUnreadable)) coverageReasons.push('execution_spec_unreadable');
-  if (capacity.result.status === 'unanswerable') coverageReasons.push('runner_capacity_unknown');
+  if (executorMode === 'runner' && capacity.result.status === 'unanswerable') coverageReasons.push('runner_capacity_unknown');
   if (graphImpact.status !== 'observed') coverageReasons.push(...graphImpact.coverageReasons.map((reason) => `graph:${reason}`));
   if (!focus) coverageReasons.push('focus_task_not_supplied');
   const unanswerable = prepared.length === 0 || (focus !== null && !focus.anticipatedFiles.length);
@@ -614,6 +630,7 @@ export async function assessProjectBottlenecks(
       repositoryKey: input.repositoryKey ?? null,
       branch: input.branch ?? null,
       baseId: input.baseId ?? null,
+      executorMode,
     },
     sources: {
       current: {
