@@ -7,7 +7,12 @@
 // the shared predicate, and the active-phase rule that reads it.
 import { describe, expect, it } from 'vitest';
 import { isSettledTaskStatus } from '@noriq-dev/shared';
-import { activePhaseIndex, planDispatchRunCounts } from './PlansView';
+import {
+  activePhaseIndex,
+  PLAN_ARCHIVE_TASK_CANCELLATION_OPTIONS,
+  PLAN_DELETE_TASK_DISPOSITION_OPTIONS,
+  planDispatchRunCounts,
+} from './PlansView';
 
 const PHASES = [{ id: 'ph1' }, { id: 'ph2' }];
 const LINKS = [
@@ -76,5 +81,23 @@ describe('planDispatchRunCounts (PLNR-477)', () => {
       { taskId: 'd', runId: 'run_d', runStatus: 'done' },
       { taskId: 'w', runId: null, runStatus: null },
     ])).toEqual({ waiting: 1, running: 0, done: 1, gated: 1, failed: 1 });
+  });
+});
+
+describe('plan lifecycle task choices (PLNR-480)', () => {
+  it('offers archive-only, open-task cancellation, and all-task cancellation', () => {
+    expect(PLAN_ARCHIVE_TASK_CANCELLATION_OPTIONS).toEqual([
+      { value: 'none', label: 'Keep task statuses unchanged' },
+      { value: 'open', label: 'Cancel open tasks' },
+      { value: 'all', label: 'Cancel every associated task' },
+    ]);
+  });
+
+  it('offers orphan, cancel-and-keep, and permanent deletion when deleting a plan', () => {
+    expect(PLAN_DELETE_TASK_DISPOSITION_OPTIONS).toEqual([
+      { value: 'orphan', label: 'Keep and orphan tasks' },
+      { value: 'cancel', label: 'Cancel and keep tasks' },
+      { value: 'delete', label: 'Permanently delete tasks' },
+    ]);
   });
 });

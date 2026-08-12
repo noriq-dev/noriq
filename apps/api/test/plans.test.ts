@@ -293,6 +293,34 @@ describe('plans & groups', () => {
     expect(tasks.find((task) => task.id === claimedId)).toMatchObject({ status: 'cancelled', claimedBy: null });
   });
 
+  it('manual archive can cancel every member task, including done and review (PLNR-480)', async () => {
+    const plan = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId, title: 'Archive and cancel everything',
+      phases: [{ title: 'Only', newTasks: [
+        { title: 'was already done' },
+        { title: 'was awaiting review' },
+        { title: 'was still queued' },
+      ] }],
+    });
+    const [doneId, reviewId, todoId] = plan.body.phases[0].taskIds as [string, string, string];
+    await mcpCall(planner.apiKey, 'update_task', { projectId, taskId: doneId, status: 'done' });
+    await mcpCall(planner.apiKey, 'update_task', { projectId, taskId: reviewId, status: 'review' });
+
+    const archived = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/plans/${plan.body.id}/archive`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ taskCancellation: 'all' }),
+    });
+    expect(archived.status).toBe(200);
+    expect(await archived.json()).toMatchObject({ archived: true, cancelledTasks: 3 });
+
+    const snap = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } });
+    const tasks = ((await snap.json()) as { tasks: Array<{ id: string; status: string }> }).tasks;
+    for (const taskId of [doneId, reviewId, todoId]) {
+      expect(tasks.find((task) => task.id === taskId)?.status).toBe('cancelled');
+    }
+  });
+
   it('deleting a plan supports explicit orphan or permanent task deletion (PLNR-446)', async () => {
     const orphanPlan = await mcpCall(planner.apiKey, 'create_plan', {
       projectId, title: 'Orphan members', phases: [{ title: 'Only', newTasks: [{ title: 'survivor' }] }],
@@ -317,6 +345,49 @@ describe('plans & groups', () => {
     expect(deleted.status).toBe(200);
     expect(await deleted.json()).toMatchObject({ orphanedTasks: 0, deletedTasks: 1 });
     expect((await mcpCall(planner.apiKey, 'get_task', { taskId: doomedId })).isError).toBe(true);
+  });
+
+  it('deleting a plan can cancel every task without deleting its history (PLNR-480)', async () => {
+    const plan = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId, title: 'Cancel members on delete', phases: [{ title: 'Only', newTasks: [
+        { title: 'completed member' },
+        { title: 'review member' },
+      ] }],
+    });
+    const [doneId, reviewId] = plan.body.phases[0].taskIds as [string, string];
+    await mcpCall(planner.apiKey, 'update_task', { projectId, taskId: doneId, status: 'done' });
+    await mcpCall(planner.apiKey, 'update_task', { projectId, taskId: reviewId, status: 'review' });
+
+    const response = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/plans/${plan.body.id}`, {
+      method: 'DELETE', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ taskDisposition: 'cancel' }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ orphanedTasks: 0, cancelledTasks: 2, deletedTasks: 0 });
+    for (const taskId of [doneId, reviewId]) {
+      const task = await mcpCall(planner.apiKey, 'get_task', { taskId });
+      expect(task.isError).toBe(false);
+      expect(task.body.task.status).toBe('cancelled');
+    }
+  });
+
+  it('rejects invalid plan task cancellation choices at the REST boundary (PLNR-480)', async () => {
+    const plan = await mcpCall(planner.apiKey, 'create_plan', {
+      projectId, title: 'Validate lifecycle choices', phases: [{ title: 'Only', newTasks: [{ title: 'member' }] }],
+    });
+    const badArchive = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/plans/${plan.body.id}/archive`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ taskCancellation: 'settled' }),
+    });
+    expect(badArchive.status).toBe(400);
+    expect(await badArchive.json()).toEqual({ error: 'taskCancellation must be none, open, or all' });
+
+    const badDelete = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/plans/${plan.body.id}`, {
+      method: 'DELETE', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ taskDisposition: 'archive' }),
+    });
+    expect(badDelete.status).toBe(400);
+    expect(await badDelete.json()).toEqual({ error: 'taskDisposition must be orphan, cancel, or delete' });
   });
 
   // ---- PLNR-133: create_plan writes plan + fully-attributed tasks in one call --

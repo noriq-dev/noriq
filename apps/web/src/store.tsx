@@ -782,7 +782,7 @@ export function useAppStore() {
       await api.deleteMilestone(pidRef.current, milestoneId);
       refresh();
     },
-    async deletePlan(planId: string, taskDisposition: 'orphan' | 'delete' = 'orphan') {
+    async deletePlan(planId: string, taskDisposition: 'orphan' | 'cancel' | 'delete' = 'orphan') {
       if (!pidRef.current) return;
       await api.deletePlan(pidRef.current, planId, taskDisposition);
       refresh();

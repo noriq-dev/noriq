@@ -3155,23 +3155,24 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
-  /** Archive / restore a plan (PLNR-148/446). Archiving normally remains display-only, but a
-   *  human may explicitly settle every open member task as cancelled in the same serialized
+  /** Archive / restore a plan (PLNR-148/446/480). Archiving normally remains display-only, but a
+   *  human may explicitly cancel either open or every member task in the same serialized
    *  operation. Restore never changes task state. */
   async setPlanArchived(
     projectId: string,
     actor: Actor,
     planId: string,
     archived: boolean,
-    opts: { cancelOpenTasks?: boolean } = {},
+    opts: { taskCancellation?: 'none' | 'open' | 'all' } = {},
   ) {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const plan = await this.env.DB.prepare('SELECT id, title FROM plans WHERE id = ? AND project_id = ?')
         .bind(planId, projectId).first<{ id: string; title: string }>();
       if (!plan) throw new Error('plan not found');
-      const cancelledTasks = archived && opts.cancelOpenTasks
-        ? await this.cancelOpenPlanTasksLocked(actor, planId)
+      const cancellation = opts.taskCancellation ?? 'none';
+      const cancelledTasks = archived && cancellation !== 'none'
+        ? await this.cancelPlanTasksLocked(actor, planId, cancellation, 'plan archived')
         : 0;
       // A RESTORE stamps archive_restored_at so it survives the auto-sweep (PLNR-225). The sweep
       // reads MAX(tasks.updated_at) as its completion proxy, and a restore moves none of that —
@@ -3185,13 +3186,20 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
-  private async cancelOpenPlanTasksLocked(actor: Actor, planId: string): Promise<number> {
+  private async cancelPlanTasksLocked(
+    actor: Actor,
+    planId: string,
+    scope: 'open' | 'all',
+    reason: 'plan archived' | 'plan deleted',
+  ): Promise<number> {
     const { results: tasks } = await this.env.DB.prepare(
       `SELECT DISTINCT t.id, t.key, t.title, t.status, t.claimed_by AS claimedBy
        FROM phase_tasks pt
        JOIN phases ph ON ph.id = pt.phase_id
        JOIN tasks t ON t.id = pt.task_id
-       WHERE ph.plan_id = ? AND t.status NOT IN ('done', 'cancelled')`,
+       WHERE ph.plan_id = ? AND ${scope === 'open'
+         ? "t.status NOT IN ('done', 'cancelled')"
+         : "t.status <> 'cancelled'"}`,
     ).bind(planId).all<{ id: string; key: string; title: string; status: string; claimedBy: string | null }>();
     if (!tasks.length) return 0;
     const now = nowIso();
@@ -3204,11 +3212,11 @@ export class ProjectRoom extends DurableObject<Env> {
         .bind(now, task.id),
     ]));
     for (const task of tasks) {
-      await this.releaseLocksForTask(task.id, actor, 'plan archived with open tasks cancelled');
+      await this.releaseLocksForTask(task.id, actor, `${reason} with tasks cancelled`);
       await this.emit(actor, 'task.status_changed', 'task', task.id, {
         key: task.key, from: task.status, to: 'cancelled', title: task.title,
         ...(task.claimedBy ? { previousHolder: task.claimedBy } : {}),
-        reason: 'plan archived',
+        reason,
       });
       this.notifyExternalDependents(await this.externalDependentsOf(task.id), { id: task.id, key: task.key });
     }
@@ -3219,12 +3227,13 @@ export class ProjectRoom extends DurableObject<Env> {
   /** Delete a plan + its phases/phase-links, including the dependency edges it minted
    *  to enforce phase order (PLNR-153) — a deleted plan must not leave tasks blocked by
    *  debris nothing explains. Manual (NULL-provenance) edges survive. PLNR-446 makes task
-   *  disposition explicit: orphan keeps member tasks; delete permanently removes them. */
+   *  disposition explicit: orphan keeps member tasks, cancel keeps their history but settles
+   *  them as cancelled, and delete permanently removes them. */
   async deletePlan(
     projectId: string,
     actor: Actor,
     planId: string,
-    taskDisposition: 'orphan' | 'delete' = 'orphan',
+    taskDisposition: 'orphan' | 'cancel' | 'delete' = 'orphan',
   )  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
@@ -3239,6 +3248,9 @@ export class ProjectRoom extends DurableObject<Env> {
          FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE ph.plan_id = ?`,
       ).bind(planId).all<{ taskId: string; phaseId: string }>();
       const memberTaskIds = [...new Set(memberTasks.map((task) => task.taskId))];
+      const cancelledTasks = taskDisposition === 'cancel'
+        ? await this.cancelPlanTasksLocked(actor, planId, 'all', 'plan deleted')
+        : 0;
       if (taskDisposition === 'delete') {
         for (const taskId of memberTaskIds) await this.deleteTaskLocked(actor, taskId);
       }
@@ -3261,6 +3273,7 @@ export class ProjectRoom extends DurableObject<Env> {
       return {
         ok: true,
         deletedTasks: taskDisposition === 'delete' ? memberTaskIds.length : 0,
+        cancelledTasks,
         orphanedTasks: taskDisposition === 'orphan' ? memberTaskIds.length : 0,
       };
     });

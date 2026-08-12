@@ -34,6 +34,21 @@ export function activePhaseIndex(
   );
 }
 
+export const PLAN_ARCHIVE_TASK_CANCELLATION_OPTIONS = [
+  { value: 'none', label: 'Keep task statuses unchanged' },
+  { value: 'open', label: 'Cancel open tasks' },
+  { value: 'all', label: 'Cancel every associated task' },
+] as const;
+
+export const PLAN_DELETE_TASK_DISPOSITION_OPTIONS = [
+  { value: 'orphan', label: 'Keep and orphan tasks' },
+  { value: 'cancel', label: 'Cancel and keep tasks' },
+  { value: 'delete', label: 'Permanently delete tasks' },
+] as const;
+
+type PlanArchiveTaskCancellation = typeof PLAN_ARCHIVE_TASK_CANCELLATION_OPTIONS[number]['value'];
+type PlanDeleteTaskDisposition = typeof PLAN_DELETE_TASK_DISPOSITION_OPTIONS[number]['value'];
+
 export function PlansView({ store }: { store: AppStore }) {
   const { snapshot, currentPid, helpers, actions } = store;
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
@@ -46,8 +61,8 @@ export function PlansView({ store }: { store: AppStore }) {
   const [lifecycle, setLifecycle] = useState<{
     kind: 'archive' | 'delete'; id: string; title: string; openTasks: number; allTasks: number;
   } | null>(null);
-  const [cancelOpenTasks, setCancelOpenTasks] = useState(false);
-  const [deleteDisposition, setDeleteDisposition] = useState<'orphan' | 'delete'>('orphan');
+  const [archiveTaskCancellation, setArchiveTaskCancellation] = useState<PlanArchiveTaskCancellation>('none');
+  const [deleteDisposition, setDeleteDisposition] = useState<PlanDeleteTaskDisposition>('orphan');
   const [lifecycleBusy, setLifecycleBusy] = useState(false);
   const [lifecycleError, setLifecycleError] = useState<string | null>(null);
   const loadDispatchState = async () => {
@@ -178,7 +193,7 @@ export function PlansView({ store }: { store: AppStore }) {
                     e.stopPropagation();
                     if (plan.archivedAt) await api.restorePlan(currentPid, plan.id);
                     else {
-                      setCancelOpenTasks(false);
+                      setArchiveTaskCancellation('none');
                       setLifecycleError(null);
                       setLifecycle({ kind: 'archive', id: plan.id, title: plan.title, openTasks: openTaskCount, allTasks: allTaskIds.length });
                       return;
@@ -368,45 +383,57 @@ export function PlansView({ store }: { store: AppStore }) {
           width={500}
         >
           {lifecycle.kind === 'archive' ? (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
               <div style={{ fontSize: 13, lineHeight: 1.6, color: 'var(--text-soft)' }}>
                 Archiving hides the plan from the default view. Its phases and task associations remain available if the plan is restored.
               </div>
-              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: 12, border: '1px solid var(--w-1)', borderRadius: 10 }}>
-                <input
-                  type="checkbox"
-                  checked={cancelOpenTasks}
-                  disabled={lifecycle.openTasks === 0}
-                  onChange={(event) => setCancelOpenTasks(event.target.checked)}
-                  style={{ marginTop: 2 }}
-                />
-                <span>
-                  <span style={{ display: 'block', fontSize: 12.5, fontWeight: 650 }}>Cancel all open tasks</span>
-                  <span style={{ display: 'block', marginTop: 3, fontSize: 11.5, lineHeight: 1.5, color: 'var(--text-dim)' }}>
-                    {lifecycle.openTasks
-                      ? `${lifecycle.openTasks} unfinished task${lifecycle.openTasks === 1 ? '' : 's'} will be marked cancelled and any active claims released.`
-                      : 'This plan has no open tasks.'}
-                  </span>
-                </span>
-              </label>
+              {PLAN_ARCHIVE_TASK_CANCELLATION_OPTIONS.map(({ value, label }) => {
+                const description = value === 'none'
+                  ? 'Archive only; no task status or claim changes.'
+                  : value === 'open'
+                    ? lifecycle.openTasks
+                      ? `${lifecycle.openTasks} unfinished task${lifecycle.openTasks === 1 ? '' : 's'} will be cancelled and any active claims released.`
+                      : 'This plan has no open tasks to cancel.'
+                    : `${lifecycle.allTasks} associated task${lifecycle.allTasks === 1 ? '' : 's'} will be cancelled, including tasks in done or review, and any active claims released.`;
+                return (
+                  <label key={value} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: 12, border: `1px solid ${archiveTaskCancellation === value ? 'rgba(198,242,78,.45)' : 'var(--w-1)'}`, borderRadius: 10 }}>
+                    <input
+                      type="radio"
+                      name="plan-archive-task-cancellation"
+                      value={value}
+                      checked={archiveTaskCancellation === value}
+                      onChange={() => setArchiveTaskCancellation(value)}
+                      style={{ marginTop: 2 }}
+                    />
+                    <span>
+                      <span style={{ display: 'block', fontSize: 12.5, fontWeight: 650 }}>{label}</span>
+                      <span style={{ display: 'block', marginTop: 3, fontSize: 11.5, lineHeight: 1.5, color: 'var(--text-dim)' }}>{description}</span>
+                    </span>
+                  </label>
+                );
+              })}
             </div>
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
               <div style={{ fontSize: 13, lineHeight: 1.6, color: 'var(--text-soft)', marginBottom: 2 }}>
                 Deleting the plan permanently removes its phases and plan-local documents. Choose what happens to its associated tasks.
               </div>
-              {([
-                ['orphan', 'Keep and orphan tasks', 'Remove the plan association while keeping every task and its history.'],
-                ['delete', 'Permanently delete tasks', `Delete all ${lifecycle.allTasks} associated tasks and their comments, attachments, claims, and references.`],
-              ] as const).map(([value, label, description]) => (
-                <label key={value} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: 12, border: `1px solid ${deleteDisposition === value ? 'rgba(198,242,78,.45)' : 'var(--w-1)'}`, borderRadius: 10 }}>
-                  <input type="radio" name="plan-task-disposition" value={value} checked={deleteDisposition === value} onChange={() => setDeleteDisposition(value)} style={{ marginTop: 2 }} />
-                  <span>
-                    <span style={{ display: 'block', fontSize: 12.5, fontWeight: 650 }}>{label}</span>
-                    <span style={{ display: 'block', marginTop: 3, fontSize: 11.5, lineHeight: 1.5, color: 'var(--text-dim)' }}>{description}</span>
-                  </span>
-                </label>
-              ))}
+              {PLAN_DELETE_TASK_DISPOSITION_OPTIONS.map(({ value, label }) => {
+                const description = value === 'orphan'
+                  ? 'Remove the plan association while keeping every task and its history.'
+                  : value === 'cancel'
+                    ? `Mark all ${lifecycle.allTasks} associated tasks cancelled, including done or review, while keeping their history.`
+                    : `Delete all ${lifecycle.allTasks} associated tasks and their comments, attachments, claims, and references.`;
+                return (
+                  <label key={value} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: 12, border: `1px solid ${deleteDisposition === value ? 'rgba(198,242,78,.45)' : 'var(--w-1)'}`, borderRadius: 10 }}>
+                    <input type="radio" name="plan-task-disposition" value={value} checked={deleteDisposition === value} onChange={() => setDeleteDisposition(value)} style={{ marginTop: 2 }} />
+                    <span>
+                      <span style={{ display: 'block', fontSize: 12.5, fontWeight: 650 }}>{label}</span>
+                      <span style={{ display: 'block', marginTop: 3, fontSize: 11.5, lineHeight: 1.5, color: 'var(--text-dim)' }}>{description}</span>
+                    </span>
+                  </label>
+                );
+              })}
             </div>
           )}
           {lifecycleError && <div style={{ marginTop: 14 }}><ErrorNote>{lifecycleError}</ErrorNote></div>}
@@ -419,7 +446,7 @@ export function PlansView({ store }: { store: AppStore }) {
                 setLifecycleBusy(true); setLifecycleError(null);
                 try {
                   if (lifecycle.kind === 'archive') {
-                    await api.archivePlan(currentPid, lifecycle.id, { cancelOpenTasks });
+                    await api.archivePlan(currentPid, lifecycle.id, { taskCancellation: archiveTaskCancellation });
                     actions.refreshNow();
                   } else {
                     await store.actions.deletePlan(lifecycle.id, deleteDisposition);

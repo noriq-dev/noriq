@@ -403,9 +403,9 @@ export const api = {
     req('PATCH', `/api/projects/${pid}/tasks/${tid}`, patch),
   deleteMilestone: (pid: string, mid: string) => req('DELETE', `/api/projects/${pid}/milestones/${mid}`),
   deleteTag: (pid: string, tid: string) => req('DELETE', `/api/projects/${pid}/tags/${tid}`),
-  deletePlan: (pid: string, plid: string, taskDisposition: 'orphan' | 'delete' = 'orphan') =>
-    req<{ ok: true; deletedTasks: number; orphanedTasks: number }>('DELETE', `/api/projects/${pid}/plans/${plid}`, { taskDisposition }),
-  archivePlan: (pid: string, plid: string, options: { cancelOpenTasks?: boolean } = {}) =>
+  deletePlan: (pid: string, plid: string, taskDisposition: 'orphan' | 'cancel' | 'delete' = 'orphan') =>
+    req<{ ok: true; deletedTasks: number; cancelledTasks: number; orphanedTasks: number }>('DELETE', `/api/projects/${pid}/plans/${plid}`, { taskDisposition }),
+  archivePlan: (pid: string, plid: string, options: { taskCancellation?: 'none' | 'open' | 'all' } = {}) =>
     req<{ ok: true; archived: true; cancelledTasks: number }>('POST', `/api/projects/${pid}/plans/${plid}/archive`, options),
   restorePlan: (pid: string, plid: string) => req('POST', `/api/projects/${pid}/plans/${plid}/restore`),
   approvePlan: (pid: string, plid: string) => req<{ id: string; status: string; tasksUngated: number }>('POST', `/api/projects/${pid}/plans/${plid}/approve`),

@@ -1503,10 +1503,10 @@ app.delete('/api/projects/:pid/tags/:tid', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).deleteTag(c.req.param('pid')!, humanActor(c), c.req.param('tid')!)));
 
 app.delete('/api/projects/:pid/plans/:plid', userAuth, async (c) => {
-  const body = await c.req.json<{ taskDisposition?: 'orphan' | 'delete' }>()
-    .catch((): { taskDisposition?: 'orphan' | 'delete' } => ({}));
-  if (body.taskDisposition !== undefined && body.taskDisposition !== 'orphan' && body.taskDisposition !== 'delete') {
-    return c.json({ error: 'taskDisposition must be orphan or delete' }, 400);
+  const body = await c.req.json<{ taskDisposition?: 'orphan' | 'cancel' | 'delete' }>()
+    .catch((): { taskDisposition?: 'orphan' | 'cancel' | 'delete' } => ({}));
+  if (body.taskDisposition !== undefined && !['orphan', 'cancel', 'delete'].includes(body.taskDisposition)) {
+    return c.json({ error: 'taskDisposition must be orphan, cancel, or delete' }, 400);
   }
   return c.json(await room(c.env, c.req.param('pid')!).deletePlan(
     c.req.param('pid')!, humanActor(c), c.req.param('plid')!, body.taskDisposition ?? 'orphan',
@@ -2733,15 +2733,27 @@ app.get('/api/ask/generations/:generationId/stream', userAuth, async (c) => {
   });
 });
 
-// Archive / restore a plan (PLNR-148) — display-only; see setPlanArchived.
+// Archive / restore a plan (PLNR-148/480). Archive remains display-only by default; a human
+// may explicitly combine it with open-task or all-task cancellation.
 app.post('/api/projects/:pid/plans/:plid/archive', userAuth, async (c) => {
-  const body = await c.req.json<{ cancelOpenTasks?: boolean }>()
-    .catch((): { cancelOpenTasks?: boolean } => ({}));
+  type ArchivePlanBody = {
+    taskCancellation?: 'none' | 'open' | 'all';
+    /** PLNR-446 compatibility for clients predating taskCancellation. */
+    cancelOpenTasks?: boolean;
+  };
+  const body = await c.req.json<ArchivePlanBody>().catch((): ArchivePlanBody => ({}));
   if (body.cancelOpenTasks !== undefined && typeof body.cancelOpenTasks !== 'boolean') {
     return c.json({ error: 'cancelOpenTasks must be a boolean' }, 400);
   }
+  if (body.taskCancellation !== undefined && !['none', 'open', 'all'].includes(body.taskCancellation)) {
+    return c.json({ error: 'taskCancellation must be none, open, or all' }, 400);
+  }
+  if (body.taskCancellation !== undefined && body.cancelOpenTasks !== undefined) {
+    return c.json({ error: 'send taskCancellation or cancelOpenTasks, not both' }, 400);
+  }
+  const taskCancellation = body.taskCancellation ?? (body.cancelOpenTasks ? 'open' : 'none');
   return c.json(await room(c.env, c.req.param('pid')!).setPlanArchived(
-    c.req.param('pid')!, humanActor(c), c.req.param('plid')!, true, { cancelOpenTasks: body.cancelOpenTasks },
+    c.req.param('pid')!, humanActor(c), c.req.param('plid')!, true, { taskCancellation },
   ));
 });
 app.post('/api/projects/:pid/plans/:plid/restore', userAuth, async (c) =>
