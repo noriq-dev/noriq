@@ -336,6 +336,53 @@ describe('the review gate (the design decision of PLNR-170)', () => {
 });
 
 describe('failure, retry, cancel, completion', () => {
+  it('does not auto-redispatch gated work, frees capacity for peers, and surfaces review (PLNR-477)', async () => {
+    const runner = await seedRunner(1);
+    const { planId, a, b, c } = await makePlan('gated');
+    const d = await createDispatch(runner, planId);
+    const runA = (await dispatchRuns(d.id)).find((r) => r.taskId === a)!;
+    const agent = await seedAgent(runner);
+    await room(pid).transitionRun(pid, actor, runA.id, { status: 'running', agentId: agent });
+    await room(pid).claimTask(pid, actor, a, agent);
+
+    // Compatibility frame emitted by pipeline-v2 before the shared vocabulary landed.
+    const gated = await room(pid).transitionRun(pid, actor, runA.id, {
+      status: 'failed', exit: { outcome: 'failed', reason: 'gated', finishedAt: new Date().toISOString() },
+    });
+    expect(gated.status).toBe('gated');
+
+    // The terminal wake-up spends the free slot on the independent peer, never another a.
+    let runs = await dispatchRuns(d.id);
+    expect(runs.filter((r) => r.taskId === a)).toHaveLength(1);
+    expect(runs.map((r) => r.taskId)).toContain(b);
+    expect(runs.map((r) => r.taskId)).not.toContain(c);
+    await room(pid).pumpProjectDispatches(pid);
+    runs = await dispatchRuns(d.id);
+    expect(runs.filter((r) => r.taskId === a)).toHaveLength(1);
+
+    const task = await env.DB.prepare('SELECT status, failed_at AS failedAt, claimed_by AS claimedBy FROM tasks WHERE id = ?')
+      .bind(a).first<{ status: string; failedAt: string | null; claimedBy: string | null }>();
+    expect(task).toEqual({ status: 'review', failedAt: null, claimedBy: null });
+    const view = (await room(pid).listPlanDispatches(pid, planId)).dispatches[0]!;
+    expect(view.tasks.find((t) => t.taskId === a)?.runStatus).toBe('gated');
+  });
+
+  it.each(['review:structural', 'review:no-verdict', 'review:floor'])(
+    'does not auto-redispatch the terminal review stop %s (PLNR-477)',
+    async (reason) => {
+      const runner = await seedRunner(1);
+      const { planId, a, b } = await makePlan(`stop-${reason}`);
+      const d = await createDispatch(runner, planId);
+      const runA = (await dispatchRuns(d.id)).find((r) => r.taskId === a)!;
+      // Remove the peer from readiness, leaving enough capacity to expose an accidental retry.
+      await room(pid).updateTask(pid, actor, b, { status: 'done' });
+      await room(pid).transitionRun(pid, actor, runA.id, { status: 'running' });
+      await room(pid).transitionRun(pid, actor, runA.id, { status: 'failed', reason });
+      await room(pid).pumpProjectDispatches(pid);
+      expect((await dispatchRuns(d.id)).filter((r) => r.taskId === a)).toHaveLength(1);
+    },
+  );
+
   it('a gate-failed phase task becomes failed, holds the plan (blocks the next phase), and retry re-arms it (PLNR-178)', async () => {
     const runner = await seedRunner(2);
     const { planId, a, b, c } = await makePlan('failgate');

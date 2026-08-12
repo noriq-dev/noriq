@@ -415,13 +415,27 @@ export interface PlanDispatchView {
 // process); dispatched/running/blocked have a live (or expected-live) process.
 const RUN_TRANSITIONS: Record<string, string[]> = {
   queued: ['dispatched', 'cancelled'],
-  dispatched: ['running', 'failed', 'cancelled'],
-  running: ['blocked', 'done', 'failed', 'cancelled'],
-  blocked: ['running', 'done', 'failed', 'cancelled'],
+  dispatched: ['running', 'gated', 'failed', 'cancelled'],
+  running: ['blocked', 'done', 'gated', 'failed', 'cancelled'],
+  blocked: ['running', 'done', 'gated', 'failed', 'cancelled'],
   done: [],
+  gated: [],
   failed: [],
   cancelled: [],
 };
+
+/** D1's original runs.status CHECK cannot be widened in place because several later tables
+ * reference runs(id). Store gated as the legacy terminal `failed`, while the exit JSON carries
+ * the truthful outcome and every wire read derives the first-class status from it. */
+function logicalRunStatus(run: Pick<RunRow, 'status' | 'exit'>): string {
+  if (run.status !== 'failed' || !run.exit) return run.status;
+  try {
+    const exit = JSON.parse(run.exit) as { outcome?: unknown; reason?: unknown };
+    return exit.outcome === 'gated' || exit.reason === 'gated' ? 'gated' : run.status;
+  } catch {
+    return run.status;
+  }
+}
 
 /*
  * SERIALIZATION NOTE (PLNR-19): D1 calls are subrequests and do NOT close the
@@ -3787,6 +3801,7 @@ export class ProjectRoom extends DurableObject<Env> {
   }
 
   private runToWire(r: RunRow): RunView {
+    const exit = r.exit ? JSON.parse(r.exit) as Record<string, unknown> : null;
     return {
       id: r.id,
       projectId: r.project_id,
@@ -3819,12 +3834,12 @@ export class ProjectRoom extends DurableObject<Env> {
       model: r.model,
       effort: r.effort,
       budget: JSON.parse(r.budget || '{}'),
-      status: r.status,
+      status: logicalRunStatus(r),
       // Sub-state of running (RUN-31): 'verifying'/'landing' are the ~60–90s in which the
       // dashboard used to show a blanket "running" with the spend frozen — a gate at work
       // is indistinguishable from a hung agent unless it says so.
       phase: r.phase as RunPhase | null,
-      exit: r.exit ? JSON.parse(r.exit) : null,
+      exit,
       worktreePath: r.worktree_path,
       tokensUsed: r.tokens_used,
       usdSpent: r.usd_spent,
@@ -3970,7 +3985,10 @@ export class ProjectRoom extends DurableObject<Env> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const run = await this.loadRun(runId);
-      if (run.status !== 'failed') throw new Error(`only a failed run can be continued (this one is ${run.status})`);
+      const priorStatus = logicalRunStatus(run);
+      if (priorStatus !== 'failed' && priorStatus !== 'gated') {
+        throw new Error(`only a failed or gated run can be continued (this one is ${priorStatus})`);
+      }
       if (run.kind !== 'build') throw new Error('only a build run keeps a worktree to continue');
       if (!run.runner_id) throw new Error('run has no runner — nothing holds its worktree');
       // The kept worktree is machine-local: continue MUST go back to the same runner, and only if
@@ -4022,7 +4040,7 @@ export class ProjectRoom extends DurableObject<Env> {
                 sitting = sitting + 1, budget = ?, dispatched_at = ?, updated_at = ? WHERE id = ?`,
       ).bind(JSON.stringify(budget), now, now, runId).run();
       await captureRunCommissioningSnapshot(this.env.DB, this.projectId, runId, now);
-      await this.emit(actor, 'run.status_changed', 'run', runId, { from: 'failed', to: 'dispatched', reason: 'continue', maxRounds: rounds });
+      await this.emit(actor, 'run.status_changed', 'run', runId, { from: priorStatus, to: 'dispatched', reason: 'continue', maxRounds: rounds });
 
       // Re-arm the anchor task — the inverse of the failed settle. Clear `failed_at` and hand it
       // back as a claimable `todo` (claim cleared) so the fresh builder session re-claims it; the
@@ -4030,13 +4048,15 @@ export class ProjectRoom extends DurableObject<Env> {
       // NOT NULL` so a human who already accepted/moved the task first is never stomped.
       if (run.anchor_type === 'task' && run.anchor_id) {
         const { meta } = await this.env.DB.prepare(
-          "UPDATE tasks SET status = 'todo', failed_at = NULL, claimed_by = NULL, claim_expires_at = NULL, updated_at = ? WHERE id = ? AND failed_at IS NOT NULL",
+          `UPDATE tasks SET status = 'todo', failed_at = NULL, claimed_by = NULL,
+                  claim_expires_at = NULL, updated_at = ?
+            WHERE id = ? AND ${priorStatus === 'gated' ? "status = 'review'" : 'failed_at IS NOT NULL'}`,
         ).bind(now, run.anchor_id).run();
         if (meta.changes) {
           const t = await this.env.DB.prepare('SELECT key, title FROM tasks WHERE id = ?')
             .bind(run.anchor_id).first<{ key: string; title: string }>();
           await this.emit(actor, 'task.status_changed', 'task', run.anchor_id, {
-            key: t?.key, from: 'failed', to: 'todo', title: t?.title, reason: 'run_continued',
+            key: t?.key, from: priorStatus === 'gated' ? 'review' : 'failed', to: 'todo', title: t?.title, reason: 'run_continued',
           });
         }
       }
@@ -4250,8 +4270,9 @@ export class ProjectRoom extends DurableObject<Env> {
            SELECT 1 FROM runs dr
            WHERE dr.anchor_type = 'task' AND dr.anchor_id = dt.id AND dr.status = 'done'))`
       : '';
-    // One attempt per task per dispatch; retry re-arms tasks whose attempts all ended
-    // failed/cancelled (which includes an agent that punted the task back to todo).
+    // One attempt per task per dispatch: automatic pumps never re-run terminal gated/review-stop
+    // attempts. `retry` is a separate, human-triggered path and only re-arms failed/cancelled
+    // tasks; gated anchors sit in review until the operator deliberately continues that run.
     const attempted = opts.retry
       ? `AND ar.status NOT IN ('failed','cancelled')`
       : '';
@@ -4442,7 +4463,7 @@ export class ProjectRoom extends DurableObject<Env> {
   private async planDispatchToWire(row: PlanDispatchRow): Promise<PlanDispatchView> {
     // Every plan task with its LATEST run from this dispatch — the dashboard's progress strip.
     const { results: tasks } = await this.env.DB.prepare(
-      `SELECT t.id AS taskId, r.id AS runId, r.status AS runStatus
+      `SELECT t.id AS taskId, r.id AS runId, r.status AS runStatus, r.exit AS runExit
        FROM phase_tasks pt
          JOIN phases ph ON ph.id = pt.phase_id
          JOIN tasks t ON t.id = pt.task_id
@@ -4452,7 +4473,7 @@ export class ProjectRoom extends DurableObject<Env> {
            ORDER BY r2.created_at DESC LIMIT 1)
        WHERE ph.plan_id = ?2
        ORDER BY ph."order", t."order"`,
-    ).bind(row.id, row.plan_id).all<{ taskId: string; runId: string | null; runStatus: string | null }>();
+    ).bind(row.id, row.plan_id).all<{ taskId: string; runId: string | null; runStatus: string | null; runExit: string | null }>();
     return {
       id: row.id,
       projectId: row.project_id,
@@ -4467,7 +4488,11 @@ export class ProjectRoom extends DurableObject<Env> {
       status: row.status as PlanDispatchView['status'],
       stallReason: row.stall_reason,
       workflow: row.workflow,
-      tasks: tasks.map((t) => ({ taskId: t.taskId, runId: t.runId, runStatus: t.runStatus })),
+      tasks: tasks.map((t) => ({
+        taskId: t.taskId,
+        runId: t.runId,
+        runStatus: t.runStatus ? logicalRunStatus({ status: t.runStatus, exit: t.runExit }) : null,
+      })),
       createdBy: row.created_by,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
@@ -4583,8 +4608,15 @@ export class ProjectRoom extends DurableObject<Env> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const run = await this.loadRun(runId);
-      const to = RunStatus.parse(patch.status);
-      if (to === run.status) {
+      const requested = RunStatus.parse(patch.status);
+      const patchExit = patch.exit ?? {};
+      const exitReason = patchExit.reason ?? patch.reason ?? null;
+      // PIPELINE-V2 shipped before this contract by reporting failed + reason=gated. Normalize
+      // that compatibility carrier at the authority boundary so old and new daemons converge.
+      const to = requested === 'gated' || patchExit.outcome === 'gated'
+        || (requested === 'failed' && exitReason === 'gated') ? 'gated' : requested;
+      const from = logicalRunStatus(run);
+      if (to === from) {
         const agentId = patch.agentId !== undefined ? patch.agentId : run.agent_id;
         const worktreePath = patch.worktreePath !== undefined ? patch.worktreePath : run.worktree_path;
         // Phase deliberately untouched: it rides the telemetry frame (RUN-31), and letting the
@@ -4593,8 +4625,8 @@ export class ProjectRoom extends DurableObject<Env> {
           .bind(agentId, worktreePath, nowIso(), runId).run();
         return this.runToWire(await this.loadRun(runId));
       }
-      if (!RUN_TRANSITIONS[run.status]?.includes(to)) {
-        throw new Error(`illegal run transition ${run.status} -> ${to}`);
+      if (!RUN_TRANSITIONS[from]?.includes(to)) {
+        throw new Error(`illegal run transition ${from} -> ${to}`);
       }
       const now = nowIso();
       const startedAt = to === 'running' && !run.started_at ? now : run.started_at;
@@ -4604,8 +4636,9 @@ export class ProjectRoom extends DurableObject<Env> {
       if (isTerminalRunStatus(to)) {
         // Synthesize a RunExit if the caller didn't supply one; caller fields win.
         exitJson = JSON.stringify({
-          outcome: to, code: null, signal: null, reason: patch.reason ?? null, finishedAt: now,
+          code: null, signal: null, reason: patch.reason ?? null, finishedAt: now,
           ...(patch.exit ?? {}),
+          outcome: to,
         });
       }
       // Phase is a sub-state of `running` (RUN-31), so terminality ends it — a done Run that
@@ -4613,10 +4646,11 @@ export class ProjectRoom extends DurableObject<Env> {
       // it can be cleared: telemetry ticks COALESCE, so the daemon can set a phase but never
       // unset one, and the DO is what actually knows the Run is over.
       const phase = isTerminalRunStatus(to) ? null : (patch.phase ?? run.phase);
+      const storedStatus = to === 'gated' ? 'failed' : to;
       const transitionStatements = [this.env.DB.prepare(
         `UPDATE runs SET status = ?, agent_id = ?, exit = ?, worktree_path = ?, phase = ?,
                 started_at = ?, updated_at = ? WHERE id = ?`,
-      ).bind(to, agentId, exitJson, worktreePath, phase, startedAt, now, runId)];
+      ).bind(storedStatus, agentId, exitJson, worktreePath, phase, startedAt, now, runId)];
       if (isTerminalRunStatus(to)) {
         transitionStatements.push(this.env.DB.prepare(
           `INSERT INTO memory_episode_jobs (project_id, run_id, sitting, requested_at)
@@ -4629,7 +4663,7 @@ export class ProjectRoom extends DurableObject<Env> {
       // repaired synchronously here for old and new Runners alike; daemon-reported child work
       // uses the additive execution protocol separately.
       await mirrorRunTransition(this.env, {
-        runId, from: run.status, to, observedAt: patch.observedAt ?? now, reason: patch.reason,
+        runId, from, to, observedAt: patch.observedAt ?? now, reason: exitReason as string | null,
       });
       if (isTerminalRunStatus(to) && agentId) await this.retireRunAgent(agentId);
       // The RUN's terminal outcome now moves its anchor task — not the agent (RUN-83). The build
@@ -4649,7 +4683,7 @@ export class ProjectRoom extends DurableObject<Env> {
           ),
         );
       }
-      await this.emit(actor, 'run.status_changed', 'run', runId, { from: run.status, to, reason: patch.reason ?? null });
+      await this.emit(actor, 'run.status_changed', 'run', runId, { from, to, reason: exitReason });
       // A terminal run is the plan-dispatch pump's main wake-up (PLNR-170): it freed a slot,
       // and if it was `done` it may have landed the dependency some other task waits on.
       // pumpLiveDispatches never throws — scheduling must not reject the daemon's report.
@@ -4670,7 +4704,7 @@ export class ProjectRoom extends DurableObject<Env> {
    */
   /**
    * Move a build run's anchor task to match the run's terminal outcome (RUN-83): gate passed
-   * (`done`) → `review`; gate failed → `failed`; cancelled → back to the queue.
+   * (`done`) → `review`; gated preserved work → `review`; gate failed → `failed`; cancelled → back to the queue.
    *
    * `failed` is a DERIVED wire status: D1 cannot widen tasks.status's CHECK (0049), so a
    * gate-failed task keeps a real status of `todo` — which is what lets the plan-dispatch RETRY
@@ -4778,7 +4812,7 @@ export class ProjectRoom extends DurableObject<Env> {
     // Built as ONE statement so there is exactly one place that can notice it changed nothing.
     let set: string;
     const pre: string[] = [];
-    if (outcome === 'done') {
+    if (outcome === 'done' || outcome === 'gated') {
       set = "status = 'review', failed_at = NULL";
     } else if (outcome === 'failed') {
       set = "status = 'todo', failed_at = ?";
@@ -4902,7 +4936,12 @@ export class ProjectRoom extends DurableObject<Env> {
     const clauses = ['project_id = ?'];
     const binds: unknown[] = [projectId];
     if (opts.runnerId) { clauses.push('runner_id = ?'); binds.push(opts.runnerId); }
-    if (opts.status) { clauses.push('status = ?'); binds.push(opts.status); }
+    // Both logical `gated` and `failed` use the legacy failed storage value. Fetch that bucket
+    // and separate it after deriving the wire status; every other status remains SQL-filterable.
+    if (opts.status) {
+      clauses.push('status = ?');
+      binds.push(opts.status === 'gated' ? 'failed' : opts.status);
+    }
     const { results } = await this.env.DB.prepare(
       `SELECT * FROM runs WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC`,
     ).bind(...binds).all<RunRow>();
@@ -4913,7 +4952,10 @@ export class ProjectRoom extends DurableObject<Env> {
       'SELECT spinoff_run_id AS rid, COUNT(*) AS n FROM tasks WHERE project_id = ? AND spinoff_run_id IS NOT NULL GROUP BY spinoff_run_id',
     ).bind(projectId).all<{ rid: string; n: number }>();
     const spinoffsByRun = new Map(spun.map((s) => [s.rid, s.n]));
-    return results.map((r) => ({ ...this.runToWire(r), spinoffs: spinoffsByRun.get(r.id) ?? 0 }));
+    const wire = results.map((r) => ({ ...this.runToWire(r), spinoffs: spinoffsByRun.get(r.id) ?? 0 }));
+    return opts.status === 'failed' || opts.status === 'gated'
+      ? wire.filter((r) => r.status === opts.status)
+      : wire;
   }
 
   async getRun(projectId: string, runId: string): Promise<RunView> {

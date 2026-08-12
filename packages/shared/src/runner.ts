@@ -79,19 +79,20 @@ export type RunModelUsage = z.infer<typeof RunModelUsage>;
 export type RunEffort = z.infer<typeof RunEffort>;
 
 // Run lifecycle: queued → dispatched → running → (blocked ⇄ running) → terminal.
-// terminal ∈ {done, failed, cancelled}. `blocked` = agent parked on request_input.
+// terminal ∈ {done, gated, failed, cancelled}. `blocked` = agent parked on request_input.
 export const RunStatus = z.enum([
   'queued', // created server-side, not yet handed to a runner
   'dispatched', // sent to a runner over /ws/runner, process not yet up
   'running', // agent process live
   'blocked', // parked awaiting a human decision (request_input); resumable → running
   'done', // completed; artifact landed (proposed plan / review diff / verify verdict)
+  'gated', // review blockers stand over preserved work; a human decides whether to continue
   'failed', // process error, budget breach, or verify gate rejection
   'cancelled', // killed by a human
 ]);
 export type RunStatus = z.infer<typeof RunStatus>;
 
-const TERMINAL_RUN_STATUSES = ['done', 'failed', 'cancelled'] as const;
+const TERMINAL_RUN_STATUSES = ['done', 'gated', 'failed', 'cancelled'] as const;
 export const isTerminalRunStatus = (s: RunStatus): boolean =>
   (TERMINAL_RUN_STATUSES as readonly string[]).includes(s);
 
@@ -139,9 +140,9 @@ export const RunBudget = z.object({
 });
 export type RunBudget = z.infer<typeof RunBudget>;
 
-// Terminal outcome detail, set when the Run reaches done|failed|cancelled.
+// Terminal outcome detail, set when the Run reaches done|gated|failed|cancelled.
 export const RunExit = z.object({
-  outcome: z.enum(['done', 'failed', 'cancelled']),
+  outcome: z.enum(['done', 'gated', 'failed', 'cancelled']),
   code: z.number().int().nullable().default(null), // process exit code, if any
   signal: z.string().nullable().default(null), // e.g. "SIGTERM" on budget breach
   reason: z.string().nullable().default(null), // human-readable cause

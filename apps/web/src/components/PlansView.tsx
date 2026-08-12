@@ -585,13 +585,7 @@ function PlanDispatchStrip({
   const live = dispatch !== null && (dispatch.status === 'active' || dispatch.status === 'stalled');
 
   if (live) {
-    const counts = { waiting: 0, running: 0, done: 0, failed: 0 };
-    for (const t of dispatch.tasks) {
-      if (!t.runStatus) counts.waiting += 1;
-      else if (t.runStatus === 'done') counts.done += 1;
-      else if (t.runStatus === 'failed' || t.runStatus === 'cancelled') counts.failed += 1;
-      else counts.running += 1;
-    }
+    const counts = planDispatchRunCounts(dispatch.tasks);
     const stalled = dispatch.status === 'stalled';
     const runner = runners.find((r) => r.id === dispatch.runnerId);
     const tone = stalled ? '#f5a623' : 'var(--green)';
@@ -613,6 +607,7 @@ function PlanDispatchStrip({
         {dispatch.workflow && <MonoTag color="var(--purple)" bg="rgba(167,139,250,.12)" size={9}>{dispatch.workflow}</MonoTag>}
         <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>
           {counts.running} running · {counts.done} done
+          {counts.gated ? ` · ${counts.gated} gated` : ''}
           {counts.failed ? ` · ${counts.failed} failed` : ''} · {counts.waiting} waiting
         </span>
         {stalled && dispatch.stallReason && (
@@ -701,6 +696,19 @@ function PlanDispatchStrip({
       )}
     </div>
   );
+}
+
+/** Keep gated preserved-work stops visible as a decision, not folded into failed execution. */
+export function planDispatchRunCounts(tasks: ApiPlanDispatch['tasks']) {
+  const counts = { waiting: 0, running: 0, done: 0, gated: 0, failed: 0 };
+  for (const task of tasks) {
+    if (!task.runStatus) counts.waiting += 1;
+    else if (task.runStatus === 'done') counts.done += 1;
+    else if (task.runStatus === 'gated') counts.gated += 1;
+    else if (task.runStatus === 'failed' || task.runStatus === 'cancelled') counts.failed += 1;
+    else counts.running += 1;
+  }
+  return counts;
 }
 
 function PlanDispatchForm({

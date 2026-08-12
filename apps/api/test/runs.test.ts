@@ -3,6 +3,7 @@
 // DO methods directly via the stub (the HTTP/WS dispatch surface lands in RUN-7).
 import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
+import { RunExit, RunStatus, isTerminalRunStatus } from '@noriq-dev/shared';
 import type { Actor, CreateRunInput, RunPatch, RunView } from '../src/do/ProjectRoom';
 import type { Env } from '../src/env';
 import { createAgent, createUser, loginSession, mcpCall, mintTokenForUser, authorizeForAllProjects } from './helpers';
@@ -113,6 +114,44 @@ describe('run lifecycle in ProjectRoom (RUN-6)', () => {
     expect(done.status).toBe('done');
     expect(done.exit).toMatchObject({ outcome: 'done' });
     expect(done.exit!.finishedAt).toBeTruthy();
+  });
+
+  it('treats gated as a first-class terminal outcome while retaining legacy D1 storage (PLNR-477)', async () => {
+    expect(RunStatus.parse('gated')).toBe('gated');
+    expect(isTerminalRunStatus('gated')).toBe(true);
+    expect(RunExit.parse({ outcome: 'gated', reason: 'review:structural', finishedAt: new Date().toISOString() }).outcome).toBe('gated');
+
+    const run = await room(pid).createRun(pid, actor, {
+      kind: 'build', repoRef: 'r', agentTool: 'claude', runnerId: 'rnr_1',
+    });
+    await room(pid).transitionRun(pid, actor, run.id, { status: 'running', agentId: 'agt_spawned' });
+    const gated = await room(pid).transitionRun(pid, actor, run.id, {
+      status: 'gated',
+      exit: { outcome: 'gated', reason: 'review:structural', finishedAt: new Date().toISOString() },
+    });
+    expect(gated.status).toBe('gated');
+    expect(gated.exit).toMatchObject({ outcome: 'gated', reason: 'review:structural' });
+    expect((await room(pid).getRun(pid, run.id)).status).toBe('gated');
+    expect((await room(pid).listRuns(pid, { status: 'gated' })).map((r) => r.id)).toContain(run.id);
+    expect((await room(pid).listRuns(pid, { status: 'failed' })).map((r) => r.id)).not.toContain(run.id);
+
+    const stored = await env.DB.prepare('SELECT status, exit FROM runs WHERE id = ?')
+      .bind(run.id).first<{ status: string; exit: string }>();
+    expect(stored!.status).toBe('failed');
+    expect(JSON.parse(stored!.exit)).toMatchObject({ outcome: 'gated', reason: 'review:structural' });
+  });
+
+  it('normalizes the pre-contract failed + reason=gated carrier (PLNR-477)', async () => {
+    const run = await room(pid).createRun(pid, actor, {
+      kind: 'build', repoRef: 'r', agentTool: 'claude', runnerId: 'rnr_1',
+    });
+    await room(pid).transitionRun(pid, actor, run.id, { status: 'running', agentId: 'agt_spawned' });
+    const gated = await room(pid).transitionRun(pid, actor, run.id, {
+      status: 'failed',
+      exit: { outcome: 'failed', reason: 'gated', finishedAt: new Date().toISOString() },
+    });
+    expect(gated.status).toBe('gated');
+    expect(gated.exit).toMatchObject({ outcome: 'gated', reason: 'gated' });
   });
 
   it('persists the worktree path reported on a transition (server-side Run visibility)', async () => {
@@ -767,7 +806,7 @@ describe("a build run settles its anchor task from the gate outcome (RUN-83)", (
   });
 });
 
-describe('continue a failed run — reopenRun (PLNR-180)', () => {
+describe('continue a failed or gated run — reopenRun (PLNR-180/477)', () => {
   // A runner that is online AND still advertises the repo the run targets (its kept worktree is on
   // that box). advertises=false / status seeds the guard cases.
   const seedOnlineRunner = (id: string, repoRef: string, opts: { online?: boolean; advertises?: boolean } = {}) =>
@@ -820,6 +859,24 @@ describe('continue a failed run — reopenRun (PLNR-180)', () => {
     expect(evs.some((e) => e.subject_id === run.id)).toBe(true);
   });
 
+  it('continues gated preserved work and moves its review task back to todo (PLNR-477)', async () => {
+    await seedRunner('rnr_gated_cont');
+    await seedOnlineRunner('rnr_gated_cont', 'repo_gated_cont');
+    await mkTask('task_gated_cont', 'CNT-G');
+    const run = await room(pid).createRun(pid, actor, {
+      kind: 'build', repoRef: 'repo_gated_cont', agentTool: 'claude',
+      anchor: { type: 'task', id: 'task_gated_cont' }, runnerId: 'rnr_gated_cont',
+    });
+    await room(pid).transitionRun(pid, actor, run.id, { status: 'running', agentId: 'agt_spawned' });
+    const gated = await room(pid).transitionRun(pid, actor, run.id, { status: 'gated', reason: 'review:floor' });
+    expect(gated.status).toBe('gated');
+    expect(await taskRow('task_gated_cont')).toEqual({ status: 'review', failedAt: null, claimedBy: null });
+
+    const reopened = await room(pid).reopenRun(pid, actor, run.id, 2);
+    expect(reopened).toMatchObject({ id: run.id, status: 'dispatched', exit: null });
+    expect(await taskRow('task_gated_cont')).toEqual({ status: 'todo', failedAt: null, claimedBy: null });
+  });
+
   it('null rounds → budget.maxRounds null (the daemon falls back to its manifest default)', async () => {
     await seedRunner('rnr_cont2');
     await seedOnlineRunner('rnr_cont2', 'repo_cont2');
@@ -829,13 +886,13 @@ describe('continue a failed run — reopenRun (PLNR-180)', () => {
     expect(reopened.budget.maxRounds).toBeNull();
   });
 
-  it('rejects a run that is not failed', async () => {
+  it('rejects a run that is neither failed nor gated', async () => {
     await seedRunner('rnr_cont3');
     await seedOnlineRunner('rnr_cont3', 'repo_cont3');
     const run = await room(pid).createRun(pid, actor, {
       kind: 'build', repoRef: 'repo_cont3', agentTool: 'claude', anchor: { type: 'task', id: 'task_none' }, runnerId: 'rnr_cont3',
     });
-    await expect(room(pid).reopenRun(pid, actor, run.id, null)).rejects.toThrow(/only a failed run/);
+    await expect(room(pid).reopenRun(pid, actor, run.id, null)).rejects.toThrow(/only a failed or gated run/);
   });
 
   it("rejects when the run's runner is offline (kept worktree unreachable)", async () => {
@@ -911,13 +968,13 @@ describe('continue a failed run — reopenRun (PLNR-180)', () => {
       expect(res.status).toBe(404);
     });
 
-    it('409 when the DO guard rejects (run not failed)', async () => {
+    it('409 when the DO guard rejects (run neither failed nor gated)', async () => {
       const run = await room(pid).createRun(pid, actor, {
         kind: 'build', repoRef: 'repo_a', agentTool: 'claude', runnerId: 'rnr_cont_http',
       });
       const res = await cont(run.id, { rounds: 1 });
       expect(res.status).toBe(409);
-      expect(JSON.stringify(await res.json())).toContain('only a failed run');
+      expect(JSON.stringify(await res.json())).toContain('only a failed or gated run');
     });
   });
 });

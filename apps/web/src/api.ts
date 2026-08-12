@@ -809,13 +809,13 @@ export interface ApiRunBudget {
   maxRounds: number | null;
 }
 export interface ApiRunExit {
-  outcome: 'done' | 'failed' | 'cancelled';
+  outcome: 'done' | 'gated' | 'failed' | 'cancelled';
   code: number | null;
   signal: string | null;
   reason: string | null;
   finishedAt: string;
 }
-export type RunStatus = 'queued' | 'dispatched' | 'running' | 'blocked' | 'done' | 'failed' | 'cancelled';
+export type RunStatus = 'queued' | 'dispatched' | 'running' | 'blocked' | 'done' | 'gated' | 'failed' | 'cancelled';
 /** Sub-state of `running` (RUN-31), never a RunStatus value — see shared/runner.ts for why. */
 export type RunPhase = 'agent' | 'verifying' | 'landing';
 /** How hard the model should think (RUN-33) — intent, not a vendor knob. The daemon maps it per

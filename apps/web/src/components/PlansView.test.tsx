@@ -7,7 +7,7 @@
 // the shared predicate, and the active-phase rule that reads it.
 import { describe, expect, it } from 'vitest';
 import { isSettledTaskStatus } from '@noriq-dev/shared';
-import { activePhaseIndex } from './PlansView';
+import { activePhaseIndex, planDispatchRunCounts } from './PlansView';
 
 const PHASES = [{ id: 'ph1' }, { id: 'ph2' }];
 const LINKS = [
@@ -65,5 +65,16 @@ describe('activePhaseIndex (PLNR-229)', () => {
   it('reports -1 when every phase is settled, so a finished plan highlights nothing', () => {
     const idx = activePhaseIndex(PHASES, LINKS, statuses({ t1: 'done', t2: 'cancelled', t3: 'done' }));
     expect(idx).toBe(-1);
+  });
+});
+
+describe('planDispatchRunCounts (PLNR-477)', () => {
+  it('surfaces gated runs separately from failed runs', () => {
+    expect(planDispatchRunCounts([
+      { taskId: 'g', runId: 'run_g', runStatus: 'gated' },
+      { taskId: 'f', runId: 'run_f', runStatus: 'failed' },
+      { taskId: 'd', runId: 'run_d', runStatus: 'done' },
+      { taskId: 'w', runId: null, runStatus: null },
+    ])).toEqual({ waiting: 1, running: 0, done: 1, gated: 1, failed: 1 });
   });
 });

@@ -25,17 +25,18 @@ function ago(iso: string | null): string {
   return `${Math.round(s / 86400)}d ago`;
 }
 
-const STATUS_STYLE: Record<RunStatus, { color: string; bg: string; live?: boolean }> = {
+export const RUN_STATUS_STYLE: Record<RunStatus, { color: string; bg: string; live?: boolean }> = {
   queued: { color: 'var(--text-mid)', bg: 'var(--w-06)' },
   dispatched: { color: 'var(--blue)', bg: 'rgba(76,157,255,.12)' },
   running: { color: 'var(--green)', bg: 'rgba(63,217,139,.13)', live: true },
   blocked: { color: '#f5a623', bg: 'rgba(245,166,35,.14)', live: true },
   done: { color: 'var(--green)', bg: 'rgba(63,217,139,.1)' },
+  gated: { color: '#f5a623', bg: 'rgba(245,166,35,.14)' },
   failed: { color: 'var(--red-soft)', bg: 'rgba(255,92,92,.12)' },
   cancelled: { color: 'var(--text-dim)', bg: 'var(--w-05)' },
 };
 
-const TERMINAL: RunStatus[] = ['done', 'failed', 'cancelled'];
+const TERMINAL: RunStatus[] = ['done', 'gated', 'failed', 'cancelled'];
 const KINDS: Array<ApiRun['kind']> = ['scope', 'build', 'verify'];
 /** Tool-agnostic intent (RUN-33) — each driver maps it. Codex tops out at 'high' and clamps
  *  the last two; the daemon does that translation, so this list stays what we MEAN. */
@@ -300,13 +301,13 @@ function RunRow({ run, runner, onCancel }: { run: ApiRun; runner: ApiRunner | nu
   const [killing, setKilling] = useState(false);
   const [continuing, setContinuing] = useState(false);
   const [showLog, setShowLog] = useState(false);
-  const st = STATUS_STYLE[run.status];
+  const st = RUN_STATUS_STYLE[run.status];
   const repo = runner?.repos.find((r) => r.id === run.repoRef);
   const terminal = TERMINAL.includes(run.status);
   const spend = fmtSpend(run);
   // Continue is only meaningful for a gate-failed BUILD run whose kept worktree is still reachable:
   // the same runner must be online and still advertise this repo (the worktree lives on that box).
-  const canContinue = run.status === 'failed' && run.kind === 'build';
+  const canContinue = (run.status === 'failed' || run.status === 'gated') && run.kind === 'build';
   const continueReady = canContinue && runner?.status === 'online' && !!runner.repos.find((r) => r.id === run.repoRef);
 
   return (
@@ -409,7 +410,7 @@ function RunRow({ run, runner, onCancel }: { run: ApiRun; runner: ApiRunner | nu
             : "the run's runner must be online and still advertise this repo — its kept worktree lives on that machine"}
           onClick={async () => {
             const ans = await prompt(
-              'Continue this failed run with how many more reviewer rounds? Leave blank for the repo’s default.',
+              `Continue this ${run.status} run with how many more reviewer rounds? Leave blank for the repo’s default.`,
               '',
               { title: 'Continue run', placeholder: 'e.g. 3' },
             );

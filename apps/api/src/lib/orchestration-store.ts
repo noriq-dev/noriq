@@ -669,7 +669,7 @@ export async function mirrorRunTransition(env: Env, input: {
     ? (input.from === 'blocked' ? 'resumed' : 'started')
     : input.to === 'blocked' ? 'parked'
       : input.to === 'done' ? 'succeeded'
-        : input.to === 'failed' ? 'failed'
+        : input.to === 'failed' || input.to === 'gated' ? 'failed'
           : input.to === 'cancelled' ? 'cancelled' : null;
   if (!event) return;
   const assignment = await ensureRunExecution(env, input.runId);
