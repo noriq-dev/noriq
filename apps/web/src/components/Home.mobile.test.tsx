@@ -19,7 +19,7 @@ function viewportMatchMedia(width: number) {
 }
 
 const project: ProjectVM = {
-  id: 'prj_1', key: 'MOB', name: 'Mobile companion', phase: 'Implementation', dotColor: '#4c9dff', badge: '',
+  id: 'prj_1', key: 'MOB', name: `Mobile companion ${'with-a-long-name-'.repeat(12)}`, phase: `Implementation ${'unbroken-description-'.repeat(20)}`, dotColor: '#4c9dff', badge: '',
   hasLive: true, groupId: null, openTasks: 3, totalTasks: 5, doneTasks: 2, effectiveRole: 'owner', accessSource: 'owner',
   canView: true, canContribute: true, canManage: true, canOwn: true, cappedByReadOnly: false,
 };
@@ -52,6 +52,15 @@ describe('Home phone composition', () => {
     expect(container.textContent).not.toContain('Connect an agent');
     expect(container.textContent).not.toContain('How Noriq works');
     expect(container.querySelector('a[href="/skill.md"]')).toBeNull();
-    expect([...container.querySelectorAll<HTMLElement>('.hover-border')].find((card) => card.textContent?.includes('Mobile companion'))?.style.minHeight).toBe('72px');
+    const card = [...container.querySelectorAll<HTMLElement>('.hover-border')].find((item) => item.textContent?.includes('Mobile companion'))!;
+    expect(card.style.minHeight).toBe('72px');
+    expect(card.style.minWidth).toBe('0');
+    expect(card.style.maxWidth).toBe('100%');
+    expect(container.querySelector<HTMLElement>('[data-testid="project-grid"]')!.style.gridTemplateColumns).toBe('minmax(0, 1fr)');
+    expect(container.querySelector<HTMLElement>('[data-testid="project-name"]')!.style.minWidth).toBe('0');
+    const description = container.querySelector<HTMLElement>('[data-testid="project-description"]')!;
+    expect(description.style.maxWidth).toBe('100%');
+    expect(description.style.overflowWrap).toBe('anywhere');
+    expect(description.style.webkitLineClamp).toBe('2');
   });
 });

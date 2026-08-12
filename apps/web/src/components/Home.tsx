@@ -227,7 +227,7 @@ export function Home({ store }: { store: AppStore }) {
 
 function ProjectGrid({ projects, phone, onOpen }: { projects: ProjectVM[]; phone: boolean; onOpen: (id: string) => void }) {
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: phone ? '1fr' : 'repeat(auto-fill, minmax(250px, 1fr))', gap: phone ? 10 : 12 }}>
+    <div data-testid="project-grid" style={{ display: 'grid', gridTemplateColumns: phone ? 'minmax(0, 1fr)' : 'repeat(auto-fill, minmax(250px, 1fr))', gap: phone ? 10 : 12 }}>
       {projects.map((p) => {
         const pct = p.totalTasks ? p.doneTasks / p.totalTasks : 0;
         return (
@@ -237,30 +237,37 @@ function ProjectGrid({ projects, phone, onOpen }: { projects: ProjectVM[]; phone
             className="hover-border"
             style={{
               border: '1px solid var(--w-07)', borderRadius: 13, padding: phone ? '16px' : '15px 16px',
-              minHeight: phone ? 72 : undefined,
+              minHeight: phone ? 72 : undefined, minWidth: 0, maxWidth: '100%', boxSizing: 'border-box',
               background: 'var(--w-02)', cursor: 'pointer',
             }}
           >
-            <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 8 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 8, minWidth: 0 }}>
               <span
                 style={{
                   fontFamily: 'var(--mono)', fontSize: 10.5, fontWeight: 700, color: p.dotColor,
-                  background: 'var(--w-05)', padding: '2px 7px', borderRadius: 5,
+                  background: 'var(--w-05)', padding: '2px 7px', borderRadius: 5, flex: 'none',
                 }}
               >
                 {p.key}
               </span>
-              <span style={{ fontSize: 13.5, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</span>
-              <div style={{ flex: 1 }} />
+              <span data-testid="project-name" style={{ flex: 1, minWidth: 0, fontSize: 13.5, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</span>
               {p.hasLive && <LiveDot size={7} />}
             </div>
             {p.phase && (
-              <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)', marginBottom: 10, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              <div
+                data-testid="project-description"
+                style={{
+                  maxWidth: '100%', minWidth: 0, fontFamily: 'var(--mono)', fontSize: 10, lineHeight: 1.45,
+                  color: 'var(--text-dim)', marginBottom: 10, overflow: 'hidden', overflowWrap: 'anywhere',
+                  textOverflow: 'ellipsis', whiteSpace: phone ? 'normal' : 'nowrap',
+                  ...(phone ? { display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' as const } : {}),
+                }}
+              >
                 {p.phase}
               </div>
             )}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <div style={{ flex: 1, height: 4, borderRadius: 2, background: 'var(--w-07)', overflow: 'hidden' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+              <div style={{ flex: 1, minWidth: 0, height: 4, borderRadius: 2, background: 'var(--w-07)', overflow: 'hidden' }}>
                 <div style={{ height: '100%', width: `${pct * 100}%`, background: pct === 1 ? 'var(--green)' : 'var(--blue)' }} />
               </div>
               <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)', whiteSpace: 'nowrap' }}>
