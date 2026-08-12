@@ -52,12 +52,15 @@ describe('orchestration MCP protocol (PLNR-366)', () => {
 describe('mission task wire contract (PLNR-485)', () => {
   it('parses begin, settle, and acknowledgement frames without changing execution telemetry', () => {
     const now = new Date().toISOString();
+    const lease = { sitting: 1, executionId: 'exe_root', epoch: 1 };
     expect(RunnerClientMessage.parse({
       type: 'mission.task.begin', runId: 'run_root',
+      lease,
       begin: { reportId: 'report-begin', attemptId: 'attempt-1', taskId: 'task-1', childKey: 'child-1', observedAt: now },
     }).type).toBe('mission.task.begin');
     expect(RunnerClientMessage.parse({
       type: 'mission.task.settle', runId: 'run_root',
+      lease,
       settle: { reportId: 'report-settle', attemptId: 'attempt-1', claimId: 'clm_1', outcome: 'done', observedAt: now },
     }).type).toBe('mission.task.settle');
     expect(RunnerServerMessage.parse({
@@ -67,5 +70,26 @@ describe('mission task wire contract (PLNR-485)', () => {
         taskId: 'task-1', claimId: 'clm_1', executionId: 'exe_1', taskStatus: 'in_progress', error: null,
       },
     }).type).toBe('mission.task.ack');
+  });
+
+  it('parses restart inventory and server adoption decisions with monotonic lease epochs', () => {
+    const now = new Date().toISOString();
+    const inventory = [{
+      runId: 'run_root',
+      lease: { sitting: 1, executionId: 'exe_root', epoch: 3 },
+      attempts: [{ attemptId: 'attempt-1', executionId: 'exe_child', epoch: 3 }],
+    }];
+    expect(RunnerClientMessage.parse({ type: 'mission.reconcile', inventory, observedAt: now }).type)
+      .toBe('mission.reconcile');
+    expect(RunnerServerMessage.parse({
+      type: 'mission.reconcile.request', deadline: now, items: inventory,
+    }).type).toBe('mission.reconcile.request');
+    expect(RunnerServerMessage.parse({
+      type: 'mission.reconcile.result',
+      results: [{
+        runId: 'run_root', decision: 'adopt',
+        lease: { sitting: 1, executionId: 'exe_root', epoch: 4 }, reason: null,
+      }],
+    }).type).toBe('mission.reconcile.result');
   });
 });

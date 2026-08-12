@@ -133,3 +133,29 @@ export const MissionTaskAck = z.object({
   error: z.string().nullable().default(null),
 });
 export type MissionTaskAck = z.infer<typeof MissionTaskAck>;
+
+export const MissionLeaseRef = z.object({
+  sitting: z.number().int().positive(),
+  executionId: z.string().min(1),
+  epoch: z.number().int().positive(),
+});
+export type MissionLeaseRef = z.infer<typeof MissionLeaseRef>;
+
+export const MissionInventoryItem = z.object({
+  runId: z.string().min(1),
+  lease: MissionLeaseRef,
+  attempts: z.array(z.object({
+    attemptId: z.string().min(1),
+    executionId: z.string().min(1),
+    epoch: z.number().int().positive(),
+  })).max(256).default([]),
+});
+export type MissionInventoryItem = z.infer<typeof MissionInventoryItem>;
+
+export const MissionAdoptionResult = z.object({
+  runId: z.string(),
+  decision: z.enum(['adopt', 'already_terminal', 'cancel', 'unknown']),
+  lease: MissionLeaseRef.nullable().default(null),
+  reason: z.string().nullable().default(null),
+});
+export type MissionAdoptionResult = z.infer<typeof MissionAdoptionResult>;

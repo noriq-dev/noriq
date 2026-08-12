@@ -8,6 +8,8 @@ import {
   RUNNER_PROTOCOL_CAPABILITIES,
   RUNNER_PROTOCOL_VERSION,
   type ExecutionReportAck,
+  type MissionAdoptionResult,
+  type MissionLeaseRef,
   type MissionTaskAck,
   type RunnerProtocolCapability,
 } from '@noriq-dev/shared';
@@ -106,12 +108,32 @@ export class RunnerHub extends DurableObject<Env> {
         // Redeliver Runs already dispatched to this runner but not yet started — they
         // may have been assigned while the socket was down (dispatch-before-connect).
         const { results } = await this.env.DB.prepare(
-          "SELECT id, project_id AS pid FROM runs WHERE runner_id = ? AND status = 'dispatched'",
+          `SELECT r.id, r.project_id AS pid FROM runs r
+             LEFT JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
+            WHERE r.runner_id = ? AND r.status = 'dispatched'
+              AND (pd.strategy IS NULL OR pd.strategy <> 'single_root' OR r.reconciliation_deadline IS NULL)`,
         ).bind(runnerId).all<{ id: string; pid: string }>();
         for (const r of results) {
           if (!(await this.authorizeProject(ws, auth, r.pid))) return;
           const run = await this.runView(r.id);
           if (run && !this.sendIfOpen(ws, await this.messageForSocket(ws, JSON.stringify({ type: 'run.assigned', run })))) return;
+        }
+        if (acceptedCapabilities.includes(MISSION_CAPABILITY)) {
+          const { results: reconcilingProjects } = await this.env.DB.prepare(
+            `SELECT DISTINCT project_id AS pid FROM runs
+              WHERE runner_id = ? AND reconciliation_deadline IS NOT NULL
+                AND status IN ('dispatched','running','blocked')`,
+          ).bind(runnerId).all<{ pid: string }>();
+          for (const { pid } of reconcilingProjects) {
+            if (!(await this.authorizeProject(ws, auth, pid))) return;
+            const reconciliation = await this.room(pid).currentRunnerMissionReconciliation(pid, runnerId);
+            if (reconciliation.deadline && reconciliation.items.length > 0
+                && !this.sendIfOpen(ws, JSON.stringify({
+                  type: 'mission.reconcile.request',
+                  deadline: reconciliation.deadline,
+                  items: reconciliation.items,
+                }))) return;
+          }
         }
         return;
       }
@@ -145,12 +167,14 @@ export class RunnerHub extends DurableObject<Env> {
           .bind(msg.runId).first<{ pid: string; rid: string | null }>();
         if (!row || row.rid !== runnerId) return;
         if (!(await this.authorizeProject(ws, auth, row.pid))) return;
+        if (!(await this.missionFrameAccepted(auth, row.pid, msg.runId, msg.missionLease))) return;
         try {
           await this.room(row.pid).transitionRun(row.pid, SYS, msg.runId, {
             status: msg.status,
             agentId: msg.agentId ?? undefined,
             exit: msg.exit ?? undefined,
             worktreePath: msg.worktreePath ?? undefined,
+            missionLease: msg.missionLease,
             observedAt: msg.at,
           });
         } catch (err) {
@@ -165,6 +189,7 @@ export class RunnerHub extends DurableObject<Env> {
       case 'execution.declare': {
         const pid = await this.authorizeRun(ws, auth, runnerId, msg.runId);
         if (!pid) return;
+        if (!(await this.missionFrameAccepted(auth, pid, msg.runId, msg.missionLease))) return;
         try {
           const result = await declareRunnerExecution(this.env, msg.runId, msg.declaration);
           this.sendExecutionAck(ws, {
@@ -180,6 +205,7 @@ export class RunnerHub extends DurableObject<Env> {
       case 'execution.relation': {
         const pid = await this.authorizeRun(ws, auth, runnerId, msg.runId);
         if (!pid) return;
+        if (!(await this.missionFrameAccepted(auth, pid, msg.runId, msg.missionLease))) return;
         try {
           await reportRunnerExecutionRelation(this.env, msg.runId, msg.relation);
           this.sendExecutionAck(ws, {
@@ -195,6 +221,7 @@ export class RunnerHub extends DurableObject<Env> {
       case 'execution.event': {
         const pid = await this.authorizeRun(ws, auth, runnerId, msg.runId);
         if (!pid) return;
+        if (!(await this.missionFrameAccepted(auth, pid, msg.runId, msg.missionLease))) return;
         try {
           const result = await reportRunnerExecutionEvent(this.env, msg.runId, msg.event);
           this.sendExecutionAck(ws, {
@@ -210,6 +237,7 @@ export class RunnerHub extends DurableObject<Env> {
       case 'execution.reconcile': {
         const pid = await this.authorizeRun(ws, auth, runnerId, msg.runId);
         if (!pid) return;
+        if (!(await this.missionFrameAccepted(auth, pid, msg.runId, msg.missionLease))) return;
         try {
           const result = await reconcileRunnerExecution(this.env, msg.runId, msg.reconciliation);
           for (const ack of result.acknowledgements) this.sendExecutionAck(ws, ack);
@@ -222,8 +250,14 @@ export class RunnerHub extends DurableObject<Env> {
       case 'mission.task.begin': {
         const pid = await this.authorizeMissionRun(ws, auth, runnerId, msg.runId);
         if (!pid) return;
+        if (!(await this.missionFrameAccepted(auth, pid, msg.runId, msg.lease))) {
+          this.sendMissionAck(ws, this.rejectedMissionAck(
+            msg.begin.reportId, msg.begin.attemptId, 'begin', new Error('stale mission lease epoch'),
+          ));
+          return;
+        }
         try {
-          const ack = await this.room(pid).beginMissionTask(pid, msg.runId, msg.begin);
+          const ack = await this.room(pid).beginMissionTask(pid, msg.runId, msg.begin, msg.lease);
           this.sendMissionAck(ws, ack);
         } catch (error) {
           this.sendMissionAck(ws, this.rejectedMissionAck(
@@ -236,14 +270,41 @@ export class RunnerHub extends DurableObject<Env> {
       case 'mission.task.settle': {
         const pid = await this.authorizeMissionRun(ws, auth, runnerId, msg.runId);
         if (!pid) return;
+        if (!(await this.missionFrameAccepted(auth, pid, msg.runId, msg.lease))) {
+          this.sendMissionAck(ws, this.rejectedMissionAck(
+            msg.settle.reportId, msg.settle.attemptId, 'settle', new Error('stale mission lease epoch'),
+          ));
+          return;
+        }
         try {
-          const ack = await this.room(pid).settleMissionTask(pid, msg.runId, msg.settle);
+          const ack = await this.room(pid).settleMissionTask(pid, msg.runId, msg.settle, msg.lease);
           this.sendMissionAck(ws, ack);
         } catch (error) {
           this.sendMissionAck(ws, this.rejectedMissionAck(
             msg.settle.reportId, msg.settle.attemptId, 'settle', error,
           ));
         }
+        return;
+      }
+
+      case 'mission.reconcile': {
+        if (!auth.capabilities?.includes(MISSION_CAPABILITY)) return;
+        const results: MissionAdoptionResult[] = [];
+        for (const inventory of msg.inventory) {
+          const row = await this.env.DB.prepare(
+            'SELECT project_id AS pid, runner_id AS rid FROM runs WHERE id = ?',
+          ).bind(inventory.runId).first<{ pid: string; rid: string | null }>();
+          if (!row || row.rid !== runnerId) {
+            results.push({
+              runId: inventory.runId, decision: 'unknown', lease: null,
+              reason: 'mission root not found',
+            });
+            continue;
+          }
+          if (!(await this.authorizeProject(ws, auth, row.pid))) return;
+          results.push(await this.room(row.pid).adoptRunnerMission(row.pid, runnerId, inventory));
+        }
+        this.sendIfOpen(ws, JSON.stringify({ type: 'mission.reconcile.result', results }));
         return;
       }
 
@@ -254,6 +315,7 @@ export class RunnerHub extends DurableObject<Env> {
           .bind(msg.runId).first<{ pid: string; rid: string | null }>();
         if (!row || row.rid !== runnerId) return;
         if (!(await this.authorizeProject(ws, auth, row.pid))) return;
+        if (!(await this.missionFrameAccepted(auth, row.pid, msg.runId, msg.missionLease))) return;
         try {
           await this.room(row.pid).recordRunTelemetry(row.pid, msg.runId, {
             tokensUsed: msg.tokensUsed,
@@ -375,6 +437,26 @@ export class RunnerHub extends DurableObject<Env> {
     return await this.authorizeProject(ws, auth, row.pid) ? row.pid : null;
   }
 
+  /** Mission roots are fenced by a server-issued sitting/execution/epoch tuple. Ordinary Runs
+   * keep accepting the legacy frame shape; a mission frame without the negotiated lease is
+   * deliberately ignored before it can mutate lifecycle or orchestration state. */
+  private async missionFrameAccepted(
+    auth: RunnerSocketAuth,
+    projectId: string,
+    runId: string,
+    lease: MissionLeaseRef | null,
+  ): Promise<boolean> {
+    const mission = await this.env.DB.prepare(
+      `SELECT 1 AS ok FROM runs r JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
+        WHERE r.id = ? AND r.project_id = ? AND r.anchor_type = 'plan' AND pd.strategy = 'single_root'`,
+    ).bind(runId, projectId).first<{ ok: number }>();
+    if (!mission) return true;
+    if (!auth.capabilities?.includes(MISSION_CAPABILITY)) return false;
+    const accepted = await this.room(projectId).validateMissionLease(projectId, runId, lease);
+    if (!accepted) console.warn(`stale mission lease rejected for ${runId}`);
+    return accepted;
+  }
+
   /** Strip orchestration from legacy sockets and derive it server-side for negotiated peers. */
   private async messageForSocket(ws: WebSocket, json: string): Promise<string> {
     let parsed: { type?: string; run?: Record<string, unknown> };
@@ -386,6 +468,25 @@ export class RunnerHub extends DurableObject<Env> {
       run.execution = await ensureRunExecution(this.env, parsed.run.id);
     } else {
       delete run.execution;
+    }
+    if (auth?.capabilities?.includes(MISSION_CAPABILITY)) {
+      const mission = await this.env.DB.prepare(
+        `SELECT r.project_id AS pid, r.sitting, r.lease_epoch AS epoch
+           FROM runs r JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
+          WHERE r.id = ? AND r.anchor_type = 'plan' AND pd.strategy = 'single_root'`,
+      ).bind(parsed.run.id).first<{ pid: string; sitting: number; epoch: number }>();
+      if (mission) {
+        const assignment = await ensureRunExecution(this.env, parsed.run.id);
+        return JSON.stringify({
+          ...parsed,
+          run,
+          missionLease: {
+            sitting: mission.sitting,
+            executionId: assignment.executionId,
+            epoch: mission.epoch,
+          },
+        });
+      }
     }
     return JSON.stringify({ ...parsed, run });
   }

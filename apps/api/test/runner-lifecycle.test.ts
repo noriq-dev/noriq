@@ -136,6 +136,33 @@ describe('runner offboard (RUN-35)', () => {
     const run = await env.DB.prepare("SELECT status FROM runs WHERE id = 'run_offb'").first<{ status: string }>();
     expect(run!.status).toBe('failed');
   });
+
+  it('keeps immediate daemon_restart failure for a reconnecting legacy runner (PLNR-486)', async () => {
+    await createUser('lifecycle-restart@example.com', 'Restart', 'longenough1', 'member').catch(() => {});
+    const t = await mintTokenForUser('lifecycle-restart@example.com');
+    const rc = await loginSession('lifecycle-restart@example.com', 'longenough1');
+    const projectRes = await SELF.fetch('https://noriq.test/api/projects', {
+      method: 'POST', headers: { Cookie: rc, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'LFRS', name: 'lifecycle-restart' }),
+    });
+    const pid = ((await projectRes.json()) as { id: string }).id;
+    await authorizeForAllProjects(t);
+    const id = ((await (await register(t, { label: 'legacy-restart' })).json()) as { runner: { id: string } }).runner.id;
+    const owner = (await env.DB.prepare('SELECT id FROM users WHERE email = ?')
+      .bind('lifecycle-restart@example.com').first<{ id: string }>())!.id;
+    const runId = `run_legacy_restart_${crypto.randomUUID()}`;
+    await env.DB.prepare(
+      `INSERT INTO runs (id, project_id, runner_id, kind, repo_ref, agent_tool, status, created_by)
+       VALUES (?, ?, ?, 'build', 'r', 'claude', 'running', ?)`,
+    ).bind(runId, pid, id, owner).run();
+
+    const reconnected = await register(t, { runnerId: id, label: 'legacy-restart' });
+    expect(reconnected.status).toBe(200);
+    const failed = await env.DB.prepare('SELECT status, exit FROM runs WHERE id = ?')
+      .bind(runId).first<{ status: string; exit: string }>();
+    expect(failed?.status).toBe('failed');
+    expect(JSON.parse(failed!.exit)).toMatchObject({ outcome: 'failed', reason: 'daemon_restart' });
+  });
 });
 
 describe('runner rename + prune (RUN-35)', () => {

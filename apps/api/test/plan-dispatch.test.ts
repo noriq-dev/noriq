@@ -8,7 +8,10 @@ import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import type { Actor, CreatePlanDispatchInput, CreateRunInput, PlanDispatchView, RunPatch, RunView } from '../src/do/ProjectRoom';
 import type { Env } from '../src/env';
-import type { MissionTaskAck, MissionTaskBeginReport, MissionTaskSettleReport } from '@noriq-dev/shared';
+import type {
+  MissionAdoptionResult, MissionInventoryItem, MissionLeaseRef,
+  MissionTaskAck, MissionTaskBeginReport, MissionTaskSettleReport,
+} from '@noriq-dev/shared';
 import { taskClaimability } from '../src/lib/claimability';
 import { createUser, loginSession } from './helpers';
 
@@ -28,8 +31,15 @@ interface RoomRpc {
   claimTask(projectId: string, actor: Actor, taskId: string, agentId: string): Promise<{ key: string }>;
   releaseTask(projectId: string, actor: Actor, taskId: string, opts?: { toStatus?: string }): Promise<unknown>;
   updateTask(projectId: string, actor: Actor, taskId: string, patch: Record<string, unknown>): Promise<unknown>;
-  beginMissionTask(projectId: string, rootRunId: string, input: MissionTaskBeginReport): Promise<MissionTaskAck>;
-  settleMissionTask(projectId: string, rootRunId: string, input: MissionTaskSettleReport): Promise<MissionTaskAck>;
+  beginMissionTask(projectId: string, rootRunId: string, input: MissionTaskBeginReport, lease?: MissionLeaseRef): Promise<MissionTaskAck>;
+  settleMissionTask(projectId: string, rootRunId: string, input: MissionTaskSettleReport, lease?: MissionLeaseRef): Promise<MissionTaskAck>;
+  missionLease(projectId: string, rootRunId: string): Promise<MissionLeaseRef>;
+  validateMissionLease(projectId: string, rootRunId: string, lease: MissionLeaseRef | null): Promise<boolean>;
+  openRunnerMissionReconciliation(projectId: string, runnerId: string, deadlineMs?: number): Promise<{ deadline: string; items: MissionInventoryItem[] }>;
+  currentRunnerMissionReconciliation(projectId: string, runnerId: string): Promise<{ deadline: string | null; items: MissionInventoryItem[] }>;
+  adoptRunnerMission(projectId: string, runnerId: string, inventory: MissionInventoryItem): Promise<MissionAdoptionResult>;
+  reconcileRunnerRuns(projectId: string, actor: Actor, runnerId: string, options?: { excludeMission?: boolean }): Promise<{ failed: number }>;
+  sweepRunnerMissionReconciliations(projectId: string, actor?: Actor): Promise<{ failed: number }>;
 }
 const room = (pid: string) =>
   appEnv.PROJECT_ROOM.get(appEnv.PROJECT_ROOM.idFromName(pid)) as unknown as RoomRpc;
@@ -678,5 +688,102 @@ describe('server-authorized mission task attempts (PLNR-485)', () => {
       .bind(mission.a, mission.b).all<{ id: string; status: string; holder: string | null }>();
     expect(states.results.find((task) => task.id === mission.a)).toMatchObject({ status: 'review', holder: null });
     expect(states.results.find((task) => task.id === mission.b)).toMatchObject({ status: 'todo', holder: null });
+  });
+});
+
+describe('durable mission restart reconciliation (PLNR-486)', () => {
+  async function liveMission(title: string) {
+    const runner = await seedRunner(4, true);
+    const agent = await seedAgent(runner);
+    const plan = await makePlan(title);
+    const dispatch = await createDispatch(runner, plan.planId, {
+      strategy: 'single_root', workflow: 'mission-plan',
+    });
+    const root = await env.DB.prepare('SELECT id FROM runs WHERE plan_dispatch_id = ?')
+      .bind(dispatch.id).first<{ id: string }>();
+    await room(pid).transitionRun(pid, actor, root!.id, { status: 'running', agentId: agent });
+    return { runner, agent, ...plan, dispatch, rootRunId: root!.id };
+  }
+
+  it('adopts an exact durable inventory by advancing the lease without duplicating attempts or resetting spend', async () => {
+    const mission = await liveMission('mission-adopt');
+    const initialLease = await room(pid).missionLease(pid, mission.rootRunId);
+    await room(pid).beginMissionTask(pid, mission.rootRunId, {
+      reportId: 'begin-adopt', attemptId: 'attempt-adopt', taskId: mission.a,
+      childKey: 'child-adopt', observedAt: new Date().toISOString(),
+    }, initialLease);
+    await env.DB.prepare('UPDATE runs SET tokens_used = 321, usd_spent = 4.25 WHERE id = ?')
+      .bind(mission.rootRunId).run();
+
+    const opened = await room(pid).openRunnerMissionReconciliation(pid, mission.runner, 10_000);
+    expect(opened.items).toHaveLength(1);
+    expect(opened.items[0]).toMatchObject({ runId: mission.rootRunId, lease: initialLease });
+    expect(opened.items[0]!.attempts).toHaveLength(1);
+
+    const adopted = await room(pid).adoptRunnerMission(pid, mission.runner, opened.items[0]!);
+    expect(adopted).toMatchObject({
+      runId: mission.rootRunId, decision: 'adopt',
+      lease: { ...initialLease, epoch: initialLease.epoch + 1 }, reason: null,
+    });
+    expect(await room(pid).validateMissionLease(pid, mission.rootRunId, initialLease)).toBe(false);
+    expect(await room(pid).validateMissionLease(pid, mission.rootRunId, adopted.lease)).toBe(true);
+    await expect(room(pid).transitionRun(pid, actor, mission.rootRunId, {
+      status: 'running', missionLease: initialLease,
+    })).rejects.toThrow(/stale mission lease/);
+    expect((await room(pid).transitionRun(pid, actor, mission.rootRunId, {
+      status: 'running', missionLease: adopted.lease!,
+    })).status).toBe('running');
+
+    const durable = await env.DB.prepare(
+      `SELECT tokens_used AS tokens, usd_spent AS usd,
+              (SELECT COUNT(*) FROM mission_task_attempts WHERE root_run_id = runs.id) AS attempts,
+              reconciliation_deadline AS deadline
+         FROM runs WHERE id = ?`,
+    ).bind(mission.rootRunId).first<{ tokens: number; usd: number; attempts: number; deadline: string | null }>();
+    expect(durable).toEqual({ tokens: 321, usd: 4.25, attempts: 1, deadline: null });
+  });
+
+  it('refuses mismatched inventory and times an unadopted mission out as daemon_restart', async () => {
+    const mismatch = await liveMission('mission-inventory-mismatch');
+    const mismatchOpen = await room(pid).openRunnerMissionReconciliation(pid, mismatch.runner, 10_000);
+    const refusal = await room(pid).adoptRunnerMission(pid, mismatch.runner, {
+      ...mismatchOpen.items[0]!,
+      lease: { ...mismatchOpen.items[0]!.lease, epoch: mismatchOpen.items[0]!.lease.epoch + 1 },
+    });
+    expect(refusal).toMatchObject({ decision: 'cancel', lease: null });
+    expect((await room(pid).currentRunnerMissionReconciliation(pid, mismatch.runner)).items).toHaveLength(1);
+
+    const timeout = await liveMission('mission-timeout');
+    const lease = await room(pid).missionLease(pid, timeout.rootRunId);
+    await room(pid).beginMissionTask(pid, timeout.rootRunId, {
+      reportId: 'begin-timeout', attemptId: 'attempt-timeout', taskId: timeout.a,
+      childKey: 'child-timeout', observedAt: new Date().toISOString(),
+    }, lease);
+    await room(pid).openRunnerMissionReconciliation(pid, timeout.runner, 5_000);
+    await env.DB.prepare('UPDATE runs SET reconciliation_deadline = ? WHERE id = ?')
+      .bind('2000-01-01T00:00:00.000Z', timeout.rootRunId).run();
+    expect((await room(pid).sweepRunnerMissionReconciliations(pid)).failed).toBe(1);
+
+    const failed = await env.DB.prepare('SELECT status, exit FROM runs WHERE id = ?')
+      .bind(timeout.rootRunId).first<{ status: string; exit: string }>();
+    expect(failed?.status).toBe('failed');
+    expect(JSON.parse(failed!.exit)).toMatchObject({ outcome: 'failed', reason: 'daemon_restart' });
+    const attempt = await env.DB.prepare('SELECT status FROM mission_task_attempts WHERE id = ?')
+      .bind('attempt-timeout').first<{ status: string }>();
+    expect(attempt?.status).toBe('interrupted');
+  });
+
+  it('keeps legacy restart failure behavior while excluding only pending mission roots', async () => {
+    const mission = await liveMission('mission-excluded-reconcile');
+    const ordinary = await room(pid).createRun(pid, actor, {
+      kind: 'build', repoRef: 'repo_pd', agentTool: 'claude', runnerId: mission.runner,
+    });
+    await room(pid).transitionRun(pid, actor, ordinary.id, { status: 'running' });
+    await room(pid).openRunnerMissionReconciliation(pid, mission.runner, 10_000);
+    expect((await room(pid).reconcileRunnerRuns(pid, actor, mission.runner, { excludeMission: true })).failed).toBe(1);
+    expect((await env.DB.prepare('SELECT status FROM runs WHERE id = ?').bind(ordinary.id).first<{ status: string }>())?.status)
+      .toBe('failed');
+    expect((await env.DB.prepare('SELECT status FROM runs WHERE id = ?').bind(mission.rootRunId).first<{ status: string }>())?.status)
+      .toBe('running');
   });
 });

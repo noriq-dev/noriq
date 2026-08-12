@@ -14,7 +14,7 @@ import {
 import { searchBackend, indexEntity, removeEntity, type SearchKind } from '../search';
 import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
-import { RunKind, AgentTool, RunStatus, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
+import { RunKind, AgentTool, RunStatus, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
 import { writeExecutionSpec } from '../lib/execution-spec';
 import { processPendingCopilotEpisodeJob, processPendingEpisodeJob } from '../memory/episodes';
 import { applyMissionTaskExecutionEvent, ensureMissionTaskExecution, ensureRunExecution, mirrorRunTransition } from '../lib/orchestration-store';
@@ -265,6 +265,7 @@ export interface RunPatch {
   phase?: RunPhase | null; // sub-state of running (RUN-31); forced to null on terminal
   reason?: string | null;
   observedAt?: string;
+  missionLease?: MissionLeaseRef | null;
 }
 
 type RunRow = {
@@ -283,6 +284,8 @@ type RunRow = {
   created_by: string; created_at: string; updated_at: string;
   dispatched_at: string | null; started_at: string | null;
   sitting: number;
+  lease_epoch: number;
+  reconciliation_deadline: string | null;
 };
 
 // The wire shape of a Run (mirrors the shared Run entity). Named explicitly so the
@@ -1759,6 +1762,7 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.loadPid();
       if (!this._pid) return;
       const now = nowIso();
+      await this.expireRunnerMissionReconciliations(now, SYSTEM_ACTOR);
       const { results } = await this.env.DB.prepare(
         `SELECT id, key, title, claimed_by FROM tasks
          WHERE project_id = ? AND claimed_by IS NOT NULL AND claim_expires_at < ? AND status = 'in_progress'`,
@@ -1792,15 +1796,20 @@ export class ProjectRoom extends DurableObject<Env> {
 
   private async scheduleExpiryAlarm() {
     // One alarm serves BOTH expiry sources (PLNR-204): the next claim TTL and the next lock TTL.
-    const [claimRow, lockRow] = await Promise.all([
+    const [claimRow, lockRow, missionRow] = await Promise.all([
       this.env.DB.prepare(
         `SELECT MIN(claim_expires_at) AS next FROM tasks WHERE project_id = ? AND claimed_by IS NOT NULL AND status = 'in_progress'`,
       ).bind(this.projectId).first<{ next: string | null }>(),
       this.env.DB.prepare(
         `SELECT MIN(expires_at) AS next FROM file_locks WHERE project_id = ? AND released_at IS NULL`,
       ).bind(this.projectId).first<{ next: string | null }>(),
+      this.env.DB.prepare(
+        `SELECT MIN(reconciliation_deadline) AS next FROM runs
+          WHERE project_id = ? AND reconciliation_deadline IS NOT NULL
+            AND status IN ('dispatched','running','blocked')`,
+      ).bind(this.projectId).first<{ next: string | null }>(),
     ]);
-    const nexts = [claimRow?.next, lockRow?.next].filter((x): x is string => !!x);
+    const nexts = [claimRow?.next, lockRow?.next, missionRow?.next].filter((x): x is string => !!x);
     if (nexts.length) {
       // +2s grace so a renewal landing right at the boundary wins.
       const soonest = nexts.reduce((a, b) => (a < b ? a : b));
@@ -4223,9 +4232,13 @@ export class ProjectRoom extends DurableObject<Env> {
     projectId: string,
     rootRunId: string,
     input: MissionTaskBeginReport,
+    lease?: MissionLeaseRef,
   ): Promise<MissionTaskAck> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
+      if (lease && !(await this.validateMissionLease(projectId, rootRunId, lease))) {
+        throw new Error('stale mission lease epoch');
+      }
       const beginHash = await sha256Hex(JSON.stringify({
         attemptId: input.attemptId, taskId: input.taskId, childKey: input.childKey, observedAt: input.observedAt,
       }));
@@ -4340,14 +4353,151 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
+  async missionLease(projectId: string, rootRunId: string): Promise<MissionLeaseRef> {
+    await this.setPid(projectId);
+    const run = await this.env.DB.prepare(
+      `SELECT r.sitting, r.lease_epoch AS epoch
+         FROM runs r JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
+        WHERE r.id = ? AND r.project_id = ? AND pd.strategy = 'single_root'`,
+    ).bind(rootRunId, projectId).first<{ sitting: number; epoch: number }>();
+    if (!run) throw new Error('mission root not found');
+    const assignment = await ensureRunExecution(this.env, rootRunId);
+    return { sitting: run.sitting, executionId: assignment.executionId, epoch: run.epoch };
+  }
+
+  async validateMissionLease(projectId: string, rootRunId: string, lease: MissionLeaseRef | null): Promise<boolean> {
+    await this.setPid(projectId);
+    if (!lease) return false;
+    try {
+      const current = await this.missionLease(projectId, rootRunId);
+      return current.sitting === lease.sitting
+        && current.executionId === lease.executionId
+        && current.epoch === lease.epoch;
+    } catch { return false; }
+  }
+
+  async openRunnerMissionReconciliation(
+    projectId: string,
+    runnerId: string,
+    deadlineMs = 30_000,
+  ): Promise<{ deadline: string; items: MissionInventoryItem[] }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const deadline = new Date(Date.now() + Math.max(5_000, Math.min(120_000, deadlineMs))).toISOString();
+      const { results } = await this.env.DB.prepare(
+        `SELECT r.id FROM runs r JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
+          WHERE r.project_id = ? AND r.runner_id = ? AND pd.strategy = 'single_root'
+            AND r.status IN ('dispatched','running','blocked')`,
+      ).bind(projectId, runnerId).all<{ id: string }>();
+      const items: MissionInventoryItem[] = [];
+      for (const { id } of results) {
+        await this.env.DB.prepare('UPDATE runs SET reconciliation_deadline = ?, updated_at = ? WHERE id = ?')
+          .bind(deadline, nowIso(), id).run();
+        const lease = await this.missionLease(projectId, id);
+        const attempts = await this.env.DB.prepare(
+          `SELECT id AS attemptId, child_execution_id AS executionId, lease_epoch AS epoch
+             FROM mission_task_attempts WHERE root_run_id = ? AND status = 'running' ORDER BY id`,
+        ).bind(id).all<{ attemptId: string; executionId: string; epoch: number }>();
+        items.push({ runId: id, lease, attempts: attempts.results });
+      }
+      await this.scheduleExpiryAlarm();
+      return { deadline, items };
+    });
+  }
+
+  async currentRunnerMissionReconciliation(
+    projectId: string,
+    runnerId: string,
+  ): Promise<{ deadline: string | null; items: MissionInventoryItem[] }> {
+    await this.setPid(projectId);
+    const { results } = await this.env.DB.prepare(
+      `SELECT r.id, r.reconciliation_deadline AS deadline
+         FROM runs r JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
+        WHERE r.project_id = ? AND r.runner_id = ? AND pd.strategy = 'single_root'
+          AND r.reconciliation_deadline IS NOT NULL AND r.status IN ('dispatched','running','blocked')`,
+    ).bind(projectId, runnerId).all<{ id: string; deadline: string }>();
+    const items: MissionInventoryItem[] = [];
+    for (const row of results) {
+      const lease = await this.missionLease(projectId, row.id);
+      const attempts = await this.env.DB.prepare(
+        `SELECT id AS attemptId, child_execution_id AS executionId, lease_epoch AS epoch
+           FROM mission_task_attempts WHERE root_run_id = ? AND status = 'running' ORDER BY id`,
+      ).bind(row.id).all<{ attemptId: string; executionId: string; epoch: number }>();
+      items.push({ runId: row.id, lease, attempts: attempts.results });
+    }
+    return { deadline: results[0]?.deadline ?? null, items };
+  }
+
+  async adoptRunnerMission(
+    projectId: string,
+    runnerId: string,
+    inventory: MissionInventoryItem,
+  ): Promise<MissionAdoptionResult> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const run = await this.env.DB.prepare(
+        `SELECT r.status, r.exit, r.sitting, r.lease_epoch AS epoch,
+                r.reconciliation_deadline AS deadline
+           FROM runs r JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
+          WHERE r.id = ? AND r.project_id = ? AND r.runner_id = ? AND pd.strategy = 'single_root'`,
+      ).bind(inventory.runId, projectId, runnerId).first<{
+        status: string; exit: string | null; sitting: number; epoch: number; deadline: string | null;
+      }>();
+      if (!run) return { runId: inventory.runId, decision: 'unknown', lease: null, reason: 'mission root not found' };
+      if (!['dispatched', 'running', 'blocked'].includes(logicalRunStatus(run))) {
+        return { runId: inventory.runId, decision: 'already_terminal', lease: null, reason: logicalRunStatus(run) };
+      }
+      if (!run.deadline || run.deadline <= nowIso()) {
+        return { runId: inventory.runId, decision: 'cancel', lease: null, reason: 'reconciliation deadline expired' };
+      }
+      const current = await this.missionLease(projectId, inventory.runId);
+      const expectedAttempts = await this.env.DB.prepare(
+        `SELECT id AS attemptId, child_execution_id AS executionId, lease_epoch AS epoch
+           FROM mission_task_attempts WHERE root_run_id = ? AND status = 'running' ORDER BY id`,
+      ).bind(inventory.runId).all<{ attemptId: string; executionId: string; epoch: number }>();
+      const supplied = [...inventory.attempts].sort((a, b) => a.attemptId.localeCompare(b.attemptId));
+      if (JSON.stringify(inventory.lease) !== JSON.stringify(current)
+          || JSON.stringify(supplied) !== JSON.stringify(expectedAttempts.results)) {
+        return { runId: inventory.runId, decision: 'cancel', lease: null, reason: 'durable mission inventory does not match server state' };
+      }
+      const next: MissionLeaseRef = { ...current, epoch: current.epoch + 1 };
+      const ttl = await this.claimTtlSeconds();
+      const claimExpiry = new Date(Date.now() + ttl * 1000).toISOString();
+      await this.env.DB.batch([
+        this.env.DB.prepare(
+          `UPDATE runs SET lease_epoch = ?, reconciliation_deadline = NULL, updated_at = ?
+            WHERE id = ? AND lease_epoch = ? AND reconciliation_deadline = ?`,
+        ).bind(next.epoch, nowIso(), inventory.runId, current.epoch, run.deadline),
+        this.env.DB.prepare(
+          `UPDATE mission_task_attempts SET lease_epoch = ?, updated_at = ?
+            WHERE root_run_id = ? AND status = 'running' AND lease_epoch = ?`,
+        ).bind(next.epoch, nowIso(), inventory.runId, current.epoch),
+        this.env.DB.prepare(
+          `UPDATE claims SET expires_at = ? WHERE id IN (
+             SELECT claim_id FROM mission_task_attempts WHERE root_run_id = ? AND status = 'running')`,
+        ).bind(claimExpiry, inventory.runId),
+        this.env.DB.prepare(
+          `UPDATE tasks SET claim_expires_at = ? WHERE id IN (
+             SELECT task_id FROM mission_task_attempts WHERE root_run_id = ? AND status = 'running')`,
+        ).bind(claimExpiry, inventory.runId),
+      ]);
+      await this.scheduleExpiryAlarm();
+      return { runId: inventory.runId, decision: 'adopt', lease: next, reason: null };
+    });
+  }
+
   /** Settle an admitted attempt using the claim returned by begin as the CAS token. */
   async settleMissionTask(
     projectId: string,
     rootRunId: string,
     input: MissionTaskSettleReport,
+    lease?: MissionLeaseRef,
   ): Promise<MissionTaskAck> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
+      if (lease && !(await this.validateMissionLease(projectId, rootRunId, lease))) {
+        throw new Error('stale mission lease epoch');
+      }
       const settleHash = await sha256Hex(JSON.stringify({
         attemptId: input.attemptId, claimId: input.claimId, outcome: input.outcome,
         reason: input.reason, observedAt: input.observedAt,
@@ -4963,6 +5113,10 @@ export class ProjectRoom extends DurableObject<Env> {
   async transitionRun(projectId: string, actor: Actor, runId: string, patch: RunPatch): Promise<RunView> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
+      if (patch.missionLease !== undefined && patch.missionLease !== null
+          && !(await this.validateMissionLease(projectId, runId, patch.missionLease))) {
+        throw new Error('stale mission lease epoch');
+      }
       const run = await this.loadRun(runId);
       const requested = RunStatus.parse(patch.status);
       const patchExit = patch.exit ?? {};
@@ -5293,44 +5447,72 @@ export class ProjectRoom extends DurableObject<Env> {
   }
 
   /** On daemon reconnect, orphaned non-terminal Runs for that runner → failed{daemon_restart}. */
-  async reconcileRunnerRuns(projectId: string, actor: Actor, runnerId: string): Promise<{ failed: number }> {
+  async reconcileRunnerRuns(
+    projectId: string,
+    actor: Actor,
+    runnerId: string,
+    options: { excludeMission?: boolean } = {},
+  ): Promise<{ failed: number }> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const { results } = await this.env.DB.prepare(
-        `SELECT id, status, agent_id AS agentId, sitting FROM runs
-         WHERE project_id = ? AND runner_id = ? AND status IN ('dispatched','running','blocked')`,
+        `SELECT r.id, r.status, r.agent_id AS agentId, r.sitting FROM runs r
+         WHERE r.project_id = ? AND r.runner_id = ? AND r.status IN ('dispatched','running','blocked')
+           ${options.excludeMission ? `AND NOT EXISTS (
+             SELECT 1 FROM plan_dispatches pd
+              WHERE pd.id = r.plan_dispatch_id AND pd.strategy = 'single_root')` : ''}`,
       ).bind(projectId, runnerId).all<{ id: string; status: string; agentId: string | null; sitting: number }>();
       const now = nowIso();
-      for (const r of results) {
-        const exit = JSON.stringify({ outcome: 'failed', code: null, signal: null, reason: 'daemon_restart', finishedAt: now });
-        await this.env.DB.batch([
-          this.env.DB.prepare("UPDATE runs SET status = 'failed', exit = ?, updated_at = ? WHERE id = ?")
-            .bind(exit, now, r.id),
-          this.env.DB.prepare(
-            `INSERT INTO memory_episode_jobs (project_id, run_id, sitting, requested_at)
-             VALUES (?, ?, ?, ?) ON CONFLICT (run_id, sitting) DO NOTHING`,
-          ).bind(projectId, r.id, r.sitting, now),
-        ]);
-        this.ctx.waitUntil(
-          processPendingEpisodeJob(this.env, projectId, r.id, r.sitting).catch((err) =>
-            console.warn(`episode recording for reconciled run ${r.id}/${r.sitting} failed: ${String(err)}`),
-          ),
-        );
-        // This path writes a TERMINAL status directly instead of going through transitionRun,
-        // so it has to do transitionRun's retirement itself. Without it a daemon restart left
-        // every orphaned run's credential valid for the rest of its 7-day TTL — a token with no
-        // process, no supervision and no budget behind it, which is precisely what
-        // retireRunAgent exists to prevent.
-        //
-        // It also silently widened RUN-160: `runKindOf` finds no live run for such an agent, and
-        // a spec write it cannot attribute to a live run is PERMITTED. That fail-open is only
-        // defensible while "the run ended" implies "the credential died" — and here it did not,
-        // so a reconciled build agent could rewrite the spec it had just been judged against.
-        if (r.agentId) await this.retireRunAgent(r.agentId);
-        await this.emit(actor, 'run.status_changed', 'run', r.id, { from: r.status, to: 'failed', reason: 'daemon_restart' });
-      }
+      for (const r of results) await this.failRunForDaemonRestart(r, actor, now);
       return { failed: results.length };
     });
+  }
+
+  /** Public sweep seam for deterministic maintenance/tests; the scheduled alarm invokes the
+   * same helper, so timeout behavior has one implementation. */
+  async sweepRunnerMissionReconciliations(
+    projectId: string,
+    actor: Actor = SYSTEM_ACTOR,
+  ): Promise<{ failed: number }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      return { failed: await this.expireRunnerMissionReconciliations(nowIso(), actor) };
+    });
+  }
+
+  private async expireRunnerMissionReconciliations(now: string, actor: Actor): Promise<number> {
+    const { results } = await this.env.DB.prepare(
+      `SELECT id, status, agent_id AS agentId, sitting FROM runs
+        WHERE project_id = ? AND reconciliation_deadline IS NOT NULL
+          AND reconciliation_deadline < ? AND status IN ('dispatched','running','blocked')`,
+    ).bind(this.projectId, now).all<{ id: string; status: string; agentId: string | null; sitting: number }>();
+    for (const run of results) await this.failRunForDaemonRestart(run, actor, now);
+    return results.length;
+  }
+
+  private async failRunForDaemonRestart(
+    run: { id: string; status: string; agentId: string | null; sitting: number },
+    actor: Actor,
+    now: string,
+  ): Promise<void> {
+    const exit = JSON.stringify({ outcome: 'failed', code: null, signal: null, reason: 'daemon_restart', finishedAt: now });
+    await this.env.DB.batch([
+      this.env.DB.prepare(
+        "UPDATE runs SET status = 'failed', exit = ?, reconciliation_deadline = NULL, updated_at = ? WHERE id = ?",
+      ).bind(exit, now, run.id),
+      this.env.DB.prepare(
+        `INSERT INTO memory_episode_jobs (project_id, run_id, sitting, requested_at)
+         VALUES (?, ?, ?, ?) ON CONFLICT (run_id, sitting) DO NOTHING`,
+      ).bind(this.projectId, run.id, run.sitting, now),
+    ]);
+    await this.interruptMissionTaskAttempts(run.id, run.agentId, now, 'failed');
+    this.ctx.waitUntil(
+      processPendingEpisodeJob(this.env, this.projectId, run.id, run.sitting).catch((err) =>
+        console.warn(`episode recording for reconciled run ${run.id}/${run.sitting} failed: ${String(err)}`),
+      ),
+    );
+    if (run.agentId) await this.retireRunAgent(run.agentId);
+    await this.emit(actor, 'run.status_changed', 'run', run.id, { from: run.status, to: 'failed', reason: 'daemon_restart' });
   }
 
   /** Read Runs for the project (UI + dispatch). Optional runner/status filters. */

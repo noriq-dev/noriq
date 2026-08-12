@@ -4,6 +4,9 @@
 import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { RunnerHello, RunnerServerMessage } from '@noriq-dev/shared';
+import type { MissionInventoryItem } from '@noriq-dev/shared';
+import type { Actor, CreatePlanDispatchInput, PlanDispatchView } from '../src/do/ProjectRoom';
+import type { Env } from '../src/env';
 import { createAgent, createUser, loginSession, mcpCall, mintTokenForUser, authorizeForAllProjects } from './helpers';
 
 // Resolve the next WS frame matching a predicate (with a timeout).
@@ -84,6 +87,13 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
 
   const wsConnect = (id: string, headers: Record<string, string>) =>
     SELF.fetch(`https://noriq.test/ws/runner/${id}`, { headers: { Upgrade: 'websocket', ...headers } });
+
+  const projectRoom = () => (env as unknown as Env).PROJECT_ROOM.get(
+    (env as unknown as Env).PROJECT_ROOM.idFromName(pid),
+  ) as unknown as {
+    createPlan(projectId: string, actor: Actor, input: Record<string, unknown>): Promise<{ id: string }>;
+    createPlanDispatch(projectId: string, actor: Actor, input: CreatePlanDispatchInput): Promise<PlanDispatchView>;
+  };
 
   it('rejects the upgrade without a token (401) and for a non-owner (404)', async () => {
     expect((await wsConnect(runnerId, {})).status).toBe(401);
@@ -240,6 +250,112 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
     expect(minted.status).toBe(200);
     expect(await minted.json()).toMatchObject({ execution: assigned.run.execution });
     ws.close();
+  });
+
+  it('reconciles a restarted mission and fences stale lifecycle frames by lease epoch (PLNR-486)', async () => {
+    const registration = {
+      runnerId,
+      label: 'ws-daemon', tools: ['claude'], kinds: ['build'], maxConcurrency: 2,
+      repos: [{
+        id: 'repo_x', projectKey: 'RWSP',
+        workflows: [{
+          name: 'mission-plan', base: 'build', description: 'WS mission harness', capabilities: ['mission.v2'],
+        }],
+      }],
+      protocolCapabilities: ['mission.v2'],
+    };
+    expect((await SELF.fetch('https://noriq.test/api/runners', {
+      method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(registration),
+    })).status).toBe(200);
+
+    const owner = await env.DB.prepare('SELECT owner_user_id AS id FROM runners WHERE id = ?')
+      .bind(runnerId).first<{ id: string }>();
+    const actor: Actor = { kind: 'human', id: owner!.id, name: 'RWS Owner' };
+    const plan = await projectRoom().createPlan(pid, actor, {
+      title: `WS mission ${crypto.randomUUID()}`,
+      phases: [{ title: 'build', newTasks: [{ title: 'mission child' }] }],
+    });
+
+    const first = await wsConnect(runnerId, { Authorization: `Bearer ${token}` });
+    const ws = first.webSocket!;
+    ws.accept();
+    const registeredP = nextFrame(ws, (m) => m.type === 'registered');
+    ws.send(JSON.stringify({
+      type: 'hello', protocol: 1, label: 'ws-daemon',
+      protocolCapabilities: ['orchestration.v1', 'mission.v2'],
+    }));
+    expect((await registeredP).acceptedCapabilities).toEqual(['orchestration.v1', 'mission.v2']);
+
+    const assignedP = nextFrame(ws, (m) => m.type === 'run.assigned' && m.missionLease);
+    const dispatch = await projectRoom().createPlanDispatch(pid, actor, {
+      planId: plan.id, runnerId, repoRef: 'repo_x', agentTool: 'claude',
+      strategy: 'single_root', workflow: 'mission-plan',
+    });
+    const assigned = await assignedP;
+    const runId = assigned.run.id as string;
+    expect(assigned.missionLease).toMatchObject({ sitting: 1, executionId: expect.any(String), epoch: 1 });
+    expect(dispatch.strategy).toBe('single_root');
+
+    // Mission lifecycle frames without the server lease retain byte compatibility in the
+    // parser but are rejected before reaching ProjectRoom.
+    ws.send(JSON.stringify({ type: 'run.status', runId, status: 'running', at: new Date().toISOString() }));
+    await sleep(75);
+    expect((await env.DB.prepare('SELECT status FROM runs WHERE id = ?').bind(runId).first<{ status: string }>())?.status)
+      .toBe('dispatched');
+    ws.send(JSON.stringify({
+      type: 'run.status', runId, status: 'running', missionLease: assigned.missionLease,
+      at: new Date().toISOString(),
+    }));
+    await waitRunStatus(runId, 'running');
+    ws.close();
+
+    // Re-registration opens the durable adoption window. Hello returns the server inventory;
+    // exact adoption advances the epoch before any further process effects are accepted.
+    expect((await SELF.fetch('https://noriq.test/api/runners', {
+      method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(registration),
+    })).status).toBe(200);
+    const second = await wsConnect(runnerId, { Authorization: `Bearer ${token}` });
+    const resumed = second.webSocket!;
+    resumed.accept();
+    const reconciliationP = nextFrame(resumed, (m) => m.type === 'mission.reconcile.request');
+    resumed.send(JSON.stringify({
+      type: 'hello', protocol: 1, label: 'ws-daemon',
+      protocolCapabilities: ['orchestration.v1', 'mission.v2'],
+    }));
+    const reconciliation = await reconciliationP as { items: MissionInventoryItem[] };
+    expect(reconciliation.items).toEqual([expect.objectContaining({ runId, lease: assigned.missionLease })]);
+    const resultP = nextFrame(resumed, (m) => m.type === 'mission.reconcile.result');
+    resumed.send(JSON.stringify({
+      type: 'mission.reconcile', inventory: reconciliation.items, observedAt: new Date().toISOString(),
+    }));
+    const result = await resultP;
+    expect(result.results[0]).toMatchObject({
+      runId, decision: 'adopt', lease: { ...assigned.missionLease, epoch: 2 }, reason: null,
+    });
+
+    resumed.send(JSON.stringify({
+      type: 'run.status', runId, status: 'blocked', missionLease: assigned.missionLease,
+      at: new Date().toISOString(),
+    }));
+    const spendBefore = await env.DB.prepare('SELECT tokens_used AS tokens FROM runs WHERE id = ?')
+      .bind(runId).first<{ tokens: number }>();
+    resumed.send(JSON.stringify({
+      type: 'run.telemetry', runId, missionLease: assigned.missionLease,
+      tokensUsed: 999, usdSpent: 999, logTail: null, phase: null,
+    }));
+    await sleep(75);
+    expect((await env.DB.prepare('SELECT status FROM runs WHERE id = ?').bind(runId).first<{ status: string }>())?.status)
+      .toBe('running');
+    expect((await env.DB.prepare('SELECT tokens_used AS tokens FROM runs WHERE id = ?')
+      .bind(runId).first<{ tokens: number }>())?.tokens).toBe(spendBefore?.tokens);
+    resumed.send(JSON.stringify({
+      type: 'run.status', runId, status: 'blocked', missionLease: result.results[0].lease,
+      at: new Date().toISOString(),
+    }));
+    await waitRunStatus(runId, 'blocked');
+    resumed.close();
   });
 
   it('dispatch rejects a repoRef that does not resolve to the project', async () => {

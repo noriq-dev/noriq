@@ -81,7 +81,7 @@ import { AGENT_LIFECYCLES, listAgentRoster, type AgentRosterLifecycle } from './
 import { listRunnerRoster, RUNNER_HEARTBEAT_TTL_MS, RUNNER_LIFECYCLES, type RunnerRosterLifecycle } from './lib/runner-roster';
 import {
   AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget,
-  ORCHESTRATION_CAPABILITY, RunnerProtocolCapability,
+  MISSION_CAPABILITY, ORCHESTRATION_CAPABILITY, RunnerProtocolCapability,
   RunnerExecutionDeclaration, RunnerExecutionEventReport, RunnerExecutionReconciliation,
   RunnerExecutionRelationReport, isTerminalRunStatus, normalizeProjectKey,
   IndexGenerationManifest, ContextPackRole, RunnerSpinoffTaskRequest, type RunnerIndexCursor,
@@ -3699,6 +3699,9 @@ const RegisterRunnerBody = z.object({
   kinds: z.array(RunKind).default([]),
   maxConcurrency: z.number().int().nonnegative().default(1),
   repos: z.array(RunnerRepo).default([]),
+  // Runtime protocol features are negotiated again on the WebSocket hello. Registration only
+  // needs this bounded advertisement to choose the restart policy before that socket exists.
+  protocolCapabilities: z.array(RunnerProtocolCapability).max(16).default([]),
   /** The daemon's RELEASE version (RUN-36). Optional: a runner older than version reporting
    *  still registers, and the panel says "unknown" rather than inventing a number. */
   version: z.string().max(40).optional(),
@@ -3876,15 +3879,21 @@ app.post('/api/runners', agentAuth, async (c) => {
                           retired_at = NULL, retire_reason = NULL, archived_at = NULL
         WHERE id = ?`,
     ).bind(b.label, capabilities, JSON.stringify(repos), b.maxConcurrency, now, c.var.connection!.tokenId, b.version ?? null, id).run();
-    // Reconnect reconciliation (RUN-6): the daemon's previous process died, so any
-    // Runs still dispatched/running/blocked for it are orphaned → failed{daemon_restart}.
-    // Runs are per-project, so sweep each affected project's ProjectRoom (the authority).
+    // Reconnect reconciliation (RUN-6/PLNR-486): legacy processes still fail every live Run
+    // immediately. A mission.v2 daemon gets a short, durable inventory window for single-root
+    // missions; all other Runs retain the existing daemon_restart outcome.
     const { results: staleProjects } = await c.env.DB.prepare(
       "SELECT DISTINCT project_id AS pid FROM runs WHERE runner_id = ? AND status IN ('dispatched','running','blocked')",
     ).bind(id).all<{ pid: string }>();
     const sysActor: Actor = { kind: 'system', id: 'system', name: 'system' };
+    const canReconcileMissions = b.protocolCapabilities.includes(MISSION_CAPABILITY);
     for (const { pid } of staleProjects) {
-      await room(c.env, pid).reconcileRunnerRuns(pid, sysActor, id);
+      if (canReconcileMissions) {
+        await room(c.env, pid).openRunnerMissionReconciliation(pid, id);
+        await room(c.env, pid).reconcileRunnerRuns(pid, sysActor, id, { excludeMission: true });
+      } else {
+        await room(c.env, pid).reconcileRunnerRuns(pid, sysActor, id);
+      }
     }
   } else {
     id = newId('rnr');
