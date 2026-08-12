@@ -1,4 +1,4 @@
-import { RunBudget, type ExecutedConfigurationEvidence, type ExecutionSpec, type ProjectIntelligenceEpisode } from '@noriq-dev/shared';
+import { RunBudget, type CommissionedExecutionProfile, type ExecutedConfigurationEvidence, type ExecutionSpec, type ProjectIntelligenceEpisode } from '@noriq-dev/shared';
 import { readExecutionSpec } from './execution-spec';
 import { nowIso, sha256Hex } from './util';
 
@@ -35,11 +35,12 @@ export interface RunCommissioningSnapshot {
     effort: string | null;
     workflow: string | null;
   };
+  executionProfile: CommissionedExecutionProfile | null;
   executionSpec: ExecutionSpec | null;
   executionSpecUnreadable: boolean;
   executionSpecFingerprint: string | null;
   budget: { maxTokens: number | null; maxUsd: number | null; maxDurationSeconds: number | null; maxRounds: number | null };
-  configuration: Array<{ kind: 'runner' | 'workflow' | 'reviewer' | 'verifier' | 'manifest' | 'context'; name: string | null; version: string | null; fingerprint: string }>;
+  configuration: Array<{ kind: 'runner' | 'workflow' | 'reviewer' | 'verifier' | 'manifest' | 'context' | 'execution_profile'; name: string | null; version: string | null; fingerprint: string }>;
   capturedAt: string;
 }
 
@@ -79,6 +80,7 @@ export async function captureRunCommissioningSnapshot(
             r.anchor_id AS anchorId, r.plan_id AS planId, r.plan_dispatch_id AS planDispatchId,
             r.repo_ref AS repoRef, r.runner_id AS runnerId, r.target_branch AS targetBranch,
             r.agent_tool AS agentTool, r.agent, r.model, r.effort, r.workflow, r.budget,
+            r.execution_profile AS executionProfile,
             t.title AS taskTitle, t.type AS taskType, t.execution_spec AS executionSpec,
             ph.id AS phaseId, ph."order" AS phaseOrder, pd.gate AS gateMode,
             pr.repository_key AS repositoryKey, rn.version AS runnerVersion
@@ -119,6 +121,18 @@ export async function captureRunCommissioningSnapshot(
       fingerprint: await sha256Hex(canonicalJson({ runnerId: run.runnerId, version })),
     });
   }
+  const executionProfile = parseJson<CommissionedExecutionProfile | null>(
+    run.executionProfile == null ? null : String(run.executionProfile),
+    null,
+  );
+  if (executionProfile) {
+    configuration.push({
+      kind: 'execution_profile',
+      name: executionProfile.id,
+      version: String(executionProfile.generation),
+      fingerprint: executionProfile.effectiveFingerprint,
+    });
+  }
   const snapshot: RunCommissioningSnapshot = {
     runId,
     sitting: Number(run.sitting),
@@ -138,6 +152,7 @@ export async function captureRunCommissioningSnapshot(
     baseId: null,
     requested,
     commissioned: { ...requested },
+    executionProfile,
     executionSpec: storedSpec.spec,
     executionSpecUnreadable: storedSpec.unreadable === true,
     executionSpecFingerprint,

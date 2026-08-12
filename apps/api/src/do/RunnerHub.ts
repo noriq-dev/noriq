@@ -4,6 +4,7 @@ import type { Actor } from './ProjectRoom';
 import {
   ORCHESTRATION_CAPABILITY,
   MISSION_CAPABILITY,
+  RunnerRepo,
   RunnerClientMessage,
   RUNNER_PROTOCOL_CAPABILITIES,
   RUNNER_PROTOCOL_VERSION,
@@ -101,6 +102,7 @@ export class RunnerHub extends DurableObject<Env> {
         const acceptedCapabilities = RUNNER_PROTOCOL_CAPABILITIES.filter((capability) =>
           msg.protocolCapabilities.includes(capability));
         ws.serializeAttachment({ ...auth, capabilities: acceptedCapabilities } satisfies RunnerSocketAuth);
+        await this.refreshExecutionProfiles(runnerId, msg.repos);
         if (!this.sendIfOpen(ws, JSON.stringify({
           type: 'registered', runnerId, protocol: RUNNER_PROTOCOL_VERSION,
           serverTime: new Date().toISOString(), acceptedCapabilities,
@@ -139,13 +141,14 @@ export class RunnerHub extends DurableObject<Env> {
       }
 
       case 'heartbeat': {
+        if (msg.repos) await this.refreshExecutionProfiles(runnerId, msg.repos);
         await this.env.DB.prepare("UPDATE runners SET free_slots = ?, status = 'online', last_heartbeat_at = ? WHERE id = ?")
           .bind(msg.freeSlots, new Date().toISOString(), runnerId).run();
         // The plan-dispatch reconcile (PLNR-170). A shared runner's slots can free from
         // ANOTHER project's runs — an event the waiting project's room never hears — so the
         // periodic heartbeat is the wake-up that closes that gap. Best-effort: the rooms'
         // pumps are idempotent and the next heartbeat asks again.
-        if (msg.freeSlots > 0) {
+        if (msg.freeSlots > 0 || msg.repos) {
           const { results } = await this.env.DB.prepare(
             "SELECT DISTINCT project_id AS pid FROM plan_dispatches WHERE runner_id = ? AND status IN ('active','stalled')",
           ).bind(runnerId).all<{ pid: string }>();
@@ -372,6 +375,31 @@ export class RunnerHub extends DurableObject<Env> {
 
   private room(projectId: string) {
     return this.env.PROJECT_ROOM.get(this.env.PROJECT_ROOM.idFromName(projectId));
+  }
+
+  /** WebSocket liveness refreshes only nested secret-free profile offers. Project/repository
+   * resolution remains the REST registration authority; a daemon cannot rewrite it in hello. */
+  private async refreshExecutionProfiles(runnerId: string, advertised: RunnerRepo[]): Promise<void> {
+    if (advertised.length === 0) return;
+    const row = await this.env.DB.prepare('SELECT repos FROM runners WHERE id = ?')
+      .bind(runnerId).first<{ repos: string }>();
+    if (!row) return;
+    let stored: Array<Record<string, unknown> & { id: string; executionProfiles?: unknown }>;
+    try {
+      stored = (JSON.parse(row.repos || '[]') as Array<Record<string, unknown> & { id: string }>);
+    } catch { return; }
+    const incoming = new Map(advertised.map((repo) => [repo.id, repo.executionProfiles]));
+    let changed = false;
+    const merged = stored.map((repo) => {
+      const profiles = incoming.get(repo.id);
+      if (!profiles) return repo;
+      changed = true;
+      return { ...repo, executionProfiles: profiles };
+    });
+    if (changed) {
+      await this.env.DB.prepare('UPDATE runners SET repos = ? WHERE id = ?')
+        .bind(JSON.stringify(merged), runnerId).run();
+    }
   }
 
   /** Async authorization/redelivery work may outlive a peer-initiated close. Treat that as an

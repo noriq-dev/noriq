@@ -707,6 +707,26 @@ export interface ApiRunnerRepo {
    *  description} — base lets the selector default the run's kind to the workflow's posture.
    *  Prompt/stages stay the runner's authority (committed manifest). */
   workflows: Array<string | ApiAdvertisedWorkflow>;
+  /** Opaque, secret-free machine environments. Details needed to resolve them stay local. */
+  executionProfiles?: ApiExecutionProfileOffer[];
+}
+export interface ApiExecutionProfileOffer {
+  id: string;
+  declarationFingerprint: string;
+  effectiveFingerprint: string | null;
+  resolution: 'resolved' | 'unresolved' | 'drifted';
+  health: 'healthy' | 'degraded' | 'unavailable';
+  attestationCapable: boolean;
+  observedAt: string;
+  generation: number;
+  capacity: { maxConcurrency: number; freeSlots: number };
+}
+export interface ApiCommissionedExecutionProfile {
+  id: string;
+  declarationFingerprint: string;
+  effectiveFingerprint: string;
+  generation: number;
+  attestationCapable: true;
 }
 export interface ApiAdvertisedWorkflow {
   name: string;
@@ -837,6 +857,7 @@ export interface ApiRun {
   /** The selected repo-defined workflow (RUN-121); null = the built-in for `kind`. Overrides only
    *  the prompt — `kind` still carries the posture. */
   workflow: string | null;
+  executionProfile: ApiCommissionedExecutionProfile | null;
   /** per_task is the legacy fan-out; single_root delegates child scheduling to a mission.v2 workflow. */
   strategy: 'per_task' | 'single_root';
   budget: Partial<ApiRunBudget>;
@@ -895,6 +916,8 @@ export interface ApiPlanDispatch {
   /** The dispatch-level workflow default (PLNR-240); null = the built-in build. A task's own
    *  `workflow` overrides it per run. */
   workflow: string | null;
+  executionProfileId: string | null;
+  executionProfile: ApiCommissionedExecutionProfile | null;
   /** Every plan task with its latest run from THIS dispatch (null = not dispatched yet). */
   tasks: Array<{ taskId: string; runId: string | null; runStatus: string | null }>;
   createdBy: string;
@@ -915,6 +938,7 @@ export interface PlanDispatchInput {
    *  Must be advertised by the chosen repo; the server refuses an unknown name. */
   workflow?: string | null;
   strategy?: 'per_task' | 'single_root';
+  executionProfileId?: string | null;
 }
 /** One transcript segment (RUN-74). Consecutive same-voice segments merge in the UI. */
 export interface ApiRunLogSegment {
@@ -949,6 +973,7 @@ export interface DispatchInput {
   /** A repo-defined workflow name (RUN-121). Overrides only the prompt, so `kind` must be set to
    *  the workflow's base — the daemon keys permissions off `kind`. */
   workflow?: string | null;
+  executionProfileId?: string | null;
   budget?: Partial<ApiRunBudget>;
 }
 

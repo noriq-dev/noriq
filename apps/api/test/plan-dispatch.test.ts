@@ -51,7 +51,7 @@ let pid: string;
 /** A runner the pump can schedule onto. Fresh per test — capacity math reads the runs
  *  table, so sharing a runner across tests would leak slots between them. */
 let runnerSeq = 0;
-async function seedRunner(maxConcurrency: number, mission = false): Promise<string> {
+async function seedRunner(maxConcurrency: number, mission = false, executionProfiles: unknown[] = []): Promise<string> {
   const id = `rnr_pd_${++runnerSeq}`;
   await env.DB.prepare(
     `INSERT INTO runners (id, label, owner_user_id, status, capabilities, repos, free_slots)
@@ -64,6 +64,7 @@ async function seedRunner(maxConcurrency: number, mission = false): Promise<stri
       workflows: mission ? [{
         name: 'mission-plan', base: 'build', description: 'Runner mission harness', capabilities: ['mission.v2'],
       }] : [],
+      executionProfiles,
     }]),
     maxConcurrency,
   ).run();
@@ -785,5 +786,64 @@ describe('durable mission restart reconciliation (PLNR-486)', () => {
       .toBe('failed');
     expect((await env.DB.prepare('SELECT status FROM runs WHERE id = ?').bind(mission.rootRunId).first<{ status: string }>())?.status)
       .toBe('running');
+  });
+});
+
+describe('profile-aware plan scheduling (PLNR-487)', () => {
+  const profile = (over: Record<string, unknown> = {}) => ({
+    id: 'nod-resources', declarationFingerprint: 'decl-nod', effectiveFingerprint: 'inventory-nod',
+    resolution: 'resolved', health: 'healthy', attestationCapable: true,
+    observedAt: new Date().toISOString(), generation: 7,
+    capacity: { maxConcurrency: 1, freeSlots: 1 }, ...over,
+  });
+
+  it('augments global capacity with singleton profile capacity and snapshots every commissioned sitting', async () => {
+    const runner = await seedRunner(4, false, [profile()]);
+    const plan = await makePlan('profile-singleton');
+    const dispatch = await createDispatch(runner, plan.planId, { executionProfileId: 'nod-resources' });
+    expect(dispatch.executionProfile).toMatchObject({
+      id: 'nod-resources', declarationFingerprint: 'decl-nod', effectiveFingerprint: 'inventory-nod', generation: 7,
+    });
+    const runs = await env.DB.prepare(
+      `SELECT id, execution_profile_id AS profileId, execution_profile AS profile
+         FROM runs WHERE plan_dispatch_id = ?`,
+    ).bind(dispatch.id).all<{ id: string; profileId: string; profile: string }>();
+    expect(runs.results).toHaveLength(1);
+    expect(runs.results[0]?.profileId).toBe('nod-resources');
+    expect(JSON.parse(runs.results[0]!.profile)).toEqual(dispatch.executionProfile);
+
+    // Global capacity is four, but one live profile sitting consumes the singleton. Re-pumping
+    // cannot send the second ready phase-one task until this one exits.
+    expect((await room(pid).pumpProjectDispatches(pid)).created).toBe(0);
+    await room(pid).transitionRun(pid, actor, runs.results[0]!.id, { status: 'running' });
+    await room(pid).transitionRun(pid, actor, runs.results[0]!.id, { status: 'done' });
+    const after = await env.DB.prepare('SELECT id FROM runs WHERE plan_dispatch_id = ?')
+      .bind(dispatch.id).all<{ id: string }>();
+    expect(after.results).toHaveLength(2);
+  });
+
+  it('stalls on profile drift without falling back while omitted selection keeps legacy fan-out', async () => {
+    const runner = await seedRunner(4, false, [profile()]);
+    const selectedPlan = await makePlan('profile-drift');
+    const selected = await createDispatch(runner, selectedPlan.planId, { executionProfileId: 'nod-resources' });
+    const repos = JSON.parse((await env.DB.prepare('SELECT repos FROM runners WHERE id = ?')
+      .bind(runner).first<{ repos: string }>())!.repos) as Array<Record<string, unknown>>;
+    repos[0]!.executionProfiles = [profile({ generation: 8, effectiveFingerprint: 'inventory-drifted' })];
+    await env.DB.prepare('UPDATE runners SET repos = ? WHERE id = ?').bind(JSON.stringify(repos), runner).run();
+    const first = await env.DB.prepare('SELECT id FROM runs WHERE plan_dispatch_id = ?')
+      .bind(selected.id).first<{ id: string }>();
+    await room(pid).transitionRun(pid, actor, first!.id, { status: 'running' });
+    await room(pid).transitionRun(pid, actor, first!.id, { status: 'done' });
+    const stalled = (await room(pid).listPlanDispatches(pid, selectedPlan.planId)).dispatches[0]!;
+    expect(stalled.status).toBe('stalled');
+    expect(stalled.stallReason).toMatch(/execution profile unavailable.*drifted/);
+    expect((await env.DB.prepare('SELECT COUNT(*) AS n FROM runs WHERE plan_dispatch_id = ?')
+      .bind(selected.id).first<{ n: number }>())?.n).toBe(1);
+
+    const legacyRunner = await seedRunner(4);
+    const legacyPlan = await makePlan('profile-omitted');
+    const legacy = await createDispatch(legacyRunner, legacyPlan.planId);
+    expect(legacy.executionProfile).toBeNull();
+    expect((await dispatchRuns(legacy.id)).length).toBe(2);
   });
 });

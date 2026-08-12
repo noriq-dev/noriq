@@ -632,6 +632,7 @@ function PlanDispatchStrip({
         <MonoTag color="var(--text-mid)" bg="var(--w-05)" size={9}>gate {dispatch.gate}</MonoTag>
         {/* The dispatch-level workflow default (PLNR-240); per-task overrides still win. */}
         {dispatch.workflow && <MonoTag color="var(--purple)" bg="rgba(167,139,250,.12)" size={9}>{dispatch.workflow}</MonoTag>}
+        {dispatch.executionProfile && <MonoTag color="var(--cyan)" bg="rgba(34,211,238,.10)" size={9}>profile {dispatch.executionProfile.id}</MonoTag>}
         <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>
           {counts.running} running · {counts.done} done
           {counts.gated ? ` · ${counts.gated} gated` : ''}
@@ -766,9 +767,11 @@ function PlanDispatchForm({
   // the task names its own. Only BUILD-based workflows make sense — the pump mints build runs —
   // but bare-name advertisements (older daemons) carry no base, so they stay offered.
   const [workflow, setWorkflow] = useState('');
+  const [executionProfileId, setExecutionProfileId] = useState('');
   const repoWorkflows = (repos.find((r) => r.id === repoRef)?.workflows ?? [])
     .map(advertisedWorkflow)
     .filter((w) => w.base === 'build' || w.base === null);
+  const executionProfiles = repos.find((r) => r.id === repoRef)?.executionProfiles ?? [];
   const [maxUsd, setMaxUsd] = useState('');
   const [maxTokens, setMaxTokens] = useState('');
   const [maxMinutes, setMaxMinutes] = useState('');
@@ -783,7 +786,7 @@ function PlanDispatchForm({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runnerId]);
   // A workflow belongs to one repo — drop the choice when the repo changes (PLNR-240).
-  useEffect(() => { setWorkflow(''); }, [repoRef]);
+  useEffect(() => { setWorkflow(''); setExecutionProfileId(''); }, [repoRef]);
 
   const num = (s: string): number | null => {
     const n = Number(s.trim());
@@ -807,6 +810,9 @@ function PlanDispatchForm({
         gate,
         // '' = the built-in build. The server refuses an unadvertised name (PLNR-240).
         workflow: repoWorkflows.some((w) => w.name === workflow) ? workflow : null,
+        executionProfileId: executionProfiles.some((profile) => profile.id === executionProfileId)
+          ? executionProfileId
+          : null,
         // Per-RUN ceilings — each task's agent gets this envelope, not a shared pool.
         budget: { maxUsd: num(maxUsd), maxTokens: num(maxTokens), maxDurationSeconds: maxMinutes.trim() ? (num(maxMinutes) ?? 0) * 60 : null },
       });
@@ -874,6 +880,18 @@ function PlanDispatchForm({
               {repoWorkflows.map((w) => (
                 <option key={w.name} value={w.name} title={w.description ?? undefined}>
                   {w.name}{w.description ? ` — ${w.description.slice(0, 60)}` : ''}
+                </option>
+              ))}
+            </Select>
+          </Field>
+        )}
+        {executionProfiles.length > 0 && (
+          <Field label="execution profile (optional)" hint="shared across every task run in this dispatch">
+            <Select value={executionProfileId} onChange={(e) => setExecutionProfileId(e.target.value)}>
+              <option value="">— runner default —</option>
+              {executionProfiles.map((profile) => (
+                <option key={profile.id} value={profile.id}>
+                  {profile.id} · {profile.resolution}/{profile.health} · {profile.capacity.freeSlots}/{profile.capacity.maxConcurrency} slots
                 </option>
               ))}
             </Select>

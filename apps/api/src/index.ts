@@ -80,7 +80,7 @@ import { agentLifecycleSweepConfig, sweepAgentLifecycle, type AgentLifecycleCurs
 import { AGENT_LIFECYCLES, listAgentRoster, type AgentRosterLifecycle } from './lib/agent-roster';
 import { listRunnerRoster, RUNNER_HEARTBEAT_TTL_MS, RUNNER_LIFECYCLES, type RunnerRosterLifecycle } from './lib/runner-roster';
 import {
-  AgentTool, AdvertisedAgent, RunEffort, RunKind, RunnerRepo, RunBudget,
+  AgentTool, AdvertisedAgent, ExecutionProfileId, RunEffort, RunKind, RunnerRepo, RunBudget,
   MISSION_CAPABILITY, ORCHESTRATION_CAPABILITY, RunnerProtocolCapability,
   RunnerExecutionDeclaration, RunnerExecutionEventReport, RunnerExecutionReconciliation,
   RunnerExecutionRelationReport, isTerminalRunStatus, normalizeProjectKey,
@@ -97,6 +97,7 @@ import {
   declareRunnerExecution, ensureRunExecution, getOrchestrationTree, listOrchestrations, reconcileRunnerExecution,
   reportRunnerExecutionEvent, reportRunnerExecutionRelation,
 } from './lib/orchestration-store';
+import { commissionExecutionProfile } from './lib/execution-profiles';
 
 export { ProjectRoom } from './do/ProjectRoom';
 export { AgentSession } from './do/AgentSession';
@@ -4222,6 +4223,7 @@ const DispatchBody = z.object({
   // than silently falling back to the built-in — a run built under the wrong posture's prompt
   // is worse than one that didn't start.
   workflow: z.string().min(1).max(80).nullish(),
+  executionProfileId: ExecutionProfileId.nullish(),
   budget: RunBudget.optional(),
 });
 
@@ -4241,7 +4243,10 @@ app.post('/api/projects/:pid/runs', userAuth, async (c) => {
   const runner = await c.env.DB.prepare('SELECT repos FROM runners WHERE id = ? AND owner_user_id = ?')
     .bind(b.runnerId, c.var.user!.id).first<{ repos: string }>();
   if (!runner) return c.json({ error: 'runner not found' }, 404);
-  const repo = (JSON.parse(runner.repos) as Array<{ id: string; projectId: string | null; workflows?: Array<string | { name: string }> }>).find((r) => r.id === b.repoRef);
+  const repo = (JSON.parse(runner.repos) as Array<{
+    id: string; projectId: string | null; workflows?: Array<string | { name: string }>;
+    executionProfiles?: z.infer<typeof RunnerRepo>['executionProfiles'];
+  }>).find((r) => r.id === b.repoRef);
   if (!repo) return c.json({ error: 'unknown repoRef for this runner' }, 400);
   if (repo.projectId !== pid) return c.json({ error: 'repo does not resolve to this project' }, 400);
 
@@ -4249,6 +4254,12 @@ app.post('/api/projects/:pid/runs', userAuth, async (c) => {
   // silently fall back to the built-in.
   if (b.workflow && !advertisedWorkflowNames(repo).has(b.workflow)) {
     return c.json({ error: `workflow "${b.workflow}" is not advertised by this repo — refresh the runner or pick another` }, 400);
+  }
+  if (b.executionProfileId) {
+    try { commissionExecutionProfile({ id: repo.id, executionProfiles: repo.executionProfiles ?? [] }, b.executionProfileId); }
+    catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : 'execution profile is unavailable' }, 409);
+    }
   }
 
   // A verify run must judge a real build in THIS project — otherwise the daemon would
@@ -4261,15 +4272,20 @@ app.post('/api/projects/:pid/runs', userAuth, async (c) => {
     if (target.kind !== 'build') return c.json({ error: 'only a build run produces a diff to verify' }, 400);
   }
 
-  const run = await room(c.env, pid).createRun(pid, humanActor(c), {
-    kind: b.kind, agentTool: b.agentTool, repoRef: b.repoRef, brief: b.brief,
-    anchor: b.anchor ? { type: b.anchor.type, id: b.anchor.id } : null,
-    verifiesRunId: b.verifiesRunId ?? null,
-    targetBranch: b.targetBranch ?? null,
-    agent: b.agent ?? null, workflow: b.workflow ?? null,
-    model: b.model ?? null, effort: b.effort ?? null,
-    budget: b.budget, runnerId: b.runnerId,
-  });
+  let run;
+  try {
+    run = await room(c.env, pid).createRun(pid, humanActor(c), {
+      kind: b.kind, agentTool: b.agentTool, repoRef: b.repoRef, brief: b.brief,
+      anchor: b.anchor ? { type: b.anchor.type, id: b.anchor.id } : null,
+      verifiesRunId: b.verifiesRunId ?? null,
+      targetBranch: b.targetBranch ?? null,
+      agent: b.agent ?? null, workflow: b.workflow ?? null,
+      model: b.model ?? null, effort: b.effort ?? null,
+      budget: b.budget, runnerId: b.runnerId, executionProfileId: b.executionProfileId ?? null,
+    });
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : 'run dispatch failed' }, 409);
+  }
   const { delivered } = await hub(c.env, b.runnerId).deliver(JSON.stringify({ type: 'run.assigned', run }));
   return c.json({ run, delivered });
 });
@@ -4335,6 +4351,7 @@ const PlanDispatchApiBody = z.object({
   // same as the single-run dispatch; a task-level name is validated by the pump per task.
   workflow: z.string().min(1).max(80).nullish(),
   strategy: z.enum(['per_task', 'single_root']).default('per_task'),
+  executionProfileId: ExecutionProfileId.nullish(),
 });
 app.post('/api/projects/:pid/plans/:planId/dispatch', userAuth, async (c) => {
   const denied = demoDenied(c);
@@ -4348,7 +4365,10 @@ app.post('/api/projects/:pid/plans/:planId/dispatch', userAuth, async (c) => {
   const runner = await c.env.DB.prepare('SELECT repos FROM runners WHERE id = ? AND owner_user_id = ?')
     .bind(b.runnerId, c.var.user!.id).first<{ repos: string }>();
   if (!runner) return c.json({ error: 'runner not found' }, 404);
-  const repo = (JSON.parse(runner.repos) as Array<{ id: string; projectId: string | null; workflows?: Array<string | { name: string }> }>).find((r) => r.id === b.repoRef);
+  const repo = (JSON.parse(runner.repos) as Array<{
+    id: string; projectId: string | null; workflows?: Array<string | { name: string; base?: string; capabilities?: string[] }>;
+    executionProfiles?: z.infer<typeof RunnerRepo>['executionProfiles'];
+  }>).find((r) => r.id === b.repoRef);
   if (!repo) return c.json({ error: 'unknown repoRef for this runner' }, 400);
   if (repo.projectId !== pid) return c.json({ error: 'repo does not resolve to this project' }, 400);
   if (b.workflow && !advertisedWorkflowNames(repo).has(b.workflow)) {
@@ -4357,12 +4377,19 @@ app.post('/api/projects/:pid/plans/:planId/dispatch', userAuth, async (c) => {
   if (b.strategy === 'single_root' && (!b.workflow || !workflowSupports(repo, b.workflow, 'build', 'mission.v2'))) {
     return c.json({ error: 'single_root requires an advertised build-posture workflow with mission.v2' }, 400);
   }
+  if (b.executionProfileId) {
+    try { commissionExecutionProfile({ id: repo.id, executionProfiles: repo.executionProfiles ?? [] }, b.executionProfileId, { requireCapacity: false }); }
+    catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : 'execution profile is unavailable' }, 409);
+    }
+  }
   try {
     const dispatch = await room(c.env, pid).createPlanDispatch(pid, humanActor(c), {
       planId, runnerId: b.runnerId, repoRef: b.repoRef, agentTool: b.agentTool,
       model: b.model ?? null, effort: b.effort ?? null, budget: b.budget, gate: b.gate,
       workflow: b.workflow ?? null,
       strategy: b.strategy,
+      executionProfileId: b.executionProfileId ?? null,
     });
     return c.json({ dispatch });
   } catch (e) {

@@ -335,6 +335,7 @@ function RunRow({ run, runner, onCancel }: { run: ApiRun; runner: ApiRunner | nu
           {/* A custom workflow (RUN-121) ran under `kind`'s posture but its own prompt — worth
               showing, since two runs of the same kind can be very different work. */}
           {run.workflow && <MonoTag color="var(--purple)" bg="rgba(167,139,250,.12)" size={9}>{run.workflow}</MonoTag>}
+          {run.executionProfile && <MonoTag color="var(--cyan)" bg="rgba(34,211,238,.10)" size={9}>profile {run.executionProfile.id}</MonoTag>}
           <MonoTag color="var(--blue)" bg="rgba(76,157,255,.1)" size={9}>{run.agentTool}</MonoTag>
           <span style={{ color: 'var(--text-soft)' }}>{repo?.name ?? run.repoRef}</span>
           {run.anchor && (
@@ -573,6 +574,7 @@ function DispatchForm({
   const [effort, setEffort] = useState<RunEffort | ''>('');
   // '' = the built-in for `kind`; a custom workflow name (RUN-121) overrides only the prompt.
   const [workflow, setWorkflow] = useState('');
+  const [executionProfileId, setExecutionProfileId] = useState('');
   const [maxUsd, setMaxUsd] = useState('');
   const [maxTokens, setMaxTokens] = useState('');
   const [maxMinutes, setMaxMinutes] = useState('');
@@ -592,9 +594,10 @@ function DispatchForm({
   // The selected repo's custom workflows (RUN-121/PLNR-240); the three built-ins are always
   // implicit. Normalized: a bare name (pre-PLNR-240 daemon) has no known base or description.
   const repoWorkflows = (repos.find((r) => r.id === repoRef)?.workflows ?? []).map(advertisedWorkflow);
+  const executionProfiles = repos.find((r) => r.id === repoRef)?.executionProfiles ?? [];
 
   // A custom workflow belongs to one repo — drop the choice when the repo changes.
-  useEffect(() => { setWorkflow(''); }, [repoRef]);
+  useEffect(() => { setWorkflow(''); setExecutionProfileId(''); }, [repoRef]);
   // Selecting a workflow whose base is advertised (PLNR-240) sets `kind` to that posture —
   // the operator no longer has to know it. A bare-name advertisement changes nothing.
   const pickWorkflow = (name: string) => {
@@ -640,6 +643,9 @@ function DispatchForm({
       // A custom workflow (RUN-121/PLNR-240). Guarded to the repo's advertised set — the server
       // refuses an unadvertised name outright rather than silently running the built-in.
       workflow: repoWorkflows.some((w) => w.name === workflow) ? workflow : null,
+      executionProfileId: executionProfiles.some((profile) => profile.id === executionProfileId)
+        ? executionProfileId
+        : null,
       budget: { maxUsd: num(maxUsd), maxTokens: num(maxTokens), maxDurationSeconds: maxMinutes.trim() ? (num(maxMinutes) ?? 0) * 60 : null },
     };
     setBusy(true);
@@ -723,6 +729,19 @@ function DispatchForm({
             {repoWorkflows.map((w) => (
               <option key={w.name} value={w.name} title={w.description ?? undefined}>
                 {w.name}{w.base ? ` (${w.base})` : ''}{w.description ? ` — ${w.description.slice(0, 60)}` : ''}
+              </option>
+            ))}
+          </Select>
+        </Field>
+      )}
+
+      {executionProfiles.length > 0 && (
+        <Field label="execution profile (optional)" hint="opaque machine-local resource environment">
+          <Select value={executionProfileId} onChange={(e) => setExecutionProfileId(e.target.value)}>
+            <option value="">— runner default —</option>
+            {executionProfiles.map((profile) => (
+              <option key={profile.id} value={profile.id}>
+                {profile.id} · {profile.resolution}/{profile.health} · {profile.capacity.freeSlots}/{profile.capacity.maxConcurrency} slots
               </option>
             ))}
           </Select>

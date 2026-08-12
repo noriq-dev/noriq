@@ -14,10 +14,13 @@ import {
 import { searchBackend, indexEntity, removeEntity, type SearchKind } from '../search';
 import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
-import { RunKind, AgentTool, RunStatus, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
+import { RunKind, AgentTool, RunStatus, ExecutionProfileOffer, type CommissionedExecutionProfile, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
 import { writeExecutionSpec } from '../lib/execution-spec';
 import { processPendingCopilotEpisodeJob, processPendingEpisodeJob } from '../memory/episodes';
 import { applyMissionTaskExecutionEvent, ensureMissionTaskExecution, ensureRunExecution, mirrorRunTransition } from '../lib/orchestration-store';
+import {
+  commissionExecutionProfile, executionProfileSlots, requireCommissionedExecutionProfile,
+} from '../lib/execution-profiles';
 import {
   captureRunCommissioningSnapshot, recordRunSittingExecutedConfiguration, recordRunSittingExecutedSpec,
 } from '../lib/run-sitting-intelligence';
@@ -255,6 +258,10 @@ export interface CreateRunInput {
   createdBy?: string;
   /** The plan dispatch that fanned this run out (PLNR-170). Null = a one-off dispatch. */
   planDispatchId?: string | null;
+  /** Optional repo-scoped machine environment. Omission preserves legacy Runner defaults. */
+  executionProfileId?: string | null;
+  /** Internal expected identity for plan pumps; always revalidated against the current offer. */
+  executionProfile?: CommissionedExecutionProfile | null;
 }
 
 export interface RunPatch {
@@ -281,6 +288,8 @@ type RunRow = {
   model_usage: string | null;
   executed_spec: string | null;
   plan_dispatch_id: string | null;
+  execution_profile_id: string | null;
+  execution_profile: string | null;
   created_by: string; created_at: string; updated_at: string;
   dispatched_at: string | null; started_at: string | null;
   sitting: number;
@@ -340,6 +349,8 @@ export interface RunView {
   /** The plan dispatch that fanned this run out (PLNR-170). Null = a one-off. The daemon's
    *  Run schema doesn't know the field and strips it — orchestration is server/UI business. */
   planDispatchId: string | null;
+  /** Exact secret-free profile identity commissioned for this sitting. */
+  executionProfile: CommissionedExecutionProfile | null;
   createdBy: string;
   createdAt: string;
   updatedAt: string;
@@ -379,6 +390,7 @@ export interface CreatePlanDispatchInput {
   /** Omitted/per_task preserves the legacy fan-out pump. single_root commissions one
    * plan-anchored build Run under a mission.v2 workflow. */
   strategy?: 'per_task' | 'single_root';
+  executionProfileId?: string | null;
   createdBy?: string;
 }
 
@@ -387,6 +399,8 @@ type PlanDispatchRow = {
   agent_tool: string; model: string | null; effort: string | null; budget: string;
   gate: string; status: string; stall_reason: string | null; workflow: string | null;
   strategy: 'per_task' | 'single_root';
+  execution_profile_id: string | null;
+  execution_profile: string | null;
   created_by: string; created_at: string; updated_at: string; finished_at: string | null;
 };
 
@@ -413,6 +427,8 @@ export interface PlanDispatchView {
   /** The dispatch-level workflow default (PLNR-240); null = the built-in build. */
   workflow: string | null;
   strategy: 'per_task' | 'single_root';
+  executionProfileId: string | null;
+  executionProfile: CommissionedExecutionProfile | null;
   tasks: PlanDispatchTaskView[];
   createdBy: string;
   createdAt: string;
@@ -3791,6 +3807,7 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM run_log_segments WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare('DELETE FROM runtime_deliveries WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare('DELETE FROM steers WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
+        this.env.DB.prepare('DELETE FROM execution_profile_leases WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare('DELETE FROM memory_episode_jobs WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM memory_analytics_jobs WHERE project_id = ?').bind(pid),
         // Canonical execution history owns FKs to Runs/plans/tasks. Remove the orchestration
@@ -3932,6 +3949,7 @@ export class ProjectRoom extends DurableObject<Env> {
       logTail: r.log_tail,
       modelUsage: r.model_usage ? JSON.parse(r.model_usage) : null,
       planDispatchId: r.plan_dispatch_id,
+      executionProfile: r.execution_profile ? JSON.parse(r.execution_profile) as CommissionedExecutionProfile : null,
       createdBy: r.created_by,
       createdAt: r.created_at,
       updatedAt: r.updated_at,
@@ -3945,6 +3963,88 @@ export class ProjectRoom extends DurableObject<Env> {
       .bind(runId, this.projectId).first<RunRow>();
     if (!row) throw new Error('run not found');
     return row;
+  }
+
+  /** Resolve only the closed, secret-free profile advertisement stored on the selected repo.
+   * The expected identity is the plan's immutable commission; mutable offer fields may refresh,
+   * but fingerprints/generation cannot drift underneath already-selected work. */
+  private async resolveExecutionProfile(
+    runnerId: string,
+    repoRef: string,
+    profileId: string,
+    expected: CommissionedExecutionProfile | null = null,
+    requireCapacity = true,
+  ): Promise<{ commissioned: CommissionedExecutionProfile; slots: number; capacityLimit: number }> {
+    const runner = await this.env.DB.prepare('SELECT repos FROM runners WHERE id = ?')
+      .bind(runnerId).first<{ repos: string }>();
+    let repo: { id: string; executionProfiles: import('@noriq-dev/shared').ExecutionProfileOffer[] } | undefined;
+    try {
+      const raw = (JSON.parse(runner?.repos || '[]') as Array<{ id?: unknown; executionProfiles?: unknown }> )
+        .find((value) => value.id === repoRef);
+      if (raw) {
+        repo = {
+          id: repoRef,
+          executionProfiles: Array.isArray(raw.executionProfiles)
+            ? raw.executionProfiles.map((value) => ExecutionProfileOffer.safeParse(value))
+                .filter((result): result is { success: true; data: import('@noriq-dev/shared').ExecutionProfileOffer } => result.success)
+                .map((result) => result.data)
+            : [],
+        };
+      }
+    } catch { /* unavailable below */ }
+    if (!repo) throw new Error(`repo "${repoRef}" is no longer advertised by this runner`);
+    const resolved = expected
+      ? { offer: requireCommissionedExecutionProfile(repo, expected), commissioned: expected }
+      : commissionExecutionProfile(repo, profileId, { requireCapacity: false });
+    const busy = await this.env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM execution_profile_leases
+        WHERE runner_id = ? AND profile_id = ?`,
+    ).bind(runnerId, profileId).first<{ n: number }>();
+    const slots = executionProfileSlots(resolved.offer, busy?.n ?? 0);
+    const capacityLimit = Math.min(
+      resolved.offer.capacity.maxConcurrency,
+      (busy?.n ?? 0) + resolved.offer.capacity.freeSlots,
+    );
+    if (requireCapacity) {
+      if (slots < 1) {
+        throw new Error(`execution profile "${profileId}" has no free capacity`);
+      }
+    }
+    return { commissioned: resolved.commissioned, slots, capacityLimit };
+  }
+
+  private async acquireExecutionProfileLease(
+    runId: string,
+    runnerId: string,
+    profileId: string,
+    availableSlots: number,
+  ): Promise<void> {
+    // Reap abandoned reservations before allocation. Missing Runs get a grace period because
+    // reservation deliberately precedes Run insertion; without it, a concurrent ProjectRoom
+    // could erase a valid in-flight reservation and double-book the same singleton slot.
+    const orphanCutoff = new Date(Date.now() - 60_000).toISOString();
+    await this.env.DB.prepare(
+      `DELETE FROM execution_profile_leases
+        WHERE (NOT EXISTS (
+                 SELECT 1 FROM runs r WHERE r.id = execution_profile_leases.run_id)
+               AND acquired_at < ?)
+           OR EXISTS (
+                SELECT 1 FROM runs r WHERE r.id = execution_profile_leases.run_id
+                  AND r.status NOT IN ('dispatched','running','blocked'))`,
+    ).bind(orphanCutoff).run();
+    if (availableSlots < 1) throw new Error(`execution profile "${profileId}" has no free capacity`);
+    const result = await this.env.DB.prepare(
+      `INSERT INTO execution_profile_leases (run_id, runner_id, profile_id, slot, acquired_at)
+       WITH RECURSIVE slots(slot) AS (
+         SELECT 1 UNION ALL SELECT slot + 1 FROM slots WHERE slot < ?
+       )
+       SELECT ?, ?, ?, slot, ? FROM slots
+        WHERE NOT EXISTS (
+          SELECT 1 FROM execution_profile_leases l
+           WHERE l.runner_id = ? AND l.profile_id = ? AND l.slot = slots.slot)
+        ORDER BY slot LIMIT 1`,
+    ).bind(availableSlots, runId, runnerId, profileId, nowIso(), runnerId, profileId).run();
+    if (!result.meta.changes) throw new Error(`execution profile "${profileId}" has no free capacity`);
   }
 
   /** Create a Run. Starts `queued`; if runnerId is given, create + dispatch atomically. */
@@ -3981,6 +4081,16 @@ export class ProjectRoom extends DurableObject<Env> {
     }
     const runnerId = input.runnerId ?? null;
     const status = runnerId ? 'dispatched' : 'queued';
+    const executionProfileId = input.executionProfileId ?? input.executionProfile?.id ?? null;
+    if (input.executionProfile && executionProfileId !== input.executionProfile.id) {
+      throw new Error('execution profile id does not match the commissioned identity');
+    }
+    const resolvedProfile = executionProfileId && runnerId
+      ? await this.resolveExecutionProfile(
+          runnerId, input.repoRef, executionProfileId, input.executionProfile ?? null, true,
+        )
+      : null;
+    const executionProfile = resolvedProfile?.commissioned ?? null;
     // Only a verify run judges another run; carrying it elsewhere would be meaningless.
     const verifiesRunId = input.kind === 'verify' ? (input.verifiesRunId ?? null) : null;
     // Which plan does this run serve? (RUN-28) Resolved HERE because the daemon cannot: a
@@ -3989,12 +4099,17 @@ export class ProjectRoom extends DurableObject<Env> {
     // Stored rather than re-derived at landing time: a task can be re-parented and a plan
     // deleted, but the branch a run landed on is a historical fact, not a live lookup.
     const plan = await this.resolveRunPlan(anchorType, anchorId);
-    await this.env.DB.prepare(
+    if (executionProfileId && runnerId && resolvedProfile) {
+      await this.acquireExecutionProfileLease(id, runnerId, executionProfileId, resolvedProfile.capacityLimit);
+    }
+    try {
+      await this.env.DB.prepare(
       `INSERT INTO runs (id, project_id, runner_id, kind, anchor_type, anchor_id, verifies_run_id,
                          plan_id, plan_key, target_branch, brief, repo_ref, agent_tool, agent, workflow,
                          model, effort,
-                         budget, status, plan_dispatch_id, created_by, created_at, updated_at, dispatched_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                         budget, status, plan_dispatch_id, execution_profile_id, execution_profile,
+                         created_by, created_at, updated_at, dispatched_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       id, this.projectId, runnerId, input.kind, anchorType, anchorId, verifiesRunId,
       plan?.id ?? null, plan ? this.planKey(plan) : null, input.targetBranch ?? null,
@@ -4002,9 +4117,16 @@ export class ProjectRoom extends DurableObject<Env> {
       input.agentTool, input.agent ?? null, input.workflow ?? null,
       input.model ?? null, input.effort ?? null,
       JSON.stringify(input.budget ?? {}), status, input.planDispatchId ?? null,
+      executionProfileId, executionProfile ? JSON.stringify(executionProfile) : null,
       input.createdBy ?? actor.id, now, now,
       runnerId ? now : null,
-    ).run();
+      ).run();
+    } catch (error) {
+      if (executionProfileId) {
+        await this.env.DB.prepare('DELETE FROM execution_profile_leases WHERE run_id = ?').bind(id).run();
+      }
+      throw error;
+    }
     if (runnerId) await captureRunCommissioningSnapshot(this.env.DB, this.projectId, id, now);
     const anchorLabel = anchorType === 'task' && anchorId
       ? (await this.env.DB.prepare('SELECT title FROM tasks WHERE id = ? AND project_id = ?').bind(anchorId, this.projectId).first<{ title: string }>())?.title ?? anchorId
@@ -4033,10 +4155,31 @@ export class ProjectRoom extends DurableObject<Env> {
       if (!RUN_TRANSITIONS[run.status]?.includes('dispatched')) {
         throw new Error(`cannot dispatch run in status ${run.status}`);
       }
+      const expectedProfile = run.execution_profile
+        ? JSON.parse(run.execution_profile) as CommissionedExecutionProfile
+        : null;
+      const resolvedProfile = run.execution_profile_id
+        ? await this.resolveExecutionProfile(
+            runnerId, run.repo_ref, run.execution_profile_id, expectedProfile, true,
+          )
+        : null;
+      const executionProfile = resolvedProfile?.commissioned ?? null;
       const now = nowIso();
-      await this.env.DB.prepare(
-        "UPDATE runs SET runner_id = ?, status = 'dispatched', dispatched_at = ?, updated_at = ? WHERE id = ?",
-      ).bind(runnerId, now, now, runId).run();
+      if (run.execution_profile_id && resolvedProfile) {
+        await this.acquireExecutionProfileLease(
+          runId, runnerId, run.execution_profile_id, resolvedProfile.capacityLimit,
+        );
+      }
+      try {
+        await this.env.DB.prepare(
+          "UPDATE runs SET runner_id = ?, execution_profile = ?, status = 'dispatched', dispatched_at = ?, updated_at = ? WHERE id = ?",
+        ).bind(runnerId, executionProfile ? JSON.stringify(executionProfile) : null, now, now, runId).run();
+      } catch (error) {
+        if (run.execution_profile_id) {
+          await this.env.DB.prepare('DELETE FROM execution_profile_leases WHERE run_id = ?').bind(runId).run();
+        }
+        throw error;
+      }
       await captureRunCommissioningSnapshot(this.env.DB, this.projectId, runId, now);
       await this.emit(actor, 'run.dispatched', 'run', runId, { runnerId, from: run.status, to: 'dispatched' });
       const view = this.runToWire(await this.loadRun(runId));
@@ -4089,6 +4232,17 @@ export class ProjectRoom extends DurableObject<Env> {
         advertises = (JSON.parse(runner.repos || '[]') as Array<{ id: string }>).some((r) => r.id === run.repo_ref);
       } catch { /* malformed repos JSON → treat as not advertised */ }
       if (!advertises) throw new Error("the run's runner no longer advertises this repo — its worktree is unreachable");
+      let resolvedProfile: Awaited<ReturnType<ProjectRoom['resolveExecutionProfile']>> | null = null;
+      if (run.execution_profile_id) {
+        if (!run.execution_profile) throw new Error('the run has no commissioned execution profile identity');
+        resolvedProfile = await this.resolveExecutionProfile(
+          run.runner_id,
+          run.repo_ref,
+          run.execution_profile_id,
+          JSON.parse(run.execution_profile) as CommissionedExecutionProfile,
+          true,
+        );
+      }
 
       // A retry for the failed sitting must finish before this method clears `exit` and advances
       // `sitting`; otherwise the server no longer has the terminal state needed to reconstruct
@@ -4104,6 +4258,11 @@ export class ProjectRoom extends DurableObject<Env> {
       // run as a plain run.assigned built from the row (RunnerHub.ts hello handler), so the datum
       // has to live ON the run, not in the one-shot frame we push below.
       const budget = { ...(JSON.parse(run.budget || '{}') as Record<string, unknown>), maxRounds: rounds };
+      if (run.execution_profile_id && resolvedProfile) {
+        await this.acquireExecutionProfileLease(
+          runId, run.runner_id, run.execution_profile_id, resolvedProfile.capacityLimit,
+        );
+      }
       // `agent_id` is CLEARED, and that is what makes continuing possible at all (RUN-182). The
       // agent that ran the failed sitting was retired when it failed — token revoked, marked
       // offline — but the run still pointed at it, and the mint endpoint refuses a run that
@@ -4121,10 +4280,17 @@ export class ProjectRoom extends DurableObject<Env> {
       // is a new sitting under one run id, and the episode writer keys an episode on
       // (run_id, sitting) precisely so the failed sitting's episode is never overwritten by the
       // one this reopened attempt eventually produces.
-      await this.env.DB.prepare(
-        `UPDATE runs SET status = 'dispatched', exit = NULL, phase = NULL, agent_id = NULL,
-                sitting = sitting + 1, budget = ?, dispatched_at = ?, updated_at = ? WHERE id = ?`,
-      ).bind(JSON.stringify(budget), now, now, runId).run();
+      try {
+        await this.env.DB.prepare(
+          `UPDATE runs SET status = 'dispatched', exit = NULL, phase = NULL, agent_id = NULL,
+                  sitting = sitting + 1, budget = ?, dispatched_at = ?, updated_at = ? WHERE id = ?`,
+        ).bind(JSON.stringify(budget), now, now, runId).run();
+      } catch (error) {
+        if (run.execution_profile_id) {
+          await this.env.DB.prepare('DELETE FROM execution_profile_leases WHERE run_id = ?').bind(runId).run();
+        }
+        throw error;
+      }
       await captureRunCommissioningSnapshot(this.env.DB, this.projectId, runId, now);
       await this.emit(actor, 'run.status_changed', 'run', runId, { from: priorStatus, to: 'dispatched', reason: 'continue', maxRounds: rounds });
 
@@ -4192,6 +4358,11 @@ export class ProjectRoom extends DurableObject<Env> {
           throw new Error(`workflow "${input.workflow}" is not a build-posture mission.v2 offer`);
         }
       }
+      const executionProfile = input.executionProfileId
+        ? (await this.resolveExecutionProfile(
+            input.runnerId, input.repoRef, input.executionProfileId, null, false,
+          )).commissioned
+        : null;
       // One live dispatch per plan: two pumps would race each other to the same ready tasks,
       // and "which runner is working my plan" should have one answer.
       const existing = await this.env.DB.prepare(
@@ -4210,12 +4381,16 @@ export class ProjectRoom extends DurableObject<Env> {
       const now = nowIso();
       await this.env.DB.prepare(
         `INSERT INTO plan_dispatches (id, project_id, plan_id, runner_id, repo_ref, agent_tool,
-                                      model, effort, budget, gate, workflow, strategy, status, created_by, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+                                      model, effort, budget, gate, workflow, strategy,
+                                      execution_profile_id, execution_profile,
+                                      status, created_by, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
       ).bind(
         id, projectId, input.planId, input.runnerId, input.repoRef, input.agentTool,
         input.model ?? null, input.effort ?? null, JSON.stringify(input.budget ?? {}),
-        input.gate ?? 'approved', input.workflow ?? null, strategy, input.createdBy ?? actor.id, now, now,
+        input.gate ?? 'approved', input.workflow ?? null, strategy,
+        input.executionProfileId ?? null, executionProfile ? JSON.stringify(executionProfile) : null,
+        input.createdBy ?? actor.id, now, now,
       ).run();
       await this.emit(actor, 'plan_dispatch.created', 'plan_dispatch', id, {
         planId: plan.id, planTitle: plan.title, runnerId: input.runnerId, gate: input.gate ?? 'approved',
@@ -4766,6 +4941,31 @@ export class ProjectRoom extends DurableObject<Env> {
       slots = Math.max(0, maxC - (busy?.n ?? 0));
     }
 
+    let commissionedProfile: CommissionedExecutionProfile | null = null;
+    if (d.execution_profile_id) {
+      try {
+        if (!d.execution_profile) throw new Error('commissioned profile identity is missing');
+        const profile = await this.resolveExecutionProfile(
+          d.runner_id,
+          d.repo_ref,
+          d.execution_profile_id,
+          JSON.parse(d.execution_profile) as CommissionedExecutionProfile,
+          false,
+        );
+        commissionedProfile = profile.commissioned;
+        slots = Math.min(slots, profile.slots);
+      } catch (error) {
+        const reason = `execution profile unavailable: ${error instanceof Error ? error.message : String(error)}; refresh or explicitly choose another profile`;
+        await this.env.DB.prepare(
+          "UPDATE plan_dispatches SET status = 'stalled', stall_reason = ?, updated_at = ? WHERE id = ?",
+        ).bind(reason, nowIso(), d.id).run();
+        if (d.status !== 'stalled' || d.stall_reason !== reason) {
+          await this.emit(actor, 'plan_dispatch.stalled', 'plan_dispatch', d.id, { planId: d.plan_id, reason });
+        }
+        return { created: 0 };
+      }
+    }
+
     let created = 0;
     for (const t of dispatchable.slice(0, slots)) {
       const run = await this.insertRun(actor, {
@@ -4780,6 +4980,8 @@ export class ProjectRoom extends DurableObject<Env> {
         runnerId: d.runner_id,
         createdBy: d.created_by,
         planDispatchId: d.id,
+        executionProfileId: d.execution_profile_id,
+        executionProfile: commissionedProfile,
       });
       created += 1;
       // Fast path only: a frame the socket misses is redelivered on the daemon's next
@@ -4881,6 +5083,30 @@ export class ProjectRoom extends DurableObject<Env> {
       ).bind(d.runner_id).first<{ n: number }>();
       slots = Math.max(0, max - (busy?.n ?? 0));
     }
+    let commissionedProfile: CommissionedExecutionProfile | null = null;
+    if (d.execution_profile_id) {
+      try {
+        if (!d.execution_profile) throw new Error('commissioned profile identity is missing');
+        const profile = await this.resolveExecutionProfile(
+          d.runner_id,
+          d.repo_ref,
+          d.execution_profile_id,
+          JSON.parse(d.execution_profile) as CommissionedExecutionProfile,
+          false,
+        );
+        commissionedProfile = profile.commissioned;
+        slots = Math.min(slots, profile.slots);
+      } catch (error) {
+        const reason = `execution profile unavailable: ${error instanceof Error ? error.message : String(error)}; refresh or explicitly choose another profile`;
+        await this.env.DB.prepare(
+          "UPDATE plan_dispatches SET status = 'stalled', stall_reason = ?, updated_at = ? WHERE id = ?",
+        ).bind(reason, nowIso(), d.id).run();
+        if (d.status !== 'stalled' || d.stall_reason !== reason) {
+          await this.emit(actor, 'plan_dispatch.stalled', 'plan_dispatch', d.id, { planId: d.plan_id, reason });
+        }
+        return { created: 0 };
+      }
+    }
     if (slots < 1) return { created: 0 };
 
     const run = await this.insertRun(actor, {
@@ -4888,6 +5114,7 @@ export class ProjectRoom extends DurableObject<Env> {
       agentTool: d.agent_tool, model: d.model, effort: d.effort, workflow: d.workflow,
       budget: JSON.parse(d.budget || '{}'), runnerId: d.runner_id,
       createdBy: d.created_by, planDispatchId: d.id,
+      executionProfileId: d.execution_profile_id, executionProfile: commissionedProfile,
       brief: 'Execute this approved plan through the advertised Runner mission harness.',
     });
     try {
@@ -4948,6 +5175,7 @@ export class ProjectRoom extends DurableObject<Env> {
         `INSERT INTO memory_episode_jobs (project_id, run_id, sitting, requested_at)
          VALUES (?, ?, ?, ?) ON CONFLICT (run_id, sitting) DO NOTHING`,
       ).bind(this.projectId, run.id, run.sitting, now),
+      this.env.DB.prepare('DELETE FROM execution_profile_leases WHERE run_id = ?').bind(run.id),
     ]);
     this.ctx.waitUntil(
       processPendingEpisodeJob(this.env, this.projectId, run.id, run.sitting).catch((err) =>
@@ -4994,6 +5222,8 @@ export class ProjectRoom extends DurableObject<Env> {
       stallReason: row.stall_reason,
       workflow: row.workflow,
       strategy: row.strategy,
+      executionProfileId: row.execution_profile_id,
+      executionProfile: row.execution_profile ? JSON.parse(row.execution_profile) as CommissionedExecutionProfile : null,
       tasks: tasks.map((t) => ({
         taskId: t.taskId,
         runId: t.runId,
@@ -5166,6 +5396,9 @@ export class ProjectRoom extends DurableObject<Env> {
           `INSERT INTO memory_episode_jobs (project_id, run_id, sitting, requested_at)
            VALUES (?, ?, ?, ?) ON CONFLICT (run_id, sitting) DO NOTHING`,
         ).bind(projectId, runId, run.sitting, now));
+        transitionStatements.push(
+          this.env.DB.prepare('DELETE FROM execution_profile_leases WHERE run_id = ?').bind(runId),
+        );
       }
       // D1 batch is atomic: a terminal state can never commit without its retryable episode job.
       await this.env.DB.batch(transitionStatements);
@@ -5504,6 +5737,7 @@ export class ProjectRoom extends DurableObject<Env> {
         `INSERT INTO memory_episode_jobs (project_id, run_id, sitting, requested_at)
          VALUES (?, ?, ?, ?) ON CONFLICT (run_id, sitting) DO NOTHING`,
       ).bind(this.projectId, run.id, run.sitting, now),
+      this.env.DB.prepare('DELETE FROM execution_profile_leases WHERE run_id = ?').bind(run.id),
     ]);
     await this.interruptMissionTaskAttempts(run.id, run.agentId, now, 'failed');
     this.ctx.waitUntil(

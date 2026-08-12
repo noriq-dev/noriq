@@ -3,7 +3,7 @@
 // DO methods directly via the stub (the HTTP/WS dispatch surface lands in RUN-7).
 import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
-import { RunExit, RunStatus, isTerminalRunStatus } from '@noriq-dev/shared';
+import { RunExit, RunnerRepo, RunStatus, isTerminalRunStatus } from '@noriq-dev/shared';
 import type { Actor, CreateRunInput, RunPatch, RunView } from '../src/do/ProjectRoom';
 import type { Env } from '../src/env';
 import { createAgent, createUser, loginSession, mcpCall, mintTokenForUser, authorizeForAllProjects } from './helpers';
@@ -221,6 +221,92 @@ describe('run lifecycle in ProjectRoom (RUN-6)', () => {
     expect(run.dispatchedAt).not.toBeNull();
   });
 
+  it('commissions a fresh secret-free execution profile and refuses missing, stale, drifted, or occupied offers (PLNR-487)', async () => {
+    const profile = (over: Record<string, unknown> = {}) => ({
+      id: 'project-nod', declarationFingerprint: 'decl-v1', effectiveFingerprint: 'effective-v1',
+      resolution: 'resolved', health: 'healthy', attestationCapable: true,
+      observedAt: new Date().toISOString(), generation: 1,
+      capacity: { maxConcurrency: 1, freeSlots: 1 }, ...over,
+    });
+    const runnerId = 'rnr_profile';
+    expect(RunnerRepo.safeParse({
+      id: 'leaky', projectKey: 'RUNL', executionProfiles: [{
+        ...profile(), command: 'mcp serve', url: 'https://secret.invalid', credential: 'token',
+      }],
+    }).success).toBe(false);
+    const writeOffer = async (offer: Record<string, unknown>) => env.DB.prepare(
+      `INSERT INTO runners (id, label, repos) VALUES (?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET repos = excluded.repos`,
+    ).bind(runnerId, runnerId, JSON.stringify([{
+      id: 'repo_profile', projectKey: 'RUNL', projectId: pid, executionProfiles: [offer],
+    }])).run();
+    await writeOffer(profile());
+
+    const commissioned = await room(pid).createRun(pid, actor, {
+      kind: 'build', repoRef: 'repo_profile', agentTool: 'claude', runnerId,
+      executionProfileId: 'project-nod',
+    });
+    expect(commissioned.executionProfile).toEqual({
+      id: 'project-nod', declarationFingerprint: 'decl-v1', effectiveFingerprint: 'effective-v1',
+      generation: 1, attestationCapable: true,
+    });
+    const sitting = await env.DB.prepare(
+      'SELECT commissioning FROM run_sitting_intelligence WHERE run_id = ? AND sitting = 1',
+    ).bind(commissioned.id).first<{ commissioning: string }>();
+    const snapshot = JSON.parse(sitting!.commissioning) as Record<string, any>;
+    expect(snapshot.executionProfile).toEqual(commissioned.executionProfile);
+    expect(snapshot.configuration).toContainEqual({
+      kind: 'execution_profile', name: 'project-nod', version: '1', fingerprint: 'effective-v1',
+    });
+    // The daemon has not refreshed its advertised freeSlots yet. The durable lease must still
+    // prevent another ProjectRoom allocation from double-booking the singleton profile.
+    await expect(room(pid).createRun(pid, actor, {
+      kind: 'build', repoRef: 'repo_profile', agentTool: 'claude', runnerId,
+      executionProfileId: 'project-nod',
+    })).rejects.toThrow(/no free capacity/);
+    await room(pid).recordRunTelemetry(pid, commissioned.id, {
+      executedConfiguration: {
+        strategy: null, configuration: [],
+        executionProfile: {
+          id: 'project-nod', generation: 1, effectiveFingerprint: 'effective-v1',
+          inventoryFingerprint: 'observed-inventory-v1',
+        },
+      },
+    });
+    const executed = await env.DB.prepare(
+      'SELECT executed_config AS evidence FROM run_sitting_intelligence WHERE run_id = ? AND sitting = 1',
+    ).bind(commissioned.id).first<{ evidence: string }>();
+    expect(JSON.parse(executed!.evidence).executionProfile).toEqual({
+      id: 'project-nod', generation: 1, effectiveFingerprint: 'effective-v1',
+      inventoryFingerprint: 'observed-inventory-v1',
+    });
+    expect(JSON.stringify(commissioned)).not.toMatch(/command|credential|https?:|\/home\//i);
+    await env.DB.prepare("UPDATE runners SET status = 'online' WHERE id = ?").bind(runnerId).run();
+    await room(pid).transitionRun(pid, actor, commissioned.id, { status: 'running' });
+    await room(pid).transitionRun(pid, actor, commissioned.id, { status: 'failed' });
+
+    await expect(room(pid).createRun(pid, actor, {
+      kind: 'build', repoRef: 'repo_profile', agentTool: 'claude', runnerId,
+      executionProfileId: 'missing',
+    })).rejects.toThrow(/not advertised/);
+
+    await writeOffer(profile({ observedAt: '2000-01-01T00:00:00.000Z' }));
+    await expect(room(pid).createRun(pid, actor, {
+      kind: 'build', repoRef: 'repo_profile', agentTool: 'claude', runnerId,
+      executionProfileId: 'project-nod',
+    })).rejects.toThrow(/stale/);
+
+    await writeOffer(profile({ generation: 2, effectiveFingerprint: 'effective-v2' }));
+    await env.DB.prepare("UPDATE runners SET status = 'online' WHERE id = ?").bind(runnerId).run();
+    await expect(room(pid).reopenRun(pid, actor, commissioned.id, null)).rejects.toThrow(/drifted/);
+
+    await writeOffer(profile({ capacity: { maxConcurrency: 1, freeSlots: 0 } }));
+    await expect(room(pid).createRun(pid, actor, {
+      kind: 'build', repoRef: 'repo_profile', agentTool: 'claude', runnerId,
+      executionProfileId: 'project-nod',
+    })).rejects.toThrow(/no free capacity/);
+  });
+
   it('reconcileRunnerRuns fails orphaned non-terminal runs for that runner', async () => {
     const a = await room(pid).createRun(pid, actor, { kind: 'build', repoRef: 'r', agentTool: 'claude', runnerId: 'rnr_recon' });
     await room(pid).transitionRun(pid, actor, a.id, { status: 'running' });
@@ -431,7 +517,15 @@ describe('dispatch validates verifiesRunId (HTTP)', () => {
        VALUES ('rnr_owned', 'owned', ?, ?, 'online')`,
     // `docs` is advertised because PLNR-240 made the menu load-bearing: a dispatch naming a
     // workflow the repo does not advertise is now refused at the door, not silently run.
-    ).bind(u!.id, JSON.stringify([{ id: 'repo_a', projectId: pid, workflows: ['docs'] }])).run();
+    ).bind(u!.id, JSON.stringify([{
+      id: 'repo_a', projectId: pid, workflows: ['docs'],
+      executionProfiles: [{
+        id: 'api-profile', declarationFingerprint: 'api-decl', effectiveFingerprint: 'api-effective',
+        resolution: 'resolved', health: 'healthy', attestationCapable: true,
+        observedAt: new Date().toISOString(), generation: 1,
+        capacity: { maxConcurrency: 2, freeSlots: 2 },
+      }],
+    }])).run();
   });
 
   const dispatch = (body: Record<string, unknown>) =>
@@ -510,6 +604,17 @@ describe('dispatch validates verifiesRunId (HTTP)', () => {
     const row = await env.DB.prepare('SELECT agent, workflow FROM runs WHERE id = ?')
       .bind(run.id).first<{ agent: string | null; workflow: string | null }>();
     expect(row).toMatchObject({ agent: 'claude.claude-opus-4_8.high', workflow: 'docs' });
+  });
+
+  it('selects a fresh execution profile through the HTTP dispatch surface (PLNR-487)', async () => {
+    const res = await dispatch({
+      runnerId: 'rnr_owned', kind: 'build', agentTool: 'claude', repoRef: 'repo_a',
+      executionProfileId: 'api-profile', brief: 'use the commissioned resource environment',
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json() as { run: RunView }).run.executionProfile).toMatchObject({
+      id: 'api-profile', declarationFingerprint: 'api-decl', effectiveFingerprint: 'api-effective', generation: 1,
+    });
   });
 
   it('rejects an effort that is not one of ours (RUN-33)', async () => {

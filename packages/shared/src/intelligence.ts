@@ -93,6 +93,7 @@ export const ConfigurationFingerprintKind = z.enum([
   'verifier',
   'manifest',
   'context',
+  'execution_profile',
 ]);
 
 export const ConfigurationFingerprint = z.object({
@@ -103,11 +104,20 @@ export const ConfigurationFingerprint = z.object({
 });
 export type ConfigurationFingerprint = z.infer<typeof ConfigurationFingerprint>;
 
+export const ExecutedExecutionProfileEvidence = z.object({
+  id: z.string().min(1).max(80).regex(/^[A-Za-z0-9._:-]+$/),
+  generation: z.number().int().positive(),
+  effectiveFingerprint: z.string().min(1).max(200).regex(/^[A-Za-z0-9._:+\-=]+$/),
+  inventoryFingerprint: z.string().min(1).max(200).regex(/^[A-Za-z0-9._:+\-=]+$/),
+}).strict();
+export type ExecutedExecutionProfileEvidence = z.infer<typeof ExecutedExecutionProfileEvidence>;
+
 /** Late Runner evidence about the configuration that actually executed. It is deliberately
  * distinct from the server's commissioning snapshot and optional on telemetry for old Runners. */
 export const ExecutedConfigurationEvidence = z.object({
   strategy: StrategyCoordinate.nullable().default(null),
   configuration: z.array(ConfigurationFingerprint).default([]),
+  executionProfile: ExecutedExecutionProfileEvidence.nullable().default(null),
 });
 export type ExecutedConfigurationEvidence = z.infer<typeof ExecutedConfigurationEvidence>;
 
