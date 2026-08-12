@@ -19,6 +19,7 @@ import { searchWorkspaceEvidence, searchWorkspaceTasks } from './lib/workspace-o
 import {
   ExecutionEventType, ExecutionKind, ExecutionLineageStatus, ExecutionRelationType, ExecutionRole,
   ExecutionSpec, type ExecutionSpecInput, MemoryKind, MemoryEdgeType, EvidenceRef, ContextPackRole,
+  RepoPath,
 } from '@noriq-dev/shared';
 import { RETRIEVAL_DEFAULTS } from './memory/retrieval';
 import { assembleContextPack } from './memory/context-pack';
@@ -1909,15 +1910,20 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'release_task',
-    'Release your claim when done or handing off. toStatus: "review" (default for finished work needing eyes), "done", "todo" (give it back), or "blocked". Optional comment records closing thoughts in the same call. Optional commitId attaches the exact opaque VCS revision this release produced, so later review, intelligence, and memory can trace the work without a separate attach_ref call.',
+    'Release your claim when done or handing off. toStatus: "review" (default for finished work needing eyes), "done", "todo" (give it back), or "blocked". Optional comment records closing thoughts in the same call. Optional commitId attaches the exact opaque VCS revision this release produced. IDE Copilots may also report bounded workEvidence; it is retained as driver-reported testimony and is never promoted to server/VCS-observed fact without independent verification. A completed Copilot release durably schedules a reusable effort episode; analytics failure never rolls back the release.',
     {
       projectId: z.string(),
       taskId: z.string(),
       toStatus: z.enum(['todo', 'review', 'done', 'blocked']).optional(),
       comment: z.string().optional().describe('Closing thoughts / handoff notes to record on the task'),
       commitId: z.string().min(1).optional().describe('Exact opaque VCS commit/base identifier produced by this work; stored as the task commit ref without parsing or normalization'),
+      workEvidence: z.object({
+        filesTouched: z.array(RepoPath).max(200).optional(),
+        testsRun: z.array(z.string().min(1).max(1_000)).max(100).optional(),
+        outcomeSummary: z.string().max(4_000).optional(),
+      }).strict().optional().describe('IDE-reported evidence retained with driver_reported provenance; never treated as independently verified'),
     },
-    tool(async ({ projectId, taskId, toStatus, comment, commitId }) => {
+    tool(async ({ projectId, taskId, toStatus, comment, commitId, workEvidence }) => {
       refuseLifecycleCall('release_task');
       const id = await resolveTaskId(env, projectId, taskId);
       if (toStatus === 'done') {
@@ -1934,7 +1940,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           throw new Error(`task has ${gate.n} open input request(s) awaiting a human decision — can't finish until they're answered`);
         }
       }
-      return room(env, projectId).releaseTask(projectId, actor, id, { toStatus, comment, commitId });
+      return room(env, projectId).releaseTask(projectId, actor, id, { toStatus, comment, commitId, workEvidence });
     }),
   );
 

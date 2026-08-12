@@ -751,19 +751,22 @@ describe('applyCoordinationEvent draws edges end to end (PLNR-316)', () => {
     const release = await mcpCall(token, 'release_task', { projectId, taskId, toStatus: 'review' });
     if (release.isError) throw new Error(`release_task failed: ${release.text}`);
     const edgesBeforeUnlink = await memory(projectId)._countEdges(projectId);
-    const applied = await memory(projectId).runProjector(projectId);
-    expect(applied.applied).toBeGreaterThan(0);
+    await memory(projectId).runProjector(projectId);
 
     const afterRelease = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: taskUri, edgeTypes: ['owned_by'] });
     expect(afterRelease.downstream).toEqual([]);
-    expect(await memory(projectId)._countEdges(projectId)).toBe(edgesBeforeUnlink - 1);
+    const edgesAfterUnlink = await memory(projectId)._countEdges(projectId);
+    // Copilot release episode recording may bring the active generation current before this
+    // explicit projector call. In either ordering, exactly this ownership edge is absent and a
+    // second projector pass is idempotent.
+    expect(edgesAfterUnlink).toBeGreaterThanOrEqual(edgesBeforeUnlink - 1);
+    expect(edgesAfterUnlink).toBeLessThanOrEqual(edgesBeforeUnlink);
 
     // The agent node itself is untouched by the unlink — only the edge is gone.
     const agentAsSeed = await memory(projectId).dependencyNeighborhood(projectId, { entityUri: agentUri });
     expect(agentAsSeed.coverage.reasons).not.toContain('seed-not-found');
 
     // Idempotent: re-running finds nothing left to unlink.
-    const edgesAfterUnlink = await memory(projectId)._countEdges(projectId);
     const second = await memory(projectId).runProjector(projectId);
     expect(second.applied).toBe(0);
     expect(await memory(projectId)._countEdges(projectId)).toBe(edgesAfterUnlink);

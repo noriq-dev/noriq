@@ -7,7 +7,8 @@ import {
   ProjectIntelligenceEpisode,
   ProjectQualityEvent,
   UploadedEpisodeIntelligence, type UploadedEpisodeIntelligence as UploadedEpisodeIntelligenceData,
-  evidenceHash, type EpisodeLandingOutcome, type MemoryBackupManifest,
+  evidenceHash, type CopilotReportedEvidence, type EpisodeLandingOutcome, type MemoryBackupManifest,
+  type WorkEpisodeSource,
 } from '@noriq-dev/shared';
 import { projectCoordinationEvents, type ProjectedEvent } from '../lib/memory-projector';
 import {
@@ -292,6 +293,8 @@ interface RecordEpisodeInput {
   steeringEvents: string[];
   landingOutcome: string;
   remainingWork: string[];
+  workSource?: WorkEpisodeSource;
+  reportedEvidence?: CopilotReportedEvidence | null;
   intelligence?: EpisodeIntelligenceDraft;
   intelligenceEnrichment?: UploadedEpisodeIntelligenceData;
   selfSummary?: unknown;
@@ -2840,6 +2843,7 @@ export class ProjectMemory extends DurableObject<Env> {
       id: episodeId,
       projectId,
       runId: input.runId,
+      workSource: input.workSource,
       taskId: input.taskId,
       repositoryKey: input.repositoryKey,
       baseId: input.baseId,
@@ -2856,6 +2860,7 @@ export class ProjectMemory extends DurableObject<Env> {
       steeringEvents: input.steeringEvents,
       landingOutcome: input.landingOutcome,
       remainingWork: input.remainingWork,
+      reportedEvidence: input.reportedEvidence,
       intelligence,
       selfSummary: mergedSelfSummary,
       createdAt,
@@ -2914,8 +2919,10 @@ export class ProjectMemory extends DurableObject<Env> {
       };
 
       const episodeNodeId = upsertNode('episode', buildEntityUri({ kind: 'episode', id: episodeId }), `${input.runKind} episode (${input.outcome})`);
-      const runNodeId = upsertNode('run', buildEntityUri({ kind: 'run', id: input.runId }), `${input.runKind} run`);
-      linkEdge('derived_from', episodeNodeId, runNodeId);
+      if (input.workSource?.kind !== 'copilot_claim') {
+        const runNodeId = upsertNode('run', buildEntityUri({ kind: 'run', id: input.runId }), `${input.runKind} run`);
+        linkEdge('derived_from', episodeNodeId, runNodeId);
+      }
 
       if (input.taskId) {
         const taskNodeId = upsertNode('task', buildEntityUri({ kind: 'task', id: input.taskId }), input.taskTitle ?? input.taskId);
@@ -2946,7 +2953,11 @@ export class ProjectMemory extends DurableObject<Env> {
       this.ctx.storage.sql.exec(
         `INSERT INTO outbox (id, operation_id, verb, subject_type, subject_id, payload, created_at) VALUES (?1,?2,'memory.changed','memory',?3,?4,?5)`,
         newId('obx'), operationId, episodeId,
-        JSON.stringify({ operationId, entityType: 'episode', runId: input.runId, outcome: input.outcome, nodesWritten, edgesWritten }),
+        JSON.stringify({
+          operationId, entityType: 'episode', runId: input.runId,
+          workSource: input.workSource ?? { kind: 'runner_run', runId: input.runId, sitting: input.sitting },
+          outcome: input.outcome, nodesWritten, edgesWritten,
+        }),
         now,
       );
       this.ctx.storage.sql.exec(`UPDATE memory_revision SET value = value + 1 WHERE id = 0`);

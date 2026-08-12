@@ -125,6 +125,15 @@ export const ProjectIntelligenceIdentity = z.object({
   branch: z.string().min(1).nullable().default(null),
   baseId: z.string().min(1).nullable().default(null),
   lineage: LineageCompleteness,
+  /** Additive source discriminator. Legacy episodes omit it and remain Runner-run episodes. */
+  workSource: z.discriminatedUnion('kind', [
+    z.object({ kind: z.literal('runner_run'), runId: z.string().min(1), sitting: z.number().int().positive() }),
+    z.object({
+      kind: z.literal('copilot_claim'),
+      claimId: z.string().min(1),
+      executionId: z.string().min(1).nullable().default(null),
+    }),
+  ]).optional(),
 });
 export type ProjectIntelligenceIdentity = z.infer<typeof ProjectIntelligenceIdentity>;
 

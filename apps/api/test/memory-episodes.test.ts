@@ -13,7 +13,10 @@ import type { Actor, CreateRunInput, RunPatch, RunView } from '../src/do/Project
 import type { Env } from '../src/env';
 import { buildEntityUri, IntelligenceContextConsumptionMetric, ProjectIntelligenceEpisode, UploadedEpisodeIntelligence } from '@noriq-dev/shared';
 import { createAgent, mcpCall } from './helpers';
-import { recordEpisodeForRun, sweepPendingEpisodeJobs } from '../src/memory/episodes';
+import {
+  processPendingCopilotEpisodeJob, recordEpisodeForCopilotClaim,
+  recordEpisodeForRun, sweepPendingEpisodeJobs,
+} from '../src/memory/episodes';
 
 const appEnv = env as unknown as Env;
 const actor: Actor = { kind: 'human', id: 'usr_epi_test', name: 'Episode Tester' };
@@ -491,6 +494,81 @@ describe('a terminal Run produces its deterministic episode (ProjectRoom → rec
     });
     const linkedEpisodeUris = taskNeighborhood.upstream.filter((e) => e.type === 'episode').map((e) => e.uri);
     expect(linkedEpisodeUris).toEqual(expect.arrayContaining(afterSitting2));
+  });
+});
+
+describe('Copilot claim episodes (PLNR-483)', () => {
+  it('records one discriminated episode without a Run and keeps IDE testimony driver-reported', async () => {
+    const projectId = await newProject('MEPICOP');
+    const made = await mcpCall(agent.apiKey, 'create_task', {
+      projectId, title: 'Implement from an IDE', tags: ['episode-test'],
+      executionSpec: { anticipatedFiles: [{ path: 'src/expected.ts', change: 'modify', why: 'planned scope' }] },
+    });
+    const taskId = made.body.id as string;
+    const claimed = await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId, workRole: 'verify' });
+    const claimId = claimed.body.claimId as string;
+    expect(claimed.body.executionId).toMatch(/^exe_/);
+
+    const released = await mcpCall(agent.apiKey, 'release_task', {
+      projectId, taskId, toStatus: 'review', commitId: 'copilot-commit-1',
+      workEvidence: {
+        filesTouched: ['src/reported.ts'], testsRun: ['npm test -- reported'],
+        outcomeSummary: 'IDE reported that focused verification passed',
+      },
+    });
+    expect(released.isError).toBe(false);
+    await processPendingCopilotEpisodeJob(appEnv, projectId, claimId).catch(() => false);
+
+    const first = await recordEpisodeForCopilotClaim(appEnv, projectId, claimId);
+    const second = await recordEpisodeForCopilotClaim(appEnv, projectId, claimId);
+    expect(second.episodeId).toBe(first.episodeId);
+    expect(second.created).toBe(false);
+    expect(await appEnv.DB.prepare('SELECT id FROM runs WHERE id = ?').bind(claimId).first()).toBeNull();
+
+    const episode = await memory(projectId)._getEpisodeForTest(projectId, claimId, 1) as any;
+    expect(episode).toMatchObject({
+      runId: claimId,
+      workSource: { kind: 'copilot_claim', claimId, executionId: claimed.body.executionId },
+      taskId, baseId: 'copilot-commit-1', filesTouched: [], testsRun: [],
+      reportedEvidence: {
+        provenance: 'driver_reported', source: 'driver', sourceId: claimId,
+        filesTouched: ['src/reported.ts'], testsRun: ['npm test -- reported'],
+      },
+      intelligence: {
+        identity: { workSource: { kind: 'copilot_claim', claimId } },
+        execution: {
+          observedModelUsage: { status: 'unavailable', value: null },
+          changes: { changedFiles: { status: 'partial', provenance: 'driver_reported', value: 1 } },
+        },
+      },
+    });
+  });
+
+  it('commits release and retains a retry job when ProjectMemory episode recording fails', async () => {
+    const projectId = await newProject('MEPICF');
+    const made = await mcpCall(agent.apiKey, 'create_task', {
+      projectId, title: 'Release despite analytics outage', tags: ['episode-test'],
+    });
+    const taskId = made.body.id as string;
+    const claimed = await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId });
+    const claimId = claimed.body.claimId as string;
+    await memory(projectId)._setForceWriteFailure(projectId, true);
+
+    const released = await mcpCall(agent.apiKey, 'release_task', {
+      projectId, taskId, toStatus: 'review', commitId: 'copilot-commit-retry',
+    });
+    expect(released.isError).toBe(false);
+    expect(await appEnv.DB.prepare('SELECT status, claimed_by AS claimedBy FROM tasks WHERE id = ?')
+      .bind(taskId).first()).toMatchObject({ status: 'review', claimedBy: null });
+    expect(await appEnv.DB.prepare('SELECT claim_id AS claimId FROM copilot_episode_jobs WHERE claim_id = ?')
+      .bind(claimId).first()).toEqual({ claimId });
+
+    await memory(projectId)._setForceWriteFailure(projectId, false);
+    const swept = await sweepPendingEpisodeJobs(appEnv);
+    expect(swept.completed).toBeGreaterThanOrEqual(1);
+    expect(await memory(projectId)._getEpisodeForTest(projectId, claimId, 1)).not.toBeNull();
+    expect(await appEnv.DB.prepare('SELECT 1 FROM copilot_episode_jobs WHERE claim_id = ?')
+      .bind(claimId).first()).toBeNull();
   });
 });
 

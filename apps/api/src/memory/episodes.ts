@@ -22,14 +22,16 @@
 // is read straight off the `runs` row below, exactly like every other identity field here.
 import type { Env } from '../env';
 import {
-  EpisodeLandingOutcome, ExecutionSpec, LineageCompleteness, RunModelUsage, StrategyCoordinate,
-  type IntelligenceDurationMs, type IntelligenceIntegerMetric, type IntelligenceRatioMetric,
+  CopilotReportedEvidence, EpisodeLandingOutcome, ExecutionSpec, LineageCompleteness, RunModelUsage,
+  StrategyCoordinate, type IntelligenceDurationMs, type IntelligenceIntegerMetric,
+  type IntelligenceRatioMetric, type WorkEpisodeSource,
 } from '@noriq-dev/shared';
 import {
   INTELLIGENCE_EXTRACTION_VERSION, loadRunSittingEvidence, type EpisodeIntelligenceDraft,
 } from '../lib/run-sitting-intelligence';
 import { requestProjectAnalyticsRebuild } from './analytics';
 import { attachShadowOutcomeRef } from './shadow-dispatch';
+import { readExecutionSpec } from '../lib/execution-spec';
 
 /** The subset of a `runs` row the skeleton needs — D1 column names, matching the shape
  *  `env.DB.prepare(...).first()` hands back. */
@@ -108,6 +110,8 @@ export interface EpisodeSkeleton {
   steeringEvents: string[];
   landingOutcome: EpisodeLandingOutcome;
   remainingWork: string[];
+  workSource?: WorkEpisodeSource;
+  reportedEvidence?: CopilotReportedEvidence | null;
   /** Present only for runs captured at the PLNR-291 dispatch boundary. Legacy episodes remain
    * valid without it; ProjectMemory supplies the stable episode id at its write seam. */
   intelligence?: EpisodeIntelligenceDraft;
@@ -128,6 +132,14 @@ const serverMetric = <T>(value: T, sourceId: string, observedAt: string | null) 
 const runnerMetric = <T>(value: T, sourceId: string, observedAt: string | null) => ({
   status: 'complete' as const, value, provenance: 'runner_observed' as const,
   source: 'runner' as const, sourceId, observedAt, acceptedAt: null, reason: null,
+});
+const driverMetric = <T>(value: T, sourceId: string, observedAt: string | null, reason: string) => ({
+  status: 'partial' as const, value, provenance: 'driver_reported' as const,
+  source: 'driver' as const, sourceId, observedAt, acceptedAt: observedAt, reason,
+});
+const partialServerMetric = <T>(value: T, sourceId: string, observedAt: string | null, reason: string) => ({
+  status: 'partial' as const, value, provenance: 'server_observed' as const,
+  source: 'd1_coordination' as const, sourceId, observedAt, acceptedAt: observedAt, reason,
 });
 
 function durationBetween(
@@ -374,6 +386,204 @@ export async function loadEpisodeSkeleton(env: Env, projectId: string, runId: st
   return skeleton;
 }
 
+type CopilotEpisodeJob = {
+  claimId: string;
+  taskId: string;
+  agentId: string;
+  acquiredAt: string;
+  releasedAt: string;
+  releaseStatus: 'review' | 'done';
+  workRole: 'scope' | 'build' | 'verify' | null;
+  executionId: string | null;
+  commitId: string | null;
+  reportedEvidence: string | null;
+  taskTitle: string;
+  taskType: string | null;
+  executionSpec: string | null;
+};
+
+function parseReportedEvidence(raw: string | null, claimId: string, releasedAt: string): CopilotReportedEvidence | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as { filesTouched?: unknown; testsRun?: unknown; outcomeSummary?: unknown };
+    const filesTouched = Array.isArray(parsed.filesTouched)
+      ? parsed.filesTouched.filter((item): item is string => typeof item === 'string')
+      : [];
+    const testsRun = Array.isArray(parsed.testsRun)
+      ? parsed.testsRun.filter((item): item is string => typeof item === 'string')
+      : [];
+    const evidence = CopilotReportedEvidence.safeParse({
+      provenance: 'driver_reported', source: 'driver', sourceId: claimId, reportedAt: releasedAt,
+      filesTouched, testsRun,
+      outcomeSummary: typeof parsed.outcomeSummary === 'string' ? parsed.outcomeSummary : null,
+    });
+    return evidence.success ? evidence.data : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Build and record one Copilot claim episode. `claimId` occupies the legacy runId storage key,
+ * but `workSource` is authoritative and no Run row or Run graph node is created. */
+export async function recordEpisodeForCopilotClaim(
+  env: Env,
+  projectId: string,
+  claimId: string,
+): Promise<{ episodeId: string; created: boolean }> {
+  const row = await env.DB.prepare(
+    `SELECT c.id AS claimId, c.task_id AS taskId, c.agent_id AS agentId,
+            c.acquired_at AS acquiredAt, c.released_at AS releasedAt,
+            c.release_status AS releaseStatus, c.work_role AS workRole,
+            c.execution_id AS executionId, c.commit_id AS commitId,
+            c.reported_evidence AS reportedEvidence,
+            t.title AS taskTitle, t.type AS taskType, t.execution_spec AS executionSpec
+       FROM claims c JOIN tasks t ON t.id = c.task_id
+      WHERE c.id = ? AND t.project_id = ? AND c.released_at IS NOT NULL
+        AND c.release_status IN ('review','done')`,
+  ).bind(claimId, projectId).first<CopilotEpisodeJob>();
+  if (!row) throw new Error(`completed Copilot claim ${claimId} not found in project ${projectId}`);
+
+  const [tagRows, execution, eventRow, mergedPr] = await Promise.all([
+    env.DB.prepare(
+      `SELECT g.name FROM task_tags tt JOIN tags g ON g.id = tt.tag_id
+        WHERE tt.task_id = ? ORDER BY g.name`,
+    ).bind(row.taskId).all<{ name: string }>(),
+    row.executionId ? env.DB.prepare(
+      `SELECT id, orchestration_id AS orchestrationId, completeness_status AS status,
+              completeness_missing AS missing, completeness_reason AS reason, updated_at AS updatedAt
+         FROM execution_nodes WHERE id = ? AND project_id = ? AND kind = 'copilot_session'`,
+    ).bind(row.executionId, projectId).first<{
+      id: string; orchestrationId: string; status: string; missing: string; reason: string | null; updatedAt: string;
+    }>() : Promise.resolve(null),
+    env.DB.prepare('SELECT MAX(seq) AS seq FROM events WHERE project_id = ?')
+      .bind(projectId).first<{ seq: number | null }>(),
+    env.DB.prepare("SELECT 1 AS yes FROM task_refs WHERE task_id = ? AND kind = 'pr' AND state = 'merged' LIMIT 1")
+      .bind(row.taskId).first<{ yes: number }>(),
+  ]);
+  const reportedEvidence = parseReportedEvidence(row.reportedEvidence, row.claimId, row.releasedAt);
+  const source: WorkEpisodeSource = {
+    kind: 'copilot_claim', claimId: row.claimId, executionId: row.executionId,
+  };
+  const lineageParsed = LineageCompleteness.safeParse(execution ? {
+    status: execution.status,
+    missing: (() => { try { return JSON.parse(execution.missing || '[]'); } catch { return ['legacy']; } })(),
+    reason: execution.reason,
+  } : { status: 'unknown', missing: ['events', 'legacy'], reason: 'Copilot claim has no session execution identity' });
+  const lineage = lineageParsed.success
+    ? lineageParsed.data
+    : LineageCompleteness.parse({ status: 'unknown', missing: ['legacy'], reason: 'invalid stored Copilot lineage' });
+  const elapsed = Math.max(0, Date.parse(row.releasedAt) - Date.parse(row.acquiredAt));
+  const workRole = row.workRole ?? 'build';
+  const storedSpec = readExecutionSpec(row.executionSpec, row.taskId);
+  const changedFilesMetric = reportedEvidence?.filesTouched.length
+    ? driverMetric(reportedEvidence.filesTouched.length, row.claimId, row.releasedAt, 'IDE-reported paths are not VCS-backend verified')
+    : unavailable('IDE did not report changed paths');
+  const intelligence: EpisodeIntelligenceDraft = {
+    schemaVersion: 1,
+    identity: {
+      projectId, runId: row.claimId, sitting: 1, taskId: row.taskId,
+      planId: null, planDispatchId: null,
+      orchestrationId: execution?.orchestrationId ?? null,
+      executionId: row.executionId, repositoryKey: null, branch: null, baseId: row.commitId,
+      lineage, workSource: source,
+    },
+    sources: {
+      memoryRevision: null, coordinationEventSequence: eventRow?.seq ?? null,
+      orchestrationAcceptedAt: execution?.updatedAt ?? null, capturedAt: row.releasedAt,
+    },
+    versions: { extraction: INTELLIGENCE_EXTRACTION_VERSION, retrieval: null, risk: null, comparison: null },
+    preExecution: {
+      task: {
+        taskType: row.taskType, tags: tagRows.results.map((tag) => tag.name),
+        executionSpecFingerprint: null, capturedAt: row.acquiredAt,
+      },
+      requestedStrategy: null, commissionedStrategy: null,
+      commissionedSpec: storedSpec.spec, budget: null, configuration: [],
+    },
+    execution: {
+      executedStrategy: null, executedSpec: null,
+      observedModelUsage: unavailable('IDE Copilot model usage was not independently observed'),
+      clocks: {
+        queueDurationMs: notApplicable('Copilot claims are not Runner queued work') as IntelligenceDurationMs,
+        dispatchToStartMs: notApplicable('Copilot claims are not Runner dispatched work') as IntelligenceDurationMs,
+        elapsedExecutionMs: partialServerMetric(elapsed, row.claimId, row.releasedAt, 'claim occupancy bounds work but is not continuous execution time') as IntelligenceDurationMs,
+        humanBlockedMs: unavailable('Copilot claim blocked intervals are not instrumented') as IntelligenceDurationMs,
+        verifyDurationMs: workRole === 'verify'
+          ? partialServerMetric(elapsed, row.claimId, row.releasedAt, 'verify claim occupancy bounds verification time') as IntelligenceDurationMs
+          : notApplicable('not a verify claim') as IntelligenceDurationMs,
+      },
+      stages: row.executionId ? [{
+        executionId: row.executionId, kind: 'copilot_session', role: workRole === 'verify' ? 'verifier' : workRole === 'scope' ? 'planner' : 'worker',
+        stage: workRole,
+        elapsedMs: partialServerMetric(elapsed, row.claimId, row.releasedAt, 'claim occupancy bounds stage time'),
+        tokens: unavailable('IDE Copilot token usage was not observed'),
+        costUSD: unavailable('IDE Copilot cost was not observed'),
+      }] : [],
+      changes: {
+        backend: null,
+        changedFiles: changedFilesMetric,
+        additions: unavailable('VCS backend evidence was not observed'),
+        deletions: unavailable('VCS backend evidence was not observed'),
+        churn: unavailable('VCS backend evidence was not observed'),
+      },
+    },
+    outcome: {
+      runOutcome: 'done',
+      landingOutcome: mergedPr ? 'landed' : 'pending',
+      reviewRounds: unavailable('Copilot review rounds were not independently observed') as IntelligenceIntegerMetric,
+      acceptanceCoverage: unavailable('Copilot acceptance coverage was not independently observed') as IntelligenceRatioMetric,
+    },
+  };
+
+  const recorded = await env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)).recordEpisode(projectId, {
+    runId: row.claimId,
+    sitting: 1,
+    agentId: row.agentId,
+    runKind: workRole,
+    outcome: 'done',
+    startedAt: row.acquiredAt,
+    finishedAt: row.releasedAt,
+    taskId: row.taskId,
+    taskTitle: row.taskTitle,
+    repositoryKey: null,
+    baseId: row.commitId,
+    timeline: [
+      { at: row.acquiredAt, label: `Copilot claim acquired (${workRole})` },
+      { at: row.releasedAt, label: `Copilot claim released to ${row.releaseStatus}` },
+    ],
+    filesTouched: [], commands: [], testsRun: [], failures: [], findings: [],
+    reviewRounds: 0, tokenUsage: {}, costUSD: 0, acceptanceCoverage: null,
+    steeringEvents: [], landingOutcome: mergedPr ? 'landed' : 'pending', remainingWork: [],
+    workSource: source, reportedEvidence, intelligence,
+    actor: { kind: 'system', id: null }, writeMode: 'skeleton',
+  });
+  await requestProjectAnalyticsRebuild(env, projectId);
+  return { episodeId: recorded.episodeId, created: recorded.created };
+}
+
+export async function processPendingCopilotEpisodeJob(
+  env: Env,
+  projectId: string,
+  claimId: string,
+): Promise<boolean> {
+  const job = await env.DB.prepare(
+    'SELECT 1 FROM copilot_episode_jobs WHERE project_id = ? AND claim_id = ?',
+  ).bind(projectId, claimId).first();
+  if (!job) return false;
+  try {
+    await recordEpisodeForCopilotClaim(env, projectId, claimId);
+    await env.DB.prepare('DELETE FROM copilot_episode_jobs WHERE project_id = ? AND claim_id = ?')
+      .bind(projectId, claimId).run();
+    return true;
+  } catch (error) {
+    await env.DB.prepare(
+      `UPDATE copilot_episode_jobs SET attempts = attempts + 1, last_error = ?, last_attempt_at = ?
+        WHERE project_id = ? AND claim_id = ?`,
+    ).bind(String(error), new Date().toISOString(), projectId, claimId).run();
+    throw error;
+  }
+}
+
 /**
  * Load one run's authoritative skeleton, then record it through the ProjectMemory DO. The
  * terminal transition's durable job processor calls this outside the run's critical path;
@@ -450,6 +660,18 @@ export async function sweepPendingEpisodeJobs(env: Env, limit = 100): Promise<{ 
     } catch (err) {
       failed++;
       console.warn(`episode job retry for ${row.run_id}/${row.sitting} failed: ${String(err)}`);
+    }
+  }
+  const copilotJobs = await env.DB.prepare(
+    `SELECT project_id, claim_id FROM copilot_episode_jobs
+      ORDER BY requested_at ASC LIMIT ?`,
+  ).bind(limit).all<{ project_id: string; claim_id: string }>();
+  for (const row of copilotJobs.results) {
+    try {
+      if (await processPendingCopilotEpisodeJob(env, row.project_id, row.claim_id)) completed++;
+    } catch (err) {
+      failed++;
+      console.warn(`Copilot episode job retry for ${row.claim_id} failed: ${String(err)}`);
     }
   }
   return { completed, failed };

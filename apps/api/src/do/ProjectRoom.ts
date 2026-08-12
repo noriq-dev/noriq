@@ -16,7 +16,7 @@ import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
 import { RunKind, AgentTool, RunStatus, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType } from '@noriq-dev/shared';
 import { writeExecutionSpec } from '../lib/execution-spec';
-import { processPendingEpisodeJob } from '../memory/episodes';
+import { processPendingCopilotEpisodeJob, processPendingEpisodeJob } from '../memory/episodes';
 import { ensureRunExecution, mirrorRunTransition } from '../lib/orchestration-store';
 import {
   captureRunCommissioningSnapshot, recordRunSittingExecutedConfiguration, recordRunSittingExecutedSpec,
@@ -1621,7 +1621,12 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
-  async releaseTask(projectId: string, actor: Actor, taskId: string, opts: { toStatus?: string; comment?: string; commitId?: string } = {})  {
+  async releaseTask(projectId: string, actor: Actor, taskId: string, opts: {
+    toStatus?: string;
+    comment?: string;
+    commitId?: string;
+    workEvidence?: { filesTouched?: string[]; testsRun?: string[]; outcomeSummary?: string };
+  } = {})  {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const task = await this.getTask(taskId);
@@ -1634,24 +1639,49 @@ export class ProjectRoom extends DurableObject<Env> {
       }
       const toStatus = opts.toStatus ?? 'todo';
       if (!['todo', 'review', 'done', 'blocked'].includes(toStatus)) throw new Error(`invalid release status: ${toStatus}`);
+      const liveClaim = await this.env.DB.prepare(
+        `SELECT c.id, c.agent_id AS agentId, a.kind AS agentKind
+           FROM claims c JOIN agents a ON a.id = c.agent_id
+          WHERE c.task_id = ? AND c.released_at IS NULL ORDER BY c.acquired_at DESC LIMIT 1`,
+      ).bind(taskId).first<{ id: string; agentId: string; agentKind: string }>();
+      if (!liveClaim) throw new Error(`${task.key} has no live claim row`);
       // A copilot release can identify the exact revision it produced (PLNR-427), matching the
       // commit ref Runner-backed work already exposes to episodes and Project Intelligence. Keep
       // it opaque and commit it atomically with the release: a task must never say "released"
       // while silently losing the revision the caller supplied with that same operation.
       const commitId = opts.commitId?.trim() || null;
+      const releaseAt = nowIso();
+      const reportedEvidence = opts.workEvidence ? JSON.stringify(opts.workEvidence) : null;
       const releaseStatements = [
-        this.env.DB.prepare('UPDATE claims SET released_at = ? WHERE task_id = ? AND released_at IS NULL').bind(nowIso(), taskId),
+        this.env.DB.prepare(
+          `UPDATE claims SET released_at = ?, release_status = ?, commit_id = ?, reported_evidence = ?
+            WHERE task_id = ? AND released_at IS NULL`,
+        ).bind(releaseAt, toStatus, commitId, reportedEvidence, taskId),
         this.env.DB.prepare('UPDATE tasks SET status = ?, claimed_by = NULL, claim_expires_at = NULL, updated_at = ? WHERE id = ?')
-          .bind(toStatus, nowIso(), taskId),
+          .bind(toStatus, releaseAt, taskId),
       ];
+      const createsCopilotEpisode = liveClaim.agentKind === 'copilot' && (toStatus === 'review' || toStatus === 'done');
+      if (createsCopilotEpisode) {
+        releaseStatements.push(this.env.DB.prepare(
+          `INSERT INTO copilot_episode_jobs (claim_id, project_id, task_id, requested_at)
+           VALUES (?, ?, ?, ?) ON CONFLICT (claim_id) DO NOTHING`,
+        ).bind(liveClaim.id, projectId, taskId, releaseAt));
+      }
       if (commitId) {
         releaseStatements.push(this.env.DB.prepare(
           `INSERT INTO task_refs (id, task_id, kind, ref, url, state, created_at)
            VALUES (?, ?, 'commit', ?, NULL, NULL, ?)
            ON CONFLICT (task_id, kind, ref) DO NOTHING`,
-        ).bind(newId('ref'), taskId, commitId, nowIso()));
+        ).bind(newId('ref'), taskId, commitId, releaseAt));
       }
       await this.env.DB.batch(releaseStatements);
+      if (createsCopilotEpisode) {
+        this.ctx.waitUntil(
+          processPendingCopilotEpisodeJob(this.env, projectId, liveClaim.id).catch((error) =>
+            console.warn(`Copilot episode recording for claim ${liveClaim.id} failed: ${String(error)}`),
+          ),
+        );
+      }
       // Releasing the task hands its file locks back too (§5 auto-release).
       await this.releaseLocksForTask(taskId, actor, `task released to ${toStatus}`);
       await this.emit(actor, 'task.released', 'task', taskId, {
