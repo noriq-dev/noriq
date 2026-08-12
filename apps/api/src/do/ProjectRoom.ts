@@ -98,10 +98,11 @@ export interface CreateTaskInput {
   /** What a builder is told before it spends anything (RUN-135). Omit or null = no spec, which
    *  is what every task carried before this existed. Validated here, at the write seam. */
   executionSpec?: ExecutionSpecInput | null;
-  /** Spin-off provenance (PLNR-230): set only by spin_off_task. Its presence makes the task
+  /** Spin-off provenance (PLNR-230/478): set only by the agent tool or runner endpoint. Its
+   *  presence makes the task
    *  PROPOSED (proposed_at set) — board-visible but inert to every agent path until a human
-   *  accepts it. runId/sourceTaskId are derived from the calling agent's live run, never
-   *  caller-claimed; `finding` is the evidence the adjudicator checks pointers against. */
+   *  accepts it. The agent tool derives runId/sourceTaskId; the daemon endpoint validates its
+   *  explicit pair against the runner's live run. `finding` is the evidence the adjudicator checks. */
   spinoff?: { runId: string; sourceTaskId: string | null; finding: string };
 }
 

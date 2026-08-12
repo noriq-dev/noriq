@@ -150,6 +150,37 @@ export const RunExit = z.object({
 });
 export type RunExit = z.infer<typeof RunExit>;
 
+/**
+ * A review follow-up the daemon files through POST /api/runner-spinoffs (PLNR-478).
+ *
+ * Unlike the agent-only spin_off_task tool, provenance is explicit on this wire because the
+ * daemon has no Noriq agent identity. The server validates all three pointers as one fact: the
+ * source run belongs to runnerId, is live, and is anchored to sourceTaskId in projectId. The
+ * product remains a proposed task until a human accepts or rejects it.
+ */
+export const RunnerSpinoffTaskRequest = z.object({
+  projectId: z.string().min(1),
+  runnerId: z.string().min(1),
+  sourceRunId: z.string().min(1),
+  sourceTaskId: z.string().min(1),
+  title: z.string().min(1),
+  body: z.string().optional(),
+  finding: z.string().min(1),
+  /** Optional override. Omit to inherit the source task's existing vocabulary. */
+  tags: z.array(z.string().min(1)).min(1).optional(),
+  allowNewTags: z.boolean().optional(),
+  priority: z.number().int().min(0).max(4).optional(),
+  type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
+});
+export type RunnerSpinoffTaskRequest = z.infer<typeof RunnerSpinoffTaskRequest>;
+
+export const RunnerSpinoffTaskResponse = z.object({
+  id: z.string(),
+  key: z.string(),
+  status: z.literal('proposed'),
+});
+export type RunnerSpinoffTaskResponse = z.infer<typeof RunnerSpinoffTaskResponse>;
+
 export const Run = z.object({
   id: z.string(),
   projectId: z.string(),

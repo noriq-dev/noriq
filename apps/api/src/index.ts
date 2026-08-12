@@ -35,7 +35,7 @@ import {
   recordAuthorizationAudit, userCanCreateGroup, userCanCreateProject, type ProjectAction,
 } from './lib/authorization';
 import { advertisedWorkflowNames } from './lib/workflows';
-import type { Actor, RunView } from './do/ProjectRoom';
+import type { Actor, CreateTaskInput, RunView } from './do/ProjectRoom';
 import { SKILL_MD, SKILL_REFERENCES, SKILL_MD_SURFACE } from './skill';
 import { DOC_SKILL_MD } from './skill-docs';
 import { buildNoriqSkillArchive } from './skill-archive';
@@ -84,7 +84,7 @@ import {
   ORCHESTRATION_CAPABILITY, RunnerProtocolCapability,
   RunnerExecutionDeclaration, RunnerExecutionEventReport, RunnerExecutionReconciliation,
   RunnerExecutionRelationReport, isTerminalRunStatus, normalizeProjectKey,
-  IndexGenerationManifest, ContextPackRole, type RunnerIndexCursor,
+  IndexGenerationManifest, ContextPackRole, RunnerSpinoffTaskRequest, type RunnerIndexCursor,
 } from '@noriq-dev/shared';
 import { auditAuthorizationParity, reconcileLegacyGroupGrants } from './lib/authorization-parity';
 import { evaluateMemoryAcceptance } from './memory/acceptance';
@@ -5038,6 +5038,79 @@ app.post('/api/runner-ingest/capability', agentAuth, async (c) => {
     );
   }
   return c.json({ token, maxBytes: max, expiresAt: new Date(expSec * 1000).toISOString() });
+});
+
+// --- Runner-filed review follow-ups (PLNR-478) -----------------------------------------------
+// The discovery reviewer deliberately has no Noriq credential, so the daemon owns the follow-up
+// records but cannot call the run-agent-only spin_off_task tool. This flat agentAuth route stays
+// OUTSIDE /api/projects/:pid/* (whose blanket userAuth middleware rejects bearer-only daemons).
+// It grants no claimable-work authority: createTask's existing spin-off seam stores `todo` plus
+// proposed_at, so the RUN-23 human accept/reject gate and all claim/dispatch exclusions stay intact.
+app.post('/api/runner-spinoffs', agentAuth, async (c) => {
+  const accountDenied = await connectionWriteDenied(c);
+  if (accountDenied) return accountDenied;
+  const parsed = RunnerSpinoffTaskRequest.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid runner spin-off request', detail: parsed.error.issues }, 400);
+  const b = parsed.data;
+  const conn = c.var.connection!;
+
+  // Bind this write to the exact live daemon registration, not merely another token owned by the
+  // same user. A stale/offboarded runner or a re-authorized token cannot mint provenance for it.
+  const liveCutoff = new Date(Date.now() - RUNNER_HEARTBEAT_TTL_MS).toISOString();
+  const runner = await c.env.DB.prepare(
+    `SELECT id, label FROM runners
+      WHERE id = ? AND owner_user_id = ? AND token_id = ?
+        AND status = 'online' AND offboarded_at IS NULL AND retired_at IS NULL
+        AND last_heartbeat_at >= ?`,
+  ).bind(b.runnerId, conn.userId, conn.tokenId, liveCutoff).first<{ id: string; label: string }>();
+  if (!runner) return c.json({ error: 'runner is not active on this connection' }, 404);
+  const projectDenied = await runnerProjectActionDenied(c, b.projectId, 'contribute');
+  if (projectDenied) return projectDenied;
+
+  // Explicit provenance is accepted only after reconstructing the relationship from canonical
+  // rows. This is the daemon twin of spin_off_task deriving the pointers from its bound agent.
+  const source = await c.env.DB.prepare(
+    `SELECT r.id FROM runs r
+       JOIN tasks t ON t.id = r.anchor_id AND t.project_id = r.project_id
+      WHERE r.id = ? AND r.project_id = ? AND r.runner_id = ?
+        AND r.kind IN ('build','verify')
+        AND r.status IN ('dispatched','running','blocked')
+        AND r.anchor_type = 'task' AND r.anchor_id = ? AND t.id = ?`,
+  ).bind(b.sourceRunId, b.projectId, b.runnerId, b.sourceTaskId, b.sourceTaskId).first<{ id: string }>();
+  if (!source) {
+    return c.json({ error: 'source run is not a live task-anchored run for this runner' }, 409);
+  }
+
+  // A classified follow-up does not carry project-vocabulary knowledge. By default it inherits
+  // its source task's tags, preserving the project's established filters without making the
+  // daemon mint words blindly. An explicit list remains available for a richer future classifier.
+  let tags = b.tags;
+  if (!tags) {
+    const inherited = await c.env.DB.prepare(
+      `SELECT tg.name FROM task_tags tt JOIN tags tg ON tg.id = tt.tag_id
+        WHERE tt.task_id = ? ORDER BY tg.name`,
+    ).bind(b.sourceTaskId).all<{ name: string }>();
+    tags = inherited.results.map((tag) => tag.name);
+  }
+  if (!tags.length) {
+    return c.json({ error: 'source task has no tags — provide at least one descriptive tag' }, 400);
+  }
+
+  try {
+    const input: CreateTaskInput = {
+      title: b.title, body: b.body,
+      tags, allowNewTags: b.allowNewTags, priority: b.priority, type: b.type,
+      spinoff: { runId: b.sourceRunId, sourceTaskId: b.sourceTaskId, finding: b.finding },
+    };
+    const created = await room(c.env, b.projectId).createTask(
+      b.projectId,
+      { kind: 'system', id: b.runnerId, name: `${runner.label} daemon` },
+      input,
+    );
+    return c.json(created);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+  }
 });
 
 // --- Runner-reachable (agentAuth) Project Memory READS (PLNR-306) -----------------------------
