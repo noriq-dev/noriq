@@ -37,7 +37,10 @@ export function PublicView({ pid, onNotPublic }: { pid: string; onNotPublic: () 
   const done = tasks.filter((t) => t.status === 'done').length;
 
   return (
-    <div style={{ minHeight: '100vh', background: 'var(--bg)', color: 'var(--text)' }}>
+    <div
+      data-testid="public-project-scroll"
+      style={{ height: '100dvh', overflowY: 'auto', overscrollBehavior: 'contain', background: 'var(--bg)', color: 'var(--text)' }}
+    >
       <div style={{ borderBottom: '1px solid var(--line)', background: 'var(--bg-raised)', padding: '12px 22px', display: 'flex', alignItems: 'center', gap: 12 }}>
         <Logo size={26} radius={7} />
         <span style={{ fontWeight: 700, fontSize: 15 }}>{snap.project.name}</span>
