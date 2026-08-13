@@ -3,7 +3,9 @@
 // expanding a plan reveals task chips per phase.
 import { useEffect, useState } from 'react';
 import { isSettledTaskStatus } from '@noriq-dev/shared';
-import { advertisedWorkflow, api, type ApiPlanDispatch, type ApiRunner, type RunEffort } from '../api';
+import {
+  advertisedWorkflow, api, type ApiExecutionProfileOffer, type ApiPlanDispatch, type ApiRunner, type RunEffort,
+} from '../api';
 import type { AppStore } from '../store';
 import { statusMeta } from '../design';
 import { AvatarChip, LiveDot, MonoTag, SectionLabel } from './bits';
@@ -45,6 +47,17 @@ export const PLAN_DELETE_TASK_DISPOSITION_OPTIONS = [
   { value: 'cancel', label: 'Cancel and keep tasks' },
   { value: 'delete', label: 'Permanently delete tasks' },
 ] as const;
+
+export function supportsSingleRootMission(workflow: ReturnType<typeof advertisedWorkflow> | undefined): boolean {
+  return workflow?.base === 'build' && workflow.capabilities.includes('mission.v2');
+}
+
+export function isMissionExecutionProfile(profile: ApiExecutionProfileOffer): boolean {
+  return profile.resolution === 'resolved'
+    && profile.health === 'healthy'
+    && profile.attestationCapable
+    && Boolean(profile.effectiveFingerprint);
+}
 
 type PlanArchiveTaskCancellation = typeof PLAN_ARCHIVE_TASK_CANCELLATION_OPTIONS[number]['value'];
 type PlanDeleteTaskDisposition = typeof PLAN_DELETE_TASK_DISPOSITION_OPTIONS[number]['value'];
@@ -763,6 +776,7 @@ function PlanDispatchForm({
   const [model, setModel] = useState('');
   const [effort, setEffort] = useState<RunEffort | ''>('');
   const [gate, setGate] = useState<'landed' | 'approved'>('approved');
+  const [strategy, setStrategy] = useState<'per_task' | 'single_root'>('per_task');
   // The dispatch-level workflow default (PLNR-240): every pump-created run selects it unless
   // the task names its own. Only BUILD-based workflows make sense — the pump mints build runs —
   // but bare-name advertisements (older daemons) carry no base, so they stay offered.
@@ -772,6 +786,10 @@ function PlanDispatchForm({
     .map(advertisedWorkflow)
     .filter((w) => w.base === 'build' || w.base === null);
   const executionProfiles = repos.find((r) => r.id === repoRef)?.executionProfiles ?? [];
+  const selectedWorkflow = repoWorkflows.find((candidate) => candidate.name === workflow);
+  const missionWorkflowEligible = supportsSingleRootMission(selectedWorkflow);
+  const selectedProfile = executionProfiles.find((profile) => profile.id === executionProfileId);
+  const missionProfileEligible = selectedProfile ? isMissionExecutionProfile(selectedProfile) : false;
   const [maxUsd, setMaxUsd] = useState('');
   const [maxTokens, setMaxTokens] = useState('');
   const [maxMinutes, setMaxMinutes] = useState('');
@@ -786,7 +804,10 @@ function PlanDispatchForm({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runnerId]);
   // A workflow belongs to one repo — drop the choice when the repo changes (PLNR-240).
-  useEffect(() => { setWorkflow(''); setExecutionProfileId(''); }, [repoRef]);
+  useEffect(() => { setWorkflow(''); setExecutionProfileId(''); setStrategy('per_task'); }, [repoRef]);
+  useEffect(() => {
+    if (!missionWorkflowEligible || (executionProfileId && !missionProfileEligible)) setStrategy('per_task');
+  }, [executionProfileId, missionProfileEligible, missionWorkflowEligible]);
 
   const num = (s: string): number | null => {
     const n = Number(s.trim());
@@ -798,6 +819,8 @@ function PlanDispatchForm({
     if (!runnerId) return setErr('no online runner advertises a repo for this project (and the build kind)');
     if (!repoRef) return setErr('pick a repo');
     if (!agentTool) return setErr('this runner advertises no agent tools');
+    if (strategy === 'single_root' && !missionWorkflowEligible) return setErr('pick a build workflow advertising mission.v2');
+    if (strategy === 'single_root' && !missionProfileEligible) return setErr('pick an exact healthy attested execution profile');
     setBusy(true);
     try {
       await api.dispatchPlan(pid, planId, {
@@ -808,6 +831,7 @@ function PlanDispatchForm({
         model: model.trim() || null,
         effort: effort || null,
         gate,
+        strategy,
         // '' = the built-in build. The server refuses an unadvertised name (PLNR-240).
         workflow: repoWorkflows.some((w) => w.name === workflow) ? workflow : null,
         executionProfileId: executionProfiles.some((profile) => profile.id === executionProfileId)
@@ -885,12 +909,23 @@ function PlanDispatchForm({
             </Select>
           </Field>
         )}
+        {missionWorkflowEligible && (
+          <Field label="execution strategy" hint="mission mode commissions this whole plan to one Runner root">
+            <Select value={strategy} onChange={(e) => setStrategy(e.target.value as 'per_task' | 'single_root')}>
+              <option value="per_task">per task — one run per ready task (default)</option>
+              <option value="single_root">single root — Runner mission harness</option>
+            </Select>
+          </Field>
+        )}
         {executionProfiles.length > 0 && (
-          <Field label="execution profile (optional)" hint="shared across every task run in this dispatch">
+          <Field
+            label={strategy === 'single_root' ? 'execution profile (required)' : 'execution profile (optional)'}
+            hint={strategy === 'single_root' ? 'exact healthy attested environment commissioned for this mission' : 'shared across every task run in this dispatch'}
+          >
             <Select value={executionProfileId} onChange={(e) => setExecutionProfileId(e.target.value)}>
-              <option value="">— runner default —</option>
+              <option value="">{strategy === 'single_root' ? '— select an exact profile —' : '— runner default —'}</option>
               {executionProfiles.map((profile) => (
-                <option key={profile.id} value={profile.id}>
+                <option key={profile.id} value={profile.id} disabled={strategy === 'single_root' && !isMissionExecutionProfile(profile)}>
                   {profile.id} · {profile.resolution}/{profile.health} · {profile.capacity.freeSlots}/{profile.capacity.maxConcurrency} slots
                 </option>
               ))}
@@ -913,7 +948,12 @@ function PlanDispatchForm({
       {err && <ErrorNote>{err}</ErrorNote>}
 
       <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
-        <Button variant="primary" disabled={busy || !candidates.length} onClick={submit} style={{ padding: '8px 18px' }}>
+        <Button
+          variant="primary"
+          disabled={busy || !candidates.length || (strategy === 'single_root' && (!missionWorkflowEligible || !missionProfileEligible))}
+          onClick={submit}
+          style={{ padding: '8px 18px' }}
+        >
           {busy ? 'dispatching…' : 'dispatch plan'}
         </Button>
         <span style={{ flex: 1 }} />

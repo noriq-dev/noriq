@@ -732,10 +732,13 @@ export interface ApiAdvertisedWorkflow {
   name: string;
   base: 'scope' | 'build' | 'verify';
   description?: string | null;
+  capabilities?: string[];
 }
 /** Normalize an advertised workflow entry (PLNR-240): a bare RUN-121 name has no known base. */
-export const advertisedWorkflow = (w: string | ApiAdvertisedWorkflow): { name: string; base: 'scope' | 'build' | 'verify' | null; description: string | null } =>
-  typeof w === 'string' ? { name: w, base: null, description: null } : { name: w.name, base: w.base, description: w.description ?? null };
+export const advertisedWorkflow = (w: string | ApiAdvertisedWorkflow): { name: string; base: 'scope' | 'build' | 'verify' | null; description: string | null; capabilities: string[] } =>
+  typeof w === 'string'
+    ? { name: w, base: null, description: null, capabilities: [] }
+    : { name: w.name, base: w.base, description: w.description ?? null, capabilities: w.capabilities ?? [] };
 /** One installed driver's coordinate MENU (RUN-115): model ids + efforts for the agent picker.
  *  `models` is a suggestion list, not a whitelist — the dispatch model field stays free-text. */
 export interface ApiAdvertisedAgent {
