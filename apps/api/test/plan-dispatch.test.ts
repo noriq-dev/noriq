@@ -664,10 +664,26 @@ describe('single_root Runner mission commissioning (PLNR-484)', () => {
     const cancelDispatch = await createDispatch(runner, cancelPlan.planId, {
       strategy: 'single_root', workflow: 'mission-plan',
     });
+    const cancelRoot = await env.DB.prepare('SELECT id FROM runs WHERE plan_dispatch_id = ?')
+      .bind(cancelDispatch.id).first<{ id: string }>();
+    const cancelAgent = await seedAgent(runner);
+    await room(pid).transitionRun(pid, actor, cancelRoot!.id, { status: 'running', agentId: cancelAgent });
+    const liveAttempt = await room(pid).beginMissionTask(pid, cancelRoot!.id, {
+      reportId: 'cancel-live-begin', attemptId: 'cancel-live-attempt', taskId: cancelPlan.a,
+      childKey: 'cancel-live-child', observedAt: new Date().toISOString(),
+    });
     expect((await room(pid).cancelPlanDispatch(pid, actor, cancelDispatch.id)).cancelledRuns).toBe(1);
     const cancelled = await env.DB.prepare('SELECT status FROM runs WHERE plan_dispatch_id = ?')
       .bind(cancelDispatch.id).first<{ status: string }>();
     expect(cancelled?.status).toBe('cancelled');
+    expect(await env.DB.prepare('SELECT status FROM mission_task_attempts WHERE id = ?')
+      .bind(liveAttempt.attemptId).first<{ status: string }>()).toEqual({ status: 'interrupted' });
+    expect(await env.DB.prepare('SELECT status, claimed_by AS holder FROM tasks WHERE id = ?')
+      .bind(cancelPlan.a).first<{ status: string; holder: string | null }>())
+      .toEqual({ status: 'todo', holder: null });
+    expect(await env.DB.prepare('SELECT released_at AS releasedAt FROM claims WHERE id = ?')
+      .bind(liveAttempt.claimId).first<{ releasedAt: string | null }>()).toMatchObject({ releasedAt: expect.any(String) });
+    expect(await room(pid).cancelPlanDispatch(pid, actor, cancelDispatch.id)).toEqual({ ok: true, cancelledRuns: 0 });
   });
 });
 

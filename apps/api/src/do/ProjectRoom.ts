@@ -5470,6 +5470,9 @@ export class ProjectRoom extends DurableObject<Env> {
       ).bind(this.projectId, run.id, run.sitting, now),
       this.env.DB.prepare('DELETE FROM execution_profile_leases WHERE run_id = ?').bind(run.id),
     ]);
+    if (run.kind === 'build' && run.anchor_type === 'plan') {
+      await this.interruptMissionTaskAttempts(run.id, run.agent_id, now, 'cancelled');
+    }
     this.ctx.waitUntil(
       processPendingEpisodeJob(this.env, this.projectId, run.id, run.sitting).catch((err) =>
         console.warn(`episode recording for run ${run.id}/${run.sitting} failed: ${String(err)}`),
