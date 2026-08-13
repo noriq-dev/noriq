@@ -203,7 +203,8 @@ export class RunnerHub extends DurableObject<Env> {
           `SELECT r.id, r.project_id AS pid FROM runs r
              LEFT JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
             WHERE r.runner_id = ? AND r.status = 'dispatched'
-              AND (pd.strategy IS NULL OR pd.strategy <> 'single_root' OR r.reconciliation_deadline IS NULL)`,
+              AND ((pd.strategy IS NULL OR pd.strategy <> 'single_root') AND r.mission_mode IS NULL
+                   OR r.reconciliation_deadline IS NULL)`,
         ).bind(runnerId).all<{ id: string; pid: string }>();
         for (const r of results) {
           if (!(await this.authorizeProject(ws, auth, r.pid))) return;
@@ -564,8 +565,8 @@ export class RunnerHub extends DurableObject<Env> {
     if (!auth.capabilities?.includes(MISSION_CAPABILITY)) return null;
     const row = await this.env.DB.prepare(
       `SELECT r.project_id AS pid, r.runner_id AS rid
-         FROM runs r JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
-        WHERE r.id = ? AND r.anchor_type = 'plan' AND pd.strategy = 'single_root'`,
+         FROM runs r LEFT JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
+        WHERE r.id = ? AND (pd.strategy = 'single_root' OR r.mission_mode = 'task_root')`,
     ).bind(runId).first<{ pid: string; rid: string | null }>();
     if (!row || row.rid !== runnerId) return null;
     return await this.authorizeProject(ws, auth, row.pid) ? row.pid : null;
@@ -581,8 +582,9 @@ export class RunnerHub extends DurableObject<Env> {
     lease: MissionLeaseRef | null,
   ): Promise<boolean> {
     const mission = await this.env.DB.prepare(
-      `SELECT 1 AS ok FROM runs r JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
-        WHERE r.id = ? AND r.project_id = ? AND r.anchor_type = 'plan' AND pd.strategy = 'single_root'`,
+      `SELECT 1 AS ok FROM runs r LEFT JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
+        WHERE r.id = ? AND r.project_id = ?
+          AND (pd.strategy = 'single_root' OR r.mission_mode = 'task_root')`,
     ).bind(runId, projectId).first<{ ok: number }>();
     if (!mission) return true;
     if (!auth.capabilities?.includes(MISSION_CAPABILITY)) return false;
@@ -606,13 +608,16 @@ export class RunnerHub extends DurableObject<Env> {
     if (auth?.capabilities?.includes(MISSION_CAPABILITY)) {
       const mission = await this.env.DB.prepare(
         `SELECT r.project_id AS pid, r.sitting, r.lease_epoch AS epoch
-           FROM runs r JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
-          WHERE r.id = ? AND r.anchor_type = 'plan' AND pd.strategy = 'single_root'`,
+           FROM runs r LEFT JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
+          WHERE r.id = ? AND (pd.strategy = 'single_root' OR r.mission_mode = 'task_root')`,
       ).bind(parsed.run.id).first<{ pid: string; sitting: number; epoch: number }>();
       if (mission) {
         const assignment = await ensureRunExecution(this.env, parsed.run.id);
-        const commission = await this.env.DB.prepare(
+        let commission = await this.env.DB.prepare(
           'SELECT digest, snapshot FROM mission_commissions WHERE root_run_id = ?',
+        ).bind(parsed.run.id).first<{ digest: string; snapshot: string }>();
+        commission ??= await this.env.DB.prepare(
+          'SELECT digest, snapshot FROM mission_task_root_commissions WHERE root_run_id = ?',
         ).bind(parsed.run.id).first<{ digest: string; snapshot: string }>();
         return JSON.stringify({
           ...parsed,

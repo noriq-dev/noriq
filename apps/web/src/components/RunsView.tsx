@@ -575,6 +575,7 @@ function DispatchForm({
   // '' = the built-in for `kind`; a custom workflow name (RUN-121) overrides only the prompt.
   const [workflow, setWorkflow] = useState('');
   const [executionProfileId, setExecutionProfileId] = useState('');
+  const [missionMode, setMissionMode] = useState<'ordinary' | 'task_root'>('ordinary');
   const [maxUsd, setMaxUsd] = useState('');
   const [maxTokens, setMaxTokens] = useState('');
   const [maxMinutes, setMaxMinutes] = useState('');
@@ -595,9 +596,18 @@ function DispatchForm({
   // implicit. Normalized: a bare name (pre-PLNR-240 daemon) has no known base or description.
   const repoWorkflows = (repos.find((r) => r.id === repoRef)?.workflows ?? []).map(advertisedWorkflow);
   const executionProfiles = repos.find((r) => r.id === repoRef)?.executionProfiles ?? [];
+  const selectedWorkflow = repoWorkflows.find((candidate) => candidate.name === workflow);
+  const selectedProfile = executionProfiles.find((candidate) => candidate.id === executionProfileId);
+  const taskMissionEligible = anchorTask && kind === 'build'
+    && selectedWorkflow?.base === 'build' && selectedWorkflow.capabilities.includes('mission.v2')
+    && selectedProfile?.resolution === 'resolved' && selectedProfile.health === 'healthy'
+    && selectedProfile.attestationCapable && Boolean(selectedProfile.effectiveFingerprint);
 
   // A custom workflow belongs to one repo — drop the choice when the repo changes.
-  useEffect(() => { setWorkflow(''); setExecutionProfileId(''); }, [repoRef]);
+  useEffect(() => { setWorkflow(''); setExecutionProfileId(''); setMissionMode('ordinary'); }, [repoRef]);
+  useEffect(() => {
+    if (!taskMissionEligible) setMissionMode('ordinary');
+  }, [taskMissionEligible]);
   // Selecting a workflow whose base is advertised (PLNR-240) sets `kind` to that posture —
   // the operator no longer has to know it. A bare-name advertisement changes nothing.
   const pickWorkflow = (name: string) => {
@@ -623,6 +633,7 @@ function DispatchForm({
     if (!kind) return setErr('this runner advertises no run kinds');
     if (!agentTool) return setErr('this runner advertises no agent tools');
     if (!brief.trim() && !anchorTask) return setErr('give a brief or anchor to a task');
+    if (missionMode === 'task_root' && !taskMissionEligible) return setErr('task mission requires an anchor, mission.v2 build workflow, and exact healthy attested profile');
     const body: DispatchInput = {
       runnerId: runner.id,
       kind,
@@ -643,6 +654,7 @@ function DispatchForm({
       // A custom workflow (RUN-121/PLNR-240). Guarded to the repo's advertised set — the server
       // refuses an unadvertised name outright rather than silently running the built-in.
       workflow: repoWorkflows.some((w) => w.name === workflow) ? workflow : null,
+      missionMode: missionMode === 'task_root' ? 'task_root' : null,
       executionProfileId: executionProfiles.some((profile) => profile.id === executionProfileId)
         ? executionProfileId
         : null,
@@ -744,6 +756,15 @@ function DispatchForm({
                 {profile.id} · {profile.resolution}/{profile.health} · {profile.capacity.freeSlots}/{profile.capacity.maxConcurrency} slots
               </option>
             ))}
+          </Select>
+        </Field>
+      )}
+
+      {taskMissionEligible && (
+        <Field label="execution mode" hint="task mission adds durable lease and restart adoption">
+          <Select value={missionMode} onChange={(e) => setMissionMode(e.target.value as 'ordinary' | 'task_root')}>
+            <option value="ordinary">ordinary task run (default)</option>
+            <option value="task_root">task-root Runner mission</option>
           </Select>
         </Field>
       )}

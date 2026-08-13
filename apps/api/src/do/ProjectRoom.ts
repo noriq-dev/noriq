@@ -14,7 +14,7 @@ import {
 import { searchBackend, indexEntity, removeEntity, type SearchKind } from '../search';
 import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
-import { MissionCommission as MissionCommissionSchema, RunKind, AgentTool, RunStatus, ExecutionProfileOffer, type AcceptedRevisionHandoff, type AcceptedRevisionHandoffView, type CommissionedExecutionProfile, type MissionCommission, type MissionCommissionSnapshot, type MissionHandoffAck, type MissionHandoffConsumed, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
+import { MissionCommission as MissionCommissionSchema, MissionRootCommission as MissionRootCommissionSchema, RunKind, AgentTool, RunStatus, ExecutionProfileOffer, type AcceptedRevisionHandoff, type AcceptedRevisionHandoffView, type CommissionedExecutionProfile, type MissionCommission, type MissionCommissionSnapshot, type MissionRootCommission, type TaskRootMissionCommissionSnapshot, type MissionHandoffAck, type MissionHandoffConsumed, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
 import { readExecutionSpec, writeExecutionSpec } from '../lib/execution-spec';
 import { processPendingCopilotEpisodeJob, processPendingEpisodeJob } from '../memory/episodes';
 import { applyMissionTaskExecutionEvent, ensureMissionTaskExecution, ensureRunExecution, mirrorRunTransition } from '../lib/orchestration-store';
@@ -262,6 +262,7 @@ export interface CreateRunInput {
   executionProfileId?: string | null;
   /** Internal expected identity for plan pumps; always revalidated against the current offer. */
   executionProfile?: CommissionedExecutionProfile | null;
+  missionMode?: 'task_root' | null;
 }
 
 export interface RunPatch {
@@ -290,6 +291,7 @@ type RunRow = {
   plan_dispatch_id: string | null;
   execution_profile_id: string | null;
   execution_profile: string | null;
+  mission_mode: 'task_root' | null;
   created_by: string; created_at: string; updated_at: string;
   dispatched_at: string | null; started_at: string | null;
   sitting: number;
@@ -352,6 +354,7 @@ export interface RunView {
   planDispatchId: string | null;
   /** Exact secret-free profile identity commissioned for this sitting. */
   executionProfile: CommissionedExecutionProfile | null;
+  missionMode: 'task_root' | null;
   createdBy: string;
   createdAt: string;
   updatedAt: string;
@@ -3953,6 +3956,7 @@ export class ProjectRoom extends DurableObject<Env> {
       agentTool: r.agent_tool,
       agent: r.agent,
       workflow: r.workflow,
+      missionMode: r.mission_mode,
       model: r.model,
       effort: r.effort,
       budget: JSON.parse(r.budget || '{}'),
@@ -4101,6 +4105,24 @@ export class ProjectRoom extends DurableObject<Env> {
     const runnerId = input.runnerId ?? null;
     const status = runnerId ? 'dispatched' : 'queued';
     const executionProfileId = input.executionProfileId ?? input.executionProfile?.id ?? null;
+    if (input.missionMode === 'task_root') {
+      if (input.kind !== 'build' || anchorType !== 'task' || !anchorId) {
+        throw new Error('task_root requires one exact task-anchored build Run');
+      }
+      if (!runnerId || !input.workflow || !executionProfileId) {
+        throw new Error('task_root requires a runner, mission.v2 workflow, and exact execution profile');
+      }
+      const advertised = await this.env.DB.prepare('SELECT repos FROM runners WHERE id = ?')
+        .bind(runnerId).first<{ repos: string }>();
+      let repo: { id: string; projectId?: string | null; workflows?: Array<string | { name: string; base?: string; capabilities?: string[] }> } | undefined;
+      try {
+        repo = (JSON.parse(advertised?.repos || '[]') as Array<typeof repo>)
+          .find((candidate) => candidate?.id === input.repoRef);
+      } catch { /* rejected below */ }
+      if (!repo || repo.projectId !== this.projectId || !workflowSupports(repo, input.workflow, 'build', 'mission.v2')) {
+        throw new Error('task_root requires an advertised build-posture workflow with mission.v2');
+      }
+    }
     if (input.executionProfile && executionProfileId !== input.executionProfile.id) {
       throw new Error('execution profile id does not match the commissioned identity');
     }
@@ -4126,9 +4148,9 @@ export class ProjectRoom extends DurableObject<Env> {
       `INSERT INTO runs (id, project_id, runner_id, kind, anchor_type, anchor_id, verifies_run_id,
                          plan_id, plan_key, target_branch, brief, repo_ref, agent_tool, agent, workflow,
                          model, effort,
-                         budget, status, plan_dispatch_id, execution_profile_id, execution_profile,
+                         budget, status, plan_dispatch_id, execution_profile_id, execution_profile, mission_mode,
                          created_by, created_at, updated_at, dispatched_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       id, this.projectId, runnerId, input.kind, anchorType, anchorId, verifiesRunId,
       plan?.id ?? null, plan ? this.planKey(plan) : null, input.targetBranch ?? null,
@@ -4137,6 +4159,7 @@ export class ProjectRoom extends DurableObject<Env> {
       input.model ?? null, input.effort ?? null,
       JSON.stringify(input.budget ?? {}), status, input.planDispatchId ?? null,
       executionProfileId, executionProfile ? JSON.stringify(executionProfile) : null,
+      input.missionMode ?? null,
       input.createdBy ?? actor.id, now, now,
       runnerId ? now : null,
       ).run();
@@ -4146,6 +4169,9 @@ export class ProjectRoom extends DurableObject<Env> {
         if (dispatch?.strategy === 'single_root') {
           await this.createMissionCommission(id, anchorId, 1, now);
         }
+      }
+      if (input.missionMode === 'task_root' && anchorType === 'task' && anchorId) {
+        await this.createTaskRootMissionCommission(id, anchorId, 1, now);
       }
     } catch (error) {
       await this.env.DB.prepare('DELETE FROM runs WHERE id = ?').bind(id).run().catch(() => undefined);
@@ -4249,12 +4275,59 @@ export class ProjectRoom extends DurableObject<Env> {
     return commission;
   }
 
+  /** Immutable authority for an explicit task-root mission: exactly the server-selected task. */
+  private async createTaskRootMissionCommission(
+    rootRunId: string,
+    taskId: string,
+    sitting: number,
+    commissionedAt: string,
+  ): Promise<MissionRootCommission> {
+    const task = await this.env.DB.prepare(
+      `SELECT id AS taskId, key, title, body, priority, type, estimate, due_at AS dueAt,
+              workflow, execution_spec AS executionSpec
+         FROM tasks WHERE id = ? AND project_id = ?`,
+    ).bind(taskId, this.projectId).first<{
+      taskId: string; key: string; title: string; body: string; priority: number; type: string;
+      estimate: number | null; dueAt: string | null; workflow: string | null; executionSpec: string | null;
+    }>();
+    if (!task) throw new Error('commissioned task not found');
+    const stored = readExecutionSpec(task.executionSpec, task.taskId);
+    if (stored.unreadable) throw new Error(`${task.key} has an unreadable execution spec`);
+    const snapshot: TaskRootMissionCommissionSnapshot = {
+      schemaVersion: 1, commissionId: newId('mco'), runId: rootRunId, sitting,
+      taskId, commissionedAt,
+      task: {
+        taskId, key: task.key, title: task.title, body: task.body, priority: task.priority,
+        type: task.type, estimate: task.estimate, dueAt: task.dueAt,
+        workflow: task.workflow, executionSpec: stored.spec,
+      },
+    };
+    const snapshotText = JSON.stringify(snapshot);
+    const digest = await sha256Hex(snapshotText);
+    const commission = MissionRootCommissionSchema.parse({ digest, snapshot });
+    await this.env.DB.prepare(
+      `INSERT INTO mission_task_root_commissions
+         (root_run_id, project_id, task_id, sitting, commission_id, digest, snapshot, commissioned_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(rootRunId, this.projectId, taskId, sitting, snapshot.commissionId, digest, snapshotText, commissionedAt).run();
+    return commission;
+  }
+
   async getMissionCommission(projectId: string, rootRunId: string): Promise<MissionCommission | null> {
     await this.setPid(projectId);
     const row = await this.env.DB.prepare(
       'SELECT digest, snapshot FROM mission_commissions WHERE root_run_id = ? AND project_id = ?',
     ).bind(rootRunId, projectId).first<{ digest: string; snapshot: string }>();
     return row ? MissionCommissionSchema.parse({ digest: row.digest, snapshot: JSON.parse(row.snapshot) }) : null;
+  }
+
+  private async getMissionRootCommission(projectId: string, rootRunId: string): Promise<MissionRootCommission | null> {
+    const plan = await this.getMissionCommission(projectId, rootRunId);
+    if (plan) return plan;
+    const row = await this.env.DB.prepare(
+      'SELECT digest, snapshot FROM mission_task_root_commissions WHERE root_run_id = ? AND project_id = ?',
+    ).bind(rootRunId, projectId).first<{ digest: string; snapshot: string }>();
+    return row ? MissionRootCommissionSchema.parse({ digest: row.digest, snapshot: JSON.parse(row.snapshot) }) : null;
   }
 
   /** Assign a queued Run to a runner and mark it dispatched. */
@@ -4791,8 +4864,9 @@ export class ProjectRoom extends DurableObject<Env> {
     await this.setPid(projectId);
     const run = await this.env.DB.prepare(
       `SELECT r.sitting, r.lease_epoch AS epoch
-         FROM runs r JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
-        WHERE r.id = ? AND r.project_id = ? AND pd.strategy = 'single_root'`,
+         FROM runs r LEFT JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
+        WHERE r.id = ? AND r.project_id = ?
+          AND (pd.strategy = 'single_root' OR r.mission_mode = 'task_root')`,
     ).bind(rootRunId, projectId).first<{ sitting: number; epoch: number }>();
     if (!run) throw new Error('mission root not found');
     const assignment = await ensureRunExecution(this.env, rootRunId);
@@ -4820,8 +4894,9 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.setPid(projectId);
       const deadline = new Date(Date.now() + Math.max(5_000, Math.min(120_000, deadlineMs))).toISOString();
       const { results } = await this.env.DB.prepare(
-        `SELECT r.id FROM runs r JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
-          WHERE r.project_id = ? AND r.runner_id = ? AND pd.strategy = 'single_root'
+        `SELECT r.id FROM runs r LEFT JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
+          WHERE r.project_id = ? AND r.runner_id = ?
+            AND (pd.strategy = 'single_root' OR r.mission_mode = 'task_root')
             AND r.status IN ('dispatched','running','blocked')
             ${pendingOnly ? 'AND r.reconciliation_pending = 1 AND r.reconciliation_deadline IS NULL' : ''}`,
       ).bind(projectId, runnerId).all<{ id: string }>();
@@ -4834,7 +4909,7 @@ export class ProjectRoom extends DurableObject<Env> {
           `SELECT id AS attemptId, child_execution_id AS executionId, lease_epoch AS epoch
              FROM mission_task_attempts WHERE root_run_id = ? AND status = 'running' ORDER BY id`,
         ).bind(id).all<{ attemptId: string; executionId: string; epoch: number }>();
-        const commission = await this.getMissionCommission(projectId, id);
+        const commission = await this.getMissionRootCommission(projectId, id);
         items.push({ runId: id, lease, commissionDigest: commission?.digest ?? null, attempts: attempts.results });
       }
       await this.scheduleExpiryAlarm();
@@ -4853,8 +4928,8 @@ export class ProjectRoom extends DurableObject<Env> {
       const result = await this.env.DB.prepare(
         `UPDATE runs SET reconciliation_pending = 1, reconciliation_deadline = NULL, updated_at = ?
           WHERE project_id = ? AND runner_id = ? AND status IN ('dispatched','running','blocked')
-            AND EXISTS (SELECT 1 FROM plan_dispatches pd
-                         WHERE pd.id = runs.plan_dispatch_id AND pd.strategy = 'single_root')`,
+            AND (mission_mode = 'task_root' OR EXISTS (SELECT 1 FROM plan_dispatches pd
+                         WHERE pd.id = runs.plan_dispatch_id AND pd.strategy = 'single_root'))`,
       ).bind(nowIso(), projectId, runnerId).run();
       return { pending: result.meta.changes };
     });
@@ -4867,8 +4942,9 @@ export class ProjectRoom extends DurableObject<Env> {
     await this.setPid(projectId);
     const { results } = await this.env.DB.prepare(
       `SELECT r.id, r.reconciliation_deadline AS deadline
-         FROM runs r JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
-        WHERE r.project_id = ? AND r.runner_id = ? AND pd.strategy = 'single_root'
+         FROM runs r LEFT JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
+        WHERE r.project_id = ? AND r.runner_id = ?
+          AND (pd.strategy = 'single_root' OR r.mission_mode = 'task_root')
           AND r.reconciliation_deadline IS NOT NULL AND r.status IN ('dispatched','running','blocked')`,
     ).bind(projectId, runnerId).all<{ id: string; deadline: string }>();
     const items: MissionInventoryItem[] = [];
@@ -4878,7 +4954,7 @@ export class ProjectRoom extends DurableObject<Env> {
         `SELECT id AS attemptId, child_execution_id AS executionId, lease_epoch AS epoch
            FROM mission_task_attempts WHERE root_run_id = ? AND status = 'running' ORDER BY id`,
       ).bind(row.id).all<{ attemptId: string; executionId: string; epoch: number }>();
-      const commission = await this.getMissionCommission(projectId, row.id);
+      const commission = await this.getMissionRootCommission(projectId, row.id);
       items.push({ runId: row.id, lease, commissionDigest: commission?.digest ?? null, attempts: attempts.results });
     }
     return { deadline: results[0]?.deadline ?? null, items };
@@ -4894,8 +4970,9 @@ export class ProjectRoom extends DurableObject<Env> {
       const run = await this.env.DB.prepare(
         `SELECT r.status, r.exit, r.sitting, r.lease_epoch AS epoch,
                 r.reconciliation_deadline AS deadline
-           FROM runs r JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
-          WHERE r.id = ? AND r.project_id = ? AND r.runner_id = ? AND pd.strategy = 'single_root'`,
+           FROM runs r LEFT JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
+          WHERE r.id = ? AND r.project_id = ? AND r.runner_id = ?
+            AND (pd.strategy = 'single_root' OR r.mission_mode = 'task_root')`,
       ).bind(inventory.runId, projectId, runnerId).first<{
         status: string; exit: string | null; sitting: number; epoch: number; deadline: string | null;
       }>();
@@ -4907,7 +4984,7 @@ export class ProjectRoom extends DurableObject<Env> {
         return { runId: inventory.runId, decision: 'cancel', lease: null, reason: 'reconciliation deadline expired' };
       }
       const current = await this.missionLease(projectId, inventory.runId);
-      const commission = await this.getMissionCommission(projectId, inventory.runId);
+      const commission = await this.getMissionRootCommission(projectId, inventory.runId);
       const expectedAttempts = await this.env.DB.prepare(
         `SELECT id AS attemptId, child_execution_id AS executionId, lease_epoch AS epoch
            FROM mission_task_attempts WHERE root_run_id = ? AND status = 'running' ORDER BY id`,
@@ -5470,7 +5547,7 @@ export class ProjectRoom extends DurableObject<Env> {
       ).bind(this.projectId, run.id, run.sitting, now),
       this.env.DB.prepare('DELETE FROM execution_profile_leases WHERE run_id = ?').bind(run.id),
     ]);
-    if (run.kind === 'build' && run.anchor_type === 'plan') {
+    if (run.kind === 'build' && (run.anchor_type === 'plan' || run.mission_mode === 'task_root')) {
       await this.interruptMissionTaskAttempts(run.id, run.agent_id, now, 'cancelled');
     }
     this.ctx.waitUntil(
@@ -5712,7 +5789,8 @@ export class ProjectRoom extends DurableObject<Env> {
       if (isTerminalRunStatus(to) && run.kind === 'build' && run.anchor_type === 'task' && run.anchor_id) {
         await this.settleAnchorTask(run.anchor_id, to, now, agentId);
       }
-      if (isTerminalRunStatus(to) && run.kind === 'build' && run.anchor_type === 'plan') {
+      if (isTerminalRunStatus(to) && run.kind === 'build'
+          && (run.anchor_type === 'plan' || run.mission_mode === 'task_root')) {
         await this.interruptMissionTaskAttempts(run.id, agentId, now, to);
       }
       // Every terminal run produces a deterministic episode (§14, PLNR-263). Delivery starts in
@@ -5987,7 +6065,7 @@ export class ProjectRoom extends DurableObject<Env> {
       const { results } = await this.env.DB.prepare(
         `SELECT r.id, r.status, r.agent_id AS agentId, r.sitting FROM runs r
          WHERE r.project_id = ? AND r.runner_id = ? AND r.status IN ('dispatched','running','blocked')
-           ${options.excludeMission ? `AND NOT EXISTS (
+           ${options.excludeMission ? `AND r.mission_mode IS NULL AND NOT EXISTS (
              SELECT 1 FROM plan_dispatches pd
               WHERE pd.id = r.plan_dispatch_id AND pd.strategy = 'single_root')` : ''}`,
       ).bind(projectId, runnerId).all<{ id: string; status: string; agentId: string | null; sitting: number }>();

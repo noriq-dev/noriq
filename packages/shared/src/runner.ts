@@ -299,6 +299,8 @@ export const Run = z.object({
   // Optional, repo-scoped machine environment commissioned by opaque identity/fingerprints.
   // Null preserves the legacy/default Runner environment selection.
   executionProfile: CommissionedExecutionProfile.nullable().default(null),
+  // Explicit opt-in; null keeps every legacy task Run byte-for-byte ordinary.
+  missionMode: z.literal('task_root').nullable().default(null),
   // Per-dispatch model + effort (RUN-33). Null = fall through to the repo's [defaults] for this
   // kind, then to whatever the tool itself defaults to. Deliberately a free string, not an enum:
   // model names are the vendor's and they change weekly, so pinning them in a wire contract (or

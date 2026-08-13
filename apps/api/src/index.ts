@@ -4223,6 +4223,7 @@ const DispatchBody = z.object({
   // than silently falling back to the built-in — a run built under the wrong posture's prompt
   // is worse than one that didn't start.
   workflow: z.string().min(1).max(80).nullish(),
+  missionMode: z.literal('task_root').nullish(),
   executionProfileId: ExecutionProfileId.nullish(),
   budget: RunBudget.optional(),
 });
@@ -4244,7 +4245,7 @@ app.post('/api/projects/:pid/runs', userAuth, async (c) => {
     .bind(b.runnerId, c.var.user!.id).first<{ repos: string }>();
   if (!runner) return c.json({ error: 'runner not found' }, 404);
   const repo = (JSON.parse(runner.repos) as Array<{
-    id: string; projectId: string | null; workflows?: Array<string | { name: string }>;
+    id: string; projectId: string | null; workflows?: Array<string | { name: string; base?: string; capabilities?: string[] }>;
     executionProfiles?: z.infer<typeof RunnerRepo>['executionProfiles'];
   }>).find((r) => r.id === b.repoRef);
   if (!repo) return c.json({ error: 'unknown repoRef for this runner' }, 400);
@@ -4254,6 +4255,17 @@ app.post('/api/projects/:pid/runs', userAuth, async (c) => {
   // silently fall back to the built-in.
   if (b.workflow && !advertisedWorkflowNames(repo).has(b.workflow)) {
     return c.json({ error: `workflow "${b.workflow}" is not advertised by this repo — refresh the runner or pick another` }, 400);
+  }
+  if (b.missionMode === 'task_root') {
+    if (b.kind !== 'build' || b.anchor?.type !== 'task') {
+      return c.json({ error: 'task_root requires one exact task-anchored build Run' }, 400);
+    }
+    if (!b.workflow || !workflowSupports(repo, b.workflow, 'build', 'mission.v2')) {
+      return c.json({ error: 'task_root requires an advertised build-posture workflow with mission.v2' }, 400);
+    }
+    if (!b.executionProfileId) {
+      return c.json({ error: 'task_root requires an exact healthy attested execution profile' }, 400);
+    }
   }
   if (b.executionProfileId) {
     try { commissionExecutionProfile({ id: repo.id, executionProfiles: repo.executionProfiles ?? [] }, b.executionProfileId); }
@@ -4282,6 +4294,7 @@ app.post('/api/projects/:pid/runs', userAuth, async (c) => {
       agent: b.agent ?? null, workflow: b.workflow ?? null,
       model: b.model ?? null, effort: b.effort ?? null,
       budget: b.budget, runnerId: b.runnerId, executionProfileId: b.executionProfileId ?? null,
+      missionMode: b.missionMode ?? null,
     });
   } catch (error) {
     return c.json({ error: error instanceof Error ? error.message : 'run dispatch failed' }, 409);

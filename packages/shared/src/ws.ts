@@ -4,7 +4,7 @@ import {
   AcceptedRevisionHandoff,
 } from './runner';
 import { ExecutionSpec } from './execution-spec';
-import { MissionCommission } from './runner-protocol';
+import { MissionRootCommission } from './runner-protocol';
 import { ExecutedConfigurationEvidence } from './intelligence';
 import {
   ExecutionReportAck,
@@ -103,7 +103,7 @@ export const RunnerServerMessage = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('run.assigned'), run: Run,
     missionLease: MissionLeaseRef.nullable().default(null),
-    missionCommission: MissionCommission.nullable().default(null),
+    missionCommission: MissionRootCommission.nullable().default(null),
   }),
 
   // A plan finished, so its working branch is ready to become a merge request (RUN-28).

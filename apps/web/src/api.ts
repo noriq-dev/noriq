@@ -861,6 +861,7 @@ export interface ApiRun {
    *  the prompt — `kind` still carries the posture. */
   workflow: string | null;
   executionProfile: ApiCommissionedExecutionProfile | null;
+  missionMode: 'task_root' | null;
   /** per_task is the legacy fan-out; single_root delegates child scheduling to a mission.v2 workflow. */
   strategy: 'per_task' | 'single_root';
   budget: Partial<ApiRunBudget>;
@@ -976,6 +977,7 @@ export interface DispatchInput {
   /** A repo-defined workflow name (RUN-121). Overrides only the prompt, so `kind` must be set to
    *  the workflow's base — the daemon keys permissions off `kind`. */
   workflow?: string | null;
+  missionMode?: 'task_root' | null;
   executionProfileId?: string | null;
   budget?: Partial<ApiRunBudget>;
 }

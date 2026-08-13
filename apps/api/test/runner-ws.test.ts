@@ -91,8 +91,13 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
   const projectRoom = () => (env as unknown as Env).PROJECT_ROOM.get(
     (env as unknown as Env).PROJECT_ROOM.idFromName(pid),
   ) as unknown as {
-    createPlan(projectId: string, actor: Actor, input: Record<string, unknown>): Promise<{ id: string }>;
+    createPlan(projectId: string, actor: Actor, input: Record<string, unknown>): Promise<{
+      id: string; phases: Array<{ id: string; taskIds: string[] }>;
+    }>;
     createPlanDispatch(projectId: string, actor: Actor, input: CreatePlanDispatchInput): Promise<PlanDispatchView>;
+    adoptRunnerMission(projectId: string, runnerId: string, inventory: MissionInventoryItem): Promise<{
+      runId: string; decision: string; lease: { epoch: number } | null;
+    }>;
   };
 
   it('rejects the upgrade without a token (401) and for a non-owner (404)', async () => {
@@ -377,6 +382,104 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
     }));
     await waitRunStatus(runId, 'blocked');
     resumed.close();
+  });
+
+  it('commissions and restart-adopts an explicit task-root mission without changing ordinary task runs (PLNR-492)', async () => {
+    const registration = {
+      runnerId, label: 'ws-daemon', tools: ['claude'], kinds: ['build'], maxConcurrency: 2,
+      repos: [{
+        id: 'repo_x', projectKey: 'RWSP', projectId: pid,
+        workflows: [{ name: 'mission-task', base: 'build', capabilities: ['mission.v2'] }],
+        executionProfiles: [{
+          id: 'task-mission-profile', declarationFingerprint: 'decl-task', effectiveFingerprint: 'inventory-task',
+          resolution: 'resolved', health: 'healthy', attestationCapable: true,
+          observedAt: new Date().toISOString(), generation: 1,
+          capacity: { maxConcurrency: 2, freeSlots: 2 },
+        }],
+      }],
+      protocolCapabilities: ['mission.v2'],
+    };
+    expect((await SELF.fetch('https://noriq.test/api/runners', {
+      method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(registration),
+    })).status).toBe(200);
+    const owner = await env.DB.prepare('SELECT owner_user_id AS id FROM runners WHERE id = ?')
+      .bind(runnerId).first<{ id: string }>();
+    const actor: Actor = { kind: 'human', id: owner!.id, name: 'RWS Owner' };
+    const plan = await projectRoom().createPlan(pid, actor, {
+      title: `WS task mission ${crypto.randomUUID()}`,
+      phases: [{ title: 'task', newTasks: [{ title: 'exact mission task' }] }],
+    });
+    const taskId = plan.phases[0]!.taskIds[0]!;
+
+    const first = await wsConnect(runnerId, { Authorization: `Bearer ${token}` });
+    const ws = first.webSocket!;
+    ws.accept();
+    const registeredP = nextFrame(ws, (m) => m.type === 'registered');
+    ws.send(JSON.stringify({ type: 'hello', protocol: 1, label: 'ws-daemon', protocolCapabilities: ['mission.v2'] }));
+    await registeredP;
+    const assignedP = nextFrame(ws, (m) => m.type === 'run.assigned' && m.missionLease);
+    const dispatched = await SELF.fetch(`https://noriq.test/api/projects/${pid}/runs`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        runnerId, kind: 'build', agentTool: 'claude', repoRef: 'repo_x',
+        anchor: { type: 'task', id: taskId }, workflow: 'mission-task', missionMode: 'task_root',
+        executionProfileId: 'task-mission-profile',
+      }),
+    });
+    expect(dispatched.status).toBe(200);
+    expect(await dispatched.clone().json()).toMatchObject({ run: { missionMode: 'task_root' } });
+    const assigned = await assignedP.catch((error) => { throw new Error(`task-root assignment: ${String(error)}`); });
+    expect(assigned.run).toMatchObject({ missionMode: 'task_root', executionProfile: { id: 'task-mission-profile' } });
+    expect(assigned.missionLease).toMatchObject({ sitting: 1, epoch: 1, executionId: expect.any(String) });
+    expect(assigned.missionCommission).toMatchObject({
+      digest: expect.any(String),
+      snapshot: { runId: assigned.run.id, taskId, task: { taskId, title: 'exact mission task' } },
+    });
+    ws.send(JSON.stringify({
+      type: 'run.status', runId: assigned.run.id, status: 'running', missionLease: assigned.missionLease,
+      at: new Date().toISOString(),
+    }));
+    await waitRunStatus(assigned.run.id, 'running');
+    ws.close();
+
+    expect((await SELF.fetch('https://noriq.test/api/runners', {
+      method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(registration),
+    })).status).toBe(200);
+    const resumedResult = await wsConnect(runnerId, { Authorization: `Bearer ${token}` });
+    const resumed = resumedResult.webSocket!;
+    resumed.accept();
+    const requestP = nextFrame(resumed, (m) => m.type === 'mission.reconcile.request');
+    resumed.send(JSON.stringify({ type: 'hello', protocol: 1, label: 'ws-daemon', protocolCapabilities: ['mission.v2'] }));
+    const request = await requestP.catch((error) => { throw new Error(`task-root reconciliation request: ${String(error)}`); });
+    const item = request.items.find((candidate: { runId: string }) => candidate.runId === assigned.run.id);
+    expect(item).toMatchObject({ runId: assigned.run.id, commissionDigest: assigned.missionCommission.digest });
+    expect(await projectRoom().adoptRunnerMission(pid, runnerId, item)).toMatchObject({
+      runId: assigned.run.id, decision: 'adopt', lease: { epoch: 2 },
+    });
+    resumed.close();
+
+    const cancelled = await SELF.fetch(`https://noriq.test/api/runs/${assigned.run.id}/cancel`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason: 'task-root cancellation test' }),
+    });
+    expect(cancelled.status).toBe(200);
+    expect(await cancelled.json()).toMatchObject({ run: { status: 'cancelled', missionMode: 'task_root' } });
+    expect(await env.DB.prepare('SELECT run_id AS runId FROM execution_profile_leases WHERE run_id = ?')
+      .bind(assigned.run.id).first()).toBeNull();
+
+    const ordinaryResponse = await SELF.fetch(`https://noriq.test/api/projects/${pid}/runs`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        kind: 'build', runnerId, repoRef: 'repo_x', agentTool: 'claude', anchor: { type: 'task', id: taskId },
+      }),
+    });
+    expect(ordinaryResponse.status).toBe(200);
+    const ordinary = (await ordinaryResponse.json()) as { run: { id: string; missionMode: null } };
+    expect(ordinary.run.missionMode).toBeNull();
+    expect(await env.DB.prepare('SELECT mission_mode AS missionMode FROM runs WHERE id = ?')
+      .bind(ordinary.run.id).first<{ missionMode: string | null }>()).toEqual({ missionMode: null });
   });
 
   it('persists exact mission handoffs and replays authorized consumption after reconnect (PLNR-488)', async () => {
