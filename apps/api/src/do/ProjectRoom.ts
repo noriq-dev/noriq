@@ -4988,14 +4988,14 @@ export class ProjectRoom extends DurableObject<Env> {
           ...(event.status === 'cancelled' ? [this.env.DB.prepare(
             `UPDATE tasks SET status = 'todo', failed_at = NULL,
                     claimed_by = NULL, claim_expires_at = NULL, updated_at = ?
-              WHERE status = 'in_progress' AND id IN (
+              WHERE (status = 'in_progress' OR failed_at IS NOT NULL) AND id IN (
                 SELECT task_id FROM runner_job_items
-                 WHERE job_id = ? AND status IN ('pending','running')
+                 WHERE job_id = ? AND status IN ('pending','running','failed')
               )`,
           ).bind(receivedAt, jobId)] : []),
           this.env.DB.prepare(
             `UPDATE runner_job_items SET status = CASE
-                      WHEN ? = 'cancelled' AND status IN ('pending','running') THEN 'cancelled'
+                      WHEN ? = 'cancelled' AND status IN ('pending','running','failed') THEN 'cancelled'
                       WHEN status = 'pending' THEN 'not_started'
                       ELSE status
                     END,

@@ -239,5 +239,22 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
       type: 'task.result', at, taskId: task.id, status: 'accepted',
       checkpoint: { ref: revision, label: revision, url: null }, summary: 'too late', findings: [],
     })).toMatchObject({ accepted: false, ack: 1 });
+    const output = {
+      workspaceMode: 'isolated', retainedLocation: { vcs: 'git', label: 'noriq/recovery/cancelled', url: null },
+      baseRevision: revision, headRevision: revision, acceptedTaskCheckpoints: {},
+      checks: [], findings: [],
+      usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0, costUsd: 0, calls: 0 },
+      summary: 'cancelled', dirtyPaths: [],
+    };
+    expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 2, {
+      type: 'terminal', at, status: 'cancelled', output,
+    })).toMatchObject({ accepted: true, ack: 2 });
+    expect(await env.DB.prepare(
+      'SELECT status FROM runner_job_items WHERE job_id = ?',
+    ).bind(job.id).first<{ status: string }>()).toEqual({ status: 'cancelled' });
+    expect(await env.DB.prepare(
+      'SELECT status, failed_at AS failedAt FROM tasks WHERE id = ?',
+    ).bind(task.id).first<{ status: string; failedAt: string | null }>())
+      .toEqual({ status: 'todo', failedAt: null });
   });
 });
