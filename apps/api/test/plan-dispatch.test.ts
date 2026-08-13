@@ -9,6 +9,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import type { Actor, CreatePlanDispatchInput, CreateRunInput, PlanDispatchView, RunPatch, RunView } from '../src/do/ProjectRoom';
 import type { Env } from '../src/env';
 import type {
+  AcceptedRevisionHandoff, AcceptedRevisionHandoffView, MissionHandoffAck,
   MissionAdoptionResult, MissionInventoryItem, MissionLeaseRef,
   MissionTaskAck, MissionTaskBeginReport, MissionTaskSettleReport,
 } from '@noriq-dev/shared';
@@ -40,6 +41,9 @@ interface RoomRpc {
   adoptRunnerMission(projectId: string, runnerId: string, inventory: MissionInventoryItem): Promise<MissionAdoptionResult>;
   reconcileRunnerRuns(projectId: string, actor: Actor, runnerId: string, options?: { excludeMission?: boolean }): Promise<{ failed: number }>;
   sweepRunnerMissionReconciliations(projectId: string, actor?: Actor): Promise<{ failed: number }>;
+  publishMissionHandoff(projectId: string, rootRunId: string, reportId: string, handoff: AcceptedRevisionHandoff, lease: MissionLeaseRef): Promise<MissionHandoffAck>;
+  getMissionHandoff(projectId: string, rootRunId: string): Promise<AcceptedRevisionHandoffView | null>;
+  consumeMissionHandoff(projectId: string, actor: Actor, rootRunId: string, handoff: AcceptedRevisionHandoff): Promise<{ handoff: AcceptedRevisionHandoffView }>;
 }
 const room = (pid: string) =>
   appEnv.PROJECT_ROOM.get(appEnv.PROJECT_ROOM.idFromName(pid)) as unknown as RoomRpc;
@@ -600,6 +604,57 @@ describe('single_root Runner mission commissioning (PLNR-484)', () => {
     const cancelled = await env.DB.prepare('SELECT status FROM runs WHERE plan_dispatch_id = ?')
       .bind(cancelDispatch.id).first<{ status: string }>();
     expect(cancelled?.status).toBe('cancelled');
+  });
+});
+
+describe('accepted mission handoff consumption (PLNR-488)', () => {
+  it('preserves, exposes, exactly consumes, and idempotently replays an unlanded handoff', async () => {
+    const runner = await seedRunner(2, true);
+    const plan = await makePlan('mission-handoff');
+    const dispatch = await createDispatch(runner, plan.planId, {
+      strategy: 'single_root', workflow: 'mission-plan',
+    });
+    const root = await env.DB.prepare('SELECT id, status FROM runs WHERE plan_dispatch_id = ?')
+      .bind(dispatch.id).first<{ id: string; status: string }>();
+    const lease = await room(pid).missionLease(pid, root!.id);
+    const handoff: AcceptedRevisionHandoff = {
+      schemaVersion: 1, handoffId: 'handoff-exact-1', backend: 'opaque-vcs',
+      repositoryKey: 'noriq', checkpoint: 'checkpoint-17', revision: 'revision-abc',
+      reference: 'preserved-ref-17',
+    };
+
+    const published = await room(pid).publishMissionHandoff(pid, root!.id, 'publish-1', handoff, lease);
+    expect(published).toMatchObject({
+      accepted: true, handoffId: handoff.handoffId, state: 'preserved_unlanded',
+      consumedAt: null, consumptionId: null,
+    });
+    expect(await room(pid).publishMissionHandoff(pid, root!.id, 'publish-replay', handoff, lease))
+      .toMatchObject({ accepted: true, state: 'preserved_unlanded', preservedAt: published.preservedAt });
+    await expect(room(pid).publishMissionHandoff(pid, root!.id, 'publish-conflict', {
+      ...handoff, revision: 'different-revision',
+    }, lease)).rejects.toThrow(/conflicting/);
+    expect(await room(pid).getMissionHandoff(pid, root!.id)).toEqual({
+      identity: handoff, state: 'preserved_unlanded', preservedAt: published.preservedAt,
+      consumedAt: null, consumptionId: null,
+    });
+
+    await expect(room(pid).consumeMissionHandoff(pid, actor, root!.id, {
+      ...handoff, reference: 'stale-ref',
+    })).rejects.toThrow(/identity mismatch/);
+    const consumed = await room(pid).consumeMissionHandoff(pid, actor, root!.id, handoff);
+    expect(consumed.handoff).toMatchObject({ identity: handoff, state: 'consumed_unlanded' });
+    expect(consumed.handoff.consumptionId).toMatch(/^hca_/);
+    const replay = await room(pid).consumeMissionHandoff(pid, actor, root!.id, handoff);
+    expect(replay.handoff).toEqual(consumed.handoff);
+
+    // Neither preservation nor consumption claims that the root or its plan tasks landed.
+    expect((await env.DB.prepare('SELECT status FROM runs WHERE id = ?').bind(root!.id).first<{ status: string }>())?.status)
+      .toBe('dispatched');
+    const open = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id
+        JOIN tasks t ON t.id = pt.task_id WHERE ph.plan_id = ? AND t.status = 'todo'`,
+    ).bind(plan.planId).first<{ n: number }>();
+    expect(open?.n).toBe(3);
   });
 });
 

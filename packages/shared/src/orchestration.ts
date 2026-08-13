@@ -6,8 +6,11 @@ import { z } from 'zod';
 
 export const ORCHESTRATION_CAPABILITY = 'orchestration.v1' as const;
 export const MISSION_CAPABILITY = 'mission.v2' as const;
+export const MISSION_HANDOFF_CAPABILITY = 'mission.handoff.v1' as const;
 export const MCP_SESSION_LINEAGE_META = 'io.noriq/sessionLineage' as const;
-export const RunnerProtocolCapability = z.enum([ORCHESTRATION_CAPABILITY, MISSION_CAPABILITY]);
+export const RunnerProtocolCapability = z.enum([
+  ORCHESTRATION_CAPABILITY, MISSION_CAPABILITY, MISSION_HANDOFF_CAPABILITY,
+]);
 export type RunnerProtocolCapability = z.infer<typeof RunnerProtocolCapability>;
 
 export const McpSessionLineageHint = z.object({

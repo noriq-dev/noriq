@@ -14,7 +14,7 @@ import {
 import { searchBackend, indexEntity, removeEntity, type SearchKind } from '../search';
 import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
-import { RunKind, AgentTool, RunStatus, ExecutionProfileOffer, type CommissionedExecutionProfile, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
+import { RunKind, AgentTool, RunStatus, ExecutionProfileOffer, type AcceptedRevisionHandoff, type AcceptedRevisionHandoffView, type CommissionedExecutionProfile, type MissionHandoffAck, type MissionHandoffConsumed, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
 import { writeExecutionSpec } from '../lib/execution-spec';
 import { processPendingCopilotEpisodeJob, processPendingEpisodeJob } from '../memory/episodes';
 import { applyMissionTaskExecutionEvent, ensureMissionTaskExecution, ensureRunExecution, mirrorRunTransition } from '../lib/orchestration-store';
@@ -361,6 +361,24 @@ export interface RunView {
    *  (listRuns/getRun); absent on transition echoes, which nothing renders a count from. */
   spinoffs?: number;
 }
+
+type MissionHandoffRow = {
+  root_run_id: string;
+  project_id: string;
+  runner_id: string;
+  handoff_id: string;
+  backend: string;
+  repository_key: string;
+  checkpoint: string;
+  revision: string;
+  reference: string;
+  identity_hash: string;
+  preserved_at: string;
+  consumed_at: string | null;
+  consumption_id: string | null;
+  consumed_by_kind: string | null;
+  consumed_by_id: string | null;
+};
 
 // --- Plan dispatch (PLNR-170) -----------------------------------------------
 // "Dispatch a plan" = a durable orchestration record + a pump. The pump creates one
@@ -4525,6 +4543,143 @@ export class ProjectRoom extends DurableObject<Env> {
         rootRunId, attemptId: input.attemptId, executionId: execution.id,
       });
       return ack;
+    });
+  }
+
+  private missionHandoffIdentity(row: MissionHandoffRow): AcceptedRevisionHandoff {
+    return {
+      schemaVersion: 1,
+      handoffId: row.handoff_id,
+      backend: row.backend,
+      repositoryKey: row.repository_key,
+      checkpoint: row.checkpoint,
+      revision: row.revision,
+      reference: row.reference,
+    };
+  }
+
+  private missionHandoffView(row: MissionHandoffRow): AcceptedRevisionHandoffView {
+    return {
+      identity: this.missionHandoffIdentity(row),
+      state: row.consumed_at ? 'consumed_unlanded' : 'preserved_unlanded',
+      preservedAt: row.preserved_at,
+      consumedAt: row.consumed_at,
+      consumptionId: row.consumption_id,
+    };
+  }
+
+  /** Persist the exact successful-mission recovery artifact. This is deliberately not a landing
+   * transition: both states retain the `_unlanded` suffix, including after human consumption. */
+  async publishMissionHandoff(
+    projectId: string,
+    rootRunId: string,
+    reportId: string,
+    handoff: AcceptedRevisionHandoff,
+    lease: MissionLeaseRef,
+  ): Promise<MissionHandoffAck> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      if (!(await this.validateMissionLease(projectId, rootRunId, lease))) {
+        throw new Error('stale mission lease epoch');
+      }
+      const root = await this.env.DB.prepare(
+        `SELECT r.runner_id AS runnerId
+           FROM runs r JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
+          WHERE r.id = ? AND r.project_id = ? AND r.anchor_type = 'plan'
+            AND pd.strategy = 'single_root' AND r.runner_id IS NOT NULL`,
+      ).bind(rootRunId, projectId).first<{ runnerId: string }>();
+      if (!root) throw new Error('run is not a commissioned single_root mission');
+
+      RepositoryKey.parse(handoff.repositoryKey);
+      const identityHash = await sha256Hex(JSON.stringify(handoff));
+      const existing = await this.env.DB.prepare('SELECT * FROM mission_handoffs WHERE root_run_id = ?')
+        .bind(rootRunId).first<MissionHandoffRow>();
+      if (existing) {
+        if (existing.identity_hash !== identityHash) {
+          throw new Error('mission already preserves a conflicting accepted-revision handoff');
+        }
+        const view = this.missionHandoffView(existing);
+        return {
+          reportId, accepted: true, handoffId: handoff.handoffId, state: view.state,
+          preservedAt: view.preservedAt, consumedAt: view.consumedAt,
+          consumptionId: view.consumptionId, error: null,
+        };
+      }
+
+      const preservedAt = nowIso();
+      await this.env.DB.prepare(
+        `INSERT INTO mission_handoffs
+           (root_run_id, project_id, runner_id, handoff_id, backend, repository_key,
+            checkpoint, revision, reference, identity_hash, preserved_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        rootRunId, projectId, root.runnerId, handoff.handoffId, handoff.backend,
+        handoff.repositoryKey, handoff.checkpoint, handoff.revision, handoff.reference,
+        identityHash, preservedAt,
+      ).run();
+      await this.emit(SYSTEM_ACTOR, 'run.handoff_preserved', 'run', rootRunId, {
+        handoffId: handoff.handoffId, backend: handoff.backend,
+        repositoryKey: handoff.repositoryKey, state: 'preserved_unlanded',
+      });
+      return {
+        reportId, accepted: true, handoffId: handoff.handoffId,
+        state: 'preserved_unlanded', preservedAt, consumedAt: null,
+        consumptionId: null, error: null,
+      };
+    });
+  }
+
+  async getMissionHandoff(projectId: string, rootRunId: string): Promise<AcceptedRevisionHandoffView | null> {
+    await this.setPid(projectId);
+    const row = await this.env.DB.prepare(
+      'SELECT * FROM mission_handoffs WHERE root_run_id = ? AND project_id = ?',
+    ).bind(rootRunId, projectId).first<MissionHandoffRow>();
+    return row ? this.missionHandoffView(row) : null;
+  }
+
+  /** Authorized exact-consumption acknowledgement. A retry of the same complete identity returns
+   * the original durable acknowledgement; a stale or cross-mission identity fails closed. */
+  async consumeMissionHandoff(
+    projectId: string,
+    actor: Actor,
+    rootRunId: string,
+    expected: AcceptedRevisionHandoff,
+  ): Promise<{ handoff: AcceptedRevisionHandoffView; delivery: MissionHandoffConsumed }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const row = await this.env.DB.prepare(
+        'SELECT * FROM mission_handoffs WHERE root_run_id = ? AND project_id = ?',
+      ).bind(rootRunId, projectId).first<MissionHandoffRow>();
+      if (!row) throw new Error('mission handoff not found');
+      const expectedHash = await sha256Hex(JSON.stringify(expected));
+      if (row.identity_hash !== expectedHash) throw new Error('mission handoff identity mismatch');
+
+      if (!row.consumed_at) {
+        const consumedAt = nowIso();
+        const consumptionId = newId('hca');
+        await this.env.DB.prepare(
+          `UPDATE mission_handoffs
+              SET consumed_at = ?, consumption_id = ?, consumed_by_kind = ?, consumed_by_id = ?
+            WHERE root_run_id = ? AND consumed_at IS NULL`,
+        ).bind(consumedAt, consumptionId, actor.kind, actor.id, rootRunId).run();
+        row.consumed_at = consumedAt;
+        row.consumption_id = consumptionId;
+        row.consumed_by_kind = actor.kind;
+        row.consumed_by_id = actor.id;
+        await this.emit(actor, 'run.handoff_consumed', 'run', rootRunId, {
+          handoffId: row.handoff_id, consumptionId, state: 'consumed_unlanded',
+        });
+      }
+      const view = this.missionHandoffView(row);
+      return {
+        handoff: view,
+        delivery: {
+          runId: rootRunId,
+          handoff: view.identity,
+          consumptionId: view.consumptionId!,
+          consumedAt: view.consumedAt!,
+        },
+      };
     });
   }
 

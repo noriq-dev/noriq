@@ -4,12 +4,14 @@ import type { Actor } from './ProjectRoom';
 import {
   ORCHESTRATION_CAPABILITY,
   MISSION_CAPABILITY,
+  MISSION_HANDOFF_CAPABILITY,
   RunnerRepo,
   RunnerClientMessage,
   RUNNER_PROTOCOL_CAPABILITIES,
   RUNNER_PROTOCOL_VERSION,
   type ExecutionReportAck,
   type MissionAdoptionResult,
+  type MissionHandoffAck,
   type MissionLeaseRef,
   type MissionTaskAck,
   type RunnerProtocolCapability,
@@ -80,6 +82,24 @@ export class RunnerHub extends DurableObject<Env> {
     return { delivered };
   }
 
+  /** Capability-scoped fast path. Durable state remains the source of replay; this prevents an
+   * additive frame from being sent to an older socket that never negotiated its parser. */
+  async deliverCapability(
+    json: string,
+    capability: RunnerProtocolCapability,
+  ): Promise<{ delivered: boolean }> {
+    let delivered = false;
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        const auth = await this.authorizeSocket(ws);
+        if (!auth?.capabilities?.includes(capability)) continue;
+        ws.send(await this.messageForSocket(ws, json));
+        delivered = true;
+      } catch { /* socket gone */ }
+    }
+    return { delivered };
+  }
+
   override async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string) {
     if (typeof message !== 'string') return;
     const runnerId = await this.loadRunnerId();
@@ -107,6 +127,38 @@ export class RunnerHub extends DurableObject<Env> {
           type: 'registered', runnerId, protocol: RUNNER_PROTOCOL_VERSION,
           serverTime: new Date().toISOString(), acceptedCapabilities,
         }))) return;
+        // Consumption is a durable control-plane fact, not a best-effort notification. A Runner
+        // that missed the fast path receives every consumed handoff again after negotiating the
+        // additive capability; applying the stable consumptionId is idempotent daemon-side.
+        if (acceptedCapabilities.includes(MISSION_HANDOFF_CAPABILITY)) {
+          const { results: consumed } = await this.env.DB.prepare(
+            `SELECT root_run_id AS runId, project_id AS pid, handoff_id AS handoffId,
+                    backend, repository_key AS repositoryKey, checkpoint, revision, reference,
+                    consumption_id AS consumptionId, consumed_at AS consumedAt
+               FROM mission_handoffs
+              WHERE runner_id = ? AND consumed_at IS NOT NULL ORDER BY consumed_at`,
+          ).bind(runnerId).all<{
+            runId: string; pid: string; handoffId: string; backend: string; repositoryKey: string;
+            checkpoint: string; revision: string; reference: string;
+            consumptionId: string; consumedAt: string;
+          }>();
+          for (const item of consumed) {
+            if (!(await this.authorizeProject(ws, auth, item.pid))) return;
+            if (!this.sendIfOpen(ws, JSON.stringify({
+              type: 'mission.handoff.consumed',
+              consumed: {
+                runId: item.runId,
+                handoff: {
+                  schemaVersion: 1, handoffId: item.handoffId, backend: item.backend,
+                  repositoryKey: item.repositoryKey, checkpoint: item.checkpoint,
+                  revision: item.revision, reference: item.reference,
+                },
+                consumptionId: item.consumptionId,
+                consumedAt: item.consumedAt,
+              },
+            }))) return;
+          }
+        }
         // Redeliver Runs already dispatched to this runner but not yet started — they
         // may have been assigned while the socket was down (dispatch-before-connect).
         const { results } = await this.env.DB.prepare(
@@ -290,6 +342,27 @@ export class RunnerHub extends DurableObject<Env> {
         return;
       }
 
+      case 'mission.handoff.publish': {
+        if (!auth.capabilities?.includes(MISSION_HANDOFF_CAPABILITY)) return;
+        const pid = await this.authorizeMissionRun(ws, auth, runnerId, msg.runId);
+        if (!pid) return;
+        if (!(await this.missionFrameAccepted(auth, pid, msg.runId, msg.lease))) {
+          this.sendMissionHandoffAck(ws, this.rejectedMissionHandoffAck(
+            msg.publication.reportId, new Error('stale mission lease epoch'),
+          ));
+          return;
+        }
+        try {
+          const ack = await this.room(pid).publishMissionHandoff(
+            pid, msg.runId, msg.publication.reportId, msg.publication.handoff, msg.lease,
+          );
+          this.sendMissionHandoffAck(ws, ack);
+        } catch (error) {
+          this.sendMissionHandoffAck(ws, this.rejectedMissionHandoffAck(msg.publication.reportId, error));
+        }
+        return;
+      }
+
       case 'mission.reconcile': {
         if (!auth.capabilities?.includes(MISSION_CAPABILITY)) return;
         const results: MissionAdoptionResult[] = [];
@@ -438,6 +511,18 @@ export class RunnerHub extends DurableObject<Env> {
     return {
       reportId, attemptId, phase, accepted: false, taskId: null, claimId: null,
       executionId: null, taskStatus: null,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  private sendMissionHandoffAck(ws: WebSocket, ack: MissionHandoffAck): void {
+    this.sendIfOpen(ws, JSON.stringify({ type: 'mission.handoff.ack', ack }));
+  }
+
+  private rejectedMissionHandoffAck(reportId: string, error: unknown): MissionHandoffAck {
+    return {
+      reportId, accepted: false, handoffId: null, state: null, preservedAt: null,
+      consumedAt: null, consumptionId: null,
       error: error instanceof Error ? error.message : String(error),
     };
   }

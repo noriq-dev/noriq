@@ -358,6 +358,103 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
     resumed.close();
   });
 
+  it('persists exact mission handoffs and replays authorized consumption after reconnect (PLNR-488)', async () => {
+    const registration = {
+      runnerId,
+      label: 'ws-daemon', tools: ['claude'], kinds: ['build'], maxConcurrency: 2,
+      repos: [{
+        id: 'repo_x', projectKey: 'RWSP', repositoryKey: 'noriq',
+        workflows: [{
+          name: 'mission-plan', base: 'build', description: 'WS mission harness', capabilities: ['mission.v2'],
+        }],
+      }],
+      protocolCapabilities: ['mission.v2', 'mission.handoff.v1'],
+    };
+    expect((await SELF.fetch('https://noriq.test/api/runners', {
+      method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(registration),
+    })).status).toBe(200);
+    const owner = await env.DB.prepare('SELECT owner_user_id AS id FROM runners WHERE id = ?')
+      .bind(runnerId).first<{ id: string }>();
+    const actor: Actor = { kind: 'human', id: owner!.id, name: 'RWS Owner' };
+    const plan = await projectRoom().createPlan(pid, actor, {
+      title: `WS handoff ${crypto.randomUUID()}`,
+      phases: [{ title: 'build', newTasks: [{ title: 'mission child' }] }],
+    });
+
+    const first = await wsConnect(runnerId, { Authorization: `Bearer ${token}` });
+    const ws = first.webSocket!;
+    ws.accept();
+    const registeredP = nextFrame(ws, (m) => m.type === 'registered');
+    ws.send(JSON.stringify({
+      type: 'hello', protocol: 1, label: 'ws-daemon',
+      protocolCapabilities: ['mission.v2', 'mission.handoff.v1'],
+    }));
+    expect((await registeredP).acceptedCapabilities).toEqual(['mission.v2', 'mission.handoff.v1']);
+
+    const assignedP = nextFrame(ws, (m) => m.type === 'run.assigned' && m.missionLease);
+    await projectRoom().createPlanDispatch(pid, actor, {
+      planId: plan.id, runnerId, repoRef: 'repo_x', agentTool: 'claude',
+      strategy: 'single_root', workflow: 'mission-plan',
+    });
+    const assigned = await assignedP;
+    const handoff = {
+      schemaVersion: 1, handoffId: `handoff-${crypto.randomUUID()}`, backend: 'opaque-vcs',
+      repositoryKey: 'noriq', checkpoint: 'checkpoint-1', revision: 'revision-1', reference: 'reference-1',
+    };
+    const ackP = nextFrame(ws, (m) => m.type === 'mission.handoff.ack' && m.ack.reportId === 'publish-handoff');
+    ws.send(JSON.stringify({
+      type: 'mission.handoff.publish', runId: assigned.run.id, lease: assigned.missionLease,
+      publication: { reportId: 'publish-handoff', handoff },
+    }));
+    expect((await ackP).ack).toMatchObject({ accepted: true, state: 'preserved_unlanded' });
+
+    const read = await SELF.fetch(`https://noriq.test/api/runs/${assigned.run.id}/handoff`, {
+      headers: { Cookie: cookie },
+    });
+    expect(read.status).toBe(200);
+    expect(await read.json()).toMatchObject({ handoff: { identity: handoff, state: 'preserved_unlanded' } });
+
+    const stale = await SELF.fetch(`https://noriq.test/api/runs/${assigned.run.id}/handoff/consume`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...handoff, revision: 'stale-revision' }),
+    });
+    expect(stale.status).toBe(409);
+
+    const consumedP = nextFrame(ws, (m) => m.type === 'mission.handoff.consumed');
+    const consumed = await SELF.fetch(`https://noriq.test/api/runs/${assigned.run.id}/handoff/consume`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify(handoff),
+    });
+    expect(consumed.status).toBe(200);
+    const consumedBody = await consumed.json() as { handoff: { state: string; consumptionId: string } };
+    expect(consumedBody.handoff).toMatchObject({ state: 'consumed_unlanded', consumptionId: expect.any(String) });
+    expect((await consumedP).consumed).toMatchObject({
+      runId: assigned.run.id, handoff, consumptionId: consumedBody.handoff.consumptionId,
+    });
+
+    const replayResponse = await SELF.fetch(`https://noriq.test/api/runs/${assigned.run.id}/handoff/consume`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify(handoff),
+    });
+    expect((await replayResponse.json() as { handoff: { consumptionId: string } }).handoff.consumptionId)
+      .toBe(consumedBody.handoff.consumptionId);
+    ws.close();
+
+    const second = await wsConnect(runnerId, { Authorization: `Bearer ${token}` });
+    const resumed = second.webSocket!;
+    resumed.accept();
+    const replayP = nextFrame(resumed, (m) => m.type === 'mission.handoff.consumed');
+    resumed.send(JSON.stringify({
+      type: 'hello', protocol: 1, label: 'ws-daemon',
+      protocolCapabilities: ['mission.v2', 'mission.handoff.v1'],
+    }));
+    expect((await replayP).consumed).toMatchObject({
+      runId: assigned.run.id, consumptionId: consumedBody.handoff.consumptionId,
+    });
+    resumed.close();
+  });
+
   it('dispatch rejects a repoRef that does not resolve to the project', async () => {
     const res = await SELF.fetch(`https://noriq.test/api/projects/${pid}/runs`, {
       method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },

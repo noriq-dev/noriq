@@ -93,3 +93,32 @@ describe('mission task wire contract (PLNR-485)', () => {
     }).type).toBe('mission.reconcile.result');
   });
 });
+
+describe('mission accepted-revision handoff wire contract (PLNR-488)', () => {
+  it('keeps publication, acknowledgement, and consumption backend-neutral and exact', () => {
+    const now = new Date().toISOString();
+    const lease = { sitting: 1, executionId: 'exe_root', epoch: 1 };
+    const handoff = {
+      schemaVersion: 1, handoffId: 'handoff-1', backend: 'opaque-vcs',
+      repositoryKey: 'noriq', checkpoint: 'checkpoint-1', revision: 'revision-1',
+      reference: 'reference-1',
+    };
+    expect(RunnerClientMessage.parse({
+      type: 'mission.handoff.publish', runId: 'run_root', lease,
+      publication: { reportId: 'publish-1', handoff },
+    }).type).toBe('mission.handoff.publish');
+    expect(RunnerServerMessage.parse({
+      type: 'mission.handoff.ack',
+      ack: {
+        reportId: 'publish-1', accepted: true, handoffId: 'handoff-1',
+        state: 'preserved_unlanded', preservedAt: now, consumedAt: null,
+        consumptionId: null, error: null,
+      },
+    }).type).toBe('mission.handoff.ack');
+    expect(RunnerServerMessage.parse({
+      type: 'mission.handoff.consumed',
+      consumed: { runId: 'run_root', handoff, consumptionId: 'hca_1', consumedAt: now },
+    }).type).toBe('mission.handoff.consumed');
+    expect(JSON.stringify(handoff)).not.toMatch(/credential|command|localPath|mcp/i);
+  });
+});

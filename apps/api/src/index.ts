@@ -80,8 +80,8 @@ import { agentLifecycleSweepConfig, sweepAgentLifecycle, type AgentLifecycleCurs
 import { AGENT_LIFECYCLES, listAgentRoster, type AgentRosterLifecycle } from './lib/agent-roster';
 import { listRunnerRoster, RUNNER_HEARTBEAT_TTL_MS, RUNNER_LIFECYCLES, type RunnerRosterLifecycle } from './lib/runner-roster';
 import {
-  AgentTool, AdvertisedAgent, ExecutionProfileId, RunEffort, RunKind, RunnerRepo, RunBudget,
-  MISSION_CAPABILITY, ORCHESTRATION_CAPABILITY, RunnerProtocolCapability,
+  AcceptedRevisionHandoff, AgentTool, AdvertisedAgent, ExecutionProfileId, RunEffort, RunKind, RunnerRepo, RunBudget,
+  MISSION_CAPABILITY, MISSION_HANDOFF_CAPABILITY, ORCHESTRATION_CAPABILITY, RunnerProtocolCapability,
   RunnerExecutionDeclaration, RunnerExecutionEventReport, RunnerExecutionReconciliation,
   RunnerExecutionRelationReport, isTerminalRunStatus, normalizeProjectKey,
   IndexGenerationManifest, ContextPackRole, RunnerSpinoffTaskRequest, type RunnerIndexCursor,
@@ -4449,6 +4449,46 @@ app.get('/api/runs/:runId/log', userAuth, async (c) => {
   if (!(await reachesProject(c, run.pid))) return c.json({ error: 'not found' }, 404);
   const { segments } = await room(c.env, run.pid).getRunLog(run.pid, runId);
   return c.json({ segments });
+});
+
+// Accepted mission work is a separate durable fact from Run terminality and from landing. The
+// read uses explicit `*_unlanded` states so the UI cannot accidentally present preservation or
+// consumption as a merge/push/submission result.
+app.get('/api/runs/:runId/handoff', userAuth, async (c) => {
+  const runId = c.req.param('runId')!;
+  const run = await c.env.DB.prepare('SELECT project_id AS pid FROM runs WHERE id = ?')
+    .bind(runId).first<{ pid: string }>();
+  if (!run) return c.json({ error: 'run not found' }, 404);
+  if (!(await reachesProject(c, run.pid))) return c.json({ error: 'not found' }, 404);
+  return c.json({ handoff: await room(c.env, run.pid).getMissionHandoff(run.pid, runId) });
+});
+
+app.post('/api/runs/:runId/handoff/consume', userAuth, async (c) => {
+  const denied = demoDenied(c);
+  if (denied) return denied;
+  const runId = c.req.param('runId')!;
+  const parsed = AcceptedRevisionHandoff.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid mission handoff identity', detail: parsed.error.issues }, 400);
+  const run = await c.env.DB.prepare(
+    'SELECT project_id AS pid, runner_id AS runnerId FROM runs WHERE id = ?',
+  ).bind(runId).first<{ pid: string; runnerId: string | null }>();
+  if (!run) return c.json({ error: 'run not found' }, 404);
+  const actionDenied = await humanProjectActionDenied(c, run.pid, 'manage');
+  if (actionDenied) return actionDenied;
+  try {
+    const result = await room(c.env, run.pid).consumeMissionHandoff(
+      run.pid, humanActor(c), runId, parsed.data,
+    );
+    const delivered = run.runnerId
+      ? (await hub(c.env, run.runnerId).deliverCapability(
+          JSON.stringify({ type: 'mission.handoff.consumed', consumed: result.delivery }),
+          MISSION_HANDOFF_CAPABILITY,
+        )).delivered
+      : false;
+    return c.json({ handoff: result.handoff, delivered });
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 409);
+  }
 });
 
 // Cancel a Run (RUN-7): mark it cancelled in its project's authority and push
