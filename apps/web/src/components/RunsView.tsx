@@ -1,30 +1,23 @@
-// Runs — the execution plane (RUN-22). Registered runners self-report via the
-// daemon; dispatch a Run to an online runner that advertises a repo for THIS
-// project, then watch it here. Reads persisted Run state (REST snapshot + a
-// short poll) and reuses the store's WS-invalidate signal (store.snapshot) to
-// reload on project change. Live token/USD + log tail stream to the daemon and
-// are not persisted server-side yet — the view surfaces the budget envelope and
-// the terminal exit instead (see the note in the Runs header).
-import { UNATTRIBUTED_MODEL_ID } from '@noriq-dev/shared';
+// Runner Jobs — the minimal protocol-v2 control-plane surface. Noriq chooses only
+// the immutable task/plan target and a runner repository; the committed project
+// configuration remains the authority for models, workflows, budgets, and Git mode.
 import { useEffect, useMemo, useState } from 'react';
-import { advertisedWorkflow, api, type ApiRun, type ApiRunLogSegment, type ApiRunModelMix, type ApiRunner, type DispatchInput, type RunEffort, type RunStatus } from '../api';
+import {
+  api,
+  type ApiRun,
+  type ApiRunner,
+  type ApiRunnerJobDetail,
+  type ApiRunnerJobOutput,
+  type ApiRunnerJobSummary,
+  type RunnerJobStatus,
+  type RunStatus,
+} from '../api';
 import type { AppStore } from '../store';
-import { Markdown } from './Markdown';
-import { LiveDot, MonoTag, SectionLabel } from './bits';
-import { Button, ErrorNote, Field, Select, TextArea, TextInput } from './ui';
-import { alert, confirm, prompt } from './Dialog';
-import { DispatchIntelligencePanel } from './DispatchIntelligence';
-import { TaskSearchSelect } from './TaskSearchSelect';
+import { MonoTag, SectionLabel } from './bits';
+import { Button, ErrorNote, Field, Select, TextArea } from './ui';
+import { confirm } from './Dialog';
 
-function ago(iso: string | null): string {
-  if (!iso) return 'never';
-  const s = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
-  if (s < 90) return `${s}s ago`;
-  if (s < 5400) return `${Math.round(s / 60)}m ago`;
-  if (s < 129600) return `${Math.round(s / 3600)}h ago`;
-  return `${Math.round(s / 86400)}d ago`;
-}
-
+// Retained for the read-only legacy-history renderer and its regression test.
 export const RUN_STATUS_STYLE: Record<RunStatus, { color: string; bg: string; live?: boolean }> = {
   queued: { color: 'var(--text-mid)', bg: 'var(--w-06)' },
   dispatched: { color: 'var(--blue)', bg: 'rgba(76,157,255,.12)' },
@@ -36,791 +29,400 @@ export const RUN_STATUS_STYLE: Record<RunStatus, { color: string; bg: string; li
   cancelled: { color: 'var(--text-dim)', bg: 'var(--w-05)' },
 };
 
-const TERMINAL: RunStatus[] = ['done', 'gated', 'failed', 'cancelled'];
-const KINDS: Array<ApiRun['kind']> = ['scope', 'build', 'verify'];
-/** Tool-agnostic intent (RUN-33) — each driver maps it. Codex tops out at 'high' and clamps
- *  the last two; the daemon does that translation, so this list stays what we MEAN. */
-const EFFORTS: RunEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+export const JOB_STATUS_STYLE: Record<RunnerJobStatus, { color: string; bg: string }> = {
+  queued: { color: 'var(--text-mid)', bg: 'var(--w-06)' },
+  assigned: { color: 'var(--blue)', bg: 'rgba(76,157,255,.12)' },
+  running: { color: 'var(--green)', bg: 'rgba(63,217,139,.13)' },
+  waiting: { color: '#f5a623', bg: 'rgba(245,166,35,.14)' },
+  succeeded: { color: 'var(--green)', bg: 'rgba(63,217,139,.1)' },
+  partial: { color: '#f5a623', bg: 'rgba(245,166,35,.14)' },
+  failed: { color: 'var(--red-soft)', bg: 'rgba(255,92,92,.12)' },
+  cancelled: { color: 'var(--text-dim)', bg: 'var(--w-05)' },
+};
 
-// Build an agent coordinate the way the daemon's parser reads it (RUN-114): `<tool>.<model>.<effort>`,
-// with the model's own dots escaped to underscores so they don't read as segment separators
-// (`claude` + `opus-4.8` + `high` → `claude.opus-4_8.high`). Kept in lockstep with the runner's
-// escapeModel/formatCoordinate; the daemon still accepts the legacy triple, so this is a UI upgrade.
-function formatCoordinate(tool: string, model: string | null, effort: RunEffort | ''): string {
-  const m = model ? model.replaceAll('.', '_') : '';
-  if (effort) return `${tool}.${m}.${effort}`;
-  if (m) return `${tool}.${m}`;
-  return tool;
+const TERMINAL_JOBS: RunnerJobStatus[] = ['succeeded', 'partial', 'failed', 'cancelled'];
+
+function ago(iso: string | null): string {
+  if (!iso) return 'never';
+  const seconds = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+  if (seconds < 90) return `${seconds}s ago`;
+  if (seconds < 5400) return `${Math.round(seconds / 60)}m ago`;
+  if (seconds < 129600) return `${Math.round(seconds / 3600)}h ago`;
+  return `${Math.round(seconds / 86400)}d ago`;
 }
 
-/**
- * What the pill says (RUN-31). A running Run spends its last 60–90s in the verify gate and then
- * the landing rebase — agent process already gone, spend frozen — so a blanket "running" made a
- * gate doing its job read as a hung agent.
- *
- * This replaces the WORD, not the status: it stays styled live because it genuinely is live.
- * 'agent' gets no special label — "running" already means that to a reader.
- */
-const runLabel = (run: ApiRun): string =>
-  run.status === 'running' && run.phase && run.phase !== 'agent' ? run.phase : run.status;
-
-function fmtBudget(b: ApiRun['budget']): string {
-  const parts: string[] = [];
-  if (b.maxTokens) parts.push(`${(b.maxTokens / 1000).toLocaleString()}k tok`);
-  if (b.maxUsd) parts.push(`$${b.maxUsd}`);
-  if (b.maxDurationSeconds) parts.push(`${Math.round(b.maxDurationSeconds / 60)}m`);
-  return parts.length ? parts.join(' · ') : 'no ceiling';
+function shortSha(sha: string | null | undefined): string {
+  return sha ? sha.slice(0, 10) : '—';
 }
 
-const fmtTokens = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n));
-
-// "claude-opus-4-8" → "opus", "claude-haiku-4-5-20251001" → "haiku", "gpt-5.6-sol" → "gpt".
-const shortModel = (id: string): string => id.replace(/^claude-/, '').split(/[-.]/)[0] || id;
-
-// The model mix a run ACTUALLY spent (RUN-59/86): a share per model, each hovering a tooltip with
-// that model's raw tokens + dollars — so a run dispatched as opus that quietly spent 30% on haiku
-// shows it. Share is by WORK tokens (input+output), not cost: a codex session reports tokens but
-// NO cost, so a cost basis would render it as 0% — the token basis lets every contributor show,
-// and the tooltip still carries exact dollars for the models that have them. Spend that no driver
-// could attribute (codex, the claude usage-fallback) is folded into one UNATTRIBUTED bucket
-// (RUN-86) shown last, so the parts still sum to the run total. "not reported" survives for the
-// one honest case it names: a run that reported no spend at all.
-const workTokens = (m: ApiRunModelMix): number => m.inputTokens + m.outputTokens;
-
-function ModelMix({ usage }: { usage: ApiRun['modelUsage'] }) {
-  const entries = usage ? Object.entries(usage) : [];
-  if (!entries.length) return <span style={{ color: 'var(--text-faint)' }}>models not reported</span>;
-  const total = entries.reduce((s, [, m]) => s + workTokens(m), 0);
-  // Real models by work descending; the unattributed bucket is always pinned last.
-  const ordered = entries.sort((a, b) => {
-    if (a[0] === UNATTRIBUTED_MODEL_ID) return 1;
-    if (b[0] === UNATTRIBUTED_MODEL_ID) return -1;
-    return workTokens(b[1]) - workTokens(a[1]);
-  });
-  return (
-    <>
-      {ordered.map(([id, m], i) => {
-        const unattributed = id === UNATTRIBUTED_MODEL_ID;
-        const pct = total > 0 ? Math.round((workTokens(m) / total) * 100) : 0;
-        const title = unattributed
-          ? `${m.inputTokens.toLocaleString()} in · ${m.outputTokens.toLocaleString()} out tok\nper-model split unavailable (e.g. a codex reviewer); cost not reported`
-          : `${id}\n${m.inputTokens.toLocaleString()} in · ${m.outputTokens.toLocaleString()} out tok · $${m.costUSD.toFixed(4)}`;
-        return (
-          <span
-            key={id}
-            title={title}
-            style={{ color: unattributed ? 'var(--text-faint)' : 'var(--text-dim)' }}
-          >
-            {i > 0 ? ' · ' : ''}{unattributed ? 'unattributed' : shortModel(id)} {pct}%
-          </span>
-        );
-      })}
-    </>
-  );
-}
-
-// The live spend readout — tokens burned and USD, each against its ceiling when set.
-function fmtSpend(run: ApiRun): string | null {
-  const parts: string[] = [];
-  if (run.tokensUsed != null) parts.push(`${fmtTokens(run.tokensUsed)}${run.budget.maxTokens ? `/${fmtTokens(run.budget.maxTokens)}` : ''} tok`);
-  if (run.usdSpent != null) parts.push(`$${run.usdSpent.toFixed(2)}${run.budget.maxUsd ? `/$${run.budget.maxUsd}` : ''}`);
-  return parts.length ? parts.join(' · ') : null;
+function jobTarget(job: ApiRunnerJobSummary, store: AppStore): string {
+  if (job.sourceKind === 'task') {
+    const task = store.helpers.allTasksOf(store.currentPid).find((candidate) => candidate.id === job.sourceId);
+    return task ? `${task.key} · ${task.title}` : job.sourceId;
+  }
+  const plan = store.snapshot?.plans.find((candidate) => candidate.id === job.sourceId);
+  return plan?.title ?? job.sourceId;
 }
 
 export function RunsView({ store }: { store: AppStore }) {
   const pid = store.currentPid;
   const [runners, setRunners] = useState<ApiRunner[]>([]);
-  const [runs, setRuns] = useState<ApiRun[]>([]);
-  const [dispatchFor, setDispatchFor] = useState<string | null>(null); // runner id, or null
+  const [jobs, setJobs] = useState<ApiRunnerJobSummary[]>([]);
+  const [legacyRuns, setLegacyRuns] = useState<ApiRun[] | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<ApiRunnerJobDetail | null>(null);
+  const [showDispatch, setShowDispatch] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const load = async () => {
+    if (!pid) return;
     try {
-      const [rr, ru] = await Promise.all([api.runners({ view: 'active', projectId: pid, limit: 100 }), api.runs(pid)]);
-      setRunners(rr.runners);
-      setRuns(ru.runs);
-    } catch {
-      /* transient — the poll will retry */
+      const [runnerResult, jobResult] = await Promise.all([
+        api.runners({ view: 'active', projectId: pid, limit: 100 }),
+        api.runnerJobs(pid),
+      ]);
+      setRunners(runnerResult.runners);
+      setJobs(jobResult.jobs);
+      if (selectedId) setDetail(await api.runnerJob(pid, selectedId));
+      setError(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Unable to load Runner jobs');
     }
   };
+
   useEffect(() => {
     if (!pid) return;
     void load();
-    const iv = setInterval(() => void load(), 5000); // Runs are live; poll tighter than the roster
-    return () => clearInterval(iv);
+    const interval = setInterval(() => void load(), 5000);
+    return () => clearInterval(interval);
+    // Store snapshots change when the project event stream invalidates this read model.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pid, store.snapshot]); // reload on project switch + on any WS-driven store refresh
+  }, [pid, store.snapshot, selectedId]);
 
-  // A runner can serve this project only via a repo whose committed key resolved here.
-  const reposForPid = (r: ApiRunner) => r.repos.filter((repo) => repo.projectId === pid);
-  const canDispatch = (r: ApiRunner) => r.status === 'online' && r.freeSlots > 0 && reposForPid(r).length > 0;
-
-  const sortedRuns = useMemo(
-    () => [...runs].sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1)),
-    [runs],
+  const sortedJobs = useMemo(
+    () => [...jobs].sort((left, right) => right.createdAt.localeCompare(left.createdAt)),
+    [jobs],
   );
-  const liveRuns = sortedRuns.filter((r) => !TERMINAL.includes(r.status));
-
+  const liveCount = sortedJobs.filter((job) => !TERMINAL_JOBS.includes(job.status)).length;
   if (!pid) return null;
 
   return (
     <div style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: '18px 22px' }}>
-      <div style={{ maxWidth: 900, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 26 }}>
-        {/* ---- Runners roster ---- */}
+      <div style={{ maxWidth: 980, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 22 }}>
         <section>
-          <div style={{ display: 'flex', alignItems: 'center', marginBottom: 12 }}>
-            <SectionLabel>Runners · {runners.filter((r) => r.status === 'online').length} online</SectionLabel>
-            <div style={{ flex: 1 }} />
-            <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>
-              daemons self-register — run <span style={{ color: 'var(--text-soft)' }}>noriq-runner</span> on a machine
-            </span>
-          </div>
-
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {runners.map((r) => {
-              const repos = reposForPid(r);
-              const online = r.status === 'online';
-              const offboarded = r.status === 'offboarded';
-              const dot = offboarded ? '#ff5c5c' : online ? (r.freeSlots > 0 ? '#3fd98b' : '#f5a623') : '#6b7280';
-              return (
-                <div key={r.id}>
-                  <div
-                    className="hover-border"
-                    style={{
-                      display: 'flex', alignItems: 'center', gap: 12, padding: '13px 15px', borderRadius: 11,
-                      background: 'var(--w-02)', border: '1px solid var(--w-07)', opacity: online ? 1 : 0.55,
-                    }}
-                  >
-                    <span style={{ width: 10, height: 10, borderRadius: '50%', background: dot, flex: 'none' }} />
-                    <div style={{ minWidth: 0, flex: 1 }}>
-                      <div style={{ fontSize: 13.5, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 7 }}>
-                        {r.label}
-                        <MonoTag
-                          color={offboarded ? 'var(--red-soft)' : 'var(--text-mid)'}
-                          bg={offboarded ? 'rgba(255,92,92,.12)' : 'var(--w-05)'}
-                          size={9}
-                        >
-                          {r.status}
-                        </MonoTag>
-                        {r.capabilities.tools.map((t) => (
-                          <MonoTag key={t} color="var(--blue)" bg="rgba(76,157,255,.1)" size={9}>{t}</MonoTag>
-                        ))}
-                        {/* What code this box runs (RUN-36). You cannot support someone's
-                            install without knowing what they are running — and unknown is a
-                            different fact from old, so it says so rather than guessing.
-                            Whether it is CURRENT is the runner's business: it checks its own
-                            repo and says so on that box (RUN-37). */}
-                        <MonoTag color="var(--text-faint)" bg="var(--w-04)" size={9}>
-                          {r.version ? `v${r.version}` : 'version unknown'}
-                        </MonoTag>
-                      </div>
-                      <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', marginTop: 2 }}>
-                        {offboarded
-                          ? `offboarded ${ago(r.offboardedAt)} — token revoked`
-                          : `${r.freeSlots}/${r.capabilities.maxConcurrency} slots free · ${repos.length} repo${repos.length === 1 ? '' : 's'} here · heartbeat ${ago(r.lastHeartbeatAt)}`}
-                      </div>
-                    </div>
-                    {/* The kill switch (RUN-35). Confirmed, because it revokes a credential and
-                        fails live runs — and honest about its limit: it severs Noriq, it does not
-                        reach into the machine. */}
-                    {!offboarded && (
-                      <Button
-                        variant="danger"
-                        style={{ padding: '7px 12px', fontSize: 12 }}
-                        onClick={async () => {
-                          if (!(await confirm(
-                            `Offboard "${r.label}"?\n\nThis revokes its token: no dispatch, no MCP, and its live runs fail.\n\n` +
-                            'It does NOT stop the daemon touching that machine\'s repos — stop the process there too.',
-                          ))) return;
-                          const res = await api.offboardRunner(r.id);
-                          if (res.warning) await alert(res.warning);
-                          await load();
-                        }}
-                      >
-                        offboard
-                      </Button>
-                    )}
-                    <Button
-                      variant={dispatchFor === r.id ? 'ghost' : 'primary'}
-                      disabled={!canDispatch(r)}
-                      style={{ padding: '7px 14px', fontSize: 12 }}
-                      title={canDispatch(r) ? 'Dispatch a Run to this runner' : 'runner must be online, have a free slot, and advertise a repo for this project'}
-                      onClick={() => setDispatchFor(dispatchFor === r.id ? null : r.id)}
-                    >
-                      {dispatchFor === r.id ? 'cancel' : 'dispatch →'}
-                    </Button>
-                  </div>
-                  {dispatchFor === r.id && (
-                    <DispatchForm
-                      store={store}
-                      runner={r}
-                      pid={pid}
-                      onDone={() => {
-                        setDispatchFor(null);
-                        void load();
-                      }}
-                    />
-                  )}
-                </div>
-              );
-            })}
-            {!runners.length && (
-              <div style={{ padding: 40, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-dim)' }}>
-                no runners registered — start the Noriq Runner daemon on a machine with a checkout of this project
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', marginBottom: 12 }}>
+            <div>
+              <SectionLabel>Runner jobs · {liveCount} live</SectionLabel>
+              <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 4 }}>
+                Dispatch a task or plan. Agent routing, limits, checks, and Git behavior come from the repository.
               </div>
-            )}
+            </div>
+            <div style={{ flex: 1 }} />
+            <Button variant={showDispatch ? 'ghost' : 'primary'} onClick={() => setShowDispatch(!showDispatch)}>
+              {showDispatch ? 'close' : 'dispatch job'}
+            </Button>
           </div>
+          {showDispatch && (
+            <RunnerJobDispatchForm
+              store={store}
+              runners={runners}
+              onDone={async (jobId) => {
+                setShowDispatch(false);
+                setSelectedId(jobId);
+                await load();
+              }}
+            />
+          )}
+          {error && <ErrorNote>{error}</ErrorNote>}
         </section>
 
-        {/* ---- Runs ---- */}
-        <section>
-          <div style={{ display: 'flex', alignItems: 'center', marginBottom: 12 }}>
-            <SectionLabel>Runs · {liveRuns.length} live</SectionLabel>
-            <div style={{ flex: 1 }} />
-            <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>
-              live token/$ &amp; log tail stream to the daemon — the envelope &amp; exit show here
-            </span>
-          </div>
-
+        <section style={{ display: 'grid', gridTemplateColumns: 'minmax(300px, .9fr) minmax(0, 1.5fr)', gap: 14 }}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {sortedRuns.map((run) => (
-              <RunRow key={run.id} run={run} runner={runners.find((r) => r.id === run.runnerId) ?? null} onCancel={load} />
+            {sortedJobs.map((job) => (
+              <JobRow
+                key={job.id}
+                job={job}
+                title={jobTarget(job, store)}
+                selected={selectedId === job.id}
+                onClick={() => setSelectedId(job.id)}
+              />
             ))}
-            {!sortedRuns.length && (
-              <div style={{ padding: 40, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-dim)' }}>
-                no runs yet — dispatch one to a runner above
-              </div>
+            {!sortedJobs.length && (
+              <EmptyState>no Runner jobs yet</EmptyState>
             )}
           </div>
+          <div>
+            {detail ? (
+              <JobDetail
+                detail={detail}
+                onRefresh={load}
+                onCancel={async () => {
+                  if (!(await confirm('Cancel this Runner job? Accepted commits remain on its local output branch.'))) return;
+                  await api.cancelRunnerJob(pid, detail.job.id);
+                  await load();
+                }}
+              />
+            ) : (
+              <EmptyState>select a job to inspect its evidence and retained Git result</EmptyState>
+            )}
+          </div>
+        </section>
+
+        <section style={{ borderTop: '1px solid var(--w-06)', paddingTop: 14 }}>
+          <Button
+            variant="ghost"
+            onClick={async () => {
+              if (legacyRuns === null) setLegacyRuns((await api.runs(pid)).runs);
+              else setLegacyRuns(null);
+            }}
+          >
+            {legacyRuns === null ? 'show legacy Run history' : 'hide legacy Run history'}
+          </Button>
+          {legacyRuns !== null && <LegacyHistory runs={legacyRuns} />}
         </section>
       </div>
     </div>
   );
 }
 
-function RunRow({ run, runner, onCancel }: { run: ApiRun; runner: ApiRunner | null; onCancel: () => void }) {
-  const [killing, setKilling] = useState(false);
-  const [continuing, setContinuing] = useState(false);
-  const [showLog, setShowLog] = useState(false);
-  const st = RUN_STATUS_STYLE[run.status];
-  const repo = runner?.repos.find((r) => r.id === run.repoRef);
-  const terminal = TERMINAL.includes(run.status);
-  const spend = fmtSpend(run);
-  // Continue is only meaningful for a gate-failed BUILD run whose kept worktree is still reachable:
-  // the same runner must be online and still advertise this repo (the worktree lives on that box).
-  const canContinue = (run.status === 'failed' || run.status === 'gated') && run.kind === 'build';
-  const continueReady = canContinue && runner?.status === 'online' && !!runner.repos.find((r) => r.id === run.repoRef);
-
-  return (
-    <div
-      className="hover-border"
-      style={{
-        display: 'flex', alignItems: 'flex-start', gap: 12, padding: '13px 15px', borderRadius: 11,
-        background: 'var(--w-02)', border: '1px solid var(--w-07)',
-      }}
-    >
-      <span
-        style={{
-          display: 'inline-flex', alignItems: 'center', gap: 6, flex: 'none', marginTop: 1,
-          fontFamily: 'var(--mono)', fontSize: 10, fontWeight: 700, letterSpacing: '.04em', textTransform: 'uppercase',
-          color: st.color, background: st.bg, padding: '3px 8px', borderRadius: 6, minWidth: 78, justifyContent: 'center',
-        }}
-      >
-        {st.live && <LiveDot color={st.color} size={5} />}
-        {runLabel(run)}
-      </span>
-
-      <div style={{ minWidth: 0, flex: 1 }}>
-        <div style={{ fontSize: 13, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' }}>
-          <MonoTag color="var(--accent-ink)" bg="rgba(198,242,78,.12)" size={9}>{run.kind}</MonoTag>
-          {/* A custom workflow (RUN-121) ran under `kind`'s posture but its own prompt — worth
-              showing, since two runs of the same kind can be very different work. */}
-          {run.workflow && <MonoTag color="var(--purple)" bg="rgba(167,139,250,.12)" size={9}>{run.workflow}</MonoTag>}
-          {run.executionProfile && <MonoTag color="var(--cyan)" bg="rgba(34,211,238,.10)" size={9}>profile {run.executionProfile.id}</MonoTag>}
-          <MonoTag color="var(--blue)" bg="rgba(76,157,255,.1)" size={9}>{run.agentTool}</MonoTag>
-          <span style={{ color: 'var(--text-soft)' }}>{repo?.name ?? run.repoRef}</span>
-          {run.anchor && (
-            <MonoTag color="var(--text-mid)" bg="var(--w-05)" size={9}>
-              {run.anchor.type === 'task' ? `task ${run.anchor.taskId.slice(-6)}` : `plan ${run.anchor.planId.slice(-6)}`}
-            </MonoTag>
-          )}
-          {/* Spin-off volume (PLNR-230): how many tasks this run filed as adjacent work — the
-              guard that makes ten spin-offs dodging ten findings visible at a glance. */}
-          {(run.spinoffs ?? 0) > 0 && (
-            <MonoTag color="var(--amber)" bg="rgba(245,166,35,.12)" size={9}>
-              ⑂ {run.spinoffs} spin-off{run.spinoffs === 1 ? '' : 's'}
-            </MonoTag>
-          )}
-        </div>
-        {run.brief && (
-          <div style={{ fontSize: 12, color: 'var(--text-mid)', marginTop: 4, lineHeight: 1.45, overflow: 'hidden', textOverflow: 'ellipsis', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
-            {run.brief}
-          </div>
-        )}
-        <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)', marginTop: 5, display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
-          {spend
-            ? <span style={{ color: st.live ? 'var(--text-soft)' : 'var(--text-dim)' }}>spent {spend}</span>
-            : <span>budget {fmtBudget(run.budget)}</span>}
-          {spend && <span>· <ModelMix usage={run.modelUsage} /></span>}
-          <span>· {ago(run.startedAt ?? run.dispatchedAt ?? run.createdAt)}</span>
-          {run.worktreePath && <span title={run.worktreePath}>· ⌥ {run.worktreePath.split('/').slice(-2).join('/')}</span>}
-          <button
-            onClick={() => setShowLog((s) => !s)}
-            style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-mid)', background: 'var(--w-05)', border: '1px solid var(--w-08)', borderRadius: 5, padding: '1px 7px' }}
-          >
-            {showLog ? '▾ transcript' : '▸ transcript'}
-          </button>
-        </div>
-        {showLog && <RunTranscript run={run} live={!terminal} />}
-        {terminal && run.exit && (
-          <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: st.color, marginTop: 5 }}>
-            exit: {run.exit.outcome}
-            {run.exit.signal ? ` · ${run.exit.signal}` : ''}
-            {run.exit.code !== null && run.exit.code !== undefined ? ` · code ${run.exit.code}` : ''}
-            {run.exit.reason ? ` — ${run.exit.reason}` : ''}
-          </div>
-        )}
-      </div>
-
-      {!terminal && (
-        <Button
-          variant="danger"
-          disabled={killing}
-          style={{ padding: '5px 12px', fontSize: 11, flex: 'none' }}
-          onClick={async () => {
-            if (!(await confirm('Kill this Run? The daemon SIGTERMs the agent process; work so far stays on its branch.'))) return;
-            setKilling(true);
-            try {
-              await api.cancelRun(run.id, 'cancelled from dashboard');
-              onCancel();
-            } finally {
-              setKilling(false);
-            }
-          }}
-        >
-          {killing ? '…' : 'kill'}
-        </Button>
-      )}
-
-      {canContinue && (
-        <Button
-          variant="primary"
-          disabled={continuing || !continueReady}
-          style={{ padding: '5px 12px', fontSize: 11, flex: 'none' }}
-          title={continueReady
-            ? 'Re-open this run with more reviewer rounds — the daemon picks up from its kept worktree'
-            : "the run's runner must be online and still advertise this repo — its kept worktree lives on that machine"}
-          onClick={async () => {
-            const ans = await prompt(
-              `Continue this ${run.status} run with how many more reviewer rounds? Leave blank for the repo’s default.`,
-              '',
-              { title: 'Continue run', placeholder: 'e.g. 3' },
-            );
-            if (ans === null) return; // cancelled the dialog
-            const trimmed = ans.trim();
-            let rounds: number | null = null;
-            if (trimmed) {
-              const n = Number(trimmed);
-              if (!Number.isInteger(n) || n < 1) { await alert('Rounds must be a positive whole number.'); return; }
-              rounds = n;
-            }
-            setContinuing(true);
-            try {
-              const { delivered } = await api.continueRun(run.id, rounds);
-              if (!delivered) {
-                await alert('Re-opened — but the runner’s socket didn’t take the frame just now; it will pick the run up on its next reconnect.');
-              }
-              onCancel();
-            } catch (e) {
-              await alert(String(e instanceof Error ? e.message : e));
-            } finally {
-              setContinuing(false);
-            }
-          }}
-        >
-          {continuing ? '…' : 'continue →'}
-        </Button>
-      )}
-    </div>
-  );
-}
-
-/** Who said each part of the transcript (RUN-74). `agent` is labeled by the run's own kind. */
-const ROLE_STYLE: Record<string, { color: string; bg: string }> = {
-  agent: { color: 'var(--blue)', bg: 'rgba(76,157,255,.1)' },
-  reviewer: { color: '#f5a623', bg: 'rgba(245,166,35,.14)' },
-  verify: { color: 'var(--green)', bg: 'rgba(63,217,139,.1)' },
-  system: { color: 'var(--text-dim)', bg: 'var(--w-05)' },
-};
-
-/**
- * The run's transcript stream (RUN-74): build → reviewer round 1 → fix → reviewer round 2 → …
- * Exists because the old log box showed only the core agent's tail — after a reviewer
- * refusal, the WHY was invisible. Falls back to logTail for runs predating segments.
- */
-function RunTranscript({ run, live }: { run: ApiRun; live: boolean }) {
-  const [segments, setSegments] = useState<ApiRunLogSegment[] | null>(null);
-  useEffect(() => {
-    let stop = false;
-    const load = async () => {
-      try {
-        const { segments } = await api.runLog(run.id);
-        if (!stop) setSegments(segments);
-      } catch {
-        /* transient — poll retries */
-      }
-    };
-    void load();
-    if (!live) return;
-    const iv = setInterval(() => void load(), 5000);
-    return () => {
-      stop = true;
-      clearInterval(iv);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [run.id, live]);
-
-  // Merge consecutive segments from the same voice into one block, so the stream reads as
-  // turns, not as the daemon's flush cadence.
-  // A STEP boundary breaks a block even when the voice is unchanged (RUN-150): two consecutive
-  // `agent` blocks from different steps are two different sessions with different context, and
-  // merging them would render a chain as the single long stream it exists not to be.
-  const blocks: Array<{ role: string; round: number | null; step: string | null; text: string }> = [];
-  for (const s of segments ?? []) {
-    const last = blocks.at(-1);
-    if (last && last.role === s.role && last.round === s.round && last.step === (s.step ?? null)) {
-      last.text += s.text;
-    } else {
-      blocks.push({ role: s.role, round: s.round, step: s.step ?? null, text: s.text });
-    }
-  }
-
-  if (!blocks.length) {
-    // Nothing streamed (old daemon, or nothing said yet) — the rolling tail is still honest.
-    if (!run.logTail) return null;
-    return (
-      <div style={{ margin: '8px 0 2px', padding: '9px 11px', borderRadius: 8, maxHeight: 220, overflow: 'auto', background: 'var(--bg)', border: '1px solid var(--w-07)', fontSize: 11.5, wordBreak: 'break-word' }}>
-        <Markdown source={run.logTail} compact breaks />
-      </div>
-    );
-  }
-
-  return (
-    <div style={{ margin: '8px 0 2px', maxHeight: 380, overflow: 'auto', display: 'flex', flexDirection: 'column', gap: 6 }}>
-      {blocks.map((b, i) => {
-        const st = ROLE_STYLE[b.role] ?? ROLE_STYLE.system!;
-        // The step rides ALONGSIDE the voice rather than replacing it — a chain's step three can
-        // still be on its second reviewer round, and one label could not say which.
-        const voice =
-          b.role === 'agent' ? run.kind
-          : b.role === 'reviewer' ? `reviewer${b.round ? ` · round ${b.round}` : ''}`
-          : b.role === 'verify' ? 'verify cmd'
-          : 'runner';
-        const label = b.step ? `${voice} · ${b.step}` : voice;
-        return (
-          // biome-ignore lint/suspicious/noArrayIndexKey: blocks are append-only and stable by position
-          <div key={i} style={{ borderRadius: 8, background: 'var(--bg)', border: '1px solid var(--w-07)' }}>
-            <div style={{ padding: '5px 10px 0' }}>
-              <span
-                style={{
-                  fontFamily: 'var(--mono)', fontSize: 9, fontWeight: 700, letterSpacing: '.05em', textTransform: 'uppercase',
-                  color: st.color, background: st.bg, padding: '2px 7px', borderRadius: 5,
-                }}
-              >
-                {label}
-              </span>
-            </div>
-            <div style={{ padding: '4px 11px 9px', fontSize: 11.5, wordBreak: 'break-word' }}>
-              {/* Streamed conversational output — one newline = one line break (PLNR-172). */}
-              <Markdown source={b.text} compact breaks />
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-function DispatchForm({
+function RunnerJobDispatchForm({
   store,
-  runner,
-  pid,
+  runners,
   onDone,
 }: {
   store: AppStore;
-  runner: ApiRunner;
-  pid: string;
-  onDone: () => void;
+  runners: ApiRunner[];
+  onDone: (jobId: string) => Promise<void>;
 }) {
-  const repos = runner.repos.filter((r) => r.projectId === pid);
-  const kinds = KINDS.filter((k) => runner.capabilities.kinds.includes(k));
-  const tools = runner.capabilities.tools;
-  // The coordinate catalog (RUN-115): what the model/effort pickers suggest. Absent on a runner
-  // that registered before it existed — then the model stays free-text and effort offers them all.
-  const catalog = runner.capabilities.agents ?? [];
-
+  const pid = store.currentPid;
+  const candidates = runners.filter((runner) => runner.status === 'online' && runner.repos.some((repo) => repo.projectId === pid));
+  const [kind, setKind] = useState<'task' | 'plan'>('task');
+  const [targetId, setTargetId] = useState('');
+  const [runnerId, setRunnerId] = useState(candidates[0]?.id ?? '');
+  const runner = candidates.find((candidate) => candidate.id === runnerId) ?? null;
+  const repos = runner?.repos.filter((repo) => repo.projectId === pid) ?? [];
   const [repoRef, setRepoRef] = useState(repos[0]?.id ?? '');
-  // The board lock (RUN-71): a locked repo's anchor list shows its own board's tasks —
-  // anchoring it to work that lives elsewhere is almost always a mis-click, and the lock
-  // exists precisely so this repo's work stays on its board.
-  const lockedBoard = repos.find((r) => r.id === repoRef)?.boardId ?? null;
-  const tasks = store.helpers.tasksOf(pid).filter((t) => !lockedBoard || t.boardId === lockedBoard);
-  const [kind, setKind] = useState<ApiRun['kind']>(kinds[0] ?? 'build');
-  const [agentTool, setAgentTool] = useState(tools[0] ?? '');
-  const [brief, setBrief] = useState('');
-  const [anchorTask, setAnchorTask] = useState(''); // '' = no anchor
-  const [targetBranch, setTargetBranch] = useState(''); // '' = the repo's own choice (RUN-41)
-  // '' = don't override (RUN-33): the repo's [defaults] for this kind, then the tool's own.
-  const [model, setModel] = useState('');
-  const [effort, setEffort] = useState<RunEffort | ''>('');
-  // '' = the built-in for `kind`; a custom workflow name (RUN-121) overrides only the prompt.
-  const [workflow, setWorkflow] = useState('');
-  const [executionProfileId, setExecutionProfileId] = useState('');
-  const [missionMode, setMissionMode] = useState<'ordinary' | 'task_root'>('ordinary');
-  const [maxUsd, setMaxUsd] = useState('');
-  const [maxTokens, setMaxTokens] = useState('');
-  const [maxMinutes, setMaxMinutes] = useState('');
   const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const tasks = store.helpers.allTasksOf(pid).filter((task) => task.status === 'todo' || task.status === 'failed');
+  const plans = (store.snapshot?.plans ?? []).filter((plan) => !plan.archivedAt && plan.status !== 'proposed');
 
-  // A repository board lock changes the legal anchor set, so an anchor selected for the
-  // previous repository must not silently survive the switch.
-  useEffect(() => { setAnchorTask(''); }, [lockedBoard]);
-
-  // The selected tool's coordinate menu (RUN-115): model suggestions + the efforts it distinguishes
-  // (codex collapses xhigh/max into its own 'high', so it advertises fewer). Empty menu → free-text
-  // model and all five efforts, exactly as before the catalog existed.
-  const agentMenu = catalog.find((a) => a.tool === agentTool);
-  const modelSuggestions = agentMenu?.models ?? [];
-  const effortOptions = agentMenu?.efforts?.length ? agentMenu.efforts : EFFORTS;
-  // The selected repo's custom workflows (RUN-121/PLNR-240); the three built-ins are always
-  // implicit. Normalized: a bare name (pre-PLNR-240 daemon) has no known base or description.
-  const repoWorkflows = (repos.find((r) => r.id === repoRef)?.workflows ?? []).map(advertisedWorkflow);
-  const executionProfiles = repos.find((r) => r.id === repoRef)?.executionProfiles ?? [];
-  const selectedWorkflow = repoWorkflows.find((candidate) => candidate.name === workflow);
-  const selectedProfile = executionProfiles.find((candidate) => candidate.id === executionProfileId);
-  const taskMissionEligible = anchorTask && kind === 'build'
-    && selectedWorkflow?.base === 'build' && selectedWorkflow.capabilities.includes('mission.v2')
-    && selectedProfile?.resolution === 'resolved' && selectedProfile.health === 'healthy'
-    && selectedProfile.attestationCapable && Boolean(selectedProfile.effectiveFingerprint);
-
-  // A custom workflow belongs to one repo — drop the choice when the repo changes.
-  useEffect(() => { setWorkflow(''); setExecutionProfileId(''); setMissionMode('ordinary'); }, [repoRef]);
   useEffect(() => {
-    if (!taskMissionEligible) setMissionMode('ordinary');
-  }, [taskMissionEligible]);
-  // Selecting a workflow whose base is advertised (PLNR-240) sets `kind` to that posture —
-  // the operator no longer has to know it. A bare-name advertisement changes nothing.
-  const pickWorkflow = (name: string) => {
-    setWorkflow(name);
-    const base = repoWorkflows.find((w) => w.name === name)?.base;
-    if (base && kinds.includes(base)) setKind(base);
-  };
-  // Drop an effort the newly-selected tool does not advertise (e.g. xhigh/max after switching to
-  // codex), so the field never shows a value the picker no longer offers.
+    const selected = candidates.find((candidate) => candidate.id === runnerId);
+    setRepoRef(selected?.repos.find((repo) => repo.projectId === pid)?.id ?? '');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runnerId, pid]);
   useEffect(() => {
-    const efforts = runner.capabilities.agents?.find((a) => a.tool === agentTool)?.efforts;
-    if (efforts?.length) setEffort((e) => (e && !efforts.includes(e) ? '' : e));
-  }, [agentTool, runner.capabilities.agents]);
-
-  const num = (s: string): number | null => {
-    const n = Number(s.trim());
-    return s.trim() && Number.isFinite(n) && n > 0 ? n : null;
-  };
+    setTargetId(kind === 'task' ? (tasks[0]?.id ?? '') : (plans[0]?.id ?? ''));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [kind]);
 
   const submit = async () => {
-    setErr(null);
-    if (!repoRef) return setErr('pick a repo');
-    if (!kind) return setErr('this runner advertises no run kinds');
-    if (!agentTool) return setErr('this runner advertises no agent tools');
-    if (!brief.trim() && !anchorTask) return setErr('give a brief or anchor to a task');
-    if (missionMode === 'task_root' && !taskMissionEligible) return setErr('task mission requires an anchor, mission.v2 build workflow, and exact healthy attested profile');
-    const body: DispatchInput = {
-      runnerId: runner.id,
-      kind,
-      agentTool,
-      repoRef,
-      brief: brief.trim(),
-      anchor: anchorTask ? { type: 'task', id: anchorTask } : null,
-      // Empty = don't override. Sending '' would be an override to a branch named "".
-      targetBranch: targetBranch.trim() || null,
-      // Same rule (RUN-33): blank means "whatever the repo/tool would have picked", so it must
-      // travel as null. Sending '' would be a request for a model named "".
-      model: model.trim() || null,
-      effort: effort || null,
-      // The agent COORDINATE (RUN-114), emitted alongside the triple during the deprecation window:
-      // the daemon prefers it when set and falls back to the triple otherwise. Only sent when a
-      // model or effort is actually pinned — a bare-tool coordinate carries nothing the triple lacks.
-      agent: model.trim() || effort ? formatCoordinate(agentTool, model.trim() || null, effort) : null,
-      // A custom workflow (RUN-121/PLNR-240). Guarded to the repo's advertised set — the server
-      // refuses an unadvertised name outright rather than silently running the built-in.
-      workflow: repoWorkflows.some((w) => w.name === workflow) ? workflow : null,
-      missionMode: missionMode === 'task_root' ? 'task_root' : null,
-      executionProfileId: executionProfiles.some((profile) => profile.id === executionProfileId)
-        ? executionProfileId
-        : null,
-      budget: { maxUsd: num(maxUsd), maxTokens: num(maxTokens), maxDurationSeconds: maxMinutes.trim() ? (num(maxMinutes) ?? 0) * 60 : null },
-    };
+    if (!runnerId || !repoRef || !targetId) return setError('Select a target, runner, and repository.');
     setBusy(true);
+    setError(null);
     try {
-      await api.dispatchRun(pid, body);
-      onDone();
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : 'dispatch failed');
+      const result = kind === 'task'
+        ? await api.dispatchTaskJob(pid, targetId, { runnerId, repoRef })
+        : await api.dispatchPlanJob(pid, targetId, { runnerId, repoRef });
+      await onDone(result.job.id);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Dispatch failed');
     } finally {
       setBusy(false);
     }
   };
 
   return (
-    <div style={{ margin: '6px 0 2px', padding: '15px 16px', borderRadius: 11, background: 'var(--w-04)', border: '1px solid var(--w-1)' }}>
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
-        <Field label="repo">
-          <Select value={repoRef} onChange={(e) => setRepoRef(e.target.value)}>
-            {repos.map((r) => (
-              <option key={r.id} value={r.id}>
-                {r.name || r.projectKey}{r.defaultBranch ? ` (${r.defaultBranch})` : ''}{r.board ? ` · board ${r.board}` : ''}
+    <div style={{ padding: 15, marginBottom: 16, borderRadius: 11, background: 'var(--w-03)', border: '1px solid var(--w-08)' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))', gap: 12 }}>
+        <Field label="source">
+          <Select value={kind} onChange={(event) => setKind(event.target.value as 'task' | 'plan')}>
+            <option value="task">individual task</option>
+            <option value="plan">entire plan</option>
+          </Select>
+        </Field>
+        <Field label={kind}>
+          <Select value={targetId} onChange={(event) => setTargetId(event.target.value)}>
+            {(kind === 'task' ? tasks : plans).map((target) => (
+              <option key={target.id} value={target.id}>
+                {'key' in target ? `${target.key} · ${target.title}` : target.title}
               </option>
             ))}
           </Select>
         </Field>
-        <Field label="branch (optional)">
-          {/* Blank = wherever the repo lands runs by default — its working branch, or the
-              per-plan one (RUN-28). Naming something else only works if the repo opted in via
-              [land].allowedBranches; the daemon refuses otherwise rather than quietly using the
-              default, since silently landing an agent's diff somewhere nobody asked for is how it
-              ends up somewhere nobody looks. */}
-          <TextInput
-            value={targetBranch}
-            onChange={(e: React.ChangeEvent<HTMLInputElement>) => setTargetBranch(e.target.value)}
-            placeholder="repo default"
-          />
-        </Field>
-        <Field label="kind">
-          <Select value={kind} onChange={(e) => setKind(e.target.value as ApiRun['kind'])}>
-            {kinds.map((k) => <option key={k} value={k}>{k}</option>)}
+        <Field label="runner">
+          <Select value={runnerId} onChange={(event) => setRunnerId(event.target.value)}>
+            {candidates.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.label}</option>)}
+            {!candidates.length && <option value="">— no protocol-v2 runner online —</option>}
           </Select>
         </Field>
-        <Field label="agent">
-          <Select value={agentTool} onChange={(e) => setAgentTool(e.target.value)}>
-            {tools.map((t) => <option key={t} value={t}>{t}</option>)}
-          </Select>
-        </Field>
-        <Field label="model (optional)">
-          {/* Free text, not a dropdown: model names belong to the vendor and change constantly,
-              so a hardcoded list would go stale and would reject a model the operator's own CLI
-              supports. The tool's advertised catalog (RUN-115) is offered as datalist SUGGESTIONS,
-              never a whitelist. Blank = the repo's [defaults] for this kind, then the tool's own. */}
-          <TextInput
-            value={model}
-            onChange={(e: React.ChangeEvent<HTMLInputElement>) => setModel(e.target.value)}
-            placeholder="repo default"
-            list={modelSuggestions.length ? `models-${runner.id}` : undefined}
-          />
-          {modelSuggestions.length > 0 && (
-            <datalist id={`models-${runner.id}`}>
-              {modelSuggestions.map((m) => <option key={m} value={m} />)}
-            </datalist>
-          )}
-        </Field>
-        <Field label="effort (optional)">
-          <Select value={effort} onChange={(e) => setEffort(e.target.value as RunEffort | '')}>
-            <option value="">repo default</option>
-            {effortOptions.map((x) => <option key={x} value={x}>{x}</option>)}
+        <Field label="repository">
+          <Select value={repoRef} onChange={(event) => setRepoRef(event.target.value)}>
+            {repos.map((repo) => <option key={repo.id} value={repo.id}>{repo.name || repo.projectKey}</option>)}
           </Select>
         </Field>
       </div>
-
-      {/* A repo-defined workflow (RUN-121/PLNR-240): a named variant of a run kind. Only shown
-          when the selected repo advertises any — the built-ins need no picker. Picking one whose
-          base is advertised sets `kind` to that posture automatically; a bare-name entry (older
-          daemon) still needs the operator to set kind to its base by hand. */}
-      {repoWorkflows.length > 0 && (
-        <Field label="workflow (optional)" hint={`runs under the "${kind}" posture${workflow && !repoWorkflows.find((w) => w.name === workflow)?.base ? ' — set kind to its base' : ''}`}>
-          <Select value={workflow} onChange={(e) => pickWorkflow(e.target.value)}>
-            <option value="">— built-in {kind} —</option>
-            {repoWorkflows.map((w) => (
-              <option key={w.name} value={w.name} title={w.description ?? undefined}>
-                {w.name}{w.base ? ` (${w.base})` : ''}{w.description ? ` — ${w.description.slice(0, 60)}` : ''}
-              </option>
-            ))}
-          </Select>
-        </Field>
-      )}
-
-      {executionProfiles.length > 0 && (
-        <Field label="execution profile (optional)" hint="opaque machine-local resource environment">
-          <Select value={executionProfileId} onChange={(e) => setExecutionProfileId(e.target.value)}>
-            <option value="">— runner default —</option>
-            {executionProfiles.map((profile) => (
-              <option key={profile.id} value={profile.id}>
-                {profile.id} · {profile.resolution}/{profile.health} · {profile.capacity.freeSlots}/{profile.capacity.maxConcurrency} slots
-              </option>
-            ))}
-          </Select>
-        </Field>
-      )}
-
-      {taskMissionEligible && (
-        <Field label="execution mode" hint="task mission adds durable lease and restart adoption">
-          <Select value={missionMode} onChange={(e) => setMissionMode(e.target.value as 'ordinary' | 'task_root')}>
-            <option value="ordinary">ordinary task run (default)</option>
-            <option value="task_root">task-root Runner mission</option>
-          </Select>
-        </Field>
-      )}
-
-      <Field label="brief" hint="what this Run should do (or anchor to a task below)">
-        <TextArea value={brief} onChange={(e) => setBrief(e.target.value)} placeholder="e.g. implement the RunsView dispatch form and verify with tsc + tests" />
-      </Field>
-
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 12 }}>
-        <Field label="anchor task" hint="optional">
-          <TaskSearchSelect
-            projectId={pid}
-            boardId={lockedBoard}
-            value={anchorTask}
-            onChange={setAnchorTask}
-            initialTasks={tasks}
-            label="Anchor task"
-          />
-        </Field>
-        <Field label="max $" hint="optional">
-          <TextInput value={maxUsd} onChange={(e) => setMaxUsd(e.target.value)} inputMode="decimal" placeholder="—" />
-        </Field>
-        <Field label="max tokens" hint="optional">
-          <TextInput value={maxTokens} onChange={(e) => setMaxTokens(e.target.value)} inputMode="numeric" placeholder="—" />
-        </Field>
-        <Field label="max minutes" hint="optional">
-          <TextInput value={maxMinutes} onChange={(e) => setMaxMinutes(e.target.value)} inputMode="numeric" placeholder="—" />
-        </Field>
-      </div>
-
-      {anchorTask && <DispatchIntelligencePanel
-        expanded
-        includeComparison
-        pid={pid}
-        taskId={anchorTask}
-        runnerId={runner.id}
-        repositoryCheckoutId={repoRef || null}
-        branch={targetBranch.trim() || null}
-        budget={{
-          maxUsd: num(maxUsd), maxTokens: num(maxTokens),
-          maxDurationSeconds: maxMinutes.trim() ? (num(maxMinutes) ?? 0) * 60 : null,
-          maxRounds: null,
-        }}
-      />}
-
-      {err && <ErrorNote>{err}</ErrorNote>}
-
-      <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
-        <Button variant="primary" disabled={busy} onClick={submit} style={{ padding: '8px 18px' }}>
-          {busy ? 'dispatching…' : 'dispatch Run'}
+      <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginTop: 12 }}>
+        <Button variant="primary" disabled={busy || !targetId || !runnerId || !repoRef} onClick={submit}>
+          {busy ? 'dispatching…' : `dispatch ${kind}`}
         </Button>
-        <span style={{ flex: 1 }} />
-        <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)', alignSelf: 'center' }}>
-          → {runner.label}
+        <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>
+          Only runnerId and repoRef cross the control-plane boundary.
         </span>
       </div>
+      {error && <ErrorNote>{error}</ErrorNote>}
+    </div>
+  );
+}
+
+function JobRow({ job, title, selected, onClick }: { job: ApiRunnerJobSummary; title: string; selected: boolean; onClick: () => void }) {
+  const style = JOB_STATUS_STYLE[job.status];
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      style={{
+        width: '100%', textAlign: 'left', color: 'inherit', cursor: 'pointer', padding: '12px 13px', borderRadius: 10,
+        border: `1px solid ${selected ? 'var(--blue)' : 'var(--w-07)'}`, background: selected ? 'rgba(76,157,255,.05)' : 'var(--w-02)',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <MonoTag color={style.color} bg={style.bg} size={9}>{job.status}</MonoTag>
+        <span style={{ fontSize: 12.5, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{title}</span>
+      </div>
+      <div style={{ display: 'flex', gap: 8, marginTop: 7, fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+        <span>{job.phase}</span><span>·</span><span>{Math.round(job.progress * 100)}%</span><span>·</span><span>{ago(job.updatedAt)}</span>
+      </div>
+    </button>
+  );
+}
+
+function JobDetail({ detail, onRefresh, onCancel }: { detail: ApiRunnerJobDetail; onRefresh: () => Promise<void>; onCancel: () => Promise<void> }) {
+  const { job, items, questions } = detail;
+  const output = job.finalResult;
+  const statusStyle = JOB_STATUS_STYLE[job.status];
+  return (
+    <div style={{ borderRadius: 11, border: '1px solid var(--w-07)', background: 'var(--w-02)', padding: 16 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <MonoTag color={statusStyle.color} bg={statusStyle.bg} size={10}>{job.status}</MonoTag>
+        <strong style={{ fontSize: 14 }}>{job.sourceKind} job</strong>
+        <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>{job.id}</span>
+        <div style={{ flex: 1 }} />
+        {!TERMINAL_JOBS.includes(job.status) && <Button variant="danger" onClick={onCancel}>cancel</Button>}
+      </div>
+      <div style={{ height: 4, borderRadius: 4, background: 'var(--w-07)', margin: '14px 0' }}>
+        <div style={{ width: `${Math.max(1, job.progress * 100)}%`, height: '100%', borderRadius: 4, background: statusStyle.color }} />
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(125px, 1fr))', gap: 8, fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>
+        <span>phase <b>{job.phase}</b></span>
+        <span>events <b>{job.lastEventSeq}</b></span>
+        <span>warnings <b>{job.warningCount}</b></span>
+        <span>updated <b>{ago(job.updatedAt)}</b></span>
+      </div>
+
+      {questions.filter((question) => question.state === 'open').map((question) => (
+        <Question key={question.questionId} pid={job.id} question={question} onAnswered={onRefresh} projectId={job.snapshot && typeof job.snapshot === 'object' && 'projectId' in job.snapshot ? String((job.snapshot as { projectId: unknown }).projectId) : ''} />
+      ))}
+
+      <Section title="Tasks">
+        {items.map((item) => (
+          <div key={item.taskId} style={{ padding: '9px 0', borderBottom: '1px solid var(--w-05)' }}>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <MonoTag color="var(--text-mid)" bg="var(--w-06)" size={9}>{item.status}</MonoTag>
+              <strong style={{ fontSize: 12 }}>{item.taskKey}</strong>
+              {item.commitRevision && <code style={{ fontSize: 10 }}>{shortSha(item.commitRevision)}</code>}
+            </div>
+            {item.summary && <div style={{ fontSize: 11.5, color: 'var(--text-dim)', marginTop: 5 }}>{item.summary}</div>}
+            {item.projectionConflict && <div style={{ color: '#f5a623', fontSize: 11, marginTop: 5 }}>Task status changed by a human; Runner projection was not applied.</div>}
+          </div>
+        ))}
+      </Section>
+      {output && <Output output={output} />}
+    </div>
+  );
+}
+
+function Question({ projectId, pid: jobId, question, onAnswered }: { projectId: string; pid: string; question: ApiRunnerJobDetail['questions'][number]; onAnswered: () => Promise<void> }) {
+  const [answer, setAnswer] = useState('');
+  const [busy, setBusy] = useState(false);
+  return (
+    <div style={{ marginTop: 14, padding: 12, border: '1px solid rgba(245,166,35,.25)', borderRadius: 9, background: 'rgba(245,166,35,.05)' }}>
+      <div style={{ fontSize: 12, marginBottom: 8 }}>{question.prompt}</div>
+      <TextArea value={answer} onChange={(event) => setAnswer(event.target.value)} placeholder="Answer the Runner" />
+      <Button
+        variant="primary"
+        disabled={busy || !answer.trim() || !projectId}
+        style={{ marginTop: 8 }}
+        onClick={async () => {
+          setBusy(true);
+          try { await api.answerRunnerJobQuestion(projectId, jobId, question.questionId, answer.trim()); await onAnswered(); }
+          finally { setBusy(false); }
+        }}
+      >
+        {busy ? 'sending…' : 'send answer'}
+      </Button>
+    </div>
+  );
+}
+
+function Output({ output }: { output: ApiRunnerJobOutput }) {
+  return (
+    <Section title="Retained output">
+      <div style={{ padding: 11, borderRadius: 8, background: 'rgba(76,157,255,.06)', border: '1px solid rgba(76,157,255,.18)', fontSize: 11.5, lineHeight: 1.55 }}>
+        <strong>Human merge required.</strong> Runner retained this work locally and did not push, merge another branch, or open a pull request.
+      </div>
+      <dl style={{ display: 'grid', gridTemplateColumns: '100px minmax(0, 1fr)', gap: '6px 10px', fontFamily: 'var(--mono)', fontSize: 10.5 }}>
+        <dt>mode</dt><dd>{output.workspaceMode}</dd>
+        <dt>branch</dt><dd style={{ overflowWrap: 'anywhere' }}>{output.branch}</dd>
+        <dt>base</dt><dd>{shortSha(output.baseRevision)}</dd>
+        <dt>head</dt><dd>{shortSha(output.headRevision)}</dd>
+      </dl>
+      <div style={{ fontSize: 11.5, color: 'var(--text-dim)', lineHeight: 1.55 }}>{output.summary}</div>
+      <div style={{ marginTop: 9, fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>
+        {output.usage.calls} calls · {(output.usage.inputTokens + output.usage.outputTokens).toLocaleString()} tokens
+        {output.usage.costUsd != null ? ` · $${output.usage.costUsd.toFixed(4)}` : ''}
+      </div>
+      {output.checks.map((check, index) => (
+        <details key={`${check.command}-${index}`} style={{ marginTop: 8 }}>
+          <summary style={{ cursor: 'pointer', fontSize: 11, color: check.exitCode === 0 && !check.timedOut ? 'var(--green)' : 'var(--red-soft)' }}>
+            check: {check.command} ({check.timedOut ? 'timed out' : `exit ${check.exitCode ?? 'none'}`})
+          </summary>
+          <pre style={{ overflowX: 'auto', whiteSpace: 'pre-wrap', fontSize: 10 }}>{check.output}</pre>
+        </details>
+      ))}
+      {output.findings.map((finding, index) => (
+        <div key={`${finding.title}-${index}`} style={{ marginTop: 8, fontSize: 11.5 }}>
+          <MonoTag color={finding.severity === 'minor' ? '#f5a623' : 'var(--red-soft)'} bg="var(--w-06)" size={9}>{finding.severity}</MonoTag>{' '}
+          <strong>{finding.title}</strong> — {finding.body}
+        </div>
+      ))}
+    </Section>
+  );
+}
+
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return <section style={{ marginTop: 16 }}><SectionLabel>{title}</SectionLabel><div style={{ marginTop: 7 }}>{children}</div></section>;
+}
+
+function EmptyState({ children }: { children: React.ReactNode }) {
+  return <div style={{ padding: 34, textAlign: 'center', border: '1px dashed var(--w-08)', borderRadius: 10, fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>{children}</div>;
+}
+
+function LegacyHistory({ runs }: { runs: ApiRun[] }) {
+  if (!runs.length) return <div style={{ marginTop: 10, fontSize: 11, color: 'var(--text-faint)' }}>No legacy Runs.</div>;
+  return (
+    <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
+      {runs.map((run) => {
+        const style = RUN_STATUS_STYLE[run.status];
+        return (
+          <div key={run.id} style={{ padding: '9px 11px', border: '1px solid var(--w-06)', borderRadius: 8, opacity: .72 }}>
+            <MonoTag color={style.color} bg={style.bg} size={9}>{run.status}</MonoTag>{' '}
+            <span style={{ fontSize: 11.5 }}>{run.brief}</span>
+            <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)', marginLeft: 8 }}>{ago(run.updatedAt)}</span>
+          </div>
+        );
+      })}
     </div>
   );
 }

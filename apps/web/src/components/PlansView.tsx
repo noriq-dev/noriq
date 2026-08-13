@@ -67,10 +67,6 @@ export function PlansView({ store }: { store: AppStore }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   // Archived plans hide by default (PLNR-148) — a display concern, nothing else changes.
   const [showArchived, setShowArchived] = useState(false);
-  // Plan dispatch (PLNR-170): the orchestration records + the runner roster the form needs.
-  // Polled like RunsView — dispatches move on their own (the pump runs server-side).
-  const [dispatches, setDispatches] = useState<ApiPlanDispatch[]>([]);
-  const [runners, setRunners] = useState<ApiRunner[]>([]);
   const [lifecycle, setLifecycle] = useState<{
     kind: 'archive' | 'delete'; id: string; title: string; openTasks: number; allTasks: number;
   } | null>(null);
@@ -78,22 +74,6 @@ export function PlansView({ store }: { store: AppStore }) {
   const [deleteDisposition, setDeleteDisposition] = useState<PlanDeleteTaskDisposition>('orphan');
   const [lifecycleBusy, setLifecycleBusy] = useState(false);
   const [lifecycleError, setLifecycleError] = useState<string | null>(null);
-  const loadDispatchState = async () => {
-    if (!currentPid) return;
-    try {
-      const [d, r] = await Promise.all([api.planDispatches(currentPid), api.runners({ view: 'active', limit: 100 })]);
-      setDispatches(d.dispatches);
-      setRunners(r.runners);
-    } catch {
-      /* transient — the poll retries */
-    }
-  };
-  useEffect(() => {
-    void loadDispatchState();
-    const iv = setInterval(() => void loadDispatchState(), 6000);
-    return () => clearInterval(iv);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentPid, snapshot]);
   const allPlans = snapshot?.plans ?? [];
   const archivedCount = allPlans.filter((p) => p.archivedAt).length;
   const plans = showArchived ? allPlans : allPlans.filter((p) => !p.archivedAt);
@@ -286,21 +266,21 @@ export function PlansView({ store }: { store: AppStore }) {
                 </div>
               )}
 
-              {/* plan dispatch (PLNR-170): hand the whole plan to a runner; the server pumps
-                  ready tasks into parallel per-task runs. Hidden for proposed/archived plans —
-                  a proposed plan's tasks are not real work yet, an archived plan is shelved. */}
+              {/* RunnerJob v2 keeps all dispatch choices in one small Jobs surface. The plan
+                  card no longer exposes legacy pump/model/workflow/profile controls. */}
               {!proposed && !plan.archivedAt && currentPid && (
-                <PlanDispatchStrip
-                  pid={currentPid}
-                  planId={plan.id}
-                  dispatch={dispatches.find((d) => d.planId === plan.id) ?? null}
-                  runners={runners}
-                  openTasks={allTaskIds.filter((tid) => {
-                    const st = taskById.get(tid)?.status;
-                    return st !== 'done' && st !== 'cancelled';
-                  }).length}
-                  onChange={() => void loadDispatchState()}
-                />
+                <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '9px 18px', borderTop: '1px solid var(--w-05)' }}>
+                  <Button
+                    variant="ghost"
+                    style={{ padding: '5px 14px', fontSize: 11.5 }}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      store.actions.setView('runs');
+                    }}
+                  >
+                    dispatch from Jobs →
+                  </Button>
+                </div>
               )}
 
               {/* expanded: the plan document + stacked phases */}

@@ -511,6 +511,19 @@ export const api = {
   agentLifecycleSweep: (pid: string, apply = false, cursor?: Record<string, string | null>) =>
     req<ApiAgentLifecycleSweep>('POST', `/api/projects/${pid}/agent-lifecycle-sweep${apply ? '?apply=true' : ''}`, cursor ? { cursor } : {}),
   runs: (pid: string) => req<{ runs: ApiRun[] }>('GET', `/api/projects/${pid}/runs`),
+  runnerJobs: (pid: string) => req<{ jobs: ApiRunnerJobSummary[] }>('GET', `/api/projects/${pid}/runner-jobs`),
+  runnerJob: (pid: string, jobId: string) =>
+    req<ApiRunnerJobDetail>('GET', `/api/projects/${pid}/runner-jobs/${jobId}`),
+  dispatchTaskJob: (pid: string, taskId: string, body: RunnerJobDispatchInput) =>
+    req<{ job: ApiRunnerJobSummary; delivered: boolean }>('POST', `/api/projects/${pid}/tasks/${taskId}/runner-jobs`, body),
+  dispatchPlanJob: (pid: string, planId: string, body: RunnerJobDispatchInput) =>
+    req<{ job: ApiRunnerJobSummary; delivered: boolean }>('POST', `/api/projects/${pid}/plans/${planId}/runner-jobs`, body),
+  cancelRunnerJob: (pid: string, jobId: string) =>
+    req<{ ok: true; terminal: boolean; delivered?: boolean }>('POST', `/api/projects/${pid}/runner-jobs/${jobId}/cancel`, {}),
+  answerRunnerJobQuestion: (pid: string, jobId: string, questionId: string, answer: string) =>
+    req<{ ok: true; delivered: boolean }>(
+      'POST', `/api/projects/${pid}/runner-jobs/${jobId}/questions/${questionId}/answer`, { answer },
+    ),
   orchestrations: (pid: string, options: { view?: 'active' | 'history'; cursor?: string; limit?: number } = {}) => {
     const q = new URLSearchParams();
     if (options.view) q.set('view', options.view);
@@ -709,6 +722,8 @@ export interface ApiRunnerRepo {
   workflows: Array<string | ApiAdvertisedWorkflow>;
   /** Opaque, secret-free machine environments. Details needed to resolve them stay local. */
   executionProfiles?: ApiExecutionProfileOffer[];
+  /** Protocol-v2 jobs pin this advertised revision into their immutable assignment. */
+  baseRevision?: string;
 }
 export interface ApiExecutionProfileOffer {
   id: string;
@@ -823,6 +838,50 @@ export interface ApiOrchestrationTree {
   nodes: ApiExecutionNode[]; rootExecutionIds: string[]; relations: ApiExecutionRelation[]; timeline: ApiExecutionTimelineEvent[];
   timelinePage: { limit: number; hasMore: boolean; nextCursor: string | null };
 }
+
+export type RunnerJobStatus = 'queued' | 'assigned' | 'running' | 'waiting' | 'succeeded' | 'partial' | 'failed' | 'cancelled';
+export type RunnerJobPhase = 'preparing' | 'planning' | 'building' | 'checking' | 'reviewing' | 'repairing' | 'integrating' | 'finalizing';
+export type RunnerJobTaskStatus = 'pending' | 'running' | 'accepted' | 'failed' | 'not_started' | 'cancelled';
+export interface RunnerJobDispatchInput { runnerId: string; repoRef: string }
+export interface ApiRunnerJobUsage {
+  inputTokens: number; outputTokens: number; cachedTokens: number; costUsd: number | null; calls: number;
+}
+export interface ApiRunnerJobFinding {
+  severity: 'blocker' | 'major' | 'minor'; title: string; body: string; path: string | null; line: number | null;
+}
+export interface ApiRunnerJobCheck {
+  command: string; exitCode: number | null; durationMs: number; output: string; timedOut: boolean;
+}
+export interface ApiRunnerJobOutput {
+  workspaceMode: 'isolated' | 'direct'; branch: string; baseRevision: string; headRevision: string;
+  acceptedTaskCommits: Record<string, string>; checks: ApiRunnerJobCheck[]; findings: ApiRunnerJobFinding[];
+  usage: ApiRunnerJobUsage; summary: string; dirtyPaths: string[];
+}
+export interface ApiRunnerJobSummary {
+  id: string; runnerId: string; repoRef: string; sourceKind: 'task' | 'plan'; sourceId: string;
+  status: RunnerJobStatus; phase: RunnerJobPhase; progress: number; usage: ApiRunnerJobUsage | null;
+  finalResult: ApiRunnerJobOutput | null; warningCount: number; createdAt: string; startedAt: string | null;
+  finishedAt: string | null; updatedAt: string;
+}
+export interface ApiRunnerJobItem {
+  taskId: string; taskKey: string; phaseOrder: number; taskOrder: number; status: RunnerJobTaskStatus;
+  plan: string | null; commitRevision: string | null; summary: string | null; findings: ApiRunnerJobFinding[];
+  projectionConflict: Record<string, unknown> | null; startedAt: string | null; finishedAt: string | null; updatedAt: string;
+}
+export interface ApiRunnerJobQuestion {
+  questionId: string; prompt: string; state: 'open' | 'answered'; answer: string | null;
+  publishedAt: string; answeredAt: string | null;
+}
+export interface ApiRunnerJobDetail {
+  job: ApiRunnerJobSummary & {
+    snapshot: unknown; snapshotDigest: string; expectedBaseRevision: string; orchestrationId: string;
+    lastEventSeq: number; assignedAt: string | null; cancelRequestedAt: string | null;
+  };
+  items: ApiRunnerJobItem[];
+  events: Array<{ seq: number; type: string; payload: unknown; observedAt: string; receivedAt: string }>;
+  questions: ApiRunnerJobQuestion[];
+}
+
 export interface ApiRunBudget {
   maxTokens: number | null;
   maxUsd: number | null;
