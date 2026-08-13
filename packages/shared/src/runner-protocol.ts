@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { ExecutionSpec } from './execution-spec';
+import { MissionLeaseRef } from './orchestration';
 
 /** A bounded, server-authored task as it existed when a single-root mission was commissioned. */
 export const MissionCommissionTask = z.object({
@@ -79,3 +80,34 @@ export type TaskRootMissionCommission = z.infer<typeof TaskRootMissionCommission
 
 export const MissionRootCommission = z.union([PlanMissionCommission, TaskRootMissionCommission]);
 export type MissionRootCommission = z.infer<typeof MissionRootCommission>;
+
+export const MissionQuestionPublication = z.object({
+  reportId: z.string().min(1).max(160),
+  questionId: z.string().min(1).max(160),
+  attemptId: z.string().min(1).max(160).nullable().default(null),
+  prompt: z.string().min(1).max(20_000),
+  observedAt: z.string().datetime(),
+}).strict();
+export type MissionQuestionPublication = z.infer<typeof MissionQuestionPublication>;
+
+export const MissionQuestionAck = z.object({
+  reportId: z.string().min(1).max(160),
+  questionId: z.string().min(1).max(160),
+  attemptId: z.string().nullable(),
+  accepted: z.boolean(),
+  state: z.enum(['open', 'answered', 'abandoned']).nullable(),
+  signalId: z.string().nullable(),
+  error: z.string().nullable(),
+}).strict();
+export type MissionQuestionAck = z.infer<typeof MissionQuestionAck>;
+
+export const MissionQuestionAnswer = z.object({
+  answerId: z.string().min(1).max(160),
+  runId: z.string().min(1),
+  questionId: z.string().min(1).max(160),
+  attemptId: z.string().nullable(),
+  lease: MissionLeaseRef,
+  answer: z.string().min(1).max(50_000),
+  answeredAt: z.string().datetime(),
+}).strict();
+export type MissionQuestionAnswer = z.infer<typeof MissionQuestionAnswer>;

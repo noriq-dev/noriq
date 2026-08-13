@@ -162,3 +162,33 @@ describe('single-root mission commission wire contract (PLNR-489)', () => {
     })).toMatchObject({ inventory: [{ commissionDigest: missionCommission.digest }] });
   });
 });
+
+describe('durable mission question wire contract (PLNR-496)', () => {
+  it('carries exact root, attempt, question, answer, and lease identities without legacy signal inference', () => {
+    const now = new Date().toISOString();
+    const lease = { sitting: 2, executionId: 'exe_root', epoch: 4 };
+    expect(RunnerClientMessage.parse({
+      type: 'mission.question.publish', runId: 'run_root', lease,
+      question: {
+        reportId: 'question-report', questionId: 'question-1', attemptId: 'attempt-1',
+        prompt: 'Choose a rollout window.', observedAt: now,
+      },
+    })).toMatchObject({ type: 'mission.question.publish', runId: 'run_root', lease });
+    expect(RunnerServerMessage.parse({
+      type: 'mission.question.ack', runId: 'run_root', lease,
+      ack: {
+        reportId: 'question-report', questionId: 'question-1', attemptId: 'attempt-1',
+        accepted: true, state: 'open', signalId: 'sig_1', error: null,
+      },
+    }).type).toBe('mission.question.ack');
+    expect(RunnerServerMessage.parse({
+      type: 'mission.question.answer',
+      answer: {
+        answerId: 'answer-1', runId: 'run_root', questionId: 'question-1', attemptId: 'attempt-1',
+        lease, answer: 'Use Tuesday.', answeredAt: now,
+      },
+    })).toMatchObject({
+      answer: { answerId: 'answer-1', runId: 'run_root', questionId: 'question-1', attemptId: 'attempt-1', lease },
+    });
+  });
+});

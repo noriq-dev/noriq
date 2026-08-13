@@ -11,6 +11,7 @@ import type { Env } from '../src/env';
 import type {
   AcceptedRevisionHandoff, AcceptedRevisionHandoffView, MissionCommission, MissionHandoffAck,
   MissionAdoptionResult, MissionInventoryItem, MissionLeaseRef,
+  MissionQuestionAck, MissionQuestionPublication,
   MissionTaskAck, MissionTaskBeginReport, MissionTaskSettleReport,
 } from '@noriq-dev/shared';
 import { taskClaimability } from '../src/lib/claimability';
@@ -45,6 +46,8 @@ interface RoomRpc {
   publishMissionHandoff(projectId: string, rootRunId: string, reportId: string, handoff: AcceptedRevisionHandoff, lease: MissionLeaseRef): Promise<MissionHandoffAck>;
   getMissionHandoff(projectId: string, rootRunId: string): Promise<AcceptedRevisionHandoffView | null>;
   consumeMissionHandoff(projectId: string, actor: Actor, rootRunId: string, handoff: AcceptedRevisionHandoff): Promise<{ handoff: AcceptedRevisionHandoffView }>;
+  publishMissionQuestion(projectId: string, rootRunId: string, question: MissionQuestionPublication, lease: MissionLeaseRef): Promise<MissionQuestionAck>;
+  answerSignal(projectId: string, actor: Actor, signalId: string, response: string): Promise<{ ok: boolean; alreadyResolved?: boolean }>;
 }
 const room = (pid: string) =>
   appEnv.PROJECT_ROOM.get(appEnv.PROJECT_ROOM.idFromName(pid)) as unknown as RoomRpc;
@@ -862,6 +865,55 @@ describe('server-authorized mission task attempts (PLNR-485)', () => {
     await room(pid).publishMissionHandoff(pid, gated.rootRunId, 'gated-publish', gatedHandoff, gatedLease);
     await room(pid).consumeMissionHandoff(pid, actor, gated.rootRunId, gatedHandoff);
     expect((await taskClaimability(env.DB, gated.c)).claimable).toBe(false);
+  });
+
+  it('durably maps exact mission questions and abandons outstanding ones on settlement/cancellation (PLNR-496)', async () => {
+    const mission = await liveMission('mission-question');
+    await begin(mission.rootRunId, mission.a, 'question-attempt');
+    const lease = await room(pid).missionLease(pid, mission.rootRunId);
+    const publication: MissionQuestionPublication = {
+      reportId: 'question-report', questionId: 'question-exact', attemptId: 'question-attempt',
+      prompt: 'Choose the exact deployment window.', observedAt: new Date().toISOString(),
+    };
+    const first = await room(pid).publishMissionQuestion(pid, mission.rootRunId, publication, lease);
+    expect(first).toMatchObject({ accepted: true, state: 'open', signalId: expect.any(String) });
+    expect(await room(pid).publishMissionQuestion(pid, mission.rootRunId, {
+      ...publication, reportId: 'question-replay',
+    }, lease)).toMatchObject({ accepted: true, state: 'open', signalId: first.signalId });
+    await expect(room(pid).publishMissionQuestion(pid, mission.rootRunId, {
+      ...publication, prompt: 'Different prompt under same identity',
+    }, lease)).rejects.toThrow(/conflicts/);
+    await expect(room(pid).publishMissionQuestion(pid, mission.rootRunId, {
+      ...publication, questionId: 'wrong-attempt', attemptId: 'missing-attempt',
+    }, lease)).rejects.toThrow(/does not belong/);
+    await expect(room(pid).publishMissionQuestion(pid, mission.rootRunId, {
+      ...publication, questionId: 'stale-epoch',
+    }, { ...lease, epoch: lease.epoch + 1 })).rejects.toThrow(/stale mission lease/);
+    expect(await env.DB.prepare('SELECT status, task_id AS taskId FROM signals WHERE id = ?')
+      .bind(first.signalId).first<{ status: string; taskId: string }>())
+      .toEqual({ status: 'open', taskId: mission.a });
+
+    await room(pid).settleMissionTask(pid, mission.rootRunId, {
+      reportId: 'settle-question-attempt', attemptId: 'question-attempt',
+      claimId: (await env.DB.prepare('SELECT claim_id AS claimId FROM mission_task_attempts WHERE id = ?')
+        .bind('question-attempt').first<{ claimId: string }>())!.claimId,
+      outcome: 'cancelled', reason: 'question no longer applies', observedAt: new Date().toISOString(),
+    }, lease);
+    expect(await env.DB.prepare('SELECT state FROM mission_questions WHERE question_id = ?')
+      .bind('question-exact').first<{ state: string }>()).toEqual({ state: 'abandoned' });
+    expect(await env.DB.prepare('SELECT status FROM signals WHERE id = ?')
+      .bind(first.signalId).first<{ status: string }>()).toEqual({ status: 'dismissed' });
+
+    const rootQuestion = await room(pid).publishMissionQuestion(pid, mission.rootRunId, {
+      reportId: 'root-question', questionId: 'root-question', attemptId: null,
+      prompt: 'Continue this mission?', observedAt: new Date().toISOString(),
+    }, lease);
+    expect(rootQuestion.state).toBe('open');
+    await room(pid).cancelPlanDispatch(pid, actor, mission.dispatch.id, 'cancel unanswered question');
+    expect(await env.DB.prepare('SELECT state FROM mission_questions WHERE question_id = ?')
+      .bind('root-question').first<{ state: string }>()).toEqual({ state: 'abandoned' });
+    await expect(room(pid).answerSignal(pid, actor, rootQuestion.signalId!, 'stale answer'))
+      .resolves.toMatchObject({ ok: true, alreadyResolved: true });
   });
 });
 

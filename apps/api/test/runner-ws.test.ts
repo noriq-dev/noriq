@@ -381,7 +381,47 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
       at: new Date().toISOString(),
     }));
     await waitRunStatus(runId, 'blocked');
+    const questionAckP = nextFrame(resumed, (m) => m.type === 'mission.question.ack');
+    resumed.send(JSON.stringify({
+      type: 'mission.question.publish', runId, lease: result.results[0].lease,
+      question: {
+        reportId: 'question-publish-1', questionId: 'durable-question-1', attemptId: null,
+        prompt: 'Which rollout window should this mission use?', observedAt: new Date().toISOString(),
+      },
+    }));
+    const questionAck = await questionAckP;
+    expect(questionAck).toMatchObject({
+      runId, lease: result.results[0].lease,
+      ack: { accepted: true, state: 'open', questionId: 'durable-question-1', signalId: expect.any(String) },
+    });
     resumed.close();
+
+    // Answer while Runner is disconnected. The normal Signals surface remains the human UI,
+    // while the durable mapping preserves mission identity instead of emitting legacy run.resume.
+    const answered = await SELF.fetch(`https://noriq.test/api/projects/${pid}/signals/${questionAck.ack.signalId}/answer`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ response: 'Use the maintenance window.' }),
+    });
+    expect(answered.status).toBe(200);
+
+    const third = await wsConnect(runnerId, { Authorization: `Bearer ${token}` });
+    const replayed = third.webSocket!;
+    replayed.accept();
+    const answerP = nextFrame(replayed, (m) => m.type === 'mission.question.answer');
+    replayed.send(JSON.stringify({
+      type: 'hello', protocol: 1, label: 'ws-daemon', protocolCapabilities: ['mission.v2'],
+    }));
+    const answer = await answerP;
+    expect(answer.answer).toMatchObject({
+      answerId: expect.any(String), runId, questionId: 'durable-question-1', attemptId: null,
+      lease: result.results[0].lease, answer: 'Use the maintenance window.',
+    });
+    const replayAgainP = nextFrame(replayed, (m) => m.type === 'mission.question.answer');
+    replayed.send(JSON.stringify({
+      type: 'hello', protocol: 1, label: 'ws-daemon', protocolCapabilities: ['mission.v2'],
+    }));
+    expect((await replayAgainP).answer.answerId).toBe(answer.answer.answerId);
+    replayed.close();
   });
 
   it('commissions and restart-adopts an explicit task-root mission without changing ordinary task runs (PLNR-492)', async () => {

@@ -4,7 +4,9 @@ import {
   AcceptedRevisionHandoff,
 } from './runner';
 import { ExecutionSpec } from './execution-spec';
-import { MissionRootCommission } from './runner-protocol';
+import {
+  MissionQuestionAck, MissionQuestionAnswer, MissionQuestionPublication, MissionRootCommission,
+} from './runner-protocol';
 import { ExecutedConfigurationEvidence } from './intelligence';
 import {
   ExecutionReportAck,
@@ -136,6 +138,9 @@ export const RunnerServerMessage = z.discriminatedUnion('type', [
     answer: z.string(),
   }),
 
+  z.object({ type: z.literal('mission.question.ack'), runId: z.string(), lease: MissionLeaseRef, ack: MissionQuestionAck }),
+  z.object({ type: z.literal('mission.question.answer'), answer: MissionQuestionAnswer }),
+
   // Kill a Run. hard=true → SIGTERM the process now; false → let it wind down.
   z.object({
     type: z.literal('run.cancel'),
@@ -255,6 +260,10 @@ export const RunnerClientMessage = z.discriminatedUnion('type', [
 
   z.object({ type: z.literal('mission.task.begin'), runId: z.string(), lease: MissionLeaseRef, begin: MissionTaskBeginReport }),
   z.object({ type: z.literal('mission.task.settle'), runId: z.string(), lease: MissionLeaseRef, settle: MissionTaskSettleReport }),
+  z.object({
+    type: z.literal('mission.question.publish'), runId: z.string(), lease: MissionLeaseRef,
+    question: MissionQuestionPublication,
+  }),
   z.object({
     type: z.literal('mission.handoff.publish'), runId: z.string(), lease: MissionLeaseRef,
     publication: MissionHandoffPublication,

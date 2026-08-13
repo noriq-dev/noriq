@@ -14,7 +14,7 @@ import {
 import { searchBackend, indexEntity, removeEntity, type SearchKind } from '../search';
 import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
-import { MissionCommission as MissionCommissionSchema, MissionRootCommission as MissionRootCommissionSchema, RunKind, AgentTool, RunStatus, ExecutionProfileOffer, type AcceptedRevisionHandoff, type AcceptedRevisionHandoffView, type CommissionedExecutionProfile, type MissionCommission, type MissionCommissionSnapshot, type MissionRootCommission, type TaskRootMissionCommissionSnapshot, type MissionHandoffAck, type MissionHandoffConsumed, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
+import { MISSION_CAPABILITY, MissionCommission as MissionCommissionSchema, MissionRootCommission as MissionRootCommissionSchema, RunKind, AgentTool, RunStatus, ExecutionProfileOffer, type AcceptedRevisionHandoff, type AcceptedRevisionHandoffView, type CommissionedExecutionProfile, type MissionCommission, type MissionCommissionSnapshot, type MissionRootCommission, type TaskRootMissionCommissionSnapshot, type MissionHandoffAck, type MissionHandoffConsumed, type MissionQuestionAck, type MissionQuestionAnswer, type MissionQuestionPublication, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
 import { readExecutionSpec, writeExecutionSpec } from '../lib/execution-spec';
 import { processPendingCopilotEpisodeJob, processPendingEpisodeJob } from '../memory/episodes';
 import { applyMissionTaskExecutionEvent, ensureMissionTaskExecution, ensureRunExecution, mirrorRunTransition } from '../lib/orchestration-store';
@@ -2348,12 +2348,61 @@ export class ProjectRoom extends DurableObject<Env> {
       ).bind(signalId, this.projectId).first<{ id: string; taskId: string | null; agentId: string | null; type: string; status: string; title: string; body: string | null; blocking: number }>();
       if (!sig) throw new Error('signal not found');
       if (sig.status !== 'open') return { ok: true, alreadyResolved: true };
+      const missionQuestion = await this.env.DB.prepare(
+        `SELECT id, runner_id AS runnerId, root_run_id AS rootRunId, attempt_id AS attemptId,
+                question_id AS questionId, sitting, execution_id AS executionId,
+                lease_epoch AS epoch, state
+           FROM mission_questions WHERE signal_id = ?`,
+      ).bind(signalId).first<{
+        id: string; runnerId: string; rootRunId: string; attemptId: string | null; questionId: string;
+        sitting: number; executionId: string; epoch: number; state: string;
+      }>();
+      if (missionQuestion) {
+        if (missionQuestion.state !== 'open') throw new Error(`mission question is ${missionQuestion.state}`);
+        const current = await this.missionLease(this.projectId, missionQuestion.rootRunId);
+        if (current.sitting !== missionQuestion.sitting || current.executionId !== missionQuestion.executionId
+            || current.epoch !== missionQuestion.epoch) {
+          throw new Error('mission question belongs to a stale lease epoch');
+        }
+      }
       if (!response && answers?.length) {
         const fmt = (a: string | string[] | number | boolean) => Array.isArray(a) ? a.join(', ') : String(a);
         response = answers.map((a) => `${a.question} → ${fmt(a.answer)}`).join('\n');
       }
       await this.env.DB.prepare("UPDATE signals SET status = 'answered', response = ?, response_json = ?, responder_id = ?, resolved_at = ? WHERE id = ?")
         .bind(response, answers?.length ? JSON.stringify(answers) : null, actor.id, nowIso(), signalId).run();
+      if (missionQuestion) {
+        const answeredAt = nowIso();
+        const answerId = newId('mqa');
+        await this.env.DB.prepare(
+          `UPDATE mission_questions SET state = 'answered', answer_id = ?, answer = ?, answered_at = ?, updated_at = ?
+            WHERE id = ? AND state = 'open'`,
+        ).bind(answerId, response, answeredAt, answeredAt, missionQuestion.id).run();
+        const remaining = await this.env.DB.prepare(
+          "SELECT 1 AS present FROM mission_questions WHERE root_run_id = ? AND state = 'open' LIMIT 1",
+        ).bind(missionQuestion.rootRunId).first<{ present: number }>();
+        if (!remaining) {
+          const resumed = await this.env.DB.prepare("UPDATE runs SET status = 'running', updated_at = ? WHERE id = ? AND status = 'blocked'")
+            .bind(answeredAt, missionQuestion.rootRunId).run();
+          if (resumed.meta.changes) {
+            await this.emit(actor, 'run.status_changed', 'run', missionQuestion.rootRunId, {
+              from: 'blocked', to: 'running', reason: 'mission_question_answered',
+            });
+          }
+        }
+        const answer: MissionQuestionAnswer = {
+          answerId, runId: missionQuestion.rootRunId, questionId: missionQuestion.questionId,
+          attemptId: missionQuestion.attemptId,
+          lease: {
+            sitting: missionQuestion.sitting, executionId: missionQuestion.executionId, epoch: missionQuestion.epoch,
+          },
+          answer: response, answeredAt,
+        };
+        try {
+          await this.env.RUNNER_HUB.get(this.env.RUNNER_HUB.idFromName(missionQuestion.runnerId))
+            .deliverCapability(JSON.stringify({ type: 'mission.question.answer', answer }), MISSION_CAPABILITY);
+        } catch { /* durable reconnect replay below is authoritative */ }
+      }
       // Return a parked task to the queue so the requester (or anyone) can resume it.
       let taskKey: string | null = null;
       if (sig.type === 'input_request' && sig.taskId) {
@@ -4728,6 +4777,91 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
+  /** Publish one lease-bound human question and expose it through the existing Signals UI. */
+  async publishMissionQuestion(
+    projectId: string,
+    rootRunId: string,
+    question: MissionQuestionPublication,
+    lease: MissionLeaseRef,
+  ): Promise<MissionQuestionAck> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      if (!(await this.validateMissionLease(projectId, rootRunId, lease))) throw new Error('stale mission lease epoch');
+      const root = await this.env.DB.prepare(
+        `SELECT runner_id AS runnerId, agent_id AS agentId, status, exit, anchor_type AS anchorType,
+                anchor_id AS anchorId, mission_mode AS missionMode
+           FROM runs WHERE id = ? AND project_id = ? AND runner_id IS NOT NULL`,
+      ).bind(rootRunId, projectId).first<{
+        runnerId: string; agentId: string | null; status: string; exit: string | null; anchorType: string | null;
+        anchorId: string | null; missionMode: string | null;
+      }>();
+      if (!root || !['running', 'blocked'].includes(logicalRunStatus(root))) throw new Error('mission root is not live');
+      let taskId = root.missionMode === 'task_root' && root.anchorType === 'task' ? root.anchorId : null;
+      if (question.attemptId) {
+        const attempt = await this.env.DB.prepare(
+          `SELECT task_id AS taskId FROM mission_task_attempts
+            WHERE id = ? AND root_run_id = ? AND status = 'running' AND lease_epoch = ?`,
+        ).bind(question.attemptId, rootRunId, lease.epoch).first<{ taskId: string }>();
+        if (!attempt) throw new Error('question attempt does not belong to the current mission lease');
+        taskId = attempt.taskId;
+      }
+      const publicationHash = await sha256Hex(JSON.stringify({
+        rootRunId, attemptId: question.attemptId, questionId: question.questionId,
+        prompt: question.prompt, lease,
+      }));
+      const existing = await this.env.DB.prepare(
+        `SELECT publication_hash AS publicationHash, state, signal_id AS signalId, attempt_id AS attemptId
+           FROM mission_questions WHERE root_run_id = ? AND question_id = ?`,
+      ).bind(rootRunId, question.questionId).first<{
+        publicationHash: string; state: 'open' | 'answered' | 'abandoned'; signalId: string; attemptId: string | null;
+      }>();
+      if (existing) {
+        if (existing.publicationHash !== publicationHash) throw new Error('questionId conflicts with its durable mission identity');
+        return {
+          reportId: question.reportId, questionId: question.questionId, attemptId: existing.attemptId,
+          accepted: true, state: existing.state, signalId: existing.signalId, error: null,
+        };
+      }
+      const now = nowIso();
+      const signalId = newId('sig');
+      const id = newId('mqu');
+      await this.env.DB.batch([
+        this.env.DB.prepare(
+          `INSERT INTO signals
+             (id, project_id, task_id, agent_id, agent_name, type, severity, title, body,
+              blocking, status, created_at)
+           VALUES (?, ?, ?, NULL, 'Runner mission', 'input_request', 'info', ?, ?, 1, 'open', ?)`,
+        ).bind(signalId, projectId, taskId, `Mission question · ${question.questionId}`, question.prompt, now),
+        this.env.DB.prepare(
+          `INSERT INTO mission_questions
+             (id, project_id, runner_id, root_run_id, attempt_id, question_id, signal_id,
+              sitting, execution_id, lease_epoch, prompt, publication_hash, state,
+              published_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)`,
+        ).bind(
+          id, projectId, root.runnerId, rootRunId, question.attemptId, question.questionId, signalId,
+          lease.sitting, lease.executionId, lease.epoch, question.prompt, publicationHash, now, now,
+        ),
+        this.env.DB.prepare(
+          "UPDATE runs SET status = 'blocked', updated_at = ? WHERE id = ? AND status = 'running'",
+        ).bind(now, rootRunId),
+      ]);
+      await this.emit(SYSTEM_ACTOR, 'signal.raised', taskId ? 'task' : 'run', taskId ?? rootRunId, {
+        signalId, sigType: 'input_request', title: `Mission question · ${question.questionId}`,
+        rootRunId, attemptId: question.attemptId, questionId: question.questionId, parked: true,
+      });
+      if (root.status === 'running') {
+        await this.emit(SYSTEM_ACTOR, 'run.status_changed', 'run', rootRunId, {
+          from: 'running', to: 'blocked', reason: 'mission_question',
+        });
+      }
+      return {
+        reportId: question.reportId, questionId: question.questionId, attemptId: question.attemptId,
+        accepted: true, state: 'open', signalId, error: null,
+      };
+    });
+  }
+
   private missionHandoffIdentity(row: MissionHandoffRow): AcceptedRevisionHandoff {
     return {
       schemaVersion: 1,
@@ -5014,6 +5148,10 @@ export class ProjectRoom extends DurableObject<Env> {
             WHERE root_run_id = ? AND status = 'running' AND lease_epoch = ?`,
         ).bind(next.epoch, nowIso(), inventory.runId, current.epoch),
         this.env.DB.prepare(
+          `UPDATE mission_questions SET lease_epoch = ?, updated_at = ?
+            WHERE root_run_id = ? AND state IN ('open','answered') AND lease_epoch = ?`,
+        ).bind(next.epoch, nowIso(), inventory.runId, current.epoch),
+        this.env.DB.prepare(
           `UPDATE claims SET expires_at = ? WHERE id IN (
              SELECT claim_id FROM mission_task_attempts WHERE root_run_id = ? AND status = 'running')`,
         ).bind(claimExpiry, inventory.runId),
@@ -5096,6 +5234,7 @@ export class ProjectRoom extends DurableObject<Env> {
         toStatus: taskStatus, reason: `mission attempt settled: ${input.outcome}`,
         rootRunId, attemptId: input.attemptId,
       });
+      await this.abandonMissionQuestions(rootRunId, input.attemptId, now);
       return ack;
     });
   }
@@ -5559,6 +5698,7 @@ export class ProjectRoom extends DurableObject<Env> {
     ]);
     if (run.kind === 'build' && (run.anchor_type === 'plan' || run.mission_mode === 'task_root')) {
       await this.interruptMissionTaskAttempts(run.id, run.agent_id, now, 'cancelled');
+      await this.abandonMissionQuestions(run.id, null, now);
     }
     this.ctx.waitUntil(
       processPendingEpisodeJob(this.env, this.projectId, run.id, run.sitting).catch((err) =>
@@ -5802,6 +5942,7 @@ export class ProjectRoom extends DurableObject<Env> {
       if (isTerminalRunStatus(to) && run.kind === 'build'
           && (run.anchor_type === 'plan' || run.mission_mode === 'task_root')) {
         await this.interruptMissionTaskAttempts(run.id, agentId, now, to);
+        await this.abandonMissionQuestions(run.id, null, now);
       }
       // Every terminal run produces a deterministic episode (§14, PLNR-263). Delivery starts in
       // the background, but unlike the old bare promise it is backed by `memory_episode_jobs`:
@@ -5990,6 +6131,24 @@ export class ProjectRoom extends DurableObject<Env> {
 
   /** A root process ending revokes only its still-live task attempts. Settled rows are immutable
    * history and are excluded by status; human moves/foreign claims survive the ownership guard. */
+  private async abandonMissionQuestions(rootRunId: string, attemptId: string | null, now: string): Promise<void> {
+    const predicate = attemptId ? 'root_run_id = ? AND attempt_id = ?' : 'root_run_id = ?';
+    const binds = attemptId ? [rootRunId, attemptId] : [rootRunId];
+    const { results } = await this.env.DB.prepare(
+      `SELECT signal_id AS signalId FROM mission_questions WHERE ${predicate} AND state = 'open'`,
+    ).bind(...binds).all<{ signalId: string }>();
+    if (!results.length) return;
+    await this.env.DB.batch([
+      this.env.DB.prepare(
+        `UPDATE mission_questions SET state = 'abandoned', abandoned_at = ?, updated_at = ?
+          WHERE ${predicate} AND state = 'open'`,
+      ).bind(now, now, ...binds),
+      ...results.map((row) => this.env.DB.prepare(
+        "UPDATE signals SET status = 'dismissed', resolved_at = ? WHERE id = ? AND status = 'open'",
+      ).bind(now, row.signalId)),
+    ]);
+  }
+
   private async interruptMissionTaskAttempts(
     rootRunId: string,
     agentId: string | null,
@@ -6124,6 +6283,7 @@ export class ProjectRoom extends DurableObject<Env> {
       this.env.DB.prepare('DELETE FROM execution_profile_leases WHERE run_id = ?').bind(run.id),
     ]);
     await this.interruptMissionTaskAttempts(run.id, run.agentId, now, 'failed');
+    await this.abandonMissionQuestions(run.id, null, now);
     this.ctx.waitUntil(
       processPendingEpisodeJob(this.env, this.projectId, run.id, run.sitting).catch((err) =>
         console.warn(`episode recording for reconciled run ${run.id}/${run.sitting} failed: ${String(err)}`),

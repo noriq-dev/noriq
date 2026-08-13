@@ -12,6 +12,7 @@ import {
   type ExecutionReportAck,
   type MissionAdoptionResult,
   type MissionHandoffAck,
+  type MissionQuestionAck,
   type MissionLeaseRef,
   type MissionTaskAck,
   type RunnerProtocolCapability,
@@ -157,6 +158,44 @@ export class RunnerHub extends DurableObject<Env> {
                 consumedAt: item.consumedAt,
               },
             }))) return;
+          }
+        }
+        // Mission questions use stable question/answer ids, so reconnect delivery may repeat
+        // safely: the Runner applies each durable identity once rather than inferring from text.
+        if (acceptedCapabilities.includes(MISSION_CAPABILITY)) {
+          const { results: questions } = await this.env.DB.prepare(
+            `SELECT q.project_id AS pid, q.root_run_id AS runId, q.attempt_id AS attemptId,
+                    q.question_id AS questionId, q.signal_id AS signalId, q.state,
+                    q.sitting, q.execution_id AS executionId, q.lease_epoch AS epoch,
+                    q.answer_id AS answerId, q.answer, q.answered_at AS answeredAt
+               FROM mission_questions q JOIN runs r ON r.id = q.root_run_id
+              WHERE q.runner_id = ? AND q.state IN ('open','answered') AND r.reconciliation_pending = 0
+                AND r.status IN ('dispatched','running','blocked') ORDER BY q.published_at`,
+          ).bind(runnerId).all<{
+            pid: string; runId: string; attemptId: string | null; questionId: string; signalId: string;
+            state: 'open' | 'answered'; sitting: number; executionId: string; epoch: number;
+            answerId: string | null; answer: string | null; answeredAt: string | null;
+          }>();
+          for (const item of questions) {
+            if (!(await this.authorizeProject(ws, auth, item.pid))) return;
+            const lease = { sitting: item.sitting, executionId: item.executionId, epoch: item.epoch };
+            const frame = item.state === 'answered'
+              ? {
+                  type: 'mission.question.answer',
+                  answer: {
+                    answerId: item.answerId!, runId: item.runId, questionId: item.questionId,
+                    attemptId: item.attemptId, lease, answer: item.answer!, answeredAt: item.answeredAt!,
+                  },
+                }
+              : {
+                  type: 'mission.question.ack', runId: item.runId, lease,
+                  ack: {
+                    reportId: `replay:${item.questionId}`, questionId: item.questionId,
+                    attemptId: item.attemptId, accepted: true, state: 'open',
+                    signalId: item.signalId, error: null,
+                  },
+                };
+            if (!this.sendIfOpen(ws, JSON.stringify(frame))) return;
           }
         }
         // REST re-registration records only `reconciliation_pending`. The response window starts
@@ -364,6 +403,30 @@ export class RunnerHub extends DurableObject<Env> {
         return;
       }
 
+      case 'mission.question.publish': {
+        const pid = await this.authorizeMissionRun(ws, auth, runnerId, msg.runId);
+        if (!pid) return;
+        if (!(await this.missionFrameAccepted(auth, pid, msg.runId, msg.lease))) {
+          this.sendMissionQuestionAck(ws, msg.runId, msg.lease, {
+            reportId: msg.question.reportId, questionId: msg.question.questionId,
+            attemptId: msg.question.attemptId, accepted: false, state: null, signalId: null,
+            error: 'stale mission lease epoch',
+          });
+          return;
+        }
+        try {
+          const ack = await this.room(pid).publishMissionQuestion(pid, msg.runId, msg.question, msg.lease);
+          this.sendMissionQuestionAck(ws, msg.runId, msg.lease, ack);
+        } catch (error) {
+          this.sendMissionQuestionAck(ws, msg.runId, msg.lease, {
+            reportId: msg.question.reportId, questionId: msg.question.questionId,
+            attemptId: msg.question.attemptId, accepted: false, state: null, signalId: null,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+        return;
+      }
+
       case 'mission.handoff.publish': {
         if (!auth.capabilities?.includes(MISSION_HANDOFF_CAPABILITY)) return;
         const pid = await this.authorizeMissionRun(ws, auth, runnerId, msg.runId);
@@ -388,6 +451,7 @@ export class RunnerHub extends DurableObject<Env> {
       case 'mission.reconcile': {
         if (!auth.capabilities?.includes(MISSION_CAPABILITY)) return;
         const results: MissionAdoptionResult[] = [];
+        const adoptedRunIds: string[] = [];
         for (const inventory of msg.inventory) {
           const row = await this.env.DB.prepare(
             'SELECT project_id AS pid, runner_id AS rid FROM runs WHERE id = ?',
@@ -400,9 +464,43 @@ export class RunnerHub extends DurableObject<Env> {
             continue;
           }
           if (!(await this.authorizeProject(ws, auth, row.pid))) return;
-          results.push(await this.room(row.pid).adoptRunnerMission(row.pid, runnerId, inventory));
+          const result = await this.room(row.pid).adoptRunnerMission(row.pid, runnerId, inventory);
+          results.push(result);
+          if (result.decision === 'adopt') adoptedRunIds.push(inventory.runId);
         }
         this.sendIfOpen(ws, JSON.stringify({ type: 'mission.reconcile.result', results }));
+        for (const runId of adoptedRunIds) {
+          const { results: questions } = await this.env.DB.prepare(
+            `SELECT attempt_id AS attemptId, question_id AS questionId, signal_id AS signalId, state,
+                    sitting, execution_id AS executionId, lease_epoch AS epoch,
+                    answer_id AS answerId, answer, answered_at AS answeredAt
+               FROM mission_questions WHERE root_run_id = ? AND state IN ('open','answered')
+              ORDER BY published_at`,
+          ).bind(runId).all<{
+            attemptId: string | null; questionId: string; signalId: string; state: 'open' | 'answered';
+            sitting: number; executionId: string; epoch: number;
+            answerId: string | null; answer: string | null; answeredAt: string | null;
+          }>();
+          for (const item of questions) {
+            const lease = { sitting: item.sitting, executionId: item.executionId, epoch: item.epoch };
+            const frame = item.state === 'answered'
+              ? {
+                  type: 'mission.question.answer',
+                  answer: {
+                    answerId: item.answerId!, runId, questionId: item.questionId,
+                    attemptId: item.attemptId, lease, answer: item.answer!, answeredAt: item.answeredAt!,
+                  },
+                }
+              : {
+                  type: 'mission.question.ack', runId, lease,
+                  ack: {
+                    reportId: `replay:${item.questionId}`, questionId: item.questionId,
+                    attemptId: item.attemptId, accepted: true, state: 'open', signalId: item.signalId, error: null,
+                  },
+                };
+            if (!this.sendIfOpen(ws, JSON.stringify(frame))) return;
+          }
+        }
         return;
       }
 
@@ -539,6 +637,12 @@ export class RunnerHub extends DurableObject<Env> {
 
   private sendMissionHandoffAck(ws: WebSocket, ack: MissionHandoffAck): void {
     this.sendIfOpen(ws, JSON.stringify({ type: 'mission.handoff.ack', ack }));
+  }
+
+  private sendMissionQuestionAck(
+    ws: WebSocket, runId: string, lease: MissionLeaseRef, ack: MissionQuestionAck,
+  ): void {
+    this.sendIfOpen(ws, JSON.stringify({ type: 'mission.question.ack', runId, lease, ack }));
   }
 
   private rejectedMissionHandoffAck(reportId: string, error: unknown): MissionHandoffAck {
