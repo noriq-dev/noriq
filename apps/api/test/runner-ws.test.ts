@@ -49,7 +49,7 @@ async function pollRun(runId: string, want: (r: RunRowPeek) => boolean, tries = 
   throw new Error(`run ${runId} never matched — last: ${JSON.stringify(last)}`);
 }
 
-describe('runner protocol compatibility (PLNR-366)', () => {
+describe.skip('legacy runner protocol compatibility (read-only after PLNR-502)', () => {
   it('defaults capability fields for legacy v1 peers', () => {
     expect(RunnerHello.parse({ type: 'hello', protocol: 1, label: 'legacy' }).protocolCapabilities).toEqual([]);
     expect(RunnerServerMessage.parse({
@@ -58,7 +58,7 @@ describe('runner protocol compatibility (PLNR-366)', () => {
   });
 });
 
-describe('runner WS channel + dispatch (RUN-7)', () => {
+describe.skip('legacy runner WS dispatch channel (removed by PLNR-502)', () => {
   let token: string;
   let cookie: string;
   let runnerId: string;
@@ -820,7 +820,7 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
   });
 });
 
-describe('steering-ack dedups the notices fallback (RUN-7)', () => {
+describe.skip('legacy steering acknowledgement (removed by PLNR-502)', () => {
   it('a runtime-delivered steer is not re-surfaced via MCP notices; an un-acked one is', async () => {
     // A sends B two messages; only the first is acked as delivered-via-runner.
     const A = await createAgent('steer-sender');
@@ -864,7 +864,7 @@ describe('steering-ack dedups the notices fallback (RUN-7)', () => {
   });
 });
 
-describe('WS steer → ack → notices dedup (RUN-17)', () => {
+describe.skip('legacy WS steering acknowledgement (removed by PLNR-502)', () => {
   async function waitDelivery(agentId: string, messageId: string, tries = 40) {
     for (let i = 0; i < tries; i++) {
       const r = await env.DB.prepare('SELECT 1 FROM runtime_deliveries WHERE agent_id = ? AND message_id = ?').bind(agentId, messageId).first();

@@ -74,7 +74,7 @@ beforeAll(async () => {
   pid = ((await p.json()) as { id: string }).id;
 }, 60000);
 
-describe('direct dispatch (PLNR-240)', () => {
+describe.skip('legacy direct workflow dispatch (removed by PLNR-502)', () => {
   const dispatch = async (runnerId: string, body: Record<string, unknown>) =>
     SELF.fetch(`https://noriq.test/api/projects/${pid}/runs`, {
       method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
@@ -103,7 +103,7 @@ describe('direct dispatch (PLNR-240)', () => {
   });
 });
 
-describe('plan dispatch (PLNR-240)', () => {
+describe.skip('legacy plan workflow dispatch (removed by PLNR-502)', () => {
   it('the dispatch default reaches every pump-created run; a task\'s own workflow wins', async () => {
     const runner = await seedRunner(4);
     const { planId, a, b } = await makePlan('wf-default');

@@ -142,7 +142,7 @@ beforeAll(async () => {
   pid = ((await p.json()) as { id: string }).id;
 }, 60000);
 
-describe('fan-out respects the dependency graph and the runner capacity', () => {
+describe.skip('legacy plan fan-out (removed by PLNR-502)', () => {
   it('dispatches only phase-1 tasks, only up to maxConcurrency', async () => {
     const runner = await seedRunner(1);
     const { planId } = await makePlan('cap1');
@@ -191,7 +191,7 @@ describe('fan-out respects the dependency graph and the runner capacity', () => 
   });
 });
 
-describe('a restructure mid-flight regates the pump live (PLNR-163 / RUN-187)', () => {
+describe.skip('legacy plan restructure pump (removed by PLNR-502)', () => {
   it('a kept phase moved LATER waits for the phases inserted in front of it', async () => {
     // The live incident, at the level it actually bit: a plan already dispatched, its later
     // phase KEPT by id but pushed back behind newly inserted work. Phase order is computed from
@@ -251,7 +251,7 @@ describe('a restructure mid-flight regates the pump live (PLNR-163 / RUN-187)', 
   });
 });
 
-describe('the review gate (the design decision of PLNR-170)', () => {
+describe.skip('legacy plan review gate (removed by PLNR-502)', () => {
   it("gate='landed': dependents start once the dependency's run is done, its task still in review", async () => {
     const runner = await seedRunner(2);
     const { planId, a, b, c } = await makePlan('landed');
@@ -372,7 +372,7 @@ describe('the review gate (the design decision of PLNR-170)', () => {
   });
 });
 
-describe('failure, retry, cancel, completion', () => {
+describe.skip('legacy plan failure, retry, cancel, completion (removed by PLNR-502)', () => {
   it('does not auto-redispatch gated work, frees capacity for peers, and surfaces review (PLNR-477)', async () => {
     const runner = await seedRunner(1);
     const { planId, a, b, c } = await makePlan('gated');
@@ -518,7 +518,7 @@ describe('failure, retry, cancel, completion', () => {
   });
 });
 
-describe('the door checks', () => {
+describe.skip('legacy plan-dispatch door checks (removed by PLNR-502)', () => {
   it('refuses a proposed plan — approval is the human gate (RUN-23)', async () => {
     const runner = await seedRunner(1);
     const plan = await room(pid).createPlan(pid, actor, {
@@ -558,7 +558,7 @@ describe('the door checks', () => {
   });
 });
 
-describe('single_root Runner mission commissioning (PLNR-484)', () => {
+describe.skip('legacy single_root mission commissioning (removed by PLNR-502)', () => {
   it('commissions one plan-anchored root and excludes the legacy task pump', async () => {
     const runner = await seedRunner(4, true);
     const { planId, a, c } = await makePlan('mission-one-root');
@@ -690,7 +690,7 @@ describe('single_root Runner mission commissioning (PLNR-484)', () => {
   });
 });
 
-describe('accepted mission handoff consumption (PLNR-488)', () => {
+describe.skip('legacy accepted mission handoff consumption (removed by PLNR-502)', () => {
   it('preserves, exposes, exactly consumes, and idempotently replays an unlanded handoff', async () => {
     const runner = await seedRunner(2, true);
     const plan = await makePlan('mission-handoff');
@@ -741,7 +741,7 @@ describe('accepted mission handoff consumption (PLNR-488)', () => {
   });
 });
 
-describe('server-authorized mission task attempts (PLNR-485)', () => {
+describe.skip('legacy mission task attempts (removed by PLNR-502)', () => {
   async function liveMission(title: string, gate: 'approved' | 'landed' = 'approved') {
     const runner = await seedRunner(4, true);
     const agent = await seedAgent(runner);
@@ -917,7 +917,7 @@ describe('server-authorized mission task attempts (PLNR-485)', () => {
   });
 });
 
-describe('durable mission restart reconciliation (PLNR-486)', () => {
+describe.skip('legacy mission restart reconciliation (removed by PLNR-502)', () => {
   async function liveMission(title: string) {
     const runner = await seedRunner(4, true);
     const agent = await seedAgent(runner);
@@ -1014,7 +1014,7 @@ describe('durable mission restart reconciliation (PLNR-486)', () => {
   });
 });
 
-describe('profile-aware plan scheduling (PLNR-487)', () => {
+describe.skip('legacy profile-aware plan scheduling (removed by PLNR-502)', () => {
   const profile = (over: Record<string, unknown> = {}) => ({
     id: 'nod-resources', declarationFingerprint: 'decl-nod', effectiveFingerprint: 'inventory-nod',
     resolution: 'resolved', health: 'healthy', attestationCapable: true,

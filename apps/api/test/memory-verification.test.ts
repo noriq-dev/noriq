@@ -539,7 +539,7 @@ describe('acceptVerificationReport — the Runner thorough tier', () => {
   });
 });
 
-describe('POST /api/runs/:runId/verification-report — the run\'s own bound agent only', () => {
+describe.skip('legacy run verification report endpoint (removed by PLNR-502)', () => {
   it("accepts and applies a report from the run's own agent", async () => {
     const { projectId } = await newOwnedProject('pm-verify-rest@example.com', 'PMVREST');
     const { memoryId } = await memory(projectId).recordMemory(projectId, {

@@ -193,7 +193,7 @@ describe('spin_off_task (PLNR-230)', () => {
   // any of them: createRun took the anchor on trust and claimAnchorTaskForRun matched raw
   // `status='todo'` — which is exactly how a proposed spin-off is stored. So a human could
   // dispatch a run straight at an un-accepted proposal and it would be claimed and worked.
-  it('a run cannot be dispatched at a PROPOSED spin-off', async () => {
+  it('legacy run dispatch is cut off before a proposed spin-off can be dispatched', async () => {
     const made = await fileSpinoff('must not be dispatchable');
     // runs.runner_id is a real FK, and the route validates the body before the DO sees it — so a
     // genuine runner is needed to reach the gate this test is about.
@@ -208,8 +208,8 @@ describe('spin_off_task (PLNR-230)', () => {
         anchor: { type: 'task', id: made.id },
       }),
     });
-    expect(res.status).toBeGreaterThanOrEqual(400);
-    expect(await res.text()).toContain('proposed spin-off');
+    expect(res.status).toBe(410);
+    expect(await res.json()).toMatchObject({ code: 'runner_job_cutover' });
   });
 
   it('the run-mint claim cannot take a PROPOSED spin-off even if one is reached directly', async () => {

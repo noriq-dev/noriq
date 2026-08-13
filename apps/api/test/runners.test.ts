@@ -199,7 +199,7 @@ async function mcpRpc(token: string, method: string, params: unknown): Promise<u
   return (await mcpRpcRaw(token, method, params) as { result: unknown }).result;
 }
 
-describe('run agent creation (RUN-43)', () => {
+describe.skip('legacy run agent creation (removed by PLNR-502)', () => {
   const createAgentFor = (token: string, runId: string, body: unknown = {}) =>
     SELF.fetch(`https://noriq.test/api/runs/${runId}/agent`, {
       method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },

@@ -1,5 +1,6 @@
 import { SELF, env } from 'cloudflare:test';
 import { VECTORIZE_METADATA_TOPK_MAX } from '../src/search';
+import { issueTokens } from '../src/oauth';
 
 export const ADMIN = 'test-admin-token';
 
@@ -104,7 +105,7 @@ export async function createAgent(name: string, role: 'orchestrator' | 'worker' 
 }
 
 // ---------------------------------------------------------------------------
-// Acting as a RUNNER-SPAWNED agent (RUN-160).
+// Acting as a historical RUNNER-SPAWNED agent (RUN-160).
 // ---------------------------------------------------------------------------
 
 const runOwnerTokens = new Map<string, string>();
@@ -113,18 +114,14 @@ const runOwnerTokens = new Map<string, string>();
  * An agent with `agents.kind = 'agent'`, bound to a live run of a given kind, and the token that
  * IS it.
  *
- * `createAgent` above cannot produce one and never will: that path mints COPILOTS, held there by
- * a filter in `resolveSessionAgent` whose whole job is to stop a runner's agent being adopted by
- * whoever presents a session id. The two identities are reached differently, too — a copilot is
- * resolved per MCP session, while a run agent rides a token BOUND to it (`connection.boundAgent`)
- * and no session can move it. So a test that needs to act as a build agent has to walk the real
- * runner path: own a runner, seed the run, POST /api/runs/:id/agent. That is what this does, and
- * walking it rather than seeding `agents` directly is the point — a fixture that hand-writes the
- * row it wants would stop telling us whether the endpoint still hands out what it claims to.
+ * New RunnerJob dispatches never mint server-side run agents. The legacy creation endpoint is
+ * intentionally gone, but generic MCP and memory tests still need to exercise how already-stored
+ * bound-agent identities are interpreted. This fixture therefore seeds that historical identity
+ * shape directly. It must not be used to test dispatch or agent creation; the cutover tests assert
+ * those writes return 410.
  *
  * The owner defaults to the user `createAgent` mints under, so a project created by a copilot in
- * the same suite is reachable with no extra grant: the endpoint refuses a run outside the
- * connection's authorized projects (RUN-38), and that check is not decorative.
+ * the same suite remains reachable with no extra grant.
  *
  * `kind` is the three the schema allows — 0018's CHECK constrains `runs.kind` — so a test asking
  * for a kind that cannot exist fails at the type, not with an opaque D1 error.
@@ -164,17 +161,29 @@ export async function createRunAgent(
     `INSERT INTO runs (id, project_id, runner_id, kind, repo_ref, agent_tool, status, created_by)
      VALUES (?, ?, ?, ?, 'repo_fx', 'claude', 'dispatched', ?)`,
   ).bind(runId, projectId, runnerId, kind, owner.id).run();
-
-  const res = await SELF.fetch(`https://noriq.test/api/runs/${runId}/agent`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${ownerToken}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(opts.allowedTools ? { allowedTools: opts.allowedTools } : {}),
-  });
-  if (res.status !== 200) {
-    throw new Error(`createRunAgent: POST /api/runs/${runId}/agent → ${res.status}: ${await res.text()}`);
-  }
-  const body = (await res.json()) as { agentId: string; token: string };
-  return { agentId: body.agentId, apiKey: body.token, runId, runnerId };
+  const client = await db.prepare(
+    'SELECT client_id AS clientId FROM oauth_tokens WHERE user_id = ? ORDER BY rowid DESC LIMIT 1',
+  ).bind(owner.id).first<{ clientId: string }>();
+  if (!client) throw new Error(`createRunAgent: no OAuth client for ${email}`);
+  const agentId = `agt_fx${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+  const now = new Date().toISOString();
+  await db.prepare(
+    `INSERT INTO agents (
+       id, name, label, role, status, kind, actor_class, user_id, project_id, runner_id,
+       allowed_tools, last_seen_at, lineage_status, lineage_reason, lifecycle_updated_at, created_at
+     ) VALUES (?, ?, ?, 'worker', 'active', 'agent', 'runner_agent', ?, ?, ?, ?, ?,
+               'partial', 'legacy_test_fixture', ?, ?)`,
+  ).bind(
+    agentId, `runner-${agentId.slice(-6)}`, `${kind}-${runId.slice(-6)}`,
+    owner.id, projectId, runnerId, opts.allowedTools ? JSON.stringify(opts.allowedTools) : null,
+    now, now, now,
+  ).run();
+  const tokens = await issueTokens(db, client.clientId, owner.id, agentId, 'mcp');
+  await db.batch([
+    db.prepare('UPDATE agents SET oauth_token_id = ? WHERE id = ?').bind(tokens.tokenId, agentId),
+    db.prepare('UPDATE runs SET agent_id = ? WHERE id = ?').bind(agentId, runId),
+  ]);
+  return { agentId, apiKey: tokens.access_token, runId, runnerId };
 }
 
 /** The ProjectRoom for a project, for tests that need to drive a transition the HTTP surface
