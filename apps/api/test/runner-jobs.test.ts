@@ -10,6 +10,7 @@ interface RoomRpc {
   assignRunnerJob(projectId: string, jobId: string, runnerId: string): Promise<{ assignmentId: string } | null>;
   acceptRunnerJob(projectId: string, jobId: string, runnerId: string, assignmentId: string): Promise<boolean>;
   recordRunnerJobEvent(projectId: string, jobId: string, runnerId: string, assignmentId: string, seq: number, event: unknown): Promise<{ accepted: boolean; ack: number; error: string | null }>;
+  cancelRunnerJob(projectId: string, actor: Actor, jobId: string): Promise<{ terminal: boolean }>;
 }
 
 let pid: string;
@@ -169,5 +170,74 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
     expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 4, {
       type: 'warning', at, code: 'LATE', message: 'must not regress terminal state',
     })).toMatchObject({ accepted: false, ack: 3 });
+  });
+
+  it('drains a cancellation and terminalizes unfinished items without cancelling their tasks', async () => {
+    const response = await SELF.fetch('https://noriq.test/api/projects', {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: `RC${crypto.randomUUID().slice(0, 6).toUpperCase()}`, name: 'cancelled runner job' }),
+    });
+    const projectId = ((await response.json()) as { id: string }).id;
+    const isolatedRoom = projectRoom<RoomRpc>(projectId);
+    const task = await isolatedRoom.createTask(projectId, SYSTEM_ACTOR as Actor, { title: 'Cancelled execution' });
+    const job = await isolatedRoom.createRunnerJob(projectId, SYSTEM_ACTOR as Actor, {
+      source: { kind: 'task', id: task.id }, runnerId, repoRef: 'repo', expectedBaseRevision: revision,
+    });
+    await isolatedRoom.assignRunnerJob(projectId, job.id, runnerId);
+    expect(await isolatedRoom.acceptRunnerJob(projectId, job.id, runnerId, job.assignmentId)).toBe(true);
+    const at = new Date().toISOString();
+    expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 1, {
+      type: 'task.result', at, taskId: task.id, status: 'running', checkpoint: null,
+      summary: 'started', findings: [],
+    })).toMatchObject({ accepted: true, ack: 1 });
+    expect(await isolatedRoom.cancelRunnerJob(projectId, SYSTEM_ACTOR as Actor, job.id))
+      .toMatchObject({ terminal: false });
+    expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 2, {
+      type: 'progress', at, phase: 'building', message: 'late progress', progress: 0.5,
+    })).toMatchObject({ accepted: false, ack: 1 });
+
+    const output = {
+      workspaceMode: 'isolated', retainedLocation: { vcs: 'git', label: 'noriq/recovery/cancelled', url: null },
+      baseRevision: revision, headRevision: revision, acceptedTaskCheckpoints: {},
+      checks: [], findings: [],
+      usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0, costUsd: 0, calls: 0 },
+      summary: 'cancelled', dirtyPaths: [],
+    };
+    expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 2, {
+      type: 'terminal', at, status: 'cancelled', output,
+    })).toMatchObject({ accepted: true, ack: 2 });
+    expect(await env.DB.prepare('SELECT status FROM runner_jobs WHERE id = ?').bind(job.id).first<{ status: string }>())
+      .toEqual({ status: 'cancelled' });
+    expect(await env.DB.prepare(
+      'SELECT status, reservation_active AS active FROM runner_job_items WHERE job_id = ?',
+    ).bind(job.id).first<{ status: string; active: number }>())
+      .toEqual({ status: 'cancelled', active: 0 });
+    expect(await env.DB.prepare('SELECT status FROM tasks WHERE id = ?').bind(task.id).first<{ status: string }>())
+      .toEqual({ status: 'todo' });
+  });
+
+  it('accepts only terminal-safe task outcomes while a cancellation drains', async () => {
+    const response = await SELF.fetch('https://noriq.test/api/projects', {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: `RD${crypto.randomUUID().slice(0, 6).toUpperCase()}`, name: 'runner cancellation drain' }),
+    });
+    const projectId = ((await response.json()) as { id: string }).id;
+    const isolatedRoom = projectRoom<RoomRpc>(projectId);
+    const task = await isolatedRoom.createTask(projectId, SYSTEM_ACTOR as Actor, { title: 'Legacy cancellation drain' });
+    const job = await isolatedRoom.createRunnerJob(projectId, SYSTEM_ACTOR as Actor, {
+      source: { kind: 'task', id: task.id }, runnerId, repoRef: 'repo', expectedBaseRevision: revision,
+    });
+    await isolatedRoom.assignRunnerJob(projectId, job.id, runnerId);
+    expect(await isolatedRoom.acceptRunnerJob(projectId, job.id, runnerId, job.assignmentId)).toBe(true);
+    await isolatedRoom.cancelRunnerJob(projectId, SYSTEM_ACTOR as Actor, job.id);
+    const at = new Date().toISOString();
+    expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 1, {
+      type: 'task.result', at, taskId: task.id, status: 'failed', checkpoint: null,
+      summary: 'builder aborted', findings: [],
+    })).toMatchObject({ accepted: true, ack: 1 });
+    expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 2, {
+      type: 'task.result', at, taskId: task.id, status: 'accepted',
+      checkpoint: { ref: revision, label: revision, url: null }, summary: 'too late', findings: [],
+    })).toMatchObject({ accepted: false, ack: 1 });
   });
 });

@@ -4865,7 +4865,10 @@ export class ProjectRoom extends DurableObject<Env> {
         return { accepted: false, ack: job.lastEventSeq, error: `event sequence gap: expected ${job.lastEventSeq + 1}` };
       }
       const cancellationTerminal = event.type === 'terminal' && event.status === 'cancelled';
-      if (!['assigned', 'running', 'waiting'].includes(job.status) || (job.cancelRequestedAt && !cancellationTerminal)) {
+      const cancellationDrain = event.type === 'task.result'
+        && (event.status === 'failed' || event.status === 'cancelled');
+      if (!['assigned', 'running', 'waiting'].includes(job.status)
+        || (job.cancelRequestedAt && !cancellationTerminal && !cancellationDrain)) {
         return { accepted: false, ack: job.lastEventSeq, error: 'job is no longer accepting events' };
       }
       const receivedAt = nowIso();
@@ -4982,10 +4985,22 @@ export class ProjectRoom extends DurableObject<Env> {
                     usage = ?, final_result = ?, finished_at = ?, updated_at = ?
               WHERE id = ? AND status IN ('assigned','running','waiting')`,
           ).bind(event.status, JSON.stringify(event.output.usage), JSON.stringify(event.output), event.at, receivedAt, jobId),
+          ...(event.status === 'cancelled' ? [this.env.DB.prepare(
+            `UPDATE tasks SET status = 'todo', failed_at = NULL,
+                    claimed_by = NULL, claim_expires_at = NULL, updated_at = ?
+              WHERE status = 'in_progress' AND id IN (
+                SELECT task_id FROM runner_job_items
+                 WHERE job_id = ? AND status IN ('pending','running')
+              )`,
+          ).bind(receivedAt, jobId)] : []),
           this.env.DB.prepare(
-            `UPDATE runner_job_items SET status = CASE WHEN status = 'pending' THEN 'not_started' ELSE status END,
+            `UPDATE runner_job_items SET status = CASE
+                      WHEN ? = 'cancelled' AND status IN ('pending','running') THEN 'cancelled'
+                      WHEN status = 'pending' THEN 'not_started'
+                      ELSE status
+                    END,
                     reservation_active = 0, updated_at = ? WHERE job_id = ?`,
-          ).bind(receivedAt, jobId),
+          ).bind(event.status, receivedAt, jobId),
         );
         await rootStatus(event.status === 'succeeded' ? 'succeeded' : event.status === 'cancelled' ? 'cancelled' : 'failed');
       }
