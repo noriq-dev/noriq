@@ -4666,8 +4666,13 @@ export class ProjectRoom extends DurableObject<Env> {
       if (blockerIds.size > 0) {
         const { results: blockerRows } = await this.env.DB.prepare(
           `SELECT t.id, t.status,
-                  EXISTS (SELECT 1 FROM runs r
-                           WHERE r.anchor_type = 'task' AND r.anchor_id = t.id AND r.status = 'done') AS landed
+                  (EXISTS (SELECT 1 FROM runs r
+                           WHERE r.anchor_type = 'task' AND r.anchor_id = t.id AND r.status = 'done')
+                   OR EXISTS (
+                     SELECT 1 FROM mission_task_attempts ma
+                     JOIN mission_handoffs mh ON mh.root_run_id = ma.root_run_id
+                     WHERE ma.task_id = t.id AND ma.status = 'review' AND ma.outcome = 'done'
+                       AND mh.consumed_at IS NOT NULL)) AS landed
              FROM tasks t WHERE t.id IN (SELECT value FROM json_each(?))`,
         ).bind(JSON.stringify([...blockerIds])).all<{ id: string; status: string; landed: number }>();
         const byId = new Map(blockerRows.map((row) => [row.id, row]));
@@ -5077,9 +5082,9 @@ export class ProjectRoom extends DurableObject<Env> {
           `UPDATE claims SET released_at = ?, release_status = ? WHERE id = ? AND released_at IS NULL`,
         ).bind(now, taskStatus, input.claimId),
         this.env.DB.prepare(
-          `UPDATE mission_task_attempts SET settle_hash = ?, settle_ack = ?, status = ?, settled_at = ?, updated_at = ?
+          `UPDATE mission_task_attempts SET settle_hash = ?, settle_ack = ?, status = ?, outcome = ?, settled_at = ?, updated_at = ?
             WHERE id = ? AND status = 'running'`,
-        ).bind(settleHash, JSON.stringify(ack), attemptStatus, now, now, input.attemptId),
+        ).bind(settleHash, JSON.stringify(ack), attemptStatus, input.outcome, now, now, input.attemptId),
       ]);
       await applyMissionTaskExecutionEvent(this.env, {
         rootRunId, attemptId: input.attemptId, executionId: String(attempt.child_execution_id),
@@ -5237,9 +5242,14 @@ export class ProjectRoom extends DurableObject<Env> {
     // PLNR-163) BLOCKS unless done/cancelled — or, under gate='landed', unless it is in
     // review with a landed run. SQL is composed from a fixed pair of literals, never input.
     const landedException = d.gate === 'landed'
-      ? `AND NOT (dt.status = 'review' AND EXISTS (
-           SELECT 1 FROM runs dr
-           WHERE dr.anchor_type = 'task' AND dr.anchor_id = dt.id AND dr.status = 'done'))`
+      ? `AND NOT (dt.status = 'review' AND (
+           EXISTS (SELECT 1 FROM runs dr
+                    WHERE dr.anchor_type = 'task' AND dr.anchor_id = dt.id AND dr.status = 'done')
+           OR EXISTS (
+             SELECT 1 FROM mission_task_attempts ma
+             JOIN mission_handoffs mh ON mh.root_run_id = ma.root_run_id
+             WHERE ma.task_id = dt.id AND ma.status = 'review' AND ma.outcome = 'done'
+               AND mh.consumed_at IS NOT NULL)))`
       : '';
     // One attempt per task per dispatch: automatic pumps never re-run terminal gated/review-stop
     // attempts. `retry` is a separate, human-triggered path and only re-arms failed/cancelled

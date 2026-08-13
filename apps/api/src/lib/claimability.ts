@@ -58,13 +58,21 @@ async function blockerRows(db: D1Database, taskIds: string[]): Promise<Map<strin
   const { results } = await db.prepare(
     `SELECT d.task_id AS taskId, blocker.id AS blockerTaskId, blocker.key, blocker.status,
             'dependency' AS source,
-            EXISTS(SELECT 1 FROM runs r WHERE r.anchor_type = 'task' AND r.anchor_id = blocker.id AND r.status = 'done') AS landedRun
+            (EXISTS(SELECT 1 FROM runs r WHERE r.anchor_type = 'task' AND r.anchor_id = blocker.id AND r.status = 'done')
+             OR EXISTS(SELECT 1 FROM mission_task_attempts ma
+                        JOIN mission_handoffs mh ON mh.root_run_id = ma.root_run_id
+                       WHERE ma.task_id = blocker.id AND ma.status = 'review' AND ma.outcome = 'done'
+                         AND mh.consumed_at IS NOT NULL)) AS landedRun
        FROM dependencies d JOIN tasks blocker ON blocker.id = d.depends_on_task_id
       WHERE d.task_id IN (${ids}) AND blocker.status NOT IN ('done','cancelled')
       UNION ALL
      SELECT pt.task_id AS taskId, blocker.id AS blockerTaskId, blocker.key, blocker.status,
             'phase' AS source,
-            EXISTS(SELECT 1 FROM runs r WHERE r.anchor_type = 'task' AND r.anchor_id = blocker.id AND r.status = 'done') AS landedRun
+            (EXISTS(SELECT 1 FROM runs r WHERE r.anchor_type = 'task' AND r.anchor_id = blocker.id AND r.status = 'done')
+             OR EXISTS(SELECT 1 FROM mission_task_attempts ma
+                        JOIN mission_handoffs mh ON mh.root_run_id = ma.root_run_id
+                       WHERE ma.task_id = blocker.id AND ma.status = 'review' AND ma.outcome = 'done'
+                         AND mh.consumed_at IS NOT NULL)) AS landedRun
        FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id
        JOIN plans pl ON pl.id = ph.plan_id AND pl.status != 'rejected'
        JOIN phases prev ON prev.plan_id = ph.plan_id AND prev."order" < ph."order"

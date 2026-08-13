@@ -739,12 +739,12 @@ describe('accepted mission handoff consumption (PLNR-488)', () => {
 });
 
 describe('server-authorized mission task attempts (PLNR-485)', () => {
-  async function liveMission(title: string) {
+  async function liveMission(title: string, gate: 'approved' | 'landed' = 'approved') {
     const runner = await seedRunner(4, true);
     const agent = await seedAgent(runner);
     const plan = await makePlan(title);
     const dispatch = await createDispatch(runner, plan.planId, {
-      strategy: 'single_root', workflow: 'mission-plan',
+      strategy: 'single_root', workflow: 'mission-plan', gate,
     });
     const root = await env.DB.prepare('SELECT id FROM runs WHERE plan_dispatch_id = ?')
       .bind(dispatch.id).first<{ id: string }>();
@@ -824,6 +824,44 @@ describe('server-authorized mission task attempts (PLNR-485)', () => {
       .bind(mission.a, mission.b).all<{ id: string; status: string; holder: string | null }>();
     expect(states.results.find((task) => task.id === mission.a)).toMatchObject({ status: 'review', holder: null });
     expect(states.results.find((task) => task.id === mission.b)).toMatchObject({ status: 'todo', holder: null });
+  });
+
+  it('unlocks gate=landed only for successful attempts backed by consumed handoff evidence (PLNR-495)', async () => {
+    const mission = await liveMission('mission-landed-evidence', 'landed');
+    for (const [taskId, suffix] of [[mission.a, 'a'], [mission.b, 'b']] as const) {
+      const admitted = await begin(mission.rootRunId, taskId, `landed-${suffix}`);
+      await room(pid).settleMissionTask(pid, mission.rootRunId, {
+        reportId: `settle-landed-${suffix}`, attemptId: `landed-${suffix}`, claimId: admitted.claimId!,
+        outcome: 'done', reason: null, observedAt: new Date().toISOString(),
+      });
+    }
+    expect((await taskClaimability(env.DB, mission.c)).claimable).toBe(false);
+
+    const lease = await room(pid).missionLease(pid, mission.rootRunId);
+    const handoff: AcceptedRevisionHandoff = {
+      schemaVersion: 1, handoffId: 'landed-gate-handoff', backend: 'opaque-vcs', repositoryKey: 'noriq',
+      checkpoint: 'landed-checkpoint', revision: 'landed-revision', reference: 'landed-reference',
+    };
+    await room(pid).publishMissionHandoff(pid, mission.rootRunId, 'landed-publish', handoff, lease);
+    expect((await taskClaimability(env.DB, mission.c)).claimable).toBe(false);
+    await room(pid).consumeMissionHandoff(pid, actor, mission.rootRunId, handoff);
+    expect((await taskClaimability(env.DB, mission.c)).claimable).toBe(true);
+
+    const gated = await liveMission('mission-gated-not-landed', 'landed');
+    for (const [taskId, suffix, outcome] of [
+      [gated.a, 'a', 'gated'], [gated.b, 'b', 'done'],
+    ] as const) {
+      const admitted = await begin(gated.rootRunId, taskId, `not-landed-${suffix}`);
+      await room(pid).settleMissionTask(pid, gated.rootRunId, {
+        reportId: `settle-not-landed-${suffix}`, attemptId: `not-landed-${suffix}`, claimId: admitted.claimId!,
+        outcome, reason: null, observedAt: new Date().toISOString(),
+      });
+    }
+    const gatedLease = await room(pid).missionLease(pid, gated.rootRunId);
+    const gatedHandoff = { ...handoff, handoffId: 'gated-handoff', checkpoint: 'gated-checkpoint' };
+    await room(pid).publishMissionHandoff(pid, gated.rootRunId, 'gated-publish', gatedHandoff, gatedLease);
+    await room(pid).consumeMissionHandoff(pid, actor, gated.rootRunId, gatedHandoff);
+    expect((await taskClaimability(env.DB, gated.c)).claimable).toBe(false);
   });
 });
 
