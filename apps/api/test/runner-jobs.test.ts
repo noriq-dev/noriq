@@ -10,6 +10,13 @@ interface RoomRpc {
   assignRunnerJob(projectId: string, jobId: string, runnerId: string): Promise<{ assignmentId: string } | null>;
   acceptRunnerJob(projectId: string, jobId: string, runnerId: string, assignmentId: string): Promise<boolean>;
   recordRunnerJobEvent(projectId: string, jobId: string, runnerId: string, assignmentId: string, seq: number, event: unknown): Promise<{ accepted: boolean; ack: number; error: string | null }>;
+  requestRunnerJobLanding(projectId: string, actor: Actor, jobId: string): Promise<{
+    runnerId: string; assignmentId: string; requestId: string | null; target: string | null; terminal: boolean;
+  }>;
+  recordRunnerJobLandingResult(
+    projectId: string, jobId: string, runnerId: string, assignmentId: string, requestId: string,
+    result: { status: 'landed' | 'failed'; target: string; checkpoint: { ref: string; label: string; url: string | null } | null; error: string | null },
+  ): Promise<{ accepted: boolean; error: string | null }>;
   cancelRunnerJob(projectId: string, actor: Actor, jobId: string): Promise<{ terminal: boolean }>;
 }
 
@@ -214,6 +221,102 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
       .toEqual({ status: 'cancelled', active: 0 });
     expect(await env.DB.prepare('SELECT status FROM tasks WHERE id = ?').bind(task.id).first<{ status: string }>())
       .toEqual({ status: 'todo' });
+  });
+
+  it('persists one manual landing request and marks reviewed tasks done only after Runner success', async () => {
+    const response = await SELF.fetch('https://noriq.test/api/projects', {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: `RL${crypto.randomUUID().slice(0, 6).toUpperCase()}`, name: 'runner landing' }),
+    });
+    const projectId = ((await response.json()) as { id: string }).id;
+    const isolatedRoom = projectRoom<RoomRpc>(projectId);
+    const task = await isolatedRoom.createTask(projectId, SYSTEM_ACTOR as Actor, { title: 'Land reviewed output' });
+    const job = await isolatedRoom.createRunnerJob(projectId, SYSTEM_ACTOR as Actor, {
+      source: { kind: 'task', id: task.id }, runnerId, repoRef: 'repo', expectedBaseRevision: revision,
+    });
+    await isolatedRoom.assignRunnerJob(projectId, job.id, runnerId);
+    await isolatedRoom.acceptRunnerJob(projectId, job.id, runnerId, job.assignmentId);
+    const at = new Date().toISOString();
+    const checkpoint = { ref: 'c'.repeat(40), label: 'noriq/task/landing', url: null };
+    await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 1, {
+      type: 'task.result', at, taskId: task.id, status: 'accepted', checkpoint,
+      summary: 'reviewed', findings: [],
+    });
+    await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 2, {
+      type: 'terminal', at, status: 'succeeded',
+      output: {
+        workspaceMode: 'isolated', retainedLocation: { vcs: 'git', label: checkpoint.label, url: null },
+        baseRevision: revision, headRevision: checkpoint.ref,
+        acceptedTaskCheckpoints: { [task.id]: checkpoint }, checks: [], findings: [],
+        usage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, costUsd: 0, calls: 1 },
+        summary: 'ready to land', dirtyPaths: [],
+        landing: {
+          policy: 'manual', status: 'retained', target: 'main', checkpoint: null,
+          error: null, requestId: null,
+        },
+      },
+    });
+    expect(await env.DB.prepare('SELECT status FROM tasks WHERE id = ?').bind(task.id).first<{ status: string }>())
+      .toEqual({ status: 'review' });
+
+    const request = await isolatedRoom.requestRunnerJobLanding(projectId, SYSTEM_ACTOR as Actor, job.id);
+    expect(request).toMatchObject({ terminal: false, target: 'main', requestId: expect.any(String) });
+    const replay = await isolatedRoom.requestRunnerJobLanding(projectId, SYSTEM_ACTOR as Actor, job.id);
+    expect(replay.requestId).toBe(request.requestId);
+    const landedCheckpoint = { ref: checkpoint.ref, label: 'main', url: null };
+    expect(await isolatedRoom.recordRunnerJobLandingResult(
+      projectId, job.id, runnerId, job.assignmentId, request.requestId!,
+      { status: 'landed', target: 'main', checkpoint: landedCheckpoint, error: null },
+    )).toEqual({ accepted: true, error: null });
+    expect(await env.DB.prepare('SELECT status FROM tasks WHERE id = ?').bind(task.id).first<{ status: string }>())
+      .toEqual({ status: 'done' });
+    expect(await env.DB.prepare(
+      'SELECT landing_status AS status, landing_checkpoint AS checkpoint FROM runner_jobs WHERE id = ?',
+    ).bind(job.id).first<{ status: string; checkpoint: string }>())
+      .toEqual({ status: 'landed', checkpoint: JSON.stringify(landedCheckpoint) });
+    expect(await isolatedRoom.recordRunnerJobLandingResult(
+      projectId, job.id, runnerId, job.assignmentId, request.requestId!,
+      { status: 'landed', target: 'main', checkpoint: landedCheckpoint, error: null },
+    )).toEqual({ accepted: true, error: null });
+  });
+
+  it('projects an automatic terminal landing without a human request', async () => {
+    const response = await SELF.fetch('https://noriq.test/api/projects', {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: `RA${crypto.randomUUID().slice(0, 6).toUpperCase()}`, name: 'automatic landing' }),
+    });
+    const projectId = ((await response.json()) as { id: string }).id;
+    const isolatedRoom = projectRoom<RoomRpc>(projectId);
+    const task = await isolatedRoom.createTask(projectId, SYSTEM_ACTOR as Actor, { title: 'Automatically landed task' });
+    const job = await isolatedRoom.createRunnerJob(projectId, SYSTEM_ACTOR as Actor, {
+      source: { kind: 'task', id: task.id }, runnerId, repoRef: 'repo', expectedBaseRevision: revision,
+    });
+    await isolatedRoom.assignRunnerJob(projectId, job.id, runnerId);
+    await isolatedRoom.acceptRunnerJob(projectId, job.id, runnerId, job.assignmentId);
+    const at = new Date().toISOString();
+    const checkpoint = { ref: 'e'.repeat(40), label: 'main', url: null };
+    await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 1, {
+      type: 'task.result', at, taskId: task.id, status: 'accepted', checkpoint,
+      summary: 'accepted', findings: [],
+    });
+    expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 2, {
+      type: 'terminal', at, status: 'succeeded',
+      output: {
+        workspaceMode: 'isolated', retainedLocation: { vcs: 'git', label: 'noriq/task/auto', url: null },
+        baseRevision: revision, headRevision: checkpoint.ref,
+        acceptedTaskCheckpoints: { [task.id]: checkpoint }, checks: [], findings: [],
+        usage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, costUsd: 0, calls: 1 },
+        summary: 'automatically landed', dirtyPaths: [],
+        landing: {
+          policy: 'auto', status: 'landed', target: 'main', checkpoint,
+          error: null, requestId: null,
+        },
+      },
+    })).toMatchObject({ accepted: true, ack: 2 });
+    expect(await env.DB.prepare('SELECT status FROM tasks WHERE id = ?').bind(task.id).first<{ status: string }>())
+      .toEqual({ status: 'done' });
+    expect(await env.DB.prepare('SELECT landing_status AS status FROM runner_jobs WHERE id = ?').bind(job.id).first<{ status: string }>())
+      .toEqual({ status: 'landed' });
   });
 
   it('accepts only terminal-safe task outcomes while a cancellation drains', async () => {

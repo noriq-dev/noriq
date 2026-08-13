@@ -4293,13 +4293,21 @@ app.get('/api/projects/:pid/runner-jobs', userAuth, async (c) => {
   const { results } = await c.env.DB.prepare(
     `SELECT id, runner_id AS runnerId, repo_ref AS repoRef, source_kind AS sourceKind,
             source_id AS sourceId, status, phase, progress, usage, final_result AS finalResult,
+            landing_policy AS landingPolicy, landing_status AS landingStatus,
+            landing_target AS landingTarget, landing_request_id AS landingRequestId,
+            landing_requested_at AS landingRequestedAt,
+            landing_finished_at AS landingFinishedAt,
+            landing_checkpoint AS landingCheckpoint, landing_error AS landingError,
             warning_count AS warningCount, created_at AS createdAt, started_at AS startedAt,
             finished_at AS finishedAt, updated_at AS updatedAt
        FROM runner_jobs WHERE project_id = ? ORDER BY created_at DESC LIMIT 100`,
-  ).bind(c.req.param('pid')!).all<Record<string, unknown> & { usage: string; finalResult: string | null }>();
+  ).bind(c.req.param('pid')!).all<Record<string, unknown> & {
+    usage: string; finalResult: string | null; landingCheckpoint: string | null;
+  }>();
   return c.json({ jobs: results.map((job) => ({
     ...job, usage: parseStoredJson(job.usage, null),
     finalResult: parseStoredJson(job.finalResult, null),
+    landingCheckpoint: parseStoredJson(job.landingCheckpoint, null),
   })) });
 });
 
@@ -4309,12 +4317,17 @@ app.get('/api/projects/:pid/runner-jobs/:jobId', userAuth, async (c) => {
             source_id AS sourceId, snapshot, snapshot_digest AS snapshotDigest,
             expected_base_revision AS expectedBaseRevision, orchestration_id AS orchestrationId,
             status, phase, progress, usage, final_result AS finalResult,
+            landing_policy AS landingPolicy, landing_status AS landingStatus,
+            landing_target AS landingTarget, landing_request_id AS landingRequestId,
+            landing_requested_at AS landingRequestedAt,
+            landing_finished_at AS landingFinishedAt,
+            landing_checkpoint AS landingCheckpoint, landing_error AS landingError,
             warning_count AS warningCount, last_event_seq AS lastEventSeq,
             created_at AS createdAt, assigned_at AS assignedAt, started_at AS startedAt,
             cancel_requested_at AS cancelRequestedAt, finished_at AS finishedAt, updated_at AS updatedAt
        FROM runner_jobs WHERE id = ? AND project_id = ?`,
   ).bind(c.req.param('jobId')!, c.req.param('pid')!).first<Record<string, unknown> & {
-    snapshot: string; usage: string; finalResult: string | null;
+    snapshot: string; usage: string; finalResult: string | null; landingCheckpoint: string | null;
   }>();
   if (!job) return c.json({ error: 'RunnerJob not found' }, 404);
   const [items, events, questions] = await Promise.all([
@@ -4339,6 +4352,7 @@ app.get('/api/projects/:pid/runner-jobs/:jobId', userAuth, async (c) => {
     job: {
       ...job, snapshot: parseStoredJson(job.snapshot, null), usage: parseStoredJson(job.usage, null),
       finalResult: parseStoredJson(job.finalResult, null),
+      landingCheckpoint: parseStoredJson(job.landingCheckpoint, null),
     },
     items: items.results.map((item) => ({
       ...item, findings: parseStoredJson(item.findings, []),
@@ -4361,6 +4375,24 @@ app.post('/api/projects/:pid/runner-jobs/:jobId/cancel', userAuth, async (c) => 
     return c.json({ ok: true, terminal: result.terminal, ...delivery });
   } catch (error) {
     return c.json({ error: error instanceof Error ? error.message : 'RunnerJob cancellation failed' }, 409);
+  }
+});
+
+app.post('/api/projects/:pid/runner-jobs/:jobId/land', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  try {
+    const result = await room(c.env, pid).requestRunnerJobLanding(
+      pid, humanActor(c), c.req.param('jobId')!,
+    );
+    const delivery = result.terminal
+      ? { delivered: false }
+      : await hub(c.env, result.runnerId).deliverRunnerJobLanding(c.req.param('jobId')!);
+    return c.json({
+      ok: true, terminal: result.terminal, requestId: result.requestId,
+      target: result.target, ...delivery,
+    });
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : 'RunnerJob landing failed' }, 409);
   }
 });
 

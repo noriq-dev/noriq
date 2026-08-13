@@ -2,9 +2,12 @@ key = "PLNR"
 repositoryKey = "noriq"
 defaultBranch = "main"
 
-[workspace]
+[sourceControl]
+backend = "auto"
 mode = "isolated"
-baseBranch = "main"
+base = "main"
+target = "main"
+landing = "manual"
 
 [harness]
 maxParallelTasks = 2

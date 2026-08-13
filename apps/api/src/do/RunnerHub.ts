@@ -139,6 +139,31 @@ export class RunnerHub extends DurableObject<Env> {
     return { delivered };
   }
 
+  async deliverRunnerJobLanding(jobId: string): Promise<{ delivered: boolean }> {
+    const runnerId = await this.loadRunnerId();
+    if (!runnerId) return { delivered: false };
+    const row = await this.env.DB.prepare(
+      `SELECT project_id AS pid, assignment_id AS assignmentId,
+              landing_request_id AS requestId, landing_target AS target
+         FROM runner_jobs
+        WHERE id = ? AND runner_id = ? AND landing_status IN ('requested','landing')`,
+    ).bind(jobId, runnerId).first<{
+      pid: string; assignmentId: string; requestId: string | null; target: string | null;
+    }>();
+    if (!row?.requestId || !row.target) return { delivered: false };
+    let delivered = false;
+    for (const ws of this.ctx.getWebSockets()) {
+      const auth = await this.authorizeSocket(ws);
+      if (!auth || (auth as RunnerSocketAttachment).jobProtocol !== 2) continue;
+      if (!(await this.authorizeProject(ws, auth, row.pid))) continue;
+      delivered = this.sendIfOpen(ws, JSON.stringify({
+        type: 'job.land', jobId, assignmentId: row.assignmentId,
+        requestId: row.requestId, target: row.target,
+      })) || delivered;
+    }
+    return { delivered };
+  }
+
   /** Capability-scoped fast path. Durable state remains the source of replay; this prevents an
    * additive frame from being sent to an older socket that never negotiated its parser. */
   async deliverCapability(
@@ -716,6 +741,21 @@ export class RunnerHub extends DurableObject<Env> {
       for (const answer of answers) {
         if (!this.sendIfOpen(ws, JSON.stringify({ type: 'job.answer', ...answer }))) return;
       }
+      const { results: landings } = await this.env.DB.prepare(
+        `SELECT id AS jobId, project_id AS pid, assignment_id AS assignmentId,
+                landing_request_id AS requestId, landing_target AS target
+           FROM runner_jobs
+          WHERE runner_id = ? AND landing_status IN ('requested','landing')
+          ORDER BY landing_requested_at`,
+      ).bind(runnerId).all<{
+        jobId: string; pid: string; assignmentId: string;
+        requestId: string; target: string;
+      }>();
+      for (const landing of landings) {
+        if (!(await this.authorizeProject(ws, auth, landing.pid))) return;
+        const { pid: _pid, ...frame } = landing;
+        if (!this.sendIfOpen(ws, JSON.stringify({ type: 'job.land', ...frame }))) return;
+      }
       return;
     }
 
@@ -762,6 +802,24 @@ export class RunnerHub extends DurableObject<Env> {
       this.sendIfOpen(ws, JSON.stringify({
         type: 'job.event.ack', jobId: message.jobId,
         assignmentId: message.assignmentId, seq: result.ack,
+      }));
+      return;
+    }
+    if (message.type === 'job.land.result') {
+      const result = await this.room(row.pid).recordRunnerJobLandingResult(
+        row.pid, message.jobId, runnerId, message.assignmentId, message.requestId,
+        {
+          status: message.status, target: message.target,
+          checkpoint: message.checkpoint, error: message.error,
+        },
+      );
+      if (!result.accepted) {
+        ws.close(1008, result.error ?? 'RunnerJob landing result rejected');
+        return;
+      }
+      this.sendIfOpen(ws, JSON.stringify({
+        type: 'job.land.ack', jobId: message.jobId,
+        assignmentId: message.assignmentId, requestId: message.requestId,
       }));
       return;
     }

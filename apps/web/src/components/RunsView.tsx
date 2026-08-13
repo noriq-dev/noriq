@@ -161,6 +161,12 @@ export function RunsView({ store }: { store: AppStore }) {
                   await api.cancelRunnerJob(pid, detail.job.id);
                   await load();
                 }}
+                onLand={async () => {
+                  const target = detail.job.landingTarget ?? 'the configured target';
+                  if (!(await confirm(`Accept this reviewed output and ask Runner to land it into ${target}?`))) return;
+                  await api.landRunnerJob(pid, detail.job.id);
+                  await load();
+                }}
               />
             ) : (
               <EmptyState>select a job to inspect its evidence and retained Git result</EmptyState>
@@ -298,10 +304,19 @@ function JobRow({ job, title, selected, onClick }: { job: ApiRunnerJobSummary; t
   );
 }
 
-function JobDetail({ detail, onRefresh, onCancel }: { detail: ApiRunnerJobDetail; onRefresh: () => Promise<void>; onCancel: () => Promise<void> }) {
+function JobDetail({ detail, onRefresh, onCancel, onLand }: {
+  detail: ApiRunnerJobDetail;
+  onRefresh: () => Promise<void>;
+  onCancel: () => Promise<void>;
+  onLand: () => Promise<void>;
+}) {
   const { job, items, questions } = detail;
   const output = job.finalResult;
   const statusStyle = JOB_STATUS_STYLE[job.status];
+  const canLand = job.status === 'succeeded'
+    && ['manual', 'auto'].includes(job.landingPolicy)
+    && ['retained', 'failed'].includes(job.landingStatus);
+  const landingPending = ['requested', 'landing'].includes(job.landingStatus);
   return (
     <div style={{ borderRadius: 11, border: '1px solid var(--w-07)', background: 'var(--w-02)', padding: 16 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
@@ -309,6 +324,8 @@ function JobDetail({ detail, onRefresh, onCancel }: { detail: ApiRunnerJobDetail
         <strong style={{ fontSize: 14 }}>{job.sourceKind} job</strong>
         <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>{job.id}</span>
         <div style={{ flex: 1 }} />
+        {canLand && <Button variant="primary" onClick={onLand}>{job.landingStatus === 'failed' ? 'retry landing' : 'accept & land'}</Button>}
+        {landingPending && <Button variant="ghost" disabled>landing requested</Button>}
         {!TERMINAL_JOBS.includes(job.status) && <Button variant="danger" onClick={onCancel}>cancel</Button>}
       </div>
       <div style={{ height: 4, borderRadius: 4, background: 'var(--w-07)', margin: '14px 0' }}>
@@ -338,7 +355,7 @@ function JobDetail({ detail, onRefresh, onCancel }: { detail: ApiRunnerJobDetail
           </div>
         ))}
       </Section>
-      {output && <Output output={output} />}
+      {output && <Output output={output} job={job} />}
     </div>
   );
 }
@@ -366,11 +383,22 @@ function Question({ projectId, pid: jobId, question, onAnswered }: { projectId: 
   );
 }
 
-function Output({ output }: { output: ApiRunnerJobOutput }) {
+function Output({ output, job }: { output: ApiRunnerJobOutput; job: ApiRunnerJobSummary }) {
+  const landingMessage = job.landingStatus === 'landed'
+    ? `Runner landed this reviewed output into ${job.landingTarget ?? 'the configured target'}.`
+    : job.landingStatus === 'failed'
+      ? `Landing failed and the reviewed output remains retained: ${job.landingError ?? 'unknown error'}`
+      : job.landingPolicy === 'manual'
+        ? `Reviewed output is retained. Accept & land will ask Runner to integrate it into ${job.landingTarget ?? 'the configured target'}.`
+        : job.landingPolicy === 'auto'
+          ? `Runner is configured to land successful reviewed output automatically into ${job.landingTarget ?? 'the configured target'}.`
+          : output.workspaceMode === 'direct'
+            ? 'Runner committed accepted work directly to the configured target.'
+            : 'Human merge required. Runner retained this work locally and will not integrate it automatically.';
   return (
     <Section title="Retained output">
       <div style={{ padding: 11, borderRadius: 8, background: 'rgba(76,157,255,.06)', border: '1px solid rgba(76,157,255,.18)', fontSize: 11.5, lineHeight: 1.55 }}>
-        <strong>Human merge required.</strong> Runner retained this work locally and did not push, merge another branch, or open a pull request.
+        <strong>Landing: {job.landingStatus}.</strong> {landingMessage}
       </div>
       <dl style={{ display: 'grid', gridTemplateColumns: '100px minmax(0, 1fr)', gap: '6px 10px', fontFamily: 'var(--mono)', fontSize: 10.5 }}>
         <dt>mode</dt><dd>{output.workspaceMode}</dd>

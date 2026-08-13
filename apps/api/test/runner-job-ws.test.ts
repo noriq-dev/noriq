@@ -160,4 +160,71 @@ describe('RunnerJob protocol v2 (PLNR-499)', () => {
     expect(await env.DB.prepare('SELECT status FROM runner_jobs WHERE id = ?').bind(job.id).first<{ status: string }>())
       .toEqual({ status: 'queued' });
   });
+
+  it('redelivers a durable human landing request and acknowledges its idempotent result', async () => {
+    const ws = await connect();
+    const taskId = await createTask('Landing protocol task');
+    const assignedPromise = nextFrame(ws, (message) => message.type === 'job.assign');
+    const job = await dispatch(taskId);
+    await assignedPromise;
+    ws.send(JSON.stringify({ type: 'job.accept', jobId: job.id, assignmentId: job.assignmentId }));
+    const checkpoint = { ref: 'd'.repeat(40), label: 'noriq/task/landing-protocol', url: null };
+    const acceptedAck = nextFrame(ws, (message) => message.type === 'job.event.ack' && message.seq === 1);
+    ws.send(JSON.stringify({
+      type: 'job.event', jobId: job.id, assignmentId: job.assignmentId, seq: 1,
+      payload: {
+        type: 'task.result', at: new Date().toISOString(), taskId, status: 'accepted',
+        checkpoint, summary: 'reviewed', findings: [],
+      },
+    }));
+    await acceptedAck;
+    const terminalAck = nextFrame(ws, (message) => message.type === 'job.event.ack' && message.seq === 2);
+    ws.send(JSON.stringify({
+      type: 'job.event', jobId: job.id, assignmentId: job.assignmentId, seq: 2,
+      payload: {
+        type: 'terminal', at: new Date().toISOString(), status: 'succeeded',
+        output: {
+          workspaceMode: 'isolated', retainedLocation: { vcs: 'git', label: checkpoint.label, url: null },
+          baseRevision, headRevision: checkpoint.ref, acceptedTaskCheckpoints: { [taskId]: checkpoint },
+          checks: [], findings: [],
+          usage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, costUsd: 0, calls: 1 },
+          summary: 'ready', dirtyPaths: [],
+          landing: {
+            policy: 'manual', status: 'retained', target: 'main', checkpoint: null,
+            error: null, requestId: null,
+          },
+        },
+      },
+    }));
+    await terminalAck;
+
+    const landingFrame = nextFrame(ws, (message) => message.type === 'job.land' && message.jobId === job.id);
+    const request = await SELF.fetch(`https://noriq.test/api/projects/${pid}/runner-jobs/${job.id}/land`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: '{}',
+    });
+    expect(request.status).toBe(200);
+    const landing = RunnerJobServerMessage.parse(await landingFrame);
+    expect(landing).toMatchObject({ type: 'job.land', jobId: job.id, target: 'main' });
+    if (landing.type !== 'job.land') throw new Error('landing frame not received');
+    ws.close();
+
+    const reconnected = await connect();
+    const replay = RunnerJobServerMessage.parse(await nextFrame(
+      reconnected,
+      (message) => message.type === 'job.land' && message.jobId === job.id,
+    ));
+    expect(replay).toEqual(landing);
+    const ack = nextFrame(reconnected, (message) => message.type === 'job.land.ack' && message.jobId === job.id);
+    reconnected.send(JSON.stringify({
+      type: 'job.land.result', jobId: job.id, assignmentId: job.assignmentId,
+      requestId: landing.requestId, status: 'landed', target: 'main',
+      checkpoint: { ref: checkpoint.ref, label: 'main', url: null }, error: null,
+    }));
+    expect(await ack).toMatchObject({ requestId: landing.requestId });
+    expect(await env.DB.prepare('SELECT status FROM tasks WHERE id = ?').bind(taskId).first<{ status: string }>())
+      .toEqual({ status: 'done' });
+    expect(await env.DB.prepare('SELECT landing_status AS status FROM runner_jobs WHERE id = ?').bind(job.id).first<{ status: string }>())
+      .toEqual({ status: 'landed' });
+    reconnected.close();
+  });
 });

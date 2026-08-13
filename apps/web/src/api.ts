@@ -520,6 +520,10 @@ export const api = {
     req<{ job: ApiRunnerJobSummary; delivered: boolean }>('POST', `/api/projects/${pid}/plans/${planId}/runner-jobs`, body),
   cancelRunnerJob: (pid: string, jobId: string) =>
     req<{ ok: true; terminal: boolean; delivered?: boolean }>('POST', `/api/projects/${pid}/runner-jobs/${jobId}/cancel`, {}),
+  landRunnerJob: (pid: string, jobId: string) =>
+    req<{ ok: true; terminal: boolean; delivered: boolean; requestId: string | null; target: string | null }>(
+      'POST', `/api/projects/${pid}/runner-jobs/${jobId}/land`, {},
+    ),
   answerRunnerJobQuestion: (pid: string, jobId: string, questionId: string, answer: string) =>
     req<{ ok: true; delivered: boolean }>(
       'POST', `/api/projects/${pid}/runner-jobs/${jobId}/questions/${questionId}/answer`, { answer },
@@ -842,6 +846,8 @@ export interface ApiOrchestrationTree {
 export type RunnerJobStatus = 'queued' | 'assigned' | 'running' | 'waiting' | 'succeeded' | 'partial' | 'failed' | 'cancelled';
 export type RunnerJobPhase = 'preparing' | 'planning' | 'building' | 'checking' | 'reviewing' | 'repairing' | 'integrating' | 'finalizing';
 export type RunnerJobTaskStatus = 'pending' | 'running' | 'accepted' | 'failed' | 'not_started' | 'cancelled';
+export type RunnerJobLandingPolicy = 'retain' | 'manual' | 'auto' | 'direct';
+export type RunnerJobLandingStatus = 'retained' | 'requested' | 'landing' | 'landed' | 'failed' | 'not_applicable';
 export interface RunnerJobDispatchInput { runnerId: string; repoRef: string }
 export interface ApiRunnerJobUsage {
   inputTokens: number; outputTokens: number; cachedTokens: number; costUsd: number | null; calls: number;
@@ -864,6 +870,10 @@ export interface ApiRunnerJobSummary {
   status: RunnerJobStatus; phase: RunnerJobPhase; progress: number; usage: ApiRunnerJobUsage | null;
   finalResult: ApiRunnerJobOutput | null; warningCount: number; createdAt: string; startedAt: string | null;
   finishedAt: string | null; updatedAt: string;
+  landingPolicy: RunnerJobLandingPolicy; landingStatus: RunnerJobLandingStatus;
+  landingTarget: string | null; landingRequestId: string | null;
+  landingRequestedAt: string | null; landingFinishedAt: string | null;
+  landingCheckpoint: ApiRunnerJobCheckpoint | null; landingError: string | null;
 }
 export interface ApiRunnerJobItem {
   taskId: string; taskKey: string; phaseOrder: number; taskOrder: number; status: RunnerJobTaskStatus;

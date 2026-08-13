@@ -14,7 +14,7 @@ import {
 import { searchBackend, indexEntity, removeEntity, type SearchKind } from '../search';
 import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
-import { MISSION_CAPABILITY, MissionCommission as MissionCommissionSchema, MissionRootCommission as MissionRootCommissionSchema, RunnerJobEvent as RunnerJobEventSchema, RunnerJobSource as RunnerJobSourceSchema, RunKind, AgentTool, RunStatus, ExecutionProfileOffer, type AcceptedRevisionHandoff, type AcceptedRevisionHandoffView, type CommissionedExecutionProfile, type MissionCommission, type MissionCommissionSnapshot, type MissionRootCommission, type RunnerJobAssignment, type RunnerJobEvent, type RunnerJobSource, type TaskRootMissionCommissionSnapshot, type MissionHandoffAck, type MissionHandoffConsumed, type MissionQuestionAck, type MissionQuestionAnswer, type MissionQuestionPublication, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
+import { MISSION_CAPABILITY, MissionCommission as MissionCommissionSchema, MissionRootCommission as MissionRootCommissionSchema, RunnerJobEvent as RunnerJobEventSchema, RunnerJobSource as RunnerJobSourceSchema, RunKind, AgentTool, RunStatus, ExecutionProfileOffer, type AcceptedRevisionHandoff, type AcceptedRevisionHandoffView, type CommissionedExecutionProfile, type MissionCommission, type MissionCommissionSnapshot, type MissionRootCommission, type RunnerJobAssignment, type RunnerJobCheckpoint, type RunnerJobEvent, type RunnerJobSource, type TaskRootMissionCommissionSnapshot, type MissionHandoffAck, type MissionHandoffConsumed, type MissionQuestionAck, type MissionQuestionAnswer, type MissionQuestionPublication, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
 import { readExecutionSpec, writeExecutionSpec } from '../lib/execution-spec';
 import { processPendingCopilotEpisodeJob, processPendingEpisodeJob } from '../memory/episodes';
 import { applyMissionTaskExecutionEvent, ensureMissionTaskExecution, ensureRunExecution, mirrorRunTransition } from '../lib/orchestration-store';
@@ -4979,12 +4979,55 @@ export class ProjectRoom extends DurableObject<Env> {
         if (!terminal.includes(event.status)) {
           return { accepted: false, ack: job.lastEventSeq, error: 'invalid terminal status' };
         }
+        const landing = event.output.landing ?? (event.output.workspaceMode === 'direct'
+          ? {
+              policy: 'direct' as const, status: 'landed' as const,
+              target: null,
+              checkpoint: {
+                ref: event.output.headRevision,
+                label: event.output.retainedLocation.label,
+                url: event.output.retainedLocation.url,
+              },
+              error: null, requestId: null,
+            }
+          : {
+              policy: 'retain' as const, status: 'retained' as const,
+              target: null, checkpoint: null, error: null, requestId: null,
+            });
+        const landingValid = landing.requestId === null
+          && (landing.status !== 'landed' || landing.checkpoint !== null)
+          && (landing.status !== 'failed' || landing.error !== null)
+          && (landing.policy !== 'manual'
+            || (landing.target !== null && ['retained', 'not_applicable'].includes(landing.status)))
+          && (landing.policy !== 'auto'
+            || (landing.target !== null && ['landed', 'failed', 'not_applicable'].includes(landing.status)))
+          && (landing.policy !== 'retain' || ['retained', 'not_applicable'].includes(landing.status))
+          && (landing.policy !== 'direct' || ['landed', 'not_applicable'].includes(landing.status))
+          && !['requested', 'landing'].includes(landing.status)
+          && !(event.status !== 'succeeded' && landing.policy === 'auto' && landing.status === 'landed');
+        if (!landingValid) {
+          return { accepted: false, ack: job.lastEventSeq, error: 'terminal event has an invalid landing outcome' };
+        }
         statements.push(
           this.env.DB.prepare(
             `UPDATE runner_jobs SET status = ?, phase = 'finalizing', progress = 1,
-                    usage = ?, final_result = ?, finished_at = ?, updated_at = ?
+                    usage = ?, final_result = ?, landing_policy = ?, landing_status = ?,
+                    landing_target = ?, landing_request_id = ?, landing_checkpoint = ?,
+                    landing_error = ?, landing_finished_at = ?, finished_at = ?, updated_at = ?
               WHERE id = ? AND status IN ('assigned','running','waiting')`,
-          ).bind(event.status, JSON.stringify(event.output.usage), JSON.stringify(event.output), event.at, receivedAt, jobId),
+          ).bind(
+            event.status, JSON.stringify(event.output.usage), JSON.stringify(event.output),
+            landing.policy, landing.status, landing.target, landing.requestId,
+            landing.checkpoint ? JSON.stringify(landing.checkpoint) : null, landing.error,
+            ['landed', 'failed', 'not_applicable'].includes(landing.status) ? event.at : null,
+            event.at, receivedAt, jobId,
+          ),
+          ...(landing.status === 'landed' ? [this.env.DB.prepare(
+            `UPDATE tasks SET status = 'done', updated_at = ?
+              WHERE status = 'review' AND id IN (
+                SELECT task_id FROM runner_job_items WHERE job_id = ? AND status = 'accepted'
+              )`,
+          ).bind(receivedAt, jobId)] : []),
           ...(event.status === 'cancelled' ? [this.env.DB.prepare(
             `UPDATE tasks SET status = 'todo', failed_at = NULL,
                     claimed_by = NULL, claim_expires_at = NULL, updated_at = ?
@@ -5029,6 +5072,142 @@ export class ProjectRoom extends DurableObject<Env> {
     if (row.cancelRequestedAt || !['assigned', 'running', 'waiting'].includes(row.status)) return 'cancel';
     if (lastLocalSeq < row.lastEventSeq) return 'cancel';
     return 'continue';
+  }
+
+  async requestRunnerJobLanding(
+    projectId: string,
+    actor: Actor,
+    jobId: string,
+  ): Promise<{
+    runnerId: string; assignmentId: string; requestId: string | null;
+    target: string | null; terminal: boolean;
+  }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const row = await this.env.DB.prepare(
+        `SELECT runner_id AS runnerId, assignment_id AS assignmentId, status,
+                landing_policy AS landingPolicy, landing_status AS landingStatus,
+                landing_target AS landingTarget, landing_request_id AS landingRequestId
+           FROM runner_jobs WHERE id = ? AND project_id = ?`,
+      ).bind(jobId, projectId).first<{
+        runnerId: string; assignmentId: string; status: string;
+        landingPolicy: string; landingStatus: string; landingTarget: string | null;
+        landingRequestId: string | null;
+      }>();
+      if (!row) throw new Error('RunnerJob not found');
+      if (row.status !== 'succeeded') throw new Error('only a succeeded RunnerJob can be landed');
+      if (row.landingStatus === 'landed') {
+        return {
+          runnerId: row.runnerId, assignmentId: row.assignmentId,
+          requestId: row.landingRequestId, target: row.landingTarget, terminal: true,
+        };
+      }
+      if (!['manual', 'auto'].includes(row.landingPolicy)) {
+        throw new Error(
+          row.landingPolicy === 'direct'
+            ? 'direct RunnerJob output is already landed'
+            : 'this repository is configured to retain output for human-managed integration',
+        );
+      }
+      if (!row.landingTarget) throw new Error('RunnerJob did not publish a landing target');
+      if (['requested', 'landing'].includes(row.landingStatus) && row.landingRequestId) {
+        return {
+          runnerId: row.runnerId, assignmentId: row.assignmentId,
+          requestId: row.landingRequestId, target: row.landingTarget, terminal: false,
+        };
+      }
+      const requestId = newId('land');
+      const at = nowIso();
+      const result = await this.env.DB.prepare(
+        `UPDATE runner_jobs SET landing_status = 'requested', landing_request_id = ?,
+                landing_requested_by = ?, landing_requested_at = ?, landing_started_at = NULL,
+                landing_finished_at = NULL, landing_checkpoint = NULL, landing_error = NULL,
+                updated_at = ?
+          WHERE id = ? AND project_id = ? AND status = 'succeeded'
+            AND landing_status IN ('retained','failed')`,
+      ).bind(requestId, actor.id, at, at, jobId, projectId).run();
+      if (result.meta.changes !== 1) throw new Error('RunnerJob landing state changed; refresh and retry');
+      await this.emit(actor, 'runner_job.status_changed', 'runner_job', jobId, {
+        landing: { from: row.landingStatus, to: 'requested', requestId, target: row.landingTarget },
+      });
+      return {
+        runnerId: row.runnerId, assignmentId: row.assignmentId,
+        requestId, target: row.landingTarget, terminal: false,
+      };
+    });
+  }
+
+  async recordRunnerJobLandingResult(
+    projectId: string,
+    jobId: string,
+    runnerId: string,
+    assignmentId: string,
+    requestId: string,
+    result: {
+      status: 'landed' | 'failed'; target: string;
+      checkpoint: RunnerJobCheckpoint | null; error: string | null;
+    },
+  ): Promise<{ accepted: boolean; error: string | null }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const row = await this.env.DB.prepare(
+        `SELECT runner_id AS runnerId, assignment_id AS assignmentId,
+                landing_request_id AS landingRequestId, landing_status AS landingStatus,
+                landing_target AS landingTarget, landing_checkpoint AS landingCheckpoint,
+                landing_error AS landingError
+           FROM runner_jobs WHERE id = ? AND project_id = ?`,
+      ).bind(jobId, projectId).first<{
+        runnerId: string; assignmentId: string; landingRequestId: string | null;
+        landingStatus: string; landingTarget: string | null;
+        landingCheckpoint: string | null; landingError: string | null;
+      }>();
+      if (!row || row.runnerId !== runnerId || row.assignmentId !== assignmentId
+        || row.landingRequestId !== requestId) {
+        return { accepted: false, error: 'stale or foreign landing request' };
+      }
+      if (row.landingTarget !== result.target) {
+        return { accepted: false, error: 'landing target differs from the durable request' };
+      }
+      if (['landed', 'failed'].includes(row.landingStatus)) {
+        const same = row.landingStatus === result.status
+          && row.landingCheckpoint === (result.checkpoint ? JSON.stringify(result.checkpoint) : null)
+          && row.landingError === result.error;
+        return same
+          ? { accepted: true, error: null }
+          : { accepted: false, error: 'landing result conflicts with its durable outcome' };
+      }
+      if (!['requested', 'landing'].includes(row.landingStatus)) {
+        return { accepted: false, error: 'RunnerJob is not accepting a landing result' };
+      }
+      if (result.status === 'landed' && !result.checkpoint) {
+        return { accepted: false, error: 'landed result requires a checkpoint' };
+      }
+      if (result.status === 'failed' && !result.error) {
+        return { accepted: false, error: 'failed result requires an error' };
+      }
+      const at = nowIso();
+      const statements = [
+        this.env.DB.prepare(
+          `UPDATE runner_jobs SET landing_status = ?, landing_started_at = COALESCE(landing_started_at, ?),
+                  landing_finished_at = ?, landing_checkpoint = ?, landing_error = ?, updated_at = ?
+            WHERE id = ? AND landing_request_id = ? AND landing_status IN ('requested','landing')`,
+        ).bind(
+          result.status, at, at, result.checkpoint ? JSON.stringify(result.checkpoint) : null,
+          result.error, at, jobId, requestId,
+        ),
+        ...(result.status === 'landed' ? [this.env.DB.prepare(
+          `UPDATE tasks SET status = 'done', updated_at = ?
+            WHERE status = 'review' AND id IN (
+              SELECT task_id FROM runner_job_items WHERE job_id = ? AND status = 'accepted'
+            )`,
+        ).bind(at, jobId)] : []),
+      ];
+      await this.env.DB.batch(statements);
+      await this.emit(SYSTEM_ACTOR, 'runner_job.status_changed', 'runner_job', jobId, {
+        landing: { from: row.landingStatus, to: result.status, requestId, target: result.target },
+      });
+      return { accepted: true, error: null };
+    });
   }
 
   async cancelRunnerJob(projectId: string, actor: Actor, jobId: string): Promise<{
