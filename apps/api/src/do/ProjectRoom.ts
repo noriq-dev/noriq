@@ -295,6 +295,7 @@ type RunRow = {
   sitting: number;
   lease_epoch: number;
   reconciliation_deadline: string | null;
+  reconciliation_pending: number;
 };
 
 // The wire shape of a Run (mirrors the shared Run entity). Named explicitly so the
@@ -4810,6 +4811,7 @@ export class ProjectRoom extends DurableObject<Env> {
     projectId: string,
     runnerId: string,
     deadlineMs = 30_000,
+    pendingOnly = false,
   ): Promise<{ deadline: string; items: MissionInventoryItem[] }> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
@@ -4817,7 +4819,8 @@ export class ProjectRoom extends DurableObject<Env> {
       const { results } = await this.env.DB.prepare(
         `SELECT r.id FROM runs r JOIN plan_dispatches pd ON pd.id = r.plan_dispatch_id
           WHERE r.project_id = ? AND r.runner_id = ? AND pd.strategy = 'single_root'
-            AND r.status IN ('dispatched','running','blocked')`,
+            AND r.status IN ('dispatched','running','blocked')
+            ${pendingOnly ? 'AND r.reconciliation_pending = 1 AND r.reconciliation_deadline IS NULL' : ''}`,
       ).bind(projectId, runnerId).all<{ id: string }>();
       const items: MissionInventoryItem[] = [];
       for (const { id } of results) {
@@ -4833,6 +4836,24 @@ export class ProjectRoom extends DurableObject<Env> {
       }
       await this.scheduleExpiryAlarm();
       return { deadline, items };
+    });
+  }
+
+  /** REST registration can prove process replacement but cannot carry the inventory response.
+   * Record only the need to reconcile; the negotiated WebSocket hello starts the deadline. */
+  async markRunnerMissionReconciliationPending(
+    projectId: string,
+    runnerId: string,
+  ): Promise<{ pending: number }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const result = await this.env.DB.prepare(
+        `UPDATE runs SET reconciliation_pending = 1, reconciliation_deadline = NULL, updated_at = ?
+          WHERE project_id = ? AND runner_id = ? AND status IN ('dispatched','running','blocked')
+            AND EXISTS (SELECT 1 FROM plan_dispatches pd
+                         WHERE pd.id = runs.plan_dispatch_id AND pd.strategy = 'single_root')`,
+      ).bind(nowIso(), projectId, runnerId).run();
+      return { pending: result.meta.changes };
     });
   }
 
@@ -4899,7 +4920,8 @@ export class ProjectRoom extends DurableObject<Env> {
       const claimExpiry = new Date(Date.now() + ttl * 1000).toISOString();
       await this.env.DB.batch([
         this.env.DB.prepare(
-          `UPDATE runs SET lease_epoch = ?, reconciliation_deadline = NULL, updated_at = ?
+          `UPDATE runs SET lease_epoch = ?, reconciliation_deadline = NULL,
+                  reconciliation_pending = 0, updated_at = ?
             WHERE id = ? AND lease_epoch = ? AND reconciliation_deadline = ?`,
         ).bind(next.epoch, nowIso(), inventory.runId, current.epoch, run.deadline),
         this.env.DB.prepare(
@@ -5990,7 +6012,7 @@ export class ProjectRoom extends DurableObject<Env> {
     const exit = JSON.stringify({ outcome: 'failed', code: null, signal: null, reason: 'daemon_restart', finishedAt: now });
     await this.env.DB.batch([
       this.env.DB.prepare(
-        "UPDATE runs SET status = 'failed', exit = ?, reconciliation_deadline = NULL, updated_at = ? WHERE id = ?",
+        "UPDATE runs SET status = 'failed', exit = ?, reconciliation_deadline = NULL, reconciliation_pending = 0, updated_at = ? WHERE id = ?",
       ).bind(exit, now, run.id),
       this.env.DB.prepare(
         `INSERT INTO memory_episode_jobs (project_id, run_id, sitting, requested_at)

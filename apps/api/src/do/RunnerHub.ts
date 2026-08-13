@@ -159,6 +159,44 @@ export class RunnerHub extends DurableObject<Env> {
             }))) return;
           }
         }
+        // REST re-registration records only `reconciliation_pending`. The response window starts
+        // here, after hello has actually negotiated mission.v2 on a socket that can answer.
+        const { results: pendingProjects } = await this.env.DB.prepare(
+          `SELECT DISTINCT project_id AS pid FROM runs
+            WHERE runner_id = ? AND reconciliation_pending = 1
+              AND reconciliation_deadline IS NULL
+              AND status IN ('dispatched','running','blocked')`,
+        ).bind(runnerId).all<{ pid: string }>();
+        if (acceptedCapabilities.includes(MISSION_CAPABILITY)) {
+          for (const { pid } of pendingProjects) {
+            if (!(await this.authorizeProject(ws, auth, pid))) return;
+            await this.room(pid).openRunnerMissionReconciliation(pid, runnerId, 30_000, true);
+          }
+          // A socket can reconnect after the request was durably opened but before its reply was
+          // applied. Re-send the same deadline rather than restarting the bounded window.
+          const { results: openedProjects } = await this.env.DB.prepare(
+            `SELECT DISTINCT project_id AS pid FROM runs
+              WHERE runner_id = ? AND reconciliation_pending = 1
+                AND reconciliation_deadline IS NOT NULL
+                AND status IN ('dispatched','running','blocked')`,
+          ).bind(runnerId).all<{ pid: string }>();
+          for (const { pid } of openedProjects) {
+            if (!(await this.authorizeProject(ws, auth, pid))) return;
+            const reconciliation = await this.room(pid).currentRunnerMissionReconciliation(pid, runnerId);
+            if (reconciliation.deadline && reconciliation.items.length > 0
+                && !this.sendIfOpen(ws, JSON.stringify({
+                  type: 'mission.reconcile.request', deadline: reconciliation.deadline,
+                  items: reconciliation.items,
+                }))) return;
+          }
+        } else {
+          // REST capability claims are advisory until hello. A peer that cannot negotiate the
+          // mission channel gets the established fail-closed restart outcome, not an endless hold.
+          for (const { pid } of pendingProjects) {
+            if (!(await this.authorizeProject(ws, auth, pid))) return;
+            await this.room(pid).reconcileRunnerRuns(pid, SYS, runnerId);
+          }
+        }
         // Redeliver Runs already dispatched to this runner but not yet started — they
         // may have been assigned while the socket was down (dispatch-before-connect).
         const { results } = await this.env.DB.prepare(
@@ -171,23 +209,6 @@ export class RunnerHub extends DurableObject<Env> {
           if (!(await this.authorizeProject(ws, auth, r.pid))) return;
           const run = await this.runView(r.id);
           if (run && !this.sendIfOpen(ws, await this.messageForSocket(ws, JSON.stringify({ type: 'run.assigned', run })))) return;
-        }
-        if (acceptedCapabilities.includes(MISSION_CAPABILITY)) {
-          const { results: reconcilingProjects } = await this.env.DB.prepare(
-            `SELECT DISTINCT project_id AS pid FROM runs
-              WHERE runner_id = ? AND reconciliation_deadline IS NOT NULL
-                AND status IN ('dispatched','running','blocked')`,
-          ).bind(runnerId).all<{ pid: string }>();
-          for (const { pid } of reconcilingProjects) {
-            if (!(await this.authorizeProject(ws, auth, pid))) return;
-            const reconciliation = await this.room(pid).currentRunnerMissionReconciliation(pid, runnerId);
-            if (reconciliation.deadline && reconciliation.items.length > 0
-                && !this.sendIfOpen(ws, JSON.stringify({
-                  type: 'mission.reconcile.request',
-                  deadline: reconciliation.deadline,
-                  items: reconciliation.items,
-                }))) return;
-          }
         }
         return;
       }

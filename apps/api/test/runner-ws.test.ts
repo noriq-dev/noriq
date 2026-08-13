@@ -320,6 +320,10 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
       method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(registration),
     })).status).toBe(200);
+    const beforeChannel = await env.DB.prepare(
+      'SELECT reconciliation_pending AS pending, reconciliation_deadline AS deadline FROM runs WHERE id = ?',
+    ).bind(runId).first<{ pending: number; deadline: string | null }>();
+    expect(beforeChannel).toEqual({ pending: 1, deadline: null });
     const second = await wsConnect(runnerId, { Authorization: `Bearer ${token}` });
     const resumed = second.webSocket!;
     resumed.accept();
@@ -329,6 +333,11 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
       protocolCapabilities: ['orchestration.v1', 'mission.v2'],
     }));
     const reconciliation = await reconciliationP as { items: MissionInventoryItem[] };
+    const afterChannel = await env.DB.prepare(
+      'SELECT reconciliation_pending AS pending, reconciliation_deadline AS deadline FROM runs WHERE id = ?',
+    ).bind(runId).first<{ pending: number; deadline: string | null }>();
+    expect(afterChannel?.pending).toBe(1);
+    expect(afterChannel?.deadline).toBeTruthy();
     expect(reconciliation.items).toEqual([expect.objectContaining({
       runId, lease: assigned.missionLease, commissionDigest: assigned.missionCommission.digest,
     })]);

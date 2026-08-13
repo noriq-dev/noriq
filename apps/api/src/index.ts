@@ -3890,7 +3890,7 @@ app.post('/api/runners', agentAuth, async (c) => {
     const canReconcileMissions = b.protocolCapabilities.includes(MISSION_CAPABILITY);
     for (const { pid } of staleProjects) {
       if (canReconcileMissions) {
-        await room(c.env, pid).openRunnerMissionReconciliation(pid, id);
+        await room(c.env, pid).markRunnerMissionReconciliationPending(pid, id);
         await room(c.env, pid).reconcileRunnerRuns(pid, sysActor, id, { excludeMission: true });
       } else {
         await room(c.env, pid).reconcileRunnerRuns(pid, sysActor, id);
