@@ -51,8 +51,8 @@ function ago(iso: string | null): string {
   return `${Math.round(seconds / 86400)}d ago`;
 }
 
-function shortSha(sha: string | null | undefined): string {
-  return sha ? sha.slice(0, 10) : '—';
+function shortRevision(revision: string | null | undefined): string {
+  return revision ? (revision.length > 18 ? `${revision.slice(0, 18)}…` : revision) : '—';
 }
 
 function jobTarget(job: ApiRunnerJobSummary, store: AppStore): string {
@@ -331,7 +331,7 @@ function JobDetail({ detail, onRefresh, onCancel }: { detail: ApiRunnerJobDetail
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
               <MonoTag color="var(--text-mid)" bg="var(--w-06)" size={9}>{item.status}</MonoTag>
               <strong style={{ fontSize: 12 }}>{item.taskKey}</strong>
-              {item.commitRevision && <code style={{ fontSize: 10 }}>{shortSha(item.commitRevision)}</code>}
+              {item.checkpointRef && <code style={{ fontSize: 10 }}>{shortRevision(item.checkpointRef)}</code>}
             </div>
             {item.summary && <div style={{ fontSize: 11.5, color: 'var(--text-dim)', marginTop: 5 }}>{item.summary}</div>}
             {item.projectionConflict && <div style={{ color: '#f5a623', fontSize: 11, marginTop: 5 }}>Task status changed by a human; Runner projection was not applied.</div>}
@@ -374,9 +374,10 @@ function Output({ output }: { output: ApiRunnerJobOutput }) {
       </div>
       <dl style={{ display: 'grid', gridTemplateColumns: '100px minmax(0, 1fr)', gap: '6px 10px', fontFamily: 'var(--mono)', fontSize: 10.5 }}>
         <dt>mode</dt><dd>{output.workspaceMode}</dd>
-        <dt>branch</dt><dd style={{ overflowWrap: 'anywhere' }}>{output.branch}</dd>
-        <dt>base</dt><dd>{shortSha(output.baseRevision)}</dd>
-        <dt>head</dt><dd>{shortSha(output.headRevision)}</dd>
+        <dt>VCS</dt><dd>{output.retainedLocation.vcs}</dd>
+        <dt>location</dt><dd style={{ overflowWrap: 'anywhere' }}>{output.retainedLocation.url ? <a href={output.retainedLocation.url}>{output.retainedLocation.label}</a> : output.retainedLocation.label}</dd>
+        <dt>base</dt><dd>{shortRevision(output.baseRevision)}</dd>
+        <dt>head</dt><dd>{shortRevision(output.headRevision)}</dd>
       </dl>
       <div style={{ fontSize: 11.5, color: 'var(--text-dim)', lineHeight: 1.55 }}>{output.summary}</div>
       <div style={{ marginTop: 9, fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>

@@ -852,9 +852,11 @@ export interface ApiRunnerJobFinding {
 export interface ApiRunnerJobCheck {
   command: string; exitCode: number | null; durationMs: number; output: string; timedOut: boolean;
 }
+export interface ApiRunnerJobCheckpoint { ref: string; label: string; url: string | null }
 export interface ApiRunnerJobOutput {
-  workspaceMode: 'isolated' | 'direct'; branch: string; baseRevision: string; headRevision: string;
-  acceptedTaskCommits: Record<string, string>; checks: ApiRunnerJobCheck[]; findings: ApiRunnerJobFinding[];
+  workspaceMode: 'isolated' | 'direct'; retainedLocation: { vcs: string; label: string; url: string | null };
+  baseRevision: string; headRevision: string; acceptedTaskCheckpoints: Record<string, ApiRunnerJobCheckpoint>;
+  checks: ApiRunnerJobCheck[]; findings: ApiRunnerJobFinding[];
   usage: ApiRunnerJobUsage; summary: string; dirtyPaths: string[];
 }
 export interface ApiRunnerJobSummary {
@@ -865,7 +867,7 @@ export interface ApiRunnerJobSummary {
 }
 export interface ApiRunnerJobItem {
   taskId: string; taskKey: string; phaseOrder: number; taskOrder: number; status: RunnerJobTaskStatus;
-  plan: string | null; commitRevision: string | null; summary: string | null; findings: ApiRunnerJobFinding[];
+  plan: string | null; checkpointRef: string | null; summary: string | null; findings: ApiRunnerJobFinding[];
   projectionConflict: Record<string, unknown> | null; startedAt: string | null; finishedAt: string | null; updatedAt: string;
 }
 export interface ApiRunnerJobQuestion {

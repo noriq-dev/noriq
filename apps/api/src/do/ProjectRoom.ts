@@ -4921,13 +4921,13 @@ export class ProjectRoom extends DurableObject<Env> {
           ? JSON.stringify({ at: receivedAt, taskStatus: item.taskStatus, runnerStatus: event.status })
           : null;
         statements.push(this.env.DB.prepare(
-          `UPDATE runner_job_items SET status = ?, commit_revision = ?, summary = ?, findings = ?,
+          `UPDATE runner_job_items SET status = ?, checkpoint_ref = ?, summary = ?, findings = ?,
                   projection_conflict = COALESCE(?, projection_conflict),
                   started_at = CASE WHEN ? = 'running' THEN COALESCE(started_at, ?) ELSE started_at END,
                   finished_at = CASE WHEN ? IN ('accepted','failed','cancelled') THEN ? ELSE finished_at END,
                   updated_at = ? WHERE job_id = ? AND task_id = ?`,
         ).bind(
-          event.status, event.commit, event.summary, JSON.stringify(event.findings), conflict,
+          event.status, event.checkpoint?.ref ?? null, event.summary, JSON.stringify(event.findings), conflict,
           event.status, event.at, event.status, event.at, receivedAt, jobId, event.taskId,
         ));
         if (!humanWon) {

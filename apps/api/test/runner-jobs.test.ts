@@ -127,7 +127,7 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
     expect(await isolatedRoom.acceptRunnerJob(projectId, job.id, runnerId, job.assignmentId)).toBe(true);
     const at = new Date().toISOString();
     expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 1, {
-      type: 'task.result', at, taskId: task.id, status: 'running', commit: null,
+      type: 'task.result', at, taskId: task.id, status: 'running', checkpoint: null,
       summary: 'started', findings: [],
     })).toMatchObject({ accepted: true, ack: 1 });
     expect(await env.DB.prepare('SELECT status FROM tasks WHERE id = ?').bind(task.id).first<{ status: string }>())
@@ -135,7 +135,7 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
 
     await env.DB.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").bind(task.id).run();
     expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 2, {
-      type: 'task.result', at, taskId: task.id, status: 'accepted', commit: revision,
+      type: 'task.result', at, taskId: task.id, status: 'accepted', checkpoint: { ref: revision, label: revision, url: null },
       summary: 'accepted', findings: [{ severity: 'minor', title: 'note', body: 'human can inspect', path: null, line: null }],
     })).toMatchObject({ accepted: true, ack: 2 });
     const item = await env.DB.prepare(
@@ -147,8 +147,9 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
       .toEqual({ status: 'done' });
 
     const output = {
-      workspaceMode: 'isolated', branch: 'noriq/task/projected-job',
-      baseRevision: revision, headRevision: revision, acceptedTaskCommits: { [task.id]: revision },
+      workspaceMode: 'isolated', retainedLocation: { vcs: 'git', label: 'noriq/task/projected-job', url: null },
+      baseRevision: revision, headRevision: revision,
+      acceptedTaskCheckpoints: { [task.id]: { ref: revision, label: revision, url: null } },
       checks: [], findings: [],
       usage: { inputTokens: 10, outputTokens: 5, cachedTokens: 0, costUsd: 0.01, calls: 3 },
       summary: 'partial output retained', dirtyPaths: [],

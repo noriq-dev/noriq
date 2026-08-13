@@ -4320,7 +4320,7 @@ app.get('/api/projects/:pid/runner-jobs/:jobId', userAuth, async (c) => {
   const [items, events, questions] = await Promise.all([
     c.env.DB.prepare(
       `SELECT task_id AS taskId, task_key AS taskKey, phase_order AS phaseOrder,
-              task_order AS taskOrder, status, plan, commit_revision AS commitRevision,
+              task_order AS taskOrder, status, plan, checkpoint_ref AS checkpointRef,
               summary, findings, projection_conflict AS projectionConflict,
               started_at AS startedAt, finished_at AS finishedAt, updated_at AS updatedAt
          FROM runner_job_items WHERE job_id = ? ORDER BY phase_order, task_order, task_key`,

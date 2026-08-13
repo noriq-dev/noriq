@@ -56,7 +56,7 @@ describe('RunnerJob protocol v2 (PLNR-499)', () => {
     ws.accept();
     ws.send(JSON.stringify({
       type: 'hello', protocolVersion: 2, runnerId, capacity: 2,
-      repositories: [{ repositoryKey, repoRef, baseRevision }],
+      repositories: [{ repositoryKey, repoRef, vcs: 'git', baseRevision }],
     }));
     return ws;
   }
