@@ -590,6 +590,9 @@ export class RunnerHub extends DurableObject<Env> {
       ).bind(parsed.run.id).first<{ pid: string; sitting: number; epoch: number }>();
       if (mission) {
         const assignment = await ensureRunExecution(this.env, parsed.run.id);
+        const commission = await this.env.DB.prepare(
+          'SELECT digest, snapshot FROM mission_commissions WHERE root_run_id = ?',
+        ).bind(parsed.run.id).first<{ digest: string; snapshot: string }>();
         return JSON.stringify({
           ...parsed,
           run,
@@ -598,6 +601,9 @@ export class RunnerHub extends DurableObject<Env> {
             executionId: assignment.executionId,
             epoch: mission.epoch,
           },
+          missionCommission: commission
+            ? { digest: commission.digest, snapshot: JSON.parse(commission.snapshot) }
+            : null,
         });
       }
     }

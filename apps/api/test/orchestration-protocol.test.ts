@@ -122,3 +122,43 @@ describe('mission accepted-revision handoff wire contract (PLNR-488)', () => {
     expect(JSON.stringify(handoff)).not.toMatch(/credential|command|localPath|mcp/i);
   });
 });
+
+describe('single-root mission commission wire contract (PLNR-489)', () => {
+  it('parses a bounded immutable task graph on assignment and reconciliation', () => {
+    const now = new Date().toISOString();
+    const snapshot = {
+      schemaVersion: 1, commissionId: 'mco_1', runId: 'run_root', sitting: 1,
+      planId: 'plan_1', planTitle: 'Plan', planBody: 'Body', planRevision: 'revision-digest',
+      commissionedAt: now,
+      tasks: [{
+        taskId: 'task_1', key: 'T-1', title: 'Task', body: 'Task body',
+        phaseId: 'phase_1', phaseTitle: 'Build', phaseOrder: 0, taskOrder: 0,
+        priority: 1, type: 'task', estimate: null, dueAt: null, workflow: null,
+        executionSpec: null,
+      }],
+      dependencies: [],
+    };
+    const missionCommission = { digest: 'commission-digest', snapshot };
+    const run = {
+      id: 'run_root', projectId: 'project_1', runnerId: 'runner_1', agentId: null,
+      execution: null, kind: 'build', anchor: { type: 'plan', planId: 'plan_1' },
+      verifiesRunId: null, planKey: 'plan-1', targetBranch: null, brief: '', repoRef: 'repo_1',
+      agentTool: 'codex', agent: null, workflow: 'mission-plan', executionProfile: null,
+      model: null, effort: null, budget: {}, status: 'dispatched', phase: null, exit: null,
+      worktreePath: null, modelUsage: null, createdBy: 'human_1', createdAt: now,
+      updatedAt: now, dispatchedAt: now, startedAt: null,
+    };
+    expect(RunnerServerMessage.parse({
+      type: 'run.assigned', run,
+      missionLease: { sitting: 1, executionId: 'exe_root', epoch: 1 },
+      missionCommission,
+    })).toMatchObject({ missionCommission });
+    expect(RunnerClientMessage.parse({
+      type: 'mission.reconcile', observedAt: now,
+      inventory: [{
+        runId: 'run_root', lease: { sitting: 1, executionId: 'exe_root', epoch: 1 },
+        commissionDigest: missionCommission.digest, attempts: [],
+      }],
+    })).toMatchObject({ inventory: [{ commissionDigest: missionCommission.digest }] });
+  });
+});

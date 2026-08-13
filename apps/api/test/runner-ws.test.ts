@@ -295,6 +295,10 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
     const assigned = await assignedP;
     const runId = assigned.run.id as string;
     expect(assigned.missionLease).toMatchObject({ sitting: 1, executionId: expect.any(String), epoch: 1 });
+    expect(assigned.missionCommission).toMatchObject({
+      digest: expect.any(String),
+      snapshot: { runId, planId: plan.id, sitting: 1, tasks: [expect.objectContaining({ taskId: expect.any(String) })] },
+    });
     expect(dispatch.strategy).toBe('single_root');
 
     // Mission lifecycle frames without the server lease retain byte compatibility in the
@@ -325,7 +329,9 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
       protocolCapabilities: ['orchestration.v1', 'mission.v2'],
     }));
     const reconciliation = await reconciliationP as { items: MissionInventoryItem[] };
-    expect(reconciliation.items).toEqual([expect.objectContaining({ runId, lease: assigned.missionLease })]);
+    expect(reconciliation.items).toEqual([expect.objectContaining({
+      runId, lease: assigned.missionLease, commissionDigest: assigned.missionCommission.digest,
+    })]);
     const resultP = nextFrame(resumed, (m) => m.type === 'mission.reconcile.result');
     resumed.send(JSON.stringify({
       type: 'mission.reconcile', inventory: reconciliation.items, observedAt: new Date().toISOString(),

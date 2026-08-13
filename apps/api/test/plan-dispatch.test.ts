@@ -9,7 +9,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import type { Actor, CreatePlanDispatchInput, CreateRunInput, PlanDispatchView, RunPatch, RunView } from '../src/do/ProjectRoom';
 import type { Env } from '../src/env';
 import type {
-  AcceptedRevisionHandoff, AcceptedRevisionHandoffView, MissionHandoffAck,
+  AcceptedRevisionHandoff, AcceptedRevisionHandoffView, MissionCommission, MissionHandoffAck,
   MissionAdoptionResult, MissionInventoryItem, MissionLeaseRef,
   MissionTaskAck, MissionTaskBeginReport, MissionTaskSettleReport,
 } from '@noriq-dev/shared';
@@ -41,6 +41,7 @@ interface RoomRpc {
   adoptRunnerMission(projectId: string, runnerId: string, inventory: MissionInventoryItem): Promise<MissionAdoptionResult>;
   reconcileRunnerRuns(projectId: string, actor: Actor, runnerId: string, options?: { excludeMission?: boolean }): Promise<{ failed: number }>;
   sweepRunnerMissionReconciliations(projectId: string, actor?: Actor): Promise<{ failed: number }>;
+  getMissionCommission(projectId: string, rootRunId: string): Promise<MissionCommission | null>;
   publishMissionHandoff(projectId: string, rootRunId: string, reportId: string, handoff: AcceptedRevisionHandoff, lease: MissionLeaseRef): Promise<MissionHandoffAck>;
   getMissionHandoff(projectId: string, rootRunId: string): Promise<AcceptedRevisionHandoffView | null>;
   consumeMissionHandoff(projectId: string, actor: Actor, rootRunId: string, handoff: AcceptedRevisionHandoff): Promise<{ handoff: AcceptedRevisionHandoffView }>;
@@ -547,7 +548,7 @@ describe('the door checks', () => {
 describe('single_root Runner mission commissioning (PLNR-484)', () => {
   it('commissions one plan-anchored root and excludes the legacy task pump', async () => {
     const runner = await seedRunner(4, true);
-    const { planId } = await makePlan('mission-one-root');
+    const { planId, a, c } = await makePlan('mission-one-root');
     const dispatch = await createDispatch(runner, planId, {
       strategy: 'single_root', workflow: 'mission-plan',
     });
@@ -559,10 +560,57 @@ describe('single_root Runner mission commissioning (PLNR-484)', () => {
     ).bind(dispatch.id).all<{ id: string; anchorType: string; anchorId: string; workflow: string }>();
     expect(roots.results).toHaveLength(1);
     expect(roots.results[0]).toMatchObject({ anchorType: 'plan', anchorId: planId, workflow: 'mission-plan' });
+    const commission = await room(pid).getMissionCommission(pid, roots.results[0]!.id);
+    expect(commission).toMatchObject({
+      digest: expect.any(String),
+      snapshot: {
+        schemaVersion: 1, runId: roots.results[0]!.id, planId, sitting: 1,
+        planRevision: expect.any(String), tasks: expect.any(Array), dependencies: expect.any(Array),
+      },
+    });
+    expect(commission!.snapshot.tasks).toHaveLength(3);
+    expect(commission!.snapshot.tasks.find((task) => task.taskId === c)!.phaseOrder)
+      .toBeGreaterThan(commission!.snapshot.tasks.find((task) => task.taskId === a)!.phaseOrder);
 
     await room(pid).pumpProjectDispatches(pid);
     await room(pid).retryPlanDispatch(pid, actor, dispatch.id);
     expect((await env.DB.prepare('SELECT id FROM runs WHERE plan_dispatch_id = ?').bind(dispatch.id).all()).results).toHaveLength(1);
+  });
+
+  it('keeps the commissioned task graph immutable and admits only snapshot membership', async () => {
+    const runner = await seedRunner(4, true);
+    const agent = await seedAgent(runner);
+    const plan = await makePlan('mission-snapshot-immutable');
+    const dispatch = await createDispatch(runner, plan.planId, {
+      strategy: 'single_root', workflow: 'mission-plan',
+    });
+    const root = await env.DB.prepare('SELECT id FROM runs WHERE plan_dispatch_id = ?')
+      .bind(dispatch.id).first<{ id: string }>();
+    const before = await room(pid).getMissionCommission(pid, root!.id);
+    expect(before!.snapshot.tasks.find((task) => task.taskId === plan.a)?.title).toContain('a');
+
+    await room(pid).updateTask(pid, actor, plan.a, { title: 'mutated after commission', body: 'new mutable text' });
+    await room(pid).restructurePlan(pid, actor, plan.planId, [
+      { title: 'changed phase', taskIds: [plan.b] },
+      { title: 'later', taskIds: [plan.c] },
+    ]);
+    const after = await room(pid).getMissionCommission(pid, root!.id);
+    expect(after).toEqual(before);
+    expect(after!.snapshot.tasks.map((task) => task.taskId)).toContain(plan.a);
+
+    await room(pid).transitionRun(pid, actor, root!.id, { status: 'running', agentId: agent });
+    const lease = await room(pid).missionLease(pid, root!.id);
+    const accepted = await room(pid).beginMissionTask(pid, root!.id, {
+      reportId: 'snapshot-old-member', attemptId: 'snapshot-old-member', taskId: plan.a,
+      childKey: 'snapshot-old-member', observedAt: new Date().toISOString(),
+    }, lease);
+    expect(accepted).toMatchObject({ accepted: true, taskId: plan.a });
+
+    const foreign = await makePlan('mission-snapshot-new-member');
+    await expect(room(pid).beginMissionTask(pid, root!.id, {
+      reportId: 'snapshot-new-member', attemptId: 'snapshot-new-member', taskId: foreign.a,
+      childKey: 'snapshot-new-member', observedAt: new Date().toISOString(),
+    }, lease)).rejects.toThrow(/snapshot/);
   });
 
   it('requires an explicit rich build mission.v2 offer while legacy dispatch remains unchanged', async () => {

@@ -14,8 +14,8 @@ import {
 import { searchBackend, indexEntity, removeEntity, type SearchKind } from '../search';
 import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
-import { RunKind, AgentTool, RunStatus, ExecutionProfileOffer, type AcceptedRevisionHandoff, type AcceptedRevisionHandoffView, type CommissionedExecutionProfile, type MissionHandoffAck, type MissionHandoffConsumed, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
-import { writeExecutionSpec } from '../lib/execution-spec';
+import { MissionCommission as MissionCommissionSchema, RunKind, AgentTool, RunStatus, ExecutionProfileOffer, type AcceptedRevisionHandoff, type AcceptedRevisionHandoffView, type CommissionedExecutionProfile, type MissionCommission, type MissionCommissionSnapshot, type MissionHandoffAck, type MissionHandoffConsumed, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
+import { readExecutionSpec, writeExecutionSpec } from '../lib/execution-spec';
 import { processPendingCopilotEpisodeJob, processPendingEpisodeJob } from '../memory/episodes';
 import { applyMissionTaskExecutionEvent, ensureMissionTaskExecution, ensureRunExecution, mirrorRunTransition } from '../lib/orchestration-store';
 import {
@@ -4139,7 +4139,15 @@ export class ProjectRoom extends DurableObject<Env> {
       input.createdBy ?? actor.id, now, now,
       runnerId ? now : null,
       ).run();
+      if (anchorType === 'plan' && anchorId && input.planDispatchId) {
+        const dispatch = await this.env.DB.prepare('SELECT strategy FROM plan_dispatches WHERE id = ?')
+          .bind(input.planDispatchId).first<{ strategy: string }>();
+        if (dispatch?.strategy === 'single_root') {
+          await this.createMissionCommission(id, anchorId, 1, now);
+        }
+      }
     } catch (error) {
+      await this.env.DB.prepare('DELETE FROM runs WHERE id = ?').bind(id).run().catch(() => undefined);
       if (executionProfileId) {
         await this.env.DB.prepare('DELETE FROM execution_profile_leases WHERE run_id = ?').bind(id).run();
       }
@@ -4163,6 +4171,89 @@ export class ProjectRoom extends DurableObject<Env> {
     view.execution = await ensureRunExecution(this.env, id);
     if (runnerId) this.scheduleShadowDispatchSnapshot(id, 1, now);
     return view;
+  }
+
+  /** Build once from canonical plan state, then persist before run.assigned can be emitted. */
+  private async createMissionCommission(
+    rootRunId: string,
+    planId: string,
+    sitting: number,
+    commissionedAt: string,
+  ): Promise<MissionCommission> {
+    const existing = await this.env.DB.prepare('SELECT digest, snapshot FROM mission_commissions WHERE root_run_id = ?')
+      .bind(rootRunId).first<{ digest: string; snapshot: string }>();
+    if (existing) return MissionCommissionSchema.parse({ digest: existing.digest, snapshot: JSON.parse(existing.snapshot) });
+
+    const plan = await this.env.DB.prepare(
+      'SELECT id, title, body FROM plans WHERE id = ? AND project_id = ?',
+    ).bind(planId, this.projectId).first<{ id: string; title: string; body: string }>();
+    if (!plan) throw new Error('commissioned plan not found');
+    const { results: taskRows } = await this.env.DB.prepare(
+      `SELECT t.id AS taskId, t.key, t.title, t.body, t.priority, t.type, t.estimate,
+              t.due_at AS dueAt, t.workflow, t.execution_spec AS executionSpec,
+              t."order" AS taskOrder, ph.id AS phaseId, ph.title AS phaseTitle,
+              ph."order" AS phaseOrder
+         FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id
+         JOIN tasks t ON t.id = pt.task_id
+        WHERE ph.plan_id = ?
+        ORDER BY ph."order", t."order", t.id`,
+    ).bind(planId).all<{
+      taskId: string; key: string; title: string; body: string; priority: number; type: string;
+      estimate: number | null; dueAt: string | null; workflow: string | null; executionSpec: string | null;
+      taskOrder: number; phaseId: string; phaseTitle: string; phaseOrder: number;
+    }>();
+    if (taskRows.length === 0) throw new Error('single_root plan has no commissioned tasks');
+    if (taskRows.length > 256) throw new Error('single_root plan exceeds the 256-task mission snapshot limit');
+    const tasks = taskRows.map((row) => {
+      const stored = readExecutionSpec(row.executionSpec, row.taskId);
+      if (stored.unreadable) throw new Error(`${row.key} has an unreadable execution spec`);
+      return {
+        taskId: row.taskId, key: row.key, title: row.title, body: row.body,
+        phaseId: row.phaseId, phaseTitle: row.phaseTitle,
+        phaseOrder: row.phaseOrder, taskOrder: row.taskOrder,
+        priority: row.priority, type: row.type, estimate: row.estimate,
+        dueAt: row.dueAt, workflow: row.workflow, executionSpec: stored.spec,
+      };
+    });
+    const { results: dependencies } = await this.env.DB.prepare(
+      `SELECT d.task_id AS taskId, d.depends_on_task_id AS dependsOnTaskId
+         FROM dependencies d
+        WHERE d.task_id IN (
+          SELECT pt.task_id FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE ph.plan_id = ?)
+        ORDER BY d.task_id, d.depends_on_task_id`,
+    ).bind(planId).all<{ taskId: string; dependsOnTaskId: string }>();
+    if (dependencies.length > 2_048) throw new Error('single_root plan exceeds the 2048-edge mission snapshot limit');
+
+    const revisionInput = { plan: { id: plan.id, title: plan.title, body: plan.body }, tasks, dependencies };
+    const planRevision = await sha256Hex(JSON.stringify(revisionInput));
+    const snapshot: MissionCommissionSnapshot = {
+      schemaVersion: 1, commissionId: newId('mco'), runId: rootRunId, sitting,
+      planId, planTitle: plan.title, planBody: plan.body, planRevision, commissionedAt,
+      tasks, dependencies,
+    };
+    const snapshotText = JSON.stringify(snapshot);
+    if (new TextEncoder().encode(snapshotText).byteLength > 1_048_576) {
+      throw new Error('single_root mission snapshot exceeds the 1 MiB commission limit');
+    }
+    const digest = await sha256Hex(snapshotText);
+    const commission = MissionCommissionSchema.parse({ digest, snapshot });
+    await this.env.DB.prepare(
+      `INSERT INTO mission_commissions
+         (root_run_id, project_id, plan_id, sitting, commission_id, plan_revision, digest, snapshot, commissioned_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      rootRunId, this.projectId, planId, sitting, snapshot.commissionId,
+      planRevision, digest, snapshotText, commissionedAt,
+    ).run();
+    return commission;
+  }
+
+  async getMissionCommission(projectId: string, rootRunId: string): Promise<MissionCommission | null> {
+    await this.setPid(projectId);
+    const row = await this.env.DB.prepare(
+      'SELECT digest, snapshot FROM mission_commissions WHERE root_run_id = ? AND project_id = ?',
+    ).bind(rootRunId, projectId).first<{ digest: string; snapshot: string }>();
+    return row ? MissionCommissionSchema.parse({ digest: row.digest, snapshot: JSON.parse(row.snapshot) }) : null;
   }
 
   /** Assign a queued Run to a runner and mark it dispatched. */
@@ -4472,36 +4563,45 @@ export class ProjectRoom extends DurableObject<Env> {
       if (!root || root.strategy !== 'single_root') throw new Error('run is not a commissioned single_root mission');
       if (!['running', 'blocked'].includes(logicalRunStatus(root))) throw new Error('mission root is not live');
       if (!root.agentId) throw new Error('mission root has no registered Run agent');
+      const commission = await this.getMissionCommission(projectId, rootRunId);
+      if (!commission) throw new Error('mission has no immutable plan commission');
+      const commissionedTask = commission.snapshot.tasks.find((candidate) => candidate.taskId === input.taskId);
+      if (!commissionedTask) throw new Error('task is not part of the commissioned plan snapshot');
       const task = await this.env.DB.prepare(
-        `SELECT t.id, t.key, t.title, t.status, t.claimed_by AS claimedBy, t.proposed_at AS proposedAt,
-                ph."order" AS phaseOrder
-           FROM tasks t JOIN phase_tasks pt ON pt.task_id = t.id
-           JOIN phases ph ON ph.id = pt.phase_id
-          WHERE t.id = ? AND t.project_id = ? AND ph.plan_id = ?`,
-      ).bind(input.taskId, projectId, root.planId).first<{
+        `SELECT id, key, title, status, claimed_by AS claimedBy, proposed_at AS proposedAt
+           FROM tasks WHERE id = ? AND project_id = ?`,
+      ).bind(input.taskId, projectId).first<{
         id: string; key: string; title: string; status: string; claimedBy: string | null;
-        proposedAt: string | null; phaseOrder: number;
+        proposedAt: string | null;
       }>();
-      if (!task) throw new Error('task is not part of the commissioned plan');
+      if (!task) throw new Error('commissioned task no longer exists');
       if (task.status !== 'todo' || task.claimedBy || task.proposedAt) {
         throw new Error(`${task.key} is not eligible for mission begin`);
       }
-      const landedException = root.gate === 'landed'
-        ? `AND NOT (dt.status = 'review' AND EXISTS (
-             SELECT 1 FROM runs dr WHERE dr.anchor_type = 'task' AND dr.anchor_id = dt.id AND dr.status = 'done'))`
-        : '';
-      const blocked = await this.env.DB.prepare(
-        `SELECT 1 AS blocked
-           WHERE EXISTS (
-             SELECT 1 FROM dependencies dp JOIN tasks dt ON dt.id = dp.depends_on_task_id
-              WHERE dp.task_id = ?1 AND dt.status NOT IN ('done','cancelled') ${landedException})
-              OR EXISTS (
-             SELECT 1 FROM phases prev JOIN phase_tasks ppt ON ppt.phase_id = prev.id
-               JOIN tasks dt ON dt.id = ppt.task_id
-              WHERE prev.plan_id = ?2 AND prev."order" < ?3
-                AND dt.status NOT IN ('done','cancelled') ${landedException})`,
-      ).bind(task.id, root.planId, task.phaseOrder).first();
-      if (blocked) throw new Error(`${task.key} is blocked by the commissioned plan dependency gate`);
+      const blockerIds = new Set(
+        commission.snapshot.dependencies
+          .filter((edge) => edge.taskId === task.id)
+          .map((edge) => edge.dependsOnTaskId),
+      );
+      for (const candidate of commission.snapshot.tasks) {
+        if (candidate.phaseOrder < commissionedTask.phaseOrder) blockerIds.add(candidate.taskId);
+      }
+      if (blockerIds.size > 0) {
+        const { results: blockerRows } = await this.env.DB.prepare(
+          `SELECT t.id, t.status,
+                  EXISTS (SELECT 1 FROM runs r
+                           WHERE r.anchor_type = 'task' AND r.anchor_id = t.id AND r.status = 'done') AS landed
+             FROM tasks t WHERE t.id IN (SELECT value FROM json_each(?))`,
+        ).bind(JSON.stringify([...blockerIds])).all<{ id: string; status: string; landed: number }>();
+        const byId = new Map(blockerRows.map((row) => [row.id, row]));
+        const blocked = [...blockerIds].some((id) => {
+          const blocker = byId.get(id);
+          if (!blocker) return true;
+          if (blocker.status === 'done' || blocker.status === 'cancelled') return false;
+          return !(root.gate === 'landed' && blocker.status === 'review' && blocker.landed);
+        });
+        if (blocked) throw new Error(`${task.key} is blocked by the commissioned plan dependency gate`);
+      }
 
       const execution = await ensureMissionTaskExecution(this.env, rootRunId, input);
       const ttl = await this.claimTtlSeconds();
@@ -4728,7 +4828,8 @@ export class ProjectRoom extends DurableObject<Env> {
           `SELECT id AS attemptId, child_execution_id AS executionId, lease_epoch AS epoch
              FROM mission_task_attempts WHERE root_run_id = ? AND status = 'running' ORDER BY id`,
         ).bind(id).all<{ attemptId: string; executionId: string; epoch: number }>();
-        items.push({ runId: id, lease, attempts: attempts.results });
+        const commission = await this.getMissionCommission(projectId, id);
+        items.push({ runId: id, lease, commissionDigest: commission?.digest ?? null, attempts: attempts.results });
       }
       await this.scheduleExpiryAlarm();
       return { deadline, items };
@@ -4753,7 +4854,8 @@ export class ProjectRoom extends DurableObject<Env> {
         `SELECT id AS attemptId, child_execution_id AS executionId, lease_epoch AS epoch
            FROM mission_task_attempts WHERE root_run_id = ? AND status = 'running' ORDER BY id`,
       ).bind(row.id).all<{ attemptId: string; executionId: string; epoch: number }>();
-      items.push({ runId: row.id, lease, attempts: attempts.results });
+      const commission = await this.getMissionCommission(projectId, row.id);
+      items.push({ runId: row.id, lease, commissionDigest: commission?.digest ?? null, attempts: attempts.results });
     }
     return { deadline: results[0]?.deadline ?? null, items };
   }
@@ -4781,12 +4883,14 @@ export class ProjectRoom extends DurableObject<Env> {
         return { runId: inventory.runId, decision: 'cancel', lease: null, reason: 'reconciliation deadline expired' };
       }
       const current = await this.missionLease(projectId, inventory.runId);
+      const commission = await this.getMissionCommission(projectId, inventory.runId);
       const expectedAttempts = await this.env.DB.prepare(
         `SELECT id AS attemptId, child_execution_id AS executionId, lease_epoch AS epoch
            FROM mission_task_attempts WHERE root_run_id = ? AND status = 'running' ORDER BY id`,
       ).bind(inventory.runId).all<{ attemptId: string; executionId: string; epoch: number }>();
       const supplied = [...inventory.attempts].sort((a, b) => a.attemptId.localeCompare(b.attemptId));
-      if (JSON.stringify(inventory.lease) !== JSON.stringify(current)
+      if (inventory.commissionDigest !== (commission?.digest ?? null)
+          || JSON.stringify(inventory.lease) !== JSON.stringify(current)
           || JSON.stringify(supplied) !== JSON.stringify(expectedAttempts.results)) {
         return { runId: inventory.runId, decision: 'cancel', lease: null, reason: 'durable mission inventory does not match server state' };
       }

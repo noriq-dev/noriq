@@ -147,6 +147,7 @@ export type MissionLeaseRef = z.infer<typeof MissionLeaseRef>;
 export const MissionInventoryItem = z.object({
   runId: z.string().min(1),
   lease: MissionLeaseRef,
+  commissionDigest: z.string().min(1).max(128).nullable().default(null),
   attempts: z.array(z.object({
     attemptId: z.string().min(1),
     executionId: z.string().min(1),
