@@ -261,6 +261,12 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
         workflows: [{
           name: 'mission-plan', base: 'build', description: 'WS mission harness', capabilities: ['mission.v2'],
         }],
+        executionProfiles: [{
+          id: 'mission-profile', declarationFingerprint: 'decl-mission', effectiveFingerprint: 'inventory-mission',
+          resolution: 'resolved', health: 'healthy', attestationCapable: true,
+          observedAt: new Date().toISOString(), generation: 1,
+          capacity: { maxConcurrency: 2, freeSlots: 2 },
+        }],
       }],
       protocolCapabilities: ['mission.v2'],
     };
@@ -290,7 +296,7 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
     const assignedP = nextFrame(ws, (m) => m.type === 'run.assigned' && m.missionLease);
     const dispatch = await projectRoom().createPlanDispatch(pid, actor, {
       planId: plan.id, runnerId, repoRef: 'repo_x', agentTool: 'claude',
-      strategy: 'single_root', workflow: 'mission-plan',
+      strategy: 'single_root', workflow: 'mission-plan', executionProfileId: 'mission-profile',
     });
     const assigned = await assignedP;
     const runId = assigned.run.id as string;
@@ -382,6 +388,12 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
         workflows: [{
           name: 'mission-plan', base: 'build', description: 'WS mission harness', capabilities: ['mission.v2'],
         }],
+        executionProfiles: [{
+          id: 'mission-profile', declarationFingerprint: 'decl-mission', effectiveFingerprint: 'inventory-mission',
+          resolution: 'resolved', health: 'healthy', attestationCapable: true,
+          observedAt: new Date().toISOString(), generation: 1,
+          capacity: { maxConcurrency: 2, freeSlots: 2 },
+        }],
       }],
       protocolCapabilities: ['mission.v2', 'mission.handoff.v1'],
     };
@@ -410,7 +422,7 @@ describe('runner WS channel + dispatch (RUN-7)', () => {
     const assignedP = nextFrame(ws, (m) => m.type === 'run.assigned' && m.missionLease);
     await projectRoom().createPlanDispatch(pid, actor, {
       planId: plan.id, runnerId, repoRef: 'repo_x', agentTool: 'claude',
-      strategy: 'single_root', workflow: 'mission-plan',
+      strategy: 'single_root', workflow: 'mission-plan', executionProfileId: 'mission-profile',
     });
     const assigned = await assignedP;
     const handoff = {

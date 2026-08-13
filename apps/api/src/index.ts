@@ -4377,6 +4377,9 @@ app.post('/api/projects/:pid/plans/:planId/dispatch', userAuth, async (c) => {
   if (b.strategy === 'single_root' && (!b.workflow || !workflowSupports(repo, b.workflow, 'build', 'mission.v2'))) {
     return c.json({ error: 'single_root requires an advertised build-posture workflow with mission.v2' }, 400);
   }
+  if (b.strategy === 'single_root' && !b.executionProfileId) {
+    return c.json({ error: 'single_root requires an exact healthy attested execution profile' }, 400);
+  }
   if (b.executionProfileId) {
     try { commissionExecutionProfile({ id: repo.id, executionProfiles: repo.executionProfiles ?? [] }, b.executionProfileId, { requireCapacity: false }); }
     catch (error) {

@@ -56,6 +56,12 @@ let pid: string;
 /** A runner the pump can schedule onto. Fresh per test — capacity math reads the runs
  *  table, so sharing a runner across tests would leak slots between them. */
 let runnerSeq = 0;
+const missionProfile = () => ({
+  id: 'mission-profile', declarationFingerprint: 'decl-mission', effectiveFingerprint: 'inventory-mission',
+  resolution: 'resolved', health: 'healthy', attestationCapable: true,
+  observedAt: new Date().toISOString(), generation: 1,
+  capacity: { maxConcurrency: 8, freeSlots: 8 },
+});
 async function seedRunner(maxConcurrency: number, mission = false, executionProfiles: unknown[] = []): Promise<string> {
   const id = `rnr_pd_${++runnerSeq}`;
   await env.DB.prepare(
@@ -69,7 +75,7 @@ async function seedRunner(maxConcurrency: number, mission = false, executionProf
       workflows: mission ? [{
         name: 'mission-plan', base: 'build', description: 'Runner mission harness', capabilities: ['mission.v2'],
       }] : [],
-      executionProfiles,
+      executionProfiles: mission && executionProfiles.length === 0 ? [missionProfile()] : executionProfiles,
     }]),
     maxConcurrency,
   ).run();
@@ -108,7 +114,11 @@ const dispatchRuns = async (dispatchId: string) => {
 
 const createDispatch = (runnerId: string, planId: string, over: Partial<CreatePlanDispatchInput> = {}) =>
   room(pid).createPlanDispatch(pid, actor, {
-    planId, runnerId, repoRef: 'repo_pd', agentTool: 'claude', ...over,
+    planId, runnerId, repoRef: 'repo_pd', agentTool: 'claude',
+    ...(over.strategy === 'single_root' && !Object.hasOwn(over, 'executionProfileId')
+      ? { executionProfileId: 'mission-profile' }
+      : {}),
+    ...over,
   });
 
 /** Walk one run through the daemon's happy path: running (with its agent) → done. */
@@ -624,6 +634,12 @@ describe('single_root Runner mission commissioning (PLNR-484)', () => {
     await expect(createDispatch(legacyRunner, plan.planId, {
       strategy: 'single_root', workflow: 'mission-plan',
     })).rejects.toThrow(/mission\.v2/);
+
+    const missionRunner = await seedRunner(2, true);
+    const profilePlan = await makePlan('mission-profile-required');
+    await expect(createDispatch(missionRunner, profilePlan.planId, {
+      strategy: 'single_root', workflow: 'mission-plan', executionProfileId: null,
+    })).rejects.toThrow(/exact healthy attested execution profile/);
   });
 
   it('cancels the root and stalls rather than claiming completion when it exits with open tasks', async () => {

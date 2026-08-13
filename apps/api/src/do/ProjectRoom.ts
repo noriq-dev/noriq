@@ -4457,6 +4457,9 @@ export class ProjectRoom extends DurableObject<Env> {
       const strategy = input.strategy ?? 'per_task';
       if (strategy === 'single_root') {
         if (!input.workflow) throw new Error('single_root requires an explicit mission.v2 workflow');
+        if (!input.executionProfileId) {
+          throw new Error('single_root requires an exact healthy attested execution profile');
+        }
         const runner = await this.env.DB.prepare('SELECT repos FROM runners WHERE id = ?')
           .bind(input.runnerId).first<{ repos: string }>();
         let repo: { id: string; projectId?: string | null; workflows?: Array<string | { name: string; base?: string; capabilities?: string[] }> } | undefined;
@@ -5365,9 +5368,18 @@ export class ProjectRoom extends DurableObject<Env> {
       slots = Math.max(0, max - (busy?.n ?? 0));
     }
     let commissionedProfile: CommissionedExecutionProfile | null = null;
+    if (!d.execution_profile_id || !d.execution_profile) {
+      const reason = 'single_root requires an exact commissioned execution profile';
+      await this.env.DB.prepare(
+        "UPDATE plan_dispatches SET status = 'stalled', stall_reason = ?, updated_at = ? WHERE id = ?",
+      ).bind(reason, nowIso(), d.id).run();
+      if (d.status !== 'stalled' || d.stall_reason !== reason) {
+        await this.emit(actor, 'plan_dispatch.stalled', 'plan_dispatch', d.id, { planId: d.plan_id, reason });
+      }
+      return { created: 0 };
+    }
     if (d.execution_profile_id) {
       try {
-        if (!d.execution_profile) throw new Error('commissioned profile identity is missing');
         const profile = await this.resolveExecutionProfile(
           d.runner_id,
           d.repo_ref,
