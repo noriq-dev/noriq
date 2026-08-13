@@ -14,7 +14,7 @@ import {
 import { searchBackend, indexEntity, removeEntity, type SearchKind } from '../search';
 import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
-import { MISSION_CAPABILITY, MissionCommission as MissionCommissionSchema, MissionRootCommission as MissionRootCommissionSchema, RunnerJobSource as RunnerJobSourceSchema, RunKind, AgentTool, RunStatus, ExecutionProfileOffer, type AcceptedRevisionHandoff, type AcceptedRevisionHandoffView, type CommissionedExecutionProfile, type MissionCommission, type MissionCommissionSnapshot, type MissionRootCommission, type RunnerJobAssignment, type RunnerJobSource, type TaskRootMissionCommissionSnapshot, type MissionHandoffAck, type MissionHandoffConsumed, type MissionQuestionAck, type MissionQuestionAnswer, type MissionQuestionPublication, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
+import { MISSION_CAPABILITY, MissionCommission as MissionCommissionSchema, MissionRootCommission as MissionRootCommissionSchema, RunnerJobEvent as RunnerJobEventSchema, RunnerJobSource as RunnerJobSourceSchema, RunKind, AgentTool, RunStatus, ExecutionProfileOffer, type AcceptedRevisionHandoff, type AcceptedRevisionHandoffView, type CommissionedExecutionProfile, type MissionCommission, type MissionCommissionSnapshot, type MissionRootCommission, type RunnerJobAssignment, type RunnerJobEvent, type RunnerJobSource, type TaskRootMissionCommissionSnapshot, type MissionHandoffAck, type MissionHandoffConsumed, type MissionQuestionAck, type MissionQuestionAnswer, type MissionQuestionPublication, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
 import { readExecutionSpec, writeExecutionSpec } from '../lib/execution-spec';
 import { processPendingCopilotEpisodeJob, processPendingEpisodeJob } from '../memory/episodes';
 import { applyMissionTaskExecutionEvent, ensureMissionTaskExecution, ensureRunExecution, mirrorRunTransition } from '../lib/orchestration-store';
@@ -4782,6 +4782,202 @@ export class ProjectRoom extends DurableObject<Env> {
         progress: 0, expectedBaseRevision: input.expectedBaseRevision, createdAt: at, updatedAt: at,
         assignment,
       };
+    });
+  }
+
+  private runnerJobAssignment(row: {
+    id: string; assignmentId: string; snapshotDigest: string; snapshot: string;
+    repoRef: string; expectedBaseRevision: string;
+  }): RunnerJobAssignment {
+    return {
+      protocolVersion: 2, jobId: row.id, assignmentId: row.assignmentId,
+      snapshotDigest: row.snapshotDigest, source: RunnerJobSourceSchema.parse(JSON.parse(row.snapshot)),
+      repoRef: row.repoRef, expectedBaseRevision: row.expectedBaseRevision,
+    };
+  }
+
+  async assignRunnerJob(projectId: string, jobId: string, runnerId: string): Promise<RunnerJobAssignment | null> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const row = await this.env.DB.prepare(
+        `SELECT id, assignment_id AS assignmentId, snapshot_digest AS snapshotDigest, snapshot,
+                repo_ref AS repoRef, expected_base_revision AS expectedBaseRevision, status,
+                cancel_requested_at AS cancelRequestedAt
+           FROM runner_jobs WHERE id = ? AND project_id = ? AND runner_id = ?`,
+      ).bind(jobId, projectId, runnerId).first<{
+        id: string; assignmentId: string; snapshotDigest: string; snapshot: string;
+        repoRef: string; expectedBaseRevision: string; status: string; cancelRequestedAt: string | null;
+      }>();
+      if (!row || row.cancelRequestedAt || !['queued', 'assigned'].includes(row.status)) return null;
+      if (row.status === 'queued') {
+        const at = nowIso();
+        await this.env.DB.prepare(
+          "UPDATE runner_jobs SET status = 'assigned', assigned_at = ?, updated_at = ? WHERE id = ? AND status = 'queued'",
+        ).bind(at, at, jobId).run();
+        await this.emit(SYSTEM_ACTOR, 'runner_job.status_changed', 'runner_job', jobId, {
+          from: 'queued', to: 'assigned', runnerId,
+        });
+      }
+      return this.runnerJobAssignment(row);
+    });
+  }
+
+  async acceptRunnerJob(projectId: string, jobId: string, runnerId: string, assignmentId: string): Promise<boolean> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const result = await this.env.DB.prepare(
+        `UPDATE runner_jobs SET updated_at = ?
+          WHERE id = ? AND project_id = ? AND runner_id = ? AND assignment_id = ?
+            AND status = 'assigned' AND cancel_requested_at IS NULL`,
+      ).bind(nowIso(), jobId, projectId, runnerId, assignmentId).run();
+      return result.meta.changes === 1;
+    });
+  }
+
+  async recordRunnerJobEvent(
+    projectId: string,
+    jobId: string,
+    runnerId: string,
+    assignmentId: string,
+    seq: number,
+    eventInput: RunnerJobEvent,
+  ): Promise<{ accepted: boolean; ack: number; error: string | null }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const event = RunnerJobEventSchema.parse(eventInput);
+      const encoded = JSON.stringify(event);
+      const payloadHash = await sha256Hex(encoded);
+      const job = await this.env.DB.prepare(
+        `SELECT assignment_id AS assignmentId, runner_id AS runnerId, status,
+                cancel_requested_at AS cancelRequestedAt, last_event_seq AS lastEventSeq
+           FROM runner_jobs WHERE id = ? AND project_id = ?`,
+      ).bind(jobId, projectId).first<{
+        assignmentId: string; runnerId: string; status: string;
+        cancelRequestedAt: string | null; lastEventSeq: number;
+      }>();
+      if (!job || job.runnerId !== runnerId || job.assignmentId !== assignmentId) {
+        return { accepted: false, ack: job?.lastEventSeq ?? 0, error: 'stale or foreign assignment' };
+      }
+      const existing = await this.env.DB.prepare(
+        'SELECT payload_hash AS payloadHash FROM runner_job_events WHERE job_id = ? AND seq = ?',
+      ).bind(jobId, seq).first<{ payloadHash: string }>();
+      if (existing) {
+        return existing.payloadHash === payloadHash
+          ? { accepted: true, ack: job.lastEventSeq, error: null }
+          : { accepted: false, ack: job.lastEventSeq, error: 'event sequence conflicts with its durable payload' };
+      }
+      if (seq !== job.lastEventSeq + 1) {
+        return { accepted: false, ack: job.lastEventSeq, error: `event sequence gap: expected ${job.lastEventSeq + 1}` };
+      }
+      if (!['assigned', 'running', 'waiting'].includes(job.status) || job.cancelRequestedAt) {
+        return { accepted: false, ack: job.lastEventSeq, error: 'job is no longer accepting events' };
+      }
+      const receivedAt = nowIso();
+      const statements = [
+        this.env.DB.prepare(
+          `INSERT INTO runner_job_events
+             (job_id, seq, assignment_id, event_type, payload, payload_hash, observed_at, received_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).bind(jobId, seq, assignmentId, event.type, encoded, payloadHash, event.at, receivedAt),
+        this.env.DB.prepare(
+          `UPDATE runner_jobs SET last_event_seq = ?, updated_at = ?
+            WHERE id = ? AND assignment_id = ? AND last_event_seq = ?`,
+        ).bind(seq, receivedAt, jobId, assignmentId, job.lastEventSeq),
+      ];
+      if (event.type === 'question') {
+        statements.push(this.env.DB.prepare(
+          `INSERT INTO runner_job_questions
+             (id, job_id, question_id, prompt, state, published_at, updated_at)
+           VALUES (?, ?, ?, ?, 'open', ?, ?)`,
+        ).bind(newId('rjq'), jobId, event.questionId, event.prompt, event.at, receivedAt));
+      }
+      await this.env.DB.batch(statements);
+      return { accepted: true, ack: seq, error: null };
+    });
+  }
+
+  async reconcileRunnerJob(
+    projectId: string,
+    jobId: string,
+    runnerId: string,
+    assignmentId: string,
+    lastLocalSeq: number,
+  ): Promise<'continue' | 'cancel'> {
+    await this.setPid(projectId);
+    const row = await this.env.DB.prepare(
+      `SELECT assignment_id AS assignmentId, runner_id AS runnerId, status,
+              cancel_requested_at AS cancelRequestedAt, last_event_seq AS lastEventSeq
+         FROM runner_jobs WHERE id = ? AND project_id = ?`,
+    ).bind(jobId, projectId).first<{
+      assignmentId: string; runnerId: string; status: string;
+      cancelRequestedAt: string | null; lastEventSeq: number;
+    }>();
+    if (!row || row.assignmentId !== assignmentId || row.runnerId !== runnerId) return 'cancel';
+    if (row.cancelRequestedAt || !['assigned', 'running', 'waiting'].includes(row.status)) return 'cancel';
+    if (lastLocalSeq < row.lastEventSeq) return 'cancel';
+    return 'continue';
+  }
+
+  async cancelRunnerJob(projectId: string, actor: Actor, jobId: string): Promise<{
+    runnerId: string; assignmentId: string; terminal: boolean;
+  }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const row = await this.env.DB.prepare(
+        `SELECT runner_id AS runnerId, assignment_id AS assignmentId, status
+           FROM runner_jobs WHERE id = ? AND project_id = ?`,
+      ).bind(jobId, projectId).first<{ runnerId: string; assignmentId: string; status: string }>();
+      if (!row) throw new Error('RunnerJob not found');
+      if (['succeeded', 'partial', 'failed', 'cancelled'].includes(row.status)) {
+        return { ...row, terminal: true };
+      }
+      const at = nowIso();
+      const queued = row.status === 'queued';
+      await this.env.DB.batch([
+        this.env.DB.prepare(
+          `UPDATE runner_jobs SET status = ?, cancel_requested_at = ?, finished_at = ?, updated_at = ? WHERE id = ?`,
+        ).bind(queued ? 'cancelled' : row.status, at, queued ? at : null, at, jobId),
+        ...(queued ? [this.env.DB.prepare(
+          'UPDATE runner_job_items SET status = CASE WHEN status = \'pending\' THEN \'cancelled\' ELSE status END, reservation_active = 0, updated_at = ? WHERE job_id = ?',
+        ).bind(at, jobId)] : []),
+      ]);
+      await this.emit(actor, 'runner_job.status_changed', 'runner_job', jobId, {
+        from: row.status, to: queued ? 'cancelled' : row.status, cancellationRequested: true,
+      });
+      return { runnerId: row.runnerId, assignmentId: row.assignmentId, terminal: queued };
+    });
+  }
+
+  async answerRunnerJobQuestion(
+    projectId: string,
+    actor: Actor,
+    jobId: string,
+    questionId: string,
+    answer: string,
+  ): Promise<{ runnerId: string; assignmentId: string; answer: string }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const row = await this.env.DB.prepare(
+        `SELECT j.runner_id AS runnerId, j.assignment_id AS assignmentId, q.state, q.answer
+           FROM runner_job_questions q JOIN runner_jobs j ON j.id = q.job_id
+          WHERE q.job_id = ? AND q.question_id = ? AND j.project_id = ?`,
+      ).bind(jobId, questionId, projectId).first<{
+        runnerId: string; assignmentId: string; state: string; answer: string | null;
+      }>();
+      if (!row) throw new Error('RunnerJob question not found');
+      if (row.state === 'answered') {
+        if (row.answer !== answer) throw new Error('question already has a different answer');
+        return { runnerId: row.runnerId, assignmentId: row.assignmentId, answer };
+      }
+      const at = nowIso();
+      await this.env.DB.prepare(
+        `UPDATE runner_job_questions SET state = 'answered', answer = ?, answered_at = ?, updated_at = ?
+          WHERE job_id = ? AND question_id = ? AND state = 'open'`,
+      ).bind(answer, at, at, jobId, questionId).run();
+      await this.emit(actor, 'runner_job.status_changed', 'runner_job', jobId, {
+        questionId, answered: true,
+      });
+      return { runnerId: row.runnerId, assignmentId: row.assignmentId, answer };
     });
   }
 

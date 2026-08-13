@@ -6,6 +6,7 @@ import {
   MISSION_CAPABILITY,
   MISSION_HANDOFF_CAPABILITY,
   RunnerRepo,
+  RunnerJobRunnerMessage,
   RunnerClientMessage,
   RUNNER_PROTOCOL_CAPABILITIES,
   RUNNER_PROTOCOL_VERSION,
@@ -39,6 +40,7 @@ import {
  */
 const SYS: Actor = { kind: 'system', id: 'system', name: 'system' };
 type RunnerSocketAuth = { userId: string; tokenId: string; capabilities?: RunnerProtocolCapability[] };
+type RunnerSocketAttachment = RunnerSocketAuth & { jobProtocol?: 2 };
 
 export class RunnerHub extends DurableObject<Env> {
   private _runnerId?: string;
@@ -76,9 +78,63 @@ export class RunnerHub extends DurableObject<Env> {
       try {
         const auth = await this.authorizeSocket(ws);
         if (!auth) continue;
+        if ((auth as RunnerSocketAttachment).jobProtocol === 2) continue;
         ws.send(await this.messageForSocket(ws, json));
         delivered = true;
       } catch { /* socket gone */ }
+    }
+    return { delivered };
+  }
+
+  /** Assign or replay one durable protocol-v2 job to a negotiated socket. */
+  async deliverRunnerJob(jobId: string): Promise<{ delivered: boolean }> {
+    const runnerId = await this.loadRunnerId();
+    if (!runnerId) return { delivered: false };
+    const row = await this.env.DB.prepare(
+      'SELECT project_id AS pid FROM runner_jobs WHERE id = ? AND runner_id = ?',
+    ).bind(jobId, runnerId).first<{ pid: string }>();
+    if (!row) return { delivered: false };
+    const assignment = await this.room(row.pid).assignRunnerJob(row.pid, jobId, runnerId);
+    if (!assignment) return { delivered: false };
+    let delivered = false;
+    for (const ws of this.ctx.getWebSockets()) {
+      const auth = await this.authorizeSocket(ws);
+      if (!auth || (auth as RunnerSocketAttachment).jobProtocol !== 2) continue;
+      if (!(await this.authorizeProject(ws, auth, row.pid))) continue;
+      delivered = this.sendIfOpen(ws, JSON.stringify({ type: 'job.assign', assignment })) || delivered;
+    }
+    return { delivered };
+  }
+
+  async deliverRunnerJobAnswer(
+    jobId: string,
+    assignmentId: string,
+    questionId: string,
+    answer: string,
+  ): Promise<{ delivered: boolean }> {
+    let delivered = false;
+    for (const ws of this.ctx.getWebSockets()) {
+      const auth = await this.authorizeSocket(ws);
+      if (!auth || (auth as RunnerSocketAttachment).jobProtocol !== 2) continue;
+      delivered = this.sendIfOpen(ws, JSON.stringify({
+        type: 'job.answer', jobId, assignmentId, questionId, answer,
+      })) || delivered;
+    }
+    return { delivered };
+  }
+
+  async deliverRunnerJobCancellation(
+    jobId: string,
+    assignmentId: string,
+    reason: string,
+  ): Promise<{ delivered: boolean }> {
+    let delivered = false;
+    for (const ws of this.ctx.getWebSockets()) {
+      const auth = await this.authorizeSocket(ws);
+      if (!auth || (auth as RunnerSocketAttachment).jobProtocol !== 2) continue;
+      delivered = this.sendIfOpen(ws, JSON.stringify({
+        type: 'job.cancel', jobId, assignmentId, reason,
+      })) || delivered;
     }
     return { delivered };
   }
@@ -107,10 +163,16 @@ export class RunnerHub extends DurableObject<Env> {
     if (!runnerId) return;
     const auth = await this.authorizeSocket(ws);
     if (!auth) return;
-    let parsed;
+    let raw: unknown;
     try {
-      parsed = RunnerClientMessage.safeParse(JSON.parse(message));
+      raw = JSON.parse(message);
     } catch { return; }
+    const jobMessage = RunnerJobRunnerMessage.safeParse(raw);
+    if (jobMessage.success) {
+      await this.handleRunnerJobMessage(ws, auth, runnerId, jobMessage.data);
+      return;
+    }
+    const parsed = RunnerClientMessage.safeParse(raw);
     if (!parsed.success) return;
     const msg = parsed.data;
 
@@ -566,6 +628,118 @@ export class RunnerHub extends DurableObject<Env> {
     ws.close();
   }
 
+  private async handleRunnerJobMessage(
+    ws: WebSocket,
+    auth: RunnerSocketAuth,
+    runnerId: string,
+    message: RunnerJobRunnerMessage,
+  ): Promise<void> {
+    if (message.type === 'hello') {
+      if (message.runnerId !== runnerId) {
+        ws.close(1008, 'runner identity mismatch');
+        return;
+      }
+      ws.serializeAttachment({ ...auth, jobProtocol: 2 } satisfies RunnerSocketAttachment);
+      await this.refreshRunnerJobRepositories(runnerId, message.repositories);
+      await this.env.DB.prepare(
+        "UPDATE runners SET free_slots = ?, status = 'online', last_heartbeat_at = ? WHERE id = ?",
+      ).bind(message.capacity, new Date().toISOString(), runnerId).run();
+      const { results: jobs } = await this.env.DB.prepare(
+        `SELECT id, project_id AS pid, status, assignment_id AS assignmentId,
+                cancel_requested_at AS cancelRequestedAt
+           FROM runner_jobs
+          WHERE runner_id = ? AND status IN ('queued','assigned','running','waiting')
+          ORDER BY created_at`,
+      ).bind(runnerId).all<{
+        id: string; pid: string; status: string; assignmentId: string; cancelRequestedAt: string | null;
+      }>();
+      let free = message.capacity - jobs.filter((job) => ['assigned', 'running', 'waiting'].includes(job.status)).length;
+      for (const job of jobs) {
+        if (!(await this.authorizeProject(ws, auth, job.pid))) return;
+        if (job.cancelRequestedAt) {
+          if (!this.sendIfOpen(ws, JSON.stringify({
+            type: 'job.cancel', jobId: job.id, assignmentId: job.assignmentId,
+            reason: 'cancellation requested while disconnected',
+          }))) return;
+          continue;
+        }
+        if (job.status === 'queued' && free <= 0) continue;
+        const assignment = await this.room(job.pid).assignRunnerJob(job.pid, job.id, runnerId);
+        if (assignment) {
+          if (!this.sendIfOpen(ws, JSON.stringify({ type: 'job.assign', assignment }))) return;
+          if (job.status === 'queued') free -= 1;
+        }
+      }
+      const { results: answers } = await this.env.DB.prepare(
+        `SELECT q.job_id AS jobId, j.assignment_id AS assignmentId,
+                q.question_id AS questionId, q.answer
+           FROM runner_job_questions q JOIN runner_jobs j ON j.id = q.job_id
+          WHERE j.runner_id = ? AND q.state = 'answered'
+            AND j.status IN ('assigned','running','waiting') ORDER BY q.answered_at`,
+      ).bind(runnerId).all<{
+        jobId: string; assignmentId: string; questionId: string; answer: string;
+      }>();
+      for (const answer of answers) {
+        if (!this.sendIfOpen(ws, JSON.stringify({ type: 'job.answer', ...answer }))) return;
+      }
+      return;
+    }
+
+    if ((auth as RunnerSocketAttachment).jobProtocol !== 2) {
+      ws.close(1002, 'protocol v2 hello required');
+      return;
+    }
+
+    if (message.type === 'heartbeat') {
+      await this.env.DB.prepare(
+        "UPDATE runners SET free_slots = ?, status = 'online', last_heartbeat_at = ? WHERE id = ?",
+      ).bind(message.freeSlots, new Date().toISOString(), runnerId).run();
+      if (message.freeSlots > 0) {
+        const { results } = await this.env.DB.prepare(
+          "SELECT id FROM runner_jobs WHERE runner_id = ? AND status = 'queued' ORDER BY created_at LIMIT ?",
+        ).bind(runnerId, message.freeSlots).all<{ id: string }>();
+        for (const job of results) await this.deliverRunnerJob(job.id);
+      }
+      return;
+    }
+
+    const row = await this.env.DB.prepare(
+      'SELECT project_id AS pid, runner_id AS runnerId FROM runner_jobs WHERE id = ?',
+    ).bind(message.jobId).first<{ pid: string; runnerId: string }>();
+    if (!row || row.runnerId !== runnerId || !(await this.authorizeProject(ws, auth, row.pid))) {
+      ws.close(1008, 'RunnerJob is outside this runner');
+      return;
+    }
+    if (message.type === 'job.accept') {
+      const accepted = await this.room(row.pid).acceptRunnerJob(
+        row.pid, message.jobId, runnerId, message.assignmentId,
+      );
+      if (!accepted) ws.close(1008, 'stale assignment');
+      return;
+    }
+    if (message.type === 'job.event') {
+      const result = await this.room(row.pid).recordRunnerJobEvent(
+        row.pid, message.jobId, runnerId, message.assignmentId, message.seq, message.payload,
+      );
+      if (!result.accepted) {
+        ws.close(1008, result.error ?? 'RunnerJob event rejected');
+        return;
+      }
+      this.sendIfOpen(ws, JSON.stringify({
+        type: 'job.event.ack', jobId: message.jobId,
+        assignmentId: message.assignmentId, seq: result.ack,
+      }));
+      return;
+    }
+    const action = await this.room(row.pid).reconcileRunnerJob(
+      row.pid, message.jobId, runnerId, message.assignmentId, message.lastLocalSeq,
+    );
+    this.sendIfOpen(ws, JSON.stringify({
+      type: 'job.reconcile.result', jobId: message.jobId,
+      assignmentId: message.assignmentId, action,
+    }));
+  }
+
   private room(projectId: string) {
     return this.env.PROJECT_ROOM.get(this.env.PROJECT_ROOM.idFromName(projectId));
   }
@@ -593,6 +767,27 @@ export class RunnerHub extends DurableObject<Env> {
       await this.env.DB.prepare('UPDATE runners SET repos = ? WHERE id = ?')
         .bind(JSON.stringify(merged), runnerId).run();
     }
+  }
+
+  /** V2 hello may refresh only the base revision and opaque repoRef of an already-authorized
+   * registration. Project association remains the REST registration authority. */
+  private async refreshRunnerJobRepositories(
+    runnerId: string,
+    advertised: Array<{ repositoryKey: string; repoRef: string; baseRevision: string }>,
+  ): Promise<void> {
+    const row = await this.env.DB.prepare('SELECT repos FROM runners WHERE id = ?')
+      .bind(runnerId).first<{ repos: string }>();
+    if (!row) return;
+    let stored: Array<Record<string, unknown> & { id?: string; repositoryKey?: string | null }>;
+    try { stored = JSON.parse(row.repos || '[]') as typeof stored; } catch { return; }
+    const merged = stored.map((repository) => {
+      const incoming = advertised.find((candidate) =>
+        candidate.repoRef === repository.id || candidate.repositoryKey === repository.repositoryKey,
+      );
+      return incoming ? { ...repository, repoRef: incoming.repoRef, baseRevision: incoming.baseRevision } : repository;
+    });
+    await this.env.DB.prepare('UPDATE runners SET repos = ? WHERE id = ?')
+      .bind(JSON.stringify(merged), runnerId).run();
   }
 
   /** Async authorization/redelivery work may outlive a peer-initiated close. Treat that as an

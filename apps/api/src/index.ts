@@ -4271,7 +4271,8 @@ async function dispatchRunnerJob(
       source, runnerId: parsed.data.runnerId, repoRef: parsed.data.repoRef,
       expectedBaseRevision: repository.baseRevision,
     });
-    return c.json({ job, delivered: false }, 201);
+    const { delivered } = await hub(c.env, parsed.data.runnerId).deliverRunnerJob(job.id);
+    return c.json({ job, delivered }, 201);
   } catch (error) {
     return c.json({ error: error instanceof Error ? error.message : 'RunnerJob dispatch failed' }, 409);
   }
@@ -4282,6 +4283,39 @@ app.post('/api/projects/:pid/tasks/:taskId/runner-jobs', userAuth, (c) =>
 
 app.post('/api/projects/:pid/plans/:planId/runner-jobs', userAuth, (c) =>
   dispatchRunnerJob(c, { kind: 'plan', id: c.req.param('planId')! }));
+
+app.post('/api/projects/:pid/runner-jobs/:jobId/cancel', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  try {
+    const result = await room(c.env, pid).cancelRunnerJob(pid, humanActor(c), c.req.param('jobId')!);
+    const delivery = result.terminal
+      ? { delivered: false }
+      : await hub(c.env, result.runnerId).deliverRunnerJobCancellation(
+          c.req.param('jobId')!, result.assignmentId, 'cancelled by a human',
+        );
+    return c.json({ ok: true, terminal: result.terminal, ...delivery });
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : 'RunnerJob cancellation failed' }, 409);
+  }
+});
+
+app.post('/api/projects/:pid/runner-jobs/:jobId/questions/:questionId/answer', userAuth, async (c) => {
+  const parsed = z.object({ answer: z.string().trim().min(1).max(20_000) }).strict()
+    .safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid answer', detail: parsed.error.issues }, 400);
+  const pid = c.req.param('pid')!;
+  try {
+    const result = await room(c.env, pid).answerRunnerJobQuestion(
+      pid, humanActor(c), c.req.param('jobId')!, c.req.param('questionId')!, parsed.data.answer,
+    );
+    const delivery = await hub(c.env, result.runnerId).deliverRunnerJobAnswer(
+      c.req.param('jobId')!, result.assignmentId, c.req.param('questionId')!, result.answer,
+    );
+    return c.json({ ok: true, ...delivery });
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : 'RunnerJob answer failed' }, 409);
+  }
+});
 
 
 // Dispatch a brief → a Run on a runner (RUN-7). The dispatch primitive is the
