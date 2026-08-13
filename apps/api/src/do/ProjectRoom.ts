@@ -1825,7 +1825,6 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.loadPid();
       if (!this._pid) return;
       const now = nowIso();
-      await this.expireRunnerMissionReconciliations(now, SYSTEM_ACTOR);
       const { results } = await this.env.DB.prepare(
         `SELECT id, key, title, claimed_by FROM tasks
          WHERE project_id = ? AND claimed_by IS NOT NULL AND claim_expires_at < ? AND status = 'in_progress'`,
@@ -1859,20 +1858,15 @@ export class ProjectRoom extends DurableObject<Env> {
 
   private async scheduleExpiryAlarm() {
     // One alarm serves BOTH expiry sources (PLNR-204): the next claim TTL and the next lock TTL.
-    const [claimRow, lockRow, missionRow] = await Promise.all([
+    const [claimRow, lockRow] = await Promise.all([
       this.env.DB.prepare(
         `SELECT MIN(claim_expires_at) AS next FROM tasks WHERE project_id = ? AND claimed_by IS NOT NULL AND status = 'in_progress'`,
       ).bind(this.projectId).first<{ next: string | null }>(),
       this.env.DB.prepare(
         `SELECT MIN(expires_at) AS next FROM file_locks WHERE project_id = ? AND released_at IS NULL`,
       ).bind(this.projectId).first<{ next: string | null }>(),
-      this.env.DB.prepare(
-        `SELECT MIN(reconciliation_deadline) AS next FROM runs
-          WHERE project_id = ? AND reconciliation_deadline IS NOT NULL
-            AND status IN ('dispatched','running','blocked')`,
-      ).bind(this.projectId).first<{ next: string | null }>(),
     ]);
-    const nexts = [claimRow?.next, lockRow?.next, missionRow?.next].filter((x): x is string => !!x);
+    const nexts = [claimRow?.next, lockRow?.next].filter((x): x is string => !!x);
     if (nexts.length) {
       // +2s grace so a renewal landing right at the boundary wins.
       const soonest = nexts.reduce((a, b) => (a < b ? a : b));

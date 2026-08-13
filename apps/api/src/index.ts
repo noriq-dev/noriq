@@ -4382,12 +4382,24 @@ app.post('/api/projects/:pid/runner-jobs/:jobId/questions/:questionId/answer', u
   }
 });
 
+const legacyRunnerWriteGone = async (c: Context<AppContext>) => {
+  // Drain a submitted JSON body before responding so runtimes do not retain an unread stream.
+  await c.req.text().catch(() => '');
+  return c.json({
+    error: 'legacy Run and mission writes are disabled; dispatch a RunnerJob instead',
+    code: 'runner_job_cutover',
+    replacement: `/api/projects/${c.req.param('pid') || ':pid'}/runner-jobs`,
+  }, 410);
+};
+const legacyRunnerWritesDisabled = (): boolean => true;
 
 // Dispatch a brief → a Run on a runner (RUN-7). The dispatch primitive is the
 // *intent*: kind + repo + brief (+ optional task/plan anchor). Creates the Run in
 // the project's ProjectRoom (authoritative, dispatched) and pushes run.assigned
 // down the runner's live socket. Under /api/projects/:pid/* → project reach gated.
 app.post('/api/projects/:pid/runs', userAuth, async (c) => {
+  return legacyRunnerWriteGone(c);
+  /* Legacy implementation retained temporarily as a migration reference; unreachable after cutover.
   const denied = demoDenied(c); // the demo drives no runners (PLNR-199)
   if (denied) return denied;
   const pid = c.req.param('pid')!;
@@ -4455,6 +4467,7 @@ app.post('/api/projects/:pid/runs', userAuth, async (c) => {
   }
   const { delivered } = await hub(c.env, b.runnerId).deliver(JSON.stringify({ type: 'run.assigned', run }));
   return c.json({ run, delivered });
+  */
 });
 
 // List a project's Runs for the dashboard (RUN-22). Under /api/projects/:pid/* →
@@ -4521,6 +4534,8 @@ const PlanDispatchApiBody = z.object({
   executionProfileId: ExecutionProfileId.nullish(),
 });
 app.post('/api/projects/:pid/plans/:planId/dispatch', userAuth, async (c) => {
+  return legacyRunnerWriteGone(c);
+  /* Legacy server-side plan pump retained only as a read-migration reference.
   const denied = demoDenied(c);
   if (denied) return denied;
   const pid = c.req.param('pid')!;
@@ -4567,6 +4582,7 @@ app.post('/api/projects/:pid/plans/:planId/dispatch', userAuth, async (c) => {
     // caller's to fix — surface them as a 409, not a 500.
     return c.json({ error: e instanceof Error ? e.message : 'plan dispatch failed' }, 409);
   }
+  */
 });
 
 app.get('/api/projects/:pid/plan-dispatches', userAuth, async (c) => {
@@ -4577,6 +4593,8 @@ app.get('/api/projects/:pid/plan-dispatches', userAuth, async (c) => {
 });
 
 app.post('/api/plan-dispatches/:id/cancel', userAuth, async (c) => {
+  return legacyRunnerWriteGone(c);
+  /* Cutover migration cancelled every live legacy dispatch.
   const id = c.req.param('id')!;
   const reason = ((await c.req.json<{ reason?: string }>().catch(() => ({}))) as { reason?: string }).reason ?? null;
   const row = await c.env.DB.prepare('SELECT project_id AS pid FROM plan_dispatches WHERE id = ?')
@@ -4587,11 +4605,14 @@ app.post('/api/plan-dispatches/:id/cancel', userAuth, async (c) => {
   if (!projectRoleAllows(access.role, 'manage')) return c.json({ error: 'project manager role required', code: 'project_action_denied', action: 'manage' }, 403);
   const res = await room(c.env, row.pid).cancelPlanDispatch(row.pid, humanActor(c), id, reason);
   return c.json(res);
+  */
 });
 
 // Re-arm tasks whose only attempts failed and pump again. The pump never retries on its
 // own — a failed agent run is a human's judgment call, and this endpoint is that judgment.
 app.post('/api/plan-dispatches/:id/retry', userAuth, async (c) => {
+  return legacyRunnerWriteGone(c);
+  /* Legacy mutation disabled after RunnerJob cutover.
   const denied = demoDenied(c);
   if (denied) return denied;
   const id = c.req.param('id')!;
@@ -4606,6 +4627,7 @@ app.post('/api/plan-dispatches/:id/retry', userAuth, async (c) => {
   } catch (e) {
     return c.json({ error: e instanceof Error ? e.message : 'retry failed' }, 409);
   }
+  */
 });
 
 // The run TRANSCRIPT (RUN-74): the append-only, role-labeled stream of everything the run
@@ -4634,6 +4656,7 @@ app.get('/api/runs/:runId/handoff', userAuth, async (c) => {
 });
 
 app.post('/api/runs/:runId/handoff/consume', userAuth, async (c) => {
+  if (legacyRunnerWritesDisabled()) return legacyRunnerWriteGone(c);
   const denied = demoDenied(c);
   if (denied) return denied;
   const runId = c.req.param('runId')!;
@@ -4664,6 +4687,7 @@ app.post('/api/runs/:runId/handoff/consume', userAuth, async (c) => {
 // Cancel a Run (RUN-7): mark it cancelled in its project's authority and push
 // run.cancel down the runner's socket so the daemon SIGTERMs the process.
 app.post('/api/runs/:runId/cancel', userAuth, async (c) => {
+  if (legacyRunnerWritesDisabled()) return legacyRunnerWriteGone(c);
   const runId = c.req.param('runId')!;
   const reason = ((await c.req.json<{ reason?: string }>().catch(() => ({}))) as { reason?: string }).reason ?? null;
   const run = await c.env.DB.prepare('SELECT project_id AS pid, runner_id AS runnerId FROM runs WHERE id = ?')
@@ -4686,6 +4710,7 @@ app.post('/api/runs/:runId/cancel', userAuth, async (c) => {
 // the anchor task in the same DO breath.
 const ContinueBody = z.object({ rounds: z.number().int().positive().nullable().default(null) });
 app.post('/api/runs/:runId/continue', userAuth, async (c) => {
+  if (legacyRunnerWritesDisabled()) return legacyRunnerWriteGone(c);
   const denied = demoDenied(c);
   if (denied) return denied;
   const runId = c.req.param('runId')!;
@@ -4725,6 +4750,7 @@ const SteerBody = z.object({
   noticeCursor: z.number().int().nonnegative().nullish(),
 });
 app.post('/api/runs/:runId/steer', userAuth, async (c) => {
+  if (legacyRunnerWritesDisabled()) return legacyRunnerWriteGone(c);
   const denied = demoDenied(c);
   if (denied) return denied;
   const runId = c.req.param('runId')!;
@@ -4784,6 +4810,7 @@ const RunAgentBody = z.object({
   protocolCapabilities: z.array(RunnerProtocolCapability).max(16).default([]),
 });
 app.post('/api/runs/:runId/agent', agentAuth, async (c) => {
+  if (legacyRunnerWritesDisabled()) return legacyRunnerWriteGone(c);
   const runId = c.req.param('runId')!;
   const parsed = RunAgentBody.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) return c.json({ error: 'invalid run-agent request', detail: parsed.error.issues }, 400);
@@ -4917,6 +4944,7 @@ app.get('/api/runs/:runId/orchestration', agentAuth, async (c) => {
 });
 
 app.post('/api/runs/:runId/executions', agentAuth, async (c) => {
+  if (legacyRunnerWritesDisabled()) return legacyRunnerWriteGone(c);
   const runId = c.req.param('runId')!;
   const run = await runnerOwnedRun(c, runId);
   if (!run || run.owner !== c.var.connection!.userId) return c.json({ error: 'run not found' }, 404);
@@ -4932,6 +4960,7 @@ app.post('/api/runs/:runId/executions', agentAuth, async (c) => {
 });
 
 app.post('/api/runs/:runId/execution-relations', agentAuth, async (c) => {
+  if (legacyRunnerWritesDisabled()) return legacyRunnerWriteGone(c);
   const runId = c.req.param('runId')!;
   const run = await runnerOwnedRun(c, runId);
   if (!run || run.owner !== c.var.connection!.userId) return c.json({ error: 'run not found' }, 404);
@@ -4947,6 +4976,7 @@ app.post('/api/runs/:runId/execution-relations', agentAuth, async (c) => {
 });
 
 app.post('/api/runs/:runId/execution-events', agentAuth, async (c) => {
+  if (legacyRunnerWritesDisabled()) return legacyRunnerWriteGone(c);
   const runId = c.req.param('runId')!;
   const run = await runnerOwnedRun(c, runId);
   if (!run || run.owner !== c.var.connection!.userId) return c.json({ error: 'run not found' }, 404);
@@ -4962,6 +4992,7 @@ app.post('/api/runs/:runId/execution-events', agentAuth, async (c) => {
 });
 
 app.post('/api/runs/:runId/execution-reconcile', agentAuth, async (c) => {
+  if (legacyRunnerWritesDisabled()) return legacyRunnerWriteGone(c);
   const runId = c.req.param('runId')!;
   const run = await runnerOwnedRun(c, runId);
   if (!run || run.owner !== c.var.connection!.userId) return c.json({ error: 'run not found' }, 404);
@@ -5100,6 +5131,7 @@ const SteerAckBody = z.object({
   via: z.enum(['runtime', 'fallback', 'dropped']).default('runtime'),
 });
 app.post('/api/runs/:runId/steer-ack', agentAuth, async (c) => {
+  if (legacyRunnerWritesDisabled()) return legacyRunnerWriteGone(c);
   const runId = c.req.param('runId')!;
   const parsed = SteerAckBody.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) return c.json({ error: 'invalid steer-ack', detail: parsed.error.issues }, 400);
@@ -5133,6 +5165,7 @@ app.post('/api/runs/:runId/steer-ack', agentAuth, async (c) => {
 // tightened here to the exact bound agent because a verification report is written attributed to
 // an actor, not merely gated by project reach.
 app.post('/api/runs/:runId/verification-report', agentAuth, async (c) => {
+  if (legacyRunnerWritesDisabled()) return legacyRunnerWriteGone(c);
   const runId = c.req.param('runId')!;
   let report: ReturnType<typeof normalizeVerificationReport>;
   try {

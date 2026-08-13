@@ -37,6 +37,24 @@ beforeAll(async () => {
 }, 60_000);
 
 describe('RunnerJob commissioning (PLNR-498)', () => {
+  it('hard-cuts legacy write endpoints while retaining historical reads (PLNR-502)', async () => {
+    const headers = { Cookie: cookie, 'Content-Type': 'application/json' };
+    for (const [path, body] of [
+      [`/api/projects/${pid}/runs`, {}],
+      [`/api/projects/${pid}/plans/legacy-plan/dispatch`, {}],
+      ['/api/plan-dispatches/legacy-dispatch/retry', {}],
+      ['/api/runs/legacy-run/cancel', {}],
+    ] as const) {
+      const response = await SELF.fetch(`https://noriq.test${path}`, {
+        method: 'POST', headers, body: JSON.stringify(body),
+      });
+      expect(response.status, path).toBe(410);
+      expect(await response.json()).toMatchObject({ code: 'runner_job_cutover' });
+    }
+    expect((await SELF.fetch(`https://noriq.test/api/projects/${pid}/runs`, { headers })).status).toBe(200);
+    expect((await SELF.fetch(`https://noriq.test/api/projects/${pid}/plan-dispatches`, { headers })).status).toBe(200);
+  });
+
   it('creates a bounded immutable snapshot, one root, and a live reservation atomically', async () => {
     const task = await room.createTask(pid, SYSTEM_ACTOR as Actor, { title: 'Reserved task' });
     const job = await room.createRunnerJob(pid, SYSTEM_ACTOR as Actor, {

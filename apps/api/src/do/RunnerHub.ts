@@ -176,6 +176,8 @@ export class RunnerHub extends DurableObject<Env> {
     if (!parsed.success) return;
     const msg = parsed.data;
 
+    if (await this.handleLegacyCutoverFrame(ws, auth, runnerId, msg)) return;
+
     switch (msg.type) {
       case 'ping':
         this.sendIfOpen(ws, JSON.stringify({ type: 'pong' }));
@@ -626,6 +628,38 @@ export class RunnerHub extends DurableObject<Env> {
 
   override async webSocketClose(ws: WebSocket) {
     ws.close();
+  }
+
+  /**
+   * Every schema-valid v1 frame terminates here. Keeping this as a boolean guard (rather than
+   * leaving an unconditional return above the old switch) lets TypeScript continue checking
+   * the retained migration-reference code without making any of it reachable at runtime.
+   */
+  private async handleLegacyCutoverFrame(
+    ws: WebSocket,
+    auth: RunnerSocketAuth,
+    runnerId: string,
+    message: RunnerClientMessage,
+  ): Promise<boolean> {
+    if (message.type === 'ping') {
+      this.sendIfOpen(ws, JSON.stringify({ type: 'pong' }));
+      return true;
+    }
+    if (message.type === 'hello') {
+      ws.serializeAttachment({ ...auth, capabilities: [] } satisfies RunnerSocketAuth);
+      this.sendIfOpen(ws, JSON.stringify({
+        type: 'registered', runnerId, protocol: RUNNER_PROTOCOL_VERSION,
+        serverTime: new Date().toISOString(), acceptedCapabilities: [],
+      }));
+      return true;
+    }
+    if (message.type === 'heartbeat') {
+      await this.env.DB.prepare("UPDATE runners SET free_slots = ?, status = 'online', last_heartbeat_at = ? WHERE id = ?")
+        .bind(message.freeSlots, new Date().toISOString(), runnerId).run();
+      return true;
+    }
+    console.warn(`ignored legacy Runner frame after RunnerJob cutover: ${message.type}`);
+    return true;
   }
 
   private async handleRunnerJobMessage(
