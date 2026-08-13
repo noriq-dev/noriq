@@ -4284,6 +4284,71 @@ app.post('/api/projects/:pid/tasks/:taskId/runner-jobs', userAuth, (c) =>
 app.post('/api/projects/:pid/plans/:planId/runner-jobs', userAuth, (c) =>
   dispatchRunnerJob(c, { kind: 'plan', id: c.req.param('planId')! }));
 
+const parseStoredJson = <T>(value: string | null, fallback: T): T => {
+  if (value === null) return fallback;
+  try { return JSON.parse(value) as T; } catch { return fallback; }
+};
+
+app.get('/api/projects/:pid/runner-jobs', userAuth, async (c) => {
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, runner_id AS runnerId, repo_ref AS repoRef, source_kind AS sourceKind,
+            source_id AS sourceId, status, phase, progress, usage, final_result AS finalResult,
+            warning_count AS warningCount, created_at AS createdAt, started_at AS startedAt,
+            finished_at AS finishedAt, updated_at AS updatedAt
+       FROM runner_jobs WHERE project_id = ? ORDER BY created_at DESC LIMIT 100`,
+  ).bind(c.req.param('pid')!).all<Record<string, unknown> & { usage: string; finalResult: string | null }>();
+  return c.json({ jobs: results.map((job) => ({
+    ...job, usage: parseStoredJson(job.usage, null),
+    finalResult: parseStoredJson(job.finalResult, null),
+  })) });
+});
+
+app.get('/api/projects/:pid/runner-jobs/:jobId', userAuth, async (c) => {
+  const job = await c.env.DB.prepare(
+    `SELECT id, runner_id AS runnerId, repo_ref AS repoRef, source_kind AS sourceKind,
+            source_id AS sourceId, snapshot, snapshot_digest AS snapshotDigest,
+            expected_base_revision AS expectedBaseRevision, orchestration_id AS orchestrationId,
+            status, phase, progress, usage, final_result AS finalResult,
+            warning_count AS warningCount, last_event_seq AS lastEventSeq,
+            created_at AS createdAt, assigned_at AS assignedAt, started_at AS startedAt,
+            cancel_requested_at AS cancelRequestedAt, finished_at AS finishedAt, updated_at AS updatedAt
+       FROM runner_jobs WHERE id = ? AND project_id = ?`,
+  ).bind(c.req.param('jobId')!, c.req.param('pid')!).first<Record<string, unknown> & {
+    snapshot: string; usage: string; finalResult: string | null;
+  }>();
+  if (!job) return c.json({ error: 'RunnerJob not found' }, 404);
+  const [items, events, questions] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT task_id AS taskId, task_key AS taskKey, phase_order AS phaseOrder,
+              task_order AS taskOrder, status, plan, commit_revision AS commitRevision,
+              summary, findings, projection_conflict AS projectionConflict,
+              started_at AS startedAt, finished_at AS finishedAt, updated_at AS updatedAt
+         FROM runner_job_items WHERE job_id = ? ORDER BY phase_order, task_order, task_key`,
+    ).bind(c.req.param('jobId')!).all<Record<string, unknown> & { findings: string; projectionConflict: string | null }>(),
+    c.env.DB.prepare(
+      `SELECT seq, event_type AS type, payload, observed_at AS observedAt, received_at AS receivedAt
+         FROM runner_job_events WHERE job_id = ? ORDER BY seq`,
+    ).bind(c.req.param('jobId')!).all<Record<string, unknown> & { payload: string }>(),
+    c.env.DB.prepare(
+      `SELECT question_id AS questionId, prompt, state, answer,
+              published_at AS publishedAt, answered_at AS answeredAt
+         FROM runner_job_questions WHERE job_id = ? ORDER BY published_at`,
+    ).bind(c.req.param('jobId')!).all(),
+  ]);
+  return c.json({
+    job: {
+      ...job, snapshot: parseStoredJson(job.snapshot, null), usage: parseStoredJson(job.usage, null),
+      finalResult: parseStoredJson(job.finalResult, null),
+    },
+    items: items.results.map((item) => ({
+      ...item, findings: parseStoredJson(item.findings, []),
+      projectionConflict: parseStoredJson(item.projectionConflict, null),
+    })),
+    events: events.results.map((event) => ({ ...event, payload: parseStoredJson(event.payload, null) })),
+    questions: questions.results,
+  });
+});
+
 app.post('/api/projects/:pid/runner-jobs/:jobId/cancel', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
   try {

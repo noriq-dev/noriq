@@ -7,6 +7,9 @@ import { createUser, loginSession, projectRoom, SYSTEM_ACTOR } from './helpers';
 interface RoomRpc {
   createTask(projectId: string, actor: Actor, input: { title: string }): Promise<{ id: string; key: string }>;
   createRunnerJob(projectId: string, actor: Actor, input: CreateRunnerJobInput): Promise<RunnerJobView>;
+  assignRunnerJob(projectId: string, jobId: string, runnerId: string): Promise<{ assignmentId: string } | null>;
+  acceptRunnerJob(projectId: string, jobId: string, runnerId: string, assignmentId: string): Promise<boolean>;
+  recordRunnerJobEvent(projectId: string, jobId: string, runnerId: string, assignmentId: string, seq: number, event: unknown): Promise<{ accepted: boolean; ack: number; error: string | null }>;
 }
 
 let pid: string;
@@ -89,5 +92,63 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
       kind: 'plan', projectId: 'p', projectKey: 'P', planId: 'x', planKey: 'x', planTitle: 'x',
       tasks: Array.from({ length: 501 }, (_, index) => ({ taskId: `t${index}`, key: `P-${index}`, title: 't', body: '', executionSpec: null, status: 'todo', retry: false, order: index, phaseOrder: 0 })), dependencies: [],
     })).toThrow();
+  });
+
+  it('projects task and terminal outcomes without overwriting a later human terminal state', async () => {
+    const response = await SELF.fetch('https://noriq.test/api/projects', {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: `RP${crypto.randomUUID().slice(0, 6).toUpperCase()}`, name: 'projector runner job' }),
+    });
+    const projectId = ((await response.json()) as { id: string }).id;
+    const isolatedRoom = projectRoom<RoomRpc>(projectId);
+    const task = await isolatedRoom.createTask(projectId, SYSTEM_ACTOR as Actor, { title: 'Projected task' });
+    const job = await isolatedRoom.createRunnerJob(projectId, SYSTEM_ACTOR as Actor, {
+      source: { kind: 'task', id: task.id }, runnerId, repoRef: 'repo', expectedBaseRevision: revision,
+    });
+    await isolatedRoom.assignRunnerJob(projectId, job.id, runnerId);
+    expect(await isolatedRoom.acceptRunnerJob(projectId, job.id, runnerId, job.assignmentId)).toBe(true);
+    const at = new Date().toISOString();
+    expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 1, {
+      type: 'task.result', at, taskId: task.id, status: 'running', commit: null,
+      summary: 'started', findings: [],
+    })).toMatchObject({ accepted: true, ack: 1 });
+    expect(await env.DB.prepare('SELECT status FROM tasks WHERE id = ?').bind(task.id).first<{ status: string }>())
+      .toEqual({ status: 'in_progress' });
+
+    await env.DB.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").bind(task.id).run();
+    expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 2, {
+      type: 'task.result', at, taskId: task.id, status: 'accepted', commit: revision,
+      summary: 'accepted', findings: [{ severity: 'minor', title: 'note', body: 'human can inspect', path: null, line: null }],
+    })).toMatchObject({ accepted: true, ack: 2 });
+    const item = await env.DB.prepare(
+      'SELECT status, projection_conflict AS conflict FROM runner_job_items WHERE job_id = ? AND task_id = ?',
+    ).bind(job.id, task.id).first<{ status: string; conflict: string | null }>();
+    expect(item?.status).toBe('accepted');
+    expect(item?.conflict).toContain('"taskStatus":"done"');
+    expect(await env.DB.prepare('SELECT status FROM tasks WHERE id = ?').bind(task.id).first<{ status: string }>())
+      .toEqual({ status: 'done' });
+
+    const output = {
+      workspaceMode: 'isolated', branch: 'noriq/task/projected-job',
+      baseRevision: revision, headRevision: revision, acceptedTaskCommits: { [task.id]: revision },
+      checks: [], findings: [],
+      usage: { inputTokens: 10, outputTokens: 5, cachedTokens: 0, costUsd: 0.01, calls: 3 },
+      summary: 'partial output retained', dirtyPaths: [],
+    };
+    expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 3, {
+      type: 'terminal', at, status: 'partial', output,
+    })).toMatchObject({ accepted: true, ack: 3 });
+    expect(await env.DB.prepare('SELECT status FROM runner_jobs WHERE id = ?').bind(job.id).first<{ status: string }>())
+      .toEqual({ status: 'partial' });
+    expect(await env.DB.prepare('SELECT reservation_active AS active FROM runner_job_items WHERE job_id = ?').bind(job.id).first<{ active: number }>())
+      .toEqual({ active: 0 });
+    const root = await env.DB.prepare(
+      `SELECT o.status, COUNT(n.id) AS nodes FROM orchestrations o
+         JOIN execution_nodes n ON n.orchestration_id = o.id WHERE o.id = ? GROUP BY o.id`,
+    ).bind(job.orchestrationId).first<{ status: string; nodes: number }>();
+    expect(root).toEqual({ status: 'failed', nodes: 1 });
+    expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 4, {
+      type: 'warning', at, code: 'LATE', message: 'must not regress terminal state',
+    })).toMatchObject({ accepted: false, ack: 3 });
   });
 });

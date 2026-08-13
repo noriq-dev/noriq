@@ -4848,11 +4848,12 @@ export class ProjectRoom extends DurableObject<Env> {
       const encoded = JSON.stringify(event);
       const payloadHash = await sha256Hex(encoded);
       const job = await this.env.DB.prepare(
-        `SELECT assignment_id AS assignmentId, runner_id AS runnerId, status,
-                cancel_requested_at AS cancelRequestedAt, last_event_seq AS lastEventSeq
+        `SELECT assignment_id AS assignmentId, runner_id AS runnerId, status, phase,
+                orchestration_id AS orchestrationId, cancel_requested_at AS cancelRequestedAt,
+                last_event_seq AS lastEventSeq
            FROM runner_jobs WHERE id = ? AND project_id = ?`,
       ).bind(jobId, projectId).first<{
-        assignmentId: string; runnerId: string; status: string;
+        assignmentId: string; runnerId: string; status: string; phase: string; orchestrationId: string;
         cancelRequestedAt: string | null; lastEventSeq: number;
       }>();
       if (!job || job.runnerId !== runnerId || job.assignmentId !== assignmentId) {
@@ -4869,7 +4870,8 @@ export class ProjectRoom extends DurableObject<Env> {
       if (seq !== job.lastEventSeq + 1) {
         return { accepted: false, ack: job.lastEventSeq, error: `event sequence gap: expected ${job.lastEventSeq + 1}` };
       }
-      if (!['assigned', 'running', 'waiting'].includes(job.status) || job.cancelRequestedAt) {
+      const cancellationTerminal = event.type === 'terminal' && event.status === 'cancelled';
+      if (!['assigned', 'running', 'waiting'].includes(job.status) || (job.cancelRequestedAt && !cancellationTerminal)) {
         return { accepted: false, ack: job.lastEventSeq, error: 'job is no longer accepting events' };
       }
       const receivedAt = nowIso();
@@ -4884,12 +4886,114 @@ export class ProjectRoom extends DurableObject<Env> {
             WHERE id = ? AND assignment_id = ? AND last_event_seq = ?`,
         ).bind(seq, receivedAt, jobId, assignmentId, job.lastEventSeq),
       ];
-      if (event.type === 'question') {
+      const rootStatus = async (status: 'running' | 'parked' | 'succeeded' | 'failed' | 'cancelled') => {
+        statements.push(
+          this.env.DB.prepare(
+            `UPDATE orchestrations SET status = ?, updated_at = ?, finished_at = ? WHERE id = ?`,
+          ).bind(status, receivedAt, ['succeeded', 'failed', 'cancelled'].includes(status) ? receivedAt : null, job.orchestrationId),
+          this.env.DB.prepare(
+            `UPDATE execution_nodes SET status = ?, last_revision = last_revision + 1,
+                    started_at = CASE WHEN ? = 'running' THEN COALESCE(started_at, ?) ELSE started_at END,
+                    parked_at = CASE WHEN ? = 'parked' THEN ? WHEN ? = 'running' THEN NULL ELSE parked_at END,
+                    finished_at = CASE WHEN ? IN ('succeeded','failed','cancelled') THEN ? ELSE NULL END,
+                    updated_at = ?
+              WHERE orchestration_id = ? AND parent_execution_id IS NULL`,
+          ).bind(status, status, receivedAt, status, receivedAt, status, status, receivedAt, receivedAt, job.orchestrationId),
+        );
+      };
+      if (event.type === 'progress') {
         statements.push(this.env.DB.prepare(
-          `INSERT INTO runner_job_questions
-             (id, job_id, question_id, prompt, state, published_at, updated_at)
-           VALUES (?, ?, ?, ?, 'open', ?, ?)`,
-        ).bind(newId('rjq'), jobId, event.questionId, event.prompt, event.at, receivedAt));
+          `UPDATE runner_jobs SET status = CASE WHEN status = 'assigned' THEN 'running' ELSE status END,
+                  phase = ?, progress = ?, started_at = COALESCE(started_at, ?), updated_at = ?
+            WHERE id = ?`,
+        ).bind(event.phase, event.progress, event.at, receivedAt, jobId));
+        if (job.status === 'assigned') await rootStatus('running');
+      } else if (event.type === 'task.plan') {
+        statements.push(this.env.DB.prepare(
+          'UPDATE runner_job_items SET plan = ?, updated_at = ? WHERE job_id = ? AND task_id = ?',
+        ).bind(event.plan, receivedAt, jobId, event.taskId));
+      } else if (event.type === 'task.result') {
+        const item = await this.env.DB.prepare(
+          `SELECT i.status, t.status AS taskStatus, t.key AS taskKey
+             FROM runner_job_items i JOIN tasks t ON t.id = i.task_id
+            WHERE i.job_id = ? AND i.task_id = ?`,
+        ).bind(jobId, event.taskId).first<{ status: string; taskStatus: string; taskKey: string }>();
+        if (!item) return { accepted: false, ack: job.lastEventSeq, error: 'event names a task outside the snapshot' };
+        if (['accepted', 'failed', 'cancelled'].includes(item.status) && item.status !== event.status) {
+          return { accepted: false, ack: job.lastEventSeq, error: 'task result cannot regress or change terminal outcome' };
+        }
+        const humanWon = ['done', 'cancelled'].includes(item.taskStatus);
+        const conflict = humanWon
+          ? JSON.stringify({ at: receivedAt, taskStatus: item.taskStatus, runnerStatus: event.status })
+          : null;
+        statements.push(this.env.DB.prepare(
+          `UPDATE runner_job_items SET status = ?, commit_revision = ?, summary = ?, findings = ?,
+                  projection_conflict = COALESCE(?, projection_conflict),
+                  started_at = CASE WHEN ? = 'running' THEN COALESCE(started_at, ?) ELSE started_at END,
+                  finished_at = CASE WHEN ? IN ('accepted','failed','cancelled') THEN ? ELSE finished_at END,
+                  updated_at = ? WHERE job_id = ? AND task_id = ?`,
+        ).bind(
+          event.status, event.commit, event.summary, JSON.stringify(event.findings), conflict,
+          event.status, event.at, event.status, event.at, receivedAt, jobId, event.taskId,
+        ));
+        if (!humanWon) {
+          if (event.status === 'running' && item.taskStatus === 'todo') {
+            statements.push(this.env.DB.prepare(
+              "UPDATE tasks SET status = 'in_progress', failed_at = NULL, updated_at = ? WHERE id = ? AND status = 'todo'",
+            ).bind(receivedAt, event.taskId));
+          } else if (event.status === 'accepted' && ['todo', 'in_progress', 'blocked', 'review'].includes(item.taskStatus)) {
+            statements.push(this.env.DB.prepare(
+              "UPDATE tasks SET status = 'review', failed_at = NULL, claimed_by = NULL, claim_expires_at = NULL, updated_at = ? WHERE id = ? AND status NOT IN ('done','cancelled')",
+            ).bind(receivedAt, event.taskId));
+          } else if (event.status === 'failed') {
+            statements.push(this.env.DB.prepare(
+              "UPDATE tasks SET status = 'todo', failed_at = ?, claimed_by = NULL, claim_expires_at = NULL, updated_at = ? WHERE id = ? AND status NOT IN ('done','cancelled')",
+            ).bind(event.at, receivedAt, event.taskId));
+          }
+        }
+        if (event.status === 'running' && job.status === 'assigned') {
+          statements.push(this.env.DB.prepare(
+            "UPDATE runner_jobs SET status = 'running', started_at = COALESCE(started_at, ?), updated_at = ? WHERE id = ?",
+          ).bind(event.at, receivedAt, jobId));
+          await rootStatus('running');
+        }
+      } else if (event.type === 'question') {
+        statements.push(
+          this.env.DB.prepare(
+            `INSERT INTO runner_job_questions
+               (id, job_id, question_id, prompt, state, published_at, updated_at)
+             VALUES (?, ?, ?, ?, 'open', ?, ?)`,
+          ).bind(newId('rjq'), jobId, event.questionId, event.prompt, event.at, receivedAt),
+          this.env.DB.prepare(
+            "UPDATE runner_jobs SET status = 'waiting', updated_at = ? WHERE id = ?",
+          ).bind(receivedAt, jobId),
+        );
+        await rootStatus('parked');
+      } else if (event.type === 'usage') {
+        statements.push(this.env.DB.prepare(
+          'UPDATE runner_jobs SET usage = ?, updated_at = ? WHERE id = ?',
+        ).bind(JSON.stringify(event.usage), receivedAt, jobId));
+      } else if (event.type === 'warning') {
+        statements.push(this.env.DB.prepare(
+          'UPDATE runner_jobs SET warning_count = warning_count + 1, updated_at = ? WHERE id = ?',
+        ).bind(receivedAt, jobId));
+      } else if (event.type === 'terminal') {
+        const terminal = ['succeeded', 'partial', 'failed', 'cancelled'];
+        if (!terminal.includes(event.status)) {
+          return { accepted: false, ack: job.lastEventSeq, error: 'invalid terminal status' };
+        }
+        statements.push(
+          this.env.DB.prepare(
+            `UPDATE runner_jobs SET status = ?, phase = 'finalizing', progress = 1,
+                    usage = ?, final_result = ?, finished_at = ?, updated_at = ?
+              WHERE id = ? AND status IN ('assigned','running','waiting')`,
+          ).bind(event.status, JSON.stringify(event.output.usage), JSON.stringify(event.output), event.at, receivedAt, jobId),
+          this.env.DB.prepare(
+            `UPDATE runner_job_items SET status = CASE WHEN status = 'pending' THEN 'not_started' ELSE status END,
+                    reservation_active = 0, updated_at = ? WHERE job_id = ?`,
+          ).bind(receivedAt, jobId),
+        );
+        await rootStatus(event.status === 'succeeded' ? 'succeeded' : event.status === 'cancelled' ? 'cancelled' : 'failed');
       }
       await this.env.DB.batch(statements);
       return { accepted: true, ack: seq, error: null };
@@ -4970,10 +5074,25 @@ export class ProjectRoom extends DurableObject<Env> {
         return { runnerId: row.runnerId, assignmentId: row.assignmentId, answer };
       }
       const at = nowIso();
-      await this.env.DB.prepare(
-        `UPDATE runner_job_questions SET state = 'answered', answer = ?, answered_at = ?, updated_at = ?
-          WHERE job_id = ? AND question_id = ? AND state = 'open'`,
-      ).bind(answer, at, at, jobId, questionId).run();
+      await this.env.DB.batch([
+        this.env.DB.prepare(
+          `UPDATE runner_job_questions SET state = 'answered', answer = ?, answered_at = ?, updated_at = ?
+            WHERE job_id = ? AND question_id = ? AND state = 'open'`,
+        ).bind(answer, at, at, jobId, questionId),
+        this.env.DB.prepare(
+          "UPDATE runner_jobs SET status = CASE WHEN status = 'waiting' THEN 'running' ELSE status END, updated_at = ? WHERE id = ?",
+        ).bind(at, jobId),
+        this.env.DB.prepare(
+          `UPDATE orchestrations SET status = CASE WHEN status = 'parked' THEN 'running' ELSE status END,
+                  updated_at = ? WHERE id = (SELECT orchestration_id FROM runner_jobs WHERE id = ?)`,
+        ).bind(at, jobId),
+        this.env.DB.prepare(
+          `UPDATE execution_nodes SET status = CASE WHEN status = 'parked' THEN 'running' ELSE status END,
+                  parked_at = NULL, last_revision = last_revision + CASE WHEN status = 'parked' THEN 1 ELSE 0 END,
+                  updated_at = ? WHERE orchestration_id = (SELECT orchestration_id FROM runner_jobs WHERE id = ?)
+                    AND parent_execution_id IS NULL`,
+        ).bind(at, jobId),
+      ]);
       await this.emit(actor, 'runner_job.status_changed', 'runner_job', jobId, {
         questionId, answered: true,
       });
