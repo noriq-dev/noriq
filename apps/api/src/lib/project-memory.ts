@@ -634,9 +634,12 @@ export interface MemoryBackupRunSummary {
   chunks: number;
   invocations: number;
   rows: number;
+  snapshotRows: number;
   bytes: number;
   compressedBytes: number;
   durationMs: number;
+  phase: 'begin' | 'snapshot' | 'export' | 'complete';
+  table: string | null;
 }
 
 export type MemoryBackupRunResult =
@@ -686,7 +689,10 @@ export async function runMemoryBackup(
   tier: 'core' | 'full' = 'core',
   options: { alertOnFailure?: boolean } = {},
 ): Promise<MemoryBackupRunResult> {
-  const summary: MemoryBackupRunSummary = { chunks: 0, invocations: 0, rows: 0, bytes: 0, compressedBytes: 0, durationMs: 0 };
+  const summary: MemoryBackupRunSummary = {
+    chunks: 0, invocations: 0, rows: 0, snapshotRows: 0, bytes: 0, compressedBytes: 0,
+    durationMs: 0, phase: 'begin', table: null,
+  };
   const stub = env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)) as unknown as MemoryBackupSessionStub;
   let exportId: string | null = null;
   try {
@@ -698,25 +704,35 @@ export async function runMemoryBackup(
       return { ok: false, reason: begun.reason, summary };
     }
     exportId = begun.exportId;
+    summary.phase = 'snapshot';
     for (;;) {
       summary.invocations++;
       const continued = await stub.exportContinue(projectId, exportId);
       if (!continued.ok) {
         await stub.exportAbort(projectId, exportId, continued.reason).catch(() => {});
-        await surfaceMemoryBackupFailure(env, projectId, continued.reason, options.alertOnFailure === true);
-        return { ok: false, reason: continued.reason, summary };
+        const reason = `${summary.phase} phase failed${summary.table ? ` at ${summary.table}` : ''}: ${continued.reason}`;
+        await surfaceMemoryBackupFailure(env, projectId, reason, options.alertOnFailure === true);
+        return { ok: false, reason, summary };
       }
       summary.chunks += continued.metrics.chunks;
       summary.rows += continued.metrics.rows;
+      summary.snapshotRows += continued.metrics.snapshotRows;
       summary.bytes += continued.metrics.bytes;
       summary.compressedBytes += continued.metrics.compressedBytes;
       summary.durationMs += continued.metrics.durationMs;
       if (continued.done) {
+        summary.phase = 'complete';
+        summary.table = null;
         return { ok: true, manifest: continued.manifest, manifestKey: continued.manifestKey, summary };
       }
+      summary.phase = continued.progress.phase;
+      summary.table = continued.progress.table;
     }
   } catch (error) {
-    const reason = String(error);
+    const rawReason = String(error);
+    const reason = rawReason.includes(`${summary.phase} phase failed`)
+      ? rawReason
+      : `${summary.phase} phase failed${summary.table ? ` at ${summary.table}` : ''}: ${rawReason}`;
     if (exportId) await stub.exportAbort(projectId, exportId, reason).catch(() => {});
     await surfaceMemoryBackupFailure(env, projectId, reason, options.alertOnFailure === true);
     return { ok: false, reason, summary };

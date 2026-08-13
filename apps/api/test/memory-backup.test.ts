@@ -11,6 +11,7 @@ import { MemoryBackupManifest } from '@noriq-dev/shared';
 import { runMemoryBackup } from '../src/lib/project-memory';
 import {
   BACKUP_TABLES, MEMORY_BACKUP_EXPORT_CHUNKS_PER_INVOCATION, MEMORY_BACKUP_EXPORT_SESSION_TTL_MS,
+  MEMORY_BACKUP_SNAPSHOT_BATCHES_PER_INVOCATION, MEMORY_BACKUP_SNAPSHOT_ROWS_PER_BATCH,
 } from '../src/do/ProjectMemory';
 
 const appEnv = env as unknown as Env;
@@ -31,13 +32,27 @@ interface MemoryRpc {
   exportBegin(pid: string, opts?: { tier?: 'core' | 'full' }): Promise<
     { ok: true; exportId: string; sweptSessions: number } | { ok: false; reason: string }
   >;
-  exportContinue(pid: string, exportId: string): Promise<{ ok: boolean; done?: boolean; reason?: string }>;
+  exportContinue(pid: string, exportId: string): Promise<
+    | { ok: false; reason: string }
+    | {
+      ok: true; done: false;
+      progress: { phase: 'snapshot' | 'export'; table: string | null; tableIndex: number; cursor: number | null };
+      metrics: { snapshotRows: number; chunks: number };
+    }
+    | { ok: true; done: true; manifest: unknown; manifestKey: string; metrics: { snapshotRows: number; chunks: number } }
+  >;
   exportAbort(pid: string, exportId: string, reason?: string): Promise<{ ok: true }>;
+  eraseAll(pid: string): Promise<{ ok: boolean; steps: Array<{ step: string; ok: boolean; detail: string }> }>;
   restoreSnapshot(pid: string, input: { exportedAt: string }): Promise<{ ok: boolean; reason?: string }>;
   _backdateExportSessionForTest(pid: string, exportId: string, updatedAt: string): Promise<{ ok: true }>;
   _exportCopyTableCountForTest(pid: string, exportId: string): Promise<number>;
+  _exportCopyRowCountForTest(pid: string, exportId: string): Promise<number>;
+  _exportMirrorTriggerCountForTest(pid: string, exportId: string): Promise<number>;
   _seedBackupScaleForTest(pid: string, input: {
     start: number; count: number; nodeCount: number; payloadBytes: number; evidencePerMemory?: number;
+  }): Promise<{ ok: true }>;
+  _seedBackupIndexScaleForTest(pid: string, input: {
+    start: number; count: number; payloadBytes?: number;
   }): Promise<{ ok: true }>;
   writeNode(pid: string, input: { type: string; uri: string; label: string; actor: { kind: string; id: string | null } }): Promise<{ nodeId: string }>;
 }
@@ -149,17 +164,24 @@ describe('worker-driven multi-invocation export sessions (PLNR-456)', () => {
         start, count: 100, nodeCount: 300, payloadBytes: 5 * 1024, evidencePerMemory: 2,
       });
     }
+    const indexRows = 3_000;
+    for (let start = 0; start < indexRows; start += 250) {
+      await memory(projectId)._seedBackupIndexScaleForTest(projectId, { start, count: 250, payloadBytes: 256 });
+    }
     const populated = await memory(projectId).health(projectId);
     expect(populated.tableCounts.nodes).toBe((baseline.tableCounts.nodes ?? 0) + 300);
     expect(populated.tableCounts.edges).toBe((baseline.tableCounts.edges ?? 0) + 299);
     expect(populated.tableCounts.memory_items).toBe((baseline.tableCounts.memory_items ?? 0) + rows);
     expect(populated.tableCounts.evidence).toBe((baseline.tableCounts.evidence ?? 0) + rows * 2);
     expect(populated.tableCounts.episodes).toBe((baseline.tableCounts.episodes ?? 0) + rows);
+    expect(populated.tableCounts.index_staged_entities).toBe((baseline.tableCounts.index_staged_entities ?? 0) + indexRows);
+    expect(populated.tableCounts.index_staged_edges).toBe((baseline.tableCounts.index_staged_edges ?? 0) + indexRows - 1);
 
     const result = await runMemoryBackup(appEnv, projectId, 'full');
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error(result.reason);
     expect(result.summary.invocations).toBeGreaterThan(2); // begin + multiple fresh continue events
+    expect(result.summary.snapshotRows).toBe(Object.values(result.manifest.tableCounts).reduce((sum, count) => sum + count, 0));
     expect(result.summary.chunks).toBeGreaterThan(4);
     expect(result.summary.invocations).toBeGreaterThanOrEqual(
       Math.ceil(result.summary.chunks / MEMORY_BACKUP_EXPORT_CHUNKS_PER_INVOCATION) + 1,
@@ -171,6 +193,10 @@ describe('worker-driven multi-invocation export sessions (PLNR-456)', () => {
     expect(result.manifest.tableCounts.memory_items).toBe(populated.tableCounts.memory_items);
     expect(result.manifest.tableCounts.evidence).toBe(populated.tableCounts.evidence);
     expect(result.manifest.tableCounts.episodes).toBe(populated.tableCounts.episodes);
+    expect(result.manifest.tableCounts.index_staged_entities).toBe(populated.tableCounts.index_staged_entities);
+    expect(result.manifest.tableCounts.index_staged_edges).toBe(populated.tableCounts.index_staged_edges);
+    expect(result.manifest.tableCounts.memory_revision).toBe(1);
+    expect(result.manifest.tableCounts.projector_cursor).toBe(1);
     expect(Object.keys(result.manifest.tableCounts)).toEqual([...BACKUP_TABLES]);
     expect(result.manifest.r2EvidenceRefs.filter((key) => key.includes('/memory_items/')).length).toBeGreaterThan(2);
     expect(result.manifest.r2EvidenceRefs.filter((key) => key.includes('/episodes/')).length).toBeGreaterThan(2);
@@ -184,11 +210,61 @@ describe('worker-driven multi-invocation export sessions (PLNR-456)', () => {
     }
   }, 60_000);
 
+  it('materializes a live-consistent mirror over multiple bounded continuations before writing R2', async () => {
+    const { projectId } = await newOwnedProject('pm-backup-snapshot-bounded@example.com', 'PMBKSNAP');
+    await memory(projectId).reconcile(projectId);
+    const indexRows = MEMORY_BACKUP_SNAPSHOT_ROWS_PER_BATCH * MEMORY_BACKUP_SNAPSHOT_BATCHES_PER_INVOCATION + 500;
+    for (let start = 0; start < indexRows; start += 250) {
+      await memory(projectId)._seedBackupIndexScaleForTest(projectId, { start, count: Math.min(250, indexRows - start) });
+    }
+    const baseline = await memory(projectId).health(projectId);
+
+    const begun = await memory(projectId).exportBegin(projectId);
+    if (!begun.ok) throw new Error(begun.reason);
+    expect(await memory(projectId)._exportCopyTableCountForTest(projectId, begun.exportId)).toBe(BACKUP_TABLES.length);
+    expect(await memory(projectId)._exportCopyRowCountForTest(projectId, begun.exportId)).toBe(0);
+    expect(await memory(projectId)._exportMirrorTriggerCountForTest(projectId, begun.exportId)).toBe(BACKUP_TABLES.length * 3);
+
+    const first = await memory(projectId).exportContinue(projectId, begun.exportId);
+    expect(first).toMatchObject({ ok: true, done: false, progress: { phase: 'snapshot' } });
+    if (!first.ok || first.done) throw new Error('expected an in-progress snapshot');
+    expect(first.metrics.snapshotRows).toBeLessThanOrEqual(
+      MEMORY_BACKUP_SNAPSHOT_ROWS_PER_BATCH * MEMORY_BACKUP_SNAPSHOT_BATCHES_PER_INVOCATION,
+    );
+    expect(first.metrics.chunks).toBe(0);
+
+    // This arrives after snapshot construction began. The mirror triggers must include it in the
+    // finalized generation without freezing or rejecting the normal write path.
+    await memory(projectId).writeNode(projectId, {
+      type: 'unknown', uri: 'noriq://unknown/during-backup', label: 'written during backup', actor: SYSTEM,
+    });
+    await memory(projectId)._seedBackupIndexScaleForTest(projectId, { start: indexRows, count: 1 });
+
+    let snapshotContinuations = 1;
+    let completed: Extract<Awaited<ReturnType<MemoryRpc['exportContinue']>>, { ok: true; done: true }> | null = null;
+    for (;;) {
+      const continued = await memory(projectId).exportContinue(projectId, begun.exportId);
+      if (!continued.ok) throw new Error(continued.reason);
+      if (continued.done) { completed = continued; break; }
+      if (continued.progress.phase === 'snapshot') snapshotContinuations++;
+    }
+    expect(snapshotContinuations).toBeGreaterThan(1);
+    expect(await memory(projectId)._exportMirrorTriggerCountForTest(projectId, begun.exportId)).toBe(0);
+    expect(await memory(projectId)._exportCopyTableCountForTest(projectId, begun.exportId)).toBe(0);
+
+    const manifest = MemoryBackupManifest.parse(completed!.manifest);
+    expect(manifest.tableCounts.nodes).toBe((baseline.tableCounts.nodes ?? 0) + 1);
+    expect(manifest.tableCounts.index_staged_entities).toBe((baseline.tableCounts.index_staged_entities ?? 0) + 1);
+    expect(manifest.tableCounts.index_staged_edges).toBe((baseline.tableCounts.index_staged_edges ?? 0) + 1);
+    expect(await verifyMemorySnapshot(appEnv, manifest)).toEqual({ ok: true });
+  }, 60_000);
+
   it('sweeps an abandoned session and drops all of its immutable copy tables at the next begin', async () => {
     const { projectId } = await newOwnedProject('pm-backup-session-sweep@example.com', 'PMBKSWP');
     const abandoned = await memory(projectId).exportBegin(projectId);
     if (!abandoned.ok) throw new Error(abandoned.reason);
     expect(await memory(projectId)._exportCopyTableCountForTest(projectId, abandoned.exportId)).toBe(BACKUP_TABLES.length);
+    expect(await memory(projectId)._exportMirrorTriggerCountForTest(projectId, abandoned.exportId)).toBe(BACKUP_TABLES.length * 3);
     await memory(projectId)._backdateExportSessionForTest(
       projectId,
       abandoned.exportId,
@@ -199,8 +275,25 @@ describe('worker-driven multi-invocation export sessions (PLNR-456)', () => {
     if (!replacement.ok) throw new Error(replacement.reason);
     expect(replacement.sweptSessions).toBe(1);
     expect(await memory(projectId)._exportCopyTableCountForTest(projectId, abandoned.exportId)).toBe(0);
+    expect(await memory(projectId)._exportMirrorTriggerCountForTest(projectId, abandoned.exportId)).toBe(0);
     expect(await memory(projectId).exportContinue(projectId, abandoned.exportId)).toMatchObject({ ok: false });
     await memory(projectId).exportAbort(projectId, replacement.exportId, 'test cleanup');
+    expect(await memory(projectId)._exportMirrorTriggerCountForTest(projectId, replacement.exportId)).toBe(0);
+  });
+
+  it('removes active mirror triggers before erasure drops their target tables', async () => {
+    const { projectId } = await newOwnedProject('pm-backup-session-erase@example.com', 'PMBKERAS');
+    const active = await memory(projectId).exportBegin(projectId);
+    if (!active.ok) throw new Error(active.reason);
+    expect(await memory(projectId)._exportMirrorTriggerCountForTest(projectId, active.exportId)).toBe(BACKUP_TABLES.length * 3);
+
+    const erased = await memory(projectId).eraseAll(projectId);
+    expect(erased.ok).toBe(true);
+    expect(await memory(projectId)._exportMirrorTriggerCountForTest(projectId, active.exportId)).toBe(0);
+    expect(await memory(projectId)._exportCopyTableCountForTest(projectId, active.exportId)).toBe(0);
+    await expect(memory(projectId).writeNode(projectId, {
+      type: 'unknown', uri: 'noriq://unknown/post-erase', label: 'post erase', actor: SYSTEM,
+    })).resolves.toMatchObject({ nodeId: expect.any(String) });
   });
 });
 
