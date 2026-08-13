@@ -14,7 +14,7 @@ import {
 import { searchBackend, indexEntity, removeEntity, type SearchKind } from '../search';
 import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
-import { MISSION_CAPABILITY, MissionCommission as MissionCommissionSchema, MissionRootCommission as MissionRootCommissionSchema, RunKind, AgentTool, RunStatus, ExecutionProfileOffer, type AcceptedRevisionHandoff, type AcceptedRevisionHandoffView, type CommissionedExecutionProfile, type MissionCommission, type MissionCommissionSnapshot, type MissionRootCommission, type TaskRootMissionCommissionSnapshot, type MissionHandoffAck, type MissionHandoffConsumed, type MissionQuestionAck, type MissionQuestionAnswer, type MissionQuestionPublication, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
+import { MISSION_CAPABILITY, MissionCommission as MissionCommissionSchema, MissionRootCommission as MissionRootCommissionSchema, RunnerJobSource as RunnerJobSourceSchema, RunKind, AgentTool, RunStatus, ExecutionProfileOffer, type AcceptedRevisionHandoff, type AcceptedRevisionHandoffView, type CommissionedExecutionProfile, type MissionCommission, type MissionCommissionSnapshot, type MissionRootCommission, type RunnerJobAssignment, type RunnerJobSource, type TaskRootMissionCommissionSnapshot, type MissionHandoffAck, type MissionHandoffConsumed, type MissionQuestionAck, type MissionQuestionAnswer, type MissionQuestionPublication, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
 import { readExecutionSpec, writeExecutionSpec } from '../lib/execution-spec';
 import { processPendingCopilotEpisodeJob, processPendingEpisodeJob } from '../memory/episodes';
 import { applyMissionTaskExecutionEvent, ensureMissionTaskExecution, ensureRunExecution, mirrorRunTransition } from '../lib/orchestration-store';
@@ -158,6 +158,31 @@ export interface TaskUpdateExpectation {
 export type CreatedTask = { id: string; key: string; status?: 'proposed'; executionSpec?: ExecutionSpec };
 /** What an update returns. `executionSpec` present iff the patch mentioned it; null = cleared. */
 export type UpdatedTask = { ok: true; key: string; executionSpec?: ExecutionSpec | null };
+
+export interface CreateRunnerJobInput {
+  source: { kind: 'task'; id: string } | { kind: 'plan'; id: string };
+  runnerId: string;
+  repoRef: string;
+  expectedBaseRevision: string;
+}
+
+export interface RunnerJobView {
+  id: string;
+  projectId: string;
+  runnerId: string;
+  repoRef: string;
+  source: RunnerJobSource;
+  snapshotDigest: string;
+  assignmentId: string;
+  orchestrationId: string;
+  status: string;
+  phase: string;
+  progress: number;
+  expectedBaseRevision: string;
+  createdAt: string;
+  updatedAt: string;
+  assignment: RunnerJobAssignment;
+}
 
 export interface RecordQualityEventInput {
   operationKey: string;
@@ -3851,6 +3876,10 @@ export class ProjectRoom extends DurableObject<Env> {
       // project-scoped and orphaned along with everything else once `projects` loses the row.
       // Emitting into a feed that is being deleted in the same batch would be a write to nothing.
       await this.env.DB.batch([
+        this.env.DB.prepare('DELETE FROM runner_job_questions WHERE job_id IN (SELECT id FROM runner_jobs WHERE project_id = ?)').bind(pid),
+        this.env.DB.prepare('DELETE FROM runner_job_events WHERE job_id IN (SELECT id FROM runner_jobs WHERE project_id = ?)').bind(pid),
+        this.env.DB.prepare('DELETE FROM runner_job_items WHERE job_id IN (SELECT id FROM runner_jobs WHERE project_id = ?)').bind(pid),
+        this.env.DB.prepare('DELETE FROM runner_jobs WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM similar_effort_feedback WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM similar_effort_occurrences WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM project_quality_events WHERE project_id = ?').bind(pid),
@@ -4561,6 +4590,200 @@ export class ProjectRoom extends DurableObject<Env> {
   // DO evictions, and the runner being off (the lesson plan_landings already taught;
   // a queue in memory re-ships the fire-and-forget bug a third time).
   // ---------------------------------------------------------------------------
+
+  /** Commission one immutable RunnerJob and reserve its selected tasks atomically. */
+  async createRunnerJob(
+    projectId: string,
+    actor: Actor,
+    input: CreateRunnerJobInput,
+  ): Promise<RunnerJobView> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      if (!/^[0-9a-f]{40,64}$/.test(input.expectedBaseRevision)) {
+        throw new Error('runner repository has no valid base revision');
+      }
+      const project = await this.env.DB.prepare(
+        'SELECT id, key FROM projects WHERE id = ?',
+      ).bind(projectId).first<{ id: string; key: string }>();
+      if (!project) throw new Error('project not found');
+      const runner = await this.env.DB.prepare(
+        "SELECT id FROM runners WHERE id = ? AND status != 'offboarded'",
+      ).bind(input.runnerId).first<{ id: string }>();
+      if (!runner) throw new Error('runner not found or offboarded');
+
+      let source: RunnerJobSource;
+      if (input.source.kind === 'task') {
+        const row = await this.env.DB.prepare(
+          `SELECT id AS taskId, key, title, body, status, failed_at AS failedAt, execution_spec AS executionSpec,
+                  "order" AS taskOrder
+             FROM tasks WHERE id = ? AND project_id = ?`,
+        ).bind(input.source.id, projectId).first<{
+          taskId: string; key: string; title: string; body: string; status: string; failedAt: string | null;
+          executionSpec: string | null; taskOrder: number;
+        }>();
+        if (!row) throw new Error('task not found');
+        if (row.status !== 'todo') {
+          throw new Error(`task ${row.key} is ${row.status}; only todo or an explicit failed retry is dispatchable`);
+        }
+        const claim = await this.env.DB.prepare(
+          'SELECT 1 FROM claims WHERE task_id = ? AND released_at IS NULL AND expires_at > ?',
+        ).bind(row.taskId, nowIso()).first();
+        if (claim) throw new Error(`task ${row.key} has a live claim`);
+        const spec = readExecutionSpec(row.executionSpec, row.taskId);
+        if (spec.unreadable) throw new Error(`${row.key} has an unreadable execution spec`);
+        source = {
+          kind: 'task', projectId, projectKey: project.key,
+          task: {
+            taskId: row.taskId, key: row.key, title: row.title, body: row.body,
+            executionSpec: spec.spec, status: row.failedAt ? 'failed' : 'todo',
+            retry: row.failedAt !== null, order: row.taskOrder, phaseOrder: 0,
+          },
+        };
+      } else {
+        const plan = await this.env.DB.prepare(
+          'SELECT id, title, status FROM plans WHERE id = ? AND project_id = ?',
+        ).bind(input.source.id, projectId).first<{ id: string; title: string; status: string }>();
+        if (!plan) throw new Error('plan not found');
+        if (plan.status === 'proposed') throw new Error('plan is proposed — approve it before dispatching');
+        const { results: rows } = await this.env.DB.prepare(
+          `SELECT t.id AS taskId, t.key, t.title, t.body, t.status, t.failed_at AS failedAt,
+                  t.execution_spec AS executionSpec, t."order" AS taskOrder,
+                  ph."order" AS phaseOrder
+             FROM phase_tasks pt
+             JOIN phases ph ON ph.id = pt.phase_id
+             JOIN tasks t ON t.id = pt.task_id
+            WHERE ph.plan_id = ?
+            ORDER BY ph."order", t."order", t.key`,
+        ).bind(plan.id).all<{
+          taskId: string; key: string; title: string; body: string; status: string; failedAt: string | null;
+          executionSpec: string | null; taskOrder: number; phaseOrder: number;
+        }>();
+        const duplicateIds = rows.filter((row, index) => rows.findIndex((other) => other.taskId === row.taskId) !== index);
+        if (duplicateIds.length) throw new Error('plan contains a task in more than one phase');
+        const unsettled = rows.filter((row) => ['claimed', 'in_progress', 'blocked', 'review'].includes(row.status));
+        if (unsettled.length) {
+          throw new Error(`plan has unsettled tasks: ${unsettled.map((row) => `${row.key} (${row.status})`).join(', ')}`);
+        }
+        const selected = rows.filter((row) => row.status === 'todo');
+        if (!selected.length) throw new Error('plan has no todo or failed tasks to dispatch');
+        if (selected.length > 500) throw new Error('plan exceeds the 500-task RunnerJob snapshot limit');
+        const taskIds = new Set(selected.map((row) => row.taskId));
+        const tasks = selected.map((row) => {
+          const spec = readExecutionSpec(row.executionSpec, row.taskId);
+          if (spec.unreadable) throw new Error(`${row.key} has an unreadable execution spec`);
+          return {
+            taskId: row.taskId, key: row.key, title: row.title, body: row.body,
+            executionSpec: spec.spec, status: row.failedAt ? 'failed' as const : 'todo' as const,
+            retry: row.failedAt !== null, order: row.taskOrder, phaseOrder: row.phaseOrder,
+          };
+        });
+        const { results: dependencies } = await this.env.DB.prepare(
+          `SELECT d.task_id AS taskId, d.depends_on_task_id AS dependsOnTaskId
+             FROM dependencies d
+            WHERE d.task_id IN (
+              SELECT pt.task_id FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id WHERE ph.plan_id = ?)
+            ORDER BY d.task_id, d.depends_on_task_id`,
+        ).bind(plan.id).all<{ taskId: string; dependsOnTaskId: string }>();
+        const boundedDependencies = dependencies.filter((edge) => taskIds.has(edge.taskId) && taskIds.has(edge.dependsOnTaskId));
+        if (boundedDependencies.length > 5_000) throw new Error('plan exceeds the 5000-edge RunnerJob snapshot limit');
+        source = {
+          kind: 'plan', projectId, projectKey: project.key, planId: plan.id,
+          planKey: plan.id, planTitle: plan.title, tasks, dependencies: boundedDependencies,
+        };
+      }
+
+      RunnerJobSourceSchema.parse(source);
+      const ids = source.kind === 'task' ? [source.task.taskId] : source.tasks.map((task) => task.taskId);
+      if (source.kind === 'plan') {
+        const incoming = new Map(ids.map((id) => [id, 0]));
+        const children = new Map(ids.map((id) => [id, [] as string[]]));
+        for (const edge of source.dependencies) {
+          incoming.set(edge.taskId, (incoming.get(edge.taskId) ?? 0) + 1);
+          children.get(edge.dependsOnTaskId)!.push(edge.taskId);
+        }
+        const ready = [...incoming].filter(([, count]) => count === 0).map(([id]) => id);
+        for (const id of ready) {
+          for (const child of children.get(id) ?? []) {
+            const count = incoming.get(child)! - 1;
+            incoming.set(child, count);
+            if (count === 0) ready.push(child);
+          }
+        }
+        if (ready.length !== ids.length) throw new Error('plan task dependencies contain a cycle');
+      }
+      const snapshot = JSON.stringify(source);
+      if (new TextEncoder().encode(snapshot).byteLength > 2_097_152) {
+        throw new Error('RunnerJob snapshot exceeds 2 MiB');
+      }
+      const snapshotDigest = await sha256Hex(snapshot);
+      const id = newId('job');
+      const assignmentId = newId('asn');
+      const orchestrationId = newId('orc');
+      const executionId = newId('exe');
+      const at = nowIso();
+      const items = source.kind === 'task' ? [source.task] : source.tasks;
+      try {
+        await this.env.DB.batch([
+          this.env.DB.prepare(
+            `INSERT INTO orchestrations
+               (id, project_id, anchor_type, anchor_id, root_execution_id, status,
+                completeness_status, completeness_missing, created_by_kind, created_by_id,
+                created_at, updated_at)
+             VALUES (?, ?, ?, ?, NULL, 'pending', 'complete', '[]', ?, ?, ?, ?)`,
+          ).bind(orchestrationId, projectId, source.kind, input.source.id, actor.kind, actor.id, at, at),
+          this.env.DB.prepare(
+            `INSERT INTO execution_nodes
+               (id, orchestration_id, project_id, kind, role, actor_kind, actor_id,
+                task_id, plan_id, status, completeness_status, completeness_missing,
+                last_revision, created_at, updated_at)
+             VALUES (?, ?, ?, 'run', 'orchestrator', ?, ?, ?, ?, 'pending', 'complete', '[]', 0, ?, ?)`,
+          ).bind(
+            executionId, orchestrationId, projectId, actor.kind, actor.id,
+            source.kind === 'task' ? source.task.taskId : null,
+            source.kind === 'plan' ? source.planId : null, at, at,
+          ),
+          this.env.DB.prepare('UPDATE orchestrations SET root_execution_id = ? WHERE id = ?')
+            .bind(executionId, orchestrationId),
+          this.env.DB.prepare(
+            `INSERT INTO runner_jobs
+               (id, project_id, runner_id, repo_ref, source_kind, source_id, snapshot,
+                snapshot_digest, expected_base_revision, assignment_id, orchestration_id,
+                status, phase, created_by, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 'preparing', ?, ?, ?)`,
+          ).bind(
+            id, projectId, input.runnerId, input.repoRef, source.kind, input.source.id,
+            snapshot, snapshotDigest, input.expectedBaseRevision, assignmentId,
+            orchestrationId, actor.id, at, at,
+          ),
+          ...items.map((task) => this.env.DB.prepare(
+            `INSERT INTO runner_job_items
+               (job_id, task_id, task_key, phase_order, task_order, status,
+                reservation_active, updated_at)
+             VALUES (?, ?, ?, ?, ?, 'pending', 1, ?)`,
+          ).bind(id, task.taskId, task.key, task.phaseOrder, task.order, at)),
+        ]);
+      } catch (error) {
+        if (error instanceof Error && /idx_runner_job_items_live_task|UNIQUE constraint failed: runner_job_items.task_id/.test(error.message)) {
+          throw new Error('one or more selected tasks are reserved by another live RunnerJob');
+        }
+        throw error;
+      }
+      await this.emit(actor, 'runner_job.created', 'runner_job', id, {
+        jobId: id, sourceKind: source.kind, sourceId: input.source.id, runnerId: input.runnerId,
+        taskCount: items.length, snapshotDigest,
+      });
+      const assignment: RunnerJobAssignment = {
+        protocolVersion: 2, jobId: id, assignmentId, snapshotDigest,
+        source, repoRef: input.repoRef, expectedBaseRevision: input.expectedBaseRevision,
+      };
+      return {
+        id, projectId, runnerId: input.runnerId, repoRef: input.repoRef, source,
+        snapshotDigest, assignmentId, orchestrationId, status: 'queued', phase: 'preparing',
+        progress: 0, expectedBaseRevision: input.expectedBaseRevision, createdAt: at, updatedAt: at,
+        assignment,
+      };
+    });
+  }
 
   async createPlanDispatch(
     projectId: string,

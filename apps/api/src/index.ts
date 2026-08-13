@@ -85,6 +85,7 @@ import {
   RunnerExecutionDeclaration, RunnerExecutionEventReport, RunnerExecutionReconciliation,
   RunnerExecutionRelationReport, isTerminalRunStatus, normalizeProjectKey,
   IndexGenerationManifest, ContextPackRole, RunnerSpinoffTaskRequest, type RunnerIndexCursor,
+  RunnerJobDispatch,
 } from '@noriq-dev/shared';
 import { auditAuthorizationParity, reconcileLegacyGroupGrants } from './lib/authorization-parity';
 import { evaluateMemoryAcceptance } from './memory/acceptance';
@@ -4227,6 +4228,60 @@ const DispatchBody = z.object({
   executionProfileId: ExecutionProfileId.nullish(),
   budget: RunBudget.optional(),
 });
+
+async function resolveRunnerJobRepository(
+  c: Context<AppContext>,
+  projectId: string,
+  runnerId: string,
+  repoRef: string,
+): Promise<{ baseRevision: string } | Response> {
+  const runner = await c.env.DB.prepare(
+    'SELECT repos FROM runners WHERE id = ? AND owner_user_id = ? AND offboarded_at IS NULL',
+  ).bind(runnerId, c.var.user!.id).first<{ repos: string }>();
+  if (!runner) return c.json({ error: 'runner not found' }, 404);
+  let repositories: Array<{ id?: string; repoRef?: string; projectId?: string | null; baseRevision?: string }>;
+  try {
+    repositories = JSON.parse(runner.repos) as typeof repositories;
+  } catch {
+    return c.json({ error: 'runner repository advertisement is malformed' }, 409);
+  }
+  const repository = repositories.find((candidate) =>
+    (candidate.repoRef === repoRef || candidate.id === repoRef) && candidate.projectId === projectId,
+  );
+  if (!repository) return c.json({ error: 'repoRef does not resolve to this project' }, 400);
+  if (!repository.baseRevision || !/^[0-9a-f]{40,64}$/.test(repository.baseRevision)) {
+    return c.json({ error: 'runner must reconnect with protocol v2 and advertise a base revision' }, 409);
+  }
+  return { baseRevision: repository.baseRevision };
+}
+
+async function dispatchRunnerJob(
+  c: Context<AppContext>,
+  source: { kind: 'task' | 'plan'; id: string },
+): Promise<Response> {
+  const denied = demoDenied(c);
+  if (denied) return denied;
+  const pid = c.req.param('pid')!;
+  const parsed = RunnerJobDispatch.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid RunnerJob dispatch', detail: parsed.error.issues }, 400);
+  const repository = await resolveRunnerJobRepository(c, pid, parsed.data.runnerId, parsed.data.repoRef);
+  if (repository instanceof Response) return repository;
+  try {
+    const job = await room(c.env, pid).createRunnerJob(pid, humanActor(c), {
+      source, runnerId: parsed.data.runnerId, repoRef: parsed.data.repoRef,
+      expectedBaseRevision: repository.baseRevision,
+    });
+    return c.json({ job, delivered: false }, 201);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : 'RunnerJob dispatch failed' }, 409);
+  }
+}
+
+app.post('/api/projects/:pid/tasks/:taskId/runner-jobs', userAuth, (c) =>
+  dispatchRunnerJob(c, { kind: 'task', id: c.req.param('taskId')! }));
+
+app.post('/api/projects/:pid/plans/:planId/runner-jobs', userAuth, (c) =>
+  dispatchRunnerJob(c, { kind: 'plan', id: c.req.param('planId')! }));
 
 
 // Dispatch a brief → a Run on a runner (RUN-7). The dispatch primitive is the
