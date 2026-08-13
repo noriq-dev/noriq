@@ -4802,7 +4802,7 @@ export class ProjectRoom extends DurableObject<Env> {
         id: string; assignmentId: string; snapshotDigest: string; snapshot: string;
         repoRef: string; expectedBaseRevision: string; status: string; cancelRequestedAt: string | null;
       }>();
-      if (!row || row.cancelRequestedAt || !['queued', 'assigned'].includes(row.status)) return null;
+      if (!row || row.cancelRequestedAt || !['queued', 'assigned', 'running', 'waiting'].includes(row.status)) return null;
       if (row.status === 'queued') {
         const at = nowIso();
         await this.env.DB.prepare(

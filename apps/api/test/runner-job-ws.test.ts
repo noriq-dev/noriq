@@ -88,7 +88,10 @@ describe('RunnerJob protocol v2 (PLNR-499)', () => {
     expect(assigned).toMatchObject({ type: 'job.assign', assignment: { jobId: job.id, assignmentId: job.assignmentId, expectedBaseRevision: baseRevision } });
     ws.send(JSON.stringify({ type: 'job.accept', jobId: job.id, assignmentId: job.assignmentId }));
 
-    const event = { type: 'warning', at: new Date().toISOString(), code: 'TEST', message: 'durable' };
+    const event = {
+      type: 'progress', at: new Date().toISOString(), phase: 'building',
+      message: 'durable', progress: 0.25,
+    };
     const ackOne = nextFrame(ws, (message) => message.type === 'job.event.ack' && message.seq === 1);
     ws.send(JSON.stringify({ type: 'job.event', jobId: job.id, assignmentId: job.assignmentId, seq: 1, payload: event }));
     expect(await ackOne).toMatchObject({ seq: 1 });
@@ -96,6 +99,8 @@ describe('RunnerJob protocol v2 (PLNR-499)', () => {
     ws.send(JSON.stringify({ type: 'job.event', jobId: job.id, assignmentId: job.assignmentId, seq: 1, payload: event }));
     await replayAck;
     expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM runner_job_events WHERE job_id = ?').bind(job.id).first<{ n: number }>()).toEqual({ n: 1 });
+    expect(await env.DB.prepare('SELECT status FROM runner_jobs WHERE id = ?').bind(job.id).first<{ status: string }>())
+      .toEqual({ status: 'running' });
 
     ws.close();
     const reconnected = await connect();
