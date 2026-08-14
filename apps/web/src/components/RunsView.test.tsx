@@ -1,9 +1,9 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { api, type ApiRunner, type ApiRunnerJobObservationPage, type ApiRunnerJobOutput, type ApiRunnerJobSummary } from '../api';
+import { api, type ApiRunner, type ApiRunnerJobActivityPage, type ApiRunnerJobActivityStage, type ApiRunnerJobOutput, type ApiRunnerJobSummary } from '../api';
 import type { AppStore } from '../store';
-import { JOB_STATUS_STYLE, ObservationInspector, RUN_STATUS_STYLE, RunnerJobDispatchForm, RunnerJobOutputSummary } from './RunsView';
+import { hasMeaningfulLineage, JOB_STATUS_STYLE, JobActivity, RUN_STATUS_STYLE, RunnerJobDispatchForm, RunnerJobOutputSummary } from './RunsView';
 
 let container: HTMLDivElement;
 let root: Root | null = null;
@@ -38,6 +38,34 @@ function inputValue(input: HTMLInputElement, value: string) {
   input.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
+const activityTiming: ApiRunnerJobActivityPage['timing'] = {
+  runner: { startedAt: '2026-08-13T00:00:00.000Z', finishedAt: null },
+  server: {
+    asOf: '2026-08-13T00:01:00.000Z', commissionedAt: '2026-08-13T00:00:00.000Z',
+    workStartedAt: '2026-08-13T00:00:00.000Z', workFinishedAt: null,
+    queueMs: 0, elapsedMs: null, humanWaitMs: 0, humanWaitStartedAt: null,
+    landing: { requestedAt: null, startedAt: null, finishedAt: null, durationMs: null }, task: null,
+  },
+};
+
+function activityStage(input: Partial<ApiRunnerJobActivityStage> & Pick<ApiRunnerJobActivityStage, 'id' | 'observationId' | 'stage' | 'attempt' | 'taskId' | 'status' | 'occurredAt'>): ApiRunnerJobActivityStage {
+  return {
+    kind: 'stage', actor: { kind: 'command', driver: 'git', vendor: null, model: null, effort: null, role: null, operation: 'inspect' },
+    startedAt: input.occurredAt, finishedAt: input.status === 'running' ? null : input.occurredAt,
+    updatedAt: input.occurredAt, duration: { status: 'complete', value: 10, provenance: 'runner_reported' },
+    usage: {
+      inputTokens: { status: 'not_applicable', value: null, provenance: 'derived' },
+      outputTokens: { status: 'not_applicable', value: null, provenance: 'derived' },
+      cacheReadTokens: { status: 'not_applicable', value: null, provenance: 'derived' },
+      cacheWriteTokens: { status: 'not_applicable', value: null, provenance: 'derived' },
+      calls: { status: 'not_applicable', value: null, provenance: 'derived' },
+      costUsd: { status: 'not_applicable', value: null, provenance: 'derived' },
+    },
+    recovery: 'none', evidence: null, startSeq: 1, finishSeq: 2, cursorSeq: 2,
+    ...input,
+  };
+}
+
 beforeEach(() => vi.useFakeTimers());
 
 afterEach(() => {
@@ -60,6 +88,14 @@ describe('RunnerJob status presentation (PLNR-501)', () => {
   it('keeps partial output distinct from both success and failure', () => {
     expect(JOB_STATUS_STYLE.partial).not.toEqual(JOB_STATUS_STYLE.succeeded);
     expect(JOB_STATUS_STYLE.partial).not.toEqual(JOB_STATUS_STYLE.failed);
+  });
+
+  it('shows contextual lineage only when it contains useful structure or a completeness warning', () => {
+    const base = { orchestrationId: 'orc_1', nodeCount: 1, relationCount: 0, incompleteNodeCount: 0 };
+    expect(hasMeaningfulLineage(base)).toBe(false);
+    expect(hasMeaningfulLineage({ ...base, nodeCount: 2 })).toBe(true);
+    expect(hasMeaningfulLineage({ ...base, relationCount: 1 })).toBe(true);
+    expect(hasMeaningfulLineage({ ...base, incompleteNodeCount: 1 })).toBe(true);
   });
 });
 
@@ -88,8 +124,8 @@ describe('RunnerJob VCS-neutral output presentation (PLNR-504)', () => {
   });
 });
 
-describe('RunnerJob observation follow inspector (PLNR-511)', () => {
-  it('shows a running stage, replaces it with finish evidence, and pauses without losing the cursor', async () => {
+describe('RunnerJob activity timeline', () => {
+  it('groups a running stage, replaces it with finish evidence, and pauses without losing the cursor', async () => {
     const base = {
       observationId: 'obs_1', taskId: 'task_1', stage: 'build' as const, attempt: 1,
       actor: {
@@ -99,9 +135,11 @@ describe('RunnerJob observation follow inspector (PLNR-511)', () => {
       startedAt: '2026-08-13T00:00:00.000Z', recovery: null,
       evidence: null, startSeq: 2, finishSeq: null,
     };
-    const page = (finished: boolean): ApiRunnerJobObservationPage => ({
-      observations: [{
+    const page = (finished: boolean): ApiRunnerJobActivityPage => ({
+      items: [{
         ...base,
+        kind: 'stage', id: 'stage:obs_1', occurredAt: base.startedAt,
+        updatedAt: finished ? '2026-08-13T00:00:01.000Z' : base.startedAt,
         status: finished ? 'succeeded' : 'running',
         finishedAt: finished ? '2026-08-13T00:00:01.000Z' : null,
         duration: finished ? { status: 'complete', value: 1_000, provenance: 'runner_reported' } : null,
@@ -115,7 +153,7 @@ describe('RunnerJob observation follow inspector (PLNR-511)', () => {
         } : null,
         finishSeq: finished ? 3 : null, cursorSeq: finished ? 3 : 2,
       }],
-      cursor: { afterSeq: finished ? 2 : 0, nextSeq: finished ? 3 : 2, highWaterSeq: finished ? 3 : 2, hasMore: false },
+      cursor: { next: finished ? 'cursor_3' : 'cursor_2', hasMore: false },
       scope: { taskId: 'task_1' },
       timing: {
         runner: { startedAt: base.startedAt, finishedAt: finished ? '2026-08-13T00:00:01.000Z' : null },
@@ -129,14 +167,14 @@ describe('RunnerJob observation follow inspector (PLNR-511)', () => {
       },
       partial: !finished, expired: false,
     });
-    const observations = vi.spyOn(api, 'runnerJobObservations')
+    const observations = vi.spyOn(api, 'runnerJobActivity')
       .mockResolvedValueOnce(page(false)).mockResolvedValue(page(true));
     vi.spyOn(api, 'runnerJobIntelligence').mockResolvedValue({
       state: 'pending', status: 'running', projectedAt: null, detailPrunedAt: null,
       job: null, tasks: [],
     });
     container = document.createElement('div'); document.body.appendChild(container); root = createRoot(container);
-    act(() => root!.render(<ObservationInspector
+    act(() => root!.render(<JobActivity
       projectId="project_1"
       jobId="job_1"
       items={[{
@@ -148,17 +186,53 @@ describe('RunnerJob observation follow inspector (PLNR-511)', () => {
     />));
     await act(async () => { await Promise.resolve(); await Promise.resolve(); });
     expect(container.textContent).toContain('running');
-    expect(container.textContent).toContain('usage pending');
+    expect(container.textContent).toContain('usage not reported');
 
     await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
-    expect(container.querySelectorAll('.runner-observation-grid article')).toHaveLength(1);
+    expect(container.querySelectorAll('.runner-activity-stage')).toHaveLength(1);
     expect(container.textContent).toContain('succeeded');
-    expect(container.textContent).toContain('100');
+    expect(container.textContent).toContain('125 tokens');
     const follow = [...container.querySelectorAll('button')].find((button) => button.textContent === 'following')!;
     act(() => follow.click());
     const calls = observations.mock.calls.length;
     await act(async () => { await vi.advanceTimersByTimeAsync(4_000); });
     expect(observations).toHaveBeenCalledTimes(calls);
+  });
+
+  it('nests job overhead and tasks beneath chronological stage attempts without rendering irrelevant metrics', async () => {
+    vi.spyOn(api, 'runnerJobActivity').mockResolvedValue({
+      items: [{
+        kind: 'milestone', id: 'job:commissioned', type: 'commissioned', status: 'succeeded',
+        occurredAt: '2026-08-13T00:00:00.000Z', updatedAt: '2026-08-13T00:00:00.000Z',
+        taskId: null, title: 'Job commissioned', detail: null, cursorSeq: null,
+      },
+      activityStage({ id: 'stage:finalize-job', observationId: 'finalize-job', stage: 'finalize', attempt: 1, taskId: null, status: 'succeeded', occurredAt: '2026-08-13T00:00:01.000Z' }),
+      activityStage({ id: 'stage:finalize-task', observationId: 'finalize-task', stage: 'finalize', attempt: 1, taskId: 'task_1', status: 'succeeded', occurredAt: '2026-08-13T00:00:02.000Z' }),
+      activityStage({ id: 'stage:review-1', observationId: 'review-1', stage: 'review', attempt: 1, taskId: 'task_1', status: 'succeeded', occurredAt: '2026-08-13T00:00:03.000Z' }),
+      { kind: 'milestone', id: 'event:warning', type: 'warning', status: 'warning', occurredAt: '2026-08-13T00:00:04.000Z', updatedAt: '2026-08-13T00:00:04.000Z', taskId: null, title: 'Review retry', detail: 'One more pass', cursorSeq: 7 },
+      activityStage({ id: 'stage:review-2', observationId: 'review-2', stage: 'review', attempt: 2, taskId: 'task_1', status: 'running', occurredAt: '2026-08-13T00:00:05.000Z' })],
+      cursor: { next: 'cursor_7', hasMore: false }, scope: { taskId: null }, timing: activityTiming,
+      partial: true, expired: false,
+    });
+    vi.spyOn(api, 'runnerJobIntelligence').mockResolvedValue({ state: 'pending', status: 'running', projectedAt: null, detailPrunedAt: null, job: null, tasks: [] });
+    container = document.createElement('div'); document.body.appendChild(container); root = createRoot(container);
+    act(() => root!.render(<JobActivity projectId="project_1" jobId="job_1" items={[{
+      taskId: 'task_1', taskKey: 'RUN-1', phaseOrder: 0, taskOrder: 0, status: 'running', plan: null,
+      checkpointRef: null, summary: null, findings: [], projectionConflict: null, startedAt: null,
+      finishedAt: null, updatedAt: '2026-08-13T00:00:00.000Z',
+    }]} terminal={false} />));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    const stages = [...container.querySelectorAll<HTMLElement>('.runner-activity-stage')];
+    expect(stages).toHaveLength(3);
+    expect(stages[0]!.textContent).toContain('finalizeattempt 12 operations · 1 task');
+    expect(stages[1]!.textContent).toContain('reviewattempt 1');
+    expect(stages[2]!.textContent).toContain('reviewattempt 2');
+    expect(container.textContent).not.toContain('not applicable');
+    act(() => stages[0]!.querySelector<HTMLButtonElement>('button')!.click());
+    expect(stages[0]!.textContent).toContain('Job overhead');
+    expect(stages[0]!.textContent).toContain('RUN-1');
+    expect(stages[2]!.querySelector('button')?.getAttribute('aria-expanded')).toBe('true');
   });
 });
 

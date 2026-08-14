@@ -535,18 +535,18 @@ export const api = {
   runnerJobs: (pid: string) => req<{ jobs: ApiRunnerJobSummary[] }>('GET', `/api/projects/${pid}/runner-jobs`),
   runnerJob: (pid: string, jobId: string) =>
     req<ApiRunnerJobDetail>('GET', `/api/projects/${pid}/runner-jobs/${jobId}`),
-  runnerJobObservations: (
+  runnerJobActivity: (
     pid: string,
     jobId: string,
-    options: { afterSeq?: number; limit?: number; taskId?: string } = {},
+    options: { cursor?: string; limit?: number; taskId?: string } = {},
   ) => {
     const query = new URLSearchParams();
-    if (options.afterSeq != null) query.set('afterSeq', String(options.afterSeq));
+    if (options.cursor) query.set('cursor', options.cursor);
     if (options.limit != null) query.set('limit', String(options.limit));
     if (options.taskId) query.set('taskId', options.taskId);
     const suffix = query.size ? `?${query}` : '';
-    return req<ApiRunnerJobObservationPage>(
-      'GET', `/api/projects/${pid}/runner-jobs/${jobId}/observations${suffix}`,
+    return req<ApiRunnerJobActivityPage>(
+      'GET', `/api/projects/${pid}/runner-jobs/${jobId}/activity${suffix}`,
     );
   },
   runnerJobIntelligence: (pid: string, jobId: string) =>
@@ -856,7 +856,8 @@ export interface ApiOrchestrationSummary {
   anchorLabel: string | null; rootExecutionId: string | null; status: ApiExecutionStatus;
   completenessStatus: 'complete' | 'partial' | 'unknown'; completenessMissing: string[]; completenessReason: string | null;
   createdByKind: string; createdById: string; createdByName: string | null;
-  nodeCount: number; liveNodeCount: number; incompleteNodeCount: number;
+  nodeCount: number; liveNodeCount: number; incompleteNodeCount: number; relationCount: number;
+  runnerJobId: string | null;
   createdAt: string; updatedAt: string; finishedAt: string | null;
 }
 export interface ApiOrchestrationPage {
@@ -933,9 +934,9 @@ export interface ApiRunnerJobDetail {
   job: ApiRunnerJobSummary & {
     snapshot: unknown; snapshotDigest: string; expectedBaseRevision: string; orchestrationId: string;
     lastEventSeq: number; assignedAt: string | null; cancelRequestedAt: string | null;
+    lineage: { orchestrationId: string; nodeCount: number; relationCount: number; incompleteNodeCount: number };
   };
   items: ApiRunnerJobItem[];
-  events: Array<{ seq: number; type: string; payload: unknown; observedAt: string; receivedAt: string }>;
   questions: ApiRunnerJobQuestion[];
 }
 
@@ -970,9 +971,23 @@ export interface ApiRunnerJobObservation {
   } | null;
   startSeq: number | null; finishSeq: number | null; cursorSeq: number;
 }
-export interface ApiRunnerJobObservationPage {
-  observations: ApiRunnerJobObservation[];
-  cursor: { afterSeq: number; nextSeq: number; highWaterSeq: number; hasMore: boolean };
+export interface ApiRunnerJobActivityStage extends ApiRunnerJobObservation {
+  kind: 'stage'; id: string; occurredAt: string; updatedAt: string;
+}
+export type RunnerJobActivityMilestoneType =
+  | 'commissioned' | 'assigned' | 'workspace_prepared' | 'phase_changed'
+  | 'question_opened' | 'question_answered' | 'warning' | 'task_result'
+  | 'cancel_requested' | 'terminal' | 'landing_requested' | 'landing_started'
+  | 'landing_succeeded' | 'landing_failed';
+export interface ApiRunnerJobActivityMilestone {
+  kind: 'milestone'; id: string; type: RunnerJobActivityMilestoneType; status: string;
+  occurredAt: string; updatedAt: string; taskId: string | null; title: string;
+  detail: string | null; cursorSeq: number | null;
+}
+export type ApiRunnerJobActivityItem = ApiRunnerJobActivityStage | ApiRunnerJobActivityMilestone;
+export interface ApiRunnerJobActivityPage {
+  items: ApiRunnerJobActivityItem[];
+  cursor: { next: string | null; hasMore: boolean };
   scope: { taskId: string | null };
   timing: {
     runner: { startedAt: string | null; finishedAt: string | null };
@@ -1491,7 +1506,7 @@ export interface ApiSearchHit {
 
 export type ApiUiSurface =
   | 'control' | 'graph' | 'board' | 'plans' | 'roadmap' | 'review' | 'docs'
-  | 'executions' | 'intelligence' | 'agents' | 'runs' | 'memory' | 'project-settings';
+  | 'intelligence' | 'agents' | 'runs' | 'memory' | 'project-settings';
 
 export interface ApiSnapshot {
   /** Server package version — deploy marker for the SPA's self-refresh (PLNR-193). */

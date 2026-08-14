@@ -145,6 +145,16 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
         WHERE o.id = ? GROUP BY o.id`,
     ).bind(job.orchestrationId).first<{ rootId: string; nodes: number }>();
     expect(orchestration).toMatchObject({ rootId: expect.any(String), nodes: 1 });
+    const detail = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/runner-jobs/${job.id}`,
+      { headers: { Cookie: cookie } },
+    );
+    const detailBody = await detail.json() as { job: Record<string, unknown> };
+    expect(detailBody.job.lineage).toEqual({
+      orchestrationId: job.orchestrationId, nodeCount: 1, relationCount: 0, incompleteNodeCount: 0,
+    });
+    expect(detailBody).not.toHaveProperty('events');
+    expect(detailBody.job).not.toHaveProperty('lineageNodeCount');
 
     const failedAt = new Date().toISOString();
     await env.DB.prepare("UPDATE tasks SET status = 'in_progress', failed_at = ? WHERE id = ?")
@@ -345,6 +355,16 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
       type: 'stage.started', at: startedAt, observationId: 'obs_build_1', taskId: task.id,
       stage: 'build', attempt: 1, actor,
     })).toMatchObject({ accepted: true, ack: 2 });
+    const runningResponse = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/runner-jobs/${job.id}/activity?limit=10&taskId=${task.id}`,
+      { headers: { Cookie: cookie } },
+    );
+    const runningBody = await runningResponse.json() as {
+      items: Array<Record<string, unknown>>; cursor: { next: string };
+    };
+    expect(runningBody.items).toEqual(expect.arrayContaining([expect.objectContaining({
+      kind: 'stage', id: 'stage:obs_build_1', status: 'running', finishSeq: null,
+    })]));
     const usage = {
       inputTokens: { status: 'complete' as const, value: 100, provenance: 'driver_reported' as const },
       outputTokens: { status: 'complete' as const, value: 25, provenance: 'driver_reported' as const },
@@ -366,20 +386,32 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
     })).toMatchObject({ accepted: true, ack: 3 });
 
     const cursorResponse = await SELF.fetch(
-      `https://noriq.test/api/projects/${projectId}/runner-jobs/${job.id}/observations?afterSeq=2&limit=10&taskId=${task.id}`,
+      `https://noriq.test/api/projects/${projectId}/runner-jobs/${job.id}/activity?limit=10&taskId=${task.id}&cursor=${encodeURIComponent(runningBody.cursor.next)}`,
       { headers: { Cookie: cookie } },
     );
     expect(cursorResponse.status).toBe(200);
-    expect(await cursorResponse.json()).toMatchObject({
-      observations: [{
-        observationId: 'obs_build_1', taskId: task.id, stage: 'build', status: 'succeeded',
-        duration: { status: 'complete', value: 2_500, provenance: 'runner_reported' },
-        actor, usage, evidence, startSeq: 2, finishSeq: 3, cursorSeq: 3,
-        startReceivedAt: expect.any(String), finishReceivedAt: expect.any(String),
-      }],
-      cursor: { afterSeq: 2, nextSeq: 3, highWaterSeq: 3, hasMore: false },
+    const activityBody = await cursorResponse.json() as { items: Array<Record<string, unknown>>; cursor: { next: string } };
+    expect(activityBody).toMatchObject({
+      cursor: { next: expect.any(String), hasMore: false },
       scope: { taskId: task.id }, partial: true, expired: false,
     });
+    expect(activityBody.items).toEqual(expect.arrayContaining([expect.objectContaining({
+        kind: 'stage', id: 'stage:obs_build_1', observationId: 'obs_build_1',
+        taskId: task.id, stage: 'build', status: 'succeeded',
+        duration: { status: 'complete', value: 2_500, provenance: 'runner_reported' },
+        actor, usage,
+        evidence: {
+          changedPathCount: 2, blockerFindings: null, majorFindings: null,
+          minorFindings: null, exitCode: null, timedOut: null,
+          checkpointRef: revision, errorCode: null,
+        },
+        startSeq: 2, finishSeq: 3, cursorSeq: 3,
+        occurredAt: startedAt, updatedAt: expect.any(String),
+      })]));
+    expect(JSON.stringify(activityBody.items)).not.toContain('operationDigest');
+    expect(activityBody.items.map((item) => String(item.occurredAt))).toEqual(
+      activityBody.items.map((item) => String(item.occurredAt)).sort(),
+    );
     expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 4, {
       type: 'stage.started', at: finishedAt, observationId: 'obs_build_1', taskId: task.id,
       stage: 'review', attempt: 1, actor,
@@ -396,7 +428,7 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
       checkpoint: { ref: revision, label: revision, url: null }, summary: 'accepted', findings: [],
     })).toMatchObject({ accepted: true, ack: 5 });
     const timingResponse = await SELF.fetch(
-      `https://noriq.test/api/projects/${projectId}/runner-jobs/${job.id}/observations?afterSeq=3&taskId=${task.id}`,
+      `https://noriq.test/api/projects/${projectId}/runner-jobs/${job.id}/activity?cursor=${encodeURIComponent(activityBody.cursor.next)}&taskId=${task.id}`,
       { headers: { Cookie: cookie } },
     );
     const timingBody = await timingResponse.json() as {
@@ -405,6 +437,47 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
     expect(timingBody.timing.server.queueMs).toBeGreaterThanOrEqual(0);
     expect(timingBody.timing.server.humanWaitMs).toBeGreaterThanOrEqual(1_900);
     expect(timingBody.timing.server.task.durationMs).toBeGreaterThanOrEqual(0);
+    const overheadResponse = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/runner-jobs/${job.id}/activity?taskId=overhead`,
+      { headers: { Cookie: cookie } },
+    );
+    const overheadBody = await overheadResponse.json() as { items: Array<{ taskId: string | null; type?: string; detail?: string | null }> };
+    expect(overheadBody.items.every((item) => item.taskId === null)).toBe(true);
+    expect(overheadBody.items.find((item) => item.type === 'question_opened')).toMatchObject({ detail: null });
+    expect(overheadBody.items.some((item) => item.type === 'task_result')).toBe(false);
+    const invalidCursor = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/runner-jobs/${job.id}/activity?cursor=not-a-cursor`,
+      { headers: { Cookie: cookie } },
+    );
+    expect(invalidCursor.status).toBe(400);
+    const oversizedPage = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/runner-jobs/${job.id}/activity?limit=201`,
+      { headers: { Cookie: cookie } },
+    );
+    expect(oversizedPage.status).toBe(400);
+    const oneItemPage = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/runner-jobs/${job.id}/activity?limit=1`,
+      { headers: { Cookie: cookie } },
+    );
+    const oneItemBody = await oneItemPage.json() as {
+      items: unknown[]; cursor: { next: string; hasMore: boolean };
+    };
+    expect(oneItemBody.items).toHaveLength(1);
+    expect(oneItemBody.cursor.hasMore).toBe(true);
+    const nextOneItemPage = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/runner-jobs/${job.id}/activity?limit=1&cursor=${encodeURIComponent(oneItemBody.cursor.next)}`,
+      { headers: { Cookie: cookie } },
+    );
+    expect(((await nextOneItemPage.json()) as { items: unknown[] }).items.length).toBeLessThanOrEqual(1);
+    const unauthorized = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/runner-jobs/${job.id}/activity`,
+    );
+    expect(unauthorized.status).toBe(401);
+    const removedObservations = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/runner-jobs/${job.id}/observations`,
+      { headers: { Cookie: cookie } },
+    );
+    expect(removedObservations.status).toBe(404);
     expect(await env.DB.prepare(
       `SELECT COUNT(*) AS nodes FROM execution_nodes WHERE orchestration_id = ?`,
     ).bind(job.orchestrationId).first<{ nodes: number }>()).toEqual({ nodes: 1 });

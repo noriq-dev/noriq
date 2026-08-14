@@ -49,6 +49,13 @@ describe('surface-scoped project loading (PLNR-400)', () => {
     expect(projectUiSurface('project-settings')).toBe('project-settings');
   });
 
+  it('treats the removed Execution route as an unknown project view', () => {
+    history.replaceState(null, '', '/p/prj_alpha/executions?orchestration=old');
+    expect(parseUrl()).toEqual({ pid: 'prj_alpha', view: 'control', task: null });
+    expect(projectUiSurface(parseUrl().view)).toBe('control');
+    history.replaceState(null, '', '/');
+  });
+
   it('does not issue project reads for global routes', () => {
     for (const view of ['home', 'ask', 'settings', 'admin'] as const) {
       expect(projectUiSurface(view)).toBeNull();

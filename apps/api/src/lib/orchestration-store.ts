@@ -789,6 +789,8 @@ export async function listOrchestrations(db: D1Database, projectId: string, opti
               AND n.status IN ('pending','running','parked')) AS liveNodeCount,
             (SELECT COUNT(*) FROM execution_nodes n WHERE n.orchestration_id = o.id
               AND n.completeness_status != 'complete') AS incompleteNodeCount,
+            (SELECT COUNT(*) FROM execution_relations r WHERE r.orchestration_id = o.id) AS relationCount,
+            (SELECT id FROM runner_jobs j WHERE j.orchestration_id = o.id LIMIT 1) AS runnerJobId,
             o.created_at AS createdAt, o.updated_at AS updatedAt, o.finished_at AS finishedAt
        FROM orchestrations o
       WHERE o.project_id = ? AND ${statuses}${cursorSql}
@@ -837,6 +839,8 @@ export async function getOrchestrationTree(db: D1Database, projectId: string, or
               AND n.status IN ('pending','running','parked')) AS liveNodeCount,
             (SELECT COUNT(*) FROM execution_nodes n WHERE n.orchestration_id = orchestrations.id
               AND n.completeness_status != 'complete') AS incompleteNodeCount,
+            (SELECT COUNT(*) FROM execution_relations r WHERE r.orchestration_id = orchestrations.id) AS relationCount,
+            (SELECT id FROM runner_jobs j WHERE j.orchestration_id = orchestrations.id LIMIT 1) AS runnerJobId,
             created_at AS createdAt, updated_at AS updatedAt, finished_at AS finishedAt
        FROM orchestrations WHERE id = ? AND project_id = ?`,
   ).bind(orchestrationId, projectId).first<Record<string, unknown>>();

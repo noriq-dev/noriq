@@ -9,7 +9,6 @@ export const DESKTOP_ONLY_VIEWS = {
   roadmap: ['Roadmap', 'Arrange milestones and delivery windows across the project timeline.'],
   docs: ['Docs', 'Read and edit long-form project documents with their surrounding workspace context.'],
   memory: ['Memory', 'Explore durable memories and evidence relationships in the full constellation workspace.'],
-  executions: ['Execution', 'Inspect orchestration trees and timelines that need room for parallel branches.'],
   runs: ['Runs', 'Compare run history, model attribution, usage, and outcomes in the full table.'],
   agents: ['Agents', 'Manage runner presence, agent history, capacity, and administrative controls.'],
 } satisfies Partial<Record<ViewId, readonly [string, string]>>;

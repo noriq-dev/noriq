@@ -90,8 +90,8 @@ describe('surface-scoped UI state (PLNR-400)', () => {
     expect(await response.json()).toEqual({ taskIds: [taskId], nextCursor: null });
   });
 
-  it('rejects unknown surfaces instead of silently falling back to the full snapshot', async () => {
-    const response = await uiState('everything');
+  it('rejects removed and unknown surfaces instead of silently falling back to the full snapshot', async () => {
+    const response = await uiState('executions');
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({ error: 'unknown UI surface' });
   });

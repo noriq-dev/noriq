@@ -6,11 +6,12 @@ import {
   api,
   type ApiRun,
   type ApiRunner,
+  type ApiRunnerJobActivityItem,
+  type ApiRunnerJobActivityPage,
+  type ApiRunnerJobActivityStage,
   type ApiRunnerJobDetail,
   type ApiRunnerJobIntelligenceDetail,
   type ApiRunnerJobMetric,
-  type ApiRunnerJobObservation,
-  type ApiRunnerJobObservationPage,
   type ApiRunnerJobOutput,
   type ApiRunnerJobSummary,
   type RunnerJobStatus,
@@ -22,6 +23,7 @@ import { Button, ErrorNote, Field, Select, TextArea } from './ui';
 import { confirm } from './Dialog';
 import { TaskSearchSelect } from './TaskSearchSelect';
 import { PlanSearchSelect } from './PlanSearchSelect';
+import { LineagePanel } from './LineagePanel';
 
 // Retained for the read-only legacy-history renderer and its regression test.
 export const RUN_STATUS_STYLE: Record<RunStatus, { color: string; bg: string; live?: boolean }> = {
@@ -338,6 +340,10 @@ function JobRow({ job, title, selected, onClick }: { job: ApiRunnerJobSummary; t
   );
 }
 
+export function hasMeaningfulLineage(lineage: ApiRunnerJobDetail['job']['lineage']): boolean {
+  return lineage.nodeCount > 1 || lineage.relationCount > 0 || lineage.incompleteNodeCount > 0;
+}
+
 function JobDetail({ detail, projectId, onRefresh, onCancel, onLand }: {
   detail: ApiRunnerJobDetail;
   projectId: string;
@@ -352,6 +358,28 @@ function JobDetail({ detail, projectId, onRefresh, onCancel, onLand }: {
     && ['manual', 'auto'].includes(job.landingPolicy)
     && ['retained', 'failed'].includes(job.landingStatus);
   const landingPending = ['requested', 'landing'].includes(job.landingStatus);
+  const meaningfulLineage = hasMeaningfulLineage(job.lineage);
+  const [lineageOpen, setLineageOpen] = useState(
+    new URLSearchParams(location.search).get('lineage') === job.lineage.orchestrationId,
+  );
+  const [lineageNode, setLineageNode] = useState<string | null>(new URLSearchParams(location.search).get('node'));
+  useEffect(() => {
+    const query = new URLSearchParams(location.search);
+    setLineageOpen(query.get('lineage') === job.lineage.orchestrationId);
+    setLineageNode(query.get('node'));
+  }, [job.id, job.lineage.orchestrationId]);
+  const toggleLineage = () => {
+    const next = !lineageOpen;
+    setLineageOpen(next);
+    const query = new URLSearchParams(location.search);
+    if (next) {
+      query.set('lineage', job.lineage.orchestrationId);
+      query.delete('node');
+      setLineageNode(null);
+    }
+    else { query.delete('lineage'); query.delete('node'); setLineageNode(null); }
+    history.replaceState(null, '', `${location.pathname}${query.size ? `?${query}` : ''}`);
+  };
   return (
     <div style={{ borderRadius: 11, border: '1px solid var(--w-07)', background: 'var(--w-02)', padding: 16 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
@@ -361,6 +389,7 @@ function JobDetail({ detail, projectId, onRefresh, onCancel, onLand }: {
         <div style={{ flex: 1 }} />
         {canLand && <Button variant="primary" onClick={onLand}>{job.landingStatus === 'failed' ? 'retry landing' : 'accept & land'}</Button>}
         {landingPending && <Button variant="ghost" disabled>landing requested</Button>}
+        {meaningfulLineage && <Button variant="ghost" onClick={toggleLineage}>{lineageOpen ? 'hide lineage' : 'view lineage'}</Button>}
         {!TERMINAL_JOBS.includes(job.status) && <Button variant="danger" onClick={onCancel}>cancel</Button>}
       </div>
       <div style={{ height: 4, borderRadius: 4, background: 'var(--w-07)', margin: '14px 0' }}>
@@ -390,7 +419,20 @@ function JobDetail({ detail, projectId, onRefresh, onCancel, onLand }: {
           </div>
         ))}
       </Section>
-      <ObservationInspector
+      {meaningfulLineage && lineageOpen && <Section title="Lineage">
+        <LineagePanel
+          projectId={projectId}
+          orchestrationId={job.lineage.orchestrationId}
+          initialExecutionId={lineageNode}
+          onSelectionChange={(_, executionId) => {
+            setLineageNode(executionId);
+            const query = new URLSearchParams(location.search);
+            if (executionId) query.set('node', executionId); else query.delete('node');
+            history.replaceState(null, '', `${location.pathname}?${query}`);
+          }}
+        />
+      </Section>}
+      <JobActivity
         projectId={projectId}
         jobId={job.id}
         items={items}
@@ -401,11 +443,6 @@ function JobDetail({ detail, projectId, onRefresh, onCancel, onLand }: {
   );
 }
 
-function metricText(metric: ApiRunnerJobMetric | null, suffix = ''): string {
-  if (!metric || metric.value == null) return metric?.status?.replace('_', ' ') ?? 'pending';
-  return `${metric.value.toLocaleString()}${suffix}${metric.status === 'partial' ? ' partial' : ''}`;
-}
-
 function durationText(value: number | null): string {
   if (value == null) return 'unavailable';
   if (value < 1_000) return `${value}ms`;
@@ -413,12 +450,7 @@ function durationText(value: number | null): string {
   return `${(value / 60_000).toFixed(1)}m`;
 }
 
-function observationLabel(observation: ApiRunnerJobObservation, items: ApiRunnerJobDetail['items']): string {
-  if (!observation.taskId) return 'job overhead';
-  return items.find((item) => item.taskId === observation.taskId)?.taskKey ?? observation.taskId;
-}
-
-export function ObservationInspector({ projectId, jobId, items, terminal }: {
+export function JobActivity({ projectId, jobId, items, terminal }: {
   projectId: string;
   jobId: string;
   items: ApiRunnerJobDetail['items'];
@@ -426,11 +458,11 @@ export function ObservationInspector({ projectId, jobId, items, terminal }: {
 }) {
   const [filter, setFilter] = useState('all');
   const [follow, setFollow] = useState(true);
-  const [observations, setObservations] = useState<ApiRunnerJobObservation[]>([]);
-  const [page, setPage] = useState<ApiRunnerJobObservationPage | null>(null);
+  const [activity, setActivity] = useState<ApiRunnerJobActivityItem[]>([]);
+  const [page, setPage] = useState<ApiRunnerJobActivityPage | null>(null);
   const [summary, setSummary] = useState<ApiRunnerJobIntelligenceDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const cursor = useRef(0);
+  const cursor = useRef<string | null>(null);
   const loading = useRef(false);
   const generation = useRef(0);
 
@@ -445,27 +477,24 @@ export function ObservationInspector({ projectId, jobId, items, terminal }: {
     if (loading.current) return;
     loading.current = true;
     try {
-      if (reset) cursor.current = 0;
+      if (reset) cursor.current = null;
       let nextAfter = cursor.current;
-      let latest: ApiRunnerJobObservationPage | null = null;
+      let latest: ApiRunnerJobActivityPage | null = null;
       for (let pageIndex = 0; pageIndex < 5; pageIndex++) {
         const replaceThisPage = reset && pageIndex === 0;
-        const response = await api.runnerJobObservations(projectId, jobId, {
-          afterSeq: nextAfter,
+        const response = await api.runnerJobActivity(projectId, jobId, {
+          ...(nextAfter ? { cursor: nextAfter } : {}),
           limit: 100,
-          ...(filter !== 'all' && filter !== 'overhead' ? { taskId: filter } : {}),
+          ...(filter !== 'all' ? { taskId: filter } : {}),
         });
         if (requestGeneration !== generation.current) return;
         latest = response;
-        const visible = filter === 'overhead'
-          ? response.observations.filter((observation) => observation.taskId === null)
-          : response.observations;
-        setObservations((current) => {
-          const merged = new Map((replaceThisPage ? [] : current).map((observation) => [observation.observationId, observation]));
-          for (const observation of visible) merged.set(observation.observationId, observation);
-          return [...merged.values()].sort((left, right) => left.cursorSeq - right.cursorSeq);
+        setActivity((current) => {
+          const merged = new Map((replaceThisPage ? [] : current).map((item) => [item.id, item]));
+          for (const item of response.items) merged.set(item.id, item);
+          return [...merged.values()].sort((left, right) => left.occurredAt.localeCompare(right.occurredAt) || left.id.localeCompare(right.id));
         });
-        nextAfter = response.cursor.nextSeq;
+        nextAfter = response.cursor.next;
         if (!response.cursor.hasMore) break;
       }
       cursor.current = nextAfter;
@@ -474,7 +503,7 @@ export function ObservationInspector({ projectId, jobId, items, terminal }: {
       if (terminal || latest?.expired) await loadSummary(requestGeneration);
     } catch (cause) {
       if (requestGeneration === generation.current) {
-        setError(cause instanceof Error ? cause.message : 'Unable to read RunnerJob observations');
+        setError(cause instanceof Error ? cause.message : 'Unable to read job activity');
       }
     } finally {
       if (requestGeneration === generation.current) loading.current = false;
@@ -485,10 +514,10 @@ export function ObservationInspector({ projectId, jobId, items, terminal }: {
     generation.current++;
     loading.current = false;
     const requestGeneration = generation.current;
-    setObservations([]);
+    setActivity([]);
     setPage(null);
     setSummary(null);
-    cursor.current = 0;
+    cursor.current = null;
     void pull(true, requestGeneration);
     void loadSummary(requestGeneration);
     // Reset only when the selected job or observation scope changes.
@@ -503,7 +532,7 @@ export function ObservationInspector({ projectId, jobId, items, terminal }: {
   }, [projectId, jobId, filter, follow, terminal]);
 
   const timing = page?.timing.server;
-  return <Section title="Stage observations">
+  return <Section title="Job activity">
     <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'end', marginBottom: 10 }}>
       <label style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)', flex: '1 1 180px' }}>
         Scope
@@ -524,10 +553,10 @@ export function ObservationInspector({ projectId, jobId, items, terminal }: {
       <Button variant="ghost" onClick={() => void pull()}>{follow ? 'refresh now' : 'refresh paused view'}</Button>
     </div>
     {page?.expired && <div role="status" style={{ padding: 10, borderRadius: 8, border: '1px solid var(--amber)', color: 'var(--text-mid)', fontSize: 11.5, marginBottom: 10 }}>
-      Detailed stage evidence expired after 90 days. The permanent job and task summaries remain below.
+      Detailed activity expired after 90 days. The permanent job and task summaries remain below.
     </div>}
-    {page?.partial && !page.expired && <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: '#f5a623', marginBottom: 8 }}>
-      LIVE PARTIAL · running stages do not have duration or usage until their finish evidence arrives
+    {page?.partial && !page.expired && <div role="status" style={{ fontFamily: 'var(--mono)', fontSize: 10, color: '#f5a623', marginBottom: 8 }}>
+      LIVE PARTIAL · running work fills in duration and usage when finish evidence arrives
     </div>}
     {timing && <div className="runner-observation-timing">
       <TimingFact label="queue" value={durationText(timing.queueMs)} />
@@ -536,14 +565,8 @@ export function ObservationInspector({ projectId, jobId, items, terminal }: {
       <TimingFact label="landing" value={durationText(timing.landing.durationMs)} />
     </div>}
     {error && <ErrorNote>{error}</ErrorNote>}
-    <div className="runner-observation-grid">
-      {[...observations].reverse().map((observation) => <ObservationCard
-        key={observation.observationId}
-        observation={observation}
-        scope={observationLabel(observation, items)}
-      />)}
-    </div>
-    {!observations.length && !error && <EmptyState>{page?.expired ? 'detailed evidence expired' : 'no observations in this scope yet'}</EmptyState>}
+    <ActivityTimeline activity={activity} items={items} follow={follow} />
+    {!activity.length && !error && <EmptyState>{page?.expired ? 'detailed activity expired' : 'no activity in this scope yet'}</EmptyState>}
     {summary && <PermanentRunnerJobSummary summary={summary} />}
   </Section>;
 }
@@ -552,36 +575,163 @@ function TimingFact({ label, value }: { label: string; value: string }) {
   return <div><span>{label}</span><b>{value}</b></div>;
 }
 
-function ObservationCard({ observation, scope }: { observation: ApiRunnerJobObservation; scope: string }) {
-  const color = observation.status === 'succeeded' ? 'var(--green)'
-    : observation.status === 'running' ? 'var(--blue)'
-      : observation.status === 'skipped' ? 'var(--text-dim)' : 'var(--red-soft)';
-  const usage = observation.usage;
-  return <article style={{ border: '1px solid var(--w-07)', borderRadius: 9, padding: 11, background: 'var(--w-02)', minWidth: 0 }}>
-    <div style={{ display: 'flex', gap: 7, alignItems: 'center', flexWrap: 'wrap' }}>
-      <MonoTag color={color} bg="var(--w-06)" size={8}>{observation.status}</MonoTag>
-      <b style={{ fontSize: 12 }}>{observation.stage}</b>
-      <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>attempt {observation.attempt}</span>
-      <span style={{ marginLeft: 'auto', fontFamily: 'var(--mono)', fontSize: 9.5, color: observation.taskId ? 'var(--text-mid)' : '#f5a623' }}>{scope}</span>
+type ActivityStageGroup = {
+  kind: 'group'; id: string; stage: ApiRunnerJobActivityStage['stage']; attempt: number;
+  occurredAt: string; observations: ApiRunnerJobActivityStage[];
+};
+
+function ActivityTimeline({ activity, items, follow }: {
+  activity: ApiRunnerJobActivityItem[];
+  items: ApiRunnerJobDetail['items'];
+  follow: boolean;
+}) {
+  const scroll = useRef<HTMLDivElement | null>(null);
+  const nearNewest = useRef(true);
+  const blocks = useMemo(() => {
+    const groups = new Map<string, ActivityStageGroup>();
+    const result: Array<ActivityStageGroup | Exclude<ApiRunnerJobActivityItem, ApiRunnerJobActivityStage>> = [];
+    for (const item of activity) {
+      if (item.kind === 'milestone') { result.push(item); continue; }
+      const key = `${item.stage}:${item.attempt}`;
+      const group = groups.get(key) ?? { kind: 'group' as const, id: key, stage: item.stage, attempt: item.attempt, occurredAt: item.occurredAt, observations: [] };
+      group.observations.push(item);
+      if (item.occurredAt < group.occurredAt) group.occurredAt = item.occurredAt;
+      if (!groups.has(key)) { groups.set(key, group); result.push(group); }
+    }
+    return result.sort((left, right) => left.occurredAt.localeCompare(right.occurredAt) || left.id.localeCompare(right.id));
+  }, [activity]);
+
+  useEffect(() => {
+    const element = scroll.current;
+    if (!element || !follow || !nearNewest.current || typeof element.scrollTo !== 'function') return;
+    element.scrollTo({ top: element.scrollHeight, behavior: 'smooth' });
+  }, [blocks, follow]);
+
+  if (!blocks.length) return null;
+  return <div
+    ref={scroll}
+    className="runner-activity-scroll"
+    aria-live="polite"
+    aria-label="Chronological job activity"
+    onScroll={(event) => {
+      const element = event.currentTarget;
+      nearNewest.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+    }}
+  >
+    <div className="runner-activity-timeline">
+      {blocks.map((block) => block.kind === 'milestone'
+        ? <ActivityMilestone key={block.id} milestone={block} items={items} />
+        : <ActivityStage key={block.id} group={block} items={items} />)}
     </div>
-    <div style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)', marginTop: 7, overflowWrap: 'anywhere' }}>
-      {observation.actor.role ?? observation.actor.kind} · {observation.actor.driver}
-      {observation.actor.model ? ` / ${observation.actor.model}` : ''} · {observation.actor.operation}
+  </div>;
+}
+
+function statusColor(status: string): string {
+  if (status === 'succeeded' || status === 'accepted') return 'var(--green)';
+  if (status === 'running' || status === 'assigned') return 'var(--blue)';
+  if (status === 'waiting' || status === 'warning' || status === 'partial') return '#f5a623';
+  if (status === 'skipped' || status === 'cancelled') return 'var(--text-dim)';
+  return 'var(--red-soft)';
+}
+
+function ActivityMilestone({ milestone, items }: {
+  milestone: Extract<ApiRunnerJobActivityItem, { kind: 'milestone' }>;
+  items: ApiRunnerJobDetail['items'];
+}) {
+  const task = milestone.taskId ? items.find((item) => item.taskId === milestone.taskId) : null;
+  return <article className="runner-activity-milestone">
+    <span className="runner-activity-dot" style={{ background: statusColor(milestone.status) }} />
+    <div>
+      <div className="runner-activity-title"><b>{milestone.title}</b>{task && <MonoTag color="var(--text-mid)" bg="var(--w-06)" size={8}>{task.taskKey}</MonoTag>}</div>
+      {milestone.detail && <div className="runner-activity-detail">{milestone.detail}</div>}
     </div>
-    <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 8, fontFamily: 'var(--mono)', fontSize: 9.5 }}>
-      <span>time <b>{metricText(observation.duration, 'ms')}</b></span>
-      {usage ? <>
-        <span>in <b>{metricText(usage.inputTokens)}</b></span>
-        <span>out <b>{metricText(usage.outputTokens)}</b></span>
-        <span>cache r/w <b>{metricText(usage.cacheReadTokens)} / {metricText(usage.cacheWriteTokens)}</b></span>
-        <span>calls <b>{metricText(usage.calls)}</b></span>
-        <span>cost <b>{usage.costUsd.value == null ? usage.costUsd.status.replace('_', ' ') : `$${usage.costUsd.value.toFixed(4)}${usage.costUsd.status === 'partial' ? ' partial' : ''}`}</b></span>
-      </> : <span style={{ color: 'var(--text-dim)' }}>usage pending</span>}
-    </div>
-    {observation.recovery && observation.recovery !== 'none' && <div style={{ marginTop: 7, fontFamily: 'var(--mono)', fontSize: 9.5, color: '#f5a623' }}>
-      recovered by {observation.recovery.replace('_', ' ')}
+    <time>{new Date(milestone.occurredAt).toLocaleTimeString()}</time>
+  </article>;
+}
+
+function aggregateMetric(observations: ApiRunnerJobActivityStage[], select: (item: ApiRunnerJobActivityStage) => ApiRunnerJobMetric | null): { value: number | null; partial: boolean } {
+  const metrics = observations.map(select).filter((metric): metric is ApiRunnerJobMetric => metric?.value != null);
+  return { value: metrics.length ? metrics.reduce((sum, metric) => sum + metric.value!, 0) : null, partial: metrics.some((metric) => metric.status === 'partial') };
+}
+
+function ActivityStage({ group, items }: { group: ActivityStageGroup; items: ApiRunnerJobDetail['items'] }) {
+  const statuses = group.observations.map((observation) => observation.status);
+  const status = statuses.includes('failed') ? 'failed'
+    : statuses.includes('cancelled') ? 'cancelled'
+      : statuses.includes('running') ? 'running'
+        : statuses.every((candidate) => candidate === 'skipped') ? 'skipped' : 'succeeded';
+  const noteworthy = status !== 'succeeded' && status !== 'skipped'
+    || group.observations.some((observation) => observation.recovery && observation.recovery !== 'none');
+  const [expanded, setExpanded] = useState(noteworthy);
+  const duration = aggregateMetric(group.observations, (observation) => observation.duration);
+  const tokens = aggregateMetric(group.observations, (observation) => observation.usage ? {
+    status: observation.usage.inputTokens.status === 'partial' || observation.usage.outputTokens.status === 'partial' ? 'partial' : 'complete',
+    value: observation.usage.inputTokens.value == null && observation.usage.outputTokens.value == null
+      ? null : (observation.usage.inputTokens.value ?? 0) + (observation.usage.outputTokens.value ?? 0),
+    provenance: 'derived',
+  } : null);
+  const calls = aggregateMetric(group.observations, (observation) => observation.usage?.calls ?? null);
+  const cost = aggregateMetric(group.observations, (observation) => observation.usage?.costUsd ?? null);
+  const taskCount = new Set(group.observations.map((observation) => observation.taskId).filter(Boolean)).size;
+  const orderedScopes: Array<{ id: string | null; label: string; observations: ApiRunnerJobActivityStage[] }> = [];
+  const overhead = group.observations.filter((observation) => observation.taskId === null);
+  if (overhead.length) orderedScopes.push({ id: null, label: 'Job overhead', observations: overhead });
+  for (const item of items) {
+    const scoped = group.observations.filter((observation) => observation.taskId === item.taskId);
+    if (scoped.length) orderedScopes.push({ id: item.taskId, label: item.taskKey, observations: scoped });
+  }
+  const known = new Set(orderedScopes.flatMap((scope) => scope.observations.map((observation) => observation.id)));
+  for (const observation of group.observations.filter((candidate) => !known.has(candidate.id))) {
+    orderedScopes.push({ id: observation.taskId, label: observation.taskId ?? 'Job overhead', observations: [observation] });
+  }
+  const metrics = [
+    duration.value == null ? null : durationText(duration.value),
+    tokens.value == null ? null : `${tokens.value.toLocaleString()} tokens${tokens.partial ? ' partial' : ''}`,
+    calls.value == null ? null : `${calls.value.toLocaleString()} calls`,
+    cost.value == null ? null : `$${cost.value.toFixed(4)}${cost.partial ? ' partial' : ''}`,
+  ].filter(Boolean);
+  return <article className="runner-activity-stage" data-status={status}>
+    <button type="button" className="runner-activity-stage-header" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>
+      <span className="runner-activity-chevron">{expanded ? '▾' : '▸'}</span>
+      <MonoTag color={statusColor(status)} bg="var(--w-06)" size={8}>{status}</MonoTag>
+      <b>{group.stage}</b>
+      <span className="runner-activity-attempt">attempt {group.attempt}</span>
+      <span className="runner-activity-stage-summary">{group.observations.length} operation{group.observations.length === 1 ? '' : 's'}{taskCount ? ` · ${taskCount} task${taskCount === 1 ? '' : 's'}` : ''}{metrics.length ? ` · ${metrics.join(' · ')}` : ' · usage not reported'}</span>
+    </button>
+    {expanded && <div className="runner-activity-stage-body">
+      {orderedScopes.map((scope, index) => <section key={`${scope.id ?? 'overhead'}:${index}`} className="runner-activity-scope">
+        <h4>{scope.label}</h4>
+        {scope.observations.sort((left, right) => left.occurredAt.localeCompare(right.occurredAt)).map((observation) => <ActivityOperation key={observation.id} observation={observation} />)}
+      </section>)}
     </div>}
   </article>;
+}
+
+function ActivityOperation({ observation }: { observation: ApiRunnerJobActivityStage }) {
+  const actor = `${observation.actor.role ?? observation.actor.kind} · ${observation.actor.driver}${observation.actor.model ? ` / ${observation.actor.model}` : ''}`;
+  const metrics = [
+    observation.duration?.value == null ? null : `time ${durationText(observation.duration.value)}`,
+    observation.usage?.inputTokens.value == null ? null : `in ${observation.usage.inputTokens.value.toLocaleString()}`,
+    observation.usage?.outputTokens.value == null ? null : `out ${observation.usage.outputTokens.value.toLocaleString()}`,
+    observation.usage?.calls.value == null ? null : `${observation.usage.calls.value.toLocaleString()} calls`,
+    observation.usage?.costUsd.value == null ? null : `$${observation.usage.costUsd.value.toFixed(4)}`,
+  ].filter(Boolean);
+  const evidence = observation.evidence ? [
+    observation.evidence.changedPathCount == null ? null : `${observation.evidence.changedPathCount} paths`,
+    observation.evidence.blockerFindings == null ? null : `${observation.evidence.blockerFindings} blockers`,
+    observation.evidence.majorFindings == null ? null : `${observation.evidence.majorFindings} major`,
+    observation.evidence.minorFindings == null ? null : `${observation.evidence.minorFindings} minor`,
+    observation.evidence.exitCode == null ? null : `exit ${observation.evidence.exitCode}`,
+    observation.evidence.timedOut ? 'timed out' : null,
+    observation.evidence.checkpointRef ? `checkpoint ${shortRevision(observation.evidence.checkpointRef)}` : null,
+    observation.evidence.errorCode ? `error ${observation.evidence.errorCode}` : null,
+  ].filter(Boolean) : [];
+  return <div className="runner-activity-operation">
+    <span className="runner-activity-dot" style={{ background: statusColor(observation.status) }} />
+    <div className="runner-activity-operation-main"><b>{observation.actor.operation}</b><span>{actor}</span></div>
+    <div className="runner-activity-operation-facts">{[...metrics, ...evidence].map((fact) => <span key={fact}>{fact}</span>)}</div>
+    {observation.recovery && observation.recovery !== 'none' && <span className="runner-activity-recovery">recovered by {observation.recovery.replace('_', ' ')}</span>}
+  </div>;
 }
 
 function PermanentRunnerJobSummary({ summary }: { summary: ApiRunnerJobIntelligenceDetail }) {

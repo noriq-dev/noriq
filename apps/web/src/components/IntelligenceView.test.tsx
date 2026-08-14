@@ -1,7 +1,7 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { api, type ApiProjectIntelligence } from '../api';
+import { api, type ApiOrchestrationSummary, type ApiOrchestrationTree, type ApiProjectIntelligence } from '../api';
 import type { AppStore } from '../store';
 import { IntelligenceView } from './IntelligenceView';
 
@@ -51,11 +51,39 @@ const packet: ApiProjectIntelligence = {
   bounds: { from: '2026-07-10T00:00:00.000Z', to: '2026-08-10T00:00:00.000Z', caseLimit: 24, groupBy: 'executed_workflow' },
 };
 
+const lineageSummary: ApiOrchestrationSummary = {
+  id: 'orc_1', anchorType: 'task', anchorId: 'task_1', anchorLabel: 'RUN-1 · Example',
+  rootExecutionId: 'exe_1', status: 'succeeded', completenessStatus: 'complete',
+  completenessMissing: [], completenessReason: null, createdByKind: 'copilot', createdById: 'agent_1',
+  createdByName: 'Codex', nodeCount: 1, liveNodeCount: 0, incompleteNodeCount: 0,
+  relationCount: 0, runnerJobId: null, createdAt: '2026-08-10T00:00:00.000Z',
+  updatedAt: '2026-08-10T01:00:00.000Z', finishedAt: '2026-08-10T01:00:00.000Z',
+};
+const lineageTree: ApiOrchestrationTree = {
+  orchestration: lineageSummary,
+  nodes: [{
+    id: 'exe_1', parentExecutionId: null, kind: 'copilot_session', role: 'worker', actorKind: 'copilot',
+    actorId: 'agent_1', actorName: 'Codex', presenceId: null, taskId: 'task_1', taskKey: 'RUN-1',
+    taskTitle: 'Example', planId: null, planTitle: null, runId: null, sitting: null, stage: null,
+    step: null, gateId: null, status: 'succeeded', completenessStatus: 'complete', completenessMissing: [],
+    completenessReason: null, lastRevision: 1, startedAt: lineageSummary.createdAt, parkedAt: null,
+    finishedAt: lineageSummary.finishedAt, outcomeReason: null, createdAt: lineageSummary.createdAt,
+    updatedAt: lineageSummary.updatedAt,
+  }],
+  rootExecutionIds: ['exe_1'], relations: [], timeline: [],
+  timelinePage: { limit: 100, hasMore: false, nextCursor: null },
+};
+
 beforeEach(() => {
   vi.spyOn(api, 'runnerJobIntelligenceHistory').mockResolvedValue({
     from: '2026-07-10T00:00:00.000Z', to: '2026-08-10T00:00:00.000Z',
     jobs: [], tasks: [], truncated: false,
   });
+  vi.spyOn(api, 'orchestrations').mockResolvedValue({
+    orchestrations: [lineageSummary], counts: { active: 0, history: 1, total: 1 },
+    page: { limit: 40, hasMore: false, nextCursor: null },
+  });
+  vi.spyOn(api, 'orchestration').mockResolvedValue(lineageTree);
 });
 
 afterEach(() => { act(() => root?.unmount()); container?.remove(); root = null; window.matchMedia = originalMatchMedia; vi.restoreAllMocks(); history.replaceState(null, '', '/'); });
@@ -96,16 +124,19 @@ describe('Project Intelligence surface (PLNR-302)', () => {
     }));
   });
 
-  it('hands a canonical case to the existing execution view instead of drawing another graph', async () => {
+  it('opens canonical lineage inside Intelligence and restores it in query state', async () => {
     vi.spyOn(api, 'projectIntelligence').mockResolvedValue(packet);
     history.replaceState(null, '', '/p/prj_1/intelligence');
     container = document.createElement('div'); document.body.appendChild(container); root = createRoot(container);
     act(() => root!.render(<IntelligenceView store={{ currentPid: 'prj_1' } as AppStore} />));
     await tick();
-    const button = [...container.querySelectorAll('button')].find((item) => item.textContent === 'Execution');
+    const button = [...container.querySelectorAll('button')].find((item) => item.textContent === 'Lineage');
     act(() => button!.click());
-    expect(location.pathname).toBe('/p/prj_1/executions');
-    expect(location.search).toContain('orchestration=orc_1');
-    expect(location.search).toContain('execution=exe_1');
+    await tick();
+    expect(location.pathname).toBe('/p/prj_1/intelligence');
+    expect(location.search).toContain('lineage=orc_1');
+    expect(location.search).toContain('node=exe_1');
+    expect(container.textContent).toContain('Canonical execution relationships');
+    expect(container.textContent).toContain('RUN-1 · Example');
   });
 });

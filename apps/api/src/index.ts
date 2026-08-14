@@ -98,6 +98,7 @@ import {
   declareRunnerExecution, ensureRunExecution, getOrchestrationTree, listOrchestrations, reconcileRunnerExecution,
   reportRunnerExecutionEvent, reportRunnerExecutionRelation,
 } from './lib/orchestration-store';
+import { readRunnerJobActivity } from './lib/runner-job-activity';
 import { commissionExecutionProfile } from './lib/execution-profiles';
 
 export { ProjectRoom } from './do/ProjectRoom';
@@ -961,7 +962,7 @@ app.get('/api/public/projects/:pid/snapshot', async (c) => {
 // endpoint). Keep this allowlist closed so a new view cannot silently fall back to "everything".
 const UI_STATE_SURFACES = new Set([
   'control', 'graph', 'board', 'plans', 'roadmap', 'review', 'docs',
-  'executions', 'intelligence', 'agents', 'runs', 'memory', 'project-settings',
+  'intelligence', 'agents', 'runs', 'memory', 'project-settings',
 ]);
 
 /** Translate the historical storage columns into the generic proposal wire contract. The
@@ -4425,7 +4426,11 @@ app.get('/api/projects/:pid/runner-jobs/:jobId', userAuth, async (c) => {
             intelligence_finished_received_at AS intelligenceFinishedReceivedAt,
             human_wait_started_received_at AS humanWaitStartedReceivedAt,
             human_wait_ms AS humanWaitMs, detail_pruned_at AS detailPrunedAt,
-            intelligence_projected_at AS intelligenceProjectedAt, updated_at AS updatedAt
+            intelligence_projected_at AS intelligenceProjectedAt, updated_at AS updatedAt,
+            (SELECT COUNT(*) FROM execution_nodes n WHERE n.orchestration_id = runner_jobs.orchestration_id) AS lineageNodeCount,
+            (SELECT COUNT(*) FROM execution_relations r WHERE r.orchestration_id = runner_jobs.orchestration_id) AS lineageRelationCount,
+            (SELECT COUNT(*) FROM execution_nodes n WHERE n.orchestration_id = runner_jobs.orchestration_id
+              AND n.completeness_status != 'complete') AS lineageIncompleteNodeCount
        FROM runner_jobs WHERE id = ? AND project_id = ?`,
   ).bind(c.req.param('jobId')!, c.req.param('pid')!).first<Record<string, unknown> & {
     snapshot: string; usage: string; intelligenceContext: string | null;
@@ -4449,136 +4454,49 @@ app.get('/api/projects/:pid/runner-jobs/:jobId', userAuth, async (c) => {
          FROM runner_job_questions WHERE job_id = ? ORDER BY published_at`,
     ).bind(c.req.param('jobId')!).all(),
   ]);
+  const {
+    lineageNodeCount, lineageRelationCount, lineageIncompleteNodeCount,
+    ...jobFields
+  } = job;
   return c.json({
     job: {
-      ...job, snapshot: parseStoredJson(job.snapshot, null), usage: parseStoredJson(job.usage, null),
+      ...jobFields, snapshot: parseStoredJson(job.snapshot, null), usage: parseStoredJson(job.usage, null),
       intelligenceContext: parseStoredJson(job.intelligenceContext, null),
       finalResult: parseStoredJson(job.finalResult, null),
       landingCheckpoint: parseStoredJson(job.landingCheckpoint, null),
+      lineage: {
+        orchestrationId: String(job.orchestrationId),
+        nodeCount: Number(job.lineageNodeCount ?? 0),
+        relationCount: Number(job.lineageRelationCount ?? 0),
+        incompleteNodeCount: Number(job.lineageIncompleteNodeCount ?? 0),
+      },
     },
     items: items.results.map((item) => ({
       ...item, findings: parseStoredJson(item.findings, []),
       projectionConflict: parseStoredJson(item.projectionConflict, null),
     })),
-    // Current clients follow the bounded observation cursor. Keep this empty compatibility
-    // property so a rolling older web bundle does not fail while avoiding an unbounded journal read.
-    events: [],
     questions: questions.results,
   });
 });
 
-app.get('/api/projects/:pid/runner-jobs/:jobId/observations', userAuth, async (c) => {
-  const pid = c.req.param('pid')!;
-  const jobId = c.req.param('jobId')!;
-  const afterRaw = c.req.query('afterSeq') ?? '0';
+app.get('/api/projects/:pid/runner-jobs/:jobId/activity', userAuth, async (c) => {
   const limitRaw = c.req.query('limit') ?? '100';
-  const taskId = c.req.query('taskId')?.trim() || null;
-  if (!/^\d+$/.test(afterRaw)) return c.json({ error: 'afterSeq must be a non-negative integer' }, 400);
   if (!/^\d+$/.test(limitRaw)) return c.json({ error: 'limit must be an integer from 1 to 200' }, 400);
-  const afterSeq = Number(afterRaw);
   const limit = Number(limitRaw);
-  if (!Number.isSafeInteger(afterSeq) || afterSeq < 0) {
-    return c.json({ error: 'afterSeq must be a non-negative safe integer' }, 400);
-  }
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
     return c.json({ error: 'limit must be an integer from 1 to 200' }, 400);
   }
-  if (taskId && taskId.length > 128) return c.json({ error: 'taskId is too long' }, 400);
-  const job = await c.env.DB.prepare(
-    `SELECT status, last_event_seq AS lastEventSeq, created_at AS createdAt,
-            detail_pruned_at AS detailPrunedAt,
-            started_at AS startedAt, finished_at AS finishedAt,
-            intelligence_started_received_at AS intelligenceStartedReceivedAt,
-            intelligence_finished_received_at AS intelligenceFinishedReceivedAt,
-            human_wait_started_received_at AS humanWaitStartedReceivedAt,
-            human_wait_ms AS humanWaitMs,
-            landing_requested_at AS landingRequestedAt, landing_started_at AS landingStartedAt,
-            landing_finished_at AS landingFinishedAt
-       FROM runner_jobs WHERE id = ? AND project_id = ?`,
-  ).bind(jobId, pid).first<{
-    status: string; lastEventSeq: number; createdAt: string; detailPrunedAt: string | null;
-    startedAt: string | null; finishedAt: string | null;
-    intelligenceStartedReceivedAt: string | null; intelligenceFinishedReceivedAt: string | null;
-    humanWaitStartedReceivedAt: string | null; humanWaitMs: number;
-    landingRequestedAt: string | null; landingStartedAt: string | null; landingFinishedAt: string | null;
-  }>();
-  if (!job) return c.json({ error: 'RunnerJob not found' }, 404);
-  const query = taskId
-    ? `SELECT observation_id AS observationId, task_id AS taskId, stage, attempt, actor, status,
-              started_at AS startedAt, finished_at AS finishedAt, duration,
-              usage, recovery, evidence, start_seq AS startSeq, finish_seq AS finishSeq,
-              start_received_at AS startReceivedAt, finish_received_at AS finishReceivedAt,
-              COALESCE(finish_seq, start_seq) AS cursorSeq
-         FROM runner_job_observations
-        WHERE job_id = ? AND task_id = ? AND COALESCE(finish_seq, start_seq) > ?
-        ORDER BY COALESCE(finish_seq, start_seq), observation_id LIMIT ?`
-    : `SELECT observation_id AS observationId, task_id AS taskId, stage, attempt, actor, status,
-              started_at AS startedAt, finished_at AS finishedAt, duration,
-              usage, recovery, evidence, start_seq AS startSeq, finish_seq AS finishSeq,
-              start_received_at AS startReceivedAt, finish_received_at AS finishReceivedAt,
-              COALESCE(finish_seq, start_seq) AS cursorSeq
-         FROM runner_job_observations
-        WHERE job_id = ? AND COALESCE(finish_seq, start_seq) > ?
-        ORDER BY COALESCE(finish_seq, start_seq), observation_id LIMIT ?`;
-  const statement = c.env.DB.prepare(query);
-  const rows = taskId
-    ? await statement.bind(jobId, taskId, afterSeq, limit + 1).all<Record<string, unknown> & {
-        actor: string; duration: string | null; usage: string | null; evidence: string | null; cursorSeq: number;
-      }>()
-    : await statement.bind(jobId, afterSeq, limit + 1).all<Record<string, unknown> & {
-        actor: string; duration: string | null; usage: string | null; evidence: string | null; cursorSeq: number;
-      }>();
-  const page = rows.results.slice(0, limit);
-  const pageCursor = page.length > 0 ? page[page.length - 1]!.cursorSeq : afterSeq;
-  // Once this bounded query proves there is no next matching row, advancing to the durable
-  // event high-water avoids rescanning unrelated events without risking a future finish update.
-  const nextSeq = rows.results.length > limit ? pageCursor : Math.max(pageCursor, job.lastEventSeq);
-  const asOf = new Date().toISOString();
-  const elapsedMs = (start: string | null, end: string | null) => start && end
-    ? Math.max(0, Date.parse(end) - Date.parse(start))
-    : null;
-  const taskTiming = taskId ? await c.env.DB.prepare(
-    `SELECT intelligence_started_received_at AS startedAt,
-            intelligence_finished_received_at AS finishedAt
-       FROM runner_job_items WHERE job_id = ? AND task_id = ?`,
-  ).bind(jobId, taskId).first<{ startedAt: string | null; finishedAt: string | null }>() : null;
-  const currentHumanWaitMs = job.humanWaitStartedReceivedAt
-    ? Math.max(0, Date.parse(asOf) - Date.parse(job.humanWaitStartedReceivedAt))
-    : 0;
-  return c.json({
-    observations: page.map((row) => ({
-      ...row,
-      actor: parseStoredJson(row.actor, null),
-      duration: parseStoredJson(row.duration, null),
-      usage: parseStoredJson(row.usage, null),
-      evidence: parseStoredJson(row.evidence, null),
-    })),
-    cursor: { afterSeq, nextSeq, highWaterSeq: job.lastEventSeq, hasMore: rows.results.length > limit },
-    scope: { taskId },
-    timing: {
-      runner: { startedAt: job.startedAt, finishedAt: job.finishedAt },
-      server: {
-        asOf, commissionedAt: job.createdAt,
-        workStartedAt: job.intelligenceStartedReceivedAt,
-        workFinishedAt: job.intelligenceFinishedReceivedAt,
-        queueMs: elapsedMs(job.createdAt, job.intelligenceStartedReceivedAt),
-        elapsedMs: elapsedMs(job.intelligenceStartedReceivedAt, job.intelligenceFinishedReceivedAt),
-        humanWaitMs: job.humanWaitMs + currentHumanWaitMs,
-        humanWaitStartedAt: job.humanWaitStartedReceivedAt,
-        landing: {
-          requestedAt: job.landingRequestedAt, startedAt: job.landingStartedAt,
-          finishedAt: job.landingFinishedAt,
-          durationMs: elapsedMs(job.landingRequestedAt, job.landingFinishedAt),
-        },
-        task: taskTiming ? {
-          startedAt: taskTiming.startedAt, finishedAt: taskTiming.finishedAt,
-          durationMs: elapsedMs(taskTiming.startedAt, taskTiming.finishedAt),
-        } : null,
-      },
-    },
-    partial: !['succeeded', 'partial', 'failed', 'cancelled'].includes(job.status),
-    expired: job.detailPrunedAt !== null,
-  });
+  try {
+    return c.json(await readRunnerJobActivity(
+      c.env.DB,
+      c.req.param('pid')!,
+      c.req.param('jobId')!,
+      { cursor: c.req.query('cursor'), limit, taskId: c.req.query('taskId') },
+    ));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return c.json({ error: message }, message === 'RunnerJob not found' ? 404 : 400);
+  }
 });
 
 const runnerJobIntelligenceRow = (row: Record<string, unknown> & {

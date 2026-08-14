@@ -8,6 +8,7 @@ import type { AppStore } from '../store';
 import { MonoTag, SectionLabel } from './bits';
 import { Button, Select } from './ui';
 import { MIN_TOUCH_TARGET, useViewport } from '../viewport';
+import { LineageExplorer } from './LineagePanel';
 
 const card: React.CSSProperties = {
   background: 'var(--w-025)', border: '1px solid var(--w-08)', borderRadius: 12, padding: 15, minWidth: 0,
@@ -39,6 +40,10 @@ export function IntelligenceView({ store }: { store: AppStore }) {
   const [error, setError] = useState<string | null>(null);
   const [comparisonOpen, setComparisonOpen] = useState(false);
   const [casesOpen, setCasesOpen] = useState(false);
+  const initialLineage = new URLSearchParams(location.search).get('lineage');
+  const [lineageOpen, setLineageOpen] = useState(initialLineage !== null);
+  const [lineageId, setLineageId] = useState<string | null>(initialLineage === 'all' ? null : initialLineage);
+  const [lineageNodeId, setLineageNodeId] = useState<string | null>(new URLSearchParams(location.search).get('node'));
 
   const load = async (cursor?: string) => {
     if (!pid) return;
@@ -68,11 +73,27 @@ export function IntelligenceView({ store }: { store: AppStore }) {
   };
   useEffect(() => { setPacket(null); setCases([]); setRunnerHistory(null); void load(); }, [pid, days, groupBy, scope, dimension, metric]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const navigate = (view: 'executions' | 'memory' | 'runs', params: Record<string, string | null>) => {
+  const navigate = (view: 'memory' | 'runs', params: Record<string, string | null>) => {
     const query = new URLSearchParams();
     for (const [key, value] of Object.entries(params)) if (value) query.set(key, value);
     history.pushState(null, '', `/p/${encodeURIComponent(pid)}/${view}${query.size ? `?${query}` : ''}`);
     window.dispatchEvent(new PopStateEvent('popstate'));
+  };
+  const writeLineageQuery = (orchestrationId: string | null, executionId: string | null) => {
+    const query = new URLSearchParams(location.search);
+    query.set('lineage', orchestrationId ?? 'all');
+    if (executionId) query.set('node', executionId); else query.delete('node');
+    history.replaceState(null, '', `${location.pathname}?${query}`);
+  };
+  const openLineage = (orchestrationId: string | null, executionId: string | null) => {
+    setLineageOpen(true); setLineageId(orchestrationId); setLineageNodeId(executionId);
+    writeLineageQuery(orchestrationId, executionId);
+  };
+  const closeLineage = () => {
+    setLineageOpen(false); setLineageId(null); setLineageNodeId(null);
+    const query = new URLSearchParams(location.search);
+    query.delete('lineage'); query.delete('node');
+    history.replaceState(null, '', query.size ? `${location.pathname}?${query}` : location.pathname);
   };
 
   if (loading && !packet) return <State title="Loading Project Intelligence" detail="Reading current coordination and the latest complete analytics generation…" />;
@@ -111,6 +132,24 @@ export function IntelligenceView({ store }: { store: AppStore }) {
         </label>
       </header>
 
+      {lineageOpen && <section className="intelligence-lineage" aria-label="Project lineage">
+        <div className="lineage-context-header">
+          <div><SectionLabel>Lineage</SectionLabel><div style={mono}>Canonical execution relationships and lifecycle evidence.</div></div>
+          <div style={{ flex: 1 }} />
+          <Button variant="ghost" onClick={closeLineage}>close lineage</Button>
+        </div>
+        <LineageExplorer
+          projectId={pid}
+          initialOrchestrationId={lineageId}
+          initialExecutionId={lineageNodeId}
+          onSelectionChange={(orchestrationId, executionId) => {
+            setLineageId(orchestrationId); setLineageNodeId(executionId);
+            writeLineageQuery(orchestrationId, executionId);
+          }}
+          onOpenJob={(jobId) => navigate('runs', { job: jobId, lineage: lineageId })}
+        />
+      </section>}
+
       {error && <div role="alert" style={{ ...card, borderColor: 'var(--red-soft)', marginBottom: 14 }}>{error}</div>}
       <section aria-labelledby="live-intelligence" style={{ marginBottom: 22 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
@@ -120,7 +159,7 @@ export function IntelligenceView({ store }: { store: AppStore }) {
         </div>
         <div className="intelligence-grid">
           <EvidenceCard title="Task readiness" primary={`${packet.live.readiness.readyTasks} ready`} details={`${packet.live.readiness.inProgressTasks} active · ${packet.live.readiness.blockedTasks} blocked · ${packet.live.readiness.reviewTasks} review`} />
-          <EvidenceCard title="Execution flow" primary={`${packet.live.execution.activeNodes} live nodes`} details={`${packet.live.execution.parkedNodes} parked · ${sum(packet.live.execution.runStatuses)} runs`} action={<Button variant="ghost" onClick={() => navigate('executions', {})}>Open execution tree</Button>} />
+          <EvidenceCard title="Execution flow" primary={`${packet.live.execution.activeNodes} live nodes`} details={`${packet.live.execution.parkedNodes} parked · ${sum(packet.live.execution.runStatuses)} runs`} action={<Button variant="ghost" onClick={() => openLineage(null, null)}>Open lineage</Button>} />
           <EvidenceCard title="Coordination" primary={`${packet.live.coordination.activeClaims} claims`} details={`${packet.live.coordination.activeLocks} active file locks`} />
           <EvidenceCard title="Runner capacity" primary={packet.live.runners.capacity.freeSlots == null ? 'unavailable' : `${packet.live.runners.capacity.freeSlots} free slots`} details={packet.live.runners.capacity.maxConcurrency == null ? `${packet.live.runners.capacity.reportedRunners} reporting runners` : `${packet.live.runners.capacity.busySlots} busy of ${packet.live.runners.capacity.maxConcurrency} · ${packet.live.runners.capacity.completeness}`} />
           <EvidenceCard title="Plan gates" primary={`${packet.live.plans.phaseGateStatuses.pending ?? 0} pending`} details={`${packet.live.plans.phasesWithoutGate} phases without gate · ${packet.live.plans.landings.owed} landings owed`} />
@@ -177,7 +216,7 @@ export function IntelligenceView({ store }: { store: AppStore }) {
           : <>
             {!historical.result.coverage.complete && <Coverage reasons={historical.result.coverage.reasons} />}
             {!groups.length ? <State inline title="No historical cases in this range" detail="The dashboard remains useful for live readiness and capacity while execution evidence accumulates." />
-              : <div className="intelligence-groups">{groups.map((group) => <GroupCard key={`${group.dimension}:${group.value}`} group={group} onOpen={(item) => navigate('executions', { orchestration: item.orchestrationId, execution: item.executionId })} />)}</div>}
+              : <div className="intelligence-groups">{groups.map((group) => <GroupCard key={`${group.dimension}:${group.value}`} group={group} onOpen={(item) => openLineage(item.orchestrationId, item.executionId) } />)}</div>}
           </>}
       </section>
 
@@ -203,7 +242,7 @@ export function IntelligenceView({ store }: { store: AppStore }) {
           {!cases.length ? <div style={{ padding: 18, color: 'var(--text-dim)' }}>No cases in this bounded page.</div> : cases.map((item) => { const runnerJobId = item.runId.startsWith('runner_job:') ? item.runId.split(':')[1] ?? null : null; return <div key={item.episodeId} className="intelligence-case">
             <div style={{ minWidth: 0, flex: 1 }}><b style={{ fontSize: 12 }}>{runnerJobId ? 'RunnerJob task episode' : `Run ${item.runId} · sitting ${item.sitting}`}</b><div style={{ ...mono, overflow: 'hidden', textOverflow: 'ellipsis' }}>episode {item.episodeId}{item.taskId ? ` · task ${item.taskId}` : ''}{item.planId ? ` · plan ${item.planId}` : ''}</div></div>
             {runnerJobId && <Button variant="ghost" onClick={() => navigate('runs', { job: runnerJobId })}>RunnerJob</Button>}
-            {item.orchestrationId && <Button variant="ghost" onClick={() => navigate('executions', { orchestration: item.orchestrationId, execution: item.executionId })}>Execution</Button>}
+            {item.orchestrationId && <Button variant="ghost" onClick={() => openLineage(item.orchestrationId, item.executionId)}>Lineage</Button>}
             <Button variant="ghost" onClick={() => navigate('memory', { q: item.episodeId })}>Evidence</Button>
           </div>; })}
           {nextCursor && <div style={{ padding: 12, borderTop: '1px solid var(--w-07)', textAlign: 'center' }}><Button variant="ghost" disabled={loadingMore} onClick={() => void load(nextCursor)}>{loadingMore ? 'Loading…' : 'Load more cases'}</Button></div>}

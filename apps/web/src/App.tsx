@@ -16,7 +16,6 @@ import { CommandPalette } from './components/CommandPalette';
 import { RoadmapView } from './components/RoadmapView';
 import { AgentsView } from './components/AgentsView';
 import { RunsView } from './components/RunsView';
-import { ExecutionView } from './components/ExecutionView';
 import { IntelligenceView } from './components/IntelligenceView';
 import { MemoryView } from './components/MemoryView';
 import { ModalHost } from './components/modals';
@@ -142,7 +141,6 @@ export function App() {
               {desktopOnlyView ? <DesktopOnly projectId={store.currentPid} view={desktopOnlyView} /> : <>
                 {store.view === 'control' && <MissionControl store={store} />}
                 {store.view === 'graph' && <Graph store={store} />}
-                {store.view === 'executions' && <ExecutionView store={store} />}
                 {store.view === 'intelligence' && <IntelligenceView store={store} />}
                 {store.view === 'board' && <Board store={store} />}
                 {store.view === 'plans' && <PlansView store={store} />}

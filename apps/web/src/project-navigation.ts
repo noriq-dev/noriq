@@ -34,7 +34,6 @@ export const PROJECT_NAV_GROUPS: ProjectNavigationGroup[] = [
   {
     label: 'Operate',
     items: [
-      { id: 'executions', label: 'Execution', description: 'Execution specifications' },
       { id: 'runs', label: 'Jobs', description: 'Agent-guided work and retained outcomes' },
       { id: 'agents', label: 'Agents', description: 'Live actors and lifecycle' },
       { id: 'intelligence', label: 'Intelligence', description: 'Project-level signals' },

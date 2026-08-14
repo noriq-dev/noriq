@@ -213,15 +213,19 @@ describe('RunnerJob durable intelligence projection (PLNR-510)', () => {
     expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM runner_job_intelligence_tasks WHERE job_id = ?')
       .bind(job.id).first<{ n: number }>()).toEqual({ n: 2 });
     expect(await memory._getEpisodeForTest(projectId, firstRunId, 1)).not.toBeNull();
-    const observationsResponse = await SELF.fetch(
-      `https://noriq.test/api/projects/${projectId}/runner-jobs/${job.id}/observations`,
+    const activityResponse = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/runner-jobs/${job.id}/activity`,
       { headers: { Cookie: cookie } },
     );
-    expect(await observationsResponse.json()).toMatchObject({ observations: [], expired: true });
+    const expiredActivity = await activityResponse.json() as { items: Array<Record<string, unknown>>; expired: boolean };
+    expect(expiredActivity.expired).toBe(true);
+    expect(expiredActivity.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'milestone', type: 'commissioned' }),
+    ]));
     const detailResponse = await SELF.fetch(
       `https://noriq.test/api/projects/${projectId}/runner-jobs/${job.id}`,
       { headers: { Cookie: cookie } },
     );
-    expect(await detailResponse.json()).toMatchObject({ events: [], job: { detailPrunedAt: expect.any(String) } });
+    expect(await detailResponse.json()).toMatchObject({ job: { detailPrunedAt: expect.any(String) } });
   }, 60_000);
 });
