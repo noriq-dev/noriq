@@ -14,7 +14,7 @@ import {
 import { searchBackend, indexEntity, removeEntity, type SearchKind } from '../search';
 import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
-import { MISSION_CAPABILITY, MissionCommission as MissionCommissionSchema, MissionRootCommission as MissionRootCommissionSchema, RunnerJobEvent as RunnerJobEventSchema, RunnerJobSource as RunnerJobSourceSchema, RunKind, AgentTool, RunStatus, ExecutionProfileOffer, type AcceptedRevisionHandoff, type AcceptedRevisionHandoffView, type CommissionedExecutionProfile, type MissionCommission, type MissionCommissionSnapshot, type MissionRootCommission, type RunnerJobAssignment, type RunnerJobCheckpoint, type RunnerJobEvent, type RunnerJobSource, type TaskRootMissionCommissionSnapshot, type MissionHandoffAck, type MissionHandoffConsumed, type MissionQuestionAck, type MissionQuestionAnswer, type MissionQuestionPublication, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
+import { MISSION_CAPABILITY, MissionCommission as MissionCommissionSchema, MissionRootCommission as MissionRootCommissionSchema, RunnerJobEvent as RunnerJobEventSchema, RunnerJobRevision, RunnerJobSource as RunnerJobSourceSchema, RunKind, AgentTool, RunStatus, ExecutionProfileOffer, type AcceptedRevisionHandoff, type AcceptedRevisionHandoffView, type CommissionedExecutionProfile, type MissionCommission, type MissionCommissionSnapshot, type MissionRootCommission, type RunnerJobAssignment, type RunnerJobCheckpoint, type RunnerJobEvent, type RunnerJobSource, type TaskRootMissionCommissionSnapshot, type MissionHandoffAck, type MissionHandoffConsumed, type MissionQuestionAck, type MissionQuestionAnswer, type MissionQuestionPublication, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
 import { readExecutionSpec, writeExecutionSpec } from '../lib/execution-spec';
 import {
   processPendingCopilotEpisodeJob, processPendingEpisodeJob, processPendingRunnerJobEpisodeJob,
@@ -4618,7 +4618,7 @@ export class ProjectRoom extends DurableObject<Env> {
   ): Promise<RunnerJobView> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
-      if (!/^[0-9a-f]{40,64}$/.test(input.expectedBaseRevision)) {
+      if (!RunnerJobRevision.safeParse(input.expectedBaseRevision).success) {
         throw new Error('runner repository has no valid base revision');
       }
       const project = await this.env.DB.prepare(

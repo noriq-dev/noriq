@@ -1,9 +1,9 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { api, type ApiRunner, type ApiRunnerJobObservationPage } from '../api';
+import { api, type ApiRunner, type ApiRunnerJobObservationPage, type ApiRunnerJobOutput, type ApiRunnerJobSummary } from '../api';
 import type { AppStore } from '../store';
-import { JOB_STATUS_STYLE, ObservationInspector, RUN_STATUS_STYLE, RunnerJobDispatchForm } from './RunsView';
+import { JOB_STATUS_STYLE, ObservationInspector, RUN_STATUS_STYLE, RunnerJobDispatchForm, RunnerJobOutputSummary } from './RunsView';
 
 let container: HTMLDivElement;
 let root: Root | null = null;
@@ -60,6 +60,31 @@ describe('RunnerJob status presentation (PLNR-501)', () => {
   it('keeps partial output distinct from both success and failure', () => {
     expect(JOB_STATUS_STYLE.partial).not.toEqual(JOB_STATUS_STYLE.succeeded);
     expect(JOB_STATUS_STYLE.partial).not.toEqual(JOB_STATUS_STYLE.failed);
+  });
+});
+
+describe('RunnerJob VCS-neutral output presentation (PLNR-504)', () => {
+  it('labels opaque revisions and retained locations without Git-only terms', () => {
+    const output = {
+      workspaceMode: 'isolated',
+      retainedLocation: { vcs: 'perforce', label: 'shelf 184206', url: null },
+      baseRevision: '//depot/noriq/main@184205', headRevision: 'shelf:184206',
+      acceptedTaskCheckpoints: {}, checks: [], findings: [],
+      usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0, costUsd: null, calls: 0 },
+      summary: 'Retained for review', dirtyPaths: [],
+    } satisfies ApiRunnerJobOutput;
+    const job = {
+      landingStatus: 'retained', landingPolicy: 'retain', landingTarget: null, landingError: null,
+    } as ApiRunnerJobSummary;
+    container = document.createElement('div'); document.body.appendChild(container); root = createRoot(container);
+    act(() => root!.render(<RunnerJobOutputSummary output={output} job={job} />));
+
+    expect(container.textContent).toContain('perforce');
+    expect(container.textContent).toContain('shelf 184206');
+    expect(container.textContent).toContain('base revision');
+    expect(container.textContent).toContain('head revision');
+    expect(container.textContent).not.toContain('branch');
+    expect(container.textContent).not.toContain('commit');
   });
 });
 

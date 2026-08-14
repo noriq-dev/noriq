@@ -85,7 +85,7 @@ import {
   RunnerExecutionDeclaration, RunnerExecutionEventReport, RunnerExecutionReconciliation,
   RunnerExecutionRelationReport, isTerminalRunStatus, normalizeProjectKey,
   IndexGenerationManifest, ContextPackRole, RunnerSpinoffTaskRequest, type RunnerIndexCursor,
-  RunnerJobDispatch,
+  RunnerJobDispatch, RunnerJobRevision,
 } from '@noriq-dev/shared';
 import { auditAuthorizationParity, reconcileLegacyGroupGrants } from './lib/authorization-parity';
 import { evaluateMemoryAcceptance } from './memory/acceptance';
@@ -4278,10 +4278,11 @@ async function resolveRunnerJobRepository(
     (candidate.repoRef === repoRef || candidate.id === repoRef) && candidate.projectId === projectId,
   );
   if (!repository) return c.json({ error: 'repoRef does not resolve to this project' }, 400);
-  if (!repository.baseRevision || !/^[0-9a-f]{40,64}$/.test(repository.baseRevision)) {
+  const baseRevision = RunnerJobRevision.safeParse(repository.baseRevision);
+  if (!baseRevision.success) {
     return c.json({ error: 'runner must reconnect with protocol v2 and advertise a base revision' }, 409);
   }
-  return { baseRevision: repository.baseRevision };
+  return { baseRevision: baseRevision.data };
 }
 
 async function dispatchRunnerJob(

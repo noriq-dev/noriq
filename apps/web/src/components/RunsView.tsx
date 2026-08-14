@@ -1,6 +1,6 @@
 // Runner Jobs — the minimal protocol-v2 control-plane surface. Noriq chooses only
 // the immutable task/plan target and a runner repository; the committed project
-// configuration remains the authority for models, workflows, budgets, and Git mode.
+// configuration remains the authority for models, workflows, budgets, and source control.
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
@@ -125,7 +125,7 @@ export function RunsView({ store }: { store: AppStore }) {
             <div>
               <SectionLabel>Runner jobs · {liveCount} live</SectionLabel>
               <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 4 }}>
-                Dispatch a task or plan. Agent routing, limits, checks, and Git behavior come from the repository.
+                Dispatch a task or plan. Agent routing, limits, checks, and source-control behavior come from the repository.
               </div>
             </div>
             <div style={{ flex: 1 }} />
@@ -169,7 +169,7 @@ export function RunsView({ store }: { store: AppStore }) {
                 projectId={pid}
                 onRefresh={load}
                 onCancel={async () => {
-                  if (!(await confirm('Cancel this Runner job? Accepted commits remain on its local output branch.'))) return;
+                  if (!(await confirm('Cancel this Runner job? Accepted checkpoints remain at the retained output location.'))) return;
                   await api.cancelRunnerJob(pid, detail.job.id);
                   await load();
                 }}
@@ -181,7 +181,7 @@ export function RunsView({ store }: { store: AppStore }) {
                 }}
               />
             ) : (
-              <EmptyState>select a job to inspect its evidence and retained Git result</EmptyState>
+              <EmptyState>select a job to inspect its evidence and retained output</EmptyState>
             )}
           </div>
         </section>
@@ -383,7 +383,7 @@ function JobDetail({ detail, projectId, onRefresh, onCancel, onLand }: {
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
               <MonoTag color="var(--text-mid)" bg="var(--w-06)" size={9}>{item.status}</MonoTag>
               <strong style={{ fontSize: 12 }}>{item.taskKey}</strong>
-              {item.checkpointRef && <code style={{ fontSize: 10 }}>{shortRevision(item.checkpointRef)}</code>}
+              {item.checkpointRef && <code aria-label="checkpoint" style={{ fontSize: 10 }}>{shortRevision(item.checkpointRef)}</code>}
             </div>
             {item.summary && <div style={{ fontSize: 11.5, color: 'var(--text-dim)', marginTop: 5 }}>{item.summary}</div>}
             {item.projectionConflict && <div style={{ color: '#f5a623', fontSize: 11, marginTop: 5 }}>Task status changed by a human; Runner projection was not applied.</div>}
@@ -396,7 +396,7 @@ function JobDetail({ detail, projectId, onRefresh, onCancel, onLand }: {
         items={items}
         terminal={TERMINAL_JOBS.includes(job.status)}
       />
-      {output && <Output output={output} job={job} />}
+      {output && <RunnerJobOutputSummary output={output} job={job} />}
     </div>
   );
 }
@@ -638,7 +638,7 @@ function Question({ projectId, pid: jobId, question, onAnswered }: { projectId: 
   );
 }
 
-function Output({ output, job }: { output: ApiRunnerJobOutput; job: ApiRunnerJobSummary }) {
+export function RunnerJobOutputSummary({ output, job }: { output: ApiRunnerJobOutput; job: ApiRunnerJobSummary }) {
   const landingMessage = job.landingStatus === 'landed'
     ? `Runner landed this reviewed output into ${job.landingTarget ?? 'the configured target'}.`
     : job.landingStatus === 'failed'
@@ -648,8 +648,8 @@ function Output({ output, job }: { output: ApiRunnerJobOutput; job: ApiRunnerJob
         : job.landingPolicy === 'auto'
           ? `Runner is configured to land successful reviewed output automatically into ${job.landingTarget ?? 'the configured target'}.`
           : output.workspaceMode === 'direct'
-            ? 'Runner committed accepted work directly to the configured target.'
-            : 'Human merge required. Runner retained this work locally and will not integrate it automatically.';
+            ? 'Runner applied accepted work directly to the configured target.'
+            : 'Human integration required. Runner retained this work and will not integrate it automatically.';
   return (
     <Section title="Retained output">
       <div style={{ padding: 11, borderRadius: 8, background: 'rgba(76,157,255,.06)', border: '1px solid rgba(76,157,255,.18)', fontSize: 11.5, lineHeight: 1.55 }}>
@@ -659,8 +659,8 @@ function Output({ output, job }: { output: ApiRunnerJobOutput; job: ApiRunnerJob
         <dt>mode</dt><dd>{output.workspaceMode}</dd>
         <dt>VCS</dt><dd>{output.retainedLocation.vcs}</dd>
         <dt>location</dt><dd style={{ overflowWrap: 'anywhere' }}>{output.retainedLocation.url ? <a href={output.retainedLocation.url}>{output.retainedLocation.label}</a> : output.retainedLocation.label}</dd>
-        <dt>base</dt><dd>{shortRevision(output.baseRevision)}</dd>
-        <dt>head</dt><dd>{shortRevision(output.headRevision)}</dd>
+        <dt>base revision</dt><dd>{shortRevision(output.baseRevision)}</dd>
+        <dt>head revision</dt><dd>{shortRevision(output.headRevision)}</dd>
       </dl>
       <div style={{ fontSize: 11.5, color: 'var(--text-dim)', lineHeight: 1.55 }}>{output.summary}</div>
       <div style={{ marginTop: 9, fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>

@@ -25,7 +25,7 @@ describe('RunnerJob protocol v2 (PLNR-499)', () => {
   let runnerId: string;
   const repoRef = `repo-job-${crypto.randomUUID()}`;
   const repositoryKey = `runner-job-${crypto.randomUUID()}`;
-  const baseRevision = 'b'.repeat(40);
+  const baseRevision = '//depot/noriq/main@184205';
 
   beforeAll(async () => {
     await createUser('runner-job-ws@example.com', 'Runner Job WS', 'longenough1', 'member').catch(() => {});
@@ -56,7 +56,7 @@ describe('RunnerJob protocol v2 (PLNR-499)', () => {
     ws.accept();
     ws.send(JSON.stringify({
       type: 'hello', protocolVersion: 2, runnerId, capacity: 2,
-      repositories: [{ repositoryKey, repoRef, vcs: 'git', baseRevision }],
+      repositories: [{ repositoryKey, repoRef, vcs: 'perforce', baseRevision }],
     }));
     return ws;
   }

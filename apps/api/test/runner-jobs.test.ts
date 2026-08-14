@@ -50,6 +50,31 @@ beforeAll(async () => {
 }, 60_000);
 
 describe('RunnerJob commissioning (PLNR-498)', () => {
+  it('accepts opaque non-Git revisions and checkpoints (PLNR-504)', async () => {
+    const response = await SELF.fetch('https://noriq.test/api/projects', {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: `VN${crypto.randomUUID().slice(0, 6).toUpperCase()}`, name: 'VCS-neutral runner job' }),
+    });
+    const projectId = ((await response.json()) as { id: string }).id;
+    const isolatedRoom = projectRoom<RoomRpc>(projectId);
+    const task = await isolatedRoom.createTask(projectId, SYSTEM_ACTOR as Actor, { title: 'Perforce checkpoint' });
+    const baseRevision = '//depot/noriq/main@184205';
+    const job = await isolatedRoom.createRunnerJob(projectId, SYSTEM_ACTOR as Actor, {
+      source: { kind: 'task', id: task.id }, runnerId, repoRef: 'perforce-workspace', expectedBaseRevision: baseRevision,
+    });
+    expect(RunnerJobAssignment.parse(job.assignment).expectedBaseRevision).toBe(baseRevision);
+
+    expect(await isolatedRoom.assignRunnerJob(projectId, job.id, runnerId)).toMatchObject({ assignmentId: job.assignmentId });
+    expect(await isolatedRoom.acceptRunnerJob(projectId, job.id, runnerId, job.assignmentId)).toBe(true);
+    const checkpoint = { ref: 'shelf:184206', label: 'shelf 184206', url: null };
+    expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 1, {
+      type: 'task.result', at: new Date().toISOString(), taskId: task.id, status: 'accepted',
+      checkpoint, summary: 'shelved', findings: [],
+    })).toMatchObject({ accepted: true, ack: 1 });
+    expect(await env.DB.prepare('SELECT checkpoint_ref AS checkpointRef FROM runner_job_items WHERE job_id = ?')
+      .bind(job.id).first()).toEqual({ checkpointRef: checkpoint.ref });
+  });
+
   it('hard-cuts legacy write endpoints while retaining historical reads (PLNR-502)', async () => {
     const headers = { Cookie: cookie, 'Content-Type': 'application/json' };
     for (const [path, body] of [
