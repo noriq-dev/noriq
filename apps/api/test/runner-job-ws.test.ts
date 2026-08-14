@@ -40,6 +40,16 @@ function expectNoFrame(ws: WebSocket, predicate: (message: any) => boolean, time
   });
 }
 
+function nextClose(ws: WebSocket, timeoutMs = 3_000): Promise<CloseEvent> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('close timeout')), timeoutMs);
+    ws.addEventListener('close', (event) => {
+      clearTimeout(timer);
+      resolve(event);
+    }, { once: true });
+  });
+}
+
 async function catalogDigest(repositories: RunnerJobRuntimeRepository[]): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(runnerCatalogCanonicalJson(repositories)));
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
@@ -186,6 +196,64 @@ describe('RunnerJob protocol v2 (PLNR-499)', () => {
     const job = (await response.json() as { job: { id: string } }).job;
     expect(await env.DB.prepare('SELECT status FROM runner_jobs WHERE id = ?').bind(job.id).first<{ status: string }>())
       .toEqual({ status: 'queued' });
+  });
+
+  it('serializes an immediate catalog frame behind its v2 hello and rejects an unnegotiated socket (PLNR-522)', async () => {
+    const projectKey = (await env.DB.prepare('SELECT key FROM projects WHERE id = ?')
+      .bind(pid).first<{ key: string }>())!.key;
+    const catalogRef = `catalog-race-${crypto.randomUUID()}`;
+    const catalogKey = `catalog-race-key-${crypto.randomUUID()}`;
+    const registration = await SELF.fetch('https://noriq.test/api/runners', {
+      method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        label: 'catalog-race', maxConcurrency: 1,
+        protocolCapabilities: ['runner-job.v2', RUNNER_CATALOG_CAPABILITY],
+        repos: [{ id: catalogRef, projectKey, repositoryKey: catalogKey }],
+      }),
+    });
+    expect(registration.status).toBe(200);
+    const catalogRunnerId = ((await registration.json()) as { runner: { id: string } }).runner.id;
+
+    // Widen the hello handler's pre-negotiation D1 read without changing its registered
+    // capabilities. The next wire frame must remain behind hello for the whole delayed turn.
+    const stored = await env.DB.prepare('SELECT capabilities FROM runners WHERE id = ?')
+      .bind(catalogRunnerId).first<{ capabilities: string }>();
+    await env.DB.prepare('UPDATE runners SET capabilities = ? WHERE id = ?').bind(JSON.stringify({
+      ...JSON.parse(stored!.capabilities), helloReadPadding: 'x'.repeat(512_000),
+    }), catalogRunnerId).run();
+
+    const repositories: RunnerJobRuntimeRepository[] = [{
+      repositoryKey: catalogKey, repoRef: catalogRef, vcs: 'git', baseRevision: 'a'.repeat(40),
+    }];
+    const digest = await catalogDigest(repositories);
+    const response = await SELF.fetch(`https://noriq.test/ws/runner/${catalogRunnerId}`, {
+      headers: { Upgrade: 'websocket', Authorization: `Bearer ${token}` },
+    });
+    expect(response.status).toBe(101);
+    const ws = response.webSocket!;
+    ws.accept();
+    const acknowledged = nextFrame(ws, (message) => message.type === 'catalog.ack');
+    ws.send(JSON.stringify({
+      type: 'hello', protocolVersion: 2, runnerId: catalogRunnerId, capacity: 1, repositories,
+    }));
+    ws.send(JSON.stringify({
+      type: 'catalog.update', catalog: { generation: 1, digest, repositories },
+    }));
+    expect(await acknowledged).toMatchObject({
+      accepted: true, generation: 1, digest, dispatchableRepoRefs: [catalogRef], error: null,
+    });
+    ws.close();
+
+    const rawResponse = await SELF.fetch(`https://noriq.test/ws/runner/${catalogRunnerId}`, {
+      headers: { Upgrade: 'websocket', Authorization: `Bearer ${token}` },
+    });
+    const raw = rawResponse.webSocket!;
+    raw.accept();
+    const closed = nextClose(raw);
+    raw.send(JSON.stringify({
+      type: 'catalog.update', catalog: { generation: 2, digest, repositories },
+    }));
+    await expect(closed).resolves.toMatchObject({ code: 1002, reason: 'protocol v2 hello required' });
   });
 
   it('negotiates monotonic live checkout catalogs without replaying assignments', async () => {

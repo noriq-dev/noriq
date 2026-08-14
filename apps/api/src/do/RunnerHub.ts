@@ -63,6 +63,9 @@ type StoredRunnerCapabilities = Record<string, unknown> & {
 
 export class RunnerHub extends DurableObject<Env> {
   private _runnerId?: string;
+  /** Cloudflare may dispatch a later frame while an earlier handler is awaiting D1. Preserve
+   * WebSocket wire order per peer without blocking unrelated Runner sockets in this hub. */
+  private readonly socketMessageTails = new WeakMap<WebSocket, Promise<void>>();
 
   private async setRunnerId(id: string) {
     if (this._runnerId === id) return;
@@ -206,6 +209,17 @@ export class RunnerHub extends DurableObject<Env> {
 
   override async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string) {
     if (typeof message !== 'string') return;
+    const previous = this.socketMessageTails.get(ws) ?? Promise.resolve();
+    const current = previous.then(() => this.processWebSocketMessage(ws, message));
+    this.socketMessageTails.set(ws, current);
+    try {
+      await current;
+    } finally {
+      if (this.socketMessageTails.get(ws) === current) this.socketMessageTails.delete(ws);
+    }
+  }
+
+  private async processWebSocketMessage(ws: WebSocket, message: string): Promise<void> {
     const runnerId = await this.loadRunnerId();
     if (!runnerId) return;
     const auth = await this.authorizeSocket(ws);
@@ -674,6 +688,7 @@ export class RunnerHub extends DurableObject<Env> {
   }
 
   override async webSocketClose(ws: WebSocket) {
+    this.socketMessageTails.delete(ws);
     ws.close();
   }
 
