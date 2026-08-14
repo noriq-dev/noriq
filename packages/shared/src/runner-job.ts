@@ -164,7 +164,7 @@ export const RunnerJobObservationActor = z.object({
 }).strict();
 export type RunnerJobObservationActor = z.infer<typeof RunnerJobObservationActor>;
 
-export const RunnerJobRouteSize = z.enum(['small', 'medium', 'large']);
+export const RunnerJobRouteSize = z.enum(['tiny', 'small', 'medium', 'large']);
 export type RunnerJobRouteSize = z.infer<typeof RunnerJobRouteSize>;
 
 export const RunnerJobRouteRisk = z.enum(['low', 'medium', 'high']);

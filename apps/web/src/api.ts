@@ -961,7 +961,7 @@ export interface ApiRunnerJobObservationActor {
 }
 export interface ApiRunnerJobAgentRoute {
   taskId: string; role: string; attempt: number; policyVersion: string;
-  size: 'small' | 'medium' | 'large'; risk: 'low' | 'medium' | 'high';
+  size: 'tiny' | 'small' | 'medium' | 'large'; risk: 'low' | 'medium' | 'high';
   specCoverage: 'none' | 'partial' | 'complete'; reasons: string[];
   candidateCount: number; eligibleCount: number; actor: ApiRunnerJobObservationActor | null;
   decision: 'invoke' | 'skip';

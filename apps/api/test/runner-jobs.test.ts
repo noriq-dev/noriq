@@ -334,15 +334,17 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
       kind: 'agent' as const, driver: 'codex', vendor: 'openai', model: 'gpt-5.6-codex',
       effort: 'high', role: 'build', operation: 'invoke',
     };
-    expect(RunnerJobEvent.parse({
-      type: 'agent.route', at,
-      route: {
-        taskId: 'task_1', role: 'build', attempt: 1, policyVersion: 'adaptive-v1',
-        size: 'medium', risk: 'high', specCoverage: 'complete',
-        reasons: ['risk.high', 'spec.complete'], candidateCount: 3, eligibleCount: 2,
-        actor, decision: 'invoke',
-      },
-    })).toMatchObject({ type: 'agent.route', route: { decision: 'invoke', actor } });
+    for (const size of ['tiny', 'small', 'medium', 'large'] as const) {
+      expect(RunnerJobEvent.parse({
+        type: 'agent.route', at,
+        route: {
+          taskId: 'task_1', role: 'build', attempt: 1, policyVersion: 'adaptive-v1',
+          size, risk: 'high', specCoverage: 'complete',
+          reasons: ['risk.high', 'spec.complete'], candidateCount: 3, eligibleCount: 2,
+          actor, decision: 'invoke',
+        },
+      })).toMatchObject({ type: 'agent.route', route: { size, decision: 'invoke', actor } });
+    }
     expect(RunnerJobEvent.parse({
       type: 'progress', at, taskId: 'task_1', phase: 'building', message: 'building', progress: 0.5,
     })).toMatchObject({ taskId: 'task_1' });

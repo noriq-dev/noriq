@@ -241,7 +241,7 @@ describe('RunnerJob durable intelligence projection (PLNR-510)', () => {
       type: 'agent.route', at,
       route: {
         taskId: task.id, role: 'build', attempt: 1, policyVersion: 'adaptive-v1',
-        size: 'medium', risk: 'high', specCoverage: 'complete',
+        size: 'tiny', risk: 'high', specCoverage: 'complete',
         reasons: ['risk.high'], candidateCount: 2, eligibleCount: 1,
         actor, decision: 'invoke',
       },
@@ -324,7 +324,7 @@ describe('RunnerJob durable intelligence projection (PLNR-510)', () => {
       routes: [{ policyVersion: 'adaptive-v1', actor: { model: 'gpt-test' } }],
       build: {
         facts: [{
-          route: { size: 'medium', risk: 'high', specCoverage: 'complete' },
+          route: { size: 'tiny', risk: 'high', specCoverage: 'complete' },
           costBasis: { kind: 'api_list_estimate', priceSource: { stale: true, ageSeconds: 7_200 } },
           costUsd: { status: 'partial', value: 0.125, provenance: 'derived' },
         }],
@@ -341,7 +341,7 @@ describe('RunnerJob durable intelligence projection (PLNR-510)', () => {
     expect(episode.intelligence.execution.stages).toEqual(expect.arrayContaining([
       expect.objectContaining({
         actor: expect.objectContaining({ model: 'gpt-test', effort: 'medium' }),
-        route: expect.objectContaining({ policyVersion: 'adaptive-v1', size: 'medium', risk: 'high' }),
+        route: expect.objectContaining({ policyVersion: 'adaptive-v1', size: 'tiny', risk: 'high' }),
         costBasis: expect.objectContaining({ kind: 'api_list_estimate' }),
         costUSD: expect.objectContaining({ status: 'partial', value: 0.125, provenance: 'derived' }),
       }),

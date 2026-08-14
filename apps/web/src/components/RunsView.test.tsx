@@ -257,7 +257,7 @@ describe('RunnerJob activity timeline', () => {
   it('labels adaptive routes and reported, estimated, stale, and unavailable cost truthfully', async () => {
     const route = {
       taskId: 'task_1', role: 'build', attempt: 1, policyVersion: 'adaptive-v2',
-      size: 'medium' as const, risk: 'high' as const, specCoverage: 'complete' as const,
+      size: 'tiny' as const, risk: 'high' as const, specCoverage: 'complete' as const,
       reasons: ['risk.high'], candidateCount: 2, eligibleCount: 1, decision: 'invoke' as const,
       actor: {
         kind: 'agent' as const, driver: 'codex', vendor: 'openai', model: 'gpt-5.6-codex',
@@ -337,7 +337,7 @@ describe('RunnerJob activity timeline', () => {
       act(() => stage.querySelector<HTMLButtonElement>('button')!.click());
     }
 
-    expect(container.textContent).toContain('gpt-5.6-codex · high · medium · high risk · complete spec · adaptive-v2');
+    expect(container.textContent).toContain('gpt-5.6-codex · high · tiny · high risk · complete spec · adaptive-v2');
     expect(container.textContent).toContain('RUN-1 · building 40%');
     expect(container.textContent).toContain('≈$0.1250 API-list estimate');
     expect(container.textContent).toContain('openai official-api-list · 2h old · stale · partial');
