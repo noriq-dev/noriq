@@ -249,6 +249,37 @@ describe('collision and bottleneck evidence (PLNR-296)', () => {
     expect(result.coverage.reasons).not.toContain('runner_capacity_unknown');
   });
 
+  it('reports canonical wire statuses while keeping failed work ready for retry (PLNR-514)', async () => {
+    const projectId = await project('BTWIRE', 'Bottleneck wire status');
+    const failed = await task(projectId, 'retry failed work');
+    const todo = await task(projectId, 'fresh todo work');
+    const proposed = await task(projectId, 'proposed work');
+    const review = await task(projectId, 'review work');
+    const done = await task(projectId, 'done work');
+    await appEnv.DB.batch([
+      appEnv.DB.prepare("UPDATE tasks SET failed_at = ? WHERE id = ? AND status = 'todo'").bind(observedAt, failed.id),
+      appEnv.DB.prepare("UPDATE tasks SET proposed_at = ? WHERE id = ? AND status = 'todo'").bind(observedAt, proposed.id),
+      appEnv.DB.prepare("UPDATE tasks SET status = 'review' WHERE id = ?").bind(review.id),
+      appEnv.DB.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").bind(done.id),
+    ]);
+
+    const result = await assessProjectBottlenecks(appEnv, projectId, {
+      taskId: done.id, executorMode: 'copilot', observedAt,
+    });
+    const readiness = new Map(result.readiness.tasks.map((item) => [item.taskId, item]));
+    expect(readiness.get(failed.id)).toMatchObject({
+      status: 'failed', primary: 'ready', claimability: { claimable: true, reasonCode: 'claimable' },
+      reason: expect.stringMatching(/failed work is ready for retry/),
+    });
+    expect(readiness.get(todo.id)).toMatchObject({ status: 'todo', primary: 'ready' });
+    expect(readiness.get(todo.id)?.reason).not.toMatch(/retry/);
+    expect(readiness.get(proposed.id)).toMatchObject({ status: 'proposed', primary: 'approval' });
+    expect(readiness.get(review.id)).toMatchObject({ status: 'review', primary: 'approval' });
+    expect(readiness.get(done.id)).toMatchObject({ status: 'done', primary: 'unknown' });
+    expect(await appEnv.DB.prepare('SELECT status, failed_at AS failedAt FROM tasks WHERE id = ?')
+      .bind(failed.id).first()).toEqual({ status: 'todo', failedAt: observedAt });
+  });
+
   it('counts a continued run once while identifying only blocking input requests as human blocks', async () => {
     const projectId = await project('BTLINE', 'Bottleneck execution lineage');
     const parkedTask = await task(projectId, 'waiting for explicit input');

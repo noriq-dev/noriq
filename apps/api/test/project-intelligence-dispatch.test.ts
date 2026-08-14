@@ -16,6 +16,30 @@ let owner: { apiKey: string };
 beforeAll(async () => { owner = await createAgent('dispatch-intelligence'); }, 60_000);
 
 describe('dispatch-time Project Intelligence (PLNR-303)', () => {
+  it('preserves derived failed status and retry readiness in the full packet (PLNR-514)', async () => {
+    const projectId = (await mcpCall(owner.apiKey, 'create_project', {
+      key: 'PIFAIL', name: 'Failed dispatch intelligence',
+    })).body.id as string;
+    const taskId = (await mcpCall(owner.apiKey, 'create_task', {
+      projectId, title: 'Retry through an IDE Copilot', tags: ['analytics-test'],
+    })).body.id as string;
+    const failedAt = '2026-08-14T00:00:00.000Z';
+    await appEnv.DB.prepare("UPDATE tasks SET failed_at = ? WHERE id = ? AND status = 'todo'")
+      .bind(failedAt, taskId).run();
+
+    const full = await mcpCall(owner.apiKey, 'get_task_intelligence', {
+      projectId, taskId, executorMode: 'copilot',
+    });
+    expect(full.isError).toBe(false);
+    expect(full.body.current.readiness).toMatchObject({
+      taskId, status: 'failed', primary: 'ready',
+      claimability: { claimable: true, reasonCode: 'claimable' },
+      reason: expect.stringMatching(/failed work is ready for retry/),
+    });
+    expect(await appEnv.DB.prepare('SELECT status, failed_at AS failedAt FROM tasks WHERE id = ?')
+      .bind(taskId).first()).toEqual({ status: 'todo', failedAt });
+  });
+
   it('serves a validated executor-aware packet and bounded summary to MCP Copilots', async () => {
     const projectId = (await mcpCall(owner.apiKey, 'create_project', {
       key: 'PICOP', name: 'Copilot intelligence',

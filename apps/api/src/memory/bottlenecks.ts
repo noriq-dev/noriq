@@ -5,6 +5,7 @@ import { analyticsSourceWatermarks } from './analytics';
 import {
   projectTaskClaimability, taskClaimability, type Claimability, type ClaimabilityReason,
 } from '../lib/claimability';
+import { taskWireStatus } from '../lib/visibility';
 import { readExecutionSpec } from '../lib/execution-spec';
 import {
   branchScopesOverlap, normalizePattern, patternsOverlap, type NormalizedPattern,
@@ -43,6 +44,8 @@ type TaskRow = {
   title: string;
   body: string | null;
   status: string;
+  failedAt: string | null;
+  proposedAt: string | null;
   claimedBy: string | null;
   executionSpec: string | null;
   updatedAt: string;
@@ -275,14 +278,21 @@ function primaryClassification(input: {
   if (executorMode !== 'runner') {
     return {
       primary: 'ready',
-      reason: executorMode === 'copilot'
-        ? 'shared claimability passes for the active Copilot executor; Runner capacity is not applicable'
-        : 'shared claimability passes for the human executor; Runner capacity is not applicable',
+      reason: task.status === 'failed'
+        ? `failed work is ready for retry by the ${executorMode === 'copilot' ? 'active Copilot' : 'human'} executor; Runner capacity is not applicable`
+        : executorMode === 'copilot'
+          ? 'shared claimability passes for the active Copilot executor; Runner capacity is not applicable'
+          : 'shared claimability passes for the human executor; Runner capacity is not applicable',
     };
   }
   if (!capacityKnown) return { primary: 'unknown', reason: 'Runner capacity is unavailable; zero capacity was not inferred' };
   if (availableSlots === 0) return { primary: 'runner_capacity', reason: 'the task is claimable and live capable Runners have no derived free slot' };
-  return { primary: 'ready', reason: 'shared claimability passes and a live capable Runner slot is available' };
+  return {
+    primary: 'ready',
+    reason: task.status === 'failed'
+      ? 'failed work is ready for retry and a live capable Runner slot is available'
+      : 'shared claimability passes and a live capable Runner slot is available',
+  };
 }
 
 function capacityFacts(
@@ -421,12 +431,14 @@ export async function assessProjectBottlenecks(
   let focusTaskRow: TaskRow | null = null;
   if (focusTaskId && !claimabilityItems.some((item) => item.id === focusTaskId)) {
     const focus = await env.DB.prepare(
-      `SELECT id, key, title, body, status, claimed_by AS claimedBy,
-              execution_spec AS executionSpec, updated_at AS updatedAt, proposed_at AS proposedAt
-         FROM tasks WHERE id = ? AND project_id = ?`,
+      `SELECT t.id, t.key, t.title, t.body, ${taskWireStatus('t')} AS status,
+              t.claimed_by AS claimedBy, t.execution_spec AS executionSpec,
+              t.updated_at AS updatedAt, t.failed_at AS failedAt, t.proposed_at AS proposedAt
+         FROM tasks t WHERE t.id = ? AND t.project_id = ?`,
     ).bind(focusTaskId, projectId).first<{
       id: string; key: string; title: string; body: string | null; status: string;
-      claimedBy: string | null; executionSpec: string | null; updatedAt: string; proposedAt: string | null;
+      claimedBy: string | null; executionSpec: string | null; updatedAt: string;
+      failedAt: string | null; proposedAt: string | null;
     }>();
     if (!focus) throw new Error(`task ${focusTaskId} not found in project ${projectId}`);
     // The project-wide inventory intentionally stays bounded to open tasks. An explicitly
@@ -446,8 +458,10 @@ export async function assessProjectBottlenecks(
     env.DB.prepare('SELECT key, file_locking_enabled AS fileLockingEnabled FROM projects WHERE id = ?')
       .bind(projectId).first<{ key: string; fileLockingEnabled: number }>(),
     boundedTaskIds.length ? env.DB.prepare(
-      `SELECT id, key, title, body, status, claimed_by AS claimedBy, execution_spec AS executionSpec, updated_at AS updatedAt
-         FROM tasks WHERE id IN (${ids})`,
+      `SELECT t.id, t.key, t.title, t.body, ${taskWireStatus('t')} AS status,
+              t.claimed_by AS claimedBy, t.execution_spec AS executionSpec,
+              t.updated_at AS updatedAt, t.failed_at AS failedAt, t.proposed_at AS proposedAt
+         FROM tasks t WHERE t.id IN (${ids})`,
     ).bind(...boundedTaskIds).all<TaskRow>() : Promise.resolve({ results: [] as TaskRow[] }),
     env.DB.prepare(
       `SELECT r.id, CASE WHEN r.anchor_type = 'task' THEN r.anchor_id END AS taskId,
