@@ -1,6 +1,6 @@
 import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { RunnerJobAssignment, RunnerJobSource } from '@noriq-dev/shared';
+import { RunnerJobAssignment, RunnerJobEvent, RunnerJobSource } from '@noriq-dev/shared';
 import type { Actor, CreateRunnerJobInput, RunnerJobView } from '../src/do/ProjectRoom';
 import { createUser, loginSession, projectRoom, SYSTEM_ACTOR } from './helpers';
 
@@ -12,6 +12,9 @@ interface RoomRpc {
   recordRunnerJobEvent(projectId: string, jobId: string, runnerId: string, assignmentId: string, seq: number, event: unknown): Promise<{ accepted: boolean; ack: number; error: string | null }>;
   requestRunnerJobLanding(projectId: string, actor: Actor, jobId: string): Promise<{
     runnerId: string; assignmentId: string; requestId: string | null; target: string | null; terminal: boolean;
+  }>;
+  answerRunnerJobQuestion(projectId: string, actor: Actor, jobId: string, questionId: string, answer: string): Promise<{
+    runnerId: string; assignmentId: string; answer: string;
   }>;
   recordRunnerJobLandingResult(
     projectId: string, jobId: string, runnerId: string, assignmentId: string, requestId: string,
@@ -149,6 +152,115 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
       kind: 'plan', projectId: 'p', projectKey: 'P', planId: 'x', planKey: 'x', planTitle: 'x',
       tasks: Array.from({ length: 501 }, (_, index) => ({ taskId: `t${index}`, key: `P-${index}`, title: 't', body: '', executionSpec: null, status: 'todo', retry: false, order: index, phaseOrder: 0 })), dependencies: [],
     })).toThrow();
+    expect(() => RunnerJobEvent.parse({
+      type: 'stage.finished', at: new Date().toISOString(), startedAt: new Date().toISOString(),
+      observationId: 'obs_bad_unknown', taskId: null, stage: 'build', attempt: 1,
+      actor: { kind: 'agent', driver: 'codex', vendor: 'openai', model: null, effort: null, role: 'build', operation: 'invoke' },
+      outcome: 'succeeded', durationMs: 1, recovery: 'none',
+      usage: {
+        inputTokens: { status: 'unavailable', value: 0, provenance: 'not_reported' },
+        outputTokens: { status: 'unavailable', value: null, provenance: 'not_reported' },
+        cacheReadTokens: { status: 'unavailable', value: null, provenance: 'not_reported' },
+        cacheWriteTokens: { status: 'unavailable', value: null, provenance: 'not_reported' },
+        calls: { status: 'complete', value: 1, provenance: 'driver_reported' },
+        costUsd: { status: 'unavailable', value: null, provenance: 'not_reported' },
+      },
+      evidence: {
+        operationDigest: null, resultDigest: null, exitCode: null, timedOut: null,
+        changedPathCount: null, blockerFindings: null, majorFindings: null,
+        minorFindings: null, checkpointRef: null, errorCode: null,
+      },
+    })).toThrow();
+  });
+
+  it('reduces bounded stage observations atomically and exposes a task-filtered cursor', async () => {
+    const response = await SELF.fetch('https://noriq.test/api/projects', {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: `RI${crypto.randomUUID().slice(0, 6).toUpperCase()}`, name: 'runner intelligence' }),
+    });
+    const projectId = ((await response.json()) as { id: string }).id;
+    const isolatedRoom = projectRoom<RoomRpc>(projectId);
+    const task = await isolatedRoom.createTask(projectId, SYSTEM_ACTOR as Actor, { title: 'Observed build' });
+    const job = await isolatedRoom.createRunnerJob(projectId, SYSTEM_ACTOR as Actor, {
+      source: { kind: 'task', id: task.id }, runnerId, repoRef: 'repo', expectedBaseRevision: revision,
+    });
+    await isolatedRoom.assignRunnerJob(projectId, job.id, runnerId);
+    await isolatedRoom.acceptRunnerJob(projectId, job.id, runnerId, job.assignmentId);
+    const startedAt = '2026-08-13T01:00:00.000Z';
+    const finishedAt = '2026-08-13T01:00:02.500Z';
+    const actor = {
+      kind: 'agent' as const, driver: 'codex', vendor: 'openai', model: 'gpt-test',
+      effort: 'medium', role: 'build', operation: 'invoke',
+    };
+    expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 1, {
+      type: 'job.context', at: startedAt, vcs: 'git', workspaceMode: 'isolated',
+      landingPolicy: 'manual', agents: [{ role: 'build', driver: 'codex', vendor: 'openai', model: 'gpt-test', effort: 'medium' }],
+    })).toMatchObject({ accepted: true, ack: 1 });
+    expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 2, {
+      type: 'stage.started', at: startedAt, observationId: 'obs_build_1', taskId: task.id,
+      stage: 'build', attempt: 1, actor,
+    })).toMatchObject({ accepted: true, ack: 2 });
+    const usage = {
+      inputTokens: { status: 'complete' as const, value: 100, provenance: 'driver_reported' as const },
+      outputTokens: { status: 'complete' as const, value: 25, provenance: 'driver_reported' as const },
+      cacheReadTokens: { status: 'complete' as const, value: 40, provenance: 'driver_reported' as const },
+      cacheWriteTokens: { status: 'unavailable' as const, value: null, provenance: 'not_reported' as const },
+      calls: { status: 'complete' as const, value: 1, provenance: 'driver_reported' as const },
+      costUsd: { status: 'unavailable' as const, value: null, provenance: 'not_reported' as const },
+    };
+    const evidence = {
+      operationDigest: 'b'.repeat(64), resultDigest: 'c'.repeat(64), exitCode: null,
+      timedOut: null, changedPathCount: 2, blockerFindings: null, majorFindings: null,
+      minorFindings: null, checkpointRef: revision, errorCode: null,
+    };
+    expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 3, {
+      type: 'stage.finished', at: finishedAt, startedAt, observationId: 'obs_build_1', taskId: task.id,
+      stage: 'build', attempt: 1, actor, outcome: 'succeeded', durationMs: 2_500,
+      usage, recovery: 'none', evidence,
+    })).toMatchObject({ accepted: true, ack: 3 });
+
+    const cursorResponse = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/runner-jobs/${job.id}/observations?afterSeq=2&limit=10&taskId=${task.id}`,
+      { headers: { Cookie: cookie } },
+    );
+    expect(cursorResponse.status).toBe(200);
+    expect(await cursorResponse.json()).toMatchObject({
+      observations: [{
+        observationId: 'obs_build_1', taskId: task.id, stage: 'build', status: 'succeeded',
+        durationMs: 2_500, actor, usage, evidence, startSeq: 2, finishSeq: 3, cursorSeq: 3,
+        startReceivedAt: expect.any(String), finishReceivedAt: expect.any(String),
+      }],
+      cursor: { afterSeq: 2, nextSeq: 3, highWaterSeq: 3, hasMore: false },
+      scope: { taskId: task.id }, partial: true, expired: false,
+    });
+    expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 4, {
+      type: 'stage.started', at: finishedAt, observationId: 'obs_build_1', taskId: task.id,
+      stage: 'review', attempt: 1, actor,
+    })).toMatchObject({ accepted: false, ack: 3, error: expect.stringContaining('identity conflicts') });
+    expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 4, {
+      type: 'question', at: finishedAt, questionId: 'question_1', prompt: 'Choose the safe option.',
+    })).toMatchObject({ accepted: true, ack: 4 });
+    await env.DB.prepare(
+      "UPDATE runner_jobs SET human_wait_started_received_at = datetime('now', '-2 seconds') WHERE id = ?",
+    ).bind(job.id).run();
+    await isolatedRoom.answerRunnerJobQuestion(projectId, SYSTEM_ACTOR as Actor, job.id, 'question_1', 'Proceed.');
+    expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 5, {
+      type: 'task.result', at: finishedAt, taskId: task.id, status: 'accepted',
+      checkpoint: { ref: revision, label: revision, url: null }, summary: 'accepted', findings: [],
+    })).toMatchObject({ accepted: true, ack: 5 });
+    const timingResponse = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/runner-jobs/${job.id}/observations?afterSeq=3&taskId=${task.id}`,
+      { headers: { Cookie: cookie } },
+    );
+    const timingBody = await timingResponse.json() as {
+      timing: { server: { queueMs: number; humanWaitMs: number; task: { durationMs: number } } };
+    };
+    expect(timingBody.timing.server.queueMs).toBeGreaterThanOrEqual(0);
+    expect(timingBody.timing.server.humanWaitMs).toBeGreaterThanOrEqual(1_900);
+    expect(timingBody.timing.server.task.durationMs).toBeGreaterThanOrEqual(0);
+    expect(await env.DB.prepare(
+      `SELECT COUNT(*) AS nodes FROM execution_nodes WHERE orchestration_id = ?`,
+    ).bind(job.orchestrationId).first<{ nodes: number }>()).toEqual({ nodes: 1 });
   });
 
   it('projects task and terminal outcomes without overwriting a later human terminal state', async () => {

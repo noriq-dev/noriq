@@ -3871,6 +3871,7 @@ export class ProjectRoom extends DurableObject<Env> {
       // Emitting into a feed that is being deleted in the same batch would be a write to nothing.
       await this.env.DB.batch([
         this.env.DB.prepare('DELETE FROM runner_job_questions WHERE job_id IN (SELECT id FROM runner_jobs WHERE project_id = ?)').bind(pid),
+        this.env.DB.prepare('DELETE FROM runner_job_observations WHERE job_id IN (SELECT id FROM runner_jobs WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare('DELETE FROM runner_job_events WHERE job_id IN (SELECT id FROM runner_jobs WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare('DELETE FROM runner_job_items WHERE job_id IN (SELECT id FROM runner_jobs WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare('DELETE FROM runner_jobs WHERE project_id = ?').bind(pid),
@@ -4867,11 +4868,43 @@ export class ProjectRoom extends DurableObject<Env> {
       const cancellationTerminal = event.type === 'terminal' && event.status === 'cancelled';
       const cancellationDrain = event.type === 'task.result'
         && (event.status === 'failed' || event.status === 'cancelled');
+      const observationDrain = event.type === 'stage.finished'
+        && (event.outcome === 'failed' || event.outcome === 'cancelled');
       if (!['assigned', 'running', 'waiting'].includes(job.status)
-        || (job.cancelRequestedAt && !cancellationTerminal && !cancellationDrain)) {
+        || (job.cancelRequestedAt && !cancellationTerminal && !cancellationDrain && !observationDrain)) {
         return { accepted: false, ack: job.lastEventSeq, error: 'job is no longer accepting events' };
       }
       const receivedAt = nowIso();
+      let observation: {
+        taskId: string | null; stage: string; attempt: number; actor: string; status: string;
+      } | null = null;
+      if (event.type === 'stage.started' || event.type === 'stage.finished') {
+        if (event.taskId) {
+          const item = await this.env.DB.prepare(
+            'SELECT 1 AS present FROM runner_job_items WHERE job_id = ? AND task_id = ?',
+          ).bind(jobId, event.taskId).first<{ present: number }>();
+          if (!item) return { accepted: false, ack: job.lastEventSeq, error: 'observation names a task outside the snapshot' };
+        }
+        observation = await this.env.DB.prepare(
+          `SELECT task_id AS taskId, stage, attempt, actor, status
+             FROM runner_job_observations WHERE job_id = ? AND observation_id = ?`,
+        ).bind(jobId, event.observationId).first<{
+          taskId: string | null; stage: string; attempt: number; actor: string; status: string;
+        }>() ?? null;
+        const actor = JSON.stringify(event.actor);
+        if (observation && (
+          observation.taskId !== event.taskId || observation.stage !== event.stage
+          || observation.attempt !== event.attempt || observation.actor !== actor
+        )) {
+          return { accepted: false, ack: job.lastEventSeq, error: 'observation identity conflicts with its durable payload' };
+        }
+        if (event.type === 'stage.started' && observation) {
+          return { accepted: false, ack: job.lastEventSeq, error: 'observation was already started' };
+        }
+        if (event.type === 'stage.finished' && observation && observation.status !== 'running') {
+          return { accepted: false, ack: job.lastEventSeq, error: 'observation is already terminal' };
+        }
+      }
       const statements = [
         this.env.DB.prepare(
           `INSERT INTO runner_job_events
@@ -4898,12 +4931,82 @@ export class ProjectRoom extends DurableObject<Env> {
           ).bind(status, status, receivedAt, status, receivedAt, status, status, receivedAt, receivedAt, job.orchestrationId),
         );
       };
-      if (event.type === 'progress') {
+      if (event.type === 'job.context') {
+        statements.push(this.env.DB.prepare(
+          'UPDATE runner_jobs SET intelligence_context = ?, updated_at = ? WHERE id = ?',
+        ).bind(JSON.stringify({
+          vcs: event.vcs, workspaceMode: event.workspaceMode,
+          landingPolicy: event.landingPolicy, agents: event.agents,
+        }), receivedAt, jobId));
+      } else if (event.type === 'stage.started') {
+        statements.push(
+          this.env.DB.prepare(
+            `INSERT INTO runner_job_observations
+               (job_id, observation_id, task_id, stage, attempt, actor, status,
+                started_at, start_seq, start_received_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)`,
+          ).bind(
+            jobId, event.observationId, event.taskId, event.stage, event.attempt,
+            JSON.stringify(event.actor), event.at, seq, receivedAt,
+          ),
+          this.env.DB.prepare(
+            `UPDATE runner_jobs SET status = CASE WHEN status = 'assigned' THEN 'running' ELSE status END,
+                    started_at = COALESCE(started_at, ?),
+                    intelligence_started_received_at = COALESCE(intelligence_started_received_at, ?),
+                    updated_at = ? WHERE id = ?`,
+          ).bind(event.at, receivedAt, receivedAt, jobId),
+          ...(event.taskId ? [this.env.DB.prepare(
+            `UPDATE runner_job_items
+                SET intelligence_started_received_at = COALESCE(intelligence_started_received_at, ?),
+                    updated_at = ? WHERE job_id = ? AND task_id = ?`,
+          ).bind(receivedAt, receivedAt, jobId, event.taskId)] : []),
+        );
+        if (job.status === 'assigned') await rootStatus('running');
+      } else if (event.type === 'stage.finished') {
+        const terminalFields = [
+          event.outcome, event.at, event.durationMs, JSON.stringify(event.usage),
+          event.recovery, JSON.stringify(event.evidence), seq, receivedAt,
+        ] as const;
+        if (observation) {
+          statements.push(this.env.DB.prepare(
+            `UPDATE runner_job_observations
+                SET status = ?, finished_at = ?, duration_ms = ?, usage = ?, recovery = ?, evidence = ?,
+                    finish_seq = ?, finish_received_at = ?
+              WHERE job_id = ? AND observation_id = ? AND status = 'running'`,
+          ).bind(...terminalFields, jobId, event.observationId));
+        } else {
+          statements.push(this.env.DB.prepare(
+            `INSERT INTO runner_job_observations
+               (job_id, observation_id, task_id, stage, attempt, actor, status, started_at,
+                finished_at, duration_ms, usage, recovery, evidence, finish_seq, finish_received_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ).bind(
+            jobId, event.observationId, event.taskId, event.stage, event.attempt,
+            JSON.stringify(event.actor), event.outcome, event.startedAt, event.at,
+            event.durationMs, JSON.stringify(event.usage), event.recovery,
+            JSON.stringify(event.evidence), seq, receivedAt,
+          ));
+        }
         statements.push(this.env.DB.prepare(
           `UPDATE runner_jobs SET status = CASE WHEN status = 'assigned' THEN 'running' ELSE status END,
-                  phase = ?, progress = ?, started_at = COALESCE(started_at, ?), updated_at = ?
+                  started_at = COALESCE(started_at, ?),
+                  intelligence_started_received_at = COALESCE(intelligence_started_received_at, ?),
+                  updated_at = ? WHERE id = ?`,
+        ).bind(event.startedAt, receivedAt, receivedAt, jobId));
+        if (event.taskId) statements.push(this.env.DB.prepare(
+          `UPDATE runner_job_items
+              SET intelligence_started_received_at = COALESCE(intelligence_started_received_at, ?),
+                  updated_at = ? WHERE job_id = ? AND task_id = ?`,
+        ).bind(receivedAt, receivedAt, jobId, event.taskId));
+        if (job.status === 'assigned') await rootStatus('running');
+      } else if (event.type === 'progress') {
+        statements.push(this.env.DB.prepare(
+          `UPDATE runner_jobs SET status = CASE WHEN status = 'assigned' THEN 'running' ELSE status END,
+                  phase = ?, progress = ?, started_at = COALESCE(started_at, ?),
+                  intelligence_started_received_at = COALESCE(intelligence_started_received_at, ?),
+                  updated_at = ?
             WHERE id = ?`,
-        ).bind(event.phase, event.progress, event.at, receivedAt, jobId));
+        ).bind(event.phase, event.progress, event.at, receivedAt, receivedAt, jobId));
         if (job.status === 'assigned') await rootStatus('running');
       } else if (event.type === 'task.plan') {
         statements.push(this.env.DB.prepare(
@@ -4928,10 +5031,14 @@ export class ProjectRoom extends DurableObject<Env> {
                   projection_conflict = COALESCE(?, projection_conflict),
                   started_at = CASE WHEN ? = 'running' THEN COALESCE(started_at, ?) ELSE started_at END,
                   finished_at = CASE WHEN ? IN ('accepted','failed','cancelled') THEN ? ELSE finished_at END,
+                  intelligence_started_received_at = COALESCE(intelligence_started_received_at, ?),
+                  intelligence_finished_received_at = CASE
+                    WHEN ? IN ('accepted','failed','cancelled') THEN ? ELSE intelligence_finished_received_at END,
                   updated_at = ? WHERE job_id = ? AND task_id = ?`,
         ).bind(
           event.status, event.checkpoint?.ref ?? null, event.summary, JSON.stringify(event.findings), conflict,
-          event.status, event.at, event.status, event.at, receivedAt, jobId, event.taskId,
+          event.status, event.at, event.status, event.at, receivedAt,
+          event.status, receivedAt, receivedAt, jobId, event.taskId,
         ));
         if (!humanWon) {
           if (event.status === 'running' && item.taskStatus === 'todo') {
@@ -4950,8 +5057,10 @@ export class ProjectRoom extends DurableObject<Env> {
         }
         if (event.status === 'running' && job.status === 'assigned') {
           statements.push(this.env.DB.prepare(
-            "UPDATE runner_jobs SET status = 'running', started_at = COALESCE(started_at, ?), updated_at = ? WHERE id = ?",
-          ).bind(event.at, receivedAt, jobId));
+            `UPDATE runner_jobs SET status = 'running', started_at = COALESCE(started_at, ?),
+                    intelligence_started_received_at = COALESCE(intelligence_started_received_at, ?),
+                    updated_at = ? WHERE id = ?`,
+          ).bind(event.at, receivedAt, receivedAt, jobId));
           await rootStatus('running');
         }
       } else if (event.type === 'question') {
@@ -4962,8 +5071,10 @@ export class ProjectRoom extends DurableObject<Env> {
              VALUES (?, ?, ?, ?, 'open', ?, ?)`,
           ).bind(newId('rjq'), jobId, event.questionId, event.prompt, event.at, receivedAt),
           this.env.DB.prepare(
-            "UPDATE runner_jobs SET status = 'waiting', updated_at = ? WHERE id = ?",
-          ).bind(receivedAt, jobId),
+            `UPDATE runner_jobs SET status = 'waiting',
+                    human_wait_started_received_at = COALESCE(human_wait_started_received_at, ?),
+                    updated_at = ? WHERE id = ?`,
+          ).bind(receivedAt, receivedAt, jobId),
         );
         await rootStatus('parked');
       } else if (event.type === 'usage') {
@@ -5013,14 +5124,20 @@ export class ProjectRoom extends DurableObject<Env> {
             `UPDATE runner_jobs SET status = ?, phase = 'finalizing', progress = 1,
                     usage = ?, final_result = ?, landing_policy = ?, landing_status = ?,
                     landing_target = ?, landing_request_id = ?, landing_checkpoint = ?,
-                    landing_error = ?, landing_finished_at = ?, finished_at = ?, updated_at = ?
+                    landing_error = ?, landing_finished_at = ?, finished_at = ?,
+                    intelligence_finished_received_at = ?,
+                    human_wait_ms = human_wait_ms + CASE
+                      WHEN human_wait_started_received_at IS NULL THEN 0
+                      ELSE MAX(0, CAST(ROUND((julianday(?) - julianday(human_wait_started_received_at)) * 86400000) AS INTEGER))
+                    END,
+                    human_wait_started_received_at = NULL, updated_at = ?
               WHERE id = ? AND status IN ('assigned','running','waiting')`,
           ).bind(
             event.status, JSON.stringify(event.output.usage), JSON.stringify(event.output),
             landing.policy, landing.status, landing.target, landing.requestId,
             landing.checkpoint ? JSON.stringify(landing.checkpoint) : null, landing.error,
-            ['landed', 'failed', 'not_applicable'].includes(landing.status) ? event.at : null,
-            event.at, receivedAt, jobId,
+            ['landed', 'failed', 'not_applicable'].includes(landing.status) ? receivedAt : null,
+            event.at, receivedAt, receivedAt, receivedAt, jobId,
           ),
           ...(landing.status === 'landed' ? [this.env.DB.prepare(
             `UPDATE tasks SET status = 'done', updated_at = ?
@@ -5227,8 +5344,10 @@ export class ProjectRoom extends DurableObject<Env> {
       const queued = row.status === 'queued';
       await this.env.DB.batch([
         this.env.DB.prepare(
-          `UPDATE runner_jobs SET status = ?, cancel_requested_at = ?, finished_at = ?, updated_at = ? WHERE id = ?`,
-        ).bind(queued ? 'cancelled' : row.status, at, queued ? at : null, at, jobId),
+          `UPDATE runner_jobs SET status = ?, cancel_requested_at = ?, finished_at = ?,
+                  intelligence_finished_received_at = CASE WHEN ? THEN ? ELSE intelligence_finished_received_at END,
+                  updated_at = ? WHERE id = ?`,
+        ).bind(queued ? 'cancelled' : row.status, at, queued ? at : null, queued ? 1 : 0, at, at, jobId),
         ...(queued ? [this.env.DB.prepare(
           'UPDATE runner_job_items SET status = CASE WHEN status = \'pending\' THEN \'cancelled\' ELSE status END, reservation_active = 0, updated_at = ? WHERE job_id = ?',
         ).bind(at, jobId)] : []),
@@ -5268,8 +5387,13 @@ export class ProjectRoom extends DurableObject<Env> {
             WHERE job_id = ? AND question_id = ? AND state = 'open'`,
         ).bind(answer, at, at, jobId, questionId),
         this.env.DB.prepare(
-          "UPDATE runner_jobs SET status = CASE WHEN status = 'waiting' THEN 'running' ELSE status END, updated_at = ? WHERE id = ?",
-        ).bind(at, jobId),
+          `UPDATE runner_jobs SET status = CASE WHEN status = 'waiting' THEN 'running' ELSE status END,
+                  human_wait_ms = human_wait_ms + CASE
+                    WHEN human_wait_started_received_at IS NULL THEN 0
+                    ELSE MAX(0, CAST(ROUND((julianday(?) - julianday(human_wait_started_received_at)) * 86400000) AS INTEGER))
+                  END,
+                  human_wait_started_received_at = NULL, updated_at = ? WHERE id = ?`,
+        ).bind(at, at, jobId),
         this.env.DB.prepare(
           `UPDATE orchestrations SET status = CASE WHEN status = 'parked' THEN 'running' ELSE status END,
                   updated_at = ? WHERE id = (SELECT orchestration_id FROM runner_jobs WHERE id = ?)`,

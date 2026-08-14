@@ -4317,7 +4317,11 @@ app.get('/api/projects/:pid/runner-jobs', userAuth, async (c) => {
             landing_finished_at AS landingFinishedAt,
             landing_checkpoint AS landingCheckpoint, landing_error AS landingError,
             warning_count AS warningCount, created_at AS createdAt, started_at AS startedAt,
-            finished_at AS finishedAt, updated_at AS updatedAt
+            finished_at AS finishedAt,
+            intelligence_started_received_at AS intelligenceStartedReceivedAt,
+            intelligence_finished_received_at AS intelligenceFinishedReceivedAt,
+            human_wait_started_received_at AS humanWaitStartedReceivedAt,
+            human_wait_ms AS humanWaitMs, updated_at AS updatedAt
        FROM runner_jobs WHERE project_id = ? ORDER BY created_at DESC LIMIT 100`,
   ).bind(c.req.param('pid')!).all<Record<string, unknown> & {
     usage: string; finalResult: string | null; landingCheckpoint: string | null;
@@ -4334,7 +4338,8 @@ app.get('/api/projects/:pid/runner-jobs/:jobId', userAuth, async (c) => {
     `SELECT id, runner_id AS runnerId, repo_ref AS repoRef, source_kind AS sourceKind,
             source_id AS sourceId, snapshot, snapshot_digest AS snapshotDigest,
             expected_base_revision AS expectedBaseRevision, orchestration_id AS orchestrationId,
-            status, phase, progress, usage, final_result AS finalResult,
+            status, phase, progress, usage, intelligence_context AS intelligenceContext,
+            final_result AS finalResult,
             landing_policy AS landingPolicy, landing_status AS landingStatus,
             landing_target AS landingTarget, landing_request_id AS landingRequestId,
             landing_requested_at AS landingRequestedAt,
@@ -4342,10 +4347,15 @@ app.get('/api/projects/:pid/runner-jobs/:jobId', userAuth, async (c) => {
             landing_checkpoint AS landingCheckpoint, landing_error AS landingError,
             warning_count AS warningCount, last_event_seq AS lastEventSeq,
             created_at AS createdAt, assigned_at AS assignedAt, started_at AS startedAt,
-            cancel_requested_at AS cancelRequestedAt, finished_at AS finishedAt, updated_at AS updatedAt
+            cancel_requested_at AS cancelRequestedAt, finished_at AS finishedAt,
+            intelligence_started_received_at AS intelligenceStartedReceivedAt,
+            intelligence_finished_received_at AS intelligenceFinishedReceivedAt,
+            human_wait_started_received_at AS humanWaitStartedReceivedAt,
+            human_wait_ms AS humanWaitMs, updated_at AS updatedAt
        FROM runner_jobs WHERE id = ? AND project_id = ?`,
   ).bind(c.req.param('jobId')!, c.req.param('pid')!).first<Record<string, unknown> & {
-    snapshot: string; usage: string; finalResult: string | null; landingCheckpoint: string | null;
+    snapshot: string; usage: string; intelligenceContext: string | null;
+    finalResult: string | null; landingCheckpoint: string | null;
   }>();
   if (!job) return c.json({ error: 'RunnerJob not found' }, 404);
   const [items, events, questions] = await Promise.all([
@@ -4353,7 +4363,10 @@ app.get('/api/projects/:pid/runner-jobs/:jobId', userAuth, async (c) => {
       `SELECT task_id AS taskId, task_key AS taskKey, phase_order AS phaseOrder,
               task_order AS taskOrder, status, plan, checkpoint_ref AS checkpointRef,
               summary, findings, projection_conflict AS projectionConflict,
-              started_at AS startedAt, finished_at AS finishedAt, updated_at AS updatedAt
+              started_at AS startedAt, finished_at AS finishedAt,
+              intelligence_started_received_at AS intelligenceStartedReceivedAt,
+              intelligence_finished_received_at AS intelligenceFinishedReceivedAt,
+              updated_at AS updatedAt
          FROM runner_job_items WHERE job_id = ? ORDER BY phase_order, task_order, task_key`,
     ).bind(c.req.param('jobId')!).all<Record<string, unknown> & { findings: string; projectionConflict: string | null }>(),
     c.env.DB.prepare(
@@ -4369,6 +4382,7 @@ app.get('/api/projects/:pid/runner-jobs/:jobId', userAuth, async (c) => {
   return c.json({
     job: {
       ...job, snapshot: parseStoredJson(job.snapshot, null), usage: parseStoredJson(job.usage, null),
+      intelligenceContext: parseStoredJson(job.intelligenceContext, null),
       finalResult: parseStoredJson(job.finalResult, null),
       landingCheckpoint: parseStoredJson(job.landingCheckpoint, null),
     },
@@ -4378,6 +4392,115 @@ app.get('/api/projects/:pid/runner-jobs/:jobId', userAuth, async (c) => {
     })),
     events: events.results.map((event) => ({ ...event, payload: parseStoredJson(event.payload, null) })),
     questions: questions.results,
+  });
+});
+
+app.get('/api/projects/:pid/runner-jobs/:jobId/observations', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const jobId = c.req.param('jobId')!;
+  const afterRaw = c.req.query('afterSeq') ?? '0';
+  const limitRaw = c.req.query('limit') ?? '100';
+  const taskId = c.req.query('taskId')?.trim() || null;
+  if (!/^\d+$/.test(afterRaw)) return c.json({ error: 'afterSeq must be a non-negative integer' }, 400);
+  if (!/^\d+$/.test(limitRaw)) return c.json({ error: 'limit must be an integer from 1 to 200' }, 400);
+  const afterSeq = Number(afterRaw);
+  const limit = Number(limitRaw);
+  if (!Number.isSafeInteger(afterSeq) || afterSeq < 0) {
+    return c.json({ error: 'afterSeq must be a non-negative safe integer' }, 400);
+  }
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+    return c.json({ error: 'limit must be an integer from 1 to 200' }, 400);
+  }
+  if (taskId && taskId.length > 128) return c.json({ error: 'taskId is too long' }, 400);
+  const job = await c.env.DB.prepare(
+    `SELECT status, last_event_seq AS lastEventSeq, created_at AS createdAt,
+            started_at AS startedAt, finished_at AS finishedAt,
+            intelligence_started_received_at AS intelligenceStartedReceivedAt,
+            intelligence_finished_received_at AS intelligenceFinishedReceivedAt,
+            human_wait_started_received_at AS humanWaitStartedReceivedAt,
+            human_wait_ms AS humanWaitMs,
+            landing_requested_at AS landingRequestedAt, landing_started_at AS landingStartedAt,
+            landing_finished_at AS landingFinishedAt
+       FROM runner_jobs WHERE id = ? AND project_id = ?`,
+  ).bind(jobId, pid).first<{
+    status: string; lastEventSeq: number; createdAt: string;
+    startedAt: string | null; finishedAt: string | null;
+    intelligenceStartedReceivedAt: string | null; intelligenceFinishedReceivedAt: string | null;
+    humanWaitStartedReceivedAt: string | null; humanWaitMs: number;
+    landingRequestedAt: string | null; landingStartedAt: string | null; landingFinishedAt: string | null;
+  }>();
+  if (!job) return c.json({ error: 'RunnerJob not found' }, 404);
+  const query = taskId
+    ? `SELECT observation_id AS observationId, task_id AS taskId, stage, attempt, actor, status,
+              started_at AS startedAt, finished_at AS finishedAt, duration_ms AS durationMs,
+              usage, recovery, evidence, start_seq AS startSeq, finish_seq AS finishSeq,
+              start_received_at AS startReceivedAt, finish_received_at AS finishReceivedAt,
+              COALESCE(finish_seq, start_seq) AS cursorSeq
+         FROM runner_job_observations
+        WHERE job_id = ? AND task_id = ? AND COALESCE(finish_seq, start_seq) > ?
+        ORDER BY COALESCE(finish_seq, start_seq), observation_id LIMIT ?`
+    : `SELECT observation_id AS observationId, task_id AS taskId, stage, attempt, actor, status,
+              started_at AS startedAt, finished_at AS finishedAt, duration_ms AS durationMs,
+              usage, recovery, evidence, start_seq AS startSeq, finish_seq AS finishSeq,
+              start_received_at AS startReceivedAt, finish_received_at AS finishReceivedAt,
+              COALESCE(finish_seq, start_seq) AS cursorSeq
+         FROM runner_job_observations
+        WHERE job_id = ? AND COALESCE(finish_seq, start_seq) > ?
+        ORDER BY COALESCE(finish_seq, start_seq), observation_id LIMIT ?`;
+  const statement = c.env.DB.prepare(query);
+  const rows = taskId
+    ? await statement.bind(jobId, taskId, afterSeq, limit + 1).all<Record<string, unknown> & {
+        actor: string; usage: string | null; evidence: string | null; cursorSeq: number;
+      }>()
+    : await statement.bind(jobId, afterSeq, limit + 1).all<Record<string, unknown> & {
+        actor: string; usage: string | null; evidence: string | null; cursorSeq: number;
+      }>();
+  const page = rows.results.slice(0, limit);
+  const nextSeq = page.length > 0 ? page[page.length - 1]!.cursorSeq : afterSeq;
+  const asOf = new Date().toISOString();
+  const elapsedMs = (start: string | null, end: string | null) => start && end
+    ? Math.max(0, Date.parse(end) - Date.parse(start))
+    : null;
+  const taskTiming = taskId ? await c.env.DB.prepare(
+    `SELECT intelligence_started_received_at AS startedAt,
+            intelligence_finished_received_at AS finishedAt
+       FROM runner_job_items WHERE job_id = ? AND task_id = ?`,
+  ).bind(jobId, taskId).first<{ startedAt: string | null; finishedAt: string | null }>() : null;
+  const currentHumanWaitMs = job.humanWaitStartedReceivedAt
+    ? Math.max(0, Date.parse(asOf) - Date.parse(job.humanWaitStartedReceivedAt))
+    : 0;
+  return c.json({
+    observations: page.map((row) => ({
+      ...row,
+      actor: parseStoredJson(row.actor, null),
+      usage: parseStoredJson(row.usage, null),
+      evidence: parseStoredJson(row.evidence, null),
+    })),
+    cursor: { afterSeq, nextSeq, highWaterSeq: job.lastEventSeq, hasMore: rows.results.length > limit },
+    scope: { taskId },
+    timing: {
+      runner: { startedAt: job.startedAt, finishedAt: job.finishedAt },
+      server: {
+        asOf, commissionedAt: job.createdAt,
+        workStartedAt: job.intelligenceStartedReceivedAt,
+        workFinishedAt: job.intelligenceFinishedReceivedAt,
+        queueMs: elapsedMs(job.createdAt, job.intelligenceStartedReceivedAt),
+        elapsedMs: elapsedMs(job.intelligenceStartedReceivedAt, job.intelligenceFinishedReceivedAt),
+        humanWaitMs: job.humanWaitMs + currentHumanWaitMs,
+        humanWaitStartedAt: job.humanWaitStartedReceivedAt,
+        landing: {
+          requestedAt: job.landingRequestedAt, startedAt: job.landingStartedAt,
+          finishedAt: job.landingFinishedAt,
+          durationMs: elapsedMs(job.landingRequestedAt, job.landingFinishedAt),
+        },
+        task: taskTiming ? {
+          startedAt: taskTiming.startedAt, finishedAt: taskTiming.finishedAt,
+          durationMs: elapsedMs(taskTiming.startedAt, taskTiming.finishedAt),
+        } : null,
+      },
+    },
+    partial: !['succeeded', 'partial', 'failed', 'cancelled'].includes(job.status),
+    expired: false,
   });
 });
 
