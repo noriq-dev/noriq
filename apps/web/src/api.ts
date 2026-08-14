@@ -923,6 +923,7 @@ export interface ApiRunnerJobSummary {
 }
 export interface ApiRunnerJobItem {
   taskId: string; taskKey: string; phaseOrder: number; taskOrder: number; status: RunnerJobTaskStatus;
+  phase: RunnerJobPhase | null; progress: number | null; phaseUpdatedAt: string | null;
   plan: string | null; checkpointRef: string | null; summary: string | null; findings: ApiRunnerJobFinding[];
   projectionConflict: Record<string, unknown> | null; startedAt: string | null; finishedAt: string | null; updatedAt: string;
 }
@@ -954,15 +955,30 @@ export interface ApiRunnerJobObservationUsage {
   cacheReadTokens: ApiRunnerJobMetric; cacheWriteTokens: ApiRunnerJobMetric;
   calls: ApiRunnerJobMetric; costUsd: ApiRunnerJobMetric;
 }
+export interface ApiRunnerJobObservationActor {
+  kind: 'runner' | 'agent' | 'command' | 'vcs'; driver: string; vendor: string | null;
+  model: string | null; effort: string | null; role: string | null; operation: string;
+}
+export interface ApiRunnerJobAgentRoute {
+  taskId: string; role: string; attempt: number; policyVersion: string;
+  size: 'small' | 'medium' | 'large'; risk: 'low' | 'medium' | 'high';
+  specCoverage: 'none' | 'partial' | 'complete'; reasons: string[];
+  candidateCount: number; eligibleCount: number; actor: ApiRunnerJobObservationActor | null;
+  decision: 'invoke' | 'skip';
+}
+export type ApiRunnerJobCostBasis =
+  | { kind: 'driver_reported' }
+  | {
+    kind: 'api_list_estimate';
+    priceSource: { provider: string; catalog: string; fetchedAt: string; ageSeconds: number; stale: boolean };
+  };
 export interface ApiRunnerJobObservation {
   observationId: string; taskId: string | null; stage: RunnerJobObservationStage; attempt: number;
-  actor: {
-    kind: 'runner' | 'agent' | 'command' | 'vcs'; driver: string; vendor: string | null;
-    model: string | null; effort: string | null; role: string | null; operation: string;
-  };
+  actor: ApiRunnerJobObservationActor;
   status: 'running' | 'succeeded' | 'failed' | 'cancelled' | 'skipped';
   startedAt: string; finishedAt: string | null; duration: ApiRunnerJobMetric | null;
   usage: ApiRunnerJobObservationUsage | null;
+  costBasis: ApiRunnerJobCostBasis | null;
   recovery: 'none' | 'journal_replay' | 'process_recovery' | null;
   evidence: {
     changedPathCount: number | null; blockerFindings: number | null; majorFindings: number | null;
@@ -975,7 +991,7 @@ export interface ApiRunnerJobActivityStage extends ApiRunnerJobObservation {
   kind: 'stage'; id: string; occurredAt: string; updatedAt: string;
 }
 export type RunnerJobActivityMilestoneType =
-  | 'commissioned' | 'assigned' | 'workspace_prepared' | 'phase_changed'
+  | 'commissioned' | 'assigned' | 'workspace_prepared' | 'agent_route' | 'phase_changed'
   | 'question_opened' | 'question_answered' | 'warning' | 'task_result'
   | 'cancel_requested' | 'terminal' | 'landing_requested' | 'landing_started'
   | 'landing_succeeded' | 'landing_failed';
@@ -983,6 +999,7 @@ export interface ApiRunnerJobActivityMilestone {
   kind: 'milestone'; id: string; type: RunnerJobActivityMilestoneType; status: string;
   occurredAt: string; updatedAt: string; taskId: string | null; title: string;
   detail: string | null; cursorSeq: number | null;
+  route?: ApiRunnerJobAgentRoute;
 }
 export type ApiRunnerJobActivityItem = ApiRunnerJobActivityStage | ApiRunnerJobActivityMilestone;
 export interface ApiRunnerJobActivityPage {
@@ -1014,6 +1031,14 @@ export interface ApiRunnerJobCompactUsage {
   cacheWriteTokens: ApiRunnerJobCompactMetric; calls: ApiRunnerJobCompactMetric;
   costUsd: ApiRunnerJobCompactMetric;
 }
+export interface ApiRunnerJobIntelligenceStageFact {
+  observationId: string; taskId: string | null; attempt: number;
+  actor: ApiRunnerJobObservationActor; route: ApiRunnerJobAgentRoute | null;
+  costBasis: ApiRunnerJobCostBasis | null; costUsd: ApiRunnerJobMetric;
+}
+export type ApiRunnerJobIntelligenceStages = Record<string, unknown> & {
+  routes?: Array<ApiRunnerJobAgentRoute & { eventSeq: number; observedAt: string }>;
+};
 export interface ApiRunnerJobIntelligenceJob {
   jobId: string; projectId: string; sourceKind: 'task' | 'plan'; sourceId: string;
   outcome: RunnerJobStatus; taskCount: number; taskEpisodeCount: number;
@@ -1024,7 +1049,7 @@ export interface ApiRunnerJobIntelligenceJob {
     elapsedMs: number | null; humanWaitMs: number; landingMs: number | null;
   };
   usage: { total: ApiRunnerJobCompactUsage; tasks: ApiRunnerJobCompactUsage; overhead: ApiRunnerJobCompactUsage };
-  stages: Record<string, ApiRunnerJobCompactUsage>;
+  stages: ApiRunnerJobIntelligenceStages;
   overhead: { observations: ApiRunnerJobCompactUsage; queueMs: number | null; humanWaitMs: number; landingMs: number | null };
   landing: { policy: string; status: RunnerJobLandingStatus; target: string | null; errorPresent: boolean };
   projectedAt: string; updatedAt: string;
@@ -1034,7 +1059,7 @@ export interface ApiRunnerJobIntelligenceTask {
   outcome: 'done' | 'failed' | 'cancelled';
   timing: { workStartedAt: string | null; workFinishedAt: string | null; elapsedMs: number | null };
   usage: ApiRunnerJobCompactUsage;
-  stages: Record<string, ApiRunnerJobCompactUsage>;
+  stages: ApiRunnerJobIntelligenceStages;
   landing: { policy: string; status: RunnerJobLandingStatus; outcome: string; target: string | null; errorPresent: boolean };
   projectedAt: string; updatedAt: string;
 }

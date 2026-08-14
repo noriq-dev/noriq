@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api, type ApiRunner, type ApiRunnerJobActivityPage, type ApiRunnerJobActivityStage, type ApiRunnerJobOutput, type ApiRunnerJobSummary } from '../api';
 import type { AppStore } from '../store';
-import { hasMeaningfulLineage, JOB_STATUS_STYLE, JobActivity, RUN_STATUS_STYLE, RunnerJobDispatchForm, RunnerJobOutputSummary } from './RunsView';
+import { hasMeaningfulLineage, JOB_STATUS_STYLE, JobActivity, RUN_STATUS_STYLE, runnerJobCostLabel, RunnerJobDispatchForm, RunnerJobOutputSummary } from './RunsView';
 
 let container: HTMLDivElement;
 let root: Root | null = null;
@@ -61,6 +61,7 @@ function activityStage(input: Partial<ApiRunnerJobActivityStage> & Pick<ApiRunne
       calls: { status: 'not_applicable', value: null, provenance: 'derived' },
       costUsd: { status: 'not_applicable', value: null, provenance: 'derived' },
     },
+    costBasis: null,
     recovery: 'none', evidence: null, startSeq: 1, finishSeq: 2, cursorSeq: 2,
     ...input,
   };
@@ -125,6 +126,21 @@ describe('RunnerJob VCS-neutral output presentation (PLNR-504)', () => {
 });
 
 describe('RunnerJob activity timeline', () => {
+  it('keeps permanent summary cost labels honest', () => {
+    const metric = {
+      status: 'partial' as const, value: 0.125, observedCount: 1,
+      partialCount: 1, unavailableCount: 0, notApplicableCount: 0,
+    };
+    expect(runnerJobCostLabel(metric, [{
+      kind: 'api_list_estimate',
+      priceSource: { provider: 'openai', catalog: 'official-api-list', fetchedAt: '2026-08-13T00:00:00.000Z', ageSeconds: 10, stale: false },
+    }])).toBe('≈$0.1250 API-list estimate · partial');
+    expect(runnerJobCostLabel({ ...metric, status: 'complete', value: 0.2 }, [{ kind: 'driver_reported' }]))
+      .toBe('$0.2000 reported · complete');
+    expect(runnerJobCostLabel({ ...metric, status: 'unavailable', value: null }, []))
+      .toBe('unavailable');
+  });
+
   it('groups a running stage, replaces it with finish evidence, and pauses without losing the cursor', async () => {
     const base = {
       observationId: 'obs_1', taskId: 'task_1', stage: 'build' as const, attempt: 1,
@@ -151,6 +167,7 @@ describe('RunnerJob activity timeline', () => {
           calls: { status: 'complete', value: 1, provenance: 'driver_reported' },
           costUsd: { status: 'unavailable', value: null, provenance: 'not_reported' },
         } : null,
+        costBasis: null,
         finishSeq: finished ? 3 : null, cursorSeq: finished ? 3 : 2,
       }],
       cursor: { next: finished ? 'cursor_3' : 'cursor_2', hasMore: false },
@@ -179,6 +196,7 @@ describe('RunnerJob activity timeline', () => {
       jobId="job_1"
       items={[{
         taskId: 'task_1', taskKey: 'RUN-1', phaseOrder: 0, taskOrder: 0, status: 'running',
+        phase: 'building', progress: 0.5, phaseUpdatedAt: base.startedAt,
         plan: null, checkpointRef: null, summary: null, findings: [], projectionConflict: null,
         startedAt: base.startedAt, finishedAt: null, updatedAt: base.startedAt,
       }]}
@@ -218,6 +236,7 @@ describe('RunnerJob activity timeline', () => {
     container = document.createElement('div'); document.body.appendChild(container); root = createRoot(container);
     act(() => root!.render(<JobActivity projectId="project_1" jobId="job_1" items={[{
       taskId: 'task_1', taskKey: 'RUN-1', phaseOrder: 0, taskOrder: 0, status: 'running', plan: null,
+      phase: null, progress: null, phaseUpdatedAt: null,
       checkpointRef: null, summary: null, findings: [], projectionConflict: null, startedAt: null,
       finishedAt: null, updatedAt: '2026-08-13T00:00:00.000Z',
     }]} terminal={false} />));
@@ -233,6 +252,98 @@ describe('RunnerJob activity timeline', () => {
     expect(stages[0]!.textContent).toContain('Job overhead');
     expect(stages[0]!.textContent).toContain('RUN-1');
     expect(stages[2]!.querySelector('button')?.getAttribute('aria-expanded')).toBe('true');
+  });
+
+  it('labels adaptive routes and reported, estimated, stale, and unavailable cost truthfully', async () => {
+    const route = {
+      taskId: 'task_1', role: 'build', attempt: 1, policyVersion: 'adaptive-v2',
+      size: 'medium' as const, risk: 'high' as const, specCoverage: 'complete' as const,
+      reasons: ['risk.high'], candidateCount: 2, eligibleCount: 1, decision: 'invoke' as const,
+      actor: {
+        kind: 'agent' as const, driver: 'codex', vendor: 'openai', model: 'gpt-5.6-codex',
+        effort: 'high', role: 'build', operation: 'invoke',
+      },
+    };
+    const codex = activityStage({
+      id: 'stage:codex', observationId: 'codex', stage: 'build', attempt: 1,
+      taskId: 'task_1', status: 'succeeded', occurredAt: '2026-08-13T00:00:01.000Z',
+      actor: route.actor,
+      usage: {
+        inputTokens: { status: 'complete', value: 100, provenance: 'driver_reported' },
+        outputTokens: { status: 'complete', value: 25, provenance: 'driver_reported' },
+        cacheReadTokens: { status: 'unavailable', value: null, provenance: 'not_reported' },
+        cacheWriteTokens: { status: 'not_applicable', value: null, provenance: 'derived' },
+        calls: { status: 'complete', value: 1, provenance: 'driver_reported' },
+        costUsd: { status: 'partial', value: 0.125, provenance: 'derived' },
+      },
+      costBasis: {
+        kind: 'api_list_estimate',
+        priceSource: {
+          provider: 'openai', catalog: 'official-api-list', fetchedAt: '2026-08-12T22:00:00.000Z',
+          ageSeconds: 7_200, stale: true,
+        },
+      },
+    });
+    const claude = activityStage({
+      id: 'stage:claude', observationId: 'claude', stage: 'review', attempt: 1,
+      taskId: 'task_1', status: 'succeeded', occurredAt: '2026-08-13T00:00:02.000Z',
+      actor: {
+        kind: 'agent', driver: 'claude', vendor: 'anthropic', model: 'claude-opus',
+        effort: 'high', role: 'review', operation: 'invoke',
+      },
+      usage: {
+        inputTokens: { status: 'complete', value: 80, provenance: 'driver_reported' },
+        outputTokens: { status: 'complete', value: 20, provenance: 'driver_reported' },
+        cacheReadTokens: { status: 'unavailable', value: null, provenance: 'not_reported' },
+        cacheWriteTokens: { status: 'not_applicable', value: null, provenance: 'derived' },
+        calls: { status: 'complete', value: 1, provenance: 'driver_reported' },
+        costUsd: { status: 'complete', value: 0.2, provenance: 'driver_reported' },
+      },
+      costBasis: { kind: 'driver_reported' },
+    });
+    const unavailable = activityStage({
+      id: 'stage:missing', observationId: 'missing', stage: 'check', attempt: 1,
+      taskId: 'task_1', status: 'succeeded', occurredAt: '2026-08-13T00:00:03.000Z',
+      usage: {
+        inputTokens: { status: 'unavailable', value: null, provenance: 'not_reported' },
+        outputTokens: { status: 'unavailable', value: null, provenance: 'not_reported' },
+        cacheReadTokens: { status: 'unavailable', value: null, provenance: 'not_reported' },
+        cacheWriteTokens: { status: 'unavailable', value: null, provenance: 'not_reported' },
+        calls: { status: 'unavailable', value: null, provenance: 'not_reported' },
+        costUsd: { status: 'unavailable', value: null, provenance: 'not_reported' },
+      },
+    });
+    vi.spyOn(api, 'runnerJobActivity').mockResolvedValue({
+      items: [{
+        kind: 'milestone', id: 'event:route', type: 'agent_route', status: 'succeeded',
+        occurredAt: '2026-08-13T00:00:00.000Z', updatedAt: '2026-08-13T00:00:00.000Z',
+        taskId: 'task_1', title: 'Agent route selected', detail: null, cursorSeq: 1, route,
+      }, codex, claude, unavailable],
+      cursor: { next: 'cursor_4', hasMore: false }, scope: { taskId: null }, timing: activityTiming,
+      partial: false, expired: false,
+    });
+    vi.spyOn(api, 'runnerJobIntelligence').mockResolvedValue({
+      state: 'pending', status: 'succeeded', projectedAt: null, detailPrunedAt: null, job: null, tasks: [],
+    });
+    container = document.createElement('div'); document.body.appendChild(container); root = createRoot(container);
+    act(() => root!.render(<JobActivity projectId="project_1" jobId="job_1" items={[{
+      taskId: 'task_1', taskKey: 'RUN-1', phaseOrder: 0, taskOrder: 0, status: 'accepted',
+      phase: 'building', progress: 0.4, phaseUpdatedAt: '2026-08-13T00:00:00.000Z',
+      plan: null, checkpointRef: null, summary: null, findings: [], projectionConflict: null,
+      startedAt: null, finishedAt: null, updatedAt: '2026-08-13T00:00:00.000Z',
+    }]} terminal />));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    for (const stage of container.querySelectorAll<HTMLElement>('.runner-activity-stage')) {
+      act(() => stage.querySelector<HTMLButtonElement>('button')!.click());
+    }
+
+    expect(container.textContent).toContain('gpt-5.6-codex · high · medium · high risk · complete spec · adaptive-v2');
+    expect(container.textContent).toContain('RUN-1 · building 40%');
+    expect(container.textContent).toContain('≈$0.1250 API-list estimate');
+    expect(container.textContent).toContain('openai official-api-list · 2h old · stale · partial');
+    expect(container.textContent).toContain('$0.2000 reported · complete');
+    expect(container.textContent).toContain('cost unavailable');
+    expect(container.textContent).not.toContain('$0.0000');
   });
 });
 

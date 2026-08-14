@@ -9,6 +9,9 @@ import {
   type ApiRunnerJobActivityItem,
   type ApiRunnerJobActivityPage,
   type ApiRunnerJobActivityStage,
+  type ApiRunnerJobAgentRoute,
+  type ApiRunnerJobCompactMetric,
+  type ApiRunnerJobCostBasis,
   type ApiRunnerJobDetail,
   type ApiRunnerJobIntelligenceDetail,
   type ApiRunnerJobMetric,
@@ -412,6 +415,9 @@ function JobDetail({ detail, projectId, onRefresh, onCancel, onLand }: {
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
               <MonoTag color="var(--text-mid)" bg="var(--w-06)" size={9}>{item.status}</MonoTag>
               <strong style={{ fontSize: 12 }}>{item.taskKey}</strong>
+              {item.phase && <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>
+                {item.phase}{item.progress == null ? '' : ` · ${Math.round(item.progress * 100)}%`}
+              </span>}
               {item.checkpointRef && <code aria-label="checkpoint" style={{ fontSize: 10 }}>{shortRevision(item.checkpointRef)}</code>}
             </div>
             {item.summary && <div style={{ fontSize: 11.5, color: 'var(--text-dim)', marginTop: 5 }}>{item.summary}</div>}
@@ -600,6 +606,8 @@ function ActivityTimeline({ activity, items, follow }: {
     }
     return result.sort((left, right) => left.occurredAt.localeCompare(right.occurredAt) || left.id.localeCompare(right.id));
   }, [activity]);
+  const routes = useMemo(() => activity.flatMap((item) => item.kind === 'milestone' && item.route
+    ? [item.route] : []), [activity]);
 
   useEffect(() => {
     const element = scroll.current;
@@ -621,7 +629,7 @@ function ActivityTimeline({ activity, items, follow }: {
     <div className="runner-activity-timeline">
       {blocks.map((block) => block.kind === 'milestone'
         ? <ActivityMilestone key={block.id} milestone={block} items={items} />
-        : <ActivityStage key={block.id} group={block} items={items} />)}
+        : <ActivityStage key={block.id} group={block} items={items} routes={routes} />)}
     </div>
   </div>;
 }
@@ -644,6 +652,7 @@ function ActivityMilestone({ milestone, items }: {
     <div>
       <div className="runner-activity-title"><b>{milestone.title}</b>{task && <MonoTag color="var(--text-mid)" bg="var(--w-06)" size={8}>{task.taskKey}</MonoTag>}</div>
       {milestone.detail && <div className="runner-activity-detail">{milestone.detail}</div>}
+      {milestone.route && <div className="runner-activity-detail">{routeDescription(milestone.route)}</div>}
     </div>
     <time>{new Date(milestone.occurredAt).toLocaleTimeString()}</time>
   </article>;
@@ -654,7 +663,73 @@ function aggregateMetric(observations: ApiRunnerJobActivityStage[], select: (ite
   return { value: metrics.length ? metrics.reduce((sum, metric) => sum + metric.value!, 0) : null, partial: metrics.some((metric) => metric.status === 'partial') };
 }
 
-function ActivityStage({ group, items }: { group: ActivityStageGroup; items: ApiRunnerJobDetail['items'] }) {
+function priceAge(ageSeconds: number): string {
+  if (ageSeconds < 60) return `${ageSeconds}s old`;
+  if (ageSeconds < 3_600) return `${Math.round(ageSeconds / 60)}m old`;
+  if (ageSeconds < 86_400) return `${Math.round(ageSeconds / 3_600)}h old`;
+  return `${Math.round(ageSeconds / 86_400)}d old`;
+}
+
+function routeDescription(route: ApiRunnerJobAgentRoute): string {
+  const actor = route.actor
+    ? [route.actor.model ?? route.actor.driver, route.actor.effort].filter(Boolean).join(' · ')
+    : 'no actor';
+  return `${actor} · ${route.size} · ${route.risk} risk · ${route.specCoverage} spec · ${route.policyVersion}`;
+}
+
+function observationCost(observation: ApiRunnerJobActivityStage): string | null {
+  const metric = observation.usage?.costUsd;
+  if (!metric || metric.status === 'not_applicable') return null;
+  if (metric.value == null) return 'cost unavailable';
+  if (observation.costBasis?.kind === 'api_list_estimate') {
+    const source = observation.costBasis.priceSource;
+    return `≈$${metric.value.toFixed(4)} API-list estimate · ${source.provider} ${source.catalog} · ${priceAge(source.ageSeconds)}${source.stale ? ' · stale' : ''} · ${metric.status}`;
+  }
+  if (observation.costBasis?.kind === 'driver_reported' || metric.provenance === 'driver_reported') {
+    return `$${metric.value.toFixed(4)} reported · ${metric.status}`;
+  }
+  return `≈$${metric.value.toFixed(4)} estimate · ${metric.status}`;
+}
+
+export function runnerJobCostLabel(
+  metric: Pick<ApiRunnerJobCompactMetric, 'status' | 'value'>,
+  bases: Array<ApiRunnerJobCostBasis | null>,
+): string {
+  if (metric.value == null) return metric.status;
+  const observed = bases.filter((basis): basis is ApiRunnerJobCostBasis => basis !== null);
+  if (observed.length > 0 && observed.every((basis) => basis.kind === 'api_list_estimate')) {
+    return `≈$${metric.value.toFixed(4)} API-list estimate · ${metric.status}`;
+  }
+  if (observed.length > 0 && observed.every((basis) => basis.kind === 'driver_reported')) {
+    return `$${metric.value.toFixed(4)} reported · ${metric.status}`;
+  }
+  return `$${metric.value.toFixed(4)}${observed.length ? ' mixed cost evidence' : ''} · ${metric.status}`;
+}
+
+function stageCost(observations: ApiRunnerJobActivityStage[]): string | null {
+  const priced = observations.filter((observation) => observation.usage?.costUsd.value != null);
+  if (!priced.length) {
+    return observations.some((observation) => observation.usage?.costUsd.status === 'unavailable')
+      ? 'cost unavailable' : null;
+  }
+  const value = priced.reduce((sum, observation) => sum + observation.usage!.costUsd.value!, 0);
+  const partial = priced.some((observation) => observation.usage!.costUsd.status === 'partial')
+    || observations.some((observation) => observation.usage?.costUsd.status === 'unavailable');
+  if (priced.every((observation) => observation.costBasis?.kind === 'api_list_estimate')) {
+    return `≈$${value.toFixed(4)} API-list estimate${partial ? ' · partial' : ''}`;
+  }
+  if (priced.every((observation) => observation.costBasis?.kind === 'driver_reported'
+    || observation.usage?.costUsd.provenance === 'driver_reported')) {
+    return `$${value.toFixed(4)} reported${partial ? ' · partial' : ''}`;
+  }
+  return `$${value.toFixed(4)} mixed cost evidence${partial ? ' · partial' : ''}`;
+}
+
+function ActivityStage({ group, items, routes }: {
+  group: ActivityStageGroup;
+  items: ApiRunnerJobDetail['items'];
+  routes: ApiRunnerJobAgentRoute[];
+}) {
   const statuses = group.observations.map((observation) => observation.status);
   const status = statuses.includes('failed') ? 'failed'
     : statuses.includes('cancelled') ? 'cancelled'
@@ -671,14 +746,17 @@ function ActivityStage({ group, items }: { group: ActivityStageGroup; items: Api
     provenance: 'derived',
   } : null);
   const calls = aggregateMetric(group.observations, (observation) => observation.usage?.calls ?? null);
-  const cost = aggregateMetric(group.observations, (observation) => observation.usage?.costUsd ?? null);
   const taskCount = new Set(group.observations.map((observation) => observation.taskId).filter(Boolean)).size;
   const orderedScopes: Array<{ id: string | null; label: string; observations: ApiRunnerJobActivityStage[] }> = [];
   const overhead = group.observations.filter((observation) => observation.taskId === null);
   if (overhead.length) orderedScopes.push({ id: null, label: 'Job overhead', observations: overhead });
   for (const item of items) {
     const scoped = group.observations.filter((observation) => observation.taskId === item.taskId);
-    if (scoped.length) orderedScopes.push({ id: item.taskId, label: item.taskKey, observations: scoped });
+    if (scoped.length) orderedScopes.push({
+      id: item.taskId,
+      label: `${item.taskKey}${item.phase ? ` · ${item.phase}${item.progress == null ? '' : ` ${Math.round(item.progress * 100)}%`}` : ''}`,
+      observations: scoped,
+    });
   }
   const known = new Set(orderedScopes.flatMap((scope) => scope.observations.map((observation) => observation.id)));
   for (const observation of group.observations.filter((candidate) => !known.has(candidate.id))) {
@@ -688,7 +766,7 @@ function ActivityStage({ group, items }: { group: ActivityStageGroup; items: Api
     duration.value == null ? null : durationText(duration.value),
     tokens.value == null ? null : `${tokens.value.toLocaleString()} tokens${tokens.partial ? ' partial' : ''}`,
     calls.value == null ? null : `${calls.value.toLocaleString()} calls`,
-    cost.value == null ? null : `$${cost.value.toFixed(4)}${cost.partial ? ' partial' : ''}`,
+    stageCost(group.observations),
   ].filter(Boolean);
   return <article className="runner-activity-stage" data-status={status}>
     <button type="button" className="runner-activity-stage-header" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>
@@ -701,20 +779,29 @@ function ActivityStage({ group, items }: { group: ActivityStageGroup; items: Api
     {expanded && <div className="runner-activity-stage-body">
       {orderedScopes.map((scope, index) => <section key={`${scope.id ?? 'overhead'}:${index}`} className="runner-activity-scope">
         <h4>{scope.label}</h4>
-        {scope.observations.sort((left, right) => left.occurredAt.localeCompare(right.occurredAt)).map((observation) => <ActivityOperation key={observation.id} observation={observation} />)}
+        {scope.observations.sort((left, right) => left.occurredAt.localeCompare(right.occurredAt)).map((observation) => <ActivityOperation
+          key={observation.id}
+          observation={observation}
+          route={routes.find((route) => route.taskId === observation.taskId
+            && route.role === observation.actor.role && route.attempt === observation.attempt) ?? null}
+        />)}
       </section>)}
     </div>}
   </article>;
 }
 
-function ActivityOperation({ observation }: { observation: ApiRunnerJobActivityStage }) {
-  const actor = `${observation.actor.role ?? observation.actor.kind} · ${observation.actor.driver}${observation.actor.model ? ` / ${observation.actor.model}` : ''}`;
+function ActivityOperation({ observation, route }: {
+  observation: ApiRunnerJobActivityStage;
+  route: ApiRunnerJobAgentRoute | null;
+}) {
+  const actor = `${observation.actor.role ?? observation.actor.kind} · ${observation.actor.driver}${observation.actor.model ? ` / ${observation.actor.model}` : ''}${observation.actor.effort ? ` · ${observation.actor.effort}` : ''}`;
   const metrics = [
     observation.duration?.value == null ? null : `time ${durationText(observation.duration.value)}`,
     observation.usage?.inputTokens.value == null ? null : `in ${observation.usage.inputTokens.value.toLocaleString()}`,
     observation.usage?.outputTokens.value == null ? null : `out ${observation.usage.outputTokens.value.toLocaleString()}`,
     observation.usage?.calls.value == null ? null : `${observation.usage.calls.value.toLocaleString()} calls`,
-    observation.usage?.costUsd.value == null ? null : `$${observation.usage.costUsd.value.toFixed(4)}`,
+    observationCost(observation),
+    route ? `route ${route.size} · ${route.risk} risk · ${route.specCoverage} spec` : null,
   ].filter(Boolean);
   const evidence = observation.evidence ? [
     observation.evidence.changedPathCount == null ? null : `${observation.evidence.changedPathCount} paths`,
@@ -743,6 +830,11 @@ function PermanentRunnerJobSummary({ summary }: { summary: ApiRunnerJobIntellige
     + (job.usage.total.outputTokens.value ?? 0)
     + (job.usage.total.cacheReadTokens.value ?? 0)
     + (job.usage.total.cacheWriteTokens.value ?? 0);
+  const costBases = Object.values(job.stages).flatMap((stage) => {
+    if (!stage || typeof stage !== 'object' || Array.isArray(stage) || !('facts' in stage)) return [];
+    const facts = (stage as { facts?: Array<{ costBasis?: ApiRunnerJobCostBasis | null }> }).facts;
+    return Array.isArray(facts) ? facts.map((fact) => fact.costBasis ?? null) : [];
+  });
   return <div style={{ marginTop: 14, borderTop: '1px solid var(--w-07)', paddingTop: 12 }}>
     <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
       <b style={{ fontSize: 12 }}>Permanent job summary</b>
@@ -752,7 +844,7 @@ function PermanentRunnerJobSummary({ summary }: { summary: ApiRunnerJobIntellige
     <div className="runner-observation-timing" style={{ marginTop: 8 }}>
       <TimingFact label="tasks" value={`${job.taskEpisodeCount}/${job.taskCount}`} />
       <TimingFact label="tokens" value={`${tokens.toLocaleString()} · ${job.usage.total.inputTokens.status}`} />
-      <TimingFact label="cost" value={job.usage.total.costUsd.value == null ? job.usage.total.costUsd.status : `$${job.usage.total.costUsd.value.toFixed(4)} · ${job.usage.total.costUsd.status}`} />
+      <TimingFact label="cost" value={runnerJobCostLabel(job.usage.total.costUsd, costBases)} />
       <TimingFact label="overhead" value={`${job.overhead.observations.observationCount} observations`} />
     </div>
     <div style={{ marginTop: 9, display: 'flex', flexDirection: 'column', gap: 5 }}>
