@@ -15,6 +15,7 @@ interface TaskSearchSelectProps {
   boardId?: string | null;
   value: string;
   onChange: (taskId: string) => void;
+  onSelect?: (task: TaskSearchOption | null) => void;
   initialTasks?: TaskSearchOption[];
   /** When supplied, query each derived status and merge the bounded results. */
   searchStatuses?: string[];
@@ -29,6 +30,7 @@ export function TaskSearchSelect({
   boardId = null,
   value,
   onChange,
+  onSelect,
   initialTasks = [],
   searchStatuses = [],
   label,
@@ -56,6 +58,7 @@ export function TaskSearchSelect({
     <AsyncSearchSelect
       value={value}
       onChange={onChange}
+      onSelect={onSelect}
       initialOptions={initialTasks}
       loadOptions={loadOptions}
       optionLabel={(task) => `${task.key} · ${task.title}`}

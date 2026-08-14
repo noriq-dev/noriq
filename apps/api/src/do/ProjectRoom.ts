@@ -168,6 +168,25 @@ export interface CreateRunnerJobInput {
   expectedBaseRevision: string;
 }
 
+type RunnerJobTaskCandidate = {
+  taskId: string;
+  key: string;
+  title: string;
+  body: string;
+  status: string;
+  failedAt: string | null;
+  executionSpec: string | null;
+  taskOrder: number;
+  phaseOrder?: number;
+};
+
+/** Failed is derived from failed_at. Older failure paths can leave a raw execution status,
+ * but an explicit retry must never override a human or terminal workflow state. */
+function runnerJobDispatchStatus(row: Pick<RunnerJobTaskCandidate, 'status' | 'failedAt'>): string {
+  if (row.failedAt !== null && ['todo', 'claimed', 'in_progress'].includes(row.status)) return 'failed';
+  return row.status;
+}
+
 export interface RunnerJobView {
   id: string;
   projectId: string;
@@ -4617,26 +4636,20 @@ export class ProjectRoom extends DurableObject<Env> {
           `SELECT id AS taskId, key, title, body, status, failed_at AS failedAt, execution_spec AS executionSpec,
                   "order" AS taskOrder
              FROM tasks WHERE id = ? AND project_id = ?`,
-        ).bind(input.source.id, projectId).first<{
-          taskId: string; key: string; title: string; body: string; status: string; failedAt: string | null;
-          executionSpec: string | null; taskOrder: number;
-        }>();
+        ).bind(input.source.id, projectId).first<RunnerJobTaskCandidate>();
         if (!row) throw new Error('task not found');
-        if (row.status !== 'todo') {
-          throw new Error(`task ${row.key} is ${row.status}; only todo or an explicit failed retry is dispatchable`);
+        const dispatchStatus = runnerJobDispatchStatus(row);
+        if (!['todo', 'failed'].includes(dispatchStatus)) {
+          throw new Error(`task ${row.key} is ${dispatchStatus}; only todo or an explicit failed retry is dispatchable`);
         }
-        const claim = await this.env.DB.prepare(
-          'SELECT 1 FROM claims WHERE task_id = ? AND released_at IS NULL AND expires_at > ?',
-        ).bind(row.taskId, nowIso()).first();
-        if (claim) throw new Error(`task ${row.key} has a live claim`);
         const spec = readExecutionSpec(row.executionSpec, row.taskId);
         if (spec.unreadable) throw new Error(`${row.key} has an unreadable execution spec`);
         source = {
           kind: 'task', projectId, projectKey: project.key,
           task: {
             taskId: row.taskId, key: row.key, title: row.title, body: row.body,
-            executionSpec: spec.spec, status: row.failedAt ? 'failed' : 'todo',
-            retry: row.failedAt !== null, order: row.taskOrder, phaseOrder: 0,
+            executionSpec: spec.spec, status: dispatchStatus as 'todo' | 'failed',
+            retry: dispatchStatus === 'failed', order: row.taskOrder, phaseOrder: 0,
           },
         };
       } else {
@@ -4654,17 +4667,14 @@ export class ProjectRoom extends DurableObject<Env> {
              JOIN tasks t ON t.id = pt.task_id
             WHERE ph.plan_id = ?
             ORDER BY ph."order", t."order", t.key`,
-        ).bind(plan.id).all<{
-          taskId: string; key: string; title: string; body: string; status: string; failedAt: string | null;
-          executionSpec: string | null; taskOrder: number; phaseOrder: number;
-        }>();
+        ).bind(plan.id).all<RunnerJobTaskCandidate & { phaseOrder: number }>();
         const duplicateIds = rows.filter((row, index) => rows.findIndex((other) => other.taskId === row.taskId) !== index);
         if (duplicateIds.length) throw new Error('plan contains a task in more than one phase');
-        const unsettled = rows.filter((row) => ['claimed', 'in_progress', 'blocked', 'review'].includes(row.status));
+        const unsettled = rows.filter((row) => ['claimed', 'in_progress', 'blocked', 'review'].includes(runnerJobDispatchStatus(row)));
         if (unsettled.length) {
-          throw new Error(`plan has unsettled tasks: ${unsettled.map((row) => `${row.key} (${row.status})`).join(', ')}`);
+          throw new Error(`plan has unsettled tasks: ${unsettled.map((row) => `${row.key} (${runnerJobDispatchStatus(row)})`).join(', ')}`);
         }
-        const selected = rows.filter((row) => row.status === 'todo');
+        const selected = rows.filter((row) => ['todo', 'failed'].includes(runnerJobDispatchStatus(row)));
         if (!selected.length) throw new Error('plan has no todo or failed tasks to dispatch');
         if (selected.length > 500) throw new Error('plan exceeds the 500-task RunnerJob snapshot limit');
         const taskIds = new Set(selected.map((row) => row.taskId));
@@ -4673,8 +4683,8 @@ export class ProjectRoom extends DurableObject<Env> {
           if (spec.unreadable) throw new Error(`${row.key} has an unreadable execution spec`);
           return {
             taskId: row.taskId, key: row.key, title: row.title, body: row.body,
-            executionSpec: spec.spec, status: row.failedAt ? 'failed' as const : 'todo' as const,
-            retry: row.failedAt !== null, order: row.taskOrder, phaseOrder: row.phaseOrder,
+            executionSpec: spec.spec, status: runnerJobDispatchStatus(row) as 'todo' | 'failed',
+            retry: runnerJobDispatchStatus(row) === 'failed', order: row.taskOrder, phaseOrder: row.phaseOrder,
           };
         });
         const { results: dependencies } = await this.env.DB.prepare(
@@ -4694,6 +4704,16 @@ export class ProjectRoom extends DurableObject<Env> {
 
       RunnerJobSourceSchema.parse(source);
       const ids = source.kind === 'task' ? [source.task.taskId] : source.tasks.map((task) => task.taskId);
+      const { results: liveClaims } = await this.env.DB.prepare(
+        `SELECT t.key
+           FROM claims c JOIN tasks t ON t.id = c.task_id
+          WHERE c.task_id IN (SELECT value FROM json_each(?))
+            AND c.released_at IS NULL AND c.expires_at > ?
+          ORDER BY t.key LIMIT 5`,
+      ).bind(JSON.stringify(ids), nowIso()).all<{ key: string }>();
+      if (liveClaims.length) {
+        throw new Error(`selected tasks have live claims: ${liveClaims.map((claim) => claim.key).join(', ')}`);
+      }
       if (source.kind === 'plan') {
         const incoming = new Map(ids.map((id) => [id, 0]));
         const children = new Map(ids.map((id) => [id, [] as string[]]));
@@ -4724,6 +4744,10 @@ export class ProjectRoom extends DurableObject<Env> {
       const items = source.kind === 'task' ? [source.task] : source.tasks;
       try {
         await this.env.DB.batch([
+          ...items.filter((task) => task.retry).map((task) => this.env.DB.prepare(
+            `UPDATE tasks SET status = 'todo', claimed_by = NULL, claim_expires_at = NULL, updated_at = ?
+              WHERE id = ? AND failed_at IS NOT NULL AND status IN ('todo','claimed','in_progress')`,
+          ).bind(at, task.taskId)),
           this.env.DB.prepare(
             `INSERT INTO orchestrations
                (id, project_id, anchor_type, anchor_id, root_execution_id, status,

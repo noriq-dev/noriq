@@ -216,6 +216,7 @@ export function RunnerJobDispatchForm({
   const candidates = runners.filter((runner) => runner.status === 'online' && runner.repos.some((repo) => repo.projectId === pid));
   const [kind, setKind] = useState<'task' | 'plan'>('task');
   const [targetId, setTargetId] = useState('');
+  const [targetTaskStatus, setTargetTaskStatus] = useState<string | null>(null);
   const [runnerId, setRunnerId] = useState(candidates[0]?.id ?? '');
   const runner = candidates.find((candidate) => candidate.id === runnerId) ?? null;
   const repos = runner?.repos.filter((repo) => repo.projectId === pid) ?? [];
@@ -232,7 +233,10 @@ export function RunnerJobDispatchForm({
   }, [runnerId, pid]);
   useEffect(() => {
     setTargetId('');
+    setTargetTaskStatus(null);
   }, [kind]);
+
+  const retryingTask = kind === 'task' && targetTaskStatus === 'failed';
 
   const submit = async () => {
     if (!runnerId || !repoRef || !targetId) return setError('Select a target, runner, and repository.');
@@ -265,6 +269,7 @@ export function RunnerJobDispatchForm({
               projectId={pid}
               value={targetId}
               onChange={setTargetId}
+              onSelect={(task) => setTargetTaskStatus(task?.status ?? null)}
               initialTasks={tasks}
               searchStatuses={['todo', 'failed']}
               label="Task"
@@ -298,10 +303,12 @@ export function RunnerJobDispatchForm({
       </div>
       <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginTop: 12 }}>
         <Button variant="primary" disabled={busy || !targetId || !runnerId || !repoRef} onClick={submit}>
-          {busy ? 'dispatching…' : `dispatch ${kind}`}
+          {busy ? 'dispatching…' : retryingTask ? 'retry task' : `dispatch ${kind}`}
         </Button>
         <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>
-          Only runnerId and repoRef cross the control-plane boundary.
+          {retryingTask
+            ? 'Retry creates a fresh RunnerJob; the prior terminal job remains in history.'
+            : 'Only runnerId and repoRef cross the control-plane boundary.'}
         </span>
       </div>
       {error && <ErrorNote>{error}</ErrorNote>}

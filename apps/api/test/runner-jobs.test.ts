@@ -2,7 +2,7 @@ import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { RunnerJobAssignment, RunnerJobEvent, RunnerJobSource } from '@noriq-dev/shared';
 import type { Actor, CreateRunnerJobInput, RunnerJobView } from '../src/do/ProjectRoom';
-import { createUser, loginSession, projectRoom, SYSTEM_ACTOR } from './helpers';
+import { createAgent, createUser, loginSession, projectRoom, SYSTEM_ACTOR } from './helpers';
 
 interface RoomRpc {
   createTask(projectId: string, actor: Actor, input: { title: string }): Promise<{ id: string; key: string }>;
@@ -28,6 +28,7 @@ let room: RoomRpc;
 let cookie: string;
 const runnerId = `rnr_job_${crypto.randomUUID()}`;
 const revision = 'a'.repeat(40);
+let claimAgentId: string;
 
 beforeAll(async () => {
   await createUser('runner-jobs@example.com', 'Runner Jobs', 'longenough1', 'member').catch(() => {});
@@ -44,6 +45,7 @@ beforeAll(async () => {
   await env.DB.prepare(
     "INSERT INTO runners (id, owner_user_id, label, status, repos) VALUES (?, ?, 'job-runner', 'online', '[]')",
   ).bind(runnerId, user!.id).run();
+  claimAgentId = (await createAgent('runner-job-retry-claim')).id;
   room = projectRoom<RoomRpc>(pid);
 }, 60_000);
 
@@ -98,8 +100,14 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
   });
 
   it('creates a bounded immutable snapshot, one root, and a live reservation atomically', async () => {
-    const task = await room.createTask(pid, SYSTEM_ACTOR as Actor, { title: 'Reserved task' });
-    const job = await room.createRunnerJob(pid, SYSTEM_ACTOR as Actor, {
+    const response = await SELF.fetch('https://noriq.test/api/projects', {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: `RV${crypto.randomUUID().slice(0, 6).toUpperCase()}`, name: 'reservation isolation' }),
+    });
+    const projectId = ((await response.json()) as { id: string }).id;
+    const isolatedRoom = projectRoom<RoomRpc>(projectId);
+    const task = await isolatedRoom.createTask(projectId, SYSTEM_ACTOR as Actor, { title: 'Reserved task' });
+    const job = await isolatedRoom.createRunnerJob(projectId, SYSTEM_ACTOR as Actor, {
       source: { kind: 'task', id: task.id }, runnerId, repoRef: 'repo', expectedBaseRevision: revision,
     });
     expect(RunnerJobSource.parse(job.source)).toMatchObject({ kind: 'task', task: { taskId: task.id, retry: false } });
@@ -113,11 +121,123 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
     ).bind(job.orchestrationId).first<{ rootId: string; nodes: number }>();
     expect(orchestration).toMatchObject({ rootId: expect.any(String), nodes: 1 });
 
-    await expect(room.createRunnerJob(pid, SYSTEM_ACTOR as Actor, {
+    const failedAt = new Date().toISOString();
+    await env.DB.prepare("UPDATE tasks SET status = 'in_progress', failed_at = ? WHERE id = ?")
+      .bind(failedAt, task.id).run();
+    await expect(isolatedRoom.createRunnerJob(projectId, SYSTEM_ACTOR as Actor, {
       source: { kind: 'task', id: task.id }, runnerId, repoRef: 'repo', expectedBaseRevision: revision,
     })).rejects.toThrow(/reserved by another live RunnerJob/);
+    expect(await env.DB.prepare('SELECT status, failed_at AS failedAt FROM tasks WHERE id = ?')
+      .bind(task.id).first()).toEqual({ status: 'in_progress', failedAt });
     await expect(env.DB.prepare('UPDATE runner_jobs SET snapshot = ? WHERE id = ?')
       .bind('{}', job.id).run()).rejects.toThrow(/immutable/);
+  });
+
+  it('commissions an explicit failed retry as a fresh job without changing terminal history', async () => {
+    const task = await room.createTask(pid, SYSTEM_ACTOR as Actor, { title: 'Retry failed task' });
+    const prior = await room.createRunnerJob(pid, SYSTEM_ACTOR as Actor, {
+      source: { kind: 'task', id: task.id }, runnerId, repoRef: 'repo', expectedBaseRevision: revision,
+    });
+    await room.cancelRunnerJob(pid, SYSTEM_ACTOR as Actor, prior.id);
+    const historical = await env.DB.prepare(
+      `SELECT snapshot, assignment_id AS assignmentId, status, updated_at AS updatedAt
+         FROM runner_jobs WHERE id = ?`,
+    ).bind(prior.id).first();
+    const failedAt = new Date().toISOString();
+    await env.DB.prepare(
+      "UPDATE tasks SET status = 'in_progress', failed_at = ?, claimed_by = NULL, claim_expires_at = NULL WHERE id = ?",
+    ).bind(failedAt, task.id).run();
+
+    const retry = await room.createRunnerJob(pid, SYSTEM_ACTOR as Actor, {
+      source: { kind: 'task', id: task.id }, runnerId, repoRef: 'repo', expectedBaseRevision: revision,
+    });
+
+    expect(retry.id).not.toBe(prior.id);
+    expect(retry.assignmentId).not.toBe(prior.assignmentId);
+    expect(RunnerJobSource.parse(retry.source)).toMatchObject({
+      kind: 'task', task: { taskId: task.id, status: 'failed', retry: true },
+    });
+    expect(await env.DB.prepare(
+      `SELECT snapshot, assignment_id AS assignmentId, status, updated_at AS updatedAt
+         FROM runner_jobs WHERE id = ?`,
+    ).bind(prior.id).first()).toEqual(historical);
+    expect(await env.DB.prepare('SELECT status, failed_at AS failedAt FROM tasks WHERE id = ?')
+      .bind(task.id).first()).toEqual({ status: 'todo', failedAt });
+  });
+
+  it('includes todo and failed items together in a plan retry snapshot', async () => {
+    const response = await SELF.fetch('https://noriq.test/api/projects', {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: `RR${crypto.randomUUID().slice(0, 6).toUpperCase()}`, name: 'plan retry runner job' }),
+    });
+    const projectId = ((await response.json()) as { id: string }).id;
+    const isolatedRoom = projectRoom<RoomRpc>(projectId);
+    const todo = await isolatedRoom.createTask(projectId, SYSTEM_ACTOR as Actor, { title: 'Todo item' });
+    const failed = await isolatedRoom.createTask(projectId, SYSTEM_ACTOR as Actor, { title: 'Failed item' });
+    const failedAt = new Date().toISOString();
+    await env.DB.prepare("UPDATE tasks SET status = 'in_progress', failed_at = ? WHERE id = ?")
+      .bind(failedAt, failed.id).run();
+    const planId = `pln_${crypto.randomUUID()}`;
+    const phaseId = `phs_${crypto.randomUUID()}`;
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO plans (id, project_id, title, status) VALUES (?, ?, 'Retry plan', 'active')").bind(planId, projectId),
+      env.DB.prepare("INSERT INTO phases (id, plan_id, title, \"order\") VALUES (?, ?, 'One', 0)").bind(phaseId, planId),
+      env.DB.prepare('INSERT INTO phase_tasks (phase_id, task_id) VALUES (?, ?)').bind(phaseId, todo.id),
+      env.DB.prepare('INSERT INTO phase_tasks (phase_id, task_id) VALUES (?, ?)').bind(phaseId, failed.id),
+    ]);
+
+    const job = await isolatedRoom.createRunnerJob(projectId, SYSTEM_ACTOR as Actor, {
+      source: { kind: 'plan', id: planId }, runnerId, repoRef: 'repo', expectedBaseRevision: revision,
+    });
+    const source = RunnerJobSource.parse(job.source);
+    expect(source.kind).toBe('plan');
+    if (source.kind !== 'plan') throw new Error('expected a plan source');
+    expect(source.tasks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ taskId: todo.id, status: 'todo', retry: false }),
+      expect.objectContaining({ taskId: failed.id, status: 'failed', retry: true }),
+    ]));
+    expect(await env.DB.prepare('SELECT status, failed_at AS failedAt FROM tasks WHERE id = ?')
+      .bind(failed.id).first()).toEqual({ status: 'todo', failedAt });
+  });
+
+  it('rejects a failed retry with a live claim', async () => {
+    const response = await SELF.fetch('https://noriq.test/api/projects', {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: `RC${crypto.randomUUID().slice(0, 6).toUpperCase()}`, name: 'claimed retry isolation' }),
+    });
+    const projectId = ((await response.json()) as { id: string }).id;
+    const isolatedRoom = projectRoom<RoomRpc>(projectId);
+    const task = await isolatedRoom.createTask(projectId, SYSTEM_ACTOR as Actor, { title: 'Claimed failed retry' });
+    const failedAt = new Date().toISOString();
+    await env.DB.prepare("UPDATE tasks SET status = 'in_progress', failed_at = ? WHERE id = ?")
+      .bind(failedAt, task.id).run();
+    const acquiredAt = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 60_000).toISOString();
+    await env.DB.prepare(
+      'INSERT INTO claims (id, task_id, agent_id, acquired_at, expires_at) VALUES (?, ?, ?, ?, ?)',
+    ).bind(`clm_${crypto.randomUUID()}`, task.id, claimAgentId, acquiredAt, expiresAt).run();
+
+    await expect(isolatedRoom.createRunnerJob(projectId, SYSTEM_ACTOR as Actor, {
+      source: { kind: 'task', id: task.id }, runnerId, repoRef: 'repo', expectedBaseRevision: revision,
+    })).rejects.toThrow(new RegExp(`live claims: ${task.key}`));
+    expect(await env.DB.prepare('SELECT status, failed_at AS failedAt FROM tasks WHERE id = ?')
+      .bind(task.id).first()).toEqual({ status: 'in_progress', failedAt });
+  });
+
+  it.each(['blocked', 'review', 'done', 'cancelled'])('does not retry a %s task even with stale failure metadata', async (status) => {
+    const response = await SELF.fetch('https://noriq.test/api/projects', {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: `RI${crypto.randomUUID().slice(0, 6).toUpperCase()}`, name: `${status} retry isolation` }),
+    });
+    const projectId = ((await response.json()) as { id: string }).id;
+    const isolatedRoom = projectRoom<RoomRpc>(projectId);
+    const task = await isolatedRoom.createTask(projectId, SYSTEM_ACTOR as Actor, { title: `Ineligible ${status} retry` });
+    await env.DB.prepare('UPDATE tasks SET status = ?, failed_at = ? WHERE id = ?')
+      .bind(status, new Date().toISOString(), task.id).run();
+
+    await expect(isolatedRoom.createRunnerJob(projectId, SYSTEM_ACTOR as Actor, {
+      source: { kind: 'task', id: task.id }, runnerId, repoRef: 'repo', expectedBaseRevision: revision,
+    })).rejects.toThrow(new RegExp(`is ${status}`));
   });
 
   it('refuses unsettled plan tasks instead of silently selecting around them', async () => {

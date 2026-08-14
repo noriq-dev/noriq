@@ -163,6 +163,32 @@ describe('RunnerJob dispatch target search', () => {
     expect(onDone).toHaveBeenCalledWith('job_1');
   });
 
+  it('makes a failed-task retry explicit and surfaces a commissioning rejection', async () => {
+    const task = {
+      id: 'task_failed', key: 'RUN-513', title: 'Retry me', status: 'failed', priority: 1, type: 'bug',
+      projectId: 'project_1', projectKey: 'RUN', boardId: null, updatedAt: '2026-08-13T00:00:00.000Z',
+    };
+    vi.spyOn(api, 'searchTasks').mockImplementation(async (input) => ({
+      tasks: input.status === 'failed' ? [task] : [], matched: input.status === 'failed' ? 1 : 0, returned: input.status === 'failed' ? 1 : 0,
+    }));
+    const dispatch = vi.spyOn(api, 'dispatchTaskJob').mockRejectedValue(new Error('selected tasks have live claims: RUN-513'));
+    const onDone = renderDispatchForm();
+
+    const input = container.querySelector<HTMLInputElement>('[aria-label="Task"]')!;
+    act(() => input.focus());
+    act(() => inputValue(input, 'RUN-513'));
+    await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+    act(() => container.querySelector<HTMLElement>('[role="option"]')!.click());
+    expect(container.textContent).toContain('Retry creates a fresh RunnerJob');
+    const retry = [...container.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent === 'retry task')!;
+    await act(async () => { retry.click(); });
+
+    expect(dispatch).toHaveBeenCalledWith('project_1', 'task_failed', { runnerId: 'runner_1', repoRef: 'repo_1' });
+    expect(container.textContent).toContain('selected tasks have live claims: RUN-513');
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
   it('dispatches a searched plan even when the Runs snapshot contains no plans', async () => {
     const plan = {
       id: 'plan_1', title: 'Remote plan', description: 'Not in the snapshot', status: 'active',

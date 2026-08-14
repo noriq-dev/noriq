@@ -8,6 +8,7 @@ export interface AsyncSearchOption { id: string }
 interface AsyncSearchSelectProps<T extends AsyncSearchOption> {
   value: string;
   onChange: (id: string) => void;
+  onSelect?: (option: T | null) => void;
   initialOptions?: T[];
   loadOptions: (query: string, signal: AbortSignal) => Promise<T[]>;
   optionLabel: (option: T) => string;
@@ -24,6 +25,7 @@ const SEARCH_DELAY_MS = 200;
 export function AsyncSearchSelect<T extends AsyncSearchOption>({
   value,
   onChange,
+  onSelect,
   initialOptions = [],
   loadOptions,
   optionLabel,
@@ -122,6 +124,7 @@ export function AsyncSearchSelect<T extends AsyncSearchOption>({
   const choose = (option: T | null) => {
     setSelected(option);
     onChange(option?.id ?? '');
+    onSelect?.(option);
     setQuery('');
     setOpen(false);
   };
