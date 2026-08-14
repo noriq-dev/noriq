@@ -4441,6 +4441,7 @@ app.get('/api/projects/:pid/runner-jobs/:jobId', userAuth, async (c) => {
     c.env.DB.prepare(
       `SELECT task_id AS taskId, task_key AS taskKey, phase_order AS phaseOrder,
               task_order AS taskOrder, status, plan, checkpoint_ref AS checkpointRef,
+              phase, progress, phase_updated_at AS phaseUpdatedAt,
               summary, findings, projection_conflict AS projectionConflict,
               started_at AS startedAt, finished_at AS finishedAt,
               intelligence_started_received_at AS intelligenceStartedReceivedAt,

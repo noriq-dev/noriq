@@ -228,4 +228,141 @@ describe('RunnerJob durable intelligence projection (PLNR-510)', () => {
     );
     expect(await detailResponse.json()).toMatchObject({ job: { detailPrunedAt: expect.any(String) } });
   }, 60_000);
+
+  it('projects adaptive routes and price basis idempotently while task progress stays task-scoped', async () => {
+    const task = await room.createTask(projectId, SYSTEM_ACTOR as Actor, { title: 'Adaptive projected task' });
+    const job = await room.createRunnerJob(projectId, SYSTEM_ACTOR as Actor, {
+      source: { kind: 'task', id: task.id }, runnerId, repoRef: 'repo', expectedBaseRevision: revision,
+    });
+    await room.assignRunnerJob(projectId, job.id, runnerId);
+    await room.acceptRunnerJob(projectId, job.id, runnerId, job.assignmentId);
+    const at = '2026-08-14T12:00:00.000Z';
+    const routeEvent = {
+      type: 'agent.route', at,
+      route: {
+        taskId: task.id, role: 'build', attempt: 1, policyVersion: 'adaptive-v1',
+        size: 'medium', risk: 'high', specCoverage: 'complete',
+        reasons: ['risk.high'], candidateCount: 2, eligibleCount: 1,
+        actor, decision: 'invoke',
+      },
+    };
+    expect(await room.recordRunnerJobEvent(
+      projectId, job.id, runnerId, job.assignmentId, 1, routeEvent,
+    )).toMatchObject({ accepted: true, ack: 1 });
+    expect(await room.recordRunnerJobEvent(
+      projectId, job.id, runnerId, job.assignmentId, 1, routeEvent,
+    )).toMatchObject({ accepted: true, ack: 1 });
+    expect(await room.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 2, {
+      type: 'progress', at, taskId: task.id, phase: 'building', message: 'task build', progress: 0.4,
+    })).toMatchObject({ accepted: true, ack: 2 });
+    expect(await env.DB.prepare(
+      'SELECT phase, progress FROM runner_job_items WHERE job_id = ? AND task_id = ?',
+    ).bind(job.id, task.id).first()).toEqual({ phase: 'building', progress: 0.4 });
+    expect(await env.DB.prepare('SELECT phase FROM runner_jobs WHERE id = ?').bind(job.id).first())
+      .toEqual({ phase: 'preparing' });
+    const derivedUsage = {
+      inputTokens: complete(100), outputTokens: complete(25),
+      cacheReadTokens: notApplicable(), cacheWriteTokens: notApplicable(), calls: complete(1),
+      costUsd: { status: 'partial' as const, value: 0.125, provenance: 'derived' as const },
+    };
+    const stageEvent = {
+      type: 'stage.finished', at, startedAt: at, observationId: 'obs_adaptive', taskId: task.id,
+      stage: 'build', attempt: 1, actor, outcome: 'succeeded', duration: complete(1_000),
+      usage: derivedUsage,
+      costBasis: {
+        kind: 'api_list_estimate',
+        priceSource: {
+          provider: 'openai', catalog: 'official-api-list', fetchedAt: at, ageSeconds: 7_200, stale: true,
+        },
+      },
+      recovery: 'none', evidence: evidence(1),
+    };
+    expect(await room.recordRunnerJobEvent(
+      projectId, job.id, runnerId, job.assignmentId, 3, stageEvent,
+    )).toMatchObject({ accepted: true, ack: 3 });
+    expect(await room.recordRunnerJobEvent(
+      projectId, job.id, runnerId, job.assignmentId, 3, stageEvent,
+    )).toMatchObject({ accepted: true, ack: 3 });
+    expect(await room.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 4, {
+      ...stageEvent, observationId: 'obs_no_price', stage: 'review',
+      usage: {
+        ...derivedUsage,
+        costUsd: { status: 'unavailable', value: null, provenance: 'not_reported' },
+      },
+      costBasis: undefined,
+    })).toMatchObject({ accepted: true, ack: 4 });
+    expect(await room.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 5, {
+      type: 'task.result', at, taskId: task.id, status: 'accepted',
+      checkpoint: { ref: revision, label: task.key, url: null }, summary: 'done', findings: [],
+    })).toMatchObject({ accepted: true, ack: 5 });
+    expect(await room.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 6, {
+      type: 'terminal', at, status: 'succeeded', output: {
+        workspaceMode: 'isolated', retainedLocation: { vcs: 'git', label: 'worktree', url: null },
+        baseRevision: revision, headRevision: revision,
+        acceptedTaskCheckpoints: { [task.id]: { ref: revision, label: task.key, url: null } },
+        checks: [], findings: [],
+        usage: { inputTokens: 100, outputTokens: 25, cachedTokens: 0, costUsd: null, calls: 1 },
+        summary: 'complete', dirtyPaths: [],
+      },
+    })).toMatchObject({ accepted: true, ack: 6 });
+
+    expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM runner_job_routes WHERE job_id = ?')
+      .bind(job.id).first<{ n: number }>()).toEqual({ n: 1 });
+    expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM runner_job_observations WHERE job_id = ?')
+      .bind(job.id).first<{ n: number }>()).toEqual({ n: 2 });
+    expect(await env.DB.prepare('SELECT phase FROM runner_jobs WHERE id = ?').bind(job.id).first())
+      .toEqual({ phase: 'finalizing' });
+
+    const firstProjection = await recordEpisodesForRunnerJob(appEnv, projectId, job.id);
+    const secondProjection = await recordEpisodesForRunnerJob(appEnv, projectId, job.id);
+    expect(secondProjection).toEqual(firstProjection);
+    const taskSummary = await env.DB.prepare(
+      'SELECT usage, stages FROM runner_job_intelligence_tasks WHERE job_id = ? AND task_id = ?',
+    ).bind(job.id, task.id).first<{ usage: string; stages: string }>();
+    expect(JSON.parse(taskSummary!.usage).costUsd).toMatchObject({ status: 'partial', value: 0.125 });
+    expect(JSON.parse(taskSummary!.stages)).toMatchObject({
+      routes: [{ policyVersion: 'adaptive-v1', actor: { model: 'gpt-test' } }],
+      build: {
+        facts: [{
+          route: { size: 'medium', risk: 'high', specCoverage: 'complete' },
+          costBasis: { kind: 'api_list_estimate', priceSource: { stale: true, ageSeconds: 7_200 } },
+          costUsd: { status: 'partial', value: 0.125, provenance: 'derived' },
+        }],
+      },
+      review: { facts: [{ costBasis: null, costUsd: { status: 'unavailable', value: null } }] },
+    });
+    const memory = appEnv.PROJECT_MEMORY.get(
+      appEnv.PROJECT_MEMORY.idFromName(projectId),
+    ) as unknown as MemoryRpc;
+    const episode = await memory._getEpisodeForTest(
+      projectId, `runner_job:${job.id}:task:${task.id}`, 1,
+    ) as any;
+    expect(episode.intelligence.execution.stages).toHaveLength(2);
+    expect(episode.intelligence.execution.stages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        actor: expect.objectContaining({ model: 'gpt-test', effort: 'medium' }),
+        route: expect.objectContaining({ policyVersion: 'adaptive-v1', size: 'medium', risk: 'high' }),
+        costBasis: expect.objectContaining({ kind: 'api_list_estimate' }),
+        costUSD: expect.objectContaining({ status: 'partial', value: 0.125, provenance: 'derived' }),
+      }),
+      expect.objectContaining({
+        stage: 'review', costUSD: expect.objectContaining({ status: 'unavailable', value: null }),
+      }),
+    ]));
+    const activity = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/runner-jobs/${job.id}/activity?taskId=${task.id}`,
+      { headers: { Cookie: cookie } },
+    );
+    expect(await activity.json()).toMatchObject({
+      items: expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'milestone', type: 'agent_route', route: expect.objectContaining({ taskId: task.id }),
+        }),
+        expect.objectContaining({
+          kind: 'stage', observationId: 'obs_adaptive',
+          costBasis: expect.objectContaining({ kind: 'api_list_estimate' }),
+        }),
+      ]),
+    });
+  }, 60_000);
 });

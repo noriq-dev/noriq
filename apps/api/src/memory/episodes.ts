@@ -23,7 +23,7 @@
 import type { Env } from '../env';
 import {
   CopilotReportedEvidence, EpisodeLandingOutcome, ExecutionSpec, LineageCompleteness, RunModelUsage,
-  RunnerJobDurationMetric, RunnerJobObservationActor, RunnerJobObservationEvidence,
+  RunnerJobAgentRoute, RunnerJobCostBasis, RunnerJobDurationMetric, RunnerJobObservationActor, RunnerJobObservationEvidence,
   RunnerJobObservationUsage, RunnerJobSource, StrategyCoordinate, UNATTRIBUTED_MODEL_ID,
   type IntelligenceDurationMs, type IntelligenceIntegerMetric, type IntelligenceNumberMetric,
   type IntelligenceRatioMetric, type RunnerJobObservationStage, type WorkEpisodeSource,
@@ -614,7 +614,15 @@ type RunnerJobProjectionObservation = {
   finishedAt: string | null;
   duration: ReturnType<typeof RunnerJobDurationMetric.parse>;
   usage: ReturnType<typeof RunnerJobObservationUsage.parse>;
+  costBasis: ReturnType<typeof RunnerJobCostBasis.parse> | null;
+  route: ReturnType<typeof RunnerJobAgentRoute.parse> | null;
   evidence: ReturnType<typeof RunnerJobObservationEvidence.parse>;
+};
+
+type RunnerJobProjectionRoute = {
+  fact: ReturnType<typeof RunnerJobAgentRoute.parse>;
+  eventSeq: number;
+  observedAt: string;
 };
 
 type CompactMetric = {
@@ -640,6 +648,7 @@ type CompactObservationAggregate = {
 type RunnerMetric = {
   status: 'complete' | 'partial' | 'unavailable' | 'not_applicable';
   value: number | null;
+  provenance?: string;
 };
 
 const compactMetric = (metrics: RunnerMetric[]): CompactMetric => {
@@ -732,14 +741,20 @@ function intelligenceMetric(
   sourceId: string,
   observedAt: string | null,
 ): IntelligenceNumberMetric {
-  const provenance = metric.status === 'unavailable' || metric.status === 'not_applicable'
-    ? 'unavailable' as const : 'runner_observed' as const;
+  const unavailableMetric = metric.status === 'unavailable' || metric.status === 'not_applicable';
+  const provenance = unavailableMetric
+    ? 'unavailable' as const
+    : metric.provenance === 'driver_reported' ? 'driver_reported' as const
+      : metric.provenance === 'derived' ? 'derived' as const : 'runner_observed' as const;
+  const source = unavailableMetric
+    ? 'project_memory_episode' as const
+    : provenance === 'driver_reported' ? 'driver' as const
+      : provenance === 'derived' ? 'derived_generation' as const : 'runner' as const;
   return {
     status: metric.status,
     value: metric.value,
     provenance,
-    source: metric.status === 'unavailable' || metric.status === 'not_applicable'
-      ? 'project_memory_episode' as const : 'runner' as const,
+    source,
     sourceId, observedAt, acceptedAt: null,
     reason: metric.status === 'partial' ? 'known value excludes one or more unavailable components'
       : metric.status === 'unavailable' ? 'Runner or driver did not report this metric'
@@ -816,8 +831,12 @@ function runnerJobLandingOutcome(
   return 'pending';
 }
 
-function stageSummary(rows: RunnerJobProjectionObservation[]): Record<string, unknown> {
-  return Object.fromEntries([...new Set(rows.map((row) => row.stage))].sort().map((stage) => {
+function stageSummary(
+  rows: RunnerJobProjectionObservation[],
+  routes: RunnerJobProjectionRoute[],
+): Record<string, unknown> {
+  return {
+    ...Object.fromEntries([...new Set(rows.map((row) => row.stage))].sort().map((stage) => {
     const stageRows = rows.filter((row) => row.stage === stage);
     return [stage, {
       ...aggregateRunnerJobObservations(stageRows),
@@ -825,8 +844,15 @@ function stageSummary(rows: RunnerJobProjectionObservation[]): Record<string, un
         status, stageRows.filter((row) => row.status === status).length,
       ])),
       maxAttempt: Math.max(...stageRows.map((row) => row.attempt)),
+      facts: stageRows.map((row) => ({
+        observationId: row.observationId, taskId: row.taskId, attempt: row.attempt,
+        actor: row.actor, route: row.route, costBasis: row.costBasis,
+        costUsd: row.usage.costUsd,
+      })),
     }];
-  }));
+    })),
+    routes: routes.map((route) => ({ ...route.fact, eventSeq: route.eventSeq, observedAt: route.observedAt })),
+  };
 }
 
 async function resolveRunnerJobRepositoryKey(
@@ -869,7 +895,7 @@ export async function recordEpisodesForRunnerJob(
   ).bind(jobId, projectId).first<RunnerJobProjectionRow>();
   if (!job) throw new Error(`terminal RunnerJob ${jobId} not found in project ${projectId}`);
 
-  const [itemRows, observationRows, rootExecution, eventRow, tagRows] = await Promise.all([
+  const [itemRows, observationRows, routeRows, rootExecution, eventRow, tagRows] = await Promise.all([
     env.DB.prepare(
       `SELECT i.task_id AS taskId, i.task_key AS taskKey, i.status,
               i.checkpoint_ref AS checkpointRef, i.started_at AS startedAt,
@@ -883,14 +909,18 @@ export async function recordEpisodesForRunnerJob(
     env.DB.prepare(
       `SELECT observation_id AS observationId, task_id AS taskId, stage, attempt, status,
               actor, started_at AS startedAt, finished_at AS finishedAt,
-              duration, usage, evidence
+              duration, usage, cost_basis AS costBasis, evidence
          FROM runner_job_observations WHERE job_id = ?
         ORDER BY COALESCE(finish_seq, start_seq), observation_id`,
     ).bind(jobId).all<{
       observationId: string; taskId: string | null; stage: RunnerJobObservationStage;
       attempt: number; status: string; actor: string; startedAt: string; finishedAt: string | null;
-      duration: string | null; usage: string | null; evidence: string | null;
+      duration: string | null; usage: string | null; costBasis: string | null; evidence: string | null;
     }>(),
+    env.DB.prepare(
+      `SELECT route, event_seq AS eventSeq, observed_at AS observedAt
+         FROM runner_job_routes WHERE job_id = ? ORDER BY event_seq`,
+    ).bind(jobId).all<{ route: string; eventSeq: number; observedAt: string }>(),
     env.DB.prepare(
       `SELECT id, updated_at AS updatedAt FROM execution_nodes
         WHERE orchestration_id = ? AND parent_execution_id IS NULL LIMIT 1`,
@@ -906,30 +936,42 @@ export async function recordEpisodesForRunnerJob(
   if (!rootExecution) throw new Error(`RunnerJob ${jobId} has no root execution identity`);
   const source = RunnerJobSource.parse(JSON.parse(job.snapshot));
   const context = parseJson<Record<string, unknown> | null>(job.intelligenceContext, null);
-  const observations: RunnerJobProjectionObservation[] = observationRows.results.map((row) => ({
-    observationId: row.observationId,
-    taskId: row.taskId,
-    stage: row.stage,
-    attempt: row.attempt,
-    status: row.status,
-    actor: RunnerJobObservationActor.safeParse(parseJson(row.actor, null)).success
-      ? RunnerJobObservationActor.parse(parseJson(row.actor, null))
+  const routes: RunnerJobProjectionRoute[] = routeRows.results.flatMap((row) => {
+    const parsed = RunnerJobAgentRoute.safeParse(parseJson(row.route, null));
+    return parsed.success ? [{ fact: parsed.data, eventSeq: row.eventSeq, observedAt: row.observedAt }] : [];
+  });
+  const observations: RunnerJobProjectionObservation[] = observationRows.results.map((row) => {
+    const parsedActor = RunnerJobObservationActor.safeParse(parseJson(row.actor, null));
+    const actor = parsedActor.success
+      ? parsedActor.data
       : RunnerJobObservationActor.parse({
           kind: 'runner', driver: 'unknown', vendor: null, model: null, effort: null,
           role: null, operation: 'unknown',
-        }),
-    startedAt: row.startedAt,
-    finishedAt: row.finishedAt,
-    duration: RunnerJobDurationMetric.safeParse(parseJson(row.duration, null)).success
-      ? RunnerJobDurationMetric.parse(parseJson(row.duration, null))
-      : RunnerJobDurationMetric.parse(unavailableRunnerMetric()),
-    usage: RunnerJobObservationUsage.safeParse(parseJson(row.usage, null)).success
-      ? RunnerJobObservationUsage.parse(parseJson(row.usage, null))
-      : unavailableRunnerUsage(),
-    evidence: RunnerJobObservationEvidence.safeParse(parseJson(row.evidence, null)).success
-      ? RunnerJobObservationEvidence.parse(parseJson(row.evidence, null))
-      : emptyRunnerEvidence(),
-  }));
+        });
+    const parsedCostBasis = RunnerJobCostBasis.safeParse(parseJson(row.costBasis, null));
+    return {
+      observationId: row.observationId,
+      taskId: row.taskId,
+      stage: row.stage,
+      attempt: row.attempt,
+      status: row.status,
+      actor,
+      startedAt: row.startedAt,
+      finishedAt: row.finishedAt,
+      duration: RunnerJobDurationMetric.safeParse(parseJson(row.duration, null)).success
+        ? RunnerJobDurationMetric.parse(parseJson(row.duration, null))
+        : RunnerJobDurationMetric.parse(unavailableRunnerMetric()),
+      usage: RunnerJobObservationUsage.safeParse(parseJson(row.usage, null)).success
+        ? RunnerJobObservationUsage.parse(parseJson(row.usage, null))
+        : unavailableRunnerUsage(),
+      costBasis: parsedCostBasis.success ? parsedCostBasis.data : null,
+      route: routes.find((route) => route.fact.taskId === row.taskId
+        && route.fact.role === actor.role && route.fact.attempt === row.attempt)?.fact ?? null,
+      evidence: RunnerJobObservationEvidence.safeParse(parseJson(row.evidence, null)).success
+        ? RunnerJobObservationEvidence.parse(parseJson(row.evidence, null))
+        : emptyRunnerEvidence(),
+    };
+  });
   const repositoryKey = await resolveRunnerJobRepositoryKey(env, projectId, job.runnerId, job.repoRef);
   const byTask = new Map(itemRows.results.map((item) => [
     item.taskId, aggregateRunnerJobObservations(observations.filter((row) => row.taskId === item.taskId)),
@@ -1017,6 +1059,8 @@ export async function recordEpisodesForRunnerJob(
           ]);
           return {
             executionId: rootExecution.id, kind: 'stage' as const, role: stageRole(row), stage: row.stage,
+            actor: row.actor, ...(row.route ? { route: row.route } : {}),
+            ...(row.costBasis ? { costBasis: row.costBasis } : {}),
             elapsedMs: intelligenceMetric(row.duration, row.observationId, row.finishedAt) as IntelligenceDurationMs,
             tokens: aggregateIntelligenceMetric(tokenMetric, row.observationId, row.finishedAt) as IntelligenceIntegerMetric,
             costUSD: intelligenceMetric(row.usage.costUsd, row.observationId, row.finishedAt),
@@ -1088,7 +1132,9 @@ export async function recordEpisodesForRunnerJob(
         workStartedAt: item.workStartedAt, workFinishedAt: item.workFinishedAt,
         elapsedMs: taskElapsed,
       }),
-      JSON.stringify(taskAggregate), JSON.stringify(stageSummary(taskObservations)),
+      JSON.stringify(taskAggregate), JSON.stringify(stageSummary(
+        taskObservations, routes.filter((route) => route.fact.taskId === item.taskId),
+      )),
       JSON.stringify({
         policy: job.landingPolicy, status: job.landingStatus, outcome: landingOutcome,
         target: job.landingTarget, requestedAt: job.landingRequestedAt,
@@ -1131,7 +1177,7 @@ export async function recordEpisodesForRunnerJob(
           comparableAxes: ['durationMs','inputTokens','outputTokens','cacheReadTokens','cacheWriteTokens','calls','costUsd'],
         },
       }),
-      JSON.stringify(stageSummary(observations)),
+      JSON.stringify(stageSummary(observations, routes)),
       JSON.stringify({
         observations: overhead, queueMs: elapsed(job.createdAt, job.workStartedAt),
         humanWaitMs: job.humanWaitMs,

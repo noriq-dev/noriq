@@ -1,3 +1,5 @@
+import { RunnerJobAgentRoute } from '@noriq-dev/shared';
+
 type ActivityOptions = { cursor?: string; limit?: number; taskId?: string };
 
 type JobRow = {
@@ -13,6 +15,7 @@ type ObservationRow = Record<string, unknown> & {
   observationId: string; taskId: string | null; stage: string; attempt: number; status: string;
   actor: string; startedAt: string; finishedAt: string | null; duration: string | null;
   usage: string | null; evidence: string | null; cursorSeq: number;
+  costBasis: string | null;
   recovery: string | null; startSeq: number | null; finishSeq: number | null;
   startReceivedAt: string; finishReceivedAt: string | null;
 };
@@ -89,11 +92,25 @@ function milestone(input: {
 
 function eventMilestone(row: EventRow, taskScope: string | null) {
   const payload = parseJson<Record<string, unknown>>(row.payload, {});
-  const taskId = typeof payload.taskId === 'string' ? payload.taskId : null;
+  const parsedRoute = row.eventType === 'agent.route'
+    ? RunnerJobAgentRoute.safeParse(payload.route)
+    : null;
+  const route = parsedRoute?.success ? parsedRoute.data : null;
+  const taskId = route?.taskId ?? (typeof payload.taskId === 'string' ? payload.taskId : null);
   if (taskScope === 'overhead' && taskId) return null;
   if (taskScope && taskScope !== 'overhead' && taskId && taskId !== taskScope) return null;
   const common = { id: `event:${row.seq}`, occurredAt: row.observedAt, updatedAt: row.receivedAt, cursorSeq: row.seq, taskId };
   switch (row.eventType) {
+    case 'agent.route':
+      if (!route) return null;
+      return {
+        ...milestone({
+          ...common, type: 'agent_route',
+          status: route.decision === 'invoke' ? 'succeeded' : 'skipped',
+          title: route.decision === 'invoke' ? 'Agent route selected' : 'Agent invocation skipped',
+        }),
+        route,
+      };
     case 'job.context':
       return milestone({ ...common, type: 'workspace_prepared', status: 'succeeded', title: 'Workspace prepared', detail: [text(payload.vcs, 100), text(payload.workspaceMode, 100)].filter(Boolean).join(' · ') || null });
     case 'progress':
@@ -146,7 +163,8 @@ export async function readRunnerJobActivity(
   const [observations, events, answeredQuestions] = await Promise.all([
     db.prepare(
       `SELECT observation_id AS observationId, task_id AS taskId, stage, attempt, actor, status,
-              started_at AS startedAt, finished_at AS finishedAt, duration, usage, recovery, evidence,
+              started_at AS startedAt, finished_at AS finishedAt, duration, usage,
+              cost_basis AS costBasis, recovery, evidence,
               start_seq AS startSeq, finish_seq AS finishSeq, start_received_at AS startReceivedAt,
               finish_received_at AS finishReceivedAt, COALESCE(finish_seq, start_seq) AS cursorSeq
          FROM runner_job_observations
@@ -157,7 +175,7 @@ export async function readRunnerJobActivity(
       `SELECT seq, event_type AS eventType, payload, observed_at AS observedAt, received_at AS receivedAt
          FROM runner_job_events
         WHERE job_id = ? AND seq > ?
-          AND event_type IN ('job.context','progress','task.result','question','warning','terminal')
+          AND event_type IN ('job.context','agent.route','progress','task.result','question','warning','terminal')
         ORDER BY seq LIMIT ?`,
     ).bind(jobId, afterSeq, limit + 1).all<EventRow>(),
     db.prepare(
@@ -184,6 +202,7 @@ export async function readRunnerJobActivity(
         updatedAt: row.finishReceivedAt ?? row.startReceivedAt,
         duration: parseJson(row.duration, null),
         usage: parseJson(row.usage, null),
+        costBasis: parseJson(row.costBasis, null),
         recovery: row.recovery,
         evidence: row.evidence === null ? null : sanitizedEvidence(row.evidence),
         startSeq: row.startSeq,
