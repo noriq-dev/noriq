@@ -4,6 +4,7 @@ import type { Env } from '../src/env';
 import { taskClaimability } from '../src/lib/claimability';
 import { assessProjectBottlenecks } from '../src/memory/bottlenecks';
 import { createAgent, mcpCall } from './helpers';
+import { RUNNER_JOB_CAPABILITY, RUNNER_PROTOCOL_CAPABILITIES } from '@noriq-dev/shared';
 
 const appEnv = env as unknown as Env;
 const observedAt = '2026-08-09T12:00:00.000Z';
@@ -33,20 +34,83 @@ async function task(
   return { id: response.body.id as string, key: response.body.key as string };
 }
 
-async function runner(projectId: string, id: string, heartbeat = observedAt, maxConcurrency = 2) {
+async function runner(
+  projectId: string,
+  id: string,
+  heartbeat = observedAt,
+  maxConcurrency = 2,
+  advertised: { kinds?: string[]; protocolCapabilities?: string[] } = {},
+) {
+  const capabilities = {
+    tools: ['codex'],
+    kinds: advertised.kinds ?? ['build'],
+    maxConcurrency,
+    agents: [],
+    ...(advertised.protocolCapabilities === undefined
+      ? {}
+      : { protocolCapabilities: advertised.protocolCapabilities }),
+  };
   await appEnv.DB.prepare(
     `INSERT INTO runners
       (id, project_id, label, status, capabilities, repos, free_slots, last_heartbeat_at, created_at)
      VALUES (?, ?, ?, 'online', ?, ?, ?, ?, ?)`,
   ).bind(
     id, projectId, id,
-    JSON.stringify({ tools: ['codex'], kinds: ['build'], maxConcurrency, agents: [] }),
+    JSON.stringify(capabilities),
     JSON.stringify([{ id: `repo_${id}`, projectId, repositoryKey: 'noriq', defaultBranch: 'main' }]),
     maxConcurrency, heartbeat, heartbeat,
   ).run();
 }
 
 describe('collision and bottleneck evidence (PLNR-296)', () => {
+  it('recognizes explicit RunnerJob v2 and legacy build capacity without inventing zero capacity', async () => {
+    expect(RUNNER_PROTOCOL_CAPABILITIES).not.toContain(RUNNER_JOB_CAPABILITY);
+
+    const runnerJobProject = await project('BTJOBV2', 'RunnerJob v2 capacity');
+    await runner(runnerJobProject, 'rnr_bt_job_v2', observedAt, 2, {
+      kinds: [], protocolCapabilities: [RUNNER_JOB_CAPABILITY],
+    });
+    const runnerJob = await assessProjectBottlenecks(appEnv, runnerJobProject, {
+      repositoryKey: 'noriq', observedAt,
+    });
+    expect(runnerJob.capacity).toMatchObject({
+      status: 'observed', availableSlots: 2, activeCapableRunners: 1,
+      runners: [{ buildCapable: true, maxConcurrency: 2, busyRuns: 0, derivedFreeSlots: 2 }],
+    });
+
+    const legacyProject = await project('BTLEGACY', 'Legacy build capacity');
+    await runner(legacyProject, 'rnr_bt_legacy', observedAt, 2);
+    const legacy = await assessProjectBottlenecks(appEnv, legacyProject, {
+      repositoryKey: 'noriq', observedAt,
+    });
+    expect(legacy.capacity).toMatchObject({
+      status: 'observed', availableSlots: 2, activeCapableRunners: 1,
+      runners: [{ buildCapable: true, derivedFreeSlots: 2 }],
+    });
+
+    const incapableProject = await project('BTINCAP', 'No advertised execution protocol');
+    await runner(incapableProject, 'rnr_bt_incapable', observedAt, 2, {
+      kinds: [], protocolCapabilities: [],
+    });
+    const incapable = await assessProjectBottlenecks(appEnv, incapableProject, {
+      repositoryKey: 'noriq', observedAt,
+    });
+    expect(incapable.capacity).toMatchObject({
+      status: 'unanswerable', availableSlots: null, activeCapableRunners: 0,
+      runners: [{ buildCapable: false, completeness: 'complete', derivedFreeSlots: null }],
+    });
+
+    const unknownProject = await project('BTUNKN', 'Unknown RunnerJob capability');
+    await runner(unknownProject, 'rnr_bt_unknown', observedAt, 2, { kinds: [] });
+    const unknown = await assessProjectBottlenecks(appEnv, unknownProject, {
+      repositoryKey: 'noriq', observedAt,
+    });
+    expect(unknown.capacity).toMatchObject({
+      status: 'unanswerable', availableSlots: null, activeCapableRunners: 0,
+      runners: [{ buildCapable: null, completeness: 'partial', derivedFreeSlots: null }],
+    });
+  });
+
   it('does not load an explicit focus task from another project', async () => {
     const projectId = await project('BTISO', 'Bottleneck focus isolation');
     const otherProjectId = await project('BTOTHER', 'Other bottleneck project');

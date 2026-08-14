@@ -11,7 +11,7 @@ import {
 } from '../lib/lockmatch';
 import { RUNNER_HEARTBEAT_TTL_MS } from '../lib/runner-roster';
 import type { ProjectMemoryStub } from '../lib/project-memory';
-import { buildEntityUri } from '@noriq-dev/shared';
+import { buildEntityUri, RUNNER_JOB_CAPABILITY } from '@noriq-dev/shared';
 import type { PriorEffortCase } from './similar-effort';
 
 export const BOTTLENECK_ASSESSMENT_VERSION = 'collision-bottleneck-v1';
@@ -155,7 +155,9 @@ export interface BottleneckAssessmentResult {
     runners: Array<{
       id: string; label: string; lifecycle: 'active' | 'stale' | 'draining' | 'retired';
       heartbeatAt: string | null; heartbeatFresh: boolean; presenceState: string | null;
-      advertisesProject: boolean; advertisesRepository: boolean | null; buildCapable: boolean | null;
+      advertisesProject: boolean; advertisesRepository: boolean | null;
+      /** Legacy field name: true for either explicit legacy-build or RunnerJob-v2 support. */
+      buildCapable: boolean | null;
       maxConcurrency: number | null; reportedFreeSlots: number; busyRuns: number;
       derivedFreeSlots: number | null; completeness: 'complete' | 'partial' | 'unavailable';
     }>;
@@ -299,11 +301,25 @@ function capacityFacts(
     let repoRows: Array<{ projectId?: string | null; repositoryKey?: string | null }> = [];
     let completeness: 'complete' | 'partial' | 'unavailable' = 'complete';
     try {
-      const capabilities = JSON.parse(row.capabilities || '{}') as { maxConcurrency?: unknown; kinds?: unknown };
+      const capabilities = JSON.parse(row.capabilities || '{}') as {
+        maxConcurrency?: unknown;
+        kinds?: unknown;
+        protocolCapabilities?: unknown;
+      };
       if (typeof capabilities.maxConcurrency === 'number' && Number.isInteger(capabilities.maxConcurrency) && capabilities.maxConcurrency >= 0) {
         maxConcurrency = capabilities.maxConcurrency;
       }
-      buildCapable = Array.isArray(capabilities.kinds) ? capabilities.kinds.includes('build') : null;
+      const legacyBuildCapable = Array.isArray(capabilities.kinds)
+        ? capabilities.kinds.includes('build')
+        : null;
+      const runnerJobCapable = Array.isArray(capabilities.protocolCapabilities)
+        ? capabilities.protocolCapabilities.includes(RUNNER_JOB_CAPABILITY)
+        : null;
+      buildCapable = legacyBuildCapable === true || runnerJobCapable === true
+        ? true
+        : legacyBuildCapable === false && runnerJobCapable === false
+          ? false
+          : null;
       if (maxConcurrency == null || buildCapable == null) completeness = 'partial';
     } catch { completeness = 'unavailable'; }
     try { repoRows = JSON.parse(row.repos || '[]') as typeof repoRows; } catch { completeness = 'unavailable'; }

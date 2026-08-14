@@ -6,6 +6,7 @@ import { createUser, loginSession, mintTokenForUser, authorizeForAllProjects, pr
 import type { Env } from '../src/env';
 import type { Actor } from '../src/do/ProjectRoom';
 import { resolveRepositoryByKey, listRepositoryCheckouts } from '../src/lib/project-memory';
+import { RUNNER_JOB_CAPABILITY } from '@noriq-dev/shared';
 
 const appEnv = env as unknown as Env;
 
@@ -60,6 +61,7 @@ describe('runners (RUN-5)', () => {
     const res = await register(ownerToken, {
       label: 'montana-laptop',
       tools: ['claude', 'codex'], kinds: ['scope', 'build', 'verify'], maxConcurrency: 2,
+      protocolCapabilities: [RUNNER_JOB_CAPABILITY],
       repos: [
         { id: 'repo_a', projectKey: 'rnrx' },   // lowercase → normalized + resolved
         { id: 'repo_b', projectKey: 'NOSUCH' },  // no such project → null
@@ -72,7 +74,13 @@ describe('runners (RUN-5)', () => {
     expect(runner.freeSlots).toBe(2);
     // A registration that sends no coordinate catalog (RUN-115) defaults `agents` to [] — the
     // dashboard picker falls back to free-text for an older runner.
-    expect(runner.capabilities).toEqual({ tools: ['claude', 'codex'], kinds: ['scope', 'build', 'verify'], maxConcurrency: 2, agents: [] });
+    expect(runner.capabilities).toEqual({
+      tools: ['claude', 'codex'],
+      kinds: ['scope', 'build', 'verify'],
+      protocolCapabilities: [RUNNER_JOB_CAPABILITY],
+      maxConcurrency: 2,
+      agents: [],
+    });
     const byId = Object.fromEntries(runner.repos.map((r: any) => [r.id, r]));
     expect(byId.repo_a.projectKey).toBe('RNRX'); // normalized
     expect(byId.repo_a.projectId).toBe(rnrxProjectId); // resolved

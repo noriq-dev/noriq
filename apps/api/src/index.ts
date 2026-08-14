@@ -3721,9 +3721,10 @@ const RegisterRunnerBody = z.object({
   kinds: z.array(RunKind).default([]),
   maxConcurrency: z.number().int().nonnegative().default(1),
   repos: z.array(RunnerRepo).default([]),
-  // Runtime protocol features are negotiated again on the WebSocket hello. Registration only
-  // needs this bounded advertisement to choose the restart policy before that socket exists.
-  protocolCapabilities: z.array(RunnerProtocolCapability).max(16).default([]),
+  // Runtime protocol features are negotiated again on the WebSocket hello. Registration keeps
+  // this bounded advertisement for restart policy and durable capacity evidence. Omitted means
+  // an older daemon whose support is unknown; an explicit [] means it advertises neither.
+  protocolCapabilities: z.array(RunnerProtocolCapability).max(16).optional(),
   /** The daemon's RELEASE version (RUN-36). Optional: a runner older than version reporting
    *  still registers, and the panel says "unknown" rather than inventing a number. */
   version: z.string().max(40).optional(),
@@ -3880,7 +3881,15 @@ app.post('/api/runners', agentAuth, async (c) => {
   const b = parsed.data;
   const userId = c.var.connection!.userId;
   const repos = await resolveRunnerRepos(c.env, userId, b.repos, c.var.connection!.tokenId);
-  const capabilities = JSON.stringify({ tools: b.tools, kinds: b.kinds, maxConcurrency: b.maxConcurrency, agents: b.agents });
+  const capabilities = JSON.stringify({
+    tools: b.tools,
+    kinds: b.kinds,
+    ...(b.protocolCapabilities === undefined
+      ? {}
+      : { protocolCapabilities: b.protocolCapabilities }),
+    maxConcurrency: b.maxConcurrency,
+    agents: b.agents,
+  });
   const now = nowIso();
   let id = b.runnerId;
   if (id) {
@@ -3908,7 +3917,7 @@ app.post('/api/runners', agentAuth, async (c) => {
       "SELECT DISTINCT project_id AS pid FROM runs WHERE runner_id = ? AND status IN ('dispatched','running','blocked')",
     ).bind(id).all<{ pid: string }>();
     const sysActor: Actor = { kind: 'system', id: 'system', name: 'system' };
-    const canReconcileMissions = b.protocolCapabilities.includes(MISSION_CAPABILITY);
+    const canReconcileMissions = b.protocolCapabilities?.includes(MISSION_CAPABILITY) ?? false;
     for (const { pid } of staleProjects) {
       if (canReconcileMissions) {
         await room(c.env, pid).markRunnerMissionReconciliationPending(pid, id);
