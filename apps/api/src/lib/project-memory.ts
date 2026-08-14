@@ -4,7 +4,7 @@
 // runs first, at the Worker boundary, before env.PROJECT_MEMORY.get() is ever called.
 import type { Env } from '../env';
 import type {
-  ProjectMemoryHealth, IndexGenerationSummary, MemoryBackupExportBeginResult, MemoryBackupExportContinueResult,
+  ProjectMemoryHealth, IndexGenerationSummary, MemoryBackupExportBeginResult, MemoryBackupExportContinueResult, ActiveCodeIndexRead,
 } from '../do/ProjectMemory';
 import type { RankedHit } from '../memory/retrieval';
 import type { DuplicateWarning, EffortSummary, PriorEffortCase } from '../memory/similar-effort';
@@ -221,6 +221,12 @@ export interface ProjectMemoryStub {
   ): Promise<{ findings: number; newFindings: number }>;
   /** PLNR-266: the stored, deduplicated guidance-drift findings for this project — read-only. */
   listGuidanceDriftFindings(projectId: string): Promise<GuidanceDriftFindingRecord[]>;
+  /** PLNR-524: active-generation identity plus exact staged content resolution. Vector
+   * metadata is never accepted as source text or citation scope. */
+  readActiveCodeIndex(
+    projectId: string,
+    input: { repositoryKey: string; generationId?: string; branch?: string; baseId?: string; uris?: string[]; maxContentChars?: number },
+  ): Promise<ActiveCodeIndexRead>;
   /** PLNR-257: bounded multi-hop graph traversal from one or more seed nodes, each hit carrying
    *  the edge path back to its seed — the general read API `_traverseFrom` was a narrow
    *  test-only stand-in for. */

@@ -240,6 +240,28 @@ export interface IndexGenerationSummary {
   activatedAt: string | null;
 }
 
+export interface ActiveCodeIndexScope {
+  projectId: string;
+  repositoryKey: string;
+  generationId: string;
+  branch: string;
+  baseId: string;
+}
+
+export interface ActiveCodeIndexEntity extends ActiveCodeIndexScope {
+  uri: string;
+  path: string;
+  symbol: string | null;
+  entityType: 'file' | 'symbol' | 'test' | 'api';
+  label: string;
+  content: string;
+  contentTruncated: boolean;
+}
+
+export type ActiveCodeIndexRead =
+  | { available: true; scope: ActiveCodeIndexScope; entities: ActiveCodeIndexEntity[] }
+  | { available: false; reason: 'active-generation-unavailable' | 'active-generation-changed' | 'scope-mismatch' };
+
 interface AnalyticsHealthGenerationRow {
   [key: string]: string | number | null;
   id: string;
@@ -2967,6 +2989,78 @@ export class ProjectMemory extends DurableObject<Env> {
       createdAt: r.created_at,
       activatedAt: r.activated_at,
     }));
+  }
+
+  /**
+   * PLNR-524: the authoritative half of code-context retrieval. Vectorize may suggest URIs, but
+   * only this read can turn them into source evidence. It re-checks the active generation on
+   * every call and selects content by the exact (generation_id, uri) key, so a cutover between
+   * candidate selection and resolution fails open instead of serving the superseded checkout.
+   */
+  async readActiveCodeIndex(
+    projectId: string,
+    input: {
+      repositoryKey: string;
+      generationId?: string;
+      branch?: string;
+      baseId?: string;
+      uris?: string[];
+      maxContentChars?: number;
+    },
+  ): Promise<ActiveCodeIndexRead> {
+    await this.assertProjectId(projectId);
+    const generation = this.ctx.storage.sql.exec<{ id: string; branch: string; base_id: string }>(
+      `SELECT id, branch, base_id FROM index_generations
+       WHERE repository_key = ?1 AND status = 'active'`,
+      input.repositoryKey,
+    ).toArray()[0];
+    if (!generation) return { available: false, reason: 'active-generation-unavailable' };
+    if (input.generationId && input.generationId !== generation.id) {
+      return { available: false, reason: 'active-generation-changed' };
+    }
+    if ((input.branch && input.branch !== generation.branch) || (input.baseId && input.baseId !== generation.base_id)) {
+      return { available: false, reason: 'scope-mismatch' };
+    }
+
+    const scope: ActiveCodeIndexScope = {
+      projectId,
+      repositoryKey: input.repositoryKey,
+      generationId: generation.id,
+      branch: generation.branch,
+      baseId: generation.base_id,
+    };
+    const uris = [...new Set(input.uris ?? [])].slice(0, 12);
+    if (!uris.length) return { available: true, scope, entities: [] };
+    const maxContentChars = Math.min(Math.max(Math.floor(input.maxContentChars ?? 2400), 1), 4000);
+    const placeholders = uris.map((_, index) => `?${index + 2}`).join(',');
+    const rows = this.ctx.storage.sql.exec<{ uri: string; type: string; label: string; content: string | null }>(
+      `SELECT uri, type, label, content FROM index_staged_entities
+       WHERE generation_id = ?1 AND uri IN (${placeholders})`,
+      generation.id,
+      ...uris,
+    ).toArray();
+    const byUri = new Map(rows.map((row) => [row.uri, row]));
+    const projectKey = await this.resolveProjectKey(projectId);
+    const entities: ActiveCodeIndexEntity[] = [];
+    for (const uri of uris) {
+      const row = byUri.get(uri);
+      if (!row?.content) continue;
+      let ref;
+      try { ref = parseEntityUri(row.uri); } catch { continue; }
+      if (!('repositoryKey' in ref) || ref.projectKey !== projectKey || ref.repositoryKey !== input.repositoryKey || !('path' in ref)) continue;
+      if (ref.kind !== 'file' && ref.kind !== 'symbol' && ref.kind !== 'test' && ref.kind !== 'api') continue;
+      entities.push({
+        ...scope,
+        uri: row.uri,
+        path: ref.path,
+        symbol: 'name' in ref ? ref.name : null,
+        entityType: ref.kind,
+        label: row.label,
+        content: row.content.slice(0, maxContentChars),
+        contentTruncated: row.content.length > maxContentChars,
+      });
+    }
+    return { available: true, scope, entities };
   }
 
   /**

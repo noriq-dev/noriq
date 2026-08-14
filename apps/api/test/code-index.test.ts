@@ -63,6 +63,12 @@ interface MemRpc {
   pruneSupersededGenerations(pid: string, maxAgeMs: number): Promise<number>;
   _seedSupersededIndexGenerationForTest(pid: string, repositoryKey: string, activatedAt: string): Promise<string>;
   _getIndexGenerationStatusForTest(pid: string, generationId: string): Promise<string | null>;
+  readActiveCodeIndex(pid: string, input: {
+    repositoryKey: string; generationId?: string; branch?: string; baseId?: string; uris?: string[]; maxContentChars?: number;
+  }): Promise<
+    | { available: false; reason: string }
+    | { available: true; scope: { generationId: string; branch: string; baseId: string }; entities: Array<{ uri: string; path: string; content: string; contentTruncated: boolean }> }
+  >;
 }
 const memory = (pid: string) => appEnv.PROJECT_MEMORY.get(appEnv.PROJECT_MEMORY.idFromName(pid)) as unknown as MemRpc;
 
@@ -201,6 +207,32 @@ describe('queryCodeIndex filters query-time on the active generation', () => {
     const hits = await queryCodeIndex(backend, { q: 'x.ts', projectId: 'pA' });
     expect(hits.map((h) => h.uri)).toEqual(['noriq://file/AAA/repo-a/x.ts']);
   });
+
+  it('rechecks repository metadata client-side and uses URI as a deterministic equal-score tie-break', async () => {
+    const backend: CodeSearchBackend = {
+      embedder: fakeEmbedder,
+      store: {
+        async upsert() {},
+        async deleteByIds() {},
+        async query() {
+          return {
+            matches: [
+              { id: 'wrong-repo', score: 1, metadata: { projectId: 'p1', repositoryKey: 'repo-b', generationId: 'gen-a', uri: 'noriq://file/PLNR/repo-b/z.ts' } },
+              { id: 'z', score: 0.9, metadata: { projectId: 'p1', repositoryKey: 'repo-a', generationId: 'gen-a', uri: 'noriq://file/PLNR/repo-a/z.ts' } },
+              { id: 'a', score: 0.9, metadata: { projectId: 'p1', repositoryKey: 'repo-a', generationId: 'gen-a', uri: 'noriq://file/PLNR/repo-a/a.ts' } },
+            ],
+          };
+        },
+      },
+    };
+    const hits = await queryCodeIndex(backend, {
+      q: 'context', projectId: 'p1', repositoryKey: 'repo-a', activeGenerationIds: ['gen-a'],
+    });
+    expect(hits.map((hit) => hit.uri)).toEqual([
+      'noriq://file/PLNR/repo-a/a.ts',
+      'noriq://file/PLNR/repo-a/z.ts',
+    ]);
+  });
 });
 
 describe('rebuildCodeIndex — resumable and idempotent, mirroring reindexProject\'s contract', () => {
@@ -251,6 +283,44 @@ describe('activateIndexGeneration — real index_generations status transitions 
     await expect(
       stageAndActivate(projectId, { generationId: 'gen_x', repositoryKey: 'repo-b', branch: 'main', baseId: 'sha_1', entities: [] }),
     ).resolves.toMatchObject({ activated: 'gen_x', superseded: [] });
+  });
+
+  it('resolves only exact active-generation staged content in requested order and rejects an old generation after cutover', async () => {
+    const { projectId } = await newOwnedProject('code-idx-read@example.com', 'CIDXR');
+    const oldUri = 'noriq://file/CIDXR/repo-r/old.ts';
+    const firstUri = 'noriq://file/CIDXR/repo-r/first.ts';
+    const secondUri = 'noriq://file/CIDXR/repo-r/second.ts';
+    await stageAndActivate(projectId, {
+      generationId: 'gen_read_a', repositoryKey: 'repo-r', branch: 'main', baseId: 'sha-a',
+      entities: [{ kind: 'node', uri: oldUri, type: 'file', label: 'old.ts', content: 'old only' }],
+    });
+    await stageAndActivate(projectId, {
+      generationId: 'gen_read_b', repositoryKey: 'repo-r', branch: 'main', baseId: 'sha-b',
+      entities: [
+        { kind: 'node', uri: firstUri, type: 'file', label: 'first.ts', content: 'first content' },
+        { kind: 'node', uri: secondUri, type: 'file', label: 'second.ts', content: 'second content' },
+      ],
+    });
+
+    const active = await memory(projectId).readActiveCodeIndex(projectId, {
+      repositoryKey: 'repo-r',
+      generationId: 'gen_read_b',
+      branch: 'main',
+      baseId: 'sha-b',
+      uris: [secondUri, oldUri, firstUri, secondUri],
+      maxContentChars: 6,
+    });
+    expect(active).toMatchObject({
+      available: true,
+      scope: { generationId: 'gen_read_b', branch: 'main', baseId: 'sha-b' },
+      entities: [
+        { uri: secondUri, path: 'second.ts', content: 'second', contentTruncated: true },
+        { uri: firstUri, path: 'first.ts', content: 'first ', contentTruncated: true },
+      ],
+    });
+    await expect(memory(projectId).readActiveCodeIndex(projectId, {
+      repositoryKey: 'repo-r', generationId: 'gen_read_a', uris: [oldUri],
+    })).resolves.toEqual({ available: false, reason: 'active-generation-changed' });
   });
 });
 

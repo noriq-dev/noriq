@@ -13,6 +13,7 @@ import type { Env } from '../src/env';
 import { createAgent, createRunAgent, createUser, mintTokenForUser, loginSession, mcpCall, mcpList } from './helpers';
 import { allocateBudget, SECTION_ORDER, CHARS_PER_TOKEN, assembleContextPack } from '../src/memory/context-pack';
 import { buildEntityUri } from '@noriq-dev/shared';
+import { computeStagedContentHash } from '../src/memory/ingest';
 
 const appEnv = env as unknown as Env;
 
@@ -28,6 +29,16 @@ interface MemRpc {
   recordEpisode(pid: string, input: Record<string, unknown>): Promise<{ episodeId: string }>;
   writeNode(pid: string, input: { type: string; uri: string; label: string; actor: { kind: string; id: string | null } }): Promise<{ nodeId: string }>;
   writeEdge(pid: string, input: { type: string; fromNodeId: string; toNodeId: string; actor: { kind: string; id: string | null } }): Promise<{ edgeId: string }>;
+  beginIndexIngest(pid: string, manifest: {
+    generationId: string; projectId: string; repositoryKey: string; branch: string; baseId: string;
+    indexerVersion: string; batchCount: number; fileCount: number; contentHash: string; deletions: string[]; createdAt: string;
+  }): Promise<{ ok: true }>;
+  ingestIndexBatch(
+    pid: string,
+    batch: { generationId: string; batchNumber: number; batchHash: string },
+    rows: Array<{ kind: 'node'; uri: string; type: string; label: string; content?: string | null }>,
+  ): Promise<{ ok: true; deduped: boolean }>;
+  completeIndexIngest(pid: string, generationId: string): Promise<{ validation: { ok: boolean; problems: string[] } }>;
 }
 const memory = (pid: string) => appEnv.PROJECT_MEMORY.get(appEnv.PROJECT_MEMORY.idFromName(pid)) as unknown as MemRpc;
 
@@ -46,6 +57,53 @@ async function newProject(key: string): Promise<string> {
   // consume — see memory-lifecycle.test.ts's newOwnedProject for the full explanation.
   await memory(projectId).reconcile(projectId);
   return projectId;
+}
+
+async function activateCodeGeneration(
+  projectId: string,
+  input: {
+    generationId: string; repositoryKey: string; branch: string; baseId: string;
+    rows: Array<{ kind: 'node'; uri: string; type: string; label: string; content?: string | null }>;
+  },
+): Promise<void> {
+  await memory(projectId).beginIndexIngest(projectId, {
+    generationId: input.generationId,
+    projectId,
+    repositoryKey: input.repositoryKey,
+    branch: input.branch,
+    baseId: input.baseId,
+    indexerVersion: 'context-pack-test',
+    batchCount: 1,
+    fileCount: input.rows.filter((row) => row.type === 'file').length,
+    contentHash: await computeStagedContentHash(input.rows as never),
+    deletions: [],
+    createdAt: new Date().toISOString(),
+  });
+  await memory(projectId).ingestIndexBatch(
+    projectId,
+    { generationId: input.generationId, batchNumber: 0, batchHash: 'context-pack-test' },
+    input.rows,
+  );
+  const completed = await memory(projectId).completeIndexIngest(projectId, input.generationId);
+  if (!completed.validation.ok) throw new Error(completed.validation.problems.join('; '));
+}
+
+function withCodeSearch(
+  matches: Array<{ id: string; score: number; metadata: Record<string, string> }>,
+): Env {
+  return new Proxy(appEnv, {
+    get(target, property, receiver) {
+      if (property === 'AI') return { run: async () => ({ data: [[1, 0, 0]] }) };
+      if (property === 'CODE_VECTORIZE') {
+        return {
+          query: async (_vector: number[], options: { topK: number }) => ({ matches: matches.slice(0, options.topK) }),
+          upsert: async () => undefined,
+          deleteByIds: async () => undefined,
+        };
+      }
+      return Reflect.get(target as object, property, receiver);
+    },
+  }) as Env;
 }
 
 beforeAll(async () => {
@@ -374,6 +432,10 @@ describe('assembleContextPack — no-Vectorize degradation and read-only', () =>
     expect(pack.taskFacts.title).toBe('Degraded mode probe');
     const relevant = pack.sections.find((s) => s.id === 'relevant_memories')!;
     expect(relevant.excerpts.length).toBeGreaterThan(0);
+    expect(pack.sections.find((s) => s.id === 'source_excerpts')!.notice).toMatchObject({
+      kind: 'unanswerable',
+      reason: expect.stringMatching(/indexed source requires|code index is unavailable/),
+    });
   });
 
   it('is read-only: assembling packs (including one with a verification report already applied) changes no memory row, validity, or revision', async () => {
@@ -394,6 +456,86 @@ describe('assembleContextPack — no-Vectorize degradation and read-only', () =>
     await assembleContextPack(appEnv, projectId, made.body.id as string, { tokenBudget: 1 });
     const after = await memory(projectId).health(projectId);
     expect(after).toEqual(before);
+  });
+});
+
+describe('assembleContextPack — active repository source excerpts', () => {
+  it('resolves ordered vector candidates through the exact active generation and rejects stale and cross-scope metadata', async () => {
+    const projectKey = 'MCPSRC';
+    const projectId = await newProject(projectKey);
+    const repositoryKey = 'repo-source';
+    const made = await mcpCall(agent.apiKey, 'create_task', {
+      projectId,
+      title: 'Repair repository context assembly',
+      tags: ['context-pack-test'],
+      executionSpec: { anticipatedFiles: [{ path: 'src/context.ts', change: 'modify', why: 'repair source lookup' }] },
+    });
+    const oldUri = buildEntityUri({ kind: 'file', projectKey, repositoryKey, path: 'src/old.ts' });
+    const currentUri = buildEntityUri({ kind: 'file', projectKey, repositoryKey, path: 'src/context.ts' });
+    const secondUri = buildEntityUri({ kind: 'symbol', projectKey, repositoryKey, path: 'src/helper.ts', name: 'assemble' });
+    await activateCodeGeneration(projectId, {
+      generationId: 'gen_source_a', repositoryKey, branch: 'main', baseId: 'sha-a',
+      rows: [{ kind: 'node', uri: oldUri, type: 'file', label: 'src/old.ts', content: 'superseded implementation' }],
+    });
+    await activateCodeGeneration(projectId, {
+      generationId: 'gen_source_b', repositoryKey, branch: 'main', baseId: 'sha-b',
+      rows: [
+        { kind: 'node', uri: currentUri, type: 'file', label: 'src/context.ts', content: 'export function assembleContext() { return "current"; }' },
+        { kind: 'node', uri: secondUri, type: 'symbol', label: 'assemble', content: 'function assemble() { return true; }' },
+      ],
+    });
+
+    const searchEnv = withCodeSearch([
+      { id: `${oldUri}:stale`, score: 0.99, metadata: { projectId, repositoryKey, generationId: 'gen_source_a', type: 'file', uri: oldUri } },
+      { id: 'foreign-project', score: 0.98, metadata: { projectId: 'prj_foreign', repositoryKey, generationId: 'gen_source_b', type: 'file', uri: currentUri } },
+      { id: 'foreign-repo', score: 0.97, metadata: { projectId, repositoryKey: 'other-repo', generationId: 'gen_source_b', type: 'file', uri: currentUri } },
+      { id: `${secondUri}:chunk-1`, score: 0.91, metadata: { projectId, repositoryKey, generationId: 'gen_source_b', type: 'symbol', uri: secondUri } },
+      { id: `${currentUri}:chunk-1`, score: 0.9, metadata: { projectId, repositoryKey, generationId: 'gen_source_b', type: 'file', uri: currentUri } },
+      { id: `${currentUri}:chunk-2`, score: 0.8, metadata: { projectId, repositoryKey, generationId: 'gen_source_b', type: 'file', uri: currentUri } },
+    ]);
+    const input = { repositoryKey, branch: 'main', baseId: 'sha-b', tokenBudget: 30_000 } as const;
+    const first = await assembleContextPack(searchEnv, projectId, made.body.id as string, input);
+    const second = await assembleContextPack(searchEnv, projectId, made.body.id as string, input);
+    const source = first.sections.find((section) => section.id === 'source_excerpts')!;
+
+    expect(source.notice).toBeNull();
+    expect(source.provenance).toEqual(['semantic', 'exact']);
+    expect(source.excerpts.map((excerpt) => excerpt.id)).toEqual([secondUri, currentUri]);
+    expect(source.excerpts.every((excerpt) => excerpt.excerptKind === 'code')).toBe(true);
+    expect(source.excerpts[0]).toMatchObject({
+      excerptKind: 'code',
+      projectId,
+      repositoryKey,
+      generationId: 'gen_source_b',
+      branch: 'main',
+      baseId: 'sha-b',
+      path: 'src/helper.ts',
+      symbol: 'assemble',
+      content: 'function assemble() { return true; }',
+    });
+    expect(source.excerpts.map((excerpt) => excerpt.id)).not.toContain(oldUri);
+    expect(JSON.stringify({ ...first, generatedAt: 'X' })).toBe(JSON.stringify({ ...second, generatedAt: 'X' }));
+    expect(first.charsUsed).toBeLessThanOrEqual(first.charBudget);
+  });
+
+  it('fails open with an explicit unanswerable source section when the caller base does not match the active generation', async () => {
+    const projectKey = 'MCPSRB';
+    const projectId = await newProject(projectKey);
+    const repositoryKey = 'repo-source';
+    const made = await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'Base mismatch source probe', tags: ['context-pack-test'] });
+    const uri = buildEntityUri({ kind: 'file', projectKey, repositoryKey, path: 'src/probe.ts' });
+    await activateCodeGeneration(projectId, {
+      generationId: 'gen_scope', repositoryKey, branch: 'main', baseId: 'sha-active',
+      rows: [{ kind: 'node', uri, type: 'file', label: 'src/probe.ts', content: 'export const probe = true;' }],
+    });
+    const pack = await assembleContextPack(withCodeSearch([
+      { id: uri, score: 1, metadata: { projectId, repositoryKey, generationId: 'gen_scope', type: 'file', uri } },
+    ]), projectId, made.body.id as string, {
+      repositoryKey, branch: 'main', baseId: 'sha-other', tokenBudget: 10_000,
+    });
+    const source = pack.sections.find((section) => section.id === 'source_excerpts')!;
+    expect(source.excerpts).toEqual([]);
+    expect(source.notice).toEqual({ kind: 'unanswerable', reason: 'scope-mismatch' });
   });
 });
 

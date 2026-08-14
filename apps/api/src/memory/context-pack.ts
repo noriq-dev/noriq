@@ -1,8 +1,8 @@
-// PLNR-267: get_task_context — the task-aware context pack assembler (§10). Composition ONLY:
-// every retrieval primitive this module needs already shipped in Phase 6 (PLNR-257/258/264/265)
-// — `ProjectMemory.searchProjectMemory`/`similarEffort`/`dependencyNeighborhood`/`validatingTests`/
-// `changeImpact`/`getMemoryItem`. Nothing here opens a new retrieval path; it reads the task's own
-// D1 row for the REQUIRED half of the pack and composes the shipped RPCs for everything else.
+// PLNR-267/524: get_task_context — the task-aware context pack assembler (§10). It reads the
+// task's own D1 row for the REQUIRED half and composes ProjectMemory retrieval RPCs for the rest.
+// PLNR-524 adds one deliberately narrow path: CODE_VECTORIZE proposes active-generation URI
+// candidates, then ProjectMemory resolves their text and checkout identity from canonical staged
+// rows. Vector metadata is never source evidence.
 //
 // WHY THIS LIVES HERE AND NOT AS A NEW ProjectMemory RPC (locked decision): the pack's required
 // facts (goal, executionSpec, acceptance, open comments, claim state) are D1 coordination data the
@@ -29,13 +29,14 @@ import { RETRIEVAL_DEFAULTS, type RankedHit, type RetrievalStage } from './retri
 import { effortSignals } from './similar-effort';
 import { verifiedForBase, type CallerBaseScope } from './verification';
 import { renderEvidenceFrame, type EvidenceFrameItem, type EvidenceFrameResult } from './evidence-frame';
+import { codeSearchBackend, queryCodeIndex } from './code-index';
 import {
   buildEntityUri,
   type ContextPack,
   type ContextPackCitation,
+  type ContextPackCodeExcerpt,
   type ContextPackCoverage,
   type ContextPackEpisodeExcerpt,
-  type ContextPackExcerpt,
   type ContextPackGraphEntity,
   type ContextPackMemoryExcerpt,
   type ContextPackMode,
@@ -59,6 +60,8 @@ export const DEFAULT_CHAR_BUDGET = 24_000;
 // candidates per section get enriched at all — a candidate ceiling, deliberately distinct from
 // the character BUDGET (allocateBudget) below, which then decides how many of THESE fit.
 const MAX_CANDIDATES_PER_SECTION = 8;
+const MAX_CODE_EXCERPTS = 8;
+const MAX_CODE_EXCERPT_CHARS = 2400;
 
 // ---------------------------------------------------------------------------------------------
 // Section fill order and budget weights (locked decision: "declared as data ... not implied by
@@ -240,6 +243,57 @@ function memoryHitStages(hits: RankedHit[]): RetrievalStage[] {
   return [...new Set(hits.map((h) => h.stage))];
 }
 
+async function retrieveCodeExcerpts(
+  env: Env,
+  stub: ProjectMemoryStub,
+  projectId: string,
+  input: ContextPackInput,
+  query: string,
+): Promise<{ excerpts: ContextPackCodeExcerpt[]; notice: ContextPackNotice | null }> {
+  if (!input.repositoryKey || !input.branch || !input.baseId) {
+    return { excerpts: [], notice: { kind: 'unanswerable', reason: 'indexed source requires repositoryKey, branch, and baseId' } };
+  }
+  const backend = codeSearchBackend(env);
+  if (!backend) {
+    return { excerpts: [], notice: { kind: 'unanswerable', reason: 'code index is unavailable' } };
+  }
+  try {
+    const active = await stub.readActiveCodeIndex(projectId, {
+      repositoryKey: input.repositoryKey,
+      branch: input.branch,
+      baseId: input.baseId,
+    });
+    if (!active.available) {
+      return { excerpts: [], notice: { kind: 'unanswerable', reason: active.reason } };
+    }
+    const candidates = await queryCodeIndex(backend, {
+      q: query,
+      projectId,
+      repositoryKey: input.repositoryKey,
+      activeGenerationIds: [active.scope.generationId],
+      topK: MAX_CODE_EXCERPTS,
+    });
+    if (!candidates.length) return { excerpts: [], notice: null };
+    const resolved = await stub.readActiveCodeIndex(projectId, {
+      repositoryKey: input.repositoryKey,
+      generationId: active.scope.generationId,
+      branch: input.branch,
+      baseId: input.baseId,
+      uris: candidates.map((candidate) => candidate.uri),
+      maxContentChars: MAX_CODE_EXCERPT_CHARS,
+    });
+    if (!resolved.available) {
+      return { excerpts: [], notice: { kind: 'unanswerable', reason: resolved.reason } };
+    }
+    return {
+      excerpts: resolved.entities.map((entity) => ({ excerptKind: 'code', id: entity.uri, ...entity })),
+      notice: null,
+    };
+  } catch {
+    return { excerpts: [], notice: { kind: 'unanswerable', reason: 'indexed source lookup failed' } };
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The assembler
 // ---------------------------------------------------------------------------------------------
@@ -292,7 +346,8 @@ interface OpenCommentRow {
  *
  * READ-ONLY throughout (locked decision): every ProjectMemory RPC this calls
  * (`searchProjectMemory`/`similarEffort`/`dependencyNeighborhood`/`validatingTests`/
- * `changeImpact`/`getMemoryItem`) is itself read-only, and every D1 query here is a plain SELECT.
+ * `changeImpact`/`getMemoryItem`/`readActiveCodeIndex`) is itself read-only, and every D1
+ * query here is a plain SELECT.
  * Assembling a pack changes no memory row, no validity, no verification state, and emits no
  * outbox event.
  */
@@ -372,7 +427,7 @@ export async function assembleContextPack(
     }
   }
 
-  const [searchResult, effortResult, depResult, testsResult, lockRows] = await Promise.all([
+  const [searchResult, effortResult, depResult, testsResult, lockRows, codeResult] = await Promise.all([
     stub.searchProjectMemory(projectId, {
       query: signals.queryText || undefined,
       taskId: row.id,
@@ -402,6 +457,7 @@ export async function assembleContextPack(
            ORDER BY fl.acquired_at ASC LIMIT 500`,
         ).bind(projectId).all<{ id: string; taskId: string | null; agentId: string; canonPattern: string; taskKey: string | null; taskTitle: string | null; taskStatus: string | null }>()
       : Promise.resolve({ results: [] as Array<{ id: string; taskId: string | null; agentId: string; canonPattern: string; taskKey: string | null; taskTitle: string | null; taskStatus: string | null }> }),
+    retrieveCodeExcerpts(env, stub, projectId, input, signals.queryText || row.title),
   ]);
 
   // Bucket searchProjectMemory's hits by kind — one call feeds five sections (locked-decision-
@@ -487,7 +543,6 @@ export async function assembleContextPack(
   // ---- 4. Fill sections in the FIXED order, rolling unused budget forward -------------------
   const sections: ContextPackSection[] = [];
   let pool = 0;
-  let takenExcerptsSoFar: ContextPackExcerpt[] = [];
 
   for (const spec of SECTION_ORDER) {
     const cap = (allotments[spec.id] ?? 0) + pool;
@@ -501,7 +556,6 @@ export async function assembleContextPack(
           notice: truncated ? { kind: 'truncated', reason: `${decisionExcerpts.length - taken.length} more decision(s) did not fit in ${cap} characters` } : null,
           charsAllotted: cap, charsUsed: used, excerpts: taken, graphEntities: [], coverage: null, items: [],
         };
-        takenExcerptsSoFar = [...takenExcerptsSoFar, ...taken];
         break;
       }
       case 'known_hazards': {
@@ -511,7 +565,6 @@ export async function assembleContextPack(
           notice: truncated ? { kind: 'truncated', reason: `${hazardExcerpts.length - taken.length} more hazard(s) did not fit in ${cap} characters` } : null,
           charsAllotted: cap, charsUsed: used, excerpts: taken, graphEntities: [], coverage: null, items: [],
         };
-        takenExcerptsSoFar = [...takenExcerptsSoFar, ...taken];
         break;
       }
       case 'failed_approaches': {
@@ -521,7 +574,6 @@ export async function assembleContextPack(
           notice: truncated ? { kind: 'truncated', reason: `${failedExcerpts.length - taken.length} more failed-approach record(s) did not fit in ${cap} characters` } : null,
           charsAllotted: cap, charsUsed: used, excerpts: taken, graphEntities: [], coverage: null, items: [],
         };
-        takenExcerptsSoFar = [...takenExcerptsSoFar, ...taken];
         break;
       }
       case 'relevant_memories': {
@@ -531,7 +583,6 @@ export async function assembleContextPack(
           notice: truncated ? { kind: 'truncated', reason: `${relevantExcerpts.length - taken.length} more memory item(s) did not fit in ${cap} characters` } : null,
           charsAllotted: cap, charsUsed: used, excerpts: taken, graphEntities: [], coverage: null, items: [],
         };
-        takenExcerptsSoFar = [...takenExcerptsSoFar, ...taken];
         break;
       }
       case 'similar_episodes': {
@@ -541,7 +592,6 @@ export async function assembleContextPack(
           notice: truncated ? { kind: 'truncated', reason: `${episodeExcerpts.length - taken.length} more similar episode(s) did not fit in ${cap} characters` } : null,
           charsAllotted: cap, charsUsed: used, excerpts: taken, graphEntities: [], coverage: null, items: [],
         };
-        takenExcerptsSoFar = [...takenExcerptsSoFar, ...taken];
         break;
       }
       case 'graph_neighborhood': {
@@ -597,33 +647,13 @@ export async function assembleContextPack(
           notice: truncated ? { kind: 'truncated', reason: `${combined.length - takenCombined.length} more uncertainty item(s) did not fit in ${cap} characters` } : null,
           charsAllotted: cap, charsUsed: used, excerpts, graphEntities: [], coverage: null, items,
         };
-        takenExcerptsSoFar = [...takenExcerptsSoFar, ...excerpts];
         break;
       }
       case 'source_excerpts': {
-        // A pure ROLLUP of what already survived its OWN section's budget above — no extra RPC
-        // calls (the full excerpt objects, evidence included, were already built). This is the
-        // one well-known place PLNR-270's quoted-evidence renderer can iterate every citation in
-        // the pack without walking each section individually. De-duplicated by (kind, id): the
-        // same memory/episode can legitimately surface via more than one earlier section (e.g. a
-        // decision that is ALSO graph-reachable is not — graph hits don't feed excerpts, so this
-        // only guards a hit appearing in two memory-kind buckets, which cannot happen since a
-        // memory row has exactly one `kind`, but a defensive dedupe costs nothing and documents
-        // the invariant this section relies on).
-        const seen = new Set<string>();
-        const pool2: ContextPackExcerpt[] = [];
-        for (const e of takenExcerptsSoFar) {
-          const key = `${e.excerptKind}:${e.id}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          pool2.push(e);
-        }
-        const { taken, used, truncated } = fillGreedy(pool2, cap);
-        const stages = new Set<string>();
-        for (const e of taken) if (e.excerptKind === 'memory') stages.add('exact'); else stages.add('similar-effort');
+        const { taken, used, truncated } = fillGreedy(codeResult.excerpts, cap);
         section = {
-          id: spec.id, provenance: taken.length ? [...stages] as ContextPackSection['provenance'] : ['none'],
-          notice: truncated ? { kind: 'truncated', reason: `${pool2.length - taken.length} more citation(s) did not fit in ${cap} characters` } : null,
+          id: spec.id, provenance: taken.length ? ['semantic', 'exact'] : ['none'],
+          notice: codeResult.notice ?? (truncated ? { kind: 'truncated', reason: `${codeResult.excerpts.length - taken.length} more code excerpt(s) did not fit in ${cap} characters` } : null),
           charsAllotted: cap, charsUsed: used, excerpts: taken, graphEntities: [], coverage: null, items: [],
         };
         break;
@@ -701,11 +731,9 @@ export async function assembleContextPack(
 
 // ---------------------------------------------------------------------------------------------
 // PLNR-270: gather every section that carries agent- or repository-authored prose for
-// `renderEvidenceFrame` (§13). Deliberately excludes `source_excerpts` (a de-duplicated ROLLUP of
-// excerpts already rendered from their OWN section above — rendering it too would show the same
-// evidence twice) and the graph/test/neighboring-work sections (structural facts — uri/type/label
-// triples from the coordination or code graph, not free-form authored prose; see this task's own
-// discretion note on repository-derived text).
+// `renderEvidenceFrame` (§13). Deliberately excludes `source_excerpts`: indexed code is a
+// separately scoped source channel consumed only after checkout verification, while this frame
+// is for memory/episode prose. Graph/test/neighboring-work sections remain structural facts.
 // ---------------------------------------------------------------------------------------------
 
 function memoryExcerptToEvidenceItem(e: ContextPackMemoryExcerpt): EvidenceFrameItem {

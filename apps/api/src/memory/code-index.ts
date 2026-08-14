@@ -169,15 +169,17 @@ export async function queryCodeIndex(backend: CodeSearchBackend, opts: CodeQuery
   for (const m of matches) {
     const projectId = String(m.metadata?.projectId ?? '');
     if (projectId !== opts.projectId) continue; // belt-and-suspenders — see search.ts's own note on this being the real leak surface
+    const repositoryKey = String(m.metadata?.repositoryKey ?? '');
+    if (opts.repositoryKey && repositoryKey !== opts.repositoryKey) continue;
     const generationId = String(m.metadata?.generationId ?? '');
     if (allowedGenerations && !allowedGenerations.has(generationId)) continue;
     const uri = String(m.metadata?.uri ?? m.id);
     const prev = best.get(uri);
     if (!prev || m.score > prev.score) {
-      best.set(uri, { uri, type: String(m.metadata?.type ?? 'unknown'), repositoryKey: String(m.metadata?.repositoryKey ?? ''), generationId, score: m.score });
+      best.set(uri, { uri, type: String(m.metadata?.type ?? 'unknown'), repositoryKey, generationId, score: m.score });
     }
   }
-  return [...best.values()].sort((a, b) => b.score - a.score).slice(0, topK);
+  return [...best.values()].sort((a, b) => b.score - a.score || a.uri.localeCompare(b.uri)).slice(0, topK);
 }
 
 export interface RebuildCodeIndexProgress {
