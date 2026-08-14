@@ -4432,7 +4432,7 @@ app.get('/api/projects/:pid/runner-jobs/:jobId/observations', userAuth, async (c
   if (!job) return c.json({ error: 'RunnerJob not found' }, 404);
   const query = taskId
     ? `SELECT observation_id AS observationId, task_id AS taskId, stage, attempt, actor, status,
-              started_at AS startedAt, finished_at AS finishedAt, duration_ms AS durationMs,
+              started_at AS startedAt, finished_at AS finishedAt, duration,
               usage, recovery, evidence, start_seq AS startSeq, finish_seq AS finishSeq,
               start_received_at AS startReceivedAt, finish_received_at AS finishReceivedAt,
               COALESCE(finish_seq, start_seq) AS cursorSeq
@@ -4440,7 +4440,7 @@ app.get('/api/projects/:pid/runner-jobs/:jobId/observations', userAuth, async (c
         WHERE job_id = ? AND task_id = ? AND COALESCE(finish_seq, start_seq) > ?
         ORDER BY COALESCE(finish_seq, start_seq), observation_id LIMIT ?`
     : `SELECT observation_id AS observationId, task_id AS taskId, stage, attempt, actor, status,
-              started_at AS startedAt, finished_at AS finishedAt, duration_ms AS durationMs,
+              started_at AS startedAt, finished_at AS finishedAt, duration,
               usage, recovery, evidence, start_seq AS startSeq, finish_seq AS finishSeq,
               start_received_at AS startReceivedAt, finish_received_at AS finishReceivedAt,
               COALESCE(finish_seq, start_seq) AS cursorSeq
@@ -4450,10 +4450,10 @@ app.get('/api/projects/:pid/runner-jobs/:jobId/observations', userAuth, async (c
   const statement = c.env.DB.prepare(query);
   const rows = taskId
     ? await statement.bind(jobId, taskId, afterSeq, limit + 1).all<Record<string, unknown> & {
-        actor: string; usage: string | null; evidence: string | null; cursorSeq: number;
+        actor: string; duration: string | null; usage: string | null; evidence: string | null; cursorSeq: number;
       }>()
     : await statement.bind(jobId, afterSeq, limit + 1).all<Record<string, unknown> & {
-        actor: string; usage: string | null; evidence: string | null; cursorSeq: number;
+        actor: string; duration: string | null; usage: string | null; evidence: string | null; cursorSeq: number;
       }>();
   const page = rows.results.slice(0, limit);
   const nextSeq = page.length > 0 ? page[page.length - 1]!.cursorSeq : afterSeq;
@@ -4473,6 +4473,7 @@ app.get('/api/projects/:pid/runner-jobs/:jobId/observations', userAuth, async (c
     observations: page.map((row) => ({
       ...row,
       actor: parseStoredJson(row.actor, null),
+      duration: parseStoredJson(row.duration, null),
       usage: parseStoredJson(row.usage, null),
       evidence: parseStoredJson(row.evidence, null),
     })),

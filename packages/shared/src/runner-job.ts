@@ -136,8 +136,10 @@ const metricEnvelope = <T extends z.ZodTypeAny>(value: T) => z.discriminatedUnio
 
 export const RunnerJobTokenMetric = metricEnvelope(z.number().int().nonnegative());
 export const RunnerJobCostMetric = metricEnvelope(z.number().nonnegative());
+export const RunnerJobDurationMetric = metricEnvelope(z.number().int().nonnegative());
 export type RunnerJobTokenMetric = z.infer<typeof RunnerJobTokenMetric>;
 export type RunnerJobCostMetric = z.infer<typeof RunnerJobCostMetric>;
+export type RunnerJobDurationMetric = z.infer<typeof RunnerJobDurationMetric>;
 
 export const RunnerJobObservationUsage = z.object({
   inputTokens: RunnerJobTokenMetric,
@@ -234,7 +236,7 @@ export const RunnerJobEvent = z.discriminatedUnion('type', [
     observationId: id, taskId: id.nullable(), stage: RunnerJobObservationStage,
     attempt: z.number().int().positive(), actor: RunnerJobObservationActor,
     outcome: z.enum(['succeeded', 'failed', 'cancelled', 'skipped']),
-    durationMs: z.number().int().nonnegative(), usage: RunnerJobObservationUsage,
+    duration: RunnerJobDurationMetric, usage: RunnerJobObservationUsage,
     recovery: z.enum(['none', 'journal_replay', 'process_recovery']),
     evidence: RunnerJobObservationEvidence,
   }).strict(),

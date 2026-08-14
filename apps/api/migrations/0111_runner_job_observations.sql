@@ -25,7 +25,7 @@ CREATE TABLE runner_job_observations (
   status TEXT NOT NULL CHECK (status IN ('running','succeeded','failed','cancelled','skipped')),
   started_at TEXT NOT NULL,
   finished_at TEXT,
-  duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+  duration TEXT,
   usage TEXT,
   recovery TEXT CHECK (recovery IS NULL OR recovery IN ('none','journal_replay','process_recovery')),
   evidence TEXT,

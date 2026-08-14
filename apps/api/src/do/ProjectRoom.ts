@@ -4964,13 +4964,13 @@ export class ProjectRoom extends DurableObject<Env> {
         if (job.status === 'assigned') await rootStatus('running');
       } else if (event.type === 'stage.finished') {
         const terminalFields = [
-          event.outcome, event.at, event.durationMs, JSON.stringify(event.usage),
+          event.outcome, event.at, JSON.stringify(event.duration), JSON.stringify(event.usage),
           event.recovery, JSON.stringify(event.evidence), seq, receivedAt,
         ] as const;
         if (observation) {
           statements.push(this.env.DB.prepare(
             `UPDATE runner_job_observations
-                SET status = ?, finished_at = ?, duration_ms = ?, usage = ?, recovery = ?, evidence = ?,
+                SET status = ?, finished_at = ?, duration = ?, usage = ?, recovery = ?, evidence = ?,
                     finish_seq = ?, finish_received_at = ?
               WHERE job_id = ? AND observation_id = ? AND status = 'running'`,
           ).bind(...terminalFields, jobId, event.observationId));
@@ -4978,12 +4978,12 @@ export class ProjectRoom extends DurableObject<Env> {
           statements.push(this.env.DB.prepare(
             `INSERT INTO runner_job_observations
                (job_id, observation_id, task_id, stage, attempt, actor, status, started_at,
-                finished_at, duration_ms, usage, recovery, evidence, finish_seq, finish_received_at)
+                finished_at, duration, usage, recovery, evidence, finish_seq, finish_received_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           ).bind(
             jobId, event.observationId, event.taskId, event.stage, event.attempt,
             JSON.stringify(event.actor), event.outcome, event.startedAt, event.at,
-            event.durationMs, JSON.stringify(event.usage), event.recovery,
+            JSON.stringify(event.duration), JSON.stringify(event.usage), event.recovery,
             JSON.stringify(event.evidence), seq, receivedAt,
           ));
         }

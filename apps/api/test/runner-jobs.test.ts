@@ -156,7 +156,7 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
       type: 'stage.finished', at: new Date().toISOString(), startedAt: new Date().toISOString(),
       observationId: 'obs_bad_unknown', taskId: null, stage: 'build', attempt: 1,
       actor: { kind: 'agent', driver: 'codex', vendor: 'openai', model: null, effort: null, role: 'build', operation: 'invoke' },
-      outcome: 'succeeded', durationMs: 1, recovery: 'none',
+      outcome: 'succeeded', duration: { status: 'complete', value: 1, provenance: 'runner_reported' }, recovery: 'none',
       usage: {
         inputTokens: { status: 'unavailable', value: 0, provenance: 'not_reported' },
         outputTokens: { status: 'unavailable', value: null, provenance: 'not_reported' },
@@ -215,7 +215,8 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
     };
     expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 3, {
       type: 'stage.finished', at: finishedAt, startedAt, observationId: 'obs_build_1', taskId: task.id,
-      stage: 'build', attempt: 1, actor, outcome: 'succeeded', durationMs: 2_500,
+      stage: 'build', attempt: 1, actor, outcome: 'succeeded',
+      duration: { status: 'complete', value: 2_500, provenance: 'runner_reported' },
       usage, recovery: 'none', evidence,
     })).toMatchObject({ accepted: true, ack: 3 });
 
@@ -227,7 +228,8 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
     expect(await cursorResponse.json()).toMatchObject({
       observations: [{
         observationId: 'obs_build_1', taskId: task.id, stage: 'build', status: 'succeeded',
-        durationMs: 2_500, actor, usage, evidence, startSeq: 2, finishSeq: 3, cursorSeq: 3,
+        duration: { status: 'complete', value: 2_500, provenance: 'runner_reported' },
+        actor, usage, evidence, startSeq: 2, finishSeq: 3, cursorSeq: 3,
         startReceivedAt: expect.any(String), finishReceivedAt: expect.any(String),
       }],
       cursor: { afterSeq: 2, nextSeq: 3, highWaterSeq: 3, hasMore: false },
