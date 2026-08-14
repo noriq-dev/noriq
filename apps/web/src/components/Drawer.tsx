@@ -332,12 +332,12 @@ export function Drawer({ store }: { store: AppStore }) {
               : <Markdown source={detailBody} />}
           </div>
 
-          {/* Spin-off provenance + decision (PLNR-230). The panel persists after the decision —
-              which run filed it, from which task, on what finding is the durable record the
+          {/* Proposal provenance + decision. The panel persists after the decision — who filed
+              it and the available execution/run/source context form the durable record the
               adjudicator (and any reviewer) checks "tracked there" claims against. The
               accept/reject buttons render only while the task is still proposed. */}
-          {task.spinoffRunId && (() => {
-            const src = task.spinoffSourceTaskId ? tasks.find((x) => x.id === task.spinoffSourceTaskId) : null;
+          {task.proposal && (() => {
+            const src = task.proposal.sourceTaskId ? tasks.find((x) => x.id === task.proposal!.sourceTaskId) : null;
             return (
               <div
                 style={{
@@ -346,7 +346,8 @@ export function Drawer({ store }: { store: AppStore }) {
                 }}
               >
                 <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--amber)', marginBottom: 6 }}>
-                  ⑂ spin-off · filed by run {task.spinoffRunId.slice(-6)}
+                  ⑂ proposal · filed by {task.proposal.filedBy ? `${task.proposal.filedBy.kind} ${task.proposal.filedBy.id.slice(-6)}` : 'legacy actor'}
+                  {task.proposal.runId ? ` · run ${task.proposal.runId.slice(-6)}` : ''}
                   {src && (
                     <>
                       {' · found while working '}
@@ -360,8 +361,8 @@ export function Drawer({ store }: { store: AppStore }) {
                     </>
                   )}
                 </div>
-                {task.spinoffFinding && (
-                  <div style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-soft)', whiteSpace: 'pre-wrap' }}>{task.spinoffFinding}</div>
+                {task.proposal.finding && (
+                  <div style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-soft)', whiteSpace: 'pre-wrap' }}>{task.proposal.finding}</div>
                 )}
                 {task.status === 'proposed' && store.permissions.canManage && (
                   <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
@@ -372,7 +373,7 @@ export function Drawer({ store }: { store: AppStore }) {
                     <Button
                       variant="primary"
                       style={{ padding: '5px 14px', fontSize: 12 }}
-                      onClick={() => void actions.acceptSpinoff(task.id)}
+                      onClick={() => void actions.acceptProposal(task.id)}
                     >
                       Accept
                     </Button>
@@ -380,8 +381,8 @@ export function Drawer({ store }: { store: AppStore }) {
                       variant="danger"
                       style={{ padding: '5px 12px', fontSize: 12 }}
                       onClick={async () => {
-                        if (await confirm(`Reject spin-off ${task.key}? The task is cancelled (its finding stays on record).`)) {
-                          void actions.rejectSpinoff(task.id);
+                        if (await confirm(`Reject proposal ${task.key}? The task is cancelled (its finding stays on record).`)) {
+                          void actions.rejectProposal(task.id);
                         }
                       }}
                     >

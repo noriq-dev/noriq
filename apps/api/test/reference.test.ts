@@ -9,7 +9,7 @@ describe('MCP tool reference', () => {
     expect(res.headers.get('Content-Type')).toContain('text/markdown');
     const md = await res.text();
     // Core tools present.
-    for (const t of ['get_briefing', 'claim_task', 'release_task', 'add_attachment', 'create_plan']) {
+    for (const t of ['get_briefing', 'claim_task', 'release_task', 'attach_files', 'create_plan']) {
       expect(md).toContain(`\`${t}\``);
     }
     // Params rendered from the zod schema (required/optional flags, types).
@@ -29,7 +29,7 @@ describe('MCP tool reference', () => {
       resources: Array<{ minimumProjectAction: string }>;
     };
     expect(doc.serverInfo.name).toBe('noriq');
-    expect(doc.catalog).toMatchObject({ valid: true, toolCount: 70, findings: [] });
+    expect(doc.catalog).toMatchObject({ valid: true, toolCount: 56, findings: [] });
     const claim = doc.tools.find((t) => t.name === 'claim_task');
     expect(claim).toBeTruthy();
     expect(claim!.minimumProjectAction).toBe('contribute');

@@ -115,8 +115,8 @@ export async function getDispatchIntelligence(
 }
 
 /** A deliberately small subset for automatic inclusion in get_task_context. The full packet is
- * available through get_task_intelligence; quoted evidence and case bodies are never duplicated
- * into the context pack. */
+ * available by requesting intelligenceDetail="full"; quoted evidence and case bodies are never
+ * duplicated into the summary context pack. */
 export function summarizeDispatchIntelligence(
   packet: Awaited<ReturnType<typeof getDispatchIntelligence>>,
 ) {
@@ -146,6 +146,7 @@ export function summarizeDispatchIntelligence(
       observation: packet.observations.scope.observation,
     },
     historicalCaseCount: packet.historical.cases.length,
-    fullPacketTool: 'get_task_intelligence' as const,
+    fullPacketTool: 'get_task_context' as const,
+    fullPacketArguments: { intelligenceDetail: 'full' as const },
   };
 }

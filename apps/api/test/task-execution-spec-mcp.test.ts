@@ -212,6 +212,7 @@ describe('the execution spec on the MCP task tools (RUN-136)', () => {
   // descriptions are dropped in the JSON-Schema conversion while the structure survives. This
   // asserts on what an agent actually receives.
   it('states what the spec is for in the tool descriptions an agent actually sees', async () => {
+    await mcpCall(agent.apiKey, 'configure_agent', { toolPacks: ['planning'] }, 'tools-list-probe');
     const res = await SELF.fetch('https://noriq.test/mcp', {
       method: 'POST',
       headers: {
@@ -228,7 +229,7 @@ describe('the execution spec on the MCP task tools (RUN-136)', () => {
       (listed.result.tools as Array<{ name: string; description: string; inputSchema: unknown }>).map((t) => [t.name, t]),
     );
 
-    for (const name of ['create_task', 'create_tasks', 'update_task', 'create_plan']) {
+    for (const name of ['create_tasks', 'update_tasks', 'create_plan']) {
       const d = tools.get(name)!.description;
       // Not just the word: what it is FOR, and when to write one.
       expect(d, name).toContain('executionSpec');
@@ -241,9 +242,9 @@ describe('the execution spec on the MCP task tools (RUN-136)', () => {
     expect(getTask).toContain('lockedDecisions bind you');
     expect(getTask).toContain('executionSpecUnreadable');
     // The bulk tool warns rather than forbids.
-    expect(tools.get('update_tasks')!.description).toMatch(/will be wrong for every task but one/);
+    expect(tools.get('update_tasks')!.description).toMatch(/same contract genuinely applies to every item/);
     // …and the field really is in the advertised schema, not merely described.
-    expect(JSON.stringify(tools.get('create_task')!.inputSchema)).toContain('anticipatedFiles');
+    expect(JSON.stringify(tools.get('create_tasks')!.inputSchema)).toContain('anticipatedFiles');
   });
 
   it('tells agents about the spec in all three guidance surfaces', async () => {

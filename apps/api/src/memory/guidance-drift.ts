@@ -138,9 +138,9 @@ export const GUIDANCE_RULES: readonly GuidanceRule[] = [
   },
   {
     id: 'roaming-copilot-focus',
-    description: 'a roaming Copilot uses focus_project before read-only work in another project while runner agents remain pinned',
+    description: 'a roaming Copilot uses configure_agent project focus before read-only work in another project while runner agents remain pinned',
     expectedSurfaces: BASE_SURFACES,
-    detect: coOccurring(450, [/roaming copilot/i, /focus_project/i, /pinned/i]),
+    detect: coOccurring(500, [/roaming copilot/i, /configure_agent/i, /project/i, /pinned/i]),
   },
   {
     id: 'claim-before-work',
@@ -168,9 +168,9 @@ export const GUIDANCE_RULES: readonly GuidanceRule[] = [
   },
   {
     id: 'escalation-channels',
-    description: 'request_input blocks on a decision, raise_alert flags a non-blocking concern, spin_off_task files out-of-scope work',
+    description: 'request_input blocks on a decision, raise_alert flags a non-blocking concern, and create_tasks proposal metadata files out-of-scope work',
     expectedSurfaces: BASE_SURFACES,
-    detect: coOccurring(Infinity, [/request_input/i, /raise_alert/i, /spin_off_task/i]),
+    detect: coOccurring(Infinity, [/request_input/i, /raise_alert/i, /create_tasks/i, /proposal/i]),
   },
   {
     id: 'priority-inversion',

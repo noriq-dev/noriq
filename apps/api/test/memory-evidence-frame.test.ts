@@ -11,7 +11,7 @@
 import { env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import type { Env } from '../src/env';
-import { createAgent, mcpCall } from './helpers';
+import { createAgent, createRunAgent, mcpCall } from './helpers';
 import { assembleContextPack, collectContextPackEvidenceItems } from '../src/memory/context-pack';
 import {
   renderEvidenceFrame,
@@ -402,7 +402,8 @@ describe('claim_task / can_claim — priorEffort.evidenceFrame frames a real hos
       selfSummary: { approachSummary: hostileAttempt, rejectedHypotheses: [], durableLearnings: [], unresolvedQuestions: [] },
     }));
 
-    const probe = await mcpCall(agent.apiKey, 'can_claim', { taskId });
+    const guard = await createRunAgent(projectId, 'build', { allowedTools: ['can_claim'] });
+    const probe = await mcpCall(guard.apiKey, 'can_claim', { taskId });
     expect(probe.isError).toBe(false);
     expect(probe.body.claimable).toBe(true); // priorEffort is advisory — it never changes claimability
     expect(probe.body.priorEffort).toBeTruthy();

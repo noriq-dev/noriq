@@ -56,5 +56,5 @@ export const specWriteRefusalMessage = (r: SpecWriteRefusal): string =>
   `a ${r.runKind} run does not rewrite execution specs — any of them, not just your own task's: ` +
   'a spec\'s lockedDecisions bind you and its acceptance is what your work is judged against, and ' +
   'nothing here can tell which task will end up judging it. If a spec is wrong, say so in a ' +
-  'comment (add_comment) and let a human or a scope run correct it. You may still give a spec to ' +
+  'comment (post_comment) and let a human or a scope run correct it. You may still give a spec to ' +
   'a task you CREATE.';

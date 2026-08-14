@@ -432,8 +432,8 @@ export const api = {
   approvePlan: (pid: string, plid: string) => req<{ id: string; status: string; tasksUngated: number }>('POST', `/api/projects/${pid}/plans/${plid}/approve`),
   rejectPlan: (pid: string, plid: string) => req<{ ok: boolean; cancelledTasks: number }>('POST', `/api/projects/${pid}/plans/${plid}/reject`),
   // Spin-off gate (PLNR-230): accept → plain claimable todo; reject → cancelled (provenance kept).
-  acceptSpinoff: (pid: string, tid: string) => req<{ id: string; key: string; status: string }>('POST', `/api/projects/${pid}/tasks/${tid}/spinoff/accept`),
-  rejectSpinoff: (pid: string, tid: string) => req<{ id: string; key: string; status: string }>('POST', `/api/projects/${pid}/tasks/${tid}/spinoff/reject`),
+  acceptProposal: (pid: string, tid: string) => req<{ id: string; key: string; status: string }>('POST', `/api/projects/${pid}/tasks/${tid}/proposal/accept`),
+  rejectProposal: (pid: string, tid: string) => req<{ id: string; key: string; status: string }>('POST', `/api/projects/${pid}/tasks/${tid}/proposal/reject`),
   deleteTask: (pid: string, tid: string) => req('DELETE', `/api/projects/${pid}/tasks/${tid}`),
   deleteProject: (pid: string) => req('DELETE', `/api/projects/${pid}`),
   /** Cross-project "what needs me" (PLNR-121): open decisions/alerts + overdue tasks. */
@@ -1514,12 +1514,15 @@ export interface ApiSnapshot {
     failedAt?: string | null;
     /** 1/0 from SQLite — whether the task has an execution spec at all (RUN-162). */
     specPlanned?: number | boolean;
-    /** Spin-off surface (PLNR-230): 'proposed' status derives from proposedAt; the rest is the
-     *  provenance the approval UI shows — which run filed it, from which task, on what finding. */
+    /** Generic proposal provenance. Historical Runner spin-offs are normalized to this shape. */
     proposedAt?: string | null;
-    spinoffRunId?: string | null;
-    spinoffSourceTaskId?: string | null;
-    spinoffFinding?: string | null;
+    proposal?: {
+      finding: string;
+      filedBy: { kind: string; id: string } | null;
+      sourceTaskId: string | null;
+      executionId: string | null;
+      runId: string | null;
+    } | null;
     /** Dispatch-workflow override (PLNR-240): the plan pump runs this task under it. */
     workflow?: string | null;
   }>;

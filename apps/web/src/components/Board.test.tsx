@@ -46,9 +46,7 @@ const task = (id: string, key: string, title: string): TaskVM => ({
   archivedAt: null,
   specPlanned: false,
   proposedAt: null,
-  spinoffRunId: null,
-  spinoffSourceTaskId: null,
-  spinoffFinding: null,
+  proposal: null,
   workflow: null,
   comments: [],
 });

@@ -11,7 +11,7 @@ import { env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import { ProjectIntelligenceEpisode } from '@noriq-dev/shared';
 import type { Env } from '../src/env';
-import { createAgent, mcpCall } from './helpers';
+import { createAgent, createRunAgent, mcpCall } from './helpers';
 import {
   classifySupport, duplicateWarnings, effortSignals, summarizeEffort,
   type EffortCandidate, type EffortSignals,
@@ -525,7 +525,8 @@ describe('can_claim / claim_task — priorEffort is advisory and never touches c
       },
     }));
 
-    const probe = await mcpCall(agent.apiKey, 'can_claim', { taskId });
+    const guard = await createRunAgent(projectId, 'build', { allowedTools: ['can_claim'] });
+    const probe = await mcpCall(guard.apiKey, 'can_claim', { taskId });
     expect(probe.isError).toBe(false);
     expect(probe.body.claimable).toBe(true);
     expect(probe.body.priorEffort).toBeTruthy();
@@ -549,7 +550,8 @@ describe('can_claim / claim_task — priorEffort is advisory and never touches c
     const made = await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'A brand new task with no history whatsoever', tags: ['similar-effort-test'] });
     const taskId = made.body.id as string;
 
-    const probe = await mcpCall(agent.apiKey, 'can_claim', { taskId });
+    const guard = await createRunAgent(projectId, 'build', { allowedTools: ['can_claim'] });
+    const probe = await mcpCall(guard.apiKey, 'can_claim', { taskId });
     expect(probe.body.claimable).toBe(true);
     expect(probe.body.priorEffort).toBeUndefined();
 

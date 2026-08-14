@@ -1,6 +1,6 @@
 import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { createAgent, createUser, loginSession, mcpCall, authorizeForAllProjects } from './helpers';
+import { createAgent, createRunAgent, createUser, loginSession, mcpCall, authorizeForAllProjects } from './helpers';
 
 // NOTE: runs in the same shared-storage suite as coordination.test.ts;
 // setup endpoints are exercised first while no users beyond ours may exist.
@@ -588,7 +588,8 @@ describe('plans & groups', () => {
     await mcpCall(planner.apiKey, 'update_task', { projectId, taskId: cancelled, status: 'cancelled' });
 
     // Nothing in phase 1 is still going to happen, so phase 2 must open.
-    const probe = await mcpCall(worker.apiKey, 'can_claim', { taskId: dependent });
+    const guard = await createRunAgent(projectId, 'build', { allowedTools: ['can_claim'] });
+    const probe = await mcpCall(guard.apiKey, 'can_claim', { taskId: dependent });
     expect(probe.body.claimable).toBe(true);
     const open = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: dependent });
     expect(open.isError).toBe(false);
@@ -607,31 +608,32 @@ describe('plans & groups', () => {
       ],
     });
     const base = plan.body.phases[0].taskIds[0];
-    const baseKey = (await mcpCall(worker.apiKey, 'can_claim', { taskId: base })).body.taskKey;
+    const guard = await createRunAgent(projectId, 'build', { allowedTools: ['can_claim'] });
+    const baseKey = (await mcpCall(guard.apiKey, 'can_claim', { taskId: base })).body.taskKey;
     const dependent = plan.body.phases[1].taskIds[0];
 
     // Phase 2 is locked while phase 1 is unfinished — reported, not claimed.
-    const blocked = await mcpCall(worker.apiKey, 'can_claim', { taskId: dependent });
+    const blocked = await mcpCall(guard.apiKey, 'can_claim', { taskId: dependent });
     expect(blocked.isError).toBe(false);
     expect(blocked.body.claimable).toBe(false);
     expect(blocked.body.reason).toContain(baseKey);
 
     // Phase 1 itself is claimable.
-    expect((await mcpCall(worker.apiKey, 'can_claim', { taskId: base })).body.claimable).toBe(true);
+    expect((await mcpCall(guard.apiKey, 'can_claim', { taskId: base })).body.claimable).toBe(true);
 
     // A task only in review is not claimable (the RUN-59 shape: verifier passed, not approved).
     await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: base });
     await mcpCall(worker.apiKey, 'release_task', { projectId, taskId: base, toStatus: 'review' });
-    const inReview = await mcpCall(worker.apiKey, 'can_claim', { taskId: dependent });
+    const inReview = await mcpCall(guard.apiKey, 'can_claim', { taskId: dependent });
     expect(inReview.body.claimable).toBe(false); // phase 1 in review ≠ done → phase 2 stays locked
-    expect((await mcpCall(worker.apiKey, 'can_claim', { taskId: base })).body.reason).toContain('review');
+    expect((await mcpCall(guard.apiKey, 'can_claim', { taskId: base })).body.reason).toContain('review');
 
     // Approving phase 1 (done) opens phase 2.
     await mcpCall(worker.apiKey, 'update_task', { projectId, taskId: base, status: 'done' });
-    expect((await mcpCall(worker.apiKey, 'can_claim', { taskId: dependent })).body.claimable).toBe(true);
+    expect((await mcpCall(guard.apiKey, 'can_claim', { taskId: dependent })).body.claimable).toBe(true);
 
     // Unknown task → error, so the daemon's probe fails OPEN (never strands a run).
-    expect((await mcpCall(worker.apiKey, 'can_claim', { taskId: 'task_nope' })).isError).toBe(true);
+    expect((await mcpCall(guard.apiKey, 'can_claim', { taskId: 'task_nope' })).isError).toBe(true);
   });
 
   // ---- PLNR-228: create a task straight into a plan phase -----------------------

@@ -10,7 +10,7 @@ import { Button, Select } from './ui';
 import { confirm, prompt } from './Dialog';
 
 const COLUMNS: Array<[TaskStatus, string]> = [
-  // A run agent's proposed spin-off (PLNR-230) sits BEFORE todo: it is not yet work, it is a
+  // A run agent's proposed task (PLNR-230) sits BEFORE todo: it is not yet work, it is a
   // question — accept (→ todo) or reject (→ cancelled) from the card/drawer. Not a drop
   // target in either direction (store.moveTask refuses); the buttons are the only doors.
   ['proposed', 'Proposed'],
@@ -212,8 +212,8 @@ export function Board({ store }: { store: AppStore }) {
                   <div style={{ fontSize: 14, lineHeight: 1.45, color: 'var(--text)' }}>{task.title}</div>
                   {task.status === 'proposed' && store.permissions.canManage && (
                     <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
-                      <Button variant="primary" style={{ minHeight: MIN_TOUCH_TARGET, padding: '5px 13px' }} onClick={(event) => { event.stopPropagation(); void actions.acceptSpinoff(task.id); }}>✓ accept</Button>
-                      <Button variant="danger" style={{ minHeight: MIN_TOUCH_TARGET, padding: '5px 13px' }} onClick={async (event) => { event.stopPropagation(); if (await confirm(`Reject spin-off ${task.key}? The task is cancelled (its finding stays on record).`)) void actions.rejectSpinoff(task.id); }}>✕ reject</Button>
+                      <Button variant="primary" style={{ minHeight: MIN_TOUCH_TARGET, padding: '5px 13px' }} onClick={(event) => { event.stopPropagation(); void actions.acceptProposal(task.id); }}>✓ accept</Button>
+                      <Button variant="danger" style={{ minHeight: MIN_TOUCH_TARGET, padding: '5px 13px' }} onClick={async (event) => { event.stopPropagation(); if (await confirm(`Reject proposal ${task.key}? The task is cancelled (its finding stays on record).`)) void actions.rejectProposal(task.id); }}>✕ reject</Button>
                     </div>
                   )}
                   {(taskTags.length > 0 || agent || blocked || milestone) && (
@@ -553,14 +553,14 @@ export function Board({ store }: { store: AppStore }) {
                           )}
                         </div>
                         <div style={{ fontSize: 12.5, lineHeight: 1.45, color: 'var(--text)' }}>{t.title}</div>
-                        {/* The spin-off decision (PLNR-230): accept → todo, reject → cancelled.
+                        {/* The proposal decision (PLNR-230): accept → todo, reject → cancelled.
                             These buttons (and the drawer's) are the ONLY doors out of proposed. */}
                         {t.status === 'proposed' && store.permissions.canManage && (
                           <div style={{ display: 'flex', gap: 6, marginTop: 9 }}>
                             <Button
                               variant="primary"
                               style={{ fontSize: 10.5, padding: '3px 10px' }}
-                              onClick={(e) => { e.stopPropagation(); void actions.acceptSpinoff(t.id); }}
+                              onClick={(e) => { e.stopPropagation(); void actions.acceptProposal(t.id); }}
                             >
                               ✓ accept
                             </Button>
@@ -569,8 +569,8 @@ export function Board({ store }: { store: AppStore }) {
                               style={{ fontSize: 10.5, padding: '3px 10px' }}
                               onClick={async (e) => {
                                 e.stopPropagation();
-                                if (await confirm(`Reject spin-off ${t.key}? The task is cancelled (its finding stays on record).`)) {
-                                  void actions.rejectSpinoff(t.id);
+                                if (await confirm(`Reject proposal ${t.key}? The task is cancelled (its finding stays on record).`)) {
+                                  void actions.rejectProposal(t.id);
                                 }
                               }}
                             >

@@ -158,7 +158,7 @@ describe('multi-question input requests', () => {
       projectId: pid, taskId: t.id, title: 'Architecture decisions',
       questions: [
         { question: 'Which database?', header: 'DB', options: ['sqlite', 'postgres'] },
-        { question: 'Which caches?', multi: true, options: ['redis', 'memcached'] },
+        { question: 'Which caches?', kind: 'multi', options: ['redis', 'memcached'] },
         { question: 'Anything else to consider?' },
       ],
     });
@@ -171,11 +171,12 @@ describe('multi-question input requests', () => {
     // The batch structure reaches the snapshot (what all three UIs render).
     const snap = (await (await SELF.fetch(`https://noriq.test/api/projects/${pid}/snapshot`, {
       headers: { Cookie: cookie },
-    })).json()) as { signals: Array<{ id: string; questions: Array<{ question: string; multi?: boolean }> | null }> };
+    })).json()) as { signals: Array<{ id: string; questions: Array<{ question: string; kind?: string; multi?: boolean }> | null }> };
     const sig = snap.signals.find((x) => x.questions);
     expect(sig).toBeTruthy();
     expect(sig!.questions).toHaveLength(3);
-    expect(sig!.questions![1]!.multi).toBe(true);
+    expect(sig!.questions![1]!.kind).toBe('multi');
+    expect(sig!.questions![1]).not.toHaveProperty('multi');
 
     // Answer as the UI would: one formatted string for the whole batch.
     const answer = 'Which database? → postgres\nWhich caches? → redis, other: disk tier\nAnything else to consider? → keep it simple';

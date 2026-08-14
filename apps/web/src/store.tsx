@@ -18,7 +18,7 @@ function timeOf(iso: string): string {
 }
 
 /** Map raw events to the feed's visual vocabulary. */
-function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
+export function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
   const p = e.payload;
   const actor = (p.actorName as string) ?? e.actorId;
   let verb = e.verb;
@@ -30,10 +30,13 @@ function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
     case 'task.released': verb = 'released'; subject = `${p.key} · was held by ${p.previousHolder ?? '—'} → ${p.toStatus}`; taskId = e.subjectId; break;
     case 'task.requeued': verb = 'requeued'; subject = `${p.key} · ${p.reason}`; taskId = e.subjectId; break;
     case 'task.created': verb = p.parentTaskId ? 'subtask' : 'task'; subject = `created ${p.key} · ${p.title}`; taskId = e.subjectId; break;
-    // Spin-offs (PLNR-230): a run filed adjacent work; a human accepted/rejected it.
+    // Historical spin-off verbs stay readable after the generic proposal cutover.
     case 'task.spun_off': verb = 'spin-off'; subject = `proposed ${p.key} · ${p.title}${p.sourceTaskKey ? ` (found in ${p.sourceTaskKey})` : ''}`; taskId = e.subjectId; break;
     case 'task.spinoff_accepted': verb = 'spin-off ✓'; subject = `accepted ${p.key} · ${p.title}`; taskId = e.subjectId; break;
     case 'task.spinoff_rejected': verb = 'spin-off ✗'; subject = `rejected ${p.key} · ${p.title}`; taskId = e.subjectId; break;
+    case 'task.proposed': verb = 'proposal'; subject = `proposed ${p.key} · ${p.title}${p.sourceTaskKey ? ` (found in ${p.sourceTaskKey})` : ''}`; taskId = e.subjectId; break;
+    case 'task.proposal_accepted': verb = 'proposal ✓'; subject = `accepted ${p.key} · ${p.title}`; taskId = e.subjectId; break;
+    case 'task.proposal_rejected': verb = 'proposal ✗'; subject = `rejected ${p.key} · ${p.title}`; taskId = e.subjectId; break;
     case 'task.status_changed': verb = `status →${p.to}`; subject = `${p.key} · ${p.title ?? ''}`; taskId = e.subjectId; break;
     case 'task.updated': verb = 'updated'; subject = `${p.key} · ${(p.fields as string[] | undefined)?.join(', ') ?? ''}`; taskId = e.subjectId; break;
     case 'comment.posted': verb = String(p.kind ?? 'comment'); subject = `on ${p.taskKey} · “${p.body}”`; taskId = String(p.taskId ?? ''); break;
@@ -528,9 +531,7 @@ export function useAppStore() {
         archivedAt: t.archivedAt,
         specPlanned: Boolean(t.specPlanned),
         proposedAt: t.proposedAt ?? null,
-        spinoffRunId: t.spinoffRunId ?? null,
-        spinoffSourceTaskId: t.spinoffSourceTaskId ?? null,
-        spinoffFinding: t.spinoffFinding ?? null,
+        proposal: t.proposal ?? null,
         workflow: t.workflow ?? null,
         comments: t.id === selectedTaskId ? comments : [],
       };
@@ -797,16 +798,16 @@ export function useAppStore() {
       await api.rejectPlan(pidRef.current, planId);
       refresh();
     },
-    // The spin-off gate's task-level twin (PLNR-230): a run agent's proposed spin-off is
+    // The proposal gate's task-level twin (PLNR-230): a run agent's proposed task is
     // inert to every agent until one of these two buttons is pressed.
-    async acceptSpinoff(taskId: string) {
+    async acceptProposal(taskId: string) {
       if (!pidRef.current) return;
-      await api.acceptSpinoff(pidRef.current, taskId);
+      await api.acceptProposal(pidRef.current, taskId);
       refresh();
     },
-    async rejectSpinoff(taskId: string) {
+    async rejectProposal(taskId: string) {
       if (!pidRef.current) return;
-      await api.rejectSpinoff(pidRef.current, taskId);
+      await api.rejectProposal(pidRef.current, taskId);
       refresh();
     },
     async createPlanDoc(planId: string, input: { name: string; description?: string; body?: string }) {

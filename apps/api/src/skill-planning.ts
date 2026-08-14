@@ -34,7 +34,7 @@ findings, gotchas, final outcome; pass the full new body, or a \`phaseId\` to re
 phase). Plans are restructurable too: pass \`phases\` with the complete new shape to
 add/remove/move tasks or phases — gating follows the new structure instantly. Never
 paper over a structural change with prose alone; fix the structure so the document and
-reality agree. Reserve \`dependsOn\`/\`add_dependency\` for real, hand-picked orderings
+reality agree. Reserve \`dependsOn\`/\`update_tasks.addDependsOn\` for real, hand-picked orderings
 outside the phase flow.
 
 ## The execution spec
@@ -67,8 +67,8 @@ It carries:
   classic half-done build: every file present, every export defined, nothing calling any of it.
 
 Every field is optional — fill in what you actually know, and leave the rest empty rather than
-inventing it. Set it on \`create_task\`/\`create_tasks\`, on a plan's \`newTasks\`, or later
-with \`update_task\` (which REPLACES the whole spec — there is no field-level merge).
+inventing it. Set it on \`create_tasks\`, on a plan's \`newTasks\`, or later
+with \`update_tasks\` (which REPLACES the whole spec — there is no field-level merge).
 
 **Who may write one.** Anyone planning: a human, a copilot, or a **scope** run filing the tasks it
 found. Not a **build** or **verify** run on its own task — the spec is what its work is judged
@@ -81,10 +81,10 @@ is a finding, not an obstacle.
 \`executionSpecUnreadable\` is set, the stored spec is corrupt — say so and ask; do not treat
 it as "no spec" and plan over it.
 
-For a quick subtree without the ceremony, \`decompose_task\`; for ad-hoc ordering,
-\`add_dependency\` (undo a wrong edge with \`remove_dependency\`). A dependency may
+For a quick subtree without the ceremony, \`create_tasks\`; for ad-hoc ordering,
+\`update_tasks.addDependsOn\` (undo a wrong edge with \`update_tasks.removeDependsOn\`). A dependency may
 cross projects: task ids and display keys are globally unique, so \`dependsOn\` and
-\`add_dependency\` accept a blocker from any project you can access, and the claim
+\`update_tasks.addDependsOn\` accept a blocker from any project you can access, and the claim
 gate holds across the boundary exactly as within it. To coordinate
 mid-flight, \`send_message\`. See who else is on the project (and what they hold)
 with \`list_agents\`, and hand a task to a specific agent with \`handoff_task\` —

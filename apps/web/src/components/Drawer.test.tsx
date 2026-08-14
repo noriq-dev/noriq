@@ -16,15 +16,15 @@ const task: TaskVM = {
   claimedBy: null, claimExpiresAt: null, priority: 2, estimate: null, dueAt: null, deps: [],
   phaseDeps: [], milestoneId: null, boardId: 'board_1', tagIds: [], type: 'feature',
   openComments: 0, archivedAt: null, specPlanned: false, proposedAt: null,
-  spinoffRunId: null, spinoffSourceTaskId: null, spinoffFinding: null, workflow: null, comments: [],
+  proposal: null, workflow: null, comments: [],
 };
 
 const tick = () => act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
 
-function mount() {
+function mount(selectedTask: TaskVM = task) {
   const store = {
     currentPid: 'prj_plnr',
-    selectedTaskId: task.id,
+    selectedTaskId: selectedTask.id,
     draftKind: 'comment',
     draftText: '',
     permissions: { canContribute: true, canManage: true },
@@ -32,15 +32,15 @@ function mount() {
       tags: [], milestones: [], boards: [{ id: 'board_1', name: 'Main' }], signals: [], externalTasks: [],
     },
     helpers: {
-      tasksOf: () => [task],
-      effStatus: () => 'todo',
+      tasksOf: () => [selectedTask],
+      effStatus: () => selectedTask.status,
       agentById: () => null,
     },
     actions: {
       closeTask: vi.fn(), refreshNow: vi.fn(), restoreTask: vi.fn(), archiveTask: vi.fn(),
       deleteTask: vi.fn(), openTask: vi.fn(), removeDependency: vi.fn(), addDependency: vi.fn(),
-      claimToggle: vi.fn(), answerSignal: vi.fn(), acknowledgeSignal: vi.fn(), acceptSpinoff: vi.fn(),
-      rejectSpinoff: vi.fn(), setView: vi.fn(), resolveComment: vi.fn(), cycleKind: vi.fn(),
+      claimToggle: vi.fn(), answerSignal: vi.fn(), acknowledgeSignal: vi.fn(), acceptProposal: vi.fn(),
+      rejectProposal: vi.fn(), setView: vi.fn(), resolveComment: vi.fn(), cycleKind: vi.fn(),
       setDraftText: vi.fn(), postComment: vi.fn(),
     },
   } as unknown as AppStore;
@@ -82,5 +82,46 @@ describe('task detail editing (PLNR-429)', () => {
     expect(dialog).toBeTruthy();
     expect(dialog.querySelector<HTMLInputElement>('input[aria-label="Task title"]')?.value).toBe('Keep the detail visible');
     expect(container.querySelector('.task-drawer')?.textContent).toContain('Canonical task detail');
+  });
+
+  it('renders a Copilot proposal without requiring run provenance', async () => {
+    mount({
+      ...task,
+      status: 'proposed',
+      proposedAt: '2026-08-14T12:00:00.000Z',
+      proposal: {
+        finding: 'The selector cannot find unloaded tasks.',
+        filedBy: { kind: 'copilot', id: 'agt_copilot_123456' },
+        sourceTaskId: null,
+        executionId: 'exe_1',
+        runId: null,
+      },
+    });
+    await tick();
+    const text = container.querySelector('.task-drawer')?.textContent ?? '';
+    expect(text).toContain('proposal · filed by copilot 123456');
+    expect(text).toContain('The selector cannot find unloaded tasks.');
+    expect(text).not.toContain('· run ');
+    expect(text).toContain('Accept');
+    expect(text).toContain('Reject');
+  });
+
+  it('retains Runner run provenance when it is available', async () => {
+    mount({
+      ...task,
+      status: 'proposed',
+      proposedAt: '2026-08-14T12:00:00.000Z',
+      proposal: {
+        finding: 'A follow-up found during verification.',
+        filedBy: { kind: 'agent', id: 'agt_runner_654321' },
+        sourceTaskId: null,
+        executionId: 'exe_2',
+        runId: 'run_abcdef123456',
+      },
+    });
+    await tick();
+    const text = container.querySelector('.task-drawer')?.textContent ?? '';
+    expect(text).toContain('filed by agent 654321');
+    expect(text).toContain('run 123456');
   });
 });

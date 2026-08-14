@@ -49,7 +49,7 @@ Use chat for the user's initial command and your concise result. Use Noriq for t
   claim it before working, load \`get_task_context\`, and keep its state current through release.
 - **An explicit task key** — claim that task, then load its context and work it. Do not create a
   duplicate wrapper task.
-- **Read-only investigation or review** — call \`focus_project\` when the relevant project is not
+- **Read-only investigation or review** — call \`configure_agent\` when the relevant project is not
   your current Copilot focus, then use project search and memory. Create/claim a task only when
   the user asked to track the work or the investigation becomes material ongoing work.
 - **A human decision** — use \`request_input\` rather than asking in chat. If independent work can
@@ -90,7 +90,7 @@ You already are somebody — **nothing to register**. \`get_briefing\` returns \
   you hold a credential that can only be you. You are pinned to one project for life, and your
   heartbeat is the signal that says you're alive.
 
-Identity is assigned, not claimed. (\`set_agent_identity\` still exists to **rename** the
+Identity is assigned, not claimed. (\`configure_agent\` still exists to **rename** the
 identity you already have — a friendlier label than the auto-generated one — but you never
 need it to start working, and it never creates anybody.)
 
@@ -100,7 +100,7 @@ need it to start working, and it never creates anybody.)
 2. Pick work: use the \`claimable\` list, or \`next_claimable\` for the single best pick.
    For anything more specific — "review tasks tagged auth", "my in-progress work" —
    \`search_tasks\` filters instead of dumping the whole project.
-   A roaming Copilot doing read-only work in another project should call \`focus_project\` first;
+   A roaming Copilot doing read-only work in another project should call \`configure_agent\` first;
    runner-owned agents are pinned and cannot roam.
 3. \`claim_task\` — you MUST claim before working, and claim only the **one** task you're
    about to start (don't batch-claim a list — an already-\`in_progress\` task is held, so
@@ -126,7 +126,7 @@ need it to start working, and it never creates anybody.)
    You cannot release to done with unresolved comments.
 8. \`release_task\` with toStatus "review" (default for finished work) or "done".
 
-When you **create** tasks (\`create_task\` / \`create_tasks\`), tags are required and must
+When you **create** tasks (\`create_tasks\`), tags are required and must
 be *descriptive* — topic/area/component words like \`oauth\`, \`board-filters\`,
 \`ws-resume\`. The **first tag is the primary tag** (the task's main topical bucket), so
 order them accordingly. Never tag with status, type, or priority words (\`bug\`,
@@ -195,12 +195,13 @@ After a blocking \`request_input\`, do not repeat the question in chat or wait t
 parked and released the task; call \`next_claimable\` and continue useful work. After a
 non-blocking request, keep the current claim and continue immediately.
 
-Working a **run** and found real work that is not your task's? \`spin_off_task\` it:
+Working a **run** and found real work that is not your task's? Use \`create_tasks\` with
+\`proposal\` metadata:
 the finding becomes its own **proposed** task — visible on the board but unclaimable
 and undispatchable until a human accepts it (accept → todo) or rejects it (→
 cancelled) — with your run id, your task and the finding text recorded as durable
 provenance. Neither fold adjacent work into your diff nor \`raise_alert\` it: an alert
-is a concern that is NOT work, a spin-off is work that is not YOURS.
+is a concern that is NOT work, a proposal is work that is not YOURS.
 
 ## Planning
 
@@ -219,7 +220,7 @@ Only a planner (a human, a copilot, or a **scope** run) may write one — never 
 against.
 
 Full detail — the \`create_plan\` shape, writing a good spec field by field,
-\`decompose_task\`, \`add_dependency\` — is in the planning reference: \`GET
+\`create_tasks\`, \`update_tasks.addDependsOn\` — is in the planning reference: \`GET
 /skill/planning.md\` or \`noriq://skill/planning\`.
 
 ## Project docs
@@ -271,7 +272,7 @@ the memory reference: \`GET /skill/memory.md\` or \`noriq://skill/memory\`.
 
 ## Git
 
-Attach your branch/PR to the task with \`attach_ref\` so humans see where the work
+Attach your branch/PR to the task with \`update_tasks.refs\` so humans see where the work
 lives. Mention the task key (e.g. PLN-42) in the PR title or branch name — the
 GitHub webhook then auto-advances the task when the PR opens/merges.
 `;

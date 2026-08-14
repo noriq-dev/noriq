@@ -73,7 +73,7 @@ describe('dispatch-time Project Intelligence (PLNR-303)', () => {
       advisory: true, available: true, executorMode: 'copilot',
       repository: { key: 'noriq', reason: null },
       readiness: { taskId, primary: 'ready' },
-      fullPacketTool: 'get_task_intelligence',
+      fullPacketTool: 'get_task_context',
     });
     expect(context.body.intelligenceSummary).not.toHaveProperty('quotedEvidence');
 

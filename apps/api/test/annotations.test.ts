@@ -2,7 +2,7 @@
 // idempotent where true, closed-world) instead of the spec defaults (write +
 // destructive + open-world) for everything.
 import { beforeAll, describe, expect, it } from 'vitest';
-import { createAgent, mcpList } from './helpers';
+import { createAgent, mcpCall, mcpList } from './helpers';
 
 type Hints = { readOnlyHint?: boolean; destructiveHint?: boolean; idempotentHint?: boolean; openWorldHint?: boolean };
 type Tool = { name: string; annotations?: Hints };
@@ -10,6 +10,9 @@ type Tool = { name: string; annotations?: Hints };
 let agent: { id: string; apiKey: string };
 beforeAll(async () => {
   agent = await createAgent('annot-agent');
+  await mcpCall(agent.apiKey, 'configure_agent', {
+    toolPacks: ['planning', 'maintenance', 'orchestration'],
+  });
 }, 60000);
 
 describe('MCP tool annotations (PLNR-88)', () => {
@@ -22,16 +25,16 @@ describe('MCP tool annotations (PLNR-88)', () => {
       expect(t.annotations, `${t.name} is missing annotations`).toBeTruthy();
       expect(t.annotations!.openWorldHint, `${t.name} openWorldHint`).toBe(false);
     }
-    for (const r of ['get_briefing', 'my_updates', 'list_projects', 'get_project', 'get_task', 'next_claimable', 'read_open_comments', 'get_plans']) {
+    for (const r of ['get_briefing', 'my_updates', 'get_project', 'get_task', 'next_claimable', 'get_plans', 'get_task_context']) {
       expect(by[r]?.readOnlyHint, r).toBe(true);
     }
     // Writes are not read-only and not destructive (no MCP tool deletes data).
-    for (const w of ['create_task', 'create_project', 'claim_task', 'release_task', 'add_comment', 'request_input', 'raise_alert']) {
+    for (const w of ['create_tasks', 'create_project', 'claim_task', 'release_task', 'post_comment', 'request_input', 'raise_alert']) {
       expect(by[w]?.readOnlyHint, w).toBe(false);
       expect(by[w]?.destructiveHint, w).toBe(false);
     }
     // Idempotent writes are flagged as such.
-    for (const i of ['heartbeat', 'update_task', 'update_plan', 'set_agent_identity', 'add_dependency', 'remove_dependency', 'attach_ref']) {
+    for (const i of ['heartbeat', 'update_tasks', 'update_plan', 'configure_agent']) {
       expect(by[i]?.readOnlyHint, i).toBe(false);
       expect(by[i]?.idempotentHint, i).toBe(true);
     }

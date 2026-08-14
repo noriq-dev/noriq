@@ -137,7 +137,7 @@ function evaluateClaimability(
   if (task.proposedAt) {
     return {
       claimable: false, taskKey: task.key, reasonCode: 'spin_off_approval', gate, blockers: [],
-      reason: 'it is a proposed spin-off — awaiting human acceptance',
+      reason: 'it is a proposed task — awaiting human acceptance',
     };
   }
   if (proposedPlan) {

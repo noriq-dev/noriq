@@ -31,9 +31,10 @@ describe('auth', () => {
   it('exposes the coordination tools', async () => {
     const tools = await mcpList(orch.apiKey);
     const names = tools.map((t) => t.name);
-    for (const required of ['get_briefing', 'my_updates', 'claim_task', 'release_task', 'heartbeat', 'next_claimable', 'acknowledge_comment', 'resolve_comment', 'decompose_task']) {
+    for (const required of ['get_briefing', 'my_updates', 'claim_task', 'release_task', 'heartbeat', 'next_claimable', 'acknowledge_comment', 'resolve_comment', 'create_tasks', 'update_tasks']) {
       expect(names).toContain(required);
     }
+    expect(names).not.toContain('decompose_task');
   });
 });
 

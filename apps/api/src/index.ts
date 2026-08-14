@@ -241,7 +241,7 @@ const MANAGER_ROUTES = [
   /\/runs$/,
   /\/plans\/[^/]+\/dispatch$/,
   /\/plans\/[^/]+\/(approve|reject)$/,
-  /\/tasks\/[^/]+\/spinoff\/(accept|reject)$/,
+  /\/tasks\/[^/]+\/proposal\/(accept|reject)$/,
   /\/locks\/[^/]+\/force-release$/,
   /\/search\/reindex$/,
   /\/memory\/repositories(?:\/[^/]+)?$/,
@@ -964,6 +964,29 @@ const UI_STATE_SURFACES = new Set([
   'executions', 'intelligence', 'agents', 'runs', 'memory', 'project-settings',
 ]);
 
+/** Translate the historical storage columns into the generic proposal wire contract. The
+ * spinoff_* columns remain the durable compatibility seam, but clients never need to know that
+ * implementation detail. */
+function withProposal(row: Record<string, unknown>): Record<string, unknown> {
+  const {
+    spinoffRunId, spinoffSourceTaskId, spinoffFinding,
+    proposalActorKind, proposalActorId, proposalExecutionId,
+    ...task
+  } = row;
+  return {
+    ...task,
+    proposal: (spinoffFinding || proposalActorId) ? {
+      finding: String(spinoffFinding ?? ''),
+      filedBy: proposalActorId
+        ? { kind: String(proposalActorKind ?? 'copilot'), id: String(proposalActorId) }
+        : null,
+      sourceTaskId: spinoffSourceTaskId ? String(spinoffSourceTaskId) : null,
+      executionId: proposalExecutionId ? String(proposalExecutionId) : null,
+      runId: spinoffRunId ? String(spinoffRunId) : null,
+    } : null,
+  };
+}
+
 app.get('/api/projects/:pid/ui-state', userAuth, async (c) => {
   const startedAt = performance.now();
   const pid = c.req.param('pid')!;
@@ -1012,6 +1035,8 @@ app.get('/api/projects/:pid/ui-state', userAuth, async (c) => {
               t.failed_at AS failedAt, t.open_comments AS openComments, t."order",
               t.proposed_at AS proposedAt, t.spinoff_run_id AS spinoffRunId,
               t.spinoff_source_task_id AS spinoffSourceTaskId, t.spinoff_finding AS spinoffFinding,
+              t.proposal_actor_kind AS proposalActorKind, t.proposal_actor_id AS proposalActorId,
+              t.proposal_execution_id AS proposalExecutionId,
               (t.execution_spec IS NOT NULL) AS specPlanned, t.workflow
          FROM tasks t WHERE ${taskWhere} ORDER BY t."order"`, pid),
     rows(taskSurface,
@@ -1085,7 +1110,7 @@ app.get('/api/projects/:pid/ui-state', userAuth, async (c) => {
     version: pkg.version,
     surface,
     project: { ...project, ...projectAccessFields(effectiveAccess) },
-    tasks,
+    tasks: tasks.map(withProposal),
     dependencies,
     externalTasks,
     agents,
@@ -1156,6 +1181,8 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
               -- are the provenance the drawer shows a human deciding accept vs reject.
               proposed_at AS proposedAt, spinoff_run_id AS spinoffRunId,
               spinoff_source_task_id AS spinoffSourceTaskId, spinoff_finding AS spinoffFinding,
+              proposal_actor_kind AS proposalActorKind, proposal_actor_id AS proposalActorId,
+              proposal_execution_id AS proposalExecutionId,
               -- Whether there IS a spec, never the spec (RUN-162). Approving a plan approves what
               -- its tasks say, so the board counts the unplanned ones; shipping every spec through
               -- this poll to draw that number would be the whole feature's payload for it.
@@ -1237,7 +1264,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
   return c.json({
     version: pkg.version, // deploy marker — the SPA reloads itself on mismatch (PLNR-193)
     project: { ...(project as Record<string, unknown>), ...projectAccessFields(effectiveAccess) },
-    tasks: tasks.results,
+    tasks: tasks.results.map(withProposal),
     dependencies: deps.results,
     externalTasks,
     agents: agents.results,
@@ -1308,9 +1335,19 @@ app.get('/api/tasks/:tid', userAuth, async (c) => {
   // Derived 'proposed' + spin-off provenance (PLNR-230), mirroring MCP get_task.
   if (task.proposed_at && task.status === 'todo') task.status = 'proposed';
   task.proposedAt = task.proposed_at;
-  task.spinoffRunId = task.spinoff_run_id;
-  task.spinoffSourceTaskId = task.spinoff_source_task_id;
-  task.spinoffFinding = task.spinoff_finding;
+  task.proposal = (task.spinoff_finding || task.proposal_actor_id) ? {
+    finding: task.spinoff_finding,
+    filedBy: task.proposal_actor_id ? { kind: task.proposal_actor_kind, id: task.proposal_actor_id } : null,
+    sourceTaskId: task.spinoff_source_task_id,
+    executionId: task.proposal_execution_id,
+    runId: task.spinoff_run_id,
+  } : null;
+  delete task.spinoff_run_id;
+  delete task.spinoff_source_task_id;
+  delete task.spinoff_finding;
+  delete task.proposal_actor_kind;
+  delete task.proposal_actor_id;
+  delete task.proposal_execution_id;
   // The execution spec (RUN-135) rides only on the DETAIL reads — a board snapshot ships every
   // task in a project and renders none of this. `SELECT *` brought the raw JSON along, so the
   // column is dropped rather than shipped beside its parsed form: unlike the scalars above, a
@@ -2400,8 +2437,8 @@ app.post('/api/projects/:pid/memory/acceptance', userAuth, async (c) => {
 });
 
 // Proposed-decision approval (PLNR-253) — HUMAN-only, never an MCP tool (§12/§13: an agent must
-// never be the one that approves its own or another agent's claim). Mirrors the spin-off
-// accept/reject route shape (/api/projects/:pid/tasks/:tid/spinoff/accept|reject).
+// never be the one that approves its own or another agent's claim). Mirrors the task-proposal
+// accept/reject route shape (/api/projects/:pid/tasks/:tid/proposal/accept|reject).
 app.get('/api/projects/:pid/memory/proposed-decisions', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
   return c.json({ decisions: await memoryStub(c.env, pid).listProposedDecisions(pid) });
@@ -2794,10 +2831,10 @@ app.post('/api/projects/:pid/plans/:plid/reject', userAuth, async (c) =>
 // The spin-off gate's task-level twin (PLNR-230): accept a run agent's proposed spin-off
 // (→ plain claimable todo) or reject it (→ cancelled; provenance kept). Same project-reach
 // gating as the plan gate above.
-app.post('/api/projects/:pid/tasks/:tid/spinoff/accept', userAuth, async (c) =>
-  c.json(await room(c.env, c.req.param('pid')!).acceptSpinoff(c.req.param('pid')!, humanActor(c), c.req.param('tid')!)));
-app.post('/api/projects/:pid/tasks/:tid/spinoff/reject', userAuth, async (c) =>
-  c.json(await room(c.env, c.req.param('pid')!).rejectSpinoff(c.req.param('pid')!, humanActor(c), c.req.param('tid')!)));
+app.post('/api/projects/:pid/tasks/:tid/proposal/accept', userAuth, async (c) =>
+  c.json(await room(c.env, c.req.param('pid')!).acceptProposal(c.req.param('pid')!, humanActor(c), c.req.param('tid')!)));
+app.post('/api/projects/:pid/tasks/:tid/proposal/reject', userAuth, async (c) =>
+  c.json(await room(c.env, c.req.param('pid')!).rejectProposal(c.req.param('pid')!, humanActor(c), c.req.param('tid')!)));
 
 app.delete('/api/projects/:pid/tasks/:tid', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).deleteTask(c.req.param('pid')!, humanActor(c), c.req.param('tid')!)));
@@ -3730,6 +3767,22 @@ const RegisterRunnerBody = z.object({
   version: z.string().max(40).optional(),
 });
 
+function versionAtLeast(actual: string | null, minimum: string): boolean {
+  if (!actual) return false;
+  const parse = (value: string): [number, number, number] | null => {
+    const match = /^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:[-+][0-9A-Za-z.-]+)?$/.exec(value.trim());
+    if (!match) return null;
+    return [Number(match[1]), Number(match[2] ?? 0), Number(match[3] ?? 0)];
+  };
+  const a = parse(actual);
+  const b = parse(minimum);
+  if (!a || !b) return false;
+  for (let i = 0; i < 3; i++) {
+    if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) > (b[i] ?? 0);
+  }
+  return true;
+}
+
 const HeartbeatBody = z.object({
   freeSlots: z.number().int().nonnegative(),
   // 'offline' is the daemon saying GOODBYE on a clean shutdown (RUN-35). Without it, stopping
@@ -4265,9 +4318,16 @@ async function resolveRunnerJobRepository(
   repoRef: string,
 ): Promise<{ baseRevision: string } | Response> {
   const runner = await c.env.DB.prepare(
-    'SELECT repos FROM runners WHERE id = ? AND owner_user_id = ? AND offboarded_at IS NULL',
-  ).bind(runnerId, c.var.user!.id).first<{ repos: string }>();
+    'SELECT repos, version FROM runners WHERE id = ? AND owner_user_id = ? AND offboarded_at IS NULL',
+  ).bind(runnerId, c.var.user!.id).first<{ repos: string; version: string | null }>();
   if (!runner) return c.json({ error: 'runner not found' }, 404);
+  const minimumRunner = c.env.MIN_RUNNER_CATALOG_VERSION?.trim();
+  if (minimumRunner && !versionAtLeast(runner.version, minimumRunner)) {
+    return c.json({
+      error: `runner ${minimumRunner} or newer is required for MCP catalog revision 2`,
+      runnerVersion: runner.version,
+    }, 409);
+  }
   let repositories: Array<{ id?: string; repoRef?: string; projectId?: string | null; baseRevision?: string }>;
   try {
     repositories = JSON.parse(runner.repos) as typeof repositories;
@@ -5084,7 +5144,7 @@ app.post('/api/runs/:runId/steer', userAuth, async (c) => {
 // The runner creates the agent it is about to spawn, and gets a token BOUND to it (RUN-43).
 //
 // This inverts how identity used to work. The daemon told the model, in English, to call
-// set_agent_identity — so identity depended on the model choosing to comply, the daemon never
+// configure_agent — so identity depended on the model choosing to comply, the daemon never
 // learned the agt_ that resulted (run.status.agentId was always null), and Codex, which never
 // had MCP wired at all, was silently un-attributable. Now the identity exists BEFORE the
 // process does, and the process inherits it by holding a credential that can only be it.
@@ -5113,15 +5173,19 @@ app.post('/api/runs/:runId/agent', agentAuth, async (c) => {
   const conn = c.var.connection!;
   const run = await c.env.DB.prepare(
     `SELECT r.id, r.kind, r.status, r.project_id AS projectId, r.runner_id AS runnerId, r.agent_id AS agentId,
-            rn.owner_user_id AS owner
+            rn.owner_user_id AS owner, rn.version AS runnerVersion
      FROM runs r LEFT JOIN runners rn ON rn.id = r.runner_id WHERE r.id = ?`,
   ).bind(runId).first<{
     id: string; kind: string; status: RunStatus; projectId: string; runnerId: string | null;
-    agentId: string | null; owner: string | null;
+    agentId: string | null; owner: string | null; runnerVersion: string | null;
   }>();
   // Same ownership test as steer-ack: the run must belong to a runner this user owns.
   if (!run || run.owner !== conn.userId) return c.json({ error: 'run not found' }, 404);
   if (!run.runnerId) return c.json({ error: 'run has no runner yet' }, 400);
+  const minimumRunner = c.env.MIN_RUNNER_CATALOG_VERSION?.trim();
+  if (minimumRunner && !versionAtLeast(run.runnerVersion, minimumRunner)) {
+    return c.json({ error: `runner ${minimumRunner} or newer is required for MCP catalog revision 2`, runnerVersion: run.runnerVersion }, 409);
+  }
   const actionDenied = await runnerProjectActionDenied(c, run.projectId, 'manage');
   if (actionDenied) return actionDenied;
   // A run that is OVER gets no credential at all, and this is asked FIRST so a finished run says
@@ -5530,7 +5594,7 @@ app.post('/api/tasks/:tid/attachments', userAuth, async (c) => {
 });
 
 // Agent upload via capability token (PLNR-173). No cookie/bearer — the signed token IS
-// the authorization, minted by create_attachment_upload for exactly this (agent, task,
+// the authorization, minted by attach_files upload mode for exactly this (agent, task,
 // file). Bytes stream straight to R2, never through the model context. Mirrors the POST
 // route above, including the PLNR-98 real-size check (Content-Length is client-controlled).
 app.put('/api/attachments/upload/:token', async (c) => {
@@ -5635,7 +5699,7 @@ app.post('/api/runner-ingest/capability', agentAuth, async (c) => {
 
 // --- Runner-filed review follow-ups (PLNR-478) -----------------------------------------------
 // The discovery reviewer deliberately has no Noriq credential, so the daemon owns the follow-up
-// records but cannot call the run-agent-only spin_off_task tool. This flat agentAuth route stays
+// records but may not have a live MCP session. This flat agentAuth route stays
 // OUTSIDE /api/projects/:pid/* (whose blanket userAuth middleware rejects bearer-only daemons).
 // It grants no claimable-work authority: createTask's existing spin-off seam stores `todo` plus
 // proposed_at, so the RUN-23 human accept/reject gate and all claim/dispatch exclusions stay intact.
@@ -5661,7 +5725,7 @@ app.post('/api/runner-spinoffs', agentAuth, async (c) => {
   if (projectDenied) return projectDenied;
 
   // Explicit provenance is accepted only after reconstructing the relationship from canonical
-  // rows. This is the daemon twin of spin_off_task deriving the pointers from its bound agent.
+  // rows. This is the daemon twin of create_tasks proposal provenance derived from its bound agent.
   const source = await c.env.DB.prepare(
     `SELECT r.id FROM runs r
        JOIN tasks t ON t.id = r.anchor_id AND t.project_id = r.project_id
@@ -5693,7 +5757,10 @@ app.post('/api/runner-spinoffs', agentAuth, async (c) => {
     const input: CreateTaskInput = {
       title: b.title, body: b.body,
       tags, allowNewTags: b.allowNewTags, priority: b.priority, type: b.type,
-      spinoff: { runId: b.sourceRunId, sourceTaskId: b.sourceTaskId, finding: b.finding },
+      proposal: {
+        runId: b.sourceRunId, sourceTaskId: b.sourceTaskId, finding: b.finding,
+        actorKind: 'agent', actorId: b.runnerId, executionId: null,
+      },
     };
     const created = await room(c.env, b.projectId).createTask(
       b.projectId,

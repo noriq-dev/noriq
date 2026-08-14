@@ -23,6 +23,8 @@ export interface Env {
   /** Poll interval (ms) for the subscriptions/listen event stream (PLNR-234).
    *  Default 5000; tests set it low so change notifications arrive within a tick. */
   LISTEN_POLL_MS?: string;
+  /** Optional coordinated catalog-cutover floor, e.g. 0.16.0. */
+  MIN_RUNNER_CATALOG_VERSION?: string;
   /** Poll cadence for reconnectable Ask SSE followers. Primarily lowered by tests. */
   ASK_STREAM_POLL_MS?: string;
   /** Maximum generated tokens for an Ask answer. Parsed and clamped by askOutputTokenLimit. */
@@ -74,8 +76,8 @@ export interface Env {
   CODE_VECTORIZE?: VectorizeIndex;
   /** HMAC key for signing agent attachment-upload capability tokens (PLNR-173). Optional:
    *  falls back to ADMIN_TOKEN, so an instance with an admin token already supports agent
-   *  uploads with no extra config. If neither is set, create_attachment_upload is disabled
-   *  and agents fall back to inline add_attachment for small files. */
+   *  uploads with no extra config. If neither is set, attach_files upload mode is disabled
+   *  and agents fall back to inline attach_files for small files. */
   ATTACHMENT_UPLOAD_SECRET?: string;
   /**
    * Optional CIMD (Client ID Metadata Document) trust policy: a comma-separated

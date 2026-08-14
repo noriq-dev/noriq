@@ -186,7 +186,7 @@ describe('get_briefing — additive `memory` block', () => {
   it('a memory that disagrees with a task never changes the coordination facts alongside it — only appears as labelled evidence', async () => {
     const projectId = await newProject('MPB5');
     const agent = await createRunAgent(projectId, 'scope');
-    const made = await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'Ship the throttle fix', tags: ['briefing-test'] });
+    const made = await mcpCall(owner.apiKey, 'create_task', { projectId, title: 'Ship the throttle fix', tags: ['briefing-test'] });
     const taskId = made.body.id as string;
     // A decision that claims something FALSE about the task's real state.
     await mcpCall(agent.apiKey, 'record_memory', {
@@ -210,22 +210,22 @@ describe('get_briefing — additive `memory` block', () => {
   it('the notices text block still delivers exactly as before, alongside the new field', async () => {
     const projectId = await newProject('MPB6');
     const agent = await createRunAgent(projectId, 'scope');
-    const made = await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'Notices probe', tags: ['briefing-test'] });
+    const made = await mcpCall(owner.apiKey, 'create_task', { projectId, title: 'Notices probe', tags: ['briefing-test'] });
     const taskId = made.body.id as string;
     const claimed = await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId });
     expect(claimed.isError).toBeFalsy();
 
     const other = await createRunAgent(projectId, 'build');
-    const commented = await mcpCall(other.apiKey, 'post_comment', { projectId, taskId, body: 'please double-check the retry budget', kind: 'question' });
+    const commented = await mcpCall(other.apiKey, 'post_comment', { projectId, taskId, body: 'please double-check the retry budget', kind: 'comment' });
     expect(commented.isError).toBeFalsy();
 
     // The "--- notices ---" footer is built by a SEPARATE computeUpdates call the `tool()`
     // wrapper (mcp.ts) makes AFTER every handler, cursor-gated — so the FIRST call to observe a
     // new event is the one whose footer carries it (a SECOND call afterward would see nothing
     // new, since the first already advanced the cursor). Use a plain, unrelated tool call
-    // (list_projects) as that first observer, exactly like any real working agent's next call
+    // (get_project) as that first observer, exactly like any real working agent's next call
     // would.
-    const probe = await mcpCall(agent.apiKey, 'list_projects', {});
+    const probe = await mcpCall(agent.apiKey, 'get_project', { projectId });
     expect(probe.notices).toBeTruthy();
     expect(probe.notices).toContain('retry budget');
 

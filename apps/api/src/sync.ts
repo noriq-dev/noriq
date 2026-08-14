@@ -96,7 +96,7 @@ export async function computeUpdates(
   ).bind(agent.id).all<{ id: string; key: string; title: string; status: string; claimExpiresAt: string | null }>();
   for (const t of heldRows.results) heldTaskIds.add(t.id);
 
-  // The agent's LOCAL project (set when it scopes via set_agent_identity or its first
+  // The agent's LOCAL project (set when it scopes via configure_agent or its first
   // claim). my_updates is scoped to it so an agent working one project doesn't see
   // other projects' claimable tasks / questions / broadcasts (PLNR-142) — even ones the
   // same user owns. NULL for a not-yet-localized agent → fall back to the user-wide view

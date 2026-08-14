@@ -19,7 +19,7 @@ describe('roaming Copilot project focus', () => {
     expect((await mcpCall(copilot.apiKey, 'get_briefing', {})).body.state.agentProjectId).toBe(b);
     await mcpCall(copilot.apiKey, 'release_task', { projectId: b, taskId: taskB.id, toStatus: 'done' });
 
-    const focused = await mcpCall(copilot.apiKey, 'focus_project', { projectId: a });
+    const focused = await mcpCall(copilot.apiKey, 'configure_agent', { projectId: a });
     expect(focused.body).toMatchObject({ previousProjectId: b, projectId: a });
     expect(focused.body.nextAction).toMatch(/get_briefing/);
     expect((await mcpCall(copilot.apiKey, 'get_briefing', {})).body.state.agentProjectId).toBe(a);
@@ -30,16 +30,16 @@ describe('roaming Copilot project focus', () => {
     const a = (await mcpCall(owner.apiKey, 'create_project', { key: 'FOCRUNA', name: 'Runner A' })).body.id as string;
     const b = (await mcpCall(owner.apiKey, 'create_project', { key: 'FOCRUNB', name: 'Runner B' })).body.id as string;
     const runner = await createRunAgent(a, 'build', {
-      allowedTools: ['get_briefing', 'set_agent_identity', 'focus_project'],
+      allowedTools: ['get_briefing', 'configure_agent'],
     });
 
-    const focus = await mcpCall(runner.apiKey, 'focus_project', { projectId: b });
+    const focus = await mcpCall(runner.apiKey, 'configure_agent', { projectId: b });
     expect(focus.isError).toBe(true);
-    expect(focus.text).toMatch(/unknown tool|not found/i);
+    expect(focus.text).toMatch(/pinned|cannot change project focus/i);
 
-    const rename = await mcpCall(runner.apiKey, 'set_agent_identity', { name: 'still-pinned', projectId: b });
+    const rename = await mcpCall(runner.apiKey, 'configure_agent', { name: 'still-pinned', projectId: b });
     expect(rename.isError).toBe(true);
-    expect(rename.text).toMatch(/pinned/i);
+    expect(rename.text).toMatch(/pinned|cannot change project focus/i);
     expect((await mcpCall(runner.apiKey, 'get_briefing', {})).body.state.agentProjectId).toBe(a);
   });
 });

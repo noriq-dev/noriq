@@ -2,7 +2,7 @@ import type { Context } from 'hono';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { Env } from './env';
 import { resolveSessionAgent, type AppContext, type Connection } from './auth';
-import { buildMcpServer, INSTRUCTIONS, SERVER_INFO } from './mcp';
+import { buildMcpServer, INSTRUCTIONS, serverInfoForAgent } from './mcp';
 import { handleSubscriptionsListen } from './mcp-listen';
 import { copilotSessionContextFromMessages } from './lib/copilot-session';
 
@@ -63,7 +63,7 @@ const FORWARDED_METHODS = new Set(['tools/list', 'tools/call', 'resources/list',
 /** Freshness hints for CacheableResult methods. All private: tools/list varies with the
  *  agent's tool floor and every read is behind the caller's token. */
 const CACHE_TTLS: Record<string, number> = {
-  // A deploy can change the catalogue. SERVER_INFO.version is the durable cache revision, while
+  // A deploy can change the catalogue. The server-info version is the durable cache revision, while
   // this short TTL keeps hosts that ignore it from holding a stale Copilot surface for an hour.
   'tools/list': 60_000,
   'resources/list': 60_000,
@@ -180,6 +180,25 @@ export async function handleModernMcp(c: Context<AppContext>, env: Env, conn: Co
 
   // --- server/discover: answered directly, no SDK involved ---
   if (isDiscover) {
+    let discoveryAgent = conn.boundAgent;
+    if (!discoveryAgent) {
+      const openAiSession = meta['openai/session'];
+      const discoverySessionKey = typeof openAiSession === 'string' && openAiSession.length > 0
+        ? `openai:${openAiSession}`
+        : `stateless:${conn.tokenId}`;
+      try {
+        discoveryAgent = await resolveSessionAgent(
+          env,
+          conn,
+          discoverySessionKey,
+          copilotSessionContextFromMessages([msg]),
+        );
+      } catch (e) {
+        const message = (e as Error).message;
+        const authFailure = /does not belong|revoked|session has ended/i.test(message);
+        return c.json({ error: message }, authFailure ? 401 : 400);
+      }
+    }
     return c.json({
       jsonrpc: '2.0' as const,
       id,
@@ -193,7 +212,7 @@ export async function handleModernMcp(c: Context<AppContext>, env: Env, conn: Co
         instructions: INSTRUCTIONS,
         ttlMs: 60_000,
         cacheScope: 'private' as const,
-        _meta: { [META_SERVER_INFO]: SERVER_INFO },
+        _meta: { [META_SERVER_INFO]: serverInfoForAgent(discoveryAgent) },
       },
     }, 200);
   }
@@ -255,7 +274,10 @@ export async function handleModernMcp(c: Context<AppContext>, env: Env, conn: Co
     }
     const result = (resp.result ?? {}) as Record<string, unknown>;
     result.resultType ??= 'complete';
-    result._meta = { ...(result._meta as Record<string, unknown> ?? {}), [META_SERVER_INFO]: SERVER_INFO };
+    result._meta = {
+      ...(result._meta as Record<string, unknown> ?? {}),
+      [META_SERVER_INFO]: serverInfoForAgent(agent),
+    };
     const ttl = CACHE_TTLS[method];
     if (ttl !== undefined) {
       result.ttlMs ??= ttl;

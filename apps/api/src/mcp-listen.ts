@@ -23,9 +23,9 @@ import { nowIso } from './lib/util';
  *    the honored subset echoed in the ack) → `notifications/resources/updated` on edit.
  *    Attachment URIs are excluded: attachments are immutable, so `updated` can never
  *    fire and granting the subscription would be a promise that cannot be kept.
- *  - `toolsListChanged` / `promptsListChanged` are omitted from the ack: the tool
- *    catalogue changes only on deploy (or a runner re-dispatch), which this stream
- *    cannot observe, and there are no prompts.
+ *  - `toolsListChanged`: persistent Copilot pack profile updates on this OAuth
+ *    connection → `notifications/tools/list_changed`.
+ *  - `promptsListChanged` remains unsupported because there are no prompts.
  *
  * Mechanics: the stream POLLS the per-project event log (`events`, verbs `doc.*` /
  * `attachment.*`) rather than wiring the ProjectRoom fanout into MCP — reads stay out of
@@ -64,6 +64,7 @@ export async function handleSubscriptionsListen(
     );
   }
   const wantListChanged = filter.resourcesListChanged === true;
+  const wantToolsChanged = filter.toolsListChanged === true;
   const requestedUris = Array.isArray(filter.resourceSubscriptions)
     ? filter.resourceSubscriptions.filter((u): u is string => typeof u === 'string')
     : [];
@@ -96,11 +97,16 @@ export async function handleSubscriptionsListen(
   }
 
   const granted: SubscriptionFilter = {
+    ...(wantToolsChanged ? { toolsListChanged: true } : {}),
     ...(wantListChanged ? { resourcesListChanged: true } : {}),
     ...(honoredUris.length > 0 ? { resourceSubscriptions: honoredUris } : {}),
   };
   const subMeta = { [META_SUBSCRIPTION_ID]: msg.id };
   const pollMs = Math.max(50, Number(env.LISTEN_POLL_MS ?? '5000') || 5000);
+  const initialToolProfile = wantToolsChanged
+    ? await env.DB.prepare(`SELECT MAX(tool_profile_updated_at) AS updatedAt FROM agents WHERE oauth_token_id = ? AND kind = 'copilot'`)
+        .bind(conn.tokenId).first<{ updatedAt: string | null }>()
+    : null;
 
   const encoder = new TextEncoder();
   const frame = (payload: unknown) => encoder.encode(`data: ${JSON.stringify(payload)}\n\n`);
@@ -122,10 +128,24 @@ export async function handleSubscriptionsListen(
       let cursor = nowIso();
       let seenAtCursor = new Set<string>();
       let quietPolls = 0;
+      let toolProfileCursor = initialToolProfile?.updatedAt ?? '';
 
       const poll = async () => {
         if (stopped) { try { controller.close(); } catch { /* already closed */ } return; }
         try {
+          if (wantToolsChanged) {
+            const profile = await env.DB.prepare(
+              `SELECT MAX(tool_profile_updated_at) AS updatedAt FROM agents
+                WHERE oauth_token_id = ? AND kind = 'copilot'`,
+            ).bind(conn.tokenId).first<{ updatedAt: string | null }>();
+            if (profile?.updatedAt && profile.updatedAt !== toolProfileCursor) {
+              controller.enqueue(frame({
+                jsonrpc: '2.0', method: 'notifications/tools/list_changed', params: { _meta: subMeta },
+              }));
+              quietPolls = 0;
+            }
+            toolProfileCursor = profile?.updatedAt ?? '';
+          }
           // `>=` + the seen-id set: strictly `>` would skip a second write landing in the
           // same millisecond as the last one we reported.
           // Explicit ?N numbering throughout — the WHERE fragments use ?1, and mixing

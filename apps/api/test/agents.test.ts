@@ -1,7 +1,7 @@
 // Agent re-model: one connection (token) → many agents (MCP sessions), each project-local.
 import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
-import { createAgent, loginSession, createUser, mcpCall, mintTokenForUser } from './helpers';
+import { createAgent, loginSession, createUser, mcpCall, mcpList, mintTokenForUser } from './helpers';
 
 let conn: { id: string; apiKey: string }; // one OAuth connection (token)
 let projectId: string;
@@ -17,8 +17,8 @@ beforeAll(async () => {
 
 describe('agents are per-session, project-local', () => {
   it('two MCP sessions on ONE connection are two distinct agents', async () => {
-    const a = await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'alpha', projectId }, 'sess-A');
-    const b = await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'beta', projectId }, 'sess-B');
+    const a = await mcpCall(conn.apiKey, 'configure_agent', { name: 'alpha', projectId }, 'sess-A');
+    const b = await mcpCall(conn.apiKey, 'configure_agent', { name: 'beta', projectId }, 'sess-B');
     expect(a.isError).toBe(false);
     expect(b.isError).toBe(false);
     expect(a.body.actingAs.id).not.toBe(b.body.actingAs.id);
@@ -49,7 +49,7 @@ describe('agents are per-session, project-local', () => {
 
   it('project snapshot lists only that project’s agents', async () => {
     // scope one agent to the OTHER project
-    await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'gamma', projectId: otherProjectId }, 'sess-C');
+    await mcpCall(conn.apiKey, 'configure_agent', { name: 'gamma', projectId: otherProjectId }, 'sess-C');
     const cookie = await bootAdmin();
     const snap = await (await SELF.fetch(`https://noriq.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json() as {
       agents: Array<{ name: string; parentAgentId: string | null }>;
@@ -61,22 +61,22 @@ describe('agents are per-session, project-local', () => {
   });
 
   it('the same friendly name is allowed in different projects (PLNR-65)', async () => {
-    const here = await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'builder', projectId }, 'sess-dup1');
-    const there = await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'builder', projectId: otherProjectId }, 'sess-dup2');
+    const here = await mcpCall(conn.apiKey, 'configure_agent', { name: 'builder', projectId }, 'sess-dup1');
+    const there = await mcpCall(conn.apiKey, 'configure_agent', { name: 'builder', projectId: otherProjectId }, 'sess-dup2');
     expect(here.isError).toBe(false);
     expect(there.isError).toBe(false);
     expect(here.body.actingAs.name).toBe('builder');
     expect(there.body.actingAs.name).toBe('builder');
     expect(here.body.actingAs.id).not.toBe(there.body.actingAs.id);
     // But a second 'builder' in the SAME project is refused.
-    const clash = await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'builder', projectId }, 'sess-dup3');
+    const clash = await mcpCall(conn.apiKey, 'configure_agent', { name: 'builder', projectId }, 'sess-dup3');
     expect(clash.isError).toBe(true);
-    expect(clash.text).toMatch(/already taken in this project/);
+    expect(clash.text).toMatch(/already taken(?: or retired)? in this project/);
   });
 
   it('the Agents roster is scoped to a project too', async () => {
-    await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'roster-here', projectId }, 'sess-r1');
-    await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'roster-there', projectId: otherProjectId }, 'sess-r2');
+    await mcpCall(conn.apiKey, 'configure_agent', { name: 'roster-here', projectId }, 'sess-r1');
+    await mcpCall(conn.apiKey, 'configure_agent', { name: 'roster-there', projectId: otherProjectId }, 'sess-r2');
     const cookie = await bootAdmin();
     const roster = await (await SELF.fetch(`https://noriq.test/api/agents?projectId=${projectId}`, { headers: { Cookie: cookie } })).json() as {
       agents: Array<{ name: string }>;
@@ -121,7 +121,7 @@ describe('agents are per-session, project-local', () => {
   });
 
   it('attributes a sub-agent through immediate session and execution lineage', async () => {
-    await mcpCall(conn.apiKey, 'set_agent_identity', { name: 'lead', projectId }, 'sess-lead');
+    await mcpCall(conn.apiKey, 'configure_agent', { name: 'lead', projectId }, 'sess-lead');
     const parentBriefing = await mcpCall(conn.apiKey, 'get_briefing', {}, 'sess-lead');
     const parent = parentBriefing.body.you as {
       presenceId: string; execution: { executionId: string };
@@ -133,7 +133,7 @@ describe('agents are per-session, project-local', () => {
       },
     };
     const sub = await mcpCall(
-      conn.apiKey, 'set_agent_identity', { name: 'helper', projectId }, 'sess-sub', lineage,
+      conn.apiKey, 'configure_agent', { name: 'helper', projectId }, 'sess-sub', lineage,
     );
     expect(sub.isError).toBe(false);
     const subBriefing = await mcpCall(conn.apiKey, 'get_briefing', {}, 'sess-sub');
@@ -151,16 +151,15 @@ describe('agents are per-session, project-local', () => {
     expect(helper?.parentAgentId).toBeNull();
   });
 
-  it('rejects the legacy mutable parentAgentId route', async () => {
-    const attempted = await mcpCall(conn.apiKey, 'set_agent_identity', {
-      name: 'legacy-parent', projectId, parentAgentId: 'agt_guess',
-    }, 'sess-legacy-parent');
-    expect(attempted.isError).toBe(true);
-    expect(attempted.text).toContain('io.noriq/sessionLineage');
+  it('removes the legacy mutable parentAgentId field from the canonical schema', async () => {
+    const configure = (await mcpList(conn.apiKey)).find((tool) => tool.name === 'configure_agent') as
+      | { inputSchema?: { properties?: Record<string, unknown> } }
+      | undefined;
+    expect(configure?.inputSchema?.properties).not.toHaveProperty('parentAgentId');
   });
 
   it('rejects self, cross-user, and cross-project lineage hints', async () => {
-    await mcpCall(conn.apiKey, 'focus_project', { projectId }, 'sess-lineage-guard');
+    await mcpCall(conn.apiKey, 'configure_agent', { projectId }, 'sess-lineage-guard');
     const own = (await mcpCall(conn.apiKey, 'get_briefing', {}, 'sess-lineage-guard')).body.you as {
       presenceId: string; execution: { executionId: string };
     };
@@ -173,7 +172,7 @@ describe('agents are per-session, project-local', () => {
       'io.noriq/sessionLineage': { parentPresenceId: own.presenceId },
     })).rejects.toThrow(/another user/);
 
-    await expect(mcpCall(conn.apiKey, 'focus_project', { projectId: otherProjectId }, 'sess-lineage-project', {
+    await expect(mcpCall(conn.apiKey, 'configure_agent', { projectId: otherProjectId }, 'sess-lineage-project', {
       'io.noriq/sessionLineage': { parentExecutionId: own.execution.executionId },
     })).rejects.toThrow(/another project/);
   });

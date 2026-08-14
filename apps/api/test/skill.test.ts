@@ -55,7 +55,7 @@ describe('skill core (PLNR-310)', () => {
     expect(text).toContain('executionSpec');
     expect(text).toContain('anticipatedFiles');
     expect(text).toContain('Noriq is the channel of record');
-    expect(text).toContain('focus_project');
+    expect(text).toContain('configure_agent');
     expect(text).toContain('get_task_context');
     expect(text).toMatch(/request_input[\s\S]+do not repeat the question in chat/i);
     expect(text).toMatch(/description:.*plan, implement, fix, review, investigate, continue/i);

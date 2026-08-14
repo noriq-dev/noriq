@@ -88,12 +88,16 @@ export interface TaskVM {
    *  every spec through the snapshot to draw a number would be the whole feature's payload for it.
    *  The spec itself is a detail read. */
   specPlanned: boolean;
-  /** Spin-off surface (PLNR-230): set only on a task filed via spin_off_task. proposedAt
+  /** Proposal surface: set only on a task filed for human acceptance. proposedAt
    *  non-null = still awaiting the human accept/reject decision. */
   proposedAt: string | null;
-  spinoffRunId: string | null;
-  spinoffSourceTaskId: string | null;
-  spinoffFinding: string | null;
+  proposal: {
+    finding: string;
+    filedBy: { kind: string; id: string } | null;
+    sourceTaskId: string | null;
+    executionId: string | null;
+    runId: string | null;
+  } | null;
   /** Dispatch-workflow override (PLNR-240): the plan pump runs this task under it; null =
    *  the dispatch's default, then the built-in build. */
   workflow: string | null;

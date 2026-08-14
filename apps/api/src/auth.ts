@@ -9,6 +9,7 @@ import {
 
 /** What kind of thing is working (RUN-43). See migration 0026 for the full contrast. */
 export type AgentKind = 'copilot' | 'agent';
+export type CopilotToolPack = 'planning' | 'maintenance' | 'orchestration';
 
 export interface AgentIdentity {
   id: string;
@@ -26,6 +27,10 @@ export interface AgentIdentity {
    * by a pre-RUN-47 daemon) → the full catalogue, the pre-existing behavior.
    */
   allowedTools?: string[] | null;
+  /** Optional persistent catalog packs for IDE Copilots. Core is always implied. */
+  toolPacks?: CopilotToolPack[];
+  /** Revision watched by subscriptions/listen for tools/list changes. */
+  toolProfileUpdatedAt?: string | null;
 }
 
 /** An authorized OAuth credential (one `claude mcp add`). Many copilots (sessions) share one.
@@ -64,7 +69,7 @@ export interface UserIdentity {
 export type Vars = {
   agent?: AgentIdentity;
   user?: UserIdentity;
-  /** Set when the agent authenticated with an OAuth access token (enables set_agent_identity). */
+  /** Set when the agent authenticated with an OAuth access token (enables configure_agent). */
   oauthTokenId?: string;
   /** The OAuth connection behind an agent request (agents are resolved per MCP session). */
   connection?: Connection;
@@ -83,6 +88,19 @@ function parseAllowedTools(raw: string | null): string[] | null {
     return Array.isArray(v) && v.every((x) => typeof x === 'string') ? v : null;
   } catch {
     return null;
+  }
+}
+
+const TOOL_PACKS = new Set<CopilotToolPack>(['planning', 'maintenance', 'orchestration']);
+function parseToolPacks(raw: string | null): CopilotToolPack[] {
+  if (!raw) return [];
+  try {
+    const value = JSON.parse(raw);
+    return Array.isArray(value)
+      ? [...new Set(value.filter((entry): entry is CopilotToolPack => typeof entry === 'string' && TOOL_PACKS.has(entry as CopilotToolPack)))]
+      : [];
+  } catch {
+    return [];
   }
 }
 
@@ -111,7 +129,8 @@ export async function agentAuth(c: Context<AppContext>, next: Next) {
     `SELECT t.id AS tokenId, t.user_id AS userId, t.client_id AS clientId, t.agent_id AS boundAgentId,
             t.copilot_id AS copilotId, u.email AS userEmail,
             a.id AS agentId, COALESCE(a.label, a.name) AS agentName, a.role AS agentRole, a.kind AS agentKind,
-            a.allowed_tools AS agentAllowedTools,
+            a.allowed_tools AS agentAllowedTools, a.tool_packs AS agentToolPacks,
+            a.tool_profile_updated_at AS agentToolProfileUpdatedAt,
             COALESCE(cl.name, 'MCP client') AS clientName
      FROM oauth_tokens t
      JOIN users u ON u.id = t.user_id
@@ -124,7 +143,8 @@ export async function agentAuth(c: Context<AppContext>, next: Next) {
     tokenId: string; userId: string; clientId: string; clientName: string; boundAgentId: string | null;
     copilotId: string | null; userEmail: string;
     agentId: string | null; agentName: string | null; agentRole: 'orchestrator' | 'worker' | null;
-    agentKind: AgentKind | null; agentAllowedTools: string | null;
+    agentKind: AgentKind | null; agentAllowedTools: string | null; agentToolPacks: string | null;
+    agentToolProfileUpdatedAt: string | null;
   }>();
   if (!t) {
     // The primary lookup collapses "no such token", "revoked", "expired" and "user disabled"
@@ -168,6 +188,8 @@ export async function agentAuth(c: Context<AppContext>, next: Next) {
         id: t.agentId, name: t.agentName ?? t.agentId, role: t.agentRole ?? 'worker',
         userId: t.userId, kind: t.agentKind ?? 'agent',
         allowedTools: parseAllowedTools(t.agentAllowedTools),
+        toolPacks: parseToolPacks(t.agentToolPacks),
+        toolProfileUpdatedAt: t.agentToolProfileUpdatedAt,
       }
     : null;
   c.set('oauthTokenId', t.tokenId);
@@ -194,7 +216,7 @@ const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(
  *
  * Nothing here needs announcing itself: the parent was registered when the grant was
  * exchanged and the child is named from the client, so an agent never has to invent an
- * identity (PLNR-157). set_agent_identity survives only to RENAME one it already has.
+ * identity (PLNR-157). configure_agent may rename one it already has.
  *
  * This path only ever mints copilots. A runner-spawned agent is created by the runner
  * and reached through a token bound to it (connection.boundAgent) — it never arrives
@@ -214,10 +236,13 @@ export async function resolveSessionAgent(
   // connection no longer being an agent (0026) this is the only place left that it can.
   const existing = await env.DB.prepare(
     `SELECT id, COALESCE(label, name) AS name, role, user_id AS userId, kind, status,
-            retired_at AS retiredAt, retire_reason AS retireReason
+            retired_at AS retiredAt, retire_reason AS retireReason,
+            tool_packs AS rawToolPacks, tool_profile_updated_at AS toolProfileUpdatedAt
        FROM agents WHERE session_id = ? AND kind = 'copilot'`,
-  ).bind(sessionId).first<AgentIdentity & { status: string; retiredAt: string | null; retireReason: string | null }>();
+  ).bind(sessionId).first<AgentIdentity & { status: string; retiredAt: string | null; retireReason: string | null; rawToolPacks: string | null }>();
   if (existing) {
+    existing.toolPacks = parseToolPacks(existing.rawToolPacks);
+    delete (existing as AgentIdentity & { rawToolPacks?: string }).rawToolPacks;
     // The session id is client-supplied (echoed back from initialize). Bind it to
     // the authenticated user so a leaked session id can't be replayed with another
     // user's token to act AS that user's agent (PLNR-101).
@@ -247,7 +272,7 @@ export async function resolveSessionAgent(
   await validateCopilotSessionContext(env, conn.tokenId, conn.userId, context);
   const id = newId('agt');
   // `name` is a stable, globally-unique internal handle (label is the friendly display,
-  // set via set_agent_identity). The id suffix guarantees uniqueness. PLNR-65 settled this
+  // set via configure_agent). The id suffix guarantees uniqueness. PLNR-65 settled this
   // split deliberately — name is not dead weight, it is the handle label falls back to.
   const name = `${slug(conn.clientName)}-${id.slice(-6)}`;
   await env.DB.prepare(
@@ -259,7 +284,7 @@ export async function resolveSessionAgent(
   ).bind(
     id, name, conn.userId, conn.tokenId, sessionId, nowIso(), nowIso(), nowIso(),
   ).run();
-  const created: AgentIdentity = { id, name, role: 'worker', userId: conn.userId, kind: 'copilot' };
+  const created: AgentIdentity = { id, name, role: 'worker', userId: conn.userId, kind: 'copilot', toolPacks: [], toolProfileUpdatedAt: null };
   await syncCopilotSession(env, conn.tokenId, created, context);
   return created;
 }

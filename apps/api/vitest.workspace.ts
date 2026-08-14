@@ -39,6 +39,9 @@ const DEMO_FILES = ['demo.test.ts', 'demo-gates.test.ts'];
 // MAINTENANCE_MODE freezes writes globally (PLNR-166) — like DEMO_MODE it can't ride the
 // shared default, so this file gets its own project with the flag ON.
 const MAINTENANCE_FILES = ['maintenance.test.ts'];
+// The minimum compatible Runner is a deployment gate, so its route test needs the binding ON
+// without changing every other dispatch fixture in the shared shards.
+const RUNNER_VERSION_FILES = ['runner-version-gate.test.ts'];
 // Load suites are heavy/timing-sensitive by design and belong only in the opt-in `load`
 // project (PLNR-431) — this is the single source of truth for that list; the shard filter
 // below excludes exactly these files, so a new load suite added here is automatically kept
@@ -48,7 +51,7 @@ const LOAD_FILES = ['load.test.ts', 'memory-load.test.ts'];
 const testDir = path.join(__dirname, 'test');
 const testFiles = fs
   .readdirSync(testDir)
-  .filter((f) => f.endsWith('.test.ts') && !LOAD_FILES.includes(f) && !DEMO_FILES.includes(f) && !MAINTENANCE_FILES.includes(f))
+  .filter((f) => f.endsWith('.test.ts') && !LOAD_FILES.includes(f) && !DEMO_FILES.includes(f) && !MAINTENANCE_FILES.includes(f) && !RUNNER_VERSION_FILES.includes(f))
   .sort();
 const shards: string[][] = Array.from({ length: SHARDS }, () => []);
 testFiles.forEach((f, i) => shards[i % SHARDS]!.push(`test/${f}`));
@@ -126,5 +129,8 @@ export default [
   // Write-freeze suite runs with MAINTENANCE_MODE ON (its own project so the flag stays off
   // everywhere else). `npm test` selects it explicitly alongside the shards.
   project('maintenance', MAINTENANCE_FILES.map((f) => `test/${f}`), { MAINTENANCE_MODE: '1' }),
+  project('shard-runner-version-gate', RUNNER_VERSION_FILES.map((f) => `test/${f}`), {
+    MIN_RUNNER_CATALOG_VERSION: '0.16.0',
+  }),
   project('load', LOAD_FILES.map((f) => `test/${f}`)),
 ];

@@ -30,7 +30,7 @@ describe('who may rewrite an execution spec (RUN-160)', () => {
     const msg = specWriteRefusalMessage(r!);
     expect(msg).toMatch(/is what your work is judged against/);
     // A refusal with no alternative is a refusal an agent works around.
-    expect(msg).toMatch(/add_comment/);
+    expect(msg).toMatch(/post_comment/);
   });
 
   // A scope run authoring specs for the tasks it files is the entire point of the field, and the
@@ -146,22 +146,24 @@ describe('rewriting an execution spec, end to end (RUN-160)', () => {
     expect(res.text).toMatch(/is what your work is judged against/);
   });
 
-  // …and creating one is NOT the same act. A builder handing follow-up work a spec is useful and
-  // is not editing the standard it is being measured by; closing this would push it to leave the
-  // next agent nothing.
-  it('permits a build agent to give a task it CREATES a spec', async () => {
+  // Catalog revision 2 narrows every Runner creation to a proposal. A builder can still hand the
+  // follow-up a spec, but it must carry proposal metadata and await human acceptance.
+  it('permits a build agent to give a PROPOSED task it creates a spec', async () => {
     const runner = await createRunAgent(projectId, 'build', {});
-    const made = await mcpCall(runner.apiKey, 'create_task', {
+    const made = await mcpCall(runner.apiKey, 'create_tasks', {
       projectId,
-      title: 'follow-up the builder found',
-      tags: ['exec-spec'],
-      executionSpec: { deferred: ['the bit I could not reach'] },
+      tasks: [{
+        title: 'follow-up the builder found',
+        tags: ['exec-spec'],
+        executionSpec: { deferred: ['the bit I could not reach'] },
+        proposal: { finding: 'the follow-up is real and outside this build task' },
+      }],
     });
     expect(made.isError).toBeFalsy();
     // Not just "the call succeeded" — a silently dropped spec would satisfy that and leave the
     // next agent with nothing, which is the outcome this permission exists to avoid.
     const stored = await env.DB.prepare('SELECT execution_spec AS s FROM tasks WHERE id = ?')
-      .bind(made.body.id).first<{ s: string | null }>();
+      .bind(made.body.created[0].id).first<{ s: string | null }>();
     expect(stored!.s).toMatch(/the bit I could not reach/);
   });
 
@@ -207,8 +209,9 @@ describe('rewriting an execution spec, end to end (RUN-160)', () => {
       taskIds: [taskId],
       set: { executionSpec: { lockedDecisions: [{ decision: 'via the bulk door' }] } },
     });
-    expect(res.isError).toBe(true);
-    expect(res.text).toMatch(/is what your work is judged against/);
+    expect(res.isError).toBe(false);
+    expect(res.body.results[0].ok).toBe(false);
+    expect(res.body.results[0].error).toMatch(/is what your work is judged against/);
     expect(await storedSpec()).toBe(before);
   });
 
@@ -220,8 +223,9 @@ describe('rewriting an execution spec, end to end (RUN-160)', () => {
       taskIds: [taskId],
       set: { status: 'done' },
     });
-    expect(res.isError).toBe(true);
-    expect(res.text).toMatch(/run agents don't set task status/);
+    expect(res.isError).toBe(false);
+    expect(res.body.results[0].ok).toBe(false);
+    expect(res.body.results[0].error).toMatch(/run agents don't set task status/);
     const row = await env.DB.prepare('SELECT status FROM tasks WHERE id = ?').bind(taskId)
       .first<{ status: string }>();
     expect(row!.status).not.toBe('done');

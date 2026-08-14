@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import { SELF } from 'cloudflare:test';
 import { createAgent, mcpCall } from './helpers';
 import pkg from '../package.json';
-import { mcpReferenceSpecs } from '../src/mcp';
+import { MCP_TOOL_AUDIENCE } from '../src/mcp';
 
 /**
  * MCP 2026-07-28 ("modern") compat layer — PLNR-233.
@@ -93,12 +93,28 @@ describe('server/discover', () => {
     expect(r.cacheScope).toBe('private');
     expect(r._meta[SERVER_INFO_KEY].name).toBe('noriq');
     expect(r._meta[SERVER_INFO_KEY].version).toBe(pkg.version);
+    expect(r._meta[SERVER_INFO_KEY]).toMatchObject({ catalogRevision: 2, toolPacks: [] });
   });
 
   it('works without the required-for-other-methods _meta fields (it is the probe)', async () => {
     const { status, body } = await modern(apiKey, 'server/discover', {}, { version: null, omitCaps: true, headers: { 'Mcp-Method': undefined } });
     expect(status).toBe(200);
     expect(body.result.supportedVersions).toContain(MODERN);
+  });
+
+  it('returns persisted active packs in discovery metadata', async () => {
+    const packed = await createAgent('modern-packed-agent');
+    const configured = await modern(packed.apiKey, 'tools/call', {
+      name: 'configure_agent',
+      arguments: { toolPacks: ['planning'] },
+    });
+    expect(toolBody(configured.body.result)).toMatchObject({
+      toolPacks: ['planning'], catalogRevision: 2, catalogChanged: true,
+    });
+    const discovered = await modern(packed.apiKey, 'server/discover');
+    expect(discovered.body.result._meta[SERVER_INFO_KEY]).toMatchObject({
+      catalogRevision: 2, toolPacks: ['planning'],
+    });
   });
 });
 
@@ -108,6 +124,7 @@ describe('stateless requests (no initialize, no session)', () => {
     expect(status).toBe(200);
     expect(body.result.resultType).toBe('complete');
     expect(body.result._meta[SERVER_INFO_KEY].name).toBe('noriq');
+    expect(body.result._meta[SERVER_INFO_KEY]).toMatchObject({ catalogRevision: 2, toolPacks: [] });
     expect(toolBody(body.result).you.name).toBeDefined();
   });
 
@@ -134,10 +151,13 @@ describe('stateless requests (no initialize, no session)', () => {
     expect(status).toBe(200);
     expect(body.result._meta[SERVER_INFO_KEY].version).toBe(pkg.version);
 
-    const expected = mcpReferenceSpecs().tools.map((tool) => tool.name).sort();
+    const expected = Object.entries(MCP_TOOL_AUDIENCE)
+      .filter(([, audience]) => audience === 'core')
+      .map(([name]) => name)
+      .sort();
     const actual = body.result.tools.map((tool: { name: string }) => tool.name).sort();
     expect(actual).toEqual(expected);
-    for (const required of ['spin_off_task', 'record_memory', 'search_project_memory', 'explain_project_area', 'get_task_context']) {
+    for (const required of ['create_tasks', 'record_memory', 'search_project_memory', 'explain_project_area', 'get_task_context']) {
       expect(actual).toContain(required);
     }
 
@@ -238,6 +258,8 @@ describe('dual-era coexistence', () => {
       ? JSON.parse(raw.split('\n').filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trim()).find((d) => d.includes('"result"'))!)
       : JSON.parse(raw);
     expect(data.result.protocolVersion).toBe('2025-11-25');
-    expect(data.result.serverInfo.name).toBe('noriq');
+    expect(data.result.serverInfo).toMatchObject({
+      name: 'noriq', catalogRevision: 2, toolPacks: [],
+    });
   });
 });

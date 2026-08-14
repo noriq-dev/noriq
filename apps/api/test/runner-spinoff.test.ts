@@ -116,12 +116,12 @@ describe('POST /api/runner-spinoffs (PLNR-478)', () => {
     expect(tags.results.map((tag) => tag.name)).toEqual(['runner-followups']);
 
     const event = await db().prepare(
-      "SELECT actor_kind AS actorKind, actor_id AS actorId FROM events WHERE subject_id = ? AND verb = 'task.spun_off'",
+      "SELECT actor_kind AS actorKind, actor_id AS actorId FROM events WHERE subject_id = ? AND verb = 'task.proposed'",
     ).bind(made.id).first<{ actorKind: string; actorId: string }>();
     expect(event).toEqual({ actorKind: 'system', actorId: runnerId });
 
     const accepted = await SELF.fetch(
-      `https://noriq.test/api/projects/${projectId}/tasks/${made.id}/spinoff/accept`,
+      `https://noriq.test/api/projects/${projectId}/tasks/${made.id}/proposal/accept`,
       { method: 'POST', headers: { Cookie: ownerCookie } },
     );
     expect(accepted.status).toBe(200);

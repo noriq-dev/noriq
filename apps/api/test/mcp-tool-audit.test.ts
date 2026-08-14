@@ -4,8 +4,10 @@
 import { env } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { auditMcpCatalog } from '../src/mcp-tool-audit';
-import { MCP_TOOL_POLICIES, mcpReferenceSpecs } from '../src/mcp';
-import { authorizeForAllProjects, createUser, mcpCall, mcpList, mintTokenForUser } from './helpers';
+import { MCP_TOOL_AUDIENCE, MCP_TOOL_POLICIES, mcpReferenceSpecs } from '../src/mcp';
+import { authorizeForAllProjects, createUser, mcpCall, mcpList, mcpRpc, mintTokenForUser } from './helpers';
+
+const REMOVED_TOOLS = ['create_task', 'decompose_task', 'spin_off_task', 'update_task', 'add_dependency', 'remove_dependency', 'attach_ref', 'add_comment', 'read_open_comments', 'list_projects', 'create_plan_from_template', 'get_task_intelligence', 'add_attachment', 'create_attachment_upload', 'set_agent_identity', 'focus_project'];
 
 describe('complete MCP tool contract audit', () => {
   it('has one explicit, valid policy and schema for every registered tool', () => {
@@ -13,11 +15,13 @@ describe('complete MCP tool contract audit', () => {
     const audit = auditMcpCatalog(specs);
     expect(audit.findings).toEqual([]);
     expect(audit.valid).toBe(true);
-    expect(audit.toolCount).toBe(70);
+    expect(audit.toolCount).toBe(56);
     expect(Object.keys(MCP_TOOL_POLICIES).sort()).toEqual(specs.tools.map((tool) => tool.name).sort());
+    expect(Object.keys(MCP_TOOL_AUDIENCE).sort()).toEqual(specs.tools.map((tool) => tool.name).sort());
+    expect(specs.tools.filter((tool) => tool.audience === 'core')).toHaveLength(34);
   });
 
-  it('legacy Copilots receive the same complete names, schemas, annotations, and floors', async () => {
+  it('Copilots receive the 34-tool core catalog by default', async () => {
     const token = await mintTokenForUser('mcp-catalog-audit@example.com');
     const live = await mcpList(token) as Array<{
       name: string;
@@ -26,13 +30,43 @@ describe('complete MCP tool contract audit', () => {
       annotations: Record<string, unknown>;
     }>;
     const specs = mcpReferenceSpecs();
-    expect(live.map((tool) => tool.name).sort()).toEqual(specs.tools.map((tool) => tool.name).sort());
+    expect(live.map((tool) => tool.name).sort()).toEqual(specs.tools.filter((tool) => tool.audience === 'core').map((tool) => tool.name).sort());
+    expect(live).toHaveLength(34);
+    for (const removed of REMOVED_TOOLS) {
+      expect(live.some((tool) => tool.name === removed), removed).toBe(false);
+    }
     for (const tool of live) {
       expect(tool.description.length, tool.name).toBeGreaterThan(39);
       expect(tool.annotations.openWorldHint, tool.name).toBe(false);
       expect(tool.inputSchema.properties, tool.name).toBeDefined();
     }
     expect(live.find((tool) => tool.name === 'request_input')!.inputSchema.properties).toHaveProperty('blocking');
+  });
+
+  it('rejects every removed tool name instead of preserving hidden aliases', async () => {
+    const token = await mintTokenForUser('mcp-catalog-removed@example.com');
+    for (const removed of REMOVED_TOOLS) {
+      const result = await mcpRpc(token, 'tools/call', { name: removed, arguments: {} }) as {
+        isError?: boolean;
+        content?: Array<{ text?: string }>;
+      };
+      expect(result.isError, removed).toBe(true);
+      expect(result.content?.[0]?.text, removed).toMatch(/not found/i);
+    }
+  });
+
+  it('persists optional packs and advertises their canonical tools on the next tools/list', async () => {
+    const token = await mintTokenForUser('mcp-catalog-packs@example.com');
+    const configured = await mcpCall(token, 'configure_agent', { toolPacks: ['planning'] });
+    expect(configured.body).toMatchObject({ toolPacks: ['planning'], catalogRevision: 2, catalogChanged: true });
+    const live = await mcpList(token);
+    expect(live).toHaveLength(43);
+    expect(live.some((tool) => tool.name === 'create_plan')).toBe(true);
+    expect(live.some((tool) => tool.name === 'create_project')).toBe(false);
+
+    const reset = await mcpCall(token, 'configure_agent', { toolPacks: [] });
+    expect(reset.body).toMatchObject({ toolPacks: [], catalogRevision: 2, catalogChanged: true });
+    expect(await mcpList(token)).toHaveLength(34);
   });
 
   it('requires contributor access on both sides of a cross-project task move', async () => {
@@ -44,7 +78,8 @@ describe('complete MCP tool contract audit', () => {
     const bob = await mintTokenForUser(bobEmail);
     const source = (await mcpCall(alice, 'create_project', { key: 'AUDSRC', name: 'Audit source' })).body.id as string;
     const target = (await mcpCall(bob, 'create_project', { key: 'AUDTGT', name: 'Audit target' })).body.id as string;
-    const task = (await mcpCall(alice, 'create_task', { projectId: source, title: 'Do not plant through viewer access', tags: ['mcp-tools'] })).body;
+    const batch = (await mcpCall(alice, 'create_tasks', { projectId: source, tasks: [{ title: 'Do not plant through viewer access', tags: ['mcp-tools'] }] })).body;
+    const task = batch.created[0];
     const aliceUser = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(aliceEmail).first<{ id: string }>();
     await env.DB.prepare("INSERT INTO project_grants (project_id, principal_type, principal_id, role) VALUES (?, 'user', ?, 'viewer')")
       .bind(target, aliceUser!.id).run();

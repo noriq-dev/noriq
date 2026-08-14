@@ -2,7 +2,7 @@
 // PLNR-241: cross-project dependencies — a blocker may live in another project.
 import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
-import { createAgent, createUser, loginSession, mcpCall } from './helpers';
+import { createAgent, createRunAgent, createUser, loginSession, mcpCall } from './helpers';
 
 let agent: { id: string; apiKey: string };
 let projectId: string;
@@ -121,7 +121,8 @@ describe('cross-project dependencies (PLNR-241)', () => {
     })).body;
     expect(await edgesOf(dependent.id)).toEqual([{ dep: foreignId }]);
 
-    const probe = await mcpCall(agent.apiKey, 'can_claim', { taskId: dependent.id });
+    const guard = await createRunAgent(projectId, 'build', { allowedTools: ['can_claim'] });
+    const probe = await mcpCall(guard.apiKey, 'can_claim', { taskId: dependent.id });
     expect(probe.body.claimable).toBe(false);
     expect(probe.body.reason).toContain(foreignKey);
 

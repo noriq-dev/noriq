@@ -26,7 +26,7 @@ export function assertVectorizeTopKOk(topK: number): void {
 
 // ---------------------------------------------------------------------------
 // Agent minting via the REAL OAuth flow (static keys are retired — PLNR-52):
-// one shared client + consent user, then set_agent_identity names the agent.
+// one shared client + consent user, then configure_agent names the agent.
 // ---------------------------------------------------------------------------
 
 const MINT_REDIRECT = 'http://localhost:39999/cb';
@@ -65,7 +65,7 @@ async function userProjectIds(email: string): Promise<string[]> {
 const mintUserProjectIds = () => userProjectIds('agent-mint@example.com');
 
 /**
- * Full OAuth mint: consent → code → token → set_agent_identity(name, role).
+ * Full OAuth mint: consent → code → token → configure_agent(name, role).
  *
  * Consent now REQUIRES a project scope when the user has any (RUN-38), so tick all of them —
  * that reproduces exactly what these tests assumed before scoping existed ("this token reaches
@@ -99,8 +99,8 @@ export async function createAgent(name: string, role: 'orchestrator' | 'worker' 
     }).toString(),
   });
   const apiKey = ((await tokenRes.json()) as { access_token: string }).access_token;
-  const set = await mcpCall(apiKey, 'set_agent_identity', { name, role });
-  if (set.isError) throw new Error(`set_agent_identity failed for ${name}: ${set.text}`);
+  const set = await mcpCall(apiKey, 'configure_agent', { name, role });
+  if (set.isError) throw new Error(`configure_agent failed for ${name}: ${set.text}`);
   return { id: set.body.actingAs.id as string, apiKey };
 }
 
@@ -260,6 +260,7 @@ let rpcId = 1;
  * are really exercising.
  */
 const defaultSessions = new Map<string, string>();
+const configuredCatalogSessions = new Set<string>();
 export const sessionFor = (apiKey: string): string => {
   const existing = defaultSessions.get(apiKey);
   if (existing) return existing;
@@ -277,11 +278,98 @@ export async function mcpCall(
   sessionId?: string,
   meta?: Record<string, unknown>,
 ) {
-  const first = await mcpCallOnce(apiKey, tool, args, sessionId, meta);
+  const effectiveSession = sessionId ?? sessionFor(apiKey);
+  const catalogKey = `${apiKey}:${effectiveSession}`;
+  if (tool !== 'configure_agent' && !configuredCatalogSessions.has(catalogKey)) {
+    configuredCatalogSessions.add(catalogKey);
+    await mcpCallOnce(apiKey, 'configure_agent', {
+      toolPacks: ['planning', 'maintenance', 'orchestration'],
+    }, effectiveSession).catch(() => null);
+  }
+  // Keep older behavioral tests exercising the canonical server doors while those files are
+  // migrated incrementally. This adapter exists only in test code; deprecated names never reach
+  // tools/call and therefore cannot mask a production alias.
+  let wireTool = tool;
+  let wireArgs = args;
+  let unwrap: 'created' | 'updated' | 'attachment' | 'projects' | 'intelligence' | 'comments' | undefined;
+  if (tool === 'create_task') {
+    const { projectId, allowNewTags, ...task } = args;
+    wireTool = 'create_tasks'; wireArgs = { projectId, allowNewTags, tasks: [task] }; unwrap = 'created';
+  } else if (tool === 'spin_off_task') {
+    const { projectId, finding, ...task } = args;
+    wireTool = 'create_tasks'; wireArgs = { projectId, tasks: [{ ...task, proposal: { finding } }] }; unwrap = 'created';
+  } else if (tool === 'update_task') {
+    const { projectId, taskId, ...set } = args;
+    wireTool = 'update_tasks'; wireArgs = { projectId, tasks: [{ taskId, set }] }; unwrap = 'updated';
+  } else if (tool === 'add_dependency' || tool === 'remove_dependency') {
+    const { projectId, taskId, dependsOnTaskId } = args;
+    wireTool = 'update_tasks'; wireArgs = { projectId, tasks: [{ taskId, [tool === 'add_dependency' ? 'addDependsOn' : 'removeDependsOn']: [dependsOnTaskId] }] }; unwrap = 'updated';
+  } else if (tool === 'attach_ref') {
+    const lookup = await mcpCallOnce(apiKey, 'get_task', { taskId: args.taskId }, effectiveSession, meta);
+    if (lookup.isError) return lookup;
+    const task = (lookup.body as { task?: Record<string, unknown> } | null)?.task;
+    const projectId = task?.projectId ?? task?.project_id;
+    const { taskId, kind, ref, url, state } = args;
+    wireTool = 'update_tasks'; wireArgs = { projectId, tasks: [{ taskId, refs: [{ kind, ref, url, state }] }] }; unwrap = 'updated';
+  } else if (tool === 'add_comment') {
+    wireTool = 'post_comment'; wireArgs = { ...args, kind: 'comment' };
+  } else if (tool === 'create_plan_from_template') {
+    wireTool = 'create_plan';
+  } else if (tool === 'get_task_intelligence') {
+    wireTool = 'get_task_context'; wireArgs = { ...args, intelligenceDetail: 'full' }; unwrap = 'intelligence';
+  } else if (tool === 'add_attachment') {
+    const { projectId, taskId, filename, data, contentType } = args;
+    wireTool = 'attach_files'; wireArgs = { projectId, taskId, files: [{ filename, contentType, source: { kind: 'inline', data } }] }; unwrap = 'attachment';
+  } else if (tool === 'create_attachment_upload') {
+    const { projectId, taskId, filename, contentType } = args;
+    wireTool = 'attach_files'; wireArgs = { projectId, taskId, files: [{ filename, contentType, source: { kind: 'upload' } }] }; unwrap = 'attachment';
+  } else if (tool === 'set_agent_identity' || tool === 'focus_project') {
+    wireTool = 'configure_agent';
+    if (tool === 'set_agent_identity') {
+      const { parentAgentId: _removedParentAgentId, ...canonical } = args;
+      wireArgs = canonical;
+    }
+  } else if (tool === 'list_projects') {
+    wireTool = 'get_briefing'; wireArgs = {}; unwrap = 'projects';
+  } else if (tool === 'read_open_comments') {
+    wireTool = 'get_task'; unwrap = 'comments';
+  } else if (tool === 'decompose_task') {
+    const { projectId, parentTaskId, subtasks } = args as { projectId: string; parentTaskId: string; subtasks: Array<Record<string, unknown> & { dependsOnIndex?: number[] }> };
+    wireTool = 'create_tasks';
+    wireArgs = { projectId, tasks: subtasks.map((task, index) => {
+      const { dependsOnIndex, ...rest } = task;
+      return { ...rest, ref: `subtask-${index}`, parentTaskId, tags: rest.tags ?? ['decomposition'], dependsOn: (dependsOnIndex ?? []).map((i) => `subtask-${i}`) };
+    }) };
+  } else if (tool === 'update_tasks' && Array.isArray(args.taskIds)) {
+    const { projectId, taskIds, set } = args as { projectId: string; taskIds: string[]; set: Record<string, unknown> };
+    wireArgs = { projectId, tasks: taskIds.map((taskId) => ({ taskId, set })) };
+  }
+  let first = await mcpCallOnce(apiKey, wireTool, wireArgs, effectiveSession, meta);
   // vitest-pool-workers reloads the bundle between files, breaking in-flight DO
   // stubs exactly once ("invalidating this Durable Object ... Please retry").
   if (first.isError && first.text.includes('invalidating this Durable Object')) {
-    return mcpCallOnce(apiKey, tool, args, sessionId, meta);
+    first = await mcpCallOnce(apiKey, wireTool, wireArgs, effectiveSession, meta);
+  }
+  if (!first.isError && unwrap) {
+    const body = first.body as Record<string, unknown> | null;
+    let value: unknown = body;
+    if (unwrap === 'created') value = (body?.created as unknown[] | undefined)?.[0];
+    if (unwrap === 'updated') value = (body?.results as unknown[] | undefined)?.[0];
+    if (unwrap === 'attachment') {
+      const attachment = (body?.results as Array<Record<string, unknown>> | undefined)?.[0];
+      value = attachment?.resourceUri && !attachment.resource
+        ? { ...attachment, resource: attachment.resourceUri }
+        : attachment;
+    }
+    if (unwrap === 'projects') value = { projects: body?.projects };
+    if (unwrap === 'intelligence') value = body?.intelligence;
+    if (unwrap === 'comments') {
+      const task = body?.task as { comments?: Array<{ status?: string }> } | undefined;
+      value = { openComments: (task?.comments ?? []).filter((comment) => comment.status === 'open' || comment.status === 'acknowledged') };
+    }
+    const item = value as { error?: string; ok?: boolean } | undefined;
+    if (item?.error || item?.ok === false) return { ...first, isError: true, text: `Error: ${item.error ?? 'operation failed'}`, body: null };
+    return { ...first, body: value };
   }
   return first;
 }

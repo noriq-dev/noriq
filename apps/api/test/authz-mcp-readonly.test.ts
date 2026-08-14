@@ -45,7 +45,7 @@ describe('MCP account and project policy (PLNR-329)', () => {
     ).bind(projectId).first<{ action: string; decision: string; reason: string; metadata: string }>();
     expect(audit).toMatchObject({ action: 'mcp.tool', decision: 'deny', reason: 'account_read_only' });
     expect(JSON.parse(audit!.metadata)).toEqual({
-      tool: 'create_task', requiredAction: 'contribute', transport: 'mcp',
+      tool: 'create_tasks', requiredAction: 'contribute', transport: 'mcp',
     });
   });
 });

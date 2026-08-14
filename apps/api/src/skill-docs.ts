@@ -185,7 +185,7 @@ Pick the shape that fits; do not force every heading onto every doc.
 ## After writing
 
 Link the tasks that implement or must follow the doc (\`docIds\` on
-create_task/update_task) — workers read a task's related docs before starting, so
+create_tasks/update_tasks) — workers read a task's related docs before starting, so
 an unlinked doc protects nobody. When your work changes what a doc states, updating
 that doc is part of finishing the task, not optional follow-up.
 `;

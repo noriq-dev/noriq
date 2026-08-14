@@ -257,8 +257,8 @@ export interface CoordinationEventForProjection {
  * (`task_docs`). `plan.tasks_linked`/`plan.tasks_unlinked` and `task.docs_linked`/
  * `task.docs_unlinked` all share one payload shape — `{ links: Array<{...}> }` — because
  * ProjectRoom.ts's write sites vary in which side is "the one" and which is "the many" (a single
- * task joining one plan via `create_task`'s `phaseId`; forty tasks joining one plan via
- * `create_plan`; one task's whole doc set replacing via `update_task`'s `docIds`; one doc's every
+ * task joining one plan via `create_tasks`'s `phaseId`; forty tasks joining one plan via
+ * `create_plan`; one task's whole doc set replacing via `update_tasks`'s `docIds`; one doc's every
  * attachment severing via `deleteDoc`'s cascade). Rather than build edges from `ev.subjectId` and
  * special-case which endpoint that names, EVERY link item carries BOTH endpoint ids (and, where
  * the writer already had them, both labels) — `ev.subjectId` is bookkeeping for the event's own

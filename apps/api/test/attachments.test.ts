@@ -142,7 +142,7 @@ describe('MCP attachments', () => {
     const big = btoa('x'.repeat(17 * 1024)); // 17 KB decoded, over the 16 KB inline limit
     const r = await mcpCall(agent.apiKey, 'add_attachment', { projectId, taskId, filename: 'big.bin', data: big });
     expect(r.isError).toBe(true);
-    expect(r.text).toMatch(/create_attachment_upload/);
+    expect(r.text).toMatch(/source\.kind="upload"/);
   });
 });
 
