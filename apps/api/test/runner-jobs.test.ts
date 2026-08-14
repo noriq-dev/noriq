@@ -380,6 +380,53 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
     })).toThrow(/requires derived provenance/);
   });
 
+  it('accepts privacy-bounded memory context and rejects raw memory payloads', () => {
+    const at = new Date().toISOString();
+    const memoryContext = {
+      type: 'memory.context' as const,
+      at,
+      taskId: 'task_1',
+      packDigest: 'a'.repeat(64),
+      generatedAt: at,
+      consumption: {
+        status: 'complete' as const,
+        value: {
+          mode: 'semantic' as const,
+          role: 'build' as const,
+          charBudget: 8_000,
+          charsUsed: 3_200,
+          sections: [{
+            id: 'active_decisions' as const,
+            excerptCount: 2,
+            graphEntityCount: 1,
+            truncated: false,
+            unanswerable: false,
+          }],
+          similarEpisodesConsidered: 1,
+          staleCitationsCount: 0,
+          noticesCount: 0,
+          retrievalTookMs: 24,
+        },
+        provenance: 'runner_observed' as const,
+        source: 'runner' as const,
+        sourceId: null,
+        observedAt: at,
+        acceptedAt: null,
+        reason: null,
+      },
+    };
+    expect(RunnerJobEvent.parse(memoryContext)).toMatchObject({
+      type: 'memory.context', taskId: 'task_1', consumption: { status: 'complete' },
+    });
+    expect(() => RunnerJobEvent.parse({
+      ...memoryContext,
+      consumption: {
+        ...memoryContext.consumption,
+        value: { ...memoryContext.consumption.value, excerptText: 'must never cross the wire' },
+      },
+    })).toThrow();
+  });
+
   it('rejects unsafe or inconsistent adaptive route facts', () => {
     const at = new Date().toISOString();
     const base = {

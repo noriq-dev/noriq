@@ -6,6 +6,7 @@ import {
   MISSION_CAPABILITY,
   MISSION_HANDOFF_CAPABILITY,
   RUNNER_CATALOG_CAPABILITY,
+  RUNNER_MEMORY_CONTEXT_CAPABILITY,
   RunnerRepo,
   RunnerJobRunnerMessage,
   runnerCatalogCanonicalJson,
@@ -831,6 +832,11 @@ export class RunnerHub extends DurableObject<Env> {
       return;
     }
     if (message.type === 'job.event') {
+      if (message.payload.type === 'memory.context'
+          && !auth.capabilities?.includes(RUNNER_MEMORY_CONTEXT_CAPABILITY)) {
+        ws.close(1008, 'runner.memory-context.v1 was not registered');
+        return;
+      }
       const result = await this.room(row.pid).recordRunnerJobEvent(
         row.pid, message.jobId, runnerId, message.assignmentId, message.seq, message.payload,
       );

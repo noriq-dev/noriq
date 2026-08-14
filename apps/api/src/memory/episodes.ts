@@ -24,7 +24,7 @@ import type { Env } from '../env';
 import {
   CopilotReportedEvidence, EpisodeLandingOutcome, ExecutionSpec, LineageCompleteness, RunModelUsage,
   RunnerJobAgentRoute, RunnerJobCostBasis, RunnerJobDurationMetric, RunnerJobObservationActor, RunnerJobObservationEvidence,
-  RunnerJobObservationUsage, RunnerJobSource, StrategyCoordinate, UNATTRIBUTED_MODEL_ID,
+  RunnerJobEvent, RunnerJobObservationUsage, RunnerJobSource, StrategyCoordinate, UNATTRIBUTED_MODEL_ID,
   type IntelligenceDurationMs, type IntelligenceIntegerMetric, type IntelligenceNumberMetric,
   type IntelligenceRatioMetric, type RunnerJobObservationStage, type WorkEpisodeSource,
 } from '@noriq-dev/shared';
@@ -895,7 +895,7 @@ export async function recordEpisodesForRunnerJob(
   ).bind(jobId, projectId).first<RunnerJobProjectionRow>();
   if (!job) throw new Error(`terminal RunnerJob ${jobId} not found in project ${projectId}`);
 
-  const [itemRows, observationRows, routeRows, rootExecution, eventRow, tagRows] = await Promise.all([
+  const [itemRows, observationRows, routeRows, memoryContextRows, rootExecution, eventRow, tagRows] = await Promise.all([
     env.DB.prepare(
       `SELECT i.task_id AS taskId, i.task_key AS taskKey, i.status,
               i.checkpoint_ref AS checkpointRef, i.started_at AS startedAt,
@@ -922,6 +922,10 @@ export async function recordEpisodesForRunnerJob(
          FROM runner_job_routes WHERE job_id = ? ORDER BY event_seq`,
     ).bind(jobId).all<{ route: string; eventSeq: number; observedAt: string }>(),
     env.DB.prepare(
+      `SELECT payload, received_at AS receivedAt FROM runner_job_events
+        WHERE job_id = ? AND event_type = 'memory.context' ORDER BY seq`,
+    ).bind(jobId).all<{ payload: string; receivedAt: string }>(),
+    env.DB.prepare(
       `SELECT id, updated_at AS updatedAt FROM execution_nodes
         WHERE orchestration_id = ? AND parent_execution_id IS NULL LIMIT 1`,
     ).bind(job.orchestrationId).first<{ id: string; updatedAt: string }>(),
@@ -940,6 +944,13 @@ export async function recordEpisodesForRunnerJob(
     const parsed = RunnerJobAgentRoute.safeParse(parseJson(row.route, null));
     return parsed.success ? [{ fact: parsed.data, eventSeq: row.eventSeq, observedAt: row.observedAt }] : [];
   });
+  const memoryContexts = memoryContextRows.results.flatMap((row) => {
+    const parsed = RunnerJobEvent.safeParse(parseJson(row.payload, null));
+    return parsed.success && parsed.data.type === 'memory.context'
+      ? [{ event: parsed.data, receivedAt: row.receivedAt }]
+      : [];
+  });
+  const memoryContextByTask = new Map(memoryContexts.map((row) => [row.event.taskId, row]));
   const observations: RunnerJobProjectionObservation[] = observationRows.results.map((row) => {
     const parsedActor = RunnerJobObservationActor.safeParse(parseJson(row.actor, null));
     const actor = parsedActor.success
@@ -1007,6 +1018,7 @@ export async function recordEpisodesForRunnerJob(
         ) as IntelligenceIntegerMetric
       : unavailable('RunnerJob observations did not include a changed-path count') as IntelligenceIntegerMetric;
     const tags = tagRows.results.filter((row) => row.taskId === item.taskId).map((row) => row.name);
+    const memoryContext = memoryContextByTask.get(item.taskId);
     const intelligence: EpisodeIntelligenceDraft = {
       schemaVersion: 1,
       identity: {
@@ -1084,6 +1096,13 @@ export async function recordEpisodesForRunnerJob(
           item.status === 'accepted' ? 1 : 0, `${jobId}:${item.taskId}`, item.workFinishedAt,
         ) as IntelligenceRatioMetric,
       },
+      ...(memoryContext ? {
+        contextConsumption: {
+          ...memoryContext.event.consumption,
+          sourceId: jobId,
+          acceptedAt: memoryContext.receivedAt,
+        },
+      } : {}),
     };
     const recorded = await env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)).recordEpisode(projectId, {
       runId: `runner_job:${jobId}:task:${item.taskId}`,

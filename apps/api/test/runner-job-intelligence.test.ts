@@ -365,4 +365,66 @@ describe('RunnerJob durable intelligence projection (PLNR-510)', () => {
       ]),
     });
   }, 60_000);
+
+  it('merges exact-task memory consumption into the server-owned episode without a duplicate', async () => {
+    const task = await room.createTask(projectId, SYSTEM_ACTOR as Actor, { title: 'Memory-context projected task' });
+    const outside = await room.createTask(projectId, SYSTEM_ACTOR as Actor, { title: 'Outside memory task' });
+    const job = await room.createRunnerJob(projectId, SYSTEM_ACTOR as Actor, {
+      source: { kind: 'task', id: task.id }, runnerId, repoRef: 'repo', expectedBaseRevision: revision,
+    });
+    await room.assignRunnerJob(projectId, job.id, runnerId);
+    await room.acceptRunnerJob(projectId, job.id, runnerId, job.assignmentId);
+    const at = '2026-08-14T15:00:00.000Z';
+    const consumption = {
+      status: 'partial' as const,
+      value: {
+        mode: 'keyword' as const, role: 'build' as const, charBudget: 8_000, charsUsed: 2_400,
+        sections: [{
+          id: 'known_hazards' as const, excerptCount: 1, graphEntityCount: 0,
+          truncated: true, unanswerable: false,
+        }],
+        similarEpisodesConsidered: 2, staleCitationsCount: 1, noticesCount: 1, retrievalTookMs: 35,
+      },
+      provenance: 'runner_observed' as const, source: 'runner' as const,
+      sourceId: null, observedAt: at, acceptedAt: null, reason: 'bounded retrieval',
+    };
+    expect(await room.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 1, {
+      type: 'memory.context', at, taskId: outside.id, packDigest: 'b'.repeat(64), generatedAt: at,
+      consumption,
+    })).toMatchObject({ accepted: false, ack: 0, error: 'event names a task outside the snapshot' });
+    expect(await room.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 1, {
+      type: 'memory.context', at, taskId: task.id, packDigest: 'a'.repeat(64), generatedAt: at,
+      consumption,
+    })).toMatchObject({ accepted: true, ack: 1 });
+    expect(await room.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 2, {
+      type: 'task.result', at, taskId: task.id, status: 'accepted',
+      checkpoint: { ref: revision, label: task.key, url: null }, summary: 'done', findings: [],
+    })).toMatchObject({ accepted: true, ack: 2 });
+    expect(await room.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 3, {
+      type: 'terminal', at, status: 'succeeded', output: {
+        workspaceMode: 'isolated', retainedLocation: { vcs: 'git', label: 'worktree', url: null },
+        baseRevision: revision, headRevision: revision,
+        acceptedTaskCheckpoints: { [task.id]: { ref: revision, label: task.key, url: null } },
+        checks: [], findings: [],
+        usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0, costUsd: null, calls: 0 },
+        summary: 'complete', dirtyPaths: [],
+      },
+    })).toMatchObject({ accepted: true, ack: 3 });
+
+    const first = await recordEpisodesForRunnerJob(appEnv, projectId, job.id);
+    const second = await recordEpisodesForRunnerJob(appEnv, projectId, job.id);
+    expect(second).toEqual(first);
+    expect(first.episodeIds).toHaveLength(1);
+    const memory = appEnv.PROJECT_MEMORY.get(
+      appEnv.PROJECT_MEMORY.idFromName(projectId),
+    ) as unknown as MemoryRpc;
+    const episode = await memory._getEpisodeForTest(
+      projectId, `runner_job:${job.id}:task:${task.id}`, 1,
+    ) as any;
+    expect(episode.intelligence.contextConsumption).toMatchObject({
+      status: 'partial', value: { mode: 'keyword', charsUsed: 2_400 },
+      provenance: 'runner_observed', source: 'runner', sourceId: job.id,
+      observedAt: at, acceptedAt: expect.any(String), reason: 'bounded retrieval',
+    });
+  });
 });

@@ -4920,7 +4920,7 @@ export class ProjectRoom extends DurableObject<Env> {
       } | null = null;
       const scopedTaskId = event.type === 'agent.route'
         ? event.route.taskId
-        : event.type === 'progress' ? event.taskId : undefined;
+        : event.type === 'progress' || event.type === 'memory.context' ? event.taskId : undefined;
       if (scopedTaskId) {
         const item = await this.env.DB.prepare(
           'SELECT 1 AS present FROM runner_job_items WHERE job_id = ? AND task_id = ?',

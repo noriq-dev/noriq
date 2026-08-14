@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { ExecutionSpec } from './execution-spec';
+import type { IntelligenceContextConsumptionMetric } from './intelligence';
 
 const id = z.string().trim().min(1).max(128);
 const text = (maximum: number) => z.string().trim().min(1).max(maximum);
@@ -107,7 +108,7 @@ export type RunnerJobUsage = z.infer<typeof RunnerJobUsage>;
  * while stages describe bounded work without creating execution child nodes.
  */
 export const RunnerJobObservationStage = z.enum([
-  'preflight', 'workspace', 'plan', 'setup', 'build', 'candidate', 'integrate',
+  'preflight', 'workspace', 'plan', 'setup', 'memory', 'build', 'candidate', 'integrate',
   'check', 'review', 'repair', 'accept', 'preserve', 'finalize', 'human_wait', 'landing',
 ]);
 export type RunnerJobObservationStage = z.infer<typeof RunnerJobObservationStage>;
@@ -276,6 +277,59 @@ export const RunnerJobOutput = z.object({
 export type RunnerJobOutput = z.infer<typeof RunnerJobOutput>;
 
 const at = z.string().datetime();
+
+// Runtime-importing intelligence.ts here would create an initialization cycle because that
+// contract consumes RunnerJob schemas. Keep a strict wire schema locally and make TypeScript
+// prove it remains structurally identical to IntelligenceContextConsumptionMetric.
+const RunnerJobContextConsumptionSection = z.object({
+  id: z.enum([
+    'active_decisions', 'known_hazards', 'failed_approaches', 'relevant_memories',
+    'similar_episodes', 'graph_neighborhood', 'affected_tests', 'active_neighboring_work',
+    'uncertainty', 'source_excerpts',
+  ]),
+  excerptCount: z.number().int().nonnegative(),
+  graphEntityCount: z.number().int().nonnegative(),
+  truncated: z.boolean(),
+  unanswerable: z.boolean(),
+}).strict();
+const RunnerJobContextConsumptionSnapshot = z.object({
+  mode: z.enum(['semantic', 'keyword']),
+  role: z.enum(['scope', 'build', 'verify', 'human']),
+  charBudget: z.number().int().positive(),
+  charsUsed: z.number().int().nonnegative(),
+  sections: z.array(RunnerJobContextConsumptionSection).default([]),
+  similarEpisodesConsidered: z.number().int().nonnegative(),
+  staleCitationsCount: z.number().int().nonnegative(),
+  noticesCount: z.number().int().nonnegative(),
+  retrievalTookMs: z.number().int().nonnegative(),
+}).strict();
+const RunnerJobContextMetricObservation = {
+  provenance: z.enum([
+    'server_observed', 'runner_observed', 'driver_reported', 'backend_observed',
+    'derived', 'inferred', 'unavailable',
+  ]),
+  source: z.enum([
+    'd1_coordination', 'd1_orchestration', 'project_memory_episode', 'runner', 'driver',
+    'vcs_backend', 'derived_generation',
+  ]),
+  sourceId: z.string().nullable().default(null),
+  observedAt: at.nullable().default(null),
+  acceptedAt: at.nullable().default(null),
+  reason: z.string().nullable().default(null),
+};
+export const RunnerJobContextConsumptionMetric = z.discriminatedUnion('status', [
+  z.object({ status: z.literal('complete'), value: RunnerJobContextConsumptionSnapshot, ...RunnerJobContextMetricObservation }).strict(),
+  z.object({ status: z.literal('partial'), value: RunnerJobContextConsumptionSnapshot, ...RunnerJobContextMetricObservation }).strict(),
+  z.object({ status: z.literal('unavailable'), value: z.null(), ...RunnerJobContextMetricObservation }).strict(),
+  z.object({ status: z.literal('not_applicable'), value: z.null(), ...RunnerJobContextMetricObservation }).strict(),
+]);
+export type RunnerJobContextConsumptionMetric = z.infer<typeof RunnerJobContextConsumptionMetric>;
+type ContextMetricMatchesIntelligence = RunnerJobContextConsumptionMetric extends IntelligenceContextConsumptionMetric
+  ? IntelligenceContextConsumptionMetric extends RunnerJobContextConsumptionMetric ? true : false
+  : false;
+const contextMetricMatchesIntelligence: ContextMetricMatchesIntelligence = true;
+void contextMetricMatchesIntelligence;
+
 const RunnerJobStageFinishedEvent = z.object({
   type: z.literal('stage.finished'), at, startedAt: at,
   observationId: id, taskId: id.nullable(), stage: RunnerJobObservationStage,
@@ -309,6 +363,20 @@ export const RunnerJobEvent = z.discriminatedUnion('type', [
   }).strict(),
   RunnerJobStageFinishedEvent,
   z.object({ type: z.literal('agent.route'), at, route: RunnerJobAgentRoute }).strict(),
+  z.object({
+    type: z.literal('memory.context'), at, taskId: id,
+    packDigest: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
+    generatedAt: at.nullable(),
+    consumption: RunnerJobContextConsumptionMetric,
+  }).strict().superRefine((event, ctx) => {
+    if (!['runner_observed', 'driver_reported', 'backend_observed'].includes(event.consumption.provenance)
+        || !['runner', 'driver', 'vcs_backend'].includes(event.consumption.source)) {
+      ctx.addIssue({
+        code: 'custom', path: ['consumption'],
+        message: 'memory context must carry daemon-observed provenance',
+      });
+    }
+  }),
   z.object({ type: z.literal('progress'), at, taskId: id.optional(), phase: RunnerJobPhase, message: z.string().max(4_000), progress: z.number().min(0).max(1) }).strict(),
   z.object({ type: z.literal('task.plan'), at, taskId: id, plan: z.string().max(20_000) }).strict(),
   z.object({ type: z.literal('task.result'), at, taskId: id, status: RunnerJobTaskResult, checkpoint: RunnerJobCheckpoint.nullable(), summary: z.string().max(20_000), findings: z.array(RunnerJobFinding).max(100) }).strict(),
