@@ -82,6 +82,7 @@ import { listRunnerRoster, RUNNER_HEARTBEAT_TTL_MS, RUNNER_LIFECYCLES, type Runn
 import {
   AcceptedRevisionHandoff, AgentTool, AdvertisedAgent, ExecutionProfileId, RunEffort, RunKind, RunnerRepo, RunBudget,
   MISSION_CAPABILITY, MISSION_HANDOFF_CAPABILITY, ORCHESTRATION_CAPABILITY, RunnerProtocolCapability,
+  RUNNER_CATALOG_CAPABILITY,
   RunnerExecutionDeclaration, RunnerExecutionEventReport, RunnerExecutionReconciliation,
   RunnerExecutionRelationReport, isTerminalRunStatus, normalizeProjectKey,
   IndexGenerationManifest, ContextPackRole, RunnerSpinoffTaskRequest, type RunnerIndexCursor,
@@ -3934,7 +3935,18 @@ app.post('/api/runners', agentAuth, async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid runner registration', detail: parsed.error.issues }, 400);
   const b = parsed.data;
   const userId = c.var.connection!.userId;
-  const repos = await resolveRunnerRepos(c.env, userId, b.repos, c.var.connection!.tokenId);
+  let repos = await resolveRunnerRepos(c.env, userId, b.repos, c.var.connection!.tokenId);
+  let priorCatalog: { catalogGeneration?: number; catalogDigest?: string | null } = {};
+  if (b.runnerId) {
+    const prior = await c.env.DB.prepare('SELECT capabilities FROM runners WHERE id = ? AND owner_user_id = ?')
+      .bind(b.runnerId, userId).first<{ capabilities: string }>();
+    try {
+      const parsed = JSON.parse(prior?.capabilities ?? '{}') as typeof priorCatalog;
+      priorCatalog = { catalogGeneration: parsed.catalogGeneration, catalogDigest: parsed.catalogDigest };
+    } catch { /* malformed prior capability state is replaced below */ }
+  }
+  const catalogCapable = b.protocolCapabilities?.includes(RUNNER_CATALOG_CAPABILITY) ?? false;
+  if (catalogCapable) repos = repos.map((repository) => ({ ...repository, catalogAcknowledged: false }));
   const capabilities = JSON.stringify({
     tools: b.tools,
     kinds: b.kinds,
@@ -3943,6 +3955,7 @@ app.post('/api/runners', agentAuth, async (c) => {
       : { protocolCapabilities: b.protocolCapabilities }),
     maxConcurrency: b.maxConcurrency,
     agents: b.agents,
+    ...(catalogCapable ? { catalogGeneration: priorCatalog.catalogGeneration ?? 0, catalogDigest: priorCatalog.catalogDigest ?? null } : {}),
   });
   const now = nowIso();
   let id = b.runnerId;
@@ -4319,8 +4332,8 @@ async function resolveRunnerJobRepository(
   repoRef: string,
 ): Promise<{ baseRevision: string } | Response> {
   const runner = await c.env.DB.prepare(
-    'SELECT repos, version FROM runners WHERE id = ? AND owner_user_id = ? AND offboarded_at IS NULL',
-  ).bind(runnerId, c.var.user!.id).first<{ repos: string; version: string | null }>();
+    'SELECT repos, capabilities, version FROM runners WHERE id = ? AND owner_user_id = ? AND offboarded_at IS NULL',
+  ).bind(runnerId, c.var.user!.id).first<{ repos: string; capabilities: string; version: string | null }>();
   if (!runner) return c.json({ error: 'runner not found' }, 404);
   const minimumRunner = c.env.MIN_RUNNER_CATALOG_VERSION?.trim();
   if (minimumRunner && !versionAtLeast(runner.version, minimumRunner)) {
@@ -4329,7 +4342,7 @@ async function resolveRunnerJobRepository(
       runnerVersion: runner.version,
     }, 409);
   }
-  let repositories: Array<{ id?: string; repoRef?: string; projectId?: string | null; baseRevision?: string }>;
+  let repositories: Array<{ id?: string; repoRef?: string; projectId?: string | null; baseRevision?: string; catalogAcknowledged?: boolean }>;
   try {
     repositories = JSON.parse(runner.repos) as typeof repositories;
   } catch {
@@ -4339,6 +4352,14 @@ async function resolveRunnerJobRepository(
     (candidate.repoRef === repoRef || candidate.id === repoRef) && candidate.projectId === projectId,
   );
   if (!repository) return c.json({ error: 'repoRef does not resolve to this project' }, 400);
+  let catalogCapable = false;
+  try {
+    const capabilities = JSON.parse(runner.capabilities || '{}') as { protocolCapabilities?: string[] };
+    catalogCapable = capabilities.protocolCapabilities?.includes(RUNNER_CATALOG_CAPABILITY) ?? false;
+  } catch { /* malformed capabilities are treated as the older startup-catalog shape */ }
+  if (catalogCapable && repository.catalogAcknowledged !== true) {
+    return c.json({ error: 'runner checkout catalog has not acknowledged this repoRef' }, 409);
+  }
   const baseRevision = RunnerJobRevision.safeParse(repository.baseRevision);
   if (!baseRevision.success) {
     return c.json({ error: 'runner must reconnect with protocol v2 and advertise a base revision' }, 409);

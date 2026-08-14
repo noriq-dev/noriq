@@ -1,6 +1,9 @@
 import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { RunnerJobServerMessage } from '@noriq-dev/shared';
+import {
+  RUNNER_CATALOG_CAPABILITY, RunnerJobServerMessage, runnerCatalogCanonicalJson,
+  type RunnerJobRuntimeRepository,
+} from '@noriq-dev/shared';
 import { authorizeForAllProjects, createUser, loginSession, mintTokenForUser } from './helpers';
 
 function nextFrame(ws: WebSocket, predicate: (message: any) => boolean, timeoutMs = 3_000): Promise<any> {
@@ -16,6 +19,30 @@ function nextFrame(ws: WebSocket, predicate: (message: any) => boolean, timeoutM
     const cleanup = () => { clearTimeout(timer); ws.removeEventListener('message', listener); };
     ws.addEventListener('message', listener);
   });
+}
+
+function expectNoFrame(ws: WebSocket, predicate: (message: any) => boolean, timeoutMs = 100): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      ws.removeEventListener('message', listener);
+      resolve();
+    }, timeoutMs);
+    const listener = (event: MessageEvent) => {
+      let message: any;
+      try { message = JSON.parse(event.data as string); } catch { return; }
+      if (predicate(message)) {
+        clearTimeout(timer);
+        ws.removeEventListener('message', listener);
+        reject(new Error(`unexpected frame: ${JSON.stringify(message)}`));
+      }
+    };
+    ws.addEventListener('message', listener);
+  });
+}
+
+async function catalogDigest(repositories: RunnerJobRuntimeRepository[]): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(runnerCatalogCanonicalJson(repositories)));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
 describe('RunnerJob protocol v2 (PLNR-499)', () => {
@@ -159,6 +186,104 @@ describe('RunnerJob protocol v2 (PLNR-499)', () => {
     const job = (await response.json() as { job: { id: string } }).job;
     expect(await env.DB.prepare('SELECT status FROM runner_jobs WHERE id = ?').bind(job.id).first<{ status: string }>())
       .toEqual({ status: 'queued' });
+  });
+
+  it('negotiates monotonic live checkout catalogs without replaying assignments', async () => {
+    const projectKey = (await env.DB.prepare('SELECT key FROM projects WHERE id = ?').bind(pid).first<{ key: string }>())!.key;
+    const liveRunnerRef = `catalog-runner-${crypto.randomUUID()}`;
+    const firstRef = `catalog-a-${crypto.randomUUID()}`;
+    const secondRef = `catalog-b-${crypto.randomUUID()}`;
+    const sharedRepositoryKey = `catalog-key-${crypto.randomUUID()}`;
+    const register = (repos: Array<{ id: string; projectKey: string; repositoryKey: string }>) => SELF.fetch(
+      'https://noriq.test/api/runners', {
+        method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          runnerId: liveRunnerRef.startsWith('rnr_') ? liveRunnerRef : undefined,
+          label: 'catalog-v1', maxConcurrency: 2,
+          protocolCapabilities: ['runner-job.v2', RUNNER_CATALOG_CAPABILITY], repos,
+        }),
+      },
+    );
+    const initial = await register([{ id: firstRef, projectKey, repositoryKey: sharedRepositoryKey }]);
+    expect(initial.status).toBe(200);
+    const catalogRunnerId = ((await initial.json()) as { runner: { id: string } }).runner.id;
+
+    const response = await SELF.fetch(`https://noriq.test/ws/runner/${catalogRunnerId}`, {
+      headers: { Upgrade: 'websocket', Authorization: `Bearer ${token}` },
+    });
+    const ws = response.webSocket!;
+    ws.accept();
+    ws.send(JSON.stringify({
+      type: 'hello', protocolVersion: 2, runnerId: catalogRunnerId, capacity: 2,
+      repositories: [{ repositoryKey: sharedRepositoryKey, repoRef: firstRef, vcs: 'git', baseRevision: 'a'.repeat(40) }],
+    }));
+
+    const reregister = await SELF.fetch('https://noriq.test/api/runners', {
+      method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        runnerId: catalogRunnerId, label: 'catalog-v1', maxConcurrency: 2,
+        protocolCapabilities: ['runner-job.v2', RUNNER_CATALOG_CAPABILITY],
+        repos: [
+          { id: firstRef, projectKey, repositoryKey: sharedRepositoryKey },
+          { id: secondRef, projectKey, repositoryKey: sharedRepositoryKey },
+        ],
+      }),
+    });
+    expect(reregister.status).toBe(200);
+
+    const beforeAckTask = await createTask('Catalog not yet acknowledged');
+    const beforeAck = await SELF.fetch(`https://noriq.test/api/projects/${pid}/tasks/${beforeAckTask}/runner-jobs`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runnerId: catalogRunnerId, repoRef: secondRef }),
+    });
+    expect(beforeAck.status).toBe(409);
+
+    const generationOne: RunnerJobRuntimeRepository[] = [
+      { repositoryKey: sharedRepositoryKey, repoRef: firstRef, vcs: 'git', baseRevision: 'a'.repeat(40) },
+      { repositoryKey: sharedRepositoryKey, repoRef: secondRef, vcs: 'git', baseRevision: 'b'.repeat(40) },
+    ];
+    const digestOne = await catalogDigest(generationOne);
+    const ackOne = nextFrame(ws, (message) => message.type === 'catalog.ack' && message.generation === 1);
+    ws.send(JSON.stringify({ type: 'catalog.update', catalog: { generation: 1, digest: digestOne, repositories: generationOne } }));
+    expect(RunnerJobServerMessage.parse(await ackOne)).toMatchObject({
+      accepted: true, digest: digestOne, dispatchableRepoRefs: [firstRef, secondRef].sort(), error: null,
+    });
+
+    const taskId = await createTask('Catalog dispatch');
+    const assignment = nextFrame(ws, (message) => message.type === 'job.assign');
+    const dispatched = await SELF.fetch(`https://noriq.test/api/projects/${pid}/tasks/${taskId}/runner-jobs`, {
+      method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runnerId: catalogRunnerId, repoRef: secondRef }),
+    });
+    expect(dispatched.status).toBe(201);
+    await assignment;
+
+    const generationTwo: RunnerJobRuntimeRepository[] = [
+      { repositoryKey: sharedRepositoryKey, repoRef: secondRef, vcs: 'git', baseRevision: 'c'.repeat(40) },
+    ];
+    const digestTwo = await catalogDigest(generationTwo);
+    const noReplay = expectNoFrame(ws, (message) => message.type === 'job.assign');
+    const ackTwo = nextFrame(ws, (message) => message.type === 'catalog.ack' && message.generation === 2);
+    ws.send(JSON.stringify({ type: 'catalog.update', catalog: { generation: 2, digest: digestTwo, repositories: generationTwo } }));
+    expect(await ackTwo).toMatchObject({ accepted: true, dispatchableRepoRefs: [secondRef] });
+    await noReplay;
+
+    const stored = await env.DB.prepare('SELECT repos FROM runners WHERE id = ?')
+      .bind(catalogRunnerId).first<{ repos: string }>();
+    const repositories = JSON.parse(stored!.repos) as Array<Record<string, unknown>>;
+    expect(repositories.find((repository) => repository.id === firstRef)).toMatchObject({ catalogAcknowledged: false });
+    expect(repositories.find((repository) => repository.id === firstRef)).not.toHaveProperty('baseRevision');
+    expect(repositories.find((repository) => repository.id === secondRef)).toMatchObject({
+      catalogAcknowledged: true, baseRevision: 'c'.repeat(40), repositoryKey: sharedRepositoryKey,
+    });
+
+    const rejectedAck = nextFrame(ws, (message) => message.type === 'catalog.ack' && message.generation === 2 && message.accepted === false);
+    ws.send(JSON.stringify({
+      type: 'catalog.update',
+      catalog: { generation: 2, digest: digestOne, repositories: generationOne },
+    }));
+    expect(await rejectedAck).toMatchObject({ error: 'catalog generation must advance monotonically from 2' });
+    ws.close();
   });
 
   it('redelivers a durable human landing request and acknowledges its idempotent result', async () => {

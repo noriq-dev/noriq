@@ -5,8 +5,10 @@ import {
   ORCHESTRATION_CAPABILITY,
   MISSION_CAPABILITY,
   MISSION_HANDOFF_CAPABILITY,
+  RUNNER_CATALOG_CAPABILITY,
   RunnerRepo,
   RunnerJobRunnerMessage,
+  runnerCatalogCanonicalJson,
   RunnerClientMessage,
   RUNNER_PROTOCOL_CAPABILITIES,
   RUNNER_PROTOCOL_VERSION,
@@ -18,6 +20,7 @@ import {
   type MissionTaskAck,
   type RunnerProtocolCapability,
 } from '@noriq-dev/shared';
+import { sha256Hex } from '../lib/util';
 import { projectRoleAllows, resolveAccountCapabilities, resolveProjectAccess } from '../lib/authorization';
 import { tokenCanReachProject } from '../lib/visibility';
 import {
@@ -41,6 +44,21 @@ import {
 const SYS: Actor = { kind: 'system', id: 'system', name: 'system' };
 type RunnerSocketAuth = { userId: string; tokenId: string; capabilities?: RunnerProtocolCapability[] };
 type RunnerSocketAttachment = RunnerSocketAuth & { jobProtocol?: 2 };
+
+type StoredRunnerRepository = Record<string, unknown> & {
+  id?: string;
+  repoRef?: string;
+  repositoryKey?: string | null;
+  projectId?: string | null;
+  baseRevision?: string;
+  catalogAcknowledged?: boolean;
+};
+
+type StoredRunnerCapabilities = Record<string, unknown> & {
+  protocolCapabilities?: RunnerProtocolCapability[];
+  catalogGeneration?: number;
+  catalogDigest?: string | null;
+};
 
 export class RunnerHub extends DurableObject<Env> {
   private _runnerId?: string;
@@ -91,9 +109,12 @@ export class RunnerHub extends DurableObject<Env> {
     const runnerId = await this.loadRunnerId();
     if (!runnerId) return { delivered: false };
     const row = await this.env.DB.prepare(
-      'SELECT project_id AS pid FROM runner_jobs WHERE id = ? AND runner_id = ?',
-    ).bind(jobId, runnerId).first<{ pid: string }>();
+      `SELECT j.project_id AS pid, j.repo_ref AS repoRef, r.repos, r.capabilities
+         FROM runner_jobs j JOIN runners r ON r.id = j.runner_id
+        WHERE j.id = ? AND j.runner_id = ?`,
+    ).bind(jobId, runnerId).first<{ pid: string; repoRef: string; repos: string; capabilities: string }>();
     if (!row) return { delivered: false };
+    if (!this.repositoryDispatchable(row.repos, row.capabilities, row.pid, row.repoRef)) return { delivered: false };
     const assignment = await this.room(row.pid).assignRunnerJob(row.pid, jobId, runnerId);
     if (!assignment) return { delivered: false };
     let delivered = false;
@@ -698,23 +719,31 @@ export class RunnerHub extends DurableObject<Env> {
         ws.close(1008, 'runner identity mismatch');
         return;
       }
-      ws.serializeAttachment({ ...auth, jobProtocol: 2 } satisfies RunnerSocketAttachment);
-      await this.refreshRunnerJobRepositories(runnerId, message.repositories);
+      const registered = await this.env.DB.prepare('SELECT capabilities FROM runners WHERE id = ?')
+        .bind(runnerId).first<{ capabilities: string }>();
+      const capabilities = this.parseCapabilities(registered?.capabilities ?? '{}').protocolCapabilities ?? [];
+      ws.serializeAttachment({ ...auth, capabilities, jobProtocol: 2 } satisfies RunnerSocketAttachment);
+      if (!capabilities.includes(RUNNER_CATALOG_CAPABILITY)) {
+        await this.refreshRunnerJobRepositories(runnerId, message.repositories);
+      }
       await this.env.DB.prepare(
         "UPDATE runners SET free_slots = ?, status = 'online', last_heartbeat_at = ? WHERE id = ?",
       ).bind(message.capacity, new Date().toISOString(), runnerId).run();
       const { results: jobs } = await this.env.DB.prepare(
-        `SELECT id, project_id AS pid, status, assignment_id AS assignmentId,
-                cancel_requested_at AS cancelRequestedAt
-           FROM runner_jobs
-          WHERE runner_id = ? AND status IN ('queued','assigned','running','waiting')
-          ORDER BY created_at`,
+        `SELECT j.id, j.project_id AS pid, j.status, j.assignment_id AS assignmentId,
+                j.cancel_requested_at AS cancelRequestedAt, j.repo_ref AS repoRef,
+                r.repos, r.capabilities
+           FROM runner_jobs j JOIN runners r ON r.id = j.runner_id
+          WHERE j.runner_id = ? AND j.status IN ('queued','assigned','running','waiting')
+          ORDER BY j.created_at`,
       ).bind(runnerId).all<{
         id: string; pid: string; status: string; assignmentId: string; cancelRequestedAt: string | null;
+        repoRef: string; repos: string; capabilities: string;
       }>();
       let free = message.capacity - jobs.filter((job) => ['assigned', 'running', 'waiting'].includes(job.status)).length;
       for (const job of jobs) {
         if (!(await this.authorizeProject(ws, auth, job.pid))) return;
+        if (!this.repositoryDispatchable(job.repos, job.capabilities, job.pid, job.repoRef)) continue;
         if (job.cancelRequestedAt) {
           if (!this.sendIfOpen(ws, JSON.stringify({
             type: 'job.cancel', jobId: job.id, assignmentId: job.assignmentId,
@@ -774,6 +803,16 @@ export class RunnerHub extends DurableObject<Env> {
         ).bind(runnerId, message.freeSlots).all<{ id: string }>();
         for (const job of results) await this.deliverRunnerJob(job.id);
       }
+      return;
+    }
+
+    if (message.type === 'catalog.update') {
+      if (!auth.capabilities?.includes(RUNNER_CATALOG_CAPABILITY)) {
+        ws.close(1008, 'runner.catalog.v1 was not registered');
+        return;
+      }
+      const ack = await this.applyRunnerCatalogUpdate(runnerId, message.catalog);
+      this.sendIfOpen(ws, JSON.stringify({ type: 'catalog.ack', ...ack }));
       return;
     }
 
@@ -872,14 +911,103 @@ export class RunnerHub extends DurableObject<Env> {
     if (!row) return;
     let stored: Array<Record<string, unknown> & { id?: string; repositoryKey?: string | null }>;
     try { stored = JSON.parse(row.repos || '[]') as typeof stored; } catch { return; }
+    const keyCounts = new Map<string, number>();
+    for (const repository of stored) {
+      if (repository.repositoryKey) keyCounts.set(repository.repositoryKey, (keyCounts.get(repository.repositoryKey) ?? 0) + 1);
+    }
     const merged = stored.map((repository) => {
-      const incoming = advertised.find((candidate) =>
-        candidate.repoRef === repository.id || candidate.repositoryKey === repository.repositoryKey,
-      );
+      const incoming = advertised.find((candidate) => candidate.repoRef === repository.id)
+        ?? (repository.repositoryKey && keyCounts.get(repository.repositoryKey) === 1
+          ? advertised.find((candidate) => candidate.repositoryKey === repository.repositoryKey)
+          : undefined);
       return incoming ? { ...repository, repoRef: incoming.repoRef, baseRevision: incoming.baseRevision } : repository;
     });
     await this.env.DB.prepare('UPDATE runners SET repos = ? WHERE id = ?')
       .bind(JSON.stringify(merged), runnerId).run();
+  }
+
+  private parseCapabilities(value: string): StoredRunnerCapabilities {
+    try { return JSON.parse(value || '{}') as StoredRunnerCapabilities; } catch { return {}; }
+  }
+
+  private repositoryDispatchable(
+    reposValue: string,
+    capabilitiesValue: string,
+    projectId: string,
+    repoRef: string,
+  ): boolean {
+    let repositories: StoredRunnerRepository[];
+    try { repositories = JSON.parse(reposValue || '[]') as StoredRunnerRepository[]; } catch { return false; }
+    const capabilities = this.parseCapabilities(capabilitiesValue);
+    const repository = repositories.find((candidate) =>
+      (candidate.id === repoRef || candidate.repoRef === repoRef) && candidate.projectId === projectId);
+    if (!repository?.baseRevision) return false;
+    return !capabilities.protocolCapabilities?.includes(RUNNER_CATALOG_CAPABILITY)
+      || repository.catalogAcknowledged === true;
+  }
+
+  private async applyRunnerCatalogUpdate(
+    runnerId: string,
+    catalog: { generation: number; digest: string; repositories: Array<{ repositoryKey: string; repoRef: string; vcs: string; baseRevision: string }> },
+  ): Promise<{ generation: number; digest: string; accepted: boolean; dispatchableRepoRefs: string[]; error: string | null }> {
+    const reject = (error: string) => ({
+      generation: catalog.generation, digest: catalog.digest, accepted: false,
+      dispatchableRepoRefs: [] as string[], error,
+    });
+    if (await sha256Hex(runnerCatalogCanonicalJson(catalog.repositories)) !== catalog.digest) {
+      return reject('catalog digest does not match repositories');
+    }
+    const row = await this.env.DB.prepare('SELECT repos, capabilities FROM runners WHERE id = ?')
+      .bind(runnerId).first<{ repos: string; capabilities: string }>();
+    if (!row) return reject('runner is not registered');
+    const capabilities = this.parseCapabilities(row.capabilities);
+    if (!capabilities.protocolCapabilities?.includes(RUNNER_CATALOG_CAPABILITY)) {
+      return reject('runner.catalog.v1 was not registered');
+    }
+    const priorGeneration = capabilities.catalogGeneration ?? 0;
+    const priorDigest = capabilities.catalogDigest ?? null;
+    if (catalog.generation < priorGeneration
+        || (catalog.generation === priorGeneration && priorDigest !== null && priorDigest !== catalog.digest)) {
+      return reject(`catalog generation must advance monotonically from ${priorGeneration}`);
+    }
+    let stored: StoredRunnerRepository[];
+    try { stored = JSON.parse(row.repos || '[]') as StoredRunnerRepository[]; } catch { return reject('registered repository inventory is malformed'); }
+    const incoming = new Map(catalog.repositories.map((repository) => [repository.repoRef, repository]));
+    for (const repository of catalog.repositories) {
+      const registered = stored.find((candidate) => candidate.id === repository.repoRef);
+      if (!registered || !registered.projectId || registered.repositoryKey !== repository.repositoryKey) {
+        return reject(`checkout ${repository.repoRef} must be resolved by REST registration before catalog activation`);
+      }
+    }
+    const merged = stored.map((repository) => {
+      const runtime = repository.id ? incoming.get(repository.id) : undefined;
+      if (!runtime) {
+        const {
+          baseRevision: _baseRevision,
+          catalogGeneration: _catalogGeneration,
+          repoRef: _repoRef,
+          vcs: _vcs,
+          ...staticRepository
+        } = repository;
+        return { ...staticRepository, catalogAcknowledged: false };
+      }
+      return {
+        ...repository,
+        repoRef: runtime.repoRef,
+        vcs: runtime.vcs,
+        baseRevision: runtime.baseRevision,
+        catalogAcknowledged: true,
+        catalogGeneration: catalog.generation,
+      };
+    });
+    capabilities.catalogGeneration = catalog.generation;
+    capabilities.catalogDigest = catalog.digest;
+    await this.env.DB.prepare('UPDATE runners SET repos = ?, capabilities = ? WHERE id = ?')
+      .bind(JSON.stringify(merged), JSON.stringify(capabilities), runnerId).run();
+    return {
+      generation: catalog.generation, digest: catalog.digest, accepted: true,
+      dispatchableRepoRefs: catalog.repositories.map((repository) => repository.repoRef).sort(), error: null,
+    };
   }
 
   /** Async authorization/redelivery work may outlive a peer-initiated close. Treat that as an

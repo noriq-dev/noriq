@@ -333,8 +333,39 @@ export type RunnerJobAssignment = z.infer<typeof RunnerJobAssignment>;
 export const RunnerJobDispatch = z.object({ runnerId: id, repoRef: text(500) }).strict();
 export type RunnerJobDispatch = z.infer<typeof RunnerJobDispatch>;
 
+export const RunnerJobRuntimeRepository = z.object({
+  repositoryKey: id,
+  repoRef: text(500),
+  vcs: text(100),
+  baseRevision: RunnerJobRevision,
+}).strict();
+export type RunnerJobRuntimeRepository = z.infer<typeof RunnerJobRuntimeRepository>;
+
+export const RunnerCatalog = z.object({
+  generation: z.number().int().positive(),
+  digest: z.string().regex(/^[0-9a-f]{64}$/),
+  repositories: z.array(RunnerJobRuntimeRepository).max(1_000),
+}).strict().superRefine((catalog, ctx) => {
+  const refs = new Set<string>();
+  for (const [index, repository] of catalog.repositories.entries()) {
+    if (refs.has(repository.repoRef)) {
+      ctx.addIssue({ code: 'custom', path: ['repositories', index, 'repoRef'], message: 'repoRef must be unique within a catalog' });
+    }
+    refs.add(repository.repoRef);
+  }
+});
+export type RunnerCatalog = z.infer<typeof RunnerCatalog>;
+
+/** Stable digest input shared by daemon and server. Inventory order is not semantic. */
+export function runnerCatalogCanonicalJson(repositories: RunnerJobRuntimeRepository[]): string {
+  return JSON.stringify([...repositories]
+    .sort((a, b) => a.repoRef.localeCompare(b.repoRef))
+    .map(({ repositoryKey, repoRef, vcs, baseRevision }) => ({ repositoryKey, repoRef, vcs, baseRevision })));
+}
+
 export const RunnerJobRunnerMessage = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('hello'), protocolVersion: z.literal(2), runnerId: id, capacity: z.number().int().min(1).max(32), repositories: z.array(z.object({ repositoryKey: id, repoRef: text(500), vcs: text(100), baseRevision: RunnerJobRevision }).strict()).max(1_000) }).strict(),
+  z.object({ type: z.literal('hello'), protocolVersion: z.literal(2), runnerId: id, capacity: z.number().int().min(1).max(32), repositories: z.array(RunnerJobRuntimeRepository).max(1_000) }).strict(),
+  z.object({ type: z.literal('catalog.update'), catalog: RunnerCatalog }).strict(),
   z.object({ type: z.literal('heartbeat'), freeSlots: z.number().int().min(0).max(32), activeJobIds: z.array(id).max(32) }).strict(),
   z.object({ type: z.literal('job.accept'), jobId: id, assignmentId: id }).strict(),
   z.object({ type: z.literal('job.event'), jobId: id, assignmentId: id, seq: z.number().int().positive(), payload: RunnerJobEvent }).strict(),
@@ -348,6 +379,11 @@ export const RunnerJobRunnerMessage = z.discriminatedUnion('type', [
 export type RunnerJobRunnerMessage = z.infer<typeof RunnerJobRunnerMessage>;
 
 export const RunnerJobServerMessage = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('catalog.ack'), generation: z.number().int().positive(),
+    digest: z.string().regex(/^[0-9a-f]{64}$/), accepted: z.boolean(),
+    dispatchableRepoRefs: z.array(text(500)).max(1_000), error: z.string().max(4_000).nullable(),
+  }).strict(),
   z.object({ type: z.literal('job.assign'), assignment: RunnerJobAssignment }).strict(),
   z.object({ type: z.literal('job.cancel'), jobId: id, assignmentId: id, reason: z.string().max(4_000) }).strict(),
   z.object({ type: z.literal('job.answer'), jobId: id, assignmentId: id, questionId: id, answer: z.string().max(20_000) }).strict(),
