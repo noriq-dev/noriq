@@ -328,6 +328,84 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
     })).toThrow();
   });
 
+  it('accepts additive routing, pricing-basis, and task-scoped progress contracts', () => {
+    const at = new Date().toISOString();
+    const actor = {
+      kind: 'agent' as const, driver: 'codex', vendor: 'openai', model: 'gpt-5.6-codex',
+      effort: 'high', role: 'build', operation: 'invoke',
+    };
+    expect(RunnerJobEvent.parse({
+      type: 'agent.route', at,
+      route: {
+        taskId: 'task_1', role: 'build', attempt: 1, policyVersion: 'adaptive-v1',
+        size: 'medium', risk: 'high', specCoverage: 'complete',
+        reasons: ['risk.high', 'spec.complete'], candidateCount: 3, eligibleCount: 2,
+        actor, decision: 'invoke',
+      },
+    })).toMatchObject({ type: 'agent.route', route: { decision: 'invoke', actor } });
+    expect(RunnerJobEvent.parse({
+      type: 'progress', at, taskId: 'task_1', phase: 'building', message: 'building', progress: 0.5,
+    })).toMatchObject({ taskId: 'task_1' });
+    expect(RunnerJobEvent.parse({
+      type: 'progress', at, phase: 'building', message: 'job progress', progress: 0.5,
+    })).not.toHaveProperty('taskId');
+
+    const usage = {
+      inputTokens: { status: 'complete' as const, value: 100, provenance: 'driver_reported' as const },
+      outputTokens: { status: 'complete' as const, value: 25, provenance: 'driver_reported' as const },
+      cacheReadTokens: { status: 'unavailable' as const, value: null, provenance: 'not_reported' as const },
+      cacheWriteTokens: { status: 'unavailable' as const, value: null, provenance: 'not_reported' as const },
+      calls: { status: 'complete' as const, value: 1, provenance: 'driver_reported' as const },
+      costUsd: { status: 'partial' as const, value: 0.0125, provenance: 'derived' as const },
+    };
+    const event = {
+      type: 'stage.finished' as const, at, startedAt: at, observationId: 'obs_1', taskId: 'task_1',
+      stage: 'build' as const, attempt: 1, actor, outcome: 'succeeded' as const,
+      duration: { status: 'complete' as const, value: 250, provenance: 'runner_reported' as const },
+      usage, costBasis: {
+        kind: 'api_list_estimate' as const,
+        priceSource: { provider: 'openai', catalog: 'official-api-list', fetchedAt: at, ageSeconds: 30, stale: false },
+      },
+      recovery: 'none' as const,
+      evidence: {
+        operationDigest: null, resultDigest: null, exitCode: null, timedOut: null,
+        changedPathCount: null, blockerFindings: null, majorFindings: null,
+        minorFindings: null, checkpointRef: null, errorCode: null,
+      },
+    };
+    expect(RunnerJobEvent.parse(event)).toMatchObject({ costBasis: { kind: 'api_list_estimate' } });
+    expect(() => RunnerJobEvent.parse({
+      ...event,
+      usage: { ...usage, costUsd: { status: 'complete', value: 0.0125, provenance: 'driver_reported' } },
+    })).toThrow(/requires derived provenance/);
+  });
+
+  it('rejects unsafe or inconsistent adaptive route facts', () => {
+    const at = new Date().toISOString();
+    const base = {
+      type: 'agent.route' as const, at,
+      route: {
+        taskId: 'task_1', role: 'build', attempt: 1, policyVersion: 'adaptive-v1',
+        size: 'small' as const, risk: 'low' as const, specCoverage: 'partial' as const,
+        reasons: ['spec.partial'], candidateCount: 1, eligibleCount: 1,
+        actor: null, decision: 'skip' as const,
+      },
+    };
+    expect(RunnerJobEvent.parse(base)).toMatchObject({ route: { decision: 'skip' } });
+    expect(() => RunnerJobEvent.parse({
+      ...base, route: { ...base.route, decision: 'invoke', actor: null },
+    })).toThrow(/require an actor/);
+    expect(() => RunnerJobEvent.parse({
+      ...base, route: { ...base.route, reasons: ['contains task text'] },
+    })).toThrow();
+    expect(() => RunnerJobEvent.parse({
+      ...base, route: { ...base.route, candidateCount: 1, eligibleCount: 2 },
+    })).toThrow(/cannot exceed/);
+    expect(() => RunnerJobEvent.parse({
+      ...base, route: { ...base.route, reasons: Array.from({ length: 17 }, (_, i) => `reason.${i}`) },
+    })).toThrow();
+  });
+
   it('reduces bounded stage observations atomically and exposes a task-filtered cursor', async () => {
     const response = await SELF.fetch('https://noriq.test/api/projects', {
       method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
