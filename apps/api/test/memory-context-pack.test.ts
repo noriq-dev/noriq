@@ -11,8 +11,16 @@ import { env, SELF } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import type { Env } from '../src/env';
 import { createAgent, createRunAgent, createUser, mintTokenForUser, loginSession, mcpCall, mcpList } from './helpers';
-import { allocateBudget, SECTION_ORDER, CHARS_PER_TOKEN, assembleContextPack } from '../src/memory/context-pack';
-import { buildEntityUri } from '@noriq-dev/shared';
+import {
+  allocateBudget,
+  SECTION_ORDER,
+  CHARS_PER_TOKEN,
+  MIN_FITTED_CODE_EXCERPT_CHARS,
+  assembleContextPack,
+  charSize,
+  fitCodeExcerpts,
+} from '../src/memory/context-pack';
+import { buildEntityUri, type ContextPackCodeExcerpt } from '@noriq-dev/shared';
 import { computeStagedContentHash } from '../src/memory/ingest';
 
 const appEnv = env as unknown as Env;
@@ -148,6 +156,46 @@ describe('allocateBudget — pure, deterministic character budgeting', () => {
     expect(build.graph_neighborhood).toBeGreaterThan(human.graph_neighborhood!);
     const verify = allocateBudget(10_000, SECTION_ORDER, 'verify');
     expect(verify.failed_approaches).toBeGreaterThan(human.failed_approaches!);
+  });
+});
+
+describe('fitCodeExcerpts — deterministic structured source fitting', () => {
+  const excerpt = (content: string): ContextPackCodeExcerpt => ({
+    excerptKind: 'code',
+    id: 'noriq://file/PLNR/repo-source/src/context.ts',
+    uri: 'noriq://file/PLNR/repo-source/src/context.ts',
+    projectId: 'prj_source',
+    repositoryKey: 'repo-source',
+    generationId: 'gen_source',
+    branch: 'main',
+    baseId: 'sha-source',
+    path: 'src/context.ts',
+    symbol: null,
+    entityType: 'file',
+    label: 'src/context.ts',
+    content,
+    contentTruncated: false,
+  });
+
+  it('keeps every identity field and chooses the largest complete content prefix that fits', () => {
+    const candidate = excerpt('x'.repeat(512));
+    const expected = { ...candidate, content: 'x'.repeat(200), contentTruncated: true };
+    const fitted = fitCodeExcerpts([candidate], charSize(expected));
+
+    expect(fitted.taken).toEqual([expected]);
+    expect(fitted.used).toBe(charSize(expected));
+    expect(fitted.fitted).toBe(1);
+    expect(fitted.omitted).toBe(0);
+    expect(fitted.truncated).toBe(true);
+  });
+
+  it('omits a candidate when its identity plus the 128-character useful-content floor cannot fit', () => {
+    const candidate = excerpt('x'.repeat(512));
+    const minimum = { ...candidate, content: 'x'.repeat(MIN_FITTED_CODE_EXCERPT_CHARS), contentTruncated: true };
+    const fitted = fitCodeExcerpts([candidate], charSize(minimum) - 1);
+
+    expect(MIN_FITTED_CODE_EXCERPT_CHARS).toBe(128);
+    expect(fitted).toEqual({ taken: [], used: 0, fitted: 0, omitted: 1, truncated: true });
   });
 });
 
@@ -516,6 +564,69 @@ describe('assembleContextPack — active repository source excerpts', () => {
     expect(source.excerpts.map((excerpt) => excerpt.id)).not.toContain(oldUri);
     expect(JSON.stringify({ ...first, generatedAt: 'X' })).toBe(JSON.stringify({ ...second, generatedAt: 'X' }));
     expect(first.charsUsed).toBeLessThanOrEqual(first.charBudget);
+  });
+
+  it('fits useful indexed source into RUN-327\'s 1500-token, spec-heavy context budget', async () => {
+    const projectKey = 'MCPSRF';
+    const projectId = await newProject(projectKey);
+    const repositoryKey = 'repo-source';
+    const canonicalContent = 'export const boundedContextEvidence = true; // indexed source\n'.repeat(38);
+    const made = await mcpCall(agent.apiKey, 'create_task', {
+      projectId,
+      title: 'Fit indexed source excerpts to the actual ContextPack section budget',
+      body: 'A normal Runner build needs exact indexed evidence without increasing its configured context budget.',
+      tags: ['context-pack-test'],
+      executionSpec: {
+        anticipatedFiles: [{ path: 'src/context.ts', change: 'modify', why: 'fit indexed evidence to the remaining source section' }],
+        lockedDecisions: [{
+          decision: 'Keep the Runner context budget fixed and preserve complete checkout identity on every excerpt.',
+          because: 'The required task facts take precedence. '.repeat(38),
+          source: 'RUN-327',
+        }],
+        discretion: ['Choose the deterministic fitting implementation.'],
+        deferred: ['Changing Runner prompt budgets or indexed candidate ranking.'],
+        acceptance: {
+          observableTruths: ['At least one useful indexed source prefix reaches the builder.'],
+          artifacts: [],
+          links: [],
+        },
+      },
+    });
+    const taskId = made.body.id as string;
+    const uri = buildEntityUri({ kind: 'file', projectKey, repositoryKey, path: 'src/context.ts' });
+    await activateCodeGeneration(projectId, {
+      generationId: 'gen_source_fit', repositoryKey, branch: 'main', baseId: 'sha-fit',
+      rows: [{ kind: 'node', uri, type: 'file', label: 'src/context.ts', content: canonicalContent }],
+    });
+    // Settle task projection before comparing two reads; an alarm-driven reconciliation landing
+    // between them would legitimately change graph coverage while leaving source fitting intact.
+    await memory(projectId).reconcile(projectId);
+    const searchEnv = withCodeSearch([
+      { id: `${uri}:chunk-1`, score: 1, metadata: { projectId, repositoryKey, generationId: 'gen_source_fit', type: 'file', uri } },
+    ]);
+    const input = { repositoryKey, branch: 'main', baseId: 'sha-fit', tokenBudget: 1500, role: 'build' } as const;
+    const first = await assembleContextPack(searchEnv, projectId, taskId, input);
+    const second = await assembleContextPack(searchEnv, projectId, taskId, input);
+    const source = first.sections.find((section) => section.id === 'source_excerpts')!;
+    const fitted = source.excerpts[0];
+
+    expect(source.excerpts).toHaveLength(1);
+    expect(fitted?.excerptKind).toBe('code');
+    if (!fitted || fitted.excerptKind !== 'code') throw new Error('expected one fitted code excerpt');
+    expect(fitted).toMatchObject({
+      excerptKind: 'code', id: uri, uri, projectId, repositoryKey,
+      generationId: 'gen_source_fit', branch: 'main', baseId: 'sha-fit',
+      path: 'src/context.ts', symbol: null, entityType: 'file', label: 'src/context.ts',
+      contentTruncated: true,
+    });
+    expect(fitted.content.length).toBeGreaterThanOrEqual(MIN_FITTED_CODE_EXCERPT_CHARS);
+    expect(fitted.content.length).toBeLessThan(canonicalContent.length);
+    expect(canonicalContent.startsWith(fitted.content)).toBe(true);
+    expect(source.charsUsed).toBe(charSize(fitted));
+    expect(source.charsUsed).toBeLessThanOrEqual(source.charsAllotted);
+    expect(source.notice).toMatchObject({ kind: 'truncated', reason: expect.stringMatching(/shortened to fit/) });
+    expect(first.charsUsed).toBeLessThanOrEqual(first.charBudget);
+    expect(JSON.stringify({ ...first, generatedAt: 'X' })).toBe(JSON.stringify({ ...second, generatedAt: 'X' }));
   });
 
   it('fails open with an explicit unanswerable source section when the caller base does not match the active generation', async () => {

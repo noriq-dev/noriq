@@ -62,6 +62,10 @@ export const DEFAULT_CHAR_BUDGET = 24_000;
 const MAX_CANDIDATES_PER_SECTION = 8;
 const MAX_CODE_EXCERPTS = 8;
 const MAX_CODE_EXCERPT_CHARS = 2400;
+// Only section-level fitting uses this floor. A complete canonical excerpt shorter than the floor
+// is still useful and may pass through unchanged; when content must be shortened, however, we do
+// not spend most of the remaining section on identity metadata for less than this much source.
+export const MIN_FITTED_CODE_EXCERPT_CHARS = 128;
 
 // ---------------------------------------------------------------------------------------------
 // Section fill order and budget weights (locked decision: "declared as data ... not implied by
@@ -184,6 +188,95 @@ export function fillGreedy<T>(candidates: readonly T[], cap: number): { taken: T
     used += size;
   }
   return { taken, used, truncated: false };
+}
+
+/**
+ * Source excerpts have immutable checkout identity and one deliberately compressible field:
+ * `content`. Preserve ranked order and exact identity, but when the next complete excerpt does not
+ * fit, choose the largest Unicode-safe content prefix whose complete structured object does. The
+ * binary search measures the actual JSON shape at every probe, so escaping and metadata remain
+ * part of the same deterministic accounting used by every other section.
+ */
+export function fitCodeExcerpts(
+  candidates: readonly ContextPackCodeExcerpt[],
+  cap: number,
+): { taken: ContextPackCodeExcerpt[]; used: number; fitted: number; omitted: number; truncated: boolean } {
+  const boundedCap = Math.max(0, Math.floor(cap));
+  const taken: ContextPackCodeExcerpt[] = [];
+  let used = 0;
+  let fitted = 0;
+
+  for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
+    const candidate = candidates[candidateIndex]!;
+    const fullSize = charSize(candidate);
+    if (used + fullSize <= boundedCap) {
+      taken.push(candidate);
+      used += fullSize;
+      continue;
+    }
+
+    // Build prefix endpoints at Unicode code-point boundaries so fitting never returns half of a
+    // surrogate pair. JSON size is monotonic across these complete-code-point prefixes.
+    const prefixEnds: number[] = [];
+    let end = 0;
+    for (const codePoint of candidate.content) {
+      end += codePoint.length;
+      prefixEnds.push(end);
+    }
+    // The full candidate already failed, so a fitted result must be genuinely shorter. Complete
+    // excerpts below the floor were handled by the pass-through branch above.
+    const maxPrefixLength = prefixEnds.length - 1;
+    if (maxPrefixLength < MIN_FITTED_CODE_EXCERPT_CHARS) {
+      return {
+        taken,
+        used,
+        fitted,
+        omitted: candidates.length - taken.length,
+        truncated: true,
+      };
+    }
+
+    let low = MIN_FITTED_CODE_EXCERPT_CHARS;
+    let high = maxPrefixLength;
+    let best: ContextPackCodeExcerpt | null = null;
+    let bestSize = 0;
+    while (low <= high) {
+      const midpoint = Math.floor((low + high) / 2);
+      const fittedCandidate: ContextPackCodeExcerpt = {
+        ...candidate,
+        content: candidate.content.slice(0, prefixEnds[midpoint - 1]),
+        contentTruncated: true,
+      };
+      const fittedSize = charSize(fittedCandidate);
+      if (used + fittedSize <= boundedCap) {
+        best = fittedCandidate;
+        bestSize = fittedSize;
+        low = midpoint + 1;
+      } else {
+        high = midpoint - 1;
+      }
+    }
+    if (!best) {
+      return {
+        taken,
+        used,
+        fitted,
+        omitted: candidates.length - taken.length,
+        truncated: true,
+      };
+    }
+    taken.push(best);
+    used += bestSize;
+    fitted++;
+  }
+
+  return {
+    taken,
+    used,
+    fitted,
+    omitted: candidates.length - taken.length,
+    truncated: fitted > 0,
+  };
 }
 
 function emptySection(id: ContextPackSectionId, cap: number, notice: ContextPackNotice | null): ContextPackSection {
@@ -650,10 +743,14 @@ export async function assembleContextPack(
         break;
       }
       case 'source_excerpts': {
-        const { taken, used, truncated } = fillGreedy(codeResult.excerpts, cap);
+        const { taken, used, fitted, omitted, truncated } = fitCodeExcerpts(codeResult.excerpts, cap);
+        const truncationReason = [
+          fitted ? `${fitted} code excerpt(s) shortened to fit` : null,
+          omitted ? `${omitted} more code excerpt(s) did not fit` : null,
+        ].filter((part): part is string => part !== null).join('; ');
         section = {
           id: spec.id, provenance: taken.length ? ['semantic', 'exact'] : ['none'],
-          notice: codeResult.notice ?? (truncated ? { kind: 'truncated', reason: `${codeResult.excerpts.length - taken.length} more code excerpt(s) did not fit in ${cap} characters` } : null),
+          notice: codeResult.notice ?? (truncated ? { kind: 'truncated', reason: `${truncationReason} within ${cap} characters` } : null),
           charsAllotted: cap, charsUsed: used, excerpts: taken, graphEntities: [], coverage: null, items: [],
         };
         break;
