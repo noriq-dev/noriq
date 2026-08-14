@@ -1612,7 +1612,7 @@ app.post('/api/projects/:pid/memory/quality-events', userAuth, async (c) => {
 
 const HistoricalAnalyticsDimensionBody = z.enum([
   'project', 'plan', 'plan_dispatch', 'orchestration', 'task', 'run', 'sitting',
-  'commissioned_workflow', 'executed_workflow', 'configuration', 'stage', 'role',
+  'commissioned_workflow', 'executed_workflow', 'configuration', 'stage', 'role', 'work_source',
 ]);
 const HistoricalAnalyticsQueryBody = z.object({
   from: z.string().datetime().optional(),
@@ -1622,6 +1622,7 @@ const HistoricalAnalyticsQueryBody = z.object({
   caseCursor: z.string().min(1).optional(),
   caseLimit: z.number().int().min(1).max(100).optional(),
   qualityHorizonDays: z.number().int().min(1).max(3650).optional(),
+  scope: z.enum(['all', 'runner_runs', 'copilot_claims', 'runner_job_tasks']).optional(),
 }).strict();
 
 // PLNR-294: frozen historical facts and live coordination state remain separate endpoints and
@@ -4414,6 +4415,7 @@ app.get('/api/projects/:pid/runner-jobs/:jobId/observations', userAuth, async (c
   if (taskId && taskId.length > 128) return c.json({ error: 'taskId is too long' }, 400);
   const job = await c.env.DB.prepare(
     `SELECT status, last_event_seq AS lastEventSeq, created_at AS createdAt,
+            detail_pruned_at AS detailPrunedAt,
             started_at AS startedAt, finished_at AS finishedAt,
             intelligence_started_received_at AS intelligenceStartedReceivedAt,
             intelligence_finished_received_at AS intelligenceFinishedReceivedAt,
@@ -4423,7 +4425,7 @@ app.get('/api/projects/:pid/runner-jobs/:jobId/observations', userAuth, async (c
             landing_finished_at AS landingFinishedAt
        FROM runner_jobs WHERE id = ? AND project_id = ?`,
   ).bind(jobId, pid).first<{
-    status: string; lastEventSeq: number; createdAt: string;
+    status: string; lastEventSeq: number; createdAt: string; detailPrunedAt: string | null;
     startedAt: string | null; finishedAt: string | null;
     intelligenceStartedReceivedAt: string | null; intelligenceFinishedReceivedAt: string | null;
     humanWaitStartedReceivedAt: string | null; humanWaitMs: number;
@@ -4501,7 +4503,7 @@ app.get('/api/projects/:pid/runner-jobs/:jobId/observations', userAuth, async (c
       },
     },
     partial: !['succeeded', 'partial', 'failed', 'cancelled'].includes(job.status),
-    expired: false,
+    expired: job.detailPrunedAt !== null,
   });
 });
 

@@ -16,7 +16,9 @@ import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
 import { MISSION_CAPABILITY, MissionCommission as MissionCommissionSchema, MissionRootCommission as MissionRootCommissionSchema, RunnerJobEvent as RunnerJobEventSchema, RunnerJobSource as RunnerJobSourceSchema, RunKind, AgentTool, RunStatus, ExecutionProfileOffer, type AcceptedRevisionHandoff, type AcceptedRevisionHandoffView, type CommissionedExecutionProfile, type MissionCommission, type MissionCommissionSnapshot, type MissionRootCommission, type RunnerJobAssignment, type RunnerJobCheckpoint, type RunnerJobEvent, type RunnerJobSource, type TaskRootMissionCommissionSnapshot, type MissionHandoffAck, type MissionHandoffConsumed, type MissionQuestionAck, type MissionQuestionAnswer, type MissionQuestionPublication, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
 import { readExecutionSpec, writeExecutionSpec } from '../lib/execution-spec';
-import { processPendingCopilotEpisodeJob, processPendingEpisodeJob } from '../memory/episodes';
+import {
+  processPendingCopilotEpisodeJob, processPendingEpisodeJob, processPendingRunnerJobEpisodeJob,
+} from '../memory/episodes';
 import { applyMissionTaskExecutionEvent, ensureMissionTaskExecution, ensureRunExecution, mirrorRunTransition } from '../lib/orchestration-store';
 import {
   commissionExecutionProfile, executionProfileSlots, requireCommissionedExecutionProfile,
@@ -3873,6 +3875,9 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare('DELETE FROM runner_job_questions WHERE job_id IN (SELECT id FROM runner_jobs WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare('DELETE FROM runner_job_observations WHERE job_id IN (SELECT id FROM runner_jobs WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare('DELETE FROM runner_job_events WHERE job_id IN (SELECT id FROM runner_jobs WHERE project_id = ?)').bind(pid),
+        this.env.DB.prepare('DELETE FROM runner_job_intelligence_tasks WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare('DELETE FROM runner_job_intelligence_jobs WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare('DELETE FROM runner_job_episode_jobs WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM runner_job_items WHERE job_id IN (SELECT id FROM runner_jobs WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare('DELETE FROM runner_jobs WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM similar_effort_feedback WHERE project_id = ?').bind(pid),
@@ -5164,10 +5169,22 @@ export class ProjectRoom extends DurableObject<Env> {
                     END,
                     reservation_active = 0, updated_at = ? WHERE job_id = ?`,
           ).bind(event.status, receivedAt, jobId),
+          this.env.DB.prepare(
+            `INSERT INTO runner_job_episode_jobs
+               (job_id, project_id, reason, requested_at, attempts, last_error, last_attempt_at)
+             VALUES (?, ?, 'terminal', ?, 0, NULL, NULL)
+             ON CONFLICT (job_id) DO UPDATE SET
+               reason = 'terminal', requested_at = excluded.requested_at,
+               attempts = 0, last_error = NULL, last_attempt_at = NULL`,
+          ).bind(jobId, projectId, receivedAt),
         );
         await rootStatus(event.status === 'succeeded' ? 'succeeded' : event.status === 'cancelled' ? 'cancelled' : 'failed');
       }
       await this.env.DB.batch(statements);
+      if (event.type === 'terminal') {
+        void processPendingRunnerJobEpisodeJob(this.env, projectId, jobId).catch((error) =>
+          console.warn(`RunnerJob intelligence projection for ${jobId} failed: ${String(error)}`));
+      }
       return { accepted: true, ack: seq, error: null };
     });
   }
@@ -5321,11 +5338,21 @@ export class ProjectRoom extends DurableObject<Env> {
               SELECT task_id FROM runner_job_items WHERE job_id = ? AND status = 'accepted'
             )`,
         ).bind(at, jobId)] : []),
+        this.env.DB.prepare(
+          `INSERT INTO runner_job_episode_jobs
+             (job_id, project_id, reason, requested_at, attempts, last_error, last_attempt_at)
+           VALUES (?, ?, 'landing_refresh', ?, 0, NULL, NULL)
+           ON CONFLICT (job_id) DO UPDATE SET
+             reason = 'landing_refresh', requested_at = excluded.requested_at,
+             attempts = 0, last_error = NULL, last_attempt_at = NULL`,
+        ).bind(jobId, projectId, at),
       ];
       await this.env.DB.batch(statements);
       await this.emit(SYSTEM_ACTOR, 'runner_job.status_changed', 'runner_job', jobId, {
         landing: { from: row.landingStatus, to: result.status, requestId, target: result.target },
       });
+      void processPendingRunnerJobEpisodeJob(this.env, projectId, jobId).catch((error) =>
+        console.warn(`RunnerJob landing intelligence refresh for ${jobId} failed: ${String(error)}`));
       return { accepted: true, error: null };
     });
   }
@@ -5354,10 +5381,22 @@ export class ProjectRoom extends DurableObject<Env> {
         ...(queued ? [this.env.DB.prepare(
           'UPDATE runner_job_items SET status = CASE WHEN status = \'pending\' THEN \'cancelled\' ELSE status END, reservation_active = 0, updated_at = ? WHERE job_id = ?',
         ).bind(at, jobId)] : []),
+        ...(queued ? [this.env.DB.prepare(
+          `INSERT INTO runner_job_episode_jobs
+             (job_id, project_id, reason, requested_at, attempts, last_error, last_attempt_at)
+           VALUES (?, ?, 'terminal', ?, 0, NULL, NULL)
+           ON CONFLICT (job_id) DO UPDATE SET
+             reason = 'terminal', requested_at = excluded.requested_at,
+             attempts = 0, last_error = NULL, last_attempt_at = NULL`,
+        ).bind(jobId, projectId, at)] : []),
       ]);
       await this.emit(actor, 'runner_job.status_changed', 'runner_job', jobId, {
         from: row.status, to: queued ? 'cancelled' : row.status, cancellationRequested: true,
       });
+      if (queued) {
+        void processPendingRunnerJobEpisodeJob(this.env, projectId, jobId).catch((error) =>
+          console.warn(`cancelled RunnerJob intelligence projection for ${jobId} failed: ${String(error)}`));
+      }
       return { runnerId: row.runnerId, assignmentId: row.assignmentId, terminal: queued };
     });
   }

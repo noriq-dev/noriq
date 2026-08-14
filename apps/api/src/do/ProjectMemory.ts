@@ -3170,7 +3170,11 @@ export class ProjectMemory extends DurableObject<Env> {
 
       const episodeNodeId = upsertNode('episode', buildEntityUri({ kind: 'episode', id: episodeId }), `${input.runKind} episode (${input.outcome})`);
       if (input.workSource?.kind !== 'copilot_claim') {
-        const runNodeId = upsertNode('run', buildEntityUri({ kind: 'run', id: input.runId }), `${input.runKind} run`);
+        const sourceRunId = input.workSource?.kind === 'runner_job' ? input.workSource.jobId : input.runId;
+        const runNodeId = upsertNode(
+          'run', buildEntityUri({ kind: 'run', id: sourceRunId }),
+          input.workSource?.kind === 'runner_job' ? 'RunnerJob' : `${input.runKind} run`,
+        );
         linkEdge('derived_from', episodeNodeId, runNodeId);
       }
 

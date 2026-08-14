@@ -16,7 +16,11 @@ export const HISTORICAL_ANALYTICS_DEFAULT_QUALITY_HORIZON_DAYS = 30;
 
 export type HistoricalAnalyticsDimension =
   | 'project' | 'plan' | 'plan_dispatch' | 'orchestration' | 'task' | 'run' | 'sitting'
-  | 'commissioned_workflow' | 'executed_workflow' | 'configuration' | 'stage' | 'role';
+  | 'commissioned_workflow' | 'executed_workflow' | 'configuration' | 'stage' | 'role'
+  | 'work_source';
+
+export type HistoricalAnalyticsScope =
+  | 'all' | 'runner_runs' | 'copilot_claims' | 'runner_job_tasks';
 
 export interface HistoricalAnalyticsQuery {
   from?: string;
@@ -26,6 +30,7 @@ export interface HistoricalAnalyticsQuery {
   caseCursor?: string;
   caseLimit?: number;
   qualityHorizonDays?: number;
+  scope?: HistoricalAnalyticsScope;
 }
 
 export interface AnalyticsMetricSummary {
@@ -117,7 +122,11 @@ export interface HistoricalAnalyticsResult {
     orchestrationWatermark: string | null;
     completeness: unknown;
   };
-  filter: { from: string; to: string; groupBy: HistoricalAnalyticsDimension | null; filters: Array<{ dimension: HistoricalAnalyticsDimension; value: string }> };
+  filter: {
+    from: string; to: string; scope: HistoricalAnalyticsScope;
+    groupBy: HistoricalAnalyticsDimension | null;
+    filters: Array<{ dimension: HistoricalAnalyticsDimension; value: string }>;
+  };
   coverage: {
     complete: boolean; scannedRows: number; matchedSittings: number; reasons: string[];
     qualityEventsScanned: number; unassociatedQualityEvents: number;
@@ -211,7 +220,15 @@ function dimensionValues(episode: ProjectIntelligenceEpisode, dimension: Histori
       `${item.kind}:${item.name ?? '(unnamed)'}@${item.version ?? item.fingerprint}`);
     case 'stage': return [...new Set(episode.execution.stages.map((stage) => stage.stage ?? '(unnamed)'))];
     case 'role': return [...new Set(episode.execution.stages.map((stage) => stage.role))];
+    case 'work_source': return [episode.identity.workSource?.kind ?? 'runner_run'];
   }
+}
+
+function episodeScope(episode: ProjectIntelligenceEpisode): Exclude<HistoricalAnalyticsScope, 'all'> {
+  const kind = episode.identity.workSource?.kind ?? 'runner_run';
+  if (kind === 'runner_job') return 'runner_job_tasks';
+  if (kind === 'copilot_claim') return 'copilot_claims';
+  return 'runner_runs';
 }
 
 function totalModelUsage(episode: ProjectIntelligenceEpisode): { tokens: number | null; costUSD: number | null } {
@@ -439,11 +456,13 @@ export function aggregateHistoricalAnalytics(input: {
   const fromMs = Date.parse(query.from);
   const toMs = Date.parse(query.to);
   const filters = query.filters ?? [];
+  const scope = query.scope ?? 'all';
   const qualityHorizonDays = query.qualityHorizonDays ?? HISTORICAL_ANALYTICS_DEFAULT_QUALITY_HORIZON_DAYS;
   const qualityEvents = input.qualityEvents ?? [];
   const matched = input.episodes.filter((episode) => {
     const captured = Date.parse(episode.sources.capturedAt);
     return captured >= fromMs && captured <= toMs
+      && (scope === 'all' || episodeScope(episode) === scope)
       && filters.every((filter) => dimensionValues(episode, filter.dimension).includes(filter.value));
   }).sort((a, b) => a.identity.runId.localeCompare(b.identity.runId) || a.identity.sitting - b.identity.sitting);
   const groups = new Map<string, ProjectIntelligenceEpisode[]>();
@@ -469,7 +488,7 @@ export function aggregateHistoricalAnalytics(input: {
   return {
     observedAt: input.observedAt ?? new Date().toISOString(),
     generation: input.generation,
-    filter: { from: query.from, to: query.to, groupBy: query.groupBy ?? null, filters },
+    filter: { from: query.from, to: query.to, scope, groupBy: query.groupBy ?? null, filters },
     coverage: {
       complete: !input.truncated && !input.qualityEventsTruncated && unassociatedQualityEvents === 0,
       scannedRows: input.scannedRows, matchedSittings: matched.length, reasons,

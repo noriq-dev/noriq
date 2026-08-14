@@ -23,8 +23,10 @@
 import type { Env } from '../env';
 import {
   CopilotReportedEvidence, EpisodeLandingOutcome, ExecutionSpec, LineageCompleteness, RunModelUsage,
-  StrategyCoordinate, type IntelligenceDurationMs, type IntelligenceIntegerMetric,
-  type IntelligenceRatioMetric, type WorkEpisodeSource,
+  RunnerJobDurationMetric, RunnerJobObservationActor, RunnerJobObservationEvidence,
+  RunnerJobObservationUsage, RunnerJobSource, StrategyCoordinate, UNATTRIBUTED_MODEL_ID,
+  type IntelligenceDurationMs, type IntelligenceIntegerMetric, type IntelligenceNumberMetric,
+  type IntelligenceRatioMetric, type RunnerJobObservationStage, type WorkEpisodeSource,
 } from '@noriq-dev/shared';
 import {
   INTELLIGENCE_EXTRACTION_VERSION, loadRunSittingEvidence, type EpisodeIntelligenceDraft,
@@ -561,6 +563,654 @@ export async function recordEpisodeForCopilotClaim(
   return { episodeId: recorded.episodeId, created: recorded.created };
 }
 
+type RunnerJobProjectionRow = {
+  id: string;
+  runnerId: string;
+  repoRef: string;
+  sourceKind: 'task' | 'plan';
+  sourceId: string;
+  snapshot: string;
+  expectedBaseRevision: string;
+  orchestrationId: string;
+  status: 'succeeded' | 'partial' | 'failed' | 'cancelled';
+  intelligenceContext: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  workStartedAt: string | null;
+  workFinishedAt: string | null;
+  humanWaitMs: number;
+  landingPolicy: string;
+  landingStatus: string;
+  landingTarget: string | null;
+  landingRequestedAt: string | null;
+  landingStartedAt: string | null;
+  landingFinishedAt: string | null;
+  landingCheckpoint: string | null;
+  landingError: string | null;
+};
+
+type RunnerJobProjectionItem = {
+  taskId: string;
+  taskKey: string;
+  status: string;
+  checkpointRef: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  workStartedAt: string | null;
+  workFinishedAt: string | null;
+  taskType: string | null;
+  taskTitle: string;
+};
+
+type RunnerJobProjectionObservation = {
+  observationId: string;
+  taskId: string | null;
+  stage: RunnerJobObservationStage;
+  attempt: number;
+  status: string;
+  actor: ReturnType<typeof RunnerJobObservationActor.parse>;
+  startedAt: string;
+  finishedAt: string | null;
+  duration: ReturnType<typeof RunnerJobDurationMetric.parse>;
+  usage: ReturnType<typeof RunnerJobObservationUsage.parse>;
+  evidence: ReturnType<typeof RunnerJobObservationEvidence.parse>;
+};
+
+type CompactMetric = {
+  status: 'complete' | 'partial' | 'unavailable' | 'not_applicable';
+  value: number | null;
+  observedCount: number;
+  partialCount: number;
+  unavailableCount: number;
+  notApplicableCount: number;
+};
+
+type CompactObservationAggregate = {
+  observationCount: number;
+  durationMs: CompactMetric;
+  inputTokens: CompactMetric;
+  outputTokens: CompactMetric;
+  cacheReadTokens: CompactMetric;
+  cacheWriteTokens: CompactMetric;
+  calls: CompactMetric;
+  costUsd: CompactMetric;
+};
+
+type RunnerMetric = {
+  status: 'complete' | 'partial' | 'unavailable' | 'not_applicable';
+  value: number | null;
+};
+
+const compactMetric = (metrics: RunnerMetric[]): CompactMetric => {
+  let value = 0;
+  let observedCount = 0;
+  let partialCount = 0;
+  let unavailableCount = 0;
+  let notApplicableCount = 0;
+  for (const metric of metrics) {
+    if (metric.status === 'complete' || metric.status === 'partial') {
+      value += metric.value ?? 0;
+      observedCount++;
+      if (metric.status === 'partial') partialCount++;
+    } else if (metric.status === 'unavailable') unavailableCount++;
+    else notApplicableCount++;
+  }
+  const status = observedCount === 0
+    ? unavailableCount > 0 ? 'unavailable' as const : 'not_applicable' as const
+    : partialCount > 0 || unavailableCount > 0 ? 'partial' as const : 'complete' as const;
+  return {
+    status, value: observedCount > 0 ? value : null,
+    observedCount, partialCount, unavailableCount, notApplicableCount,
+  };
+};
+
+const mergeCompactMetrics = (metrics: CompactMetric[]): CompactMetric => {
+  const observedCount = metrics.reduce((sum, metric) => sum + metric.observedCount, 0);
+  const partialCount = metrics.reduce((sum, metric) => sum + metric.partialCount, 0);
+  const unavailableCount = metrics.reduce((sum, metric) => sum + metric.unavailableCount, 0);
+  const notApplicableCount = metrics.reduce((sum, metric) => sum + metric.notApplicableCount, 0);
+  const status = observedCount === 0
+    ? unavailableCount > 0 ? 'unavailable' as const : 'not_applicable' as const
+    : partialCount > 0 || unavailableCount > 0 ? 'partial' as const : 'complete' as const;
+  return {
+    status,
+    value: observedCount > 0 ? metrics.reduce((sum, metric) => sum + (metric.value ?? 0), 0) : null,
+    observedCount, partialCount, unavailableCount, notApplicableCount,
+  };
+};
+
+function aggregateRunnerJobObservations(rows: RunnerJobProjectionObservation[]): CompactObservationAggregate {
+  return {
+    observationCount: rows.length,
+    durationMs: compactMetric(rows.map((row) => row.duration)),
+    inputTokens: compactMetric(rows.map((row) => row.usage.inputTokens)),
+    outputTokens: compactMetric(rows.map((row) => row.usage.outputTokens)),
+    cacheReadTokens: compactMetric(rows.map((row) => row.usage.cacheReadTokens)),
+    cacheWriteTokens: compactMetric(rows.map((row) => row.usage.cacheWriteTokens)),
+    calls: compactMetric(rows.map((row) => row.usage.calls)),
+    costUsd: compactMetric(rows.map((row) => row.usage.costUsd)),
+  };
+}
+
+function mergeObservationAggregates(rows: CompactObservationAggregate[]): CompactObservationAggregate {
+  return {
+    observationCount: rows.reduce((sum, row) => sum + row.observationCount, 0),
+    durationMs: mergeCompactMetrics(rows.map((row) => row.durationMs)),
+    inputTokens: mergeCompactMetrics(rows.map((row) => row.inputTokens)),
+    outputTokens: mergeCompactMetrics(rows.map((row) => row.outputTokens)),
+    cacheReadTokens: mergeCompactMetrics(rows.map((row) => row.cacheReadTokens)),
+    cacheWriteTokens: mergeCompactMetrics(rows.map((row) => row.cacheWriteTokens)),
+    calls: mergeCompactMetrics(rows.map((row) => row.calls)),
+    costUsd: mergeCompactMetrics(rows.map((row) => row.costUsd)),
+  };
+}
+
+const elapsed = (from: string | null, to: string | null): number | null => from && to
+  ? Math.max(0, Date.parse(to) - Date.parse(from))
+  : null;
+
+const parseJson = <T>(raw: string | null, fallback: T): T => {
+  if (!raw) return fallback;
+  try { return JSON.parse(raw) as T; } catch { return fallback; }
+};
+
+const unavailableRunnerMetric = () => ({ status: 'unavailable' as const, value: null, provenance: 'not_reported' as const });
+const unavailableRunnerUsage = () => RunnerJobObservationUsage.parse({
+  inputTokens: unavailableRunnerMetric(), outputTokens: unavailableRunnerMetric(),
+  cacheReadTokens: unavailableRunnerMetric(), cacheWriteTokens: unavailableRunnerMetric(),
+  calls: unavailableRunnerMetric(), costUsd: unavailableRunnerMetric(),
+});
+const emptyRunnerEvidence = () => RunnerJobObservationEvidence.parse({
+  operationDigest: null, resultDigest: null, exitCode: null, timedOut: null,
+  changedPathCount: null, blockerFindings: null, majorFindings: null,
+  minorFindings: null, checkpointRef: null, errorCode: null,
+});
+
+function intelligenceMetric(
+  metric: RunnerMetric,
+  sourceId: string,
+  observedAt: string | null,
+): IntelligenceNumberMetric {
+  const provenance = metric.status === 'unavailable' || metric.status === 'not_applicable'
+    ? 'unavailable' as const : 'runner_observed' as const;
+  return {
+    status: metric.status,
+    value: metric.value,
+    provenance,
+    source: metric.status === 'unavailable' || metric.status === 'not_applicable'
+      ? 'project_memory_episode' as const : 'runner' as const,
+    sourceId, observedAt, acceptedAt: null,
+    reason: metric.status === 'partial' ? 'known value excludes one or more unavailable components'
+      : metric.status === 'unavailable' ? 'Runner or driver did not report this metric'
+      : metric.status === 'not_applicable' ? 'metric does not apply to this observation' : null,
+  } as IntelligenceNumberMetric;
+}
+
+function aggregateIntelligenceMetric(
+  metric: CompactMetric,
+  sourceId: string,
+  observedAt: string | null,
+): IntelligenceNumberMetric {
+  return intelligenceMetric(metric, sourceId, observedAt);
+}
+
+function stageRole(row: RunnerJobProjectionObservation): 'planner' | 'worker' | 'reviewer' | 'verifier' | 'repair' | 'system' {
+  if (row.stage === 'plan' || row.actor.role === 'guide' || row.actor.role === 'planner') return 'planner';
+  if (row.stage === 'review' || row.actor.role === 'reviewer') return 'reviewer';
+  if (row.stage === 'repair' || row.actor.role === 'repairer') return 'repair';
+  if (row.stage === 'check' || row.actor.role === 'verifier') return 'verifier';
+  if (row.actor.kind === 'runner') return 'system';
+  return 'worker';
+}
+
+function modelUsageForObservations(rows: RunnerJobProjectionObservation[]): {
+  metric: ReturnType<typeof RunModelUsage.parse>;
+  status: 'complete' | 'partial' | 'unavailable';
+} {
+  const agents = rows.filter((row) => row.actor.kind === 'agent');
+  const buckets = new Map<string, { input: number; output: number; read: number; write: number; cost: number }>();
+  let anyObserved = false;
+  let partial = false;
+  for (const row of agents) {
+    const key = row.actor.model ?? UNATTRIBUTED_MODEL_ID;
+    const bucket = buckets.get(key) ?? { input: 0, output: 0, read: 0, write: 0, cost: 0 };
+    const axes = [
+      ['input', row.usage.inputTokens], ['output', row.usage.outputTokens],
+      ['read', row.usage.cacheReadTokens], ['write', row.usage.cacheWriteTokens],
+      ['cost', row.usage.costUsd],
+    ] as const;
+    for (const [axis, metric] of axes) {
+      if (metric.status === 'complete' || metric.status === 'partial') {
+        bucket[axis] += metric.value;
+        anyObserved = true;
+        if (metric.status === 'partial') partial = true;
+      } else if (metric.status === 'unavailable') partial = true;
+    }
+    buckets.set(key, bucket);
+  }
+  const metric = RunModelUsage.parse(Object.fromEntries([...buckets].map(([key, bucket]) => [key, {
+    inputTokens: bucket.input,
+    outputTokens: bucket.output,
+    cacheReadInputTokens: bucket.read,
+    cacheCreationInputTokens: bucket.write,
+    costUSD: bucket.cost,
+  }])));
+  return { metric, status: !anyObserved ? 'unavailable' : partial ? 'partial' : 'complete' };
+}
+
+function runnerJobOutcome(item: RunnerJobProjectionItem, job: RunnerJobProjectionRow): 'done' | 'failed' | 'cancelled' {
+  if (item.status === 'accepted') return 'done';
+  if (item.status === 'cancelled' || job.status === 'cancelled') return 'cancelled';
+  return 'failed';
+}
+
+function runnerJobLandingOutcome(
+  item: RunnerJobProjectionItem,
+  job: RunnerJobProjectionRow,
+): 'landed' | 'not_landed' | 'failed' | 'pending' {
+  if (item.status !== 'accepted') return 'not_landed';
+  if (job.landingStatus === 'landed') return 'landed';
+  if (job.landingStatus === 'failed') return 'failed';
+  if (job.landingStatus === 'not_applicable') return 'not_landed';
+  return 'pending';
+}
+
+function stageSummary(rows: RunnerJobProjectionObservation[]): Record<string, unknown> {
+  return Object.fromEntries([...new Set(rows.map((row) => row.stage))].sort().map((stage) => {
+    const stageRows = rows.filter((row) => row.stage === stage);
+    return [stage, {
+      ...aggregateRunnerJobObservations(stageRows),
+      outcomes: Object.fromEntries(['succeeded', 'failed', 'cancelled', 'skipped', 'running'].map((status) => [
+        status, stageRows.filter((row) => row.status === status).length,
+      ])),
+      maxAttempt: Math.max(...stageRows.map((row) => row.attempt)),
+    }];
+  }));
+}
+
+async function resolveRunnerJobRepositoryKey(
+  env: Env,
+  projectId: string,
+  runnerId: string,
+  repoRef: string,
+): Promise<string | null> {
+  const row = await env.DB.prepare('SELECT repos FROM runners WHERE id = ?').bind(runnerId).first<{ repos: string }>();
+  const repositories = parseJson<Array<Record<string, unknown>>>(row?.repos ?? null, []);
+  const repository = repositories.find((candidate) => candidate.projectId === projectId
+    && (candidate.id === repoRef || candidate.repoRef === repoRef));
+  const key = repository?.repositoryKey;
+  return typeof key === 'string' && key.length > 0 ? key : null;
+}
+
+/**
+ * Project one terminal RunnerJob into one permanent job summary and one ProjectMemory episode
+ * per task. Job-level overhead remains a separate aggregate and is never divided across tasks.
+ */
+export async function recordEpisodesForRunnerJob(
+  env: Env,
+  projectId: string,
+  jobId: string,
+): Promise<{ jobId: string; episodeIds: string[] }> {
+  const job = await env.DB.prepare(
+    `SELECT id, runner_id AS runnerId, repo_ref AS repoRef, source_kind AS sourceKind,
+            source_id AS sourceId, snapshot, expected_base_revision AS expectedBaseRevision,
+            orchestration_id AS orchestrationId, status,
+            intelligence_context AS intelligenceContext, created_at AS createdAt,
+            started_at AS startedAt, finished_at AS finishedAt,
+            intelligence_started_received_at AS workStartedAt,
+            intelligence_finished_received_at AS workFinishedAt, human_wait_ms AS humanWaitMs,
+            landing_policy AS landingPolicy, landing_status AS landingStatus,
+            landing_target AS landingTarget, landing_requested_at AS landingRequestedAt,
+            landing_started_at AS landingStartedAt, landing_finished_at AS landingFinishedAt,
+            landing_checkpoint AS landingCheckpoint, landing_error AS landingError
+       FROM runner_jobs WHERE id = ? AND project_id = ?
+         AND status IN ('succeeded','partial','failed','cancelled')`,
+  ).bind(jobId, projectId).first<RunnerJobProjectionRow>();
+  if (!job) throw new Error(`terminal RunnerJob ${jobId} not found in project ${projectId}`);
+
+  const [itemRows, observationRows, rootExecution, eventRow, tagRows] = await Promise.all([
+    env.DB.prepare(
+      `SELECT i.task_id AS taskId, i.task_key AS taskKey, i.status,
+              i.checkpoint_ref AS checkpointRef, i.started_at AS startedAt,
+              i.finished_at AS finishedAt,
+              i.intelligence_started_received_at AS workStartedAt,
+              i.intelligence_finished_received_at AS workFinishedAt,
+              t.type AS taskType, t.title AS taskTitle
+         FROM runner_job_items i JOIN tasks t ON t.id = i.task_id
+        WHERE i.job_id = ? ORDER BY i.phase_order, i.task_order, i.task_key`,
+    ).bind(jobId).all<RunnerJobProjectionItem>(),
+    env.DB.prepare(
+      `SELECT observation_id AS observationId, task_id AS taskId, stage, attempt, status,
+              actor, started_at AS startedAt, finished_at AS finishedAt,
+              duration, usage, evidence
+         FROM runner_job_observations WHERE job_id = ?
+        ORDER BY COALESCE(finish_seq, start_seq), observation_id`,
+    ).bind(jobId).all<{
+      observationId: string; taskId: string | null; stage: RunnerJobObservationStage;
+      attempt: number; status: string; actor: string; startedAt: string; finishedAt: string | null;
+      duration: string | null; usage: string | null; evidence: string | null;
+    }>(),
+    env.DB.prepare(
+      `SELECT id, updated_at AS updatedAt FROM execution_nodes
+        WHERE orchestration_id = ? AND parent_execution_id IS NULL LIMIT 1`,
+    ).bind(job.orchestrationId).first<{ id: string; updatedAt: string }>(),
+    env.DB.prepare('SELECT MAX(seq) AS seq FROM events WHERE project_id = ?')
+      .bind(projectId).first<{ seq: number | null }>(),
+    env.DB.prepare(
+      `SELECT tt.task_id AS taskId, g.name FROM task_tags tt JOIN tags g ON g.id = tt.tag_id
+        WHERE tt.task_id IN (SELECT task_id FROM runner_job_items WHERE job_id = ?)
+        ORDER BY tt.task_id, g.name`,
+    ).bind(jobId).all<{ taskId: string; name: string }>(),
+  ]);
+  if (!rootExecution) throw new Error(`RunnerJob ${jobId} has no root execution identity`);
+  const source = RunnerJobSource.parse(JSON.parse(job.snapshot));
+  const context = parseJson<Record<string, unknown> | null>(job.intelligenceContext, null);
+  const observations: RunnerJobProjectionObservation[] = observationRows.results.map((row) => ({
+    observationId: row.observationId,
+    taskId: row.taskId,
+    stage: row.stage,
+    attempt: row.attempt,
+    status: row.status,
+    actor: RunnerJobObservationActor.safeParse(parseJson(row.actor, null)).success
+      ? RunnerJobObservationActor.parse(parseJson(row.actor, null))
+      : RunnerJobObservationActor.parse({
+          kind: 'runner', driver: 'unknown', vendor: null, model: null, effort: null,
+          role: null, operation: 'unknown',
+        }),
+    startedAt: row.startedAt,
+    finishedAt: row.finishedAt,
+    duration: RunnerJobDurationMetric.safeParse(parseJson(row.duration, null)).success
+      ? RunnerJobDurationMetric.parse(parseJson(row.duration, null))
+      : RunnerJobDurationMetric.parse(unavailableRunnerMetric()),
+    usage: RunnerJobObservationUsage.safeParse(parseJson(row.usage, null)).success
+      ? RunnerJobObservationUsage.parse(parseJson(row.usage, null))
+      : unavailableRunnerUsage(),
+    evidence: RunnerJobObservationEvidence.safeParse(parseJson(row.evidence, null)).success
+      ? RunnerJobObservationEvidence.parse(parseJson(row.evidence, null))
+      : emptyRunnerEvidence(),
+  }));
+  const repositoryKey = await resolveRunnerJobRepositoryKey(env, projectId, job.runnerId, job.repoRef);
+  const byTask = new Map(itemRows.results.map((item) => [
+    item.taskId, aggregateRunnerJobObservations(observations.filter((row) => row.taskId === item.taskId)),
+  ]));
+  const overhead = aggregateRunnerJobObservations(observations.filter((row) => row.taskId === null));
+  const taskAggregates = itemRows.results.map((item) => byTask.get(item.taskId)!);
+  const jobAggregate = mergeObservationAggregates([...taskAggregates, overhead]);
+  const projectedAt = new Date().toISOString();
+  const episodeIds: string[] = [];
+  const taskSummaryStatements: D1PreparedStatement[] = [];
+
+  for (const item of itemRows.results) {
+    const taskObservations = observations.filter((row) => row.taskId === item.taskId);
+    const taskAggregate = byTask.get(item.taskId)!;
+    const snapshotTask = source.kind === 'task'
+      ? source.task
+      : source.tasks.find((task) => task.taskId === item.taskId);
+    if (!snapshotTask) throw new Error(`RunnerJob ${jobId} snapshot no longer names task ${item.taskId}`);
+    const workSource: WorkEpisodeSource = {
+      kind: 'runner_job', jobId, scope: 'task', taskId: item.taskId,
+    };
+    const outcome = runnerJobOutcome(item, job);
+    const landingOutcome = runnerJobLandingOutcome(item, job);
+    const modelUsage = modelUsageForObservations(taskObservations);
+    const taskElapsed = elapsed(item.workStartedAt, item.workFinishedAt);
+    const verifyAggregate = aggregateRunnerJobObservations(taskObservations.filter((row) => row.stage === 'check'));
+    const changedPathCounts = taskObservations.map((row) => row.evidence.changedPathCount)
+      .filter((value): value is number => value !== null);
+    const changedFiles = changedPathCounts.length
+      ? partialServerMetric(
+          Math.max(...changedPathCounts), jobId, job.workFinishedAt,
+          'maximum sanitized VCS observation count; repeated operations are not additive',
+        ) as IntelligenceIntegerMetric
+      : unavailable('RunnerJob observations did not include a changed-path count') as IntelligenceIntegerMetric;
+    const tags = tagRows.results.filter((row) => row.taskId === item.taskId).map((row) => row.name);
+    const intelligence: EpisodeIntelligenceDraft = {
+      schemaVersion: 1,
+      identity: {
+        projectId, runId: `runner_job:${jobId}:task:${item.taskId}`, sitting: 1,
+        taskId: item.taskId, planId: source.kind === 'plan' ? source.planId : null,
+        planDispatchId: null, orchestrationId: job.orchestrationId,
+        executionId: rootExecution.id, repositoryKey, branch: null,
+        baseId: job.expectedBaseRevision,
+        lineage: LineageCompleteness.parse({ status: 'complete', missing: [], reason: null }),
+        workSource,
+      },
+      sources: {
+        memoryRevision: null, coordinationEventSequence: eventRow?.seq ?? null,
+        orchestrationAcceptedAt: rootExecution.updatedAt,
+        capturedAt: job.workFinishedAt ?? job.finishedAt ?? projectedAt,
+      },
+      versions: { extraction: 'runner-job-v1', retrieval: null, risk: null, comparison: null },
+      preExecution: {
+        task: { taskType: item.taskType, tags, executionSpecFingerprint: null, capturedAt: job.createdAt },
+        requestedStrategy: null, commissionedStrategy: null,
+        commissionedSpec: snapshotTask.executionSpec ?? null,
+        budget: null, configuration: [],
+      },
+      execution: {
+        executedStrategy: null, executedSpec: snapshotTask.executionSpec ?? null,
+        observedModelUsage: modelUsage.status === 'unavailable'
+          ? unavailable('RunnerJob agent observations did not contain model usage')
+          : {
+              status: modelUsage.status, value: modelUsage.metric,
+              provenance: 'runner_observed', source: 'runner', sourceId: jobId,
+              observedAt: job.workFinishedAt, acceptedAt: null,
+              reason: modelUsage.status === 'partial'
+                ? 'known model usage excludes one or more unavailable token or cost axes' : null,
+            },
+        clocks: {
+          queueDurationMs: notApplicable('RunnerJob queue time belongs to the job overhead denominator') as IntelligenceDurationMs,
+          dispatchToStartMs: notApplicable('RunnerJob dispatch time belongs to the job overhead denominator') as IntelligenceDurationMs,
+          elapsedExecutionMs: taskElapsed === null
+            ? unavailable('task server start or finish timestamp is unavailable') as IntelligenceDurationMs
+            : serverMetric(taskElapsed, `${jobId}:${item.taskId}`, item.workFinishedAt) as IntelligenceDurationMs,
+          humanBlockedMs: notApplicable('RunnerJob human wait is job overhead and is never divided among tasks') as IntelligenceDurationMs,
+          verifyDurationMs: aggregateIntelligenceMetric(
+            verifyAggregate.durationMs, `${jobId}:${item.taskId}:check`, item.workFinishedAt,
+          ) as IntelligenceDurationMs,
+        },
+        stages: taskObservations.map((row) => {
+          const tokenMetric = compactMetric([
+            row.usage.inputTokens, row.usage.outputTokens,
+            row.usage.cacheReadTokens, row.usage.cacheWriteTokens,
+          ]);
+          return {
+            executionId: rootExecution.id, kind: 'stage' as const, role: stageRole(row), stage: row.stage,
+            elapsedMs: intelligenceMetric(row.duration, row.observationId, row.finishedAt) as IntelligenceDurationMs,
+            tokens: aggregateIntelligenceMetric(tokenMetric, row.observationId, row.finishedAt) as IntelligenceIntegerMetric,
+            costUSD: intelligenceMetric(row.usage.costUsd, row.observationId, row.finishedAt),
+          };
+        }),
+        changes: {
+          backend: typeof context?.vcs === 'string' ? context.vcs : null,
+          changedFiles,
+          additions: unavailable('RunnerJob compact evidence does not upload diff statistics') as IntelligenceIntegerMetric,
+          deletions: unavailable('RunnerJob compact evidence does not upload diff statistics') as IntelligenceIntegerMetric,
+          churn: unavailable('RunnerJob compact evidence does not upload diffs') as IntelligenceIntegerMetric,
+        },
+      },
+      outcome: {
+        runOutcome: outcome, landingOutcome,
+        reviewRounds: serverMetric(
+          taskObservations.filter((row) => row.stage === 'review').reduce((max, row) => Math.max(max, row.attempt), 0),
+          `${jobId}:${item.taskId}`, item.workFinishedAt,
+        ) as IntelligenceIntegerMetric,
+        acceptanceCoverage: serverMetric(
+          item.status === 'accepted' ? 1 : 0, `${jobId}:${item.taskId}`, item.workFinishedAt,
+        ) as IntelligenceRatioMetric,
+      },
+    };
+    const recorded = await env.PROJECT_MEMORY.get(env.PROJECT_MEMORY.idFromName(projectId)).recordEpisode(projectId, {
+      runId: `runner_job:${jobId}:task:${item.taskId}`,
+      sitting: 1,
+      agentId: null,
+      // ProjectMemory's canonical episode table retains the legacy scope/build/verify check.
+      // Source identity, not runKind, distinguishes this from a legacy build Run.
+      runKind: 'build',
+      outcome,
+      startedAt: item.workStartedAt,
+      finishedAt: item.workFinishedAt ?? job.workFinishedAt ?? job.finishedAt,
+      taskId: item.taskId,
+      taskTitle: item.taskTitle,
+      repositoryKey,
+      baseId: job.expectedBaseRevision,
+      timeline: [
+        ...(item.workStartedAt ? [{ at: item.workStartedAt, label: 'RunnerJob task work started' }] : []),
+        ...((item.workFinishedAt ?? job.workFinishedAt ?? job.finishedAt) ? [{
+          at: (item.workFinishedAt ?? job.workFinishedAt ?? job.finishedAt)!,
+          label: `RunnerJob task finished (${outcome})`,
+        }] : []),
+      ],
+      filesTouched: [], commands: [], testsRun: [], failures: [], findings: [],
+      reviewRounds: taskObservations.filter((row) => row.stage === 'review')
+        .reduce((max, row) => Math.max(max, row.attempt), 0),
+      tokenUsage: modelUsage.status === 'complete' ? modelUsage.metric : {},
+      costUSD: modelUsage.status === 'complete'
+        ? Object.values(modelUsage.metric).reduce((sum, usage) => sum + usage.costUSD, 0) : 0,
+      acceptanceCoverage: item.status === 'accepted' ? 1 : 0,
+      steeringEvents: [], landingOutcome, remainingWork: [], workSource, intelligence,
+      actor: { kind: 'system', id: null }, writeMode: 'skeleton',
+    });
+    episodeIds.push(recorded.episodeId);
+    taskSummaryStatements.push(env.DB.prepare(
+      `INSERT INTO runner_job_intelligence_tasks
+         (job_id, task_id, project_id, episode_id, outcome, timing, usage, stages,
+          landing, projected_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (job_id, task_id) DO UPDATE SET
+         episode_id = excluded.episode_id, outcome = excluded.outcome,
+         timing = excluded.timing, usage = excluded.usage, stages = excluded.stages,
+         landing = excluded.landing, projected_at = excluded.projected_at,
+         updated_at = excluded.updated_at`,
+    ).bind(
+      jobId, item.taskId, projectId, recorded.episodeId, outcome,
+      JSON.stringify({
+        workStartedAt: item.workStartedAt, workFinishedAt: item.workFinishedAt,
+        elapsedMs: taskElapsed,
+      }),
+      JSON.stringify(taskAggregate), JSON.stringify(stageSummary(taskObservations)),
+      JSON.stringify({
+        policy: job.landingPolicy, status: job.landingStatus, outcome: landingOutcome,
+        target: job.landingTarget, requestedAt: job.landingRequestedAt,
+        startedAt: job.landingStartedAt, finishedAt: job.landingFinishedAt,
+        checkpoint: parseJson(job.landingCheckpoint, null), errorPresent: job.landingError !== null,
+      }), projectedAt, projectedAt,
+    ));
+  }
+
+  const taskRollup = mergeObservationAggregates(taskAggregates);
+  await env.DB.batch([
+    ...taskSummaryStatements,
+    env.DB.prepare(
+      `INSERT INTO runner_job_intelligence_jobs
+         (job_id, project_id, source_kind, source_id, outcome, task_count,
+          task_episode_count, context, timing, usage, stages, overhead, landing,
+          projected_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (job_id) DO UPDATE SET
+         outcome = excluded.outcome, task_count = excluded.task_count,
+         task_episode_count = excluded.task_episode_count, context = excluded.context,
+         timing = excluded.timing, usage = excluded.usage, stages = excluded.stages,
+         overhead = excluded.overhead, landing = excluded.landing,
+         projected_at = excluded.projected_at, updated_at = excluded.updated_at`,
+    ).bind(
+      jobId, projectId, job.sourceKind, job.sourceId, job.status,
+      itemRows.results.length, episodeIds.length, job.intelligenceContext,
+      JSON.stringify({
+        commissionedAt: job.createdAt, runnerStartedAt: job.startedAt,
+        workStartedAt: job.workStartedAt, workFinishedAt: job.workFinishedAt,
+        finishedAt: job.finishedAt, queueMs: elapsed(job.createdAt, job.workStartedAt),
+        elapsedMs: elapsed(job.workStartedAt, job.workFinishedAt),
+        humanWaitMs: job.humanWaitMs,
+        landingMs: elapsed(job.landingRequestedAt, job.landingFinishedAt),
+      }),
+      JSON.stringify({
+        total: jobAggregate, tasks: taskRollup, overhead,
+        reconciliation: {
+          rule: 'total = tasks + overhead',
+          comparableAxes: ['durationMs','inputTokens','outputTokens','cacheReadTokens','cacheWriteTokens','calls','costUsd'],
+        },
+      }),
+      JSON.stringify(stageSummary(observations)),
+      JSON.stringify({
+        observations: overhead, queueMs: elapsed(job.createdAt, job.workStartedAt),
+        humanWaitMs: job.humanWaitMs,
+        landingMs: elapsed(job.landingRequestedAt, job.landingFinishedAt),
+      }),
+      JSON.stringify({
+        policy: job.landingPolicy, status: job.landingStatus, target: job.landingTarget,
+        requestedAt: job.landingRequestedAt, startedAt: job.landingStartedAt,
+        finishedAt: job.landingFinishedAt, checkpoint: parseJson(job.landingCheckpoint, null),
+        errorPresent: job.landingError !== null,
+      }), projectedAt, projectedAt,
+    ),
+    env.DB.prepare(
+      'UPDATE runner_jobs SET intelligence_projected_at = ?, updated_at = ? WHERE id = ? AND project_id = ?',
+    ).bind(projectedAt, projectedAt, jobId, projectId),
+  ]);
+  await requestProjectAnalyticsRebuild(env, projectId);
+  return { jobId, episodeIds };
+}
+
+export async function processPendingRunnerJobEpisodeJob(
+  env: Env,
+  projectId: string,
+  jobId: string,
+): Promise<boolean> {
+  const queued = await env.DB.prepare(
+    'SELECT 1 FROM runner_job_episode_jobs WHERE project_id = ? AND job_id = ?',
+  ).bind(projectId, jobId).first();
+  if (!queued) return false;
+  try {
+    await recordEpisodesForRunnerJob(env, projectId, jobId);
+    await env.DB.prepare('DELETE FROM runner_job_episode_jobs WHERE project_id = ? AND job_id = ?')
+      .bind(projectId, jobId).run();
+    return true;
+  } catch (error) {
+    await env.DB.prepare(
+      `UPDATE runner_job_episode_jobs
+          SET attempts = attempts + 1, last_error = ?, last_attempt_at = ?
+        WHERE project_id = ? AND job_id = ?`,
+    ).bind(String(error), new Date().toISOString(), projectId, jobId).run();
+    throw error;
+  }
+}
+
+/** Prune only reconstructible RunnerJob detail after its permanent projection is complete. */
+export async function pruneRunnerJobDetails(
+  env: Env,
+  now = new Date(),
+  limit = 100,
+): Promise<number> {
+  const cutoff = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1_000).toISOString();
+  const rows = await env.DB.prepare(
+    `SELECT id FROM runner_jobs
+      WHERE intelligence_projected_at IS NOT NULL AND detail_pruned_at IS NULL
+        AND COALESCE(intelligence_finished_received_at, finished_at) < ?
+      ORDER BY COALESCE(intelligence_finished_received_at, finished_at), id LIMIT ?`,
+  ).bind(cutoff, limit).all<{ id: string }>();
+  for (const row of rows.results) {
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM runner_job_questions WHERE job_id = ?').bind(row.id),
+      env.DB.prepare('DELETE FROM runner_job_observations WHERE job_id = ?').bind(row.id),
+      env.DB.prepare('DELETE FROM runner_job_events WHERE job_id = ?').bind(row.id),
+      env.DB.prepare(
+        `UPDATE runner_job_items
+            SET plan = NULL, summary = NULL, findings = '[]', projection_conflict = NULL
+          WHERE job_id = ?`,
+      ).bind(row.id),
+      env.DB.prepare(
+        `UPDATE runner_jobs
+            SET detail_pruned_at = ?, final_result = NULL, intelligence_context = NULL,
+                landing_checkpoint = NULL, landing_error = NULL
+          WHERE id = ? AND intelligence_projected_at IS NOT NULL AND detail_pruned_at IS NULL`,
+      ).bind(now.toISOString(), row.id),
+    ]);
+  }
+  return rows.results.length;
+}
+
 export async function processPendingCopilotEpisodeJob(
   env: Env,
   projectId: string,
@@ -646,8 +1296,11 @@ export async function processPendingEpisodeJob(
   }
 }
 
-/** Retry a bounded oldest-first batch of terminal episode jobs. */
-export async function sweepPendingEpisodeJobs(env: Env, limit = 100): Promise<{ completed: number; failed: number }> {
+/** Retry bounded oldest-first batches, then enforce the independently gated detail retention. */
+export async function sweepPendingEpisodeJobs(
+  env: Env,
+  limit = 100,
+): Promise<{ completed: number; failed: number; detailsPruned: number }> {
   const { results } = await env.DB.prepare(
     `SELECT project_id, run_id, sitting FROM memory_episode_jobs
      ORDER BY requested_at ASC LIMIT ?`,
@@ -674,5 +1327,18 @@ export async function sweepPendingEpisodeJobs(env: Env, limit = 100): Promise<{ 
       console.warn(`Copilot episode job retry for ${row.claim_id} failed: ${String(err)}`);
     }
   }
-  return { completed, failed };
+  const runnerJobs = await env.DB.prepare(
+    `SELECT project_id, job_id FROM runner_job_episode_jobs
+      ORDER BY requested_at ASC LIMIT ?`,
+  ).bind(limit).all<{ project_id: string; job_id: string }>();
+  for (const row of runnerJobs.results) {
+    try {
+      if (await processPendingRunnerJobEpisodeJob(env, row.project_id, row.job_id)) completed++;
+    } catch (err) {
+      failed++;
+      console.warn(`RunnerJob episode retry for ${row.job_id} failed: ${String(err)}`);
+    }
+  }
+  const detailsPruned = await pruneRunnerJobDetails(env, new Date(), limit);
+  return { completed, failed, detailsPruned };
 }
