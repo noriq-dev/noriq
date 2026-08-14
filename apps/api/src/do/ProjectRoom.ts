@@ -218,7 +218,8 @@ type RunnerCoordinationLeaseRow = {
   assignmentId: string; taskId: string | null; idempotencyKey: string; repositoryKey: string;
   lane: string; kind: RunnerCoordinationLeaseKind; paths: string; fencingToken: number;
   expiresAt: string; releasedAt: string | null; lastExchangeFromFence?: number | null;
-  lastExchangeScope?: string | null;
+  lastExchangeScope?: string | null; landingRequestId?: string | null;
+  lastRecoverFromFence?: number | null;
 };
 
 function normalizeCoordinationPaths(paths: string[]): string[] {
@@ -255,7 +256,8 @@ function coordinationLeaseIdentityMatches(row: RunnerCoordinationLeaseRow, lease
   return row.leaseId === lease.leaseId && row.projectId === lease.projectId
     && row.runnerId === lease.runnerId && row.checkoutId === lease.checkoutId
     && row.jobId === lease.jobId && row.assignmentId === lease.assignmentId
-    && row.taskId === lease.taskId && row.idempotencyKey === lease.idempotencyKey;
+    && row.taskId === lease.taskId && row.idempotencyKey === lease.idempotencyKey
+    && (row.landingRequestId ?? undefined) === lease.landingRequestId;
 }
 
 export interface RecordQualityEventInput {
@@ -4923,6 +4925,7 @@ export class ProjectRoom extends DurableObject<Env> {
       leaseId: row.leaseId, runnerId: row.runnerId, checkoutId: row.checkoutId,
       projectId: row.projectId, jobId: row.jobId, assignmentId: row.assignmentId,
       taskId: row.taskId, idempotencyKey: row.idempotencyKey,
+      ...(row.landingRequestId ? { landingRequestId: row.landingRequestId } : {}),
       repositoryKey: row.repositoryKey, lane: row.lane, kind: row.kind,
       paths: JSON.parse(row.paths) as string[], fencingToken: row.fencingToken,
       expiresAt: row.expiresAt,
@@ -4931,19 +4934,37 @@ export class ProjectRoom extends DurableObject<Env> {
 
   private async validateCoordinationIdentity(input: {
     projectId: string; runnerId: string; checkoutId: string; jobId: string;
-    assignmentId: string; taskId: string | null;
-  }): Promise<{ orchestrationId: string; status: string }> {
+    assignmentId: string; taskId: string | null; landingRequestId?: string | null;
+  }, options?: {
+    allowPostTerminalLanding?: boolean;
+    scope?: { kind: RunnerCoordinationLeaseKind; lane: string; paths: string[] };
+  }): Promise<{ orchestrationId: string; status: string; landingRequestId: string | null }> {
     const job = await this.env.DB.prepare(
       `SELECT orchestration_id AS orchestrationId, status, cancel_requested_at AS cancelRequestedAt,
-              repo_ref AS checkoutId
+              repo_ref AS checkoutId, landing_policy AS landingPolicy,
+              landing_status AS landingStatus, landing_target AS landingTarget,
+              landing_request_id AS landingRequestId
          FROM runner_jobs
         WHERE id = ? AND project_id = ? AND runner_id = ? AND assignment_id = ?`,
     ).bind(input.jobId, input.projectId, input.runnerId, input.assignmentId).first<{
       orchestrationId: string; status: string; cancelRequestedAt: string | null; checkoutId: string;
+      landingPolicy: string; landingStatus: string; landingTarget: string | null;
+      landingRequestId: string | null;
     }>();
     if (!job || job.checkoutId !== input.checkoutId) throw new Error('stale or foreign coordination assignment');
-    if (job.cancelRequestedAt || !['assigned', 'running', 'waiting'].includes(job.status)) {
-      throw new Error('RunnerJob is no longer accepting coordination effects');
+    const live = !job.cancelRequestedAt && ['assigned', 'running', 'waiting'].includes(job.status);
+    if (live) {
+      if (input.landingRequestId) throw new Error('live RunnerJob coordination cannot name a landing request');
+    } else {
+      const scope = options?.scope;
+      const manualLanding = options?.allowPostTerminalLanding
+        && !job.cancelRequestedAt && job.status === 'succeeded'
+        && job.landingPolicy === 'manual'
+        && ['requested', 'landing'].includes(job.landingStatus)
+        && job.landingRequestId !== null && input.landingRequestId === job.landingRequestId
+        && input.taskId === null && scope?.kind === 'landing' && scope.paths.length === 0
+        && scope.lane === job.landingTarget;
+      if (!manualLanding) throw new Error('RunnerJob is no longer accepting coordination effects');
     }
     if (input.taskId) {
       const item = await this.env.DB.prepare(
@@ -4951,7 +4972,7 @@ export class ProjectRoom extends DurableObject<Env> {
       ).bind(input.jobId, input.taskId).first<{ present: number }>();
       if (!item) throw new Error('coordination lease names a task outside the snapshot');
     }
-    return job;
+    return { orchestrationId: job.orchestrationId, status: job.status, landingRequestId: job.landingRequestId };
   }
 
   private async nextCoordinationFence(
@@ -5017,16 +5038,19 @@ export class ProjectRoom extends DurableObject<Env> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       if (input.projectId !== projectId) throw new Error('coordination project identity mismatch');
-      const job = await this.validateCoordinationIdentity(input);
       const paths = normalizeCoordinationPaths(input.paths);
       if ((input.kind === 'paths') !== (paths.length > 0)) throw new Error('coordination path scope is invalid');
       const scope = { repositoryKey: input.repositoryKey, lane: input.lane, kind: input.kind, paths };
+      const job = await this.validateCoordinationIdentity(input, {
+        allowPostTerminalLanding: true, scope,
+      });
       const existing = await this.env.DB.prepare(
         `SELECT lease_id AS leaseId, project_id AS projectId, runner_id AS runnerId,
                 checkout_id AS checkoutId, job_id AS jobId, assignment_id AS assignmentId,
                 task_id AS taskId, idempotency_key AS idempotencyKey,
                 repository_key AS repositoryKey, lane, kind, paths,
-                fencing_token AS fencingToken, expires_at AS expiresAt, released_at AS releasedAt
+                fencing_token AS fencingToken, expires_at AS expiresAt, released_at AS releasedAt,
+                landing_request_id AS landingRequestId
            FROM runner_coordination_leases
           WHERE job_id = ? AND assignment_id = ? AND idempotency_key = ?`,
       ).bind(input.jobId, input.assignmentId, input.idempotencyKey).first<RunnerCoordinationLeaseRow>();
@@ -5034,6 +5058,7 @@ export class ProjectRoom extends DurableObject<Env> {
         const same = existing.runnerId === input.runnerId && existing.checkoutId === input.checkoutId
           && existing.taskId === input.taskId && existing.repositoryKey === input.repositoryKey
           && existing.lane === input.lane && existing.kind === input.kind
+          && existing.landingRequestId === (input.landingRequestId ?? null)
           && JSON.stringify(JSON.parse(existing.paths)) === JSON.stringify(paths);
         if (!same) throw new Error('coordination idempotency key already names a different lease');
         return { status: 'acquired', lease: this.coordinationLeaseView(existing) };
@@ -5045,16 +5070,18 @@ export class ProjectRoom extends DurableObject<Env> {
           this.env.DB.prepare(
             `INSERT INTO runner_coordination_waits
                (project_id, runner_id, checkout_id, job_id, assignment_id, task_id,
-                idempotency_key, repository_key, lane, kind, paths, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                idempotency_key, repository_key, lane, kind, paths, landing_request_id,
+                created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (job_id, assignment_id, idempotency_key) DO UPDATE SET
                task_id = excluded.task_id, repository_key = excluded.repository_key,
                lane = excluded.lane, kind = excluded.kind, paths = excluded.paths,
+               landing_request_id = excluded.landing_request_id,
                updated_at = excluded.updated_at`,
           ).bind(
             projectId, input.runnerId, input.checkoutId, input.jobId, input.assignmentId,
             input.taskId, input.idempotencyKey, input.repositoryKey, input.lane, input.kind,
-            JSON.stringify(paths), at, at,
+            JSON.stringify(paths), input.landingRequestId ?? null, at, at,
           ),
           this.env.DB.prepare(
             "UPDATE runner_jobs SET status = 'waiting', updated_at = ? WHERE id = ? AND status IN ('assigned','running','waiting')",
@@ -5087,21 +5114,23 @@ export class ProjectRoom extends DurableObject<Env> {
               `UPDATE runner_coordination_leases SET runner_id = ?, checkout_id = ?, task_id = ?,
                       repository_key = ?, lane = ?, kind = ?, paths = ?, fencing_token = ?,
                       expires_at = ?, released_at = NULL, last_exchange_from_fence = NULL,
-                      last_exchange_scope = NULL, updated_at = ? WHERE lease_id = ?`,
+                      last_exchange_scope = NULL, last_recover_from_fence = NULL,
+                      landing_request_id = ?, updated_at = ? WHERE lease_id = ?`,
             ).bind(
               input.runnerId, input.checkoutId, input.taskId, input.repositoryKey, input.lane,
-              input.kind, JSON.stringify(paths), fencingToken, expiresAt, at, leaseId,
+              input.kind, JSON.stringify(paths), fencingToken, expiresAt,
+              input.landingRequestId ?? null, at, leaseId,
             )
           : this.env.DB.prepare(
               `INSERT INTO runner_coordination_leases
                  (lease_id, project_id, runner_id, checkout_id, job_id, assignment_id, task_id,
                   idempotency_key, repository_key, lane, kind, paths, fencing_token,
-                  expires_at, released_at, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+                  expires_at, released_at, landing_request_id, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
             ).bind(
               leaseId, projectId, input.runnerId, input.checkoutId, input.jobId, input.assignmentId,
               input.taskId, input.idempotencyKey, input.repositoryKey, input.lane, input.kind,
-              JSON.stringify(paths), fencingToken, expiresAt, at, at,
+              JSON.stringify(paths), fencingToken, expiresAt, input.landingRequestId ?? null, at, at,
             ),
         this.env.DB.prepare(
           'DELETE FROM runner_coordination_waits WHERE job_id = ? AND assignment_id = ? AND idempotency_key = ?',
@@ -5112,6 +5141,7 @@ export class ProjectRoom extends DurableObject<Env> {
         leaseId, runnerId: input.runnerId, checkoutId: input.checkoutId, projectId,
         jobId: input.jobId, assignmentId: input.assignmentId, taskId: input.taskId,
         idempotencyKey: input.idempotencyKey, repositoryKey: input.repositoryKey,
+        ...(input.landingRequestId ? { landingRequestId: input.landingRequestId } : {}),
         lane: input.lane, kind: input.kind, paths, fencingToken, expiresAt,
       } };
     });
@@ -5132,6 +5162,7 @@ export class ProjectRoom extends DurableObject<Env> {
                 task_id AS taskId, idempotency_key AS idempotencyKey,
                 repository_key AS repositoryKey, lane, kind, paths,
                 fencing_token AS fencingToken, expires_at AS expiresAt, released_at AS releasedAt,
+                landing_request_id AS landingRequestId,
                 last_exchange_from_fence AS lastExchangeFromFence,
                 last_exchange_scope AS lastExchangeScope
            FROM runner_coordination_leases WHERE lease_id = ?`,
@@ -5169,7 +5200,7 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare(
           `UPDATE runner_coordination_leases SET lane = ?, kind = ?, paths = ?,
                   fencing_token = ?, expires_at = ?, last_exchange_from_fence = ?,
-                  last_exchange_scope = ?, updated_at = ?
+                  last_exchange_scope = ?, last_recover_from_fence = NULL, updated_at = ?
             WHERE lease_id = ? AND fencing_token = ? AND released_at IS NULL`,
         ).bind(
           scope.lane, scope.kind, JSON.stringify(paths), fencingToken, expiresAt,
@@ -5192,13 +5223,18 @@ export class ProjectRoom extends DurableObject<Env> {
                 checkout_id AS checkoutId, job_id AS jobId, assignment_id AS assignmentId,
                 task_id AS taskId, idempotency_key AS idempotencyKey,
                 repository_key AS repositoryKey, lane, kind, paths,
-                fencing_token AS fencingToken, expires_at AS expiresAt, released_at AS releasedAt
+                fencing_token AS fencingToken, expires_at AS expiresAt, released_at AS releasedAt,
+                landing_request_id AS landingRequestId,
+                last_recover_from_fence AS lastRecoverFromFence
            FROM runner_coordination_leases WHERE lease_id = ? AND project_id = ?`,
       ).bind(leaseId, projectId).first<RunnerCoordinationLeaseRow>();
       if (!row || row.releasedAt || row.fencingToken !== fencingToken || row.expiresAt <= nowIso()) {
         throw new Error('coordination lease was lost; recover before further effects');
       }
-      await this.validateCoordinationIdentity(row);
+      await this.validateCoordinationIdentity(row, {
+        allowPostTerminalLanding: true,
+        scope: { kind: row.kind, lane: row.lane, paths: JSON.parse(row.paths) as string[] },
+      });
       const at = nowIso();
       const expiresAt = new Date(Date.now() + 90_000).toISOString();
       await this.env.DB.prepare(
@@ -5214,16 +5250,32 @@ export class ProjectRoom extends DurableObject<Env> {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       if (input.projectId !== projectId) throw new Error('coordination project identity mismatch');
-      await this.validateCoordinationIdentity(input);
       const row = await this.env.DB.prepare(
         `SELECT lease_id AS leaseId, project_id AS projectId, runner_id AS runnerId,
                 checkout_id AS checkoutId, job_id AS jobId, assignment_id AS assignmentId,
                 task_id AS taskId, idempotency_key AS idempotencyKey,
                 repository_key AS repositoryKey, lane, kind, paths,
-                fencing_token AS fencingToken, expires_at AS expiresAt, released_at AS releasedAt
+                fencing_token AS fencingToken, expires_at AS expiresAt, released_at AS releasedAt,
+                landing_request_id AS landingRequestId,
+                last_recover_from_fence AS lastRecoverFromFence
            FROM runner_coordination_leases WHERE lease_id = ? AND project_id = ?`,
       ).bind(input.leaseId, projectId).first<RunnerCoordinationLeaseRow>();
       if (!row) throw new Error('coordination lease is unknown');
+      await this.validateCoordinationIdentity(input, {
+        allowPostTerminalLanding: true,
+        scope: { kind: input.kind, lane: input.lane, paths: input.paths },
+      });
+      if ((row.landingRequestId ?? undefined) !== input.landingRequestId) {
+        throw new Error('coordination lease belongs to a different landing request');
+      }
+      const recoveryReplay = !row.releasedAt && row.expiresAt > nowIso()
+        && row.lastRecoverFromFence === input.fencingToken
+        && coordinationLeaseIdentityMatches(row, input)
+        && row.repositoryKey === input.repositoryKey && row.lane === input.lane
+        && row.kind === input.kind
+        && JSON.stringify(JSON.parse(row.paths)) === JSON.stringify(normalizeCoordinationPaths(input.paths));
+      if (recoveryReplay) return { status: 'acquired', lease: this.coordinationLeaseView(row) };
+      if (row.releasedAt) throw new Error('coordination lease was explicitly released');
       if (!coordinationLeaseMatches(row, input)) {
         throw new Error('coordination lease was fenced by a newer recovery');
       }
@@ -5247,14 +5299,15 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare(
           `UPDATE runner_coordination_leases SET fencing_token = ?, expires_at = ?,
                   released_at = NULL, last_exchange_from_fence = NULL,
-                  last_exchange_scope = NULL, updated_at = ?
+                  last_exchange_scope = NULL, last_recover_from_fence = ?, updated_at = ?
             WHERE lease_id = ? AND fencing_token = ?`,
-        ).bind(fencingToken, expiresAt, at, input.leaseId, input.fencingToken),
+        ).bind(fencingToken, expiresAt, input.fencingToken, at, input.leaseId, input.fencingToken),
       ]);
       return { status: 'acquired', lease: {
         leaseId: input.leaseId, runnerId: input.runnerId, checkoutId: input.checkoutId,
         projectId, jobId: input.jobId, assignmentId: input.assignmentId, taskId: input.taskId,
         idempotencyKey: input.idempotencyKey, repositoryKey: input.repositoryKey,
+        ...(input.landingRequestId ? { landingRequestId: input.landingRequestId } : {}),
         lane: input.lane, kind: input.kind, paths, fencingToken, expiresAt,
       } };
     });
@@ -5851,6 +5904,14 @@ export class ProjectRoom extends DurableObject<Env> {
              reason = 'landing_refresh', requested_at = excluded.requested_at,
              attempts = 0, last_error = NULL, last_attempt_at = NULL`,
         ).bind(jobId, projectId, at),
+        this.env.DB.prepare(
+          `UPDATE runner_coordination_leases
+              SET released_at = COALESCE(released_at, ?), updated_at = ?
+            WHERE job_id = ? AND landing_request_id = ? AND kind = 'landing'`,
+        ).bind(at, at, jobId, requestId),
+        this.env.DB.prepare(
+          'DELETE FROM runner_coordination_waits WHERE job_id = ? AND landing_request_id = ?',
+        ).bind(jobId, requestId),
       ];
       await this.env.DB.batch(statements);
       await this.emit(SYSTEM_ACTOR, 'runner_job.status_changed', 'runner_job', jobId, {

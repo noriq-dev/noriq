@@ -5804,14 +5804,19 @@ app.post('/api/runner-memory/context', agentAuth, async (c) => {
 
 // --- RunnerJob repository coordination (PLNR-520) -------------------------------------------
 // Flat Bearer-authenticated routes, deliberately outside /api/projects/:pid/*. Every mutation
-// binds the current OAuth token to one registered Runner, its resolved checkout, the exact live
-// RunnerJob assignment, and (when present) a task in that immutable job snapshot.
+// binds the current OAuth token to one registered Runner, its resolved checkout, and the exact
+// RunnerJob assignment. The sole terminal exception is a current human-requested manual landing.
 type CoordinationGateIdentity = RunnerCoordinationLeaseIdentity & { repositoryKey: string };
+type CoordinationGateScope = {
+  kind: 'repository' | 'paths' | 'landing'; lane: string; paths: string[];
+};
 
 async function runnerCoordinationGateDenied(
   c: Context<AppContext>,
   identity: CoordinationGateIdentity,
-  requireLiveJob = true,
+  options: {
+    requireLiveJob?: boolean; allowPostTerminalLanding?: boolean; scope?: CoordinationGateScope;
+  } = {},
 ): Promise<Response | null> {
   const conn = c.var.connection!;
   const runner = await c.env.DB.prepare(
@@ -5837,16 +5842,36 @@ async function runnerCoordinationGateDenied(
   const denied = await runnerProjectActionDenied(c, identity.projectId, 'contribute');
   if (denied) return denied;
   const job = await c.env.DB.prepare(
-    `SELECT status, cancel_requested_at AS cancelRequestedAt
+    `SELECT status, cancel_requested_at AS cancelRequestedAt,
+            landing_policy AS landingPolicy, landing_status AS landingStatus,
+            landing_target AS landingTarget, landing_request_id AS landingRequestId
        FROM runner_jobs
       WHERE id = ? AND project_id = ? AND runner_id = ? AND repo_ref = ? AND assignment_id = ?`,
   ).bind(
     identity.jobId, identity.projectId, identity.runnerId,
     identity.checkoutId, identity.assignmentId,
-  ).first<{ status: string; cancelRequestedAt: string | null }>();
+  ).first<{
+    status: string; cancelRequestedAt: string | null; landingPolicy: string;
+    landingStatus: string; landingTarget: string | null; landingRequestId: string | null;
+  }>();
   if (!job) return c.json({ error: 'RunnerJob assignment not found' }, 404);
-  if (requireLiveJob && (job.cancelRequestedAt || !['assigned', 'running', 'waiting'].includes(job.status))) {
-    return c.json({ error: 'RunnerJob is no longer accepting coordination effects' }, 409);
+  const requireLiveJob = options.requireLiveJob ?? true;
+  const live = !job.cancelRequestedAt && ['assigned', 'running', 'waiting'].includes(job.status);
+  if (requireLiveJob && live && identity.landingRequestId) {
+    return c.json({ error: 'live RunnerJob coordination cannot name a landing request' }, 409);
+  }
+  if (requireLiveJob && !live) {
+    const scope = options.scope;
+    const manualLanding = options.allowPostTerminalLanding
+      && !job.cancelRequestedAt && job.status === 'succeeded'
+      && job.landingPolicy === 'manual'
+      && ['requested', 'landing'].includes(job.landingStatus)
+      && job.landingRequestId !== null && identity.landingRequestId === job.landingRequestId
+      && identity.taskId === null && scope?.kind === 'landing' && scope.paths.length === 0
+      && scope.lane === job.landingTarget;
+    if (!manualLanding) {
+      return c.json({ error: 'RunnerJob is no longer accepting coordination effects' }, 409);
+    }
   }
   if (identity.taskId) {
     const task = await c.env.DB.prepare(
@@ -5859,13 +5884,26 @@ async function runnerCoordinationGateDenied(
 
 async function coordinationLeaseIdentity(
   env: Env, leaseId: string,
-): Promise<CoordinationGateIdentity | null> {
-  return env.DB.prepare(
+): Promise<(CoordinationGateIdentity & CoordinationGateScope) | null> {
+  const row = await env.DB.prepare(
     `SELECT project_id AS projectId, runner_id AS runnerId, checkout_id AS checkoutId,
             job_id AS jobId, assignment_id AS assignmentId, task_id AS taskId,
-            idempotency_key AS idempotencyKey, repository_key AS repositoryKey
+            idempotency_key AS idempotencyKey, repository_key AS repositoryKey,
+            lane, kind, paths, landing_request_id AS landingRequestId
        FROM runner_coordination_leases WHERE lease_id = ?`,
-  ).bind(leaseId).first<CoordinationGateIdentity>();
+  ).bind(leaseId).first<{
+    projectId: string; runnerId: string; checkoutId: string; jobId: string;
+    assignmentId: string; taskId: string | null; idempotencyKey: string;
+    repositoryKey: string; kind: CoordinationGateScope['kind']; lane: string;
+    paths: string; landingRequestId: string | null;
+  }>();
+  if (!row) return null;
+  const { landingRequestId, paths, ...identity } = row;
+  return {
+    ...identity,
+    ...(landingRequestId ? { landingRequestId } : {}),
+    paths: parseStoredJson(paths, []),
+  };
 }
 
 const coordinationError = (c: Context<AppContext>, error: unknown) => c.json({
@@ -5877,7 +5915,9 @@ app.post('/api/runner-coordination/acquire', agentAuth, async (c) => {
   if (accountDenied) return accountDenied;
   const parsed = RunnerCoordinationAcquire.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) return c.json({ error: 'invalid coordination acquisition', detail: parsed.error.issues }, 400);
-  const denied = await runnerCoordinationGateDenied(c, parsed.data);
+  const denied = await runnerCoordinationGateDenied(c, parsed.data, {
+    allowPostTerminalLanding: true, scope: parsed.data,
+  });
   if (denied) return denied;
   try {
     return c.json(await room(c.env, parsed.data.projectId).acquireRunnerCoordinationLease(
@@ -5907,7 +5947,9 @@ app.post('/api/runner-coordination/renew', agentAuth, async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid coordination renewal', detail: parsed.error.issues }, 400);
   const identity = await coordinationLeaseIdentity(c.env, parsed.data.leaseId);
   if (!identity) return c.json({ error: 'coordination lease not found' }, 404);
-  const denied = await runnerCoordinationGateDenied(c, identity);
+  const denied = await runnerCoordinationGateDenied(c, identity, {
+    allowPostTerminalLanding: true, scope: identity,
+  });
   if (denied) return denied;
   try {
     return c.json(await room(c.env, identity.projectId).renewRunnerCoordinationLease(
@@ -5921,7 +5963,9 @@ app.post('/api/runner-coordination/recover', agentAuth, async (c) => {
   if (accountDenied) return accountDenied;
   const parsed = RunnerCoordinationRecover.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) return c.json({ error: 'invalid coordination recovery', detail: parsed.error.issues }, 400);
-  const denied = await runnerCoordinationGateDenied(c, parsed.data);
+  const denied = await runnerCoordinationGateDenied(c, parsed.data, {
+    allowPostTerminalLanding: true, scope: parsed.data,
+  });
   if (denied) return denied;
   try {
     return c.json(await room(c.env, parsed.data.projectId).recoverRunnerCoordinationLease(
@@ -5937,7 +5981,7 @@ app.post('/api/runner-coordination/release', agentAuth, async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid coordination release', detail: parsed.error.issues }, 400);
   const identity = await coordinationLeaseIdentity(c.env, parsed.data.leaseId);
   if (!identity) return c.json({ error: 'coordination lease not found' }, 404);
-  const denied = await runnerCoordinationGateDenied(c, identity, false);
+  const denied = await runnerCoordinationGateDenied(c, identity, { requireLiveJob: false });
   if (denied) return denied;
   try {
     return c.json(await room(c.env, identity.projectId).releaseRunnerCoordinationLease(

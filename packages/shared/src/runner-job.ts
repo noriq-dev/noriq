@@ -427,6 +427,7 @@ export const RunnerCoordinationLeaseIdentity = z.object({
   assignmentId: id,
   taskId: id.nullable(),
   idempotencyKey: text(256),
+  landingRequestId: id.optional(),
 }).strict();
 export type RunnerCoordinationLeaseIdentity = z.infer<typeof RunnerCoordinationLeaseIdentity>;
 
