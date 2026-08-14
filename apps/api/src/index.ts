@@ -10,7 +10,7 @@ import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot, importSnapshot } from './backup';
 import { sweepPendingErasures, sweepProjectDebris, sweepProjectDebrisForProject, listProjectBackupGenerations } from './memory/lifecycle';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, timingSafeEqual, verifyPassword, verifyPasswordConstantTime } from './lib/util';
-import { searchWorkspaceEvidence, searchWorkspaceTasks } from './lib/workspace-operations';
+import { searchWorkspaceEvidence, searchWorkspacePlans, searchWorkspaceTasks } from './lib/workspace-operations';
 import type { ExecutionSpecInput, RunStatus } from '@noriq-dev/shared';
 import { readExecutionSpec } from './lib/execution-spec';
 import { search, searchBackend, reindexProject, ALL_KINDS, type SearchKind } from './search';
@@ -1274,6 +1274,24 @@ app.get('/api/tasks/search', userAuth, async (c) => {
     boardId: q.boardId,
     holder: q.holder, text: q.text, includeArchived: q.includeArchived === '1', overdue: q.overdue === '1',
     limit: parseInt(q.limit ?? '50', 10) || 50,
+  });
+  return c.json(result);
+});
+
+// Plan search mirrors task search for bounded selectors. Keeping this outside project
+// snapshots lets pages such as Runs stay cheap while still finding any reachable plan.
+app.get('/api/plans/search', userAuth, async (c) => {
+  const u = c.var.user!;
+  const q = c.req.query();
+  const result = await searchWorkspacePlans(c.env, {
+    userId: u.id,
+    allowAdminOverride: u.role === 'admin',
+  }, {
+    projectId: q.projectId,
+    status: q.status,
+    text: q.text,
+    includeArchived: q.includeArchived === '1',
+    limit: parseInt(q.limit ?? '25', 10) || 25,
   });
   return c.json(result);
 });

@@ -85,6 +85,16 @@ export interface ApiTaskSearchResult {
   updatedAt: string;
 }
 
+export interface ApiPlanSearchResult {
+  id: string;
+  title: string;
+  description: string;
+  status: string;
+  projectId: string;
+  projectKey: string;
+  createdAt: string;
+}
+
 async function askStream(
   question: string,
   threadId: string | null,
@@ -210,14 +220,25 @@ export const api = {
       undefined,
       signal,
     ),
-  searchTasks: (input: { projectId?: string; boardId?: string | null; text?: string; limit?: number }, signal?: AbortSignal) => {
+  searchTasks: (input: { projectId?: string; boardId?: string | null; status?: string; text?: string; limit?: number }, signal?: AbortSignal) => {
     const query = new URLSearchParams();
     if (input.projectId) query.set('projectId', input.projectId);
     if (input.boardId) query.set('boardId', input.boardId);
+    if (input.status) query.set('status', input.status);
     if (input.text?.trim()) query.set('text', input.text.trim());
     query.set('limit', String(input.limit ?? 25));
     return req<{ tasks: ApiTaskSearchResult[]; matched: number; returned: number }>(
       'GET', `/api/tasks/search?${query}`, undefined, signal,
+    );
+  },
+  searchPlans: (input: { projectId?: string; status?: string; text?: string; limit?: number }, signal?: AbortSignal) => {
+    const query = new URLSearchParams();
+    if (input.projectId) query.set('projectId', input.projectId);
+    if (input.status) query.set('status', input.status);
+    if (input.text?.trim()) query.set('text', input.text.trim());
+    query.set('limit', String(input.limit ?? 25));
+    return req<{ plans: ApiPlanSearchResult[]; matched: number; returned: number }>(
+      'GET', `/api/plans/search?${query}`, undefined, signal,
     );
   },
   archiveTask: (pid: string, tid: string) => req('POST', `/api/projects/${pid}/tasks/${tid}/archive`),

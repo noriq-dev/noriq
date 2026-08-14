@@ -47,6 +47,14 @@ export interface WorkspaceTaskSearchInput extends TaskSearchFilters {
   limit?: number;
 }
 
+export interface WorkspacePlanSearchInput {
+  projectId?: string | null;
+  status?: string;
+  text?: string;
+  includeArchived?: boolean;
+  limit?: number;
+}
+
 export interface WorkspaceSemanticSearchInput {
   query: string;
   projectId?: string | null;
@@ -172,6 +180,37 @@ export async function searchWorkspaceTasks(env: Pick<Env, 'DB'>, scope: Workspac
     env.DB.prepare(`SELECT COUNT(*) AS n ${base}`).bind(...allBinds).first<{ n: number }>(),
   ]);
   return { tasks: rows.results, matched: total?.n ?? rows.results.length, returned: rows.results.length };
+}
+
+/** Bounded exact-substring plan search for selectors and other non-semantic discovery surfaces. */
+export async function searchWorkspacePlans(env: Pick<Env, 'DB'>, scope: WorkspaceScope, input: WorkspacePlanSearchInput) {
+  const visible = visibility(scope, 1);
+  const projectParam = `?${visible.binds.length + 1}`;
+  const conditions = [visible.sql, `(${projectParam} IS NULL OR pl.project_id = ${projectParam})`];
+  const filterBinds: unknown[] = [];
+  if (!input.includeArchived) conditions.push('pl.archived_at IS NULL');
+  if (input.status) {
+    conditions.push('pl.status = ?');
+    filterBinds.push(input.status);
+  }
+  if (input.text?.trim()) {
+    conditions.push("(pl.title LIKE ? ESCAPE '\\' OR pl.description LIKE ? ESCAPE '\\' OR pl.body LIKE ? ESCAPE '\\')");
+    const pattern = `%${input.text.trim().replace(/[\\%_]/g, (match) => `\\${match}`)}%`;
+    filterBinds.push(pattern, pattern, pattern);
+  }
+  const base = `FROM plans pl JOIN projects p ON p.id = pl.project_id AND p.status = 'active'
+    WHERE ${conditions.join(' AND ')}`;
+  const binds = [...visible.binds, input.projectId ?? null, ...filterBinds];
+  const max = Math.min(Math.max(input.limit ?? 25, 1), 100);
+  const [rows, total] = await Promise.all([
+    env.DB.prepare(
+      `SELECT pl.id, pl.title, pl.description, pl.status, pl.project_id AS projectId,
+              p.key AS projectKey, pl.created_at AS createdAt
+       ${base} ORDER BY pl.created_at DESC LIMIT ${max}`,
+    ).bind(...binds).all(),
+    env.DB.prepare(`SELECT COUNT(*) AS n ${base}`).bind(...binds).first<{ n: number }>(),
+  ]);
+  return { plans: rows.results, matched: total?.n ?? rows.results.length, returned: rows.results.length };
 }
 
 /** Resolve exact display keys without revealing whether an unavailable key exists elsewhere.

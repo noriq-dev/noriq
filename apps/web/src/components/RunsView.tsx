@@ -16,6 +16,8 @@ import type { AppStore } from '../store';
 import { MonoTag, SectionLabel } from './bits';
 import { Button, ErrorNote, Field, Select, TextArea } from './ui';
 import { confirm } from './Dialog';
+import { TaskSearchSelect } from './TaskSearchSelect';
+import { PlanSearchSelect } from './PlanSearchSelect';
 
 // Retained for the read-only legacy-history renderer and its regression test.
 export const RUN_STATUS_STYLE: Record<RunStatus, { color: string; bg: string; live?: boolean }> = {
@@ -191,7 +193,7 @@ export function RunsView({ store }: { store: AppStore }) {
   );
 }
 
-function RunnerJobDispatchForm({
+export function RunnerJobDispatchForm({
   store,
   runners,
   onDone,
@@ -211,7 +213,7 @@ function RunnerJobDispatchForm({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const tasks = store.helpers.allTasksOf(pid).filter((task) => task.status === 'todo' || task.status === 'failed');
-  const plans = (store.snapshot?.plans ?? []).filter((plan) => !plan.archivedAt && plan.status !== 'proposed');
+  const plans = (store.snapshot?.plans ?? []).filter((plan) => !plan.archivedAt && plan.status === 'active');
 
   useEffect(() => {
     const selected = candidates.find((candidate) => candidate.id === runnerId);
@@ -219,8 +221,7 @@ function RunnerJobDispatchForm({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runnerId, pid]);
   useEffect(() => {
-    setTargetId(kind === 'task' ? (tasks[0]?.id ?? '') : (plans[0]?.id ?? ''));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    setTargetId('');
   }, [kind]);
 
   const submit = async () => {
@@ -249,13 +250,29 @@ function RunnerJobDispatchForm({
           </Select>
         </Field>
         <Field label={kind}>
-          <Select value={targetId} onChange={(event) => setTargetId(event.target.value)}>
-            {(kind === 'task' ? tasks : plans).map((target) => (
-              <option key={target.id} value={target.id}>
-                {'key' in target ? `${target.key} · ${target.title}` : target.title}
-              </option>
-            ))}
-          </Select>
+          {kind === 'task' ? (
+            <TaskSearchSelect
+              projectId={pid}
+              value={targetId}
+              onChange={setTargetId}
+              initialTasks={tasks}
+              searchStatuses={['todo', 'failed']}
+              label="Task"
+              placeholder="Search todo or failed tasks…"
+              disabled={busy}
+            />
+          ) : (
+            <PlanSearchSelect
+              projectId={pid}
+              value={targetId}
+              onChange={setTargetId}
+              initialPlans={plans}
+              status="active"
+              label="Plan"
+              placeholder="Search active plans…"
+              disabled={busy}
+            />
+          )}
         </Field>
         <Field label="runner">
           <Select value={runnerId} onChange={(event) => setRunnerId(event.target.value)}>

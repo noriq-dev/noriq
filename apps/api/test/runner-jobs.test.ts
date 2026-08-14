@@ -63,6 +63,37 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
     expect((await SELF.fetch(`https://noriq.test/api/projects/${pid}/plan-dispatches`, { headers })).status).toBe(200);
   });
 
+  it('searches task and plan dispatch targets without loading them into the Runs snapshot', async () => {
+    const marker = crypto.randomUUID().slice(0, 8);
+    const task = await room.createTask(pid, SYSTEM_ACTOR as Actor, { title: `Searchable dispatch task ${marker}` });
+    const planId = `pln_${crypto.randomUUID()}`;
+    await env.DB.prepare(
+      "INSERT INTO plans (id, project_id, title, description, status) VALUES (?, ?, ?, 'search target', 'active')",
+    ).bind(planId, pid, `Searchable dispatch plan ${marker}`).run();
+
+    const taskResponse = await SELF.fetch(
+      `https://noriq.test/api/tasks/search?projectId=${pid}&status=todo&text=${encodeURIComponent(task.key)}&limit=25`,
+      { headers: { Cookie: cookie } },
+    );
+    expect(taskResponse.status).toBe(200);
+    expect(await taskResponse.json()).toMatchObject({
+      matched: 1,
+      returned: 1,
+      tasks: [{ id: task.id, key: task.key, status: 'todo' }],
+    });
+
+    const planResponse = await SELF.fetch(
+      `https://noriq.test/api/plans/search?projectId=${pid}&status=active&text=${marker}&limit=25`,
+      { headers: { Cookie: cookie } },
+    );
+    expect(planResponse.status).toBe(200);
+    expect(await planResponse.json()).toMatchObject({
+      matched: 1,
+      returned: 1,
+      plans: [{ id: planId, title: `Searchable dispatch plan ${marker}`, status: 'active' }],
+    });
+  });
+
   it('creates a bounded immutable snapshot, one root, and a live reservation atomically', async () => {
     const task = await room.createTask(pid, SYSTEM_ACTOR as Actor, { title: 'Reserved task' });
     const job = await room.createRunnerJob(pid, SYSTEM_ACTOR as Actor, {

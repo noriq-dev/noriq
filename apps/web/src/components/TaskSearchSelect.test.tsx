@@ -11,10 +11,10 @@ const searchFields = { priority: 1, type: 'feature', projectId: 'project_1', pro
 const alpha = { ...searchFields, id: 'task_a', key: 'RUN-12', title: 'Initial task', status: 'todo', boardId: 'board_1' } satisfies TaskSearchOption & typeof searchFields;
 const target = { ...searchFields, id: 'task_target', key: 'RUN-236', title: 'Dispatch this task', status: 'todo', boardId: 'board_1' } satisfies TaskSearchOption & typeof searchFields;
 
-function render(initialTasks: TaskSearchOption[] = []) {
+function render(initialTasks: TaskSearchOption[] = [], searchStatuses?: string[]) {
   function Harness() {
     const [value, setValue] = useState('');
-    return <TaskSearchSelect projectId="project_1" boardId="board_1" value={value} onChange={setValue} initialTasks={initialTasks} label="Anchor task" />;
+    return <TaskSearchSelect projectId="project_1" boardId="board_1" value={value} onChange={setValue} initialTasks={initialTasks} searchStatuses={searchStatuses} label="Anchor task" />;
   }
   container = document.createElement('div');
   document.body.appendChild(container);
@@ -86,5 +86,22 @@ describe('TaskSearchSelect', () => {
     act(() => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })));
     act(() => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })));
     expect(input.value).toContain('RUN-236');
+  });
+
+  it('merges bounded searches for each allowed derived status', async () => {
+    const failed = { ...target, id: 'task_failed', key: 'RUN-237', status: 'failed' };
+    const search = vi.spyOn(api, 'searchTasks').mockImplementation(async (input) => ({
+      tasks: input.status === 'failed' ? [failed] : [target], matched: 1, returned: 1,
+    }));
+    render([], ['todo', 'failed']);
+
+    const input = container.querySelector<HTMLInputElement>('[role="combobox"]')!;
+    act(() => input.focus());
+    await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+
+    expect(search).toHaveBeenCalledTimes(2);
+    expect(search).toHaveBeenCalledWith(expect.objectContaining({ projectId: 'project_1', status: 'todo', limit: 25 }), expect.any(AbortSignal));
+    expect(search).toHaveBeenCalledWith(expect.objectContaining({ projectId: 'project_1', status: 'failed', limit: 25 }), expect.any(AbortSignal));
+    expect(container.querySelectorAll('[role="option"]')).toHaveLength(2);
   });
 });
