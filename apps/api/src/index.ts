@@ -1653,6 +1653,7 @@ app.post('/api/projects/:pid/memory/intelligence', userAuth, async (c) => {
     from: z.string().datetime(),
     to: z.string().datetime(),
     groupBy: HistoricalAnalyticsDimensionBody.optional(),
+    scope: z.enum(['all', 'runner_runs', 'copilot_claims', 'runner_job_tasks']).optional(),
     caseCursor: z.string().min(1).optional(),
     caseLimit: z.number().int().min(1).max(100).default(24),
     comparison: z.object({
@@ -4322,7 +4323,8 @@ app.get('/api/projects/:pid/runner-jobs', userAuth, async (c) => {
             intelligence_started_received_at AS intelligenceStartedReceivedAt,
             intelligence_finished_received_at AS intelligenceFinishedReceivedAt,
             human_wait_started_received_at AS humanWaitStartedReceivedAt,
-            human_wait_ms AS humanWaitMs, updated_at AS updatedAt
+            human_wait_ms AS humanWaitMs, detail_pruned_at AS detailPrunedAt,
+            intelligence_projected_at AS intelligenceProjectedAt, updated_at AS updatedAt
        FROM runner_jobs WHERE project_id = ? ORDER BY created_at DESC LIMIT 100`,
   ).bind(c.req.param('pid')!).all<Record<string, unknown> & {
     usage: string; finalResult: string | null; landingCheckpoint: string | null;
@@ -4352,14 +4354,15 @@ app.get('/api/projects/:pid/runner-jobs/:jobId', userAuth, async (c) => {
             intelligence_started_received_at AS intelligenceStartedReceivedAt,
             intelligence_finished_received_at AS intelligenceFinishedReceivedAt,
             human_wait_started_received_at AS humanWaitStartedReceivedAt,
-            human_wait_ms AS humanWaitMs, updated_at AS updatedAt
+            human_wait_ms AS humanWaitMs, detail_pruned_at AS detailPrunedAt,
+            intelligence_projected_at AS intelligenceProjectedAt, updated_at AS updatedAt
        FROM runner_jobs WHERE id = ? AND project_id = ?`,
   ).bind(c.req.param('jobId')!, c.req.param('pid')!).first<Record<string, unknown> & {
     snapshot: string; usage: string; intelligenceContext: string | null;
     finalResult: string | null; landingCheckpoint: string | null;
   }>();
   if (!job) return c.json({ error: 'RunnerJob not found' }, 404);
-  const [items, events, questions] = await Promise.all([
+  const [items, questions] = await Promise.all([
     c.env.DB.prepare(
       `SELECT task_id AS taskId, task_key AS taskKey, phase_order AS phaseOrder,
               task_order AS taskOrder, status, plan, checkpoint_ref AS checkpointRef,
@@ -4370,10 +4373,6 @@ app.get('/api/projects/:pid/runner-jobs/:jobId', userAuth, async (c) => {
               updated_at AS updatedAt
          FROM runner_job_items WHERE job_id = ? ORDER BY phase_order, task_order, task_key`,
     ).bind(c.req.param('jobId')!).all<Record<string, unknown> & { findings: string; projectionConflict: string | null }>(),
-    c.env.DB.prepare(
-      `SELECT seq, event_type AS type, payload, observed_at AS observedAt, received_at AS receivedAt
-         FROM runner_job_events WHERE job_id = ? ORDER BY seq`,
-    ).bind(c.req.param('jobId')!).all<Record<string, unknown> & { payload: string }>(),
     c.env.DB.prepare(
       `SELECT question_id AS questionId, prompt, state, answer,
               published_at AS publishedAt, answered_at AS answeredAt
@@ -4391,7 +4390,9 @@ app.get('/api/projects/:pid/runner-jobs/:jobId', userAuth, async (c) => {
       ...item, findings: parseStoredJson(item.findings, []),
       projectionConflict: parseStoredJson(item.projectionConflict, null),
     })),
-    events: events.results.map((event) => ({ ...event, payload: parseStoredJson(event.payload, null) })),
+    // Current clients follow the bounded observation cursor. Keep this empty compatibility
+    // property so a rolling older web bundle does not fail while avoiding an unbounded journal read.
+    events: [],
     questions: questions.results,
   });
 });
@@ -4458,7 +4459,10 @@ app.get('/api/projects/:pid/runner-jobs/:jobId/observations', userAuth, async (c
         actor: string; duration: string | null; usage: string | null; evidence: string | null; cursorSeq: number;
       }>();
   const page = rows.results.slice(0, limit);
-  const nextSeq = page.length > 0 ? page[page.length - 1]!.cursorSeq : afterSeq;
+  const pageCursor = page.length > 0 ? page[page.length - 1]!.cursorSeq : afterSeq;
+  // Once this bounded query proves there is no next matching row, advancing to the durable
+  // event high-water avoids rescanning unrelated events without risking a future finish update.
+  const nextSeq = rows.results.length > limit ? pageCursor : Math.max(pageCursor, job.lastEventSeq);
   const asOf = new Date().toISOString();
   const elapsedMs = (start: string | null, end: string | null) => start && end
     ? Math.max(0, Date.parse(end) - Date.parse(start))
@@ -4504,6 +4508,111 @@ app.get('/api/projects/:pid/runner-jobs/:jobId/observations', userAuth, async (c
     },
     partial: !['succeeded', 'partial', 'failed', 'cancelled'].includes(job.status),
     expired: job.detailPrunedAt !== null,
+  });
+});
+
+const runnerJobIntelligenceRow = (row: Record<string, unknown> & {
+  context?: string | null; timing: string; usage: string; stages: string;
+  overhead?: string; landing: string;
+}) => ({
+  ...row,
+  context: parseStoredJson(row.context ?? null, null),
+  timing: parseStoredJson(row.timing, null),
+  usage: parseStoredJson(row.usage, null),
+  stages: parseStoredJson(row.stages, null),
+  ...(row.overhead !== undefined ? { overhead: parseStoredJson(row.overhead, null) } : {}),
+  landing: parseStoredJson(row.landing, null),
+});
+
+app.get('/api/projects/:pid/runner-jobs/:jobId/intelligence', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const jobId = c.req.param('jobId')!;
+  const exists = await c.env.DB.prepare(
+    `SELECT status, intelligence_projected_at AS projectedAt,
+            detail_pruned_at AS detailPrunedAt
+       FROM runner_jobs WHERE id = ? AND project_id = ?`,
+  ).bind(jobId, pid).first<{ status: string; projectedAt: string | null; detailPrunedAt: string | null }>();
+  if (!exists) return c.json({ error: 'RunnerJob not found' }, 404);
+  const [job, tasks] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT job_id AS jobId, project_id AS projectId, source_kind AS sourceKind,
+              source_id AS sourceId, outcome, task_count AS taskCount,
+              task_episode_count AS taskEpisodeCount, context, timing, usage, stages,
+              overhead, landing, projected_at AS projectedAt, updated_at AS updatedAt
+         FROM runner_job_intelligence_jobs WHERE job_id = ? AND project_id = ?`,
+    ).bind(jobId, pid).first<Record<string, unknown> & {
+      context: string | null; timing: string; usage: string; stages: string; overhead: string; landing: string;
+    }>(),
+    c.env.DB.prepare(
+      `SELECT s.job_id AS jobId, s.task_id AS taskId, i.task_key AS taskKey,
+              t.title AS taskTitle, s.episode_id AS episodeId, s.outcome,
+              s.timing, s.usage, s.stages, s.landing,
+              s.projected_at AS projectedAt, s.updated_at AS updatedAt
+         FROM runner_job_intelligence_tasks s
+         JOIN runner_job_items i ON i.job_id = s.job_id AND i.task_id = s.task_id
+         JOIN tasks t ON t.id = s.task_id
+        WHERE s.job_id = ? AND s.project_id = ?
+        ORDER BY i.phase_order, i.task_order, i.task_key`,
+    ).bind(jobId, pid).all<Record<string, unknown> & {
+      timing: string; usage: string; stages: string; landing: string;
+    }>(),
+  ]);
+  return c.json({
+    state: job ? 'available' : 'pending',
+    status: exists.status,
+    projectedAt: exists.projectedAt,
+    detailPrunedAt: exists.detailPrunedAt,
+    job: job ? runnerJobIntelligenceRow(job) : null,
+    tasks: tasks.results.map(runnerJobIntelligenceRow),
+  });
+});
+
+app.get('/api/projects/:pid/runner-job-intelligence', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const to = c.req.query('to') ?? new Date().toISOString();
+  const from = c.req.query('from') ?? new Date(Date.parse(to) - 30 * 86_400_000).toISOString();
+  const limitRaw = c.req.query('limit') ?? '100';
+  const fromMs = Date.parse(from);
+  const toMs = Date.parse(to);
+  const limit = Number(limitRaw);
+  if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || fromMs > toMs
+    || toMs - fromMs > 366 * 86_400_000) {
+    return c.json({ error: 'RunnerJob intelligence range must be ordered and at most 366 days' }, 400);
+  }
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+    return c.json({ error: 'limit must be an integer from 1 to 100' }, 400);
+  }
+  const jobs = await c.env.DB.prepare(
+    `SELECT job_id AS jobId, project_id AS projectId, source_kind AS sourceKind,
+            source_id AS sourceId, outcome, task_count AS taskCount,
+            task_episode_count AS taskEpisodeCount, context, timing, usage, stages,
+            overhead, landing, projected_at AS projectedAt, updated_at AS updatedAt
+       FROM runner_job_intelligence_jobs
+      WHERE project_id = ? AND projected_at >= ? AND projected_at <= ?
+      ORDER BY projected_at DESC, job_id LIMIT ?`,
+  ).bind(pid, from, to, limit).all<Record<string, unknown> & {
+    context: string | null; timing: string; usage: string; stages: string; overhead: string; landing: string;
+  }>();
+  if (!jobs.results.length) return c.json({ from, to, jobs: [], tasks: [], truncated: false });
+  const placeholders = jobs.results.map(() => '?').join(',');
+  const tasks = await c.env.DB.prepare(
+    `SELECT s.job_id AS jobId, s.task_id AS taskId, i.task_key AS taskKey,
+            t.title AS taskTitle, s.episode_id AS episodeId, s.outcome,
+            s.timing, s.usage, s.stages, s.landing,
+            s.projected_at AS projectedAt, s.updated_at AS updatedAt
+       FROM runner_job_intelligence_tasks s
+       JOIN runner_job_items i ON i.job_id = s.job_id AND i.task_id = s.task_id
+       JOIN tasks t ON t.id = s.task_id
+      WHERE s.job_id IN (${placeholders})
+      ORDER BY s.projected_at DESC, i.phase_order, i.task_order, i.task_key`,
+  ).bind(...jobs.results.map((row) => String(row.jobId))).all<Record<string, unknown> & {
+    timing: string; usage: string; stages: string; landing: string;
+  }>();
+  return c.json({
+    from, to,
+    jobs: jobs.results.map(runnerJobIntelligenceRow),
+    tasks: tasks.results.map(runnerJobIntelligenceRow),
+    truncated: jobs.results.length === limit,
   });
 });
 

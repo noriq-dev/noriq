@@ -1081,8 +1081,7 @@ export async function recordEpisodesForRunnerJob(
        ON CONFLICT (job_id, task_id) DO UPDATE SET
          episode_id = excluded.episode_id, outcome = excluded.outcome,
          timing = excluded.timing, usage = excluded.usage, stages = excluded.stages,
-         landing = excluded.landing, projected_at = excluded.projected_at,
-         updated_at = excluded.updated_at`,
+         landing = excluded.landing, updated_at = excluded.updated_at`,
     ).bind(
       jobId, item.taskId, projectId, recorded.episodeId, outcome,
       JSON.stringify({
@@ -1113,7 +1112,7 @@ export async function recordEpisodesForRunnerJob(
          task_episode_count = excluded.task_episode_count, context = excluded.context,
          timing = excluded.timing, usage = excluded.usage, stages = excluded.stages,
          overhead = excluded.overhead, landing = excluded.landing,
-         projected_at = excluded.projected_at, updated_at = excluded.updated_at`,
+         updated_at = excluded.updated_at`,
     ).bind(
       jobId, projectId, job.sourceKind, job.sourceId, job.status,
       itemRows.results.length, episodeIds.length, job.intelligenceContext,
@@ -1146,7 +1145,9 @@ export async function recordEpisodesForRunnerJob(
       }), projectedAt, projectedAt,
     ),
     env.DB.prepare(
-      'UPDATE runner_jobs SET intelligence_projected_at = ?, updated_at = ? WHERE id = ? AND project_id = ?',
+      `UPDATE runner_jobs
+          SET intelligence_projected_at = COALESCE(intelligence_projected_at, ?), updated_at = ?
+        WHERE id = ? AND project_id = ?`,
     ).bind(projectedAt, projectedAt, jobId, projectId),
   ]);
   await requestProjectAnalyticsRebuild(env, projectId);

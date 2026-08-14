@@ -1,9 +1,9 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { api, type ApiRunner } from '../api';
+import { api, type ApiRunner, type ApiRunnerJobObservationPage } from '../api';
 import type { AppStore } from '../store';
-import { JOB_STATUS_STYLE, RUN_STATUS_STYLE, RunnerJobDispatchForm } from './RunsView';
+import { JOB_STATUS_STYLE, ObservationInspector, RUN_STATUS_STYLE, RunnerJobDispatchForm } from './RunsView';
 
 let container: HTMLDivElement;
 let root: Root | null = null;
@@ -60,6 +60,80 @@ describe('RunnerJob status presentation (PLNR-501)', () => {
   it('keeps partial output distinct from both success and failure', () => {
     expect(JOB_STATUS_STYLE.partial).not.toEqual(JOB_STATUS_STYLE.succeeded);
     expect(JOB_STATUS_STYLE.partial).not.toEqual(JOB_STATUS_STYLE.failed);
+  });
+});
+
+describe('RunnerJob observation follow inspector (PLNR-511)', () => {
+  it('shows a running stage, replaces it with finish evidence, and pauses without losing the cursor', async () => {
+    const base = {
+      observationId: 'obs_1', taskId: 'task_1', stage: 'build' as const, attempt: 1,
+      actor: {
+        kind: 'agent' as const, driver: 'codex', vendor: 'openai', model: 'gpt-test',
+        effort: 'medium', role: 'build', operation: 'invoke',
+      },
+      startedAt: '2026-08-13T00:00:00.000Z', recovery: null,
+      evidence: null, startSeq: 2, finishSeq: null,
+    };
+    const page = (finished: boolean): ApiRunnerJobObservationPage => ({
+      observations: [{
+        ...base,
+        status: finished ? 'succeeded' : 'running',
+        finishedAt: finished ? '2026-08-13T00:00:01.000Z' : null,
+        duration: finished ? { status: 'complete', value: 1_000, provenance: 'runner_reported' } : null,
+        usage: finished ? {
+          inputTokens: { status: 'complete', value: 100, provenance: 'driver_reported' },
+          outputTokens: { status: 'complete', value: 25, provenance: 'driver_reported' },
+          cacheReadTokens: { status: 'unavailable', value: null, provenance: 'not_reported' },
+          cacheWriteTokens: { status: 'not_applicable', value: null, provenance: 'derived' },
+          calls: { status: 'complete', value: 1, provenance: 'driver_reported' },
+          costUsd: { status: 'unavailable', value: null, provenance: 'not_reported' },
+        } : null,
+        finishSeq: finished ? 3 : null, cursorSeq: finished ? 3 : 2,
+      }],
+      cursor: { afterSeq: finished ? 2 : 0, nextSeq: finished ? 3 : 2, highWaterSeq: finished ? 3 : 2, hasMore: false },
+      scope: { taskId: 'task_1' },
+      timing: {
+        runner: { startedAt: base.startedAt, finishedAt: finished ? '2026-08-13T00:00:01.000Z' : null },
+        server: {
+          asOf: '2026-08-13T00:00:01.000Z', commissionedAt: base.startedAt,
+          workStartedAt: base.startedAt, workFinishedAt: finished ? '2026-08-13T00:00:01.000Z' : null,
+          queueMs: 0, elapsedMs: finished ? 1_000 : null, humanWaitMs: 0, humanWaitStartedAt: null,
+          landing: { requestedAt: null, startedAt: null, finishedAt: null, durationMs: null },
+          task: { startedAt: base.startedAt, finishedAt: finished ? '2026-08-13T00:00:01.000Z' : null, durationMs: finished ? 1_000 : null },
+        },
+      },
+      partial: !finished, expired: false,
+    });
+    const observations = vi.spyOn(api, 'runnerJobObservations')
+      .mockResolvedValueOnce(page(false)).mockResolvedValue(page(true));
+    vi.spyOn(api, 'runnerJobIntelligence').mockResolvedValue({
+      state: 'pending', status: 'running', projectedAt: null, detailPrunedAt: null,
+      job: null, tasks: [],
+    });
+    container = document.createElement('div'); document.body.appendChild(container); root = createRoot(container);
+    act(() => root!.render(<ObservationInspector
+      projectId="project_1"
+      jobId="job_1"
+      items={[{
+        taskId: 'task_1', taskKey: 'RUN-1', phaseOrder: 0, taskOrder: 0, status: 'running',
+        plan: null, checkpointRef: null, summary: null, findings: [], projectionConflict: null,
+        startedAt: base.startedAt, finishedAt: null, updatedAt: base.startedAt,
+      }]}
+      terminal={false}
+    />));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(container.textContent).toContain('running');
+    expect(container.textContent).toContain('usage pending');
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(container.querySelectorAll('.runner-observation-grid article')).toHaveLength(1);
+    expect(container.textContent).toContain('succeeded');
+    expect(container.textContent).toContain('100');
+    const follow = [...container.querySelectorAll('button')].find((button) => button.textContent === 'following')!;
+    act(() => follow.click());
+    const calls = observations.mock.calls.length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(4_000); });
+    expect(observations).toHaveBeenCalledTimes(calls);
   });
 });
 

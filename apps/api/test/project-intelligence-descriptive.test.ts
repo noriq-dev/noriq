@@ -98,6 +98,28 @@ describe('descriptive Project Intelligence queries (PLNR-294)', () => {
     expect(aggregate.supportingCases[0]).toMatchObject({ taskId: 'task_original', orchestrationId: 'orc_original' });
   });
 
+  it('keeps RunnerJob task episodes in an explicit source denominator', () => {
+    const legacy = episode(1, 'worker', 25);
+    const runnerJob = ProjectIntelligenceEpisode.parse({
+      ...episode(2, 'reviewer', 75),
+      identity: {
+        ...episode(2, 'reviewer', 75).identity,
+        episodeId: 'epi_runner_job_task', runId: 'runner_job:job_1:task:task_original',
+        workSource: { kind: 'runner_job', jobId: 'job_1', scope: 'task', taskId: 'task_original' },
+      },
+    });
+    const scoped = aggregateHistoricalAnalytics({
+      episodes: [legacy, runnerJob], scannedRows: 2, truncated: false,
+      query: { from: at, to: at, scope: 'runner_job_tasks', groupBy: 'work_source' },
+      generation, observedAt: at,
+    });
+    expect(scoped.filter.scope).toBe('runner_job_tasks');
+    expect(scoped.coverage.matchedSittings).toBe(1);
+    expect(scoped.groups).toHaveLength(1);
+    expect(scoped.groups[0]).toMatchObject({ value: 'runner_job', sample: { sittings: 1 } });
+    expect(scoped.groups[0]!.metrics.tokens).toMatchObject({ total: 75, denominator: 1 });
+  });
+
   it('reads only the active completed generation and paginates canonical sitting cases', async () => {
     const projectId = (await mcpCall(owner.apiKey, 'create_project', {
       key: 'PIDESC', name: 'Project intelligence descriptive query',

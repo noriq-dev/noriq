@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import {
   api, type ApiAnalyticsGroup, type ApiComparisonMetric, type ApiIntelligenceCase,
-  type ApiIntelligenceDimension, type ApiProjectIntelligence, type ApiStrategyDimension,
+  type ApiIntelligenceDimension, type ApiIntelligenceScope, type ApiProjectIntelligence,
+  type ApiRunnerJobIntelligenceHistory, type ApiStrategyDimension,
 } from '../api';
 import type { AppStore } from '../store';
 import { MonoTag, SectionLabel } from './bits';
@@ -27,10 +28,12 @@ export function IntelligenceView({ store }: { store: AppStore }) {
   const pid = store.currentPid;
   const [days, setDays] = useState(30);
   const [groupBy, setGroupBy] = useState<ApiIntelligenceDimension>('executed_workflow');
+  const [scope, setScope] = useState<ApiIntelligenceScope>('runner_job_tasks');
   const [dimension, setDimension] = useState<ApiStrategyDimension>('workflow');
   const [metric, setMetric] = useState<ApiComparisonMetric>('run_success');
   const [packet, setPacket] = useState<ApiProjectIntelligence | null>(null);
   const [cases, setCases] = useState<ApiIntelligenceCase[]>([]);
+  const [runnerHistory, setRunnerHistory] = useState<ApiRunnerJobIntelligenceHistory | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -44,11 +47,17 @@ export function IntelligenceView({ store }: { store: AppStore }) {
     const to = new Date();
     const from = new Date(to.getTime() - days * 86_400_000);
     try {
-      const next = await api.projectIntelligence(pid, {
-        from: from.toISOString(), to: to.toISOString(), groupBy, caseCursor: cursor, caseLimit: 24,
-        comparison: { dimension, metric },
-      });
+      const [next, durableRunnerHistory] = await Promise.all([
+        api.projectIntelligence(pid, {
+          from: from.toISOString(), to: to.toISOString(), groupBy, scope,
+          caseCursor: cursor, caseLimit: 24, comparison: { dimension, metric },
+        }),
+        api.runnerJobIntelligenceHistory(pid, {
+          from: from.toISOString(), to: to.toISOString(), limit: 100,
+        }),
+      ]);
       setPacket(next);
+      setRunnerHistory(durableRunnerHistory);
       const page = next.analytics.historical.state === 'available' ? next.analytics.historical.result.cases.items : [];
       setCases((current) => cursor ? [...current, ...page] : page);
     } catch (cause) {
@@ -57,9 +66,9 @@ export function IntelligenceView({ store }: { store: AppStore }) {
       setLoading(false); setLoadingMore(false);
     }
   };
-  useEffect(() => { setPacket(null); setCases([]); void load(); }, [pid, days, groupBy, dimension, metric]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { setPacket(null); setCases([]); setRunnerHistory(null); void load(); }, [pid, days, groupBy, scope, dimension, metric]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const navigate = (view: 'executions' | 'memory', params: Record<string, string | null>) => {
+  const navigate = (view: 'executions' | 'memory' | 'runs', params: Record<string, string | null>) => {
     const query = new URLSearchParams();
     for (const [key, value] of Object.entries(params)) if (value) query.set(key, value);
     history.pushState(null, '', `/p/${encodeURIComponent(pid)}/${view}${query.size ? `?${query}` : ''}`);
@@ -92,6 +101,14 @@ export function IntelligenceView({ store }: { store: AppStore }) {
             <option value="configuration">Configuration</option><option value="stage">Stage</option><option value="role">Role</option>
           </Select>
         </label>
+        <label style={{ ...mono, flex: phone ? '1 1 100%' : undefined }}>Evidence scope
+          <Select variant={phone ? 'micro' : undefined} aria-label="Evidence scope" value={scope} onChange={(e) => setScope(e.target.value as ApiIntelligenceScope)} style={{ marginTop: 5, minWidth: phone ? 0 : 180, width: phone ? '100%' : undefined }}>
+            <option value="runner_job_tasks">RunnerJob tasks</option>
+            <option value="runner_runs">Legacy Runs</option>
+            <option value="copilot_claims">Copilot claims</option>
+            <option value="all">All task episodes</option>
+          </Select>
+        </label>
       </header>
 
       {error && <div role="alert" style={{ ...card, borderColor: 'var(--red-soft)', marginBottom: 14 }}>{error}</div>}
@@ -111,11 +128,49 @@ export function IntelligenceView({ store }: { store: AppStore }) {
         </div>
       </section>
 
+      <section aria-labelledby="runner-job-intelligence" style={{ marginBottom: 22 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
+          <h2 id="runner-job-intelligence" style={{ fontSize: 14, margin: 0 }}>RunnerJob permanent summaries</h2>
+          <MonoTag color="var(--green)" bg="rgba(63,217,139,.1)" size={8}>JOB + TASK DENOMINATORS</MonoTag>
+          <span style={mono}>job overhead is never allocated to tasks</span>
+        </div>
+        {!runnerHistory || !runnerHistory.jobs.length
+          ? <State inline title="No RunnerJob summaries in this range" detail="Summaries appear after a terminal job projects its task episodes." />
+          : <>
+            <div className="intelligence-grid" style={{ marginBottom: 10 }}>
+              <EvidenceCard title="Jobs" primary={`${runnerHistory.jobs.length}`} details="One permanent record per dispatched task or plan job." />
+              <EvidenceCard title="Task episodes" primary={`${runnerHistory.tasks.length}`} details="One task-scoped historical case per RunnerJob snapshot task." />
+              <EvidenceCard title="Projection coverage" primary={`${runnerHistory.jobs.reduce((sum, job) => sum + job.taskEpisodeCount, 0)}/${runnerHistory.jobs.reduce((sum, job) => sum + job.taskCount, 0)}`} details={runnerHistory.truncated ? 'Latest 100 jobs shown; range is truncated.' : 'Projected task episodes / commissioned tasks.'} />
+            </div>
+            <div className="intelligence-groups">
+              {runnerHistory.jobs.slice(0, 8).map((job) => {
+                const tokens = ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens']
+                  .reduce((sum, key) => sum + ((job.usage.total[key as keyof typeof job.usage.total] as { value: number | null }).value ?? 0), 0);
+                return <article key={job.jobId} style={card}>
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                    <b style={{ fontSize: 12 }}>{job.sourceKind} job</b>
+                    <MonoTag color="var(--text-mid)" bg="var(--w-06)" size={8}>{job.outcome}</MonoTag>
+                    <span style={{ marginLeft: 'auto', ...mono }}>{fmtDate(job.projectedAt)}</span>
+                  </div>
+                  <div className="intelligence-metrics" style={{ marginTop: 10 }}>
+                    <div><span style={mono}>TASKS</span><b>{job.taskEpisodeCount}/{job.taskCount}</b><small>separate cases</small></div>
+                    <div><span style={mono}>TOKENS</span><b>{fmtNumber(tokens)}</b><small>{job.usage.total.inputTokens.status}</small></div>
+                    <div><span style={mono}>COST</span><b>{job.usage.total.costUsd.value == null ? job.usage.total.costUsd.status : `$${job.usage.total.costUsd.value.toFixed(2)}`}</b><small>{job.usage.total.costUsd.status}</small></div>
+                    <div><span style={mono}>ELAPSED</span><b>{fmtDuration(job.timing.elapsedMs)}</b><small>job wall clock</small></div>
+                    <div><span style={mono}>OVERHEAD</span><b>{job.overhead.observations.observationCount}</b><small>observations</small></div>
+                  </div>
+                  <div style={{ marginTop: 10 }}><Button variant="ghost" onClick={() => navigate('runs', { job: job.jobId })}>Open job evidence</Button></div>
+                </article>;
+              })}
+            </div>
+          </>}
+      </section>
+
       <section aria-labelledby="history-intelligence" style={{ marginBottom: 22 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
-          <h2 id="history-intelligence" style={{ fontSize: 14, margin: 0 }}>Historical execution</h2>
+          <h2 id="history-intelligence" style={{ fontSize: 14, margin: 0 }}>Historical task episodes</h2>
           <MonoTag color="var(--amber)" bg="rgba(245,166,35,.1)" size={8}>FROZEN GENERATION</MonoTag>
-          <span style={mono}>{historical.state === 'available' ? `completed ${fmtDate(historical.result.generation.completedAt)}` : `state: ${packet.analytics.health.state}`}</span>
+          <span style={mono}>{historical.state === 'available' ? `${historical.result.filter.scope.replaceAll('_', ' ')} · completed ${fmtDate(historical.result.generation.completedAt)}` : `state: ${packet.analytics.health.state}`}</span>
         </div>
         {historical.state === 'unavailable'
           ? <State inline title="No complete analytics generation" detail={`${historical.reason}. Live coordination above remains available.`} />
@@ -145,11 +200,12 @@ export function IntelligenceView({ store }: { store: AppStore }) {
       {(!phone || casesOpen) && <section aria-labelledby="case-intelligence">
         <h2 id="case-intelligence" style={{ fontSize: 14, margin: '0 0 8px' }}>Canonical case drill-down</h2>
         <div style={{ ...card, padding: 0, overflow: 'hidden' }}>
-          {!cases.length ? <div style={{ padding: 18, color: 'var(--text-dim)' }}>No cases in this bounded page.</div> : cases.map((item) => <div key={item.episodeId} className="intelligence-case">
-            <div style={{ minWidth: 0, flex: 1 }}><b style={{ fontSize: 12 }}>Run {item.runId} · sitting {item.sitting}</b><div style={{ ...mono, overflow: 'hidden', textOverflow: 'ellipsis' }}>episode {item.episodeId}{item.taskId ? ` · task ${item.taskId}` : ''}{item.planId ? ` · plan ${item.planId}` : ''}</div></div>
+          {!cases.length ? <div style={{ padding: 18, color: 'var(--text-dim)' }}>No cases in this bounded page.</div> : cases.map((item) => { const runnerJobId = item.runId.startsWith('runner_job:') ? item.runId.split(':')[1] ?? null : null; return <div key={item.episodeId} className="intelligence-case">
+            <div style={{ minWidth: 0, flex: 1 }}><b style={{ fontSize: 12 }}>{runnerJobId ? 'RunnerJob task episode' : `Run ${item.runId} · sitting ${item.sitting}`}</b><div style={{ ...mono, overflow: 'hidden', textOverflow: 'ellipsis' }}>episode {item.episodeId}{item.taskId ? ` · task ${item.taskId}` : ''}{item.planId ? ` · plan ${item.planId}` : ''}</div></div>
+            {runnerJobId && <Button variant="ghost" onClick={() => navigate('runs', { job: runnerJobId })}>RunnerJob</Button>}
             {item.orchestrationId && <Button variant="ghost" onClick={() => navigate('executions', { orchestration: item.orchestrationId, execution: item.executionId })}>Execution</Button>}
             <Button variant="ghost" onClick={() => navigate('memory', { q: item.episodeId })}>Evidence</Button>
-          </div>)}
+          </div>; })}
           {nextCursor && <div style={{ padding: 12, borderTop: '1px solid var(--w-07)', textAlign: 'center' }}><Button variant="ghost" disabled={loadingMore} onClick={() => void load(nextCursor)}>{loadingMore ? 'Loading…' : 'Load more cases'}</Button></div>}
         </div>
       </section>}

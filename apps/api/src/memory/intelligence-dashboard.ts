@@ -3,7 +3,9 @@
 // different observation times. The browser renders these decisions; it does not join sources,
 // calculate denominators, or decide whether a comparison is eligible.
 import type { Env } from '../env';
-import type { HistoricalAnalyticsDimension, HistoricalAnalyticsResult } from './analytics-query';
+import type {
+  HistoricalAnalyticsDimension, HistoricalAnalyticsResult, HistoricalAnalyticsScope,
+} from './analytics-query';
 import { getCurrentProjectFlowSummary, getProjectAnalyticsHealth, type CurrentProjectFlowSummary } from './analytics';
 import {
   queryStrategyComparison, type ComparisonMetric, type StrategyComparisonResult, type StrategyDimension,
@@ -32,7 +34,8 @@ export interface ProjectIntelligenceDashboard {
 
 type DashboardMemory = {
   queryHistoricalAnalytics(projectId: string, query: {
-    from: string; to: string; groupBy?: HistoricalAnalyticsDimension; caseCursor?: string; caseLimit: number;
+    from: string; to: string; groupBy?: HistoricalAnalyticsDimension; scope?: HistoricalAnalyticsScope;
+    caseCursor?: string; caseLimit: number;
   }): Promise<HistoricalAnalyticsResult>;
 };
 
@@ -40,6 +43,7 @@ export async function getProjectIntelligenceDashboard(env: Env, projectId: strin
   from: string;
   to: string;
   groupBy?: HistoricalAnalyticsDimension;
+  scope?: HistoricalAnalyticsScope;
   caseCursor?: string;
   caseLimit: number;
   comparison?: { dimension: StrategyDimension; metric: ComparisonMetric };
@@ -54,7 +58,7 @@ export async function getProjectIntelligenceDashboard(env: Env, projectId: strin
     historical = {
       state: 'available',
       result: await memory.queryHistoricalAnalytics(projectId, {
-        from: input.from, to: input.to, groupBy: input.groupBy,
+        from: input.from, to: input.to, groupBy: input.groupBy, scope: input.scope,
         caseCursor: input.caseCursor, caseLimit: input.caseLimit,
       }),
     };

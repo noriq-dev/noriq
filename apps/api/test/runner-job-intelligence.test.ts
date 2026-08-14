@@ -1,4 +1,4 @@
-import { env } from 'cloudflare:test';
+import { env, SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import type { Actor, CreateRunnerJobInput, RunnerJobView } from '../src/do/ProjectRoom';
 import type { Env } from '../src/env';
@@ -38,6 +38,7 @@ const revision = 'd'.repeat(40);
 let projectId: string;
 let runnerId: string;
 let room: RoomRpc;
+let cookie: string;
 
 const actor = {
   kind: 'agent' as const, driver: 'codex', vendor: 'openai', model: 'gpt-test',
@@ -58,10 +59,10 @@ const evidence = (changedPathCount: number | null) => ({
 
 beforeAll(async () => {
   await createUser('runner-job-intelligence@example.com', 'Runner Intelligence', 'longenough1', 'member').catch(() => {});
-  const cookie = await loginSession('runner-job-intelligence@example.com', 'longenough1');
+  cookie = await loginSession('runner-job-intelligence@example.com', 'longenough1');
   const user = await env.DB.prepare('SELECT id FROM users WHERE email = ?')
     .bind('runner-job-intelligence@example.com').first<{ id: string }>();
-  const response = await (await import('cloudflare:test')).SELF.fetch('https://noriq.test/api/projects', {
+  const response = await SELF.fetch('https://noriq.test/api/projects', {
     method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
     body: JSON.stringify({ key: `RJI${crypto.randomUUID().slice(0, 5).toUpperCase()}`, name: 'runner intelligence projection' }),
   });
@@ -164,6 +165,16 @@ describe('RunnerJob durable intelligence projection (PLNR-510)', () => {
     expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM runner_job_intelligence_tasks WHERE job_id = ?')
       .bind(job.id).first<{ n: number }>()).toEqual({ n: 2 });
 
+    const intelligenceResponse = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/runner-jobs/${job.id}/intelligence`,
+      { headers: { Cookie: cookie } },
+    );
+    expect(intelligenceResponse.status).toBe(200);
+    expect(await intelligenceResponse.json()).toMatchObject({
+      state: 'available', job: { jobId: job.id, taskCount: 2, taskEpisodeCount: 2 },
+      tasks: [{ taskId: first.id, episodeId: projected.episodeIds[0] }, { taskId: second.id }],
+    });
+
     const memory = appEnv.PROJECT_MEMORY.get(
       appEnv.PROJECT_MEMORY.idFromName(projectId),
     ) as unknown as MemoryRpc;
@@ -202,5 +213,15 @@ describe('RunnerJob durable intelligence projection (PLNR-510)', () => {
     expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM runner_job_intelligence_tasks WHERE job_id = ?')
       .bind(job.id).first<{ n: number }>()).toEqual({ n: 2 });
     expect(await memory._getEpisodeForTest(projectId, firstRunId, 1)).not.toBeNull();
+    const observationsResponse = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/runner-jobs/${job.id}/observations`,
+      { headers: { Cookie: cookie } },
+    );
+    expect(await observationsResponse.json()).toMatchObject({ observations: [], expired: true });
+    const detailResponse = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/runner-jobs/${job.id}`,
+      { headers: { Cookie: cookie } },
+    );
+    expect(await detailResponse.json()).toMatchObject({ events: [], job: { detailPrunedAt: expect.any(String) } });
   }, 60_000);
 });

@@ -1,6 +1,6 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api, type ApiProjectIntelligence } from '../api';
 import type { AppStore } from '../store';
 import { IntelligenceView } from './IntelligenceView';
@@ -34,7 +34,7 @@ const packet: ApiProjectIntelligence = {
     freshness: { state: 'current', liveObservedAt: '2026-08-10T05:00:00.000Z', generationCompletedAt: '2026-08-10T04:00:00.000Z', gapMs: 3_600_000, label: 'analytics current with known sources' },
     historical: { state: 'available', result: {
       observedAt: '2026-08-10T05:00:00.000Z', generation: { id: 'ang_1', completedAt: '2026-08-10T04:00:00.000Z', completeness: {} },
-      filter: { from: '2026-07-10T00:00:00.000Z', to: '2026-08-10T00:00:00.000Z', groupBy: 'executed_workflow', filters: [] },
+      filter: { from: '2026-07-10T00:00:00.000Z', to: '2026-08-10T00:00:00.000Z', scope: 'runner_job_tasks', groupBy: 'executed_workflow', filters: [] },
       coverage: { complete: true, scannedRows: 1, matchedSittings: 1, reasons: [], qualityEventsScanned: 0, unassociatedQualityEvents: 0 },
       groups: [{
         dimension: 'executed_workflow', value: 'build', provenance: { source: 'derived_generation', generationId: 'ang_1', generationCompletedAt: '2026-08-10T04:00:00.000Z' },
@@ -50,6 +50,13 @@ const packet: ApiProjectIntelligence = {
   comparison: { dimension: 'workflow', metric: 'run_success', state: 'insufficient_evidence', interpretation: 'insufficient evidence', rows: [], eligibility: { totalCases: 1, eligibleCases: 0, independentClusters: 0, reasons: ['fewer than two comparable strategy cohorts'], policy: {} }, caseAudit: { eligible: [], excluded: [{ caseId: 'run_1/1', episodeId: 'epi_1', reasons: ['no comparison cohort'] }] } },
   bounds: { from: '2026-07-10T00:00:00.000Z', to: '2026-08-10T00:00:00.000Z', caseLimit: 24, groupBy: 'executed_workflow' },
 };
+
+beforeEach(() => {
+  vi.spyOn(api, 'runnerJobIntelligenceHistory').mockResolvedValue({
+    from: '2026-07-10T00:00:00.000Z', to: '2026-08-10T00:00:00.000Z',
+    jobs: [], tasks: [], truncated: false,
+  });
+});
 
 afterEach(() => { act(() => root?.unmount()); container?.remove(); root = null; window.matchMedia = originalMatchMedia; vi.restoreAllMocks(); history.replaceState(null, '', '/'); });
 
@@ -84,7 +91,8 @@ describe('Project Intelligence surface (PLNR-302)', () => {
     expect(container.textContent).toContain('insufficient evidence');
     expect(container.textContent).toContain('fewer than two comparable strategy cohorts');
     expect(api.projectIntelligence).toHaveBeenCalledWith('prj_1', expect.objectContaining({
-      caseLimit: 24, groupBy: 'executed_workflow', comparison: { dimension: 'workflow', metric: 'run_success' },
+      caseLimit: 24, groupBy: 'executed_workflow', scope: 'runner_job_tasks',
+      comparison: { dimension: 'workflow', metric: 'run_success' },
     }));
   });
 

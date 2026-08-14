@@ -1,12 +1,16 @@
 // Runner Jobs — the minimal protocol-v2 control-plane surface. Noriq chooses only
 // the immutable task/plan target and a runner repository; the committed project
 // configuration remains the authority for models, workflows, budgets, and Git mode.
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
   type ApiRun,
   type ApiRunner,
   type ApiRunnerJobDetail,
+  type ApiRunnerJobIntelligenceDetail,
+  type ApiRunnerJobMetric,
+  type ApiRunnerJobObservation,
+  type ApiRunnerJobObservationPage,
   type ApiRunnerJobOutput,
   type ApiRunnerJobSummary,
   type RunnerJobStatus,
@@ -76,6 +80,11 @@ export function RunsView({ store }: { store: AppStore }) {
   const [showDispatch, setShowDispatch] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  useEffect(() => {
+    const requestedJob = new URLSearchParams(window.location.search).get('job');
+    if (requestedJob) setSelectedId(requestedJob);
+  }, [pid]);
+
   const load = async () => {
     if (!pid) return;
     try {
@@ -138,7 +147,7 @@ export function RunsView({ store }: { store: AppStore }) {
           {error && <ErrorNote>{error}</ErrorNote>}
         </section>
 
-        <section style={{ display: 'grid', gridTemplateColumns: 'minmax(300px, .9fr) minmax(0, 1.5fr)', gap: 14 }}>
+        <section className="runner-job-layout">
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             {sortedJobs.map((job) => (
               <JobRow
@@ -157,6 +166,7 @@ export function RunsView({ store }: { store: AppStore }) {
             {detail ? (
               <JobDetail
                 detail={detail}
+                projectId={pid}
                 onRefresh={load}
                 onCancel={async () => {
                   if (!(await confirm('Cancel this Runner job? Accepted commits remain on its local output branch.'))) return;
@@ -321,8 +331,9 @@ function JobRow({ job, title, selected, onClick }: { job: ApiRunnerJobSummary; t
   );
 }
 
-function JobDetail({ detail, onRefresh, onCancel, onLand }: {
+function JobDetail({ detail, projectId, onRefresh, onCancel, onLand }: {
   detail: ApiRunnerJobDetail;
+  projectId: string;
   onRefresh: () => Promise<void>;
   onCancel: () => Promise<void>;
   onLand: () => Promise<void>;
@@ -372,9 +383,229 @@ function JobDetail({ detail, onRefresh, onCancel, onLand }: {
           </div>
         ))}
       </Section>
+      <ObservationInspector
+        projectId={projectId}
+        jobId={job.id}
+        items={items}
+        terminal={TERMINAL_JOBS.includes(job.status)}
+      />
       {output && <Output output={output} job={job} />}
     </div>
   );
+}
+
+function metricText(metric: ApiRunnerJobMetric | null, suffix = ''): string {
+  if (!metric || metric.value == null) return metric?.status?.replace('_', ' ') ?? 'pending';
+  return `${metric.value.toLocaleString()}${suffix}${metric.status === 'partial' ? ' partial' : ''}`;
+}
+
+function durationText(value: number | null): string {
+  if (value == null) return 'unavailable';
+  if (value < 1_000) return `${value}ms`;
+  if (value < 60_000) return `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)}s`;
+  return `${(value / 60_000).toFixed(1)}m`;
+}
+
+function observationLabel(observation: ApiRunnerJobObservation, items: ApiRunnerJobDetail['items']): string {
+  if (!observation.taskId) return 'job overhead';
+  return items.find((item) => item.taskId === observation.taskId)?.taskKey ?? observation.taskId;
+}
+
+export function ObservationInspector({ projectId, jobId, items, terminal }: {
+  projectId: string;
+  jobId: string;
+  items: ApiRunnerJobDetail['items'];
+  terminal: boolean;
+}) {
+  const [filter, setFilter] = useState('all');
+  const [follow, setFollow] = useState(true);
+  const [observations, setObservations] = useState<ApiRunnerJobObservation[]>([]);
+  const [page, setPage] = useState<ApiRunnerJobObservationPage | null>(null);
+  const [summary, setSummary] = useState<ApiRunnerJobIntelligenceDetail | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const cursor = useRef(0);
+  const loading = useRef(false);
+  const generation = useRef(0);
+
+  const loadSummary = async (requestGeneration = generation.current) => {
+    try {
+      const result = await api.runnerJobIntelligence(projectId, jobId);
+      if (requestGeneration === generation.current) setSummary(result);
+    }
+    catch { /* Projection can legitimately still be pending while the job runs. */ }
+  };
+  const pull = async (reset = false, requestGeneration = generation.current) => {
+    if (loading.current) return;
+    loading.current = true;
+    try {
+      if (reset) cursor.current = 0;
+      let nextAfter = cursor.current;
+      let latest: ApiRunnerJobObservationPage | null = null;
+      for (let pageIndex = 0; pageIndex < 5; pageIndex++) {
+        const replaceThisPage = reset && pageIndex === 0;
+        const response = await api.runnerJobObservations(projectId, jobId, {
+          afterSeq: nextAfter,
+          limit: 100,
+          ...(filter !== 'all' && filter !== 'overhead' ? { taskId: filter } : {}),
+        });
+        if (requestGeneration !== generation.current) return;
+        latest = response;
+        const visible = filter === 'overhead'
+          ? response.observations.filter((observation) => observation.taskId === null)
+          : response.observations;
+        setObservations((current) => {
+          const merged = new Map((replaceThisPage ? [] : current).map((observation) => [observation.observationId, observation]));
+          for (const observation of visible) merged.set(observation.observationId, observation);
+          return [...merged.values()].sort((left, right) => left.cursorSeq - right.cursorSeq);
+        });
+        nextAfter = response.cursor.nextSeq;
+        if (!response.cursor.hasMore) break;
+      }
+      cursor.current = nextAfter;
+      if (latest) setPage(latest);
+      setError(null);
+      if (terminal || latest?.expired) await loadSummary(requestGeneration);
+    } catch (cause) {
+      if (requestGeneration === generation.current) {
+        setError(cause instanceof Error ? cause.message : 'Unable to read RunnerJob observations');
+      }
+    } finally {
+      if (requestGeneration === generation.current) loading.current = false;
+    }
+  };
+
+  useEffect(() => {
+    generation.current++;
+    loading.current = false;
+    const requestGeneration = generation.current;
+    setObservations([]);
+    setPage(null);
+    setSummary(null);
+    cursor.current = 0;
+    void pull(true, requestGeneration);
+    void loadSummary(requestGeneration);
+    // Reset only when the selected job or observation scope changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, jobId, filter]);
+  useEffect(() => {
+    if (!follow) return;
+    const timer = window.setInterval(() => void pull(), 2_000);
+    return () => window.clearInterval(timer);
+    // Cursor lives in a ref so pausing and resuming never resets it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, jobId, filter, follow, terminal]);
+
+  const timing = page?.timing.server;
+  return <Section title="Stage observations">
+    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'end', marginBottom: 10 }}>
+      <label style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)', flex: '1 1 180px' }}>
+        Scope
+        <Select
+          aria-label="Observation scope"
+          value={filter}
+          onChange={(event) => setFilter(event.target.value)}
+          style={{ marginTop: 4, width: '100%' }}
+        >
+          <option value="all">all tasks + job overhead</option>
+          <option value="overhead">job overhead only</option>
+          {items.map((item) => <option key={item.taskId} value={item.taskId}>{item.taskKey}</option>)}
+        </Select>
+      </label>
+      <Button variant={follow ? 'primary' : 'ghost'} onClick={() => setFollow((value) => !value)}>
+        {follow ? 'following' : 'resume follow'}
+      </Button>
+      <Button variant="ghost" onClick={() => void pull()}>{follow ? 'refresh now' : 'refresh paused view'}</Button>
+    </div>
+    {page?.expired && <div role="status" style={{ padding: 10, borderRadius: 8, border: '1px solid var(--amber)', color: 'var(--text-mid)', fontSize: 11.5, marginBottom: 10 }}>
+      Detailed stage evidence expired after 90 days. The permanent job and task summaries remain below.
+    </div>}
+    {page?.partial && !page.expired && <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: '#f5a623', marginBottom: 8 }}>
+      LIVE PARTIAL · running stages do not have duration or usage until their finish evidence arrives
+    </div>}
+    {timing && <div className="runner-observation-timing">
+      <TimingFact label="queue" value={durationText(timing.queueMs)} />
+      <TimingFact label="elapsed" value={durationText(timing.elapsedMs)} />
+      <TimingFact label="human wait" value={durationText(timing.humanWaitMs)} />
+      <TimingFact label="landing" value={durationText(timing.landing.durationMs)} />
+    </div>}
+    {error && <ErrorNote>{error}</ErrorNote>}
+    <div className="runner-observation-grid">
+      {[...observations].reverse().map((observation) => <ObservationCard
+        key={observation.observationId}
+        observation={observation}
+        scope={observationLabel(observation, items)}
+      />)}
+    </div>
+    {!observations.length && !error && <EmptyState>{page?.expired ? 'detailed evidence expired' : 'no observations in this scope yet'}</EmptyState>}
+    {summary && <PermanentRunnerJobSummary summary={summary} />}
+  </Section>;
+}
+
+function TimingFact({ label, value }: { label: string; value: string }) {
+  return <div><span>{label}</span><b>{value}</b></div>;
+}
+
+function ObservationCard({ observation, scope }: { observation: ApiRunnerJobObservation; scope: string }) {
+  const color = observation.status === 'succeeded' ? 'var(--green)'
+    : observation.status === 'running' ? 'var(--blue)'
+      : observation.status === 'skipped' ? 'var(--text-dim)' : 'var(--red-soft)';
+  const usage = observation.usage;
+  return <article style={{ border: '1px solid var(--w-07)', borderRadius: 9, padding: 11, background: 'var(--w-02)', minWidth: 0 }}>
+    <div style={{ display: 'flex', gap: 7, alignItems: 'center', flexWrap: 'wrap' }}>
+      <MonoTag color={color} bg="var(--w-06)" size={8}>{observation.status}</MonoTag>
+      <b style={{ fontSize: 12 }}>{observation.stage}</b>
+      <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>attempt {observation.attempt}</span>
+      <span style={{ marginLeft: 'auto', fontFamily: 'var(--mono)', fontSize: 9.5, color: observation.taskId ? 'var(--text-mid)' : '#f5a623' }}>{scope}</span>
+    </div>
+    <div style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)', marginTop: 7, overflowWrap: 'anywhere' }}>
+      {observation.actor.role ?? observation.actor.kind} · {observation.actor.driver}
+      {observation.actor.model ? ` / ${observation.actor.model}` : ''} · {observation.actor.operation}
+    </div>
+    <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 8, fontFamily: 'var(--mono)', fontSize: 9.5 }}>
+      <span>time <b>{metricText(observation.duration, 'ms')}</b></span>
+      {usage ? <>
+        <span>in <b>{metricText(usage.inputTokens)}</b></span>
+        <span>out <b>{metricText(usage.outputTokens)}</b></span>
+        <span>cache r/w <b>{metricText(usage.cacheReadTokens)} / {metricText(usage.cacheWriteTokens)}</b></span>
+        <span>calls <b>{metricText(usage.calls)}</b></span>
+        <span>cost <b>{usage.costUsd.value == null ? usage.costUsd.status.replace('_', ' ') : `$${usage.costUsd.value.toFixed(4)}${usage.costUsd.status === 'partial' ? ' partial' : ''}`}</b></span>
+      </> : <span style={{ color: 'var(--text-dim)' }}>usage pending</span>}
+    </div>
+    {observation.recovery && observation.recovery !== 'none' && <div style={{ marginTop: 7, fontFamily: 'var(--mono)', fontSize: 9.5, color: '#f5a623' }}>
+      recovered by {observation.recovery.replace('_', ' ')}
+    </div>}
+  </article>;
+}
+
+function PermanentRunnerJobSummary({ summary }: { summary: ApiRunnerJobIntelligenceDetail }) {
+  if (summary.state === 'pending' || !summary.job) {
+    return <div style={{ marginTop: 12, fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)' }}>Permanent summary projection pending.</div>;
+  }
+  const job = summary.job;
+  const tokens = (job.usage.total.inputTokens.value ?? 0)
+    + (job.usage.total.outputTokens.value ?? 0)
+    + (job.usage.total.cacheReadTokens.value ?? 0)
+    + (job.usage.total.cacheWriteTokens.value ?? 0);
+  return <div style={{ marginTop: 14, borderTop: '1px solid var(--w-07)', paddingTop: 12 }}>
+    <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+      <b style={{ fontSize: 12 }}>Permanent job summary</b>
+      <MonoTag color="var(--green)" bg="rgba(63,217,139,.1)" size={8}>PROJECTED</MonoTag>
+      <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)' }}>{new Date(job.projectedAt).toLocaleString()}</span>
+    </div>
+    <div className="runner-observation-timing" style={{ marginTop: 8 }}>
+      <TimingFact label="tasks" value={`${job.taskEpisodeCount}/${job.taskCount}`} />
+      <TimingFact label="tokens" value={`${tokens.toLocaleString()} · ${job.usage.total.inputTokens.status}`} />
+      <TimingFact label="cost" value={job.usage.total.costUsd.value == null ? job.usage.total.costUsd.status : `$${job.usage.total.costUsd.value.toFixed(4)} · ${job.usage.total.costUsd.status}`} />
+      <TimingFact label="overhead" value={`${job.overhead.observations.observationCount} observations`} />
+    </div>
+    <div style={{ marginTop: 9, display: 'flex', flexDirection: 'column', gap: 5 }}>
+      {summary.tasks.map((task) => <div key={task.taskId} style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 11 }}>
+        <MonoTag color="var(--text-mid)" bg="var(--w-06)" size={8}>{task.outcome}</MonoTag>
+        <b>{task.taskKey}</b><span style={{ color: 'var(--text-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{task.taskTitle}</span>
+        <span style={{ marginLeft: 'auto', fontFamily: 'var(--mono)', fontSize: 9.5 }}>{task.usage.inputTokens.status}</span>
+      </div>)}
+    </div>
+  </div>;
 }
 
 function Question({ projectId, pid: jobId, question, onAnswered }: { projectId: string; pid: string; question: ApiRunnerJobDetail['questions'][number]; onAnswered: () => Promise<void> }) {

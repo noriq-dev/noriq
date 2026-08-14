@@ -148,6 +148,12 @@ button { all: unset; box-sizing: border-box; max-width: 100%; }
 .intelligence-metrics b { font-size: 13px; overflow-wrap: anywhere; }
 .intelligence-metrics small { font-family: var(--mono); font-size: 8px; color: var(--text-faint); }
 .intelligence-case { display: flex; gap: 8px; align-items: center; padding: 11px 13px; border-bottom: 1px solid var(--w-07); }
+.runner-job-layout { display: grid; grid-template-columns: minmax(300px, .9fr) minmax(0, 1.5fr); gap: 14px; }
+.runner-observation-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.runner-observation-timing { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; margin-bottom: 10px; }
+.runner-observation-timing > div { min-width: 0; border: 1px solid var(--w-06); border-radius: 7px; padding: 7px 8px; display: flex; flex-direction: column; gap: 3px; }
+.runner-observation-timing span { font-family: var(--mono); font-size: 8.5px; color: var(--text-dim); text-transform: uppercase; }
+.runner-observation-timing b { font-family: var(--mono); font-size: 10.5px; overflow-wrap: anywhere; }
 .dispatch-intelligence-cases { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
 .project-settings-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .project-settings-grant-row { display: grid; grid-template-columns: 58px minmax(120px, 1fr) 145px auto; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--w-05); }
@@ -164,6 +170,9 @@ button { all: unset; box-sizing: border-box; max-width: 100%; }
   .intelligence-groups { grid-template-columns: 1fr; }
   .intelligence-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .intelligence-case { align-items: stretch; flex-wrap: wrap; }
+  .runner-job-layout { grid-template-columns: 1fr; }
+  .runner-observation-grid { grid-template-columns: 1fr; }
+  .runner-observation-timing { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   input, select, textarea { font-size: 16px !important; }
   button, [role='button'], summary { min-height: 44px; }
 }
