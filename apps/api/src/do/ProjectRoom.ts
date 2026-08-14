@@ -16,6 +16,10 @@ import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
 import { MISSION_CAPABILITY, MissionCommission as MissionCommissionSchema, MissionRootCommission as MissionRootCommissionSchema, RunnerJobEvent as RunnerJobEventSchema, RunnerJobRevision, RunnerJobSource as RunnerJobSourceSchema, RunKind, AgentTool, RunStatus, ExecutionProfileOffer, type AcceptedRevisionHandoff, type AcceptedRevisionHandoffView, type CommissionedExecutionProfile, type MissionCommission, type MissionCommissionSnapshot, type MissionRootCommission, type RunnerJobAssignment, type RunnerJobCheckpoint, type RunnerJobEvent, type RunnerJobSource, type TaskRootMissionCommissionSnapshot, type MissionHandoffAck, type MissionHandoffConsumed, type MissionQuestionAck, type MissionQuestionAnswer, type MissionQuestionPublication, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
 import { readExecutionSpec, writeExecutionSpec } from '../lib/execution-spec';
+import type {
+  RunnerCoordinationAcquire, RunnerCoordinationAcquireResult, RunnerCoordinationExchange,
+  RunnerCoordinationLease, RunnerCoordinationLeaseKind, RunnerCoordinationRecover,
+} from '@noriq-dev/shared';
 import {
   processPendingCopilotEpisodeJob, processPendingEpisodeJob, processPendingRunnerJobEpisodeJob,
 } from '../memory/episodes';
@@ -207,6 +211,51 @@ export interface RunnerJobView {
   createdAt: string;
   updatedAt: string;
   assignment: RunnerJobAssignment;
+}
+
+type RunnerCoordinationLeaseRow = {
+  leaseId: string; projectId: string; runnerId: string; checkoutId: string; jobId: string;
+  assignmentId: string; taskId: string | null; idempotencyKey: string; repositoryKey: string;
+  lane: string; kind: RunnerCoordinationLeaseKind; paths: string; fencingToken: number;
+  expiresAt: string; releasedAt: string | null; lastExchangeFromFence?: number | null;
+  lastExchangeScope?: string | null;
+};
+
+function normalizeCoordinationPaths(paths: string[]): string[] {
+  return [...new Set(paths.map((path) => {
+    const normalized = path.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/{2,}/g, '/');
+    const parts = normalized.split('/');
+    if (!normalized || normalized.startsWith('/') || parts.some((part) => !part || part === '.' || part === '..')) {
+      throw new Error(`invalid coordination path: ${path}`);
+    }
+    return parts.join('/');
+  }))].sort();
+}
+
+function coordinationScopesConflict(
+  left: { repositoryKey: string; lane: string; kind: RunnerCoordinationLeaseKind; paths: string[] },
+  right: { repositoryKey: string; lane: string; kind: RunnerCoordinationLeaseKind; paths: string[] },
+): boolean {
+  if (left.repositoryKey !== right.repositoryKey || left.lane !== right.lane) return false;
+  if (left.kind === 'repository' || right.kind === 'repository') return true;
+  if (left.kind === 'landing' || right.kind === 'landing') {
+    return left.kind === 'landing' && right.kind === 'landing';
+  }
+  return left.paths.some((a) => right.paths.some((b) => a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`)));
+}
+
+function coordinationLeaseMatches(row: RunnerCoordinationLeaseRow, lease: RunnerCoordinationLease): boolean {
+  return coordinationLeaseIdentityMatches(row, lease)
+    && row.repositoryKey === lease.repositoryKey && row.lane === lease.lane
+    && row.kind === lease.kind && row.fencingToken === lease.fencingToken
+    && JSON.stringify(JSON.parse(row.paths)) === JSON.stringify(normalizeCoordinationPaths(lease.paths));
+}
+
+function coordinationLeaseIdentityMatches(row: RunnerCoordinationLeaseRow, lease: RunnerCoordinationLease): boolean {
+  return row.leaseId === lease.leaseId && row.projectId === lease.projectId
+    && row.runnerId === lease.runnerId && row.checkoutId === lease.checkoutId
+    && row.jobId === lease.jobId && row.assignmentId === lease.assignmentId
+    && row.taskId === lease.taskId && row.idempotencyKey === lease.idempotencyKey;
 }
 
 export interface RecordQualityEventInput {
@@ -3898,6 +3947,9 @@ export class ProjectRoom extends DurableObject<Env> {
       // project-scoped and orphaned along with everything else once `projects` loses the row.
       // Emitting into a feed that is being deleted in the same batch would be a write to nothing.
       await this.env.DB.batch([
+        this.env.DB.prepare('DELETE FROM runner_coordination_waits WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare('DELETE FROM runner_coordination_leases WHERE project_id = ?').bind(pid),
+        this.env.DB.prepare('DELETE FROM runner_coordination_fences WHERE project_id = ?').bind(pid),
         this.env.DB.prepare('DELETE FROM runner_job_questions WHERE job_id IN (SELECT id FROM runner_jobs WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare('DELETE FROM runner_job_observations WHERE job_id IN (SELECT id FROM runner_jobs WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare('DELETE FROM runner_job_routes WHERE job_id IN (SELECT id FROM runner_jobs WHERE project_id = ?)').bind(pid),
@@ -4866,6 +4918,372 @@ export class ProjectRoom extends DurableObject<Env> {
     });
   }
 
+  private coordinationLeaseView(row: RunnerCoordinationLeaseRow): RunnerCoordinationLease {
+    return {
+      leaseId: row.leaseId, runnerId: row.runnerId, checkoutId: row.checkoutId,
+      projectId: row.projectId, jobId: row.jobId, assignmentId: row.assignmentId,
+      taskId: row.taskId, idempotencyKey: row.idempotencyKey,
+      repositoryKey: row.repositoryKey, lane: row.lane, kind: row.kind,
+      paths: JSON.parse(row.paths) as string[], fencingToken: row.fencingToken,
+      expiresAt: row.expiresAt,
+    };
+  }
+
+  private async validateCoordinationIdentity(input: {
+    projectId: string; runnerId: string; checkoutId: string; jobId: string;
+    assignmentId: string; taskId: string | null;
+  }): Promise<{ orchestrationId: string; status: string }> {
+    const job = await this.env.DB.prepare(
+      `SELECT orchestration_id AS orchestrationId, status, cancel_requested_at AS cancelRequestedAt,
+              repo_ref AS checkoutId
+         FROM runner_jobs
+        WHERE id = ? AND project_id = ? AND runner_id = ? AND assignment_id = ?`,
+    ).bind(input.jobId, input.projectId, input.runnerId, input.assignmentId).first<{
+      orchestrationId: string; status: string; cancelRequestedAt: string | null; checkoutId: string;
+    }>();
+    if (!job || job.checkoutId !== input.checkoutId) throw new Error('stale or foreign coordination assignment');
+    if (job.cancelRequestedAt || !['assigned', 'running', 'waiting'].includes(job.status)) {
+      throw new Error('RunnerJob is no longer accepting coordination effects');
+    }
+    if (input.taskId) {
+      const item = await this.env.DB.prepare(
+        'SELECT 1 AS present FROM runner_job_items WHERE job_id = ? AND task_id = ?',
+      ).bind(input.jobId, input.taskId).first<{ present: number }>();
+      if (!item) throw new Error('coordination lease names a task outside the snapshot');
+    }
+    return job;
+  }
+
+  private async nextCoordinationFence(
+    projectId: string, repositoryKey: string, lane: string, previous = 0,
+  ): Promise<number> {
+    const current = await this.env.DB.prepare(
+      `SELECT fencing_token AS fencingToken FROM runner_coordination_fences
+        WHERE project_id = ? AND repository_key = ? AND lane = ?`,
+    ).bind(projectId, repositoryKey, lane).first<{ fencingToken: number }>();
+    return Math.max(current?.fencingToken ?? 0, previous) + 1;
+  }
+
+  private async coordinationConflicts(
+    projectId: string,
+    scope: { repositoryKey: string; lane: string; kind: RunnerCoordinationLeaseKind; paths: string[] },
+    excludeLeaseId?: string,
+  ): Promise<RunnerCoordinationLeaseRow[]> {
+    const { results } = await this.env.DB.prepare(
+      `SELECT lease_id AS leaseId, project_id AS projectId, runner_id AS runnerId,
+              checkout_id AS checkoutId, job_id AS jobId, assignment_id AS assignmentId,
+              task_id AS taskId, idempotency_key AS idempotencyKey,
+              repository_key AS repositoryKey, lane, kind, paths,
+              fencing_token AS fencingToken, expires_at AS expiresAt, released_at AS releasedAt
+         FROM runner_coordination_leases
+        WHERE project_id = ? AND repository_key = ? AND lane = ?
+          AND released_at IS NULL AND expires_at > ? AND lease_id != ?`,
+    ).bind(projectId, scope.repositoryKey, scope.lane, nowIso(), excludeLeaseId ?? '').all<RunnerCoordinationLeaseRow>();
+    return results.filter((row) => coordinationScopesConflict(scope, {
+      repositoryKey: row.repositoryKey, lane: row.lane, kind: row.kind,
+      paths: JSON.parse(row.paths) as string[],
+    }));
+  }
+
+  private coordinationResumeStatements(jobId: string, orchestrationId: string, at: string): D1PreparedStatement[] {
+    return [
+      this.env.DB.prepare(
+        `UPDATE runner_jobs SET status = 'running', updated_at = ?
+          WHERE id = ? AND status = 'waiting'
+            AND NOT EXISTS (SELECT 1 FROM runner_job_questions WHERE job_id = ? AND state = 'open')
+            AND NOT EXISTS (SELECT 1 FROM runner_coordination_waits WHERE job_id = ?)`,
+      ).bind(at, jobId, jobId, jobId),
+      this.env.DB.prepare(
+        `UPDATE orchestrations SET status = 'running', updated_at = ?, finished_at = NULL
+          WHERE id = ? AND status IN ('pending','parked')
+            AND NOT EXISTS (SELECT 1 FROM runner_coordination_waits WHERE job_id = ?)
+            AND NOT EXISTS (SELECT 1 FROM runner_job_questions WHERE job_id = ? AND state = 'open')`,
+      ).bind(at, orchestrationId, jobId, jobId),
+      this.env.DB.prepare(
+        `UPDATE execution_nodes SET status = 'running', parked_at = NULL,
+                started_at = COALESCE(started_at, ?), updated_at = ?,
+                last_revision = last_revision + 1
+          WHERE orchestration_id = ? AND parent_execution_id IS NULL AND status IN ('pending','parked')
+            AND NOT EXISTS (SELECT 1 FROM runner_coordination_waits WHERE job_id = ?)
+            AND NOT EXISTS (SELECT 1 FROM runner_job_questions WHERE job_id = ? AND state = 'open')`,
+      ).bind(at, at, orchestrationId, jobId, jobId),
+    ];
+  }
+
+  async acquireRunnerCoordinationLease(
+    projectId: string,
+    input: RunnerCoordinationAcquire,
+  ): Promise<RunnerCoordinationAcquireResult> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      if (input.projectId !== projectId) throw new Error('coordination project identity mismatch');
+      const job = await this.validateCoordinationIdentity(input);
+      const paths = normalizeCoordinationPaths(input.paths);
+      if ((input.kind === 'paths') !== (paths.length > 0)) throw new Error('coordination path scope is invalid');
+      const scope = { repositoryKey: input.repositoryKey, lane: input.lane, kind: input.kind, paths };
+      const existing = await this.env.DB.prepare(
+        `SELECT lease_id AS leaseId, project_id AS projectId, runner_id AS runnerId,
+                checkout_id AS checkoutId, job_id AS jobId, assignment_id AS assignmentId,
+                task_id AS taskId, idempotency_key AS idempotencyKey,
+                repository_key AS repositoryKey, lane, kind, paths,
+                fencing_token AS fencingToken, expires_at AS expiresAt, released_at AS releasedAt
+           FROM runner_coordination_leases
+          WHERE job_id = ? AND assignment_id = ? AND idempotency_key = ?`,
+      ).bind(input.jobId, input.assignmentId, input.idempotencyKey).first<RunnerCoordinationLeaseRow>();
+      if (existing && existing.releasedAt === null && existing.expiresAt > nowIso()) {
+        const same = existing.runnerId === input.runnerId && existing.checkoutId === input.checkoutId
+          && existing.taskId === input.taskId && existing.repositoryKey === input.repositoryKey
+          && existing.lane === input.lane && existing.kind === input.kind
+          && JSON.stringify(JSON.parse(existing.paths)) === JSON.stringify(paths);
+        if (!same) throw new Error('coordination idempotency key already names a different lease');
+        return { status: 'acquired', lease: this.coordinationLeaseView(existing) };
+      }
+      const conflicts = await this.coordinationConflicts(projectId, scope, existing?.leaseId);
+      if (conflicts.length) {
+        const at = nowIso();
+        await this.env.DB.batch([
+          this.env.DB.prepare(
+            `INSERT INTO runner_coordination_waits
+               (project_id, runner_id, checkout_id, job_id, assignment_id, task_id,
+                idempotency_key, repository_key, lane, kind, paths, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (job_id, assignment_id, idempotency_key) DO UPDATE SET
+               task_id = excluded.task_id, repository_key = excluded.repository_key,
+               lane = excluded.lane, kind = excluded.kind, paths = excluded.paths,
+               updated_at = excluded.updated_at`,
+          ).bind(
+            projectId, input.runnerId, input.checkoutId, input.jobId, input.assignmentId,
+            input.taskId, input.idempotencyKey, input.repositoryKey, input.lane, input.kind,
+            JSON.stringify(paths), at, at,
+          ),
+          this.env.DB.prepare(
+            "UPDATE runner_jobs SET status = 'waiting', updated_at = ? WHERE id = ? AND status IN ('assigned','running','waiting')",
+          ).bind(at, input.jobId),
+          this.env.DB.prepare(
+            "UPDATE orchestrations SET status = 'parked', updated_at = ? WHERE id = ? AND status = 'running'",
+          ).bind(at, job.orchestrationId),
+          this.env.DB.prepare(
+            `UPDATE execution_nodes SET status = 'parked', parked_at = ?, updated_at = ?,
+                    last_revision = last_revision + 1
+              WHERE orchestration_id = ? AND parent_execution_id IS NULL AND status = 'running'`,
+          ).bind(at, at, job.orchestrationId),
+        ]);
+        return { status: 'conflict', retryAfterMs: 2_000, conflictingKind: conflicts[0]!.kind };
+      }
+      const at = nowIso();
+      const fencingToken = await this.nextCoordinationFence(
+        projectId, input.repositoryKey, input.lane, input.previousFencingToken,
+      );
+      const expiresAt = new Date(Date.now() + 90_000).toISOString();
+      const leaseId = existing?.leaseId ?? newId('rcl');
+      await this.env.DB.batch([
+        this.env.DB.prepare(
+          `INSERT INTO runner_coordination_fences (project_id, repository_key, lane, fencing_token, updated_at)
+           VALUES (?, ?, ?, ?, ?) ON CONFLICT (project_id, repository_key, lane) DO UPDATE SET
+             fencing_token = excluded.fencing_token, updated_at = excluded.updated_at`,
+        ).bind(projectId, input.repositoryKey, input.lane, fencingToken, at),
+        existing
+          ? this.env.DB.prepare(
+              `UPDATE runner_coordination_leases SET runner_id = ?, checkout_id = ?, task_id = ?,
+                      repository_key = ?, lane = ?, kind = ?, paths = ?, fencing_token = ?,
+                      expires_at = ?, released_at = NULL, last_exchange_from_fence = NULL,
+                      last_exchange_scope = NULL, updated_at = ? WHERE lease_id = ?`,
+            ).bind(
+              input.runnerId, input.checkoutId, input.taskId, input.repositoryKey, input.lane,
+              input.kind, JSON.stringify(paths), fencingToken, expiresAt, at, leaseId,
+            )
+          : this.env.DB.prepare(
+              `INSERT INTO runner_coordination_leases
+                 (lease_id, project_id, runner_id, checkout_id, job_id, assignment_id, task_id,
+                  idempotency_key, repository_key, lane, kind, paths, fencing_token,
+                  expires_at, released_at, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+            ).bind(
+              leaseId, projectId, input.runnerId, input.checkoutId, input.jobId, input.assignmentId,
+              input.taskId, input.idempotencyKey, input.repositoryKey, input.lane, input.kind,
+              JSON.stringify(paths), fencingToken, expiresAt, at, at,
+            ),
+        this.env.DB.prepare(
+          'DELETE FROM runner_coordination_waits WHERE job_id = ? AND assignment_id = ? AND idempotency_key = ?',
+        ).bind(input.jobId, input.assignmentId, input.idempotencyKey),
+        ...this.coordinationResumeStatements(input.jobId, job.orchestrationId, at),
+      ]);
+      return { status: 'acquired', lease: {
+        leaseId, runnerId: input.runnerId, checkoutId: input.checkoutId, projectId,
+        jobId: input.jobId, assignmentId: input.assignmentId, taskId: input.taskId,
+        idempotencyKey: input.idempotencyKey, repositoryKey: input.repositoryKey,
+        lane: input.lane, kind: input.kind, paths, fencingToken, expiresAt,
+      } };
+    });
+  }
+
+  async exchangeRunnerCoordinationLease(
+    projectId: string,
+    input: RunnerCoordinationExchange,
+  ): Promise<RunnerCoordinationAcquireResult> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const prior = input.lease;
+      if (prior.projectId !== projectId) throw new Error('coordination project identity mismatch');
+      const job = await this.validateCoordinationIdentity(prior);
+      const row = await this.env.DB.prepare(
+        `SELECT lease_id AS leaseId, project_id AS projectId, runner_id AS runnerId,
+                checkout_id AS checkoutId, job_id AS jobId, assignment_id AS assignmentId,
+                task_id AS taskId, idempotency_key AS idempotencyKey,
+                repository_key AS repositoryKey, lane, kind, paths,
+                fencing_token AS fencingToken, expires_at AS expiresAt, released_at AS releasedAt,
+                last_exchange_from_fence AS lastExchangeFromFence,
+                last_exchange_scope AS lastExchangeScope
+           FROM runner_coordination_leases WHERE lease_id = ?`,
+      ).bind(prior.leaseId).first<RunnerCoordinationLeaseRow>();
+      const paths = normalizeCoordinationPaths(input.scope.paths);
+      if ((input.scope.kind === 'paths') !== (paths.length > 0)) throw new Error('coordination path scope is invalid');
+      if (input.scope.repositoryKey !== prior.repositoryKey) throw new Error('lease exchange cannot change repository identity');
+      const scope = { ...input.scope, paths };
+      const scopeJson = JSON.stringify({
+        repositoryKey: scope.repositoryKey, lane: scope.lane, kind: scope.kind, paths,
+      });
+      const isExactReplay = row && !row.releasedAt && row.expiresAt > nowIso()
+        && coordinationLeaseIdentityMatches(row, prior)
+        && row.lastExchangeFromFence === prior.fencingToken
+        && row.lastExchangeScope === scopeJson;
+      if (isExactReplay) return { status: 'acquired', lease: this.coordinationLeaseView(row) };
+      if (!row || row.releasedAt || row.expiresAt <= nowIso() || !coordinationLeaseMatches(row, prior)) {
+        throw new Error('coordination lease was lost; recover before further effects');
+      }
+      const conflicts = await this.coordinationConflicts(projectId, scope, row.leaseId);
+      if (conflicts.length) {
+        return { status: 'conflict', retryAfterMs: 2_000, conflictingKind: conflicts[0]!.kind };
+      }
+      const at = nowIso();
+      const fencingToken = await this.nextCoordinationFence(
+        projectId, scope.repositoryKey, scope.lane, prior.fencingToken,
+      );
+      const expiresAt = new Date(Date.now() + 90_000).toISOString();
+      await this.env.DB.batch([
+        this.env.DB.prepare(
+          `INSERT INTO runner_coordination_fences (project_id, repository_key, lane, fencing_token, updated_at)
+           VALUES (?, ?, ?, ?, ?) ON CONFLICT (project_id, repository_key, lane) DO UPDATE SET
+             fencing_token = excluded.fencing_token, updated_at = excluded.updated_at`,
+        ).bind(projectId, scope.repositoryKey, scope.lane, fencingToken, at),
+        this.env.DB.prepare(
+          `UPDATE runner_coordination_leases SET lane = ?, kind = ?, paths = ?,
+                  fencing_token = ?, expires_at = ?, last_exchange_from_fence = ?,
+                  last_exchange_scope = ?, updated_at = ?
+            WHERE lease_id = ? AND fencing_token = ? AND released_at IS NULL`,
+        ).bind(
+          scope.lane, scope.kind, JSON.stringify(paths), fencingToken, expiresAt,
+          prior.fencingToken, scopeJson, at, row.leaseId, prior.fencingToken,
+        ),
+      ]);
+      return { status: 'acquired', lease: {
+        ...prior, lane: scope.lane, kind: scope.kind, paths, fencingToken, expiresAt,
+      } };
+    });
+  }
+
+  async renewRunnerCoordinationLease(
+    projectId: string, leaseId: string, fencingToken: number,
+  ): Promise<RunnerCoordinationLease> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const row = await this.env.DB.prepare(
+        `SELECT lease_id AS leaseId, project_id AS projectId, runner_id AS runnerId,
+                checkout_id AS checkoutId, job_id AS jobId, assignment_id AS assignmentId,
+                task_id AS taskId, idempotency_key AS idempotencyKey,
+                repository_key AS repositoryKey, lane, kind, paths,
+                fencing_token AS fencingToken, expires_at AS expiresAt, released_at AS releasedAt
+           FROM runner_coordination_leases WHERE lease_id = ? AND project_id = ?`,
+      ).bind(leaseId, projectId).first<RunnerCoordinationLeaseRow>();
+      if (!row || row.releasedAt || row.fencingToken !== fencingToken || row.expiresAt <= nowIso()) {
+        throw new Error('coordination lease was lost; recover before further effects');
+      }
+      await this.validateCoordinationIdentity(row);
+      const at = nowIso();
+      const expiresAt = new Date(Date.now() + 90_000).toISOString();
+      await this.env.DB.prepare(
+        'UPDATE runner_coordination_leases SET expires_at = ?, updated_at = ? WHERE lease_id = ? AND fencing_token = ?',
+      ).bind(expiresAt, at, leaseId, fencingToken).run();
+      return { ...this.coordinationLeaseView(row), expiresAt };
+    });
+  }
+
+  async recoverRunnerCoordinationLease(
+    projectId: string, input: RunnerCoordinationRecover,
+  ): Promise<RunnerCoordinationAcquireResult> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      if (input.projectId !== projectId) throw new Error('coordination project identity mismatch');
+      await this.validateCoordinationIdentity(input);
+      const row = await this.env.DB.prepare(
+        `SELECT lease_id AS leaseId, project_id AS projectId, runner_id AS runnerId,
+                checkout_id AS checkoutId, job_id AS jobId, assignment_id AS assignmentId,
+                task_id AS taskId, idempotency_key AS idempotencyKey,
+                repository_key AS repositoryKey, lane, kind, paths,
+                fencing_token AS fencingToken, expires_at AS expiresAt, released_at AS releasedAt
+           FROM runner_coordination_leases WHERE lease_id = ? AND project_id = ?`,
+      ).bind(input.leaseId, projectId).first<RunnerCoordinationLeaseRow>();
+      if (!row) throw new Error('coordination lease is unknown');
+      if (!coordinationLeaseMatches(row, input)) {
+        throw new Error('coordination lease was fenced by a newer recovery');
+      }
+      const paths = normalizeCoordinationPaths(input.paths);
+      const scope = { repositoryKey: input.repositoryKey, lane: input.lane, kind: input.kind, paths };
+      const conflicts = await this.coordinationConflicts(projectId, scope, input.leaseId);
+      if (conflicts.length) {
+        return { status: 'conflict', retryAfterMs: 2_000, conflictingKind: conflicts[0]!.kind };
+      }
+      const at = nowIso();
+      const fencingToken = await this.nextCoordinationFence(
+        projectId, input.repositoryKey, input.lane, input.fencingToken,
+      );
+      const expiresAt = new Date(Date.now() + 90_000).toISOString();
+      await this.env.DB.batch([
+        this.env.DB.prepare(
+          `INSERT INTO runner_coordination_fences (project_id, repository_key, lane, fencing_token, updated_at)
+           VALUES (?, ?, ?, ?, ?) ON CONFLICT (project_id, repository_key, lane) DO UPDATE SET
+             fencing_token = excluded.fencing_token, updated_at = excluded.updated_at`,
+        ).bind(projectId, input.repositoryKey, input.lane, fencingToken, at),
+        this.env.DB.prepare(
+          `UPDATE runner_coordination_leases SET fencing_token = ?, expires_at = ?,
+                  released_at = NULL, last_exchange_from_fence = NULL,
+                  last_exchange_scope = NULL, updated_at = ?
+            WHERE lease_id = ? AND fencing_token = ?`,
+        ).bind(fencingToken, expiresAt, at, input.leaseId, input.fencingToken),
+      ]);
+      return { status: 'acquired', lease: {
+        leaseId: input.leaseId, runnerId: input.runnerId, checkoutId: input.checkoutId,
+        projectId, jobId: input.jobId, assignmentId: input.assignmentId, taskId: input.taskId,
+        idempotencyKey: input.idempotencyKey, repositoryKey: input.repositoryKey,
+        lane: input.lane, kind: input.kind, paths, fencingToken, expiresAt,
+      } };
+    });
+  }
+
+  async releaseRunnerCoordinationLease(
+    projectId: string, leaseId: string, fencingToken: number,
+  ): Promise<{ ok: true }> {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const row = await this.env.DB.prepare(
+        `SELECT lease_id AS leaseId, project_id AS projectId, runner_id AS runnerId,
+                checkout_id AS checkoutId, job_id AS jobId, assignment_id AS assignmentId,
+                task_id AS taskId, idempotency_key AS idempotencyKey,
+                repository_key AS repositoryKey, lane, kind, paths,
+                fencing_token AS fencingToken, expires_at AS expiresAt, released_at AS releasedAt
+           FROM runner_coordination_leases WHERE lease_id = ? AND project_id = ?`,
+      ).bind(leaseId, projectId).first<RunnerCoordinationLeaseRow>();
+      if (!row || row.fencingToken !== fencingToken) throw new Error('coordination lease is stale or unknown');
+      if (!row.releasedAt) {
+        const at = nowIso();
+        await this.env.DB.prepare(
+          'UPDATE runner_coordination_leases SET released_at = ?, updated_at = ? WHERE lease_id = ? AND fencing_token = ?',
+        ).bind(at, at, leaseId, fencingToken).run();
+      }
+      return { ok: true };
+    });
+  }
+
   async recordRunnerJobEvent(
     projectId: string,
     jobId: string,
@@ -5253,6 +5671,10 @@ export class ProjectRoom extends DurableObject<Env> {
                     reservation_active = 0, updated_at = ? WHERE job_id = ?`,
           ).bind(event.status, receivedAt, jobId),
           this.env.DB.prepare(
+            'UPDATE runner_coordination_leases SET released_at = COALESCE(released_at, ?), updated_at = ? WHERE job_id = ?',
+          ).bind(receivedAt, receivedAt, jobId),
+          this.env.DB.prepare('DELETE FROM runner_coordination_waits WHERE job_id = ?').bind(jobId),
+          this.env.DB.prepare(
             `INSERT INTO runner_job_episode_jobs
                (job_id, project_id, reason, requested_at, attempts, last_error, last_attempt_at)
              VALUES (?, ?, 'terminal', ?, 0, NULL, NULL)
@@ -5461,6 +5883,10 @@ export class ProjectRoom extends DurableObject<Env> {
                   intelligence_finished_received_at = CASE WHEN ? THEN ? ELSE intelligence_finished_received_at END,
                   updated_at = ? WHERE id = ?`,
         ).bind(queued ? 'cancelled' : row.status, at, queued ? at : null, queued ? 1 : 0, at, at, jobId),
+        this.env.DB.prepare(
+          'UPDATE runner_coordination_leases SET released_at = COALESCE(released_at, ?), updated_at = ? WHERE job_id = ?',
+        ).bind(at, at, jobId),
+        this.env.DB.prepare('DELETE FROM runner_coordination_waits WHERE job_id = ?').bind(jobId),
         ...(queued ? [this.env.DB.prepare(
           'UPDATE runner_job_items SET status = CASE WHEN status = \'pending\' THEN \'cancelled\' ELSE status END, reservation_active = 0, updated_at = ? WHERE job_id = ?',
         ).bind(at, jobId)] : []),

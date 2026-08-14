@@ -401,6 +401,87 @@ export type RunnerJobAssignment = z.infer<typeof RunnerJobAssignment>;
 export const RunnerJobDispatch = z.object({ runnerId: id, repoRef: text(500) }).strict();
 export type RunnerJobDispatch = z.infer<typeof RunnerJobDispatch>;
 
+export const RunnerCoordinationLeaseKind = z.enum(['repository', 'paths', 'landing']);
+export type RunnerCoordinationLeaseKind = z.infer<typeof RunnerCoordinationLeaseKind>;
+
+export const RunnerCoordinationLeaseScope = z.object({
+  repositoryKey: text(500),
+  lane: text(1_000),
+  kind: RunnerCoordinationLeaseKind,
+  paths: z.array(text(2_000)).max(256),
+}).strict().superRefine((scope, ctx) => {
+  if (scope.kind === 'paths' && scope.paths.length === 0) {
+    ctx.addIssue({ code: 'custom', path: ['paths'], message: 'path leases require at least one path' });
+  }
+  if (scope.kind !== 'paths' && scope.paths.length > 0) {
+    ctx.addIssue({ code: 'custom', path: ['paths'], message: 'only path leases may name paths' });
+  }
+});
+export type RunnerCoordinationLeaseScope = z.infer<typeof RunnerCoordinationLeaseScope>;
+
+export const RunnerCoordinationLeaseIdentity = z.object({
+  runnerId: id,
+  checkoutId: id,
+  projectId: id,
+  jobId: id,
+  assignmentId: id,
+  taskId: id.nullable(),
+  idempotencyKey: text(256),
+}).strict();
+export type RunnerCoordinationLeaseIdentity = z.infer<typeof RunnerCoordinationLeaseIdentity>;
+
+export const RunnerCoordinationLease = RunnerCoordinationLeaseIdentity.extend({
+  leaseId: id,
+  repositoryKey: text(500),
+  lane: text(1_000),
+  kind: RunnerCoordinationLeaseKind,
+  paths: z.array(text(2_000)).max(256),
+  fencingToken: z.number().int().nonnegative(),
+  expiresAt: z.string().datetime(),
+}).strict();
+export type RunnerCoordinationLease = z.infer<typeof RunnerCoordinationLease>;
+
+export const RunnerCoordinationAcquire = RunnerCoordinationLeaseIdentity.extend({
+  repositoryKey: text(500),
+  lane: text(1_000),
+  kind: RunnerCoordinationLeaseKind,
+  paths: z.array(text(2_000)).max(256),
+  ttlSeconds: z.literal(90),
+  previousFencingToken: z.number().int().nonnegative().optional(),
+}).strict();
+export type RunnerCoordinationAcquire = z.infer<typeof RunnerCoordinationAcquire>;
+
+export const RunnerCoordinationExchange = z.object({
+  lease: RunnerCoordinationLease,
+  scope: RunnerCoordinationLeaseScope,
+  ttlSeconds: z.literal(90),
+}).strict();
+export type RunnerCoordinationExchange = z.infer<typeof RunnerCoordinationExchange>;
+
+export const RunnerCoordinationRenew = z.object({
+  leaseId: id, fencingToken: z.number().int().nonnegative(), ttlSeconds: z.literal(90),
+}).strict();
+export type RunnerCoordinationRenew = z.infer<typeof RunnerCoordinationRenew>;
+
+export const RunnerCoordinationRecover = RunnerCoordinationLease.extend({
+  ttlSeconds: z.literal(90),
+}).strict();
+export type RunnerCoordinationRecover = z.infer<typeof RunnerCoordinationRecover>;
+
+export const RunnerCoordinationRelease = z.object({
+  leaseId: id, fencingToken: z.number().int().nonnegative(),
+}).strict();
+export type RunnerCoordinationRelease = z.infer<typeof RunnerCoordinationRelease>;
+
+export const RunnerCoordinationAcquireResult = z.discriminatedUnion('status', [
+  z.object({ status: z.literal('acquired'), lease: RunnerCoordinationLease }).strict(),
+  z.object({
+    status: z.literal('conflict'), retryAfterMs: z.number().int().nonnegative(),
+    conflictingKind: RunnerCoordinationLeaseKind,
+  }).strict(),
+]);
+export type RunnerCoordinationAcquireResult = z.infer<typeof RunnerCoordinationAcquireResult>;
+
 export const RunnerJobRuntimeRepository = z.object({
   repositoryKey: id,
   repoRef: text(500),
