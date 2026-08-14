@@ -408,6 +408,33 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
     expect(request).toMatchObject({ terminal: false, target: 'main', requestId: expect.any(String) });
     const replay = await isolatedRoom.requestRunnerJobLanding(projectId, SYSTEM_ACTOR as Actor, job.id);
     expect(replay.requestId).toBe(request.requestId);
+    const landingActor = {
+      kind: 'vcs' as const, driver: 'git', vendor: null, model: null,
+      effort: null, role: null, operation: 'land',
+    };
+    expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 3, {
+      type: 'stage.started', at, observationId: 'obs_manual_landing', taskId: null,
+      stage: 'landing', attempt: 1, actor: landingActor,
+    })).toMatchObject({ accepted: true, ack: 3 });
+    expect(await isolatedRoom.recordRunnerJobEvent(projectId, job.id, runnerId, job.assignmentId, 4, {
+      type: 'stage.finished', at, startedAt: at, observationId: 'obs_manual_landing', taskId: null,
+      stage: 'landing', attempt: 1, actor: landingActor, outcome: 'succeeded',
+      duration: { status: 'complete', value: 5, provenance: 'runner_reported' },
+      usage: {
+        inputTokens: { status: 'not_applicable', value: null, provenance: 'runner_reported' },
+        outputTokens: { status: 'not_applicable', value: null, provenance: 'runner_reported' },
+        cacheReadTokens: { status: 'not_applicable', value: null, provenance: 'runner_reported' },
+        cacheWriteTokens: { status: 'not_applicable', value: null, provenance: 'runner_reported' },
+        calls: { status: 'not_applicable', value: null, provenance: 'runner_reported' },
+        costUsd: { status: 'not_applicable', value: null, provenance: 'runner_reported' },
+      },
+      recovery: 'none',
+      evidence: {
+        operationDigest: null, resultDigest: null, exitCode: null, timedOut: null,
+        changedPathCount: null, blockerFindings: null, majorFindings: null,
+        minorFindings: null, checkpointRef: checkpoint.ref, errorCode: null,
+      },
+    })).toMatchObject({ accepted: true, ack: 4 });
     const landedCheckpoint = { ref: checkpoint.ref, label: 'main', url: null };
     expect(await isolatedRoom.recordRunnerJobLandingResult(
       projectId, job.id, runnerId, job.assignmentId, request.requestId!,

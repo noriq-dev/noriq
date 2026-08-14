@@ -4845,11 +4845,11 @@ export class ProjectRoom extends DurableObject<Env> {
       const job = await this.env.DB.prepare(
         `SELECT assignment_id AS assignmentId, runner_id AS runnerId, status, phase,
                 orchestration_id AS orchestrationId, cancel_requested_at AS cancelRequestedAt,
-                last_event_seq AS lastEventSeq
+                landing_status AS landingStatus, last_event_seq AS lastEventSeq
            FROM runner_jobs WHERE id = ? AND project_id = ?`,
       ).bind(jobId, projectId).first<{
         assignmentId: string; runnerId: string; status: string; phase: string; orchestrationId: string;
-        cancelRequestedAt: string | null; lastEventSeq: number;
+        cancelRequestedAt: string | null; landingStatus: string; lastEventSeq: number;
       }>();
       if (!job || job.runnerId !== runnerId || job.assignmentId !== assignmentId) {
         return { accepted: false, ack: job?.lastEventSeq ?? 0, error: 'stale or foreign assignment' };
@@ -4870,7 +4870,10 @@ export class ProjectRoom extends DurableObject<Env> {
         && (event.status === 'failed' || event.status === 'cancelled');
       const observationDrain = event.type === 'stage.finished'
         && (event.outcome === 'failed' || event.outcome === 'cancelled');
-      if (!['assigned', 'running', 'waiting'].includes(job.status)
+      const landingObservation = (event.type === 'stage.started' || event.type === 'stage.finished')
+        && event.stage === 'landing' && job.status === 'succeeded'
+        && ['requested', 'landing'].includes(job.landingStatus);
+      if ((!['assigned', 'running', 'waiting'].includes(job.status) && !landingObservation)
         || (job.cancelRequestedAt && !cancellationTerminal && !cancellationDrain && !observationDrain)) {
         return { accepted: false, ack: job.lastEventSeq, error: 'job is no longer accepting events' };
       }
