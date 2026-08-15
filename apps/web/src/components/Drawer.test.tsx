@@ -22,6 +22,7 @@ const task: TaskVM = {
 const tick = () => act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
 
 function mount(selectedTask: TaskVM = task) {
+  const moveTask = vi.fn();
   const store = {
     currentPid: 'prj_plnr',
     selectedTaskId: selectedTask.id,
@@ -41,7 +42,7 @@ function mount(selectedTask: TaskVM = task) {
       deleteTask: vi.fn(), openTask: vi.fn(), removeDependency: vi.fn(), addDependency: vi.fn(),
       claimToggle: vi.fn(), answerSignal: vi.fn(), acknowledgeSignal: vi.fn(), acceptProposal: vi.fn(),
       rejectProposal: vi.fn(), setView: vi.fn(), resolveComment: vi.fn(), cycleKind: vi.fn(),
-      setDraftText: vi.fn(), postComment: vi.fn(),
+      setDraftText: vi.fn(), postComment: vi.fn(), moveTask,
     },
   } as unknown as AppStore;
 
@@ -49,6 +50,7 @@ function mount(selectedTask: TaskVM = task) {
   document.body.appendChild(container);
   root = createRoot(container);
   act(() => root!.render(<Drawer store={store} />));
+  return { moveTask };
 }
 
 beforeEach(() => {
@@ -69,6 +71,37 @@ afterEach(() => {
 });
 
 describe('task detail editing (PLNR-429)', () => {
+  it('keeps task tools in a non-wrapping cluster on the right of wrapping metadata', async () => {
+    mount();
+    await tick();
+
+    const metadata = container.querySelector<HTMLElement>('[data-testid="task-header-metadata"]')!;
+    const actions = container.querySelector<HTMLElement>('[data-testid="task-header-actions"]')!;
+    expect(metadata.style.flex).toBe('1 1 0%');
+    expect(metadata.style.minWidth).toBe('0');
+    expect(metadata.style.flexWrap).toBe('wrap');
+    expect(actions.style.flex).toBe('0 0 auto');
+    expect(actions.style.flexWrap).toBe('nowrap');
+    expect(actions.style.marginLeft).toBe('auto');
+  });
+
+  it('changes status from the task overview using every user-settable status', async () => {
+    const { moveTask } = mount();
+    await tick();
+
+    act(() => {
+      container.querySelector<HTMLButtonElement>('button[aria-label="Change task status"]')!.click();
+    });
+    expect([...container.querySelectorAll<HTMLElement>('[role="option"]')].map((option) => option.dataset.value)).toEqual([
+      'todo', 'in_progress', 'blocked', 'review', 'done', 'cancelled',
+    ]);
+
+    act(() => {
+      container.querySelector<HTMLElement>('[role="option"][data-value="review"]')!.click();
+    });
+    expect(moveTask).toHaveBeenCalledWith('task_429', 'review');
+  });
+
   it('opens a distinct edit modal without replacing the task detail drawer', async () => {
     mount();
     await tick();

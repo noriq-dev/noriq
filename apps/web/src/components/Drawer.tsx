@@ -16,6 +16,19 @@ import { confirm } from './Dialog';
 import { AttachmentPreview, attachmentPreviewDecision, type AttachmentPreviewItem } from './AttachmentPreview';
 import { MOBILE_TAB_BAR_HEIGHT, useViewport } from '../viewport';
 
+const USER_SETTABLE_TASK_STATUSES: Array<{
+  value: TaskStatus;
+  label: string;
+  description: string;
+}> = [
+  { value: 'todo', label: 'Todo', description: 'Ready to be worked' },
+  { value: 'in_progress', label: 'In progress', description: 'Actively being worked' },
+  { value: 'blocked', label: 'Blocked', description: 'Waiting on a blocker' },
+  { value: 'review', label: 'Review', description: 'Awaiting review' },
+  { value: 'done', label: 'Done', description: 'Completed' },
+  { value: 'cancelled', label: 'Cancelled', description: 'No longer planned' },
+];
+
 export function drawerShellStyle(phone: boolean): CSSProperties {
   const shared: CSSProperties = {
     position: 'fixed', right: 0, bottom: 0, maxWidth: '100vw',
@@ -220,107 +233,144 @@ export function Drawer({ store }: { store: AppStore }) {
       >
         {phone && <div aria-hidden="true" style={{ flex: 'none', width: 38, height: 4, borderRadius: 999, background: 'var(--w-2)', margin: '8px auto 0' }} />}
         <div style={{ padding: phone ? '12px 14px' : '16px 20px', borderBottom: '1px solid var(--line)', flex: 'none' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, flexWrap: 'wrap' }}>
-            <MonoTag color={m.color} bg={m.bg} size={11}>{task.key}</MonoTag>
-            <MonoTag color={m.color} bg={m.bg} size={10.5}>{m.label}</MonoTag>
-            <MonoTag color={task.type === 'bug' ? 'var(--red-soft)' : 'var(--text-mid)'} bg="var(--w-05)" size={10}>{task.type}</MonoTag>
-            {/* Dispatch-workflow override (PLNR-240) — same purple family as the run's chip. */}
-            {task.workflow && <MonoTag color="var(--purple)" bg="rgba(167,139,250,.12)" size={10}>⚙ {task.workflow}</MonoTag>}
-            {milestone && <MonoTag color="var(--text-mid)" bg="var(--w-05)" size={10}>{milestone.title}</MonoTag>}
-            {task.dueAt && (() => {
-              const overdue = new Date(task.dueAt).getTime() < Date.now() && task.status !== 'done' && task.status !== 'cancelled';
-              return (
-                <MonoTag color={overdue ? 'var(--red-soft)' : 'var(--text-mid)'} bg={overdue ? 'rgba(255,92,92,.12)' : 'var(--w-05)'} size={10}>
-                  {overdue ? '⚠ overdue ' : 'due '}{new Date(task.dueAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
-                </MonoTag>
-              );
-            })()}
-            {taskTags.map((t) => (
-              <MonoTag key={t.id} color={t.color} bg="var(--w-04)" size={10}>{t.name}</MonoTag>
-            ))}
-            {addingTag ? (
-              <input
-                autoFocus
-                list="noriq-tags-quick"
-                value={newTag}
-                onChange={(e) => setNewTag(e.target.value)}
-                onBlur={() => { setAddingTag(false); setNewTag(''); }}
-                onKeyDown={async (e) => {
-                  if (e.key === 'Escape') { setAddingTag(false); setNewTag(''); }
-                  if (e.key === 'Enter' && newTag.trim()) {
-                    await api.updateTask(currentPid, task.id, { tags: [...taskTags.map((t) => t.name), newTag.trim().toLowerCase()] });
-                    setAddingTag(false);
-                    setNewTag('');
-                    actions.refreshNow();
-                  }
-                }}
-                placeholder="tag…"
-                style={{
-                  width: 90, background: 'var(--w-06)', border: '1px solid var(--w-15)',
-                  borderRadius: 5, padding: '2px 7px', color: 'var(--text)', fontSize: 10.5,
-                  fontFamily: 'var(--mono)', outline: 'none',
-                }}
-              />
-            ) : (
-              <button
-                onClick={() => setAddingTag(true)}
-                title="Add tag"
-                style={{
-                  cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)',
-                  border: '1px dashed var(--w-18)', padding: '1px 7px', borderRadius: 5, background: 'transparent',
-                }}
-                className="rail-add"
-              >
-                + tag
-              </button>
-            )}
-            <datalist id="noriq-tags-quick">
-              {allTags.map((t) => (
-                <option key={t.id} value={t.name} />
-              ))}
-            </datalist>
-            <div style={{ flex: 1 }} />
-            {store.permissions.canContribute && detailBody !== null && (
-              <button
-                onClick={startEdit}
-                title="Edit task"
-                className="drawer-x"
-                style={{ cursor: 'pointer', color: 'var(--text-dim)', fontSize: 13, width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6 }}
-              >
-                ✎
-              </button>
-            )}
-            {store.permissions.canContribute && (
-              <button
-                onClick={() => void (task.archivedAt ? actions.restoreTask(task.id) : actions.archiveTask(task.id))}
-                title={task.archivedAt ? 'Restore from archive' : 'Archive task'}
-                className="drawer-x"
-                style={{ cursor: 'pointer', color: 'var(--text-dim)', fontSize: 13, width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6 }}
-              >
-                {task.archivedAt ? '⤴' : '🗄'}
-              </button>
-            )}
-            {store.permissions.canContribute && (
-              <button
-                onClick={async () => {
-                  if (await confirm(`Delete ${task.key} "${task.title}"? This removes its comments, attachments and dependency links. Child tasks are kept.`)) {
-                    void actions.deleteTask(task.id);
-                  }
-                }}
-                title="Delete task"
-                className="drawer-x"
-                style={{ cursor: 'pointer', color: 'var(--red-soft)', fontSize: 13, width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6 }}
-              >
-                🗑
-              </button>
-            )}
-            <button
-              onClick={actions.closeTask}
-              className="drawer-x"
-              style={{ cursor: 'pointer', color: 'var(--text-dim)', fontSize: 18, width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6 }}
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 10, flexWrap: 'nowrap' }}>
+            <div
+              data-testid="task-header-metadata"
+              style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}
             >
-              ✕
-            </button>
+              <MonoTag color={m.color} bg={m.bg} size={11}>{task.key}</MonoTag>
+              {store.permissions.canContribute && task.status !== 'proposed' ? (
+                <Select
+                  variant="micro"
+                  aria-label="Change task status"
+                  value={eff}
+                  menuWidth={220}
+                  onChange={(e) => void actions.moveTask(task.id, e.target.value as TaskStatus)}
+                  style={{
+                    flex: 'none', color: m.color, background: m.bg,
+                    border: `1px solid ${m.color}44`, padding: '2px 7px',
+                  }}
+                >
+                  {!USER_SETTABLE_TASK_STATUSES.some((option) => option.value === eff) && (
+                    <option value={eff} disabled>{m.label}</option>
+                  )}
+                  {USER_SETTABLE_TASK_STATUSES.map((option) => (
+                    <option
+                      key={option.value}
+                      value={option.value}
+                      title={option.description}
+                      disabled={eff === 'blocked' && ['in_progress', 'review', 'done'].includes(option.value)}
+                    >
+                      {option.label}
+                    </option>
+                  ))}
+                </Select>
+              ) : (
+                <MonoTag color={m.color} bg={m.bg} size={10.5}>{m.label}</MonoTag>
+              )}
+              <MonoTag color={task.type === 'bug' ? 'var(--red-soft)' : 'var(--text-mid)'} bg="var(--w-05)" size={10}>{task.type}</MonoTag>
+              {/* Dispatch-workflow override (PLNR-240) — same purple family as the run's chip. */}
+              {task.workflow && <MonoTag color="var(--purple)" bg="rgba(167,139,250,.12)" size={10}>⚙ {task.workflow}</MonoTag>}
+              {milestone && <MonoTag color="var(--text-mid)" bg="var(--w-05)" size={10}>{milestone.title}</MonoTag>}
+              {task.dueAt && (() => {
+                const overdue = new Date(task.dueAt).getTime() < Date.now() && task.status !== 'done' && task.status !== 'cancelled';
+                return (
+                  <MonoTag color={overdue ? 'var(--red-soft)' : 'var(--text-mid)'} bg={overdue ? 'rgba(255,92,92,.12)' : 'var(--w-05)'} size={10}>
+                    {overdue ? '⚠ overdue ' : 'due '}{new Date(task.dueAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                  </MonoTag>
+                );
+              })()}
+              {taskTags.map((t) => (
+                <MonoTag key={t.id} color={t.color} bg="var(--w-04)" size={10}>{t.name}</MonoTag>
+              ))}
+              {addingTag ? (
+                <input
+                  autoFocus
+                  list="noriq-tags-quick"
+                  value={newTag}
+                  onChange={(e) => setNewTag(e.target.value)}
+                  onBlur={() => { setAddingTag(false); setNewTag(''); }}
+                  onKeyDown={async (e) => {
+                    if (e.key === 'Escape') { setAddingTag(false); setNewTag(''); }
+                    if (e.key === 'Enter' && newTag.trim()) {
+                      await api.updateTask(currentPid, task.id, { tags: [...taskTags.map((t) => t.name), newTag.trim().toLowerCase()] });
+                      setAddingTag(false);
+                      setNewTag('');
+                      actions.refreshNow();
+                    }
+                  }}
+                  placeholder="tag…"
+                  style={{
+                    width: 90, background: 'var(--w-06)', border: '1px solid var(--w-15)',
+                    borderRadius: 5, padding: '2px 7px', color: 'var(--text)', fontSize: 10.5,
+                    fontFamily: 'var(--mono)', outline: 'none',
+                  }}
+                />
+              ) : (
+                <button
+                  onClick={() => setAddingTag(true)}
+                  title="Add tag"
+                  style={{
+                    cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)',
+                    border: '1px dashed var(--w-18)', padding: '1px 7px', borderRadius: 5, background: 'transparent',
+                  }}
+                  className="rail-add"
+                >
+                  + tag
+                </button>
+              )}
+              <datalist id="noriq-tags-quick">
+                {allTags.map((t) => (
+                  <option key={t.id} value={t.name} />
+                ))}
+              </datalist>
+            </div>
+            <div
+              data-testid="task-header-actions"
+              style={{ flex: 'none', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'nowrap', marginLeft: 'auto' }}
+            >
+              {store.permissions.canContribute && detailBody !== null && (
+                <button
+                  onClick={startEdit}
+                  title="Edit task"
+                  className="drawer-x"
+                  style={{ cursor: 'pointer', color: 'var(--text-dim)', fontSize: 13, width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6 }}
+                >
+                  ✎
+                </button>
+              )}
+              {store.permissions.canContribute && (
+                <button
+                  onClick={() => void (task.archivedAt ? actions.restoreTask(task.id) : actions.archiveTask(task.id))}
+                  title={task.archivedAt ? 'Restore from archive' : 'Archive task'}
+                  className="drawer-x"
+                  style={{ cursor: 'pointer', color: 'var(--text-dim)', fontSize: 13, width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6 }}
+                >
+                  {task.archivedAt ? '⤴' : '🗄'}
+                </button>
+              )}
+              {store.permissions.canContribute && (
+                <button
+                  onClick={async () => {
+                    if (await confirm(`Delete ${task.key} "${task.title}"? This removes its comments, attachments and dependency links. Child tasks are kept.`)) {
+                      void actions.deleteTask(task.id);
+                    }
+                  }}
+                  title="Delete task"
+                  className="drawer-x"
+                  style={{ cursor: 'pointer', color: 'var(--red-soft)', fontSize: 13, width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6 }}
+                >
+                  🗑
+                </button>
+              )}
+              <button
+                onClick={actions.closeTask}
+                className="drawer-x"
+                style={{ cursor: 'pointer', color: 'var(--text-dim)', fontSize: 18, width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6 }}
+              >
+                ✕
+              </button>
+            </div>
           </div>
           <div style={{ fontSize: 16, fontWeight: 600, lineHeight: 1.35, letterSpacing: '-.01em' }}>{task.title}</div>
         </div>
