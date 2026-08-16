@@ -7,15 +7,21 @@
  */
 export const DOC_SKILL_MD = `---
 name: noriq-doc-authoring
-description: Author project docs in Noriq — use when writing, creating, restructuring, or ingesting knowledge-base docs (design decisions, conventions, architecture records, contracts and catalogs, game-design components, existing documentation trees) via create_doc/update_doc.
+description: >-
+  Author and maintain durable Noriq project docs with create_doc and update_doc: settled design
+  decisions, conventions, architecture records, contracts, catalogs, game-design components,
+  and verified external documentation. Use when creating, revising, restructuring, or ingesting
+  long-lived project knowledge. Do not use project docs for status, tasks, drafts, brainstorms,
+  or open questions; those belong in plans, plan-local docs, tasks, or request_input.
 ---
 
 # Authoring Noriq docs
 
-A doc is the project's long-term memory AND the corpus \`semantic_search\` retrieves
-from. Tasks finish, plans close, comments scroll away, and files in a repo are
-invisible to search here — **if knowledge is not in a doc, no future agent will find
-it**. Write every doc to be found. Together the project's docs form its design
+A doc is the project's settled knowledge base AND part of the corpus \`semantic_search\`
+retrieves. Tasks finish, plans close, and comments scroll away. Repository indexing may expose
+code and cited source through Project Memory, but it does not turn an arbitrary repo document
+into a settled Noriq project doc or link it to the tasks that must follow it. **If a settled
+contract belongs in the project corpus, ingest or author it here.** Together the project's docs form its design
 corpus: for a game project they ARE the Game Design Document, one component per doc
 (combat model, economy, netcode seams); for a software project they are the
 architecture, the decisions, the interface contracts, and the conventions — complete
@@ -46,8 +52,9 @@ A doc IS NOT a home for anything that changes weekly or is still in motion:
   (\`create_plan_doc\`), NOT a project doc
 
 **Plan docs vs project docs.** A plan doc (\`create_plan_doc\` / \`update_plan_doc\` /
-\`get_plan_doc\`) is a working document scoped to one plan: it is NOT indexed for search,
-carries NO settled-only rule, and dies with the plan. Use it for the design notes and
+\`get_plan_doc\`) is a working document scoped to one plan: it is NOT indexed for search and
+carries NO settled-only rule. It remains plan-local rather than becoming durable project truth
+when the plan finishes. Use it for the design notes and
 supporting material a plan generates while it works — things that are allowed to hold open
 questions and change as the design firms up. Keep project docs (\`create_doc\`) for what has
 settled and belongs to the project's long-term memory. When a plan doc's decision settles
@@ -67,8 +74,9 @@ search find a pointer and nothing else.
 ## Ingesting existing sources
 
 When authoritative material already exists outside Noriq (a repo \`docs/\` tree, a
-wiki, a spec), **ingest it — a pointer is not retrieval**; search cannot follow a
-link into a file it doesn't index.
+wiki, a spec), **ingest it — a pointer is not a project-doc retrieval unit**. Even when
+Project Memory can retrieve an indexed file, \`semantic_search\` over project docs and task-doc
+links do not treat that file as the settled knowledge-base record.
 
 - **Split at component seams.** A large source file holds several searchable
   components; give each its own doc that answers one question well. Never mirror

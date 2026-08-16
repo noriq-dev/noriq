@@ -3,12 +3,17 @@
  * disclosure: only an agent about to write a plan or a task's executionSpec needs the full
  * shape — everyone else just needs to know phase order gates claimability. Served at
  * GET /skill/planning.md and as the MCP resource noriq://skill/planning (see mcp.ts). The
- * prose below is moved, not rewritten — see skill.ts's module comment for the split and why
- * the guidance-drift scanner still sees it.
+ * PLNR-528 refreshed this reference against the live plan/task schemas; see skill.ts for why
+ * the guidance-drift scanner still sees the combined surface.
  */
 export const PLANNING_SKILL_MD = `---
 name: noriq-planning
-description: Write a Noriq plan (create_plan, phases, phase-gated claiming) and a task's executionSpec (requirementIds, anticipatedFiles, requiredReading, lockedDecisions, discretion, deferred, acceptance). Use before planning multi-task work, or before filling in or reading an executionSpec.
+description: >-
+  Plan multi-task Noriq work and hand precise execution contracts to builders: create_plan,
+  saved templates, ordered phase gates, plan-local docs, milestones, task dependencies, and
+  executionSpec fields. Use before creating or restructuring a plan, scoping tasks, or writing
+  and interpreting an executionSpec. Do not use for a single already-scoped task or as
+  permission for a build or verify run to rewrite its own acceptance contract.
 ---
 
 # Planning
@@ -24,10 +29,17 @@ The plan you'd write in plan mode maps onto \`create_plan\` one-to-one:
   a teammate reads to pick the work up. Humans watch it in the Plans view.
 - \`phases[]\` (ordered, up to 12) — each a stage of the pass, with its own \`body\`
   (what / how / done-when) and its tasks: \`newTasks\` created inline (title, body,
-  priority) or \`taskIds\` for ones that already exist.
+  priority, type, descriptive tags, related docs, and usually an execution spec) or \`taskIds\`
+  for ones that already exist. Every new task needs descriptive tags, either on the task or
+  through \`taskDefaults\`; the first tag is its primary topic.
+
+Use \`proposed:true\` when a scope run is handing a plan to a human for approval. Proposed-plan
+tasks stay inert until approval. A Copilot creating a plan it is authorized to execute normally
+creates an active plan. Repeated shapes belong in \`save_template\` and can be inspected with
+\`list_templates\`, then instantiated with \`create_plan.templateId\`.
 
 Phase order is **enforced by the phases themselves**: a task in phase N is claimable
-only once every task in earlier phases is finished — no dependency edges are created or
+only once every task in earlier phases is settled (done or cancelled) — no dependency edges are created or
 needed, the plan IS the gate. Workers (you, later, or others) drain it in sequence via
 \`next_claimable\`. Keep the document alive as you go with \`update_plan\` (status,
 findings, gotchas, final outcome; pass the full new body, or a \`phaseId\` to revise one
@@ -76,7 +88,8 @@ against, and an actor that can edit the standard it is graded by can pass itself
 building and the spec is wrong, say so in a comment and let a human or a scope run correct it; that
 is a finding, not an obstacle.
 
-**Reading one:** \`get_task\` returns \`executionSpec\`. If it is there, its
+**Reading one:** \`get_task\` returns \`executionSpec\`, and \`get_task_context\` returns it in
+the non-truncatable task facts alongside related evidence. If it is there, its
 \`lockedDecisions\` bind you and its \`acceptance\` is your definition of done. If
 \`executionSpecUnreadable\` is set, the stored spec is corrupt — say so and ask; do not treat
 it as "no spec" and plan over it.

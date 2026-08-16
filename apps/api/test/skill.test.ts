@@ -8,7 +8,10 @@
 import { SELF } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import { createAgent, mcpRpc } from './helpers';
-import { buildNoriqSkillArchive, noriqSkillFiles } from '../src/skill-archive';
+import { ARCHIVE_OPENAI_YAML, buildNoriqSkillArchive, noriqSkillFiles } from '../src/skill-archive';
+import { DOC_SKILL_MD } from '../src/skill-docs';
+import { MCP_TOOL_AUDIENCE } from '../src/mcp';
+import { SKILL_MD, SKILL_REFERENCES } from '../src/skill';
 
 let agent: { id: string; apiKey: string };
 
@@ -56,9 +59,13 @@ describe('skill core (PLNR-310)', () => {
     expect(text).toContain('anticipatedFiles');
     expect(text).toContain('Noriq is the channel of record');
     expect(text).toContain('configure_agent');
+    expect(text).toMatch(/complete non-Runner catalog[\s\S]+55 tools/i);
+    expect(text).toMatch(/configure_agent[\s\S]+never changes[\s\S]+tool availability/i);
     expect(text).toContain('get_task_context');
+    expect(text).toContain('repositoryKey');
+    expect(text).toContain('commitId');
     expect(text).toMatch(/request_input[\s\S]+do not repeat the question in chat/i);
-    expect(text).toMatch(/description:.*plan, implement, fix, review, investigate, continue/i);
+    expect(text).toMatch(/description: >-[\s\S]*plan,[\s\S]*implement, fix, review, investigate, continue/i);
     expect(text).toContain('noriq://skill/doc-authoring');
     for (const ref of REFERENCES) {
       expect(text).toContain(`GET /skill/${ref.slug}.md`);
@@ -66,6 +73,20 @@ describe('skill core (PLNR-310)', () => {
       // Points at the reference, but does not inline its full body — same shape as the
       // pre-existing doc-authoring split (doc-guide.test.ts).
       expect(text).not.toContain(ref.anchor);
+    }
+  });
+
+  it('keeps every skill frontmatter minimal and free of pack-activation guidance', () => {
+    const skills = [SKILL_MD, ...Object.values(SKILL_REFERENCES), DOC_SKILL_MD];
+    expect(Object.values(MCP_TOOL_AUDIENCE).filter((audience) => audience !== 'runner')).toHaveLength(55);
+    for (const skill of skills) {
+      const frontmatter = skill.match(/^---\n([\s\S]*?)\n---\n/)?.[1];
+      expect(frontmatter).toBeDefined();
+      expect(frontmatter).toMatch(/^description: >-$/m);
+      expect(frontmatter!.split('\n').map((line) => line.match(/^([a-z][a-z0-9_-]*):/)?.[1]).filter(Boolean)).toEqual([
+        'name', 'description',
+      ]);
+      expect(skill).not.toMatch(/toolPacks|enable (?:the )?(?:planning|maintenance|orchestration) pack/i);
     }
   });
 
@@ -109,7 +130,11 @@ describe('skill core (PLNR-310)', () => {
     expect([...entries.keys()].sort()).toEqual(Object.keys(noriqSkillFiles()).sort());
     expect(entries.get('noriq/SKILL.md')).toContain('noriq://skill/core');
     expect(entries.get('noriq/SKILL.md')).toContain('live resource');
-    expect(entries.get('noriq/README.md')).toMatch(/call\s+`get_briefing` first/);
+    expect(entries.get('noriq/SKILL.md')).toContain('references/file-locks.md');
+    expect(entries.has('noriq/README.md')).toBe(false);
+    expect(entries.get('noriq/agents/openai.yaml')).toBe(ARCHIVE_OPENAI_YAML);
+    expect(ARCHIVE_OPENAI_YAML).toContain('default_prompt: "Use $noriq');
+    expect(ARCHIVE_OPENAI_YAML).toContain('allow_implicit_invocation: true');
     expect(entries.get('noriq/references/memory.md')).toContain('search_project_memory');
   });
 });

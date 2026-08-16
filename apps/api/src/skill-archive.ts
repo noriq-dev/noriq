@@ -3,8 +3,8 @@ import { DOC_SKILL_MD } from './skill-docs';
 
 const encoder = new TextEncoder();
 
-const REFRESH_GUIDANCE = `
-## Refresh from the connected Noriq server
+const ARCHIVE_ROUTER = `
+## Prefer live guidance when connected
 
 This archive is a portable snapshot. At the start of every connected session, call
 \`get_briefing\`; its live playbook overrides this downloaded copy. Before using a specialized
@@ -18,29 +18,34 @@ workflow, prefer the current MCP resource over the bundled reference:
 
 If a bundled instruction and a live resource disagree, follow the live resource. It reflects the
 server and tool contracts you are actually connected to.
+
+If the live resource is unavailable, read only the bundled reference needed for the current work:
+
+- [File locks](references/file-locks.md) — before editing when project locking is enabled
+- [Planning](references/planning.md) — before plans, templates, phase changes, or execution specs
+- [Project memory](references/memory.md) — before memory retrieval, graph explanation, or recording
+- [Doc authoring](references/doc-authoring.md) — before creating or substantially revising project docs
 `;
 
-function withRefreshGuidance(skill: string): string {
+function withArchiveRouter(skill: string): string {
   const frontmatterEnd = skill.indexOf('\n---\n', 4);
   if (frontmatterEnd === -1) throw new Error('Noriq skill frontmatter is malformed');
   const insertAt = frontmatterEnd + '\n---\n'.length;
-  return `${skill.slice(0, insertAt)}${REFRESH_GUIDANCE}\n${skill.slice(insertAt)}`;
+  return `${skill.slice(0, insertAt)}${ARCHIVE_ROUTER}\n${skill.slice(insertAt)}`;
 }
 
-export const ARCHIVE_README = `# Noriq skill bundle
-
-Install the \`noriq\` directory as a skill in your agent client. \`SKILL.md\` is the entry point;
-the \`references\` directory is bundled for offline discovery.
-
-The bundle is deliberately a snapshot. When the Noriq MCP server is connected, call
-\`get_briefing\` first and prefer its live \`noriq://skill/*\` resources. Those instructions match
-the deployed server and may be newer than this archive.
+export const ARCHIVE_OPENAI_YAML = `interface:
+  display_name: "Noriq"
+  short_description: "Coordinate project work through Noriq"
+  default_prompt: "Use $noriq to coordinate and complete this project work through the connected Noriq server."
+policy:
+  allow_implicit_invocation: true
 `;
 
 export function noriqSkillFiles(): Readonly<Record<string, string>> {
   return {
-    'noriq/SKILL.md': withRefreshGuidance(SKILL_MD),
-    'noriq/README.md': ARCHIVE_README,
+    'noriq/SKILL.md': withArchiveRouter(SKILL_MD),
+    'noriq/agents/openai.yaml': ARCHIVE_OPENAI_YAML,
     'noriq/references/file-locks.md': SKILL_REFERENCES['file-locks']!,
     'noriq/references/planning.md': SKILL_REFERENCES.planning!,
     'noriq/references/memory.md': SKILL_REFERENCES.memory!,
