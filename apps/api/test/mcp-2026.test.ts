@@ -86,14 +86,15 @@ describe('server/discover', () => {
     expect(r.supportedVersions).toContain('2025-11-25');
     expect(r.supportedVersions).toContain('2025-03-26');
     expect(r.capabilities.tools).toBeDefined();
-    expect(r.capabilities.tools.listChanged).toBe(true);
+    expect(r.capabilities.tools.listChanged).toBeUndefined();
     expect(r.capabilities.resources).toBeDefined();
     expect(r.instructions).toContain('Noriq');
     expect(r.ttlMs).toBeGreaterThan(0);
     expect(r.cacheScope).toBe('private');
     expect(r._meta[SERVER_INFO_KEY].name).toBe('noriq');
     expect(r._meta[SERVER_INFO_KEY].version).toBe(pkg.version);
-    expect(r._meta[SERVER_INFO_KEY]).toMatchObject({ catalogRevision: 2, toolPacks: [] });
+    expect(r._meta[SERVER_INFO_KEY]).toMatchObject({ catalogRevision: 3 });
+    expect(r._meta[SERVER_INFO_KEY]).not.toHaveProperty('toolPacks');
   });
 
   it('works without the required-for-other-methods _meta fields (it is the probe)', async () => {
@@ -102,19 +103,18 @@ describe('server/discover', () => {
     expect(body.result.supportedVersions).toContain(MODERN);
   });
 
-  it('returns persisted active packs in discovery metadata', async () => {
-    const packed = await createAgent('modern-packed-agent');
-    const configured = await modern(packed.apiKey, 'tools/call', {
+  it('keeps identity configuration separate from discovery metadata', async () => {
+    const configuredAgent = await createAgent('modern-configured-agent');
+    const configured = await modern(configuredAgent.apiKey, 'tools/call', {
       name: 'configure_agent',
-      arguments: { toolPacks: ['planning'] },
+      arguments: { name: 'modern-renamed-agent' },
     });
-    expect(toolBody(configured.body.result)).toMatchObject({
-      toolPacks: ['planning'], catalogRevision: 2, catalogChanged: true,
-    });
-    const discovered = await modern(packed.apiKey, 'server/discover');
-    expect(discovered.body.result._meta[SERVER_INFO_KEY]).toMatchObject({
-      catalogRevision: 2, toolPacks: ['planning'],
-    });
+    expect(toolBody(configured.body.result).actingAs.name).toBe('modern-renamed-agent');
+    expect(toolBody(configured.body.result)).not.toHaveProperty('toolPacks');
+    expect(toolBody(configured.body.result)).not.toHaveProperty('catalogChanged');
+    const discovered = await modern(configuredAgent.apiKey, 'server/discover');
+    expect(discovered.body.result._meta[SERVER_INFO_KEY]).toMatchObject({ catalogRevision: 3 });
+    expect(discovered.body.result._meta[SERVER_INFO_KEY]).not.toHaveProperty('toolPacks');
   });
 });
 
@@ -124,7 +124,8 @@ describe('stateless requests (no initialize, no session)', () => {
     expect(status).toBe(200);
     expect(body.result.resultType).toBe('complete');
     expect(body.result._meta[SERVER_INFO_KEY].name).toBe('noriq');
-    expect(body.result._meta[SERVER_INFO_KEY]).toMatchObject({ catalogRevision: 2, toolPacks: [] });
+    expect(body.result._meta[SERVER_INFO_KEY]).toMatchObject({ catalogRevision: 3 });
+    expect(body.result._meta[SERVER_INFO_KEY]).not.toHaveProperty('toolPacks');
     expect(toolBody(body.result).you.name).toBeDefined();
   });
 
@@ -152,7 +153,7 @@ describe('stateless requests (no initialize, no session)', () => {
     expect(body.result._meta[SERVER_INFO_KEY].version).toBe(pkg.version);
 
     const expected = Object.entries(MCP_TOOL_AUDIENCE)
-      .filter(([, audience]) => audience === 'core')
+      .filter(([, audience]) => audience !== 'runner')
       .map(([name]) => name)
       .sort();
     const actual = body.result.tools.map((tool: { name: string }) => tool.name).sort();
@@ -259,7 +260,8 @@ describe('dual-era coexistence', () => {
       : JSON.parse(raw);
     expect(data.result.protocolVersion).toBe('2025-11-25');
     expect(data.result.serverInfo).toMatchObject({
-      name: 'noriq', catalogRevision: 2, toolPacks: [],
+      name: 'noriq', catalogRevision: 3,
     });
+    expect(data.result.serverInfo).not.toHaveProperty('toolPacks');
   });
 });

@@ -90,7 +90,7 @@ beforeAll(async () => {
 });
 
 describe('subscriptions/listen', () => {
-  it('acks first with only the honored subset, then streams list_changed and updated', async () => {
+  it('acks only supported resource notifications, then streams list_changed and updated', async () => {
     const uri = `noriq://doc/${docId}`;
     const { id, res } = await openListen(apiKey, {
       toolsListChanged: true,
@@ -106,7 +106,7 @@ describe('subscriptions/listen', () => {
       expect(ack.method).toBe('notifications/subscriptions/acknowledged');
       expect(ack.params.notifications.resourcesListChanged).toBe(true);
       expect(ack.params.notifications.resourceSubscriptions).toEqual([uri]);
-      expect(ack.params.notifications.toolsListChanged).toBe(true);
+      expect(ack.params.notifications).not.toHaveProperty('toolsListChanged');
       expect(ack.params._meta[SUB_ID]).toBe(id);
 
       // A new doc appearing → resources/list_changed.
@@ -127,13 +127,6 @@ describe('subscriptions/listen', () => {
       expect(updated.params.uri).toBe(uri);
       expect(updated.params._meta[SUB_ID]).toBe(id);
 
-      // Changing persistent packs invalidates the advertised catalog for modern subscribers.
-      const configured = await mcpCall(apiKey, 'configure_agent', { toolPacks: [] });
-      expect(configured.body).toMatchObject({ catalogChanged: true, catalogRevision: 2 });
-      expect(configured.body.nextAction).toMatch(/refresh|reconnect/i);
-      const toolsChanged = await frames.next();
-      expect(toolsChanged.method).toBe('notifications/tools/list_changed');
-      expect(toolsChanged.params._meta[SUB_ID]).toBe(id);
     } finally {
       frames.cancel();
     }

@@ -212,7 +212,6 @@ describe('the execution spec on the MCP task tools (RUN-136)', () => {
   // descriptions are dropped in the JSON-Schema conversion while the structure survives. This
   // asserts on what an agent actually receives.
   it('states what the spec is for in the tool descriptions an agent actually sees', async () => {
-    await mcpCall(agent.apiKey, 'configure_agent', { toolPacks: ['planning'] }, 'tools-list-probe');
     const res = await SELF.fetch('https://noriq.test/mcp', {
       method: 'POST',
       headers: {

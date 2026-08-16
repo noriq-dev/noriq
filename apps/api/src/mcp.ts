@@ -462,27 +462,23 @@ const minimumMcpAction = (
 // pinning this to an old protocol-era value makes newly deployed tools look permanently absent.
 // The application version is bumped for every deploy and is the cache invalidator every host can
 // observe without understanding a Noriq-specific extension.
-export const SERVER_INFO = { name: 'noriq', version: pkg.version, catalogRevision: 2 };
+export const SERVER_INFO = { name: 'noriq', version: pkg.version, catalogRevision: 3 };
 
-/** Identity-scoped discovery metadata. Hosts can compare this with their cached tools/list
- * without having to call a Noriq tool first. Runner floors are intentionally not represented as
- * packs: their tools/list is already the exact server-enforced floor. */
-export function serverInfoForAgent(agent: AgentIdentity) {
-  return {
-    ...SERVER_INFO,
-    toolPacks: agent.kind === 'copilot' ? (agent.toolPacks ?? []) : undefined,
-  };
+/** Discovery metadata for the deployed catalogue. Runner floors remain identity-scoped through
+ * tools/list itself; the server identity intentionally carries no mutable Copilot profile. */
+export function serverInfoForAgent() {
+  return SERVER_INFO;
 }
 
 export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthTokenId?: string; sessionId?: string; origin?: string } = {}): McpServer {
   const server = new McpServer(
-    serverInfoForAgent(agent),
+    serverInfoForAgent(),
     {
       instructions: INSTRUCTIONS,
       // logging → standard notifications/message (any client); experimental claude/channel
       // → Claude's richer surfacing. Both ride the live POST SSE stream (PLNR-54/45).
       capabilities: {
-        tools: { listChanged: true },
+        tools: {},
         logging: {},
         experimental: { 'claude/channel': {} },
       },
@@ -499,7 +495,6 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
   // catalogue are two views of one policy. Copilots (and agents from pre-RUN-47 daemons) carry
   // no floor and see everything, as before.
   const floor = agent.kind === 'agent' && agent.allowedTools ? new Set(agent.allowedTools) : null;
-  const enabledPacks = new Set(agent.toolPacks ?? []);
 
   // PLNR-54: in stateless Streamable HTTP there is NO standing GET SSE stream, so a
   // notification sent with no related request id is dropped by the transport. The fix
@@ -569,7 +564,9 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     const audience = MCP_TOOL_AUDIENCE[name];
     if (!audience) throw new Error(`MCP tool ${name} has no catalog audience`);
     if (floor && !floor.has(name)) return;
-    if (!floor && agent.kind === 'copilot' && audience !== 'core' && !enabledPacks.has(audience as 'planning' | 'maintenance' | 'orchestration')) return;
+    // Copilots receive the complete human-facing catalogue. Runner-only tools are reserved for
+    // daemon identities, whose allowedTools floor remains the authoritative advertised surface.
+    if (!floor && agent.kind === 'copilot' && audience === 'runner') return;
     // Capture the spec at definition time so the reference doc is generated from the
     // exact same zod schemas the tools validate against — it can't drift (PLNR-23).
     const annotations = MCP_TOOL_POLICIES[name];
@@ -657,8 +654,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         // one project for life, and expected to stay reachable.
         you: {
           id: agent.id, name: agent.name, role: agent.role, kind: agent.kind,
-          catalogRevision: 2,
-          toolPacks: agent.kind === 'copilot' ? (agent.toolPacks ?? []) : undefined,
+          catalogRevision: 3,
           ...(agent.kind === 'copilot' && opts.sessionId
             ? await describeCopilotSession(env, agent.id)
             : {}),
@@ -681,16 +677,15 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
   if (opts.oauthTokenId) {
     defineTool(
       'configure_agent',
-      'Update this existing identity, project focus, or persistent optional Copilot tool packs. Core tools are always enabled. Runner agents remain project-pinned and cannot change packs.',
+      'Update this existing identity or project focus. Every Copilot receives the complete non-runner tool catalogue; Runner agents remain project-pinned.',
       {
         name: z.string().min(2).max(40).regex(/^[a-z0-9][a-z0-9._-]*$/i, 'letters/digits/._-').optional(),
         role: z.enum(['worker', 'orchestrator']).optional(),
         projectId: z.string().optional().describe('Localize this agent to a project (recommended)'),
-        toolPacks: z.array(z.enum(['planning', 'maintenance', 'orchestration'])).max(3).optional(),
       },
-      tool(async ({ name, role, projectId, toolPacks }) => {
-        if (name === undefined && role === undefined && projectId === undefined && toolPacks === undefined) throw new Error('configure_agent requires at least one field');
-        if (agent.kind === 'agent' && (projectId !== undefined || toolPacks !== undefined)) throw new Error('runner-owned agents cannot change project focus or tool packs');
+      tool(async ({ name, role, projectId }) => {
+        if (name === undefined && role === undefined && projectId === undefined) throw new Error('configure_agent requires at least one field');
+        if (agent.kind === 'agent' && projectId !== undefined) throw new Error('runner-owned agents cannot change project focus');
         const token = await env.DB.prepare('SELECT user_id AS userId FROM oauth_tokens WHERE id = ?')
           .bind(opts.oauthTokenId).first<{ userId: string }>();
         if (!token) throw new Error('token not found');
@@ -706,21 +701,16 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         const now = nowIso();
         await env.DB.prepare(
           `UPDATE agents SET label = COALESCE(?, label), role = ?, project_id = COALESCE(?, project_id),
-             tool_packs = CASE WHEN ? IS NULL THEN tool_packs ELSE ? END,
-             tool_profile_updated_at = CASE WHEN ? IS NULL THEN tool_profile_updated_at ELSE ? END,
              status = 'active', last_seen_at = ?
            WHERE id = ?`,
-        ).bind(name ?? null, newRole, projectId ?? null, toolPacks === undefined ? null : 'set', toolPacks === undefined ? null : JSON.stringify([...new Set(toolPacks)]), toolPacks === undefined ? null : 'set', now, now, agent.id).run();
-        const after = await env.DB.prepare('SELECT project_id AS projectId, tool_packs AS toolPacks FROM agents WHERE id = ?')
-          .bind(agent.id).first<{ projectId: string | null; toolPacks: string }>();
+        ).bind(name ?? null, newRole, projectId ?? null, now, agent.id).run();
+        const after = await env.DB.prepare('SELECT project_id AS projectId FROM agents WHERE id = ?')
+          .bind(agent.id).first<{ projectId: string | null }>();
         return {
           actingAs: { id: agent.id, name: name ?? agent.name, role: newRole },
           previousProjectId: before?.projectId ?? null,
           projectId: after?.projectId ?? null,
-          toolPacks: JSON.parse(after?.toolPacks ?? '[]'),
-          catalogRevision: 2,
-          catalogChanged: toolPacks !== undefined,
-          nextAction: toolPacks !== undefined ? 'refresh tools/list or reconnect so the host sees the new catalog' : 'call get_briefing to refresh current state',
+          nextAction: 'call get_briefing to refresh current state',
         };
       }),
     );

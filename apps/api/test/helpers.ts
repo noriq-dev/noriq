@@ -260,7 +260,6 @@ let rpcId = 1;
  * are really exercising.
  */
 const defaultSessions = new Map<string, string>();
-const configuredCatalogSessions = new Set<string>();
 export const sessionFor = (apiKey: string): string => {
   const existing = defaultSessions.get(apiKey);
   if (existing) return existing;
@@ -279,13 +278,6 @@ export async function mcpCall(
   meta?: Record<string, unknown>,
 ) {
   const effectiveSession = sessionId ?? sessionFor(apiKey);
-  const catalogKey = `${apiKey}:${effectiveSession}`;
-  if (tool !== 'configure_agent' && !configuredCatalogSessions.has(catalogKey)) {
-    configuredCatalogSessions.add(catalogKey);
-    await mcpCallOnce(apiKey, 'configure_agent', {
-      toolPacks: ['planning', 'maintenance', 'orchestration'],
-    }, effectiveSession).catch(() => null);
-  }
   // Keep older behavioral tests exercising the canonical server doors while those files are
   // migrated incrementally. This adapter exists only in test code; deprecated names never reach
   // tools/call and therefore cannot mask a production alias.
@@ -472,7 +464,12 @@ export async function mcpList(apiKey: string, sessionId?: string) {
     body: JSON.stringify({ jsonrpc: '2.0', id: rpcId++, method: 'tools/list', params: {} }),
   });
   const message = parseRpcResponse(await res.text(), res.headers.get('Content-Type') ?? '');
-  return message.result?.tools as Array<{ name: string; description: string }>;
+  return message.result?.tools as Array<{
+    name: string;
+    description: string;
+    inputSchema: { properties?: Record<string, unknown> };
+    annotations?: Record<string, unknown>;
+  }>;
 }
 
 function parseRpcResponse(raw: string, contentType: string): any {

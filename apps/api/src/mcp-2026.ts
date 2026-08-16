@@ -207,12 +207,12 @@ export async function handleModernMcp(c: Context<AppContext>, env: Env, conn: Co
         supportedVersions: SUPPORTED_PROTOCOL_VERSIONS,
         // Matches what the legacy initialize result advertises (registration adds
         // tools/resources; logging is deprecated in 2026-07-28 so it is not offered here).
-        // listChanged/subscribe are honored on a subscriptions/listen stream (PLNR-234).
-        capabilities: { tools: { listChanged: true }, resources: { listChanged: true, subscribe: true }, experimental: { 'claude/channel': {} } },
+        // Resource listChanged/subscribe are honored on a subscriptions/listen stream (PLNR-234).
+        capabilities: { tools: {}, resources: { listChanged: true, subscribe: true }, experimental: { 'claude/channel': {} } },
         instructions: INSTRUCTIONS,
         ttlMs: 60_000,
         cacheScope: 'private' as const,
-        _meta: { [META_SERVER_INFO]: serverInfoForAgent(discoveryAgent) },
+        _meta: { [META_SERVER_INFO]: serverInfoForAgent() },
       },
     }, 200);
   }
@@ -276,7 +276,7 @@ export async function handleModernMcp(c: Context<AppContext>, env: Env, conn: Co
     result.resultType ??= 'complete';
     result._meta = {
       ...(result._meta as Record<string, unknown> ?? {}),
-      [META_SERVER_INFO]: serverInfoForAgent(agent),
+      [META_SERVER_INFO]: serverInfoForAgent(),
     };
     const ttl = CACHE_TTLS[method];
     if (ttl !== undefined) {

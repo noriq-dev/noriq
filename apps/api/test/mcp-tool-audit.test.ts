@@ -21,7 +21,7 @@ describe('complete MCP tool contract audit', () => {
     expect(specs.tools.filter((tool) => tool.audience === 'core')).toHaveLength(34);
   });
 
-  it('Copilots receive the 34-tool core catalog by default', async () => {
+  it('Copilots receive every non-runner tool by default', async () => {
     const token = await mintTokenForUser('mcp-catalog-audit@example.com');
     const live = await mcpList(token) as Array<{
       name: string;
@@ -30,8 +30,11 @@ describe('complete MCP tool contract audit', () => {
       annotations: Record<string, unknown>;
     }>;
     const specs = mcpReferenceSpecs();
-    expect(live.map((tool) => tool.name).sort()).toEqual(specs.tools.filter((tool) => tool.audience === 'core').map((tool) => tool.name).sort());
-    expect(live).toHaveLength(34);
+    expect(live.map((tool) => tool.name).sort()).toEqual(specs.tools.filter((tool) => tool.audience !== 'runner').map((tool) => tool.name).sort());
+    expect(live).toHaveLength(55);
+    expect(live.some((tool) => tool.name === 'can_claim')).toBe(false);
+    const freshSession = await mcpList(token, 'fresh-copilot-session');
+    expect(freshSession.map((tool) => tool.name).sort()).toEqual(live.map((tool) => tool.name).sort());
     for (const removed of REMOVED_TOOLS) {
       expect(live.some((tool) => tool.name === removed), removed).toBe(false);
     }
@@ -55,18 +58,24 @@ describe('complete MCP tool contract audit', () => {
     }
   });
 
-  it('persists optional packs and advertises their canonical tools on the next tools/list', async () => {
+  it('does not expose a self-service tool-catalog switch through configure_agent', async () => {
     const token = await mintTokenForUser('mcp-catalog-packs@example.com');
-    const configured = await mcpCall(token, 'configure_agent', { toolPacks: ['planning'] });
-    expect(configured.body).toMatchObject({ toolPacks: ['planning'], catalogRevision: 2, catalogChanged: true });
-    const live = await mcpList(token);
-    expect(live).toHaveLength(43);
+    const live = await mcpList(token) as Array<{
+      name: string;
+      inputSchema: { properties?: Record<string, unknown> };
+    }>;
+    expect(live).toHaveLength(55);
     expect(live.some((tool) => tool.name === 'create_plan')).toBe(true);
-    expect(live.some((tool) => tool.name === 'create_project')).toBe(false);
+    expect(live.some((tool) => tool.name === 'create_project')).toBe(true);
+    expect(live.some((tool) => tool.name === 'create_orchestration')).toBe(true);
 
-    const reset = await mcpCall(token, 'configure_agent', { toolPacks: [] });
-    expect(reset.body).toMatchObject({ toolPacks: [], catalogRevision: 2, catalogChanged: true });
-    expect(await mcpList(token)).toHaveLength(34);
+    const configure = live.find((tool) => tool.name === 'configure_agent')!;
+    expect(configure.inputSchema.properties).not.toHaveProperty('toolPacks');
+
+    const rejected = await mcpCall(token, 'configure_agent', { toolPacks: ['planning'] });
+    expect(rejected.isError).toBe(true);
+    expect(rejected.text).toMatch(/requires at least one field/i);
+    expect(await mcpList(token)).toHaveLength(55);
   });
 
   it('requires contributor access on both sides of a cross-project task move', async () => {

@@ -2,7 +2,7 @@
 // idempotent where true, closed-world) instead of the spec defaults (write +
 // destructive + open-world) for everything.
 import { beforeAll, describe, expect, it } from 'vitest';
-import { createAgent, mcpCall, mcpList } from './helpers';
+import { createAgent, mcpList } from './helpers';
 
 type Hints = { readOnlyHint?: boolean; destructiveHint?: boolean; idempotentHint?: boolean; openWorldHint?: boolean };
 type Tool = { name: string; annotations?: Hints };
@@ -10,9 +10,6 @@ type Tool = { name: string; annotations?: Hints };
 let agent: { id: string; apiKey: string };
 beforeAll(async () => {
   agent = await createAgent('annot-agent');
-  await mcpCall(agent.apiKey, 'configure_agent', {
-    toolPacks: ['planning', 'maintenance', 'orchestration'],
-  });
 }, 60000);
 
 describe('MCP tool annotations (PLNR-88)', () => {
