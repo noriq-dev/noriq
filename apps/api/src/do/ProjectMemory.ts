@@ -381,6 +381,7 @@ export const MEMORY_BACKUP_EXPORT_CHUNK_TARGET_BYTES = 2 * 1024 * 1024;
 export const MEMORY_BACKUP_EXPORT_READ_PAGE_ROWS = 32;
 export const MEMORY_BACKUP_SNAPSHOT_ROWS_PER_BATCH = 500;
 export const MEMORY_BACKUP_SNAPSHOT_BATCHES_PER_INVOCATION = 4;
+export const MEMORY_BACKUP_RECOVERY_ROWS_PER_INVOCATION = 500;
 export const MEMORY_BACKUP_EXPORT_SESSION_TTL_MS = 60 * 60 * 1000;
 const MEMORY_BACKUP_EXPORT_SESSION_KEY_PREFIX = 'backup_export_session:';
 
@@ -401,6 +402,8 @@ export type MemoryBackupExportBeginResult =
     ok: true;
     exportId: string;
     sweptSessions: number;
+    resumed: boolean;
+    progress: { phase: 'recover' | 'initialize' | 'snapshot' | 'export'; table: string | null };
     metrics: MemoryBackupExportInvocationMetrics;
   };
 
@@ -410,7 +413,7 @@ export type MemoryBackupExportContinueResult =
     ok: true;
     done: false;
     progress: {
-      phase: 'snapshot' | 'export';
+      phase: 'recover' | 'initialize' | 'snapshot' | 'export';
       table: string | null;
       tableIndex: number;
       tableCount: number;
@@ -450,12 +453,27 @@ interface MemoryBackupExportSessionV1 {
   updatedAt: string;
 }
 
-interface MemoryBackupExportSession extends Omit<MemoryBackupExportSessionV1, 'version' | 'totals'> {
+interface MemoryBackupExportSessionV2 extends Omit<MemoryBackupExportSessionV1, 'version' | 'totals'> {
   version: 2;
   phase: 'snapshot' | 'export';
   snapshotTableIndex: number;
   snapshotCursor: number | null;
   snapshotRows: number;
+  totals: MemoryBackupExportTotals;
+}
+
+interface MemoryBackupExportSession extends Omit<MemoryBackupExportSessionV1, 'version' | 'totals'> {
+  version: 3;
+  phase: 'recover' | 'initialize' | 'snapshot' | 'export';
+  initializeTableIndex: number;
+  snapshotTableIndex: number;
+  snapshotCursor: number | null;
+  snapshotRows: number;
+  /** Old v1/v2 sessions kept already-exported rows in their copy tables. Recovery removes those
+   * rows in bounded batches before the session resumes. */
+  recoveryTableIndex: number;
+  recoveryTargetTableIndex: number;
+  recoveryTargetCursor: number;
   totals: MemoryBackupExportTotals;
 }
 
@@ -1452,42 +1470,40 @@ export class ProjectMemory extends DurableObject<Env> {
     return { columns, primaryKey };
   }
 
-  /** Create empty mirrors and persistent triggers in one constant-size transaction. The triggers
-   * keep each mirror equal to live state while its initial rows are copied over many fresh DO
-   * invocations. Snapshot finalization drops every trigger atomically, yielding one coherent,
-   * immutable generation without blocking ordinary writes for the duration of the copy. */
-  private createExportMirrors(copyPrefix: string): void {
+  /** Create one empty mirror and its persistent triggers. Initialization advances one table per
+   * fresh DO invocation: once a table's trigger exists, later writes are reflected in its mirror;
+   * tables not initialized yet are copied from their then-current live state. Final trigger
+   * removal still yields one coherent generation without one large schema transaction. */
+  private createExportMirror(copyPrefix: string, table: string): void {
     this.assertExportCopyPrefix(copyPrefix);
-    for (const table of BACKUP_TABLES) {
-      const copy = `${copyPrefix}${table}`;
-      const { columns, primaryKey } = this.backupTableShape(table);
-      const columnList = columns.join(', ');
-      const newValues = columns.map((column) => `NEW.${column}`).join(', ');
-      const oldPrimaryKey = primaryKey.map((column) => `${column} = OLD.${column}`).join(' AND ');
-      const index = `${copy}_mirror_pk`;
-      const insertTrigger = this.exportMirrorTriggerName(copyPrefix, table, 'insert');
-      const updateTrigger = this.exportMirrorTriggerName(copyPrefix, table, 'update');
-      const deleteTrigger = this.exportMirrorTriggerName(copyPrefix, table, 'delete');
-      this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS ${copy}`);
-      this.ctx.storage.sql.exec(`CREATE TABLE ${copy} AS SELECT * FROM ${table} WHERE 0`);
-      this.ctx.storage.sql.exec(`CREATE UNIQUE INDEX ${index} ON ${copy} (${primaryKey.join(', ')})`);
-      this.ctx.storage.sql.exec(
-        `CREATE TRIGGER ${insertTrigger} AFTER INSERT ON ${table} BEGIN
-           INSERT OR REPLACE INTO ${copy} (${columnList}) VALUES (${newValues});
-         END`,
-      );
-      this.ctx.storage.sql.exec(
-        `CREATE TRIGGER ${updateTrigger} AFTER UPDATE ON ${table} BEGIN
-           DELETE FROM ${copy} WHERE ${oldPrimaryKey};
-           INSERT OR REPLACE INTO ${copy} (${columnList}) VALUES (${newValues});
-         END`,
-      );
-      this.ctx.storage.sql.exec(
-        `CREATE TRIGGER ${deleteTrigger} AFTER DELETE ON ${table} BEGIN
-           DELETE FROM ${copy} WHERE ${oldPrimaryKey};
-         END`,
-      );
-    }
+    const copy = `${copyPrefix}${table}`;
+    const { columns, primaryKey } = this.backupTableShape(table);
+    const columnList = columns.join(', ');
+    const newValues = columns.map((column) => `NEW.${column}`).join(', ');
+    const oldPrimaryKey = primaryKey.map((column) => `${column} = OLD.${column}`).join(' AND ');
+    const index = `${copy}_mirror_pk`;
+    const insertTrigger = this.exportMirrorTriggerName(copyPrefix, table, 'insert');
+    const updateTrigger = this.exportMirrorTriggerName(copyPrefix, table, 'update');
+    const deleteTrigger = this.exportMirrorTriggerName(copyPrefix, table, 'delete');
+    this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS ${copy}`);
+    this.ctx.storage.sql.exec(`CREATE TABLE ${copy} AS SELECT * FROM ${table} WHERE 0`);
+    this.ctx.storage.sql.exec(`CREATE UNIQUE INDEX ${index} ON ${copy} (${primaryKey.join(', ')})`);
+    this.ctx.storage.sql.exec(
+      `CREATE TRIGGER ${insertTrigger} AFTER INSERT ON ${table} BEGIN
+         INSERT OR REPLACE INTO ${copy} (${columnList}) VALUES (${newValues});
+       END`,
+    );
+    this.ctx.storage.sql.exec(
+      `CREATE TRIGGER ${updateTrigger} AFTER UPDATE ON ${table} BEGIN
+         DELETE FROM ${copy} WHERE ${oldPrimaryKey};
+         INSERT OR REPLACE INTO ${copy} (${columnList}) VALUES (${newValues});
+       END`,
+    );
+    this.ctx.storage.sql.exec(
+      `CREATE TRIGGER ${deleteTrigger} AFTER DELETE ON ${table} BEGIN
+         DELETE FROM ${copy} WHERE ${oldPrimaryKey};
+       END`,
+    );
   }
 
   private dropExportMirrorTriggers(copyPrefix: string): void {
@@ -1499,28 +1515,64 @@ export class ProjectMemory extends DurableObject<Env> {
     }
   }
 
+  private normalizeExportSession(
+    stored: MemoryBackupExportSession | MemoryBackupExportSessionV2 | MemoryBackupExportSessionV1,
+    exportId: string,
+  ): MemoryBackupExportSession {
+    if ((stored.version !== 1 && stored.version !== 2 && stored.version !== 3) || stored.exportId !== exportId) {
+      throw new Error(`invalid backup export session ${exportId}`);
+    }
+    this.assertExportCopyPrefix(stored.copyPrefix);
+    if (stored.version === 3) return stored;
+    const resumedPhase = stored.version === 1 ? 'export' : stored.phase;
+    const needsRecovery = resumedPhase === 'export' && (stored.tableIndex > 0 || stored.cursor > 0);
+    return {
+      ...stored,
+      version: 3,
+      phase: needsRecovery ? 'recover' : resumedPhase,
+      initializeTableIndex: BACKUP_TABLES.length,
+      snapshotTableIndex: stored.version === 1 ? BACKUP_TABLES.length : stored.snapshotTableIndex,
+      snapshotCursor: stored.version === 1 ? null : stored.snapshotCursor,
+      snapshotRows: stored.version === 1 ? 0 : stored.snapshotRows,
+      recoveryTableIndex: 0,
+      recoveryTargetTableIndex: stored.tableIndex,
+      recoveryTargetCursor: stored.cursor,
+      totals: { ...stored.totals, snapshotRows: stored.totals.snapshotRows ?? 0 },
+    };
+  }
+
   private readExportSession(exportId: string): MemoryBackupExportSession | null {
     const row = this.ctx.storage.sql.exec<{ value: string }>(
       `SELECT value FROM _meta WHERE key = ?1`, this.exportSessionKey(exportId),
     ).toArray()[0];
     if (!row) return null;
-    const stored = JSON.parse(row.value) as MemoryBackupExportSession | MemoryBackupExportSessionV1;
-    if ((stored.version !== 1 && stored.version !== 2) || stored.exportId !== exportId) {
-      throw new Error(`invalid backup export session ${exportId}`);
+    return this.normalizeExportSession(
+      JSON.parse(row.value) as MemoryBackupExportSession | MemoryBackupExportSessionV2 | MemoryBackupExportSessionV1,
+      exportId,
+    );
+  }
+
+  private resumableExportSession(projectId: string): MemoryBackupExportSession | null {
+    const rows = this.ctx.storage.sql.exec<{ key: string; value: string }>(
+      `SELECT key,value FROM _meta WHERE substr(key,1,length(?1)) = ?1 ORDER BY key`,
+      MEMORY_BACKUP_EXPORT_SESSION_KEY_PREFIX,
+    ).toArray();
+    const sessions: MemoryBackupExportSession[] = [];
+    for (const row of rows) {
+      const exportId = row.key.slice(MEMORY_BACKUP_EXPORT_SESSION_KEY_PREFIX.length);
+      try {
+        const session = this.normalizeExportSession(
+          JSON.parse(row.value) as MemoryBackupExportSession | MemoryBackupExportSessionV2 | MemoryBackupExportSessionV1,
+          exportId,
+        );
+        if (session.projectId === projectId) sessions.push(session);
+      } catch {
+        // A malformed marker is not enough authority to derive and drop arbitrary SQL objects.
+        // Leave it for operator repair rather than making a normal backup begin destructive.
+      }
     }
-    this.assertExportCopyPrefix(stored.copyPrefix);
-    if (stored.version === 1) {
-      return {
-        ...stored,
-        version: 2,
-        phase: 'export',
-        snapshotTableIndex: BACKUP_TABLES.length,
-        snapshotCursor: null,
-        snapshotRows: 0,
-        totals: { ...stored.totals, snapshotRows: stored.totals.snapshotRows ?? 0 },
-      };
-    }
-    return stored;
+    sessions.sort((a, b) => Date.parse(a.updatedAt) - Date.parse(b.updatedAt));
+    return sessions[0] ?? null;
   }
 
   private writeExportSession(session: MemoryBackupExportSession): void {
@@ -1538,27 +1590,10 @@ export class ProjectMemory extends DurableObject<Env> {
     for (const table of BACKUP_TABLES) this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS ${copyPrefix}${table}`);
   }
 
-  private sweepAbandonedExportSessions(now = Date.now()): number {
-    const rows = this.ctx.storage.sql.exec<{ key: string; value: string }>(
-      `SELECT key,value FROM _meta WHERE substr(key,1,length(?1)) = ?1`, MEMORY_BACKUP_EXPORT_SESSION_KEY_PREFIX,
-    ).toArray();
-    let swept = 0;
-    for (const row of rows) {
-      let session: MemoryBackupExportSession | null = null;
-      try { session = JSON.parse(row.value) as MemoryBackupExportSession; } catch { /* malformed sessions are deleted below */ }
-      const updated = session ? Date.parse(session.updatedAt) : Number.NaN;
-      if (Number.isFinite(updated) && now - updated <= MEMORY_BACKUP_EXPORT_SESSION_TTL_MS) continue;
-      if (session && /^export_[a-z0-9]+[a-z0-9_]*_$/.test(session.copyPrefix)) {
-        this.dropExportCopyTables(session.copyPrefix);
-      }
-      this.ctx.storage.sql.exec(`DELETE FROM _meta WHERE key = ?1`, row.key);
-      swept++;
-    }
-    return swept;
-  }
-
-  /** Register a durable producer cursor and install empty live mirrors. No project rows are
-   * copied here: exportContinue materializes them in bounded batches across fresh invocations. */
+  /** Register a durable producer cursor. Mirror schema creation, row materialization and R2
+   * export all happen in bounded exportContinue calls. An interrupted session is resumed rather
+   * than synchronously dropped: a large abandoned mirror is exactly the storage operation that
+   * can exceed Cloudflare's timeout during the next begin. */
   async exportBegin(
     projectId: string,
     opts: { tier?: 'core' | 'full' } = {},
@@ -1566,33 +1601,122 @@ export class ProjectMemory extends DurableObject<Env> {
     const started = performance.now();
     await this.assertProjectId(projectId);
     if (!this.env.FILES) return { ok: false, reason: 'R2 (FILES) not configured' };
+    const resumable = this.resumableExportSession(projectId);
+    if (resumable) {
+      const tableIndex = resumable.phase === 'recover'
+        ? Math.min(resumable.recoveryTableIndex, resumable.recoveryTargetTableIndex)
+        : resumable.phase === 'initialize'
+          ? resumable.initializeTableIndex
+          : resumable.phase === 'snapshot' ? resumable.snapshotTableIndex : resumable.tableIndex;
+      return {
+        ok: true, exportId: resumable.exportId, sweptSessions: 0, resumed: true,
+        progress: { phase: resumable.phase, table: BACKUP_TABLES[tableIndex] ?? null },
+        metrics: { chunks: 0, rows: 0, snapshotRows: 0, bytes: 0, compressedBytes: 0, durationMs: performance.now() - started },
+      };
+    }
     const exportId = newId('export');
     const copyPrefix = `${exportId}_`;
     try {
-      let sweptSessions = 0;
       this.ctx.storage.transactionSync(() => {
-        sweptSessions = this.sweepAbandonedExportSessions();
         const createdAt = nowIso();
         const session: MemoryBackupExportSession = {
-          version: 2, exportId, projectId, copyPrefix, tier: opts.tier ?? 'core', exportedAt: createdAt,
+          version: 3, exportId, projectId, copyPrefix, tier: opts.tier ?? 'core', exportedAt: createdAt,
           schemaVersion: this.readSchemaVersion(), memoryRevision: this.readMemoryRevision(),
-          phase: 'snapshot', snapshotTableIndex: 0, snapshotCursor: null, snapshotRows: 0,
+          phase: 'initialize', initializeTableIndex: 0,
+          snapshotTableIndex: 0, snapshotCursor: null, snapshotRows: 0,
+          recoveryTableIndex: 0, recoveryTargetTableIndex: 0, recoveryTargetCursor: 0,
           tableIndex: 0, cursor: 0, chunkIndex: 0, tableRowCount: 0,
           tableCounts: {}, checksums: {}, r2EvidenceRefs: [],
           totals: { chunks: 0, rows: 0, snapshotRows: 0, bytes: 0, compressedBytes: 0, durationMs: 0 },
           createdAt, updatedAt: createdAt,
         };
-        this.createExportMirrors(copyPrefix);
         this.writeExportSession(session);
       });
       return {
-        ok: true, exportId, sweptSessions,
+        ok: true, exportId, sweptSessions: 0, resumed: false,
+        progress: { phase: 'initialize', table: BACKUP_TABLES[0] ?? null },
         metrics: { chunks: 0, rows: 0, snapshotRows: 0, bytes: 0, compressedBytes: 0, durationMs: performance.now() - started },
       };
     } catch (error) {
       await this.reportBackupStatus(projectId, false);
       return { ok: false, reason: `snapshot initialization failed: ${String(error)}` };
     }
+  }
+
+  private exportCopyTableExists(copyPrefix: string, table: string): boolean {
+    this.assertExportCopyPrefix(copyPrefix);
+    return !!this.ctx.storage.sql.exec<{ name: string }>(
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1`, `${copyPrefix}${table}`,
+    ).toArray()[0];
+  }
+
+  private dropExportCopyTable(copyPrefix: string, table: string): void {
+    this.assertExportCopyPrefix(copyPrefix);
+    for (const operation of ['insert', 'update', 'delete'] as const) {
+      this.ctx.storage.sql.exec(`DROP TRIGGER IF EXISTS ${this.exportMirrorTriggerName(copyPrefix, table, operation)}`);
+    }
+    this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS ${copyPrefix}${table}`);
+  }
+
+  private advanceExportInitialization(session: MemoryBackupExportSession): void {
+    this.ctx.storage.transactionSync(() => {
+      const table = BACKUP_TABLES[session.initializeTableIndex];
+      if (table) {
+        this.createExportMirror(session.copyPrefix, table);
+        session.initializeTableIndex++;
+      }
+      if (session.initializeTableIndex >= BACKUP_TABLES.length) session.phase = 'snapshot';
+      this.writeExportSession(session);
+    });
+  }
+
+  /** v1/v2 exporters retained rows after they had already reached R2. Delete those rows in
+   * bounded batches before resuming so upgrading a large interrupted export does not require a
+   * whole-table DROP. New v3 exports reclaim each chunk as it is durably cursor-committed. */
+  private advanceExportRecovery(session: MemoryBackupExportSession): void {
+    this.ctx.storage.transactionSync(() => {
+      while (session.recoveryTableIndex < session.recoveryTargetTableIndex) {
+        const table = BACKUP_TABLES[session.recoveryTableIndex]!;
+        const copy = `${session.copyPrefix}${table}`;
+        if (!this.exportCopyTableExists(session.copyPrefix, table)) {
+          session.recoveryTableIndex++;
+          continue;
+        }
+        this.ctx.storage.sql.exec(
+          `DELETE FROM ${copy} WHERE rowid IN (SELECT rowid FROM ${copy} ORDER BY rowid LIMIT ?1)`,
+          MEMORY_BACKUP_RECOVERY_ROWS_PER_INVOCATION,
+        );
+        const remains = !!this.ctx.storage.sql.exec<{ present: number }>(`SELECT 1 AS present FROM ${copy} LIMIT 1`).toArray()[0];
+        if (!remains) {
+          this.dropExportCopyTable(session.copyPrefix, table);
+          session.recoveryTableIndex++;
+        }
+        this.writeExportSession(session);
+        return;
+      }
+
+      if (session.recoveryTargetTableIndex < BACKUP_TABLES.length && session.recoveryTargetCursor > 0) {
+        const table = BACKUP_TABLES[session.recoveryTargetTableIndex]!;
+        const copy = `${session.copyPrefix}${table}`;
+        if (this.exportCopyTableExists(session.copyPrefix, table)) {
+          this.ctx.storage.sql.exec(
+            `DELETE FROM ${copy} WHERE rowid IN (
+               SELECT rowid FROM ${copy} WHERE rowid <= ?1 ORDER BY rowid LIMIT ?2
+             )`,
+            session.recoveryTargetCursor, MEMORY_BACKUP_RECOVERY_ROWS_PER_INVOCATION,
+          );
+          const remains = !!this.ctx.storage.sql.exec<{ present: number }>(
+            `SELECT 1 AS present FROM ${copy} WHERE rowid <= ?1 LIMIT 1`, session.recoveryTargetCursor,
+          ).toArray()[0];
+          if (remains) {
+            this.writeExportSession(session);
+            return;
+          }
+        }
+      }
+      session.phase = 'export';
+      this.writeExportSession(session);
+    });
   }
 
   private copyExportSnapshotBatch(session: MemoryBackupExportSession, table: string): { rows: number; tableDone: boolean } {
@@ -1726,6 +1850,62 @@ export class ProjectMemory extends DurableObject<Env> {
       chunks: 0, rows: 0, snapshotRows: 0, bytes: 0, compressedBytes: 0, durationMs: 0,
     };
 
+    if (session.phase === 'recover') {
+      const table = BACKUP_TABLES[Math.min(session.recoveryTableIndex, session.recoveryTargetTableIndex)] ?? null;
+      try {
+        this.advanceExportRecovery(session);
+      } catch (error) {
+        throw new Error(`recovery phase failed${table ? ` at ${table}` : ''}: ${String(error)}`);
+      }
+      metrics.durationMs = performance.now() - started;
+      session.totals.durationMs += metrics.durationMs;
+      this.writeExportSession(session);
+      return {
+        ok: true,
+        done: false,
+        progress: {
+          phase: session.phase,
+          table: session.phase === 'recover'
+            ? (BACKUP_TABLES[Math.min(session.recoveryTableIndex, session.recoveryTargetTableIndex)] ?? null)
+            : (BACKUP_TABLES[session.tableIndex] ?? null),
+          tableIndex: session.phase === 'recover' ? session.recoveryTableIndex : session.tableIndex,
+          tableCount: BACKUP_TABLES.length,
+          cursor: session.phase === 'recover' ? session.recoveryTargetCursor : session.cursor,
+          chunkIndex: session.chunkIndex,
+        },
+        metrics,
+        totals: session.totals,
+      };
+    }
+
+    if (session.phase === 'initialize') {
+      const table = BACKUP_TABLES[session.initializeTableIndex] ?? null;
+      try {
+        this.advanceExportInitialization(session);
+      } catch (error) {
+        throw new Error(`initialization phase failed${table ? ` at ${table}` : ''}: ${String(error)}`);
+      }
+      metrics.durationMs = performance.now() - started;
+      session.totals.durationMs += metrics.durationMs;
+      this.writeExportSession(session);
+      return {
+        ok: true,
+        done: false,
+        progress: {
+          phase: session.phase,
+          table: session.phase === 'initialize'
+            ? (BACKUP_TABLES[session.initializeTableIndex] ?? null)
+            : (BACKUP_TABLES[session.snapshotTableIndex] ?? null),
+          tableIndex: session.phase === 'initialize' ? session.initializeTableIndex : session.snapshotTableIndex,
+          tableCount: BACKUP_TABLES.length,
+          cursor: session.phase === 'initialize' ? null : session.snapshotCursor,
+          chunkIndex: 0,
+        },
+        metrics,
+        totals: session.totals,
+      };
+    }
+
     if (session.phase === 'snapshot') {
       const table = BACKUP_TABLES[session.snapshotTableIndex] ?? null;
       let snapshotDone = false;
@@ -1760,8 +1940,11 @@ export class ProjectMemory extends DurableObject<Env> {
       const table = BACKUP_TABLES[session.tableIndex]!;
       const chunk = this.readExportChunk(session, table);
       if (chunk.rowCount === 0) {
-        this.completeExportTable(session, table);
-        this.writeExportSession(session);
+        this.ctx.storage.transactionSync(() => {
+          this.dropExportCopyTable(session.copyPrefix, table);
+          this.completeExportTable(session, table);
+          this.writeExportSession(session);
+        });
         continue;
       }
       const written = await writeMemorySnapshotChunk({
@@ -1787,8 +1970,19 @@ export class ProjectMemory extends DurableObject<Env> {
       session.totals.rows += chunk.rowCount;
       session.totals.bytes += chunk.serializedBytes;
       session.totals.compressedBytes += written.compressedBytes;
-      if (chunk.tableDone) this.completeExportTable(session, table);
-      this.writeExportSession(session);
+      this.ctx.storage.transactionSync(() => {
+        // The R2 object exists before this transaction. Cursor advancement and source-row
+        // reclamation commit together; a reset before commit simply repeats the deterministic
+        // object write, while a successful commit can never skip a row.
+        this.ctx.storage.sql.exec(
+          `DELETE FROM ${session.copyPrefix}${table} WHERE rowid <= ?1`, chunk.lastRowid,
+        );
+        if (chunk.tableDone) {
+          this.dropExportCopyTable(session.copyPrefix, table);
+          this.completeExportTable(session, table);
+        }
+        this.writeExportSession(session);
+      });
     }
 
     if (session.tableIndex >= BACKUP_TABLES.length) {
@@ -1797,10 +1991,7 @@ export class ProjectMemory extends DurableObject<Env> {
         tier: session.tier, exportedAt: session.exportedAt, tableCounts: session.tableCounts,
         checksums: session.checksums, r2EvidenceRefs: session.r2EvidenceRefs,
       });
-      this.ctx.storage.transactionSync(() => {
-        this.dropExportCopyTables(session.copyPrefix);
-        this.ctx.storage.sql.exec(`DELETE FROM _meta WHERE key = ?1`, this.exportSessionKey(exportId));
-      });
+      this.ctx.storage.sql.exec(`DELETE FROM _meta WHERE key = ?1`, this.exportSessionKey(exportId));
       await this.reportBackupStatus(projectId, true);
       metrics.durationMs = performance.now() - started;
       session.totals.durationMs += metrics.durationMs;

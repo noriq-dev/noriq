@@ -30,13 +30,17 @@ interface MemoryRpc {
     { ok: true; manifest: unknown; manifestKey: string } | { ok: false; reason: string }
   >;
   exportBegin(pid: string, opts?: { tier?: 'core' | 'full' }): Promise<
-    { ok: true; exportId: string; sweptSessions: number } | { ok: false; reason: string }
+    | {
+      ok: true; exportId: string; sweptSessions: number; resumed: boolean;
+      progress: { phase: 'recover' | 'initialize' | 'snapshot' | 'export'; table: string | null };
+    }
+    | { ok: false; reason: string }
   >;
   exportContinue(pid: string, exportId: string): Promise<
     | { ok: false; reason: string }
     | {
       ok: true; done: false;
-      progress: { phase: 'snapshot' | 'export'; table: string | null; tableIndex: number; cursor: number | null };
+      progress: { phase: 'recover' | 'initialize' | 'snapshot' | 'export'; table: string | null; tableIndex: number; cursor: number | null };
       metrics: { snapshotRows: number; chunks: number };
     }
     | { ok: true; done: true; manifest: unknown; manifestKey: string; metrics: { snapshotRows: number; chunks: number } }
@@ -221,6 +225,15 @@ describe('worker-driven multi-invocation export sessions (PLNR-456)', () => {
 
     const begun = await memory(projectId).exportBegin(projectId);
     if (!begun.ok) throw new Error(begun.reason);
+    expect(begun.resumed).toBe(false);
+    expect(await memory(projectId)._exportCopyTableCountForTest(projectId, begun.exportId)).toBe(0);
+    expect(await memory(projectId)._exportMirrorTriggerCountForTest(projectId, begun.exportId)).toBe(0);
+    for (let initialized = 1; initialized <= BACKUP_TABLES.length; initialized++) {
+      const continued = await memory(projectId).exportContinue(projectId, begun.exportId);
+      expect(continued).toMatchObject({ ok: true, done: false });
+      expect(await memory(projectId)._exportCopyTableCountForTest(projectId, begun.exportId)).toBe(initialized);
+      expect(await memory(projectId)._exportMirrorTriggerCountForTest(projectId, begun.exportId)).toBe(initialized * 3);
+    }
     expect(await memory(projectId)._exportCopyTableCountForTest(projectId, begun.exportId)).toBe(BACKUP_TABLES.length);
     expect(await memory(projectId)._exportCopyRowCountForTest(projectId, begun.exportId)).toBe(0);
     expect(await memory(projectId)._exportMirrorTriggerCountForTest(projectId, begun.exportId)).toBe(BACKUP_TABLES.length * 3);
@@ -259,10 +272,14 @@ describe('worker-driven multi-invocation export sessions (PLNR-456)', () => {
     expect(await verifyMemorySnapshot(appEnv, manifest)).toEqual({ ok: true });
   }, 60_000);
 
-  it('sweeps an abandoned session and drops all of its immutable copy tables at the next begin', async () => {
+  it('resumes an abandoned session instead of synchronously dropping its immutable copy tables at the next begin', async () => {
     const { projectId } = await newOwnedProject('pm-backup-session-sweep@example.com', 'PMBKSWP');
     const abandoned = await memory(projectId).exportBegin(projectId);
     if (!abandoned.ok) throw new Error(abandoned.reason);
+    for (let initialized = 0; initialized < BACKUP_TABLES.length; initialized++) {
+      const continued = await memory(projectId).exportContinue(projectId, abandoned.exportId);
+      if (!continued.ok) throw new Error(continued.reason);
+    }
     expect(await memory(projectId)._exportCopyTableCountForTest(projectId, abandoned.exportId)).toBe(BACKUP_TABLES.length);
     expect(await memory(projectId)._exportMirrorTriggerCountForTest(projectId, abandoned.exportId)).toBe(BACKUP_TABLES.length * 3);
     await memory(projectId)._backdateExportSessionForTest(
@@ -273,11 +290,10 @@ describe('worker-driven multi-invocation export sessions (PLNR-456)', () => {
 
     const replacement = await memory(projectId).exportBegin(projectId);
     if (!replacement.ok) throw new Error(replacement.reason);
-    expect(replacement.sweptSessions).toBe(1);
-    expect(await memory(projectId)._exportCopyTableCountForTest(projectId, abandoned.exportId)).toBe(0);
-    expect(await memory(projectId)._exportMirrorTriggerCountForTest(projectId, abandoned.exportId)).toBe(0);
-    expect(await memory(projectId).exportContinue(projectId, abandoned.exportId)).toMatchObject({ ok: false });
-    await memory(projectId).exportAbort(projectId, replacement.exportId, 'test cleanup');
+    expect(replacement).toMatchObject({ resumed: true, exportId: abandoned.exportId, sweptSessions: 0 });
+    expect(await memory(projectId)._exportCopyTableCountForTest(projectId, abandoned.exportId)).toBe(BACKUP_TABLES.length);
+    expect(await memory(projectId)._exportMirrorTriggerCountForTest(projectId, abandoned.exportId)).toBe(BACKUP_TABLES.length * 3);
+    await memory(projectId).exportAbort(projectId, abandoned.exportId, 'test cleanup');
     expect(await memory(projectId)._exportMirrorTriggerCountForTest(projectId, replacement.exportId)).toBe(0);
   });
 
@@ -285,6 +301,10 @@ describe('worker-driven multi-invocation export sessions (PLNR-456)', () => {
     const { projectId } = await newOwnedProject('pm-backup-session-erase@example.com', 'PMBKERAS');
     const active = await memory(projectId).exportBegin(projectId);
     if (!active.ok) throw new Error(active.reason);
+    for (let initialized = 0; initialized < BACKUP_TABLES.length; initialized++) {
+      const continued = await memory(projectId).exportContinue(projectId, active.exportId);
+      if (!continued.ok) throw new Error(continued.reason);
+    }
     expect(await memory(projectId)._exportMirrorTriggerCountForTest(projectId, active.exportId)).toBe(BACKUP_TABLES.length * 3);
 
     const erased = await memory(projectId).eraseAll(projectId);

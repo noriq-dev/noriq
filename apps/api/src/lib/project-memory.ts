@@ -644,7 +644,7 @@ export interface MemoryBackupRunSummary {
   bytes: number;
   compressedBytes: number;
   durationMs: number;
-  phase: 'begin' | 'snapshot' | 'export' | 'complete';
+  phase: 'begin' | 'recover' | 'initialize' | 'snapshot' | 'export' | 'complete';
   table: string | null;
 }
 
@@ -710,7 +710,8 @@ export async function runMemoryBackup(
       return { ok: false, reason: begun.reason, summary };
     }
     exportId = begun.exportId;
-    summary.phase = 'snapshot';
+    summary.phase = begun.progress.phase;
+    summary.table = begun.progress.table;
     for (;;) {
       summary.invocations++;
       const continued = await stub.exportContinue(projectId, exportId);

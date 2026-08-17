@@ -46,11 +46,15 @@ memory-backups/<projectId>/<exportedAt>/<table>/chunk-<n>.jsonl.gz
   identical timestamps.
 - Each chunk is gzip-compressed JSONL, bounded to a few hundred rows — exporting never holds
   a whole table (or the whole store) in memory at once, so it scales to a large project.
-- The immutable SQLite source generation is materialized incrementally too. Empty mirror tables
-  and temporary triggers keep normal writes reflected while bounded copy batches advance across
-  fresh Durable Object invocations; finalization drops those triggers atomically before any R2
-  chunks are read. The resulting generation is coherent without freezing the project for the
-  duration of a large export.
+- The immutable SQLite source generation is materialized incrementally too. Mirror schema is
+  initialized one table per fresh Durable Object invocation; once a table exists, temporary
+  triggers keep normal writes reflected while bounded copy batches advance. Finalization drops
+  those triggers atomically before any R2 chunks are read. The resulting generation is coherent
+  without freezing the project or putting all mirror DDL in one storage transaction.
+- Interrupted sessions are resumed instead of being synchronously dropped at the next backup.
+  Older exporter sessions first reclaim already-exported mirror rows in bounded batches. Current
+  exports reclaim each mirror chunk in the same transaction that advances its durable R2 cursor,
+  so neither recovery nor successful cleanup requires a whole-table delete/drop.
 - `manifest.json` is written **last**. Its presence is what marks the backup complete; a crash
   mid-export leaves orphaned chunks but no manifest, and nothing should treat that as
   restorable. It carries the format/schema versions, the memory revision, per-table row counts,
