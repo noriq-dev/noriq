@@ -65,6 +65,8 @@ describe('compact project TopBar (PLNR-396)', () => {
       'Plans',
       'Review1',
     ]);
+    expect(container.textContent).toContain('⌘F');
+    expect(container.textContent).not.toContain('⌘K');
     expect(pinned.querySelector('[aria-current="page"]')).toBeNull();
 
     const board = pinnedButtons

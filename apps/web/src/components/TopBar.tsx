@@ -186,7 +186,7 @@ export function TopBar({ store }: { store: AppStore }) {
 
       <div style={{ flex: 1 }} />
 
-      <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)', whiteSpace: 'nowrap' }}>⌘K</span>
+      <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)', whiteSpace: 'nowrap' }}>⌘F</span>
 
       <button
         type="button"

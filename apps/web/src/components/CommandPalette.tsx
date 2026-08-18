@@ -1,4 +1,4 @@
-// Command palette (PLNR-127) — ⌘K / Ctrl+K: jump to a task, switch view or project,
+// Command palette (PLNR-127) — ⌘F / Ctrl+F: jump to a task, switch view or project,
 // or fire a quick action without touching the mouse. Arrow keys + Enter; Esc closes.
 // PLNR-186: queries also hit the server search (semantic when the instance has an
 // embeddings backend, keyword otherwise) so docs, plans and task BODIES are findable —
@@ -46,7 +46,7 @@ export function CommandPalette({ store }: { store: AppStore }) {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'f') {
         e.preventDefault();
         setOpen((o) => !o);
         setQ('');
