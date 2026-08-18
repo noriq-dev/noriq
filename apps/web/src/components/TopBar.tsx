@@ -98,7 +98,7 @@ export function TopBar({ store }: { store: AppStore }) {
     .filter((group) => group.items.length > 0);
 
   useEffect(() => {
-    const load = () => api.attention().then((attention) => setAttnCount(attention.signals.length + attention.overdue.length)).catch(() => {});
+    const load = () => api.attention().then((attention) => setAttnCount(attention.signals.length + attention.proposed.length + attention.overdue.length)).catch(() => {});
     load();
     const interval = setInterval(load, 45_000);
     return () => clearInterval(interval);
@@ -208,8 +208,8 @@ export function TopBar({ store }: { store: AppStore }) {
       )}
 
       {attnCount > 0 && (
-        <button type="button" onClick={() => actions.setView('home')} className="hover-bright" title={`${attnCount} item(s) need you across all projects — open Home`} style={{ cursor: 'pointer', background: 'rgba(245,166,35,.1)', border: '1px solid rgba(245,166,35,.3)', borderRadius: 8, padding: '5px 9px', color: 'var(--amber)', fontFamily: 'var(--mono)', fontSize: 10.5, fontWeight: 700, whiteSpace: 'nowrap' }}>
-          Attention {attnCount}
+        <button type="button" onClick={() => actions.setView('home')} aria-label={`${attnCount} item(s) need attention across all projects`} className="hover-bright" title={`${attnCount} item(s) need you across all projects — open Home`} style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, background: 'rgba(245,166,35,.1)', border: '1px solid rgba(245,166,35,.3)', borderRadius: 8, padding: '5px 9px', color: 'var(--amber)', fontFamily: 'var(--mono)', fontSize: 10.5, fontWeight: 700, whiteSpace: 'nowrap' }}>
+          <span aria-hidden="true">🔔</span> {attnCount}
         </button>
       )}
 

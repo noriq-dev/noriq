@@ -860,13 +860,14 @@ app.get('/api/projects', userAuth, async (c) => {
 });
 
 // Cross-project attention inbox (PLNR-121): everything that needs a HUMAN right now —
-// open decisions/alerts plus overdue-and-still-open tasks (PLNR-126) — across every
+// open decisions/alerts, proposed tasks awaiting acceptance, plus overdue-and-still-open
+// tasks (PLNR-126) — across every
 // project the user can see, so "what needs me" is one call, not ten open tabs.
 app.get('/api/attention', userAuth, async (c) => {
   const u = c.var.user!;
   const visibleProjects = u.role === 'admin' ? '1 = 1' : USER_PROJECT_WHERE;
   const scopeBinds = u.role === 'admin' ? [] : [u.id];
-  const [signals, overdue] = await Promise.all([
+  const [signals, proposed, overdue] = await Promise.all([
     c.env.DB.prepare(
       `SELECT s.id, s.project_id AS projectId, p.key AS projectKey, s.task_id AS taskId,
               (SELECT key FROM tasks WHERE id = s.task_id) AS taskKey,
@@ -877,12 +878,20 @@ app.get('/api/attention', userAuth, async (c) => {
                 CASE s.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, s.created_at`,
     ).bind(...scopeBinds).all(),
     c.env.DB.prepare(
+      `SELECT t.id, t.key, t.title, t.proposed_at AS proposedAt,
+              t.spinoff_finding AS finding, t.project_id AS projectId, p.key AS projectKey
+       FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
+       WHERE ${visibleProjects}
+         AND t.status = 'todo' AND t.proposed_at IS NOT NULL AND t.archived_at IS NULL
+       ORDER BY t.proposed_at LIMIT 50`,
+    ).bind(...scopeBinds).all(),
+    c.env.DB.prepare(
       `SELECT t.id, t.key, t.title, t.due_at AS dueAt, ${taskWireStatus('t')} AS status, t.failed_at AS failedAt,
               t.project_id AS projectId, p.key AS projectKey
        FROM tasks t JOIN projects p ON p.id = t.project_id AND p.status = 'active'
        WHERE ${visibleProjects}
          AND t.due_at IS NOT NULL AND t.due_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')
-         AND t.status NOT IN ('done','cancelled') AND t.archived_at IS NULL
+         AND t.status NOT IN ('done','cancelled') AND t.proposed_at IS NULL AND t.archived_at IS NULL
        ORDER BY t.due_at LIMIT 50`,
     ).bind(...scopeBinds).all(),
   ]);
@@ -892,6 +901,7 @@ app.get('/api/attention', userAuth, async (c) => {
       options: s.options ? JSON.parse(String(s.options)) : null,
       questions: s.questions ? JSON.parse(String(s.questions)) : null,
     })),
+    proposed: proposed.results,
     overdue: overdue.results,
   });
 });

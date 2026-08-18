@@ -436,7 +436,7 @@ export const api = {
   rejectProposal: (pid: string, tid: string) => req<{ id: string; key: string; status: string }>('POST', `/api/projects/${pid}/tasks/${tid}/proposal/reject`),
   deleteTask: (pid: string, tid: string) => req('DELETE', `/api/projects/${pid}/tasks/${tid}`),
   deleteProject: (pid: string) => req('DELETE', `/api/projects/${pid}`),
-  /** Cross-project "what needs me" (PLNR-121): open decisions/alerts + overdue tasks. */
+  /** Cross-project "what needs me" (PLNR-121): open decisions/alerts + proposed + overdue tasks. */
   attention: () =>
     req<{
       signals: Array<{
@@ -444,6 +444,10 @@ export const api = {
         agentName: string; type: 'input_request' | 'alert'; severity: 'info' | 'warning' | 'critical';
         title: string; body: string | null; options: string[] | null;
         questions: ApiSignalQuestion[] | null; createdAt: string;
+      }>;
+      proposed: Array<{
+        id: string; key: string; title: string; proposedAt: string; finding: string | null;
+        projectId: string; projectKey: string;
       }>;
       overdue: Array<{ id: string; key: string; title: string; dueAt: string; status: string; projectId: string; projectKey: string }>;
     }>('GET', '/api/attention'),

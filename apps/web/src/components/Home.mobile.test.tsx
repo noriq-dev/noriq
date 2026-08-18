@@ -42,7 +42,7 @@ afterEach(() => {
 describe('Home phone composition', () => {
   it('focuses on catching up and projects without workstation agent setup', async () => {
     viewportMatchMedia(390);
-    vi.spyOn(api, 'attention').mockResolvedValue({ signals: [], overdue: [] });
+    vi.spyOn(api, 'attention').mockResolvedValue({ signals: [], proposed: [], overdue: [] });
     container = document.createElement('div');
     document.body.appendChild(container);
     root = createRoot(container);
@@ -62,5 +62,33 @@ describe('Home phone composition', () => {
     expect(description.style.maxWidth).toBe('100%');
     expect(description.style.overflowWrap).toBe('anywhere');
     expect(description.style.webkitLineClamp).toBe('2');
+  });
+
+  it('surfaces proposed tasks as actionable attention items', async () => {
+    viewportMatchMedia(390);
+    vi.spyOn(api, 'attention').mockResolvedValue({
+      signals: [], overdue: [],
+      proposed: [{
+        id: 'task_proposed', key: 'MOB-6', title: 'Consider offline sync',
+        proposedAt: '2026-08-18T12:00:00.000Z', finding: 'The mobile flow loses drafts offline.',
+        projectId: project.id, projectKey: project.key,
+      }],
+    });
+    const accept = vi.spyOn(api, 'acceptProposal').mockResolvedValue({ id: 'task_proposed', key: 'MOB-6', status: 'todo' });
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => {
+      root!.render(<Home store={store()} />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.textContent).toContain('Needs attention');
+    expect(container.textContent).toContain('PROPOSED');
+    expect(container.textContent).toContain('Consider offline sync');
+    const acceptButton = [...container.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === 'Accept')!;
+    await act(async () => { acceptButton.click(); });
+    expect(accept).toHaveBeenCalledWith(project.id, 'task_proposed');
   });
 });

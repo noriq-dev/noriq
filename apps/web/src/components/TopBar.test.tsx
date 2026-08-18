@@ -27,8 +27,12 @@ function roster(agents: ApiAgent[], live = agents.filter((item) => item.live && 
   };
 }
 
-function mount(agentRoster: ApiAgentRoster, view: ProjectViewId = 'memory') {
-  vi.spyOn(api, 'attention').mockResolvedValue({ signals: [], overdue: [] });
+function mount(
+  agentRoster: ApiAgentRoster,
+  view: ProjectViewId = 'memory',
+  attention: Awaited<ReturnType<typeof api.attention>> = { signals: [], proposed: [], overdue: [] },
+) {
+  vi.spyOn(api, 'attention').mockResolvedValue(attention);
   vi.spyOn(api, 'agents').mockResolvedValue(agentRoster);
   const setView = vi.fn();
   container = document.createElement('div');
@@ -109,6 +113,23 @@ describe('compact project TopBar (PLNR-396)', () => {
     expect(settings).toBeTruthy();
     await act(async () => { settings.click(); });
     expect(setView).toHaveBeenCalledWith('project-settings');
+  });
+
+  it('uses the bell badge and includes proposed tasks in the attention count', async () => {
+    const { setView } = mount(roster([]), 'memory', {
+      signals: [], overdue: [],
+      proposed: [{
+        id: 'task_proposed', key: 'PLNR-1', title: 'Proposed work', proposedAt: '2026-08-18T12:00:00.000Z',
+        finding: 'Adjacent work', projectId: 'prj_1', projectKey: 'PLNR',
+      }],
+    });
+    await tick();
+
+    const badge = container.querySelector<HTMLButtonElement>('[aria-label="1 item(s) need attention across all projects"]')!;
+    expect(badge.textContent?.trim()).toBe('🔔 1');
+    expect(badge.textContent).not.toContain('Attention');
+    await act(async () => { badge.click(); });
+    expect(setView).toHaveBeenCalledWith('home');
   });
 
   it('shows only server-authored live actors, working first, and opens the Agents view', async () => {

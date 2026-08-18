@@ -675,9 +675,13 @@ describe('due dates', () => {
 
 // ---- PLNR-121: the cross-project attention inbox ------------------------------------
 describe('attention inbox', () => {
-  it('aggregates open signals and overdue tasks across visible projects', async () => {
+  it('aggregates open signals, proposed tasks, and overdue tasks across visible projects', async () => {
     const pid = (await mcpCall(orch.apiKey, 'create_project', { key: 'ATTN', name: 'attention' })).body.id;
     const t = (await mcpCall(orch.apiKey, 'create_task', { tags: ['test-fixture'], projectId: pid, title: 'stuck work', dueAt: '2020-06-01T00:00:00.000Z' })).body;
+    const proposal = (await mcpCall(orch.apiKey, 'create_task', { tags: ['test-fixture'], projectId: pid, title: 'consider adjacent work', dueAt: '2020-06-01T00:00:00.000Z' })).body;
+    await (env as unknown as { DB: D1Database }).DB.prepare(
+      'UPDATE tasks SET proposed_at = ?, spinoff_finding = ? WHERE id = ?',
+    ).bind('2026-08-18T12:00:00.000Z', 'The adjacent finding', proposal.id).run();
     await mcpCall(orch.apiKey, 'claim_task', { projectId: pid, taskId: t.id });
     await mcpCall(orch.apiKey, 'request_input', {
       projectId: pid, taskId: t.id, title: 'Which database?', options: ['sqlite', 'postgres'],
@@ -687,13 +691,18 @@ describe('attention inbox', () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
       signals: Array<{ projectKey: string; type: string; title: string; options: string[] | null }>;
+      proposed: Array<{ id: string; key: string; projectKey: string; finding: string | null }>;
       overdue: Array<{ key: string; projectKey: string }>;
     };
     const sig = body.signals.find((s) => s.projectKey === 'ATTN');
     expect(sig).toBeTruthy();
     expect(sig!.type).toBe('input_request');
     expect(sig!.options).toEqual(['sqlite', 'postgres']);
+    expect(body.proposed).toContainEqual(expect.objectContaining({
+      id: proposal.id, key: proposal.key, projectKey: 'ATTN', finding: 'The adjacent finding',
+    }));
     expect(body.overdue.some((o) => o.key === t.key && o.projectKey === 'ATTN')).toBe(true);
+    expect(body.overdue.some((o) => o.key === proposal.key)).toBe(false);
   });
 });
 

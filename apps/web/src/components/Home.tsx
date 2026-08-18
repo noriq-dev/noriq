@@ -8,11 +8,12 @@ import { Button } from './ui';
 import { QuestionForm } from './QuestionForm';
 import { Markdown } from './Markdown';
 import { useViewport } from '../viewport';
+import { confirm } from './Dialog';
 
 type Attention = Awaited<ReturnType<typeof api.attention>>;
 
-/** Cross-project "what needs me right now" (PLNR-121): open decisions/alerts with
- *  inline answer/ack (no tab-hopping), plus overdue-and-open tasks (PLNR-126). */
+/** Cross-project "what needs me right now" (PLNR-121): open decisions/alerts and proposed
+ *  tasks with inline decisions (no tab-hopping), plus overdue-and-open tasks (PLNR-126). */
 function AttentionSection({ store }: { store: AppStore }) {
   const { actions } = store;
   const [att, setAtt] = useState<Attention | null>(null);
@@ -24,7 +25,7 @@ function AttentionSection({ store }: { store: AppStore }) {
     return () => clearInterval(iv);
   }, []);
 
-  if (!att || (att.signals.length === 0 && att.overdue.length === 0)) return null;
+  if (!att || (att.signals.length === 0 && att.proposed.length === 0 && att.overdue.length === 0)) return null;
   const sevColor: Record<string, string> = { critical: 'var(--red-soft)', warning: 'var(--amber)', info: 'var(--blue)' };
 
   return (
@@ -32,7 +33,7 @@ function AttentionSection({ store }: { store: AppStore }) {
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
         <SectionLabel>Needs attention</SectionLabel>
         <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--amber)' }}>
-          {att.signals.length + att.overdue.length}
+          {att.signals.length + att.proposed.length + att.overdue.length}
         </span>
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -97,6 +98,52 @@ function AttentionSection({ store }: { store: AppStore }) {
                   <button onClick={async () => { await api.acknowledgeSignal(s.projectId, s.id, true); load(); }} style={{ cursor: 'pointer', fontSize: 11, color: 'var(--text-faint)', background: 'transparent', border: 'none', padding: '4px 4px' }}>dismiss</button>
                 </div>
               )}
+            </div>
+          );
+        })}
+        {att.proposed.map((task) => {
+          const canManage = store.data.projects.find((project) => project.id === task.projectId)?.canManage ?? false;
+          return (
+            <div
+              key={task.id}
+              onClick={() => actions.selectProject(task.projectId)}
+              className="hover-border"
+              style={{ border: '1px solid rgba(245,166,35,.25)', borderLeft: '3px solid var(--amber)', borderRadius: 10, background: 'var(--card)', padding: '10px 13px', cursor: 'pointer' }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 9, flexWrap: 'wrap' }}>
+                <MonoTag color="var(--amber)" bg="rgba(245,166,35,.12)" size={9}>PROPOSED</MonoTag>
+                <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-mid)' }}>{task.projectKey} · {task.key}</span>
+                <span style={{ flex: '1 1 180px', fontSize: 12.5, fontWeight: 600, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{task.title}</span>
+                {canManage && (
+                  <div style={{ display: 'flex', gap: 6, marginLeft: 'auto' }}>
+                    <Button
+                      variant="primary"
+                      style={{ padding: '4px 10px', fontSize: 11 }}
+                      onClick={async (event) => {
+                        event.stopPropagation();
+                        await api.acceptProposal(task.projectId, task.id);
+                        load();
+                      }}
+                    >
+                      Accept
+                    </Button>
+                    <Button
+                      variant="danger"
+                      style={{ padding: '4px 10px', fontSize: 11 }}
+                      onClick={async (event) => {
+                        event.stopPropagation();
+                        if (await confirm(`Reject proposal ${task.key}? The task is cancelled (its finding stays on record).`)) {
+                          await api.rejectProposal(task.projectId, task.id);
+                          load();
+                        }
+                      }}
+                    >
+                      Reject
+                    </Button>
+                  </div>
+                )}
+              </div>
+              {task.finding && <div style={{ marginTop: 5, fontSize: 11.5, lineHeight: 1.45, color: 'var(--text-mid)' }}>{task.finding}</div>}
             </div>
           );
         })}
