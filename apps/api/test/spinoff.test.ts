@@ -6,7 +6,7 @@
 // pointers against it mechanically.
 import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { authorizeForAllProjects, createAgent, createRunAgent, loginSession, mcpCall } from './helpers';
+import { authorizeForAllProjects, createAgent, createRunAgent, createUser, loginSession, mcpCall } from './helpers';
 
 const db = () => (env as unknown as { DB: D1Database }).DB;
 /** Direct DO access, for asserting the mint-claim predicate itself rather than a route that
@@ -24,6 +24,7 @@ describe('create_tasks proposals (PLNR-230)', () => {
   let projectId: string;
   let anchorTaskId: string;
   let cookie: string;
+  let contributorCookie: string;
 
   beforeAll(async () => {
     copilot = await createAgent('spinoff-copilot', 'orchestrator');
@@ -43,6 +44,13 @@ describe('create_tasks proposals (PLNR-230)', () => {
     // The human who owns the project (createAgent's shared mint user) — accept/reject are
     // dashboard (cookie-auth) actions.
     cookie = await loginSession('agent-mint@example.com', 'longenough1');
+    const contributor = await createUser(
+      'spinoff-contributor@example.com', 'Spin-off Contributor', 'longenough1',
+    ).catch(async () => db().prepare("SELECT id FROM users WHERE email = 'spinoff-contributor@example.com'").first<{ id: string }>());
+    await db().prepare(
+      "INSERT OR REPLACE INTO project_grants (project_id, principal_type, principal_id, role) VALUES (?, 'user', ?, 'contributor')",
+    ).bind(projectId, contributor!.id).run();
+    contributorCookie = await loginSession('spinoff-contributor@example.com', 'longenough1');
   });
 
   const fileProposal = async (title: string) => {
@@ -119,6 +127,24 @@ describe('create_tasks proposals (PLNR-230)', () => {
     const claim = await mcpCall(copilot.apiKey, 'claim_task', { projectId, taskId: made.id });
     expect(claim.isError).toBeFalsy();
     await mcpCall(copilot.apiKey, 'release_task', { projectId, taskId: made.id, toStatus: 'done' });
+  });
+
+  it('lets a project contributor accept or reject proposed work', async () => {
+    const accepted = await fileProposal('contributor accepts proposal');
+    const accept = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/tasks/${accepted.id}/proposal/accept`,
+      { method: 'POST', headers: { Cookie: contributorCookie } },
+    );
+    expect(accept.status).toBe(200);
+    expect(((await accept.json()) as { status: string }).status).toBe('todo');
+
+    const rejected = await fileProposal('contributor rejects proposal');
+    const reject = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/tasks/${rejected.id}/proposal/reject`,
+      { method: 'POST', headers: { Cookie: contributorCookie } },
+    );
+    expect(reject.status).toBe(200);
+    expect(((await reject.json()) as { status: string }).status).toBe('cancelled');
   });
 
   it('reject → cancelled; provenance survives; still unclaimable', async () => {

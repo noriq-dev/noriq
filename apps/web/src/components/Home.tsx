@@ -102,7 +102,7 @@ function AttentionSection({ store }: { store: AppStore }) {
           );
         })}
         {att.proposed.map((task) => {
-          const canManage = store.data.projects.find((project) => project.id === task.projectId)?.canManage ?? false;
+          const canContribute = store.data.projects.find((project) => project.id === task.projectId)?.canContribute ?? false;
           return (
             <div
               key={task.id}
@@ -114,7 +114,7 @@ function AttentionSection({ store }: { store: AppStore }) {
                 <MonoTag color="var(--amber)" bg="rgba(245,166,35,.12)" size={9}>PROPOSED</MonoTag>
                 <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-mid)' }}>{task.projectKey} · {task.key}</span>
                 <span style={{ flex: '1 1 180px', fontSize: 12.5, fontWeight: 600, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{task.title}</span>
-                {canManage && (
+                {canContribute && (
                   <div style={{ display: 'flex', gap: 6, marginLeft: 'auto' }}>
                     <Button
                       variant="primary"

@@ -24,9 +24,9 @@ const project: ProjectVM = {
   canView: true, canContribute: true, canManage: true, canOwn: true, cappedByReadOnly: false,
 };
 
-function store(): AppStore {
+function store(projects: ProjectVM[] = [project]): AppStore {
   return {
-    user: { id: 'usr_1', name: 'Mara Chen' }, groups: [], data: { projects: [project] },
+    user: { id: 'usr_1', name: 'Mara Chen' }, groups: [], data: { projects },
     permissions: { canCreateProjects: true }, actions: { selectProject: vi.fn(), createProject: vi.fn() },
   } as unknown as AppStore;
 }
@@ -66,6 +66,7 @@ describe('Home phone composition', () => {
 
   it('surfaces proposed tasks as actionable attention items', async () => {
     viewportMatchMedia(390);
+    const contributorProject = { ...project, effectiveRole: 'contributor' as const, canManage: false, canOwn: false };
     vi.spyOn(api, 'attention').mockResolvedValue({
       signals: [], overdue: [],
       proposed: [{
@@ -79,7 +80,7 @@ describe('Home phone composition', () => {
     document.body.appendChild(container);
     root = createRoot(container);
     await act(async () => {
-      root!.render(<Home store={store()} />);
+      root!.render(<Home store={store([contributorProject])} />);
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 

@@ -210,7 +210,7 @@ export function Board({ store }: { store: AppStore }) {
                     {lockedTaskIds.has(task.id) && <MonoTag color="var(--blue)" bg="rgba(76,157,255,.12)" size={9.5}>🔒</MonoTag>}
                   </div>
                   <div style={{ fontSize: 14, lineHeight: 1.45, color: 'var(--text)' }}>{task.title}</div>
-                  {task.status === 'proposed' && store.permissions.canManage && (
+                  {task.status === 'proposed' && store.permissions.canContribute && (
                     <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
                       <Button variant="primary" style={{ minHeight: MIN_TOUCH_TARGET, padding: '5px 13px' }} onClick={(event) => { event.stopPropagation(); void actions.acceptProposal(task.id); }}>✓ accept</Button>
                       <Button variant="danger" style={{ minHeight: MIN_TOUCH_TARGET, padding: '5px 13px' }} onClick={async (event) => { event.stopPropagation(); if (await confirm(`Reject proposal ${task.key}? The task is cancelled (its finding stays on record).`)) void actions.rejectProposal(task.id); }}>✕ reject</Button>
@@ -555,7 +555,7 @@ export function Board({ store }: { store: AppStore }) {
                         <div style={{ fontSize: 12.5, lineHeight: 1.45, color: 'var(--text)' }}>{t.title}</div>
                         {/* The proposal decision (PLNR-230): accept → todo, reject → cancelled.
                             These buttons (and the drawer's) are the ONLY doors out of proposed. */}
-                        {t.status === 'proposed' && store.permissions.canManage && (
+                        {t.status === 'proposed' && store.permissions.canContribute && (
                           <div style={{ display: 'flex', gap: 6, marginTop: 9 }}>
                             <Button
                               variant="primary"

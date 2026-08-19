@@ -51,7 +51,7 @@ const task = (id: string, key: string, title: string): TaskVM => ({
   comments: [],
 });
 
-function mount(taskList?: TaskVM[]) {
+function mount(taskList?: TaskVM[], permissions = { canContribute: false, canManage: false }) {
   const tasks = taskList ?? [
     task('task_planned', 'BRD-1', 'Task from the release plan'),
     task('task_standalone', 'BRD-2', 'Standalone board task'),
@@ -61,7 +61,7 @@ function mount(taskList?: TaskVM[]) {
     boardId: 'board_1',
     draggedId: null,
     showArchived: false,
-    permissions: { canContribute: false },
+    permissions,
     snapshot: {
       boards: [{ id: 'board_1', name: 'Main' }],
       milestones: [],
@@ -80,6 +80,8 @@ function mount(taskList?: TaskVM[]) {
       toggleArchived: vi.fn(),
       openTask: vi.fn(),
       setDraggedId: vi.fn(),
+      acceptProposal: vi.fn(),
+      rejectProposal: vi.fn(),
     },
   } as unknown as AppStore;
 
@@ -107,6 +109,28 @@ afterEach(() => {
 });
 
 describe('Board plan membership filter', () => {
+  it('shows proposal decisions to contributors on desktop and phone boards', () => {
+    const proposed = {
+      ...task('task_proposed', 'BRD-9', 'Contributor decision'),
+      status: 'proposed' as const,
+      proposedAt: '2026-08-19T12:00:00.000Z',
+    };
+    mount([proposed], { canContribute: true, canManage: false });
+    expect(container.textContent).toContain('✓ accept');
+    expect(container.textContent).toContain('✕ reject');
+
+    act(() => root?.unmount());
+    container.remove();
+    root = null;
+    mockPhoneViewport();
+    mount([proposed], { canContribute: true, canManage: false });
+    const proposedLane = [...container.querySelectorAll<HTMLButtonElement>('nav[aria-label="Board lanes"] button')]
+      .find((item) => item.textContent?.includes('Proposed'))!;
+    act(() => proposedLane.click());
+    expect(container.textContent).toContain('✓ accept');
+    expect(container.textContent).toContain('✕ reject');
+  });
+
   it('renders one touch-selected lane without drag or bulk controls on phones', () => {
     mockPhoneViewport();
     const todo = task('task_todo', 'BRD-10', 'Phone todo task');

@@ -21,14 +21,14 @@ const task: TaskVM = {
 
 const tick = () => act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
 
-function mount(selectedTask: TaskVM = task) {
+function mount(selectedTask: TaskVM = task, permissions = { canContribute: true, canManage: true }) {
   const moveTask = vi.fn();
   const store = {
     currentPid: 'prj_plnr',
     selectedTaskId: selectedTask.id,
     draftKind: 'comment',
     draftText: '',
-    permissions: { canContribute: true, canManage: true },
+    permissions,
     snapshot: {
       tags: [], milestones: [], boards: [{ id: 'board_1', name: 'Main' }], signals: [], externalTasks: [],
     },
@@ -137,6 +137,25 @@ describe('task detail editing (PLNR-429)', () => {
     expect(text).not.toContain('· run ');
     expect(text).toContain('Accept');
     expect(text).toContain('Reject');
+  });
+
+  it('lets contributors decide a proposed task from its drawer', async () => {
+    mount({
+      ...task,
+      status: 'proposed',
+      proposedAt: '2026-08-14T12:00:00.000Z',
+      proposal: {
+        finding: 'A contributor should be able to accept this work.',
+        filedBy: { kind: 'copilot', id: 'agt_copilot_123456' },
+        sourceTaskId: null,
+        executionId: 'exe_1',
+        runId: null,
+      },
+    }, { canContribute: true, canManage: false });
+    await tick();
+
+    expect(container.querySelector('.task-drawer')?.textContent).toContain('Accept');
+    expect(container.querySelector('.task-drawer')?.textContent).toContain('Reject');
   });
 
   it('retains Runner run provenance when it is available', async () => {

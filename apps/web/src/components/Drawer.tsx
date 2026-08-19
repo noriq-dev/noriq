@@ -414,7 +414,7 @@ export function Drawer({ store }: { store: AppStore }) {
                 {task.proposal.finding && (
                   <div style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-soft)', whiteSpace: 'pre-wrap' }}>{task.proposal.finding}</div>
                 )}
-                {task.status === 'proposed' && store.permissions.canManage && (
+                {task.status === 'proposed' && store.permissions.canContribute && (
                   <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
                     <span style={{ fontSize: 11.5, color: 'var(--amber)', alignSelf: 'center' }}>
                       ⏳ awaiting your decision — no agent can claim this until you accept

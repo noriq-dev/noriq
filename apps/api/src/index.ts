@@ -245,7 +245,6 @@ const MANAGER_ROUTES = [
   /\/runs$/,
   /\/plans\/[^/]+\/dispatch$/,
   /\/plans\/[^/]+\/(approve|reject)$/,
-  /\/tasks\/[^/]+\/proposal\/(accept|reject)$/,
   /\/locks\/[^/]+\/force-release$/,
   /\/search\/reindex$/,
   /\/memory\/repositories(?:\/[^/]+)?$/,
