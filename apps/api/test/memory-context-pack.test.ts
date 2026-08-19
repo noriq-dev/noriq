@@ -114,6 +114,24 @@ function withCodeSearch(
   }) as Env;
 }
 
+function withDocumentSearch(
+  matches: Array<{ id: string; score: number; metadata: Record<string, string> }>,
+): Env {
+  return new Proxy(appEnv, {
+    get(target, property, receiver) {
+      if (property === 'AI') return { run: async () => ({ data: [[1, 0, 0]] }) };
+      if (property === 'VECTORIZE') {
+        return {
+          query: async (_vector: number[], options: { topK: number }) => ({ matches: matches.slice(0, options.topK) }),
+          upsert: async () => undefined,
+          deleteByIds: async () => undefined,
+        };
+      }
+      return Reflect.get(target as object, property, receiver);
+    },
+  }) as Env;
+}
+
 beforeAll(async () => {
   agent = await createAgent('memory-context-pack-agent');
 }, 60000);
@@ -204,6 +222,103 @@ describe('fitCodeExcerpts — deterministic structured source fitting', () => {
 // -------------------------------------------------------------------------------------------
 
 describe('assembleContextPack — required facts are never displaced, at any budget', () => {
+  it('keeps linked project docs and member-plan docs as metadata-only required facts', async () => {
+    const projectId = await newProject('MCPDOCS');
+    const linked = await mcpCall(agent.apiKey, 'create_doc', {
+      projectId, name: 'Settled routing contract', description: 'The approved routing rules',
+      body: 'This full body must never enter the context pack.', tags: ['context-pack-test'],
+    });
+    const made = await mcpCall(agent.apiKey, 'create_task', {
+      projectId, title: 'Apply settled routing contract', tags: ['context-pack-test'], docIds: [linked.body.id],
+    });
+    const outsider = await mcpCall(agent.apiKey, 'create_task', {
+      projectId, title: 'Unrelated task outside the plan', tags: ['context-pack-test'],
+    });
+    const plan = await mcpCall(agent.apiKey, 'create_plan', {
+      projectId, title: 'Routing rollout', description: 'Working rollout plan',
+      phases: [{ title: 'Implement', taskIds: [made.body.id] }],
+    });
+    const working = await mcpCall(agent.apiKey, 'create_plan_doc', {
+      projectId, planId: plan.body.id, name: 'Open rollout notes',
+      description: 'Provisional decisions for this rollout', body: 'TBD: this remains provisional.',
+    });
+
+    const tiny = await assembleContextPack(appEnv, projectId, made.body.id as string, { tokenBudget: 1 });
+    expect(tiny.taskFacts.relatedDocuments).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'project_doc', id: linked.body.id, relationship: 'task_link', provisional: false,
+        description: 'The approved routing rules', readRef: { kind: 'project_doc', docId: linked.body.id },
+      }),
+      expect.objectContaining({
+        kind: 'plan_doc', id: working.body.id, relationship: 'plan_membership', provisional: true,
+        description: 'Provisional decisions for this rollout',
+        plan: expect.objectContaining({ id: plan.body.id, title: 'Routing rollout', phaseTitle: 'Implement' }),
+      }),
+    ]));
+    expect(JSON.stringify(tiny.taskFacts.relatedDocuments)).not.toContain('This full body');
+    expect(JSON.stringify(tiny.taskFacts.relatedDocuments)).not.toContain('TBD:');
+
+    const outside = await assembleContextPack(appEnv, projectId, outsider.body.id as string, { tokenBudget: 10_000 });
+    expect(outside.taskFacts.relatedDocuments).toEqual([]);
+  });
+
+  it('adds bounded semantic project-doc metadata, deduplicates explicit links, and marks vector freshness unverified', async () => {
+    const projectId = await newProject('MCPSEMDO');
+    const linked = await mcpCall(agent.apiKey, 'create_doc', {
+      projectId, name: 'Linked cache contract', description: 'Explicit task contract', body: 'cache contract', tags: ['context-pack-test'],
+    });
+    const discovered = await mcpCall(agent.apiKey, 'create_doc', {
+      projectId, name: 'Cache eviction architecture', description: 'Settled eviction behavior', body: 'cache eviction behavior', tags: ['context-pack-test'],
+    });
+    const made = await mcpCall(agent.apiKey, 'create_task', {
+      projectId, title: 'Repair cache eviction behavior', body: '', tags: ['context-pack-test'], docIds: [linked.body.id],
+    });
+    const searchEnv = withDocumentSearch([
+      { id: `doc:${linked.body.id}#0`, score: 0.99, metadata: { projectId, kind: 'doc', entityId: linked.body.id } },
+      { id: `doc:${discovered.body.id}#0`, score: 0.91, metadata: { projectId, kind: 'doc', entityId: discovered.body.id } },
+      { id: 'doc:foreign#0', score: 0.9, metadata: { projectId: 'prj_foreign', kind: 'doc', entityId: 'foreign' } },
+    ]);
+
+    const pack = await assembleContextPack(searchEnv, projectId, made.body.id as string, { tokenBudget: 20_000 });
+    const documents = pack.sections.find((section) => section.id === 'related_documents')!;
+    expect(documents.provenance).toEqual(['semantic']);
+    expect(documents.documentReferences).toEqual([
+      expect.objectContaining({
+        id: discovered.body.id, name: 'Cache eviction architecture', description: 'Settled eviction behavior',
+        relationship: 'semantic', provisional: false,
+        retrieval: { mode: 'semantic', score: 0.91, indexFreshness: 'unverified' },
+      }),
+    ]);
+    expect(documents.documentReferences?.some((document) => document.id === linked.body.id)).toBe(false);
+  });
+
+  it('labels keyword document fallback and never searches plan-local docs globally', async () => {
+    const projectId = await newProject('MCPKEYDO');
+    const made = await mcpCall(agent.apiKey, 'create_task', {
+      projectId, title: 'Payment retry', tags: ['context-pack-test'],
+    });
+    const projectDoc = await mcpCall(agent.apiKey, 'create_doc', {
+      projectId, name: 'Payment retry policy', description: 'Settled payment retry behavior', body: 'payment retry', tags: ['context-pack-test'],
+    });
+    const plan = await mcpCall(agent.apiKey, 'create_plan', {
+      projectId, title: 'Payment plan', phases: [{ title: 'Work', taskIds: [made.body.id] }],
+    });
+    const planDoc = await mcpCall(agent.apiKey, 'create_plan_doc', {
+      projectId, planId: plan.body.id, name: 'Payment retry scratch', description: 'payment retry working notes', body: 'payment retry',
+    });
+
+    const pack = await assembleContextPack(appEnv, projectId, made.body.id as string, { tokenBudget: 20_000 });
+    const documents = pack.sections.find((section) => section.id === 'related_documents')!;
+    expect(documents.provenance).toEqual(['lexical']);
+    expect(documents.documentReferences).toEqual([
+      expect.objectContaining({
+        id: projectDoc.body.id,
+        retrieval: expect.objectContaining({ mode: 'keyword', indexFreshness: 'current' }),
+      }),
+    ]);
+    expect(documents.documentReferences?.some((document) => document.id === planDoc.body.id)).toBe(false);
+  });
+
   it('a small and a large budget both carry the FULL required facts; only retrieved sections shrink', async () => {
     const projectId = await newProject('MCP1');
     const made = await mcpCall(agent.apiKey, 'create_task', {
@@ -288,6 +403,7 @@ describe('assembleContextPack — required facts are never displaced, at any bud
     });
     const taskId = made.body.id as string;
     await mcpCall(agent.apiKey, 'record_memory', { projectId, kind: 'hazard', statement: 'probe task touches a shared cache' });
+    await memory(projectId).reconcile(projectId);
 
     const a = await assembleContextPack(appEnv, projectId, taskId, { tokenBudget: 2000, branch: 'main', baseId: 'sha-1' });
     const b = await assembleContextPack(appEnv, projectId, taskId, { tokenBudget: 2000, branch: 'main', baseId: 'sha-1' });

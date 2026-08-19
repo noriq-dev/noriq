@@ -42,8 +42,12 @@ export interface SearchHit {
   key?: string;
   title: string;
   snippet: string;
+  /** Authored document/plan description, distinct from a generated body snippet. */
+  description?: string;
   score: number;
   status?: string;
+  /** Current canonical D1 update time for authored task/doc/plan entities. */
+  updatedAt?: string;
   /** memory/episode only — current authority (1-5), read live from the canonical row. */
   authority?: number;
   /** memory only — current validity ('active' | 'stale' | 'invalid'), read live. */
@@ -222,7 +226,7 @@ async function hydrate(
 ): Promise<SearchHit[]> {
   const byKind: Record<SearchKind, string[]> = { task: [], doc: [], plan: [], memory: [], episode: [] };
   for (const r of refs) byKind[r.kind].push(r.id);
-  const rows = new Map<string, { title: string; snippet: string; key?: string; status?: string; authority?: number; validity?: string }>();
+  const rows = new Map<string, { title: string; snippet: string; description?: string; key?: string; status?: string; updatedAt?: string; authority?: number; validity?: string }>();
   const inList = (ids: string[]) => ids.map(() => '?').join(',');
   const db = env.DB;
   if (byKind.task.length) {
@@ -234,9 +238,10 @@ async function hydrate(
   }
   if (byKind.doc.length) {
     const { results } = await db.prepare(
-      `SELECT id, name, description, substr(body, 1, 200) AS snippet FROM docs WHERE id IN (${inList(byKind.doc)})`,
-    ).bind(...byKind.doc).all<{ id: string; name: string; description: string; snippet: string }>();
-    for (const d of results) rows.set(`doc:${d.id}`, { title: d.name, snippet: d.description || d.snippet || '' });
+      `SELECT id, name, description, substr(body, 1, 200) AS snippet, updated_at AS updatedAt
+         FROM docs WHERE id IN (${inList(byKind.doc)})`,
+    ).bind(...byKind.doc).all<{ id: string; name: string; description: string; snippet: string; updatedAt: string }>();
+    for (const d of results) rows.set(`doc:${d.id}`, { title: d.name, description: d.description, snippet: d.description || d.snippet || '', updatedAt: d.updatedAt });
   }
   if (byKind.plan.length) {
     const { results } = await db.prepare(
@@ -317,10 +322,10 @@ export async function keywordSearch(env: Env, opts: SearchOptions): Promise<Sear
   if (kinds.includes('doc')) {
     const { results } = await run({
       table: 'docs', title: 'name', body: ['description', 'body'], order: 'updated_at',
-      select: 'id, project_id AS projectId, name AS title, description, substr(body, 1, 200) AS snippet',
+      select: 'id, project_id AS projectId, name AS title, description, substr(body, 1, 200) AS snippet, updated_at AS updatedAt',
     });
-    for (const d of results as Array<{ id: string; projectId: string; title: string; description: string; snippet: string; rank: number }>) {
-      hits.push({ kind: 'doc', id: d.id, projectId: d.projectId, title: d.title, snippet: d.description || d.snippet || '', score: (d.rank + 1) / (terms.length + 1) });
+    for (const d of results as Array<{ id: string; projectId: string; title: string; description: string; snippet: string; updatedAt: string; rank: number }>) {
+      hits.push({ kind: 'doc', id: d.id, projectId: d.projectId, title: d.title, description: d.description, snippet: d.description || d.snippet || '', updatedAt: d.updatedAt, score: (d.rank + 1) / (terms.length + 1) });
     }
   }
   if (kinds.includes('plan')) {

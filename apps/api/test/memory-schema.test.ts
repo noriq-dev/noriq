@@ -7,6 +7,7 @@ import {
   AUTHORITY_HYPOTHESIS,
   BaseId,
   ContextPack,
+  IntelligenceContextConsumptionMetric,
   EffortEpisode,
   EntityRef,
   EvidenceRef,
@@ -247,13 +248,46 @@ describe('ContextPack (§10)', () => {
       taskFacts: {
         taskId: 'task_1', key: 'PLNR-1', title: 'x', body: null, status: 'todo', priority: 2,
         claimedBy: null, claimExpiresAt: null, openComments: [], executionSpec: null, executionSpecUnreadable: false,
+        relatedDocuments: [{
+          kind: 'project_doc', id: 'doc_1', name: 'Architecture', description: 'Settled architecture',
+          updatedAt: '2026-08-05T00:00:00.000Z', relationship: 'task_link', provisional: false, plan: null,
+          retrieval: { mode: 'explicit', score: null, indexFreshness: 'current' },
+          readRef: { kind: 'project_doc', docId: 'doc_1' },
+        }],
       },
-      sections: [],
+      sections: [{
+        id: 'related_documents', provenance: ['semantic'], notice: null,
+        charsAllotted: 1000, charsUsed: 100, excerpts: [], graphEntities: [], coverage: null, items: [],
+        documentReferences: [{
+          kind: 'project_doc', id: 'doc_2', name: 'Related design', description: 'Potentially relevant',
+          updatedAt: '2026-08-05T00:00:00.000Z', relationship: 'semantic', provisional: false, plan: null,
+          retrieval: { mode: 'semantic', score: 0.82, indexFreshness: 'unverified' },
+          readRef: { kind: 'project_doc', docId: 'doc_2' },
+        }],
+      }],
     });
     expect(pack.verifiedDecisions).toEqual([]);
     expect(pack.relevantEntities).toHaveLength(1);
     expect(pack.role).toBe('human'); // defaults
     expect(pack.mode).toBe('keyword'); // defaults
+    expect(pack.taskFacts.relatedDocuments).toHaveLength(1);
+    expect(pack.sections[0]?.documentReferences).toHaveLength(1);
+  });
+
+  it('round-trips typed document counts in context-consumption analytics', () => {
+    const metric = IntelligenceContextConsumptionMetric.parse({
+      status: 'complete', value: {
+        mode: 'semantic', role: 'build', charBudget: 24_000, charsUsed: 12_000,
+        sections: [{
+          id: 'related_documents', excerptCount: 0, graphEntityCount: 0,
+          documentReferenceCount: 7, truncated: false, unanswerable: false,
+        }],
+        similarEpisodesConsidered: 0, staleCitationsCount: 0, noticesCount: 0, retrievalTookMs: 8,
+      },
+      provenance: 'runner_observed', source: 'runner', sourceId: 'run_1',
+      observedAt: '2026-08-05T00:00:00.000Z', acceptedAt: null, reason: null,
+    });
+    expect(metric.value?.sections[0]?.documentReferenceCount).toBe(7);
   });
 });
 

@@ -30,12 +30,14 @@ import { effortSignals } from './similar-effort';
 import { verifiedForBase, type CallerBaseScope } from './verification';
 import { renderEvidenceFrame, type EvidenceFrameItem, type EvidenceFrameResult } from './evidence-frame';
 import { codeSearchBackend, queryCodeIndex } from './code-index';
+import { search } from '../search';
 import {
   buildEntityUri,
   type ContextPack,
   type ContextPackCitation,
   type ContextPackCodeExcerpt,
   type ContextPackCoverage,
+  type ContextPackDocumentReference,
   type ContextPackEpisodeExcerpt,
   type ContextPackGraphEntity,
   type ContextPackMemoryExcerpt,
@@ -62,6 +64,7 @@ export const DEFAULT_CHAR_BUDGET = 24_000;
 const MAX_CANDIDATES_PER_SECTION = 8;
 const MAX_CODE_EXCERPTS = 8;
 const MAX_CODE_EXCERPT_CHARS = 2400;
+const MAX_RELATED_DOCUMENTS = 12;
 // Only section-level fitting uses this floor. A complete canonical excerpt shorter than the floor
 // is still useful and may pass through unchanged; when content must be shortened, however, we do
 // not spend most of the remaining section on identity metadata for less than this much source.
@@ -86,6 +89,7 @@ export interface SectionSpec<Id extends string = ContextPackSectionId> {
 export const SECTION_ORDER: readonly SectionSpec[] = [
   { id: 'active_decisions', weight: 3 },
   { id: 'known_hazards', weight: 2 },
+  { id: 'related_documents', weight: 2 },
   { id: 'failed_approaches', weight: 2 },
   { id: 'relevant_memories', weight: 2 },
   { id: 'similar_episodes', weight: 2 },
@@ -431,6 +435,44 @@ interface OpenCommentRow {
   createdAt: string;
 }
 
+interface LinkedDocumentRow {
+  id: string;
+  name: string;
+  description: string;
+  updatedAt: string;
+}
+
+interface PlanDocumentRow extends LinkedDocumentRow {
+  planId: string;
+  planTitle: string;
+  planStatus: string;
+  phaseId: string;
+  phaseTitle: string;
+  phaseOrder: number;
+}
+
+function linkedDocumentReference(row: LinkedDocumentRow): ContextPackDocumentReference {
+  return {
+    kind: 'project_doc', id: row.id, name: row.name, description: row.description,
+    updatedAt: row.updatedAt, relationship: 'task_link', provisional: false, plan: null,
+    retrieval: { mode: 'explicit', score: null, indexFreshness: 'current' },
+    readRef: { kind: 'project_doc', docId: row.id },
+  };
+}
+
+function planDocumentReference(row: PlanDocumentRow): ContextPackDocumentReference {
+  return {
+    kind: 'plan_doc', id: row.id, name: row.name, description: row.description,
+    updatedAt: row.updatedAt, relationship: 'plan_membership', provisional: true,
+    plan: {
+      id: row.planId, title: row.planTitle, status: row.planStatus,
+      phaseId: row.phaseId, phaseTitle: row.phaseTitle, phaseOrder: row.phaseOrder,
+    },
+    retrieval: { mode: 'explicit', score: null, indexFreshness: 'current' },
+    readRef: { kind: 'plan_doc', planId: row.planId, docId: row.id },
+  };
+}
+
 /**
  * Assemble one task-aware context pack (§10). `taskId` MUST already be resolved to its canonical
  * id and known to belong to `projectId` — same contract every other `memory/*.ts` module and
@@ -466,10 +508,31 @@ export async function assembleContextPack(
 
   const derivedStatus = row.failed_at ? 'failed' : row.proposed_at && row.status === 'todo' ? 'proposed' : row.status;
   const storedSpec = readExecutionSpec(row.execution_spec, row.id);
-  const { results: openCommentRows } = await env.DB.prepare(
-    `SELECT id, kind, body, author_kind AS authorKind, author_id AS authorId, created_at AS createdAt
-     FROM comments WHERE task_id = ? AND status IN ('open','acknowledged') ORDER BY created_at ASC`,
-  ).bind(row.id).all<OpenCommentRow>();
+  const [openComments, linkedDocs, planDocs] = await Promise.all([
+    env.DB.prepare(
+      `SELECT id, kind, body, author_kind AS authorKind, author_id AS authorId, created_at AS createdAt
+         FROM comments WHERE task_id = ? AND status IN ('open','acknowledged') ORDER BY created_at ASC`,
+    ).bind(row.id).all<OpenCommentRow>(),
+    env.DB.prepare(
+      `SELECT d.id, d.name, d.description, d.updated_at AS updatedAt
+         FROM task_docs td JOIN docs d ON d.id = td.doc_id
+        WHERE td.task_id = ? AND d.project_id = ? ORDER BY d.name, d.id`,
+    ).bind(row.id, projectId).all<LinkedDocumentRow>(),
+    env.DB.prepare(
+      `SELECT pd.id, pd.name, pd.description, pd.updated_at AS updatedAt,
+              pl.id AS planId, pl.title AS planTitle, pl.status AS planStatus,
+              ph.id AS phaseId, ph.title AS phaseTitle, ph."order" AS phaseOrder
+         FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id
+         JOIN plans pl ON pl.id = ph.plan_id
+         JOIN plan_docs pd ON pd.plan_id = pl.id
+        WHERE pt.task_id = ? AND pl.project_id = ?
+        ORDER BY pl.created_at, ph."order", pd.updated_at DESC, pd.id`,
+    ).bind(row.id, projectId).all<PlanDocumentRow>(),
+  ]);
+  const relatedDocuments = [
+    ...linkedDocs.results.map(linkedDocumentReference),
+    ...planDocs.results.map(planDocumentReference),
+  ];
 
   const taskFacts: ContextPackTaskFacts = {
     taskId: row.id,
@@ -480,9 +543,10 @@ export async function assembleContextPack(
     priority: row.priority,
     claimedBy: row.claimed_by,
     claimExpiresAt: row.claim_expires_at,
-    openComments: openCommentRows,
+    openComments: openComments.results,
     executionSpec: storedSpec.spec,
     executionSpecUnreadable: !!storedSpec.unreadable,
+    relatedDocuments,
   };
   const anticipatedFiles = storedSpec.spec?.anticipatedFiles?.map((f) => f.path) ?? [];
 
@@ -520,7 +584,7 @@ export async function assembleContextPack(
     }
   }
 
-  const [searchResult, effortResult, depResult, testsResult, lockRows, codeResult] = await Promise.all([
+  const [searchResult, effortResult, depResult, testsResult, lockRows, codeResult, documentSearch] = await Promise.all([
     stub.searchProjectMemory(projectId, {
       query: signals.queryText || undefined,
       taskId: row.id,
@@ -551,7 +615,35 @@ export async function assembleContextPack(
         ).bind(projectId).all<{ id: string; taskId: string | null; agentId: string; canonPattern: string; taskKey: string | null; taskTitle: string | null; taskStatus: string | null }>()
       : Promise.resolve({ results: [] as Array<{ id: string; taskId: string | null; agentId: string; canonPattern: string; taskKey: string | null; taskTitle: string | null; taskStatus: string | null }> }),
     retrieveCodeExcerpts(env, stub, projectId, input, signals.queryText || row.title),
+    search(env, {
+      q: signals.queryText || row.title,
+      projectIds: [projectId], kinds: ['doc'], limit: MAX_RELATED_DOCUMENTS,
+    }).then((result) => ({ ...result, unavailableReason: null as string | null })).catch(() => ({
+      mode: 'keyword' as const, results: [], unavailableReason: 'document search failed',
+    })),
   ]);
+
+  const directProjectDocIds = new Set(relatedDocuments
+    .filter((document) => document.kind === 'project_doc')
+    .map((document) => document.id));
+  const documentCandidates: ContextPackDocumentReference[] = documentSearch.results
+    .filter((hit) => hit.kind === 'doc' && hit.projectId === projectId && !!hit.updatedAt && !directProjectDocIds.has(hit.id))
+    .map((hit) => ({
+      kind: 'project_doc' as const,
+      id: hit.id,
+      name: hit.title,
+      description: hit.description ?? '',
+      updatedAt: hit.updatedAt!,
+      relationship: 'semantic' as const,
+      provisional: false,
+      plan: null,
+      retrieval: {
+        mode: documentSearch.mode,
+        score: hit.score,
+        indexFreshness: documentSearch.mode === 'semantic' ? 'unverified' as const : 'current' as const,
+      },
+      readRef: { kind: 'project_doc' as const, docId: hit.id },
+    }));
 
   // Bucket searchProjectMemory's hits by kind — one call feeds five sections (locked-decision-
   // adjacent efficiency: it's the SAME retrieval every one of those sections would otherwise
@@ -657,6 +749,21 @@ export async function assembleContextPack(
           id: spec.id, provenance: taken.length ? memoryHitStages(hazardHits) : ['none'],
           notice: truncated ? { kind: 'truncated', reason: `${hazardExcerpts.length - taken.length} more hazard(s) did not fit in ${cap} characters` } : null,
           charsAllotted: cap, charsUsed: used, excerpts: taken, graphEntities: [], coverage: null, items: [],
+        };
+        break;
+      }
+      case 'related_documents': {
+        if (documentSearch.unavailableReason) {
+          section = emptySection(spec.id, cap, { kind: 'unanswerable', reason: documentSearch.unavailableReason });
+          break;
+        }
+        const { taken, used, truncated } = fillGreedy(documentCandidates, cap);
+        section = {
+          id: spec.id,
+          provenance: taken.length ? [documentSearch.mode === 'semantic' ? 'semantic' : 'lexical'] : ['none'],
+          notice: truncated ? { kind: 'truncated', reason: `${documentCandidates.length - taken.length} more document reference(s) did not fit in ${cap} characters` } : null,
+          charsAllotted: cap, charsUsed: used, excerpts: [], graphEntities: [], coverage: null,
+          documentReferences: taken, items: [],
         };
         break;
       }
