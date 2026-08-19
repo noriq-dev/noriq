@@ -1,7 +1,7 @@
 // PLNR-303: one read-only view model shared by task preview and dispatch UI. It composes the
 // already-authoritative context/risk/bottleneck/comparison paths and never changes claimability,
 // a selected strategy, a budget, or the dispatch payload.
-import type { RunBudget } from '@noriq-dev/shared';
+import type { ContextPackDocumentReference, RunBudget } from '@noriq-dev/shared';
 import type { Env } from '../env';
 import { resolveRepositoryByKey } from '../lib/project-memory';
 import {
@@ -11,8 +11,9 @@ import { assessPreDispatchRisk } from './scope-risk';
 import {
   queryStrategyComparison, type ComparisonMetric, type StrategyDimension,
 } from './strategy-comparison';
+import { assembleContextPack } from './context-pack';
 
-export const DISPATCH_INTELLIGENCE_VERSION = 'dispatch-intelligence-v1';
+export const DISPATCH_INTELLIGENCE_VERSION = 'dispatch-intelligence-v2';
 
 export interface DispatchIntelligenceInput {
   taskId: string;
@@ -24,6 +25,35 @@ export interface DispatchIntelligenceInput {
   budget?: RunBudget | null;
   comparison?: { dimension: StrategyDimension; metric: ComparisonMetric };
   executorMode?: IntelligenceExecutorMode;
+}
+
+export interface DispatchIntelligenceComposition {
+  /** Reuse a caller's canonical pack (notably get_task_context) instead of assembling again. */
+  contextPack?: Awaited<ReturnType<typeof assembleContextPack>> | Promise<Awaited<ReturnType<typeof assembleContextPack>>>;
+  /** Narrow test seam that proves the production path performs one assembly. */
+  assemble?: typeof assembleContextPack;
+}
+
+function documentContext(pack: Awaited<ReturnType<typeof assembleContextPack>>) {
+  const required = pack.taskFacts.relatedDocuments ?? [];
+  const retrievedSection = pack.sections.find((section) => section.id === 'related_documents');
+  const retrieved = retrievedSection?.documentReferences ?? [];
+  const byRelationship = (relationship: ContextPackDocumentReference['relationship']) =>
+    required.filter((document) => document.relationship === relationship);
+  return {
+    kind: 'metadata_only_document_context' as const,
+    bodiesIncluded: false as const,
+    linkedProjectDocuments: byRelationship('task_link'),
+    planLocalDocuments: byRelationship('plan_membership'),
+    semanticDocuments: retrieved,
+    coverage: {
+      retrievalMode: retrieved[0]?.retrieval.mode ?? null,
+      empty: retrieved.length === 0 && retrievedSection?.notice == null,
+      unavailable: retrievedSection?.notice?.kind === 'unanswerable',
+      truncated: retrievedSection?.notice?.kind === 'truncated',
+      notice: retrievedSection?.notice ?? null,
+    },
+  };
 }
 
 export async function resolveDispatchRepository(
@@ -49,6 +79,7 @@ export async function resolveDispatchRepository(
 
 export async function getDispatchIntelligence(
   env: Env, projectId: string, input: DispatchIntelligenceInput,
+  composition: DispatchIntelligenceComposition = {},
 ) {
   const repository = await resolveDispatchRepository(
     env, projectId, input.runnerId, input.repositoryCheckoutId, input.repositoryKey,
@@ -60,9 +91,20 @@ export async function getDispatchIntelligence(
     branch: input.branch ?? null,
     baseId: input.baseId ?? null,
   };
-  const [risk, bottlenecks, comparison] = await Promise.all([
+  const assembledPack = composition.contextPack
+    ? Promise.resolve(composition.contextPack)
+    : (composition.assemble ?? assembleContextPack)(env, projectId, input.taskId, {
+        ...context, role: 'scope', tokenBudget: 8_000,
+      });
+  const packPromise = assembledPack.then((pack) => {
+    if (pack.projectId !== projectId || pack.taskId !== input.taskId) {
+      throw new Error('preassembled context pack does not match the dispatch intelligence target');
+    }
+    return pack;
+  });
+  const [risk, bottlenecks, comparison, pack] = await Promise.all([
     assessPreDispatchRisk(env, projectId, input.taskId, {
-      ...context, budget: input.budget ?? null, observedAt,
+      ...context, budget: input.budget ?? null, observedAt, contextPack: packPromise,
     }),
     assessProjectBottlenecks(env, projectId, {
       taskId: input.taskId, ...context, observedAt, executorMode,
@@ -70,6 +112,7 @@ export async function getDispatchIntelligence(
     input.comparison
       ? queryStrategyComparison(env, projectId, input.comparison)
       : Promise.resolve(null),
+    packPromise,
   ]);
   return {
     advisory: true as const,
@@ -95,6 +138,7 @@ export async function getDispatchIntelligence(
       coverage: bottlenecks.coverage,
       sources: bottlenecks.sources.current,
     },
+    documents: documentContext(pack),
     constraints: risk.currentAuthority,
     quotedEvidence: risk.quotedMemoryEvidence,
     historical: risk.priorEvidence,
@@ -146,6 +190,13 @@ export function summarizeDispatchIntelligence(
       observation: packet.observations.scope.observation,
     },
     historicalCaseCount: packet.historical.cases.length,
+    documents: {
+      linkedProjectCount: packet.documents.linkedProjectDocuments.length,
+      planLocalCount: packet.documents.planLocalDocuments.length,
+      semanticCount: packet.documents.semanticDocuments.length,
+      coverage: packet.documents.coverage,
+      metadataOnly: true as const,
+    },
     fullPacketTool: 'get_task_context' as const,
     fullPacketArguments: { intelligenceDetail: 'full' as const },
   };

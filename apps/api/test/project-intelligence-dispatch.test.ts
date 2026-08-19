@@ -2,6 +2,7 @@ import { env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import type { Env } from '../src/env';
 import { getDispatchIntelligence } from '../src/memory/dispatch-intelligence';
+import { assembleContextPack } from '../src/memory/context-pack';
 import { createAgent, mcpCall } from './helpers';
 
 const appEnv = env as unknown as Env;
@@ -29,11 +30,18 @@ describe('dispatch-time Project Intelligence (PLNR-303)', () => {
        VALUES (?, ?, ?, ?, 'todo', 2, ?)`,
     ).bind(item.id, projectId, item.key, `Bounded task ${index + 1}`, index)));
 
+    let assemblies = 0;
     const result = await getDispatchIntelligence(appEnv, projectId, {
       taskId: tasks[0]!.id,
       executorMode: 'copilot',
+    }, {
+      assemble: async (...args) => {
+        assemblies++;
+        return assembleContextPack(...args);
+      },
     });
 
+    expect(assemblies).toBe(1);
     expect(result.current.readiness).toMatchObject({
       taskId: tasks[0]!.id,
       primary: 'ready',
@@ -99,6 +107,7 @@ describe('dispatch-time Project Intelligence (PLNR-303)', () => {
       repository: { key: 'noriq', reason: null },
       readiness: { taskId, primary: 'ready' },
       fullPacketTool: 'get_task_context',
+      documents: { linkedProjectCount: 0, planLocalCount: 0, metadataOnly: true },
     });
     expect(context.body.intelligenceSummary).not.toHaveProperty('quotedEvidence');
 
@@ -109,6 +118,43 @@ describe('dispatch-time Project Intelligence (PLNR-303)', () => {
     expect(unregistered.body.targetContext).toMatchObject({
       repositoryKey: null, repositoryResolutionReason: 'repository key is not registered to this project',
     });
+  });
+
+  it('reuses the MCP context pack and exposes identical complete document metadata in full detail', async () => {
+    const projectId = (await mcpCall(owner.apiKey, 'create_project', {
+      key: 'PIDOCS', name: 'Dispatch document intelligence',
+    })).body.id as string;
+    const linked = await mcpCall(owner.apiKey, 'create_doc', {
+      projectId, name: 'Settled dispatch architecture', description: 'Required architecture',
+      body: 'The full settled body stays behind get_doc.', tags: ['analytics-test'],
+    });
+    const task = await mcpCall(owner.apiKey, 'create_task', {
+      projectId, title: 'Enrich dispatch document context', tags: ['analytics-test'], docIds: [linked.body.id],
+    });
+    const plan = await mcpCall(owner.apiKey, 'create_plan', {
+      projectId, title: 'Document rollout', phases: [{ title: 'Compose', taskIds: [task.body.id] }],
+    });
+    const planDoc = await mcpCall(owner.apiKey, 'create_plan_doc', {
+      projectId, planId: plan.body.id, name: 'Working rollout notes',
+      description: 'Provisional plan notes', body: 'The provisional body stays behind get_plan_doc.',
+    });
+
+    const restPacket = await getDispatchIntelligence(appEnv, projectId, { taskId: task.body.id as string });
+    const full = await mcpCall(owner.apiKey, 'get_task_context', {
+      projectId, taskId: task.body.id, intelligenceDetail: 'full', budgetTokens: 8_000,
+    });
+    expect(full.isError).toBe(false);
+    expect(full.body.intelligence.version).toBe('dispatch-intelligence-v2');
+    expect(full.body.intelligence.documents).toEqual(restPacket.documents);
+    expect(full.body.intelligence.documents).toMatchObject({
+      kind: 'metadata_only_document_context', bodiesIncluded: false,
+      linkedProjectDocuments: [expect.objectContaining({ id: linked.body.id, relationship: 'task_link' })],
+      planLocalDocuments: [expect.objectContaining({
+        id: planDoc.body.id, relationship: 'plan_membership', provisional: true,
+      })],
+    });
+    expect(JSON.stringify(full.body.intelligence.documents)).not.toContain('full settled body');
+    expect(JSON.stringify(full.body.intelligence.documents)).not.toContain('provisional body');
   });
 
   it('loads an explicitly opened completed task outside the bounded open-task inventory', async () => {
@@ -163,7 +209,7 @@ describe('dispatch-time Project Intelligence (PLNR-303)', () => {
     const after = await appEnv.DB.prepare('SELECT COUNT(*) AS count FROM similar_effort_occurrences WHERE project_id = ?')
       .bind(projectId).first<{ count: number }>();
     expect(result).toMatchObject({
-      advisory: true, version: 'dispatch-intelligence-v1',
+      advisory: true, version: 'dispatch-intelligence-v2',
       feedback: { requiresExplicitHumanAction: true, previewCreatesOccurrence: false },
       current: { collisions: { locking: { status: 'unanswerable', enabled: false, current: [] } } },
       targetContext: { repositoryKey: null, repositoryResolutionReason: 'runner checkout context was not supplied' },

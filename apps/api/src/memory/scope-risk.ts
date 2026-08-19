@@ -20,6 +20,8 @@ export interface PreDispatchRiskInput {
   baseId?: string | null;
   budget?: RunBudget | null;
   observedAt?: string;
+  /** Internal composition seam: Dispatch Intelligence supplies its one canonical assembly. */
+  contextPack?: Awaited<ReturnType<typeof assembleContextPack>> | Promise<Awaited<ReturnType<typeof assembleContextPack>>>;
 }
 
 interface ObservedRange {
@@ -181,7 +183,7 @@ export async function assessPreDispatchRisk(
       phaseId: string; phaseTitle: string; order: number;
     }>(),
     input.repositoryKey ? resolveRepositoryByKey(env, projectId, input.repositoryKey) : Promise.resolve(null),
-    assembleContextPack(env, projectId, task.id, {
+    input.contextPack ?? assembleContextPack(env, projectId, task.id, {
       repositoryKey: input.repositoryKey ?? null,
       branch: input.branch ?? null,
       baseId: input.baseId ?? null,
