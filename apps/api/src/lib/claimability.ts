@@ -26,17 +26,24 @@ type ClaimTaskFacts = {
   proposedAt: string | null;
 };
 
-const placeholders = (values: readonly unknown[]) => values.map(() => '?').join(',');
+/** D1 caps the number of bound SQL variables per statement. Pass bounded task ids through
+ * json_each as one parameter so project-wide claimability does not multiply that count across
+ * the dependency and phase arms of the blocker query. */
+const requestedTasksCte = `requested_tasks(id) AS (
+  SELECT CAST(value AS TEXT) FROM json_each(?1)
+)`;
 
 async function claimGates(db: D1Database, taskIds: string[]): Promise<Map<string, 'strict' | 'landed'>> {
   if (!taskIds.length) return new Map();
   const { results } = await db.prepare(
-    `SELECT pt.task_id AS taskId, pd.gate, pd.created_at AS createdAt
-       FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id
+    `WITH ${requestedTasksCte}
+     SELECT pt.task_id AS taskId, pd.gate, pd.created_at AS createdAt
+       FROM requested_tasks requested JOIN phase_tasks pt ON pt.task_id = requested.id
+       JOIN phases ph ON ph.id = pt.phase_id
        JOIN plan_dispatches pd ON pd.plan_id = ph.plan_id
-      WHERE pt.task_id IN (${placeholders(taskIds)}) AND pd.status = 'active'
+      WHERE pd.status = 'active'
       ORDER BY pd.created_at DESC, pd.id DESC`,
-  ).bind(...taskIds).all<{ taskId: string; gate: string; createdAt: string }>();
+  ).bind(JSON.stringify(taskIds)).all<{ taskId: string; gate: string; createdAt: string }>();
   const gates = new Map<string, 'strict' | 'landed'>();
   for (const row of results) if (!gates.has(row.taskId)) gates.set(row.taskId, row.gate === 'landed' ? 'landed' : 'strict');
   return gates;
@@ -45,26 +52,29 @@ async function claimGates(db: D1Database, taskIds: string[]): Promise<Map<string
 async function proposedPlanTasks(db: D1Database, taskIds: string[]): Promise<Set<string>> {
   if (!taskIds.length) return new Set();
   const { results } = await db.prepare(
-    `SELECT DISTINCT pt.task_id AS taskId FROM phase_tasks pt
+    `WITH ${requestedTasksCte}
+     SELECT DISTINCT pt.task_id AS taskId
+       FROM requested_tasks requested JOIN phase_tasks pt ON pt.task_id = requested.id
        JOIN phases ph ON ph.id = pt.phase_id JOIN plans pl ON pl.id = ph.plan_id
-      WHERE pt.task_id IN (${placeholders(taskIds)}) AND pl.status = 'proposed'`,
-  ).bind(...taskIds).all<{ taskId: string }>();
+      WHERE pl.status = 'proposed'`,
+  ).bind(JSON.stringify(taskIds)).all<{ taskId: string }>();
   return new Set(results.map((row) => row.taskId));
 }
 
 async function blockerRows(db: D1Database, taskIds: string[]): Promise<Map<string, ClaimBlocker[]>> {
   if (!taskIds.length) return new Map();
-  const ids = placeholders(taskIds);
   const { results } = await db.prepare(
-    `SELECT d.task_id AS taskId, blocker.id AS blockerTaskId, blocker.key, blocker.status,
+    `WITH ${requestedTasksCte}
+     SELECT d.task_id AS taskId, blocker.id AS blockerTaskId, blocker.key, blocker.status,
             'dependency' AS source,
             (EXISTS(SELECT 1 FROM runs r WHERE r.anchor_type = 'task' AND r.anchor_id = blocker.id AND r.status = 'done')
              OR EXISTS(SELECT 1 FROM mission_task_attempts ma
                         JOIN mission_handoffs mh ON mh.root_run_id = ma.root_run_id
                        WHERE ma.task_id = blocker.id AND ma.status = 'review' AND ma.outcome = 'done'
                          AND mh.consumed_at IS NOT NULL)) AS landedRun
-       FROM dependencies d JOIN tasks blocker ON blocker.id = d.depends_on_task_id
-      WHERE d.task_id IN (${ids}) AND blocker.status NOT IN ('done','cancelled')
+       FROM requested_tasks requested JOIN dependencies d ON d.task_id = requested.id
+       JOIN tasks blocker ON blocker.id = d.depends_on_task_id
+      WHERE blocker.status NOT IN ('done','cancelled')
       UNION ALL
      SELECT pt.task_id AS taskId, blocker.id AS blockerTaskId, blocker.key, blocker.status,
             'phase' AS source,
@@ -73,12 +83,13 @@ async function blockerRows(db: D1Database, taskIds: string[]): Promise<Map<strin
                         JOIN mission_handoffs mh ON mh.root_run_id = ma.root_run_id
                        WHERE ma.task_id = blocker.id AND ma.status = 'review' AND ma.outcome = 'done'
                          AND mh.consumed_at IS NOT NULL)) AS landedRun
-       FROM phase_tasks pt JOIN phases ph ON ph.id = pt.phase_id
+       FROM requested_tasks requested JOIN phase_tasks pt ON pt.task_id = requested.id
+       JOIN phases ph ON ph.id = pt.phase_id
        JOIN plans pl ON pl.id = ph.plan_id AND pl.status != 'rejected'
        JOIN phases prev ON prev.plan_id = ph.plan_id AND prev."order" < ph."order"
        JOIN phase_tasks ppt ON ppt.phase_id = prev.id JOIN tasks blocker ON blocker.id = ppt.task_id
-      WHERE pt.task_id IN (${ids}) AND blocker.status NOT IN ('done','cancelled')`,
-  ).bind(...taskIds, ...taskIds).all<{
+      WHERE blocker.status NOT IN ('done','cancelled')`,
+  ).bind(JSON.stringify(taskIds)).all<{
     taskId: string; blockerTaskId: string; key: string; status: string;
     source: 'dependency' | 'phase'; landedRun: number;
   }>();

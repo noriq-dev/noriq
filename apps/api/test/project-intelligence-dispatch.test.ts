@@ -16,6 +16,31 @@ let owner: { apiKey: string };
 beforeAll(async () => { owner = await createAgent('dispatch-intelligence'); }, 60_000);
 
 describe('dispatch-time Project Intelligence (PLNR-303)', () => {
+  it('renders the default 100-task advisory without exceeding D1 bind limits', async () => {
+    const projectId = (await mcpCall(owner.apiKey, 'create_project', {
+      key: 'PIBOUND', name: 'Bounded dispatch intelligence',
+    })).body.id as string;
+    const tasks = Array.from({ length: 100 }, (_, index) => ({
+      id: `task_pi_bound_${index + 1}`,
+      key: `PIBOUND-${index + 1}`,
+    }));
+    await appEnv.DB.batch(tasks.map((item, index) => appEnv.DB.prepare(
+      `INSERT INTO tasks (id, project_id, key, title, status, priority, "order")
+       VALUES (?, ?, ?, ?, 'todo', 2, ?)`,
+    ).bind(item.id, projectId, item.key, `Bounded task ${index + 1}`, index)));
+
+    const result = await getDispatchIntelligence(appEnv, projectId, {
+      taskId: tasks[0]!.id,
+      executorMode: 'copilot',
+    });
+
+    expect(result.current.readiness).toMatchObject({
+      taskId: tasks[0]!.id,
+      primary: 'ready',
+    });
+    expect(result.current.coverage.reasons).not.toContain(expect.stringMatching(/SQL|variable/i));
+  });
+
   it('preserves derived failed status and retry readiness in the full packet (PLNR-514)', async () => {
     const projectId = (await mcpCall(owner.apiKey, 'create_project', {
       key: 'PIFAIL', name: 'Failed dispatch intelligence',
