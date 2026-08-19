@@ -56,6 +56,7 @@ import { renderEvidenceFrame, type EvidenceFrameItem } from './memory/evidence-f
 import { assembleContextPack } from './memory/context-pack';
 import { assessPreDispatchRisk } from './memory/scope-risk';
 import { getDispatchIntelligence, resolveDispatchRepository } from './memory/dispatch-intelligence';
+import { getPlanDispatchIntelligence } from './memory/plan-dispatch-intelligence';
 import {
   COMPARISON_METRICS, queryStrategyComparison, STRATEGY_DIMENSIONS,
 } from './memory/strategy-comparison';
@@ -2330,6 +2331,27 @@ app.post('/api/projects/:pid/memory/dispatch-intelligence', userAuth, async (c) 
     return c.json(await getDispatchIntelligence(c.env, pid, { ...parsed.data, taskId: task.id }));
   } catch (error) {
     return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+  }
+});
+
+// PLNR-534: one bounded aggregate for plan dispatch. Member task packets remain lazy and are
+// fetched through the existing task endpoint only when a consumer expands that task.
+app.post('/api/projects/:pid/memory/plan-dispatch-intelligence', userAuth, async (c) => {
+  const pid = c.req.param('pid')!;
+  const parsed = z.object({
+    planId: z.string().min(1),
+    runnerId: z.string().min(1).nullable().optional(),
+    repositoryCheckoutId: z.string().min(1).nullable().optional(),
+    repositoryKey: z.string().min(1).nullable().optional(),
+    branch: z.string().min(1).nullable().optional(),
+    baseId: z.string().min(1).nullable().optional(),
+  }).strict().safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: 'invalid plan dispatch intelligence request', detail: parsed.error.issues }, 400);
+  try {
+    return c.json(await getPlanDispatchIntelligence(c.env, pid, parsed.data));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return c.json({ error: message }, /not found in project/.test(message) ? 404 : 400);
   }
 });
 

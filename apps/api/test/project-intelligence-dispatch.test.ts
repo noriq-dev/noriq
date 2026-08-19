@@ -3,6 +3,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import type { Env } from '../src/env';
 import { getDispatchIntelligence } from '../src/memory/dispatch-intelligence';
 import { assembleContextPack } from '../src/memory/context-pack';
+import { getPlanDispatchIntelligence } from '../src/memory/plan-dispatch-intelligence';
 import { createAgent, mcpCall } from './helpers';
 
 const appEnv = env as unknown as Env;
@@ -221,5 +222,138 @@ describe('dispatch-time Project Intelligence (PLNR-303)', () => {
     ]));
     expect(result.historical.cases.every((item) => item.retrieval.support.length > 0)).toBe(true);
     expect(after?.count).toBe(before?.count ?? 0);
+  });
+});
+
+describe('plan dispatch intelligence (PLNR-534)', () => {
+  it('aggregates task readiness and attributed metadata-only documents without eager task packs', async () => {
+    const projectId = (await mcpCall(owner.apiKey, 'create_project', {
+      key: 'PIPLANA', name: 'Plan aggregate intelligence',
+    })).body.id as string;
+    const linked = await mcpCall(owner.apiKey, 'create_doc', {
+      projectId, name: 'Shared dispatch contract', description: 'Settled shared contract',
+      body: 'Full settled content', tags: ['analytics-test'],
+    });
+    const first = await mcpCall(owner.apiKey, 'create_task', {
+      projectId, title: 'Prepare dispatch context', tags: ['analytics-test'], docIds: [linked.body.id],
+    });
+    const second = await mcpCall(owner.apiKey, 'create_task', {
+      projectId, title: 'Apply dispatch context', tags: ['analytics-test'], docIds: [linked.body.id],
+    });
+    const third = await mcpCall(owner.apiKey, 'create_task', {
+      projectId, title: 'Verify dispatch context', tags: ['analytics-test'],
+    });
+    const plan = await mcpCall(owner.apiKey, 'create_plan', {
+      projectId, title: 'Context rollout', description: 'Roll out the shared context',
+      phases: [
+        { title: 'Prepare', taskIds: [first.body.id] },
+        { title: 'Apply', taskIds: [second.body.id, third.body.id] },
+      ],
+    });
+    const planDoc = await mcpCall(owner.apiKey, 'create_plan_doc', {
+      projectId, planId: plan.body.id, name: 'Rollout scratchpad',
+      description: 'Working plan notes', body: 'Full provisional content',
+    });
+    await appEnv.DB.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").bind(first.body.id).run();
+    await appEnv.DB.prepare("UPDATE tasks SET failed_at = '2026-08-18T00:00:00.000Z' WHERE id = ?")
+      .bind(third.body.id).run();
+
+    const result = await getPlanDispatchIntelligence(appEnv, projectId, { planId: plan.body.id as string });
+    expect(result).toMatchObject({
+      advisory: true, version: 'plan-dispatch-intelligence-v1',
+      plan: { id: plan.body.id, phaseCount: 2, taskCount: 3 },
+      counts: { phases: 2, tasks: 3, settled: 1, claimed: 0, reserved: 0 },
+      documents: {
+        bodiesIncluded: false,
+        planLocal: [expect.objectContaining({ id: planDoc.body.id, provisional: true })],
+        linkedProject: [expect.objectContaining({
+          id: linked.body.id, totalTaskLinks: 2,
+          exampleTaskKeys: expect.arrayContaining([first.body.key, second.body.key]),
+        })],
+      },
+      taskDetail: {
+        endpoint: `/api/projects/${projectId}/memory/dispatch-intelligence`,
+        instruction: expect.stringMatching(/only when a member task is expanded/i),
+      },
+    });
+    expect(result.taskIndex).toHaveLength(3);
+    expect(result.query.chars).toBeLessThanOrEqual(6_000);
+    expect(JSON.stringify(result.documents)).not.toContain('Full settled content');
+    expect(JSON.stringify(result.documents)).not.toContain('Full provisional content');
+  });
+
+  it('keeps a 500-task plan and large document associations below bind limits with visible truncation', async () => {
+    const projectId = (await mcpCall(owner.apiKey, 'create_project', {
+      key: 'PIPLANB', name: 'Large plan aggregate',
+    })).body.id as string;
+    const planId = 'pln_pi_large';
+    const phaseId = 'phs_pi_large';
+    await appEnv.DB.batch([
+      appEnv.DB.prepare("INSERT INTO plans (id, project_id, title, description, body, status) VALUES (?, ?, 'Large dispatch plan', 'bounded aggregate', '', 'active')").bind(planId, projectId),
+      appEnv.DB.prepare("INSERT INTO phases (id, plan_id, title, body, \"order\") VALUES (?, ?, 'All work', '', 0)").bind(phaseId, planId),
+    ]);
+    await appEnv.DB.prepare(
+      `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500)
+       INSERT INTO tasks (id, project_id, key, title, status, priority, "order")
+       SELECT 'task_pi_large_' || i, ?1, 'PIPLANB-' || i, 'Large member task ' || i, 'todo', 2, i FROM n`,
+    ).bind(projectId).run();
+    await appEnv.DB.prepare(
+      `INSERT INTO phase_tasks (phase_id, task_id)
+       SELECT ?1, id FROM tasks WHERE project_id = ?2`,
+    ).bind(phaseId, projectId).run();
+    await appEnv.DB.prepare(
+      `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 120)
+       INSERT INTO docs (id, project_id, name, description, body)
+       SELECT 'doc_pi_large_' || i, ?1, 'Large doc ' || printf('%03d', i), 'metadata ' || i, 'body ' || i FROM n`,
+    ).bind(projectId).run();
+    await appEnv.DB.prepare(
+      `INSERT INTO task_docs (task_id, doc_id)
+       SELECT 'task_pi_large_1', id FROM docs WHERE project_id = ?1`,
+    ).bind(projectId).run();
+    await appEnv.DB.prepare(
+      `INSERT OR IGNORE INTO task_docs (task_id, doc_id)
+       SELECT id, 'doc_pi_large_1' FROM tasks WHERE project_id = ?1`,
+    ).bind(projectId).run();
+    await appEnv.DB.prepare(
+      `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 55)
+       INSERT INTO plan_docs (id, plan_id, project_id, name, description, body)
+       SELECT 'pdoc_pi_large_' || i, ?1, ?2, 'Working doc ' || printf('%03d', i), 'provisional ' || i, 'body ' || i FROM n`,
+    ).bind(planId, projectId).run();
+
+    const result = await getPlanDispatchIntelligence(appEnv, projectId, { planId });
+    expect(result.taskIndex).toHaveLength(500);
+    expect(result.taskIndexCoverage).toEqual({ limit: 500, total: 500, emitted: 500, omitted: 0, complete: true });
+    expect(result.documents.planLocal).toHaveLength(50);
+    expect(result.documents.linkedProject).toHaveLength(100);
+    expect(result.documents.linkedProject[0]).toMatchObject({ id: 'doc_pi_large_1', totalTaskLinks: 500 });
+    expect(result.documents.coverage.planLocal).toMatchObject({ total: 55, omitted: 5 });
+    expect(result.documents.coverage.linkedProject).toMatchObject({ total: 120, omitted: 20 });
+    expect(result.coverage.reasons).toEqual(expect.arrayContaining(['plan_doc_limit_reached', 'linked_doc_limit_reached']));
+  });
+
+  it('reports semantic and memory outages without failing the aggregate', async () => {
+    const projectId = (await mcpCall(owner.apiKey, 'create_project', {
+      key: 'PIPLANC', name: 'Degraded plan aggregate',
+    })).body.id as string;
+    const task = await mcpCall(owner.apiKey, 'create_task', {
+      projectId, title: 'Degraded aggregate task', tags: ['analytics-test'],
+    });
+    const plan = await mcpCall(owner.apiKey, 'create_plan', {
+      projectId, title: 'Degraded aggregate plan', phases: [{ title: 'Work', taskIds: [task.body.id] }],
+    });
+    const unavailableMemory = {
+      searchProjectMemory: async () => { throw new Error('memory unavailable'); },
+    } as unknown as MemoryRpc;
+    const result = await getPlanDispatchIntelligence(appEnv, projectId, { planId: plan.body.id as string }, {
+      search: async () => { throw new Error('search unavailable'); },
+      memory: unavailableMemory as never,
+    });
+    expect(result.documents.coverage.semantic).toMatchObject({
+      mode: null, unavailable: true, emitted: 0, status: 'unavailable', freshness: null,
+    });
+    expect(result.memory.coverage).toMatchObject({ mode: null, unavailable: true, candidates: 0 });
+    expect(result.coverage).toMatchObject({
+      status: 'partial', reasons: expect.arrayContaining(['document_retrieval_unavailable', 'project_memory_unavailable']),
+    });
   });
 });

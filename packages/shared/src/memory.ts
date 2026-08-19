@@ -554,9 +554,10 @@ export const ContextPackDocumentReference = z.object({
     id: z.string(),
     title: z.string(),
     status: z.string(),
-    phaseId: z.string(),
-    phaseTitle: z.string(),
-    phaseOrder: z.number().int(),
+    /** Plan aggregates have no single member phase; task packs fill these three fields. */
+    phaseId: z.string().nullable(),
+    phaseTitle: z.string().nullable(),
+    phaseOrder: z.number().int().nullable(),
   }).nullable(),
   retrieval: z.object({
     mode: z.enum(['explicit', 'semantic', 'keyword']),

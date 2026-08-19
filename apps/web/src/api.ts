@@ -619,6 +619,8 @@ export const api = {
     req<ApiProjectIntelligence>('POST', `/api/projects/${pid}/memory/intelligence`, input),
   dispatchIntelligence: (pid: string, input: ApiDispatchIntelligenceInput, signal?: AbortSignal) =>
     req<ApiDispatchIntelligence>('POST', `/api/projects/${pid}/memory/dispatch-intelligence`, input, signal),
+  planDispatchIntelligence: (pid: string, input: ApiPlanDispatchIntelligenceInput, signal?: AbortSignal) =>
+    req<ApiPlanDispatchIntelligence>('POST', `/api/projects/${pid}/memory/plan-dispatch-intelligence`, input, signal),
   dispatchIntelligenceFeedback: (pid: string, input: ApiDispatchIntelligenceFeedbackInput) =>
     req<{ feedbackId: string; operationKey: string; occurrenceId: string; deduped: boolean }>(
       'POST', `/api/projects/${pid}/memory/dispatch-intelligence/feedback`, input,
@@ -1889,6 +1891,7 @@ export interface ApiProjectIntelligenceInput {
 }
 export interface ApiDispatchIntelligenceInput {
   taskId: string; runnerId?: string | null; repositoryCheckoutId?: string | null;
+  repositoryKey?: string | null;
   branch?: string | null; baseId?: string | null; budget?: Partial<ApiRunBudget> | null;
   comparison?: { dimension: ApiStrategyDimension; metric: ApiComparisonMetric };
 }
@@ -1902,6 +1905,13 @@ export interface ApiDispatchMemoryExcerpt {
   id: string; memoryKind: string; statement: string; statementTruncated?: boolean; authority: number;
   confidence: number | null; validity: string; isLead: boolean; leadReasons: string[];
   evidence: Array<{ repositoryKey: string; branch: string; baseId: string; path: string; symbol: string | null; verificationState: string; verifiedForCaller: boolean }>;
+}
+export interface ApiContextDocumentReference {
+  kind: 'project_doc' | 'plan_doc'; id: string; name: string; description: string; updatedAt: string;
+  relationship: 'task_link' | 'plan_membership' | 'semantic'; provisional: boolean;
+  plan: null | { id: string; title: string; status: string; phaseId: string | null; phaseTitle: string | null; phaseOrder: number | null };
+  retrieval: { mode: 'explicit' | 'semantic' | 'keyword'; score: number | null; indexFreshness: 'current' | 'unverified' };
+  readRef: { kind: 'project_doc'; docId: string } | { kind: 'plan_doc'; planId: string; docId: string };
 }
 export interface ApiDispatchPriorCase {
   episodeId: string; taskId: string | null; taskKey: string | null; runId: string; sitting: number;
@@ -1925,12 +1935,61 @@ export interface ApiDispatchIntelligence {
     humanBlocks: Array<{ signalId: string; title: string }>;
     coverage: { status: string; reasons: string[] };
   };
+  documents: {
+    kind: 'metadata_only_document_context'; bodiesIncluded: false;
+    linkedProjectDocuments: ApiContextDocumentReference[];
+    planLocalDocuments: ApiContextDocumentReference[];
+    semanticDocuments: ApiContextDocumentReference[];
+    coverage: { retrievalMode: 'semantic' | 'keyword' | null; empty: boolean; unavailable: boolean; truncated: boolean; notice: { kind: string; reason: string } | null };
+  };
   constraints: { kind: string; decisions: ApiDispatchMemoryExcerpt[]; hazards: ApiDispatchMemoryExcerpt[]; unknowns: ApiDispatchMemoryExcerpt[] };
   quotedEvidence: { kind: string; failedApproaches: ApiDispatchMemoryExcerpt[]; relevant: ApiDispatchMemoryExcerpt[]; evidenceFrame: { text: string; itemsIncluded: number; itemsOmitted: number; truncated: boolean } };
   historical: { kind: 'historical_case_observation'; retrievalMode: string; branchPolicy: string; supportRule: string; caseLimit: number; consideredCount: number; coverage: { complete: boolean; candidatesConsidered: number; eligibleCases: number; reasons: string[] }; cases: ApiDispatchPriorCase[] };
   observations: { kind: 'statistical_observation'; scope: { status: string; anticipatedFiles: string[]; observation: string }; budget: Record<'maxTokens' | 'maxUsd' | 'maxDurationSeconds' | 'maxRounds', { proposed: number | null; observedCount: number; unavailableCount: number; min: number | null; median: number | null; max: number | null; belowObservedCases: number; completeness: string; observation: string }>; coverage: { status: string; reasons: string[] }; versions: { risk: string; retrieval: string } };
   comparison: ApiProjectIntelligence['comparison'];
   feedback: { endpoint: string; requiresExplicitHumanAction: true; previewCreatesOccurrence: false };
+}
+export interface ApiPlanDispatchIntelligenceInput {
+  planId: string; runnerId?: string | null; repositoryCheckoutId?: string | null;
+  repositoryKey?: string | null; branch?: string | null; baseId?: string | null;
+}
+export interface ApiPlanDispatchTaskIndexItem {
+  taskId: string; taskKey: string; title: string; status: string;
+  phase: { id: string; title: string; order: number }; order: number; priority: number;
+  retry: boolean; claimed: boolean; reserved: boolean; blockerCount: number; dispatchable: boolean;
+}
+export interface ApiPlanDispatchIntelligence {
+  advisory: true; version: 'plan-dispatch-intelligence-v1'; observedAt: string;
+  plan: { id: string; title: string; description: string; status: string; phaseCount: number; taskCount: number };
+  targetContext: { runnerId: string | null; repositoryCheckoutId: string | null; repositoryKey: string | null; repositoryResolutionReason: string | null; branch: string | null; baseId: string | null };
+  counts: { phases: number; tasks: number; dispatchable: number; retry: number; settled: number; claimed: number; reserved: number };
+  blockers: { totalTasks: number; items: Array<{ taskId: string; taskKey: string; status: string; blockerCount: number; reason: string }>; omitted: number };
+  repository: { key: string | null; reason: string | null; branch: string | null; baseId: string | null };
+  documents: {
+    bodiesIncluded: false;
+    planLocal: ApiContextDocumentReference[];
+    linkedProject: Array<ApiContextDocumentReference & { totalTaskLinks: number; exampleTaskKeys: string[] }>;
+    semantic: ApiContextDocumentReference[];
+    coverage: {
+      planLocal: { total: number; emitted: number; omitted: number };
+      linkedProject: { total: number; emitted: number; omitted: number };
+      semantic: {
+        mode: 'semantic' | 'keyword' | null; unavailable: boolean; reason: string | null; emitted: number;
+        candidateLimitReached: boolean; status: 'unavailable' | 'truncated' | 'fallback' | 'empty' | 'complete';
+        freshness: 'current' | 'unverified' | null;
+      };
+    };
+  };
+  memory: {
+    constraints: Array<{ id: string; kind?: string; title: string; snippet: string; authority?: number; validity?: string; isLead: boolean; leadReasons: string[] }>;
+    evidenceFrame: { text: string; itemsIncluded: number; itemsOmitted: number; truncated: boolean; charsUsed: number; suspiciousCount: number };
+    coverage: { mode: 'semantic' | 'keyword' | null; unavailable: boolean; reason: string | null; candidates: number };
+  };
+  taskIndex: ApiPlanDispatchTaskIndexItem[];
+  taskIndexCoverage: { limit: 500; total: number; emitted: number; omitted: number; complete: boolean };
+  taskDetail: { endpoint: string; method: 'POST'; instruction: string; request: ApiDispatchIntelligenceInput };
+  query: { text: string; chars: number; limit: 6000 };
+  coverage: { status: 'complete' | 'partial'; reasons: string[] };
 }
 export interface ApiMetricSummary {
   observedCount: number; partialCount: number; unavailableCount: number; denominator: number;
