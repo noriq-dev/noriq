@@ -9,7 +9,7 @@ afterEach(() => { container?.remove(); vi.restoreAllMocks(); });
 
 describe('DesktopOnly mobile handoff', () => {
   it('defines every wide project tool and copies its canonical project link', async () => {
-    expect(Object.keys(DESKTOP_ONLY_VIEWS)).toEqual(['graph', 'plans', 'roadmap', 'docs', 'memory', 'runs', 'agents']);
+    expect(Object.keys(DESKTOP_ONLY_VIEWS)).toEqual(['graph', 'roadmap', 'docs', 'memory', 'runs', 'agents']);
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
     container = document.createElement('div'); document.body.appendChild(container);

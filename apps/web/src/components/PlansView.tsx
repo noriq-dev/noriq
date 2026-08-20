@@ -96,7 +96,7 @@ export function PlansView({ store }: { store: AppStore }) {
 
   if (!allPlans.length) {
     return (
-      <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 10 }}>
+      <div className="plans-empty">
         <SectionLabel>No plans yet</SectionLabel>
         <div style={{ fontSize: 12.5, color: 'var(--text-mid)', maxWidth: 420, textAlign: 'center', lineHeight: 1.7 }}>
           Agents write their plans here: <span style={{ fontFamily: 'var(--mono)', color: 'var(--text-soft)' }}>create_plan</span> takes a
@@ -108,8 +108,8 @@ export function PlansView({ store }: { store: AppStore }) {
   }
 
   return (
-    <div style={{ position: 'absolute', inset: 0, overflowY: 'auto', padding: '18px 22px' }}>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 14, maxWidth: 980, margin: '0 auto' }}>
+    <div className="plans-view" data-testid="plans-view">
+      <div className="plans-stack">
         {archivedCount > 0 && (
           <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
             <button
@@ -145,6 +145,7 @@ export function PlansView({ store }: { store: AppStore }) {
           return (
             <div
               key={plan.id}
+              className="plan-card"
               style={{
                 border: `1px solid ${proposed ? 'rgba(245,166,35,.45)' : 'var(--w-08)'}`,
                 borderRadius: 14,
@@ -156,31 +157,30 @@ export function PlansView({ store }: { store: AppStore }) {
               {/* header */}
               <div
                 onClick={() => setExpanded((e) => ({ ...e, [plan.id]: !open }))}
-                className="hover-border"
-                style={{ padding: '15px 18px', display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer', border: '1px solid transparent' }}
+                className="plan-card-header hover-border"
               >
-                <span style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--text-dim)', transform: open ? 'rotate(90deg)' : 'none', transition: 'transform .15s' }}>▸</span>
+                <span className="plan-card-chevron" style={{ transform: open ? 'rotate(90deg)' : 'none' }}>▸</span>
                 {agent && <AvatarChip name={agent.name} color={agent.color} size={28} radius={8} fontSize={10.5} />}
-                <div style={{ minWidth: 0, flex: 1 }}>
-                  <div style={{ fontSize: 14.5, fontWeight: 600, letterSpacing: '-.01em', display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div className="plan-card-summary">
+                  <div className="plan-card-title">
                     {plan.title}
                     {proposed && <MonoTag color="#f5a623" bg="rgba(245,166,35,.14)" size={9}>PROPOSED</MonoTag>}
                     {plan.archivedAt && <MonoTag color="var(--text-faint)" bg="var(--w-05)" size={9}>ARCHIVED</MonoTag>}
                   </div>
-                  <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  <div className="plan-card-meta">
                     {agent ? `planned by ${agent.name}` : 'planned by a human'} · {planPhases.length} phases · {doneCount}/{allTaskIds.length} tasks settled
                     {plan.description ? ` · ${plan.description}` : ''}
                   </div>
                 </div>
                 {/* phase progress rail */}
-                <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                <div className="plan-phase-rail" aria-label={`${doneCount} of ${allTaskIds.length} plan tasks settled`}>
                   {planPhases.map((ph, i) => {
                     const ids = phaseTasks.filter((pt) => pt.phaseId === ph.id).map((pt) => pt.taskId);
                     const done = ids.filter((tid) => isSettledTaskStatus(taskById.get(tid)?.status)).length;
                     const pct = ids.length ? done / ids.length : 0;
                     const isActive = i === activeIdx;
                     return (
-                      <div key={ph.id} title={`${ph.title} · ${done}/${ids.length}`} style={{ width: 46 }}>
+                      <div className="plan-phase-segment" key={ph.id} title={`${ph.title} · ${done}/${ids.length}`}>
                         <div style={{ height: 5, borderRadius: 3, background: 'var(--w-08)', overflow: 'hidden', outline: isActive ? '1px solid rgba(198,242,78,.5)' : 'none' }}>
                           <div style={{ height: '100%', width: `${pct * 100}%`, background: pct === 1 ? 'var(--green)' : 'var(--blue)' }} />
                         </div>
@@ -188,49 +188,52 @@ export function PlansView({ store }: { store: AppStore }) {
                     );
                   })}
                 </div>
-                <button
-                  onClick={async (e) => {
-                    e.stopPropagation();
-                    if (plan.archivedAt) await api.restorePlan(currentPid, plan.id);
-                    else {
-                      setArchiveTaskCancellation('none');
+                <div className="plan-card-lifecycle-actions">
+                  <button
+                    type="button"
+                    onClick={async (e) => {
+                      e.stopPropagation();
+                      if (plan.archivedAt) await api.restorePlan(currentPid, plan.id);
+                      else {
+                        setArchiveTaskCancellation('none');
+                        setLifecycleError(null);
+                        setLifecycle({ kind: 'archive', id: plan.id, title: plan.title, openTasks: openTaskCount, allTasks: allTaskIds.length });
+                        return;
+                      }
+                      actions.refreshNow();
+                    }}
+                    title={plan.archivedAt ? 'Restore plan' : 'Archive plan (hides it; everything stays in force)'}
+                    className="plan-lifecycle-button drawer-x"
+                  >
+                    {plan.archivedAt ? '↩' : '🗄'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={async (e) => {
+                      e.stopPropagation();
+                      setDeleteDisposition('orphan');
                       setLifecycleError(null);
-                      setLifecycle({ kind: 'archive', id: plan.id, title: plan.title, openTasks: openTaskCount, allTasks: allTaskIds.length });
-                      return;
-                    }
-                    actions.refreshNow();
-                  }}
-                  title={plan.archivedAt ? 'Restore plan' : 'Archive plan (hides it; everything stays in force)'}
-                  className="drawer-x"
-                  style={{ cursor: 'pointer', color: 'var(--text-dim)', fontSize: 13, width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6, flex: 'none' }}
-                >
-                  {plan.archivedAt ? '↩' : '🗄'}
-                </button>
-                <button
-                  onClick={async (e) => {
-                    e.stopPropagation();
-                    setDeleteDisposition('orphan');
-                    setLifecycleError(null);
-                    setLifecycle({ kind: 'delete', id: plan.id, title: plan.title, openTasks: openTaskCount, allTasks: allTaskIds.length });
-                  }}
-                  title="Delete plan"
-                  className="drawer-x"
-                  style={{ cursor: 'pointer', color: 'var(--red-soft)', fontSize: 13, width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6, flex: 'none' }}
-                >
-                  🗑
-                </button>
+                      setLifecycle({ kind: 'delete', id: plan.id, title: plan.title, openTasks: openTaskCount, allTasks: allTaskIds.length });
+                    }}
+                    title="Delete plan"
+                    className="plan-lifecycle-button plan-delete-button drawer-x"
+                  >
+                    🗑
+                  </button>
+                </div>
               </div>
 
               {/* the mandatory human gate (RUN-23): approve → tasks become claimable */}
               {proposed && (
                 <div
+                  className="plan-proposal-gate"
                   style={{
                     display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
                     padding: '11px 18px', borderTop: '1px solid rgba(245,166,35,.2)',
                     background: 'rgba(245,166,35,.06)',
                   }}
                 >
-                  <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: '#f5a623' }}>
+                  <span className="plan-proposal-copy" style={{ fontFamily: 'var(--mono)', fontSize: 11, color: '#f5a623' }}>
                     ⏳ awaiting your approval — its {allTaskIds.length} task{allTaskIds.length === 1 ? '' : 's'} can't be claimed or dispatched until you approve
                     {/* What is actually being approved (RUN-162). Approving a plan approves what
                         its tasks SAY, and a task with no execution spec is one whose scope and
@@ -247,7 +250,7 @@ export function PlansView({ store }: { store: AppStore }) {
                       </>
                     )}
                   </span>
-                  <div style={{ flex: 1 }} />
+                  <div className="plan-flex-spacer" style={{ flex: 1 }} />
                   <Button
                     variant="primary"
                     style={{ padding: '6px 16px', fontSize: 12 }}
@@ -276,7 +279,7 @@ export function PlansView({ store }: { store: AppStore }) {
               {/* RunnerJob v2 keeps all dispatch choices in one small Jobs surface. The plan
                   card no longer exposes legacy pump/model/workflow/profile controls. */}
               {!proposed && !plan.archivedAt && currentPid && (
-                <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '9px 18px', borderTop: '1px solid var(--w-05)' }}>
+                <div className="plan-jobs-action">
                   <Button
                     variant="ghost"
                     style={{ padding: '5px 14px', fontSize: 11.5 }}
@@ -292,13 +295,13 @@ export function PlansView({ store }: { store: AppStore }) {
 
               {/* expanded: the plan document + stacked phases */}
               {open && (
-                <div style={{ borderTop: '1px solid var(--w-06)' }}>
+                <div className="plan-expanded">
                   {plan.body && (
-                    <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--w-05)', maxWidth: 780 }}>
+                    <div className="plan-body">
                       <Markdown source={plan.body} />
                     </div>
                   )}
-                  <div style={{ padding: '14px 18px 16px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+                  <div className="plan-phases">
                     {planPhases.map((ph, i) => {
                       const ids = phaseTasks.filter((pt) => pt.phaseId === ph.id).map((pt) => pt.taskId);
                       const phaseDone = ids.filter((tid) => isSettledTaskStatus(taskById.get(tid)?.status)).length;
@@ -307,6 +310,7 @@ export function PlansView({ store }: { store: AppStore }) {
                       return (
                         <div
                           key={ph.id}
+                          className="plan-phase"
                           style={{
                             border: `1px solid ${isActive ? 'rgba(198,242,78,.3)' : 'var(--w-07)'}`,
                             background: isActive ? 'rgba(198,242,78,.03)' : 'var(--w-015)',
@@ -315,26 +319,26 @@ export function PlansView({ store }: { store: AppStore }) {
                             opacity: complete ? 0.75 : 1,
                           }}
                         >
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: ph.body || ids.length ? 10 : 0 }}>
+                          <div className="plan-phase-header" style={{ marginBottom: ph.body || ids.length ? 10 : 0 }}>
                             <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: isActive ? 'var(--accent)' : 'var(--text-dim)' }}>
                               {String(i + 1).padStart(2, '0')}
                             </span>
-                            <span style={{ fontSize: 13, fontWeight: 600 }}>{ph.title}</span>
+                            <span className="plan-phase-title">{ph.title}</span>
                             {isActive && <MonoTag color="var(--accent)" bg="rgba(198,242,78,.12)" size={8.5}>ACTIVE</MonoTag>}
                             {complete && <MonoTag color="var(--green)" bg="rgba(63,217,139,.1)" size={8.5}>✓ DONE</MonoTag>}
                             {i > 0 && !complete && !isActive && (
                               <span title="gated on previous phase" style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>⟂ gated on {String(i).padStart(2, '0')}</span>
                             )}
-                            <div style={{ flex: 1 }} />
+                            <div className="plan-flex-spacer" style={{ flex: 1 }} />
                             <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)' }}>{phaseDone}/{ids.length}</span>
                           </div>
                           {ph.body && (
-                            <div style={{ marginBottom: ids.length ? 12 : 0, maxWidth: 720 }}>
+                            <div className="plan-phase-body" style={{ marginBottom: ids.length ? 12 : 0 }}>
                               <Markdown source={ph.body} compact />
                             </div>
                           )}
                           {ids.length > 0 && (
-                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 6 }}>
+                            <div className="plan-task-grid">
                               {ids.map((tid) => {
                                 const t = taskById.get(tid);
                                 if (!t) return null;
@@ -344,7 +348,7 @@ export function PlansView({ store }: { store: AppStore }) {
                                   <div
                                     key={tid}
                                     onClick={() => actions.openTask(tid)}
-                                    className="hover-border"
+                                    className="plan-task-row hover-border"
                                     style={{
                                       display: 'flex', alignItems: 'center', gap: 7, padding: '7px 9px',
                                       borderRadius: 8, background: 'var(--card)', border: '1px solid var(--w-07)', cursor: 'pointer',
@@ -356,7 +360,7 @@ export function PlansView({ store }: { store: AppStore }) {
                                     {t.archivedAt && (
                                       <span title="archived" style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--text-faint)', flex: 'none' }}>🗄</span>
                                     )}
-                                    <span style={{ fontSize: 11.5, color: 'var(--text-soft)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.title}</span>
+                                    <span className="plan-task-title">{t.title}</span>
                                     <div style={{ flex: 1 }} />
                                     {holder && <AvatarChip name={holder.name} color={holder.color} size={16} radius={4} fontSize={7.5} />}
                                   </div>
@@ -396,7 +400,7 @@ export function PlansView({ store }: { store: AppStore }) {
                       : 'This plan has no open tasks to cancel.'
                     : `${lifecycle.allTasks} associated task${lifecycle.allTasks === 1 ? '' : 's'} will be cancelled, including tasks in done or review, and any active claims released.`;
                 return (
-                  <label key={value} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: 12, border: `1px solid ${archiveTaskCancellation === value ? 'rgba(198,242,78,.45)' : 'var(--w-1)'}`, borderRadius: 10 }}>
+                  <label className="plan-lifecycle-choice" key={value} style={{ borderColor: archiveTaskCancellation === value ? 'rgba(198,242,78,.45)' : 'var(--w-1)' }}>
                     <input
                       type="radio"
                       name="plan-archive-task-cancellation"
@@ -425,7 +429,7 @@ export function PlansView({ store }: { store: AppStore }) {
                     ? `Mark all ${lifecycle.allTasks} associated tasks cancelled, including done or review, while keeping their history.`
                     : `Delete all ${lifecycle.allTasks} associated tasks and their comments, attachments, claims, and references.`;
                 return (
-                  <label key={value} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: 12, border: `1px solid ${deleteDisposition === value ? 'rgba(198,242,78,.45)' : 'var(--w-1)'}`, borderRadius: 10 }}>
+                  <label className="plan-lifecycle-choice" key={value} style={{ borderColor: deleteDisposition === value ? 'rgba(198,242,78,.45)' : 'var(--w-1)' }}>
                     <input type="radio" name="plan-task-disposition" value={value} checked={deleteDisposition === value} onChange={() => setDeleteDisposition(value)} style={{ marginTop: 2 }} />
                     <span>
                       <span style={{ display: 'block', fontSize: 12.5, fontWeight: 650 }}>{label}</span>
@@ -437,7 +441,7 @@ export function PlansView({ store }: { store: AppStore }) {
             </div>
           )}
           {lifecycleError && <div style={{ marginTop: 14 }}><ErrorNote>{lifecycleError}</ErrorNote></div>}
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 9, marginTop: 20 }}>
+          <div className="plan-modal-actions" style={{ marginTop: 20 }}>
             <Button variant="ghost" disabled={lifecycleBusy} onClick={() => setLifecycle(null)}>Cancel</Button>
             <Button
               variant={lifecycle.kind === 'delete' ? 'danger' : 'primary'}
@@ -499,13 +503,13 @@ function PlanDocsPanel({ planId, docs, store, readOnly }: { planId: string; docs
   };
 
   return (
-    <div style={{ borderTop: '1px solid var(--w-06)', padding: '14px 18px 16px' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: docs.length ? 10 : 0 }}>
+    <div className="plan-docs">
+      <div className="plan-docs-header" style={{ marginBottom: docs.length ? 10 : 0 }}>
         <SectionLabel>Documents</SectionLabel>
         <span title="Working docs scoped to this plan — not searchable, not project docs" style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>
           plan-local · {docs.length}
         </span>
-        <div style={{ flex: 1 }} />
+        <div className="plan-flex-spacer" style={{ flex: 1 }} />
         {!readOnly && (
           <button
             onClick={() => { setEditing({ name: '', description: '', body: '' }); setErr(null); }}
@@ -531,15 +535,14 @@ function PlanDocsPanel({ planId, docs, store, readOnly }: { planId: string; docs
               <div key={d.id} style={{ border: '1px solid var(--w-07)', borderRadius: 10, background: 'var(--w-015)', overflow: 'hidden' }}>
                 <div
                   onClick={() => setOpenId(isOpen ? null : d.id)}
-                  className="hover-border"
-                  style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px', cursor: 'pointer', border: '1px solid transparent' }}
+                  className="plan-doc-header hover-border"
                 >
                   <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-dim)', transform: isOpen ? 'rotate(90deg)' : 'none', transition: 'transform .15s' }}>▸</span>
-                  <span style={{ fontSize: 12.5, fontWeight: 600 }}>{d.name}</span>
-                  {d.description && <span style={{ fontSize: 11, color: 'var(--text-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.description}</span>}
-                  <div style={{ flex: 1 }} />
+                  <span className="plan-doc-name">{d.name}</span>
+                  {d.description && <span className="plan-doc-description">{d.description}</span>}
+                  <div className="plan-flex-spacer" style={{ flex: 1 }} />
                   {!readOnly && (
-                    <>
+                    <div className="plan-doc-actions">
                       <button
                         onClick={(e) => { e.stopPropagation(); setEditing({ id: d.id, name: d.name, description: d.description, body: d.body }); setErr(null); }}
                         style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-dim)', background: 'transparent', border: 'none', padding: '2px 6px' }}
@@ -552,11 +555,11 @@ function PlanDocsPanel({ planId, docs, store, readOnly }: { planId: string; docs
                         className="drawer-x"
                         style={{ cursor: 'pointer', color: 'var(--red-soft)', fontSize: 12, padding: '2px 6px', background: 'transparent', border: 'none' }}
                       >🗑</button>
-                    </>
+                    </div>
                   )}
                 </div>
                 {isOpen && (
-                  <div style={{ padding: '4px 16px 14px', borderTop: '1px solid var(--w-05)', maxWidth: 760 }}>
+                  <div className="plan-doc-body">
                     {d.body ? <Markdown source={d.body} compact /> : <span style={{ fontSize: 11.5, color: 'var(--text-faint)' }}>empty</span>}
                   </div>
                 )}
@@ -579,7 +582,7 @@ function PlanDocsPanel({ planId, docs, store, readOnly }: { planId: string; docs
               <TextArea rows={12} value={editing.body} onChange={(e) => setEditing({ ...editing, body: e.target.value })} style={{ fontFamily: 'var(--mono)', fontSize: 12 }} />
             </Field>
             {err && <ErrorNote>{err}</ErrorNote>}
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+            <div className="plan-modal-actions">
               <Button variant="ghost" onClick={() => setEditing(null)}>Cancel</Button>
               <Button variant="primary" disabled={busy} onClick={() => void save()}>{busy ? 'Saving…' : 'Save'}</Button>
             </div>
@@ -843,8 +846,8 @@ function PlanDispatchForm({
   };
 
   return (
-    <div style={{ margin: '0 18px 14px', padding: '14px 16px', borderRadius: 11, background: 'var(--w-04)', border: '1px solid var(--w-1)' }}>
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
+    <div className="plan-dispatch-form">
+      <div className="plan-dispatch-fields">
         <Field label="runner">
           <Select value={runnerId} onChange={(e) => setRunnerId(e.target.value)}>
             {candidates.map((r) => (
@@ -927,7 +930,7 @@ function PlanDispatchForm({
           </Field>
         )}
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
+      <div className="plan-dispatch-budget-fields">
         <Field label="max $ per task" hint="optional">
           <TextInput value={maxUsd} onChange={(e) => setMaxUsd(e.target.value)} inputMode="decimal" placeholder="—" />
         </Field>
@@ -941,7 +944,7 @@ function PlanDispatchForm({
 
       {err && <ErrorNote>{err}</ErrorNote>}
 
-      <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
+      <div className="plan-dispatch-actions">
         <Button
           variant="primary"
           disabled={busy || !candidates.length || (strategy === 'single_root' && (!missionWorkflowEligible || !missionProfileEligible))}

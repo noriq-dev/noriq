@@ -203,6 +203,45 @@ button { all: unset; box-sizing: border-box; max-width: 100%; }
 .project-settings-grant-row { display: grid; grid-template-columns: 58px minmax(120px, 1fr) 145px auto; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--w-05); }
 .project-settings-grant-form { display: grid; grid-template-columns: 100px minmax(150px, 1fr) 145px auto; gap: 8px; margin-top: 12px; }
 
+/* Plans keeps the same card anatomy on every viewport; phone rules below reflow it
+   inside the app frame that already owns the fixed-tab-bar reservation. */
+.plans-empty { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 20px; }
+.plans-view { position: absolute; inset: 0; overflow-x: hidden; overflow-y: auto; padding: 18px 22px; }
+.plans-stack { display: flex; flex-direction: column; gap: 14px; max-width: 980px; margin: 0 auto; min-width: 0; }
+.plan-card { min-width: 0; }
+.plan-card-header { padding: 15px 18px; display: flex; align-items: center; gap: 12px; cursor: pointer; border: 1px solid transparent; }
+.plan-card-chevron { flex: none; font-family: var(--mono); font-size: 12px; color: var(--text-dim); transition: transform .15s; }
+.plan-card-summary { min-width: 0; flex: 1; }
+.plan-card-title { min-width: 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 14.5px; font-weight: 600; letter-spacing: -.01em; overflow-wrap: anywhere; }
+.plan-card-meta { margin-top: 2px; overflow: hidden; color: var(--text-dim); font-family: var(--mono); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.plan-phase-rail { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.plan-phase-segment { width: 46px; }
+.plan-card-lifecycle-actions, .plan-doc-actions { display: flex; align-items: center; gap: 2px; flex: none; }
+.plan-lifecycle-button { width: 26px; height: 26px; display: flex; align-items: center; justify-content: center; flex: none; border-radius: 6px; cursor: pointer; color: var(--text-dim); font-size: 13px; }
+.plan-delete-button { color: var(--red-soft); }
+.plan-jobs-action { display: flex; justify-content: flex-end; padding: 9px 18px; border-top: 1px solid var(--w-05); }
+.plan-expanded { min-width: 0; border-top: 1px solid var(--w-06); }
+.plan-body { max-width: 780px; padding: 16px 20px; border-bottom: 1px solid var(--w-05); overflow-wrap: anywhere; }
+.plan-phases { display: flex; flex-direction: column; gap: 12px; padding: 14px 18px 16px; }
+.plan-phase { min-width: 0; }
+.plan-phase-header { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.plan-phase-title { min-width: 0; font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.plan-phase-body { max-width: 720px; overflow-wrap: anywhere; }
+.plan-task-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 6px; min-width: 0; }
+.plan-task-row { min-width: 0; }
+.plan-task-title { min-width: 0; overflow: hidden; color: var(--text-soft); font-size: 11.5px; text-overflow: ellipsis; white-space: nowrap; }
+.plan-docs { padding: 14px 18px 16px; border-top: 1px solid var(--w-06); }
+.plan-docs-header, .plan-doc-header { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.plan-doc-header { padding: 9px 12px; border: 1px solid transparent; cursor: pointer; }
+.plan-doc-name { min-width: 0; font-size: 12.5px; font-weight: 600; overflow-wrap: anywhere; }
+.plan-doc-description { min-width: 0; overflow: hidden; color: var(--text-dim); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.plan-doc-body { max-width: 760px; padding: 4px 16px 14px; border-top: 1px solid var(--w-05); overflow-wrap: anywhere; }
+.plan-lifecycle-choice { display: flex; align-items: flex-start; gap: 10px; padding: 12px; border: 1px solid; border-radius: 10px; min-width: 0; overflow-wrap: anywhere; }
+.plan-modal-actions { display: flex; justify-content: flex-end; gap: 9px; }
+.plan-dispatch-form { margin: 0 18px 14px; padding: 14px 16px; border: 1px solid var(--w-1); border-radius: 11px; background: var(--w-04); }
+.plan-dispatch-fields, .plan-dispatch-budget-fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.plan-dispatch-actions { display: flex; gap: 8px; margin-top: 6px; }
+
 @media (max-width: 767px) {
   .mobile-topbar {
     display: flex; align-items: center; gap: 10px; flex: none;
@@ -225,6 +264,48 @@ button { all: unset; box-sizing: border-box; max-width: 100%; }
   .lineage-explorer-list { max-height: 280px; border-right: 0; border-bottom: 1px solid var(--w-07); }
   .lineage-explorer-detail { overflow: visible; padding: 12px; }
   .lineage-timeline-row { grid-template-columns: 1fr; gap: 3px; }
+  .plans-empty { justify-content: flex-start; padding: 28px 18px; overflow-y: auto; }
+  .plans-view { padding: 10px 10px 16px; overscroll-behavior-y: contain; }
+  .plans-stack { gap: 10px; }
+  .plan-card-header { flex-wrap: wrap; gap: 9px; padding: 12px; }
+  .plan-card-summary { min-width: 120px; }
+  .plan-card-meta { white-space: normal; overflow-wrap: anywhere; }
+  .plan-phase-rail { order: 10; flex-basis: 100%; }
+  .plan-phase-segment { width: auto; min-width: 12px; flex: 1 1 24px; }
+  .plan-card-lifecycle-actions { gap: 4px; }
+  .plan-lifecycle-button { width: 44px; height: 44px; }
+  .plan-proposal-gate { align-items: stretch !important; padding: 12px !important; }
+  .plan-proposal-copy { flex-basis: 100%; overflow-wrap: anywhere; }
+  .plan-proposal-gate .plan-flex-spacer { display: none; }
+  .plan-proposal-gate > button { flex: 1 1 calc(50% - 6px); justify-content: center; }
+  .plan-jobs-action { padding: 8px 12px; }
+  .plan-jobs-action > button { width: 100%; justify-content: center; }
+  .plan-body { max-width: none; padding: 14px 13px; }
+  .plan-phases { gap: 10px; padding: 12px; }
+  .plan-phase { padding: 12px !important; }
+  .plan-phase-header { align-items: flex-start; flex-wrap: wrap; }
+  .plan-phase-title { flex: 1 1 140px; }
+  .plan-phase-header .plan-flex-spacer { display: none; }
+  .plan-task-grid { grid-template-columns: minmax(0, 1fr); }
+  .plan-task-row { align-items: flex-start !important; min-height: 44px; }
+  .plan-task-title { display: -webkit-box; white-space: normal; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+  .plan-docs { padding: 12px; }
+  .plan-docs-header { align-items: flex-start; flex-wrap: wrap; }
+  .plan-docs-header .plan-flex-spacer { display: none; }
+  .plan-docs-header > button { margin-left: auto; }
+  .plan-doc-header { flex-wrap: wrap; padding: 8px 10px; }
+  .plan-doc-name { flex: 1 1 140px; }
+  .plan-doc-description { order: 10; flex-basis: 100%; padding-left: 19px; white-space: normal; overflow-wrap: anywhere; }
+  .plan-doc-header .plan-flex-spacer { display: none; }
+  .plan-doc-actions { margin-left: auto; }
+  .plan-doc-actions > button { min-width: 44px; display: flex; align-items: center; justify-content: center; padding: 0 !important; }
+  .plan-doc-body { max-width: none; padding: 10px 12px 14px; }
+  .plan-modal-actions > button { flex: 1 1 0; justify-content: center; }
+  .plan-dispatch-form { margin: 0 12px 12px; padding: 12px; }
+  .plan-dispatch-fields, .plan-dispatch-budget-fields { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .plan-dispatch-actions { align-items: stretch; flex-wrap: wrap; }
+  .plan-dispatch-actions > button { width: 100%; justify-content: center; }
+  .plan-dispatch-actions > span { flex-basis: 100%; text-align: left; }
   input, select, textarea { font-size: 16px !important; }
   button, [role='button'], summary { min-height: 44px; }
 }

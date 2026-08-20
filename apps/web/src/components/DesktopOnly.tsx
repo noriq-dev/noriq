@@ -5,7 +5,6 @@ import { Button } from './ui';
 
 export const DESKTOP_ONLY_VIEWS = {
   graph: ['Coordination graph', 'Explore dependencies, ownership, and live coordination across a wide connected canvas.'],
-  plans: ['Plans', 'Review phase structure, gates, dispatches, and landing evidence side by side.'],
   roadmap: ['Roadmap', 'Arrange milestones and delivery windows across the project timeline.'],
   docs: ['Docs', 'Read and edit long-form project documents with their surrounding workspace context.'],
   memory: ['Memory', 'Explore durable memories and evidence relationships in the full constellation workspace.'],

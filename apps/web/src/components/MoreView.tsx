@@ -65,6 +65,18 @@ export function MoreView({ store }: { store: AppStore }) {
           <div style={{ padding: '5px 10px 10px', color: 'var(--text-faint)', fontFamily: 'var(--mono)', fontSize: 9 }}>Preferences only · notification delivery is not enabled yet.</div>
         </MoreSection>
 
+        {project && <MoreSection title={`Project tools · ${project.key}`}>
+          <MoreRow
+            icon="☷"
+            label="Plans"
+            detail="Review phases, tasks, gates, and plan documents"
+            onClick={() => {
+              if (!store.currentPid) store.actions.selectProject(project.id);
+              store.actions.setView('plans');
+            }}
+          />
+        </MoreSection>}
+
         {project && <MoreSection title={`Desktop tools · ${project.key}`}>
           {(Object.keys(DESKTOP_ONLY_VIEWS) as DesktopOnlyView[]).map((view) => <MoreRow key={view} icon="▱" label={DESKTOP_ONLY_VIEWS[view][0]} detail="Open the desktop handoff card" onClick={() => openProjectTool(view)} />)}
         </MoreSection>}

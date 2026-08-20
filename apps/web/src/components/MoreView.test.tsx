@@ -24,7 +24,7 @@ afterEach(() => {
 });
 
 describe('More mobile hub', () => {
-  it('hides Admin from non-admins and exposes settings and desktop tools', () => {
+  it('hides Admin from non-admins and exposes mobile Plans alongside desktop tools', () => {
     window.matchMedia = vi.fn(() => ({ matches: false, media: '', onchange: null, addListener: vi.fn(), removeListener: vi.fn(), addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn() }));
     const appStore = store(false);
     container = document.createElement('div'); document.body.appendChild(container); root = createRoot(container);
@@ -34,6 +34,9 @@ describe('More mobile hub', () => {
     const settings = [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('Settings'))!;
     act(() => settings.click());
     expect(appStore.actions.setView).toHaveBeenCalledWith('settings');
+    const plans = [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('Review phases, tasks'))!;
+    act(() => plans.click());
+    expect(appStore.actions.setView).toHaveBeenCalledWith('plans');
     const graph = [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('Coordination graph'))!;
     act(() => graph.click());
     expect(appStore.actions.setView).toHaveBeenCalledWith('graph');
