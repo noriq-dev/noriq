@@ -95,6 +95,44 @@ export interface ApiPlanSearchResult {
   createdAt: string;
 }
 
+export interface ApiProjectDoc {
+  id: string;
+  name: string;
+  description: string;
+  body: string;
+  folder: string;
+  tags: string[];
+  authorKind: string;
+  authorName: string;
+  version: number;
+  archivedAt: string | null;
+  updatedAt: string;
+}
+
+export interface ApiDocVersionSummary {
+  version: number;
+  name: string;
+  description: string;
+  authorKind: string;
+  authorName: string;
+  createdAt: string;
+}
+
+export interface ApiDocVersion {
+  id: string;
+  version: number;
+  currentVersion: number;
+  name: string;
+  description: string;
+  body: string;
+  folder: string;
+  tags: string[];
+  authorKind: string;
+  authorName: string;
+  archivedAt: string | null;
+  createdAt: string;
+}
+
 async function askStream(
   question: string,
   threadId: string | null,
@@ -250,9 +288,13 @@ export const api = {
     req<{ id: string; key: string }>('POST', '/api/projects', { key, name, description }),
   groups: () => req<{ groups: Array<{ id: string; name: string; description: string; canEdit: number; myRole: 'owner' | 'manager' | 'member' | null }> }>('GET', '/api/groups'),
   createGroup: (name: string, description?: string) => req<{ id: string }>('POST', '/api/groups', { name, description }),
-  docs: (pid: string) => req<{ docs: Array<{ id: string; name: string; description: string; body: string; folder: string; tags: string[]; authorKind: string; authorName: string; updatedAt: string }> }>('GET', `/api/projects/${pid}/docs`),
-  createDoc: (pid: string, input: { name: string; description?: string; body?: string; folder?: string; tags?: string[] }) => req<{ id: string }>('POST', `/api/projects/${pid}/docs`, input),
-  updateDoc: (pid: string, did: string, patch: { name?: string; description?: string; body?: string; folder?: string; tags?: string[] }) => req('PATCH', `/api/projects/${pid}/docs/${did}`, patch),
+  docs: (pid: string, archived = false) => req<{ docs: ApiProjectDoc[] }>('GET', `/api/projects/${pid}/docs${archived ? '?archived=1' : ''}`),
+  docVersions: (pid: string, did: string) => req<{ currentVersion: number; archivedAt: string | null; versions: ApiDocVersionSummary[] }>('GET', `/api/projects/${pid}/docs/${did}/versions`),
+  docVersion: (pid: string, did: string, version: number) => req<ApiDocVersion>('GET', `/api/projects/${pid}/docs/${did}/versions/${version}`),
+  createDoc: (pid: string, input: { name: string; description?: string; body?: string; folder?: string; tags?: string[] }) => req<{ id: string; version: number }>('POST', `/api/projects/${pid}/docs`, input),
+  updateDoc: (pid: string, did: string, patch: { name?: string; description?: string; body?: string; folder?: string; tags?: string[] }) => req<{ ok: true; version: number }>('PATCH', `/api/projects/${pid}/docs/${did}`, patch),
+  archiveDoc: (pid: string, did: string) => req<{ ok: true; archived: true; version: number }>('POST', `/api/projects/${pid}/docs/${did}/archive`),
+  restoreDoc: (pid: string, did: string) => req<{ ok: true; archived: false; version: number }>('POST', `/api/projects/${pid}/docs/${did}/restore`),
   deleteDoc: (pid: string, did: string) => req('DELETE', `/api/projects/${pid}/docs/${did}`),
   // Plan-local docs (PLNR-200) — reads come from the snapshot (planDocs); these are the writes.
   createPlanDoc: (pid: string, planId: string, input: { name: string; description?: string; body?: string }) =>

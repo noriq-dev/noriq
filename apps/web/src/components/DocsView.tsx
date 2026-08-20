@@ -4,19 +4,22 @@
 // (the same vocabulary tasks use, for filtering).
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api';
+import type { ApiDocVersion, ApiDocVersionSummary, ApiProjectDoc } from '../api';
 import type { AppStore } from '../store';
 import { Markdown } from './Markdown';
 import { MonoTag, SectionLabel } from './bits';
 import { Button, TextInput } from './ui';
 import { confirm } from './Dialog';
 
-interface Doc { id: string; name: string; description: string; body: string; folder: string; tags: string[]; authorKind: string; authorName: string; updatedAt: string }
-
 export function DocsView({ store }: { store: AppStore }) {
   const { currentPid, snapshot, actions } = store;
-  const [docs, setDocs] = useState<Doc[]>([]);
+  const [docs, setDocs] = useState<ApiProjectDoc[]>([]);
+  const [archivedDocs, setArchivedDocs] = useState<ApiProjectDoc[]>([]);
+  const [showArchived, setShowArchived] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
+  const [versions, setVersions] = useState<ApiDocVersionSummary[]>([]);
+  const [viewedVersion, setViewedVersion] = useState<ApiDocVersion | null>(null);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [tagFilter, setTagFilter] = useState<string | null>(null);
   const [eName, setEName] = useState('');
@@ -25,7 +28,9 @@ export function DocsView({ store }: { store: AppStore }) {
   const [eFolder, setEFolder] = useState('');
   const [eTags, setETags] = useState('');
 
-  const load = () => api.docs(currentPid).then((r) => { setDocs(r.docs); }).catch(() => {});
+  const load = () => Promise.all([api.docs(currentPid), api.docs(currentPid, true)])
+    .then(([active, archived]) => { setDocs(active.docs); setArchivedDocs(archived.docs); })
+    .catch(() => {});
   const collapseInitFor = useRef<string | null>(null);
   useEffect(() => {
     // Deep link from the palette / task drawer (PLNR-186): open a specific doc on arrival.
@@ -33,6 +38,9 @@ export function DocsView({ store }: { store: AppStore }) {
     sessionStorage.removeItem('noriq.openDoc');
     setSelected(hint || null);
     setEditing(false);
+    setShowArchived(false);
+    setVersions([]);
+    setViewedVersion(null);
     setTagFilter(null);
     setCollapsed(new Set());
     collapseInitFor.current = null;
@@ -49,6 +57,14 @@ export function DocsView({ store }: { store: AppStore }) {
     /* eslint-disable-next-line react-hooks/exhaustive-deps */
   }, [snapshot]);
 
+  // Exact deep links can target a retained archived doc. Once both lists arrive, switch to the
+  // archive rather than presenting a blank reader for an id that still exists.
+  useEffect(() => {
+    if (selected && archivedDocs.some((doc) => doc.id === selected) && !docs.some((doc) => doc.id === selected)) {
+      setShowArchived(true);
+    }
+  }, [archivedDocs, docs, selected]);
+
   // Past 5 docs, folders start collapsed so the list is navigable (PLNR-193) — once
   // per project, so user toggles (and folders born later) are respected afterward.
   // The selected doc's folder stays open so deep links land visible.
@@ -62,7 +78,17 @@ export function DocsView({ store }: { store: AppStore }) {
     /* eslint-disable-next-line react-hooks/exhaustive-deps */
   }, [docs, currentPid]);
 
-  const sel = docs.find((d) => d.id === selected) ?? null;
+  const visibleDocs = showArchived ? archivedDocs : docs;
+  const sel = visibleDocs.find((d) => d.id === selected) ?? null;
+  const readDoc = viewedVersion ?? sel;
+  const viewingHistory = !!viewedVersion && !!sel && viewedVersion.version !== sel.version;
+
+  useEffect(() => {
+    setViewedVersion(null);
+    setVersions([]);
+    if (!selected) return;
+    void api.docVersions(currentPid, selected).then((result) => setVersions(result.versions)).catch(() => {});
+  }, [currentPid, selected]);
   // Tasks citing the selected doc (PLNR-182) — from the live snapshot's link pairs.
   const linkedTasks = sel
     ? (snapshot?.taskDocs ?? []).filter((l) => l.docId === sel.id)
@@ -76,20 +102,20 @@ export function DocsView({ store }: { store: AppStore }) {
     return m;
   }, [snapshot?.tags]);
 
-  const tagsInUse = useMemo(() => [...new Set(docs.flatMap((d) => d.tags))].sort(), [docs]);
+  const tagsInUse = useMemo(() => [...new Set(visibleDocs.flatMap((d) => d.tags))].sort(), [visibleDocs]);
   const foldersInUse = useMemo(() => [...new Set(docs.map((d) => d.folder).filter(Boolean))].sort(), [docs]);
 
   // Folder groups, root ('') first, then paths alphabetically. Tag filter applies inside.
   const groups = useMemo(() => {
-    const visible = tagFilter ? docs.filter((d) => d.tags.includes(tagFilter)) : docs;
-    const byFolder = new Map<string, Doc[]>();
+    const visible = tagFilter ? visibleDocs.filter((d) => d.tags.includes(tagFilter)) : visibleDocs;
+    const byFolder = new Map<string, ApiProjectDoc[]>();
     for (const d of visible) {
       const list = byFolder.get(d.folder) ?? [];
       list.push(d);
       byFolder.set(d.folder, list);
     }
     return [...byFolder.entries()].sort(([a], [b]) => (a === '' ? -1 : b === '' ? 1 : a.localeCompare(b)));
-  }, [docs, tagFilter]);
+  }, [visibleDocs, tagFilter]);
 
   const startNew = () => { setSelected(null); setEName(''); setEDesc(''); setEBody(''); setEFolder(''); setETags(''); setEditing(true); };
   const startEdit = () => {
@@ -110,9 +136,10 @@ export function DocsView({ store }: { store: AppStore }) {
     load();
   };
 
-  const docCard = (d: Doc, indent: boolean) => (
+  const docCard = (d: ApiProjectDoc, indent: boolean) => (
     <div
       key={d.id}
+      data-doc-id={d.id}
       onClick={() => { setSelected(d.id); setEditing(false); }}
       className="hover-border"
       style={{
@@ -121,14 +148,14 @@ export function DocsView({ store }: { store: AppStore }) {
         border: `1px solid ${selected === d.id ? 'var(--w-18)' : 'var(--w-07)'}`,
       }}
     >
-      <div style={{ fontSize: 13, fontWeight: 600 }}>{d.name}</div>
+      <div style={{ fontSize: 13, fontWeight: 600 }}>{d.archivedAt ? '🗄 ' : ''}{d.name}</div>
       {d.description && <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 2 }}>{d.description}</div>}
       <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 4, marginTop: 4 }}>
         {d.tags.map((t) => (
           <MonoTag key={t} color={tagColor.get(t) ?? 'var(--text-mid)'} bg="var(--w-04)" size={8.5}>{t}</MonoTag>
         ))}
         <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>
-          {d.authorName} · {new Date(d.updatedAt).toLocaleDateString()}
+          v{d.version} · {d.authorName} · {new Date(d.updatedAt).toLocaleDateString()}
         </span>
       </div>
     </div>
@@ -138,9 +165,18 @@ export function DocsView({ store }: { store: AppStore }) {
     <div style={{ position: 'absolute', inset: 0, display: 'grid', gridTemplateColumns: '320px 1fr', minHeight: 0 }} className="agents-grid">
       <div style={{ borderRight: '1px solid var(--line)', overflowY: 'auto', padding: '16px 14px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
-          <SectionLabel>Docs · {docs.length}</SectionLabel>
+          <SectionLabel>{showArchived ? 'Archived docs' : 'Docs'} · {visibleDocs.length}</SectionLabel>
           <div style={{ flex: 1 }} />
-          <Button variant="ghost" style={{ padding: '4px 10px', fontSize: 11 }} onClick={startNew}>+ new</Button>
+          {archivedDocs.length > 0 && (
+            <Button
+              variant="ghost"
+              style={{ padding: '4px 10px', fontSize: 11 }}
+              onClick={() => { setShowArchived((value) => !value); setSelected(null); setEditing(false); setTagFilter(null); }}
+            >
+              {showArchived ? 'active' : `archive · ${archivedDocs.length}`}
+            </Button>
+          )}
+          {!showArchived && <Button variant="ghost" style={{ padding: '4px 10px', fontSize: 11 }} onClick={startNew}>+ new</Button>}
         </div>
         {tagsInUse.length > 0 && (
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 12 }}>
@@ -186,12 +222,12 @@ export function DocsView({ store }: { store: AppStore }) {
               {!collapsed.has(folder) && list.map((d) => docCard(d, true))}
             </div>
           ))}
-          {!docs.length && !editing && (
+          {!visibleDocs.length && !editing && (
             <div style={{ padding: 30, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>
-              no docs yet — conventions, architecture notes, decisions live here
+              {showArchived ? 'no archived docs' : 'no docs yet — conventions, architecture notes, decisions live here'}
             </div>
           )}
-          {docs.length > 0 && groups.length === 0 && (
+          {visibleDocs.length > 0 && groups.length === 0 && (
             <div style={{ padding: 20, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>
               nothing tagged “{tagFilter}”
             </div>
@@ -231,30 +267,94 @@ export function DocsView({ store }: { store: AppStore }) {
               <Button onClick={() => void save()}>save</Button>
             </div>
           </div>
-        ) : sel ? (
+        ) : sel && readDoc ? (
           <div style={{ maxWidth: 780 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
-              <h2 style={{ margin: 0, fontSize: 18, fontWeight: 700 }}>{sel.name}</h2>
+              <h2 style={{ margin: 0, fontSize: 18, fontWeight: 700 }}>{readDoc.name}</h2>
+              <MonoTag color={viewingHistory ? 'var(--amber)' : 'var(--accent)'} bg="var(--w-04)" size={9}>
+                v{readDoc.version}{viewingHistory ? ' · HISTORY' : ''}
+              </MonoTag>
               <div style={{ flex: 1 }} />
-              <Button variant="ghost" style={{ padding: '5px 12px', fontSize: 11.5 }} onClick={startEdit}>edit</Button>
+              {sel.archivedAt ? (
+                <Button
+                  variant="ghost"
+                  style={{ padding: '5px 12px', fontSize: 11.5 }}
+                  onClick={async () => {
+                    await api.restoreDoc(currentPid, sel.id);
+                    setSelected(null);
+                    setShowArchived(false);
+                    await load();
+                  }}
+                >restore</Button>
+              ) : viewingHistory ? (
+                <Button variant="ghost" style={{ padding: '5px 12px', fontSize: 11.5 }} onClick={() => setViewedVersion(null)}>current</Button>
+              ) : (
+                <>
+                  <Button variant="ghost" style={{ padding: '5px 12px', fontSize: 11.5 }} onClick={startEdit}>edit</Button>
+                  <Button
+                    variant="ghost"
+                    style={{ padding: '5px 12px', fontSize: 11.5 }}
+                    onClick={async () => {
+                      if (await confirm(`Archive doc "${sel.name}"? It will leave search and task context, but its version history will be retained.`, { confirmLabel: 'Archive' })) {
+                        await api.archiveDoc(currentPid, sel.id);
+                        setSelected(null);
+                        await load();
+                      }
+                    }}
+                  >archive</Button>
+                </>
+              )}
               <Button
                 variant="danger"
                 style={{ padding: '5px 12px', fontSize: 11.5 }}
                 onClick={async () => {
-                  if (await confirm(`Delete doc "${sel.name}"?`)) {
+                  if (await confirm(`Permanently delete doc "${sel.name}" and all ${sel.version} version${sel.version === 1 ? '' : 's'}?`, { confirmLabel: 'Delete permanently' })) {
                     await api.deleteDoc(currentPid, sel.id);
                     setSelected(null);
-                    load();
+                    await load();
                   }
                 }}
               >
                 delete
               </Button>
             </div>
-            {(sel.folder || sel.tags.length > 0) && (
+            {versions.length > 0 && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+                <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)', textTransform: 'uppercase', letterSpacing: '.05em' }}>
+                  version history
+                </span>
+                <select
+                  aria-label="Document version"
+                  value={readDoc.version}
+                  onChange={(event) => {
+                    const version = Number(event.target.value);
+                    if (version === sel.version) setViewedVersion(null);
+                    else void api.docVersion(currentPid, sel.id, version).then(setViewedVersion);
+                  }}
+                  style={{ background: 'var(--w-03)', border: '1px solid var(--w-1)', borderRadius: 7, color: 'var(--text-soft)', padding: '4px 8px', fontFamily: 'var(--mono)', fontSize: 10.5 }}
+                >
+                  {versions.map((item) => (
+                    <option key={item.version} value={item.version}>
+                      v{item.version}{item.version === sel.version ? ' · current' : ''} · {item.authorName} · {new Date(item.createdAt).toLocaleString()}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            {viewingHistory && (
+              <div style={{ marginBottom: 12, border: '1px solid rgba(245,166,35,.3)', background: 'rgba(245,166,35,.07)', borderRadius: 8, padding: '8px 10px', color: 'var(--text-dim)', fontSize: 11.5 }}>
+                Read-only historical snapshot. Return to v{sel.version} to edit the current document.
+              </div>
+            )}
+            {sel.archivedAt && (
+              <div style={{ marginBottom: 12, border: '1px solid var(--w-1)', background: 'var(--w-025)', borderRadius: 8, padding: '8px 10px', color: 'var(--text-dim)', fontSize: 11.5 }}>
+                Archived · excluded from search and task context. Restore it before editing.
+              </div>
+            )}
+            {(readDoc.folder || readDoc.tags.length > 0) && (
               <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginBottom: 10 }}>
-                {sel.folder && <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)' }}>📁 {sel.folder}</span>}
-                {sel.tags.map((t) => (
+                {readDoc.folder && <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)' }}>📁 {readDoc.folder}</span>}
+                {readDoc.tags.map((t) => (
                   <MonoTag key={t} color={tagColor.get(t) ?? 'var(--text-mid)'} bg="var(--w-04)" size={9}>{t}</MonoTag>
                 ))}
               </div>
@@ -277,7 +377,7 @@ export function DocsView({ store }: { store: AppStore }) {
                 ))}
               </div>
             )}
-            <Markdown source={sel.body || '_empty_'} />
+            <Markdown source={readDoc.body || '_empty_'} />
           </div>
         ) : (
           <div style={{ padding: 60, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-dim)' }}>
