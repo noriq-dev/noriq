@@ -239,7 +239,7 @@ async function hydrate(
   if (byKind.doc.length) {
     const { results } = await db.prepare(
       `SELECT id, name, description, substr(body, 1, 200) AS snippet, updated_at AS updatedAt
-         FROM docs WHERE id IN (${inList(byKind.doc)})`,
+         FROM docs WHERE archived_at IS NULL AND id IN (${inList(byKind.doc)})`,
     ).bind(...byKind.doc).all<{ id: string; name: string; description: string; snippet: string; updatedAt: string }>();
     for (const d of results) rows.set(`doc:${d.id}`, { title: d.name, description: d.description, snippet: d.description || d.snippet || '', updatedAt: d.updatedAt });
   }
@@ -295,7 +295,7 @@ export async function keywordSearch(env: Env, opts: SearchOptions): Promise<Sear
   const db = env.DB;
   const hits: SearchHit[] = [];
 
-  const run = async (cols: { title: string; body: string[]; table: string; select: string; order: string }) => {
+  const run = async (cols: { title: string; body: string[]; table: string; select: string; order: string; where?: string }) => {
     const columns = [cols.title, ...cols.body];
     const binds: unknown[] = [];
     // rank = how many terms hit the title (binds come first — rank sits in the SELECT).
@@ -305,7 +305,7 @@ export async function keywordSearch(env: Env, opts: SearchOptions): Promise<Sear
     const where = likes.map((l) => `(${columns.map((cn) => { binds.push(l); return `${cn} LIKE ?`; }).join(' OR ')})`).join(' AND ');
     return db.prepare(
       `SELECT ${cols.select}, ${rank} AS rank FROM ${cols.table}
-       WHERE project_id IN (${inPids}) AND ${where}
+       WHERE project_id IN (${inPids})${cols.where ? ` AND ${cols.where}` : ''} AND ${where}
        ORDER BY rank DESC, ${cols.order} DESC LIMIT ${limit}`,
     ).bind(...binds).all();
   };
@@ -323,6 +323,7 @@ export async function keywordSearch(env: Env, opts: SearchOptions): Promise<Sear
     const { results } = await run({
       table: 'docs', title: 'name', body: ['description', 'body'], order: 'updated_at',
       select: 'id, project_id AS projectId, name AS title, description, substr(body, 1, 200) AS snippet, updated_at AS updatedAt',
+      where: 'archived_at IS NULL',
     });
     for (const d of results as Array<{ id: string; projectId: string; title: string; description: string; snippet: string; updatedAt: string; rank: number }>) {
       hits.push({ kind: 'doc', id: d.id, projectId: d.projectId, title: d.title, description: d.description, snippet: d.description || d.snippet || '', updatedAt: d.updatedAt, score: (d.rank + 1) / (terms.length + 1) });
@@ -367,7 +368,7 @@ export async function reindexProject(
       `SELECT d.id, d.name AS title, d.body,
               (d.description || ' ' || d.folder || ' ' ||
                COALESCE((SELECT GROUP_CONCAT(g.name, ' ') FROM doc_tags dt JOIN tags g ON g.id = dt.tag_id WHERE dt.doc_id = d.id), '')) AS extra
-       FROM docs d WHERE d.project_id = ? ORDER BY d.created_at`,
+       FROM docs d WHERE d.project_id = ? AND d.archived_at IS NULL ORDER BY d.created_at`,
     ).bind(projectId).all<{ id: string; title: string; body: string | null; extra: string | null }>(),
     env.DB.prepare('SELECT id, title, body, description AS extra FROM plans WHERE project_id = ? ORDER BY created_at')
       .bind(projectId).all<{ id: string; title: string; body: string | null; extra: string | null }>(),

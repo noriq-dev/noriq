@@ -7432,7 +7432,7 @@ export class ProjectMemory extends DurableObject<Env> {
     const [tasks, plans, docs, milestones, agents, taskPlanLinks, taskDocLinks, taskDependencies, taskClaims, runs] = await Promise.all([
       this.env.DB.prepare('SELECT id, title FROM tasks WHERE project_id = ?').bind(projectId).all<{ id: string; title: string }>(),
       this.env.DB.prepare('SELECT id, title FROM plans WHERE project_id = ?').bind(projectId).all<{ id: string; title: string }>(),
-      this.env.DB.prepare('SELECT id, name FROM docs WHERE project_id = ?').bind(projectId).all<{ id: string; name: string }>(),
+      this.env.DB.prepare('SELECT id, name FROM docs WHERE project_id = ? AND archived_at IS NULL').bind(projectId).all<{ id: string; name: string }>(),
       this.env.DB.prepare('SELECT id, title FROM milestones WHERE project_id = ?').bind(projectId).all<{ id: string; title: string }>(),
       this.env.DB.prepare('SELECT id, name FROM agents WHERE project_id = ?').bind(projectId).all<{ id: string; name: string }>(),
       this.env.DB.prepare(
@@ -7442,7 +7442,8 @@ export class ProjectMemory extends DurableObject<Env> {
       ).bind(projectId).all<{ taskId: string; planId: string; phaseId: string }>(),
       this.env.DB.prepare(
         `SELECT td.task_id AS taskId, td.doc_id AS docId FROM task_docs td
-         JOIN tasks t ON t.id = td.task_id WHERE t.project_id = ?`,
+         JOIN tasks t ON t.id = td.task_id JOIN docs d ON d.id = td.doc_id
+         WHERE t.project_id = ? AND d.archived_at IS NULL`,
       ).bind(projectId).all<{ taskId: string; docId: string }>(),
       this.env.DB.prepare(
         `SELECT d.task_id AS taskId, d.depends_on_task_id AS dependsOnId FROM dependencies d

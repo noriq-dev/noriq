@@ -1186,7 +1186,7 @@ export class ProjectRoom extends DurableObject<Env> {
         }
         if (Object.hasOwn(expected.before, 'docIds')) {
           const docs = await this.env.DB.prepare(
-            'SELECT d.id FROM task_docs td JOIN docs d ON d.id = td.doc_id WHERE td.task_id = ? ORDER BY d.name',
+            'SELECT d.id FROM task_docs td JOIN docs d ON d.id = td.doc_id WHERE td.task_id = ? AND d.archived_at IS NULL ORDER BY d.name',
           ).bind(taskId).all<{ id: string }>();
           current.docIds = docs.results.map((doc) => doc.id);
         }
@@ -2799,7 +2799,7 @@ export class ProjectRoom extends DurableObject<Env> {
         const d = await this.env.DB.prepare(
           `SELECT d.project_id AS pid, d.name, d.description, d.body, d.folder,
                   (SELECT GROUP_CONCAT(g.name, ' ') FROM doc_tags dt JOIN tags g ON g.id = dt.tag_id WHERE dt.doc_id = d.id) AS tags
-           FROM docs d WHERE d.id = ?`,
+           FROM docs d WHERE d.id = ? AND d.archived_at IS NULL`,
         ).bind(id).first<{ pid: string; name: string; description: string; body: string; folder: string; tags: string | null }>();
         if (d) await indexEntity(backend, { kind, id, projectId: d.pid, title: d.name, body: d.body, extra: [d.description, d.folder, d.tags].filter(Boolean).join(' ') });
       } else {
@@ -2825,7 +2825,7 @@ export class ProjectRoom extends DurableObject<Env> {
     const ids = [...new Set((docIds ?? []).filter(Boolean))];
     if (!ids.length) return [];
     const { results } = await this.env.DB.prepare(
-      `SELECT id, name FROM docs WHERE project_id = ? AND id IN (${ids.map(() => '?').join(',')})`,
+      `SELECT id, name FROM docs WHERE project_id = ? AND archived_at IS NULL AND id IN (${ids.map(() => '?').join(',')})`,
     ).bind(this.projectId, ...ids).all<{ id: string; name: string }>();
     const found = new Map(results.map((r) => [r.id, r.name]));
     const missing = ids.filter((d) => !found.has(d));
@@ -3254,6 +3254,29 @@ export class ProjectRoom extends DurableObject<Env> {
     await this.env.DB.batch(stmts);
   }
 
+  /** Snapshot the current doc row after a successful write. Historical revisions are D1-only:
+   *  search always reindexes the stable doc id from the current docs row, never these rows. */
+  private async appendDocVersion(docId: string, actor: Actor) {
+    const doc = await this.env.DB.prepare(
+      `SELECT id, current_version AS version, name, description, body, folder
+         FROM docs WHERE id = ? AND project_id = ?`,
+    ).bind(docId, this.projectId).first<{
+      id: string; version: number; name: string; description: string; body: string; folder: string;
+    }>();
+    if (!doc) throw new Error('doc not found in this project');
+    const { results: tags } = await this.env.DB.prepare(
+      `SELECT g.name FROM doc_tags dt JOIN tags g ON g.id = dt.tag_id
+        WHERE dt.doc_id = ? ORDER BY g.name`,
+    ).bind(docId).all<{ name: string }>();
+    await this.env.DB.prepare(
+      `INSERT INTO doc_versions
+         (doc_id, version, name, description, body, folder, tags_json, author_kind, author_name)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(doc.id, doc.version, doc.name, doc.description, doc.body, doc.folder,
+      JSON.stringify(tags.map((tag) => tag.name)), actor.kind, actor.name).run();
+    return doc.version;
+  }
+
   /** Project docs (PLNR-158) — freeform markdown reference material. Writes go through
    *  the DO like every other mutation (evented + WS fanout); reads are direct D1. */
   async createDoc(projectId: string, actor: Actor, input: { name: string; description?: string; body?: string; folder?: string; tags?: string[]; allowNewTags?: boolean }) {
@@ -3266,9 +3289,10 @@ export class ProjectRoom extends DurableObject<Env> {
       ).bind(id, this.projectId, input.name, input.description ?? '', input.body ?? '',
         ProjectRoom.normalizeFolder(input.folder ?? ''), actor.kind, actor.name).run();
       if (input.tags?.length) await this.setDocTags(projectId, actor, id, input.tags, input.allowNewTags);
-      await this.emit(actor, 'doc.created', 'doc', id, { name: input.name });
+      const version = await this.appendDocVersion(id, actor);
+      await this.emit(actor, 'doc.created', 'doc', id, { name: input.name, version });
       this.reindexSearch('doc', id);
-      return { id, name: input.name };
+      return { id, name: input.name, version };
     });
   }
 
@@ -3278,9 +3302,10 @@ export class ProjectRoom extends DurableObject<Env> {
   ) {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
-      const doc = await this.env.DB.prepare('SELECT id, name FROM docs WHERE id = ? AND project_id = ?')
-        .bind(docId, this.projectId).first<{ id: string; name: string }>();
+      const doc = await this.env.DB.prepare('SELECT id, name, archived_at AS archivedAt FROM docs WHERE id = ? AND project_id = ?')
+        .bind(docId, this.projectId).first<{ id: string; name: string; archivedAt: string | null }>();
       if (!doc) throw new Error('doc not found in this project');
+      if (doc.archivedAt) throw new Error('archived docs are read-only — restore this doc before updating it');
       requireDecisionOnlyDoc(patch.body); // PLNR-183: docs state decisions, not questions
       let touched = false;
       // Tag edits (PLNR-188), mirroring the task patterns: `tags` replaces; add/remove edit.
@@ -3311,16 +3336,53 @@ export class ProjectRoom extends DurableObject<Env> {
       if (patch.folder !== undefined) { sets.push('folder = ?'); binds.push(ProjectRoom.normalizeFolder(patch.folder)); }
       if (!sets.length) {
         if (!touched) return { ok: true };
-        await this.emit(actor, 'doc.updated', 'doc', docId, { name: doc.name, fields: ['tags'] });
+        sets.push('updated_at = ?', 'current_version = current_version + 1');
+        binds.push(nowIso(), docId);
+        await this.env.DB.prepare(`UPDATE docs SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
+        const version = await this.appendDocVersion(docId, actor);
+        await this.emit(actor, 'doc.updated', 'doc', docId, { name: doc.name, fields: ['tags'], version });
         this.reindexSearch('doc', docId);
-        return { ok: true };
+        return { ok: true, version };
       }
-      sets.push('updated_at = ?');
+      sets.push('updated_at = ?', 'current_version = current_version + 1');
       binds.push(nowIso(), docId);
       await this.env.DB.prepare(`UPDATE docs SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
-      await this.emit(actor, 'doc.updated', 'doc', docId, { name: patch.name ?? doc.name, fields: Object.keys(patch) });
+      const version = await this.appendDocVersion(docId, actor);
+      await this.emit(actor, 'doc.updated', 'doc', docId, { name: patch.name ?? doc.name, fields: Object.keys(patch), version });
       this.reindexSearch('doc', docId);
-      return { ok: true };
+      return { ok: true, version };
+    });
+  }
+
+  /** Reversible human lifecycle. Archive keeps the canonical row, links, and versions but
+   *  removes the doc from active discovery and schedules deletion of its stable vector ids. */
+  async archiveDoc(projectId: string, actor: Actor, docId: string, archived = true) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      await this.setPid(projectId);
+      const doc = await this.env.DB.prepare(
+        'SELECT id, name, current_version AS version, archived_at AS archivedAt FROM docs WHERE id = ? AND project_id = ?',
+      ).bind(docId, this.projectId).first<{ id: string; name: string; version: number; archivedAt: string | null }>();
+      if (!doc) throw new Error('doc not found in this project');
+      if (!!doc.archivedAt === archived) return { ok: true, archived, version: doc.version };
+      const archivedAt = archived ? nowIso() : null;
+      await this.env.DB.prepare('UPDATE docs SET archived_at = ? WHERE id = ?').bind(archivedAt, docId).run();
+      await this.emit(actor, archived ? 'doc.archived' : 'doc.restored', 'doc', docId, {
+        name: doc.name, version: doc.version, archivedAt,
+      });
+      if (archived) this.dropSearch('doc', docId);
+      else {
+        this.reindexSearch('doc', docId);
+        const { results: attachedTasks } = await this.env.DB.prepare(
+          'SELECT t.id AS taskId, t.title AS taskTitle FROM task_docs td JOIN tasks t ON t.id = td.task_id WHERE td.doc_id = ?',
+        ).bind(docId).all<{ taskId: string; taskTitle: string }>();
+        if (attachedTasks.length) {
+          await this.emit(actor, 'task.docs_linked', 'doc', docId, {
+            docLabel: doc.name,
+            links: attachedTasks.map((task) => ({ ...task, docId, docLabel: doc.name })),
+          });
+        }
+      }
+      return { ok: true, archived, archivedAt, version: doc.version };
     });
   }
 
@@ -3341,6 +3403,7 @@ export class ProjectRoom extends DurableObject<Env> {
       await this.env.DB.batch([
         this.env.DB.prepare('DELETE FROM task_docs WHERE doc_id = ?').bind(docId),
         this.env.DB.prepare('DELETE FROM doc_tags WHERE doc_id = ?').bind(docId),
+        this.env.DB.prepare('DELETE FROM doc_versions WHERE doc_id = ?').bind(docId),
         this.env.DB.prepare('DELETE FROM docs WHERE id = ?').bind(docId),
       ]);
       await this.emit(actor, 'doc.deleted', 'doc', docId, { name: doc.name });
@@ -3972,6 +4035,7 @@ export class ProjectRoom extends DurableObject<Env> {
         this.env.DB.prepare(`DELETE FROM task_tags WHERE task_id IN (${tasksSub}) OR tag_id IN (SELECT id FROM tags WHERE project_id = ?)`).bind(pid, pid),
         this.env.DB.prepare(`DELETE FROM task_docs WHERE task_id IN (${tasksSub}) OR doc_id IN (SELECT id FROM docs WHERE project_id = ?)`).bind(pid, pid),
         this.env.DB.prepare('DELETE FROM doc_tags WHERE doc_id IN (SELECT id FROM docs WHERE project_id = ?)').bind(pid),
+        this.env.DB.prepare('DELETE FROM doc_versions WHERE doc_id IN (SELECT id FROM docs WHERE project_id = ?)').bind(pid),
         this.env.DB.prepare(`DELETE FROM comments WHERE task_id IN (${tasksSub})`).bind(pid),
         this.env.DB.prepare(`DELETE FROM attachments WHERE task_id IN (${tasksSub})`).bind(pid),
         this.env.DB.prepare('DELETE FROM signals WHERE project_id = ?').bind(pid),

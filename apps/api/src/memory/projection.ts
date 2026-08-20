@@ -345,6 +345,7 @@ export function mapCoordinationEvent(ev: CoordinationEventForProjection): Coordi
     case 'plan.created':
       return { node: { type: 'plan', uri: buildEntityUri({ kind: 'plan', id: ev.subjectId }), label: label('title') }, edges: [] };
     case 'doc.created':
+    case 'doc.restored':
       return { node: { type: 'artifact', uri: buildEntityUri({ kind: 'artifact', id: ev.subjectId }), label: label('name') }, edges: [] };
     case 'milestone.created':
       return { node: { type: 'unknown', uri: buildEntityUri({ kind: 'unknown', id: ev.subjectId }), label: label('title') }, edges: [] };
@@ -480,6 +481,7 @@ export function mapCoordinationEvent(ev: CoordinationEventForProjection): Coordi
     // treatment as `plan.deleted`, and why `plan_doc.deleted` is deliberately absent.
     case 'task.deleted':
       return { node: null, edges: [], removeNodeUri: buildEntityUri({ kind: 'task', id: ev.subjectId }) };
+    case 'doc.archived':
     case 'doc.deleted':
       return { node: null, edges: [], removeNodeUri: buildEntityUri({ kind: 'artifact', id: ev.subjectId }) };
     case 'plan.deleted':

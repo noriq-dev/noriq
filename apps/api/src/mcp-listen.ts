@@ -37,7 +37,7 @@ import { nowIso } from './lib/util';
 
 const META_SUBSCRIPTION_ID = 'io.modelcontextprotocol/subscriptionId';
 const DOC_URI_RE = /^noriq:\/\/doc\/([A-Za-z0-9_-]+)$/;
-const CHANGE_VERBS = ['doc.created', 'doc.updated', 'doc.deleted', 'attachment.added', 'attachment.removed'];
+const CHANGE_VERBS = ['doc.created', 'doc.updated', 'doc.archived', 'doc.restored', 'doc.deleted', 'attachment.added', 'attachment.removed'];
 /** Send an SSE comment after this many consecutive empty polls (~20s at the default poll). */
 const KEEPALIVE_EVERY_POLLS = 4;
 const MAX_EVENTS_PER_POLL = 200;
@@ -82,7 +82,7 @@ export async function handleSubscriptionsListen(
     const idSlots = ids.map((_, i) => `?${i + 1}`).join(',');
     const { results } = await env.DB.prepare(
       `SELECT d.id FROM docs d JOIN projects p ON p.id = d.project_id
-       WHERE d.id IN (${idSlots}) AND ${USER_PROJECT_WHERE.replaceAll('?1', `?${ids.length + 1}`)}
+       WHERE d.id IN (${idSlots}) AND d.archived_at IS NULL AND ${USER_PROJECT_WHERE.replaceAll('?1', `?${ids.length + 1}`)}
          AND ${tokenProjectWhere(`?${ids.length + 2}`)}`,
     ).bind(...ids, conn.userId, conn.tokenId).all<{ id: string }>();
     const reachable = new Set(results.map((r) => r.id));

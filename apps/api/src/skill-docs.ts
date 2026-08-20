@@ -60,6 +60,16 @@ questions and change as the design firms up. Keep project docs (\`create_doc\`) 
 settled and belongs to the project's long-term memory. When a plan doc's decision settles
 and matters beyond the plan, restate it as a project doc.
 
+**Versions and archive.** Project docs keep immutable history under one stable doc id. Creation
+is version 1; every effective \`update_doc\` appends a version containing the complete name,
+description, body, folder, and tag state. \`get_doc\` returns the version index and accepts a
+specific \`version\` for a read-only historical snapshot. Only the current active version is
+indexed for semantic search. Humans can archive a doc from the Docs workspace when its settled
+record should be retained but no longer guide current work: archive removes it from lists,
+task context, graph retrieval, and the vector store without deleting its versions. An archived
+doc remains readable by exact id and must be restored before it can be revised. Permanent delete
+is a separate destructive action and removes the whole history.
+
 ## Coverage — the corpus, not just the doc
 
 Completeness is judged twice. Each doc is complete for its own scope (see "Writing

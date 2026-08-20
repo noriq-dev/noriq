@@ -1010,7 +1010,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     },
     tool(async ({ projectId, tag, folder }) => {
       const binds: unknown[] = [projectId];
-      let where = 'd.project_id = ?';
+      let where = 'd.project_id = ? AND d.archived_at IS NULL';
       if (tag) {
         where += ' AND EXISTS (SELECT 1 FROM doc_tags dt JOIN tags g ON g.id = dt.tag_id WHERE dt.doc_id = d.id AND g.name = ?)';
         binds.push(tag.trim().toLowerCase());
@@ -1022,6 +1022,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       }
       const { results } = await env.DB.prepare(
         `SELECT d.id, d.name, d.description, d.folder, d.author_name AS authorName, d.updated_at AS updatedAt,
+                d.current_version AS version,
                 (SELECT COUNT(*) FROM task_docs td WHERE td.doc_id = d.id) AS linkedTasks,
                 (SELECT GROUP_CONCAT(g.name) FROM doc_tags dt JOIN tags g ON g.id = dt.tag_id WHERE dt.doc_id = d.id) AS tags
          FROM docs d WHERE ${where} ORDER BY d.folder, d.updated_at DESC`,
@@ -1032,21 +1033,38 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'get_doc',
-    'Read a project doc in full (markdown), plus the tasks that cite it (linkedTasks). What it states is settled — build to it; if reality has moved on, update_doc it to the new truth rather than silently deviating. Accepts the doc id from list_docs.',
-    { projectId: z.string(), docId: z.string() },
-    tool(async ({ projectId, docId }) => {
-      const doc = await env.DB.prepare(
-        `SELECT d.id, d.name, d.description, d.body, d.folder, d.author_name AS authorName, d.updated_at AS updatedAt,
+    'Read a project doc in full (markdown), plus its immutable version index and the tasks that cite it. Omit version for the current body or pass a version number to read that historical snapshot. Archived docs remain readable by exact id but are absent from list_docs and search. What the current version states is settled — build to it; if reality has moved on, restore if needed and update_doc to the new truth rather than silently deviating.',
+    { projectId: z.string(), docId: z.string(), version: z.number().int().positive().optional() },
+    tool(async ({ projectId, docId, version }) => {
+      const current = await env.DB.prepare(
+        `SELECT d.id, d.name, d.description, d.body, d.folder, d.author_kind AS authorKind,
+                d.author_name AS authorName, d.updated_at AS updatedAt,
+                d.current_version AS currentVersion, d.archived_at AS archivedAt,
                 (SELECT GROUP_CONCAT(g.name) FROM doc_tags dt JOIN tags g ON g.id = dt.tag_id WHERE dt.doc_id = d.id) AS tags
          FROM docs d WHERE d.id = ? AND d.project_id = ?`,
-      ).bind(docId, projectId).first();
-      if (!doc) throw new Error(`doc ${docId} not found in this project`);
-      doc.tags = doc.tags ? String(doc.tags).split(',') : [];
+      ).bind(docId, projectId).first<Record<string, unknown>>();
+      if (!current) throw new Error(`doc ${docId} not found in this project`);
+      let doc: Record<string, unknown> = { ...current, version: current.currentVersion };
+      if (version !== undefined) {
+        const historical = await env.DB.prepare(
+          `SELECT doc_id AS id, version, name, description, body, folder, tags_json AS tagsJson,
+                  author_kind AS authorKind, author_name AS authorName, created_at AS updatedAt
+             FROM doc_versions WHERE doc_id = ? AND version = ?`,
+        ).bind(docId, version).first<Record<string, unknown>>();
+        if (!historical) throw new Error(`doc ${docId} version ${version} not found`);
+        doc = { ...historical, tags: JSON.parse(String(historical.tagsJson ?? '[]')), currentVersion: current.currentVersion, archivedAt: current.archivedAt };
+        delete doc.tagsJson;
+      }
+      if (version === undefined) doc.tags = doc.tags ? String(doc.tags).split(',') : [];
+      const { results: versions } = await env.DB.prepare(
+        `SELECT version, name, description, author_kind AS authorKind, author_name AS authorName,
+                created_at AS createdAt FROM doc_versions WHERE doc_id = ? ORDER BY version DESC`,
+      ).bind(docId).all();
       const { results: tasks } = await env.DB.prepare(
         `SELECT t.id, t.key, t.title, ${taskWireStatus('t')} AS status
          FROM task_docs td JOIN tasks t ON t.id = td.task_id WHERE td.doc_id = ? ORDER BY t.key`,
       ).bind(docId).all();
-      return { ...doc, resource: docUri(String(doc.id)), linkedTasks: tasks };
+      return { ...doc, resource: docUri(String(doc.id)), versions, linkedTasks: tasks };
     }),
   );
 
@@ -1070,7 +1088,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'update_doc',
-    'Revise a project doc to the CURRENT truth — pass the FULL new body (read it first via get_doc). A stale doc misleads every agent that reads it; when a decision changes, the doc changes with it, stating the new decision (not the deliberation). The same contract as create_doc is enforced: decisions and facts only, nothing open-ended — for a substantial rewrite, read the authoring guide first (resources/read noriq://skill/doc-authoring).',
+    'Revise a project doc to the CURRENT truth — pass the FULL new body (read it first via get_doc). Every effective update appends an immutable version while only the current version remains searchable. Archived docs are read-only until a human restores them. A stale doc misleads every agent that reads it; when a decision changes, the doc changes with it, stating the new decision (not the deliberation). The same contract as create_doc is enforced: decisions and facts only, nothing open-ended — for a substantial rewrite, read the authoring guide first (resources/read noriq://skill/doc-authoring).',
     {
       projectId: z.string(),
       docId: z.string(),
@@ -1110,7 +1128,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         env.DB.prepare('SELECT id, key, name, description, repo_url AS repoUrl, claim_ttl_seconds AS claimTtlSeconds, file_locking_enabled AS fileLocking FROM projects WHERE id = ?')
           .bind(projectId).first<Record<string, unknown>>(),
         env.DB.prepare('SELECT id, name, color FROM tags WHERE project_id = ? ORDER BY "order"').bind(projectId).all(),
-        env.DB.prepare('SELECT id, name, description, updated_at AS updatedAt FROM docs WHERE project_id = ? ORDER BY updated_at DESC').bind(projectId).all(),
+        env.DB.prepare('SELECT id, name, description, current_version AS version, updated_at AS updatedAt FROM docs WHERE project_id = ? AND archived_at IS NULL ORDER BY updated_at DESC').bind(projectId).all(),
         // Active/pending plans only — a plan with tasks all done/cancelled is complete and
         // skipped; a plan with no tasks yet counts as pending. Summaries only (id/title/desc +
         // task progress); read a full plan with get_plans.
@@ -1502,7 +1520,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
            FROM signals WHERE task_id = ? ORDER BY CASE WHEN status = 'open' THEN 0 ELSE 1 END, created_at DESC`,
         ).bind(id).all(),
         env.DB.prepare(
-          `SELECT d.id, d.name, d.description FROM task_docs td JOIN docs d ON d.id = td.doc_id WHERE td.task_id = ? ORDER BY d.name`,
+          `SELECT d.id, d.name, d.description FROM task_docs td JOIN docs d ON d.id = td.doc_id WHERE td.task_id = ? AND d.archived_at IS NULL ORDER BY d.name`,
         ).bind(id).all(),
       ]);
       // Each attachment carries its resource URI — read the bytes with resources/read.
@@ -2450,7 +2468,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       list: async () => {
         const { results } = await env.DB.prepare(
           `SELECT d.id, d.name, d.description FROM docs d JOIN projects p ON p.id = d.project_id
-           WHERE p.status = 'active' AND ${USER_PROJECT_WHERE} AND ${tokenProjectWhere('?2')}
+           WHERE p.status = 'active' AND d.archived_at IS NULL AND ${USER_PROJECT_WHERE} AND ${tokenProjectWhere('?2')}
            ORDER BY d.updated_at DESC LIMIT 50`,
         ).bind(agent.userId, opts.oauthTokenId ?? null).all<{ id: string; name: string; description: string }>();
         return { resources: results.map((d) => ({ uri: docUri(d.id), name: d.name, mimeType: 'text/markdown', description: d.description })) };

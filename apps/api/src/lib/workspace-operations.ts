@@ -401,7 +401,7 @@ export async function workspaceTaskDetail(env: Env, scope: WorkspaceScope, taskR
       `SELECT id, type, severity, title, body, status, blocking, response, created_at AS createdAt, resolved_at AS resolvedAt
        FROM signals WHERE task_id = ? ORDER BY CASE WHEN status = 'open' THEN 0 ELSE 1 END, created_at DESC LIMIT 30`,
     ).bind(id).all(),
-    env.DB.prepare('SELECT d.id, d.name, d.description, d.updated_at AS updatedAt FROM task_docs td JOIN docs d ON d.id = td.doc_id WHERE td.task_id = ? ORDER BY d.name').bind(id).all(),
+    env.DB.prepare('SELECT d.id, d.name, d.description, d.updated_at AS updatedAt FROM task_docs td JOIN docs d ON d.id = td.doc_id WHERE td.task_id = ? AND d.archived_at IS NULL ORDER BY d.name').bind(id).all(),
     env.DB.prepare(
       `SELECT dt.id, dt.key, dt.title, ${taskWireStatus('dt')} AS status, dt.project_id AS projectId, p.key AS projectKey
        FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id JOIN projects p ON p.id = dt.project_id
@@ -460,7 +460,7 @@ export async function workspaceDocs(
   if (!ids.length) return { docs: [], matched: 0, returned: 0, capped: false, references: [] as WorkspaceReference[] };
   const limit = boundedLimit(input.limit, 20, 40);
   const binds: unknown[] = [...ids];
-  let where = `d.project_id IN (${inClause(ids)})`;
+  let where = `d.project_id IN (${inClause(ids)}) AND d.archived_at IS NULL`;
   if (input.docId) { where += ' AND d.id = ?'; binds.push(input.docId); }
   if (input.text) {
     where += " AND (d.name LIKE ? ESCAPE '\\' OR d.description LIKE ? ESCAPE '\\' OR d.body LIKE ? ESCAPE '\\')";

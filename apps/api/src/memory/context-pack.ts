@@ -516,7 +516,7 @@ export async function assembleContextPack(
     env.DB.prepare(
       `SELECT d.id, d.name, d.description, d.updated_at AS updatedAt
          FROM task_docs td JOIN docs d ON d.id = td.doc_id
-        WHERE td.task_id = ? AND d.project_id = ? ORDER BY d.name, d.id`,
+        WHERE td.task_id = ? AND d.project_id = ? AND d.archived_at IS NULL ORDER BY d.name, d.id`,
     ).bind(row.id, projectId).all<LinkedDocumentRow>(),
     env.DB.prepare(
       `SELECT pd.id, pd.name, pd.description, pd.updated_at AS updatedAt,

@@ -594,7 +594,7 @@ async function hydrateGraphHits(env: Env, hits: AskSearchHit[]): Promise<AskSear
   if (docIds.length) {
     const { results } = await env.DB.prepare(
       `SELECT id, name AS title, COALESCE(NULLIF(description, ''), substr(body, 1, 200), '') AS snippet
-         FROM docs WHERE id IN (${inList(docIds)})`,
+         FROM docs WHERE archived_at IS NULL AND id IN (${inList(docIds)})`,
     ).bind(...docIds).all<{ id: string; title: string; snippet: string }>();
     for (const row of results) canonical.set(`doc:${row.id}`, row);
   }

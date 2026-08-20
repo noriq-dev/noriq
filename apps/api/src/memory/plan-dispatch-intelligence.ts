@@ -172,7 +172,7 @@ export async function getPlanDispatchIntelligence(
        ), aggregated AS (
          SELECT d.id, d.name, d.description, d.updated_at AS updatedAt, COUNT(*) AS totalTaskLinks
            FROM links l JOIN docs d ON d.id = l.docId
-          WHERE d.project_id = ?2 GROUP BY d.id, d.name, d.description, d.updated_at
+          WHERE d.project_id = ?2 AND d.archived_at IS NULL GROUP BY d.id, d.name, d.description, d.updated_at
        )
        SELECT a.*, COUNT(*) OVER() AS totalDocuments,
               (SELECT json_group_array(taskKey) FROM (

@@ -1378,7 +1378,7 @@ app.get('/api/tasks/:tid', userAuth, async (c) => {
     c.env.DB.prepare('SELECT kind, ref, url, state FROM task_refs WHERE task_id = ?').bind(tid).all(),
     c.env.DB.prepare('SELECT id, filename, content_type AS contentType, size, uploaded_by_kind AS uploaderKind, uploaded_by AS uploadedBy, created_at AS createdAt FROM attachments WHERE task_id = ? ORDER BY created_at').bind(tid).all(),
     c.env.DB.prepare('SELECT tag_id AS tagId FROM task_tags WHERE task_id = ?').bind(tid).all(),
-    c.env.DB.prepare('SELECT d.id, d.name, d.description FROM task_docs td JOIN docs d ON d.id = td.doc_id WHERE td.task_id = ? ORDER BY d.name').bind(tid).all(),
+    c.env.DB.prepare('SELECT d.id, d.name, d.description FROM task_docs td JOIN docs d ON d.id = td.doc_id WHERE td.task_id = ? AND d.archived_at IS NULL ORDER BY d.name').bind(tid).all(),
   ]);
   return c.json({ task, comments: comments.results, refs: refs.results, attachments: attachments.results, tagIds: taskTagRows.results.map((r) => r.tagId), docs: docRows.results });
 });
@@ -1586,12 +1586,39 @@ app.delete('/api/projects/:pid/plans/:plid', userAuth, async (c) => {
 
 // Project docs (PLNR-158) — reads direct, writes through the DO.
 app.get('/api/projects/:pid/docs', userAuth, async (c) => {
+  const archived = c.req.query('archived') === '1';
   const { results } = await c.env.DB.prepare(
-    `SELECT d.id, d.name, d.description, d.body, d.folder, d.author_kind AS authorKind, d.author_name AS authorName, d.updated_at AS updatedAt,
+    `SELECT d.id, d.name, d.description, d.body, d.folder, d.author_kind AS authorKind, d.author_name AS authorName,
+            d.current_version AS version, d.archived_at AS archivedAt, d.updated_at AS updatedAt,
             (SELECT GROUP_CONCAT(g.name) FROM doc_tags dt JOIN tags g ON g.id = dt.tag_id WHERE dt.doc_id = d.id) AS tags
-     FROM docs d WHERE d.project_id = ? ORDER BY d.folder, d.updated_at DESC`,
+     FROM docs d WHERE d.project_id = ? AND ${archived ? 'd.archived_at IS NOT NULL' : 'd.archived_at IS NULL'}
+     ORDER BY d.folder, d.updated_at DESC`,
   ).bind(c.req.param('pid')!).all();
   return c.json({ docs: results.map((d) => ({ ...d, tags: d.tags ? String(d.tags).split(',') : [] })) });
+});
+app.get('/api/projects/:pid/docs/:did/versions', userAuth, async (c) => {
+  const doc = await c.env.DB.prepare('SELECT id, current_version AS currentVersion, archived_at AS archivedAt FROM docs WHERE id = ? AND project_id = ?')
+    .bind(c.req.param('did')!, c.req.param('pid')!).first();
+  if (!doc) return c.json({ error: 'doc not found in this project' }, 404);
+  const { results } = await c.env.DB.prepare(
+    `SELECT version, name, description, author_kind AS authorKind, author_name AS authorName,
+            created_at AS createdAt FROM doc_versions WHERE doc_id = ? ORDER BY version DESC`,
+  ).bind(c.req.param('did')!).all();
+  return c.json({ currentVersion: doc.currentVersion, archivedAt: doc.archivedAt, versions: results });
+});
+app.get('/api/projects/:pid/docs/:did/versions/:version', userAuth, async (c) => {
+  const version = Number(c.req.param('version'));
+  if (!Number.isInteger(version) || version < 1) return c.json({ error: 'version must be a positive integer' }, 400);
+  const row = await c.env.DB.prepare(
+    `SELECT dv.doc_id AS id, dv.version, dv.name, dv.description, dv.body, dv.folder,
+            dv.tags_json AS tagsJson, dv.author_kind AS authorKind, dv.author_name AS authorName,
+            dv.created_at AS createdAt, d.current_version AS currentVersion, d.archived_at AS archivedAt
+       FROM doc_versions dv JOIN docs d ON d.id = dv.doc_id
+      WHERE dv.doc_id = ? AND dv.version = ? AND d.project_id = ?`,
+  ).bind(c.req.param('did')!, version, c.req.param('pid')!).first<Record<string, unknown>>();
+  if (!row) return c.json({ error: 'doc version not found in this project' }, 404);
+  const { tagsJson, ...versionRow } = row;
+  return c.json({ ...versionRow, tags: JSON.parse(String(tagsJson ?? '[]')) });
 });
 app.post('/api/projects/:pid/docs', userAuth, async (c) => {
   const body = await c.req.json<{ name: string; description?: string; body?: string; folder?: string; tags?: string[] }>();
@@ -1600,6 +1627,10 @@ app.post('/api/projects/:pid/docs', userAuth, async (c) => {
 });
 app.patch('/api/projects/:pid/docs/:did', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).updateDoc(c.req.param('pid')!, humanActor(c), c.req.param('did')!, await c.req.json())));
+app.post('/api/projects/:pid/docs/:did/archive', userAuth, async (c) =>
+  c.json(await room(c.env, c.req.param('pid')!).archiveDoc(c.req.param('pid')!, humanActor(c), c.req.param('did')!, true)));
+app.post('/api/projects/:pid/docs/:did/restore', userAuth, async (c) =>
+  c.json(await room(c.env, c.req.param('pid')!).archiveDoc(c.req.param('pid')!, humanActor(c), c.req.param('did')!, false)));
 app.delete('/api/projects/:pid/docs/:did', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).deleteDoc(c.req.param('pid')!, humanActor(c), c.req.param('did')!)));
 
