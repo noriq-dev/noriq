@@ -97,12 +97,16 @@ export function SpecView({ spec, only }: { spec: ExecutionSpec; only?: 'acceptan
         <Row label={`Anticipated files · ${spec.anticipatedFiles.length}`}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
             {spec.anticipatedFiles.map((f, i) => (
-              <div key={i} style={{ display: 'flex', alignItems: 'baseline', gap: 7 }}>
-                <MonoTag color={CHANGE_COLOR[f.change] ?? 'var(--text-mid)'} bg="var(--w-05)" size={8.5}>
-                  {f.change}
-                </MonoTag>
-                <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text)', wordBreak: 'break-all' }}>{f.path}</span>
-                {f.why && <span style={{ fontSize: 10.5, color: 'var(--text-faint)' }}>{f.why}</span>}
+              <div key={i} data-execution-spec-file style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: 7, minWidth: 0 }}>
+                  <span style={{ flex: 'none' }}>
+                    <MonoTag color={CHANGE_COLOR[f.change] ?? 'var(--text-mid)'} bg="var(--w-05)" size={8.5}>
+                      {f.change}
+                    </MonoTag>
+                  </span>
+                  <span data-execution-spec-file-path style={{ minWidth: 0, fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text)', overflowWrap: 'anywhere' }}>{f.path}</span>
+                </div>
+                {f.why && <span data-execution-spec-file-reason style={{ display: 'block', width: '100%', fontSize: 10.5, color: 'var(--text-faint)', lineHeight: 1.45 }}>{f.why}</span>}
               </div>
             ))}
           </div>
@@ -144,9 +148,9 @@ export function SpecView({ spec, only }: { spec: ExecutionSpec; only?: 'acceptan
         <Row label="Expected artifacts">
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
             {acceptance.artifacts.map((a, i) => (
-              <div key={i}>
-                <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text)', wordBreak: 'break-all' }}>{a.path}</span>
-                {a.provides && <span style={{ fontSize: 10.5, color: 'var(--text-faint)', marginLeft: 7 }}>{a.provides}</span>}
+              <div key={i} data-execution-spec-artifact style={{ minWidth: 0 }}>
+                <span data-execution-spec-artifact-path style={{ display: 'block', width: '100%', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text)', overflowWrap: 'anywhere' }}>{a.path}</span>
+                {a.provides && <span data-execution-spec-artifact-description style={{ display: 'block', width: '100%', fontSize: 10.5, color: 'var(--text-faint)', lineHeight: 1.45, marginTop: 2 }}>{a.provides}</span>}
                 {a.exports.length > 0 && (
                   <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-mid)', marginTop: 2 }}>
                     exports {a.exports.join(', ')}

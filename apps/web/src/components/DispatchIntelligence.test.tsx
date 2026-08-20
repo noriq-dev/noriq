@@ -108,6 +108,33 @@ describe('dispatch-time Intelligence panel (PLNR-303)', () => {
     expect(container.textContent).not.toContain('Full settled content');
   });
 
+  it('gives long document titles and metadata separate full-width lines', async () => {
+    const longResult = {
+      ...result,
+      documents: {
+        ...result.documents,
+        semanticDocuments: [{
+          ...result.documents.semanticDocuments[0],
+          name: 'Project Memory — settled architecture decisions with an intentionally long title',
+          description: 'Binding architecture for project-specific cognitive memory with enough detail to expose narrow layouts.',
+        }],
+      },
+    } as unknown as ApiDispatchIntelligence;
+    vi.spyOn(api, 'dispatchIntelligence').mockResolvedValue(longResult);
+    container = document.createElement('div'); document.body.appendChild(container); root = createRoot(container);
+    act(() => root!.render(<DispatchIntelligencePanel expanded pid="prj_1" taskId="task_1" />));
+    await tick(300); await tick();
+
+    const title = [...container.querySelectorAll<HTMLElement>('[data-document-reference-title]')]
+      .find((candidate) => candidate.textContent?.startsWith('Project Memory'))!;
+    const item = title.closest<HTMLElement>('[data-document-reference]')!;
+    const metadata = item.querySelector<HTMLElement>('[data-document-reference-meta]')!;
+    expect(item.style.flexDirection).toBe('column');
+    expect(title.style.width).toBe('100%');
+    expect(metadata.style.display).toBe('block');
+    expect(metadata.style.width).toBe('100%');
+  });
+
   it('aborts a stale preview when the task target changes', async () => {
     const signals: AbortSignal[] = [];
     vi.spyOn(api, 'dispatchIntelligence').mockImplementation((_pid, _input, signal) => {

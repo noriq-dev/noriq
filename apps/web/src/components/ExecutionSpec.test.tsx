@@ -94,6 +94,37 @@ describe('reading a spec', () => {
     expect(text()).not.toContain('Yours to decide');
   });
 
+  it('stacks long file and artifact metadata instead of squeezing descriptions beside paths', () => {
+    mount({
+      spec: spec({
+        anticipatedFiles: [{
+          path: 'apps/web/src/components/a-very-long-feature-directory/a-very-long-component-name.tsx',
+          change: 'modify',
+          why: 'Keep the reason readable in a narrow task drawer.',
+        }],
+        acceptance: {
+          observableTruths: [],
+          artifacts: [{
+            path: 'apps/web/src/components/a-very-long-feature-directory/a-very-long-artifact-name.tsx',
+            provides: 'A description that retains the full panel width.',
+            exports: [],
+          }],
+          links: [],
+        },
+      }),
+    });
+
+    const file = container.querySelector<HTMLElement>('[data-execution-spec-file]')!;
+    const fileReason = file.querySelector<HTMLElement>('[data-execution-spec-file-reason]')!;
+    const artifact = container.querySelector<HTMLElement>('[data-execution-spec-artifact]')!;
+    const artifactDescription = artifact.querySelector<HTMLElement>('[data-execution-spec-artifact-description]')!;
+    expect(file.style.flexDirection).toBe('column');
+    expect(fileReason.style.display).toBe('block');
+    expect(fileReason.style.width).toBe('100%');
+    expect(artifactDescription.style.display).toBe('block');
+    expect(artifactDescription.style.width).toBe('100%');
+  });
+
   it('says what having no spec COSTS, rather than just saying "none"', () => {
     mount({ spec: null });
     expect(text()).toContain('No spec');

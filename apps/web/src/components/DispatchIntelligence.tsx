@@ -318,14 +318,19 @@ function DocumentGroup({ title, description, documents, tone, onOpen }: {
       <b style={{ fontSize: 10.5 }}>{title}</b><span style={small}>{documents.length}</span>
     </div>
     <div style={small}>{description}</div>
-    {documents.map((document) => <div key={`${document.kind}:${document.id}`} style={{ display: 'flex', alignItems: 'center', gap: 7, marginTop: 6 }}>
+    {documents.map((document) => <div
+      key={`${document.kind}:${document.id}`}
+      data-document-reference
+      style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 7, minWidth: 0 }}
+    >
       <button
         type="button"
+        data-document-reference-title
         onClick={() => onOpen?.(document)}
         disabled={!onOpen}
-        style={{ cursor: onOpen ? 'pointer' : 'default', padding: 0, border: 0, background: 'transparent', color: 'var(--text)', fontSize: 10.5, fontWeight: 600, textAlign: 'left' }}
+        style={{ cursor: onOpen ? 'pointer' : 'default', width: '100%', padding: 0, border: 0, background: 'transparent', color: 'var(--text)', fontSize: 10.5, fontWeight: 600, lineHeight: 1.4, overflowWrap: 'anywhere', textAlign: 'left' }}
       >{document.name}</button>
-      <span style={{ ...small, flex: 1 }}>
+      <span data-document-reference-meta style={{ ...small, display: 'block', width: '100%', minWidth: 0 }}>
         {document.description || 'No description'} · {tone === 'settled' ? 'settled / required' : tone === 'provisional'
           ? `provisional${document.plan ? ` · ${document.plan.title}${document.plan.phaseTitle ? ` / ${document.plan.phaseTitle}` : ''}` : ''}`
           : `${document.retrieval.mode} relevance${document.retrieval.score == null ? '' : ` ${document.retrieval.score.toFixed(2)}`}`}
