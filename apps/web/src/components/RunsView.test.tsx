@@ -1,7 +1,10 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { api, type ApiRunner, type ApiRunnerJobActivityPage, type ApiRunnerJobActivityStage, type ApiRunnerJobOutput, type ApiRunnerJobSummary } from '../api';
+import {
+  api, type ApiDispatchIntelligence, type ApiPlanDispatchIntelligence, type ApiRunner,
+  type ApiRunnerJobActivityPage, type ApiRunnerJobActivityStage, type ApiRunnerJobOutput, type ApiRunnerJobSummary,
+} from '../api';
 import type { AppStore } from '../store';
 import { hasMeaningfulLineage, JOB_STATUS_STYLE, JobActivity, RUN_STATUS_STYLE, runnerJobCostLabel, RunnerJobDispatchForm, RunnerJobOutputSummary } from './RunsView';
 
@@ -36,6 +39,46 @@ function renderDispatchForm() {
 function inputValue(input: HTMLInputElement, value: string) {
   Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, value);
   input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+const taskIntelligence = {
+  advisory: true, version: 'dispatch-intelligence-v2', observedAt: '2026-08-13T00:00:00.000Z',
+  current: {
+    readiness: { primary: 'ready', reason: 'claimable now' },
+  },
+  documents: {
+    linkedProjectDocuments: [], planLocalDocuments: [], semanticDocuments: [],
+  },
+} as unknown as ApiDispatchIntelligence;
+
+function planIntelligence(): ApiPlanDispatchIntelligence {
+  return {
+    advisory: true, version: 'plan-dispatch-intelligence-v1', observedAt: '2026-08-13T00:00:00.000Z',
+    plan: { id: 'plan_1', title: 'Remote plan', description: '', status: 'active', phaseCount: 1, taskCount: 1 },
+    targetContext: { runnerId: 'runner_1', repositoryCheckoutId: 'repo_1', repositoryKey: 'noriq', repositoryResolutionReason: null, branch: 'main', baseId: 'a'.repeat(40) },
+    counts: { phases: 1, tasks: 1, dispatchable: 1, retry: 0, settled: 0, claimed: 0, reserved: 0 },
+    blockers: { totalTasks: 0, items: [], omitted: 0 },
+    repository: { key: 'noriq', reason: null, branch: 'main', baseId: 'a'.repeat(40) },
+    documents: {
+      bodiesIncluded: false, planLocal: [], linkedProject: [], semantic: [],
+      coverage: {
+        planLocal: { total: 0, emitted: 0, omitted: 0 }, linkedProject: { total: 0, emitted: 0, omitted: 0 },
+        semantic: { mode: 'keyword', unavailable: false, reason: null, emitted: 0, candidateLimitReached: false, status: 'fallback', freshness: 'current' },
+      },
+    },
+    memory: {
+      constraints: [], evidenceFrame: { text: '', itemsIncluded: 0, itemsOmitted: 0, truncated: false, charsUsed: 0, suspiciousCount: 0 },
+      coverage: { mode: 'keyword', unavailable: false, reason: null, candidates: 0 },
+    },
+    taskIndex: [{
+      taskId: 'task_9', taskKey: 'RUN-9', title: 'Lazy member', status: 'todo',
+      phase: { id: 'phase_1', title: 'Work', order: 0 }, order: 0, priority: 1,
+      retry: false, claimed: false, reserved: false, blockerCount: 0, dispatchable: true,
+    }],
+    taskIndexCoverage: { limit: 500, total: 1, emitted: 1, omitted: 0, complete: true },
+    taskDetail: { endpoint: '/api/projects/project_1/memory/dispatch-intelligence', method: 'POST', instruction: 'lazy', request: { taskId: '$TASK_ID' } },
+    query: { text: 'Remote plan', chars: 11, limit: 6000 }, coverage: { status: 'complete', reasons: [] },
+  };
 }
 
 const activityTiming: ApiRunnerJobActivityPage['timing'] = {
@@ -424,5 +467,70 @@ describe('RunnerJob dispatch target search', () => {
 
     expect(dispatch).toHaveBeenCalledWith('project_1', 'plan_1', { runnerId: 'runner_1', repoRef: 'repo_1' });
     expect(onDone).toHaveBeenCalledWith('job_2');
+  });
+
+  it('passes the selected runner repository context to task intelligence and never gates dispatch on failure', async () => {
+    const task = {
+      id: 'task_context', key: 'RUN-520', title: 'Preview me', status: 'todo', priority: 1, type: 'feature',
+      projectId: 'project_1', projectKey: 'RUN', boardId: null, updatedAt: '2026-08-13T00:00:00.000Z',
+    };
+    vi.spyOn(api, 'searchTasks').mockImplementation(async (input) => ({
+      tasks: input.status === 'todo' ? [task] : [], matched: input.status === 'todo' ? 1 : 0, returned: input.status === 'todo' ? 1 : 0,
+    }));
+    const intelligence = vi.spyOn(api, 'dispatchIntelligence').mockRejectedValue(new Error('retrieval unavailable'));
+    const dispatch = vi.spyOn(api, 'dispatchTaskJob').mockResolvedValue({ job: { id: 'job_context' } as never, delivered: true });
+    renderDispatchForm();
+
+    const input = container.querySelector<HTMLInputElement>('[aria-label="Task"]')!;
+    act(() => input.focus());
+    act(() => inputValue(input, 'RUN-520'));
+    await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+    act(() => container.querySelector<HTMLElement>('[role="option"]')!.click());
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+
+    expect(intelligence).toHaveBeenCalledWith('project_1', expect.objectContaining({
+      taskId: 'task_context', runnerId: 'runner_1', repositoryCheckoutId: 'repo_1',
+      branch: 'main', baseId: 'a'.repeat(40),
+    }), expect.any(AbortSignal));
+    expect(container.textContent).toContain('Claim and dispatch controls remain unchanged');
+    const button = [...container.querySelectorAll<HTMLButtonElement>('button')]
+      .find((candidate) => candidate.textContent?.includes('dispatch task'))!;
+    expect(button.disabled).toBe(false);
+    await act(async () => { button.click(); });
+    expect(dispatch).toHaveBeenCalled();
+  });
+
+  it('loads one plan aggregate and exactly one cached task detail only after expansion', async () => {
+    const plan = {
+      id: 'plan_1', title: 'Remote plan', description: 'Not in snapshot', status: 'active',
+      projectId: 'project_1', projectKey: 'RUN', createdAt: '2026-08-13T00:00:00.000Z',
+    };
+    vi.spyOn(api, 'searchPlans').mockResolvedValue({ plans: [plan], matched: 1, returned: 1 });
+    const aggregate = vi.spyOn(api, 'planDispatchIntelligence').mockResolvedValue(planIntelligence());
+    const detail = vi.spyOn(api, 'dispatchIntelligence').mockResolvedValue(taskIntelligence);
+    renderDispatchForm();
+
+    act(() => container.querySelector<HTMLButtonElement>('[aria-label="source"]')!.click());
+    act(() => [...container.querySelectorAll<HTMLElement>('[role="option"]')]
+      .find((option) => option.textContent?.includes('entire plan'))!.click());
+    const input = container.querySelector<HTMLInputElement>('[aria-label="Plan"]')!;
+    act(() => input.focus());
+    act(() => inputValue(input, 'Remote'));
+    await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+    act(() => container.querySelector<HTMLElement>('[role="option"]')!.click());
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+
+    expect(aggregate).toHaveBeenCalledTimes(1);
+    expect(aggregate).toHaveBeenCalledWith('project_1', expect.objectContaining({
+      planId: 'plan_1', runnerId: 'runner_1', repositoryCheckoutId: 'repo_1', branch: 'main', baseId: 'a'.repeat(40),
+    }), expect.any(AbortSignal));
+    expect(detail).not.toHaveBeenCalled();
+    const member = [...container.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.includes('RUN-9'))!;
+    await act(async () => { member.click(); await Promise.resolve(); });
+    expect(detail).toHaveBeenCalledTimes(1);
+    act(() => member.click());
+    act(() => member.click());
+    expect(detail).toHaveBeenCalledTimes(1);
   });
 });

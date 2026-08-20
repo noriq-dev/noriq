@@ -11,7 +11,7 @@ import { Markdown } from './Markdown';
 import { Composer } from './Composer';
 import { Button, Modal, Select, TextArea, TextInput } from './ui';
 import { ExecutionSpecPanel, type SpecLoad } from './ExecutionSpec';
-import { DispatchIntelligencePanel } from './DispatchIntelligence';
+import { DispatchIntelligencePanel, openIntelligenceDocument } from './DispatchIntelligence';
 import { confirm } from './Dialog';
 import { AttachmentPreview, attachmentPreviewDecision, type AttachmentPreviewItem } from './AttachmentPreview';
 import { MOBILE_TAB_BAR_HEIGHT, useViewport } from '../viewport';
@@ -634,7 +634,11 @@ export function Drawer({ store }: { store: AppStore }) {
             onSaved={() => reloadSpec(task.id)}
           />
 
-          <DispatchIntelligencePanel pid={currentPid} taskId={task.id} />
+          <DispatchIntelligencePanel
+            pid={currentPid}
+            taskId={task.id}
+            onOpenDocument={(document) => openIntelligenceDocument(document, actions.setView, actions.closeTask)}
+          />
 
           {/* related docs (PLNR-182) — the design/decision docs this task implements */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 8 }}>

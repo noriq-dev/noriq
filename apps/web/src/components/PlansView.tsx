@@ -87,6 +87,13 @@ export function PlansView({ store }: { store: AppStore }) {
   const tasks = helpers.allTasksOf(currentPid);
   const taskById = new Map(tasks.map((t) => [t.id, t]));
 
+  useEffect(() => {
+    const planId = sessionStorage.getItem('noriq.openPlan');
+    if (!planId || !allPlans.some((plan) => plan.id === planId)) return;
+    setExpanded((current) => ({ ...current, [planId]: true }));
+    sessionStorage.removeItem('noriq.openPlan');
+  }, [allPlans]);
+
   if (!allPlans.length) {
     return (
       <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 10 }}>
@@ -472,6 +479,13 @@ function PlanDocsPanel({ planId, docs, store, readOnly }: { planId: string; docs
   const [editing, setEditing] = useState<{ id?: string; name: string; description: string; body: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    const docId = sessionStorage.getItem('noriq.openPlanDoc');
+    if (!docId || !docs.some((doc) => doc.id === docId)) return;
+    setOpenId(docId);
+    sessionStorage.removeItem('noriq.openPlanDoc');
+  }, [docs]);
 
   const save = async () => {
     if (!editing || !editing.name.trim()) { setErr('name required'); return; }

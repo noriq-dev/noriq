@@ -27,6 +27,7 @@ import { confirm } from './Dialog';
 import { TaskSearchSelect } from './TaskSearchSelect';
 import { PlanSearchSelect } from './PlanSearchSelect';
 import { LineagePanel } from './LineagePanel';
+import { DispatchIntelligencePanel, openIntelligenceDocument, PlanDispatchIntelligencePanel } from './DispatchIntelligence';
 
 // Retained for the read-only legacy-history renderer and its regression test.
 export const RUN_STATUS_STYLE: Record<RunStatus, { color: string; bg: string; live?: boolean }> = {
@@ -226,6 +227,7 @@ export function RunnerJobDispatchForm({
   const runner = candidates.find((candidate) => candidate.id === runnerId) ?? null;
   const repos = runner?.repos.filter((repo) => repo.projectId === pid) ?? [];
   const [repoRef, setRepoRef] = useState(repos[0]?.id ?? '');
+  const repo = repos.find((candidate) => candidate.id === repoRef) ?? null;
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const tasks = store.helpers.allTasksOf(pid).filter((task) => task.status === 'todo' || task.status === 'failed');
@@ -242,6 +244,8 @@ export function RunnerJobDispatchForm({
   }, [kind]);
 
   const retryingTask = kind === 'task' && targetTaskStatus === 'failed';
+  const openDocument = (document: Parameters<typeof openIntelligenceDocument>[0]) =>
+    openIntelligenceDocument(document, store.actions.setView);
 
   const submit = async () => {
     if (!runnerId || !repoRef || !targetId) return setError('Select a target, runner, and repository.');
@@ -306,6 +310,29 @@ export function RunnerJobDispatchForm({
           </Select>
         </Field>
       </div>
+      {targetId && runnerId && repo && (kind === 'task' ? (
+        <DispatchIntelligencePanel
+          expanded
+          pid={pid}
+          taskId={targetId}
+          runnerId={runnerId}
+          repositoryCheckoutId={repo.id}
+          branch={repo.defaultBranch}
+          baseId={repo.baseRevision ?? null}
+          onOpenDocument={openDocument}
+        />
+      ) : (
+        <PlanDispatchIntelligencePanel
+          expanded
+          pid={pid}
+          planId={targetId}
+          runnerId={runnerId}
+          repositoryCheckoutId={repo.id}
+          branch={repo.defaultBranch}
+          baseId={repo.baseRevision ?? null}
+          onOpenDocument={openDocument}
+        />
+      ))}
       <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginTop: 12 }}>
         <Button variant="primary" disabled={busy || !targetId || !runnerId || !repoRef} onClick={submit}>
           {busy ? 'dispatching…' : retryingTask ? 'retry task' : `dispatch ${kind}`}
