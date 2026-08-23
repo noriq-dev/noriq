@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { api, type ApiProjectDoc } from '../api';
 import type { AppStore } from '../store';
 import { DialogHost } from './Dialog';
-import { DocsView } from './DocsView';
+import { diffDocumentLines, DocsView } from './DocsView';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -43,7 +43,11 @@ function mockApi() {
       { version: 1, name: 'Runtime contract v1', description: 'old rules', authorKind: 'agent', authorName: 'codex', createdAt: '2026-08-19T12:00:00.000Z' },
     ],
   });
-  vi.spyOn(api, 'docVersion').mockResolvedValue({
+  vi.spyOn(api, 'docVersion').mockImplementation(async (_pid, _docId, version) => version === 2 ? {
+    id: activeDoc.id, version: 2, currentVersion: 2, name: activeDoc.name,
+    description: activeDoc.description, body: activeDoc.body, folder: activeDoc.folder, tags: activeDoc.tags,
+    authorKind: activeDoc.authorKind, authorName: activeDoc.authorName, archivedAt: null, createdAt: activeDoc.updatedAt,
+  } : {
     id: activeDoc.id, version: 1, currentVersion: 2, name: 'Runtime contract v1',
     description: 'old rules', body: 'Historical protocol body.', folder: 'design', tags: ['protocol'],
     authorKind: 'agent', authorName: 'codex', archivedAt: null, createdAt: '2026-08-19T12:00:00.000Z',
@@ -117,6 +121,57 @@ describe('Docs version history', () => {
     await click(button('current'));
     expect(text()).toContain('Current protocol body.');
     expect(button('edit')).toBeDefined();
+  });
+
+  it('compares independently selectable revisions without changing the reader', async () => {
+    mockApi();
+    mount();
+    await tick();
+    await click(container.querySelector(`[data-doc-id="${activeDoc.id}"]`) ?? undefined);
+    await tick();
+    await click(button('compare'));
+    await tick();
+
+    const readerVersion = container.querySelector<HTMLSelectElement>('select[aria-label="Document version"]')!;
+    const from = container.querySelector<HTMLSelectElement>('select[aria-label="Compare from revision"]')!;
+    const to = container.querySelector<HTMLSelectElement>('select[aria-label="Compare to revision"]')!;
+    expect(readerVersion.value).toBe('2');
+    expect(from.value).toBe('1');
+    expect(to.value).toBe('2');
+    expect(api.docVersion).toHaveBeenCalledWith('prj_1', activeDoc.id, 1);
+    expect(api.docVersion).toHaveBeenCalledWith('prj_1', activeDoc.id, 2);
+    expect(container.querySelector('[data-diff-kind="changed"]')).toBeTruthy();
+
+    await act(async () => {
+      to.value = '1';
+      to.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await tick();
+    expect(readerVersion.value).toBe('2');
+    expect(text()).toContain('Current protocol body.');
+    await click(button('close compare'));
+    expect(container.querySelector('[data-testid="doc-version-compare"]')).toBeNull();
+    expect(readerVersion.value).toBe('2');
+  });
+});
+
+describe('document line diff', () => {
+  it('distinguishes unchanged, changed, removed, and added lines', () => {
+    const result = diffDocumentLines(
+      'same\nold\nanchor\nremove\nanchor 2',
+      'same\nnew\nanchor\nanchor 2\nadd',
+    );
+    expect(result.bounded).toBe(false);
+    expect(new Set(result.rows.map((row) => row.kind))).toEqual(new Set(['same', 'changed', 'removed', 'added']));
+  });
+
+  it('uses a bounded fallback for pathological comparisons', () => {
+    const from = Array.from({ length: 500 }, (_, index) => `old ${index}`).join('\n');
+    const to = Array.from({ length: 500 }, (_, index) => `new ${index}`).join('\n');
+    const result = diffDocumentLines(from, to);
+    expect(result.bounded).toBe(true);
+    expect(result.rows).toHaveLength(500);
+    expect(result.rows.every((row) => row.kind === 'changed')).toBe(true);
   });
 });
 

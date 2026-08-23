@@ -11,6 +11,145 @@ import { MonoTag, SectionLabel } from './bits';
 import { Button, TextInput } from './ui';
 import { confirm } from './Dialog';
 
+export interface DocumentDiffRow {
+  kind: 'same' | 'changed' | 'added' | 'removed' | 'omitted';
+  fromLine?: number;
+  toLine?: number;
+  fromText?: string;
+  toText?: string;
+}
+
+export interface DocumentDiffResult {
+  rows: DocumentDiffRow[];
+  bounded: boolean;
+}
+
+const MAX_DIFF_CELLS = 200_000;
+const MAX_DIFF_ROWS = 2_000;
+
+function comparableDocument(doc: ApiDocVersion): string {
+  return [
+    `name: ${doc.name}`,
+    `description: ${doc.description}`,
+    `folder: ${doc.folder}`,
+    `tags: ${doc.tags.join(', ')}`,
+    '',
+    doc.body,
+  ].join('\n');
+}
+
+/** A bounded line diff: LCS for ordinary documents, positional fallback for pathological inputs. */
+export function diffDocumentLines(fromText: string, toText: string): DocumentDiffResult {
+  const from = fromText.split('\n');
+  const to = toText.split('\n');
+  let prefix = 0;
+  while (prefix < from.length && prefix < to.length && from[prefix] === to[prefix]) prefix += 1;
+  let suffix = 0;
+  while (
+    suffix < from.length - prefix && suffix < to.length - prefix
+    && from[from.length - 1 - suffix] === to[to.length - 1 - suffix]
+  ) suffix += 1;
+
+  const before: DocumentDiffRow[] = Array.from({ length: prefix }, (_, index) => ({
+    kind: 'same', fromLine: index + 1, toLine: index + 1,
+    fromText: from[index], toText: to[index],
+  }));
+  const fromMiddle = from.slice(prefix, from.length - suffix);
+  const toMiddle = to.slice(prefix, to.length - suffix);
+  const raw: DocumentDiffRow[] = [];
+  let bounded = fromMiddle.length * toMiddle.length > MAX_DIFF_CELLS;
+
+  if (bounded) {
+    const shared = Math.min(fromMiddle.length, toMiddle.length);
+    for (let index = 0; index < shared; index += 1) {
+      raw.push({
+        kind: fromMiddle[index] === toMiddle[index] ? 'same' : 'changed',
+        fromLine: prefix + index + 1, toLine: prefix + index + 1,
+        fromText: fromMiddle[index], toText: toMiddle[index],
+      });
+    }
+    for (let index = shared; index < fromMiddle.length; index += 1) {
+      raw.push({ kind: 'removed', fromLine: prefix + index + 1, fromText: fromMiddle[index] });
+    }
+    for (let index = shared; index < toMiddle.length; index += 1) {
+      raw.push({ kind: 'added', toLine: prefix + index + 1, toText: toMiddle[index] });
+    }
+  } else {
+    const width = toMiddle.length + 1;
+    const lcs = new Uint32Array((fromMiddle.length + 1) * width);
+    for (let fromIndex = fromMiddle.length - 1; fromIndex >= 0; fromIndex -= 1) {
+      for (let toIndex = toMiddle.length - 1; toIndex >= 0; toIndex -= 1) {
+        const cell = fromIndex * width + toIndex;
+        lcs[cell] = fromMiddle[fromIndex] === toMiddle[toIndex]
+          ? lcs[(fromIndex + 1) * width + toIndex + 1]! + 1
+          : Math.max(lcs[(fromIndex + 1) * width + toIndex]!, lcs[fromIndex * width + toIndex + 1]!);
+      }
+    }
+    let fromIndex = 0;
+    let toIndex = 0;
+    while (fromIndex < fromMiddle.length || toIndex < toMiddle.length) {
+      if (fromIndex < fromMiddle.length && toIndex < toMiddle.length && fromMiddle[fromIndex] === toMiddle[toIndex]) {
+        raw.push({
+          kind: 'same', fromLine: prefix + fromIndex + 1, toLine: prefix + toIndex + 1,
+          fromText: fromMiddle[fromIndex], toText: toMiddle[toIndex],
+        });
+        fromIndex += 1; toIndex += 1;
+      } else if (
+        fromIndex < fromMiddle.length
+        && (toIndex >= toMiddle.length || lcs[(fromIndex + 1) * width + toIndex]! >= lcs[fromIndex * width + toIndex + 1]!)
+      ) {
+        raw.push({ kind: 'removed', fromLine: prefix + fromIndex + 1, fromText: fromMiddle[fromIndex] });
+        fromIndex += 1;
+      } else {
+        raw.push({ kind: 'added', toLine: prefix + toIndex + 1, toText: toMiddle[toIndex] });
+        toIndex += 1;
+      }
+    }
+  }
+
+  // Pair adjacent remove/add runs into explicit changed rows while retaining unpaired additions/removals.
+  const middle: DocumentDiffRow[] = [];
+  for (let index = 0; index < raw.length;) {
+    if (raw[index]!.kind === 'same' || raw[index]!.kind === 'changed') {
+      middle.push(raw[index]!); index += 1; continue;
+    }
+    const segment: DocumentDiffRow[] = [];
+    while (index < raw.length && raw[index]!.kind !== 'same' && raw[index]!.kind !== 'changed') {
+      segment.push(raw[index]!); index += 1;
+    }
+    const removed = segment.filter((row) => row.kind === 'removed');
+    const added = segment.filter((row) => row.kind === 'added');
+    const paired = Math.min(removed.length, added.length);
+    for (let pair = 0; pair < paired; pair += 1) {
+      middle.push({
+        kind: 'changed', fromLine: removed[pair]!.fromLine, toLine: added[pair]!.toLine,
+        fromText: removed[pair]!.fromText, toText: added[pair]!.toText,
+      });
+    }
+    middle.push(...removed.slice(paired), ...added.slice(paired));
+  }
+
+  const after: DocumentDiffRow[] = Array.from({ length: suffix }, (_, index) => ({
+    kind: 'same',
+    fromLine: from.length - suffix + index + 1,
+    toLine: to.length - suffix + index + 1,
+    fromText: from[from.length - suffix + index],
+    toText: to[to.length - suffix + index],
+  }));
+  let rows = [...before, ...middle, ...after];
+  if (rows.length > MAX_DIFF_ROWS) {
+    const edge = Math.floor(MAX_DIFF_ROWS / 2);
+    const omitted = rows.length - edge * 2;
+    rows = [
+      ...rows.slice(0, edge),
+      { kind: 'omitted', fromText: `${omitted.toLocaleString()} unchanged or changed lines omitted to keep this comparison responsive` },
+      ...rows.slice(-edge),
+    ];
+    bounded = true;
+  }
+  return { rows, bounded };
+}
+
 export function DocsView({ store }: { store: AppStore }) {
   const { currentPid, snapshot, actions } = store;
   const [docs, setDocs] = useState<ApiProjectDoc[]>([]);
@@ -20,6 +159,11 @@ export function DocsView({ store }: { store: AppStore }) {
   const [editing, setEditing] = useState(false);
   const [versions, setVersions] = useState<ApiDocVersionSummary[]>([]);
   const [viewedVersion, setViewedVersion] = useState<ApiDocVersion | null>(null);
+  const [compareOpen, setCompareOpen] = useState(false);
+  const [compareFrom, setCompareFrom] = useState<number | null>(null);
+  const [compareTo, setCompareTo] = useState<number | null>(null);
+  const [comparison, setComparison] = useState<{ from: ApiDocVersion; to: ApiDocVersion } | null>(null);
+  const [compareError, setCompareError] = useState(false);
   const requestedVersion = useRef<{ docId: string; version: number } | null>(null);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [tagFilter, setTagFilter] = useState<string | null>(null);
@@ -45,6 +189,8 @@ export function DocsView({ store }: { store: AppStore }) {
     setShowArchived(false);
     setVersions([]);
     setViewedVersion(null);
+    setCompareOpen(false);
+    setComparison(null);
     setTagFilter(null);
     setCollapsed(new Set());
     collapseInitFor.current = null;
@@ -90,6 +236,8 @@ export function DocsView({ store }: { store: AppStore }) {
   useEffect(() => {
     setViewedVersion(null);
     setVersions([]);
+    setCompareOpen(false);
+    setComparison(null);
     if (!selected) return;
     void api.docVersions(currentPid, selected).then((result) => setVersions(result.versions)).catch(() => {});
     const requested = requestedVersion.current;
@@ -100,6 +248,22 @@ export function DocsView({ store }: { store: AppStore }) {
         .catch(() => {});
     }
   }, [currentPid, selected]);
+
+  useEffect(() => {
+    if (!compareOpen || !selected || compareFrom == null || compareTo == null) return;
+    let current = true;
+    setComparison(null);
+    setCompareError(false);
+    void Promise.all([
+      api.docVersion(currentPid, selected, compareFrom),
+      api.docVersion(currentPid, selected, compareTo),
+    ]).then(([from, to]) => {
+      if (current) setComparison({ from, to });
+    }).catch(() => {
+      if (current) setCompareError(true);
+    });
+    return () => { current = false; };
+  }, [compareFrom, compareOpen, compareTo, currentPid, selected]);
   // Tasks citing the selected doc (PLNR-182) — from the live snapshot's link pairs.
   const linkedTasks = sel
     ? (snapshot?.taskDocs ?? []).filter((l) => l.docId === sel.id)
@@ -127,6 +291,9 @@ export function DocsView({ store }: { store: AppStore }) {
     }
     return [...byFolder.entries()].sort(([a], [b]) => (a === '' ? -1 : b === '' ? 1 : a.localeCompare(b)));
   }, [visibleDocs, tagFilter]);
+  const documentDiff = useMemo(() => comparison
+    ? diffDocumentLines(comparableDocument(comparison.from), comparableDocument(comparison.to))
+    : null, [comparison]);
 
   const startNew = () => { setSelected(null); setEName(''); setEDesc(''); setEBody(''); setEFolder(''); setETags(''); setEditing(true); };
   const startEdit = () => {
@@ -350,7 +517,96 @@ export function DocsView({ store }: { store: AppStore }) {
                     </option>
                   ))}
                 </select>
+                {versions.length > 1 && (
+                  <Button
+                    variant="ghost"
+                    style={{ padding: '4px 10px', fontSize: 10.5 }}
+                    onClick={() => {
+                      if (compareOpen) {
+                        setCompareOpen(false);
+                        setComparison(null);
+                        return;
+                      }
+                      setCompareFrom(versions.find((item) => item.version !== sel.version)?.version ?? versions[0]!.version);
+                      setCompareTo(sel.version);
+                      setCompareOpen(true);
+                    }}
+                  >{compareOpen ? 'close compare' : 'compare'}</Button>
+                )}
               </div>
+            )}
+            {compareOpen && compareFrom != null && compareTo != null && (
+              <section
+                data-testid="doc-version-compare"
+                style={{ marginBottom: 18, border: '1px solid var(--w-1)', background: 'var(--w-015)', borderRadius: 10, overflow: 'hidden' }}
+              >
+                <div style={{ padding: '10px 12px', borderBottom: '1px solid var(--w-08)', display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+                  <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)', textTransform: 'uppercase', letterSpacing: '.05em' }}>compare</span>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 5, fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+                    from
+                    <select
+                      aria-label="Compare from revision"
+                      value={compareFrom}
+                      onChange={(event) => setCompareFrom(Number(event.target.value))}
+                      style={{ background: 'var(--w-03)', border: '1px solid var(--w-1)', borderRadius: 6, color: 'var(--text-soft)', padding: '3px 7px', fontFamily: 'var(--mono)', fontSize: 10.5 }}
+                    >
+                      {versions.map((item) => <option key={item.version} value={item.version}>v{item.version}</option>)}
+                    </select>
+                  </label>
+                  <span style={{ color: 'var(--text-faint)' }}>→</span>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 5, fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)' }}>
+                    to
+                    <select
+                      aria-label="Compare to revision"
+                      value={compareTo}
+                      onChange={(event) => setCompareTo(Number(event.target.value))}
+                      style={{ background: 'var(--w-03)', border: '1px solid var(--w-1)', borderRadius: 6, color: 'var(--text-soft)', padding: '3px 7px', fontFamily: 'var(--mono)', fontSize: 10.5 }}
+                    >
+                      {versions.map((item) => <option key={item.version} value={item.version}>v{item.version}</option>)}
+                    </select>
+                  </label>
+                  <span style={{ marginLeft: 'auto', fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--text-faint)' }}>
+                    name · description · folder · tags · body
+                  </span>
+                </div>
+                {compareError ? (
+                  <div style={{ padding: 14, color: 'var(--red)', fontSize: 11.5 }}>Could not load one of these retained revisions.</div>
+                ) : !documentDiff ? (
+                  <div style={{ padding: 14, color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 10.5 }}>loading revisions…</div>
+                ) : (
+                  <div style={{ overflowX: 'auto' }}>
+                    {documentDiff.bounded && (
+                      <div style={{ padding: '7px 10px', borderBottom: '1px solid rgba(245,166,35,.25)', background: 'rgba(245,166,35,.06)', color: 'var(--amber)', fontSize: 10.5 }}>
+                        Large comparison · showing a bounded line result.
+                      </div>
+                    )}
+                    <div style={{ minWidth: 620, fontFamily: 'var(--mono)', fontSize: 10.5, lineHeight: 1.45 }}>
+                      {documentDiff.rows.map((row, index) => {
+                        if (row.kind === 'omitted') return (
+                          <div key={`omitted-${index}`} data-diff-kind="omitted" style={{ padding: '8px 12px', textAlign: 'center', color: 'var(--text-dim)', borderBottom: '1px solid var(--w-05)' }}>
+                            ⋯ {row.fromText} ⋯
+                          </div>
+                        );
+                        const changed = row.kind === 'changed';
+                        const leftBg = row.kind === 'removed' ? 'rgba(255,88,105,.11)' : changed ? 'rgba(245,166,35,.09)' : 'transparent';
+                        const rightBg = row.kind === 'added' ? 'rgba(63,217,139,.10)' : changed ? 'rgba(245,166,35,.09)' : 'transparent';
+                        return (
+                          <div
+                            key={`${row.kind}-${row.fromLine ?? 'x'}-${row.toLine ?? 'x'}-${index}`}
+                            data-diff-kind={row.kind}
+                            style={{ display: 'grid', gridTemplateColumns: '42px minmax(0, 1fr) 42px minmax(0, 1fr)', borderBottom: '1px solid var(--w-05)' }}
+                          >
+                            <span style={{ padding: '3px 7px', textAlign: 'right', color: 'var(--text-faint)', background: leftBg, userSelect: 'none' }}>{row.fromLine ?? ''}</span>
+                            <span style={{ padding: '3px 8px', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', color: row.kind === 'removed' ? 'var(--red)' : changed ? 'var(--amber)' : 'var(--text-dim)', background: leftBg }}>{row.fromText ?? ''}</span>
+                            <span style={{ padding: '3px 7px', textAlign: 'right', color: 'var(--text-faint)', background: rightBg, userSelect: 'none' }}>{row.toLine ?? ''}</span>
+                            <span style={{ padding: '3px 8px', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', color: row.kind === 'added' ? 'var(--green)' : changed ? 'var(--amber)' : 'var(--text-dim)', background: rightBg }}>{row.toText ?? ''}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </section>
             )}
             {viewingHistory && (
               <div style={{ marginBottom: 12, border: '1px solid rgba(245,166,35,.3)', background: 'rgba(245,166,35,.07)', borderRadius: 8, padding: '8px 10px', color: 'var(--text-dim)', fontSize: 11.5 }}>
