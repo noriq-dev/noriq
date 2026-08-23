@@ -106,7 +106,10 @@ function AttentionSection({ store }: { store: AppStore }) {
           return (
             <div
               key={task.id}
-              onClick={() => actions.selectProject(task.projectId)}
+              onClick={() => {
+                actions.selectProject(task.projectId);
+                actions.openTask(task.id);
+              }}
               className="hover-border"
               style={{ border: '1px solid rgba(245,166,35,.25)', borderLeft: '3px solid var(--amber)', borderRadius: 10, background: 'var(--card)', padding: '10px 13px', cursor: 'pointer' }}
             >

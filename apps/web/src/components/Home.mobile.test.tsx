@@ -26,8 +26,8 @@ const project: ProjectVM = {
 
 function store(projects: ProjectVM[] = [project]): AppStore {
   return {
-    user: { id: 'usr_1', name: 'Mara Chen' }, groups: [], data: { projects },
-    permissions: { canCreateProjects: true }, actions: { selectProject: vi.fn(), createProject: vi.fn() },
+    user: { id: 'usr_1', name: 'Mara Chen' }, groups: [], currentPid: 'prj_other', data: { projects },
+    permissions: { canCreateProjects: true }, actions: { selectProject: vi.fn(), openTask: vi.fn(), createProject: vi.fn() },
   } as unknown as AppStore;
 }
 
@@ -79,17 +79,34 @@ describe('Home phone composition', () => {
     container = document.createElement('div');
     document.body.appendChild(container);
     root = createRoot(container);
+    const homeStore = store([contributorProject]);
     await act(async () => {
-      root!.render(<Home store={store([contributorProject])} />);
+      root!.render(<Home store={homeStore} />);
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
     expect(container.textContent).toContain('Needs attention');
     expect(container.textContent).toContain('PROPOSED');
     expect(container.textContent).toContain('Consider offline sync');
+    const card = [...container.querySelectorAll<HTMLElement>('.hover-border')]
+      .find((item) => item.textContent?.includes('Consider offline sync'))!;
+    await act(async () => { card.click(); });
+    expect(homeStore.actions.selectProject).toHaveBeenCalledWith(project.id);
+    expect(homeStore.actions.openTask).toHaveBeenCalledWith('task_proposed');
+
+    vi.mocked(homeStore.actions.selectProject).mockClear();
+    vi.mocked(homeStore.actions.openTask).mockClear();
     const acceptButton = [...container.querySelectorAll<HTMLButtonElement>('button')]
       .find((button) => button.textContent?.trim() === 'Accept')!;
     await act(async () => { acceptButton.click(); });
     expect(accept).toHaveBeenCalledWith(project.id, 'task_proposed');
+    expect(homeStore.actions.selectProject).not.toHaveBeenCalled();
+    expect(homeStore.actions.openTask).not.toHaveBeenCalled();
+
+    const rejectButton = [...container.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === 'Reject')!;
+    await act(async () => { rejectButton.click(); });
+    expect(homeStore.actions.selectProject).not.toHaveBeenCalled();
+    expect(homeStore.actions.openTask).not.toHaveBeenCalled();
   });
 });
