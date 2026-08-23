@@ -460,7 +460,7 @@ export const api = {
     req('PATCH', `/api/projects/${pid}/milestones/${mid}`, patch),
   createMilestone: (pid: string, title: string, dueAt?: string) =>
     req<{ id: string }>('POST', `/api/projects/${pid}/milestones`, { title, dueAt }),
-  createTask: (pid: string, input: { title: string; body?: string; priority?: number; milestoneId?: string; tags?: string[]; type?: string; boardId?: string }) =>
+  createTask: (pid: string, input: { title: string; body?: string; priority?: number; milestoneId?: string; tags?: string[]; type?: string; boardId?: string; phaseId?: string }) =>
     req<{ id: string; key: string }>('POST', `/api/projects/${pid}/tasks`, input),
   updateTask: (pid: string, tid: string, patch: Record<string, unknown>) =>
     req('PATCH', `/api/projects/${pid}/tasks/${tid}`, patch),
@@ -474,7 +474,9 @@ export const api = {
   approvePlan: (pid: string, plid: string) => req<{ id: string; status: string; tasksUngated: number }>('POST', `/api/projects/${pid}/plans/${plid}/approve`),
   rejectPlan: (pid: string, plid: string) => req<{ ok: boolean; cancelledTasks: number }>('POST', `/api/projects/${pid}/plans/${plid}/reject`),
   // Spin-off gate (PLNR-230): accept → plain claimable todo; reject → cancelled (provenance kept).
-  acceptProposal: (pid: string, tid: string) => req<{ id: string; key: string; status: string }>('POST', `/api/projects/${pid}/tasks/${tid}/proposal/accept`),
+  acceptProposal: (pid: string, tid: string, phaseId?: string) => req<{ id: string; key: string; status: string }>(
+    'POST', `/api/projects/${pid}/tasks/${tid}/proposal/accept`, phaseId ? { phaseId } : {},
+  ),
   rejectProposal: (pid: string, tid: string) => req<{ id: string; key: string; status: string }>('POST', `/api/projects/${pid}/tasks/${tid}/proposal/reject`),
   deleteTask: (pid: string, tid: string) => req('DELETE', `/api/projects/${pid}/tasks/${tid}`),
   deleteProject: (pid: string) => req('DELETE', `/api/projects/${pid}`),

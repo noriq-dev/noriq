@@ -423,7 +423,7 @@ export function Drawer({ store }: { store: AppStore }) {
                     <Button
                       variant="primary"
                       style={{ padding: '5px 14px', fontSize: 12 }}
-                      onClick={() => void actions.acceptProposal(task.id)}
+                      onClick={() => actions.openProposalAccept(currentPid, task.id, task.key)}
                     >
                       Accept
                     </Button>

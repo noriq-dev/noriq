@@ -81,6 +81,7 @@ function mount(taskList?: TaskVM[], permissions = { canContribute: false, canMan
       openTask: vi.fn(),
       setDraggedId: vi.fn(),
       acceptProposal: vi.fn(),
+      openProposalAccept: vi.fn(),
       rejectProposal: vi.fn(),
     },
   } as unknown as AppStore;
@@ -89,6 +90,7 @@ function mount(taskList?: TaskVM[], permissions = { canContribute: false, canMan
   document.body.appendChild(container);
   root = createRoot(container);
   act(() => root!.render(<Board store={store} />));
+  return store;
 }
 
 function selectPlanFilter(value: 'planned' | 'standalone') {
@@ -115,20 +117,24 @@ describe('Board plan membership filter', () => {
       status: 'proposed' as const,
       proposedAt: '2026-08-19T12:00:00.000Z',
     };
-    mount([proposed], { canContribute: true, canManage: false });
+    const desktopStore = mount([proposed], { canContribute: true, canManage: false });
     expect(container.textContent).toContain('✓ accept');
     expect(container.textContent).toContain('✕ reject');
+    act(() => [...container.querySelectorAll<HTMLButtonElement>('button')].find((button) => button.textContent?.includes('✓ accept'))!.click());
+    expect(desktopStore.actions.openProposalAccept).toHaveBeenCalledWith('project_board', 'task_proposed', 'BRD-9');
 
     act(() => root?.unmount());
     container.remove();
     root = null;
     mockPhoneViewport();
-    mount([proposed], { canContribute: true, canManage: false });
+    const phoneStore = mount([proposed], { canContribute: true, canManage: false });
     const proposedLane = [...container.querySelectorAll<HTMLButtonElement>('nav[aria-label="Board lanes"] button')]
       .find((item) => item.textContent?.includes('Proposed'))!;
     act(() => proposedLane.click());
     expect(container.textContent).toContain('✓ accept');
     expect(container.textContent).toContain('✕ reject');
+    act(() => [...container.querySelectorAll<HTMLButtonElement>('button')].find((button) => button.textContent?.includes('✓ accept'))!.click());
+    expect(phoneStore.actions.openProposalAccept).toHaveBeenCalledWith('project_board', 'task_proposed', 'BRD-9');
   });
 
   it('renders one touch-selected lane without drag or bulk controls on phones', () => {

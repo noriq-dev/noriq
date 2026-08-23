@@ -168,7 +168,9 @@ export function useAppStore() {
   const [user, setUser] = useState<UserVM | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
   const [needsSetup, setNeedsSetup] = useState(false);
-  const [modal, setModal] = useState<null | 'project' | 'task' | 'group' | 'milestone' | 'tag'>(null);
+  const [modal, setModal] = useState<null | 'project' | 'task' | 'group' | 'milestone' | 'tag' | 'proposal'>(null);
+  const [proposalTarget, setProposalTarget] = useState<{ projectId: string; taskId: string; taskKey: string } | null>(null);
+  const [proposalDecisionRevision, setProposalDecisionRevision] = useState(0);
   const [editMilestone, setEditMilestone] = useState<{ id: string; title: string; dueAt: string | null } | null>(null);
   const [groups, setGroups] = useState<Array<{ id: string; name: string; description: string; canEdit: number; myRole: 'owner' | 'manager' | 'member' | null }>>([]);
   const initialUrl = useRef(parseUrl());
@@ -682,7 +684,7 @@ export function useAppStore() {
       if (next && !['project', 'group'].includes(next) && !permissions.canContribute) return;
       setModal(next);
     },
-    closeModal: () => { setModal(null); setEditMilestone(null); },
+    closeModal: () => { setModal(null); setEditMilestone(null); setProposalTarget(null); },
 
     createProject: () => { if (permissions.canCreateProjects) setModal('project'); },
     createTask: () => { if (permissions.canContribute) setModal('task'); },
@@ -698,7 +700,7 @@ export function useAppStore() {
       lastSeq.current = 0;
     },
 
-    async submitTask(input: { title: string; body?: string; priority?: number; milestoneId?: string; tags?: string[]; type?: string }) {
+    async submitTask(input: { title: string; body?: string; priority?: number; milestoneId?: string; tags?: string[]; type?: string; phaseId?: string }) {
       if (!pidRef.current || !permissions.canContribute) return;
       // New tasks land on the board you're currently viewing (falls back to default server-side).
       await api.createTask(pidRef.current, { ...input, ...(boardRef.current ? { boardId: boardRef.current } : {}) });
@@ -827,6 +829,21 @@ export function useAppStore() {
       await api.acceptProposal(pidRef.current, taskId);
       refresh();
     },
+    openProposalAccept(projectId: string, taskId: string, taskKey: string) {
+      const project = projects.find((candidate) => candidate.id === projectId);
+      if (!project?.canContribute) return;
+      setProposalTarget({ projectId, taskId, taskKey });
+      setModal('proposal');
+    },
+    async submitProposalAcceptance(phaseId?: string) {
+      if (!proposalTarget) return;
+      await api.acceptProposal(proposalTarget.projectId, proposalTarget.taskId, phaseId);
+      const refreshCurrentProject = proposalTarget.projectId === pidRef.current;
+      setProposalTarget(null);
+      setModal(null);
+      setProposalDecisionRevision((revision) => revision + 1);
+      if (refreshCurrentProject) refresh();
+    },
     async rejectProposal(taskId: string) {
       if (!pidRef.current) return;
       await api.rejectProposal(pidRef.current, taskId);
@@ -939,7 +956,7 @@ export function useAppStore() {
   };
 
   return {
-    user, authChecked, needsSetup, modal, editMilestone, groups, snapshot, showArchived, boardId,
+    user, authChecked, needsSetup, modal, editMilestone, proposalTarget, proposalDecisionRevision, groups, snapshot, showArchived, boardId,
     isAdmin, adminProjects, permissions,
     currentPid: currentPid ?? '', view, selectedTaskId, selectedAgentId, draftKind, draftText, draggedId,
     data, helpers, actions,
