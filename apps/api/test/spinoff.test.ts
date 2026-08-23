@@ -25,6 +25,9 @@ describe('create_tasks proposals (PLNR-230)', () => {
   let anchorTaskId: string;
   let cookie: string;
   let contributorCookie: string;
+  let placementPlanId: string;
+  let placementPhaseId: string;
+  let foreignPhaseId: string;
 
   beforeAll(async () => {
     copilot = await createAgent('spinoff-copilot', 'orchestrator');
@@ -37,6 +40,24 @@ describe('create_tasks proposals (PLNR-230)', () => {
     });
     expect(anchor.isError).toBeFalsy();
     anchorTaskId = anchor.body.id;
+    const placementPlan = await mcpCall(copilot.apiKey, 'create_plan', {
+      projectId, title: 'proposal placement plan',
+      phases: [{ title: 'Delivery', taskIds: [anchorTaskId] }],
+    });
+    expect(placementPlan.isError).toBeFalsy();
+    placementPlanId = placementPlan.body.id;
+    placementPhaseId = placementPlan.body.phases[0].id;
+    const foreignProject = await mcpCall(copilot.apiKey, 'create_project', {
+      key: 'SPF', name: 'foreign proposal phases',
+    });
+    const foreignAnchor = await mcpCall(copilot.apiKey, 'create_task', {
+      projectId: foreignProject.body.id, title: 'foreign anchor', tags: ['spinoff-anchor'], allowNewTags: true,
+    });
+    const foreignPlan = await mcpCall(copilot.apiKey, 'create_plan', {
+      projectId: foreignProject.body.id, title: 'foreign plan',
+      phases: [{ title: 'Foreign delivery', taskIds: [foreignAnchor.body.id] }],
+    });
+    foreignPhaseId = foreignPlan.body.phases[0].id;
     build = await createRunAgent(projectId, 'build');
     // The fixture seeds an anchorless run; anchor it like the dispatch path would.
     await db().prepare("UPDATE runs SET anchor_type = 'task', anchor_id = ? WHERE id = ?")
@@ -127,6 +148,47 @@ describe('create_tasks proposals (PLNR-230)', () => {
     const claim = await mcpCall(copilot.apiKey, 'claim_task', { projectId, taskId: made.id });
     expect(claim.isError).toBeFalsy();
     await mcpCall(copilot.apiKey, 'release_task', { projectId, taskId: made.id, toStatus: 'done' });
+  });
+
+  it('accepts directly into a selected same-project plan phase and emits the canonical link', async () => {
+    const made = await fileProposal('accepted into delivery');
+    const res = await SELF.fetch(
+      `https://noriq.test/api/projects/${projectId}/tasks/${made.id}/proposal/accept`,
+      {
+        method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phaseId: placementPhaseId }),
+      },
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ id: made.id, status: 'todo' });
+    expect(await db().prepare('SELECT phase_id AS phaseId FROM phase_tasks WHERE task_id = ?')
+      .bind(made.id).first<{ phaseId: string }>()).toEqual({ phaseId: placementPhaseId });
+
+    const linked = await db().prepare(
+      "SELECT payload FROM events WHERE verb = 'plan.tasks_linked' AND subject_id = ? ORDER BY global_seq DESC LIMIT 1",
+    ).bind(placementPlanId).first<{ payload: string }>();
+    expect(JSON.parse(linked!.payload)).toMatchObject({
+      links: [{ taskId: made.id, planId: placementPlanId, phaseId: placementPhaseId }],
+    });
+  });
+
+  it('rejects unknown or foreign phases without accepting or attaching the proposal', async () => {
+    for (const phaseId of ['phs_missing', foreignPhaseId]) {
+      const made = await fileProposal(`invalid placement ${phaseId}`);
+      const res = await SELF.fetch(
+        `https://noriq.test/api/projects/${projectId}/tasks/${made.id}/proposal/accept`,
+        {
+          method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ phaseId }),
+        },
+      );
+      expect(res.status).not.toBe(200);
+      const task = await db().prepare('SELECT proposed_at AS proposedAt FROM tasks WHERE id = ?')
+        .bind(made.id).first<{ proposedAt: string | null }>();
+      expect(task!.proposedAt).toBeTruthy();
+      expect((await db().prepare('SELECT COUNT(*) AS n FROM phase_tasks WHERE task_id = ?')
+        .bind(made.id).first<{ n: number }>())!.n).toBe(0);
+    }
   });
 
   it('lets a project contributor accept or reject proposed work', async () => {

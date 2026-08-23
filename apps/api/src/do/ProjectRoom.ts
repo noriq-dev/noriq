@@ -8482,14 +8482,45 @@ export class ProjectRoom extends DurableObject<Env> {
   /** Accept a PROPOSED task (PLNR-230): clear proposed_at so the task becomes a plain
    *  claimable `todo`. The human gate a spun-off task waits behind — the task-level twin of
    *  approvePlan above. Provenance (spinoff_run_id / source task / finding) is kept forever. */
-  async acceptProposal(projectId: string, actor: Actor, taskId: string) {
+  async acceptProposal(projectId: string, actor: Actor, taskId: string, phaseId?: string | null) {
     return this.ctx.blockConcurrencyWhile(async () => {
       await this.setPid(projectId);
       const task = await this.getTask(taskId);
       if (!task.proposed_at) throw new Error(`${task.key} is not a proposed task — nothing to accept`);
-      await this.env.DB.prepare('UPDATE tasks SET proposed_at = NULL, updated_at = ? WHERE id = ?')
-        .bind(nowIso(), task.id).run();
-      await this.emit(actor, 'task.proposal_accepted', 'task', task.id, { key: task.key, title: task.title });
+      // Resolve placement before clearing the proposal gate. The update and relationship row
+      // then share one D1 batch, so a stale, archived, or foreign phase cannot accept the task
+      // while silently dropping the user's intended placement.
+      let phasePlan: { id: string; title: string; phaseId: string } | null = null;
+      if (phaseId != null) {
+        const phase = await this.env.DB.prepare(
+          `SELECT ph.id AS phaseId, pl.id, pl.title
+           FROM phases ph JOIN plans pl ON pl.id = ph.plan_id
+           WHERE ph.id = ? AND pl.project_id = ? AND pl.archived_at IS NULL`,
+        ).bind(phaseId, projectId).first<{ phaseId: string; id: string; title: string }>();
+        if (!phase) throw new Error(`phase ${phaseId} not found in an active plan in this project`);
+        phasePlan = phase;
+      }
+      const stmts = [
+        this.env.DB.prepare('UPDATE tasks SET proposed_at = NULL, updated_at = ? WHERE id = ?')
+          .bind(nowIso(), task.id),
+      ];
+      if (phasePlan) {
+        stmts.push(this.env.DB.prepare('INSERT OR IGNORE INTO phase_tasks (phase_id, task_id) VALUES (?, ?)')
+          .bind(phasePlan.phaseId, task.id));
+      }
+      await this.env.DB.batch(stmts);
+      await this.emit(actor, 'task.proposal_accepted', 'task', task.id, {
+        key: task.key, title: task.title, phaseId: phasePlan?.phaseId ?? null,
+      });
+      if (phasePlan) {
+        await this.emit(actor, 'plan.tasks_linked', 'plan', phasePlan.id, {
+          planTitle: phasePlan.title,
+          links: [{
+            taskId: task.id, taskTitle: task.title, planId: phasePlan.id,
+            planTitle: phasePlan.title, phaseId: phasePlan.phaseId,
+          }],
+        });
+      }
       return { id: task.id, key: task.key, status: 'todo' };
     });
   }
