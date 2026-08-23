@@ -2,7 +2,7 @@ import { act } from 'react';
 import { createRoot } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AppStore } from '../store';
-import { MissionControl } from './MissionControl';
+import { MissionControl, openEventContent } from './MissionControl';
 
 const originalMatchMedia = window.matchMedia;
 
@@ -17,6 +17,7 @@ let container: HTMLDivElement;
 afterEach(() => {
   container?.remove();
   document.body.style.overflow = '';
+  sessionStorage.clear();
   window.matchMedia = originalMatchMedia;
   vi.restoreAllMocks();
 });
@@ -31,11 +32,38 @@ function mobileStore(answerSignal = vi.fn()) {
     },
     snapshot: { signals: [{ id: 's1', taskId: 't1', taskKey: 'PLNR-1', agentId: 'a1', agentName: 'Worker', type: 'input_request', severity: 'info', title: 'Choose', body: null, options: ['Ship it'], questions: null, followUpTo: null, createdAt: '2026-08-10T12:00:00.000Z' }] },
     helpers: { tasksOf: () => [], agentById: () => null, effStatus: (_pid: string, task: { status: string }) => task.status },
-    actions: { openTask: vi.fn(), answerSignal, acknowledgeSignal: vi.fn(), cycleKind: vi.fn(), setDraftText: vi.fn(), postComment: vi.fn() },
+    actions: { openTask: vi.fn(), setView: vi.fn(), answerSignal, acknowledgeSignal: vi.fn(), cycleKind: vi.fn(), setDraftText: vi.fn(), postComment: vi.fn() },
   } as unknown as AppStore;
 }
 
 describe('MissionControl phone composition', () => {
+  it('opens exact document revisions and owning plan documents from feed content targets', () => {
+    viewportMatchMedia(390);
+    const store = mobileStore();
+    store.data.events.p1 = [{
+      id: 'doc-event', t: '12:00:00', actor: 'Worker', actorKind: 'agent', verb: 'updated',
+      subject: 'Architecture · v4', createdAt: '2026-08-10T12:00:00.000Z',
+      contentTarget: { kind: 'doc', id: 'doc_1', version: 4 },
+    }];
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    act(() => createRoot(container).render(<MissionControl store={store} />));
+
+    act(() => container.querySelector<HTMLElement>('.event-row')!.click());
+    expect(sessionStorage.getItem('noriq.openDoc')).toBe('doc_1');
+    expect(sessionStorage.getItem('noriq.openDocVersion')).toBe('4');
+    expect(store.actions.setView).toHaveBeenCalledWith('docs');
+
+    expect(openEventContent({
+      id: 'plan-doc-event', t: '12:01:00', actor: 'Worker', actorKind: 'agent', verb: 'updated',
+      subject: 'Rollout', createdAt: '2026-08-10T12:01:00.000Z',
+      contentTarget: { kind: 'plan_doc', id: 'pdoc_1', planId: 'plan_1' },
+    }, store.actions)).toBe(true);
+    expect(sessionStorage.getItem('noriq.openPlan')).toBe('plan_1');
+    expect(sessionStorage.getItem('noriq.openPlanDoc')).toBe('pdoc_1');
+    expect(store.actions.setView).toHaveBeenLastCalledWith('plans');
+  });
+
   it('mounts only feed, wraps subjects, and answers an option directly from the decisions sheet', () => {
     viewportMatchMedia(390);
     const answerSignal = vi.fn();

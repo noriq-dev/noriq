@@ -8,6 +8,28 @@ import { AvatarChip, MonoTag, SectionLabel, WaveBars } from './bits';
 import { Composer } from './Composer';
 import { DecisionsSheet } from './DecisionsSheet';
 import { useViewport } from '../viewport';
+import type { EventVM } from '../types';
+
+/** Route feed rows through the same deep-link hints used by search, drawers, and Plans. */
+export function openEventContent(event: EventVM, actions: Pick<AppStore['actions'], 'openTask' | 'setView'>): boolean {
+  const target = event.contentTarget ?? (event.taskId ? { kind: 'task' as const, id: event.taskId } : undefined);
+  if (!target) return false;
+  if (target.kind === 'task') {
+    actions.openTask(target.id);
+    return true;
+  }
+  if (target.kind === 'doc') {
+    sessionStorage.setItem('noriq.openDoc', target.id);
+    if (target.version !== undefined) sessionStorage.setItem('noriq.openDocVersion', String(target.version));
+    else sessionStorage.removeItem('noriq.openDocVersion');
+    actions.setView('docs');
+    return true;
+  }
+  sessionStorage.setItem('noriq.openPlan', target.planId);
+  sessionStorage.setItem('noriq.openPlanDoc', target.id);
+  actions.setView('plans');
+  return true;
+}
 
 export function MissionControl({ store }: { store: AppStore }) {
   const { phone, tablet, wide } = useViewport();
@@ -449,6 +471,7 @@ function EventFeed({ store, phone = false, attentionSheet = false }: { store: Ap
           const isYou = ev.actorKind === 'human';
           const isSystem = ev.actorKind === 'system';
           const vc = verbColors(ev.verb);
+          const canOpen = !!ev.contentTarget || ev.taskId != null;
           // Break between calendar days so times read against the right date. The first row
           // also gets a label. Works in both directions — `events` is already in render order.
           const prev = events[i - 1];
@@ -464,9 +487,9 @@ function EventFeed({ store, phone = false, attentionSheet = false }: { store: Ap
               )}
             {phone ? (
               <div
-                onClick={ev.taskId != null ? () => actions.openTask(ev.taskId!) : undefined}
+                onClick={canOpen ? () => openEventContent(ev, actions) : undefined}
                 className="event-row"
-                style={{ padding: '11px 16px', display: 'flex', gap: 11, alignItems: 'flex-start', cursor: ev.taskId != null ? 'pointer' : 'default', animation: 'pl-stream-up .45s ease both', borderLeft: '2px solid transparent' }}
+                style={{ padding: '11px 16px', display: 'flex', gap: 11, alignItems: 'flex-start', cursor: canOpen ? 'pointer' : 'default', animation: 'pl-stream-up .45s ease both', borderLeft: '2px solid transparent' }}
               >
                 <div style={{ width: 30, height: 30, borderRadius: 8, background: isYou ? YOU_GRADIENT : isSystem ? '#3fd98b' : ag ? (isGhostColor(ag.color) ? 'var(--w-16)' : ag.color) : 'var(--w-16)', flex: 'none', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'var(--mono)', fontSize: 10, fontWeight: 700, color: isYou || isSystem ? '#0a0b0d' : ag ? agentFg(ag.color) : '#e6e8ec' }}>
                   {isYou ? 'Y' : isSystem ? '✓' : initials(ev.actor)}
@@ -485,14 +508,14 @@ function EventFeed({ store, phone = false, attentionSheet = false }: { store: Ap
                 </div>
               </div>
             ) : <div
-              onClick={ev.taskId != null ? () => actions.openTask(ev.taskId!) : undefined}
+              onClick={canOpen ? () => openEventContent(ev, actions) : undefined}
               className="event-row"
               style={{
                 padding: '9px 20px',
                 display: 'flex',
                 gap: 12,
                 alignItems: 'flex-start',
-                cursor: ev.taskId != null ? 'pointer' : 'default',
+                cursor: canOpen ? 'pointer' : 'default',
                 animation: 'pl-stream-up .45s ease both',
                 borderLeft: '2px solid transparent',
               }}

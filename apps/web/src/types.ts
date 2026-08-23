@@ -112,6 +112,12 @@ export interface EventVM {
   verb: string;
   subject: string;
   taskId?: string;
+  /** Retained content the feed row can open. `taskId` remains during the transition because
+   * task-focused surfaces already consume it directly. */
+  contentTarget?:
+    | { kind: 'task'; id: string }
+    | { kind: 'doc'; id: string; version?: number }
+    | { kind: 'plan_doc'; id: string; planId: string };
   /** ISO timestamp from e.createdAt (t drops the date) — drives feed day-break separators (PLNR-227). */
   createdAt: string;
   /** Swatch rendered before the subject — e.g. a created tag's color (PLNR-130). */

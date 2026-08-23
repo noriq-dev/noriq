@@ -20,6 +20,7 @@ export function DocsView({ store }: { store: AppStore }) {
   const [editing, setEditing] = useState(false);
   const [versions, setVersions] = useState<ApiDocVersionSummary[]>([]);
   const [viewedVersion, setViewedVersion] = useState<ApiDocVersion | null>(null);
+  const requestedVersion = useRef<{ docId: string; version: number } | null>(null);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [tagFilter, setTagFilter] = useState<string | null>(null);
   const [eName, setEName] = useState('');
@@ -35,8 +36,11 @@ export function DocsView({ store }: { store: AppStore }) {
   useEffect(() => {
     // Deep link from the palette / task drawer (PLNR-186): open a specific doc on arrival.
     const hint = sessionStorage.getItem('noriq.openDoc');
+    const versionHint = Number(sessionStorage.getItem('noriq.openDocVersion'));
     sessionStorage.removeItem('noriq.openDoc');
+    sessionStorage.removeItem('noriq.openDocVersion');
     setSelected(hint || null);
+    requestedVersion.current = hint && Number.isInteger(versionHint) && versionHint > 0 ? { docId: hint, version: versionHint } : null;
     setEditing(false);
     setShowArchived(false);
     setVersions([]);
@@ -88,6 +92,13 @@ export function DocsView({ store }: { store: AppStore }) {
     setVersions([]);
     if (!selected) return;
     void api.docVersions(currentPid, selected).then((result) => setVersions(result.versions)).catch(() => {});
+    const requested = requestedVersion.current;
+    if (requested?.docId === selected) {
+      requestedVersion.current = null;
+      void api.docVersion(currentPid, selected, requested.version)
+        .then((version) => setViewedVersion(version.version === version.currentVersion ? null : version))
+        .catch(() => {});
+    }
   }, [currentPid, selected]);
   // Tasks citing the selected doc (PLNR-182) — from the live snapshot's link pairs.
   const linkedTasks = sel
@@ -140,7 +151,7 @@ export function DocsView({ store }: { store: AppStore }) {
     <div
       key={d.id}
       data-doc-id={d.id}
-      onClick={() => { setSelected(d.id); setEditing(false); }}
+      onClick={() => { requestedVersion.current = null; setSelected(d.id); setEditing(false); }}
       className="hover-border"
       style={{
         padding: '9px 12px', borderRadius: 10, cursor: 'pointer', marginLeft: indent ? 14 : 0,

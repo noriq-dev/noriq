@@ -72,10 +72,26 @@ afterEach(() => {
   act(() => root?.unmount());
   container?.remove();
   root = null;
+  sessionStorage.clear();
   vi.restoreAllMocks();
 });
 
 describe('Docs version history', () => {
+  it('honors an event deep link to an exact immutable revision', async () => {
+    mockApi();
+    sessionStorage.setItem('noriq.openDoc', activeDoc.id);
+    sessionStorage.setItem('noriq.openDocVersion', '1');
+    mount();
+    await tick();
+    await tick();
+
+    expect(api.docVersion).toHaveBeenCalledWith('prj_1', activeDoc.id, 1);
+    expect(text()).toContain('Historical protocol body.');
+    expect(text()).toContain('HISTORY');
+    expect(sessionStorage.getItem('noriq.openDoc')).toBeNull();
+    expect(sessionStorage.getItem('noriq.openDocVersion')).toBeNull();
+  });
+
   it('opens historical snapshots read-only and returns explicitly to the current version', async () => {
     mockApi();
     mount();

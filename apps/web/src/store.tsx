@@ -24,6 +24,7 @@ export function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
   let verb = e.verb;
   let subject = '';
   let taskId: string | undefined;
+  let contentTarget: EventVM['contentTarget'];
   let dot: string | undefined;
   switch (e.verb) {
     case 'task.claimed': verb = 'claimed'; subject = `${p.key} · ${p.title}`; taskId = e.subjectId; break;
@@ -57,11 +58,31 @@ export function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
     // raw-id default (PLNR-130).
     case 'tag.created': verb = 'tag'; subject = `created ${p.name ?? ''}`; dot = typeof p.color === 'string' ? p.color : undefined; break;
     case 'tag.deleted': verb = 'tag'; subject = `deleted ${p.name ?? ''}`; break;
-    case 'doc.created': verb = 'doc'; subject = `wrote "${p.name ?? ''}"`; break;
-    case 'doc.updated': verb = 'doc'; subject = `revised "${p.name ?? ''}"`; break;
+    case 'doc.created':
+      verb = 'doc'; subject = `wrote "${p.name ?? ''}"`;
+      contentTarget = { kind: 'doc', id: e.subjectId, ...(typeof p.version === 'number' ? { version: p.version } : {}) };
+      break;
+    case 'doc.updated':
+      verb = 'doc'; subject = `revised "${p.name ?? ''}"`;
+      contentTarget = { kind: 'doc', id: e.subjectId, ...(typeof p.version === 'number' ? { version: p.version } : {}) };
+      break;
+    case 'doc.archived':
+      verb = 'doc'; subject = `archived "${p.name ?? ''}"`;
+      contentTarget = { kind: 'doc', id: e.subjectId, ...(typeof p.version === 'number' ? { version: p.version } : {}) };
+      break;
+    case 'doc.restored':
+      verb = 'doc'; subject = `restored "${p.name ?? ''}"`;
+      contentTarget = { kind: 'doc', id: e.subjectId, ...(typeof p.version === 'number' ? { version: p.version } : {}) };
+      break;
     case 'doc.deleted': verb = 'doc'; subject = `deleted "${p.name ?? ''}"`; break;
-    case 'plan_doc.created': verb = 'plan doc'; subject = `wrote "${p.name ?? ''}"`; break;
-    case 'plan_doc.updated': verb = 'plan doc'; subject = `revised "${p.name ?? ''}"`; break;
+    case 'plan_doc.created':
+      verb = 'plan doc'; subject = `wrote "${p.name ?? ''}"`;
+      if (typeof p.planId === 'string') contentTarget = { kind: 'plan_doc', id: e.subjectId, planId: p.planId };
+      break;
+    case 'plan_doc.updated':
+      verb = 'plan doc'; subject = `revised "${p.name ?? ''}"`;
+      if (typeof p.planId === 'string') contentTarget = { kind: 'plan_doc', id: e.subjectId, planId: p.planId };
+      break;
     case 'plan_doc.deleted': verb = 'plan doc'; subject = `deleted "${p.name ?? ''}"`; break;
     case 'lock.acquired': verb = 'lock'; subject = `held ${(p.paths as string[] | undefined)?.join(', ') ?? ''}${p.taskKey ? ` for ${p.taskKey}` : ''}`; break;
     case 'lock.released': verb = 'lock'; subject = `released ${(p.paths as string[] | undefined)?.join(', ') ?? ''}`; break;
@@ -71,7 +92,8 @@ export function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
     case 'lock.renewed': verb = 'lock'; subject = 'renewed a lock'; break;
     default: subject = `${e.verb} ${e.subjectId}`;
   }
-  return { id: e.id, t: timeOf(e.createdAt), createdAt: e.createdAt, actor, actorKind: e.actorKind, verb, subject, taskId, dot };
+  if (taskId) contentTarget = { kind: 'task', id: taskId };
+  return { id: e.id, t: timeOf(e.createdAt), createdAt: e.createdAt, actor, actorKind: e.actorKind, verb, subject, taskId, contentTarget, dot };
 }
 
 const VIEWS: ViewId[] = ['home', 'control', 'graph', 'intelligence', 'board', 'plans', 'roadmap', 'review', 'docs', 'ask', 'agents', 'runs', 'settings', 'project-settings', 'admin', 'memory', 'more'];
