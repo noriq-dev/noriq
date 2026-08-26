@@ -33,9 +33,9 @@ describe('record_memory — registration and guidance', () => {
     expect(memoryTools.map((t) => t.name)).toEqual(['record_memory']);
 
     const desc = memoryTools[0]!.description;
-    // Every MemoryKind, since the tool description enumerates them explicitly (zod's own
-    // per-field .describe() is dropped by the SDK's zod3/4 mismatch — the guidance therefore
-    // has to live in this top-level string, not on the `kind` field's schema metadata).
+    // Every MemoryKind, since the tool description enumerates them explicitly. (Per-field
+    // .describe() now survives into tools/list — PLNR-549 pinned one zod copy for us and the
+    // SDK — but the top-level string stays the primary guidance an agent reads.)
     for (const kind of ['learning', 'decision', 'failed_approach', 'procedure', 'requirement', 'hazard', 'unknown']) {
       expect(desc).toContain(kind);
     }

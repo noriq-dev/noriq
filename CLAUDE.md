@@ -171,10 +171,15 @@ for the components. (ARCHITECTURE.md calls it a "mock store" — that's stale; i
   without restatusing it. Their `allowedTools` floor means unlisted tools are **not registered**
   (absent from `tools/list`), not advertise-then-deny.
 
-- **The MCP SDK resolves zod 3.x while this repo is on zod 4.x, so `.describe()` field metadata
-  is dropped in the zod→JSON-Schema conversion.** Per-field guidance must go in the tool
-  **description string** instead (see `EXECUTION_SPEC_DESC` in mcp.ts, asserted against the
-  generated `tools/list` payload in tests).
+- **The MCP SDK must dedupe to the SAME zod copy as our schemas — the root `package.json` pins
+  `zod@^4` for exactly this (PLNR-549).** The SDK's `zod` is a *peer* dep resolved from the
+  hoisted root; when the hoisted copy was zod@3.25 (pulled in by `@cloudflare/vitest-pool-workers`),
+  its bundled `v4-mini.toJSONSchema` walked our zod@4.4 schemas and silently emitted bare
+  `{type:'string'}` — every `.min()/.max()/.describe()` vanished from `tools/list`, so agents
+  learned `create_doc`'s 120/300 caps only from the -32602 rejection. `npm ls zod` must show a
+  single root `zod@4.x` with 3.x only nested under vitest-pool-workers/miniflare; a scoped
+  `overrides` entry does NOT work (peers ignore it). `mcp-2026.test.ts` asserts the limits
+  survive. `EXECUTION_SPEC_DESC` in mcp.ts predates this and is kept as belt-and-braces.
 
 - **Dependency edges may cross projects (PLNR-241), and the `dependencies` table has no
   `project_id` — an edge is owned by the DEPENDENT task's project.** Task ids AND display

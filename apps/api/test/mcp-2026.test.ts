@@ -147,6 +147,20 @@ describe('stateless requests (no initialize, no session)', () => {
     expect(body.result.tools.length).toBeGreaterThan(10);
   });
 
+  it('advertises zod string limits and field descriptions in tools/list (PLNR-549)', async () => {
+    // The SDK dedupes to the ROOT zod; when that was zod@3.25 its bundled v4-mini converter
+    // silently stripped every constraint and .describe() from our zod@4 schemas, so agents
+    // learned create_doc's 120/300 caps only from the -32602 rejection. The root now pins
+    // zod@^4 (package.json devDependencies) so one copy serves both us and the SDK.
+    const { body } = await modern(apiKey, 'tools/list', {});
+    const createDoc = body.result.tools.find((t: { name: string }) => t.name === 'create_doc');
+    const props = createDoc.inputSchema.properties;
+    expect(props.name.minLength).toBe(1);
+    expect(props.name.maxLength).toBe(120);
+    expect(props.description.maxLength).toBe(300);
+    expect(props.description.description).toContain('max 300 chars');
+  });
+
   it('serves the complete versioned Copilot catalogue with current input shapes', async () => {
     const { status, body } = await modern(apiKey, 'tools/list', {});
     expect(status).toBe(200);

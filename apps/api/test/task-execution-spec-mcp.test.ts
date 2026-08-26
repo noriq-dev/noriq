@@ -208,9 +208,9 @@ describe('the execution spec on the MCP task tools (RUN-136)', () => {
   // An agent that never hears about the spec will never write one, whatever the schema allows.
   // The ticket's actual requirement: "tool descriptions must state what the spec is for — an
   // agent that cannot tell when to fill it in will not fill it in." `.describe()` on the FIELD
-  // does not satisfy it: the MCP SDK resolves zod 3.x while this package is on 4.x, so field
-  // descriptions are dropped in the JSON-Schema conversion while the structure survives. This
-  // asserts on what an agent actually receives.
+  // does not satisfy it on its own: until PLNR-549 the SDK converted our schemas with a
+  // mismatched zod copy and dropped every field description, and the tool description is
+  // still what an agent reads first. This asserts on what an agent actually receives.
   it('states what the spec is for in the tool descriptions an agent actually sees', async () => {
     const res = await SELF.fetch('https://noriq.test/mcp', {
       method: 'POST',
