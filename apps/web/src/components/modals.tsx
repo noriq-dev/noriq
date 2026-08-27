@@ -1,5 +1,5 @@
 // Modal host + the create dialogs (projects, tasks, groups, agents).
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api, type ApiSnapshot } from '../api';
 import type { AppStore } from '../store';
 import { Button, ErrorNote, Field, Modal, Select, TextArea, TextInput } from './ui';
@@ -11,7 +11,6 @@ export function ModalHost({ store }: { store: AppStore }) {
     case 'group': return <CreateGroupModal store={store} />;
     case 'milestone': return <CreateMilestoneModal store={store} />;
     case 'tag': return <CreateTagModal store={store} />;
-    case 'proposal': return <ProposalAcceptModal store={store} />;
     default: return null;
   }
 }
@@ -224,84 +223,6 @@ function CreateTaskModal({ store }: { store: AppStore }) {
         <ErrorNote>{error}</ErrorNote>
         <div style={{ flex: 1 }} />
         <Button disabled={busy || !title.trim() || (!!planId && !phaseId)} onClick={run}>Create task</Button>
-      </div>
-    </Modal>
-  );
-}
-
-function ProposalAcceptModal({ store }: { store: AppStore }) {
-  const target = store.proposalTarget;
-  const localSnapshot = target?.projectId === store.currentPid && activePlacementPlans(store.snapshot).length > 0
-    ? store.snapshot
-    : null;
-  const [remoteSnapshot, setRemoteSnapshot] = useState<Pick<ApiSnapshot, 'plans' | 'phases'> | null>(null);
-  const [loadError, setLoadError] = useState(false);
-  const [planId, setPlanId] = useState('');
-  const [phaseId, setPhaseId] = useState('');
-
-  useEffect(() => {
-    setRemoteSnapshot(null);
-    setLoadError(false);
-    setPlanId('');
-    setPhaseId('');
-    if (!target || localSnapshot) return;
-    let current = true;
-    void api.uiState(target.projectId, 'plans').then((snapshot) => {
-      if (current) setRemoteSnapshot(snapshot);
-    }).catch(() => {
-      if (current) setLoadError(true);
-    });
-    return () => { current = false; };
-  }, [localSnapshot, target]);
-
-  const placementPlans = useMemo(
-    () => activePlacementPlans(localSnapshot ?? remoteSnapshot),
-    [localSnapshot, remoteSnapshot],
-  );
-  const placementPhases = placementPlans.find((plan) => plan.id === planId)?.phases ?? [];
-  const loading = !!target && !localSnapshot && !remoteSnapshot && !loadError;
-  const { busy, error, run } = useSubmit(async () => {
-    await store.actions.submitProposalAcceptance(phaseId || undefined);
-  });
-  if (!target) return null;
-
-  return (
-    <Modal
-      title={`Accept ${target.taskKey}`}
-      subtitle="make it available as standalone work, or place it directly in a plan phase"
-      onClose={store.actions.closeModal}
-      width={500}
-    >
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
-        <Field label="Plan" hint="optional">
-          <Select
-            aria-label="Proposal plan"
-            value={planId}
-            disabled={loading}
-            onChange={(event) => { setPlanId(event.target.value); setPhaseId(''); }}
-          >
-            <option value="">— no plan —</option>
-            {placementPlans.map((plan) => (
-              <option key={plan.id} value={plan.id}>{plan.title}{plan.status === 'proposed' ? ' · proposed' : ''}</option>
-            ))}
-          </Select>
-        </Field>
-        <Field label="Phase" hint={planId ? 'required for this plan' : 'standalone task'}>
-          <Select aria-label="Proposal phase" value={phaseId} disabled={!planId} onChange={(event) => setPhaseId(event.target.value)}>
-            <option value="">— {planId ? 'choose phase' : 'none'} —</option>
-            {placementPhases.map((phase) => <option key={phase.id} value={phase.id}>{phase.title}</option>)}
-          </Select>
-        </Field>
-      </div>
-      {loading && <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', marginBottom: 10 }}>loading project plans…</div>}
-      {loadError && <div style={{ fontSize: 11.5, color: 'var(--amber)', marginBottom: 10 }}>Plans could not be loaded. You can still accept this as a standalone task.</div>}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 }}>
-        <ErrorNote>{error}</ErrorNote>
-        <div style={{ flex: 1 }} />
-        <Button variant="ghost" onClick={store.actions.closeModal}>Cancel</Button>
-        <Button disabled={busy || loading || (!!planId && !phaseId)} onClick={run}>
-          {phaseId ? 'Accept into phase' : 'Accept standalone'}
-        </Button>
       </div>
     </Modal>
   );

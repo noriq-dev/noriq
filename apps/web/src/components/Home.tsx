@@ -23,7 +23,7 @@ function AttentionSection({ store }: { store: AppStore }) {
     load();
     const iv = setInterval(load, 45000);
     return () => clearInterval(iv);
-  }, [store.proposalDecisionRevision]);
+  }, []);
 
   if (!att || (att.signals.length === 0 && att.proposed.length === 0 && att.overdue.length === 0)) return null;
   const sevColor: Record<string, string> = { critical: 'var(--red-soft)', warning: 'var(--amber)', info: 'var(--blue)' };
@@ -122,9 +122,10 @@ function AttentionSection({ store }: { store: AppStore }) {
                     <Button
                       variant="primary"
                       style={{ padding: '4px 10px', fontSize: 11 }}
-                      onClick={(event) => {
+                      onClick={async (event) => {
                         event.stopPropagation();
-                        actions.openProposalAccept(task.projectId, task.id, task.key);
+                        await api.acceptProposal(task.projectId, task.id);
+                        load();
                       }}
                     >
                       Accept

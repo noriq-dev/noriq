@@ -474,9 +474,7 @@ export const api = {
   approvePlan: (pid: string, plid: string) => req<{ id: string; status: string; tasksUngated: number }>('POST', `/api/projects/${pid}/plans/${plid}/approve`),
   rejectPlan: (pid: string, plid: string) => req<{ ok: boolean; cancelledTasks: number }>('POST', `/api/projects/${pid}/plans/${plid}/reject`),
   // Spin-off gate (PLNR-230): accept → plain claimable todo; reject → cancelled (provenance kept).
-  acceptProposal: (pid: string, tid: string, phaseId?: string) => req<{ id: string; key: string; status: string }>(
-    'POST', `/api/projects/${pid}/tasks/${tid}/proposal/accept`, phaseId ? { phaseId } : {},
-  ),
+  acceptProposal: (pid: string, tid: string) => req<{ id: string; key: string; status: string }>('POST', `/api/projects/${pid}/tasks/${tid}/proposal/accept`),
   rejectProposal: (pid: string, tid: string) => req<{ id: string; key: string; status: string }>('POST', `/api/projects/${pid}/tasks/${tid}/proposal/reject`),
   deleteTask: (pid: string, tid: string) => req('DELETE', `/api/projects/${pid}/tasks/${tid}`),
   deleteProject: (pid: string) => req('DELETE', `/api/projects/${pid}`),

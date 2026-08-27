@@ -27,9 +27,8 @@ const project: ProjectVM = {
 function store(projects: ProjectVM[] = [project]): AppStore {
   return {
     user: { id: 'usr_1', name: 'Mara Chen' }, groups: [], currentPid: 'prj_other', data: { projects },
-    proposalDecisionRevision: 0,
     permissions: { canCreateProjects: true },
-    actions: { selectProject: vi.fn(), openTask: vi.fn(), openProposalAccept: vi.fn(), createProject: vi.fn() },
+    actions: { selectProject: vi.fn(), openTask: vi.fn(), createProject: vi.fn() },
   } as unknown as AppStore;
 }
 
@@ -77,6 +76,7 @@ describe('Home phone composition', () => {
         projectId: project.id, projectKey: project.key,
       }],
     });
+    const accept = vi.spyOn(api, 'acceptProposal').mockResolvedValue({ id: 'task_proposed', key: 'MOB-6', status: 'todo' });
     container = document.createElement('div');
     document.body.appendChild(container);
     root = createRoot(container);
@@ -100,7 +100,7 @@ describe('Home phone composition', () => {
     const acceptButton = [...container.querySelectorAll<HTMLButtonElement>('button')]
       .find((button) => button.textContent?.trim() === 'Accept')!;
     await act(async () => { acceptButton.click(); });
-    expect(homeStore.actions.openProposalAccept).toHaveBeenCalledWith(project.id, 'task_proposed', 'MOB-6');
+    expect(accept).toHaveBeenCalledWith(project.id, 'task_proposed');
     expect(homeStore.actions.selectProject).not.toHaveBeenCalled();
     expect(homeStore.actions.openTask).not.toHaveBeenCalled();
 

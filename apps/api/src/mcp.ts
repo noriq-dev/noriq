@@ -1198,7 +1198,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           proposal: z.object({
             finding: z.string().min(1),
             sourceTaskId: z.string().optional(),
-          }).optional().describe('Create this item proposed and inert until a human accepts it'),
+          }).optional().describe('Create this item proposed and inert until a human accepts it. If the work belongs in a plan, set `phaseId` here — placement is the proposer\'s call; accepting only lifts the gate and never moves the task'),
         }),
       ).min(1).max(100),
     },

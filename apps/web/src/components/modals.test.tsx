@@ -92,24 +92,4 @@ describe('task plan placement', () => {
       title: 'Place this work', phaseId: 'phase_ship',
     }));
   });
-
-  it('loads the owning project for cross-project proposal placement', async () => {
-    vi.spyOn(api, 'uiState').mockResolvedValue(placementSnapshot as ApiSnapshot);
-    const submitProposalAcceptance = vi.fn().mockResolvedValue(undefined);
-    mount({
-      modal: 'proposal', currentPid: 'prj_other', snapshot: null,
-      proposalTarget: { projectId: 'prj_owner', taskId: 'task_1', taskKey: 'OWN-1' },
-      actions: { closeModal: vi.fn(), submitProposalAcceptance },
-    } as unknown as AppStore);
-    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
-
-    expect(api.uiState).toHaveBeenCalledWith('prj_owner', 'plans');
-    await act(async () => { dropdown('Proposal plan').click(); });
-    expect([...container.querySelectorAll<HTMLElement>('[role="option"]')].map((option) => option.textContent?.trim())).not.toContain('Retired plan');
-    await act(async () => { dropdown('Proposal plan').click(); });
-    await choose('Proposal plan', 'Release plan');
-    await choose('Proposal phase', 'Build');
-    await act(async () => { button('Accept into phase').click(); });
-    expect(submitProposalAcceptance).toHaveBeenCalledWith('phase_build');
-  });
 });

@@ -81,7 +81,6 @@ function mount(taskList?: TaskVM[], permissions = { canContribute: false, canMan
       openTask: vi.fn(),
       setDraggedId: vi.fn(),
       acceptProposal: vi.fn(),
-      openProposalAccept: vi.fn(),
       rejectProposal: vi.fn(),
     },
   } as unknown as AppStore;
@@ -121,7 +120,7 @@ describe('Board plan membership filter', () => {
     expect(container.textContent).toContain('✓ accept');
     expect(container.textContent).toContain('✕ reject');
     act(() => [...container.querySelectorAll<HTMLButtonElement>('button')].find((button) => button.textContent?.includes('✓ accept'))!.click());
-    expect(desktopStore.actions.openProposalAccept).toHaveBeenCalledWith('project_board', 'task_proposed', 'BRD-9');
+    expect(desktopStore.actions.acceptProposal).toHaveBeenCalledWith('task_proposed');
 
     act(() => root?.unmount());
     container.remove();
@@ -134,7 +133,7 @@ describe('Board plan membership filter', () => {
     expect(container.textContent).toContain('✓ accept');
     expect(container.textContent).toContain('✕ reject');
     act(() => [...container.querySelectorAll<HTMLButtonElement>('button')].find((button) => button.textContent?.includes('✓ accept'))!.click());
-    expect(phoneStore.actions.openProposalAccept).toHaveBeenCalledWith('project_board', 'task_proposed', 'BRD-9');
+    expect(phoneStore.actions.acceptProposal).toHaveBeenCalledWith('task_proposed');
   });
 
   it('renders one touch-selected lane without drag or bulk controls on phones', () => {

@@ -212,7 +212,7 @@ export function Board({ store }: { store: AppStore }) {
                   <div style={{ fontSize: 14, lineHeight: 1.45, color: 'var(--text)' }}>{task.title}</div>
                   {task.status === 'proposed' && store.permissions.canContribute && (
                     <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
-                      <Button variant="primary" style={{ minHeight: MIN_TOUCH_TARGET, padding: '5px 13px' }} onClick={(event) => { event.stopPropagation(); actions.openProposalAccept(currentPid, task.id, task.key); }}>✓ accept</Button>
+                      <Button variant="primary" style={{ minHeight: MIN_TOUCH_TARGET, padding: '5px 13px' }} onClick={(event) => { event.stopPropagation(); void actions.acceptProposal(task.id); }}>✓ accept</Button>
                       <Button variant="danger" style={{ minHeight: MIN_TOUCH_TARGET, padding: '5px 13px' }} onClick={async (event) => { event.stopPropagation(); if (await confirm(`Reject proposal ${task.key}? The task is cancelled (its finding stays on record).`)) void actions.rejectProposal(task.id); }}>✕ reject</Button>
                     </div>
                   )}
@@ -560,7 +560,7 @@ export function Board({ store }: { store: AppStore }) {
                             <Button
                               variant="primary"
                               style={{ fontSize: 10.5, padding: '3px 10px' }}
-                              onClick={(e) => { e.stopPropagation(); actions.openProposalAccept(currentPid, t.id, t.key); }}
+                              onClick={(e) => { e.stopPropagation(); void actions.acceptProposal(t.id); }}
                             >
                               ✓ accept
                             </Button>

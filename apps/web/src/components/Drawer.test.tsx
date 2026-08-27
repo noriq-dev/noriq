@@ -23,7 +23,7 @@ const tick = () => act(async () => { await new Promise((resolve) => setTimeout(r
 
 function mount(selectedTask: TaskVM = task, permissions = { canContribute: true, canManage: true }) {
   const moveTask = vi.fn();
-  const openProposalAccept = vi.fn();
+  const acceptProposal = vi.fn();
   const store = {
     currentPid: 'prj_plnr',
     selectedTaskId: selectedTask.id,
@@ -41,7 +41,7 @@ function mount(selectedTask: TaskVM = task, permissions = { canContribute: true,
     actions: {
       closeTask: vi.fn(), refreshNow: vi.fn(), restoreTask: vi.fn(), archiveTask: vi.fn(),
       deleteTask: vi.fn(), openTask: vi.fn(), removeDependency: vi.fn(), addDependency: vi.fn(),
-      claimToggle: vi.fn(), answerSignal: vi.fn(), acknowledgeSignal: vi.fn(), acceptProposal: vi.fn(), openProposalAccept,
+      claimToggle: vi.fn(), answerSignal: vi.fn(), acknowledgeSignal: vi.fn(), acceptProposal,
       rejectProposal: vi.fn(), setView: vi.fn(), resolveComment: vi.fn(), cycleKind: vi.fn(),
       setDraftText: vi.fn(), postComment: vi.fn(), moveTask,
     },
@@ -51,7 +51,7 @@ function mount(selectedTask: TaskVM = task, permissions = { canContribute: true,
   document.body.appendChild(container);
   root = createRoot(container);
   act(() => root!.render(<Drawer store={store} />));
-  return { moveTask, openProposalAccept };
+  return { moveTask, acceptProposal };
 }
 
 beforeEach(() => {
@@ -141,7 +141,7 @@ describe('task detail editing (PLNR-429)', () => {
   });
 
   it('lets contributors decide a proposed task from its drawer', async () => {
-    const { openProposalAccept } = mount({
+    const { acceptProposal } = mount({
       ...task,
       status: 'proposed',
       proposedAt: '2026-08-14T12:00:00.000Z',
@@ -158,7 +158,7 @@ describe('task detail editing (PLNR-429)', () => {
     expect(container.querySelector('.task-drawer')?.textContent).toContain('Accept');
     expect(container.querySelector('.task-drawer')?.textContent).toContain('Reject');
     act(() => [...container.querySelectorAll<HTMLButtonElement>('button')].find((button) => button.textContent?.trim() === 'Accept')!.click());
-    expect(openProposalAccept).toHaveBeenCalledWith('prj_plnr', task.id, task.key);
+    expect(acceptProposal).toHaveBeenCalledWith(task.id);
   });
 
   it('retains Runner run provenance when it is available', async () => {

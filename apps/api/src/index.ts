@@ -2897,15 +2897,8 @@ app.post('/api/projects/:pid/plans/:plid/reject', userAuth, async (c) =>
 // The spin-off gate's task-level twin (PLNR-230): accept a run agent's proposed spin-off
 // (→ plain claimable todo) or reject it (→ cancelled; provenance kept). Same project-reach
 // gating as the plan gate above.
-app.post('/api/projects/:pid/tasks/:tid/proposal/accept', userAuth, async (c) => {
-  const body = await c.req.json<{ phaseId?: unknown }>().catch((): { phaseId?: unknown } => ({}));
-  if (body.phaseId !== undefined && (typeof body.phaseId !== 'string' || !body.phaseId.trim())) {
-    return c.json({ error: 'phaseId must be a non-empty string' }, 400);
-  }
-  return c.json(await room(c.env, c.req.param('pid')!).acceptProposal(
-    c.req.param('pid')!, humanActor(c), c.req.param('tid')!, body.phaseId as string | undefined,
-  ));
-});
+app.post('/api/projects/:pid/tasks/:tid/proposal/accept', userAuth, async (c) =>
+  c.json(await room(c.env, c.req.param('pid')!).acceptProposal(c.req.param('pid')!, humanActor(c), c.req.param('tid')!)));
 app.post('/api/projects/:pid/tasks/:tid/proposal/reject', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).rejectProposal(c.req.param('pid')!, humanActor(c), c.req.param('tid')!)));
 

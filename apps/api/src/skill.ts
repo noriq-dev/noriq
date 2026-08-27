@@ -218,7 +218,8 @@ Working a **run** and found real work that is not your task's? Use \`create_task
 the finding becomes its own **proposed** task — visible on the board but unclaimable
 and undispatchable until a human accepts it (accept → todo) or rejects it (→
 cancelled) — with your run id, your task and the finding text recorded as durable
-provenance. Neither fold adjacent work into your diff nor \`raise_alert\` it: an alert
+provenance. If it belongs in a plan, set \`phaseId\` when you file it — placement is
+yours, not the accepter's. Neither fold adjacent work into your diff nor \`raise_alert\` it: an alert
 is a concern that is NOT work, a proposal is work that is not YOURS.
 
 ## Planning
