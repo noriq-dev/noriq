@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import type { ResourceSpec, ToolSpec } from './mcp';
 
+const CONSTRAINT_KEYS = ['minLength', 'maxLength', 'minimum', 'maximum', 'pattern', 'enum', 'minItems', 'maxItems'] as const;
+
 export interface McpCatalogAuditFinding {
   code: string;
   subject: string;
@@ -33,7 +35,18 @@ export function auditMcpCatalog(input: { tools: ToolSpec[]; resources: ResourceS
     if (tool.description.trim().length < 40) add('weak-description', tool.name, 'description is too short to teach selection and behavior');
 
     try {
-      z.toJSONSchema(z.object(tool.inputSchema), { io: 'input', unrepresentable: 'any' });
+      const json = z.toJSONSchema(z.object(tool.inputSchema), { io: 'input', unrepresentable: 'any' }) as {
+        properties?: Record<string, Record<string, unknown>>;
+      };
+      // PLNR-551: a limit the agent can only discover from the -32602 rejection is a trap. Every
+      // top-level field that carries a constraint must also say, in words, what the constraint
+      // means (nested shapes are the shared-schema's responsibility, checked where they live).
+      for (const [field, prop] of Object.entries(json.properties ?? {})) {
+        const constrained = CONSTRAINT_KEYS.some((key) => key in prop);
+        if (constrained && typeof prop.description !== 'string') {
+          add('undescribed-constraint', `${tool.name}.${field}`, 'field carries a limit/enum/pattern but no description explaining it');
+        }
+      }
     } catch (error) {
       add('invalid-input-schema', tool.name, error instanceof Error ? error.message : String(error));
     }

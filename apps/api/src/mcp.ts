@@ -679,8 +679,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       'configure_agent',
       'Update this existing identity or project focus. Every Copilot receives the complete non-runner tool catalogue; Runner agents remain project-pinned.',
       {
-        name: z.string().min(2).max(40).regex(/^[a-z0-9][a-z0-9._-]*$/i, 'letters/digits/._-').optional(),
-        role: z.enum(['worker', 'orchestrator']).optional(),
+        name: z.string().min(2).max(40).regex(/^[a-z0-9][a-z0-9._-]*$/i, 'letters/digits/._-').optional().describe('Display name, 2-40 chars: letters/digits/._- (e.g. "codex-refactor"); shown wherever this agent is listed'),
+        role: z.enum(['worker', 'orchestrator']).optional().describe('worker = takes tasks; orchestrator = plans and dispatches for others'),
         projectId: z.string().optional().describe('Localize this agent to a project (recommended)'),
       },
       tool(async ({ name, role, projectId }) => {
@@ -722,8 +722,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     'create_project',
     'Create a project. key is the short task-key prefix (e.g. "PLN" → PLN-1, PLN-2…). Pass groupId (see list_groups) to file it under a group at birth — grouping SHARES the project with that group\'s members.',
     {
-      key: z.string().min(1).max(8).regex(/^[A-Z][A-Z0-9]*$/, 'uppercase letters/digits'),
-      name: z.string().min(1),
+      key: z.string().min(1).max(8).regex(/^[A-Z][A-Z0-9]*$/, 'uppercase letters/digits').describe('Short uppercase project key, 1-8 chars starting with a letter (e.g. "PLNR") — permanent, prefixes every task key'),
+      name: z.string().min(1).describe('Human-readable project name'),
       description: z.string().optional(),
       repoUrl: z.string().url().optional(),
       groupId: z.string().optional().describe('Group to file the project under — you must be an accepted member'),
@@ -779,13 +779,13 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     {
       projectId: z.string(),
       includeHistory: z.boolean().optional().describe('Include dormant, retired, archived and revoked actors'),
-      lifecycle: z.enum(AGENT_LIFECYCLES).optional(),
-      kind: z.enum(['agent', 'copilot']).optional(),
+      lifecycle: z.enum(AGENT_LIFECYCLES).optional().describe('Filter by lifecycle bucket (live = active claim/presence, recent, dormant, retired, archived, revoked)'),
+      kind: z.enum(['agent', 'copilot']).optional().describe('agent = runner-spawned per run; copilot = a human-authorized IDE/CLI session'),
       runnerId: z.string().optional(),
-      activeAfter: z.string().datetime().optional(),
-      activeBefore: z.string().datetime().optional(),
+      activeAfter: z.string().datetime().optional().describe('ISO-8601 datetime — only agents active at or after this instant'),
+      activeBefore: z.string().datetime().optional().describe('ISO-8601 datetime — only agents active at or before this instant'),
       cursor: z.string().optional(),
-      limit: z.number().int().min(1).max(100).optional(),
+      limit: z.number().int().min(1).max(100).optional().describe('Page size, 1-100 (default 50); use `cursor` from the previous page to continue'),
     },
     tool(async ({ projectId, includeHistory, lifecycle, kind, runnerId, activeAfter, activeBefore, cursor, limit }) => {
       const roster = await listAgentRoster(env, {
@@ -830,7 +830,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         missing: z.array(z.string().max(100)).max(32).optional(),
         reason: z.string().max(2_000).nullable().optional(),
       }).optional(),
-      createdAt: z.string().datetime().optional(),
+      createdAt: z.string().datetime().optional().describe('ISO-8601 datetime the orchestration began; defaults to now'),
     },
     tool(async ({ projectId, anchor, completeness, createdAt }) => createOrchestration(env, {
       projectId, anchor,
@@ -845,9 +845,9 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     {
       projectId: z.string(), orchestrationId: z.string(),
       parentExecutionId: z.string().nullable().optional(),
-      localNodeKey: z.string().min(1).max(160),
-      producerScope: z.string().min(1).max(240),
-      kind: ExecutionKind, role: ExecutionRole,
+      localNodeKey: z.string().min(1).max(160).describe('Key unique within producerScope, 1-160 chars (e.g. "stage/verify", "task/PLNR-12")'),
+      producerScope: z.string().min(1).max(240).describe('Namespace the producer owns, 1-240 chars (e.g. "run/<runId>") — the (producerScope, localNodeKey) pair makes redeclaration idempotent'),
+      kind: ExecutionKind.describe('Node granularity: copilot_session, run, sitting, stage, step, or gate'), role: ExecutionRole.describe('What the node does: orchestrator, planner, worker, reviewer, verifier, repair, or system'),
       presenceId: z.string().nullable().optional(),
       subject: z.object({
         taskId: z.string().nullable().optional(), planId: z.string().nullable().optional(),
@@ -860,7 +860,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         missing: z.array(z.string().max(100)).max(32).optional(),
         reason: z.string().max(2_000).nullable().optional(),
       }).optional(),
-      continuesExecutionId: z.string().optional(), observedAt: z.string().datetime(),
+      continuesExecutionId: z.string().optional(), observedAt: z.string().datetime().describe('ISO-8601 datetime the node was observed to start'),
     },
     tool(async (input) => declareExecution(env, {
       ...input, actor: { kind: agent.kind, id: agent.id },
@@ -872,8 +872,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     'Idempotently add a typed non-tree relationship between two nodes in one authorized orchestration. Cyclic continues and depends_on relationships are rejected.',
     {
       projectId: z.string(), orchestrationId: z.string(),
-      fromExecutionId: z.string(), toExecutionId: z.string(), type: ExecutionRelationType,
-      metadata: z.record(z.string(), z.unknown()).optional(), createdAt: z.string().datetime().optional(),
+      fromExecutionId: z.string(), toExecutionId: z.string(), type: ExecutionRelationType.describe('continues, verifies, repairs, hands_off_to, or depends_on (from → to)'),
+      metadata: z.record(z.string(), z.unknown()).optional(), createdAt: z.string().datetime().optional().describe('ISO-8601 datetime the relation was established; defaults to now'),
     },
     tool(async (input) => addExecutionRelation(env, input)),
   );
@@ -883,8 +883,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     'Apply one revisioned lifecycle event to an execution. Replaying the same event or identical node revision is a no-op; gaps, conflicts, impossible transitions, and terminal resurrection are rejected.',
     {
       projectId: z.string(), orchestrationId: z.string(), executionId: z.string(),
-      eventId: z.string().min(1).max(160), revision: z.number().int().positive(),
-      type: ExecutionEventType, observedAt: z.string().datetime(),
+      eventId: z.string().min(1).max(160).describe('Producer-chosen id unique per execution, 1-160 chars — resending the same eventId is a no-op'), revision: z.number().int().positive().describe('Monotonic revision of this execution (previous + 1); a stale revision is rejected'),
+      type: ExecutionEventType.describe('Lifecycle transition being reported'), observedAt: z.string().datetime().describe('ISO-8601 datetime the transition was observed'),
       reason: z.string().max(2_000).nullable().optional(),
       metadata: z.record(z.string(), z.unknown()).optional(),
     },
@@ -941,8 +941,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     'save_template',
     'Save a reusable work template — a plan skeleton (title/body/taskDefaults/phases with newTasks) you can stamp into ANY project later with create_plan with templateId. Save the shapes your team repeats: "ship a feature", "security review", "release checklist". Templates are yours (user-owned), not project-bound. A task\'s executionSpec travels with the template — it is part of the shape, not a per-project id.',
     {
-      name: z.string().min(1).max(80),
-      description: z.string().max(300).optional(),
+      name: z.string().min(1).max(80).describe('Template name, 1-80 chars — what list_templates shows'),
+      description: z.string().max(300).optional().describe('One line (max 300 chars): what the template is for'),
       spec: z.object({
         title: z.string().min(1).describe('Default plan title (instantiation may override)'),
         description: z.string().optional(),
@@ -1034,7 +1034,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
   defineTool(
     'get_doc',
     'Read a project doc in full (markdown), plus its immutable version index and the tasks that cite it. Omit version for the current body or pass a version number to read that historical snapshot. Archived docs remain readable by exact id but are absent from list_docs and search. What the current version states is settled — build to it; if reality has moved on, restore if needed and update_doc to the new truth rather than silently deviating.',
-    { projectId: z.string(), docId: z.string(), version: z.number().int().positive().optional() },
+    { projectId: z.string(), docId: z.string(), version: z.number().int().positive().optional().describe('Read a specific historical version (1-based); omit for the current one') },
     tool(async ({ projectId, docId, version }) => {
       const current = await env.DB.prepare(
         `SELECT d.id, d.name, d.description, d.body, d.folder, d.author_kind AS authorKind,
@@ -1073,7 +1073,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     'Record a SETTLED decision or established fact as a project doc (markdown). FIRST doc of your session? Read the authoring guide first — resources/read noriq://skill/doc-authoring (or GET /skill/docs.md) — it covers what belongs in a doc, the shapes that work, and placement. The contract (enforced): docs are static, complete entities stating explicit design decisions and facts — no TBD/TODO, no open questions, no "we should discuss". An undecided point is never encoded as fact: settle it (request_input) if it blocks the doc\'s central claim, or scope the doc to exclude it and ship what IS settled. Give it a clear name and one-line description (the pair future agents scan in list_docs), and link it to the tasks that implement it via create_tasks/update_tasks docIds. For revising an existing doc use update_doc.',
     {
       projectId: z.string(),
-      name: z.string().min(1).max(120),
+      name: z.string().min(1).max(120).describe('Doc title, 1-120 chars — the name agents scan in list_docs'),
       description: z.string().max(300).optional().describe('One line (max 300 chars): what a reader finds inside'),
       body: z.string().optional().describe('The document, markdown'),
       folder: z.string().max(200).optional().describe('Folder path for human browsing, e.g. "design/networking" — organizational only, the doc is always addressed by its id. Reuse existing folders (see list_docs) before minting new ones.'),
@@ -1092,7 +1092,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     {
       projectId: z.string(),
       docId: z.string(),
-      name: z.string().min(1).max(120).optional(),
+      name: z.string().min(1).max(120).optional().describe('New doc title, 1-120 chars'),
       description: z.string().max(300).optional().describe('One line (max 300 chars): what a reader finds inside'),
       body: z.string().optional().describe('Full replacement markdown'),
       folder: z.string().max(200).optional().describe('Move the doc to this folder path ("" = root) — organizational only, links and ids are unaffected'),
@@ -1200,7 +1200,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
             sourceTaskId: z.string().optional(),
           }).optional().describe('Create this item proposed and inert until a human accepts it. If the work belongs in a plan, set `phaseId` here — placement is the proposer\'s call; accepting only lifts the gate and never moves the task'),
         }),
-      ).min(1).max(100),
+      ).min(1).max(100).describe('1-100 items per call'),
     },
     tool(async ({ projectId, defaults, allowNewTags, tasks }) => {
       if (agent.kind === 'agent' && tasks.some((item: { proposal?: unknown }) => !item.proposal)) {
@@ -1392,7 +1392,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           kind: z.enum(['branch', 'pr', 'commit']), ref: z.string().min(1),
           url: z.string().url().optional(), state: z.string().optional(),
         })).optional(),
-      })).min(1).max(100),
+      })).min(1).max(100).describe('1-100 items per call'),
     },
     tool(async ({ projectId, defaults, tasks }) => {
       let r = room(env, projectId);
@@ -1591,8 +1591,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       projectId: z.string().optional().describe('Restrict to one project; omit for everything your credential reaches'),
       // The WIRE vocabulary, derived statuses included: the filter matches what the results
       // are labeled with ('failed' from failed_at, 'proposed' from proposed_at — PLNR-230).
-      status: z.enum(['todo', 'in_progress', 'blocked', 'review', 'failed', 'proposed', 'done', 'cancelled']).optional(),
-      type: z.enum(['feature', 'bug', 'chore', 'research']).optional(),
+      status: z.enum(['todo', 'in_progress', 'blocked', 'review', 'failed', 'proposed', 'done', 'cancelled']).optional().describe('Exact wire status; proposed = awaiting a human accept, failed = last run failed'),
+      type: z.enum(['feature', 'bug', 'chore', 'research']).optional().describe('Task type'),
       tag: z.string().optional().describe('Tag name (exact, case-insensitive)'),
       milestoneId: z.string().optional(),
       holder: z.string().optional().describe("'me' (your claims), 'none' (unclaimed), or an agent id"),
@@ -1711,7 +1711,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           z.object({ kind: z.literal('inline'), data: z.string().min(1) }),
           z.object({ kind: z.literal('upload') }),
         ]),
-      })).min(1).max(20),
+      })).min(1).max(20).describe('1-20 files per call'),
     },
     tool(async ({ projectId, taskId, files }) => {
       if (!env.FILES) throw new Error('attachments not configured on this instance — enable R2 and bind FILES');
@@ -1846,7 +1846,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     {
       projectId: z.string(),
       taskId: z.string(),
-      toStatus: z.enum(['todo', 'review', 'done', 'blocked']).optional(),
+      toStatus: z.enum(['todo', 'review', 'done', 'blocked']).optional().describe('Where the task lands: review (default — finished, needs eyes), done, todo (give it back), or blocked'),
       comment: z.string().optional().describe('Closing thoughts / handoff notes to record on the task'),
       commitId: z.string().min(1).optional().describe('Exact opaque VCS commit/base identifier produced by this work; stored as the task commit ref without parsing or normalization'),
       workEvidence: z.object({
@@ -1930,7 +1930,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       + 'on file locking.',
     {
       projectId: z.string(),
-      paths: z.array(z.string().min(1)).min(1),
+      paths: z.array(z.string().min(1)).min(1).describe('Repo-relative paths to inspect (at least one)'),
       branch: z.string().optional(),
       allBranches: z.boolean().optional(),
     },
@@ -1962,8 +1962,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     {
       projectId: z.string(),
       taskId: z.string().describe('Task id or display key'),
-      kind: z.enum(['comment', 'reply']).default('comment'),
-      body: z.string().min(1),
+      kind: z.enum(['comment', 'reply']).default('comment').describe('comment = new thread; reply = answer inside the thread given by parentCommentId'),
+      body: z.string().min(1).describe('Comment text, markdown'),
       parentCommentId: z.string().optional(),
     },
     tool(async ({ projectId, taskId, kind, body, parentCommentId }) =>
@@ -1986,8 +1986,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     {
       projectId: z.string(),
       commentId: z.string(),
-      resolution: z.enum(['addressed', 'wont_do']),
-      reply: z.string().min(1),
+      resolution: z.enum(['addressed', 'wont_do']).describe('addressed = you did what was asked; wont_do = deliberately declined (say why in reply)'),
+      reply: z.string().min(1).describe('The substantive answer posted with the resolution'),
     },
     tool(async ({ projectId, commentId, resolution, reply }) =>
       room(env, projectId).resolveComment(projectId, actor, commentId, resolution, reply),
@@ -2001,7 +2001,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     'Message another agent (toAgentId, from list_agents) or broadcast to the project (omit toAgentId). Recipients see it in my_updates/notices. For narrative coordination only — a decision you need from a human is request_input (messages read as status and go unanswered), and a note that belongs on a task is post_comment (messages are not attached to tasks).',
     {
       projectId: z.string(),
-      body: z.string().min(1),
+      body: z.string().min(1).describe('Message text'),
       toAgentId: z.string().optional(),
       refTaskId: z.string().optional().describe('Task id or display key this message references'),
     },
@@ -2052,7 +2052,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     {
       projectId: z.string(),
       taskId: z.string().optional().describe('Task id or display key'),
-      title: z.string().min(1),
+      title: z.string().min(1).describe('One-line summary of the concern'),
       body: z.string().optional(),
       severity: z.enum(['info', 'warning', 'critical']).optional().describe('default info'),
     },
@@ -2071,7 +2071,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     {
       projectId: z.string(),
       templateId: z.string().optional().describe('Instantiate a saved template; mutually exclusive with inline phases/taskDefaults/body/description'),
-      title: z.string().min(1).optional(),
+      title: z.string().min(1).optional().describe('Plan title (required unless templateId supplies one)'),
       description: z.string().optional().describe('One-line summary shown on the plan card'),
       body: z.string().optional().describe('The full plan document (markdown): goals, approach, constraints, exit gate'),
       proposed: z.boolean().optional().describe('Emit as a PROPOSED plan awaiting human approval — its tasks are NOT claimable/dispatchable until someone approves it in the dashboard. Scope-mode Runner agents set this; a normal plan you intend to drain yourself does not.'),
@@ -2103,7 +2103,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
             executionSpec: ExecutionSpec.nullish(),
           })).optional(),
         }),
-      ).min(1).max(12).optional(),
+      ).min(1).max(12).optional().describe('1-12 ordered phases; phase order gates the work'),
     },
     tool(async ({ projectId, templateId, title, description, body, proposed, taskDefaults, phases }) => {
       if (templateId) {
@@ -2206,7 +2206,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     {
       projectId: z.string(),
       planId: z.string(),
-      name: z.string().min(1).max(120),
+      name: z.string().min(1).max(120).describe('Plan doc title, 1-120 chars'),
       description: z.string().max(300).optional().describe('One line (max 300 chars): what a reader finds inside'),
       body: z.string().optional().describe('The document, markdown — may be provisional'),
     },
@@ -2220,7 +2220,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     {
       projectId: z.string(),
       docId: z.string(),
-      name: z.string().min(1).max(120).optional(),
+      name: z.string().min(1).max(120).optional().describe('New plan doc title, 1-120 chars'),
       description: z.string().max(300).optional().describe('One line (max 300 chars): what a reader finds inside'),
       body: z.string().optional().describe('Full replacement markdown'),
     },
@@ -2250,8 +2250,8 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
     'Create a milestone in a project. `description` is the goal — what "done" means. Assign tasks to it via update_tasks.milestoneId, or in bulk via create_tasks/create_plan taskDefaults.',
     {
       projectId: z.string(),
-      title: z.string().min(1),
-      dueAt: z.string().datetime().optional(),
+      title: z.string().min(1).describe('Milestone title'),
+      dueAt: z.string().datetime().optional().describe('ISO-8601 datetime the milestone is due'),
       description: z.string().optional().describe('The goal / exit criteria for this milestone'),
     },
     tool(async ({ projectId, title, dueAt, description }) => room(env, projectId).createMilestone(projectId, actor, title, dueAt, description)),
@@ -2415,7 +2415,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       baseId: z.string().optional().describe('Your current opaque VCS revision (§6) — scopes which citations read as verified FOR YOU'),
       role: ContextPackRole.optional().describe('Reweights section budgets toward what that role needs most (scope/build/verify/human); defaults from your own agent kind'),
       budgetTokens: z.number().int().positive().optional().describe('Approximate token budget, converted to a character budget deterministically (no tokenizer); omitted uses a generous fixed default'),
-      intelligenceDetail: z.enum(['none', 'summary', 'full']).default('summary'),
+      intelligenceDetail: z.enum(['none', 'summary', 'full']).default('summary').describe('How much memory/graph intelligence to pack: none (task facts only), summary (default), full'),
     },
     tool(async ({ projectId, taskId, repositoryKey, branch, baseId, role, budgetTokens, intelligenceDetail }) => {
       const resolvedTaskId = await resolveTaskId(env, projectId, taskId);
