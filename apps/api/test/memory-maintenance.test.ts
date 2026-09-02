@@ -327,8 +327,8 @@ describe('decay joins the existing lifecycle sweep — no second scheduler', () 
     const { projectId } = await newOwnedProject('pm-maint-sweep@example.com', 'PMMNTSWP');
     const { memoryId } = await memory(projectId).recordMemory(projectId, { kind: 'learning', statement: 'swept away', actor: AGENT });
     await memory(projectId)._setMemoryRecordedAtForTest(projectId, memoryId, old());
-    // sweepProjectDebris only iterates registered projects — touch the DO via export so a
-    // registry row exists, same technique the existing lifecycle sweep tests use.
+    // sweepProjectDebris iterates registry UNION ingesting repositories (PLNR-553). Touch the
+    // DO via export so a registry row exists, same technique the lifecycle sweep tests use.
     const exported = await memory(projectId).exportSnapshot(projectId);
     if (!exported.ok) throw new Error('seed export failed');
 

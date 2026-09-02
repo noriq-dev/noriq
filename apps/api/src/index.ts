@@ -8,7 +8,7 @@ import { buildMcpServer, INSTRUCTIONS, GET_BRIEFING_PLAYBOOK } from './mcp';
 import { handleModernMcp, isModernMcpRequest } from './mcp-2026';
 import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot, importSnapshot } from './backup';
-import { sweepPendingErasures, sweepProjectDebris, sweepProjectDebrisForProject, listProjectBackupGenerations } from './memory/lifecycle';
+import { sweepPendingErasures, sweepProjectDebris, sweepProjectDebrisForProject, listProjectBackupGenerations, listMemoryLifecycleProjectIds } from './memory/lifecycle';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, timingSafeEqual, verifyPassword, verifyPasswordConstantTime } from './lib/util';
 import { searchWorkspaceEvidence, searchWorkspacePlans, searchWorkspaceTasks } from './lib/workspace-operations';
 import type { ExecutionSpecInput, RunStatus } from '@noriq-dev/shared';
@@ -6350,22 +6350,22 @@ export default {
           console.log(r.ok ? `[backup] wrote ${r.key}` : `[backup] skipped: ${r.reason}`);
         }),
       );
-      // ProjectMemory portable snapshots (PLNR-248): one per project that has ever touched its
-      // memory store (a project_memory_registry row exists — PLNR-246). A project that hasn't
-      // has nothing in ProjectMemory yet worth a backup. Each project's export is independent —
-      // one failure never blocks another's.
+      // ProjectMemory portable snapshots (PLNR-248/553): one per project that has a registry
+      // row OR an ingesting repository. Index ingest used to skip registry enrollment, so a
+      // project that only indexed was silently omitted. A project with neither has nothing in
+      // ProjectMemory yet worth a backup. Each project's export is independent — one failure
+      // never blocks another's.
       ctx.waitUntil(
-        env.DB.prepare('SELECT project_id FROM project_memory_registry')
-          .all<{ project_id: string }>()
-          .then(({ results }) =>
+        listMemoryLifecycleProjectIds(env)
+          .then((projectIds) =>
             Promise.all(
-              results.map((r) => runMemoryBackup(env, r.project_id, 'core', { alertOnFailure: true }).then((res) => {
+              projectIds.map((projectId) => runMemoryBackup(env, projectId, 'core', { alertOnFailure: true }).then((res) => {
                 if (res.ok) {
-                  console.log(`[memory-backup] ${r.project_id} wrote ${res.manifestKey} ${JSON.stringify(res.summary)}`);
+                  console.log(`[memory-backup] ${projectId} wrote ${res.manifestKey} ${JSON.stringify(res.summary)}`);
                 } else if (res.reason === 'R2 (FILES) not configured') {
-                  console.log(`[memory-backup] ${r.project_id} skipped: ${res.reason}`);
+                  console.log(`[memory-backup] ${projectId} skipped: ${res.reason}`);
                 } else {
-                  console.warn(JSON.stringify({ event: 'memory_backup_failed', projectId: r.project_id, reason: res.reason, summary: res.summary }));
+                  console.warn(JSON.stringify({ event: 'memory_backup_failed', projectId, reason: res.reason, summary: res.summary }));
                 }
               })),
             ),

@@ -27,7 +27,9 @@ D1 is the cross-project control plane. It intentionally does not contain the ful
 Each `ProjectMemory` Durable Object is authoritative for exactly one project's memory, evidence,
 episodes, code generations, and graph. The D1 `project_memory_registry` row is only a compact
 operational projection (backup, vector-dirty, and size status); never recover or infer the graph
-from that row.
+from that row. Daily backup and debris sweep also include projects whose `project_repositories`
+ingest has started even if that projection row is still missing (PLNR-553) — index ingest now
+enrolls the registry itself, and the sweep's health-refresh backfills any historical miss.
 
 Vector indexes are derived caches. Canonical authority, visibility, and validity are rechecked
 from D1/ProjectMemory after vector lookup. Backups do not trust or restore embeddings.

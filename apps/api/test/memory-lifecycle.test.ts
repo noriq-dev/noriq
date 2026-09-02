@@ -14,6 +14,7 @@ import {
   sweepProjectDebris,
   pruneBackupRetention,
   listProjectBackupGenerations,
+  listMemoryLifecycleProjectIds,
   STAGED_GENERATION_MAX_AGE_MS,
   RETAINED_GENERATION_MAX_AGE_MS,
 } from '../src/memory/lifecycle';
@@ -49,9 +50,15 @@ interface MemoryRpc {
   pruneRetainedGenerationIfExpired(pid: string, maxAgeMs: number): Promise<boolean>;
   recordGuidanceDriftScan(pid: string, surfaces: Partial<Record<SurfaceId, string | null>>): Promise<{ findings: number; newFindings: number }>;
   listGuidanceDriftFindings(pid: string): Promise<Array<{ id: string; ruleId: string }>>;
+  beginIndexIngest(pid: string, manifest: {
+    generationId: string; projectId: string; repositoryKey: string; branch: string; baseId: string;
+    indexerVersion: string; batchCount: number; fileCount: number; contentHash: string; deletions: string[]; createdAt: string;
+  }): Promise<{ ok: true }>;
 }
 interface RoomRpc {
   deleteProject(pid: string, actor: Actor): Promise<{ ok: true; key: string; name: string }>;
+  registerRepository(pid: string, actor: Actor, repositoryKey: string): Promise<{ id: string; created: boolean }>;
+  updateRepository(pid: string, actor: Actor, repositoryKey: string, patch: { ingestStatus?: 'none' | 'staged' | 'active' | 'failed' }): Promise<{ ok: true }>;
 }
 
 const memory = (pid: string) => appEnv.PROJECT_MEMORY.get(appEnv.PROJECT_MEMORY.idFromName(pid)) as unknown as MemoryRpc;
@@ -227,9 +234,9 @@ describe('debris pruning', () => {
 
   it('sweepProjectDebris is a no-op the second time it runs back to back', async () => {
     const { projectId } = await newOwnedProject('pm-life-sweep@example.com', 'PMLFSWP');
-    // sweepProjectDebris iterates project_memory_registry — a project with no registry row yet
-    // (nothing has exported/restored/registered against it) has nothing to sweep. Any of those
-    // calls upserts the row; exportSnapshot is the cheapest for this test's purposes.
+    // sweepProjectDebris iterates listMemoryLifecycleProjectIds (registry UNION ingesting
+    // repositories). A project with neither is skipped. exportSnapshot is the cheapest way
+    // to enroll a registry row for this test's purposes.
     const seedExport = await memory(projectId).exportSnapshot(projectId);
     if (!seedExport.ok) throw new Error('seed export failed');
     const old = new Date(Date.now() - STAGED_GENERATION_MAX_AGE_MS - 1000).toISOString();
@@ -242,6 +249,63 @@ describe('debris pruning', () => {
     const second = await sweepProjectDebris(appEnv);
     const secondForProject = second.find((r) => r.projectId === projectId);
     expect(secondForProject?.prunedStagedGenerations).toBe(0);
+  });
+});
+
+describe('lifecycle enrollment — indexed projects without a registry row (PLNR-553)', () => {
+  it('includes a project with an ingesting repository even if no registry row exists', async () => {
+    const { projectId } = await newOwnedProject('pm-life-enroll-repo@example.com', 'PMLFENR');
+    await room(projectId).registerRepository(projectId, actor, 'nod-like');
+    await room(projectId).updateRepository(projectId, actor, 'nod-like', { ingestStatus: 'active' });
+
+    const registry = await appEnv.DB.prepare('SELECT 1 FROM project_memory_registry WHERE project_id = ?').bind(projectId).first();
+    expect(registry).toBeNull();
+
+    const ids = await listMemoryLifecycleProjectIds(appEnv);
+    expect(ids).toContain(projectId);
+  });
+
+  it('does not include a registered repository that has never ingested — no empty DO to wake', async () => {
+    const { projectId } = await newOwnedProject('pm-life-enroll-none@example.com', 'PMLFENN');
+    await room(projectId).registerRepository(projectId, actor, 'never-ingested');
+
+    const ids = await listMemoryLifecycleProjectIds(appEnv);
+    expect(ids).not.toContain(projectId);
+  });
+
+  it('sweepProjectDebris enrolls that project via health-refresh', async () => {
+    const { projectId } = await newOwnedProject('pm-life-enroll-sweep@example.com', 'PMLFENS');
+    await room(projectId).registerRepository(projectId, actor, 'nod-sweep');
+    await room(projectId).updateRepository(projectId, actor, 'nod-sweep', { ingestStatus: 'staged' });
+
+    const first = await sweepProjectDebris(appEnv);
+    expect(first.find((r) => r.projectId === projectId)).toBeTruthy();
+
+    const registry = await appEnv.DB.prepare('SELECT schema_version FROM project_memory_registry WHERE project_id = ?')
+      .bind(projectId)
+      .first<{ schema_version: number }>();
+    expect(registry).not.toBeNull();
+    expect(registry!.schema_version).toBeGreaterThan(0);
+  });
+
+  it('beginIndexIngest projects a registry row so cron does not have to discover via repositories', async () => {
+    const { projectId } = await newOwnedProject('pm-life-enroll-begin@example.com', 'PMLFENB');
+    await memory(projectId).beginIndexIngest(projectId, {
+      generationId: 'gen_enroll',
+      projectId,
+      repositoryKey: 'enroll-repo',
+      branch: 'main',
+      baseId: 'sha_enroll',
+      indexerVersion: 'v1',
+      batchCount: 1,
+      fileCount: 1,
+      contentHash: '0'.repeat(64),
+      deletions: [],
+      createdAt: new Date().toISOString(),
+    });
+
+    const registry = await appEnv.DB.prepare('SELECT 1 FROM project_memory_registry WHERE project_id = ?').bind(projectId).first();
+    expect(registry).not.toBeNull();
   });
 });
 

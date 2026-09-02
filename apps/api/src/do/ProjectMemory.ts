@@ -2627,6 +2627,25 @@ export class ProjectMemory extends DurableObject<Env> {
     return row.key;
   }
 
+  /**
+   * Best-effort D1 registry enrollment (PLNR-553). Index ingest writes the DO without going
+   * through export/sweep, so a project that only indexes would otherwise never appear in
+   * `project_memory_registry` and would be skipped by daily backup + debris sweep. Uses
+   * `sql.databaseSize` rather than `health()`'s per-table COUNT(*)s. Failures are swallowed:
+   * the DO's own tables remain authority.
+   */
+  private async projectHealthToRegistry(projectId: string): Promise<void> {
+    const databaseSize = this.ctx.storage.sql.databaseSize;
+    await this.env.PROJECT_ROOM.get(this.env.PROJECT_ROOM.idFromName(projectId))
+      .upsertMemoryHealth(projectId, {
+        schemaVersion: this.readSchemaVersion(),
+        memoryRevision: this.readMemoryRevision(),
+        sizeBytes: databaseSize,
+        sizeStatus: sizeStatus(databaseSize),
+      })
+      .catch((err) => console.warn(`ProjectMemory health projection for ${projectId} failed: ${String(err)}`));
+  }
+
   async beginIndexIngest(projectId: string, manifest: IndexGenerationManifest): Promise<{ ok: true }> {
     await this.assertProjectId(projectId);
     IndexGenerationManifest.parse(manifest);
@@ -2647,34 +2666,35 @@ export class ProjectMemory extends DurableObject<Env> {
         && existing.deletions === JSON.stringify(manifest.deletions)
         && existing.created_at === manifest.createdAt;
       if (!same) throw new Error(`generation ${manifest.generationId} already began with a different manifest`);
-      return { ok: true };
+    } else {
+      const now = nowIso();
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO repositories (repository_key, created_at) VALUES (?1, ?2) ON CONFLICT (repository_key) DO NOTHING`,
+          manifest.repositoryKey,
+          now,
+        );
+        this.ctx.storage.sql.exec(
+          `INSERT INTO index_generations
+             (id, repository_key, branch, base_id, indexer_version, batch_count, file_count, content_hash,
+              deletions, predecessor_generation_id, status, created_at)
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,
+             (SELECT id FROM index_generations WHERE repository_key = ?2 AND status = 'active'),
+             'staged',?10)`,
+          manifest.generationId,
+          manifest.repositoryKey,
+          manifest.branch,
+          manifest.baseId,
+          manifest.indexerVersion,
+          manifest.batchCount,
+          manifest.fileCount,
+          manifest.contentHash,
+          JSON.stringify(manifest.deletions),
+          manifest.createdAt,
+        );
+      });
     }
-    const now = nowIso();
-    this.ctx.storage.transactionSync(() => {
-      this.ctx.storage.sql.exec(
-        `INSERT INTO repositories (repository_key, created_at) VALUES (?1, ?2) ON CONFLICT (repository_key) DO NOTHING`,
-        manifest.repositoryKey,
-        now,
-      );
-      this.ctx.storage.sql.exec(
-        `INSERT INTO index_generations
-           (id, repository_key, branch, base_id, indexer_version, batch_count, file_count, content_hash,
-            deletions, predecessor_generation_id, status, created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,
-           (SELECT id FROM index_generations WHERE repository_key = ?2 AND status = 'active'),
-           'staged',?10)`,
-        manifest.generationId,
-        manifest.repositoryKey,
-        manifest.branch,
-        manifest.baseId,
-        manifest.indexerVersion,
-        manifest.batchCount,
-        manifest.fileCount,
-        manifest.contentHash,
-        JSON.stringify(manifest.deletions),
-        manifest.createdAt,
-      );
-    });
+    await this.projectHealthToRegistry(projectId);
     return { ok: true };
   }
 
@@ -3061,6 +3081,9 @@ export class ProjectMemory extends DurableObject<Env> {
     await this.env.PROJECT_ROOM.get(this.env.PROJECT_ROOM.idFromName(projectId))
       .setRepositoryActiveGeneration(projectId, gen.repository_key, generationId)
       .catch((err) => console.warn(`ProjectMemory active-generation projection for ${projectId}/${gen.repository_key} failed: ${String(err)}`));
+    // Size will have grown with staged rows; refresh the registry projection so the next
+    // cron does not have to discover this project via project_repositories (PLNR-553).
+    await this.projectHealthToRegistry(projectId);
 
     return { activated: generationId, superseded, projection: projection! };
   }

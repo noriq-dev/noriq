@@ -155,6 +155,26 @@ export interface ProjectCleanupResult {
   errors: Array<{ step: string; message: string }>;
 }
 
+/**
+ * Projects whose ProjectMemory store should be backed up and debris-swept (PLNR-553).
+ *
+ * `project_memory_registry` is the operational projection, but it is only written by
+ * upsertMemoryHealth / updateMemoryBackupStatus / setMemoryVectorDirty — index ingest used
+ * to skip all three, so a project that only indexed never got a row and was silently omitted
+ * from cron backup and sweep. UNION in repositories that have actually started ingest
+ * (`ingest_status != 'none'`). A repository that is merely registered (`none`) has not
+ * touched the DO; including those would instantiate empty stores. A project with neither a
+ * registry row nor an ingesting repository is correctly omitted.
+ */
+export async function listMemoryLifecycleProjectIds(env: Env): Promise<string[]> {
+  const { results } = await env.DB.prepare(
+    `SELECT project_id FROM project_memory_registry
+     UNION
+     SELECT DISTINCT project_id FROM project_repositories WHERE ingest_status != 'none'`,
+  ).all<{ project_id: string }>();
+  return results.map((r) => r.project_id);
+}
+
 /** The single-project body of `sweepProjectDebris` below, extracted (PLNR-273) so an operator
  *  can trigger the same idempotent cleanup on demand for ONE project (a REST action) without
  *  waiting for the cron's pass over every registered project. Behavior is identical either
@@ -215,16 +235,18 @@ export async function sweepProjectDebrisForProject(env: Env, projectId: string):
   };
 }
 
-/** Per-project debris cleanup for every project with a memory registry row: abandoned staged
- *  index generations, an expired retained restore generation, backups beyond the retention
- *  count, and (PLNR-254) unused low-authority memory hypotheses past their decay age. Also
- *  refreshes the visible size status in the D1 registry — this sweep is the natural place for
- *  it: a periodic pass over every registered project, not an extra write on every health()
- *  read. Each project is independent — one failing never blocks the rest. */
+/** Per-project debris cleanup for every project that has a memory registry row OR an ingesting
+ *  repository (PLNR-553 — see `listMemoryLifecycleProjectIds`): abandoned staged index
+ *  generations, an expired retained restore generation, backups beyond the retention count,
+ *  and (PLNR-254) unused low-authority memory hypotheses past their decay age. Also refreshes
+ *  the visible size status in the D1 registry (and enrolls a missing registry row via
+ *  health-refresh) — this sweep is the natural place for it: a periodic pass over every
+ *  project that actually has a store, not an extra write on every health() read. Each project
+ *  is independent — one failing never blocks the rest. */
 export async function sweepProjectDebris(env: Env): Promise<ProjectCleanupResult[]> {
-  const { results } = await env.DB.prepare('SELECT project_id FROM project_memory_registry').all<{ project_id: string }>();
+  const projectIds = await listMemoryLifecycleProjectIds(env);
   const outcomes: ProjectCleanupResult[] = [];
-  for (const { project_id: projectId } of results) {
+  for (const projectId of projectIds) {
     outcomes.push(await sweepProjectDebrisForProject(env, projectId));
   }
   return outcomes;

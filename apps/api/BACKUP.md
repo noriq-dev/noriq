@@ -77,10 +77,13 @@ returns `503` with a reason — every other ProjectMemory operation (reads, writ
 keeps working regardless; backup is the one optional-binding feature here.
 
 **Schedule:** the same daily cron that runs the D1 backup (`0 6 * * *`) also exports a fresh
-snapshot for every project that has ever touched its memory store (i.e. has a row in the
-compact D1 `project_memory_registry` — a project that hasn't has nothing in ProjectMemory yet
-worth backing up). Each project's export is independent; one failing never blocks another's.
-Recent status is visible in that same registry row (`backup_status`, `last_backup_at`).
+snapshot for every project that has a `project_memory_registry` row **or** a
+`project_repositories` row whose `ingest_status` is not `none` (PLNR-553). Index ingest
+writes the Durable Object without going through export, so a project that only indexed used
+to be silently omitted from this pass. A project with neither has nothing in ProjectMemory
+yet worth backing up. Each project's export is independent; one failing never blocks
+another's. Recent status is visible in that same registry row (`backup_status`,
+`last_backup_at`) — the sweep's health-refresh enrolls a missing row on first contact.
 
 ### Restoring a ProjectMemory snapshot (PLNR-249)
 
@@ -265,8 +268,9 @@ sweep on demand: `POST /api/admin/memory-lifecycle-sweep`.
 
 The same sweep prunes debris on a policy timer: abandoned staged index generations, a restore's
 retained prior generation once its rollback window has passed, and backups beyond a keep-last-N
-retention count. All of it is idempotent — running the sweep twice in a row does nothing new
-the second time.
+retention count. It walks the same project set as the memory backup (registry UNION ingesting
+repositories — PLNR-553), so an indexed-but-never-exported project is not skipped. All of it
+is idempotent — running the sweep twice in a row does nothing new the second time.
 
 Per-project size is visible via `health()` (`databaseSize`, `sizeStatus`) and projected into
 `project_memory_registry.size_bytes`/`size_status` (migration 0073) by the same sweep. This is
