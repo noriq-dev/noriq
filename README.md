@@ -25,7 +25,7 @@ coordination layer — projects, tasks, dependencies, claims, plans, and messagi
   per-project path locks stop agents clobbering each other's edits, and curated tag
   vocabularies keep the filter language shared.
 - MCP clients authenticate via **OAuth 2.1** only (Claude Code, Codex, Copilot,
-  ChatGPT / OpenAI apps) — browser consent names the agent identity; no static API
+  ChatGPT / OpenAI apps, Grok) — browser consent names the agent identity; no static API
   keys to manage. Client registration supports **Client ID Metadata Documents**
   (URL-formatted `client_id`), **Dynamic Client Registration**, and the **device
   grant** (RFC 8628) for headless runners, so any client connects to a self-hosted

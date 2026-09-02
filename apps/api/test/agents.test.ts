@@ -212,8 +212,12 @@ describe('copilot / agent split', () => {
     expect(bound!.n).toBe(0);
   });
 
-  it('refuses a sessionless call instead of inventing somebody to be', async () => {
-    const res = await SELF.fetch('https://noriq.test/mcp', {
+  it('a sessionless call is attributable to the token (PLNR-552)', async () => {
+    // Pre-552 this 400'd ("no MCP session") because a random per-request identity would
+    // recreate the unattributable phantom 0026 deleted. The fallback is now the same
+    // `stateless:{tokenId}` key the 2026 path already used — one working copilot per
+    // connection, not a new row per call.
+    const call = () => SELF.fetch('https://noriq.test/mcp', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${conn.apiKey}`,
@@ -222,8 +226,17 @@ describe('copilot / agent split', () => {
       },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'get_briefing', arguments: {} } }),
     });
-    expect(res.status).toBe(400);
-    expect(await res.text()).toContain('no MCP session');
+    const parseId = async (res: Response) => {
+      expect(res.status).toBe(200);
+      const raw = await res.text();
+      const dataLine = raw.split('\n').filter((l) => l.startsWith('data:')).at(-1)?.slice(5).trim() ?? raw;
+      const text: string = JSON.parse(dataLine).result?.content?.[0]?.text ?? '';
+      return JSON.parse(text.split('\n\n--- notices ---\n')[0] ?? '').you.id as string;
+    };
+    const a = await parseId(await call());
+    const b = await parseId(await call());
+    expect(a).toBeDefined();
+    expect(a).toBe(b);
   });
 
   it('a revoked copilot cannot respawn itself by reusing its session id', async () => {

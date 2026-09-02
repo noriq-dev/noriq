@@ -5,6 +5,7 @@ import { resolveSessionAgent, type AppContext, type Connection } from './auth';
 import { buildMcpServer, INSTRUCTIONS, serverInfoForAgent } from './mcp';
 import { handleSubscriptionsListen } from './mcp-listen';
 import { copilotSessionContextFromMessages } from './lib/copilot-session';
+import { resolveCopilotSessionKey } from './lib/mcp-session-key';
 
 /**
  * MCP 2026-07-28 ("modern") compatibility layer — PLNR-233.
@@ -29,11 +30,12 @@ import { copilotSessionContextFromMessages } from './lib/copilot-session';
  *    JSON and SSE). Server notifications are NOT forwarded — the spec forbids
  *    `notifications/message` for requests that did not opt in via `_meta` logLevel, and
  *    the notices text block is Noriq's documented reliable channel anyway.
- *  - Identity: 2026-07-28 removed protocol sessions (SEP-2567), so a modern copilot is
- *    keyed by its OAuth token (`stateless:{tokenId}`) — one working identity per
- *    connection — or by `_meta["openai/session"]` when a bridge supplies one, using the
- *    same `openai:` key the legacy path uses so one conversation stays one copilot
- *    across eras. Runner tokens are bound to their agent and unaffected.
+ *  - Identity: 2026-07-28 removed protocol sessions (SEP-2567). A modern copilot is
+ *    keyed by the same chain as the legacy path (`resolveCopilotSessionKey`):
+ *    `_meta["openai/session"]` / `_meta["grok/session"]`, then `Mcp-Session-Id`,
+ *    then `x-mcp-session-id`, then `stateless:{tokenId}` — so one Codex/ChatGPT/Grok
+ *    conversation stays one copilot across eras. Runner tokens are bound to their
+ *    agent and unaffected.
  */
 
 const META_VERSION = 'io.modelcontextprotocol/protocolVersion';
@@ -182,10 +184,13 @@ export async function handleModernMcp(c: Context<AppContext>, env: Env, conn: Co
   if (isDiscover) {
     let discoveryAgent = conn.boundAgent;
     if (!discoveryAgent) {
-      const openAiSession = meta['openai/session'];
-      const discoverySessionKey = typeof openAiSession === 'string' && openAiSession.length > 0
-        ? `openai:${openAiSession}`
-        : `stateless:${conn.tokenId}`;
+      const discoverySessionKey = resolveCopilotSessionKey({
+        messages: [msg],
+        mcpSessionId: c.req.header('mcp-session-id'),
+        xMcpSessionId: c.req.header('x-mcp-session-id'),
+        tokenId: conn.tokenId,
+        userAgent: c.req.header('user-agent'),
+      }).key;
       try {
         discoveryAgent = await resolveSessionAgent(
           env,
@@ -233,10 +238,13 @@ export async function handleModernMcp(c: Context<AppContext>, env: Env, conn: Co
   let agent = conn.boundAgent;
   let sessionKey: string | undefined;
   if (!agent) {
-    const openAiSession = meta['openai/session'];
-    sessionKey = typeof openAiSession === 'string' && openAiSession.length > 0
-      ? `openai:${openAiSession}`
-      : `stateless:${conn.tokenId}`;
+    sessionKey = resolveCopilotSessionKey({
+      messages: [msg],
+      mcpSessionId: c.req.header('mcp-session-id'),
+      xMcpSessionId: c.req.header('x-mcp-session-id'),
+      tokenId: conn.tokenId,
+      userAgent: c.req.header('user-agent'),
+    }).key;
     try {
       agent = await resolveSessionAgent(env, conn, sessionKey, copilotSessionContextFromMessages([msg]));
     } catch (e) {

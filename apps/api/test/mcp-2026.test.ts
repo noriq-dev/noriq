@@ -31,6 +31,7 @@ async function modern(
     version?: string | null; // null → omit the _meta version entirely
     omitCaps?: boolean;
     headers?: Record<string, string | undefined>;
+    extraMeta?: Record<string, unknown>;
     id?: false; // send as a notification (no id)
   } = {},
 ) {
@@ -38,6 +39,7 @@ async function modern(
     ...(opts.version === null ? {} : { [V]: opts.version ?? MODERN }),
     ...(opts.omitCaps ? {} : { [CAPS]: {} }),
     'io.modelcontextprotocol/clientInfo': { name: 'vitest-modern', version: '1.0.0' },
+    ...opts.extraMeta,
   };
   const name = (params.name ?? params.uri) as string | undefined;
   const headers: Record<string, string | undefined> = {
@@ -136,6 +138,35 @@ describe('stateless requests (no initialize, no session)', () => {
     const idB = toolBody(b.body.result).you.id;
     expect(idA).toBeDefined();
     expect(idA).toBe(idB);
+  });
+
+  it('honors Mcp-Session-Id and x-mcp-session-id before the token fallback (PLNR-552)', async () => {
+    const viaX = await modern(apiKey, 'tools/call', { name: 'get_briefing', arguments: {} }, {
+      headers: { 'x-mcp-session-id': 'modern-conv' },
+    });
+    const viaXAgain = await modern(apiKey, 'tools/call', { name: 'get_briefing', arguments: {} }, {
+      headers: { 'x-mcp-session-id': 'modern-conv' },
+    });
+    const viaMcp = await modern(apiKey, 'tools/call', { name: 'get_briefing', arguments: {} }, {
+      headers: { 'Mcp-Session-Id': 'modern-mcp', 'x-mcp-session-id': 'modern-conv' },
+    });
+    const tokenDefault = await modern(apiKey, 'tools/call', { name: 'get_briefing', arguments: {} });
+    const idX = toolBody(viaX.body.result).you.id;
+    expect(idX).toBe(toolBody(viaXAgain.body.result).you.id);
+    expect(toolBody(viaMcp.body.result).you.id).not.toBe(idX);
+    expect(toolBody(tokenDefault.body.result).you.id).not.toBe(idX);
+  });
+
+  it('openai/session still wins over modern session headers', async () => {
+    const a = await modern(apiKey, 'tools/call', { name: 'get_briefing', arguments: {} }, {
+      headers: { 'Mcp-Session-Id': 'h1', 'x-mcp-session-id': 'x1' },
+      extraMeta: { 'openai/session': 'oa-modern' },
+    });
+    const b = await modern(apiKey, 'tools/call', { name: 'get_briefing', arguments: {} }, {
+      headers: { 'Mcp-Session-Id': 'h2', 'x-mcp-session-id': 'x2' },
+      extraMeta: { 'openai/session': 'oa-modern' },
+    });
+    expect(toolBody(a.body.result).you.id).toBe(toolBody(b.body.result).you.id);
   });
 
   it('carries ttlMs + cacheScope on tools/list', async () => {

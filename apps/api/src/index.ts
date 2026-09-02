@@ -44,6 +44,7 @@ import { issueTokens, metadataRoutes, oauth } from './oauth';
 import { demoLocksDown } from './lib/demo';
 import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
 import { copilotSessionContextFromMessages, endCopilotSession } from './lib/copilot-session';
+import { resolveCopilotSessionKey } from './lib/mcp-session-key';
 import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
 import { z } from 'zod';
@@ -141,7 +142,7 @@ const projectAccessFields = (access: Awaited<ReturnType<typeof resolveProjectAcc
 // can preflight (PLNR-82). Registered before the handlers so it wraps them.
 app.use('/mcp', cors({
   allowMethods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-  allowHeaders: ['Authorization', 'Content-Type', 'Mcp-Session-Id', 'MCP-Protocol-Version'],
+  allowHeaders: ['Authorization', 'Content-Type', 'Mcp-Session-Id', 'MCP-Protocol-Version', 'x-mcp-session-id'],
   exposeHeaders: ['Mcp-Session-Id', 'WWW-Authenticate'],
   maxAge: 86400,
 }));
@@ -336,8 +337,14 @@ app.all('/mcp', agentAuth, async (c) => {
   // authorized and may open another session; conflating these two lifecycles is what caused
   // connection revocations to be used as a workaround for abandoned Copilots.
   if (c.req.method === 'DELETE') {
-    const sessionId = c.req.header('mcp-session-id');
-    if (!sessionId) return c.json({ error: 'Mcp-Session-Id is required to terminate a session' }, 400);
+    const mcpSessionId = c.req.header('mcp-session-id');
+    const xMcpSessionId = c.req.header('x-mcp-session-id');
+    if (!mcpSessionId && !xMcpSessionId) {
+      return c.json({ error: 'Mcp-Session-Id is required to terminate a session' }, 400);
+    }
+    const sessionId = resolveCopilotSessionKey({
+      mcpSessionId, xMcpSessionId, tokenId: conn.tokenId,
+    }).key;
     const session = await c.env.DB.prepare(
       `SELECT id FROM agents WHERE session_id = ? AND kind = 'copilot' AND user_id = ?`,
     ).bind(sessionId, conn.userId).first<{ id: string }>();
@@ -361,17 +368,22 @@ app.all('/mcp', agentAuth, async (c) => {
     return handleModernMcp(c, c.env, conn, msgs);
   }
   const isInit = msgs.some((m) => m?.method === 'initialize');
-  // OpenAI app bridges may create a fresh MCP transport session for each tool
-  // invocation. Their stable conversation identity is carried on tools/call as
-  // `_meta["openai/session"]`; prefer it so one Codex/ChatGPT thread remains one
-  // Noriq copilot even when Mcp-Session-Id changes underneath it.
-  const openAiSession = msgs
-    .map((m) => m?.params?._meta?.['openai/session'])
-    .find((value) => typeof value === 'string' && value.length > 0) as string | undefined;
-  let sessionId = openAiSession ? `openai:${openAiSession}` : c.req.header('mcp-session-id') || undefined;
-  if (isInit && !sessionId) sessionId = crypto.randomUUID();
+  // Identity is a session_copilot keyed by a client-stable conversation id when the
+  // transport session is not (OpenAI `_meta["openai/session"]`, Grok `_meta["grok/session"]`
+  // / `x-mcp-session-id`). Otherwise `Mcp-Session-Id`, else `stateless:{tokenId}` —
+  // except a non-Grok initialize still mints a UUID so Claude Code keeps one copilot per
+  // chat. See resolveCopilotSessionKey (PLNR-552).
+  const resolved = resolveCopilotSessionKey({
+    messages: msgs,
+    mcpSessionId: c.req.header('mcp-session-id'),
+    xMcpSessionId: c.req.header('x-mcp-session-id'),
+    tokenId: conn.tokenId,
+    userAgent: c.req.header('user-agent'),
+    isInitialize: isInit,
+  });
+  const sessionId = resolved.key;
   let agent = conn.boundAgent;
-  if (!agent && sessionId) {
+  if (!agent) {
     // Both refusals here are authentication failures, not server faults: a session id
     // replayed under another user's token (PLNR-101), and a session whose copilot was
     // revoked. They used to escape as 500s.
@@ -384,12 +396,6 @@ app.all('/mcp', agentAuth, async (c) => {
       return c.json({ error: message }, authFailure ? 401 : 400);
     }
     if (isInit) c.header('Mcp-Session-Id', sessionId);
-  }
-  // The old sessionless path silently acted as the connection's phantom "default agent".
-  // That agent no longer exists, and minting one per request would re-create precisely the
-  // unattributable work 0026 deletes — so refuse, and say why.
-  if (!agent) {
-    return c.json({ error: 'no MCP session — call initialize first (sessionless calls are not attributable)' }, 400);
   }
 
   const server = buildMcpServer(c.env, agent, {

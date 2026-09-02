@@ -92,8 +92,11 @@ Tools double as docs (descriptions teach the workflow); every tool result piggyb
 in the `AgentSession` DO, so working agents get pushed-feeling updates without polling.
 
 **Agent identity model:** user → OAuth connection (one per `claude mcp add`) → agent (one per MCP
-session, keyed by `Mcp-Session-Id`; an `openai/session` `_meta` key takes precedence when present)
-→ sub-agents (`parent_agent_id`). Agents are **project-local** and carry a `kind`: **copilot**
+session) → sub-agents (`parent_agent_id`). Session keys, first match wins: `_meta["openai/session"]`
+(`openai:{id}`), `_meta["grok/session"]` (`grok:{id}`), `Mcp-Session-Id` (as-is), `x-mcp-session-id`
+(`grok:{id}`), else `stateless:{oauthTokenId}`. A non-Grok legacy `initialize` with none of those
+still mints a UUID so Claude Code keeps one copilot per chat; Grok (`User-Agent: grok-cli`) uses
+the token fallback because it re-initializes per tool call. See `lib/mcp-session-key.ts` (PLNR-552). Agents are **project-local** and carry a `kind`: **copilot**
 (human-authorized connection) vs **agent** (runner-spawned — minted per run via
 `POST /api/runs/:runId/agent`, one live agent per run, with reduced authority; see constraints).
 Auth lives in [auth.ts](apps/api/src/auth.ts) (agents: OAuth-only, no static keys) and
