@@ -32,8 +32,9 @@ import { resolveCopilotSessionKey } from './lib/mcp-session-key';
  *    the notices text block is Noriq's documented reliable channel anyway.
  *  - Identity: 2026-07-28 removed protocol sessions (SEP-2567). A modern copilot is
  *    keyed by the same chain as the legacy path (`resolveCopilotSessionKey`):
- *    `_meta["openai/session"]` / `_meta["grok/session"]`, then `Mcp-Session-Id`,
- *    then `x-mcp-session-id`, then `stateless:{tokenId}` — so one Codex/ChatGPT/Grok
+ *    `_meta["openai/session"]` / `_meta["grok/session"]`, then a stable
+ *    `Mcp-Session-Id` (Grok ignores ephemeral UUIDs — PLNR-557), then
+ *    `x-mcp-session-id`, then `stateless:{tokenId}` — so one Codex/ChatGPT/Grok
  *    conversation stays one copilot across eras. Runner tokens are bound to their
  *    agent and unaffected.
  */
@@ -190,6 +191,7 @@ export async function handleModernMcp(c: Context<AppContext>, env: Env, conn: Co
         xMcpSessionId: c.req.header('x-mcp-session-id'),
         tokenId: conn.tokenId,
         userAgent: c.req.header('user-agent'),
+        clientName: conn.clientName,
       }).key;
       try {
         discoveryAgent = await resolveSessionAgent(
@@ -244,6 +246,7 @@ export async function handleModernMcp(c: Context<AppContext>, env: Env, conn: Co
       xMcpSessionId: c.req.header('x-mcp-session-id'),
       tokenId: conn.tokenId,
       userAgent: c.req.header('user-agent'),
+      clientName: conn.clientName,
     }).key;
     try {
       agent = await resolveSessionAgent(env, conn, sessionKey, copilotSessionContextFromMessages([msg]));

@@ -44,7 +44,7 @@ import { issueTokens, metadataRoutes, oauth } from './oauth';
 import { demoLocksDown } from './lib/demo';
 import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
 import { copilotSessionContextFromMessages, endCopilotSession } from './lib/copilot-session';
-import { resolveCopilotSessionKey } from './lib/mcp-session-key';
+import { isDurableCopilotKey, resolveCopilotSessionKey } from './lib/mcp-session-key';
 import { errorPage, wantsHtml } from './errorPage';
 import { onboarding } from './onboarding';
 import { z } from 'zod';
@@ -344,7 +344,13 @@ app.all('/mcp', agentAuth, async (c) => {
     }
     const sessionId = resolveCopilotSessionKey({
       mcpSessionId, xMcpSessionId, tokenId: conn.tokenId,
+      userAgent: c.req.header('user-agent'),
+      clientName: conn.clientName,
     }).key;
+    // Grok DELETE's the transport session after every use_tool. That is not the end of
+    // the copilot — a `stateless:` key is the OAuth connection's working identity
+    // (PLNR-557). Claude UUID-keyed DELETE still retires.
+    if (isDurableCopilotKey(sessionId)) return c.body(null, 204);
     const session = await c.env.DB.prepare(
       `SELECT id FROM agents WHERE session_id = ? AND kind = 'copilot' AND user_id = ?`,
     ).bind(sessionId, conn.userId).first<{ id: string }>();
@@ -370,15 +376,16 @@ app.all('/mcp', agentAuth, async (c) => {
   const isInit = msgs.some((m) => m?.method === 'initialize');
   // Identity is a session_copilot keyed by a client-stable conversation id when the
   // transport session is not (OpenAI `_meta["openai/session"]`, Grok `_meta["grok/session"]`
-  // / `x-mcp-session-id`). Otherwise `Mcp-Session-Id`, else `stateless:{tokenId}` —
-  // except a non-Grok initialize still mints a UUID so Claude Code keeps one copilot per
-  // chat. See resolveCopilotSessionKey (PLNR-552).
+  // / `x-mcp-session-id`). Otherwise `Mcp-Session-Id` (Grok ignores ephemeral UUIDs),
+  // else `stateless:{tokenId}` — except a non-Grok initialize still mints a UUID so
+  // Claude Code keeps one copilot per chat. See resolveCopilotSessionKey (PLNR-552/557).
   const resolved = resolveCopilotSessionKey({
     messages: msgs,
     mcpSessionId: c.req.header('mcp-session-id'),
     xMcpSessionId: c.req.header('x-mcp-session-id'),
     tokenId: conn.tokenId,
     userAgent: c.req.header('user-agent'),
+    clientName: conn.clientName,
     isInitialize: isInit,
   });
   const sessionId = resolved.key;

@@ -223,7 +223,26 @@ export async function resolveSessionAgent(
     // user's token to act AS that user's agent (PLNR-101).
     if (existing.userId !== conn.userId) throw new Error('session id does not belong to this connection');
     if (existing.status === 'revoked') throw new Error('this session’s agent was revoked');
-    if (existing.retiredAt) throw new Error(`this MCP session has ended (${existing.retireReason ?? 'retired'})`);
+    if (existing.retiredAt) {
+      // Grok DELETE's the transport session after every tool call. A `stateless:` key is
+      // the connection's working identity, so client_terminated is resumable (PLNR-557).
+      // Revocation and idle-expiry still stick. Claude UUID-keyed sessions still end.
+      const resumable = sessionId.startsWith('stateless:') && existing.retireReason === 'client_terminated';
+      if (!resumable) throw new Error(`this MCP session has ended (${existing.retireReason ?? 'retired'})`);
+      const resumedAt = nowIso();
+      await env.DB.batch([
+        env.DB.prepare(
+          `UPDATE agents SET status = 'active', retired_at = NULL, retire_reason = NULL,
+                             last_seen_at = ?, archived_at = NULL, lifecycle_updated_at = ?
+           WHERE id = ?`,
+        ).bind(resumedAt, resumedAt, existing.id),
+        env.DB.prepare(
+          `UPDATE agent_presences SET state = 'online', ended_at = NULL, end_reason = NULL,
+                                      last_seen_at = ?, archived_at = NULL, updated_at = ?
+           WHERE actor_id = ? AND kind = 'mcp_session'`,
+        ).bind(resumedAt, resumedAt, existing.id),
+      ]);
+    }
     await validateCopilotSessionContext(env, conn.tokenId, conn.userId, context);
     await syncCopilotSession(env, conn.tokenId, existing, context);
     // Session resolution happens once per MCP request, so it is the one reliable presence touch

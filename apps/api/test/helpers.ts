@@ -207,12 +207,13 @@ export async function mintTokenForUser(email: string, password = 'longenough1'):
 export async function mintPairForUser(
   email: string,
   password = 'longenough1',
+  clientName = 'mint-user',
 ): Promise<{ access: string; refresh: string }> {
   await createUser(email, email, password).catch(() => {});
   const cookie = await loginSession(email, password);
   const reg = await SELF.fetch('https://noriq.test/oauth/register', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ client_name: 'mint-user', redirect_uris: ['http://localhost:39990/cb'] }),
+    body: JSON.stringify({ client_name: clientName, redirect_uris: ['http://localhost:39990/cb'] }),
   });
   const clientId = ((await reg.json()) as { client_id: string }).client_id;
   const verifier = `mint-${email}-`.padEnd(48, 'x');
