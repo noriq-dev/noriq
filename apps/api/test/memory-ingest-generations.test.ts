@@ -29,6 +29,9 @@ interface MemRpc {
   _getIndexGenerationStatusForTest(pid: string, generationId: string): Promise<string | null>;
   _seedStagedIndexGeneration(pid: string, repositoryKey: string, createdAt: string): Promise<string>;
   pruneAbandonedStagedGenerations(pid: string, maxAgeMs: number): Promise<number>;
+  pruneSupersededGenerations(pid: string, maxAgeMs: number): Promise<number>;
+  _countStagedIndexRowsForTest(pid: string, generationId: string): Promise<{ entities: number; edges: number; batches: number }>;
+  _setIndexGenerationActivatedAtForTest(pid: string, generationId: string, activatedAt: string): Promise<void>;
 }
 
 const memory = (pid: string) => appEnv.PROJECT_MEMORY.get(appEnv.PROJECT_MEMORY.idFromName(pid)) as unknown as MemRpc;
@@ -290,5 +293,37 @@ describe('sweep prunes real abandoned staged generations (PLNR-250\'s hook, now 
 
     const again = await m.pruneAbandonedStagedGenerations(projectId, 24 * 3600 * 1000);
     expect(again).toBe(0);
+  });
+
+  it('pruneSupersededGenerations drops the old generation\'s staged bodies and keeps the active one (PLNR-554)', async () => {
+    const { projectId } = await newOwnedProject('pm-554-super@example.com', 'PM554SUP');
+    const m = memory(projectId);
+    const file = (name: string): StagedRow[] => [
+      { kind: 'node', uri: `noriq://file/PM554SUP/repo-a/${name}.ts`, type: 'file', label: `${name}.ts`, content: `${name}-body` },
+    ];
+    const stageActivate = async (generationId: string, name: string) => {
+      const rows = file(name);
+      await m.beginIndexIngest(projectId, baseManifest({
+        generationId, projectId, repositoryKey: 'repo-a', contentHash: await computeStagedContentHash(rows as never),
+      }));
+      await m.ingestIndexBatch(projectId, { generationId, batchNumber: 0, batchHash: generationId }, rows);
+      await m.completeIndexIngest(projectId, generationId);
+      await m.activateIndexGeneration(projectId, generationId);
+    };
+
+    await stageActivate('gen_old', 'old');
+    await stageActivate('gen_new', 'new');
+    expect(await m._getIndexGenerationStatusForTest(projectId, 'gen_old')).toBe('superseded');
+    expect(await m._getIndexGenerationStatusForTest(projectId, 'gen_new')).toBe('active');
+    expect((await m._countStagedIndexRowsForTest(projectId, 'gen_old')).entities).toBe(1);
+    expect((await m._countStagedIndexRowsForTest(projectId, 'gen_new')).entities).toBe(1);
+
+    await m._setIndexGenerationActivatedAtForTest(projectId, 'gen_old', new Date(Date.now() - 25 * 3600 * 1000).toISOString());
+    expect(await m.pruneSupersededGenerations(projectId, 24 * 3600 * 1000)).toBe(1);
+
+    expect(await m._getIndexGenerationStatusForTest(projectId, 'gen_old')).toBeNull();
+    expect(await m._countStagedIndexRowsForTest(projectId, 'gen_old')).toEqual({ entities: 0, edges: 0, batches: 0 });
+    expect(await m._getIndexGenerationStatusForTest(projectId, 'gen_new')).toBe('active');
+    expect((await m._countStagedIndexRowsForTest(projectId, 'gen_new')).entities).toBe(1);
   });
 });

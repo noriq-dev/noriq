@@ -2467,17 +2467,19 @@ export class ProjectMemory extends DurableObject<Env> {
       .toArray();
     if (abandoned.length === 0) return 0;
     this.ctx.storage.transactionSync(() => {
-      // PLNR-261's staged children carry no real FK to index_generations(id) (see the
-      // migration's comment) — delete them explicitly, child-before-parent, rather than relying
-      // on a cascade DO SQLite doesn't provide.
-      for (const { id } of abandoned) {
-        this.ctx.storage.sql.exec(`DELETE FROM index_staged_edges WHERE generation_id = ?1`, id);
-        this.ctx.storage.sql.exec(`DELETE FROM index_staged_entities WHERE generation_id = ?1`, id);
-        this.ctx.storage.sql.exec(`DELETE FROM index_batches WHERE generation_id = ?1`, id);
-      }
+      for (const { id } of abandoned) this.deleteStagedIndexChildren(id);
       this.ctx.storage.sql.exec(`DELETE FROM index_generations WHERE status = 'staged' AND created_at < ?1`, cutoff);
     });
     return abandoned.length;
+  }
+
+  /** Staged children carry no real FK to `index_generations(id)` (see migration 0005) —
+   *  delete them explicitly, child-before-parent. Shared by abandoned-staged prune, abort,
+   *  and superseded prune (PLNR-554). */
+  private deleteStagedIndexChildren(generationId: string): void {
+    this.ctx.storage.sql.exec(`DELETE FROM index_staged_edges WHERE generation_id = ?1`, generationId);
+    this.ctx.storage.sql.exec(`DELETE FROM index_staged_entities WHERE generation_id = ?1`, generationId);
+    this.ctx.storage.sql.exec(`DELETE FROM index_batches WHERE generation_id = ?1`, generationId);
   }
 
   private async reportVectorDirty(projectId: string, dirty: boolean): Promise<void> {
@@ -2537,16 +2539,14 @@ export class ProjectMemory extends DurableObject<Env> {
   // surface, not a parallel one, now reading staged rows instead of trusting a direct parameter.
 
   /**
-   * Bookkeeping GC for 'superseded' `index_generations` rows past their retention window —
-   * mirrors `pruneAbandonedStagedGenerations`'s shape exactly. This does NOT retire vectors —
-   * those are retired eagerly (best-effort) at activation via `deletedUris` above; a surviving
-   * entity's vector is never orphaned because it is re-upserted at the same id under the new
-   * generation. This only clears the now-inert registry row so `index_generations` does not
-   * grow forever. Uses `activated_at` (when THIS generation itself went active) as the age
-   * reference — there is no separate "superseded_at" column (adding one would mean a schema
-   * migration this task does not need), so a long-lived generation becomes prunable
-   * immediately once superseded rather than after its own separate grace period; the tradeoff
-   * is documented here rather than hidden behind a precise-sounding column that doesn't exist.
+   * GC for 'superseded' `index_generations` past their retention window — same shape as
+   * `pruneAbandonedStagedGenerations`. PLNR-261 keeps staged children at supersession so the
+   * still-active generation can answer citation checks; PLNR-554 deletes those children here
+   * once the superseded generation itself is old enough, otherwise each reindex orphans a
+   * full copy of file content forever. Does NOT retire vectors (those go eagerly at
+   * activation via `deletedUris`). Uses `activated_at` as the age reference — there is no
+   * separate "superseded_at" column, so a long-lived generation becomes prunable immediately
+   * once superseded rather than after its own separate grace period.
    */
   async pruneSupersededGenerations(projectId: string, maxAgeMs: number): Promise<number> {
     await this.assertProjectId(projectId);
@@ -2556,6 +2556,7 @@ export class ProjectMemory extends DurableObject<Env> {
       .toArray();
     if (rows.length === 0) return 0;
     this.ctx.storage.transactionSync(() => {
+      for (const { id } of rows) this.deleteStagedIndexChildren(id);
       this.ctx.storage.sql.exec(`DELETE FROM index_generations WHERE status = 'superseded' AND activated_at < ?1`, cutoff);
     });
     return rows.length;
@@ -3144,9 +3145,7 @@ export class ProjectMemory extends DurableObject<Env> {
     if (!gen) return { ok: true };
     if (gen.status !== 'staged') throw new Error(`generation ${generationId} is already ${gen.status} — cannot abort`);
     this.ctx.storage.transactionSync(() => {
-      this.ctx.storage.sql.exec(`DELETE FROM index_staged_edges WHERE generation_id = ?1`, generationId);
-      this.ctx.storage.sql.exec(`DELETE FROM index_staged_entities WHERE generation_id = ?1`, generationId);
-      this.ctx.storage.sql.exec(`DELETE FROM index_batches WHERE generation_id = ?1`, generationId);
+      this.deleteStagedIndexChildren(generationId);
       this.ctx.storage.sql.exec(`DELETE FROM index_generations WHERE id = ?1`, generationId);
     });
     return { ok: true };
@@ -5063,9 +5062,10 @@ export class ProjectMemory extends DurableObject<Env> {
 
   /**
    * Did THIS ACTIVE GENERATION actually stage a `file`/`symbol` entity for this citation? Reads
-   * `index_staged_entities` (keyed `(generation_id, uri)`, retained for the life of the
-   * generation — PLNR-261 never deletes staged rows on supersession), never the live `nodes`
-   * table. PLNR-283: `nodes` is no longer a reliable proxy for "the index actually found this
+   * `index_staged_entities` (keyed `(generation_id, uri)`, retained for the life of THIS
+   * generation — PLNR-261 does not delete staged rows at supersession; PLNR-554's sweep
+   * deletes a superseded generation's children after SUPERSEDED_GENERATION_MAX_AGE_MS),
+   * never the live `nodes` table. PLNR-283: `nodes` is no longer a reliable proxy for "the index actually found this
    * file at this base" once `recordMemory` also upserts a `file`/`symbol` node for any
    * repository-scoped evidence citation, real or not — a citation naming a file the repository
    * has actually deleted must still verify `missing` even though the memory citing it just
@@ -7960,10 +7960,13 @@ export class ProjectMemory extends DurableObject<Env> {
 
   /** Test-only: a 'superseded' index generation with a caller-chosen `activatedAt`, so
    *  PLNR-256's `pruneSupersededGenerations` can be tested without waiting out its real max
-   *  age — same reason as `_seedStagedIndexGeneration`. */
+   *  age — same reason as `_seedStagedIndexGeneration`. Also plants one staged entity/edge/
+   *  batch so PLNR-554 can assert those children are deleted with the generation row. */
   async _seedSupersededIndexGenerationForTest(projectId: string, repositoryKey: string, activatedAt: string): Promise<string> {
     await this.assertProjectId(projectId);
     const id = newId('gen');
+    const fromUri = `noriq://file/test/${repositoryKey}/from.ts`;
+    const toUri = `noriq://file/test/${repositoryKey}/to.ts`;
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec(
         `INSERT INTO repositories (repository_key, created_at) VALUES (?1, ?2) ON CONFLICT (repository_key) DO NOTHING`,
@@ -7977,8 +7980,37 @@ export class ProjectMemory extends DurableObject<Env> {
         repositoryKey,
         activatedAt,
       );
+      this.ctx.storage.sql.exec(
+        `INSERT INTO index_batches (generation_id, batch_number, batch_hash, row_count, received_at) VALUES (?1, 0, 'h', 2, ?2)`,
+        id, activatedAt,
+      );
+      this.ctx.storage.sql.exec(
+        `INSERT INTO index_staged_entities (generation_id, uri, type, label, content) VALUES (?1, ?2, 'file', 'from.ts', 'from-body')`,
+        id, fromUri,
+      );
+      this.ctx.storage.sql.exec(
+        `INSERT INTO index_staged_entities (generation_id, uri, type, label, content) VALUES (?1, ?2, 'file', 'to.ts', 'to-body')`,
+        id, toUri,
+      );
+      this.ctx.storage.sql.exec(
+        `INSERT INTO index_staged_edges (generation_id, type, from_uri, to_uri) VALUES (?1, 'imports', ?2, ?3)`,
+        id, fromUri, toUri,
+      );
     });
     return id;
+  }
+
+  async _countStagedIndexRowsForTest(projectId: string, generationId: string): Promise<{ entities: number; edges: number; batches: number }> {
+    await this.assertProjectId(projectId);
+    const count = (table: string) => this.ctx.storage.sql
+      .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table} WHERE generation_id = ?1`, generationId)
+      .toArray()[0]?.n ?? 0;
+    return { entities: count('index_staged_entities'), edges: count('index_staged_edges'), batches: count('index_batches') };
+  }
+
+  async _setIndexGenerationActivatedAtForTest(projectId: string, generationId: string, activatedAt: string): Promise<void> {
+    await this.assertProjectId(projectId);
+    this.ctx.storage.sql.exec(`UPDATE index_generations SET activated_at = ?2 WHERE id = ?1`, generationId, activatedAt);
   }
 
   /** Test-only: this generation's current status — so PLNR-256's activation tests can assert

@@ -15,11 +15,10 @@ export const DEFAULT_BACKUP_RETENTION_COUNT = 7;
 /** A staged index generation older than this with no activation is abandoned debris — nothing
  *  stages into `index_generations` before Phase 5, so this prunes zero rows until then. */
 export const STAGED_GENERATION_MAX_AGE_MS = 24 * 3600 * 1000;
-/** PLNR-256: a 'superseded' index generation older than this (by its own `activated_at` — see
- *  `pruneSupersededGenerations`'s doc comment for why there is no separate "superseded_at")
- *  is inert registry debris the sweep discards. This does NOT retire vectors — those are
- *  retired eagerly at activation time (`activateCodeGeneration`'s `deletedUris`); this only
- *  clears the now-inert `index_generations` row. */
+/** PLNR-256/554: a 'superseded' index generation older than this (by its own `activated_at` —
+ *  see `pruneSupersededGenerations`'s doc comment for why there is no separate "superseded_at")
+ *  is inert debris the sweep discards, including its staged entities/edges/batches. This does
+ *  NOT retire vectors — those are retired eagerly at activation time (`deletedUris`). */
 export const SUPERSEDED_GENERATION_MAX_AGE_MS = 24 * 3600 * 1000;
 /** How long a restore's retained prior generation stays available for rollback before the
  *  sweep discards it. */
@@ -138,8 +137,7 @@ export interface ProjectCleanupResult {
   prunedRetainedGeneration: boolean;
   prunedBackupGenerations: number;
   decayedMemories: number;
-  /** PLNR-256: superseded index-generation registry rows discarded (no second scheduler — see
-   *  SUPERSEDED_GENERATION_MAX_AGE_MS's doc comment for what this does and does not clean up). */
+  /** PLNR-256/554: superseded index-generation rows and their staged children discarded. */
   prunedSupersededGenerations: number;
   prunedAnalyticsGenerations: number;
   abandonedAnalyticsGenerations: number;

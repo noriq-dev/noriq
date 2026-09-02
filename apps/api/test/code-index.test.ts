@@ -62,6 +62,7 @@ interface MemRpc {
   activateIndexGeneration(pid: string, generationId: string): Promise<{ activated: string; superseded: string[] }>;
   pruneSupersededGenerations(pid: string, maxAgeMs: number): Promise<number>;
   _seedSupersededIndexGenerationForTest(pid: string, repositoryKey: string, activatedAt: string): Promise<string>;
+  _countStagedIndexRowsForTest(pid: string, generationId: string): Promise<{ entities: number; edges: number; batches: number }>;
   _getIndexGenerationStatusForTest(pid: string, generationId: string): Promise<string | null>;
   readActiveCodeIndex(pid: string, input: {
     repositoryKey: string; generationId?: string; branch?: string; baseId?: string; uris?: string[]; maxContentChars?: number;
@@ -340,5 +341,17 @@ describe('pruneSupersededGenerations — registry-row GC, mirrors pruneAbandoned
     const { projectId } = await newOwnedProject('code-idx-4@example.com', 'CIDX4');
     await memory(projectId)._seedSupersededIndexGenerationForTest(projectId, 'repo-d', new Date().toISOString());
     expect(await memory(projectId).pruneSupersededGenerations(projectId, 24 * 3600 * 1000)).toBe(0);
+  });
+
+  it('deletes staged entities/edges/batches with the superseded generation (PLNR-554)', async () => {
+    const { projectId } = await newOwnedProject('code-idx-554@example.com', 'CIDX554');
+    const m = memory(projectId);
+    const old = new Date(Date.now() - 25 * 3600 * 1000).toISOString();
+    const genId = await m._seedSupersededIndexGenerationForTest(projectId, 'repo-orphan', old);
+    expect(await m._countStagedIndexRowsForTest(projectId, genId)).toEqual({ entities: 2, edges: 1, batches: 1 });
+
+    expect(await m.pruneSupersededGenerations(projectId, 24 * 3600 * 1000)).toBe(1);
+    expect(await m._getIndexGenerationStatusForTest(projectId, genId)).toBeNull();
+    expect(await m._countStagedIndexRowsForTest(projectId, genId)).toEqual({ entities: 0, edges: 0, batches: 0 });
   });
 });
