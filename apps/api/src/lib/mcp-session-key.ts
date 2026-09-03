@@ -1,5 +1,5 @@
 /**
- * Copilot session-key resolution (PLNR-552, PLNR-557).
+ * Copilot session-key resolution (PLNR-552, PLNR-557, PLNR-558).
  *
  * Noriq's working identity is one session_copilot per key, not per OAuth token.
  * Clients disagree about what that key is:
@@ -8,30 +8,31 @@
  *    the stable conversation id on `_meta["openai/session"]`.
  *  - Grok (rmcp streamable HTTP, both `grok-cli` and the TUI whose OAuth client
  *    is named `Grok`) re-initializes per `use_tool` and DELETE's the transport
- *    session after. It may send `_meta["grok/session"]` or `x-mcp-session-id`;
- *    unconfigured Grok sends a fresh UUID `Mcp-Session-Id` that is NOT a
- *    conversation id. Detected via User-Agent `grok-cli/…`, OAuth `clientName`,
- *    or initialize `clientInfo.name`.
+ *    session after. The TUI conversation id is `x-mcp-session-id` (config
+ *    `headers = { "x-mcp-session-id" = "{{session_id}}" }`). Unconfigured Grok
+ *    sends a fresh UUID `Mcp-Session-Id` that is NOT a conversation id.
+ *    Detected via User-Agent `grok-cli/…`, OAuth `clientName`, or initialize
+ *    `clientInfo.name`.
  *
  * Precedence (first match wins):
  *  1. `_meta["openai/session"]` → `openai:{id}`  (existing OpenAI contract)
- *  2. `_meta["grok/session"]`   → `grok:{id}`    (Grok first-class, same shape)
+ *  2. Grok `x-mcp-session-id`   → `grok:{id}`    (TUI session, preferred over
+ *     the transport UUID)
  *  3. `Mcp-Session-Id`          → as-is, except Grok ignores an ephemeral UUID
  *     (keep `stateless:` / `grok:` / `openai:` prefixes)
- *  4. `x-mcp-session-id`        → `grok:{id}`    (Grok's documented fallback)
+ *  4. non-Grok `x-mcp-session-id` → `grok:{id}`
  *  5. `stateless:{tokenId}`     — last resort, except a non-Grok legacy
  *     `initialize` still mints a UUID so concurrent Claude chats stay distinct.
  *
- * DELETE `/mcp` of a `stateless:` key is a 204 no-op: Grok's transport teardown
- * is not the end of the copilot. Claude UUID-keyed DELETE still retires.
+ * DELETE `/mcp` of a `stateless:` or `grok:` key is a 204 no-op: Grok's
+ * transport teardown is not the end of the copilot. Claude UUID-keyed DELETE
+ * still retires. A `stateless:` copilot is all-projects (never pinned).
  */
 
 export const OPENAI_SESSION_META = 'openai/session';
-export const GROK_SESSION_META = 'grok/session';
 
 export type CopilotSessionKeySource =
   | 'openai-meta'
-  | 'grok-meta'
   | 'mcp-session-id'
   | 'x-mcp-session-id'
   | 'stateless-token'
@@ -107,9 +108,9 @@ export function isStablePresentedSessionId(id: string): boolean {
   return id.startsWith('stateless:') || id.startsWith('grok:') || id.startsWith('openai:');
 }
 
-/** Token-keyed copilots survive Grok's per-call DELETE `/mcp`. */
+/** Token-keyed and Grok-session copilots survive Grok's per-call DELETE `/mcp`. */
 export function isDurableCopilotKey(key: string): boolean {
-  return key.startsWith('stateless:');
+  return key.startsWith('stateless:') || key.startsWith('grok:');
 }
 
 export function resolveCopilotSessionKey(input: ResolveCopilotSessionKeyInput): CopilotSessionKey {
@@ -118,8 +119,10 @@ export function resolveCopilotSessionKey(input: ResolveCopilotSessionKeyInput): 
   const openai = firstMeta(input.messages, OPENAI_SESSION_META);
   if (openai) return { key: `openai:${openai}`, source: 'openai-meta' };
 
-  const grokMeta = firstMeta(input.messages, GROK_SESSION_META);
-  if (grokMeta) return { key: `grok:${grokMeta}`, source: 'grok-meta' };
+  const xMcpSessionId = presented(input.xMcpSessionId);
+  // Grok's conversation id is x-mcp-session-id (TUI `{{session_id}}`). Prefer it over
+  // Mcp-Session-Id, which is a per-call transport UUID (PLNR-558).
+  if (grok && xMcpSessionId) return { key: `grok:${xMcpSessionId}`, source: 'x-mcp-session-id' };
 
   const mcpSessionId = presented(input.mcpSessionId);
   // Grok's Mcp-Session-Id is a transport UUID (re-minted per use_tool). Preferring it
@@ -128,7 +131,6 @@ export function resolveCopilotSessionKey(input: ResolveCopilotSessionKeyInput): 
     return { key: mcpSessionId, source: 'mcp-session-id' };
   }
 
-  const xMcpSessionId = presented(input.xMcpSessionId);
   if (xMcpSessionId) return { key: `grok:${xMcpSessionId}`, source: 'x-mcp-session-id' };
 
   // Non-Grok initialize: mint a UUID and return it as Mcp-Session-Id so the client

@@ -60,6 +60,20 @@ describe('agents are per-session, project-local', () => {
     expect(names).not.toContain('gamma'); // belongs to the other project
   });
 
+  it('snapshot includes a copilot from another project who currently holds a task here (PLNR-558)', async () => {
+    await mcpCall(conn.apiKey, 'configure_agent', { name: 'delta-holder', projectId: otherProjectId }, 'sess-holder');
+    const created = await mcpCall(conn.apiKey, 'create_task', {
+      projectId, title: 'held-by-foreign', tags: ['backend'], allowNewTags: true,
+    }, 'sess-A');
+    const taskId = (created.body as { id: string }).id;
+    await mcpCall(conn.apiKey, 'claim_task', { projectId, taskId }, 'sess-holder');
+    const cookie = await bootAdmin();
+    const snapHere = await (await SELF.fetch(`https://noriq.test/api/projects/${projectId}/snapshot`, { headers: { Cookie: cookie } })).json() as {
+      agents: Array<{ name: string }>;
+    };
+    expect(snapHere.agents.map((a) => a.name)).toContain('delta-holder');
+  });
+
   it('the same friendly name is allowed in different projects (PLNR-65)', async () => {
     const here = await mcpCall(conn.apiKey, 'configure_agent', { name: 'builder', projectId }, 'sess-dup1');
     const there = await mcpCall(conn.apiKey, 'configure_agent', { name: 'builder', projectId: otherProjectId }, 'sess-dup2');

@@ -6,6 +6,7 @@ import { resolveAccountCapabilities } from './lib/authorization';
 import {
   syncCopilotSession, validateCopilotSessionContext, type CopilotSessionContext,
 } from './lib/copilot-session';
+import { isDurableCopilotKey } from './lib/mcp-session-key';
 
 /** What kind of thing is working (RUN-43). See migration 0026 for the full contrast. */
 export type AgentKind = 'copilot' | 'agent';
@@ -224,10 +225,11 @@ export async function resolveSessionAgent(
     if (existing.userId !== conn.userId) throw new Error('session id does not belong to this connection');
     if (existing.status === 'revoked') throw new Error('this session’s agent was revoked');
     if (existing.retiredAt) {
-      // Grok DELETE's the transport session after every tool call. A `stateless:` key is
-      // the connection's working identity, so client_terminated is resumable (PLNR-557).
-      // Revocation and idle-expiry still stick. Claude UUID-keyed sessions still end.
-      const resumable = sessionId.startsWith('stateless:') && existing.retireReason === 'client_terminated';
+      // Grok DELETE's the transport session after every tool call. A `stateless:` or
+      // `grok:` key is the working identity, so client_terminated is resumable
+      // (PLNR-557/558). Revocation and idle-expiry still stick. Claude UUID-keyed
+      // sessions still end.
+      const resumable = isDurableCopilotKey(sessionId) && existing.retireReason === 'client_terminated';
       if (!resumable) throw new Error(`this MCP session has ended (${existing.retireReason ?? 'retired'})`);
       const resumedAt = nowIso();
       await env.DB.batch([

@@ -79,7 +79,7 @@ import {
 import { getProjectIntelligenceDashboard } from './memory/intelligence-dashboard';
 import { classifyAgentLifecycle } from './lib/agent-lifecycle';
 import { agentLifecycleSweepConfig, sweepAgentLifecycle, type AgentLifecycleCursor } from './lib/agent-lifecycle-sweep';
-import { AGENT_LIFECYCLES, listAgentRoster, type AgentRosterLifecycle } from './lib/agent-roster';
+import { AGENT_LIFECYCLES, listAgentRoster, projectVisibleAgentClause, type AgentRosterLifecycle } from './lib/agent-roster';
 import { listRunnerRoster, RUNNER_HEARTBEAT_TTL_MS, RUNNER_LIFECYCLES, type RunnerRosterLifecycle } from './lib/runner-roster';
 import {
   AcceptedRevisionHandoff, AgentTool, AdvertisedAgent, ExecutionProfileId, RunEffort, RunKind, RunnerRepo, RunBudget,
@@ -348,8 +348,8 @@ app.all('/mcp', agentAuth, async (c) => {
       clientName: conn.clientName,
     }).key;
     // Grok DELETE's the transport session after every use_tool. That is not the end of
-    // the copilot — a `stateless:` key is the OAuth connection's working identity
-    // (PLNR-557). Claude UUID-keyed DELETE still retires.
+    // the copilot — a `stateless:` or `grok:` key is the working identity
+    // (PLNR-557/558). Claude UUID-keyed DELETE still retires.
     if (isDurableCopilotKey(sessionId)) return c.body(null, 204);
     const session = await c.env.DB.prepare(
       `SELECT id FROM agents WHERE session_id = ? AND kind = 'copilot' AND user_id = ?`,
@@ -375,10 +375,10 @@ app.all('/mcp', agentAuth, async (c) => {
   }
   const isInit = msgs.some((m) => m?.method === 'initialize');
   // Identity is a session_copilot keyed by a client-stable conversation id when the
-  // transport session is not (OpenAI `_meta["openai/session"]`, Grok `_meta["grok/session"]`
-  // / `x-mcp-session-id`). Otherwise `Mcp-Session-Id` (Grok ignores ephemeral UUIDs),
-  // else `stateless:{tokenId}` — except a non-Grok initialize still mints a UUID so
-  // Claude Code keeps one copilot per chat. See resolveCopilotSessionKey (PLNR-552/557).
+  // transport session is not (OpenAI `_meta["openai/session"]`, Grok `x-mcp-session-id`).
+  // Otherwise `Mcp-Session-Id` (Grok ignores ephemeral UUIDs), else `stateless:{tokenId}`
+  // — except a non-Grok initialize still mints a UUID so Claude Code keeps one copilot
+  // per chat. See resolveCopilotSessionKey (PLNR-552/557/558).
   const resolved = resolveCopilotSessionKey({
     messages: msgs,
     mcpSessionId: c.req.header('mcp-session-id'),
@@ -953,12 +953,12 @@ app.get('/api/public/projects/:pid/snapshot', async (c) => {
     c.env.DB.prepare(
       `SELECT a.id, COALESCE(a.label, a.name) AS name, a.role, a.status, 'live' AS lifecycle
          FROM agents a
-        WHERE a.project_id = ? AND a.status != 'revoked'
+        WHERE ${projectVisibleAgentClause('a')} AND a.status != 'revoked'
           AND a.retired_at IS NULL AND a.archived_at IS NULL
           AND EXISTS (SELECT 1 FROM agent_presences ap
                        WHERE ap.actor_id = a.id AND ap.archived_at IS NULL
                          AND ap.state IN ('online','working') AND ap.last_seen_at >= ?)`,
-    ).bind(pid, agentLiveCutoff).all(),
+    ).bind(pid, pid, agentLiveCutoff).all(),
     c.env.DB.prepare(
       'SELECT id, seq, actor_kind AS actorKind, actor_id AS actorId, verb, subject_type AS subjectType, subject_id AS subjectId, payload, created_at AS createdAt FROM events WHERE project_id = ? ORDER BY seq DESC LIMIT 60',
     ).bind(pid).all(),
@@ -1078,7 +1078,7 @@ app.get('/api/projects/:pid/ui-state', userAuth, async (c) => {
       `SELECT a.id, COALESCE(a.label, a.name) AS name, a.role, a.status,
               a.last_seen_at AS lastSeenAt, a.parent_agent_id AS parentAgentId, u.name AS ownerName
          FROM agents a LEFT JOIN users u ON u.id = a.user_id
-        WHERE a.project_id = ? AND a.status != 'revoked' ORDER BY a.created_at`, pid),
+        WHERE ${projectVisibleAgentClause('a')} AND a.status != 'revoked' ORDER BY a.created_at`, pid, pid),
     rows(eventSurface,
       `SELECT id, seq, actor_kind AS actorKind, actor_id AS actorId, verb,
               subject_type AS subjectType, subject_id AS subjectId, payload, created_at AS createdAt
@@ -1235,14 +1235,14 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
        WHERE t.project_id = ?1 AND dt.project_id != ?1`,
     ).bind(pid).all(),
     c.env.DB.prepare(
-      // Project-local agents only (PLNR agent re-model): an agent belongs to the
-      // project it works, not to every project.
+      // Project-local agents plus anyone currently holding a task here (PLNR-558): a
+      // token-keyed or foreign copilot must still render as the holder.
       `SELECT a.id, COALESCE(a.label, a.name) AS name, a.role, a.status, a.last_seen_at AS lastSeenAt,
               a.kind, a.runner_id AS runnerId,
               a.parent_agent_id AS parentAgentId, u.name AS ownerName
        FROM agents a LEFT JOIN users u ON u.id = a.user_id
-       WHERE a.project_id = ? AND a.status != 'revoked' ORDER BY a.created_at`,
-    ).bind(pid).all(),
+       WHERE ${projectVisibleAgentClause('a')} AND a.status != 'revoked' ORDER BY a.created_at`,
+    ).bind(pid, pid).all(),
     c.env.DB.prepare(
       `SELECT id, seq, actor_kind AS actorKind, actor_id AS actorId, verb, subject_type AS subjectType,
               subject_id AS subjectId, payload, created_at AS createdAt

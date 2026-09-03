@@ -1805,12 +1805,21 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         workRole: copilotWorkRole,
         executionId: copilotExecutionId,
       });
-      // A Copilot roams: the task it successfully claimed is now its active project. A runner-
-      // owned agent is pinned by its run and may only adopt a project when an old pre-pin row is
-      // still null; it can never be moved across projects by this path.
+      // A Copilot roams. Session-keyed copilots (Claude UUID, grok: TUI session) take the
+      // claimed task's project as focus. A `stateless:` OAuth-fallback copilot is all-projects
+      // (PLNR-558) and must not be pinned — otherwise a later claim hides it from every other
+      // project's snapshot. A runner-owned agent is pinned by its run and may only adopt a
+      // project when an old pre-pin row is still null; it can never be moved across projects
+      // by this path.
       if (agent.kind === 'copilot') {
-        await env.DB.prepare("UPDATE agents SET project_id = ?, status = 'active' WHERE id = ? AND kind = 'copilot'")
-          .bind(projectId, agent.id).run();
+        const oauthFallback = typeof opts.sessionId === 'string' && opts.sessionId.startsWith('stateless:');
+        if (oauthFallback) {
+          await env.DB.prepare("UPDATE agents SET status = 'active' WHERE id = ? AND kind = 'copilot'")
+            .bind(agent.id).run();
+        } else {
+          await env.DB.prepare("UPDATE agents SET project_id = ?, status = 'active' WHERE id = ? AND kind = 'copilot'")
+            .bind(projectId, agent.id).run();
+        }
       } else {
         await env.DB.prepare("UPDATE agents SET project_id = ?, status = 'active' WHERE id = ? AND project_id IS NULL")
           .bind(projectId, agent.id).run();

@@ -8,6 +8,13 @@ const DAY_MS = 86_400_000;
 export const AGENT_LIFECYCLES = ['live', 'recent', 'dormant', 'retired', 'archived', 'revoked'] as const;
 export type AgentRosterLifecycle = typeof AGENT_LIFECYCLES[number];
 
+/** Agents that belong on a project's board: home project OR currently holding a task there
+ *  (PLNR-558 — a token-keyed / foreign copilot must still render as the holder). Bind the
+ *  project id twice. */
+export function projectVisibleAgentClause(alias = 'a'): string {
+  return `(${alias}.project_id = ? OR ${alias}.id IN (SELECT claimed_by FROM tasks WHERE project_id = ? AND claimed_by IS NOT NULL))`;
+}
+
 export type AgentRosterOptions = {
   projectId?: string;
   ownerUserId?: string;
@@ -71,8 +78,8 @@ export async function listAgentRoster(env: Env, options: AgentRosterOptions) {
   const scope: string[] = [];
   const scopeBinds: unknown[] = [];
   if (options.projectId) {
-    scope.push('a.project_id = ?');
-    scopeBinds.push(options.projectId);
+    scope.push(projectVisibleAgentClause('a'));
+    scopeBinds.push(options.projectId, options.projectId);
   }
   if (options.ownerUserId) {
     scope.push('a.user_id = ?');

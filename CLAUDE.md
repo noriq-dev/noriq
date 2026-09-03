@@ -93,12 +93,13 @@ in the `AgentSession` DO, so working agents get pushed-feeling updates without p
 
 **Agent identity model:** user → OAuth connection (one per `claude mcp add`) → agent (one per MCP
 session) → sub-agents (`parent_agent_id`). Session keys, first match wins: `_meta["openai/session"]`
-(`openai:{id}`), `_meta["grok/session"]` (`grok:{id}`), `Mcp-Session-Id` (as-is except Grok
-ignores ephemeral UUIDs), `x-mcp-session-id` (`grok:{id}`), else `stateless:{oauthTokenId}`.
+(`openai:{id}`), Grok `x-mcp-session-id` (`grok:{id}` — TUI `{{session_id}}`), `Mcp-Session-Id`
+(as-is except Grok ignores ephemeral UUIDs), else `stateless:{oauthTokenId}`.
 A non-Grok legacy `initialize` with none of those still mints a UUID so Claude Code keeps one
 copilot per chat; Grok (`User-Agent: grok-cli`, OAuth clientName/`clientInfo.name` `Grok`) uses
-the token fallback because it re-initializes and DELETE's per tool call. DELETE of a
-`stateless:` session is a no-op. See `lib/mcp-session-key.ts` (PLNR-552/557). Agents are **project-local** and carry a `kind`: **copilot**
+`x-mcp-session-id` when present, otherwise the token fallback, because it re-initializes and
+DELETE's per tool call. DELETE of a `stateless:` or `grok:` session is a no-op. A `stateless:`
+copilot is all-projects (not pinned). See `lib/mcp-session-key.ts` (PLNR-552/557/558). Agents are **project-local** (except unscoped/token copilots and current holders) and carry a `kind`: **copilot**
 (human-authorized connection) vs **agent** (runner-spawned — minted per run via
 `POST /api/runs/:runId/agent`, one live agent per run, with reduced authority; see constraints).
 Auth lives in [auth.ts](apps/api/src/auth.ts) (agents: OAuth-only, no static keys) and

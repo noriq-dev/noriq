@@ -32,11 +32,10 @@ import { resolveCopilotSessionKey } from './lib/mcp-session-key';
  *    the notices text block is Noriq's documented reliable channel anyway.
  *  - Identity: 2026-07-28 removed protocol sessions (SEP-2567). A modern copilot is
  *    keyed by the same chain as the legacy path (`resolveCopilotSessionKey`):
- *    `_meta["openai/session"]` / `_meta["grok/session"]`, then a stable
- *    `Mcp-Session-Id` (Grok ignores ephemeral UUIDs — PLNR-557), then
- *    `x-mcp-session-id`, then `stateless:{tokenId}` — so one Codex/ChatGPT/Grok
- *    conversation stays one copilot across eras. Runner tokens are bound to their
- *    agent and unaffected.
+ *    `_meta["openai/session"]`, Grok `x-mcp-session-id`, then a stable
+ *    `Mcp-Session-Id` (Grok ignores ephemeral UUIDs — PLNR-557/558), then
+ *    `stateless:{tokenId}` — so one Codex/ChatGPT/Grok conversation stays one
+ *    copilot across eras. Runner tokens are bound to their agent and unaffected.
  */
 
 const META_VERSION = 'io.modelcontextprotocol/protocolVersion';
