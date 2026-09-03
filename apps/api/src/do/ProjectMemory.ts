@@ -2482,6 +2482,14 @@ export class ProjectMemory extends DurableObject<Env> {
     this.ctx.storage.sql.exec(`DELETE FROM index_batches WHERE generation_id = ?1`, generationId);
   }
 
+  /** PLNR-555: keep staged URIs for citation checks; drop file bodies. */
+  private stripStagedEntityContent(generationId: string): void {
+    this.ctx.storage.sql.exec(
+      `UPDATE index_staged_entities SET content = NULL WHERE generation_id = ?1 AND content IS NOT NULL`,
+      generationId,
+    );
+  }
+
   private async reportVectorDirty(projectId: string, dirty: boolean): Promise<void> {
     await this.env.PROJECT_ROOM.get(this.env.PROJECT_ROOM.idFromName(projectId))
       .setMemoryVectorDirty(projectId, dirty)
@@ -3057,7 +3065,12 @@ export class ProjectMemory extends DurableObject<Env> {
         }
         superseded = retryingActive ? [] : active.map((r) => r.id);
         projection = this.applyGenerationProjection(generationId, retryingActive ? null : currentActive);
-        for (const id of superseded) this.ctx.storage.sql.exec(`UPDATE index_generations SET status = 'superseded' WHERE id = ?1`, id);
+        for (const id of superseded) {
+          this.ctx.storage.sql.exec(`UPDATE index_generations SET status = 'superseded' WHERE id = ?1`, id);
+          // Citation checks only need URI presence (PLNR-555). File bodies on a just-superseded
+          // generation are dead weight until the 24h row-GC (PLNR-554).
+          this.stripStagedEntityContent(id);
+        }
         if (!retryingActive) {
           this.ctx.storage.sql.exec(`UPDATE index_generations SET status = 'active', activated_at = ?2 WHERE id = ?1`, generationId, nowIso());
         }
@@ -3067,13 +3080,17 @@ export class ProjectMemory extends DurableObject<Env> {
 
     // Best-effort vector publish, OUTSIDE the transaction (PLNR-256: a Vectorize upsert cannot
     // join a SQLite transaction; correctness comes from query-time generation filtering, never
-    // from "we deleted the old vectors").
+    // from "we deleted the old vectors"). Strip this generation's file bodies AFTER publish
+    // (or immediately when there is no backend) — citation checks only SELECT uri (PLNR-555).
     const backend = codeSearchBackend(this.env);
     if (backend) {
       this.ctx.waitUntil(
         this.publishGenerationVectors(backend, projectId, generationId, gen.repository_key, gen.deletions)
-          .catch((err) => console.warn(`ProjectMemory code-index generation ${generationId} failed: ${String(err)}`)),
+          .catch((err) => console.warn(`ProjectMemory code-index generation ${generationId} failed: ${String(err)}`))
+          .finally(() => this.stripStagedEntityContent(generationId)),
       );
+    } else {
+      this.stripStagedEntityContent(generationId);
     }
 
     // D1-side active-generation PROJECTION (PLNR-259) — DO -> ProjectRoom -> D1, mirroring
@@ -5062,10 +5079,10 @@ export class ProjectMemory extends DurableObject<Env> {
 
   /**
    * Did THIS ACTIVE GENERATION actually stage a `file`/`symbol` entity for this citation? Reads
-   * `index_staged_entities` (keyed `(generation_id, uri)`, retained for the life of THIS
-   * generation — PLNR-261 does not delete staged rows at supersession; PLNR-554's sweep
-   * deletes a superseded generation's children after SUPERSEDED_GENERATION_MAX_AGE_MS),
-   * never the live `nodes` table. PLNR-283: `nodes` is no longer a reliable proxy for "the index actually found this
+   * `index_staged_entities` (keyed `(generation_id, uri)`). URIs are retained for the life of
+   * THIS generation; file bodies are nulled after activation (PLNR-555). PLNR-261 does not
+   * delete staged rows at supersession; PLNR-554's sweep deletes a superseded generation's
+   * children after SUPERSEDED_GENERATION_MAX_AGE_MS. Never the live `nodes` table. PLNR-283: `nodes` is no longer a reliable proxy for "the index actually found this
    * file at this base" once `recordMemory` also upserts a `file`/`symbol` node for any
    * repository-scoped evidence citation, real or not — a citation naming a file the repository
    * has actually deleted must still verify `missing` even though the memory citing it just
@@ -8011,6 +8028,18 @@ export class ProjectMemory extends DurableObject<Env> {
   async _setIndexGenerationActivatedAtForTest(projectId: string, generationId: string, activatedAt: string): Promise<void> {
     await this.assertProjectId(projectId);
     this.ctx.storage.sql.exec(`UPDATE index_generations SET activated_at = ?2 WHERE id = ?1`, generationId, activatedAt);
+  }
+
+  async _countStagedContentForTest(projectId: string, generationId: string): Promise<{ rows: number; withContent: number }> {
+    await this.assertProjectId(projectId);
+    const row = this.ctx.storage.sql
+      .exec<{ rows: number; withContent: number }>(
+        `SELECT COUNT(*) AS rows, SUM(CASE WHEN content IS NOT NULL THEN 1 ELSE 0 END) AS withContent
+           FROM index_staged_entities WHERE generation_id = ?1`,
+        generationId,
+      )
+      .toArray()[0];
+    return { rows: row?.rows ?? 0, withContent: row?.withContent ?? 0 };
   }
 
   /** Test-only: this generation's current status — so PLNR-256's activation tests can assert

@@ -63,6 +63,7 @@ interface MemRpc {
   pruneSupersededGenerations(pid: string, maxAgeMs: number): Promise<number>;
   _seedSupersededIndexGenerationForTest(pid: string, repositoryKey: string, activatedAt: string): Promise<string>;
   _countStagedIndexRowsForTest(pid: string, generationId: string): Promise<{ entities: number; edges: number; batches: number }>;
+  _countStagedContentForTest(pid: string, generationId: string): Promise<{ rows: number; withContent: number }>;
   _getIndexGenerationStatusForTest(pid: string, generationId: string): Promise<string | null>;
   readActiveCodeIndex(pid: string, input: {
     repositoryKey: string; generationId?: string; branch?: string; baseId?: string; uris?: string[]; maxContentChars?: number;
@@ -314,14 +315,29 @@ describe('activateIndexGeneration — real index_generations status transitions 
     expect(active).toMatchObject({
       available: true,
       scope: { generationId: 'gen_read_b', branch: 'main', baseId: 'sha-b' },
-      entities: [
-        { uri: secondUri, path: 'second.ts', content: 'second', contentTruncated: true },
-        { uri: firstUri, path: 'first.ts', content: 'first ', contentTruncated: true },
-      ],
     });
+    if (!active.available) throw new Error('expected active generation');
+    // PLNR-555: file bodies are stripped after activation (no CODE_VECTORIZE in this env,
+    // so strip is synchronous). URIs remain for citation checks; readActiveCodeIndex skips
+    // rows with null content.
+    expect(active.entities).toEqual([]);
+    expect(await memory(projectId)._countStagedContentForTest(projectId, 'gen_read_b')).toEqual({ rows: 2, withContent: 0 });
+    expect(await memory(projectId)._countStagedContentForTest(projectId, 'gen_read_a')).toEqual({ rows: 1, withContent: 0 });
     await expect(memory(projectId).readActiveCodeIndex(projectId, {
       repositoryKey: 'repo-r', generationId: 'gen_read_a', uris: [oldUri],
     })).resolves.toEqual({ available: false, reason: 'active-generation-changed' });
+  });
+
+  it('nulls staged file bodies after activation but keeps URIs (PLNR-555)', async () => {
+    const { projectId } = await newOwnedProject('code-idx-555@example.com', 'CIDX555');
+    const uri = 'noriq://file/CIDX555/repo-s/keep.ts';
+    await stageAndActivate(projectId, {
+      generationId: 'gen_strip', repositoryKey: 'repo-s', branch: 'main', baseId: 'sha-s',
+      entities: [{ kind: 'node', uri, type: 'file', label: 'keep.ts', content: 'this body must not survive activation' }],
+    });
+    expect(await memory(projectId)._getIndexGenerationStatusForTest(projectId, 'gen_strip')).toBe('active');
+    expect(await memory(projectId)._countStagedIndexRowsForTest(projectId, 'gen_strip')).toMatchObject({ entities: 1 });
+    expect(await memory(projectId)._countStagedContentForTest(projectId, 'gen_strip')).toEqual({ rows: 1, withContent: 0 });
   });
 });
 
