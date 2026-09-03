@@ -273,6 +273,7 @@ repositories — PLNR-553), so an indexed-but-never-exported project is not skip
 is idempotent — running the sweep twice in a row does nothing new the second time.
 
 Per-project size is visible via `health()` (`databaseSize`, `sizeStatus`) and projected into
-`project_memory_registry.size_bytes`/`size_status` (migration 0073) by the same sweep. This is
-**visibility only** — crossing the warn or critical threshold does not refuse writes; the goal
-is a warning appearing before a store becomes operationally unsafe, not an enforced quota.
+`project_memory_registry.size_bytes`/`size_status` (migration 0073) by the same sweep. Warn
+(500 MiB) and critical (1 GiB) are **visibility only**. Writes are refused at a 9 GiB fence
+against the 10 GiB SQLite Durable Object cap (PLNR-556), including restore/ingest preflight
+that reserves ~2× headroom for staging. `SQLITE_FULL` is mapped to that same operator error.

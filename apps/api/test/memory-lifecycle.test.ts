@@ -10,6 +10,10 @@ import {
   sizeStatus,
   DB_SIZE_WARN_BYTES,
   DB_SIZE_CRITICAL_BYTES,
+  SQLITE_WRITE_FENCE_BYTES,
+  SQLITE_DO_CAP_BYTES,
+  storageWriteBlocked,
+  sqliteFullOperatorMessage,
   sweepPendingErasures,
   sweepProjectDebris,
   pruneBackupRetention,
@@ -54,6 +58,7 @@ interface MemoryRpc {
     generationId: string; projectId: string; repositoryKey: string; branch: string; baseId: string;
     indexerVersion: string; batchCount: number; fileCount: number; contentHash: string; deletions: string[]; createdAt: string;
   }): Promise<{ ok: true }>;
+  _setDatabaseSizeOverrideForTest(pid: string, bytes: number | null): Promise<void>;
 }
 interface RoomRpc {
   deleteProject(pid: string, actor: Actor): Promise<{ ok: true; key: string; name: string }>;
@@ -93,6 +98,49 @@ describe('sizeStatus — pure threshold logic', () => {
     expect(sizeStatus(DB_SIZE_WARN_BYTES - 1)).toBe('ok');
     expect(sizeStatus(DB_SIZE_WARN_BYTES)).toBe('warn');
     expect(sizeStatus(DB_SIZE_CRITICAL_BYTES)).toBe('critical');
+  });
+});
+
+describe('storage write fence (PLNR-556)', () => {
+  it('refuses writes at 9 GiB, below the 10 GiB SQLite cap', () => {
+    expect(SQLITE_WRITE_FENCE_BYTES).toBeLessThan(SQLITE_DO_CAP_BYTES);
+    expect(storageWriteBlocked(0)).toBe(false);
+    expect(storageWriteBlocked(SQLITE_WRITE_FENCE_BYTES - 1)).toBe(false);
+    expect(storageWriteBlocked(SQLITE_WRITE_FENCE_BYTES)).toBe(true);
+    expect(storageWriteBlocked(SQLITE_WRITE_FENCE_BYTES - 100, 100)).toBe(true);
+    expect(storageWriteBlocked(SQLITE_WRITE_FENCE_BYTES / 2, SQLITE_WRITE_FENCE_BYTES / 2)).toBe(true);
+  });
+
+  it('maps SQLITE_FULL to an operator-facing message and ignores other errors', () => {
+    expect(sqliteFullOperatorMessage(new Error('SQLITE_FULL: database or disk is full'))).toMatch(/10 GiB/);
+    expect(sqliteFullOperatorMessage(new Error('UNIQUE constraint failed'))).toBeNull();
+  });
+
+  it('beginIndexIngest, writeNode, and restore refuse when the store is at the fence', async () => {
+    const { projectId } = await newOwnedProject('pm-life-fence@example.com', 'PMLFFNC');
+    const m = memory(projectId);
+    await m._setDatabaseSizeOverrideForTest(projectId, SQLITE_WRITE_FENCE_BYTES);
+    await expect(m.beginIndexIngest(projectId, {
+      generationId: 'gen_fence',
+      projectId,
+      repositoryKey: 'fence-repo',
+      branch: 'main',
+      baseId: 'sha_fence',
+      indexerVersion: 'v1',
+      batchCount: 1,
+      fileCount: 1,
+      contentHash: '0'.repeat(64),
+      deletions: [],
+      createdAt: new Date().toISOString(),
+    })).rejects.toThrow(/write fence/);
+    await expect(m.writeNode(projectId, {
+      type: 'unknown', uri: 'noriq://unknown/fence', label: 'fence', actor: SYSTEM,
+    })).rejects.toThrow(/write fence/);
+    const restored = await m.restoreSnapshot(projectId, { exportedAt: '2099-01-01T00-00-00-000Z' });
+    expect(restored.ok).toBe(false);
+    if (restored.ok) throw new Error('expected restore to refuse');
+    expect(restored.reason).toMatch(/write fence/);
+    await m._setDatabaseSizeOverrideForTest(projectId, null);
   });
 });
 

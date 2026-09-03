@@ -16,7 +16,10 @@ import {
   writeMemorySnapshotChunk, writeMemorySnapshotManifest,
 } from '../memory/backup';
 import { fetchManifest, readSnapshotChunks, checkManifestHeader } from '../memory/restore';
-import { deleteAllProjectBackups, sizeStatus, type EraseReport, type EraseStepResult } from '../memory/lifecycle';
+import {
+  deleteAllProjectBackups, sizeStatus, storageWriteBlocked, sqliteFullOperatorMessage,
+  SQLITE_WRITE_FENCE_BYTES, SQLITE_DO_CAP_BYTES, type EraseReport, type EraseStepResult,
+} from '../memory/lifecycle';
 import { MEMORY_MIGRATIONS } from '../memory/migrations';
 import {
   validateMemoryScope, classifyEvidenceCitation, memoryContentHash, clampAuthority,
@@ -649,9 +652,8 @@ export class ProjectMemory extends DurableObject<Env> {
   }
 
   /** Health/schema-version RPC (PLNR-246 projects this into the D1 registry). `databaseSize`
-   *  and `sizeStatus` (PLNR-250, §18) are visibility only — nothing here refuses a write at
-   *  either threshold; the point is a warning surfaces before the store becomes operationally
-   *  unsafe, not that it gets blocked. */
+   *  and `sizeStatus` (PLNR-250, §18) warn at 500 MiB / 1 GiB. Writes are refused separately
+   *  at the 9 GiB fence (PLNR-556) against the 10 GiB SQLite Durable Object cap. */
   async health(projectId: string): Promise<ProjectMemoryHealth> {
     await this.assertProjectId(projectId);
     const tableCounts: Record<string, number> = {};
@@ -2337,6 +2339,14 @@ export class ProjectMemory extends DurableObject<Env> {
   ): Promise<{ ok: true; tableCounts: Record<string, number> } | { ok: false; reason: string }> {
     await this.assertProjectId(projectId);
     if (!this.env.FILES) return { ok: false, reason: 'R2 (FILES) not configured' };
+    // Restore stages a second copy of every table before the atomic swap (~2× live size).
+    const liveSize = this.currentDatabaseSize();
+    if (storageWriteBlocked(liveSize, liveSize)) {
+      return {
+        ok: false,
+        reason: `ProjectMemory store is ${liveSize} bytes; restore needs ~2× headroom below the ${SQLITE_WRITE_FENCE_BYTES} write fence (${SQLITE_DO_CAP_BYTES} SQLite cap)`,
+      };
+    }
     let manifest;
     try {
       manifest = await fetchManifest(this.env, projectId, opts.exportedAt);
@@ -2402,7 +2412,7 @@ export class ProjectMemory extends DurableObject<Env> {
       // untrusted rows) lands here too. Nothing live was touched: staging is separate, and
       // activation is a single transaction that either committed or rolled back whole.
       this.dropStagingTables();
-      return { ok: false, reason: String(err) };
+      return { ok: false, reason: sqliteFullOperatorMessage(err) ?? String(err) };
     }
   }
 
@@ -2657,6 +2667,7 @@ export class ProjectMemory extends DurableObject<Env> {
 
   async beginIndexIngest(projectId: string, manifest: IndexGenerationManifest): Promise<{ ok: true }> {
     await this.assertProjectId(projectId);
+    this.assertStorageHeadroom(MAX_INDEX_GENERATION_BYTES);
     IndexGenerationManifest.parse(manifest);
     if (manifest.batchCount > MAX_INDEX_GENERATION_BATCHES) throw new Error(`batchCount exceeds ${MAX_INDEX_GENERATION_BATCHES}`);
     if (manifest.fileCount > MAX_INDEX_GENERATION_FILES) throw new Error(`fileCount exceeds ${MAX_INDEX_GENERATION_FILES}`);
@@ -2734,39 +2745,44 @@ export class ProjectMemory extends DurableObject<Env> {
     const accountedContentBytes = contentBytes + (totals.rows > 0 && parsedRows.length > 0 ? 1 : 0);
     if (totals.rows + parsedRows.length > MAX_INDEX_GENERATION_ROWS) throw new Error(`generation exceeds ${MAX_INDEX_GENERATION_ROWS} rows`);
     if (totals.bytes + accountedContentBytes > MAX_INDEX_GENERATION_BYTES) throw new Error(`generation exceeds ${MAX_INDEX_GENERATION_BYTES} canonical bytes`);
-    this.ctx.storage.transactionSync(() => {
-      this.ctx.storage.sql.exec(
-        `INSERT INTO index_batches (generation_id, batch_number, batch_hash, row_count, content_bytes, received_at) VALUES (?1,?2,?3,?4,?5,?6)`,
-        batch.generationId,
-        batch.batchNumber,
-        batch.batchHash,
-        rows.length,
-        accountedContentBytes,
-        nowIso(),
-      );
-      for (const row of parsedRows) {
-        if (row.kind === 'node') {
-          this.ctx.storage.sql.exec(
-            `INSERT INTO index_staged_entities (generation_id, uri, type, label, content) VALUES (?1,?2,?3,?4,?5)
-             ON CONFLICT (generation_id, uri) DO UPDATE SET type = excluded.type, label = excluded.label, content = excluded.content`,
-            batch.generationId,
-            row.uri,
-            row.type,
-            row.label,
-            row.content,
-          );
-        } else {
-          this.ctx.storage.sql.exec(
-            `INSERT INTO index_staged_edges (generation_id, type, from_uri, to_uri) VALUES (?1,?2,?3,?4)
-             ON CONFLICT (generation_id, type, from_uri, to_uri) DO NOTHING`,
-            batch.generationId,
-            row.type,
-            row.from,
-            row.to,
-          );
+    this.assertStorageHeadroom(accountedContentBytes);
+    try {
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO index_batches (generation_id, batch_number, batch_hash, row_count, content_bytes, received_at) VALUES (?1,?2,?3,?4,?5,?6)`,
+          batch.generationId,
+          batch.batchNumber,
+          batch.batchHash,
+          rows.length,
+          accountedContentBytes,
+          nowIso(),
+        );
+        for (const row of parsedRows) {
+          if (row.kind === 'node') {
+            this.ctx.storage.sql.exec(
+              `INSERT INTO index_staged_entities (generation_id, uri, type, label, content) VALUES (?1,?2,?3,?4,?5)
+               ON CONFLICT (generation_id, uri) DO UPDATE SET type = excluded.type, label = excluded.label, content = excluded.content`,
+              batch.generationId,
+              row.uri,
+              row.type,
+              row.label,
+              row.content,
+            );
+          } else {
+            this.ctx.storage.sql.exec(
+              `INSERT INTO index_staged_edges (generation_id, type, from_uri, to_uri) VALUES (?1,?2,?3,?4)
+               ON CONFLICT (generation_id, type, from_uri, to_uri) DO NOTHING`,
+              batch.generationId,
+              row.type,
+              row.from,
+              row.to,
+            );
+          }
         }
-      }
-    });
+      });
+    } catch (err) {
+      this.mapSqliteFull(err);
+    }
     return { ok: true, deduped: false };
   }
 
@@ -4331,6 +4347,30 @@ export class ProjectMemory extends DurableObject<Env> {
     this._forceWriteFailure = fail;
   }
 
+  /** Test-only: pretend `sql.databaseSize` is this value so the PLNR-556 write fence can be
+   *  exercised without filling a 9 GiB SQLite file. `null` restores the real size. */
+  private _databaseSizeOverride: number | null = null;
+  async _setDatabaseSizeOverrideForTest(projectId: string, bytes: number | null): Promise<void> {
+    await this.assertProjectId(projectId);
+    this._databaseSizeOverride = bytes;
+  }
+
+  private currentDatabaseSize(): number {
+    return this._databaseSizeOverride ?? this.ctx.storage.sql.databaseSize;
+  }
+
+  private assertStorageHeadroom(extraBytes = 0): void {
+    const size = this.currentDatabaseSize();
+    if (!storageWriteBlocked(size, extraBytes)) return;
+    throw new Error(
+      `ProjectMemory store is ${size} bytes; refusing a write that needs ${extraBytes} extra bytes of headroom (write fence ${SQLITE_WRITE_FENCE_BYTES} of ${SQLITE_DO_CAP_BYTES} cap)`,
+    );
+  }
+
+  private mapSqliteFull(err: unknown): never {
+    throw new Error(sqliteFullOperatorMessage(err) ?? (err instanceof Error ? err.message : String(err)));
+  }
+
   /** Test-only clock override: pin `recordMemory`'s `recorded_at` to an exact instant instead of
    *  `nowIso()`. PLNR-323's flake (two versions racing to the SAME millisecond) needs genuine CPU
    *  contention to reproduce on demand — this makes the tie deterministic so a regression test can
@@ -4740,6 +4780,7 @@ export class ProjectMemory extends DurableObject<Env> {
     input: { operationId?: string; type: string; uri: string; label: string; actor: { kind: string; id: string | null } },
   ): Promise<{ nodeId: string; operationId: string; deduped: boolean }> {
     await this.assertProjectId(projectId);
+    this.assertStorageHeadroom();
     if (input.operationId) {
       const existing = this.lookupAppliedOperation(input.operationId);
       if (existing) return { nodeId: (JSON.parse(existing.result) as { nodeId: string }).nodeId, operationId: input.operationId, deduped: true };

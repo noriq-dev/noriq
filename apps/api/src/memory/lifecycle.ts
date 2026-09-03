@@ -26,9 +26,15 @@ export const RETAINED_GENERATION_MAX_AGE_MS = 7 * 24 * 3600 * 1000;
 /** A cross-source analytics build older than this is an abandoned resumable job, not a live
  * generation. The sweep fails it, discards its inbox, and leaves canonical sources untouched. */
 export const ANALYTICS_BUILD_MAX_AGE_MS = 24 * 3600 * 1000;
-/** Visibility thresholds only (§18) — nothing here refuses a write at either line. */
+/** Visibility thresholds only (§18) — crossing these does not refuse a write. The write
+ *  fence below (PLNR-556) is the one that refuses, against the Durable Object SQLite cap. */
 export const DB_SIZE_WARN_BYTES = 500 * 1024 * 1024;
 export const DB_SIZE_CRITICAL_BYTES = 1024 * 1024 * 1024;
+/** Paid-plan SQLite Durable Object hard cap. Writes fail with SQLITE_FULL at this line. */
+export const SQLITE_DO_CAP_BYTES = 10 * 1024 * 1024 * 1024;
+/** Refuse new writes this far below the cap so restore/ingest staging (~2× live size) has
+ *  headroom instead of hitting SQLITE_FULL mid-transaction. */
+export const SQLITE_WRITE_FENCE_BYTES = 9 * 1024 * 1024 * 1024;
 /** PLNR-254: an authority-1/2 hypothesis with no feedback and no place in any approval/merge/
  *  supersession history is decay-eligible once it is this old. Never touches authority 3+. */
 export const MEMORY_HYPOTHESIS_DECAY_MAX_AGE_MS = 30 * 24 * 3600 * 1000;
@@ -40,6 +46,17 @@ export function sizeStatus(databaseSize: number): 'ok' | 'warn' | 'critical' {
   if (databaseSize >= DB_SIZE_CRITICAL_BYTES) return 'critical';
   if (databaseSize >= DB_SIZE_WARN_BYTES) return 'warn';
   return 'ok';
+}
+
+/** True when a write that will grow the store by `extraBytes` should be refused. */
+export function storageWriteBlocked(databaseSize: number, extraBytes = 0): boolean {
+  return databaseSize + extraBytes >= SQLITE_WRITE_FENCE_BYTES;
+}
+
+export function sqliteFullOperatorMessage(err: unknown): string | null {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (!/SQLITE_FULL|database or disk is full/i.test(msg)) return null;
+  return `ProjectMemory store is at the Durable Object SQLite cap (~10 GiB). Writes are refused until space is reclaimed (lifecycle sweep / staged-generation prune). Original error: ${msg}`;
 }
 
 async function deleteR2Prefix(env: Env, prefix: string): Promise<number> {
