@@ -50,6 +50,11 @@ describe('unscoped REST reads are project-gated (PLNR-97)', () => {
     expect((await get(`/api/tasks/${taskId}/events`, ownerCookie)).status).toBe(200);
   });
 
+  it('GET /api/tasks/:tid/comments — outsider 404, owner 200', async () => {
+    expect((await get(`/api/tasks/${taskId}/comments`, outsiderCookie)).status).toBe(404);
+    expect((await get(`/api/tasks/${taskId}/comments`, ownerCookie)).status).toBe(200);
+  });
+
   it('GET /api/agents?projectId — outsider 404, owner 200', async () => {
     expect((await get(`/api/agents?projectId=${projectId}`, outsiderCookie)).status).toBe(404);
     expect((await get(`/api/agents?projectId=${projectId}`, ownerCookie)).status).toBe(200);

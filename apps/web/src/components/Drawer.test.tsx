@@ -38,6 +38,9 @@ function mount(selectedTask: TaskVM = task, permissions = { canContribute: true,
       effStatus: () => selectedTask.status,
       agentById: () => null,
     },
+    commentsHasMore: false,
+    commentCounts: { open: 0, resolved: 0, total: 0 },
+    user: { id: 'usr_you', email: 'you@example.com', name: 'You', role: 'admin', accessMode: 'read_write', canCreateProjects: true, canCreateGroups: true },
     actions: {
       closeTask: vi.fn(), refreshNow: vi.fn(), restoreTask: vi.fn(), archiveTask: vi.fn(),
       deleteTask: vi.fn(), openTask: vi.fn(), removeDependency: vi.fn(), addDependency: vi.fn(),
@@ -180,3 +183,77 @@ describe('task detail editing (PLNR-429)', () => {
     expect(text).toContain('run 123456');
   });
 });
+
+describe('task comments at volume', () => {
+  it('collapses a long task body behind Show more', async () => {
+    vi.mocked(api.taskDetail).mockResolvedValue({
+      task: { body: `${'checkpoint line\n'.repeat(20)}end`, executionSpec: null, executionSpecUnreadable: false },
+      attachments: [], docs: [], signals: [], refs: [], dependencies: [], comments: [],
+    } as never);
+    mount();
+    await tick();
+    expect(container.querySelector('.task-drawer')?.textContent).toContain('Show more');
+  });
+
+  it('pins an open question above agent activity and newest notes first', async () => {
+    const comments = [
+      {
+        id: 'cmt_old', author: 'agt_1', role: 'agent' as const, kind: 'comment' as const,
+        body: 'scale-48 failed', status: 'addressed' as const,
+        createdAt: '2026-09-12T10:00:00.000Z', parentCommentId: null,
+      },
+      {
+        id: 'cmt_new', author: 'agt_1', role: 'agent' as const, kind: 'comment' as const,
+        body: 'scale-50 failed', status: 'addressed' as const,
+        createdAt: '2026-09-13T22:00:00.000Z', parentCommentId: null,
+      },
+      {
+        id: 'cmt_q', author: 'usr_you', role: 'human' as const, kind: 'question' as const,
+        body: 'Was CPU the cause?', status: 'open' as const,
+        createdAt: '2026-09-13T21:00:00.000Z', parentCommentId: null,
+      },
+    ];
+    const selected = {
+      ...task,
+      openComments: 1,
+      comments,
+    };
+    const moveTask = vi.fn();
+    const store = {
+      currentPid: 'prj_plnr',
+      selectedTaskId: selected.id,
+      draftKind: 'comment',
+      draftText: '',
+      permissions: { canContribute: true, canManage: true },
+      snapshot: { tags: [], milestones: [], boards: [{ id: 'board_1', name: 'Main' }], signals: [], externalTasks: [] },
+      helpers: { tasksOf: () => [selected], effStatus: () => selected.status, agentById: () => ({ name: 'Astra', color: '#4c9dff' }) },
+      commentsHasMore: true,
+      commentCounts: { open: 1, resolved: 2, total: 3 },
+      user: { id: 'usr_you', email: 'you@example.com', name: 'You', role: 'admin', accessMode: 'read_write', canCreateProjects: true, canCreateGroups: true },
+      actions: {
+        closeTask: vi.fn(), refreshNow: vi.fn(), restoreTask: vi.fn(), archiveTask: vi.fn(),
+        deleteTask: vi.fn(), openTask: vi.fn(), removeDependency: vi.fn(), addDependency: vi.fn(),
+        claimToggle: vi.fn(), answerSignal: vi.fn(), acknowledgeSignal: vi.fn(), acceptProposal: vi.fn(),
+        rejectProposal: vi.fn(), setView: vi.fn(), resolveComment: vi.fn(), cycleKind: vi.fn(),
+        setDraftText: vi.fn(), postComment: vi.fn(), moveTask,
+      },
+    } as unknown as AppStore;
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+    act(() => root!.render(<Drawer store={store} />));
+    await tick();
+
+    const panel = container.querySelector('[data-testid="drawer-comments"]')!;
+    const text = panel.textContent ?? '';
+    expect(text).toContain('1 need you');
+    expect(text).toContain('2 notes');
+    expect(text).toContain('Was CPU the cause?');
+    expect(text).toContain('scale-50 failed');
+    expect(text).toContain('scale-48 failed');
+    expect(text.indexOf('Was CPU the cause?')).toBeLessThan(text.indexOf('scale-50 failed'));
+    expect(text.indexOf('scale-50 failed')).toBeLessThan(text.indexOf('scale-48 failed'));
+    expect(container.querySelector('[data-testid="load-older-comments"]')).toBeTruthy();
+  });
+});
+

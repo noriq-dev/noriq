@@ -15,10 +15,10 @@ describe('complete MCP tool contract audit', () => {
     const audit = auditMcpCatalog(specs);
     expect(audit.findings).toEqual([]);
     expect(audit.valid).toBe(true);
-    expect(audit.toolCount).toBe(56);
+    expect(audit.toolCount).toBe(57);
     expect(Object.keys(MCP_TOOL_POLICIES).sort()).toEqual(specs.tools.map((tool) => tool.name).sort());
     expect(Object.keys(MCP_TOOL_AUDIENCE).sort()).toEqual(specs.tools.map((tool) => tool.name).sort());
-    expect(specs.tools.filter((tool) => tool.audience === 'core')).toHaveLength(34);
+    expect(specs.tools.filter((tool) => tool.audience === 'core')).toHaveLength(35);
   });
 
   it('Copilots receive every non-runner tool by default', async () => {
@@ -31,7 +31,7 @@ describe('complete MCP tool contract audit', () => {
     }>;
     const specs = mcpReferenceSpecs();
     expect(live.map((tool) => tool.name).sort()).toEqual(specs.tools.filter((tool) => tool.audience !== 'runner').map((tool) => tool.name).sort());
-    expect(live).toHaveLength(55);
+    expect(live).toHaveLength(56);
     expect(live.some((tool) => tool.name === 'can_claim')).toBe(false);
     const freshSession = await mcpList(token, 'fresh-copilot-session');
     expect(freshSession.map((tool) => tool.name).sort()).toEqual(live.map((tool) => tool.name).sort());
@@ -64,7 +64,7 @@ describe('complete MCP tool contract audit', () => {
       name: string;
       inputSchema: { properties?: Record<string, unknown> };
     }>;
-    expect(live).toHaveLength(55);
+    expect(live).toHaveLength(56);
     expect(live.some((tool) => tool.name === 'create_plan')).toBe(true);
     expect(live.some((tool) => tool.name === 'create_project')).toBe(true);
     expect(live.some((tool) => tool.name === 'create_orchestration')).toBe(true);
@@ -75,7 +75,7 @@ describe('complete MCP tool contract audit', () => {
     const rejected = await mcpCall(token, 'configure_agent', { toolPacks: ['planning'] });
     expect(rejected.isError).toBe(true);
     expect(rejected.text).toMatch(/requires at least one field/i);
-    expect(await mcpList(token)).toHaveLength(55);
+    expect(await mcpList(token)).toHaveLength(56);
   });
 
   it('requires contributor access on both sides of a cross-project task move', async () => {

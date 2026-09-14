@@ -100,7 +100,7 @@ focus.
 ## Tool availability
 
 An OAuth Copilot receives the complete non-Runner catalog on every session — catalog revision 3
-contains 55 tools. There are no optional packs to enable, and \`configure_agent\` never changes
+contains 56 tools. There are no optional packs to enable, and \`configure_agent\` never changes
 tool availability. Do not reconnect just to expand the catalog. Runner agents are different:
 their daemon-provided \`allowedTools\` floor is the exact catalog they may advertise and invoke,
 including Runner-only tools. A visible tool is capability, not authorization; project roles,
@@ -190,6 +190,12 @@ Humans post comments of kind **question** (answer it, keep working) and
 \`acknowledge_comment\` as soon as you have seen one; acknowledgement is not resolution and the
 comment stays open. Call \`resolve_comment\` only after the work or answer is real, with a
 substantive reply. The human is waiting.
+
+\`get_task\` returns every unresolved comment in full plus a short recent tail of resolved
+notes (\`moreResolvedComments\` / \`commentCounts\` tell you when there is more). Page older
+history with \`list_comments\`. When **you** post, write a delta: what changed, a pointer to
+evidence, what happens next — not a pasted run report (attach a file or cite a path). Do not
+rewrite the whole task body as a changelog; keep a short current-checkpoint section.
 
 When **you** need the human, pick the right channel: \`request_input\` to block on a
 decision (tie it to the task), \`raise_alert\` when something is wrong and needs attention,

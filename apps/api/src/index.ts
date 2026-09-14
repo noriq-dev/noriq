@@ -13,6 +13,9 @@ import { hashPassword, newApiKey, newId, nowIso, sha256Hex, timingSafeEqual, ver
 import { searchWorkspaceEvidence, searchWorkspacePlans, searchWorkspaceTasks } from './lib/workspace-operations';
 import type { ExecutionSpecInput, RunStatus } from '@noriq-dev/shared';
 import { readExecutionSpec } from './lib/execution-spec';
+import {
+  REST_DETAIL_RESOLVED_CAP, clampCommentLimit, loadTaskCommentsForDetail, listTaskCommentsPaged,
+} from './lib/task-comments';
 import { search, searchBackend, reindexProject, ALL_KINDS, type SearchKind } from './search';
 import {
   answerQuestion, generationClient, MAX_ASK_QUESTION_CHARS, normalizeAskReferences, normalizeHistory, streamingGenerationClient,
@@ -1383,17 +1386,20 @@ app.get('/api/tasks/:tid', userAuth, async (c) => {
   task.executionSpec = stored.spec;
   if (stored.unreadable) task.executionSpecUnreadable = true;
   delete task.execution_spec;
-  const [comments, refs, attachments, taskTagRows, docRows] = await Promise.all([
-    c.env.DB.prepare(
-      `SELECT id, author_kind AS authorKind, author_id AS authorId, kind, body, status, parent_comment_id AS parentCommentId, created_at AS createdAt
-       FROM comments WHERE task_id = ? ORDER BY created_at`,
-    ).bind(tid).all(),
+  const [commentPage, refs, attachments, taskTagRows, docRows] = await Promise.all([
+    loadTaskCommentsForDetail(c.env.DB, tid, REST_DETAIL_RESOLVED_CAP),
     c.env.DB.prepare('SELECT kind, ref, url, state FROM task_refs WHERE task_id = ?').bind(tid).all(),
     c.env.DB.prepare('SELECT id, filename, content_type AS contentType, size, uploaded_by_kind AS uploaderKind, uploaded_by AS uploadedBy, created_at AS createdAt FROM attachments WHERE task_id = ? ORDER BY created_at').bind(tid).all(),
     c.env.DB.prepare('SELECT tag_id AS tagId FROM task_tags WHERE task_id = ?').bind(tid).all(),
     c.env.DB.prepare('SELECT d.id, d.name, d.description FROM task_docs td JOIN docs d ON d.id = td.doc_id WHERE td.task_id = ? AND d.archived_at IS NULL ORDER BY d.name').bind(tid).all(),
   ]);
-  return c.json({ task, comments: comments.results, refs: refs.results, attachments: attachments.results, tagIds: taskTagRows.results.map((r) => r.tagId), docs: docRows.results });
+  return c.json({
+    task,
+    comments: commentPage.comments,
+    moreResolvedComments: commentPage.moreResolvedComments,
+    commentCounts: commentPage.commentCounts,
+    refs: refs.results, attachments: attachments.results, tagIds: taskTagRows.results.map((r) => r.tagId), docs: docRows.results,
+  });
 });
 
 // --- UI write API (all writes go through ProjectRoom; a human is just another actor) ---
@@ -5560,6 +5566,35 @@ app.post('/api/runs/:runId/verification-report', agentAuth, async (c) => {
   if (actionDenied) return actionDenied;
   const result = await memoryStub(c.env, run.projectId).acceptVerificationReport(run.projectId, report, { kind: 'agent', id: conn.boundAgent.id });
   return c.json(result);
+});
+
+// --- per-task comment pages (bounded; detail already returns open + a short resolved tail)
+app.get('/api/tasks/:tid/comments', userAuth, async (c) => {
+  const tid = c.req.param('tid')!;
+  const task = await c.env.DB.prepare('SELECT project_id AS pid FROM tasks WHERE id = ?').bind(tid).first<{ pid: string }>();
+  if (!task) return c.json({ error: 'not found' }, 404);
+  if (!(await reachesProject(c, task.pid))) return c.json({ error: 'not found' }, 404);
+  const statusRaw = c.req.query('status');
+  const authorRaw = c.req.query('authorKind');
+  if (statusRaw && !['open', 'resolved', 'all'].includes(statusRaw)) {
+    return c.json({ error: 'status must be open, resolved, or all' }, 400);
+  }
+  if (authorRaw && !['agent', 'human', 'system'].includes(authorRaw)) {
+    return c.json({ error: 'authorKind must be agent, human, or system' }, 400);
+  }
+  try {
+    const page = await listTaskCommentsPaged(c.env.DB, tid, {
+      status: statusRaw === 'open' || statusRaw === 'resolved' || statusRaw === 'all' ? statusRaw : undefined,
+      authorKind: authorRaw === 'agent' || authorRaw === 'human' || authorRaw === 'system' ? authorRaw : undefined,
+      limit: clampCommentLimit(parseInt(c.req.query('limit') ?? '', 10) || undefined),
+      before: c.req.query('before') || undefined,
+    });
+    return c.json(page);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/not found on this task/.test(message)) return c.json({ error: message }, 400);
+    throw err;
+  }
 });
 
 // --- per-task event timeline (PLNR-34) ----------------------------------------------

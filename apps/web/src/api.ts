@@ -282,6 +282,15 @@ export const api = {
   archiveTask: (pid: string, tid: string) => req('POST', `/api/projects/${pid}/tasks/${tid}/archive`),
   restoreTask: (pid: string, tid: string) => req('POST', `/api/projects/${pid}/tasks/${tid}/restore`),
   taskDetail: (tid: string) => req<ApiTaskDetail>('GET', `/api/tasks/${tid}`),
+  taskComments: (tid: string, q: { status?: 'open' | 'resolved' | 'all'; authorKind?: 'agent' | 'human' | 'system'; limit?: number; before?: string } = {}) => {
+    const query = new URLSearchParams();
+    if (q.status) query.set('status', q.status);
+    if (q.authorKind) query.set('authorKind', q.authorKind);
+    if (q.limit) query.set('limit', String(q.limit));
+    if (q.before) query.set('before', q.before);
+    const suffix = query.toString() ? `?${query}` : '';
+    return req<ApiCommentPage>('GET', `/api/tasks/${tid}/comments${suffix}`);
+  },
   health: () => req<{ ok: boolean; version?: string; maintenance?: boolean }>('GET', '/api/health'),
 
   createProject: (key: string, name: string, description?: string) =>
@@ -1652,11 +1661,29 @@ export interface ApiSnapshot {
   }>;
 }
 
+export interface ApiTaskComment {
+  id: string;
+  authorKind: string;
+  authorId: string;
+  kind: string;
+  body: string;
+  status: string;
+  createdAt: string;
+  parentCommentId?: string | null;
+}
+
+export interface ApiCommentPage {
+  comments: ApiTaskComment[];
+  total: number;
+  hasMore: boolean;
+  nextBefore: string | null;
+}
+
 export interface ApiTaskDetail {
   task: Record<string, unknown>;
-  comments: Array<{
-    id: string; authorKind: string; authorId: string; kind: string; body: string; status: string; createdAt: string;
-  }>;
+  comments: ApiTaskComment[];
+  moreResolvedComments?: number;
+  commentCounts?: { open: number; resolved: number; total: number };
   refs: Array<{ kind: string; ref: string; url: string | null; state: string | null }>;
   attachments: Array<{ id: string; filename: string; contentType: string; size: number; uploaderKind: string; uploadedBy: string; createdAt: string }>;
   tagIds: string[];

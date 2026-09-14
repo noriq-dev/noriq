@@ -4,7 +4,7 @@ import type { AppStore } from '../store';
 import type { TaskStatus } from '../types';
 import { api, type ApiAgentEvent } from '../api';
 import { isSettledTaskStatus, type ExecutionSpec } from '@noriq-dev/shared';
-import { KIND_META, statusMeta, verbColors } from '../design';
+import { statusMeta, verbColors } from '../design';
 import { AvatarChip, MonoTag, SectionLabel } from './bits';
 import { QuestionForm, SignalThreadHistory } from './QuestionForm';
 import { Markdown } from './Markdown';
@@ -14,6 +14,7 @@ import { ExecutionSpecPanel, type SpecLoad } from './ExecutionSpec';
 import { DispatchIntelligencePanel, openIntelligenceDocument } from './DispatchIntelligence';
 import { confirm } from './Dialog';
 import { AttachmentPreview, attachmentPreviewDecision, type AttachmentPreviewItem } from './AttachmentPreview';
+import { CollapsibleMarkdown, DrawerComments } from './DrawerComments';
 import { MOBILE_TAB_BAR_HEIGHT, useViewport } from '../viewport';
 
 const USER_SETTABLE_TASK_STATUSES: Array<{
@@ -379,7 +380,7 @@ export function Drawer({ store }: { store: AppStore }) {
           <div style={{ marginBottom: 18 }}>
             {detailBody === null
               ? <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>loading task details…</span>
-              : <Markdown source={detailBody} />}
+              : <CollapsibleMarkdown source={detailBody} />}
           </div>
 
           {/* Proposal provenance + decision. The panel persists after the decision — who filed
@@ -762,59 +763,19 @@ export function Drawer({ store }: { store: AppStore }) {
             </div>
           )}
 
-          {/* comments */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 14 }}>
-            <SectionLabel>Comments &amp; questions</SectionLabel>
-            {task.openComments > 0 && <MonoTag color="var(--amber)" bg="rgba(245,166,35,.12)" size={9.5}>{task.openComments} open</MonoTag>}
-          </div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 14, marginBottom: 18 }}>
-            {task.comments.map((c) => {
-              const isHuman = c.role === 'human';
-              const cag = c.role === 'agent' ? helpers.agentById(currentPid, c.author) : null;
-              const kind = KIND_META[c.kind];
-              const statusColor =
-                c.status === 'addressed' ? 'var(--green)' : c.status === 'acknowledged' ? 'var(--text-mid)' : c.status === 'wont_do' ? 'var(--red-soft)' : 'var(--amber)';
-              return (
-                <div key={c.id} style={{ display: 'flex', gap: 10 }}>
-                  <AvatarChip name={isHuman ? 'you' : cag?.name ?? c.author} color={isHuman ? 'you' : cag?.color ?? '#4c9dff'} size={26} radius={7} fontSize={10} />
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 4 }}>
-                      <span style={{ fontSize: 12.5, fontWeight: 600 }}>{isHuman ? 'you' : cag?.name ?? c.author}</span>
-                      <MonoTag color={kind.color} bg={kind.bg} size={9}>{c.kind}</MonoTag>
-                      <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: statusColor }}>{c.status}</span>
-                      {store.permissions.canContribute && (c.status === 'open' || c.status === 'acknowledged') && (
-                        <button
-                          onClick={() => actions.resolveComment(c.id, 'addressed')}
-                          title="mark addressed"
-                          style={{ cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--green)', marginLeft: 4, background: 'transparent' }}
-                        >
-                          ✓ resolve
-                        </button>
-                      )}
-                    </div>
-                    <div
-                      style={{
-                        fontSize: 12.5, lineHeight: 1.55, color: 'var(--text-soft)',
-                        background: c.role === 'agent' ? 'rgba(76,157,255,.06)' : 'var(--w-03)',
-                        border: `1px solid ${c.role === 'agent' ? 'rgba(76,157,255,.18)' : 'var(--w-07)'}`,
-                        borderRadius: 10, padding: '9px 12px',
-                        wordBreak: 'break-word',
-                      }}
-                    >
-                      <Markdown source={c.body} compact />
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+          <DrawerComments
+            task={task}
+            store={store}
+            counts={store.commentCounts}
+            hasMore={store.commentsHasMore}
+          />
 
           {/* timeline */}
           <div style={{ marginBottom: 8 }}>
             <SectionLabel>History</SectionLabel>
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-            {timeline.map((e) => {
+            {timeline.filter((e) => !String(e.verb).startsWith('comment.')).map((e) => {
               const vc = verbColors(String(e.verb).split('.').pop() ?? '');
               const p = e.payload as { actorName?: string; to?: string; body?: string; from?: string; resolution?: string; filename?: string };
               return (

@@ -26,6 +26,9 @@ import { assembleContextPack } from './memory/context-pack';
 import { getDispatchIntelligence, summarizeDispatchIntelligence } from './memory/dispatch-intelligence';
 import { renderEvidenceFrame, type EvidenceFrameItem } from './memory/evidence-frame';
 import { readExecutionSpec } from './lib/execution-spec';
+import {
+  COMMENT_BODY_MAX, GET_TASK_RESOLVED_CAP, loadTaskCommentsForDetail, listTaskCommentsPaged,
+} from './lib/task-comments';
 import type { ProjectMemoryStub } from './lib/project-memory';
 import { loadPriorEffort, searchHitToEvidenceItem } from './lib/project-memory';
 import { refuseSpecWrite, specWriteRefusalMessage } from './lib/spec-authority';
@@ -165,7 +168,10 @@ The contract: (1) call get_briefing first; (2) claim_task before working on anyt
 TTL is generous (30 min), so you never need to ping to stay alive. heartbeat exists only
 for the rare case where you'll go silent longer than that; (4) check and resolve open
 comments — acknowledge new human steering with acknowledge_comment, then resolve it only
-when substantively addressed; (5) release_task (to review or done) when
+when substantively addressed; get_task returns unresolved comments in full plus a short
+recent tail, and list_comments pages older notes — post_comment is a delta (what changed,
+an evidence pointer, what's next), not a pasted report, and the task body is a short current
+checkpoint, not a changelog; (5) release_task (to review or done) when
 finished. Never work on a task you have not claimed.
 When you file a task and already know more about the work than its title and body say — which
 files it touches, what to read first, what is already decided, what "done" looks like — put that
@@ -268,6 +274,7 @@ export const GET_BRIEFING_PLAYBOOK: readonly string[] = [
   'When a human steering comment arrives, call `acknowledge_comment` immediately so they know it was seen; acknowledgement leaves the comment unresolved and still blocks completion. Call `resolve_comment` only after you actually addressed it or chose `wont_do`, always with the substantive reply.',
   'Noriq is the channel of record for material project work: chat carries the user\'s initial command and concise outcome; Noriq carries task state, progress, gates, acknowledgements, alerts, and handoffs. Search before creating, and when the user names a task claim that task instead of filing a duplicate. A roaming copilot doing read-only work in another project should configure_agent first; runner-owned agents stay pinned.',
   'After blocking request_input, do not wait or repeat the question in chat: the task is parked, so call next_claimable and keep working elsewhere. With blocking:false, keep the current claim and continue independent work while the answer is pending.',
+  'get_task returns unresolved comments in full plus a short recent tail; list_comments pages older notes (status/authorKind/before). post_comment is a delta the next reader needs — what changed, a pointer to evidence, what happens next — not a pasted run report (attach a file or cite a path). Do not rewrite the whole task body as a changelog; keep a short current-checkpoint section and update that.',
 ];
 
 function room(env: Env, projectId: string) {
@@ -397,6 +404,7 @@ const WRITE_DESTRUCTIVE: ToolHints = { ...WRITE, destructiveHint: true };
 export const MCP_TOOL_POLICIES: Record<string, ToolHints> = {
   get_briefing: READ, my_updates: READ, list_agents: READ, list_groups: READ,
   list_templates: READ, list_docs: READ, get_doc: READ, get_project: READ, get_task: READ,
+  list_comments: READ,
   search_tasks: READ, semantic_search: READ, tag_report: READ, can_claim: READ,
   next_claimable: READ, check_locks: READ, list_locks: READ,
   get_plans: READ, get_plan_doc: READ, search_project_memory: READ, explain_project_area: READ,
@@ -427,7 +435,7 @@ export type ToolAudience = 'core' | 'planning' | 'maintenance' | 'orchestration'
 export const MCP_TOOL_AUDIENCE: Record<string, ToolAudience> = {
   get_briefing: 'core', my_updates: 'core', configure_agent: 'core', list_agents: 'core',
   list_docs: 'core', get_doc: 'core', get_project: 'core', create_tasks: 'core', update_tasks: 'core',
-  get_task: 'core', handoff_task: 'core', search_tasks: 'core', semantic_search: 'core', attach_files: 'core',
+  get_task: 'core', list_comments: 'core', handoff_task: 'core', search_tasks: 'core', semantic_search: 'core', attach_files: 'core',
   next_claimable: 'core', claim_task: 'core', heartbeat: 'core', release_task: 'core', acquire_lock: 'core',
   release_lock: 'core', check_locks: 'core', list_locks: 'core', post_comment: 'core', acknowledge_comment: 'core',
   resolve_comment: 'core', send_message: 'core', request_input: 'core', raise_alert: 'core', get_plans: 'core',
@@ -1435,7 +1443,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'get_task',
-    'Full task detail including body, dependencies, comments (open first), git refs, related docs (READ them before starting — they carry the design decisions the task must follow), claim state, and `executionSpec` — what this task tells you before you start. If it is there, its lockedDecisions bind you and its acceptance is your definition of done. If `executionSpecUnreadable` is set, the stored spec is corrupt: say so, and do not treat it as absent.',
+    'Full task detail including body, dependencies, comments, git refs, related docs (READ them before starting — they carry the design decisions the task must follow), claim state, and `executionSpec` — what this task tells you before you start. If it is there, its lockedDecisions bind you and its acceptance is your definition of done. If `executionSpecUnreadable` is set, the stored spec is corrupt: say so, and do not treat it as absent. Comments: unresolved (open/acknowledged) always come first and in full; then the most recent resolved notes. `moreResolvedComments` and `commentCounts` describe the rest — page them with list_comments. Do not treat get_task as the full journal.',
     { taskId: z.string() },
     tool(async ({ taskId }) => {
       const task = await env.DB.prepare(
@@ -1488,11 +1496,11 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
       task.executionSpec = storedSpec.spec;
       if (storedSpec.unreadable) task.executionSpecUnreadable = true;
       delete task.execution_spec;
-      // Comment history is unbounded; cap it so a long-lived task can't spill the result.
-      // Open/acknowledged (what you must act on) always come first and in full; the resolved
-      // tail is capped to the most recent COMMENT_CAP, with `moreResolvedComments` for the rest.
-      const COMMENT_CAP = 60;
-      const [deps, comments, commentTotal, refs, attachments, signals, docs] = await Promise.all([
+      // Comment history is unbounded; open/acknowledged always come in full (they block
+      // completion). The resolved tail is the newest GET_TASK_RESOLVED_CAP notes — page the
+      // rest with list_comments. A mixed LIMIT used to drop open comments and mislabel them
+      // as moreResolvedComments.
+      const [deps, commentPage, refs, attachments, signals, docs] = await Promise.all([
         env.DB.prepare(
           // projectId/projectKey say WHERE each blocker lives (PLNR-241) — same project for
           // most edges, but a cross-project blocker must be legible as one.
@@ -1500,15 +1508,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
            FROM dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id
            JOIN projects dp ON dp.id = dt.project_id WHERE d.task_id = ?`,
         ).bind(id).all(),
-        env.DB.prepare(
-          `SELECT id, author_kind AS authorKind, author_id AS authorId, kind, body, status, parent_comment_id AS parentCommentId, created_at AS createdAt
-           FROM comments WHERE task_id = ?
-           ORDER BY CASE WHEN status IN ('open','acknowledged') THEN 0 ELSE 1 END,
-                    CASE WHEN status IN ('open','acknowledged') THEN created_at ELSE '' END ASC,
-                    created_at DESC
-           LIMIT ${COMMENT_CAP}`,
-        ).bind(id).all(),
-        env.DB.prepare('SELECT COUNT(*) AS n FROM comments WHERE task_id = ?').bind(id).first<{ n: number }>(),
+        loadTaskCommentsForDetail(env.DB, id, GET_TASK_RESOLVED_CAP),
         env.DB.prepare('SELECT kind, ref, url, state FROM task_refs WHERE task_id = ?').bind(id).all(),
         env.DB.prepare(
           `SELECT id, filename, content_type AS contentType, size, uploaded_by_kind AS uploadedByKind, uploaded_by AS uploadedBy, created_at AS createdAt
@@ -1532,8 +1532,36 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         responseJson: s.responseJson ? JSON.parse(String(s.responseJson)) : null,
       }));
       const relatedDocs = docs.results.map((d) => ({ ...d, resource: docUri(String(d.id)) }));
-      const moreResolvedComments = Math.max(0, (commentTotal?.n ?? comments.results.length) - comments.results.length);
-      return { task, dependencies: deps.results, comments: comments.results, moreResolvedComments, refs: refs.results, attachments: withUris, signals: sigs, docs: relatedDocs };
+      return {
+        task, dependencies: deps.results, comments: commentPage.comments,
+        moreResolvedComments: commentPage.moreResolvedComments, commentCounts: commentPage.commentCounts,
+        refs: refs.results, attachments: withUris, signals: sigs, docs: relatedDocs,
+      };
+    }),
+  );
+
+  defineTool(
+    'list_comments',
+    'Page a task\'s comment history. get_task already gives you every unresolved comment plus a short recent tail — call this when you need older notes, a status/author filter, or the next page. Newest first. `before` is the last comment id from the previous page. Unresolved comments are the ones that still block done; resolved agent notes are a journal, not steering.',
+    {
+      taskId: z.string().describe('Task id or display key'),
+      status: z.enum(['open', 'resolved', 'all']).optional()
+        .describe('open = open+acknowledged (still blocking); resolved = addressed/wont_do; default all'),
+      authorKind: z.enum(['agent', 'human', 'system']).optional()
+        .describe('Restrict to comments authored by an agent, a human, or the system'),
+      limit: z.number().int().min(1).max(50).optional().describe('Page size, default 20, max 50'),
+      before: z.string().optional().describe('Comment id cursor — exclusive; rows older than this id'),
+    },
+    tool(async ({ taskId, status, authorKind, limit, before }) => {
+      const task = await env.DB.prepare(
+        'SELECT id, project_id AS projectId FROM tasks WHERE id = ? OR key = ?',
+      ).bind(taskId, taskId).first<{ id: string; projectId: string }>();
+      if (!task) throw new Error(`task ${taskId} not found`);
+      if (!(await userCanAccessProject(env, agent.userId, task.projectId))) {
+        throw new Error(`task ${taskId} not found`);
+      }
+      const page = await listTaskCommentsPaged(env.DB, task.id, { status, authorKind, limit, before });
+      return { taskId: task.id, ...page };
     }),
   );
 
@@ -1967,12 +1995,12 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'post_comment',
-    'Post your own non-blocking comment or reply to an existing task thread. Use request_input for a human decision.',
+    'Post your own non-blocking comment or reply to an existing task thread. A progress note is a delta: what changed, a pointer to evidence, what happens next — not a pasted run report (attach a file or cite a path). Use request_input for a human decision.',
     {
       projectId: z.string(),
       taskId: z.string().describe('Task id or display key'),
       kind: z.enum(['comment', 'reply']).default('comment').describe('comment = new thread; reply = answer inside the thread given by parentCommentId'),
-      body: z.string().min(1).describe('Comment text, markdown'),
+      body: z.string().min(1).max(COMMENT_BODY_MAX).describe('Comment text, markdown; a delta, not a dumped report (max 4000)'),
       parentCommentId: z.string().optional(),
     },
     tool(async ({ projectId, taskId, kind, body, parentCommentId }) =>

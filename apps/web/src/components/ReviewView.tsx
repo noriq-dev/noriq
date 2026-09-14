@@ -56,7 +56,10 @@ function ReviewRow({ task, store }: { task: TaskVM; store: AppStore }) {
   }, [task.id]);
 
   // The agent's parting words: last agent-authored comment (release_task notes land there).
-  const releaseNote = detail?.comments.filter((c) => c.authorKind === 'agent').at(-1) ?? null;
+  const releaseNote = (detail?.comments.filter((c) => c.authorKind === 'agent') ?? [])
+    .slice()
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+    .at(-1) ?? null;
   // The acceptance criteria the work was commissioned against (RUN-137). "Accept" is a judgement,
   // and a reviewer who cannot see the contract is judging from memory. READ-ONLY here on purpose:
   // editing at the moment of acceptance is moving the goalposts, and the drawer is where a spec

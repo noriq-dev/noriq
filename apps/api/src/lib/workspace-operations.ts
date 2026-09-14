@@ -3,6 +3,7 @@ import { search, type SearchKind } from '../search';
 import { taskSearchFilters, type TaskSearchFilters } from './search';
 import { USER_PROJECT_WHERE, taskWireStatus, tokenProjectWhere } from './visibility';
 import { readExecutionSpec } from './execution-spec';
+import { REST_DETAIL_RESOLVED_CAP, loadTaskCommentsForDetail } from './task-comments';
 import { assembleContextPack } from '../memory/context-pack';
 import type { ProjectMemoryStub } from './project-memory';
 
@@ -388,14 +389,8 @@ export async function workspaceTaskDetail(env: Env, scope: WorkspaceScope, taskR
   task.executionSpec = stored.spec;
   if (stored.unreadable) task.executionSpecUnreadable = true;
   delete task.execution_spec;
-  const [comments, commentTotal, refs, signals, docs, dependencies, runs] = await Promise.all([
-    env.DB.prepare(
-      `SELECT id, author_kind AS authorKind, author_id AS authorId, kind, body, status,
-              parent_comment_id AS parentCommentId, created_at AS createdAt
-       FROM comments WHERE task_id = ?
-       ORDER BY CASE WHEN status IN ('open','acknowledged') THEN 0 ELSE 1 END, created_at DESC LIMIT 40`,
-    ).bind(id).all(),
-    env.DB.prepare('SELECT COUNT(*) AS n FROM comments WHERE task_id = ?').bind(id).first<{ n: number }>(),
+  const [commentPage, refs, signals, docs, dependencies, runs] = await Promise.all([
+    loadTaskCommentsForDetail(env.DB, id, REST_DETAIL_RESOLVED_CAP),
     env.DB.prepare('SELECT kind, ref, url, state FROM task_refs WHERE task_id = ?').bind(id).all(),
     env.DB.prepare(
       `SELECT id, type, severity, title, body, status, blocking, response, created_at AS createdAt, resolved_at AS resolvedAt
@@ -414,12 +409,13 @@ export async function workspaceTaskDetail(env: Env, scope: WorkspaceScope, taskR
   ]);
   const project = byId.get(String(task.project_id))!;
   return {
-    asOf: new Date().toISOString(), task, comments: comments.results,
-    commentsMatched: commentTotal?.n ?? comments.results.length, commentsReturned: comments.results.length,
+    asOf: new Date().toISOString(), task, comments: commentPage.comments,
+    commentsMatched: commentPage.commentCounts.total, commentsReturned: commentPage.comments.length,
+    moreResolvedComments: commentPage.moreResolvedComments, commentCounts: commentPage.commentCounts,
     refs: refs.results, signals: signals.results, docs: docs.results, dependencies: dependencies.results, runs: runs.results,
     references: [
       reference('task', { ...task, key: task.key, title: task.title, status: task.status, updatedAt: task.updated_at }, project),
-      ...comments.results.map((comment) => reference('comment', {
+      ...commentPage.comments.map((comment) => reference('comment', {
         ...comment, title: `${String(task.key)} ${String(comment.kind)} comment`, updatedAt: comment.createdAt,
       }, project)),
       ...docs.results.map((doc) => reference('doc', doc, project)),

@@ -1,7 +1,8 @@
 // Live store — REST snapshots + WebSocket invalidation. Replaces the Phase-0 mock.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, type ApiProject, type ApiSnapshot, type ApiUiSurface } from './api';
-import type { AppData, CommentKind, EventVM, ProjectVM, TaskStatus, TaskVM, UserVM, ViewId } from './types';
+import type { AppData, CommentCounts, CommentKind, CommentVM, EventVM, ProjectVM, TaskStatus, TaskVM, UserVM, ViewId } from './types';
+import type { ApiTaskComment } from './api';
 
 const PALETTE = ['#4c9dff', '#b57bff', '#3fd98b', '#ff8a8a', '#c6f24e', '#f5a623'];
 const PROJECT_COLORS = ['#c6f24e', '#4c9dff', '#b57bff', '#f5a623', '#3fd98b', '#ff8a8a'];
@@ -184,6 +185,8 @@ export function useAppStore() {
   const [isAdmin, setIsAdmin] = useState(false);
   const [snapshot, setSnapshot] = useState<ApiSnapshot | null>(null);
   const [comments, setComments] = useState<TaskVM['comments']>([]);
+  const [commentsHasMore, setCommentsHasMore] = useState(false);
+  const [commentCounts, setCommentCounts] = useState<CommentCounts>({ open: 0, resolved: 0, total: 0 });
   const [tick, setTick] = useState(0);
   const [showArchived, setShowArchived] = useState(false);
   const [boardId, setBoardId] = useState<string | null>(null); // PLNR-80: which board the board view shows
@@ -332,16 +335,13 @@ export function useAppStore() {
   const loadComments = useCallback(async (tid: string) => {
     const detail = await api.taskDetail(tid);
     if (selRef.current !== tid) return;
-    setComments(
-      detail.comments.map((c) => ({
-        id: c.id,
-        author: c.authorId,
-        role: c.authorKind === 'agent' ? ('agent' as const) : ('human' as const),
-        kind: c.kind as CommentKind,
-        body: c.body,
-        status: c.status as TaskVM['comments'][number]['status'],
-      })),
-    );
+    setComments(detail.comments.map(mapTaskComment));
+    setCommentsHasMore((detail.moreResolvedComments ?? 0) > 0);
+    setCommentCounts(detail.commentCounts ?? {
+      open: detail.comments.filter((c) => c.status === 'open' || c.status === 'acknowledged').length,
+      resolved: detail.comments.filter((c) => c.status !== 'open' && c.status !== 'acknowledged').length,
+      total: detail.comments.length,
+    });
   }, []);
 
   useEffect(() => {
@@ -367,7 +367,11 @@ export function useAppStore() {
 
   useEffect(() => {
     if (selectedTaskId) void loadComments(selectedTaskId);
-    else setComments([]);
+    else {
+      setComments([]);
+      setCommentsHasMore(false);
+      setCommentCounts({ open: 0, resolved: 0, total: 0 });
+    }
   }, [selectedTaskId, loadComments]);
 
   // --- live channel -------------------------------------------------------------
@@ -942,7 +946,22 @@ export function useAppStore() {
     user, authChecked, needsSetup, modal, editMilestone, groups, snapshot, showArchived, boardId,
     isAdmin, adminProjects, permissions,
     currentPid: currentPid ?? '', view, selectedTaskId, selectedAgentId, draftKind, draftText, draggedId,
+    commentsHasMore, commentCounts,
     data, helpers, actions,
+  };
+}
+
+export function mapTaskComment(c: ApiTaskComment): CommentVM {
+  const role = c.authorKind === 'agent' ? 'agent' as const : c.authorKind === 'system' ? 'system' as const : 'human' as const;
+  return {
+    id: c.id,
+    author: c.authorId,
+    role,
+    kind: c.kind as CommentKind,
+    body: c.body,
+    status: c.status as CommentVM['status'],
+    createdAt: c.createdAt,
+    parentCommentId: c.parentCommentId ?? null,
   };
 }
 

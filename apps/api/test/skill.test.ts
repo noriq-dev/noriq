@@ -59,7 +59,7 @@ describe('skill core (PLNR-310)', () => {
     expect(text).toContain('anticipatedFiles');
     expect(text).toContain('Noriq is the channel of record');
     expect(text).toContain('configure_agent');
-    expect(text).toMatch(/complete non-Runner catalog[\s\S]+55 tools/i);
+    expect(text).toMatch(/complete non-Runner catalog[\s\S]+56 tools/i);
     expect(text).toMatch(/configure_agent[\s\S]+never changes[\s\S]+tool availability/i);
     expect(text).toContain('get_task_context');
     expect(text).toContain('repositoryKey');
@@ -78,7 +78,7 @@ describe('skill core (PLNR-310)', () => {
 
   it('keeps every skill frontmatter minimal and free of pack-activation guidance', () => {
     const skills = [SKILL_MD, ...Object.values(SKILL_REFERENCES), DOC_SKILL_MD];
-    expect(Object.values(MCP_TOOL_AUDIENCE).filter((audience) => audience !== 'runner')).toHaveLength(55);
+    expect(Object.values(MCP_TOOL_AUDIENCE).filter((audience) => audience !== 'runner')).toHaveLength(56);
     for (const skill of skills) {
       const frontmatter = skill.match(/^---\n([\s\S]*?)\n---\n/)?.[1];
       expect(frontmatter).toBeDefined();

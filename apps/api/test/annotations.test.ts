@@ -22,7 +22,7 @@ describe('MCP tool annotations (PLNR-88)', () => {
       expect(t.annotations, `${t.name} is missing annotations`).toBeTruthy();
       expect(t.annotations!.openWorldHint, `${t.name} openWorldHint`).toBe(false);
     }
-    for (const r of ['get_briefing', 'my_updates', 'get_project', 'get_task', 'next_claimable', 'get_plans', 'get_task_context']) {
+    for (const r of ['get_briefing', 'my_updates', 'get_project', 'get_task', 'list_comments', 'next_claimable', 'get_plans', 'get_task_context']) {
       expect(by[r]?.readOnlyHint, r).toBe(true);
     }
     // Writes are not read-only and not destructive (no MCP tool deletes data).

@@ -55,10 +55,18 @@ export interface AgentVM {
 export interface CommentVM {
   id: string;
   author: string;
-  role: 'human' | 'agent';
+  role: 'human' | 'agent' | 'system';
   kind: CommentKind;
   body: string;
   status: CommentStatus;
+  createdAt: string;
+  parentCommentId: string | null;
+}
+
+export interface CommentCounts {
+  open: number;
+  resolved: number;
+  total: number;
 }
 
 export interface TaskVM {
