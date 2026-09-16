@@ -41,6 +41,7 @@ import { MEMORY_SKILL_MD } from './skill-memory';
 import { SKILL_MD } from './skill';
 import { signUploadToken, resolveUploadSecret } from './lib/upload-token';
 import { taskClaimability } from './lib/claimability';
+import { presentCreatedPhases, presentPhaseOrder } from './lib/phase-order';
 import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
 import pkg from '../package.json';
 import {
@@ -182,8 +183,9 @@ Tasks you create MUST carry descriptive tags (topic/area/component words like "o
 reuse existing tags before minting new ones — near-duplicates are rejected, and curated
 projects accept no agent-minted tags at all. Never tag with status/type/priority
 words — those have dedicated fields. Plans need no dependency wiring: phase order itself
-gates tasks (a task is claimable when every earlier phase is finished); use dependsOn
-only for real, hand-picked orderings. A dependency may cross projects: ids and display
+gates tasks (a task is claimable when every earlier phase is finished); phases are numbered
+from 1, matching the Plans view (\`get_plans\` reports \`order: 1\` for the first phase, never 0);
+use dependsOn only for real, hand-picked orderings. A dependency may cross projects: ids and display
 keys are globally unique, so dependsOn/update_tasks.addDependsOn accept a blocker from any project
 you can access, and the claim gate works identically across the boundary.
 Priority runs 0 = MOST urgent to 4 = someday, as P0/P1 read everywhere else: P0 means drop
@@ -275,6 +277,7 @@ export const GET_BRIEFING_PLAYBOOK: readonly string[] = [
   'Noriq is the channel of record for material project work: chat carries the user\'s initial command and concise outcome; Noriq carries task state, progress, gates, acknowledgements, alerts, and handoffs. Search before creating, and when the user names a task claim that task instead of filing a duplicate. A roaming copilot doing read-only work in another project should configure_agent first; runner-owned agents stay pinned.',
   'After blocking request_input, do not wait or repeat the question in chat: the task is parked, so call next_claimable and keep working elsewhere. With blocking:false, keep the current claim and continue independent work while the answer is pending.',
   'get_task returns unresolved comments in full plus a short recent tail; list_comments pages older notes (status/authorKind/before). post_comment is a delta the next reader needs — what changed, a pointer to evidence, what happens next — not a pasted run report (attach a file or cite a path). Do not rewrite the whole task body as a changelog; keep a short current-checkpoint section and update that.',
+  'Plan phases are numbered from 1, matching the Plans view. get_plans reports `order: 1` for the first phase, never 0 — a user who says "start phase 3" means order 3, not the fourth phase.',
 ];
 
 function room(env: Env, projectId: string) {
@@ -2103,7 +2106,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'create_plan',
-    'Write your plan as a real document, then structure the work. body = your full written readout in markdown: goals, context, approach, constraints, risks, and an exit gate — what a teammate would need to pick this up. Each phase gets its own body (explicit details for that stage) plus its tasks (existing ids/keys via taskIds, or created inline via newTasks). Phase order is ENFORCED — computed live from the structure (PLNR-163), no edges minted: every task in phase N waits until all of phase N-1 is finished. Humans read the document and watch progress in the Plans view; append status updates later with update_plan. ' +
+    'Write your plan as a real document, then structure the work. body = your full written readout in markdown: goals, context, approach, constraints, risks, and an exit gate — what a teammate would need to pick this up. Each phase gets its own body (explicit details for that stage) plus its tasks (existing ids/keys via taskIds, or created inline via newTasks). Phase order is ENFORCED — computed live from the structure (PLNR-163), no edges minted: every task in phase N waits until all of phase N-1 is finished. Phases are numbered from 1 (the first phase is order 1), matching the Plans view — a user who says "start phase 3" means the third phase, not the fourth. Humans read the document and watch progress in the Plans view; append status updates later with update_plan. ' +
     EXECUTION_SPEC_DESC + ' Per newTask, never in taskDefaults — a spec names ONE piece of work, so a shared one would be wrong for every task that inherited it. This is how a scoping pass hands real execution detail forward instead of prose alone.',
     {
       projectId: z.string(),
@@ -2140,7 +2143,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
             executionSpec: ExecutionSpec.nullish(),
           })).optional(),
         }),
-      ).min(1).max(12).optional().describe('1-12 ordered phases; phase order gates the work'),
+      ).min(1).max(12).optional().describe('1-12 ordered phases; the first entry is phase 1 (matching the Plans view); phase order gates the work'),
     },
     tool(async ({ projectId, templateId, title, description, body, proposed, taskDefaults, phases }) => {
       if (templateId) {
@@ -2155,10 +2158,12 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
           taskDefaults?: { priority?: number; estimate?: number; type?: string; tags?: string[] };
           phases: Array<{ title: string; body?: string; newTasks: Array<{ title: string; body?: string; priority?: number; estimate?: number; type?: string; tags?: string[]; executionSpec?: ExecutionSpecInput | null }> }>;
         };
-        return room(env, projectId).createPlan(projectId, actor, { ...spec, title: title ?? spec.title, proposed, agentId: agent.id });
+        const created = await room(env, projectId).createPlan(projectId, actor, { ...spec, title: title ?? spec.title, proposed, agentId: agent.id });
+        return { ...created, phases: presentCreatedPhases(created.phases) };
       }
       if (!title || !phases) throw new Error('inline plans require title and phases');
-      return room(env, projectId).createPlan(projectId, actor, { title, description, body, proposed, agentId: agent.id, taskDefaults, phases });
+      const created = await room(env, projectId).createPlan(projectId, actor, { title, description, body, proposed, agentId: agent.id, taskDefaults, phases });
+      return { ...created, phases: presentCreatedPhases(created.phases) };
     }),
   );
 
@@ -2189,7 +2194,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
         if (title !== undefined || description !== undefined || body !== undefined) {
           await room(env, projectId).updatePlan(projectId, actor, planId, { title, description, body });
         }
-        return restructured;
+        return { ...restructured, phases: presentCreatedPhases(restructured.phases) };
       }
       if (phaseId) {
         return room(env, projectId).updatePhase(projectId, actor, phaseId, { title: phaseTitle, body: phaseBody });
@@ -2200,7 +2205,7 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
 
   defineTool(
     'get_plans',
-    'Plans in a project with per-phase progress — see how the work program is advancing. Each phase reports `total`, `done` (shipped) and `settled` (done + cancelled): a phase is FINISHED, and the next one open, when `settled === total` — a cancelled task is never coming back, so it gates nothing. Each plan also lists its plan-local docs (id/name/description); read a full one with get_plan_doc.',
+    'Plans in a project with per-phase progress — see how the work program is advancing. Each phase reports `order` numbered from 1 (matching the Plans view — the first phase is 1, never 0; a user who says "start phase 3" means order 3), plus `total`, `done` (shipped) and `settled` (done + cancelled): a phase is FINISHED, and the next one open, when `settled === total` — a cancelled task is never coming back, so it gates nothing. Each plan also lists its plan-local docs (id/name/description); read a full one with get_plan_doc.',
     { projectId: z.string() },
     tool(async ({ projectId }) => {
       const { results: plans } = await env.DB.prepare(
@@ -2220,13 +2225,16 @@ export function buildMcpServer(env: Env, agent: AgentIdentity, opts: { oauthToke
                   (SELECT COUNT(*) FROM phase_tasks pt JOIN tasks t ON t.id = pt.task_id WHERE pt.phase_id = ph.id AND t.status IN ('done','cancelled')) AS settled,
                   (SELECT GROUP_CONCAT(t.key) FROM phase_tasks pt JOIN tasks t ON t.id = pt.task_id WHERE pt.phase_id = ph.id) AS taskKeys
            FROM phases ph WHERE ph.plan_id = ? ORDER BY ph."order"`,
-        ).bind(p.id).all();
+        ).bind(p.id).all<{
+          id: string; title: string; body: string; order: number;
+          total: number; done: number; settled: number; taskKeys: string | null;
+        }>();
         // Plan-local docs (PLNR-200): summaries only — the body is fetched on demand via
         // get_plan_doc so a plan with many working docs doesn't bloat every get_plans.
         const { results: docRows } = await env.DB.prepare(
           'SELECT id, name, description, updated_at AS updatedAt FROM plan_docs WHERE plan_id = ? ORDER BY updated_at DESC',
         ).bind(p.id).all();
-        enriched.push({ ...p, phases: phasesRows, docs: docRows });
+        enriched.push({ ...p, phases: phasesRows.map(presentPhaseOrder), docs: docRows });
       }
       return { plans: enriched };
     }),

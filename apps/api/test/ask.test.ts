@@ -558,6 +558,7 @@ describe('Ask workspace read catalog', () => {
     expect(docs.references[0]).toEqual(expect.objectContaining({ kind: 'doc', projectId }));
     const plans = JSON.parse((await tools.find((tool) => tool.name === 'workspace_plans')!.execute({ projectId, limit: 1 })).content);
     expect(plans.plans[0].phases).toBeInstanceOf(Array);
+    expect(plans.plans[0].phases.every((phase: { order: number }) => phase.order >= 1)).toBe(true);
     expect(plans.references[0]).toEqual(expect.objectContaining({ kind: 'plan', projectId }));
 
     const review = JSON.parse((await tools.find((tool) => tool.name === 'workspace_review')!.execute({ projectId })).content);

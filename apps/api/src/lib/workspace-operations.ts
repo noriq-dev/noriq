@@ -5,6 +5,7 @@ import { USER_PROJECT_WHERE, taskWireStatus, tokenProjectWhere } from './visibil
 import { readExecutionSpec } from './execution-spec';
 import { REST_DETAIL_RESOLVED_CAP, loadTaskCommentsForDetail } from './task-comments';
 import { assembleContextPack } from '../memory/context-pack';
+import { presentPhaseOrder } from './phase-order';
 import type { ProjectMemoryStub } from './project-memory';
 
 /**
@@ -501,8 +502,11 @@ export async function workspacePlans(
               (SELECT COUNT(*) FROM phase_tasks pt JOIN tasks t ON t.id = pt.task_id WHERE pt.phase_id = ph.id AND t.status IN ('done','cancelled')) AS settled,
               (SELECT GROUP_CONCAT(t.key) FROM phase_tasks pt JOIN tasks t ON t.id = pt.task_id WHERE pt.phase_id = ph.id) AS taskKeys
        FROM phases ph WHERE ph.plan_id = ? ORDER BY ph."order"`,
-    ).bind(plan.id).all();
-    return { ...plan, phases };
+    ).bind(plan.id).all<{
+      id: string; title: string; body: string; order: number;
+      total: number; done: number; settled: number; taskKeys: string | null;
+    }>();
+    return { ...plan, phases: phases.map(presentPhaseOrder) };
   }));
   return {
     plans: enriched, matched: plans.matched, returned: plans.returned, capped: plans.capped,

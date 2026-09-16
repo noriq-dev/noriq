@@ -40,7 +40,9 @@ creates an active plan. Repeated shapes belong in \`save_template\` and can be i
 
 Phase order is **enforced by the phases themselves**: a task in phase N is claimable
 only once every task in earlier phases is settled (done or cancelled) — no dependency edges are created or
-needed, the plan IS the gate. Workers (you, later, or others) drain it in sequence via
+needed, the plan IS the gate. Phases are numbered from **1** (the first phase is phase 1), matching
+the Plans view; \`get_plans\` reports that as \`order\`. A user who says "start phase 3" means
+order 3, not the fourth phase. Workers (you, later, or others) drain it in sequence via
 \`next_claimable\`. Keep the document alive as you go with \`update_plan\` (status,
 findings, gotchas, final outcome; pass the full new body, or a \`phaseId\` to revise one
 phase). Plans are restructurable too: pass \`phases\` with the complete new shape to

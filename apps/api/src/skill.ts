@@ -234,7 +234,8 @@ Anything bigger than a single task starts with a **plan**, not open-loop claimin
 \`create_plan\` writes goals/approach/phases as a document humans can watch and workers
 can drain via \`next_claimable\`. Phase order is enforced by the phases themselves — a
 task in phase N is claimable only once every task in earlier phases is settled (done or cancelled), no
-dependency edges needed — and \`update_plan\` keeps it current as you go.
+dependency edges needed. Phases are numbered from 1, matching the Plans view
+(\`get_plans\` reports \`order: 1\` for the first phase, never 0). \`update_plan\` keeps it current as you go.
 
 A task's \`executionSpec\` (\`requirementIds\`, \`anticipatedFiles\`, \`requiredReading\`,
 \`lockedDecisions\`, \`discretion\`, \`deferred\`, \`acceptance.observableTruths\`) is what

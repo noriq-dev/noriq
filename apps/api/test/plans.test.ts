@@ -67,6 +67,7 @@ describe('plans & groups', () => {
       ],
     });
     expect(plan.body.phases).toHaveLength(3);
+    expect(plan.body.phases.map((p: { order: number }) => p.order)).toEqual([1, 2, 3]);
 
     // Phase-2 task is dep-blocked until phase-1 tasks are done.
     const buildTask = plan.body.phases[1].taskIds[0];
@@ -85,6 +86,7 @@ describe('plans & groups', () => {
     expect(plans.body.plans).toHaveLength(1);
     expect(plans.body.plans[0].body).toContain('# Goals');
     const phases = plans.body.plans[0].phases;
+    expect(phases.map((p: { order: number }) => p.order)).toEqual([1, 2, 3]);
     expect(phases[0].total).toBe(2);
     expect(phases[0].done).toBe(0);
     expect(phases[0].body).toContain('Schema first');
@@ -113,6 +115,7 @@ describe('plans & groups', () => {
     const snap = (await res.json()) as any;
     expect(snap.plans).toHaveLength(1);
     expect(snap.phases).toHaveLength(3);
+    expect(snap.phases.map((p: { order: number }) => p.order)).toEqual([0, 1, 2]);
     expect(snap.phaseTasks.length).toBe(4);
   });
 
@@ -454,6 +457,7 @@ describe('plans & groups', () => {
       ],
     });
     expect(move.isError).toBe(false);
+    expect(move.body.phases.map((p: { order: number }) => p.order)).toEqual([1, 2]);
 
     // movee now lives behind phase 1: blocked on base, where before it was claimable.
     const gated = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: movee });
@@ -490,6 +494,7 @@ describe('plans & groups', () => {
     const shape = after.body.plans.find((p: { id: string }) => p.id === plan.body.id);
     expect(shape.phases).toHaveLength(1);
     expect(shape.phases[0].title).toBe('Only');
+    expect(shape.phases[0].order).toBe(1);
     expect(shape.phases[0].total).toBe(2);
 
     // A phase id from some other plan is refused.
