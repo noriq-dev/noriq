@@ -17,8 +17,21 @@ const list = (qs = '') =>
 
 describe('project archive (PLNR-567)', () => {
   it('archives out of the default list, keeps data, and restores', async () => {
-    const p = (await mcpCall(agent.apiKey, 'create_project', { key: 'ARCHP', name: 'Archive Me' })).body as { id: string; key: string };
-    await mcpCall(agent.apiKey, 'create_task', { tags: ['test-fixture'], projectId: p.id, title: 'survives archive' });
+    // Create via REST so the session user owns it (MCP mint agents own their creates;
+    // admin default list is own-projects-only — PLNR-83).
+    const created = await SELF.fetch('https://noriq.test/api/projects', {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'ARCHP', name: 'Archive Me' }),
+    });
+    expect(created.status).toBe(200);
+    const p = await created.json() as { id: string; key: string };
+    const taskRes = await SELF.fetch(`https://noriq.test/api/projects/${p.id}/tasks`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'survives archive', tags: ['test-fixture'] }),
+    });
+    expect(taskRes.status).toBe(200);
 
     const before = await (await list()).json() as { projects: Array<{ id: string; status: string }> };
     expect(before.projects.some((row) => row.id === p.id)).toBe(true);
