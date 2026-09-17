@@ -30,9 +30,10 @@ beforeAll(async () => {
   await db.prepare(
     "INSERT OR IGNORE INTO agents (id, name, role, status, user_id, kind, created_at) VALUES ('agt_rd', 'rd-agent', 'worker', 'idle', 'usr_rd', 'copilot', ?)",
   ).bind(now).run();
+  // Connection copilot credential (agent_id NULL) — runner-bound tokens are refused post slice 5.
   await db.prepare(
-    `INSERT OR IGNORE INTO oauth_tokens (id, token_hash, client_id, user_id, agent_id, scope, expires_at)
-     VALUES ('tok_rd', ?, 'cli_rd', 'usr_rd', 'agt_rd', 'mcp', ?)`,
+    `INSERT OR IGNORE INTO oauth_tokens (id, token_hash, client_id, user_id, agent_id, copilot_id, scope, expires_at)
+     VALUES ('tok_rd', ?, 'cli_rd', 'usr_rd', NULL, 'agt_rd', 'mcp', ?)`,
   ).bind(await sha256Hex(AGENT_TOKEN), FUTURE).run();
 
   await createUser('rd-session@example.com', 'RD Session', 'longenough1', 'admin').catch(() => {});
@@ -78,12 +79,11 @@ describe('RUNNER_DISABLED kill-switch', () => {
     expect(dispatch.status).toBe(404);
   });
 
-  it('refuses runner WS upgrade with 410 while RUNNER_DISABLED', async () => {
+  it('returns 404 for removed runner daemon WebSocket route', async () => {
     const ws = await SELF.fetch('https://noriq.test/ws/runner/rnr_test', {
       headers: { ...bearer, Upgrade: 'websocket' },
     });
-    expect(ws.status).toBe(410);
-    expect(await ws.text()).toMatch(/runner execution is disabled/i);
+    expect(ws.status).toBe(404);
   });
 
   it('keeps MCP reachable (coordination-only)', async () => {
