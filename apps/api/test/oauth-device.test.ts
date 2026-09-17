@@ -126,13 +126,11 @@ describe('device authorization grant (RFC 8628)', () => {
     expect(ok.body.refresh_token).toMatch(/^plnrr_/);
     expect(ok.body.token_type).toBe('Bearer');
 
-    // The whole point: the token authenticates a runner against the control plane.
-    const reg = await SELF.fetch(`${BASE}/api/runners`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${ok.body.access_token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ label: 'device-authed-runner', tools: ['claude'], kinds: ['build'], maxConcurrency: 1, repos: [] }),
+    // Device-granted tokens authenticate agentAuth surfaces (runner registration REST is gone).
+    const health = await SELF.fetch(`${BASE}/api/health`, {
+      headers: { Authorization: `Bearer ${ok.body.access_token}` },
     });
-    expect(reg.status).toBe(200);
+    expect(health.status).toBe(200);
 
     // Replaying the device_code must not mint a second token.
     const replay = await poll(client_id, String(dev.device_code));

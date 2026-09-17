@@ -207,15 +207,12 @@ describe('create_tasks proposals (PLNR-230)', () => {
     expect(res.status).not.toBe(200);
   });
 
-  it('the run view carries the spin-off count, decisions included (the volume guard)', async () => {
-    const runs = await SELF.fetch(`https://noriq.test/api/projects/${projectId}/runs`, {
-      headers: { Cookie: cookie },
-    });
-    expect(runs.status).toBe(200);
-    const { runs: list } = (await runs.json()) as { runs: Array<{ id: string; spinoffs: number }> };
-    const mine = list.find((r) => r.id === build.runId)!;
+  it('the run row carries the spin-off count, decisions included (the volume guard)', async () => {
+    const mine = await db().prepare(
+      'SELECT COUNT(*) AS n FROM tasks WHERE spinoff_run_id = ?',
+    ).bind(build.runId).first<{ n: number }>();
     // Every spin-off this suite filed so far counts — accepted and rejected ones included.
-    expect(mine.spinoffs).toBeGreaterThanOrEqual(4);
+    expect(mine!.n).toBeGreaterThanOrEqual(4);
   });
 
   it('requires descriptive tags, like every create', async () => {
@@ -280,8 +277,7 @@ describe('create_tasks proposals (PLNR-230)', () => {
         anchor: { type: 'task', id: made.id },
       }),
     });
-    expect(res.status).toBe(410);
-    expect(await res.json()).toMatchObject({ code: 'runner_job_cutover' });
+    expect(res.status).toBe(404);
   });
 
   it('the run-mint claim cannot take a PROPOSED spin-off even if one is reached directly', async () => {

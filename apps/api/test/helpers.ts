@@ -1,6 +1,9 @@
 import { SELF, env } from 'cloudflare:test';
 import { VECTORIZE_METADATA_TOPK_MAX } from '../src/search';
 import { issueTokens } from '../src/oauth';
+import { resolveUploadSecret, signIngestToken } from '../src/lib/upload-token';
+import type { Env } from '../src/env';
+import { INGEST_TOKEN_TTL_SECONDS, MAX_INGEST_BATCH_BYTES } from '../src/memory/ingest';
 
 export const ADMIN = 'test-admin-token';
 
@@ -571,4 +574,68 @@ export async function authorizeForAllProjects(...apiKeys: string[]): Promise<voi
 async function sha256HexTest(s: string): Promise<string> {
   const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
   return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** Seed a live runner row bound to an OAuth token (replaces removed POST /api/runners in tests). */
+export async function seedOnlineRunnerForToken(
+  apiKey: string,
+  opts: {
+    runnerId?: string;
+    label?: string;
+    repos?: unknown[];
+    projectId?: string | null;
+  } = {},
+): Promise<string> {
+  const db = (env as unknown as Env).DB;
+  const hash = await sha256HexTest(apiKey);
+  const tok = await db.prepare('SELECT id, user_id AS userId FROM oauth_tokens WHERE token_hash = ?')
+    .bind(hash).first<{ id: string; userId: string }>();
+  if (!tok) throw new Error('seedOnlineRunnerForToken: unknown token');
+  const id = opts.runnerId ?? `rnr_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+  const now = new Date().toISOString();
+  await db.prepare(
+    `INSERT INTO runners (id, owner_user_id, project_id, label, status, capabilities, repos, free_slots, last_heartbeat_at, token_id, created_at)
+     VALUES (?, ?, ?, ?, 'online', '{}', ?, 1, ?, ?, ?)`,
+  ).bind(
+    id, tok.userId, opts.projectId ?? null, opts.label ?? 'test-runner',
+    JSON.stringify(opts.repos ?? []), now, tok.id, now,
+  ).run();
+  return id;
+}
+
+/** Mint an ingest capability JWT the way the removed runner-ingest route did (tests only). */
+export async function mintTestIngestToken(
+  apiKey: string,
+  body: {
+    projectId: string;
+    repositoryKey: string;
+    purpose: 'index' | 'episode';
+    scopeId: string;
+    runnerId: string;
+    checkoutId: string;
+    maxBytes?: number;
+  },
+): Promise<string> {
+  const appEnv = env as unknown as Env;
+  const secret = resolveUploadSecret(appEnv);
+  if (!secret) throw new Error('mintTestIngestToken: ingest secret not configured');
+  const hash = await sha256HexTest(apiKey);
+  const tok = await appEnv.DB.prepare('SELECT id, user_id AS userId FROM oauth_tokens WHERE token_hash = ?')
+    .bind(hash).first<{ id: string; userId: string }>();
+  if (!tok) throw new Error('mintTestIngestToken: unknown token');
+  const max = Math.min(body.maxBytes ?? MAX_INGEST_BATCH_BYTES, MAX_INGEST_BATCH_BYTES);
+  const exp = Math.floor(Date.now() / 1000) + INGEST_TOKEN_TTL_SECONDS;
+  return signIngestToken(secret, {
+    typ: 'ingest',
+    pid: body.projectId,
+    repositoryKey: body.repositoryKey,
+    purpose: body.purpose,
+    scopeId: body.scopeId,
+    runnerId: body.runnerId,
+    tokenId: tok.id,
+    ownerUserId: tok.userId,
+    checkoutId: body.checkoutId,
+    max,
+    exp,
+  });
 }

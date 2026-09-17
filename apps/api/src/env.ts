@@ -105,6 +105,6 @@ export interface Env {
   MAINTENANCE_MODE?: string;
   /** Runner execution plane kill-switch (drop-runner Phase 1): any truthy value refuses runner
    *  registration, dispatch, daemon WebSockets, and runner ingest with HTTP 410 while MCP
-   *  copilots and human coordination stay live. Pair with POST /api/admin/runner-plane/drain. */
+   *  copilots and human coordination stay live. */
   RUNNER_DISABLED?: string;
 }
