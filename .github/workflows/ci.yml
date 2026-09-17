@@ -1,6 +1,7 @@
-# PLNR-22: quality gate for contributors. Runs the test suite + typecheck on every
-# PR (and pushes to main). No secrets, no deploy — Noriq is self-hosted, so each
-# operator runs their own `wrangler deploy`. This only stops regressions from merging.
+# PLNR-22 / PLNR-559: quality gate for contributors. Typecheck, authz/wrangler/hook
+# guards, and the test suite on every PR (and pushes to main). No secrets, no deploy —
+# Noriq is self-hosted, so each operator runs their own `wrangler deploy`. This only
+# stops regressions from merging.
 name: CI
 
 on:
@@ -24,6 +25,15 @@ jobs:
 
       - name: Install
         run: npm ci
+
+      - name: Authorization boundaries
+        run: npm run check:authz
+
+      - name: Wrangler configs
+        run: npm run check:wrangler
+
+      - name: Claude Code hooks
+        run: npm run test:hooks
 
       # @noriq-dev/shared is consumed as source (no build output), so nothing to
       # build here — typecheck resolves it straight from packages/shared/src.
