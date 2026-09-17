@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { ExecutionSpec } from './execution-spec';
+import { AcceptedRevisionHandoff } from './runner';
 import { MissionLeaseRef } from './orchestration';
 
 /** A bounded, server-authored task as it existed when a single-root mission was commissioned. */
@@ -111,3 +112,29 @@ export const MissionQuestionAnswer = z.object({
   answeredAt: z.string().datetime(),
 }).strict();
 export type MissionQuestionAnswer = z.infer<typeof MissionQuestionAnswer>;
+
+export const MissionHandoffPublication = z.object({
+  reportId: z.string().min(1).max(160),
+  handoff: AcceptedRevisionHandoff,
+});
+export type MissionHandoffPublication = z.infer<typeof MissionHandoffPublication>;
+
+export const MissionHandoffAck = z.object({
+  reportId: z.string(),
+  accepted: z.boolean(),
+  handoffId: z.string().nullable().default(null),
+  state: z.enum(['preserved_unlanded', 'consumed_unlanded']).nullable().default(null),
+  preservedAt: z.string().datetime().nullable().default(null),
+  consumedAt: z.string().datetime().nullable().default(null),
+  consumptionId: z.string().nullable().default(null),
+  error: z.string().nullable().default(null),
+});
+export type MissionHandoffAck = z.infer<typeof MissionHandoffAck>;
+
+export const MissionHandoffConsumed = z.object({
+  runId: z.string().min(1),
+  handoff: AcceptedRevisionHandoff,
+  consumptionId: z.string().min(1),
+  consumedAt: z.string().datetime(),
+});
+export type MissionHandoffConsumed = z.infer<typeof MissionHandoffConsumed>;

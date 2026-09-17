@@ -12,7 +12,10 @@ import {
 } from '../lib/lockmatch';
 import { RUNNER_HEARTBEAT_TTL_MS } from '../lib/runner-roster';
 import type { ProjectMemoryStub } from '../lib/project-memory';
-import { buildEntityUri, RUNNER_JOB_CAPABILITY } from '@noriq-dev/shared';
+import { buildEntityUri } from '@noriq-dev/shared';
+
+/** Legacy runner registration capability — historical D1 rows only. */
+const RUNNER_JOB_CAPABILITY = 'runner-job.v2';
 import type { PriorEffortCase } from './similar-effort';
 
 export const BOTTLENECK_ASSESSMENT_VERSION = 'collision-bottleneck-v1';

@@ -1,4 +1,5 @@
-import { RunBudget, type CommissionedExecutionProfile, type ExecutedConfigurationEvidence, type ExecutionSpec, type ProjectIntelligenceEpisode } from '@noriq-dev/shared';
+import { RunBudget, type ExecutedConfigurationEvidence, type ExecutionSpec, type ProjectIntelligenceEpisode } from '@noriq-dev/shared';
+import type { CommissionedExecutionProfile } from './shared-runner-legacy';
 import { readExecutionSpec } from './execution-spec';
 import { nowIso, sha256Hex } from './util';
 

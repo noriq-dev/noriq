@@ -1,7 +1,8 @@
 // PLNR-300: immutable, per-sitting shadow evidence captured after dispatch commits. Nothing in
 // this module selects a strategy or returns a recommendation; capture failure degrades to an
 // explicit missing feature and is never thrown back through the dispatch response.
-import { RunnerCapabilities, type RunBudget } from '@noriq-dev/shared';
+import type { RunBudget } from '@noriq-dev/shared';
+import { RunnerCapabilities } from '../lib/shared-runner-legacy';
 import type { Env } from '../env';
 import {
   INTELLIGENCE_EXTRACTION_VERSION, loadRunSittingEvidence, type RunCommissioningSnapshot,

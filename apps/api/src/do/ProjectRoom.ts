@@ -14,12 +14,26 @@ import {
 import { searchBackend, indexEntity, removeEntity, type SearchKind } from '../search';
 import { findNearDupes } from '../lib/tags';
 import { DEFAULT_MAX_VERIFY_ATTEMPTS, type PhaseGateAction, phaseGateDecision } from '../lib/phase-gate';
-import { MISSION_CAPABILITY, MissionCommission as MissionCommissionSchema, MissionRootCommission as MissionRootCommissionSchema, RunnerJobEvent as RunnerJobEventSchema, RunnerJobRevision, RunnerJobSource as RunnerJobSourceSchema, RunKind, AgentTool, RunStatus, ExecutionProfileOffer, type AcceptedRevisionHandoff, type AcceptedRevisionHandoffView, type CommissionedExecutionProfile, type MissionCommission, type MissionCommissionSnapshot, type MissionRootCommission, type RunnerJobAssignment, type RunnerJobCheckpoint, type RunnerJobEvent, type RunnerJobSource, type TaskRootMissionCommissionSnapshot, type MissionHandoffAck, type MissionHandoffConsumed, type MissionQuestionAck, type MissionQuestionAnswer, type MissionQuestionPublication, type RunPhase, type ExecutionSpec, type ExecutionSpecInput, isTerminalRunStatus, RepositoryKey, type EventVerb, type EventSubjectType, type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef, type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport } from '@noriq-dev/shared';
-import { readExecutionSpec, writeExecutionSpec } from '../lib/execution-spec';
-import type {
-  RunnerCoordinationAcquire, RunnerCoordinationAcquireResult, RunnerCoordinationExchange,
-  RunnerCoordinationLease, RunnerCoordinationLeaseKind, RunnerCoordinationRecover,
+import {
+  MISSION_CAPABILITY, RepositoryKey, type ExecutionSpec, type ExecutionSpecInput,
+  type EventVerb, type EventSubjectType, type ExecutionAssignment,
+  type MissionAdoptionResult, type MissionInventoryItem, type MissionLeaseRef,
+  type MissionTaskAck, type MissionTaskBeginReport, type MissionTaskSettleReport,
 } from '@noriq-dev/shared';
+import {
+  MissionCommission as MissionCommissionSchema, MissionRootCommission as MissionRootCommissionSchema,
+  RunnerJobEvent as RunnerJobEventSchema, RunnerJobRevision, RunnerJobSource as RunnerJobSourceSchema,
+  RunKind, AgentTool, RunStatus, ExecutionProfileOffer, type AcceptedRevisionHandoff,
+  type AcceptedRevisionHandoffView, type CommissionedExecutionProfile, type MissionCommission,
+  type MissionCommissionSnapshot, type MissionRootCommission, type RunnerJobAssignment,
+  type RunnerJobCheckpoint, type RunnerJobEvent, type RunnerJobSource,
+  type TaskRootMissionCommissionSnapshot, type MissionHandoffAck, type MissionHandoffConsumed,
+  type MissionQuestionAck, type MissionQuestionAnswer, type MissionQuestionPublication,
+  type RunPhase, isTerminalRunStatus,
+  type RunnerCoordinationAcquire, type RunnerCoordinationAcquireResult, type RunnerCoordinationExchange,
+  type RunnerCoordinationLease, type RunnerCoordinationLeaseKind, type RunnerCoordinationRecover,
+} from '../lib/shared-runner-legacy';
+import { readExecutionSpec, writeExecutionSpec } from '../lib/execution-spec';
 import {
   processPendingCopilotEpisodeJob, processPendingEpisodeJob, processPendingRunnerJobEpisodeJob,
 } from '../memory/episodes';
@@ -41,8 +55,6 @@ import {
   recordShadowCaptureFailure,
   type StoredShadowDispatchSnapshot,
 } from '../memory/shadow-dispatch';
-import type { ExecutionAssignment } from '@noriq-dev/shared';
-import { isRunnerDisabled } from '../lib/runner-disabled';
 
 /**
  * ProjectRoom — one instance per project (idFromName(projectId)).
@@ -3992,7 +4004,7 @@ export class ProjectRoom extends DurableObject<Env> {
   ): Promise<{ commissioned: CommissionedExecutionProfile; slots: number; capacityLimit: number }> {
     const runner = await this.env.DB.prepare('SELECT repos FROM runners WHERE id = ?')
       .bind(runnerId).first<{ repos: string }>();
-    let repo: { id: string; executionProfiles: import('@noriq-dev/shared').ExecutionProfileOffer[] } | undefined;
+    let repo: { id: string; executionProfiles: ExecutionProfileOffer[] } | undefined;
     try {
       const raw = (JSON.parse(runner?.repos || '[]') as Array<{ id?: unknown; executionProfiles?: unknown }> )
         .find((value) => value.id === repoRef);
@@ -4001,7 +4013,7 @@ export class ProjectRoom extends DurableObject<Env> {
           id: repoRef,
           executionProfiles: Array.isArray(raw.executionProfiles)
             ? raw.executionProfiles.map((value) => ExecutionProfileOffer.safeParse(value))
-                .filter((result): result is { success: true; data: import('@noriq-dev/shared').ExecutionProfileOffer } => result.success)
+                .filter((result): result is { success: true; data: ExecutionProfileOffer } => result.success)
                 .map((result) => result.data)
             : [],
         };

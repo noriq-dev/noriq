@@ -3,7 +3,7 @@ import {
   type CommissionedExecutionProfile as CommissionedExecutionProfileValue,
   type ExecutionProfileOffer,
   type RunnerRepo,
-} from '@noriq-dev/shared';
+} from './shared-runner-legacy';
 import { RUNNER_HEARTBEAT_TTL_MS } from './runner-roster';
 
 type ProfileRepo = Pick<RunnerRepo, 'id' | 'executionProfiles'>;

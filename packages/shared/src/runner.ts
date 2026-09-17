@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { ExecutionAssignment, RunnerProtocolCapability } from './orchestration';
+import { ExecutionAssignment } from './orchestration';
 
 // ---------------------------------------------------------------------------
 // Noriq Runner — the execution plane (RUN plan, Phase 1). Runtime-neutral zod:
@@ -411,7 +411,7 @@ export const RunnerCapabilities = z.object({
   kinds: z.array(RunKind).default([]), // run kinds this runner will accept
   // Additive runtime capability evidence reported during registration. An omitted field means
   // an older registration whose RunnerJob support is unknown, not an explicit empty advert.
-  protocolCapabilities: z.array(RunnerProtocolCapability).max(16).optional(),
+  protocolCapabilities: z.array(z.string().min(1).max(80)).max(16).optional(),
   maxConcurrency: z.number().int().nonnegative().default(1),
   // The coordinate catalog per installed tool (RUN-115) — what the dashboard's agent picker reads.
   // Additive to `tools`; a runner too old to send it advertises an empty menu (free-text only).
