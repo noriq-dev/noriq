@@ -317,27 +317,31 @@ describe('activateIndexGeneration — real index_generations status transitions 
       scope: { generationId: 'gen_read_b', branch: 'main', baseId: 'sha-b' },
     });
     if (!active.available) throw new Error('expected active generation');
-    // PLNR-555: file bodies are stripped after activation (no CODE_VECTORIZE in this env,
-    // so strip is synchronous). URIs remain for citation checks; readActiveCodeIndex skips
-    // rows with null content.
-    expect(active.entities).toEqual([]);
-    expect(await memory(projectId)._countStagedContentForTest(projectId, 'gen_read_b')).toEqual({ rows: 2, withContent: 0 });
+    expect(active.entities.map((e) => e.uri)).toEqual([secondUri, firstUri]);
+    expect(active.entities[0]).toMatchObject({ uri: secondUri, content: 'second', contentTruncated: true });
+    expect(await memory(projectId)._countStagedContentForTest(projectId, 'gen_read_b')).toEqual({ rows: 2, withContent: 2 });
+    // Superseded generation bodies were stripped at cutover (PLNR-555).
     expect(await memory(projectId)._countStagedContentForTest(projectId, 'gen_read_a')).toEqual({ rows: 1, withContent: 0 });
     await expect(memory(projectId).readActiveCodeIndex(projectId, {
       repositoryKey: 'repo-r', generationId: 'gen_read_a', uris: [oldUri],
     })).resolves.toEqual({ available: false, reason: 'active-generation-changed' });
   });
 
-  it('nulls staged file bodies after activation but keeps URIs (PLNR-555)', async () => {
+  it('nulls superseded staged file bodies at cutover but keeps URIs and active bodies (PLNR-555)', async () => {
     const { projectId } = await newOwnedProject('code-idx-555@example.com', 'CIDX555');
-    const uri = 'noriq://file/CIDX555/repo-s/keep.ts';
+    const oldUri = 'noriq://file/CIDX555/repo-s/old.ts';
+    const keepUri = 'noriq://file/CIDX555/repo-s/keep.ts';
     await stageAndActivate(projectId, {
-      generationId: 'gen_strip', repositoryKey: 'repo-s', branch: 'main', baseId: 'sha-s',
-      entities: [{ kind: 'node', uri, type: 'file', label: 'keep.ts', content: 'this body must not survive activation' }],
+      generationId: 'gen_strip_a', repositoryKey: 'repo-s', branch: 'main', baseId: 'sha-a',
+      entities: [{ kind: 'node', uri: oldUri, type: 'file', label: 'old.ts', content: 'superseded body' }],
     });
-    expect(await memory(projectId)._getIndexGenerationStatusForTest(projectId, 'gen_strip')).toBe('active');
-    expect(await memory(projectId)._countStagedIndexRowsForTest(projectId, 'gen_strip')).toMatchObject({ entities: 1 });
-    expect(await memory(projectId)._countStagedContentForTest(projectId, 'gen_strip')).toEqual({ rows: 1, withContent: 0 });
+    await stageAndActivate(projectId, {
+      generationId: 'gen_strip_b', repositoryKey: 'repo-s', branch: 'main', baseId: 'sha-b',
+      entities: [{ kind: 'node', uri: keepUri, type: 'file', label: 'keep.ts', content: 'active body stays for readActiveCodeIndex' }],
+    });
+    expect(await memory(projectId)._getIndexGenerationStatusForTest(projectId, 'gen_strip_b')).toBe('active');
+    expect(await memory(projectId)._countStagedContentForTest(projectId, 'gen_strip_a')).toEqual({ rows: 1, withContent: 0 });
+    expect(await memory(projectId)._countStagedContentForTest(projectId, 'gen_strip_b')).toEqual({ rows: 1, withContent: 1 });
   });
 });
 
