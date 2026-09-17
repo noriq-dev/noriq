@@ -1,6 +1,6 @@
 import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { createAgent, createRunAgent, createUser, loginSession, mcpCall, authorizeForAllProjects } from './helpers';
+import { createAgent, createUser, loginSession, mcpCall, authorizeForAllProjects } from './helpers';
 
 // NOTE: runs in the same shared-storage suite as coordination.test.ts;
 // setup endpoints are exercised first while no users beyond ours may exist.
@@ -593,19 +593,16 @@ describe('plans & groups', () => {
     await mcpCall(planner.apiKey, 'update_task', { projectId, taskId: cancelled, status: 'cancelled' });
 
     // Nothing in phase 1 is still going to happen, so phase 2 must open.
-    const guard = await createRunAgent(projectId, 'build', { allowedTools: ['can_claim'] });
-    const probe = await mcpCall(guard.apiKey, 'can_claim', { taskId: dependent });
-    expect(probe.body.claimable).toBe(true);
     const open = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: dependent });
     expect(open.isError).toBe(false);
     await mcpCall(worker.apiKey, 'release_task', { projectId, taskId: dependent, toStatus: 'done' });
   });
 
-  it('can_claim reports the phase gate without claiming — the RUN-81 backstop probe (PLNR-177)', async () => {
+  it('claim_task reports the phase gate without claiming (PLNR-177)', async () => {
     const plan = await mcpCall(planner.apiKey, 'create_plan', {
       projectId,
       title: 'Probe the gate',
-      description: 'can_claim',
+      description: 'phase gate',
       body: '# Goal\n\nprobe.',
       phases: [
         { title: 'One', newTasks: [{ title: 'probe base' }] },
@@ -613,32 +610,20 @@ describe('plans & groups', () => {
       ],
     });
     const base = plan.body.phases[0].taskIds[0];
-    const guard = await createRunAgent(projectId, 'build', { allowedTools: ['can_claim'] });
-    const baseKey = (await mcpCall(guard.apiKey, 'can_claim', { taskId: base })).body.taskKey;
     const dependent = plan.body.phases[1].taskIds[0];
 
-    // Phase 2 is locked while phase 1 is unfinished — reported, not claimed.
-    const blocked = await mcpCall(guard.apiKey, 'can_claim', { taskId: dependent });
-    expect(blocked.isError).toBe(false);
-    expect(blocked.body.claimable).toBe(false);
-    expect(blocked.body.reason).toContain(baseKey);
+    const blocked = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: dependent });
+    expect(blocked.isError).toBe(true);
+    expect(blocked.text).toMatch(/phase|earlier|blocked|unfinished/i);
 
-    // Phase 1 itself is claimable.
-    expect((await mcpCall(guard.apiKey, 'can_claim', { taskId: base })).body.claimable).toBe(true);
+    expect((await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: base })).isError).toBe(false);
 
-    // A task only in review is not claimable (the RUN-59 shape: verifier passed, not approved).
-    await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: base });
     await mcpCall(worker.apiKey, 'release_task', { projectId, taskId: base, toStatus: 'review' });
-    const inReview = await mcpCall(guard.apiKey, 'can_claim', { taskId: dependent });
-    expect(inReview.body.claimable).toBe(false); // phase 1 in review ≠ done → phase 2 stays locked
-    expect((await mcpCall(guard.apiKey, 'can_claim', { taskId: base })).body.reason).toContain('review');
+    const stillBlocked = await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: dependent });
+    expect(stillBlocked.isError).toBe(true);
 
-    // Approving phase 1 (done) opens phase 2.
     await mcpCall(worker.apiKey, 'update_task', { projectId, taskId: base, status: 'done' });
-    expect((await mcpCall(guard.apiKey, 'can_claim', { taskId: dependent })).body.claimable).toBe(true);
-
-    // Unknown task → error, so the daemon's probe fails OPEN (never strands a run).
-    expect((await mcpCall(guard.apiKey, 'can_claim', { taskId: 'task_nope' })).isError).toBe(true);
+    expect((await mcpCall(worker.apiKey, 'claim_task', { projectId, taskId: dependent })).isError).toBe(false);
   });
 
   // ---- PLNR-228: create a task straight into a plan phase -----------------------

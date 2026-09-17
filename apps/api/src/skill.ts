@@ -83,28 +83,21 @@ only when you're about to do the thing it covers, either by its URL or by MCP
 ## Who you are
 
 You already are somebody — **nothing to register**. \`get_briefing\` returns \`you\`, and
-\`you.kind\` says which sort:
+\`you.kind\` is **\`copilot\`**: a human's MCP session (this chat, or a sub-agent you spawn).
+It was registered when they authorized this connection, and each session hangs off that
+connection automatically, so attribution — including sub-agents — needs no call from you. A
+copilot may roam between projects.
 
-- **\`copilot\`** — a human's session (this chat, or a sub-agent you spawn). It was registered
-  when they authorized this connection, and each session hangs off that connection
-  automatically, so attribution — including sub-agents — needs no call from you. A copilot may
-  roam between projects.
-- **\`agent\`** — created by a **runner** for exactly one run, before your process even started:
-  you hold a credential that can only be you. You are pinned to one project for life, and your
-  heartbeat is the signal that says you're alive.
-
-Identity is assigned, not claimed. \`configure_agent\` updates the existing Copilot's name,
-role, or project focus; it never creates an identity and Runner agents cannot change project
-focus.
+Identity is assigned, not claimed. \`configure_agent\` updates your name, role, or project
+focus; it never creates an identity.
 
 ## Tool availability
 
-An OAuth Copilot receives the complete non-Runner catalog on every session — catalog revision 3
-contains 56 tools. There are no optional packs to enable, and \`configure_agent\` never changes
-tool availability. Do not reconnect just to expand the catalog. Runner agents are different:
-their daemon-provided \`allowedTools\` floor is the exact catalog they may advertise and invoke,
-including Runner-only tools. A visible tool is capability, not authorization; project roles,
-token scope, and server-side validation still govern each call.
+Every OAuth copilot session receives the full coordination catalog on every connection — catalog
+revision 3 contains 56 tools. There are no optional packs to enable, and \`configure_agent\`
+never changes tool availability. Do not reconnect just to expand the catalog. A visible tool is
+capability, not authorization; project roles, token scope, and server-side validation still
+govern each call.
 
 ## The work loop
 
@@ -112,8 +105,7 @@ token scope, and server-side validation still govern each call.
 2. Pick work: use the \`claimable\` list, or \`next_claimable\` for the single best pick.
    For anything more specific — "review tasks tagged auth", "my in-progress work" —
    \`search_tasks\` filters instead of dumping the whole project.
-   A roaming Copilot doing read-only work in another project should call \`configure_agent\` first;
-   runner-owned agents are pinned and cannot roam.
+   A roaming copilot doing read-only work in another project should call \`configure_agent\` first.
 3. \`claim_task\` — you MUST claim before working, and claim only the **one** task you're
    about to start (don't batch-claim a list — an already-\`in_progress\` task is held, so
    re-claiming just errors). Claims are exclusive; a failed claim means pick something else.
@@ -219,14 +211,12 @@ After a blocking \`request_input\`, do not repeat the question in chat or wait t
 parked and released the task; call \`next_claimable\` and continue useful work. After a
 non-blocking request, keep the current claim and continue immediately.
 
-Working a **run** and found real work that is not your task's? Use \`create_tasks\` with
-\`proposal\` metadata:
-the finding becomes its own **proposed** task — visible on the board but unclaimable
-and undispatchable until a human accepts it (accept → todo) or rejects it (→
-cancelled) — with your run id, your task and the finding text recorded as durable
-provenance. If it belongs in a plan, set \`phaseId\` when you file it — placement is
-yours, not the accepter's. Neither fold adjacent work into your diff nor \`raise_alert\` it: an alert
-is a concern that is NOT work, a proposal is work that is not YOURS.
+Found real work that is not your task's? Use \`create_tasks\` with \`proposal\` metadata: the
+finding becomes its own **proposed** task — visible on the board but unclaimable until a human
+accepts it (accept → todo) or rejects it (→ cancelled) — with your task and the finding text
+recorded as durable provenance. If it belongs in a plan, set \`phaseId\` when you file it.
+Neither fold adjacent work into your diff nor \`raise_alert\` it: an alert is a concern that is
+NOT work, a proposal is work that is not YOURS.
 
 ## Planning
 
@@ -241,9 +231,8 @@ A task's \`executionSpec\` (\`requirementIds\`, \`anticipatedFiles\`, \`required
 \`lockedDecisions\`, \`discretion\`, \`deferred\`, \`acceptance.observableTruths\`) is what
 the agent that claims it is handed before it starts — read it via \`get_task\` before you
 begin; its \`lockedDecisions\` bind you and its \`acceptance\` is your definition of done.
-Only a planner (a human, a copilot, or a **scope** run) may write one — never a
-**build**/**verify** run on its own task, since the spec is what its work is judged
-against.
+Write specs when you plan work or know more than the title says; they are what the claiming
+agent is judged against.
 
 Full detail — the \`create_plan\` shape, writing a good spec field by field,
 \`create_tasks\`, \`update_tasks.addDependsOn\` — is in the planning reference: \`GET

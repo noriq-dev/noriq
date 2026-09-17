@@ -1,12 +1,10 @@
-// create_tasks proposal mode (PLNR-230, server half of RUN-188): an agent files adjacent work as its
-// own task in a PROPOSED, ungated state. The product must be inert to every agent path
-// (claim_task, next_claimable, the claimable feed, handoff, the dispatch pump) until a human
-// accepts it — and the provenance (run id, source task, finding) must be durable and
-// queryable, because the runner's adjudicator verifies "out of scope, tracked THERE"
-// pointers against it mechanically.
+// create_tasks proposal mode (PLNR-230): a copilot files adjacent work as its own task in a
+// PROPOSED, ungated state. The product must be inert to every agent path (claim_task,
+// next_claimable, the claimable feed, handoff) until a human accepts it — and provenance
+// (source task, finding, filedBy) must be durable and queryable.
 import { SELF, env } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { authorizeForAllProjects, createAgent, createRunAgent, createUser, loginSession, mcpCall } from './helpers';
+import { authorizeForAllProjects, createAgent, createUser, loginSession, mcpCall } from './helpers';
 
 const db = () => (env as unknown as { DB: D1Database }).DB;
 /** Direct DO access, for asserting the mint-claim predicate itself rather than a route that
@@ -20,7 +18,6 @@ const room = (projectId: string) =>
 
 describe('create_tasks proposals (PLNR-230)', () => {
   let copilot: { id: string; apiKey: string };
-  let build: { agentId: string; apiKey: string; runId: string };
   let projectId: string;
   let anchorTaskId: string;
   let cookie: string;
@@ -37,10 +34,7 @@ describe('create_tasks proposals (PLNR-230)', () => {
     });
     expect(anchor.isError).toBeFalsy();
     anchorTaskId = anchor.body.id;
-    build = await createRunAgent(projectId, 'build');
-    // The fixture seeds an anchorless run; anchor it like the dispatch path would.
-    await db().prepare("UPDATE runs SET anchor_type = 'task', anchor_id = ? WHERE id = ?")
-      .bind(anchorTaskId, build.runId).run();
+    await mcpCall(copilot.apiKey, 'claim_task', { projectId, taskId: anchorTaskId });
     // The human who owns the project (createAgent's shared mint user) — accept/reject are
     // dashboard (cookie-auth) actions.
     cookie = await loginSession('agent-mint@example.com', 'longenough1');
@@ -54,12 +48,15 @@ describe('create_tasks proposals (PLNR-230)', () => {
   });
 
   const fileProposal = async (title: string) => {
-    const res = await mcpCall(build.apiKey, 'create_tasks', {
+    const res = await mcpCall(copilot.apiKey, 'create_tasks', {
       projectId, allowNewTags: true,
       tasks: [{
         title,
         body: 'seen while working the anchor — deserves its own task',
-        proposal: { finding: 'refresh tokens are logged in cleartext in oauth.ts — real, but not my task' },
+        proposal: {
+          finding: 'refresh tokens are logged in cleartext in oauth.ts — real, but not my task',
+          sourceTaskId: anchorTaskId,
+        },
         tags: ['spinoff-oauth'],
         priority: 0, // P0 outranks everything (PLNR-231), so the claimable surfaces would offer it first if ungated
       }],
@@ -72,12 +69,11 @@ describe('create_tasks proposals (PLNR-230)', () => {
     const made = await fileProposal('adjacent: stop logging refresh tokens');
     expect(made.status).toBe('proposed');
 
-    const detail = await mcpCall(build.apiKey, 'get_task', { taskId: made.id });
+    const detail = await mcpCall(copilot.apiKey, 'get_task', { taskId: made.id });
     const task = detail.body.task;
     expect(task.status).toBe('proposed');
     expect(task.proposedAt).toBeTruthy();
-    // Provenance is derived from the live run, never caller-claimed.
-    expect(task.proposal.runId).toBe(build.runId);
+    expect(task.proposal.runId).toBeNull();
     expect(task.proposal.sourceTaskId).toBe(anchorTaskId);
     expect(task.proposal.sourceTaskKey).toBe('SPN-1');
     expect(task.proposal.finding).toContain('refresh tokens are logged');
@@ -94,14 +90,15 @@ describe('create_tasks proposals (PLNR-230)', () => {
     const updates = await mcpCall(copilot.apiKey, 'my_updates', {});
     expect((updates.body.claimable as Array<{ id: string }>).map((t) => t.id)).not.toContain(made.id);
 
-    // The mutating arbiter refuses (can_claim is Runner-only in catalog revision 2).
     const claim = await mcpCall(copilot.apiKey, 'claim_task', { projectId, taskId: made.id });
     expect(claim.isError).toBe(true);
     expect(claim.text).toContain('proposed task');
 
     // A handoff is a claim by another door — refused too.
+    const other = await createAgent('spinoff-handoff-target');
+    await mcpCall(other.apiKey, 'configure_agent', { projectId });
     const handoff = await mcpCall(copilot.apiKey, 'handoff_task', {
-      projectId, taskId: made.id, toAgentId: build.agentId,
+      projectId, taskId: made.id, toAgentId: other.id,
     });
     expect(handoff.isError).toBe(true);
     expect(handoff.text).toContain('proposed task');
@@ -120,7 +117,7 @@ describe('create_tasks proposals (PLNR-230)', () => {
     expect(detail.body.task.status).toBe('todo');
     expect(detail.body.task.proposedAt).toBeNull();
     // The durable record the adjudicator checks — untouched by the decision.
-    expect(detail.body.task.proposal.runId).toBe(build.runId);
+    expect(detail.body.task.proposal.sourceTaskId).toBe(anchorTaskId);
     expect(detail.body.task.proposal.finding).toContain('refresh tokens');
 
     // Accepted means genuinely claimable now.
@@ -138,7 +135,7 @@ describe('create_tasks proposals (PLNR-230)', () => {
     });
     expect(plan.isError).toBeFalsy();
     const phaseId: string = plan.body.phases[0].id;
-    const filed = await mcpCall(build.apiKey, 'create_tasks', {
+    const filed = await mcpCall(copilot.apiKey, 'create_tasks', {
       projectId,
       tasks: [{
         title: 'placed by the proposer', tags: ['spinoff-anchor'], phaseId,
@@ -190,7 +187,7 @@ describe('create_tasks proposals (PLNR-230)', () => {
 
     const detail = await mcpCall(copilot.apiKey, 'get_task', { taskId: made.id });
     expect(detail.body.task.status).toBe('cancelled');
-    expect(detail.body.task.proposal.runId).toBe(build.runId);
+    expect(detail.body.task.proposal.sourceTaskId).toBe(anchorTaskId);
 
     const claim = await mcpCall(copilot.apiKey, 'claim_task', { projectId, taskId: made.id });
     expect(claim.isError).toBe(true);
@@ -207,16 +204,8 @@ describe('create_tasks proposals (PLNR-230)', () => {
     expect(res.status).not.toBe(200);
   });
 
-  it('the run row carries the spin-off count, decisions included (the volume guard)', async () => {
-    const mine = await db().prepare(
-      'SELECT COUNT(*) AS n FROM tasks WHERE spinoff_run_id = ?',
-    ).bind(build.runId).first<{ n: number }>();
-    // Every spin-off this suite filed so far counts — accepted and rejected ones included.
-    expect(mine!.n).toBeGreaterThanOrEqual(4);
-  });
-
   it('requires descriptive tags, like every create', async () => {
-    const res = await mcpCall(build.apiKey, 'create_tasks', {
+    const res = await mcpCall(copilot.apiKey, 'create_tasks', {
       projectId, tasks: [{ title: 'untagged', proposal: { finding: 'something real' } }],
     });
     expect(res.isError).toBe(false);
@@ -230,24 +219,6 @@ describe('create_tasks proposals (PLNR-230)', () => {
     expect(res.isError).toBe(false);
     const detail = await mcpCall(copilot.apiKey, 'get_task', { taskId: res.body.created[0].id });
     expect(detail.body.task.proposal).toMatchObject({ runId: null, sourceTaskId: null, finding: 'x' });
-  });
-
-  it('rejects an ordinary or mixed Runner batch before writing any item', async () => {
-    const before = await db().prepare('SELECT COUNT(*) AS n FROM tasks WHERE project_id = ?').bind(projectId).first<{ n: number }>();
-    const ordinary = await mcpCall(build.apiKey, 'create_tasks', {
-      projectId, tasks: [{ title: 'ordinary runner task', tags: ['spinoff-oauth'] }],
-    });
-    expect(ordinary.isError).toBe(true);
-    const mixed = await mcpCall(build.apiKey, 'create_tasks', {
-      projectId,
-      tasks: [
-        { title: 'valid proposal', tags: ['spinoff-oauth'], proposal: { finding: 'real adjacent work' } },
-        { title: 'ordinary item poisons the whole batch', tags: ['spinoff-oauth'] },
-      ],
-    });
-    expect(mixed.isError).toBe(true);
-    const after = await db().prepare('SELECT COUNT(*) AS n FROM tasks WHERE project_id = ?').bind(projectId).first<{ n: number }>();
-    expect(after!.n).toBe(before!.n);
   });
 
   it('search_tasks speaks the derived status: proposed is findable, todo does not sweep it in', async () => {
@@ -289,7 +260,7 @@ describe('create_tasks proposals (PLNR-230)', () => {
       `INSERT INTO runs (id, project_id, runner_id, kind, repo_ref, agent_tool, status, created_by, anchor_type, anchor_id)
        VALUES (?, ?, NULL, 'build', 'repo_x', 'claude', 'dispatched', 'usr_t', 'task', ?)`,
     ).bind(runId, projectId, made.id).run();
-    await room(projectId).claimAnchorTaskOnMint(projectId, runId, build.agentId);
+    await room(projectId).claimAnchorTaskOnMint(projectId, runId, copilot.id);
     const row = await db().prepare('SELECT status, claimed_by AS claimedBy, proposed_at AS proposedAt FROM tasks WHERE id = ?')
       .bind(made.id).first<{ status: string; claimedBy: string | null; proposedAt: string | null }>();
     expect(row!.claimedBy).toBeNull();
@@ -315,12 +286,12 @@ describe('create_tasks proposals (PLNR-230)', () => {
     });
     expect(snap.status).toBe(200);
     const { tasks } = (await snap.json()) as {
-      tasks: Array<{ id: string; status: string; proposedAt: string | null; proposal: { runId: string | null; finding: string } | null }>;
+      tasks: Array<{ id: string; status: string; proposedAt: string | null; proposal: { runId: string | null; sourceTaskId: string | null; finding: string } | null }>;
     };
     const t = tasks.find((x) => x.id === made.id)!;
     expect(t.status).toBe('proposed');
     expect(t.proposedAt).toBeTruthy();
-    expect(t.proposal?.runId).toBe(build.runId);
+    expect(t.proposal?.sourceTaskId).toBe(anchorTaskId);
     expect(t.proposal?.finding).toContain('refresh tokens');
   });
 });

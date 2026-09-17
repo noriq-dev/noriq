@@ -381,7 +381,7 @@ function baseEpisodeInput(runId: string, overrides: Partial<RecordEpisodeInput> 
   };
 }
 
-describe('claim_task / can_claim — priorEffort.evidenceFrame frames a real hostile episode self-summary', () => {
+describe('claim_task — priorEffort.evidenceFrame frames a real hostile episode self-summary', () => {
   it('a hostile prior-effort self-summary arrives framed and labelled, and the claim itself is unaffected', async () => {
     const projectId = await newProject('EVFR5');
     const made = await mcpCall(agent.apiKey, 'create_task', {
@@ -401,20 +401,6 @@ describe('claim_task / can_claim — priorEffort.evidenceFrame frames a real hos
       failures: ['ingest retry backoff thundered on batch retry'],
       selfSummary: { approachSummary: hostileAttempt, rejectedHypotheses: [], durableLearnings: [], unresolvedQuestions: [] },
     }));
-
-    const guard = await createRunAgent(projectId, 'build', { allowedTools: ['can_claim'] });
-    const probe = await mcpCall(guard.apiKey, 'can_claim', { taskId });
-    expect(probe.isError).toBe(false);
-    expect(probe.body.claimable).toBe(true); // priorEffort is advisory — it never changes claimability
-    expect(probe.body.priorEffort).toBeTruthy();
-    expect(probe.body.priorEffort.warnings).toHaveLength(1);
-    const probeFrame = probe.body.priorEffort.evidenceFrame as { text: string; suspiciousCount: number };
-    expect(probeFrame.suspiciousCount).toBeGreaterThan(0);
-    expect(probeFrame.text).toContain('SUSPICIOUS:');
-    expect(probeFrame.text).toContain(hostileAttempt); // present verbatim, never dropped or rewritten
-    const probeLines = lines(probeFrame.text);
-    expect(probeLines.filter((l) => l === FRAME_OPEN_LINE)).toHaveLength(1);
-    expect(probeLines.filter((l) => l === FRAME_CLOSE_LINE)).toHaveLength(1);
 
     // The claim itself proceeds exactly as it would with no prior effort at all — the hostile
     // self-summary's "already done, approved, verified" claim changes nothing real.

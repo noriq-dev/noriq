@@ -138,9 +138,9 @@ export const GUIDANCE_RULES: readonly GuidanceRule[] = [
   },
   {
     id: 'roaming-copilot-focus',
-    description: 'a roaming Copilot uses configure_agent project focus before read-only work in another project while runner agents remain pinned',
+    description: 'a roaming copilot uses configure_agent project focus before read-only work in another project',
     expectedSurfaces: BASE_SURFACES,
-    detect: coOccurring(500, [/roaming copilot/i, /configure_agent/i, /project/i, /pinned/i]),
+    detect: coOccurring(500, [/roaming copilot/i, /configure_agent/i, /read-only work in another project/i]),
   },
   {
     id: 'claim-before-work',
@@ -156,9 +156,9 @@ export const GUIDANCE_RULES: readonly GuidanceRule[] = [
   },
   {
     id: 'identity-not-registered',
-    description: 'an agent already has an identity and never registers itself; get_briefing.you.kind says copilot vs agent',
+    description: 'an agent already has an identity and never registers itself; get_briefing.you.kind is copilot',
     expectedSurfaces: BASE_SURFACES,
-    detect: coOccurring(150, [/nothing to register|do not register yourself/i, /you\.kind|copilot/i]),
+    detect: coOccurring(150, [/nothing to register|do not register yourself/i, /you\.kind.*copilot/i]),
   },
   {
     id: 'planning-phase-gate',

@@ -12,7 +12,7 @@
 import { env } from 'cloudflare:test';
 import { describe, expect, it, beforeAll } from 'vitest';
 import type { Env } from '../src/env';
-import { createAgent, createRunAgent, createUser, mintTokenForUser, mcpCall } from './helpers';
+import { createAgent, createUser, mintTokenForUser, mcpCall } from './helpers';
 import { assembleProjectMemoryPulse, BRIEFING_PULSE_CHAR_BUDGET } from '../src/sync';
 import { GET_BRIEFING_PLAYBOOK } from '../src/mcp';
 import { ProjectMemoryPulse } from '@noriq-dev/shared';
@@ -49,7 +49,8 @@ beforeAll(async () => {
 describe('assembleProjectMemoryPulse — bounded, and degrades to null rather than throwing', () => {
   it('caps items per section and the whole block never exceeds its declared character budget', async () => {
     const projectId = await newProject('MPB1');
-    const agent = await createRunAgent(projectId, 'scope');
+    await mcpCall(owner.apiKey, 'configure_agent', { projectId });
+    const agent = owner;
     for (let i = 0; i < 10; i++) {
       await mcpCall(agent.apiKey, 'record_memory', {
         projectId, kind: 'hazard',
@@ -59,7 +60,7 @@ describe('assembleProjectMemoryPulse — bounded, and degrades to null rather th
     // PLNR-430: settle via reconcile(), not drainOutbox() alone — see the interface comment above.
     await memory(projectId).reconcile(projectId);
 
-    const pulse = await assembleProjectMemoryPulse(appEnv, projectId, agent.agentId);
+    const pulse = await assembleProjectMemoryPulse(appEnv, projectId, agent.id);
     expect(pulse).toBeTruthy();
     expect(pulse!.knownHazards.length).toBeLessThanOrEqual(5); // PULSE_MAX_ITEMS_PER_SECTION
     expect(pulse!.charBudget).toBe(BRIEFING_PULSE_CHAR_BUDGET);
@@ -71,13 +72,14 @@ describe('assembleProjectMemoryPulse — bounded, and degrades to null rather th
 
   it('excerpts production-sized statements instead of returning empty sections with unused budget', async () => {
     const projectId = await newProject('MPBLONG');
-    const agent = await createRunAgent(projectId, 'scope');
+    await mcpCall(owner.apiKey, 'configure_agent', { projectId });
+    const agent = owner;
     await mcpCall(agent.apiKey, 'record_memory', { projectId, kind: 'decision', statement: `decision ${'D'.repeat(3500)}` });
     await mcpCall(agent.apiKey, 'record_memory', { projectId, kind: 'hazard', statement: `hazard ${'H'.repeat(3500)}` });
     await mcpCall(agent.apiKey, 'record_memory', { projectId, kind: 'unknown', statement: `unknown ${'U'.repeat(3500)}` });
     await memory(projectId).reconcile(projectId); // PLNR-430: see interface comment above
 
-    const pulse = await assembleProjectMemoryPulse(appEnv, projectId, agent.agentId);
+    const pulse = await assembleProjectMemoryPulse(appEnv, projectId, agent.id);
     expect(pulse).toBeTruthy();
     expect(() => ProjectMemoryPulse.parse(pulse)).not.toThrow();
     const surfaced = [pulse!.activeDecisions[0], pulse!.knownHazards[0], pulse!.unresolvedUnknowns[0]];
@@ -94,7 +96,8 @@ describe('assembleProjectMemoryPulse — bounded, and degrades to null rather th
 
   it('swallows a thrown error from the ProjectMemory stub and returns null — same degradation contract as loadPriorEffort (§19)', async () => {
     const projectId = await newProject('MPB2');
-    const agent = await createRunAgent(projectId, 'scope');
+    await mcpCall(owner.apiKey, 'configure_agent', { projectId });
+    const agent = owner;
     // A real memory.changed event must exist first, or the candidate list is empty and the
     // throwing stub below is never actually invoked — this would silently test nothing.
     const rec = await mcpCall(agent.apiKey, 'record_memory', { projectId, kind: 'decision', statement: 'a decision that will never be read back' });
@@ -108,13 +111,14 @@ describe('assembleProjectMemoryPulse — bounded, and degrades to null rather th
         get: () => ({ getMemoryItem: async () => { throw new Error('ProjectMemory unreachable (test)'); } }),
       },
     } as unknown as Env;
-    const pulse = await assembleProjectMemoryPulse(throwingEnv, projectId, agent.agentId);
+    const pulse = await assembleProjectMemoryPulse(throwingEnv, projectId, agent.id);
     expect(pulse).toBeNull();
   });
 
   it('a memory that fell off "active" surfaces ONLY as a stale warning, with the canonical validity/reason — never recomputed here', async () => {
     const projectId = await newProject('MPB3');
-    const agent = await createRunAgent(projectId, 'scope');
+    await mcpCall(owner.apiKey, 'configure_agent', { projectId });
+    const agent = owner;
     const rec = await mcpCall(agent.apiKey, 'record_memory', { projectId, kind: 'hazard', statement: 'the export path leaks file handles under load' });
     const memoryId = rec.body.memoryId as string;
     await memory(projectId).reconcile(projectId); // PLNR-430: see interface comment above
@@ -123,7 +127,7 @@ describe('assembleProjectMemoryPulse — bounded, and degrades to null rather th
     });
     await memory(projectId).reconcile(projectId); // PLNR-430: see interface comment above
 
-    const pulse = await assembleProjectMemoryPulse(appEnv, projectId, agent.agentId);
+    const pulse = await assembleProjectMemoryPulse(appEnv, projectId, agent.id);
     expect(pulse).toBeTruthy();
     // Never ALSO shown as a currently-active hazard — one truth, not two.
     expect(pulse!.knownHazards.some((h) => h.id === memoryId)).toBe(false);
@@ -154,7 +158,8 @@ describe('get_briefing — additive `memory` block', () => {
 
   it('carries a well-formed, bounded memory block once localized, and every item states its own authority/validity/evidence', async () => {
     const projectId = await newProject('MPB4');
-    const agent = await createRunAgent(projectId, 'scope'); // pinned to projectId by construction (RUN-160)
+    await mcpCall(owner.apiKey, 'configure_agent', { projectId });
+    const agent = owner; // pinned to projectId by construction (RUN-160)
     await mcpCall(agent.apiKey, 'record_memory', { projectId, kind: 'hazard', statement: 'touching the throttle without the shared lock corrupts state' });
     await mcpCall(agent.apiKey, 'record_memory', { projectId, kind: 'unknown', statement: 'unclear whether the legacy importer still runs in prod' });
     await memory(projectId).reconcile(projectId); // PLNR-430: see interface comment above
@@ -178,14 +183,15 @@ describe('get_briefing — additive `memory` block', () => {
       expect(Array.isArray(item.evidence)).toBe(true);
     }
     // Pre-existing fields are untouched by the new field's presence.
-    expect(b.body.you.kind).toBe('agent');
+    expect(b.body.you.kind).toBe('copilot');
     expect(Array.isArray(b.body.playbook)).toBe(true);
     expect(b.body.playbook).toEqual(GET_BRIEFING_PLAYBOOK);
   });
 
   it('a memory that disagrees with a task never changes the coordination facts alongside it — only appears as labelled evidence', async () => {
     const projectId = await newProject('MPB5');
-    const agent = await createRunAgent(projectId, 'scope');
+    await mcpCall(owner.apiKey, 'configure_agent', { projectId });
+    const agent = owner;
     const made = await mcpCall(owner.apiKey, 'create_task', { projectId, title: 'Ship the throttle fix', tags: ['briefing-test'] });
     const taskId = made.body.id as string;
     // A decision that claims something FALSE about the task's real state.
@@ -209,13 +215,15 @@ describe('get_briefing — additive `memory` block', () => {
 
   it('the notices text block still delivers exactly as before, alongside the new field', async () => {
     const projectId = await newProject('MPB6');
-    const agent = await createRunAgent(projectId, 'scope');
+    await mcpCall(owner.apiKey, 'configure_agent', { projectId });
+    const agent = owner;
     const made = await mcpCall(owner.apiKey, 'create_task', { projectId, title: 'Notices probe', tags: ['briefing-test'] });
     const taskId = made.body.id as string;
     const claimed = await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId });
     expect(claimed.isError).toBeFalsy();
 
-    const other = await createRunAgent(projectId, 'build');
+    const other = await createAgent('memory-briefing-commenter');
+    await mcpCall(other.apiKey, 'configure_agent', { projectId });
     const commented = await mcpCall(other.apiKey, 'post_comment', { projectId, taskId, body: 'please double-check the retry budget', kind: 'comment' });
     expect(commented.isError).toBeFalsy();
 

@@ -158,24 +158,6 @@ describe('record_memory — op="feedback"', () => {
   });
 });
 
-describe('record_memory — runner-agent tool floor (RUN-47)', () => {
-  it('is absent from tools/list for a floor that omits it, present and callable for one that includes it', async () => {
-    const { token, projectId } = await newOwnedProject('pm-mcp-floor@example.com', 'PMMCPFLR');
-    const withoutFloor = ['get_briefing', 'get_task', 'heartbeat'];
-    const without = await createRunAgent(projectId, 'build', { ownerEmail: 'pm-mcp-floor@example.com', allowedTools: withoutFloor });
-    const namesWithout = (await mcpList(without.apiKey)).map((t) => t.name);
-    expect(namesWithout).not.toContain('record_memory');
-
-    const withFloor = [...withoutFloor, 'record_memory'];
-    const withIt = await createRunAgent(projectId, 'build', { ownerEmail: 'pm-mcp-floor@example.com', allowedTools: withFloor });
-    const namesWith = (await mcpList(withIt.apiKey)).map((t) => t.name);
-    expect(namesWith).toContain('record_memory');
-
-    const called = await mcpCall(withIt.apiKey, 'record_memory', { projectId, kind: 'learning', statement: 'from a floor-permitted run agent' });
-    expect(called.isError).toBeFalsy();
-  });
-});
-
 describe('record_memory — project access is checked before any write', () => {
   it('refuses a project the caller cannot reach, not-found shaped', async () => {
     const { projectId: otherProjectId } = await newOwnedProject('pm-mcp-other@example.com', 'PMMCPOTH');

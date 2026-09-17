@@ -502,10 +502,10 @@ describe('ProjectMemory.similarEffort — end-to-end retrieval, gate, and non-mu
 });
 
 // -------------------------------------------------------------------------------------------
-// Layer 3 — can_claim / claim_task's `priorEffort` block (the real MCP surface)
+// Layer 3 — claim_task's `priorEffort` block (the real MCP surface)
 // -------------------------------------------------------------------------------------------
 
-describe('can_claim / claim_task — priorEffort is advisory and never touches claim outcome', () => {
+describe('claim_task — priorEffort is advisory and never touches claim outcome', () => {
   it('surfaces a fully-cited priorEffort block, and claimable/success are unaffected', async () => {
     const projectId = await newProject('MSE5');
     const made = await mcpCall(agent.apiKey, 'create_task', {
@@ -525,14 +525,6 @@ describe('can_claim / claim_task — priorEffort is advisory and never touches c
       },
     }));
 
-    const guard = await createRunAgent(projectId, 'build', { allowedTools: ['can_claim'] });
-    const probe = await mcpCall(guard.apiKey, 'can_claim', { taskId });
-    expect(probe.isError).toBe(false);
-    expect(probe.body.claimable).toBe(true);
-    expect(probe.body.priorEffort).toBeTruthy();
-    expect(probe.body.priorEffort.warnings).toHaveLength(1);
-    expect(probe.body.priorEffort.warnings[0]).toMatchObject({ taskKey, outcome: 'failed' });
-
     const claimed = await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId });
     expect(claimed.isError).toBe(false);
     // The claim itself succeeded exactly as it would with no prior effort at all.
@@ -549,11 +541,6 @@ describe('can_claim / claim_task — priorEffort is advisory and never touches c
     const projectId = await newProject('MSE6');
     const made = await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'A brand new task with no history whatsoever', tags: ['similar-effort-test'] });
     const taskId = made.body.id as string;
-
-    const guard = await createRunAgent(projectId, 'build', { allowedTools: ['can_claim'] });
-    const probe = await mcpCall(guard.apiKey, 'can_claim', { taskId });
-    expect(probe.body.claimable).toBe(true);
-    expect(probe.body.priorEffort).toBeUndefined();
 
     const claimed = await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId });
     expect(claimed.isError).toBe(false);

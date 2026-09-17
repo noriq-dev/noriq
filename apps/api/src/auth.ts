@@ -17,16 +17,9 @@ export interface AgentIdentity {
   role: 'orchestrator' | 'worker';
   /** The user this agent acts on behalf of — its MCP access is scoped to them (PLNR-83). */
   userId: string;
-  /** copilot = a human's session (self-created, may hop projects, no heartbeat expectation).
-   *  agent   = runner-spawned for one run (runner-owned, project-pinned, heartbeat matters). */
+  /** copilot = a human's MCP session (self-created, may hop projects).
+   *  agent = legacy runner-spawned row; MCP no longer accepts bound-agent credentials. */
   kind: AgentKind;
-  /**
-   * The daemon-declared tool floor for a runner-spawned agent (RUN-47): the MCP server
-   * advertises only these tools, so the catalogue the model sees matches what the daemon's
-   * permission profile lets it call. NULL = no floor declared (every copilot; agents minted
-   * by a pre-RUN-47 daemon) → the full catalogue, the pre-existing behavior.
-   */
-  allowedTools?: string[] | null;
 }
 
 /** An authorized OAuth credential (one `claude mcp add`). Many copilots (sessions) share one.
@@ -37,17 +30,15 @@ export interface Connection {
   clientId: string;
   clientName: string;
   /**
-   * Set only when the token is bound to one specific agent — i.e. a runner's per-run token,
-   * which acts as exactly that agent regardless of MCP session. NULL for a human's connection,
-   * where the working copilot is resolved per session instead.
+   * Always null on live connections: per-run runner agent binding was retired with the execution
+   * plane. MCP resolves a session copilot per initialize; historical oauth_tokens.agent_id rows
+   * are refused at auth time.
    */
   boundAgent: AgentIdentity | null;
   /**
    * The connection's own copilot (PLNR-155) — minted when the grant was exchanged, and the
    * durable owner shown for that authorization. It is NOT an inferred delegation parent:
    * immediate session/execution lineage is separately reported and validated (PLNR-367).
-   * Independent of boundAgent, and never both: a human connection has a Copilot owner, while a
-   * Runner's per-run token has a bound agent. Null only for a token minted before PLNR-155.
    */
   copilotId: string | null;
 }
@@ -74,20 +65,6 @@ export type Vars = {
 export type AppContext = { Bindings: Env; Variables: Vars };
 
 /**
- * agents.allowed_tools is JSON the daemon wrote; a malformed value must degrade to
- * "no floor" (full catalogue), never to a 500 on every request this agent makes.
- */
-function parseAllowedTools(raw: string | null): string[] | null {
-  if (!raw) return null;
-  try {
-    const v = JSON.parse(raw);
-    return Array.isArray(v) && v.every((x) => typeof x === 'string') ? v : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
  * Bearer auth for agents (MCP): OAuth 2.1 access tokens only (static API keys
  * were retired — PLNR-52). 401s advertise the OAuth resource metadata so MCP
  * clients can discover the authorization server.
@@ -105,15 +82,12 @@ export async function agentAuth(c: Context<AppContext>, next: Next) {
   if (!key) return unauthorized('missing bearer token');
   const hash = await sha256Hex(key);
 
-  // The token no longer resolves an agent by itself: a connection is not an agent (0026).
-  // agent_id is set ONLY for a runner's per-run token, so the join is LEFT and its absence
-  // is the normal case for a human's connection.
+  // A connection is not an agent (0026). Human MCP credentials have agent_id NULL and resolve a
+  // session copilot per request; legacy runner per-run bindings are refused below.
   const t = await c.env.DB.prepare(
     `SELECT t.id AS tokenId, t.user_id AS userId, t.client_id AS clientId, t.agent_id AS boundAgentId,
             t.copilot_id AS copilotId, u.email AS userEmail,
-            a.id AS agentId, COALESCE(a.label, a.name) AS agentName, a.role AS agentRole, a.kind AS agentKind,
-            a.allowed_tools AS agentAllowedTools,
-            COALESCE(cl.name, 'MCP client') AS clientName
+            a.id AS agentId, COALESCE(cl.name, 'MCP client') AS clientName
      FROM oauth_tokens t
      JOIN users u ON u.id = t.user_id
      LEFT JOIN agents a ON a.id = t.agent_id AND a.status != 'revoked'
@@ -124,8 +98,7 @@ export async function agentAuth(c: Context<AppContext>, next: Next) {
   ).bind(hash).first<{
     tokenId: string; userId: string; clientId: string; clientName: string; boundAgentId: string | null;
     copilotId: string | null; userEmail: string;
-    agentId: string | null; agentName: string | null; agentRole: 'orchestrator' | 'worker' | null;
-    agentKind: AgentKind | null; agentAllowedTools: string | null;
+    agentId: string | null;
   }>();
   if (!t) {
     // The primary lookup collapses "no such token", "revoked", "expired" and "user disabled"
@@ -152,34 +125,21 @@ export async function agentAuth(c: Context<AppContext>, next: Next) {
     return unauthorized('invalid, expired, or revoked token — connect via OAuth');
   }
 
-  // Use-time kill switch for the demo (PLNR-199). The demo never mints agent tokens — the
-  // consent flow refuses the demo account — but any token minted before DEMO_MODE was set,
-  // or via a future issuance path we miss, must ALSO be refused here so the demo account can
-  // never drive the MCP / runner / agent plane. This one check closes /mcp and every
-  // agentAuth-gated runner endpoint at once.
+  // Use-time kill switch for the demo (PLNR-199).
   if (demoLocksDown(c.env, t.userEmail)) return unauthorized('the demo account cannot use API tokens');
 
-  // A token bound to an agent that is revoked (or gone) must FAIL, not silently degrade to
-  // an unbound connection — otherwise revoking a runaway agent would hand its token back the
-  // right to resolve a fresh copilot per session, which is the opposite of a kill switch.
-  if (t.boundAgentId && !t.agentId) return unauthorized('this token’s agent was revoked');
+  if (t.boundAgentId) {
+    if (!t.agentId) return unauthorized('this token’s agent was revoked');
+    return unauthorized(
+      'runner agent credentials are no longer accepted — authorize an MCP copilot connection instead',
+    );
+  }
 
-  const boundAgent: AgentIdentity | null = t.agentId
-    ? {
-        id: t.agentId, name: t.agentName ?? t.agentId, role: t.agentRole ?? 'worker',
-        userId: t.userId, kind: t.agentKind ?? 'agent',
-        allowedTools: parseAllowedTools(t.agentAllowedTools),
-      }
-    : null;
   c.set('oauthTokenId', t.tokenId);
   c.set('connection', {
     tokenId: t.tokenId, userId: t.userId, clientId: t.clientId, clientName: t.clientName,
-    boundAgent, copilotId: t.copilotId,
+    boundAgent: null, copilotId: t.copilotId,
   });
-  // No `agent` is set here. Routes that need one either read connection.boundAgent or resolve
-  // it per MCP session; the runner's REST endpoints (register/heartbeat/steer-ack) need only
-  // the connection's user.
-  if (boundAgent) c.set('agent', boundAgent);
   await next();
 }
 
@@ -197,10 +157,7 @@ const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(
  * exchanged and the child is named from the client, so an agent never has to invent an
  * identity (PLNR-157). configure_agent may rename one it already has.
  *
- * This path only ever mints copilots. A runner-spawned agent is created by the runner
- * and reached through a token bound to it (connection.boundAgent) — it never arrives
- * here, and the kind filter below keeps it that way even if one somehow carried a
- * session id: a runner's agent must never be adopted by whoever presents a session.
+ * This path only ever mints copilots. Legacy runner-bound credentials are refused in agentAuth.
  */
 export async function resolveSessionAgent(
   env: Env,

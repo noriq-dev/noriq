@@ -121,11 +121,6 @@ describe('cross-project dependencies (PLNR-241)', () => {
     })).body;
     expect(await edgesOf(dependent.id)).toEqual([{ dep: foreignId }]);
 
-    const guard = await createRunAgent(projectId, 'build', { allowedTools: ['can_claim'] });
-    const probe = await mcpCall(guard.apiKey, 'can_claim', { taskId: dependent.id });
-    expect(probe.body.claimable).toBe(false);
-    expect(probe.body.reason).toContain(foreignKey);
-
     const claim = await mcpCall(agent.apiKey, 'claim_task', { projectId, taskId: dependent.id });
     expect(claim.isError).toBe(true);
     expect(claim.text).toContain(foreignKey);
