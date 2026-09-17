@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.76.1 - 2026-09-17
+
+Keep a no-op `RunnerHub` class export so existing Durable Object instances can keep storage. `deleted_classes` is still forbidden; instance wrangler configs still omit the `RUNNER_HUB` binding.
+
 ## 0.76.0 - 2026-09-17
 
 ### Greenfield runner excision (coordination-only)
