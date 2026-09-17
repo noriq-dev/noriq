@@ -148,8 +148,8 @@ wrangler d1 execute noriq --remote --file noriq-ordered.sql --config wrangler.pr
 > ⚠️ A raw export does **not** import back as-is (learned the hard way during the
 > PLNR-143 cutover): the dump lists tables alphabetically and D1's import API does
 > not honor its `PRAGMA defer_foreign_keys` across internal batching, so the first
-> INSERT that references a later table fails (`no such table: main.runners`).
-> `scripts/reorder-d1-dump.py` rewrites the dump into FK-dependency order, breaks
+> INSERT that references a later table fails (`no such table: main.runners` on instances that
+> still carry legacy runner tables). `scripts/reorder-d1-dump.py` rewrites the dump into FK-dependency order, breaks
 > the agents↔oauth_tokens cycle via patch UPDATEs, preserves `events` rowids (the
 > agent notice-cursor), and self-verifies with a strict FK-on rehearsal.
 

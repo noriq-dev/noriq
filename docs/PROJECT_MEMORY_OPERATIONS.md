@@ -1,8 +1,8 @@
 # Project Memory operations
 
 This is the self-hosting and day-two operations guide for Project Memory. It covers the boundary
-between D1 and the per-project Durable Object, optional Cloudflare services, Runner repository
-ingest, upgrades, recovery, deletion, and release checks. Detailed snapshot formats and restore
+between D1 and the per-project Durable Object, optional Cloudflare services, repository indexing
+(cut-over: runner CLI ingest paused), upgrades, recovery, deletion, and release checks. Detailed snapshot formats and restore
 semantics live in [`apps/api/BACKUP.md`](../apps/api/BACKUP.md); the security and measured-load
 records live in [`PROJECT_MEMORY_SECURITY_REVIEW.md`](PROJECT_MEMORY_SECURITY_REVIEW.md) and
 [`PROJECT_MEMORY_LOAD_PROFILE.md`](PROJECT_MEMORY_LOAD_PROFILE.md).
@@ -16,7 +16,7 @@ bindings are optional and may be added after the first deployment.
 | --- | --- | --- | --- |
 | Projects, tasks, plans, users, repository routing, compact memory health | D1 (`DB`) | None | Required; the Worker cannot start without it |
 | Cognitive memory, evidence, graph, episodes, repository generations | Per-project SQLite `ProjectMemory` Durable Object | None | Required; lexical and graph retrieval continue without AI |
-| Live project coordination and Runner/session state | Other required Durable Objects | None | Required |
+| Live project coordination | `ProjectRoom`, `AgentSession`, `RateLimiter` Durable Objects | None | Required |
 | Attachments, D1 snapshots, portable ProjectMemory snapshots | R2 (`FILES`) | R2 | Attachments and portable backups report unavailable; memory reads/writes continue |
 | Embeddings and Ask generation | Workers AI (`AI`) | Workers AI | Ask is unavailable; search falls back to non-semantic stages |
 | Authored-memory/task/doc semantic vectors | `VECTORIZE` (`noriq-search`) | Vectorize | Keyword, lexical, and graph retrieval continue |
@@ -105,26 +105,32 @@ After enabling the bindings:
    Vectorize was enabled.
 2. In Memory > Operations, run **Rebuild vectors** for each project that reports vector-dirty.
 3. Ask a semantic question and verify its cited project/task/doc references resolve.
-4. Reindex one opted-in repository through Runner, confirm the completion receipt reports atomic
-   activation, and verify both lexical traversal and semantic code retrieval.
+4. Reindex one opted-in repository when a supported ingest client is available (see **Repository
+   indexing** below), confirm the completion receipt reports atomic activation, and verify both
+   lexical traversal and semantic code retrieval.
 
 Workers AI model behavior is a live dependency. Validate every configured `ASK_MODELS` entry in
 staging for streaming and multi-round tool calls before advertising it in production.
 
-## Runner repository indexing: server first, explicit consent
+## Repository indexing: server ingest rail (runner CLI paused)
 
 Repository intelligence is an HTTP ingest rail, not a WebSocket bulk frame and not a direct
 Vectorize write. Set `ATTACHMENT_UPLOAD_SECRET` (or, less desirably, `ADMIN_TOKEN`) before enabling
-it:
+capability minting:
 
 ```sh
 cd apps/api
 npx wrangler secret put ATTACHMENT_UPLOAD_SECRET --config wrangler.production.jsonc
 ```
 
-The server must know the repository and the live Runner checkout association before an upload can
-start. In the project settings, register the repository key and associate the online Runner. Then
-the repository itself must opt in through committed configuration:
+**Cut-over (coordination-only product):** New repository uploads via `@noriq-dev/runner` /
+`noriq-runner index-*` are **paused**. Read/Ask over **already-activated** generations continues.
+A non-daemon indexer is planned out of band; until then, operators activate or abort staged
+generations in Memory > Operations and rely on lexical/graph retrieval for code context.
+
+When ingest is available, the server must know the repository and an authorized checkout association
+before an upload can start. Register the repository key in project settings and opt in through
+committed configuration:
 
 ```toml
 [index]
@@ -133,10 +139,10 @@ include = ["src/**", "docs/**"]
 exclude = ["**/*.generated.*"]
 ```
 
-The Runner executes this server-owned sequence:
+The supported client executes this server-owned sequence:
 
-1. Authenticate as its OAuth connection and request a short-lived capability for exactly one
-   project, repository key, purpose, scope id, Runner, checkout, and byte ceiling.
+1. Authenticate with OAuth and request a short-lived capability for exactly one project, repository
+   key, purpose, scope id, checkout association, and byte ceiling.
 2. Call `begin`, upload bounded numbered batches with checksums, then call `complete`.
 3. The `ProjectMemory` store validates counts, hashes, references, and completeness while the old
    generation remains active.
@@ -147,9 +153,10 @@ The Runner executes this server-owned sequence:
    generation never becomes canonical. An admin can inspect and activate or abort a retained
    staged generation as an explicit recovery action.
 
-Use the Runner's supported controls rather than constructing capability URLs by hand:
+**Legacy runner CLI (do not start for new work):**
 
 ```sh
+# Paused with runner cut-over — listed for operators finishing in-flight uploads only
 noriq-runner index-repo --check-determinism  # local-only preview; cannot upload
 noriq-runner index-status
 noriq-runner index-reindex                   # request validation + atomic activation
@@ -157,8 +164,7 @@ noriq-runner index-cancel
 ```
 
 Turning `[index].enabled` off stops future triggers; it does not retract previously activated
-server content. `index-forget-journal` erases only local Runner bookkeeping. Server-side removal
-belongs to the project operator and project deletion lifecycle.
+server content. Server-side removal belongs to the project operator and project deletion lifecycle.
 
 ## Routine operations
 
@@ -191,9 +197,9 @@ There are three different reindex operations; use the one matching the stale der
 - **Task/doc/plan search stale:** call the MCP `reindex_search` maintenance tool, passing its
   returned offset until `remaining` is zero.
 - **Memory/episode semantic vectors dirty:** Memory > Operations > Rebuild vectors.
-- **Repository generation stale:** `noriq-runner index-reindex`, then confirm `index-status`
-  reports the server-confirmed active generation. Do not replace this with the task/doc/plan
-  Search reindex.
+- **Repository generation stale:** Memory > Operations (activate staged generation or abort), or
+  legacy `noriq-runner index-reindex` only while runner ingest is still enabled on the instance.
+  Do not replace this with the task/doc/plan Search reindex.
 
 ## Backups, restore, and recovery rehearsal
 
@@ -240,7 +246,7 @@ Treat D1 migrations, Durable Object migrations, and a Worker deployment as separ
    data-rewrite/cutover, enable `MAINTENANCE_MODE`, drain writes, snapshot, migrate, deploy, smoke
    test, and only then clear maintenance mode.
 6. Verify canonical memory reachability, schema/revision, backup status, graph drift, vector-dirty
-   status, active repository generations, Runner status, and representative retrieval.
+   status, active repository generations, and representative retrieval.
 
 If the Worker deployment fails before traffic moves, leave the existing version active and fix the
 artifact. If the new version is incompatible after migration, do not blindly deploy old code over
@@ -261,13 +267,13 @@ Rotate secrets with `npx wrangler secret put <NAME> --config wrangler.production
 verify the dependent endpoint before revoking the old upstream credential.
 
 - `ATTACHMENT_UPLOAD_SECRET`: invalidates in-flight attachment/index/episode capabilities. Rotate
-  during a quiet window; Runner should mint fresh capabilities and retry bounded work.
+  during a quiet window; any ingest client should mint fresh capabilities and retry bounded work.
 - `ADMIN_TOKEN`: immediately invalidates automation using the old bearer. Update the secret store
   supplying backup/restore jobs in the same window.
 - `GITHUB_WEBHOOK_SECRET`: update Noriq and the GitHub webhook together, then deliver a signed test.
 - `SIGNAL_WEBHOOK_SECRET`: update Noriq and the receiver together, then send a non-critical test.
 
-Never put a secret, capability token, or R2 object credential in Wrangler JSONC, Runner logs, task
+Never put a secret, capability token, or R2 object credential in Wrangler JSONC, client logs, task
 comments, or snapshot manifests.
 
 ## Deletion and retention
@@ -291,10 +297,10 @@ signals, not write quotas.
 | Backup unavailable | `FILES` binding, bucket existence, Worker R2 permission | Rebind the correct environment-specific bucket, deploy, and trigger an on-demand backup |
 | Restore refused before staging | Format/schema version, complete manifest inventory, chunk size/count/checksum, project prefix | Choose a compatible complete snapshot; do not edit checksums to force acceptance |
 | Restore validated but semantic results stale | `vectorDirty`, `AI`, `VECTORIZE` capability | Rebuild memory vectors; lexical/graph results remain authoritative meanwhile |
-| Runner capability mint returns 404 | Runner online/heartbeat, OAuth owner/token, repository registration, checkout association | Reconnect the correct Runner and repair the repository association; do not reuse another repository key |
-| Runner capability mint returns 403 | OAuth token's current project access | Grant the connection the required project role or reconnect under the correct account |
-| Runner capability mint returns 503 | Signing secret absent | Set `ATTACHMENT_UPLOAD_SECRET` and redeploy |
-| Generation remains `staged` | Older server returned no activation receipt, or recovery state remains after a conflict | Reconcile `index-status`; if the server still reports staged, review it in Memory > Operations and activate or abort explicitly |
+| Ingest capability mint returns 404 | Repository registration, checkout association, or runner cut-over (`RUNNER_DISABLED`) | Repair project settings; do not reuse another repository key |
+| Ingest capability mint returns 403 | OAuth token's current project access | Grant the connection the required project role or reconnect under the correct account |
+| Ingest capability mint returns 503 | Signing secret absent | Set `ATTACHMENT_UPLOAD_SECRET` and redeploy |
+| Generation remains `staged` | Older server returned no activation receipt, or recovery state remains after a conflict | Review in Memory > Operations and activate or abort explicitly |
 | Code semantic results absent | `AI`, `CODE_VECTORIZE`, all three metadata indexes, active generation | Correct bindings/index metadata; lexical and graph retrieval should still work |
 | Graph drift non-zero | Operations drift report by projector-owned edge kind | From an authenticated instance-admin session call `POST /api/projects/<projectId>/memory/graph/rebuild`; recheck for both missing and stale edges |
 | Database size warning/critical | Operations health plus load profile | Prune debris/retained generations, review ingest scope, back up, then investigate growth |
@@ -306,8 +312,8 @@ signals, not write quotas.
 - [ ] A full staging configuration has distinct D1, R2, Vectorize, and Worker/DO namespaces.
 - [ ] D1 and all active ProjectMemory stores have fresh, restorable backups.
 - [ ] Typecheck, ordinary API tests, security regressions, and opt-in load profile pass.
-- [ ] Runner upload is token-free in logs and reports `active` only from the server's completion
-      receipt or canonical cursor, never from bare HTTP success.
+- [ ] Repository upload (when enabled) is token-free in logs and reports `active` only from the
+      server's completion receipt or canonical cursor, never from bare HTTP success.
 - [ ] Canonical, lexical, graph, semantic, backup, restore, rollback, and deletion checks have
       recorded evidence appropriate to the bindings enabled in that environment.
 - [ ] Restore/PITR and production CPU/peak-memory claims are labelled local, staging, or live;
