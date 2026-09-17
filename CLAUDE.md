@@ -4,9 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Noriq is an AI-native project management system: an **MCP server for AI agents** plus a
+Noriq is an AI-native project management system: an **MCP server for AI copilots** plus a
 **React web app for the humans supervising them**, deployed as a single Cloudflare Worker.
-Open-source and self-hostable.
+Open-source and self-hostable. **Implementation work runs in external coding agents** (Cursor,
+Claude Code, Codex, etc.); Noriq holds coordination state — claims, plans, docs, memory, and
+human steering — not an in-product build/verify harness.
 
 ## Commands
 
@@ -63,21 +65,29 @@ keeps serving OLD code until it restarts — a DO-backed path can lag a Worker-s
 ## Architecture
 
 **One Worker does everything.** `apps/api/src/index.ts` is a Hono router that serves `/api/*`
-(REST for the SPA), `/mcp` (agents), `/ws/*` (live updates — including `/ws/runner/:id`, the
-Bearer-authenticated runner-daemon channel), `/oauth/*` + `/.well-known/*` (OAuth 2.1 AS),
+(REST for the SPA), `/mcp` (agents), `/ws/*` (live updates for the SPA and agent sessions),
+`/oauth/*` + `/.well-known/*` (OAuth 2.1 AS),
 `/skill.md` + `/skill/docs.md` + `/reference.md` + `/reference.json` (served agent guidance),
 and falls through to Workers Assets for the SPA. `run_worker_first` in the wrangler config keeps
 the dynamic paths on the Worker while static assets are served directly.
 
-**Four Durable Objects.** **`ProjectRoom` is the sole writer per project** —
+**Three Durable Objects (coordination product).** **`ProjectRoom` is the sole writer per project** —
 [apps/api/src/do/ProjectRoom.ts](apps/api/src/do/ProjectRoom.ts). All mutations (create/claim/release
 tasks, comments, milestones, boards, deletes) go through it, wrapped in `blockConcurrencyWhile`, so
 there are no double-claims or read-modify-write races, and every mutation appends to a per-project
 **event log** (monotonic `seq`, also the WS resume cursor) and fans out over WebSocket. **Reads go
 straight to D1** (e.g. the `/snapshot` endpoint); only writes cross into the DO. Humans and agents
 are the same `Actor` path — a human is just another actor. The others: `AgentSession` (per-agent
-notices cursor + presence), `RateLimiter`, and `RunnerHub` (one per runner daemon, holds its
-`/ws/runner/:id` socket — pure transport; run **authority** stays in `ProjectRoom`).
+notices cursor + presence) and `RateLimiter`.
+
+> **Runner cut-over:** The legacy execution plane (`RunnerHub`, `/ws/runner/:id`, run/job dispatch
+> REST, runner-spawned `kind: agent`) is being removed — it is not a product capability. Until the
+> removal PRs land, those code paths may still exist in the tree; do not extend them. Self-hosters:
+> stop `noriq-runner`, expect coordination-only; optional `RUNNER_DISABLED=1` rejects register/dispatch/WS
+> with `410` during staged cut-over. Keep the RFC 8628 **device grant** (generic headless OAuth),
+> **execution specs** on tasks, and **Project Memory** read/Ask; pause **runner CLI repository ingest**
+> only (alternate indexer is out of band). Never use wrangler `deleted_classes` to “remove” `RunnerHub`
+> — that wipes DO storage permanently.
 
 **MCP server** — [apps/api/src/mcp.ts](apps/api/src/mcp.ts). Streamable HTTP via `@hono/mcp`, **stateless**:
 a fresh `McpServer` is built per request, bound to the authenticated agent. Two protocol eras share
@@ -100,17 +110,17 @@ copilot per chat; Grok (`User-Agent: grok-cli`, OAuth clientName/`clientInfo.nam
 `x-mcp-session-id` when present, otherwise the token fallback, because it re-initializes and
 DELETE's per tool call. DELETE of a `stateless:` or `grok:` session is a no-op. A `stateless:`
 copilot is all-projects (not pinned). See `lib/mcp-session-key.ts` (PLNR-552/557/558). Agents are **project-local** (except unscoped/token copilots and current holders) and carry a `kind`: **copilot**
-(human-authorized connection) vs **agent** (runner-spawned — minted per run via
-`POST /api/runs/:runId/agent`, one live agent per run, with reduced authority; see constraints).
+(human-authorized OAuth connection). Legacy **runner-spawned** `kind: agent` rows and reduced
+authority still exist in code during cut-over but are not part of the coordination product.
 Auth lives in [auth.ts](apps/api/src/auth.ts) (agents: OAuth-only, no static keys) and
 [oauth.ts](apps/api/src/oauth.ts) (the AS: authz-code + PKCE/S256, DCR + CIMD client registration,
-plus the RFC 8628 device grant for headless runners).
+plus the RFC 8628 device grant for headless MCP clients).
 
 **Shared zod schemas** — [packages/shared/src](packages/shared/src) — are the single source of truth,
 consumed by MCP tools, REST, and the UI: `model.ts` (data model), `events.ts` (event log),
-`ws.ts` (browser + runner WS protocols), `runner.ts` (runs: kind/tool/effort/budget/spend),
-`manifest.ts` (the `.noriq/project.toml` and `~/.noriq/runner.toml` manifests, validated as parsed
-objects — shared deliberately has no TOML parser), and `execution-spec.ts` (the ExecutionSpec contract).
+`ws.ts` (browser project WS; legacy runner frames during removal), `runner.ts` (legacy run model —
+being trimmed), `manifest.ts` (the `.noriq/project.toml` manifest; legacy `runner.toml` during removal),
+and `execution-spec.ts` (the ExecutionSpec contract — **kept** as task planning artifacts).
 
 **Web app** — [apps/web/src/store.tsx](apps/web/src/store.tsx) is the live store: it loads REST
 `/snapshot`s and invalidates on WS events, deriving view-model types ([types.ts](apps/web/src/types.ts))
@@ -167,15 +177,15 @@ for the components. (ARCHITECTURE.md calls it a "mock store" — that's stale; i
   `d1 execute` silently flips the whole backlog. Pre-0066 backup snapshots carry the old scale
   (see [BACKUP.md](apps/api/BACKUP.md)).
 
-- **Runner-spawned agents (`kind === 'agent'`) have deliberately reduced authority, enforced in
-  server code (not the daemon's tool manifest):** they cannot set task `status` via
-  `update_task`/`update_tasks`, cannot call `release_task`/`handoff_task` (the run's terminal
-  outcome settles its anchor task), and `build`/`verify` run agents cannot rewrite **any** task's
-  execution spec ([lib/spec-authority.ts](apps/api/src/lib/spec-authority.ts) — only `scope` runs
-  author specs). Separately, **a claimed task's status is not editable via MCP at all**
+- **Runner-spawned agents (`kind === 'agent'`) — legacy execution plane, being removed:** while
+  still present in server code, they have deliberately reduced authority: they cannot set task
+  `status` via `update_task`/`update_tasks`, cannot call `release_task`/`handoff_task`, and
+  build/verify run agents cannot rewrite **any** task's execution spec
+  ([lib/spec-authority.ts](apps/api/src/lib/spec-authority.ts)). Copilots are the supported agent
+  path after cut-over. Separately, **a claimed task's status is not editable via MCP at all**
   (PLNR-226, enforced in the DO), and the GitHub webhook records a PR ref on a claimed task
-  without restatusing it. Their `allowedTools` floor means unlisted tools are **not registered**
-  (absent from `tools/list`), not advertise-then-deny.
+  without restatusing it. Legacy runner `allowedTools` floors (unlisted tools absent from
+  `tools/list`) apply only to runner-spawned agents, not copilots.
 
 - **The MCP SDK must dedupe to the SAME zod copy as our schemas — the root `package.json` pins
   `zod@^4` for exactly this (PLNR-549).** The SDK's `zod` is a *peer* dep resolved from the

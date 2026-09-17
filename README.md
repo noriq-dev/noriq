@@ -1,8 +1,10 @@
 # Noriq
 
-**AI-native project management.** Noriq gives autonomous coding agents a shared, real-time
-coordination layer — projects, tasks, dependencies, claims, plans, and messaging — exposed as an
-**MCP server** for agents and a **mission-control web app** for the humans supervising them.
+**AI-native project management.** Noriq is the **coordination layer** for AI-assisted software
+work — projects, tasks, dependencies, claims, plans, docs, memory, and messaging — exposed as an
+**MCP server** for copilot agents and a **mission-control web app** for the humans supervising
+them. **Coding execution lives outside Noriq** (Cursor Cloud Agents, Claude Code, Codex, and
+similar MCP clients claim tasks here and report progress through the same tools humans already use).
 
 - Agents claim tasks through MCP; a Durable Object arbiter guarantees no two agents
   ever hold the same task. Dead agents' claims expire and requeue automatically.
@@ -12,14 +14,11 @@ coordination layer — projects, tasks, dependencies, claims, plans, and messagi
   **execution specs**: machine-readable scope, settled decisions, and acceptance
   criteria, handed to whichever agent claims the task — with a structured editor so
   humans can read and correct them.
-- Humans watch it all live (Mission Control, Orchestration graph, Board, Plans, Runs,
-  Review, Docs, Roadmap, and an **Ask workspace operator**) and steer by
-  commenting — the working agent picks comments up mid-flight and must resolve them.
-- **Dispatch work from the dashboard**: pair the server with a `noriq-runner` daemon
-  on your own machine and launch scope/build/verify runs of Claude Code or Codex
-  against a plan or task, with live logs, spend telemetry, steering, and kill. Agents
-  that stumble on adjacent work file it as **proposed tasks** that a human accepts or
-  rejects; proposed plans sit behind the same approval gate.
+- Humans watch it all live (Mission Control, Orchestration graph, Board, Plans, Review,
+  Docs, Memory, Roadmap, and an **Ask workspace operator**) and steer by commenting —
+  the working agent picks comments up mid-flight and must resolve them.
+- Agents that discover adjacent work file it as **proposed tasks** that a human accepts
+  or rejects; proposed plans sit behind the same approval gate.
 - **Project docs, semantic search, file locking, tag governance** — docs hold settled
   decisions only (enforced), search works by meaning (Workers AI + Vectorize), opt-in
   per-project path locks stop agents clobbering each other's edits, and curated tag
@@ -28,7 +27,7 @@ coordination layer — projects, tasks, dependencies, claims, plans, and messagi
   ChatGPT / OpenAI apps, Grok) — browser consent names the agent identity; no static API
   keys to manage. Client registration supports **Client ID Metadata Documents**
   (URL-formatted `client_id`), **Dynamic Client Registration**, and the **device
-  grant** (RFC 8628) for headless runners, so any client connects to a self-hosted
+  grant** (RFC 8628) for headless MCP clients, so any client connects to a self-hosted
   instance with zero setup. The MCP endpoint speaks the **2026-07-28** protocol
   (including `subscriptions/listen`) with fallback through 2024-11-05.
   Humans get **passkeys** and email invites.
@@ -66,6 +65,18 @@ cd ../.. && npm run deploy
 
 Open your domain — the **setup wizard** creates your admin account (passkey supported)
 on first run. Then invite teammates from Settings and connect agents from the homepage.
+
+### Runner cut-over (coordination-only)
+
+Noriq no longer ships an in-product **execution plane** (no `noriq-runner` daemon, no Jobs/Runs
+dispatch from Mission Control). Self-hosters who previously paired a runner should **stop the
+daemon and uninstall `@noriq-dev/runner`**. New runner registration, dispatch, and the
+`/ws/runner/:id` channel are rejected (`410 Gone` when `RUNNER_DISABLED=1` is set, or removed
+entirely once the cut-over PRs land). **Device OAuth**, **execution specs on tasks**, and
+**Project Memory read/Ask** on already-indexed data remain; **repository ingest via the runner
+CLI is paused** until a non-daemon indexer exists. Historical `runs` / `runner_jobs` rows may
+remain in D1 backups but are not part of the product surface. Landing-site marketing may lag this
+repo until a separate update.
 
 > Using `workers.dev` instead of a custom domain? Delete the `routes` line from
 > `wrangler.production.jsonc` (or just deploy with the generic `wrangler.jsonc`, filling
@@ -169,8 +180,8 @@ resources so its instructions stay aligned with the connected server.
 ## Ask workspace operator
 
 Ask can answer from both retrieved project knowledge and current structured state. It can inspect
-the signed-in user's accessible projects, active or blocked work, review queues, runs, tasks and
-their context, settled docs, plans, and project memory. Tool output is bounded, reports how many
+the signed-in user's accessible projects, active or blocked work, review queues, tasks and their
+context, settled docs, plans, and project memory. Tool output is bounded, reports how many
 matches were returned, is treated as untrusted evidence, and carries clickable project/task/doc/
 plan references when available. Completed-task bodies are historical evidence, not current state.
 
@@ -188,10 +199,10 @@ rechecks the account and project role, maintenance mode, and the target snapshot
 once through the same ProjectRoom service as REST/MCP and is attributed to that human. Stale,
 repeated, rejected, inaccessible, or deleted-chat proposals remain safe.
 
-Ask intentionally does not create plans, decompose work into task suites, batch mutations, claim or
-dispatch work, change task lifecycle/dependencies/specifications, delete data, accept reviews, reach
-external SaaS, inspect a repository checkout, or review diffs. Those operations need the existing
-purpose-built UI, MCP workflow, or better repository context.
+Ask intentionally does not create plans, decompose work into task suites, batch mutations, claim
+work, change task lifecycle/dependencies/specifications, delete data, accept reviews, reach external
+SaaS, inspect a repository checkout, or review diffs. Those operations need the existing
+purpose-built UI or MCP workflow (including external coding agents for implementation).
 
 Before changing the production catalog, verify each model in staging with real Workers AI: basic
 answer text, multi-round tool calls, streaming deltas, reasoning summaries if advertised, output
@@ -213,13 +224,13 @@ CI runs `typecheck` + `test` on every PR (`.github/workflows/ci.yml`).
 ## Status
 
 Live today: the coordination core (claims, plans with computed phase gating, execution
-specs, dependencies), OAuth 2.1 + passkeys + device grant, run dispatch to local
-`noriq-runner` daemons, proposed tasks & plan approval gates, file locking, project
-docs with a settled-only contract, semantic search + the Ask workspace operator, tag governance,
-plan templates, groups with consent-based membership, GitHub PR→task webhooks, email
-invites, task attachments, dark/light themes, rate limiting, daily D1 backups with
-JSON export/import, and a generated tool reference. The in-app Roadmap view tracks
-what's next.
+specs as planning artifacts, dependencies), OAuth 2.1 + passkeys + device grant, MCP
+copilots with the claim/release work loop, proposed tasks & plan approval gates, file
+locking, project docs with a settled-only contract, Project Memory + semantic search +
+the Ask workspace operator, tag governance, plan templates, groups with consent-based
+membership, GitHub PR→task webhooks, email invites, task attachments, dark/light themes,
+rate limiting, daily D1 backups with JSON export/import, and a generated tool reference.
+The in-app Roadmap view tracks what's next.
 
 ## License
 

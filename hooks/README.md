@@ -75,11 +75,11 @@ those advisory locks into **best-effort enforcement** at a Claude Code session's
 `PreToolUse` hook acquires the lock *before* an `Edit`/`Write`/rename and **denies** the edit if
 another session holds it.
 
-> **Enforcement ladder.** This hook is rung 3 of 4: advisory tools → notices → **this client hook
-> (best-effort, you install it)** → runner-guaranteed enforcement. It stops a *cooperating* peer,
-> not an uncooperative one, and it depends on you installing it. For enforcement that can't be
-> skipped, spawn agents through the **Noriq Runner**, which injects locking into every run (that's
-> the companion RUN plan) and delegates to native Perforce/Diversion locks where they exist.
+> **Enforcement ladder.** This hook is rung 3 of 3 for MCP copilots: advisory tools → notices →
+> **this client hook (best-effort, you install it)**. It stops a *cooperating* peer, not an
+> uncooperative one, and it depends on you installing it. The former Noriq Runner “guaranteed”
+> tier (daemon-injected locking on dispatched runs) is removed with the execution plane — use
+> advisory MCP locks plus this hook for Claude Code sessions, or native VCS locks where they exist.
 
 ### Prerequisite: file locking must be enabled for the project
 

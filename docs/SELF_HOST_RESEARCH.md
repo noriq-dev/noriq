@@ -12,7 +12,7 @@ on every `npm test`, with SQLite standing in for D1 and disk for R2. A Docker im
 
 | Binding | Used for | Portability |
 |---|---|---|
-| Durable Objects | `ProjectRoom` (sole writer / claim arbiter / event seq), `AgentSession` (notice cursors), `RateLimiter`, `RunnerHub` (daemon WS) | **The crux.** Needs actor semantics: serialized execution per key, storage, alarms, WebSocket ownership. |
+| Durable Objects | `ProjectRoom` (sole writer / claim arbiter / event seq), `AgentSession` (notice cursors), `RateLimiter`, `ProjectMemory` (per-project cognitive store) | **The crux.** Needs actor semantics: serialized execution per key, storage, alarms, WebSocket ownership. Legacy `RunnerHub` (runner daemon WS) is being removed and is not part of the coordination product. |
 | D1 | all state | SQLite dialect throughout — trivially portable to a SQLite file; our migrations already apply cleanly in workerd. |
 | R2 | attachments, backups | Any blob store: disk volume or S3-compatible. |
 | Workers Assets | the SPA | Any static file serving. |
