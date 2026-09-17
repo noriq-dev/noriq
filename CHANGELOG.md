@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.76.0 - 2026-09-17
+
 ### Greenfield runner excision (coordination-only)
 
 - Removed `RunnerHub`, `/ws/runner`, and remaining runner-plane kill-switch scaffolding (`RUNNER_DISABLED`).
