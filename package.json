@@ -15,6 +15,7 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "check:authz": "node scripts/check-authorization-boundaries.mjs",
     "check:wrangler": "npm run check:wrangler --workspace @noriq-dev/api",
+    "check:delete-project": "npm run check:delete-project --workspace @noriq-dev/api",
     "memory:acceptance": "node scripts/memory-acceptance.mjs",
     "benchmark:constellation": "vite-node scripts/benchmark-constellation-v1.ts",
     "test": "npm run test --workspaces --if-present",

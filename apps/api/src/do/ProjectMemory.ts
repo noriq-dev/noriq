@@ -93,6 +93,19 @@ import {
 } from '../memory/verification';
 import { compareSurfaces, findingHash, type SurfaceId } from '../memory/guidance-drift';
 import type { MemoryReviewQueue, MemoryReviewReason } from '../lib/project-memory';
+import {
+  BACKUP_TABLES, CANONICAL_TABLES, CONSTELLATION_DERIVED_TABLES, MEMORY_BACKUP_EXPORT_CHUNKS_PER_INVOCATION,
+  MEMORY_BACKUP_EXPORT_CHUNK_TARGET_BYTES, MEMORY_BACKUP_EXPORT_READ_PAGE_ROWS, MEMORY_BACKUP_EXPORT_SESSION_TTL_MS,
+  MEMORY_BACKUP_RECOVERY_ROWS_PER_INVOCATION, MEMORY_BACKUP_SNAPSHOT_BATCHES_PER_INVOCATION,
+  MEMORY_BACKUP_SNAPSHOT_ROWS_PER_BATCH, OPERATIONAL_TABLES, SCHEMA_TABLES,
+} from './project-memory/table-manifest';
+
+export {
+  BACKUP_TABLES, CANONICAL_TABLES, CONSTELLATION_DERIVED_TABLES, MEMORY_BACKUP_EXPORT_CHUNKS_PER_INVOCATION,
+  MEMORY_BACKUP_EXPORT_CHUNK_TARGET_BYTES, MEMORY_BACKUP_EXPORT_READ_PAGE_ROWS, MEMORY_BACKUP_EXPORT_SESSION_TTL_MS,
+  MEMORY_BACKUP_RECOVERY_ROWS_PER_INVOCATION, MEMORY_BACKUP_SNAPSHOT_BATCHES_PER_INVOCATION,
+  MEMORY_BACKUP_SNAPSHOT_ROWS_PER_BATCH, OPERATIONAL_TABLES, SCHEMA_TABLES,
+} from './project-memory/table-manifest';
 
 /**
  * ProjectMemory — one instance per project (idFromName(projectId)), canonical
@@ -329,63 +342,6 @@ interface RecordEpisodeInput {
   writeMode?: 'replace' | 'skeleton' | 'enrichment';
 }
 
-export const CANONICAL_TABLES = [
-  'repositories',
-  'index_generations',
-  // PLNR-261's staged-generation tables: children of index_generations by convention (no real
-  // FK — see the migration's comment), so they must come right after it here too, both for
-  // backup/restore's generic parent-first/child-first ordering and for erase()'s reverse pass.
-  'index_batches',
-  'index_staged_entities',
-  'index_staged_edges',
-  'nodes',
-  'edges',
-  'memory_items',
-  'evidence',
-  'feedback',
-  'contradiction_sets',
-  'contradictions',
-  'memory_authority_transitions',
-  'episodes',
-  'outbox',
-] as const;
-
-/** PLNR-373: derived Constellation v2 generations. Counted in health and erased with the project,
- * but deliberately absent from portable backup/restore: canonical nodes/edges rebuild them. */
-export const CONSTELLATION_DERIVED_TABLES = [
-  'constellation_generations',
-  'constellation_node_stats',
-  'constellation_communities',
-  'constellation_memberships',
-  'constellation_community_links',
-  'constellation_lens_builds',
-  'constellation_lens_node_stats',
-  'constellation_lens_communities',
-  'constellation_lens_memberships',
-  'constellation_lens_community_links',
-] as const;
-
-export const SCHEMA_TABLES = [...CANONICAL_TABLES, ...CONSTELLATION_DERIVED_TABLES] as const;
-
-// Operational ledgers (PLNR-247) that are not part of SCHEMA_TABLES' health/erase accounting
-// (health counts them separately below; erase clears them explicitly) but that a faithful
-// backup/restore (PLNR-248/249) must carry — a restore missing these would re-project already
-// consumed coordination events and re-deliver already-emitted operations on the next reconcile.
-export const OPERATIONAL_TABLES = ['applied_operations', 'memory_revision', 'projector_cursor'] as const;
-
-/** Every table a backup (PLNR-248) exports and a restore (PLNR-249) imports, parents before
- *  children — the same generic per-table chunking applies to both graph data and the
- *  operational singletons (memory_revision, projector_cursor are one row each, chunked the same
- *  way as everything else rather than carved into bespoke manifest fields). */
-export const BACKUP_TABLES = [...CANONICAL_TABLES, ...OPERATIONAL_TABLES] as const;
-
-export const MEMORY_BACKUP_EXPORT_CHUNKS_PER_INVOCATION = 4;
-export const MEMORY_BACKUP_EXPORT_CHUNK_TARGET_BYTES = 2 * 1024 * 1024;
-export const MEMORY_BACKUP_EXPORT_READ_PAGE_ROWS = 32;
-export const MEMORY_BACKUP_SNAPSHOT_ROWS_PER_BATCH = 500;
-export const MEMORY_BACKUP_SNAPSHOT_BATCHES_PER_INVOCATION = 4;
-export const MEMORY_BACKUP_RECOVERY_ROWS_PER_INVOCATION = 500;
-export const MEMORY_BACKUP_EXPORT_SESSION_TTL_MS = 60 * 60 * 1000;
 const MEMORY_BACKUP_EXPORT_SESSION_KEY_PREFIX = 'backup_export_session:';
 
 export interface MemoryBackupExportInvocationMetrics {

@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import type { Context, Next } from 'hono';
+import type { Context } from 'hono';
 import { cors } from 'hono/cors';
 import { StreamableHTTPTransport } from '@hono/mcp';
 import type { Env } from './env';
@@ -36,7 +36,7 @@ import { verifyUploadToken, resolveUploadSecret, signIngestToken, verifyIngestTo
 import { USER_PROJECT_WHERE, taskWireStatus, tokenCanReachProject, tokenProjectWhere, userCanAccessProject } from './lib/visibility';
 import {
   groupRoleAllows, projectRoleAllows, resolveAccountCapabilities, resolveGroupRole, resolveProjectAccess,
-  recordAuthorizationAudit, userCanCreateGroup, userCanCreateProject, type ProjectAction,
+  recordAuthorizationAudit, userCanCreateGroup, userCanCreateProject,
 } from './lib/authorization';
 import type { Actor } from './do/ProjectRoom';
 import { SKILL_MD, SKILL_REFERENCES, SKILL_MD_SURFACE } from './skill';
@@ -45,7 +45,11 @@ import { buildNoriqSkillArchive } from './skill-archive';
 import pkg from '../package.json';
 import { issueTokens, metadataRoutes, oauth } from './oauth';
 import { demoLocksDown } from './lib/demo';
-import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
+import { isMaintenanceMode } from './lib/maintenance';
+import { registerMaintenanceFreeze } from './lib/maintenance-freeze';
+import {
+  humanProjectActionDenied, reachesProject, registerProjectAccessMiddleware, resolveBlockerRefRest,
+} from './lib/rest-project-access';
 import { copilotSessionContextFromMessages, endCopilotSession } from './lib/copilot-session';
 import { isDurableCopilotKey, resolveCopilotSessionKey } from './lib/mcp-session-key';
 import { errorPage, wantsHtml } from './errorPage';
@@ -134,27 +138,7 @@ app.use('/mcp', cors({
 }));
 app.use('/oauth/*', cors({ allowMethods: ['GET', 'POST', 'OPTIONS'], maxAge: 86400 }));
 
-// Write-freeze (PLNR-166): when MAINTENANCE_MODE is on, refuse mutating requests with a
-// retryable 503 so nothing is acked into a database about to be swapped out (PLNR-164);
-// reads stay live. Registered before every route so no handler can slip a write past it.
-// Exemptions: GET/HEAD/OPTIONS (reads); /mcp (gated per-tool instead — its reads must stay
-// live on the same POST endpoint); auth/OAuth/health/ws (bootstrap + observation, not the
-// acked coordination-write contract, and trivially redone if a session is lost); and
-// /api/admin/import — a restore is the one write you DO want under a freeze (a deliberate
-// admin DB replacement, with the freeze holding off the coordination writes that would race it).
-// /api/admin/memory-restore is the same exception for ProjectMemory (PLNR-249) — matches both
-// the restore route and its /rollback sibling by prefix; /api/admin/memory-backup is NOT
-// exempt, matching /api/admin/backup/export above it (an export is safe to defer, not something
-// you need mid-freeze).
-const FREEZE_EXEMPT_PREFIXES = ['/mcp', '/oauth/', '/.well-known/', '/api/auth/', '/api/reset', '/api/setup', '/api/health', '/ws/', '/api/admin/import', '/api/admin/memory-restore'];
-app.use('*', async (c, next) => {
-  if (!isMaintenanceMode(c.env)) return next();
-  const method = c.req.method;
-  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return next();
-  const path = new URL(c.req.url).pathname;
-  if (FREEZE_EXEMPT_PREFIXES.some((p) => path === p || path.startsWith(p))) return next();
-  return c.json({ error: MAINTENANCE_MESSAGE }, 503, { 'Retry-After': '30' });
-});
+registerMaintenanceFreeze(app);
 
 // OAuth 2.1 AS for MCP clients: discovery + register/authorize/token.
 metadataRoutes(app);
@@ -186,117 +170,7 @@ const demoDenied = (c: Context<AppContext>): Response | null =>
     ? c.json({ error: 'This action is disabled in the demo.' }, 403)
     : null;
 
-// Gate every project-scoped route (PLNR-92): being signed in is NOT enough — you
-// must be able to REACH this project. Mirrors VISIBILITY_WHERE (owner, a member of
-// its group, or an admin). Returns 404 (not 403) so project-id existence doesn't
-// leak. Registered as ONE chokepoint over /api/projects/:pid/* so no individual
-// write route can forget the check (the mass-IDOR hole this closes came from the
-// check living only on the MCP path). userAuth runs first (idempotent) to populate
-// c.var.user; the route-level userAuth then no-ops.
-/** Human-path project reach. Human admins may opt into the explicit override; credentials and
- * agent paths never call this helper and therefore never inherit it. */
-const reachesProject = async (c: Context<AppContext>, pid: string): Promise<boolean> => {
-  const access = await resolveProjectAccess(c.env.DB, c.var.user!.id, pid, { allowAdminOverride: true });
-  return projectRoleAllows(access.role, 'view');
-};
-
-/** Stable human-path denial for routes whose project id is discovered from another row and
- * therefore sit outside the central /api/projects/:pid/* policy middleware. */
-const humanProjectActionDenied = async (
-  c: Context<AppContext>,
-  pid: string,
-  action: ProjectAction,
-): Promise<Response | null> => {
-  const access = await resolveProjectAccess(c.env.DB, c.var.user!.id, pid, { allowAdminOverride: true });
-  if (!projectRoleAllows(access.role, 'view')) return c.json({ error: 'not found' }, 404);
-  if (!projectRoleAllows(access.role, action)) {
-    return c.json({
-      error: `project ${action === 'contribute' ? 'contributor' : action} role required`,
-      code: 'project_action_denied',
-      action,
-      role: access.role,
-      reason: access.cappedByReadOnly ? 'account_read_only' : 'insufficient_project_role',
-    }, 403);
-  }
-  return null;
-};
-
-// POST is ordinarily a mutation, but these query-shaped endpoints use POST for bounded request
-// bodies and remain viewer actions. Everything else maps to a stable minimum action here; more
-// sensitive per-field owner checks (publication/transfer) remain inside their handlers.
-const VIEWER_POST_ROUTES = [
-  /\/memory\/(search|similar-effort|explain|constellation|entities|context|acceptance)$/,
-];
-const MANAGER_ROUTES = [
-  /\/meta$/,
-  /\/access(?:\/.*)?$/,
-  /\/runs$/,
-  /\/plans\/[^/]+\/dispatch$/,
-  /\/plans\/[^/]+\/(approve|reject)$/,
-  /\/locks\/[^/]+\/force-release$/,
-  /\/search\/reindex$/,
-  /\/memory\/repositories(?:\/[^/]+)?$/,
-  /\/memory\/(backup|restore(?:\/rollback)?|lifecycle-sweep|graph\/rebuild)$/,
-  /\/memory\/constellation\/v2\/rebuild$/,
-  /\/memory\/generations(?:\/[^/]+\/(?:activate|abort)|\/prune-retained)$/,
-  /\/memory\/vectors\/rebuild$/,
-  /\/memory\/items\/[^/]+\/(approve|reject)$/,
-  /\/agent-lifecycle-sweep$/,
-];
-
-const projectActionForRequest = (method: string, pathname: string): ProjectAction => {
-  if (method === 'GET' || method === 'HEAD' || VIEWER_POST_ROUTES.some((re) => re.test(pathname))) return 'view';
-  if (MANAGER_ROUTES.some((re) => re.test(pathname))) return 'manage';
-  return 'contribute';
-};
-
-/** Resolve a dependency BLOCKER ref on the human path (PLNR-241): id or display key (both
- *  globally unique), in this project or any project this session can reach — the REST twin
- *  of the MCP layer's resolveBlockerRef. Unknown and unreachable collapse into ONE error so
- *  a rejected ref never confirms that a task exists somewhere the caller cannot see. */
-async function resolveBlockerRefRest(c: Context<AppContext>, pid: string, ref: string): Promise<string> {
-  const t = await c.env.DB.prepare('SELECT id, project_id AS tpid FROM tasks WHERE id = ? OR key = ?')
-    .bind(ref, ref).first<{ id: string; tpid: string }>();
-  if (t && (t.tpid === pid || (await reachesProject(c, t.tpid)))) return String(t.id);
-  throw new Error(`dependsOn ${ref} not found or not accessible`);
-}
-
-async function requireProjectAccess(c: Context<AppContext>, next: Next) {
-  // Path shape: /api/projects/<pid>/<sub>... — derive pid directly (robust
-  // regardless of how Hono resolves params for wildcard middleware). Only the
-  // SUB-routes are governed here; the bare /api/projects/:pid (whole-project
-  // DELETE) is out of scope — it keeps its own owner/admin gate (403).
-  const parts = new URL(c.req.url).pathname.split('/');
-  const pid = parts[3];
-  if (pid && parts.length > 4) {
-    const action = projectActionForRequest(c.req.method, new URL(c.req.url).pathname);
-    const access = await resolveProjectAccess(c.env.DB, c.var.user!.id, pid, { allowAdminOverride: true });
-    if (!access.exists || !projectRoleAllows(access.role, 'view')) {
-      await recordAuthorizationAudit(c.env.DB, {
-        actorKind: 'human', actorId: c.var.user!.id, action: 'project.action', resourceType: 'project', resourceId: pid,
-        decision: 'deny', reason: access.exists ? 'no_project_access' : 'project_not_found', metadata: { requiredAction: action, transport: 'rest' },
-      }).catch(() => {});
-      return c.json({ error: 'not found' }, 404);
-    }
-    if (!projectRoleAllows(access.role, action)) {
-      const requiredRole = action === 'contribute' ? 'contributor' : action === 'manage' ? 'manager' : action === 'own' ? 'owner' : 'viewer';
-      await recordAuthorizationAudit(c.env.DB, {
-        actorKind: 'human', actorId: c.var.user!.id, action: 'project.action', resourceType: 'project', resourceId: pid,
-        decision: 'deny', reason: access.cappedByReadOnly ? 'account_read_only' : 'insufficient_project_role',
-        metadata: { requiredAction: action, effectiveRole: access.role, transport: 'rest' },
-      }).catch(() => {});
-      return c.json({
-        error: `project ${requiredRole} role required`,
-        code: 'project_action_denied',
-        action,
-        role: access.role,
-        reason: access.cappedByReadOnly ? 'account is read-only' : 'insufficient project role',
-      }, 403);
-    }
-  }
-  await next();
-}
-app.use('/api/projects/:pid/*', userAuth, requireProjectAccess);
+registerProjectAccessMiddleware(app);
 
 // --- health -----------------------------------------------------------------
 // `version` comes from package.json (bumped every deploy) — the SPA compares it to

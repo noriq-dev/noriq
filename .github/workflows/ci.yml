@@ -32,6 +32,9 @@ jobs:
       - name: Wrangler configs
         run: npm run check:wrangler
 
+      - name: deleteProject cascade
+        run: npm run check:delete-project
+
       - name: Claude Code hooks
         run: npm run test:hooks
 
