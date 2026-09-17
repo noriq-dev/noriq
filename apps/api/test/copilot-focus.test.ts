@@ -1,5 +1,5 @@
 // PLNR-354: a Copilot may roam between projects, but its briefing/update/memory scope must follow
-// the work it is doing now. Runner agents remain pinned to the project chosen by their run.
+// the work it is doing now.
 import { describe, expect, it } from 'vitest';
 import { createAgent, createRunAgent, mcpCall } from './helpers';
 
@@ -25,21 +25,10 @@ describe('roaming Copilot project focus', () => {
     expect((await mcpCall(copilot.apiKey, 'get_briefing', {})).body.state.agentProjectId).toBe(a);
   });
 
-  it('does not expose roaming focus to a runner-owned agent or let rename move it', async () => {
+  it('refuses legacy runner-bound MCP credentials', async () => {
     const owner = await createAgent('runner-focus-owner');
     const a = (await mcpCall(owner.apiKey, 'create_project', { key: 'FOCRUNA', name: 'Runner A' })).body.id as string;
-    const b = (await mcpCall(owner.apiKey, 'create_project', { key: 'FOCRUNB', name: 'Runner B' })).body.id as string;
-    const runner = await createRunAgent(a, 'build', {
-      allowedTools: ['get_briefing', 'configure_agent'],
-    });
-
-    const focus = await mcpCall(runner.apiKey, 'configure_agent', { projectId: b });
-    expect(focus.isError).toBe(true);
-    expect(focus.text).toMatch(/pinned|cannot change project focus/i);
-
-    const rename = await mcpCall(runner.apiKey, 'configure_agent', { name: 'still-pinned', projectId: b });
-    expect(rename.isError).toBe(true);
-    expect(rename.text).toMatch(/pinned|cannot change project focus/i);
-    expect((await mcpCall(runner.apiKey, 'get_briefing', {})).body.state.agentProjectId).toBe(a);
+    const runner = await createRunAgent(a, 'build', {});
+    await expect(mcpCall(runner.apiKey, 'get_briefing', {})).rejects.toThrow(/401/);
   });
 });

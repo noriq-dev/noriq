@@ -15,13 +15,13 @@ describe('complete MCP tool contract audit', () => {
     const audit = auditMcpCatalog(specs);
     expect(audit.findings).toEqual([]);
     expect(audit.valid).toBe(true);
-    expect(audit.toolCount).toBe(57);
+    expect(audit.toolCount).toBe(56);
     expect(Object.keys(MCP_TOOL_POLICIES).sort()).toEqual(specs.tools.map((tool) => tool.name).sort());
     expect(Object.keys(MCP_TOOL_AUDIENCE).sort()).toEqual(specs.tools.map((tool) => tool.name).sort());
     expect(specs.tools.filter((tool) => tool.audience === 'core')).toHaveLength(35);
   });
 
-  it('Copilots receive every non-runner tool by default', async () => {
+  it('Copilots receive the full tool catalog by default', async () => {
     const token = await mintTokenForUser('mcp-catalog-audit@example.com');
     const live = await mcpList(token) as Array<{
       name: string;
@@ -30,7 +30,7 @@ describe('complete MCP tool contract audit', () => {
       annotations: Record<string, unknown>;
     }>;
     const specs = mcpReferenceSpecs();
-    expect(live.map((tool) => tool.name).sort()).toEqual(specs.tools.filter((tool) => tool.audience !== 'runner').map((tool) => tool.name).sort());
+    expect(live.map((tool) => tool.name).sort()).toEqual(specs.tools.map((tool) => tool.name).sort());
     expect(live).toHaveLength(56);
     expect(live.some((tool) => tool.name === 'can_claim')).toBe(false);
     const freshSession = await mcpList(token, 'fresh-copilot-session');

@@ -817,28 +817,22 @@ describe('get_task_context — the real MCP tool', () => {
     expect(intelligence.body.current.readiness.reason).toMatch(/active Copilot claim/);
   });
 
-  it('is registered with READ hints, and role defaults from the calling agent\'s own run kind', async () => {
+  it('is registered with READ hints, and role defaults from the copilot claim or explicit override', async () => {
     const tools = await mcpList(agent.apiKey);
     const tool = tools.find((t) => t.name === 'get_task_context');
     expect(tool).toBeTruthy();
     expect(tool!.description).toMatch(/read-only/i);
 
     const projectId = await newProject('MCPA1');
-    const made = await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'Build-run role probe', tags: ['context-pack-test'] });
+    const made = await mcpCall(agent.apiKey, 'create_task', { projectId, title: 'Role probe', tags: ['context-pack-test'] });
     const taskId = made.body.id as string;
 
-    const builder = await createRunAgent(projectId, 'build');
-    const res = await mcpCall(builder.apiKey, 'get_task_context', { projectId, taskId });
-    expect(res.isError).toBeFalsy();
-    expect(res.body.role).toBe('build');
-
-    // Explicit role overrides the derived default.
-    const overridden = await mcpCall(builder.apiKey, 'get_task_context', { projectId, taskId, role: 'verify' });
-    expect(overridden.body.role).toBe('verify');
-
-    // A copilot (this suite's shared `agent`) with no live run defaults to 'human'.
     const asCopilot = await mcpCall(agent.apiKey, 'get_task_context', { projectId, taskId });
+    expect(asCopilot.isError).toBeFalsy();
     expect(asCopilot.body.role).toBe('human');
+
+    const overridden = await mcpCall(agent.apiKey, 'get_task_context', { projectId, taskId, role: 'verify' });
+    expect(overridden.body.role).toBe('verify');
   });
 
   it('is refused for a project the caller cannot reach, the same way every other project-scoped tool refuses it', async () => {

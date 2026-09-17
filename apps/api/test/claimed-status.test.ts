@@ -122,15 +122,6 @@ describe('status on a claimed task, via MCP (PLNR-226)', () => {
     expect((await taskRow(unclaimed.id)).status).toBe('todo');
   });
 
-  it("a run agent still gets the PLNR-192 refusal FIRST — the tool-layer guard outranks this one", async () => {
-    const runner = await createRunAgent(projectId, 'build', {});
-    const res = await mcpCall(runner.apiKey, 'update_task', { projectId, taskId: claimed.id, status: 'review' });
-    expect(res.isError).toBe(true);
-    expect(res.text).toMatch(/run agents don't set task status/);
-    expect(res.text).not.toMatch(/is claimed/);
-    expect((await taskRow(claimed.id)).status).toBe('in_progress');
-  });
-
   // LAST: this one settles the fixture's claim. The human path is the override by design —
   // restatusing a claimed task works AND clears the claim on done/cancelled/todo.
   it('a human REST PATCH keeps the supervisor override, claim-clearing included', async () => {

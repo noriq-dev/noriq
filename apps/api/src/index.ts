@@ -381,25 +381,20 @@ app.all('/mcp', agentAuth, async (c) => {
     isInitialize: isInit,
   });
   const sessionId = resolved.key;
-  let agent = conn.boundAgent;
-  if (!agent) {
-    // Both refusals here are authentication failures, not server faults: a session id
-    // replayed under another user's token (PLNR-101), and a session whose copilot was
-    // revoked. They used to escape as 500s.
-    try {
-      const sessionContext = copilotSessionContextFromMessages(msgs);
-      agent = await resolveSessionAgent(c.env, conn, sessionId, sessionContext);
-    } catch (e) {
-      const message = (e as Error).message;
-      const authFailure = /does not belong|revoked|session has ended/i.test(message);
-      return c.json({ error: message }, authFailure ? 401 : 400);
-    }
-    if (isInit) c.header('Mcp-Session-Id', sessionId);
+  let agent;
+  try {
+    const sessionContext = copilotSessionContextFromMessages(msgs);
+    agent = await resolveSessionAgent(c.env, conn, sessionId, sessionContext);
+  } catch (e) {
+    const message = (e as Error).message;
+    const authFailure = /does not belong|revoked|session has ended/i.test(message);
+    return c.json({ error: message }, authFailure ? 401 : 400);
   }
+  if (isInit) c.header('Mcp-Session-Id', sessionId);
 
   const server = buildMcpServer(c.env, agent, {
     oauthTokenId: conn.tokenId,
-    sessionId: conn.boundAgent ? undefined : sessionId,
+    sessionId,
     origin: new URL(c.req.url).origin,
   });
   const transport = new StreamableHTTPTransport();

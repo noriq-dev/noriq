@@ -3,11 +3,8 @@
 // (public clients only), refresh tokens, and the device grant (RFC 8628).
 //
 // A token authorizes a CONNECTION, not an agent (RUN-43 / migration 0026). Granting
-// says "this client may act for this user"; it does not decide *who does the work*.
-// That is settled later, and separately: a human's session resolves its own copilot at
-// MCP initialize, and a runner mints the agent it owns and gets a token bound to it.
-// Tokens here are therefore issued with agent_id NULL — the binding is the exception
-// (a runner's per-run token), not the rule.
+// says "this client may act for this user"; the working copilot is resolved per MCP session.
+// Tokens are issued with agent_id NULL. Legacy per-run runner bindings are refused at MCP auth.
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 import type { AppContext } from './auth';
@@ -904,11 +901,8 @@ oauth.post('/token', async (c) => {
 /**
  * Mint an access/refresh pair for a connection.
  *
- * `agentId` is normally null: a connection is not an agent, and the working copilot is
- * resolved per MCP session. It is non-null only for a token bound to one specific agent —
- * a runner's per-run token, which acts as exactly that agent and nothing else. The refresh
- * grant threads the existing binding through so rotation cannot quietly widen a bound
- * token into a general-purpose one.
+ * `agentId` is always null for new tokens. The refresh grant threads any legacy binding through
+ * only so rotation does not widen scope; MCP refuses non-null agent_id credentials.
  */
 export async function issueTokens(
   db: D1Database,
@@ -929,9 +923,7 @@ export async function issueTokens(
    */
   scopeAll = false,
   /**
-   * The connection's copilot (PLNR-155) — the parent every session copilot on this token hangs
-   * off. Independent of `agentId`: a human's connection has a copilot and no bound agent; a
-   * runner's per-run token has a bound agent and no copilot. Never both.
+   * The connection's copilot (PLNR-155) — the parent every session copilot on this token hangs off.
    */
   copilotId: string | null = null,
 ) {

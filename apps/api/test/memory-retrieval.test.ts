@@ -198,17 +198,6 @@ describe('search_project_memory — registration and MCP floor gating', () => {
     expect((tool as unknown as { inputSchema: { properties: Record<string, unknown> } }).inputSchema.properties).toHaveProperty('preferBranch');
   });
 
-  it('is absent from tools/list for a floor that omits it, present and callable for one that includes it', async () => {
-    const { projectId } = await newOwnedProject('pm-retr-floor@example.com', 'PMRFLR');
-    const withoutFloor = ['get_briefing', 'get_task', 'heartbeat'];
-    const without = await createRunAgent(projectId, 'build', { ownerEmail: 'pm-retr-floor@example.com', allowedTools: withoutFloor });
-    expect((await mcpList(without.apiKey)).map((t) => t.name)).not.toContain('search_project_memory');
-
-    const withIt = await createRunAgent(projectId, 'build', { ownerEmail: 'pm-retr-floor@example.com', allowedTools: [...withoutFloor, 'search_project_memory'] });
-    expect((await mcpList(withIt.apiKey)).map((t) => t.name)).toContain('search_project_memory');
-    const called = await mcpCall(withIt.apiKey, 'search_project_memory', { projectId, query: 'anything' });
-    expect(called.isError).toBeFalsy();
-  });
 });
 
 describe('exact + lexical + semantic (keyword-mode) stages, with live authority/validity', () => {

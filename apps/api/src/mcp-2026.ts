@@ -182,28 +182,26 @@ export async function handleModernMcp(c: Context<AppContext>, env: Env, conn: Co
 
   // --- server/discover: answered directly, no SDK involved ---
   if (isDiscover) {
-    let discoveryAgent = conn.boundAgent;
-    if (!discoveryAgent) {
-      const discoverySessionKey = resolveCopilotSessionKey({
-        messages: [msg],
-        mcpSessionId: c.req.header('mcp-session-id'),
-        xMcpSessionId: c.req.header('x-mcp-session-id'),
-        tokenId: conn.tokenId,
-        userAgent: c.req.header('user-agent'),
-        clientName: conn.clientName,
-      }).key;
-      try {
-        discoveryAgent = await resolveSessionAgent(
-          env,
-          conn,
-          discoverySessionKey,
-          copilotSessionContextFromMessages([msg]),
-        );
-      } catch (e) {
-        const message = (e as Error).message;
-        const authFailure = /does not belong|revoked|session has ended/i.test(message);
-        return c.json({ error: message }, authFailure ? 401 : 400);
-      }
+    const discoverySessionKey = resolveCopilotSessionKey({
+      messages: [msg],
+      mcpSessionId: c.req.header('mcp-session-id'),
+      xMcpSessionId: c.req.header('x-mcp-session-id'),
+      tokenId: conn.tokenId,
+      userAgent: c.req.header('user-agent'),
+      clientName: conn.clientName,
+    }).key;
+    let discoveryAgent;
+    try {
+      discoveryAgent = await resolveSessionAgent(
+        env,
+        conn,
+        discoverySessionKey,
+        copilotSessionContextFromMessages([msg]),
+      );
+    } catch (e) {
+      const message = (e as Error).message;
+      const authFailure = /does not belong|revoked|session has ended/i.test(message);
+      return c.json({ error: message }, authFailure ? 401 : 400);
     }
     return c.json({
       jsonrpc: '2.0' as const,
@@ -236,24 +234,21 @@ export async function handleModernMcp(c: Context<AppContext>, env: Env, conn: Co
   }
 
   // --- identity (no protocol sessions in 2026-07-28 — see module docs) ---
-  let agent = conn.boundAgent;
-  let sessionKey: string | undefined;
-  if (!agent) {
-    sessionKey = resolveCopilotSessionKey({
-      messages: [msg],
-      mcpSessionId: c.req.header('mcp-session-id'),
-      xMcpSessionId: c.req.header('x-mcp-session-id'),
-      tokenId: conn.tokenId,
-      userAgent: c.req.header('user-agent'),
-      clientName: conn.clientName,
-    }).key;
-    try {
-      agent = await resolveSessionAgent(env, conn, sessionKey, copilotSessionContextFromMessages([msg]));
-    } catch (e) {
-      const message = (e as Error).message;
-      const authFailure = /does not belong|revoked|session has ended/i.test(message);
-      return c.json({ error: message }, authFailure ? 401 : 400);
-    }
+  const sessionKey = resolveCopilotSessionKey({
+    messages: [msg],
+    mcpSessionId: c.req.header('mcp-session-id'),
+    xMcpSessionId: c.req.header('x-mcp-session-id'),
+    tokenId: conn.tokenId,
+    userAgent: c.req.header('user-agent'),
+    clientName: conn.clientName,
+  }).key;
+  let agent;
+  try {
+    agent = await resolveSessionAgent(env, conn, sessionKey, copilotSessionContextFromMessages([msg]));
+  } catch (e) {
+    const message = (e as Error).message;
+    const authFailure = /does not belong|revoked|session has ended/i.test(message);
+    return c.json({ error: message }, authFailure ? 401 : 400);
   }
 
   // --- bridge into the SDK server over an in-memory pair ---

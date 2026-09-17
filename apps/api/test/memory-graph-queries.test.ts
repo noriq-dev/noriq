@@ -64,16 +64,6 @@ describe('explain_project_area — registration and MCP floor gating', () => {
     expect(tool!.description).toContain('decisionUri');
   });
 
-  it('is absent from tools/list for a floor that omits it, present and callable for one that includes it', async () => {
-    const { projectId } = await newOwnedProject('pm-gq-floor@example.com', 'PMGQFLR');
-    const without = await createRunAgent(projectId, 'build', { ownerEmail: 'pm-gq-floor@example.com', allowedTools: ['get_briefing'] });
-    expect((await mcpList(without.apiKey)).map((t) => t.name)).not.toContain('explain_project_area');
-
-    const withIt = await createRunAgent(projectId, 'build', { ownerEmail: 'pm-gq-floor@example.com', allowedTools: ['get_briefing', 'explain_project_area'] });
-    expect((await mcpList(withIt.apiKey)).map((t) => t.name)).toContain('explain_project_area');
-    const called = await mcpCall(withIt.apiKey, 'explain_project_area', { projectId, focus: 'impact', entityUris: ['noriq://file/PMGQFLR/repo-x/never-indexed.ts'] });
-    expect(called.isError).toBeFalsy();
-  });
 });
 
 describe('dependencyNeighborhood — directional, bounded, populated code graph', () => {

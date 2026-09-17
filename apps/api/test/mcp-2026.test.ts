@@ -197,10 +197,7 @@ describe('stateless requests (no initialize, no session)', () => {
     expect(status).toBe(200);
     expect(body.result._meta[SERVER_INFO_KEY].version).toBe(pkg.version);
 
-    const expected = Object.entries(MCP_TOOL_AUDIENCE)
-      .filter(([, audience]) => audience !== 'runner')
-      .map(([name]) => name)
-      .sort();
+    const expected = Object.keys(MCP_TOOL_AUDIENCE).sort();
     const actual = body.result.tools.map((tool: { name: string }) => tool.name).sort();
     expect(actual).toEqual(expected);
     for (const required of ['create_tasks', 'record_memory', 'search_project_memory', 'explain_project_area', 'get_task_context']) {
