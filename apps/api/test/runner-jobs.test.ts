@@ -175,7 +175,7 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
     });
     await room.cancelRunnerJob(pid, SYSTEM_ACTOR as Actor, prior.id);
     const historical = await env.DB.prepare(
-      `SELECT snapshot, assignment_id AS assignmentId, status, updated_at AS updatedAt
+      `SELECT snapshot, assignment_id AS assignmentId, status
          FROM runner_jobs WHERE id = ?`,
     ).bind(prior.id).first();
     const failedAt = new Date().toISOString();
@@ -192,8 +192,9 @@ describe('RunnerJob commissioning (PLNR-498)', () => {
     expect(RunnerJobSource.parse(retry.source)).toMatchObject({
       kind: 'task', task: { taskId: task.id, status: 'failed', retry: true },
     });
+    // Commissioning fields are immutable; async intelligence projection may refresh updated_at alone.
     expect(await env.DB.prepare(
-      `SELECT snapshot, assignment_id AS assignmentId, status, updated_at AS updatedAt
+      `SELECT snapshot, assignment_id AS assignmentId, status
          FROM runner_jobs WHERE id = ?`,
     ).bind(prior.id).first()).toEqual(historical);
     expect(await env.DB.prepare('SELECT status, failed_at AS failedAt FROM tasks WHERE id = ?')
