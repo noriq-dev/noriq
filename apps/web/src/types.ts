@@ -33,6 +33,7 @@ export interface ProjectVM {
   liveAgentCount?: number;
   historicalAgentCount?: number;
   isPublic?: boolean;
+  status: 'active' | 'archived';
   effectiveRole: 'owner' | 'manager' | 'contributor' | 'viewer' | null;
   accessSource: string;
   canView: boolean;

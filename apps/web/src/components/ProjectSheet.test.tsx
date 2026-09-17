@@ -7,7 +7,7 @@ import { ProjectSheet } from './ProjectSheet';
 
 const project = (id: string, key: string, name: string): ProjectVM => ({
   id, key, name, phase: '', dotColor: '#c6f24e', badge: '', hasLive: false, groupId: null,
-  openTasks: 1, totalTasks: 2, doneTasks: 1, effectiveRole: 'owner', accessSource: 'owner',
+  openTasks: 1, totalTasks: 2, doneTasks: 1, status: 'active', effectiveRole: 'owner', accessSource: 'owner',
   canView: true, canContribute: true, canManage: true, canOwn: true, cappedByReadOnly: false,
 });
 

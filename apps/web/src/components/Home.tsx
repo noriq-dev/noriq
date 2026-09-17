@@ -174,6 +174,11 @@ function AttentionSection({ store }: { store: AppStore }) {
 export function Home({ store }: { store: AppStore }) {
   const { data, groups, actions } = store;
   const { phone } = useViewport();
+  const [showArchived, setShowArchived] = useState(false);
+  const [archivedProjects, setArchivedProjects] = useState<ProjectVM[]>([]);
+  const [archivedLoading, setArchivedLoading] = useState(false);
+  const [archivedError, setArchivedError] = useState<string | null>(null);
+  const [restoreWorkingId, setRestoreWorkingId] = useState<string | null>(null);
   // A project whose group isn't in the list (e.g. not loaded) must still show —
   // treat it as ungrouped rather than dropping it (PLNR-81 regression guard).
   const knownGroupIds = new Set(groups.map((g) => g.id));
@@ -184,6 +189,54 @@ export function Home({ store }: { store: AppStore }) {
   const hour = new Date().getHours();
   const greeting = hour < 5 ? 'Working late' : hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
   const openTasks = data.projects.reduce((n, p) => n + p.openTasks, 0);
+
+  useEffect(() => {
+    if (!showArchived) {
+      setArchivedProjects([]);
+      setArchivedError(null);
+      return;
+    }
+    let current = true;
+    setArchivedLoading(true);
+    setArchivedError(null);
+    api.projects({ archived: true })
+      .then((r) => {
+        if (!current) return;
+        setArchivedProjects(r.projects.map((item, i) => ({
+          id: item.id,
+          key: item.key,
+          name: item.name,
+          phase: item.description || '',
+          dotColor: 'var(--text-dim)',
+          badge: item.key.slice(0, 2),
+          hasLive: false,
+          groupId: item.groupId,
+          openTasks: item.openTasks,
+          totalTasks: item.totalTasks,
+          doneTasks: item.doneTasks,
+          ownerName: item.ownerName,
+          agentCount: item.agentCount,
+          liveAgentCount: item.liveAgentCount,
+          historicalAgentCount: item.historicalAgentCount,
+          isPublic: !!item.public,
+          status: item.status ?? 'archived',
+          effectiveRole: item.effectiveRole,
+          accessSource: item.accessSource,
+          canView: item.canView,
+          canContribute: item.canContribute,
+          canManage: item.canManage,
+          canOwn: item.canOwn,
+          cappedByReadOnly: item.cappedByReadOnly,
+        })));
+      })
+      .catch((error) => {
+        if (current) setArchivedError(error instanceof Error ? error.message : 'Could not load archived projects.');
+      })
+      .finally(() => {
+        if (current) setArchivedLoading(false);
+      });
+    return () => { current = false; };
+  }, [showArchived, data.projects.length]);
 
   return (
     <div style={{ position: 'absolute', inset: 0, overflowY: 'auto' }}>
@@ -238,6 +291,58 @@ export function Home({ store }: { store: AppStore }) {
               </div>
             ))}
           </>
+        )}
+
+
+        <div style={{ marginTop: 28, marginBottom: 8, display: 'flex', alignItems: 'center', gap: 10 }}>
+          <SectionLabel>Archived</SectionLabel>
+          <div style={{ flex: 1 }} />
+          <Button
+            variant="ghost"
+            style={{ padding: '6px 13px', fontSize: 12 }}
+            aria-pressed={showArchived}
+            onClick={() => setShowArchived((v) => !v)}
+          >
+            {showArchived ? 'Hide archived' : 'Show archived'}
+          </Button>
+        </div>
+        {showArchived && (
+          <div data-testid="archived-projects" style={{ marginBottom: 28 }}>
+            {archivedLoading && <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)' }}>Loading archived…</div>}
+            {archivedError && <div style={{ color: 'var(--red-soft)', fontSize: 12 }}>{archivedError}</div>}
+            {!archivedLoading && !archivedError && archivedProjects.length === 0 && (
+              <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)' }}>No archived projects.</div>
+            )}
+            {archivedProjects.map((proj) => (
+              <div
+                key={proj.id}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 10, marginTop: 8,
+                  border: '1px solid var(--w-07)', borderRadius: 11, padding: '11px 13px', background: 'var(--w-015)',
+                }}
+              >
+                <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, fontWeight: 700, color: 'var(--text-dim)', background: 'var(--w-05)', padding: '2px 7px', borderRadius: 5 }}>{proj.key}</span>
+                <span style={{ flex: 1, minWidth: 0, fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{proj.name}</span>
+                {proj.canOwn && (
+                  <Button
+                    variant="ghost"
+                    disabled={restoreWorkingId === proj.id}
+                    onClick={async () => {
+                      setRestoreWorkingId(proj.id);
+                      try {
+                        await actions.restoreProject(proj.id);
+                        setArchivedProjects((list) => list.filter((item) => item.id !== proj.id));
+                      } finally {
+                        setRestoreWorkingId(null);
+                      }
+                    }}
+                  >
+                    {restoreWorkingId === proj.id ? 'Restoring…' : 'Restore'}
+                  </Button>
+                )}
+              </div>
+            ))}
+          </div>
         )}
 
         {/* Desktop onboarding belongs beside the workstation where an agent can be configured. */}

@@ -41,6 +41,8 @@ function fakeStore({ canManage = true, canOwn = true } = {}) {
       openModal: vi.fn(),
       refreshNow: vi.fn().mockResolvedValue(undefined),
       deleteProject: vi.fn().mockResolvedValue(undefined),
+      archiveProject: vi.fn().mockResolvedValue(undefined),
+      restoreProject: vi.fn().mockResolvedValue(undefined),
     },
   } as unknown as AppStore;
 }
