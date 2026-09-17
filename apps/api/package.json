@@ -12,7 +12,7 @@
     "db:migrate:staging": "wrangler d1 migrations apply DB --remote --config wrangler.staging.jsonc",
     "typecheck": "tsc --noEmit",
     "check:wrangler": "node scripts/check-wrangler-configs.mjs",
-    "test": "vitest run --project 'shard*' --project demo --project maintenance",
+    "test": "vitest run --project 'shard*' --project demo --project maintenance --project runner-disabled",
     "test:load": "vitest run --project load",
     "cf-typegen": "wrangler types",
     "db:migrate:local": "wrangler d1 migrations apply DB --local",

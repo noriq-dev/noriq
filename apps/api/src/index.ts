@@ -46,6 +46,8 @@ import pkg from '../package.json';
 import { issueTokens, metadataRoutes, oauth } from './oauth';
 import { demoLocksDown } from './lib/demo';
 import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
+import { isRunnerDisabled, runnerDisabledBody, RUNNER_DISABLED_MESSAGE } from './lib/runner-disabled';
+import { drainRunnerPlane } from './lib/runner-plane-drain';
 import { copilotSessionContextFromMessages, endCopilotSession } from './lib/copilot-session';
 import { isDurableCopilotKey, resolveCopilotSessionKey } from './lib/mcp-session-key';
 import { errorPage, wantsHtml } from './errorPage';
@@ -203,6 +205,13 @@ const demoDenied = (c: Context<AppContext>): Response | null =>
     ? c.json({ error: 'This action is disabled in the demo.' }, 403)
     : null;
 
+/** Runner execution plane off (drop-runner Phase 1): 410 for daemon registration/dispatch/WS. */
+const runnerPlaneDenied = async (c: Context<AppContext>): Promise<Response | null> => {
+  if (!isRunnerDisabled(c.env)) return null;
+  if (c.req.method !== 'GET' && c.req.method !== 'HEAD') await c.req.text().catch(() => '');
+  return c.json(runnerDisabledBody(), 410);
+};
+
 // Gate every project-scoped route (PLNR-92): being signed in is NOT enough — you
 // must be able to REACH this project. Mirrors VISIBILITY_WHERE (owner, a member of
 // its group, or an admin). Returns 404 (not 403) so project-id existence doesn't
@@ -326,6 +335,7 @@ app.get('/api/health', async (c) => {
     version: pkg.version,
     // Surfaced so the dashboard can show a write-frozen banner (PLNR-166).
     maintenance: isMaintenanceMode(c.env),
+    runnerDisabled: isRunnerDisabled(c.env),
   });
 });
 
@@ -480,6 +490,7 @@ app.get('/ws/projects/:projectId', async (c) => {
 // client can set headers), and the runner must belong to that user. The socket
 // itself lives in the RunnerHub DO (idFromName(runnerId)).
 app.get('/ws/runner/:id', async (c) => {
+  if (isRunnerDisabled(c.env)) return c.text(RUNNER_DISABLED_MESSAGE, 410);
   if (c.req.header('Upgrade')?.toLowerCase() !== 'websocket') return c.text('expected WebSocket upgrade', 426);
   const header = c.req.header('Authorization') ?? '';
   const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
@@ -520,6 +531,13 @@ app.get('/api/admin/export', adminAuth, async (c) => {
 app.post('/api/admin/backup', adminAuth, async (c) => {
   const res = await backupToR2(c.env, nowIso());
   return c.json(res, res.ok ? 200 : 503);
+});
+
+// Terminate every live runner job, legacy run, and plan dispatch (drop-runner cutover).
+// Call before or after setting RUNNER_DISABLED=1; idempotent on already-terminal rows.
+app.post('/api/admin/runner-plane/drain', adminAuth, async (c) => {
+  const summary = await drainRunnerPlane(c.env);
+  return c.json({ ok: true, ...summary });
 });
 
 // On-demand ProjectMemory portable snapshot (PLNR-248) — the per-project analogue of
@@ -4012,6 +4030,8 @@ const runnerProjectActionDenied = async (
 };
 
 app.post('/api/runners', agentAuth, async (c) => {
+  const runnerDenied = await runnerPlaneDenied(c);
+  if (runnerDenied) return runnerDenied;
   const accountDenied = await connectionWriteDenied(c);
   if (accountDenied) return accountDenied;
   const parsed = RegisterRunnerBody.safeParse(await c.req.json().catch(() => ({})));
@@ -4089,6 +4109,8 @@ app.post('/api/runners', agentAuth, async (c) => {
 });
 
 app.post('/api/runners/:id/heartbeat', agentAuth, async (c) => {
+  const runnerDenied = await runnerPlaneDenied(c);
+  if (runnerDenied) return runnerDenied;
   const accountDenied = await connectionWriteDenied(c);
   if (accountDenied) return accountDenied;
   const parsed = HeartbeatBody.safeParse(await c.req.json().catch(() => ({})));
@@ -4454,6 +4476,8 @@ async function dispatchRunnerJob(
   c: Context<AppContext>,
   source: { kind: 'task' | 'plan'; id: string },
 ): Promise<Response> {
+  const runnerDenied = await runnerPlaneDenied(c);
+  if (runnerDenied) return runnerDenied;
   const denied = demoDenied(c);
   if (denied) return denied;
   const pid = c.req.param('pid')!;
@@ -5188,6 +5212,8 @@ const RunAgentBody = z.object({
   protocolCapabilities: z.array(RunnerProtocolCapability).max(16).default([]),
 });
 app.post('/api/runs/:runId/agent', agentAuth, async (c) => {
+  const runnerDenied = await runnerPlaneDenied(c);
+  if (runnerDenied) return runnerDenied;
   if (legacyRunnerWritesDisabled()) return legacyRunnerWriteGone(c);
   const runId = c.req.param('runId')!;
   const parsed = RunAgentBody.safeParse(await c.req.json().catch(() => ({})));
@@ -5446,6 +5472,8 @@ app.get('/api/runs/:runId/park', agentAuth, async (c) => {
  * Scoped to plans this runner actually landed work for: it is the only machine with the branch.
  */
 app.get('/api/runners/:id/owed-merges', agentAuth, async (c) => {
+  const runnerDenied = await runnerPlaneDenied(c);
+  if (runnerDenied) return runnerDenied;
   const id = c.req.param('id')!;
   const owned = await c.env.DB.prepare('SELECT id FROM runners WHERE id = ? AND owner_user_id = ?')
     .bind(id, c.var.connection!.userId).first();
@@ -5482,6 +5510,8 @@ const MergeReportBody = z.object({
   failed: z.string().nullable().default(null),
 });
 app.post('/api/runners/:id/owed-merges/report', agentAuth, async (c) => {
+  const runnerDenied = await runnerPlaneDenied(c);
+  if (runnerDenied) return runnerDenied;
   const id = c.req.param('id')!;
   const parsed = MergeReportBody.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) return c.json({ error: 'invalid report', detail: parsed.error.issues }, 400);
@@ -5701,6 +5731,8 @@ const MintIngestCapabilityBody = z.object({
 });
 
 app.post('/api/runner-ingest/capability', agentAuth, async (c) => {
+  const runnerDenied = await runnerPlaneDenied(c);
+  if (runnerDenied) return runnerDenied;
   const parsed = MintIngestCapabilityBody.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) return c.json({ error: 'invalid capability request', detail: parsed.error.issues }, 400);
   const b = parsed.data;
@@ -5756,6 +5788,8 @@ app.post('/api/runner-ingest/capability', agentAuth, async (c) => {
 // It grants no claimable-work authority: createTask's existing spin-off seam stores `todo` plus
 // proposed_at, so the RUN-23 human accept/reject gate and all claim/dispatch exclusions stay intact.
 app.post('/api/runner-spinoffs', agentAuth, async (c) => {
+  const runnerDenied = await runnerPlaneDenied(c);
+  if (runnerDenied) return runnerDenied;
   const accountDenied = await connectionWriteDenied(c);
   if (accountDenied) return accountDenied;
   const parsed = RunnerSpinoffTaskRequest.safeParse(await c.req.json().catch(() => ({})));
@@ -6021,6 +6055,8 @@ const coordinationError = (c: Context<AppContext>, error: unknown) => c.json({
 }, 409);
 
 app.post('/api/runner-coordination/acquire', agentAuth, async (c) => {
+  const runnerDenied = await runnerPlaneDenied(c);
+  if (runnerDenied) return runnerDenied;
   const accountDenied = await connectionWriteDenied(c);
   if (accountDenied) return accountDenied;
   const parsed = RunnerCoordinationAcquire.safeParse(await c.req.json().catch(() => ({})));
@@ -6037,6 +6073,8 @@ app.post('/api/runner-coordination/acquire', agentAuth, async (c) => {
 });
 
 app.post('/api/runner-coordination/exchange', agentAuth, async (c) => {
+  const runnerDenied = await runnerPlaneDenied(c);
+  if (runnerDenied) return runnerDenied;
   const accountDenied = await connectionWriteDenied(c);
   if (accountDenied) return accountDenied;
   const parsed = RunnerCoordinationExchange.safeParse(await c.req.json().catch(() => ({})));
@@ -6051,6 +6089,8 @@ app.post('/api/runner-coordination/exchange', agentAuth, async (c) => {
 });
 
 app.post('/api/runner-coordination/renew', agentAuth, async (c) => {
+  const runnerDenied = await runnerPlaneDenied(c);
+  if (runnerDenied) return runnerDenied;
   const accountDenied = await connectionWriteDenied(c);
   if (accountDenied) return accountDenied;
   const parsed = RunnerCoordinationRenew.safeParse(await c.req.json().catch(() => ({})));
@@ -6069,6 +6109,8 @@ app.post('/api/runner-coordination/renew', agentAuth, async (c) => {
 });
 
 app.post('/api/runner-coordination/recover', agentAuth, async (c) => {
+  const runnerDenied = await runnerPlaneDenied(c);
+  if (runnerDenied) return runnerDenied;
   const accountDenied = await connectionWriteDenied(c);
   if (accountDenied) return accountDenied;
   const parsed = RunnerCoordinationRecover.safeParse(await c.req.json().catch(() => ({})));
@@ -6085,6 +6127,8 @@ app.post('/api/runner-coordination/recover', agentAuth, async (c) => {
 });
 
 app.post('/api/runner-coordination/release', agentAuth, async (c) => {
+  const runnerDenied = await runnerPlaneDenied(c);
+  if (runnerDenied) return runnerDenied;
   const accountDenied = await connectionWriteDenied(c);
   if (accountDenied) return accountDenied;
   const parsed = RunnerCoordinationRelease.safeParse(await c.req.json().catch(() => ({})));
