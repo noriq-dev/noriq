@@ -1,7 +1,34 @@
 # Backup & restore (D1)
 
-Noriq stores all durable state in one D1 database (`DB`). There are two backup
-paths — pick either or both.
+## Dual-plane operator checklist (PLNR-561)
+
+Noriq durability is **three** stores, not one. Treat every disaster-recovery or instance
+migration as a coordinated cutover across all of them.
+
+| Plane | What it holds | Backup prefix / path | Restore entrypoint |
+| --- | --- | --- | --- |
+| **D1** | Projects, tasks, users, registry projections, event log (`global_seq`) | R2 `backups/noriq-*.json` or `GET /api/admin/export` | `POST /api/admin/import?confirm=replace` or wrangler SQL import (below) |
+| **ProjectMemory** | Per-project cognition (graph, evidence, episodes, index generations) | R2 `memory-backups/<projectId>/<exportedAt>/` | `POST /api/admin/memory-restore/<projectId>?confirm=replace&exportedAt=…` |
+| **AgentSession** (per agent) | Notice delivery cursor (`lastEventRowid` / `global_seq`) — **not in D1 or memory backups** | *No backup* — ephemeral to the agent id + DO namespace | Reconnect the MCP client (new session) after a D1 import so cursors realign; see §3 Option B |
+
+**Before you call any restore done:**
+
+1. Restore **D1** and **every affected project's ProjectMemory** from backups taken at the same
+   cutover (matching `exportedAt` timestamps when possible).
+2. Read the JSON `warnings` array on successful import/memory-restore responses — a 200 still
+   means the other plane may be unchanged.
+3. After D1 import, expect agents to miss notices until they reconnect or until `global_seq`
+   catches up past their old cursor.
+4. For snapshots exported **before 2026-08-01**, run the `0066_invert_priority` rewrite after
+   import (see below) or refuse import until you pass `?acknowledgePre0066Priority=1`.
+5. **Staging and production must use different worker names, D1 databases, and FILES buckets**
+   (`check:wrangler` enforces the example configs). Never point staging at prod's `backups/` or
+   `memory-backups/` prefix.
+
+---
+
+Noriq stores coordination state in one D1 database (`DB`). D1 has two backup
+paths — pick either or both. ProjectMemory is a separate plane (see checklist above).
 
 ## 1. Automatic daily snapshot → R2 (PLNR-21)
 

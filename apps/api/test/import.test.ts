@@ -71,9 +71,10 @@ describe('D1 import / restore (PLNR-218)', () => {
 
     const res = await importSnap(before);
     expect(res.status, await res.clone().text()).toBe(200);
-    const body = (await res.json()) as { ok: boolean; imported: Record<string, number> };
+    const body = (await res.json()) as { ok: boolean; imported: Record<string, number>; warnings?: Array<{ code: string }> };
     expect(body.ok).toBe(true);
     expect(body.imported.tasks).toBe(before.counts.tasks);
+    expect(body.warnings?.some((w) => w.code === 'memory_plane_unchanged')).toBe(true);
 
     const after = await exportSnap();
     expect(after.counts).toEqual(before.counts);
@@ -128,6 +129,16 @@ describe('D1 import / restore (PLNR-218)', () => {
     const res = await importSnap({ nope: true });
     expect(res.status).toBe(400);
     expect(((await res.json()) as { ok: boolean }).ok).toBe(false);
+  });
+
+  it('blocks pre-0066 priority snapshots unless acknowledged', async () => {
+    const snap = await exportSnap();
+    const old = { ...snap, exportedAt: '2026-07-01T00:00:00.000Z' };
+    const blocked = await importSnap(old);
+    expect(blocked.status).toBe(400);
+    const body = (await blocked.json()) as { ok: boolean; error?: string };
+    expect(body.ok).toBe(false);
+    expect(body.error).toMatch(/0066|acknowledgePre0066Priority/);
   });
 
   it('rejects non-admin callers', async () => {

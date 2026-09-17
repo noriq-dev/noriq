@@ -68,8 +68,11 @@ export async function backupToR2(env: Env, exportedAt: string): Promise<{ ok: bo
 // event_seq counter table is restored like any other.
 // ---------------------------------------------------------------------------
 
+import type { DualPlaneWarning } from './lib/backup-dual-plane';
+import { d1ImportSuccessWarnings, isPre0066PrioritySnapshot, pre0066PriorityBlockMessage } from './lib/backup-dual-plane';
+
 export type ImportResult =
-  | { ok: true; tables: number; imported: Record<string, number>; deferred: Record<string, string[]> }
+  | { ok: true; tables: number; imported: Record<string, number>; deferred: Record<string, string[]>; warnings?: DualPlaneWarning[] }
   | { ok: false; error: string };
 
 type ColInfo = { name: string; notnull: number; pk: number };
@@ -265,13 +268,22 @@ function prepareTriggerReplayRows(
   return rows;
 }
 
+export type ImportOptions = {
+  /** Required when exportedAt predates 0066_invert_priority (PLNR-561). */
+  acknowledgePre0066Priority?: boolean;
+};
+
 /** Restore a snapshot produced by exportSnapshot, REPLACING all current data. */
-export async function importSnapshot(env: Env, raw: unknown): Promise<ImportResult> {
+export async function importSnapshot(env: Env, raw: unknown, opts: ImportOptions = {}): Promise<ImportResult> {
   const snap = raw as Partial<Snapshot> | null;
   if (!snap || typeof snap !== 'object' || (snap as Snapshot).noriq !== 'd1-snapshot')
     return { ok: false, error: 'not a Noriq snapshot (expected noriq: "d1-snapshot")' };
   if (snap.version !== 1) return { ok: false, error: `unsupported snapshot version: ${String(snap.version)}` };
   if (!snap.tables || typeof snap.tables !== 'object') return { ok: false, error: 'snapshot has no "tables"' };
+  const exportedAt = typeof snap.exportedAt === 'string' ? snap.exportedAt : undefined;
+  if (isPre0066PrioritySnapshot(exportedAt) && !opts.acknowledgePre0066Priority) {
+    return { ok: false, error: pre0066PriorityBlockMessage(exportedAt!) };
+  }
   const snapTables = snap.tables as Record<string, Array<Record<string, unknown>>>;
 
   const tables = await userTables(env);
@@ -377,5 +389,5 @@ export async function importSnapshot(env: Env, raw: unknown): Promise<ImportResu
   } catch (e) {
     return { ok: false, error: `import failed and rolled back: ${(e as Error).message}` };
   }
-  return { ok: true, tables: order.length, imported, deferred };
+  return { ok: true, tables: order.length, imported, deferred, warnings: d1ImportSuccessWarnings(exportedAt) };
 }
