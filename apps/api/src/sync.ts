@@ -77,10 +77,16 @@ export async function computeUpdates(
   let cursor = await session.cursor();
 
   // A brand-new session (cursor 0) must NOT replay the whole event history as "new"
-  // notices — start it at the current tip so it only hears about things going forward.
+  // notices — start at the tip as of agent registration. Jumping to the *current*
+  // global tip on first poll would swallow messages that landed after configure_agent
+  // but before the first tool call (PLNR-54 / notify.test.ts).
   if (cursor === 0) {
-    const tip = await env.DB.prepare('SELECT COALESCE(MAX(global_seq), 0) AS m FROM events').first<{ m: number }>();
-    cursor = tip?.m ?? 0;
+    const boot = await env.DB.prepare(
+      `SELECT COALESCE(MAX(e.global_seq), 0) AS m
+       FROM events e JOIN agents a ON a.id = ?1
+       WHERE e.created_at <= a.created_at`,
+    ).bind(agent.id).first<{ m: number }>();
+    cursor = boot?.m ?? 0;
     if (opts.advanceCursor !== false) await session.advanceCursor(cursor);
   }
 
