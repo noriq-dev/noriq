@@ -52,6 +52,8 @@ export function ProjectSettingsView({ store }: { store: AppStore }) {
   const [ownerId, setOwnerId] = useState('');
   const [confirmName, setConfirmName] = useState('');
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [archiveError, setArchiveError] = useState<string | null>(null);
+  const [archiveWorking, setArchiveWorking] = useState(false);
 
   useEffect(() => {
     if (!project || !store.permissions.canManage) return;
@@ -274,6 +276,26 @@ export function ProjectSettingsView({ store }: { store: AppStore }) {
           )}
           <ErrorNote>{accessError}</ErrorNote>
         </SettingsSection>
+
+        {canOwn && (
+          <SettingsSection title="Archive" description="Hide this project from the default project list and navigation. Tasks, plans, and history stay intact — you can restore it later from Home.">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+              <Button variant="ghost" disabled={archiveWorking} onClick={async () => {
+                if (!(await confirm(`Archive “${project.name}”? It will leave the active project list until restored.`))) return;
+                setArchiveError(null);
+                setArchiveWorking(true);
+                try {
+                  await store.actions.archiveProject(project.id);
+                } catch (error) {
+                  setArchiveError(error instanceof Error ? error.message : 'Could not archive project.');
+                  setArchiveWorking(false);
+                }
+              }}>{archiveWorking ? 'Archiving…' : 'Archive project'}</Button>
+              <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)' }}>Recoverable — not a delete</span>
+            </div>
+            <ErrorNote>{archiveError}</ErrorNote>
+          </SettingsSection>
+        )}
 
         {canOwn && (
           <SettingsSection title="Danger zone" description="Deleting a project permanently removes its tasks, plans, milestones, tags, and history.">

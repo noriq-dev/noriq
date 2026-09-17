@@ -20,7 +20,7 @@ function viewportMatchMedia(width: number) {
 
 const project: ProjectVM = {
   id: 'prj_1', key: 'MOB', name: `Mobile companion ${'with-a-long-name-'.repeat(12)}`, phase: `Implementation ${'unbroken-description-'.repeat(20)}`, dotColor: '#4c9dff', badge: '',
-  hasLive: true, groupId: null, openTasks: 3, totalTasks: 5, doneTasks: 2, effectiveRole: 'owner', accessSource: 'owner',
+  hasLive: true, groupId: null, openTasks: 3, totalTasks: 5, doneTasks: 2, status: 'active', effectiveRole: 'owner', accessSource: 'owner',
   canView: true, canContribute: true, canManage: true, canOwn: true, cappedByReadOnly: false,
 };
 
@@ -28,7 +28,7 @@ function store(projects: ProjectVM[] = [project]): AppStore {
   return {
     user: { id: 'usr_1', name: 'Mara Chen' }, groups: [], currentPid: 'prj_other', data: { projects },
     permissions: { canCreateProjects: true },
-    actions: { selectProject: vi.fn(), openTask: vi.fn(), createProject: vi.fn() },
+    actions: { selectProject: vi.fn(), openTask: vi.fn(), createProject: vi.fn(), restoreProject: vi.fn() },
   } as unknown as AppStore;
 }
 
