@@ -77,6 +77,7 @@ function CapabilitiesStrip({ capabilities }: { capabilities: ApiMemoryOpsStatus[
     { label: 'Vectorize (semantic search)', on: capabilities.vectorize, whenOff: 'retrieval falls back to exact/keyword lookup and graph expansion' },
     { label: 'Workers AI (embeddings)', on: capabilities.workersAI, whenOff: 'nothing can be embedded — semantic search and vector rebuild are inert' },
     { label: 'Code-intelligence index', on: capabilities.codeVectorize, whenOff: 'code search falls back to exact/keyword lookup' },
+    { label: 'Repository code indexing', on: capabilities.repositoryIndexing, whenOff: 'Noriq does not ingest git checkouts — local agents own code understanding; repository keys remain for URI routing and citations' },
   ];
   const reduced = rows.filter((r) => !r.on);
   if (reduced.length === 0) {
@@ -312,6 +313,11 @@ export function MemoryOps({ pid, store }: { pid: string; store: AppStore }) {
         </Section>
 
         <Section title={`Repositories · ${repositories.length}`}>
+          {!capabilities.repositoryIndexing && (
+            <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', lineHeight: 1.7, marginBottom: 12, padding: '8px 10px', borderRadius: 8, background: 'var(--w-03)', border: '1px solid var(--w-08)' }}>
+              Repository code indexing is not a Noriq product capability. Register keys only for stable URI prefixes and citations in Project Memory — use Cursor, Codex, or your IDE for code understanding.
+            </div>
+          )}
           {repositories.length === 0 ? (
             <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', marginBottom: 12 }}>
               No repository is registered against this project's memory yet.
@@ -322,6 +328,7 @@ export function MemoryOps({ pid, store }: { pid: string; store: AppStore }) {
                 <RepositoryCard
                   key={r.id}
                   repo={r}
+                  repositoryIndexing={capabilities.repositoryIndexing}
                   isAdmin={isAdmin}
                   busy={actionBusy}
                   onActivate={(genId) => runAction(`activate:${genId}`, () => api.memoryActivateGeneration(pid, genId))}
@@ -435,9 +442,10 @@ export function MemoryOps({ pid, store }: { pid: string; store: AppStore }) {
 // ---------------------------------------------------------------------------------------------
 
 function RepositoryCard({
-  repo, isAdmin, busy, onActivate, onAbort, onRemove,
+  repo, repositoryIndexing, isAdmin, busy, onActivate, onAbort, onRemove,
 }: {
   repo: ApiMemoryRepository;
+  repositoryIndexing: boolean;
   isAdmin: boolean;
   busy: string | null;
   onActivate: (generationId: string) => void;
@@ -449,13 +457,21 @@ function RepositoryCard({
     <div style={{ border: '1px solid var(--w-07)', borderRadius: 10, padding: '12px 14px', background: 'var(--w-01)' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' }}>
         <span style={{ fontFamily: 'var(--mono)', fontSize: 12.5, fontWeight: 600 }}>{repo.repositoryKey}</span>
-        <MonoTag color="var(--text-mid)" bg="var(--w-05)" size={9}>{repo.indexingEnabled ? 'indexing enabled' : 'indexing disabled'}</MonoTag>
+        {repositoryIndexing && (
+          <MonoTag color="var(--text-mid)" bg="var(--w-05)" size={9}>{repo.indexingEnabled ? 'indexing enabled' : 'indexing disabled'}</MonoTag>
+        )}
         {repo.defaultBranch && <MonoTag color="var(--text-dim)" bg="var(--w-04)" size={9}>{repo.defaultBranch}</MonoTag>}
         {repo.vcsKind && <MonoTag color="var(--text-dim)" bg="var(--w-04)" size={9}>{repo.vcsKind}</MonoTag>}
-        <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)' }}>{repo.checkouts.length} checkout(s)</span>
+        {repositoryIndexing && (
+          <span style={{ fontFamily: 'var(--mono)', fontSize: 9.5, color: 'var(--text-faint)' }}>{repo.checkouts.length} checkout(s)</span>
+        )}
         <div style={{ flex: 1 }} />
-        <StateChip tone={repo.stale ? 'warn' : 'ok'} label="stale index" />
-        <StateChip tone={repo.failedIngest ? 'bad' : 'ok'} label="failed ingest" />
+        {repositoryIndexing && (
+          <>
+            <StateChip tone={repo.stale ? 'warn' : 'ok'} label="stale index" />
+            <StateChip tone={repo.failedIngest ? 'bad' : 'ok'} label="failed ingest" />
+          </>
+        )}
         {/* Removal is human-only but NOT admin-gated (same posture as registration below —
          *  §4/§6 locked decision: humans declare identity, this mirrors that, not an operator
          *  action against live index/backup state), matching the server route's own auth
@@ -474,30 +490,30 @@ function RepositoryCard({
       {/* Visible guidance, not a hover-only tooltip — a state a human can only discover by
        *  hovering is not "distinguishable" in any meaningful sense. Only rendered for the two
        *  states that are actually triggered, so a healthy repository stays uncluttered. */}
-      {repo.stale && (
+      {repositoryIndexing && repo.stale && (
         <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--amber)', lineHeight: 1.6, marginBottom: 6 }}>
           ◐ stale index — active generation base {repo.activeGeneration?.baseId.slice(0, 10)} is behind the repository's current base ({repo.latestObservedBase?.slice(0, 10)}).
-          {' '}→ ask the Runner to reindex this repository — indexing runs from the Runner, not this panel.
+          {' '}→ re-run repository indexing from your ingest client (legacy operator path only when enabled on this instance).
         </div>
       )}
-      {repo.failedIngest && (
+      {repositoryIndexing && repo.failedIngest && (
         <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--red-soft)', lineHeight: 1.6, marginBottom: 6 }}>
           ✕ failed ingest — {repo.failedIngestProblems.join('; ') || `ingest status: ${repo.ingestStatus}`}.
-          {' '}→ re-upload from the Runner once the underlying problem is fixed.
+          {' '}→ fix the ingest payload and re-upload from your ingest client.
         </div>
       )}
 
-      {repo.activeGeneration && (
+      {repositoryIndexing && repo.activeGeneration && (
         <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-dim)', marginBottom: 6 }}>
           active: {shortId(repo.activeGeneration.id)} · base {repo.activeGeneration.baseId.slice(0, 10)} · indexer {repo.activeGeneration.indexerVersion} ·{' '}
           {repo.activeGeneration.fileCount} file(s) · activated {fmtWhen(repo.activeGeneration.activatedAt)}
         </div>
       )}
-      {!repo.activeGeneration && (
+      {repositoryIndexing && !repo.activeGeneration && (
         <div style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)', marginBottom: 6 }}>no active generation</div>
       )}
 
-      {repo.stagedGenerations.length > 0 && (
+      {repositoryIndexing && repo.stagedGenerations.length > 0 && (
         <div style={{ marginTop: 8 }}>
           <SectionLabel>Staged generations · {repo.stagedGenerations.length}</SectionLabel>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 6 }}>

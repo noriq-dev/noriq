@@ -508,7 +508,7 @@ export function MemoryConstellationV2({
   if (codeEntities === 0) {
     statusNotices.push({
       key: 'unindexed', token: 'informational',
-      message: 'No repository entities are present in this generation; repository indexing may not have run.',
+      message: 'No repository file/symbol entities in this view — Noriq does not ingest git checkouts; local agents own code understanding.',
     });
   }
   // Catalogue-by-failure (PLNR-442, lockedDecisions): the failure reason rides the SAME status

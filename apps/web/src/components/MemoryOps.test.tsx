@@ -60,7 +60,7 @@ const OK_STATUS: ApiMemoryOpsStatus = {
     rows: { nodeStats: 12, communities: 2, memberships: 12, links: 1 },
     cache: { policy: 'private-revalidate', compactPageTargetBytes: 262144, compactPageHardLimitBytes: 524288 },
   },
-  capabilities: { r2: true, vectorize: true, workersAI: true, codeVectorize: true },
+  capabilities: { r2: true, vectorize: true, workersAI: true, codeVectorize: true, repositoryIndexing: false },
 };
 
 function mockClean() {
@@ -96,6 +96,7 @@ describe('renders without crashing on a project with no repositories, generation
     expect(text()).toContain('Memory health');
     expect(text()).toContain('Repositories · 0');
     expect(text()).toContain('No repository is registered');
+    expect(text()).toContain('Repository code indexing is not a Noriq product capability');
     expect(text()).toContain('no backups yet');
   });
 });
@@ -175,7 +176,7 @@ describe('the five failure modes render distinctly — no shared generic error t
       health: { ...OK_STATUS.health },
       registry: { backupStatus: 'failed', lastBackupAt: '2026-01-01T00:00:00.000Z', vectorDirty: true, sizeBytes: 1024, sizeStatus: 'ok' },
       hierarchy: OK_STATUS.hierarchy,
-      capabilities: OK_STATUS.capabilities,
+      capabilities: { ...OK_STATUS.capabilities, repositoryIndexing: true },
     });
     vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [STALE_REPO, FAILED_REPO] });
     vi.spyOn(api, 'memoryBackupsList').mockResolvedValue({ backups: [], r2Available: true });
@@ -188,14 +189,14 @@ describe('the five failure modes render distinctly — no shared generic error t
     expect(text()).toContain('rebuild vectors');
     // Backup failure: distinct guidance to investigate R2, never "rebuild vectors" or "reindex".
     expect(text()).toContain('investigate R2 connectivity');
-    // Stale index: distinct guidance pointing at the Runner, never at R2 or vectors.
-    expect(text()).toContain('ask the Runner to reindex this repository');
+    // Stale index: distinct guidance for legacy ingest clients, never at R2 or vectors.
+    expect(text()).toContain('re-run repository indexing from your ingest client');
     // Failed ingest: distinct guidance to re-upload, carrying the actual validation problem text.
-    expect(text()).toContain('re-upload from the Runner');
+    expect(text()).toContain('re-upload from your ingest client');
     expect(text()).toContain('manifest declares fileCount 9');
 
     // No two of the four share their guidance sentence.
-    const guidances = ['rebuild vectors', 'investigate R2 connectivity', 'ask the Runner to reindex this repository', 're-upload from the Runner'];
+    const guidances = ['rebuild vectors', 'investigate R2 connectivity', 're-run repository indexing from your ingest client', 're-upload from your ingest client'];
     expect(new Set(guidances).size).toBe(guidances.length);
   });
 });
@@ -253,8 +254,12 @@ describe('a staged generation the server has not validated offers no activation 
   };
 
   it('disables activation for the unsealed generation and enables it only for the validated one', async () => {
-    mockClean();
+    vi.spyOn(api, 'memoryOpsStatus').mockResolvedValue({
+      ...OK_STATUS,
+      capabilities: { ...OK_STATUS.capabilities, repositoryIndexing: true },
+    });
     vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [repoWithUnvalidated] });
+    vi.spyOn(api, 'memoryBackupsList').mockResolvedValue({ backups: [], r2Available: true });
     const activate = vi.spyOn(api, 'memoryActivateGeneration').mockResolvedValue({ activated: 'gen_ready', superseded: [] });
 
     mount();
@@ -273,8 +278,12 @@ describe('a staged generation the server has not validated offers no activation 
   });
 
   it('shows the not-ready state and not a bare "validated" claim for the unsealed generation', async () => {
-    mockClean();
+    vi.spyOn(api, 'memoryOpsStatus').mockResolvedValue({
+      ...OK_STATUS,
+      capabilities: { ...OK_STATUS.capabilities, repositoryIndexing: true },
+    });
     vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [repoWithUnvalidated] });
+    vi.spyOn(api, 'memoryBackupsList').mockResolvedValue({ backups: [], r2Available: true });
     mount();
     await tick();
     expect(text()).toContain('not ready');
@@ -398,7 +407,7 @@ describe('a missing optional binding reads as reduced capability, never an error
       health: OK_STATUS.health,
       registry: null, // never touched its memory store — R2 unbound instances still start here
       hierarchy: OK_STATUS.hierarchy,
-      capabilities: { r2: false, vectorize: true, workersAI: true, codeVectorize: true },
+      capabilities: { r2: false, vectorize: true, workersAI: true, codeVectorize: true, repositoryIndexing: false },
     });
     vi.spyOn(api, 'memoryRepositories').mockResolvedValue({ repositories: [] });
     vi.spyOn(api, 'memoryBackupsList').mockResolvedValue({ backups: [], r2Available: false });

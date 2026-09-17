@@ -250,7 +250,7 @@ describe('MemoryConstellationV2 status region (PLNR-436)', () => {
     expect(notices).toHaveLength(4);
     expect(notices[0]!.textContent).toContain('Incident boom');
     expect(notices[1]!.textContent).toContain('This generation is stale (source 3, current 7).');
-    expect(notices[2]!.textContent).toContain('No repository entities are present');
+    expect(notices[2]!.textContent).toContain('Noriq does not ingest git checkouts');
     expect(notices[3]!.textContent).toContain('3D view unavailable — textual navigation remains active');
     expect(host.textContent).not.toContain('Partial level');
 
@@ -282,7 +282,7 @@ describe('MemoryConstellationV2 status region (PLNR-436)', () => {
     // triggers — both truthful capability statements, same tier, same container.
     expect(notices).toHaveLength(3);
     expect(notices[0]!.textContent).toContain('A newer hierarchy is building; this complete generation remains navigable.');
-    expect(notices[1]!.textContent).toContain('No repository entities are present in this generation; repository indexing may not have run.');
+    expect(notices[1]!.textContent).toContain('Noriq does not ingest git checkouts');
     expect(notices[2]!.textContent).toContain('3D view unavailable — textual navigation remains active');
     expect(notices[0]!.parentElement).toBe(notices[1]!.parentElement);
     expect(notices[1]!.parentElement).toBe(notices[2]!.parentElement);

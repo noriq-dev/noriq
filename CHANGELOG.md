@@ -48,6 +48,6 @@ This release removed the Jobs view and runner roster from the SPA, and dropped r
 2. On every machine that ran the daemon: stop the service and uninstall `@noriq-dev/runner` / remove `runner.toml`.
 3. Keep using MCP (Claude Code, Cursor, etc.) for claims, tasks, docs, and plans — execution specs on tasks remain as planning artifacts.
 
-Device OAuth (RFC 8628) stays available for headless MCP clients. Project Memory **read/Ask** continues; runner-driven repository ingest is paused until a non-daemon indexer ships.
+Device OAuth (RFC 8628) stays available for headless MCP clients. Project Memory **read/Ask** continues. **Repository code indexing** is off by default (`REPOSITORY_INDEXING` unset); episode ingest and Project Memory core remain; `/api/memory-ingest` index purpose returns 410 unless explicitly enabled for legacy/tests.
 
 See [docs/RUNNER_CUTOVER.md](docs/RUNNER_CUTOVER.md).

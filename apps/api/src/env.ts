@@ -18,6 +18,9 @@ export interface Env {
   ASK_GENERATION: DurableObjectNamespace<AskGeneration>;
   /** Set in tests to bypass rate limiting. */
   DISABLE_RATE_LIMIT?: boolean;
+  /** When `"1"`, exposes repository index ingest and operator index-generation routes (legacy/tests).
+   *  Unset or any other value: product surfaces for git-checkout repository indexing stay off. */
+  REPOSITORY_INDEXING?: string;
   /** Poll interval (ms) for the subscriptions/listen event stream (PLNR-234).
    *  Default 5000; tests set it low so change notifications arrive within a tick. */
   LISTEN_POLL_MS?: string;

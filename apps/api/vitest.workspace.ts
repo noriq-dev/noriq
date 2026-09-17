@@ -39,6 +39,8 @@ const DEMO_FILES = ['demo.test.ts', 'demo-gates.test.ts'];
 // MAINTENANCE_MODE freezes writes globally (PLNR-166) — like DEMO_MODE it can't ride the
 // shared default, so this file gets its own project with the flag ON.
 const MAINTENANCE_FILES = ['maintenance.test.ts'];
+// Repository indexing is off in production by default; this file asserts the gated HTTP surface.
+const REPOSITORY_INDEXING_OFF_FILES = ['repository-indexing-product.test.ts'];
 // Load suites are heavy/timing-sensitive by design and belong only in the opt-in `load`
 // project (PLNR-431) — this is the single source of truth for that list; the shard filter
 // below excludes exactly these files, so a new load suite added here is automatically kept
@@ -48,7 +50,7 @@ const LOAD_FILES = ['load.test.ts', 'memory-load.test.ts'];
 const testDir = path.join(__dirname, 'test');
 const testFiles = fs
   .readdirSync(testDir)
-  .filter((f) => f.endsWith('.test.ts') && !LOAD_FILES.includes(f) && !DEMO_FILES.includes(f) && !MAINTENANCE_FILES.includes(f))
+  .filter((f) => f.endsWith('.test.ts') && !LOAD_FILES.includes(f) && !DEMO_FILES.includes(f) && !MAINTENANCE_FILES.includes(f) && !REPOSITORY_INDEXING_OFF_FILES.includes(f))
   .sort();
 const shards: string[][] = Array.from({ length: SHARDS }, () => []);
 testFiles.forEach((f, i) => shards[i % SHARDS]!.push(`test/${f}`));
@@ -108,7 +110,14 @@ const project = (name: string, include: string[], extraBindings: Record<string, 
               r2Buckets: ['FILES'],
               // LISTEN_POLL_MS: the subscriptions/listen stream polls fast in tests so
               // change notifications arrive within one assertion window (PLNR-234).
-              bindings: { TEST_MIGRATIONS: migrations, ADMIN_TOKEN: 'test-admin-token', DISABLE_RATE_LIMIT: true, LISTEN_POLL_MS: '150', ...extraBindings },
+              bindings: {
+                TEST_MIGRATIONS: migrations,
+                ADMIN_TOKEN: 'test-admin-token',
+                DISABLE_RATE_LIMIT: true,
+                LISTEN_POLL_MS: '150',
+                REPOSITORY_INDEXING: '1',
+                ...extraBindings,
+              },
               // Tests run without built web assets.
               assets: { directory: './test/fixtures/empty-assets' },
             },
@@ -126,5 +135,6 @@ export default [
   // Write-freeze suite runs with MAINTENANCE_MODE ON (its own project so the flag stays off
   // everywhere else). `npm test` selects it explicitly alongside the shards.
   project('maintenance', MAINTENANCE_FILES.map((f) => `test/${f}`), { MAINTENANCE_MODE: '1' }),
+  project('repository-indexing-off', REPOSITORY_INDEXING_OFF_FILES.map((f) => `test/${f}`), { REPOSITORY_INDEXING: '0' }),
   project('load', LOAD_FILES.map((f) => `test/${f}`)),
 ];
