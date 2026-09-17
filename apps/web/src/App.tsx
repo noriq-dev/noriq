@@ -15,7 +15,6 @@ import { AskView } from './components/AskView';
 import { CommandPalette } from './components/CommandPalette';
 import { RoadmapView } from './components/RoadmapView';
 import { AgentsView } from './components/AgentsView';
-import { RunsView } from './components/RunsView';
 import { IntelligenceView } from './components/IntelligenceView';
 import { MemoryView } from './components/MemoryView';
 import { ModalHost } from './components/modals';
@@ -147,7 +146,6 @@ export function App() {
                 {store.view === 'review' && <ReviewView store={store} />}
                 {store.view === 'docs' && <DocsView store={store} />}
                 {store.view === 'roadmap' && <RoadmapView store={store} />}
-                {store.view === 'runs' && <RunsView store={store} />}
                 {store.view === 'agents' && <AgentsView store={store} />}
                 {store.view === 'memory' && <MemoryView store={store} />}
                 {store.view === 'project-settings' && <ProjectSettingsView key={store.currentPid} store={store} />}

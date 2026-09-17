@@ -56,6 +56,14 @@ describe('surface-scoped project loading (PLNR-400)', () => {
     history.replaceState(null, '', '/');
   });
 
+  it('redirects legacy Jobs / runs deep links to the board', () => {
+    history.replaceState(null, '', '/p/prj_alpha/runs?job=job_1');
+    expect(parseUrl()).toEqual({ pid: 'prj_alpha', view: 'board', task: null });
+    history.replaceState(null, '', '/p/prj_alpha/board?view=runs');
+    expect(parseUrl()).toEqual({ pid: 'prj_alpha', view: 'board', task: null });
+    history.replaceState(null, '', '/');
+  });
+
   it('does not issue project reads for global routes', () => {
     for (const view of ['home', 'ask', 'settings', 'admin'] as const) {
       expect(projectUiSurface(view)).toBeNull();

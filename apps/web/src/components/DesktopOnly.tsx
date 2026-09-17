@@ -8,8 +8,7 @@ export const DESKTOP_ONLY_VIEWS = {
   roadmap: ['Roadmap', 'Arrange milestones and delivery windows across the project timeline.'],
   docs: ['Docs', 'Read and edit long-form project documents with their surrounding workspace context.'],
   memory: ['Memory', 'Explore durable memories and evidence relationships in the full constellation workspace.'],
-  runs: ['Runs', 'Compare run history, model attribution, usage, and outcomes in the full table.'],
-  agents: ['Agents', 'Manage runner presence, agent history, capacity, and administrative controls.'],
+  agents: ['Agents', 'Manage agent and copilot presence, history, and administrative controls.'],
 } satisfies Partial<Record<ViewId, readonly [string, string]>>;
 
 export type DesktopOnlyView = keyof typeof DESKTOP_ONLY_VIEWS;

@@ -11,7 +11,6 @@ import { Markdown } from './Markdown';
 import { Composer } from './Composer';
 import { Button, Modal, Select, TextArea, TextInput } from './ui';
 import { ExecutionSpecPanel, type SpecLoad } from './ExecutionSpec';
-import { DispatchIntelligencePanel, openIntelligenceDocument } from './DispatchIntelligence';
 import { confirm } from './Dialog';
 import { AttachmentPreview, attachmentPreviewDecision, type AttachmentPreviewItem } from './AttachmentPreview';
 import { CollapsibleMarkdown, DrawerComments } from './DrawerComments';
@@ -635,12 +634,6 @@ export function Drawer({ store }: { store: AppStore }) {
             onSaved={() => reloadSpec(task.id)}
           />
 
-          <DispatchIntelligencePanel
-            pid={currentPid}
-            taskId={task.id}
-            onOpenDocument={(document) => openIntelligenceDocument(document, actions.setView, actions.closeTask)}
-          />
-
           {/* related docs (PLNR-182) — the design/decision docs this task implements */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 8 }}>
             <SectionLabel>Related docs · {taskDocs.length}</SectionLabel>
@@ -803,7 +796,7 @@ export function Drawer({ store }: { store: AppStore }) {
       {editing && (
         <Modal
           title={`Edit ${task.key}`}
-          subtitle="Task details and dispatch settings"
+          subtitle="Task details"
           width={560}
           onClose={() => setEditing(false)}
         >

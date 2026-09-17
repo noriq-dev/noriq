@@ -1,7 +1,7 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { api, type ApiAgentRoster, type ApiRunnerRoster } from '../api';
+import { api, type ApiAgentRoster } from '../api';
 import type { AppStore } from '../store';
 import { AgentsView } from './AgentsView';
 
@@ -15,16 +15,8 @@ const emptyAgents: ApiAgentRoster = {
   page: { limit: 50, hasMore: false, nextCursor: null },
   policy: { onlineSeconds: 300, recentDays: 7 },
 };
-const emptyRunners: ApiRunnerRoster = {
-  runners: [],
-  counts: { active: 1, dormant: 2, historical: 3, total: 6, byLifecycle: { active: 1, dormant: 2, retired: 2, archived: 1 } },
-  page: { limit: 50, hasMore: false, nextCursor: null },
-  policy: { heartbeatSeconds: 90 },
-};
-
 function mount(canManage = true, role: 'admin' | 'member' = 'member') {
   vi.spyOn(api, 'agents').mockResolvedValue(emptyAgents);
-  vi.spyOn(api, 'runners').mockResolvedValue(emptyRunners);
   vi.spyOn(api, 'users').mockResolvedValue({ users: [] });
   container = document.createElement('div');
   document.body.appendChild(container);
@@ -59,15 +51,9 @@ describe('actor lifecycle inventory (PLNR-368)', () => {
     expect(api.agents).toHaveBeenLastCalledWith('prj_1', 'agent', expect.objectContaining({ view: 'dormant' }));
   });
 
-  it('moves Runners into the same lifecycle inventory and surfaces bounded cleanup preview', async () => {
+  it('surfaces bounded cleanup preview for project managers', async () => {
     mount();
     await tick();
-    await act(async () => { button('runner')!.click(); });
-    await tick();
-    expect(api.runners).toHaveBeenCalledWith(expect.objectContaining({ all: false, projectId: 'prj_1', view: 'active', limit: 50 }));
-    expect(container.textContent).toContain('Active 1');
-    expect(container.textContent).toContain('Dormant 2');
-    expect(container.textContent).toContain('History 3');
 
     vi.spyOn(api, 'agentLifecycleSweep').mockResolvedValue({
       sweepId: 'als_1', dryRun: true, projectId: 'prj_1', generatedAt: new Date().toISOString(),
