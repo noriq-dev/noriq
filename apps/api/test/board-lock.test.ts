@@ -27,12 +27,6 @@ const taskBoard = (taskId: string) =>
   env.DB.prepare('SELECT board_id AS boardId FROM tasks WHERE id = ?').bind(taskId)
     .first<{ boardId: string | null }>();
 
-const register = (body: unknown) =>
-  SELF.fetch('https://noriq.test/api/runners', {
-    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-
 beforeAll(async () => {
   await createUser('board-lock@example.com', 'Board Lock', 'longenough1', 'member').catch(() => {});
   cookie = await loginSession('board-lock@example.com', 'longenough1');
@@ -49,39 +43,6 @@ beforeAll(async () => {
   });
   runnerBoardId = ((await b.json()) as { id: string }).id;
 }, 60000);
-
-describe('registration resolves the board lock the way it resolves the key (RUN-71)', () => {
-  it('committed name → per-server boardId, case-insensitively (the marker is hand-typed)', async () => {
-    const res = await register({
-      label: 'locked-box', tools: ['claude'], kinds: ['build'], maxConcurrency: 1,
-      repos: [{ id: 'repo_lk', projectKey: 'blck', board: 'runner' }], // lowercase on purpose
-    });
-    expect(res.status).toBe(200);
-    const { runner } = (await res.json()) as { runner: { repos: Array<{ board: string | null; boardId: string | null }> } };
-    expect(runner.repos[0]!.board).toBe('runner');
-    expect(runner.repos[0]!.boardId).toBe(runnerBoardId);
-  });
-
-  it('an unknown board name resolves to null — visible, and the repo stays dispatchable', async () => {
-    const res = await register({
-      label: 'mistyped-box', tools: ['claude'], kinds: ['build'], maxConcurrency: 1,
-      repos: [{ id: 'repo_typo', projectKey: 'BLCK', board: 'Runer' }],
-    });
-    const { runner } = (await res.json()) as { runner: { repos: Array<{ projectId: string | null; boardId: string | null }> } };
-    expect(runner.repos[0]!.projectId).toBe(pid); // the KEY still resolved — board is additive
-    expect(runner.repos[0]!.boardId).toBeNull();
-  });
-
-  it('no board in the marker → nulls, exactly the pre-RUN-71 shape', async () => {
-    const res = await register({
-      label: 'plain-box', tools: ['claude'], kinds: ['build'], maxConcurrency: 1,
-      repos: [{ id: 'repo_plain', projectKey: 'BLCK' }],
-    });
-    const { runner } = (await res.json()) as { runner: { repos: Array<{ board: string | null; boardId: string | null }> } };
-    expect(runner.repos[0]!.board).toBeNull();
-    expect(runner.repos[0]!.boardId).toBeNull();
-  });
-});
 
 describe("a locked repo's agent lands its tasks on the locked board", () => {
   /** A runner + live run + run-bound agent wired to a repo locked to `boardId`. */

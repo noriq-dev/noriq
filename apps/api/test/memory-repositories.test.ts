@@ -6,7 +6,10 @@ import { env, SELF } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import type { Env } from '../src/env';
 import type { Actor } from '../src/do/ProjectRoom';
-import { projectRoom, createUser, mintTokenForUser, mcpCall, SYSTEM_ACTOR, loginSession, createAgent, authorizeForAllProjects } from './helpers';
+import {
+  projectRoom, createUser, mintTokenForUser, mcpCall, SYSTEM_ACTOR, loginSession, createAgent, authorizeForAllProjects,
+  seedOnlineRunnerForToken, mintTestIngestToken,
+} from './helpers';
 import { listProjectRepositories, resolveRepositoryByKey, listRepositoryCheckouts } from '../src/lib/project-memory';
 
 const appEnv = env as unknown as Env;
@@ -191,12 +194,6 @@ describe('POST /api/projects/:pid/memory/repositories — HTTP registration (PLN
     SELF.fetch(`https://noriq.test/api/projects/${pid}/memory/repositories/${key}`, {
       method: 'DELETE', headers: { Cookie: cookie },
     });
-  const mintCap = (token: string, body: unknown) =>
-    SELF.fetch('https://noriq.test/api/runner-ingest/capability', {
-      method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-
   async function newMemberProject(email: string, key: string): Promise<{ cookie: string; pid: string }> {
     await createUser(email, 'Member', 'longenough1').catch(() => {});
     const cookie = await loginSession(email, 'longenough1');
@@ -306,38 +303,33 @@ describe('POST /api/projects/:pid/memory/repositories — HTTP registration (PLN
     expect(await resolveRepositoryByKey(appEnv, pid, 'agent-should-not-register')).toBeNull();
   });
 
-  it('registering over HTTP unblocks POST /api/runner-ingest/capability, which 404d before registration', async () => {
+  it('registering over HTTP unblocks ingest for an associated runner checkout', async () => {
     const { cookie, pid } = await newMemberProject('pm311-ingest@example.com', 'PM311ING');
     const ownerToken = await mintTokenForUser('pm311-ingest@example.com');
     await authorizeForAllProjects(ownerToken);
-    const regRes = await SELF.fetch('https://noriq.test/api/runners', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${ownerToken}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ label: 'pm311-runner' }),
-    });
-    const runnerId = ((await regRes.json()) as { runner: { id: string } }).runner.id;
+    const runnerId = await seedOnlineRunnerForToken(ownerToken, { label: 'pm311-runner', projectId: pid });
+    const checkoutId = 'ckt_pm311';
 
-    const before = await mintCap(ownerToken, { projectId: pid, repositoryKey: 'ingest-http-repo', purpose: 'index', scopeId: 'gen_pm311', runnerId });
-    expect(before.status).toBe(404);
+    const capBefore = await mintTestIngestToken(ownerToken, {
+      projectId: pid, repositoryKey: 'ingest-http-repo', purpose: 'index', scopeId: 'gen_pm311', runnerId, checkoutId,
+    });
+    expect((await SELF.fetch(`https://noriq.test/api/memory-ingest/${capBefore}/begin`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ generationId: 'gen_pm311', branch: 'main', baseId: 'abc', indexerVersion: 'v1', batchCount: 1, fileCount: 0, contentHash: '0'.repeat(64), createdAt: new Date(0).toISOString() }),
+    })).status).toBe(401);
 
     const registered = await post(pid, cookie, { repositoryKey: 'ingest-http-repo' });
     expect(registered.status).toBe(201);
 
-    const reconnect = await SELF.fetch('https://noriq.test/api/runners', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${ownerToken}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        runnerId,
-        label: 'pm311-runner',
-        repos: [{ id: 'ckt_pm311', projectKey: 'PM311ING', repositoryKey: 'ingest-http-repo', name: 'repo' }],
-      }),
-    });
-    expect(reconnect.status).toBe(200);
+    await room(pid).associateCheckout(pid, actor, { repositoryKey: 'ingest-http-repo', runnerId, checkoutId });
 
-    const after = await mintCap(ownerToken, { projectId: pid, repositoryKey: 'ingest-http-repo', purpose: 'index', scopeId: 'gen_pm311', runnerId });
-    expect(after.status).toBe(200);
-    const capBody = (await after.json()) as { token: string };
-    expect(capBody.token).toContain('.');
+    const capAfter = await mintTestIngestToken(ownerToken, {
+      projectId: pid, repositoryKey: 'ingest-http-repo', purpose: 'index', scopeId: 'gen_pm311', runnerId, checkoutId,
+    });
+    expect((await SELF.fetch(`https://noriq.test/api/memory-ingest/${capAfter}/begin`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ generationId: 'gen_pm311', branch: 'main', baseId: 'abc', indexerVersion: 'v1', batchCount: 1, fileCount: 0, contentHash: '0'.repeat(64), createdAt: new Date(0).toISOString() }),
+    })).status).toBe(200);
   });
 });
 
