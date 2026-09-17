@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Copilot lifecycle + Cursor identity (PLNR-568, PLNR-569)
+
+- **Lifecycle sweep apply:** staging example config sets `AGENT_LIFECYCLE_SWEEP_APPLY=true`; production remains opt-in after dry-run review. Project-scoped sweeps retire `session_copilot` rows only (never `connection_copilot`). OAuth revoke paths set `retired_at` with `connection_authorization_ended`.
+- **Honest counts:** project `agentCount` / session connection counts / roster `counts.total` / private snapshots exclude retired and archived copilots by default.
+- **Cursor session keys:** `cursor:{bcId}` via `_meta["cursor/agent"]` or `x-cursor-agent-id`; Cursor clients skip per-initialize UUID minting (stable `stateless:{token}` or bound agent id). `cursor:` keys are durable across transport DELETE like `grok:` / `stateless:`.
+
 ## 0.77.0 - 2026-09-17
 
 ### Project archive (PLNR-567)

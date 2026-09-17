@@ -230,4 +230,20 @@ describe('agent lifecycle sweep policy and configuration (PLNR-363)', () => {
       .toEqual({ present: 1 });
     expect(await env.DB.prepare('SELECT * FROM agent_lifecycle_sweep_state WHERE id = 1').first()).toEqual(cursorBefore);
   });
+
+  it('project-scoped sweeps never retire connection copilots (PLNR-568)', async () => {
+    await env.DB.prepare(
+      `INSERT INTO agents (
+         id, name, status, kind, actor_class, user_id, project_id, session_id,
+         last_seen_at, lineage_status, lineage_reason, lifecycle_updated_at, created_at
+       ) VALUES ('zzals_conn_copilot', 'zzals-conn', 'active', 'copilot', 'connection_copilot', ?, NULL,
+                 'zzals-conn', ?, 'complete', NULL, ?, ?)`,
+    ).bind(ownerId, OLD, OLD, OLD).run();
+    const preview = await sweepAgentLifecycle(appEnv, { dryRun: true, at: NOW, projectId, cursor: CURSOR });
+    expect(preview.examined.actors).toBeGreaterThan(0);
+    expect(preview.transitions['actor:active->retired:connection_authorization_ended']).toBeUndefined();
+    await sweepAgentLifecycle(appEnv, { dryRun: false, at: NOW, projectId, cursor: CURSOR });
+    expect(await env.DB.prepare("SELECT retired_at AS retiredAt FROM agents WHERE id = 'zzals_conn_copilot'").first())
+      .toEqual({ retiredAt: null });
+  });
 });
