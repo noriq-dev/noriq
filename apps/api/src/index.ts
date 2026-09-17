@@ -94,7 +94,6 @@ import {
 export { ProjectRoom } from './do/ProjectRoom';
 export { AgentSession } from './do/AgentSession';
 export { RateLimiter } from './do/RateLimiter';
-export { RunnerHub } from './do/RunnerHub';
 export { ProjectMemory } from './do/ProjectMemory';
 export { AskGeneration } from './do/AskGeneration';
 
@@ -463,38 +462,6 @@ app.get('/ws/projects/:projectId', async (c) => {
   headers.set('X-Noriq-Authorized-User', user.id);
   headers.set('X-Noriq-Admin-Override', user.role === 'admin' ? '1' : '0');
   return room(c.env, pid).fetch(new Request(c.req.raw, { headers }));
-});
-
-// The runtime channel (RUN-7): the daemon dials this per-runner WS. Unlike the
-// browser project socket it authenticates with the user's OAuth Bearer (a Node
-// client can set headers), and the runner must belong to that user. The socket
-// itself lives in the RunnerHub DO (idFromName(runnerId)).
-app.get('/ws/runner/:id', async (c) => {
-  if (isRunnerDisabled(c.env)) return c.text(RUNNER_DISABLED_MESSAGE, 410);
-  if (c.req.header('Upgrade')?.toLowerCase() !== 'websocket') return c.text('expected WebSocket upgrade', 426);
-  const header = c.req.header('Authorization') ?? '';
-  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
-  if (!token) return c.text('missing bearer token', 401);
-  const tok = await c.env.DB.prepare(
-    `SELECT t.id AS tokenId, t.user_id AS userId, u.email AS userEmail FROM oauth_tokens t
-     JOIN users u ON u.id = t.user_id
-     WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
-       AND u.disabled = 0`,
-  ).bind(await sha256Hex(token)).first<{ tokenId: string; userId: string; userEmail: string }>();
-  if (!tok) return c.text('invalid or expired token', 401);
-  // This route does its own bearer lookup (a Node client sets headers), so it bypasses
-  // agentAuth's demo kill switch — re-apply it here (PLNR-199) or a rotated legacy demo
-  // token could open a runner socket.
-  if (demoLocksDown(c.env, tok.userEmail)) return c.text('the demo account cannot use API tokens', 401);
-  const id = c.req.param('id')!;
-  const owned = await c.env.DB.prepare('SELECT id FROM runners WHERE id = ? AND owner_user_id = ?').bind(id, tok.userId).first();
-  if (!owned) return c.text('not found', 404);
-  const account = await resolveAccountCapabilities(c.env.DB, tok.userId);
-  if (account.accessMode !== 'read_write') return c.text('account is read-only', 403);
-  const headers = new Headers(c.req.raw.headers);
-  headers.set('X-Noriq-Authorized-User', tok.userId);
-  headers.set('X-Noriq-Authorized-Token', tok.tokenId);
-  return c.env.RUNNER_HUB.get(c.env.RUNNER_HUB.idFromName(id)).fetch(new Request(c.req.raw, { headers }));
 });
 
 // --- admin bootstrap (users; agent key issuance retired — agents arrive via OAuth) --
