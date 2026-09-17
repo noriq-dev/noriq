@@ -2,8 +2,10 @@
 
 This is the self-hosting and day-two operations guide for Project Memory. It covers the boundary
 between D1 and the per-project Durable Object, optional Cloudflare services, repository indexing
-(cut-over: runner CLI ingest paused), upgrades, recovery, deletion, and release checks. Detailed snapshot formats and restore
-semantics live in [`apps/api/BACKUP.md`](../apps/api/BACKUP.md); the security and measured-load
+(cut-over: runner CLI ingest paused), upgrades, recovery, deletion, and release checks. Dual-plane
+cutover (D1 + ProjectMemory + AgentSession cursors) is summarized at the top of
+[`apps/api/BACKUP.md`](../apps/api/BACKUP.md). Detailed snapshot formats and restore semantics
+live in the rest of that doc; the security and measured-load
 records live in [`PROJECT_MEMORY_SECURITY_REVIEW.md`](PROJECT_MEMORY_SECURITY_REVIEW.md) and
 [`PROJECT_MEMORY_LOAD_PROFILE.md`](PROJECT_MEMORY_LOAD_PROFILE.md).
 

@@ -8,6 +8,7 @@ import { buildMcpServer, INSTRUCTIONS, GET_BRIEFING_PLAYBOOK } from './mcp';
 import { handleModernMcp, isModernMcpRequest } from './mcp-2026';
 import { renderMcpReference, mcpReferenceJson } from './reference';
 import { backupToR2, exportSnapshot, importSnapshot } from './backup';
+import { memoryRestoreDualPlaneGate, memoryRestoreSuccessWarnings } from './lib/backup-dual-plane';
 import { sweepPendingErasures, sweepProjectDebris, sweepProjectDebrisForProject, listProjectBackupGenerations, listMemoryLifecycleProjectIds } from './memory/lifecycle';
 import { hashPassword, newApiKey, newId, nowIso, sha256Hex, timingSafeEqual, verifyPassword, verifyPasswordConstantTime } from './lib/util';
 import { searchWorkspaceEvidence, searchWorkspacePlans, searchWorkspaceTasks } from './lib/workspace-operations';
@@ -494,8 +495,11 @@ app.post('/api/admin/memory-restore/:projectId', adminAuth, async (c) => {
   const projectId = c.req.param('projectId')!;
   const exportedAt = c.req.query('exportedAt');
   if (!exportedAt) return c.json({ error: 'exportedAt query param is required — the timestamp of the backup to restore' }, 400);
+  const gate = await memoryRestoreDualPlaneGate(c.env, projectId);
+  if (!gate.ok) return c.json({ ok: false, reason: gate.reason, warnings: gate.warnings }, 409);
   const res = await c.env.PROJECT_MEMORY.get(c.env.PROJECT_MEMORY.idFromName(projectId)).restoreSnapshot(projectId, { exportedAt });
-  return c.json(res, res.ok ? 200 : 400);
+  if (!res.ok) return c.json(res, 400);
+  return c.json({ ...res, warnings: memoryRestoreSuccessWarnings() }, 200);
 });
 
 // Roll back to the retained prior generation (PLNR-249) — no R2 read, no re-upload. Single-
@@ -563,7 +567,9 @@ app.post('/api/admin/import', adminAuth, async (c) => {
   }
   let raw: unknown;
   try { raw = await c.req.json(); } catch { return c.json({ error: 'body must be the JSON snapshot from /api/admin/export' }, 400); }
-  const result = await importSnapshot(c.env, raw);
+  const result = await importSnapshot(c.env, raw, {
+    acknowledgePre0066Priority: c.req.query('acknowledgePre0066Priority') === '1',
+  });
   return c.json(result, result.ok ? 200 : 400);
 });
 
@@ -1880,8 +1886,11 @@ app.post('/api/projects/:pid/memory/restore', userAuth, async (c) => {
   const pid = c.req.param('pid')!;
   const exportedAt = c.req.query('exportedAt');
   if (!exportedAt) return c.json({ error: 'exportedAt query param is required — the timestamp of the backup to restore' }, 400);
+  const gate = await memoryRestoreDualPlaneGate(c.env, pid);
+  if (!gate.ok) return c.json({ ok: false, reason: gate.reason, warnings: gate.warnings }, 409);
   const res = await memoryDO(c.env, pid).restoreSnapshot(pid, { exportedAt });
-  return c.json(res, res.ok ? 200 : 400);
+  if (!res.ok) return c.json(res, 400);
+  return c.json({ ...res, warnings: memoryRestoreSuccessWarnings() }, 200);
 });
 
 app.post('/api/projects/:pid/memory/restore/rollback', userAuth, async (c) => {

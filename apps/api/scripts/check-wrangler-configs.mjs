@@ -87,6 +87,34 @@ assert.deepEqual(
 );
 assert.equal(staging.r2_buckets?.[0]?.binding, 'FILES', 'staging: missing FILES binding');
 
+// PLNR-561: staging must never alias prod worker scripts or the FILES bucket that holds
+// backups/ and memory-backups/<projectId>/ — a staging restore/erase could reach prod backups.
+function filesBucketName(config) {
+  const entry = (config.r2_buckets ?? []).find((binding) => binding.binding === 'FILES');
+  return entry?.bucket_name ?? null;
+}
+
+assert.notEqual(
+  staging.name,
+  production.name,
+  'staging: worker name must differ from production (Durable Object namespaces are per script)',
+);
+assert.notEqual(
+  staging.d1_databases?.[0]?.database_name,
+  production.d1_databases?.[0]?.database_name,
+  'staging: D1 database_name must differ from production',
+);
+const productionFilesBucket = filesBucketName(production);
+const stagingFilesBucket = filesBucketName(staging);
+assert.ok(stagingFilesBucket, 'staging: FILES bucket_name is required');
+if (productionFilesBucket) {
+  assert.notEqual(
+    stagingFilesBucket,
+    productionFilesBucket,
+    'staging: FILES bucket_name must differ from production when production binds R2',
+  );
+}
+
 assert.equal(demo.vars?.DEMO_MODE, '1', 'demo: DEMO_MODE must stay enabled');
 for (const costlyBinding of ['ai', 'vectorize', 'r2_buckets', 'send_email']) {
   assert.equal(demo[costlyBinding], undefined, `demo: ${costlyBinding} must remain omitted`);
