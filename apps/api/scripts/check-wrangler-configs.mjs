@@ -16,7 +16,6 @@ const requiredBindings = new Map([
   ['PROJECT_ROOM', 'ProjectRoom'],
   ['AGENT_SESSION', 'AgentSession'],
   ['RATE_LIMITER', 'RateLimiter'],
-  ['RUNNER_HUB', 'RunnerHub'],
   ['PROJECT_MEMORY', 'ProjectMemory'],
   ['ASK_GENERATION', 'AskGeneration'],
 ]);

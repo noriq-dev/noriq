@@ -1,7 +1,6 @@
 import type { ProjectRoom } from './do/ProjectRoom';
 import type { AgentSession } from './do/AgentSession';
 import type { RateLimiter } from './do/RateLimiter';
-import type { RunnerHub } from './do/RunnerHub';
 import type { ProjectMemory } from './do/ProjectMemory';
 import type { AskGeneration } from './do/AskGeneration';
 
@@ -11,7 +10,6 @@ export interface Env {
   PROJECT_ROOM: DurableObjectNamespace<ProjectRoom>;
   AGENT_SESSION: DurableObjectNamespace<AgentSession>;
   RATE_LIMITER: DurableObjectNamespace<RateLimiter>;
-  RUNNER_HUB: DurableObjectNamespace<RunnerHub>;
   /** ProjectMemory (PLNR-245) — one per project (idFromName(projectId)), canonical writer/
    *  query authority for cognitive memory. Separate from PROJECT_ROOM by design (§2, §19). */
   PROJECT_MEMORY: DurableObjectNamespace<ProjectMemory>;

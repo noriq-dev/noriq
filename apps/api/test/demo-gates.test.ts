@@ -101,13 +101,6 @@ describe('demo lockdown (PLNR-199)', () => {
     expect(res.status).toBe(401);
     expect((await res.json() as { error: string }).error).toContain('demo account');
 
-    // The runner WebSocket does its own bearer lookup (bypassing agentAuth), so it must
-    // reject the demo token independently — not fall through to a runner-ownership 404.
-    const ws = await SELF.fetch('https://noriq.test/ws/runner/rnr_anything', {
-      headers: { Authorization: `Bearer ${access}`, Upgrade: 'websocket' },
-    });
-    expect(ws.status).toBe(401);
-    expect(await ws.text()).toContain('demo account');
   });
 
   it('disables first-run setup so a visitor cannot self-install a non-demo admin', async () => {
