@@ -26,12 +26,11 @@ beforeAll(async () => {
   await db.prepare("INSERT OR IGNORE INTO users (id, email, name, role, created_at) VALUES ('usr_maint', 'maint@example.com', 'Maint', 'admin', ?)").bind(now).run();
   await db.prepare('INSERT OR IGNORE INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)').bind(await sha256Hex(SESSION_VALUE), 'usr_maint', FUTURE).run();
 
-  // A bound MCP connection (the OAuth mint flow is a frozen write). agent_id on the token
-  // makes agentAuth act AS this agent — no session resolution needed. A copilot (not a
-  // runner 'agent') so it needs no runner_id/project_id (the 0026 CHECK).
+  // MCP bearer for a human connection (OAuth mint is a frozen write). agent_id must stay NULL —
+  // legacy runner-bound tokens are refused; the first tools/call resolves a session copilot.
   await db.prepare("INSERT OR IGNORE INTO oauth_clients (id, name, redirect_uris, created_at) VALUES ('cli_maint', 'maint client', '[]', ?)").bind(now).run();
   await db.prepare("INSERT OR IGNORE INTO agents (id, name, role, status, user_id, kind, created_at) VALUES ('agt_maint', 'maint-seed-agent', 'worker', 'idle', 'usr_maint', 'copilot', ?)").bind(now).run();
-  await db.prepare("INSERT OR IGNORE INTO oauth_tokens (id, token_hash, client_id, user_id, agent_id, scope, expires_at) VALUES ('tok_maint', ?, 'cli_maint', 'usr_maint', 'agt_maint', 'mcp', ?)").bind(await sha256Hex(AGENT_TOKEN), FUTURE).run();
+  await db.prepare("INSERT OR IGNORE INTO oauth_tokens (id, token_hash, client_id, user_id, agent_id, copilot_id, scope, expires_at) VALUES ('tok_maint', ?, 'cli_maint', 'usr_maint', NULL, 'agt_maint', 'mcp', ?)").bind(await sha256Hex(AGENT_TOKEN), FUTURE).run();
 });
 
 describe('write-freeze (PLNR-166)', () => {
