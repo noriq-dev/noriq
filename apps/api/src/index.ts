@@ -46,7 +46,6 @@ import { issueTokens, metadataRoutes, oauth } from './oauth';
 import { demoLocksDown } from './lib/demo';
 import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
 import { isRunnerDisabled, runnerDisabledBody, RUNNER_DISABLED_MESSAGE } from './lib/runner-disabled';
-import { drainRunnerPlane } from './lib/runner-plane-drain';
 import { copilotSessionContextFromMessages, endCopilotSession } from './lib/copilot-session';
 import { isDurableCopilotKey, resolveCopilotSessionKey } from './lib/mcp-session-key';
 import { errorPage, wantsHtml } from './errorPage';
@@ -512,13 +511,6 @@ app.get('/api/admin/export', adminAuth, async (c) => {
 app.post('/api/admin/backup', adminAuth, async (c) => {
   const res = await backupToR2(c.env, nowIso());
   return c.json(res, res.ok ? 200 : 503);
-});
-
-// Terminate every live runner job, legacy run, and plan dispatch (drop-runner cutover).
-// Call before or after setting RUNNER_DISABLED=1; idempotent on already-terminal rows.
-app.post('/api/admin/runner-plane/drain', adminAuth, async (c) => {
-  const summary = await drainRunnerPlane(c.env);
-  return c.json({ ok: true, ...summary });
 });
 
 // On-demand ProjectMemory portable snapshot (PLNR-248) — the per-project analogue of

@@ -7,8 +7,6 @@ export const RUNNER_DISABLED_MESSAGE =
 
 export const RUNNER_DISABLED_CODE = 'runner_plane_disabled';
 
-export const RUNNER_PLANE_DRAIN_REASON = 'runner_plane_disabled';
-
 /** Truthy check mirroring MAINTENANCE_MODE / DEMO_MODE: any value except unset / '0' / 'false'. */
 export const isRunnerDisabled = (env: { RUNNER_DISABLED?: string }): boolean => {
   const v = env.RUNNER_DISABLED;
