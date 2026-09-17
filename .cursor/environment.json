@@ -1,0 +1,16 @@
+{
+  "name": "Noriq",
+  "install": "npm install && npm run build",
+  "start": "npm run db:migrate:local --workspace @noriq-dev/api",
+  "terminals": [
+    {
+      "name": "api",
+      "command": "npm run dev --workspace @noriq-dev/api -- --local --port 8787"
+    },
+    {
+      "name": "web",
+      "command": "npm run dev:web"
+    }
+  ],
+  "ports": [8787, 5173]
+}
