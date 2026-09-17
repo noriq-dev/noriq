@@ -3096,17 +3096,15 @@ export class ProjectMemory extends DurableObject<Env> {
 
     // Best-effort vector publish, OUTSIDE the transaction (PLNR-256: a Vectorize upsert cannot
     // join a SQLite transaction; correctness comes from query-time generation filtering, never
-    // from "we deleted the old vectors"). Strip this generation's file bodies AFTER publish
-    // (or immediately when there is no backend) — citation checks only SELECT uri (PLNR-555).
+    // from "we deleted the old vectors"). The ACTIVE generation keeps staged file bodies so
+    // readActiveCodeIndex can still resolve exact source evidence (PLNR-524/525); PLNR-555 strips
+    // only superseded generations inside the transaction above.
     const backend = codeSearchBackend(this.env);
     if (backend) {
       this.ctx.waitUntil(
         this.publishGenerationVectors(backend, projectId, generationId, gen.repository_key, gen.deletions)
-          .catch((err) => console.warn(`ProjectMemory code-index generation ${generationId} failed: ${String(err)}`))
-          .finally(() => this.stripStagedEntityContent(generationId)),
+          .catch((err) => console.warn(`ProjectMemory code-index generation ${generationId} failed: ${String(err)}`)),
       );
-    } else {
-      this.stripStagedEntityContent(generationId);
     }
 
     // D1-side active-generation PROJECTION (PLNR-259) — DO -> ProjectRoom -> D1, mirroring
@@ -5121,7 +5119,7 @@ export class ProjectMemory extends DurableObject<Env> {
   /**
    * Did THIS ACTIVE GENERATION actually stage a `file`/`symbol` entity for this citation? Reads
    * `index_staged_entities` (keyed `(generation_id, uri)`). URIs are retained for the life of
-   * THIS generation; file bodies are nulled after activation (PLNR-555). PLNR-261 does not
+   * THIS generation; file bodies on superseded generations are nulled at cutover (PLNR-555). PLNR-261 does not
    * delete staged rows at supersession; PLNR-554's sweep deletes a superseded generation's
    * children after SUPERSEDED_GENERATION_MAX_AGE_MS. Never the live `nodes` table. PLNR-283: `nodes` is no longer a reliable proxy for "the index actually found this
    * file at this base" once `recordMemory` also upserts a `file`/`symbol` node for any

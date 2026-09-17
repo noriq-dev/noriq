@@ -520,6 +520,24 @@ export async function loginSession(email: string, password: string): Promise<str
  * feature working, not a bug, so the fixtures say out loud that the human granted access
  * rather than having the old implicit "every token reaches everything" quietly restored.
  */
+/** Replace a token's project scope with exactly `projectIds` (RUN-38 scoped path). */
+export async function authorizeForProjects(apiKey: string, ...projectIds: string[]): Promise<void> {
+  const db = (env as unknown as { DB: D1Database }).DB;
+  const hash = await sha256HexTest(apiKey);
+  const tok = await db.prepare('SELECT id FROM oauth_tokens WHERE token_hash = ?')
+    .bind(hash).first<{ id: string }>();
+  if (!tok) throw new Error('authorizeForProjects: unknown token');
+  const now = new Date().toISOString();
+  const stmts = [
+    db.prepare('UPDATE oauth_tokens SET scoped_at = ?, scope_all = 0 WHERE id = ?').bind(now, tok.id),
+    db.prepare('DELETE FROM oauth_token_projects WHERE token_id = ?').bind(tok.id),
+    ...projectIds.map((pid) =>
+      db.prepare('INSERT OR IGNORE INTO oauth_token_projects (token_id, project_id) VALUES (?, ?)').bind(tok.id, pid),
+    ),
+  ];
+  await db.batch(stmts);
+}
+
 export async function authorizeForAllProjects(...apiKeys: string[]): Promise<void> {
   const db = (env as unknown as { DB: D1Database }).DB;
   for (const apiKey of apiKeys) {

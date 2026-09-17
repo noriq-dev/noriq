@@ -1,7 +1,7 @@
 // PLNR-54: notices must be *pushed* as JSON-RPC notifications on the live POST SSE
 // stream (relatedRequestId routing), not only piggybacked in the tool result text.
 import { describe, expect, it, beforeAll } from 'vitest';
-import { createAgent, mcpCall, mcpCallStream, authorizeForAllProjects } from './helpers';
+import { createAgent, mcpCall, mcpCallStream, authorizeForProjects } from './helpers';
 
 let alice: { id: string; apiKey: string };
 let bob: { id: string; apiKey: string };
@@ -16,7 +16,10 @@ beforeAll(async () => {
   // scoped to nothing and only the CREATOR gains the new project. A human would authorize them
   // for it — say so explicitly rather than let the old implicit "every token sees everything"
   // creep back in.
-  await authorizeForAllProjects(alice.apiKey, bob.apiKey);
+  // Bob was minted before NTFY existed — grant only this project. authorizeForAllProjects would
+  // also reach other shard fixtures' projects (e.g. comments-list's CMT) and sticky unassigned
+  // questions would pollute the "no pending notices" assertion below.
+  await authorizeForProjects(bob.apiKey, projectId);
 
 }, 60000);
 
