@@ -54,8 +54,9 @@
     "AGENT_PRESENCE_PURGE_DAYS": "90",
     "RUNNER_OFFLINE_ARCHIVE_DAYS": "30",
     "AGENT_LIFECYCLE_SWEEP_BATCH": "100",
-    // Keep this false until staging dry-run results have been reviewed.
-    "AGENT_LIFECYCLE_SWEEP_APPLY": "false"
+    // Staging enables scheduled retire/archive after operator dry-run review (PLNR-568).
+    // Production stays false in wrangler.production.jsonc until prod dry-run is reviewed.
+    "AGENT_LIFECYCLE_SWEEP_APPLY": "true"
   },
 
   "assets": {

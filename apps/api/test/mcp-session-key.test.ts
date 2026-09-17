@@ -2,6 +2,9 @@ import { describe, expect, it, beforeAll } from 'vitest';
 import { SELF, env } from 'cloudflare:test';
 import { createAgent, mintPairForUser, mcpCall } from './helpers';
 import {
+  CURSOR_AGENT_META,
+  isCursorClient,
+  isCursorClientName,
   isDurableCopilotKey,
   isGrokClient,
   isGrokClientName,
@@ -59,6 +62,39 @@ describe('resolveCopilotSessionKey (PLNR-552)', () => {
       source: 'x-mcp-session-id',
     });
     expect(isDurableCopilotKey(r.key)).toBe(true);
+  });
+
+  it('cursor/agent meta maps to cursor:{id}', () => {
+    const r = resolveCopilotSessionKey({
+      messages: [{ params: { _meta: { [CURSOR_AGENT_META]: 'bc-abc123' } } }],
+      tokenId,
+    });
+    expect(r).toEqual({ key: 'cursor:bc-abc123', source: 'cursor-agent' });
+    expect(isDurableCopilotKey(r.key)).toBe(true);
+    expect(isStablePresentedSessionId('cursor:bc-abc123')).toBe(true);
+  });
+
+  it('x-cursor-agent-id maps to cursor:{id}', () => {
+    expect(resolveCopilotSessionKey({ tokenId, xCursorAgentId: 'bc-cloud' }))
+      .toEqual({ key: 'cursor:bc-cloud', source: 'cursor-agent' });
+  });
+
+  it('Cursor initialize without a session key uses the token, not a minted UUID (PLNR-569)', () => {
+    const r = resolveCopilotSessionKey({
+      tokenId, isInitialize: true, mint, userAgent: 'Cursor/1.0',
+    });
+    expect(r).toEqual({ key: `stateless:${tokenId}`, source: 'stateless-token' });
+    expect(isCursorClient({ userAgent: 'Cursor/1.0' })).toBe(true);
+    expect(isCursorClientName('cursor-agent')).toBe(true);
+  });
+
+  it('Cursor ignores an ephemeral Mcp-Session-Id UUID and keys on cursor/agent', () => {
+    const r = resolveCopilotSessionKey({
+      tokenId, clientName: 'Cursor',
+      mcpSessionId: '840d6f65-9c29-4fa0-a79e-ab1005f6160a',
+      messages: [{ params: { _meta: { [CURSOR_AGENT_META]: 'bc-stable' } } }],
+    });
+    expect(r).toEqual({ key: 'cursor:bc-stable', source: 'cursor-agent' });
   });
 
   it('non-Grok initialize without a session key mints a UUID', () => {
@@ -266,6 +302,39 @@ describe('legacy MCP identity (PLNR-552)', () => {
     expect(second).not.toBe(first);
   });
 
+  it('two Cursor cloud agent ids are distinct copilots', async () => {
+    const a = await briefingRaw({ 'x-cursor-agent-id': 'bc-run-a' }, { [CURSOR_AGENT_META]: 'bc-run-a' });
+    const b = await briefingRaw({ 'x-cursor-agent-id': 'bc-run-b' });
+    const aAgain = await briefingRaw({}, { [CURSOR_AGENT_META]: 'bc-run-a' });
+    expect(a).toBe(aAgain);
+    expect(a).not.toBe(b);
+  });
+
+  it('Cursor initialize without bcId reuses stateless:{tokenId}', async () => {
+    const init = async () => {
+      const res = await SELF.fetch('https://noriq.test/mcp', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+          'User-Agent': 'Cursor/1.0',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+          params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'Cursor', version: '1' } },
+        }),
+      });
+      return res.headers.get('Mcp-Session-Id');
+    };
+    const first = await init();
+    const second = await init();
+    expect(first).toMatch(/^stateless:/);
+    expect(second).toBe(first);
+  });
+
   it('CORS allows the x-mcp-session-id request header', async () => {
     const res = await SELF.fetch('https://noriq.test/mcp', {
       method: 'OPTIONS',
@@ -277,6 +346,19 @@ describe('legacy MCP identity (PLNR-552)', () => {
     });
     expect(res.status).toBe(204);
     expect(res.headers.get('Access-Control-Allow-Headers') ?? '').toMatch(/x-mcp-session-id/i);
+  });
+
+  it('CORS allows the x-cursor-agent-id request header', async () => {
+    const res = await SELF.fetch('https://noriq.test/mcp', {
+      method: 'OPTIONS',
+      headers: {
+        Origin: 'https://example.com',
+        'Access-Control-Request-Method': 'POST',
+        'Access-Control-Request-Headers': 'x-cursor-agent-id',
+      },
+    });
+    expect(res.status).toBe(204);
+    expect(res.headers.get('Access-Control-Allow-Headers') ?? '').toMatch(/x-cursor-agent-id/i);
   });
 });
 

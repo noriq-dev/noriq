@@ -80,7 +80,8 @@ import {
 import { getProjectIntelligenceDashboard } from './memory/intelligence-dashboard';
 import { classifyAgentLifecycle } from './lib/agent-lifecycle';
 import { agentLifecycleSweepConfig, sweepAgentLifecycle, type AgentLifecycleCursor } from './lib/agent-lifecycle-sweep';
-import { AGENT_LIFECYCLES, listAgentRoster, projectVisibleAgentClause, type AgentRosterLifecycle } from './lib/agent-roster';
+import { retireAgentsForRevokedConnection } from './lib/copilot-connection';
+import { AGENT_LIFECYCLES, activeRosterAgentWhere, listAgentRoster, projectVisibleAgentClause, type AgentRosterLifecycle } from './lib/agent-roster';
 import { RUNNER_HEARTBEAT_TTL_MS } from './lib/runner-roster';
 import { IndexGenerationManifest, RunBudget } from '@noriq-dev/shared';
 import { auditAuthorizationParity, reconcileLegacyGroupGrants } from './lib/authorization-parity';
@@ -126,7 +127,7 @@ const projectAccessFields = (access: Awaited<ReturnType<typeof resolveProjectAcc
 // can preflight (PLNR-82). Registered before the handlers so it wraps them.
 app.use('/mcp', cors({
   allowMethods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-  allowHeaders: ['Authorization', 'Content-Type', 'Mcp-Session-Id', 'MCP-Protocol-Version', 'x-mcp-session-id'],
+  allowHeaders: ['Authorization', 'Content-Type', 'Mcp-Session-Id', 'MCP-Protocol-Version', 'x-mcp-session-id', 'x-cursor-agent-id'],
   exposeHeaders: ['Mcp-Session-Id', 'WWW-Authenticate'],
   maxAge: 86400,
 }));
@@ -328,6 +329,7 @@ app.all('/mcp', agentAuth, async (c) => {
     }
     const sessionId = resolveCopilotSessionKey({
       mcpSessionId, xMcpSessionId, tokenId: conn.tokenId,
+      xCursorAgentId: c.req.header('x-cursor-agent-id'),
       userAgent: c.req.header('user-agent'),
       clientName: conn.clientName,
     }).key;
@@ -367,6 +369,7 @@ app.all('/mcp', agentAuth, async (c) => {
     messages: msgs,
     mcpSessionId: c.req.header('mcp-session-id'),
     xMcpSessionId: c.req.header('x-mcp-session-id'),
+    xCursorAgentId: c.req.header('x-cursor-agent-id'),
     tokenId: conn.tokenId,
     userAgent: c.req.header('user-agent'),
     clientName: conn.clientName,
@@ -671,7 +674,7 @@ app.get('/api/auth/sessions', userAuth, async (c) => {
             t.scoped_at IS NOT NULL AS scoped,
             (SELECT GROUP_CONCAT(p.key) FROM oauth_token_projects otp JOIN projects p ON p.id = otp.project_id
               WHERE otp.token_id = t.id) AS projectKeys,
-            (SELECT COUNT(*) FROM agents a WHERE a.oauth_token_id = t.id AND a.status != 'revoked') AS agentCount,
+            (SELECT COUNT(*) FROM agents a WHERE a.oauth_token_id = t.id AND ${activeRosterAgentWhere('a')}) AS agentCount,
             (SELECT MAX(a.last_seen_at) FROM agents a WHERE a.oauth_token_id = t.id) AS lastActive
      FROM oauth_tokens t LEFT JOIN oauth_clients cl ON cl.id = t.client_id
      WHERE t.user_id = ? AND t.revoked_at IS NULL AND t.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -684,9 +687,7 @@ app.post('/api/auth/sessions/:id/revoke', userAuth, async (c) => {
   const now = nowIso();
   const r = await c.env.DB.prepare("UPDATE oauth_tokens SET revoked_at = ? WHERE id = ? AND user_id = ? AND revoked_at IS NULL")
     .bind(now, c.req.param('id'), c.var.user!.id).run();
-  // Retire the agents that ran on this connection so they stop showing as live.
-  await c.env.DB.prepare("UPDATE agents SET status = 'offline' WHERE oauth_token_id = ? AND status = 'active'")
-    .bind(c.req.param('id')).run();
+  await retireAgentsForRevokedConnection(c.env.DB, c.req.param('id')!, now);
   return c.json({ ok: true, revoked: r.meta.changes ?? 0 });
 });
 
@@ -703,7 +704,7 @@ app.get('/api/admin/oauth/connections', userAuth, async (c) => {
             t.agent_id IS NOT NULL AS bound,
             (SELECT GROUP_CONCAT(p.key) FROM oauth_token_projects otp JOIN projects p ON p.id = otp.project_id
               WHERE otp.token_id = t.id) AS projectKeys,
-            (SELECT COUNT(*) FROM agents a WHERE a.oauth_token_id = t.id AND a.status != 'revoked') AS agentCount,
+            (SELECT COUNT(*) FROM agents a WHERE a.oauth_token_id = t.id AND ${activeRosterAgentWhere('a')}) AS agentCount,
             (SELECT MAX(a.last_seen_at) FROM agents a WHERE a.oauth_token_id = t.id) AS lastActive
      FROM oauth_tokens t
      LEFT JOIN oauth_clients cl ON cl.id = t.client_id
@@ -718,8 +719,7 @@ app.post('/api/admin/oauth/connections/:id/revoke', userAuth, async (c) => {
   if (c.var.user!.role !== 'admin') return c.json({ error: 'admin role required' }, 403);
   const r = await c.env.DB.prepare('UPDATE oauth_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL')
     .bind(nowIso(), c.req.param('id')).run();
-  await c.env.DB.prepare("UPDATE agents SET status = 'offline' WHERE oauth_token_id = ? AND status = 'active'")
-    .bind(c.req.param('id')).run();
+  await retireAgentsForRevokedConnection(c.env.DB, c.req.param('id')!);
   return c.json({ ok: true, revoked: r.meta.changes ?? 0 });
 });
 
@@ -763,9 +763,12 @@ app.post('/api/auth/sessions/revoke-all', userAuth, async (c) => {
   const now = nowIso();
   const r = await c.env.DB.prepare("UPDATE oauth_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL")
     .bind(now, c.var.user!.id).run();
-  await c.env.DB.prepare(
-    "UPDATE agents SET status = 'offline' WHERE status = 'active' AND oauth_token_id IN (SELECT id FROM oauth_tokens WHERE user_id = ?)",
-  ).bind(c.var.user!.id).run();
+  const tokens = await c.env.DB.prepare(
+    'SELECT id FROM oauth_tokens WHERE user_id = ? AND revoked_at = ?',
+  ).bind(c.var.user!.id, now).all<{ id: string }>();
+  for (const row of tokens.results) {
+    await retireAgentsForRevokedConnection(c.env.DB, row.id, now);
+  }
   return c.json({ ok: true, revoked: r.meta.changes ?? 0 });
 });
 
@@ -797,17 +800,17 @@ app.get('/api/projects', userAuth, async (c) => {
                                    WHERE ap.actor_id = a.id AND ap.archived_at IS NULL
                                      AND ap.state IN ('online','working') AND ap.last_seen_at >= ?2)
                      THEN 1 ELSE 0 END) AS liveAgentCount,
-            COUNT(a.id) AS totalAgentCount
+            SUM(CASE WHEN ${activeRosterAgentWhere('a')} THEN 1 ELSE 0 END) AS activeRosterCount
        FROM projects p LEFT JOIN agents a ON a.project_id = p.id
       WHERE ${statusFilter} AND ${adminAll ? '1 = 1' : USER_PROJECT_WHERE}
       GROUP BY p.id`,
   ).bind(adminAll ? '' : u.id, liveCutoff);
   const [{ results }, { results: countRows }] = await Promise.all([
     stmt.all<Record<string, unknown> & { id: string }>(),
-    countsStmt.all<{ id: string; liveAgentCount: number; totalAgentCount: number }>(),
+    countsStmt.all<{ id: string; liveAgentCount: number; activeRosterCount: number }>(),
   ]);
   const actorCounts = new Map(countRows.map((row) => [row.id, {
-    live: Number(row.liveAgentCount), total: Number(row.totalAgentCount),
+    live: Number(row.liveAgentCount), activeRoster: Number(row.activeRosterCount),
   }]));
   const projects = await Promise.all(results.map(async (project) => ({
     ...project,
@@ -815,7 +818,7 @@ app.get('/api/projects', userAuth, async (c) => {
     // genuinely live presence. History is explicit instead of silently inflating it.
     agentCount: actorCounts.get(project.id)?.live ?? 0,
     liveAgentCount: actorCounts.get(project.id)?.live ?? 0,
-    historicalAgentCount: (actorCounts.get(project.id)?.total ?? 0) - (actorCounts.get(project.id)?.live ?? 0),
+    historicalAgentCount: (actorCounts.get(project.id)?.activeRoster ?? 0) - (actorCounts.get(project.id)?.live ?? 0),
     ...projectAccessFields(await resolveProjectAccess(c.env.DB, u.id, project.id, {
       allowAdminOverride: adminAll,
     })),
@@ -1029,7 +1032,7 @@ app.get('/api/projects/:pid/ui-state', userAuth, async (c) => {
       `SELECT a.id, COALESCE(a.label, a.name) AS name, a.role, a.status,
               a.last_seen_at AS lastSeenAt, a.parent_agent_id AS parentAgentId, u.name AS ownerName
          FROM agents a LEFT JOIN users u ON u.id = a.user_id
-        WHERE ${projectVisibleAgentClause('a')} AND a.status != 'revoked' ORDER BY a.created_at`, pid, pid),
+        WHERE ${projectVisibleAgentClause('a')} AND ${activeRosterAgentWhere('a')} ORDER BY a.created_at`, pid, pid),
     rows(eventSurface,
       `SELECT id, seq, actor_kind AS actorKind, actor_id AS actorId, verb,
               subject_type AS subjectType, subject_id AS subjectId, payload, created_at AS createdAt
@@ -1192,7 +1195,7 @@ app.get('/api/projects/:pid/snapshot', userAuth, async (c) => {
               a.kind, a.runner_id AS runnerId,
               a.parent_agent_id AS parentAgentId, u.name AS ownerName
        FROM agents a LEFT JOIN users u ON u.id = a.user_id
-       WHERE ${projectVisibleAgentClause('a')} AND a.status != 'revoked' ORDER BY a.created_at`,
+       WHERE ${projectVisibleAgentClause('a')} AND ${activeRosterAgentWhere('a')} ORDER BY a.created_at`,
     ).bind(pid, pid).all(),
     c.env.DB.prepare(
       `SELECT id, seq, actor_kind AS actorKind, actor_id AS actorId, verb, subject_type AS subjectType,

@@ -1,5 +1,5 @@
 // Profile sessions: a user can see & revoke their OAuth connections (agent re-model).
-import { SELF } from 'cloudflare:test';
+import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { createAgent, loginSession, mcpCall } from './helpers';
 
@@ -39,6 +39,11 @@ describe('OAuth session management', () => {
 
     expect((await post(cookie, `/api/auth/sessions/${list[0]!.id}/revoke`)).status).toBe(200);
     await expect(mcpCall(conn.apiKey, 'get_briefing', {})).rejects.toThrow(/401/);
+    const agents = await env.DB.prepare(
+      'SELECT retired_at AS retiredAt, retire_reason AS reason FROM agents WHERE oauth_token_id = ?',
+    ).bind(list[0]!.id).all<{ retiredAt: string | null; reason: string | null }>();
+    expect(agents.results.length).toBeGreaterThan(0);
+    expect(agents.results.every((row) => row.retiredAt && row.reason === 'connection_authorization_ended')).toBe(true);
   });
 
   it('requires a session', async () => {

@@ -224,6 +224,9 @@ export async function sweepAgentLifecycle(env: Env, options: SweepOptions = {}) 
     runnerId: selectedCursor('runnerId'),
   };
   const actorProjectPredicate = options.projectId ? ' AND project_id = ?' : '';
+  // Project managers may retire idle session copilots only — never connection copilots
+  // (they are OAuth-grant roots, often project_id IS NULL) (PLNR-568).
+  const actorClassPredicate = options.projectId ? " AND a.actor_class = 'session_copilot'" : '';
 
   const transitions: Record<string, number> = {};
   const protections: Record<string, number> = {};
@@ -262,7 +265,7 @@ export async function sweepAgentLifecycle(env: Env, options: SweepOptions = {}) 
                                   AND cr.status IN ('queued','dispatched','running','blocked'))
                      )) AS liveChild
        FROM agents a
-      WHERE ${options.projectId ? 'a.project_id = ? AND ' : ''}a.id > ?
+      WHERE ${options.projectId ? 'a.project_id = ? AND ' : ''}1 = 1${actorClassPredicate} AND a.id > ?
       ORDER BY a.id
       LIMIT ?`,
   ).bind(

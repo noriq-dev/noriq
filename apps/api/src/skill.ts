@@ -91,6 +91,11 @@ copilot may roam between projects.
 Identity is assigned, not claimed. \`configure_agent\` updates your name, role, or project
 focus; it never creates an identity.
 
+Cursor clients should bind to the execution fleet instead of minting a throwaway copilot on
+every \`initialize\`. When you know the Cursor Cloud Agent id (\`bc-…\`), pass
+\`_meta["cursor/agent"]\` on MCP tool calls or the \`x-cursor-agent-id\` request header so
+Noriq reuses one \`session_copilot\` per agent run.
+
 ## Tool availability
 
 Every OAuth copilot session receives the full coordination catalog on every connection — catalog

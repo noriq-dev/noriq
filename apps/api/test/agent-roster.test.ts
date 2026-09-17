@@ -95,7 +95,7 @@ describe('live-first paginated agent rosters (PLNR-364)', () => {
     expect(body.agents[1]).toMatchObject({
       lifecycle: 'recent', live: false, lineageStatus: 'partial', lineageReason: 'execution_contract_pending',
     });
-    expect(body.counts).toMatchObject({ live: 1, recent: 1, historical: 226, total: 228 });
+    expect(body.counts).toMatchObject({ live: 1, recent: 1, historical: 225, total: 3 });
   });
 
   it('walks a large historical roster with stable bounded cursors and no duplicates', async () => {
@@ -139,7 +139,7 @@ describe('live-first paginated agent rosters (PLNR-364)', () => {
     expect(response.isError).toBe(false);
     expect(response.body.agents).toHaveLength(1);
     expect(response.body.agents[0]).toMatchObject({ id: 'agt_roster_live', lifecycle: 'live', live: true });
-    expect(response.body.counts).toMatchObject({ live: 1, recent: 1, historical: 226, total: 228 });
+    expect(response.body.counts).toMatchObject({ live: 1, recent: 1, historical: 225, total: 3 });
     expect(response.body.page).toMatchObject({ limit: 1, hasMore: true });
   });
 
@@ -152,7 +152,7 @@ describe('live-first paginated agent rosters (PLNR-364)', () => {
     expect(body.projects.find((project) => project.id === projectId)).toMatchObject({
       agentCount: 1,
       liveAgentCount: 1,
-      historicalAgentCount: 227,
+      historicalAgentCount: 2,
     });
   });
 

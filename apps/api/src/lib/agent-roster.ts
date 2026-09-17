@@ -15,6 +15,11 @@ export function projectVisibleAgentClause(alias = 'a'): string {
   return `(${alias}.project_id = ? OR ${alias}.id IN (SELECT claimed_by FROM tasks WHERE project_id = ? AND claimed_by IS NOT NULL))`;
 }
 
+/** Default operational counts and snapshots — excludes retired/archived/revoked rows (PLNR-568). */
+export function activeRosterAgentWhere(alias = 'a'): string {
+  return `${alias}.status != 'revoked' AND ${alias}.retired_at IS NULL AND ${alias}.archived_at IS NULL`;
+}
+
 export type AgentRosterOptions = {
   projectId?: string;
   ownerUserId?: string;
@@ -174,14 +179,16 @@ export async function listAgentRoster(env: Env, options: AgentRosterOptions) {
     live: row.lifecycle === 'live',
   }));
   const last = agents.at(-1);
-  const historical = byLifecycle.dormant + byLifecycle.retired + byLifecycle.archived + byLifecycle.revoked;
+  const operational = byLifecycle.live + byLifecycle.recent + byLifecycle.dormant;
+  const historical = byLifecycle.retired + byLifecycle.archived + byLifecycle.revoked;
   return {
     agents,
     counts: {
       live: byLifecycle.live,
       recent: byLifecycle.recent,
       historical,
-      total: Object.values(byLifecycle).reduce((sum, value) => sum + value, 0),
+      // Matches Active roster semantics: live + recent (+ dormant), not retired junk (PLNR-568).
+      total: operational,
       byLifecycle,
     },
     page: {
