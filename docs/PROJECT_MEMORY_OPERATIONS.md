@@ -124,9 +124,11 @@ npx wrangler secret put ATTACHMENT_UPLOAD_SECRET --config wrangler.production.js
 ```
 
 **Cut-over (coordination-only product):** New repository uploads via `@noriq-dev/runner` /
-`noriq-runner index-*` are **paused**. Read/Ask over **already-activated** generations continues.
-A non-daemon indexer is planned out of band; until then, operators activate or abort staged
-generations in Memory > Operations and rely on lexical/graph retrieval for code context.
+`noriq-runner index-*` are **paused**. The runner product is archived (read-only
+[github.com/noriq-dev/runner](https://github.com/noriq-dev/runner); do not install the CLI for new
+work). Read/Ask over **already-activated** generations continues. A non-daemon indexer is planned
+out of band; until then, operators activate or abort staged generations in Memory > Operations and
+rely on lexical/graph retrieval for code context.
 
 When ingest is available, the server must know the repository and an authorized checkout association
 before an upload can start. Register the repository key in project settings and opt in through
