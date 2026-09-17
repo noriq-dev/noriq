@@ -37,18 +37,19 @@ afterEach(() => {
 
 const button = (label: string) => [...container.querySelectorAll('button')].find((item) => item.textContent?.trim() === label);
 
-describe('actor lifecycle inventory (PLNR-368)', () => {
-  it('defaults to Active and exposes distinct Dormant and History views with server-side filters', async () => {
+describe('copilot lifecycle inventory', () => {
+  it('lists copilots only (no agents-vs-copilots toggle) and exposes Active / Dormant / History', async () => {
     mount(true, 'admin');
     await tick();
+    expect(container.textContent).toContain('Copilot lifecycle');
     expect(container.textContent).toContain('Active 3');
     expect(container.textContent).toContain('Dormant 1');
     expect(container.textContent).toContain('History 5');
-    expect(api.agents).toHaveBeenCalledWith('prj_1', 'agent', expect.objectContaining({ view: 'active', limit: 50 }));
+    expect(api.agents).toHaveBeenCalledWith(undefined, 'copilot', expect.objectContaining({ view: 'active', limit: 50 }));
 
     await act(async () => { button('Dormant 1')!.click(); });
     await tick();
-    expect(api.agents).toHaveBeenLastCalledWith('prj_1', 'agent', expect.objectContaining({ view: 'dormant' }));
+    expect(api.agents).toHaveBeenLastCalledWith(undefined, 'copilot', expect.objectContaining({ view: 'dormant' }));
   });
 
   it('surfaces bounded cleanup preview for project managers', async () => {
@@ -63,7 +64,7 @@ describe('actor lifecycle inventory (PLNR-368)', () => {
     });
     await act(async () => { button('dry run')!.click(); });
     expect(api.agentLifecycleSweep).toHaveBeenCalledWith('prj_1', false);
-    expect(container.textContent).toContain('DRY RUN · examined 4 actors / 3 presences / 0 Runners');
+    expect(container.textContent).toContain('DRY RUN · examined 4 actors / 3 presences');
     expect(container.textContent).toContain('reference probe passed');
   });
 

@@ -101,8 +101,4 @@ export interface Env {
    *  clear it after the repoint. Lives OUTSIDE the DB deliberately — the flag must not
    *  depend on the thing being cut over. See lib/maintenance.ts. */
   MAINTENANCE_MODE?: string;
-  /** Runner execution plane kill-switch (drop-runner Phase 1): any truthy value refuses runner
-   *  registration, dispatch, daemon WebSockets, and runner ingest with HTTP 410 while MCP
-   *  copilots and human coordination stay live. */
-  RUNNER_DISABLED?: string;
 }

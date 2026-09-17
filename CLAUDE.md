@@ -80,14 +80,13 @@ straight to D1** (e.g. the `/snapshot` endpoint); only writes cross into the DO.
 are the same `Actor` path — a human is just another actor. The others: `AgentSession` (per-agent
 notices cursor + presence) and `RateLimiter`.
 
-> **Runner cut-over:** The legacy execution plane (`RunnerHub`, `/ws/runner/:id`, run/job dispatch
-> REST, runner-spawned `kind: agent`) is being removed — it is not a product capability. Until the
-> removal PRs land, those code paths may still exist in the tree; do not extend them. Self-hosters:
-> stop `noriq-runner`, expect coordination-only; optional `RUNNER_DISABLED=1` rejects register/dispatch/WS
-> with `410` during staged cut-over. Keep the RFC 8628 **device grant** (generic headless OAuth),
-> **execution specs** on tasks, and **Project Memory** read/Ask; pause **runner CLI repository ingest**
-> only (alternate indexer is out of band). Never use wrangler `deleted_classes` to “remove” `RunnerHub`
-> — that wipes DO storage permanently.
+> **Runner cut-over (landed):** The legacy execution plane (`RunnerHub`, `/ws/runner/:id`, run/job
+> dispatch REST, runner-spawned `kind: agent`) is **removed** from the product surface. Self-hosters:
+> stop `noriq-runner`, expect coordination-only. Keep the RFC 8628 **device grant** (generic headless
+> OAuth), **execution specs** on tasks, and **Project Memory** read/Ask; pause **runner CLI repository
+> ingest** only (alternate indexer is out of band). Historical wrangler migration tag `v3` still
+> records `RunnerHub` — never use `deleted_classes` to “remove” it (that wipes DO storage permanently).
+> Remove any stale `RUNNER_HUB` **binding** from instance configs after deploy.
 
 **MCP server** — [apps/api/src/mcp.ts](apps/api/src/mcp.ts). Streamable HTTP via `@hono/mcp`, **stateless**:
 a fresh `McpServer` is built per request, bound to the authenticated agent. Two protocol eras share
@@ -109,9 +108,9 @@ A non-Grok legacy `initialize` with none of those still mints a UUID so Claude C
 copilot per chat; Grok (`User-Agent: grok-cli`, OAuth clientName/`clientInfo.name` `Grok`) uses
 `x-mcp-session-id` when present, otherwise the token fallback, because it re-initializes and
 DELETE's per tool call. DELETE of a `stateless:` or `grok:` session is a no-op. A `stateless:`
-copilot is all-projects (not pinned). See `lib/mcp-session-key.ts` (PLNR-552/557/558). Agents are **project-local** (except unscoped/token copilots and current holders) and carry a `kind`: **copilot**
-(human-authorized OAuth connection). Legacy **runner-spawned** `kind: agent` rows and reduced
-authority still exist in code during cut-over but are not part of the coordination product.
+copilot is all-projects (not pinned). See `lib/mcp-session-key.ts` (PLNR-552/557/558). Product actors are
+**copilots** (human-authorized OAuth connections and their sub-agents). Legacy runner-spawned
+`kind: agent` rows may remain in D1 history but are not minted or accepted on the MCP path.
 Auth lives in [auth.ts](apps/api/src/auth.ts) (agents: OAuth-only, no static keys) and
 [oauth.ts](apps/api/src/oauth.ts) (the AS: authz-code + PKCE/S256, DCR + CIMD client registration,
 plus the RFC 8628 device grant for headless MCP clients).

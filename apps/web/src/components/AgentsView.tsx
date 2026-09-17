@@ -1,4 +1,4 @@
-// Actor lifecycle inventory — live work first, durable history on demand.
+// Copilot lifecycle inventory — live work first, durable history on demand.
 import { useEffect, useMemo, useState } from 'react';
 import {
   api, type ApiAgent, type ApiAgentEvent, type ApiAgentLifecycleSweep, type ApiAgentRoster,
@@ -27,7 +27,6 @@ function ago(iso: string | null | undefined): string {
   return `${Math.round(s / 86400)}d ago`;
 }
 
-type Subject = 'agent' | 'copilot';
 type LifecycleView = 'active' | 'dormant' | 'history';
 
 const selectStyle = {
@@ -36,7 +35,6 @@ const selectStyle = {
 };
 
 export function AgentsView({ store }: { store: AppStore }) {
-  const [subject, setSubject] = useState<Subject>('agent');
   const [view, setView] = useState<LifecycleView>('active');
   const [agents, setAgents] = useState<ApiAgent[]>([]);
   const [users, setUsers] = useState<ApiUser[]>([]);
@@ -45,22 +43,21 @@ export function AgentsView({ store }: { store: AppStore }) {
   const [loadingMore, setLoadingMore] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [events, setEvents] = useState<ApiAgentEvent[]>([]);
-  const [projectScope, setProjectScope] = useState<'current' | 'all'>('current');
   const [ownerUserId, setOwnerUserId] = useState('');
   const [olderThanDays, setOlderThanDays] = useState('');
   const [retireReason, setRetireReason] = useState('');
   const [sweep, setSweep] = useState<ApiAgentLifecycleSweep | null>(null);
   const [operation, setOperation] = useState<string | null>(null);
   const isAdmin = store.user?.role === 'admin';
-  const canCleanCurrentProject = Boolean(store.currentPid && store.permissions.canManage && projectScope === 'current');
+  const canCleanCurrentProject = Boolean(store.currentPid && store.permissions.canManage);
 
   const activeBefore = olderThanDays
     ? new Date(Date.now() - Number(olderThanDays) * 86_400_000).toISOString()
     : undefined;
-  const scopedProjectId = projectScope === 'current' ? store.currentPid || undefined : undefined;
 
   const load = async (cursor?: string, append = false) => {
-    const result = await api.agents(scopedProjectId, subject, {
+    // Coordination-only: Agents page lists copilots (OAuth sessions), not runner-spawned agents.
+    const result = await api.agents(undefined, 'copilot', {
       view, ownerUserId: ownerUserId || undefined,
       retireReason: retireReason || undefined, activeBefore, cursor, limit: 50,
     });
@@ -75,7 +72,7 @@ export function AgentsView({ store }: { store: AppStore }) {
     const interval = setInterval(() => void load().catch(() => {}), 15_000);
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [store.modal, store.currentPid, subject, view, projectScope, ownerUserId, olderThanDays, retireReason]);
+  }, [store.modal, store.currentPid, view, ownerUserId, olderThanDays, retireReason]);
 
   useEffect(() => {
     if (isAdmin) void api.users().then((result) => setUsers(result.users)).catch(() => {});
@@ -111,7 +108,7 @@ export function AgentsView({ store }: { store: AppStore }) {
   const runSweep = async (apply: boolean) => {
     if (!store.currentPid || !canCleanCurrentProject) return;
     if (apply && !(await confirm(
-      'Apply one bounded lifecycle sweep batch?\n\nThis can retire inactive actors, archive retained history, and purge only verified-safe expired presence rows. Durable actor history is never deleted.',
+      'Apply one bounded lifecycle sweep batch?\n\nThis can retire inactive copilots, archive retained history, and purge only verified-safe expired presence rows. Durable actor history is never deleted.',
     ))) return;
     setOperation('sweep');
     try { setSweep(await api.agentLifecycleSweep(store.currentPid, apply)); await load(); }
@@ -124,15 +121,14 @@ export function AgentsView({ store }: { store: AppStore }) {
       <div style={{ overflowY: 'auto', padding: '18px 22px', minWidth: 0 }}>
         <div style={{ maxWidth: 980, margin: '0 auto' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
-            <SectionLabel>Actor lifecycle · {counts.total} recorded</SectionLabel>
+            <SectionLabel>Copilot lifecycle · {counts.total} recorded</SectionLabel>
             <div style={{ flex: 1 }} />
             <span style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-faint)' }}>
-              live state is presence/heartbeat evidence; history remains durable attribution
+              live state is presence evidence; history remains durable attribution
             </span>
           </div>
 
           <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, marginBottom: 10 }}>
-            <Segmented values={['agent', 'copilot']} selected={subject} onSelect={(value) => setSubject(value as Subject)} />
             <Segmented
               values={['active', 'dormant', 'history']}
               labels={{ active: `Active ${counts.active}`, dormant: `Dormant ${counts.dormant}`, history: `History ${counts.history}` }}
@@ -142,12 +138,6 @@ export function AgentsView({ store }: { store: AppStore }) {
           </div>
 
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7, marginBottom: 14 }}>
-            {subject !== 'copilot' && (
-              <Select variant="micro" aria-label="Project scope" style={selectStyle} value={projectScope} onChange={(event) => setProjectScope(event.target.value as 'current' | 'all')}>
-                <option value="current">current project</option>
-                {isAdmin && <option value="all">all projects</option>}
-              </Select>
-            )}
             {isAdmin && (
               <Select variant="micro" aria-label="Owner" style={selectStyle} value={ownerUserId} onChange={(event) => setOwnerUserId(event.target.value)}>
                 <option value="">all owners</option>
@@ -160,9 +150,9 @@ export function AgentsView({ store }: { store: AppStore }) {
             </Select>
             {view === 'history' && (
               <Select variant="micro" aria-label="Retirement reason" style={selectStyle} value={retireReason} onChange={(event) => setRetireReason(event.target.value)}>
-                <option value="">all retirement reasons</option><option value="runner_offboarded">offboarded</option>
-                <option value="runner_offline_retention">offline retention elapsed</option><option value="run_terminal">run terminal</option>
-                <option value="session_inactive">session inactive</option><option value="connection_authorization_ended">authorization ended</option>
+                <option value="">all retirement reasons</option>
+                <option value="session_inactive">session inactive</option>
+                <option value="connection_authorization_ended">authorization ended</option>
                 <option value="administrator_revoked">administrator revoked</option>
               </Select>
             )}
@@ -171,13 +161,13 @@ export function AgentsView({ store }: { store: AppStore }) {
           {canCleanCurrentProject && (
             <div style={{ padding: '10px 12px', marginBottom: 12, borderRadius: 9, border: '1px solid var(--w-07)', background: 'var(--w-02)', fontSize: 11 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <b>Project cleanup preview</b><span style={{ color: 'var(--text-dim)' }}>actors and presence rows · bounded and dry-run by default</span><div style={{ flex: 1 }} />
+                <b>Project cleanup preview</b><span style={{ color: 'var(--text-dim)' }}>copilots and presence rows · bounded and dry-run by default</span><div style={{ flex: 1 }} />
                 <Button variant="ghost" disabled={operation === 'sweep'} onClick={() => void runSweep(false)}>dry run</Button>
                 <Button variant="danger" disabled={operation === 'sweep'} onClick={() => void runSweep(true)}>apply one batch</Button>
               </div>
               {sweep && (
                 <div style={{ marginTop: 7, fontFamily: 'var(--mono)', fontSize: 10, color: sweep.errors.length ? 'var(--amber)' : 'var(--text-dim)' }}>
-                  {sweep.dryRun ? 'DRY RUN' : 'APPLIED'} · examined {sweep.examined.actors} actors / {sweep.examined.presences} presences / {sweep.examined.runners} Runners
+                  {sweep.dryRun ? 'DRY RUN' : 'APPLIED'} · examined {sweep.examined.actors} actors / {sweep.examined.presences} presences
                   {' '}· {Object.values(sweep.transitions).reduce((sum, count) => sum + count, 0)} transition(s)
                   {' '}· reference probe {sweep.referenceCheck.complete ? 'passed' : 'blocked'} · {sweep.complete ? 'complete' : 'more batches available'}
                 </div>
@@ -194,7 +184,7 @@ export function AgentsView({ store }: { store: AppStore }) {
             ))}
             {!agents.length && (
               <div style={{ padding: 40, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-dim)' }}>
-                no {view} {subject}s in this scope
+                no {view} copilots in this scope
               </div>
             )}
             {nextCursor && <Button variant="ghost" disabled={loadingMore} onClick={() => void loadMore()} style={{ alignSelf: 'center', marginTop: 6 }}>{loadingMore ? 'loading…' : 'load more'}</Button>}
@@ -233,7 +223,7 @@ function ActorRow({ agent, allAgents, selected, isAdmin, busy, onSelect, onActio
   agent: ApiAgent; allAgents: ApiAgent[]; selected: boolean; isAdmin: boolean; busy: boolean;
   onSelect: () => void; onAction: (key: string, action: () => Promise<unknown>) => Promise<void>;
 }) {
-  const child = agent.kind === 'copilot' && !!agent.parentAgentId && allAgents.some((parent) => parent.id === agent.parentAgentId);
+  const child = !!agent.parentAgentId && allAgents.some((parent) => parent.id === agent.parentAgentId);
   const historical = ['retired', 'archived', 'revoked'].includes(agent.lifecycle);
   const why = agent.lifecycle === 'live' ? 'fresh online/working presence'
     : agent.lifecycle === 'recent' ? 'recent activity, no fresh live presence'
@@ -251,7 +241,7 @@ function ActorRow({ agent, allAgents, selected, isAdmin, busy, onSelect, onActio
         {agent.role === 'orchestrator' && <MonoTag color="var(--accent)" bg="rgba(198,242,78,.12)" size={9}>ORCH</MonoTag>}
         {agent.lineageStatus !== 'complete' && <MonoTag color="var(--amber)" bg="rgba(245,166,35,.10)" size={9}>LINEAGE {agent.lineageStatus.toUpperCase()}</MonoTag>}
       </div>
-      <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', marginTop: 2 }}>{why} · activity {ago(agent.activityAt)} · {agent.totalClaims} claims · {agent.ownerName ?? 'owner unknown'}{agent.runnerId ? ` · Runner ${agent.runnerId}` : ''}</div>
+      <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', marginTop: 2 }}>{why} · activity {ago(agent.activityAt)} · {agent.totalClaims} claims · {agent.ownerName ?? 'owner unknown'}</div>
     </div>
     {agent.heldTasks > 0 && <MonoTag color="var(--blue)" bg="rgba(76,157,255,.12)" size={10}>{agent.heldTasks} held</MonoTag>}
     {isAdmin && agent.lifecycle === 'archived' && <Action busy={busy} label="restore visibility" onClick={() => onAction(agent.id, () => api.restoreAgentVisibility(agent.id))} />}

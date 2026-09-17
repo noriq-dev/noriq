@@ -299,7 +299,7 @@ signals, not write quotas.
 | Backup unavailable | `FILES` binding, bucket existence, Worker R2 permission | Rebind the correct environment-specific bucket, deploy, and trigger an on-demand backup |
 | Restore refused before staging | Format/schema version, complete manifest inventory, chunk size/count/checksum, project prefix | Choose a compatible complete snapshot; do not edit checksums to force acceptance |
 | Restore validated but semantic results stale | `vectorDirty`, `AI`, `VECTORIZE` capability | Rebuild memory vectors; lexical/graph results remain authoritative meanwhile |
-| Ingest capability mint returns 404 | Repository registration, checkout association, or runner cut-over (`RUNNER_DISABLED`) | Repair project settings; do not reuse another repository key |
+| Ingest capability mint returns 404 | Repository registration / checkout association, or runner ingest removed (coordination-only) | Repair project settings; do not reuse another repository key |
 | Ingest capability mint returns 403 | OAuth token's current project access | Grant the connection the required project role or reconnect under the correct account |
 | Ingest capability mint returns 503 | Signing secret absent | Set `ATTACHMENT_UPLOAD_SECRET` and redeploy |
 | Generation remains `staged` | Older server returned no activation receipt, or recovery state remains after a conflict | Review in Memory > Operations and activate or abort explicitly |

@@ -45,7 +45,6 @@ import pkg from '../package.json';
 import { issueTokens, metadataRoutes, oauth } from './oauth';
 import { demoLocksDown } from './lib/demo';
 import { isMaintenanceMode, MAINTENANCE_MESSAGE } from './lib/maintenance';
-import { isRunnerDisabled, runnerDisabledBody, RUNNER_DISABLED_MESSAGE } from './lib/runner-disabled';
 import { copilotSessionContextFromMessages, endCopilotSession } from './lib/copilot-session';
 import { isDurableCopilotKey, resolveCopilotSessionKey } from './lib/mcp-session-key';
 import { errorPage, wantsHtml } from './errorPage';
@@ -184,13 +183,6 @@ const demoDenied = (c: Context<AppContext>): Response | null =>
     ? c.json({ error: 'This action is disabled in the demo.' }, 403)
     : null;
 
-/** Runner execution plane off (drop-runner Phase 1): 410 for daemon registration/dispatch/WS. */
-const runnerPlaneDenied = async (c: Context<AppContext>): Promise<Response | null> => {
-  if (!isRunnerDisabled(c.env)) return null;
-  if (c.req.method !== 'GET' && c.req.method !== 'HEAD') await c.req.text().catch(() => '');
-  return c.json(runnerDisabledBody(), 410);
-};
-
 // Gate every project-scoped route (PLNR-92): being signed in is NOT enough — you
 // must be able to REACH this project. Mirrors VISIBILITY_WHERE (owner, a member of
 // its group, or an admin). Returns 404 (not 403) so project-id existence doesn't
@@ -314,7 +306,6 @@ app.get('/api/health', async (c) => {
     version: pkg.version,
     // Surfaced so the dashboard can show a write-frozen banner (PLNR-166).
     maintenance: isMaintenanceMode(c.env),
-    runnerDisabled: isRunnerDisabled(c.env),
   });
 });
 
@@ -783,7 +774,10 @@ app.get('/api/projects', userAuth, async (c) => {
   // PLNR-83: admins see only their own projects by default (owning all of them is
   // noise); `?scope=all` opts into the admin-wide view. Non-admins always get the
   // user-scoped set. `admin` in the response tells the UI it may offer admin view.
+  // PLNR-567: default lists are active only; `?archived=1` returns archived projects
+  // so operators can restore them (mirrors docs/tasks includeArchived).
   const adminAll = u.role === 'admin' && c.req.query('scope') === 'all';
+  const statusFilter = c.req.query('archived') === '1' ? "p.status = 'archived'" : "p.status = 'active'";
   const select = `SELECT p.id, p.key, p.name, p.description, p.status, p.repo_url AS repoUrl, p.group_id AS groupId, p.public,
             p.owner_user_id AS ownerUserId, ou.name AS ownerName,
             (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'in_progress') AS liveTasks,
@@ -792,8 +786,8 @@ app.get('/api/projects', userAuth, async (c) => {
             (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'done') AS doneTasks
      FROM projects p LEFT JOIN users ou ON ou.id = p.owner_user_id`;
   const stmt = adminAll
-    ? c.env.DB.prepare(`${select} WHERE p.status = 'active' ORDER BY p.created_at`)
-    : c.env.DB.prepare(`${select} WHERE p.status = 'active' AND ${USER_PROJECT_WHERE} ORDER BY p.created_at`).bind(u.id);
+    ? c.env.DB.prepare(`${select} WHERE ${statusFilter} ORDER BY p.created_at`)
+    : c.env.DB.prepare(`${select} WHERE ${statusFilter} AND ${USER_PROJECT_WHERE} ORDER BY p.created_at`).bind(u.id);
   const liveCutoff = new Date(Date.now() - agentLifecycleSweepConfig(c.env).onlineSeconds * 1_000).toISOString();
   const countsStmt = c.env.DB.prepare(
     `SELECT p.id,
@@ -804,7 +798,7 @@ app.get('/api/projects', userAuth, async (c) => {
                      THEN 1 ELSE 0 END) AS liveAgentCount,
             COUNT(a.id) AS totalAgentCount
        FROM projects p LEFT JOIN agents a ON a.project_id = p.id
-      WHERE p.status = 'active' AND ${adminAll ? '1 = 1' : USER_PROJECT_WHERE}
+      WHERE ${statusFilter} AND ${adminAll ? '1 = 1' : USER_PROJECT_WHERE}
       GROUP BY p.id`,
   ).bind(adminAll ? '' : u.id, liveCutoff);
   const [{ results }, { results: countRows }] = await Promise.all([
@@ -2876,6 +2870,27 @@ app.post('/api/projects/:pid/tasks/:tid/proposal/reject', userAuth, async (c) =>
 
 app.delete('/api/projects/:pid/tasks/:tid', userAuth, async (c) =>
   c.json(await room(c.env, c.req.param('pid')!).deleteTask(c.req.param('pid')!, humanActor(c), c.req.param('tid')!)));
+
+// Soft-archive / restore a project (PLNR-567) — owner or admin. Data stays; default
+// lists hide archived projects. Demo refuse matches delete/meta.
+app.post('/api/projects/:pid/archive', userAuth, async (c) => {
+  const denied = demoDenied(c);
+  if (denied) return denied;
+  const pid = c.req.param('pid')!;
+  const access = await resolveProjectAccess(c.env.DB, c.var.user!.id, pid, { allowAdminOverride: true });
+  if (!access.exists || !projectRoleAllows(access.role, 'view')) return c.json({ error: 'not found' }, 404);
+  if (!projectRoleAllows(access.role, 'own')) return c.json({ error: 'project owner role required', code: 'project_action_denied', action: 'own' }, 403);
+  return c.json(await room(c.env, pid).setProjectArchived(pid, humanActor(c), true));
+});
+app.post('/api/projects/:pid/restore', userAuth, async (c) => {
+  const denied = demoDenied(c);
+  if (denied) return denied;
+  const pid = c.req.param('pid')!;
+  const access = await resolveProjectAccess(c.env.DB, c.var.user!.id, pid, { allowAdminOverride: true });
+  if (!access.exists || !projectRoleAllows(access.role, 'view')) return c.json({ error: 'not found' }, 404);
+  if (!projectRoleAllows(access.role, 'own')) return c.json({ error: 'project owner role required', code: 'project_action_denied', action: 'own' }, 403);
+  return c.json(await room(c.env, pid).setProjectArchived(pid, humanActor(c), false));
+});
 
 // Whole-project delete — owner or admin only. Irreversible.
 app.delete('/api/projects/:pid', userAuth, async (c) => {

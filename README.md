@@ -72,13 +72,14 @@ Noriq no longer ships an in-product **execution plane** (no `noriq-runner` daemo
 dispatch from Mission Control). Self-hosters who previously paired a runner should **stop the
 daemon and uninstall `@noriq-dev/runner`**. The former runner codebase lives in the archived,
 read-only repository [noriq-dev/runner](https://github.com/noriq-dev/runner) (final npm release
-**0.19.1**; operators should run `npm deprecate` per that repo's `docs/npm-deprecate.md`). New
-runner registration, dispatch, and the `/ws/runner/:id` channel are rejected (`410 Gone` when
-`RUNNER_DISABLED=1` is set, or removed entirely once the cut-over PRs land). **Device OAuth**,
+**0.19.1**; operators should run `npm deprecate` per that repo's `docs/npm-deprecate.md`).
+`RunnerHub`, `/ws/runner`, and runner REST are **gone** from the Worker (historical D1 tables may
+remain; do not use wrangler `deleted_classes` on the old DO class). **Device OAuth**,
 **execution specs on tasks**, and **Project Memory read/Ask** on already-indexed data remain;
-**repository ingest via the runner CLI is paused** until a non-daemon indexer exists. Historical
-`runs` / `runner_jobs` rows may remain in D1 backups but are not part of the product surface.
+**repository ingest via the runner CLI is paused** until a non-daemon indexer exists. The Agents
+page lists **copilots only**. See [docs/RUNNER_CUTOVER.md](docs/RUNNER_CUTOVER.md).
 Landing-site marketing may lag this repo until a separate update.
+
 
 > Using `workers.dev` instead of a custom domain? Delete the `routes` line from
 > `wrangler.production.jsonc` (or just deploy with the generic `wrangler.jsonc`, filling

@@ -150,5 +150,5 @@ notices piggyback), OAuth 2.1 copilot auth + human sessions, execution specs on 
 the live SPA (login, REST snapshots, WS invalidation, Board/Plans/Docs/Memory/Ask,
 human actions incl. force-release and comment resolution), GitHub webhook PR-state
 reflection, and /skill.md. Worker tests cover coordination end-to-end through the real
-MCP endpoint. Runner dispatch and `RunnerHub` are legacy and not part of the architecture
-going forward.
+MCP endpoint. The former runner execution plane (`RunnerHub`, daemon dispatch) has been
+removed; Noriq is coordination-only.

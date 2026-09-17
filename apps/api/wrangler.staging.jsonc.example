@@ -12,7 +12,7 @@
 // WHAT MUST DIFFER FROM PRODUCTION, AND WHY
 //
 //  * `name` — Durable Object namespaces are created per worker SCRIPT. A different name is what
-//    gives staging its own ProjectRoom/ProjectMemory/AgentSession/RunnerHub instances. Sharing the
+//    gives staging its own ProjectRoom/ProjectMemory/AgentSession instances. Sharing the
 //    name would put staging traffic on prod's DOs, which is unrecoverable, not just messy.
 //    (Note: namespace LABELS are minted from the worker name at creation and can never be renamed
 //    — cosmetic only. Never "fix" one with a deleted_classes migration; that wipes the storage.)
@@ -35,14 +35,11 @@
   "compatibility_flags": ["nodejs_compat"],
 
   // Defaults to noriq-staging.workers.dev — no DNS work, and it is a real HTTPS origin, so
-  // OAuth/MCP (`claude mcp add`) and the runner daemon all work against it unchanged.
+  // OAuth/MCP (`claude mcp add`) work against it unchanged.
   // For a custom hostname instead, uncomment and set PUBLIC_ORIGIN to match:
   // "routes": [{ "pattern": "staging.example.com", "custom_domain": true }],
 
   "vars": {
-    // Drop-runner cutover: set to "1" to refuse runner registration/dispatch/WS (410) while MCP
-    // copilots stay live. Pair with POST /api/admin/runner-plane/drain — see docs/RUNNER_CUTOVER.md.
-    // "RUNNER_DISABLED": "1",
     // Used for links in out-of-band notifications, where there is no request origin to read.
     "PUBLIC_ORIGIN": "https://noriq-staging.<your-subdomain>.workers.dev",
     "ASK_MAX_OUTPUT_TOKENS": "8192",
