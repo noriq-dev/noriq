@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.79.0 - 2026-09-17
+
+### Repository indexing off by default (PLNR-573)
+
+Git-checkout repository index ingest and operator generation controls are gated behind `REPOSITORY_INDEXING=1` (legacy/tests only). Project Memory, docs, and episode ingest stay. Memory Ops UI reports the capability honestly; `/api/memory-ingest` index purpose returns 410 unless the gate is on.
+
+### Also
+
+- Modularize `deleteProject` and add a cascade guard in CI (PLNR-560).
+
 ## 0.78.0 - 2026-09-17
 
 ### Copilot lifecycle + Cursor identity (PLNR-568, PLNR-569)
