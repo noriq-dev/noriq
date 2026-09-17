@@ -11,11 +11,7 @@ import {
   activePhaseIndex,
   PLAN_ARCHIVE_TASK_CANCELLATION_OPTIONS,
   PLAN_DELETE_TASK_DISPOSITION_OPTIONS,
-  isMissionExecutionProfile,
-  planDispatchRunCounts,
-  supportsSingleRootMission,
 } from './PlansView';
-import { advertisedWorkflow } from '../api';
 
 const PHASES = [{ id: 'ph1' }, { id: 'ph2' }];
 const LINKS = [
@@ -76,17 +72,6 @@ describe('activePhaseIndex (PLNR-229)', () => {
   });
 });
 
-describe('planDispatchRunCounts (PLNR-477)', () => {
-  it('surfaces gated runs separately from failed runs', () => {
-    expect(planDispatchRunCounts([
-      { taskId: 'g', runId: 'run_g', runStatus: 'gated' },
-      { taskId: 'f', runId: 'run_f', runStatus: 'failed' },
-      { taskId: 'd', runId: 'run_d', runStatus: 'done' },
-      { taskId: 'w', runId: null, runStatus: null },
-    ])).toEqual({ waiting: 1, running: 0, done: 1, gated: 1, failed: 1 });
-  });
-});
-
 describe('plan lifecycle task choices (PLNR-480)', () => {
   it('offers archive-only, open-task cancellation, and all-task cancellation', () => {
     expect(PLAN_ARCHIVE_TASK_CANCELLATION_OPTIONS).toEqual([
@@ -102,30 +87,5 @@ describe('plan lifecycle task choices (PLNR-480)', () => {
       { value: 'cancel', label: 'Cancel and keep tasks' },
       { value: 'delete', label: 'Permanently delete tasks' },
     ]);
-  });
-});
-
-describe('single-root mission dispatch choice (PLNR-491)', () => {
-  it('requires an explicit rich build workflow advertising mission.v2', () => {
-    expect(supportsSingleRootMission(advertisedWorkflow({
-      name: 'mission', base: 'build', capabilities: ['mission.v2'],
-    }))).toBe(true);
-    expect(supportsSingleRootMission(advertisedWorkflow({
-      name: 'ordinary', base: 'build', capabilities: [],
-    }))).toBe(false);
-    expect(supportsSingleRootMission(advertisedWorkflow('mission-by-name-only'))).toBe(false);
-  });
-
-  it('accepts only resolved healthy attested profiles with an effective identity', () => {
-    const profile = {
-      id: 'exact', declarationFingerprint: 'decl', effectiveFingerprint: 'effective',
-      resolution: 'resolved' as const, health: 'healthy' as const, attestationCapable: true,
-      observedAt: new Date().toISOString(), generation: 1,
-      capacity: { maxConcurrency: 1, freeSlots: 1 },
-    };
-    expect(isMissionExecutionProfile(profile)).toBe(true);
-    expect(isMissionExecutionProfile({ ...profile, health: 'degraded' })).toBe(false);
-    expect(isMissionExecutionProfile({ ...profile, effectiveFingerprint: null })).toBe(false);
-    expect(isMissionExecutionProfile({ ...profile, attestationCapable: false })).toBe(false);
   });
 });

@@ -52,7 +52,7 @@ afterEach(() => {
 });
 
 describe('Plans phone composition', () => {
-  it('keeps lifecycle, phases, task navigation, Jobs dispatch, and plan docs in the narrow layout', () => {
+  it('keeps lifecycle, phases, task navigation, and plan docs in the narrow layout', () => {
     const store = mobilePlanStore();
     container = document.createElement('div');
     document.body.appendChild(container);
@@ -72,11 +72,6 @@ describe('Plans phone composition', () => {
 
     act(() => container.querySelector<HTMLElement>('.plan-task-row')!.click());
     expect(store.actions.openTask).toHaveBeenCalledWith('task_1');
-
-    const jobs = [...container.querySelectorAll<HTMLButtonElement>('button')]
-      .find((button) => button.textContent?.includes('dispatch from Jobs'))!;
-    act(() => jobs.click());
-    expect(store.actions.setView).toHaveBeenCalledWith('runs');
 
     act(() => container.querySelector<HTMLElement>('.plan-doc-header')!.click());
     expect(container.querySelector('.plan-doc-body')?.textContent).toContain('Mobile readers can open this.');

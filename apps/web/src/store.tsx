@@ -97,10 +97,10 @@ export function eventToVM(e: ApiSnapshot['events'][number]): EventVM {
   return { id: e.id, t: timeOf(e.createdAt), createdAt: e.createdAt, actor, actorKind: e.actorKind, verb, subject, taskId, contentTarget, dot };
 }
 
-const VIEWS: ViewId[] = ['home', 'control', 'graph', 'intelligence', 'board', 'plans', 'roadmap', 'review', 'docs', 'ask', 'agents', 'runs', 'settings', 'project-settings', 'admin', 'memory', 'more'];
+const VIEWS: ViewId[] = ['home', 'control', 'graph', 'intelligence', 'board', 'plans', 'roadmap', 'review', 'docs', 'ask', 'agents', 'settings', 'project-settings', 'admin', 'memory', 'more'];
 const UI_SURFACES = new Set<ApiUiSurface>([
   'control', 'graph', 'intelligence', 'board', 'plans', 'roadmap',
-  'review', 'docs', 'agents', 'runs', 'project-settings', 'memory',
+  'review', 'docs', 'agents', 'project-settings', 'memory',
 ]);
 
 /** Global views have no project read model. Project views map one-to-one to the API's
@@ -115,15 +115,23 @@ export function safeDecode(s: string): string {
   try { return decodeURIComponent(s); } catch { return s; }
 }
 
+/** Legacy Jobs / runs deep links land on the board until bookmarks expire. */
+function normalizeLegacyRunsView(view: string | undefined): ViewId | undefined {
+  if (view === 'runs') return 'board';
+  return view as ViewId | undefined;
+}
+
 export function parseUrl(): { pid: string | null; view: ViewId; task: string | null } {
   const m = location.pathname.match(/^\/p\/([^/]+)(?:\/([a-z]+))?/);
+  const queryView = new URLSearchParams(location.search).get('view');
+  const pathSegment = normalizeLegacyRunsView(m?.[2]) ?? (queryView === 'runs' ? 'board' : undefined);
   const view = location.pathname === '/settings'
     ? 'settings'
     : location.pathname === '/ask'
       ? 'ask'
       : m?.[2] === 'settings'
         ? 'project-settings'
-        : (m?.[2] as ViewId | undefined);
+        : pathSegment;
   return {
     pid: m?.[1] ? safeDecode(m[1]) : null,
     view: view && VIEWS.includes(view) ? view : m ? 'control' : 'home',

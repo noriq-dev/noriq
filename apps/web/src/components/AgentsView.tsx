@@ -2,7 +2,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   api, type ApiAgent, type ApiAgentEvent, type ApiAgentLifecycleSweep, type ApiAgentRoster,
-  type ApiRunner, type ApiRunnerRoster, type ApiUser,
+  type ApiUser,
 } from '../api';
 import type { AppStore } from '../store';
 import { initials } from '../design';
@@ -27,7 +27,7 @@ function ago(iso: string | null | undefined): string {
   return `${Math.round(s / 86400)}d ago`;
 }
 
-type Subject = 'agent' | 'copilot' | 'runner';
+type Subject = 'agent' | 'copilot';
 type LifecycleView = 'active' | 'dormant' | 'history';
 
 const selectStyle = {
@@ -39,18 +39,14 @@ export function AgentsView({ store }: { store: AppStore }) {
   const [subject, setSubject] = useState<Subject>('agent');
   const [view, setView] = useState<LifecycleView>('active');
   const [agents, setAgents] = useState<ApiAgent[]>([]);
-  const [runners, setRunners] = useState<ApiRunner[]>([]);
-  const [runnerChoices, setRunnerChoices] = useState<ApiRunner[]>([]);
   const [users, setUsers] = useState<ApiUser[]>([]);
   const [agentCounts, setAgentCounts] = useState<ApiAgentRoster['counts'] | null>(null);
-  const [runnerCounts, setRunnerCounts] = useState<ApiRunnerRoster['counts'] | null>(null);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [events, setEvents] = useState<ApiAgentEvent[]>([]);
   const [projectScope, setProjectScope] = useState<'current' | 'all'>('current');
   const [ownerUserId, setOwnerUserId] = useState('');
-  const [runnerId, setRunnerId] = useState('');
   const [olderThanDays, setOlderThanDays] = useState('');
   const [retireReason, setRetireReason] = useState('');
   const [sweep, setSweep] = useState<ApiAgentLifecycleSweep | null>(null);
@@ -64,18 +60,8 @@ export function AgentsView({ store }: { store: AppStore }) {
   const scopedProjectId = projectScope === 'current' ? store.currentPid || undefined : undefined;
 
   const load = async (cursor?: string, append = false) => {
-    if (subject === 'runner') {
-      const result = await api.runners({
-        all: isAdmin, projectId: scopedProjectId, ownerUserId: ownerUserId || undefined,
-        view, retireReason: retireReason || undefined, activeBefore, cursor, limit: 50,
-      });
-      setRunners((current) => append ? [...current, ...result.runners] : result.runners);
-      setRunnerCounts(result.counts);
-      setNextCursor(result.page.nextCursor);
-      return;
-    }
     const result = await api.agents(scopedProjectId, subject, {
-      view, runnerId: runnerId || undefined, ownerUserId: ownerUserId || undefined,
+      view, ownerUserId: ownerUserId || undefined,
       retireReason: retireReason || undefined, activeBefore, cursor, limit: 50,
     });
     setAgents((current) => append ? [...current, ...result.agents] : result.agents);
@@ -89,28 +75,23 @@ export function AgentsView({ store }: { store: AppStore }) {
     const interval = setInterval(() => void load().catch(() => {}), 15_000);
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [store.modal, store.currentPid, subject, view, projectScope, ownerUserId, runnerId, olderThanDays, retireReason]);
+  }, [store.modal, store.currentPid, subject, view, projectScope, ownerUserId, olderThanDays, retireReason]);
 
   useEffect(() => {
     if (isAdmin) void api.users().then((result) => setUsers(result.users)).catch(() => {});
-    void api.runners({ all: isAdmin, limit: 100 }).then((result) => setRunnerChoices(result.runners)).catch(() => {});
   }, [isAdmin]);
 
   useEffect(() => {
-    if (selected && subject !== 'runner') void api.agentEvents(selected).then((r) => setEvents(r.events)).catch(() => setEvents([]));
+    if (selected) void api.agentEvents(selected).then((r) => setEvents(r.events)).catch(() => setEvents([]));
     else setEvents([]);
-  }, [selected, subject]);
+  }, [selected]);
 
-  const counts = useMemo(() => subject === 'runner'
-    ? {
-      active: runnerCounts?.active ?? 0, dormant: runnerCounts?.dormant ?? 0,
-      history: runnerCounts?.historical ?? 0, total: runnerCounts?.total ?? 0,
-    }
-    : {
-      active: (agentCounts?.live ?? 0) + (agentCounts?.recent ?? 0),
-      dormant: agentCounts?.byLifecycle.dormant ?? 0,
-      history: agentCounts?.historical ?? 0, total: agentCounts?.total ?? 0,
-    }, [subject, runnerCounts, agentCounts]);
+  const counts = useMemo(() => ({
+    active: (agentCounts?.live ?? 0) + (agentCounts?.recent ?? 0),
+    dormant: agentCounts?.byLifecycle.dormant ?? 0,
+    history: agentCounts?.historical ?? 0,
+    total: agentCounts?.total ?? 0,
+  }), [agentCounts]);
   const sel = agents.find((agent) => agent.id === selected) ?? null;
 
   const reloadAfter = async (key: string, action: () => Promise<unknown>) => {
@@ -151,7 +132,7 @@ export function AgentsView({ store }: { store: AppStore }) {
           </div>
 
           <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, marginBottom: 10 }}>
-            <Segmented values={['agent', 'copilot', 'runner']} selected={subject} onSelect={(value) => setSubject(value as Subject)} />
+            <Segmented values={['agent', 'copilot']} selected={subject} onSelect={(value) => setSubject(value as Subject)} />
             <Segmented
               values={['active', 'dormant', 'history']}
               labels={{ active: `Active ${counts.active}`, dormant: `Dormant ${counts.dormant}`, history: `History ${counts.history}` }}
@@ -171,12 +152,6 @@ export function AgentsView({ store }: { store: AppStore }) {
               <Select variant="micro" aria-label="Owner" style={selectStyle} value={ownerUserId} onChange={(event) => setOwnerUserId(event.target.value)}>
                 <option value="">all owners</option>
                 {users.map((user) => <option key={user.id} value={user.id}>{user.name}</option>)}
-              </Select>
-            )}
-            {subject === 'agent' && (
-              <Select variant="micro" aria-label="Runner" style={selectStyle} value={runnerId} onChange={(event) => setRunnerId(event.target.value)}>
-                <option value="">all Runners</option>
-                {runnerChoices.map((runner) => <option key={runner.id} value={runner.id}>{runner.label}</option>)}
               </Select>
             )}
             <Select variant="micro" aria-label="Actor age" style={selectStyle} value={olderThanDays} onChange={(event) => setOlderThanDays(event.target.value)}>
@@ -211,17 +186,15 @@ export function AgentsView({ store }: { store: AppStore }) {
           )}
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {subject === 'runner'
-              ? runners.map((runner) => <RunnerRow key={runner.id} runner={runner} busy={operation === runner.id} onAction={reloadAfter} />)
-              : agents.map((agent) => (
-                <ActorRow
-                  key={agent.id} agent={agent} allAgents={agents} selected={selected === agent.id} isAdmin={isAdmin}
-                  busy={operation === agent.id} onSelect={() => setSelected(selected === agent.id ? null : agent.id)} onAction={reloadAfter}
-                />
-              ))}
-            {((subject === 'runner' && !runners.length) || (subject !== 'runner' && !agents.length)) && (
+            {agents.map((agent) => (
+              <ActorRow
+                key={agent.id} agent={agent} allAgents={agents} selected={selected === agent.id} isAdmin={isAdmin}
+                busy={operation === agent.id} onSelect={() => setSelected(selected === agent.id ? null : agent.id)} onAction={reloadAfter}
+              />
+            ))}
+            {!agents.length && (
               <div style={{ padding: 40, textAlign: 'center', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-dim)' }}>
-                no {view} {subject === 'runner' ? 'Runners' : `${subject}s`} in this scope
+                no {view} {subject}s in this scope
               </div>
             )}
             {nextCursor && <Button variant="ghost" disabled={loadingMore} onClick={() => void loadMore()} style={{ alignSelf: 'center', marginTop: 6 }}>{loadingMore ? 'loading…' : 'load more'}</Button>}
@@ -284,25 +257,6 @@ function ActorRow({ agent, allAgents, selected, isAdmin, busy, onSelect, onActio
     {isAdmin && agent.lifecycle === 'archived' && <Action busy={busy} label="restore visibility" onClick={() => onAction(agent.id, () => api.restoreAgentVisibility(agent.id))} />}
     {isAdmin && (agent.lifecycle === 'retired' || agent.lifecycle === 'revoked') && <Action busy={busy} label="archive" onClick={() => onAction(agent.id, () => api.archiveAgent(agent.id))} />}
     {isAdmin && !['revoked', 'archived'].includes(agent.lifecycle) && <Action danger busy={busy} label="revoke" onClick={async () => { if (await confirm(`Revoke ${agent.name}? Its credential and live presence will end.`)) await onAction(agent.id, () => api.revokeAgent(agent.id)); }} />}
-  </div>;
-}
-
-function RunnerRow({ runner, busy, onAction }: { runner: ApiRunner; busy: boolean; onAction: (key: string, action: () => Promise<unknown>) => Promise<void> }) {
-  const lifecycle = runner.lifecycle ?? (runner.status === 'online' ? 'active' : runner.status === 'offboarded' ? 'retired' : 'dormant');
-  const why = lifecycle === 'active' ? 'fresh heartbeat'
-    : lifecycle === 'dormant' ? 'heartbeat is stale or daemon reported offline'
-      : lifecycle === 'archived' ? `visibility archived · ${runner.retireReason ?? 'retained history'}`
-        : `retired · ${runner.retireReason ?? 'lifecycle policy'}`;
-  return <div className="hover-border" style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '13px 15px', borderRadius: 11, background: 'var(--w-02)', border: '1px solid var(--w-07)', opacity: lifecycle === 'active' ? 1 : 0.68 }}>
-    <span style={{ width: 10, height: 10, borderRadius: '50%', background: lifecycle === 'active' ? '#3fd98b' : runner.status === 'offboarded' ? '#ff5c5c' : '#6b7280' }} />
-    <div style={{ minWidth: 0, flex: 1 }}>
-      <div style={{ fontSize: 13.5, fontWeight: 600, display: 'flex', gap: 7, alignItems: 'center' }}>{runner.label}<MonoTag color="var(--text-dim)" bg="var(--w-05)" size={9}>{lifecycle.toUpperCase()}</MonoTag><MonoTag color="var(--text-faint)" bg="var(--w-04)" size={9}>{runner.version ? `v${runner.version}` : 'version unknown'}</MonoTag></div>
-      <div style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-dim)', marginTop: 2 }}>{why} · heartbeat {ago(runner.lastHeartbeatAt)} · {runner.agentCount ?? 0} agents · {runner.liveRuns ?? 0} live runs · {runner.ownerName ?? 'owner unknown'}</div>
-    </div>
-    {lifecycle === 'archived' && <Action busy={busy} label="restore visibility" onClick={() => onAction(runner.id, () => api.restoreRunnerVisibility(runner.id))} />}
-    {lifecycle === 'retired' && <Action busy={busy} label="archive" onClick={() => onAction(runner.id, () => api.archiveRunner(runner.id))} />}
-    {(lifecycle === 'active' || lifecycle === 'dormant') && <Action danger busy={busy} label="offboard" onClick={async () => { if (await confirm(`Offboard ${runner.label}? This revokes Noriq access and fails live runs, but cannot stop the process on its machine.`)) await onAction(runner.id, () => api.offboardRunner(runner.id)); }} />}
-    {runner.eligiblePurge && <Action danger busy={busy} label="purge unused" onClick={async () => { if (await confirm(`Permanently remove unused Runner identity ${runner.label}? This is allowed only because it has no agents or live runs.`)) await onAction(runner.id, () => api.deleteRunner(runner.id)); }} />}
   </div>;
 }
 

@@ -586,7 +586,7 @@ export function AskView({ store }: { store: AppStore }) {
     else if (source.kind === 'memory' || source.kind === 'episode') {
       if (source.kind === 'memory') sessionStorage.setItem('noriq.openMemory', source.id);
       actions.setView('memory');
-    } else if (source.kind === 'run') actions.setView('runs');
+    } else if (source.kind === 'run') actions.setView('intelligence');
     else if (source.kind === 'signal') actions.setView('control');
   };
 

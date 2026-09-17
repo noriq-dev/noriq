@@ -73,10 +73,10 @@ export function IntelligenceView({ store }: { store: AppStore }) {
   };
   useEffect(() => { setPacket(null); setCases([]); setRunnerHistory(null); void load(); }, [pid, days, groupBy, scope, dimension, metric]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const navigate = (view: 'memory' | 'runs', params: Record<string, string | null>) => {
+  const openMemory = (params: Record<string, string | null>) => {
     const query = new URLSearchParams();
     for (const [key, value] of Object.entries(params)) if (value) query.set(key, value);
-    history.pushState(null, '', `/p/${encodeURIComponent(pid)}/${view}${query.size ? `?${query}` : ''}`);
+    history.pushState(null, '', `/p/${encodeURIComponent(pid)}/memory${query.size ? `?${query}` : ''}`);
     window.dispatchEvent(new PopStateEvent('popstate'));
   };
   const writeLineageQuery = (orchestrationId: string | null, executionId: string | null) => {
@@ -146,7 +146,7 @@ export function IntelligenceView({ store }: { store: AppStore }) {
             setLineageId(orchestrationId); setLineageNodeId(executionId);
             writeLineageQuery(orchestrationId, executionId);
           }}
-          onOpenJob={(jobId) => navigate('runs', { job: jobId, lineage: lineageId })}
+          onOpenJob={(jobId) => openMemory({ q: jobId })}
         />
       </section>}
 
@@ -198,7 +198,7 @@ export function IntelligenceView({ store }: { store: AppStore }) {
                     <div><span style={mono}>ELAPSED</span><b>{fmtDuration(job.timing.elapsedMs)}</b><small>job wall clock</small></div>
                     <div><span style={mono}>OVERHEAD</span><b>{job.overhead.observations.observationCount}</b><small>observations</small></div>
                   </div>
-                  <div style={{ marginTop: 10 }}><Button variant="ghost" onClick={() => navigate('runs', { job: job.jobId })}>Open job evidence</Button></div>
+                  <div style={{ marginTop: 10 }}><Button variant="ghost" onClick={() => openMemory({ q: job.jobId })}>Search memory</Button></div>
                 </article>;
               })}
             </div>
@@ -241,9 +241,8 @@ export function IntelligenceView({ store }: { store: AppStore }) {
         <div style={{ ...card, padding: 0, overflow: 'hidden' }}>
           {!cases.length ? <div style={{ padding: 18, color: 'var(--text-dim)' }}>No cases in this bounded page.</div> : cases.map((item) => { const runnerJobId = item.runId.startsWith('runner_job:') ? item.runId.split(':')[1] ?? null : null; return <div key={item.episodeId} className="intelligence-case">
             <div style={{ minWidth: 0, flex: 1 }}><b style={{ fontSize: 12 }}>{runnerJobId ? 'RunnerJob task episode' : `Run ${item.runId} · sitting ${item.sitting}`}</b><div style={{ ...mono, overflow: 'hidden', textOverflow: 'ellipsis' }}>episode {item.episodeId}{item.taskId ? ` · task ${item.taskId}` : ''}{item.planId ? ` · plan ${item.planId}` : ''}</div></div>
-            {runnerJobId && <Button variant="ghost" onClick={() => navigate('runs', { job: runnerJobId })}>RunnerJob</Button>}
             {item.orchestrationId && <Button variant="ghost" onClick={() => openLineage(item.orchestrationId, item.executionId)}>Lineage</Button>}
-            <Button variant="ghost" onClick={() => navigate('memory', { q: item.episodeId })}>Evidence</Button>
+            <Button variant="ghost" onClick={() => openMemory({ q: runnerJobId ?? item.episodeId })}>Evidence</Button>
           </div>; })}
           {nextCursor && <div style={{ padding: 12, borderTop: '1px solid var(--w-07)', textAlign: 'center' }}><Button variant="ghost" disabled={loadingMore} onClick={() => void load(nextCursor)}>{loadingMore ? 'Loading…' : 'Load more cases'}</Button></div>}
         </div>

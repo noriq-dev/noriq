@@ -555,57 +555,10 @@ export const api = {
   releaseTask: (pid: string, tid: string, toStatus?: string) =>
     req('POST', `/api/projects/${pid}/tasks/${tid}/release`, { toStatus }),
 
-  // --- runners / runs (RUN-22) ---
-  runners: (options: {
-    all?: boolean; projectId?: string; ownerUserId?: string; lifecycle?: ApiRunner['lifecycle']; view?: 'active' | 'dormant' | 'history';
-    retireReason?: string; activeAfter?: string; activeBefore?: string; cursor?: string; limit?: number;
-  } = {}) => {
-    const q = new URLSearchParams();
-    if (options.all) q.set('all', '1');
-    if (options.projectId) q.set('projectId', options.projectId);
-    if (options.ownerUserId) q.set('ownerUserId', options.ownerUserId);
-    if (options.lifecycle) q.set('lifecycle', options.lifecycle);
-    if (options.view) q.set('view', options.view);
-    if (options.retireReason) q.set('retireReason', options.retireReason);
-    if (options.activeAfter) q.set('activeAfter', options.activeAfter);
-    if (options.activeBefore) q.set('activeBefore', options.activeBefore);
-    if (options.cursor) q.set('cursor', options.cursor);
-    if (options.limit) q.set('limit', String(options.limit));
-    const qs = q.toString();
-    return req<ApiRunnerRoster>('GET', qs ? `/api/runners?${qs}` : '/api/runners');
-  },
-  /** Cut a runner off (RUN-35): revokes its token, fails its live runs. Severs Noriq — it does
-   *  NOT remove the daemon's local repo access, so the process must be stopped too. */
-  offboardRunner: (id: string) =>
-    req<{ ok: boolean; tokenRevoked: boolean; failedRuns: number; warning?: string; note: string }>(
-      'POST', `/api/runners/${id}/offboard`),
-  renameRunner: (id: string, label: string) => req('PATCH', `/api/runners/${id}`, { label }),
-  archiveRunner: (id: string) => req<{ ok: true; archived: true }>('POST', `/api/runners/${id}/archive`),
-  restoreRunnerVisibility: (id: string) => req<{ ok: true; archived: false; note: string }>('POST', `/api/runners/${id}/restore-visibility`),
-  deleteRunner: (id: string) => req('DELETE', `/api/runners/${id}`),
   agentLifecycleClassification: () => req<ApiAgentLifecycleClassification>('GET', '/api/admin/agent-lifecycle/classification'),
   agentLifecycleSweep: (pid: string, apply = false, cursor?: Record<string, string | null>) =>
     req<ApiAgentLifecycleSweep>('POST', `/api/projects/${pid}/agent-lifecycle-sweep${apply ? '?apply=true' : ''}`, cursor ? { cursor } : {}),
-  runs: (pid: string) => req<{ runs: ApiRun[] }>('GET', `/api/projects/${pid}/runs`),
-  runnerJobs: (pid: string) => req<{ jobs: ApiRunnerJobSummary[] }>('GET', `/api/projects/${pid}/runner-jobs`),
-  runnerJob: (pid: string, jobId: string) =>
-    req<ApiRunnerJobDetail>('GET', `/api/projects/${pid}/runner-jobs/${jobId}`),
-  runnerJobActivity: (
-    pid: string,
-    jobId: string,
-    options: { cursor?: string; limit?: number; taskId?: string } = {},
-  ) => {
-    const query = new URLSearchParams();
-    if (options.cursor) query.set('cursor', options.cursor);
-    if (options.limit != null) query.set('limit', String(options.limit));
-    if (options.taskId) query.set('taskId', options.taskId);
-    const suffix = query.size ? `?${query}` : '';
-    return req<ApiRunnerJobActivityPage>(
-      'GET', `/api/projects/${pid}/runner-jobs/${jobId}/activity${suffix}`,
-    );
-  },
-  runnerJobIntelligence: (pid: string, jobId: string) =>
-    req<ApiRunnerJobIntelligenceDetail>('GET', `/api/projects/${pid}/runner-jobs/${jobId}/intelligence`),
+  /** Historical RunnerJob summaries for Intelligence (read-only; dispatch UI removed). */
   runnerJobIntelligenceHistory: (pid: string, options: { from: string; to: string; limit?: number }) => {
     const query = new URLSearchParams({ from: options.from, to: options.to });
     if (options.limit != null) query.set('limit', String(options.limit));
@@ -613,20 +566,6 @@ export const api = {
       'GET', `/api/projects/${pid}/runner-job-intelligence?${query}`,
     );
   },
-  dispatchTaskJob: (pid: string, taskId: string, body: RunnerJobDispatchInput) =>
-    req<{ job: ApiRunnerJobSummary; delivered: boolean }>('POST', `/api/projects/${pid}/tasks/${taskId}/runner-jobs`, body),
-  dispatchPlanJob: (pid: string, planId: string, body: RunnerJobDispatchInput) =>
-    req<{ job: ApiRunnerJobSummary; delivered: boolean }>('POST', `/api/projects/${pid}/plans/${planId}/runner-jobs`, body),
-  cancelRunnerJob: (pid: string, jobId: string) =>
-    req<{ ok: true; terminal: boolean; delivered?: boolean }>('POST', `/api/projects/${pid}/runner-jobs/${jobId}/cancel`, {}),
-  landRunnerJob: (pid: string, jobId: string) =>
-    req<{ ok: true; terminal: boolean; delivered: boolean; requestId: string | null; target: string | null }>(
-      'POST', `/api/projects/${pid}/runner-jobs/${jobId}/land`, {},
-    ),
-  answerRunnerJobQuestion: (pid: string, jobId: string, questionId: string, answer: string) =>
-    req<{ ok: true; delivered: boolean }>(
-      'POST', `/api/projects/${pid}/runner-jobs/${jobId}/questions/${questionId}/answer`, { answer },
-    ),
   orchestrations: (pid: string, options: { view?: 'active' | 'history'; cursor?: string; limit?: number } = {}) => {
     const q = new URLSearchParams();
     if (options.view) q.set('view', options.view);
@@ -642,24 +581,6 @@ export const api = {
     const query = q.toString();
     return req<ApiOrchestrationTree>('GET', `/api/projects/${pid}/orchestrations/${id}${query ? `?${query}` : ''}`);
   },
-  dispatchRun: (pid: string, body: DispatchInput) => req<{ run: ApiRun; delivered: boolean }>('POST', `/api/projects/${pid}/runs`, body),
-  cancelRun: (runId: string, reason?: string) => req<{ run: ApiRun }>('POST', `/api/runs/${runId}/cancel`, { reason }),
-  /** Continue a FAILED run (PLNR-180): re-open the same run id with N more reviewer rounds, back on
-   *  the runner that still holds its kept worktree. `rounds` null → the daemon's manifest default. */
-  continueRun: (runId: string, rounds: number | null) =>
-    req<{ run: ApiRun; delivered: boolean }>('POST', `/api/runs/${runId}/continue`, { rounds }),
-  /** The run's transcript (RUN-74): every voice in the run, in order — the "why" surface. */
-  runLog: (runId: string) => req<{ segments: ApiRunLogSegment[] }>('GET', `/api/runs/${runId}/log`),
-
-  // --- plan dispatch (PLNR-170): dispatch a whole plan; the server fans out per-task runs ---
-  planDispatches: (pid: string, planId?: string) =>
-    req<{ dispatches: ApiPlanDispatch[] }>('GET', `/api/projects/${pid}/plan-dispatches${planId ? `?planId=${planId}` : ''}`),
-  dispatchPlan: (pid: string, planId: string, body: PlanDispatchInput) =>
-    req<{ dispatch: ApiPlanDispatch }>('POST', `/api/projects/${pid}/plans/${planId}/dispatch`, body),
-  cancelPlanDispatch: (id: string, reason?: string) =>
-    req<{ ok: boolean; cancelledRuns: number }>('POST', `/api/plan-dispatches/${id}/cancel`, { reason }),
-  retryPlanDispatch: (id: string) => req<{ created: number }>('POST', `/api/plan-dispatches/${id}/retry`),
-
   // --- Project Memory explorer (PLNR-271) — REST reads/writes the DO never exposes directly;
   // the web app reaches it only through these routes (apps/api/src/index.ts ~line 1093+). ---
   /** A dedicated reachability + size probe (PLNR-271's "unreachable, not empty" acceptance line):
@@ -668,14 +589,6 @@ export const api = {
   memoryHealth: (pid: string) => req<ApiMemoryHealth>('GET', `/api/projects/${pid}/memory/health`),
   projectIntelligence: (pid: string, input: ApiProjectIntelligenceInput) =>
     req<ApiProjectIntelligence>('POST', `/api/projects/${pid}/memory/intelligence`, input),
-  dispatchIntelligence: (pid: string, input: ApiDispatchIntelligenceInput, signal?: AbortSignal) =>
-    req<ApiDispatchIntelligence>('POST', `/api/projects/${pid}/memory/dispatch-intelligence`, input, signal),
-  planDispatchIntelligence: (pid: string, input: ApiPlanDispatchIntelligenceInput, signal?: AbortSignal) =>
-    req<ApiPlanDispatchIntelligence>('POST', `/api/projects/${pid}/memory/plan-dispatch-intelligence`, input, signal),
-  dispatchIntelligenceFeedback: (pid: string, input: ApiDispatchIntelligenceFeedbackInput) =>
-    req<{ feedbackId: string; operationKey: string; occurrenceId: string; deduped: boolean }>(
-      'POST', `/api/projects/${pid}/memory/dispatch-intelligence/feedback`, input,
-    ),
   memoryRepositories: (pid: string) => req<{ repositories: ApiMemoryRepository[] }>('GET', `/api/projects/${pid}/memory/repositories`),
   /** PLNR-311: registers a canonical repository — the ONE write in this file open to any project
    *  member, not gated to admin (unlike every action below): registration is a human declaring
@@ -1588,7 +1501,7 @@ export interface ApiSearchHit {
 
 export type ApiUiSurface =
   | 'control' | 'graph' | 'board' | 'plans' | 'roadmap' | 'review' | 'docs'
-  | 'intelligence' | 'agents' | 'runs' | 'memory' | 'project-settings';
+  | 'intelligence' | 'agents' | 'memory' | 'project-settings';
 
 export interface ApiSnapshot {
   /** Server package version — deploy marker for the SPA's self-refresh (PLNR-193). */

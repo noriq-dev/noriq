@@ -132,7 +132,7 @@ export interface EventVM {
   dot?: string;
 }
 
-export type ViewId = 'home' | 'control' | 'graph' | 'intelligence' | 'board' | 'plans' | 'roadmap' | 'review' | 'docs' | 'ask' | 'agents' | 'runs' | 'settings' | 'project-settings' | 'admin' | 'memory' | 'more';
+export type ViewId = 'home' | 'control' | 'graph' | 'intelligence' | 'board' | 'plans' | 'roadmap' | 'review' | 'docs' | 'ask' | 'agents' | 'settings' | 'project-settings' | 'admin' | 'memory' | 'more';
 
 export interface BoardVM {
   id: string;
