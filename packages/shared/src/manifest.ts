@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { RepositoryKey } from './memory';
-import { AgentTool, RunBudget, RunEffort, RunKind } from './runner';
+import { AgentTool, RunEffort, RunKind } from './runner';
 
 // ---------------------------------------------------------------------------
 // The two manifests (RUN plan, Phase 1). The daemon reads TOML off disk; these
@@ -436,57 +436,8 @@ export const ProjectManifest = z.object({
 });
 export type ProjectManifest = z.infer<typeof ProjectManifest>;
 
-// ---------------------------------------------------------------------------
-// Machine config
-// ---------------------------------------------------------------------------
-
-/**
- * How this machine keeps up with releases (RUN-37).
- *
- * There is NO `apply` / `enabled` self-replacement key here, and its absence is the design.
- * Shipping one that did nothing would repeat exactly the mistake RUN-38 had to undo: a stored
- * setting that reads as working while nothing consults it. An operator would set
- * `apply = true`, believe the box self-updates, and be wrong.
- *
- * Self-replacement is blocked on judgement, not mechanics: @noriq-dev/runner is published, so it
- * COULD npm-install itself. But the daemon holds the operator's OAuth token, spawns agents at a
- * permission floor it chooses, and with [land] writes branches — so whoever controls the version
- * feed controls all of that on every opted-in box. The package has npm's registry signatures (as
- * every package does) but no provenance attestation, so nothing proves an artifact came from
- * this repo's CI rather than someone's laptop. It also has to drain live runs and be restarted
- * by something. Both are solvable; neither is solved. See THREAT-MODEL.md.
- *
- * So this is the checking half, which is safe and useful on its own: a public GET, and a runner
- * that says out loud when it is behind.
- */
-export const UpdatePolicy = z.object({
-  /** Check whether this runner is behind and say so (log + the dashboard's version badge).
-   *  Nothing is downloaded, nothing is replaced. */
-  check: z.boolean().default(true),
-  checkIntervalHours: z.number().positive().default(24),
-});
-export type UpdatePolicy = z.infer<typeof UpdatePolicy>;
-
-export const RunnerConfig = z.object({
-  label: z.string().min(1), // human name for this runner, e.g. "my-laptop"
-  server: z.string().url(), // the Noriq server this runner dials (control plane)
-  scanRoots: z.array(z.string()).min(1), // dirs walked to discover .noriq/project.toml markers
-  concurrency: z.number().int().positive().default(1), // → Runner.capabilities.maxConcurrency
-  // default ceilings applied to Runs lacking their own. zod v4: `.default({})` now
-  // wants the full OUTPUT value, so use `.prefault({})` — it parses `{}` through
-  // RunBudget, applying each field's inner default (the v3 `.default({})` behavior).
-  budget: RunBudget.prefault({}),
-  // Installed drivers. Optional — the daemon may auto-detect; when set it pins
-  // what this runner advertises (Runner.capabilities.tools).
-  tools: z.array(AgentTool).nullable().default(null),
-  // Staying current (RUN-37). Machine-local on purpose: updating the daemon is a property of
-  // the BOX, not of a repo — a repo must never be able to update the daemon supervising it.
-  update: UpdatePolicy.prefault({}),
-  // NOTE: the OAuth token is a local secret and intentionally NOT part of this
-  // schema — it lives outside the config file (credential store / token file);
-  // only the token crosses the wire, per the security model. See RUN-5/RUN-9.
-});
-export type RunnerConfig = z.infer<typeof RunnerConfig>;
+// Project-manifest kinds still shared with execution-spec and memory intelligence.
+export { RunKind, AgentTool, RunEffort, RunBudget } from './runner';
 
 // ---------------------------------------------------------------------------
 // key → projectId resolution contract

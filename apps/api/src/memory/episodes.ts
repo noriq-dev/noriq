@@ -23,11 +23,15 @@
 import type { Env } from '../env';
 import {
   CopilotReportedEvidence, EpisodeLandingOutcome, ExecutionSpec, LineageCompleteness, RunModelUsage,
-  RunnerJobAgentRoute, RunnerJobCostBasis, RunnerJobDurationMetric, RunnerJobObservationActor, RunnerJobObservationEvidence,
-  RunnerJobEvent, RunnerJobObservationUsage, RunnerJobSource, StrategyCoordinate, UNATTRIBUTED_MODEL_ID,
+  StrategyCoordinate, UNATTRIBUTED_MODEL_ID,
   type IntelligenceDurationMs, type IntelligenceIntegerMetric, type IntelligenceNumberMetric,
-  type IntelligenceRatioMetric, type RunnerJobObservationStage, type WorkEpisodeSource,
+  type IntelligenceRatioMetric, type WorkEpisodeSource,
 } from '@noriq-dev/shared';
+import {
+  RunnerJobAgentRoute, RunnerJobCostBasis, RunnerJobDurationMetric, RunnerJobObservationActor,
+  RunnerJobObservationEvidence, RunnerJobEvent, RunnerJobObservationUsage, RunnerJobSource,
+  type RunnerJobObservationStage,
+} from '../lib/shared-runner-legacy';
 import {
   INTELLIGENCE_EXTRACTION_VERSION, loadRunSittingEvidence, type EpisodeIntelligenceDraft,
 } from '../lib/run-sitting-intelligence';

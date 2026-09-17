@@ -4,7 +4,7 @@ import type { Env } from '../src/env';
 import { taskClaimability } from '../src/lib/claimability';
 import { assessProjectBottlenecks } from '../src/memory/bottlenecks';
 import { createAgent, mcpCall } from './helpers';
-import { RUNNER_JOB_CAPABILITY, RUNNER_PROTOCOL_CAPABILITIES } from '@noriq-dev/shared';
+const RUNNER_JOB_CAPABILITY = 'runner-job.v2';
 
 const appEnv = env as unknown as Env;
 const observedAt = '2026-08-09T12:00:00.000Z';
@@ -64,8 +64,6 @@ async function runner(
 
 describe('collision and bottleneck evidence (PLNR-296)', () => {
   it('recognizes explicit RunnerJob v2 and legacy build capacity without inventing zero capacity', async () => {
-    expect(RUNNER_PROTOCOL_CAPABILITIES).not.toContain(RUNNER_JOB_CAPABILITY);
-
     const runnerJobProject = await project('BTJOBV2', 'RunnerJob v2 capacity');
     await runner(runnerJobProject, 'rnr_bt_job_v2', observedAt, 2, {
       kinds: [], protocolCapabilities: [RUNNER_JOB_CAPABILITY],

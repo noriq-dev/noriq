@@ -4,6 +4,8 @@ import { ProjectIntelligenceEpisode } from './intelligence';
 import type { ContextConsumptionMode, ContextConsumptionRole, ContextConsumptionSectionId } from './intelligence';
 import { RunModelUsage } from './runner';
 
+export { RunModelUsage, RunModelMix, UNATTRIBUTED_MODEL_ID } from './runner';
+
 /** PLNR-474: one resident-graph ceiling shared by the 2D fallback response and the 3D continuous
  * space. Consumers may impose representation-specific edge/page bounds around this node budget,
  * but neither visualization gets a smaller universe merely because it uses a different renderer. */
