@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.77.0 - 2026-09-17
+
+### Project archive (PLNR-567)
+
+Soft-archive and restore projects. Reuses `projects.status` (`active` | `archived`) with `ProjectRoom` as the sole writer, owner-gated REST archive/restore, `?archived=1` listing, WS events, and SPA controls in project settings plus Home archived restore.
+
 ## 0.76.1 - 2026-09-17
 
 Keep a no-op `RunnerHub` class export so existing Durable Object instances can keep storage. `deleted_classes` is still forbidden; instance wrangler configs still omit the `RUNNER_HUB` binding.
